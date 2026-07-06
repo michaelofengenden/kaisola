@@ -23,6 +23,8 @@ jobs:
           # unsigned build (identity: null in package.json); Gatekeeper
           # instructions live in the README
           CSC_IDENTITY_AUTO_DISCOVERY: 'false'
+      # stable-named copy so the site can link releases/latest/download/Kaisola.dmg
+      - run: cp release/Kaisola-*.dmg release/Kaisola.dmg
       - uses: softprops/action-gh-release@v2
         with:
           files: |

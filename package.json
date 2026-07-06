@@ -3,7 +3,7 @@
   "productName": "Kaisola",
   "version": "0.1.0",
   "private": true,
-  "description": "Kaisola — a Research IDE. Move research from literature → hypotheses → experiments → results → paper, with a human reviewing every transition.",
+  "description": "Kaisola \u2014 a Research IDE. Move research from literature \u2192 hypotheses \u2192 experiments \u2192 results \u2192 paper, with a human reviewing every transition.",
   "type": "module",
   "main": "electron/main.cjs",
   "scripts": {
@@ -19,7 +19,7 @@
     "smoke": "vite build && electron electron/smoke.cjs",
     "shoot": "vite build && electron electron/shoot.cjs",
     "rebuild": "electron-rebuild -f -w node-pty -w better-sqlite3",
-    "postinstall": "electron-rebuild -f -w node-pty -w better-sqlite3 || echo 'native rebuild skipped — run: npm run rebuild'",
+    "postinstall": "electron-rebuild -f -w node-pty -w better-sqlite3 || echo 'native rebuild skipped \u2014 run: npm run rebuild'",
     "dist": "vite build && electron-builder",
     "dist:dir": "vite build && electron-builder --dir"
   },
@@ -29,6 +29,7 @@
     "directories": {
       "output": "release"
     },
+    "afterPack": "scripts/adhoc-sign.cjs",
     "files": [
       "dist/**",
       "electron/**",

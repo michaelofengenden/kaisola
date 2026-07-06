@@ -111,8 +111,8 @@
   .mark { display: flex; align-items: center; gap: 10px; font-weight: 650; letter-spacing: -0.01em; text-decoration: none; font-size: 17px; }
   .keystone { width: 20px; height: 20px; flex: none; }
   .nav-links { display: flex; gap: 22px; margin-left: auto; align-items: center; }
-  .nav-links a { text-decoration: none; color: var(--ink-3); font-size: 14px; transition: color 0.15s; }
-  .nav-links a:hover, .nav-links a:focus-visible { color: var(--ink); }
+  .nav-links a:not(.btn) { text-decoration: none; color: var(--ink-3); font-size: 14px; transition: color 0.15s; }
+  .nav-links a:not(.btn):hover, .nav-links a:not(.btn):focus-visible { color: var(--ink); }
   .btn {
     display: inline-flex; align-items: center; gap: 8px;
     background: var(--olive); color: #fff; border: none; cursor: pointer;

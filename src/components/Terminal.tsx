@@ -70,6 +70,24 @@ const fontStack = (family: string) =>
 /** POSIX single-quote escaping, for paths written into the live shell. */
 const shellQuote = (s: string) => `'${s.replace(/'/g, "'\\''")}'`
 
+/** Terminal ids that have mounted an xterm in THIS renderer. SessionCards keeps
+ * exactly these alive as hidden ghost cards across project switches — a switch
+ * back re-shows a live xterm instead of replaying the whole pty snapshot. Never
+ * seeds NEW ptys: an id lands here only after its terminal actually mounted. */
+export const everMountedTerminals = new Set<string>()
+
+/** Window-level visibility (minimized / fully occluded): while nobody can see
+ * the window, every terminal buffers instead of parsing + painting. */
+function useDocVisible() {
+  const [v, setV] = useState(!document.hidden)
+  useEffect(() => {
+    const on = () => setV(!document.hidden)
+    document.addEventListener('visibilitychange', on)
+    return () => document.removeEventListener('visibilitychange', on)
+  }, [])
+  return v
+}
+
 /**
  * A real terminal (node-pty in the main process; raw byte forwarding here).
  * `attach` binds to an existing agent-owned session without owning its lifecycle.
@@ -93,10 +111,20 @@ export function Terminal({ id, attach = false, boot, cwd }: { id: string; attach
   const termFontWeight = useKaisola((s) => s.termFontWeight)
   const setTermFontSize = useKaisola((s) => s.setTermFontSize)
   // put-away cards keep their pty but must not keep painting: output buffers
-  // here and replays when the card is shown (pop-out windows are always shown)
-  const visible = useKaisola((s) => !!POP_TERMINAL_ID || (s.dockOpen && s.dockViews.includes(id)))
+  // here and replays when the card is shown (pop-out windows are always shown).
+  // An occluded/minimized WINDOW counts as hidden too — agents streaming into a
+  // window nobody can see should cost buffering, not parse + GPU frames.
+  const cardShown = useKaisola((s) => !!POP_TERMINAL_ID || (s.dockOpen && s.dockViews.includes(id)))
+  const docVisible = useDocVisible()
+  const visible = cardShown && docVisible
   const visibleRef = useRef(visible)
   visibleRef.current = visible
+  const cardShownRef = useRef(cardShown)
+  cardShownRef.current = cardShown
+  // the WebGL renderer lives only while the card is shown — a hidden card
+  // paints nothing, so holding a GPU context (and its glyph atlas) for it is
+  // pure drain, and freed contexts keep many-session grids under the GL cap
+  const glCtlRef = useRef<{ attach: () => void; drop: () => void } | null>(null)
   const pendingRef = useRef<{ chunks: string[]; bytes: number }>({ chunks: [], bytes: 0 })
   const themeRef = useRef(theme)
   themeRef.current = theme
@@ -138,6 +166,14 @@ export function Terminal({ id, attach = false, boot, cwd }: { id: string; attach
     p.bytes = 0
     term.write(chunk)
   }, [visible, attach])
+
+  // the GPU renderer follows the CARD, not the window: putting a card away
+  // frees its GL context; occlusion alone keeps it (re-showing the window
+  // must not pay a per-terminal context rebuild)
+  useEffect(() => {
+    if (cardShown) glCtlRef.current?.attach()
+    else glCtlRef.current?.drop()
+  }, [cardShown])
 
   // font settings (Settings → Terminal, plus ⌘+/⌘−/⌘0) apply LIVE to every
   // terminal — the renderer rebuilds its glyph atlas and the pty re-fits
@@ -201,10 +237,13 @@ export function Terminal({ id, attach = false, boot, cwd }: { id: string; attach
       void bridge.openExternal(uri)
     }))
     term.open(hostRef.current)
+    everMountedTerminals.add(id)
     // GPU renderer when available (the pty stays byte-identical without it).
     // Its dispose() is NOT idempotent and crashes inside term.dispose() (seen
     // under StrictMode's dev double-mount) — so we dispose it ourselves first,
     // exactly once, and never let the addon manager hit a live GL renderer.
+    // Attach/drop follows card visibility (glCtlRef): hidden cards hold no
+    // GL context, so ghost cards and put-away sessions cost RAM, not GPU.
     let gl: WebglAddon | null = null
     const dropWebgl = () => {
       const g = gl
@@ -214,13 +253,18 @@ export function Terminal({ id, attach = false, boot, cwd }: { id: string; attach
         g.dispose()
       } catch { /* already torn down */ }
     }
-    try {
-      gl = new WebglAddon()
-      gl.onContextLoss(() => dropWebgl())
-      term.loadAddon(gl)
-    } catch {
-      gl = null // canvas/DOM renderer fallback
+    const attachWebgl = () => {
+      if (gl) return
+      try {
+        gl = new WebglAddon()
+        gl.onContextLoss(() => dropWebgl())
+        term.loadAddon(gl)
+      } catch {
+        gl = null // canvas/DOM renderer fallback
+      }
     }
+    glCtlRef.current = { attach: attachWebgl, drop: dropWebgl }
+    if (cardShownRef.current) attachWebgl()
     fit.fit()
 
     let disposed = false
@@ -448,6 +492,7 @@ export function Terminal({ id, attach = false, boot, cwd }: { id: string; attach
       offPrompts()
       promptMarksRef.current = []
       pendingRef.current = { chunks: [], bytes: 0 }
+      glCtlRef.current = null
       dropWebgl() // must go before term.dispose() — see note above
       try {
         term.dispose()
@@ -465,6 +510,8 @@ export function Terminal({ id, attach = false, boot, cwd }: { id: string; attach
 
   // deliver a boot adopted after the pty went live (see bootPending). The shell
   // was spawned before the terminal had a cwd, so cd to it as a user would.
+  // A cwd WITHOUT a boot is the workspace adoption: the default shell just
+  // cd's into the freshly opened project folder.
   useEffect(() => {
     if (!ptyReady || !bootPending) return
     const st = useKaisola.getState()
@@ -473,9 +520,11 @@ export function Terminal({ id, attach = false, boot, cwd }: { id: string; attach
     // bootPending is an explicit "write it now" (set only for already-live
     // ptys — new terminals boot via the create path), so a rerun of the SAME
     // command (LaTeX rebuild) must not be swallowed by the sent-once guard
-    if (!t?.boot) return
+    const line = t?.boot
+      ? t.cwd ? `cd ${shellQuote(t.cwd)} && ${t.boot}` : t.boot
+      : t?.cwd ? `cd ${shellQuote(t.cwd)}` : null
+    if (!line) return
     bootSentRef.current = true
-    const line = t.cwd ? `cd ${shellQuote(t.cwd)} && ${t.boot}` : t.boot
     setTimeout(() => bridge.terminal.write(id, line + '\n'), 700)
   }, [ptyReady, bootPending, id])
 

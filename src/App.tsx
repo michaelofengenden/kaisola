@@ -1,4 +1,4 @@
-import { useEffect, useRef, type MouseEvent as ReactMouseEvent } from 'react'
+import { useEffect, useRef, type CSSProperties, type MouseEvent as ReactMouseEvent } from 'react'
 import { useKaisola, sessionOrderIds, projectIdForEvent, terminalOwnerMap, POP_TERMINAL_ID, type AgentFeedItem, type ProjectTab, type ClosedProject } from './store/store'
 import { bridge, isDesktop } from './lib/bridge'
 import { uid, nowISO } from './domain/ids'
@@ -182,6 +182,7 @@ export default function App() {
   const canvasOpen = useKaisola((s) => s.canvasOpen)
   const canvasWidth = useKaisola((s) => s.canvasWidth)
   const setCanvasWidth = useKaisola((s) => s.setCanvasWidth)
+  const railWidth = useKaisola((s) => s.railWidth)
   const requestTerminal = useKaisola((s) => s.requestTerminal)
   const workspacePath = useKaisola((s) => s.workspacePath)
   const activeProjectId = useKaisola((s) => s.activeProjectId)
@@ -524,7 +525,11 @@ export default function App() {
       {isDesktop && !POP_TERMINAL_ID && <ProjectTabs />}
       {isDesktop && <TabMenuSync />}
       <TopProgress />
-      <div className="app-body" data-layout={layoutMode}>
+      <div
+        className="app-body"
+        data-layout={layoutMode}
+        style={railWidth ? ({ '--wsrail-w': `${railWidth}px` } as CSSProperties) : undefined}
+      >
         {studio && <WorkspaceRail />}
         {/* session cards on the left, the files/canvas card on the right
             (minimizable — when hidden the cards take the whole work row) */}

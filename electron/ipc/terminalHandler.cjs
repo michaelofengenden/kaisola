@@ -12,7 +12,12 @@ const mgr = require('./terminalManager.cjs')
 // its live cwd (lsof — the shell cd's after spawn, so the record cwd goes
 // stale); cwd changes refresh repo root + branch. Only DIFFS are broadcast
 // (terminal:meta) so an idle shell costs nothing downstream.
-const POLL_MS = 2500
+// 2.5s while the app is focused; 10s while it's in the background — the meta
+// only feeds badges/labels, and lsof every 2.5s for an app nobody is looking
+// at is pure heat. Refocus polls immediately, so badges are fresh on return.
+const POLL_MS_FOCUSED = 2500
+const POLL_MS_BLURRED = 10_000
+let pollMs = POLL_MS_FOCUSED
 const SHELLS = new Set(['zsh', 'bash', 'fish', 'sh', 'dash', '-zsh', '-bash', 'login'])
 let metaTimer = null
 const metaCache = new Map() // id → { process, cwd, root, branch }
@@ -104,8 +109,22 @@ async function pollMeta() {
 
 function ensureMetaPolling() {
   if (metaTimer || process.env.KAISOLA_SMOKE || process.env.PASOLA_SMOKE) return // deterministic harnesses skip the poller
-  metaTimer = setInterval(() => { void pollMeta() }, POLL_MS)
+  metaTimer = setInterval(() => { void pollMeta() }, pollMs)
   void pollMeta()
+}
+
+/** App focus drives the whole terminal-stream profile: pty flush coalescing
+ * (manager) and this poller's cadence. Called from main.cjs. */
+function setAppFocused(focused) {
+  mgr.setAppFocused(focused)
+  const next = focused ? POLL_MS_FOCUSED : POLL_MS_BLURRED
+  if (next === pollMs) return
+  pollMs = next
+  if (metaTimer) {
+    clearInterval(metaTimer)
+    metaTimer = setInterval(() => { void pollMeta() }, pollMs)
+    if (focused) void pollMeta() // catch up the badges the moment the user is back
+  }
 }
 
 function registerTerminalHandlers(ipcMain) {
@@ -165,4 +184,4 @@ function killAllSessions() {
   }
 }
 
-module.exports = { registerTerminalHandlers, killAllSessions }
+module.exports = { registerTerminalHandlers, killAllSessions, setAppFocused }

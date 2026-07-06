@@ -1,35 +1,54 @@
-import { useCallback, useEffect, useRef, useState, type CSSProperties } from 'react'
-import { useKaisola, GROUP_COLORS } from '../../store/store'
+import { useCallback, useEffect, useRef, useState } from 'react'
+import { useKaisola } from '../../store/store'
 import { bridge, isDesktop, type FsEntry } from '../../lib/bridge'
-import { sessionHue, terminalAgentKey } from '../../lib/sessionHue'
-import { useAgentRegistry, agentName, type RegistryAgent } from '../../lib/registry'
 import { Icon } from '../Icon'
 import { fileIcon } from '../../lib/fileIcon'
-
-const urlHost = (u?: string) => {
-  try {
-    return u ? new URL(u).host : undefined
-  } catch {
-    return undefined
-  }
-}
+import { shellDrag } from './SessionCards'
 
 /**
- * The left rail card — what you're working WITH. The session list (agent
- * threads + terminals + panels), then the workspace tree. New sessions are
- * minted from the "+" at the end of the session tab strip above the cards.
+ * The left rail card — the PROJECT: its file tree (plus the open file's
+ * outline and captured quotes). Sessions live only in the tab strip above the
+ * cards — the strip is the one session list; no duplicate rail list here.
  */
 export function WorkspaceRail() {
-  const { all } = useAgentRegistry()
-
   return (
     <aside className="wsrail">
-      <SessionsSection agents={all} />
       <AgentPulse />
       <OutlineSection />
       <QuotesSection />
       <FilesTree />
+      <RailResize />
     </aside>
+  )
+}
+
+/** Drag handle on the rail's right edge — stretch the files sidebar. */
+function RailResize() {
+  const setRailWidth = useKaisola((s) => s.setRailWidth)
+  const start = (e: React.MouseEvent) => {
+    e.preventDefault()
+    // iframes/webviews must not eat mousemove mid-drag (same rule as the
+    // canvas edge and the card grips)
+    shellDrag.start()
+    const rail = (e.currentTarget as HTMLElement).parentElement
+    const startX = e.clientX
+    const startW = rail?.getBoundingClientRect().width ?? 232
+    const onMove = (ev: MouseEvent) => setRailWidth(startW + (ev.clientX - startX))
+    const onUp = () => {
+      shellDrag.end()
+      window.removeEventListener('mousemove', onMove)
+      window.removeEventListener('mouseup', onUp)
+    }
+    window.addEventListener('mousemove', onMove)
+    window.addEventListener('mouseup', onUp)
+  }
+  return (
+    <div
+      className="wsrail-resize"
+      onMouseDown={start}
+      onDoubleClick={() => setRailWidth(null)}
+      title="Drag to resize · double-click to reset"
+    />
   )
 }
 
@@ -144,369 +163,6 @@ function AgentPulse() {
       <span className="agent-pulse-dot" data-running={running} />
       <span className="grow truncate">{latest.text}</span>
     </button>
-  )
-}
-
-/**
- * Sessions — the open cards read as raised tabs on a segmented track. Click
- * to open a session as its own card (never disturbing the cards already
- * placed), double-click to rename (threads and terminals alike).
- */
-function SessionsSection({ agents }: { agents: RegistryAgent[] }) {
-  const threads = useKaisola((s) => s.assistantThreads)
-  const terminals = useKaisola((s) => s.terminals)
-  const agentTerminals = useKaisola((s) => s.agentTerminals)
-  const panels = useKaisola((s) => s.panels)
-  const closePanel = useKaisola((s) => s.closePanel)
-  const terminalMeta = useKaisola((s) => s.terminalMeta)
-  const workspacePath = useKaisola((s) => s.workspacePath)
-  const dockViews = useKaisola((s) => s.dockViews)
-  const dockOpen = useKaisola((s) => s.dockOpen)
-  const setActiveThread = useKaisola((s) => s.setActiveThread)
-  const setDockView = useKaisola((s) => s.setDockView)
-  const addDockSplit = useKaisola((s) => s.addDockSplit)
-  const removeDockView = useKaisola((s) => s.removeDockView)
-  const closeThread = useKaisola((s) => s.closeAssistantThread)
-  const closeTerminal = useKaisola((s) => s.closeTerminal)
-  const closeAgentTerminal = useKaisola((s) => s.closeAgentTerminal)
-  const renameThread = useKaisola((s) => s.renameAssistantThread)
-  const renameTerminal = useKaisola((s) => s.renameTerminal)
-  const reorderThreads = useKaisola((s) => s.reorderAssistantThreads)
-
-  const sessionGroups = useKaisola((s) => s.sessionGroups)
-  const createSessionGroup = useKaisola((s) => s.createSessionGroup)
-  const renameSessionGroup = useKaisola((s) => s.renameSessionGroup)
-  const toggleSessionGroupCollapsed = useKaisola((s) => s.toggleSessionGroupCollapsed)
-  const assignToGroup = useKaisola((s) => s.assignToGroup)
-  const removeSessionGroup = useKaisola((s) => s.removeSessionGroup)
-  const setSessionGroupColor = useKaisola((s) => s.setSessionGroupColor)
-  const pinnedSessions = useKaisola((s) => s.pinnedSessions)
-  const togglePinSession = useKaisola((s) => s.togglePinSession)
-  const needsYou = useKaisola((s) => s.needsYou)
-  const worktreeSessions = useKaisola((s) => s.worktreeSessions)
-  const saveSessionTemplate = useKaisola((s) => s.saveSessionTemplate)
-  const mergeWorktreeSession = useKaisola((s) => s.mergeWorktreeSession)
-  const removeWorktreeSession = useKaisola((s) => s.removeWorktreeSession)
-
-  const [editing, setEditing] = useState<{ id: string; kind: 'thread' | 'term' | 'group' } | null>(null)
-  const [editValue, setEditValue] = useState('')
-  const dragRef = useRef<string | null>(null)
-  // Chrome-style grouping: right-click a session row → move between groups
-  const [sessionMenu, setSessionMenu] = useState<{ x: number; y: number; id: string } | null>(null)
-
-  const commitRename = () => {
-    if (editing) {
-      const name = editValue.trim() || undefined
-      if (editing.kind === 'thread') renameThread(editing.id, name)
-      else if (editing.kind === 'group') renameSessionGroup(editing.id, name ?? '')
-      else renameTerminal(editing.id, name)
-    }
-    setEditing(null)
-  }
-  const isActive = (id: string) => dockOpen && dockViews.includes(id)
-
-  // ambiguity rule: repo suffixes appear only when sessions span >1 root
-  const rootOf = (id: string, fallback?: string) => {
-    const m = terminalMeta[id]
-    return m?.root ?? m?.cwd ?? fallback ?? workspacePath ?? undefined
-  }
-  const allRoots = new Set(
-    [
-      ...terminals.map((t) => rootOf(t.id, t.cwd)),
-      ...agentTerminals.map((t) => rootOf(t.terminalId, t.cwd)),
-    ].filter(Boolean) as string[],
-  )
-  const ambiguous = allRoots.size > 1
-  const hueStyle = (hue: string) => ({ '--sid': hue } as CSSProperties)
-
-  const renameInput = (
-    <input
-      className="thread-rename"
-      value={editValue}
-      autoFocus
-      onChange={(e) => setEditValue(e.target.value)}
-      onBlur={commitRename}
-      onKeyDown={(e) => { if (e.key === 'Enter') commitRename(); if (e.key === 'Escape') setEditing(null) }}
-    />
-  )
-  // the little window figure toggles the session's CARD — open it beside the
-  // others, or put it away (the session itself stays alive)
-  const cardToggle = (id: string) => (
-    <button
-      className="session-split"
-      data-on={isActive(id)}
-      onClick={() => (isActive(id) ? removeDockView(id) : addDockSplit(id))}
-      title={isActive(id) ? 'Close this card' : 'Open as a card'}
-    >
-      <Icon name="Columns2" size={11} />
-    </button>
-  )
-  return (
-    <div className="side-sessions">
-      <div className="session-list">
-        {(() => {
-          const onSessionMenu = (e: React.MouseEvent, id: string) => {
-            e.preventDefault()
-            e.stopPropagation()
-            setSessionMenu({ x: e.clientX, y: e.clientY, id })
-          }
-          const threadRows = threads.map((t, i) => {
-            const nm = agentName(agents, t.agentKey) ?? 'Agent'
-            const label = t.name ?? t.autoName ?? `${nm}${threads.filter((x) => x.agentKey === t.agentKey).length > 1 ? ` ${i + 1}` : ''}`
-            return {
-              id: t.id,
-              node: (
-                <div
-                  key={t.id}
-                  className="session-row"
-                  data-active={isActive(t.id)}
-                  style={hueStyle(sessionHue({ agentKey: t.agentKey }))}
-                  draggable={editing?.id !== t.id}
-                  onDragStart={() => (dragRef.current = t.id)}
-                  onDragOver={(e) => e.preventDefault()}
-                  onDrop={() => { if (dragRef.current) reorderThreads(dragRef.current, t.id); dragRef.current = null }}
-                  onContextMenu={(e) => onSessionMenu(e, t.id)}
-                >
-                  {editing?.id === t.id ? renameInput : (
-                    <button
-                      className="session-main"
-                      onClick={() => setActiveThread(t.id)}
-                      onDoubleClick={() => { setEditing({ id: t.id, kind: 'thread' }); setEditValue(label) }}
-                      title="Double-click to rename · drag to reorder · right-click to group"
-                    >
-                      <Icon name="Sparkles" size={13} className="session-icon" />
-                      <span className="grow truncate">{label}</span>
-                      {needsYou[t.id] && <span className="session-needs" title="Waiting on you" />}
-                      {t.busy && <span className="session-busy" aria-label="working" />}
-                    </button>
-                  )}
-                  {cardToggle(t.id)}
-                  {!pinnedSessions.includes(t.id) && (
-                    <button className="session-close" onClick={() => closeThread(t.id)} title="Close">
-                      <Icon name="X" size={11} />
-                    </button>
-                  )}
-                </div>
-              ),
-            }
-          })
-          const termRows = terminals.map((t, i) => {
-            const meta = terminalMeta[t.id]
-            const agentKey = terminalAgentKey(t.singletonKey)
-            // stable identity, never keystrokes: manual name → agent → repo → folder
-            const folder = meta?.repo ?? (meta?.cwd ?? t.cwd)?.split('/').filter(Boolean).pop()
-            const label =
-              t.name ??
-              (agentKey ? agentName(agents, agentKey) ?? agentKey : undefined) ??
-              folder ??
-              (terminals.length > 1 ? `Terminal ${i + 1}` : 'Terminal')
-            const hue = sessionHue({ agentKey, folder: meta?.root ?? meta?.cwd ?? t.cwd })
-            const failed = !meta?.running && (meta?.lastExit ?? 0) > 0
-            const title = [
-              meta?.running && meta.fgProcess ? `running ${meta.fgProcess}` : null,
-              meta?.repo && `${meta.repo}${meta.branch ? ` ⎇ ${meta.branch}` : ''}`,
-              meta?.cwd,
-              'Double-click to rename',
-            ]
-              .filter(Boolean)
-              .join(' · ')
-            return {
-              id: t.id,
-              node: (
-                <div key={t.id} className="session-row" data-active={isActive(t.id)} style={hueStyle(hue)} onContextMenu={(e) => onSessionMenu(e, t.id)}>
-                  {editing?.id === t.id ? renameInput : (
-                    <button
-                      className="session-main"
-                      onClick={() => setDockView(t.id)}
-                      onDoubleClick={() => { setEditing({ id: t.id, kind: 'term' }); setEditValue(label) }}
-                      title={title}
-                    >
-                      <Icon name="SquareTerminal" size={13} className="session-icon" />
-                      <span className="grow truncate">
-                        {label}
-                        {worktreeSessions[t.id] && <span className="session-repo"> ⎇ {worktreeSessions[t.id].branch}</span>}
-                        {ambiguous && meta?.repo && meta.repo !== label && <span className="session-repo"> · {meta.repo}</span>}
-                      </span>
-                      {needsYou[t.id] && <span className="session-needs" title="Waiting on you" />}
-                      {meta?.running && <span className="session-busy" aria-label="running" />}
-                      {failed && <span className="session-fail" aria-label="last command failed" />}
-                    </button>
-                  )}
-                  {cardToggle(t.id)}
-                  {terminals.length > 1 && !pinnedSessions.includes(t.id) && (
-                    <button
-                      className="session-close"
-                      // no immediate kill: the store gives the pty a 60s grace
-                      // so ⌘⇧T can bring the whole session back
-                      onClick={() => closeTerminal(t.id)}
-                      title="Close · ⌘⇧T reopens"
-                    >
-                      <Icon name="X" size={11} />
-                    </button>
-                  )}
-                </div>
-              ),
-            }
-          })
-          const agentTermRows = agentTerminals.map((t) => ({
-            id: t.terminalId,
-            node: (
-              <div
-                key={t.terminalId}
-                className="session-row"
-                data-active={isActive(t.terminalId)}
-                style={hueStyle(sessionHue({ agentKey: t.agentKey, folder: terminalMeta[t.terminalId]?.root ?? t.cwd }))}
-                onContextMenu={(e) => onSessionMenu(e, t.terminalId)}
-              >
-                <button className="session-main" onClick={() => setDockView(t.terminalId)} title={`${t.agentName ?? 'agent'}: ${t.command ?? ''}`}>
-                  <span className="agent-run-dot" />
-                  <span className="grow truncate">
-                    {t.label || 'agent'}
-                    {ambiguous && terminalMeta[t.terminalId]?.repo && <span className="session-repo"> · {terminalMeta[t.terminalId]?.repo}</span>}
-                  </span>
-                </button>
-                {cardToggle(t.terminalId)}
-                <button
-                  className="session-close"
-                  onClick={() => { closeAgentTerminal(t.terminalId); bridge.terminal.kill(t.terminalId) }}
-                  title="Close"
-                >
-                  <Icon name="X" size={11} />
-                </button>
-              </div>
-            ),
-          }))
-          const panelRows = panels.map((p) => {
-            const label = p.kind === 'git' ? 'Commit' : p.title ?? urlHost(p.url) ?? 'Browser'
-            const hue = p.kind === 'git'
-              ? sessionHue({ agentKey: 'git', folder: workspacePath })
-              : sessionHue({ agentKey: urlHost(p.url) ?? 'browser' })
-            return {
-              id: p.id,
-              node: (
-                <div key={p.id} className="session-row" data-active={isActive(p.id)} style={hueStyle(hue)} onContextMenu={(e) => onSessionMenu(e, p.id)}>
-                  <button className="session-main" onClick={() => setDockView(p.id)} title={p.kind === 'git' ? 'Stage & commit' : p.url ?? 'Browser'}>
-                    <Icon name={p.kind === 'git' ? 'GitCommitHorizontal' : 'Globe'} size={13} className="session-icon" />
-                    <span className="grow truncate">{label}</span>
-                    {needsYou[p.id] && <span className="session-needs" title="Waiting on you" />}
-                  </button>
-                  {cardToggle(p.id)}
-                  {!pinnedSessions.includes(p.id) && (
-                    <button className="session-close" onClick={() => closePanel(p.id)} title="Close">
-                      <Icon name="X" size={11} />
-                    </button>
-                  )}
-                </div>
-              ),
-            }
-          })
-
-          // Chrome-style order: pinned first, then colored collapsible groups,
-          // then the rest. NO attention-reordering — the amber dot is the
-          // signal (reordering would break the rail = ⌘1-9 = Ctrl+Tab
-          // invariant, and Chrome badges tabs without moving them)
-          const allRows = [...threadRows, ...termRows, ...agentTermRows, ...panelRows]
-          const rowMap = new Map(allRows.map((r) => [r.id, r.node]))
-          const pinned = pinnedSessions.filter((id) => rowMap.has(id))
-          const grouped = new Set(sessionGroups.flatMap((g) => g.members).filter((id) => !pinned.includes(id)))
-          const restSorted = allRows.filter((r) => !grouped.has(r.id) && !pinned.includes(r.id))
-          return (
-            <>
-              {pinned.length > 0 && (
-                <div className="session-pinned">
-                  {pinned.map((id) => rowMap.get(id))}
-                </div>
-              )}
-              {sessionGroups.map((g) => {
-                const members = g.members.filter((id) => rowMap.has(id) && !pinned.includes(id))
-                if (!members.length) return null
-                const color = g.color ?? sessionHue({ folder: g.name })
-                return (
-                  <div key={g.id} className="session-group" style={hueStyle(color)}>
-                    <div
-                      className="session-group-head"
-                      onClick={() => toggleSessionGroupCollapsed(g.id)}
-                      onDoubleClick={() => { setEditing({ id: g.id, kind: 'group' }); setEditValue(g.name) }}
-                      title="Click to collapse · double-click to rename"
-                    >
-                      <Icon name={g.collapsed ? 'ChevronRight' : 'ChevronDown'} size={10} className="session-group-caret" />
-                      <button
-                        className="session-group-dot"
-                        onClick={(e) => {
-                          // the dot cycles the Chrome-style palette (then back to auto)
-                          e.stopPropagation()
-                          const at = g.color ? GROUP_COLORS.indexOf(g.color) : -1
-                          setSessionGroupColor(g.id, at + 1 >= GROUP_COLORS.length ? undefined : GROUP_COLORS[at + 1])
-                        }}
-                        title="Change group color"
-                      />
-                      {editing?.id === g.id ? renameInput : <span className="truncate">{g.name}</span>}
-                      <span className="session-group-count">{members.length}</span>
-                      <button
-                        className="session-close session-group-x"
-                        onClick={(e) => { e.stopPropagation(); removeSessionGroup(g.id) }}
-                        title="Ungroup (sessions stay)"
-                      >
-                        <Icon name="X" size={10} />
-                      </button>
-                    </div>
-                    {!g.collapsed && members.map((id) => rowMap.get(id))}
-                  </div>
-                )
-              })}
-              {restSorted.map((r) => r.node)}
-            </>
-          )
-        })()}
-      </div>
-      {sessionMenu && (
-        <div className="tree-menu-overlay" onMouseDown={() => setSessionMenu(null)} onContextMenu={(e) => { e.preventDefault(); setSessionMenu(null) }}>
-          <div
-            className="tree-menu"
-            style={{ left: Math.min(sessionMenu.x, window.innerWidth - 220), top: Math.min(sessionMenu.y, window.innerHeight - 200) }}
-            onMouseDown={(e) => e.stopPropagation()}
-          >
-            <button className="tree-menu-item" onClick={() => { togglePinSession(sessionMenu.id); setSessionMenu(null) }}>
-              <Icon name={pinnedSessions.includes(sessionMenu.id) ? 'PinOff' : 'Pin'} size={13} />
-              {pinnedSessions.includes(sessionMenu.id) ? 'Unpin' : 'Pin'}
-            </button>
-            <button className="tree-menu-item" onClick={() => { saveSessionTemplate(sessionMenu.id); setSessionMenu(null) }}>
-              <Icon name="BookmarkPlus" size={13} /> Save as template
-            </button>
-            <div className="tree-menu-sep" />
-            {sessionGroups
-              .filter((g) => !g.members.includes(sessionMenu.id))
-              .map((g) => (
-                <button key={g.id} className="tree-menu-item" onClick={() => { assignToGroup(sessionMenu.id, g.id); setSessionMenu(null) }}>
-                  <Icon name="FolderInput" size={13} /> Move to “{g.name}”
-                </button>
-              ))}
-            <button
-              className="tree-menu-item"
-              onClick={() => { createSessionGroup(`Group ${sessionGroups.length + 1}`, [sessionMenu.id]); setSessionMenu(null) }}
-            >
-              <Icon name="FolderPlus" size={13} /> New group
-            </button>
-            {sessionGroups.some((g) => g.members.includes(sessionMenu.id)) && (
-              <button className="tree-menu-item" onClick={() => { assignToGroup(sessionMenu.id, null); setSessionMenu(null) }}>
-                <Icon name="FolderMinus" size={13} /> Remove from group
-              </button>
-            )}
-            {worktreeSessions[sessionMenu.id] && (
-              <>
-                <div className="tree-menu-sep" />
-                <button className="tree-menu-item" onClick={() => { void mergeWorktreeSession(sessionMenu.id); setSessionMenu(null) }}>
-                  <Icon name="GitMerge" size={13} /> Merge worktree back
-                </button>
-                <button className="tree-menu-item tree-menu-danger" onClick={() => { void removeWorktreeSession(sessionMenu.id); setSessionMenu(null) }}>
-                  <Icon name="Trash2" size={13} /> Remove worktree
-                </button>
-              </>
-            )}
-          </div>
-        </div>
-      )}
-    </div>
   )
 }
 

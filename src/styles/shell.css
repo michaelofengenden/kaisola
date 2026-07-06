@@ -917,6 +917,27 @@
 .stab-close:hover {
   color: var(--text-0);
 }
+/* the two-pane button: open this session BESIDE the showing cards (accent
+   while its pane is up). Hidden until hover, like the close ×. */
+.stab-split {
+  display: inline-flex;
+  align-items: center;
+  flex-shrink: 0;
+  padding: 0;
+  color: var(--text-3);
+  opacity: 0;
+  transition: opacity var(--dur-1) var(--ease-out), color var(--dur-1) var(--ease-out);
+}
+.stab:hover .stab-split {
+  opacity: 1;
+}
+.stab-split[data-on='true'] {
+  opacity: 1;
+  color: var(--sid, var(--accent));
+}
+.stab-split:hover {
+  color: var(--text-0);
+}
 /* background-activity badge, in precedence order: needs-you > failed > running */
 .stab-badge {
   width: 6px;
@@ -1146,6 +1167,21 @@
   flex-direction: column;
   min-height: 0;
   min-width: 0;
+}
+/* drag handle on the rail's right edge — stretch the files sidebar.
+   `.wsrail > .wsrail-resize` outranks the `.wsrail > *` positioning reset. */
+.wsrail > .wsrail-resize {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  right: 0;
+  width: 7px;
+  cursor: ew-resize;
+  z-index: 6;
+  -webkit-app-region: no-drag;
+}
+.wsrail > .wsrail-resize:hover {
+  background: var(--accent-soft);
 }
 .wsrail .side-sessions {
   flex-shrink: 0;

@@ -451,7 +451,7 @@ const GLOBAL_KEYS = [
   'theme', 'themeMode', 'layoutMode', 'agentModels', 'fileTextZoom', 'termFontSize', 'termFontFamily',
   'termFontWeight', 'customAgents', 'enabledAgents', 'sessionTemplates', 'claudeModel', 'reasoningProvider',
   'localBaseUrl', 'localModel', 'openaiBaseUrl', 'openaiModel', 'openAlexMailto', 'grobidEndpoint',
-  'sandboxMode', 'workflows', 'automationsEnabled', 'ecoMode',
+  'sandboxMode', 'workflows', 'automationsEnabled', 'ecoMode', 'railWidth',
   'permissionRules', 'sensitiveGlobs', 'latexMain', 'unsavedBuffers',
 ] as const
 
@@ -601,6 +601,8 @@ interface KaisolaState {
   /** Terminal font size (⌘+/⌘−/⌘0, persisted; applies to every terminal). */
   /** Energy saver: solid surfaces, still status dots, opaque terminals. */
   ecoMode: boolean
+  /** Width of the left workspace rail in px (null = the CSS default). */
+  railWidth: number | null
   termFontSize: number
   /** Terminal typeface — a curated mono list in Settings (persisted). */
   termFontFamily: string
@@ -698,6 +700,7 @@ interface KaisolaState {
   /** Re-place a card relative to another card's edge (drag-and-drop). */
   placeDockView: (id: string, targetId: string, edge: 'left' | 'right' | 'top' | 'bottom') => void
   setCanvasWidth: (w: number | null) => void
+  setRailWidth: (w: number | null) => void
   setDockColWeights: (weights: number[] | null) => void
   /** Minimize/restore the main view — when minimized the work row is all cards. */
   toggleCanvas: () => void
@@ -1189,14 +1192,16 @@ const resetEphemeralCursors = () => ({
 })
 
 /** A brand-new project slice: one seeded terminal + one codex thread, empty rest.
- * The seed ids namespace off `pid` so they never collide across tabs (risk #2). */
-const freshSlice = (pid: string): ProjectSliceMemory => {
+ * The seed ids namespace off `pid` so they never collide across tabs (risk #2).
+ * With a `path`, the seed terminal spawns IN the project folder — the default
+ * card is a shell already sitting at the project root, not $HOME. */
+const freshSlice = (pid: string, path: string | null = null): ProjectSliceMemory => {
   const term = seedTermId(pid)
   const threadId = `a-${pid}`
   return {
     project: emptyProject(),
     stage: 'files',
-    workspacePath: null,
+    workspacePath: path,
     autonomy: 'propose',
     agentPreset: 'codex',
     fileTabs: [],
@@ -1207,7 +1212,7 @@ const freshSlice = (pid: string): ProjectSliceMemory => {
     assistantThreads: [{ id: threadId, agentKey: 'codex', busy: false }],
     assistantRuntimes: {},
     activeThreadId: threadId,
-    terminals: [{ id: term }],
+    terminals: [{ id: term, cwd: path ?? undefined }],
     panels: [],
     sessionGroups: [],
     pinnedSessions: [],
@@ -1492,6 +1497,7 @@ export const useKaisola = create<KaisolaState>()(
   fileTabs: [],
   fileTextZoom: 1,
   ecoMode: false,
+  railWidth: null,
   termFontSize: 12,
   termFontFamily: 'JetBrains Mono',
   termFontWeight: 500,
@@ -1645,6 +1651,8 @@ export const useKaisola = create<KaisolaState>()(
     }),
   setCanvasWidth: (w) =>
     set({ canvasWidth: w == null ? null : Math.min(1600, Math.max(340, Math.round(w))) }),
+  setRailWidth: (w) =>
+    set({ railWidth: w == null ? null : Math.min(480, Math.max(176, Math.round(w))) }),
   setDockColWeights: (weights) =>
     set({ dockColWeights: weights && weights.length ? weights.map((w) => Math.max(0.15, w)) : null }),
   // minimizing the main view leaves only the session cards — so keep them shown
@@ -2250,6 +2258,16 @@ export const useKaisola = create<KaisolaState>()(
       agentFeed: [],
       latexMode: false,
       latexDismissed: false,
+      // the default shell follows the project: a pristine idle terminal (never
+      // placed anywhere, running nothing) adopts the folder — bootPending makes
+      // the live pty `cd` there, so the default card sits at the project root
+      terminals: path
+        ? s.terminals.map((t) =>
+            !t.cwd && !t.boot && !t.singletonKey && !s.terminalMeta[t.id]?.running
+              ? { ...t, cwd: path, bootPending: true }
+              : t,
+          )
+        : s.terminals,
       projectTabs: s.projectTabs.map((t) =>
         t.id === s.activeProjectId ? { ...t, workspacePath: path, hue: folderHue(path ?? t.id) } : t,
       ),
@@ -3422,8 +3440,7 @@ export const useKaisola = create<KaisolaState>()(
     const path = opts?.path ?? null
     const focus = opts?.focus !== false
     set((s) => {
-      const slice = freshSlice(pid)
-      slice.workspacePath = path
+      const slice = freshSlice(pid, path)
       const tab: ProjectTab = { id: pid, workspacePath: path, hue: folderHue(path ?? pid), createdAt: Date.now() }
       // focus:false creates the tab in the background (its slice is parked).
       if (!focus) return { projectTabs: [...s.projectTabs, tab], projectSlices: { ...s.projectSlices, [pid]: slice } }

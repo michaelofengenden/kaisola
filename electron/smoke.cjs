@@ -129,7 +129,9 @@ app.whenReady().then(async () => {
   const minimalShell = await win.webContents.executeJavaScript(`(() => ({
     noWorkflowSidebar: !document.querySelector('.sidebar') && !document.querySelector('.side-nav') && !document.querySelector('.side-section'),
     hasRail: !!document.querySelector('.wsrail'),
-    hasSessions: document.querySelectorAll('.wsrail .session-row').length >= 2,
+    // sessions live ONLY in the tab strip — the rail is the project's files
+    hasSessions: document.querySelectorAll('.stabs .stab').length >= 2,
+    railFilesOnly: document.querySelectorAll('.wsrail .session-row').length === 0,
     // with no workspace bound (fresh empty tab) the canvas shows the project
     // launcher (open-a-folder empty state), not the file view.
     hasEmptyLauncher: !!document.querySelector('.canvas .plaunch'),
@@ -965,24 +967,25 @@ a^2 + b^2 = c^2
   })()`)
   console.log('FILEUI=' + JSON.stringify(fileui))
 
-  // 13) sessions live in the LEFT RAIL (threads + terminals as rows, above the
-  //     workspace tree); a new agent thread adds a row there and focuses the
-  //     dock pane. The dock itself carries no tab chrome; identity sits in the foot.
+  // 13) sessions live in the TAB STRIP above the cards (the rail is files
+  //     only); a new agent thread adds a tab there and focuses the dock pane.
+  //     The dock itself carries no tab chrome; identity sits in the foot.
   const layout = await win.webContents.executeJavaScript(`(async () => {
     const st = window.__kaisola.getState()
     st.setLayoutMode('studio')
     st.setDock(true, 'assistant')
     await new Promise((r) => setTimeout(r, 150))
-    const rows = () => document.querySelectorAll('.wsrail .session-row').length
-    const before = rows()
+    const tabsN = () => document.querySelectorAll('.stabs .stab').length
+    const before = tabsN()
     const foot = document.querySelector('.assistant-foot')
     st.requestNewThread()
     await new Promise((r) => setTimeout(r, 150))
-    const after = rows()
+    const after = tabsN()
     const s2 = window.__kaisola.getState()
     return {
-      sessionsInRail: before >= 2, // at least one agent thread + one terminal
+      sessionsInRail: before >= 2, // (strip) at least one agent thread + one terminal
       hasRailTreeArea: !!document.querySelector('.wsrail .wsrail-files'),
+      railHasNoSessions: document.querySelectorAll('.wsrail .session-row').length === 0,
       addsRow: after === before + 1,
       focusesNewThread: s2.dockViews.includes(s2.activeThreadId),
       noDockChrome: !document.querySelector('.dock-head') && !document.querySelector('.dock-tab'),
@@ -1036,7 +1039,7 @@ a^2 + b^2 = c^2
   // 13c) the rail "+" — must be clickable (NOT window-drag), visibly a button,
   //      and offer every agent preset plus a terminal
   const plus = await win.webContents.executeJavaScript(`(async () => {
-    const btn = document.querySelector('.rail-head .drop-btn')
+    const btn = document.querySelector('.stabs .drop-btn')
     if (!btn) return { hasBtn: false }
     const noDrag = getComputedStyle(btn).getPropertyValue('-webkit-app-region') === 'no-drag'
     const r = btn.getBoundingClientRect()
@@ -1246,16 +1249,20 @@ a^2 + b^2 = c^2
   }
   console.log('WINDETACH=' + JSON.stringify(windetach))
 
-  // 13f) the window figure beside each session toggles its CARD — press to put
-  //      the card away (the session stays alive), press again to bring it back;
-  //      putting away the last card hides the whole work area
+  // 13f) the two-pane figure on each session TAB toggles its CARD — press to
+  //      put the card away (the session stays alive), press again to bring it
+  //      back; putting away the last card hides the whole work area
   const toggle = await win.webContents.executeJavaScript(`(async () => {
     const get = () => window.__kaisola.getState()
     const a1 = get().assistantThreads[0].id
     get().setDockView(a1)
-    await new Promise((r) => setTimeout(r, 120))
-    const fig = () => document.querySelectorAll('.wsrail .session-row')[0].querySelector('.session-split')
+    await new Promise((r) => setTimeout(r, 300))
+    const fig = () => {
+      const tab = document.querySelector('.stab[data-sid="' + a1 + '"]')
+      return tab ? tab.querySelector('.stab-split') : null
+    }
     if (!fig()) return { hasFig: false }
+    // while its pane is up the figure stays visible (accent, data-on)
     const visibleAtRest = getComputedStyle(fig()).opacity === '1'
     fig().click()
     await new Promise((r) => setTimeout(r, 120))
@@ -1281,12 +1288,12 @@ a^2 + b^2 = c^2
     await new Promise((r) => setTimeout(r, 120))
     const th = () => get().assistantThreads.find((t) => t.id === tid)
     const named = !!th().autoName && th().autoName.startsWith('Investigate flaky parser')
-    const rowShows = [...document.querySelectorAll('.wsrail .session-row')].some((r) => (r.textContent || '').includes('Investigate flaky'))
+    const rowShows = [...document.querySelectorAll('.stabs .stab')].some((r) => (r.textContent || '').includes('Investigate flaky'))
     get().autoNameThread(tid, 'a totally different topic now')
     const sticky = !!th().autoName && th().autoName.startsWith('Investigate')
     get().renameAssistantThread(tid, 'Parser deep-dive')
     await new Promise((r) => setTimeout(r, 100))
-    const manualWins = [...document.querySelectorAll('.wsrail .session-row')].some((r) => (r.textContent || '').includes('Parser deep-dive'))
+    const manualWins = [...document.querySelectorAll('.stabs .stab')].some((r) => (r.textContent || '').includes('Parser deep-dive'))
     get().requestTerminal('echo train-model-v2')
     await new Promise((r) => setTimeout(r, 120))
     const term = get().terminals[get().terminals.length - 1]
@@ -1306,7 +1313,7 @@ a^2 + b^2 = c^2
       noSidebarResize: !document.querySelector('.sidebar-resize'),
       noStageNav: document.querySelectorAll('.side-nav-item').length === 0,
       hasRail: !!document.querySelector('.wsrail'),
-      hasPlus: !!document.querySelector('.rail-head .drop-btn'),
+      hasPlus: !!document.querySelector('.stabs .drop-btn'),
       hasFiles: !!document.querySelector('.wsrail-files'),
     }
   })()`)
@@ -1854,7 +1861,7 @@ a^2 + b^2 = c^2
     const qwenOff = !g().enabledAgents.includes('qwen')
     g().addCustomAgent({ id: 'custom-smoke', name: 'Smokey', kind: 'terminal', command: 'true', args: [] })
     const customAdded = g().customAgents.some((a) => a.id === 'custom-smoke')
-    const btn = document.querySelector('.rail-head .drop-btn')
+    const btn = document.querySelector('.stabs .drop-btn')
     btn.click()
     await new Promise((r) => setTimeout(r, 150))
     const labels = [...document.querySelectorAll('.drop-menu .drop-item')].map((i) => i.textContent || '')
@@ -1901,7 +1908,7 @@ a^2 + b^2 = c^2
       await new Promise((r) => setTimeout(r, 200))
       const inGrid = g().dockViews.includes('panel-git')
       const rendered = !!document.querySelector('.session-card[data-show="true"] .git-panel')
-      const railRow = [...document.querySelectorAll('.wsrail .session-row')].some((row) => /Commit/.test(row.textContent || ''))
+      const railRow = [...document.querySelectorAll('.stabs .stab')].some((row) => /Commit/.test(row.textContent || ''))
       g().closePanel('panel-git')
       await new Promise((r) => setTimeout(r, 120))
       const closed = !g().panels.some((p) => p.id === 'panel-git') && !g().dockViews.includes('panel-git')
@@ -2116,8 +2123,10 @@ a^2 + b^2 = c^2
   }
   console.log('LATEX=' + JSON.stringify(latex))
 
-  // 28) Chrome-style session groups + tab switching: grouped cluster renders,
-  //     collapse works, switchSession swaps the anchor card, empty groups die
+  // 28) Chrome-style session groups + tab switching: a grouped session leads
+  //     the strip order (groups drive ordering; their chrome lives in the
+  //     tab's right-click menu now), collapse works, switchSession swaps the
+  //     anchor card, empty groups die
   const groups = await win.webContents.executeJavaScript(`(async () => {
     const g = () => window.__kaisola.getState()
     const tid = g().terminals[0].id
@@ -2125,8 +2134,10 @@ a^2 + b^2 = c^2
     await new Promise((r) => setTimeout(r, 180))
     const grp = g().sessionGroups.find((x) => x.name === 'Research')
     const created = !!grp && grp.members.includes(tid)
-    const headEl = [...document.querySelectorAll('.session-group-head')].some((h) => /Research/.test(h.textContent || ''))
-    const rowInGroup = !!document.querySelector('.session-group .session-row')
+    // grouped sessions cluster at the head of the ⌘1..9 / strip order
+    const order = window.__kaisolaLib && window.__kaisolaLib.sessionOrderIds ? window.__kaisolaLib.sessionOrderIds(g()) : []
+    const headEl = order[0] === tid
+    const rowInGroup = !!document.querySelector('.stab[data-sid="' + tid + '"]')
     g().toggleSessionGroupCollapsed(grp.id)
     const collapsed = g().sessionGroups.find((x) => x.id === grp.id).collapsed === true
     g().toggleSessionGroupCollapsed(grp.id)
@@ -2155,19 +2166,20 @@ a^2 + b^2 = c^2
   const chrome = await win.webContents.executeJavaScript(`(async () => {
     const g = () => window.__kaisola.getState()
     const tid = g().terminals[0].id
-    // pin: floats to slot 1 (⌘1 order) and the rail hides its close button
+    // pin: floats to slot 1 (⌘1 order) and the strip hides its close button
     g().togglePinSession(tid)
     await new Promise((r) => setTimeout(r, 150))
     const pinnedFirst = (window.__kaisolaLib && window.__kaisolaLib.sessionOrderIds
       ? window.__kaisolaLib.sessionOrderIds(g())
       : [tid])[0] === tid
-    const pinnedSection = !!document.querySelector('.session-pinned .session-row')
+    const pinnedTab = document.querySelector('.stab[data-sid="' + tid + '"]')
+    const pinnedSection = !!pinnedTab && !pinnedTab.querySelector('.stab-close')
     g().togglePinSession(tid)
     const unpinned = !g().pinnedSessions.includes(tid)
     // needs-you: mark → dot renders; viewing the session clears it
     g().markNeedsYou(tid)
     await new Promise((r) => setTimeout(r, 120))
-    const dot = !!document.querySelector('.session-needs')
+    const dot = !!document.querySelector('.stab[data-state="needs-you"]')
     g().setDockView(tid)
     await new Promise((r) => setTimeout(r, 80))
     const cleared = !g().needsYou[tid]
@@ -2271,7 +2283,7 @@ a^2 + b^2 = c^2
     // close any stale menu first (outside-close fires on mousedown)
     document.body.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }))
     await new Promise((r) => setTimeout(r, 80))
-    const btn = document.querySelector('.rail-head .drop-btn')
+    const btn = document.querySelector('.stabs .drop-btn')
     btn.click()
     await new Promise((r) => setTimeout(r, 150))
     const labels = [...document.querySelectorAll('.drop-menu .drop-item')].map((i) => i.textContent || '')
@@ -2325,7 +2337,7 @@ a^2 + b^2 = c^2
   console.log('WTSESS=' + JSON.stringify(wtsess))
 
   const failed =
-    !rootChildren || !minimalShell.noWorkflowSidebar || !minimalShell.hasRail || !minimalShell.hasSessions || !minimalShell.hasEmptyLauncher || !minimalShell.stageFiles || !minimalShell.studioDefault || !minimalShell.floatingTools || !claudePrepared || !nativeWindow.rendererClippedMaterial || !icon.exists || !icon.usable || !icon.square || !icon.large || !glass.appSamplingLayer || !glass.activeTintWhite || !glass.railLayerFlattened || !glass.contentGlassy || !glass.sessionGlassy || !glass.termGlassTint || !glass.blurKeepsGlass || !glass.lightsGray || !glass.nativeWindowRounding ||
+    !rootChildren || !minimalShell.noWorkflowSidebar || !minimalShell.hasRail || !minimalShell.hasSessions || !minimalShell.railFilesOnly || !minimalShell.hasEmptyLauncher || !minimalShell.stageFiles || !minimalShell.studioDefault || !minimalShell.floatingTools || !claudePrepared || !nativeWindow.rendererClippedMaterial || !icon.exists || !icon.usable || !icon.square || !icon.large || !glass.appSamplingLayer || !glass.activeTintWhite || !glass.railLayerFlattened || !glass.contentGlassy || !glass.sessionGlassy || !glass.termGlassTint || !glass.blurKeepsGlass || !glass.lightsGray || !glass.nativeWindowRounding ||
     !emptyOk || !demoOk ||
     !review.opened || !review.closed || !review.decided ||
     !term.run || !term.ptyOk || !term.cdWorks || !term.dock || !term.host ||
@@ -2353,7 +2365,7 @@ a^2 + b^2 = c^2
     !fileui.topBarsDrag || !fileui.compactFileChrome || !fileui.topBarControlsNoDrag || !fileui.topBarBordersVisible ||
     !fileui.shellGuttersDrag || !fileui.shellSurfacesDrag || !fileui.shellInnerNoDrag || !fileui.shellHandlesNoDrag ||
     !fileui.fileTabsPersisted || !fileui.fileZoomPersisted ||
-    !layout.sessionsInRail || !layout.hasRailTreeArea || !layout.addsRow || !layout.focusesNewThread || !layout.noDockChrome ||
+    !layout.sessionsInRail || !layout.hasRailTreeArea || !layout.railHasNoSessions || !layout.addsRow || !layout.focusesNewThread || !layout.noDockChrome ||
     !layout.hasFoot || !layout.footWs || !layout.footConn ||
     !splits.one || !splits.appended || !splits.heads || !splits.stacked || !splits.besides || !splits.uncapped || !splits.closes ||
     !plus.hasBtn || !plus.noDrag || !plus.pronounced || !plus.hasTerminalOption || !plus.agentChoices || !plus.claudeOpensTerminal || !plus.claudeNoThread || !plus.adds ||

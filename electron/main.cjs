@@ -10,7 +10,7 @@ const fs = require('node:fs')
 const { registerModelHandlers } = require('./ipc/modelHandler.cjs')
 const { registerToolHandlers } = require('./ipc/toolHandler.cjs')
 const { registerSettingsHandlers } = require('./ipc/settingsHandler.cjs')
-const { registerTerminalHandlers, killAllSessions } = require('./ipc/terminalHandler.cjs')
+const { registerTerminalHandlers, killAllSessions, setAppFocused } = require('./ipc/terminalHandler.cjs')
 const { registerAcpHandlers, disposeAcp } = require('./ipc/acpHandler.cjs')
 const { registerAuthHandlers, disposeAuth } = require('./ipc/authHandler.cjs')
 const { registerFsHandlers, disposeFs } = require('./ipc/fsHandler.cjs')
@@ -548,6 +548,17 @@ app.whenReady().then(() => {
 
 app.on('window-all-closed', () => {
   if (process.platform !== 'darwin') app.quit()
+})
+
+// Energy: while the user works elsewhere, terminals stream in a slower profile
+// (pty flush coalescing widens, the identity poller relaxes) — nothing is
+// dropped, the machine just stops burning frames for windows out of focus.
+// blur fires before the next window's focus, so confirm nobody has focus.
+app.on('browser-window-focus', () => setAppFocused(true))
+app.on('browser-window-blur', () => {
+  setTimeout(() => {
+    if (!BrowserWindow.getFocusedWindow()) setAppFocused(false)
+  }, 150)
 })
 
 app.on('before-quit', () => {

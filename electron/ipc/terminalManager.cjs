@@ -14,11 +14,22 @@ try {
 }
 
 const OUTPUT_CAP = 1_000_000 // keep up to ~1MB of output per terminal
-// Coalesce pty output into ~one IPC frame per FLUSH_MS: agent TUIs emit
+// Coalesce pty output into ~one IPC frame per flush window: agent TUIs emit
 // hundreds of tiny chunks a second (spinner frames, cursor moves), and one
 // renderer wake-up per chunk is what makes an idle-looking app burn CPU.
-const FLUSH_MS = 8
+// 16ms ≈ one 60Hz frame — flushing faster than the display paints is waste.
+// While NO app window is focused the window stretches to 100ms: output still
+// flows (nothing is dropped), the machine just stops compositing an agent
+// spinner at full rate for a window the user isn't working in.
+const FLUSH_MS_FOCUSED = 16
+const FLUSH_MS_BLURRED = 100
+let flushMs = FLUSH_MS_FOCUSED
 const FLUSH_CAP = 65_536 // a burst bigger than this flushes immediately
+
+/** main.cjs calls this on app focus/blur — the stream profile follows. */
+function setAppFocused(focused) {
+  flushMs = focused ? FLUSH_MS_FOCUSED : FLUSH_MS_BLURRED
+}
 
 /** id → record */
 const terms = new Map()
@@ -121,7 +132,7 @@ function spawn({ id, command, args, cwd, env, cols, rows, sender }) {
     }
     rec.pending += data
     if (rec.pending.length >= FLUSH_CAP) flushPending()
-    else if (!rec.flushTimer) rec.flushTimer = setTimeout(flushPending, FLUSH_MS)
+    else if (!rec.flushTimer) rec.flushTimer = setTimeout(flushPending, flushMs)
   })
   p.onExit(({ exitCode, signal }) => {
     flushPending() // the tail of the stream must land before the exit signal
@@ -234,4 +245,4 @@ function list() {
   return out
 }
 
-module.exports = { available, has, isLive, spawn, write, resize, setSender, snapshot, waitForExit, kill, release, killAll, list }
+module.exports = { available, has, isLive, spawn, write, resize, setSender, snapshot, waitForExit, kill, release, killAll, list, setAppFocused }

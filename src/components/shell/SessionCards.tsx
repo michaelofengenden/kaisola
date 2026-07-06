@@ -1,8 +1,9 @@
 import { useRef, useState, type CSSProperties, type DragEvent, type ReactNode } from 'react'
+import { useShallow } from 'zustand/react/shallow'
 import { useKaisola, type TerminalMeta } from '../../store/store'
 import { sessionHue, terminalAgentKey } from '../../lib/sessionHue'
 import { useAgentRegistry, agentName } from '../../lib/registry'
-import { Terminal } from '../Terminal'
+import { Terminal, everMountedTerminals } from '../Terminal'
 import { Assistant } from '../Assistant'
 import { GitPanel } from './GitPanel'
 import { BrowserCard } from './BrowserCard'
@@ -80,6 +81,18 @@ export function SessionCards() {
   const termRemounts = useKaisola((s) => s.termRemounts)
   const dockColWeights = useKaisola((s) => s.dockColWeights)
   const setDockColWeights = useKaisola((s) => s.setDockColWeights)
+  // ghost cards: BACKGROUND projects' terminals whose xterm already mounted in
+  // this renderer stay mounted (hidden) — a tab switch re-shows a live terminal
+  // instead of disposing + re-creating xterm/WebGL and replaying the snapshot,
+  // which is what made switching feel slow. Only ever-mounted ids qualify, so
+  // parked tabs restored at launch still lazy-spawn their ptys on first view.
+  // (Record identity is stable across background feed patches → shallow bails.)
+  const ghostTerms = useKaisola(
+    useShallow((s) => Object.values(s.projectSlices).flatMap((sl) => sl.terminals.filter((t) => everMountedTerminals.has(t.id)))),
+  )
+  const ghostAgentTerms = useKaisola(
+    useShallow((s) => Object.values(s.projectSlices).flatMap((sl) => sl.agentTerminals.filter((t) => everMountedTerminals.has(t.terminalId)))),
+  )
   const { all: agents } = useAgentRegistry()
   const dragRef = useRef<string | null>(null)
   const gridRef = useRef<HTMLDivElement>(null)
@@ -280,50 +293,73 @@ export function SessionCards() {
           running: t.busy,
         })
       })}
-      {terminals.map((t, i) => {
-        const meta = terminalMeta[t.id]
-        const agentKey = terminalAgentKey(t.singletonKey)
-        // stable identity, never keystrokes: manual name → agent → repo → folder
-        const folder = meta?.repo ?? (meta?.cwd ?? t.cwd)?.split('/').filter(Boolean).pop()
-        const label =
-          t.name ??
-          (agentKey ? agentName(agents, agentKey) ?? agentKey : undefined) ??
-          folder ??
-          (terminals.length > 1 ? `Terminal ${i + 1}` : 'Terminal')
-        const sub = showMetaFor(t.id, t.cwd) ? metaLine(meta) : null
-        return card(
-          t.id,
-          'SquareTerminal',
-          label,
-          // keyed by the remount seq: a returning pop-out re-attaches the pty
-          // stream and replays the snapshot into a fresh xterm
-          <div className="dock-pane-term"><Terminal key={termRemounts[t.id] ?? 0} id={t.id} boot={t.boot} cwd={t.cwd} /></div>,
-          {
-            hue: sessionHue({ agentKey, folder: meta?.root ?? meta?.cwd ?? t.cwd }),
-            // when the title already IS the repo, the sub line keeps only branch·path
-            sub: sub && sub.repo === label ? { ...sub, repo: undefined } : sub,
-            running: !!meta?.running,
-            failed: !meta?.running && (meta?.lastExit ?? 0) > 0,
-            poppable: true,
-            ports: meta?.ports,
-          },
-        )
-      })}
-      {agentTerminals.map((t) => {
-        const meta = terminalMeta[t.terminalId]
-        return card(
-          t.terminalId,
-          'SquareTerminal',
-          t.label || 'agent',
-          <div className="dock-pane-term"><Terminal key={termRemounts[t.terminalId] ?? 0} id={t.terminalId} attach /></div>,
-          {
-            hue: sessionHue({ agentKey: t.agentKey, folder: meta?.root ?? meta?.cwd ?? t.cwd }),
-            sub: showMetaFor(t.terminalId, t.cwd) ? metaLine(meta) : null,
-            running: !!meta?.running,
-            poppable: true,
-          },
-        )
-      })}
+      {/* live + ghost terminal cards share ONE array expression on purpose:
+          React matches keys only within the same child slot, so a terminal
+          moving between active and ghost on a project switch keeps its element
+          (and its live xterm) instead of remounting */}
+      {[
+        ...terminals.map((t, i) => {
+          const meta = terminalMeta[t.id]
+          const agentKey = terminalAgentKey(t.singletonKey)
+          // stable identity, never keystrokes: manual name → agent → repo → folder
+          const folder = meta?.repo ?? (meta?.cwd ?? t.cwd)?.split('/').filter(Boolean).pop()
+          const label =
+            t.name ??
+            (agentKey ? agentName(agents, agentKey) ?? agentKey : undefined) ??
+            folder ??
+            (terminals.length > 1 ? `Terminal ${i + 1}` : 'Terminal')
+          const sub = showMetaFor(t.id, t.cwd) ? metaLine(meta) : null
+          return card(
+            t.id,
+            'SquareTerminal',
+            label,
+            // keyed by the remount seq: a returning pop-out re-attaches the pty
+            // stream and replays the snapshot into a fresh xterm
+            <div className="dock-pane-term"><Terminal key={termRemounts[t.id] ?? 0} id={t.id} boot={t.boot} cwd={t.cwd} /></div>,
+            {
+              hue: sessionHue({ agentKey, folder: meta?.root ?? meta?.cwd ?? t.cwd }),
+              // when the title already IS the repo, the sub line keeps only branch·path
+              sub: sub && sub.repo === label ? { ...sub, repo: undefined } : sub,
+              running: !!meta?.running,
+              failed: !meta?.running && (meta?.lastExit ?? 0) > 0,
+              poppable: true,
+              ports: meta?.ports,
+            },
+          )
+        }),
+        ...agentTerminals.map((t) => {
+          const meta = terminalMeta[t.terminalId]
+          return card(
+            t.terminalId,
+            'SquareTerminal',
+            t.label || 'agent',
+            <div className="dock-pane-term"><Terminal key={termRemounts[t.terminalId] ?? 0} id={t.terminalId} attach /></div>,
+            {
+              hue: sessionHue({ agentKey: t.agentKey, folder: meta?.root ?? meta?.cwd ?? t.cwd }),
+              sub: showMetaFor(t.terminalId, t.cwd) ? metaLine(meta) : null,
+              running: !!meta?.running,
+              poppable: true,
+            },
+          )
+        }),
+        // ghost cards — never placed (no pos), so they render hidden
+        ...ghostTerms.map((t) =>
+          card(
+            t.id,
+            'SquareTerminal',
+            t.name ?? 'Terminal',
+            <div className="dock-pane-term"><Terminal key={termRemounts[t.id] ?? 0} id={t.id} boot={t.boot} cwd={t.cwd} /></div>,
+          ),
+        ),
+        ...ghostAgentTerms.map((t) =>
+          card(
+            t.terminalId,
+            'SquareTerminal',
+            t.label || 'agent',
+            <div className="dock-pane-term"><Terminal key={termRemounts[t.terminalId] ?? 0} id={t.terminalId} attach /></div>,
+          ),
+        ),
+      ]}
       {panels.map((p) => {
         // terminals stay mounted while put away (pty parity) — panels don't:
         // a hidden GitPanel would keep running `git status` on every file

@@ -44,17 +44,30 @@ export function SessionTabs() {
   const pinnedSessions = useKaisola((s) => s.pinnedSessions)
   const needsYou = useKaisola((s) => s.needsYou)
   const dockViews = useKaisola((s) => s.dockViews)
+  const dockOpen = useKaisola((s) => s.dockOpen)
   const switchSession = useKaisola((s) => s.switchSession)
+  const addDockSplit = useKaisola((s) => s.addDockSplit)
+  const removeDockView = useKaisola((s) => s.removeDockView)
   const closeThread = useKaisola((s) => s.closeAssistantThread)
   const closeTerminal = useKaisola((s) => s.closeTerminal)
   const closeAgentTerminal = useKaisola((s) => s.closeAgentTerminal)
   const closePanel = useKaisola((s) => s.closePanel)
   const renameThread = useKaisola((s) => s.renameAssistantThread)
   const renameTerminal = useKaisola((s) => s.renameTerminal)
+  const togglePinSession = useKaisola((s) => s.togglePinSession)
+  const saveSessionTemplate = useKaisola((s) => s.saveSessionTemplate)
+  const createSessionGroup = useKaisola((s) => s.createSessionGroup)
+  const assignToGroup = useKaisola((s) => s.assignToGroup)
+  const worktreeSessions = useKaisola((s) => s.worktreeSessions)
+  const mergeWorktreeSession = useKaisola((s) => s.mergeWorktreeSession)
+  const removeWorktreeSession = useKaisola((s) => s.removeWorktreeSession)
   const { all: agents } = useAgentRegistry()
 
   const [editing, setEditing] = useState<string | null>(null)
   const [editValue, setEditValue] = useState('')
+  // right-click a tab → the session menu (pin, template, groups, worktree) —
+  // this strip is the ONLY session list now, so it owns what the rail used to
+  const [menu, setMenu] = useState<{ x: number; y: number; id: string } | null>(null)
 
   const tabs = new Map<string, STab>()
   threads.forEach((t, i) => {
@@ -163,10 +176,11 @@ export function SessionTabs() {
           .map((id) => tabs.get(id))
           .filter((t): t is STab => !!t)
           .map((t) => {
-            const active = dockViews.includes(t.id)
+            const active = dockOpen && dockViews.includes(t.id)
             return (
               <div
                 key={t.id}
+                data-sid={t.id}
                 className="stab"
                 role="tab"
                 aria-selected={active}
@@ -181,6 +195,7 @@ export function SessionTabs() {
                 }}
                 onMouseDown={(e) => { if (e.button === 1) e.preventDefault() }}
                 onAuxClick={(e) => { if (e.button === 1 && t.closable) { e.preventDefault(); closeTab(t) } }}
+                onContextMenu={(e) => { e.preventDefault(); e.stopPropagation(); setMenu({ x: e.clientX, y: e.clientY, id: t.id }) }}
                 title={t.title}
               >
                 <Icon name={t.icon} size={12} className="stab-icon" />
@@ -203,6 +218,20 @@ export function SessionTabs() {
                   <span className="stab-label truncate">{t.label}</span>
                 )}
                 <span className="stab-badge" />
+                {/* the two-pane button: open this session BESIDE what's showing
+                    (a click on the tab itself swaps it into the current pane) */}
+                <button
+                  className="stab-split"
+                  data-on={active}
+                  onClick={(e) => {
+                    e.stopPropagation()
+                    if (active) removeDockView(t.id)
+                    else addDockSplit(t.id)
+                  }}
+                  title={active ? 'Put this pane away' : 'Open beside — view side by side'}
+                >
+                  <Icon name="Columns2" size={11} />
+                </button>
                 {t.closable && (
                   <button className="stab-close" onClick={(e) => { e.stopPropagation(); closeTab(t) }} title="Close session">
                     <Icon name="X" size={10} />
@@ -213,6 +242,63 @@ export function SessionTabs() {
           })}
       </div>
       <NewSessionButton />
+      {menu && (
+        <div className="tree-menu-overlay" onMouseDown={() => setMenu(null)} onContextMenu={(e) => { e.preventDefault(); setMenu(null) }}>
+          <div
+            className="tree-menu"
+            style={{ left: Math.min(menu.x, window.innerWidth - 220), top: Math.min(menu.y, window.innerHeight - 220) }}
+            onMouseDown={(e) => e.stopPropagation()}
+          >
+            <button
+              className="tree-menu-item"
+              onClick={() => {
+                if (dockOpen && dockViews.includes(menu.id)) removeDockView(menu.id)
+                else addDockSplit(menu.id)
+                setMenu(null)
+              }}
+            >
+              <Icon name="Columns2" size={13} /> {dockOpen && dockViews.includes(menu.id) ? 'Put pane away' : 'Open beside'}
+            </button>
+            <button className="tree-menu-item" onClick={() => { togglePinSession(menu.id); setMenu(null) }}>
+              <Icon name={pinnedSessions.includes(menu.id) ? 'PinOff' : 'Pin'} size={13} />
+              {pinnedSessions.includes(menu.id) ? 'Unpin' : 'Pin'}
+            </button>
+            <button className="tree-menu-item" onClick={() => { saveSessionTemplate(menu.id); setMenu(null) }}>
+              <Icon name="BookmarkPlus" size={13} /> Save as template
+            </button>
+            <div className="tree-menu-sep" />
+            {sessionGroups
+              .filter((g) => !g.members.includes(menu.id))
+              .map((g) => (
+                <button key={g.id} className="tree-menu-item" onClick={() => { assignToGroup(menu.id, g.id); setMenu(null) }}>
+                  <Icon name="FolderInput" size={13} /> Move to “{g.name}”
+                </button>
+              ))}
+            <button
+              className="tree-menu-item"
+              onClick={() => { createSessionGroup(`Group ${sessionGroups.length + 1}`, [menu.id]); setMenu(null) }}
+            >
+              <Icon name="FolderPlus" size={13} /> New group
+            </button>
+            {sessionGroups.some((g) => g.members.includes(menu.id)) && (
+              <button className="tree-menu-item" onClick={() => { assignToGroup(menu.id, null); setMenu(null) }}>
+                <Icon name="FolderMinus" size={13} /> Remove from group
+              </button>
+            )}
+            {worktreeSessions[menu.id] && (
+              <>
+                <div className="tree-menu-sep" />
+                <button className="tree-menu-item" onClick={() => { void mergeWorktreeSession(menu.id); setMenu(null) }}>
+                  <Icon name="GitMerge" size={13} /> Merge worktree back
+                </button>
+                <button className="tree-menu-item tree-menu-danger" onClick={() => { void removeWorktreeSession(menu.id); setMenu(null) }}>
+                  <Icon name="Trash2" size={13} /> Remove worktree
+                </button>
+              </>
+            )}
+          </div>
+        </div>
+      )}
     </div>
   )
 }

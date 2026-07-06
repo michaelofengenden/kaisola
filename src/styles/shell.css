@@ -162,6 +162,29 @@
   flex: 1 1 auto;
   -webkit-app-region: drag;
 }
+/* Chrome's update pill, Chrome's spot (strip far right): only rendered once a
+   new build is downloaded — one click restarts into it */
+.update-pill {
+  -webkit-app-region: no-drag;
+  display: inline-flex;
+  align-items: center;
+  gap: var(--sp-2);
+  align-self: center;
+  height: 26px;
+  padding: 0 var(--sp-4);
+  margin-right: var(--sp-2);
+  flex-shrink: 0;
+  border: 1px solid color-mix(in srgb, var(--accent) 45%, transparent);
+  border-radius: var(--r-full);
+  background: color-mix(in srgb, var(--accent) 14%, transparent);
+  color: var(--text-0);
+  font-size: var(--fs-12);
+  font-weight: var(--fw-medium);
+  cursor: pointer;
+}
+.update-pill:hover {
+  background: color-mix(in srgb, var(--accent) 22%, transparent);
+}
 
 /* a tab: sits at flex-basis 200px, shrinks to 54px, then the track scrolls */
 .ptab {
@@ -505,22 +528,6 @@
 
 /* ── Top bar ─────────────────────────────────────────────────────────────── */
 /* ── Card top strips (drag regions; no separate title bar exists) ────────── */
-/* rail card: our traffic lights on the left, "+ new session" on the right.
-   Tall enough that the session tabs below sit clear of the close button. */
-.rail-head {
-  display: flex;
-  align-items: center;
-  /* lights live in the tab strip now — this row is just the + session menu, so
-     it hugs the session list instead of floating in its own tall band */
-  height: 30px;
-  padding: 2px var(--sp-2) 0 10px;
-  flex-shrink: 0;
-  -webkit-app-region: drag;
-}
-:root[data-shell='desktop'][data-fullscreen='true'] .rail-head {
-  height: 36px;
-  padding-left: var(--sp-3);
-}
 :root[data-shell='desktop'][data-fullscreen='true'] .lights {
   display: none;
 }
@@ -564,33 +571,6 @@
 /* macOS grays the lights when the window loses focus */
 :root[data-winfocus='false'] .light {
   background: var(--bg-4);
-}
-/* the + must NOT be part of the window-drag region or clicks just move the
-   window — and it should read as a real button, not a ghost */
-.rail-head .drop-btn {
-  -webkit-app-region: no-drag;
-  width: 26px;
-  height: 26px;
-  justify-content: center;
-  padding: 0;
-  border-radius: var(--r-2);
-  border: 1px solid color-mix(in srgb, var(--border-faint) 58%, transparent);
-  background: color-mix(in srgb, var(--app-active-glass-tint) 18%, transparent);
-  color: var(--text-1);
-}
-.rail-head .drop-btn:hover {
-  background: color-mix(in srgb, var(--app-active-glass-tint) 26%, transparent);
-  color: var(--text-0);
-}
-.rail-head .drop-btn .drop-btn-icon {
-  color: inherit;
-}
-.rail-head .drop-btn-label {
-  display: none;
-}
-/* the + is enough — no caret next to it */
-.rail-head .drop-caret {
-  display: none;
 }
 /* sidebar card: the shell tool cluster */
 .side-tools {
@@ -816,6 +796,15 @@
   min-height: 0;
   -webkit-app-region: drag;
 }
+/* the dock column: the session tab strip on top, the card grid below */
+.dock-col {
+  flex: 1 1 0;
+  min-width: 0;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-3);
+}
 /* cards arrange on a grid — columns side by side, stacks within a column;
    the template comes inline from dockGrid */
 .session-grid {
@@ -826,6 +815,161 @@
   gap: var(--sp-4);
   position: relative; /* anchors the column-resize grips */
   -webkit-app-region: drag;
+}
+
+/* ── Session tabs: the project strip's idea, one level down ───────────────── */
+.stabs {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  height: 30px;
+  flex-shrink: 0;
+  -webkit-app-region: drag; /* the leftover strip space drags the window */
+}
+.stab,
+.stab-close,
+.stabs button {
+  -webkit-app-region: no-drag;
+}
+.stabs-track {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  min-width: 0;
+  overflow-x: auto;
+  scrollbar-width: none;
+}
+.stabs-track::-webkit-scrollbar {
+  display: none;
+}
+/* a tab: sits at 150px, shrinks to 48px, then the track scrolls */
+.stab {
+  flex: 0 1 auto;
+  width: 150px; /* intrinsic (not flex-basis): the track measures max-content */
+  min-width: 48px;
+  max-width: 190px;
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  height: 28px;
+  padding: 0 var(--sp-3);
+  border-radius: var(--r-2);
+  /* a real border slot on every state — transparent when idle so nothing
+     shifts, visible on hover/active so tabs read clearly against the glass */
+  border: 1px solid transparent;
+  color: var(--text-2);
+  font-size: var(--fs-12);
+  font-weight: var(--fw-medium);
+  position: relative;
+  transition: background var(--dur-2) var(--ease-out), color var(--dur-2) var(--ease-out),
+    border-color var(--dur-2) var(--ease-out);
+}
+.stab:hover {
+  background: var(--hover-overlay);
+  color: var(--text-1);
+  border-color: var(--border-faint);
+}
+.stab[data-active='true'] {
+  background: color-mix(in srgb, var(--bg-1) 94%, transparent);
+  color: var(--text-0);
+  border-color: var(--border-strong);
+  box-shadow: var(--shadow-1);
+}
+/* the 2px identity line at the top of an open tab — its session hue, the same
+   hue that tints the card's top edge (the tab and its card read as one) */
+.stab[data-active='true']::before {
+  content: '';
+  position: absolute;
+  inset-inline: var(--sp-3);
+  top: 0;
+  height: 2px;
+  border-radius: 2px;
+  background: color-mix(in srgb, var(--sid, var(--accent)) 70%, transparent);
+}
+.stab-icon {
+  flex-shrink: 0;
+  color: color-mix(in srgb, var(--sid, var(--accent)) 62%, var(--text-2));
+}
+.stab[data-active='true'] .stab-icon {
+  color: var(--sid, var(--accent));
+}
+.stab-label {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+/* the close affordance is hidden until the tab is hovered or open */
+.stab-close {
+  display: inline-flex;
+  align-items: center;
+  flex-shrink: 0;
+  padding: 0;
+  color: var(--text-3);
+  opacity: 0;
+  transition: opacity var(--dur-1) var(--ease-out), color var(--dur-1) var(--ease-out);
+}
+.stab:hover .stab-close,
+.stab[data-active='true'] .stab-close {
+  opacity: 1;
+}
+.stab-close:hover {
+  color: var(--text-0);
+}
+/* background-activity badge, in precedence order: needs-you > failed > running */
+.stab-badge {
+  width: 6px;
+  height: 6px;
+  border-radius: var(--r-full);
+  flex-shrink: 0;
+  display: none;
+}
+.stab[data-state='needs-you'] .stab-badge {
+  display: block;
+  background: var(--warn);
+}
+.stab[data-state='failed'] .stab-badge {
+  display: block;
+  background: var(--danger);
+}
+.stab[data-state='running'] .stab-badge {
+  display: block;
+  background: var(--accent);
+  animation: queue-pulse 1.4s var(--ease-in-out) infinite;
+}
+@media (prefers-reduced-motion: reduce) {
+  .stab[data-state='running'] .stab-badge {
+    animation: none;
+  }
+}
+/* the + session menu, inline after the last tab (Chrome's new-tab position) */
+.stabs .drop-btn {
+  -webkit-app-region: no-drag;
+  width: 26px;
+  height: 26px;
+  justify-content: center;
+  padding: 0;
+  margin-left: var(--sp-1);
+  flex-shrink: 0;
+  border-radius: var(--r-2);
+  border: 1px solid color-mix(in srgb, var(--border-faint) 58%, transparent);
+  background: color-mix(in srgb, var(--app-active-glass-tint) 18%, transparent);
+  color: var(--text-1);
+}
+.stabs .drop-btn:hover {
+  background: color-mix(in srgb, var(--app-active-glass-tint) 26%, transparent);
+  color: var(--text-0);
+}
+.stabs .drop-btn .drop-btn-icon {
+  color: inherit;
+}
+.stabs .drop-btn-label {
+  display: none;
+}
+/* the + is enough — no caret next to it */
+.stabs .drop-caret {
+  display: none;
 }
 /* ── pop-out window: one glass terminal card filling the window ──────────── */
 .pop-app {
@@ -981,7 +1125,9 @@
 }
 .wsrail .side-sessions {
   flex-shrink: 0;
-  padding-top: var(--sp-1); /* keep the first tab clear of the traffic lights */
+  /* no rail-head strip anymore (the + lives in the session tab strip) — the
+     list itself reserves the top breathing room */
+  padding-top: var(--sp-3);
 }
 .wsrail-files {
   flex: 1;

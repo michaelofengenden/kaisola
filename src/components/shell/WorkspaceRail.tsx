@@ -2,9 +2,8 @@ import { useCallback, useEffect, useRef, useState, type CSSProperties } from 're
 import { useKaisola, GROUP_COLORS } from '../../store/store'
 import { bridge, isDesktop, type FsEntry } from '../../lib/bridge'
 import { sessionHue, terminalAgentKey } from '../../lib/sessionHue'
-import { useAgentRegistry, agentName, openAgentSession, type RegistryAgent } from '../../lib/registry'
+import { useAgentRegistry, agentName, type RegistryAgent } from '../../lib/registry'
 import { Icon } from '../Icon'
-import { Dropdown } from '../Dropdown'
 import { fileIcon } from '../../lib/fileIcon'
 
 const urlHost = (u?: string) => {
@@ -16,16 +15,15 @@ const urlHost = (u?: string) => {
 }
 
 /**
- * The left rail card — what you're working WITH. Its top strip hosts the
- * native traffic lights (drag region) and the "+" session menu; then the
- * session tabs (agent threads + terminals + panels), then the workspace tree.
+ * The left rail card — what you're working WITH. The session list (agent
+ * threads + terminals + panels), then the workspace tree. New sessions are
+ * minted from the "+" at the end of the session tab strip above the cards.
  */
 export function WorkspaceRail() {
-  const { all, menu } = useAgentRegistry()
+  const { all } = useAgentRegistry()
 
   return (
     <aside className="wsrail">
-      <RailHead menu={menu} />
       <SessionsSection agents={all} />
       <AgentPulse />
       <OutlineSection />
@@ -146,58 +144,6 @@ function AgentPulse() {
       <span className="agent-pulse-dot" data-running={running} />
       <span className="grow truncate">{latest.text}</span>
     </button>
-  )
-}
-
-/** The card's top strip: the window-drag space + "new session". */
-function RailHead({ menu }: { menu: RegistryAgent[] }) {
-  const requestTerminal = useKaisola((s) => s.requestTerminal)
-  const openGitPanel = useKaisola((s) => s.openGitPanel)
-  const openBrowserPanel = useKaisola((s) => s.openBrowserPanel)
-  const setSettingsOpen = useKaisola((s) => s.setSettingsOpen)
-  const sessionTemplates = useKaisola((s) => s.sessionTemplates)
-  const openSessionTemplate = useKaisola((s) => s.openSessionTemplate)
-  const newWorktreeSession = useKaisola((s) => s.newWorktreeSession)
-  const openSession = (value: string) => {
-    if (value === 'terminal') { requestTerminal(); return }
-    if (value === 'git') { openGitPanel(); return }
-    if (value === 'browser') { openBrowserPanel(); return }
-    if (value === 'worktree') { void newWorktreeSession(); return }
-    if (value === 'registry') { setSettingsOpen(true, 'agents'); return }
-    if (value.startsWith('tpl:')) { openSessionTemplate(value.slice(4)); return }
-    const agent = menu.find((a) => a.id === value.slice('agent:'.length))
-    if (agent) openAgentSession(agent)
-  }
-  return (
-    <div
-      className="rail-head"
-      // native titlebar parity: double-clicking the drag strip zooms the window
-      onDoubleClick={(e) => {
-        if ((e.target as HTMLElement).closest('button')) return
-        bridge.winCtl('zoom')
-      }}
-    >
-      <span className="grow" />
-      <Dropdown
-        icon="Plus"
-        value=""
-        placeholder=""
-        options={[
-          // agents first (the user picks WHICH one — no silent default), then
-          // saved templates, the other session kinds, and the registry
-          ...menu.map((a) => ({ value: `agent:${a.id}`, name: a.name })),
-          ...sessionTemplates.map((t) => ({ value: `tpl:${t.id}`, name: `▸ ${t.name}` })),
-          { value: 'worktree', name: 'Agent in a worktree' },
-          { value: 'terminal', name: 'New terminal' },
-          { value: 'git', name: 'Git commit' },
-          { value: 'browser', name: 'Browser' },
-          { value: 'registry', name: 'Add agents…' },
-        ]}
-        onSelect={openSession}
-        title="New session"
-        align="left"
-      />
-    </div>
   )
 }
 

@@ -6,6 +6,7 @@ import { Terminal } from '../Terminal'
 import { Assistant } from '../Assistant'
 import { GitPanel } from './GitPanel'
 import { BrowserCard } from './BrowserCard'
+import { SessionTabs } from './SessionTabs'
 import { Icon } from '../Icon'
 
 const urlHost = (u?: string) => {
@@ -251,14 +252,16 @@ export function SessionCards() {
   }
 
   return (
-    <div
-      ref={gridRef}
-      className="session-grid"
-      style={{
-        gridTemplateColumns: weights.map((w) => `minmax(0, ${w}fr)`).join(' ') || 'minmax(0, 1fr)',
-        gridTemplateRows: `repeat(${rows}, minmax(0, 1fr))`,
-      }}
-    >
+    <div className="dock-col">
+      <SessionTabs />
+      <div
+        ref={gridRef}
+        className="session-grid"
+        style={{
+          gridTemplateColumns: weights.map((w) => `minmax(0, ${w}fr)`).join(' ') || 'minmax(0, 1fr)',
+          gridTemplateRows: `repeat(${rows}, minmax(0, 1fr))`,
+        }}
+      >
       {boundaries.map((frac, i) => (
         <div
           key={`colgrip-${i}`}
@@ -334,6 +337,7 @@ export function SessionCards() {
               hue: sessionHue({ agentKey: urlHost(p.url) ?? 'browser' }),
             })
       })}
+      </div>
     </div>
   )
 }

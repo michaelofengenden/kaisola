@@ -1,0 +1,248 @@
+/* ============================================================================
+   Pasola design tokens
+   Dark-first, minimal, one accent. Tuned for a Cursor / Linear / Raycast feel.
+   ========================================================================== */
+
+:root,
+:root[data-theme='dark'] {
+  /* — Background layers (deepest → highest) — */
+  --bg-0: #0a0b0d; /* app frame / behind everything */
+  --bg-1: #0e1014; /* main canvas */
+  --bg-2: #14161c; /* panels, rails */
+  --bg-3: #1a1d25; /* cards, inputs */
+  --bg-4: #21252f; /* hover / raised */
+  --bg-inset: #07080a; /* code blocks, wells */
+  --term-bg: #0b0d11; /* terminal/dock — a touch darker than the app surface */
+
+  /* — Surfaces & borders — */
+  --surface: #14161c;
+  --surface-hover: #1a1d25;
+  --border: #23262f;
+  --border-strong: #2f3340;
+  --border-faint: #1c1f26; /* visible at 1px on the dark canvas, still a whisper */
+
+  /* — Text tiers — */
+  --text-0: #f3f4f6; /* primary */
+  --text-1: #c4c8d2; /* secondary */
+  --text-2: #8b909d; /* muted / labels */
+  --text-3: #5a5f6b; /* faint / placeholder */
+  --text-on-accent: #ffffff;
+
+  /* — Accent (single olive — a touch stronger than the original) — */
+  --accent: #95a456;
+  --accent-hover: #a4b364;
+  --accent-press: #7e8c45;
+  --accent-soft: rgba(149, 164, 86, 0.17);
+  --accent-line: rgba(149, 164, 86, 0.42);
+  --accent-glow: rgba(149, 164, 86, 0.3);
+  --accent-grad-hi: color-mix(in oklch, var(--accent), white 22%); /* loader highlight band */
+
+  /* — Overlay (the ONE canonical row-hover wash) — */
+  --hover-overlay: rgba(255, 255, 255, 0.045);
+
+  /* — Semantic — */
+  --success: #54c08a;
+  --success-soft: rgba(84, 192, 138, 0.14);
+  --warn: #d8a44a;
+  --warn-soft: rgba(216, 164, 74, 0.14);
+  --danger: #e16a6a;
+  --danger-soft: rgba(225, 106, 106, 0.14);
+  --info: #5aa9e6;
+  --info-soft: rgba(90, 169, 230, 0.14);
+
+  /* — Trust scale (provenance is first-class, so trust has its own colors) — */
+  --trust-high: #54c08a;
+  --trust-high-soft: rgba(84, 192, 138, 0.13);
+  --trust-medium: #d8a44a;
+  --trust-medium-soft: rgba(216, 164, 74, 0.13);
+  --trust-low: #d77f4a;
+  --trust-low-soft: rgba(215, 127, 74, 0.13);
+  --trust-unsupported: #e16a6a;
+  --trust-unsupported-soft: rgba(225, 106, 106, 0.13);
+
+  /* — Agent identity tints (used sparingly in the activity feed) — */
+  --agent-literature: #5aa9e6;
+  --agent-novelty: #a88752;
+  --agent-hypothesis: #8a9658;
+  --agent-planning: #5ec5c0;
+  --agent-coding: #82b366;
+  --agent-execution: #d8a44a;
+  --agent-analysis: #e6915a;
+  --agent-writing: #e07aaa;
+  --agent-reviewer: #e16a6a;
+  --agent-citation: #54c08a;
+
+  /* — Code syntax palette (the embedded editor; resolves with the theme) — */
+  --cm-keyword: #b7a36b;
+  --cm-string: #8fce9b;
+  --cm-comment: #5a5f6b;
+  --cm-number: #e0a96d;
+  --cm-function: #6cb6f0;
+  --cm-variable: #c4c8d2;
+  --cm-type: #6cd0cb;
+  --cm-operator: #9aa0b0;
+  --cm-property: #9ecbf5;
+  --cm-tag: #e07aaa;
+  --cm-attr: #d8a44a;
+  --cm-punctuation: #8b909d;
+  --cm-link: var(--accent-hover);
+  --cm-heading: #9aa866;
+
+  /* — Typography — */
+  --font-ui: 'Inter', system-ui, -apple-system, 'Segoe UI', sans-serif;
+  --font-serif: 'Source Serif 4', Georgia, 'Times New Roman', serif;
+  --font-mono: 'JetBrains Mono', ui-monospace, 'SF Mono', Menlo, monospace;
+
+  --fs-9: 9px;
+  --fs-10: 10px;
+  --fs-11: 11px;
+  --fs-12: 12px;
+  --fs-13: 13px;
+  --fs-14: 14px;
+  --fs-15: 15px;
+  --fs-16: 16px;
+  --fs-18: 18px;
+  --fs-21: 21px;
+  --fs-24: 24px;
+  --fs-30: 30px;
+
+  --fw-regular: 400;
+  --fw-medium: 500;
+  --fw-semibold: 600;
+  --fw-bold: 700;
+
+  --lh-tight: 1.2;
+  --lh-snug: 1.4;
+  --lh-normal: 1.55;
+  --lh-relaxed: 1.7; /* manuscript reading */
+
+  --tracking-tight: -0.01em;
+  --tracking-wide: 0.02em;
+  --tracking-caps: 0.06em;
+
+  /* — Spacing scale (4px base) — */
+  --sp-0: 0;
+  --sp-1: 2px;
+  --sp-2: 4px;
+  --sp-3: 6px;
+  --sp-4: 8px;
+  --sp-5: 12px;
+  --sp-6: 16px;
+  --sp-7: 20px;
+  --sp-8: 24px;
+  --sp-9: 32px;
+  --sp-10: 40px;
+  --sp-11: 56px;
+  --sp-12: 72px;
+
+  /* — Radii (small controls stay crisp; window shells follow modern macOS) — */
+  --r-1: 5px;
+  --r-2: 7px;
+  --r-3: 10px;
+  --r-4: 12px;
+  --r-5: 16px;
+  --r-shell: 20px;
+  --r-window: 24px;
+  --r-full: 999px;
+
+  /* — Shadows (subtle; depth comes from layering, not heavy shadows) — */
+  --shadow-1: 0 1px 2px rgba(0, 0, 0, 0.3);
+  --shadow-2: 0 4px 12px rgba(0, 0, 0, 0.35);
+  --shadow-3: 0 12px 32px rgba(0, 0, 0, 0.45);
+  --shadow-pop: 0 16px 48px rgba(0, 0, 0, 0.55);
+  --ring-accent: 0 0 0 1px var(--accent-line), 0 0 0 4px var(--accent-soft);
+  /* a clean "pin-tailed" shine — ONE soft halo + a gentle outer bloom, no
+     stacked 1px lines (those doubled the border edge). The crisp edge is the
+     element's own 1px accent border. */
+  --ring-glow: 0 0 0 3px var(--accent-soft), 0 6px 22px -8px var(--accent-glow);
+
+  /* — Motion — */
+  --ease-out: cubic-bezier(0.16, 1, 0.3, 1);
+  --ease-in-out: cubic-bezier(0.65, 0, 0.35, 1);
+  --dur-1: 90ms;
+  --dur-2: 140ms;
+  --dur-3: 220ms;
+  --dur-4: 380ms;
+
+  /* — Layout — */
+  --rail-w: 60px;
+  --wsrail-w: 232px; /* left workspace rail: sessions + file tree */
+  --sidebar-w: 264px;
+  --inspector-w: 340px;
+
+  /* — Z-index — */
+  --z-base: 1;
+  --z-sticky: 50;
+  --z-rail: 100;
+  --z-inspector: 110;
+  --z-popover: 500;
+  --z-palette: 800;
+  --z-toast: 900;
+}
+
+:root[data-theme='light'] {
+  --bg-0: #f4f5f7;
+  --bg-1: #ffffff; /* pure white canvas, Codex/ChatGPT-style */
+  --bg-2: #f6f6f8;
+  --bg-3: #ffffff;
+  --bg-4: #ececef;
+  --bg-inset: #f4f4f6;
+  --term-bg: #e9ebef; /* terminal/dock — a touch darker than the light app surface */
+
+  --surface: #ffffff;
+  --surface-hover: #f5f5f6;
+  --border: #e4e6eb;
+  --border-strong: #d3d6dd;
+  --border-faint: #ededf0;
+
+  --text-0: #16181d;
+  --text-1: #3b3f48;
+  --text-2: #6b7080;
+  --text-3: #808896;
+  --text-on-accent: #ffffff;
+
+  --accent: #5e7030;
+  --accent-hover: #526329;
+  --accent-press: #475724;
+  --accent-soft: rgba(94, 112, 48, 0.13);
+  --accent-line: rgba(94, 112, 48, 0.4);
+  --accent-glow: rgba(94, 112, 48, 0.26);
+  --accent-grad-hi: color-mix(in oklch, var(--accent), white 18%);
+
+  --hover-overlay: rgba(16, 18, 22, 0.04);
+
+  --success: #2f9e6b;
+  --warn: #b9842a;
+  --danger: #cf4f4f;
+  --info: #2f86c9;
+
+  --trust-high: #2f9e6b;
+  --trust-high-soft: rgba(47, 158, 107, 0.12);
+  --trust-medium: #b9842a;
+  --trust-medium-soft: rgba(185, 132, 42, 0.12);
+  --trust-low: #c46a2a;
+  --trust-low-soft: rgba(196, 106, 42, 0.12);
+  --trust-unsupported: #cf4f4f;
+  --trust-unsupported-soft: rgba(207, 79, 79, 0.12);
+
+  /* — Code syntax palette (light) — */
+  --cm-keyword: #8a713a;
+  --cm-string: #1f8a55;
+  --cm-comment: #9aa0ad;
+  --cm-number: #b9842a;
+  --cm-function: #2f6fce;
+  --cm-variable: #3b3f48;
+  --cm-type: #1d8b86;
+  --cm-operator: #6b7080;
+  --cm-property: #2f6fce;
+  --cm-tag: #c2417f;
+  --cm-attr: #b9842a;
+  --cm-punctuation: #6b7080;
+  --cm-link: var(--accent);
+  --cm-heading: #596735;
+
+  --shadow-1: 0 1px 2px rgba(16, 18, 22, 0.06);
+  --shadow-2: 0 4px 12px rgba(16, 18, 22, 0.08);
+  --shadow-3: 0 12px 32px rgba(16, 18, 22, 0.12);
+  --shadow-pop: 0 16px 48px rgba(16, 18, 22, 0.16);
+}

@@ -1,0 +1,468 @@
+/* ============================================================================
+   Shared component classes. View-specific styles live next to their views.
+   ========================================================================== */
+
+/* ── Buttons ────────────────────────────────────────────────────────────── */
+.btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: var(--sp-3);
+  height: 30px;
+  padding: 0 var(--sp-5);
+  border-radius: var(--r-2);
+  font-size: var(--fs-13);
+  font-weight: var(--fw-medium);
+  color: var(--text-1);
+  background: var(--bg-3);
+  border: 1px solid var(--border);
+  white-space: nowrap;
+  transition: background var(--dur-1) var(--ease-out),
+    border-color var(--dur-1) var(--ease-out), color var(--dur-1) var(--ease-out),
+    transform var(--dur-1) var(--ease-out);
+}
+.btn:hover {
+  background: var(--bg-4);
+  border-color: var(--border-strong);
+  color: var(--text-0);
+}
+.btn:active {
+  transform: translateY(0.5px);
+}
+.btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+.btn svg {
+  width: 14px;
+  height: 14px;
+}
+
+.btn-primary {
+  background: var(--accent);
+  border-color: transparent;
+  color: var(--text-on-accent);
+  box-shadow: var(--shadow-1), 0 0 0 0 var(--accent-glow);
+}
+.btn-primary:hover {
+  background: var(--accent-hover);
+  color: var(--text-on-accent);
+  box-shadow: var(--shadow-2), 0 0 16px -2px var(--accent-glow);
+}
+.btn-ghost {
+  background: transparent;
+  border-color: transparent;
+}
+.btn-ghost:hover {
+  background: var(--bg-3);
+  border-color: transparent;
+}
+.btn-danger {
+  color: var(--danger);
+  border-color: transparent;
+  background: transparent;
+}
+.btn-danger:hover {
+  background: var(--danger-soft);
+  color: var(--danger);
+  border-color: transparent;
+}
+.btn-success {
+  color: var(--success);
+}
+.btn-sm {
+  height: 24px;
+  padding: 0 var(--sp-4);
+  font-size: var(--fs-12);
+}
+.btn-icon {
+  width: 32px;
+  height: 32px;
+  padding: 0;
+  border-radius: var(--r-2);
+  color: var(--text-2);
+  transition: color var(--dur-1) var(--ease-out), background var(--dur-1) var(--ease-out);
+}
+.btn-icon:hover {
+  color: var(--text-0);
+  background: var(--bg-3);
+}
+.btn-icon[data-active='true'] {
+  color: var(--text-0);
+  background: var(--bg-3);
+  box-shadow: inset 0 0 0 1px var(--border);
+}
+
+/* ── Chips / facet toggles ──────────────────────────────────────────────── */
+.chip {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--sp-2);
+  height: 24px;
+  padding: 0 var(--sp-4);
+  border-radius: var(--r-full);
+  font-size: var(--fs-12);
+  font-weight: var(--fw-medium);
+  color: var(--text-2);
+  background: var(--bg-3);
+  border: 1px solid var(--border);
+  transition: all var(--dur-1) var(--ease-out);
+}
+.chip:hover {
+  color: var(--text-0);
+  border-color: var(--border-strong);
+}
+.chip.active {
+  color: var(--accent);
+  background: var(--accent-soft);
+  border-color: var(--accent-line);
+}
+.chip .count {
+  font-size: var(--fs-11);
+  color: var(--text-3);
+}
+
+/* ── Badges ─────────────────────────────────────────────────────────────── */
+.badge {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--sp-2);
+  height: 19px;
+  padding: 0 var(--sp-3);
+  border-radius: var(--r-1);
+  font-size: var(--fs-11);
+  font-weight: var(--fw-semibold);
+  letter-spacing: var(--tracking-wide);
+  color: var(--text-2);
+  background: var(--bg-3);
+  border: 1px solid var(--border);
+  white-space: nowrap;
+}
+.badge-dot::before {
+  content: '';
+  width: 6px;
+  height: 6px;
+  border-radius: var(--r-full);
+  background: currentColor;
+}
+
+/* ── Trust badges (provenance is first-class) ───────────────────────────── */
+.trust {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--sp-2);
+  height: 19px;
+  padding: 0 var(--sp-3);
+  border-radius: var(--r-1);
+  font-size: var(--fs-11);
+  font-weight: var(--fw-semibold);
+  border: 1px solid transparent;
+}
+.trust::before {
+  content: '';
+  width: 6px;
+  height: 6px;
+  border-radius: var(--r-full);
+  background: currentColor;
+}
+.trust-high {
+  color: var(--trust-high);
+  background: var(--trust-high-soft);
+}
+.trust-medium {
+  color: var(--trust-medium);
+  background: var(--trust-medium-soft);
+}
+.trust-low {
+  color: var(--trust-low);
+  background: var(--trust-low-soft);
+}
+.trust-unsupported {
+  color: var(--trust-unsupported);
+  background: var(--trust-unsupported-soft);
+}
+
+/* ── Cards ──────────────────────────────────────────────────────────────── */
+.card {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--r-4);
+  transition: border-color var(--dur-2) var(--ease-out),
+    background var(--dur-2) var(--ease-out), transform var(--dur-2) var(--ease-out);
+}
+.card-hover:hover {
+  border-color: var(--border-strong);
+  background: var(--surface-hover);
+}
+
+/* ── Inputs ─────────────────────────────────────────────────────────────── */
+.input {
+  height: 30px;
+  padding: 0 var(--sp-5);
+  border-radius: var(--r-2);
+  background: var(--bg-3);
+  border: 1px solid var(--border);
+  color: var(--text-0);
+  font-size: var(--fs-13);
+  transition: border-color var(--dur-1) var(--ease-out);
+}
+.input::placeholder {
+  color: var(--text-3);
+}
+.input:focus {
+  border-color: var(--accent-line);
+  box-shadow: var(--ring-accent);
+}
+
+/* ── Keyboard hint ──────────────────────────────────────────────────────── */
+kbd,
+.kbd {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 18px;
+  height: 18px;
+  padding: 0 var(--sp-2);
+  font-family: var(--font-ui);
+  font-size: var(--fs-11);
+  font-weight: var(--fw-medium);
+  color: var(--text-2);
+  background: var(--bg-3);
+  border: 1px solid var(--border);
+  border-bottom-width: 2px;
+  border-radius: var(--r-1);
+}
+
+/* ── Risk meter (novelty / feasibility dots) ────────────────────────────── */
+.riskmeter {
+  display: inline-flex;
+  gap: 3px;
+  align-items: center;
+}
+.riskmeter .pip {
+  width: 6px;
+  height: 6px;
+  border-radius: var(--r-full);
+  background: var(--border-strong);
+}
+.riskmeter .pip.on {
+  background: var(--accent);
+}
+.riskmeter.warn .pip.on {
+  background: var(--warn);
+}
+.riskmeter.danger .pip.on {
+  background: var(--danger);
+}
+
+/* ── Section title bar ──────────────────────────────────────────────────── */
+.section-title .sub {
+  font-size: var(--fs-12);
+  font-weight: var(--fw-regular);
+  color: var(--text-2);
+}
+
+/* ── Empty state ────────────────────────────────────────────────────────── */
+.empty {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: var(--sp-5);
+  padding: var(--sp-12) var(--sp-8);
+  text-align: center;
+  color: var(--text-2);
+}
+.empty svg {
+  width: 28px;
+  height: 28px;
+  color: var(--text-3);
+}
+
+/* ── Divider ────────────────────────────────────────────────────────────── */
+.hr {
+  height: 1px;
+  background: var(--border-faint);
+  border: 0;
+}
+
+/* ── Skeleton shimmer ───────────────────────────────────────────────────── */
+.skeleton {
+  background: linear-gradient(
+    90deg,
+    var(--bg-3) 25%,
+    var(--bg-4) 37%,
+    var(--bg-3) 63%
+  );
+  background-size: 200% 100%;
+  animation: shimmer 1.4s ease-in-out infinite;
+  border-radius: var(--r-2);
+}
+
+/* ── Conic border-beam — "this agent is working right now" ──────────────────
+   A single crisp 1px accent ring that sweeps around a running row. The accent
+   earns its keep here: it's the one place we signal the machine is thinking. */
+.agent-row.is-running,
+.msg.is-running {
+  position: relative;
+  isolation: isolate;
+}
+.agent-row.is-running::before,
+.msg.is-running::before {
+  content: '';
+  position: absolute;
+  inset: 0;
+  z-index: -1;
+  border-radius: var(--r-2);
+  padding: 1px;
+  background: conic-gradient(
+    from var(--beam-angle),
+    transparent 0deg,
+    transparent 280deg,
+    var(--accent) 330deg,
+    var(--accent-grad-hi) 348deg,
+    transparent 360deg
+  );
+  -webkit-mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0);
+  -webkit-mask-composite: xor;
+  mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0);
+  mask-composite: exclude;
+  animation: beam-spin 4.5s linear infinite;
+}
+
+/* ── Indeterminate top load bar — app-wide "something is working" ─────────── */
+.top-progress {
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: 2px;
+  overflow: hidden;
+  z-index: var(--z-sticky);
+  pointer-events: none;
+}
+.top-progress::before {
+  content: '';
+  position: absolute;
+  inset: 0;
+  width: 45%;
+  border-radius: 2px;
+  background: linear-gradient(90deg, transparent, var(--accent), var(--accent-grad-hi), transparent);
+  box-shadow: 0 0 10px 1px var(--accent-glow);
+  transform-origin: left center;
+  animation: top-progress 1.8s var(--ease-in-out) infinite;
+}
+@media (prefers-reduced-motion: reduce) {
+  .top-progress::before {
+    width: 100%;
+    box-shadow: none;
+    opacity: 0.6;
+    background: var(--accent);
+  }
+}
+
+/* ── Gradient-text shimmer — the calm "Thinking…" breath ────────────────── */
+.shimmer-text {
+  background: linear-gradient(100deg, var(--text-3) 35%, var(--accent-grad-hi) 50%, var(--text-3) 65%);
+  background-size: 200% 100%;
+  -webkit-background-clip: text;
+  background-clip: text;
+  -webkit-text-fill-color: transparent;
+  color: transparent;
+  animation: shimmer 2.2s linear infinite;
+}
+@media (prefers-reduced-motion: reduce) {
+  .shimmer-text {
+    color: var(--text-2);
+    -webkit-text-fill-color: var(--text-2);
+  }
+}
+
+/* ── Aurora wash — one ambient, slow gradient behind a "loading" moment ──── */
+.aurora { position: relative; overflow: hidden; }
+.aurora > * { position: relative; z-index: 1; }
+.aurora::before {
+  content: '';
+  position: absolute;
+  inset: -25%;
+  background:
+    radial-gradient(42% 42% at 28% 32%, color-mix(in oklch, var(--accent), transparent 45%), transparent 60%),
+    radial-gradient(44% 40% at 72% 74%, color-mix(in oklch, var(--accent) 72%, var(--info)), transparent 62%);
+  filter: blur(64px) saturate(1.05);
+  opacity: 0.4;
+  background-size: 200% 200%;
+  animation: aurora-drift 22s var(--ease-in-out) infinite alternate;
+}
+
+/* ── Toaster — ephemeral event notifications (bottom-right, calm) ─────────── */
+.toaster {
+  position: fixed;
+  /* clear the composer foot when the dock sits on the right */
+  bottom: calc(var(--sp-6) + 48px);
+  right: var(--sp-6);
+  z-index: var(--z-toast);
+  display: flex;
+  flex-direction: column-reverse;
+  gap: var(--sp-2);
+  pointer-events: none;
+  width: 320px;
+  max-width: calc(100vw - var(--sp-9));
+  -webkit-app-region: no-drag;
+}
+.toast {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  min-height: 34px;
+  max-height: 64px;
+  padding: var(--sp-2) var(--sp-2) var(--sp-2) 0;
+  border-radius: var(--r-3);
+  background: var(--bg-3);
+  border: 1px solid var(--border);
+  box-shadow: var(--shadow-2);
+  overflow: hidden;
+  pointer-events: all;
+  animation: toast-in var(--dur-3) var(--ease-out);
+  -webkit-app-region: no-drag;
+}
+.toast * {
+  -webkit-app-region: no-drag;
+}
+.toast-accent {
+  width: 3px;
+  align-self: stretch;
+  flex-shrink: 0;
+  border-radius: var(--r-full) 0 0 var(--r-full);
+}
+.toast[data-kind='success'] .toast-accent { background: var(--success); }
+.toast[data-kind='info'] .toast-accent { background: var(--accent); }
+.toast[data-kind='warn'] .toast-accent { background: var(--warn); }
+.toast[data-kind='error'] .toast-accent { background: var(--danger); }
+.toast-text {
+  flex: 1;
+  min-width: 0;
+  font-size: var(--fs-12);
+  color: var(--text-1);
+  line-height: var(--lh-snug);
+  /* wrap to at most 2 lines instead of truncating workflow names mid-word */
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+  padding-left: var(--sp-2);
+}
+.toast-dismiss {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+  height: 20px;
+  flex-shrink: 0;
+  border-radius: var(--r-2);
+  color: var(--text-3);
+}
+.toast-dismiss:hover { color: var(--text-0); background: var(--bg-4); }
+@keyframes toast-in {
+  from { opacity: 0; transform: translateX(12px); }
+  to { opacity: 1; transform: translateX(0); }
+}

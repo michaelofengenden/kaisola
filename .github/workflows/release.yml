@@ -1,0 +1,29 @@
+# Build + publish a macOS release whenever a v* tag is pushed.
+#   git tag v0.2.0 && git push origin v0.2.0
+name: release
+on:
+  push:
+    tags: ['v*']
+permissions:
+  contents: write
+jobs:
+  mac:
+    runs-on: macos-14 # Apple Silicon
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run dist
+        env:
+          # unsigned build (identity: null in package.json); Gatekeeper
+          # instructions live in the README
+          CSC_IDENTITY_AUTO_DISCOVERY: 'false'
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            release/*.dmg
+            release/*.zip
+          generate_release_notes: true

@@ -1,0 +1,1512 @@
+/* ============================================================================
+   Shell — calm, bare, content-forward. Left agent sidebar · dominant canvas.
+   Tuned to feel like Obsidian / Zed / Codex: minimal chrome, few borders,
+   generous space, one quiet accent.
+   ========================================================================== */
+
+/* The shell is a quiet tinted field; the rail, main page and sidebar float on
+   it as rounded cards (Codex-style) reaching the very top — no chrome rows.
+   The traffic lights live in the rail card, the tool cluster in the sidebar. */
+.app {
+  --app-active-glass-tint: #fffefd;
+  /* lift percentages are tuned to replace the old post-blur brightness(1.34),
+     which stretched the blur's 8-bit steps into visible bands in light theme */
+  --app-active-glass-lift-top: 45%;
+  --app-active-glass-lift-bottom: 30%;
+  --app-active-glass-blur: 1600px; /* radius > window width: the backdrop averages to a near-uniform color wash */
+  --side-veil-alpha: 0%;
+  --content-glass-alpha: 90%;
+  /* session cards (terminals + agents) are the true glass surfaces: a light
+     ink wash + DEEP blur + strong saturation. The blur is the readability
+     workhorse — it flattens busy/colorful wallpapers into a smooth tinted
+     glow so 12px terminal glyphs keep their edges; saturation is what keeps
+     it reading as glass. The reading canvas stays denser. */
+  --session-glass-alpha: 58%;
+  --session-glass-blur: 340px;
+  --session-glass-saturate: 1.5;
+  --content-glass-blur: 170px;
+  display: grid;
+  grid-template-rows: var(--tabstrip-h) 1fr; /* row 1: project tab strip · row 2: app body */
+  height: 100vh;
+  background: transparent;
+  position: relative; /* anchors the .top-progress beam + floating tools */
+  isolation: isolate;
+  /* the frameless window's base drag surface (design: drag-everywhere, no-drag
+     opt-outs on every interactive island). CAREFUL: the draggable region is
+     built in order — any no-drag island (e.g. .float-tools) must come AFTER
+     every overlapping drag container in the DOM or its clickable hole gets
+     paved over by the later drag rect (real clicks then drag the window). */
+  -webkit-app-region: drag;
+}
+.app::before {
+  content: '';
+  position: absolute;
+  inset: 0;
+  /* -1 keeps the glass BELOW every child inside .app's isolated context on its
+     own — never position the children to lift them above it: a `.app > *
+     { position: relative }` rule silently overrode overlays' position:fixed
+     (the Toaster flowed to the bottom-left corner and clipped offscreen) */
+  z-index: -1;
+  pointer-events: none;
+  background:
+    linear-gradient(
+      180deg,
+      color-mix(in srgb, var(--app-active-glass-tint) var(--app-active-glass-lift-top), transparent),
+      color-mix(in srgb, var(--app-active-glass-tint) var(--app-active-glass-lift-bottom), transparent)
+    );
+  /* NO brightness() here: a >1 multiplier after the blur amplifies its 8-bit
+     quantization into ~176px horizontal bands (visible on empty light chrome).
+     The lift lives in the pre-blur gradient tint above instead. */
+  backdrop-filter: blur(var(--app-active-glass-blur)) saturate(1.5);
+  -webkit-backdrop-filter: blur(var(--app-active-glass-blur)) saturate(1.5);
+}
+/* Dark theme: the glass field must DARKEN what it samples, never lift it —
+   the light-tuned white tint + brightness() left the transparent rail nearly
+   unreadable. The native vibrancy material itself follows the app theme too
+   (main syncs nativeTheme.themeSource); this layer does the rest. */
+:root[data-theme='dark'] .app {
+  --app-active-glass-tint: #0b0d12;
+  /* 2.5x would pass 100% (a solid wall) — clamped just under so color still breathes */
+  --app-active-glass-lift-top: 90%;
+  --app-active-glass-lift-bottom: 80%;
+  /* dark text-on-glass needs a bit more ink under 12px terminal type */
+  --session-glass-alpha: 64%;
+}
+:root[data-theme='dark'] .app::before {
+  backdrop-filter: blur(var(--app-active-glass-blur)) saturate(1.3) brightness(0.88);
+  -webkit-backdrop-filter: blur(var(--app-active-glass-blur)) saturate(1.3) brightness(0.88);
+}
+/* Deliberately NO data-winfocus overrides on any surface: the shell looks
+   identical when the window is inactive (main keeps the native material
+   sampling via visualEffectState 'active'); only the traffic lights gray. */
+
+/* ── Project tabs — a browser-style strip at the true window top ─────────── */
+/* One grid row above the whole app, in front of the glass backdrop. Its height
+   token also re-anchors the absolutely-positioned overlays below. The strip is
+   the desktop main window only: `data-shell` already gates the desktop chrome
+   (global.css:33), so on web the token drops to 0 and the row collapses (the
+   element isn't rendered there either). No `data-tabs` variant is needed. */
+:root { --tabstrip-h: 40px; }
+:root[data-shell='desktop'][data-fullscreen='true'] { --tabstrip-h: 30px; }
+:root:not([data-shell='desktop']) { --tabstrip-h: 0px; }
+
+.tabstrip {
+  display: flex;
+  align-items: stretch;
+  height: var(--tabstrip-h);
+  gap: 2px;
+  padding: 0 var(--sp-3);
+  -webkit-app-region: drag;
+  border-bottom: 1px solid var(--border-faint);
+  background: color-mix(in srgb, var(--bg-2) 22%, transparent);
+}
+/* everything interactive in the strip opts out of the window-drag region */
+.tabstrip .lights,
+.tabstrip-track,
+.ptab,
+.ptab-close,
+.tabstrip button {
+  -webkit-app-region: no-drag;
+}
+.tabstrip-track {
+  display: flex;
+  align-items: stretch;
+  gap: 2px;
+  min-width: 0;
+  overflow-x: auto;
+  scrollbar-width: none;
+}
+/* scroll-cue fades — applied per edge ONLY while tabs hide past it (the JS
+   sync sets data-fade-l/r); a static mask would eat the outermost tab border */
+.tabstrip-track[data-fade-l='true'] {
+  mask-image: linear-gradient(90deg, transparent 0, #000 14px, #000 100%);
+  -webkit-mask-image: linear-gradient(90deg, transparent 0, #000 14px, #000 100%);
+}
+.tabstrip-track[data-fade-r='true'] {
+  mask-image: linear-gradient(90deg, #000 0, #000 calc(100% - 14px), transparent 100%);
+  -webkit-mask-image: linear-gradient(90deg, #000 0, #000 calc(100% - 14px), transparent 100%);
+}
+.tabstrip-track[data-fade-l='true'][data-fade-r='true'] {
+  mask-image: linear-gradient(90deg, transparent 0, #000 14px, #000 calc(100% - 14px), transparent 100%);
+  -webkit-mask-image: linear-gradient(90deg, transparent 0, #000 14px, #000 calc(100% - 14px), transparent 100%);
+}
+.tabstrip-track::-webkit-scrollbar {
+  display: none;
+}
+/* the + split control (Chrome's): a plain new-tab button beside the chevron
+   menu — centered as a unit, not stretched to the strip edge */
+.tabstrip-new {
+  display: flex;
+  align-items: center;
+  align-self: center;
+  margin-left: var(--sp-1);
+}
+.tabstrip-new-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 26px;
+  height: 26px;
+  border: none;
+  border-radius: var(--r-2);
+  background: transparent;
+  color: var(--text-2);
+  cursor: pointer;
+}
+.tabstrip-new-btn:hover {
+  background: var(--hover-overlay);
+  color: var(--text-0);
+}
+/* the leftover strip space is a drag handle (double-click zooms, wired in JS) */
+.tabstrip-fill {
+  flex: 1 1 auto;
+  -webkit-app-region: drag;
+}
+
+/* a tab: sits at flex-basis 200px, shrinks to 54px, then the track scrolls */
+.ptab {
+  flex: 0 1 auto;
+  width: 200px; /* intrinsic (not flex-basis): the track measures max-content */
+  min-width: 54px;
+  max-width: 220px;
+  display: flex;
+  align-items: center;
+  gap: var(--sp-3);
+  height: calc(var(--tabstrip-h) - 8px);
+  margin: 4px 0;
+  padding: 0 var(--sp-4);
+  border-radius: var(--r-2);
+  /* a real border slot on every state — transparent when idle so nothing
+     shifts, visible on hover/active so tabs read clearly against the glass */
+  border: 1px solid transparent;
+  color: var(--text-2);
+  font-size: var(--fs-12);
+  font-weight: var(--fw-medium);
+  position: relative;
+  transition: background var(--dur-2) var(--ease-out), color var(--dur-2) var(--ease-out),
+    border-color var(--dur-2) var(--ease-out), transform 160ms var(--ease-out);
+}
+.ptab:hover {
+  background: var(--hover-overlay);
+  color: var(--text-1);
+  border-color: var(--border-faint);
+}
+.ptab[data-active='true'] {
+  background: color-mix(in srgb, var(--bg-1) 94%, transparent);
+  color: var(--text-0);
+  border-color: var(--border-strong);
+  box-shadow: var(--shadow-1);
+}
+/* the 2px identity line at the top of the active tab — its folder hue */
+.ptab[data-active='true']::before {
+  content: '';
+  position: absolute;
+  inset-inline: var(--sp-4);
+  top: 0;
+  height: 2px;
+  border-radius: 2px;
+  background: color-mix(in srgb, var(--ptab-hue, var(--accent)) 70%, transparent);
+}
+.ptab-icon {
+  flex-shrink: 0;
+  color: color-mix(in srgb, var(--ptab-hue, var(--accent)) 62%, var(--text-2));
+}
+.ptab[data-active='true'] .ptab-icon {
+  color: var(--ptab-hue, var(--accent));
+}
+.ptab-label {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+/* a folder that no longer exists on disk reads as struck-through */
+.ptab[data-missing='true'] .ptab-label {
+  text-decoration: line-through;
+  color: var(--text-3);
+}
+/* the close affordance is hidden until the tab is hovered or active */
+.ptab-close {
+  display: inline-flex;
+  align-items: center;
+  flex-shrink: 0;
+  padding: 0;
+  color: var(--text-3);
+  opacity: 0;
+  transition: opacity var(--dur-1) var(--ease-out), color var(--dur-1) var(--ease-out);
+}
+.ptab:hover .ptab-close,
+.ptab[data-active='true'] .ptab-close {
+  opacity: 1;
+}
+.ptab-close:hover {
+  color: var(--text-0);
+}
+
+/* background-activity badge, in precedence order: needs-you > failed > running */
+.ptab-badge {
+  width: 7px;
+  height: 7px;
+  border-radius: var(--r-full);
+  flex-shrink: 0;
+  display: none;
+}
+.ptab[data-state='needs-you'] .ptab-badge {
+  display: block;
+  background: var(--warn);
+}
+.ptab[data-state='failed'] .ptab-badge {
+  display: block;
+  background: var(--danger);
+}
+.ptab[data-state='running'] .ptab-badge {
+  display: block;
+  background: var(--accent);
+  animation: queue-pulse 1.4s var(--ease-in-out) infinite; /* the app's running pulse */
+}
+@media (prefers-reduced-motion: reduce) {
+  .ptab[data-state='running'] .ptab-badge {
+    animation: none;
+  }
+}
+
+/* traffic lights ride at the strip's left — reuse the shared .lights/.light
+   rules (below), just re-centered for the shorter strip. Fullscreen hides them
+   via the existing [data-fullscreen] .lights rule (higher specificity wins). */
+.tabstrip .lights {
+  align-self: center;
+  margin-top: 0;
+  padding: 0 var(--sp-3) 0 var(--sp-2);
+}
+
+/* the strip pushes the two absolutely-positioned overlays down by its height.
+   .top-progress lives in components.css (imported before this file), so this
+   later same-specificity rule wins on `top`; .app-body is grid row 2 already. */
+.top-progress {
+  top: var(--tabstrip-h);
+}
+
+/* ── Project launcher — the empty-tab canvas: recents + open folder ──────── */
+.plaunch {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: var(--sp-8);
+  overflow-y: auto;
+}
+.plaunch-panel {
+  width: min(520px, 100%);
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-5);
+  text-align: center;
+}
+.plaunch-title {
+  font-size: var(--fs-18);
+  font-weight: var(--fw-semibold);
+  color: var(--text-0);
+}
+.plaunch-sub {
+  margin-top: calc(-1 * var(--sp-3));
+  font-size: var(--fs-13);
+  color: var(--text-2);
+}
+.plaunch-open {
+  align-self: center;
+  display: inline-flex;
+  align-items: center;
+  gap: var(--sp-2);
+  height: 34px;
+  padding: 0 var(--sp-6);
+  border-radius: var(--r-3);
+  background: var(--accent);
+  color: var(--text-on-accent);
+  font-size: var(--fs-13);
+  font-weight: var(--fw-medium);
+  transition: background var(--dur-2) var(--ease-out);
+}
+.plaunch-open:hover {
+  background: var(--accent-hover);
+}
+.plaunch-open:active {
+  background: var(--accent-press);
+}
+/* recents: a compact grid of folder buttons */
+.plaunch-recents {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
+  gap: var(--sp-3);
+  text-align: left;
+}
+.plaunch-recent {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-3);
+  min-width: 0;
+  padding: var(--sp-3) var(--sp-4);
+  border-radius: var(--r-3);
+  border: 1px solid var(--border-faint);
+  background: color-mix(in srgb, var(--bg-2) 40%, transparent);
+  color: var(--text-1);
+  text-align: left;
+  transition: background var(--dur-2) var(--ease-out), border-color var(--dur-2) var(--ease-out),
+    color var(--dur-2) var(--ease-out);
+}
+.plaunch-recent:hover {
+  background: var(--hover-overlay);
+  border-color: var(--border-strong);
+  color: var(--text-0);
+}
+.plaunch-recent-icon {
+  flex-shrink: 0;
+  color: var(--text-3);
+}
+.plaunch-recent-body {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  min-width: 0;
+}
+.plaunch-recent-name {
+  font-size: var(--fs-13);
+  font-weight: var(--fw-medium);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.plaunch-recent-path {
+  font-size: var(--fs-11);
+  color: var(--text-3);
+  font-family: var(--font-mono);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+/* faint drop hint — a dashed well that brightens while a folder drags over it */
+.plaunch-drop {
+  padding: var(--sp-6);
+  border: 1px dashed var(--border-strong);
+  border-radius: var(--r-4);
+  color: var(--text-3);
+  font-size: var(--fs-12);
+  transition: border-color var(--dur-2) var(--ease-out), background var(--dur-2) var(--ease-out),
+    color var(--dur-2) var(--ease-out);
+}
+.plaunch-drop[data-over='true'] {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+  color: var(--text-1);
+}
+
+.app-body {
+  /* workspace rail (sessions + files) · canvas+dock · agent sidebar */
+  grid-row: 2; /* always the content row — the tab strip owns row 1 (0px on web, so it collapses) */
+  display: grid;
+  grid-template-columns: var(--wsrail-w) var(--sidebar-w) 1fr;
+  gap: var(--sp-4);
+  padding: var(--sp-4);
+  min-height: 0;
+  position: relative;
+  -webkit-app-region: drag;
+}
+/* the floating surfaces — side rails get a frosted macOS-style wash, while
+   content surfaces stay denser for document/code readability. */
+.wsrail,
+.sidebar {
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: var(--r-shell);
+  box-shadow: none;
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
+  overflow: hidden;
+  position: relative;
+  isolation: isolate;
+  -webkit-app-region: drag;
+}
+.wsrail::before,
+.sidebar::before {
+  content: '';
+  position: absolute;
+  inset: 0;
+  z-index: 0;
+  pointer-events: none;
+  display: none;
+}
+.wsrail > *,
+.sidebar > * {
+  position: relative;
+  z-index: 1;
+  -webkit-app-region: no-drag;
+}
+.session-card,
+.canvas-wrap > .canvas {
+  background: color-mix(in srgb, var(--bg-1) var(--content-glass-alpha), transparent);
+  border: 1px solid var(--border);
+  border-radius: var(--r-shell);
+  box-shadow: var(--shadow-1);
+  backdrop-filter: blur(var(--content-glass-blur)) saturate(1.04);
+  -webkit-backdrop-filter: blur(var(--content-glass-blur)) saturate(1.04);
+  overflow: hidden;
+  position: relative;
+  -webkit-app-region: drag;
+}
+.session-card > *,
+.canvas-wrap > .canvas > * {
+  -webkit-app-region: no-drag;
+}
+/* the sidebar can hang on either edge — 'right' flips the grid and its border */
+.app-body[data-sidebar-side='right'] {
+  grid-template-columns: var(--wsrail-w) 1fr var(--sidebar-w);
+}
+.app-body[data-sidebar-side='right'] > .sidebar {
+  order: 2;
+}
+.app-body[data-sidebar-side='right'] .sidebar-resize {
+  margin-right: -3px;
+}
+.app[data-sidebar='false'] .app-body {
+  grid-template-columns: var(--wsrail-w) 1fr;
+}
+.app-body[data-layout='focus'] {
+  grid-template-columns: var(--sidebar-w) minmax(0, 1fr);
+}
+.app-body[data-layout='focus'][data-sidebar-side='right'] {
+  grid-template-columns: minmax(0, 1fr) var(--sidebar-w);
+}
+.app[data-sidebar='false'] .app-body[data-layout='focus'] {
+  grid-template-columns: minmax(0, 1fr);
+}
+.app-body[data-layout='focus'] .work-row,
+.app-body[data-layout='focus'] .canvas-wrap {
+  min-width: 0;
+}
+.app-body[data-layout='focus'] .canvas-wrap {
+  flex: 1 1 auto;
+  order: 0;
+}
+/* drag handle on the sidebar's right edge — resize the left agent sidebar */
+.sidebar-resize {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  width: 6px;
+  margin-left: -3px;
+  cursor: ew-resize;
+  z-index: 6;
+  -webkit-app-region: no-drag;
+}
+.sidebar-resize:hover {
+  background: var(--accent-soft);
+}
+
+/* ── Top bar ─────────────────────────────────────────────────────────────── */
+/* ── Card top strips (drag regions; no separate title bar exists) ────────── */
+/* rail card: our traffic lights on the left, "+ new session" on the right.
+   Tall enough that the session tabs below sit clear of the close button. */
+.rail-head {
+  display: flex;
+  align-items: center;
+  /* lights live in the tab strip now — this row is just the + session menu, so
+     it hugs the session list instead of floating in its own tall band */
+  height: 30px;
+  padding: 2px var(--sp-2) 0 10px;
+  flex-shrink: 0;
+  -webkit-app-region: drag;
+}
+:root[data-shell='desktop'][data-fullscreen='true'] .rail-head {
+  height: 36px;
+  padding-left: var(--sp-3);
+}
+:root[data-shell='desktop'][data-fullscreen='true'] .lights {
+  display: none;
+}
+/* renderer-drawn traffic lights — a touch larger than the native 12px, tucked
+   into the card corner; glyphs appear on group hover, gray when blurred */
+.lights {
+  display: flex;
+  gap: 8px;
+  align-self: center; /* the strip centers them; no rail-head top reservation anymore */
+  -webkit-app-region: no-drag;
+}
+.light {
+  width: 13px;
+  height: 13px;
+  border-radius: var(--r-full);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  box-shadow: inset 0 0 0 0.5px rgba(0, 0, 0, 0.14);
+}
+.light svg {
+  width: 9px;
+  height: 9px;
+  opacity: 0;
+  stroke: rgba(0, 0, 0, 0.55);
+  stroke-width: 1.4;
+  stroke-linecap: round;
+  fill: none;
+}
+.light svg .fill {
+  fill: rgba(0, 0, 0, 0.55);
+  stroke: none;
+}
+.lights:hover .light svg {
+  opacity: 1;
+}
+.light-close { background: #ff5f57; }
+.light-min { background: #febc2e; }
+.light-full { background: #28c840; }
+/* macOS grays the lights when the window loses focus */
+:root[data-winfocus='false'] .light {
+  background: var(--bg-4);
+}
+/* the + must NOT be part of the window-drag region or clicks just move the
+   window — and it should read as a real button, not a ghost */
+.rail-head .drop-btn {
+  -webkit-app-region: no-drag;
+  width: 26px;
+  height: 26px;
+  justify-content: center;
+  padding: 0;
+  border-radius: var(--r-2);
+  border: 1px solid color-mix(in srgb, var(--border-faint) 58%, transparent);
+  background: color-mix(in srgb, var(--app-active-glass-tint) 18%, transparent);
+  color: var(--text-1);
+}
+.rail-head .drop-btn:hover {
+  background: color-mix(in srgb, var(--app-active-glass-tint) 26%, transparent);
+  color: var(--text-0);
+}
+.rail-head .drop-btn .drop-btn-icon {
+  color: inherit;
+}
+.rail-head .drop-btn-label {
+  display: none;
+}
+/* the + is enough — no caret next to it */
+.rail-head .drop-caret {
+  display: none;
+}
+/* sidebar card: the shell tool cluster */
+.side-tools {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-1);
+  height: 44px;
+  padding: 0 var(--sp-3);
+  flex-shrink: 0;
+  -webkit-app-region: drag;
+}
+.side-tools button {
+  -webkit-app-region: no-drag;
+}
+/* the same cluster floats over the field when the sidebar is hidden */
+.float-tools {
+  position: absolute;
+  top: calc(var(--tabstrip-h) + var(--sp-4) + 6px); /* clears the tab strip */
+  right: calc(var(--sp-4) + 6px);
+  z-index: var(--z-sticky);
+  display: flex;
+  gap: var(--sp-1);
+  padding: 2px;
+  border-radius: var(--r-3);
+  background: color-mix(in srgb, var(--bg-1) 78%, transparent);
+  backdrop-filter: blur(8px);
+  -webkit-backdrop-filter: blur(8px);
+  -webkit-app-region: no-drag;
+}
+.float-tools * {
+  -webkit-app-region: no-drag;
+}
+
+/* ── Left sidebar (the agent panel) ──────────────────────────────────────── */
+.sidebar {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  min-width: 0; /* let the rail shrink to hug the nav words */
+}
+.side-nav {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  padding: var(--sp-4) var(--sp-3) var(--sp-3);
+}
+.side-nav-item {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-3);
+  height: 28px;
+  padding: 0 var(--sp-3);
+  border-radius: var(--r-2);
+  font-size: var(--fs-13);
+  color: var(--text-2);
+  text-align: left;
+  transition: color var(--dur-1) var(--ease-out), background var(--dur-1) var(--ease-out);
+}
+.side-nav-item:hover {
+  color: var(--text-0);
+  background: var(--hover-overlay);
+}
+.side-nav-item[data-active='true'] {
+  color: var(--text-0);
+  background: color-mix(in srgb, var(--bg-4) 36%, transparent); /* keep the active row readable without masking the native glass */
+}
+.side-nav-icon {
+  color: var(--text-3);
+  flex-shrink: 0;
+}
+.side-nav-item[data-active='true'] .side-nav-icon {
+  color: var(--accent);
+}
+.side-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: var(--r-full);
+  background: var(--accent);
+  flex-shrink: 0;
+}
+
+.side-scroll {
+  flex: 1;
+  overflow-y: auto;
+  min-height: 0;
+  padding: var(--sp-3) 0 var(--sp-6);
+  border-top: 1px solid var(--border-faint);
+  margin-top: var(--sp-2);
+}
+
+/* collapsible sections (native <details>) */
+.side-section {
+  padding: 0 var(--sp-3);
+}
+.side-summary {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  height: 30px;
+  padding: 0 var(--sp-2);
+  border-radius: var(--r-2);
+  cursor: pointer;
+  list-style: none;
+  font-size: var(--fs-11);
+  font-weight: var(--fw-semibold);
+  letter-spacing: var(--tracking-caps);
+  text-transform: uppercase;
+  color: var(--text-2);
+  user-select: none;
+}
+.side-summary::-webkit-details-marker {
+  display: none;
+}
+.side-summary:hover {
+  color: var(--text-1);
+}
+.side-caret {
+  transition: transform var(--dur-2) var(--ease-out);
+  color: var(--text-3);
+}
+.side-section[open] > .side-summary .side-caret {
+  transform: rotate(90deg);
+}
+.side-count {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 16px;
+  height: 15px;
+  padding: 0 4px;
+  font-size: 10px;
+  font-weight: var(--fw-bold);
+  color: var(--accent);
+  background: var(--accent-soft);
+  border-radius: var(--r-full);
+  letter-spacing: 0;
+}
+.side-section-body {
+  padding: var(--sp-2) 0 var(--sp-5) 0;
+}
+.side-empty {
+  padding: var(--sp-2) var(--sp-3) var(--sp-3);
+  font-size: var(--fs-12);
+  color: var(--text-3);
+}
+
+.agent-list {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.agent-row {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-3);
+  height: 30px;
+  padding: 0 var(--sp-3);
+  border-radius: var(--r-2);
+  font-size: var(--fs-13);
+  color: var(--text-2);
+  text-align: left;
+  transition: background-color var(--dur-2) var(--ease-out), color var(--dur-2) var(--ease-out);
+}
+.agent-row:hover {
+  color: var(--text-1);
+  background: var(--hover-overlay);
+}
+/* the identity tint is the agent's signature — quiet at rest, brightens on engage */
+.agent-bullet {
+  width: 5px;
+  height: 5px;
+  border-radius: var(--r-full);
+  flex-shrink: 0;
+  background: currentColor;
+  opacity: 0.55;
+  transition: opacity var(--dur-2) var(--ease-out);
+}
+.agent-row:hover .agent-bullet,
+.agent-row.is-running .agent-bullet {
+  opacity: 1;
+}
+.agent-run {
+  opacity: 0;
+  color: var(--text-3);
+  transition: opacity var(--dur-1) var(--ease-out);
+}
+.agent-row:hover .agent-run {
+  opacity: 1;
+}
+/* while the agent is running the row is disabled (no :hover) — keep the spinner visible */
+.agent-row:disabled .agent-run {
+  opacity: 1;
+}
+
+.side-activity {
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+.side-act-row {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-3);
+  padding: var(--sp-2) var(--sp-3);
+  border-radius: var(--r-2);
+  font-size: var(--fs-12);
+  color: var(--text-2);
+}
+.side-act-row:hover {
+  background: var(--bg-2);
+}
+.side-act-time {
+  font-size: var(--fs-10);
+  flex-shrink: 0;
+}
+
+/* ── Work row: the session-card grid (left) · the files/canvas card (right) ─ */
+.work-row {
+  display: flex;
+  gap: var(--sp-4);
+  min-width: 0;
+  min-height: 0;
+  -webkit-app-region: drag;
+}
+/* cards arrange on a grid — columns side by side, stacks within a column;
+   the template comes inline from dockGrid */
+.session-grid {
+  flex: 1 1 0;
+  min-width: 0;
+  min-height: 0;
+  display: grid;
+  gap: var(--sp-4);
+  position: relative; /* anchors the column-resize grips */
+  -webkit-app-region: drag;
+}
+/* ── pop-out window: one glass terminal card filling the window ──────────── */
+.pop-app {
+  display: flex;
+  padding: var(--sp-4);
+}
+.pop-card {
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+.pop-head {
+  -webkit-app-region: drag; /* the head IS the window's titlebar */
+  cursor: default;
+}
+.pop-head .pane-head-title,
+.pop-head .pane-head-sub {
+  -webkit-app-region: drag;
+}
+/* one small traffic light — closing sends the card home */
+.pop-light {
+  width: 12px;
+  height: 12px;
+  margin-right: var(--sp-2);
+  border-radius: var(--r-full);
+  background: #ff5f57;
+  box-shadow: inset 0 0 0 0.5px rgba(0, 0, 0, 0.14);
+  flex-shrink: 0;
+  -webkit-app-region: no-drag;
+  padding: 0;
+}
+:root[data-winfocus='false'] .pop-light {
+  background: var(--bg-4);
+}
+.pane-head-pop {
+  opacity: 0;
+}
+.pane-head:hover .pane-head-pop {
+  opacity: 1;
+}
+
+/* drag grip between two card columns — lives in the gap */
+.grid-col-resize {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  width: 10px;
+  transform: translateX(-50%);
+  cursor: col-resize;
+  z-index: 6;
+  border-radius: var(--r-full);
+  -webkit-app-region: no-drag;
+}
+.grid-col-resize:hover {
+  background: var(--accent-soft);
+}
+.session-card {
+  display: none;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+}
+.session-card[data-show='true'] {
+  display: flex;
+}
+/* the terminal/agent cards are the "transparent glass" surfaces — clearer
+   than the files canvas, whose density protects long reading. Deeper blur
+   keeps 12px terminal type readable on busy wallpapers; saturate() is what
+   makes it read as glass instead of milk. */
+.session-card {
+  background: color-mix(in srgb, var(--bg-1) var(--session-glass-alpha), transparent);
+  backdrop-filter: blur(var(--session-glass-blur)) saturate(var(--session-glass-saturate));
+  -webkit-backdrop-filter: blur(var(--session-glass-blur)) saturate(var(--session-glass-saturate));
+}
+/* The identity edge, fluent: a hairline that FADES at both ends (no abrupt
+   stops at the rounded corners) over a soft wash of the same hue that tints
+   the card's head and dissolves into the glass — the session's color reads
+   as light falling on the pane, not a painted stripe. Pairs with the tinted
+   icon in the rail. */
+.session-card[data-show='true']::before {
+  content: '';
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: 52px;
+  background:
+    linear-gradient(
+        90deg,
+        transparent 1%,
+        color-mix(in srgb, var(--sid, transparent) 60%, transparent) 16%,
+        color-mix(in srgb, var(--sid, transparent) 60%, transparent) 84%,
+        transparent 99%
+      )
+      top / 100% 1.5px no-repeat,
+    linear-gradient(180deg, color-mix(in srgb, var(--sid, transparent) 13%, transparent), transparent 92%);
+  z-index: 2;
+  pointer-events: none;
+}
+/* while dragging a card head, the edge it would land on lights up */
+.session-card[data-drop='left'] {
+  box-shadow: var(--shadow-1), inset 3px 0 0 0 var(--accent);
+}
+.session-card[data-drop='right'] {
+  box-shadow: var(--shadow-1), inset -3px 0 0 0 var(--accent);
+}
+.session-card[data-drop='top'] {
+  box-shadow: var(--shadow-1), inset 0 3px 0 0 var(--accent);
+}
+.session-card[data-drop='bottom'] {
+  box-shadow: var(--shadow-1), inset 0 -3px 0 0 var(--accent);
+}
+.canvas-wrap {
+  position: relative;
+  display: flex;
+  flex: 1.35 1 0; /* a touch wider than a session card when sharing space */
+  order: 100; /* the files card keeps the right-hand slot */
+  min-width: 340px;
+  min-height: 0;
+  -webkit-app-region: drag;
+}
+/* drag handle on the canvas card's left edge — sits in the gutter */
+.canvas-resize {
+  position: absolute;
+  left: -7px;
+  top: 0;
+  bottom: 0;
+  width: 8px;
+  cursor: ew-resize;
+  z-index: 6;
+  -webkit-app-region: no-drag;
+}
+.canvas-resize:hover {
+  background: var(--accent-soft);
+}
+.canvas {
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
+  background: var(--bg-1);
+  overflow-y: auto;
+  overflow-x: hidden;
+}
+
+/* ── Workspace rail (left): sessions on top, the file tree below ─────────── */
+.wsrail {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  min-width: 0;
+}
+.wsrail .side-sessions {
+  flex-shrink: 0;
+  padding-top: var(--sp-1); /* keep the first tab clear of the traffic lights */
+}
+.wsrail-files {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  margin-top: var(--sp-3);
+  padding: var(--sp-3) var(--sp-2) var(--sp-6);
+  border-top: 1px solid transparent;
+}
+.wsrail-open {
+  margin: var(--sp-1) var(--sp-2);
+}
+
+/* ── Sessions (the dock's contents, listed in the rail) ──────────────────── */
+.side-sessions {
+  padding: 0 var(--sp-3);
+}
+.side-head {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  height: 30px;
+  padding: 0 var(--sp-2);
+  font-size: var(--fs-11);
+  font-weight: var(--fw-semibold);
+  letter-spacing: var(--tracking-caps);
+  text-transform: uppercase;
+  color: var(--text-2);
+  user-select: none;
+}
+.side-head .drop-btn {
+  height: 22px;
+  padding: 0 var(--sp-2);
+  color: var(--text-3);
+}
+.side-head .drop-btn:hover {
+  color: var(--text-0);
+}
+/* the + is enough — a caret next to it is noise */
+.side-head .drop-caret {
+  display: none;
+}
+/* a vertical segmented control: gray track, the open pane(s) read as raised tabs */
+.session-list {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 2px 0;
+  margin-bottom: var(--sp-4);
+  background: transparent;
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
+  border-radius: 0;
+}
+.session-row {
+  position: relative;
+  display: flex;
+  align-items: center;
+  border-radius: var(--r-2);
+  color: var(--text-2);
+}
+/* the rail half of the identity pairing — the session icon carries the same
+   hue as its card's top edge (no line geometry in a 28px row) */
+.session-row .session-icon {
+  color: var(--sid, var(--text-3));
+  opacity: 0.9;
+}
+.session-row .agent-run-dot {
+  background: var(--sid, var(--agent-execution));
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--sid, var(--agent-execution)) 25%, transparent);
+}
+.session-repo {
+  color: var(--text-3);
+  font-size: var(--fs-11);
+}
+.session-fail {
+  width: 6px;
+  height: 6px;
+  border-radius: var(--r-full);
+  background: var(--danger);
+  flex-shrink: 0;
+}
+.session-row:hover {
+  color: var(--text-0);
+  background: var(--hover-overlay);
+}
+.session-row[data-active='true'] {
+  color: var(--text-0);
+  background: color-mix(in srgb, var(--app-active-glass-tint) 22%, transparent);
+  box-shadow: none;
+}
+.session-row[draggable='true'] .session-main {
+  cursor: grab;
+}
+.session-main {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: var(--sp-3);
+  height: 28px;
+  padding: 0 var(--sp-3);
+  font-size: var(--fs-13);
+  color: inherit;
+  text-align: left;
+}
+.session-icon {
+  color: var(--text-3);
+  flex-shrink: 0;
+}
+.session-row[data-active='true'] .session-icon {
+  color: var(--accent);
+}
+.session-close,
+.session-split {
+  display: inline-flex;
+  align-items: center;
+  padding: 0 var(--sp-2);
+  height: 28px;
+  color: var(--text-3);
+  opacity: 0;
+  flex-shrink: 0;
+}
+.session-row:hover .session-close,
+.session-row:hover .session-split {
+  opacity: 1;
+}
+/* the window figure stays visible on OPEN sessions — press it to put the card away */
+.session-split[data-on='true'] {
+  opacity: 1;
+  color: var(--accent);
+}
+.session-close:hover,
+.session-split:hover {
+  color: var(--text-0);
+}
+.session-busy {
+  width: 6px;
+  height: 6px;
+  border-radius: var(--r-full);
+  background: var(--warn);
+  flex-shrink: 0;
+  animation: queue-pulse 2s var(--ease-in-out) infinite;
+}
+
+/* ── Command palette ─────────────────────────────────────────────────────── */
+.palette-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: var(--z-palette);
+  background: rgba(0, 0, 0, 0.4);
+  backdrop-filter: blur(3px);
+  display: flex;
+  justify-content: center;
+  align-items: flex-start;
+  padding-top: 14vh;
+  animation: fade-in var(--dur-2) var(--ease-out);
+  -webkit-app-region: no-drag;
+}
+.palette {
+  width: min(600px, 92vw);
+  max-height: 60vh;
+  display: flex;
+  flex-direction: column;
+  background: var(--bg-2);
+  border: 1px solid var(--border);
+  border-radius: var(--r-5);
+  box-shadow: var(--shadow-pop);
+  overflow: hidden;
+  animation: pop-in var(--dur-2) var(--ease-out);
+  -webkit-app-region: no-drag;
+}
+.palette * {
+  -webkit-app-region: no-drag;
+}
+.palette-search {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-3);
+  padding: 0 var(--sp-5);
+  height: 48px;
+  border-bottom: 1px solid var(--border-faint);
+  flex-shrink: 0;
+}
+.palette-input {
+  flex: 1;
+  height: 100%;
+  background: none;
+  border: none;
+  outline: none;
+  font-size: var(--fs-15);
+  color: var(--text-0);
+}
+.palette-input::placeholder {
+  color: var(--text-3);
+}
+.palette-list {
+  overflow-y: auto;
+  padding: var(--sp-3) var(--sp-3) var(--sp-5);
+  /* scroll cue: a soft bottom fade — the extra padding keeps the last row
+     ABOVE the fade at scroll-end, so a half-clipped row reads as "more below"
+     instead of a row sliced by the footer */
+  mask-image: linear-gradient(180deg, #000 0, #000 calc(100% - 14px), transparent 100%);
+  -webkit-mask-image: linear-gradient(180deg, #000 0, #000 calc(100% - 14px), transparent 100%);
+}
+.palette-empty {
+  padding: var(--sp-7);
+  text-align: center;
+}
+.palette-group-label {
+  padding: var(--sp-3) var(--sp-3) var(--sp-2);
+}
+.palette-item {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-4);
+  width: 100%;
+  padding: var(--sp-3) var(--sp-4);
+  border-radius: var(--r-3);
+  text-align: left;
+  color: var(--text-1);
+}
+.palette-item[data-active='true'] {
+  background: var(--bg-4);
+  color: var(--text-0);
+}
+.palette-item[data-active='true'] .palette-item-icon {
+  color: var(--accent);
+}
+.palette-item-icon {
+  color: var(--text-3);
+  flex-shrink: 0;
+}
+.palette-item-label {
+  font-size: var(--fs-13);
+  font-weight: var(--fw-medium);
+}
+.palette-item-hint {
+  margin-left: auto;
+  font-size: var(--fs-12);
+  max-width: 50%;
+}
+/* fuzzy-matched characters glow accent — the eye tracks WHY a row matched */
+.palette-match {
+  color: var(--accent);
+  font-weight: var(--fw-semibold, 600);
+}
+.palette-recent {
+  font-size: var(--fs-11);
+  color: var(--text-3);
+  border: 1px solid var(--border-faint);
+  border-radius: var(--r-full);
+  padding: 0 var(--sp-2);
+  flex-shrink: 0;
+}
+.palette-foot {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-5);
+  padding: var(--sp-2) var(--sp-5);
+  border-top: 1px solid var(--border-faint);
+  font-size: var(--fs-11);
+  color: var(--text-3);
+  flex-shrink: 0;
+}
+.palette-foot .kbd {
+  margin-right: var(--sp-1);
+}
+
+/* ── Agent pulse — one line of live agent activity in the rail ───────────── */
+.agent-pulse {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  margin: 0 var(--sp-3);
+  padding: var(--sp-1) var(--sp-2);
+  border-radius: var(--r-2);
+  color: var(--text-3);
+  font-size: var(--fs-11);
+  text-align: left;
+  flex-shrink: 0;
+  -webkit-app-region: no-drag;
+}
+.agent-pulse:hover { color: var(--text-1); background: var(--hover-overlay); }
+.agent-pulse-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: var(--r-full);
+  background: var(--text-3);
+  flex-shrink: 0;
+}
+.agent-pulse-dot[data-running='true'] {
+  background: var(--accent);
+  animation: queue-pulse 2s var(--ease-in-out) infinite;
+}
+
+/* ── Rail sections: Outline + Quotes (inside the rail, never a new panel) ── */
+.rail-sec {
+  flex-shrink: 0;
+  max-height: 32vh;
+  display: flex;
+  flex-direction: column;
+  margin: 0 var(--sp-2);
+  border-top: 1px solid var(--border-faint);
+  -webkit-app-region: no-drag;
+}
+.rail-sec-head {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  padding: var(--sp-2) var(--sp-3);
+  font-size: var(--fs-11);
+  letter-spacing: var(--tracking-caps);
+  text-transform: uppercase;
+  color: var(--text-3);
+  cursor: pointer;
+  list-style: none;
+  user-select: none;
+}
+.rail-sec-head::-webkit-details-marker { display: none; }
+.rail-sec-caret { transition: transform var(--dur-2) var(--ease-out); }
+.rail-sec[open] .rail-sec-caret { transform: rotate(90deg); }
+.rail-sec-count {
+  font-size: var(--fs-10);
+  color: var(--text-3);
+}
+.rail-sec-body {
+  overflow-y: auto;
+  min-height: 0;
+  padding-bottom: var(--sp-2);
+}
+.rail-outline-item {
+  display: flex;
+  width: 100%;
+  height: 22px;
+  align-items: center;
+  padding-right: var(--sp-3);
+  border-radius: var(--r-1);
+  color: var(--text-2);
+  font-size: var(--fs-12);
+  text-align: left;
+}
+.rail-outline-item:hover { color: var(--text-0); background: var(--hover-overlay); }
+.rail-outline-item[data-active='true'] {
+  color: var(--text-0);
+  background: var(--accent-soft);
+}
+.rail-quote {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--sp-1);
+  margin: 0 var(--sp-2) var(--sp-2);
+  border-left: 2px solid var(--annot-color, var(--accent));
+  border-radius: var(--r-1);
+  background: color-mix(in srgb, var(--annot-color, var(--accent)) 6%, transparent);
+}
+.rail-quote-main {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  padding: var(--sp-2) var(--sp-3);
+  text-align: left;
+}
+.rail-quote-text {
+  color: var(--text-1);
+  font-size: var(--fs-12);
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+.rail-quote-src {
+  color: var(--text-3);
+  font-size: var(--fs-10);
+  font-family: var(--font-mono);
+}
+.rail-quote-x {
+  display: inline-flex;
+  padding: var(--sp-2);
+  color: var(--text-3);
+  opacity: 0;
+}
+.rail-quote:hover .rail-quote-x { opacity: 1; }
+.rail-quote-x:hover { color: var(--danger); }
+
+/* ── Queue-active dot (sidebar "Agent tasks" header) ─────────────────────── */
+.queue-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: var(--r-full);
+  background: var(--warn);
+  flex-shrink: 0;
+  animation: queue-pulse 2.4s var(--ease-in-out) infinite;
+}
+@keyframes queue-pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.3; }
+}
+
+/* ── Chrome-style session groups (rail clusters) ────────────────────────── */
+.session-group {
+  display: flex;
+  flex-direction: column;
+  border-radius: var(--r-2);
+  /* the group's hue washes the cluster the way a Chrome tab-group colors its tabs */
+  background: color-mix(in srgb, var(--sid, transparent) 7%, transparent);
+  padding-bottom: 2px;
+  margin: 1px 0;
+}
+.session-group-head {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  min-height: 24px;
+  padding: 0 var(--sp-2) 0 var(--sp-2);
+  font-size: var(--fs-11);
+  font-weight: var(--fw-semibold);
+  color: var(--text-2);
+  cursor: pointer;
+  border-radius: var(--r-2);
+  user-select: none;
+  min-width: 0;
+}
+.session-group-head:hover { color: var(--text-0); }
+.session-group-caret { color: var(--text-3); flex-shrink: 0; }
+.session-group-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 999px;
+  background: var(--sid, var(--border-strong));
+  flex-shrink: 0;
+}
+.session-group-count {
+  font-size: var(--fs-10);
+  color: var(--text-3);
+  font-weight: var(--fw-regular);
+  font-variant-numeric: tabular-nums;
+}
+.session-group-x { opacity: 0; margin-left: auto; }
+.session-group-head:hover .session-group-x { opacity: 1; }
+.session-group .session-row { margin-left: var(--sp-3); }
+
+/* ── needs-you (amber), pins, port chips, omnibar ───────────────────────── */
+.session-needs {
+  width: 7px;
+  height: 7px;
+  border-radius: 999px;
+  background: var(--warn);
+  flex-shrink: 0;
+  animation: needs-pulse 2.2s ease-in-out infinite;
+}
+@keyframes needs-pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.45; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .session-needs { animation: none; }
+}
+.session-pinned {
+  border-bottom: 1px solid var(--border-faint);
+  padding-bottom: 2px;
+  margin-bottom: 2px;
+}
+.session-group-dot { cursor: pointer; border: none; padding: 0; }
+.session-group-dot:hover { transform: scale(1.35); }
+.pane-port {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  height: 17px;
+  padding: 0 6px;
+  margin-right: 2px;
+  border-radius: 999px;
+  border: 1px solid var(--border-strong);
+  background: color-mix(in srgb, var(--bg-inset) 40%, transparent);
+  color: var(--text-2);
+  font-size: 10px;
+  font-family: var(--font-mono);
+  cursor: pointer;
+  flex-shrink: 0;
+}
+.pane-port:hover { color: var(--text-0); border-color: var(--accent); background: var(--accent-soft); }
+
+.omni-overlay { align-items: flex-start; padding-top: 18vh; }
+.omni {
+  width: min(560px, 92vw);
+  background: var(--bg-2);
+  border: 1px solid var(--border);
+  border-radius: var(--r-4);
+  box-shadow: var(--shadow-pop);
+  overflow: hidden;
+  animation: pop-in var(--dur-2) var(--ease-out);
+}
+.omni-inputrow {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-3);
+  padding: 0 var(--sp-4);
+  height: 44px;
+}
+.omni-input {
+  flex: 1;
+  min-width: 0;
+  border: none;
+  background: transparent;
+  color: var(--text-0);
+  font-size: var(--fs-14);
+  font-family: var(--font-ui);
+}
+.omni-input:focus { outline: none; }
+.omni-list {
+  border-top: 1px solid var(--border-faint);
+  padding: var(--sp-2);
+  display: flex;
+  flex-direction: column;
+}
+.omni-item { width: 100%; }
+
+/* while a shell drag runs, embedded documents must not eat pointer events —
+   a PDF iframe or a browser card under the cursor would freeze the drag */
+body[data-shell-drag='1'] iframe,
+body[data-shell-drag='1'] webview,
+body[data-shell-drag='1'] embed,
+body[data-shell-drag='1'] object {
+  pointer-events: none !important;
+}

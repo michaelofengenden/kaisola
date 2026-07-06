@@ -1,0 +1,25 @@
+node_modules/
+dist/
+dist-electron/
+release/
+.DS_Store
+*.log
+.vite/
+.env
+.env.local
+# generated UI screenshots (npm run shoot) — regenerate, don't track
+screenshots/
+
+# Legacy paper-tracker data source (62MB) — NOT part of the product. The derived
+# corpus.seed.json (src/data) is what the app uses. Track separately if needed.
+ResearchPubs/
+# icon design exploration (concept candidates) — the chosen icon lives in
+# electron/assets; variants regenerate with scripts/render-icon.cjs
+kaisola_icon_concepts/
+# native module DBs / sqlite WAL files
+*.db
+*.db-wal
+*.db-shm
+
+# Claude Code tooling state (agent scratch memory, session config)
+.claude/

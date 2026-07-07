@@ -57,11 +57,11 @@
       color-mix(in srgb, var(--app-active-glass-tint) var(--app-active-glass-lift-top), transparent),
       color-mix(in srgb, var(--app-active-glass-tint) var(--app-active-glass-lift-bottom), transparent)
     );
-  /* NO brightness() here: a >1 multiplier after the blur amplifies its 8-bit
-     quantization into ~176px horizontal bands (visible on empty light chrome).
-     The lift lives in the pre-blur gradient tint above instead. */
-  backdrop-filter: blur(var(--app-active-glass-blur)) saturate(1.5);
-  -webkit-backdrop-filter: blur(var(--app-active-glass-blur)) saturate(1.5);
+  /* TINT ONLY — no backdrop-filter. The full-window blur re-composited on
+     every frame a terminal painted (the whole-computer-heats-up bug); the
+     blur wash now lives on the CHROME surfaces that rarely repaint
+     (.tabstrip::before / .wsrail::before below), and the OS vibrancy keeps
+     blurring the desktop behind everything. */
 }
 /* Dark theme: the glass field must DARKEN what it samples, never lift it —
    the light-tuned white tint + brightness() left the transparent rail nearly
@@ -75,10 +75,6 @@
   /* dark text-on-glass needs a bit more ink under 12px terminal type */
   --session-glass-alpha: 64%;
 }
-:root[data-theme='dark'] .app::before {
-  backdrop-filter: blur(var(--app-active-glass-blur)) saturate(1.3) brightness(0.88);
-  -webkit-backdrop-filter: blur(var(--app-active-glass-blur)) saturate(1.3) brightness(0.88);
-}
 /* Deliberately NO data-winfocus overrides on any surface: the shell looks
    identical when the window is inactive (main keeps the native material
    sampling via visualEffectState 'active'); only the traffic lights gray. */
@@ -90,7 +86,6 @@
    (global.css:33), so on web the token drops to 0 and the row collapses (the
    element isn't rendered there either). No `data-tabs` variant is needed. */
 :root { --tabstrip-h: 40px; }
-:root[data-shell='desktop'][data-fullscreen='true'] { --tabstrip-h: 30px; }
 :root:not([data-shell='desktop']) { --tabstrip-h: 0px; }
 
 .tabstrip {
@@ -102,6 +97,20 @@
   -webkit-app-region: drag;
   border-bottom: 1px solid var(--border-faint);
   background: color-mix(in srgb, var(--bg-2) 22%, transparent);
+  position: relative;
+}
+/* chrome glass: the blur wash lives HERE (and on the rail), not on the whole
+   window — these surfaces repaint rarely, so the blur recomputes rarely,
+   while terminals stream over cheap opaque cards. z-index -1 joins .app's
+   isolated context just above the tint field (.app::before). */
+.tabstrip::before {
+  content: '';
+  position: absolute;
+  inset: 0;
+  z-index: -1;
+  pointer-events: none;
+  backdrop-filter: blur(var(--app-active-glass-blur)) saturate(1.5);
+  -webkit-backdrop-filter: blur(var(--app-active-glass-blur)) saturate(1.5);
 }
 /* everything interactive in the strip opts out of the window-drag region */
 .tabstrip .lights,
@@ -322,8 +331,8 @@
 }
 
 /* traffic lights ride at the strip's left — reuse the shared .lights/.light
-   rules (below), just re-centered for the shorter strip. Fullscreen hides them
-   via the existing [data-fullscreen] .lights rule (higher specificity wins). */
+   rules (below), just re-centered for the shorter strip. Visible in
+   fullscreen too: with custom lights there's no native hover-reveal. */
 .tabstrip .lights {
   align-self: center;
   margin-top: 0;
@@ -484,7 +493,18 @@
   inset: 0;
   z-index: 0;
   pointer-events: none;
-  display: none;
+  /* chrome glass (pairs with .tabstrip::before): the frosted wash, scoped to
+     surfaces that rarely repaint — never the whole window */
+  backdrop-filter: blur(var(--app-active-glass-blur)) saturate(1.5);
+  -webkit-backdrop-filter: blur(var(--app-active-glass-blur)) saturate(1.5);
+}
+/* dark chrome glass darkens what it samples — same params the old full-window
+   dark field used */
+:root[data-theme='dark'] .tabstrip::before,
+:root[data-theme='dark'] .wsrail::before,
+:root[data-theme='dark'] .sidebar::before {
+  backdrop-filter: blur(var(--app-active-glass-blur)) saturate(1.3) brightness(0.88);
+  -webkit-backdrop-filter: blur(var(--app-active-glass-blur)) saturate(1.3) brightness(0.88);
 }
 .wsrail > *,
 .sidebar > * {
@@ -494,14 +514,21 @@
 }
 .session-card,
 .canvas-wrap > .canvas {
-  background: color-mix(in srgb, var(--bg-1) var(--content-glass-alpha), transparent);
+  /* OPAQUE on purpose: these hold terminals and documents that repaint
+     constantly — glass here forced the compositor to re-blur every frame
+     (measured ~19% GPU core under one streaming claude vs ~0% opaque).
+     The glass look lives on the chrome around them. */
+  background: var(--bg-1);
   border: 1px solid var(--border);
   border-radius: var(--r-shell);
   box-shadow: var(--shadow-1);
-  backdrop-filter: blur(var(--content-glass-blur)) saturate(1.04);
-  -webkit-backdrop-filter: blur(var(--content-glass-blur)) saturate(1.04);
   overflow: hidden;
   position: relative;
+  /* the old backdrop-filter made each card the containing block for its
+     fixed-position descendants (popovers anchor within the card) — contain
+     keeps those semantics now that the filter is gone, and isolates a
+     streaming terminal's repaints from the rest of the page as a bonus */
+  contain: paint;
   -webkit-app-region: drag;
 }
 .session-card > *,
@@ -555,9 +582,10 @@
 
 /* ── Top bar ─────────────────────────────────────────────────────────────── */
 /* ── Card top strips (drag regions; no separate title bar exists) ────────── */
-:root[data-shell='desktop'][data-fullscreen='true'] .lights {
-  display: none;
-}
+/* NOTE: the lights stay VISIBLE in fullscreen — this frameless window draws
+   its own, so macOS's hover-reveal fallback doesn't exist; hiding them left
+   no mouse path out of fullscreen (and squeezing the strip to 30px made the
+   tabs read broken). Fullscreen keeps the normal strip. */
 /* renderer-drawn traffic lights — a touch larger than the native 12px, tucked
    into the card corner; glyphs appear on group hover, gray when blurred */
 .lights {
@@ -1085,15 +1113,9 @@
 .session-card[data-show='true'] {
   display: flex;
 }
-/* the terminal/agent cards are the "transparent glass" surfaces — clearer
-   than the files canvas, whose density protects long reading. Deeper blur
-   keeps 12px terminal type readable on busy wallpapers; saturate() is what
-   makes it read as glass instead of milk. */
-.session-card {
-  background: color-mix(in srgb, var(--bg-1) var(--session-glass-alpha), transparent);
-  backdrop-filter: blur(var(--session-glass-blur)) saturate(var(--session-glass-saturate));
-  -webkit-backdrop-filter: blur(var(--session-glass-blur)) saturate(var(--session-glass-saturate));
-}
+/* (the per-card glass tint/blur used to live here — cards are opaque now;
+   see the .session-card comment above and the chrome glass on .tabstrip /
+   .wsrail) */
 /* The identity edge: a hairline that FADES at both ends over a soft wash of
    the session hue. POP-OUT windows only — they have no tab strip, so this is
    their one identity mark. Docked cards carry the hue on their tab's 2px line
@@ -1136,6 +1158,12 @@
   background: var(--bg-0);
   backdrop-filter: none;
   -webkit-backdrop-filter: none;
+}
+/* the chrome glass pseudos rest too — eco is solid everywhere */
+:root[data-perf='eco'] .tabstrip::before,
+:root[data-perf='eco'] .wsrail::before,
+:root[data-perf='eco'] .sidebar::before {
+  display: none;
 }
 :root[data-perf='eco'] .dock-pane-term {
   background: var(--term-bg);

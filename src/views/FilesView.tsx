@@ -257,6 +257,13 @@ export function FilesView() {
   useEffect(() => { tabsRef.current = tabs }, [tabs])
   useEffect(() => {
     const next = clampFileZoom(fileTextZoom)
+    // an EXTERNAL zoom change (⌘0 reset, another surface) wins over any
+    // still-pending gesture commit — otherwise that commit fires up to 800ms
+    // later and silently clobbers the reset back to the pre-reset zoom
+    if (zoomCommitTimerRef.current !== null && pendingZoomRef.current !== next) {
+      window.clearTimeout(zoomCommitTimerRef.current)
+      zoomCommitTimerRef.current = null
+    }
     zoomRef.current = next
     pendingZoomRef.current = next
     setLiveZoom(next)

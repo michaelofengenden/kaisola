@@ -206,7 +206,7 @@ app.whenReady().then(async () => {
       if (previousWinFocus == null) delete document.documentElement.dataset.winfocus
       else document.documentElement.dataset.winfocus = previousWinFocus
       await new Promise((r) => setTimeout(r, 80))
-      return { appSamplingLayer: false, activeTintWhite: false, railLayerFlattened: false, contentGlassy: false, sessionGlassy: false, termGlassTint: false, blurKeepsGlass: false, lightsGray: false, nativeWindowRounding: false }
+      return { appSamplingLayer: false, chromeGlass: false, activeTintWhite: false, railLayerFlattened: false, contentGlassy: false, sessionGlassy: false, termGlassTint: false, blurKeepsGlass: false, lightsGray: false, nativeWindowRounding: false }
     }
     const appStyle = getComputedStyle(app)
     const railStyle = getComputedStyle(rail)
@@ -270,18 +270,23 @@ app.whenReady().then(async () => {
     const blurredFp = fp()
     const surfacesEqual = ['appGlassDisplay', 'appBg', 'railBg', 'railBd', 'canvasBg', 'canvasBd', 'cardBg', 'cardBd', 'termBg']
       .every((k) => activeFp[k] === blurredFp[k])
+    const tabstrip = document.querySelector('.tabstrip')
+    const tabstripGlassBd = tabstrip ? backdrop(getComputedStyle(tabstrip, '::before')) : ''
+    const railGlassBd = backdrop(getComputedStyle(rail, '::before'))
     const out = {
-      // NO brightness() in the light glass backdrop — a >1 multiplier after the
-      // blur amplifies 8-bit quantization into visible bands; the lift moved into
-      // the pre-blur gradient tint instead (hence the higher lift percentages)
-      appSamplingLayer: !/blur/.test(activeAppBackdrop) && /blur/.test(activeAppGlassBackdrop) && !/brightness/.test(activeAppGlassBackdrop) && alpha(activeAppBackground) < 0.05 && appLiftTop >= 43 && appLiftTop <= 47 && appLiftBottom >= 28 && appLiftBottom <= 32 && /1[0-9]{3}px/.test(appGlassBlur),
+      // CHROME-ONLY GLASS: the app field is tint-only (no blur — a full-window
+      // backdrop re-composited on every terminal frame, the fans-spin-up bug);
+      // the blur wash lives on the tab strip + rail pseudos, which rarely repaint
+      appSamplingLayer: !/blur/.test(activeAppBackdrop) && !/blur/.test(activeAppGlassBackdrop) && alpha(activeAppBackground) < 0.05 && appLiftTop >= 43 && appLiftTop <= 47 && appLiftBottom >= 28 && appLiftBottom <= 32 && /1[0-9]{3}px/.test(appGlassBlur),
+      chromeGlass: /blur\\(1[0-9]{3}px\\)/.test(tabstripGlassBd) && /saturate/.test(tabstripGlassBd) && /blur\\(1[0-9]{3}px\\)/.test(railGlassBd),
       activeTintWhite: activeAppTint === '#fffefd',
       railBackdrop: activeRailBackdrop,
       railLayerFlattened: !activeRailBackdrop && activeRailBackgroundAlpha <= 0.02 && (!activeRailBgImage || activeRailBgImage === 'none') && activeSessionListFlat && activeRailDividerFlat && activeRailSearchFlat && veilAlpha >= 0 && veilAlpha <= 1,
-      contentGlassy: contentAlpha >= 88 && contentAlpha <= 92 && activeCanvasBackdrop && /1[0-9][0-9]px/.test(contentBlur),
-      // the session cards are the CLEAR glass: lighter ink than the canvas,
-      // their own deeper blur, and saturate ≥1.3 (glass, not milk)
-      sessionGlassy: sessionAlpha >= 50 && sessionAlpha <= 70 && !!cardStyle && alpha(cardStyle.backgroundColor) >= 0.4 && alpha(cardStyle.backgroundColor) <= 0.75 && /blur\\([2-4][0-9][0-9]px\\)/.test(backdrop(cardStyle)) && /saturate\\(1\\.[3-9]/.test(backdrop(cardStyle)),
+      // work surfaces are OPAQUE on purpose: terminals/documents repaint
+      // constantly, and glass under them re-blurred per frame (~19% GPU core
+      // per streaming claude, measured; ~0% opaque)
+      contentGlassy: !activeCanvasBackdrop && alpha(canvasStyle.backgroundColor) >= 0.99,
+      sessionGlassy: !!cardStyle && !/blur/.test(backdrop(cardStyle)) && alpha(cardStyle.backgroundColor) >= 0.99,
       termGlassTint: !!termStyle && alpha(termStyle.backgroundColor) <= 0.5,
       blurKeepsGlass: surfacesEqual && blurredFp.appGlassDisplay !== 'none',
       lightsGray: !!light && activeFp.lightBg !== blurredFp.lightBg,
@@ -834,7 +839,10 @@ a^2 + b^2 = c^2
       const started = performance.now()
       const tick = () => {
         const codeCssNow = pane ? parseFloat(getComputedStyle(pane).getPropertyValue('--fx-code-font')) : 0
-        if (codeCssNow > codeCssBefore || performance.now() - started > 1200) resolve()
+        // 2.5s deadline: without per-frame glass recomposition the hidden
+        // window schedules frames lazily, and a loaded machine can push the
+        // rAF-applied zoom past the old 1.2s (it flaked, not failed)
+        if (codeCssNow > codeCssBefore || performance.now() - started > 2500) resolve()
         else requestAnimationFrame(tick)
       }
       tick()
@@ -2081,13 +2089,22 @@ a^2 + b^2 = c^2
       await waitFor(() => !document.querySelector('.fx-latexbar .spin'))
       const uiBuildNoPdf = g().openFilePath === beforeUiBuild
       let latexIssuePopoverContained = true
+      let popDbg = null
       if (b?.ok) {
         await window.kaisola.fs.write(ws + '/broken.tex', '\\\\documentclass{article}\\n\\\\begin{document}\\n\\\\undefinedcommandwithanintentionallylongnamethatshouldwrapinsidepasola\\n\\\\end{document}\\n')
         g().requestFile(ws + '/broken.tex', 'edit', { pinned: true })
         g().setLatexMain(ws, ws + '/broken.tex')
         await waitFor(() => /broken\\.tex/.test(document.querySelector('.fx-tab[data-active="true"]')?.textContent || ''), 3000)
-        const brokenBtn = [...document.querySelectorAll('.fx-latexbar button')].find((btn) => /Compile/.test(btn.getAttribute('title') || ''))
+        // the broken.tex WRITE can kick off an auto-build of the OLD main —
+        // while it runs the Compile button is disabled and a click is a
+        // silent no-op (the successful old-main result then shows no issues).
+        // Wait for the bar to retarget AND be clickable before compiling.
+        const brokenBtn = await waitFor(() => {
+          const btn = [...document.querySelectorAll('.fx-latexbar button')].find((x) => /Compile broken\\.tex/.test(x.getAttribute('title') || ''))
+          return btn && !btn.disabled ? btn : null
+        }, 30000)
         brokenBtn?.click()
+        const spinnerSeen = !!(await waitFor(() => document.querySelector('.fx-latexbar .spin'), 2500))
         // the failing build itself can exceed a fixed popover wait under machine
         // load — wait for the BUILD to finish first, then the popover must be up
         await waitFor(() => !document.querySelector('.fx-latexbar .spin'), 60000)
@@ -2096,17 +2113,45 @@ a^2 + b^2 = c^2
           if (!node) return null
           const style = getComputedStyle(node)
           return style.visibility !== 'hidden' && style.position === 'fixed' ? node : null
-        }, 5000)
-        const rect = popover?.getBoundingClientRect()
+        }, 20000)
         const messageNode = popover?.querySelector('.fx-latex-issue .truncate')
         const whiteSpace = messageNode ? getComputedStyle(messageNode).whiteSpace : ''
-        latexIssuePopoverContained = !!rect &&
-          rect.left >= -1 &&
-          rect.top >= -1 &&
-          rect.right <= window.innerWidth + 1 &&
-          rect.bottom <= window.innerHeight + 1 &&
-          rect.width <= window.innerWidth &&
-          whiteSpace !== 'nowrap'
+        // the bar repositions the popover in a rAF after it mounts — under
+        // machine load the first paint can be mid-flight, so wait for a
+        // settled in-viewport rect instead of measuring the first frame
+        // (a genuinely escaping popover still fails: it never settles inside)
+        const settledRect = popover
+          ? await waitFor(() => {
+              const rect = popover.getBoundingClientRect()
+              return rect.left >= -1 &&
+                rect.top >= -1 &&
+                rect.right <= window.innerWidth + 1 &&
+                rect.bottom <= window.innerHeight + 1 &&
+                rect.width <= window.innerWidth
+                ? rect
+                : null
+            }, 3000)
+          : null
+        latexIssuePopoverContained = !!settledRect && whiteSpace !== 'nowrap'
+        const dbg = popover ? popover.getBoundingClientRect() : null
+        const anyIssues = document.querySelector('.fx-latex-issues')
+        popDbg = popover ? {
+          rect: [Math.round(dbg.left), Math.round(dbg.top), Math.round(dbg.right), Math.round(dbg.bottom)],
+          win: [window.innerWidth, window.innerHeight],
+          pos: getComputedStyle(popover).position,
+          ws: whiteSpace,
+          offsetParent: popover.offsetParent ? popover.offsetParent.className : null,
+        } : {
+          found: false,
+          anyIssues: !!anyIssues,
+          anyClass: anyIssues ? anyIssues.className : null,
+          vis: anyIssues ? getComputedStyle(anyIssues).visibility : null,
+          pos: anyIssues ? getComputedStyle(anyIssues).position : null,
+          bar: !!document.querySelector('.fx-latexbar'),
+          brokenBtnFound: !!brokenBtn,
+          spinnerSeen,
+          mainInStore: g().latexMain[ws],
+        }
       }
       const badInput = await window.kaisola.latex.build(ws + '/nope.tex')
       const buildGuard = badInput && badInput.ok === false
@@ -2118,7 +2163,7 @@ a^2 + b^2 = c^2
       await new Promise((r) => setTimeout(r, 300))
       const dismissedSticks = g().latexMode === false
       g().setLatexMain(ws, null)
-      return { chip, offAtFirst, autoOn, autoMain, bar, noOverleafLink, buildShape, syncShape, pdfDblClickSync, pdfAutoBuildSynctex, pdfSourceZoomIndependent, uiBuildNoPdf, latexIssuePopoverContained, buildGuard, barGone, dismissedSticks }
+      return { chip, offAtFirst, autoOn, autoMain, bar, noOverleafLink, buildShape, syncShape, pdfDblClickSync, pdfAutoBuildSynctex, pdfSourceZoomIndependent, uiBuildNoPdf, latexIssuePopoverContained, popDbg, buildGuard, barGone, dismissedSticks }
     })()`)
     fsx.rmSync(texRepo, { recursive: true, force: true })
   } catch (e) {
@@ -2340,7 +2385,7 @@ a^2 + b^2 = c^2
   console.log('WTSESS=' + JSON.stringify(wtsess))
 
   const failed =
-    !rootChildren || !minimalShell.noWorkflowSidebar || !minimalShell.hasRail || !minimalShell.hasSessions || !minimalShell.railFilesOnly || !minimalShell.hasEmptyLauncher || !minimalShell.stageFiles || !minimalShell.studioDefault || !minimalShell.floatingTools || !claudePrepared || !nativeWindow.rendererClippedMaterial || !icon.exists || !icon.usable || !icon.square || !icon.large || !glass.appSamplingLayer || !glass.activeTintWhite || !glass.railLayerFlattened || !glass.contentGlassy || !glass.sessionGlassy || !glass.termGlassTint || !glass.blurKeepsGlass || !glass.lightsGray || !glass.nativeWindowRounding ||
+    !rootChildren || !minimalShell.noWorkflowSidebar || !minimalShell.hasRail || !minimalShell.hasSessions || !minimalShell.railFilesOnly || !minimalShell.hasEmptyLauncher || !minimalShell.stageFiles || !minimalShell.studioDefault || !minimalShell.floatingTools || !claudePrepared || !nativeWindow.rendererClippedMaterial || !icon.exists || !icon.usable || !icon.square || !icon.large || !glass.appSamplingLayer || !glass.chromeGlass || !glass.activeTintWhite || !glass.railLayerFlattened || !glass.contentGlassy || !glass.sessionGlassy || !glass.termGlassTint || !glass.blurKeepsGlass || !glass.lightsGray || !glass.nativeWindowRounding ||
     !emptyOk || !demoOk ||
     !review.opened || !review.closed || !review.decided ||
     !term.run || !term.ptyOk || !term.cdWorks || !term.dock || !term.host ||

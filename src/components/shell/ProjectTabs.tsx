@@ -194,12 +194,21 @@ export function ProjectTabs() {
 }
 
 /**
- * Chrome's update pill, in Chrome's spot (strip far-right): appears only once
- * a new release is DOWNLOADED and ready — one click restarts into it. Silent
- * while checking/downloading; Settings → General shows the live status.
+ * Chrome's update pill, in Chrome's spot (strip far-right). A found release
+ * shows up here immediately — first as quiet download progress, then as the
+ * one-click "Restart to update". Checking stays silent; Settings → General
+ * shows the full live status.
  */
 function UpdatePill() {
   const u = useUpdateState()
+  if (u.type === 'downloading') {
+    return (
+      <span className="update-pill" data-busy title={`Downloading Kaisola ${u.version ?? ''} — restart button appears when it's ready`}>
+        <Icon name="ArrowDownToLine" size={12} />
+        {u.percent ?? 0}%
+      </span>
+    )
+  }
   if (u.type !== 'ready') return null
   return (
     <button

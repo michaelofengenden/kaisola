@@ -188,6 +188,16 @@
 .update-pill:hover {
   background: color-mix(in srgb, var(--accent) 22%, transparent);
 }
+/* while the new build downloads: same pill, quieter, not clickable yet */
+.update-pill[data-busy] {
+  cursor: default;
+  color: var(--text-2);
+  border-color: var(--border-strong);
+  background: transparent;
+}
+.update-pill[data-busy]:hover {
+  background: transparent;
+}
 
 /* a tab: sits at flex-basis 200px, shrinks to 54px, then the track scrolls */
 .ptab {

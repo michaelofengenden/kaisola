@@ -666,7 +666,7 @@ function UpdatesRow() {
           )}
         </div>
       </div>
-      <p className="settings-note">New releases install from GitHub — Kaisola checks in the background and updates on restart.</p>
+      <p className="settings-note">New releases download themselves — Kaisola checks at launch, when the window regains focus, and hourly. The tab-strip pill restarts into the new build; quitting applies it too.</p>
     </>
   )
 }

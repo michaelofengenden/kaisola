@@ -8,8 +8,12 @@
 // path). Ad-hoc-signed local builds can check but will fail to install.
 const { app, BrowserWindow } = require('electron')
 
-const CHECK_EVERY_MS = 4 * 60 * 60 * 1000 // startup + every 4h
+const CHECK_EVERY_MS = 60 * 60 * 1000 // startup + hourly (a tiny yml GET)
 const FIRST_CHECK_DELAY_MS = 15 * 1000 // let the shell boot first
+// re-focusing the app also checks (releases ship many times a day; a user
+// coming back should find the pill waiting, never need the Settings button) —
+// rate-limited so cmd-tabbing around doesn't hammer the feed
+const FOCUS_CHECK_MIN_MS = 15 * 60 * 1000
 
 /** The single source of truth the renderer mirrors (late subscribers pull it). */
 let state = { type: 'idle', version: null, percent: 0, message: null, appVersion: app.getVersion() }
@@ -47,7 +51,9 @@ function registerUpdateHandlers(ipcMain) {
   autoUpdater.on('update-downloaded', (info) => setState({ type: 'ready', version: info.version, percent: 100 }))
   autoUpdater.on('error', (err) => setState({ type: 'error', message: err?.message ?? String(err) }))
 
+  let lastCheckAt = 0
   const check = async () => {
+    lastCheckAt = Date.now()
     try {
       await autoUpdater.checkForUpdates()
       return { ok: true }
@@ -57,8 +63,10 @@ function registerUpdateHandlers(ipcMain) {
       return { ok: false, message: err?.message ?? String(err) }
     }
   }
+  // a check already in flight, downloading, or sitting ready needs no re-check
+  const busy = () => state.type === 'checking' || state.type === 'downloading' || state.type === 'ready'
 
-  ipcMain.handle('update:check', () => check())
+  ipcMain.handle('update:check', () => (busy() ? { ok: true } : check()))
   ipcMain.handle('update:install', () => {
     // before-quit (pty teardown etc.) still runs — quitAndInstall goes
     // through the normal quit path, then relaunches into the new build
@@ -67,7 +75,11 @@ function registerUpdateHandlers(ipcMain) {
   })
 
   setTimeout(() => void check(), FIRST_CHECK_DELAY_MS)
-  setInterval(() => void check(), CHECK_EVERY_MS)
+  setInterval(() => { if (!busy()) void check() }, CHECK_EVERY_MS)
+  app.on('browser-window-focus', () => {
+    if (busy() || Date.now() - lastCheckAt < FOCUS_CHECK_MIN_MS) return
+    void check()
+  })
 }
 
 module.exports = { registerUpdateHandlers }

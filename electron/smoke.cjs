@@ -137,7 +137,9 @@ app.whenReady().then(async () => {
     hasEmptyLauncher: !!document.querySelector('.canvas .plaunch'),
     stageFiles: window.__kaisola.getState().stage === 'files',
     studioDefault: window.__kaisola.getState().layoutMode === 'studio',
-    floatingTools: !!document.querySelector('.float-tools'),
+    // desktop main window: the tool cluster docks in the tab strip (the
+    // floating overlay remains only on web / pop windows)
+    floatingTools: !!document.querySelector('.tabstrip-tools .btn-icon') && !document.querySelector('.float-tools'),
   }))()`)
   const autonomy = await win.webContents.executeJavaScript(`(document.querySelector('.autonomy-seg[data-active="true"]')||{}).innerText || ''`)
   // auto-claude waits for a workspace (never boots the agent in $HOME): absent

@@ -6,6 +6,7 @@ import { useUpdateState } from '../../lib/updates'
 import { Icon } from '../Icon'
 import { Dropdown, type DropOption } from '../Dropdown'
 import { WindowLights } from './WindowLights'
+import { ShellTools } from './AgentSidebar'
 
 const basename = (p: string | null | undefined) => (p ? p.split('/').filter(Boolean).pop() : undefined)
 const tabLabel = (t: { title?: string; workspacePath: string | null }) => t.title ?? basename(t.workspacePath) ?? 'New Project'
@@ -133,6 +134,12 @@ export function ProjectTabs() {
       <NewProjectButton />
       <div className="tabstrip-fill" onDoubleClick={() => bridge.winCtl('zoom')} />
       <UpdatePill />
+      {/* the tool cluster rides the strip's right end — in the chrome row,
+          never overlapping the session tabs below (App renders the floating
+          fallback only where this strip doesn't exist: web + pop windows) */}
+      <div className="tabstrip-tools">
+        <ShellTools />
+      </div>
 
       {/* portalled to <body> — rendered in-strip it inherits a stacking context
           that loses to the session cards' glass layers and slides behind them */}

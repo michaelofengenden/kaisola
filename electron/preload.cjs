@@ -102,6 +102,7 @@ const bridge = {
     })(),
     armHooks: () => ipcRenderer.invoke('claude:arm'),
     rebind: () => ipcRenderer.invoke('claude:rebind'),
+    sessionExists: (cwd, sessionId) => ipcRenderer.invoke('claude:session-exists', { cwd, sessionId }),
     onEvent: (cb) => {
       const listener = (_e, ev) => cb(ev)
       ipcRenderer.on('claude:event', listener)

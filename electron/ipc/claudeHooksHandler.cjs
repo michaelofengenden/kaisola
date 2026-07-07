@@ -144,6 +144,23 @@ function registerClaudeHooksHandlers(ipcMain) {
 
   // events broadcast to every window now — rebind is a no-op kept for callers
   ipcMain.handle('claude:rebind', () => ({ ok: true }))
+
+  // Does a Claude Code session transcript still exist for this workspace?
+  // Claude stores sessions at ~/.claude/projects/<cwd with non-alnum → '-'>/
+  // <session-id>.jsonl — the renderer asks before booting `claude --resume`,
+  // so a pruned/stale id never boots into an error message.
+  ipcMain.handle('claude:session-exists', (_e, { cwd, sessionId } = {}) => {
+    if (typeof cwd !== 'string' || !cwd || typeof sessionId !== 'string' || !/^[a-zA-Z0-9-]+$/.test(sessionId)) {
+      return { ok: false, exists: false }
+    }
+    try {
+      const os = require('node:os')
+      const dir = path.join(os.homedir(), '.claude', 'projects', cwd.replace(/[^a-zA-Z0-9]/g, '-'))
+      return { ok: true, exists: fs.existsSync(path.join(dir, `${sessionId}.jsonl`)) }
+    } catch {
+      return { ok: false, exists: false }
+    }
+  })
 }
 
 function disposeClaudeHooks() {

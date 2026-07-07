@@ -166,6 +166,11 @@ function AgentPulse() {
   )
 }
 
+/** Per-workspace tree memory: switching project tabs restores the tree (and
+ * its expanded folders) instantly instead of repainting from an empty rail;
+ * a background refresh then reconciles anything that changed while away. */
+const treeCache = new Map<string, { children: Record<string, FsEntry[]>; expanded: Set<string> }>()
+
 /** One right-click menu invocation: what it targets and where it floats. */
 interface TreeMenuState {
   x: number
@@ -267,13 +272,25 @@ function FilesTree() {
   }, [workspacePath])
 
   useEffect(() => {
-    setChildren({})
-    setExpanded(new Set())
+    // restore this workspace's cached tree so a project switch paints
+    // instantly; the loadDir calls below refresh it in the background
+    const cached = workspacePath ? treeCache.get(workspacePath) : undefined
+    setChildren(cached?.children ?? {})
+    setExpanded(cached ? new Set(cached.expanded) : new Set())
     setQuery('')
     setResults([])
-    if (workspacePath) loadDir(workspacePath)
+    if (workspacePath) {
+      void loadDir(workspacePath)
+      if (cached) for (const dir of cached.expanded) if (cached.children[dir]) void loadDir(dir)
+    }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [loadDir, workspacePath])
+
+  // keep the cache current — only once THIS workspace's root has loaded, so a
+  // just-switched render can't file the old project's tree under the new key
+  useEffect(() => {
+    if (workspacePath && children[workspacePath]) treeCache.set(workspacePath, { children, expanded })
+  }, [children, expanded, workspacePath])
 
   useEffect(() => {
     if (!workspacePath || watchSeq === 0) return

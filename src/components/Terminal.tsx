@@ -56,9 +56,11 @@ const xtermTheme = (theme: 'dark' | 'light', eco: boolean) => {
   return eco ? { ...t, background: theme === 'light' ? '#e9ebef' : '#0b0d11' } : t
 }
 
-/** Output kept for a HIDDEN terminal until its card is shown again (≫ the
- * 5000-line scrollback for typical lines — nothing the user could see is lost). */
-const HIDDEN_BUF_CAP = 4_000_000
+/** Output kept for a HIDDEN terminal until its card is shown again. Sized to
+ * comfortably refill the 5000-line scrollback (~100 chars/line) — a bigger
+ * buffer only makes re-showing the card parse megabytes it will immediately
+ * scroll away, which is what made tab switches stutter. */
+const HIDDEN_BUF_CAP = 512_000
 
 /** The user's chosen face first, honest fallbacks behind it. 'ui-monospace'
  * is the "SF Mono (system)" choice — the name itself, unquoted. */
@@ -141,6 +143,10 @@ export function Terminal({ id, attach = false, boot, cwd }: { id: string; attach
   const bootPending = useKaisola((s) => s.terminals.find((t) => t.id === id)?.bootPending)
   const [ptyReady, setPtyReady] = useState(false)
   const bootSentRef = useRef(false)
+  // what the create path actually typed (and when) — the adopted-boot effect
+  // dedupes against it so a record update landing inside create's 700ms window
+  // can't get the same command typed twice
+  const lastBootRef = useRef<{ boot: string; at: number } | null>(null)
 
   // keep the live terminal's palette in sync with the app theme + energy saver
   useEffect(() => {
@@ -456,10 +462,25 @@ export function Terminal({ id, attach = false, boot, cwd }: { id: string; attach
         }
         if (res.output) term.write(res.output)
         wire()
-        // run a boot command (e.g. `codex login`) once the shell prompt is ready
-        if (boot && !res.existed && !bootSentRef.current) {
-          bootSentRef.current = true
-          setTimeout(() => { if (!disposed) bridge.terminal.write(id, boot + '\n') }, 700)
+        // run a boot command (e.g. `codex login`) once the shell prompt is
+        // ready. FRESH pty: this path is the single boot writer — it reads the
+        // record at FIRE time (the auto-launch may have swapped in a --resume
+        // line since mount) and clears bootPending so the adopted-boot effect
+        // can't type the same command twice.
+        if (!res.existed) {
+          useKaisola.getState().clearBootPending(id)
+          if (!bootSentRef.current) {
+            bootSentRef.current = true
+            setTimeout(() => {
+              if (disposed) return
+              const st = useKaisola.getState()
+              st.clearBootPending(id) // an update that landed during the wait is delivered right here
+              const line = st.terminals.find((t) => t.id === id)?.boot ?? boot
+              if (!line) return
+              lastBootRef.current = { boot: line, at: Date.now() }
+              bridge.terminal.write(id, line + '\n')
+            }, 700)
+          }
         }
         setPtyReady(true)
       })
@@ -524,6 +545,13 @@ export function Terminal({ id, attach = false, boot, cwd }: { id: string; attach
       ? t.cwd ? `cd ${shellQuote(t.cwd)} && ${t.boot}` : t.boot
       : t?.cwd ? `cd ${shellQuote(t.cwd)}` : null
     if (!line) return
+    // never type into a program holding the foreground — a running TUI would
+    // swallow the command as chat text; boots land at a shell prompt only
+    if (st.terminalMeta[id]?.running) return
+    // the create path may have typed this exact boot moments ago (a record
+    // update that landed inside its 700ms window) — don't type it twice.
+    // Deliberate reruns (LaTeX rebuild) come much later and pass the window.
+    if (t?.boot && lastBootRef.current?.boot === t.boot && Date.now() - lastBootRef.current.at < 10_000) return
     bootSentRef.current = true
     setTimeout(() => bridge.terminal.write(id, line + '\n'), 700)
   }, [ptyReady, bootPending, id])

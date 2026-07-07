@@ -22,9 +22,12 @@
      glow so 12px terminal glyphs keep their edges; saturation is what keeps
      it reading as glass. The reading canvas stays denser. */
   --session-glass-alpha: 58%;
-  --session-glass-blur: 340px;
+  /* blur radii are the GPU hot path: the cards re-filter while terminals
+     paint, and past ~200px the blur of the already-smooth tint field is
+     visually converged — deeper radii only cost kernel passes. */
+  --session-glass-blur: 200px;
   --session-glass-saturate: 1.5;
-  --content-glass-blur: 170px;
+  --content-glass-blur: 120px;
   display: grid;
   grid-template-rows: var(--tabstrip-h) 1fr; /* row 1: project tab strip · row 2: app body */
   height: 100vh;
@@ -292,6 +295,20 @@
   .ptab[data-state='running'] .ptab-badge {
     animation: none;
   }
+}
+
+/* the tool cluster at the strip's right end (palette · follow · layout ·
+   terminal · theme · settings) — chrome row, not an overlay */
+.tabstrip-tools {
+  display: flex;
+  align-items: center;
+  align-self: center;
+  gap: var(--sp-1);
+  padding-right: var(--sp-2);
+  -webkit-app-region: no-drag;
+}
+.tabstrip-tools * {
+  -webkit-app-region: no-drag;
 }
 
 /* traffic lights ride at the strip's left — reuse the shared .lights/.light

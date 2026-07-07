@@ -145,6 +145,27 @@ function pushProjectFeed(pid: string, isActive: boolean, item: Omit<AgentFeedIte
   else st.patchProject(pid, (sl) => ({ agentFeed: [{ ...item, id: uid('feed') }, ...sl.agentFeed].slice(0, 60) }), badge)
 }
 
+// ── native agent notifications ───────────────────────────────────────────────
+// Fired only when the user is NOT looking (background tab, or the window is
+// unfocused/hidden). Click focuses the window and switches to the owning tab.
+// Deduped per project within a short window so a chatty turn doesn't stack
+// notification banners.
+const lastNotifyAt = new Map<string, number>()
+function notifyAgent(title: string, body: string, pid: string) {
+  if (typeof Notification === 'undefined' || bridge.smoke) return
+  const now = Date.now()
+  if (now - (lastNotifyAt.get(pid) ?? 0) < 15_000) return
+  lastNotifyAt.set(pid, now)
+  try {
+    const n = new Notification(title, { body, silent: true })
+    n.onclick = () => {
+      window.focus()
+      const st = useKaisola.getState()
+      if (st.projectTabs.some((t) => t.id === pid)) st.switchProject(pid)
+    }
+  } catch { /* notifications denied/unavailable — the tab badge still shows */ }
+}
+
 /** A turn-start checkpoint for a BACKGROUND project (the active project uses the
  * store's `snapshotWorkspace`, which is pinned to `activeProjectId`). */
 async function snapshotBackground(pid: string, ws: string | null, label: string) {
@@ -349,6 +370,9 @@ export default function App() {
       // ignore sessions running outside the owner's workspace (a no-prefix event
       // falls back to the active tab; drop it if its cwd isn't under that tree)
       if (ws && ev.cwd && ev.cwd !== ws && !ev.cwd.startsWith(`${ws}/`)) return
+      // remember the conversation: the next launch boots `claude --resume` into
+      // this session, so a restart lands you back in the same chat
+      if (ev.sessionId && ws) st.setClaudeSession(ws, ev.sessionId)
       if (ev.event === 'UserPromptSubmit') {
         const label = ev.prompt ? `Claude: ${ev.prompt.slice(0, 42)}` : 'Claude turn'
         pushProjectFeed(pid, isActive, { at: ev.at, kind: 'prompt', text: ev.prompt || 'Prompt sent' })
@@ -378,6 +402,16 @@ export default function App() {
           if (claude && !st.dockViews.includes(claude.id)) st.markNeedsYou(claude.id)
         } else {
           st.setProjectActivity(pid, 'needs-you')
+        }
+        // native notification when you're NOT looking (window unfocused/hidden,
+        // or the owning tab is in the background) — click brings the tab up
+        if (!isActive || document.hidden || !document.hasFocus()) {
+          const tab = st.projectTabs.find((t) => t.id === pid)
+          notifyAgent(
+            ev.event === 'Stop' ? 'Claude finished' : 'Claude needs you',
+            tab ? projectLabel(tab) : 'Kaisola',
+            pid,
+          )
         }
       }
     })
@@ -450,6 +484,14 @@ export default function App() {
       // or deleted workspace would spawn the agent in the wrong tree / $HOME)
       const exists = await bridge.fs.list(workspacePath)
       if (!exists.ok) return
+      // resume the workspace's last conversation — only when its transcript
+      // still exists on disk (a pruned session id must never boot into an error)
+      const sid = useKaisola.getState().claudeSessions[workspacePath]
+      let resume: string | null = null
+      if (sid) {
+        const r = await bridge.claude.sessionExists?.(workspacePath, sid)
+        if (r?.exists) resume = sid
+      }
       // a fast switch may have moved on while we probed the folder
       const before = useKaisola.getState()
       if (before.activeProjectId !== activeProjectId || before.workspacePath !== workspacePath) return
@@ -470,7 +512,10 @@ export default function App() {
       // constant on the bridge — the boot line is built synchronously, so the
       // pty never boots plain `claude` in a race with an async arm
       const hooksPath = bridge.claude.settingsPath
-      const boot = hooksPath ? `claude --settings ${shq(hooksPath)}` : 'claude'
+      const boot = [
+        hooksPath ? `claude --settings ${shq(hooksPath)}` : 'claude',
+        resume ? `--resume ${shq(resume)}` : '',
+      ].filter(Boolean).join(' ')
       requestTerminal(boot, {
         cwd: workspacePath,
         name: 'Claude',
@@ -552,14 +597,19 @@ export default function App() {
           )}
         </div>
       </div>
-      {/* AFTER .app-body on purpose: the body is a drag surface, and Chromium
+      {/* On desktop main windows the tool cluster lives IN the project tab
+          strip (ProjectTabs) — same chrome row, no overlap with the session
+          tabs. This floating fallback covers web + pop windows only. AFTER
+          .app-body on purpose: the body is a drag surface, and Chromium
           builds the window's draggable region in order — a drag rect that comes
           later paves over an earlier no-drag island. Rendering the tools last
           keeps their no-drag hole final, so these buttons take real clicks
           instead of dragging the window. */}
-      <div className="float-tools">
-        <ShellTools />
-      </div>
+      {!(isDesktop && !POP_TERMINAL_ID) && (
+        <div className="float-tools">
+          <ShellTools />
+        </div>
+      )}
       <CommandPalette />
       <OmniBar />
       <ProvenancePopover />

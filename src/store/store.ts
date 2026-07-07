@@ -451,7 +451,7 @@ const GLOBAL_KEYS = [
   'theme', 'themeMode', 'layoutMode', 'agentModels', 'fileTextZoom', 'termFontSize', 'termFontFamily',
   'termFontWeight', 'customAgents', 'enabledAgents', 'sessionTemplates', 'claudeModel', 'reasoningProvider',
   'localBaseUrl', 'localModel', 'openaiBaseUrl', 'openaiModel', 'openAlexMailto', 'grobidEndpoint',
-  'sandboxMode', 'workflows', 'automationsEnabled', 'ecoMode', 'railWidth',
+  'sandboxMode', 'workflows', 'automationsEnabled', 'ecoMode', 'railWidth', 'claudeSessions',
   'permissionRules', 'sensitiveGlobs', 'latexMain', 'unsavedBuffers',
 ] as const
 
@@ -603,6 +603,10 @@ interface KaisolaState {
   ecoMode: boolean
   /** Width of the left workspace rail in px (null = the CSS default). */
   railWidth: number | null
+  /** Last Claude Code session id per workspace (from the hooks tap) — the
+   * auto-launch resumes it (`claude --resume`) so a restart lands you back
+   * in the same conversation. Persisted; capped. */
+  claudeSessions: Record<string, string>
   termFontSize: number
   /** Terminal typeface — a curated mono list in Settings (persisted). */
   termFontFamily: string
@@ -701,6 +705,7 @@ interface KaisolaState {
   placeDockView: (id: string, targetId: string, edge: 'left' | 'right' | 'top' | 'bottom') => void
   setCanvasWidth: (w: number | null) => void
   setRailWidth: (w: number | null) => void
+  setClaudeSession: (workspace: string, sessionId: string) => void
   setDockColWeights: (weights: number[] | null) => void
   /** Minimize/restore the main view — when minimized the work row is all cards. */
   toggleCanvas: () => void
@@ -1498,6 +1503,7 @@ export const useKaisola = create<KaisolaState>()(
   fileTextZoom: 1,
   ecoMode: false,
   railWidth: null,
+  claudeSessions: {},
   termFontSize: 12,
   termFontFamily: 'JetBrains Mono',
   termFontWeight: 500,
@@ -1653,6 +1659,14 @@ export const useKaisola = create<KaisolaState>()(
     set({ canvasWidth: w == null ? null : Math.min(1600, Math.max(340, Math.round(w))) }),
   setRailWidth: (w) =>
     set({ railWidth: w == null ? null : Math.min(480, Math.max(176, Math.round(w))) }),
+  setClaudeSession: (workspace, sessionId) =>
+    set((s) => {
+      if (s.claudeSessions[workspace] === sessionId) return s
+      // cap the map: drop the oldest entries past 40 workspaces (insertion order)
+      const entries = Object.entries(s.claudeSessions).filter(([ws]) => ws !== workspace)
+      while (entries.length >= 40) entries.shift()
+      return { claudeSessions: Object.fromEntries([...entries, [workspace, sessionId]]) }
+    }),
   setDockColWeights: (weights) =>
     set({ dockColWeights: weights && weights.length ? weights.map((w) => Math.max(0.15, w)) : null }),
   // minimizing the main view leaves only the session cards — so keep them shown

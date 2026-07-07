@@ -376,6 +376,8 @@ export interface KaisolaBridge {
     armHooks(): Promise<{ ok: boolean; settingsPath?: string; message?: string }>
     rebind(): Promise<{ ok: boolean }>
     onEvent(cb: (ev: ClaudeHookEvent) => void): () => void
+    /** Does ~/.claude/projects/<cwd>/<sessionId>.jsonl still exist? Gates --resume. */
+    sessionExists?(cwd: string, sessionId: string): Promise<{ ok: boolean; exists: boolean }>
   }
   git: {
     status(cwd: string): Promise<{ ok: boolean; notRepo?: boolean; root?: string; branch?: string | null; entries?: GitStatusEntry[] }>

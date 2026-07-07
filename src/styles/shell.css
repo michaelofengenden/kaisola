@@ -892,8 +892,8 @@
   border-color: var(--border-strong);
   box-shadow: var(--shadow-1);
 }
-/* the 2px identity line at the top of an open tab — its session hue, the same
-   hue that tints the card's top edge (the tab and its card read as one) */
+/* the 2px identity line at the top of an open tab — the session's ONE colored
+   edge (the card below stays clean; pop-outs keep a hairline, having no tab) */
 .stab[data-active='true']::before {
   content: '';
   position: absolute;
@@ -1084,12 +1084,11 @@
   backdrop-filter: blur(var(--session-glass-blur)) saturate(var(--session-glass-saturate));
   -webkit-backdrop-filter: blur(var(--session-glass-blur)) saturate(var(--session-glass-saturate));
 }
-/* The identity edge, fluent: a hairline that FADES at both ends (no abrupt
-   stops at the rounded corners) over a soft wash of the same hue that tints
-   the card's head and dissolves into the glass — the session's color reads
-   as light falling on the pane, not a painted stripe. Pairs with the tinted
-   icon in the rail. */
-.session-card[data-show='true']::before {
+/* The identity edge: a hairline that FADES at both ends over a soft wash of
+   the session hue. POP-OUT windows only — they have no tab strip, so this is
+   their one identity mark. Docked cards carry the hue on their tab's 2px line
+   instead (one colored edge per session, not two). */
+.session-card.pop-card[data-show='true']::before {
   content: '';
   position: absolute;
   top: 0;

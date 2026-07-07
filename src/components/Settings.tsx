@@ -31,7 +31,7 @@ type SectionId = (typeof SECTIONS)[number]['id']
 /** One quiet line under each pane title — sparse panes read as designed, not empty. */
 const SECTION_DESC: Record<SectionId, string> = {
   general: 'How the shell looks — theme and the native glass material — and software updates.',
-  terminal: 'Type in every terminal card — size, weight, and typeface.',
+  terminal: 'Every terminal card — font size, weight, typeface, and cursor color.',
   agents: 'The CLIs in your + menu. Each runs with your existing install and login — Kaisola never proxies a model.',
   guardrails: 'What agents may do without you: autonomy, saved permission rules, and protected files.',
   models: 'Where AI features think, and the API keys they use — keys live in the OS keychain.',
@@ -40,6 +40,9 @@ const SECTION_DESC: Record<SectionId, string> = {
 
 const slug = (s: string) =>
   s.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 24) || 'agent'
+
+/** Cursor color chips: the olive is the pre-0.1.7 accent look. */
+const CURSOR_COLORS = ['#95a456', '#5aa9e6', '#d8a44a', '#e16a6a', '#5ec5c0']
 
 /**
  * Settings — Zed-style: a category nav on the left, one pane at a time on the
@@ -63,6 +66,8 @@ export function Settings() {
   const setTermFontFamily = useKaisola((s) => s.setTermFontFamily)
   const termFontWeight = useKaisola((s) => s.termFontWeight)
   const setTermFontWeight = useKaisola((s) => s.setTermFontWeight)
+  const termCursorColor = useKaisola((s) => s.termCursorColor)
+  const setTermCursorColor = useKaisola((s) => s.setTermCursorColor)
   const permissionRules = useKaisola((s) => s.permissionRules)
   const removePermissionRule = useKaisola((s) => s.removePermissionRule)
   const sensitiveGlobs = useKaisola((s) => s.sensitiveGlobs)
@@ -319,39 +324,77 @@ export function Settings() {
             )}
 
             {section === 'terminal' && (
-              <div className="settings-row">
-                <span className="settings-row-label">Font</span>
-                <div className="settings-row-control">
-                  <Dropdown
-                    value={String(termFontSize)}
-                    options={[10, 11, 12, 13, 14, 15, 16].map((n) => ({ value: String(n), name: `${n} px` }))}
-                    onSelect={(v) => setTermFontSize(Number(v))}
-                    align="right"
-                    title="Size — ⌘+ / ⌘− anywhere"
-                  />
-                  <Dropdown
-                    value={String(termFontWeight)}
-                    options={[{ value: '400', name: 'Regular' }, { value: '500', name: 'Medium' }, { value: '700', name: 'Bold' }]}
-                    onSelect={(v) => setTermFontWeight(Number(v))}
-                    align="right"
-                    title="Weight"
-                  />
-                  <Dropdown
-                    value={termFontFamily}
-                    options={[
-                      { value: 'JetBrains Mono', name: 'JetBrains Mono' },
-                      { value: 'Fira Code', name: 'Fira Code' },
-                      { value: 'IBM Plex Mono', name: 'IBM Plex Mono' },
-                      { value: 'ui-monospace', name: 'SF Mono (system)' },
-                      { value: 'Menlo', name: 'Menlo' },
-                      { value: 'Monaco', name: 'Monaco' },
-                    ]}
-                    onSelect={setTermFontFamily}
-                    align="right"
-                    title="Typeface"
-                  />
+              <>
+                <div className="settings-row">
+                  <span className="settings-row-label">Font</span>
+                  <div className="settings-row-control">
+                    <Dropdown
+                      value={String(termFontSize)}
+                      options={[10, 11, 12, 13, 14, 15, 16].map((n) => ({ value: String(n), name: `${n} px` }))}
+                      onSelect={(v) => setTermFontSize(Number(v))}
+                      align="right"
+                      title="Size — ⌘+ / ⌘− anywhere"
+                    />
+                    <Dropdown
+                      value={String(termFontWeight)}
+                      options={[{ value: '400', name: 'Regular' }, { value: '500', name: 'Medium' }, { value: '700', name: 'Bold' }]}
+                      onSelect={(v) => setTermFontWeight(Number(v))}
+                      align="right"
+                      title="Weight"
+                    />
+                    <Dropdown
+                      value={termFontFamily}
+                      options={[
+                        { value: 'JetBrains Mono', name: 'JetBrains Mono' },
+                        { value: 'Fira Code', name: 'Fira Code' },
+                        { value: 'IBM Plex Mono', name: 'IBM Plex Mono' },
+                        { value: 'ui-monospace', name: 'SF Mono (system)' },
+                        { value: 'Menlo', name: 'Menlo' },
+                        { value: 'Monaco', name: 'Monaco' },
+                      ]}
+                      onSelect={setTermFontFamily}
+                      align="right"
+                      title="Typeface"
+                    />
+                  </div>
                 </div>
-              </div>
+                <div className="settings-row">
+                  <span className="settings-row-label">Cursor color</span>
+                  <div className="settings-row-control" style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
+                    <button
+                      title="Match text color (default)"
+                      onClick={() => setTermCursorColor('auto')}
+                      style={{
+                        width: 14, height: 14, borderRadius: '50%', cursor: 'pointer', padding: 0,
+                        background: 'var(--text-1)',
+                        border: '1px solid var(--border-strong)',
+                        outline: termCursorColor === 'auto' ? '2px solid var(--text-1)' : 'none',
+                        outlineOffset: 2,
+                      }}
+                    />
+                    {CURSOR_COLORS.map((c) => (
+                      <button
+                        key={c}
+                        title={c}
+                        onClick={() => setTermCursorColor(c)}
+                        style={{
+                          width: 14, height: 14, borderRadius: '50%', background: c, border: 'none',
+                          cursor: 'pointer', padding: 0,
+                          outline: termCursorColor === c ? '2px solid var(--text-1)' : 'none',
+                          outlineOffset: 2,
+                        }}
+                      />
+                    ))}
+                    <input
+                      type="color"
+                      title="Custom color"
+                      value={termCursorColor.startsWith('#') ? termCursorColor : '#d6dae2'}
+                      onChange={(e) => setTermCursorColor(e.target.value)}
+                      style={{ width: 22, height: 18, padding: 0, border: 'none', background: 'transparent', cursor: 'pointer', marginLeft: 4 }}
+                    />
+                  </div>
+                </div>
+              </>
             )}
 
             {section === 'agents' && (!isDesktop ? (

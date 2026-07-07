@@ -18,7 +18,9 @@ const DARK_THEME: ITheme = {
   // a step brighter than the UI's --text-1: glyphs on glass lose edge contrast
   // to the blended backdrop, so the terminal needs more ink than DOM text
   foreground: '#d6dae2',
-  cursor: '#95a456',
+  // minimalist default: the cursor is the same ink as the text; a custom
+  // color (Settings → Terminal) overrides it in xtermTheme below
+  cursor: '#d6dae2',
   cursorAccent: '#0b0d11',
   selectionBackground: 'rgba(149,164,86,0.25)',
   black: '#14161c',
@@ -35,7 +37,7 @@ const DARK_THEME: ITheme = {
 const LIGHT_THEME: ITheme = {
   background: 'rgba(233, 235, 239, 0)',
   foreground: '#21242b',
-  cursor: '#5e7030',
+  cursor: '#21242b',
   cursorAccent: '#e9ebef',
   selectionBackground: 'rgba(94,112,48,0.18)',
   black: '#2a2d34',
@@ -51,8 +53,9 @@ const LIGHT_THEME: ITheme = {
 }
 // energy saver trades the glass look for an opaque backbuffer (transparent
 // WebGL surfaces force an extra compose pass per frame) — solid --term-bg hex
-const xtermTheme = (theme: 'dark' | 'light', eco: boolean) => {
-  const t = theme === 'light' ? LIGHT_THEME : DARK_THEME
+const xtermTheme = (theme: 'dark' | 'light', eco: boolean, cursorColor = 'auto') => {
+  const base = theme === 'light' ? LIGHT_THEME : DARK_THEME
+  const t = cursorColor === 'auto' ? base : { ...base, cursor: cursorColor }
   return eco ? { ...t, background: theme === 'light' ? '#e9ebef' : '#0b0d11' } : t
 }
 
@@ -102,6 +105,9 @@ export function Terminal({ id, attach = false, boot, cwd }: { id: string; attach
   const findInputRef = useRef<HTMLInputElement>(null)
   const [findOpen, setFindOpen] = useState(false)
   const [findQuery, setFindQuery] = useState('')
+  // an OS file drag hovering this terminal — the drop types its path(s) at the
+  // prompt (iTerm-style) instead of opening a file tab
+  const [fileDropHover, setFileDropHover] = useState(false)
   // prompt timeline for the Claude session: a marker per hook prompt event
   const promptMarksRef = useRef<{ marker: IMarker; text: string; at: number }[]>([])
   const [, setPromptTick] = useState(0)
@@ -111,6 +117,7 @@ export function Terminal({ id, attach = false, boot, cwd }: { id: string; attach
   const termFontSize = useKaisola((s) => s.termFontSize)
   const termFontFamily = useKaisola((s) => s.termFontFamily)
   const termFontWeight = useKaisola((s) => s.termFontWeight)
+  const termCursorColor = useKaisola((s) => s.termCursorColor)
   const setTermFontSize = useKaisola((s) => s.setTermFontSize)
   // put-away cards keep their pty but must not keep painting: output buffers
   // here and replays when the card is shown (pop-out windows are always shown).
@@ -138,6 +145,8 @@ export function Terminal({ id, attach = false, boot, cwd }: { id: string; attach
   fontFamilyRef.current = termFontFamily
   const fontWeightRef = useRef(termFontWeight)
   fontWeightRef.current = termFontWeight
+  const cursorColorRef = useRef(termCursorColor)
+  cursorColorRef.current = termCursorColor
   // boot delivery: `create` boots only FRESH ptys; a boot adopted while the pty
   // is already live arrives via the record's bootPending flag instead
   const bootPending = useKaisola((s) => s.terminals.find((t) => t.id === id)?.bootPending)
@@ -154,9 +163,9 @@ export function Terminal({ id, attach = false, boot, cwd }: { id: string; attach
     if (!term) return
     try {
       term.options.allowTransparency = !ecoMode
-      term.options.theme = xtermTheme(theme, ecoMode)
+      term.options.theme = xtermTheme(theme, ecoMode, termCursorColor)
     } catch { /* renderer mid-rebuild */ }
-  }, [theme, ecoMode])
+  }, [theme, ecoMode, termCursorColor])
 
   // a card being put away / brought back: replay buffered output, and stop the
   // cursor-blink render loop while nobody can see it
@@ -216,7 +225,7 @@ export function Terminal({ id, attach = false, boot, cwd }: { id: string; attach
       scrollback: 5000,
       // lift low-contrast ANSI colors (dim grays on glass) to a readable floor
       minimumContrastRatio: 3,
-      theme: xtermTheme(themeRef.current, ecoRef.current),
+      theme: xtermTheme(themeRef.current, ecoRef.current, cursorColorRef.current),
     })
     termRef.current = term
     const fit = new FitAddon()
@@ -586,7 +595,31 @@ export function Terminal({ id, attach = false, boot, cwd }: { id: string; attach
   }
   const promptMarks = promptMarksRef.current.filter((p) => !p.marker.isDisposed)
   return (
-    <div className="term-wrap" data-rail={promptMarks.length > 1 || undefined}>
+    <div
+      className="term-wrap"
+      data-rail={promptMarks.length > 1 || undefined}
+      data-file-drop={fileDropHover || undefined}
+      onDragOver={(e) => {
+        if (!e.dataTransfer?.types.includes('Files')) return
+        e.preventDefault()
+        e.stopPropagation()
+        if (!fileDropHover) setFileDropHover(true)
+      }}
+      onDragLeave={(e) => {
+        if (fileDropHover && !e.currentTarget.contains(e.relatedTarget as Node)) setFileDropHover(false)
+      }}
+      onDrop={(e) => {
+        setFileDropHover(false)
+        const files = Array.from(e.dataTransfer?.files ?? [])
+        if (!files.length) return
+        e.preventDefault()
+        e.stopPropagation() // the window-level handler would open it as a file tab
+        const paths = files.map((f) => bridge.pathForFile?.(f)).filter(Boolean) as string[]
+        if (!paths.length) return
+        bridge.terminal.write(id, paths.map(shellQuote).join(' ') + ' ')
+        termRef.current?.focus()
+      }}
+    >
       {/* prompt timeline for the Claude session — a tick per instigated turn */}
       {promptMarks.length > 1 && (
         <div className="turn-rail" onMouseLeave={() => setRailHover(null)}>

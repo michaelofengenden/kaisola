@@ -168,6 +168,8 @@ export function Assistant({ threadId }: { threadId: string }) {
   const [notice, setNotice] = useState<string | null>(null)
   const [authUrl, setAuthUrl] = useState<string | null>(null)
   const [attachments, setAttachments] = useState<string[]>([])
+  // an OS file drag hovering the chat — the drop lands as attachment chips
+  const [fileDropHover, setFileDropHover] = useState(false)
   const [mentions, setMentions] = useState<Mention[]>([])
   // the active "@query" being typed (null = the mention typeahead is closed)
   const [mentionQuery, setMentionQuery] = useState<string | null>(null)
@@ -518,7 +520,31 @@ export function Assistant({ threadId }: { threadId: string }) {
   }
 
   return (
-    <div className="assistant" data-rail={prompts.length > 1 || undefined}>
+    <div
+      className="assistant"
+      data-rail={prompts.length > 1 || undefined}
+      data-file-drop={fileDropHover || undefined}
+      onDragOver={(e) => {
+        if (!e.dataTransfer?.types.includes('Files')) return
+        e.preventDefault()
+        e.stopPropagation()
+        if (!fileDropHover) setFileDropHover(true)
+      }}
+      onDragLeave={(e) => {
+        if (fileDropHover && !e.currentTarget.contains(e.relatedTarget as Node)) setFileDropHover(false)
+      }}
+      onDrop={(e) => {
+        setFileDropHover(false)
+        const files = Array.from(e.dataTransfer?.files ?? [])
+        if (!files.length) return
+        e.preventDefault()
+        e.stopPropagation() // the window-level handler would open it as a file tab
+        const paths = files.map((f) => bridge.pathForFile?.(f)).filter(Boolean) as string[]
+        if (!paths.length) return
+        setAttachments((a) => [...new Set([...a, ...paths])])
+        inputRef.current?.focus()
+      }}
+    >
       {/* the prompt timeline — every turn you instigated, one tick each */}
       {prompts.length > 1 && (
         <div className="turn-rail" onMouseLeave={() => setRailHover(null)}>

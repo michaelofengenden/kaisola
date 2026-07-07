@@ -100,6 +100,16 @@
   display: flex;
   flex-direction: column;
 }
+/* an OS file drag over the terminal: the drop types the path at the prompt */
+.term-wrap[data-file-drop]::after {
+  content: '';
+  position: absolute;
+  inset: 2px;
+  border: 1.5px dashed var(--border-strong);
+  border-radius: var(--r-2);
+  pointer-events: none;
+  z-index: 3;
+}
 .term-host {
   flex: 1;
   min-height: 0;
@@ -244,6 +254,16 @@
 }
 /* ── turn timeline: a tick per prompt, hover = card, click = jump ────────── */
 .assistant { position: relative; }
+/* an OS file drag over the chat: the drop lands as attachment chips */
+.assistant[data-file-drop]::after {
+  content: '';
+  position: absolute;
+  inset: 2px;
+  border: 1.5px dashed var(--border-strong);
+  border-radius: var(--r-2);
+  pointer-events: none;
+  z-index: 3;
+}
 .assistant[data-rail] .assistant-stream { padding-left: 24px; }
 .term-wrap[data-rail] .term-host { padding-left: 22px; }
 .turn-rail {

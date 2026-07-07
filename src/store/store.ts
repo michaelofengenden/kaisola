@@ -449,7 +449,7 @@ export const PROJECT_SLICE_MEMORY_KEYS = [
 
 const GLOBAL_KEYS = [
   'theme', 'themeMode', 'layoutMode', 'agentModels', 'fileTextZoom', 'termFontSize', 'termFontFamily',
-  'termFontWeight', 'customAgents', 'enabledAgents', 'sessionTemplates', 'claudeModel', 'reasoningProvider',
+  'termFontWeight', 'termCursorColor', 'customAgents', 'enabledAgents', 'sessionTemplates', 'claudeModel', 'reasoningProvider',
   'localBaseUrl', 'localModel', 'openaiBaseUrl', 'openaiModel', 'openAlexMailto', 'grobidEndpoint',
   'sandboxMode', 'workflows', 'automationsEnabled', 'ecoMode', 'railWidth', 'claudeSessions',
   'permissionRules', 'sensitiveGlobs', 'latexMain', 'unsavedBuffers',
@@ -612,6 +612,9 @@ interface KaisolaState {
   termFontFamily: string
   /** Terminal text weight: 400 / 500 / 700 (persisted). */
   termFontWeight: number
+  /** Terminal cursor color: 'auto' follows the terminal text color, otherwise
+   * a hex value ('#95a456' restores the accent look). Persisted. */
+  termCursorColor: string
   /** Working-tree checkpoints (newest first) — hidden-ref git commits taken
    * before each Claude turn and on demand. Scoped to workspacePath. */
   repoCheckpoints: RepoCheckpoint[]
@@ -789,6 +792,7 @@ interface KaisolaState {
   setTermFontSize: (size: number | null) => void
   setTermFontFamily: (family: string) => void
   setTermFontWeight: (weight: number) => void
+  setTermCursorColor: (color: string) => void
   snapshotWorkspace: (label: string) => Promise<RepoCheckpoint | null>
   restoreRepoCheckpoint: (id: string) => Promise<void>
   pushAgentFeed: (item: Omit<AgentFeedItem, 'id'>) => void
@@ -1543,6 +1547,7 @@ export const useKaisola = create<KaisolaState>()(
   termFontSize: 12,
   termFontFamily: 'JetBrains Mono',
   termFontWeight: 500,
+  termCursorColor: 'auto',
   repoCheckpoints: [],
   agentFeed: [],
   followAgent: false,
@@ -2343,6 +2348,8 @@ export const useKaisola = create<KaisolaState>()(
   setTermFontSize: (size) => set({ termFontSize: size == null ? 12 : Math.min(18, Math.max(9, Math.round(size))) }),
   setTermFontFamily: (family) => set({ termFontFamily: family || 'JetBrains Mono' }),
   setTermFontWeight: (weight) => set({ termFontWeight: [400, 500, 700].includes(weight) ? weight : 500 }),
+  setTermCursorColor: (color) =>
+    set({ termCursorColor: color === 'auto' || /^#[0-9a-fA-F]{6}$/.test(color) ? color : 'auto' }),
 
   // ── working-tree checkpoints (Zed-style restore points, via hidden git refs) ──
   snapshotWorkspace: async (label) => {
@@ -3845,6 +3852,7 @@ export const useKaisola = create<KaisolaState>()(
           termFontSize: s.termFontSize,
           termFontFamily: s.termFontFamily,
           termFontWeight: s.termFontWeight,
+          termCursorColor: s.termCursorColor,
           permissionRules: s.permissionRules.slice(-200),
           sensitiveGlobs: s.sensitiveGlobs,
           customAgents: s.customAgents,

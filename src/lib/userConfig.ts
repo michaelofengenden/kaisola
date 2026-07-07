@@ -17,6 +17,7 @@ export const SETTINGS_TEMPLATE = `// Kaisola settings — applied on launch and 
   // "termFontFamily": "JetBrains Mono",
   // "termFontSize": 13,
   // "termFontWeight": 500,                  // 400 | 500 | 700
+  // "termCursorColor": "auto",              // "auto" (match text) | "#rrggbb"
   // "autonomy": "propose",                  // observe | propose | execute | sprint
   // "enabledAgents": ["claude-code", "codex", "opencode"],
   // "customAgents": [{ "id": "custom-my", "name": "My agent", "kind": "terminal", "command": "my-cli", "args": [] }],
@@ -94,6 +95,7 @@ function applySettings(raw: unknown) {
   if (typeof cfg.termFontFamily === 'string') s.setTermFontFamily(cfg.termFontFamily)
   if (typeof cfg.termFontSize === 'number') s.setTermFontSize(cfg.termFontSize)
   if (typeof cfg.termFontWeight === 'number') s.setTermFontWeight(cfg.termFontWeight)
+  if (typeof cfg.termCursorColor === 'string') s.setTermCursorColor(cfg.termCursorColor)
   if (typeof cfg.autonomy === 'string' && ['observe', 'propose', 'execute', 'sprint'].includes(cfg.autonomy)) {
     s.setAutonomy(cfg.autonomy as AutonomyLevel)
   }

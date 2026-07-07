@@ -34,6 +34,11 @@ function setAppFocused(focused) {
 /** id → record */
 const terms = new Map()
 
+/** terminal:run children (plain child_process, not node-pty) — tracked here so
+ *  a non-terminating run command dies on app quit instead of reparenting to
+ *  launchd. terminalHandler registers/unregisters each spawned child. */
+const runChildren = new Set()
+
 function terminalEnv(extra) {
   const env = agentEnv({
     ...(extra || {}),
@@ -155,9 +160,12 @@ function spawn({ id, command, args, cwd, env, cols, rows, sender }) {
   if (missingCwd) {
     // NOT silent: a "worktree" agent that actually landed in $HOME must be
     // visibly flagged at the top of its terminal, never mistaken for an
-    // isolated checkout. Sent through the same data channel the shell uses.
+    // isolated checkout. Seeded as chunks[0] so the create-reply snapshot
+    // carries it — a live send here would fire before Terminal.tsx's data
+    // listener is wired (Electron drops it) and never reach the renderer.
     const warn = `\r\n\x1b[33m⚠ working directory not found:\x1b[0m ${cwd}\r\n\x1b[33m  started in ${os.homedir()} instead — this session is NOT isolated.\x1b[0m\r\n\r\n`
-    queueMicrotask(() => send(rec.sender, `terminal:data:${id}`, warn))
+    rec.chunks.push(warn)
+    rec.chunksLen += warn.length
   }
   return rec
 }
@@ -235,6 +243,20 @@ function release(id) {
   terms.delete(id)
 }
 
+/** Track a terminal:run child so killAll() reaps it on quit; it auto-drops
+ *  itself when the child exits, so the set never accumulates corpses. */
+function trackChild(child) {
+  runChildren.add(child)
+  const drop = () => runChildren.delete(child)
+  child.once('exit', drop)
+  child.once('error', drop)
+  return child
+}
+
+function untrackChild(child) {
+  runChildren.delete(child)
+}
+
 function killAll() {
   for (const r of terms.values()) {
     if (r.flushTimer) clearTimeout(r.flushTimer)
@@ -245,6 +267,20 @@ function killAll() {
     }
   }
   terms.clear()
+  // terminal:run children are plain child_process, not ptys — reap them too, or
+  // a non-terminating run command (dev server, tail -f) reparents to launchd
+  // and outlives the app.
+  for (const child of runChildren) {
+    // -pid: the run-child is spawned detached (its own group), so a negative pid
+    // SIGKILLs the shell AND its grandchildren (dev server / pipeline members);
+    // fall back to the bare child if the group is already gone.
+    try {
+      process.kill(-child.pid, 'SIGKILL')
+    } catch {
+      try { child.kill('SIGKILL') } catch { /* noop */ }
+    }
+  }
+  runChildren.clear()
 }
 
 /** Live sessions with their pid + FOREGROUND process name (node-pty reads the
@@ -262,4 +298,4 @@ function list() {
   return out
 }
 
-module.exports = { available, has, isLive, spawn, write, resize, setSender, snapshot, waitForExit, kill, release, killAll, list, setAppFocused }
+module.exports = { available, has, isLive, spawn, write, resize, setSender, snapshot, waitForExit, kill, release, trackChild, untrackChild, killAll, list, setAppFocused }

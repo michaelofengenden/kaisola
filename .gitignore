@@ -23,3 +23,7 @@ kaisola_icon_concepts/
 
 # Claude Code tooling state (agent scratch memory, session config)
 .claude/
+
+# App-created git worktrees (isolated agent task checkouts) — runtime artifacts,
+# each holds its own nested .git; never track them.
+.pasola-worktrees/

@@ -261,7 +261,10 @@ export const Assistant = memo(function Assistant({ threadId }: { threadId: strin
     for (const file of attachments) rows.push({ id: `file-${file}`, icon: 'Paperclip', label: file.split('/').pop() ?? file, detail: file })
     return rows
   }, [attachments, autonomy, mentions, project, stage])
-  const contextTokenEstimate = Math.ceil((buildContext().length + mentions.reduce((n, m) => n + m.text.length, 0) + attachments.join('\n').length) / 4)
+  const contextTokenEstimate = useMemo(
+    () => Math.ceil((buildContext().length + mentions.reduce((n, m) => n + m.text.length, 0) + attachments.join('\n').length) / 4),
+    [attachments, autonomy, mentions, project, stage],
+  )
 
   const detectMention = (value: string, caret: number) => {
     const m = value.slice(0, caret).match(/@([\w-]*)$/)
@@ -473,7 +476,8 @@ export const Assistant = memo(function Assistant({ threadId }: { threadId: strin
     const refLine = [...mns.map((m) => `@${m.label}`), ...files.map((f) => `📎 ${f.split('/').pop() ?? ''}`)].join('  ·  ')
     const shownText = refLine ? `${text}\n\n${refLine}` : text
     autoNameThread(threadId, text) // first message → the session's topic title
-    updateRuntime(threadId, (r) => ({ ...r, turns: [...r.turns, { kind: 'user', text: shownText, at: Date.now() }], first: false }))
+    const userTurn: Turn = { kind: 'user', text: shownText, at: Date.now() }
+    updateRuntime(threadId, (r) => ({ ...r, turns: [...r.turns, userTurn], first: false }))
     setThreadBusy(threadId, true)
     const mentionPrefix = mns.length ? `Referenced from the research project (use if relevant):\n${mns.map((m) => `- ${m.text}`).join('\n')}\n\n` : ''
     const filePrefix = files.length ? `Attached files (read them if relevant):\n${files.join('\n')}\n\n` : ''
@@ -493,7 +497,17 @@ export const Assistant = memo(function Assistant({ threadId }: { threadId: strin
     setThreadBusy(threadId, false)
     // finished while the card is put away → amber "needs you" dot in the rail
     if (!useKaisola.getState().dockViews.includes(threadId)) useKaisola.getState().markNeedsYou(threadId)
-    if (!res.ok && res.message) { setNotice(res.message); refresh() }
+    if (!res.ok) {
+      // the prompt was rejected — roll back the optimistic user turn so the
+      // transcript doesn't strand an undelivered message. ONLY when nothing
+      // streamed after it (the mid-turn / not-connected rejections reply nothing):
+      // if the agent crashed mid-reply, keep the [user, partial-reply] pair coherent.
+      updateRuntime(threadId, (r) =>
+        r.turns[r.turns.length - 1] === userTurn ? { ...r, turns: r.turns.slice(0, -1), first } : r,
+      )
+      if (res.message) { setNotice(res.message); refresh() }
+      return false
+    }
     return true
   }
   // the ⌘L bar hands prompts to threads through the store — deliver ours once
@@ -559,7 +573,7 @@ export const Assistant = memo(function Assistant({ threadId }: { threadId: strin
             <button
               key={p.idx}
               className="turn-tick"
-              data-active={n === activePrompt}
+              data-active={Math.max(0, prompts.length - 24) + n === activePrompt}
               onMouseEnter={(e) => setRailHover({ n, y: (e.currentTarget as HTMLElement).offsetTop })}
               onClick={() => jumpToTurn(p.idx)}
               aria-label={p.turn.text.slice(0, 60)}

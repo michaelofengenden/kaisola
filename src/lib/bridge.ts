@@ -7,6 +7,8 @@
  * the UI running with clear "desktop only" responses.
  */
 
+import type { AutonomyLevel } from '../domain/types'
+
 /** An Anthropic tool definition (its input_schema is a domain JSON schema). */
 export interface ModelTool {
   name: string
@@ -357,6 +359,8 @@ export interface KaisolaBridge {
     connect(config: AcpConnectConfig): Promise<{ ok: boolean; key?: string; agent?: AcpMeta; controls?: AcpControls; authMethods?: AcpAuthMethod[]; message?: string }>
     disconnect(agentKey: string): Promise<{ ok: boolean }>
     cancel(agentKey: string): Promise<{ ok: boolean }>
+    /** Live autonomy dial — update every connection this window owns in main. */
+    setAutonomy(autonomy: AutonomyLevel): Promise<{ ok: boolean }>
     setMode(agentKey: string, modeId: string): Promise<{ ok: boolean; message?: string }>
     setModel(agentKey: string, modelId: string): Promise<{ ok: boolean; message?: string }>
     setConfigOption(agentKey: string, configId: string, value: string): Promise<{ ok: boolean; message?: string }>
@@ -366,6 +370,8 @@ export interface KaisolaBridge {
     onControls(cb: (info: { key: string; controls: AcpControls }) => void): () => void
     onTerminal(cb: (info: AcpTerminalInfo) => void): () => void
     onPermission(cb: (req: AcpPermissionRequest) => void): () => void
+    /** Main auto-resolved a pending permission (timeout / connection death). */
+    onPermissionResolved(cb: (permId: string) => void): () => void
     respondPermission(permId: string, answer: { optionId?: string; decision?: 'allow' | 'reject' }): Promise<{ ok: boolean }>
     /** Push the sensitive-file globs main enforces on agents' fs channel. */
     setGuardrails?(globs: string[]): void
@@ -449,7 +455,7 @@ export interface KaisolaBridge {
     finalize(req: { taskId: string; message?: string; repo?: string }): Promise<{ ok: boolean; committed?: boolean; message?: string }>
     diff(req: { taskId: string }): Promise<{ ok: boolean; patch?: string; files?: WorktreeFile[]; message?: string }>
     merge(req: { taskId: string; repo?: string }): Promise<{ ok: boolean; conflicted?: boolean; message?: string }>
-    remove(req: { taskId: string; repo?: string }): Promise<{ ok: boolean }>
+    remove(req: { taskId: string; repo?: string }): Promise<{ ok: boolean; message?: string }>
     list(req: { repo: string }): Promise<{ ok: boolean; raw?: string }>
   }
   codex: {
@@ -551,6 +557,9 @@ const webMock: KaisolaBridge = {
     async cancel() {
       return { ok: true }
     },
+    async setAutonomy() {
+      return { ok: true }
+    },
     async setMode() {
       return { ok: false, message: DESKTOP_ONLY }
     },
@@ -576,6 +585,9 @@ const webMock: KaisolaBridge = {
       return () => {}
     },
     onPermission() {
+      return () => {}
+    },
+    onPermissionResolved() {
       return () => {}
     },
     async respondPermission() {

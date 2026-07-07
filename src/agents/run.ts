@@ -1,6 +1,7 @@
 import type { Agent, AgentContext } from './types'
 import type { Proposal } from '../domain/types'
 import { bridge, type AcpUpdate } from '../lib/bridge'
+import { extractJsonObject } from '../lib/extractJson'
 import { EMIT_PROPOSAL_TOOL, EMIT_PROPOSAL_JSON_SCHEMA, toolInputToProposals } from './schema'
 
 export interface RunResult {
@@ -23,16 +24,6 @@ export interface RunOpts {
   agentKey?: string
   /** For provider 'codex': the workspace cwd for `codex exec`. */
   cwd?: string
-}
-
-/** Pull the first parseable {...} object out of free text (for the agent route). */
-function extractJsonObject(text: string): unknown | null {
-  const start = text.indexOf('{')
-  if (start < 0) return null
-  for (let end = text.lastIndexOf('}'); end > start; end = text.lastIndexOf('}', end - 1)) {
-    try { return JSON.parse(text.slice(start, end + 1)) } catch { /* keep shrinking */ }
-  }
-  return null
 }
 
 const SCHEMA_HINT =

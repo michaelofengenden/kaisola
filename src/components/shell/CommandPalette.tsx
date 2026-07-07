@@ -7,6 +7,7 @@ import { openConfigFile } from '../../lib/userConfig'
 import { fileIcon } from '../../lib/fileIcon'
 import { Icon } from '../Icon'
 import { relTime } from '../../lib/format'
+import { terminalLabel } from '@/lib/sessionLabel'
 
 interface Command {
   id: string
@@ -115,7 +116,7 @@ export function CommandPalette() {
       ...st.assistantThreads.map((t) => ({ id: t.id, label: t.name ?? t.autoName ?? 'Agent', icon: 'Sparkles' })),
       ...st.terminals.map((t, i) => ({
         id: t.id,
-        label: t.name ?? t.autoName ?? (st.terminals.length > 1 ? `Terminal ${i + 1}` : 'Terminal'),
+        label: terminalLabel(t, { meta: st.terminalMeta[t.id], index: i, count: st.terminals.length }),
         icon: 'SquareTerminal',
       })),
       ...st.agentTerminals.map((t) => ({ id: t.terminalId, label: t.label || 'agent', icon: 'SquareTerminal' })),

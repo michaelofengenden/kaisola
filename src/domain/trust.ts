@@ -13,9 +13,13 @@ export function minTrust(levels: TrustLevel[]): TrustLevel {
 
 /**
  * Trust of a single provenance link.
- *  - a verified citation, or a result with ≥3 seeds → high
- *  - an unverified citation, a derivation, a dataset, or a 1–2 seed result → medium
+ *  - a verified citation, or an experiment result → high
+ *  - an unverified citation, a derivation, or a dataset → medium
  *  - a human note → low (agency without external support)
+ *
+ * A `result` grades `high` outright — a recorded experiment result is a strong
+ * source. Per-seed grading isn't done here: the ProvenanceLink carries no seed
+ * count (seeds live on ResultRecord, not reachable from the link).
  */
 export function linkTrust(link: ProvenanceLink): TrustLevel {
   switch (link.kind) {

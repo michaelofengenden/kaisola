@@ -51,12 +51,20 @@ const LIGHT_THEME: ITheme = {
   white: '#3b3f48',
   brightWhite: '#16181d',
 }
-// energy saver trades the glass look for an opaque backbuffer (transparent
-// WebGL surfaces force an extra compose pass per frame) — solid --term-bg hex
+// The xterm surface is ALWAYS opaque (allowTransparency stays off): a transparent
+// WebGL surface forces an extra GPU compose every frame the terminal paints — the
+// app's dominant cost while an agent streams. Glass BAKES the old translucent look
+// (45% --term-bg over the opaque --bg-1 card) into a solid color, so it's visually
+// identical to the old transparent surface but never re-composited; eco stays flat
+// --term-bg. Keep these in sync with tokens.css if --term-bg / --bg-1 change.
+const TERM_SURFACE = {
+  glass: { dark: '#0d0f13', light: '#f5f6f8' }, // = color-mix(in srgb, var(--term-bg) 45%, var(--bg-1))
+  eco: { dark: '#0b0d11', light: '#e9ebef' }, // = var(--term-bg)
+}
 const xtermTheme = (theme: 'dark' | 'light', eco: boolean, cursorColor = 'auto') => {
   const base = theme === 'light' ? LIGHT_THEME : DARK_THEME
   const t = cursorColor === 'auto' ? base : { ...base, cursor: cursorColor }
-  return eco ? { ...t, background: theme === 'light' ? '#e9ebef' : '#0b0d11' } : t
+  return { ...t, background: (eco ? TERM_SURFACE.eco : TERM_SURFACE.glass)[theme] }
 }
 
 /** Output kept for a HIDDEN terminal until its card is shown again. Sized to
@@ -89,6 +97,13 @@ const bootLine = (boot: string, singletonKey?: string) =>
  * back re-shows a live xterm instead of replaying the whole pty snapshot. Never
  * seeds NEW ptys: an id lands here only after its terminal actually mounted. */
 export const everMountedTerminals = new Set<string>()
+
+/** Drop a terminal id from the ever-mounted Set — call ONLY on a real terminal
+ * close (store's closeTerminal reap), never on a React unmount: the Set must
+ * survive tab-hide remounts, and only a genuine close should shrink it. */
+export const forgetMountedTerminal = (id: string) => {
+  everMountedTerminals.delete(id)
+}
 
 /** Window-level visibility (minimized / fully occluded): while nobody can see
  * the window, every terminal buffers instead of parsing + painting. */
@@ -171,7 +186,7 @@ export function Terminal({ id, attach = false, boot, cwd }: { id: string; attach
     const term = termRef.current
     if (!term) return
     try {
-      term.options.allowTransparency = !ecoMode
+      term.options.allowTransparency = false // opaque in both modes — no transparent-WebGL per-frame compose
       term.options.theme = xtermTheme(theme, ecoMode, termCursorColor)
     } catch { /* renderer mid-rebuild */ }
   }, [theme, ecoMode, termCursorColor])
@@ -233,7 +248,7 @@ export function Terminal({ id, attach = false, boot, cwd }: { id: string; attach
       allowProposedApi: true,
       // the glass shell shows through the pane tint — unless energy saver
       // trades the see-through backbuffer for a cheaper opaque one
-      allowTransparency: !ecoRef.current,
+      allowTransparency: false, // opaque in both modes — see TERM_SURFACE (no per-frame WebGL compose)
       scrollback: 5000,
       // lift low-contrast ANSI colors (dim grays on glass) to a readable floor
       minimumContrastRatio: 3,

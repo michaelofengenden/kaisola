@@ -3,6 +3,7 @@ import { useKaisola, sessionOrderIds } from '../../store/store'
 import { bridge } from '../../lib/bridge'
 import { fuzzyRank } from '../../lib/fuzzy'
 import { useAgentRegistry, agentName } from '../../lib/registry'
+import { terminalLabel } from '@/lib/sessionLabel'
 import { Icon } from '../Icon'
 
 interface OmniAction {
@@ -77,7 +78,7 @@ export function OmniBar() {
       const th = threads.find((t) => t.id === id)
       if (th) return { label: th.name ?? th.autoName ?? agentName(agents, th.agentKey) ?? 'Agent', icon: 'Sparkles' }
       const te = terminals.find((t) => t.id === id)
-      if (te) return { label: te.name ?? te.autoName ?? 'Terminal', icon: 'SquareTerminal' }
+      if (te) return { label: terminalLabel(te, { meta: s.terminalMeta[te.id], agents, index: terminals.indexOf(te), count: terminals.length }), icon: 'SquareTerminal' }
       const at = agentTerminals.find((t) => t.terminalId === id)
       if (at) return { label: at.label || 'agent', icon: 'SquareTerminal' }
       const p = panels.find((x) => x.id === id)

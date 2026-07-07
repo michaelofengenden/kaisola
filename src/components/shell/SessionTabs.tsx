@@ -2,17 +2,10 @@ import { useState, type CSSProperties } from 'react'
 import { useKaisola, sessionOrderIds } from '../../store/store'
 import { bridge } from '../../lib/bridge'
 import { sessionHue, terminalAgentKey } from '../../lib/sessionHue'
-import { useAgentRegistry, agentName, openAgentSession } from '../../lib/registry'
+import { useAgentRegistry, openAgentSession } from '../../lib/registry'
+import { urlHost, terminalLabel, threadLabel } from '@/lib/sessionLabel'
 import { Icon } from '../Icon'
 import { Dropdown } from '../Dropdown'
-
-const urlHost = (u?: string) => {
-  try {
-    return u ? new URL(u).host : undefined
-  } catch {
-    return undefined
-  }
-}
 
 interface STab {
   id: string
@@ -71,8 +64,7 @@ export function SessionTabs() {
 
   const tabs = new Map<string, STab>()
   threads.forEach((t, i) => {
-    const nm = agentName(agents, t.agentKey) ?? 'Agent'
-    const label = t.name ?? t.autoName ?? `${nm}${threads.filter((x) => x.agentKey === t.agentKey).length > 1 ? ` ${i + 1}` : ''}`
+    const label = threadLabel(t, agents, threads, i)
     tabs.set(t.id, {
       id: t.id,
       icon: 'Sparkles',
@@ -87,13 +79,7 @@ export function SessionTabs() {
   terminals.forEach((t, i) => {
     const meta = terminalMeta[t.id]
     const agentKey = terminalAgentKey(t.singletonKey)
-    // stable identity, never keystrokes: manual name → agent → repo → folder
-    const folder = meta?.repo ?? (meta?.cwd ?? t.cwd)?.split('/').filter(Boolean).pop()
-    const label =
-      t.name ??
-      (agentKey ? agentName(agents, agentKey) ?? agentKey : undefined) ??
-      folder ??
-      (terminals.length > 1 ? `Terminal ${i + 1}` : 'Terminal')
+    const label = terminalLabel(t, { meta, agents, index: i, count: terminals.length })
     const failed = !meta?.running && (meta?.lastExit ?? 0) > 0
     tabs.set(t.id, {
       id: t.id,

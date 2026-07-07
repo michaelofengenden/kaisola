@@ -7,6 +7,11 @@ const { spawn, execFile } = require('node:child_process')
 const { BrowserWindow } = require('electron')
 const mgr = require('./terminalManager.cjs')
 
+// terminal:run cap: a non-terminating command (dev server, tail -f, blocked on
+// stdin) never fires 'close', so without this the invoke Promise hangs forever.
+// On timeout the child is killed and the promise resolves with partial output.
+const RUN_TIMEOUT_MS = 120_000
+
 // ── session identity poller ──────────────────────────────────────────────────
 // Every live pty is polled for its FOREGROUND process (free via node-pty) and
 // its live cwd (lsof — the shell cd's after spawn, so the record cwd goes
@@ -165,15 +170,39 @@ function registerTerminalHandlers(ipcMain) {
   ipcMain.handle('terminal:run', (_e, { command, cwd } = {}) => {
     return new Promise((resolve) => {
       const shell = process.env.SHELL || '/bin/zsh'
-      const child = spawn(shell, ['-lc', command], { cwd: cwd || os.homedir(), env: process.env })
+      // detached: give the shell its OWN process group so killing -pid reaps the
+      // whole tree (npm → node/vite, pipeline members), not just the shell — a bare
+      // child.kill would orphan grandchildren (a dev server) to launchd.
+      const child = spawn(shell, ['-lc', command], { cwd: cwd || os.homedir(), env: process.env, detached: true })
+      mgr.trackChild(child) // reaped on app quit instead of reparenting to launchd
+      child.unref() // a lingering run-child must not, by itself, hold the app open
       // only the first 20k chars survive anyway — cap DURING accumulation so a
       // huge-output command can't balloon main-process memory first
       let out = ''
       let err = ''
+      let settled = false
+      let timer = null
+      const finish = (result) => {
+        if (settled) return
+        settled = true
+        clearTimeout(timer)
+        mgr.untrackChild(child)
+        resolve(result)
+      }
+      // a command that never terminates (dev server, tail -f, blocked on stdin)
+      // never fires 'close', so cap it: kill the child and resolve with whatever
+      // it printed so far (flagged timedOut) rather than hang the invoke forever.
+      timer = setTimeout(() => {
+        // -pid kills the whole detached group (shell + grandchildren); fall back
+        // to the bare child if it already exited and the group is gone.
+        try { process.kill(-child.pid, 'SIGKILL') } catch { try { child.kill('SIGKILL') } catch { /* already gone */ } }
+        finish({ ok: false, code: -1, stdout: out.slice(0, 20000), stderr: err.slice(0, 20000), timedOut: true })
+      }, RUN_TIMEOUT_MS)
+      timer.unref?.() // the timeout itself must not keep the event loop alive
       child.stdout.on('data', (d) => { if (out.length < 20000) out += d.toString() })
       child.stderr.on('data', (d) => { if (err.length < 20000) err += d.toString() })
-      child.on('close', (code) => resolve({ ok: code === 0, code, stdout: out.slice(0, 20000), stderr: err.slice(0, 20000) }))
-      child.on('error', (e) => resolve({ ok: false, code: -1, stdout: '', stderr: String(e.message) }))
+      child.on('close', (code) => finish({ ok: code === 0, code, stdout: out.slice(0, 20000), stderr: err.slice(0, 20000) }))
+      child.on('error', (e) => finish({ ok: false, code: -1, stdout: '', stderr: String(e.message) }))
     })
   })
 }

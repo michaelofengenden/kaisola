@@ -290,8 +290,8 @@ export default function App() {
   // Background → the auto-answer is global (sensitiveGlobs + permissionRules),
   // so honor it here too, but park the human-facing card in the owner's slice
   // with a needs-you badge (never the active project — spec risk #3).
-  useEffect(
-    () =>
+  useEffect(() => {
+    const offs = [
       bridge.acp.onPermission((req) => {
         const st = useKaisola.getState()
         const pid = projectIdForEvent(st, { agentKey: req.key })
@@ -321,8 +321,12 @@ export default function App() {
           'needs-you',
         )
       }),
-    [],
-  )
+      // main resolved a pending ask itself (5-min timeout, or the agent died
+      // while it was pending) — drop the inline card the composer is still showing
+      bridge.acp.onPermissionResolved((permId) => useKaisola.getState().dismissPermission(permId)),
+    ]
+    return () => { for (const off of offs) off?.() }
+  }, [])
 
   // push the rehydrated sensitive-file globs to main (agents' fs enforcement)
   useEffect(() => {

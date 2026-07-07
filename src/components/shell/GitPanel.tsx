@@ -64,6 +64,9 @@ export function GitPanel() {
   // last-fired wins: a slow watcher-triggered status must never overwrite the
   // result of a later post-stage/post-commit refresh
   const refreshSeq = useRef(0)
+  // last-clicked wins: a slow diff read for one file must never overwrite the
+  // diff of a later-clicked file
+  const openSeq = useRef(0)
 
   const refresh = useCallback(async () => {
     if (!workspacePath || !isDesktop) return
@@ -111,6 +114,7 @@ export function GitPanel() {
 
   const openDiff = async (entry: GitStageEntry, stagedSide: boolean) => {
     if (!root) return
+    const seq = ++openSeq.current
     const abs = `${root}/${entry.path}`
     // a STAGED row previews what the commit will actually contain: HEAD vs the
     // INDEX (:0:path). An unstaged row previews the worktree edits.
@@ -122,6 +126,7 @@ export function GitPanel() {
           ? bridge.git.show(root, ':0', abs)
           : bridge.fs.read(abs),
     ])
+    if (seq !== openSeq.current) return
     setDiff({
       path: entry.path,
       base: 'content' in baseR && typeof baseR.content === 'string' ? baseR.content : '',

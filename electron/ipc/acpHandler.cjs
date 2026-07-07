@@ -28,22 +28,41 @@ function surfaceAuthUrl(entry, name, key, url) {
 
 const MOCK_AGENT = path.join(__dirname, '..', 'acp-mock-agent.cjs')
 let acpTermSeq = 0
-let autonomy = 'propose'
+// autonomy is PER-CONNECTION (entry.autonomy) — this is only the initial default
+// a connect uses when the renderer didn't send one.
+const DEFAULT_AUTONOMY = 'propose'
 // sensitive-file guardrails (Zed's pattern): agents' fs channel refuses these.
 // The renderer owns the list (Settings) and pushes updates; defaults mirror it.
 let sensitiveGlobs = ['**/.env*', '**/*.pem', '**/*.key', '**/*.cert', '**/*.crt', '**/.dev.vars', '**/secrets.yml']
+// MUST mirror src/lib/permissionRules.ts `wildcardMatch` (the canonical spec):
+// same flags 'is' (case-insensitive + dotAll) so a newline-containing path the
+// renderer flags sensitive is refused here too, not silently allowed.
 const globRe = (g) =>
-  new RegExp('^' + g.split('*').map((s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('.*') + '$', 'i')
+  new RegExp('^' + g.split('*').map((s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('.*') + '$', 'is')
 function isSensitivePath(p) {
   const s = String(p || '')
   return sensitiveGlobs.some(
     (g) => globRe(g).test(s) || (g.startsWith('**/') && (globRe(g.slice(3)).test(s) || globRe('*' + g.slice(2)).test(s))),
   )
 }
-// inline permission cards: permId → resolver for the agent's blocked request
+// inline permission cards: permId → { resolve, timer, entry } for the agent's
+// blocked request (entry lets us clean up a dying connection's cards)
 let permSeq = 0
 const pendingPermissions = new Map()
 const PERMISSION_TIMEOUT_MS = 300_000
+
+/** Auto-resolve (as cancel) and clear every inline permission a dying connection
+ * left pending, telling its renderer to drop the now-orphaned card + needs-you
+ * badge. Idempotent — an already-answered/timed-out permId is simply absent. */
+function cancelPendingFor(entry) {
+  for (const [permId, p] of pendingPermissions) {
+    if (p.entry !== entry) continue
+    clearTimeout(p.timer)
+    pendingPermissions.delete(permId)
+    p.resolve('cancel')
+    sendTo(entry, 'acp:permission-resolved', { permId })
+  }
+}
 
 /**
  * `${webContents.id}|${presetId}` → { conn, meta, sender, controls, current }.
@@ -181,7 +200,6 @@ function registerAcpHandlers(ipcMain) {
   })
 
   ipcMain.handle('acp:connect', async (event, config = {}) => {
-    autonomy = config.autonomy || autonomy
     const resolved = resolveConfig(config)
     const key = resolved.presetId
     const internalKey = ikey(event.sender, key)
@@ -198,7 +216,7 @@ function registerAcpHandlers(ipcMain) {
     let stderrTail = ''
     // entry.sender tracks the CURRENT window (acp:status rebinds it), so these
     // callbacks keep reaching the renderer after a window close/reopen
-    const entry = { conn: null, meta: null, sender: event.sender, controls: { modes: null, configOptions: [] }, current: { sender: null, channel: null } }
+    const entry = { conn: null, meta: null, sender: event.sender, controls: { modes: null, configOptions: [] }, current: { sender: null, channel: null }, autonomy: config.autonomy || DEFAULT_AUTONOMY }
 
     const conn = new AcpConnection(
       { command: resolved.command, args: resolved.args, env: resolved.env, cwd: sessionCwd },
@@ -211,6 +229,9 @@ function registerAcpHandlers(ipcMain) {
         },
         onNotice: (n) => {
           if (n && n.kind === 'stderr' && n.text) stderrTail = (stderrTail + n.text).slice(-600)
+          // the agent process died — drop any inline cards it left pending, else
+          // their resolvers + needs-you badge leak until the 5-min timeout
+          if (n && n.kind === 'exit') cancelPendingFor(entry)
           sendTo(entry, 'acp:notice', { agent: resolved.name, key, ...n })
           const m = n && n.text && n.text.match(URL_RE)
           if (m) surfaceAuthUrl(entry, resolved.name, key, m[0])
@@ -223,8 +244,11 @@ function registerAcpHandlers(ipcMain) {
         // execute/sprint auto-allow, propose asks the human via an inline
         // card in the thread (Zed-style — non-modal, option-per-button).
         onPermission: async (params) => {
-          if (autonomy === 'observe') return 'reject'
-          if (autonomy === 'execute' || autonomy === 'sprint') return 'allow'
+          // per-connection autonomy (NOT a shared global): a window-1 Observe
+          // agent stays read-only even after window-2 connects at Sprint, and the
+          // live dial (acp:set-autonomy) can lower it mid-turn to stop this agent
+          if (entry.autonomy === 'observe') return 'reject'
+          if (entry.autonomy === 'execute' || entry.autonomy === 'sprint') return 'allow'
           // no live window to ask → fail CLOSED, never silently allow
           if (!entry.sender || entry.sender.isDestroyed()) return 'cancel'
           const toolCall = (params && params.toolCall) || {}
@@ -243,8 +267,11 @@ function registerAcpHandlers(ipcMain) {
             const timer = setTimeout(() => {
               pendingPermissions.delete(permId)
               resolve('cancel') // nobody answered — never silently allow
+              // symmetrical to the acp:permission emit below: clear the orphaned
+              // inline card + needs-you badge the renderer is still showing
+              sendTo(entry, 'acp:permission-resolved', { permId })
             }, PERMISSION_TIMEOUT_MS)
-            pendingPermissions.set(permId, { resolve, timer })
+            pendingPermissions.set(permId, { resolve, timer, entry })
             sendTo(entry, 'acp:permission', {
               permId,
               key,
@@ -285,18 +312,22 @@ function registerAcpHandlers(ipcMain) {
     const entry = entryFor(event.sender, agentKey)
     if (!entry || !entry.conn.alive) return { ok: false, message: 'Agent not connected.' }
     if (entry.current.channel) return { ok: false, message: 'Agent is mid-turn — send again when it finishes.' }
-    entry.current = { sender: event.sender, channel: `acp:update:${reqId}` }
+    // identity token: acp:cancel may null entry.current to free the composer for a
+    // hung agent, so read the __done target from this local turn (not entry.current,
+    // which cancel/a newer prompt may have replaced) and clear only if still ours.
+    const turn = { sender: event.sender, channel: `acp:update:${reqId}` }
+    entry.current = turn
     try {
       const res = await entry.conn.prompt(text)
-      if (entry.current.sender && !entry.current.sender.isDestroyed()) {
-        entry.current.sender.send(entry.current.channel, { __done: true, stopReason: res && res.stopReason })
+      if (turn.sender && !turn.sender.isDestroyed()) {
+        turn.sender.send(turn.channel, { __done: true, stopReason: res && res.stopReason })
       }
       return { ok: true, stopReason: res && res.stopReason }
     } catch (err) {
-      if (entry.current.sender && !entry.current.sender.isDestroyed()) entry.current.sender.send(entry.current.channel, { __done: true })
+      if (turn.sender && !turn.sender.isDestroyed()) turn.sender.send(turn.channel, { __done: true })
       return { ok: false, message: err.message }
     } finally {
-      entry.current = { sender: null, channel: null }
+      if (entry.current === turn) entry.current = { sender: null, channel: null }
     }
   })
 
@@ -339,6 +370,17 @@ function registerAcpHandlers(ipcMain) {
     if (Array.isArray(globs)) sensitiveGlobs = globs.filter((g) => typeof g === 'string' && g.trim())
   })
 
+  // live autonomy dial: apply to EVERY connection this window owns (keys start
+  // `${sender.id}|`) so lowering to Observe mid-session immediately stops each
+  // running agent's next request, without touching another window's agents.
+  ipcMain.handle('acp:set-autonomy', (event, { autonomy } = {}) => {
+    const prefix = `${event.sender.id}|`
+    for (const [k, entry] of connections) {
+      if (k.startsWith(prefix)) entry.autonomy = autonomy || DEFAULT_AUTONOMY
+    }
+    return { ok: true }
+  })
+
   // the inline card's answer — 'allow' | 'reject' | a concrete optionId
   ipcMain.handle('acp:permission:respond', (_e, { permId, optionId, decision } = {}) => {
     const pending = pendingPermissions.get(permId)
@@ -350,7 +392,14 @@ function registerAcpHandlers(ipcMain) {
   })
 
   ipcMain.handle('acp:cancel', (event, { agentKey } = {}) => {
-    entryFor(event.sender, agentKey)?.conn.cancel()
+    const entry = entryFor(event.sender, agentKey)
+    entry?.conn.cancel()
+    // a hung agent may ACK session/cancel but neither finish nor exit, so the
+    // prompt's promise never settles and its finally never clears the lock —
+    // free it here so the composer isn't wedged. The in-flight prompt's finally
+    // is identity-guarded (only clears if entry.current is still its own turn),
+    // so this can't double-clear or stomp a newer turn.
+    if (entry && entry.current.channel) entry.current = { sender: null, channel: null }
     return { ok: true }
   })
 
@@ -358,6 +407,7 @@ function registerAcpHandlers(ipcMain) {
     const internalKey = ikey(event.sender, agentKey)
     const entry = connections.get(internalKey)
     if (entry) {
+      cancelPendingFor(entry) // drop any inline cards before the connection goes away
       entry.conn.dispose()
       connections.delete(internalKey)
     }

@@ -1,4 +1,4 @@
-import { useMemo, useState } from 'react'
+import { useEffect, useMemo } from 'react'
 import {
   ReactFlow,
   Background,
@@ -6,6 +6,8 @@ import {
   Handle,
   Position,
   MarkerType,
+  useNodesState,
+  useEdgesState,
   type Node,
   type Edge,
   type NodeProps,
@@ -107,8 +109,23 @@ export function ClaimGraphView() {
     [claimGraph.edges],
   )
 
-  const [nodes] = useState<FlowNode[]>(initialNodes)
-  const [edges] = useState<Edge[]>(initialEdges)
+  const [nodes, setNodes, onNodesChange] = useNodesState<FlowNode>(initialNodes)
+  const [edges, setEdges, onEdgesChange] = useEdgesState(initialEdges)
+
+  /** initialNodes/initialEdges re-memoize on store edits — push them into the
+   *  canvas so verify/apply/ingest changes land. Merge by id so a local drag
+   *  position + selection survives a store write (e.g. a no-op Verify that
+   *  rebuilds the nodes array); only genuinely new nodes take their store position. */
+  useEffect(() => {
+    setNodes((cur) => {
+      const prev = new Map(cur.map((n) => [n.id, n]))
+      return initialNodes.map((n) => {
+        const p = prev.get(n.id)
+        return p ? { ...n, position: p.position, selected: p.selected } : n
+      })
+    })
+  }, [initialNodes, setNodes])
+  useEffect(() => { setEdges(initialEdges) }, [initialEdges, setEdges])
 
   /** Only legend the types that actually appear, in a stable canonical order. */
   const presentTypes = useMemo<GraphNodeType[]>(() => {
@@ -151,6 +168,8 @@ export function ClaimGraphView() {
         <ReactFlow
           nodes={nodes}
           edges={edges}
+          onNodesChange={onNodesChange}
+          onEdgesChange={onEdgesChange}
           nodeTypes={nodeTypes}
           fitView
           proOptions={{ hideAttribution: true }}

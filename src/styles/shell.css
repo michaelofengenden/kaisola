@@ -1175,6 +1175,12 @@
 :root[data-perf='eco'] .queue-dot,
 :root[data-perf='eco'] .agent-pulse-dot,
 :root[data-perf='eco'] .agent-run-dot,
+/* the conic "agent running" border-beam + top progress beam repaint a full
+   gradient ring/bar every frame — the most expensive animations eco used to
+   leave running, against its own "still indicators" contract */
+:root[data-perf='eco'] .agent-row.is-running::before,
+:root[data-perf='eco'] .msg.is-running::before,
+:root[data-perf='eco'] .top-progress::before,
 :root[data-perf='eco'] .aurora::before,
 /* background-position loops repaint their gradient every frame — still, in eco */
 :root[data-perf='eco'] .skeleton,

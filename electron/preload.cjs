@@ -40,6 +40,8 @@ const bridge = {
     connect: (config) => ipcRenderer.invoke('acp:connect', config),
     disconnect: (agentKey) => ipcRenderer.invoke('acp:disconnect', { agentKey }),
     cancel: (agentKey) => ipcRenderer.invoke('acp:cancel', { agentKey }),
+    // live autonomy dial → every connection this window owns (see acpHandler)
+    setAutonomy: (autonomy) => ipcRenderer.invoke('acp:set-autonomy', { autonomy }),
     setMode: (agentKey, modeId) => ipcRenderer.invoke('acp:setMode', { agentKey, modeId }),
     setModel: (agentKey, modelId) => ipcRenderer.invoke('acp:setModel', { agentKey, modelId }),
     setConfigOption: (agentKey, configId, value) => ipcRenderer.invoke('acp:setConfigOption', { agentKey, configId, value }),
@@ -82,6 +84,12 @@ const bridge = {
       const listener = (_e, req) => cb(req)
       ipcRenderer.on('acp:permission', listener)
       return () => ipcRenderer.removeListener('acp:permission', listener)
+    },
+    /** Main auto-resolved a pending permission (timeout / connection death) — drop the card. */
+    onPermissionResolved: (cb) => {
+      const listener = (_e, { permId }) => cb(permId)
+      ipcRenderer.on('acp:permission-resolved', listener)
+      return () => ipcRenderer.removeListener('acp:permission-resolved', listener)
     },
     respondPermission: (permId, answer) =>
       ipcRenderer.invoke('acp:permission:respond', { permId, ...answer }),

@@ -39,6 +39,7 @@ import { extractDoi, lookupOpenAlex, lookupOpenAlexByArxiv, resolveReferences } 
 import { parseTei, locateQuote } from '../lib/grobid'
 import { bridge, isDesktop, type AcpPermissionRequest } from '../lib/bridge'
 import { folderHue } from '../lib/sessionHue'
+import { forgetMountedTerminal } from '../components/Terminal'
 import {
   allowOnceAnswer,
   rejectOnceAnswer,
@@ -800,6 +801,8 @@ interface KaisolaState {
   receivePermission: (req: AcpPermissionRequest) => void
   pushPermission: (req: AcpPermissionRequest) => void
   answerPermission: (permId: string, answer: { optionId?: string; decision?: 'allow' | 'reject' }, opts?: { cascadeReject?: boolean }) => void
+  /** UI-only: drop a card main already resolved itself (timeout / agent death). */
+  dismissPermission: (permId: string) => void
   alwaysAllowPermission: (permId: string) => void
   removePermissionRule: (id: string) => void
   setSensitiveGlobs: (globs: string[]) => void
@@ -1679,7 +1682,13 @@ export const useKaisola = create<KaisolaState>()(
   },
   setLayoutMode: (mode) => set({ layoutMode: mode }),
   toggleLayoutMode: () => set((s) => ({ layoutMode: s.layoutMode === 'focus' ? 'studio' : 'focus' })),
-  setAutonomy: (a) => set({ autonomy: a }),
+  setAutonomy: (a) => {
+    set({ autonomy: a })
+    // tell main NOW — main gates each connection's permissions on its per-entry
+    // autonomy, so lowering the dial mid-session must reach it to stop a running
+    // agent (fire-and-forget; the web mock no-ops)
+    void bridge.acp.setAutonomy(a)
+  },
   openPalette: (mode) => set((s) => ({ paletteOpen: true, paletteMode: mode ?? s.paletteMode })),
   closePalette: () => set({ paletteOpen: false }),
   // toggling into an ALREADY-OPEN palette with a different mode switches modes
@@ -1853,6 +1862,10 @@ export const useKaisola = create<KaisolaState>()(
       termCloseTokens.delete(id) // grace resolved — don't let the Map grow per-close forever
       const now = get()
       if (now.terminals.some((t) => t.id === id)) return // reopened — keep the pty
+      // REAL close (survived the grace, not reopened): drop it from the
+      // ever-mounted Set too — the sibling termCloseTokens reap left it growing
+      // forever. Placed after the reopened guard so a kept terminal isn't forgotten.
+      forgetMountedTerminal(id)
       void bridge.terminal.kill(id)
       set((s) => ({ closedStack: s.closedStack.filter((c) => c.term?.id !== id) }))
     }, 60_000)
@@ -2240,7 +2253,14 @@ export const useKaisola = create<KaisolaState>()(
     const s = get()
     const wt = s.worktreeSessions[sessionId]
     if (!wt) return
-    await bridge.worktree.remove({ taskId: wt.taskId, repo: wt.repo })
+    const r = await bridge.worktree.remove({ taskId: wt.taskId, repo: wt.repo })
+    // git cleanup can fail (worktree locked, branch checked out elsewhere). Keep
+    // the session AND its terminal so the user can retry, and say why — never toast
+    // success while .pasola-worktrees/<taskId> + pz/<taskId> linger orphaned.
+    if (!r.ok) {
+      s.pushToast('error', `Couldn’t remove the ${wt.branch} worktree${r.message ? ` — ${r.message}` : ''}. Try again once nothing else is using it.`)
+      return
+    }
     set((st) => {
       const worktreeSessions = { ...st.worktreeSessions }
       delete worktreeSessions[sessionId]
@@ -2507,6 +2527,26 @@ export const useKaisola = create<KaisolaState>()(
     }
     set({ pendingPermissions: remaining })
   },
+  // main already resolved this ask itself (5-min timeout, or the connection died
+  // while it was pending) — just remove the card. Mirrors answerPermission's card
+  // removal but sends NO response to main (it already has one); the needs-you dot
+  // clears on view exactly as after an answer.
+  dismissPermission: (permId) =>
+    set((s) => ({
+      pendingPermissions: s.pendingPermissions.filter((p) => p.permId !== permId),
+      // the resolved event carries no project id, and App.tsx parks a NON-active
+      // project's ask into its slice (projectSlices[pid].pendingPermissions), so
+      // the card can live off the active flat list — clear it from every slice
+      // that holds it too, or a background project's timed-out card stays stuck.
+      projectSlices: Object.fromEntries(
+        Object.entries(s.projectSlices).map(([id, sl]) => [
+          id,
+          sl.pendingPermissions?.some((p) => p.permId === permId)
+            ? { ...sl, pendingPermissions: sl.pendingPermissions.filter((p) => p.permId !== permId) }
+            : sl,
+        ]),
+      ),
+    })),
   // "Always allow" = save a client-side rule, answer this ask, and
   // RETROACTIVELY resolve every other pending ask the new rule now covers
   alwaysAllowPermission: (permId) => {
@@ -3370,6 +3410,7 @@ export const useKaisola = create<KaisolaState>()(
       },
     })),
   runExperiment: async (planId) => {
+    const pid = get().activeProjectId // pin every write to this project, even across a mid-run switch
     const { project, autonomy, sandboxMode, workspacePath } = get()
     const plan = project.experiments.find((e) => e.id === planId)
     if (!plan) return
@@ -3433,13 +3474,13 @@ export const useKaisola = create<KaisolaState>()(
           createdAt: startedAt,
         }
       : undefined
-    set((s) => ({
+    get().patchProject(pid, (sl) => ({
       project: {
-        ...s.project,
-        runs: [...s.project.runs, run],
-        attempts: attempt ? [...s.project.attempts, attempt] : s.project.attempts,
-        campaign: campaign ? { ...campaign, status: 'active', updatedAt: nowISO() } : s.project.campaign,
-        experiments: s.project.experiments.map((e) => (e.id === planId ? { ...e, status: 'running' } : e)),
+        ...sl.project,
+        runs: [...sl.project.runs, run],
+        attempts: attempt ? [...sl.project.attempts, attempt] : sl.project.attempts,
+        campaign: campaign ? { ...campaign, status: 'active', updatedAt: nowISO() } : sl.project.campaign,
+        experiments: sl.project.experiments.map((e) => (e.id === planId ? { ...e, status: 'running' } : e)),
       },
     }))
     if (campaign && command === placeholderCommand) {
@@ -3447,10 +3488,10 @@ export const useKaisola = create<KaisolaState>()(
     }
     get().pushActivity('execution', `Running “${plan.title}” in the ${sandboxMode} sandbox…`)
     const appendNb = (level: NotebookLevel, text: string) =>
-      set((s) => ({
+      get().patchProject(pid, (sl) => ({
         project: {
-          ...s.project,
-          runs: s.project.runs.map((r) =>
+          ...sl.project,
+          runs: sl.project.runs.map((r) =>
             r.id === runId ? { ...r, notebook: [...r.notebook, { id: uid('nb'), at: nowISO(), level, text }] } : r,
           ),
         },
@@ -3467,32 +3508,32 @@ export const useKaisola = create<KaisolaState>()(
       },
     )
     const metricValue = campaign ? parseMetric(stdout, campaign.evaluator.metric, campaign.evaluator.unit) : undefined
-    set((s) => ({
+    get().patchProject(pid, (sl) => ({
       project: {
-        ...s.project,
-        runs: s.project.runs.map((r) =>
+        ...sl.project,
+        runs: sl.project.runs.map((r) =>
           r.id === runId
             ? { ...r, status: res.ok ? 'done' : 'failed', endedAt: nowISO(), summary: res.ok ? 'Completed in the sandbox.' : res.message ?? `Exited ${res.code}` }
             : r,
         ),
         attempts: attemptId
-          ? s.project.attempts.map((a) =>
+          ? sl.project.attempts.map((a) =>
               a.id === attemptId
                 ? {
                     ...a,
                     status: res.ok ? 'ready' : 'failed',
                     completedAt: nowISO(),
-                    artifactIds: s.project.runs.find((r) => r.id === runId)?.artifacts.map((artifact) => artifact.id) ?? [],
+                    artifactIds: sl.project.runs.find((r) => r.id === runId)?.artifacts.map((artifact) => artifact.id) ?? [],
                     metric: metricValue != null && campaign
                       ? { name: campaign.evaluator.metric, value: metricValue, unit: campaign.evaluator.unit }
                       : a.metric,
                   }
                 : a,
             )
-          : s.project.attempts,
+          : sl.project.attempts,
         // the plan transitions running → done once execution completes; the Run
         // record (above) holds the actual pass/fail, so it never sticks on 'running'
-        experiments: s.project.experiments.map((e) => (e.id === planId ? { ...e, status: 'done' } : e)),
+        experiments: sl.project.experiments.map((e) => (e.id === planId ? { ...e, status: 'done' } : e)),
       },
     }))
     get().pushActivity('execution', res.ok

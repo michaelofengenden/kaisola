@@ -122,8 +122,16 @@ async function remove(taskId, repo) {
     worktrees.delete(taskId)
     return { ok: true }
   }
-  await git(wt.repo, ['worktree', 'remove', '--force', wt.path])
-  await git(wt.repo, ['branch', '-D', wt.branch])
+  // capture both results — git() never rejects, so a failed removal (locked
+  // worktree, branch checked out elsewhere) is a swallowed ok:false otherwise.
+  const rm = await git(wt.repo, ['worktree', 'remove', '--force', wt.path])
+  const br = await git(wt.repo, ['branch', '-D', wt.branch])
+  if (!rm.ok || !br.ok) {
+    // leave the entry registered so a retry can still find it — deleting here
+    // would orphan .pasola-worktrees/<taskId> + the pz/<taskId> branch on disk
+    const bad = rm.ok ? br : rm
+    return { ok: false, message: (bad.stderr || bad.stdout).trim().slice(0, 300) || 'worktree remove failed' }
+  }
   worktrees.delete(taskId)
   return { ok: true }
 }

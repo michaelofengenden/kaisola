@@ -98,6 +98,23 @@ async function ensureIndexAt(root, sha) {
   return r.ok
 }
 
+// The shadow repo has ONE index ($GIT_DIR/index) shared by every op on a root.
+// read-tree/status/checkout each read-then-write it across await boundaries, so
+// two overlapping ops would diff/restore against the wrong tree (or collide on
+// index.lock). Chain each root's index ops so they run strictly one at a time —
+// the tail promise IS the lock, and it releases even on error (the next op
+// chains on a swallowed settle).
+const indexLocks = new Map() // shadow dir → tail Promise of the last queued op
+function withIndexLock(root, fn) {
+  const key = shadowDirFor(root)
+  const prev = indexLocks.get(key) || Promise.resolve()
+  const run = prev.then(() => fn(), () => fn())
+  const tail = run.then(() => {}, () => {})
+  indexLocks.set(key, tail)
+  tail.then(() => { if (indexLocks.get(key) === tail) indexLocks.delete(key) })
+  return run
+}
+
 /** Working-tree snapshot: temp index → add -A → write-tree → commit-tree. */
 async function snapshot(root, label) {
   if (!(await ensureShadow(root))) return { ok: false, message: 'could not create checkpoint store' }
@@ -117,7 +134,7 @@ async function snapshot(root, label) {
     // a ref inside the SHADOW keeps its own gc honest; the real repo never sees it
     await sgit(root, ['update-ref', `refs/ckpt/${Date.now()}`, sha])
     // aim the shadow index at the new snapshot so the next status diff is warm
-    await ensureIndexAt(root, sha)
+    await withIndexLock(root, () => ensureIndexAt(root, sha))
     return { ok: true, sha }
   } finally {
     fs.promises.unlink(tmpIndex).catch(() => {})
@@ -127,21 +144,23 @@ async function snapshot(root, label) {
 /** name-status list of what changed since a SHADOW snapshot (status-based:
  *  stat-cache fast after the first pass, and untracked files just work). */
 async function shadowChanges(root, sha) {
-  if (!(await ensureIndexAt(root, sha))) return { ok: false, message: 'checkpoint not found' }
-  const st = await sgit(root, ['status', '--porcelain=v1', '-z', '--untracked-files=all'])
-  if (!st.ok) return { ok: false, message: st.stderr.trim() }
-  const files = []
-  for (const rec of st.stdout.split('\0')) {
-    if (!rec || rec.length < 4) continue
-    const x = rec[0]
-    const y = rec[1]
-    const p = rec.slice(3)
-    // the shadow has no HEAD branch, so the X (vs-HEAD) column is pure noise —
-    // identity lives in Y (snapshot index vs worktree) and '??' (new files)
-    if (x === '?') files.push({ status: 'A', path: p })
-    else if (y !== ' ') files.push({ status: y, path: p })
-  }
-  return { ok: true, files }
+  return withIndexLock(root, async () => {
+    if (!(await ensureIndexAt(root, sha))) return { ok: false, message: 'checkpoint not found' }
+    const st = await sgit(root, ['status', '--porcelain=v1', '-z', '--untracked-files=all'])
+    if (!st.ok) return { ok: false, message: st.stderr.trim() }
+    const files = []
+    for (const rec of st.stdout.split('\0')) {
+      if (!rec || rec.length < 4) continue
+      const x = rec[0]
+      const y = rec[1]
+      const p = rec.slice(3)
+      // the shadow has no HEAD branch, so the X (vs-HEAD) column is pure noise —
+      // identity lives in Y (snapshot index vs worktree) and '??' (new files)
+      if (x === '?') files.push({ status: 'A', path: p })
+      else if (y !== ' ') files.push({ status: y, path: p })
+    }
+    return { ok: true, files }
+  })
 }
 
 // ── legacy (pre-shadow) checkpoints: commits on hidden refs in the REAL repo ──
@@ -376,17 +395,19 @@ function registerGitHandlers(ipcMain) {
       } catch { /* already gone */ }
     }
     const paths = ch.files.filter((f) => f.status !== 'A').map((f) => `:(literal)${f.path}`)
-    for (let i = 0; i < paths.length; i += 200) {
-      const batch = paths.slice(i, i + 200)
-      // legacy (real-repo) snapshots: `git restore --worktree` — `checkout <sha> --`
-      // would also stage every restored file into the user's real index
-      const co = shadow
-        ? await sgit(root, ['checkout', sha, '--', ...batch])
-        : await git(root, ['restore', '--source', sha, '--worktree', '--', ...batch])
-      if (co.ok) restored += batch.length
-    }
-    // the shadow index tracked the restore via checkout; re-aim to be exact
-    if (shadow) shadowIndexAt.delete(shadowDirFor(root))
+    await withIndexLock(root, async () => {
+      for (let i = 0; i < paths.length; i += 200) {
+        const batch = paths.slice(i, i + 200)
+        // legacy (real-repo) snapshots: `git restore --worktree` — `checkout <sha> --`
+        // would also stage every restored file into the user's real index
+        const co = shadow
+          ? await sgit(root, ['checkout', sha, '--', ...batch])
+          : await git(root, ['restore', '--source', sha, '--worktree', '--', ...batch])
+        if (co.ok) restored += batch.length
+      }
+      // the shadow index tracked the restore via checkout; re-aim to be exact
+      if (shadow) shadowIndexAt.delete(shadowDirFor(root))
+    })
     return { ok: true, restored, trashed }
   })
 }

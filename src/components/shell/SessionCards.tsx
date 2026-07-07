@@ -2,21 +2,14 @@ import { useRef, useState, type CSSProperties, type DragEvent, type ReactNode } 
 import { useShallow } from 'zustand/react/shallow'
 import { useKaisola, type TerminalMeta } from '../../store/store'
 import { sessionHue, terminalAgentKey } from '../../lib/sessionHue'
-import { useAgentRegistry, agentName } from '../../lib/registry'
+import { useAgentRegistry } from '../../lib/registry'
+import { urlHost, terminalLabel, threadLabel } from '@/lib/sessionLabel'
 import { Terminal, everMountedTerminals } from '../Terminal'
 import { Assistant } from '../Assistant'
 import { GitPanel } from './GitPanel'
 import { BrowserCard } from './BrowserCard'
 import { SessionTabs } from './SessionTabs'
 import { Icon } from '../Icon'
-
-const urlHost = (u?: string) => {
-  try {
-    return u ? new URL(u).host : undefined
-  } catch {
-    return undefined
-  }
-}
 
 /**
  * While ANY shell drag runs (card heads, column grips, the canvas edge),
@@ -286,8 +279,7 @@ export function SessionCards() {
         />
       ))}
       {threads.map((t, i) => {
-        const nm = agentName(agents, t.agentKey) ?? 'Agent'
-        const label = t.name ?? t.autoName ?? `${nm}${threads.filter((x) => x.agentKey === t.agentKey).length > 1 ? ` ${i + 1}` : ''}`
+        const label = threadLabel(t, agents, threads, i)
         return card(t.id, 'Sparkles', label, <Assistant threadId={t.id} />, {
           hue: sessionHue({ agentKey: t.agentKey }),
           running: t.busy,
@@ -301,13 +293,7 @@ export function SessionCards() {
         ...terminals.map((t, i) => {
           const meta = terminalMeta[t.id]
           const agentKey = terminalAgentKey(t.singletonKey)
-          // stable identity, never keystrokes: manual name → agent → repo → folder
-          const folder = meta?.repo ?? (meta?.cwd ?? t.cwd)?.split('/').filter(Boolean).pop()
-          const label =
-            t.name ??
-            (agentKey ? agentName(agents, agentKey) ?? agentKey : undefined) ??
-            folder ??
-            (terminals.length > 1 ? `Terminal ${i + 1}` : 'Terminal')
+          const label = terminalLabel(t, { meta, agents, index: i, count: terminals.length })
           const sub = showMetaFor(t.id, t.cwd) ? metaLine(meta) : null
           return card(
             t.id,

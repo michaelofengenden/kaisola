@@ -49,6 +49,7 @@ async function callAnthropic(req) {
   return { ok: true, model: req.model || MODEL, text, toolCalls, stopReason: data.stop_reason, usage: data.usage }
 }
 
+// Mirror of src/lib/extractJson.ts — keep the two in sync (ESM/CJS boundary prevents sharing).
 // grab the first parseable {...} object from free text (for models that ignore tools)
 function extractJsonObject(text) {
   const start = text.indexOf('{')

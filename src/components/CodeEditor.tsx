@@ -1,5 +1,5 @@
 import { useEffect, useRef } from 'react'
-import { EditorState, Compartment, StateField, type Extension } from '@codemirror/state'
+import { EditorState, Compartment, StateField, Annotation, type Extension } from '@codemirror/state'
 import {
   EditorView,
   keymap,
@@ -438,6 +438,10 @@ export const baseTheme = EditorView.theme({
   '.cm-quote-copy:hover': { color: 'var(--text-0)' },
 })
 
+// Marks the programmatic doc replacement in the external-`value` effect so the
+// change listener can tell it apart from a real user edit (and skip onChange).
+const externalSync = Annotation.define<boolean>()
+
 export function CodeEditor({
   value,
   ext,
@@ -542,7 +546,8 @@ export function CodeEditor({
           onQuote ? quotePopupExtension((a, s) => onQuoteRef.current?.(a, s)) : [],
         ),
         EditorView.updateListener.of((u) => {
-          if (u.docChanged) onChangeRef.current?.(u.state.doc.toString())
+          if (u.docChanged && !u.transactions.some((tr) => tr.annotation(externalSync)))
+            onChangeRef.current?.(u.state.doc.toString())
           if ((u.selectionSet || u.docChanged) && onCursorLineRef.current) {
             if (cursorTimer.current !== null) window.clearTimeout(cursorTimer.current)
             cursorTimer.current = window.setTimeout(() => {
@@ -574,7 +579,7 @@ export function CodeEditor({
     const v = view.current
     if (!v) return
     if (value !== v.state.doc.toString()) {
-      v.dispatch({ changes: { from: 0, to: v.state.doc.length, insert: value } })
+      v.dispatch({ changes: { from: 0, to: v.state.doc.length, insert: value }, annotations: externalSync.of(true) })
     }
   }, [value])
 

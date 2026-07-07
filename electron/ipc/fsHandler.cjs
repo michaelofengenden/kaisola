@@ -30,6 +30,11 @@ const PDF_INFO_CACHE_LIMIT = 64
 const PNG_SIZE_CACHE_LIMIT = 512
 const pdfInfoCache = new Map() // path\0size\0mtime → parsed pdfinfo
 const pngSizeCache = new Map() // rendered png path → { width, height }
+// Concurrent fs:pdfPage calls for the same zoom bucket derive one output path;
+// collapse them onto a single in-flight render so only one pdftoppm runs and no
+// caller ever decodes another render's partially written PNG.
+const pdfRenderInFlight = new Map() // png path → Promise<{ ok, width, height, … }>
+let pdfRenderSeq = 0 // monotonic — gives every render a unique temp-file path
 let previewProtocolRegistered = false
 const PDF_RENDER_TIMEOUT_MS = 30_000
 const PDF_RENDER_MIN_DPI = 96
@@ -171,6 +176,57 @@ function pdfRenderKey(pdfPath, stat, page, dpi) {
     .update('\0')
     .update(String(dpi))
     .digest('hex')
+}
+
+// Render page → PNG with two guarantees the bare existsSync guard lacked:
+// (1) same-path renders share one in-flight promise, so a slight zoom mid-render
+// can't fire a second pdftoppm at the same file; (2) pdftoppm writes to a unique
+// temp path that's atomically renamed into place, so nativeImage never decodes a
+// half-written PNG. Resolves to a size on success or a failure {ok:false,…}.
+async function renderPdfPage(png, prefix, pdfPath, pageNo, dpi) {
+  const pending = pdfRenderInFlight.get(png)
+  if (pending) return pending
+  const task = (async () => {
+    if (!fs.existsSync(png)) {
+      await fsp.mkdir(PDF_CACHE_DIR, { recursive: true })
+      const tmpPrefix = `${prefix}.tmp.${process.pid}.${pdfRenderSeq++}`
+      const tmpPng = `${tmpPrefix}.png`
+      const r = await runTool('pdftoppm', ['-f', String(pageNo), '-l', String(pageNo), '-singlefile', '-png', '-r', String(dpi), pdfPath, tmpPrefix], path.dirname(pdfPath))
+      if (r.enoent) return { ok: false, missing: true, message: 'pdftoppm is not installed.' }
+      if (!r.ok || !fs.existsSync(tmpPng)) {
+        try { fs.rmSync(tmpPng, { force: true }) } catch { /* nothing to clean up */ }
+        return { ok: false, message: r.out.trim() || 'Could not render this PDF page.' }
+      }
+      try {
+        fs.renameSync(tmpPng, png)
+      } catch (err) {
+        try { fs.rmSync(tmpPng, { force: true }) } catch { /* raced */ }
+        return { ok: false, message: String((err && err.message) || err) }
+      }
+      trimPdfCache()
+    }
+    let size = pngSizeCache.get(png)
+    if (!size) {
+      const image = nativeImage.createFromPath(png)
+      // a fully rendered page that still decodes empty is a real failure — never
+      // cache {0,0}; drop the file so a later call re-renders instead of being
+      // served a blank page forever from a poisoned cache
+      if (image.isEmpty()) {
+        try { fs.rmSync(png, { force: true }) } catch { /* raced */ }
+        return { ok: false, message: 'Could not render this PDF page.' }
+      }
+      size = image.getSize()
+      pngSizeCache.set(png, size)
+      while (pngSizeCache.size > PNG_SIZE_CACHE_LIMIT) pngSizeCache.delete(pngSizeCache.keys().next().value)
+    }
+    return { ok: true, width: size.width, height: size.height }
+  })()
+  pdfRenderInFlight.set(png, task)
+  try {
+    return await task
+  } finally {
+    pdfRenderInFlight.delete(png)
+  }
 }
 
 function parseRange(header, size) {
@@ -479,26 +535,14 @@ function registerFsHandlers(ipcMain) {
       const key = pdfRenderKey(p, checked.stat, pageNo, dpi)
       const prefix = path.join(PDF_CACHE_DIR, key)
       const png = `${prefix}.png`
-      if (!fs.existsSync(png)) {
-        await fsp.mkdir(PDF_CACHE_DIR, { recursive: true })
-        const r = await runTool('pdftoppm', ['-f', String(pageNo), '-l', String(pageNo), '-singlefile', '-png', '-r', String(dpi), p, prefix], path.dirname(p))
-        if (r.enoent) return { ok: false, missing: true, message: 'pdftoppm is not installed.' }
-        if (!r.ok || !fs.existsSync(png)) return { ok: false, message: r.out.trim() || 'Could not render this PDF page.' }
-        trimPdfCache()
-      }
-      let size = pngSizeCache.get(png)
-      if (!size) {
-        const image = nativeImage.createFromPath(png)
-        size = image.isEmpty() ? { width: 0, height: 0 } : image.getSize()
-        pngSizeCache.set(png, size)
-        while (pngSizeCache.size > PNG_SIZE_CACHE_LIMIT) pngSizeCache.delete(pngSizeCache.keys().next().value)
-      }
+      const rendered = await renderPdfPage(png, prefix, p, pageNo, dpi)
+      if (!rendered.ok) return rendered
       return {
         ok: true,
         page: pageNo,
         url: previewUrlFor(png, 'image/png'),
-        width: size.width,
-        height: size.height,
+        width: rendered.width,
+        height: rendered.height,
         scale: dpi / 72,
       }
     } catch (err) {

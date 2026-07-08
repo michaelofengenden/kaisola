@@ -200,6 +200,7 @@ function TabMenuSync() {
 
 export default function App() {
   const layoutMode = useKaisola((s) => s.layoutMode)
+  const perfMode = useKaisola((s) => s.perfMode)
   const stage = useKaisola((s) => s.stage)
   const setStage = useKaisola((s) => s.setStage)
   const dockOpen = useKaisola((s) => s.dockOpen)
@@ -576,6 +577,9 @@ export default function App() {
 
   return (
     <div className="app" data-sidebar={false} data-layout={layoutMode}>
+      {/* painted glass: an opaque window that draws its own see-through — the
+          pre-blurred wallpaper (glassWash.ts) pinned to the desktop position */}
+      {isDesktop && perfMode === 'painted' && <div className="app-wallpaper" aria-hidden />}
       {/* grid row 1: the project strip (desktop main window only; on web/pop it
           isn't rendered and --tabstrip-h collapses the row to 0) */}
       {isDesktop && !POP_TERMINAL_ID && <ProjectTabs />}

@@ -74,6 +74,24 @@
      (.tabstrip::before / .wsrail::before below), and the OS vibrancy keeps
      blurring the desktop behind everything. */
 }
+/* PAINTED GLASS: an opaque window that draws its own see-through — the
+   pre-blurred wallpaper (sampled in main, glassWash.ts) pinned to the
+   window's desktop position. z-index -2 sits UNDER the tint field (-1), so
+   everything translucent "sees" the painting exactly where live glass saw
+   the OS material. Static layer: rasters once, repaints never. */
+.app-wallpaper {
+  position: absolute;
+  inset: 0;
+  z-index: -2;
+  pointer-events: none;
+  background-image: var(--wallpaper-img, radial-gradient(120% 90% at 30% 0%,
+    color-mix(in srgb, var(--accent) 14%, var(--bg-0)), var(--bg-0)));
+  background-size: var(--wallpaper-size, cover);
+  background-position: var(--wallpaper-x, 0) var(--wallpaper-y, 0);
+  background-repeat: no-repeat;
+  filter: blur(24px) saturate(1.25);
+  transform: scale(1.04); /* hide the blur's edge vignette */
+}
 /* Dark theme: the glass field must DARKEN what it samples, never lift it —
    the light-tuned white tint + brightness() left the transparent rail nearly
    unreadable. The native vibrancy material itself follows the app theme too

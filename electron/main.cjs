@@ -327,6 +327,18 @@ function createWindow(opts = {}) {
     if (tryLiquidGlass(win) && typeof win.setVibrancy === 'function') win.setVibrancy(null)
   })
   syncMacMaterial()
+  // vibrancy nap: the under-window material keeps sampling the desktop even
+  // for a hidden window (visualEffectState 'active'). Detach while nothing is
+  // visible; syncMacMaterial re-attaches on show/restore/focus. Liquid Glass
+  // (glassActive) has no stable detach API — the nap covers vibrancy only.
+  const napMacMaterial = () => {
+    if (process.platform === 'darwin' && typeof win.setVibrancy === 'function' && !glassActive) {
+      win.setVibrancy(null)
+    }
+  }
+  win.on('hide', napMacMaterial)
+  win.on('minimize', napMacMaterial)
+  win.on('restore', syncMacMaterial)
 
   // corners square off while full-screen; the lights gray out while blurred
   // (the renderer listens for this)

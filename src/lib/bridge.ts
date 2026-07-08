@@ -483,6 +483,12 @@ export interface KaisolaBridge {
   pickFiles(): Promise<{ ok: boolean; paths?: string[] }>
   /** Liquid Glass preference (macOS 26+; needs a relaunch to apply). */
   glass(patch?: { enabled: boolean }): Promise<{ supported: boolean; active: boolean; enabled: boolean }>
+  /** Perf-mode window plumbing: transparency is a creation-time option — set()
+   *  persists what the NEXT window should be; a want/live mismatch drives the
+   *  Settings "Restart to finish applying" chip. */
+  windowMode(patch?: { solidWindow?: boolean; solidBg?: string }): Promise<{ wantSolid: boolean; liveSolid: boolean }>
+  /** Quit and relaunch (used to apply a window-mode change). */
+  relaunch(): Promise<void>
   /** Wallpaper-sampled glass wash (macOS; failures degrade to the theme tint). */
   glassWash: {
     sample(): Promise<{ ok: boolean; avg?: { r: number; g: number; b: number }; blurDataUrl?: string; screen?: { x: number; y: number; w: number; h: number } }>
@@ -810,6 +816,10 @@ const webMock: KaisolaBridge = {
   async glass() {
     return { supported: false, active: false, enabled: false }
   },
+  async windowMode() {
+    return { wantSolid: false, liveSolid: false }
+  },
+  async relaunch() {},
   glassWash: {
     async sample() {
       return { ok: false }

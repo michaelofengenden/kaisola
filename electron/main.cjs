@@ -258,6 +258,13 @@ app.on('open-file', (event, filePath) => {
 function createWindow(opts = {}) {
   const appIcon = loadAppIcon()
   const isPop = !!opts.pop
+  // painted/eco perf modes want an OPAQUE window (occlusion culling returns,
+  // no vibrancy tax) — transparency is a creation-time option, so the
+  // renderer persists its preference in shell-prefs and it lands here on the
+  // next launch. solidBg avoids a wrong-color flash before first paint.
+  const solidWin = readShellPrefs().solidWindow === true
+  const solidBgRaw = readShellPrefs().solidBg
+  const solidBg = /^#[0-9a-fA-F]{6}$/.test(solidBgRaw || '') ? solidBgRaw : '#0b0d11'
   const win = new BrowserWindow({
     width: isPop ? 760 : 1440,
     height: isPop ? 520 : 920,
@@ -267,11 +274,12 @@ function createWindow(opts = {}) {
     frame: false,
     ...(process.platform === 'darwin' ? { roundedCorners: true } : {}),
     // transparent window: the renderer paints its own (rounder) corners on the
-    // .app surface, Codex-style; macOS draws the shadow around the painted shape.
-    transparent: true,
-    backgroundColor: '#00000000',
+    // .app surface, Codex-style; macOS draws the shadow around the painted
+    // shape. Solid windows keep native rounding instead (see data-solidwin).
+    transparent: !solidWin,
+    backgroundColor: solidWin ? solidBg : '#00000000',
     ...(appIcon ? { icon: appIcon } : {}),
-    ...macVibrancy,
+    ...(solidWin ? {} : macVibrancy),
     webPreferences: {
       preload: path.join(__dirname, 'preload.cjs'),
       contextIsolation: true, // renderer cannot touch Node
@@ -290,6 +298,8 @@ function createWindow(opts = {}) {
     })
   })
   const query = {}
+  if (solidWin) query.solidwin = '1' // renderer squares its painted corners to the native clip
+  win.__kaisolaSolid = solidWin // what THIS window is (vs what prefs now want)
   if (opts.slot) query.win = String(opts.slot)
   if (opts.adopt) query.adopt = '1' // tear-off adoption: boot pristine, never rehydrate the slot
   if (opts.at && Number.isFinite(opts.at.x) && Number.isFinite(opts.at.y)) {
@@ -317,7 +327,7 @@ function createWindow(opts = {}) {
     // sampling): the app deliberately looks IDENTICAL when inactive — only the
     // traffic lights gray. Dropping vibrancy on blur is what used to flash the
     // shell to flat white.
-    if (process.platform === 'darwin' && typeof win.setVibrancy === 'function' && !glassActive) {
+    if (process.platform === 'darwin' && typeof win.setVibrancy === 'function' && !glassActive && !solidWin) {
       win.setVibrancy(macVibrancyType)
     }
     if (typeof win.setHasShadow === 'function') {
@@ -325,7 +335,7 @@ function createWindow(opts = {}) {
     }
   }
   win.once('ready-to-show', () => {
-    if (tryLiquidGlass(win) && typeof win.setVibrancy === 'function') win.setVibrancy(null)
+    if (!solidWin && tryLiquidGlass(win) && typeof win.setVibrancy === 'function') win.setVibrancy(null)
   })
   syncMacMaterial()
   // vibrancy nap: the under-window material keeps sampling the desktop even
@@ -333,7 +343,7 @@ function createWindow(opts = {}) {
   // visible; syncMacMaterial re-attaches on show/restore/focus. Liquid Glass
   // (glassActive) has no stable detach API — the nap covers vibrancy only.
   const napMacMaterial = () => {
-    if (process.platform === 'darwin' && typeof win.setVibrancy === 'function' && !glassActive) {
+    if (process.platform === 'darwin' && typeof win.setVibrancy === 'function' && !glassActive && !solidWin) {
       win.setVibrancy(null)
     }
   }
@@ -505,6 +515,20 @@ ipcMain.handle('shell:glass', (_e, patch) => {
     active: glassActive,
     enabled: readShellPrefs().liquidGlass !== false,
   }
+})
+
+// Perf-mode window plumbing: the renderer persists what the NEXT window
+// should be (transparency is creation-time); liveSolid is what THIS window
+// already is — a mismatch drives the "Restart to finish applying" chip.
+ipcMain.handle('shell:window-mode', (e, patch) => {
+  if (patch && typeof patch.solidWindow === 'boolean') writeShellPrefs({ solidWindow: patch.solidWindow })
+  if (patch && typeof patch.solidBg === 'string' && /^#[0-9a-fA-F]{6}$/.test(patch.solidBg)) writeShellPrefs({ solidBg: patch.solidBg })
+  const win = BrowserWindow.fromWebContents(e.sender)
+  return { wantSolid: readShellPrefs().solidWindow === true, liveSolid: !!(win && win.__kaisolaSolid) }
+})
+ipcMain.handle('shell:relaunch', () => {
+  app.relaunch()
+  app.exit(0)
 })
 
 // The app has its own theme toggle; the native under-window material

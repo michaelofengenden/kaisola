@@ -41,6 +41,15 @@ body {
 :root[data-shell='desktop'][data-fullscreen='true'] .app {
   border-radius: 0;
 }
+/* solid (painted/eco) windows: the window rect is opaque, so macOS clips the
+   frame to its native ~10px radius (roundedCorners) — the painted 24px radius
+   would leave square backgroundColor corners poking past the native clip */
+:root[data-shell='desktop'][data-solidwin='true'] .app {
+  border-radius: 10px;
+}
+:root[data-shell='desktop'][data-solidwin='true'] body {
+  background: transparent; /* the window's own backgroundColor is the base */
+}
 
 ::selection {
   background: var(--accent-soft);

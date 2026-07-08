@@ -18,9 +18,14 @@ import './styles/calm.css'
 import './styles/dock.css'
 import '@xterm/xterm/css/xterm.css'
 
-// apply persisted/initial theme + energy-saver mode before first paint
+// apply persisted/initial theme + appearance-energy mode before first paint
 document.documentElement.dataset.theme = useKaisola.getState().theme
 document.documentElement.dataset.perf = useKaisola.getState().perfMode
+// solid (painted/eco) windows: main created this window opaque — square the
+// painted corners to the native clip before first paint (global.css)
+if (new URLSearchParams(location.search).get('solidwin') === '1') {
+  document.documentElement.dataset.solidwin = 'true'
+}
 
 // expose the store + pure research libs for debugging / headless smoke tests
 ;(window as unknown as { __kaisola: typeof useKaisola }).__kaisola = useKaisola

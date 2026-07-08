@@ -2426,6 +2426,11 @@ export const useKaisola = create<KaisolaState>()(
   setPerfMode: (mode) => {
     document.documentElement.dataset.perf = mode
     set({ perfMode: mode })
+    // persist what the NEXT window should be (transparency is creation-time;
+    // Settings shows a restart chip on mismatch). solidBg = the current theme
+    // bg, so an opaque window paints the right color before first render.
+    const bg = getComputedStyle(document.documentElement).getPropertyValue('--bg-0').trim()
+    void bridge.windowMode({ solidWindow: mode !== 'glass', ...(/^#[0-9a-fA-F]{6}$/.test(bg) ? { solidBg: bg } : {}) }).catch(() => {})
   },
   setTermFontSize: (size) => set({ termFontSize: size == null ? 12 : Math.min(18, Math.max(9, Math.round(size))) }),
   setTermFontFamily: (family) => set({ termFontFamily: family || 'JetBrains Mono' }),

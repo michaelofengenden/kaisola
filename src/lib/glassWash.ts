@@ -69,6 +69,12 @@ export function initGlassWash(): () => void {
   const offRefresh = bridge.glassWash.onRefresh(() => void apply())
   const unsub = useKaisola.subscribe((s, prev) => {
     if (s.perfMode !== prev.perfMode || s.theme !== prev.theme) void apply()
+    // a theme flip while a solid mode is persisted must refresh the opaque
+    // window's boot color, or the next launch flashes the old theme's bg
+    if (s.theme !== prev.theme && s.perfMode !== 'glass') {
+      const bg = getComputedStyle(document.documentElement).getPropertyValue('--bg-0').trim()
+      if (/^#[0-9a-fA-F]{6}$/.test(bg)) void bridge.windowMode({ solidBg: bg }).catch(() => {})
+    }
   })
   return () => {
     offRefresh()

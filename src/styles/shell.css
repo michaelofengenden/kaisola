@@ -22,6 +22,9 @@
   --wash-strip-alpha: 44%;
   --wash-rail-color: 255 254 254;
   --wash-rail-alpha: 35%;
+  /* frost grain: a 96px feTurbulence tile, neutral gray pinned by the color
+     matrix, alpha 0.04 — texture, not static. Rasters once, tiles forever. */
+  --frost-grain: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='96' height='96'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='2' stitchTiles='stitch'/%3E%3CfeColorMatrix type='matrix' values='0 0 0 0 0.5 0 0 0 0 0.5 0 0 0 0 0.5 0 0 0 0.04 0'/%3E%3C/filter%3E%3Crect width='96' height='96' filter='url(%23n)'/%3E%3C/svg%3E");
   --side-veil-alpha: 0%;
   --content-glass-alpha: 90%;
   /* session cards (terminals + agents) are the true glass surfaces: a light
@@ -126,8 +129,13 @@
   /* PAINTED WASH — no backdrop-filter. The old blur(1600px) of the uniform
      tint field was mathematically a constant; the OS material carries the
      live glow. The constant is painted here, and wallpaper sampling tints
-     it for real — fidelity the blur never had. */
-  background: rgb(var(--wash-strip-color) / var(--wash-strip-alpha));
+     it for real — fidelity the blur never had. The grain tile on top is what
+     makes frost read as frost up close (neutral-gray noise at 4%). */
+  background-image:
+    var(--frost-grain),
+    linear-gradient(rgb(var(--wash-strip-color) / var(--wash-strip-alpha)),
+                    rgb(var(--wash-strip-color) / var(--wash-strip-alpha)));
+  background-repeat: repeat, no-repeat;
 }
 /* everything interactive in the strip opts out of the window-drag region */
 .tabstrip .lights,
@@ -530,7 +538,11 @@
   pointer-events: none;
   /* painted wash (pairs with .tabstrip::before): scoped to surfaces that
      rarely repaint — never the whole window */
-  background: rgb(var(--wash-rail-color) / var(--wash-rail-alpha));
+  background-image:
+    var(--frost-grain),
+    linear-gradient(rgb(var(--wash-rail-color) / var(--wash-rail-alpha)),
+                    rgb(var(--wash-rail-color) / var(--wash-rail-alpha)));
+  background-repeat: repeat, no-repeat;
 }
 .wsrail > *,
 .sidebar > * {

@@ -279,8 +279,9 @@ app.whenReady().then(async () => {
       // anywhere; the OS material carries the live glow
       appSamplingLayer: !/blur/.test(activeAppBackdrop) && !/blur/.test(activeAppGlassBackdrop) && alpha(activeAppBackground) < 0.05 && appLiftTop >= 43 && appLiftTop <= 47 && appLiftBottom >= 28 && appLiftBottom <= 32,
       chromeGlass: !/blur/.test(tabstripGlassBd) && !/blur/.test(railGlassBd)
-        && alpha(getComputedStyle(tabstrip, '::before').backgroundColor) >= 0.25
-        && alpha(getComputedStyle(rail, '::before').backgroundColor) >= 0.25
+        && getComputedStyle(tabstrip, '::before').backgroundImage.includes('data:image/svg')
+        && getComputedStyle(tabstrip, '::before').backgroundImage.includes('linear-gradient')
+        && getComputedStyle(rail, '::before').backgroundImage.includes('linear-gradient')
         && getComputedStyle(rail, '::before').display !== 'none',
       activeTintWhite: activeAppTint === '#fffefd',
       railBackdrop: activeRailBackdrop,

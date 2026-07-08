@@ -13,7 +13,15 @@
      which stretched the blur's 8-bit steps into visible bands in light theme */
   --app-active-glass-lift-top: 45%;
   --app-active-glass-lift-bottom: 30%;
-  --app-active-glass-blur: 1600px; /* radius > window width: the backdrop averages to a near-uniform color wash */
+  /* chrome veils — the PAINTED constants the old blur(1600px) chrome
+     converged to (kernel wider than the window ⇒ the filter collapsed to a
+     per-theme rgba constant; these were solved from before/after capture
+     means, glassprobe.cjs). Wallpaper sampling (glassWash.ts) retints the
+     colors so the chrome tracks the desktop; the alphas ARE the look. */
+  --wash-strip-color: 255 255 254;
+  --wash-strip-alpha: 44%;
+  --wash-rail-color: 255 254 254;
+  --wash-rail-alpha: 35%;
   --side-veil-alpha: 0%;
   --content-glass-alpha: 90%;
   /* session cards (terminals + agents) are the true glass surfaces: a light
@@ -74,6 +82,12 @@
   --app-active-glass-lift-bottom: 80%;
   /* dark text-on-glass needs a bit more ink under 12px terminal type */
   --session-glass-alpha: 64%;
+  /* dark chrome veils (see the light-theme block): near-opaque ink — that's
+     what the dark blur chrome measured as, and what keeps rail text readable */
+  --wash-strip-color: 11 13 18;
+  --wash-strip-alpha: 90%;
+  --wash-rail-color: 11 12 17;
+  --wash-rail-alpha: 83%;
 }
 /* Deliberately NO data-winfocus overrides on any surface: the shell looks
    identical when the window is inactive (main keeps the native material
@@ -109,8 +123,11 @@
   inset: 0;
   z-index: -1;
   pointer-events: none;
-  backdrop-filter: blur(var(--app-active-glass-blur)) saturate(1.5);
-  -webkit-backdrop-filter: blur(var(--app-active-glass-blur)) saturate(1.5);
+  /* PAINTED WASH — no backdrop-filter. The old blur(1600px) of the uniform
+     tint field was mathematically a constant; the OS material carries the
+     live glow. The constant is painted here, and wallpaper sampling tints
+     it for real — fidelity the blur never had. */
+  background: rgb(var(--wash-strip-color) / var(--wash-strip-alpha));
 }
 /* everything interactive in the strip opts out of the window-drag region */
 .tabstrip .lights,
@@ -511,18 +528,9 @@
   inset: 0;
   z-index: 0;
   pointer-events: none;
-  /* chrome glass (pairs with .tabstrip::before): the frosted wash, scoped to
-     surfaces that rarely repaint — never the whole window */
-  backdrop-filter: blur(var(--app-active-glass-blur)) saturate(1.5);
-  -webkit-backdrop-filter: blur(var(--app-active-glass-blur)) saturate(1.5);
-}
-/* dark chrome glass darkens what it samples — same params the old full-window
-   dark field used */
-:root[data-theme='dark'] .tabstrip::before,
-:root[data-theme='dark'] .wsrail::before,
-:root[data-theme='dark'] .sidebar::before {
-  backdrop-filter: blur(var(--app-active-glass-blur)) saturate(1.3) brightness(0.88);
-  -webkit-backdrop-filter: blur(var(--app-active-glass-blur)) saturate(1.3) brightness(0.88);
+  /* painted wash (pairs with .tabstrip::before): scoped to surfaces that
+     rarely repaint — never the whole window */
+  background: rgb(var(--wash-rail-color) / var(--wash-rail-alpha));
 }
 .wsrail > *,
 .sidebar > * {

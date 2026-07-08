@@ -216,7 +216,6 @@ app.whenReady().then(async () => {
     const termPane = document.querySelector('.dock-pane-term')
     const light = document.querySelector('.light-close')
     const activeAppTint = appStyle.getPropertyValue('--app-active-glass-tint').trim()
-    const appGlassBlur = appStyle.getPropertyValue('--app-active-glass-blur').trim()
     const appLiftTop = pct(appStyle.getPropertyValue('--app-active-glass-lift-top'))
     const appLiftBottom = pct(appStyle.getPropertyValue('--app-active-glass-lift-bottom'))
     const veilAlpha = pct(appStyle.getPropertyValue('--side-veil-alpha'))
@@ -274,11 +273,15 @@ app.whenReady().then(async () => {
     const tabstripGlassBd = tabstrip ? backdrop(getComputedStyle(tabstrip, '::before')) : ''
     const railGlassBd = backdrop(getComputedStyle(rail, '::before'))
     const out = {
-      // CHROME-ONLY GLASS: the app field is tint-only (no blur — a full-window
-      // backdrop re-composited on every terminal frame, the fans-spin-up bug);
-      // the blur wash lives on the tab strip + rail pseudos, which rarely repaint
-      appSamplingLayer: !/blur/.test(activeAppBackdrop) && !/blur/.test(activeAppGlassBackdrop) && alpha(activeAppBackground) < 0.05 && appLiftTop >= 43 && appLiftTop <= 47 && appLiftBottom >= 28 && appLiftBottom <= 32 && /1[0-9]{3}px/.test(appGlassBlur),
-      chromeGlass: /blur\\(1[0-9]{3}px\\)/.test(tabstripGlassBd) && /saturate/.test(tabstripGlassBd) && /blur\\(1[0-9]{3}px\\)/.test(railGlassBd),
+      // PAINTED-GLASS CHROME: the app field is tint-only, and the chrome
+      // pseudos carry a PAINTED veil (the constant the old blur(1600px)
+      // converged to — glassprobe.cjs solved it) with NO backdrop-filter
+      // anywhere; the OS material carries the live glow
+      appSamplingLayer: !/blur/.test(activeAppBackdrop) && !/blur/.test(activeAppGlassBackdrop) && alpha(activeAppBackground) < 0.05 && appLiftTop >= 43 && appLiftTop <= 47 && appLiftBottom >= 28 && appLiftBottom <= 32,
+      chromeGlass: !/blur/.test(tabstripGlassBd) && !/blur/.test(railGlassBd)
+        && alpha(getComputedStyle(tabstrip, '::before').backgroundColor) >= 0.25
+        && alpha(getComputedStyle(rail, '::before').backgroundColor) >= 0.25
+        && getComputedStyle(rail, '::before').display !== 'none',
       activeTintWhite: activeAppTint === '#fffefd',
       railBackdrop: activeRailBackdrop,
       railLayerFlattened: !activeRailBackdrop && activeRailBackgroundAlpha <= 0.02 && (!activeRailBgImage || activeRailBgImage === 'none') && activeSessionListFlat && activeRailDividerFlat && activeRailSearchFlat && veilAlpha >= 0 && veilAlpha <= 1,

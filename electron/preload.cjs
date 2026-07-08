@@ -264,6 +264,15 @@ const bridge = {
   pickFiles: () => ipcRenderer.invoke('kaisola:pickFiles'),
   // Liquid Glass preference (macOS 26+; applies on next launch)
   glass: (patch) => ipcRenderer.invoke('shell:glass', patch),
+  // wallpaper-sampled glass wash (macOS; failures degrade to theme tint)
+  glassWash: {
+    sample: () => ipcRenderer.invoke('glass:sample'),
+    onRefresh: (cb) => {
+      const listener = () => cb()
+      ipcRenderer.on('glass:refresh', listener)
+      return () => ipcRenderer.removeListener('glass:refresh', listener)
+    },
+  },
   // ── multi-window: full slots (own persisted state) + terminal pop-outs ──
   windows: {
     newWindow: () => ipcRenderer.invoke('window:new'),

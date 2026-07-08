@@ -5,6 +5,7 @@ import { uid, nowISO } from './domain/ids'
 import { requestIsSensitive, requestMatchesRules, allowOnceAnswer } from './lib/permissionRules'
 import { OmniBar } from './components/shell/OmniBar'
 import { loadUserConfig, watchUserConfig } from './lib/userConfig'
+import { initGlassWash } from './lib/glassWash'
 import { ShellTools } from './components/shell/AgentSidebar'
 import { WorkspaceRail } from './components/shell/WorkspaceRail'
 import { ProjectTabs } from './components/shell/ProjectTabs'
@@ -342,6 +343,10 @@ export default function App() {
     void loadUserConfig({ quiet: true })
     return watchUserConfig()
   }, [])
+
+  // wallpaper-sampled chrome wash + painted-mode background (macOS only;
+  // failures silently keep the theme-tint defaults)
+  useEffect(() => initGlassWash(), [])
 
   // the native under-window material (vibrancy/glass) must follow the APP
   // theme — push the persisted theme once on boot (store actions push changes)

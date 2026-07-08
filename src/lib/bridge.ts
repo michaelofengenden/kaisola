@@ -483,6 +483,11 @@ export interface KaisolaBridge {
   pickFiles(): Promise<{ ok: boolean; paths?: string[] }>
   /** Liquid Glass preference (macOS 26+; needs a relaunch to apply). */
   glass(patch?: { enabled: boolean }): Promise<{ supported: boolean; active: boolean; enabled: boolean }>
+  /** Wallpaper-sampled glass wash (macOS; failures degrade to the theme tint). */
+  glassWash: {
+    sample(): Promise<{ ok: boolean; avg?: { r: number; g: number; b: number }; blurDataUrl?: string; screen?: { x: number; y: number; w: number; h: number } }>
+    onRefresh(cb: () => void): () => void
+  }
   /** Multi-window: full slot windows + terminal pop-outs + project-tab menu wiring. */
   windows?: {
     newWindow(): Promise<{ ok: boolean }>
@@ -804,6 +809,14 @@ const webMock: KaisolaBridge = {
   },
   async glass() {
     return { supported: false, active: false, enabled: false }
+  },
+  glassWash: {
+    async sample() {
+      return { ok: false }
+    },
+    onRefresh() {
+      return () => {}
+    },
   },
   windows: {
     async newWindow() {

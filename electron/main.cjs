@@ -23,6 +23,7 @@ const { registerGitHandlers } = require('./ipc/gitHandler.cjs')
 const { registerLatexHandlers } = require('./ipc/latexHandler.cjs')
 const { registerClaudeHooksHandlers, disposeClaudeHooks } = require('./ipc/claudeHooksHandler.cjs')
 const { registerUpdateHandlers } = require('./ipc/updateHandler.cjs')
+const { registerGlassHandlers, wireGlassEvents } = require('./ipc/glassHandler.cjs')
 
 const DEV_URL = process.env.KAISOLA_DEV_URL ?? process.env.PASOLA_DEV_URL // set by `npm run electron:dev`
 const isDev = !!DEV_URL
@@ -339,6 +340,7 @@ function createWindow(opts = {}) {
   win.on('hide', napMacMaterial)
   win.on('minimize', napMacMaterial)
   win.on('restore', syncMacMaterial)
+  wireGlassEvents(win) // wallpaper re-sample nudges (moved/resize/display/theme)
 
   // corners square off while full-screen; the lights gray out while blurred
   // (the renderer listens for this)
@@ -552,6 +554,7 @@ app.whenReady().then(() => {
   registerLatexHandlers(ipcMain)
   registerClaudeHooksHandlers(ipcMain)
   registerUpdateHandlers(ipcMain)
+  registerGlassHandlers(ipcMain)
   createWindow()
   app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length === 0) createWindow()

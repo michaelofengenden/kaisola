@@ -23,6 +23,7 @@ const { registerCodexHandlers } = require('./ipc/codexHandler.cjs')
 const { registerGitHandlers } = require('./ipc/gitHandler.cjs')
 const { registerClaudeHooksHandlers } = require('./ipc/claudeHooksHandler.cjs')
 const { registerUpdateHandlers } = require('./ipc/updateHandler.cjs')
+const { registerGlassHandlers } = require('./ipc/glassHandler.cjs')
 const worktree = require('./ipc/worktreeHandler.cjs')
 
 process.env.KAISOLA_SMOKE = '1'
@@ -51,6 +52,7 @@ app.whenReady().then(async () => {
   registerFsHandlers(ipcMain); registerGrobidHandlers(ipcMain); registerSandboxHandlers(ipcMain)
   registerDbHandlers(ipcMain); registerCodexHandlers(ipcMain); worktree.registerWorktreeHandlers(ipcMain)
   registerGitHandlers(ipcMain); registerClaudeHooksHandlers(ipcMain); registerUpdateHandlers(ipcMain)
+  registerGlassHandlers(ipcMain)
   ipcMain.handle('shell:glass', () => ({ supported: false, active: false, enabled: false }))
 
   const win = new BrowserWindow({
@@ -101,5 +103,27 @@ app.whenReady().then(async () => {
     fsx.writeFileSync(path.join(OUT_DIR, `glass-${tag}-${theme}.png`), img.toPNG())
   }
   console.log(`CHROME_MEAN_${tag.toUpperCase()}=` + JSON.stringify(out))
-  app.exit(0)
+
+  // WASH: the wallpaper sampler must have retinted the veils (inline vars set
+  // by glassWash.ts) and cached the pre-blurred painting. Poll — sampling is
+  // async behind plutil/sips.
+  let wash = null
+  for (let i = 0; i < 10; i++) {
+    wash = await js(`(() => {
+      const st = document.documentElement.style
+      return {
+        strip: st.getPropertyValue('--wash-strip-color').trim(),
+        rail: st.getPropertyValue('--wash-rail-color').trim(),
+        img: st.getPropertyValue('--wallpaper-img').slice(0, 30),
+        size: st.getPropertyValue('--wallpaper-size').trim(),
+      }
+    })()`)
+    if (wash.strip) break
+    await wait(400)
+  }
+  const triplet = (s) => /^\d{1,3} \d{1,3} \d{1,3}$/.test(s)
+  const washOk = wash && triplet(wash.strip) && triplet(wash.rail)
+    && wash.img.startsWith('url("data:image/jpeg') && /^\d+px \d+px$/.test(wash.size)
+  console.log(`WASH=${washOk ? 'PASS' : 'FAIL'} ` + JSON.stringify(wash))
+  app.exit(washOk ? 0 : 1)
 })

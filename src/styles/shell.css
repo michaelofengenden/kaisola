@@ -1559,9 +1559,6 @@
 /* ── Rail sections: Outline + Quotes (inside the rail, never a new panel) ── */
 .rail-sec {
   flex-shrink: 0;
-  max-height: 32vh;
-  display: flex;
-  flex-direction: column;
   margin: 0 var(--sp-2);
   border-top: 1px solid var(--border-faint);
   -webkit-app-region: no-drag;
@@ -1589,6 +1586,11 @@
 .rail-sec-body {
   overflow-y: auto;
   min-height: 0;
+  /* the cap lives on the BODY, not the <details> box: Chromium renders
+     details children through shadow-DOM slots, so a flex/max-height clamp
+     on the details never reaches the body — a 40-section .tex outline laid
+     out at full height and painted 600px over the file tree below */
+  max-height: calc(32vh - 30px);
   padding-bottom: var(--sp-2);
 }
 .rail-outline-item {

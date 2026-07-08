@@ -1060,11 +1060,16 @@ export function FilesView() {
     void buildMain()
   }, [buildMain, pdfSourceTab?.baseline, pdfSourceTab?.loading, pdfSourceTab?.path])
 
+  // latexSyncEnabled covers ANY pdf in the workspace: syncFromPdf handles
+  // every miss itself — no SyncTeX data builds the SIBLING .tex and retries,
+  // and a pdf with no source at all gets one quiet "could not map" toast.
+  // The old gate (this pdf must be latexMain's own pdf) made double-click
+  // silently dead until the user had explicitly picked/built a main.
   const mediaPreview = active && activeIsMedia ? (
     <MediaPreview
       tab={active}
       zoom={liveZoom}
-      latexSyncEnabled={!!activeLatexPdf && active.path === activeLatexPdf}
+      latexSyncEnabled={isDesktop && !!workspacePath}
       onPdfSync={syncFromPdf}
     />
   ) : null

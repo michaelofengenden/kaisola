@@ -66,6 +66,16 @@ async function apply() {
 export function initGlassWash(): () => void {
   if (!isDesktop) return () => {}
   void apply()
+  // consolidate mode → window prefs at every boot: a fresh install defaults to
+  // painted before any Settings visit, and its opaque window should arrive on
+  // the very next launch without anyone touching the picker
+  {
+    const bg = getComputedStyle(document.documentElement).getPropertyValue('--bg-0').trim()
+    void bridge.windowMode({
+      solidWindow: useKaisola.getState().perfMode !== 'glass',
+      ...(/^#[0-9a-fA-F]{6}$/.test(bg) ? { solidBg: bg } : {}),
+    }).catch(() => {})
+  }
   const offRefresh = bridge.glassWash.onRefresh(() => void apply())
   const unsub = useKaisola.subscribe((s, prev) => {
     if (s.perfMode !== prev.perfMode || s.theme !== prev.theme) void apply()

@@ -61,16 +61,16 @@ const LIGHT_THEME: ITheme = {
 // Keep these in sync with tokens.css [data-termbg] if --term-bg / --bg-1 change.
 const TERM_SURFACE: Record<TermBackground, { glass: { dark: string; light: string }; eco: { dark: string; light: string } }> = {
   ink: {
-    glass: { dark: '#0d0f13', light: '#f5f6f8' }, // = color-mix(in srgb, var(--term-bg) 45%, var(--bg-1))
-    eco: { dark: '#0b0d11', light: '#e9ebef' }, // = var(--term-bg)
+    glass: { dark: '#0d0f13', light: '#f7f8fa' }, // = color-mix(in srgb, var(--term-bg) 45%, var(--bg-1))
+    eco: { dark: '#0b0d11', light: '#fbfcfd' }, // = var(--term-bg)
   },
   slate: {
-    glass: { dark: '#1c2027', light: '#f5f6f8' },
-    eco: { dark: '#191d24', light: '#e9ebef' },
+    glass: { dark: '#1c2027', light: '#f7f8fa' },
+    eco: { dark: '#191d24', light: '#fbfcfd' },
   },
   paper: {
-    glass: { dark: '#eceef0', light: '#f5f6f8' },
-    eco: { dark: '#e9ebef', light: '#e9ebef' },
+    glass: { dark: '#f8f9fb', light: '#f7f8fa' },
+    eco: { dark: '#fbfcfd', light: '#fbfcfd' },
   },
 }
 const xtermTheme = (theme: 'dark' | 'light', eco: boolean, cursorColor = 'auto', termBg: TermBackground = 'paper') => {
@@ -198,6 +198,12 @@ export function Terminal({ id, attach = false, boot, cwd }: { id: string; attach
   // dedupes against it so a record update landing inside create's 700ms window
   // can't get the same command typed twice
   const lastBootRef = useRef<{ boot: string; at: number } | null>(null)
+  // draft survival: the CLI composer's unsent text, reconstructed from
+  // keystrokes (see trackDraft) — replayed into a resumed agent after restart
+  const lastOutputAtRef = useRef(Date.now())
+  const draftBufRef = useRef('')
+  const trackDraftRef = useRef<(data: string) => void>(() => {})
+  const armDraftRetypeRef = useRef<(bootStr: string) => void>(() => {})
 
   // keep the live terminal's palette in sync with the app theme + energy saver
   useEffect(() => {
@@ -404,6 +410,7 @@ export function Terminal({ id, attach = false, boot, cwd }: { id: string; attach
       // line, which is also a newline, not a submit
       if (ev.type === 'keydown' && ev.key === 'Enter' && ev.shiftKey && !ev.metaKey && !ev.ctrlKey && !ev.altKey) {
         bridge.terminal.write(id, '\\\r')
+        trackDraftRef.current('\\\r') // direct write bypasses term.onData — feed the draft tracker too
         return false
       }
       if (ev.type !== 'keydown' || !ev.metaKey) return true
@@ -466,6 +473,73 @@ export function Terminal({ id, attach = false, boot, cwd }: { id: string; attach
       }
     }
 
+    // DRAFT SURVIVAL (agent terminals): the composer's unsent text lives
+    // inside the CLI process, so it's reconstructed here from keystrokes —
+    // printable chars append, backspace trims, Enter submits (clears), and
+    // claude's backslash+CR line continuation becomes a stored newline.
+    // Arrow-key edits degrade fidelity (linear model) — accepted best-effort.
+    const isAgentTerm = () =>
+      !!useKaisola.getState().terminals.find((t) => t.id === id)?.singletonKey?.match(/^(agent|wt):/)
+    const flushDraft = () => useKaisola.getState().setTermDraft(id, draftBufRef.current)
+    const trackDraft = (data: string) => {
+      if (!isAgentTerm()) return
+      if (data === '\x1b' || data === '\x03' || data === '\x15') {
+        // bare Esc / Ctrl-C / Ctrl-U — the composer cleared
+        draftBufRef.current = ''
+        flushDraft()
+        return
+      }
+      const d = data.replace(/\x1b\[20[01]~/g, '') // keep bracketed-paste payloads
+      for (let i = 0; i < d.length; i++) {
+        const ch = d[i]
+        if (ch === '\x1b') {
+          // CSI/SS3 (arrows, home/end…) — skip the sequence, track nothing
+          i++
+          if (d[i] === '[' || d[i] === 'O') {
+            while (i + 1 < d.length && !/[a-zA-Z~]/.test(d[i + 1])) i++
+            i++
+          }
+          continue
+        }
+        if (ch === '\r' || ch === '\n') {
+          if (draftBufRef.current.endsWith('\\')) {
+            draftBufRef.current = draftBufRef.current.slice(0, -1) + '\n' // Shift+⏎ continuation
+          } else {
+            draftBufRef.current = '' // submitted
+          }
+          continue
+        }
+        if (ch === '\x7f') {
+          draftBufRef.current = draftBufRef.current.slice(0, -1)
+          continue
+        }
+        if (ch >= ' ') draftBufRef.current += ch
+      }
+      flushDraft()
+    }
+    trackDraftRef.current = trackDraft
+    // after a --resume/--continue boot, retype the saved draft once the TUI
+    // settles (quiet pty ≥2s). Abort if the user starts typing first, and
+    // give up after 30s — the draft stays persisted for the next launch.
+    armDraftRetypeRef.current = (bootStr: string) => {
+      if (!/--resume|--continue/.test(bootStr)) return
+      const saved = useKaisola.getState().termDrafts[id]
+      if (!saved || saved.trim().length < 3 || !isAgentTerm()) return
+      const born = Date.now()
+      const tryType = () => {
+        if (disposed) return
+        if (draftBufRef.current) return // the user is already typing — leave them be
+        if (Date.now() - born > 30_000) return
+        if (Date.now() - born > 3000 && Date.now() - lastOutputAtRef.current > 2000) {
+          bridge.terminal.write(id, saved.replaceAll('\n', '\\\r'))
+          draftBufRef.current = saved // the composer now holds it — track edits from here
+          return
+        }
+        setTimeout(tryType, 500)
+      }
+      setTimeout(tryType, 3200)
+    }
+
     // dev-server detection: a URL/port in the output becomes a chip on the
     // card head that opens (or re-points) a browser card beside this terminal
     const PORT_RE = /(?:localhost|127\.0\.0\.1|0\.0\.0\.0):(\d{2,5})/
@@ -486,6 +560,7 @@ export function Terminal({ id, attach = false, boot, cwd }: { id: string; attach
 
     const wire = () => {
       unsubData = bridge.terminal.onData(id, (data) => {
+        lastOutputAtRef.current = Date.now() // draft retype waits for pty quiescence
         // hidden cards don't paint: buffer (capped) and replay on show —
         // parse + GPU render for a card nobody can see is pure battery drain
         if (visibleRef.current) {
@@ -505,6 +580,7 @@ export function Terminal({ id, attach = false, boot, cwd }: { id: string; attach
       term.onData((data) => {
         bridge.terminal.write(id, data)
         if (!attach) trackInput(data)
+        trackDraft(data)
       })
       bridge.terminal.resize(id, term.cols, term.rows)
     }
@@ -543,6 +619,7 @@ export function Terminal({ id, attach = false, boot, cwd }: { id: string; attach
               // dedupe against the CLEAN boot — the typed line may carry the wipe
               lastBootRef.current = { boot: line, at: Date.now() }
               bridge.terminal.write(id, bootLine(line, rec?.singletonKey) + '\n')
+              armDraftRetypeRef.current(line)
             }, 700)
           }
         }
@@ -617,7 +694,10 @@ export function Terminal({ id, attach = false, boot, cwd }: { id: string; attach
     // Deliberate reruns (LaTeX rebuild) come much later and pass the window.
     if (t?.boot && lastBootRef.current?.boot === t.boot && Date.now() - lastBootRef.current.at < 10_000) return
     bootSentRef.current = true
-    setTimeout(() => bridge.terminal.write(id, line + '\n'), 700)
+    setTimeout(() => {
+      bridge.terminal.write(id, line + '\n')
+      armDraftRetypeRef.current(line)
+    }, 700)
   }, [ptyReady, bootPending, id])
 
   // find-in-scrollback: amber matches, accent active match (proposed-API decorations)

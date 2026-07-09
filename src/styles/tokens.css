@@ -17,7 +17,7 @@
   /* Terminal surface tone (Settings → Terminal → Background). Mirrors
      TERM_SURFACE in Terminal.tsx — xterm needs the same values as concrete hex. */
   &[data-termbg='slate'] { --term-bg: #191d24; }
-  &[data-termbg='paper'] { --term-bg: #e9ebef; }
+  &[data-termbg='paper'] { --term-bg: #fbfcfd; }
 
   /* — Surfaces & borders — */
   --surface: #14161c;
@@ -192,7 +192,7 @@
   --bg-3: #ffffff;
   --bg-4: #ececef;
   --bg-inset: #f4f4f6;
-  --term-bg: #e9ebef; /* terminal/dock — a touch darker than the light app surface */
+  --term-bg: #fbfcfd; /* terminal/dock — near-white: sleek paper, not gray */
 
   --surface: #ffffff;
   --surface-hover: #f5f5f6;

@@ -482,7 +482,7 @@ const GLOBAL_KEYS = [
   'termFontWeight', 'termCursorColor', 'termBackground', 'customAgents', 'enabledAgents', 'sessionTemplates', 'claudeModel', 'reasoningProvider',
   'localBaseUrl', 'localModel', 'openaiBaseUrl', 'openaiModel', 'openAlexMailto', 'grobidEndpoint',
   'sandboxMode', 'workflows', 'automationsEnabled', 'perfMode', 'railWidth', 'railOpen', 'claudeSessions', 'claudeAccounts',
-  'permissionRules', 'sensitiveGlobs', 'latexMain', 'unsavedBuffers',
+  'permissionRules', 'sensitiveGlobs', 'latexMain', 'unsavedBuffers', 'termDrafts',
 ] as const
 
 type ProjectSlicePersist = Pick<KaisolaState, (typeof PROJECT_SLICE_PERSIST_KEYS)[number]>
@@ -594,6 +594,10 @@ interface KaisolaState {
   latexDismissed: boolean
   /** Per-workspace main .tex file (what latexmk builds). */
   latexMain: Record<string, string>
+  /** Unsent composer text per AGENT terminal id — reconstructed from
+   *  keystrokes (the real text lives inside the CLI process), persisted so a
+   *  restart can retype it into the resumed agent. */
+  termDrafts: Record<string, string>
   /** Live identity per terminal id (session-scoped, never persisted). */
   terminalMeta: Record<string, TerminalMeta>
   /** Bumped when a pop-out window returns a terminal — forces the xterm to
@@ -770,6 +774,7 @@ interface KaisolaState {
   addAgentTerminal: (t: AgentTerminalSession) => void
   closeAgentTerminal: (terminalId: string) => void
   setTerminalMeta: (id: string, patch: TerminalMeta) => void
+  setTermDraft: (id: string, text: string) => void
   popOutTerminal: (id: string, title?: string, hue?: string) => void
   restorePoppedTerminal: (id: string) => void
   /** Open (or focus) the git commit panel card — one per window. */
@@ -1457,6 +1462,16 @@ function persistSnapshot(s: KaisolaState) {
     railOpen: s.railOpen,
     claudeSessions: s.claudeSessions,
     claudeAccounts: s.claudeAccounts,
+    // drafts survive only as long as a terminal that could replay them exists
+    // somewhere (any slice, the live list, or the undo-close stack)
+    termDrafts: (() => {
+      const live = new Set<string>([
+        ...s.terminals.map((t) => t.id),
+        ...Object.values(s.projectSlices).flatMap((sl) => (sl.terminals ?? []).map((t) => t.id)),
+        ...s.closedStack.filter((c) => c.kind === 'term').map((c) => (c as { term: { id: string } }).term.id),
+      ])
+      return Object.fromEntries(Object.entries(s.termDrafts).filter(([id]) => live.has(id)))
+    })(),
     // TABS
     projectTabs: s.projectTabs,
     activeProjectId: s.activeProjectId,
@@ -1632,6 +1647,7 @@ export const useKaisola = create<KaisolaState>()(
   latexMode: false,
   latexDismissed: false,
   latexMain: {},
+  termDrafts: {},
   terminalMeta: {},
   termRemounts: {},
   settingsOpen: false,
@@ -1662,7 +1678,9 @@ export const useKaisola = create<KaisolaState>()(
   fileDirty: false,
   fileTabs: [],
   fileTextZoom: 1,
-  perfMode: 'glass' as PerfMode,
+  // painted is the out-of-the-box mode: the glass look at a fraction of the
+  // energy. Existing installs keep whatever they chose (persisted/migrated).
+  perfMode: 'painted' as PerfMode,
   railWidth: null,
   railOpen: true,
   claudeSessions: {},
@@ -2018,6 +2036,16 @@ export const useKaisola = create<KaisolaState>()(
         agentTerminals,
         ...gridState(grid.length ? grid : fallback ? [[fallback]] : []),
       }
+    }),
+  setTermDraft: (id, text) =>
+    set((s) => {
+      if (!text) {
+        if (!(id in s.termDrafts)) return {}
+        const { [id]: _dropped, ...rest } = s.termDrafts
+        return { termDrafts: rest }
+      }
+      if (s.termDrafts[id] === text) return {}
+      return { termDrafts: { ...s.termDrafts, [id]: text } }
     }),
   setTerminalMeta: (id, patch) =>
     set((s) => {

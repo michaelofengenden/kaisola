@@ -1078,14 +1078,11 @@ a^2 + b^2 = c^2
     if (claudeItem) claudeItem.click()
     await new Promise((rr) => setTimeout(rr, 150))
     const mid = window.__kaisola.getState()
-    const claudeTerm = mid.terminals.find((term) => term.singletonKey === 'agent:claude-code')
-    const claudeOpensTerminal =
-      (mid.terminals.length === beforeTerms || mid.terminals.length === beforeTerms + 1) &&
-      claudeTerm?.boot === 'claude' &&
-      claudeTerm?.restart === true &&
-      claudeTerm?.name === 'Claude' &&
-      mid.dockViews.includes(claudeTerm.id)
-    const claudeNoThread = mid.assistantThreads.length === before
+    // Claude is an ACP chat agent since v0.1.20 — the + menu opens a THREAD
+    // keyed to claude-code (the prepared per-project terminal is separate)
+    const claudeThread = mid.assistantThreads[mid.assistantThreads.length - 1]
+    const claudeOpensThread = mid.assistantThreads.length === before + 1 && claudeThread?.agentKey === 'claude-code'
+    const claudeNoTerminal = mid.terminals.length === beforeTerms
     btn.click()
     await new Promise((rr) => setTimeout(rr, 150))
     const items2 = [...document.querySelectorAll('.drop-menu .drop-item')]
@@ -1100,9 +1097,9 @@ a^2 + b^2 = c^2
       pronounced: r.width >= 24 && r.height >= 24,
       hasTerminalOption: labels.some((l) => /terminal/i.test(l)),
       agentChoices: labels.length >= 4, // 3+ agent presets + terminal
-      claudeOpensTerminal,
-      claudeNoThread,
-      adds: after === before + 1,
+      claudeOpensThread,
+      claudeNoTerminal,
+      adds: after === before + 2, // the claude thread above + the codex thread here
     }
   })()`)
   console.log('PLUS=' + JSON.stringify(plus))
@@ -2430,7 +2427,7 @@ a^2 + b^2 = c^2
     !layout.sessionsInRail || !layout.hasRailTreeArea || !layout.railHasNoSessions || !layout.addsRow || !layout.focusesNewThread || !layout.noDockChrome ||
     !layout.hasFoot || !layout.footWs || !layout.footConn ||
     !splits.one || !splits.appended || !splits.heads || !splits.stacked || !splits.besides || !splits.uncapped || !splits.closes ||
-    !plus.hasBtn || !plus.noDrag || !plus.pronounced || !plus.hasTerminalOption || !plus.agentChoices || !plus.claudeOpensTerminal || !plus.claudeNoThread || !plus.adds ||
+    !plus.hasBtn || !plus.noDrag || !plus.pronounced || !plus.hasTerminalOption || !plus.agentChoices || !plus.claudeOpensThread || !plus.claudeNoTerminal || !plus.adds ||
     !canvasR.hasHandle || !canvasR.sized || !canvasR.clampedMin || !canvasR.resets ||
     !canvasMin.shownBefore || !canvasMin.hasBtn || !canvasMin.hidden || !canvasMin.cardsStay || !canvasMin.restoredByNav || !canvasMin.restoredByFile ||
     !lights.three || !lights.bigger || !lights.corner || !lights.noDrag || !lights.ctlApi ||

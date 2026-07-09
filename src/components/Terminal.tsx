@@ -73,7 +73,7 @@ const TERM_SURFACE: Record<TermBackground, { glass: { dark: string; light: strin
     eco: { dark: '#fbfcfd', light: '#fbfcfd' },
   },
 }
-const xtermTheme = (theme: 'dark' | 'light', eco: boolean, cursorColor = 'auto', termBg: TermBackground = 'paper') => {
+const xtermTheme = (theme: 'dark' | 'light', eco: boolean, cursorColor = 'auto', termBg: TermBackground = 'ink') => {
   // paper is a light surface even in the dark app — text must flip with it
   const lightSurface = theme === 'light' || termBg === 'paper'
   const base = lightSurface ? LIGHT_THEME : DARK_THEME

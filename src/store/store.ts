@@ -1690,7 +1690,9 @@ export const useKaisola = create<KaisolaState>()(
   termFontFamily: 'JetBrains Mono',
   termFontWeight: 500,
   termCursorColor: 'auto',
-  termBackground: 'paper' as TermBackground,
+  // ink follows the app theme: dark app → dark terminal with light text.
+  // paper (light-in-dark) is an explicit Settings choice, never the default.
+  termBackground: 'ink' as TermBackground,
   repoCheckpoints: [],
   agentFeed: [],
   followAgent: false,
@@ -4122,7 +4124,10 @@ export const useKaisola = create<KaisolaState>()(
       // state now lives in `projectSlices` (the active tab's slice IS the live
       // flat fields). migrate wraps the v5 flat state losslessly into one tab.
       // v7 (2026-07-08): ecoMode boolean → perfMode ('glass'|'painted'|'eco').
-      version: 7,
+      // v8 (2026-07-08): termBackground 'paper' was the accidental DEFAULT for
+      // one release (light terminal inside the dark app) — reset it to 'ink'
+      // (theme-following); paper stays available as an explicit choice.
+      version: 8,
       migrate: (persisted, version) => {
         const toV7 = (p: unknown) => {
           const rec = p as Record<string, unknown>
@@ -4132,8 +4137,14 @@ export const useKaisola = create<KaisolaState>()(
           }
           return p
         }
-        if (version >= 7) return persisted
-        if (version === 6) return toV7(persisted)
+        const toV8 = (p: unknown) => {
+          const rec = p as Record<string, unknown>
+          if (rec && typeof rec === 'object' && rec.termBackground === 'paper') rec.termBackground = 'ink'
+          return p
+        }
+        if (version >= 8) return persisted
+        if (version === 7) return toV8(persisted)
+        if (version === 6) return toV8(toV7(persisted))
         const flat = migrateFlatV5(persisted)
         const pid = uid('proj')
         const ws = flat.workspacePath ?? null
@@ -4146,7 +4157,7 @@ export const useKaisola = create<KaisolaState>()(
           const v = (flat as Record<string, unknown>)[k]
           if (v !== undefined) (base as Record<string, unknown>)[k] = v
         }
-        return toV7({
+        return toV8(toV7({
           ...pickGlobals(flat as Record<string, unknown>),
           // pickGlobals no longer knows ecoMode — hand it to toV7 explicitly
           ecoMode: (flat as Record<string, unknown>).ecoMode,
@@ -4154,7 +4165,7 @@ export const useKaisola = create<KaisolaState>()(
           activeProjectId: pid,
           projectSlices: { [pid]: sanitizeSliceForPersist(base) },
           recentProjects: ws ? [{ path: ws, name, at: Date.now() }] : [],
-        })
+        }))
       },
       // split the persisted blob back apart SYNCHRONOUSLY (getItem is sync → no
       // rehydration flash). Spread `current` FIRST so action fns are never

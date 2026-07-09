@@ -72,7 +72,7 @@ function registerUpdateHandlers(ipcMain) {
   // a stale build and had to download+restart AGAIN for each hop. While ready,
   // probe() keeps watching the feed and swaps the pending download for the
   // newest release, so one restart always lands on latest.
-  const busy = () => state.type === 'checking' || state.type === 'downloading'
+  const busy = () => state.type === 'checking' || state.type === 'downloading' || state.type === 'installing'
 
   const newer = (a, b) => {
     // semver-ish compare, enough for x.y.z tags
@@ -112,22 +112,40 @@ function registerUpdateHandlers(ipcMain) {
 
   ipcMain.handle('update:check', () => recheck())
   ipcMain.handle('update:install', async () => {
-    // rapid-release guard: releases ship minutes apart some days, and
-    // quitAndInstall applies the last COMPLETED download — a pill clicked
-    // late used to land one release behind and immediately grow a new pill
-    // (update → restart → update again, one hop per release). Give the feed
-    // one last look and swap in anything newer BEFORE restarting; the state
-    // broadcasts keep the pill honest ("Downloading…") while it swaps.
-    try {
-      if (state.type === 'ready') await probe()
+    if (state.type !== 'ready') {
+      return { ok: false, message: 'No downloaded update is ready to install.' }
+    }
+    // Install EXACTLY what's downloaded — never re-check the feed here. The
+    // last-look probe this used to do could reset electron-updater's pending
+    // download reference mid-flight, turning quitAndInstall into a silent
+    // no-op (the "restart button doesn't restart" bug). Staying current is
+    // the hourly/focus probe's job; one extra hop on a rapid-release day is
+    // fine, a restart button that doesn't restart is not.
+    if (probing) {
+      // a background probe is mid-flight — give it a moment to settle so it
+      // can't clear the pending download under quitAndInstall
       const started = Date.now()
-      while (state.type === 'downloading' && Date.now() - started < 180_000) {
-        await new Promise((r) => setTimeout(r, 250))
+      while (probing && Date.now() - started < 10_000) {
+        await new Promise((r) => setTimeout(r, 100))
       }
-    } catch { /* offline etc. — the already-downloaded build is still fine */ }
+    }
+    setState({ type: 'installing', message: 'Restarting to apply update…' })
     // before-quit (pty teardown etc.) still runs — quitAndInstall goes
     // through the normal quit path, then relaunches into the new build
-    setImmediate(() => autoUpdater.quitAndInstall())
+    let quitStarted = false
+    app.once('before-quit-for-update', () => { quitStarted = true })
+    setImmediate(() => {
+      try { autoUpdater.quitAndInstall(false, true) } catch { /* fall through to the backstop */ }
+    })
+    // BACKSTOP: if quitAndInstall no-ops (updater lost its pending-download
+    // state), still honor the click — a plain relaunch quits the app, and
+    // autoInstallOnAppQuit applies the downloaded build during that quit. A
+    // quit that's merely SLOW skips this (before-quit already fired).
+    setTimeout(() => {
+      if (quitStarted) return
+      app.relaunch()
+      app.exit(0)
+    }, 4000)
     return { ok: true }
   })
 

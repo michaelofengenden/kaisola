@@ -157,6 +157,15 @@ const bridge = {
     userConfig: () => ipcRenderer.invoke('mcp:user-config'),
     discover: () => ipcRenderer.invoke('mcp:discover'),
     importDiscovered: () => ipcRenderer.invoke('mcp:import-discovered'),
+    serverAdd: (name, config) => ipcRenderer.invoke('mcp:server-add', { name, config }),
+    // kaisola://mcp/install deeplinks: the trust modal renders these; main
+    // queues links that arrive before the renderer announces readiness
+    onInstallRequest: (cb) => {
+      const listener = (_e, req) => cb(req)
+      ipcRenderer.on('mcp:install-request', listener)
+      ipcRenderer.send('mcp:install-ready')
+      return () => ipcRenderer.removeListener('mcp:install-request', listener)
+    },
     onServersChanged: (cb) => {
       const listener = () => cb()
       ipcRenderer.on('mcp:servers-changed', listener)

@@ -252,6 +252,37 @@ app.on('open-file', (event, filePath) => {
   deliverOpenFile(filePath)
 })
 
+// ── kaisola:// deeplinks ──────────────────────────────────────────────────────
+// kaisola://mcp/install?name=<name>&config=<base64 json> — the Cursor-shaped
+// MCP install link. The URL is parsed + validated in main; NOTHING is written
+// until the renderer's trust modal gets an explicit Install. Links arriving
+// before any window exists queue and deliver on first load.
+const { parseInstallUrl } = require('./ipc/mcpCatalog.cjs')
+const pendingInstalls = []
+let installsReady = false
+function deliverInstall(req) {
+  const win = BrowserWindow.getFocusedWindow() ?? BrowserWindow.getAllWindows().find((w) => !w.webContents.isDestroyed())
+  if (!win || !installsReady) {
+    pendingInstalls.push(req)
+    if (!win && app.isReady()) createWindow({ slot: nextSlot++ })
+    return
+  }
+  if (win.isMinimized()) win.restore()
+  win.show()
+  win.webContents.send('mcp:install-request', req)
+}
+app.on('open-url', (event, url) => {
+  event.preventDefault()
+  const req = parseInstallUrl(url)
+  if (req) deliverInstall(req)
+})
+ipcMain.on('mcp:install-ready', (e) => {
+  installsReady = true
+  for (const req of pendingInstalls.splice(0)) {
+    if (!e.sender.isDestroyed()) e.sender.send('mcp:install-request', req)
+  }
+})
+
 /**
  * All windows share this chrome. `opts.slot` opens a FULL app window with its
  * own persisted state (slot 2, 3, … — each remembers its own workspace and
@@ -580,6 +611,9 @@ app.whenReady().then(() => {
   // paint the native material in the persisted app theme from the first frame
   const savedTheme = readShellPrefs().appTheme
   if (savedTheme === 'dark' || savedTheme === 'light' || savedTheme === 'system') nativeTheme.themeSource = savedTheme
+  // kaisola:// deeplinks (MCP install links) — packaged builds only; a dev
+  // registration would hijack the protocol from the installed app
+  if (app.isPackaged) app.setAsDefaultProtocolClient('kaisola')
   installAppMenu()
   const appIcon = loadAppIcon()
   if (appIcon) {

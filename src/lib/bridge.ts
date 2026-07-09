@@ -511,6 +511,10 @@ export interface KaisolaBridge {
     /** Import every discovered server into the user catalog, DISABLED. */
     importDiscovered?(): Promise<{ ok: boolean; imported: number; message?: string }>
     onServersChanged?(cb: () => void): () => void
+    /** Write one server into the user catalog (trust-modal Install only). */
+    serverAdd?(name: string, config: unknown): Promise<{ ok: boolean; message?: string }>
+    /** kaisola://mcp/install deeplinks — validated in main, consented here. */
+    onInstallRequest?(cb: (req: { name: string; config: Record<string, unknown> }) => void): () => void
   }
   git: {
     status(cwd: string): Promise<{ ok: boolean; notRepo?: boolean; root?: string; branch?: string | null; entries?: GitStatusEntry[] }>

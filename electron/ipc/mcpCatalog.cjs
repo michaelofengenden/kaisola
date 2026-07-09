@@ -394,7 +394,47 @@ function ensureUserConfig() {
   return file
 }
 
+// ── install deeplink (kaisola://mcp/install?name=…&config=BASE64(json)) ─────
+// Mirrors Cursor's install-link shape so ecosystem "Add to Cursor" buttons
+// translate 1:1. The parser only VALIDATES — nothing is written until the
+// renderer's trust modal gets an explicit Install click.
+const INSTALL_NAME_RE = /^[a-z0-9][a-z0-9_-]{0,39}$/i
+function parseInstallUrl(rawUrl) {
+  let u
+  try { u = new URL(rawUrl) } catch { return null }
+  // both kaisola://mcp/install (host=mcp, path=/install) and kaisola:mcp/install
+  const where = `${u.host}${u.pathname}`.replace(/\/+$/, '')
+  if (u.protocol !== 'kaisola:' || where !== 'mcp/install') return null
+  const name = u.searchParams.get('name') ?? ''
+  const b64 = u.searchParams.get('config') ?? ''
+  if (!INSTALL_NAME_RE.test(name)) return null
+  let config
+  try { config = JSON.parse(Buffer.from(b64, 'base64').toString('utf8')) } catch { return null }
+  if (!config || typeof config !== 'object' || Array.isArray(config)) return null
+  // must normalize to something runnable — same validator the catalog uses
+  if (!normalizeSpec(config)) return null
+  return { name, config }
+}
+
+/** Write one server into the USER catalog (raw spec verbatim — never
+ *  env-expanded into the file). Called only after the trust modal's Install. */
+function addUserServer(name, config) {
+  if (!INSTALL_NAME_RE.test(name) || !normalizeSpec(config)) return { ok: false, message: 'Invalid server spec.' }
+  const { data } = readJson(userConfigPath())
+  const cfg = data && typeof data === 'object' ? data : {}
+  cfg.mcpServers = { ...(cfg.mcpServers || {}), [name]: config }
+  if (Object.keys(cfg.mcpServers).length > MAX_SERVERS_PER_SCOPE) return { ok: false, message: `User catalog is full (${MAX_SERVERS_PER_SCOPE}).` }
+  writeJson(userConfigPath(), cfg)
+  emitChange()
+  return { ok: true }
+}
+
 function registerMcpCatalogHandlers(ipcMain) {
+  ipcMain.handle('mcp:server-add', (_e, { name, config } = {}) => {
+    try { return addUserServer(String(name ?? ''), config) } catch (err) {
+      return { ok: false, message: String((err && err.message) || err) }
+    }
+  })
   ipcMain.handle('mcp:servers', (_e, { workspace } = {}) => {
     try { return { ok: true, ...listServers(workspace || null) } } catch (err) {
       return { ok: false, servers: [], message: String((err && err.message) || err) }
@@ -429,4 +469,4 @@ function registerMcpCatalogHandlers(ipcMain) {
   })
 }
 
-module.exports = { registerMcpCatalogHandlers, acpEntries, claudeUserEntries, onChange }
+module.exports = { registerMcpCatalogHandlers, acpEntries, claudeUserEntries, onChange, parseInstallUrl, addUserServer }

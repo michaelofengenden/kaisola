@@ -1530,3 +1530,28 @@ details.assistant-tool.tool-artifacts > summary::-webkit-details-marker { displa
   transition: width var(--dur-2) var(--ease-out);
 }
 .ctx-meter[data-hot] .ctx-meter-fill { background: var(--warning, #d8a44a); }
+
+/* the MCP install trust modal (kaisola://mcp/install deeplinks) */
+.mcp-install { max-width: 520px; }
+.mcp-install-body { padding: var(--sp-4) var(--sp-5); display: flex; flex-direction: column; gap: var(--sp-3); }
+.mcp-install-warning {
+  display: flex;
+  gap: var(--sp-2);
+  align-items: flex-start;
+  font-size: var(--fs-12);
+  color: var(--text-2);
+  line-height: var(--lh-snug);
+}
+.mcp-install-spec {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+  padding: var(--sp-3);
+  border: 1px solid var(--border-faint);
+  border-radius: var(--r-2);
+  background: var(--bg-inset);
+}
+.mcp-install-row { display: flex; align-items: center; gap: var(--sp-3); min-width: 0; font-size: var(--fs-12); }
+.mcp-install-row code { font-family: var(--font-mono); font-size: var(--fs-11); color: var(--text-1); min-width: 0; }
+.mcp-install-msg { font-size: var(--fs-12); color: var(--warning, #d8a44a); }
+.mcp-install-actions { display: flex; gap: var(--sp-2); padding: 0 var(--sp-5) var(--sp-4); }

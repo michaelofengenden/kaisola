@@ -14,6 +14,7 @@ import { CommandPalette } from './components/shell/CommandPalette'
 import { SessionCards, shellDrag } from './components/shell/SessionCards'
 import { ProvenancePopover } from './components/Provenance'
 import { ReviewFocus } from './components/ReviewFocus'
+import { McpInstallModal } from './components/shell/McpInstallModal'
 import { Settings } from './components/Settings'
 import { SignInCard } from './components/SignInCard'
 import { Toaster } from './components/Toaster'
@@ -620,6 +621,7 @@ export default function App() {
       <OmniBar />
       <ProvenancePopover />
       <ReviewFocus />
+      <McpInstallModal />
       <Settings />
       <SignInCard />
       <Toaster />

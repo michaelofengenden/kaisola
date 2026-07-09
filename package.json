@@ -26,6 +26,14 @@
   "build": {
     "appId": "app.kaisola.desktop",
     "productName": "Kaisola",
+    "protocols": [
+      {
+        "name": "Kaisola",
+        "schemes": [
+          "kaisola"
+        ]
+      }
+    ],
     "directories": {
       "output": "release"
     },

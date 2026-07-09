@@ -84,10 +84,11 @@ app.whenReady().then(async () => {
   const paintedShot = await win.webContents.capturePage()
   const painted = await js(`(() => {
     const el = document.querySelector('.app-wallpaper')
+    // the painting lives on ::before (a parent filter would blur the grain)
     return {
       perf: document.documentElement.dataset.perf,
       mounted: !!el,
-      bg: el ? getComputedStyle(el).backgroundImage.slice(0, 40) : '',
+      bg: el ? getComputedStyle(el, '::before').backgroundImage.slice(0, 40) : '',
     }
   })()`)
 

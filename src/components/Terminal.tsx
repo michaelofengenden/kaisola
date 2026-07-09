@@ -148,7 +148,9 @@ export function Terminal({ id, attach = false, boot, cwd }: { id: string; attach
   // prompt (iTerm-style) instead of opening a file tab
   const [fileDropHover, setFileDropHover] = useState(false)
   // prompt timeline for the Claude session: a marker per hook prompt event
-  const promptMarksRef = useRef<{ marker: IMarker; text: string; at: number }[]>([])
+  const promptMarksRef = useRef<{ marker: IMarker; text: string; at: number; src?: 'typed' | 'hook' }[]>([])
+  // once a hook-sourced mark arrives, the typed fallback stands down
+  const hookMarksLiveRef = useRef(false)
   const [, setPromptTick] = useState(0)
   const [railHover, setRailHover] = useState<{ n: number; y: number } | null>(null)
   const theme = useKaisola((s) => s.theme)
@@ -365,7 +367,13 @@ export function Terminal({ id, attach = false, boot, cwd }: { id: string; attach
       if (rec?.singletonKey !== 'agent:claude-code') return
       const marker = term.registerMarker(0)
       if (!marker) return
-      promptMarksRef.current.push({ marker, text: (ev.prompt || 'prompt').slice(0, 200), at: ev.at })
+      hookMarksLiveRef.current = true
+      // a typed fallback mark for this same prompt may have landed moments
+      // ago (Enter beat the hook event) — replace it, don't double-tick
+      promptMarksRef.current = promptMarksRef.current.filter(
+        (p) => !(p.src === 'typed' && Date.now() - p.at < 3000),
+      )
+      promptMarksRef.current.push({ marker, text: (ev.prompt || 'prompt').slice(0, 200), at: ev.at, src: 'hook' })
       if (promptMarksRef.current.length > 40) promptMarksRef.current.shift()
       marker.onDispose(() => {
         promptMarksRef.current = promptMarksRef.current.filter((p) => p.marker !== marker)
@@ -505,7 +513,13 @@ export function Terminal({ id, attach = false, boot, cwd }: { id: string; attach
           if (draftBufRef.current.endsWith('\\')) {
             draftBufRef.current = draftBufRef.current.slice(0, -1) + '\n' // Shift+⏎ continuation
           } else {
-            draftBufRef.current = '' // submitted
+            // submitted — ALSO pin a prompt-timeline mark. The tracker knows
+            // the moment and the text without needing the hooks tap, so the
+            // rail works even when hook events never arrive (unarmed hooks,
+            // non-claude agents). Hook marks win when both fire (see flag).
+            const submitted = draftBufRef.current.trim()
+            if (submitted.length >= 3) pinTypedPromptMark(submitted)
+            draftBufRef.current = ''
           }
           continue
         }
@@ -518,6 +532,20 @@ export function Terminal({ id, attach = false, boot, cwd }: { id: string; attach
       flushDraft()
     }
     trackDraftRef.current = trackDraft
+    // typed-prompt fallback marks: skipped once hook marks prove live (the
+    // hook path has better fidelity — server-confirmed prompts)
+    const pinTypedPromptMark = (text: string) => {
+      if (hookMarksLiveRef.current || !isAgentTerm()) return
+      const term = termRef.current
+      const marker = term?.registerMarker(0)
+      if (!marker) return
+      promptMarksRef.current.push({ marker, text: text.slice(0, 200), at: Date.now(), src: 'typed' })
+      if (promptMarksRef.current.length > 40) promptMarksRef.current.shift()
+      marker.onDispose(() => {
+        promptMarksRef.current = promptMarksRef.current.filter((p) => p.marker !== marker)
+      })
+      setPromptTick((n) => n + 1)
+    }
     // after a --resume/--continue boot, retype the saved draft once the TUI
     // settles (quiet pty ≥2s). Abort if the user starts typing first, and
     // give up after 30s — the draft stays persisted for the next launch.

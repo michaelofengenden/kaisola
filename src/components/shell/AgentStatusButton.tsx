@@ -77,7 +77,7 @@ export function AgentStatusButton() {
   const [probes, setProbes] = useState<Record<string, McpProbeResult>>({})
   const [discovered, setDiscovered] = useState<Array<{ name: string; origin: string }>>([])
   const btnRef = useRef<HTMLButtonElement | null>(null)
-  const { all } = useAgentRegistry()
+  const { all, menu } = useAgentRegistry()
   const openSettings = useKaisola((s) => s.setSettingsOpen)
   const workspacePath = useKaisola((s) => s.workspacePath)
   const requestFile = useKaisola((s) => s.requestFile)
@@ -139,7 +139,14 @@ export function AgentStatusButton() {
     if (!open) return
     const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') setOpen(false) }
     window.addEventListener('keydown', onKey)
-    return () => window.removeEventListener('keydown', onKey)
+    // while open, the panel is LIVE — a steady poll under the event triggers,
+    // so busy/connected states never read stale ("the activity doesn't stay")
+    const iv = window.setInterval(() => void load(), 2500)
+    return () => {
+      window.removeEventListener('keydown', onKey)
+      window.clearInterval(iv)
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [open])
 
   if (!isDesktop) return null
@@ -270,7 +277,14 @@ export function AgentStatusButton() {
                 />
               )
             })}
-            {claudeRunning === undefined && agents.length === 0 && (
+            {/* enabled agents that AREN'T connected still get a quiet row —
+                rows must never vanish between sessions ("doesn't stay") */}
+            {menu
+              .filter((m) => m.kind === 'acp' && !agents.some((a) => (a.presetId ?? a.key) === m.id))
+              .map((m) => (
+                <Row key={`off:${m.id}`} tone={DOT.off} name={m.name} sub="acp" state="off" title="Not connected — open a session from the + menu" />
+              ))}
+            {claudeRunning === undefined && agents.length === 0 && menu.filter((m) => m.kind === 'acp').length === 0 && (
               <span className="faint">No agents connected — open a session from the + menu.</span>
             )}
 

@@ -1,7 +1,9 @@
 import { memo, useEffect, useMemo, useRef, useState } from 'react'
+import { createPortal } from 'react-dom'
 import {
   useKaisola,
   type AssistantDraft,
+  type ClaudeEffort,
   type AssistantMention,
   type AssistantRuntime,
   type PlanEntry,
@@ -28,8 +30,8 @@ type Runtime = AssistantRuntime
 type ControlKind = 'mode' | 'model' | 'config'
 interface UiControl { id: string; name: string; category: string; value: string; options: { value: string; name: string; description?: string }[]; kind: ControlKind }
 
-const CATEGORY_ORDER: Record<string, number> = { mode: 0, model: 1, thought_level: 2 }
-const CATEGORY_ICON: Record<string, string> = { mode: 'ShieldCheck', model: 'Box', thought_level: 'Brain' }
+const CATEGORY_ORDER: Record<string, number> = { mode: 0, model: 1, thought_level: 2, speed: 3 }
+const CATEGORY_ICON: Record<string, string> = { mode: 'ShieldCheck', model: 'Box', thought_level: 'Brain', speed: 'Gauge' }
 const mentionIcon = (kind: Mention['kind']): string =>
   kind === 'paper' ? 'FileText'
     : kind === 'claim' ? 'Network'
@@ -46,12 +48,146 @@ const SPEED_OPTIONS = [
   { value: 'balanced', name: 'Balanced', description: 'Default agent effort' },
   { value: 'deep', name: 'Deep', description: 'More checking before answering' },
 ]
+const CLAUDE_EFFORT_OPTIONS = [
+  { value: 'low', name: 'Light', description: 'Fastest · minimal thinking' },
+  { value: 'medium', name: 'Medium', description: 'Moderate reasoning' },
+  { value: 'high', name: 'High', description: 'Deep reasoning' },
+  { value: 'xhigh', name: 'Extra High', description: 'More time for difficult work' },
+  { value: 'max', name: 'Max', description: 'Maximum available effort · higher usage' },
+]
 const isAssistantSpeed = (v: string): v is AssistantSpeed => v === 'fast' || v === 'balanced' || v === 'deep'
+const isClaudeEffort = (v: string): v is ClaudeEffort => ['low', 'medium', 'high', 'xhigh', 'max'].includes(v)
 const speedGuidance = (speed: AssistantSpeed, nativeApplied: boolean): string => {
   if (nativeApplied) return ''
   if (speed === 'fast') return 'Kaisola speed: Fast. Prioritize a quick, concise answer and avoid broad exploration unless it is necessary.\n\n'
   if (speed === 'deep') return 'Kaisola speed: Deep. Spend extra effort checking edge cases, tradeoffs, and likely failure modes before answering.\n\n'
   return ''
+}
+
+function useProviderPopover(open: boolean, setOpen: (open: boolean) => void, button: React.RefObject<HTMLButtonElement>, panel: React.RefObject<HTMLDivElement>) {
+  useEffect(() => {
+    if (!open) return
+    const onPointer = (event: MouseEvent) => {
+      const target = event.target as Node
+      if (!button.current?.contains(target) && !panel.current?.contains(target)) setOpen(false)
+    }
+    const onKey = (event: KeyboardEvent) => {
+      if (event.key !== 'Escape') return
+      event.stopPropagation()
+      setOpen(false)
+    }
+    document.addEventListener('mousedown', onPointer)
+    window.addEventListener('keydown', onKey, true)
+    return () => {
+      document.removeEventListener('mousedown', onPointer)
+      window.removeEventListener('keydown', onKey, true)
+    }
+  }, [open, setOpen, button, panel])
+}
+
+function popoverPosition(button: HTMLButtonElement | null) {
+  const rect = button?.getBoundingClientRect()
+  if (!rect) return { right: 12, bottom: 56 }
+  return {
+    right: Math.max(8, window.innerWidth - rect.right),
+    bottom: Math.max(8, window.innerHeight - rect.top + 7),
+  }
+}
+
+/** Claude's own Faster → Smarter effort treatment, backed by a real reconnect. */
+function ClaudeEffortPicker({ value, busy, onSelect }: { value: ClaudeEffort; busy?: boolean; onSelect: (value: string) => void }) {
+  const [open, setOpen] = useState(false)
+  const button = useRef<HTMLButtonElement>(null)
+  const panel = useRef<HTMLDivElement>(null)
+  useProviderPopover(open, setOpen, button, panel)
+  const index = Math.max(0, CLAUDE_EFFORT_OPTIONS.findIndex((option) => option.value === value))
+  const current = CLAUDE_EFFORT_OPTIONS[index]
+  return (
+    <>
+      <button ref={button} className="provider-summary-btn" data-open={open} disabled={busy} onClick={() => setOpen((state) => !state)} title="Claude effort">
+        <span>{current?.name ?? value}</span><Icon name="ChevronDown" size={12} />
+      </button>
+      {open && createPortal(
+        <div ref={panel} className="provider-pop claude-effort-pop" style={{ position: 'fixed', ...popoverPosition(button.current) }}>
+          <div className="provider-pop-head">
+            <span className="faint">Effort</span>
+            <strong>{current?.name ?? value}</strong>
+            <span className="grow" />
+            <Icon name="CircleHelp" size={14} className="faint" />
+          </div>
+          <div className="effort-axis"><span>Faster</span><span>Smarter</span></div>
+          <div className="effort-track">
+            <span className="effort-track-fill" style={{ width: `${index * 25}%` }} />
+            {CLAUDE_EFFORT_OPTIONS.map((option, optionIndex) => (
+              <button
+                key={option.value}
+                data-active={optionIndex === index}
+                data-past={optionIndex <= index || undefined}
+                onClick={() => { onSelect(option.value); setOpen(false) }}
+                title={`${option.name} — ${option.description}`}
+                aria-label={`Set Claude effort to ${option.name}`}
+              ><span /></button>
+            ))}
+          </div>
+          <p>{current?.description}</p>
+        </div>,
+        document.body,
+      )}
+    </>
+  )
+}
+
+/** Codex's compact Advanced panel. Effort is honest about adapter support. */
+function CodexAdvancedPicker({
+  model,
+  speed,
+  onModel,
+  onSpeed,
+}: {
+  model: UiControl
+  speed: AssistantSpeed
+  onModel: (value: string) => void
+  onSpeed: (value: string) => void
+}) {
+  const [open, setOpen] = useState(false)
+  const button = useRef<HTMLButtonElement>(null)
+  const panel = useRef<HTMLDivElement>(null)
+  useProviderPopover(open, setOpen, button, panel)
+  const currentModel = model.options.find((option) => option.value === model.value)
+  const speedName = SPEED_OPTIONS.find((option) => option.value === speed)?.name ?? speed
+  const compactModel = (currentModel?.name ?? model.value).replace(/^GPT-/, '')
+  return (
+    <>
+      <button ref={button} className="provider-summary-btn codex-summary" data-open={open} onClick={() => setOpen((state) => !state)} title="Codex model, effort, and speed">
+        <Icon name="Zap" size={13} />
+        <span>{compactModel}</span>
+        <b>{speedName}</b>
+        <Icon name="ChevronDown" size={12} />
+      </button>
+      {open && createPortal(
+        <div ref={panel} className="provider-pop codex-advanced-pop" style={{ position: 'fixed', ...popoverPosition(button.current) }}>
+          <div className="provider-pop-head"><strong>Codex</strong><span className="grow" /><span className="faint">Advanced</span></div>
+          <div className="provider-setting-head"><span>Model</span><strong>{currentModel?.name ?? model.value}</strong></div>
+          <div className="provider-model-grid">
+            {model.options.map((option) => (
+              <button key={option.value} data-active={option.value === model.value} onClick={() => onModel(option.value)}>
+                <Icon name="Check" size={11} /><span><strong>{option.name}</strong>{option.description && <small>{option.description}</small>}</span>
+              </button>
+            ))}
+          </div>
+          <div className="provider-setting-row provider-setting-disabled" title="The connected codex-acp adapter does not expose live effort yet">
+            <span>Effort</span><strong>Codex config</strong><Icon name="LockKeyhole" size={12} />
+          </div>
+          <p className="provider-capability-note">Live effort appears here as soon as the connected Codex adapter exposes it. Terminal sessions still honor your Codex setting, including Max and Ultra.</p>
+          <div className="provider-setting-head"><span>Speed</span><strong>{speedName}</strong></div>
+          <div className="provider-speed-grid">
+            {SPEED_OPTIONS.map((option) => <button key={option.value} data-active={option.value === speed} onClick={() => onSpeed(option.value)}>{option.name}</button>)}
+          </div>
+        </div>,
+        document.body,
+      )}
+    </>
+  )
 }
 // one quiet auto-connect attempt per agent+workspace per app run — module
 // scope so two side-by-side threads on the same agent can't race a double
@@ -276,11 +412,15 @@ function controlList(controls: AcpControls | null): UiControl[] {
   return list.sort((a, b) => (CATEGORY_ORDER[a.category] ?? 9) - (CATEGORY_ORDER[b.category] ?? 9))
 }
 
+/** A real provider speed/latency switch, not reasoning effort. Older code
+ * matched effort/thought controls here too, hid them, and silently translated
+ * Fast/Balanced/Deep into the provider's reasoning level. That made Codex's
+ * model effort impossible to inspect independently from response speed. */
 function nativeSpeedControl(controls: UiControl[]): UiControl | null {
   return controls.find((c) => {
     if (c.kind !== 'config' || c.options.length < 2) return false
     const haystack = `${c.id} ${c.name} ${c.category}`.toLowerCase()
-    return /speed|effort|reasoning|thought|think/.test(haystack)
+    return /speed|latency|pace|fast.mode/.test(haystack) && !/effort|reasoning|thought|think/.test(haystack)
   }) ?? null
 }
 
@@ -333,6 +473,7 @@ export const Assistant = memo(function Assistant({ threadId }: { threadId: strin
   const setThreadBusy = useKaisola((s) => s.setThreadBusy)
   const autoNameThread = useKaisola((s) => s.autoNameThread)
   const setStoreThreadAgent = useKaisola((s) => s.setAssistantThreadAgent)
+  const setThreadClaudeEffort = useKaisola((s) => s.setThreadClaudeEffort)
   const project = useKaisola((s) => s.project)
   const stage = useKaisola((s) => s.stage)
   const agentTerminals = useKaisola((s) => s.agentTerminals)
@@ -375,6 +516,7 @@ export const Assistant = memo(function Assistant({ threadId }: { threadId: strin
   const attachments = draft.attachments
   const mentions = draft.mentions
   const speed = draft.speed
+  const claudeEffort = active.claudeEffort ?? 'high'
   useEffect(() => { if (inputRef.current && !input) inputRef.current.style.height = '' }, [input])
   const permsForAgent = pendingPermissions.filter((p) => p.key === agentKey)
   const arun: Runtime = liveRuntime ?? { turns: [], first: true }
@@ -385,6 +527,13 @@ export const Assistant = memo(function Assistant({ threadId }: { threadId: strin
   const controls = controlList(aState?.controls ?? null)
   const speedControl = nativeSpeedControl(controls)
   const visibleControls = speedControl ? controls.filter((c) => c.id !== speedControl.id) : controls
+  const hasNativeEffort = controls.some((c) => /effort|reasoning|thought|think/.test(`${c.id} ${c.name} ${c.category}`.toLowerCase()))
+  const claudeAgent = /claude/i.test(`${agentKey} ${agentName}`)
+  const codexAgent = /codex/i.test(`${agentKey} ${agentName}`)
+  const providerModelControl = visibleControls.find((control) => control.kind === 'model' || control.category === 'model')
+  const composerControls = providerModelControl && (claudeAgent || codexAgent)
+    ? visibleControls.filter((control) => control !== providerModelControl)
+    : visibleControls
   const codeAgent = /codex|claude/i.test(`${agentKey} ${agentName}`)
   const activityTools = arun.turns.filter((t) => t.kind === 'tool').slice(-8)
   const activeToolCount = activityTools.filter((t) => !doneStatuses.has((t.status || '').toLowerCase())).length
@@ -540,7 +689,7 @@ export const Assistant = memo(function Assistant({ threadId }: { threadId: strin
     if (r.message) setNotice(r.message)
     return null
   }
-  const connect = async (key: string): Promise<boolean> => {
+  const connect = async (key: string, opts: { claudeEffort?: ClaudeEffort } = {}): Promise<boolean> => {
     setNotice(null)
     const preset = presets.find((p) => p.id === key)
     if (preset?.terminalOnly) {
@@ -559,10 +708,11 @@ export const Assistant = memo(function Assistant({ threadId }: { threadId: strin
     // restart continuity: this thread's last agent-side session resumes via
     // session/load when the agent supports it (stale ids fall back fresh)
     const resumeSessionId = key === active.agentKey ? active.acpSessionId : undefined
+    const effort = key === 'claude-code' ? (opts.claudeEffort ?? active.claudeEffort ?? 'high') : undefined
     const res = await bridge.acp.connect(
       custom
-        ? { presetId: key, name: custom.name, command: custom.command, args: custom.args, autonomy, cwd, resumeSessionId }
-        : { presetId: key, autonomy, cwd, resumeSessionId },
+        ? { presetId: key, name: custom.name, command: custom.command, args: custom.args, autonomy, cwd, resumeSessionId, claudeEffort: effort }
+        : { presetId: key, autonomy, cwd, resumeSessionId, claudeEffort: effort },
     )
     if (res.ok) {
       setNotice(null); refresh()
@@ -608,9 +758,13 @@ export const Assistant = memo(function Assistant({ threadId }: { threadId: strin
     void connect(agentKey)
   }, [agentKey, connected, busy, presets, workspacePath])
   const onControlChange = async (c: UiControl, value: string) => {
-    if (c.kind === 'mode') await bridge.acp.setMode(agentKey, value)
-    else if (c.kind === 'model') await bridge.acp.setModel(agentKey, value)
-    else await bridge.acp.setConfigOption(agentKey, c.id, value)
+    const result = c.kind === 'mode'
+      ? await bridge.acp.setMode(agentKey, value)
+      : c.kind === 'model'
+        ? await bridge.acp.setModel(agentKey, value)
+        : await bridge.acp.setConfigOption(agentKey, c.id, value)
+    if (!result.ok) setNotice(result.message ?? `${c.name} could not be changed.`)
+    else setNotice(null)
     refresh()
   }
   const applySpeed = async (nextSpeed: AssistantSpeed): Promise<boolean> => {
@@ -627,6 +781,17 @@ export const Assistant = memo(function Assistant({ threadId }: { threadId: strin
     if (!isAssistantSpeed(value)) return
     setAssistantDraft(active.id, { speed: value })
     void applySpeed(value)
+  }
+  const changeClaudeEffort = async (value: string) => {
+    if (!isClaudeEffort(value)) return
+    if (busy) {
+      setNotice('Wait for this turn to finish before changing Claude effort.')
+      return
+    }
+    setThreadClaudeEffort(active.id, value)
+    setNotice('Applying Claude effort…')
+    const ok = await connect(agentKey, { claudeEffort: value })
+    if (ok) setNotice(`Claude effort: ${CLAUDE_EFFORT_OPTIONS.find((o) => o.value === value)?.name ?? value}. Session resumed.`)
   }
 
   // Chunks arrive far faster than frames paint, and every runtime update
@@ -1198,11 +1363,18 @@ export const Assistant = memo(function Assistant({ threadId }: { threadId: strin
         <div className="composer-bar">
           <button className="composer-tool" onClick={attach} title="Attach files"><Icon name="Paperclip" size={14} /></button>
           <button className="composer-tool" onClick={insertMention} title="Reference a paper, claim, hypothesis, run or figure"><Icon name="AtSign" size={14} /></button>
-          <Dropdown icon="Gauge" value={speed} options={SPEED_OPTIONS} onSelect={setSpeed} title="Speed" />
-          {visibleControls.map((c) => (
+          {composerControls.map((c) => (
             <Dropdown key={c.id} icon={CATEGORY_ICON[c.category]} value={c.value} options={c.options} onSelect={(v) => onControlChange(c, v)} title={c.name} />
           ))}
+          {!claudeAgent && !codexAgent && <Dropdown icon="Gauge" value={speed} options={SPEED_OPTIONS} onSelect={setSpeed} title="Response speed" />}
           <span className="grow" />
+          {claudeAgent && providerModelControl && (
+            <Dropdown icon="Sparkles" value={providerModelControl.value} options={providerModelControl.options} onSelect={(value) => void onControlChange(providerModelControl, value)} title="Claude model" align="right" />
+          )}
+          {claudeAgent && !hasNativeEffort && <ClaudeEffortPicker value={claudeEffort} busy={busy} onSelect={(value) => void changeClaudeEffort(value)} />}
+          {codexAgent && providerModelControl && (
+            <CodexAdvancedPicker model={providerModelControl} speed={speed} onModel={(value) => void onControlChange(providerModelControl, value)} onSpeed={setSpeed} />
+          )}
           {busy ? (
             <>
               {input.trim() && (

@@ -24,7 +24,9 @@ import {
   foldGutter,
   foldKeymap,
   foldService,
+  StreamLanguage,
   syntaxTree,
+  type StringStream,
 } from '@codemirror/language'
 import { tags as t } from '@lezer/highlight'
 import { markdown } from '@codemirror/lang-markdown'
@@ -34,6 +36,12 @@ import { css as cssLang } from '@codemirror/lang-css'
 import { html } from '@codemirror/lang-html'
 import { python } from '@codemirror/lang-python'
 import { yaml } from '@codemirror/lang-yaml'
+import {
+  isExtensionInstalled,
+  languageContributionFor,
+  useExtensionRevision,
+  type LanguageContribution,
+} from '../lib/extensions'
 
 /**
  * A small, elegant CodeMirror 6 editor themed entirely through Kaisola's CSS
@@ -41,22 +49,87 @@ import { yaml } from '@codemirror/lang-yaml'
  * palette lives in tokens.css as `--cm-*` vars). No external editor theme dep.
  */
 
+interface SimpleLanguageState { blockEnd: string | null }
+const contributedLanguages = new WeakMap<LanguageContribution, ReturnType<typeof StreamLanguage.define<SimpleLanguageState>>>()
+
+/** A safe declarative grammar: comments, strings, numbers, keywords, atoms. */
+function simpleLanguage(contribution: LanguageContribution) {
+  const cached = contributedLanguages.get(contribution)
+  if (cached) return cached
+  const grammar = contribution.grammar
+  const keywords = new Set(grammar.keywords ?? [])
+  const atoms = new Set(grammar.atoms ?? [])
+  const lineComments = [...(grammar.lineComments ?? [])].sort((a, b) => b.length - a.length)
+  const blockComments = [...(grammar.blockComments ?? [])].sort((a, b) => b[0].length - a[0].length)
+  const language = StreamLanguage.define<SimpleLanguageState>({
+    name: contribution.id,
+    startState: () => ({ blockEnd: null }),
+    token(stream: StringStream, state: SimpleLanguageState) {
+      if (state.blockEnd) {
+        if (stream.skipTo(state.blockEnd)) {
+          stream.match(state.blockEnd)
+          state.blockEnd = null
+        } else stream.skipToEnd()
+        return 'comment'
+      }
+      if (stream.eatSpace()) return null
+      for (const [start, end] of blockComments) {
+        if (!stream.match(start, false)) continue
+        stream.match(start)
+        if (stream.skipTo(end)) stream.match(end)
+        else { stream.skipToEnd(); state.blockEnd = end }
+        return 'comment'
+      }
+      for (const marker of lineComments) {
+        if (!stream.match(marker, false)) continue
+        stream.skipToEnd()
+        return 'comment'
+      }
+      if (stream.match(/^(?:r#*)?"(?:\\.|[^"\\])*"?/)) return 'string'
+      if (stream.match(/^'(?:\\.|[^'\\])*'?/)) return 'string'
+      if (stream.match(/^(?:0x[\da-f]+|0b[01]+|\d+(?:\.\d+)?(?:e[+-]?\d+)?)(?:_[\da-f]+)*/i)) return 'number'
+      const matchedWord = stream.match(/^[A-Za-z_$][\w$-]*/)
+      const word = Array.isArray(matchedWord) ? matchedWord[0] : undefined
+      if (word) {
+        if (keywords.has(word)) return 'keyword'
+        if (atoms.has(word)) return 'bool'
+        if (/^[A-Z]/.test(word)) return 'typeName'
+        return 'variableName'
+      }
+      if (stream.match(/^(?:=>|->|::|==|!=|<=|>=|&&|\|\||[+*/%=<>!&|^-]+)/)) return 'operator'
+      stream.next()
+      return null
+    },
+    languageData: {
+      commentTokens: {
+        line: lineComments[0],
+        block: blockComments[0] ? { open: blockComments[0][0], close: blockComments[0][1] } : undefined,
+      },
+    },
+  })
+  contributedLanguages.set(contribution, language)
+  return language
+}
+
 export function languageFor(ext?: string) {
+  const contributed = languageContributionFor(ext)
+  if (contributed) return simpleLanguage(contributed)
   switch ((ext ?? '').toLowerCase()) {
     case 'md':
     case 'markdown':
     case 'mdx':
-      return markdown()
+      return isExtensionInstalled('kaisola.markdown') ? markdown() : []
     case 'ts':
     case 'tsx':
-      return javascript({ typescript: true, jsx: true })
+      return isExtensionInstalled('kaisola.javascript-typescript') ? javascript({ typescript: true, jsx: true }) : []
     case 'js':
     case 'jsx':
     case 'mjs':
     case 'cjs':
-      return javascript({ jsx: true })
+      return isExtensionInstalled('kaisola.javascript-typescript') ? javascript({ jsx: true }) : []
     case 'json':
-      return json()
+    case 'jsonl':
+      return isExtensionInstalled('kaisola.json-yaml') ? json() : []
     case 'css':
     case 'scss':
     case 'less':
@@ -65,12 +138,12 @@ export function languageFor(ext?: string) {
     case 'htm':
     case 'xml':
     case 'svg':
-      return html()
+      return isExtensionInstalled('kaisola.html') ? html() : []
     case 'py':
-      return python()
+      return isExtensionInstalled('kaisola.python') ? python() : []
     case 'yml':
     case 'yaml':
-      return yaml()
+      return isExtensionInstalled('kaisola.json-yaml') ? yaml() : []
     default:
       return []
   }
@@ -482,6 +555,7 @@ export function CodeEditor({
   /** Selection-first quote popup action. */
   onQuote?: (action: QuoteAction, sel: { from: number; to: number; text: string }) => void
 }) {
+  const extensionRevision = useExtensionRevision()
   const host = useRef<HTMLDivElement>(null)
   const view = useRef<EditorView | null>(null)
   const langC = useRef(new Compartment())
@@ -592,7 +666,7 @@ export function CodeEditor({
         foldC.current.reconfigure(sectionFoldFor(ext)),
       ],
     })
-  }, [ext])
+  }, [ext, extensionRevision])
 
   // Live layers: scrollbar marks, the blame note, annotation highlights.
   useEffect(() => {

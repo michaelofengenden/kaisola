@@ -110,6 +110,7 @@ export interface ProvenanceTarget {
  * An assistant chat thread. The session metadata lives here (so the sidebar can
  * list it next to the terminals); the turn runtime is stored separately by id.
  */
+export type ClaudeEffort = 'low' | 'medium' | 'high' | 'xhigh' | 'max'
 export interface AssistantThread {
   id: string
   agentKey: string
@@ -123,6 +124,9 @@ export interface AssistantThread {
   /** The agent-side ACP session id — reconnects after a restart try
    * session/load with it so the agent resumes where the transcript left off. */
   acpSessionId?: string
+  /** Claude SDK effort is a session-creation option. Changing it reconnects
+   * this resumable ACP session with the new value. */
+  claudeEffort?: ClaudeEffort
 }
 
 /** Diff/terminal artifacts a tool-call frame carries (ACP ToolCallContent). */
@@ -911,6 +915,7 @@ interface KaisolaState {
   autoNameThread: (id: string, text: string) => void
   setAssistantThreadAgent: (id: string, agentKey: string) => void
   setThreadAcpSession: (id: string, sessionId: string | undefined) => void
+  setThreadClaudeEffort: (id: string, effort: ClaudeEffort) => void
   updateAssistantRuntime: (id: string, fn: (runtime: AssistantRuntime) => AssistantRuntime) => void
   resetAssistantRuntime: (id: string) => void
   setAssistantDraft: (id: string, patch: Partial<AssistantDraft>) => void
@@ -2722,6 +2727,8 @@ export const useKaisola = create<KaisolaState>()(
     set((s) => ({ assistantThreads: s.assistantThreads.map((t) => (t.id === id ? { ...t, agentKey } : t)) })),
   setThreadAcpSession: (id, sessionId) =>
     set((s) => ({ assistantThreads: s.assistantThreads.map((t) => (t.id === id ? { ...t, acpSessionId: sessionId } : t)) })),
+  setThreadClaudeEffort: (id, claudeEffort) =>
+    set((s) => ({ assistantThreads: s.assistantThreads.map((t) => (t.id === id ? { ...t, claudeEffort } : t)) })),
   updateAssistantRuntime: (id, fn) =>
     set((s) => {
       const current = s.assistantRuntimes[id] ?? { turns: [], first: true }

@@ -1,4 +1,4 @@
-import { useRef, useState, type CSSProperties, type DragEvent, type ReactNode } from 'react'
+import { Suspense, lazy, useRef, useState, type CSSProperties, type DragEvent, type ReactNode } from 'react'
 import { useShallow } from 'zustand/react/shallow'
 import { useKaisola, type TerminalMeta } from '../../store/store'
 import { sessionHue, terminalAgentKey } from '../../lib/sessionHue'
@@ -7,11 +7,14 @@ import { urlHost, terminalLabel, threadLabel } from '@/lib/sessionLabel'
 import { CostChip } from './CostChip'
 import { Terminal, everMountedTerminals } from '../Terminal'
 import { Assistant } from '../Assistant'
-import { GitPanel } from './GitPanel'
 import { BrowserCard } from './BrowserCard'
 import { LedgerCard } from './LedgerCard'
 import { SessionTabs } from './SessionTabs'
 import { Icon } from '../Icon'
+
+// Git diff rendering pulls in CodeMirror. Keep it out of the initial shell
+// bundle; Files and Commit share the same lazy editor chunk on first use.
+const GitPanel = lazy(() => import('./GitPanel').then((module) => ({ default: module.GitPanel })))
 
 /**
  * While ANY shell drag runs (card heads, column grips, the canvas edge),
@@ -355,7 +358,7 @@ export function SessionCards() {
         // change, and a hidden webview holds a live page nobody can see
         const placed = pos.has(p.id)
         return p.kind === 'git'
-          ? card(p.id, 'GitCommitHorizontal', 'Commit', placed ? <GitPanel /> : null, {
+          ? card(p.id, 'GitCommitHorizontal', 'Commit', placed ? <Suspense fallback={<div className="fx-loading aurora"><span className="shimmer-text">Loading diff…</span></div>}><GitPanel /></Suspense> : null, {
               hue: sessionHue({ agentKey: 'git', folder: workspacePath }),
             })
           : p.kind === 'ledger'

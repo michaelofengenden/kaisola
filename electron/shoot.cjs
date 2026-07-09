@@ -24,6 +24,8 @@ const { registerCodexHandlers } = require('./ipc/codexHandler.cjs')
 const { registerGitHandlers } = require('./ipc/gitHandler.cjs')
 const { registerClaudeHooksHandlers } = require('./ipc/claudeHooksHandler.cjs')
 const { registerUpdateHandlers } = require('./ipc/updateHandler.cjs')
+const { registerMcpHandlers } = require('./ipc/mcpServer.cjs')
+const { registerExtensionHandlers } = require('./ipc/extensionHandler.cjs')
 const worktree = require('./ipc/worktreeHandler.cjs')
 
 process.env.KAISOLA_SMOKE = '1'
@@ -42,6 +44,7 @@ app.whenReady().then(async () => {
   registerFsHandlers(ipcMain); registerGrobidHandlers(ipcMain); registerSandboxHandlers(ipcMain)
   registerDbHandlers(ipcMain); registerCodexHandlers(ipcMain); worktree.registerWorktreeHandlers(ipcMain)
   registerGitHandlers(ipcMain); registerClaudeHooksHandlers(ipcMain); registerUpdateHandlers(ipcMain)
+  registerMcpHandlers(ipcMain); registerExtensionHandlers(ipcMain)
   ipcMain.handle('shell:glass', () => ({ supported: false, active: false, enabled: false }))
 
   const win = new BrowserWindow({
@@ -110,6 +113,16 @@ app.whenReady().then(async () => {
       await openSettings(tab); await shot(`settings-${tab}-dark`)
     }
     await closeSettings()
+
+    // Extensions — the Zed-shaped full-screen catalog, both themes.
+    await setTheme('light')
+    await js(`window.dispatchEvent(new CustomEvent('kaisola:extensions-open'))`)
+    await shot('extensions-light')
+    await js(`window.dispatchEvent(new CustomEvent('kaisola:extensions-open:close'))`)
+    await setTheme('dark')
+    await js(`window.dispatchEvent(new CustomEvent('kaisola:extensions-open'))`)
+    await shot('extensions-dark')
+    await js(`window.dispatchEvent(new CustomEvent('kaisola:extensions-open:close'))`)
 
     // Files editor — set a real workspace, open a code file, switch to Edit
     await setTheme('light'); await setStage('files')

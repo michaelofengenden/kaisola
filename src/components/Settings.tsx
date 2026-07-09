@@ -855,18 +855,23 @@ export function Settings() {
 
 /**
  * Software updates — the running version, a manual check, and the live status
- * of the background flow (checks on launch + every 4h, downloads silently,
+ * of the background flow (checks on launch + hourly, downloads silently,
  * the tab-strip pill appears when a restart applies it).
  */
 function UpdatesRow() {
   const u = useUpdateState()
+  const checking = u.type === 'checking' || !!u.checkingForLatest
+  const preparing = u.type === 'downloading' && (u.percent ?? 0) >= 100
   const status =
-    u.type === 'checking' ? 'Checking…'
+    u.checkingForLatest ? `Checking for newer than ${u.version ?? 'downloaded update'}…`
+    : u.type === 'checking' ? 'Checking…'
+    : preparing ? `Preparing ${u.version ?? 'update'}…`
     : u.type === 'downloading' ? `Downloading ${u.version ?? 'update'}… ${u.percent ?? 0}%`
     : u.type === 'ready' ? `${u.version} downloaded`
     : u.type === 'installing' ? 'Restarting…'
-    : u.type === 'error' ? 'Could not check for updates'
+    : u.type === 'error' ? 'Update check failed'
     : 'Up to date'
+  const error = u.checkError ?? (u.type === 'error' ? u.message : null)
   return (
     <>
       <div className="settings-row">
@@ -874,22 +879,28 @@ function UpdatesRow() {
           Updates {u.appVersion && <span className="faint" style={{ fontWeight: 400 }}>· v{u.appVersion}</span>}
         </span>
         <div className="settings-row-control">
-          <span className="faint" title={u.type === 'error' ? u.message ?? undefined : undefined}>{status}</span>
-          {u.type === 'ready' || u.type === 'installing' ? (
-            <button className="btn btn-primary btn-sm" disabled={u.type === 'installing'} onClick={() => void bridge.update?.install()}>
+          <span className="faint" title={error ?? undefined}>{status}</span>
+          {(u.type === 'ready' || u.type === 'installing') && (
+            <button
+              className="btn btn-primary btn-sm"
+              disabled={u.type === 'installing' || !!u.checkingForLatest}
+              onClick={() => void bridge.update?.install()}
+              title={u.checkingForLatest ? 'Waiting for the latest-version check to finish' : 'Restart into the fully prepared update'}
+            >
               <Icon name="ArrowDownToLine" size={12} /> Restart to update
             </button>
-          ) : (
-            <button
-              className="btn btn-sm"
-              disabled={u.type === 'checking' || u.type === 'downloading'}
-              onClick={() => void bridge.update?.check()}
-            >
-              <Icon name="RefreshCw" size={12} /> Check for updates
-            </button>
           )}
+          <button
+            className="btn btn-sm"
+            disabled={checking || u.type === 'downloading' || u.type === 'installing'}
+            onClick={() => void bridge.update?.check()}
+            title={u.type === 'ready' ? 'Check whether a newer release has shipped before restarting' : 'Check the release feed now'}
+          >
+            <Icon name="RefreshCw" size={12} /> Check for updates
+          </button>
         </div>
       </div>
+      {error && <p className="settings-note" style={{ color: 'var(--danger)' }}>{error}</p>}
       <p className="settings-note">New releases download themselves — Kaisola checks at launch, when the window regains focus, and hourly. The tab-strip pill restarts into the new build; quitting applies it too.</p>
     </>
   )

@@ -11,8 +11,17 @@ export function useUpdateState(): UpdateState {
   useEffect(() => {
     if (!bridge.update) return
     let live = true
-    bridge.update.state().then((s) => { if (live) setState(s) }).catch(() => {})
-    const off = bridge.update.onEvent((s) => { if (live) setState(s) })
+    const apply = (next: UpdateState) => {
+      if (!live) return
+      setState((current) => {
+        // Subscribe before pulling the snapshot below. If an event and the
+        // snapshot cross in flight, only the newest main-process revision wins.
+        if (next.revision != null && current.revision != null && next.revision < current.revision) return current
+        return next
+      })
+    }
+    const off = bridge.update.onEvent(apply)
+    bridge.update.state().then(apply).catch(() => {})
     return () => { live = false; off() }
   }, [])
   return state

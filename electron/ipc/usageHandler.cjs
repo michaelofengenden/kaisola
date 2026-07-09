@@ -1,178 +1,280 @@
 // Subscription limits at a click. Two very different sources, one IPC surface:
 //
 // • Codex — the CLI ships an app-server (JSON-RPC over stdio) whose
-//   account/rateLimits/read returns the REAL rate-limit state: primary = the
-//   rolling 5h window, secondary = the weekly window, usedPercent + resetsAt.
-//   We spawn it read-only/untrusted, ask, and kill it (CodexBar's approach).
+//   account/rateLimits/read returns the real rolling rate-limit state.
 //
-// • Claude — there is NO sanctioned non-interactive `/usage`. The honest local
-//   proxy is the transcripts: every assistant message in
-//   <configDir>/projects/*/*.jsonl carries token usage. We sum the last 5h and
-//   7d (ccusage's approach) and label it an estimate. Works per account
-//   (CLAUDE_CONFIG_DIR) with zero auth.
+// • Claude — Claude Code does not expose its subscription percentage through a
+//   supported non-interactive command. The honest local proxy is its JSONL
+//   transcripts. We sum the last 5h / 7d and label the result as local activity.
+//
+// Keep both paths non-blocking. In particular, transcript trees can be large;
+// synchronous reads here freeze Electron's main process and make every window
+// look hung while the Limits panel is open.
 const { spawn } = require('node:child_process')
 const fs = require('node:fs')
+const fsp = require('node:fs/promises')
 const os = require('node:os')
 const path = require('node:path')
 const readline = require('node:readline')
+const { agentEnv } = require('./shellEnv.cjs')
 
 const CODEX_TIMEOUT_MS = 15_000
-const CLAUDE_FILE_CAP = 400 // most-recent transcript files scanned per account
-const CLAUDE_FILE_MAX_BYTES = 30 * 1024 * 1024
+const CODEX_ERROR_TAIL = 1_200
+const CLAUDE_FILE_CAP = 600 // most-recent transcript files scanned per account
+const CLAUDE_TOTAL_BYTE_CAP = 512 * 1024 * 1024
+const CLAUDE_TREE_ENTRY_CAP = 20_000
 
 const expandHome = (p) => (typeof p === 'string' ? p.replace(/^~(?=\/|$)/, os.homedir()) : p)
+const messageOf = (err) => String((err && err.message) || err || 'Unknown error')
+const tail = (text, cap = CODEX_ERROR_TAIL) => text.slice(-cap).trim()
 
-/** codex app-server: initialize → account/read → account/rateLimits/read. */
-function codexUsage(codexHome) {
+/** Pick the backwards-compatible Codex bucket, with support for the newer
+ * multi-bucket response. The latter matters for accounts with several metered
+ * products: the first object key is not guaranteed to be Codex. */
+function codexRateLimitSnapshot(result) {
+  const legacy = result && result.rateLimits
+  const byId = result && result.rateLimitsByLimitId
+  if (!byId || typeof byId !== 'object') return legacy || null
+  return byId.codex || Object.values(byId).find((x) => x && (x.limitId === 'codex' || x.primary || x.secondary)) || legacy || null
+}
+
+/** codex app-server: initialize -> account/read -> account/rateLimits/read. */
+function codexUsage(codexHome, options = {}) {
+  if (!options.spawnImpl && (process.env.KAISOLA_SMOKE || process.env.PASOLA_SMOKE)) {
+    return Promise.resolve({ ok: false, message: 'Codex usage disabled during smoke tests.' })
+  }
   return new Promise((resolve) => {
-    let settled = false
-    const done = (v) => { if (!settled) { settled = true; try { proc.kill() } catch { /* gone */ } resolve(v) } }
-    const env = { ...process.env }
-    if (codexHome) env.CODEX_HOME = expandHome(codexHome)
+    const spawnImpl = options.spawnImpl || spawn
+    const timeoutMs = options.timeoutMs || CODEX_TIMEOUT_MS
+    const extraEnv = codexHome ? { CODEX_HOME: expandHome(codexHome) } : undefined
+    // GUI-launched macOS apps inherit /usr/bin:/bin, not the user's shell PATH.
+    // Every other agent process already uses agentEnv(); usage must do the same.
+    const env = options.env || agentEnv(extraEnv)
     let proc
-    try {
-      proc = spawn('codex', ['-s', 'read-only', '-a', 'untrusted', 'app-server'], { env, stdio: ['pipe', 'pipe', 'ignore'] })
-    } catch (err) {
-      return resolve({ ok: false, message: String((err && err.message) || err) })
+    let timer
+    let lines
+    let settled = false
+    let stderr = ''
+
+    const cleanup = () => {
+      if (timer) clearTimeout(timer)
+      try { lines && lines.close() } catch { /* already closed */ }
+      try { proc && proc.kill() } catch { /* already gone */ }
     }
-    proc.on('error', (err) => done({ ok: false, message: /ENOENT/.test(String(err)) ? 'Codex CLI not found on PATH.' : String(err.message || err) }))
-    const timer = setTimeout(() => done({ ok: false, message: 'Codex app-server timed out.' }), CODEX_TIMEOUT_MS)
+    const done = (value) => {
+      if (settled) return
+      settled = true
+      cleanup()
+      resolve(value)
+    }
+    const fail = (fallback) => {
+      const detail = tail(stderr)
+      done({ ok: false, message: detail || fallback })
+    }
+
+    try {
+      proc = spawnImpl('codex', ['-s', 'read-only', '-a', 'untrusted', 'app-server'], {
+        env,
+        stdio: ['pipe', 'pipe', 'pipe'],
+      })
+    } catch (err) {
+      done({ ok: false, message: /ENOENT/.test(messageOf(err)) ? 'Codex CLI not found on PATH.' : messageOf(err) })
+      return
+    }
+
+    proc.on('error', (err) => {
+      const msg = /ENOENT/.test(messageOf(err)) ? 'Codex CLI not found on PATH.' : messageOf(err)
+      fail(msg)
+    })
+    proc.on('exit', (code, signal) => {
+      if (settled) return
+      fail(`Codex app-server exited before returning limits (${signal || `code ${code}`}).`)
+    })
+    proc.stderr.on('data', (chunk) => { stderr = (stderr + chunk.toString()).slice(-CODEX_ERROR_TAIL) })
+    // Killing after a completed response can race a final stdin write.
+    proc.stdin.on('error', () => {})
+    timer = setTimeout(() => fail('Codex app-server timed out.'), timeoutMs)
     timer.unref?.()
 
-    const out = { account: null, rateLimits: null }
+    const account = { value: null }
     const send = (id, method, params) => {
-      try { proc.stdin.write(JSON.stringify({ jsonrpc: '2.0', id, method, params }) + '\n') } catch { /* dying */ }
+      if (settled || !proc.stdin.writable) return
+      try { proc.stdin.write(JSON.stringify({ jsonrpc: '2.0', id, method, params }) + '\n') } catch { /* exit/error reports the cause */ }
     }
-    const rl = readline.createInterface({ input: proc.stdout })
-    rl.on('line', (line) => {
+    const notify = (method, params = {}) => {
+      if (settled || !proc.stdin.writable) return
+      try { proc.stdin.write(JSON.stringify({ jsonrpc: '2.0', method, params }) + '\n') } catch { /* exit/error reports the cause */ }
+    }
+
+    lines = readline.createInterface({ input: proc.stdout })
+    lines.on('line', (line) => {
       let msg
       try { msg = JSON.parse(line) } catch { return }
-      if (msg.id === 1) send(2, 'account/read', { refreshToken: false })
-      else if (msg.id === 2) {
-        out.account = (msg.result && msg.result.account) || null
+      if (msg.id === 1) {
+        if (msg.error) { fail(msg.error.message || 'Codex app-server initialization failed.'); return }
+        notify('initialized')
+        send(2, 'account/read', { refreshToken: false })
+      } else if (msg.id === 2) {
+        if (msg.error) { fail(msg.error.message || 'Codex account read failed.'); return }
+        account.value = (msg.result && msg.result.account) || null
+        if (!account.value) {
+          done({ ok: false, message: 'Codex is not signed in. Run `codex login`.' })
+          return
+        }
         send(3, 'account/rateLimits/read', {})
       } else if (msg.id === 3) {
-        if (msg.error) return done({ ok: false, message: msg.error.message || 'rateLimits read failed' })
-        out.rateLimits = (msg.result && msg.result.rateLimits) || null
-        const rl2 = out.rateLimits || {}
+        if (msg.error) { fail(msg.error.message || 'Codex rate-limit read failed.'); return }
+        const snapshot = codexRateLimitSnapshot(msg.result)
+        if (!snapshot) {
+          done({ ok: false, message: 'Codex returned no rate-limit windows for this account.' })
+          return
+        }
         done({
           ok: true,
-          email: out.account && out.account.email,
-          plan: (out.account && out.account.planType) || rl2.planType,
-          primary: rl2.primary || null, //   { usedPercent, windowDurationMins, resetsAt }
-          secondary: rl2.secondary || null, // weekly window, same shape
+          email: account.value && account.value.email,
+          plan: (account.value && account.value.planType) || snapshot.planType,
+          primary: snapshot.primary || null,
+          secondary: snapshot.secondary || null,
+          updatedAt: Date.now(),
         })
       }
     })
+
     send(1, 'initialize', { clientInfo: { name: 'kaisola', title: 'Kaisola', version: '0' } })
   })
 }
 
-/** Sum assistant-message token usage in <configDir>/projects over 5h/7d. */
-function claudeUsage(configDir) {
-  const base = configDir ? expandHome(configDir) : path.join(os.homedir(), '.claude')
-  const projectsDir = path.join(base, 'projects')
-  const now = Date.now()
-  const H5 = now - 5 * 3600_000
-  const D7 = now - 7 * 24 * 3600_000
-  const zero = () => ({ input: 0, output: 0, cacheRead: 0, cacheWrite: 0 })
-  const fiveHour = zero()
-  const week = zero()
-  let lastActivity = 0
-  const seen = new Set()
+const zeroTokens = () => ({ input: 0, output: 0, cacheRead: 0, cacheWrite: 0 })
 
-  let files = []
-  try {
-    for (const proj of fs.readdirSync(projectsDir)) {
-      const dir = path.join(projectsDir, proj)
-      let names
-      try { names = fs.readdirSync(dir) } catch { continue }
-      for (const f of names) {
-        if (!f.endsWith('.jsonl')) continue
-        const full = path.join(dir, f)
-        try {
-          const st = fs.statSync(full)
-          if (st.mtimeMs >= D7 && st.size <= CLAUDE_FILE_MAX_BYTES) files.push({ full, mtime: st.mtimeMs })
-        } catch { /* raced */ }
-      }
+/** Recursively collect Claude's main + subagent JSONL transcripts. Newer
+ * Claude versions put subagent logs below a session directory; a one-level
+ * scan silently under-counts them. */
+async function claudeTranscriptFiles(projectsDir, since) {
+  const stack = [projectsDir]
+  const files = []
+  let entries = 0
+  let treeCapped = false
+  while (stack.length && entries < CLAUDE_TREE_ENTRY_CAP) {
+    const dir = stack.pop()
+    let children
+    try { children = await fsp.readdir(dir, { withFileTypes: true }) } catch { continue }
+    for (const child of children) {
+      entries += 1
+      if (entries >= CLAUDE_TREE_ENTRY_CAP) { treeCapped = true; break }
+      const full = path.join(dir, child.name)
+      if (child.isDirectory()) { stack.push(full); continue }
+      if (!child.isFile() || !child.name.endsWith('.jsonl')) continue
+      try {
+        const st = await fsp.stat(full)
+        if (st.mtimeMs >= since) files.push({ full, mtime: st.mtimeMs, size: st.size })
+      } catch { /* raced with cleanup */ }
     }
-  } catch {
-    return { ok: true, exists: false, fiveHour, week, lastActivity: 0 }
   }
-  files = files.sort((a, b) => b.mtime - a.mtime).slice(0, CLAUDE_FILE_CAP)
+  return { files, treeCapped }
+}
 
-  for (const { full } of files) {
-    let text
-    try { text = fs.readFileSync(full, 'utf8') } catch { continue }
-    for (let s = 0; s < text.length;) {
-      const e = text.indexOf('\n', s)
-      const line = text.slice(s, e < 0 ? text.length : e)
-      s = e < 0 ? text.length : e + 1
+function addClaudeUsage(acc, usage) {
+  acc.input += Number(usage.input_tokens) || 0
+  acc.output += Number(usage.output_tokens) || 0
+  acc.cacheRead += Number(usage.cache_read_input_tokens) || 0
+  acc.cacheWrite += Number(usage.cache_creation_input_tokens) || 0
+}
+
+/** Stream one transcript instead of readFileSync(JSONL). This bounds memory and
+ * yields to Electron between filesystem reads. */
+async function scanClaudeTranscript(full, onUsage) {
+  const input = fs.createReadStream(full, { encoding: 'utf8' })
+  const lines = readline.createInterface({ input, crlfDelay: Infinity })
+  try {
+    for await (const line of lines) {
       if (!line.includes('"usage"')) continue
       let ev
       try { ev = JSON.parse(line) } catch { continue }
       const usage = ev && ev.message && ev.message.usage
-      if (!usage) continue
-      const ts = Date.parse(ev.timestamp || '') || 0
-      if (!ts || ts < D7) continue
-      // retries re-log the same request — count each message once (ccusage's dedupe)
-      const id = `${(ev.message && ev.message.id) || ''}:${ev.requestId || ''}`
-      if (id !== ':' && seen.has(id)) continue
-      if (id !== ':') seen.add(id)
-      if (ts > lastActivity) lastActivity = ts
-      const add = (acc) => {
-        acc.input += usage.input_tokens || 0
-        acc.output += usage.output_tokens || 0
-        acc.cacheRead += usage.cache_read_input_tokens || 0
-        acc.cacheWrite += usage.cache_creation_input_tokens || 0
-      }
-      add(week)
-      if (ts >= H5) add(fiveHour)
+      if (usage) onUsage(ev, usage)
     }
+  } finally {
+    lines.close()
+    input.destroy()
   }
-  return { ok: true, exists: true, fiveHour, week, lastActivity }
 }
 
-// Per-SESSION token sums, grouped by model (the $ chip on session cards).
-// A Claude session's transcript is projects/<slug>/<sessionId>.jsonl — the
-// session id names the file, so this reads exactly one file per project dir.
-function claudeSessionUsage(configDir, sessionId) {
+/** Sum assistant-message token usage in <configDir>/projects over 5h / 7d. */
+async function claudeUsage(configDir, now = Date.now()) {
+  const base = configDir ? expandHome(configDir) : path.join(os.homedir(), '.claude')
+  const projectsDir = path.join(base, 'projects')
+  const H5 = now - 5 * 3600_000
+  const D7 = now - 7 * 24 * 3600_000
+  const fiveHour = zeroTokens()
+  const week = zeroTokens()
+  const seen = new Set()
+  let lastActivity = 0
+
+  const collected = await claudeTranscriptFiles(projectsDir, D7)
+  if (!collected.files.length) {
+    let exists = false
+    try { exists = (await fsp.stat(projectsDir)).isDirectory() } catch { /* absent */ }
+    return { ok: true, exists, fiveHour, week, lastActivity: 0, scannedFiles: 0, partial: collected.treeCapped }
+  }
+
+  const candidates = collected.files.sort((a, b) => b.mtime - a.mtime).slice(0, CLAUDE_FILE_CAP)
+  const selected = []
+  let bytes = 0
+  for (const file of candidates) {
+    // Always include the newest file, even if one exceptionally large active
+    // transcript exceeds the aggregate cap by itself.
+    if (selected.length && bytes + file.size > CLAUDE_TOTAL_BYTE_CAP) break
+    selected.push(file)
+    bytes += file.size
+  }
+  const partial = collected.treeCapped || collected.files.length > candidates.length || selected.length < candidates.length
+
+  // Sequential streaming gives deterministic cross-file dedupe and avoids
+  // opening hundreds of descriptors at once.
+  for (const { full } of selected) {
+    try {
+      await scanClaudeTranscript(full, (ev, usage) => {
+        const ts = Date.parse(ev.timestamp || '') || 0
+        if (!ts || ts < D7) return
+        // Retries and subagent mirrors can log the same request more than once.
+        const id = `${(ev.message && ev.message.id) || ''}:${ev.requestId || ''}`
+        if (id !== ':' && seen.has(id)) return
+        if (id !== ':') seen.add(id)
+        if (ts > lastActivity) lastActivity = ts
+        addClaudeUsage(week, usage)
+        if (ts >= H5) addClaudeUsage(fiveHour, usage)
+      })
+    } catch { /* one corrupt/raced transcript must not blank the whole meter */ }
+  }
+  return { ok: true, exists: true, fiveHour, week, lastActivity, scannedFiles: selected.length, partial }
+}
+
+// Per-session token sums, grouped by model (the $ chip on session cards).
+async function claudeSessionUsage(configDir, sessionId) {
   if (!sessionId || /[/\\]/.test(sessionId)) return { ok: false }
   const base = configDir ? expandHome(configDir) : path.join(os.homedir(), '.claude')
   const projectsDir = path.join(base, 'projects')
   const seen = new Set()
-  const models = new Map() // model → sums
+  const models = new Map()
   let found = false
   let dirs = []
-  try { dirs = fs.readdirSync(projectsDir) } catch { return { ok: true, exists: false, models: [] } }
-  for (const proj of dirs) {
-    const full = path.join(projectsDir, proj, `${sessionId}.jsonl`)
-    let text
+  try { dirs = await fsp.readdir(projectsDir, { withFileTypes: true }) } catch { return { ok: true, exists: false, models: [] } }
+  for (const dir of dirs) {
+    if (!dir.isDirectory()) continue
+    const full = path.join(projectsDir, dir.name, `${sessionId}.jsonl`)
     try {
-      if (fs.statSync(full).size > CLAUDE_FILE_MAX_BYTES) continue
-      text = fs.readFileSync(full, 'utf8')
-    } catch { continue }
-    found = true
-    for (let s = 0; s < text.length;) {
-      const e = text.indexOf('\n', s)
-      const line = text.slice(s, e < 0 ? text.length : e)
-      s = e < 0 ? text.length : e + 1
-      if (!line.includes('"usage"')) continue
-      let ev
-      try { ev = JSON.parse(line) } catch { continue }
-      const usage = ev && ev.message && ev.message.usage
-      if (!usage) continue
-      const id = `${(ev.message && ev.message.id) || ''}:${ev.requestId || ''}`
-      if (id !== ':' && seen.has(id)) continue
-      if (id !== ':') seen.add(id)
-      const model = (ev.message && ev.message.model) || 'unknown'
-      const acc = models.get(model) || { model, input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }
-      acc.input += usage.input_tokens || 0
-      acc.output += usage.output_tokens || 0
-      acc.cacheRead += usage.cache_read_input_tokens || 0
-      acc.cacheWrite += usage.cache_creation_input_tokens || 0
-      models.set(model, acc)
-    }
+      await fsp.access(full)
+      found = true
+      await scanClaudeTranscript(full, (ev, usage) => {
+        const id = `${(ev.message && ev.message.id) || ''}:${ev.requestId || ''}`
+        if (id !== ':' && seen.has(id)) return
+        if (id !== ':') seen.add(id)
+        const model = (ev.message && ev.message.model) || 'unknown'
+        const acc = models.get(model) || { model, ...zeroTokens() }
+        addClaudeUsage(acc, usage)
+        models.set(model, acc)
+      })
+    } catch { /* not in this project / raced */ }
   }
   return { ok: true, exists: found, models: [...models.values()] }
 }
@@ -180,19 +282,18 @@ function claudeSessionUsage(configDir, sessionId) {
 function registerUsageHandlers(ipcMain) {
   ipcMain.handle('usage:codex', async (_e, { codexHome } = {}) => codexUsage(codexHome))
   ipcMain.handle('usage:claude', async (_e, { configDir } = {}) => {
-    try {
-      return claudeUsage(configDir)
-    } catch (err) {
-      return { ok: false, message: String((err && err.message) || err) }
-    }
+    try { return await claudeUsage(configDir) } catch (err) { return { ok: false, message: messageOf(err) } }
   })
   ipcMain.handle('usage:claudeSession', async (_e, { configDir, sessionId } = {}) => {
-    try {
-      return claudeSessionUsage(configDir, sessionId)
-    } catch (err) {
-      return { ok: false, message: String((err && err.message) || err) }
-    }
+    try { return await claudeSessionUsage(configDir, sessionId) } catch (err) { return { ok: false, message: messageOf(err) } }
   })
 }
 
-module.exports = { registerUsageHandlers }
+module.exports = {
+  registerUsageHandlers,
+  // Focused probes/tests use the real parsers without booting Electron.
+  codexUsage,
+  codexRateLimitSnapshot,
+  claudeUsage,
+  claudeSessionUsage,
+}

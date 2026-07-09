@@ -9,9 +9,6 @@ const path = require('node:path');
 
 exports.default = async function adhocSign(context) {
   if (context.electronPlatformName !== 'darwin') return;
-  // real Developer ID signing configured → electron-builder signs (and
-  // notarizes) after this hook; don't waste time on an adhoc signature
-  if (process.env.CSC_LINK || process.env.CSC_NAME) return;
   const appPath = path.join(
     context.appOutDir,
     `${context.packager.appInfo.productFilename}.app`
@@ -21,13 +18,24 @@ exports.default = async function adhocSign(context) {
   // Finder information, or similar detritus not allowed"). xattr -cr can't
   // remove the system-stamped com.apple.provenance, so strip by copying with
   // cp -X — and retry, because macOS can re-stamp the fresh copy mid-sign.
-  let lastErr;
-  for (let attempt = 1; attempt <= 3; attempt++) {
+  const cleanBundle = () => {
     sh(`rm -rf "${appPath}.clean"`);
     sh(`cp -RX "${appPath}" "${appPath}.clean"`);
     sh(`rm -rf "${appPath}"`);
     sh(`mv "${appPath}.clean" "${appPath}"`);
     sh(`find "${appPath}" -name .DS_Store -delete`);
+  };
+
+  // Always clean once before electron-builder's real Developer ID signing.
+  // Previously this hook returned before cleaning when CSC_NAME was present,
+  // allowing FinderInfo copied from Electron's downloaded bundle to make the
+  // release fail late in codesign.
+  cleanBundle();
+  if (process.env.CSC_LINK || process.env.CSC_NAME) return;
+
+  let lastErr;
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    if (attempt > 1) cleanBundle();
     try {
       sh(`codesign --force --deep --sign - "${appPath}"`);
       // no --strict: a late provenance re-stamp trips it, harmlessly

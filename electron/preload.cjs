@@ -158,7 +158,8 @@ const bridge = {
     userConfig: () => ipcRenderer.invoke('mcp:user-config'),
     discover: () => ipcRenderer.invoke('mcp:discover'),
     importDiscovered: () => ipcRenderer.invoke('mcp:import-discovered'),
-    serverAdd: (name, config) => ipcRenderer.invoke('mcp:server-add', { name, config }),
+    serverAdd: (name, config, extensionId) => ipcRenderer.invoke('mcp:server-add', { name, config, extensionId }),
+    serverRemove: (name, extensionId) => ipcRenderer.invoke('mcp:server-remove', { name, extensionId }),
     // kaisola://mcp/install deeplinks: the trust modal renders these; main
     // queues links that arrive before the renderer announces readiness
     onInstallRequest: (cb) => {
@@ -172,6 +173,15 @@ const bridge = {
       ipcRenderer.on('mcp:servers-changed', listener)
       return () => ipcRenderer.removeListener('mcp:servers-changed', listener)
     },
+  },
+  // Declarative editor extensions. Main is authoritative for installed/dev
+  // records; the renderer keeps only a fast cache of the same safe metadata.
+  extensions: {
+    state: () => ipcRenderer.invoke('extensions:state'),
+    set: (id, record) => ipcRenderer.invoke('extensions:set', { id, record }),
+    inspectDev: (sourcePath) => ipcRenderer.invoke('extensions:dev-inspect', { sourcePath }),
+    registerDev: (sourcePath) => ipcRenderer.invoke('extensions:dev-register', { sourcePath }),
+    removeDev: (id) => ipcRenderer.invoke('extensions:dev-remove', { id }),
   },
 
   // ── git checkpoints + status (tree tinting, diff review) + commit panel ──

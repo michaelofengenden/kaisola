@@ -7,6 +7,7 @@ const os = require('node:os')
 const fs = require('node:fs')
 const { shell, app } = require('electron')
 const { AcpConnection } = require('./acp.cjs')
+const { agentEnv } = require('./shellEnv.cjs')
 const { mcpHttpEntry } = require('./mcpServer.cjs')
 const { acpEntries } = require('./mcpCatalog.cjs')
 const mgr = require('./terminalManager.cjs')
@@ -136,6 +137,24 @@ function presets() {
 }
 
 const CONNECT_TIMEOUT_MS = 120_000
+const CLAUDE_EFFORTS = new Set(['low', 'medium', 'high', 'xhigh', 'max'])
+
+/** Resolve a CLI on the same recovered login-shell PATH used to spawn agents.
+ * claude-code-acp bundles a lagging Claude binary, but explicitly supports
+ * CLAUDE_CODE_EXECUTABLE. Pointing it at the user's current installation keeps
+ * models and effort levels (including xhigh) in step with their terminal. */
+function agentExecutable(name, extraEnv) {
+  const env = agentEnv(extraEnv)
+  const suffixes = process.platform === 'win32' ? ['', '.exe', '.cmd', '.bat'] : ['']
+  for (const dir of String(env.PATH || '').split(path.delimiter)) {
+    if (!dir) continue
+    for (const suffix of suffixes) {
+      const candidate = path.join(dir, `${name}${suffix}`)
+      try { fs.accessSync(candidate, fs.constants.X_OK); return candidate } catch { /* next */ }
+    }
+  }
+  return null
+}
 
 // ---- keeping the model surface CURRENT (checked 2026-07-09) -----------------
 // The adapters' declared lists trail the release train: claude-code-acp still
@@ -156,6 +175,17 @@ const CURRENT_CODEX_MODELS = [
   { value: 'gpt-5.6-luna', name: 'GPT-5.6 Luna', description: 'Fast tier' },
 ]
 
+// Match Codex's own approval copy instead of surfacing the adapter's internal
+// preset names. Values stay untouched — only the human-facing labels change.
+const CODEX_APPROVAL_LABELS = {
+  'read-only': { name: 'Ask for approval', description: 'Always ask before editing external files or using the internet.' },
+  auto: { name: 'Approve for me', description: 'Only ask for actions detected as potentially unsafe.' },
+  'full-access': { name: 'Full access', description: 'Unrestricted access to the internet and files on this computer.' },
+}
+const labelCodexApproval = (option) => option && CODEX_APPROVAL_LABELS[option.value || option.id]
+  ? { ...option, ...CODEX_APPROVAL_LABELS[option.value || option.id] }
+  : option
+
 /** Merge the current model lineup into an adapter's declared controls. */
 function freshenControls(presetId, controls) {
   try {
@@ -170,13 +200,23 @@ function freshenControls(presetId, controls) {
       return { ...controls, models: { ...controls.models, availableModels: [...head, ...CURRENT_CLAUDE_MODELS, ...tail] } }
     }
     if (presetId === 'codex' && controls && Array.isArray(controls.configOptions)) {
+      const currentIds = new Set(CURRENT_CODEX_MODELS.map((m) => m.value))
       return {
         ...controls,
+        modes: controls.modes && Array.isArray(controls.modes.availableModes)
+          ? { ...controls.modes, availableModes: controls.modes.availableModes.map(labelCodexApproval) }
+          : controls.modes,
         configOptions: controls.configOptions.map((o) => {
+          if ((o.id === 'mode' || o.category === 'mode') && Array.isArray(o.options)) {
+            return { ...o, name: 'Approval', options: o.options.map(labelCodexApproval) }
+          }
           if (!(o.id === 'model' || o.category === 'model') || !Array.isArray(o.options)) return o
-          const have = new Set(o.options.map((x) => x.value))
-          const add = CURRENT_CODEX_MODELS.filter((m) => !have.has(m.value))
-          return add.length ? { ...o, options: [...o.options, ...add] } : o
+          const declared = new Map(o.options.map((x) => [x.value, x]))
+          // Known current rows are replaced, not merely appended: adapters often
+          // report a raw id ("gpt-5.6-sol") before they ship its display metadata.
+          const current = CURRENT_CODEX_MODELS.map((m) => ({ ...(declared.get(m.value) || {}), ...m }))
+          const extras = o.options.filter((x) => !currentIds.has(x.value))
+          return { ...o, options: [...current, ...extras] }
         }),
       }
     }
@@ -320,13 +360,23 @@ function registerAcpHandlers(ipcMain) {
     if (resolved.presetId === 'codex') {
       const shim = codexCompatHome(env && env.CODEX_HOME)
       if (shim) env = { ...(env || {}), CODEX_HOME: shim }
+    } else if (resolved.presetId === 'claude-code' && !(env && env.CLAUDE_CODE_EXECUTABLE)) {
+      const currentClaude = agentExecutable('claude', env)
+      if (currentClaude) env = { ...(env || {}), CLAUDE_CODE_EXECUTABLE: currentClaude }
     }
+    // claude-code-acp intentionally exposes namespaced Claude Agent SDK
+    // options through session/new|load `_meta`. Effort is fixed when that SDK
+    // session is created, so the renderer reconnects the resumable session when
+    // it changes; no global ~/.claude setting is modified.
+    const sessionMeta = resolved.presetId === 'claude-code' && CLAUDE_EFFORTS.has(config.claudeEffort)
+      ? { claudeCode: { options: { effort: config.claudeEffort } } }
+      : null
     const conn = new AcpConnection(
       // every ACP agent gets the shared Kaisola MCP server (project state +
       // agent-task ledger) plus the workspace's armed external servers
       // (.mcp.json approved + user catalog). The connection filters remote
       // entries per the agent's declared mcp capabilities at session time.
-      { command: resolved.command, args: resolved.args, env, cwd: sessionCwd, mcpServers: [mcpHttpEntry(), ...acpEntries(sessionCwd, { http: true, sse: true })].filter(Boolean) },
+      { command: resolved.command, args: resolved.args, env, cwd: sessionCwd, sessionMeta, mcpServers: [mcpHttpEntry(), ...acpEntries(sessionCwd, { http: true, sse: true })].filter(Boolean) },
       {
         onUpdate: (params) => {
           try { const m = JSON.stringify(params).match(URL_RE); if (m) surfaceAuthUrl(entry, resolved.name, key, m[0]) } catch { /* noop */ }

@@ -394,6 +394,7 @@ export interface CodexUsage {
   plan?: string
   primary?: CodexWindow | null
   secondary?: CodexWindow | null
+  updatedAt?: number
 }
 export interface ClaudeTokenSums { input: number; output: number; cacheRead: number; cacheWrite: number }
 export interface ClaudeUsage {
@@ -403,6 +404,9 @@ export interface ClaudeUsage {
   fiveHour?: ClaudeTokenSums
   week?: ClaudeTokenSums
   lastActivity?: number
+  scannedFiles?: number
+  /** True when safety caps excluded older transcript files. */
+  partial?: boolean
 }
 
 export interface AcpConnectConfig {
@@ -421,6 +425,9 @@ export interface AcpConnectConfig {
   /** Resume this session id via session/load when the agent supports it —
    * restart continuity; a stale id silently falls back to a fresh session. */
   resumeSessionId?: string
+  /** Claude Agent SDK session-creation effort. The Claude ACP adapter accepts
+   * this through its namespaced `_meta`; other agents ignore it. */
+  claudeEffort?: 'low' | 'medium' | 'high' | 'xhigh' | 'max'
 }
 
 export interface UpdateState {
@@ -430,8 +437,16 @@ export interface UpdateState {
   version?: string | null
   percent?: number
   message?: string | null
+  /** A failed latest-version check can coexist with a valid downloaded build. */
+  checkError?: string | null
+  /** True while checking whether an already-downloaded build is still latest. */
+  checkingForLatest?: boolean
+  /** Last successful release-feed check (epoch milliseconds). */
+  checkedAt?: number | null
   /** The running build's version. */
   appVersion?: string
+  /** Monotonic main-process state version; prevents stale snapshot races. */
+  revision?: number
 }
 
 export interface KaisolaBridge {
@@ -515,9 +530,20 @@ export interface KaisolaBridge {
     importDiscovered?(): Promise<{ ok: boolean; imported: number; message?: string }>
     onServersChanged?(cb: () => void): () => void
     /** Write one server into the user catalog (trust-modal Install only). */
-    serverAdd?(name: string, config: unknown): Promise<{ ok: boolean; message?: string }>
+    serverAdd?(name: string, config: unknown, extensionId?: string): Promise<{ ok: boolean; created?: boolean; owned?: boolean; existing?: boolean; updated?: boolean; conflict?: boolean; message?: string }>
+    /** Remove a user-scope server. Extension-owned removals preserve collisions
+     * and user-edited records instead of deleting by name. */
+    serverRemove?(name: string, extensionId?: string): Promise<{ ok: boolean; removed?: boolean; missing?: boolean; preserved?: boolean; modified?: boolean; conflict?: boolean; message?: string }>
     /** kaisola://mcp/install deeplinks — validated in main, consented here. */
     onInstallRequest?(cb: (req: { name: string; config: Record<string, unknown> }) => void): () => void
+  }
+  /** Declarative extension registry persisted and validated in main. */
+  extensions?: {
+    state(): Promise<{ ok: boolean; exists?: boolean; installed: Record<string, { version: string; installedAt: number; enabled: boolean; source: 'bundled' | 'development' }>; development: unknown[]; error?: string; message?: string }>
+    set(id: string, record: { version: string; installedAt: number; enabled: boolean; source: 'bundled' | 'development' } | null): Promise<{ ok: boolean; message?: string }>
+    inspectDev(sourcePath: string): Promise<{ ok: boolean; manifest?: unknown; message?: string }>
+    registerDev(sourcePath: string): Promise<{ ok: boolean; manifest?: unknown; message?: string }>
+    removeDev(id: string): Promise<{ ok: boolean; message?: string }>
   }
   git: {
     status(cwd: string): Promise<{ ok: boolean; notRepo?: boolean; root?: string; branch?: string | null; entries?: GitStatusEntry[] }>
@@ -660,7 +686,7 @@ export interface KaisolaBridge {
     state(): Promise<UpdateState>
     check(): Promise<{ ok: boolean; message?: string }>
     /** Quit and relaunch into the downloaded build. */
-    install(): Promise<{ ok: boolean }>
+    install(): Promise<{ ok: boolean; message?: string }>
     onEvent(cb: (s: UpdateState) => void): () => void
   }
   /** Sync the native under-window material to the app theme. */

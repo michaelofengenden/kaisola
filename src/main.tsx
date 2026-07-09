@@ -16,6 +16,7 @@ import './styles/shell.css'
 import './styles/signature.css'
 import './styles/calm.css'
 import './styles/dock.css'
+import './styles/extensions.css'
 import '@xterm/xterm/css/xterm.css'
 
 // apply persisted/initial theme + appearance-energy mode before first paint

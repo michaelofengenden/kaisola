@@ -18,6 +18,7 @@ import { McpInstallModal } from './components/shell/McpInstallModal'
 import { Settings } from './components/Settings'
 import { SignInCard } from './components/SignInCard'
 import { Toaster } from './components/Toaster'
+import { ExtensionsCenter } from './components/ExtensionsCenter'
 
 import { FilesView } from './views/FilesView'
 
@@ -622,6 +623,7 @@ export default function App() {
       <ProvenancePopover />
       <ReviewFocus />
       <McpInstallModal />
+      <ExtensionsCenter />
       <Settings />
       <SignInCard />
       <Toaster />

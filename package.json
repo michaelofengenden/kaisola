@@ -1,7 +1,7 @@
 {
   "name": "kaisola",
   "productName": "Kaisola",
-  "version": "0.1.32",
+  "version": "0.1.33",
   "private": true,
   "description": "Kaisola — a Research IDE. Move research from literature → hypotheses → experiments → results → paper, with a human reviewing every transition.",
   "type": "module",
@@ -46,6 +46,8 @@
     "files": [
       "dist/**",
       "electron/**",
+      "!electron/*probe.*",
+      "!electron/*.test.*",
       "!electron/smoke.cjs",
       "!electron/shoot.cjs",
       "package.json"
@@ -174,17 +176,17 @@
     "zustand": "^4.5.5"
   },
   "devDependencies": {
-    "@electron/rebuild": "^4.0.4",
+    "@electron/rebuild": "^4.2.0",
     "@types/node": "^22.9.0",
     "@types/react": "^18.3.12",
     "@types/react-dom": "^18.3.1",
     "@vitejs/plugin-react": "^4.3.3",
-    "concurrently": "^9.2.1",
+    "concurrently": "^9.2.3",
     "cross-env": "^7.0.3",
-    "electron": "^33.4.11",
+    "electron": "^39.8.5",
     "electron-builder": "^26.15.3",
     "typescript": "^5.6.3",
-    "vite": "^5.4.11",
+    "vite": "^7.3.6",
     "wait-on": "^8.0.5"
   }
 }

@@ -233,10 +233,11 @@ function RailToggle() {
 function UpdatePill() {
   const u = useUpdateState()
   if (u.type === 'downloading') {
+    const preparing = (u.percent ?? 0) >= 100
     return (
-      <span className="update-pill" data-busy title={`Downloading Kaisola ${u.version ?? ''} — restart button appears when it's ready`}>
+      <span className="update-pill" data-busy title={preparing ? `Preparing Kaisola ${u.version ?? ''} for a reliable restart` : `Downloading Kaisola ${u.version ?? ''} — restart button appears when it's ready`}>
         <Icon name="ArrowDownToLine" size={12} />
-        {u.percent ?? 0}%
+        {preparing ? 'Preparing…' : `${u.percent ?? 0}%`}
       </span>
     )
   }
@@ -252,11 +253,14 @@ function UpdatePill() {
   return (
     <button
       className="update-pill"
+      disabled={!!u.checkingForLatest}
       onClick={() => void bridge.update?.install()}
-      title={`Kaisola ${u.version} is downloaded — restart the app to apply`}
+      title={u.checkingForLatest
+        ? `Checking whether Kaisola ${u.version} is still latest`
+        : u.checkError ?? `Kaisola ${u.version} is downloaded — restart the app to apply`}
     >
-      <Icon name="ArrowDownToLine" size={12} />
-      Restart to update
+      <Icon name={u.checkingForLatest ? 'RefreshCw' : 'ArrowDownToLine'} size={12} />
+      {u.checkingForLatest ? 'Checking latest…' : 'Restart to update'}
     </button>
   )
 }

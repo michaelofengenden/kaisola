@@ -25,6 +25,7 @@ const { registerClaudeHooksHandlers, disposeClaudeHooks } = require('./ipc/claud
 const { registerUsageHandlers } = require('./ipc/usageHandler.cjs')
 const { registerLedgerHandlers } = require('./ipc/ledgerHandler.cjs')
 const { registerMcpHandlers, disposeMcp } = require('./ipc/mcpServer.cjs')
+const { registerExtensionHandlers } = require('./ipc/extensionHandler.cjs')
 const { registerUpdateHandlers } = require('./ipc/updateHandler.cjs')
 const { registerGlassHandlers, wireGlassEvents } = require('./ipc/glassHandler.cjs')
 
@@ -642,6 +643,7 @@ app.whenReady().then(() => {
   registerUsageHandlers(ipcMain)
   registerLedgerHandlers(ipcMain)
   registerMcpHandlers(ipcMain)
+  registerExtensionHandlers(ipcMain)
   registerUpdateHandlers(ipcMain)
   registerGlassHandlers(ipcMain)
   createWindow()

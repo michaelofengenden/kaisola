@@ -14,7 +14,7 @@ const PROTOCOL_VERSION = 1
 
 class AcpConnection {
   constructor(config, hooks = {}) {
-    this.config = config // { command, args, env, cwd, mcpServers }
+    this.config = config // { command, args, env, cwd, mcpServers, sessionMeta }
     this.hooks = hooks // { onUpdate, onNotice, onPermission }
     this.mcpServers = Array.isArray(config.mcpServers) ? config.mcpServers : null
     this.proc = null
@@ -266,11 +266,16 @@ class AcpConnection {
    * tool hookup must degrade to a working, tool-less chat, never a dead thread. */
   async _session(method, params) {
     const servers = this.sessionMcpServers()
+    const withClientMeta = (mcpServers) => ({
+      ...params,
+      mcpServers,
+      ...(this.config.sessionMeta ? { _meta: this.config.sessionMeta } : {}),
+    })
     try {
-      return await this.request(method, { ...params, mcpServers: servers })
+      return await this.request(method, withClientMeta(servers))
     } catch (err) {
       if (!servers.length || !/invalid params/i.test(String(err && err.message))) throw err
-      return await this.request(method, { ...params, mcpServers: [] })
+      return await this.request(method, withClientMeta([]))
     }
   }
 

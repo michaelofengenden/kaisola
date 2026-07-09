@@ -14,7 +14,7 @@ import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import { bridge, type FsReadResult } from '../lib/bridge'
 
-export type DocumentPreviewKind = 'markdown' | 'html'
+export type DocumentPreviewKind = 'markdown' | 'html' | 'csv' | 'json'
 
 interface DocumentPreviewProps {
   text: string
@@ -226,6 +226,142 @@ function openPreviewLink(e: React.MouseEvent<HTMLElement>) {
   bridge.openExternal(link.href || href)
 }
 
+interface ParsedTable { rows: string[][]; truncated: boolean; error?: string }
+
+/** RFC-4180-ish parser with strict display caps so a giant dataset stays calm. */
+function parseTable(text: string, delimiter: ',' | '\t'): ParsedTable {
+  const rows: string[][] = []
+  let row: string[] = []
+  let cell = ''
+  let quoted = false
+  let truncated = false
+  const source = text.slice(0, 4_000_000)
+  if (source.length < text.length) truncated = true
+  for (let i = 0; i < source.length; i += 1) {
+    const char = source[i]
+    if (quoted) {
+      if (char === '"' && source[i + 1] === '"') { cell += '"'; i += 1 }
+      else if (char === '"') quoted = false
+      else cell += char
+      continue
+    }
+    if (char === '"' && cell.length === 0) { quoted = true; continue }
+    if (char === delimiter) { row.push(cell); cell = ''; continue }
+    if (char === '\n' || char === '\r') {
+      if (char === '\r' && source[i + 1] === '\n') i += 1
+      row.push(cell); cell = ''
+      rows.push(row.slice(0, 200)); row = []
+      if (rows.length >= 2_000) { truncated = true; break }
+      continue
+    }
+    cell += char
+  }
+  if (quoted) return { rows, truncated, error: 'The file ends inside a quoted cell.' }
+  if (cell || row.length) { row.push(cell); rows.push(row.slice(0, 200)) }
+  return { rows, truncated }
+}
+
+type PreviewJsonNode =
+  | { kind: 'leaf'; value: unknown }
+  | { kind: 'array' | 'object'; total: number; children: Array<{ name: string; node: PreviewJsonNode }>; truncated: boolean }
+
+const JSON_NODE_LIMIT = 5_000
+const JSON_DEPTH_LIMIT = 32
+const JSON_CHILD_LIMIT = 200
+
+/**
+ * Build a bounded, non-recursive projection before React sees the data. This
+ * makes the worst-case DOM finite even when a small JSON file contains a very
+ * broad or deeply nested structure.
+ */
+export function buildPreviewJsonTree(value: unknown): { root: PreviewJsonNode; truncated: boolean; nodes: number } {
+  const makeNode = (item: unknown): PreviewJsonNode => {
+    if (Array.isArray(item)) return { kind: 'array', total: item.length, children: [], truncated: false }
+    if (item !== null && typeof item === 'object') return { kind: 'object', total: Object.keys(item as object).length, children: [], truncated: false }
+    return { kind: 'leaf', value: item }
+  }
+  const root = makeNode(value)
+  const work: Array<{ source: unknown; node: PreviewJsonNode; depth: number }> = [{ source: value, node: root, depth: 0 }]
+  let nodes = 1
+  let truncated = false
+
+  while (work.length) {
+    const current = work.pop()!
+    if (current.node.kind === 'leaf') continue
+    if (current.depth >= JSON_DEPTH_LIMIT) {
+      current.node.truncated = current.node.total > 0
+      truncated ||= current.node.truncated
+      continue
+    }
+    const source = current.source
+    const names = Array.isArray(source)
+      ? Array.from({ length: Math.min(source.length, JSON_CHILD_LIMIT) }, (_, index) => String(index))
+      : Object.keys(source as Record<string, unknown>).slice(0, JSON_CHILD_LIMIT)
+    for (const name of names) {
+      if (nodes >= JSON_NODE_LIMIT) {
+        current.node.truncated = true
+        truncated = true
+        break
+      }
+      const childValue = Array.isArray(source) ? source[Number(name)] : (source as Record<string, unknown>)[name]
+      const child = makeNode(childValue)
+      current.node.children.push({ name, node: child })
+      nodes += 1
+      if (child.kind !== 'leaf') work.push({ source: childValue, node: child, depth: current.depth + 1 })
+    }
+    if (current.node.children.length < current.node.total) {
+      current.node.truncated = true
+      truncated = true
+    }
+  }
+  return { root, truncated, nodes }
+}
+
+function JsonNode({ name, node, depth = 0 }: { name?: string; node: PreviewJsonNode; depth?: number }) {
+  const [expanded, setExpanded] = useState(depth < 2)
+  const prefix = name == null ? null : <span className="fx-json-key">{name}</span>
+  if (node.kind === 'leaf') {
+    const value = node.value
+    if (value === null) return <div className="fx-json-leaf">{prefix}<span className="fx-json-null">null</span></div>
+    if (typeof value === 'string') return <div className="fx-json-leaf">{prefix}<span className="fx-json-string">{JSON.stringify(value)}</span></div>
+    if (typeof value === 'number') return <div className="fx-json-leaf">{prefix}<span className="fx-json-number">{String(value)}</span></div>
+    if (typeof value === 'boolean') return <div className="fx-json-leaf">{prefix}<span className="fx-json-bool">{String(value)}</span></div>
+    return <div className="fx-json-leaf">{prefix}<span>{String(value)}</span></div>
+  }
+  const omitted = node.total - node.children.length
+  return (
+    <details className="fx-json-node" open={expanded} onToggle={(event) => setExpanded(event.currentTarget.open)}>
+      <summary>{prefix}<span className="fx-json-shape">{node.kind === 'array' ? 'Array' : 'Object'}({node.total})</span></summary>
+      {expanded && (
+        <div className="fx-json-children">
+          {node.children.map((child) => <JsonNode key={child.name} name={child.name} node={child.node} depth={depth + 1} />)}
+          {(node.truncated || omitted > 0) && <div className="fx-json-more">… {Math.max(omitted, 0)} more {node.kind === 'array' ? 'items' : 'properties'} (preview limit)</div>}
+        </div>
+      )}
+    </details>
+  )
+}
+
+function parseJsonPreview(text: string, sourcePath?: string): { tree?: PreviewJsonNode; error?: string; truncated?: boolean } {
+  if (text.length > 4_000_000) return { error: 'This JSON file is over the 4 MB preview limit.', truncated: true }
+  try {
+    let value: unknown
+    let sourceTruncated = false
+    if (sourcePath?.toLowerCase().endsWith('.jsonl')) {
+      const lines = text.split(/\r?\n/).filter((line) => line.trim())
+      const visible = lines.slice(0, 2_000).map((line) => JSON.parse(line))
+      value = visible
+      sourceTruncated = visible.length < lines.length
+    } else {
+      value = JSON.parse(text)
+    }
+    const projected = buildPreviewJsonTree(value)
+    return { tree: projected.root, truncated: sourceTruncated || projected.truncated }
+  } catch (error) {
+    return { error: String((error as Error)?.message ?? error) }
+  }
+}
+
 /** The image payload of a read, if it has one (svg arrives as editable text). */
 function imageUrlFrom(r: FsReadResult): string | null {
   if (!r.ok) return null
@@ -279,6 +415,8 @@ function MarkdownImage({ src, alt, title, sourcePath }: { src?: string; alt?: st
 
 export const DocumentPreview = memo(function DocumentPreview({ text, kind, sourcePath, highlight = '', onEdit, scrollHeading }: DocumentPreviewProps) {
   const html = useMemo(() => (kind === 'html' ? sanitizeHtml(text, highlight) : ''), [kind, text, highlight])
+  const table = useMemo(() => kind === 'csv' ? parseTable(text, sourcePath?.toLowerCase().endsWith('.tsv') ? '\t' : ',') : null, [kind, text, sourcePath])
+  const jsonTree = useMemo(() => kind === 'json' ? parseJsonPreview(text, sourcePath) : null, [kind, text, sourcePath])
   const rootRef = useRef<HTMLDivElement>(null)
 
   // outline click → scroll the RENDERED page to that heading
@@ -293,6 +431,40 @@ export const DocumentPreview = memo(function DocumentPreview({ text, kind, sourc
     return (
       <div ref={rootRef} className="fx-doc fx-doc-html" onClickCapture={openPreviewLink} onDoubleClick={onEdit}>
         <article className="fx-doc-page fx-html-body" dangerouslySetInnerHTML={{ __html: html }} />
+      </div>
+    )
+  }
+
+  if (kind === 'csv' && table) {
+    const [head = [], ...body] = table.rows
+    return (
+      <div ref={rootRef} className="fx-doc fx-doc-table" onDoubleClick={onEdit}>
+        <div className="fx-table-wrap">
+          {table.error && <div className="fx-preview-error">{table.error}</div>}
+          <table>
+            <thead><tr><th className="fx-row-number">#</th>{head.map((cell, index) => <th key={index}>{highlightText(cell || `Column ${index + 1}`, highlight)}</th>)}</tr></thead>
+            <tbody>
+              {body.map((row, rowIndex) => (
+                <tr key={rowIndex}>
+                  <th className="fx-row-number">{rowIndex + 1}</th>
+                  {Array.from({ length: Math.max(head.length, row.length) }, (_, cellIndex) => <td key={cellIndex}>{highlightText(row[cellIndex] ?? '', highlight)}</td>)}
+                </tr>
+              ))}
+            </tbody>
+          </table>
+          {table.truncated && <div className="fx-preview-limit">Preview capped at 2,000 rows, 200 columns, or 4 MB. The source file is unchanged.</div>}
+        </div>
+      </div>
+    )
+  }
+
+  if (kind === 'json' && jsonTree) {
+    return (
+      <div ref={rootRef} className="fx-doc fx-doc-json" onDoubleClick={onEdit}>
+        <article className="fx-doc-page fx-json-tree">
+          {jsonTree.error ? <div className="fx-preview-error"><strong>JSON preview unavailable</strong><span>{jsonTree.error}</span></div> : jsonTree.tree ? <JsonNode node={jsonTree.tree} /> : null}
+          {jsonTree.truncated && <div className="fx-preview-limit">Preview capped for responsiveness. The source file is unchanged.</div>}
+        </article>
       </div>
     )
   }

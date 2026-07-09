@@ -11,6 +11,7 @@ import { DocumentPreview, countMatches, type DocumentPreviewKind } from '../comp
 import { Icon } from '../components/Icon'
 import { LatexBar } from '../components/shell/LatexBar'
 import { fileIcon } from '../lib/fileIcon'
+import { isExtensionInstalled, previewContributionFor, useExtensionRevision } from '../lib/extensions'
 
 // The editor (CodeMirror) is only pulled in when a file is actually opened —
 // the preview path stays light, and the web build never loads it.
@@ -162,6 +163,7 @@ const tabWithReadResult = (current: FileTab, r: FsReadResult): FileTab => {
  * mode, and content buffer.
  */
 export function FilesView() {
+  const extensionRevision = useExtensionRevision()
   const workspacePath = useKaisola((s) => s.workspacePath)
   const setWorkspace = useKaisola((s) => s.setWorkspace)
   const fileRequest = useKaisola((s) => s.fileRequest)
@@ -233,11 +235,15 @@ export function FilesView() {
   const activeIsLatex = activeIsText && isLatex(active?.path)
   // svg arrives as TEXT (editable source); its preview renders from the buffer
   const activeIsSvg = activeIsText && isSvg(active?.path)
-  const previewKind: DocumentPreviewKind | null = activeIsMd ? 'markdown' : activeIsHtml ? 'html' : null
+  const contributedPreview = previewContributionFor(ext)
+  const previewKind: DocumentPreviewKind | null = contributedPreview?.renderer
+    ?? (activeIsMd && isExtensionInstalled('kaisola.markdown') ? 'markdown'
+      : activeIsHtml && isExtensionInstalled('kaisola.html') ? 'html'
+        : null)
   const canPreview = !!previewKind || activeIsSvg
   const findMatches = useMemo(
     () => (active && previewKind && findText.trim() ? countMatches(active.value, findText) : 0),
-    [active, previewKind, findText],
+    [active, previewKind, findText, extensionRevision],
   )
 
   useEffect(() => { setFileDirty(anyDirty) }, [anyDirty, setFileDirty])

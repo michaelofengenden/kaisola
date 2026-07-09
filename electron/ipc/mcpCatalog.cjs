@@ -42,8 +42,20 @@ function readJson(file) {
   }
 }
 function writeJson(file, data) {
-  fs.mkdirSync(path.dirname(file), { recursive: true })
-  fs.writeFileSync(file, JSON.stringify(data, null, 2))
+  fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 })
+  const json = JSON.stringify(data, null, 2)
+  const temp = `${file}.tmp.${process.pid}.${Date.now()}.${crypto.randomBytes(4).toString('hex')}`
+  try {
+    fs.writeFileSync(temp, json, { mode: 0o600 })
+    // An existing file can have inherited permissive bits; rename preserves the
+    // freshly-created temp file's private mode on POSIX.
+    try { fs.chmodSync(temp, 0o600) } catch { /* Windows / restrictive FS */ }
+    fs.renameSync(temp, file)
+    try { fs.chmodSync(file, 0o600) } catch { /* Windows / restrictive FS */ }
+  } catch (err) {
+    try { fs.unlinkSync(temp) } catch { /* no temp / already renamed */ }
+    throw err
+  }
 }
 
 // ── spec normalization ───────────────────────────────────────────────────────
@@ -60,27 +72,35 @@ function expandEnv(value) {
  */
 function normalizeSpec(raw) {
   if (!raw || typeof raw !== 'object') return null
+  // Manual user/project configs share the same plaintext-secret boundary as
+  // install links. The file is preserved verbatim, but unsafe entries are not
+  // surfaced, armed, or copied into agent sessions. ${NAME} references remain
+  // valid; env/header references expand only in the in-memory representation.
+  if (containsLiteralSecret(raw)) return null
   if (typeof raw.url === 'string' && raw.url) {
+    let parsed
+    try { parsed = new URL(raw.url) } catch { return null }
+    if (parsed.protocol !== 'https:' && parsed.protocol !== 'http:') return null
     const kind = raw.type === 'sse' ? 'sse' : 'http'
     const headers = {}
     if (raw.headers && typeof raw.headers === 'object' && !Array.isArray(raw.headers)) {
-      for (const [k, v] of Object.entries(raw.headers)) {
-        if (typeof v === 'string') headers[k] = expandEnv(v)
+      for (const [k, v] of Object.entries(raw.headers).slice(0, 32)) {
+        if (/^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/.test(k) && typeof v === 'string' && v.length <= 4096) headers[k] = expandEnv(v)
       }
     }
-    return { kind, url: expandEnv(raw.url), headers }
+    return { kind, url: parsed.toString(), headers }
   }
-  if (typeof raw.command === 'string' && raw.command.trim()) {
+  if (typeof raw.command === 'string' && raw.command.trim() && raw.command.length <= 512) {
     const env = {}
     if (raw.env && typeof raw.env === 'object' && !Array.isArray(raw.env)) {
-      for (const [k, v] of Object.entries(raw.env)) {
-        if (typeof v === 'string') env[k] = expandEnv(v)
+      for (const [k, v] of Object.entries(raw.env).slice(0, 32)) {
+        if (/^[A-Z_][A-Z0-9_]{0,127}$/i.test(k) && typeof v === 'string' && v.length <= 4096) env[k] = expandEnv(v)
       }
     }
     return {
       kind: 'stdio',
       command: expandEnv(raw.command.trim()),
-      args: Array.isArray(raw.args) ? raw.args.filter((a) => typeof a === 'string').map(expandEnv) : [],
+      args: Array.isArray(raw.args) ? raw.args.filter((a) => typeof a === 'string' && a.length <= 4096).slice(0, 64).map(expandEnv) : [],
       env,
     }
   }
@@ -90,8 +110,8 @@ function normalizeSpec(raw) {
 /** Stable hash of a spec — the approval key ingredient (edits re-prompt). */
 function specHash(spec) {
   const canon = spec.kind === 'stdio'
-    ? ['stdio', spec.command, ...spec.args, ...Object.entries(spec.env).flat()]
-    : [spec.kind, spec.url, ...Object.entries(spec.headers).flat()]
+    ? ['stdio', spec.command, ...spec.args, ...Object.entries(spec.env).sort(([a], [b]) => a.localeCompare(b)).flat()]
+    : [spec.kind, spec.url, ...Object.entries(spec.headers).sort(([a], [b]) => a.localeCompare(b)).flat()]
   return crypto.createHash('sha256').update(JSON.stringify(canon)).digest('hex').slice(0, 24)
 }
 
@@ -109,7 +129,10 @@ function parseServers(configData) {
 }
 
 // ── approvals (project scope) ────────────────────────────────────────────────
-const approvalKey = (workspace, name) => `${workspace}\u0000${name}`
+const canonicalWorkspace = (workspace) => {
+  try { return fs.realpathSync.native(path.resolve(workspace)) } catch { return path.resolve(workspace) }
+}
+const approvalKey = (workspace, name) => `${canonicalWorkspace(workspace)}\u0000${name}`
 
 function readApprovals() {
   const { data } = readJson(approvalsPath())
@@ -222,20 +245,50 @@ function claudeUserEntries() {
 }
 
 // ── health probe (remote servers only) ───────────────────────────────────────
-function rpcPost(url, headers, payload) {
+function parseRpcBody(body, contentType) {
+  if (!body.trim()) return null
+  if (/text\/event-stream/i.test(contentType || '')) {
+    const messages = body.split(/\r?\n\r?\n/)
+      .flatMap((event) => event.split(/\r?\n/).filter((line) => line.startsWith('data:')).map((line) => line.slice(5).trim()))
+      .filter((line) => line && line !== '[DONE]')
+    if (!messages.length) return null
+    return JSON.parse(messages[messages.length - 1])
+  }
+  return JSON.parse(body)
+}
+
+function rpcPost(url, headers, payload, { sessionId, protocolVersion } = {}) {
   return new Promise((resolve) => {
     let u
     try { u = new URL(url) } catch { return resolve({ ok: false, message: 'invalid url' }) }
     const lib = u.protocol === 'https:' ? https : http
     const req = lib.request(
       u,
-      { method: 'POST', headers: { 'Content-Type': 'application/json', Accept: 'application/json', ...headers } },
+      {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Accept: 'application/json, text/event-stream',
+          ...(sessionId ? { 'Mcp-Session-Id': sessionId } : {}),
+          ...(protocolVersion ? { 'MCP-Protocol-Version': protocolVersion } : {}),
+          ...headers,
+        },
+      },
       (res) => {
         let body = ''
-        res.on('data', (c) => { body += c; if (body.length > 200_000) req.destroy() })
+        res.on('data', (c) => {
+          body += c
+          if (body.length > 200_000) req.destroy(new Error('response too large'))
+        })
         res.on('end', () => {
           if (!res.statusCode || res.statusCode >= 400) return resolve({ ok: false, message: `HTTP ${res.statusCode}` })
-          try { resolve({ ok: true, json: JSON.parse(body) }) } catch { resolve({ ok: false, message: 'non-JSON reply' }) }
+          try {
+            resolve({
+              ok: true,
+              json: parseRpcBody(body, res.headers['content-type']),
+              sessionId: typeof res.headers['mcp-session-id'] === 'string' ? res.headers['mcp-session-id'] : sessionId,
+            })
+          } catch { resolve({ ok: false, message: /text\/event-stream/i.test(res.headers['content-type'] || '') ? 'invalid SSE reply' : 'non-JSON reply' }) }
         })
       },
     )
@@ -249,14 +302,29 @@ function rpcPost(url, headers, payload) {
 async function probeServer(workspace, name) {
   const spec = armedSpecs(workspace).get(name) ?? specByName(workspace, name)
   if (!spec) return { ok: false, message: 'unknown server' }
-  if (spec.kind === 'stdio') return { ok: true, kind: 'stdio', message: 'stdio servers start with the agent session' }
+  if (spec.kind === 'stdio') return { ok: true, kind: 'stdio', message: 'configured — stdio servers start with the agent session' }
+  if (spec.kind === 'sse') return { ok: true, kind: 'sse', message: 'configured — legacy SSE starts with the agent session' }
   const init = await rpcPost(spec.url, spec.headers, {
     jsonrpc: '2.0', id: 1, method: 'initialize',
     params: { protocolVersion: '2025-06-18', capabilities: {}, clientInfo: { name: 'kaisola', version: app.getVersion() } },
   })
   if (!init.ok) return { ok: false, kind: spec.kind, message: init.message }
   const serverInfo = init.json && init.json.result && init.json.result.serverInfo
-  const tools = await rpcPost(spec.url, spec.headers, { jsonrpc: '2.0', id: 2, method: 'tools/list', params: {} })
+  const protocolVersion = init.json && init.json.result && init.json.result.protocolVersion || '2025-06-18'
+  const initialized = await rpcPost(
+    spec.url,
+    spec.headers,
+    { jsonrpc: '2.0', method: 'notifications/initialized', params: {} },
+    { sessionId: init.sessionId, protocolVersion },
+  )
+  if (!initialized.ok) return { ok: false, kind: spec.kind, message: initialized.message }
+  const tools = await rpcPost(
+    spec.url,
+    spec.headers,
+    { jsonrpc: '2.0', id: 2, method: 'tools/list', params: {} },
+    { sessionId: init.sessionId, protocolVersion },
+  )
+  if (!tools.ok) return { ok: false, kind: spec.kind, message: tools.message }
   const toolCount = tools.ok && tools.json && tools.json.result && Array.isArray(tools.json.result.tools)
     ? tools.json.result.tools.length
     : undefined
@@ -289,7 +357,9 @@ function emitChange() {
 /** Enable/disable (user scope) or approve/revoke (project scope) one server. */
 function setServerEnabled(workspace, scope, name, enabled) {
   if (scope === 'user') {
-    const cfg = readJson(userConfigPath()).data ?? {}
+    const loaded = readJson(userConfigPath())
+    if (loaded.error) return { ok: false, message: loaded.error }
+    const cfg = loaded.data ?? {}
     const disabled = new Set(Array.isArray(cfg.disabled) ? cfg.disabled : [])
     if (enabled) disabled.delete(name)
     else disabled.add(name)
@@ -323,20 +393,29 @@ function discoverySources() {
 function sanitizeRaw(raw) {
   if (!raw || typeof raw !== 'object') return null
   if (typeof raw.url === 'string' && raw.url) {
-    const out = { type: raw.type === 'sse' ? 'sse' : 'http', url: raw.url }
+    let parsed
+    try { parsed = new URL(raw.url) } catch { return null }
+    if (parsed.protocol !== 'https:' && parsed.protocol !== 'http:') return null
+    const out = { type: raw.type === 'sse' ? 'sse' : 'http', url: parsed.toString() }
     const headers = raw.headers && typeof raw.headers === 'object' && !Array.isArray(raw.headers)
-      ? Object.fromEntries(Object.entries(raw.headers).filter(([, v]) => typeof v === 'string'))
+      ? Object.fromEntries(Object.entries(raw.headers)
+          .filter(([k, v]) => /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/.test(k) && typeof v === 'string' && v.length <= 4096)
+          .slice(0, 32))
       : {}
     if (Object.keys(headers).length) out.headers = headers
+    if (containsLiteralSecret(out)) return null
     return out
   }
-  if (typeof raw.command === 'string' && raw.command.trim()) {
+  if (typeof raw.command === 'string' && raw.command.trim() && raw.command.length <= 512) {
     const out = { command: raw.command.trim() }
-    if (Array.isArray(raw.args)) out.args = raw.args.filter((a) => typeof a === 'string')
+    if (Array.isArray(raw.args)) out.args = raw.args.filter((a) => typeof a === 'string' && a.length <= 4096).slice(0, 64)
     const env = raw.env && typeof raw.env === 'object' && !Array.isArray(raw.env)
-      ? Object.fromEntries(Object.entries(raw.env).filter(([, v]) => typeof v === 'string'))
+      ? Object.fromEntries(Object.entries(raw.env)
+          .filter(([k, v]) => /^[A-Z_][A-Z0-9_]{0,127}$/i.test(k) && typeof v === 'string' && v.length <= 4096)
+          .slice(0, 32))
       : {}
     if (Object.keys(env).length) out.env = env
+    if (containsLiteralSecret(out)) return null
     return out
   }
   return null
@@ -366,7 +445,9 @@ function discoverExternal() {
 function importDiscovered() {
   const found = discoverExternal()
   if (!found.length) return { ok: true, imported: 0 }
-  const cfg = readJson(userConfigPath()).data ?? {}
+  const loaded = readJson(userConfigPath())
+  if (loaded.error) return { ok: false, imported: 0, message: loaded.error }
+  const cfg = loaded.data ?? {}
   const mcpServers = { ...(cfg.mcpServers && typeof cfg.mcpServers === 'object' ? cfg.mcpServers : {}) }
   const disabled = new Set(Array.isArray(cfg.disabled) ? cfg.disabled : [])
   for (const { name, spec } of found) {
@@ -399,6 +480,30 @@ function ensureUserConfig() {
 // translate 1:1. The parser only VALIDATES — nothing is written until the
 // renderer's trust modal gets an explicit Install click.
 const INSTALL_NAME_RE = /^[a-z0-9][a-z0-9_-]{0,39}$/i
+const MAX_INSTALL_CONFIG_BYTES = 64 * 1024
+const SECRET_NAME_RE = /(authorization|api[-_]?key|token|secret|password|credential)/i
+const ENV_PLACEHOLDER_RE = /^\$\{[A-Z_][A-Z0-9_]*\}$/i
+function containsLiteralSecret(config) {
+  for (const field of ['env', 'headers']) {
+    const values = config && config[field]
+    if (!values || typeof values !== 'object' || Array.isArray(values)) continue
+    for (const [name, value] of Object.entries(values)) {
+      if (SECRET_NAME_RE.test(name) && typeof value === 'string' && value && !ENV_PLACEHOLDER_RE.test(value)) return true
+    }
+  }
+  if (config && typeof config.url === 'string') {
+    try {
+      const parsed = new URL(config.url)
+      // URL userinfo is itself a credential carrier and is also easy to expose
+      // accidentally in the review UI, logs, and server detail rows.
+      if (parsed.username || parsed.password) return true
+      for (const [name, value] of parsed.searchParams) {
+        if (SECRET_NAME_RE.test(name) && value && !ENV_PLACEHOLDER_RE.test(value)) return true
+      }
+    } catch { return true }
+  }
+  return false
+}
 function parseInstallUrl(rawUrl) {
   let u
   try { u = new URL(rawUrl) } catch { return null }
@@ -408,30 +513,164 @@ function parseInstallUrl(rawUrl) {
   const name = u.searchParams.get('name') ?? ''
   const b64 = u.searchParams.get('config') ?? ''
   if (!INSTALL_NAME_RE.test(name)) return null
+  if (!b64 || b64.length > MAX_INSTALL_CONFIG_BYTES * 2) return null
   let config
-  try { config = JSON.parse(Buffer.from(b64, 'base64').toString('utf8')) } catch { return null }
+  try {
+    const decoded = Buffer.from(b64, 'base64')
+    if (decoded.length > MAX_INSTALL_CONFIG_BYTES) return null
+    config = JSON.parse(decoded.toString('utf8'))
+  } catch { return null }
   if (!config || typeof config !== 'object' || Array.isArray(config)) return null
-  // must normalize to something runnable — same validator the catalog uses
-  if (!normalizeSpec(config)) return null
-  return { name, config }
+  const clean = sanitizeRaw(config)
+  if (!clean) return null
+  return { name, config: clean }
 }
 
 /** Write one server into the USER catalog (raw spec verbatim — never
  *  env-expanded into the file). Called only after the trust modal's Install. */
-function addUserServer(name, config) {
-  if (!INSTALL_NAME_RE.test(name) || !normalizeSpec(config)) return { ok: false, message: 'Invalid server spec.' }
-  const { data } = readJson(userConfigPath())
-  const cfg = data && typeof data === 'object' ? data : {}
-  cfg.mcpServers = { ...(cfg.mcpServers || {}), [name]: config }
-  if (Object.keys(cfg.mcpServers).length > MAX_SERVERS_PER_SCOPE) return { ok: false, message: `User catalog is full (${MAX_SERVERS_PER_SCOPE}).` }
-  writeJson(userConfigPath(), cfg)
+const EXTENSION_OWNER_RE = /^[a-z0-9][a-z0-9._-]{2,79}$/
+const SPEC_HASH_RE = /^[a-f0-9]{64}$/
+
+/** Canonical hash of the RAW persisted spec. Unlike specHash(), this never
+ * expands ${VAR}; changing an environment variable must not make an extension
+ * lose ownership of the record it installed. */
+function storedSpecHash(raw) {
+  const clean = sanitizeRaw(raw)
+  if (!clean) return null
+  const canon = clean.command
+    ? ['stdio', clean.command, ...(clean.args || []), ...Object.entries(clean.env || {}).sort(([a], [b]) => a.localeCompare(b)).flat()]
+    : [clean.type === 'sse' ? 'sse' : 'http', clean.url, ...Object.entries(clean.headers || {}).sort(([a], [b]) => a.localeCompare(b)).flat()]
+  return crypto.createHash('sha256').update(JSON.stringify(canon)).digest('hex')
+}
+
+function cleanExtensionOwners(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return {}
+  return Object.fromEntries(Object.entries(value).filter(([name, record]) =>
+    INSTALL_NAME_RE.test(name)
+      && record && typeof record === 'object' && !Array.isArray(record)
+      && EXTENSION_OWNER_RE.test(record.extensionId)
+      && SPEC_HASH_RE.test(record.specHash),
+  ))
+}
+
+/** Pure mutation planner, exported to focused tests. Existing configs without
+ * ownership metadata remain user-owned and are never silently claimed/deleted. */
+function planAddUserServer(input, name, config, extensionId) {
+  if (!INSTALL_NAME_RE.test(name)) return { ok: false, message: 'Invalid server name.' }
+  if (extensionId != null && (typeof extensionId !== 'string' || !EXTENSION_OWNER_RE.test(extensionId))) {
+    return { ok: false, message: 'Invalid extension owner.' }
+  }
+  const clean = sanitizeRaw(config)
+  const nextHash = clean && storedSpecHash(clean)
+  if (!clean || !nextHash) return { ok: false, message: containsLiteralSecret(config) ? 'Store secrets in an environment variable and use a ${NAME} placeholder.' : 'Invalid server spec.' }
+
+  const cfg = input && typeof input === 'object' && !Array.isArray(input) ? input : {}
+  const mcpServers = cfg.mcpServers && typeof cfg.mcpServers === 'object' && !Array.isArray(cfg.mcpServers)
+    ? { ...cfg.mcpServers }
+    : {}
+  const extensionOwners = cleanExtensionOwners(cfg.extensionOwners)
+  const owner = Object.prototype.hasOwnProperty.call(extensionOwners, name) ? extensionOwners[name] : null
+  const hasExisting = Object.prototype.hasOwnProperty.call(mcpServers, name)
+  const existingHash = hasExisting ? storedSpecHash(mcpServers[name]) : null
+
+  if (hasExisting) {
+    if (owner && owner.extensionId !== extensionId) {
+      return { ok: false, conflict: true, message: `“${name}” is managed by extension ${owner.extensionId}.` }
+    }
+    if (extensionId && owner && owner.extensionId === extensionId) {
+      // Only replace an owned entry while it still matches the last spec this
+      // extension wrote. A user edit is an ownership handoff, not an update target.
+      if (!existingHash || existingHash !== owner.specHash) {
+        return { ok: false, conflict: true, message: `“${name}” was edited after installation; the existing server was preserved.` }
+      }
+      mcpServers[name] = clean
+      extensionOwners[name] = { extensionId, specHash: nextHash }
+      const disabled = Array.isArray(cfg.disabled) ? cfg.disabled.filter((item) => item !== name) : []
+      return { ok: true, created: false, owned: true, updated: existingHash !== nextHash, config: { ...cfg, mcpServers, disabled, extensionOwners } }
+    }
+    if (existingHash === nextHash) {
+      // Exact user-owned matches can satisfy an extension without transferring
+      // ownership. Uninstall will consequently preserve the user's record.
+      const disabled = Array.isArray(cfg.disabled) ? cfg.disabled.filter((item) => item !== name) : []
+      return { ok: true, created: false, owned: false, existing: true, config: { ...cfg, mcpServers, disabled, extensionOwners } }
+    }
+    return { ok: false, conflict: true, message: `A different user server named “${name}” already exists. Rename or remove it before installing.` }
+  }
+
+  if (Object.keys(mcpServers).length >= MAX_SERVERS_PER_SCOPE) return { ok: false, message: `User catalog is full (${MAX_SERVERS_PER_SCOPE}).` }
+  mcpServers[name] = clean
+  if (extensionId) extensionOwners[name] = { extensionId, specHash: nextHash }
+  else delete extensionOwners[name]
+  const disabled = Array.isArray(cfg.disabled) ? cfg.disabled.filter((item) => item !== name) : []
+  return { ok: true, created: true, owned: !!extensionId, config: { ...cfg, mcpServers, disabled, extensionOwners } }
+}
+
+function addUserServer(name, config, extensionId) {
+  const loaded = readJson(userConfigPath())
+  if (loaded.error) return { ok: false, message: loaded.error }
+  const planned = planAddUserServer(loaded.data, name, config, extensionId)
+  if (!planned.ok) return planned
+  writeJson(userConfigPath(), planned.config)
   emitChange()
-  return { ok: true }
+  const { config: _config, ...result } = planned
+  return result
+}
+
+function planRemoveUserServer(input, name, extensionId) {
+  if (!INSTALL_NAME_RE.test(name)) return { ok: false, message: 'Invalid server name.' }
+  if (extensionId != null && (typeof extensionId !== 'string' || !EXTENSION_OWNER_RE.test(extensionId))) {
+    return { ok: false, message: 'Invalid extension owner.' }
+  }
+  const cfg = input && typeof input === 'object' && !Array.isArray(input) ? input : {}
+  const mcpServers = cfg.mcpServers && typeof cfg.mcpServers === 'object' && !Array.isArray(cfg.mcpServers)
+    ? { ...cfg.mcpServers }
+    : {}
+  const extensionOwners = cleanExtensionOwners(cfg.extensionOwners)
+  const owner = Object.prototype.hasOwnProperty.call(extensionOwners, name) ? extensionOwners[name] : null
+  if (!Object.prototype.hasOwnProperty.call(mcpServers, name)) {
+    if (owner) {
+      delete extensionOwners[name]
+      return { ok: true, missing: true, config: { ...cfg, mcpServers, extensionOwners } }
+    }
+    return { ok: true, missing: true }
+  }
+  if (extensionId) {
+    if (!owner || owner.extensionId !== extensionId) return { ok: true, preserved: true }
+    const currentHash = storedSpecHash(mcpServers[name])
+    if (!currentHash || currentHash !== owner.specHash) {
+      // A post-install user edit releases ownership. Keep the server and remove
+      // stale metadata so no later uninstall can delete it.
+      delete extensionOwners[name]
+      return { ok: true, preserved: true, modified: true, config: { ...cfg, mcpServers, extensionOwners } }
+    }
+  } else if (owner) {
+    return { ok: false, conflict: true, message: `“${name}” is managed by extension ${owner.extensionId}. Uninstall that extension first.` }
+  }
+  delete mcpServers[name]
+  delete extensionOwners[name]
+  const disabled = Array.isArray(cfg.disabled) ? cfg.disabled.filter((item) => item !== name) : []
+  return { ok: true, removed: true, config: { ...cfg, mcpServers, disabled, extensionOwners } }
+}
+
+function removeUserServer(name, extensionId) {
+  const loaded = readJson(userConfigPath())
+  if (loaded.error) return { ok: false, message: loaded.error }
+  const planned = planRemoveUserServer(loaded.data, name, extensionId)
+  if (!planned.ok) return planned
+  if (planned.config) writeJson(userConfigPath(), planned.config)
+  emitChange()
+  const { config: _config, ...result } = planned
+  return result
 }
 
 function registerMcpCatalogHandlers(ipcMain) {
-  ipcMain.handle('mcp:server-add', (_e, { name, config } = {}) => {
-    try { return addUserServer(String(name ?? ''), config) } catch (err) {
+  ipcMain.handle('mcp:server-add', (_e, { name, config, extensionId } = {}) => {
+    try { return addUserServer(String(name ?? ''), config, extensionId == null ? undefined : String(extensionId)) } catch (err) {
+      return { ok: false, message: String((err && err.message) || err) }
+    }
+  })
+  ipcMain.handle('mcp:server-remove', (_e, { name, extensionId } = {}) => {
+    try { return removeUserServer(String(name ?? ''), extensionId == null ? undefined : String(extensionId)) } catch (err) {
       return { ok: false, message: String((err && err.message) || err) }
     }
   })
@@ -469,4 +708,13 @@ function registerMcpCatalogHandlers(ipcMain) {
   })
 }
 
-module.exports = { registerMcpCatalogHandlers, acpEntries, claudeUserEntries, onChange, parseInstallUrl, addUserServer }
+module.exports = {
+  registerMcpCatalogHandlers,
+  acpEntries,
+  claudeUserEntries,
+  onChange,
+  parseInstallUrl,
+  addUserServer,
+  removeUserServer,
+  __test: { normalizeSpec, parseRpcBody, containsLiteralSecret, specHash, sanitizeRaw, storedSpecHash, planAddUserServer, planRemoveUserServer, writeJson },
+}

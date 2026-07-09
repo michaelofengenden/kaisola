@@ -21,6 +21,7 @@ const { registerUpdateHandlers } = require('./ipc/updateHandler.cjs')
 const { registerUsageHandlers } = require('./ipc/usageHandler.cjs')
 const { registerLedgerHandlers } = require('./ipc/ledgerHandler.cjs')
 const { registerMcpHandlers } = require('./ipc/mcpServer.cjs')
+const { registerExtensionHandlers } = require('./ipc/extensionHandler.cjs')
 const { registerGlassHandlers } = require('./ipc/glassHandler.cjs')
 const worktree = require('./ipc/worktreeHandler.cjs')
 
@@ -77,6 +78,7 @@ app.whenReady().then(async () => {
   registerUsageHandlers(ipcMain)
   registerLedgerHandlers(ipcMain)
   registerMcpHandlers(ipcMain)
+  registerExtensionHandlers(ipcMain)
   registerGlassHandlers(ipcMain)
   // Liquid Glass prefs are cosmetic; the smoke shell answers with "unsupported"
   ipcMain.handle('shell:glass', () => ({ supported: false, active: false, enabled: false }))
@@ -682,6 +684,9 @@ app.whenReady().then(async () => {
   fsx.writeFileSync(path.join(fileUiRoot, 'alpha-search-target.txt'), 'alpha\n')
   fsx.writeFileSync(path.join(fileUiRoot, 'beta-notes.md'), '# beta\n\nReadable olive markdown.\n\n![inline figure](figs/inline.png)\n\n- [x] task\n')
   fsx.writeFileSync(path.join(fileUiRoot, 'page.html'), '<main><h1>HTML title</h1><p>Readable olive html.</p><script>window.__badHtmlPreview = true</script><p onclick="window.__badHtmlPreview = true">unsafe attr</p></main>')
+  fsx.writeFileSync(path.join(fileUiRoot, 'table.csv'), 'name,score\nAda,98\nGrace,97\n')
+  fsx.writeFileSync(path.join(fileUiRoot, 'tree.json'), '{"project":"Kaisola","features":["extensions","previews"]}\n')
+  fsx.writeFileSync(path.join(fileUiRoot, 'tree-wide.json'), JSON.stringify(Array.from({ length: 240 }, () => Array.from({ length: 240 }, () => 1))))
   fsx.writeFileSync(path.join(fileUiRoot, 'paper.tex'), String.raw`\title{Kaisola Field Notes}
 \author{Research Desk}
 \date{June 2026}
@@ -1378,6 +1383,58 @@ a^2 + b^2 = c^2
     return { hasAppearance, noSidebarControls: !hasSidebarControls }
   })()`)
   console.log('SETTINGS=' + JSON.stringify(settings))
+
+  // 15b) Extensions is a real full-screen browser; bundled installs hot-load
+  //      preview contributions and persist their authoritative main record.
+  const extensionsUi = await win.webContents.executeJavaScript(`(async () => {
+    window.dispatchEvent(new CustomEvent('kaisola:extensions-open'))
+    await new Promise((r) => setTimeout(r, 180))
+    const surface = document.querySelector('.extensions-surface')
+    const cards = [...document.querySelectorAll('.ext-card')]
+    const hasFilters = !!document.querySelector('.extensions-status') && !!document.querySelector('.extensions-categories')
+    const install = async (name) => {
+      const card = [...document.querySelectorAll('.ext-card')].find((node) => node.querySelector('h2')?.textContent === name)
+      const button = card && [...card.querySelectorAll('button')].find((node) => /Install/.test(node.textContent || ''))
+      button?.click()
+      await new Promise((r) => setTimeout(r, 120))
+      return !!card && /Uninstall/.test(card.textContent || '')
+    }
+    const csvInstalled = await install('CSV Table Preview')
+    const jsonInstalled = await install('JSON Tree Preview')
+    const htmlCard = [...document.querySelectorAll('.ext-card')].find((node) => node.querySelector('h2')?.textContent === 'HTML')
+    const htmlUninstall = htmlCard && [...htmlCard.querySelectorAll('button')].find((node) => node.textContent?.trim() === 'Uninstall')
+    htmlUninstall?.click()
+    await new Promise((r) => setTimeout(r, 120))
+    const mainState = await window.kaisola.extensions.state()
+    const defaultUninstallPersisted = mainState.installed?.['kaisola.html']?.enabled === false
+    document.querySelector('.extensions-head-actions .btn-icon')?.click()
+    const st = window.__kaisola.getState()
+    st.requestFile(${JSON.stringify(path.join(fileUiRoot, 'table.csv'))}, undefined, { pinned: true })
+    await new Promise((r) => setTimeout(r, 220))
+    const csvPreview = !!document.querySelector('.fx-doc-table table') && /Ada/.test(document.querySelector('.fx-doc-table')?.textContent || '')
+    st.requestFile(${JSON.stringify(path.join(fileUiRoot, 'tree.json'))}, undefined, { pinned: true })
+    await new Promise((r) => setTimeout(r, 220))
+    const jsonPreview = !!document.querySelector('.fx-json-tree') && /Kaisola/.test(document.querySelector('.fx-json-tree')?.textContent || '')
+    st.requestFile(${JSON.stringify(path.join(fileUiRoot, 'tree-wide.json'))}, undefined, { pinned: true })
+    await new Promise((r) => setTimeout(r, 320))
+    const jsonNodeCount = document.querySelectorAll('.fx-json-node,.fx-json-leaf').length
+    const boundedJsonPreview = jsonNodeCount > 0 && jsonNodeCount <= 5000 && /Preview capped/.test(document.querySelector('.fx-doc-json')?.textContent || '')
+    return {
+      opened: !!surface,
+      cards: cards.length,
+      hasFilters,
+      csvInstalled,
+      jsonInstalled,
+      persisted: !!mainState.installed?.['kaisola.csv-preview'] && !!mainState.installed?.['kaisola.json-preview'],
+      defaultUninstallPersisted,
+      csvPreview,
+      jsonPreview,
+      boundedJsonPreview,
+      jsonNodeCount,
+      closed: !document.querySelector('.extensions-surface'),
+    }
+  })()`)
+  console.log('EXTENSIONS=' + JSON.stringify(extensionsUi))
 
   // 16) a dropdown opened from the right-docked pane's foot stays on-screen
   const dropfit = await win.webContents.executeJavaScript(`(async () => {
@@ -2493,6 +2550,8 @@ a^2 + b^2 = c^2
     !autoname.named || !autoname.rowShows || !autoname.sticky || !autoname.manualWins || !autoname.termNamed ||
     !minimalUi.noSidebar || !minimalUi.noSidebarResize || !minimalUi.noStageNav || !minimalUi.hasRail || !minimalUi.hasPlus || !minimalUi.hasFiles ||
     !settings.hasAppearance || !settings.noSidebarControls ||
+    !extensionsUi.opened || extensionsUi.cards < 8 || !extensionsUi.hasFilters || !extensionsUi.csvInstalled || !extensionsUi.jsonInstalled ||
+    !extensionsUi.persisted || !extensionsUi.defaultUninstallPersisted || !extensionsUi.csvPreview || !extensionsUi.jsonPreview || !extensionsUi.boundedJsonPreview || !extensionsUi.closed ||
     !dropfit.hasBtn || !dropfit.fits ||
     agentrun.added < 1 || agentrun.agentId !== 'hypothesis' || !agentrun.hasChanges || agentrun.status !== 'pending' ||
     approve.hypAdded < 1 || approve.createStatus !== 'approved' || !approve.patched ||

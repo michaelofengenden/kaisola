@@ -8,6 +8,7 @@ import { fileIcon } from '../../lib/fileIcon'
 import { Icon } from '../Icon'
 import { relTime } from '../../lib/format'
 import { terminalLabel } from '@/lib/sessionLabel'
+import { openExtensionsCenter } from '../../lib/extensions'
 
 interface Command {
   id: string
@@ -165,6 +166,7 @@ export function CommandPalette() {
     }))]
     const nav: Command[] = [
       { id: 'go-file', group: 'Navigate', label: 'Go to file…', hint: '⌘P', icon: 'FileSearch', run: () => togglePalette('files') },
+      { id: 'extensions', group: 'Navigate', label: 'Extensions', hint: 'Languages, previews, and MCP servers', icon: 'Blocks', run: () => { close(); openExtensionsCenter() } },
       { id: 'new-terminal', group: 'Navigate', label: 'New terminal', icon: 'SquareTerminal', run: () => { requestTerminal(undefined, { cwd: workspacePath ?? undefined }); close() } },
       { id: 'git-panel', group: 'Navigate', label: 'Git: stage & commit', hint: 'Side-by-side diffs, without leaving the window', icon: 'GitCommitHorizontal', run: () => { useKaisola.getState().openGitPanel(); close() } },
       { id: 'ledger-panel', group: 'Navigate', label: 'Agent tasks', hint: 'The shared ledger — what agents posted, claimed, finished', icon: 'ListTodo', run: () => { useKaisola.getState().openLedgerPanel(); close() } },

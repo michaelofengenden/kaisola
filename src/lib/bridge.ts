@@ -330,6 +330,13 @@ export interface TerminalMetaEvent {
   repo: string | null
   branch: string | null
 }
+/** A human-gated write from an agent (hypothesis_propose / claim_assert over MCP). */
+export interface McpProposalEvent {
+  kind: 'hypothesis' | 'claim'
+  args: Record<string, unknown>
+  at: number
+}
+
 /** A row in the shared agent-task ledger (coordination state, never research state). */
 export interface LedgerTask {
   id: string
@@ -458,6 +465,8 @@ export interface KaisolaBridge {
   /** The in-app MCP server every connected agent shares. */
   mcp?: {
     info(): Promise<{ ok: boolean; url?: string | null; configPath?: string | null }>
+    /** An agent called a human-gated write tool → a pending Proposal. */
+    onProposal?(cb: (ev: McpProposalEvent) => void): () => void
   }
   git: {
     status(cwd: string): Promise<{ ok: boolean; notRepo?: boolean; root?: string; branch?: string | null; entries?: GitStatusEntry[] }>

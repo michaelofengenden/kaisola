@@ -8,6 +8,7 @@ import { Terminal, everMountedTerminals } from '../Terminal'
 import { Assistant } from '../Assistant'
 import { GitPanel } from './GitPanel'
 import { BrowserCard } from './BrowserCard'
+import { LedgerCard } from './LedgerCard'
 import { SessionTabs } from './SessionTabs'
 import { Icon } from '../Icon'
 
@@ -355,9 +356,13 @@ export function SessionCards() {
           ? card(p.id, 'GitCommitHorizontal', 'Commit', placed ? <GitPanel /> : null, {
               hue: sessionHue({ agentKey: 'git', folder: workspacePath }),
             })
-          : card(p.id, 'Globe', p.title ?? urlHost(p.url) ?? 'Browser', placed ? <BrowserCard id={p.id} /> : null, {
-              hue: sessionHue({ agentKey: urlHost(p.url) ?? 'browser' }),
-            })
+          : p.kind === 'ledger'
+            ? card(p.id, 'ListTodo', 'Agent tasks', placed ? <LedgerCard /> : null, {
+                hue: sessionHue({ agentKey: 'ledger', folder: workspacePath }),
+              })
+            : card(p.id, 'Globe', p.title ?? urlHost(p.url) ?? 'Browser', placed ? <BrowserCard id={p.id} /> : null, {
+                hue: sessionHue({ agentKey: urlHost(p.url) ?? 'browser' }),
+              })
       })}
       </div>
     </div>

@@ -142,6 +142,13 @@ const bridge = {
   // handler isn't registered (sendSync never returns without a listener)
   mcp: {
     info: () => ipcRenderer.invoke('mcp:info'),
+    // an agent used a HUMAN-GATED write tool — the payload becomes a pending
+    // Proposal in the renderer's review gate
+    onProposal: (cb) => {
+      const listener = (_e, ev) => cb(ev)
+      ipcRenderer.on('mcp:proposal', listener)
+      return () => ipcRenderer.removeListener('mcp:proposal', listener)
+    },
   },
 
   // ── git checkpoints + status (tree tinting, diff review) + commit panel ──

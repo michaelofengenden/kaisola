@@ -54,6 +54,7 @@ export function SessionTabs() {
   const worktreeSessions = useKaisola((s) => s.worktreeSessions)
   const mergeWorktreeSession = useKaisola((s) => s.mergeWorktreeSession)
   const removeWorktreeSession = useKaisola((s) => s.removeWorktreeSession)
+  const proposeWorktreeSession = useKaisola((s) => s.proposeWorktreeSession)
   const { all: agents } = useAgentRegistry()
 
   const [editing, setEditing] = useState<string | null>(null)
@@ -274,6 +275,9 @@ export function SessionTabs() {
             {worktreeSessions[menu.id] && (
               <>
                 <div className="tree-menu-sep" />
+                <button className="tree-menu-item" onClick={() => { void proposeWorktreeSession(menu.id); setMenu(null) }}>
+                  <Icon name="FileDiff" size={13} /> Review changes as proposal
+                </button>
                 <button className="tree-menu-item" onClick={() => { void mergeWorktreeSession(menu.id); setMenu(null) }}>
                   <Icon name="GitMerge" size={13} /> Merge worktree back
                 </button>
@@ -298,6 +302,7 @@ function NewSessionButton() {
   const { menu } = useAgentRegistry()
   const requestTerminal = useKaisola((s) => s.requestTerminal)
   const openGitPanel = useKaisola((s) => s.openGitPanel)
+  const openLedgerPanel = useKaisola((s) => s.openLedgerPanel)
   const openBrowserPanel = useKaisola((s) => s.openBrowserPanel)
   const setSettingsOpen = useKaisola((s) => s.setSettingsOpen)
   const sessionTemplates = useKaisola((s) => s.sessionTemplates)
@@ -306,6 +311,7 @@ function NewSessionButton() {
   const openSession = (value: string) => {
     if (value === 'terminal') { requestTerminal(); return }
     if (value === 'git') { openGitPanel(); return }
+    if (value === 'ledger') { openLedgerPanel(); return }
     if (value === 'browser') { openBrowserPanel(); return }
     if (value === 'worktree') { void newWorktreeSession(); return }
     if (value === 'registry') { setSettingsOpen(true, 'agents'); return }
@@ -324,6 +330,7 @@ function NewSessionButton() {
         { value: 'worktree', name: 'Agent in a worktree' },
         { value: 'terminal', name: 'New terminal' },
         { value: 'git', name: 'Git commit' },
+        { value: 'ledger', name: 'Agent tasks' },
         { value: 'browser', name: 'Browser' },
         { value: 'registry', name: 'Add agents…' },
       ]}

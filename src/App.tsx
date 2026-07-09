@@ -331,6 +331,8 @@ export default function App() {
       // main resolved a pending ask itself (5-min timeout, or the agent died
       // while it was pending) — drop the inline card the composer is still showing
       bridge.acp.onPermissionResolved((permId) => useKaisola.getState().dismissPermission(permId)),
+      // a human-gated MCP write tool fired → a pending Proposal in the gate
+      bridge.mcp?.onProposal?.((ev) => useKaisola.getState().receiveMcpProposal(ev)),
       // agent-task ledger traffic (agents coordinating over the Kaisola MCP
       // server) lands in the OWNING project's activity feed — agent↔agent
       // messages stay in the human's line of sight

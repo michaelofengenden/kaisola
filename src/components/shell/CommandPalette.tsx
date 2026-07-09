@@ -167,6 +167,7 @@ export function CommandPalette() {
       { id: 'go-file', group: 'Navigate', label: 'Go to file…', hint: '⌘P', icon: 'FileSearch', run: () => togglePalette('files') },
       { id: 'new-terminal', group: 'Navigate', label: 'New terminal', icon: 'SquareTerminal', run: () => { requestTerminal(undefined, { cwd: workspacePath ?? undefined }); close() } },
       { id: 'git-panel', group: 'Navigate', label: 'Git: stage & commit', hint: 'Side-by-side diffs, without leaving the window', icon: 'GitCommitHorizontal', run: () => { useKaisola.getState().openGitPanel(); close() } },
+      { id: 'ledger-panel', group: 'Navigate', label: 'Agent tasks', hint: 'The shared ledger — what agents posted, claimed, finished', icon: 'ListTodo', run: () => { useKaisola.getState().openLedgerPanel(); close() } },
       { id: 'new-browser', group: 'Navigate', label: 'New browser card', hint: 'Preview a dev server beside its terminal', icon: 'Globe', run: () => { useKaisola.getState().openBrowserPanel(); close() } },
       {
         id: 'latex-mode',

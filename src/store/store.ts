@@ -37,7 +37,7 @@ import { verifyCitation } from '../lib/verify'
 import { recomputeProvenanced, sectionTrust } from '../domain/trust'
 import { extractDoi, lookupOpenAlex, lookupOpenAlexByArxiv, resolveReferences } from '../lib/openalex'
 import { parseTei, locateQuote } from '../lib/grobid'
-import { bridge, isDesktop, acpScope, type AcpPermissionRequest } from '../lib/bridge'
+import { bridge, isDesktop, acpScope, type AcpPermissionRequest, type McpProposalEvent } from '../lib/bridge'
 import { folderHue } from '../lib/sessionHue'
 import { forgetMountedTerminal } from '../components/Terminal'
 import {
@@ -206,7 +206,7 @@ export interface AgentTerminalSession {
  */
 export interface DockPanel {
   id: string
-  kind: 'git' | 'browser'
+  kind: 'git' | 'browser' | 'ledger'
   url?: string
   /** Live page title (browser) — display only, refreshed on navigation. */
   title?: string
@@ -774,6 +774,7 @@ interface KaisolaState {
   restorePoppedTerminal: (id: string) => void
   /** Open (or focus) the git commit panel card — one per window. */
   openGitPanel: () => void
+  openLedgerPanel: () => void
   /** Open a browser card; same-origin URLs re-point the existing card. */
   openBrowserPanel: (url?: string) => void
   closePanel: (id: string) => void
@@ -887,6 +888,12 @@ interface KaisolaState {
   }) => void
   /** Approve a coding patch: merge its worktree branch back, then clean up. */
   mergeWorktreeProposal: (id: string) => Promise<void>
+  /** The REVIEWED path for a worktree session: commit its work, turn the diff
+   * into a file-patch Proposal, and open it in the review overlay — approve
+   * there to merge. (The context menu's direct merge stays for trusted work.) */
+  proposeWorktreeSession: (sessionId: string) => Promise<void>
+  /** An agent used a human-gated MCP write tool → a pending Proposal here. */
+  receiveMcpProposal: (ev: McpProposalEvent) => void
 
   // ── undo timeline (the checkpoint over the gate) ──
   /** Revert the project to a checkpoint, dropping it and everything newer. */
@@ -2072,6 +2079,15 @@ export const useKaisola = create<KaisolaState>()(
         ...gridState(grid, { dockOpen: true }),
       }
     }),
+  openLedgerPanel: () =>
+    set((s) => {
+      const id = 'panel-ledger'
+      const grid = s.dockViews.includes(id) ? s.dockGrid : [...s.dockGrid, [id]]
+      return {
+        panels: s.panels.some((p) => p.id === id) ? s.panels : [...s.panels, { id, kind: 'ledger' as const }],
+        ...gridState(grid, { dockOpen: true }),
+      }
+    }),
   openBrowserPanel: (url) =>
     set((s) => {
       const origin = (u?: string) => { try { return u ? new URL(u).origin : null } catch { return null } }
@@ -3024,6 +3040,80 @@ export const useKaisola = create<KaisolaState>()(
     }
     set((s) => ({ project: { ...s.project, proposals: [...s.project.proposals, proposal] } }))
     get().pushActivity(agentId, `Coding agent proposed a ${files.length}-file patch from worktree ${branch}.`, proposal.id)
+  },
+
+  receiveMcpProposal: (ev) => {
+    const a = ev.args ?? {}
+    const str = (v: unknown, cap = 4000) => (typeof v === 'string' ? v.slice(0, cap) : '')
+    const from = str(a.from, 60)
+    let proposal: Proposal | null = null
+    if (ev.kind === 'hypothesis') {
+      const title = str(a.title, 200)
+      const claim = str(a.claim)
+      if (!title || !claim) return
+      const entity: Hypothesis = {
+        id: uid('hyp'), title, claim,
+        why: str(a.why), mvp: str(a.mvp),
+        noveltyRisk: 3, feasibility: 3, computeEstimate: '', dataNeeds: '',
+        failureModes: [], closestRelatedWork: [], expectedContribution: str(a.why),
+        status: 'proposed', provenance: [], trust: 'unsupported',
+      }
+      proposal = {
+        id: uid('prop'), agentId: 'hypothesis', stage: 'ideas',
+        title: `Hypothesis: ${title}`,
+        summary: `${from || 'An agent'} proposed this over MCP. ${claim}`,
+        changes: [{ id: uid('ch'), kind: 'create', entityType: 'hypothesis', label: title, after: claim, reason: str(a.why, 400) || 'Proposed by an agent over MCP', payload: entity }],
+        evidence: [], status: 'pending', createdAt: nowISO(),
+      }
+    } else if (ev.kind === 'claim') {
+      const label = str(a.label, 300)
+      if (!label) return
+      const nodeTypes = ['claim', 'method', 'dataset', 'metric', 'result', 'limitation', 'assumption', 'question', 'contradiction']
+      const type = nodeTypes.includes(str(a.type, 30)) ? (str(a.type, 30) as GraphNode['type']) : 'claim'
+      const entity: GraphNode = {
+        id: uid('node'), type, label, detail: str(a.detail) || undefined,
+        sourceIds: [], provenance: [], trust: 'unsupported',
+      }
+      proposal = {
+        id: uid('prop'), agentId: 'literature', stage: 'claims',
+        title: `Claim: ${label.slice(0, 80)}`,
+        summary: `${from || 'An agent'} asserted this into the claim graph over MCP.${str(a.detail, 300) ? ` ${str(a.detail, 300)}` : ''}`,
+        changes: [{ id: uid('ch'), kind: 'create', entityType: 'graph-node', label, after: str(a.detail, 400), reason: 'Asserted by an agent over MCP', payload: entity }],
+        evidence: [], status: 'pending', createdAt: nowISO(),
+      }
+    }
+    if (!proposal) return
+    const p = proposal
+    set((s) => ({ project: { ...s.project, proposals: [...s.project.proposals, p] } }))
+    get().pushActivity(p.agentId, `${from || 'An agent'} submitted “${trim(p.title)}” for review (MCP).`, p.id)
+    get().pushToast('info', `${from || 'An agent'} proposed: ${trim(p.title)} — review to apply.`)
+  },
+
+  proposeWorktreeSession: async (sessionId) => {
+    const s = get()
+    const wt = s.worktreeSessions[sessionId]
+    if (!wt) return
+    // commit whatever the agent left uncommitted, then read the branch diff
+    const fin = await bridge.worktree.finalize({ taskId: wt.taskId, message: `kaisola: changes on ${wt.branch}`, repo: wt.repo })
+    if (!fin.ok) {
+      s.pushToast('error', fin.message ?? `Could not commit the ${wt.branch} changes.`)
+      return
+    }
+    const df = await bridge.worktree.diff({ taskId: wt.taskId })
+    if (!df.ok) { s.pushToast('error', df.message ?? 'Could not read the worktree diff.'); return }
+    if (!(df.files ?? []).length) { s.pushToast('info', `No changes in ${wt.branch} yet.`); return }
+    get().createWorktreeProposal({
+      taskId: wt.taskId,
+      branch: wt.branch,
+      repo: wt.repo,
+      agentId: 'coding',
+      patch: df.patch ?? '',
+      files: df.files ?? [],
+    })
+    // open the freshly created proposal in the review overlay
+    const latest = get().project.proposals
+    const prop = latest[latest.length - 1]
+    if (prop) get().focusProposal(prop.id)
   },
 
   mergeWorktreeProposal: async (id) => {

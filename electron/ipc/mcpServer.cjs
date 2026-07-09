@@ -18,9 +18,22 @@ const http = require('node:http')
 const crypto = require('node:crypto')
 const path = require('node:path')
 const fs = require('node:fs')
-const { app } = require('electron')
+const { app, BrowserWindow } = require('electron')
 const { dbGet } = require('./dbHandler.cjs')
 const ledger = require('./ledgerHandler.cjs')
+
+/** Hand a write request to the renderer as a PENDING proposal — the human
+ * approves it in the review gate before it touches project state. */
+function broadcastProposal(kind, args) {
+  for (const win of BrowserWindow.getAllWindows()) {
+    if (!win.webContents.isDestroyed()) win.webContents.send('mcp:proposal', { kind, args, at: Date.now() })
+  }
+  return {
+    ok: true,
+    status: 'pending_human_review',
+    note: 'A proposal was created in Kaisola’s review gate. It becomes project state only if the human approves it — do not assume it applied.',
+  }
+}
 
 const PROTOCOL = '2025-06-18'
 let server = null
@@ -147,6 +160,49 @@ const TOOLS = [
     },
   },
   {
+    name: 'hypothesis_propose',
+    description: 'Propose a research hypothesis to the project. HUMAN-GATED: this creates a pending proposal in Kaisola’s review gate — it becomes project state only if the human approves. Give a falsifiable claim and why it matters.',
+    _meta: { 'anthropic/requiresUserInteraction': true },
+    inputSchema: {
+      type: 'object',
+      properties: {
+        title: { type: 'string', description: 'Short hypothesis title' },
+        claim: { type: 'string', description: 'The falsifiable statement' },
+        why: { type: 'string', description: 'Why it matters / expected contribution' },
+        mvp: { type: 'string', description: 'The minimum experiment that would test it' },
+        from: { type: 'string', description: 'Your agent name' },
+      },
+      required: ['title', 'claim'],
+      additionalProperties: false,
+    },
+    run: (args = {}) => {
+      if (!String(args.title || '').trim() || !String(args.claim || '').trim()) {
+        return { ok: false, message: 'title and claim are required' }
+      }
+      return broadcastProposal('hypothesis', args)
+    },
+  },
+  {
+    name: 'claim_assert',
+    description: 'Assert a claim (or method/result/limitation…) into the project’s claim graph. HUMAN-GATED: creates a pending proposal in the review gate — applied only if the human approves.',
+    _meta: { 'anthropic/requiresUserInteraction': true },
+    inputSchema: {
+      type: 'object',
+      properties: {
+        label: { type: 'string', description: 'The claim, stated compactly' },
+        detail: { type: 'string', description: 'Supporting detail / evidence pointers' },
+        type: { type: 'string', description: 'Node type: claim | method | dataset | metric | result | limitation | assumption | question | contradiction (default claim)' },
+        from: { type: 'string', description: 'Your agent name' },
+      },
+      required: ['label'],
+      additionalProperties: false,
+    },
+    run: (args = {}) => {
+      if (!String(args.label || '').trim()) return { ok: false, message: 'label is required' }
+      return broadcastProposal('claim', args)
+    },
+  },
+  {
     name: 'agent_task_update',
     description: 'Update a ledger task: claim it (status=claimed, owner=you), report progress (in_progress/blocked), or finish it (done + result). Ledger-only — never mutates project state.',
     inputSchema: {
@@ -184,7 +240,12 @@ function handleRpc(msg) {
   }
   if (method === 'ping') return rpcResult(id, {})
   if (method === 'tools/list') {
-    return rpcResult(id, { tools: TOOLS.map(({ name, description, inputSchema }) => ({ name, description, inputSchema })) })
+    // _meta carries anthropic/requiresUserInteraction on the write tools — the
+    // client must prompt the human on EVERY call, even under auto-accept modes
+    return rpcResult(id, {
+      tools: TOOLS.map(({ name, description, inputSchema, _meta }) =>
+        _meta ? { name, description, inputSchema, _meta } : { name, description, inputSchema }),
+    })
   }
   if (method === 'tools/call') {
     const tool = TOOLS.find((t) => t.name === (params && params.name))

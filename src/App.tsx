@@ -513,14 +513,16 @@ export default function App() {
       const freshShell =
         // 'focus' was the pre-rename default; 'studio' is the current one — a
         // pristine store can carry either depending on when it was created.
-        // The lone default card may be the thread (old stores) or the terminal
-        // (terminal-first default) — both count as untouched.
         (before.layoutMode === 'focus' || before.layoutMode === 'studio') &&
         before.assistantThreads.length <= 1 &&
         before.terminals.length === 1 &&
-        before.dockGrid.length === 1 &&
-        before.dockGrid[0]?.length === 1 &&
-        (before.dockGrid[0]?.[0] === before.activeThreadId || before.dockGrid[0]?.[0] === before.terminals[0]?.id) &&
+        // the lone default card may be the thread (old stores), the terminal
+        // (terminal-first default), or NO card at all (the clean homescreen
+        // default) — all count as an untouched shell
+        (before.dockGrid.length === 0 ||
+          (before.dockGrid.length === 1 &&
+            before.dockGrid[0]?.length === 1 &&
+            (before.dockGrid[0]?.[0] === before.activeThreadId || before.dockGrid[0]?.[0] === before.terminals[0]?.id))) &&
         !before.terminals.some((term) => term.singletonKey === 'agent:claude-code')
 
       // the boot line (account env, --resume/--continue probing, hooks tap) is

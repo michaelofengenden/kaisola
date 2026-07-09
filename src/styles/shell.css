@@ -444,8 +444,8 @@
   padding: 0 var(--sp-3) 0 var(--sp-2);
   flex-shrink: 0; /* the track shrinks, chrome never does */
 }
-/* sidebar toggle, in the Claude-app spot right of the lights — a quiet
-   ghost button that only speaks on hover */
+/* sidebar toggle, in the Claude-app spot right of the lights — always lit
+   (text-1 at rest): at text-3 it dissolved into the glass and was unfindable */
 .tabstrip .rail-toggle {
   -webkit-app-region: no-drag;
   align-self: center;
@@ -457,10 +457,11 @@
   height: 26px;
   margin-right: var(--sp-2);
   border-radius: var(--r-2);
-  color: var(--text-3);
+  color: var(--text-1);
+  transition: color var(--dur-1) var(--ease-out), background var(--dur-1) var(--ease-out);
 }
 .tabstrip .rail-toggle:hover {
-  color: var(--text-1);
+  color: var(--text-0);
   background: var(--hover-overlay);
 }
 

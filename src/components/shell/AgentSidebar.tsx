@@ -1,6 +1,7 @@
 import { useKaisola } from '../../store/store'
 import { Icon } from '../Icon'
 import { LimitsButton } from './LimitsButton'
+import { AgentStatusButton } from './AgentStatusButton'
 
 /**
  * The shell tool cluster — palette, dock toggle, settings, theme, sidebar.
@@ -52,6 +53,7 @@ export function ShellTools() {
         <Icon name={canvasOpen ? 'PanelRightClose' : 'PanelRightOpen'} size={15} />
       </button>
       <LimitsButton />
+      <AgentStatusButton />
       <button className="btn-icon" onClick={() => openSettings(true)} title="Settings  ⌘,">
         <Icon name="Settings" size={15} />
       </button>

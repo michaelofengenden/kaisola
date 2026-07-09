@@ -1,5 +1,14 @@
 import { memo, useEffect, useMemo, useRef, useState } from 'react'
-import { useKaisola, type AssistantRuntime, type AssistantThread, type AssistantTurn } from '../store/store'
+import {
+  useKaisola,
+  type AssistantDraft,
+  type AssistantMention,
+  type AssistantRuntime,
+  type AssistantSpeed,
+  type AssistantThread,
+  type AssistantTurn,
+  type QueuedAssistantPrompt,
+} from '../store/store'
 import { bridge, type AcpUpdate, type AcpControls, type AcpPreset, type AcpAgent, type AcpPermissionRequest } from '../lib/bridge'
 import { diffHunks, diffStat } from '../lib/lineDiff'
 import { ruleForRequest, ruleLabel } from '../lib/permissionRules'
@@ -12,7 +21,7 @@ import type { Paper } from '../domain/types'
 
 type Turn = AssistantTurn
 /** An @-mention of a project entity, attached to the next message as context. */
-interface Mention { id: string; kind: 'paper' | 'claim' | 'hypothesis' | 'run' | 'figure'; label: string; text: string }
+type Mention = AssistantMention
 type Runtime = AssistantRuntime
 type ControlKind = 'mode' | 'model' | 'config'
 interface UiControl { id: string; name: string; category: string; value: string; options: { value: string; name: string; description?: string }[]; kind: ControlKind }
@@ -28,6 +37,20 @@ const mentionIcon = (kind: Mention['kind']): string =>
 const doneStatuses = new Set(['completed', 'failed', 'cancelled', 'canceled'])
 /** Streaming transcript flush cadence — ~12 renders/sec regardless of token rate. */
 const STREAM_FLUSH_MS = 80
+const EMPTY_DRAFT: AssistantDraft = { text: '', attachments: [], mentions: [], speed: 'balanced' }
+const EMPTY_QUEUE: QueuedAssistantPrompt[] = []
+const SPEED_OPTIONS = [
+  { value: 'fast', name: 'Fast', description: 'Lower effort, quicker turns' },
+  { value: 'balanced', name: 'Balanced', description: 'Default agent effort' },
+  { value: 'deep', name: 'Deep', description: 'More checking before answering' },
+]
+const isAssistantSpeed = (v: string): v is AssistantSpeed => v === 'fast' || v === 'balanced' || v === 'deep'
+const speedGuidance = (speed: AssistantSpeed, nativeApplied: boolean): string => {
+  if (nativeApplied) return ''
+  if (speed === 'fast') return 'Kaisola speed: Fast. Prioritize a quick, concise answer and avoid broad exploration unless it is necessary.\n\n'
+  if (speed === 'deep') return 'Kaisola speed: Deep. Spend extra effort checking edge cases, tradeoffs, and likely failure modes before answering.\n\n'
+  return ''
+}
 // one quiet auto-connect attempt per agent+workspace per app run — module
 // scope so two side-by-side threads on the same agent can't race a double
 // connect (the second would dispose the first's fresh session)
@@ -179,6 +202,28 @@ function controlList(controls: AcpControls | null): UiControl[] {
   return list.sort((a, b) => (CATEGORY_ORDER[a.category] ?? 9) - (CATEGORY_ORDER[b.category] ?? 9))
 }
 
+function nativeSpeedControl(controls: UiControl[]): UiControl | null {
+  return controls.find((c) => {
+    if (c.kind !== 'config' || c.options.length < 2) return false
+    const haystack = `${c.id} ${c.name} ${c.category}`.toLowerCase()
+    return /speed|effort|reasoning|thought|think/.test(haystack)
+  }) ?? null
+}
+
+function speedOptionValue(c: UiControl, speed: AssistantSpeed): string | null {
+  const want =
+    speed === 'fast'
+      ? /fast|quick|low|minimal|light|none|short/
+      : speed === 'deep'
+        ? /deep|high|max|extended|thorough/
+        : /balanced|medium|auto|normal|standard|default/
+  const hit = c.options.find((o) => want.test(`${o.value} ${o.name}`.toLowerCase()))
+  if (hit) return hit.value
+  if (speed === 'fast') return c.options[0]?.value ?? null
+  if (speed === 'deep') return c.options[c.options.length - 1]?.value ?? null
+  return c.options[Math.floor((c.options.length - 1) / 2)]?.value ?? null
+}
+
 function buildContext(): string {
   const { project, stage, autonomy } = useKaisola.getState()
   const papers = project.corpus.filter((s): s is Paper => s.kind === 'paper')
@@ -221,20 +266,16 @@ export const Assistant = memo(function Assistant({ threadId }: { threadId: strin
 
   const [presets, setPresets] = useState<AcpPreset[]>([])
   const [agents, setAgents] = useState<AcpAgent[]>([])
-  const [input, setInput] = useState('')
   const [notice, setNotice] = useState<string | null>(null)
   const [authUrl, setAuthUrl] = useState<string | null>(null)
-  const [attachments, setAttachments] = useState<string[]>([])
   // an OS file drag hovering the chat — the drop lands as attachment chips
   const [fileDropHover, setFileDropHover] = useState(false)
-  const [mentions, setMentions] = useState<Mention[]>([])
   // the active "@query" being typed (null = the mention typeahead is closed)
   const [mentionQuery, setMentionQuery] = useState<string | null>(null)
   const scrollRef = useRef<HTMLDivElement>(null)
   const inputRef = useRef<HTMLTextAreaElement>(null)
   // grow the composer to fit what's typed (capped); reset to one line when empty
   const autoGrow = (el: HTMLTextAreaElement) => { el.style.height = 'auto'; el.style.height = `${Math.min(el.scrollHeight, 160)}px` }
-  useEffect(() => { if (inputRef.current && !input) inputRef.current.style.height = '' }, [input])
 
   const pendingPermissions = useKaisola((s) => s.pendingPermissions)
   const answerPermission = useKaisola((s) => s.answerPermission)
@@ -247,8 +288,20 @@ export const Assistant = memo(function Assistant({ threadId }: { threadId: strin
     threads.find((t) => t.id === threadId) ??
     threads[0] ??
     ({ id: threadId, agentKey: 'codex', busy: false } as AssistantThread)
+  const draft = useKaisola((s) => s.assistantDrafts[active.id] ?? EMPTY_DRAFT)
+  const queuedPrompts = useKaisola((s) => s.assistantPromptQueues[active.id] ?? EMPTY_QUEUE)
+  const setAssistantDraft = useKaisola((s) => s.setAssistantDraft)
+  const clearAssistantDraft = useKaisola((s) => s.clearAssistantDraft)
+  const enqueueAssistantPrompt = useKaisola((s) => s.enqueueAssistantPrompt)
+  const dequeueAssistantPrompt = useKaisola((s) => s.dequeueAssistantPrompt)
+  const removeQueuedAssistantPrompt = useKaisola((s) => s.removeQueuedAssistantPrompt)
   const agentKey = active.agentKey
   const busy = active.busy
+  const input = draft.text
+  const attachments = draft.attachments
+  const mentions = draft.mentions
+  const speed = draft.speed
+  useEffect(() => { if (inputRef.current && !input) inputRef.current.style.height = '' }, [input])
   const permsForAgent = pendingPermissions.filter((p) => p.key === agentKey)
   const arun: Runtime = liveRuntime ?? { turns: [], first: true }
   const agentPreset = presets.find((p) => p.id === agentKey)
@@ -256,6 +309,8 @@ export const Assistant = memo(function Assistant({ threadId }: { threadId: strin
   const aState = agents.find((a) => a.key === agentKey)
   const connected = !!aState?.connected
   const controls = controlList(aState?.controls ?? null)
+  const speedControl = nativeSpeedControl(controls)
+  const visibleControls = speedControl ? controls.filter((c) => c.id !== speedControl.id) : controls
   const codeAgent = /codex|claude/i.test(`${agentKey} ${agentName}`)
   const activityTools = arun.turns.filter((t) => t.kind === 'tool').slice(-8)
   const activeToolCount = activityTools.filter((t) => !doneStatuses.has((t.status || '').toLowerCase())).length
@@ -323,8 +378,10 @@ export const Assistant = memo(function Assistant({ threadId }: { threadId: strin
     const el = inputRef.current
     const caret = el?.selectionStart ?? input.length
     // drop the trailing "@query" the user typed, then attach the entity as a chip
-    setInput(input.slice(0, caret).replace(/@([\w-]*)$/, '') + input.slice(caret))
-    setMentions((m) => (m.some((x) => x.id === c.id) ? m : [...m, c]))
+    setAssistantDraft(active.id, {
+      text: input.slice(0, caret).replace(/@([\w-]*)$/, '') + input.slice(caret),
+      mentions: mentions.some((x) => x.id === c.id) ? mentions : [...mentions, c],
+    })
     setMentionQuery(null)
     setTimeout(() => inputRef.current?.focus(), 0)
   }
@@ -333,7 +390,7 @@ export const Assistant = memo(function Assistant({ threadId }: { threadId: strin
     const caret = inputRef.current?.selectionStart ?? input.length
     const before = input.slice(0, caret)
     const pad = before && !/\s$/.test(before) ? ' ' : ''
-    setInput(`${before}${pad}@${input.slice(caret)}`)
+    setAssistantDraft(active.id, { text: `${before}${pad}@${input.slice(caret)}` })
     setMentionQuery('')
     const pos = before.length + pad.length + 1
     setTimeout(() => { inputRef.current?.focus(); inputRef.current?.setSelectionRange(pos, pos) }, 0)
@@ -482,6 +539,21 @@ export const Assistant = memo(function Assistant({ threadId }: { threadId: strin
     else await bridge.acp.setConfigOption(agentKey, c.id, value)
     refresh()
   }
+  const applySpeed = async (nextSpeed: AssistantSpeed): Promise<boolean> => {
+    if (!speedControl) return false
+    const value = speedOptionValue(speedControl, nextSpeed)
+    if (!value) return false
+    if (value === speedControl.value) return true
+    const res = await bridge.acp.setConfigOption(agentKey, speedControl.id, value)
+    if (!res.ok && res.message) setNotice(res.message)
+    refresh()
+    return res.ok
+  }
+  const setSpeed = (value: string) => {
+    if (!isAssistantSpeed(value)) return
+    setAssistantDraft(active.id, { speed: value })
+    void applySpeed(value)
+  }
 
   // Chunks arrive far faster than frames paint, and every runtime update
   // re-parses the growing turn's markdown from scratch. Buffer text chunks and
@@ -552,33 +624,57 @@ export const Assistant = memo(function Assistant({ threadId }: { threadId: strin
     return { onUpdate, flush }
   }
 
+  const resetComposerHeight = () => { if (inputRef.current) inputRef.current.style.height = '' }
+  const currentPrompt = (): AssistantDraft => ({
+    text: input.trim(),
+    attachments,
+    mentions,
+    speed,
+  })
+  const queuePrompt = (prompt: AssistantDraft) => {
+    if (!prompt.text.trim()) return
+    enqueueAssistantPrompt(active.id, prompt)
+    clearAssistantDraft(active.id, { keepSpeed: true })
+    resetComposerHeight()
+    useKaisola.getState().pushToast('info', `Queued prompt for ${agentName}`)
+  }
   const send = async () => {
-    const text = input.trim()
-    if (!text || busy) return
-    // clear only once the prompt is actually on its way — a failed connect
-    // must not eat what the user typed
-    const sent = await sendText(text)
-    if (sent) setInput('')
+    const prompt = currentPrompt()
+    if (!prompt.text) return
+    if (busy) { queuePrompt(prompt); return }
+    void sendText(prompt, { clearDraft: true, restoreOnFailure: true })
   }
   /** The composer's send, callable with explicit text (the ⌘L bar uses it). */
-  const sendText = async (text: string): Promise<boolean> => {
-    if (!text || busy) return false
+  const sendText = async (
+    promptOrText: string | AssistantDraft,
+    opts: { clearDraft?: boolean; restoreOnFailure?: boolean } = {},
+  ): Promise<boolean> => {
+    const prompt: AssistantDraft =
+      typeof promptOrText === 'string'
+        ? { ...EMPTY_DRAFT, text: promptOrText.trim(), speed }
+        : { ...promptOrText, text: promptOrText.text.trim(), speed: promptOrText.speed ?? speed }
+    if (!prompt.text) return false
+    if (useKaisola.getState().assistantThreads.find((t) => t.id === active.id)?.busy) return false
     if (!connected) { const ok = await connect(agentKey); if (!ok) return false }
     const threadId = active.id
-    const first = arun.first
-    const files = attachments
-    const mns = mentions
-    setAttachments([])
-    setMentions([])
+    if (useKaisola.getState().assistantThreads.find((t) => t.id === threadId)?.busy) return false
+    const first = (useKaisola.getState().assistantRuntimes[threadId] ?? arun).first
+    const files = prompt.attachments
+    const mns = prompt.mentions
     const refLine = [...mns.map((m) => `@${m.label}`), ...files.map((f) => `📎 ${f.split('/').pop() ?? ''}`)].join('  ·  ')
-    const shownText = refLine ? `${text}\n\n${refLine}` : text
-    autoNameThread(threadId, text) // first message → the session's topic title
+    const shownText = refLine ? `${prompt.text}\n\n${refLine}` : prompt.text
+    autoNameThread(threadId, prompt.text) // first message → the session's topic title
     const userTurn: Turn = { kind: 'user', text: shownText, at: Date.now() }
     updateRuntime(threadId, (r) => ({ ...r, turns: [...r.turns, userTurn], first: false }))
     setThreadBusy(threadId, true)
+    if (opts.clearDraft) {
+      clearAssistantDraft(threadId, { keepSpeed: true })
+      resetComposerHeight()
+    }
     const mentionPrefix = mns.length ? `Referenced from the research project (use if relevant):\n${mns.map((m) => `- ${m.text}`).join('\n')}\n\n` : ''
     const filePrefix = files.length ? `Attached files (read them if relevant):\n${files.join('\n')}\n\n` : ''
-    const payload = `${first ? `${buildContext()}\n\n` : ''}${mentionPrefix}${filePrefix}${text}`
+    const nativeSpeedApplied = await applySpeed(prompt.speed)
+    const payload = `${speedGuidance(prompt.speed, nativeSpeedApplied)}${first ? `${buildContext()}\n\n` : ''}${mentionPrefix}${filePrefix}${prompt.text}`
     // image attachments ALSO ride as real ACP image blocks (pixels, not a
     // path) for agents that take them; the path stays in filePrefix above as
     // the text-only fallback. Unreadable/oversized images just stay paths.
@@ -593,7 +689,12 @@ export const Assistant = memo(function Assistant({ threadId }: { threadId: strin
       )
     ).filter((i): i is { mimeType: string; data: string } => i !== null)
     const stream = makeOnUpdate(threadId)
-    const res = await bridge.acp.prompt(agentKey, payload, stream.onUpdate, images.length ? images : undefined)
+    let res: { ok: boolean; stopReason?: string; message?: string }
+    try {
+      res = await bridge.acp.prompt(agentKey, payload, stream.onUpdate, images.length ? images : undefined)
+    } catch (err) {
+      res = { ok: false, message: String((err as Error)?.message ?? err) }
+    }
     stream.flush() // drain any buffered tail before settling the turn
     updateRuntime(threadId, (r) => {
       let turns = r.turns
@@ -618,10 +719,33 @@ export const Assistant = memo(function Assistant({ threadId }: { threadId: strin
         r.turns[r.turns.length - 1] === userTurn ? { ...r, turns: r.turns.slice(0, -1), first } : r,
       )
       if (res.message) { setNotice(res.message); refresh() }
+      if (opts.restoreOnFailure) {
+        const cur = useKaisola.getState().assistantDrafts[threadId] ?? EMPTY_DRAFT
+        if (!cur.text && cur.attachments.length === 0 && cur.mentions.length === 0) setAssistantDraft(threadId, prompt)
+      }
       return false
     }
     return true
   }
+  const drainingQueueRef = useRef(false)
+  const queuePausedRef = useRef(false)
+  useEffect(() => { if (connected) queuePausedRef.current = false }, [connected])
+  useEffect(() => {
+    if (!connected || busy || queuePausedRef.current || drainingQueueRef.current || queuedPrompts.length === 0) return
+    const next = dequeueAssistantPrompt(active.id)
+    if (!next) return
+    drainingQueueRef.current = true
+    void sendText(next).then((sent) => {
+      if (!sent) {
+        enqueueAssistantPrompt(active.id, next, { front: true })
+        queuePausedRef.current = true
+        useKaisola.getState().pushToast('warn', `${agentName} queue paused`)
+      }
+    }).finally(() => {
+      drainingQueueRef.current = false
+    })
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [connected, busy, queuedPrompts.length, active.id])
   // the ⌘L bar hands prompts to threads through the store — deliver ours once
   const omniPrompt = useKaisola((s) => s.omniPrompt)
   const omniSeqRef = useRef(0)
@@ -630,9 +754,14 @@ export const Assistant = memo(function Assistant({ threadId }: { threadId: strin
     omniSeqRef.current = omniPrompt.seq
     useKaisola.getState().clearOmniPrompt()
     const text = omniPrompt.text
+    if (busy) {
+      enqueueAssistantPrompt(active.id, { ...EMPTY_DRAFT, text: text.trim(), speed })
+      useKaisola.getState().pushToast('info', `Queued prompt for ${agentName}`)
+      return
+    }
     void sendText(text).then((sent) => {
       // never swallow a ⌘L prompt silently — busy/unconnected must SAY so
-      if (!sent) useKaisola.getState().pushToast('info', busy ? 'Agent is mid-turn — send it again when it finishes.' : 'Prompt not sent — the agent could not connect.')
+      if (!sent) useKaisola.getState().pushToast('info', 'Prompt not sent — the agent could not connect.')
     })
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [omniPrompt, threadId])
@@ -643,7 +772,7 @@ export const Assistant = memo(function Assistant({ threadId }: { threadId: strin
   }
   const attach = async () => {
     const r = await bridge.pickFiles()
-    if (r.ok && r.paths) setAttachments((a) => [...new Set([...a, ...r.paths!])])
+    if (r.ok && r.paths) setAssistantDraft(active.id, { attachments: [...new Set([...attachments, ...r.paths])] })
   }
   // the foot's agent picker re-points the active thread to a different agent
   const setThreadAgent = (key: string) => {
@@ -674,7 +803,7 @@ export const Assistant = memo(function Assistant({ threadId }: { threadId: strin
         e.stopPropagation() // the window-level handler would open it as a file tab
         const paths = files.map((f) => bridge.pathForFile?.(f)).filter(Boolean) as string[]
         if (!paths.length) return
-        setAttachments((a) => [...new Set([...a, ...paths])])
+        setAssistantDraft(active.id, { attachments: [...new Set([...attachments, ...paths])] })
         inputRef.current?.focus()
       }}
     >
@@ -818,7 +947,7 @@ export const Assistant = memo(function Assistant({ threadId }: { threadId: strin
             {attachments.map((f) => (
               <span key={f} className="attach-chip" title={f}>
                 <Icon name="Paperclip" size={11} /> {f.split('/').pop()}
-                <button onClick={() => setAttachments((a) => a.filter((x) => x !== f))}><Icon name="X" size={10} /></button>
+                <button onClick={() => setAssistantDraft(active.id, { attachments: attachments.filter((x) => x !== f) })}><Icon name="X" size={10} /></button>
               </span>
             ))}
           </div>
@@ -828,7 +957,21 @@ export const Assistant = memo(function Assistant({ threadId }: { threadId: strin
             {mentions.map((mn) => (
               <span key={mn.id} className="attach-chip" title={mn.text}>
                 <Icon name={mentionIcon(mn.kind)} size={11} /> {mn.label.length > 30 ? `${mn.label.slice(0, 30)}…` : mn.label}
-                <button onClick={() => setMentions((a) => a.filter((x) => x.id !== mn.id))}><Icon name="X" size={10} /></button>
+                <button onClick={() => setAssistantDraft(active.id, { mentions: mentions.filter((x) => x.id !== mn.id) })}><Icon name="X" size={10} /></button>
+              </span>
+            ))}
+          </div>
+        )}
+        {queuedPrompts.length > 0 && (
+          <div className="composer-queue">
+            <span className="composer-queue-label">
+              <Icon name="ListChecks" size={11} /> {queuedPrompts.length} queued
+            </span>
+            {queuedPrompts.slice(0, 4).map((q) => (
+              <span key={q.id} className="queue-chip" title={q.text}>
+                <Icon name={q.speed === 'fast' ? 'Gauge' : q.speed === 'deep' ? 'Brain' : 'Circle'} size={10} />
+                {q.text.length > 34 ? `${q.text.slice(0, 34)}…` : q.text}
+                <button onClick={() => removeQueuedAssistantPrompt(active.id, q.id)}><Icon name="X" size={9} /></button>
               </span>
             ))}
           </div>
@@ -863,7 +1006,7 @@ export const Assistant = memo(function Assistant({ threadId }: { threadId: strin
           ref={inputRef}
           className="composer-input"
           value={input}
-          onChange={(e) => { const v = e.target.value; setInput(v); autoGrow(e.currentTarget); detectMention(v, e.target.selectionStart ?? v.length) }}
+          onChange={(e) => { const v = e.target.value; setAssistantDraft(active.id, { text: v }); autoGrow(e.currentTarget); detectMention(v, e.target.selectionStart ?? v.length) }}
           onKeyDown={(e) => {
             if (mentionQuery != null && mentionCandidates.length > 0) {
               if (e.key === 'Enter') { e.preventDefault(); pickMention(mentionCandidates[0]); return }
@@ -878,14 +1021,22 @@ export const Assistant = memo(function Assistant({ threadId }: { threadId: strin
         <div className="composer-bar">
           <button className="composer-tool" onClick={attach} title="Attach files"><Icon name="Paperclip" size={14} /></button>
           <button className="composer-tool" onClick={insertMention} title="Reference a paper, claim, hypothesis, run or figure"><Icon name="AtSign" size={14} /></button>
-          {controls.map((c) => (
+          <Dropdown icon="Gauge" value={speed} options={SPEED_OPTIONS} onSelect={setSpeed} title="Speed" />
+          {visibleControls.map((c) => (
             <Dropdown key={c.id} icon={CATEGORY_ICON[c.category]} value={c.value} options={c.options} onSelect={(v) => onControlChange(c, v)} title={c.name} />
           ))}
           <span className="grow" />
           {busy ? (
-            <button className="composer-send composer-stop" onClick={cancelActive} title="Stop output">
-              <Icon name="Square" size={11} />
-            </button>
+            <>
+              {input.trim() && (
+                <button className="composer-send composer-queue-send" onClick={send} title="Queue prompt  ⏎">
+                  <Icon name="ListPlus" size={13} />
+                </button>
+              )}
+              <button className="composer-send composer-stop" onClick={cancelActive} title="Stop output">
+                <Icon name="Square" size={11} />
+              </button>
+            </>
           ) : (
             <button className="composer-send" onClick={send} disabled={!input.trim()} title="Send  ⏎">
               <Icon name="ArrowUp" size={14} />

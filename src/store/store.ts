@@ -141,6 +141,27 @@ export interface AssistantRuntime {
   thinkStart?: number
 }
 
+export type AssistantSpeed = 'fast' | 'balanced' | 'deep'
+
+export interface AssistantMention {
+  id: string
+  kind: 'paper' | 'claim' | 'hypothesis' | 'run' | 'figure'
+  label: string
+  text: string
+}
+
+export interface AssistantDraft {
+  text: string
+  attachments: string[]
+  mentions: AssistantMention[]
+  speed: AssistantSpeed
+}
+
+export interface QueuedAssistantPrompt extends AssistantDraft {
+  id: string
+  queuedAt: number
+}
+
 export interface FileSessionTab {
   path: string
   mode: 'preview' | 'edit' | 'split'
@@ -338,6 +359,31 @@ export interface Workflow {
 }
 
 export type ToastKind = 'info' | 'success' | 'warn' | 'error'
+
+const emptyAssistantDraft = (speed: AssistantSpeed = 'balanced'): AssistantDraft => ({
+  text: '',
+  attachments: [],
+  mentions: [],
+  speed,
+})
+
+const normalizeAssistantDraft = (draft?: Partial<AssistantDraft> | null): AssistantDraft => ({
+  text: draft?.text ?? '',
+  attachments: Array.isArray(draft?.attachments) ? draft.attachments.filter((x): x is string => typeof x === 'string') : [],
+  mentions: Array.isArray(draft?.mentions)
+    ? draft.mentions.filter((m): m is AssistantMention =>
+        !!m &&
+        typeof m.id === 'string' &&
+        ['paper', 'claim', 'hypothesis', 'run', 'figure'].includes((m as AssistantMention).kind) &&
+        typeof m.label === 'string' &&
+        typeof m.text === 'string',
+      )
+    : [],
+  speed: draft?.speed === 'fast' || draft?.speed === 'deep' ? draft.speed : 'balanced',
+})
+
+const assistantDraftIsEmpty = (draft: AssistantDraft) =>
+  !draft.text && draft.attachments.length === 0 && draft.mentions.length === 0 && draft.speed === 'balanced'
 /** An ephemeral notification — EVENTS (done/failed/ready), never ongoing work.
  *  Session-scoped (not persisted); the Activity feed is the persistent record. */
 export interface Toast {
@@ -444,6 +490,7 @@ function provenanceKey(link: ProvenanceLink): string {
 export const PROJECT_SLICE_PERSIST_KEYS = [
   'project', 'stage', 'workspacePath', 'autonomy', 'agentPreset', 'claudeAccountId', 'fileTabs', 'openFilePath',
   'repoCheckpoints', 'followAgent', 'annotations', 'assistantThreads', 'assistantRuntimes',
+  'assistantDrafts', 'assistantPromptQueues',
   'activeThreadId', 'terminals', 'panels', 'sessionGroups', 'pinnedSessions', 'worktreeSessions',
   'latexMode', 'dockGrid', 'dockViews', 'dockColWeights', 'canvasWidth', 'canvasOpen', 'dockOpen',
 ] as const
@@ -614,6 +661,10 @@ interface KaisolaState {
   assistantThreads: AssistantThread[]
   /** Durable per-thread chat turns. */
   assistantRuntimes: Record<string, AssistantRuntime>
+  /** Durable composer state per assistant thread. */
+  assistantDrafts: Record<string, AssistantDraft>
+  /** Prompts accepted while a thread is busy; drained FIFO after each turn. */
+  assistantPromptQueues: Record<string, QueuedAssistantPrompt[]>
   /** Which assistant thread is currently shown. */
   activeThreadId: string
   /** Which ACP agent preset to connect (the registry choice). */
@@ -836,6 +887,11 @@ interface KaisolaState {
   setThreadAcpSession: (id: string, sessionId: string | undefined) => void
   updateAssistantRuntime: (id: string, fn: (runtime: AssistantRuntime) => AssistantRuntime) => void
   resetAssistantRuntime: (id: string) => void
+  setAssistantDraft: (id: string, patch: Partial<AssistantDraft>) => void
+  clearAssistantDraft: (id: string, opts?: { keepSpeed?: boolean }) => void
+  enqueueAssistantPrompt: (id: string, prompt: AssistantDraft, opts?: { front?: boolean }) => string
+  dequeueAssistantPrompt: (id: string) => QueuedAssistantPrompt | undefined
+  removeQueuedAssistantPrompt: (id: string, promptId: string) => void
   reorderAssistantThreads: (srcId: string, destId: string) => void
   setThreadBusy: (id: string, busy: boolean) => void
   /** `pane` deep-links a Settings section (e.g. 'agents') — cleared on close. */
@@ -1352,6 +1408,8 @@ const freshSlice = (pid: string, path: string | null = null): ProjectSliceMemory
     annotations: [],
     assistantThreads: [{ id: threadId, agentKey: 'codex', busy: false }],
     assistantRuntimes: {},
+    assistantDrafts: {},
+    assistantPromptQueues: {},
     activeThreadId: threadId,
     terminals: [{ id: term, cwd: path ?? undefined }],
     panels: [],
@@ -1359,12 +1417,14 @@ const freshSlice = (pid: string, path: string | null = null): ProjectSliceMemory
     pinnedSessions: [],
     worktreeSessions: {},
     latexMode: false,
-    dockGrid: [[term]],
-    dockViews: [term],
+    // a NEW empty tab is a clean homescreen — just the launcher, no cards; a
+    // tab born onto a folder still docks its terminal like before
+    dockGrid: path ? [[term]] : [],
+    dockViews: path ? [term] : [],
     dockColWeights: null,
     canvasWidth: null,
     canvasOpen: true,
-    dockOpen: true,
+    dockOpen: !!path,
     ...freshMemory(),
   }
 }
@@ -1404,6 +1464,25 @@ function sanitizeSliceForPersist(slice: ProjectSliceMemory): ProjectSlicePersist
       .filter(([id]) => assistantThreads.some((t) => t.id === id))
       .map(([id, runtime]) => [id, { turns: runtime.turns.slice(-200), first: runtime.first }]),
   )
+  const liveThreadIds = new Set(assistantThreads.map((t) => t.id))
+  const assistantDrafts = Object.fromEntries(
+    Object.entries(slice.assistantDrafts ?? {})
+      .filter(([id]) => liveThreadIds.has(id))
+      .map(([id, draft]) => [id, normalizeAssistantDraft(draft)])
+      .filter(([, draft]) => !assistantDraftIsEmpty(draft as AssistantDraft)),
+  )
+  const assistantPromptQueues = Object.fromEntries(
+    Object.entries(slice.assistantPromptQueues ?? {})
+      .filter(([id]) => liveThreadIds.has(id))
+      .map(([id, queue]) => [
+        id,
+        (Array.isArray(queue) ? queue : [])
+          .map((q) => ({ ...normalizeAssistantDraft(q), id: q.id || uid('qp'), queuedAt: Number(q.queuedAt) || Date.now() }))
+          .filter((q) => q.text.trim())
+          .slice(0, 20),
+      ])
+      .filter(([, queue]) => (queue as QueuedAssistantPrompt[]).length),
+  )
   return {
     project: slice.project,
     stage: slice.stage,
@@ -1418,6 +1497,8 @@ function sanitizeSliceForPersist(slice: ProjectSliceMemory): ProjectSlicePersist
     annotations: slice.annotations.slice(-500),
     assistantThreads,
     assistantRuntimes,
+    assistantDrafts,
+    assistantPromptQueues,
     activeThreadId,
     terminals,
     panels,
@@ -1601,6 +1682,8 @@ function migrateFlatV5(persisted: unknown): Partial<KaisolaState> {
     agentPreset: chatAgent(state.agentPreset),
     assistantThreads,
     assistantRuntimes: state.assistantRuntimes ?? {},
+    assistantDrafts: state.assistantDrafts ?? {},
+    assistantPromptQueues: state.assistantPromptQueues ?? {},
     activeThreadId,
     terminals,
     agentTerminals: [],
@@ -1681,6 +1764,8 @@ export const useKaisola = create<KaisolaState>()(
   signIn: null,
   assistantThreads: [{ id: 'a1', agentKey: 'codex', busy: false }],
   assistantRuntimes: {},
+  assistantDrafts: {},
+  assistantPromptQueues: {},
   activeThreadId: 'a1',
   agentPreset: 'codex',
   agentRunning: {},
@@ -2110,7 +2195,11 @@ export const useKaisola = create<KaisolaState>()(
       if ('fgProcess' in patch) {
         const t = s.terminals.find((x) => x.id === id)
         const fg = String(patch.fgProcess || '')
-        if (t && !t.singletonKey && /^claude\b/.test(fg)) {
+        // NEVER adopt a login terminal (`claude /login`): stamping it with
+        // restart:true + `claude --continue` made the transient sign-in pane
+        // immortal — it re-persisted, re-booted, and refused to close.
+        const isLogin = /\/login\b/.test(t?.boot ?? '')
+        if (t && !t.singletonKey && !isLogin && /^claude\b/.test(fg)) {
           terminals = s.terminals.map((x) =>
             x.id === id
               ? { ...x, singletonKey: `agent:claude-cli-${id}`, restart: true, boot: 'claude --continue', name: x.name ?? 'Claude' }
@@ -2554,6 +2643,10 @@ export const useKaisola = create<KaisolaState>()(
       const assistantRuntimes = { ...s.assistantRuntimes }
       const runtime = assistantRuntimes[id]
       delete assistantRuntimes[id]
+      const assistantDrafts = { ...s.assistantDrafts }
+      delete assistantDrafts[id]
+      const assistantPromptQueues = { ...s.assistantPromptQueues }
+      delete assistantPromptQueues[id]
       const activeThreadId = s.activeThreadId === id ? next[next.length - 1]?.id ?? '' : s.activeThreadId
       const grid = gridWithout(s.dockGrid, id)
       const fallback = next[next.length - 1]?.id ?? s.terminals[0]?.id
@@ -2562,6 +2655,8 @@ export const useKaisola = create<KaisolaState>()(
       return {
         assistantThreads: next,
         assistantRuntimes,
+        assistantDrafts,
+        assistantPromptQueues,
         activeThreadId,
         needsYou,
         closedStack: closing
@@ -2594,6 +2689,53 @@ export const useKaisola = create<KaisolaState>()(
     }),
   resetAssistantRuntime: (id) =>
     set((s) => ({ assistantRuntimes: { ...s.assistantRuntimes, [id]: { turns: [], first: true } } })),
+  setAssistantDraft: (id, patch) =>
+    set((s) => {
+      const draft = normalizeAssistantDraft({ ...(s.assistantDrafts[id] ?? emptyAssistantDraft()), ...patch })
+      const assistantDrafts = { ...s.assistantDrafts }
+      if (assistantDraftIsEmpty(draft)) delete assistantDrafts[id]
+      else assistantDrafts[id] = draft
+      return { assistantDrafts }
+    }),
+  clearAssistantDraft: (id, opts) =>
+    set((s) => {
+      const prev = normalizeAssistantDraft(s.assistantDrafts[id])
+      const next = opts?.keepSpeed ? emptyAssistantDraft(prev.speed) : emptyAssistantDraft()
+      const assistantDrafts = { ...s.assistantDrafts }
+      if (assistantDraftIsEmpty(next)) delete assistantDrafts[id]
+      else assistantDrafts[id] = next
+      return { assistantDrafts }
+    }),
+  enqueueAssistantPrompt: (id, prompt, opts) => {
+    const queued: QueuedAssistantPrompt = { ...normalizeAssistantDraft(prompt), id: uid('qp'), queuedAt: Date.now() }
+    if (!queued.text.trim()) return queued.id
+    set((s) => {
+      const current = s.assistantPromptQueues[id] ?? []
+      const next = opts?.front ? [queued, ...current].slice(0, 20) : [...current, queued].slice(-20)
+      return { assistantPromptQueues: { ...s.assistantPromptQueues, [id]: next } }
+    })
+    return queued.id
+  },
+  dequeueAssistantPrompt: (id) => {
+    const queue = get().assistantPromptQueues[id] ?? []
+    const [next, ...rest] = queue
+    if (!next) return undefined
+    set((s) => {
+      const assistantPromptQueues = { ...s.assistantPromptQueues }
+      if (rest.length) assistantPromptQueues[id] = rest
+      else delete assistantPromptQueues[id]
+      return { assistantPromptQueues }
+    })
+    return next
+  },
+  removeQueuedAssistantPrompt: (id, promptId) =>
+    set((s) => {
+      const rest = (s.assistantPromptQueues[id] ?? []).filter((p) => p.id !== promptId)
+      const assistantPromptQueues = { ...s.assistantPromptQueues }
+      if (rest.length) assistantPromptQueues[id] = rest
+      else delete assistantPromptQueues[id]
+      return { assistantPromptQueues }
+    }),
   reorderAssistantThreads: (srcId, destId) =>
     set((s) => {
       if (srcId === destId) return s
@@ -3998,7 +4140,7 @@ export const useKaisola = create<KaisolaState>()(
       if (targetId === s.activeProjectId || !s.projectTabs.some((t) => t.id === targetId)) return s
       const outgoing = pick(s, PROJECT_SLICE_MEMORY_KEYS)
       const { [targetId]: incoming, ...restBg } = s.projectSlices
-      const target = incoming ?? freshSlice(targetId)
+      const target = incoming ? { ...freshSlice(targetId), ...incoming } : freshSlice(targetId)
       return {
         activeProjectId: targetId,
         projectSlices: { ...restBg, [s.activeProjectId]: outgoing },
@@ -4303,7 +4445,7 @@ export const useKaisola = create<KaisolaState>()(
         // background slices persist only bucket A — re-seed their in-memory
         // bucket D empty so a later switch hoists a complete slice.
         const bgHydrated: Record<string, ProjectSliceMemory> = {}
-        for (const [id, sl] of Object.entries(bg)) bgHydrated[id] = { ...freshMemory(), ...sl }
+        for (const [id, sl] of Object.entries(bg)) bgHydrated[id] = { ...freshSlice(id), ...freshMemory(), ...sl }
         return {
           ...cur, // defaults + ACTION FUNCTIONS (must be first)
           ...pickGlobals(p), // bucket B + C

@@ -763,6 +763,37 @@
 }
 .attach-chip button { display: inline-flex; color: var(--text-3); }
 .attach-chip button:hover { color: var(--text-0); }
+.composer-queue {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: var(--sp-2);
+  padding: var(--sp-3) var(--sp-4) 0;
+}
+.composer-queue-label,
+.queue-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--sp-2);
+  min-height: 21px;
+  max-width: 240px;
+  font-size: var(--fs-11);
+  color: var(--text-2);
+  white-space: nowrap;
+}
+.composer-queue-label {
+  color: var(--text-3);
+}
+.queue-chip {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  background: var(--bg-3);
+  border: 1px solid var(--border-faint);
+  border-radius: var(--r-1);
+  padding: 1px var(--sp-2) 1px var(--sp-3);
+}
+.queue-chip button { display: inline-flex; color: var(--text-3); flex-shrink: 0; }
+.queue-chip button:hover { color: var(--text-0); }
 .composer-bar {
   display: flex;
   align-items: center;
@@ -793,6 +824,13 @@
 }
 .composer-send:hover { background: var(--accent-hover); }
 .composer-send:disabled { background: var(--bg-4); color: var(--text-3); }
+.composer-queue-send {
+  background: var(--bg-4);
+  color: var(--text-1);
+}
+.composer-queue-send:hover {
+  background: var(--bg-5);
+}
 .assistant-stream {
   flex: 1;
   overflow-y: auto;

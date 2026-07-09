@@ -160,6 +160,8 @@ export interface AssistantRuntime {
   thinkStart?: number
   /** The agent's live plan (sessionUpdate:'plan'), replaced wholesale per frame. */
   plan?: PlanEntry[]
+  /** The agent's REAL context window (ACP usage_update), when it reports one. */
+  usage?: { used: number; size: number }
 }
 
 export type AssistantSpeed = 'fast' | 'balanced' | 'deep'

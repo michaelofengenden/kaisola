@@ -711,7 +711,15 @@ export const Assistant = memo(function Assistant({ threadId }: { threadId: strin
       const kind = u.sessionUpdate
       if (kind === 'agent_message_chunk') buffer('assistant', u.content?.text ?? u.text ?? '')
       else if (kind === 'agent_thought_chunk') buffer('thought', u.content?.text ?? u.text ?? '')
-      else if (kind === 'plan') {
+      else if (kind === 'usage_update') {
+        // the agent's own context-window numbers — trust them over any estimate
+        const uu = u as { usedTokens?: number; used?: number; maxTokens?: number; size?: number; contextWindow?: { used?: number; size?: number } }
+        const used = uu.usedTokens ?? uu.used ?? uu.contextWindow?.used
+        const size = uu.maxTokens ?? uu.size ?? uu.contextWindow?.size
+        if (typeof used === 'number' && typeof size === 'number' && size > 0) {
+          updateRuntime(threadId, (r) => ({ ...r, usage: { used, size } }))
+        }
+      } else if (kind === 'plan') {
         // the agent's own todo list — whole-array replace per frame (Zed's
         // update_plan semantics), rendered as the pinned strip, never a turn
         const entries = (u as { entries?: PlanEntry[] }).entries
@@ -1124,7 +1132,13 @@ export const Assistant = memo(function Assistant({ threadId }: { threadId: strin
         <details className="context-ledger">
           <summary>
             <Icon name="Database" size={12} />
-            Context · {contextLedger.length} item{contextLedger.length === 1 ? '' : 's'} · ~{contextTokenEstimate} tokens
+            {arun.usage
+              ? <>Context · {Math.round((arun.usage.used / arun.usage.size) * 100)}% of {Math.round(arun.usage.size / 1000)}k
+                  <span className="ctx-meter" data-hot={arun.usage.used / arun.usage.size > 0.7 || undefined}>
+                    <span className="ctx-meter-fill" style={{ width: `${Math.min(100, Math.round((arun.usage.used / arun.usage.size) * 100))}%` }} />
+                  </span>
+                  · {contextLedger.length} item{contextLedger.length === 1 ? '' : 's'}</>
+              : <>Context · {contextLedger.length} item{contextLedger.length === 1 ? '' : 's'} · ~{contextTokenEstimate} tokens</>}
           </summary>
           <div className="context-ledger-list">
             {contextLedger.map((row) => (

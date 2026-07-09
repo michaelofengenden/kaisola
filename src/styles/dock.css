@@ -1509,3 +1509,24 @@ details.assistant-tool.tool-artifacts > summary::-webkit-details-marker { displa
   padding: 1px 7px;
   flex-shrink: 0;
 }
+
+/* the real context meter (ACP usage_update): a thin fill that warms past 70%
+   — the agent auto-compacts itself around ~80%, Kaisola only forecasts */
+.ctx-meter {
+  display: inline-block;
+  width: 64px;
+  height: 4px;
+  margin: 0 var(--sp-2);
+  border-radius: 2px;
+  background: var(--bg-inset);
+  overflow: hidden;
+  vertical-align: middle;
+}
+.ctx-meter-fill {
+  display: block;
+  height: 100%;
+  border-radius: 2px;
+  background: var(--accent);
+  transition: width var(--dur-2) var(--ease-out);
+}
+.ctx-meter[data-hot] .ctx-meter-fill { background: var(--warning, #d8a44a); }

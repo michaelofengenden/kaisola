@@ -107,6 +107,7 @@ async function handlePrompt(reqId, params) {
       { content: 'Patch the null guard', priority: 'high', status: 'completed' },
       { content: 'Re-run the suite', priority: 'medium', status: 'in_progress' },
     ] })
+    update(sid, { sessionUpdate: 'usage_update', usedTokens: 68000, maxTokens: 200000 })
     text(sid, 'plan exercised.')
     send({ jsonrpc: '2.0', id: reqId, result: { stopReason: 'end_turn' } })
     return

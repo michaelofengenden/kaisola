@@ -155,14 +155,19 @@ function AgentPulse() {
   const latest = feed[0]
   if (!latest) return null
   const running = latest.kind !== 'stop'
+  // speak in sentences, not raw feed fragments: name the speaker, then the
+  // event — an unattributed echo of your own prompt read as debris up here
+  const speaker = latest.kind === 'prompt' ? 'You' : latest.kind === 'tool' || latest.kind === 'stop' ? 'Claude' : null
+  const line = latest.kind === 'stop' ? 'finished the turn' : latest.text
   return (
     <button
       className="agent-pulse"
       data-running={running}
       onClick={() => { if (latest.path) requestFile(latest.path) }}
-      title={latest.path ? `${latest.text} — click to open` : latest.text}
+      title={latest.path ? `${line} — click to open` : line}
     >
-      <span className="grow truncate">{latest.text}</span>
+      {speaker && <span className="agent-pulse-k">{speaker}</span>}
+      <span className="grow truncate">{line}</span>
     </button>
   )
 }

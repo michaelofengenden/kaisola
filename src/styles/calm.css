@@ -116,7 +116,9 @@
   padding: 0 var(--sp-3);
   margin-bottom: var(--sp-2);
   border-radius: var(--r-2);
-  font-size: var(--fs-12);
+  /* 13px, one size up: 12px Inter over the translucent rail veil was the
+     "can't read the sidebar" complaint — the tree is primary text, not a caption */
+  font-size: var(--fs-13);
   font-weight: var(--fw-semibold);
   color: var(--text-1);
   text-align: left;
@@ -134,10 +136,10 @@
   display: flex;
   align-items: center;
   gap: var(--sp-2);
-  height: 25px;
+  height: 26px;
   padding-right: var(--sp-3);
   border-radius: var(--r-2);
-  font-size: var(--fs-12);
+  font-size: var(--fs-13); /* matches .fx-root — see the readability note there */
   color: var(--text-1);
   text-align: left;
   width: 100%;
@@ -152,9 +154,10 @@
 .fx-caret { width: 12px; flex-shrink: 0; color: var(--text-3); display: inline-flex; }
 .fx-icon { flex-shrink: 0; color: var(--text-3); }
 .fx-row[data-active='true'] .fx-icon { color: var(--accent); }
-/* inline git state, Zed-style: tint the NAME, not a gutter column */
-.fx-row[data-git='modified'] .truncate { color: var(--warn); }
-.fx-row[data-git='added'] .truncate { color: var(--success); }
+/* inline git state, Zed-style: tint the NAME, not a gutter column — mixed
+   toward primary text so tinted names keep contrast on the glass veil */
+.fx-row[data-git='modified'] .truncate { color: color-mix(in srgb, var(--warn) 72%, var(--text-0)); }
+.fx-row[data-git='added'] .truncate { color: color-mix(in srgb, var(--success) 72%, var(--text-0)); }
 .fx-git-dot {
   width: 5px;
   height: 5px;

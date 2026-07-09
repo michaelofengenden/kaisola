@@ -2,13 +2,14 @@ import { bridge, isDesktop } from './bridge'
 import { useKaisola } from '../store/store'
 
 /**
- * Wallpaper-sampled glass wash. The chrome veils (--wash-strip-color /
- * --wash-rail-color, shell.css) default to per-theme constants — the exact
- * colors the old blur(1600px) chrome converged to. Sampling retints them
- * toward the average color of the desktop under the window, which is the one
- * thing the CSS blur could never see. Alphas stay untouched: they ARE the
- * chrome's ink level. Every failure path leaves the defaults — the
- * pre-sampling look — so this can only ever add fidelity.
+ * Wallpaper-sampled glass wash. The rail veil (--wash-rail-color, shell.css)
+ * defaults to a per-theme constant — the exact color the old blur(1600px)
+ * chrome converged to. Sampling retints it toward the average color of the
+ * desktop under the window, which is the one thing the CSS blur could never
+ * see. Alphas stay untouched: they ARE the chrome's ink level. Every failure
+ * path leaves the defaults — the pre-sampling look — so this can only ever
+ * add fidelity. (The tab strip carries no veil anymore — it sits on the bare
+ * glass field, so there is nothing to retint up there.)
  *
  * Also caches the pre-blurred wallpaper copy + screen geometry for the
  * painted-mode background layer (--wallpaper-img/-size, .app-wallpaper).
@@ -17,10 +18,10 @@ import { useKaisola } from '../store/store'
 /** How much of the wallpaper's color the veils adopt (0 = today's constants). */
 const WALLPAPER_TINT = 0.22
 
-// base veil colors per theme — keep in sync with the shell.css defaults
+// base veil color per theme — keep in sync with the shell.css defaults
 const VEIL_BASE = {
-  light: { strip: [255, 255, 254], rail: [255, 254, 254] },
-  dark: { strip: [11, 13, 18], rail: [11, 12, 17] },
+  light: { rail: [255, 254, 254] },
+  dark: { rail: [11, 12, 17] },
 } as const
 
 let screenRect: { x: number; y: number; w: number; h: number } | null = null
@@ -54,11 +55,9 @@ async function apply() {
         .map((c, i) => Math.round(c + ([s.avg!.r, s.avg!.g, s.avg!.b][i] - c) * WALLPAPER_TINT))
         .join(' ')
     const base = VEIL_BASE[useKaisola.getState().theme]
-    root.style.setProperty('--wash-strip-color', mix(base.strip))
     root.style.setProperty('--wash-rail-color', mix(base.rail))
   } else {
-    // Settings → Interface switch OFF: veils stay the theme constants
-    root.style.removeProperty('--wash-strip-color')
+    // Settings → Interface switch OFF: the veil stays the theme constant
     root.style.removeProperty('--wash-rail-color')
   }
   if (s.blurDataUrl && s.screen) {

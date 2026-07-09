@@ -1713,7 +1713,10 @@ export const useKaisola = create<KaisolaState>()(
   // energy. Existing installs keep whatever they chose (persisted/migrated).
   perfMode: 'painted' as PerfMode,
   railWidth: null,
-  railOpen: true,
+  // Traycer-style quiet start: fresh installs open on the canvas alone; ⌘B
+  // (or the strip's panel button) summons the rail. Existing installs keep
+  // their persisted choice.
+  railOpen: false,
   claudeSessions: {},
   claudeAccounts: [],
   claudeAccountId: '',

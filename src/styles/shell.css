@@ -13,13 +13,13 @@
      which stretched the blur's 8-bit steps into visible bands in light theme */
   --app-active-glass-lift-top: 45%;
   --app-active-glass-lift-bottom: 30%;
-  /* chrome veils — the PAINTED constants the old blur(1600px) chrome
-     converged to (kernel wider than the window ⇒ the filter collapsed to a
-     per-theme rgba constant; these were solved from before/after capture
-     means, glassprobe.cjs). Wallpaper sampling (glassWash.ts) retints the
-     colors so the chrome tracks the desktop; the alphas ARE the look. */
-  --wash-strip-color: 255 255 254;
-  --wash-strip-alpha: 44%;
+  /* chrome veil — the PAINTED constant the old blur(1600px) chrome converged
+     to (kernel wider than the window ⇒ the filter collapsed to a per-theme
+     rgba constant; solved from capture means, glassprobe.cjs). Wallpaper
+     sampling (glassWash.ts) retints it so the chrome tracks the desktop.
+     RAIL ONLY now: the tab strip carries no veil — it sits on the bare glass
+     field (.app::before spans its row), so the window top reads as one
+     uninterrupted pane and stops costing its own composited layer. */
   --wash-rail-color: 255 254 254;
   --wash-rail-alpha: 35%;
   /* frost grain: a 96px feTurbulence tile, neutral gray pinned by the color
@@ -108,23 +108,19 @@
   --app-active-glass-lift-bottom: 80%;
   /* dark text-on-glass needs a bit more ink under 12px terminal type */
   --session-glass-alpha: 64%;
-  /* dark chrome veils (see the light-theme block): near-opaque ink — that's
+  /* dark rail veil (see the light-theme block): near-opaque ink — that's
      what the dark blur chrome measured as, and what keeps rail text readable */
-  --wash-strip-color: 11 13 18;
-  --wash-strip-alpha: 90%;
   --wash-rail-color: 11 12 17;
   --wash-rail-alpha: 83%;
 }
 /* PAINTED-MODE LEGIBILITY: the wallpaper painting is livelier than the OS
-   material it replaces, so the chrome veils carry more ink — text on the
-   strip and rail keeps its contrast. Live glass is untouched (its veils are
-   parity-locked to the measured blur constants). */
+   material it replaces, so the rail veil carries more ink — rail text keeps
+   its contrast. Live glass is untouched (parity-locked to the measured blur
+   constants). */
 :root[data-perf='painted'] .app {
-  --wash-strip-alpha: 62%;
-  --wash-rail-alpha: 55%;
+  --wash-rail-alpha: 64%; /* was 55% — the tree's 13px labels come first */
 }
 :root[data-theme='dark'][data-perf='painted'] .app {
-  --wash-strip-alpha: 95%;
   --wash-rail-alpha: 91%;
 }
 
@@ -148,41 +144,12 @@
   gap: 2px;
   padding: 0 var(--sp-3);
   -webkit-app-region: drag;
-  background: color-mix(in srgb, var(--bg-2) 22%, transparent);
+  /* NO veil, film, or hairline of its own: the strip sits directly on the
+     glass field (.app::before spans this row too), so the window top is one
+     uninterrupted pane — tabs supply their own contrast (pill fills below).
+     Also retires the strip's composited pseudo-layer + grain raster. */
+  background: transparent;
   position: relative;
-}
-/* the strip's bottom hairline lives INSIDE the strip (not border-bottom) so
-   the active Chrome-style tab can merge through it — the tab and its hills
-   paint over the line where they meet it */
-.tabstrip::after {
-  content: '';
-  position: absolute;
-  inset-inline: 0;
-  bottom: 0;
-  height: 1px;
-  background: var(--border-faint);
-  pointer-events: none;
-}
-/* chrome glass: the blur wash lives HERE (and on the rail), not on the whole
-   window — these surfaces repaint rarely, so the blur recomputes rarely,
-   while terminals stream over cheap opaque cards. z-index -1 joins .app's
-   isolated context just above the tint field (.app::before). */
-.tabstrip::before {
-  content: '';
-  position: absolute;
-  inset: 0;
-  z-index: -1;
-  pointer-events: none;
-  /* PAINTED WASH — no backdrop-filter. The old blur(1600px) of the uniform
-     tint field was mathematically a constant; the OS material carries the
-     live glow. The constant is painted here, and wallpaper sampling tints
-     it for real — fidelity the blur never had. The grain tile on top is what
-     makes frost read as frost up close (neutral-gray noise at 4%). */
-  background-image:
-    var(--frost-grain),
-    linear-gradient(rgb(var(--wash-strip-color) / var(--wash-strip-alpha)),
-                    rgb(var(--wash-strip-color) / var(--wash-strip-alpha)));
-  background-repeat: repeat, no-repeat;
 }
 /* everything interactive in the strip opts out of the window-drag region */
 .tabstrip .lights,
@@ -207,7 +174,7 @@
   overflow-x: auto;
   scrollbar-width: none;
   position: relative;
-  z-index: 1; /* tabs (and their hills) paint above the strip's ::after hairline */
+  z-index: 1; /* tabs paint above the strip's later chrome siblings */
 }
 /* scroll-cue fades — applied per edge ONLY while tabs hide past it (the JS
    sync sets data-fade-l/r); a static mask would eat the outermost tab border */
@@ -306,7 +273,8 @@
   /* a real border slot on every state — transparent when idle so nothing
      shifts, visible on hover/active so tabs read clearly against the glass */
   border: 1px solid transparent;
-  color: var(--text-2);
+  /* one tier up from the old muted tabs: labels sit on bare glass now, not a veil */
+  color: var(--text-1);
   font-size: var(--fs-12);
   font-weight: var(--fw-medium);
   position: relative;
@@ -318,33 +286,24 @@
   color: var(--text-1);
   border-color: var(--border-faint);
 }
-/* the ACTIVE tab is Chrome-shaped: it drops to the strip's bottom edge,
-   rounds only its top corners, and flares into concave "hills" where it
-   meets the hairline — the tab reads as attached to the page below, not a
-   floating pill. Inactive tabs keep the quiet pill hover. */
+/* the ACTIVE tab is a quiet raised pill. (It used to be Chrome-shaped —
+   merged through a strip hairline into "the page below" — but on this shell
+   the strip floats over glass with a gutter beneath, so there was no page to
+   merge into, and the hairline it needed kept the strip from being glass.)
+   Lift = fill + hairline border + shadow; the folder-hue line stays the one
+   identity mark. */
 .ptab[data-active='true'] {
   --ptab-bg: color-mix(in srgb, var(--bg-1) 96%, transparent);
-  margin: 4px 0 0;
-  height: calc(var(--tabstrip-h) - 4px);
-  border-radius: 10px 10px 0 0;
   background: var(--ptab-bg);
   color: var(--text-0);
-  border-color: transparent;
-  z-index: 1; /* hills flare past the tab box — stay above later siblings */
+  border-color: var(--border-faint);
+  box-shadow: var(--shadow-1);
 }
-/* the hills: a 10px square hugging each bottom corner from OUTSIDE, filled
-   with the tab color except a quarter-circle cut facing away from the tab */
-.ptab[data-active='true']::after {
-  content: '';
-  position: absolute;
-  bottom: 0;
-  left: -10px;
-  right: -10px;
-  height: 10px;
-  pointer-events: none;
-  background:
-    radial-gradient(circle 10px at 0 0, transparent 9.5px, var(--ptab-bg) 10px) left bottom / 10px 10px no-repeat,
-    radial-gradient(circle 10px at 10px 0, transparent 9.5px, var(--ptab-bg) 10px) right bottom / 10px 10px no-repeat;
+/* dark glass is near-black ink — a bg-1 fill vanished into it (the "which
+   tab am I on" bug). Fill with the raised layer and let the border speak. */
+:root[data-theme='dark'] .ptab[data-active='true'] {
+  --ptab-bg: color-mix(in srgb, var(--bg-3) 94%, transparent);
+  border-color: var(--border-strong);
 }
 /* the 2px identity line at the top of the active tab — its folder hue */
 .ptab[data-active='true']::before {
@@ -1111,6 +1070,10 @@
   border-color: var(--border-strong);
   box-shadow: var(--shadow-1);
 }
+/* same ink-on-ink rescue as the project tabs: dark bg-1 ≈ the dark rail veil */
+:root[data-theme='dark'] .stab[data-active='true'] {
+  background: color-mix(in srgb, var(--bg-3) 94%, transparent);
+}
 /* the 2px identity line at the top of an open tab — the session's ONE colored
    edge (the card below stays clean; pop-outs keep a hairline, having no tab) */
 .stab[data-active='true']::before {
@@ -1341,7 +1304,6 @@
   -webkit-backdrop-filter: none;
 }
 /* the chrome glass pseudos rest too — eco is solid everywhere */
-:root[data-perf='eco'] .tabstrip::before,
 :root[data-perf='eco'] .wsrail::before,
 :root[data-perf='eco'] .sidebar::before {
   display: none;
@@ -1718,13 +1680,20 @@
   margin: 0 var(--sp-3);
   padding: var(--sp-1) var(--sp-2);
   border-radius: var(--r-2);
-  color: var(--text-3);
-  font-size: var(--fs-11);
+  color: var(--text-2);
+  font-size: var(--fs-12);
   text-align: left;
   flex-shrink: 0;
   -webkit-app-region: no-drag;
 }
 .agent-pulse:hover { color: var(--text-1); background: var(--hover-overlay); }
+/* who the line is about — a quiet speaker label before the event text */
+.agent-pulse-k {
+  flex-shrink: 0;
+  color: var(--text-3);
+  font-weight: var(--fw-medium);
+}
+.agent-pulse[data-running='true'] .agent-pulse-k { color: var(--accent); }
 .agent-pulse-dot {
   width: 6px;
   height: 6px;

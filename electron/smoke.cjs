@@ -134,7 +134,9 @@ app.whenReady().then(async () => {
   const rootChildren = await win.webContents.executeJavaScript(`document.getElementById('root').children.length`)
   const minimalShell = await win.webContents.executeJavaScript(`(() => ({
     noWorkflowSidebar: !document.querySelector('.sidebar') && !document.querySelector('.side-nav') && !document.querySelector('.side-section'),
-    hasRail: !!document.querySelector('.wsrail'),
+    // fresh installs open on the canvas alone (Traycer-style quiet start) —
+    // the rail is summoned with ⌘B / the strip's panel button
+    railHiddenByDefault: !document.querySelector('.wsrail'),
     // sessions live ONLY in the tab strip — the rail is the project's files
     hasSessions: document.querySelectorAll('.stabs .stab').length >= 2,
     railFilesOnly: document.querySelectorAll('.wsrail .session-row').length === 0,
@@ -147,6 +149,15 @@ app.whenReady().then(async () => {
     // floating overlay remains only on web / pop windows)
     floatingTools: !!document.querySelector('.tabstrip-tools .btn-icon') && !document.querySelector('.float-tools'),
   }))()`)
+  // the empty-shell probe asserted the closed-by-default rail above — open it
+  // now; every later section (tree, GLASS veils, drag regions) drives the rail
+  await win.webContents.executeJavaScript(`(async () => {
+    if (!document.querySelector('.wsrail')) {
+      window.__kaisola.getState().toggleRail()
+      await new Promise((r) => setTimeout(r, 150))
+    }
+    return !!document.querySelector('.wsrail')
+  })()`)
   const autonomy = await win.webContents.executeJavaScript(`(document.querySelector('.autonomy-seg[data-active="true"]')||{}).innerText || ''`)
   // auto-claude waits for a workspace (never boots the agent in $HOME): absent
   // before one is chosen, prepared with the workspace as cwd right after.
@@ -288,10 +299,14 @@ app.whenReady().then(async () => {
       // anywhere; the OS material carries the live glow
       appSamplingLayer: !/blur/.test(activeAppBackdrop) && !/blur/.test(activeAppGlassBackdrop) && alpha(activeAppBackground) < 0.05 && appLiftTop >= 43 && appLiftTop <= 47 && appLiftBottom >= 28 && appLiftBottom <= 32,
       chromeGlass: !/blur/.test(tabstripGlassBd) && !/blur/.test(railGlassBd)
-        && getComputedStyle(tabstrip, '::before').backgroundImage.includes('data:image/svg')
-        && getComputedStyle(tabstrip, '::before').backgroundImage.includes('linear-gradient')
+        // the RAIL keeps the painted veil + grain…
+        && getComputedStyle(rail, '::before').backgroundImage.includes('data:image/svg')
         && getComputedStyle(rail, '::before').backgroundImage.includes('linear-gradient')
-        && getComputedStyle(rail, '::before').display !== 'none',
+        && getComputedStyle(rail, '::before').display !== 'none'
+        // …while the STRIP is bare glass: no veil pseudo, no base film — the
+        // window top is one uninterrupted pane (tabs carry their own fills)
+        && !getComputedStyle(tabstrip, '::before').backgroundImage.includes('linear-gradient')
+        && alpha(getComputedStyle(tabstrip).backgroundColor) <= 0.02,
       activeTintWhite: activeAppTint === '#fffefd',
       railBackdrop: activeRailBackdrop,
       railLayerFlattened: !activeRailBackdrop && activeRailBackgroundAlpha <= 0.02 && (!activeRailBgImage || activeRailBgImage === 'none') && activeSessionListFlat && activeRailDividerFlat && activeRailSearchFlat && veilAlpha >= 0 && veilAlpha <= 1,
@@ -335,7 +350,7 @@ app.whenReady().then(async () => {
 
   // 1) empty project — the minimal shell should land on the project launcher
   //    (open-a-folder empty state), not the old workflow nav.
-  const emptyOk = !!(minimalShell.noWorkflowSidebar && minimalShell.hasRail && minimalShell.hasSessions && minimalShell.hasEmptyLauncher && minimalShell.stageFiles && minimalShell.studioDefault)
+  const emptyOk = !!(minimalShell.noWorkflowSidebar && minimalShell.railHiddenByDefault && minimalShell.hasSessions && minimalShell.hasEmptyLauncher && minimalShell.stageFiles && minimalShell.studioDefault)
   console.log('EMPTY_MINIMAL=' + emptyOk)
 
   // 2) load the demo and confirm state still seeds correctly without exposing old views.
@@ -2397,7 +2412,7 @@ a^2 + b^2 = c^2
   console.log('WTSESS=' + JSON.stringify(wtsess))
 
   const failed =
-    !rootChildren || !minimalShell.noWorkflowSidebar || !minimalShell.hasRail || !minimalShell.hasSessions || !minimalShell.railFilesOnly || !minimalShell.hasEmptyLauncher || !minimalShell.stageFiles || !minimalShell.studioDefault || !minimalShell.floatingTools || !claudePrepared || !nativeWindow.rendererClippedMaterial || !icon.exists || !icon.usable || !icon.square || !icon.large || !glass.appSamplingLayer || !glass.chromeGlass || !glass.activeTintWhite || !glass.railLayerFlattened || !glass.contentGlassy || !glass.sessionGlassy || !glass.termGlassTint || !glass.blurKeepsGlass || !glass.lightsGray || !glass.nativeWindowRounding ||
+    !rootChildren || !minimalShell.noWorkflowSidebar || !minimalShell.railHiddenByDefault || !minimalShell.hasSessions || !minimalShell.railFilesOnly || !minimalShell.hasEmptyLauncher || !minimalShell.stageFiles || !minimalShell.studioDefault || !minimalShell.floatingTools || !claudePrepared || !nativeWindow.rendererClippedMaterial || !icon.exists || !icon.usable || !icon.square || !icon.large || !glass.appSamplingLayer || !glass.chromeGlass || !glass.activeTintWhite || !glass.railLayerFlattened || !glass.contentGlassy || !glass.sessionGlassy || !glass.termGlassTint || !glass.blurKeepsGlass || !glass.lightsGray || !glass.nativeWindowRounding ||
     !emptyOk || !demoOk ||
     !review.opened || !review.closed || !review.decided ||
     !term.run || !term.ptyOk || !term.cdWorks || !term.dock || !term.host ||

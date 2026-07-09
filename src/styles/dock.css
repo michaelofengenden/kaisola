@@ -224,12 +224,16 @@
   overflow: hidden;
 }
 .assistant-foot .drop-btn { height: 24px; }
-.foot-ws { max-width: 160px; }
+/* the workspace chip yields FIRST in narrow columns (it ellipsizes cleanly);
+   the connection state ("Offline · Sign in") must never hard-clip mid-word —
+   it carries the card's only sign-in affordance */
+.foot-ws { max-width: 160px; min-width: 0; flex-shrink: 1; }
 .foot-ws .drop-btn-label { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .foot-conn {
   display: inline-flex;
   align-items: center;
   gap: var(--sp-2);
+  flex-shrink: 0;
   font-size: var(--fs-11);
   color: var(--text-3);
   white-space: nowrap;

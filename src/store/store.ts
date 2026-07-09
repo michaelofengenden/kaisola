@@ -2895,9 +2895,24 @@ export const useKaisola = create<KaisolaState>()(
   // never auto-allow them); a matching allow-rule answers the rest silently
   receivePermission: (req) => {
     const s = get()
+    // presence: a BLOCKED agent must surface wherever the user is looking.
+    // Background-project asks badge their tab immediately (the inbox rolls
+    // them up); an active-project ask on a put-away thread gets the amber
+    // dot on ONE thread (the agent's active/first, not every hidden sibling).
+    const surface = () => {
+      const st = get()
+      if (req.scope && req.scope !== st.activeProjectId) {
+        st.setProjectActivity(req.scope, 'needs-you')
+        return
+      }
+      const mine = st.assistantThreads.filter((t) => t.agentKey === req.key)
+      const target = mine.find((t) => t.id === st.activeThreadId) ?? mine[0]
+      if (target && !st.dockViews.includes(target.id)) st.markNeedsYou(target.id)
+    }
     if (requestIsSensitive(s.sensitiveGlobs, req)) {
       s.pushPermission({ ...req, sensitive: true })
       s.pushAgentFeed({ at: Date.now(), kind: 'permission', text: `⚠ ${req.agent} asks (sensitive file): ${req.title}` })
+      surface() // a sensitive ask used to stall silently on hidden surfaces
       return
     }
     const rule = requestMatchesRules(s.permissionRules, s.workspacePath, req)
@@ -2908,11 +2923,7 @@ export const useKaisola = create<KaisolaState>()(
     }
     s.pushPermission(req)
     s.pushAgentFeed({ at: Date.now(), kind: 'permission', text: `${req.agent} asks: ${req.title}` })
-    // a blocked agent whose thread is put away gets the amber "needs you" dot
-    // — ONE thread (the agent's active/first), not every hidden sibling
-    const mine = s.assistantThreads.filter((t) => t.agentKey === req.key)
-    const target = mine.find((t) => t.id === s.activeThreadId) ?? mine[0]
-    if (target && !s.dockViews.includes(target.id)) s.markNeedsYou(target.id)
+    surface()
   },
   pushPermission: (req) =>
     set((s) =>

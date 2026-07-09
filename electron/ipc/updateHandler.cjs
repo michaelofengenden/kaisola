@@ -131,18 +131,27 @@ function registerUpdateHandlers(ipcMain) {
     }
     setState({ type: 'installing', message: 'Restarting to apply update…' })
     // before-quit (pty teardown etc.) still runs — quitAndInstall goes
-    // through the normal quit path, then relaunches into the new build
+    // through the normal quit path, then relaunches into the new build.
+    // 'before-quit-for-update' is emitted on the NATIVE autoUpdater module
+    // (electron-updater re-emits it there too), never on `app` — listening on
+    // app left quitStarted forever-false, so the backstop force-relaunched
+    // under every HEALTHY quit and could race the ShipIt swap. Listen on the
+    // right emitter, plus app 'before-quit' (any quit underway = stand down).
     let quitStarted = false
-    app.once('before-quit-for-update', () => { quitStarted = true })
+    const markQuit = () => { quitStarted = true }
+    require('electron').autoUpdater.once('before-quit-for-update', markQuit)
+    app.once('before-quit', markQuit)
     setImmediate(() => {
       try { autoUpdater.quitAndInstall(false, true) } catch { /* fall through to the backstop */ }
     })
     // BACKSTOP: if quitAndInstall no-ops (updater lost its pending-download
-    // state), still honor the click — a plain relaunch quits the app, and
-    // autoInstallOnAppQuit applies the downloaded build during that quit. A
-    // quit that's merely SLOW skips this (before-quit already fired).
+    // state, or macOS staging isn't finished), still honor the click — a plain
+    // relaunch quits the app, and autoInstallOnAppQuit applies the downloaded
+    // build during that quit. A quit that's underway skips this.
     setTimeout(() => {
       if (quitStarted) return
+      require('electron').autoUpdater.removeListener('before-quit-for-update', markQuit)
+      app.removeListener('before-quit', markQuit)
       app.relaunch()
       app.exit(0)
     }, 4000)

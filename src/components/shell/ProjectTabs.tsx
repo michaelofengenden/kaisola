@@ -240,6 +240,14 @@ function UpdatePill() {
       </span>
     )
   }
+  if (u.type === 'installing') {
+    return (
+      <span className="update-pill" data-busy title="Restarting Kaisola to apply the downloaded update">
+        <Icon name="RefreshCw" size={12} />
+        Restarting…
+      </span>
+    )
+  }
   if (u.type !== 'ready') return null
   return (
     <button

@@ -823,6 +823,7 @@ function UpdatesRow() {
     u.type === 'checking' ? 'Checking…'
     : u.type === 'downloading' ? `Downloading ${u.version ?? 'update'}… ${u.percent ?? 0}%`
     : u.type === 'ready' ? `${u.version} downloaded`
+    : u.type === 'installing' ? 'Restarting…'
     : u.type === 'error' ? 'Could not check for updates'
     : 'Up to date'
   return (
@@ -833,8 +834,8 @@ function UpdatesRow() {
         </span>
         <div className="settings-row-control">
           <span className="faint" title={u.type === 'error' ? u.message ?? undefined : undefined}>{status}</span>
-          {u.type === 'ready' ? (
-            <button className="btn btn-primary btn-sm" onClick={() => void bridge.update?.install()}>
+          {u.type === 'ready' || u.type === 'installing' ? (
+            <button className="btn btn-primary btn-sm" disabled={u.type === 'installing'} onClick={() => void bridge.update?.install()}>
               <Icon name="ArrowDownToLine" size={12} /> Restart to update
             </button>
           ) : (

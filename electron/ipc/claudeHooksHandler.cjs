@@ -103,12 +103,16 @@ function drain() {
   }
 }
 
+// renderer-chosen Claude Code settings (fastMode, …) merged into the same
+// --settings file the boot line already carries — hooks stay authoritative
+let extraFlags = {}
+
 /** Write the settings file, reset the events file, start tailing. */
 function armTap() {
   const evFile = eventsPath()
   const stFile = settingsPath()
   fs.writeFileSync(evFile, '')
-  fs.writeFileSync(stFile, JSON.stringify(buildSettings(evFile), null, 2))
+  fs.writeFileSync(stFile, JSON.stringify({ ...buildSettings(evFile), ...extraFlags }, null, 2))
   stopTail()
   const watcher = fs.watch(evFile, { persistent: false }, () => drain())
   // fs.watch on a single file can go quiet after atomic replaces — a slow
@@ -130,6 +134,18 @@ function registerClaudeHooksHandlers(ipcMain) {
   // SYNC path getter — preload exposes it as a constant on the bridge
   ipcMain.on('claude:settings-path-sync', (event) => {
     event.returnValue = armedPath
+  })
+
+  // fast mode etc. — rewrite ONLY the settings file (never resets the events
+  // tail); a claude launched after this boots with the new flags
+  ipcMain.handle('claude:settings-flags', (event, flags) => {
+    extraFlags = flags && typeof flags === 'object' ? flags : {}
+    try {
+      fs.writeFileSync(settingsPath(), JSON.stringify({ ...buildSettings(eventsPath()), ...extraFlags }, null, 2))
+      return { ok: true }
+    } catch (err) {
+      return { ok: false, message: String((err && err.message) || err) }
+    }
   })
 
   // kept for compatibility: re-arm on demand (also resets the events file)

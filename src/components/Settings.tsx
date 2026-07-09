@@ -8,13 +8,25 @@ import { useUpdateState } from '../lib/updates'
 import { Icon } from './Icon'
 import { Dropdown } from './Dropdown'
 
-// Current Claude models (for the direct API path).
+// Current Claude models (for the direct API path). Checked 2026-07-09.
 const CLAUDE_MODELS = [
   { value: 'claude-fable-5', name: 'Fable 5' },
   { value: 'claude-opus-4-8', name: 'Opus 4.8' },
+  { value: 'claude-sonnet-5', name: 'Sonnet 5' },
   { value: 'claude-opus-4-7', name: 'Opus 4.7' },
   { value: 'claude-sonnet-4-6', name: 'Sonnet 4.6' },
   { value: 'claude-haiku-4-5', name: 'Haiku 4.5' },
+]
+
+// Aliases the Claude Code CLI resolves itself (`--model`): kept as aliases so
+// they track the newest release without Kaisola updates.
+const CLAUDE_TERMINAL_MODELS = [
+  { value: 'default', name: 'Default', description: 'Whatever the CLI/account is set to' },
+  { value: 'fable', name: 'Fable 5', description: 'Deepest reasoning, longest sessions' },
+  { value: 'opus', name: 'Opus 4.8', description: 'Frontier Opus · fast-mode capable' },
+  { value: 'sonnet', name: 'Sonnet 5', description: 'Everyday coding · 1M context' },
+  { value: 'haiku', name: 'Haiku 4.5', description: 'Fastest for quick tasks' },
+  { value: 'opusplan', name: 'Opus Plan', description: 'Opus plans, Sonnet executes' },
 ]
 
 /** Multiple Claude subscriptions: each account is an isolated CLAUDE_CONFIG_DIR;
@@ -173,6 +185,10 @@ export function Settings() {
   const setDraftRestore = useKaisola((s) => s.setDraftRestore)
   const wallpaperTint = useKaisola((s) => s.wallpaperTint)
   const setWallpaperTint = useKaisola((s) => s.setWallpaperTint)
+  const claudeTerminalModel = useKaisola((s) => s.claudeTerminalModel)
+  const setClaudeTerminalModel = useKaisola((s) => s.setClaudeTerminalModel)
+  const claudeFastMode = useKaisola((s) => s.claudeFastMode)
+  const setClaudeFastMode = useKaisola((s) => s.setClaudeFastMode)
   const setPerfMode = useKaisola((s) => s.setPerfMode)
   const autonomy = useKaisola((s) => s.autonomy)
   const setAutonomy = useKaisola((s) => s.setAutonomy)
@@ -636,6 +652,31 @@ export function Settings() {
                   </>
                 )}
                 <ClaudeAccountsBlock />
+                <div className="hr" />
+                <div className="settings-row">
+                  <span className="settings-row-label">Claude terminal model <span className="faint" style={{ fontWeight: 400 }}>· the prepared per-project session</span></span>
+                  <div className="settings-row-control">
+                    <Dropdown value={claudeTerminalModel} options={CLAUDE_TERMINAL_MODELS} onSelect={setClaudeTerminalModel} align="right" title="Passed as --model; aliases resolve to the newest release" />
+                  </div>
+                </div>
+                <div className="settings-row">
+                  <span className="settings-row-label">Fast mode <span className="faint" style={{ fontWeight: 400 }}>· Opus ↯ up to 2.5× faster, premium pricing</span></span>
+                  <div className="settings-row-control">
+                    <Dropdown
+                      value={claudeFastMode ? 'on' : 'off'}
+                      options={[{ value: 'on', name: 'On' }, { value: 'off', name: 'Off' }]}
+                      onSelect={(v) => setClaudeFastMode(v === 'on')}
+                      align="right"
+                      title="Injected as fastMode:true via the terminal's --settings file"
+                    />
+                  </div>
+                </div>
+                <p className="settings-note">
+                  Fast mode bills usage credits at the fast-mode Opus rate ($10/$50 per MTok) and needs credits
+                  enabled on your Claude account. Codex model &amp; reasoning effort follow ~/.codex/config.toml
+                  (currently honored: GPT-5.6 Sol · ultra in the terminal; chat threads cap effort at xhigh until
+                  the codex-acp adapter learns the new levels).
+                </p>
               </>
             ))}
 

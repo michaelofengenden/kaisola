@@ -109,6 +109,7 @@ const bridge = {
       }
     })(),
     armHooks: () => ipcRenderer.invoke('claude:arm'),
+    setSettingsFlags: (flags) => ipcRenderer.invoke('claude:settings-flags', flags),
     rebind: () => ipcRenderer.invoke('claude:rebind'),
     sessionExists: (cwd, sessionId, configDir) => ipcRenderer.invoke('claude:session-exists', { cwd, sessionId, configDir }),
     accountInfo: (configDir) => ipcRenderer.invoke('claude:account-info', { configDir }),

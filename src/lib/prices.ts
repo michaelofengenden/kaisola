@@ -1,6 +1,7 @@
 /**
- * Claude API list prices, USD per MILLION tokens — the $ chip's rate table.
- * Source: platform.claude.com/docs/en/about-claude/pricing (checked 2026-07-09).
+ * Model list prices, USD per MILLION tokens — the $ chip's rate table.
+ * Claude source: platform.claude.com/docs/en/about-claude/pricing; GPT-5.6
+ * family from the 2026-07-09 launch pricing (both checked 2026-07-09).
  * Cache-write uses the 5-minute rate (1.25× input) — transcripts don't say
  * which duration was used and 5m is the default. Unknown models price as null
  * and the chip shows raw tokens instead of a made-up number.
@@ -11,12 +12,18 @@ export interface Rate { input: number; output: number; cacheRead: number; cacheW
 
 const TABLE: Array<{ re: RegExp; rate: Rate }> = [
   { re: /fable|mythos/i, rate: { input: 10, output: 50, cacheRead: 1, cacheWrite: 12.5 } },
+  // fast-mode Opus bills flat $10/$50 (research preview, 2026-07)
+  { re: /opus.*fast|fast.*opus/i, rate: { input: 10, output: 50, cacheRead: 1, cacheWrite: 12.5 } },
   { re: /opus-4-[5-9]/i, rate: { input: 5, output: 25, cacheRead: 0.5, cacheWrite: 6.25 } },
   { re: /opus/i, rate: { input: 15, output: 75, cacheRead: 1.5, cacheWrite: 18.75 } },
   { re: /sonnet-5/i, rate: { input: 2, output: 10, cacheRead: 0.2, cacheWrite: 2.5 } },
   { re: /sonnet/i, rate: { input: 3, output: 15, cacheRead: 0.3, cacheWrite: 3.75 } },
   { re: /haiku-4/i, rate: { input: 1, output: 5, cacheRead: 0.1, cacheWrite: 1.25 } },
   { re: /haiku/i, rate: { input: 0.8, output: 4, cacheRead: 0.08, cacheWrite: 1 } },
+  // GPT-5.6 family (Codex sessions; OpenAI charges no cache write, ~10% cached read)
+  { re: /gpt-5\.6-sol/i, rate: { input: 5, output: 30, cacheRead: 0.5, cacheWrite: 0 } },
+  { re: /gpt-5\.6-terra/i, rate: { input: 2.5, output: 15, cacheRead: 0.25, cacheWrite: 0 } },
+  { re: /gpt-5\.6-luna/i, rate: { input: 1, output: 6, cacheRead: 0.1, cacheWrite: 0 } },
 ]
 
 export const rateFor = (model: string): Rate | null =>

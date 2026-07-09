@@ -556,6 +556,7 @@ const GLOBAL_KEYS = [
   'localBaseUrl', 'localModel', 'openaiBaseUrl', 'openaiModel', 'openAlexMailto', 'grobidEndpoint',
   'sandboxMode', 'workflows', 'automationsEnabled', 'perfMode', 'railWidth', 'railOpen', 'claudeSessions',
   'wordDiffs', 'showCosts', 'inbox', 'draftRestore', 'wallpaperTint', 'claudeAccounts',
+  'claudeTerminalModel', 'claudeFastMode',
   'permissionRules', 'sensitiveGlobs', 'latexMain', 'unsavedBuffers', 'termDrafts',
 ] as const
 
@@ -1035,6 +1036,12 @@ interface KaisolaState {
   /** Wallpaper-sampled retinting of the chrome veils. */
   wallpaperTint: boolean
   setWallpaperTint: (on: boolean) => void
+  /** Model alias the prepared Claude terminal boots with ('default' = CLI's own). */
+  claudeTerminalModel: string
+  setClaudeTerminalModel: (m: string) => void
+  /** Fast mode (Opus ↯, premium pricing) for the prepared Claude terminal. */
+  claudeFastMode: boolean
+  setClaudeFastMode: (on: boolean) => void
   addWorkflow: (name?: string) => void
   deleteWorkflow: (id: string) => void
   setWorkflowTrigger: (id: string, trigger: 'manual' | 'on-stage', stage?: TrajectoryStage) => void
@@ -1812,6 +1819,8 @@ export const useKaisola = create<KaisolaState>()(
   inbox: true,
   draftRestore: true,
   wallpaperTint: true,
+  claudeTerminalModel: 'default',
+  claudeFastMode: false,
   agentModels: {},
   workspacePath: null,
   fileRequest: null,
@@ -2047,9 +2056,14 @@ export const useKaisola = create<KaisolaState>()(
     // the hooks tap is armed at app startup (main) and its settings path is a
     // constant on the bridge — the boot line is built synchronously
     const hooksPath = bridge.claude.settingsPath
+    // fast mode rides the same settings file; sync it in case this launch is
+    // the first since the preference was restored from disk
+    await bridge.claude.setSettingsFlags?.(get().claudeFastMode ? { fastMode: true } : {})
+    const model = get().claudeTerminalModel
     const boot = [
       acct?.configDir ? `CLAUDE_CONFIG_DIR=${shellConfigDir(acct.configDir)}` : '',
       hooksPath ? `claude --settings ${q(hooksPath)}` : 'claude',
+      model && model !== 'default' ? `--model ${q(model)}` : '',
       mcpPath ? `--mcp-config ${q(mcpPath)}` : '',
       resumeArg,
     ].filter(Boolean).join(' ')
@@ -2538,7 +2552,8 @@ export const useKaisola = create<KaisolaState>()(
     // claude in a worktree keeps the hooks tap — same checkpoints/feed as the
     // main claude terminal (the settings path is a sync bridge constant)
     const hooksPath = bridge.claude.settingsPath
-    const claudeBoot = hooksPath ? `claude --settings '${hooksPath.replace(/'/g, `'\\''`)}'` : 'claude'
+    const wtModel = s.claudeTerminalModel !== 'default' ? ` --model '${s.claudeTerminalModel.replace(/'/g, `'\\''`)}'` : ''
+    const claudeBoot = (hooksPath ? `claude --settings '${hooksPath.replace(/'/g, `'\\''`)}'` : 'claude') + wtModel
     const terminalCommand =
       custom?.kind === 'terminal'
         ? [custom.command, ...custom.args].join(' ')
@@ -3678,6 +3693,12 @@ export const useKaisola = create<KaisolaState>()(
   setShowCosts: (on) => set({ showCosts: on }),
   setInbox: (on) => set({ inbox: on }),
   setDraftRestore: (on) => set({ draftRestore: on }),
+  setClaudeTerminalModel: (m) => set({ claudeTerminalModel: m || 'default' }),
+  setClaudeFastMode: (on) => {
+    set({ claudeFastMode: on })
+    // rewrite the armed --settings file now — the next `claude` boot carries it
+    void bridge.claude.setSettingsFlags?.(on ? { fastMode: true } : {})
+  },
   setWallpaperTint: (on) => set({ wallpaperTint: on }),
 
   addWorkflow: (name) =>

@@ -468,6 +468,9 @@ export interface KaisolaBridge {
     /** Constant path of the armed hooks settings file (undefined on web). */
     settingsPath?: string
     armHooks(): Promise<{ ok: boolean; settingsPath?: string; message?: string }>
+    /** Merge Claude Code settings (e.g. { fastMode: true }) into the armed
+     * --settings file — the next `claude` boot picks them up. */
+    setSettingsFlags?(flags: Record<string, unknown>): Promise<{ ok: boolean; message?: string }>
     rebind(): Promise<{ ok: boolean }>
     onEvent(cb: (ev: ClaudeHookEvent) => void): () => void
     /** Does <configDir>/projects/<cwd>/<sessionId>.jsonl still exist? Gates

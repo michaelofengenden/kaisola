@@ -4,7 +4,8 @@
 // registry of presets — open-source agents you can add, Zed-style.
 const path = require('node:path')
 const os = require('node:os')
-const { shell } = require('electron')
+const fs = require('node:fs')
+const { shell, app } = require('electron')
 const { AcpConnection } = require('./acp.cjs')
 const { mcpHttpEntry } = require('./mcpServer.cjs')
 const { acpEntries } = require('./mcpCatalog.cjs')
@@ -136,6 +137,77 @@ function presets() {
 
 const CONNECT_TIMEOUT_MS = 120_000
 
+// ---- keeping the model surface CURRENT (checked 2026-07-09) -----------------
+// The adapters' declared lists trail the release train: claude-code-acp still
+// describes the Opus 4.6 era, and codex-acp 0.16.0 (newest published) predates
+// GPT-5.6. Both agents accept ids beyond their declared list (probe-verified
+// pass-through), so the dropdowns get the current lineup merged in — anything
+// the adapter declares that we don't know stays.
+const CURRENT_CLAUDE_MODELS = [
+  { modelId: 'fable', name: 'Fable 5', description: 'Deepest reasoning for the hardest, longest-running work' },
+  { modelId: 'opus', name: 'Opus 4.8', description: 'Frontier Opus for complex work · fast-mode capable' },
+  { modelId: 'sonnet', name: 'Sonnet 5', description: 'Everyday coding · native 1M context' },
+  { modelId: 'haiku', name: 'Haiku 4.5', description: 'Fastest for quick tasks' },
+  { modelId: 'opusplan', name: 'Opus Plan', description: 'Opus plans, Sonnet executes' },
+]
+const CURRENT_CODEX_MODELS = [
+  { value: 'gpt-5.6-sol', name: 'GPT-5.6 Sol', description: 'Flagship — deepest reasoning (ultra effort in the codex CLI)' },
+  { value: 'gpt-5.6-terra', name: 'GPT-5.6 Terra', description: 'Balanced tier' },
+  { value: 'gpt-5.6-luna', name: 'GPT-5.6 Luna', description: 'Fast tier' },
+]
+
+/** Merge the current model lineup into an adapter's declared controls. */
+function freshenControls(presetId, controls) {
+  try {
+    if (presetId === 'claude-code' && controls && controls.models && Array.isArray(controls.models.availableModels)) {
+      const curIds = new Set(CURRENT_CLAUDE_MODELS.map((m) => m.modelId))
+      const declared = controls.models.availableModels
+      // adapter's `default` leads; our current aliases replace its stale
+      // alias rows (wrong era descriptions); unknown extras (custom ids,
+      // whatever the user set) ride along at the end
+      const head = declared.filter((m) => m.modelId === 'default')
+      const tail = declared.filter((m) => m.modelId !== 'default' && !curIds.has(m.modelId))
+      return { ...controls, models: { ...controls.models, availableModels: [...head, ...CURRENT_CLAUDE_MODELS, ...tail] } }
+    }
+    if (presetId === 'codex' && controls && Array.isArray(controls.configOptions)) {
+      return {
+        ...controls,
+        configOptions: controls.configOptions.map((o) => {
+          if (!(o.id === 'model' || o.category === 'model') || !Array.isArray(o.options)) return o
+          const have = new Set(o.options.map((x) => x.value))
+          const add = CURRENT_CODEX_MODELS.filter((m) => !have.has(m.value))
+          return add.length ? { ...o, options: [...o.options, ...add] } : o
+        }),
+      }
+    }
+  } catch { /* a stale-but-working dropdown beats a broken one */ }
+  return controls
+}
+
+// codex-acp 0.16.0 predates the GPT-5.6 effort levels — a config.toml carrying
+// model_reasoning_effort = "ultra" | "max" kills the adapter at boot ("unknown
+// variant"). Until Zed ships a newer adapter, spawn it against a shadow
+// CODEX_HOME: every entry of the real home symlinked (auth, sessions,
+// memories…), only config.toml copied with the effort capped at xhigh — the
+// adapter's ceiling. The real ~/.codex, and the codex CLI everywhere else,
+// keep ultra untouched. Drop this once codex-acp parses the new levels.
+function codexCompatHome(overrideHome) {
+  try {
+    const home = overrideHome || process.env.CODEX_HOME || path.join(os.homedir(), '.codex')
+    const cfg = fs.readFileSync(path.join(home, 'config.toml'), 'utf8')
+    const m = cfg.match(/^(\s*model_reasoning_effort\s*=\s*")(ultra|max)(")/m)
+    if (!m) return null
+    const shim = path.join(app.getPath('userData'), 'codex-acp-home')
+    fs.mkdirSync(shim, { recursive: true })
+    for (const entry of fs.readdirSync(home)) {
+      if (entry === 'config.toml') continue
+      try { fs.symlinkSync(path.join(home, entry), path.join(shim, entry)) } catch { /* exists */ }
+    }
+    fs.writeFileSync(path.join(shim, 'config.toml'), cfg.replace(m[0], `${m[1]}xhigh${m[3]}`))
+    return shim
+  } catch { return null } // no config / unreadable — spawn plain, agent decides
+}
+
 function resolveConfig(config) {
   if (config && config.command) return { presetId: config.presetId || config.command, name: config.name || config.command, command: config.command, args: config.args, env: config.env }
   const p = presets().find((x) => x.id === (config && config.presetId)) || presets()[0]
@@ -242,9 +314,13 @@ function registerAcpHandlers(ipcMain) {
 
     // per-connection env on top of the preset's (e.g. CLAUDE_CONFIG_DIR / CODEX_HOME
     // for the project's bound subscription)
-    const env = config.env && typeof config.env === 'object'
+    let env = config.env && typeof config.env === 'object'
       ? { ...(resolved.env || {}), ...config.env }
       : resolved.env
+    if (resolved.presetId === 'codex') {
+      const shim = codexCompatHome(env && env.CODEX_HOME)
+      if (shim) env = { ...(env || {}), CODEX_HOME: shim }
+    }
     const conn = new AcpConnection(
       // every ACP agent gets the shared Kaisola MCP server (project state +
       // agent-task ledger) plus the workspace's armed external servers
@@ -268,8 +344,8 @@ function registerAcpHandlers(ipcMain) {
           if (m) surfaceAuthUrl(entry, resolved.name, key, m[0])
         },
         onControls: (controls) => {
-          entry.controls = controls
-          sendTo(entry, 'acp:controls', { key, controls })
+          entry.controls = freshenControls(resolved.presetId, controls)
+          sendTo(entry, 'acp:controls', { key, controls: entry.controls })
         },
         // The autonomy ladder decides who answers: observe auto-rejects,
         // execute/sprint auto-allow, propose asks the human via an inline
@@ -338,7 +414,7 @@ function registerAcpHandlers(ipcMain) {
       const timeout = new Promise((_, rej) => setTimeout(() => rej(new Error('TIMEOUT')), CONNECT_TIMEOUT_MS))
       const session = await Promise.race([handshake, timeout])
       entry.meta = { key, presetId: resolved.presetId, scope, name: resolved.name, sessionId: session.sessionId }
-      entry.controls = conn.getControls()
+      entry.controls = freshenControls(resolved.presetId, conn.getControls())
       connections.set(internalKey, entry)
       return { ok: true, key, agent: entry.meta, controls: entry.controls, authMethods: conn.authMethods, resumed: !!session.resumed }
     } catch (err) {

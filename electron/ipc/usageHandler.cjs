@@ -133,11 +133,62 @@ function claudeUsage(configDir) {
   return { ok: true, exists: true, fiveHour, week, lastActivity }
 }
 
+// Per-SESSION token sums, grouped by model (the $ chip on session cards).
+// A Claude session's transcript is projects/<slug>/<sessionId>.jsonl — the
+// session id names the file, so this reads exactly one file per project dir.
+function claudeSessionUsage(configDir, sessionId) {
+  if (!sessionId || /[/\\]/.test(sessionId)) return { ok: false }
+  const base = configDir ? expandHome(configDir) : path.join(os.homedir(), '.claude')
+  const projectsDir = path.join(base, 'projects')
+  const seen = new Set()
+  const models = new Map() // model → sums
+  let found = false
+  let dirs = []
+  try { dirs = fs.readdirSync(projectsDir) } catch { return { ok: true, exists: false, models: [] } }
+  for (const proj of dirs) {
+    const full = path.join(projectsDir, proj, `${sessionId}.jsonl`)
+    let text
+    try {
+      if (fs.statSync(full).size > CLAUDE_FILE_MAX_BYTES) continue
+      text = fs.readFileSync(full, 'utf8')
+    } catch { continue }
+    found = true
+    for (let s = 0; s < text.length;) {
+      const e = text.indexOf('\n', s)
+      const line = text.slice(s, e < 0 ? text.length : e)
+      s = e < 0 ? text.length : e + 1
+      if (!line.includes('"usage"')) continue
+      let ev
+      try { ev = JSON.parse(line) } catch { continue }
+      const usage = ev && ev.message && ev.message.usage
+      if (!usage) continue
+      const id = `${(ev.message && ev.message.id) || ''}:${ev.requestId || ''}`
+      if (id !== ':' && seen.has(id)) continue
+      if (id !== ':') seen.add(id)
+      const model = (ev.message && ev.message.model) || 'unknown'
+      const acc = models.get(model) || { model, input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }
+      acc.input += usage.input_tokens || 0
+      acc.output += usage.output_tokens || 0
+      acc.cacheRead += usage.cache_read_input_tokens || 0
+      acc.cacheWrite += usage.cache_creation_input_tokens || 0
+      models.set(model, acc)
+    }
+  }
+  return { ok: true, exists: found, models: [...models.values()] }
+}
+
 function registerUsageHandlers(ipcMain) {
   ipcMain.handle('usage:codex', async (_e, { codexHome } = {}) => codexUsage(codexHome))
   ipcMain.handle('usage:claude', async (_e, { configDir } = {}) => {
     try {
       return claudeUsage(configDir)
+    } catch (err) {
+      return { ok: false, message: String((err && err.message) || err) }
+    }
+  })
+  ipcMain.handle('usage:claudeSession', async (_e, { configDir, sessionId } = {}) => {
+    try {
+      return claudeSessionUsage(configDir, sessionId)
     } catch (err) {
       return { ok: false, message: String((err && err.message) || err) }
     }

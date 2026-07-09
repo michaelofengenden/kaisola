@@ -1878,6 +1878,17 @@
   flex-shrink: 0;
 }
 .pane-port:hover { color: var(--text-0); border-color: var(--accent); background: var(--accent-soft); }
+/* the $ chip (Settings → Interface → Session cost chips): quieter than a
+   port chip — informational, not clickable */
+.pane-cost {
+  flex-shrink: 0;
+  margin-right: 2px;
+  font-size: 10px;
+  font-family: var(--font-mono);
+  color: var(--text-3);
+  cursor: default;
+}
+.pane-head:hover .pane-cost { color: var(--text-2); }
 
 .omni-overlay { align-items: flex-start; padding-top: 18vh; }
 .omni {

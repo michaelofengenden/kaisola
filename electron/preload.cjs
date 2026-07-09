@@ -123,6 +123,7 @@ const bridge = {
   usage: {
     codex: (codexHome) => ipcRenderer.invoke('usage:codex', { codexHome }),
     claude: (configDir) => ipcRenderer.invoke('usage:claude', { configDir }),
+    claudeSession: (configDir, sessionId) => ipcRenderer.invoke('usage:claudeSession', { configDir, sessionId }),
   },
 
   // ── shared agent-task ledger (agent↔agent coordination, human-visible) ──

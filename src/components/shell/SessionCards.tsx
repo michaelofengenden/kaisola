@@ -4,6 +4,7 @@ import { useKaisola, type TerminalMeta } from '../../store/store'
 import { sessionHue, terminalAgentKey } from '../../lib/sessionHue'
 import { useAgentRegistry } from '../../lib/registry'
 import { urlHost, terminalLabel, threadLabel } from '@/lib/sessionLabel'
+import { CostChip } from './CostChip'
 import { Terminal, everMountedTerminals } from '../Terminal'
 import { Assistant } from '../Assistant'
 import { GitPanel } from './GitPanel'
@@ -220,6 +221,7 @@ export function SessionCards() {
               </span>
             )}
             <span className="grow" />
+            <CostChip termId={id} />
             {idn?.ports?.map((port) => (
               <button
                 key={port}

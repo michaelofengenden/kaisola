@@ -453,6 +453,8 @@ export interface KaisolaBridge {
   usage?: {
     codex(codexHome?: string): Promise<CodexUsage>
     claude(configDir?: string): Promise<ClaudeUsage>
+    /** Per-session token sums grouped by model — the $ chip on session cards. */
+    claudeSession(configDir: string | undefined, sessionId: string): Promise<{ ok: boolean; exists?: boolean; models?: Array<{ model: string; input: number; output: number; cacheRead: number; cacheWrite: number }> }>
   }
   /** The shared agent-task ledger — agents coordinate through it (via the
    * Kaisola MCP server); the human sees every change in the activity feed. */

@@ -534,6 +534,31 @@ ipcMain.handle('shell:relaunch', () => {
   app.exit(0)
 })
 
+// Apply the persisted window mode NOW by recreating THIS window — no app
+// restart. Transparency is creation-time, but everything that matters lives
+// in the MAIN process and survives a window swap: ptys re-attach by id
+// (tear-off already relies on this), ACP agents are orphan-adopted by the
+// next acp:status, and the renderer rehydrates its slot from sqlite. The
+// swap is close→create so the two renderers never race one store slot.
+let reapplyingWindow = false
+ipcMain.handle('shell:reapply-window', (e) => {
+  const win = BrowserWindow.fromWebContents(e.sender)
+  if (!win) return { ok: false }
+  const wantSolid = readShellPrefs().solidWindow === true
+  if (!!win.__kaisolaSolid === wantSolid) return { ok: true, unchanged: true }
+  let slot = null
+  try { slot = new URL(win.webContents.getURL()).searchParams.get('win') } catch { /* fresh window keeps no slot */ }
+  const bounds = win.isFullScreen() ? null : win.getBounds()
+  reapplyingWindow = true
+  win.once('closed', () => {
+    const next = createWindow(slot ? { slot: Number(slot) } : {})
+    if (bounds) next.setBounds(bounds)
+    next.once('ready-to-show', () => { reapplyingWindow = false })
+  })
+  win.close()
+  return { ok: true }
+})
+
 // The app has its own theme toggle; the native under-window material
 // (vibrancy / Liquid Glass) follows the SYSTEM appearance unless told
 // otherwise — sync it, or a dark app sits on a light blur and the
@@ -592,7 +617,8 @@ app.whenReady().then(() => {
 })
 
 app.on('window-all-closed', () => {
-  if (process.platform !== 'darwin') app.quit()
+  // a window-mode reapply swaps the last window close→create — not a quit
+  if (process.platform !== 'darwin' && !reapplyingWindow) app.quit()
 })
 
 // Energy: while the user works elsewhere, terminals stream in a slower profile

@@ -439,10 +439,10 @@ export function Settings() {
                     {windowModeMismatch && (
                       <button
                         className="settings-chip"
-                        onClick={() => void bridge.relaunch()}
-                        title="The window's transparency is set at launch — restart Kaisola to finish switching"
+                        onClick={() => void bridge.reapplyWindow()}
+                        title="The window's transparency is set when it opens — this reopens the window in place (terminals and agents keep running)"
                       >
-                        Restart to finish applying
+                        Apply now
                       </button>
                     )}
                     <Dropdown

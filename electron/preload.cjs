@@ -302,6 +302,7 @@ const bridge = {
   // perf-mode window plumbing: persist next-launch solidity, read the mismatch
   windowMode: (patch) => ipcRenderer.invoke('shell:window-mode', patch),
   relaunch: () => ipcRenderer.invoke('shell:relaunch'),
+  reapplyWindow: () => ipcRenderer.invoke('shell:reapply-window'),
   // wallpaper-sampled glass wash (macOS; failures degrade to theme tint)
   glassWash: {
     sample: () => ipcRenderer.invoke('glass:sample'),

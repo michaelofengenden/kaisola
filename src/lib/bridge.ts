@@ -575,6 +575,9 @@ export interface KaisolaBridge {
   windowMode(patch?: { solidWindow?: boolean; solidBg?: string }): Promise<{ wantSolid: boolean; liveSolid: boolean }>
   /** Quit and relaunch (used to apply a window-mode change). */
   relaunch(): Promise<void>
+  /** Apply the persisted window mode NOW by recreating this window (ptys and
+   *  agents live in main and survive; the renderer rehydrates its slot). */
+  reapplyWindow(): Promise<{ ok: boolean; unchanged?: boolean }>
   /** Wallpaper-sampled glass wash (macOS; failures degrade to the theme tint). */
   glassWash: {
     sample(): Promise<{ ok: boolean; avg?: { r: number; g: number; b: number }; blurDataUrl?: string; screen?: { x: number; y: number; w: number; h: number } }>
@@ -909,6 +912,9 @@ const webMock: KaisolaBridge = {
     return { wantSolid: false, liveSolid: false }
   },
   async relaunch() {},
+  async reapplyWindow() {
+    return { ok: false }
+  },
   glassWash: {
     async sample() {
       return { ok: false }

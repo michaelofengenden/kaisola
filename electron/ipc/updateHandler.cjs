@@ -111,7 +111,20 @@ function registerUpdateHandlers(ipcMain) {
   const recheck = () => (state.type === 'ready' ? probe() : busy() ? Promise.resolve({ ok: true }) : check())
 
   ipcMain.handle('update:check', () => recheck())
-  ipcMain.handle('update:install', () => {
+  ipcMain.handle('update:install', async () => {
+    // rapid-release guard: releases ship minutes apart some days, and
+    // quitAndInstall applies the last COMPLETED download — a pill clicked
+    // late used to land one release behind and immediately grow a new pill
+    // (update → restart → update again, one hop per release). Give the feed
+    // one last look and swap in anything newer BEFORE restarting; the state
+    // broadcasts keep the pill honest ("Downloading…") while it swaps.
+    try {
+      if (state.type === 'ready') await probe()
+      const started = Date.now()
+      while (state.type === 'downloading' && Date.now() - started < 180_000) {
+        await new Promise((r) => setTimeout(r, 250))
+      }
+    } catch { /* offline etc. — the already-downloaded build is still fine */ }
     // before-quit (pty teardown etc.) still runs — quitAndInstall goes
     // through the normal quit path, then relaunches into the new build
     setImmediate(() => autoUpdater.quitAndInstall())

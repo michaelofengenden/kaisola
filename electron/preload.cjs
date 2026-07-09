@@ -47,7 +47,7 @@ const bridge = {
     setConfigOption: (agentKey, configId, value) => ipcRenderer.invoke('acp:setConfigOption', { agentKey, configId, value }),
     authenticate: (agentKey, methodId) => ipcRenderer.invoke('acp:authenticate', { agentKey, methodId }),
     /** Send a prompt to agentKey; onUpdate(update) streams session/update payloads. */
-    prompt: (agentKey, text, onUpdate) => {
+    prompt: (agentKey, text, onUpdate, images) => {
       const reqId = `p${++seq}`
       const chan = `acp:update:${reqId}`
       const listener = (_e, update) => {
@@ -58,7 +58,7 @@ const bridge = {
         onUpdate(update)
       }
       ipcRenderer.on(chan, listener)
-      const p = ipcRenderer.invoke('acp:prompt', { agentKey, reqId, text })
+      const p = ipcRenderer.invoke('acp:prompt', { agentKey, reqId, text, images })
       p.finally(() => setTimeout(() => ipcRenderer.removeListener(chan, listener), 3000)) // safety net
       return p
     },
@@ -234,6 +234,7 @@ const bridge = {
     search: (root, query) => ipcRenderer.invoke('fs:search', { root, query }),
     index: (root) => ipcRenderer.invoke('fs:index', { root }),
     read: (path) => ipcRenderer.invoke('fs:read', { path }),
+    readImage: (path) => ipcRenderer.invoke('fs:readImage', { path }),
     write: (path, content) => ipcRenderer.invoke('fs:write', { path, content }),
     create: (path, dir) => ipcRenderer.invoke('fs:create', { path, dir }),
     rename: (from, to) => ipcRenderer.invoke('fs:rename', { from, to }),

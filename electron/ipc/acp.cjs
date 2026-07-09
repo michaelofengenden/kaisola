@@ -239,6 +239,9 @@ class AcpConnection {
     this.canLoadSession = !!(res && res.agentCapabilities && res.agentCapabilities.loadSession)
     // agents that accept HTTP MCP servers get the Kaisola server at session/new
     this.mcpHttpOk = !!(res && res.agentCapabilities && res.agentCapabilities.mcpCapabilities && res.agentCapabilities.mcpCapabilities.http)
+    // agents that accept image content blocks in session/prompt (claude does;
+    // an image dropped on the chat rides as real pixels, not just a path)
+    this.promptImageOk = !!(res && res.agentCapabilities && res.agentCapabilities.promptCapabilities && res.agentCapabilities.promptCapabilities.image)
     return res
   }
 
@@ -300,10 +303,18 @@ class AcpConnection {
     return r
   }
 
-  async prompt(text) {
+  async prompt(text, images) {
+    // attached images become ACP image content blocks — only for agents that
+    // advertised promptCapabilities.image. Every attachment is ALSO listed by
+    // path in the text, so a text-only agent still gets something it can read.
+    const blocks = this.promptImageOk && Array.isArray(images)
+      ? images
+          .filter((i) => i && typeof i.data === 'string' && typeof i.mimeType === 'string')
+          .map((i) => ({ type: 'image', mimeType: i.mimeType, data: i.data }))
+      : []
     return this.request('session/prompt', {
       sessionId: this.sessionId,
-      prompt: [{ type: 'text', text }],
+      prompt: [{ type: 'text', text }, ...blocks],
     })
   }
 

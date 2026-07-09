@@ -69,7 +69,11 @@ export function SignInCard() {
             </div>
           ) : (
             <>
-              <p className="signin-instr">Open the authorization page, sign in, and enter the one-time code.</p>
+              <p className="signin-instr">
+                {ev?.code
+                  ? 'Open the authorization page, sign in, and enter the one-time code.'
+                  : 'Open the authorization page and sign in — this card completes on its own.'}
+              </p>
 
               <button
                 className="btn btn-primary signin-open"

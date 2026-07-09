@@ -94,7 +94,11 @@ function presets() {
       docs: 'https://docs.anthropic.com/en/docs/claude-code/overview', builtin: false },
     { id: 'codex', name: 'Codex', command: 'npx', args: ['-y', '@zed-industries/codex-acp'],
       login: 'codex login', installCmd: 'npm i -g @openai/codex',
-      deviceLogin: { command: 'codex', args: ['login', '--device-auth'] },
+      // plain `codex login` — the CLI retired `--device-auth` (codex-cli
+      // ≥0.14x rejects it, which surfaced as a bare "invalid params" in the
+      // sign-in card). It prints/opens the OAuth URL and exits 0 when the
+      // browser flow completes, which is exactly what auth:start streams.
+      deviceLogin: { command: 'codex', args: ['login'] },
       docs: 'https://developers.openai.com/codex/cli', builtin: false },
     // OpenCode ships a real ACP server (`opencode acp`) — full chat threads,
     // inline permission cards, the autonomy dial. No wrapper package needed.
@@ -332,7 +336,7 @@ function registerAcpHandlers(ipcMain) {
     }
   })
 
-  ipcMain.handle('acp:prompt', async (event, { agentKey, reqId, text } = {}) => {
+  ipcMain.handle('acp:prompt', async (event, { agentKey, reqId, text, images } = {}) => {
     const entry = entryFor(event.sender, agentKey)
     if (!entry || !entry.conn.alive) return { ok: false, message: 'Agent not connected.' }
     if (entry.current.channel) return { ok: false, message: 'Agent is mid-turn — send again when it finishes.' }
@@ -342,7 +346,7 @@ function registerAcpHandlers(ipcMain) {
     const turn = { sender: event.sender, channel: `acp:update:${reqId}` }
     entry.current = turn
     try {
-      const res = await entry.conn.prompt(text)
+      const res = await entry.conn.prompt(text, images)
       if (turn.sender && !turn.sender.isDestroyed()) {
         turn.sender.send(turn.channel, { __done: true, stopReason: res && res.stopReason })
       }
@@ -380,9 +384,15 @@ function registerAcpHandlers(ipcMain) {
   ipcMain.handle('acp:authenticate', async (event, { agentKey, methodId } = {}) => {
     const entry = entryFor(event.sender, agentKey)
     if (!entry) return { ok: false, message: 'Agent not connected.' }
+    // never send a methodId the agent didn't advertise — agents answer an
+    // unknown/absent id with a bare JSON-RPC "Invalid params", which is
+    // useless to a human. Fall back to the first advertised method.
+    const methods = (entry.conn && entry.conn.authMethods) || []
+    const mid = methods.some((m) => m && m.id === methodId) ? methodId : methods[0] && methods[0].id
+    if (mid == null) return { ok: false, message: 'This agent offers no in-app sign-in — use its CLI login instead.' }
     entry.recentAuthAt = Date.now()
     entry.lastAuthUrl = null
-    const call = entry.conn.authenticate(methodId).then(() => ({ done: true })).catch((err) => ({ err: err.message }))
+    const call = entry.conn.authenticate(mid).then(() => ({ done: true })).catch((err) => ({ err: err.message }))
     const quick = await Promise.race([call, new Promise((r) => setTimeout(() => r({ pending: true }), 2500))])
     if (quick.err) return { ok: false, message: quick.err }
     if (quick.pending) return { ok: true, pending: true } // browser flow in progress; URL opens via surfaceAuthUrl

@@ -424,7 +424,7 @@ export interface KaisolaBridge {
     setModel(agentKey: string, modelId: string): Promise<{ ok: boolean; message?: string }>
     setConfigOption(agentKey: string, configId: string, value: string): Promise<{ ok: boolean; message?: string }>
     authenticate(agentKey: string, methodId: string): Promise<{ ok: boolean; pending?: boolean; message?: string }>
-    prompt(agentKey: string, text: string, onUpdate: (u: AcpUpdate) => void): Promise<{ ok: boolean; stopReason?: string; message?: string }>
+    prompt(agentKey: string, text: string, onUpdate: (u: AcpUpdate) => void, images?: { mimeType: string; data: string }[]): Promise<{ ok: boolean; stopReason?: string; message?: string }>
     onNotice(cb: (n: AcpNotice) => void): () => void
     onControls(cb: (info: { key: string; controls: AcpControls }) => void): () => void
     onTerminal(cb: (info: AcpTerminalInfo) => void): () => void
@@ -520,6 +520,8 @@ export interface KaisolaBridge {
     search(root: string, query: string): Promise<FsSearchResult>
     index(root: string): Promise<{ ok: boolean; files?: string[]; truncated?: boolean; message?: string }>
     read(path: string): Promise<FsReadResult>
+    /** Image bytes as base64 (png/jpeg/gif/webp, ≤8 MB) — for ACP image blocks. */
+    readImage(path: string): Promise<{ ok: boolean; mimeType?: string; data?: string; size?: number; message?: string }>
     write(path: string, content: string): Promise<{ ok: boolean; message?: string }>
     create(path: string, dir?: boolean): Promise<{ ok: boolean; message?: string }>
     rename(from: string, to: string): Promise<{ ok: boolean; message?: string }>
@@ -816,6 +818,9 @@ const webMock: KaisolaBridge = {
     async read() {
       return { ok: false }
     },
+    async readImage() {
+      return { ok: false, message: DESKTOP_ONLY }
+    },
     async write() {
       return { ok: false, message: DESKTOP_ONLY }
     },
@@ -994,7 +999,7 @@ function scopeAcp(acp: KaisolaBridge['acp']): KaisolaBridge['acp'] {
     setModel: (k, m) => acp.setModel(scopedKey(k), m),
     setConfigOption: (k, c, v) => acp.setConfigOption(scopedKey(k), c, v),
     authenticate: (k, m) => acp.authenticate(scopedKey(k), m),
-    prompt: (k, text, onUpdate) => acp.prompt(scopedKey(k), text, onUpdate),
+    prompt: (k, text, onUpdate, images) => acp.prompt(scopedKey(k), text, onUpdate, images),
     onNotice: (cb) =>
       acp.onNotice((n) => {
         const { key, scope } = splitScopedKey(n.key)

@@ -601,6 +601,26 @@ function registerFsHandlers(ipcMain) {
     }
   })
 
+  // An image attachment's bytes, base64 — the agent chat sends these as ACP
+  // image content blocks so a dropped screenshot reaches the model as pixels
+  // (the path alone is useless to an agent that can't read local files).
+  ipcMain.handle('fs:readImage', async (_e, { path: p } = {}) => {
+    try {
+      if (typeof p !== 'string' || !p) return { ok: false, message: 'no path' }
+      // NB: this file's extname() is dot-less + lowercased ("png", not ".png")
+      const mime = { png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg', gif: 'image/gif', webp: 'image/webp' }[extname(p)]
+      if (!mime) return { ok: false, message: 'Not a supported image type.' }
+      const stat = await fsp.stat(p)
+      // prompts are JSON over stdio — keep inline blocks sane (8 MB of pixels
+      // ≈ 11 MB of base64); bigger images still ride as a path in the text
+      if (stat.size > 8 * 1024 * 1024) return { ok: false, message: 'Image is larger than the 8 MB inline cap.' }
+      const buf = await fsp.readFile(p)
+      return { ok: true, mimeType: mime, data: buf.toString('base64'), size: stat.size }
+    } catch (err) {
+      return { ok: false, message: String((err && err.message) || err) }
+    }
+  })
+
   // Save manual edits back to a workspace file (the IDE's edit path).
   ipcMain.handle('fs:write', async (_e, { path: p, content } = {}) => {
     try {

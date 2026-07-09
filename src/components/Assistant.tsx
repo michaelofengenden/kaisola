@@ -28,6 +28,10 @@ const mentionIcon = (kind: Mention['kind']): string =>
 const doneStatuses = new Set(['completed', 'failed', 'cancelled', 'canceled'])
 /** Streaming transcript flush cadence — ~12 renders/sec regardless of token rate. */
 const STREAM_FLUSH_MS = 80
+// one quiet auto-connect attempt per agent+workspace per app run — module
+// scope so two side-by-side threads on the same agent can't race a double
+// connect (the second would dispose the first's fresh session)
+const acpAutoConnectTried = new Set<string>()
 const statusTone = (status?: string): string => {
   const s = (status || 'pending').toLowerCase()
   return s === 'completed' ? 'completed' : s === 'failed' ? 'failed' : s === 'cancelled' || s === 'canceled' ? 'cancelled' : 'running'
@@ -455,6 +459,23 @@ export const Assistant = memo(function Assistant({ threadId }: { threadId: strin
       setNotice('This agent has no CLI login.')
     }
   }
+  // A fresh thread just TRIES to connect: the CLIs cache their logins on disk
+  // (claude/codex), so most threads should come up Connected without anyone
+  // touching "Sign in" — clicking it used to be the only visible path, and for
+  // Claude that path is a `claude /login` terminal, which read as broken when
+  // the user was already signed in. Never auto-runs when no workspace is set
+  // (connect() would pop the folder picker); failures land in the notice line
+  // and the explicit Sign in button remains.
+  useEffect(() => {
+    if (connected || busy || !workspacePath) return
+    const preset = presets.find((p) => p.id === agentKey)
+    const custom = useKaisola.getState().customAgents.find((a) => a.id === agentKey && a.kind === 'acp')
+    if ((!preset || preset.terminalOnly) && !custom) return
+    const attempt = `${agentKey}|${workspacePath}`
+    if (acpAutoConnectTried.has(attempt)) return
+    acpAutoConnectTried.add(attempt)
+    void connect(agentKey)
+  }, [agentKey, connected, busy, presets, workspacePath])
   const onControlChange = async (c: UiControl, value: string) => {
     if (c.kind === 'mode') await bridge.acp.setMode(agentKey, value)
     else if (c.kind === 'model') await bridge.acp.setModel(agentKey, value)
@@ -558,8 +579,21 @@ export const Assistant = memo(function Assistant({ threadId }: { threadId: strin
     const mentionPrefix = mns.length ? `Referenced from the research project (use if relevant):\n${mns.map((m) => `- ${m.text}`).join('\n')}\n\n` : ''
     const filePrefix = files.length ? `Attached files (read them if relevant):\n${files.join('\n')}\n\n` : ''
     const payload = `${first ? `${buildContext()}\n\n` : ''}${mentionPrefix}${filePrefix}${text}`
+    // image attachments ALSO ride as real ACP image blocks (pixels, not a
+    // path) for agents that take them; the path stays in filePrefix above as
+    // the text-only fallback. Unreadable/oversized images just stay paths.
+    const images = (
+      await Promise.all(
+        files
+          .filter((f) => /\.(png|jpe?g|gif|webp)$/i.test(f))
+          .map(async (f) => {
+            const r = await bridge.fs.readImage(f)
+            return r.ok && r.data && r.mimeType ? { mimeType: r.mimeType, data: r.data } : null
+          }),
+      )
+    ).filter((i): i is { mimeType: string; data: string } => i !== null)
     const stream = makeOnUpdate(threadId)
-    const res = await bridge.acp.prompt(agentKey, payload, stream.onUpdate)
+    const res = await bridge.acp.prompt(agentKey, payload, stream.onUpdate, images.length ? images : undefined)
     stream.flush() // drain any buffered tail before settling the turn
     updateRuntime(threadId, (r) => {
       let turns = r.turns

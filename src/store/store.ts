@@ -39,6 +39,7 @@ import { extractDoi, lookupOpenAlex, lookupOpenAlexByArxiv, resolveReferences } 
 import { parseTei, locateQuote } from '../lib/grobid'
 import { bridge, isDesktop, acpScope, type AcpPermissionRequest, type McpProposalEvent } from '../lib/bridge'
 import { folderHue } from '../lib/sessionHue'
+import { lineHunks, applyHunks } from '../lib/wordDiff'
 import { forgetMountedTerminal } from '../components/Terminal'
 import {
   allowOnceAnswer,
@@ -878,6 +879,8 @@ interface KaisolaState {
 
   // ── proposal lifecycle (the gate) ──
   approveProposal: (id: string) => void
+  /** Approve keeping only some hunks (changeId → kept hunk indexes); status 'edited'. */
+  approveProposalPartial: (id: string, keep: Record<string, number[]>) => void
   rejectProposal: (id: string) => void
   /** Best-of-N: approve one competing proposal and reject its siblings. */
   pickWinner: (winnerId: string) => void
@@ -2907,6 +2910,49 @@ export const useKaisola = create<KaisolaState>()(
           ),
           activity: [
             { id: uid('act'), agentId: 'human', state: 'done', text: `Approved “${trim(proposal.title)}”`, at: nowISO(), proposalId: id },
+            ...applied.activity,
+          ],
+        },
+      }
+    }),
+
+  // Partial accept: the human keeps only some hunks of a text change. The
+  // derived (smaller) proposal flows through the SAME applyProposal gate —
+  // 'edited' is just 'approved' with a trimmed diff, never a second mutation
+  // path. `keep` maps changeId → kept hunk indexes (changes not listed apply
+  // whole). Only changes whose payload.patch has a field strictly equal to
+  // `after` are eligible (ProposalCard enforces the same check) — otherwise
+  // the applied patch and the displayed text could silently diverge.
+  approveProposalPartial: (id, keep) =>
+    set((state) => {
+      const proposal = state.project.proposals.find((p) => p.id === id)
+      if (!proposal || proposal.status !== 'pending') return {}
+      const derived: Proposal = {
+        ...proposal,
+        changes: proposal.changes.map((c) => {
+          const keptIdx = keep[c.id]
+          if (!keptIdx || c.before == null || c.after == null) return c
+          const after = applyHunks(c.before, lineHunks(c.before, c.after), new Set(keptIdx))
+          if (after === c.after) return c
+          const payload = c.payload as { id?: string; patch?: Record<string, unknown> } | undefined
+          const patch = payload?.patch
+          const key = patch ? Object.keys(patch).find((k) => patch[k] === c.after) : undefined
+          if (!key || !payload) return c // no safe mapping — apply whole (card never offers hunks here)
+          return { ...c, after, payload: { ...payload, patch: { ...patch, [key]: after } } }
+        }),
+      }
+      const applied = applyProposal(state.project, derived)
+      return {
+        focusedProposalId: null,
+        agentTasks: updateTaskForProposal(state.agentTasks, proposal, 'applied'),
+        checkpoints: pushCheckpoint(state, `Before applying (edited) “${trim(proposal.title)}”`, 'approve'),
+        project: {
+          ...applied,
+          proposals: applied.proposals.map((p) =>
+            p.id === id ? { ...derived, status: 'edited' as const, resolvedAt: nowISO() } : p,
+          ),
+          activity: [
+            { id: uid('act'), agentId: 'human', state: 'done', text: `Approved with edits “${trim(proposal.title)}”`, at: nowISO(), proposalId: id },
             ...applied.activity,
           ],
         },

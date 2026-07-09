@@ -340,6 +340,34 @@
   font-size: var(--fs-11);
   color: var(--warn);
 }
+/* hunk picker (Edit on a text proposal): keep/drop each contiguous change */
+.proposal-hunks {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+  padding: var(--sp-3) var(--sp-4);
+  border: 1px solid var(--border-faint);
+  border-radius: var(--r-2);
+  background: color-mix(in srgb, var(--bg-inset) 50%, transparent);
+}
+.proposal-hunks-change {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-1);
+}
+.proposal-hunk {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  font-size: var(--fs-12);
+  font-family: var(--font-mono);
+  color: var(--text-2);
+  cursor: pointer;
+}
+.proposal-hunk input { accent-color: var(--accent); }
+.proposal-hunk-preview { min-width: 0; }
+.proposal-resolved-edited { color: var(--accent); }
+
 .proposal-actions {
   display: flex;
   gap: var(--sp-3);

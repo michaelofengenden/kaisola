@@ -65,8 +65,9 @@
   max-height: 60vh;
   display: flex;
   flex-direction: column;
-  background: var(--bg-3);
-  border: 1px solid var(--border-strong);
+  background-color: var(--shell-popover-bg);
+  background-image: var(--shell-surface-grain);
+  border: 1px solid var(--shell-surface-border);
   border-radius: var(--r-4);
   box-shadow: var(--shadow-pop);
   overflow: hidden;

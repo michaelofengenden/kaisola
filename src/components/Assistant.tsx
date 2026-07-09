@@ -4,6 +4,7 @@ import {
   useKaisola,
   type AssistantDraft,
   type ClaudeEffort,
+  type CodexEffort,
   type AssistantMention,
   type AssistantRuntime,
   type PlanEntry,
@@ -12,6 +13,7 @@ import {
   type AssistantThread,
   type AssistantTurn,
   type QueuedAssistantPrompt,
+  ASSISTANT_DRAFT_TEXT_LIMIT,
 } from '../store/store'
 import { bridge, type AcpUpdate, type AcpControls, type AcpPreset, type AcpAgent, type AcpPermissionRequest } from '../lib/bridge'
 import { diffHunks, diffStat } from '../lib/lineDiff'
@@ -29,6 +31,53 @@ type Mention = AssistantMention
 type Runtime = AssistantRuntime
 type ControlKind = 'mode' | 'model' | 'config'
 interface UiControl { id: string; name: string; category: string; value: string; options: { value: string; name: string; description?: string }[]; kind: ControlKind }
+
+const ARCHIVED_TURN_KINDS = new Set<Turn['kind']>(['user', 'assistant', 'thought', 'tool'])
+const MAX_ARCHIVE_VIEW_TURNS = 180
+const MAX_ARCHIVE_VIEW_BYTES = 32 * 1024 * 1024
+/** IPC archives are private app data, but still cross a process boundary. Keep
+ * malformed/corrupt JSONL records away from render-time string operations. */
+const archivedTurn = (value: unknown): Turn | null => {
+  if (!value || typeof value !== 'object') return null
+  const raw = value as Record<string, unknown>
+  if (!ARCHIVED_TURN_KINDS.has(raw.kind as Turn['kind']) || typeof raw.text !== 'string') return null
+  const kind = raw.kind as Turn['kind']
+  const turn: Turn = { kind, text: raw.text.slice(0, kind === 'tool' ? 4000 : kind === 'thought' ? 160_000 : 320_000) }
+  if (typeof raw.toolId === 'string') turn.toolId = raw.toolId.slice(0, 4000)
+  if (typeof raw.status === 'string') turn.status = raw.status.slice(0, 200)
+  if (typeof raw.at === 'number' && Number.isFinite(raw.at)) turn.at = raw.at
+  if (typeof raw.thinkMs === 'number' && Number.isFinite(raw.thinkMs)) turn.thinkMs = raw.thinkMs
+  if (typeof raw.checkpointId === 'string') turn.checkpointId = raw.checkpointId
+  if (Array.isArray(raw.artifacts)) {
+    const artifacts: ToolArtifact[] = []
+    for (const item of raw.artifacts.slice(0, 8)) {
+      if (!item || typeof item !== 'object') continue
+      const artifact = item as Record<string, unknown>
+      if (artifact.type === 'diff' && typeof artifact.path === 'string' && typeof artifact.oldText === 'string' && typeof artifact.newText === 'string') {
+        artifacts.push({ type: 'diff', path: artifact.path.slice(0, 2000), oldText: artifact.oldText.slice(-200_000), newText: artifact.newText.slice(-200_000) })
+      } else if (artifact.type === 'terminal' && typeof artifact.terminalId === 'string') {
+        artifacts.push({ type: 'terminal', terminalId: artifact.terminalId.slice(0, 4000) })
+      } else if (artifact.type === 'content' && typeof artifact.text === 'string') {
+        artifacts.push({ type: 'content', text: artifact.text.slice(0, 320_000) })
+      }
+    }
+    if (artifacts.length) turn.artifacts = artifacts
+  }
+  return turn
+}
+
+const boundArchivedView = (turns: Turn[]): { turns: Turn[]; truncated: boolean } => {
+  const kept: Turn[] = []
+  let bytes = 0
+  for (const turn of turns) {
+    let size = 0
+    try { size = new TextEncoder().encode(JSON.stringify(turn)).byteLength } catch { continue }
+    if (kept.length >= MAX_ARCHIVE_VIEW_TURNS || (kept.length > 0 && bytes + size > MAX_ARCHIVE_VIEW_BYTES)) return { turns: kept, truncated: true }
+    kept.push(turn)
+    bytes += size
+  }
+  return { turns: kept, truncated: false }
+}
 
 const CATEGORY_ORDER: Record<string, number> = { mode: 0, model: 1, thought_level: 2, speed: 3 }
 const CATEGORY_ICON: Record<string, string> = { mode: 'ShieldCheck', model: 'Box', thought_level: 'Brain', speed: 'Gauge' }
@@ -49,14 +98,50 @@ const SPEED_OPTIONS = [
   { value: 'deep', name: 'Deep', description: 'More checking before answering' },
 ]
 const CLAUDE_EFFORT_OPTIONS = [
+  { value: 'default', name: 'Default', description: 'Use this Claude model’s default effort' },
   { value: 'low', name: 'Light', description: 'Fastest · minimal thinking' },
   { value: 'medium', name: 'Medium', description: 'Moderate reasoning' },
   { value: 'high', name: 'High', description: 'Deep reasoning' },
   { value: 'xhigh', name: 'Extra High', description: 'More time for difficult work' },
   { value: 'max', name: 'Max', description: 'Maximum available effort · higher usage' },
 ]
+const CODEX_EFFORT_OPTIONS = [
+  { value: 'low', name: 'Light', description: 'Fastest · minimal reasoning' },
+  { value: 'medium', name: 'Medium', description: 'Balanced reasoning' },
+  { value: 'high', name: 'High', description: 'Deep reasoning' },
+  { value: 'xhigh', name: 'Extra High', description: 'More time for difficult work' },
+  { value: 'max', name: 'Ultra', description: 'Maximum reasoning available for this model' },
+  { value: 'ultra', name: 'Ultra', description: 'Maximum Codex reasoning · higher usage' },
+]
 const isAssistantSpeed = (v: string): v is AssistantSpeed => v === 'fast' || v === 'balanced' || v === 'deep'
-const isClaudeEffort = (v: string): v is ClaudeEffort => ['low', 'medium', 'high', 'xhigh', 'max'].includes(v)
+const isClaudeEffort = (v: string): v is ClaudeEffort => ['default', 'low', 'medium', 'high', 'xhigh', 'max'].includes(v)
+const isCodexEffort = (v: string): v is CodexEffort => ['low', 'medium', 'high', 'xhigh', 'max', 'ultra'].includes(v)
+const MAX_VISIBLE_TURN_TEXT = 320_000
+const MAX_DIFF_TEXT = 200_000
+const MAX_TOOL_ARTIFACTS = 8
+const MAX_TOOL_ARTIFACT_CHARS = 1_500_000
+const appendBounded = (current: string, chunk: string, cap = MAX_VISIBLE_TURN_TEXT) => {
+  const combined = current + chunk
+  if (combined.length <= cap) return combined
+  const marker = '\n\n… earlier output compacted to keep this session responsive …\n\n'
+  const head = Math.floor(cap * 0.58)
+  return combined.slice(0, head) + marker + combined.slice(-(cap - head - marker.length))
+}
+const artifactChars = (artifact: ToolArtifact) =>
+  (artifact.path?.length ?? 0) + (artifact.oldText?.length ?? 0) + (artifact.newText?.length ?? 0) +
+  (artifact.terminalId?.length ?? 0) + (artifact.text?.length ?? 0)
+const boundArtifacts = (artifacts: ToolArtifact[], preferNewest = false): ToolArtifact[] => {
+  const source = preferNewest ? [...artifacts].reverse() : artifacts
+  const out: ToolArtifact[] = []
+  let chars = 0
+  for (const artifact of source) {
+    const size = artifactChars(artifact)
+    if (out.length >= MAX_TOOL_ARTIFACTS || (out.length > 0 && chars + size > MAX_TOOL_ARTIFACT_CHARS)) break
+    out.push(artifact)
+    chars += size
+  }
+  return preferNewest ? out.reverse() : out
+}
 const speedGuidance = (speed: AssistantSpeed, nativeApplied: boolean): string => {
   if (nativeApplied) return ''
   if (speed === 'fast') return 'Kaisola speed: Fast. Prioritize a quick, concise answer and avoid broad exploration unless it is necessary.\n\n'
@@ -75,10 +160,13 @@ function useProviderPopover(open: boolean, setOpen: (open: boolean) => void, but
       if (event.key !== 'Escape') return
       event.stopPropagation()
       setOpen(false)
+      button.current?.focus()
     }
     document.addEventListener('mousedown', onPointer)
     window.addEventListener('keydown', onKey, true)
+    const raf = requestAnimationFrame(() => panel.current?.querySelector<HTMLElement>('button,[tabindex="0"]')?.focus())
     return () => {
+      cancelAnimationFrame(raf)
       document.removeEventListener('mousedown', onPointer)
       window.removeEventListener('keydown', onKey, true)
     }
@@ -88,27 +176,38 @@ function useProviderPopover(open: boolean, setOpen: (open: boolean) => void, but
 function popoverPosition(button: HTMLButtonElement | null) {
   const rect = button?.getBoundingClientRect()
   if (!rect) return { right: 12, bottom: 56 }
-  return {
-    right: Math.max(8, window.innerWidth - rect.right),
-    bottom: Math.max(8, window.innerHeight - rect.top + 7),
-  }
+  const above = Math.max(120, rect.top - 14)
+  const below = Math.max(120, window.innerHeight - rect.bottom - 14)
+  return above >= below
+    ? { right: Math.max(8, window.innerWidth - rect.right), bottom: Math.max(8, window.innerHeight - rect.top + 7), maxHeight: above }
+    : { right: Math.max(8, window.innerWidth - rect.right), top: rect.bottom + 7, maxHeight: below }
+}
+
+function codexPopoverPosition(button: HTMLButtonElement | null) {
+  const base = popoverPosition(button)
+  const rect = button?.getBoundingClientRect()
+  if (!rect || window.innerWidth <= 680) return base
+  const width = Math.min(608, window.innerWidth - 16)
+  const left = Math.max(8, Math.min(rect.left, window.innerWidth - width - 8))
+  const { right: _right, ...vertical } = base
+  return { ...vertical, left }
 }
 
 /** Claude's own Faster → Smarter effort treatment, backed by a real reconnect. */
-function ClaudeEffortPicker({ value, busy, onSelect }: { value: ClaudeEffort; busy?: boolean; onSelect: (value: string) => void }) {
+function ClaudeEffortPicker({ value, options = CLAUDE_EFFORT_OPTIONS, busy, onSelect }: { value: ClaudeEffort; options?: typeof CLAUDE_EFFORT_OPTIONS; busy?: boolean; onSelect: (value: string) => void }) {
   const [open, setOpen] = useState(false)
   const button = useRef<HTMLButtonElement>(null)
   const panel = useRef<HTMLDivElement>(null)
   useProviderPopover(open, setOpen, button, panel)
-  const index = Math.max(0, CLAUDE_EFFORT_OPTIONS.findIndex((option) => option.value === value))
-  const current = CLAUDE_EFFORT_OPTIONS[index]
+  const index = Math.max(0, options.findIndex((option) => option.value === value))
+  const current = options[index]
   return (
     <>
-      <button ref={button} className="provider-summary-btn" data-open={open} disabled={busy} onClick={() => setOpen((state) => !state)} title="Claude effort">
+      <button ref={button} className="provider-summary-btn" data-open={open} disabled={busy} onClick={() => setOpen((state) => !state)} title="Claude effort" aria-haspopup="dialog" aria-expanded={open}>
         <span>{current?.name ?? value}</span><Icon name="ChevronDown" size={12} />
       </button>
       {open && createPortal(
-        <div ref={panel} className="provider-pop claude-effort-pop" style={{ position: 'fixed', ...popoverPosition(button.current) }}>
+        <div ref={panel} className="provider-pop claude-effort-pop" role="dialog" aria-label="Claude effort" style={{ position: 'fixed', ...popoverPosition(button.current) }}>
           <div className="provider-pop-head">
             <span className="faint">Effort</span>
             <strong>{current?.name ?? value}</strong>
@@ -116,9 +215,9 @@ function ClaudeEffortPicker({ value, busy, onSelect }: { value: ClaudeEffort; bu
             <Icon name="CircleHelp" size={14} className="faint" />
           </div>
           <div className="effort-axis"><span>Faster</span><span>Smarter</span></div>
-          <div className="effort-track">
-            <span className="effort-track-fill" style={{ width: `${index * 25}%` }} />
-            {CLAUDE_EFFORT_OPTIONS.map((option, optionIndex) => (
+          <div className="effort-track" style={{ gridTemplateColumns: `repeat(${Math.max(1, options.length)}, 1fr)` }}>
+            <span className="effort-track-fill" style={{ width: `${options.length > 1 ? (index / (options.length - 1)) * 100 : 0}%` }} />
+            {options.map((option, optionIndex) => (
               <button
                 key={option.value}
                 data-active={optionIndex === index}
@@ -126,6 +225,7 @@ function ClaudeEffortPicker({ value, busy, onSelect }: { value: ClaudeEffort; bu
                 onClick={() => { onSelect(option.value); setOpen(false) }}
                 title={`${option.name} — ${option.description}`}
                 aria-label={`Set Claude effort to ${option.name}`}
+                aria-pressed={optionIndex === index}
               ><span /></button>
             ))}
           </div>
@@ -140,48 +240,80 @@ function ClaudeEffortPicker({ value, busy, onSelect }: { value: ClaudeEffort; bu
 /** Codex's compact Advanced panel. Effort is honest about adapter support. */
 function CodexAdvancedPicker({
   model,
+  effort,
+  effortValue,
   speed,
   onModel,
+  onEffort,
   onSpeed,
 }: {
   model: UiControl
+  effort?: UiControl
+  effortValue: CodexEffort
   speed: AssistantSpeed
   onModel: (value: string) => void
+  onEffort: (value: string) => void
   onSpeed: (value: string) => void
 }) {
   const [open, setOpen] = useState(false)
+  const [section, setSection] = useState<'model' | 'effort' | 'speed'>('effort')
   const button = useRef<HTMLButtonElement>(null)
   const panel = useRef<HTMLDivElement>(null)
   useProviderPopover(open, setOpen, button, panel)
   const currentModel = model.options.find((option) => option.value === model.value)
   const speedName = SPEED_OPTIONS.find((option) => option.value === speed)?.name ?? speed
-  const compactModel = (currentModel?.name ?? model.value).replace(/^GPT-/, '')
+  const effortOptions = effort?.options.filter((option) => isCodexEffort(option.value)) ?? []
+  const currentEffort = effortOptions.find((option) => option.value === effortValue)
+    ?? CODEX_EFFORT_OPTIONS.find((option) => option.value === effortValue)
+  const compactModel = (currentModel?.name ?? model.value).replace(/^GPT-/i, '').replaceAll('-', ' ')
+  const chooseModel = (value: string) => { onModel(value); setOpen(false) }
+  const chooseEffort = (value: string) => { onEffort(value); setOpen(false) }
+  const chooseSpeed = (value: string) => { onSpeed(value); setOpen(false) }
   return (
     <>
-      <button ref={button} className="provider-summary-btn codex-summary" data-open={open} onClick={() => setOpen((state) => !state)} title="Codex model, effort, and speed">
+      <button ref={button} className="provider-summary-btn codex-summary" data-open={open} onClick={() => { setSection('effort'); setOpen((state) => !state) }} title="Codex model, effort, and speed" aria-haspopup="menu" aria-expanded={open}>
         <Icon name="Zap" size={13} />
         <span>{compactModel}</span>
-        <b>{speedName}</b>
+        <b>{currentEffort?.name ?? effortValue}</b>
         <Icon name="ChevronDown" size={12} />
       </button>
       {open && createPortal(
-        <div ref={panel} className="provider-pop codex-advanced-pop" style={{ position: 'fixed', ...popoverPosition(button.current) }}>
-          <div className="provider-pop-head"><strong>Codex</strong><span className="grow" /><span className="faint">Advanced</span></div>
-          <div className="provider-setting-head"><span>Model</span><strong>{currentModel?.name ?? model.value}</strong></div>
-          <div className="provider-model-grid">
-            {model.options.map((option) => (
-              <button key={option.value} data-active={option.value === model.value} onClick={() => onModel(option.value)}>
-                <Icon name="Check" size={11} /><span><strong>{option.name}</strong>{option.description && <small>{option.description}</small>}</span>
+        <div ref={panel} className="provider-pop-stack" role="menu" aria-label="Codex controls" style={{ position: 'fixed', ...codexPopoverPosition(button.current) }}>
+          <div className="provider-pop codex-advanced-pop codex-main-menu">
+            {([
+              ['model', 'Model', compactModel],
+              ['effort', 'Effort', currentEffort?.name ?? effortValue],
+              ['speed', 'Speed', speedName],
+            ] as const).map(([id, label, value]) => (
+              <button key={id} className="provider-menu-row" data-active={section === id} onMouseEnter={() => setSection(id)} onClick={() => setSection(id)} aria-haspopup="menu" aria-expanded={section === id}>
+                <span>{label}</span><strong>{value}</strong><Icon name="ChevronRight" size={14} />
               </button>
             ))}
+            <div className="provider-menu-foot"><span>Advanced</span><Icon name="ChevronUp" size={13} /></div>
           </div>
-          <div className="provider-setting-row provider-setting-disabled" title="The connected codex-acp adapter does not expose live effort yet">
-            <span>Effort</span><strong>Codex config</strong><Icon name="LockKeyhole" size={12} />
-          </div>
-          <p className="provider-capability-note">Live effort appears here as soon as the connected Codex adapter exposes it. Terminal sessions still honor your Codex setting, including Max and Ultra.</p>
-          <div className="provider-setting-head"><span>Speed</span><strong>{speedName}</strong></div>
-          <div className="provider-speed-grid">
-            {SPEED_OPTIONS.map((option) => <button key={option.value} data-active={option.value === speed} onClick={() => onSpeed(option.value)}>{option.name}</button>)}
+          <div className="provider-pop codex-submenu" role="menu" aria-label={`Codex ${section}`}>
+            <div className="provider-pop-head"><span className="faint">{section === 'model' ? 'Model' : section === 'effort' ? 'Effort' : 'Speed'}</span></div>
+            {section === 'model' && model.options.map((option) => (
+              <button key={option.value} className="provider-choice-row" role="menuitemradio" aria-checked={option.value === model.value} onClick={() => chooseModel(option.value)}>
+                <span><strong>{option.name}</strong>{option.description && <small>{option.description}</small>}</span><Icon name="Check" size={14} />
+              </button>
+            ))}
+            {section === 'effort' && effort && effortOptions.length > 0 && effortOptions.map((option) => (
+              <button key={option.value} className="provider-choice-row" role="menuitemradio" aria-checked={option.value === effortValue} onClick={() => chooseEffort(option.value)}>
+                <span>{option.name}</span><Icon name="Check" size={14} />
+              </button>
+            ))}
+            {section === 'effort' && (!effort || !effortOptions.length) && <p className="provider-capability-note">The installed Codex adapter does not expose live reasoning effort.</p>}
+            {section === 'speed' && SPEED_OPTIONS.map((option) => (
+              <button key={option.value} className="provider-choice-row" role="menuitemradio" aria-checked={option.value === speed} onClick={() => chooseSpeed(option.value)}>
+                <span>{option.name}</span><Icon name="Check" size={14} />
+              </button>
+            ))}
+            <p className="provider-choice-note">
+              {section === 'effort'
+                ? currentEffort?.name === 'Ultra' ? 'Consumes usage limits faster' : currentEffort?.description
+                : section === 'speed' ? 'Fast mode reduces latency; effort remains separate.' : currentModel?.description}
+            </p>
           </div>
         </div>,
         document.body,
@@ -189,10 +321,6 @@ function CodexAdvancedPicker({
     </>
   )
 }
-// one quiet auto-connect attempt per agent+workspace per app run — module
-// scope so two side-by-side threads on the same agent can't race a double
-// connect (the second would dispose the first's fresh session)
-const acpAutoConnectTried = new Set<string>()
 const statusTone = (status?: string): string => {
   const s = (status || 'pending').toLowerCase()
   return s === 'completed' ? 'completed' : s === 'failed' ? 'failed' : s === 'cancelled' || s === 'canceled' ? 'cancelled' : 'running'
@@ -425,6 +553,7 @@ function nativeSpeedControl(controls: UiControl[]): UiControl | null {
 }
 
 function speedOptionValue(c: UiControl, speed: AssistantSpeed): string | null {
+  if (/fast[-_ ]?mode/i.test(`${c.id} ${c.name}`)) return speed === 'fast' ? 'on' : 'off'
   const want =
     speed === 'fast'
       ? /fast|quick|low|minimal|light|none|short/
@@ -436,6 +565,19 @@ function speedOptionValue(c: UiControl, speed: AssistantSpeed): string | null {
   if (speed === 'fast') return c.options[0]?.value ?? null
   if (speed === 'deep') return c.options[c.options.length - 1]?.value ?? null
   return c.options[Math.floor((c.options.length - 1) / 2)]?.value ?? null
+}
+
+function displayedSpeed(c: UiControl | null, draft: AssistantSpeed): AssistantSpeed {
+  if (!c) return draft
+  const selected = c.options.find((option) => option.value === c.value)
+  const value = `${c.value} ${selected?.name ?? ''}`.toLowerCase()
+  if (/fast[-_ ]?mode/i.test(`${c.id} ${c.name}`)) {
+    if (/\b(on|true|enabled|fast)\b/.test(value)) return 'fast'
+    return draft === 'fast' ? 'balanced' : draft
+  }
+  if (/fast|quick|low|minimal|light/.test(value)) return 'fast'
+  if (/deep|high|max|extended|thorough/.test(value)) return 'deep'
+  return 'balanced'
 }
 
 function buildContext(): string {
@@ -456,6 +598,7 @@ export const Assistant = memo(function Assistant({ threadId }: { threadId: strin
   const autonomy = useKaisola((s) => s.autonomy)
   const openSettings = useKaisola((s) => s.setSettingsOpen)
   const workspacePath = useKaisola((s) => s.workspacePath)
+  const projectId = useKaisola((s) => s.activeProjectId)
   const setWorkspace = useKaisola((s) => s.setWorkspace)
   const requestTerminal = useKaisola((s) => s.requestTerminal)
   const openSignIn = useKaisola((s) => s.openSignIn)
@@ -474,6 +617,7 @@ export const Assistant = memo(function Assistant({ threadId }: { threadId: strin
   const autoNameThread = useKaisola((s) => s.autoNameThread)
   const setStoreThreadAgent = useKaisola((s) => s.setAssistantThreadAgent)
   const setThreadClaudeEffort = useKaisola((s) => s.setThreadClaudeEffort)
+  const setThreadCodexEffort = useKaisola((s) => s.setThreadCodexEffort)
   const project = useKaisola((s) => s.project)
   const stage = useKaisola((s) => s.stage)
   const agentTerminals = useKaisola((s) => s.agentTerminals)
@@ -481,6 +625,8 @@ export const Assistant = memo(function Assistant({ threadId }: { threadId: strin
 
   const [presets, setPresets] = useState<AcpPreset[]>([])
   const [agents, setAgents] = useState<AcpAgent[]>([])
+  const [statusReadyKey, setStatusReadyKey] = useState('')
+  const autoConnectAttemptRef = useRef<string | null>(null)
   const [notice, setNotice] = useState<string | null>(null)
   const [authUrl, setAuthUrl] = useState<string | null>(null)
   // an OS file drag hovering the chat — the drop lands as attachment chips
@@ -511,35 +657,133 @@ export const Assistant = memo(function Assistant({ threadId }: { threadId: strin
   const dequeueAssistantPrompt = useKaisola((s) => s.dequeueAssistantPrompt)
   const removeQueuedAssistantPrompt = useKaisola((s) => s.removeQueuedAssistantPrompt)
   const agentKey = active.agentKey
+  // Provider sessions are per assistant thread, not merely per provider. Two
+  // Codex cards in one project therefore retain independent contexts and
+  // resume ids when hidden adapters park to disk.
+  const connectionKey = `${agentKey}::${active.id}`
   const busy = active.busy
   const input = draft.text
   const attachments = draft.attachments
   const mentions = draft.mentions
   const speed = draft.speed
-  const claudeEffort = active.claudeEffort ?? 'high'
   useEffect(() => { if (inputRef.current && !input) inputRef.current.style.height = '' }, [input])
-  const permsForAgent = pendingPermissions.filter((p) => p.key === agentKey)
+  const permsForAgent = pendingPermissions.filter((p) => p.key === connectionKey)
   const arun: Runtime = liveRuntime ?? { turns: [], first: true }
+  const [archivedPage, setArchivedPage] = useState<Turn[]>([])
+  const [archiveBefore, setArchiveBefore] = useState<number | undefined>()
+  const [archiveTotal, setArchiveTotal] = useState<number | undefined>()
+  const [archiveHasMore, setArchiveHasMore] = useState(false)
+  const [archiveLoading, setArchiveLoading] = useState(false)
+  const [archiveGap, setArchiveGap] = useState(false)
+  const archiveRequestRef = useRef(0)
+  const archiveRetryAttemptRef = useRef('')
+  const archiveScope = useMemo(() => ({
+    projectId,
+    threadId: active.id,
+    ...(arun.archiveEpoch ? { epoch: arun.archiveEpoch } : {}),
+  }), [active.id, arun.archiveEpoch, projectId])
+  const archiveScopeKey = `${archiveScope.projectId}\u0000${archiveScope.threadId}\u0000${archiveScope.epoch ?? '0'}`
+  // Main owns the authoritative end. Probe metadata without hydrating turns;
+  // a recovered post-crash tail therefore becomes discoverable immediately.
+  useEffect(() => {
+    const request = ++archiveRequestRef.current
+    setArchivedPage([])
+    setArchiveBefore(undefined)
+    setArchiveTotal(undefined)
+    setArchiveHasMore(false)
+    setArchiveLoading(false)
+    setArchiveGap(false)
+    if (!bridge.assistantArchive) return
+    void bridge.assistantArchive.info(archiveScope).then((result) => {
+      if (archiveRequestRef.current !== request || !result.ok) return
+      setArchiveTotal(result.total)
+      setArchiveHasMore(result.total > 0)
+    }).catch(() => {})
+  }, [archiveScopeKey, arun.archivedTurns])
+  // A quit or disk error retains the unacknowledged prefix and its idempotency
+  // token. Retry once this owning card is mounted again.
+  useEffect(() => {
+    if (!arun.archiveBatch || arun.archivePending) return
+    const attempt = `${archiveScopeKey}\u0000${arun.archiveBatch.id}`
+    if (archiveRetryAttemptRef.current === attempt) return
+    archiveRetryAttemptRef.current = attempt
+    updateAssistantRuntime(active.id, (runtime) => runtime, projectId)
+  }, [active.id, archiveScopeKey, arun.archiveBatch?.id, arun.archivePending, projectId, updateAssistantRuntime])
+  const archivedCount = archiveTotal ?? arun.archivedTurns ?? 0
+  const canLoadArchive = archiveBefore === undefined ? archivedCount > 0 : archiveHasMore
+  const loadOlderTurns = async (fromLatest = false) => {
+    if (archiveLoading || !bridge.assistantArchive) return
+    const request = archiveRequestRef.current
+    const cursor = fromLatest ? undefined : archiveBefore
+    setArchiveLoading(true)
+    try {
+      // `undefined` deliberately lets main choose its reconciled end; never
+      // seed first paging from a possibly stale renderer count.
+      const result = await bridge.assistantArchive.page(archiveScope, cursor, 60)
+      if (archiveRequestRef.current !== request || !result.ok) return
+      const turns = result.turns.map(archivedTurn).filter((turn): turn is Turn => !!turn)
+      const replace = fromLatest || archiveBefore === undefined
+      const bounded = boundArchivedView(replace ? turns : [...turns, ...archivedPage])
+      setArchivedPage(bounded.turns)
+      setArchiveGap(bounded.truncated)
+      setArchiveBefore(result.before ?? Math.max(0, (cursor ?? result.total ?? archivedCount) - turns.length))
+      setArchiveTotal(result.total ?? archivedCount)
+      setArchiveHasMore(!!result.hasMore)
+    } catch {
+      // The live window stays intact; archive IPC failures are retryable and
+      // never justify dropping conversation state.
+    } finally {
+      if (archiveRequestRef.current === request) setArchiveLoading(false)
+    }
+  }
   const agentPreset = presets.find((p) => p.id === agentKey)
   const agentName = agentPreset?.name ?? agentKey
-  const aState = agents.find((a) => a.key === agentKey)
+  const aState = agents.find((a) => a.key === connectionKey)
   const connected = !!aState?.connected
   const controls = controlList(aState?.controls ?? null)
   const speedControl = nativeSpeedControl(controls)
+  const liveSpeed = displayedSpeed(speedControl, speed)
   const visibleControls = speedControl ? controls.filter((c) => c.id !== speedControl.id) : controls
-  const hasNativeEffort = controls.some((c) => /effort|reasoning|thought|think/.test(`${c.id} ${c.name} ${c.category}`.toLowerCase()))
   const claudeAgent = /claude/i.test(`${agentKey} ${agentName}`)
   const codexAgent = /codex/i.test(`${agentKey} ${agentName}`)
   const providerModelControl = visibleControls.find((control) => control.kind === 'model' || control.category === 'model')
+  const providerEffortControl = visibleControls.find((control) => /reasoning.*effort|effort/i.test(`${control.id} ${control.name} ${control.category}`))
   const composerControls = providerModelControl && (claudeAgent || codexAgent)
-    ? visibleControls.filter((control) => control !== providerModelControl)
+    ? visibleControls.filter((control) => control !== providerModelControl && control !== providerEffortControl)
     : visibleControls
+  const providerClaudeEfforts = providerEffortControl?.options.map((option) => option.value).filter(isClaudeEffort) ?? []
+  const savedClaudeEffort = active.claudeEffort && providerClaudeEfforts.includes(active.claudeEffort) ? active.claudeEffort : null
+  const currentClaudeEffort = providerEffortControl && isClaudeEffort(providerEffortControl.value) && providerClaudeEfforts.includes(providerEffortControl.value)
+    ? providerEffortControl.value
+    : null
+  const claudeEffort: ClaudeEffort = providerEffortControl
+    ? currentClaudeEffort ?? savedClaudeEffort ?? (providerClaudeEfforts.includes('high') ? 'high' : providerClaudeEfforts[0] ?? 'high')
+    : active.claudeEffort ?? 'high'
+  const claudeEffortOptions = providerEffortControl
+    ? CLAUDE_EFFORT_OPTIONS.filter((option) => providerClaudeEfforts.includes(option.value as ClaudeEffort))
+    : CLAUDE_EFFORT_OPTIONS.filter((option) => option.value !== 'default')
+  useEffect(() => {
+    if (!claudeAgent || !providerEffortControl || !active.claudeEffort || active.claudeEffort === claudeEffort) return
+    setThreadClaudeEffort(active.id, claudeEffort, projectId)
+  }, [active.claudeEffort, active.id, claudeAgent, claudeEffort, providerEffortControl, setThreadClaudeEffort])
+  const providerEfforts = providerEffortControl?.options.map((option) => option.value) ?? []
+  const savedCodexEffort = active.codexEffort && providerEfforts.includes(active.codexEffort) ? active.codexEffort : null
+  const currentCodexEffort = providerEffortControl && isCodexEffort(providerEffortControl.value) && providerEfforts.includes(providerEffortControl.value)
+    ? providerEffortControl.value
+    : null
+  // The live model catalog wins: changing Sol Ultra → Luna must immediately
+  // show/persist Luna's actual max/xhigh wire value, never stale "Ultra".
+  const codexEffort: CodexEffort = currentCodexEffort ?? savedCodexEffort ?? 'high'
+  useEffect(() => {
+    if (!codexAgent || !providerEffortControl || !active.codexEffort || active.codexEffort === codexEffort) return
+    setThreadCodexEffort(active.id, codexEffort, projectId)
+  }, [active.codexEffort, active.id, codexAgent, codexEffort, providerEffortControl, setThreadCodexEffort])
   const codeAgent = /codex|claude/i.test(`${agentKey} ${agentName}`)
   const activityTools = arun.turns.filter((t) => t.kind === 'tool').slice(-8)
   const activeToolCount = activityTools.filter((t) => !doneStatuses.has((t.status || '').toLowerCase())).length
   const visibleToolCalls = activityTools.slice(-5).reverse()
   const liveAgentTerminals = agentTerminals
-    .filter((t) => t.agentKey === agentKey || (!t.agentKey && t.agentName === agentName))
+    .filter((t) => t.agentKey === connectionKey || t.agentKey === agentKey || (!t.agentKey && t.agentName === agentName))
     .slice(-4)
     .reverse()
   const showAgentActivity = codeAgent || busy || activityTools.length > 0 || liveAgentTerminals.length > 0
@@ -548,7 +792,11 @@ export const Assistant = memo(function Assistant({ threadId }: { threadId: strin
     : 'No subagents or background tasks yet'
 
   const updateRuntime = (id: string, fn: (r: Runtime) => Runtime) =>
-    updateAssistantRuntime(id, fn)
+    updateAssistantRuntime(id, fn, projectId)
+  const owningSlice = () => {
+    const state = useKaisola.getState()
+    return state.activeProjectId === projectId ? state : state.projectSlices[projectId]
+  }
   const openTerminalPreset = (preset: AcpPreset) => {
     if (!preset.terminalCommand) return
     requestTerminal(preset.terminalCommand, {
@@ -604,7 +852,7 @@ export const Assistant = memo(function Assistant({ threadId }: { threadId: strin
     setAssistantDraft(active.id, {
       text: input.slice(0, caret).replace(/@([\w-]*)$/, '') + input.slice(caret),
       mentions: mentions.some((x) => x.id === c.id) ? mentions : [...mentions, c],
-    })
+    }, projectId)
     setMentionQuery(null)
     setTimeout(() => inputRef.current?.focus(), 0)
   }
@@ -613,22 +861,48 @@ export const Assistant = memo(function Assistant({ threadId }: { threadId: strin
     const caret = inputRef.current?.selectionStart ?? input.length
     const before = input.slice(0, caret)
     const pad = before && !/\s$/.test(before) ? ' ' : ''
-    setAssistantDraft(active.id, { text: `${before}${pad}@${input.slice(caret)}` })
+    setAssistantDraft(active.id, { text: `${before}${pad}@${input.slice(caret)}` }, projectId)
     setMentionQuery('')
     const pos = before.length + pad.length + 1
     setTimeout(() => { inputRef.current?.focus(); inputRef.current?.setSelectionRange(pos, pos) }, 0)
   }
 
-  const refresh = () => bridge.acp.status().then((s) => setAgents(s.agents))
-  useEffect(() => { bridge.acp.presets().then(setPresets); refresh() }, [])
-  useEffect(() => { const off = bridge.acp.onControls(() => refresh()); return off }, [])
+  const refresh = () => bridge.acp.status([connectionKey]).then((s) => setAgents(s.agents))
+  useEffect(() => {
+    let live = true
+    void Promise.allSettled([bridge.acp.status([connectionKey]), bridge.acp.presets()]).then(([statusResult, presetResult]) => {
+      if (!live) return
+      if (statusResult.status === 'fulfilled') setAgents(statusResult.value.agents)
+      if (presetResult.status === 'fulfilled') setPresets(presetResult.value)
+      // Autoconnect must not race status: an idle connection may already be
+      // alive in main after a renderer remount/window swap.
+      setStatusReadyKey(connectionKey)
+    })
+    return () => { live = false }
+  }, [connectionKey])
+  useEffect(() => {
+    // One lease per mounted card. Hidden/unmounted chats release their lease;
+    // main parks the adapter only after its idle timeout and only when the ACP
+    // session is resumable, with no turn or permission in flight.
+    void bridge.acp.lease(connectionKey, threadId, true, undefined, projectId)
+    return () => {
+      void bridge.acp.lease(connectionKey, threadId, false, undefined, projectId)
+    }
+  }, [connectionKey, projectId, threadId, workspacePath])
+  useEffect(() => { const off = bridge.acp.onControls(() => refresh()); return off }, [connectionKey])
   // many agents print an OAuth URL to authorize — surface it as an openable link
   useEffect(() => {
     const off = bridge.acp.onNotice((n) => {
+      if (n.key && n.key !== connectionKey) return
       if (n.url) { setAuthUrl(n.url); setNotice(`${n.agent ?? 'The agent'} needs browser authorization.`) }
+      if (n.kind === 'cancel-timeout' || n.kind === 'exit') {
+        if (n.text) setNotice(n.text)
+        autoConnectAttemptRef.current = null
+        refresh()
+      }
     })
     return off
-  }, [])
+  }, [connectionKey])
   // ── turn timeline (Codex-style): one tick per prompt, hover = card, click = jump ──
   const prompts = useMemo(
     () => arun.turns.map((t, i) => ({ turn: t, idx: i })).filter((x) => x.turn.kind === 'user'),
@@ -689,7 +963,7 @@ export const Assistant = memo(function Assistant({ threadId }: { threadId: strin
     if (r.message) setNotice(r.message)
     return null
   }
-  const connect = async (key: string, opts: { claudeEffort?: ClaudeEffort } = {}): Promise<boolean> => {
+  const connect = async (key: string, opts: { claudeEffort?: ClaudeEffort; forceReconnect?: boolean } = {}): Promise<boolean> => {
     setNotice(null)
     const preset = presets.find((p) => p.id === key)
     if (preset?.terminalOnly) {
@@ -711,16 +985,25 @@ export const Assistant = memo(function Assistant({ threadId }: { threadId: strin
     const effort = key === 'claude-code' ? (opts.claudeEffort ?? active.claudeEffort ?? 'high') : undefined
     const res = await bridge.acp.connect(
       custom
-        ? { presetId: key, name: custom.name, command: custom.command, args: custom.args, autonomy, cwd, resumeSessionId, claudeEffort: effort }
-        : { presetId: key, autonomy, cwd, resumeSessionId, claudeEffort: effort },
+        ? { presetId: key, clientKey: `${key}::${active.id}`, name: custom.name, command: custom.command, args: custom.args, autonomy, cwd, resumeSessionId, claudeEffort: effort, forceReconnect: opts.forceReconnect }
+        : { presetId: key, clientKey: `${key}::${active.id}`, autonomy, cwd, resumeSessionId, claudeEffort: effort, forceReconnect: opts.forceReconnect },
     )
     if (res.ok) {
       setNotice(null); refresh()
       // this agentKey now belongs to the active project — so its background
       // permission asks / terminals route home after a mid-run tab switch
-      useKaisola.getState().setAgentProject(key)
+      useKaisola.getState().setAgentProject(`${key}::${active.id}`, projectId)
       // remember the agent-side session so the NEXT connect can resume it
-      if (res.agent?.sessionId) useKaisola.getState().setThreadAcpSession(active.id, res.agent.sessionId)
+      if (res.agent?.sessionId) useKaisola.getState().setThreadAcpSession(active.id, res.agent.sessionId, projectId)
+      // Reasoning effort is a native app-server config option. Reapply the
+      // thread's durable choice after a parked/restarted adapter resumes.
+      if (key === 'codex' && active.codexEffort) {
+        const effortControl = controlList(res.controls ?? null).find((control) => /reasoning.*effort|effort/i.test(`${control.id} ${control.name} ${control.category}`))
+        if (effortControl?.options.some((option) => option.value === active.codexEffort)) {
+          const applied = await bridge.acp.setConfigOption(`${key}::${active.id}`, effortControl.id, active.codexEffort)
+          if (!applied.ok) setNotice(applied.message ?? 'Codex effort could not be restored.')
+        }
+      }
       if (res.resumed) setNotice('Resumed the previous session.')
     }
     else setNotice(res.message ?? 'Could not connect.')
@@ -748,21 +1031,21 @@ export const Assistant = memo(function Assistant({ threadId }: { threadId: strin
   // (connect() would pop the folder picker); failures land in the notice line
   // and the explicit Sign in button remains.
   useEffect(() => {
-    if (connected || busy || !workspacePath) return
+    if (statusReadyKey !== connectionKey || connected || busy || !workspacePath) return
     const preset = presets.find((p) => p.id === agentKey)
     const custom = useKaisola.getState().customAgents.find((a) => a.id === agentKey && a.kind === 'acp')
     if ((!preset || preset.terminalOnly) && !custom) return
-    const attempt = `${agentKey}|${workspacePath}`
-    if (acpAutoConnectTried.has(attempt)) return
-    acpAutoConnectTried.add(attempt)
+    const attempt = `${threadId}|${agentKey}|${workspacePath}`
+    if (autoConnectAttemptRef.current === attempt) return
+    autoConnectAttemptRef.current = attempt
     void connect(agentKey)
-  }, [agentKey, connected, busy, presets, workspacePath])
+  }, [agentKey, connected, busy, connectionKey, presets, statusReadyKey, threadId, workspacePath])
   const onControlChange = async (c: UiControl, value: string) => {
     const result = c.kind === 'mode'
-      ? await bridge.acp.setMode(agentKey, value)
+      ? await bridge.acp.setMode(connectionKey, value)
       : c.kind === 'model'
-        ? await bridge.acp.setModel(agentKey, value)
-        : await bridge.acp.setConfigOption(agentKey, c.id, value)
+        ? await bridge.acp.setModel(connectionKey, value)
+        : await bridge.acp.setConfigOption(connectionKey, c.id, value)
     if (!result.ok) setNotice(result.message ?? `${c.name} could not be changed.`)
     else setNotice(null)
     refresh()
@@ -772,14 +1055,16 @@ export const Assistant = memo(function Assistant({ threadId }: { threadId: strin
     const value = speedOptionValue(speedControl, nextSpeed)
     if (!value) return false
     if (value === speedControl.value) return true
-    const res = await bridge.acp.setConfigOption(agentKey, speedControl.id, value)
+    const res = await bridge.acp.setConfigOption(connectionKey, speedControl.id, value)
     if (!res.ok && res.message) setNotice(res.message)
     refresh()
-    return res.ok
+    // Fast mode is a latency control, not deeper reasoning. Turning it off for
+    // Deep still needs Kaisola's explicit thoroughness guidance.
+    return res.ok && !(/fast[-_ ]?mode/i.test(`${speedControl.id} ${speedControl.name}`) && nextSpeed === 'deep')
   }
   const setSpeed = (value: string) => {
     if (!isAssistantSpeed(value)) return
-    setAssistantDraft(active.id, { speed: value })
+    setAssistantDraft(active.id, { speed: value }, projectId)
     void applySpeed(value)
   }
   const changeClaudeEffort = async (value: string) => {
@@ -788,10 +1073,41 @@ export const Assistant = memo(function Assistant({ threadId }: { threadId: strin
       setNotice('Wait for this turn to finish before changing Claude effort.')
       return
     }
-    setThreadClaudeEffort(active.id, value)
+    if (providerEffortControl) {
+      if (!providerEffortControl.options.some((option) => option.value === value)) {
+        setNotice('The selected Claude model does not support that effort level.')
+        return
+      }
+      const res = await bridge.acp.setConfigOption(connectionKey, providerEffortControl.id, value)
+      if (!res.ok) { setNotice(res.message ?? `Claude rejected ${value} effort.`); return }
+      setThreadClaudeEffort(active.id, value, projectId)
+      setNotice(`Claude effort: ${CLAUDE_EFFORT_OPTIONS.find((o) => o.value === value)?.name ?? value}.`)
+      refresh()
+      return
+    }
+    setThreadClaudeEffort(active.id, value, projectId)
     setNotice('Applying Claude effort…')
-    const ok = await connect(agentKey, { claudeEffort: value })
+    const ok = await connect(agentKey, { claudeEffort: value, forceReconnect: true })
     if (ok) setNotice(`Claude effort: ${CLAUDE_EFFORT_OPTIONS.find((o) => o.value === value)?.name ?? value}. Session resumed.`)
+  }
+  const changeCodexEffort = async (value: string) => {
+    if (!isCodexEffort(value)) return
+    if (busy) {
+      setNotice('Wait for this turn to finish before changing Codex effort.')
+      return
+    }
+    if (!providerEffortControl || !providerEffortControl.options.some((option) => option.value === value)) {
+      setNotice('The installed Codex ACP adapter does not support that effort level.')
+      return
+    }
+    const res = await bridge.acp.setConfigOption(connectionKey, providerEffortControl.id, value)
+    if (!res.ok) {
+      setNotice(res.message ?? `Codex rejected ${value} effort.`)
+      return
+    }
+    setThreadCodexEffort(active.id, value, projectId)
+    setNotice(`Codex effort: ${CODEX_EFFORT_OPTIONS.find((option) => option.value === value)?.name ?? value}.`)
+    refresh()
   }
 
   // Chunks arrive far faster than frames paint, and every runtime update
@@ -817,8 +1133,8 @@ export const Assistant = memo(function Assistant({ threadId }: { threadId: strin
           }
         }
         const last = turns[turns.length - 1]
-        if (last && last.kind === k) turns[turns.length - 1] = { ...last, text: last.text + text }
-        else turns.push({ kind: k, text, at })
+        if (last && last.kind === k) turns[turns.length - 1] = { ...last, text: appendBounded(last.text, text, k === 'thought' ? 160_000 : MAX_VISIBLE_TURN_TEXT) }
+        else turns.push({ kind: k, text: text.slice(0, k === 'thought' ? 160_000 : MAX_VISIBLE_TURN_TEXT), at })
         return { ...r, turns, thinkStart }
       })
     const flush = () => {
@@ -839,6 +1155,7 @@ export const Assistant = memo(function Assistant({ threadId }: { threadId: strin
     // open those files as transient previews while the agent works
     const followLocations = (u2: AcpUpdate) => {
       const st = useKaisola.getState()
+      if (st.activeProjectId !== projectId) return
       if (!st.followAgent) return
       const locs = (u2 as { locations?: Array<{ path?: string }> }).locations
       const p = locs?.find((l) => typeof l.path === 'string')?.path
@@ -853,12 +1170,12 @@ export const Assistant = memo(function Assistant({ threadId }: { threadId: strin
       for (const c of raw as Array<Record<string, unknown>>) {
         if (!c || typeof c !== 'object') continue
         if (c.type === 'diff' && typeof c.path === 'string') {
-          out.push({ type: 'diff', path: c.path, oldText: String(c.oldText ?? ''), newText: String(c.newText ?? '') })
+          out.push({ type: 'diff', path: c.path.slice(0, 2000), oldText: String(c.oldText ?? '').slice(-MAX_DIFF_TEXT), newText: String(c.newText ?? '').slice(-MAX_DIFF_TEXT) })
         } else if (c.type === 'terminal' && typeof c.terminalId === 'string') {
-          out.push({ type: 'terminal', terminalId: c.terminalId })
+          out.push({ type: 'terminal', terminalId: c.terminalId.slice(0, 4000) })
         }
       }
-      return out.length ? out : undefined
+      return out.length ? boundArtifacts(out) : undefined
     }
     const mergeArtifacts = (prev?: ToolArtifact[], next?: ToolArtifact[]) => {
       if (!next) return prev
@@ -870,7 +1187,7 @@ export const Assistant = memo(function Assistant({ threadId }: { threadId: strin
         if (i >= 0) merged[i] = a
         else merged.push(a)
       }
-      return merged
+      return boundArtifacts(merged, true)
     }
     const onUpdate = (u: AcpUpdate) => {
       const kind = u.sessionUpdate
@@ -888,21 +1205,25 @@ export const Assistant = memo(function Assistant({ threadId }: { threadId: strin
         // the agent's own todo list — whole-array replace per frame (Zed's
         // update_plan semantics), rendered as the pinned strip, never a turn
         const entries = (u as { entries?: PlanEntry[] }).entries
-        if (Array.isArray(entries)) updateRuntime(threadId, (r) => ({ ...r, plan: entries }))
+        if (Array.isArray(entries)) updateRuntime(threadId, (r) => ({ ...r, plan: entries.slice(0, 100).map((entry) => ({ ...entry, content: String(entry.content ?? '').slice(0, 4000) })) }))
       } else if (kind === 'tool_call') {
         const tc = u as { toolCallId?: string; title?: string; kind?: string; status?: string }
+        const toolId = typeof tc.toolCallId === 'string' ? tc.toolCallId.slice(0, 4000) : undefined
+        const status = typeof tc.status === 'string' ? tc.status.slice(0, 200) : 'pending'
         flush()
         followLocations(u)
-        updateRuntime(threadId, (r) => ({ ...r, turns: [...r.turns, { kind: 'tool', toolId: tc.toolCallId, text: tc.title ?? tc.kind ?? 'tool', status: tc.status ?? 'pending', at: Date.now(), artifacts: artifactsOf(u) }] }))
+        updateRuntime(threadId, (r) => ({ ...r, turns: [...r.turns, { kind: 'tool', toolId, text: String(tc.title ?? tc.kind ?? 'tool').slice(0, 4000), status, at: Date.now(), artifacts: artifactsOf(u) }] }))
       } else if (kind === 'tool_call_update') {
         const tc = u as { toolCallId?: string; title?: string; status?: string }
+        const toolId = typeof tc.toolCallId === 'string' ? tc.toolCallId.slice(0, 4000) : undefined
+        const status = typeof tc.status === 'string' ? tc.status.slice(0, 200) : undefined
         flush()
         followLocations(u)
         updateRuntime(threadId, (r) => ({
           ...r,
           turns: r.turns.map((x) =>
-            x.kind === 'tool' && x.toolId === tc.toolCallId
-              ? { ...x, status: tc.status ?? x.status, text: tc.title ?? x.text, artifacts: mergeArtifacts(x.artifacts, artifactsOf(u)) }
+            x.kind === 'tool' && x.toolId === toolId
+              ? { ...x, status: status ?? x.status, text: String(tc.title ?? x.text).slice(0, 4000), artifacts: mergeArtifacts(x.artifacts, artifactsOf(u)) }
               : x,
           ),
         }))
@@ -920,8 +1241,8 @@ export const Assistant = memo(function Assistant({ threadId }: { threadId: strin
   })
   const queuePrompt = (prompt: AssistantDraft) => {
     if (!prompt.text.trim()) return
-    enqueueAssistantPrompt(active.id, prompt)
-    clearAssistantDraft(active.id, { keepSpeed: true })
+    enqueueAssistantPrompt(active.id, prompt, undefined, projectId)
+    clearAssistantDraft(active.id, { keepSpeed: true }, projectId)
     resetComposerHeight()
     useKaisola.getState().pushToast('info', `Queued prompt for ${agentName}`)
   }
@@ -936,31 +1257,34 @@ export const Assistant = memo(function Assistant({ threadId }: { threadId: strin
     promptOrText: string | AssistantDraft,
     opts: { clearDraft?: boolean; restoreOnFailure?: boolean } = {},
   ): Promise<boolean> => {
-    const prompt: AssistantDraft =
+    const rawPrompt: AssistantDraft =
       typeof promptOrText === 'string'
         ? { ...EMPTY_DRAFT, text: promptOrText.trim(), speed }
         : { ...promptOrText, text: promptOrText.text.trim(), speed: promptOrText.speed ?? speed }
+    const wasTrimmed = rawPrompt.text.length > ASSISTANT_DRAFT_TEXT_LIMIT
+    const prompt: AssistantDraft = { ...rawPrompt, text: rawPrompt.text.slice(0, ASSISTANT_DRAFT_TEXT_LIMIT) }
     if (!prompt.text) return false
-    if (useKaisola.getState().assistantThreads.find((t) => t.id === active.id)?.busy) return false
+    if (owningSlice()?.assistantThreads.find((t) => t.id === active.id)?.busy) return false
     if (!connected) { const ok = await connect(agentKey); if (!ok) return false }
+    if (wasTrimmed) setNotice(`Message limited to ${ASSISTANT_DRAFT_TEXT_LIMIT.toLocaleString()} characters to keep the IDE responsive. Attach long material as a file to preserve it in full.`)
     const threadId = active.id
-    if (useKaisola.getState().assistantThreads.find((t) => t.id === threadId)?.busy) return false
-    const first = (useKaisola.getState().assistantRuntimes[threadId] ?? arun).first
+    if (owningSlice()?.assistantThreads.find((t) => t.id === threadId)?.busy) return false
+    const first = (owningSlice()?.assistantRuntimes[threadId] ?? arun).first
     const files = prompt.attachments
     const mns = prompt.mentions
     const refLine = [...mns.map((m) => `@${m.label}`), ...files.map((f) => `📎 ${f.split('/').pop() ?? ''}`)].join('  ·  ')
     const shownText = refLine ? `${prompt.text}\n\n${refLine}` : prompt.text
-    autoNameThread(threadId, prompt.text) // first message → the session's topic title
+    autoNameThread(threadId, prompt.text, projectId) // first message → the session's topic title
     const userTurn: Turn = { kind: 'user', text: shownText, at: Date.now() }
     updateRuntime(threadId, (r) => ({ ...r, turns: [...r.turns, userTurn], first: false }))
-    setThreadBusy(threadId, true)
+    setThreadBusy(threadId, true, projectId)
     // per-prompt checkpoint (Claude Code's /rewind grammar): snap the working
     // tree BEFORE the agent acts, attach the id to this turn — the turn rail
     // grows a "Restore files" affordance. Non-blocking: the snapshot races the
     // prompt harmlessly (it captures pre-turn state either way, git is fast).
     {
       const turnAt = userTurn.at
-      void useKaisola.getState().snapshotWorkspace(`Before “${prompt.text.slice(0, 40)}”`).then((ckpt) => {
+      void useKaisola.getState().snapshotWorkspace(`Before “${prompt.text.slice(0, 40)}”`, projectId).then((ckpt) => {
         if (!ckpt) return
         updateRuntime(threadId, (r) => ({
           ...r,
@@ -969,7 +1293,7 @@ export const Assistant = memo(function Assistant({ threadId }: { threadId: strin
       })
     }
     if (opts.clearDraft) {
-      clearAssistantDraft(threadId, { keepSpeed: true })
+      clearAssistantDraft(threadId, { keepSpeed: true }, projectId)
       resetComposerHeight()
     }
     const mentionPrefix = mns.length ? `Referenced from the research project (use if relevant):\n${mns.map((m) => `- ${m.text}`).join('\n')}\n\n` : ''
@@ -992,7 +1316,7 @@ export const Assistant = memo(function Assistant({ threadId }: { threadId: strin
     const stream = makeOnUpdate(threadId)
     let res: { ok: boolean; stopReason?: string; message?: string }
     try {
-      res = await bridge.acp.prompt(agentKey, payload, stream.onUpdate, images.length ? images : undefined)
+      res = await bridge.acp.prompt(connectionKey, payload, stream.onUpdate, images.length ? images : undefined, projectId)
     } catch (err) {
       res = { ok: false, message: String((err as Error)?.message ?? err) }
     }
@@ -1008,9 +1332,9 @@ export const Assistant = memo(function Assistant({ threadId }: { threadId: strin
       }
       return { ...r, thinkStart: undefined, turns }
     })
-    setThreadBusy(threadId, false)
+    setThreadBusy(threadId, false, projectId)
     // finished while the card is put away → amber "needs you" dot in the rail
-    if (!useKaisola.getState().dockViews.includes(threadId)) useKaisola.getState().markNeedsYou(threadId)
+    if (!owningSlice()?.dockViews.includes(threadId)) useKaisola.getState().markNeedsYou(threadId, projectId)
     if (!res.ok) {
       // the prompt was rejected — roll back the optimistic user turn so the
       // transcript doesn't strand an undelivered message. ONLY when nothing
@@ -1021,8 +1345,8 @@ export const Assistant = memo(function Assistant({ threadId }: { threadId: strin
       )
       if (res.message) { setNotice(res.message); refresh() }
       if (opts.restoreOnFailure) {
-        const cur = useKaisola.getState().assistantDrafts[threadId] ?? EMPTY_DRAFT
-        if (!cur.text && cur.attachments.length === 0 && cur.mentions.length === 0) setAssistantDraft(threadId, prompt)
+        const cur = owningSlice()?.assistantDrafts[threadId] ?? EMPTY_DRAFT
+        if (!cur.text && cur.attachments.length === 0 && cur.mentions.length === 0) setAssistantDraft(threadId, prompt, projectId)
       }
       return false
     }
@@ -1042,12 +1366,12 @@ export const Assistant = memo(function Assistant({ threadId }: { threadId: strin
   }, [queuedPrompts.length])
   useEffect(() => {
     if (!connected || busy || queuePausedRef.current || drainingQueueRef.current || queuedPrompts.length === 0) return
-    const next = dequeueAssistantPrompt(active.id)
+    const next = dequeueAssistantPrompt(active.id, projectId)
     if (!next) return
     drainingQueueRef.current = true
     void sendText(next).then((sent) => {
       if (!sent) {
-        enqueueAssistantPrompt(active.id, next, { front: true })
+        enqueueAssistantPrompt(active.id, next, { front: true }, projectId)
         queuePausedRef.current = true
         useKaisola.getState().pushToast('warn', `${agentName} queue paused — send or queue a prompt to resume`)
       }
@@ -1065,7 +1389,7 @@ export const Assistant = memo(function Assistant({ threadId }: { threadId: strin
     useKaisola.getState().clearOmniPrompt()
     const text = omniPrompt.text
     if (busy) {
-      enqueueAssistantPrompt(active.id, { ...EMPTY_DRAFT, text: text.trim(), speed })
+      enqueueAssistantPrompt(active.id, { ...EMPTY_DRAFT, text: text.trim(), speed }, undefined, projectId)
       useKaisola.getState().pushToast('info', `Queued prompt for ${agentName}`)
       return
     }
@@ -1073,7 +1397,7 @@ export const Assistant = memo(function Assistant({ threadId }: { threadId: strin
       // never swallow a ⌘L prompt: a race-y busy flip QUEUES it (review
       // finding #4 — it used to be dropped with a misleading toast)
       if (!sent) {
-        enqueueAssistantPrompt(active.id, { ...EMPTY_DRAFT, text: text.trim(), speed })
+        enqueueAssistantPrompt(active.id, { ...EMPTY_DRAFT, text: text.trim(), speed }, undefined, projectId)
         useKaisola.getState().pushToast('info', `Queued prompt for ${agentName}`)
       }
     })
@@ -1086,19 +1410,19 @@ export const Assistant = memo(function Assistant({ threadId }: { threadId: strin
       queuePausedRef.current = true
       useKaisola.getState().pushToast('info', 'Queue paused — send or queue a prompt to resume')
     }
-    bridge.acp.cancel(agentKey)
-    setThreadBusy(active.id, false)
+    bridge.acp.cancel(connectionKey)
+    setThreadBusy(active.id, false, projectId)
     updateRuntime(active.id, (r) => ({ ...r, thinkStart: undefined }))
   }
   const attach = async () => {
     const r = await bridge.pickFiles()
-    if (r.ok && r.paths) setAssistantDraft(active.id, { attachments: [...new Set([...attachments, ...r.paths])] })
+    if (r.ok && r.paths) setAssistantDraft(active.id, { attachments: [...new Set([...attachments, ...r.paths])] }, projectId)
   }
   // the foot's agent picker re-points the active thread to a different agent
   const setThreadAgent = (key: string) => {
     const preset = presets.find((p) => p.id === key)
     if (preset?.terminalOnly) { openTerminalPreset(preset); return }
-    setStoreThreadAgent(active.id, key); resetAssistantRuntime(active.id); refresh()
+    setStoreThreadAgent(active.id, key); resetAssistantRuntime(active.id, projectId); refresh()
   }
 
   return (
@@ -1123,7 +1447,7 @@ export const Assistant = memo(function Assistant({ threadId }: { threadId: strin
         e.stopPropagation() // the window-level handler would open it as a file tab
         const paths = files.map((f) => bridge.pathForFile?.(f)).filter(Boolean) as string[]
         if (!paths.length) return
-        setAssistantDraft(active.id, { attachments: [...new Set([...attachments, ...paths])] })
+        setAssistantDraft(active.id, { attachments: [...new Set([...attachments, ...paths])] }, projectId)
         inputRef.current?.focus()
       }}
     >
@@ -1236,7 +1560,7 @@ export const Assistant = memo(function Assistant({ threadId }: { threadId: strin
             )}
           </div>
         )}
-        {arun.turns.length === 0 && !notice && (
+        {arun.turns.length === 0 && archivedPage.length === 0 && archivedCount === 0 && !notice && (
           <div className="assistant-empty">
             <Icon name="Sparkles" size={18} />
             <p>
@@ -1249,6 +1573,31 @@ export const Assistant = memo(function Assistant({ threadId }: { threadId: strin
           </div>
         )}
         {(arun.plan?.length ?? 0) > 0 && <PlanStrip plan={arun.plan!} />}
+        {canLoadArchive && (
+          <button
+            className="assistant-load-history"
+            disabled={archiveLoading}
+            onClick={() => { void loadOlderTurns() }}
+          >
+            <Icon name="History" size={12} />
+            {archiveLoading ? 'Loading history…' : `Load older history · ${Math.max(0, archivedCount - archivedPage.length)} on disk`}
+          </button>
+        )}
+        {archivedPage.map((t, i) => (
+          <TurnRow
+            key={`archived-${t.at ?? 'turn'}-${i}`}
+            t={t}
+            i={i - archivedPage.length}
+            agentName={agentName}
+            showCaret={false}
+          />
+        ))}
+        {archiveGap && (
+          <button className="assistant-load-history" disabled={archiveLoading} onClick={() => { void loadOlderTurns(true) }}>
+            <Icon name="RotateCcw" size={12} />
+            Return to recent archived history
+          </button>
+        )}
         {arun.turns.map((t, i) => (
           <TurnRow
             key={i}
@@ -1283,7 +1632,7 @@ export const Assistant = memo(function Assistant({ threadId }: { threadId: strin
             {attachments.map((f) => (
               <span key={f} className="attach-chip" title={f}>
                 <Icon name="Paperclip" size={11} /> {f.split('/').pop()}
-                <button onClick={() => setAssistantDraft(active.id, { attachments: attachments.filter((x) => x !== f) })}><Icon name="X" size={10} /></button>
+                <button onClick={() => setAssistantDraft(active.id, { attachments: attachments.filter((x) => x !== f) }, projectId)}><Icon name="X" size={10} /></button>
               </span>
             ))}
           </div>
@@ -1293,7 +1642,7 @@ export const Assistant = memo(function Assistant({ threadId }: { threadId: strin
             {mentions.map((mn) => (
               <span key={mn.id} className="attach-chip" title={mn.text}>
                 <Icon name={mentionIcon(mn.kind)} size={11} /> {mn.label.length > 30 ? `${mn.label.slice(0, 30)}…` : mn.label}
-                <button onClick={() => setAssistantDraft(active.id, { mentions: mentions.filter((x) => x.id !== mn.id) })}><Icon name="X" size={10} /></button>
+                <button onClick={() => setAssistantDraft(active.id, { mentions: mentions.filter((x) => x.id !== mn.id) }, projectId)}><Icon name="X" size={10} /></button>
               </span>
             ))}
           </div>
@@ -1348,7 +1697,14 @@ export const Assistant = memo(function Assistant({ threadId }: { threadId: strin
           ref={inputRef}
           className="composer-input"
           value={input}
-          onChange={(e) => { const v = e.target.value; setAssistantDraft(active.id, { text: v }); autoGrow(e.currentTarget); detectMention(v, e.target.selectionStart ?? v.length) }}
+          onChange={(e) => {
+            const raw = e.target.value
+            const v = raw.slice(0, ASSISTANT_DRAFT_TEXT_LIMIT)
+            if (raw.length > ASSISTANT_DRAFT_TEXT_LIMIT) setNotice(`Message limited to ${ASSISTANT_DRAFT_TEXT_LIMIT.toLocaleString()} characters. Attach long material as a file to preserve it in full.`)
+            setAssistantDraft(active.id, { text: v }, projectId)
+            autoGrow(e.currentTarget)
+            detectMention(v, Math.min(e.target.selectionStart ?? v.length, v.length))
+          }}
           onKeyDown={(e) => {
             if (mentionQuery != null && mentionCandidates.length > 0) {
               if (e.key === 'Enter') { e.preventDefault(); pickMention(mentionCandidates[0]); return }
@@ -1371,9 +1727,17 @@ export const Assistant = memo(function Assistant({ threadId }: { threadId: strin
           {claudeAgent && providerModelControl && (
             <Dropdown icon="Sparkles" value={providerModelControl.value} options={providerModelControl.options} onSelect={(value) => void onControlChange(providerModelControl, value)} title="Claude model" align="right" />
           )}
-          {claudeAgent && !hasNativeEffort && <ClaudeEffortPicker value={claudeEffort} busy={busy} onSelect={(value) => void changeClaudeEffort(value)} />}
+          {claudeAgent && <ClaudeEffortPicker value={claudeEffort} options={claudeEffortOptions} busy={busy} onSelect={(value) => void changeClaudeEffort(value)} />}
           {codexAgent && providerModelControl && (
-            <CodexAdvancedPicker model={providerModelControl} speed={speed} onModel={(value) => void onControlChange(providerModelControl, value)} onSpeed={setSpeed} />
+            <CodexAdvancedPicker
+              model={providerModelControl}
+              effort={providerEffortControl}
+              effortValue={codexEffort}
+              speed={liveSpeed}
+              onModel={(value) => void onControlChange(providerModelControl, value)}
+              onEffort={(value) => void changeCodexEffort(value)}
+              onSpeed={setSpeed}
+            />
           )}
           {busy ? (
             <>

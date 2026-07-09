@@ -5,7 +5,7 @@ import { sessionHue, terminalAgentKey } from '../../lib/sessionHue'
 import { useAgentRegistry } from '../../lib/registry'
 import { urlHost, terminalLabel, threadLabel } from '@/lib/sessionLabel'
 import { CostChip } from './CostChip'
-import { Terminal, everMountedTerminals } from '../Terminal'
+import { Terminal, everMountedTerminals, hiddenTerminalResidentCap } from '../Terminal'
 import { Assistant } from '../Assistant'
 import { BrowserCard } from './BrowserCard'
 import { LedgerCard } from './LedgerCard'
@@ -61,8 +61,8 @@ function edgeAt(e: DragEvent, el: HTMLElement): Edge {
  * The open sessions, each as its OWN floating card laid out on a grid to the
  * left of the files/canvas card. A card's slim head is the handle: drag it
  * onto another card's edge to place it beside, above or below; × closes just
- * that card. Every session stays mounted (hidden when not open) so ptys and
- * chats live on.
+ * that card. Hidden renderers are hibernated after a tiny LRU; ptys and chat
+ * state stay live/durable without retaining every xterm/React transcript.
  */
 export function SessionCards() {
   const open = useKaisola((s) => s.dockOpen)
@@ -79,17 +79,15 @@ export function SessionCards() {
   const termRemounts = useKaisola((s) => s.termRemounts)
   const dockColWeights = useKaisola((s) => s.dockColWeights)
   const setDockColWeights = useKaisola((s) => s.setDockColWeights)
-  // ghost cards: BACKGROUND projects' terminals whose xterm already mounted in
-  // this renderer stay mounted (hidden) — a tab switch re-shows a live terminal
-  // instead of disposing + re-creating xterm/WebGL and replaying the snapshot,
-  // which is what made switching feel slow. Only ever-mounted ids qualify, so
-  // parked tabs restored at launch still lazy-spawn their ptys on first view.
+  // Keep only a tiny most-recently-used set of hidden xterms warm. Older ones
+  // unmount, persist their viewport/scrollback to disk, and leave the pty alive.
+  const warmTerminalIds = new Set([...everMountedTerminals].slice(-hiddenTerminalResidentCap()))
   // (Record identity is stable across background feed patches → shallow bails.)
   const ghostTerms = useKaisola(
-    useShallow((s) => Object.values(s.projectSlices).flatMap((sl) => sl.terminals.filter((t) => everMountedTerminals.has(t.id)))),
+    useShallow((s) => Object.values(s.projectSlices).flatMap((sl) => sl.terminals.filter((t) => warmTerminalIds.has(t.id)))),
   )
   const ghostAgentTerms = useKaisola(
-    useShallow((s) => Object.values(s.projectSlices).flatMap((sl) => sl.agentTerminals.filter((t) => everMountedTerminals.has(t.terminalId)))),
+    useShallow((s) => Object.values(s.projectSlices).flatMap((sl) => sl.agentTerminals.filter((t) => warmTerminalIds.has(t.terminalId)))),
   )
   const { all: agents } = useAgentRegistry()
   const dragRef = useRef<string | null>(null)
@@ -286,7 +284,7 @@ export function SessionCards() {
       ))}
       {threads.map((t, i) => {
         const label = threadLabel(t, agents, threads, i)
-        return card(t.id, 'Sparkles', label, <Assistant threadId={t.id} />, {
+        return card(t.id, 'Sparkles', label, pos.has(t.id) ? <Assistant threadId={t.id} /> : null, {
           hue: sessionHue({ agentKey: t.agentKey }),
           running: t.busy,
         })
@@ -307,7 +305,9 @@ export function SessionCards() {
             label,
             // keyed by the remount seq: a returning pop-out re-attaches the pty
             // stream and replays the snapshot into a fresh xterm
-            <div className="dock-pane-term"><Terminal key={termRemounts[t.id] ?? 0} id={t.id} boot={t.boot} cwd={t.cwd} /></div>,
+            pos.has(t.id) || warmTerminalIds.has(t.id)
+              ? <div className="dock-pane-term"><Terminal key={termRemounts[t.id] ?? 0} id={t.id} boot={t.boot} cwd={t.cwd} /></div>
+              : null,
             {
               hue: sessionHue({ agentKey, folder: meta?.root ?? meta?.cwd ?? t.cwd }),
               // when the title already IS the repo, the sub line keeps only branch·path
@@ -325,7 +325,9 @@ export function SessionCards() {
             t.terminalId,
             'SquareTerminal',
             t.label || 'agent',
-            <div className="dock-pane-term"><Terminal key={termRemounts[t.terminalId] ?? 0} id={t.terminalId} attach /></div>,
+            pos.has(t.terminalId) || warmTerminalIds.has(t.terminalId)
+              ? <div className="dock-pane-term"><Terminal key={termRemounts[t.terminalId] ?? 0} id={t.terminalId} attach /></div>
+              : null,
             {
               hue: sessionHue({ agentKey: t.agentKey, folder: meta?.root ?? meta?.cwd ?? t.cwd }),
               sub: showMetaFor(t.terminalId, t.cwd) ? metaLine(meta) : null,

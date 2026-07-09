@@ -4,14 +4,14 @@
 // the UI is fully usable without Electron. Electron adds the native shell plus
 // the privileged "tools" the research IDE needs (model calls, filesystem,
 // running experiments) — all behind a locked-down preload bridge.
-const { app, BrowserWindow, ipcMain, Menu, nativeImage, nativeTheme, shell } = require('electron')
+const { app, BrowserWindow, dialog, ipcMain, Menu, nativeImage, nativeTheme, shell } = require('electron')
 const path = require('node:path')
 const fs = require('node:fs')
 const { registerModelHandlers } = require('./ipc/modelHandler.cjs')
 const { registerToolHandlers } = require('./ipc/toolHandler.cjs')
 const { registerSettingsHandlers } = require('./ipc/settingsHandler.cjs')
-const { registerTerminalHandlers, killAllSessions, setAppFocused } = require('./ipc/terminalHandler.cjs')
-const { registerAcpHandlers, disposeAcp } = require('./ipc/acpHandler.cjs')
+const { registerTerminalHandlers, killAllSessions, setAppFocused, detachRendererOwner } = require('./ipc/terminalHandler.cjs')
+const { registerAcpHandlers, disposeAcp, acpRendererSwapState, releaseAcpRenderer } = require('./ipc/acpHandler.cjs')
 const { registerAuthHandlers, disposeAuth } = require('./ipc/authHandler.cjs')
 const { registerFsHandlers, disposeFs } = require('./ipc/fsHandler.cjs')
 const { registerGrobidHandlers } = require('./ipc/grobidHandler.cjs')
@@ -28,6 +28,7 @@ const { registerMcpHandlers, disposeMcp } = require('./ipc/mcpServer.cjs')
 const { registerExtensionHandlers } = require('./ipc/extensionHandler.cjs')
 const { registerUpdateHandlers } = require('./ipc/updateHandler.cjs')
 const { registerGlassHandlers, wireGlassEvents } = require('./ipc/glassHandler.cjs')
+const { registerAssistantArchiveHandlers } = require('./ipc/assistantArchive.cjs')
 
 const DEV_URL = process.env.KAISOLA_DEV_URL ?? process.env.PASOLA_DEV_URL // set by `npm run electron:dev`
 const isDev = !!DEV_URL
@@ -37,6 +38,7 @@ const macVibrancyType = 'under-window'
 const macVibrancy = process.platform === 'darwin'
   ? { vibrancy: macVibrancyType, visualEffectState: 'active' }
   : {}
+let appIsQuitting = false
 
 // ── Liquid Glass (macOS 26 "Tahoe"+) ─────────────────────────────────────────
 // Darwin 25 == macOS 26. When the native module is present and supported, the
@@ -57,10 +59,29 @@ function writeShellPrefs(patch) {
 }
 const glassSupported =
   process.platform === 'darwin' && Number.parseInt(require('node:os').release(), 10) >= 25
-let glassActive = false
+// Native-glass lifetime belongs to a BrowserWindow, never the app globally.
+// A global boolean made one successful window disable vibrancy fallbacks in
+// every other window (including solid/pop-out windows). The dependency has no
+// stable removeView API, so the id is diagnostic only and the native view dies
+// with its owning window. A bounded renderer-window swap handles live↔solid
+// transitions without stopping PTYs or agent turns in the main process.
+const glassByWindow = new WeakMap()
+function glassState(win) {
+  let state = glassByWindow.get(win)
+  if (!state) {
+    state = { attempted: false, active: false, id: null, fallback: 'pending' }
+    glassByWindow.set(win, state)
+  }
+  return state
+}
 function tryLiquidGlass(win) {
-  if (!glassSupported || (process.env.KAISOLA_SMOKE || process.env.PASOLA_SMOKE)) return false
-  if (readShellPrefs().liquidGlass === false) return false
+  const state = glassState(win)
+  if (state.attempted) return state.active
+  state.attempted = true
+  if (win.__kaisolaSolid) { state.fallback = 'solid'; return false }
+  if (!glassSupported) { state.fallback = 'unsupported'; return false }
+  if (process.env.KAISOLA_SMOKE || process.env.PASOLA_SMOKE) { state.fallback = 'probe'; return false }
+  if (readShellPrefs().liquidGlass === false) { state.fallback = 'disabled'; return false }
   try {
     // stable API surface only (addView); the unstable_* variant tuners use
     // private APIs and stay untouched. The module itself falls back to legacy
@@ -68,10 +89,13 @@ function tryLiquidGlass(win) {
     const liquidGlass = require('electron-liquid-glass')
     const id = liquidGlass.addView(win.getNativeWindowHandle(), { cornerRadius: 24 })
     if (id != null && id >= 0) {
-      glassActive = true
+      state.id = id
+      state.active = true
+      state.fallback = null
       return true
     }
-  } catch { /* module missing or OS refused — vibrancy remains */ }
+    state.fallback = 'native-refused'
+  } catch { state.fallback = 'native-error' /* module missing or OS refused — vibrancy remains */ }
   return false
 }
 
@@ -91,6 +115,20 @@ try {
 } catch {
   /* keep the default path */
 }
+
+// A second process sharing userData must never run the stale-process reclaimer
+// against the first process's live ACP groups. Electron's single-instance lock
+// makes one main process the sole ledger owner; subsequent launches simply
+// focus the existing shell.
+const hasSingleInstanceLock = app.requestSingleInstanceLock()
+if (!hasSingleInstanceLock) app.quit()
+else app.on('second-instance', () => {
+  const win = BrowserWindow.getFocusedWindow() ?? BrowserWindow.getAllWindows().find((candidate) => !candidate.isDestroyed())
+  if (!win) return
+  if (win.isMinimized()) win.restore()
+  win.show()
+  win.focus()
+})
 
 function loadAppIcon() {
   const icon = nativeImage.createFromPath(appIconPath)
@@ -297,7 +335,10 @@ function createWindow(opts = {}) {
   // no vibrancy tax) — transparency is a creation-time option, so the
   // renderer persists its preference in shell-prefs and it lands here on the
   // next launch. solidBg avoids a wrong-color flash before first paint.
-  const solidWin = readShellPrefs().solidWindow === true
+  // A terminal pop-out is almost entirely an opaque xterm surface; backing it
+  // with another full-window native glass view wastes compositor memory for a
+  // few header pixels. Keep pop-outs solid even when the full shell is live.
+  const solidWin = isPop || readShellPrefs().solidWindow === true
   const solidBgRaw = readShellPrefs().solidBg
   const solidBg = /^#[0-9a-fA-F]{6}$/.test(solidBgRaw || '') ? solidBgRaw : '#0b0d11'
   const win = new BrowserWindow({
@@ -335,6 +376,8 @@ function createWindow(opts = {}) {
   const query = {}
   if (solidWin) query.solidwin = '1' // renderer squares its painted corners to the native clip
   win.__kaisolaSolid = solidWin // what THIS window is (vs what prefs now want)
+  const nativeGlass = glassState(win)
+  nativeGlass.fallback = solidWin ? 'solid' : 'vibrancy'
   if (opts.slot) query.win = String(opts.slot)
   if (opts.adopt) query.adopt = '1' // tear-off adoption: boot pristine, never rehydrate the slot
   if (opts.at && Number.isFinite(opts.at.x) && Number.isFinite(opts.at.y)) {
@@ -362,7 +405,7 @@ function createWindow(opts = {}) {
     // sampling): the app deliberately looks IDENTICAL when inactive — only the
     // traffic lights gray. Dropping vibrancy on blur is what used to flash the
     // shell to flat white.
-    if (process.platform === 'darwin' && typeof win.setVibrancy === 'function' && !glassActive && !solidWin) {
+    if (process.platform === 'darwin' && typeof win.setVibrancy === 'function' && !nativeGlass.active && !solidWin) {
       win.setVibrancy(macVibrancyType)
     }
     if (typeof win.setHasShadow === 'function') {
@@ -376,9 +419,11 @@ function createWindow(opts = {}) {
   // vibrancy nap: the under-window material keeps sampling the desktop even
   // for a hidden window (visualEffectState 'active'). Detach while nothing is
   // visible; syncMacMaterial re-attaches on show/restore/focus. Liquid Glass
-  // (glassActive) has no stable detach API — the nap covers vibrancy only.
+  // Native Liquid Glass has no stable detach API — the nap covers vibrancy
+  // only. Its state is window-local, so another glass window cannot suppress
+  // this window's fallback.
   const napMacMaterial = () => {
-    if (process.platform === 'darwin' && typeof win.setVibrancy === 'function' && !glassActive && !solidWin) {
+    if (process.platform === 'darwin' && typeof win.setVibrancy === 'function' && !nativeGlass.active && !solidWin) {
       win.setVibrancy(null)
     }
   }
@@ -408,7 +453,38 @@ function createWindow(opts = {}) {
   })
   // drop this window's cached tab list when it goes away, then refresh the menu
   const wcId = win.webContents.id
+  const rendererOwner = win.webContents
+  win.on('close', (event) => {
+    if (appIsQuitting) return
+    const state = acpRendererSwapState(rendererOwner)
+    if (state.safe) return
+    // A normal macOS window close is not an app quit. Preserve the live turn
+    // and its request-specific stream listener instead of silently creating a
+    // transcript/provider-context fork on reopen.
+    event.preventDefault()
+    if (win.__kaisolaCloseWarning) return
+    win.__kaisolaCloseWarning = true
+    const detail = state.awaitingPermission
+      ? 'Answer or reject the pending agent approval, then close the window.'
+      : 'Let the active agent turn finish, or cancel it and allow a few seconds for shutdown, then close the window.'
+    void dialog.showMessageBox(win, {
+      type: 'info',
+      title: 'Agent work is still active',
+      message: 'Kaisola kept this window open to preserve the live agent stream.',
+      detail,
+      buttons: ['OK'],
+    }).finally(() => { win.__kaisolaCloseWarning = false })
+  })
+  rendererOwner.once('destroyed', () => {
+    // React cleanup does not reliably run on window crashes/closes. Main owns
+    // the authoritative fallback: keep processes alive, but release all hot
+    // renderer resources and leases for this exact WebContents.
+    detachRendererOwner(rendererOwner)
+    releaseAcpRenderer(rendererOwner)
+  })
   win.on('closed', () => {
+    nativeGlass.active = false
+    nativeGlass.fallback = 'closed'
     tabsByWc.delete(wcId)
     if (!isPop) installAppMenu()
   })
@@ -543,12 +619,15 @@ ipcMain.on('win:set-title', (e, title) => {
 })
 
 // Liquid Glass preference — read by Settings, applied on next launch
-ipcMain.handle('shell:glass', (_e, patch) => {
+ipcMain.handle('shell:glass', (e, patch) => {
   if (patch && typeof patch.enabled === 'boolean') writeShellPrefs({ liquidGlass: patch.enabled })
+  const win = BrowserWindow.fromWebContents(e.sender)
+  const state = win ? glassState(win) : null
   return {
     supported: glassSupported,
-    active: glassActive,
+    active: !!state?.active,
     enabled: readShellPrefs().liquidGlass !== false,
+    fallback: state?.fallback ?? 'no-window',
   }
 })
 
@@ -562,30 +641,63 @@ ipcMain.handle('shell:window-mode', (e, patch) => {
   return { wantSolid: readShellPrefs().solidWindow === true, liveSolid: !!(win && win.__kaisolaSolid) }
 })
 ipcMain.handle('shell:relaunch', () => {
+  // Let the replacement acquire the single-instance lock while this process
+  // enters its normal before-quit cleanup path.
+  app.releaseSingleInstanceLock()
   app.relaunch()
-  app.exit(0)
+  // quit (rather than exit) runs the normal cleanup path; renderer state and
+  // drafts are already synchronously disk-backed, while native/PTY resources
+  // are released before the replacement process starts.
+  setImmediate(() => app.quit())
 })
 
-// Apply the persisted window mode NOW by recreating THIS window — no app
-// restart. Transparency is creation-time, but everything that matters lives
-// in the MAIN process and survives a window swap: ptys re-attach by id
-// (tear-off already relies on this), ACP agents are orphan-adopted by the
-// next acp:status, and the renderer rehydrates its slot from sqlite. The
-// swap is close→create so the two renderers never race one store slot.
-let reapplyingWindow = false
+// Transparency is creation-time. Recreate ONLY the requesting renderer window:
+// PTYs, ACP turns, hooks and the terminal spool live in main and continue
+// uninterrupted, while the renderer rehydrates its disk-backed slot. The
+// Liquid Glass dependency has no stable removeView API; its registry holds a
+// non-retaining raw pointer after the old NSView dies. Bound repeated swaps so
+// pathological theme-toggle loops cannot grow even that tiny registry forever.
+let reapplyingWindows = 0
+let windowModeSwapCount = 0
+const MAX_WINDOW_MODE_SWAPS = 8
 ipcMain.handle('shell:reapply-window', (e) => {
   const win = BrowserWindow.fromWebContents(e.sender)
-  if (!win) return { ok: false }
+  if (!win || win.isDestroyed()) return { ok: false }
   const wantSolid = readShellPrefs().solidWindow === true
   if (!!win.__kaisolaSolid === wantSolid) return { ok: true, unchanged: true }
+  if (windowModeSwapCount >= MAX_WINDOW_MODE_SWAPS) {
+    return {
+      ok: false,
+      restartRequired: true,
+      message: 'Kaisola left running work untouched. Quit and reopen when convenient to apply another glass-mode change.',
+    }
+  }
+  const acpState = acpRendererSwapState(e.sender)
+  if (!acpState.safe) {
+    return {
+      ok: false,
+      busy: acpState.busy,
+      awaitingPermission: acpState.awaitingPermission,
+      message: acpState.awaitingPermission
+        ? 'Answer the pending agent approval before applying this appearance change.'
+        : 'Let the active agent turn finish before applying this appearance change.',
+    }
+  }
   let slot = null
-  try { slot = new URL(win.webContents.getURL()).searchParams.get('win') } catch { /* fresh window keeps no slot */ }
-  const bounds = win.isFullScreen() ? null : win.getBounds()
-  reapplyingWindow = true
+  try { slot = new URL(win.webContents.getURL()).searchParams.get('win') } catch { /* primary window has no slot */ }
+  const bounds = win.isFullScreen() ? win.getNormalBounds() : win.getBounds()
+  const wasMaximized = win.isMaximized()
+  const wasFullScreen = win.isFullScreen()
+  windowModeSwapCount++
+  reapplyingWindows++
   win.once('closed', () => {
     const next = createWindow(slot ? { slot: Number(slot) } : {})
     if (bounds) next.setBounds(bounds)
-    next.once('ready-to-show', () => { reapplyingWindow = false })
+    next.once('ready-to-show', () => {
+      if (wasMaximized) next.maximize()
+      if (wasFullScreen) next.setFullScreen(true)
+      reapplyingWindows = Math.max(0, reapplyingWindows - 1)
+    })
   })
   win.close()
   return { ok: true }
@@ -608,7 +720,7 @@ ipcMain.on('shell:app-theme', (e, theme) => {
   }
 })
 
-app.whenReady().then(() => {
+if (hasSingleInstanceLock) app.whenReady().then(() => {
   // paint the native material in the persisted app theme from the first frame
   const savedTheme = readShellPrefs().appTheme
   if (savedTheme === 'dark' || savedTheme === 'light' || savedTheme === 'system') nativeTheme.themeSource = savedTheme
@@ -646,6 +758,7 @@ app.whenReady().then(() => {
   registerExtensionHandlers(ipcMain)
   registerUpdateHandlers(ipcMain)
   registerGlassHandlers(ipcMain)
+  registerAssistantArchiveHandlers(ipcMain, path.join(app.getPath('userData'), 'assistant-archives'))
   createWindow()
   app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length === 0) createWindow()
@@ -653,8 +766,9 @@ app.whenReady().then(() => {
 })
 
 app.on('window-all-closed', () => {
-  // a window-mode reapply swaps the last window close→create — not a quit
-  if (process.platform !== 'darwin' && !reapplyingWindow) app.quit()
+  // A mode swap closes the old renderer before constructing its replacement.
+  // Do not treat that intentional gap as an application quit on Windows/Linux.
+  if (process.platform !== 'darwin' && reapplyingWindows === 0) app.quit()
 })
 
 // Energy: while the user works elsewhere, terminals stream in a slower profile
@@ -669,6 +783,7 @@ app.on('browser-window-blur', () => {
 })
 
 app.on('before-quit', () => {
+  appIsQuitting = true
   killAllSessions()
   disposeAcp()
   disposeAuth()

@@ -14,6 +14,17 @@
   --bg-inset: #07080a; /* code blocks, wells */
   --term-bg: #0b0d11; /* terminal/dock — a touch darker than the app surface */
 
+  /* Shell material roles. They stay opaque in live/eco by default; painted
+     mode overrides them with static translucency over its cached wallpaper.
+     Keeping roles separate prevents the old all-white card/canvas/popover
+     wall while preserving dense reading and terminal surfaces where needed. */
+  --shell-card-bg: var(--bg-1);
+  --shell-canvas-bg: var(--bg-1);
+  --shell-popover-bg: var(--bg-2);
+  --shell-surface-border: var(--border);
+  --shell-surface-grain: none;
+  --shell-inner-highlight: inset 0 1px 0 transparent;
+
   /* Terminal surface tone (Settings → Terminal → Background). Mirrors
      TERM_SURFACE in Terminal.tsx — xterm needs the same values as concrete hex. */
   &[data-termbg='slate'] { --term-bg: #191d24; }
@@ -250,4 +261,24 @@
   --shadow-2: 0 4px 12px rgba(16, 18, 22, 0.08);
   --shadow-3: 0 12px 32px rgba(16, 18, 22, 0.12);
   --shadow-pop: 0 16px 48px rgba(16, 18, 22, 0.16);
+}
+
+/* Painted glass spends a small static wallpaper raster instead of persistent
+   compositor memory. Surfaces use real alpha but never backdrop-filter: the
+   already-soft painting supplies depth and the tiny tiled grain supplies the
+   close-up glass texture. */
+:root[data-theme='light'][data-perf='painted'] {
+  --shell-card-bg: rgb(255 255 255 / 72%);
+  --shell-canvas-bg: rgb(255 255 255 / 80%);
+  --shell-popover-bg: rgb(255 255 255 / 90%);
+  --shell-surface-border: rgb(255 255 255 / 68%);
+  --shell-inner-highlight: inset 0 1px 0 rgb(255 255 255 / 72%);
+}
+
+:root[data-theme='dark'][data-perf='painted'] {
+  --shell-card-bg: rgb(14 16 20 / 76%);
+  --shell-canvas-bg: rgb(14 16 20 / 84%);
+  --shell-popover-bg: rgb(20 22 28 / 92%);
+  --shell-surface-border: rgb(255 255 255 / 10%);
+  --shell-inner-highlight: inset 0 1px 0 rgb(255 255 255 / 9%);
 }

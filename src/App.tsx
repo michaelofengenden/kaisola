@@ -226,7 +226,7 @@ export default function App() {
     () =>
       bridge.acp.onTerminal((info) => {
         const st = useKaisola.getState()
-        const pid = projectIdForEvent(st, { agentKey: info.agentKey, cwd: info.cwd })
+        const pid = info.scope || projectIdForEvent(st, { agentKey: info.agentKey, cwd: info.cwd })
         if (pid === st.activeProjectId) { st.addAgentTerminal(info); return }
         st.patchProject(
           pid,

@@ -79,17 +79,15 @@
 }
 .pane-head:hover .pane-head-close { opacity: 1; }
 .pane-head-close:hover { color: var(--text-0); background: var(--hover-overlay); }
-/* terminals are frosted glass: xterm paints NO background (allowTransparency)
-   — the session card's glass does the blurring, and this tint gives the text
-   a calmer ground than the assistant panes. 45% is the readability floor on
-   colorful wallpapers; the glass look survives because the card's deep blur +
-   saturation carry it, not raw transparency. */
+/* The xterm/WebGL surface is intentionally opaque. Transparency here adds a
+   compositor pass for every streamed glyph; the surrounding card/header can
+   still show the painted material without making terminal output expensive. */
 .dock-pane-term {
   flex: 1;
   min-height: 0;
   display: flex;
   flex-direction: column;
-  background: color-mix(in srgb, var(--term-bg) 45%, transparent);
+  background: var(--term-bg);
 }
 
 /* ── Terminal ────────────────────────────────────────────────────────────── */
@@ -673,8 +671,9 @@ details.assistant-tool.tool-artifacts > summary::-webkit-details-marker { displa
 .drop-menu {
   min-width: 230px;
   max-width: 360px;
-  background: var(--bg-3);
-  border: 1px solid var(--border-strong);
+  background-color: var(--shell-popover-bg);
+  background-image: var(--shell-surface-grain);
+  border: 1px solid var(--shell-surface-border);
   border-radius: var(--r-3);
   box-shadow: var(--shadow-pop);
   padding: var(--sp-2);
@@ -729,7 +728,8 @@ details.assistant-tool.tool-artifacts > summary::-webkit-details-marker { displa
   bottom: calc(100% + var(--sp-2));
   max-height: 240px;
   overflow-y: auto;
-  background: var(--bg-3);
+  background-color: var(--shell-popover-bg);
+  background-image: var(--shell-surface-grain);
   border: 1px solid var(--border);
   border-radius: var(--r-3);
   box-shadow: var(--shadow-pop);
@@ -902,9 +902,10 @@ details.assistant-tool.tool-artifacts > summary::-webkit-details-marker { displa
   z-index: 850;
   width: min(380px, calc(100vw - 16px));
   padding: 13px;
-  border: 1px solid var(--border-strong);
+  border: 1px solid var(--shell-surface-border);
   border-radius: 14px;
-  background: var(--bg-2);
+  background-color: var(--shell-popover-bg);
+  background-image: var(--shell-surface-grain);
   box-shadow: var(--shadow-pop);
   color: var(--text-0);
   -webkit-app-region: no-drag;
@@ -960,7 +961,60 @@ details.assistant-tool.tool-artifacts > summary::-webkit-details-marker { displa
   background: var(--accent);
 }
 .claude-effort-pop > p { margin-top: 3px; color: var(--text-3); font-size: var(--fs-10); }
-.codex-advanced-pop { width: min(420px, calc(100vw - 16px)); max-height: min(620px, calc(100vh - 20px)); overflow: auto; }
+.provider-pop-stack {
+  z-index: 850;
+  display: flex;
+  flex-direction: row;
+  align-items: flex-start;
+  gap: 8px;
+  max-width: calc(100vw - 16px);
+  -webkit-app-region: no-drag;
+}
+.provider-pop-stack > .provider-pop { max-height: inherit; overflow: auto; }
+.codex-advanced-pop { width: min(285px, calc(100vw - 16px)); padding: 8px; }
+.codex-main-menu { flex-shrink: 0; }
+.provider-menu-row {
+  width: 100%;
+  min-height: 45px;
+  display: grid;
+  grid-template-columns: minmax(64px, auto) minmax(0, 1fr) 16px;
+  align-items: center;
+  gap: 10px;
+  padding: 7px 9px;
+  border-radius: 9px;
+  text-align: left;
+  color: var(--text-0);
+  font-size: var(--fs-13);
+}
+.provider-menu-row:hover,
+.provider-menu-row[data-active='true'] { background: var(--hover-overlay); }
+.provider-menu-row > strong { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; text-align: right; color: var(--text-2); font-weight: var(--fw-regular); }
+.provider-menu-row > svg { color: var(--text-3); }
+.provider-menu-foot { display: flex; align-items: center; gap: 6px; margin-top: 5px; padding: 11px 9px 3px; border-top: 1px solid var(--border-faint); color: var(--text-3); font-size: var(--fs-12); }
+.codex-submenu { width: min(315px, calc(100vw - 16px)); padding: 11px; }
+.provider-choice-row {
+  width: 100%;
+  min-height: 42px;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 18px;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 9px;
+  border-radius: 8px;
+  text-align: left;
+  color: var(--text-0);
+  font-size: var(--fs-13);
+}
+.provider-choice-row:hover { background: var(--hover-overlay); }
+.provider-choice-row > svg { color: var(--text-0); opacity: 0; }
+.provider-choice-row[aria-checked='true'] > svg { opacity: 1; }
+.provider-choice-row strong { display: block; font-weight: var(--fw-medium); }
+.provider-choice-row small { display: block; margin-top: 2px; color: var(--text-3); font-size: var(--fs-10); line-height: 1.3; }
+.provider-choice-note { margin: 8px 9px 2px; color: var(--text-3); font-size: var(--fs-11); line-height: 1.35; }
+@media (max-width: 680px) {
+  .provider-pop-stack { flex-direction: column; overflow: auto; }
+  .provider-pop-stack > .provider-pop { width: min(360px, calc(100vw - 16px)); flex-shrink: 0; }
+}
 .provider-setting-head,
 .provider-setting-row { display: flex; align-items: center; gap: 8px; padding: 9px 2px 7px; font-size: var(--fs-12); }
 .provider-setting-head > span,
@@ -986,6 +1040,7 @@ details.assistant-tool.tool-artifacts > summary::-webkit-details-marker { displa
 .provider-setting-disabled > svg { color: var(--text-3); }
 .provider-capability-note { margin: -1px 2px 7px; color: var(--text-3); font-size: var(--fs-10); line-height: 1.4; }
 .provider-speed-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 4px; }
+.provider-effort-grid { grid-template-columns: repeat(5, minmax(0, 1fr)); }
 .provider-speed-grid button { padding: 6px; border: 1px solid var(--border); border-radius: 7px; color: var(--text-2); font-size: var(--fs-11); }
 .provider-speed-grid button:hover { background: var(--bg-3); }
 .provider-speed-grid button[data-active='true'] { color: var(--accent); border-color: color-mix(in srgb, var(--accent) 40%, var(--border)); background: color-mix(in srgb, var(--accent) 9%, transparent); }
@@ -1037,6 +1092,20 @@ details.assistant-tool.tool-artifacts > summary::-webkit-details-marker { displa
   line-height: var(--lh-snug);
   max-width: 36ch;
 }
+.assistant-load-history {
+  align-self: center;
+  display: inline-flex;
+  align-items: center;
+  gap: var(--sp-2);
+  padding: 6px 10px;
+  border: 1px solid var(--border-faint);
+  border-radius: var(--r-full);
+  background: color-mix(in srgb, var(--bg-2) 80%, transparent);
+  color: var(--text-2);
+  font-size: var(--fs-11);
+}
+.assistant-load-history:hover:not(:disabled) { background: var(--bg-3); color: var(--text-1); }
+.assistant-load-history:disabled { opacity: .6; }
 .assistant-nokey {
   display: flex;
   align-items: center;
@@ -1242,8 +1311,9 @@ details.assistant-tool.tool-artifacts > summary::-webkit-details-marker { displa
   width: min(800px, 96vw);
   display: flex;
   flex-direction: column;
-  background: var(--bg-2);
-  border: 1px solid var(--border);
+  background-color: var(--shell-popover-bg);
+  background-image: var(--shell-surface-grain);
+  border: 1px solid var(--shell-surface-border);
   border-radius: var(--r-5);
   box-shadow: var(--shadow-pop);
   overflow: hidden;

@@ -5,6 +5,7 @@
 // defaults, which are exactly the pre-sampling look. Never a toast.
 const { nativeImage, BrowserWindow, screen, nativeTheme } = require('electron')
 const { execFile } = require('node:child_process')
+const crypto = require('node:crypto')
 const fs = require('node:fs')
 const os = require('node:os')
 const path = require('node:path')
@@ -67,19 +68,57 @@ async function wallpaperPath() {
   return out && fs.existsSync(out) ? out : null
 }
 
-// nativeImage can't decode HEIC (Apple's dynamic wallpapers) — sips converts
-// once per source into a temp cache, downsampled: sampling needs no pixels
-// beyond ~1200 wide.
+let wallpaperImageCache = null
+// Decode/downsample in a short-lived native helper before Electron touches the
+// pixels. A full 6K/8K PNG can otherwise transiently add 100–250MB to main even
+// though painted mode only emits a 360px raster.
 async function loadWallpaper(p) {
-  let img = nativeImage.createFromPath(p)
-  if (!img.isEmpty()) return img
-  const cached = path.join(os.tmpdir(), `kaisola-wp-${Buffer.from(p).toString('base64url').slice(0, 24)}.png`)
+  let stat
+  try { stat = fs.statSync(p) } catch { return null }
+  const cacheKey = `${p}:${stat.mtimeMs}:${stat.size}`
+  if (wallpaperImageCache?.key === cacheKey && !wallpaperImageCache.img.isEmpty()) return wallpaperImageCache.img
+  const digest = crypto.createHash('sha256').update(cacheKey).digest('hex').slice(0, 24)
+  const cached = path.join(os.tmpdir(), `kaisola-wp-${digest}.jpg`)
   if (!fs.existsSync(cached)) {
-    const ok = await exec('/usr/bin/sips', ['-s', 'format', 'png', '--resampleWidth', '1200', p, '--out', cached], 15000)
-    if (ok == null) return null
+    const ok = await exec('/usr/bin/sips', ['-s', 'format', 'jpeg', '-s', 'formatOptions', '82', '--resampleWidth', '1600', p, '--out', cached], 15000)
+    if (ok == null) {
+      // Non-mac/test fallback: still cap the retained nativeImage immediately.
+      const direct = nativeImage.createFromPath(p)
+      if (direct.isEmpty()) return null
+      const size = direct.getSize()
+      const img = size.width > 1600 ? direct.resize({ width: 1600 }) : direct
+      wallpaperImageCache = { key: cacheKey, img }
+      return img
+    }
   }
-  img = nativeImage.createFromPath(cached)
-  return img.isEmpty() ? null : img
+  const img = nativeImage.createFromPath(cached)
+  if (img.isEmpty()) return null
+  wallpaperImageCache = { key: cacheKey, img }
+  return img
+}
+
+/**
+ * Source rectangle macOS displays when an image is aspect-filled into a
+ * display. Keeping this calculation in main means the renderer receives an
+ * already-correct display frame instead of stretching the wallpaper to the
+ * screen's aspect ratio (the old painted-mode distortion bug).
+ */
+function aspectFillRect(imageSize, displaySize) {
+  const iw = Math.max(1, imageSize.width)
+  const ih = Math.max(1, imageSize.height)
+  const dw = Math.max(1, displaySize.width)
+  const dh = Math.max(1, displaySize.height)
+  const scale = Math.max(dw / iw, dh / ih)
+  const visW = Math.min(iw, dw / scale)
+  const visH = Math.min(ih, dh / scale)
+  const width = Math.max(1, Math.min(iw, Math.round(visW)))
+  const height = Math.max(1, Math.min(ih, Math.round(visH)))
+  return {
+    x: Math.max(0, Math.min(iw - width, Math.round((iw - visW) / 2))),
+    y: Math.max(0, Math.min(ih - height, Math.round((ih - visH) / 2))),
+    width,
+    height,
+  }
 }
 
 function sampleForWindow(win, img) {
@@ -87,27 +126,33 @@ function sampleForWindow(win, img) {
   const { width: iw, height: ih } = img.getSize()
   const db = disp.bounds
   // aspect-fill mapping of the wallpaper onto the display (macOS default)
-  const scale = Math.max(db.width / iw, db.height / ih)
-  const visW = db.width / scale
-  const visH = db.height / scale
-  const offX = (iw - visW) / 2
-  const offY = (ih - visH) / 2
+  const displayRect = aspectFillRect({ width: iw, height: ih }, db)
+  const scaleX = db.width / displayRect.width
+  const scaleY = db.height / displayRect.height
   const wb = win.getBounds()
+  // A window can hang off an edge or straddle displays. Sample only the part
+  // actually on the selected display so the average never clamps a too-large
+  // crop onto an unrelated wallpaper region.
+  const left = Math.max(wb.x, db.x)
+  const top = Math.max(wb.y, db.y)
+  const right = Math.min(wb.x + wb.width, db.x + db.width)
+  const bottom = Math.min(wb.y + wb.height, db.y + db.height)
   const rect = {
-    x: Math.round(offX + Math.max(0, wb.x - db.x) / scale),
-    y: Math.round(offY + Math.max(0, wb.y - db.y) / scale),
-    width: Math.max(1, Math.round(Math.min(wb.width, db.width) / scale)),
-    height: Math.max(1, Math.round(Math.min(wb.height, db.height) / scale)),
+    x: Math.round(displayRect.x + Math.max(0, left - db.x) / scaleX),
+    y: Math.round(displayRect.y + Math.max(0, top - db.y) / scaleY),
+    width: Math.max(1, Math.round(Math.max(1, right - left) / scaleX)),
+    height: Math.max(1, Math.round(Math.max(1, bottom - top) / scaleY)),
   }
   rect.x = Math.max(0, Math.min(rect.x, iw - rect.width))
   rect.y = Math.max(0, Math.min(rect.y, ih - rect.height))
   const px = img.crop(rect).resize({ width: 1, height: 1 }).toBitmap() // BGRA
   const avg = { r: px[2], g: px[1], b: px[0] }
-  // pre-blurred copy for the painted layer: a heavy downscale IS the blur
-  // (the renderer re-scales it to screen size under a static CSS blur)
-  // 200w/q82 (was 120/70): headroom for the softer blur(14px) painted layer —
-  // still only a few KB, rasters once
-  const blurDataUrl = 'data:image/jpeg;base64,' + img.resize({ width: 200 }).toJPEG(82).toString('base64')
+  // Crop to the display's aspect-filled source frame BEFORE downscaling. A
+  // 360px raster is deliberately small: bilinear upscaling supplies the soft
+  // static painting without a full-window CSS filter/compositor pass. It is
+  // still detailed enough for organic color drift under the frost grain.
+  const painting = img.crop(displayRect).resize({ width: Math.min(360, db.width) })
+  const blurDataUrl = 'data:image/jpeg;base64,' + painting.toJPEG(84).toString('base64')
   return { ok: true, avg, blurDataUrl, screen: { x: db.x, y: db.y, w: db.width, h: db.height } }
 }
 
@@ -152,4 +197,4 @@ function wireGlassEvents(win) {
   })
 }
 
-module.exports = { registerGlassHandlers, wireGlassEvents }
+module.exports = { registerGlassHandlers, wireGlassEvents, __test: { aspectFillRect } }

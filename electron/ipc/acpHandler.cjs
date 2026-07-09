@@ -5,12 +5,15 @@
 const path = require('node:path')
 const os = require('node:os')
 const fs = require('node:fs')
+const { execFileSync } = require('node:child_process')
 const { shell, app } = require('electron')
 const { AcpConnection } = require('./acp.cjs')
 const { agentEnv } = require('./shellEnv.cjs')
 const { mcpHttpEntry } = require('./mcpServer.cjs')
 const { acpEntries } = require('./mcpCatalog.cjs')
 const mgr = require('./terminalManager.cjs')
+const { AcpProcessLedger } = require('./acpProcessLedger.cjs')
+const { resolveBundledCodexExecutable, resolveBundledClaudeExecutable } = require('./nativeAgentPaths.cjs')
 
 const URL_RE = /https?:\/\/[^\s"'<>)]+/
 
@@ -54,6 +57,7 @@ function isSensitivePath(p) {
 let permSeq = 0
 const pendingPermissions = new Map()
 const PERMISSION_TIMEOUT_MS = 300_000
+const CANCEL_GRACE_MS = 8_000
 
 /** Auto-resolve (as cancel) and clear every inline permission a dying connection
  * left pending, telling its renderer to drop the now-orphaned card + needs-you
@@ -68,6 +72,11 @@ function cancelPendingFor(entry) {
   }
 }
 
+function clearCancelWatchdog(entry) {
+  if (entry?.cancelWatchdog) clearTimeout(entry.cancelWatchdog)
+  if (entry) entry.cancelWatchdog = null
+}
+
 /**
  * `${webContents.id}|${presetId}` → { conn, meta, sender, controls, current }.
  * Connections are scoped PER WINDOW (multi-window: window 2 connecting codex
@@ -77,8 +86,230 @@ function cancelPendingFor(entry) {
  * the next window that announces itself via acp:status.
  */
 const connections = new Map()
+const connectTasks = new Map() // internalKey -> completion gate (dedup handshakes)
 const ikey = (sender, presetId) => `${sender.id}|${presetId}`
 const entryFor = (sender, presetId) => connections.get(ikey(sender, presetId))
+let processLedger = null
+const connectionLeases = new Map() // internalKey -> Set<renderer thread id>
+const idleTimers = new Map()
+const ACP_IDLE_MS = (() => {
+  const n = Number(process.env.KAISOLA_ACP_IDLE_MS)
+  return Number.isFinite(n) ? Math.min(24 * 60 * 60_000, Math.max(30_000, Math.round(n))) : 5 * 60_000
+})()
+
+function clearIdleTimer(internalKey) {
+  const timer = idleTimers.get(internalKey)
+  if (timer) clearTimeout(timer)
+  idleTimers.delete(internalKey)
+}
+
+function scheduleIdlePark(internalKey, requestedMs) {
+  clearIdleTimer(internalKey)
+  const delay = Number.isFinite(Number(requestedMs))
+    ? Math.min(24 * 60 * 60_000, Math.max(30_000, Math.round(Number(requestedMs))))
+    : ACP_IDLE_MS
+  const timer = setTimeout(() => {
+    idleTimers.delete(internalKey)
+    if ((connectionLeases.get(internalKey)?.size ?? 0) > 0) return
+    const entry = connections.get(internalKey)
+    if (!entry || !entry.conn || !entry.conn.alive) return
+    // Conservative gate: only an agent that promised session/load and has a
+    // durable session id may park. Never stop a turn or a permission wait.
+    if (!canIdlePark(entry)) {
+      const temporarilyBusy = (entry.inFlightTurns ?? 0) > 0 || !!entry.current?.channel || [...pendingPermissions.values()].some((p) => p.entry === entry)
+      if (temporarilyBusy) scheduleIdlePark(internalKey, delay)
+      return
+    }
+    entry.conn.dispose()
+    connections.delete(internalKey)
+  }, delay)
+  timer.unref?.()
+  idleTimers.set(internalKey, timer)
+}
+
+function canIdlePark(entry) {
+  const awaitingPermission = [...pendingPermissions.values()].some((p) => p.entry === entry)
+  return !!entry && (entry.inFlightTurns ?? 0) === 0 && !entry.current?.channel && !awaitingPermission && !!entry.conn?.alive && !!entry.conn.canLoadSession && !!entry.meta?.sessionId
+}
+
+/** A renderer-window swap is safe only while its ACP sessions are between
+ * turns and not waiting for a permission answer. An active prompt streams to a
+ * request-specific renderer listener, so closing that renderer would preserve
+ * the process but lose output and the completion signal. */
+function acpRendererSwapState(sender) {
+  const owned = [...connections.values()].filter((entry) => entry.sender === sender)
+  const connecting = [...connectTasks.values()].some((task) => task.sender === sender || task.sender?.id === sender?.id)
+  const busy = connecting || owned.some((entry) => (entry.inFlightTurns ?? 0) > 0 || !!entry.current?.channel)
+  const awaitingPermission = [...pendingPermissions.values()].some((pending) => pending.entry?.sender === sender)
+  return { safe: !busy && !awaitingPermission, busy, connecting, awaitingPermission }
+}
+
+/** Renderer destruction is not guaranteed to run React effect cleanup. Clear
+ * its leases in main, cancel now-unanswerable approvals, and start the normal
+ * conservative idle timer without stopping any live turn. */
+function releaseAcpRenderer(sender) {
+  if (!sender) return 0
+  let released = 0
+  for (const [internalKey, entry] of connections) {
+    if (entry.sender !== sender && entry.sender?.id !== sender.id) continue
+    cancelPendingFor(entry)
+    connectionLeases.delete(internalKey)
+    clearIdleTimer(internalKey)
+    scheduleIdlePark(internalKey)
+    released++
+  }
+  for (const task of connectTasks.values()) {
+    if (task.sender !== sender && task.sender?.id !== sender.id) continue
+    task.cancelled = true
+    task.entry?.conn?.dispose()
+  }
+  return released
+}
+
+const adapterCache = new Map()
+/** Resolve an adapter already downloaded by npx to its exact JS entrypoint.
+ * This removes the npm+npx wrapper processes while preserving npx as a safe
+ * fallback when the cache is absent. Every path is realpathed beneath ~/.npm. */
+function cachedNpxAdapter(packageName, binName) {
+  const cacheKey = `${packageName}|${binName}`
+  if (adapterCache.has(cacheKey)) return adapterCache.get(cacheKey)
+  const root = path.join(os.homedir(), '.npm', '_npx')
+  const hits = []
+  try {
+    const realRoot = fs.realpathSync(root) + path.sep
+    for (const bucket of fs.readdirSync(root)) {
+      const pkgDir = path.join(root, bucket, 'node_modules', ...packageName.split('/'))
+      const manifestFile = path.join(pkgDir, 'package.json')
+      let manifest
+      try { manifest = JSON.parse(fs.readFileSync(manifestFile, 'utf8')) } catch { continue }
+      if (manifest.name !== packageName) continue
+      const rel = typeof manifest.bin === 'string' ? manifest.bin : manifest.bin && manifest.bin[binName]
+      if (typeof rel !== 'string' || path.isAbsolute(rel) || rel.split(path.sep).includes('..')) continue
+      let script
+      try { script = fs.realpathSync(path.join(pkgDir, rel)) } catch { continue }
+      if (!script.startsWith(realRoot) || !fs.statSync(script).isFile()) continue
+      hits.push({ script, pkgDir: fs.realpathSync(pkgDir), version: String(manifest.version || ''), mtime: fs.statSync(manifestFile).mtimeMs })
+    }
+  } catch { /* cache absent */ }
+  hits.sort((a, b) => b.mtime - a.mtime)
+  const hit = hits[0] || null
+  adapterCache.set(cacheKey, hit)
+  return hit
+}
+
+function adapterPreset({ id, name, packageName, binName, ...rest }) {
+  const cached = cachedNpxAdapter(packageName, binName)
+  let direct = cached ? { command: process.execPath, args: [cached.script], env: { ELECTRON_RUN_AS_NODE: '1' } } : null
+  // codex-acp's JS bin is only a spawnSync trampoline. Resolve its signed,
+  // platform-specific binary directly too, removing the final Node wrapper.
+  if (cached && packageName === '@zed-industries/codex-acp') {
+    const platformName = `@zed-industries/codex-acp-${process.platform}-${process.arch}`
+    const platformDir = path.join(path.dirname(path.dirname(cached.pkgDir)), ...platformName.split('/'))
+    const binary = path.join(platformDir, 'bin', process.platform === 'win32' ? 'codex-acp.exe' : 'codex-acp')
+    try {
+      const manifest = JSON.parse(fs.readFileSync(path.join(platformDir, 'package.json'), 'utf8'))
+      const real = fs.realpathSync(binary)
+      const npmRoot = fs.realpathSync(path.join(os.homedir(), '.npm')) + path.sep
+      if (manifest.name === platformName && real.startsWith(npmRoot) && fs.statSync(real).isFile()) direct = { command: real, args: [], env: {} }
+    } catch { /* use the verified JS entrypoint */ }
+  }
+  return direct
+    ? { id, name, ...direct, adapterVersion: cached.version, direct: true, ...rest }
+    : { id, name, command: 'npx', args: ['-y', packageName], direct: false, ...rest }
+}
+
+function installedPackageAdapter(packageName, binName) {
+  const roots = [
+    path.join(__dirname, '..', '..', 'node_modules'),
+    process.resourcesPath && path.join(process.resourcesPath, 'app.asar', 'node_modules'),
+    process.resourcesPath && path.join(process.resourcesPath, 'app.asar.unpacked', 'node_modules'),
+  ].filter(Boolean)
+  for (const root of roots) {
+    const pkgDir = path.join(root, ...packageName.split('/'))
+    try {
+      const manifest = JSON.parse(fs.readFileSync(path.join(pkgDir, 'package.json'), 'utf8'))
+      if (manifest.name !== packageName) continue
+      const rel = typeof manifest.bin === 'string' ? manifest.bin : manifest.bin && manifest.bin[binName]
+      if (typeof rel !== 'string' || path.isAbsolute(rel) || rel.split(path.sep).includes('..')) continue
+      const script = path.join(pkgDir, rel)
+      if (!fs.statSync(script).isFile()) continue
+      return { command: process.execPath, args: [script], env: { ELECTRON_RUN_AS_NODE: '1' }, version: String(manifest.version || '') }
+    } catch { /* next root */ }
+  }
+  return null
+}
+
+let currentCodexPath
+
+function directCodexBinary(command) {
+  try {
+    const real = fs.realpathSync(command)
+    if (!/[/\\]@openai[/\\]codex[/\\]bin[/\\]codex\.js$/.test(real)) return command
+    const packageRoot = path.dirname(path.dirname(real))
+    const platformPackage = `@openai/codex-${process.platform}-${process.arch}`
+    const triples = {
+      'darwin-arm64': 'aarch64-apple-darwin', 'darwin-x64': 'x86_64-apple-darwin',
+      'linux-arm64': 'aarch64-unknown-linux-musl', 'linux-x64': 'x86_64-unknown-linux-musl',
+      'win32-arm64': 'aarch64-pc-windows-msvc', 'win32-x64': 'x86_64-pc-windows-msvc',
+    }
+    const triple = triples[`${process.platform}-${process.arch}`]
+    if (!triple) return command
+    const platformRoot = path.join(packageRoot, 'node_modules', ...platformPackage.split('/'))
+    const manifest = JSON.parse(fs.readFileSync(path.join(platformRoot, 'package.json'), 'utf8'))
+    const native = fs.realpathSync(path.join(platformRoot, 'vendor', triple, 'bin', process.platform === 'win32' ? 'codex.exe' : 'codex'))
+    const manifestMatches = manifest.name === platformPackage
+      || (manifest.name === '@openai/codex' && manifest.os?.includes(process.platform) && manifest.cpu?.includes(process.arch))
+    if (manifestMatches && native.startsWith(fs.realpathSync(platformRoot) + path.sep) && fs.statSync(native).isFile()) return native
+  } catch { /* wrapper layout changed */ }
+  return command
+}
+
+function newestCodexExecutable(extraEnv) {
+  if (currentCodexPath !== undefined) return currentCodexPath
+  const env = agentEnv(extraEnv)
+  const pathCandidates = []
+  for (const dir of String(env.PATH || '').split(path.delimiter)) {
+    const candidate = path.join(dir, process.platform === 'win32' ? 'codex.exe' : 'codex')
+    try {
+      fs.accessSync(candidate, fs.constants.X_OK)
+      if (!pathCandidates.includes(candidate)) pathCandidates.push(candidate)
+    } catch { /* next */ }
+  }
+  const candidates = [
+    ...pathCandidates,
+    process.platform === 'darwin' ? '/Applications/ChatGPT.app/Contents/Resources/codex' : null,
+    resolveBundledCodexExecutable(),
+  ].filter(Boolean)
+  const versions = candidates.map((command) => {
+    try {
+      const raw = execFileSync(command, ['--version'], { encoding: 'utf8', timeout: 3000, stdio: ['ignore', 'pipe', 'ignore'] })
+      const m = raw.match(/(\d+)\.(\d+)\.(\d+)/)
+      return { command, tuple: m ? m.slice(1).map(Number) : [0, 0, 0], prerelease: /(?:alpha|beta|rc|nightly|dev)/i.test(raw) }
+    } catch { return null }
+  }).filter(Boolean)
+  versions.sort((a, b) => (b.tuple[0] - a.tuple[0]) || (b.tuple[1] - a.tuple[1]) || (b.tuple[2] - a.tuple[2]) || Number(a.prerelease) - Number(b.prerelease))
+  currentCodexPath = versions[0]?.command ? directCodexBinary(versions[0].command) : null
+  return currentCodexPath
+}
+
+function codexPreset() {
+  // Modern app-server adapter: this is the maintained package and supports the
+  // model/reasoning/fast controls (including Ultra) exposed by current Codex.
+  const modern = installedPackageAdapter('@agentclientprotocol/codex-acp', 'codex-acp')
+  const base = modern
+    ? { id: 'codex', name: 'Codex', command: modern.command, args: modern.args, env: modern.env, adapterVersion: modern.version, direct: true, modern: true }
+    : adapterPreset({ id: 'codex', name: 'Codex', packageName: '@zed-industries/codex-acp', binName: 'codex-acp' })
+  const codexPath = newestCodexExecutable(base.env)
+  return { ...base, env: codexPath ? { ...(base.env || {}), CODEX_PATH: codexPath } : base.env }
+}
+
+function claudePreset() {
+  const modern = installedPackageAdapter('@agentclientprotocol/claude-agent-acp', 'claude-agent-acp')
+  const nativeClaude = resolveBundledClaudeExecutable()
+  return modern
+    ? { id: 'claude-code', name: 'Claude', command: modern.command, args: modern.args, env: nativeClaude ? { ...(modern.env || {}), CLAUDE_CODE_EXECUTABLE: nativeClaude } : modern.env, adapterVersion: modern.version, direct: true, modern: true }
+    : adapterPreset({ id: 'claude-code', name: 'Claude', packageName: '@zed-industries/claude-code-acp', binName: 'claude-code-acp' })
+}
 
 // The built-in agent registry (Zed's agent_servers pattern). Each agent runs
 // as the official CLI (installed by the user). Auth is owned by the CLI:
@@ -91,11 +322,10 @@ function presets() {
     // Claude speaks ACP (chat threads) since v0.1.20 — the auto-prepared
     // per-project terminal (accounts, hooks tap, --mcp-config, --resume) stays
     // the workspace default until the ACP path reaches feature parity.
-    { id: 'claude-code', name: 'Claude',
-      command: 'npx', args: ['-y', '@zed-industries/claude-code-acp'],
+    { ...claudePreset(),
       login: 'claude /login', installCmd: 'npm i -g @anthropic-ai/claude-code',
       docs: 'https://docs.anthropic.com/en/docs/claude-code/overview', builtin: false },
-    { id: 'codex', name: 'Codex', command: 'npx', args: ['-y', '@zed-industries/codex-acp'],
+    { ...codexPreset(),
       login: 'codex login', installCmd: 'npm i -g @openai/codex',
       // plain `codex login` — the CLI retired `--device-auth` (codex-cli
       // ≥0.14x rejects it, which surfaced as a bare "invalid params" in the
@@ -180,16 +410,27 @@ const CURRENT_CODEX_MODELS = [
 const CODEX_APPROVAL_LABELS = {
   'read-only': { name: 'Ask for approval', description: 'Always ask before editing external files or using the internet.' },
   auto: { name: 'Approve for me', description: 'Only ask for actions detected as potentially unsafe.' },
+  agent: { name: 'Approve for me', description: 'Only ask for actions detected as potentially unsafe.' },
   'full-access': { name: 'Full access', description: 'Unrestricted access to the internet and files on this computer.' },
+  'agent-full-access': { name: 'Full access', description: 'Unrestricted access to the internet and files on this computer.' },
 }
+const CODEX_EFFORT_LABELS = {
+  low: { name: 'Light', description: 'Fastest · minimal reasoning' },
+  medium: { name: 'Medium', description: 'Balanced reasoning' },
+  high: { name: 'High', description: 'Deep reasoning' },
+  xhigh: { name: 'Extra High', description: 'More time for difficult work' },
+  max: { name: 'Ultra', description: 'Maximum reasoning available for this model' },
+  ultra: { name: 'Ultra', description: 'Maximum Codex reasoning · higher usage' },
+}
+const CODEX_EFFORT_BASE_ORDER = ['low', 'medium', 'high', 'xhigh']
 const labelCodexApproval = (option) => option && CODEX_APPROVAL_LABELS[option.value || option.id]
   ? { ...option, ...CODEX_APPROVAL_LABELS[option.value || option.id] }
   : option
 
 /** Merge the current model lineup into an adapter's declared controls. */
-function freshenControls(presetId, controls) {
+function freshenControls(presetId, controls, { modern = false } = {}) {
   try {
-    if (presetId === 'claude-code' && controls && controls.models && Array.isArray(controls.models.availableModels)) {
+    if (presetId === 'claude-code' && !modern && controls && controls.models && Array.isArray(controls.models.availableModels)) {
       const curIds = new Set(CURRENT_CLAUDE_MODELS.map((m) => m.modelId))
       const declared = controls.models.availableModels
       // adapter's `default` leads; our current aliases replace its stale
@@ -210,7 +451,24 @@ function freshenControls(presetId, controls) {
           if ((o.id === 'mode' || o.category === 'mode') && Array.isArray(o.options)) {
             return { ...o, name: 'Approval', options: o.options.map(labelCodexApproval) }
           }
+          if (/reasoning.*effort|effort/i.test(`${o.id} ${o.name} ${o.category}`) && Array.isArray(o.options)) {
+            const declared = new Map(o.options.map((x) => [String(x.value), x]))
+            // The product surface has one top "Ultra" slot. Preserve an
+            // already-active `max` wire (notably Luna→Sol) instead of hiding
+            // it and falsely falling back to High; otherwise prefer Sol/Terra's
+            // real `ultra` wire. The description remains wire-specific.
+            const top = String(o.currentValue) === 'max' && declared.has('max')
+              ? 'max'
+              : declared.has('ultra') ? 'ultra' : declared.has('max') ? 'max' : null
+            const options = [...CODEX_EFFORT_BASE_ORDER, ...(top ? [top] : [])]
+              .filter((value) => declared.has(value))
+              .map((value) => ({ ...declared.get(value), value, ...CODEX_EFFORT_LABELS[value] }))
+            return { ...o, name: 'Effort', category: 'thought_level', options: options.length ? options : o.options }
+          }
           if (!(o.id === 'model' || o.category === 'model') || !Array.isArray(o.options)) return o
+          // The app-server catalog is authoritative for this account/model.
+          // Hardcoded model rows are only a legacy-adapter compatibility shim.
+          if (modern) return o
           const declared = new Map(o.options.map((x) => [x.value, x]))
           // Known current rows are replaced, not merely appended: adapters often
           // report a raw id ("gpt-5.6-sol") before they ship its display metadata.
@@ -251,7 +509,7 @@ function codexCompatHome(overrideHome) {
 function resolveConfig(config) {
   if (config && config.command) return { presetId: config.presetId || config.command, name: config.name || config.command, command: config.command, args: config.args, env: config.env }
   const p = presets().find((x) => x.id === (config && config.presetId)) || presets()[0]
-  return { presetId: p.id, name: p.name, command: p.command, args: p.args, env: p.env }
+  return { presetId: p.id, name: p.name, command: p.command, args: p.args, env: p.env, modern: p.modern, adapterVersion: p.adapterVersion }
 }
 
 function buildTerminalHost(entry, sessionCwd, agentKey, agentName) {
@@ -305,6 +563,10 @@ function agentSummary(sender) {
 }
 
 function registerAcpHandlers(ipcMain) {
+  if (!processLedger) {
+    processLedger = new AcpProcessLedger(path.join(app.getPath('userData'), 'process-ledger'))
+    processLedger.reclaimStale()
+  }
   ipcMain.handle('acp:presets', () =>
     presets().map(({ id, name, login, installCmd, deviceLogin, docs, builtin, terminalOnly, terminalCommand, hidden }) =>
       ({ id, name, login, installCmd, deviceLogin, docs, builtin, terminalOnly, terminalCommand, hidden })),
@@ -314,20 +576,57 @@ function registerAcpHandlers(ipcMain) {
   // ONLY orphaned connections (their window's webContents destroyed) are
   // adopted by the caller — so agents survive a window close/reopen on macOS,
   // while a second live window can never hijack the first window's agents.
-  ipcMain.handle('acp:status', (event) => {
+  ipcMain.handle('acp:status', (event, { clientKeys, scope } = {}) => {
+    const requested = Array.isArray(clientKeys) ? new Set(clientKeys.filter((key) => typeof key === 'string')) : null
     for (const [k, entry] of [...connections.entries()]) {
       if (!entry.sender || entry.sender.isDestroyed()) {
         const rendererKey = entry.meta && (entry.meta.key || entry.meta.presetId)
+        const bareKey = typeof rendererKey === 'string' ? rendererKey.split('@@')[0] : rendererKey
+        if (scope && entry.meta?.scope && entry.meta.scope !== scope) continue
+        if (requested && !requested.has(bareKey)) continue
         const nk = ikey(event.sender, rendererKey)
         if (!connections.has(nk)) {
+          const oldLeases = connectionLeases.get(k)
+          clearIdleTimer(k)
+          connectionLeases.delete(k)
           connections.delete(k)
           entry.sender = event.sender
           connections.set(nk, entry)
+          if (oldLeases?.size) connectionLeases.set(nk, new Set(oldLeases))
+          if ((connectionLeases.get(nk)?.size ?? 0) === 0) scheduleIdlePark(nk)
         }
       }
     }
     return { ok: true, agents: agentSummary(event.sender) }
   })
+
+  // A mounted Assistant card holds one lease. Unmounting only schedules a
+  // delayed park; a remount cancels it. Multiple visible cards sharing an ACP
+  // key keep independent leases, so one card can never park another's agent.
+  ipcMain.handle('acp:lease', (event, { agentKey, leaseId, active, idleMs } = {}) => {
+    if (!agentKey || !leaseId) return { ok: false }
+    const internalKey = ikey(event.sender, agentKey)
+    const leases = new Set(connectionLeases.get(internalKey) || [])
+    if (active) {
+      leases.add(String(leaseId))
+      connectionLeases.set(internalKey, leases)
+      clearIdleTimer(internalKey)
+    } else {
+      leases.delete(String(leaseId))
+      if (leases.size) connectionLeases.set(internalKey, leases)
+      else {
+        connectionLeases.delete(internalKey)
+        scheduleIdlePark(internalKey, idleMs)
+      }
+    }
+    return { ok: true, leases: leases.size }
+  })
+  ipcMain.handle('acp:diagnostics', () => ({
+    idleMs: ACP_IDLE_MS,
+    directAdapters: presets().filter((p) => p.direct).map((p) => ({ id: p.id, version: p.adapterVersion, command: p.command, args: p.args })),
+    connections: [...connections.entries()].map(([key, e]) => ({ key, pid: e.conn?.proc?.pid, busy: !!e.current?.channel, inFlightTurns: e.inFlightTurns ?? 0, canLoadSession: !!e.conn?.canLoadSession, sessionId: e.meta?.sessionId, leases: connectionLeases.get(key)?.size ?? 0 })),
+    ledger: processLedger?.diagnostics(),
+  }))
 
   ipcMain.handle('acp:connect', async (event, config = {}) => {
     const resolved = resolveConfig(config)
@@ -335,8 +634,24 @@ function registerAcpHandlers(ipcMain) {
     // two independent connections/sessions. The composed key is what the
     // renderer echoes back on every later call (bridge.ts scopes/unscopes it).
     const scope = typeof config.scope === 'string' && config.scope ? config.scope : ''
-    const key = scope ? `${resolved.presetId}@@${scope}` : resolved.presetId
+    const clientKey = typeof config.clientKey === 'string' && config.clientKey.length <= 240 && !config.clientKey.includes('@@')
+      ? config.clientKey
+      : resolved.presetId
+    const key = scope ? `${clientKey}@@${scope}` : clientKey
     const internalKey = ikey(event.sender, key)
+    // Autoconnect and an immediate Send can arrive together. Serialize by the
+    // authoritative main-process key so only one adapter/process ledger entry
+    // is ever created for this exact thread.
+    while (connectTasks.has(internalKey)) await connectTasks.get(internalKey).promise
+    const already = connections.get(internalKey)
+    if (already?.conn?.alive && !config.forceReconnect) {
+      return { ok: true, key, agent: already.meta, controls: already.controls, authMethods: already.conn.authMethods, resumed: true, existing: true }
+    }
+    let releaseConnect
+    const connectGate = new Promise((resolve) => { releaseConnect = resolve })
+    const connectTask = { promise: connectGate, sender: event.sender, entry: null, cancelled: false }
+    connectTasks.set(internalKey, connectTask)
+    try {
     const preset = presets().find((x) => x.id === resolved.presetId)
     if (preset && preset.terminalOnly) {
       return { ok: false, message: `${preset.name} runs as a terminal session. Open it from the + menu or Settings.` }
@@ -350,20 +665,23 @@ function registerAcpHandlers(ipcMain) {
     let stderrTail = ''
     // entry.sender tracks the CURRENT window (acp:status rebinds it), so these
     // callbacks keep reaching the renderer after a window close/reopen
-    const entry = { conn: null, meta: null, sender: event.sender, controls: { modes: null, configOptions: [] }, current: { sender: null, channel: null }, autonomy: config.autonomy || DEFAULT_AUTONOMY }
+    const processToken = processLedger ? processLedger.newToken() : null
+    const entry = { conn: null, meta: null, sender: event.sender, controls: { modes: null, configOptions: [] }, current: { sender: null, channel: null }, inFlightTurns: 0, autonomy: config.autonomy || DEFAULT_AUTONOMY, processToken }
+    connectTask.entry = entry
 
     // per-connection env on top of the preset's (e.g. CLAUDE_CONFIG_DIR / CODEX_HOME
     // for the project's bound subscription)
     let env = config.env && typeof config.env === 'object'
       ? { ...(resolved.env || {}), ...config.env }
       : resolved.env
-    if (resolved.presetId === 'codex') {
+    if (resolved.presetId === 'codex' && !resolved.modern) {
       const shim = codexCompatHome(env && env.CODEX_HOME)
       if (shim) env = { ...(env || {}), CODEX_HOME: shim }
     } else if (resolved.presetId === 'claude-code' && !(env && env.CLAUDE_CODE_EXECUTABLE)) {
       const currentClaude = agentExecutable('claude', env)
       if (currentClaude) env = { ...(env || {}), CLAUDE_CODE_EXECUTABLE: currentClaude }
     }
+    if (processLedger && processToken) env = { ...(env || {}), ...processLedger.markers(processToken) }
     // claude-code-acp intentionally exposes namespaced Claude Agent SDK
     // options through session/new|load `_meta`. Effort is fixed when that SDK
     // session is created, so the renderer reconnects the resumable session when
@@ -388,13 +706,13 @@ function registerAcpHandlers(ipcMain) {
           if (n && n.kind === 'stderr' && n.text) stderrTail = (stderrTail + n.text).slice(-600)
           // the agent process died — drop any inline cards it left pending, else
           // their resolvers + needs-you badge leak until the 5-min timeout
-          if (n && n.kind === 'exit') cancelPendingFor(entry)
+          if (n && n.kind === 'exit') { cancelPendingFor(entry); clearCancelWatchdog(entry) }
           sendTo(entry, 'acp:notice', { agent: resolved.name, key, ...n })
           const m = n && n.text && n.text.match(URL_RE)
           if (m) surfaceAuthUrl(entry, resolved.name, key, m[0])
         },
         onControls: (controls) => {
-          entry.controls = freshenControls(resolved.presetId, controls)
+          entry.controls = freshenControls(resolved.presetId, controls, { modern: !!resolved.modern })
           sendTo(entry, 'acp:controls', { key, controls: entry.controls })
         },
         // The autonomy ladder decides who answers: observe auto-rejects,
@@ -442,6 +760,8 @@ function registerAcpHandlers(ipcMain) {
         },
         terminalHost: buildTerminalHost(entry, sessionCwd, key, resolved.name),
         fsGuard: (p) => !isSensitivePath(p),
+        onSpawn: ({ pid, pgid, command }) => processLedger?.recordSpawn({ token: processToken, pid, pgid, presetId: resolved.presetId, command }),
+        onProcessExit: () => processLedger?.recordExit(processToken),
       },
     )
     entry.conn = conn
@@ -463,25 +783,35 @@ function registerAcpHandlers(ipcMain) {
       })()
       const timeout = new Promise((_, rej) => setTimeout(() => rej(new Error('TIMEOUT')), CONNECT_TIMEOUT_MS))
       const session = await Promise.race([handshake, timeout])
+      if (connectTask.cancelled || event.sender.isDestroyed()) {
+        conn.dispose()
+        return { ok: false, message: 'The window closed while the agent was connecting.' }
+      }
       entry.meta = { key, presetId: resolved.presetId, scope, name: resolved.name, sessionId: session.sessionId }
-      entry.controls = freshenControls(resolved.presetId, conn.getControls())
+      entry.controls = freshenControls(resolved.presetId, conn.getControls(), { modern: !!resolved.modern })
       connections.set(internalKey, entry)
+      if ((connectionLeases.get(internalKey)?.size ?? 0) === 0) scheduleIdlePark(internalKey)
       return { ok: true, key, agent: entry.meta, controls: entry.controls, authMethods: conn.authMethods, resumed: !!session.resumed }
     } catch (err) {
       conn.dispose()
       return { ok: false, message: friendly(resolved, err, stderrTail) }
+    }
+    } finally {
+      if (connectTasks.get(internalKey) === connectTask) connectTasks.delete(internalKey)
+      releaseConnect()
     }
   })
 
   ipcMain.handle('acp:prompt', async (event, { agentKey, reqId, text, images } = {}) => {
     const entry = entryFor(event.sender, agentKey)
     if (!entry || !entry.conn.alive) return { ok: false, message: 'Agent not connected.' }
-    if (entry.current.channel) return { ok: false, message: 'Agent is mid-turn — send again when it finishes.' }
+    if (entry.current.channel || (entry.inFlightTurns ?? 0) > 0) return { ok: false, message: 'The previous agent turn is still stopping — send again in a moment.' }
     // identity token: acp:cancel may null entry.current to free the composer for a
     // hung agent, so read the __done target from this local turn (not entry.current,
     // which cancel/a newer prompt may have replaced) and clear only if still ours.
     const turn = { sender: event.sender, channel: `acp:update:${reqId}` }
     entry.current = turn
+    entry.inFlightTurns = (entry.inFlightTurns ?? 0) + 1
     try {
       const res = await entry.conn.prompt(text, images)
       if (turn.sender && !turn.sender.isDestroyed()) {
@@ -493,6 +823,8 @@ function registerAcpHandlers(ipcMain) {
       return { ok: false, message: err.message }
     } finally {
       if (entry.current === turn) entry.current = { sender: null, channel: null }
+      entry.inFlightTurns = Math.max(0, (entry.inFlightTurns ?? 1) - 1)
+      if (entry.inFlightTurns === 0) clearCancelWatchdog(entry)
     }
   })
 
@@ -563,6 +895,7 @@ function registerAcpHandlers(ipcMain) {
   })
 
   ipcMain.handle('acp:cancel', (event, { agentKey } = {}) => {
+    const internalKey = ikey(event.sender, agentKey)
     const entry = entryFor(event.sender, agentKey)
     entry?.conn.cancel()
     // a hung agent may ACK session/cancel but neither finish nor exit, so the
@@ -571,14 +904,33 @@ function registerAcpHandlers(ipcMain) {
     // is identity-guarded (only clears if entry.current is still its own turn),
     // so this can't double-clear or stomp a newer turn.
     if (entry && entry.current.channel) entry.current = { sender: null, channel: null }
+    if (entry && (entry.inFlightTurns ?? 0) > 0 && !entry.cancelWatchdog) {
+      entry.cancelWatchdog = setTimeout(() => {
+        entry.cancelWatchdog = null
+        if ((entry.inFlightTurns ?? 0) <= 0) return
+        // Some adapters acknowledge cancel but never settle session/prompt.
+        // Reap this exact owned group after a grace period; its durable session
+        // id lets the next send reconnect without mixing old/new turn streams.
+        cancelPendingFor(entry)
+        entry.conn.dispose()
+        if (connections.get(internalKey) === entry) connections.delete(internalKey)
+        connectionLeases.delete(internalKey)
+        clearIdleTimer(internalKey)
+        sendTo(entry, 'acp:notice', { agent: entry.meta?.name, key: agentKey, kind: 'cancel-timeout', text: 'The agent did not stop cleanly; Kaisola safely ended its owned process group. Send again to resume.' })
+      }, CANCEL_GRACE_MS)
+      entry.cancelWatchdog.unref?.()
+    }
     return { ok: true }
   })
 
   ipcMain.handle('acp:disconnect', (event, { agentKey } = {}) => {
     const internalKey = ikey(event.sender, agentKey)
+    clearIdleTimer(internalKey)
+    connectionLeases.delete(internalKey)
     const entry = connections.get(internalKey)
     if (entry) {
       cancelPendingFor(entry) // drop any inline cards before the connection goes away
+      clearCancelWatchdog(entry)
       entry.conn.dispose()
       connections.delete(internalKey)
     }
@@ -587,8 +939,13 @@ function registerAcpHandlers(ipcMain) {
 }
 
 function disposeAcp() {
-  for (const e of connections.values()) e.conn.dispose()
+  for (const timer of idleTimers.values()) clearTimeout(timer)
+  idleTimers.clear()
+  connectionLeases.clear()
+  for (const e of connections.values()) { clearCancelWatchdog(e); e.conn.dispose() }
+  for (const task of connectTasks.values()) task.entry?.conn?.dispose()
   connections.clear()
+  connectTasks.clear()
 }
 
-module.exports = { registerAcpHandlers, disposeAcp }
+module.exports = { registerAcpHandlers, disposeAcp, acpRendererSwapState, releaseAcpRenderer, cachedNpxAdapter, adapterPreset, claudePreset, codexPreset, newestCodexExecutable, freshenControls, _acpTest: { connections, connectionLeases, idleTimers, scheduleIdlePark, canIdlePark, acpRendererSwapState, releaseAcpRenderer, resolveBundledCodexExecutable, resolveBundledClaudeExecutable } }

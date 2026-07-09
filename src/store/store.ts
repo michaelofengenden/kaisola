@@ -110,7 +110,8 @@ export interface ProvenanceTarget {
  * An assistant chat thread. The session metadata lives here (so the sidebar can
  * list it next to the terminals); the turn runtime is stored separately by id.
  */
-export type ClaudeEffort = 'low' | 'medium' | 'high' | 'xhigh' | 'max'
+export type ClaudeEffort = 'default' | 'low' | 'medium' | 'high' | 'xhigh' | 'max'
+export type CodexEffort = 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra'
 export interface AssistantThread {
   id: string
   agentKey: string
@@ -127,6 +128,8 @@ export interface AssistantThread {
   /** Claude SDK effort is a session-creation option. Changing it reconnects
    * this resumable ACP session with the new value. */
   claudeEffort?: ClaudeEffort
+  /** Native Codex app-server reasoning effort, restored on reconnect. */
+  codexEffort?: CodexEffort
 }
 
 /** Diff/terminal artifacts a tool-call frame carries (ACP ToolCallContent). */
@@ -162,6 +165,17 @@ export interface PlanEntry {
 export interface AssistantRuntime {
   turns: AssistantTurn[]
   first: boolean
+  /** Turns evicted from the live window and preserved in the append-only
+   * per-thread disk archive. Only explicit history paging hydrates them. */
+  archivedTurns?: number
+  /** Reset/provider changes mint a new epoch so a failed unlink can never make
+   * old history reappear in the replacement conversation. */
+  archiveEpoch?: string
+  /** Durable idempotency token for a batch that has not been acknowledged.
+   * While present, persistence keeps the entire live prefix. */
+  archiveBatch?: { id: string; count: number }
+  /** Main-process append currently in flight; deliberately not persisted. */
+  archivePending?: boolean
   /** Streaming-only; stripped from durable persistence. */
   thinkStart?: number
   /** The agent's live plan (sessionUpdate:'plan'), replaced wholesale per frame. */
@@ -247,6 +261,7 @@ export interface AgentTerminalSession {
   cwd?: string
   agentKey?: string
   agentName?: string
+  scope?: string
 }
 
 /**
@@ -389,6 +404,13 @@ export interface Workflow {
 
 export type ToastKind = 'info' | 'success' | 'warn' | 'error'
 
+/** Keeps drafts/user turns comfortably below the archive's byte-bounded
+ * record size even for worst-case JSON escaping. Longer material belongs in
+ * an attached file, which preserves it without pinning Chromium memory. */
+export const ASSISTANT_DRAFT_TEXT_LIMIT = 1_000_000
+const ASSISTANT_DRAFT_ATTACHMENT_LIMIT = 64
+const ASSISTANT_DRAFT_MENTION_LIMIT = 64
+
 const emptyAssistantDraft = (speed: AssistantSpeed = 'balanced'): AssistantDraft => ({
   text: '',
   attachments: [],
@@ -397,8 +419,10 @@ const emptyAssistantDraft = (speed: AssistantSpeed = 'balanced'): AssistantDraft
 })
 
 const normalizeAssistantDraft = (draft?: Partial<AssistantDraft> | null): AssistantDraft => ({
-  text: draft?.text ?? '',
-  attachments: Array.isArray(draft?.attachments) ? draft.attachments.filter((x): x is string => typeof x === 'string') : [],
+  text: typeof draft?.text === 'string' ? draft.text.slice(0, ASSISTANT_DRAFT_TEXT_LIMIT) : '',
+  attachments: Array.isArray(draft?.attachments)
+    ? draft.attachments.filter((x): x is string => typeof x === 'string').slice(0, ASSISTANT_DRAFT_ATTACHMENT_LIMIT).map((path) => path.slice(0, 4096))
+    : [],
   mentions: Array.isArray(draft?.mentions)
     ? draft.mentions.filter((m): m is AssistantMention =>
         !!m &&
@@ -407,6 +431,8 @@ const normalizeAssistantDraft = (draft?: Partial<AssistantDraft> | null): Assist
         typeof m.label === 'string' &&
         typeof m.text === 'string',
       )
+      .slice(0, ASSISTANT_DRAFT_MENTION_LIMIT)
+      .map((mention) => ({ ...mention, id: mention.id.slice(0, 4000), label: mention.label.slice(0, 2000), text: mention.text.slice(0, 16_000) }))
     : [],
   speed: draft?.speed === 'fast' || draft?.speed === 'deep' ? draft.speed : 'balanced',
 })
@@ -886,7 +912,7 @@ interface KaisolaState {
   togglePinSession: (id: string) => void
   setSessionGroupColor: (id: string, color?: string) => void
   /** Flag a session as waiting on the human (amber dot; cleared on view). */
-  markNeedsYou: (id: string) => void
+  markNeedsYou: (id: string, projectId?: string) => void
   /** ⌘⇧T — restore the most recently closed session. */
   reopenClosedSession: () => void
   setOmniOpen: (open: boolean) => void
@@ -912,19 +938,20 @@ interface KaisolaState {
   closeAssistantThread: (id: string) => void
   renameAssistantThread: (id: string, name?: string) => void
   /** Auto-title a thread from its first message's topic (manual name wins). */
-  autoNameThread: (id: string, text: string) => void
+  autoNameThread: (id: string, text: string, projectId?: string) => void
   setAssistantThreadAgent: (id: string, agentKey: string) => void
-  setThreadAcpSession: (id: string, sessionId: string | undefined) => void
-  setThreadClaudeEffort: (id: string, effort: ClaudeEffort) => void
-  updateAssistantRuntime: (id: string, fn: (runtime: AssistantRuntime) => AssistantRuntime) => void
-  resetAssistantRuntime: (id: string) => void
-  setAssistantDraft: (id: string, patch: Partial<AssistantDraft>) => void
-  clearAssistantDraft: (id: string, opts?: { keepSpeed?: boolean }) => void
-  enqueueAssistantPrompt: (id: string, prompt: AssistantDraft, opts?: { front?: boolean }) => string
-  dequeueAssistantPrompt: (id: string) => QueuedAssistantPrompt | undefined
+  setThreadAcpSession: (id: string, sessionId: string | undefined, projectId?: string) => void
+  setThreadClaudeEffort: (id: string, effort: ClaudeEffort, projectId?: string) => void
+  setThreadCodexEffort: (id: string, effort: CodexEffort, projectId?: string) => void
+  updateAssistantRuntime: (id: string, fn: (runtime: AssistantRuntime) => AssistantRuntime, projectId?: string) => void
+  resetAssistantRuntime: (id: string, projectId?: string) => void
+  setAssistantDraft: (id: string, patch: Partial<AssistantDraft>, projectId?: string) => void
+  clearAssistantDraft: (id: string, opts?: { keepSpeed?: boolean }, projectId?: string) => void
+  enqueueAssistantPrompt: (id: string, prompt: AssistantDraft, opts?: { front?: boolean }, projectId?: string) => string
+  dequeueAssistantPrompt: (id: string, projectId?: string) => QueuedAssistantPrompt | undefined
   removeQueuedAssistantPrompt: (id: string, promptId: string) => void
   reorderAssistantThreads: (srcId: string, destId: string) => void
-  setThreadBusy: (id: string, busy: boolean) => void
+  setThreadBusy: (id: string, busy: boolean, projectId?: string) => void
   /** `pane` deep-links a Settings section (e.g. 'agents') — cleared on close. */
   setSettingsOpen: (open: boolean, pane?: string) => void
   setAgentPreset: (id: string) => void
@@ -941,7 +968,7 @@ interface KaisolaState {
   setTermCursorColor: (color: string) => void
   setTermBackground: (bg: TermBackground) => void
   toggleRail: () => void
-  snapshotWorkspace: (label: string) => Promise<RepoCheckpoint | null>
+  snapshotWorkspace: (label: string, projectId?: string) => Promise<RepoCheckpoint | null>
   restoreRepoCheckpoint: (id: string) => Promise<void>
   pushAgentFeed: (item: Omit<AgentFeedItem, 'id'>) => void
   toggleFollowAgent: () => void
@@ -1470,6 +1497,60 @@ const freshSlice = (pid: string, path: string | null = null): ProjectSliceMemory
 const projectFields = (s: KaisolaState, pid: string): ProjectSliceMemory =>
   pid === s.activeProjectId ? pick(s, PROJECT_SLICE_MEMORY_KEYS) : (s.projectSlices[pid] ?? freshSlice(pid))
 
+const ASSISTANT_ARCHIVE_BATCH_TURNS = 100
+const ASSISTANT_ARCHIVE_BATCH_BYTES = 20 * 1024 * 1024
+const utf8 = new TextEncoder()
+/** Select a count-bounded and byte-bounded prefix while retaining the latest
+ * 200 live turns. One oversize record is still attempted; if main rejects it,
+ * the durable retry marker preserves it rather than dropping data. */
+const assistantArchiveBatchCount = (turns: AssistantTurn[]): number => {
+  const available = Math.min(ASSISTANT_ARCHIVE_BATCH_TURNS, Math.max(0, turns.length - 200))
+  let count = 0
+  let bytes = 0
+  for (let i = 0; i < available; i++) {
+    let size = 0
+    try { size = utf8.encode(JSON.stringify(turns[i])).byteLength + 80 } catch { return Math.max(1, count) }
+    if (count > 0 && bytes + size > ASSISTANT_ARCHIVE_BATCH_BYTES) break
+    bytes += size
+    count++
+  }
+  return count
+}
+
+/** Stable 128-bit content/sequence fingerprint. If main fsyncs a batch and the
+ * process dies before Zustand's throttled snapshot records archiveBatch, the
+ * same persisted prefix regenerates the same id and main returns a duplicate
+ * ACK instead of appending the turns twice. */
+const assistantArchiveBatchId = (
+  scope: { projectId: string; threadId: string; epoch?: string },
+  baseCount: number,
+  turns: AssistantTurn[],
+): string => {
+  let h1 = 0x811c9dc5
+  let h2 = 0x9e3779b9
+  let h3 = 0x243f6a88
+  let h4 = 0xb7e15162
+  let length = 0
+  const feed = (value: string) => {
+    length += value.length
+    for (let i = 0; i < value.length; i++) {
+      const code = value.charCodeAt(i)
+      h1 = Math.imul(h1 ^ code, 0x01000193)
+      h2 = Math.imul(h2 ^ code, 0x85ebca6b)
+      h3 = Math.imul(h3 ^ code, 0xc2b2ae35)
+      h4 = Math.imul(h4 ^ code, 0x27d4eb2f)
+    }
+    h1 = Math.imul(h1 ^ 0xff, 0x01000193)
+    h2 = Math.imul(h2 ^ 0xff, 0x85ebca6b)
+    h3 = Math.imul(h3 ^ 0xff, 0xc2b2ae35)
+    h4 = Math.imul(h4 ^ 0xff, 0x27d4eb2f)
+  }
+  feed(JSON.stringify([scope.projectId, scope.threadId, scope.epoch ?? '0', baseCount, turns.length]))
+  for (const turn of turns) feed(JSON.stringify(turn))
+  const hash = [h1, h2, h3, h4].map((value) => (value >>> 0).toString(16).padStart(8, '0')).join('')
+  return `v1-${baseCount}-${turns.length}-${length}-${hash}`
+}
+
 /** Today's per-slice pruning (extracted from `partialize`): projects a live slice
  * onto the durable persist keys, dropping transient bucket-D fields and capping
  * the heavy arrays / healing the grid. Pure — safe for any slice, active or not. */
@@ -1499,7 +1580,17 @@ function sanitizeSliceForPersist(slice: ProjectSliceMemory): ProjectSlicePersist
   const assistantRuntimes = Object.fromEntries(
     Object.entries(slice.assistantRuntimes)
       .filter(([id]) => assistantThreads.some((t) => t.id === id))
-      .map(([id, runtime]) => [id, { turns: runtime.turns.slice(-200), first: runtime.first }]),
+      .map(([id, runtime]) => [id, {
+        // Match the live headroom: a quit at 201–240 turns must not prune a
+        // turn that has not crossed the archive spill threshold yet. A batch
+        // awaiting fsync/ACK keeps its whole prefix so quit/ENOSPC cannot lose
+        // data; it retries idempotently after rehydration.
+        turns: runtime.archiveBatch ? runtime.turns : runtime.turns.slice(-240),
+        first: runtime.first,
+        ...(runtime.archivedTurns ? { archivedTurns: runtime.archivedTurns } : {}),
+        ...(runtime.archiveEpoch ? { archiveEpoch: runtime.archiveEpoch } : {}),
+        ...(runtime.archiveBatch ? { archiveBatch: runtime.archiveBatch } : {}),
+      }]),
   )
   const liveThreadIds = new Set(assistantThreads.map((t) => t.id))
   const assistantDrafts = Object.fromEntries(
@@ -2063,7 +2154,7 @@ export const useKaisola = create<KaisolaState>()(
     const hooksPath = bridge.claude.settingsPath
     // fast mode rides the same settings file; sync it in case this launch is
     // the first since the preference was restored from disk
-    await bridge.claude.setSettingsFlags?.(get().claudeFastMode ? { fastMode: true } : {})
+    await bridge.claude.setSettingsFlags?.(get().claudeFastMode ? { fastMode: true } : {}, acct?.configDir, ws)
     const model = get().claudeTerminalModel
     const boot = [
       acct?.configDir ? `CLAUDE_CONFIG_DIR=${shellConfigDir(acct.configDir)}` : '',
@@ -2425,7 +2516,10 @@ export const useKaisola = create<KaisolaState>()(
     })),
   setSessionGroupColor: (id, color) =>
     set((s) => ({ sessionGroups: s.sessionGroups.map((g) => (g.id === id ? { ...g, color } : g)) })),
-  markNeedsYou: (id) => set((s) => (s.needsYou[id] ? s : { needsYou: { ...s.needsYou, [id]: true } })),
+  markNeedsYou: (id, projectId) => {
+    const pid = projectId ?? get().activeProjectId
+    get().patchProject(pid, (sl) => (sl.needsYou[id] ? {} : { needsYou: { ...sl.needsYou, [id]: true } }))
+  },
   reopenClosedSession: () =>
     set((s) => {
       const [top, ...rest] = s.closedStack
@@ -2686,7 +2780,8 @@ export const useKaisola = create<KaisolaState>()(
       const closing = s.assistantThreads.find((t) => t.id === id)
       const next = s.assistantThreads.filter((t) => t.id !== id)
       const assistantRuntimes = { ...s.assistantRuntimes }
-      const runtime = assistantRuntimes[id]
+      const rawRuntime = assistantRuntimes[id]
+      const runtime = rawRuntime ? { ...rawRuntime, archivePending: undefined } : undefined
       delete assistantRuntimes[id]
       const assistantDrafts = { ...s.assistantDrafts }
       delete assistantDrafts[id]
@@ -2717,58 +2812,145 @@ export const useKaisola = create<KaisolaState>()(
   renameAssistantThread: (id, name) =>
     set((s) => ({ assistantThreads: s.assistantThreads.map((t) => (t.id === id ? { ...t, name: name || undefined } : t)) })),
   // the FIRST message names the thread (its topic); later messages don't churn it
-  autoNameThread: (id, text) =>
-    set((s) => ({
-      assistantThreads: s.assistantThreads.map((t) =>
+  autoNameThread: (id, text, projectId) => {
+    const pid = projectId ?? get().activeProjectId
+    get().patchProject(pid, (sl) => ({
+      assistantThreads: sl.assistantThreads.map((t) =>
         t.id === id && !t.name && !t.autoName ? { ...t, autoName: titleFrom(text) } : t,
       ),
-    })),
+    }))
+  },
   setAssistantThreadAgent: (id, agentKey) =>
-    set((s) => ({ assistantThreads: s.assistantThreads.map((t) => (t.id === id ? { ...t, agentKey } : t)) })),
-  setThreadAcpSession: (id, sessionId) =>
-    set((s) => ({ assistantThreads: s.assistantThreads.map((t) => (t.id === id ? { ...t, acpSessionId: sessionId } : t)) })),
-  setThreadClaudeEffort: (id, claudeEffort) =>
-    set((s) => ({ assistantThreads: s.assistantThreads.map((t) => (t.id === id ? { ...t, claudeEffort } : t)) })),
-  updateAssistantRuntime: (id, fn) =>
-    set((s) => {
-      const current = s.assistantRuntimes[id] ?? { turns: [], first: true }
-      return { assistantRuntimes: { ...s.assistantRuntimes, [id]: fn(current) } }
-    }),
-  resetAssistantRuntime: (id) =>
-    set((s) => ({ assistantRuntimes: { ...s.assistantRuntimes, [id]: { turns: [], first: true } } })),
-  setAssistantDraft: (id, patch) =>
-    set((s) => {
-      const draft = normalizeAssistantDraft({ ...(s.assistantDrafts[id] ?? emptyAssistantDraft()), ...patch })
-      const assistantDrafts = { ...s.assistantDrafts }
+    set((s) => ({ assistantThreads: s.assistantThreads.map((t) => (t.id === id ? { ...t, agentKey, acpSessionId: undefined } : t)) })),
+  setThreadAcpSession: (id, sessionId, projectId) => {
+    const pid = projectId ?? get().activeProjectId
+    get().patchProject(pid, (sl) => ({ assistantThreads: sl.assistantThreads.map((t) => (t.id === id ? { ...t, acpSessionId: sessionId } : t)) }))
+  },
+  setThreadClaudeEffort: (id, claudeEffort, projectId) => {
+    const pid = projectId ?? get().activeProjectId
+    get().patchProject(pid, (sl) => ({ assistantThreads: sl.assistantThreads.map((t) => (t.id === id ? { ...t, claudeEffort } : t)) }))
+  },
+  setThreadCodexEffort: (id, codexEffort, projectId) => {
+    const pid = projectId ?? get().activeProjectId
+    get().patchProject(pid, (sl) => ({ assistantThreads: sl.assistantThreads.map((t) => (t.id === id ? { ...t, codexEffort } : t)) }))
+  },
+  updateAssistantRuntime: (id, fn, projectId) => {
+    const pid = projectId ?? get().activeProjectId
+    const slice = projectFields(get(), pid)
+    // A late ACP frame after its project/thread closed is ignored instead of
+    // resurrecting that runtime inside whichever tab happens to be active.
+    if (!slice.assistantThreads.some((thread) => thread.id === id)) return
+    const current = slice.assistantRuntimes[id] ?? { turns: [], first: true }
+    let next = fn(current)
+    let job: { scope: { projectId: string; threadId: string; epoch?: string }; batchId: string; count: number; turns: AssistantTurn[] } | null = null
+    if (next.turns.length > 240 && !next.archivePending && bridge.assistantArchive) {
+      const available = Math.max(0, next.turns.length - 200)
+      const retryCount = next.archiveBatch?.count
+      const count = retryCount && retryCount <= available ? retryCount : assistantArchiveBatchCount(next.turns)
+      if (count > 0) {
+        const scope = { projectId: pid, threadId: id, ...(next.archiveEpoch ? { epoch: next.archiveEpoch } : {}) }
+        const turns = next.turns.slice(0, count)
+        const batchId = next.archiveBatch?.id ?? assistantArchiveBatchId(scope, next.archivedTurns ?? 0, turns)
+        const archiveBatch = { id: batchId, count }
+        next = { ...next, archiveBatch, archivePending: true }
+        job = {
+          scope,
+          batchId,
+          count,
+          turns,
+        }
+      }
+    }
+    get().patchProject(pid, (sl) => ({ assistantRuntimes: { ...sl.assistantRuntimes, [id]: next } }))
+    if (!job || !bridge.assistantArchive) return
+    const pending = job
+    const fail = () => {
+      get().patchProject(pid, (sl) => {
+        const runtime = sl.assistantRuntimes[id]
+        if (!runtime || runtime.archiveBatch?.id !== pending.batchId) return {}
+        return { assistantRuntimes: { ...sl.assistantRuntimes, [id]: { ...runtime, archivePending: undefined } } }
+      })
+    }
+    const submit = (attempt = 0) => {
+      void bridge.assistantArchive!.append(pending.scope, pending.batchId, pending.turns).then((result) => {
+        if (!result.ok || !Number.isInteger(result.count)) {
+          if (result.retryable && attempt < 10) {
+            const delay = Math.min(2000, 100 * (2 ** attempt))
+            window.setTimeout(() => {
+              const runtime = projectFields(get(), pid).assistantRuntimes[id]
+              if (runtime?.archiveBatch?.id === pending.batchId && runtime.archivePending) submit(attempt + 1)
+            }, delay)
+          } else fail()
+          return
+        }
+        let shouldContinue = false
+        get().patchProject(pid, (sl) => {
+          const runtime = sl.assistantRuntimes[id]
+          if (!runtime || runtime.archiveBatch?.id !== pending.batchId) return {}
+          const { archiveBatch: _batch, archivePending: _pending, ...rest } = runtime
+          const next: AssistantRuntime = {
+            ...rest,
+            turns: runtime.turns.slice(pending.count),
+            archivedTurns: result.count,
+          }
+          shouldContinue = next.turns.length > 240
+          return { assistantRuntimes: { ...sl.assistantRuntimes, [id]: next } }
+        })
+        // A burst may have grown while fsync was in flight. Drain another bounded
+        // batch only after the prior ACK, keeping ordering and memory bounded.
+        if (shouldContinue) queueMicrotask(() => get().updateAssistantRuntime(id, (runtime) => runtime, pid))
+      }, fail)
+    }
+    submit()
+  },
+  resetAssistantRuntime: (id, projectId) => {
+    const pid = projectId ?? get().activeProjectId
+    const previous = projectFields(get(), pid).assistantRuntimes[id]
+    const oldScope = { projectId: pid, threadId: id, ...(previous?.archiveEpoch ? { epoch: previous.archiveEpoch } : {}) }
+    const clear = bridge.assistantArchive?.clear(oldScope)
+    if (clear) void clear.catch(() => {})
+    const archiveEpoch = uid('archive-epoch')
+    get().patchProject(pid, (sl) => ({ assistantRuntimes: { ...sl.assistantRuntimes, [id]: { turns: [], first: true, archiveEpoch } } }))
+  },
+  setAssistantDraft: (id, patch, projectId) => {
+    const pid = projectId ?? get().activeProjectId
+    get().patchProject(pid, (sl) => {
+      const draft = normalizeAssistantDraft({ ...(sl.assistantDrafts[id] ?? emptyAssistantDraft()), ...patch })
+      const assistantDrafts = { ...sl.assistantDrafts }
       if (assistantDraftIsEmpty(draft)) delete assistantDrafts[id]
       else assistantDrafts[id] = draft
       return { assistantDrafts }
-    }),
-  clearAssistantDraft: (id, opts) =>
-    set((s) => {
-      const prev = normalizeAssistantDraft(s.assistantDrafts[id])
+    })
+  },
+  clearAssistantDraft: (id, opts, projectId) => {
+    const pid = projectId ?? get().activeProjectId
+    get().patchProject(pid, (sl) => {
+      const prev = normalizeAssistantDraft(sl.assistantDrafts[id])
       const next = opts?.keepSpeed ? emptyAssistantDraft(prev.speed) : emptyAssistantDraft()
-      const assistantDrafts = { ...s.assistantDrafts }
+      const assistantDrafts = { ...sl.assistantDrafts }
       if (assistantDraftIsEmpty(next)) delete assistantDrafts[id]
       else assistantDrafts[id] = next
       return { assistantDrafts }
-    }),
-  enqueueAssistantPrompt: (id, prompt, opts) => {
+    })
+  },
+  enqueueAssistantPrompt: (id, prompt, opts, projectId) => {
     const queued: QueuedAssistantPrompt = { ...normalizeAssistantDraft(prompt), id: uid('qp'), queuedAt: Date.now() }
     if (!queued.text.trim()) return queued.id
-    set((s) => {
-      const current = s.assistantPromptQueues[id] ?? []
+    const pid = projectId ?? get().activeProjectId
+    get().patchProject(pid, (sl) => {
+      const current = sl.assistantPromptQueues[id] ?? []
       const next = opts?.front ? [queued, ...current].slice(0, 20) : [...current, queued].slice(-20)
-      return { assistantPromptQueues: { ...s.assistantPromptQueues, [id]: next } }
+      return { assistantPromptQueues: { ...sl.assistantPromptQueues, [id]: next } }
     })
     return queued.id
   },
-  dequeueAssistantPrompt: (id) => {
-    const queue = get().assistantPromptQueues[id] ?? []
+  dequeueAssistantPrompt: (id, projectId) => {
+    const pid = projectId ?? get().activeProjectId
+    const queue = projectFields(get(), pid).assistantPromptQueues[id] ?? []
     const [next, ...rest] = queue
     if (!next) return undefined
-    set((s) => {
-      const assistantPromptQueues = { ...s.assistantPromptQueues }
+    get().patchProject(pid, (sl) => {
+      const assistantPromptQueues = { ...sl.assistantPromptQueues }
       if (rest.length) assistantPromptQueues[id] = rest
       else delete assistantPromptQueues[id]
       return { assistantPromptQueues }
@@ -2794,8 +2976,10 @@ export const useKaisola = create<KaisolaState>()(
       arr.splice(to, 0, moved)
       return { assistantThreads: arr }
     }),
-  setThreadBusy: (id, busy) =>
-    set((s) => ({ assistantThreads: s.assistantThreads.map((t) => (t.id === id ? { ...t, busy } : t)) })),
+  setThreadBusy: (id, busy, projectId) => {
+    const pid = projectId ?? get().activeProjectId
+    get().patchProject(pid, (sl) => ({ assistantThreads: sl.assistantThreads.map((t) => (t.id === id ? { ...t, busy } : t)) }))
+  },
   setSettingsOpen: (open, pane) => set({ settingsOpen: open, settingsPane: open ? pane ?? null : null }),
   setAgentPreset: (id) => set({ agentPreset: id }),
   setWorkspace: (path) => {
@@ -2860,8 +3044,8 @@ export const useKaisola = create<KaisolaState>()(
   toggleRail: () => set((s) => ({ railOpen: !s.railOpen })),
 
   // ── working-tree checkpoints (Zed-style restore points, via hidden git refs) ──
-  snapshotWorkspace: async (label) => {
-    const pid = get().activeProjectId
+  snapshotWorkspace: async (label, projectId) => {
+    const pid = projectId ?? get().activeProjectId
     const ws = projectFields(get(), pid).workspacePath
     if (!ws || !isDesktop) return null
     const r = await bridge.git.snapshot(ws, label)
@@ -2931,8 +3115,12 @@ export const useKaisola = create<KaisolaState>()(
         st.setProjectActivity(req.scope, 'needs-you')
         return
       }
-      const mine = st.assistantThreads.filter((t) => t.agentKey === req.key)
-      const target = mine.find((t) => t.id === st.activeThreadId) ?? mine[0]
+      const threadSep = req.key.lastIndexOf('::')
+      const routedThreadId = threadSep >= 0 ? req.key.slice(threadSep + 2) : ''
+      const exact = routedThreadId ? st.assistantThreads.find((t) => t.id === routedThreadId) : undefined
+      const providerKey = threadSep >= 0 ? req.key.slice(0, threadSep) : req.key
+      const mine = st.assistantThreads.filter((t) => t.agentKey === providerKey)
+      const target = exact ?? mine.find((t) => t.id === st.activeThreadId) ?? mine[0]
       if (target && !st.dockViews.includes(target.id)) st.markNeedsYou(target.id)
     }
     if (requestIsSensitive(s.sensitiveGlobs, req)) {
@@ -3534,7 +3722,7 @@ export const useKaisola = create<KaisolaState>()(
           : reasoningProvider === 'codex'
             ? { provider: 'codex' as const, cwd: pf.workspacePath ?? undefined }
             : reasoningProvider === 'agent'
-              ? { provider: 'agent' as const, agentKey: pf.agentPreset }
+              ? { provider: 'agent' as const, agentKey: pf.agentPreset, cwd: pf.workspacePath ?? undefined, scope: pid }
               : reasoningProvider === 'openai'
                 ? { provider: 'openai' as const, baseUrl: s.openaiBaseUrl, model: agentModels[agentId] || s.openaiModel, useStoredKey: true }
                 : { provider: 'openai' as const, baseUrl: s.localBaseUrl, model: agentModels[agentId] || s.localModel }

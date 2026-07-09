@@ -113,6 +113,18 @@ const bootLine = (boot: string, singletonKey?: string) =>
  * seeds NEW ptys: an id lands here only after its terminal actually mounted. */
 export const everMountedTerminals = new Set<string>()
 
+/** Hidden xterms kept warm for instant back-switches. Everything beyond this
+ * small LRU is unmounted; its pty keeps running with disk-backed scrollback. */
+export const hiddenTerminalResidentCap = () => {
+  const n = Number(localStorage.getItem('kaisola:hidden-terminal-residents') ?? '2')
+  return Number.isFinite(n) ? Math.min(8, Math.max(0, Math.round(n))) : 2
+}
+
+export const touchMountedTerminal = (id: string) => {
+  everMountedTerminals.delete(id)
+  everMountedTerminals.add(id)
+}
+
 /** Drop a terminal id from the ever-mounted Set — call ONLY on a real terminal
  * close (store's closeTerminal reap), never on a React unmount: the Set must
  * survive tab-hide remounts, and only a genuine close should shrink it. */
@@ -203,7 +215,10 @@ export function Terminal({ id, attach = false, boot, cwd }: { id: string; attach
   // draft survival: the CLI composer's unsent text, reconstructed from
   // keystrokes (see trackDraft) — replayed into a resumed agent after restart
   const lastOutputAtRef = useRef(Date.now())
-  const draftBufRef = useRef('')
+  // A hibernated xterm remounts around the same live CLI composer. Seed the
+  // keystroke tracker from durable state so the next character appends to the
+  // existing draft instead of replacing it with only the new suffix.
+  const draftBufRef = useRef(useKaisola.getState().termDrafts[id] ?? '')
   const trackDraftRef = useRef<(data: string) => void>(() => {})
   const armDraftRetypeRef = useRef<(bootStr: string) => void>(() => {})
 
@@ -236,9 +251,12 @@ export function Terminal({ id, attach = false, boot, cwd }: { id: string; attach
   // frees its GL context; occlusion alone keeps it (re-showing the window
   // must not pay a per-terminal context rebuild)
   useEffect(() => {
-    if (cardShown) glCtlRef.current?.attach()
+    if (cardShown) {
+      touchMountedTerminal(id)
+      glCtlRef.current?.attach()
+    }
     else glCtlRef.current?.drop()
-  }, [cardShown])
+  }, [cardShown, id])
 
   // font settings (Settings → Terminal, plus ⌘+/⌘−/⌘0) apply LIVE to every
   // terminal — the renderer rebuilds its glyph atlas and the pty re-fits
@@ -305,7 +323,7 @@ export function Terminal({ id, attach = false, boot, cwd }: { id: string; attach
       void bridge.openExternal(uri)
     }))
     term.open(hostRef.current)
-    everMountedTerminals.add(id)
+    touchMountedTerminal(id)
     // GPU renderer when available (the pty stays byte-identical without it).
     // Its dispose() is NOT idempotent and crashes inside term.dispose() (seen
     // under StrictMode's dev double-mount) — so we dispose it ourselves first,
@@ -614,10 +632,21 @@ export function Terminal({ id, attach = false, boot, cwd }: { id: string; attach
       bridge.terminal.resize(id, term.cols, term.rows)
     }
 
+    const restoreSnapshot = (snap: { output?: string; viewState?: { scrollFromBottom?: number } | null }) => {
+      const restoreView = () => {
+        const fromBottom = Number(snap.viewState?.scrollFromBottom)
+        if (Number.isFinite(fromBottom) && fromBottom > 0) {
+          try { term.scrollToLine(Math.max(0, term.buffer.active.baseY - fromBottom)) } catch { /* stale geometry */ }
+        }
+      }
+      if (snap.output) term.write(snap.output, restoreView)
+      else restoreView()
+    }
+
     if (attach) {
       bridge.terminal.attach(id).then((snap) => {
         if (disposed) return
-        if (snap.output) term.write(snap.output)
+        restoreSnapshot(snap)
         wire()
       })
     } else {
@@ -627,7 +656,7 @@ export function Terminal({ id, attach = false, boot, cwd }: { id: string; attach
           term.writeln('\x1b[38;2;225;106;106mTerminal unavailable.\x1b[0m')
           return
         }
-        if (res.output) term.write(res.output)
+        restoreSnapshot(res)
         wire()
         // run a boot command (e.g. `codex login`) once the shell prompt is
         // ready. FRESH pty: this path is the single boot writer — it reads the
@@ -674,6 +703,14 @@ export function Terminal({ id, attach = false, boot, cwd }: { id: string; attach
 
     return () => {
       disposed = true
+      // Persist the viewport before xterm releases its scrollback. This only
+      // detaches the renderer; a running shell/agent is never killed.
+      const viewState = {
+        scrollFromBottom: Math.max(0, term.buffer.active.baseY - term.buffer.active.viewportY),
+        cols: term.cols,
+        rows: term.rows,
+      }
+      void bridge.terminal.detachRenderer(id, viewState)
       if (titleTimer) clearTimeout(titleTimer)
       window.removeEventListener('resize', onWinResize)
       host.removeEventListener('click', focus)

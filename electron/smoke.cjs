@@ -6,8 +6,8 @@ const path = require('node:path')
 const { registerModelHandlers } = require('./ipc/modelHandler.cjs')
 const { registerToolHandlers } = require('./ipc/toolHandler.cjs')
 const { registerSettingsHandlers } = require('./ipc/settingsHandler.cjs')
-const { registerTerminalHandlers } = require('./ipc/terminalHandler.cjs')
-const { registerAcpHandlers } = require('./ipc/acpHandler.cjs')
+const { registerTerminalHandlers, killAllSessions } = require('./ipc/terminalHandler.cjs')
+const { registerAcpHandlers, disposeAcp } = require('./ipc/acpHandler.cjs')
 const { registerAuthHandlers } = require('./ipc/authHandler.cjs')
 const { registerFsHandlers } = require('./ipc/fsHandler.cjs')
 const { registerGrobidHandlers } = require('./ipc/grobidHandler.cjs')
@@ -23,6 +23,8 @@ const { registerLedgerHandlers } = require('./ipc/ledgerHandler.cjs')
 const { registerMcpHandlers } = require('./ipc/mcpServer.cjs')
 const { registerExtensionHandlers } = require('./ipc/extensionHandler.cjs')
 const { registerGlassHandlers } = require('./ipc/glassHandler.cjs')
+const { registerAssistantArchiveHandlers } = require('./ipc/assistantArchive.cjs')
+const { AcpProcessLedger } = require('./ipc/acpProcessLedger.cjs')
 const worktree = require('./ipc/worktreeHandler.cjs')
 
 process.env.KAISOLA_SMOKE = '1' // never auto-open a real browser during the test
@@ -34,6 +36,13 @@ app.disableHardwareAcceleration()
 const os = require('node:os')
 const fsx = require('node:fs')
 const SMOKE_USERDATA = path.join(os.tmpdir(), 'kaisola-smoke-userdata')
+// Reclaim the PREVIOUS harness run before deleting its ephemeral userData;
+// otherwise the ownership ledger disappears before it can reap an interrupted
+// adapter tree on the next run.
+try {
+  const priorLedger = path.join(SMOKE_USERDATA, 'process-ledger')
+  if (fsx.existsSync(path.join(priorLedger, 'acp-processes.json'))) new AcpProcessLedger(priorLedger).reclaimStale()
+} catch { /* no prior harness */ }
 try { fsx.rmSync(SMOKE_USERDATA, { recursive: true, force: true }) } catch { /* fresh */ }
 app.setPath('userData', SMOKE_USERDATA)
 
@@ -80,6 +89,7 @@ app.whenReady().then(async () => {
   registerMcpHandlers(ipcMain)
   registerExtensionHandlers(ipcMain)
   registerGlassHandlers(ipcMain)
+  registerAssistantArchiveHandlers(ipcMain, path.join(SMOKE_USERDATA, 'assistant-archives'))
   // Liquid Glass prefs are cosmetic; the smoke shell answers with "unsupported"
   ipcMain.handle('shell:glass', () => ({ supported: false, active: false, enabled: false }))
   ipcMain.handle('shell:window-mode', () => ({ wantSolid: false, liveSolid: false }))
@@ -219,12 +229,14 @@ app.whenReady().then(async () => {
     const backdrop = (style) => [style.backdropFilter, style.getPropertyValue('-webkit-backdrop-filter')].filter(Boolean).join(' ')
     const store = window.__kaisola.getState()
     const previousLayout = store.layoutMode
+    const previousPerfMode = store.perfMode
     const previousWinFocus = document.documentElement.dataset.winfocus
     // this check asserts LIGHT-theme token values — force the theme, or the
     // suite goes red every night when macOS's scheduled dark mode flips the
     // default 'system' theme under it (found 2026-07-09, 1am)
     const previousThemeMode = store.themeMode
     store.setThemeMode('light')
+    store.setPerfMode('painted')
     store.setLayoutMode('studio')
     document.documentElement.dataset.winfocus = 'true'
     await new Promise((r) => setTimeout(r, 160))
@@ -233,6 +245,7 @@ app.whenReady().then(async () => {
     const canvas = document.querySelector('.canvas-wrap > .canvas')
     if (!app || !rail || !canvas) {
       store.setThemeMode(previousThemeMode)
+      store.setPerfMode(previousPerfMode)
       store.setLayoutMode(previousLayout)
       if (previousWinFocus == null) delete document.documentElement.dataset.winfocus
       else document.documentElement.dataset.winfocus = previousWinFocus
@@ -308,7 +321,7 @@ app.whenReady().then(async () => {
       // pseudos carry a PAINTED veil (the constant the old blur(1600px)
       // converged to — glassprobe.cjs solved it) with NO backdrop-filter
       // anywhere; the OS material carries the live glow
-      appSamplingLayer: !/blur/.test(activeAppBackdrop) && !/blur/.test(activeAppGlassBackdrop) && alpha(activeAppBackground) < 0.05 && appLiftTop >= 43 && appLiftTop <= 47 && appLiftBottom >= 28 && appLiftBottom <= 32,
+      appSamplingLayer: !/blur/.test(activeAppBackdrop) && !/blur/.test(activeAppGlassBackdrop) && alpha(activeAppBackground) < 0.05 && appLiftTop >= 22 && appLiftTop <= 24 && appLiftBottom >= 11 && appLiftBottom <= 13,
       chromeGlass: !/blur/.test(tabstripGlassBd) && !/blur/.test(railGlassBd)
         // the RAIL keeps the painted veil + grain…
         && getComputedStyle(rail, '::before').backgroundImage.includes('data:image/svg')
@@ -321,12 +334,11 @@ app.whenReady().then(async () => {
       activeTintWhite: activeAppTint === '#fffefd',
       railBackdrop: activeRailBackdrop,
       railLayerFlattened: !activeRailBackdrop && activeRailBackgroundAlpha <= 0.02 && (!activeRailBgImage || activeRailBgImage === 'none') && activeSessionListFlat && activeRailDividerFlat && activeRailSearchFlat && veilAlpha >= 0 && veilAlpha <= 1,
-      // work surfaces are OPAQUE on purpose: terminals/documents repaint
-      // constantly, and glass under them re-blurred per frame (~19% GPU core
-      // per streaming claude, measured; ~0% opaque)
-      contentGlassy: !activeCanvasBackdrop && alpha(canvasStyle.backgroundColor) >= 0.99,
-      sessionGlassy: !!cardStyle && !/blur/.test(backdrop(cardStyle)) && alpha(cardStyle.backgroundColor) >= 0.99,
-      termGlassTint: !!termStyle && alpha(termStyle.backgroundColor) <= 0.5,
+      // painted cards are genuine alpha over a STATIC wallpaper raster: no
+      // backdrop compositor. The terminal pane/xterm stays opaque.
+      contentGlassy: !activeCanvasBackdrop && alpha(canvasStyle.backgroundColor) >= 0.78 && alpha(canvasStyle.backgroundColor) <= 0.82 && canvasStyle.backgroundImage.includes('data:image/svg'),
+      sessionGlassy: !!cardStyle && !/blur/.test(backdrop(cardStyle)) && alpha(cardStyle.backgroundColor) >= 0.70 && alpha(cardStyle.backgroundColor) <= 0.74 && cardStyle.backgroundImage.includes('data:image/svg'),
+      termGlassTint: !!termStyle && alpha(termStyle.backgroundColor) >= 0.99,
       blurKeepsGlass: surfacesEqual && blurredFp.appGlassDisplay !== 'none',
       lightsGray: !!light && activeFp.lightBg !== blurredFp.lightBg,
       nativeWindowRounding: appRadius >= 23 && appRadius <= 26 && railRadius >= 19 && railRadius <= 22 && canvasRadius >= 19 && canvasRadius <= 22,
@@ -345,6 +357,7 @@ app.whenReady().then(async () => {
       canvasRadius,
     }
     store.setLayoutMode(previousLayout)
+    store.setPerfMode(previousPerfMode)
     store.setThemeMode(previousThemeMode)
     if (previousWinFocus == null) delete document.documentElement.dataset.winfocus
     else document.documentElement.dataset.winfocus = previousWinFocus
@@ -595,6 +608,10 @@ app.whenReady().then(async () => {
     st.setTheme('dark')
     st.setAgentPreset('opencode')
     st.updateAssistantRuntime(st.activeThreadId, () => ({ first: false, turns: [{ kind: 'user', text: 'persisted chat turn', at: 1 }] }))
+    st.setAssistantDraft(st.activeThreadId, { text: 'x'.repeat(1000100) })
+    const draftBounded = window.__kaisola.getState().assistantDrafts[st.activeThreadId].text.length === 1000000
+    st.setAssistantDraft(st.activeThreadId, { text: 'persisted unsent draft' })
+    st.setThreadCodexEffort(st.activeThreadId, 'ultra')
     await new Promise((r) => setTimeout(r, 1000)) // outlast the write-throttled persist (800ms) + async db.set
     const raw = window.kaisola.db.getSync('kaisola-store')
     const kind = await window.kaisola.db.kind()
@@ -604,6 +621,9 @@ app.whenReady().then(async () => {
       hasAgent: !!(raw && raw.includes('"agentPreset":"opencode"')),
       hasThread: !!(raw && raw.includes('"assistantThreads"')),
       hasChatTurn: !!(raw && raw.includes('persisted chat turn')),
+      hasDraft: !!(raw && raw.includes('persisted unsent draft')),
+      draftBounded,
+      hasCodexEffort: !!(raw && raw.includes('"codexEffort":"ultra"')),
       backend: kind.kind,
     }
   })()`)
@@ -1222,6 +1242,12 @@ a^2 + b^2 = c^2
     const gridsDiffer = secondGrid !== firstGrid
     const parkedFirst = g().projectSlices[firstId]
     const parkedFirstOk = !!parkedFirst && parkedFirst.terminals.map((t) => t.id).sort().join() === firstTerms
+    // A live ACP callback retains its origin pid. While tab two is active, its
+    // runtime write must land in parked tab one and leave tab two untouched.
+    const firstThread = parkedFirst?.assistantThreads?.[0]?.id
+    if (firstThread) g().updateAssistantRuntime(firstThread, () => ({ first: false, turns: [{ kind: 'assistant', text: 'origin-routed', at: 2 }] }), firstId)
+    const runtimeRouted = !!firstThread && g().projectSlices[firstId]?.assistantRuntimes?.[firstThread]?.turns?.[0]?.text === 'origin-routed'
+    const activeRuntimeUntouched = !!firstThread && !g().assistantRuntimes[firstThread]
     // 2) switch back to the first tab — live fields restored, second parked
     g().switchProject(firstId)
     await wait(160)
@@ -1249,7 +1275,7 @@ a^2 + b^2 = c^2
     await wait(140)
     const backToSingle = g().projectTabs.length === startTabs && g().activeProjectId === firstId
     return {
-      twoTabs, isSecondActive, termsDiffer, gridsDiffer, parkedFirstOk,
+      twoTabs, isSecondActive, termsDiffer, gridsDiffer, parkedFirstOk, runtimeRouted, activeRuntimeUntouched,
       backToFirst, firstRestored, parkedSecondOk,
       domTwoTabs, domActiveOne,
       closedGone, stackHas, reopened, reopenedTermsOk, reopenedGridOk, backToSingle,
@@ -2519,7 +2545,7 @@ a^2 + b^2 = c^2
     !permrules.saved || !permrules.cascaded || !permrules.autoAnswered || !permrules.rejectCascade ||
     !sensitive.surfaced || !sensitive.stillPending || !sensitive.diffFlagged || sensitive.pendingAfter !== 0 ||
     !activityUi.card || !activityUi.hasSubagent || !activityUi.hasTerminal || !activityUi.hasStatus || !activityUi.openBtn ||
-    !persist.stored || !persist.hasTheme || !persist.hasAgent || !persist.hasThread || !persist.hasChatTurn ||
+    !persist.stored || !persist.hasTheme || !persist.hasAgent || !persist.hasThread || !persist.hasChatTurn || !persist.hasDraft || !persist.draftBounded || !persist.hasCodexEffort ||
     !boot.hasId || !boot.ran ||
     !auth.hasUrl || auth.code !== 'ABCD-1234' || !auth.done ||
     !cards.cardPerView || !cards.chatLeftOfFiles || !cards.hasHead || !cards.noDockPanel || !fschk.listed || !fschk.read || !fschk.wrote ||
@@ -2541,7 +2567,7 @@ a^2 + b^2 = c^2
     !canvasR.hasHandle || !canvasR.sized || !canvasR.clampedMin || !canvasR.resets ||
     !canvasMin.shownBefore || !canvasMin.hasBtn || !canvasMin.hidden || !canvasMin.cardsStay || !canvasMin.restoredByNav || !canvasMin.restoredByFile ||
     !lights.three || !lights.bigger || !lights.corner || !lights.noDrag || !lights.ctlApi ||
-    !projtabs.twoTabs || !projtabs.isSecondActive || !projtabs.termsDiffer || !projtabs.gridsDiffer || !projtabs.parkedFirstOk ||
+    !projtabs.twoTabs || !projtabs.isSecondActive || !projtabs.termsDiffer || !projtabs.gridsDiffer || !projtabs.parkedFirstOk || !projtabs.runtimeRouted || !projtabs.activeRuntimeUntouched ||
     !projtabs.backToFirst || !projtabs.firstRestored || !projtabs.parkedSecondOk ||
     !projtabs.domTwoTabs || !projtabs.domActiveOne ||
     !projtabs.closedGone || !projtabs.stackHas || !projtabs.reopened || !projtabs.reopenedTermsOk || !projtabs.reopenedGridOk || !projtabs.backToSingle ||
@@ -2596,5 +2622,11 @@ a^2 + b^2 = c^2
     errors.forEach((e) => console.log(e))
   }
   console.log(failed ? 'SMOKE_RESULT=FAIL' : 'SMOKE_RESULT=PASS')
+  // The harness calls app.exit directly (production's before-quit hooks do not
+  // run here). Reap exact owned groups so repeated smoke runs never manufacture
+  // the very PPID-1 adapter leak the lifecycle suite guards against.
+  disposeAcp()
+  killAllSessions()
+  await new Promise((resolve) => setTimeout(resolve, 250))
   app.exit(failed ? 1 : 0)
 })

@@ -1,10 +1,12 @@
-// GPU-cost probe — boots the REAL renderer (hardware acceleration ON,
-// transparent window + vibrancy like main.cjs), docks one terminal running a
-// claude-style spinner, and holds still so `top` can sample the GPU helper.
+// GPU/memory-cost probe — boots the REAL renderer (hardware acceleration ON),
+// docks one terminal running a claude-style spinner, and holds still so
+// `footprint`, `vmmap`, or `top` can sample the complete Electron process tree.
 //
 //   npx electron electron/perfprobe.cjs A   → current full glass (baseline)
 //   npx electron electron/perfprobe.cjs B   → opaque cards/canvas, window blur kept
 //   npx electron electron/perfprobe.cjs C   → B + full-window blur dropped
+//   npx electron electron/perfprobe.cjs G   → shipped live-glass mode
+//   npx electron electron/perfprobe.cjs P   → shipped painted/solid-window mode
 const { app, BrowserWindow, ipcMain } = require('electron')
 const path = require('node:path')
 const os = require('node:os')
@@ -27,7 +29,8 @@ const worktree = require('./ipc/worktreeHandler.cjs')
 const mgr = require('./ipc/terminalManager.cjs')
 
 process.env.KAISOLA_SMOKE = '1' // no external side effects; meta poller off
-const variant = (process.argv.find((a) => /^[ABC]$/.test(a)) || 'A').toUpperCase()
+const variant = (process.argv.find((a) => /^[ABCGP]$/i.test(a)) || 'A').toUpperCase()
+const solidWindow = variant === 'P'
 app.setPath('userData', path.join(os.tmpdir(), `kaisola-perfprobe-${variant}`))
 try { fsx.rmSync(app.getPath('userData'), { recursive: true, force: true }) } catch { /* fresh */ }
 
@@ -64,10 +67,9 @@ app.whenReady().then(async () => {
     width: 1280,
     height: 800,
     frame: false,
-    transparent: true,
-    backgroundColor: '#00000000',
-    vibrancy: 'under-window',
-    visualEffectState: 'active',
+    transparent: !solidWindow,
+    backgroundColor: solidWindow ? '#f2f1ee' : '#00000000',
+    ...(solidWindow ? {} : { vibrancy: 'under-window', visualEffectState: 'active' }),
     webPreferences: {
       preload: path.join(__dirname, 'preload.cjs'),
       contextIsolation: true,
@@ -77,8 +79,12 @@ app.whenReady().then(async () => {
       plugins: true,
     },
   })
-  await win.loadFile(path.join(__dirname, '..', 'dist', 'index.html'))
+  await win.loadFile(path.join(__dirname, '..', 'dist', 'index.html'), solidWindow ? { query: { solidwin: '1' } } : undefined)
   await wait(1200)
+  if (variant === 'P' || variant === 'G') {
+    await win.webContents.executeJavaScript(`window.__kaisola.setState({ perfMode: ${JSON.stringify(variant === 'P' ? 'painted' : 'glass')} })`, true)
+    await wait(600)
+  }
   const css = VARIANT_CSS[variant]
   if (css) await win.webContents.insertCSS(css)
   const js = (code) => win.webContents.executeJavaScript(code, true)
@@ -94,6 +100,6 @@ app.whenReady().then(async () => {
   const len1 = mgr.snapshot(termId).output.length
   await wait(1000)
   const len2 = mgr.snapshot(termId).output.length
-  console.log(`PROBE_READY variant=${variant} term=${termId || 'NONE'} spinner=${len2 > len1 ? 'FLOWING' : 'STALLED'} (+${len2 - len1}b/s)`)
+  console.log(`PROBE_READY variant=${variant} pid=${process.pid} solid=${solidWindow} term=${termId || 'NONE'} spinner=${len2 > len1 ? 'FLOWING' : 'STALLED'} (+${len2 - len1}b/s)`)
   setTimeout(() => app.exit(0), 60_000) // backstop — the driver usually kills us
 })

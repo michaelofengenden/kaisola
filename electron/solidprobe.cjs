@@ -84,11 +84,36 @@ app.whenReady().then(async () => {
   const paintedShot = await win.webContents.capturePage()
   const painted = await js(`(() => {
     const el = document.querySelector('.app-wallpaper')
+    const app = document.querySelector('.app')
+    const canvas = document.querySelector('.canvas-wrap > .canvas')
+    const alpha = (value) => {
+      const m = String(value || '').match(/rgba?\\(([^)]+)\\)/)
+      if (!m) return value === 'transparent' ? 0 : 1
+      const p = m[1].split(/[ ,/]+/).filter(Boolean)
+      return p.length > 3 ? Number(p[3]) : 1
+    }
+    const term = document.createElement('div')
+    term.className = 'dock-pane-term'
+    app.appendChild(term)
+    const termAlpha = alpha(getComputedStyle(term).backgroundColor)
+    term.remove()
+    const filtered = [...document.querySelectorAll('.app *')].some((node) => {
+      const s = getComputedStyle(node)
+      return /blur/.test([s.backdropFilter, s.getPropertyValue('-webkit-backdrop-filter')].join(' '))
+    })
     // the painting lives on ::before (a parent filter would blur the grain)
     return {
       perf: document.documentElement.dataset.perf,
       mounted: !!el,
       bg: el ? getComputedStyle(el, '::before').backgroundImage.slice(0, 40) : '',
+      wallpaperFilter: el ? getComputedStyle(el, '::before').filter : '',
+      wallpaperTransform: el ? getComputedStyle(el, '::before').transform : '',
+      liftTop: app ? getComputedStyle(app).getPropertyValue('--app-active-glass-lift-top').trim() : '',
+      railAlpha: app ? getComputedStyle(app).getPropertyValue('--wash-rail-alpha').trim() : '',
+      canvasAlpha: canvas ? alpha(getComputedStyle(canvas).backgroundColor) : 1,
+      canvasGrain: canvas ? getComputedStyle(canvas).backgroundImage.includes('data:image/svg') : false,
+      termAlpha,
+      hasBackdropBlur: filtered,
     }
   })()`)
 
@@ -109,6 +134,10 @@ app.whenReady().then(async () => {
     windowOpaque: opaque,
     paintedMounts: painted.perf === 'painted' && painted.mounted,
     paintedHasImage: /data:image\/jpeg|gradient/.test(painted.bg),
+    paintedStatic: painted.wallpaperFilter === 'none' && painted.wallpaperTransform === 'none' && !painted.hasBackdropBlur,
+    paintedLightWash: painted.liftTop === '23%' && painted.railAlpha === '48%',
+    paintedSurfaces: painted.canvasAlpha >= 0.78 && painted.canvasAlpha <= 0.82 && painted.canvasGrain,
+    terminalOpaque: painted.termAlpha >= 0.99,
     ecoUnmounts: eco.perf === 'eco' && !eco.mounted,
     writeThrough: prefsAfter.solidWindow === false, // glass wants transparent again
   }

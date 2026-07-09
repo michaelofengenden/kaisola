@@ -24,6 +24,8 @@ export interface RunOpts {
   agentKey?: string
   /** For provider 'codex': the workspace cwd for `codex exec`. */
   cwd?: string
+  /** Owning project id for background ACP routing, even after tab switches. */
+  scope?: string
 }
 
 const SCHEMA_HINT =
@@ -32,19 +34,29 @@ const SCHEMA_HINT =
   '[{"kind":"create"|"update"|"delete","entityType":string,"label":string,"before"?:string,"after"?:string,"reason"?:string}]}]}'
 
 /** Route a domain agent through a connected ACP terminal agent (uses your CLI subscription). */
-async function runViaAgent(agent: Agent, ctx: AgentContext, agentKey?: string): Promise<Proposal[] | null> {
+async function runViaAgent(agent: Agent, ctx: AgentContext, agentKey?: string, cwd?: string, scope?: string): Promise<Proposal[] | null> {
   if (!agentKey || !agent.prompt) return null
-  const status = await bridge.acp.status()
-  if (!status.agents.find((a) => a.key === agentKey)?.connected) return null
+  const connectionKey = `${agentKey}::automation:${scope || 'default'}`
+  const status = await bridge.acp.status([connectionKey], scope)
+  if (!status.agents.find((a) => a.key === connectionKey)?.connected) {
+    const connected = await bridge.acp.connect({ presetId: agentKey, clientKey: connectionKey, cwd, scope })
+    if (!connected.ok) return null
+  }
   const { system, user } = agent.prompt(ctx)
   let text = ''
-  const res = await bridge.acp.prompt(agentKey, `${system}\n\n${user}\n\n${SCHEMA_HINT}`, (u: AcpUpdate) => {
-    if (u.sessionUpdate === 'agent_message_chunk') text += u.content?.text ?? u.text ?? ''
-  })
-  if (!res.ok) return null
-  const json = extractJsonObject(text)
-  if (!json) return null
-  return toolInputToProposals(json, { agentId: agent.meta.id, stage: agent.meta.stage, evidence: agent.evidence?.(ctx) })
+  const leaseId = `automation:${agent.meta.id}`
+  await bridge.acp.lease(connectionKey, leaseId, true, undefined, scope)
+  try {
+    const res = await bridge.acp.prompt(connectionKey, `${system}\n\n${user}\n\n${SCHEMA_HINT}`, (u: AcpUpdate) => {
+      if (u.sessionUpdate === 'agent_message_chunk') text += u.content?.text ?? u.text ?? ''
+    }, undefined, scope)
+    if (!res.ok) return null
+    const json = extractJsonObject(text)
+    if (!json) return null
+    return toolInputToProposals(json, { agentId: agent.meta.id, stage: agent.meta.stage, evidence: agent.evidence?.(ctx) })
+  } finally {
+    await bridge.acp.lease(connectionKey, leaseId, false, undefined, scope)
+  }
 }
 
 /** Route through `codex exec` — runs on your ChatGPT/Codex subscription (no per-token API key). */
@@ -69,7 +81,7 @@ export async function runAgent(agent: Agent, ctx: AgentContext, opts: RunOpts = 
   if (agent.prompt) {
     try {
       if (opts.provider === 'agent') {
-        const proposals = await runViaAgent(agent, ctx, opts.agentKey)
+        const proposals = await runViaAgent(agent, ctx, opts.agentKey, opts.cwd, opts.scope)
         if (proposals && proposals.length) return { proposals, source: 'model' }
       } else if (opts.provider === 'codex') {
         const proposals = await runViaCodex(agent, ctx, opts.cwd)

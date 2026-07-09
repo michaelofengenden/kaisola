@@ -4,7 +4,7 @@
 const os = require('node:os')
 const path = require('node:path')
 const { spawn, execFile } = require('node:child_process')
-const { BrowserWindow } = require('electron')
+const { BrowserWindow, app } = require('electron')
 const mgr = require('./terminalManager.cjs')
 
 // terminal:run cap: a non-terminating command (dev server, tail -f, blocked on
@@ -133,6 +133,7 @@ function setAppFocused(focused) {
 }
 
 function registerTerminalHandlers(ipcMain) {
+  mgr.configureStorage(path.join(app.getPath('userData'), 'terminal-cache'))
   ipcMain.handle('terminal:create', (event, { id, cwd, cols, rows } = {}) => {
     if (!mgr.available()) {
       return { ok: false, message: 'node-pty unavailable (run: npm run rebuild)' }
@@ -152,6 +153,8 @@ function registerTerminalHandlers(ipcMain) {
   ipcMain.handle('terminal:write', (_e, { id, data } = {}) => ({ ok: mgr.write(id, data) }))
   ipcMain.handle('terminal:resize', (_e, { id, cols, rows } = {}) => ({ ok: mgr.resize(id, cols, rows) }))
   ipcMain.handle('terminal:snapshot', (_e, { id } = {}) => mgr.snapshot(id))
+  ipcMain.handle('terminal:detachRenderer', (event, { id, viewState } = {}) => ({ ok: mgr.detachRenderer(id, event.sender, viewState) }))
+  ipcMain.handle('terminal:diagnostics', () => mgr.diagnostics())
   ipcMain.handle('terminal:signal', (_e, { id } = {}) => ({ ok: mgr.write(id, '\x03') }))
   ipcMain.handle('terminal:kill', (_e, { id } = {}) => {
     mgr.release(id)
@@ -215,4 +218,8 @@ function killAllSessions() {
   }
 }
 
-module.exports = { registerTerminalHandlers, killAllSessions, setAppFocused }
+function detachRendererOwner(sender) {
+  return mgr.detachSender(sender)
+}
+
+module.exports = { registerTerminalHandlers, killAllSessions, setAppFocused, detachRendererOwner }

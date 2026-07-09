@@ -11,8 +11,9 @@ import { useKaisola } from '../store/store'
  * add fidelity. (The tab strip carries no veil anymore — it sits on the bare
  * glass field, so there is nothing to retint up there.)
  *
- * Also caches the pre-blurred wallpaper copy + screen geometry for the
- * painted-mode background layer (--wallpaper-img/-size, .app-wallpaper).
+ * Also installs main's aspect-correct, downsampled display painting + screen
+ * geometry for painted mode (--wallpaper-img/-size, .app-wallpaper). Live and
+ * eco release that raster; they never retain pixels they do not draw.
  */
 
 /** How much of the wallpaper's color the veils adopt (0 = today's constants). */
@@ -25,7 +26,17 @@ const VEIL_BASE = {
 } as const
 
 let screenRect: { x: number; y: number; w: number; h: number } | null = null
+let requestGeneration = 0
 export const getGlassScreen = () => screenRect
+
+function releasePainting() {
+  screenRect = null
+  const root = document.documentElement
+  root.style.removeProperty('--wallpaper-img')
+  root.style.removeProperty('--wallpaper-size')
+  root.style.removeProperty('--wallpaper-x')
+  root.style.removeProperty('--wallpaper-y')
+}
 
 function anchor() {
   const r = screenRect
@@ -40,13 +51,19 @@ function anchor() {
 
 async function apply() {
   const state = useKaisola.getState()
-  if (state.perfMode === 'eco') return // eco paints nothing glassy
+  const generation = ++requestGeneration
+  if (state.perfMode === 'eco') {
+    releasePainting()
+    return
+  }
+  if (state.perfMode !== 'painted') releasePainting()
   let s: Awaited<ReturnType<typeof bridge.glassWash.sample>>
   try {
     s = await bridge.glassWash.sample()
   } catch {
     return // no handler (probe harness / non-mac) — keep the theme defaults
   }
+  if (generation !== requestGeneration) return // a newer move/theme/mode won
   if (!s.ok || !s.avg) return
   const root = document.documentElement
   if (useKaisola.getState().wallpaperTint) {
@@ -60,11 +77,13 @@ async function apply() {
     // Settings → Interface switch OFF: the veil stays the theme constant
     root.style.removeProperty('--wash-rail-color')
   }
-  if (s.blurDataUrl && s.screen) {
+  if (useKaisola.getState().perfMode === 'painted' && s.blurDataUrl && s.screen) {
     screenRect = s.screen
     root.style.setProperty('--wallpaper-img', `url("${s.blurDataUrl}")`)
     root.style.setProperty('--wallpaper-size', `${s.screen.w}px ${s.screen.h}px`)
     anchor()
+  } else {
+    releasePainting()
   }
 }
 

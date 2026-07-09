@@ -231,8 +231,6 @@ export function Settings() {
 
   const { all: registry, menu } = useAgentRegistry()
   const [agents, setAgents] = useState<AcpAgent[]>([])
-  const [connecting, setConnecting] = useState<string | null>(null)
-  const [agentMsg, setAgentMsg] = useState<{ id: string; text: string } | null>(null)
   const [glass, setGlass] = useState<{ supported: boolean; active: boolean; enabled: boolean } | null>(null)
   const [section, setSection] = useState<SectionId>('general')
 
@@ -263,7 +261,7 @@ export function Settings() {
 
   useEffect(() => {
     if (!open) return
-    setAgentMsg(null); setKeyMsg(null); setKey(''); setOaMsg(null); setOaKey(''); setAdding(false)
+    setKeyMsg(null); setKey(''); setOaMsg(null); setOaKey(''); setAdding(false)
     const pane = useKaisola.getState().settingsPane
     setSection(SECTIONS.some((s) => s.id === pane) ? (pane as SectionId) : 'general')
     void refresh()
@@ -283,7 +281,8 @@ export function Settings() {
 
   if (!open) return null
 
-  const isConnected = (id: string) => agents.some((a) => a.key === id && a.connected)
+  const providerConnections = (id: string) => agents.filter((a) => (a.presetId === id || a.key === id || a.key.startsWith(`${id}::`)) && a.connected)
+  const isConnected = (id: string) => providerConnections(id).length > 0
   const runInTerminal = (cmd?: string, name?: string) => {
     if (!cmd) return
     requestTerminal(cmd, { cwd: workspacePath ?? undefined, name })
@@ -294,18 +293,11 @@ export function Settings() {
     else if (a.login) runInTerminal(a.login, `${a.name} Login`)
   }
   const openAgent = (a: RegistryAgent) => {
-    if (a.kind === 'terminal') { openAgentSession(a); setOpen(false); return }
-    void (async () => {
-      setConnecting(a.id); setAgentMsg(null)
-      const r = await bridge.acp.connect(
-        a.custom
-          ? { presetId: a.id, name: a.name, command: a.command, args: a.args, autonomy, cwd: workspacePath ?? undefined }
-          : { presetId: a.id, autonomy, cwd: workspacePath ?? undefined },
-      )
-      setConnecting(null)
-      if (r.ok) void refresh()
-      else setAgentMsg({ id: a.id, text: r.message ?? 'Could not connect.' })
-    })()
+    // ACP connections belong to concrete chat threads. Opening a card lets its
+    // per-thread owner connect/resume; Settings never creates an orphan
+    // provider-scoped session behind the UI.
+    openAgentSession(a)
+    setOpen(false)
   }
   const addCustom = () => {
     const parts = newCmd.trim().split(/\s+/)
@@ -362,15 +354,13 @@ export function Settings() {
       ...(a.installCmd ? [{ value: 'install', name: 'Install CLI', description: a.installCmd }] : []),
       ...(a.login || a.deviceLogin ? [{ value: 'signin', name: 'Sign in', description: a.deviceLogin ? 'Device-code login' : a.login }] : []),
       ...(a.docs ? [{ value: 'docs', name: 'Docs' }] : []),
-      { value: 'remove', name: a.custom ? 'Remove agent' : 'Remove from + menu', description: on ? 'Disconnects it first' : undefined },
+      { value: 'remove', name: a.custom ? 'Remove agent' : 'Remove from + menu', description: on ? 'Existing chat sessions stay open' : undefined },
     ]
     const onOverflow = (value: string) => {
       if (value === 'install') runInTerminal(a.installCmd, `${a.name} Install`)
       else if (value === 'signin') signIn(a)
       else if (value === 'docs') void bridge.openExternal(a.docs!)
       else if (value === 'remove') {
-        // never orphan a live connection behind a removed row
-        if (on) void bridge.acp.disconnect(a.id).then(() => void refresh())
         if (a.custom) removeCustomAgent(a.id)
         else toggleAgentEnabled(a.id)
       }
@@ -386,16 +376,13 @@ export function Settings() {
           <span className="agent-kind">{a.kind === 'acp' ? 'ACP · stdio' : 'Terminal'}</span>
           {a.kind === 'terminal' ? (
             <button className="btn btn-primary btn-sm" onClick={() => openAgent(a)}><Icon name="SquareTerminal" size={12} /> Open</button>
-          ) : on ? (
-            <button className="btn btn-sm" onClick={() => { void bridge.acp.disconnect(a.id).then(() => void refresh()) }}><Icon name="Unplug" size={12} /> Disconnect</button>
           ) : (
-            <button className="btn btn-primary btn-sm" onClick={() => openAgent(a)} disabled={connecting === a.id}>
-              {connecting === a.id ? <Icon name="LoaderCircle" size={12} className="spin" /> : <Icon name="Plug" size={12} />} Connect
+            <button className="btn btn-primary btn-sm" onClick={() => openAgent(a)}>
+              <Icon name={on ? 'MessageSquarePlus' : 'Plug'} size={12} /> {on ? 'New chat' : 'Connect'}
             </button>
           )}
           <Dropdown icon="Ellipsis" value="" placeholder="" options={overflow} onSelect={onOverflow} align="right" title="More" />
         </div>
-        {agentMsg?.id === a.id && <div className="settings-msg">{agentMsg.text}</div>}
       </div>
     )
   }
@@ -455,8 +442,12 @@ export function Settings() {
                     {windowModeMismatch && (
                       <button
                         className="settings-chip"
-                        onClick={() => void bridge.reapplyWindow()}
-                        title="The window's transparency is set when it opens — this reopens the window in place (terminals and agents keep running)"
+                        onClick={() => {
+                          void bridge.reapplyWindow().then((result) => {
+                            if (!result.ok) pushToast('info', result.message ?? 'Quit and reopen Kaisola when convenient to apply this appearance change.')
+                          })
+                        }}
+                        title="Reopen only this window in place. Running terminals stay alive; Kaisola waits for any active agent turn or approval first."
                       >
                         Apply now
                       </button>
@@ -474,6 +465,7 @@ export function Settings() {
                     />
                   </div>
                 </div>
+                <p className="settings-note">Live glass uses a native macOS material. Switching modes reopens only this window; commands stay alive and Kaisola waits for active agent turns or approvals, while projects, layouts, and drafts rehydrate from disk.</p>
                 {isDesktop && <UpdatesRow />}
               </>
             )}

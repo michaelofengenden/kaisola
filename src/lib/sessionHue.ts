@@ -29,8 +29,9 @@ export function folderHue(folder: string): string {
 
 /** The one entry point: agent identity wins; folders otherwise; calm gray fallback. */
 export function sessionHue(opts: { agentKey?: string | null; folder?: string | null }): string {
-  if (opts.agentKey && AGENT_HUES[opts.agentKey]) return AGENT_HUES[opts.agentKey]
-  if (opts.agentKey) return folderHue(opts.agentKey) // unknown agents still get a stable hue
+  const providerKey = opts.agentKey?.split('::')[0]
+  if (providerKey && AGENT_HUES[providerKey]) return AGENT_HUES[providerKey]
+  if (providerKey) return folderHue(providerKey) // unknown agents still get a stable hue
   if (opts.folder) return folderHue(opts.folder)
   return 'var(--border-strong)'
 }

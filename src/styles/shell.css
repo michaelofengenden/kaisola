@@ -102,11 +102,12 @@
   background-size: var(--wallpaper-size, cover);
   background-position: var(--wallpaper-x, 0) var(--wallpaper-y, 0);
   background-repeat: no-repeat;
-  /* blur 14 (was 24): 24 erased ALL organic variation into flat blobs; 14
-     keeps soft color-drift flowing while still burying the source JPEG's
-     block artifacts (verified against the real pipeline at both values) */
-  filter: blur(14px) saturate(1.25);
-  transform: scale(1.04); /* hide the blur's edge vignette */
+  /* Main already crops to this display and downsamples to a tiny raster. The
+     browser's bilinear upscale is the blur; a CSS filter here forced a
+     full-window composited layer and paid again on every frame. */
+  filter: none;
+  transform: none;
+  image-rendering: auto;
 }
 /* the same frost grain the veils wear, on the painting itself — texture is
    what reads as "glass" up close, not just blur */
@@ -116,7 +117,7 @@
   inset: 0;
   background-image: var(--frost-grain);
   background-repeat: repeat;
-  opacity: 0.5;
+  opacity: 0.34;
 }
 /* Dark theme: the glass field must DARKEN what it samples, never lift it —
    the light-tuned white tint + brightness() left the transparent rail nearly
@@ -139,10 +140,29 @@
    its contrast. Live glass is untouched (parity-locked to the measured blur
    constants). */
 :root[data-perf='painted'] .app {
-  --wash-rail-alpha: 64%; /* was 55% — the tree's 13px labels come first */
+  /* Let the cached desktop painting breathe. These are deliberately much
+     lighter than the old 45→30% full-window white veil + 64% rail wall. */
+  --app-active-glass-lift-top: 23%;
+  --app-active-glass-lift-bottom: 12%;
+  --wash-rail-alpha: 48%;
+  /* --frost-grain is owned by .app, so resolve this role here (declaring the
+     indirection on :root would resolve before --frost-grain exists). */
+  --shell-surface-grain: var(--frost-grain);
 }
 :root[data-theme='dark'][data-perf='painted'] .app {
-  --wash-rail-alpha: 91%;
+  --app-active-glass-lift-top: 58%;
+  --app-active-glass-lift-bottom: 46%;
+  --wash-rail-alpha: 62%;
+}
+
+/* Painted mode must remain a static painting. This also catches transient
+   menus/scrims supplied by feature stylesheets: no descendant may silently
+   reintroduce a backdrop compositor layer. */
+:root[data-perf='painted'] .app *,
+:root[data-perf='painted'] .app *::before,
+:root[data-perf='painted'] .app *::after {
+  backdrop-filter: none !important;
+  -webkit-backdrop-filter: none !important;
 }
 
 /* Deliberately NO data-winfocus overrides on any surface: the shell looks
@@ -458,7 +478,8 @@
   padding: var(--sp-2);
   border: 1px solid var(--border);
   border-radius: var(--r-2);
-  background: var(--bg-1);
+  background-color: var(--shell-popover-bg);
+  background-image: var(--shell-surface-grain);
   box-shadow: var(--shadow-1);
 }
 .inbox-row {
@@ -669,6 +690,11 @@
     linear-gradient(rgb(var(--wash-rail-color) / var(--wash-rail-alpha)),
                     rgb(var(--wash-rail-color) / var(--wash-rail-alpha)));
   background-repeat: repeat, no-repeat;
+  box-shadow: inset 0 1px 0 rgb(255 255 255 / 22%);
+}
+:root[data-theme='dark'] .wsrail::before,
+:root[data-theme='dark'] .sidebar::before {
+  box-shadow: inset 0 1px 0 rgb(255 255 255 / 7%);
 }
 .wsrail > *,
 .sidebar > * {
@@ -678,14 +704,13 @@
 }
 .session-card,
 .canvas-wrap > .canvas {
-  /* OPAQUE on purpose: these hold terminals and documents that repaint
-     constantly — glass here forced the compositor to re-blur every frame
-     (measured ~19% GPU core under one streaming claude vs ~0% opaque).
-     The glass look lives on the chrome around them. */
-  background: var(--bg-1);
-  border: 1px solid var(--border);
+  /* Alpha is cheap in painted mode because the thing behind it is a static
+     bitmap, not a live backdrop filter. xterm itself remains opaque. */
+  background-color: var(--shell-card-bg);
+  background-image: var(--shell-surface-grain);
+  border: 1px solid var(--shell-surface-border);
   border-radius: var(--r-shell);
-  box-shadow: var(--shadow-1);
+  box-shadow: var(--shadow-1), var(--shell-inner-highlight);
   overflow: hidden;
   position: relative;
   /* the old backdrop-filter made each card the containing block for its
@@ -694,6 +719,9 @@
      streaming terminal's repaints from the rest of the page as a bonus */
   contain: paint;
   -webkit-app-region: drag;
+}
+.canvas-wrap > .canvas {
+  background-color: var(--shell-canvas-bg);
 }
 .session-card > *,
 .canvas-wrap > .canvas > * {
@@ -1094,6 +1122,14 @@
   position: relative;
   transition: background var(--dur-2) var(--ease-out), color var(--dur-2) var(--ease-out),
     border-color var(--dur-2) var(--ease-out);
+}
+/* Painted mode can sit over a high-contrast wallpaper without a live material
+   adapting behind text. A quiet local frost veil keeps inactive labels legible
+   while preserving the light, mostly-transparent field. */
+:root[data-perf='painted'] .stab:not([data-active='true']) {
+  background: color-mix(in srgb, var(--bg-1) 38%, transparent);
+  color: var(--text-1);
+  border-color: color-mix(in srgb, var(--border-faint) 45%, transparent);
 }
 .stab:hover {
   background: var(--hover-overlay);
@@ -1595,8 +1631,9 @@
   max-height: 60vh;
   display: flex;
   flex-direction: column;
-  background: var(--bg-2);
-  border: 1px solid var(--border);
+  background-color: var(--shell-popover-bg);
+  background-image: var(--shell-surface-grain);
+  border: 1px solid var(--shell-surface-border);
   border-radius: var(--r-5);
   box-shadow: var(--shadow-pop);
   overflow: hidden;

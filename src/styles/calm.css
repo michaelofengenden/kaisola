@@ -193,7 +193,8 @@
   position: fixed;
   min-width: 190px;
   padding: var(--sp-2);
-  background: var(--bg-2);
+  background-color: var(--shell-popover-bg);
+  background-image: var(--shell-surface-grain);
   border: 1px solid var(--border);
   border-radius: var(--r-3);
   box-shadow: var(--shadow-pop);
@@ -369,7 +370,8 @@
   padding: var(--sp-2);
   border: 1px solid var(--border);
   border-radius: var(--r-3);
-  background: var(--bg-2);
+  background-color: var(--shell-popover-bg);
+  background-image: var(--shell-surface-grain);
   box-shadow: var(--shadow-pop);
   -webkit-app-region: no-drag;
   user-select: auto;
@@ -413,7 +415,8 @@
   padding: var(--sp-2);
   border: 1px solid var(--border);
   border-radius: var(--r-3);
-  background: var(--bg-2);
+  background-color: var(--shell-popover-bg);
+  background-image: var(--shell-surface-grain);
   box-shadow: var(--shadow-pop);
   user-select: auto;
 }
@@ -1494,7 +1497,8 @@ a.tag-quiet:hover {
   max-width: calc(100vw - 24px);
   border: 1px solid var(--border);
   border-radius: var(--r-3);
-  background: var(--bg-1);
+  background-color: var(--shell-popover-bg);
+  background-image: var(--shell-surface-grain);
   box-shadow: var(--shadow-3);
 }
 .fx-latex-issue {

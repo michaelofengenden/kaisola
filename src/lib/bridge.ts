@@ -118,6 +118,12 @@ export interface FileTextZoomGesture {
   direction: 'in' | 'out'
 }
 
+export interface AssistantArchiveScope {
+  projectId: string
+  threadId: string
+  epoch?: string
+}
+
 // ── ACP ──
 export interface AcpPreset {
   id: string
@@ -224,6 +230,8 @@ export interface AcpTerminalInfo {
   cwd?: string
   agentKey?: string
   agentName?: string
+  /** Owning project scope; terminal events are never dropped for background tabs. */
+  scope?: string
 }
 /** An agent is blocked waiting for the human — rendered as an inline card. */
 export interface AcpPermissionRequest {
@@ -326,6 +334,7 @@ export interface TermSnapshot {
   truncated?: boolean
   exited?: boolean
   exitStatus?: { exitCode: number; signal: string | null } | null
+  viewState?: { scrollFromBottom?: number; cols?: number; rows?: number } | null
 }
 /** Live identity of a pty session — who's running, where (diff-broadcast). */
 export interface TerminalMetaEvent {
@@ -397,10 +406,42 @@ export interface CodexUsage {
   updatedAt?: number
 }
 export interface ClaudeTokenSums { input: number; output: number; cacheRead: number; cacheWrite: number }
+export interface ClaudeLimitWindow { usedPercent?: number; resetsAt?: number }
+export interface ClaudeModelLimit extends ClaudeLimitWindow { label: string }
+export interface ClaudeExtraUsage {
+  enabled: boolean
+  monthlyLimit?: number
+  usedCredits?: number
+  utilization?: number
+  currency?: string
+}
 export interface ClaudeUsage {
   ok: boolean
   message?: string
+  source?: 'agent-sdk' | 'status-line' | 'transcripts' | 'unavailable'
+  sourceLabel?: string
+  /** The structured SDK usage method is experimental; status-line fallback is stable. */
+  experimental?: boolean
+  updatedAt?: number
+  stale?: boolean
+  refreshError?: string
+  subscriptionType?: string
+  rateLimitsAvailable?: boolean
+  limits?: {
+    fiveHour?: ClaudeLimitWindow | null
+    sevenDay?: ClaudeLimitWindow | null
+    modelScoped?: ClaudeModelLimit[]
+    extraUsage?: ClaudeExtraUsage | null
+  }
   exists?: boolean
+  /** Secondary local diagnostic; it is not a subscription percentage. */
+  activity?: {
+    fiveHour?: ClaudeTokenSums
+    week?: ClaudeTokenSums
+    lastActivity?: number
+    scannedFiles?: number
+    partial?: boolean
+  }
   fiveHour?: ClaudeTokenSums
   week?: ClaudeTokenSums
   lastActivity?: number
@@ -411,6 +452,9 @@ export interface ClaudeUsage {
 
 export interface AcpConnectConfig {
   presetId?: string
+  /** Renderer-stable logical connection id. Multiple UI threads using the
+   * same preset must not share one provider session/context. */
+  clientKey?: string
   /** Custom (user-added) agents: the exact ACP server command to spawn. */
   command?: string
   args?: string[]
@@ -427,7 +471,9 @@ export interface AcpConnectConfig {
   resumeSessionId?: string
   /** Claude Agent SDK session-creation effort. The Claude ACP adapter accepts
    * this through its namespaced `_meta`; other agents ignore it. */
-  claudeEffort?: 'low' | 'medium' | 'high' | 'xhigh' | 'max'
+  claudeEffort?: 'default' | 'low' | 'medium' | 'high' | 'xhigh' | 'max'
+  /** Replace an existing live connection (used for session-creation settings). */
+  forceReconnect?: boolean
 }
 
 export interface UpdateState {
@@ -458,17 +504,20 @@ export interface KaisolaBridge {
   }
   acp: {
     presets(): Promise<AcpPreset[]>
-    status(): Promise<{ ok: boolean; agents: AcpAgent[] }>
+    status(clientKeys?: string[], scope?: string): Promise<{ ok: boolean; agents: AcpAgent[] }>
     connect(config: AcpConnectConfig): Promise<{ ok: boolean; key?: string; agent?: AcpMeta; controls?: AcpControls; authMethods?: AcpAuthMethod[]; message?: string; resumed?: boolean }>
     disconnect(agentKey: string): Promise<{ ok: boolean }>
     cancel(agentKey: string): Promise<{ ok: boolean }>
+    /** Keep/release a mounted-card lease; release parks only resumable idle agents. */
+    lease(agentKey: string, leaseId: string, active: boolean, idleMs?: number, scope?: string): Promise<{ ok: boolean; leases?: number }>
+    diagnostics?(): Promise<unknown>
     /** Live autonomy dial — update every connection this window owns in main. */
     setAutonomy(autonomy: AutonomyLevel): Promise<{ ok: boolean }>
     setMode(agentKey: string, modeId: string): Promise<{ ok: boolean; message?: string }>
     setModel(agentKey: string, modelId: string): Promise<{ ok: boolean; message?: string }>
     setConfigOption(agentKey: string, configId: string, value: string): Promise<{ ok: boolean; message?: string }>
     authenticate(agentKey: string, methodId: string): Promise<{ ok: boolean; pending?: boolean; message?: string }>
-    prompt(agentKey: string, text: string, onUpdate: (u: AcpUpdate) => void, images?: { mimeType: string; data: string }[]): Promise<{ ok: boolean; stopReason?: string; message?: string }>
+    prompt(agentKey: string, text: string, onUpdate: (u: AcpUpdate) => void, images?: { mimeType: string; data: string }[], scope?: string): Promise<{ ok: boolean; stopReason?: string; message?: string }>
     onNotice(cb: (n: AcpNotice) => void): () => void
     onControls(cb: (info: { key: string; controls: AcpControls }) => void): () => void
     onTerminal(cb: (info: AcpTerminalInfo) => void): () => void
@@ -485,7 +534,7 @@ export interface KaisolaBridge {
     armHooks(): Promise<{ ok: boolean; settingsPath?: string; message?: string }>
     /** Merge Claude Code settings (e.g. { fastMode: true }) into the armed
      * --settings file — the next `claude` boot picks them up. */
-    setSettingsFlags?(flags: Record<string, unknown>): Promise<{ ok: boolean; message?: string }>
+    setSettingsFlags?(flags: Record<string, unknown>, configDir?: string, cwd?: string): Promise<{ ok: boolean; usageStatusLine?: boolean; message?: string }>
     rebind(): Promise<{ ok: boolean }>
     onEvent(cb: (ev: ClaudeHookEvent) => void): () => void
     /** Does <configDir>/projects/<cwd>/<sessionId>.jsonl still exist? Gates
@@ -495,11 +544,12 @@ export interface KaisolaBridge {
     /** Who is signed in under a Claude config dir (multi-subscription labels). */
     accountInfo?(configDir?: string): Promise<{ ok: boolean; exists?: boolean; email?: string; org?: string }>
   }
-  /** Subscription limits (the top-bar gauge). Codex = real percentages from the
-   * CLI's app-server; Claude = token sums estimated from local transcripts. */
+  /** Subscription limits (the top-bar gauge). Codex uses app-server; Claude
+   * uses the official Agent SDK with documented status-line fallback. */
   usage?: {
-    codex(codexHome?: string): Promise<CodexUsage>
-    claude(configDir?: string): Promise<ClaudeUsage>
+    codex(codexHome?: string, force?: boolean): Promise<CodexUsage>
+    /** force bypasses the five-minute main-process cache (manual refresh). */
+    claude(configDir?: string, force?: boolean, exactOnly?: boolean): Promise<ClaudeUsage>
     /** Per-session token sums grouped by model — the $ chip on session cards. */
     claudeSession(configDir: string | undefined, sessionId: string): Promise<{ ok: boolean; exists?: boolean; models?: Array<{ model: string; input: number; output: number; cacheRead: number; cacheWrite: number }> }>
   }
@@ -579,12 +629,24 @@ export interface KaisolaBridge {
     resize(id: string, cols: number, rows: number): Promise<{ ok: boolean }>
     snapshot(id: string): Promise<TermSnapshot>
     attach(id: string): Promise<TermSnapshot>
+    /** Unmount xterm only; the pty continues and scrollback moves to disk. */
+    detachRenderer(id: string, viewState?: { scrollFromBottom?: number; cols?: number; rows?: number }): Promise<{ ok: boolean }>
+    diagnostics?(): Promise<Array<{ id: string; visible: boolean; ramBytes: number; diskBytes: number; pid?: number; exited: boolean }>>
     signal(id: string, signal?: string): Promise<{ ok: boolean }>
     kill(id: string): Promise<{ ok: boolean }>
     run(command: string, cwd?: string): Promise<CmdResult>
     onData(id: string, cb: (data: string) => void): () => void
     onExit(id: string, cb: (code: number) => void): () => void
     onMeta(cb: (meta: TerminalMetaEvent) => void): () => void
+  }
+  /** Append-only transcript storage for turns outside the renderer's recent
+   * working set. IPC returns unknown records deliberately; the renderer
+   * validates the archive boundary before rendering them. */
+  assistantArchive?: {
+    append(scope: AssistantArchiveScope, batchId: string, turns: unknown[]): Promise<{ ok: boolean; count?: number; duplicate?: boolean; retryable?: boolean; message?: string }>
+    info(scope: AssistantArchiveScope): Promise<{ ok: boolean; total: number; message?: string }>
+    page(scope: AssistantArchiveScope, before?: number, limit?: number): Promise<{ ok: boolean; turns: unknown[]; before?: number; total?: number; hasMore?: boolean; bytes?: number; message?: string }>
+    clear(scope: AssistantArchiveScope): Promise<{ ok: boolean; message?: string }>
   }
   auth: {
     start(command: string, args: string[], onEvent: (ev: AuthEvent) => void): string
@@ -643,16 +705,17 @@ export interface KaisolaBridge {
   pickFolder(): Promise<{ ok: boolean; path?: string; message?: string }>
   pickFiles(): Promise<{ ok: boolean; paths?: string[] }>
   /** Liquid Glass preference (macOS 26+; needs a relaunch to apply). */
-  glass(patch?: { enabled: boolean }): Promise<{ supported: boolean; active: boolean; enabled: boolean }>
+  glass(patch?: { enabled: boolean }): Promise<{ supported: boolean; active: boolean; enabled: boolean; fallback?: string | null }>
   /** Perf-mode window plumbing: transparency is a creation-time option — set()
    *  persists what the NEXT window should be; a want/live mismatch drives the
    *  Settings "Restart to finish applying" chip. */
   windowMode(patch?: { solidWindow?: boolean; solidBg?: string }): Promise<{ wantSolid: boolean; liveSolid: boolean }>
   /** Quit and relaunch (used to apply a window-mode change). */
   relaunch(): Promise<void>
-  /** Apply the persisted window mode NOW by recreating this window (ptys and
-   *  agents live in main and survive; the renderer rehydrates its slot). */
-  reapplyWindow(): Promise<{ ok: boolean; unchanged?: boolean }>
+  /** Apply a creation-time mode by swapping only this renderer window. Main's
+   * PTYs/agent turns remain alive; after repeated swaps a manual restart may be
+   * requested without automatically terminating work. */
+  reapplyWindow(): Promise<{ ok: boolean; unchanged?: boolean; restartRequired?: boolean; busy?: boolean; awaitingPermission?: boolean; message?: string }>
   /** Wallpaper-sampled glass wash (macOS; failures degrade to the theme tint). */
   glassWash: {
     sample(): Promise<{ ok: boolean; avg?: { r: number; g: number; b: number }; blurDataUrl?: string; screen?: { x: number; y: number; w: number; h: number } }>
@@ -704,6 +767,9 @@ export interface KaisolaBridge {
 }
 
 const DESKTOP_ONLY = 'Available in the desktop app (npm run electron:dev).'
+const webAssistantArchive = new Map<string, unknown[]>()
+const webAssistantArchiveBatches = new Map<string, Set<string>>()
+const webArchiveKey = (scope: AssistantArchiveScope) => JSON.stringify([scope.projectId, scope.threadId, scope.epoch ?? '0'])
 
 const webMock: KaisolaBridge = {
   env: 'web',
@@ -731,6 +797,12 @@ const webMock: KaisolaBridge = {
     },
     async cancel() {
       return { ok: true }
+    },
+    async lease() {
+      return { ok: true }
+    },
+    async diagnostics() {
+      return {}
     },
     async setAutonomy() {
       return { ok: true }
@@ -856,6 +928,12 @@ const webMock: KaisolaBridge = {
     async attach() {
       return { output: '' }
     },
+    async detachRenderer() {
+      return { ok: true }
+    },
+    async diagnostics() {
+      return []
+    },
     async signal() {
       return { ok: false }
     },
@@ -873,6 +951,33 @@ const webMock: KaisolaBridge = {
     },
     onMeta() {
       return () => {}
+    },
+  },
+  assistantArchive: {
+    async append(scope, batchId, turns) {
+      const key = webArchiveKey(scope)
+      const batches = webAssistantArchiveBatches.get(key) ?? new Set<string>()
+      if (batches.has(batchId)) return { ok: true, count: webAssistantArchive.get(key)?.length ?? 0, duplicate: true }
+      const next = [...(webAssistantArchive.get(key) ?? []), ...turns]
+      webAssistantArchive.set(key, next)
+      batches.add(batchId)
+      webAssistantArchiveBatches.set(key, batches)
+      return { ok: true, count: next.length }
+    },
+    async info(scope) {
+      return { ok: true, total: webAssistantArchive.get(webArchiveKey(scope))?.length ?? 0 }
+    },
+    async page(scope, before, limit = 60) {
+      const turns = webAssistantArchive.get(webArchiveKey(scope)) ?? []
+      const end = Math.min(turns.length, before ?? turns.length)
+      const start = Math.max(0, end - limit)
+      return { ok: true, turns: turns.slice(start, end), before: start, total: turns.length, hasMore: start > 0 }
+    },
+    async clear(scope) {
+      const key = webArchiveKey(scope)
+      webAssistantArchive.delete(key)
+      webAssistantArchiveBatches.delete(key)
+      return { ok: true }
     },
   },
   auth: {
@@ -1054,6 +1159,7 @@ declare global {
 export const acpScope = { current: '' }
 const SCOPE_SEP = '@@'
 const scopedKey = (key: string) => (acpScope.current ? `${key}${SCOPE_SEP}${acpScope.current}` : key)
+const scopedKeyFor = (key: string, scope?: string) => (scope ? `${key}${SCOPE_SEP}${scope}` : scopedKey(key))
 const splitScopedKey = (raw: unknown): { key: string; scope: string } => {
   const s = String(raw ?? '')
   const i = s.indexOf(SCOPE_SEP)
@@ -1066,21 +1172,23 @@ const scopeIsCurrent = (scope: string) => !scope || scope === acpScope.current
 function scopeAcp(acp: KaisolaBridge['acp']): KaisolaBridge['acp'] {
   return {
     ...acp,
-    status: async () => {
-      const res = await acp.status()
+    status: async (clientKeys, explicitScope) => {
+      const scopeForCall = explicitScope ?? (acpScope.current || undefined)
+      const res = await acp.status(clientKeys, scopeForCall)
       const agents = (res.agents ?? [])
         .map((a) => { const { key, scope } = splitScopedKey(a.key); return { ...a, key, scope } })
-        .filter((a) => scopeIsCurrent(a.scope ?? ''))
+        .filter((a) => !a.scope || a.scope === (scopeForCall ?? ''))
       return { ...res, agents }
     },
     connect: (config) => acp.connect({ ...config, scope: config.scope ?? (acpScope.current || undefined) }),
     disconnect: (k) => acp.disconnect(scopedKey(k)),
     cancel: (k) => acp.cancel(scopedKey(k)),
+    lease: (k, leaseId, active, idleMs, scope) => acp.lease(scopedKeyFor(k, scope), leaseId, active, idleMs),
     setMode: (k, m) => acp.setMode(scopedKey(k), m),
     setModel: (k, m) => acp.setModel(scopedKey(k), m),
     setConfigOption: (k, c, v) => acp.setConfigOption(scopedKey(k), c, v),
     authenticate: (k, m) => acp.authenticate(scopedKey(k), m),
-    prompt: (k, text, onUpdate, images) => acp.prompt(scopedKey(k), text, onUpdate, images),
+    prompt: (k, text, onUpdate, images, scope) => acp.prompt(scopedKeyFor(k, scope), text, onUpdate, images),
     onNotice: (cb) =>
       acp.onNotice((n) => {
         const { key, scope } = splitScopedKey(n.key)
@@ -1094,7 +1202,7 @@ function scopeAcp(acp: KaisolaBridge['acp']): KaisolaBridge['acp'] {
     onTerminal: (cb) =>
       acp.onTerminal((info) => {
         const { key, scope } = splitScopedKey(info.agentKey)
-        if (scopeIsCurrent(scope)) cb({ ...info, agentKey: info.agentKey ? key : info.agentKey })
+        cb({ ...info, agentKey: info.agentKey ? key : info.agentKey, scope })
       }),
     onPermission: (cb) =>
       acp.onPermission((req) => {

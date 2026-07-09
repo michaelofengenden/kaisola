@@ -10,7 +10,9 @@ const fs = require('node:fs')
 const path = require('node:path')
 
 const EVENTS_CAP_BYTES = 5 * 1024 * 1024
-let tail = null // { file, watcher, offset, timer }
+const STATUS_CAP_BYTES = 5 * 1024 * 1024
+const STATUS_RETAIN_BYTES = 768 * 1024
+let tail = null // { file, watcher, offset, timer, statusTimer }
 
 const shq = (s) => `'${String(s).replace(/'/g, `'\\''`)}'`
 
@@ -20,10 +22,18 @@ function eventsPath() {
 function settingsPath() {
   return path.join(app.getPath('userData'), 'claude-hooks.json')
 }
+function statusCachePath() {
+  return path.join(app.getPath('userData'), 'claude-statusline.jsonl')
+}
 
-function buildSettings(evFile) {
+function buildSettings(evFile, statusFile = statusCachePath(), includeStatusLine = true) {
   // append stdin (one JSON doc) as ONE line; tr strips interior newlines
   const append = `tr -d '\\n\\r' >> ${shq(evFile)}; printf '\\n' >> ${shq(evFile)}`
+  // Claude Code's documented status-line JSON is a stable fallback for exact
+  // 5h/7d plan windows. Prefix each captured object with epoch seconds so the
+  // renderer can be honest about staleness. This command does not read auth or
+  // call a model; the cache is private app data and contains no credentials.
+  const captureStatus = `input=$(tr -d '\\n\\r'); printf '%s\\t%s\\n' "$(date +%s)" "$input" >> ${shq(statusFile)}; five=$(printf '%s' "$input" | sed -nE 's/.*"five_hour"[[:space:]]*:[[:space:]]*\\{[^}]*"used_percentage"[[:space:]]*:[[:space:]]*([0-9]+([.][0-9]+)?).*/\\1/p'); week=$(printf '%s' "$input" | sed -nE 's/.*"seven_day"[[:space:]]*:[[:space:]]*\\{[^}]*"used_percentage"[[:space:]]*:[[:space:]]*([0-9]+([.][0-9]+)?).*/\\1/p'); label='Claude'; [ -n "$five" ] && label="$label · 5h \${five}%"; [ -n "$week" ] && label="$label · 7d \${week}%"; printf '%s\\n' "$label"`
   const entry = [{ hooks: [{ type: 'command', command: append, timeout: 10 }] }]
   return {
     hooks: {
@@ -34,7 +44,58 @@ function buildSettings(evFile) {
       // drives the rail's amber "needs you" dot
       Notification: entry,
     },
+    ...(includeStatusLine ? {
+      statusLine: {
+        type: 'command',
+        command: captureStatus,
+        padding: 0,
+      },
+    } : {}),
   }
+}
+
+const expandHome = (value) => typeof value === 'string'
+  ? value.replace(/^~(?=\/|$)/, require('node:os').homedir())
+  : value
+
+/** Respect an existing Claude status-line in user, project, or local-project
+ * settings. `--settings` has high precedence, so injecting our usage fallback
+ * unconditionally would silently replace the user's own status UI. */
+function hasCustomStatusLine(configDir, cwd) {
+  const base = typeof configDir === 'string' && configDir.trim()
+    ? path.resolve(expandHome(configDir.trim()))
+    : path.join(require('node:os').homedir(), '.claude')
+  const candidates = [path.join(base, 'settings.json')]
+  if (typeof cwd === 'string' && cwd.trim()) {
+    const root = path.resolve(expandHome(cwd.trim()))
+    candidates.push(path.join(root, '.claude', 'settings.json'), path.join(root, '.claude', 'settings.local.json'))
+  }
+  return candidates.some((file) => {
+    try {
+      const value = JSON.parse(fs.readFileSync(file, 'utf8'))
+      return !!(value && typeof value === 'object' && value.statusLine && typeof value.statusLine === 'object')
+    } catch {
+      return false
+    }
+  })
+}
+
+function prepareStatusCache(file) {
+  try {
+    fs.mkdirSync(path.dirname(file), { recursive: true })
+    if (!fs.existsSync(file)) fs.writeFileSync(file, '', { mode: 0o600 })
+    const st = fs.statSync(file)
+    if (st.size > STATUS_CAP_BYTES) {
+      const fd = fs.openSync(file, 'r')
+      const length = Math.min(st.size, STATUS_RETAIN_BYTES)
+      const buf = Buffer.alloc(length)
+      fs.readSync(fd, buf, 0, length, st.size - length)
+      fs.closeSync(fd)
+      const firstNl = buf.indexOf(10)
+      fs.writeFileSync(file, firstNl >= 0 ? buf.subarray(firstNl + 1) : buf, { mode: 0o600 })
+    }
+    fs.chmodSync(file, 0o600)
+  } catch { /* capture is a fallback; Claude still launches without it */ }
 }
 
 /** Forward only what the renderer needs — tool_input can carry whole files. */
@@ -56,6 +117,7 @@ function stopTail() {
   if (!tail) return
   try { tail.watcher.close() } catch { /* already closed */ }
   if (tail.timer) clearInterval(tail.timer)
+  if (tail.statusTimer) clearInterval(tail.statusTimer)
   tail = null
 }
 
@@ -108,17 +170,28 @@ function drain() {
 let extraFlags = {}
 
 /** Write the settings file, reset the events file, start tailing. */
-function armTap() {
+function armTap(context = {}) {
   const evFile = eventsPath()
   const stFile = settingsPath()
+  const statusFile = statusCachePath()
+  prepareStatusCache(statusFile)
+  // usageHandler intentionally avoids importing Electron in its unit-testable
+  // module. This process-local pointer joins the two main-process services.
+  process.env.KAISOLA_CLAUDE_STATUS_CACHE = statusFile
   fs.writeFileSync(evFile, '')
-  fs.writeFileSync(stFile, JSON.stringify({ ...buildSettings(evFile), ...extraFlags }, null, 2))
+  const includeStatusLine = !hasCustomStatusLine(context.configDir, context.cwd)
+  fs.writeFileSync(stFile, JSON.stringify({ ...buildSettings(evFile, statusFile, includeStatusLine), ...extraFlags }, null, 2))
   stopTail()
   const watcher = fs.watch(evFile, { persistent: false }, () => drain())
   // fs.watch on a single file can go quiet after atomic replaces — a slow
   // poll guarantees delivery without meaningful cost
   const timer = setInterval(() => drain(), 1500)
-  tail = { file: evFile, watcher, offset: 0, timer }
+  // Status-line commands can run for weeks without restarting Kaisola. Keep
+  // their private JSONL fallback bounded during the live process too, not only
+  // at startup.
+  const statusTimer = setInterval(() => prepareStatusCache(statusFile), 60_000)
+  statusTimer.unref?.()
+  tail = { file: evFile, watcher, offset: 0, timer, statusTimer }
   return stFile
 }
 
@@ -138,11 +211,19 @@ function registerClaudeHooksHandlers(ipcMain) {
 
   // fast mode etc. — rewrite ONLY the settings file (never resets the events
   // tail); a claude launched after this boots with the new flags
-  ipcMain.handle('claude:settings-flags', (event, flags) => {
+  ipcMain.handle('claude:settings-flags', (_event, payload) => {
+    // Backwards compatible with old renderers that sent the flags object
+    // directly; current renderers also identify the account/workspace whose
+    // settings precedence must be respected.
+    const wrapped = payload && typeof payload === 'object' && Object.prototype.hasOwnProperty.call(payload, 'flags')
+    const flags = wrapped ? payload.flags : payload
+    const configDir = wrapped ? payload.configDir : undefined
+    const cwd = wrapped ? payload.cwd : undefined
     extraFlags = flags && typeof flags === 'object' ? flags : {}
     try {
-      fs.writeFileSync(settingsPath(), JSON.stringify({ ...buildSettings(eventsPath()), ...extraFlags }, null, 2))
-      return { ok: true }
+      const includeStatusLine = !hasCustomStatusLine(configDir, cwd)
+      fs.writeFileSync(settingsPath(), JSON.stringify({ ...buildSettings(eventsPath(), statusCachePath(), includeStatusLine), ...extraFlags }, null, 2))
+      return { ok: true, usageStatusLine: includeStatusLine }
     } catch (err) {
       return { ok: false, message: String((err && err.message) || err) }
     }
@@ -214,4 +295,4 @@ function disposeClaudeHooks() {
   stopTail()
 }
 
-module.exports = { registerClaudeHooksHandlers, disposeClaudeHooks }
+module.exports = { registerClaudeHooksHandlers, disposeClaudeHooks, _buildSettingsForTests: buildSettings, _hasCustomStatusLineForTests: hasCustomStatusLine }

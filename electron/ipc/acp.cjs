@@ -48,12 +48,17 @@ class AcpConnection {
       cwd: this.cwd,
       env: childEnv,
       stdio: ['pipe', 'pipe', 'pipe'],
+      // One owned process group lets Kaisola reap the adapter AND any model CLI
+      // it spawned. Killing only an npx wrapper is what left PPID-1 trees.
+      detached: process.platform !== 'win32',
     })
     this.alive = true
+    this.hooks.onSpawn?.({ pid: this.proc.pid, pgid: this.proc.pid, command, args })
     this.proc.stdout.on('data', (d) => this._onData(d))
     this.proc.stderr.on('data', (d) => this.hooks.onNotice?.({ kind: 'stderr', text: d.toString() }))
     this.proc.on('exit', (code) => {
       this.alive = false
+      this.hooks.onProcessExit?.({ pid: this.proc && this.proc.pid, code })
       for (const { reject } of this.pending.values()) reject(new Error(`agent exited (${code})`))
       this.pending.clear()
       this.hooks.onNotice?.({ kind: 'exit', code })
@@ -313,8 +318,11 @@ class AcpConnection {
 
   async setConfigOption(configId, value) {
     const r = await this.request('session/set_config_option', { sessionId: this.sessionId, configId, value })
-    const opt = this.configOptions.find((o) => o.id === configId)
-    if (opt) opt.currentValue = value
+    if (Array.isArray(r?.configOptions)) this.configOptions = r.configOptions
+    else {
+      const opt = this.configOptions.find((o) => o.id === configId)
+      if (opt) opt.currentValue = value
+    }
     this.hooks.onControls?.(this.getControls())
     return r
   }
@@ -347,7 +355,18 @@ class AcpConnection {
 
   dispose() {
     try {
-      this.proc?.kill()
+      if (this.proc && this.proc.pid && process.platform !== 'win32') {
+        const pgid = this.proc.pid
+        try { process.kill(-pgid, 'SIGTERM') } catch { this.proc.kill() }
+        // A wedged grandchild must not survive as a PPID-1 orphan. The exact
+        // group was created above by this connection, never discovered by name.
+        const hard = setTimeout(() => {
+          try { process.kill(-pgid, 'SIGKILL') } catch { /* already gone */ }
+        }, 1500)
+        hard.unref?.()
+      } else {
+        this.proc?.kill()
+      }
     } catch {
       /* noop */
     }

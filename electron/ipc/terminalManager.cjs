@@ -4,7 +4,9 @@
 // dock — you watch it happen and can take over — while its output + exit status
 // flow back to the agent.
 const os = require('node:os')
+const path = require('node:path')
 const { agentEnv } = require('./shellEnv.cjs')
+const { TerminalSpool, DEFAULT_HOT_CAP } = require('./terminalSpool.cjs')
 
 let pty = null
 try {
@@ -13,7 +15,7 @@ try {
   console.error('[pasola] node-pty unavailable:', err.message)
 }
 
-const OUTPUT_CAP = 1_000_000 // keep up to ~1MB of output per terminal
+const OUTPUT_CAP = DEFAULT_HOT_CAP // older scrollback is disk-backed
 // Coalesce pty output into ~one IPC frame per flush window: agent TUIs emit
 // hundreds of tiny chunks a second (spinner frames, cursor moves), and one
 // renderer wake-up per chunk is what makes an idle-looking app burn CPU.
@@ -33,6 +35,11 @@ function setAppFocused(focused) {
 
 /** id → record */
 const terms = new Map()
+let spoolDir = path.join(os.tmpdir(), `kaisola-terminal-cache-${process.pid}`)
+
+function configureStorage(dir) {
+  if (dir) spoolDir = dir
+}
 
 /** terminal:run children (plain child_process, not node-pty) — tracked here so
  *  a non-terminating run command dies on app quit instead of reparenting to
@@ -110,12 +117,10 @@ function spawn({ id, command, args, cwd, env, cols, rows, sender }) {
     id,
     pty: p,
     sender,
-    // snapshot ring as a CHUNK LIST, joined lazily on snapshot(): the old
-    // `output += data; slice(-CAP)` did a ~1MB string copy on every chunk
-    // once the ring was full — a fast-scrolling command turned that into
-    // gigabytes of allocation. Dropping whole stale chunks is O(dropped).
-    chunks: [],
-    chunksLen: 0,
+    // Hidden renderers leave zero scrollback in RAM. The pty stays alive and
+    // writes to this bounded disk spool until an xterm reattaches.
+    spool: new TerminalSpool({ dir: spoolDir, id }),
+    rendererVisible: true,
     pending: '', // coalesced-but-unsent output (already part of the ring)
     flushTimer: null,
     truncated: false,
@@ -131,22 +136,16 @@ function spawn({ id, command, args, cwd, env, cols, rows, sender }) {
     if (!rec.pending) return
     const chunk = rec.pending
     rec.pending = ''
-    send(rec.sender, `terminal:data:${id}`, chunk)
+    if (rec.rendererVisible) send(rec.sender, `terminal:data:${id}`, chunk)
   }
   rec.flushPending = flushPending
   p.onData((data) => {
-    rec.chunks.push(data)
-    rec.chunksLen += data.length
-    if (rec.chunksLen > OUTPUT_CAP) {
-      rec.truncated = true
-      while (rec.chunks.length > 1 && rec.chunksLen - rec.chunks[0].length >= OUTPUT_CAP) {
-        rec.chunksLen -= rec.chunks[0].length
-        rec.chunks.shift()
-      }
+    rec.spool.push(data)
+    if (rec.rendererVisible) {
+      rec.pending += data
+      if (rec.pending.length >= FLUSH_CAP) flushPending()
+      else if (!rec.flushTimer) rec.flushTimer = setTimeout(flushPending, flushMs)
     }
-    rec.pending += data
-    if (rec.pending.length >= FLUSH_CAP) flushPending()
-    else if (!rec.flushTimer) rec.flushTimer = setTimeout(flushPending, flushMs)
   })
   p.onExit(({ exitCode, signal }) => {
     flushPending() // the tail of the stream must land before the exit signal
@@ -164,8 +163,7 @@ function spawn({ id, command, args, cwd, env, cols, rows, sender }) {
     // carries it — a live send here would fire before Terminal.tsx's data
     // listener is wired (Electron drops it) and never reach the renderer.
     const warn = `\r\n\x1b[33m⚠ working directory not found:\x1b[0m ${cwd}\r\n\x1b[33m  started in ${os.homedir()} instead — this session is NOT isolated.\x1b[0m\r\n\r\n`
-    rec.chunks.push(warn)
-    rec.chunksLen += warn.length
+    rec.spool.push(warn)
   }
   return rec
 }
@@ -202,19 +200,42 @@ function setSender(id, sender) {
   }
   r.pending = ''
   r.sender = sender
+  r.rendererVisible = true
+  r.spool.setVisible(true)
+}
+
+/** Drop only the renderer. The pty/command continues and all output moves to
+ * disk. Sender identity prevents an old window cleanup racing a new pop-out. */
+function detachRenderer(id, sender, viewState) {
+  const r = terms.get(id)
+  if (!r || (sender && r.sender && sender !== r.sender)) return false
+  if (r.flushTimer) {
+    clearTimeout(r.flushTimer)
+    r.flushTimer = null
+  }
+  r.pending = ''
+  r.rendererVisible = false
+  r.sender = null
+  r.spool.setVisible(false, viewState)
+  return true
+}
+
+/** Main-process fallback for a renderer crash/window close where React cleanup
+ * never got a chance to send terminal:detachRenderer. PTYs keep running; only
+ * renderer ownership and hot scrollback move to the disk spool. */
+function detachSender(sender) {
+  let detached = 0
+  for (const [id, r] of terms) {
+    if (!r.sender || !sender || (r.sender !== sender && r.sender.id !== sender.id)) continue
+    if (detachRenderer(id, r.sender)) detached++
+  }
+  return detached
 }
 
 function snapshot(id) {
   const r = terms.get(id)
   if (!r) return { output: '', exited: true, exitStatus: null }
-  // join once and collapse the ring to a single exact-cap chunk, so repeated
-  // snapshots (and the next joins) stay cheap
-  if (r.chunks.length > 1 || (r.chunks[0]?.length ?? 0) > OUTPUT_CAP) {
-    const joined = r.chunks.join('')
-    r.chunks = [joined.length > OUTPUT_CAP ? joined.slice(-OUTPUT_CAP) : joined]
-    r.chunksLen = r.chunks[0].length
-  }
-  return { output: r.chunks[0] ?? '', truncated: r.truncated, exited: r.exited, exitStatus: r.exitStatus }
+  return { ...r.spool.snapshot(OUTPUT_CAP), exited: r.exited, exitStatus: r.exitStatus }
 }
 
 function waitForExit(id) {
@@ -240,6 +261,7 @@ function release(id) {
   const r = terms.get(id)
   if (r?.flushTimer) clearTimeout(r.flushTimer)
   kill(id)
+  r?.spool.close({ remove: true })
   terms.delete(id)
 }
 
@@ -265,6 +287,9 @@ function killAll() {
     } catch {
       /* noop */
     }
+    // App quit is not a user close: retain the spool so persisted terminal
+    // records can restore their previous scrollback on next launch.
+    r.spool.close()
   }
   terms.clear()
   // terminal:run children are plain child_process, not ptys — reap them too, or
@@ -298,4 +323,8 @@ function list() {
   return out
 }
 
-module.exports = { available, has, isLive, spawn, write, resize, setSender, snapshot, waitForExit, kill, release, trackChild, untrackChild, killAll, list, setAppFocused }
+function diagnostics() {
+  return [...terms.values()].map((r) => ({ ...r.spool.stats(), pid: r.pty && r.pty.pid, exited: r.exited }))
+}
+
+module.exports = { available, has, isLive, spawn, write, resize, setSender, detachRenderer, detachSender, snapshot, waitForExit, kill, release, trackChild, untrackChild, killAll, list, setAppFocused, configureStorage, diagnostics }

@@ -4,10 +4,9 @@ import { bridge, isDesktop, type ClaudeTokenSums, type ClaudeUsage, type CodexUs
 import { useKaisola } from '../../store/store'
 import { Icon } from '../Icon'
 
-/** Top-bar usage gauge. Codex exposes real rolling-window percentages through
- * its app-server. Claude's supported local surface only exposes transcript
- * token activity, so that section is deliberately labelled rather than
- * presenting an invented subscription percentage. */
+/** Top-bar usage gauge. Codex uses app-server; Claude uses the official Agent
+ * SDK's structured `/usage` control, with documented status-line fallback.
+ * Local transcript tokens remain a clearly secondary diagnostic. */
 
 const fmt = (n: number): string =>
   n >= 1e9 ? `${(n / 1e9).toFixed(1)}B`
@@ -71,6 +70,19 @@ function ClaudeActivity({ label, sums }: { label: string; sums?: ClaudeTokenSums
   )
 }
 
+const extraAmount = (value: number | undefined, currency?: string): string => {
+  if (value == null) return '—'
+  try {
+    return new Intl.NumberFormat(undefined, {
+      style: currency ? 'currency' : 'decimal',
+      currency: currency || undefined,
+      maximumFractionDigits: 2,
+    }).format(value)
+  } catch {
+    return `${value.toFixed(2)}${currency ? ` ${currency}` : ''}`
+  }
+}
+
 interface ClaudeRow { id: string; label: string; email?: string; usage?: ClaudeUsage }
 
 export function LimitsButton() {
@@ -85,7 +97,7 @@ export function LimitsButton() {
   const seqRef = useRef(0)
   const initialLoadRef = useRef(false)
 
-  const load = useCallback(async () => {
+  const load = useCallback(async (force = false, exactOnly = false) => {
     if (!bridge.usage) return
     const seq = ++seqRef.current
     const accounts = useKaisola.getState().claudeAccounts
@@ -107,14 +119,14 @@ export function LimitsButton() {
 
     // Do not put these in one Promise.all: a missing Codex executable used to
     // hold the already-finished Claude result hostage for the full timeout.
-    const codexTask = bridge.usage.codex()
+    const codexTask = bridge.usage.codex(undefined, force)
       .catch((err) => ({ ok: false, message: String((err as Error)?.message || err || 'Unavailable') } as CodexUsage))
       .then((result) => { if (seq === seqRef.current) setCodex(result) })
       .finally(() => { if (seq === seqRef.current) setCodexLoading(false) })
 
     const claudeTask = (async () => {
       const infoTask = bridge.claude.accountInfo?.().catch(() => undefined) ?? Promise.resolve(undefined)
-      const usages = await Promise.all(accountRows.map((row) => bridge.usage!.claude(row.configDir).catch((err) => ({ ok: false, message: String((err as Error)?.message || err) } as ClaudeUsage))))
+      const usages = await Promise.all(accountRows.map((row) => bridge.usage!.claude(row.configDir, force, exactOnly).catch((err) => ({ ok: false, message: String((err as Error)?.message || err) } as ClaudeUsage))))
       const defaultInfo = await infoTask
       if (seq !== seqRef.current) return
       setClaude(accountRows.map((row, i) => ({
@@ -143,7 +155,7 @@ export function LimitsButton() {
     if (bridge.smoke) return
     if (initialLoadRef.current) return
     initialLoadRef.current = true
-    void load()
+    void load(false, true)
   }, [load])
 
   useEffect(() => {
@@ -154,10 +166,21 @@ export function LimitsButton() {
   }, [open])
 
   if (!isDesktop || !bridge.usage) return null
-  const peak = codex?.ok ? Math.max(codex.primary?.usedPercent ?? 0, codex.secondary?.usedPercent ?? 0) : null
-  const indicator = codexLoading && !codex
+  const codexPeak = codex?.ok ? Math.max(codex.primary?.usedPercent ?? 0, codex.secondary?.usedPercent ?? 0) : null
+  const claudePercents = claude.flatMap((row) => [
+    row.usage?.limits?.fiveHour?.usedPercent,
+    row.usage?.limits?.sevenDay?.usedPercent,
+    ...(row.usage?.limits?.modelScoped?.map((model) => model.usedPercent) ?? []),
+  ]).filter((value): value is number => value != null)
+  const claudePeak = claudePercents.length ? Math.max(...claudePercents) : null
+  const peak = codexPeak == null ? claudePeak : claudePeak == null ? codexPeak : Math.max(codexPeak, claudePeak)
+  const indicator = (codexLoading || claudeLoading) && peak == null
     ? 'var(--text-3)'
     : peak == null ? 'var(--text-3)' : peak >= 90 ? 'var(--danger)' : peak >= 70 ? 'var(--warn)' : 'var(--success)'
+  const usageTitle = [
+    codexPeak == null ? null : `Codex ${Math.round(codexPeak)}% peak`,
+    claudePeak == null ? null : `Claude ${Math.round(claudePeak)}% peak`,
+  ].filter(Boolean).join(' · ')
 
   return (
     <>
@@ -166,7 +189,7 @@ export function LimitsButton() {
         className="btn-icon"
         data-active={open}
         onClick={toggle}
-        title={codex?.ok ? `Usage — Codex ${Math.round(codex.primary?.usedPercent ?? 0)}% current, ${Math.round(codex.secondary?.usedPercent ?? 0)}% weekly` : 'Usage — Claude & Codex'}
+        title={usageTitle ? `Usage — ${usageTitle}` : 'Usage — Claude & Codex'}
         aria-label="Open Claude and Codex usage"
         style={{ position: 'relative' }}
       >
@@ -190,7 +213,7 @@ export function LimitsButton() {
               <span style={{ fontWeight: 600 }}>Usage</span>
               <span className="faint">Updated {relativeTime(updatedAt)}</span>
               <span className="grow" />
-              <button className="btn-icon btn-sm" onClick={() => void load()} title="Refresh usage" disabled={codexLoading || claudeLoading}>
+              <button className="btn-icon btn-sm" onClick={() => void load(true)} title="Refresh usage (bypass cache)" disabled={codexLoading || claudeLoading}>
                 <Icon name="RefreshCw" size={12} />
               </button>
             </div>
@@ -212,37 +235,68 @@ export function LimitsButton() {
 
             <div style={{ height: 1, background: 'var(--border)' }} />
 
-            <section style={{ display: 'flex', flexDirection: 'column', gap: 9 }} aria-label="Claude local activity">
+            <section style={{ display: 'flex', flexDirection: 'column', gap: 9 }} aria-label="Claude subscription usage">
               <div style={{ display: 'flex', alignItems: 'center', gap: 7 }}>
                 <span style={{ fontWeight: 600 }}>Claude</span>
-                <span className="faint">local activity</span>
+                <span className="faint">subscription limits</span>
               </div>
-              {claude.length === 0 && <span className="faint">{claudeLoading ? 'Reading Claude transcripts…' : 'No accounts'}</span>}
+              {claude.length === 0 && <span className="faint">{claudeLoading ? 'Reading Claude limits…' : 'No accounts'}</span>}
               {claude.map((row) => {
                 const usage = row.usage
+                const limits = usage?.limits
+                const activity = usage?.activity
+                const hasLimits = Boolean(limits?.fiveHour || limits?.sevenDay || limits?.modelScoped?.length)
+                const plan = usage?.subscriptionType ? usage.subscriptionType.charAt(0).toUpperCase() + usage.subscriptionType.slice(1) : ''
                 return (
-                  <div key={row.id} style={{ display: 'flex', flexDirection: 'column', gap: 5 }}>
+                  <div key={row.id} style={{ display: 'flex', flexDirection: 'column', gap: 7 }}>
                     <div style={{ display: 'flex', alignItems: 'baseline', gap: 7, minWidth: 0 }}>
                       <span style={{ fontWeight: 500, whiteSpace: 'nowrap' }}>{row.label}</span>
+                      {plan && <span className="tag" style={{ textTransform: 'none' }}>{plan}</span>}
                       <span className="faint truncate" title={row.email}>{row.email}</span>
-                      <span className="grow" />
-                      {usage?.lastActivity ? <span className="faint" style={{ whiteSpace: 'nowrap' }}>{relativeTime(usage.lastActivity)}</span> : null}
                     </div>
-                    {usage?.ok && usage.exists ? (
+                    {hasLimits ? (
                       <>
-                        <ClaudeActivity label="Last 5 hours" sums={usage.fiveHour} />
-                        <ClaudeActivity label="Last 7 days" sums={usage.week} />
-                        {usage.partial && <span className="faint" style={{ fontSize: 'var(--fs-10, 10px)' }}>Recent {usage.scannedFiles ?? ''} transcript files shown; older activity was capped.</span>}
+                        <WindowBar label="Current session" usedPercent={limits?.fiveHour?.usedPercent} resetsAt={limits?.fiveHour?.resetsAt} />
+                        <WindowBar label="Weekly" usedPercent={limits?.sevenDay?.usedPercent} resetsAt={limits?.sevenDay?.resetsAt} />
+                        {limits?.modelScoped?.map((model) => (
+                          <WindowBar key={`${model.label}:${model.resetsAt ?? ''}`} label={model.label} usedPercent={model.usedPercent} resetsAt={model.resetsAt} />
+                        ))}
+                        {limits?.extraUsage && (
+                          <div style={{ display: 'flex', justifyContent: 'space-between', gap: 12 }}>
+                            <span>Extra usage</span>
+                            <span className="faint">
+                              {limits.extraUsage.enabled
+                                ? `${extraAmount(limits.extraUsage.usedCredits, limits.extraUsage.currency)} / ${extraAmount(limits.extraUsage.monthlyLimit, limits.extraUsage.currency)}${limits.extraUsage.utilization == null ? '' : ` · ${Math.round(limits.extraUsage.utilization)}%`}`
+                                : 'Off'}
+                            </span>
+                          </div>
+                        )}
                       </>
                     ) : (
-                      <span className="faint">{claudeLoading && !usage ? 'Reading…' : usage?.message ?? 'No local activity found'}</span>
+                      <span className="faint">{claudeLoading && !usage ? 'Reading…' : usage?.message ?? 'No subscription limits reported yet'}</span>
+                    )}
+                    {usage && (
+                      <span className="faint" style={{ fontSize: 'var(--fs-10, 10px)', lineHeight: 1.35 }}>
+                        {usage.sourceLabel ?? 'Claude'}{usage.experimental ? ' · experimental structured API' : ''}
+                        {usage.updatedAt ? ` · ${relativeTime(usage.updatedAt)}` : ''}{usage.stale ? ' · last known good' : ''}
+                        {usage.refreshError ? ` · refresh failed: ${usage.refreshError}` : ''}
+                      </span>
+                    )}
+                    {activity && (
+                      <details style={{ color: 'var(--text-3)', fontSize: 'var(--fs-10, 10px)' }}>
+                        <summary style={{ cursor: 'pointer' }}>Local activity diagnostic</summary>
+                        <div style={{ display: 'flex', flexDirection: 'column', gap: 4, paddingTop: 5 }}>
+                          <ClaudeActivity label="Last 5 hours" sums={activity.fiveHour} />
+                          <ClaudeActivity label="Last 7 days" sums={activity.week} />
+                          {activity.lastActivity ? <span>Last response {relativeTime(activity.lastActivity)}</span> : null}
+                          {activity.partial && <span>Recent {activity.scannedFiles ?? ''} files scanned; older activity was capped.</span>}
+                          <span>Transcript tokens are local diagnostics, not plan percentages.</span>
+                        </div>
+                      </details>
                     )}
                   </div>
                 )
               })}
-              <span className="faint" style={{ fontSize: 'var(--fs-10, 10px)', lineHeight: 1.4 }}>
-                Anthropic does not expose an exact subscription meter to desktop clients. These are local transcript tokens, not plan percentages; use <code>/usage</code> in Claude for the official view.
-              </span>
             </section>
           </div>
         </div>,

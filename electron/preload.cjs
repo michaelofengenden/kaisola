@@ -36,10 +36,12 @@ const bridge = {
   // Multiple agents can be connected at once; methods target one by agentKey.
   acp: {
     presets: () => ipcRenderer.invoke('acp:presets'),
-    status: () => ipcRenderer.invoke('acp:status'),
+    status: (clientKeys, scope) => ipcRenderer.invoke('acp:status', { clientKeys, scope }),
     connect: (config) => ipcRenderer.invoke('acp:connect', config),
     disconnect: (agentKey) => ipcRenderer.invoke('acp:disconnect', { agentKey }),
     cancel: (agentKey) => ipcRenderer.invoke('acp:cancel', { agentKey }),
+    lease: (agentKey, leaseId, active, idleMs) => ipcRenderer.invoke('acp:lease', { agentKey, leaseId, active, idleMs }),
+    diagnostics: () => ipcRenderer.invoke('acp:diagnostics'),
     // live autonomy dial → every connection this window owns (see acpHandler)
     setAutonomy: (autonomy) => ipcRenderer.invoke('acp:set-autonomy', { autonomy }),
     setMode: (agentKey, modeId) => ipcRenderer.invoke('acp:setMode', { agentKey, modeId }),
@@ -109,7 +111,7 @@ const bridge = {
       }
     })(),
     armHooks: () => ipcRenderer.invoke('claude:arm'),
-    setSettingsFlags: (flags) => ipcRenderer.invoke('claude:settings-flags', flags),
+    setSettingsFlags: (flags, configDir, cwd) => ipcRenderer.invoke('claude:settings-flags', { flags, configDir, cwd }),
     rebind: () => ipcRenderer.invoke('claude:rebind'),
     sessionExists: (cwd, sessionId, configDir) => ipcRenderer.invoke('claude:session-exists', { cwd, sessionId, configDir }),
     accountInfo: (configDir) => ipcRenderer.invoke('claude:account-info', { configDir }),
@@ -122,8 +124,8 @@ const bridge = {
 
   // ── subscription limits (the top-bar gauge) ──
   usage: {
-    codex: (codexHome) => ipcRenderer.invoke('usage:codex', { codexHome }),
-    claude: (configDir) => ipcRenderer.invoke('usage:claude', { configDir }),
+    codex: (codexHome, force = false) => ipcRenderer.invoke('usage:codex', { codexHome, force }),
+    claude: (configDir, force = false, exactOnly = false) => ipcRenderer.invoke('usage:claude', { configDir, force, exactOnly }),
     claudeSession: (configDir, sessionId) => ipcRenderer.invoke('usage:claudeSession', { configDir, sessionId }),
   },
 
@@ -222,6 +224,8 @@ const bridge = {
     resize: (id, cols, rows) => ipcRenderer.invoke('terminal:resize', { id, cols, rows }),
     snapshot: (id) => ipcRenderer.invoke('terminal:snapshot', { id }),
     attach: (id) => ipcRenderer.invoke('terminal:attach', { id }),
+    detachRenderer: (id, viewState) => ipcRenderer.invoke('terminal:detachRenderer', { id, viewState }),
+    diagnostics: () => ipcRenderer.invoke('terminal:diagnostics'),
     signal: (id, signal) => ipcRenderer.invoke('terminal:signal', { id, signal }),
     kill: (id) => ipcRenderer.invoke('terminal:kill', { id }),
     run: (command, cwd) => ipcRenderer.invoke('terminal:run', { command, cwd }),
@@ -243,6 +247,12 @@ const bridge = {
       ipcRenderer.on('terminal:meta', listener)
       return () => ipcRenderer.removeListener('terminal:meta', listener)
     },
+  },
+  assistantArchive: {
+    append: (scope, batchId, turns) => ipcRenderer.invoke('assistant-archive:append', { scope, batchId, turns }),
+    info: (scope) => ipcRenderer.invoke('assistant-archive:info', { scope }),
+    page: (scope, before, limit) => ipcRenderer.invoke('assistant-archive:page', { scope, before, limit }),
+    clear: (scope) => ipcRenderer.invoke('assistant-archive:clear', { scope }),
   },
 
   // headless device-code login (e.g. `codex login --device-auth`) → in-app card
@@ -334,6 +344,7 @@ const bridge = {
   // perf-mode window plumbing: persist next-launch solidity, read the mismatch
   windowMode: (patch) => ipcRenderer.invoke('shell:window-mode', patch),
   relaunch: () => ipcRenderer.invoke('shell:relaunch'),
+  // live↔solid swaps only the renderer window; PTYs/agent turns remain in main
   reapplyWindow: () => ipcRenderer.invoke('shell:reapply-window'),
   // wallpaper-sampled glass wash (macOS; failures degrade to theme tint)
   glassWash: {

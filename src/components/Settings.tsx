@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react'
-import { useKaisola, shellConfigDir, type ThemeMode, type PerfMode, type CustomAgent, type TermBackground } from '../store/store'
+import { useKaisola, shellConfigDir, type ThemeMode, type PerfMode, type TabLayout, type CustomAgent, type TermBackground } from '../store/store'
 import { bridge, isDesktop, type AcpAgent, type AppAuthStatus } from '../lib/bridge'
 import type { AutonomyLevel } from '../domain/types'
 import { useAgentRegistry, openAgentSession, type RegistryAgent } from '../lib/registry'
@@ -154,7 +154,7 @@ type SectionId = (typeof SECTIONS)[number]['id']
 const SECTION_DESC: Record<SectionId, string> = {
   general: 'Theme, native Live Glass or the lowest-memory Eco shell, and software updates.',
   usage: 'Live subscription windows for your signed-in Codex and Claude accounts.',
-  interface: 'The little conveniences — every one of them yours to switch off.',
+  interface: 'Tab hierarchy and the little conveniences — every one of them yours to tune.',
   terminal: 'Every terminal card — font size, weight, typeface, and cursor color.',
   agents: 'The CLIs in your + menu. Each runs with your existing install and login — Kaisola never proxies a model.',
   guardrails: 'What agents may do without you: autonomy, saved permission rules, and protected files.',
@@ -221,6 +221,8 @@ export function Settings() {
   const themeMode = useKaisola((s) => s.themeMode)
   const setThemeMode = useKaisola((s) => s.setThemeMode)
   const perfMode = useKaisola((s) => s.perfMode)
+  const tabLayout = useKaisola((s) => s.tabLayout)
+  const setTabLayout = useKaisola((s) => s.setTabLayout)
   const wordDiffs = useKaisola((s) => s.wordDiffs)
   const setWordDiffs = useKaisola((s) => s.setWordDiffs)
   const showCosts = useKaisola((s) => s.showCosts)
@@ -524,6 +526,24 @@ export function Settings() {
 
             {section === 'interface' && (
               <>
+                <div className="settings-row">
+                  <span className="settings-row-label">Tab layout <span className="faint" style={{ fontWeight: 400 }}>· switches live</span></span>
+                  <div className="settings-row-control">
+                    <Dropdown
+                      value={tabLayout}
+                      options={[
+                        { value: 'shelf', name: 'Nested shelf' },
+                        { value: 'bare', name: 'Bare hierarchy' },
+                        { value: 'runway', name: 'Neutral runway' },
+                        { value: 'flat', name: 'Flat labels' },
+                        { value: 'compact', name: 'Compact row' },
+                      ]}
+                      onSelect={(v) => setTabLayout(v as TabLayout)}
+                      align="right"
+                      title="How project tabs and their sessions share the window chrome"
+                    />
+                  </div>
+                </div>
                 {([
                   { label: 'Session cost chips', hint: 'what each Claude session cost', value: showCosts, set: setShowCosts, title: 'A quiet $ chip on Claude session cards — token totals on hover' },
                   { label: 'Cross-project inbox', hint: 'everything that needs you', value: inbox, set: setInbox, title: 'One bell in the tab strip rolling up waiting sessions and gates across every project tab' },

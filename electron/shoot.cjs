@@ -104,7 +104,7 @@ app.whenReady().then(async () => {
 
     // Settings — every tab, both themes for the default tab
     await setTheme('light')
-    for (const tab of ['general', 'agents', 'models']) {
+    for (const tab of ['general', 'interface', 'agents', 'models']) {
       await openSettings(tab); await shot(`settings-${tab}-light`)
     }
     await closeSettings()
@@ -164,9 +164,14 @@ app.whenReady().then(async () => {
     // the toast-pass toasts must not linger into the hero shots
     await js(`(() => { const s = window.__kaisola.getState(); for (const t of s.toasts) s.dismissToast(t.id) })()`)
     await wait(300)
-    await shot('session-grid-light')
-    await setTheme('dark')
-    await shot('session-grid-dark')
+    for (const theme of ['light', 'dark']) {
+      await setTheme(theme)
+      for (const layout of ['shelf', 'bare', 'runway', 'flat', 'compact']) {
+        await js(`window.__kaisola.getState().setTabLayout(${JSON.stringify(layout)})`)
+        await shot(`tab-layout-${layout}-${theme}`)
+      }
+    }
+    await js(`window.__kaisola.getState().setTabLayout('bare')`)
   } catch (e) {
     console.log('SHOOT_ERROR ' + (e && e.message || e))
   }

@@ -23,6 +23,7 @@ import '@xterm/xterm/css/xterm.css'
 // apply persisted/initial theme + appearance-energy mode before first paint
 document.documentElement.dataset.theme = useKaisola.getState().theme
 document.documentElement.dataset.perf = useKaisola.getState().perfMode
+document.documentElement.dataset.tabLayout = useKaisola.getState().tabLayout
 document.documentElement.dataset.termbg = useKaisola.getState().termBackground
 // solid Eco windows: main created this window opaque — square the custom
 // corners to the native clip before first paint (global.css)

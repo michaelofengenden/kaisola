@@ -59,6 +59,8 @@ export type ThemeMode = Theme | 'system'
 export type LayoutMode = 'focus' | 'studio'
 /** Appearance energy: native live glass or the opaque, still Eco shell. */
 export type PerfMode = 'glass' | 'eco'
+/** Project/session hierarchy treatment. Applied live per app window. */
+export type TabLayout = 'shelf' | 'bare' | 'runway' | 'flat' | 'compact'
 export type PaletteMode = 'commands' | 'files'
 
 /** A working-tree checkpoint — a real (hidden-ref) git commit of everything. */
@@ -601,7 +603,7 @@ const GLOBAL_KEYS = [
   'theme', 'themeMode', 'agentModels', 'fileTextZoom', 'termFontSize', 'termFontFamily',
   'termFontWeight', 'termCursorColor', 'termBackground', 'customAgents', 'enabledAgents', 'sessionTemplates', 'claudeModel', 'reasoningProvider',
   'localBaseUrl', 'localModel', 'openaiBaseUrl', 'openaiModel', 'openAlexMailto', 'grobidEndpoint',
-  'sandboxMode', 'workflows', 'automationsEnabled', 'perfMode', 'railWidth', 'railOpen', 'claudeSessions',
+  'sandboxMode', 'workflows', 'automationsEnabled', 'perfMode', 'tabLayout', 'railWidth', 'railOpen', 'claudeSessions',
   'wordDiffs', 'showCosts', 'inbox', 'draftRestore', 'wallpaperTint', 'claudeAccounts',
   'claudeTerminalModel', 'claudeFastMode',
   'permissionRules', 'sensitiveGlobs', 'latexMain', 'unsavedBuffers', 'termDrafts', 'onboardingVersion',
@@ -773,6 +775,9 @@ interface KaisolaState {
   /** Terminal font size (⌘+/⌘−/⌘0, persisted; applies to every terminal). */
   /** Appearance energy: 'glass' live translucency · 'eco' solid and still. */
   perfMode: PerfMode
+  /** Visual relationship between project tabs and their child sessions. */
+  tabLayout: TabLayout
+  setTabLayout: (layout: TabLayout) => void
   /** Zero only for a genuinely fresh install; migrations mark existing users done. */
   onboardingVersion: number
   /** Width of the left workspace rail in px (null = the CSS default). */
@@ -1785,6 +1790,7 @@ function persistSnapshot(s: KaisolaState) {
     wallpaperTint: s.wallpaperTint,
     onboardingVersion: s.onboardingVersion,
     perfMode: s.perfMode,
+    tabLayout: s.tabLayout,
     railWidth: s.railWidth,
     railOpen: s.railOpen,
     claudeSessions: s.claudeSessions,
@@ -2050,6 +2056,8 @@ export const useKaisola = create<KaisolaState>()(
   // Fresh installs start in the lowest-memory shell. Live Glass remains one
   // click away; removed painted-glass installs migrate to Eco losslessly.
   perfMode: 'eco' as PerfMode,
+  // Hierarchy by scale and spacing only: no arrow, shelf, or colored underline.
+  tabLayout: 'bare' as TabLayout,
   onboardingVersion: 0,
   railWidth: null,
   // Traycer-style quiet start: fresh installs open on the canvas alone; ⌘B
@@ -3217,6 +3225,11 @@ export const useKaisola = create<KaisolaState>()(
     // bg, so an opaque window paints the right color before first render.
     const bg = getComputedStyle(document.documentElement).getPropertyValue('--bg-0').trim()
     void bridge.windowMode({ solidWindow: mode !== 'glass', ...(/^#[0-9a-fA-F]{6}$/.test(bg) ? { solidBg: bg } : {}) }).catch(() => {})
+  },
+  setTabLayout: (layout) => {
+    const value: TabLayout = ['shelf', 'bare', 'runway', 'flat', 'compact'].includes(layout) ? layout : 'bare'
+    document.documentElement.dataset.tabLayout = value
+    set({ tabLayout: value })
   },
   setTermFontSize: (size) => set({ termFontSize: size == null ? 12 : Math.min(18, Math.max(9, Math.round(size))) }),
   setTermFontFamily: (family) => set({ termFontFamily: family || 'JetBrains Mono' }),
@@ -4827,6 +4840,7 @@ export const useKaisola = create<KaisolaState>()(
       const after = get()
       document.documentElement.dataset.theme = after.theme
       document.documentElement.dataset.perf = after.perfMode
+      document.documentElement.dataset.tabLayout = after.tabLayout
       document.documentElement.dataset.termbg = after.termBackground
       bridge.setAppTheme?.(after.themeMode === 'system' ? 'system' : after.theme)
     }
@@ -4963,6 +4977,7 @@ export const useKaisola = create<KaisolaState>()(
           ...cur, // defaults + ACTION FUNCTIONS (must be first)
           ...pickGlobals(p), // bucket B + C
           perfMode: p.perfMode === 'glass' ? 'glass' : 'eco',
+          tabLayout: ['shelf', 'bare', 'runway', 'flat', 'compact'].includes(p.tabLayout) ? p.tabLayout : 'bare',
           // pre-themeMode blobs carried only an explicit theme — honor it rather
           // than silently flipping existing users to system-following
           themeMode: (p as { themeMode?: ThemeMode }).themeMode ?? (p as { theme?: Theme }).theme ?? 'system',

@@ -74,6 +74,7 @@ export function SessionCards() {
   const terminalMeta = useKaisola((s) => s.terminalMeta)
   const workspacePath = useKaisola((s) => s.workspacePath)
   const perfMode = useKaisola((s) => s.perfMode)
+  const tabLayout = useKaisola((s) => s.tabLayout)
   const removeDockView = useKaisola((s) => s.removeDockView)
   const placeDockView = useKaisola((s) => s.placeDockView)
   const popOutTerminal = useKaisola((s) => s.popOutTerminal)
@@ -279,7 +280,7 @@ export function SessionCards() {
 
   return (
     <div className="dock-col">
-      <SessionTabs />
+      {tabLayout !== 'compact' && <SessionTabs />}
       <div
         ref={gridRef}
         className="session-grid"

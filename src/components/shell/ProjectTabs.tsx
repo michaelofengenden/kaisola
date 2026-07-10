@@ -9,6 +9,7 @@ import { WindowLights } from './WindowLights'
 import { InboxButton } from './InboxButton'
 import { ShellTools } from './AgentSidebar'
 import { terminalAgentKey } from '../../lib/sessionHue'
+import { SessionTabs } from './SessionTabs'
 
 const basename = (p: string | null | undefined) => (p ? p.split('/').filter(Boolean).pop() : undefined)
 const tabLabel = (t: { title?: string; workspacePath: string | null }) => t.title ?? basename(t.workspacePath) ?? 'New Project'
@@ -23,6 +24,7 @@ const tabLabel = (t: { title?: string; workspacePath: string | null }) => t.titl
 export function ProjectTabs() {
   const tabs = useKaisola((s) => s.projectTabs)
   const activeId = useKaisola((s) => s.activeProjectId)
+  const tabLayout = useKaisola((s) => s.tabLayout)
   // Derive activity for EVERY project, including parked slices. Previously a
   // tab only received `running` after it was already in the background, so the
   // common flow (start agent → switch tab) lost its dot entirely.
@@ -173,6 +175,11 @@ export function ProjectTabs() {
         })}
       </div>
       <NewProjectButton />
+      {tabLayout === 'compact' && (
+        <div className="compact-session-slot">
+          <SessionTabs />
+        </div>
+      )}
       <div className="tabstrip-fill" onDoubleClick={() => bridge.winCtl('zoom')} />
       <UpdatePill />
       {/* the tool cluster rides the strip's right end — in the chrome row,

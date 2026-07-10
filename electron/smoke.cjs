@@ -935,6 +935,7 @@ app.whenReady().then(async () => {
     const draftBounded = window.__kaisola.getState().assistantDrafts[st.activeThreadId].text.length === 1000000
     st.setAssistantDraft(st.activeThreadId, { text: 'persisted unsent draft' })
     st.setThreadCodexEffort(st.activeThreadId, 'ultra')
+    st.setTabLayout('bare')
     await new Promise((r) => setTimeout(r, 1000)) // outlast the write-throttled persist (800ms) + async db.set
     const raw = window.kaisola.db.getSync('kaisola-store')
     const kind = await window.kaisola.db.kind()
@@ -947,6 +948,7 @@ app.whenReady().then(async () => {
       hasDraft: !!(raw && raw.includes('persisted unsent draft')),
       draftBounded,
       hasCodexEffort: !!(raw && raw.includes('"codexEffort":"ultra"')),
+      hasTabLayout: !!(raw && raw.includes('"tabLayout":"bare"')),
       backend: kind.kind,
     }
   })()`)
@@ -1832,37 +1834,65 @@ a^2 + b^2 = c^2
   })()`)
   console.log('MINIMAL_UI=' + JSON.stringify(minimalUi))
 
-  // 14b) project/session hierarchy: the lower row is an inset shelf carrying
-  //      the active project's identity, while session tabs retain their own
-  //      hue. The shelf stays a static paint surface (no new backdrop blur).
-  const sessionShelf = await win.webContents.executeJavaScript(`(() => {
+  // 14b) project/session hierarchy is user-selectable and switches in place.
+  //      Every treatment keeps the same terminal/thread identities and drafts;
+  //      even Compact moves the one existing session row rather than cloning it.
+  const tabLayouts = await win.webContents.executeJavaScript(`(async () => {
+    const get = () => window.__kaisola.getState()
+    const wait = () => new Promise((r) => setTimeout(r, 45))
     const project = document.querySelector('.ptab[data-active="true"]')
-    const shelf = document.querySelector('.stabs')
-    const marker = shelf?.querySelector('.stabs-project-anchor')
-    const session = shelf?.querySelector('.stab')
-    const grid = document.querySelector('.session-grid')
-    if (!project || !shelf || !marker || !session || !grid) return { rendered: false }
-    const projectHue = project.style.getPropertyValue('--ptab-hue').trim()
-    const shelfHue = shelf.style.getPropertyValue('--project-hue').trim()
-    const shelfStyle = getComputedStyle(shelf)
-    const projectRect = project.getBoundingClientRect()
-    const shelfRect = shelf.getBoundingClientRect()
-    const sessionRect = session.getBoundingClientRect()
-    const gridRect = grid.getBoundingClientRect()
-    return {
-      rendered: true,
-      projectLinked: !!projectHue && projectHue === shelfHue,
-      projectIdLinked: shelf.dataset.projectId === project.dataset.projectId,
-      accessible: /sessions$/i.test(shelf.getAttribute('aria-label') || ''),
-      nestedMarker: marker.getBoundingClientRect().width >= 16,
-      inset: shelfRect.left > gridRect.left,
-      tiered: projectRect.height > sessionRect.height || document.querySelectorAll('.ptab').length === 1,
-      surfaced: shelfStyle.backgroundImage !== 'none' && shelfStyle.borderTopWidth !== '0px',
-      staticPaint: !shelfStyle.backdropFilter || shelfStyle.backdropFilter === 'none',
-      sessionIdentity: !!session.style.getPropertyValue('--sid').trim(),
+    if (!project) return { rendered: false }
+    const original = get().tabLayout
+    const termIds = get().terminals.map((t) => t.id).join('|')
+    const threadIds = get().assistantThreads.map((t) => t.id).join('|')
+    const active = get().activeThreadId
+    get().setAssistantDraft(active, { text: 'layout-switch-draft' })
+    const inspect = () => {
+      const shelf = document.querySelector('.stabs')
+      const marker = shelf?.querySelector('.stabs-project-anchor')
+      const session = shelf?.querySelector('.stab[data-active="true"]') || shelf?.querySelector('.stab')
+      const style = shelf ? getComputedStyle(shelf) : null
+      return { shelf, marker, session, style }
     }
+    get().setTabLayout('shelf'); await wait()
+    const shelf = inspect()
+    const shelfOk = !!shelf.shelf && !!shelf.marker && shelf.marker.getBoundingClientRect().width >= 16 &&
+      getComputedStyle(project, '::after').display !== 'none' && shelf.style.borderTopWidth !== '0px'
+
+    get().setTabLayout('bare'); await wait()
+    const bare = inspect()
+    const bareOk = document.documentElement.dataset.tabLayout === 'bare' && !!bare.shelf &&
+      getComputedStyle(project, '::after').display === 'none' && getComputedStyle(bare.marker).display === 'none' &&
+      bare.style.borderTopWidth === '0px' && bare.style.backgroundImage === 'none'
+
+    get().setTabLayout('runway'); await wait()
+    const runway = inspect()
+    const runwayOk = !!runway.shelf && runway.style.backgroundColor !== 'rgba(0, 0, 0, 0)' &&
+      runway.style.backgroundColor !== 'transparent' && getComputedStyle(runway.marker).display === 'none'
+
+    get().setTabLayout('flat'); await wait()
+    const flat = inspect()
+    const flatSession = flat.session && getComputedStyle(flat.session)
+    const flatOk = document.documentElement.dataset.tabLayout === 'flat' && !!flatSession &&
+      Number.parseInt(flatSession.fontWeight, 10) >= 600 && flatSession.boxShadow === 'none' &&
+      getComputedStyle(flat.marker).display === 'none'
+
+    get().setTabLayout('compact'); await wait()
+    const compact = inspect()
+    const compactOk = document.querySelectorAll('.stabs').length === 1 &&
+      !!document.querySelector('.compact-session-slot > .stabs') && !document.querySelector('.dock-col > .stabs') &&
+      !!compact.session
+
+    const stateKept = get().terminals.map((t) => t.id).join('|') === termIds &&
+      get().assistantThreads.map((t) => t.id).join('|') === threadIds &&
+      get().assistantDrafts[active]?.text === 'layout-switch-draft'
+    const staticPaint = [shelf, bare, runway, flat, compact].every((v) => !v.style?.backdropFilter || v.style.backdropFilter === 'none')
+    const accessible = /sessions$/i.test(compact.shelf?.getAttribute('aria-label') || '')
+    const sessionIdentity = !!compact.session?.style.getPropertyValue('--sid').trim()
+    get().setTabLayout(original); await wait()
+    return { rendered: true, shelfOk, bareOk, runwayOk, flatOk, compactOk, stateKept, staticPaint, accessible, sessionIdentity }
   })()`)
-  console.log('SESSION_SHELF=' + JSON.stringify(sessionShelf))
+  console.log('TAB_LAYOUTS=' + JSON.stringify(tabLayouts))
 
   // 15) settings exposes the appearance/layout configuration
   const settings = await win.webContents.executeJavaScript(`(async () => {
@@ -1879,6 +1909,11 @@ a^2 + b^2 = c^2
     advancedNav?.click()
     await new Promise((r) => setTimeout(r, 50))
     const hasDiskResidency = /Hidden terminal renderers/.test(document.querySelector('.settings-pane')?.textContent || '') && /settings\.json/.test(document.querySelector('.settings-pane')?.textContent || '')
+    const interfaceNav = [...document.querySelectorAll('.settings-nav-item')].find((e) => /Interface/.test(e.textContent || ''))
+    interfaceNav?.click()
+    await new Promise((r) => setTimeout(r, 50))
+    const hasTabLayout = /Tab layout/.test(document.querySelector('.settings-pane')?.textContent || '') &&
+      /Bare hierarchy/.test(document.querySelector('.settings-pane')?.textContent || '')
     const generalNav = [...document.querySelectorAll('.settings-nav-item')].find((e) => /General/.test(e.textContent || ''))
     generalNav?.click()
     await new Promise((r) => setTimeout(r, 30))
@@ -1900,7 +1935,7 @@ a^2 + b^2 = c^2
     document.querySelector('.canvas')?.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true }))
     await new Promise((r) => setTimeout(r, 30))
     const usagePreviewDismissed = !document.querySelector('.limits-panel')
-    return { hasAppearance, hasUsage, hasDiskResidency, hasFilesButton: !!filesButton, noSidebarControls: !hasSidebarControls, previewOpened, previewDismissed, usagePreviewOpened, usagePreviewDismissed }
+    return { hasAppearance, hasUsage, hasDiskResidency, hasTabLayout, hasFilesButton: !!filesButton, noSidebarControls: !hasSidebarControls, previewOpened, previewDismissed, usagePreviewOpened, usagePreviewDismissed }
   })()`)
   console.log('SETTINGS=' + JSON.stringify(settings))
 
@@ -2917,10 +2952,10 @@ a^2 + b^2 = c^2
     const paths = await window.kaisola.settings.paths()
     const pathsOk = !!paths && typeof paths.settings === 'string' && paths.settings.endsWith('settings.json')
     const themeBefore = g().theme
-    await window.kaisola.fs.write(paths.settings, '// smoke\\n{ "theme": "dark", "termFontSize": 15, }\\n')
+    await window.kaisola.fs.write(paths.settings, '// smoke\\n{ "theme": "dark", "termFontSize": 15, "tabLayout": "runway", }\\n')
     await window.kaisola.fs.write(paths.keymap, '[ { "bindings": { "cmd-9": null, "cmd-shift-y": "dock.toggle" } } ]\\n')
     await window.__kaisolaLib.loadUserConfig()
-    const applied = g().theme === 'dark' && g().termFontSize === 15
+    const applied = g().theme === 'dark' && g().termFontSize === 15 && g().tabLayout === 'runway'
     const km = g().keymapOverrides
     const kmOk = km['cmd-9'] === null && km['cmd-shift-y'] === 'dock.toggle'
     // restore
@@ -2928,6 +2963,7 @@ a^2 + b^2 = c^2
     await window.kaisola.fs.write(paths.keymap, '')
     g().setTheme(${JSON.stringify('light')})
     g().setTermFontSize(13)
+    g().setTabLayout('bare')
     g().setKeymapOverrides({})
     return { pathsOk, applied, kmOk, themeBefore }
   })()`)
@@ -3070,7 +3106,7 @@ a^2 + b^2 = c^2
     !brokerActivity.created || !brokerActivity.began || !brokerActivity.detached || !brokerActivity.settled || !brokerActivity.durable ||
     !transcriptTypography.rendered || !transcriptTypography.normalWhitespace || !transcriptTypography.readableWidth || !transcriptTypography.compactStream || !transcriptTypography.compactList ||
     !promptQueue.started || !promptQueue.queuedTwo || !promptQueue.compactCapsule || !promptQueue.queuePopover || !promptQueue.drained || !promptQueue.combinedOnce || !promptQueue.deliveredTogether || !promptQueue.newestSpeedWon ||
-    !persist.stored || !persist.hasTheme || !persist.hasAgent || !persist.hasThread || !persist.hasChatTurn || !persist.hasDraft || !persist.draftBounded || !persist.hasCodexEffort ||
+    !persist.stored || !persist.hasTheme || !persist.hasAgent || !persist.hasThread || !persist.hasChatTurn || !persist.hasDraft || !persist.draftBounded || !persist.hasCodexEffort || !persist.hasTabLayout ||
     !boot.hasId || !boot.ran ||
     !auth.hasUrl || auth.code !== 'ABCD-1234' || !auth.done ||
     !cards.cardPerView || !cards.chatLeftOfFiles || !cards.soloHeadSuppressed || !cards.noDockPanel || !cards.emptyMessageGone || !fschk.listed || !fschk.read || !fschk.wrote ||
@@ -3102,8 +3138,8 @@ a^2 + b^2 = c^2
     !toggle.hasFig || !toggle.visibleAtRest || !toggle.putAway || !toggle.back || !toggle.hidesAll ||
     !autoname.named || !autoname.rowShows || !autoname.sticky || !autoname.manualWins || !autoname.termNamed ||
     !minimalUi.noSidebar || !minimalUi.noSidebarResize || !minimalUi.noStageNav || !minimalUi.hasRail || !minimalUi.hasPlus || !minimalUi.hasFiles ||
-    !sessionShelf.rendered || !sessionShelf.projectLinked || !sessionShelf.projectIdLinked || !sessionShelf.accessible || !sessionShelf.nestedMarker || !sessionShelf.inset || !sessionShelf.tiered || !sessionShelf.surfaced || !sessionShelf.staticPaint || !sessionShelf.sessionIdentity ||
-    !settings.hasAppearance || !settings.hasUsage || !settings.hasDiskResidency || !settings.hasFilesButton || !settings.noSidebarControls || !settings.previewOpened || !settings.previewDismissed || !settings.usagePreviewOpened || !settings.usagePreviewDismissed ||
+    !tabLayouts.rendered || !tabLayouts.shelfOk || !tabLayouts.bareOk || !tabLayouts.runwayOk || !tabLayouts.flatOk || !tabLayouts.compactOk || !tabLayouts.stateKept || !tabLayouts.staticPaint || !tabLayouts.accessible || !tabLayouts.sessionIdentity ||
+    !settings.hasAppearance || !settings.hasUsage || !settings.hasDiskResidency || !settings.hasTabLayout || !settings.hasFilesButton || !settings.noSidebarControls || !settings.previewOpened || !settings.previewDismissed || !settings.usagePreviewOpened || !settings.usagePreviewDismissed ||
     !extensionsUi.opened || extensionsUi.cards < 8 || !extensionsUi.hasFilters || !extensionsUi.csvInstalled || !extensionsUi.jsonInstalled ||
     !extensionsUi.persisted || !extensionsUi.defaultUninstallPersisted || !extensionsUi.csvPreview || !extensionsUi.jsonPreview || !extensionsUi.boundedJsonPreview || !extensionsUi.closed ||
     !dropfit.hasBtn || !dropfit.fits ||

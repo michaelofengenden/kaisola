@@ -736,7 +736,7 @@ interface KaisolaState {
   assistantRuntimes: Record<string, AssistantRuntime>
   /** Durable composer state per assistant thread. */
   assistantDrafts: Record<string, AssistantDraft>
-  /** Prompts accepted while a thread is busy; drained FIFO after each turn. */
+  /** Prompts accepted while a thread is busy; coalesced into the next turn. */
   assistantPromptQueues: Record<string, QueuedAssistantPrompt[]>
   /** Which assistant thread is currently shown. */
   activeThreadId: string
@@ -968,6 +968,9 @@ interface KaisolaState {
   clearAssistantDraft: (id: string, opts?: { keepSpeed?: boolean }, projectId?: string) => void
   enqueueAssistantPrompt: (id: string, prompt: AssistantDraft, opts?: { front?: boolean }, projectId?: string) => string
   dequeueAssistantPrompt: (id: string, projectId?: string) => QueuedAssistantPrompt | undefined
+  /** Atomically remove every prompt waiting for a thread. The renderer merges
+   * the returned batch into one ordered next turn. */
+  takeAssistantPromptQueue: (id: string, projectId?: string) => QueuedAssistantPrompt[]
   removeQueuedAssistantPrompt: (id: string, promptId: string) => void
   reorderAssistantThreads: (srcId: string, destId: string) => void
   setThreadBusy: (id: string, busy: boolean, projectId?: string) => void
@@ -3044,6 +3047,19 @@ export const useKaisola = create<KaisolaState>()(
       return { assistantPromptQueues }
     })
     return next
+  },
+  takeAssistantPromptQueue: (id, projectId) => {
+    const pid = projectId ?? get().activeProjectId
+    const queue = [...(projectFields(get(), pid).assistantPromptQueues[id] ?? [])]
+    if (!queue.length) return queue
+    // Reading then clearing is atomic here: Zustand mutations are synchronous,
+    // so an enqueue cannot interleave between this snapshot and patchProject.
+    get().patchProject(pid, (sl) => {
+      const assistantPromptQueues = { ...sl.assistantPromptQueues }
+      delete assistantPromptQueues[id]
+      return { assistantPromptQueues }
+    })
+    return queue
   },
   removeQueuedAssistantPrompt: (id, promptId) =>
     set((s) => {

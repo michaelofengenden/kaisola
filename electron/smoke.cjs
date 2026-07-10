@@ -447,9 +447,13 @@ app.whenReady().then(async () => {
   // 4) the REAL terminal (node-pty) — verify `cd` actually changes directory
   const term = await win.webContents.executeJavaScript(`(async () => {
     const st = window.__kaisola.getState()
+    const previousTheme = st.theme
     st.setLayoutMode('studio')
     st.setDock(true, 'terminal')
+    st.setTheme('light')
     await new Promise(r => setTimeout(r, 150))
+    const lightHosts = [...document.querySelectorAll('.term-wrap[data-terminal-theme="light"]')]
+    const lightComposerPalette = lightHosts.length > 0 && lightHosts.every((host) => host.dataset.ansiBlack === '#eef0f4')
     const runRes = await window.kaisola.terminal.run('echo pasola-run-ok')
     let buf = ''
     const id = 'smoke-pty'
@@ -461,12 +465,14 @@ app.whenReady().then(async () => {
     await window.kaisola.terminal.write(id, 'pwd\\r')
     await new Promise(r => setTimeout(r, 600))
     off(); window.kaisola.terminal.kill(id)
+    st.setTheme(previousTheme)
     return {
       run: !!(runRes && runRes.ok && (runRes.stdout||'').includes('pasola-run-ok')),
       ptyOk: !!cr.ok,
       cdWorks: /\\/(private\\/)?tmp/.test(buf),
       dock: !!document.querySelector('.session-card'),
       host: !!document.querySelector('.term-host'),
+      lightComposerPalette,
     }
   })()`)
   console.log('TERMINAL=' + JSON.stringify(term))
@@ -644,6 +650,54 @@ app.whenReady().then(async () => {
     }
   })()`)
   console.log('ACTIVITY_UI=' + JSON.stringify(activityUi))
+
+  // 7c) prompts typed while an ACP turn is active coalesce into ONE ordered
+  //     follow-up and drain without relying on a React re-render after a ref
+  //     flips. This regresses the two-item queue that used to remain stranded.
+  const promptQueue = await win.webContents.executeJavaScript(`(async () => {
+    const get = () => window.__kaisola.getState()
+    const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
+    const tid = get().activeThreadId
+    get().setWorkspace('/tmp/pasola-smoke')
+    get().setAssistantThreadAgent(tid, 'mock')
+    get().resetAssistantRuntime(tid)
+    get().setDockView(tid)
+    await wait(220)
+    get().setAssistantDraft(tid, { text: '[queue-smoke-hold] first turn', attachments: [], mentions: [], speed: 'default' })
+    await wait(80)
+    const assistant = document.querySelector('.assistant[data-thread-id="' + tid + '"]')
+    const send = assistant?.querySelector('.composer-send:not(.composer-stop)')
+    send?.click()
+    let started = false
+    for (let i = 0; i < 50; i++) {
+      if (get().assistantThreads.find((thread) => thread.id === tid)?.busy) { started = true; break }
+      await wait(40)
+    }
+    get().enqueueAssistantPrompt(tid, { text: 'queue-smoke-second', attachments: [], mentions: [], speed: 'default' })
+    get().enqueueAssistantPrompt(tid, { text: 'queue-smoke-third', attachments: [], mentions: [], speed: 'fast' })
+    const queuedTwo = (get().assistantPromptQueues[tid] || []).length === 2
+    for (let i = 0; i < 180; i++) {
+      const state = get()
+      const threadBusy = state.assistantThreads.find((thread) => thread.id === tid)?.busy
+      const turns = state.assistantRuntimes[tid]?.turns || []
+      const delivered = turns.some((turn) => turn.kind === 'assistant' && turn.text.includes('queue-smoke-second') && turn.text.includes('queue-smoke-third'))
+      if (!threadBusy && !(state.assistantPromptQueues[tid] || []).length && delivered) break
+      await wait(50)
+    }
+    const state = get()
+    const turns = state.assistantRuntimes[tid]?.turns || []
+    const users = turns.filter((turn) => turn.kind === 'user')
+    const combined = users.filter((turn) => turn.text.includes('queue-smoke-second') && turn.text.includes('queue-smoke-third'))
+    return {
+      started,
+      queuedTwo,
+      drained: !(state.assistantPromptQueues[tid] || []).length && !state.assistantThreads.find((thread) => thread.id === tid)?.busy,
+      combinedOnce: users.length === 2 && combined.length === 1 && combined[0].text.indexOf('queue-smoke-second') < combined[0].text.indexOf('queue-smoke-third'),
+      deliveredTogether: turns.some((turn) => turn.kind === 'assistant' && turn.text.includes('queue-smoke-second') && turn.text.includes('queue-smoke-third')),
+      newestSpeedWon: turns.some((turn) => turn.kind === 'assistant' && turn.text.includes('Kaisola speed: Fast') && turn.text.includes('queue-smoke-third')),
+    }
+  })()`)
+  console.log('PROMPT_QUEUE=' + JSON.stringify(promptQueue))
 
   // 8) persistence — the store writes to the durable main-process DB (SQLite,
   //    JSON fallback). Verify the blob round-trips + which backend is active.
@@ -2687,7 +2741,7 @@ a^2 + b^2 = c^2
     !rootChildren || !minimalShell.noWorkflowSidebar || !minimalShell.railHiddenByDefault || !minimalShell.hasSessions || !minimalShell.railFilesOnly || !minimalShell.hasEmptyLauncher || !minimalShell.stageFiles || !minimalShell.studioDefault || !minimalShell.floatingTools || !claudePrepared || !nativeWindow.rendererClippedMaterial || !icon.exists || !icon.usable || !icon.square || !icon.large || !glass.appSamplingLayer || !glass.chromeGlass || !glass.activeTintWhite || !glass.railLayerFlattened || !glass.contentGlassy || !glass.sessionGlassy || !glass.termGlassTint || !glass.blurKeepsGlass || !glass.lightsGray || !glass.nativeWindowRounding ||
     !emptyOk || !demoOk ||
     !review.opened || !review.closed || !review.decided ||
-    !term.run || !term.ptyOk || !term.cdWorks || !term.dock || !term.host ||
+    !term.run || !term.ptyOk || !term.cdWorks || !term.dock || !term.host || !term.lightComposerPalette ||
     !model.shape || !model.graceful ||
     !acp.connect || !acp.ok || !acp.claudeTerminal || !acp.ranCommand || acp.termEvents < 1 || !acp.cancelOk ||
     acp.authCount < 1 || !acp.authOk || !acp.authUrlSeen || !acp.setModelOk || acp.modelAfter !== 'mock-mini' ||
@@ -2697,6 +2751,7 @@ a^2 + b^2 = c^2
     !permrules.saved || !permrules.cascaded || !permrules.autoAnswered || !permrules.rejectCascade ||
     !sensitive.surfaced || !sensitive.stillPending || !sensitive.diffFlagged || sensitive.pendingAfter !== 0 ||
     !activityUi.card || !activityUi.hasSubagent || !activityUi.hasTerminal || !activityUi.hasStatus || !activityUi.openBtn || !activityUi.noContext || !activityUi.noMention || !activityUi.compactChrome || !activityUi.overflow ||
+    !promptQueue.started || !promptQueue.queuedTwo || !promptQueue.drained || !promptQueue.combinedOnce || !promptQueue.deliveredTogether || !promptQueue.newestSpeedWon ||
     !persist.stored || !persist.hasTheme || !persist.hasAgent || !persist.hasThread || !persist.hasChatTurn || !persist.hasDraft || !persist.draftBounded || !persist.hasCodexEffort ||
     !boot.hasId || !boot.ran ||
     !auth.hasUrl || auth.code !== 'ABCD-1234' || !auth.done ||

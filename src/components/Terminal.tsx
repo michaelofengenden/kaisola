@@ -40,7 +40,9 @@ const LIGHT_THEME: ITheme = {
   cursor: '#21242b',
   cursorAccent: '#e9ebef',
   selectionBackground: 'rgba(94,112,48,0.18)',
-  black: '#2a2d34',
+  // TUIs use ANSI black as a panel/composer BACKGROUND. On a light surface it
+  // must invert to paper; xterm's contrast floor remaps black foreground text.
+  black: '#eef0f4',
   brightBlack: '#8b909d',
   red: '#cf4f4f',
   green: '#2f9e6b',
@@ -859,11 +861,14 @@ export function Terminal({ id, attach = false, boot, cwd }: { id: string; attach
     )
   }
   const promptMarks = promptMarksRef.current.filter((p) => !p.marker.isDisposed)
+  const livePalette = xtermTheme(theme, ecoMode, termCursorColor, termBackground)
   return (
     <div
       className="term-wrap"
       data-rail={promptMarks.length > 1 || undefined}
       data-file-drop={fileDropHover || undefined}
+      data-terminal-theme={theme}
+      data-ansi-black={livePalette.black}
       onDragOver={(e) => {
         if (!e.dataTransfer?.types.includes('Files')) return
         e.preventDefault()

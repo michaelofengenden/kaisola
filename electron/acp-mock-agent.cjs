@@ -91,6 +91,9 @@ function dispatch(msg) {
 async function handlePrompt(reqId, params) {
   const sid = params.sessionId
   const prompt = (params.prompt || []).map((b) => b.text || '').join(' ')
+  // Gives the renderer smoke test a deterministic busy window in which to
+  // enqueue multiple follow-ups. Production agents naturally have this gap.
+  if (prompt.includes('[queue-smoke-hold]')) await new Promise((resolve) => setTimeout(resolve, 350))
   // "plan" anywhere in the prompt → exercise the plan + diff-artifact frames
   // (the renderer's PlanStrip and tool-call disclosures; smoke drives this)
   if (/\bplan\b/i.test(prompt)) {

@@ -92,6 +92,28 @@ const doneStatuses = new Set(['completed', 'failed', 'cancelled', 'canceled'])
 const STREAM_FLUSH_MS = 80
 const EMPTY_DRAFT: AssistantDraft = { text: '', attachments: [], mentions: [], speed: 'default' }
 const EMPTY_QUEUE: QueuedAssistantPrompt[] = []
+/** Messages typed during one active turn are one piece of steering. Preserve
+ * their order, de-duplicate shared context, and use the newest speed choice. */
+const mergeQueuedPrompts = (queue: QueuedAssistantPrompt[]): AssistantDraft => {
+  const mentionKeys = new Set<string>()
+  const mergedMentions: AssistantMention[] = []
+  for (const prompt of queue) {
+    for (const mention of prompt.mentions) {
+      const key = `${mention.kind}\u0000${mention.id}`
+      if (mentionKeys.has(key)) continue
+      mentionKeys.add(key)
+      mergedMentions.push(mention)
+      if (mergedMentions.length >= 64) break
+    }
+    if (mergedMentions.length >= 64) break
+  }
+  return {
+    text: queue.map((prompt) => prompt.text.trim()).filter(Boolean).join('\n\n'),
+    attachments: [...new Set(queue.flatMap((prompt) => prompt.attachments))].slice(0, 64),
+    mentions: mergedMentions,
+    speed: queue[queue.length - 1]?.speed ?? 'default',
+  }
+}
 const SPEED_OPTIONS = [
   { value: 'default', name: 'Default' },
   { value: 'fast', name: 'Fast' },
@@ -622,7 +644,7 @@ export const Assistant = memo(function Assistant({ threadId }: { threadId: strin
   const setAssistantDraft = useKaisola((s) => s.setAssistantDraft)
   const clearAssistantDraft = useKaisola((s) => s.clearAssistantDraft)
   const enqueueAssistantPrompt = useKaisola((s) => s.enqueueAssistantPrompt)
-  const dequeueAssistantPrompt = useKaisola((s) => s.dequeueAssistantPrompt)
+  const takeAssistantPromptQueue = useKaisola((s) => s.takeAssistantPromptQueue)
   const removeQueuedAssistantPrompt = useKaisola((s) => s.removeQueuedAssistantPrompt)
   const agentKey = active.agentKey
   // Provider sessions are per assistant thread, not merely per provider. Two
@@ -1145,8 +1167,12 @@ export const Assistant = memo(function Assistant({ threadId }: { threadId: strin
     mentions,
     speed,
   })
+  const drainingQueueRef = useRef(false)
+  const queuePausedRef = useRef(false)
   const queuePrompt = (prompt: AssistantDraft) => {
     if (!prompt.text.trim()) return
+    // A fresh user enqueue is an explicit resume after Stop/a delivery error.
+    queuePausedRef.current = false
     enqueueAssistantPrompt(active.id, prompt, undefined, projectId)
     clearAssistantDraft(active.id, { keepSpeed: true }, projectId)
     resetComposerHeight()
@@ -1156,6 +1182,7 @@ export const Assistant = memo(function Assistant({ threadId }: { threadId: strin
     const prompt = currentPrompt()
     if (!prompt.text) return
     if (busy) { queuePrompt(prompt); return }
+    queuePausedRef.current = false
     void sendText(prompt, { clearDraft: true, restoreOnFailure: true })
   }
   /** The composer's send, callable with explicit text (the ⌘L bar uses it). */
@@ -1265,32 +1292,42 @@ export const Assistant = memo(function Assistant({ threadId }: { threadId: strin
     }
     return true
   }
-  const drainingQueueRef = useRef(false)
-  // Queue pause semantics (review findings, 2026-07-09): a pause must always
-  // have a matching resume. Resumes: reconnect, a NEW enqueue (the user
-  // clearly wants the queue live), or a successful manual send. Stop PAUSES
-  // the queue (aborting a turn must not auto-fire the next prompt).
-  const queuePausedRef = useRef(false)
-  const queueLenRef = useRef(queuedPrompts.length)
+  // Queue pause semantics: reconnecting, a new enqueue, or a manual send
+  // resumes; Stop pauses so cancelling never auto-fires the next instruction.
   useEffect(() => { if (connected) queuePausedRef.current = false }, [connected])
-  useEffect(() => {
-    if (queuedPrompts.length > queueLenRef.current) queuePausedRef.current = false // new enqueue resumes
-    queueLenRef.current = queuedPrompts.length
-  }, [queuedPrompts.length])
+  const drainQueuedPrompts = async () => {
+    if (!connected || queuePausedRef.current || drainingQueueRef.current) return
+    drainingQueueRef.current = true
+    try {
+      // Keep ownership in one async loop. A ref alone cannot wake React after
+      // finally; the old one-shot effect therefore stranded item 2 forever.
+      while (!queuePausedRef.current) {
+        const owner = owningSlice()
+        const thread = owner?.assistantThreads.find((candidate) => candidate.id === active.id)
+        const waiting = owner?.assistantPromptQueues[active.id] ?? EMPTY_QUEUE
+        if (!thread || thread.busy || waiting.length === 0) return
+        const batch = takeAssistantPromptQueue(active.id, projectId)
+        if (!batch.length) return
+        const combined = mergeQueuedPrompts(batch)
+        const sent = await sendText(combined)
+        if (!sent) {
+          // Pause BEFORE restoring so the queue-length render cannot race an
+          // immediate retry. A new user enqueue or reconnect resumes it.
+          queuePausedRef.current = true
+          enqueueAssistantPrompt(active.id, combined, { front: true }, projectId)
+          useKaisola.getState().pushToast('warn', `${agentName} queue paused — send or queue a prompt to resume`)
+          return
+        }
+        // Anything typed while that combined prompt ran is now waiting in the
+        // store and is picked up by this same loop without needing a re-render.
+      }
+    } finally {
+      drainingQueueRef.current = false
+    }
+  }
   useEffect(() => {
     if (!connected || busy || queuePausedRef.current || drainingQueueRef.current || queuedPrompts.length === 0) return
-    const next = dequeueAssistantPrompt(active.id, projectId)
-    if (!next) return
-    drainingQueueRef.current = true
-    void sendText(next).then((sent) => {
-      if (!sent) {
-        enqueueAssistantPrompt(active.id, next, { front: true }, projectId)
-        queuePausedRef.current = true
-        useKaisola.getState().pushToast('warn', `${agentName} queue paused — send or queue a prompt to resume`)
-      }
-    }).finally(() => {
-      drainingQueueRef.current = false
-    })
+    void drainQueuedPrompts()
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [connected, busy, queuedPrompts.length, active.id])
   // the ⌘L bar hands prompts to threads through the store — deliver ours once
@@ -1302,6 +1339,7 @@ export const Assistant = memo(function Assistant({ threadId }: { threadId: strin
     useKaisola.getState().clearOmniPrompt()
     const text = omniPrompt.text
     if (busy) {
+      queuePausedRef.current = false
       enqueueAssistantPrompt(active.id, { ...EMPTY_DRAFT, text: text.trim(), speed }, undefined, projectId)
       useKaisola.getState().pushToast('info', `Queued prompt for ${agentName}`)
       return
@@ -1310,6 +1348,7 @@ export const Assistant = memo(function Assistant({ threadId }: { threadId: strin
       // never swallow a ⌘L prompt: a race-y busy flip QUEUES it (review
       // finding #4 — it used to be dropped with a misleading toast)
       if (!sent) {
+        queuePausedRef.current = false
         enqueueAssistantPrompt(active.id, { ...EMPTY_DRAFT, text: text.trim(), speed }, undefined, projectId)
         useKaisola.getState().pushToast('info', `Queued prompt for ${agentName}`)
       }
@@ -1341,6 +1380,7 @@ export const Assistant = memo(function Assistant({ threadId }: { threadId: strin
   return (
     <div
       className="assistant"
+      data-thread-id={active.id}
       data-rail={prompts.length > 1 || undefined}
       data-file-drop={fileDropHover || undefined}
       onDragOver={(e) => {
@@ -1529,7 +1569,7 @@ export const Assistant = memo(function Assistant({ threadId }: { threadId: strin
         {queuedPrompts.length > 0 && (
           <div className="composer-queue">
             <span className="composer-queue-label">
-              <Icon name="ListChecks" size={11} /> {queuedPrompts.length} queued
+              <Icon name="ListChecks" size={11} /> {queuedPrompts.length} queued{queuedPrompts.length > 1 ? ' · sends together' : ''}
             </span>
             {queuedPrompts.slice(0, 4).map((q) => (
               <span key={q.id} className="queue-chip" title={q.text}>

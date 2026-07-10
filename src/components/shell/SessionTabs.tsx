@@ -37,6 +37,10 @@ export function SessionTabs() {
   const panels = useKaisola((s) => s.panels)
   const terminalMeta = useKaisola((s) => s.terminalMeta)
   const workspacePath = useKaisola((s) => s.workspacePath)
+  const activeProjectId = useKaisola((s) => s.activeProjectId)
+  // Select the active object by reference rather than the whole project array:
+  // background project activity dots can update without repainting this shelf.
+  const activeProject = useKaisola((s) => s.projectTabs.find((project) => project.id === s.activeProjectId))
   const sessionGroups = useKaisola((s) => s.sessionGroups)
   const pinnedSessions = useKaisola((s) => s.pinnedSessions)
   const needsYou = useKaisola((s) => s.needsYou)
@@ -63,6 +67,14 @@ export function SessionTabs() {
   const removeWorktreeSession = useKaisola((s) => s.removeWorktreeSession)
   const proposeWorktreeSession = useKaisola((s) => s.proposeWorktreeSession)
   const { all: agents } = useAgentRegistry()
+
+  // Repeat the active project's identity on the session shelf. Project tabs
+  // and session tabs remain separate controls, but now read as a clear parent
+  // and child instead of two unrelated rows of pills.
+  const projectLabel = activeProject?.title
+    ?? activeProject?.workspacePath?.split('/').filter(Boolean).pop()
+    ?? 'New Project'
+  const projectHue = activeProject?.color ?? activeProject?.hue ?? 'var(--accent)'
 
   const [editing, setEditing] = useState<string | null>(null)
   const [editValue, setEditValue] = useState('')
@@ -175,7 +187,17 @@ export function SessionTabs() {
   const menuPorts = menu ? terminalMeta[menu.id]?.ports ?? [] : []
 
   return (
-    <div className="stabs" role="tablist" data-single={order.length === 1 || undefined}>
+    <div
+      className="stabs"
+      role="tablist"
+      aria-label={`${projectLabel} sessions`}
+      data-project-id={activeProjectId}
+      data-single={order.length === 1 || undefined}
+      style={{ '--project-hue': projectHue } as CSSProperties}
+    >
+      <span className="stabs-project-anchor" aria-hidden="true" title={`${projectLabel} sessions`}>
+        <Icon name="CornerDownRight" size={11} />
+      </span>
       <div className="stabs-track">
         {order
           .map((id) => tabs.get(id))

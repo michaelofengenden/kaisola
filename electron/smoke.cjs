@@ -1832,6 +1832,38 @@ a^2 + b^2 = c^2
   })()`)
   console.log('MINIMAL_UI=' + JSON.stringify(minimalUi))
 
+  // 14b) project/session hierarchy: the lower row is an inset shelf carrying
+  //      the active project's identity, while session tabs retain their own
+  //      hue. The shelf stays a static paint surface (no new backdrop blur).
+  const sessionShelf = await win.webContents.executeJavaScript(`(() => {
+    const project = document.querySelector('.ptab[data-active="true"]')
+    const shelf = document.querySelector('.stabs')
+    const marker = shelf?.querySelector('.stabs-project-anchor')
+    const session = shelf?.querySelector('.stab')
+    const grid = document.querySelector('.session-grid')
+    if (!project || !shelf || !marker || !session || !grid) return { rendered: false }
+    const projectHue = project.style.getPropertyValue('--ptab-hue').trim()
+    const shelfHue = shelf.style.getPropertyValue('--project-hue').trim()
+    const shelfStyle = getComputedStyle(shelf)
+    const projectRect = project.getBoundingClientRect()
+    const shelfRect = shelf.getBoundingClientRect()
+    const sessionRect = session.getBoundingClientRect()
+    const gridRect = grid.getBoundingClientRect()
+    return {
+      rendered: true,
+      projectLinked: !!projectHue && projectHue === shelfHue,
+      projectIdLinked: shelf.dataset.projectId === project.dataset.projectId,
+      accessible: /sessions$/i.test(shelf.getAttribute('aria-label') || ''),
+      nestedMarker: marker.getBoundingClientRect().width >= 16,
+      inset: shelfRect.left > gridRect.left,
+      tiered: projectRect.height > sessionRect.height || document.querySelectorAll('.ptab').length === 1,
+      surfaced: shelfStyle.backgroundImage !== 'none' && shelfStyle.borderTopWidth !== '0px',
+      staticPaint: !shelfStyle.backdropFilter || shelfStyle.backdropFilter === 'none',
+      sessionIdentity: !!session.style.getPropertyValue('--sid').trim(),
+    }
+  })()`)
+  console.log('SESSION_SHELF=' + JSON.stringify(sessionShelf))
+
   // 15) settings exposes the appearance/layout configuration
   const settings = await win.webContents.executeJavaScript(`(async () => {
     window.__kaisola.getState().setSettingsOpen(true)
@@ -3070,6 +3102,7 @@ a^2 + b^2 = c^2
     !toggle.hasFig || !toggle.visibleAtRest || !toggle.putAway || !toggle.back || !toggle.hidesAll ||
     !autoname.named || !autoname.rowShows || !autoname.sticky || !autoname.manualWins || !autoname.termNamed ||
     !minimalUi.noSidebar || !minimalUi.noSidebarResize || !minimalUi.noStageNav || !minimalUi.hasRail || !minimalUi.hasPlus || !minimalUi.hasFiles ||
+    !sessionShelf.rendered || !sessionShelf.projectLinked || !sessionShelf.projectIdLinked || !sessionShelf.accessible || !sessionShelf.nestedMarker || !sessionShelf.inset || !sessionShelf.tiered || !sessionShelf.surfaced || !sessionShelf.staticPaint || !sessionShelf.sessionIdentity ||
     !settings.hasAppearance || !settings.hasUsage || !settings.hasDiskResidency || !settings.hasFilesButton || !settings.noSidebarControls || !settings.previewOpened || !settings.previewDismissed || !settings.usagePreviewOpened || !settings.usagePreviewDismissed ||
     !extensionsUi.opened || extensionsUi.cards < 8 || !extensionsUi.hasFilters || !extensionsUi.csvInstalled || !extensionsUi.jsonInstalled ||
     !extensionsUi.persisted || !extensionsUi.defaultUninstallPersisted || !extensionsUi.csvPreview || !extensionsUi.jsonPreview || !extensionsUi.boundedJsonPreview || !extensionsUi.closed ||

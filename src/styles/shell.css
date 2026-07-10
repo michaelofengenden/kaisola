@@ -269,20 +269,34 @@
   --ptab-bg: color-mix(in srgb, var(--bg-1) 96%, transparent);
   background: var(--ptab-bg);
   color: var(--text-0);
-  border-color: var(--border-faint);
+  border-color: color-mix(in srgb, var(--ptab-hue, var(--accent)) 20%, var(--border-faint));
   box-shadow: var(--shadow-1);
+}
+/* A short project-hue key is repeated on the child session shelf below. It
+   establishes hierarchy without joining the two rows with a large container
+   or adding another blur/compositor layer. */
+.ptab[data-active='true']::after {
+  content: '';
+  position: absolute;
+  left: var(--sp-4);
+  bottom: 2px;
+  width: 22px;
+  height: 2px;
+  border-radius: var(--r-full);
+  background: color-mix(in srgb, var(--ptab-hue, var(--accent)) 70%, transparent);
+  pointer-events: none;
 }
 /* dark glass is near-black ink — a bg-1 fill vanished into it (the "which
    tab am I on" bug). Fill with the raised layer and let the border speak. */
 :root[data-theme='dark'] .ptab[data-active='true'] {
   --ptab-bg: color-mix(in srgb, var(--bg-3) 94%, transparent);
-  border-color: var(--border-strong);
+  border-color: color-mix(in srgb, var(--ptab-hue, var(--accent)) 24%, var(--border-strong));
 }
 /* light needs the SAME border strength (it silently fell through to
    border-faint — the measured reason light tabs read washed-out) plus a
    touch more shadow than the 6%-alpha shared token gives */
 :root[data-theme='light'] .ptab[data-active='true'] {
-  border-color: var(--border-strong);
+  border-color: color-mix(in srgb, var(--ptab-hue, var(--accent)) 20%, var(--border-strong));
   box-shadow: 0 1px 3px rgba(16, 18, 22, 0.1), 0 1px 1px rgba(16, 18, 22, 0.06);
 }
 /* One project does not need a full browser tab treatment. Keep its name and
@@ -304,6 +318,12 @@
   color: var(--text-0);
   background: var(--hover-overlay);
   border-color: transparent;
+}
+.tabstrip[data-single='true'] .ptab[data-active='true']::after {
+  left: var(--sp-3);
+  bottom: 1px;
+  width: 16px;
+  opacity: 0.72;
 }
 .tabstrip[data-single='true'] .ptab-close { opacity: 0; }
 .tabstrip[data-single='true'] .ptab:hover .ptab-close { opacity: 1; }
@@ -1015,7 +1035,7 @@
   min-height: 0;
   display: flex;
   flex-direction: column;
-  gap: var(--sp-3);
+  gap: var(--sp-2);
 }
 /* cards arrange on a grid — columns side by side, stacks within a column;
    the template comes inline from dockGrid */
@@ -1033,9 +1053,23 @@
 .stabs {
   display: flex;
   align-items: center;
-  gap: 2px;
-  height: 30px;
+  gap: 3px;
+  height: 34px;
+  min-width: 0;
+  margin: 0 4px 0 6px;
+  padding: 3px 5px 3px 7px;
   flex-shrink: 0;
+  border: 1px solid color-mix(in srgb, var(--project-hue, var(--accent)) 18%, var(--border-faint));
+  border-top-color: color-mix(in srgb, var(--project-hue, var(--accent)) 28%, var(--border-faint));
+  border-radius: var(--r-3);
+  background: linear-gradient(
+    90deg,
+    color-mix(in srgb, var(--project-hue, var(--accent)) 8%, var(--bg-1)),
+    color-mix(in srgb, var(--bg-1) 90%, transparent) 72%
+  );
+  box-shadow:
+    inset 2px 0 0 color-mix(in srgb, var(--project-hue, var(--accent)) 42%, transparent),
+    0 1px 2px color-mix(in srgb, var(--text-0) 5%, transparent);
   -webkit-app-region: drag; /* the leftover strip space drags the window */
 }
 .stab,
@@ -1047,6 +1081,7 @@
   display: flex;
   align-items: center;
   gap: 2px;
+  flex: 0 1 auto;
   min-width: 0;
   overflow-x: auto;
   scrollbar-width: none;
@@ -1054,16 +1089,29 @@
 .stabs-track::-webkit-scrollbar {
   display: none;
 }
-/* a tab: sits at 150px, shrinks to 48px, then the track scrolls */
+/* The small turn-in marker makes the project → session nesting legible even
+   when colors are muted or the user has several similarly colored projects. */
+.stabs-project-anchor {
+  width: 18px;
+  height: 22px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: 0 0 18px;
+  color: color-mix(in srgb, var(--project-hue, var(--accent)) 72%, var(--text-2));
+  border-right: 1px solid color-mix(in srgb, var(--project-hue, var(--accent)) 24%, transparent);
+  pointer-events: none;
+}
+/* a tab: sits at 144px, shrinks to 48px, then the track scrolls */
 .stab {
   flex: 0 1 auto;
-  width: 150px; /* intrinsic (not flex-basis): the track measures max-content */
+  width: 144px; /* intrinsic (not flex-basis): the track measures max-content */
   min-width: 48px;
   max-width: 190px;
   display: flex;
   align-items: center;
   gap: var(--sp-2);
-  height: 28px;
+  height: 26px;
   padding: 0 var(--sp-3);
   border-radius: var(--r-2);
   /* a real border slot on every state — transparent when idle so nothing
@@ -1084,7 +1132,7 @@
 .stab[data-active='true'] {
   background: color-mix(in srgb, var(--bg-1) 94%, transparent);
   color: var(--text-0);
-  border-color: var(--border-strong);
+  border-color: color-mix(in srgb, var(--sid, var(--accent)) 20%, var(--border-strong));
   box-shadow: var(--shadow-1);
 }
 /* same ink-on-ink rescue as the project tabs: dark bg-1 ≈ the dark rail veil */
@@ -1094,7 +1142,7 @@
 /* A lone session is the remaining identity label when its redundant pane head
    disappears. Render it as a compact crumb instead of a second raised tab. */
 .stabs[data-single='true'] {
-  height: 27px;
+  height: 32px;
 }
 .stabs[data-single='true'] .stab {
   width: auto;
@@ -1111,6 +1159,13 @@
   color: var(--text-0);
   background: var(--hover-overlay);
   border-color: transparent;
+}
+:root[data-perf='eco'] .stabs {
+  background: linear-gradient(
+    90deg,
+    color-mix(in srgb, var(--project-hue, var(--accent)) 6%, var(--bg-1)),
+    var(--bg-1) 72%
+  );
 }
 /* identity lives in the ICON's hue (below), matching the project tabs — the
    2px colored top edge read as a stray streak on the pill and is gone.

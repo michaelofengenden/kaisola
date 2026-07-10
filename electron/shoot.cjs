@@ -147,6 +147,19 @@ app.whenReady().then(async () => {
       const st = window.__kaisola.getState()
       const term = st.terminals[st.terminals.length - 1].id
       st.placeDockView(term, st.activeThreadId, 'bottom')
+      // Keep the hero shot representative of the two-tier navigation: one
+      // active project owns the session shelf while background projects show
+      // independent activity states in the calmer parent row.
+      st.renameProjectTab(st.activeProjectId, 'Kaisola')
+      st.setProjectColor(st.activeProjectId, '#6376d9')
+      const docs = st.newProject({ path: null, focus: false })
+      st.renameProjectTab(docs, 'Docs')
+      st.setProjectColor(docs, '#52a96b')
+      st.setProjectActivity(docs, 'running')
+      const experiments = st.newProject({ path: null, focus: false })
+      st.renameProjectTab(experiments, 'Experiments')
+      st.setProjectColor(experiments, '#d18a55')
+      st.setProjectActivity(experiments, 'completed')
     })()`)
     // the toast-pass toasts must not linger into the hero shots
     await js(`(() => { const s = window.__kaisola.getState(); for (const t of s.toasts) s.dismissToast(t.id) })()`)

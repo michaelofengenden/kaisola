@@ -1,6 +1,6 @@
 import { useCallback, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
-import { useKaisola } from '../../store/store'
+import { useKaisola, dockShowsLiveCard } from '../../store/store'
 import { Icon } from '../Icon'
 import { LimitsButton } from './LimitsButton'
 import { openExtensionsCenter } from '../../lib/extensions'
@@ -15,7 +15,9 @@ export function ShellTools() {
   const layoutMode = useKaisola((s) => s.layoutMode)
   const toggleLayoutMode = useKaisola((s) => s.toggleLayoutMode)
   const openPalette = useKaisola((s) => s.openPalette)
-  const dockOpen = useKaisola((s) => s.dockOpen)
+  // label from the same predicate toggleDock decides with — dockOpen alone
+  // lies over a stale/empty grid ("Hide sessions" on an invisible dock)
+  const dockVisible = useKaisola((s) => s.dockOpen && dockShowsLiveCard(s))
   const toggleDock = useKaisola((s) => s.toggleDock)
   const canvasOpen = useKaisola((s) => s.canvasOpen)
   const toggleCanvas = useKaisola((s) => s.toggleCanvas)
@@ -63,7 +65,7 @@ export function ShellTools() {
               <kbd>⌘⇧F</kbd>
             </button>
             <button className="tree-menu-item" onClick={() => act(toggleDock)}>
-              <Icon name="SquareTerminal" size={13} /> {dockOpen && layoutMode === 'studio' ? 'Hide sessions' : 'Show sessions'}
+              <Icon name="SquareTerminal" size={13} /> {dockVisible && layoutMode === 'studio' ? 'Hide sessions' : 'Show sessions'}
               <kbd>⌘J</kbd>
             </button>
             <div className="tree-menu-sep" />

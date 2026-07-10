@@ -217,6 +217,8 @@ export interface AcpAgent {
   mcpHttp?: boolean
   canLoadSession?: boolean
   promptImages?: boolean
+  /** Native prompt queueing → mid-turn steering is available for this agent. */
+  promptQueue?: boolean
   busy?: boolean
   autonomy?: string
 }
@@ -555,6 +557,9 @@ export interface KaisolaBridge {
     setConfigOption(agentKey: string, configId: string, value: string): Promise<{ ok: boolean; message?: string }>
     authenticate(agentKey: string, methodId: string): Promise<{ ok: boolean; pending?: boolean; message?: string }>
     prompt(agentKey: string, text: string, onUpdate: (u: AcpUpdate) => void, images?: { mimeType: string; data: string }[], scope?: string): Promise<{ ok: boolean; stopReason?: string; message?: string }>
+    /** Inject a follow-up into an agent's already-running turn (mid-turn steer).
+     * `unsupported`/`noTurn` signal the caller to fall back to normal enqueue. */
+    steer(agentKey: string, text: string, images?: { mimeType: string; data: string }[], scope?: string): Promise<{ ok: boolean; stopReason?: string; message?: string; unsupported?: boolean; noTurn?: boolean }>
     onNotice(cb: (n: AcpNotice) => void): () => void
     onControls(cb: (info: { key: string; controls: AcpControls }) => void): () => void
     onTerminal(cb: (info: AcpTerminalInfo) => void): () => void
@@ -891,6 +896,9 @@ const webMock: KaisolaBridge = {
       return { ok: false, message: DESKTOP_ONLY }
     },
     async prompt() {
+      return { ok: false, message: DESKTOP_ONLY }
+    },
+    async steer() {
       return { ok: false, message: DESKTOP_ONLY }
     },
     onNotice() {
@@ -1295,6 +1303,7 @@ function scopeAcp(acp: KaisolaBridge['acp']): KaisolaBridge['acp'] {
     setConfigOption: (k, c, v) => acp.setConfigOption(scopedKey(k), c, v),
     authenticate: (k, m) => acp.authenticate(scopedKey(k), m),
     prompt: (k, text, onUpdate, images, scope) => acp.prompt(scopedKeyFor(k, scope), text, onUpdate, images),
+    steer: (k, text, images, scope) => acp.steer(scopedKeyFor(k, scope), text, images),
     onNotice: (cb) =>
       acp.onNotice((n) => {
         const { key, scope } = splitScopedKey(n.key)

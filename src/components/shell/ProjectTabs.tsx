@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState, type CSSProperties } from 'react'
 import { createPortal } from 'react-dom'
+import { useShallow } from 'zustand/react/shallow'
 import { useKaisola, GROUP_COLORS } from '../../store/store'
 import { bridge } from '../../lib/bridge'
 import { useUpdateState } from '../../lib/updates'
@@ -28,13 +29,42 @@ export function ProjectTabs() {
   // Derive activity for EVERY project, including parked slices. Previously a
   // tab only received `running` after it was already in the background, so the
   // common flow (start agent → switch tab) lost its dot entirely.
-  const projectSlices = useKaisola((s) => s.projectSlices)
-  const terminalMeta = useKaisola((s) => s.terminalMeta)
-  const activeTerminals = useKaisola((s) => s.terminals)
-  const activeAgentTerminals = useKaisola((s) => s.agentTerminals)
-  const activeThreads = useKaisola((s) => s.assistantThreads)
-  const activeNeedsYou = useKaisola((s) => s.needsYou)
-  const activePermissions = useKaisola((s) => s.pendingPermissions)
+  // ONE shallow-compared array of derived states, not raw slice/meta
+  // subscriptions: projectSlices and terminalMeta change identity on every
+  // feed line and pty tick, which re-rendered the whole strip during streams.
+  const tabStates = useKaisola(
+    useShallow((s) =>
+      s.projectTabs.map((tab) => {
+        const slice = tab.id === s.activeProjectId
+          ? {
+              terminals: s.terminals,
+              agentTerminals: s.agentTerminals,
+              assistantThreads: s.assistantThreads,
+              needsYou: s.needsYou,
+              pendingPermissions: s.pendingPermissions,
+            }
+          : s.projectSlices[tab.id]
+        const running = !!slice && (
+          slice.terminals.some((terminal) => terminalAgentKey(terminal.singletonKey)
+            ? (s.terminalMeta[terminal.id]?.agentBusy ?? s.terminalMeta[terminal.id]?.running)
+            : s.terminalMeta[terminal.id]?.running) ||
+          slice.agentTerminals.some((terminal) => s.terminalMeta[terminal.terminalId]?.running) ||
+          slice.assistantThreads.some((thread) => thread.busy)
+        )
+        const needsAttention = !!slice?.pendingPermissions.length
+        const unread = !!slice && Object.keys(slice.needsYou).length > 0
+        return needsAttention || tab.activity === 'needs-you'
+          ? 'needs-you'
+          : tab.activity === 'failed'
+            ? 'failed'
+            : running
+              ? 'running'
+              : unread
+                ? 'completed'
+                : tab.activity ?? ''
+      }),
+    ),
+  )
   const switchProject = useKaisola((s) => s.switchProject)
   const closeProject = useKaisola((s) => s.closeProject)
   const reorderProjects = useKaisola((s) => s.reorderProjects)
@@ -83,37 +113,11 @@ export function ProjectTabs() {
       <WindowLights />
       <RailToggle />
       <div className="tabstrip-track" role="tablist" ref={trackRef} onScroll={syncFade}>
-        {tabs.map((tab) => {
+        {tabs.map((tab, i) => {
           const active = tab.id === activeId
           const label = tabLabel(tab)
           const loneEmpty = tabs.length === 1 && !tab.workspacePath
-          const slice = active
-            ? {
-                terminals: activeTerminals,
-                agentTerminals: activeAgentTerminals,
-                assistantThreads: activeThreads,
-                needsYou: activeNeedsYou,
-                pendingPermissions: activePermissions,
-              }
-            : projectSlices[tab.id]
-          const running = !!slice && (
-            slice.terminals.some((terminal) => terminalAgentKey(terminal.singletonKey)
-              ? (terminalMeta[terminal.id]?.agentBusy ?? terminalMeta[terminal.id]?.running)
-              : terminalMeta[terminal.id]?.running) ||
-            slice.agentTerminals.some((terminal) => terminalMeta[terminal.terminalId]?.running) ||
-            slice.assistantThreads.some((thread) => thread.busy)
-          )
-          const needsAttention = !!slice?.pendingPermissions.length
-          const unread = !!slice && Object.keys(slice.needsYou).length > 0
-          const state = needsAttention || tab.activity === 'needs-you'
-            ? 'needs-you'
-            : tab.activity === 'failed'
-              ? 'failed'
-              : running
-                ? 'running'
-                : unread
-                  ? 'completed'
-                  : tab.activity
+          const state = tabStates[i] || undefined
           return (
             <div
               key={tab.id}

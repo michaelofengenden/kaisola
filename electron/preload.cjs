@@ -64,6 +64,10 @@ const bridge = {
       p.finally(() => setTimeout(() => ipcRenderer.removeListener(chan, listener), 3000)) // safety net
       return p
     },
+    /** Mid-turn steer: inject a follow-up into the ALREADY-RUNNING turn. No new
+     * channel — its output rides the active prompt()'s stream. Rejects (ok:false,
+     * unsupported/noTurn) when the agent can't queue or nothing is running. */
+    steer: (agentKey, text, images) => ipcRenderer.invoke('acp:steer', { agentKey, text, images }),
     onNotice: (cb) => {
       const listener = (_e, n) => cb(n)
       ipcRenderer.on('acp:notice', listener)

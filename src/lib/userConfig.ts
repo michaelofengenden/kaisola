@@ -25,7 +25,8 @@ export const SETTINGS_TEMPLATE = `// Kaisola settings — applied on launch and 
   // "inbox": true,                          // cross-project needs-you inbox in the tab strip
   // "draftRestore": true,                   // retype saved CLI drafts after restart
   // "wallpaperTint": true,                  // wallpaper-sampled chrome tinting
-  // "autonomy": "propose",                  // observe | propose | execute | sprint
+  // "autonomy": "propose",                  // this project: observe | propose | execute | sprint
+  // "defaultAutonomy": "propose",           // every NEW project starts here (execute/sprint auto-allow)
   // "enabledAgents": ["claude-code", "codex", "opencode"],
   // "customAgents": [{ "id": "custom-my", "name": "My agent", "kind": "terminal", "command": "my-cli", "args": [] }],
   // "sensitiveGlobs": ["**/.env*", "**/*.pem"],
@@ -114,6 +115,9 @@ function applySettings(raw: unknown) {
   if (typeof cfg.wallpaperTint === 'boolean') s.setWallpaperTint(cfg.wallpaperTint)
   if (typeof cfg.autonomy === 'string' && ['observe', 'propose', 'execute', 'sprint'].includes(cfg.autonomy)) {
     s.setAutonomy(cfg.autonomy as AutonomyLevel)
+  }
+  if (typeof cfg.defaultAutonomy === 'string' && ['observe', 'propose', 'execute', 'sprint'].includes(cfg.defaultAutonomy)) {
+    s.setDefaultAutonomy(cfg.defaultAutonomy as AutonomyLevel)
   }
   if (Array.isArray(cfg.enabledAgents) && cfg.enabledAgents.every((x) => typeof x === 'string')) {
     useKaisola.setState({ enabledAgents: cfg.enabledAgents as string[] })

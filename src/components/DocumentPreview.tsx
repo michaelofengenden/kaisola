@@ -33,11 +33,8 @@ function escapeRegExp(value: string) {
   return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
 }
 
-export function countMatches(text: string, query: string) {
-  const q = query.trim()
-  if (!q) return 0
-  return text.match(new RegExp(escapeRegExp(q), 'gi'))?.length ?? 0
-}
+// countMatches lives in lib/format.ts — importing it from here would drag
+// this whole lazy markdown chunk back into the main bundle.
 
 function highlightText(value: string, query: string): ReactNode {
   const q = query.trim()

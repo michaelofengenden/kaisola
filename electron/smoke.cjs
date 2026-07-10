@@ -191,8 +191,9 @@ app.whenReady().then(async () => {
     // fresh installs open on the canvas alone (Traycer-style quiet start) —
     // the rail is summoned with ⌘B / the strip's panel button
     railHiddenByDefault: !document.querySelector('.wsrail'),
-    // sessions live ONLY in the tab strip — the rail is the project's files
-    hasSessions: document.querySelectorAll('.stabs .stab').length >= 2,
+    // sessions live ONLY in the tab strip — the rail is the project's files.
+    // the fresh shell is ONE session (the seed terminal; chats are opt-in)
+    hasSessions: document.querySelectorAll('.stabs .stab').length >= 1,
     railFilesOnly: document.querySelectorAll('.wsrail .session-row').length === 0,
     // with no workspace bound (fresh empty tab) the canvas shows the project
     // launcher (open-a-folder empty state), not the file view.
@@ -537,7 +538,10 @@ app.whenReady().then(async () => {
     await window.kaisola.fs.write(markerFile, '')
     st.setLayoutMode('studio')
     st.requestTerminal("printf 'boot-once\\n' >> " + markerFile, { name: 'Hibernate smoke' })
-    const id = st.terminals[st.terminals.length - 1].id
+    // fresh read — \`st\` predates the requestTerminal set(), so its stale
+    // terminals array would point this whole probe at whatever terminal
+    // happened to be last BEFORE the hibernate one was created
+    const id = window.__kaisola.getState().terminals.find((t) => t.name === 'Hibernate smoke').id
     st.setDockView(id)
     const originalHidden = Object.getOwnPropertyDescriptor(document, 'hidden')
     let forcedHidden = false
@@ -658,6 +662,8 @@ app.whenReady().then(async () => {
   //    you can actually pick another chat agent — terminal-only agents stay in
   //    the session + menu instead.
   const dd = await win.webContents.executeJavaScript(`(async () => {
+    // the fresh shell seeds no chat thread — this probe tests the thread UI
+    if (!window.__kaisola.getState().assistantThreads.length) window.__kaisola.getState().requestNewThread()
     window.__kaisola.getState().setLayoutMode('studio')
     window.__kaisola.getState().setDock(true, 'assistant')
     await new Promise((r) => setTimeout(r, 200))
@@ -741,6 +747,8 @@ app.whenReady().then(async () => {
   // 7b) current agent work is ONE compact live line (the transcript owns
   //     history); subagents and live terminals remain directly reachable.
   const activityUi = await win.webContents.executeJavaScript(`(async () => {
+    // the fresh shell seeds no chat thread — this probe exercises one
+    if (!window.__kaisola.getState().assistantThreads.length) window.__kaisola.getState().requestNewThread('mock')
     const st = window.__kaisola.getState()
     st.setLayoutMode('studio')
     st.setDock(true, 'assistant')
@@ -785,8 +793,9 @@ app.whenReady().then(async () => {
   const attentionUi = await win.webContents.executeJavaScript(`(async () => {
     const st = window.__kaisola.getState()
     const pid = st.newProject({ path: '/tmp/attention-smoke', focus: false })
-    const slice = window.__kaisola.getState().projectSlices[pid]
-    const tid = slice.assistantThreads[0].id
+    // fresh slices seed no chat thread — park one to drive the busy/needs-you dots
+    st.patchProject(pid, () => ({ assistantThreads: [{ id: 'att-thr', agentKey: 'mock', busy: false }], activeThreadId: 'att-thr' }))
+    const tid = 'att-thr'
     st.patchProject(pid, (sl) => ({
       assistantThreads: sl.assistantThreads.map((thread) => thread.id === tid ? { ...thread, busy: true } : thread),
     }))
@@ -924,6 +933,62 @@ app.whenReady().then(async () => {
   })()`)
   console.log('PROMPT_QUEUE=' + JSON.stringify(promptQueue))
 
+  // 7c-ii) MID-TURN STEER — a promptQueueing agent (the mock advertises it)
+  //        gets follow-ups injected into the RUNNING turn, not queued until it
+  //        ends. Hold a first turn, click send again while busy, and prove the
+  //        second message reaches the agent immediately (never queued) and the
+  //        turn ends only after BOTH settle.
+  const steer = await win.webContents.executeJavaScript(`(async () => {
+    const get = () => window.__kaisola.getState()
+    const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
+    const tid = get().activeThreadId
+    get().setWorkspace('/tmp/pasola-smoke')
+    get().setAssistantThreadAgent(tid, 'mock')
+    get().resetAssistantRuntime(tid)
+    get().setDockView(tid)
+    await wait(200) // the mock (connected in PROMPT_QUEUE) advertises promptQueueing → canSteer
+    const assistant = document.querySelector('.assistant[data-thread-id="' + tid + '"]')
+    // first turn holds ~350ms before streaming (the mock's [queue-smoke-hold])
+    get().setAssistantDraft(tid, { text: '[queue-smoke-hold] steer-base', attachments: [], mentions: [], speed: 'default' })
+    await wait(80)
+    const send = () => assistant?.querySelector('.composer-send:not(.composer-stop)')
+    send()?.click()
+    let started = false
+    for (let i = 0; i < 50; i++) { if (get().assistantThreads.find((t) => t.id === tid)?.busy) { started = true; break } await wait(20) }
+    // while busy, submit a follow-up — must STEER (go straight into the turn),
+    // not sit in the queue
+    get().setAssistantDraft(tid, { text: 'steer-follow', attachments: [], mentions: [], speed: 'default' })
+    await wait(40)
+    send()?.click()
+    await wait(120)
+    const midQueueEmpty = (get().assistantPromptQueues[tid] || []).length === 0
+    const midUsers = (get().assistantRuntimes[tid]?.turns || []).filter((t) => t.kind === 'user')
+    const steeredWhileBusy = get().assistantThreads.find((t) => t.id === tid)?.busy && midUsers.some((t) => t.text.includes('steer-follow'))
+    // let both turns settle
+    for (let i = 0; i < 200; i++) {
+      const s = get()
+      const busy = s.assistantThreads.find((t) => t.id === tid)?.busy
+      const turns = s.assistantRuntimes[tid]?.turns || []
+      const both = turns.some((t) => t.kind === 'assistant' && t.text.includes('steer-follow')) && turns.some((t) => t.kind === 'assistant' && t.text.includes('steer-base'))
+      if (!busy && both) break
+      await wait(50)
+    }
+    const turns = get().assistantRuntimes[tid]?.turns || []
+    const users = turns.filter((t) => t.kind === 'user')
+    return {
+      started,
+      neverQueued: midQueueEmpty,
+      steeredWhileBusy: !!steeredWhileBusy,
+      twoUserTurns: users.length === 2 && users.some((t) => t.text.includes('steer-base')) && users.some((t) => t.text.includes('steer-follow')),
+      followDelivered: turns.some((t) => t.kind === 'assistant' && t.text.includes('you said: steer-follow')),
+      // the base turn rides sendText, whose payload prepends speed/context — so
+      // match the echoed prompt as a substring, not the bare "you said:" prefix
+      baseDelivered: turns.some((t) => t.kind === 'assistant' && t.text.includes('steer-base')),
+      endedIdle: !get().assistantThreads.find((t) => t.id === tid)?.busy,
+    }
+  })()`)
+  console.log('STEER=' + JSON.stringify(steer))
+
   // 8) persistence — the store writes to the durable main-process DB (SQLite,
   //    JSON fallback). Verify the blob round-trips + which backend is active.
   const persist = await win.webContents.executeJavaScript(`(async () => {
@@ -989,6 +1054,11 @@ app.whenReady().then(async () => {
     const st = window.__kaisola.getState()
     st.setLayoutMode('studio')
     st.setDock(true, 'assistant')
+    // the solo-baseline assertions below need EXACTLY one card — earlier
+    // probes (thread creation, terminals) leave their session cards docked
+    for (const v of window.__kaisola.getState().dockViews.filter((x) => x !== window.__kaisola.getState().activeThreadId)) {
+      window.__kaisola.getState().removeDockView(v)
+    }
     await new Promise((r) => setTimeout(r, 150))
     const shown = document.querySelectorAll('.session-card[data-show="true"]')
     const canvas = document.querySelector('.canvas-wrap > .canvas')
@@ -3106,6 +3176,7 @@ a^2 + b^2 = c^2
     !brokerActivity.created || !brokerActivity.began || !brokerActivity.detached || !brokerActivity.settled || !brokerActivity.durable ||
     !transcriptTypography.rendered || !transcriptTypography.normalWhitespace || !transcriptTypography.readableWidth || !transcriptTypography.compactStream || !transcriptTypography.compactList ||
     !promptQueue.started || !promptQueue.queuedTwo || !promptQueue.compactCapsule || !promptQueue.queuePopover || !promptQueue.drained || !promptQueue.combinedOnce || !promptQueue.deliveredTogether || !promptQueue.newestSpeedWon ||
+    !steer.started || !steer.neverQueued || !steer.steeredWhileBusy || !steer.twoUserTurns || !steer.followDelivered || !steer.baseDelivered || !steer.endedIdle ||
     !persist.stored || !persist.hasTheme || !persist.hasAgent || !persist.hasThread || !persist.hasChatTurn || !persist.hasDraft || !persist.draftBounded || !persist.hasCodexEffort || !persist.hasTabLayout ||
     !boot.hasId || !boot.ran ||
     !auth.hasUrl || auth.code !== 'ABCD-1234' || !auth.done ||

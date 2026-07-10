@@ -61,7 +61,11 @@ function dispatch(msg) {
   }
   const { id, method, params } = msg
   if (method === 'initialize') {
-    send({ jsonrpc: '2.0', id, result: { protocolVersion: 1, agentCapabilities: { promptCapabilities: {} }, authMethods } })
+    // _meta.claudeCode.promptQueueing → the renderer offers mid-turn STEER for
+    // this agent (a follow-up sent while busy injects concurrently, exercised by
+    // the STEER smoke section). handlePrompt runs each prompt independently, so a
+    // second session/prompt during a held first turn streams its own frames.
+    send({ jsonrpc: '2.0', id, result: { protocolVersion: 1, agentCapabilities: { promptCapabilities: {}, _meta: { claudeCode: { promptQueueing: true } } }, authMethods } })
   } else if (method === 'authenticate') {
     // emulate an agent that prints its OAuth URL (so the client can surface/open it)
     process.stderr.write(`Please visit https://example.com/auth/mock-${(params && params.methodId) || 'x'} to authorize\n`)

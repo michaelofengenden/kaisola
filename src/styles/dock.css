@@ -600,9 +600,27 @@ details.assistant-tool.tool-artifacts > summary::-webkit-details-marker { displa
   white-space: nowrap;
 }
 .agent-live-pill:hover { color: var(--text-0); border-color: var(--border); }
+/* elapsed working time — ticks while the turn runs */
+.agent-live-elapsed {
+  flex-shrink: 0;
+  font-size: var(--fs-10);
+  font-variant-numeric: tabular-nums;
+  color: var(--text-3);
+}
 @media (prefers-reduced-motion: reduce) {
   .agent-live-dot { animation: none; }
 }
+
+/* "Worked for X" — the quiet close of a settled exchange */
+.turn-worked {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  margin: 2px 0 4px;
+  font-size: var(--fs-10);
+  color: var(--text-3);
+}
+.turn-worked > svg { flex-shrink: 0; opacity: 0.7; }
 
 /* viewable thinking */
 .assistant-thought {

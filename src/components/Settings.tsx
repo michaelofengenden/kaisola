@@ -240,6 +240,8 @@ export function Settings() {
   const setPerfMode = useKaisola((s) => s.setPerfMode)
   const autonomy = useKaisola((s) => s.autonomy)
   const setAutonomy = useKaisola((s) => s.setAutonomy)
+  const defaultAutonomy = useKaisola((s) => s.defaultAutonomy)
+  const setDefaultAutonomy = useKaisola((s) => s.setDefaultAutonomy)
   const workspacePath = useKaisola((s) => s.workspacePath)
   const termFontSize = useKaisola((s) => s.termFontSize)
   const setTermFontSize = useKaisola((s) => s.setTermFontSize)
@@ -747,14 +749,20 @@ export function Settings() {
             {section === 'guardrails' && (
               <>
                 <div className="settings-row">
-                  <span className="settings-row-label">Agent autonomy <span className="faint" style={{ fontWeight: 400 }}>· what agents may do without you</span></span>
+                  <span className="settings-row-label">Agent autonomy <span className="faint" style={{ fontWeight: 400 }}>· this project</span></span>
                   <div className="settings-row-control">
-                    <Dropdown value={autonomy} options={[{ value: 'observe', name: 'Observe' }, { value: 'propose', name: 'Propose' }, { value: 'execute', name: 'Execute' }, { value: 'sprint', name: 'Sprint' }]} onSelect={(v) => setAutonomy(v as AutonomyLevel)} align="right" title="Observe auto-rejects; Propose/Execute ask; Sprint auto-allows" />
+                    <Dropdown value={autonomy} options={[{ value: 'observe', name: 'Observe' }, { value: 'propose', name: 'Propose' }, { value: 'execute', name: 'Execute' }, { value: 'sprint', name: 'Sprint' }]} onSelect={(v) => setAutonomy(v as AutonomyLevel)} align="right" title="Observe auto-rejects; Propose asks; Execute/Sprint auto-allow" />
+                  </div>
+                </div>
+                <div className="settings-row">
+                  <span className="settings-row-label">Default autonomy <span className="faint" style={{ fontWeight: 400 }}>· every new project starts here</span></span>
+                  <div className="settings-row-control">
+                    <Dropdown value={defaultAutonomy} options={[{ value: 'observe', name: 'Observe' }, { value: 'propose', name: 'Propose' }, { value: 'execute', name: 'Execute' }, { value: 'sprint', name: 'Sprint' }]} onSelect={(v) => setDefaultAutonomy(v as AutonomyLevel)} align="right" title="Set auto permissions once, for every agent every time — Execute/Sprint auto-allow; the Claude terminal mirrors it (acceptEdits / bypassPermissions)" />
                   </div>
                 </div>
                 <p className="settings-note">
                   “Always allow” on a permission card saves a rule here. Files matching the globs are blocked on the
-                  agents' file channel and never auto-allowed.
+                  agents' file channel and never auto-allowed — even at Execute/Sprint.
                 </p>
                 {rules.map((r) => (
                   <div key={r.id} className="settings-row">

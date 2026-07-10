@@ -114,7 +114,7 @@ export function SessionTabs() {
       hue: sessionHue({ agentKey, folder: meta?.root ?? meta?.cwd ?? t.cwd }),
       state: failed ? 'failed' : working ? 'running' : needsYou[t.id] ? 'completed' : undefined,
       kind: 'term',
-      closable: terminals.length > 1 && !pinnedSessions.includes(t.id),
+      closable: !pinnedSessions.includes(t.id),
       continued: !!t.continued?.sameProcess,
       title: [
         t.continued?.sameProcess ? 'Continued — same process across the update' : null,

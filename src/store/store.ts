@@ -160,6 +160,8 @@ export interface AssistantTurn {
   artifacts?: ToolArtifact[]
   /** User turns: the pre-turn working-tree checkpoint (turn-rail Restore). */
   checkpointId?: string
+  /** User turns: how long the agent worked on this prompt (stamped at settle). */
+  workedMs?: number
 }
 
 /** One ACP plan entry — the agent's own todo list (whole-array replace). */
@@ -599,13 +601,27 @@ export const shellConfigDir = (dir: string): string =>
     ? `"$HOME/${dir.slice(2).replace(/(["\\$`])/g, '\\$1')}"`
     : `'${dir.replace(/'/g, `'\\''`)}'`
 
+/** Everything the armed Claude --settings file carries beyond the hooks tap:
+ * fast mode, plus the CLI-side mirror of auto permissions. The autonomy dial
+ * only reaches ACP connections; the Claude TERMINAL honors its own permission
+ * modes, so execute → acceptEdits and sprint → bypassPermissions keep "auto
+ * permissions for every agent" true for the terminal agent too. */
+const claudeSettingsFlags = (s: Pick<KaisolaState, 'claudeFastMode' | 'defaultAutonomy'>) => ({
+  ...(s.claudeFastMode ? { fastMode: true } : {}),
+  ...(s.defaultAutonomy === 'sprint'
+    ? { permissions: { defaultMode: 'bypassPermissions' } }
+    : s.defaultAutonomy === 'execute'
+      ? { permissions: { defaultMode: 'acceptEdits' } }
+      : {}),
+})
+
 const GLOBAL_KEYS = [
   'theme', 'themeMode', 'agentModels', 'fileTextZoom', 'termFontSize', 'termFontFamily',
   'termFontWeight', 'termCursorColor', 'termBackground', 'customAgents', 'enabledAgents', 'sessionTemplates', 'claudeModel', 'reasoningProvider',
   'localBaseUrl', 'localModel', 'openaiBaseUrl', 'openaiModel', 'openAlexMailto', 'grobidEndpoint',
   'sandboxMode', 'workflows', 'automationsEnabled', 'perfMode', 'tabLayout', 'railWidth', 'railOpen', 'claudeSessions',
   'wordDiffs', 'showCosts', 'inbox', 'draftRestore', 'wallpaperTint', 'claudeAccounts',
-  'claudeTerminalModel', 'claudeFastMode',
+  'claudeTerminalModel', 'claudeFastMode', 'defaultAutonomy',
   'permissionRules', 'sensitiveGlobs', 'latexMain', 'unsavedBuffers', 'termDrafts', 'onboardingVersion',
 ] as const
 
@@ -880,6 +896,11 @@ interface KaisolaState {
   setLayoutMode: (mode: LayoutMode) => void
   toggleLayoutMode: () => void
   setAutonomy: (a: AutonomyLevel) => void
+  /** The autonomy every NEW project starts at — set once, applies to every
+   * agent every time (execute/sprint auto-allow; the Claude terminal mirrors
+   * it through the armed --settings permission mode). */
+  defaultAutonomy: AutonomyLevel
+  setDefaultAutonomy: (a: AutonomyLevel) => void
   completeOnboarding: () => void
   openPalette: (mode?: PaletteMode) => void
   closePalette: () => void
@@ -1489,15 +1510,37 @@ function gridState(grid: string[][], extra: object = {}) {
 const gridWithout = (grid: string[][], id: string) =>
   grid.map((col) => col.filter((v) => v !== id)).filter((col) => col.length)
 
+/** Every id the card grid can actually render — threads, terminals (plain and
+ * agent-spawned), and panels. Grid ids outside this set paint nothing. */
+type DockSessions = Pick<KaisolaState, 'assistantThreads' | 'terminals' | 'agentTerminals' | 'panels'>
+const liveSessionIds = (s: DockSessions) =>
+  new Set<string>([
+    ...s.assistantThreads.map((t) => t.id),
+    ...s.terminals.map((t) => t.id),
+    ...s.agentTerminals.map((t) => t.terminalId),
+    ...s.panels.map((p) => p.id),
+  ])
+
+/** True when opening the dock would actually show a card. `dockOpen` alone
+ * can lie: a grid of stale ids (a slice from an older layout, a session that
+ * never left the grid) renders zero cards. */
+export const dockShowsLiveCard = (s: DockSessions & Pick<KaisolaState, 'dockViews'>) => {
+  const live = liveSessionIds(s)
+  return s.dockViews.some((id) => live.has(id))
+}
+
 /** Make the sessions area visibly useful. A boolean dockOpen with an empty
- * grid was the source of "Show sessions" doing nothing. */
+ * grid — or a grid of stale ids — was the source of "Show sessions" doing
+ * nothing. Prune to renderable ids; seed a card when nothing survives. */
 function visibleDockState(
-  s: Pick<KaisolaState, 'dockViews' | 'dockGrid' | 'activeThreadId' | 'assistantThreads' | 'terminals'>,
+  s: DockSessions & Pick<KaisolaState, 'dockViews' | 'dockGrid' | 'activeThreadId'>,
   extra: Record<string, unknown> = {},
 ) {
-  if (s.dockViews.length) return { dockOpen: true, ...extra }
+  const live = liveSessionIds(s)
+  const grid = s.dockGrid.map((col) => col.filter((id) => live.has(id))).filter((col) => col.length)
+  if (grid.length) return gridState(grid, { dockOpen: true, ...extra })
   const thread = s.assistantThreads.find((entry) => entry.id === s.activeThreadId) ?? s.assistantThreads[0]
-  const id = thread?.id ?? s.terminals[0]?.id
+  const id = thread?.id ?? s.terminals[0]?.id ?? s.agentTerminals[0]?.terminalId ?? s.panels[0]?.id
   return id ? gridState([[id]], { dockOpen: true, ...extra }) : { dockOpen: true, ...extra }
 }
 
@@ -1533,13 +1576,14 @@ const resetEphemeralCursors = () => ({
   fileDirty: false,
 })
 
-/** A brand-new project slice: one seeded terminal + one codex thread, empty rest.
- * The seed ids namespace off `pid` so they never collide across tabs (risk #2).
+/** A brand-new project slice: ONE seeded terminal, nothing else. With a
+ * workspace it's adopted as the Claude agent terminal by App's auto-launch —
+ * a new project is a single agent session, not a strip of session tabs. The
+ * seed ids namespace off `pid` so they never collide across tabs (risk #2).
  * With a `path`, the seed terminal spawns IN the project folder — the default
  * card is a shell already sitting at the project root, not $HOME. */
 const freshSlice = (pid: string, path: string | null = null): ProjectSliceMemory => {
   const term = seedTermId(pid)
-  const threadId = `a-${pid}`
   return {
     project: emptyProject(),
     stage: 'files',
@@ -1553,11 +1597,11 @@ const freshSlice = (pid: string, path: string | null = null): ProjectSliceMemory
     repoCheckpoints: [],
     followAgent: false,
     annotations: [],
-    assistantThreads: [{ id: threadId, agentKey: 'codex', busy: false }],
+    assistantThreads: [],
     assistantRuntimes: {},
     assistantDrafts: {},
     assistantPromptQueues: {},
-    activeThreadId: threadId,
+    activeThreadId: '',
     terminals: [{ id: term, cwd: path ?? undefined }],
     panels: [],
     sessionGroups: [],
@@ -1579,6 +1623,25 @@ const freshSlice = (pid: string, path: string | null = null): ProjectSliceMemory
 /** Read a project's slice: the live flat fields when active, else its parked slice. */
 const projectFields = (s: KaisolaState, pid: string): ProjectSliceMemory =>
   pid === s.activeProjectId ? pick(s, PROJECT_SLICE_MEMORY_KEYS) : (s.projectSlices[pid] ?? freshSlice(pid))
+
+/** Rehydrate-time grid repair: drop ids this slice can't render (a session
+ * closed elsewhere, an agent terminal from a previous run). A persisted
+ * phantom grid otherwise keeps the dock "open" over zero cards forever. An
+ * open dock that prunes to nothing re-seeds a card, like visibleDockState. */
+const pruneSliceGrid = <T extends Partial<ProjectSlicePersist>>(slice: T): T => {
+  const live = new Set<string>([
+    ...(slice.assistantThreads ?? []).map((t) => t.id),
+    ...(slice.terminals ?? []).map((t) => t.id),
+    ...(slice.panels ?? []).map((p) => p.id),
+  ])
+  const grid = (slice.dockGrid ?? []).map((col) => col.filter((id) => live.has(id))).filter((col) => col.length)
+  if (!grid.length && slice.dockOpen) {
+    const seed = slice.assistantThreads?.[0]?.id ?? slice.terminals?.[0]?.id ?? slice.panels?.[0]?.id
+    if (seed) return { ...slice, dockGrid: [[seed]], dockViews: [seed] }
+    return { ...slice, dockGrid: [], dockViews: [], dockOpen: false }
+  }
+  return { ...slice, dockGrid: grid, dockViews: grid.flat() }
+}
 
 // The provider owns its complete conversational context. Kaisola keeps a
 // smooth recent renderer window and fsyncs everything older to its pageable
@@ -1797,6 +1860,7 @@ function persistSnapshot(s: KaisolaState) {
     claudeAccounts: s.claudeAccounts,
     claudeTerminalModel: s.claudeTerminalModel,
     claudeFastMode: s.claudeFastMode,
+    defaultAutonomy: s.defaultAutonomy,
     // drafts survive only as long as a terminal that could replay them exists
     // somewhere (any slice, the live list, or the undo-close stack)
     termDrafts: (() => {
@@ -2019,11 +2083,14 @@ export const useKaisola = create<KaisolaState>()(
   settingsOpen: false,
   settingsPane: null,
   signIn: null,
-  assistantThreads: [{ id: 'a1', agentKey: 'codex', busy: false }],
+  // no seeded chat thread: the fresh shell is ONE session (the terminal below,
+  // adopted as the Claude agent once a workspace exists) — chats are opt-in
+  // from the "+" session menu
+  assistantThreads: [],
   assistantRuntimes: {},
   assistantDrafts: {},
   assistantPromptQueues: {},
-  activeThreadId: 'a1',
+  activeThreadId: '',
   agentPreset: 'codex',
   agentRunning: {},
   agentTasks: [],
@@ -2040,12 +2107,14 @@ export const useKaisola = create<KaisolaState>()(
   ],
   automationsEnabled: false,
   wordDiffs: true,
-  showCosts: true,
+  // dollars-per-session is a power-user readout — quiet by default
+  showCosts: false,
   inbox: true,
   draftRestore: true,
   wallpaperTint: true,
   claudeTerminalModel: 'default',
   claudeFastMode: false,
+  defaultAutonomy: 'propose' as AutonomyLevel,
   agentModels: {},
   workspacePath: null,
   fileRequest: null,
@@ -2163,6 +2232,12 @@ export const useKaisola = create<KaisolaState>()(
     // agent (fire-and-forget; the web mock no-ops)
     void bridge.acp.setAutonomy(a)
   },
+  setDefaultAutonomy: (a) => {
+    set({ defaultAutonomy: a })
+    // the armed --settings file is global — rewrite it now so the NEXT claude
+    // boot (any project) carries the matching permission mode
+    void bridge.claude.setSettingsFlags?.(claudeSettingsFlags(get()))
+  },
   openPalette: (mode) => set((s) => ({ paletteOpen: true, paletteMode: mode ?? s.paletteMode })),
   closePalette: () => set({ paletteOpen: false }),
   // toggling into an ALREADY-OPEN palette with a different mode switches modes
@@ -2177,7 +2252,9 @@ export const useKaisola = create<KaisolaState>()(
   showProvenance: (t) => set({ provenance: t }),
   hideProvenance: () => set({ provenance: null }),
   focusProposal: (id) => set({ focusedProposalId: id }),
-  toggleDock: () => set((s) => s.layoutMode === 'studio' && s.dockOpen
+  // close only a dock that's visibly open — "open" over stale/empty grids
+  // must fall through to the show branch, or the click looks like a no-op
+  toggleDock: () => set((s) => s.layoutMode === 'studio' && s.dockOpen && dockShowsLiveCard(s)
     ? { dockOpen: false }
     : visibleDockState(s, { layoutMode: 'studio' })),
   // kept for callers/harnesses that think in panes: 'assistant' focuses the
@@ -2295,7 +2372,7 @@ export const useKaisola = create<KaisolaState>()(
     const hooksPath = bridge.claude.settingsPath
     // fast mode rides the same settings file; sync it in case this launch is
     // the first since the preference was restored from disk
-    await bridge.claude.setSettingsFlags?.(get().claudeFastMode ? { fastMode: true } : {}, acct?.configDir, ws)
+    await bridge.claude.setSettingsFlags?.(claudeSettingsFlags(get()), acct?.configDir, ws)
     const model = get().claudeTerminalModel
     const boot = [
       acct?.configDir ? `CLAUDE_CONFIG_DIR=${shellConfigDir(acct.configDir)}` : '',
@@ -2333,8 +2410,18 @@ export const useKaisola = create<KaisolaState>()(
       // startup auto-launch must not re-dock a card the user put away
       const reveal = opts?.reveal !== false
       const autoName = command ? titleFrom(command, 26) : undefined
-      const defaultTerminal = opts?.singletonKey && command && s.terminals.length === 1
-        ? s.terminals.find((t) => !s.dockViews.includes(t.id) && !t.boot && !t.restart && !t.singletonKey && !t.cwd && !t.name && !t.autoName)
+      // the lone pristine shell is ADOPTED in place (retyped into the agent
+      // terminal) rather than joined by a second card — a new project stays a
+      // single session. The seed may already be docked and sitting at the
+      // project root (freshSlice/setWorkspace put it there), so only a cwd the
+      // launch itself didn't ask for, or anything actually running, blocks it.
+      // Never under the smoke harness: adopting the MOUNTED seed card boots
+      // the real CLI, and probe keystrokes would land in a live agent session
+      // (the suite asserts boot-line preparation, not execution).
+      const defaultTerminal = opts?.singletonKey && command && s.terminals.length === 1 && !bridge.smoke
+        ? s.terminals.find((t) =>
+            !t.boot && !t.restart && !t.singletonKey && !t.name && !t.autoName &&
+            (!t.cwd || t.cwd === opts?.cwd) && !s.terminalMeta[t.id]?.running)
         : undefined
       const existing = opts?.singletonKey
         ? s.terminals.find((t) =>
@@ -2407,18 +2494,24 @@ export const useKaisola = create<KaisolaState>()(
   closeTerminal: (id) => {
     set((s) => {
       const closing = s.terminals.find((t) => t.id === id)
-      const rest = s.terminals.filter((t) => t.id !== id)
-      const terminals = rest.length ? rest : [{ id: uid('term') }]
+      const terminals = s.terminals.filter((t) => t.id !== id)
       const grid = gridWithout(s.dockGrid, id)
       const needsYou = { ...s.needsYou }
       delete needsYou[id]
+      // the LAST session is closable too — an empty grid falls back to any
+      // other live session, else the dock closes (the clean homescreen)
+      const fallback =
+        terminals[terminals.length - 1]?.id ??
+        s.assistantThreads[0]?.id ??
+        s.agentTerminals[0]?.terminalId ??
+        s.panels[0]?.id
       return {
         terminals,
         needsYou,
         // Chrome's undo-close: the record goes on the stack and the pty gets
         // a 60s grace before the deferred kill below reaps it
         closedStack: closing ? [{ kind: 'term' as const, at: Date.now(), term: closing }, ...s.closedStack].slice(0, 8) : s.closedStack,
-        ...gridState(grid.length ? grid : [[terminals[terminals.length - 1].id]]),
+        ...gridState(grid.length ? grid : fallback ? [[fallback]] : [], grid.length || fallback ? {} : { dockOpen: false }),
       }
     })
     const token = (termCloseTokens.get(id) ?? 0) + 1
@@ -2453,7 +2546,7 @@ export const useKaisola = create<KaisolaState>()(
       const fallback = s.terminals[0]?.id ?? s.assistantThreads[0]?.id
       return {
         agentTerminals,
-        ...gridState(grid.length ? grid : fallback ? [[fallback]] : []),
+        ...gridState(grid.length ? grid : fallback ? [[fallback]] : [], grid.length || fallback ? {} : { dockOpen: false }),
       }
     }),
   setTermDraft: (id, text) =>
@@ -4092,7 +4185,7 @@ export const useKaisola = create<KaisolaState>()(
   setClaudeFastMode: (on) => {
     set({ claudeFastMode: on })
     // rewrite the armed --settings file now — the next `claude` boot carries it
-    void bridge.claude.setSettingsFlags?.(on ? { fastMode: true } : {})
+    void bridge.claude.setSettingsFlags?.(claudeSettingsFlags(get()))
   },
   setWallpaperTint: (on) => set({ wallpaperTint: on }),
 
@@ -4553,7 +4646,9 @@ export const useKaisola = create<KaisolaState>()(
     const path = opts?.path ?? null
     const focus = opts?.focus !== false
     set((s) => {
-      const slice = freshSlice(pid, path)
+      // fresh tabs start at the user's chosen default autonomy — "set auto
+      // permissions once" instead of re-raising the dial per project
+      const slice = { ...freshSlice(pid, path), autonomy: s.defaultAutonomy ?? 'propose' }
       // blank tabs learn to count: a second concurrent workspace-less tab gets
       // "New Project 2" (persisted like any title; rename wins) — several
       // identical "New Project" labels were indistinguishable
@@ -4972,7 +5067,7 @@ export const useKaisola = create<KaisolaState>()(
         // background slices persist only bucket A — re-seed their in-memory
         // bucket D empty so a later switch hoists a complete slice.
         const bgHydrated: Record<string, ProjectSliceMemory> = {}
-        for (const [id, sl] of Object.entries(bg)) bgHydrated[id] = { ...freshSlice(id), ...freshMemory(), ...sl }
+        for (const [id, sl] of Object.entries(bg)) bgHydrated[id] = pruneSliceGrid({ ...freshSlice(id), ...freshMemory(), ...sl })
         return {
           ...cur, // defaults + ACTION FUNCTIONS (must be first)
           ...pickGlobals(p), // bucket B + C
@@ -4989,7 +5084,7 @@ export const useKaisola = create<KaisolaState>()(
           projectSlices: bgHydrated, // background tabs only
           ...freshMemory(), // bucket D seeded empty
           ...resetEphemeralCursors(), // bucket F defaults
-          ...(activeSlice ?? sanitizeSliceForPersist(freshSlice(active))), // hoist active slice → flat
+          ...pruneSliceGrid(activeSlice ?? sanitizeSliceForPersist(freshSlice(active))), // hoist active slice → flat
           terminalMeta: {},
           termRemounts: {}, // bucket E rebuilds from the poller
         }

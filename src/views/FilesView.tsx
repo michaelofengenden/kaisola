@@ -4,10 +4,10 @@ import { bridge, isDesktop, type FsEntry, type FsReadMediaKind, type FsReadResul
 import { extractOutline } from '../lib/outline'
 import { changedNewLines } from '../lib/lineDiff'
 import { computeTurnBlame, type BlameLine } from '../lib/turnBlame'
-import { relTime } from '../lib/format'
+import { relTime, countMatches } from '../lib/format'
 import type { AnnotationRange, QuoteAction, ScrollMark } from '../components/CodeEditor'
 import { EmptyState } from '../components/EmptyState'
-import { DocumentPreview, countMatches, type DocumentPreviewKind } from '../components/DocumentPreview'
+import type { DocumentPreviewKind } from '../components/DocumentPreview'
 import { Icon } from '../components/Icon'
 import { LatexBar } from '../components/shell/LatexBar'
 import { fileIcon } from '../lib/fileIcon'
@@ -17,6 +17,10 @@ import { isExtensionInstalled, previewContributionFor, useExtensionRevision } fr
 // the preview path stays light, and the web build never loads it.
 const CodeEditor = lazy(() =>
   import('../components/CodeEditor').then((m) => ({ default: m.CodeEditor })),
+)
+// The rendered-document preview carries the react-markdown stack — same deal.
+const DocumentPreview = lazy(() =>
+  import('../components/DocumentPreview').then((m) => ({ default: m.DocumentPreview })),
 )
 
 type Mode = 'preview' | 'edit' | 'split'
@@ -999,15 +1003,17 @@ export function FilesView() {
       ? { index: storeScrollRequest.heading, seq: storeScrollRequest.seq }
       : null
   const documentPreview = active && previewKind ? (
-    <DocumentPreview
-      key={`${active.path}:${previewKind}`}
-      text={active.value}
-      kind={previewKind}
-      sourcePath={active.path}
-      highlight={findText}
-      onEdit={editActivePreview}
-      scrollHeading={previewScroll}
-    />
+    <Suspense fallback={<div className="fx-loading aurora"><span className="shimmer-text">Loading preview…</span></div>}>
+      <DocumentPreview
+        key={`${active.path}:${previewKind}`}
+        text={active.value}
+        kind={previewKind}
+        sourcePath={active.path}
+        highlight={findText}
+        onEdit={editActivePreview}
+        scrollHeading={previewScroll}
+      />
+    </Suspense>
   ) : null
   const activeLatexMain = workspacePath ? latexMain[workspacePath] : undefined
   const activeLatexPdf = activeLatexMain?.replace(/\.tex$/i, '.pdf')

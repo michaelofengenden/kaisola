@@ -29,6 +29,7 @@ class AcpConnection {
     this.models = null // { currentModelId, availableModels: [{modelId,name,description}] }  (set_model)
     this.configOptions = [] // [{id,name,category,type,currentValue,options:[{value,name,description}]}]  (set_config_option)
     this.authMethods = [] // [{id,name,description}] from initialize — drives the login buttons
+    this.supportsPromptQueue = false // set from initialize — enables mid-turn steering
   }
 
   getControls() {
@@ -236,12 +237,27 @@ class AcpConnection {
       clientCapabilities: {
         fs: { readTextFile: true, writeTextFile: true },
         terminal: true, // we can run the agent's commands in a real, visible pty
+        // Terminal-based sign-in. claude-code-acp only advertises its real auth
+        // methods (`claude auth login --claudeai`, `--console`) when the client
+        // declares one of these; without them it emits an unusable localhost
+        // browser-redirect URL its OWN source calls broken over ACP (dist/
+        // acp-agent.js: supportsTerminalAuth / supportsMetaTerminalAuth). We CAN
+        // run its login in a real pty, so we advertise both spellings.
+        auth: { terminal: true },
+        _meta: { 'terminal-auth': true },
       },
     })
     this.authMethods = (res && res.authMethods) || []
     // agents advertising loadSession can resume a prior session after an app
     // restart (session/load) instead of starting blank
     this.canLoadSession = !!(res && res.agentCapabilities && res.agentCapabilities.loadSession)
+    // Native prompt queueing: a session/prompt sent while a turn is running is
+    // pushed onto the agent's streaming input and injected at the next tool
+    // boundary (claude-code-acp: agentCapabilities._meta.claudeCode.
+    // promptQueueing). This is what powers mid-turn STEERING — a follow-up that
+    // reaches the agent between tool calls instead of waiting out the turn.
+    const caps = (res && res.agentCapabilities) || {}
+    this.supportsPromptQueue = !!(caps._meta && caps._meta.claudeCode && caps._meta.claudeCode.promptQueueing)
     // agents that accept HTTP/SSE MCP servers get remote entries at session/new
     this.mcpHttpOk = !!(res && res.agentCapabilities && res.agentCapabilities.mcpCapabilities && res.agentCapabilities.mcpCapabilities.http)
     this.mcpSseOk = !!(res && res.agentCapabilities && res.agentCapabilities.mcpCapabilities && res.agentCapabilities.mcpCapabilities.sse)

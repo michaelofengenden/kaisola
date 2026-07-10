@@ -5,7 +5,6 @@ import { sessionHue, terminalAgentKey } from '../../lib/sessionHue'
 import { useAgentRegistry } from '../../lib/registry'
 import { urlHost, terminalLabel, threadLabel } from '@/lib/sessionLabel'
 import { Terminal, everMountedTerminals, hiddenTerminalResidentCap } from '../Terminal'
-import { Assistant } from '../Assistant'
 import { BrowserCard } from './BrowserCard'
 import { LedgerCard } from './LedgerCard'
 import { SessionTabs } from './SessionTabs'
@@ -15,6 +14,9 @@ import { ProviderIcon } from '../ProviderIcon'
 // Git diff rendering pulls in CodeMirror. Keep it out of the initial shell
 // bundle; Files and Commit share the same lazy editor chunk on first use.
 const GitPanel = lazy(() => import('./GitPanel').then((module) => ({ default: module.GitPanel })))
+// Chat threads carry the react-markdown stack — loaded on the first chat
+// card, not at boot (the default shell is a lone agent terminal now).
+const Assistant = lazy(() => import('../Assistant').then((module) => ({ default: module.Assistant })))
 
 /**
  * While ANY shell drag runs (card heads, column grips, the canvas edge),
@@ -302,7 +304,10 @@ export function SessionCards() {
       ))}
       {threads.map((t, i) => {
         const label = threadLabel(t, agents, threads, i)
-        return card(t.id, 'Sparkles', label, pos.has(t.id) ? <Assistant threadId={t.id} /> : null, {
+        const body = pos.has(t.id)
+          ? <Suspense fallback={<div className="fx-loading aurora"><span className="shimmer-text">Loading chat…</span></div>}><Assistant threadId={t.id} /></Suspense>
+          : null
+        return card(t.id, 'Sparkles', label, body, {
           hue: sessionHue({ agentKey: t.agentKey }),
           agentKey: t.agentKey,
           running: t.busy,

@@ -689,6 +689,7 @@ function agentSummary(sender) {
       mcpHttp: !!(e.conn && e.conn.mcpHttpOk && e.conn.sessionMcpServers && e.conn.sessionMcpServers().length),
       canLoadSession: !!(e.conn && e.conn.canLoadSession),
       promptImages: !!(e.conn && e.conn.promptImageOk),
+      promptQueue: !!(e.conn && e.conn.supportsPromptQueue),
       busy: !!(e.current && e.current.channel),
       autonomy: e.autonomy,
     }))
@@ -944,19 +945,51 @@ function registerAcpHandlers(ipcMain) {
     const turn = { sender: event.sender, channel: `acp:update:${reqId}` }
     entry.current = turn
     entry.inFlightTurns = (entry.inFlightTurns ?? 0) + 1
+    entry.steerPromises = [] // steering follow-ups injected while THIS turn runs
     try {
       const res = await entry.conn.prompt(text, images)
+      // A steering follow-up (acp:steer) rides this same channel and may still
+      // be streaming when the original turn's result lands — hold the channel
+      // (and the __done that ends the exchange) until every injected turn
+      // settles, so late steered output is never dropped on a cleared channel.
+      if (entry.steerPromises.length) await Promise.allSettled(entry.steerPromises)
       if (turn.sender && !turn.sender.isDestroyed()) {
         turn.sender.send(turn.channel, { __done: true, stopReason: res && res.stopReason })
       }
       return { ok: true, stopReason: res && res.stopReason }
     } catch (err) {
+      if (entry.steerPromises.length) await Promise.allSettled(entry.steerPromises)
       if (turn.sender && !turn.sender.isDestroyed()) turn.sender.send(turn.channel, { __done: true })
       return { ok: false, message: err.message }
     } finally {
       if (entry.current === turn) entry.current = { sender: null, channel: null }
+      entry.steerPromises = []
       entry.inFlightTurns = Math.max(0, (entry.inFlightTurns ?? 1) - 1)
       if (entry.inFlightTurns === 0) clearCancelWatchdog(entry)
+    }
+  })
+
+  // Mid-turn STEER: deliver a follow-up to an agent whose turn is already
+  // running, WITHOUT opening a new stream channel. For a promptQueueing agent
+  // (claude-code-acp) the SDK injects it at the next tool boundary; its output
+  // rides the active turn's channel, and the original acp:prompt above holds
+  // that channel open until this settles. Refused (so the renderer falls back
+  // to normal enqueue) when the agent can't queue or there's no active turn.
+  ipcMain.handle('acp:steer', async (event, { agentKey, text, images } = {}) => {
+    const entry = entryFor(event.sender, agentKey)
+    if (!entry || !entry.conn.alive) return { ok: false, message: 'Agent not connected.' }
+    if (!entry.conn.supportsPromptQueue) return { ok: false, message: 'unsupported', unsupported: true }
+    if (!(entry.current && entry.current.channel)) return { ok: false, message: 'No active turn to steer.', noTurn: true }
+    entry.inFlightTurns = (entry.inFlightTurns ?? 0) + 1
+    const p = entry.conn.prompt(text, images)
+    ;(entry.steerPromises ??= []).push(p.catch(() => {}))
+    try {
+      const res = await p
+      return { ok: true, stopReason: res && res.stopReason }
+    } catch (err) {
+      return { ok: false, message: err.message }
+    } finally {
+      entry.inFlightTurns = Math.max(0, (entry.inFlightTurns ?? 1) - 1)
     }
   })
 

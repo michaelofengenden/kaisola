@@ -1,4 +1,4 @@
-import { memo, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
+import { Fragment, memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
 import {
   useKaisola,
@@ -22,7 +22,7 @@ import { Icon } from './Icon'
 import { Dropdown } from './Dropdown'
 import { Markdown } from './Markdown'
 import { stageMeta } from '../lib/stages'
-import { clockTime } from '../lib/format'
+import { clockTime, workedTime } from '../lib/format'
 import type { Paper } from '../domain/types'
 
 type Turn = AssistantTurn
@@ -658,6 +658,9 @@ export const Assistant = memo(function Assistant({ threadId }: { threadId: strin
   const [agents, setAgents] = useState<AcpAgent[]>([])
   const [statusReadyKey, setStatusReadyKey] = useState('')
   const autoConnectAttemptRef = useRef<string | null>(null)
+  // mirrors awaitingAuth so the window-focus reconnect listener (a stable
+  // closure) reads the live value without re-subscribing on every toggle
+  const awaitingAuthRef = useRef(false)
   const [notice, setNotice] = useState<string | null>(null)
   const [authUrl, setAuthUrl] = useState<string | null>(null)
   // an OS file drag hovering the chat — the drop lands as attachment chips
@@ -774,6 +777,10 @@ export const Assistant = memo(function Assistant({ threadId }: { threadId: strin
   const agentName = agentPreset?.name ?? agentKey
   const aState = agents.find((a) => a.key === connectionKey)
   const connected = !!aState?.connected
+  // Native prompt queueing (claude-code-acp) → a follow-up sent mid-turn is
+  // STEERED into the running turn at the next tool boundary, instead of waiting
+  // out the whole turn. Agents without it keep the queue-until-idle behavior.
+  const canSteer = !!aState?.promptQueue
   const controls = controlList(aState?.controls ?? null)
   const speedControl = nativeSpeedControl(controls)
   const liveSpeed = displayedSpeed(speedControl, speed)
@@ -1073,6 +1080,41 @@ export const Assistant = memo(function Assistant({ threadId }: { threadId: strin
       setNotice('This agent has no CLI login.')
     }
   }
+  // The "needs browser authorization" URL is scraped from the adapter's stderr,
+  // but that localhost-redirect OAuth doesn't complete over ACP (claude-code-acp
+  // says so in its own source) and nothing here ever retried the session. So
+  // Authorize runs the agent's REAL login — the device-code card (codex) or its
+  // `/login` pty (claude), both of which have a working browser flow — clears
+  // the wedged turn, and arms a one-shot reconnect. Returning to the window (or
+  // the manual Reconnect button) then reconnects the thread and drains its queue.
+  const [awaitingAuth, setAwaitingAuth] = useState(false)
+  const reconnectAfterAuth = useCallback(async () => {
+    if (!awaitingAuthRef.current) return
+    if (useKaisola.getState().signIn) return // the device-code card is still open
+    const ok = await connect(agentKey, { forceReconnect: true })
+    if (ok) { awaitingAuthRef.current = false; setAwaitingAuth(false); setAuthUrl(null); setNotice(null) }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [agentKey, workspacePath, projectId])
+  const authorize = () => {
+    setAuthUrl(null)
+    if (busy) { void bridge.acp.cancel(connectionKey); setThreadBusy(active.id, false, projectId) }
+    awaitingAuthRef.current = true
+    setAwaitingAuth(true)
+    setNotice('Finish signing in — this thread reconnects when you return, or press Reconnect.')
+    signIn()
+  }
+  // External login (browser/terminal) → the window regains focus; the in-app
+  // codex device card → it closes (signInOpen falls). Either return triggers
+  // the one-shot reconnect.
+  useEffect(() => {
+    const onFocus = () => { void reconnectAfterAuth() }
+    window.addEventListener('focus', onFocus)
+    return () => window.removeEventListener('focus', onFocus)
+  }, [reconnectAfterAuth])
+  const signInOpen = useKaisola((s) => !!s.signIn)
+  useEffect(() => {
+    if (!signInOpen) void reconnectAfterAuth()
+  }, [signInOpen, reconnectAfterAuth])
   // A fresh thread just TRIES to connect: the CLIs cache their logins on disk
   // (claude/codex), so most threads should come up Connected without anyone
   // touching "Sign in" — clicking it used to be the only visible path, and for
@@ -1302,9 +1344,50 @@ export const Assistant = memo(function Assistant({ threadId }: { threadId: strin
   const send = async () => {
     const prompt = currentPrompt()
     if (!prompt.text) return
-    if (busy) { queuePrompt(prompt); return }
+    // Steering agent + a turn in flight → inject NOW (arrives at the next tool
+    // boundary). Everything else keeps the queue-until-idle path.
+    if (busy) {
+      if (canSteer) { clearAssistantDraft(active.id, { keepSpeed: true }, projectId); resetComposerHeight(); void steerText(prompt); return }
+      queuePrompt(prompt); return
+    }
     queuePausedRef.current = false
     void sendText(prompt, { clearDraft: true, restoreOnFailure: true })
+  }
+  /** Deliver a follow-up into the running turn (mid-turn steer). The user turn
+   * is appended optimistically and the agent's steered reply streams after it on
+   * the active turn's channel. On refusal (turn ended, or the agent can't queue
+   * after all) it rolls back and falls back to the normal queue. */
+  const steerText = async (prompt: AssistantDraft) => {
+    const text = prompt.text.trim().slice(0, ASSISTANT_DRAFT_TEXT_LIMIT)
+    if (!text) return
+    const threadId = active.id
+    const files = prompt.attachments
+    const mns = prompt.mentions
+    const refLine = [...mns.map((m) => `@${m.label}`), ...files.map((f) => `📎 ${f.split('/').pop() ?? ''}`)].join('  ·  ')
+    const shownText = refLine ? `${text}\n\n${refLine}` : text
+    const userTurn: Turn = { kind: 'user', text: shownText, at: Date.now() }
+    updateRuntime(threadId, (r) => ({ ...r, turns: [...r.turns, userTurn] }))
+    const mentionPrefix = mns.length ? `Referenced from the research project (use if relevant):\n${mns.map((m) => `- ${m.text}`).join('\n')}\n\n` : ''
+    const filePrefix = files.length ? `Attached files (read them if relevant):\n${files.join('\n')}\n\n` : ''
+    const images = (
+      await Promise.all(
+        files
+          .filter((f) => /\.(png|jpe?g|gif|webp)$/i.test(f))
+          .map(async (f) => {
+            const r = await bridge.fs.readImage(f)
+            return r.ok && r.data && r.mimeType ? { mimeType: r.mimeType, data: r.data } : null
+          }),
+      )
+    ).filter((i): i is { mimeType: string; data: string } => i !== null)
+    const res = await bridge.acp.steer(connectionKey, `${mentionPrefix}${filePrefix}${text}`, images.length ? images : undefined, projectId)
+    if (!res.ok) {
+      // the turn ended between the busy check and delivery (noTurn), or the
+      // agent can't queue after all — undo the optimistic turn and enqueue it so
+      // the normal drain sends it as the next turn (nothing is lost)
+      updateRuntime(threadId, (r) => (r.turns[r.turns.length - 1] === userTurn ? { ...r, turns: r.turns.slice(0, -1) } : r))
+      queuePausedRef.current = false
+      enqueueAssistantPrompt(threadId, prompt, undefined, projectId)
+    }
   }
   /** The composer's send, callable with explicit text (the ⌘L bar uses it). */
   const sendText = async (
@@ -1383,6 +1466,15 @@ export const Assistant = memo(function Assistant({ threadId }: { threadId: strin
         for (let i = turns.length - 1; i >= 0; i--) {
           if (turns[i].kind === 'thought') { turns[i] = { ...turns[i], thinkMs: turns[i].thinkMs ?? ms }; break }
         }
+      }
+      // stamp how long the agent worked on this prompt (rendered as a quiet
+      // "Worked for X" row when the exchange settles; steered follow-ups fold
+      // into the original exchange's span, which is what a reader expects).
+      // Only on success: the !res.ok rollback below matches userTurn by
+      // IDENTITY, which a remap here would silently break.
+      if (res.ok && userTurn.at != null) {
+        const startedAt = userTurn.at
+        turns = turns.map((x) => (x.kind === 'user' && x.at === startedAt && x.workedMs == null ? { ...x, workedMs: Date.now() - startedAt } : x))
       }
       return { ...r, thinkStart: undefined, turns }
     })
@@ -1470,6 +1562,7 @@ export const Assistant = memo(function Assistant({ threadId }: { threadId: strin
     useKaisola.getState().clearOmniPrompt()
     const text = omniPrompt.text
     if (busy) {
+      if (canSteer) { void steerText({ ...EMPTY_DRAFT, text: text.trim(), speed }); return }
       queuePausedRef.current = false
       enqueueAssistantPrompt(active.id, { ...EMPTY_DRAFT, text: text.trim(), speed }, undefined, projectId)
       useKaisola.getState().pushToast('info', `Queued prompt for ${agentName}`)
@@ -1583,16 +1676,20 @@ export const Assistant = memo(function Assistant({ threadId }: { threadId: strin
       <div className="assistant-stream" ref={scrollRef} onScroll={onStreamScroll}>
         {notice && (
           <div className="assistant-nokey">
-            <Icon name={authUrl ? 'KeyRound' : 'Info'} size={15} />
+            <Icon name={awaitingAuth || authUrl ? 'KeyRound' : 'Info'} size={15} />
             <div className="grow">{notice}</div>
-            {authUrl ? (
-              <button className="btn btn-primary btn-sm" onClick={() => { bridge.openExternal(authUrl); }}>
-                <Icon name="ExternalLink" size={13} /> Authorize
+            {awaitingAuth ? (
+              <button className="btn btn-primary btn-sm" onClick={() => { void reconnectAfterAuth() }}>
+                <Icon name="RefreshCw" size={13} /> Reconnect
+              </button>
+            ) : authUrl ? (
+              <button className="btn btn-primary btn-sm" onClick={authorize}>
+                <Icon name="KeyRound" size={13} /> Authorize
               </button>
             ) : (
               <button className="btn btn-ghost btn-sm" onClick={() => openSettings(true)}><Icon name="Settings" size={13} /> Settings</button>
             )}
-            <button className="btn-icon btn-sm" onClick={() => { setNotice(null); setAuthUrl(null) }}><Icon name="X" size={13} /></button>
+            <button className="btn-icon btn-sm" onClick={() => { setNotice(null); setAuthUrl(null); awaitingAuthRef.current = false; setAwaitingAuth(false) }}><Icon name="X" size={13} /></button>
           </div>
         )}
         {showLiveActivity && (
@@ -1602,6 +1699,10 @@ export const Assistant = memo(function Assistant({ threadId }: { threadId: strin
             <span className="grow truncate">
               {latestActivity?.text || (liveAgentTerminals.length ? 'Running a terminal task' : `${agentName} is working`)}
             </span>
+            {busy && prompts.length > 0 && prompts[prompts.length - 1].turn.at != null && (
+              // ticks on the existing 500ms busy re-render
+              <span className="agent-live-elapsed mono">{workedTime(Date.now() - prompts[prompts.length - 1].turn.at!)}</span>
+            )}
             {subagentCount > 0 && <span className="agent-live-pill"><Icon name="Bot" size={10} /> {subagentCount}</span>}
             {liveAgentTerminals.map((term) => (
               <button key={term.terminalId} className="agent-live-pill" onClick={() => setDockView(term.terminalId)} title={term.command || term.label || 'Open terminal'}>
@@ -1636,16 +1737,34 @@ export const Assistant = memo(function Assistant({ threadId }: { threadId: strin
             Return to recent archived history
           </button>
         )}
-        {arun.turns.map((t, i) => (
-          <TurnRow
-            key={i}
-            t={t}
-            i={i}
-            agentName={agentName}
-            showCaret={busy && i === arun.turns.length - 1}
-            liveThinkStart={t.kind === 'thought' && t.thinkMs == null ? arun.thinkStart : undefined}
-          />
-        ))}
+        {arun.turns.map((t, i) => {
+          // "Worked for X" closes each settled exchange: at the last turn before
+          // the next user prompt (or transcript end), surface the owning user
+          // turn's workedMs. The live exchange has no stamp yet, so nothing
+          // renders under a running turn.
+          const next = arun.turns[i + 1]
+          let worked: number | undefined
+          if (!next || next.kind === 'user') {
+            for (let j = i; j >= 0; j--) {
+              const u = arun.turns[j]
+              if (u.kind === 'user') { worked = u.workedMs; break }
+            }
+          }
+          return (
+            <Fragment key={i}>
+              <TurnRow
+                t={t}
+                i={i}
+                agentName={agentName}
+                showCaret={busy && i === arun.turns.length - 1}
+                liveThinkStart={t.kind === 'thought' && t.thinkMs == null ? arun.thinkStart : undefined}
+              />
+              {worked != null && t.kind !== 'user' && (
+                <div className="turn-worked"><Icon name="Timer" size={11} /> Worked for {workedTime(worked)}</div>
+              )}
+            </Fragment>
+          )
+        })}
         {/* the agent is BLOCKED on these — inline, non-modal, option-per-button */}
         {permsForAgent.map((perm) => (
           <PermissionCard

@@ -81,7 +81,7 @@
 .pane-head-close:hover { color: var(--text-0); background: var(--hover-overlay); }
 /* The xterm/WebGL surface is intentionally opaque. Transparency here adds a
    compositor pass for every streamed glyph; the surrounding card/header can
-   still show the painted material without making terminal output expensive. */
+   still sit over Live Glass without making terminal output expensive. */
 .dock-pane-term {
   flex: 1;
   min-height: 0;

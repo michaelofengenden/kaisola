@@ -271,6 +271,16 @@ const bridge = {
     },
     cancel: (id) => ipcRenderer.invoke('auth:cancel', { id }),
   },
+  appAuth: {
+    status: () => ipcRenderer.invoke('app-auth:status'),
+    signInGoogle: () => ipcRenderer.invoke('app-auth:google-start'),
+    signOut: () => ipcRenderer.invoke('app-auth:sign-out'),
+    onChanged: (cb) => {
+      const listener = (_e, status) => cb(status)
+      ipcRenderer.on('app-auth:changed', listener)
+      return () => ipcRenderer.removeListener('app-auth:changed', listener)
+    },
+  },
 
   fs: {
     list: (dir) => ipcRenderer.invoke('fs:list', { dir }),

@@ -1,11 +1,12 @@
 import { useEffect, useState } from 'react'
 import { useKaisola, shellConfigDir, type ThemeMode, type PerfMode, type CustomAgent, type TermBackground } from '../store/store'
-import { bridge, isDesktop, type AcpAgent } from '../lib/bridge'
+import { bridge, isDesktop, type AcpAgent, type AppAuthStatus } from '../lib/bridge'
 import type { AutonomyLevel } from '../domain/types'
 import { useAgentRegistry, openAgentSession, type RegistryAgent } from '../lib/registry'
 import { openConfigFile } from '../lib/userConfig'
 import { useUpdateState } from '../lib/updates'
 import { Icon } from './Icon'
+import { GoogleIcon } from './ProviderIcon'
 import { Dropdown } from './Dropdown'
 
 // Current Claude models (for the direct API path). Checked 2026-07-09.
@@ -148,7 +149,7 @@ type SectionId = (typeof SECTIONS)[number]['id']
 
 /** One quiet line under each pane title — sparse panes read as designed, not empty. */
 const SECTION_DESC: Record<SectionId, string> = {
-  general: 'How the shell looks — theme and the native glass material — and software updates.',
+  general: 'Theme, native Live Glass or the lowest-memory Eco shell, and software updates.',
   interface: 'The little conveniences — every one of them yours to switch off.',
   terminal: 'Every terminal card — font size, weight, typeface, and cursor color.',
   agents: 'The CLIs in your + menu. Each runs with your existing install and login — Kaisola never proxies a model.',
@@ -162,6 +163,46 @@ const slug = (s: string) =>
 
 /** Cursor color chips: the olive is the pre-0.1.7 accent look. */
 const CURSOR_COLORS = ['#95a456', '#5aa9e6', '#d8a44a', '#e16a6a', '#5ec5c0']
+
+function AppAccountRow() {
+  const [status, setStatus] = useState<AppAuthStatus | null>(null)
+  const [busy, setBusy] = useState(false)
+  useEffect(() => {
+    let alive = true
+    void bridge.appAuth.status().then((next) => { if (alive) setStatus(next) })
+    const off = bridge.appAuth.onChanged((next) => { if (alive) { setStatus(next); setBusy(false) } })
+    return () => { alive = false; off() }
+  }, [])
+  const signIn = async () => {
+    setBusy(true)
+    const next = await bridge.appAuth.signInGoogle()
+    setStatus((current) => ({ ...(current ?? { configured: next.configured }), ...next }))
+    if (!next.ok) setBusy(false)
+  }
+  const signOut = async () => {
+    setBusy(true)
+    setStatus(await bridge.appAuth.signOut())
+    setBusy(false)
+  }
+  return (
+    <div className="settings-row">
+      <span className="settings-row-label">Kaisola account</span>
+      <div className="settings-row-control" style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+        <GoogleIcon size={14} />
+        {status?.profile ? (
+          <>
+            <span className="truncate" title={status.profile.email}>{status.profile.name || status.profile.email}</span>
+            <button className="btn btn-ghost btn-sm" disabled={busy} onClick={() => { void signOut() }}>Sign out</button>
+          </>
+        ) : (
+          <button className="btn btn-ghost btn-sm" disabled={busy || status?.configured === false} onClick={() => { void signIn() }}>
+            {busy ? 'Opening Google…' : 'Sign in with Google'}
+          </button>
+        )}
+      </div>
+    </div>
+  )
+}
 
 /**
  * Settings — Zed-style: a category nav on the left, one pane at a time on the
@@ -413,6 +454,7 @@ export function Settings() {
 
             {section === 'general' && (
               <>
+                <AppAccountRow />
                 <div className="settings-row">
                   <span className="settings-row-label">Theme</span>
                   <div className="settings-row-control">
@@ -455,17 +497,16 @@ export function Settings() {
                     <Dropdown
                       value={perfMode}
                       options={[
-                        { value: 'glass', name: 'Glass · live ●●●' },
-                        { value: 'painted', name: 'Glass · painted ●●' },
-                        { value: 'eco', name: 'Energy saver ●' },
+                        { value: 'glass', name: 'Live Glass' },
+                        { value: 'eco', name: 'Eco saver' },
                       ]}
                       onSelect={(v) => setPerfMode(v as PerfMode)}
                       align="right"
-                      title="Live: real translucency. Painted: the same look drawn as a static painting — far cheaper. Energy saver: solid and still — cheapest."
+                      title="Live Glass uses the native macOS material. Eco saver is pure white, opaque, still, and keeps hidden renderers on disk."
                     />
                   </div>
                 </div>
-                <p className="settings-note">Live glass uses a native macOS material. Switching modes reopens only this window; commands stay alive and Kaisola waits for active agent turns or approvals, while projects, layouts, and drafts rehydrate from disk.</p>
+                <p className="settings-note">Switching modes reopens only this window. Commands stay alive; projects, layouts, drafts, scrollback, and agent history rehydrate from disk.</p>
                 {isDesktop && <UpdatesRow />}
               </>
             )}

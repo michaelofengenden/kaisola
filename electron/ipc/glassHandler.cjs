@@ -1,6 +1,6 @@
-// Wallpaper sampling for the painted glass wash. The renderer asks for the
-// desktop picture under its window and gets back the average color (retints
-// the chrome veils) plus a pre-blurred copy (the painted mode background).
+// Wallpaper average sampling for Live Glass chrome. The renderer receives only
+// three RGB bytes; a tiny thumbnail lives on disk and no desktop raster stays
+// retained in Electron memory.
 // Every failure returns { ok: false } — the renderer keeps the theme-tint
 // defaults, which are exactly the pre-sampling look. Never a toast.
 const { nativeImage, BrowserWindow, screen, nativeTheme } = require('electron')
@@ -68,32 +68,28 @@ async function wallpaperPath() {
   return out && fs.existsSync(out) ? out : null
 }
 
-let wallpaperImageCache = null
 // Decode/downsample in a short-lived native helper before Electron touches the
-// pixels. A full 6K/8K PNG can otherwise transiently add 100–250MB to main even
-// though painted mode only emits a 360px raster.
+// pixels. A full 6K/8K PNG can otherwise transiently add 100–250MB to main.
+// Ninety-six pixels is ample for a local average and keeps the nativeImage well
+// below 100KB; the thumbnail is reusable disk cache, not renderer heap.
 async function loadWallpaper(p) {
   let stat
   try { stat = fs.statSync(p) } catch { return null }
   const cacheKey = `${p}:${stat.mtimeMs}:${stat.size}`
-  if (wallpaperImageCache?.key === cacheKey && !wallpaperImageCache.img.isEmpty()) return wallpaperImageCache.img
   const digest = crypto.createHash('sha256').update(cacheKey).digest('hex').slice(0, 24)
-  const cached = path.join(os.tmpdir(), `kaisola-wp-${digest}.jpg`)
+  const cached = path.join(os.tmpdir(), `kaisola-wp-avg96-${digest}.jpg`)
   if (!fs.existsSync(cached)) {
-    const ok = await exec('/usr/bin/sips', ['-s', 'format', 'jpeg', '-s', 'formatOptions', '82', '--resampleWidth', '1600', p, '--out', cached], 15000)
+    const ok = await exec('/usr/bin/sips', ['-s', 'format', 'jpeg', '-s', 'formatOptions', '72', '--resampleWidth', '96', p, '--out', cached], 15000)
     if (ok == null) {
       // Non-mac/test fallback: still cap the retained nativeImage immediately.
       const direct = nativeImage.createFromPath(p)
       if (direct.isEmpty()) return null
       const size = direct.getSize()
-      const img = size.width > 1600 ? direct.resize({ width: 1600 }) : direct
-      wallpaperImageCache = { key: cacheKey, img }
-      return img
+      return size.width > 96 ? direct.resize({ width: 96 }) : direct
     }
   }
   const img = nativeImage.createFromPath(cached)
   if (img.isEmpty()) return null
-  wallpaperImageCache = { key: cacheKey, img }
   return img
 }
 
@@ -147,13 +143,7 @@ function sampleForWindow(win, img) {
   rect.y = Math.max(0, Math.min(rect.y, ih - rect.height))
   const px = img.crop(rect).resize({ width: 1, height: 1 }).toBitmap() // BGRA
   const avg = { r: px[2], g: px[1], b: px[0] }
-  // Crop to the display's aspect-filled source frame BEFORE downscaling. A
-  // 360px raster is deliberately small: bilinear upscaling supplies the soft
-  // static painting without a full-window CSS filter/compositor pass. It is
-  // still detailed enough for organic color drift under the frost grain.
-  const painting = img.crop(displayRect).resize({ width: Math.min(360, db.width) })
-  const blurDataUrl = 'data:image/jpeg;base64,' + painting.toJPEG(84).toString('base64')
-  return { ok: true, avg, blurDataUrl, screen: { x: db.x, y: db.y, w: db.width, h: db.height } }
+  return { ok: true, avg }
 }
 
 function registerGlassHandlers(ipcMain) {

@@ -36,8 +36,8 @@ const ARCHIVED_TURN_KINDS = new Set<Turn['kind']>(['user', 'assistant', 'thought
 // History is durable in main's append-only archive. Keep only a compact page in
 // Chromium: users can page through every turn, but old prose/diffs no longer
 // sit duplicated in both the renderer heap and the disk archive.
-const MAX_ARCHIVE_VIEW_TURNS = 72
-const MAX_ARCHIVE_VIEW_BYTES = 6 * 1024 * 1024
+const MAX_ARCHIVE_VIEW_TURNS = 48
+const MAX_ARCHIVE_VIEW_BYTES = 3 * 1024 * 1024
 /** IPC archives are private app data, but still cross a process boundary. Keep
  * malformed/corrupt JSONL records away from render-time string operations. */
 const archivedTurn = (value: unknown): Turn | null => {
@@ -1501,18 +1501,6 @@ export const Assistant = memo(function Assistant({ threadId }: { threadId: strin
                 <Icon name="TerminalSquare" size={10} /> {term.label || 'Terminal'}
               </button>
             ))}
-          </div>
-        )}
-        {arun.turns.length === 0 && archivedPage.length === 0 && archivedCount === 0 && !notice && (
-          <div className="assistant-empty">
-            <Icon name="Sparkles" size={18} />
-            <p>
-              {connected
-                ? `Message ${agentName} — it reads files and runs commands here.`
-                : presets.find((p) => p.id === agentKey)?.login
-                  ? `Pick a workspace, then send — ${agentName} connects on send.`
-                  : `Connect ${agentName} in Settings to start.`}
-            </p>
           </div>
         )}
         {(arun.plan?.length ?? 0) > 0 && <PlanStrip plan={arun.plan!} />}

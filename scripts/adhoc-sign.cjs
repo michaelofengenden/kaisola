@@ -16,9 +16,8 @@ exports.default = async function adhocSign(context) {
   const entitlements = path.join(__dirname, '..', 'node_modules', 'app-builder-lib', 'templates', 'entitlements.mac.plist');
   const sh = (cmd) => execSync(cmd, { stdio: 'inherit' });
   // codesign refuses bundles containing Finder metadata ("resource fork,
-  // Finder information, or similar detritus not allowed"). xattr -cr can't
-  // remove the system-stamped com.apple.provenance, so strip by copying with
-  // cp -X — and retry, because macOS can re-stamp the fresh copy mid-sign.
+  // Finder information, or similar detritus not allowed"). package.cjs stages
+  // outside ~/Documents so macOS cannot immediately re-stamp the cleaned copy.
   const cleanBundle = () => {
     sh(`rm -rf "${appPath}.clean"`);
     sh(`cp -RX "${appPath}" "${appPath}.clean"`);

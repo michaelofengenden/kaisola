@@ -14,7 +14,7 @@
      which stretched the blur's 8-bit steps into visible bands in light theme */
   --app-active-glass-lift-top: 45%;
   --app-active-glass-lift-bottom: 30%;
-  /* chrome veil — the PAINTED constant the old blur(1600px) chrome converged
+  /* chrome veil — the static constant the old blur(1600px) chrome converged
      to (kernel wider than the window ⇒ the filter collapsed to a per-theme
      rgba constant; solved from capture means, glassprobe.cjs). Wallpaper
      sampling (glassWash.ts) retints it so the chrome tracks the desktop.
@@ -23,8 +23,7 @@
      uninterrupted pane and stops costing its own composited layer. */
   --wash-rail-color: 255 254 254;
   --wash-rail-alpha: 35%;
-  /* frost grain: a 96px feTurbulence tile, neutral gray pinned by the color
-     matrix, alpha 0.04 — texture, not static. Rasters once, tiles forever. */
+  /* frost grain for native Live Glass chrome only. Eco hides the pseudo. */
   --frost-grain: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='96' height='96'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='2' stitchTiles='stitch'/%3E%3CfeColorMatrix type='matrix' values='0 0 0 0 0.5 0 0 0 0 0.5 0 0 0 0 0.5 0 0 0 0.04 0'/%3E%3C/filter%3E%3Crect width='96' height='96' filter='url(%23n)'/%3E%3C/svg%3E");
   --side-veil-alpha: 0%;
   --content-glass-alpha: 90%;
@@ -80,46 +79,6 @@
      (.tabstrip::before / .wsrail::before below), and the OS vibrancy keeps
      blurring the desktop behind everything. */
 }
-/* PAINTED GLASS: an opaque window that draws its own see-through — the
-   pre-blurred wallpaper (sampled in main, glassWash.ts) pinned to the
-   window's desktop position. z-index -2 sits UNDER the tint field (-1), so
-   everything translucent "sees" the painting exactly where live glass saw
-   the OS material. Static layer: rasters once, repaints never. */
-.app-wallpaper {
-  position: absolute;
-  inset: 0;
-  z-index: -2;
-  pointer-events: none;
-  overflow: hidden;
-}
-/* the painting rides its own filtered child — a filter on the parent would
-   also blur the grain pseudo below into nothing */
-.app-wallpaper::before {
-  content: '';
-  position: absolute;
-  inset: 0;
-  background-image: var(--wallpaper-img, radial-gradient(120% 90% at 30% 0%,
-    color-mix(in srgb, var(--accent) 14%, var(--bg-0)), var(--bg-0)));
-  background-size: var(--wallpaper-size, cover);
-  background-position: var(--wallpaper-x, 0) var(--wallpaper-y, 0);
-  background-repeat: no-repeat;
-  /* Main already crops to this display and downsamples to a tiny raster. The
-     browser's bilinear upscale is the blur; a CSS filter here forced a
-     full-window composited layer and paid again on every frame. */
-  filter: none;
-  transform: none;
-  image-rendering: auto;
-}
-/* the same frost grain the veils wear, on the painting itself — texture is
-   what reads as "glass" up close, not just blur */
-.app-wallpaper::after {
-  content: '';
-  position: absolute;
-  inset: 0;
-  background-image: var(--frost-grain);
-  background-repeat: repeat;
-  opacity: 0.34;
-}
 /* Dark theme: the glass field must DARKEN what it samples, never lift it —
    the light-tuned white tint + brightness() left the transparent rail nearly
    unreadable. The native vibrancy material itself follows the app theme too
@@ -135,35 +94,6 @@
      what the dark blur chrome measured as, and what keeps rail text readable */
   --wash-rail-color: 11 12 17;
   --wash-rail-alpha: 83%;
-}
-/* PAINTED-MODE LEGIBILITY: the wallpaper painting is livelier than the OS
-   material it replaces, so the rail veil carries more ink — rail text keeps
-   its contrast. Live glass is untouched (parity-locked to the measured blur
-   constants). */
-:root[data-perf='painted'] .app {
-  /* Let the cached desktop painting breathe. These are deliberately much
-     lighter than the old 45→30% full-window white veil + 64% rail wall. */
-  --app-active-glass-lift-top: 23%;
-  --app-active-glass-lift-bottom: 12%;
-  --wash-rail-alpha: 48%;
-  /* --frost-grain is owned by .app, so resolve this role here (declaring the
-     indirection on :root would resolve before --frost-grain exists). */
-  --shell-surface-grain: var(--frost-grain);
-}
-:root[data-theme='dark'][data-perf='painted'] .app {
-  --app-active-glass-lift-top: 58%;
-  --app-active-glass-lift-bottom: 46%;
-  --wash-rail-alpha: 62%;
-}
-
-/* Painted mode must remain a static painting. This also catches transient
-   menus/scrims supplied by feature stylesheets: no descendant may silently
-   reintroduce a backdrop compositor layer. */
-:root[data-perf='painted'] .app *,
-:root[data-perf='painted'] .app *::before,
-:root[data-perf='painted'] .app *::after {
-  backdrop-filter: none !important;
-  -webkit-backdrop-filter: none !important;
 }
 
 /* Deliberately NO data-winfocus overrides on any surface: the shell looks
@@ -707,7 +637,7 @@
   inset: 0;
   z-index: 0;
   pointer-events: none;
-  /* painted wash (pairs with .tabstrip::before): scoped to surfaces that
+  /* quiet chrome wash: scoped to surfaces that
      rarely repaint — never the whole window */
   background-image:
     var(--frost-grain),
@@ -728,8 +658,6 @@
 }
 .session-card,
 .canvas-wrap > .canvas {
-  /* Alpha is cheap in painted mode because the thing behind it is a static
-     bitmap, not a live backdrop filter. xterm itself remains opaque. */
   background-color: var(--shell-card-bg);
   background-image: var(--shell-surface-grain);
   border: 1px solid var(--shell-surface-border);
@@ -1147,14 +1075,6 @@
   transition: background var(--dur-2) var(--ease-out), color var(--dur-2) var(--ease-out),
     border-color var(--dur-2) var(--ease-out);
 }
-/* Painted mode can sit over a high-contrast wallpaper without a live material
-   adapting behind text. A quiet local frost veil keeps inactive labels legible
-   while preserving the light, mostly-transparent field. */
-:root[data-perf='painted'] .stab:not([data-active='true']) {
-  background: color-mix(in srgb, var(--bg-1) 38%, transparent);
-  color: var(--text-1);
-  border-color: color-mix(in srgb, var(--border-faint) 45%, transparent);
-}
 .stab:hover {
   background: var(--hover-overlay);
   color: var(--text-1);
@@ -1403,7 +1323,7 @@
   z-index: 2;
   pointer-events: none;
 }
-/* ── Energy saver (root[data-perf='eco']) ─────────────────────────────────
+/* ── Eco saver (root[data-perf='eco']) ────────────────────────────────────
    The glass look costs real GPU: backdrop blurs re-composite on every frame a
    terminal paints, and the always-on pulse dots keep the compositor awake.
    Eco keeps the layout and hues but goes opaque and still. */

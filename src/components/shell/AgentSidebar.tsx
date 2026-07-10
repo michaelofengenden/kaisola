@@ -14,11 +14,9 @@ import { openExtensionsCenter } from '../../lib/extensions'
 export function ShellTools() {
   const layoutMode = useKaisola((s) => s.layoutMode)
   const toggleLayoutMode = useKaisola((s) => s.toggleLayoutMode)
-  const setLayoutMode = useKaisola((s) => s.setLayoutMode)
   const openPalette = useKaisola((s) => s.openPalette)
   const dockOpen = useKaisola((s) => s.dockOpen)
   const toggleDock = useKaisola((s) => s.toggleDock)
-  const setDock = useKaisola((s) => s.setDock)
   const canvasOpen = useKaisola((s) => s.canvasOpen)
   const toggleCanvas = useKaisola((s) => s.toggleCanvas)
   const openSettings = useKaisola((s) => s.setSettingsOpen)
@@ -60,10 +58,7 @@ export function ShellTools() {
               {layoutMode === 'focus' ? 'Studio layout' : 'Focus layout'}
               <kbd>⌘⇧F</kbd>
             </button>
-            <button className="tree-menu-item" onClick={() => act(() => {
-              if (layoutMode === 'focus') { setLayoutMode('studio'); setDock(true) }
-              else toggleDock()
-            })}>
+            <button className="tree-menu-item" onClick={() => act(toggleDock)}>
               <Icon name="SquareTerminal" size={13} /> {dockOpen && layoutMode === 'studio' ? 'Hide sessions' : 'Show sessions'}
               <kbd>⌘J</kbd>
             </button>

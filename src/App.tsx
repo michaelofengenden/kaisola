@@ -19,6 +19,7 @@ import { Settings } from './components/Settings'
 import { SignInCard } from './components/SignInCard'
 import { Toaster } from './components/Toaster'
 import { ExtensionsCenter } from './components/ExtensionsCenter'
+import { Onboarding } from './components/Onboarding'
 
 import { FilesView } from './views/FilesView'
 
@@ -202,7 +203,6 @@ function TabMenuSync() {
 
 export default function App() {
   const layoutMode = useKaisola((s) => s.layoutMode)
-  const perfMode = useKaisola((s) => s.perfMode)
   const stage = useKaisola((s) => s.stage)
   const setStage = useKaisola((s) => s.setStage)
   const dockOpen = useKaisola((s) => s.dockOpen)
@@ -382,8 +382,8 @@ export default function App() {
     return watchUserConfig()
   }, [])
 
-  // wallpaper-sampled chrome wash + painted-mode background (macOS only;
-  // failures silently keep the theme-tint defaults)
+  // A tiny disk-cached wallpaper thumbnail can tint the live chrome. The
+  // renderer retains only three average-color bytes, never a desktop raster.
   useEffect(() => initGlassWash(), [])
 
   // the native under-window material (vibrancy/glass) must follow the APP
@@ -592,9 +592,6 @@ export default function App() {
 
   return (
     <div className="app" data-sidebar={false} data-layout={layoutMode}>
-      {/* painted glass: an opaque window that draws its own see-through — the
-          pre-blurred wallpaper (glassWash.ts) pinned to the desktop position */}
-      {isDesktop && perfMode === 'painted' && <div className="app-wallpaper" aria-hidden />}
       {/* grid row 1: the project strip (desktop main window only; on web/pop it
           isn't rendered and --tabstrip-h collapses the row to 0) */}
       {isDesktop && !POP_TERMINAL_ID && <ProjectTabs />}
@@ -650,6 +647,7 @@ export default function App() {
       <Settings />
       <SignInCard />
       <Toaster />
+      <Onboarding />
     </div>
   )
 }

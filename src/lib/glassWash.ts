@@ -11,9 +11,9 @@ import { useKaisola } from '../store/store'
  * add fidelity. (The tab strip carries no veil anymore — it sits on the bare
  * glass field, so there is nothing to retint up there.)
  *
- * Also installs main's aspect-correct, downsampled display painting + screen
- * geometry for painted mode (--wallpaper-img/-size, .app-wallpaper). Live and
- * eco release that raster; they never retain pixels they do not draw.
+ * The removed painted-glass mode used to retain a desktop raster here. The
+ * current path receives only an average RGB triplet from a tiny disk-cached
+ * thumbnail, so changing wallpaper tint no longer pins image memory.
  */
 
 /** How much of the wallpaper's color the veils adopt (0 = today's constants). */
@@ -25,38 +25,12 @@ const VEIL_BASE = {
   dark: { rail: [11, 12, 17] },
 } as const
 
-let screenRect: { x: number; y: number; w: number; h: number } | null = null
 let requestGeneration = 0
-export const getGlassScreen = () => screenRect
-
-function releasePainting() {
-  screenRect = null
-  const root = document.documentElement
-  root.style.removeProperty('--wallpaper-img')
-  root.style.removeProperty('--wallpaper-size')
-  root.style.removeProperty('--wallpaper-x')
-  root.style.removeProperty('--wallpaper-y')
-}
-
-function anchor() {
-  const r = screenRect
-  if (!r) return
-  const root = document.documentElement
-  // window.screenX/Y are the window's desktop coords; the painting is
-  // screen-sized, so shifting it by the negative window offset pins it to
-  // the physical desktop (re-anchored via glass:refresh after drag-end)
-  root.style.setProperty('--wallpaper-x', `${-(window.screenX - r.x)}px`)
-  root.style.setProperty('--wallpaper-y', `${-(window.screenY - r.y)}px`)
-}
 
 async function apply() {
   const state = useKaisola.getState()
   const generation = ++requestGeneration
-  if (state.perfMode === 'eco') {
-    releasePainting()
-    return
-  }
-  if (state.perfMode !== 'painted') releasePainting()
+  if (state.perfMode === 'eco') return
   let s: Awaited<ReturnType<typeof bridge.glassWash.sample>>
   try {
     s = await bridge.glassWash.sample()
@@ -77,22 +51,13 @@ async function apply() {
     // Settings → Interface switch OFF: the veil stays the theme constant
     root.style.removeProperty('--wash-rail-color')
   }
-  if (useKaisola.getState().perfMode === 'painted' && s.blurDataUrl && s.screen) {
-    screenRect = s.screen
-    root.style.setProperty('--wallpaper-img', `url("${s.blurDataUrl}")`)
-    root.style.setProperty('--wallpaper-size', `${s.screen.w}px ${s.screen.h}px`)
-    anchor()
-  } else {
-    releasePainting()
-  }
 }
 
 export function initGlassWash(): () => void {
   if (!isDesktop) return () => {}
   void apply()
-  // consolidate mode → window prefs at every boot: a fresh install defaults to
-  // painted before any Settings visit, and its opaque window should arrive on
-  // the very next launch without anyone touching the picker
+  // Consolidate mode → window prefs at every boot. Fresh installs default to
+  // Eco, so the very next launch is opaque even before Settings is opened.
   {
     const bg = getComputedStyle(document.documentElement).getPropertyValue('--bg-0').trim()
     void bridge.windowMode({

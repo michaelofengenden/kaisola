@@ -1,9 +1,6 @@
-// Solid-window + painted-mode probe. Boots dist with ISOLATED userData whose
-// shell-prefs ask for an opaque window (as main.cjs would create after a
-// perfMode switch + relaunch), then asserts the whole chain:
-//   prefs → opaque window + ?solidwin → data-solidwin + squared corners →
-//   setPerfMode writes prefs back → painted mode mounts .app-wallpaper →
-//   eco unmounts it.
+// Solid-window Eco probe. Boots dist with isolated opaque-window prefs, then
+// verifies pure-white Eco surfaces, no wallpaper raster/backdrop compositor,
+// native clipping, and write-through when switching back to Live Glass.
 const { app, BrowserWindow, ipcMain } = require('electron')
 const path = require('node:path')
 const os = require('node:os')
@@ -22,7 +19,6 @@ const { registerCodexHandlers } = require('./ipc/codexHandler.cjs')
 const { registerGitHandlers } = require('./ipc/gitHandler.cjs')
 const { registerClaudeHooksHandlers } = require('./ipc/claudeHooksHandler.cjs')
 const { registerUpdateHandlers } = require('./ipc/updateHandler.cjs')
-const { registerGlassHandlers } = require('./ipc/glassHandler.cjs')
 const worktree = require('./ipc/worktreeHandler.cjs')
 
 process.env.KAISOLA_SMOKE = '1'
@@ -31,9 +27,8 @@ try { fsx.rmSync(USER_DATA, { recursive: true, force: true }) } catch { /* fresh
 fsx.mkdirSync(USER_DATA, { recursive: true })
 app.setPath('userData', USER_DATA)
 const PREFS = path.join(USER_DATA, 'shell-prefs.json')
-fsx.writeFileSync(PREFS, JSON.stringify({ solidWindow: true, solidBg: '#0b0d11' }))
-
-const wait = (ms) => new Promise((r) => setTimeout(r, ms))
+fsx.writeFileSync(PREFS, JSON.stringify({ solidWindow: true, solidBg: '#ffffff' }))
+const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
 
 app.whenReady().then(async () => {
   registerModelHandlers(ipcMain); registerToolHandlers(ipcMain); registerSettingsHandlers(ipcMain)
@@ -41,110 +36,71 @@ app.whenReady().then(async () => {
   registerFsHandlers(ipcMain); registerGrobidHandlers(ipcMain); registerSandboxHandlers(ipcMain)
   registerDbHandlers(ipcMain); registerCodexHandlers(ipcMain); worktree.registerWorktreeHandlers(ipcMain)
   registerGitHandlers(ipcMain); registerClaudeHooksHandlers(ipcMain); registerUpdateHandlers(ipcMain)
-  registerGlassHandlers(ipcMain)
   ipcMain.handle('shell:glass', () => ({ supported: false, active: false, enabled: false }))
-  // the real shell:window-mode handler lives in main.cjs — replicate its
-  // contract against THIS probe's prefs file so setPerfMode's write-through
-  // and the mismatch read are exercised end to end
+  ipcMain.handle('glass:sample', () => ({ ok: false }))
+  ipcMain.handle('mcp:info', () => ({ ok: false }))
+  ipcMain.handle('mcp:servers', () => [])
+  ipcMain.handle('mcp:discover', () => [])
+  ipcMain.handle('extensions:state', () => ({ installed: [], available: [] }))
   const readPrefs = () => { try { return JSON.parse(fsx.readFileSync(PREFS, 'utf8')) } catch { return {} } }
-  ipcMain.handle('shell:window-mode', (e, patch) => {
-    const cur = readPrefs()
-    if (patch && typeof patch.solidWindow === 'boolean') cur.solidWindow = patch.solidWindow
-    if (patch && typeof patch.solidBg === 'string' && /^#[0-9a-fA-F]{6}$/.test(patch.solidBg)) cur.solidBg = patch.solidBg
-    fsx.writeFileSync(PREFS, JSON.stringify(cur))
-    return { wantSolid: cur.solidWindow === true, liveSolid: true }
+  ipcMain.handle('shell:window-mode', (_event, patch) => {
+    const current = readPrefs()
+    if (typeof patch?.solidWindow === 'boolean') current.solidWindow = patch.solidWindow
+    if (typeof patch?.solidBg === 'string' && /^#[0-9a-fA-F]{6}$/.test(patch.solidBg)) current.solidBg = patch.solidBg
+    fsx.writeFileSync(PREFS, JSON.stringify(current))
+    return { wantSolid: current.solidWindow === true, liveSolid: true }
   })
 
-  // mirror main.cjs's creation-time branch for a solid window
   const win = new BrowserWindow({
     show: true, width: 1280, height: 800, frame: false,
-    transparent: false, backgroundColor: '#0b0d11',
+    transparent: false, backgroundColor: '#ffffff',
     webPreferences: {
-      preload: path.join(__dirname, 'preload.cjs'),
-      contextIsolation: true, nodeIntegration: false, sandbox: false, webviewTag: true, plugins: true,
+      preload: path.join(__dirname, 'preload.cjs'), contextIsolation: true,
+      nodeIntegration: false, sandbox: false, webviewTag: true, plugins: true,
       backgroundThrottling: false,
     },
   })
   const js = (code) => win.webContents.executeJavaScript(code, true)
   await win.loadFile(path.join(__dirname, '..', 'dist', 'index.html'), { query: { solidwin: '1' } })
-  await wait(1800)
-
-  const boot = await js(`(() => ({
-    solidwin: document.documentElement.dataset.solidwin,
-    radius: getComputedStyle(document.querySelector('.app')).borderTopLeftRadius,
-  }))()`)
-  const img = await win.webContents.capturePage()
-  const corner = img.toBitmap().slice(0, 4) // BGRA of pixel (0,0)
-  const opaque = corner[3] === 255
-
-  await js(`window.__kaisola.getState().setPerfMode('painted')`)
-  await wait(900)
-  win.webContents.invalidate()
-  await wait(600)
-  const paintedShot = await win.webContents.capturePage()
-  const painted = await js(`(() => {
-    const el = document.querySelector('.app-wallpaper')
+  await wait(1600)
+  const boot = await js(`(() => ({ solidwin: document.documentElement.dataset.solidwin, radius: getComputedStyle(document.querySelector('.app')).borderTopLeftRadius }))()`)
+  const corner = (await win.webContents.capturePage()).toBitmap().slice(0, 4)
+  await js(`window.__kaisola.getState().setThemeMode('light'); window.__kaisola.getState().setPerfMode('eco')`)
+  await wait(500)
+  const eco = await js(`(() => {
     const app = document.querySelector('.app')
     const canvas = document.querySelector('.canvas-wrap > .canvas')
-    const alpha = (value) => {
-      const m = String(value || '').match(/rgba?\\(([^)]+)\\)/)
-      if (!m) return value === 'transparent' ? 0 : 1
-      const p = m[1].split(/[ ,/]+/).filter(Boolean)
-      return p.length > 3 ? Number(p[3]) : 1
-    }
-    const term = document.createElement('div')
-    term.className = 'dock-pane-term'
-    app.appendChild(term)
-    const termAlpha = alpha(getComputedStyle(term).backgroundColor)
-    term.remove()
-    const filtered = [...document.querySelectorAll('.app *')].some((node) => {
-      const s = getComputedStyle(node)
-      return /blur/.test([s.backdropFilter, s.getPropertyValue('-webkit-backdrop-filter')].join(' '))
-    })
-    // the painting lives on ::before (a parent filter would blur the grain)
+    const card = document.querySelector('.session-card')
+    const rail = document.querySelector('.wsrail')
+    const styles = [...document.querySelectorAll('.app *')].map((node) => getComputedStyle(node))
     return {
       perf: document.documentElement.dataset.perf,
-      mounted: !!el,
-      bg: el ? getComputedStyle(el, '::before').backgroundImage.slice(0, 40) : '',
-      wallpaperFilter: el ? getComputedStyle(el, '::before').filter : '',
-      wallpaperTransform: el ? getComputedStyle(el, '::before').transform : '',
-      liftTop: app ? getComputedStyle(app).getPropertyValue('--app-active-glass-lift-top').trim() : '',
-      railAlpha: app ? getComputedStyle(app).getPropertyValue('--wash-rail-alpha').trim() : '',
-      canvasAlpha: canvas ? alpha(getComputedStyle(canvas).backgroundColor) : 1,
-      canvasGrain: canvas ? getComputedStyle(canvas).backgroundImage.includes('data:image/svg') : false,
-      termAlpha,
-      hasBackdropBlur: filtered,
+      bg0: getComputedStyle(document.documentElement).getPropertyValue('--bg-0').trim(),
+      appBg: getComputedStyle(app, '::before').backgroundColor,
+      canvasBg: canvas ? getComputedStyle(canvas).backgroundColor : '',
+      cardBg: card ? getComputedStyle(card).backgroundColor : '',
+      railVeil: rail ? getComputedStyle(rail, '::before').display : '',
+      wallpaper: !!document.querySelector('.app-wallpaper'),
+      hasBackdropBlur: styles.some((style) => /blur/.test([style.backdropFilter, style.getPropertyValue('-webkit-backdrop-filter')].join(' '))),
     }
   })()`)
-
-  await js(`window.__kaisola.getState().setPerfMode('eco')`)
-  await wait(400)
-  const eco = await js(`(() => ({
-    perf: document.documentElement.dataset.perf,
-    mounted: !!document.querySelector('.app-wallpaper'),
-  }))()`)
-
+  const ecoShot = await win.webContents.capturePage()
   await js(`window.__kaisola.getState().setPerfMode('glass')`)
-  await wait(400)
+  await wait(150)
   const prefsAfter = readPrefs()
-
   const checks = {
     bootSolidwin: boot.solidwin === 'true',
     bootRadius: boot.radius === '10px',
-    windowOpaque: opaque,
-    paintedMounts: painted.perf === 'painted' && painted.mounted,
-    paintedHasImage: /data:image\/jpeg|gradient/.test(painted.bg),
-    paintedStatic: painted.wallpaperFilter === 'none' && painted.wallpaperTransform === 'none' && !painted.hasBackdropBlur,
-    paintedLightWash: painted.liftTop === '23%' && painted.railAlpha === '48%',
-    paintedSurfaces: painted.canvasAlpha >= 0.78 && painted.canvasAlpha <= 0.82 && painted.canvasGrain,
-    terminalOpaque: painted.termAlpha >= 0.99,
-    ecoUnmounts: eco.perf === 'eco' && !eco.mounted,
-    writeThrough: prefsAfter.solidWindow === false, // glass wants transparent again
+    windowOpaque: corner[3] === 255,
+    ecoSelected: eco.perf === 'eco',
+    pureWhiteBase: eco.bg0 === '#ffffff' && eco.appBg === 'rgb(255, 255, 255)',
+    pureWhiteSurfaces: eco.canvasBg === 'rgb(255, 255, 255)' && (!eco.cardBg || eco.cardBg === 'rgb(255, 255, 255)'),
+    noWallpaperRaster: !eco.wallpaper,
+    noBackdropBlur: !eco.hasBackdropBlur && (!eco.railVeil || eco.railVeil === 'none'),
+    writeThrough: prefsAfter.solidWindow === false,
   }
   const pass = Object.values(checks).every(Boolean)
-  console.log('SOLID=' + (pass ? 'PASS' : 'FAIL') + ' ' + JSON.stringify({ ...checks, painted }))
-  if (process.env.SOLIDPROBE_OUT) {
-    fsx.writeFileSync(path.join(process.env.SOLIDPROBE_OUT, 'painted.png'), paintedShot.toPNG())
-  }
+  console.log('SOLID=' + (pass ? 'PASS' : 'FAIL') + ' ' + JSON.stringify({ ...checks, eco }))
+  if (process.env.SOLIDPROBE_OUT) fsx.writeFileSync(path.join(process.env.SOLIDPROBE_OUT, 'eco.png'), ecoShot.toPNG())
   app.exit(pass ? 0 : 1)
 })

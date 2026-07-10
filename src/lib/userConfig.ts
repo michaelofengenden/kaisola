@@ -18,7 +18,7 @@ export const SETTINGS_TEMPLATE = `// Kaisola settings — applied on launch and 
   // "termFontSize": 13,
   // "termFontWeight": 500,                  // 400 | 500 | 700
   // "termCursorColor": "auto",              // "auto" (match text) | "#rrggbb"
-  // "perfMode": "glass",                    // "glass" (live) | "painted" (cheaper) | "eco" (cheapest)
+  // "perfMode": "eco",                      // "glass" (native) | "eco" (opaque, lowest memory)
   // "wordDiffs": true,                      // word-level highlights in research diffs
   // "showCosts": true,                      // $-cost chips on Claude session cards
   // "inbox": true,                          // cross-project needs-you inbox in the tab strip
@@ -102,7 +102,7 @@ function applySettings(raw: unknown) {
   if (typeof cfg.termFontSize === 'number') s.setTermFontSize(cfg.termFontSize)
   if (typeof cfg.termFontWeight === 'number') s.setTermFontWeight(cfg.termFontWeight)
   if (typeof cfg.termCursorColor === 'string') s.setTermCursorColor(cfg.termCursorColor)
-  if (cfg.perfMode === 'glass' || cfg.perfMode === 'painted' || cfg.perfMode === 'eco') s.setPerfMode(cfg.perfMode)
+  if (cfg.perfMode === 'glass' || cfg.perfMode === 'eco') s.setPerfMode(cfg.perfMode)
   if (typeof cfg.wordDiffs === 'boolean') s.setWordDiffs(cfg.wordDiffs)
   if (typeof cfg.showCosts === 'boolean') s.setShowCosts(cfg.showCosts)
   if (typeof cfg.inbox === 'boolean') s.setInbox(cfg.inbox)

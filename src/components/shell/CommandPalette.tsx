@@ -42,6 +42,10 @@ export function CommandPalette() {
   const togglePalette = useKaisola((s) => s.togglePalette)
   const toggleTheme = useKaisola((s) => s.toggleTheme)
   const setLayoutMode = useKaisola((s) => s.setLayoutMode)
+  const layoutMode = useKaisola((s) => s.layoutMode)
+  const canvasOpen = useKaisola((s) => s.canvasOpen)
+  const setDock = useKaisola((s) => s.setDock)
+  const toggleCanvas = useKaisola((s) => s.toggleCanvas)
   const runAgent = useKaisola((s) => s.runAgent)
   const runStageAgents = useKaisola((s) => s.runStageAgents)
   const enqueueStageAgents = useKaisola((s) => s.enqueueStageAgents)
@@ -281,6 +285,10 @@ export function CommandPalette() {
       { id: 'theme', group: 'Actions', label: 'Toggle theme', icon: 'SunMoon', run: () => { toggleTheme(); close() } },
       { id: 'layout-focus', group: 'Actions', label: 'Switch to Focus layout', hint: 'Hide the workspace rail and session cards', icon: 'Focus', run: () => { setLayoutMode('focus'); close() } },
       { id: 'layout-studio', group: 'Actions', label: 'Switch to Studio layout', hint: 'Show the existing rail, file tree, sessions, and canvas structure', icon: 'PanelsTopLeft', run: () => { setLayoutMode('studio'); close() } },
+      { id: 'sessions-show', group: 'Actions', label: 'Show sessions', hint: 'Reveal a live agent or terminal in Studio', icon: 'PanelLeftOpen', run: () => { setDock(true); close() } },
+      { id: 'sessions-hide', group: 'Actions', label: 'Hide sessions', hint: 'Keep sessions running in the background', icon: 'PanelLeftClose', run: () => { setDock(false); close() } },
+      { id: 'files-show', group: 'Actions', label: 'Show files', hint: 'Reveal the project canvas', icon: 'PanelRightOpen', run: () => { if (layoutMode === 'studio' && !canvasOpen) toggleCanvas(); close() } },
+      { id: 'files-hide', group: 'Actions', label: 'Hide files', hint: 'Give the whole work row to sessions', icon: 'PanelRightClose', run: () => { if (layoutMode === 'focus' || canvasOpen) toggleCanvas(); close() } },
     ]
     const autonomy: Command[] = (['observe', 'propose', 'execute', 'sprint'] as const).map((a) => ({
       id: `auto-${a}`,
@@ -312,7 +320,7 @@ export function CommandPalette() {
     }))
     return [...nav, ...workspace, ...agents, ...wfCmds, ...actions, ...history, ...autonomy]
   // `open` is a dep so each palette-open rebuilds the session-jump entries
-  }, [open, close, togglePalette, requestTerminal, workspacePath, followAgent, toggleFollowAgent, repoCheckpoints, snapshotWorkspace, restoreRepoCheckpoint, pushToast, runAgent, runStageAgents, enqueueStageAgents, workflows, runWorkflow, verifyCitations, buildCitationGraph, ingestAllPdfs, toggleTheme, setLayoutMode, setAutonomy, loadDemo, clearProject, checkpoints, undoLast, restoreCheckpoint, proposals, focusProposal])
+  }, [open, close, togglePalette, requestTerminal, workspacePath, followAgent, toggleFollowAgent, repoCheckpoints, snapshotWorkspace, restoreRepoCheckpoint, pushToast, runAgent, runStageAgents, enqueueStageAgents, workflows, runWorkflow, verifyCitations, buildCitationGraph, ingestAllPdfs, toggleTheme, setLayoutMode, setDock, toggleCanvas, layoutMode, canvasOpen, setAutonomy, loadDemo, clearProject, checkpoints, undoLast, restoreCheckpoint, proposals, focusProposal])
 
   // ── ranked rows for the current mode ──
   const commandRows = useMemo(() => {

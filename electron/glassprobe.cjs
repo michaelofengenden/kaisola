@@ -1,7 +1,7 @@
 // Glass parity probe — captures the renderer's own output (capturePage: the
 // pre-OS-composite pixels, exactly what backdrop-filter/wash changes touch)
 // and prints per-channel means for the chrome regions (tab strip + rail).
-// Used to gate the blur→painted-wash swap: means must match within ≤2/255.
+// Used to gate the native Live Glass chrome wash.
 //
 //   npx electron electron/glassprobe.cjs before   → writes glass-before.png + means
 //   npx electron electron/glassprobe.cjs after    → writes glass-after.png + means
@@ -110,9 +110,8 @@ app.whenReady().then(async () => {
   }
   console.log(`CHROME_MEAN_${tag.toUpperCase()}=` + JSON.stringify(out))
 
-  // WASH: the wallpaper sampler must have retinted the RAIL veil (inline var
-  // set by glassWash.ts) and cached the pre-blurred painting. The strip veil
-  // retired in the bare-glass strip redesign (595043e) — no strip assertion.
+  // WASH: the wallpaper sampler retints the rail with an RGB average but must
+  // not retain the removed painted-mode raster in the renderer.
   // Poll — sampling is async behind plutil/sips.
   let wash = null
   for (let i = 0; i < 10; i++) {
@@ -128,8 +127,7 @@ app.whenReady().then(async () => {
     await wait(400)
   }
   const triplet = (s) => /^\d{1,3} \d{1,3} \d{1,3}$/.test(s)
-  const washOk = wash && triplet(wash.rail)
-    && wash.img.startsWith('url("data:image/jpeg') && /^\d+px \d+px$/.test(wash.size)
+  const washOk = wash && triplet(wash.rail) && !wash.img && !wash.size
   console.log(`WASH=${washOk ? 'PASS' : 'FAIL'} ` + JSON.stringify(wash))
   app.exit(washOk ? 0 : 1)
 })

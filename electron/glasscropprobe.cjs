@@ -1,4 +1,4 @@
-// Pure geometry probe for the painted-wallpaper pipeline:
+// Pure geometry probe for window-local wallpaper average sampling:
 //   node electron/glasscropprobe.cjs
 const assert = require('node:assert/strict')
 const { __test } = require('./ipc/glassHandler.cjs')

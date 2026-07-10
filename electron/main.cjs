@@ -333,7 +333,7 @@ ipcMain.on('mcp:install-ready', (e) => {
 function createWindow(opts = {}) {
   const appIcon = loadAppIcon()
   const isPop = !!opts.pop
-  // painted/eco perf modes want an OPAQUE window (occlusion culling returns,
+  // Eco mode wants an OPAQUE window (occlusion culling returns,
   // no vibrancy tax) — transparency is a creation-time option, so the
   // renderer persists its preference in shell-prefs and it lands here on the
   // next launch. solidBg avoids a wrong-color flash before first paint.
@@ -353,7 +353,7 @@ function createWindow(opts = {}) {
     frame: false,
     ...(process.platform === 'darwin' ? { roundedCorners: true } : {}),
     // transparent window: the renderer paints its own (rounder) corners on the
-    // .app surface, Codex-style; macOS draws the shadow around the painted
+    // .app surface, Codex-style; macOS draws the shadow around the custom
     // shape. Solid windows keep native rounding instead (see data-solidwin).
     transparent: !solidWin,
     backgroundColor: solidWin ? solidBg : '#00000000',
@@ -384,7 +384,7 @@ function createWindow(opts = {}) {
     })
   })
   const query = {}
-  if (solidWin) query.solidwin = '1' // renderer squares its painted corners to the native clip
+  if (solidWin) query.solidwin = '1' // renderer squares its custom corners to the native clip
   win.__kaisolaSolid = solidWin // what THIS window is (vs what prefs now want)
   const nativeGlass = glassState(win)
   nativeGlass.fallback = solidWin ? 'solid' : 'vibrancy'

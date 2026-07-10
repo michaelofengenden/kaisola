@@ -275,7 +275,7 @@ app.whenReady().then(async () => {
     // default 'system' theme under it (found 2026-07-09, 1am)
     const previousThemeMode = store.themeMode
     store.setThemeMode('light')
-    store.setPerfMode('painted')
+    store.setPerfMode('eco')
     store.setLayoutMode('studio')
     document.documentElement.dataset.winfocus = 'true'
     await new Promise((r) => setTimeout(r, 160))
@@ -356,27 +356,19 @@ app.whenReady().then(async () => {
     const tabstripGlassBd = tabstrip ? backdrop(getComputedStyle(tabstrip, '::before')) : ''
     const railGlassBd = backdrop(getComputedStyle(rail, '::before'))
     const out = {
-      // PAINTED-GLASS CHROME: the app field is tint-only, and the chrome
-      // pseudos carry a PAINTED veil (the constant the old blur(1600px)
-      // converged to — glassprobe.cjs solved it) with NO backdrop-filter
-      // anywhere; the OS material carries the live glow
-      appSamplingLayer: !/blur/.test(activeAppBackdrop) && !/blur/.test(activeAppGlassBackdrop) && alpha(activeAppBackground) < 0.05 && appLiftTop >= 22 && appLiftTop <= 24 && appLiftBottom >= 11 && appLiftBottom <= 13,
+      // ECO CHROME: pure white, opaque and compositor-still. The app/window
+      // field owns the paper base and no descendant reintroduces a blur.
+      appSamplingLayer: !/blur/.test(activeAppBackdrop) && !/blur/.test(activeAppGlassBackdrop)
+        && alpha(activeAppBackground) < 0.05 && appGlassStyle.backgroundColor === 'rgb(255, 255, 255)',
       chromeGlass: !/blur/.test(tabstripGlassBd) && !/blur/.test(railGlassBd)
-        // the RAIL keeps the painted veil + grain…
-        && getComputedStyle(rail, '::before').backgroundImage.includes('data:image/svg')
-        && getComputedStyle(rail, '::before').backgroundImage.includes('linear-gradient')
-        && getComputedStyle(rail, '::before').display !== 'none'
-        // …while the STRIP is bare glass: no veil pseudo, no base film — the
-        // window top is one uninterrupted pane (tabs carry their own fills)
+        && getComputedStyle(rail, '::before').display === 'none'
         && !getComputedStyle(tabstrip, '::before').backgroundImage.includes('linear-gradient')
         && alpha(getComputedStyle(tabstrip).backgroundColor) <= 0.02,
       activeTintWhite: activeAppTint === '#fffefd',
       railBackdrop: activeRailBackdrop,
       railLayerFlattened: !activeRailBackdrop && activeRailBackgroundAlpha <= 0.02 && (!activeRailBgImage || activeRailBgImage === 'none') && activeSessionListFlat && activeRailDividerFlat && activeRailSearchFlat && veilAlpha >= 0 && veilAlpha <= 1,
-      // painted cards are genuine alpha over a STATIC wallpaper raster: no
-      // backdrop compositor. The terminal pane/xterm stays opaque.
-      contentGlassy: !activeCanvasBackdrop && alpha(canvasStyle.backgroundColor) >= 0.78 && alpha(canvasStyle.backgroundColor) <= 0.82 && canvasStyle.backgroundImage.includes('data:image/svg'),
-      sessionGlassy: !!cardStyle && !/blur/.test(backdrop(cardStyle)) && alpha(cardStyle.backgroundColor) >= 0.70 && alpha(cardStyle.backgroundColor) <= 0.74 && cardStyle.backgroundImage.includes('data:image/svg'),
+      contentGlassy: !activeCanvasBackdrop && alpha(canvasStyle.backgroundColor) >= 0.99 && canvasStyle.backgroundColor === 'rgb(255, 255, 255)' && !canvasStyle.backgroundImage.includes('data:image/svg'),
+      sessionGlassy: !!cardStyle && !/blur/.test(backdrop(cardStyle)) && alpha(cardStyle.backgroundColor) >= 0.99 && cardStyle.backgroundColor === 'rgb(255, 255, 255)' && !cardStyle.backgroundImage.includes('data:image/svg'),
       termGlassTint: !!termStyle && alpha(termStyle.backgroundColor) >= 0.99,
       blurKeepsGlass: surfacesEqual && blurredFp.appGlassDisplay !== 'none',
       lightsGray: !!light && activeFp.lightBg !== blurredFp.lightBg,
@@ -855,11 +847,15 @@ app.whenReady().then(async () => {
     const canvas = document.querySelector('.canvas-wrap > .canvas')
     const c = canvas && canvas.getBoundingClientRect()
     const s0 = shown[0] && shown[0].getBoundingClientRect()
-    return {
+    const baseline = {
       cardPerView: shown.length === window.__kaisola.getState().dockViews.length,
       chatLeftOfFiles: !!(s0 && c && s0.left < c.left),
       soloHeadSuppressed: !!document.querySelector('.session-card[data-show="true"][data-headless="true"]') && !document.querySelector('.session-card[data-show="true"] .pane-head'),
       noDockPanel: !document.querySelector('.dock'),
+    }
+    return {
+      ...baseline,
+      emptyMessageGone: !document.querySelector('.assistant-empty'),
     }
   })()`)
   console.log('CARDS=' + JSON.stringify(cards))
@@ -1327,6 +1323,8 @@ a^2 + b^2 = c^2
     if (agentItem) agentItem.click() // really adds a session
     await new Promise((rr) => setTimeout(rr, 150))
     const after = window.__kaisola.getState().assistantThreads.length
+    const claudeBrandIcon = !!document.querySelector('.stab svg[aria-label="Claude"]')
+    const openaiBrandIcon = !!document.querySelector('.stab svg[aria-label="OpenAI"]')
     return {
       hasBtn: true,
       noDrag,
@@ -1335,6 +1333,8 @@ a^2 + b^2 = c^2
       agentChoices: labels.length >= 4, // 3+ agent presets + terminal
       claudeOpensThread,
       claudeNoTerminal,
+      claudeBrandIcon,
+      openaiBrandIcon,
       adds: after === before + 2, // the claude thread above + the codex thread here
     }
   })()`)
@@ -1418,17 +1418,33 @@ a^2 + b^2 = c^2
     const firstId = g().activeProjectId
     const firstTerms = g().terminals.map((t) => t.id).sort().join()
     const firstGrid = JSON.stringify(g().dockGrid)
+    g().setLayoutMode('focus')
+    const firstFocus = g().layoutMode === 'focus' && g().canvasOpen
     // 1) open a SECOND project tab (fresh slice, its own seeded terminal + dock)
     const secondId = g().newProject({ path: null, focus: true })
     await wait(160)
     const isSecondActive = g().activeProjectId === secondId
     const twoTabs = g().projectTabs.length === startTabs + 1
     const secondTerms = g().terminals.map((t) => t.id).sort().join()
+    const initialSecondGrid = JSON.stringify(g().dockGrid)
+    const layoutIndependent = firstFocus && g().layoutMode === 'studio'
+    // Every control must make a visible, coherent state transition — no open
+    // boolean with an empty grid, and no hidden canvas bit under Focus.
+    g().setDock(true)
+    const showSessionsWorks = g().layoutMode === 'studio' && g().dockOpen && g().dockViews.length > 0
+    g().setLayoutMode('focus')
+    g().toggleCanvas()
+    const hideFilesWorks = g().layoutMode === 'studio' && !g().canvasOpen && g().dockOpen && g().dockViews.length > 0
+    g().toggleCanvas()
+    const showFilesWorks = g().layoutMode === 'studio' && g().canvasOpen
+    g().setDock(false)
+    g().setLayoutMode('studio')
+    const studioWorks = g().layoutMode === 'studio' && g().canvasOpen && g().dockOpen && g().dockViews.length > 0
     const secondGrid = JSON.stringify(g().dockGrid)
     // isolation: the tabs have DIFFERENT terminal ids and dock grids, and the
     // outgoing first slice is parked intact
     const termsDiffer = !!secondTerms && !!firstTerms && secondTerms !== firstTerms
-    const gridsDiffer = secondGrid !== firstGrid
+    const gridsDiffer = initialSecondGrid !== firstGrid
     const parkedFirst = g().projectSlices[firstId]
     const parkedFirstOk = !!parkedFirst && parkedFirst.terminals.map((t) => t.id).sort().join() === firstTerms
     // A live ACP callback retains its origin pid. While tab two is active, its
@@ -1441,9 +1457,12 @@ a^2 + b^2 = c^2
     g().switchProject(firstId)
     await wait(160)
     const backToFirst = g().activeProjectId === firstId
+    const focusRestored = g().layoutMode === 'focus' && g().canvasOpen
     const firstRestored = g().terminals.map((t) => t.id).sort().join() === firstTerms && JSON.stringify(g().dockGrid) === firstGrid
     const parkedSecond = g().projectSlices[secondId]
     const parkedSecondOk = !!parkedSecond && parkedSecond.terminals.map((t) => t.id).sort().join() === secondTerms
+    // Restore the first tab's ordinary Studio layout for downstream probes.
+    g().setLayoutMode('studio')
     // 3) DOM: a .ptab per tab, exactly one marked active
     const ptabs = [...document.querySelectorAll('.tabstrip .ptab')]
     const domTwoTabs = ptabs.length === startTabs + 1
@@ -1466,6 +1485,7 @@ a^2 + b^2 = c^2
     const adaptiveSingle = !!document.querySelector('.tabstrip[data-single="true"] .ptab')
     return {
       twoTabs, isSecondActive, termsDiffer, gridsDiffer, parkedFirstOk, runtimeRouted, activeRuntimeUntouched,
+      layoutIndependent, showSessionsWorks, hideFilesWorks, showFilesWorks, studioWorks, focusRestored,
       backToFirst, firstRestored, parkedSecondOk,
       domTwoTabs, domActiveOne,
       closedGone, stackHas, reopened, reopenedTermsOk, reopenedGridOk, backToSingle, adaptiveSingle,
@@ -2846,7 +2866,7 @@ a^2 + b^2 = c^2
     !persist.stored || !persist.hasTheme || !persist.hasAgent || !persist.hasThread || !persist.hasChatTurn || !persist.hasDraft || !persist.draftBounded || !persist.hasCodexEffort ||
     !boot.hasId || !boot.ran ||
     !auth.hasUrl || auth.code !== 'ABCD-1234' || !auth.done ||
-    !cards.cardPerView || !cards.chatLeftOfFiles || !cards.soloHeadSuppressed || !cards.noDockPanel || !fschk.listed || !fschk.read || !fschk.wrote ||
+    !cards.cardPerView || !cards.chatLeftOfFiles || !cards.soloHeadSuppressed || !cards.noDockPanel || !cards.emptyMessageGone || !fschk.listed || !fschk.read || !fschk.wrote ||
     !fileui.hasSearch || fileui.resultCount < 1 || fileui.tabs < 1 || !fileui.alphaPreview || !fileui.previewReplaced || !fileui.betaPinned || !fileui.hasBeta || !fileui.activeBeta ||
     !fileui.mdPreview || !fileui.mdImage || !fileui.mdMark || !fileui.mdExternal || !fileui.mdReadableChannel || !fileui.mdSplitFillsPane ||
     !fileui.htmlPreview || !fileui.htmlSafe || !fileui.texSource || !fileui.texEditable || !fileui.texNoPreview ||
@@ -2861,11 +2881,12 @@ a^2 + b^2 = c^2
     !layout.sessionsInRail || !layout.hasRailTreeArea || !layout.railHasNoSessions || !layout.addsRow || !layout.focusesNewThread || !layout.noDockChrome ||
     !layout.hasFoot || !layout.footWs || !layout.footConn ||
     !splits.one || !splits.appended || !splits.heads || !splits.stacked || !splits.besides || !splits.uncapped || !splits.closes ||
-    !plus.hasBtn || !plus.noDrag || !plus.pronounced || !plus.hasTerminalOption || !plus.agentChoices || !plus.claudeOpensThread || !plus.claudeNoTerminal || !plus.adds ||
+    !plus.hasBtn || !plus.noDrag || !plus.pronounced || !plus.hasTerminalOption || !plus.agentChoices || !plus.claudeOpensThread || !plus.claudeNoTerminal || !plus.claudeBrandIcon || !plus.openaiBrandIcon || !plus.adds ||
     !canvasR.hasHandle || !canvasR.sized || !canvasR.clampedMin || !canvasR.resets ||
     !canvasMin.shownBefore || !canvasMin.hasBtn || !canvasMin.hidden || !canvasMin.cardsStay || !canvasMin.restoredByNav || !canvasMin.restoredByFile ||
     !lights.three || !lights.bigger || !lights.corner || !lights.noDrag || !lights.ctlApi ||
     !projtabs.twoTabs || !projtabs.isSecondActive || !projtabs.termsDiffer || !projtabs.gridsDiffer || !projtabs.parkedFirstOk || !projtabs.runtimeRouted || !projtabs.activeRuntimeUntouched ||
+    !projtabs.layoutIndependent || !projtabs.showSessionsWorks || !projtabs.hideFilesWorks || !projtabs.showFilesWorks || !projtabs.studioWorks || !projtabs.focusRestored ||
     !projtabs.backToFirst || !projtabs.firstRestored || !projtabs.parkedSecondOk ||
     !projtabs.domTwoTabs || !projtabs.domActiveOne ||
     !projtabs.closedGone || !projtabs.stackHas || !projtabs.reopened || !projtabs.reopenedTermsOk || !projtabs.reopenedGridOk || !projtabs.backToSingle || !projtabs.adaptiveSingle ||

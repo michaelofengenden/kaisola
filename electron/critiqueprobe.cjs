@@ -1,5 +1,5 @@
 // Capture probe for the 4-complaint UI critique pass (top-bar density,
-// light vs dark project tabs, painted-glass chrome, Agents & MCP popover).
+// light vs dark project tabs, Eco chrome, Agents & MCP popover).
 // Pattern copied from solidprobe.cjs (isolated userData, full handler set,
 // invalidate()+600ms before every capturePage()).
 const { app, BrowserWindow, ipcMain } = require('electron')
@@ -64,7 +64,7 @@ app.whenReady().then(async () => {
   await win.loadFile(path.join(__dirname, '..', 'dist', 'index.html'))
   await wait(1800)
 
-  await js(`window.__kaisola.getState().setPerfMode('painted')`)
+  await js(`window.__kaisola.getState().setPerfMode('eco')`)
   await wait(500)
 
   // 4 project tabs total (1 default empty + 3 more) for the tab-strip comparison

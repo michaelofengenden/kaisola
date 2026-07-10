@@ -10,6 +10,7 @@ import { BrowserCard } from './BrowserCard'
 import { LedgerCard } from './LedgerCard'
 import { SessionTabs } from './SessionTabs'
 import { Icon } from '../Icon'
+import { ProviderIcon } from '../ProviderIcon'
 
 // Git diff rendering pulls in CodeMirror. Keep it out of the initial shell
 // bundle; Files and Commit share the same lazy editor chunk on first use.
@@ -72,6 +73,7 @@ export function SessionCards() {
   const panels = useKaisola((s) => s.panels)
   const terminalMeta = useKaisola((s) => s.terminalMeta)
   const workspacePath = useKaisola((s) => s.workspacePath)
+  const perfMode = useKaisola((s) => s.perfMode)
   const removeDockView = useKaisola((s) => s.removeDockView)
   const placeDockView = useKaisola((s) => s.placeDockView)
   const popOutTerminal = useKaisola((s) => s.popOutTerminal)
@@ -80,7 +82,8 @@ export function SessionCards() {
   const setDockColWeights = useKaisola((s) => s.setDockColWeights)
   // Keep only a tiny most-recently-used set of hidden xterms warm. Older ones
   // unmount, persist their viewport/scrollback to disk, and leave the pty alive.
-  const warmTerminalIds = new Set([...everMountedTerminals].slice(-hiddenTerminalResidentCap()))
+  const hiddenCap = hiddenTerminalResidentCap(perfMode)
+  const warmTerminalIds = new Set(hiddenCap > 0 ? [...everMountedTerminals].slice(-hiddenCap) : [])
   // (Record identity is stable across background feed patches → shallow bails.)
   const ghostTerms = useKaisola(
     useShallow((s) => Object.values(s.projectSlices).flatMap((sl) => sl.terminals.filter((t) => warmTerminalIds.has(t.id)))),
@@ -167,6 +170,7 @@ export function SessionCards() {
     poppable?: boolean
     /** Dev-server ports seen in the output — chips that open a browser card. */
     ports?: number[]
+    agentKey?: string
   }
 
   const card = (id: string, icon: string, label: string, body: ReactNode, idn?: CardIdentity) => {
@@ -210,7 +214,9 @@ export function SessionCards() {
             onDragEnd={() => { dragRef.current = null; setDrop(null); shellDrag.end() }}
             title="Drag onto another card's edge to place it there"
           >
-            <Icon name={icon} size={12} className="pane-head-icon" />
+            {idn?.agentKey
+              ? <ProviderIcon provider={idn.agentKey} name={label} size={12} className="pane-head-icon" />
+              : <Icon name={icon} size={12} className="pane-head-icon" />}
             <span className="pane-head-title truncate">{label}</span>
             {idn?.running && <span className="session-busy" title="Running" />}
             {!idn?.running && idn?.failed && <span className="pane-fail-dot" title="Last command failed" />}
@@ -291,6 +297,7 @@ export function SessionCards() {
         const label = threadLabel(t, agents, threads, i)
         return card(t.id, 'Sparkles', label, pos.has(t.id) ? <Assistant threadId={t.id} /> : null, {
           hue: sessionHue({ agentKey: t.agentKey }),
+          agentKey: t.agentKey,
           running: t.busy,
         })
       })}

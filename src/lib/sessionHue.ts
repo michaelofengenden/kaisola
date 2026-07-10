@@ -3,7 +3,7 @@
  * terminal owns the app accent); plain shells hash their REPO ROOT (fallback
  * cwd), so two terminals in the same tree share a stripe — the color means
  * "same folder", not "different tab". Saturation stays low: a whisper, not a
- * painted header.
+ * session header.
  */
 
 const AGENT_HUES: Record<string, string> = {

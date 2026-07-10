@@ -57,8 +57,8 @@ export type Theme = 'dark' | 'light'
 /** 'system' follows macOS appearance live (incl. scheduled/sunset switches). */
 export type ThemeMode = Theme | 'system'
 export type LayoutMode = 'focus' | 'studio'
-/** Appearance energy, ranked by GPU cost: live glass > painted glass > eco. */
-export type PerfMode = 'glass' | 'painted' | 'eco'
+/** Appearance energy: native live glass or the opaque, still Eco shell. */
+export type PerfMode = 'glass' | 'eco'
 export type PaletteMode = 'commands' | 'files'
 
 /** A working-tree checkpoint — a real (hidden-ref) git commit of everything. */
@@ -558,7 +558,7 @@ function provenanceKey(link: ProvenanceLink): string {
  * reset-on-switch ephemeral cursor (bucket F, rebuilt) — see `resetEphemeralCursors`.
  */
 export const PROJECT_SLICE_PERSIST_KEYS = [
-  'project', 'stage', 'workspacePath', 'autonomy', 'agentPreset', 'claudeAccountId', 'fileTabs', 'openFilePath',
+  'project', 'stage', 'layoutMode', 'workspacePath', 'autonomy', 'agentPreset', 'claudeAccountId', 'fileTabs', 'openFilePath',
   'repoCheckpoints', 'followAgent', 'annotations', 'assistantThreads', 'assistantRuntimes',
   'assistantDrafts', 'assistantPromptQueues',
   'activeThreadId', 'terminals', 'panels', 'sessionGroups', 'pinnedSessions', 'worktreeSessions',
@@ -596,13 +596,13 @@ export const shellConfigDir = (dir: string): string =>
     : `'${dir.replace(/'/g, `'\\''`)}'`
 
 const GLOBAL_KEYS = [
-  'theme', 'themeMode', 'layoutMode', 'agentModels', 'fileTextZoom', 'termFontSize', 'termFontFamily',
+  'theme', 'themeMode', 'agentModels', 'fileTextZoom', 'termFontSize', 'termFontFamily',
   'termFontWeight', 'termCursorColor', 'termBackground', 'customAgents', 'enabledAgents', 'sessionTemplates', 'claudeModel', 'reasoningProvider',
   'localBaseUrl', 'localModel', 'openaiBaseUrl', 'openaiModel', 'openAlexMailto', 'grobidEndpoint',
   'sandboxMode', 'workflows', 'automationsEnabled', 'perfMode', 'railWidth', 'railOpen', 'claudeSessions',
   'wordDiffs', 'showCosts', 'inbox', 'draftRestore', 'wallpaperTint', 'claudeAccounts',
   'claudeTerminalModel', 'claudeFastMode',
-  'permissionRules', 'sensitiveGlobs', 'latexMain', 'unsavedBuffers', 'termDrafts',
+  'permissionRules', 'sensitiveGlobs', 'latexMain', 'unsavedBuffers', 'termDrafts', 'onboardingVersion',
 ] as const
 
 type ProjectSlicePersist = Pick<KaisolaState, (typeof PROJECT_SLICE_PERSIST_KEYS)[number]>
@@ -769,9 +769,10 @@ interface KaisolaState {
   /** Text zoom inside the Files viewer, driven by pinch gestures. */
   fileTextZoom: number
   /** Terminal font size (⌘+/⌘−/⌘0, persisted; applies to every terminal). */
-  /** Appearance energy: 'glass' live translucency · 'painted' opaque window
-   *  drawing its own pre-blurred wallpaper · 'eco' solid and still. */
+  /** Appearance energy: 'glass' live translucency · 'eco' solid and still. */
   perfMode: PerfMode
+  /** Zero only for a genuinely fresh install; migrations mark existing users done. */
+  onboardingVersion: number
   /** Width of the left workspace rail in px (null = the CSS default). */
   railWidth: number | null
   /** Left workspace rail visibility — the strip button / ⌘B (persisted). */
@@ -872,6 +873,7 @@ interface KaisolaState {
   setLayoutMode: (mode: LayoutMode) => void
   toggleLayoutMode: () => void
   setAutonomy: (a: AutonomyLevel) => void
+  completeOnboarding: () => void
   openPalette: (mode?: PaletteMode) => void
   closePalette: () => void
   togglePalette: (mode?: PaletteMode) => void
@@ -1480,6 +1482,18 @@ function gridState(grid: string[][], extra: object = {}) {
 const gridWithout = (grid: string[][], id: string) =>
   grid.map((col) => col.filter((v) => v !== id)).filter((col) => col.length)
 
+/** Make the sessions area visibly useful. A boolean dockOpen with an empty
+ * grid was the source of "Show sessions" doing nothing. */
+function visibleDockState(
+  s: Pick<KaisolaState, 'dockViews' | 'dockGrid' | 'activeThreadId' | 'assistantThreads' | 'terminals'>,
+  extra: Record<string, unknown> = {},
+) {
+  if (s.dockViews.length) return { dockOpen: true, ...extra }
+  const thread = s.assistantThreads.find((entry) => entry.id === s.activeThreadId) ?? s.assistantThreads[0]
+  const id = thread?.id ?? s.terminals[0]?.id
+  return id ? gridState([[id]], { dockOpen: true, ...extra }) : { dockOpen: true, ...extra }
+}
+
 // ── PROJECT TABS: slice helpers ───────────────────────────────────────────────
 // terminals popped into their own window — the pop OWNS the pty, so closeProject
 // must NOT schedule its grace-kill (risk #4). Renderer-scoped, not persisted.
@@ -1522,6 +1536,7 @@ const freshSlice = (pid: string, path: string | null = null): ProjectSliceMemory
   return {
     project: emptyProject(),
     stage: 'files',
+    layoutMode: 'studio',
     workspacePath: path,
     autonomy: 'propose',
     agentPreset: 'codex',
@@ -1561,9 +1576,9 @@ const projectFields = (s: KaisolaState, pid: string): ProjectSliceMemory =>
 // The provider owns its complete conversational context. Kaisola keeps a
 // smooth recent renderer window and fsyncs everything older to its pageable
 // JSONL archive. This deliberately spends disk instead of Chromium heap.
-const ASSISTANT_LIVE_TURNS = 60
-const ASSISTANT_ARCHIVE_TRIGGER_TURNS = 72
-const ASSISTANT_ARCHIVE_BATCH_TURNS = 64
+const ASSISTANT_LIVE_TURNS = 40
+const ASSISTANT_ARCHIVE_TRIGGER_TURNS = 48
+const ASSISTANT_ARCHIVE_BATCH_TURNS = 40
 const ASSISTANT_ARCHIVE_BATCH_BYTES = 8 * 1024 * 1024
 const utf8 = new TextEncoder()
 /** Select a count-bounded and byte-bounded prefix while retaining the latest
@@ -1714,6 +1729,7 @@ function sanitizeSliceForPersist(slice: ProjectSliceMemory): ProjectSlicePersist
       ...Object.entries(slice.worktreeSessions).filter(([id]) => validIds.has(id)),
       ...Object.entries(slice.worktreeSessions).filter(([id]) => !validIds.has(id)).slice(-20),
     ]),
+    layoutMode: slice.layoutMode,
     latexMode: slice.latexMode,
     dockGrid: sessionGrid.dockGrid,
     dockViews: sessionGrid.dockViews,
@@ -1735,7 +1751,6 @@ function persistSnapshot(s: KaisolaState) {
     // GLOBAL (bucket B + C) with the same caps as before
     theme: s.theme,
     themeMode: s.themeMode,
-    layoutMode: s.layoutMode,
     agentModels: s.agentModels,
     fileTextZoom: s.fileTextZoom,
     termFontSize: s.termFontSize,
@@ -1766,6 +1781,7 @@ function persistSnapshot(s: KaisolaState) {
     inbox: s.inbox,
     draftRestore: s.draftRestore,
     wallpaperTint: s.wallpaperTint,
+    onboardingVersion: s.onboardingVersion,
     perfMode: s.perfMode,
     railWidth: s.railWidth,
     railOpen: s.railOpen,
@@ -2029,9 +2045,10 @@ export const useKaisola = create<KaisolaState>()(
   fileDirty: false,
   fileTabs: [],
   fileTextZoom: 1,
-  // painted is the out-of-the-box mode: the glass look at a fraction of the
-  // energy. Existing installs keep whatever they chose (persisted/migrated).
-  perfMode: 'painted' as PerfMode,
+  // Fresh installs start in the lowest-memory shell. Live Glass remains one
+  // click away; removed painted-glass installs migrate to Eco losslessly.
+  perfMode: 'eco' as PerfMode,
+  onboardingVersion: 0,
   railWidth: null,
   // Traycer-style quiet start: fresh installs open on the canvas alone; ⌘B
   // (or the strip's panel button) summons the rail. Existing installs keep
@@ -2095,6 +2112,7 @@ export const useKaisola = create<KaisolaState>()(
     }
     for (const w of armed) get().runWorkflow(w.id)
   },
+  completeOnboarding: () => set({ onboardingVersion: 1 }),
   toggleTheme: () => {
     // a manual toggle is an EXPLICIT choice — it leaves system mode
     const next = get().theme === 'dark' ? 'light' : 'dark'
@@ -2122,8 +2140,12 @@ export const useKaisola = create<KaisolaState>()(
     document.documentElement.dataset.theme = eff
     set({ themeMode: t, theme: eff })
   },
-  setLayoutMode: (mode) => set({ layoutMode: mode }),
-  toggleLayoutMode: () => set((s) => ({ layoutMode: s.layoutMode === 'focus' ? 'studio' : 'focus' })),
+  setLayoutMode: (mode) => set((s) => mode === 'focus'
+    ? { layoutMode: 'focus', canvasOpen: true }
+    : visibleDockState(s, { layoutMode: 'studio', canvasOpen: true })),
+  toggleLayoutMode: () => set((s) => s.layoutMode === 'focus'
+    ? visibleDockState(s, { layoutMode: 'studio', canvasOpen: true })
+    : { layoutMode: 'focus', canvasOpen: true }),
   setAutonomy: (a) => {
     set({ autonomy: a })
     // tell main NOW — main gates each connection's permissions on its per-entry
@@ -2145,7 +2167,9 @@ export const useKaisola = create<KaisolaState>()(
   showProvenance: (t) => set({ provenance: t }),
   hideProvenance: () => set({ provenance: null }),
   focusProposal: (id) => set({ focusedProposalId: id }),
-  toggleDock: () => set((s) => ({ dockOpen: !s.dockOpen })),
+  toggleDock: () => set((s) => s.layoutMode === 'studio' && s.dockOpen
+    ? { dockOpen: false }
+    : visibleDockState(s, { layoutMode: 'studio' })),
   // kept for callers/harnesses that think in panes: 'assistant' focuses the
   // active thread, 'terminal' the current/first terminal.
   setDock: (open, tab) =>
@@ -2156,7 +2180,9 @@ export const useKaisola = create<KaisolaState>()(
           : tab === 'terminal' && s.terminals.length && !s.terminals.some((t) => s.dockViews.includes(t.id))
             ? s.terminals[0].id
             : null
-      return focus ? gridState([[focus]], { dockOpen: open }) : { dockOpen: open }
+      if (!open) return { dockOpen: false }
+      if (focus) return gridState([[focus]], { dockOpen: true, layoutMode: 'studio' })
+      return visibleDockState(s, { layoutMode: 'studio' })
     }),
   // showing a session never tears down the layout you built — an unopened
   // session joins as a new card on the right. Viewing clears its amber dot.
@@ -2282,7 +2308,15 @@ export const useKaisola = create<KaisolaState>()(
   setDockColWeights: (weights) =>
     set({ dockColWeights: weights && weights.length ? weights.map((w) => Math.max(0.15, w)) : null }),
   // minimizing the main view leaves only the session cards — so keep them shown
-  toggleCanvas: () => set((s) => (s.canvasOpen ? { canvasOpen: false, dockOpen: true } : { canvasOpen: true })),
+  toggleCanvas: () => set((s) => {
+    // Focus always renders the canvas, so "Hide files" must first return to
+    // Studio and reveal a real session. Otherwise the button changes state
+    // while the screen visibly does nothing.
+    if (s.layoutMode === 'focus' || s.canvasOpen) {
+      return visibleDockState(s, { layoutMode: 'studio', canvasOpen: false })
+    }
+    return { canvasOpen: true }
+  }),
   requestTerminal: (command, opts) =>
     set((s) => {
       // reveal: false ensures the terminal exists without touching the layout —
@@ -4841,7 +4875,12 @@ export const useKaisola = create<KaisolaState>()(
       // v8 (2026-07-08): termBackground 'paper' was the accidental DEFAULT for
       // one release (light terminal inside the dark app) — reset it to 'ink'
       // (theme-following); paper stays available as an explicit choice.
-      version: 8,
+      // v9 (2026-07-10): painted glass was removed. Existing users must not be
+      // shown first-run onboarding after an upgrade, so migration also marks
+      // them complete; only a store that never existed starts at zero.
+      // v10: layout is project-scoped, so Studio/Focus never leaks to every
+      // project tab and session/canvas visibility stays internally coherent.
+      version: 10,
       migrate: (persisted, version) => {
         const toV7 = (p: unknown) => {
           const rec = p as Record<string, unknown>
@@ -4856,9 +4895,31 @@ export const useKaisola = create<KaisolaState>()(
           if (rec && typeof rec === 'object' && rec.termBackground === 'paper') rec.termBackground = 'ink'
           return p
         }
-        if (version >= 8) return persisted
-        if (version === 7) return toV8(persisted)
-        if (version === 6) return toV8(toV7(persisted))
+        const toV9 = (p: unknown) => {
+          const rec = p as Record<string, unknown>
+          if (rec && typeof rec === 'object') {
+            if (rec.perfMode === 'painted') rec.perfMode = 'eco'
+            rec.onboardingVersion = 1
+          }
+          return p
+        }
+        const toV10 = (p: unknown) => {
+          const rec = p as Record<string, any>
+          if (!rec || typeof rec !== 'object') return p
+          const mode = rec.layoutMode === 'focus' ? 'focus' : 'studio'
+          if (rec.projectSlices && typeof rec.projectSlices === 'object') {
+            for (const slice of Object.values(rec.projectSlices) as Array<Record<string, unknown>>) {
+              if (slice && typeof slice === 'object' && slice.layoutMode !== 'focus' && slice.layoutMode !== 'studio') slice.layoutMode = mode
+            }
+          }
+          delete rec.layoutMode
+          return p
+        }
+        if (version >= 10) return persisted
+        if (version === 9) return toV10(persisted)
+        if (version === 8) return toV10(toV9(persisted))
+        if (version === 7) return toV10(toV9(toV8(persisted)))
+        if (version === 6) return toV10(toV9(toV8(toV7(persisted))))
         const flat = migrateFlatV5(persisted)
         const pid = uid('proj')
         const ws = flat.workspacePath ?? null
@@ -4871,7 +4932,7 @@ export const useKaisola = create<KaisolaState>()(
           const v = (flat as Record<string, unknown>)[k]
           if (v !== undefined) (base as Record<string, unknown>)[k] = v
         }
-        return toV8(toV7({
+        return toV10(toV9(toV8(toV7({
           ...pickGlobals(flat as Record<string, unknown>),
           // pickGlobals no longer knows ecoMode — hand it to toV7 explicitly
           ecoMode: (flat as Record<string, unknown>).ecoMode,
@@ -4879,7 +4940,7 @@ export const useKaisola = create<KaisolaState>()(
           activeProjectId: pid,
           projectSlices: { [pid]: sanitizeSliceForPersist(base) },
           recentProjects: ws ? [{ path: ws, name, at: Date.now() }] : [],
-        }))
+        }))))
       },
       // split the persisted blob back apart SYNCHRONOUSLY (getItem is sync → no
       // rehydration flash). Spread `current` FIRST so action fns are never
@@ -4899,6 +4960,7 @@ export const useKaisola = create<KaisolaState>()(
         return {
           ...cur, // defaults + ACTION FUNCTIONS (must be first)
           ...pickGlobals(p), // bucket B + C
+          perfMode: p.perfMode === 'glass' ? 'glass' : 'eco',
           // pre-themeMode blobs carried only an explicit theme — honor it rather
           // than silently flipping existing users to system-following
           themeMode: (p as { themeMode?: ThemeMode }).themeMode ?? (p as { theme?: Theme }).theme ?? 'system',

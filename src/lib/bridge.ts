@@ -146,6 +146,20 @@ export interface AuthEvent {
   error?: string
   tail?: string
 }
+export interface AppIdentity {
+  provider: 'google'
+  id: string
+  email: string
+  name?: string
+  signedInAt?: number
+}
+export interface AppAuthStatus {
+  ok?: boolean
+  configured: boolean
+  pending?: boolean
+  profile?: AppIdentity | null
+  message?: string
+}
 export interface AcpMeta {
   presetId?: string
   name: string
@@ -670,6 +684,12 @@ export interface KaisolaBridge {
     start(command: string, args: string[], onEvent: (ev: AuthEvent) => void): string
     cancel(id: string): Promise<{ ok: boolean }>
   }
+  appAuth: {
+    status(): Promise<AppAuthStatus>
+    signInGoogle(): Promise<AppAuthStatus>
+    signOut(): Promise<AppAuthStatus>
+    onChanged(cb: (status: AppAuthStatus) => void): () => void
+  }
   fs: {
     list(dir: string): Promise<{ ok: boolean; entries?: FsEntry[]; message?: string }>
     search(root: string, query: string): Promise<FsSearchResult>
@@ -734,9 +754,9 @@ export interface KaisolaBridge {
    * PTYs/agent turns remain alive; after repeated swaps a manual restart may be
    * requested without automatically terminating work. */
   reapplyWindow(): Promise<{ ok: boolean; unchanged?: boolean; restartRequired?: boolean; busy?: boolean; awaitingPermission?: boolean; message?: string }>
-  /** Wallpaper-sampled glass wash (macOS; failures degrade to the theme tint). */
+  /** Tiny wallpaper-average sample for live chrome tint (macOS). */
   glassWash: {
-    sample(): Promise<{ ok: boolean; avg?: { r: number; g: number; b: number }; blurDataUrl?: string; screen?: { x: number; y: number; w: number; h: number } }>
+    sample(): Promise<{ ok: boolean; avg?: { r: number; g: number; b: number } }>
     onRefresh(cb: () => void): () => void
   }
   /** Multi-window: full slot windows + terminal pop-outs + project-tab menu wiring. */
@@ -1026,6 +1046,20 @@ const webMock: KaisolaBridge = {
     },
     async cancel() {
       return { ok: true }
+    },
+  },
+  appAuth: {
+    async status() {
+      return { configured: false, profile: null }
+    },
+    async signInGoogle() {
+      return { ok: false, configured: false, message: DESKTOP_ONLY }
+    },
+    async signOut() {
+      return { ok: true, configured: false, profile: null }
+    },
+    onChanged() {
+      return () => {}
     },
   },
   fs: {

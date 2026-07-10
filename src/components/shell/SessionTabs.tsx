@@ -5,12 +5,14 @@ import { sessionHue, terminalAgentKey } from '../../lib/sessionHue'
 import { useAgentRegistry, openAgentSession } from '../../lib/registry'
 import { urlHost, terminalLabel, threadLabel } from '@/lib/sessionLabel'
 import { Icon } from '../Icon'
+import { ProviderIcon } from '../ProviderIcon'
 import { Dropdown } from '../Dropdown'
 import { CostChip } from './CostChip'
 
 interface STab {
   id: string
   icon: string
+  agentKey?: string
   label: string
   hue: string
   /** Pulse while working; completed stays still until the session is viewed. */
@@ -74,6 +76,7 @@ export function SessionTabs() {
     tabs.set(t.id, {
       id: t.id,
       icon: 'Sparkles',
+      agentKey: t.agentKey,
       label,
       hue: sessionHue({ agentKey: t.agentKey }),
       state: pendingPermissions.some((permission) => permission.key === `${t.agentKey}::${t.id}`)
@@ -199,7 +202,9 @@ export function SessionTabs() {
                 title={t.title}
               >
                 <span className="stab-badge" />
-                <Icon name={t.icon} size={12} className="stab-icon" />
+                {t.kind === 'thread'
+                  ? <ProviderIcon provider={t.agentKey} name={t.label} size={12} className="stab-icon" />
+                  : <Icon name={t.icon} size={12} className="stab-icon" />}
                 {editing === t.id ? (
                   <input
                     className="stab-label"

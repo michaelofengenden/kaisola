@@ -10,7 +10,10 @@ const readline = require('node:readline')
 const MAX_BATCH_TURNS = 100
 const MAX_BATCH_BYTES = 24 * 1024 * 1024
 const MAX_RECORD_BYTES = MAX_BATCH_BYTES + 1024
-const MAX_PAGE_BYTES = 24 * 1024 * 1024
+// Renderer pages are intentionally small; the archive itself remains complete
+// and append-only on disk. Paging again is cheaper than pinning tens of MB in
+// both Electron main and Chromium for an idle transcript.
+const MAX_PAGE_BYTES = 6 * 1024 * 1024
 const MAX_PENDING_BYTES = 32 * 1024 * 1024
 
 const safeId = (id) => crypto.createHash('sha256').update(String(id)).digest('hex').slice(0, 40)

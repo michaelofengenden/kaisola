@@ -184,16 +184,16 @@ class AcpConnection {
         })
         this.respond(id, { terminalId })
       } else if (method === 'terminal/output') {
-        const o = this.hooks.terminalHost.output(params.terminalId)
+        const o = await this.hooks.terminalHost.output(params.terminalId)
         this.respond(id, o)
       } else if (method === 'terminal/wait_for_exit') {
         const r = await this.hooks.terminalHost.waitForExit(params.terminalId)
         this.respond(id, { exitStatus: r })
       } else if (method === 'terminal/kill') {
-        this.hooks.terminalHost.kill(params.terminalId)
+        await this.hooks.terminalHost.kill(params.terminalId)
         this.respond(id, {})
       } else if (method === 'terminal/release') {
-        this.hooks.terminalHost.release(params.terminalId)
+        await this.hooks.terminalHost.release(params.terminalId)
         this.respond(id, {})
       } else {
         this.respondError(id, -32601, `Method not handled: ${method}`)

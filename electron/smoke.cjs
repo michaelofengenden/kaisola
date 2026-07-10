@@ -477,6 +477,82 @@ app.whenReady().then(async () => {
   })()`)
   console.log('TERMINAL=' + JSON.stringify(term))
 
+  // 4b) window hibernation tears down the renderer only: after the grace the
+  //     broker owns the same live PTY + disk spool, visibility reattaches it,
+  //     replays hidden output, and an existing boot command is never re-run.
+  //     The across-update receipt is durable until it is actually seen.
+  const terminalContinuity = await win.webContents.executeJavaScript(`(async () => {
+    const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
+    const st = window.__kaisola.getState()
+    const markerFile = '/tmp/kaisola-hibernate-smoke.txt'
+    await window.kaisola.fs.write(markerFile, '')
+    st.setLayoutMode('studio')
+    st.requestTerminal("printf 'boot-once\\n' >> " + markerFile, { name: 'Hibernate smoke' })
+    const id = st.terminals[st.terminals.length - 1].id
+    st.setDockView(id)
+    const originalHidden = Object.getOwnPropertyDescriptor(document, 'hidden')
+    let forcedHidden = false
+    Object.defineProperty(document, 'hidden', { configurable: true, get: () => forcedHidden })
+    document.dispatchEvent(new Event('visibilitychange'))
+    await wait(1500) // terminal create + one-shot boot
+    const before = (await window.kaisola.terminal.diagnostics()).find((row) => row.id === id)
+    const hostBefore = document.querySelector('.term-wrap[data-terminal-id="' + id + '"]')
+
+    forcedHidden = true
+    document.dispatchEvent(new Event('visibilitychange'))
+    await wait(1550) // > WINDOW_HIBERNATE_GRACE_MS
+    const asleepHost = document.querySelector('.term-wrap[data-terminal-id="' + id + '"]')
+    const asleepDiag = (await window.kaisola.terminal.diagnostics()).find((row) => row.id === id)
+    const rendererReleased = asleepHost?.getAttribute('data-renderer-awake') === 'false' && asleepDiag?.visible === false
+    await window.kaisola.terminal.write(id, 'echo hidden-output\\r')
+    await wait(300)
+    const detachedSnap = await window.kaisola.terminal.snapshot(id)
+    const spooled = (detachedSnap.output || '').includes('hidden-output')
+
+    forcedHidden = false
+    document.dispatchEvent(new Event('visibilitychange'))
+    await wait(750)
+    const awakeHost = document.querySelector('.term-wrap[data-terminal-id="' + id + '"]')
+    const after = (await window.kaisola.terminal.diagnostics()).find((row) => row.id === id)
+    const snap = await window.kaisola.terminal.snapshot(id)
+    const samePid = !!before?.pid && before.pid === after?.pid && !after?.exited
+    const replayed = (snap.output || '').includes('hidden-output')
+    const reattached = awakeHost?.getAttribute('data-renderer-awake') === 'true' && after?.visible === true
+    const bootFile = await window.kaisola.fs.read(markerFile)
+    const bootOnce = !!bootFile.ok && (bootFile.content.match(/boot-once/g) || []).length === 1
+
+    st.setTerminalContinuation(id, { sameProcess: true, at: Date.now(), terminalPid: after?.pid, outputBytes: 42 })
+    await wait(950) // outlast persisted-store throttle
+    const raw = window.kaisola.db.getSync('kaisola-store') || ''
+    const receiptPersisted = raw.includes('"continued":{"sameProcess":true')
+    const tabReceipt = !!document.querySelector('.stab[data-sid="' + id + '"] .stab-continuity')
+    const receipt = document.querySelector('.term-wrap[data-terminal-id="' + id + '"] .term-continuity')
+    const receiptShown = /Continued/.test(receipt?.textContent || '') && /same process/.test(receipt?.textContent || '')
+    receipt?.click()
+    await wait(80)
+    const receiptCleared = !window.__kaisola.getState().terminals.find((terminal) => terminal.id === id)?.continued &&
+      !document.querySelector('.stab[data-sid="' + id + '"] .stab-continuity')
+
+    if (originalHidden) Object.defineProperty(document, 'hidden', originalHidden)
+    else delete document.hidden
+    await window.kaisola.terminal.kill(id)
+    st.closeTerminal(id)
+    return {
+      mounted: !!hostBefore && before?.visible === true,
+      rendererReleased,
+      reattached,
+      samePid,
+      spooled,
+      replayed,
+      bootOnce,
+      receiptPersisted,
+      tabReceipt,
+      receiptShown,
+      receiptCleared,
+    }
+  })()`)
+  console.log('TERMINAL_CONTINUITY=' + JSON.stringify(terminalContinuity))
+
   // 5) live model wiring — no key in the sandbox, so it must degrade gracefully
   const model = await win.webContents.executeJavaScript(`(async () => {
     const k = await window.kaisola.settings.hasApiKey()
@@ -637,11 +713,14 @@ app.whenReady().then(async () => {
     await new Promise((r) => setTimeout(r, 180))
     const card = document.querySelector('.agent-livebar')
     const text = card?.textContent || ''
+    const liveDot = card?.querySelector('.agent-live-dot')
+    const liveDotStyle = liveDot ? getComputedStyle(liveDot) : null
     return {
       card: !!card,
       hasSubagent: /coding subagent/.test(text) && !!card?.querySelector('.agent-live-pill svg'),
       hasTerminal: /npm run smoke/.test(text),
       hasStatus: !!card?.querySelector('.agent-live-dot') && !document.querySelector('.agent-activity'),
+      standardizedDot: liveDotStyle?.width === '6px' && liveDotStyle?.height === '6px',
       openBtn: !!card?.querySelector('button.agent-live-pill'),
       noContext: !document.querySelector('.context-ledger'),
       noMention: !document.querySelector('button[title^="Reference a paper"]'),
@@ -676,6 +755,13 @@ app.whenReady().then(async () => {
     get().enqueueAssistantPrompt(tid, { text: 'queue-smoke-second', attachments: [], mentions: [], speed: 'default' })
     get().enqueueAssistantPrompt(tid, { text: 'queue-smoke-third', attachments: [], mentions: [], speed: 'fast' })
     const queuedTwo = (get().assistantPromptQueues[tid] || []).length === 2
+    await wait(80)
+    const queueCapsule = assistant?.querySelector('.composer-queue-capsule')
+    const compactCapsule = !!queueCapsule && !assistant?.querySelector('.composer-queue, .queue-chip')
+    queueCapsule?.click()
+    await wait(60)
+    const queuePopover = document.querySelectorAll('.queue-pop .queue-pop-row').length === 2
+    queueCapsule?.click()
     for (let i = 0; i < 180; i++) {
       const state = get()
       const threadBusy = state.assistantThreads.find((thread) => thread.id === tid)?.busy
@@ -691,6 +777,8 @@ app.whenReady().then(async () => {
     return {
       started,
       queuedTwo,
+      compactCapsule,
+      queuePopover,
       drained: !(state.assistantPromptQueues[tid] || []).length && !state.assistantThreads.find((thread) => thread.id === tid)?.busy,
       combinedOnce: users.length === 2 && combined.length === 1 && combined[0].text.indexOf('queue-smoke-second') < combined[0].text.indexOf('queue-smoke-third'),
       deliveredTogether: turns.some((turn) => turn.kind === 'assistant' && turn.text.includes('queue-smoke-second') && turn.text.includes('queue-smoke-third')),
@@ -770,7 +858,7 @@ app.whenReady().then(async () => {
     return {
       cardPerView: shown.length === window.__kaisola.getState().dockViews.length,
       chatLeftOfFiles: !!(s0 && c && s0.left < c.left),
-      hasHead: !!document.querySelector('.session-card[data-show="true"] .pane-head'),
+      soloHeadSuppressed: !!document.querySelector('.session-card[data-show="true"][data-headless="true"]') && !document.querySelector('.session-card[data-show="true"] .pane-head'),
       noDockPanel: !document.querySelector('.dock'),
     }
   })()`)
@@ -1375,11 +1463,12 @@ a^2 + b^2 = c^2
     g().closeProject(secondId, { force: true })
     await wait(140)
     const backToSingle = g().projectTabs.length === startTabs && g().activeProjectId === firstId
+    const adaptiveSingle = !!document.querySelector('.tabstrip[data-single="true"] .ptab')
     return {
       twoTabs, isSecondActive, termsDiffer, gridsDiffer, parkedFirstOk, runtimeRouted, activeRuntimeUntouched,
       backToFirst, firstRestored, parkedSecondOk,
       domTwoTabs, domActiveOne,
-      closedGone, stackHas, reopened, reopenedTermsOk, reopenedGridOk, backToSingle,
+      closedGone, stackHas, reopened, reopenedTermsOk, reopenedGridOk, backToSingle, adaptiveSingle,
     }
   })()`)
   console.log('PROJTABS=' + JSON.stringify(projtabs))
@@ -2742,6 +2831,8 @@ a^2 + b^2 = c^2
     !emptyOk || !demoOk ||
     !review.opened || !review.closed || !review.decided ||
     !term.run || !term.ptyOk || !term.cdWorks || !term.dock || !term.host || !term.lightComposerPalette ||
+    !terminalContinuity.mounted || !terminalContinuity.rendererReleased || !terminalContinuity.reattached || !terminalContinuity.samePid || !terminalContinuity.spooled || !terminalContinuity.replayed || !terminalContinuity.bootOnce ||
+    !terminalContinuity.receiptPersisted || !terminalContinuity.tabReceipt || !terminalContinuity.receiptShown || !terminalContinuity.receiptCleared ||
     !model.shape || !model.graceful ||
     !acp.connect || !acp.ok || !acp.claudeTerminal || !acp.ranCommand || acp.termEvents < 1 || !acp.cancelOk ||
     acp.authCount < 1 || !acp.authOk || !acp.authUrlSeen || !acp.setModelOk || acp.modelAfter !== 'mock-mini' ||
@@ -2750,12 +2841,12 @@ a^2 + b^2 = c^2
     !dd.hasBtn || !dd.portal || dd.items < 2 ||
     !permrules.saved || !permrules.cascaded || !permrules.autoAnswered || !permrules.rejectCascade ||
     !sensitive.surfaced || !sensitive.stillPending || !sensitive.diffFlagged || sensitive.pendingAfter !== 0 ||
-    !activityUi.card || !activityUi.hasSubagent || !activityUi.hasTerminal || !activityUi.hasStatus || !activityUi.openBtn || !activityUi.noContext || !activityUi.noMention || !activityUi.compactChrome || !activityUi.overflow ||
-    !promptQueue.started || !promptQueue.queuedTwo || !promptQueue.drained || !promptQueue.combinedOnce || !promptQueue.deliveredTogether || !promptQueue.newestSpeedWon ||
+    !activityUi.card || !activityUi.hasSubagent || !activityUi.hasTerminal || !activityUi.hasStatus || !activityUi.standardizedDot || !activityUi.openBtn || !activityUi.noContext || !activityUi.noMention || !activityUi.compactChrome || !activityUi.overflow ||
+    !promptQueue.started || !promptQueue.queuedTwo || !promptQueue.compactCapsule || !promptQueue.queuePopover || !promptQueue.drained || !promptQueue.combinedOnce || !promptQueue.deliveredTogether || !promptQueue.newestSpeedWon ||
     !persist.stored || !persist.hasTheme || !persist.hasAgent || !persist.hasThread || !persist.hasChatTurn || !persist.hasDraft || !persist.draftBounded || !persist.hasCodexEffort ||
     !boot.hasId || !boot.ran ||
     !auth.hasUrl || auth.code !== 'ABCD-1234' || !auth.done ||
-    !cards.cardPerView || !cards.chatLeftOfFiles || !cards.hasHead || !cards.noDockPanel || !fschk.listed || !fschk.read || !fschk.wrote ||
+    !cards.cardPerView || !cards.chatLeftOfFiles || !cards.soloHeadSuppressed || !cards.noDockPanel || !fschk.listed || !fschk.read || !fschk.wrote ||
     !fileui.hasSearch || fileui.resultCount < 1 || fileui.tabs < 1 || !fileui.alphaPreview || !fileui.previewReplaced || !fileui.betaPinned || !fileui.hasBeta || !fileui.activeBeta ||
     !fileui.mdPreview || !fileui.mdImage || !fileui.mdMark || !fileui.mdExternal || !fileui.mdReadableChannel || !fileui.mdSplitFillsPane ||
     !fileui.htmlPreview || !fileui.htmlSafe || !fileui.texSource || !fileui.texEditable || !fileui.texNoPreview ||
@@ -2777,7 +2868,7 @@ a^2 + b^2 = c^2
     !projtabs.twoTabs || !projtabs.isSecondActive || !projtabs.termsDiffer || !projtabs.gridsDiffer || !projtabs.parkedFirstOk || !projtabs.runtimeRouted || !projtabs.activeRuntimeUntouched ||
     !projtabs.backToFirst || !projtabs.firstRestored || !projtabs.parkedSecondOk ||
     !projtabs.domTwoTabs || !projtabs.domActiveOne ||
-    !projtabs.closedGone || !projtabs.stackHas || !projtabs.reopened || !projtabs.reopenedTermsOk || !projtabs.reopenedGridOk || !projtabs.backToSingle ||
+    !projtabs.closedGone || !projtabs.stackHas || !projtabs.reopened || !projtabs.reopenedTermsOk || !projtabs.reopenedGridOk || !projtabs.backToSingle || !projtabs.adaptiveSingle ||
     !windetach.spawned || !windetach.adopted || !windetach.termsMoved || !windetach.globalsMoved || !windetach.styleApplied || !windetach.draftMoved || !windetach.srcDropped ||
     !windetach.recombined || !windetach.insertedAtDrop || !windetach.termsSame || !windetach.pidsSame || !windetach.sourceClosed || !windetach.targetReused || !windetach.windowCountRestored ||
     !toggle.hasFig || !toggle.visibleAtRest || !toggle.putAway || !toggle.back || !toggle.hidesAll ||

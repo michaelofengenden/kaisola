@@ -5,14 +5,53 @@
 // flow back to the agent.
 const os = require('node:os')
 const path = require('node:path')
+const fs = require('node:fs')
 const { agentEnv } = require('./shellEnv.cjs')
 const { TerminalSpool, DEFAULT_HOT_CAP } = require('./terminalSpool.cjs')
 
 let pty = null
-try {
-  pty = require('node-pty')
-} catch (err) {
-  console.error('[pasola] node-pty unavailable:', err.message)
+let ptyLoadAttempted = false
+
+/** Hardened macOS apps may load node-pty's native module from Resources, but
+ * posix_spawn refuses its nested spawn-helper at that location. Copy only the
+ * signed 50 KB helper into private userData and point node-pty at that stable
+ * executable. The native module remains packaged and signed in the app. */
+function loadPty(helperRoot) {
+  if (pty || ptyLoadAttempted) return
+  ptyLoadAttempted = true
+  let restore = null
+  try {
+    if (process.platform === 'darwin' && helperRoot) {
+      const packageRoot = path.dirname(require.resolve('node-pty/package.json'))
+      const candidates = [
+        path.join(packageRoot, 'build', 'Release', 'spawn-helper'),
+        path.join(packageRoot, 'prebuilds', `${process.platform}-${process.arch}`, 'spawn-helper'),
+      ]
+      const source = candidates.find((file) => fs.existsSync(file))
+      if (!source) throw new Error('node-pty spawn-helper is missing')
+      const helperDir = path.join(helperRoot, `darwin-${process.arch}`)
+      fs.mkdirSync(helperDir, { recursive: true, mode: 0o700 })
+      try { fs.chmodSync(helperDir, 0o700) } catch { /* best effort */ }
+      const helper = path.join(helperDir, 'spawn-helper')
+      const tmp = `${helper}.${process.pid}.${Date.now()}.tmp`
+      fs.copyFileSync(source, tmp)
+      fs.chmodSync(tmp, 0o700)
+      fs.renameSync(tmp, helper)
+      fs.chmodSync(helper, 0o700)
+
+      // unixTerminal captures `native.dir` at module evaluation. Override the
+      // loader for that one require, then restore the package unchanged.
+      const utils = require('node-pty/lib/utils.js')
+      const original = utils.loadNativeModule
+      utils.loadNativeModule = (name) => ({ ...original(name), dir: helperDir })
+      restore = () => { utils.loadNativeModule = original }
+    }
+    pty = require('node-pty')
+  } catch (err) {
+    console.error('[kaisola] node-pty unavailable:', err.message)
+  } finally {
+    restore?.()
+  }
 }
 
 const OUTPUT_CAP = DEFAULT_HOT_CAP // older scrollback is disk-backed
@@ -36,9 +75,19 @@ function setAppFocused(focused) {
 /** id → record */
 const terms = new Map()
 let spoolDir = path.join(os.tmpdir(), `kaisola-terminal-cache-${process.pid}`)
+let eventSink = null
 
 function configureStorage(dir) {
-  if (dir) spoolDir = dir
+  if (dir) {
+    spoolDir = dir
+    loadPty(path.join(dir, '.native'))
+  } else loadPty()
+}
+
+/** A detached session broker supplies an event sink instead of Electron
+ * WebContents. Keeping this injectable preserves the direct in-main probes. */
+function setEventSink(sink) {
+  eventSink = typeof sink === 'function' ? sink : null
 }
 
 /** terminal:run children (plain child_process, not node-pty) — tracked here so
@@ -65,6 +114,12 @@ function terminalEnv(extra) {
   delete env.SHELL_SESSION_HISTFILE
   delete env.SHELL_SESSION_HISTFILE_NEW
   delete env.SHELL_SESSION_TIMESTAMP
+  // These variables belong only to the detached helper itself. Leaking
+  // ELECTRON_RUN_AS_NODE into a user's shell would make any Electron binary
+  // launched from that terminal behave like plain Node; broker identity is
+  // private implementation state and must not reach child commands either.
+  delete env.ELECTRON_RUN_AS_NODE
+  delete env.KAISOLA_SESSION_BROKER
   return env
 }
 
@@ -82,7 +137,24 @@ function isLive(id) {
   return !!r && !r.exited
 }
 
+function senderId(sender) {
+  if (sender == null) return ''
+  if (typeof sender === 'string') return sender
+  return String(sender.id ?? '')
+}
+
+function sameSender(a, b) {
+  if (a === b) return true
+  const aa = senderId(a)
+  const bb = senderId(b)
+  return !!aa && aa === bb
+}
+
 function send(sender, channel, payload) {
+  if (eventSink) {
+    eventSink(sender, channel, payload)
+    return
+  }
   if (sender && !sender.isDestroyed?.()) sender.send(channel, payload)
 }
 
@@ -103,7 +175,6 @@ function spawn({ id, command, args, cwd, env, cols, rows, sender }) {
   const shell = process.env.SHELL || '/bin/zsh'
   // a persisted cwd can be GONE by now (removed worktree, deleted folder) —
   // pty.spawn throws uncaught on a missing dir; fall back to home instead
-  const fs = require('node:fs')
   const missingCwd = !!cwd && !fs.existsSync(cwd)
   const startCwd = missingCwd ? os.homedir() : (cwd || os.homedir())
   const p = pty.spawn(command || shell, command ? args || [] : ['-l'], {
@@ -127,6 +198,12 @@ function spawn({ id, command, args, cwd, env, cols, rows, sender }) {
     exited: false,
     exitStatus: null, // { exitCode, signal }
     waiters: [],
+    // Restart continuation accounting. The hot tail remains bounded by the
+    // spool; this is only metadata and a byte counter while no UI is attached.
+    lastSender: sender,
+    detachedAt: null,
+    detachedBytes: 0,
+    exitedWhileDetached: false,
   }
   const flushPending = () => {
     if (rec.flushTimer) {
@@ -141,6 +218,7 @@ function spawn({ id, command, args, cwd, env, cols, rows, sender }) {
   rec.flushPending = flushPending
   p.onData((data) => {
     rec.spool.push(data)
+    if (!rec.rendererVisible) rec.detachedBytes += Buffer.byteLength(data)
     if (rec.rendererVisible) {
       rec.pending += data
       if (rec.pending.length >= FLUSH_CAP) flushPending()
@@ -150,6 +228,7 @@ function spawn({ id, command, args, cwd, env, cols, rows, sender }) {
   p.onExit(({ exitCode, signal }) => {
     flushPending() // the tail of the stream must land before the exit signal
     rec.exited = true
+    rec.exitedWhileDetached = !rec.rendererVisible
     rec.exitStatus = { exitCode: exitCode ?? 0, signal: signal ?? null }
     send(rec.sender, `terminal:exit:${id}`, rec.exitStatus.exitCode)
     rec.waiters.forEach((w) => w(rec.exitStatus))
@@ -190,7 +269,17 @@ function resize(id, cols, rows) {
 /** Re-bind a record's output stream to a (possibly new) renderer webContents. */
 function setSender(id, sender) {
   const r = terms.get(id)
-  if (!r) return
+  if (!r) return null
+  const priorSender = r.lastSender
+  const continuation = r.detachedAt
+    ? {
+        detachedAt: r.detachedAt,
+        outputBytes: r.detachedBytes,
+        exitedWhileDetached: r.exitedWhileDetached,
+        previousOwner: senderId(priorSender),
+        ownerChanged: !sameSender(priorSender, sender),
+      }
+    : null
   // drop unflushed bytes: they are already in the snapshot ring, and the
   // (re)attaching renderer replays the snapshot — flushing them too would
   // double-print
@@ -200,22 +289,29 @@ function setSender(id, sender) {
   }
   r.pending = ''
   r.sender = sender
+  r.lastSender = sender
   r.rendererVisible = true
   r.spool.setVisible(true)
+  r.detachedAt = null
+  r.detachedBytes = 0
+  r.exitedWhileDetached = false
+  return continuation
 }
 
 /** Drop only the renderer. The pty/command continues and all output moves to
  * disk. Sender identity prevents an old window cleanup racing a new pop-out. */
 function detachRenderer(id, sender, viewState) {
   const r = terms.get(id)
-  if (!r || (sender && r.sender && sender !== r.sender)) return false
+  if (!r || (sender && r.sender && !sameSender(sender, r.sender))) return false
   if (r.flushTimer) {
     clearTimeout(r.flushTimer)
     r.flushTimer = null
   }
   r.pending = ''
   r.rendererVisible = false
+  r.lastSender = r.sender || r.lastSender
   r.sender = null
+  if (!r.detachedAt) r.detachedAt = Date.now()
   r.spool.setVisible(false, viewState)
   return true
 }
@@ -226,7 +322,19 @@ function detachRenderer(id, sender, viewState) {
 function detachSender(sender) {
   let detached = 0
   for (const [id, r] of terms) {
-    if (!r.sender || !sender || (r.sender !== sender && r.sender.id !== sender.id)) continue
+    if (!r.sender || !sender || !sameSender(r.sender, sender)) continue
+    if (detachRenderer(id, r.sender)) detached++
+  }
+  return detached
+}
+
+/** Broker socket loss means every renderer owner from that app instance is
+ * gone. Move all matching terminals to disk without stopping their PTYs. */
+function detachSenderPrefix(prefix) {
+  if (!prefix) return 0
+  let detached = 0
+  for (const [id, r] of terms) {
+    if (typeof r.sender !== 'string' || !r.sender.startsWith(prefix)) continue
     if (detachRenderer(id, r.sender)) detached++
   }
   return detached
@@ -324,7 +432,14 @@ function list() {
 }
 
 function diagnostics() {
-  return [...terms.values()].map((r) => ({ ...r.spool.stats(), pid: r.pty && r.pty.pid, exited: r.exited }))
+  return [...terms.values()].map((r) => ({
+    ...r.spool.stats(),
+    pid: r.pty && r.pty.pid,
+    exited: r.exited,
+    owner: senderId(r.sender),
+    detachedAt: r.detachedAt,
+    detachedBytes: r.detachedBytes,
+  }))
 }
 
-module.exports = { available, has, isLive, spawn, write, resize, setSender, detachRenderer, detachSender, snapshot, waitForExit, kill, release, trackChild, untrackChild, killAll, list, setAppFocused, configureStorage, diagnostics }
+module.exports = { available, has, isLive, spawn, write, resize, setSender, detachRenderer, detachSender, detachSenderPrefix, snapshot, waitForExit, kill, release, trackChild, untrackChild, killAll, list, setAppFocused, configureStorage, setEventSink, diagnostics }

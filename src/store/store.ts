@@ -254,6 +254,16 @@ export interface TerminalSession {
   name?: string
   /** Derived from the command being run; display fallback. */
   autoName?: string
+  /** One-shot receipt that the detached broker handed this exact live PTY to
+   * a new app instance. Persisted until the user has actually seen it. */
+  continued?: TerminalContinuationStatus
+}
+
+export interface TerminalContinuationStatus {
+  sameProcess: true
+  at: number
+  terminalPid?: number
+  outputBytes?: number
 }
 
 /** A live terminal an ACP agent spawned — listed so you can watch/take over. */
@@ -894,6 +904,8 @@ interface KaisolaState {
   toggleCanvas: () => void
   requestTerminal: (command?: string, opts?: { cwd?: string; name?: string; singletonKey?: string; restart?: boolean; reveal?: boolean; rerun?: boolean }) => void
   clearBootPending: (id: string) => void
+  /** Persist/clear the one-shot same-process continuation receipt. */
+  setTerminalContinuation: (id: string, status?: TerminalContinuationStatus, projectId?: string) => void
   closeTerminal: (id: string) => void
   renameTerminal: (id: string, name?: string) => void
   /** Auto-title a terminal from the command it's running (manual name wins). */
@@ -1078,7 +1090,7 @@ interface KaisolaState {
   /** Word-level highlights inside ResearchDiff rows. */
   wordDiffs: boolean
   setWordDiffs: (on: boolean) => void
-  /** $-cost chips on Claude session cards. */
+  /** $-cost chips on Claude session tabs. */
   showCosts: boolean
   setShowCosts: (on: boolean) => void
   /** The cross-project needs-you inbox in the tab strip. */
@@ -1546,14 +1558,19 @@ const freshSlice = (pid: string, path: string | null = null): ProjectSliceMemory
 const projectFields = (s: KaisolaState, pid: string): ProjectSliceMemory =>
   pid === s.activeProjectId ? pick(s, PROJECT_SLICE_MEMORY_KEYS) : (s.projectSlices[pid] ?? freshSlice(pid))
 
-const ASSISTANT_ARCHIVE_BATCH_TURNS = 100
-const ASSISTANT_ARCHIVE_BATCH_BYTES = 20 * 1024 * 1024
+// The provider owns its complete conversational context. Kaisola keeps a
+// smooth recent renderer window and fsyncs everything older to its pageable
+// JSONL archive. This deliberately spends disk instead of Chromium heap.
+const ASSISTANT_LIVE_TURNS = 60
+const ASSISTANT_ARCHIVE_TRIGGER_TURNS = 72
+const ASSISTANT_ARCHIVE_BATCH_TURNS = 64
+const ASSISTANT_ARCHIVE_BATCH_BYTES = 8 * 1024 * 1024
 const utf8 = new TextEncoder()
 /** Select a count-bounded and byte-bounded prefix while retaining the latest
- * 200 live turns. One oversize record is still attempted; if main rejects it,
+ * compact live window. One oversize record is still attempted; if main rejects it,
  * the durable retry marker preserves it rather than dropping data. */
 const assistantArchiveBatchCount = (turns: AssistantTurn[]): number => {
-  const available = Math.min(ASSISTANT_ARCHIVE_BATCH_TURNS, Math.max(0, turns.length - 200))
+  const available = Math.min(ASSISTANT_ARCHIVE_BATCH_TURNS, Math.max(0, turns.length - ASSISTANT_LIVE_TURNS))
   let count = 0
   let bytes = 0
   for (let i = 0; i < available; i++) {
@@ -1613,6 +1630,14 @@ function sanitizeSliceForPersist(slice: ProjectSliceMemory): ProjectSlicePersist
     singletonKey: t.singletonKey,
     restart: t.restart,
     boot: t.restart ? t.boot : undefined,
+    continued: t.continued?.sameProcess && Number.isFinite(t.continued.at)
+      ? {
+          sameProcess: true as const,
+          at: t.continued.at,
+          ...(Number.isFinite(t.continued.terminalPid) ? { terminalPid: t.continued.terminalPid } : {}),
+          ...(Number.isFinite(t.continued.outputBytes) ? { outputBytes: t.continued.outputBytes } : {}),
+        }
+      : undefined,
   }))
   const panels = slice.panels.map((p) => ({ id: p.id, kind: p.kind, url: p.url, title: p.title }))
   const validIds = new Set([
@@ -1630,11 +1655,11 @@ function sanitizeSliceForPersist(slice: ProjectSliceMemory): ProjectSlicePersist
     Object.entries(slice.assistantRuntimes)
       .filter(([id]) => assistantThreads.some((t) => t.id === id))
       .map(([id, runtime]) => [id, {
-        // Match the live headroom: a quit at 201–240 turns must not prune a
+        // Match the live headroom: a quit just before a spill must not prune a
         // turn that has not crossed the archive spill threshold yet. A batch
         // awaiting fsync/ACK keeps its whole prefix so quit/ENOSPC cannot lose
         // data; it retries idempotently after rehydration.
-        turns: runtime.archiveBatch ? runtime.turns : runtime.turns.slice(-240),
+        turns: runtime.archiveBatch ? runtime.turns : runtime.turns.slice(-ASSISTANT_ARCHIVE_TRIGGER_TURNS),
         first: runtime.first,
         ...(runtime.archivedTurns ? { archivedTurns: runtime.archivedTurns } : {}),
         ...(runtime.archiveEpoch ? { archiveEpoch: runtime.archiveEpoch } : {}),
@@ -1860,6 +1885,14 @@ function migrateFlatV5(persisted: unknown): Partial<KaisolaState> {
         singletonKey: t.singletonKey,
         restart: t.restart,
         boot: t.restart ? t.boot : undefined,
+        continued: t.continued?.sameProcess && Number.isFinite(t.continued.at)
+          ? {
+              sameProcess: true as const,
+              at: t.continued.at,
+              ...(Number.isFinite(t.continued.terminalPid) ? { terminalPid: t.continued.terminalPid } : {}),
+              ...(Number.isFinite(t.continued.outputBytes) ? { outputBytes: t.continued.outputBytes } : {}),
+            }
+          : undefined,
       }))
     : [{ id: DEFAULT_TERM_ID }]
   const panels = (state.panels ?? []).map((p) => ({ id: p.id, kind: p.kind, url: p.url, title: p.title }))
@@ -2313,6 +2346,20 @@ export const useKaisola = create<KaisolaState>()(
         ? { terminals: s.terminals.map((t) => (t.id === id ? { ...t, bootPending: undefined } : t)) }
         : s,
     ),
+  setTerminalContinuation: (id, status, projectId) => {
+    const state = get()
+    const owner = projectId ?? terminalOwnerMap(state)[id] ?? state.activeProjectId
+    state.patchProject(owner, (slice) => {
+      const current = slice.terminals.find((terminal) => terminal.id === id)?.continued
+      if (!status && !current) return {}
+      if (status && current?.at === status.at && current.terminalPid === status.terminalPid && current.outputBytes === status.outputBytes) return {}
+      return {
+        terminals: slice.terminals.map((terminal) =>
+          terminal.id === id ? { ...terminal, continued: status } : terminal,
+        ),
+      }
+    })
+  },
   closeTerminal: (id) => {
     set((s) => {
       const closing = s.terminals.find((t) => t.id === id)
@@ -2934,8 +2981,8 @@ export const useKaisola = create<KaisolaState>()(
     const current = slice.assistantRuntimes[id] ?? { turns: [], first: true }
     let next = fn(current)
     let job: { scope: { projectId: string; threadId: string; epoch?: string }; batchId: string; count: number; turns: AssistantTurn[] } | null = null
-    if (next.turns.length > 240 && !next.archivePending && bridge.assistantArchive) {
-      const available = Math.max(0, next.turns.length - 200)
+    if (next.turns.length > ASSISTANT_ARCHIVE_TRIGGER_TURNS && !next.archivePending && bridge.assistantArchive) {
+      const available = Math.max(0, next.turns.length - ASSISTANT_LIVE_TURNS)
       const retryCount = next.archiveBatch?.count
       const count = retryCount && retryCount <= available ? retryCount : assistantArchiveBatchCount(next.turns)
       if (count > 0) {
@@ -2984,7 +3031,7 @@ export const useKaisola = create<KaisolaState>()(
             turns: runtime.turns.slice(pending.count),
             archivedTurns: result.count,
           }
-          shouldContinue = next.turns.length > 240
+          shouldContinue = next.turns.length > ASSISTANT_ARCHIVE_TRIGGER_TURNS
           return { assistantRuntimes: { ...sl.assistantRuntimes, [id]: next } }
         })
         // A burst may have grown while fsync was in flight. Drain another bounded

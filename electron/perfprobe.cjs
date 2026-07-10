@@ -14,7 +14,7 @@ const fsx = require('node:fs')
 const { registerModelHandlers } = require('./ipc/modelHandler.cjs')
 const { registerToolHandlers } = require('./ipc/toolHandler.cjs')
 const { registerSettingsHandlers } = require('./ipc/settingsHandler.cjs')
-const { registerTerminalHandlers } = require('./ipc/terminalHandler.cjs')
+const { registerTerminalHandlers, killAllSessions } = require('./ipc/terminalHandler.cjs')
 const { registerAcpHandlers } = require('./ipc/acpHandler.cjs')
 const { registerAuthHandlers } = require('./ipc/authHandler.cjs')
 const { registerFsHandlers } = require('./ipc/fsHandler.cjs')
@@ -26,7 +26,6 @@ const { registerGitHandlers } = require('./ipc/gitHandler.cjs')
 const { registerClaudeHooksHandlers } = require('./ipc/claudeHooksHandler.cjs')
 const { registerUpdateHandlers } = require('./ipc/updateHandler.cjs')
 const worktree = require('./ipc/worktreeHandler.cjs')
-const mgr = require('./ipc/terminalManager.cjs')
 
 process.env.KAISOLA_SMOKE = '1' // no external side effects; meta poller off
 const variant = (process.argv.find((a) => /^[ABCGP]$/i.test(a)) || 'A').toUpperCase()
@@ -94,12 +93,16 @@ app.whenReady().then(async () => {
   if (termId) {
     // claude-shaped load: a ~10-line block redraw at ~12fps, not a one-cell
     // spinner — the TUI repaints its whole status/composer area per frame
-    mgr.write(termId, `while :; do printf '\\033[H'; for i in 1 2 3 4 5 6 7 8 9 10; do printf '── streaming line %s %s ──────────────────────\\033[K\\n' "$i" "$RANDOM"; done; sleep 0.08; done\n`)
+    const spinner = `while :; do printf '\\033[H'; for i in 1 2 3 4 5 6 7 8 9 10; do printf '── streaming line %s %s ──────────────────────\\033[K\\n' "$i" "$RANDOM"; done; sleep 0.08; done\n`
+    await js(`window.kaisola.terminal.write(${JSON.stringify(termId)}, ${JSON.stringify(spinner)})`)
   }
   await wait(1500)
-  const len1 = mgr.snapshot(termId).output.length
+  const len1 = termId ? await js(`window.kaisola.terminal.snapshot(${JSON.stringify(termId)}).then((snapshot) => snapshot.output.length)`) : 0
   await wait(1000)
-  const len2 = mgr.snapshot(termId).output.length
+  const len2 = termId ? await js(`window.kaisola.terminal.snapshot(${JSON.stringify(termId)}).then((snapshot) => snapshot.output.length)`) : 0
   console.log(`PROBE_READY variant=${variant} pid=${process.pid} solid=${solidWindow} term=${termId || 'NONE'} spinner=${len2 > len1 ? 'FLOWING' : 'STALLED'} (+${len2 - len1}b/s)`)
-  setTimeout(() => app.exit(0), 60_000) // backstop — the driver usually kills us
+  setTimeout(() => {
+    killAllSessions() // probes must not leave their broker-owned spinner behind
+    setTimeout(() => app.exit(0), 200)
+  }, 60_000) // backstop — the driver usually kills us
 })

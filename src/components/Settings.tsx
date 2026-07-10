@@ -860,7 +860,7 @@ function UpdatesRow() {
     : preparing ? `Preparing ${u.version ?? 'update'}…`
     : u.type === 'downloading' ? `Downloading ${u.version ?? 'update'}… ${u.percent ?? 0}%`
     : u.type === 'ready' ? `${u.version} downloaded`
-    : u.type === 'installing' ? 'Restarting…'
+    : u.type === 'installing' ? (u.message ?? 'Restarting…')
     : u.type === 'error' ? 'Update check failed'
     : 'Up to date'
   const error = u.checkError ?? (u.type === 'error' ? u.message : null)

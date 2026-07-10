@@ -4,7 +4,6 @@ import { useKaisola, type TerminalMeta } from '../../store/store'
 import { sessionHue, terminalAgentKey } from '../../lib/sessionHue'
 import { useAgentRegistry } from '../../lib/registry'
 import { urlHost, terminalLabel, threadLabel } from '@/lib/sessionLabel'
-import { CostChip } from './CostChip'
 import { Terminal, everMountedTerminals, hiddenTerminalResidentCap } from '../Terminal'
 import { Assistant } from '../Assistant'
 import { BrowserCard } from './BrowserCard'
@@ -157,6 +156,7 @@ export function SessionCards() {
       pos.set(id, { col: ci + 1, row: ri * span + 1, span })
     }),
   )
+  const soloCard = pos.size === 1
 
   interface CardIdentity {
     hue: string
@@ -171,11 +171,16 @@ export function SessionCards() {
 
   const card = (id: string, icon: string, label: string, body: ReactNode, idn?: CardIdentity) => {
     const p = pos.get(id)
+    // The session tab already carries identity + working/completed state. A
+    // second title bar earns its height only when there are multiple movable
+    // cards or meaningful cross-workspace metadata.
+    const showHead = !!p && (!soloCard || !!idn?.sub)
     return (
       <div
         key={id}
         className="session-card"
         data-show={!!p}
+        data-headless={!!p && !showHead || undefined}
         data-drop={drop?.id === id && dragRef.current && dragRef.current !== id ? drop.edge : undefined}
         style={{
           ...(p ? { gridColumn: p.col, gridRow: `${p.row} / span ${p.span}` } : {}),
@@ -197,7 +202,7 @@ export function SessionCards() {
           setDrop(null)
         }}
       >
-        {p && (
+        {showHead && (
           <div
             className="pane-head"
             draggable
@@ -222,7 +227,6 @@ export function SessionCards() {
               </span>
             )}
             <span className="grow" />
-            <CostChip termId={id} />
             {idn?.ports?.map((port) => (
               <button
                 key={port}
@@ -267,6 +271,7 @@ export function SessionCards() {
       <div
         ref={gridRef}
         className="session-grid"
+        data-solo={soloCard || undefined}
         style={{
           gridTemplateColumns: weights.map((w) => `minmax(0, ${w}fr)`).join(' ') || 'minmax(0, 1fr)',
           gridTemplateRows: `repeat(${rows}, minmax(0, 1fr))`,

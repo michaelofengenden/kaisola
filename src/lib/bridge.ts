@@ -329,12 +329,27 @@ export interface PdfPageResult {
   missing?: boolean
   message?: string
 }
+/** Evidence that a renderer attached to the exact broker-owned PTY that
+ * survived a previous app instance. Same-instance card/window hibernation does
+ * not set `acrossRestart`, so the UI never mistakes an ordinary remount for a
+ * restart continuation. */
+export interface TermContinuation {
+  detachedAt?: number
+  outputBytes?: number
+  exitedWhileDetached?: boolean
+  ownerChanged?: boolean
+  acrossRestart?: boolean
+  reattachedAt?: number
+  brokerPid?: number
+  terminalPid?: number
+}
 export interface TermSnapshot {
   output: string
   truncated?: boolean
   exited?: boolean
   exitStatus?: { exitCode: number; signal: string | null } | null
   viewState?: { scrollFromBottom?: number; cols?: number; rows?: number } | null
+  continuation?: TermContinuation | null
 }
 /** Live identity of a pty session — who's running, where (diff-broadcast). */
 export interface TerminalMetaEvent {

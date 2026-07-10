@@ -4,7 +4,7 @@ import { bridge, isDesktop } from '../../lib/bridge'
 import { estimate, fmtUsd, fmtTok, type ModelSums } from '../../lib/prices'
 
 /**
- * The $ chip on a Claude session card — what this session actually cost,
+ * The $ chip on a Claude session tab — what this session actually cost,
  * summed from its own transcript (per-model, deduped) and priced at list
  * rates. Hover for the per-model token breakdown. Unknown models show raw
  * tokens instead of an invented dollar figure. Refreshes when the session's

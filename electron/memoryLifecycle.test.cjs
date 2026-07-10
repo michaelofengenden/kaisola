@@ -103,14 +103,14 @@ test('assistant archive preserves evicted turns in order and pages them without 
 
     // Byte accounting is per selected turn, not a batch-line average: two
     // neighboring large turns from heterogeneous batches must not cross the
-    // 24 MiB main→renderer page bound.
+    // compact 6 MiB main→renderer page bound.
     const boundedKey = scopeKey({ projectId: 'project-byte-bound', threadId: 'thread-byte-bound' })
-    const large = 'x'.repeat(13 * 1024 * 1024)
+    const large = 'x'.repeat(4 * 1024 * 1024)
     await archive.append(boundedKey, 'hetero-a', [...Array.from({ length: 99 }, () => ({ kind: 'user', text: 'x' })), { kind: 'assistant', text: large }])
     await archive.append(boundedKey, 'hetero-b', [{ kind: 'assistant', text: large }, ...Array.from({ length: 99 }, () => ({ kind: 'user', text: 'x' }))])
     const bounded = await archive.page(boundedKey, 101, 2)
     assert.equal(bounded.turns.length, 1)
-    assert.ok(bounded.bytes <= 24 * 1024 * 1024)
+    assert.ok(bounded.bytes <= 6 * 1024 * 1024)
     await archive.clear(boundedKey)
 
     const pressureKey = scopeKey({ projectId: 'project-pressure', threadId: 'thread-pressure' })
@@ -250,6 +250,40 @@ test('renderer-window glass swap is blocked during an active ACP turn', () => {
     assert.deepEqual(_acpTest.acpRendererSwapState(sender), { safe: true, busy: false, connecting: false, awaitingPermission: false })
   } finally {
     _acpTest.connections.delete(key)
+  }
+})
+
+test('process-wide ACP restart gate fails closed for connections, turns, and permissions', async () => {
+  const sender = { id: 751 }
+  const key = '751|codex'
+  const entry = { sender, current: { channel: 'acp:update:req-restart' }, inFlightTurns: 1 }
+  _acpTest.connections.set(key, entry)
+  _acpTest.connectTasks.set('751|claude', { sender })
+  _acpTest.pendingPermissions.set('perm-restart', { entry })
+  try {
+    const blocked = _acpTest.acpRestartSafetyState()
+    assert.equal(blocked.safe, false)
+    assert.equal(blocked.connectingCount, 1)
+    assert.equal(blocked.inFlightTurns, 1)
+    assert.equal(blocked.pendingPermissionCount, 1)
+    assert.deepEqual(blocked.blockers, ['connecting', 'active-turns', 'permission'])
+
+    const timeout = await _acpTest.waitForAcpRestartSafe({ timeoutMs: 0 })
+    assert.equal(timeout.ok, false)
+    assert.equal(timeout.timedOut, true)
+    assert.equal(timeout.safe, false)
+
+    _acpTest.connectTasks.delete('751|claude')
+    _acpTest.pendingPermissions.delete('perm-restart')
+    entry.current = { channel: null }
+    entry.inFlightTurns = 0
+    const safe = await _acpTest.waitForAcpRestartSafe({ timeoutMs: 0 })
+    assert.equal(safe.ok, true)
+    assert.equal(safe.safe, true)
+  } finally {
+    _acpTest.connections.delete(key)
+    _acpTest.connectTasks.delete('751|claude')
+    _acpTest.pendingPermissions.delete('perm-restart')
   }
 })
 

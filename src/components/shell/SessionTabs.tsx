@@ -6,6 +6,7 @@ import { useAgentRegistry, openAgentSession } from '../../lib/registry'
 import { urlHost, terminalLabel, threadLabel } from '@/lib/sessionLabel'
 import { Icon } from '../Icon'
 import { Dropdown } from '../Dropdown'
+import { CostChip } from './CostChip'
 
 interface STab {
   id: string
@@ -16,6 +17,7 @@ interface STab {
   state?: 'needs-you' | 'failed' | 'running' | 'completed'
   kind: 'thread' | 'term' | 'agentTerm' | 'panel'
   closable: boolean
+  continued?: boolean
   title?: string
 }
 
@@ -42,6 +44,8 @@ export function SessionTabs() {
   const switchSession = useKaisola((s) => s.switchSession)
   const addDockSplit = useKaisola((s) => s.addDockSplit)
   const removeDockView = useKaisola((s) => s.removeDockView)
+  const popOutTerminal = useKaisola((s) => s.popOutTerminal)
+  const openBrowserPanel = useKaisola((s) => s.openBrowserPanel)
   const closeThread = useKaisola((s) => s.closeAssistantThread)
   const closeTerminal = useKaisola((s) => s.closeTerminal)
   const closeAgentTerminal = useKaisola((s) => s.closeAgentTerminal)
@@ -94,7 +98,9 @@ export function SessionTabs() {
       state: failed ? 'failed' : working ? 'running' : needsYou[t.id] ? 'completed' : undefined,
       kind: 'term',
       closable: terminals.length > 1 && !pinnedSessions.includes(t.id),
+      continued: !!t.continued?.sameProcess,
       title: [
+        t.continued?.sameProcess ? 'Continued — same process across the update' : null,
         working && meta?.fgProcess ? `running ${meta.fgProcess}` : null,
         meta?.repo && `${meta.repo}${meta.branch ? ` ⎇ ${meta.branch}` : ''}`,
         meta?.cwd,
@@ -160,8 +166,11 @@ export function SessionTabs() {
     setEditing(null)
   }
 
+  const menuTab = menu ? tabs.get(menu.id) : undefined
+  const menuPorts = menu ? terminalMeta[menu.id]?.ports ?? [] : []
+
   return (
-    <div className="stabs" role="tablist">
+    <div className="stabs" role="tablist" data-single={order.length === 1 || undefined}>
       <div className="stabs-track">
         {order
           .map((id) => tabs.get(id))
@@ -189,6 +198,7 @@ export function SessionTabs() {
                 onContextMenu={(e) => { e.preventDefault(); e.stopPropagation(); setMenu({ x: e.clientX, y: e.clientY, id: t.id }) }}
                 title={t.title}
               >
+                <span className="stab-badge" />
                 <Icon name={t.icon} size={12} className="stab-icon" />
                 {editing === t.id ? (
                   <input
@@ -208,7 +218,8 @@ export function SessionTabs() {
                 ) : (
                   <span className="stab-label truncate">{t.label}</span>
                 )}
-                <span className="stab-badge" />
+                {t.continued && <span className="stab-continuity">Continued</span>}
+                {t.kind === 'term' && <CostChip termId={t.id} />}
                 {/* the two-pane button: open this session BESIDE what's showing
                     (a click on the tab itself swaps it into the current pane) */}
                 <button
@@ -287,6 +298,22 @@ export function SessionTabs() {
                 </button>
                 <button className="tree-menu-item tree-menu-danger" onClick={() => { void removeWorktreeSession(menu.id); setMenu(null) }}>
                   <Icon name="Trash2" size={13} /> Remove worktree
+                </button>
+              </>
+            )}
+            {(menuTab?.kind === 'term' || menuTab?.kind === 'agentTerm') && (
+              <>
+                <div className="tree-menu-sep" />
+                {menuPorts.map((port) => (
+                  <button key={port} className="tree-menu-item" onClick={() => { openBrowserPanel(`http://localhost:${port}`); setMenu(null) }}>
+                    <Icon name="Globe" size={13} /> Open localhost:{port}
+                  </button>
+                ))}
+                <button
+                  className="tree-menu-item"
+                  onClick={() => { popOutTerminal(menuTab.id, menuTab.label, menuTab.hue); setMenu(null) }}
+                >
+                  <Icon name="PictureInPicture2" size={13} /> Open in its own window
                 </button>
               </>
             )}

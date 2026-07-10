@@ -11,7 +11,7 @@ const { AcpConnection } = require('./acp.cjs')
 const { agentEnv } = require('./shellEnv.cjs')
 const { mcpHttpEntry } = require('./mcpServer.cjs')
 const { acpEntries } = require('./mcpCatalog.cjs')
-const mgr = require('./terminalManager.cjs')
+const { sessionBroker } = require('./sessionBrokerClient.cjs')
 const { AcpProcessLedger } = require('./acpProcessLedger.cjs')
 const { resolveBundledCodexExecutable, resolveBundledClaudeExecutable } = require('./nativeAgentPaths.cjs')
 
@@ -92,6 +92,9 @@ const entryFor = (sender, presetId) => connections.get(ikey(sender, presetId))
 let processLedger = null
 const connectionLeases = new Map() // internalKey -> Set<renderer thread id>
 const idleTimers = new Map()
+const DEFAULT_ACP_RESTART_WAIT_MS = 5 * 60_000
+const MAX_ACP_RESTART_WAIT_MS = 10 * 60_000
+const DEFAULT_ACP_RESTART_POLL_MS = 100
 const ACP_IDLE_MS = (() => {
   const n = Number(process.env.KAISOLA_ACP_IDLE_MS)
   return Number.isFinite(n) ? Math.min(24 * 60 * 60_000, Math.max(30_000, Math.round(n))) : 5 * 60_000
@@ -142,6 +145,77 @@ function acpRendererSwapState(sender) {
   const busy = connecting || owned.some((entry) => (entry.inFlightTurns ?? 0) > 0 || !!entry.current?.channel)
   const awaitingPermission = [...pendingPermissions.values()].some((pending) => pending.entry?.sender === sender)
   return { safe: !busy && !awaitingPermission, busy, connecting, awaitingPermission }
+}
+
+/** Authoritative process-wide ACP restart gate. An updater restart must not
+ * close a renderer while a handshake, prompt, or approval is live: the agent
+ * process may survive, but its request-specific output/completion listener does
+ * not. Counts make the state useful for diagnostics without exposing prompts. */
+function acpRestartSafetyState() {
+  let activeConnections = 0
+  let inFlightTurns = 0
+  for (const entry of connections.values()) {
+    const entryTurns = Math.max(0, Number(entry.inFlightTurns) || 0)
+    inFlightTurns += entryTurns
+    if (entryTurns > 0 || !!entry.current?.channel) activeConnections++
+  }
+
+  const connectingCount = connectTasks.size
+  const pendingPermissionCount = pendingPermissions.size
+  const connecting = connectingCount > 0
+  const busy = connecting || activeConnections > 0
+  const awaitingPermission = pendingPermissionCount > 0
+  const blockers = []
+  if (connecting) blockers.push('connecting')
+  if (activeConnections > 0) blockers.push('active-turns')
+  if (awaitingPermission) blockers.push('permission')
+
+  return {
+    safe: !busy && !awaitingPermission,
+    busy,
+    connecting,
+    awaitingPermission,
+    connectingCount,
+    activeConnections,
+    inFlightTurns,
+    pendingPermissionCount,
+    blockers,
+  }
+}
+
+/** Wait for the ACP restart gate, but never turn a timeout into permission to
+ * quit. Callers receive the last authoritative unsafe snapshot and must leave
+ * the update ready for a later retry. The hard cap also prevents a malformed
+ * option/environment value from holding an IPC request forever. */
+function waitForAcpRestartSafe(options = {}) {
+  const requestedTimeout = Number(options.timeoutMs)
+  const timeoutMs = Number.isFinite(requestedTimeout)
+    ? Math.min(MAX_ACP_RESTART_WAIT_MS, Math.max(0, Math.round(requestedTimeout)))
+    : DEFAULT_ACP_RESTART_WAIT_MS
+  const requestedPoll = Number(options.pollMs)
+  const pollMs = Number.isFinite(requestedPoll)
+    ? Math.min(1_000, Math.max(1, Math.round(requestedPoll)))
+    : DEFAULT_ACP_RESTART_POLL_MS
+  const now = typeof options.now === 'function' ? options.now : Date.now
+  const setTimeoutFn = typeof options.setTimeoutFn === 'function' ? options.setTimeoutFn : setTimeout
+  const startedAt = now()
+
+  return new Promise((resolve) => {
+    const check = () => {
+      const state = acpRestartSafetyState()
+      const waitedMs = Math.max(0, now() - startedAt)
+      if (state.safe) {
+        resolve({ ok: true, timedOut: false, waitedMs, ...state })
+        return
+      }
+      if (waitedMs >= timeoutMs) {
+        resolve({ ok: false, timedOut: true, waitedMs, ...state })
+        return
+      }
+      setTimeoutFn(check, Math.max(1, Math.min(pollMs, timeoutMs - waitedMs)))
+    }
+    check()
+  })
 }
 
 /** A project tab may change renderer owners between turns, but an active ACP
@@ -565,18 +639,27 @@ function buildTerminalHost(entry, sessionCwd, agentKey, agentName) {
   return {
     async create({ command, args, env, cwd }) {
       const terminalId = `acp-term-${++acpTermSeq}`
-      mgr.spawn({ id: terminalId, command, args, env, cwd: cwd || sessionCwd, sender: entry.sender })
+      const created = await sessionBroker().terminal('create', entry.sender, {
+        id: terminalId,
+        command,
+        args,
+        env,
+        cwd: cwd || sessionCwd,
+        cols: 100,
+        rows: 30,
+      }, { timeoutMs: 20_000 })
+      if (!created?.ok) throw new Error(created?.message || 'Could not start the agent terminal.')
       const label = [command, ...(args || [])].join(' ').slice(0, 80)
       sendTo(entry, 'acp:terminal', { terminalId, command, label, cwd: cwd || sessionCwd, agentKey, agentName })
       return { terminalId }
     },
-    output(terminalId) {
-      const s = mgr.snapshot(terminalId)
+    async output(terminalId) {
+      const s = await sessionBroker().terminal('output', entry.sender, { id: terminalId })
       return { output: s.output, truncated: !!s.truncated, exitStatus: s.exitStatus }
     },
-    waitForExit(terminalId) { return mgr.waitForExit(terminalId) },
-    kill(terminalId) { mgr.kill(terminalId) },
-    release(terminalId) { mgr.release(terminalId) },
+    waitForExit(terminalId) { return sessionBroker().terminal('waitForExit', entry.sender, { id: terminalId }, { timeoutMs: 0 }) },
+    kill(terminalId) { return sessionBroker().terminal('kill', entry.sender, { id: terminalId }) },
+    release(terminalId) { return sessionBroker().terminal('release', entry.sender, { id: terminalId }) },
   }
 }
 
@@ -997,4 +1080,36 @@ function disposeAcp() {
   connectTasks.clear()
 }
 
-module.exports = { registerAcpHandlers, disposeAcp, acpRendererSwapState, acpProjectTransferState, transferAcpProject, releaseAcpRenderer, cachedNpxAdapter, adapterPreset, claudePreset, codexPreset, newestCodexExecutable, freshenControls, _acpTest: { connections, connectionLeases, idleTimers, scheduleIdlePark, canIdlePark, acpRendererSwapState, acpProjectTransferState, transferAcpProject, releaseAcpRenderer, resolveBundledCodexExecutable, resolveBundledClaudeExecutable } }
+module.exports = {
+  registerAcpHandlers,
+  disposeAcp,
+  acpRendererSwapState,
+  acpRestartSafetyState,
+  waitForAcpRestartSafe,
+  acpProjectTransferState,
+  transferAcpProject,
+  releaseAcpRenderer,
+  cachedNpxAdapter,
+  adapterPreset,
+  claudePreset,
+  codexPreset,
+  newestCodexExecutable,
+  freshenControls,
+  _acpTest: {
+    connections,
+    connectTasks,
+    pendingPermissions,
+    connectionLeases,
+    idleTimers,
+    scheduleIdlePark,
+    canIdlePark,
+    acpRendererSwapState,
+    acpRestartSafetyState,
+    waitForAcpRestartSafe,
+    acpProjectTransferState,
+    transferAcpProject,
+    releaseAcpRenderer,
+    resolveBundledCodexExecutable,
+    resolveBundledClaudeExecutable,
+  },
+}

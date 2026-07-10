@@ -6,12 +6,18 @@ const path = require('node:path')
 const fs = require('node:fs/promises')
 const { spawn, execFile } = require('node:child_process')
 const { BrowserWindow, app } = require('electron')
-const mgr = require('./terminalManager.cjs')
+const { configureSessionBroker, sessionBroker } = require('./sessionBrokerClient.cjs')
 
 // terminal:run cap: a non-terminating command (dev server, tail -f, blocked on
 // stdin) never fires 'close', so without this the invoke Promise hangs forever.
 // On timeout the child is killed and the promise resolves with partial output.
 const RUN_TIMEOUT_MS = 120_000
+const runChildren = new Set()
+let brokerClient = null
+
+function broker() {
+  return brokerClient || sessionBroker()
+}
 
 // ── session identity poller ──────────────────────────────────────────────────
 // Every live pty is polled for its FOREGROUND process (free via node-pty) and
@@ -50,7 +56,9 @@ const jsonStringField = (text, field) => {
  * process which JSONL it has open (exact even with many sessions); fall back to
  * the newest CLI/TUI rollout for this cwd if lsof races startup. */
 async function codexSession(id, cwd) {
-  const live = mgr.list().find((terminal) => terminal.id === id)
+  let terminals = []
+  try { terminals = await broker().terminal('list', null, {}, { timeoutMs: 5000 }) } catch { /* semantic fallback below */ }
+  const live = terminals.find((terminal) => terminal.id === id)
   if (live?.pid) {
     const foreground = Number(String(await execOut('ps', ['-o', 'tpgid=', '-p', String(live.pid)]) || '').trim())
     if (foreground > 0) {
@@ -132,7 +140,8 @@ async function gitInfo(cwd) {
 }
 
 async function pollMeta() {
-  const live = mgr.list()
+  let live = []
+  try { live = await broker().terminal('list', null, {}, { timeoutMs: 5000 }) } catch { return }
   for (const id of Array.from(metaCache.keys())) {
     if (!live.some((t) => t.id === id)) metaCache.delete(id)
   }
@@ -191,7 +200,7 @@ function ensureMetaPolling() {
 /** App focus drives the whole terminal-stream profile: pty flush coalescing
  * (manager) and this poller's cadence. Called from main.cjs. */
 function setAppFocused(focused) {
-  mgr.setAppFocused(focused)
+  void broker().terminal('setFocused', null, { focused }, { timeoutMs: 3000 }).catch(() => {})
   const next = focused ? POLL_MS_FOCUSED : POLL_MS_BLURRED
   if (next === pollMs) return
   pollMs = next
@@ -203,41 +212,42 @@ function setAppFocused(focused) {
 }
 
 function registerTerminalHandlers(ipcMain) {
-  mgr.configureStorage(path.join(app.getPath('userData'), 'terminal-cache'))
-  ipcMain.handle('terminal:create', (event, { id, cwd, cols, rows } = {}) => {
-    if (!mgr.available()) {
-      return { ok: false, message: 'node-pty unavailable (run: npm run rebuild)' }
-    }
-    // "existed" means a LIVE session was reused — an exited pty respawns fresh
-    // (spawn drops dead records), and the caller should treat that as new
-    const existed = mgr.isLive(id)
-    const rec = mgr.spawn({ id, cwd: cwd || os.homedir(), cols, rows, sender: event.sender })
-    if (!rec) return { ok: false, message: 'could not start terminal' }
-    // keep the stream pointed at the live window
-    mgr.setSender(id, event.sender)
+  const brokerScript = app.isPackaged
+    ? path.join(process.resourcesPath, 'app.asar.unpacked', 'electron', 'session-broker.cjs')
+    : path.join(__dirname, '..', 'session-broker.cjs')
+  brokerClient = configureSessionBroker({
+    userData: app.getPath('userData'),
+    execPath: process.execPath,
+    brokerScript,
+    appVersion: app.getVersion(),
+    smoke: !!(process.env.KAISOLA_SMOKE || process.env.PASOLA_SMOKE),
+  })
+  // Lazy by design: file-only work should not pay for a helper process. The
+  // first terminal/CLI/ACP-terminal request adopts an existing broker or starts
+  // one; closing the last session lets that helper retire again.
+
+  ipcMain.handle('terminal:create', async (event, { id, cwd, cols, rows } = {}) => {
+    const result = await broker().terminal('create', event.sender, { id, cwd: cwd || os.homedir(), cols, rows }, { timeoutMs: 20_000 })
+    if (!result?.ok) return result || { ok: false, message: 'could not start terminal' }
     ensureMetaPolling()
-    const snap = mgr.snapshot(id)
-    return { ok: true, cwd: cwd || os.homedir(), shell: process.env.SHELL || '/bin/zsh', existed, ...snap }
+    return { ...result, cwd: cwd || os.homedir(), shell: process.env.SHELL || '/bin/zsh' }
   })
 
-  ipcMain.handle('terminal:write', (_e, { id, data } = {}) => ({ ok: mgr.write(id, data) }))
-  ipcMain.handle('terminal:resize', (_e, { id, cols, rows } = {}) => ({ ok: mgr.resize(id, cols, rows) }))
-  ipcMain.handle('terminal:snapshot', (_e, { id } = {}) => mgr.snapshot(id))
-  ipcMain.handle('terminal:detachRenderer', (event, { id, viewState } = {}) => ({ ok: mgr.detachRenderer(id, event.sender, viewState) }))
-  ipcMain.handle('terminal:diagnostics', () => mgr.diagnostics())
+  ipcMain.handle('terminal:write', (event, { id, data } = {}) => broker().terminal('write', event.sender, { id, data }))
+  ipcMain.handle('terminal:resize', (event, { id, cols, rows } = {}) => broker().terminal('resize', event.sender, { id, cols, rows }))
+  ipcMain.handle('terminal:snapshot', (event, { id } = {}) => broker().terminal('snapshot', event.sender, { id }))
+  ipcMain.handle('terminal:detachRenderer', (event, { id, viewState } = {}) => broker().terminal('detachRenderer', event.sender, { id, viewState }))
+  ipcMain.handle('terminal:diagnostics', () => broker().terminal('diagnostics', null))
   ipcMain.handle('terminal:codexSession', (_event, { id, cwd } = {}) => codexSession(id, cwd))
-  ipcMain.handle('terminal:signal', (_e, { id } = {}) => ({ ok: mgr.write(id, '\x03') }))
-  ipcMain.handle('terminal:kill', (_e, { id } = {}) => {
-    mgr.release(id)
-    return { ok: true }
-  })
+  ipcMain.handle('terminal:signal', (event, { id } = {}) => broker().terminal('signal', event.sender, { id }))
+  ipcMain.handle('terminal:kill', (event, { id } = {}) => broker().terminal('release', event.sender, { id }))
 
   // when a renderer (re)attaches to an existing session, re-point its stream
   // (agent-spawned ptys arrive this way — make sure they're polled too)
-  ipcMain.handle('terminal:attach', (event, { id } = {}) => {
-    mgr.setSender(id, event.sender)
+  ipcMain.handle('terminal:attach', async (event, { id } = {}) => {
+    const result = await broker().terminal('attach', event.sender, { id })
     ensureMetaPolling()
-    return mgr.snapshot(id)
+    return result
   })
 
   // One-shot capture (used by the agent's lightweight run-command tool).
@@ -248,7 +258,10 @@ function registerTerminalHandlers(ipcMain) {
       // whole tree (npm → node/vite, pipeline members), not just the shell — a bare
       // child.kill would orphan grandchildren (a dev server) to launchd.
       const child = spawn(shell, ['-lc', command], { cwd: cwd || os.homedir(), env: process.env, detached: true })
-      mgr.trackChild(child) // reaped on app quit instead of reparenting to launchd
+      runChildren.add(child)
+      const dropChild = () => runChildren.delete(child)
+      child.once('exit', dropChild)
+      child.once('error', dropChild)
       child.unref() // a lingering run-child must not, by itself, hold the app open
       // only the first 20k chars survive anyway — cap DURING accumulation so a
       // huge-output command can't balloon main-process memory first
@@ -260,7 +273,7 @@ function registerTerminalHandlers(ipcMain) {
         if (settled) return
         settled = true
         clearTimeout(timer)
-        mgr.untrackChild(child)
+        runChildren.delete(child)
         resolve(result)
       }
       // a command that never terminates (dev server, tail -f, blocked on stdin)
@@ -281,8 +294,16 @@ function registerTerminalHandlers(ipcMain) {
   })
 }
 
+function killRunChildren() {
+  for (const child of runChildren) {
+    try { process.kill(-child.pid, 'SIGKILL') } catch { try { child.kill('SIGKILL') } catch {} }
+  }
+  runChildren.clear()
+}
+
 function killAllSessions() {
-  mgr.killAll()
+  void broker().shutdown()
+  killRunChildren()
   if (metaTimer) {
     clearInterval(metaTimer)
     metaTimer = null
@@ -290,12 +311,26 @@ function killAllSessions() {
 }
 
 function detachRendererOwner(sender) {
-  return mgr.detachSender(sender)
+  return broker().detachOwner(sender)
+}
+
+/** Normal app quit/update: close only Electron's authenticated socket. The
+ * detached broker and every PTY continue, writing unseen output to disk. */
+function detachSessionBroker() {
+  if (metaTimer) {
+    clearInterval(metaTimer)
+    metaTimer = null
+  }
+  // terminal:run is a bounded one-shot helper rather than a user-owned PTY.
+  // Never orphan its shell/process group during an app replacement.
+  killRunChildren()
+  return broker().disconnect()
 }
 
 module.exports = {
   registerTerminalHandlers,
   killAllSessions,
+  detachSessionBroker,
   setAppFocused,
   detachRendererOwner,
   __test: { codexIdFromPath, jsonStringField, codexSession },

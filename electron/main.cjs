@@ -10,8 +10,8 @@ const fs = require('node:fs')
 const { registerModelHandlers } = require('./ipc/modelHandler.cjs')
 const { registerToolHandlers } = require('./ipc/toolHandler.cjs')
 const { registerSettingsHandlers } = require('./ipc/settingsHandler.cjs')
-const { registerTerminalHandlers, killAllSessions, setAppFocused, detachRendererOwner } = require('./ipc/terminalHandler.cjs')
-const { registerAcpHandlers, disposeAcp, acpRendererSwapState, acpProjectTransferState, transferAcpProject, releaseAcpRenderer } = require('./ipc/acpHandler.cjs')
+const { registerTerminalHandlers, detachSessionBroker, setAppFocused, detachRendererOwner } = require('./ipc/terminalHandler.cjs')
+const { registerAcpHandlers, disposeAcp, acpRendererSwapState, acpRestartSafetyState, waitForAcpRestartSafe, acpProjectTransferState, transferAcpProject, releaseAcpRenderer } = require('./ipc/acpHandler.cjs')
 const { registerAuthHandlers, disposeAuth } = require('./ipc/authHandler.cjs')
 const { registerFsHandlers, disposeFs } = require('./ipc/fsHandler.cjs')
 const { registerGrobidHandlers } = require('./ipc/grobidHandler.cjs')
@@ -39,6 +39,8 @@ const macVibrancy = process.platform === 'darwin'
   ? { vibrancy: macVibrancyType, visualEffectState: 'active' }
   : {}
 let appIsQuitting = false
+let appCleanupStarted = false
+let deferredQuitTask = null
 
 // ── Liquid Glass (macOS 26 "Tahoe"+) ─────────────────────────────────────────
 // Darwin 25 == macOS 26. When the native module is present and supported, the
@@ -936,7 +938,7 @@ if (hasSingleInstanceLock) app.whenReady().then(() => {
   registerLedgerHandlers(ipcMain)
   registerMcpHandlers(ipcMain)
   registerExtensionHandlers(ipcMain)
-  registerUpdateHandlers(ipcMain)
+  registerUpdateHandlers(ipcMain, { waitForRestartSafe: waitForAcpRestartSafe })
   registerGlassHandlers(ipcMain)
   registerAssistantArchiveHandlers(ipcMain, path.join(app.getPath('userData'), 'assistant-archives'))
   createWindow()
@@ -962,9 +964,47 @@ app.on('browser-window-blur', () => {
   }, 150)
 })
 
-app.on('before-quit', () => {
+app.on('before-quit', (event) => {
+  const restartState = acpRestartSafetyState()
+  if (!restartState.safe) {
+    // ACP streams still terminate in Electron main. Keep the UI available for
+    // a live turn/approval, then complete this one quit request automatically.
+    // PTY/CLI sessions are broker-owned and never enter this gate.
+    event.preventDefault()
+    appIsQuitting = false
+    if (!deferredQuitTask) {
+      const focused = BrowserWindow.getFocusedWindow()
+      const options = {
+        type: 'info',
+        title: 'Finishing active agent work',
+        message: 'Kaisola will close as soon as the active agent reaches a safe stopping point.',
+        detail: restartState.awaitingPermission
+          ? 'Respond to the pending approval in the app. Terminal and CLI sessions will continue in the background through the restart.'
+          : 'You can let the response finish or stop it. Terminal and CLI sessions will continue in the background through the restart.',
+        buttons: ['OK'],
+      }
+      const notice = focused ? dialog.showMessageBox(focused, options) : dialog.showMessageBox(options)
+      void notice.catch(() => {})
+      deferredQuitTask = waitForAcpRestartSafe().then((result) => {
+        deferredQuitTask = null
+        if (result.ok && result.safe) app.quit()
+        else {
+          const detail = result.awaitingPermission
+            ? 'A permission request is still waiting for your response.'
+            : 'Agent work did not reach a safe stopping point. Stop it or let it finish, then quit again.'
+          void dialog.showMessageBox({ type: 'warning', title: 'Kaisola stayed open', message: 'The app was not closed, so live agent output was not lost.', detail, buttons: ['OK'] })
+        }
+      })
+    }
+    return
+  }
   appIsQuitting = true
-  killAllSessions()
+  if (appCleanupStarted) return
+  appCleanupStarted = true
+  // PTYs/CLI agents belong to the detached broker and continue through app
+  // replacement. Closing this authenticated client makes their hot tails flush
+  // to disk; the next main process reattaches to the same PIDs.
+  void detachSessionBroker()
   disposeAcp()
   disposeAuth()
   disposeFs()

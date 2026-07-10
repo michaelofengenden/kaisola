@@ -45,6 +45,7 @@ function createUpdateController({
   appVersion,
   publish = () => {},
   appEmitter,
+  waitForRestartSafe = async () => ({ ok: true, safe: true }),
   now = () => Date.now(),
   setTimeoutFn = setTimeout,
   clearTimeoutFn = clearTimeout,
@@ -60,7 +61,7 @@ function createUpdateController({
     appVersion,
     revision: 0,
   }
-  let operation = null // check | download | ready-check | replacement-download | install
+  let operation = null // check | download | ready-check | replacement-download | install (including its safety wait)
   let activeTask = null
   let lastCheckAt = 0
   let installWatchdog = null
@@ -267,9 +268,60 @@ function createUpdateController({
       return { ok: false, message }
     }
 
+    const readyVersion = state.version
     operation = 'install'
-    setState({ type: 'installing', message: 'Restarting to apply update…', checkError: null, checkingForLatest: false })
+    setState({
+      type: 'installing',
+      message: 'Waiting for active agent work before restarting…',
+      checkError: null,
+      checkingForLatest: false,
+    })
     clearInstallWatchdog()
+
+    let restartSafety
+    try {
+      restartSafety = await waitForRestartSafe()
+    } catch {
+      restartSafety = { ok: false, safe: false, unavailable: true }
+    }
+
+    // The gate is deliberately fail-closed: a timeout, exception, malformed
+    // response, or missing main-process integration leaves the downloaded build
+    // ready for retry. Never infer safety merely because the wait ended.
+    if (restartSafety?.ok !== true || restartSafety?.safe !== true) {
+      const message = restartSafety?.awaitingPermission
+        ? 'Update remains ready. Respond to the pending agent approval, then choose Restart to update.'
+        : restartSafety?.connecting
+          ? 'Update remains ready. An agent is still connecting, so Kaisola did not restart. Try again when it finishes.'
+          : restartSafety?.busy
+            ? 'Update remains ready. Agent work is still active, so Kaisola did not restart. Try again when it finishes.'
+            : 'Update remains ready. Kaisola could not verify that agent work was safe to restart, so it did not quit.'
+      operation = null
+      setState({
+        type: 'ready',
+        version: readyVersion,
+        percent: 100,
+        message: null,
+        checkError: message,
+        checkingForLatest: false,
+      })
+      return {
+        ok: false,
+        deferred: true,
+        timedOut: !!restartSafety?.timedOut,
+        message,
+        restartSafety,
+      }
+    }
+
+    // An updater error or disposal event that changed state while the gate was
+    // waiting must not be overwritten by a late "safe" result.
+    if (operation !== 'install' || state.type !== 'installing') {
+      operation = null
+      return { ok: false, deferred: true, message: 'The update state changed before restart could begin.' }
+    }
+
+    setState({ type: 'installing', message: 'Restarting to apply update…', checkError: null })
 
     const onBeforeQuit = () => clearInstallWatchdog()
     appEmitter.once('before-quit', onBeforeQuit)
@@ -322,7 +374,7 @@ function createUpdateController({
   }
 }
 
-function registerUpdateHandlers(ipcMain) {
+function registerUpdateHandlers(ipcMain, options = {}) {
   const { app, BrowserWindow } = require('electron')
   let state = {
     type: 'idle',
@@ -365,6 +417,12 @@ function registerUpdateHandlers(ipcMain) {
     appVersion: app.getVersion(),
     publish: broadcast,
     appEmitter: app,
+    // Packaged installs fail closed until main supplies the authoritative ACP
+    // gate. createUpdateController's permissive default exists only so isolated
+    // updater probes remain independent of Electron's ACP runtime.
+    waitForRestartSafe: typeof options.waitForRestartSafe === 'function'
+      ? options.waitForRestartSafe
+      : async () => ({ ok: false, safe: false, unavailable: true }),
   })
   state = controller.snapshot()
 

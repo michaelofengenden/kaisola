@@ -4,8 +4,8 @@ import { FitAddon } from '@xterm/addon-fit'
 import { SearchAddon } from '@xterm/addon-search'
 import { WebLinksAddon } from '@xterm/addon-web-links'
 import { WebglAddon } from '@xterm/addon-webgl'
-import { bridge, isDesktop } from '../lib/bridge'
-import { useKaisola, terminalOwnerMap, POP_TERMINAL_ID, type TermBackground } from '../store/store'
+import { bridge, isDesktop, type TermSnapshot } from '../lib/bridge'
+import { useKaisola, terminalOwnerMap, POP_TERMINAL_ID, type TermBackground, type TerminalContinuationStatus } from '../store/store'
 import { clockTime } from '../lib/format'
 import { Icon } from './Icon'
 
@@ -89,6 +89,10 @@ const xtermTheme = (theme: 'dark' | 'light', eco: boolean, cursorColor = 'auto',
  * buffer only makes re-showing the card parse megabytes it will immediately
  * scroll away, which is what made tab switches stutter. */
 const HIDDEN_BUF_CAP = 512_000
+/** Minimize/hide can be a momentary Mission Control transition. Wait briefly
+ * before paying the teardown/replay cost; a genuinely hidden window then owns
+ * zero xterm canvases, glyph atlases, listeners, or renderer scrollback. */
+const WINDOW_HIBERNATE_GRACE_MS = 1200
 
 /** The user's chosen face first, honest fallbacks behind it. 'ui-monospace'
  * is the "SF Mono (system)" choice — the name itself, unquoted. */
@@ -134,16 +138,49 @@ export const forgetMountedTerminal = (id: string) => {
   everMountedTerminals.delete(id)
 }
 
-/** Window-level visibility (minimized / fully occluded): while nobody can see
- * the window, every terminal buffers instead of parsing + painting. */
-function useDocVisible() {
-  const [v, setV] = useState(!document.hidden)
+/** Window visibility has two phases: stop painting immediately, then fully
+ * dispose/detach the renderer after a short grace. The broker PTY is untouched. */
+function useDocumentTerminalLifecycle() {
+  const initial = !document.hidden
+  const [visible, setVisible] = useState(initial)
+  const [rendererAwake, setRendererAwake] = useState(initial)
   useEffect(() => {
-    const on = () => setV(!document.hidden)
+    let timer: number | null = null
+    const on = () => {
+      const next = !document.hidden
+      setVisible(next)
+      if (timer != null) window.clearTimeout(timer)
+      timer = null
+      if (next) {
+        setRendererAwake(true)
+        return
+      }
+      timer = window.setTimeout(() => {
+        timer = null
+        setRendererAwake(false)
+      }, WINDOW_HIBERNATE_GRACE_MS)
+    }
+    on()
     document.addEventListener('visibilitychange', on)
-    return () => document.removeEventListener('visibilitychange', on)
+    return () => {
+      if (timer != null) window.clearTimeout(timer)
+      document.removeEventListener('visibilitychange', on)
+    }
   }, [])
-  return v
+  return { visible, rendererAwake }
+}
+
+/** Only an across-app-instance handoff of a still-live PTY earns the receipt.
+ * Ordinary card/window remounts deliberately return null. */
+function continuedStatus(snapshot: Partial<TermSnapshot>): TerminalContinuationStatus | null {
+  const continuity = snapshot.continuation
+  if (!continuity?.acrossRestart || continuity.exitedWhileDetached || snapshot.exited) return null
+  return {
+    sameProcess: true,
+    at: Number.isFinite(continuity.reattachedAt) ? continuity.reattachedAt! : Date.now(),
+    ...(Number.isFinite(continuity.terminalPid) ? { terminalPid: continuity.terminalPid } : {}),
+    ...(Number.isFinite(continuity.outputBytes) ? { outputBytes: continuity.outputBytes } : {}),
+  }
 }
 
 /**
@@ -180,7 +217,7 @@ export function Terminal({ id, attach = false, boot, cwd }: { id: string; attach
   // An occluded/minimized WINDOW counts as hidden too — agents streaming into a
   // window nobody can see should cost buffering, not parse + GPU frames.
   const cardShown = useKaisola((s) => !!POP_TERMINAL_ID || (s.dockOpen && s.dockViews.includes(id)))
-  const docVisible = useDocVisible()
+  const { visible: docVisible, rendererAwake } = useDocumentTerminalLifecycle()
   const visible = cardShown && docVisible
   const visibleRef = useRef(visible)
   visibleRef.current = visible
@@ -208,6 +245,12 @@ export function Terminal({ id, attach = false, boot, cwd }: { id: string; attach
   // boot delivery: `create` boots only FRESH ptys; a boot adopted while the pty
   // is already live arrives via the record's bootPending flag instead
   const bootPending = useKaisola((s) => s.terminals.find((t) => t.id === id)?.bootPending)
+  const persistedContinuation = useKaisola((s) => s.terminals.find((t) => t.id === id)?.continued)
+  const setTerminalContinuation = useKaisola((s) => s.setTerminalContinuation)
+  // Agent-owned attach-only terminals are not durable TerminalSession rows;
+  // they still get the receipt for this mount, while user/CLI terminals persist it.
+  const [attachedContinuation, setAttachedContinuation] = useState<TerminalContinuationStatus | null>(null)
+  const continuation = persistedContinuation ?? attachedContinuation
   const [ptyReady, setPtyReady] = useState(false)
   const bootSentRef = useRef(false)
   // what the create path actually typed (and when) — the adopted-boot effect
@@ -227,6 +270,17 @@ export function Terminal({ id, attach = false, boot, cwd }: { id: string; attach
   const draftBufRef = useRef(useKaisola.getState().termDrafts[id] ?? '')
   const trackDraftRef = useRef<(data: string) => void>(() => {})
   const armDraftRetypeRef = useRef<(bootStr: string) => void>(() => {})
+
+  // One-time means one actually visible glance, not “eight seconds elapsed in
+  // a minimized window.” If the app exits first, the persisted receipt returns.
+  useEffect(() => {
+    if (!visible || !continuation) return
+    const timer = window.setTimeout(() => {
+      if (persistedContinuation) setTerminalContinuation(id, undefined)
+      setAttachedContinuation(null)
+    }, 8000)
+    return () => window.clearTimeout(timer)
+  }, [visible, continuation?.at, persistedContinuation, id, setTerminalContinuation])
 
   // keep the live terminal's palette in sync with the app theme + energy saver
   useEffect(() => {
@@ -280,7 +334,8 @@ export function Terminal({ id, attach = false, boot, cwd }: { id: string; attach
   }, [termFontSize, termFontFamily, termFontWeight, id])
 
   useEffect(() => {
-    if (!isDesktop || !hostRef.current) return
+    if (!isDesktop || !hostRef.current || !rendererAwake) return
+    hostRef.current.replaceChildren()
     const term = new XTerm({
       fontFamily: fontStack(fontFamilyRef.current),
       fontSize: fontSizeRef.current,
@@ -696,7 +751,7 @@ export function Terminal({ id, attach = false, boot, cwd }: { id: string; attach
       bridge.terminal.resize(id, term.cols, term.rows)
     }
 
-    const restoreSnapshot = (snap: { output?: string; viewState?: { scrollFromBottom?: number } | null }) => {
+    const restoreSnapshot = (snap: Partial<TermSnapshot>) => {
       const restoreView = () => {
         const fromBottom = Number(snap.viewState?.scrollFromBottom)
         if (Number.isFinite(fromBottom) && fromBottom > 0) {
@@ -710,6 +765,8 @@ export function Terminal({ id, attach = false, boot, cwd }: { id: string; attach
     if (attach) {
       bridge.terminal.attach(id).then((snap) => {
         if (disposed) return
+        const receipt = continuedStatus(snap)
+        if (receipt) setAttachedContinuation(receipt)
         restoreSnapshot(snap)
         wire()
       })
@@ -720,6 +777,13 @@ export function Terminal({ id, attach = false, boot, cwd }: { id: string; attach
           term.writeln('\x1b[38;2;225;106;106mTerminal unavailable.\x1b[0m')
           return
         }
+        const receipt = continuedStatus(res)
+        const state = useKaisola.getState()
+        if (receipt) state.setTerminalContinuation(id, receipt)
+        // A brand-new PTY proves any unviewed receipt restored from a crashed
+        // app is stale; an ordinary same-instance hibernation (`existed`) must
+        // leave a still-pending receipt alone.
+        else if (!res.existed) state.setTerminalContinuation(id, undefined)
         restoreSnapshot(res)
         wire()
         // run a boot command (e.g. `codex login`) once the shell prompt is
@@ -791,6 +855,7 @@ export function Terminal({ id, attach = false, boot, cwd }: { id: string; attach
       try {
         term.dispose()
       } catch { /* an addon threw mid-teardown — the pty is unaffected */ }
+      host.replaceChildren()
       termRef.current = null
       fitRef.current = null
       searchRef.current = null
@@ -800,7 +865,7 @@ export function Terminal({ id, attach = false, boot, cwd }: { id: string; attach
     // cwd is intentionally NOT a dep: it only matters at spawn time, and a
     // record cwd change must never tear down a live session mid-run
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [id, attach])
+  }, [id, attach, rendererAwake])
 
   // deliver a boot adopted after the pty went live (see bootPending). The shell
   // was spawned before the terminal had a cwd, so cd to it as a user would.
@@ -869,6 +934,8 @@ export function Terminal({ id, attach = false, boot, cwd }: { id: string; attach
       data-file-drop={fileDropHover || undefined}
       data-terminal-theme={theme}
       data-ansi-black={livePalette.black}
+      data-terminal-id={id}
+      data-renderer-awake={rendererAwake}
       onDragOver={(e) => {
         if (!e.dataTransfer?.types.includes('Files')) return
         e.preventDefault()
@@ -935,6 +1002,22 @@ export function Terminal({ id, attach = false, boot, cwd }: { id: string; attach
           <button onClick={() => findNext(false)} title="Next  ⏎"><Icon name="ChevronDown" size={12} /></button>
           <button onClick={closeFind} title="Close  esc"><Icon name="X" size={12} /></button>
         </div>
+      )}
+      {continuation && visible && (
+        <button
+          className="term-continuity"
+          role="status"
+          aria-live="polite"
+          onClick={() => {
+            if (persistedContinuation) setTerminalContinuation(id, undefined)
+            setAttachedContinuation(null)
+          }}
+          title={continuation.terminalPid ? `Terminal process ${continuation.terminalPid} stayed alive across the update` : 'The same terminal process stayed alive across the update'}
+        >
+          <span className="term-continuity-dot" aria-hidden />
+          <span>Continued</span>
+          <span className="faint">same process</span>
+        </button>
       )}
       <div ref={hostRef} className="term-host" />
     </div>

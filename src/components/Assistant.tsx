@@ -33,8 +33,11 @@ type ControlKind = 'mode' | 'model' | 'config'
 interface UiControl { id: string; name: string; category: string; value: string; options: { value: string; name: string; description?: string }[]; kind: ControlKind }
 
 const ARCHIVED_TURN_KINDS = new Set<Turn['kind']>(['user', 'assistant', 'thought', 'tool'])
-const MAX_ARCHIVE_VIEW_TURNS = 180
-const MAX_ARCHIVE_VIEW_BYTES = 32 * 1024 * 1024
+// History is durable in main's append-only archive. Keep only a compact page in
+// Chromium: users can page through every turn, but old prose/diffs no longer
+// sit duplicated in both the renderer heap and the disk archive.
+const MAX_ARCHIVE_VIEW_TURNS = 72
+const MAX_ARCHIVE_VIEW_BYTES = 6 * 1024 * 1024
 /** IPC archives are private app data, but still cross a process boundary. Keep
  * malformed/corrupt JSONL records away from render-time string operations. */
 const archivedTurn = (value: unknown): Turn | null => {
@@ -625,6 +628,10 @@ export const Assistant = memo(function Assistant({ threadId }: { threadId: strin
   const [fileDropHover, setFileDropHover] = useState(false)
   const scrollRef = useRef<HTMLDivElement>(null)
   const inputRef = useRef<HTMLTextAreaElement>(null)
+  const [queueOpen, setQueueOpen] = useState(false)
+  const queueButton = useRef<HTMLButtonElement>(null)
+  const queuePanel = useRef<HTMLDivElement>(null)
+  useProviderPopover(queueOpen, setQueueOpen, queueButton, queuePanel)
   // grow the composer to fit what's typed (capped); reset to one line when empty
   const autoGrow = (el: HTMLTextAreaElement) => { el.style.height = 'auto'; el.style.height = `${Math.min(el.scrollHeight, 160)}px` }
 
@@ -657,6 +664,7 @@ export const Assistant = memo(function Assistant({ threadId }: { threadId: strin
   const mentions = draft.mentions
   const speed = draft.speed
   useEffect(() => { if (inputRef.current && !input) inputRef.current.style.height = '' }, [input])
+  useEffect(() => { if (!queuedPrompts.length) setQueueOpen(false) }, [queuedPrompts.length])
   const permsForAgent = pendingPermissions.filter((p) => p.key === connectionKey)
   const arun: Runtime = liveRuntime ?? { turns: [], first: true }
   const [archivedPage, setArchivedPage] = useState<Turn[]>([])
@@ -810,15 +818,17 @@ export const Assistant = memo(function Assistant({ threadId }: { threadId: strin
     })
     return () => { live = false }
   }, [connectionKey])
+  const keepAgentHot = busy || permsForAgent.length > 0
   useEffect(() => {
-    // One lease per mounted card. Hidden/unmounted chats release their lease;
-    // main parks the adapter only after its idle timeout and only when the ACP
-    // session is resumable, with no turn or permission in flight.
-    void bridge.acp.lease(connectionKey, threadId, true, undefined, projectId)
+    // A visible but idle transcript does not need a live Node/CLI adapter. The
+    // resumable provider session is the durable state, so main parks it after
+    // a short grace and reconnects on the next send. Active turns and approval
+    // prompts always hold the lease and therefore cannot be parked.
+    void bridge.acp.lease(connectionKey, threadId, keepAgentHot, 90_000, projectId)
     return () => {
-      void bridge.acp.lease(connectionKey, threadId, false, undefined, projectId)
+      void bridge.acp.lease(connectionKey, threadId, false, 90_000, projectId)
     }
-  }, [connectionKey, projectId, threadId, workspacePath])
+  }, [connectionKey, keepAgentHot, projectId, threadId])
   useEffect(() => { const off = bridge.acp.onControls(() => refresh()); return off }, [connectionKey])
   // many agents print an OAuth URL to authorize — surface it as an openable link
   useEffect(() => {
@@ -939,6 +949,19 @@ export const Assistant = memo(function Assistant({ threadId }: { threadId: strin
     else setNotice(res.message ?? 'Could not connect.')
     return res.ok
   }
+  const ensureAgentConnected = async (): Promise<boolean> => {
+    // Main may have parked this idle adapter to reclaim its CLI/Node memory
+    // while the transcript stayed mounted. A cheap status probe distinguishes
+    // that from the optimistic renderer badge and resumes the durable provider
+    // session before the next prompt or control mutation.
+    let agentReady = connected
+    try {
+      const status = await bridge.acp.status([connectionKey], projectId)
+      setAgents(status.agents)
+      agentReady = status.agents.some((agent) => agent.key === connectionKey && agent.connected)
+    } catch { /* fall back to the last renderer-known state */ }
+    return agentReady || connect(agentKey)
+  }
   // Sign in: a clean in-app device-code card where available (codex), else fall
   // back to running the CLI's login in a terminal.
   const signIn = () => {
@@ -971,6 +994,7 @@ export const Assistant = memo(function Assistant({ threadId }: { threadId: strin
     void connect(agentKey)
   }, [agentKey, connected, busy, connectionKey, presets, statusReadyKey, threadId, workspacePath])
   const onControlChange = async (c: UiControl, value: string) => {
+    if (!(await ensureAgentConnected())) return
     const result = c.kind === 'mode'
       ? await bridge.acp.setMode(connectionKey, value)
       : c.kind === 'model'
@@ -1198,7 +1222,7 @@ export const Assistant = memo(function Assistant({ threadId }: { threadId: strin
     const prompt: AssistantDraft = { ...rawPrompt, text: rawPrompt.text.slice(0, ASSISTANT_DRAFT_TEXT_LIMIT) }
     if (!prompt.text) return false
     if (owningSlice()?.assistantThreads.find((t) => t.id === active.id)?.busy) return false
-    if (!connected) { const ok = await connect(agentKey); if (!ok) return false }
+    if (!(await ensureAgentConnected())) return false
     if (wasTrimmed) setNotice(`Message limited to ${ASSISTANT_DRAFT_TEXT_LIMIT.toLocaleString()} characters to keep the IDE responsive. Attach long material as a file to preserve it in full.`)
     const threadId = active.id
     if (owningSlice()?.assistantThreads.find((t) => t.id === threadId)?.busy) return false
@@ -1566,20 +1590,6 @@ export const Assistant = memo(function Assistant({ threadId }: { threadId: strin
             ))}
           </div>
         )}
-        {queuedPrompts.length > 0 && (
-          <div className="composer-queue">
-            <span className="composer-queue-label">
-              <Icon name="ListChecks" size={11} /> {queuedPrompts.length} queued{queuedPrompts.length > 1 ? ' · sends together' : ''}
-            </span>
-            {queuedPrompts.slice(0, 4).map((q) => (
-              <span key={q.id} className="queue-chip" title={q.text}>
-                <Icon name={q.speed === 'fast' ? 'Gauge' : 'Circle'} size={10} />
-                {q.text.length > 34 ? `${q.text.slice(0, 34)}…` : q.text}
-                <button onClick={() => removeQueuedAssistantPrompt(active.id, q.id)}><Icon name="X" size={9} /></button>
-              </span>
-            ))}
-          </div>
-        )}
         <textarea
           ref={inputRef}
           className="composer-input"
@@ -1600,6 +1610,51 @@ export const Assistant = memo(function Assistant({ threadId }: { threadId: strin
         />
         <div className="composer-bar">
           <button className="composer-tool" onClick={attach} title="Attach files"><Icon name="Paperclip" size={14} /></button>
+          {queuedPrompts.length > 0 && (
+            <>
+              <button
+                ref={queueButton}
+                className="composer-queue-capsule"
+                data-open={queueOpen || undefined}
+                onClick={() => setQueueOpen((value) => !value)}
+                title={`${queuedPrompts.length} queued prompt${queuedPrompts.length === 1 ? '' : 's'}${queuedPrompts.length > 1 ? ' · sends together' : ''}`}
+                aria-haspopup="dialog"
+                aria-expanded={queueOpen}
+              >
+                <Icon name="ListChecks" size={12} />
+                <span>{queuedPrompts.length} queued</span>
+                <Icon name="ChevronUp" size={10} />
+              </button>
+              {queueOpen && createPortal(
+                <div
+                  ref={queuePanel}
+                  className="provider-pop queue-pop"
+                  role="dialog"
+                  aria-label="Queued prompts"
+                  style={{ position: 'fixed', ...popoverPosition(queueButton.current) }}
+                >
+                  <div className="provider-pop-head">
+                    <strong>Queued prompts</strong>
+                    <span className="grow" />
+                    <span className="faint">{queuedPrompts.length > 1 ? 'Sends together' : 'Sends next'}</span>
+                  </div>
+                  <div className="queue-pop-list">
+                    {queuedPrompts.map((q, index) => (
+                      <div key={q.id} className="queue-pop-row">
+                        <span className="queue-pop-index">{index + 1}</span>
+                        <span className="queue-pop-text" title={q.text}>{q.text}</span>
+                        {q.speed === 'fast' && <Icon name="Gauge" size={11} />}
+                        <button onClick={() => removeQueuedAssistantPrompt(active.id, q.id)} title="Remove queued prompt" aria-label="Remove queued prompt">
+                          <Icon name="X" size={11} />
+                        </button>
+                      </div>
+                    ))}
+                  </div>
+                </div>,
+                document.body,
+              )}
+            </>
+          )}
           {composerControls.map((c) => (
             <Dropdown key={c.id} icon={CATEGORY_ICON[c.category]} value={c.value} options={c.options.map(({ value, name }) => ({ value, name }))} onSelect={(v) => onControlChange(c, v)} title={c.name} />
           ))}

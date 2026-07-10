@@ -1,8 +1,8 @@
 // Draft-survival probe, two launches over one userData:
 //   phase 1 — create an agent-singleton terminal (boot contains --resume so
 //             the retype arms on relaunch), persist a draft for it, quit.
-//   phase 2 — the rehydrated terminal boots; after the pty goes quiet the
-//             saved draft must be retyped (cat echoes it into the snapshot).
+//   phase 2 — the rehydrated terminal adopts the SAME broker-owned process;
+//             its durable draft backup and same-process receipt both survive.
 //   npx electron electron/draftprobe.cjs 1 && npx electron electron/draftprobe.cjs 2
 const { app, BrowserWindow, ipcMain } = require('electron')
 const path = require('node:path')
@@ -24,7 +24,6 @@ const { registerClaudeHooksHandlers } = require('./ipc/claudeHooksHandler.cjs')
 const { registerUpdateHandlers } = require('./ipc/updateHandler.cjs')
 const { registerGlassHandlers } = require('./ipc/glassHandler.cjs')
 const worktree = require('./ipc/worktreeHandler.cjs')
-const mgr = require('./ipc/terminalManager.cjs')
 
 process.env.KAISOLA_SMOKE = '1'
 const phase = process.argv.find((a) => /^[12]$/.test(a)) || '1'
@@ -73,17 +72,19 @@ app.whenReady().then(async () => {
     return
   }
 
-  // phase 2: rehydrated agent terminal reboots with --resume in its boot line;
-  // the retype waits for ≥2s quiescence starting 3s after boot
-  await wait(14_000)
+  // phase 2: the new renderer adopts the exact still-live PTY instead of
+  // restarting its boot command. The receipt remains visible for eight seconds.
+  await wait(4_000)
   const out = await js(`(() => {
     const st = window.__kaisola.getState()
     const t = st.terminals.find((x) => x.singletonKey === 'agent:probe')
-    return { id: t ? t.id : '', draftLeft: t ? st.termDrafts[t.id] ?? null : null }
+    return { id: t ? t.id : '', continued: !!t?.continued?.sameProcess, draftLeft: t ? st.termDrafts[t.id] ?? null : null }
   })()`)
   if (!out.id) { console.log('DRAFT=FAIL terminal not rehydrated'); app.exit(1); return }
-  const snap = mgr.snapshot(out.id)
-  const typed = snap.output.includes(DRAFT)
-  console.log('DRAFT=' + (typed ? 'PASS' : 'FAIL') + ' ' + JSON.stringify({ typed, draftLeft: out.draftLeft, tail: snap.output.slice(-200).replace(/\s+/g, ' ') }))
-  app.exit(typed ? 0 : 1)
+  const snap = await js(`window.kaisola.terminal.snapshot(${JSON.stringify(out.id)})`)
+  const passed = out.continued && out.draftLeft === DRAFT && !snap.exited
+  console.log('DRAFT=' + (passed ? 'PASS' : 'FAIL') + ' ' + JSON.stringify({ continued: out.continued, draftLeft: out.draftLeft, tail: snap.output.slice(-200).replace(/\s+/g, ' ') }))
+  await js(`window.kaisola.terminal.kill(${JSON.stringify(out.id)})`)
+  await wait(200)
+  app.exit(passed ? 0 : 1)
 })

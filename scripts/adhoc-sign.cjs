@@ -13,6 +13,7 @@ exports.default = async function adhocSign(context) {
     context.appOutDir,
     `${context.packager.appInfo.productFilename}.app`
   );
+  const entitlements = path.join(__dirname, '..', 'node_modules', 'app-builder-lib', 'templates', 'entitlements.mac.plist');
   const sh = (cmd) => execSync(cmd, { stdio: 'inherit' });
   // codesign refuses bundles containing Finder metadata ("resource fork,
   // Finder information, or similar detritus not allowed"). xattr -cr can't
@@ -24,6 +25,11 @@ exports.default = async function adhocSign(context) {
     sh(`rm -rf "${appPath}"`);
     sh(`mv "${appPath}.clean" "${appPath}"`);
     sh(`find "${appPath}" -name .DS_Store -delete`);
+    // cp -X prevents inherited metadata; xattr -cr also removes FinderInfo a
+    // background Finder/provenance service can stamp onto the fresh copy in
+    // the milliseconds before electron-builder begins its recursive signing.
+    // com.apple.provenance may be SIP-protected, but codesign tolerates it.
+    sh(`xattr -cr "${appPath}" || true`);
   };
 
   // Always clean once before electron-builder's real Developer ID signing.
@@ -37,7 +43,10 @@ exports.default = async function adhocSign(context) {
   for (let attempt = 1; attempt <= 3; attempt++) {
     if (attempt > 1) cleanBundle();
     try {
-      sh(`codesign --force --deep --sign - "${appPath}"`);
+      // Keep Electron's JIT/native-module entitlements in local builds too;
+      // otherwise an ad-hoc bundle can open yet fail only when a native PTY or
+      // detached RunAsNode helper is exercised.
+      sh(`codesign --force --deep --sign - --options runtime --entitlements "${entitlements}" "${appPath}"`);
       // no --strict: a late provenance re-stamp trips it, harmlessly
       sh(`codesign --verify --deep "${appPath}"`);
       return;

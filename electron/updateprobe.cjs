@@ -124,6 +124,42 @@ async function main() {
   assert.equal(controller.snapshot().type, 'ready')
   assert.match(controller.snapshot().checkError, /Quit and reopen Kaisola/)
 
+  // Active ACP work is a fail-closed restart gate. The downloaded update stays
+  // ready, and quitAndInstall is never called merely because the wait timed out.
+  const guardedUpdater = new FakeUpdater()
+  const guardedEvents = new EventEmitter()
+  const guard = deferred()
+  let guardResult = guard.promise
+  const guarded = createUpdateController({
+    autoUpdater: guardedUpdater,
+    appVersion: '1.0.0',
+    appEmitter: guardedEvents,
+    waitForRestartSafe: () => guardResult,
+  })
+  const guardedDownload = deferred()
+  guardedUpdater.scenarios.push({ available: true, version: '1.1.0', download: guardedDownload })
+  const guardedCheck = guarded.check()
+  await turn()
+  guardedUpdater.emit('update-downloaded', { version: '1.1.0' })
+  guardedDownload.resolve([])
+  await guardedCheck
+  const guardedInstall = guarded.install()
+  await turn()
+  assert.equal(guarded.snapshot().type, 'installing')
+  assert.match(guarded.snapshot().message, /Waiting for active agent/)
+  assert.equal(guardedUpdater.quitCalls, 0)
+  guard.resolve({ ok: false, safe: false, busy: true, timedOut: true })
+  const deferredInstall = await guardedInstall
+  assert.equal(deferredInstall.deferred, true)
+  assert.equal(guardedUpdater.quitCalls, 0)
+  assert.equal(guarded.snapshot().type, 'ready')
+  assert.match(guarded.snapshot().checkError, /Agent work is still active/)
+
+  guardResult = Promise.resolve({ ok: true, safe: true })
+  assert.equal((await guarded.install()).ok, true)
+  assert.equal(guardedUpdater.quitCalls, 1)
+  guarded.dispose()
+
   // Every publication is monotonic, which makes renderer snapshot/event races safe.
   for (let i = 1; i < states.length; i += 1) {
     assert.ok(states[i].revision > states[i - 1].revision)

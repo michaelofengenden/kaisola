@@ -76,7 +76,7 @@ export function ProjectTabs() {
   }
 
   return (
-    <div className="tabstrip">
+    <div className="tabstrip" data-single={tabs.length === 1 || undefined}>
       <WindowLights />
       <RailToggle />
       <div className="tabstrip-track" role="tablist" ref={trackRef} onScroll={syncFade}>
@@ -245,9 +245,9 @@ function UpdatePill() {
   }
   if (u.type === 'installing') {
     return (
-      <span className="update-pill" data-busy title="Restarting Kaisola to apply the downloaded update">
+      <span className="update-pill" data-busy title={u.message ?? 'Restarting Kaisola to apply the downloaded update'}>
         <Icon name="RefreshCw" size={12} />
-        Restarting…
+        {u.message?.startsWith('Waiting') ? 'Waiting for agents…' : 'Restarting…'}
       </span>
     )
   }

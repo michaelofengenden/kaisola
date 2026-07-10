@@ -568,8 +568,8 @@ app.whenReady().then(async () => {
   })()`)
   console.log('SENSITIVE=' + JSON.stringify(sensitive))
 
-  // 7b) code-agent activity ledger — tool/subagent calls and background
-  //     terminals should be visible as a neat summary inside the agent card.
+  // 7b) current agent work is ONE compact live line (the transcript owns
+  //     history); subagents and live terminals remain directly reachable.
   const activityUi = await win.webContents.executeJavaScript(`(async () => {
     const st = window.__kaisola.getState()
     st.setLayoutMode('studio')
@@ -587,16 +587,21 @@ app.whenReady().then(async () => {
         ...s.agentTerminals.filter((t) => t.terminalId !== 'activity-smoke-term'),
         { terminalId: 'activity-smoke-term', agentKey: 'mock', agentName: 'Mock Agent', command: 'npm run smoke', label: 'npm run smoke', cwd: '/tmp/pasola-smoke' },
       ],
+      terminalMeta: { ...s.terminalMeta, 'activity-smoke-term': { running: true, fgProcess: 'npm' } },
     }))
     await new Promise((r) => setTimeout(r, 180))
-    const card = document.querySelector('.agent-activity')
+    const card = document.querySelector('.agent-livebar')
     const text = card?.textContent || ''
     return {
       card: !!card,
-      hasSubagent: /Subagent/.test(text) && /coding subagent/.test(text),
-      hasTerminal: /Background terminals/.test(text) && /npm run smoke/.test(text),
-      hasStatus: /pending/.test(text) && /completed/.test(text),
-      openBtn: !!document.querySelector('.agent-activity-terminal button'),
+      hasSubagent: /coding subagent/.test(text) && !!card?.querySelector('.agent-live-pill svg'),
+      hasTerminal: /npm run smoke/.test(text),
+      hasStatus: !!card?.querySelector('.agent-live-dot') && !document.querySelector('.agent-activity'),
+      openBtn: !!card?.querySelector('button.agent-live-pill'),
+      noContext: !document.querySelector('.context-ledger'),
+      noMention: !document.querySelector('button[title^="Reference a paper"]'),
+      compactChrome: document.querySelectorAll('.tabstrip-tools > button').length <= 5,
+      overflow: !!document.querySelector('.tabstrip-tools > button[title="More"]'),
     }
   })()`)
   console.log('ACTIVITY_UI=' + JSON.stringify(activityUi))
@@ -1180,7 +1185,10 @@ a^2 + b^2 = c^2
     get().setStage('corpus') // canvas shown
     await new Promise((r) => setTimeout(r, 120))
     const shownBefore = !!document.querySelector('.canvas-wrap')
-    const hasBtn = !!document.querySelector('.btn-icon[title^="Toggle main view"]')
+    document.querySelector('.tabstrip-tools > button[title="More"]')?.click()
+    await new Promise((r) => setTimeout(r, 40))
+    const hasBtn = [...document.querySelectorAll('.shell-more-menu .tree-menu-item')].some((button) => /Hide files|Show files/.test(button.textContent || ''))
+    document.querySelector('.tree-menu-overlay')?.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }))
     get().toggleCanvas()
     await new Promise((r) => setTimeout(r, 120))
     const hidden = !document.querySelector('.canvas-wrap') && get().canvasOpen === false
@@ -2344,10 +2352,10 @@ a^2 + b^2 = c^2
     const pinnedSection = !!pinnedTab && !pinnedTab.querySelector('.stab-close')
     g().togglePinSession(tid)
     const unpinned = !g().pinnedSessions.includes(tid)
-    // needs-you: mark → dot renders; viewing the session clears it
+    // unseen completion: a STILL completed dot renders; viewing clears it
     g().markNeedsYou(tid)
     await new Promise((r) => setTimeout(r, 120))
-    const dot = !!document.querySelector('.stab[data-state="needs-you"]')
+    const dot = !!document.querySelector('.stab[data-state="completed"]')
     g().setDockView(tid)
     await new Promise((r) => setTimeout(r, 80))
     const cleared = !g().needsYou[tid]
@@ -2530,7 +2538,30 @@ a^2 + b^2 = c^2
   })()`)
   console.log('MANUAL_CLAUDE=' + JSON.stringify(manualClaude))
 
+  // Manual Codex gets the same restart contract, then an exact discovered
+  // session id upgrades the --last fallback. Drafts remain disk-persisted.
+  const manualCodex = await win.webContents.executeJavaScript(`(() => {
+    const g = () => window.__kaisola.getState()
+    g().requestTerminal()
+    const t = g().terminals[g().terminals.length - 1]
+    g().setTerminalMeta(t.id, { fgProcess: 'codex' })
+    let row = g().terminals.find((x) => x.id === t.id)
+    const upgraded = row?.singletonKey === 'agent:codex-cli-' + t.id && row?.restart === true && row?.boot === 'codex resume --last'
+    g().setTermDraft(t.id, 'preserve this codex draft')
+    g().setTerminalResume(t.id, 'codex resume 019f4965-6294-77c0-abf8-ddae5bce85dc')
+    row = g().terminals.find((x) => x.id === t.id)
+    const exact = row?.boot === 'codex resume 019f4965-6294-77c0-abf8-ddae5bce85dc' && row?.restart === true
+    const draftKept = g().termDrafts[t.id] === 'preserve this codex draft'
+    g().setTerminalMeta(t.id, { fgProcess: 'zsh' })
+    row = g().terminals.find((x) => x.id === t.id)
+    const downgraded = !row?.singletonKey && !row?.boot && !row?.restart
+    g().closeTerminal(t.id)
+    return { upgraded, exact, draftKept, downgraded }
+  })()`)
+  console.log('MANUAL_CODEX=' + JSON.stringify(manualCodex))
+
   const failed =
+    !manualCodex.upgraded || !manualCodex.exact || !manualCodex.draftKept || !manualCodex.downgraded ||
     !manualClaude.upgraded || !manualClaude.draftKept || !manualClaude.toolKept || !manualClaude.downgraded ||
     !rootChildren || !minimalShell.noWorkflowSidebar || !minimalShell.railHiddenByDefault || !minimalShell.hasSessions || !minimalShell.railFilesOnly || !minimalShell.hasEmptyLauncher || !minimalShell.stageFiles || !minimalShell.studioDefault || !minimalShell.floatingTools || !claudePrepared || !nativeWindow.rendererClippedMaterial || !icon.exists || !icon.usable || !icon.square || !icon.large || !glass.appSamplingLayer || !glass.chromeGlass || !glass.activeTintWhite || !glass.railLayerFlattened || !glass.contentGlassy || !glass.sessionGlassy || !glass.termGlassTint || !glass.blurKeepsGlass || !glass.lightsGray || !glass.nativeWindowRounding ||
     !emptyOk || !demoOk ||
@@ -2544,7 +2575,7 @@ a^2 + b^2 = c^2
     !dd.hasBtn || !dd.portal || dd.items < 2 ||
     !permrules.saved || !permrules.cascaded || !permrules.autoAnswered || !permrules.rejectCascade ||
     !sensitive.surfaced || !sensitive.stillPending || !sensitive.diffFlagged || sensitive.pendingAfter !== 0 ||
-    !activityUi.card || !activityUi.hasSubagent || !activityUi.hasTerminal || !activityUi.hasStatus || !activityUi.openBtn ||
+    !activityUi.card || !activityUi.hasSubagent || !activityUi.hasTerminal || !activityUi.hasStatus || !activityUi.openBtn || !activityUi.noContext || !activityUi.noMention || !activityUi.compactChrome || !activityUi.overflow ||
     !persist.stored || !persist.hasTheme || !persist.hasAgent || !persist.hasThread || !persist.hasChatTurn || !persist.hasDraft || !persist.draftBounded || !persist.hasCodexEffort ||
     !boot.hasId || !boot.ran ||
     !auth.hasUrl || auth.code !== 'ABCD-1234' || !auth.done ||

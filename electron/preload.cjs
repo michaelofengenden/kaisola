@@ -226,6 +226,7 @@ const bridge = {
     attach: (id) => ipcRenderer.invoke('terminal:attach', { id }),
     detachRenderer: (id, viewState) => ipcRenderer.invoke('terminal:detachRenderer', { id, viewState }),
     diagnostics: () => ipcRenderer.invoke('terminal:diagnostics'),
+    codexSession: (id, cwd) => ipcRenderer.invoke('terminal:codexSession', { id, cwd }),
     signal: (id, signal) => ipcRenderer.invoke('terminal:signal', { id, signal }),
     kill: (id) => ipcRenderer.invoke('terminal:kill', { id }),
     run: (command, cwd) => ipcRenderer.invoke('terminal:run', { command, cwd }),

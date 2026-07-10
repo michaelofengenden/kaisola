@@ -151,7 +151,7 @@ function mockClaudeSdk(raw, capture = {}, failure) {
       capture.params = params
       capture.calls = (capture.calls || 0) + 1
       return {
-        initializationResult: async () => ({ account: { tokenSource: 'oauth' } }),
+        initializationResult: async () => ({ account: { tokenSource: 'oauth', email: 'person@example.com', organization: 'Example', subscriptionType: 'Claude Max' } }),
         usage_EXPERIMENTAL_MAY_CHANGE_DO_NOT_RELY_ON_THIS_API_YET: async () => {
           if (failure) throw new Error(failure)
           return raw
@@ -172,6 +172,7 @@ test('Claude SDK usage normalizes plan, Fable and extra-usage fields without a p
   })
   assert.equal(usage.ok, true)
   assert.equal(usage.subscriptionType, 'max')
+  assert.equal(usage.email, 'person@example.com')
   assert.equal(usage.limits.fiveHour.usedPercent, 5)
   assert.equal(usage.limits.modelScoped[0].label, 'Fable')
   assert.equal(usage.limits.extraUsage.usedCredits, 12.25)
@@ -185,6 +186,18 @@ test('Claude SDK usage normalizes plan, Fable and extra-usage fields without a p
   assert.equal(capture.params.options.env.CLAUDE_CODE_OAUTH_TOKEN, undefined)
   assert.equal(capture.params.options.env.ANTHROPIC_BASE_URL, undefined)
   assert.equal(capture.closed, true)
+})
+
+test('Claude default account leaves CLAUDE_CONFIG_DIR unset so Keychain OAuth and limits remain visible', async () => {
+  const capture = {}
+  const usage = await readClaudeSdkUsage(path.join(os.homedir(), '.claude'), {
+    sdk: mockClaudeSdk(rawClaudeLimits(), capture),
+    timeoutMs: 500,
+    env: { PATH: '/probe', CLAUDE_CONFIG_DIR: '/wrong-isolated-profile' },
+  })
+  assert.equal(usage.ok, true)
+  assert.equal(usage.subscriptionType, 'max')
+  assert.equal(capture.params.options.env.CLAUDE_CONFIG_DIR, undefined)
 })
 
 test('Claude SDK schema rejects malformed experimental responses', () => {

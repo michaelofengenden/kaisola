@@ -3,6 +3,7 @@
 // colors/interactive apps work. The renderer (xterm.js) forwards raw bytes.
 const os = require('node:os')
 const path = require('node:path')
+const fs = require('node:fs/promises')
 const { spawn, execFile } = require('node:child_process')
 const { BrowserWindow, app } = require('electron')
 const mgr = require('./terminalManager.cjs')
@@ -32,6 +33,75 @@ function execOut(cmd, args) {
   return new Promise((resolve) => {
     execFile(cmd, args, { timeout: 4000 }, (err, stdout) => resolve(err ? null : stdout))
   })
+}
+
+const CODEX_SESSION_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
+const codexIdFromPath = (file) => {
+  const match = path.basename(file).match(/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\.jsonl$/i)
+  return match?.[1] && CODEX_SESSION_ID.test(match[1]) ? match[1] : null
+}
+const jsonStringField = (text, field) => {
+  const match = text.match(new RegExp(`"${field}":"((?:\\\\.|[^"\\\\])*)"`))
+  if (!match) return null
+  try { return JSON.parse(`"${match[1]}"`) } catch { return null }
+}
+
+/** Resolve a live Codex TUI to its exact rollout. First ask the foreground
+ * process which JSONL it has open (exact even with many sessions); fall back to
+ * the newest CLI/TUI rollout for this cwd if lsof races startup. */
+async function codexSession(id, cwd) {
+  const live = mgr.list().find((terminal) => terminal.id === id)
+  if (live?.pid) {
+    const foreground = Number(String(await execOut('ps', ['-o', 'tpgid=', '-p', String(live.pid)]) || '').trim())
+    if (foreground > 0) {
+      const openFiles = await execOut('lsof', ['-a', '-p', String(foreground), '-Fn'])
+      for (const line of String(openFiles || '').split('\n')) {
+        if (!line.startsWith('n') || !/\/\.codex\/sessions\/.+\.jsonl$/.test(line)) continue
+        const sessionId = codexIdFromPath(line.slice(1))
+        if (sessionId) return { ok: true, sessionId, exact: true }
+      }
+    }
+  }
+
+  const root = path.join(process.env.CODEX_HOME || path.join(os.homedir(), '.codex'), 'sessions')
+  const files = []
+  const walk = async (dir, depth = 0) => {
+    if (depth > 4 || files.length >= 3000) return
+    let entries
+    try { entries = await fs.readdir(dir, { withFileTypes: true }) } catch { return }
+    // Session directories are YYYY/MM/DD. Newest-first sequential traversal
+    // makes the cap deterministic instead of letting Promise scheduling fill
+    // it with arbitrary old years on large Codex histories.
+    entries.sort((a, b) => b.name.localeCompare(a.name))
+    for (const entry of entries) {
+      if (files.length >= 3000) break
+      const full = path.join(dir, entry.name)
+      if (entry.isDirectory()) await walk(full, depth + 1)
+      else if (entry.isFile() && entry.name.endsWith('.jsonl')) {
+        files.push({ file: full })
+      }
+    }
+  }
+  await walk(root)
+  // Rollout filenames carry their creation timestamp. mtime is wrong here: a
+  // day-old Codex window that is still chatting would beat a newly launched
+  // terminal and attach the restart command to the wrong conversation.
+  files.sort((a, b) => b.file.localeCompare(a.file))
+  for (const candidate of files.slice(0, 120)) {
+    let handle
+    try {
+      handle = await fs.open(candidate.file, 'r')
+      const buffer = Buffer.alloc(32 * 1024)
+      const { bytesRead } = await handle.read(buffer, 0, buffer.length, 0)
+      const head = buffer.subarray(0, bytesRead).toString('utf8')
+      const originator = jsonStringField(head, 'originator')
+      if (!/codex[-_](?:tui|cli)|codex_cli_rs/i.test(originator || '')) continue
+      if (cwd && jsonStringField(head, 'cwd') !== cwd) continue
+      const sessionId = jsonStringField(head, 'session_id') || codexIdFromPath(candidate.file)
+      if (sessionId && CODEX_SESSION_ID.test(sessionId)) return { ok: true, sessionId, exact: false }
+    } catch { /* unreadable candidate */ } finally { await handle?.close().catch(() => {}) }
+  }
+  return { ok: false, message: 'Codex session is not discoverable yet.' }
 }
 
 /** cwd per pid for MANY pids in ONE lsof call — lsof enumerates fd tables and
@@ -155,6 +225,7 @@ function registerTerminalHandlers(ipcMain) {
   ipcMain.handle('terminal:snapshot', (_e, { id } = {}) => mgr.snapshot(id))
   ipcMain.handle('terminal:detachRenderer', (event, { id, viewState } = {}) => ({ ok: mgr.detachRenderer(id, event.sender, viewState) }))
   ipcMain.handle('terminal:diagnostics', () => mgr.diagnostics())
+  ipcMain.handle('terminal:codexSession', (_event, { id, cwd } = {}) => codexSession(id, cwd))
   ipcMain.handle('terminal:signal', (_e, { id } = {}) => ({ ok: mgr.write(id, '\x03') }))
   ipcMain.handle('terminal:kill', (_e, { id } = {}) => {
     mgr.release(id)
@@ -222,4 +293,10 @@ function detachRendererOwner(sender) {
   return mgr.detachSender(sender)
 }
 
-module.exports = { registerTerminalHandlers, killAllSessions, setAppFocused, detachRendererOwner }
+module.exports = {
+  registerTerminalHandlers,
+  killAllSessions,
+  setAppFocused,
+  detachRendererOwner,
+  __test: { codexIdFromPath, jsonStringField, codexSession },
+}

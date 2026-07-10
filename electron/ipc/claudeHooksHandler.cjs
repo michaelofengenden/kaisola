@@ -275,12 +275,27 @@ function registerClaudeHooksHandlers(ipcMain) {
   ipcMain.handle('claude:account-info', (_e, { configDir } = {}) => {
     try {
       const os = require('node:os')
-      const base = typeof configDir === 'string' && configDir.trim()
-        ? configDir.replace(/^~(?=\/|$)/, os.homedir())
+      const custom = typeof configDir === 'string' && !!configDir.trim()
+      const base = custom
+        ? path.resolve(configDir.trim().replace(/^~(?=\/|$)/, os.homedir()))
         : path.join(os.homedir(), '.claude')
-      const raw = fs.readFileSync(path.join(base, '.claude.json'), 'utf8')
-      const cfg = JSON.parse(raw)
-      const oa = cfg && typeof cfg === 'object' ? cfg.oauthAccount || {} : {}
+      // The default profile's account metadata is ~/.claude.json. Isolated
+      // CLAUDE_CONFIG_DIR profiles keep it inside their selected directory.
+      // Retain the nested path as a legacy fallback for older installs.
+      const candidates = custom
+        ? [path.join(base, '.claude.json')]
+        : [path.join(os.homedir(), '.claude.json'), path.join(base, '.claude.json')]
+      let oa = null
+      for (const file of candidates) {
+        try {
+          const cfg = JSON.parse(fs.readFileSync(file, 'utf8'))
+          if (cfg && typeof cfg === 'object' && cfg.oauthAccount && typeof cfg.oauthAccount === 'object') {
+            oa = cfg.oauthAccount
+            break
+          }
+        } catch { /* try the next compatible location */ }
+      }
+      if (!oa) return { ok: true, exists: false }
       const email = typeof oa.emailAddress === 'string' ? oa.emailAddress : undefined
       const org = typeof oa.organizationName === 'string' ? oa.organizationName : undefined
       return { ok: true, email, org, exists: true }

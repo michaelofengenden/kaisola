@@ -80,11 +80,24 @@ app.whenReady().then(async () => {
   const out = path.join(os.tmpdir(), 'kaisola-codex-effort.png')
   fs.writeFileSync(out, image.toPNG())
   const facts = await win.webContents.executeJavaScript(`(() => ({
-    opened: !!document.querySelector('.provider-pop-stack'),
-    rows: [...document.querySelectorAll('.codex-submenu .provider-choice-row')].map((el) => el.textContent.trim()),
-    checked: document.querySelector('.codex-submenu [aria-checked="true"]')?.textContent.trim(),
-    note: document.querySelector('.provider-choice-note')?.textContent.trim(),
+    opened: !!document.querySelector('.codex-minimal-pop'),
+    tabs: [...document.querySelectorAll('.provider-section-tabs button')].map((el) => el.textContent.trim()),
+    rows: [...document.querySelectorAll('.codex-minimal-pop .provider-choice-row')].map((el) => el.textContent.trim()),
+    checked: document.querySelector('.codex-minimal-pop [aria-checked="true"]')?.textContent.trim(),
+    note: document.querySelector('.provider-choice-note')?.textContent.trim() || null,
   }))()`)
-  console.log('EFFORT_UI=' + JSON.stringify({ clicked: opened, ...facts, screenshot: out }))
-  app.exit(opened && facts.rows.length === 5 && facts.checked === 'Ultra' ? 0 : 1)
+  await win.webContents.executeJavaScript(`(() => [...document.querySelectorAll('.provider-section-tabs button')].find((el) => el.textContent.trim() === 'Speed')?.click())()`)
+  await wait(80)
+  const speedRows = await win.webContents.executeJavaScript(`(() => [...document.querySelectorAll('.codex-minimal-pop .provider-choice-row')].map((el) => el.textContent.trim()))()`)
+  await win.webContents.executeJavaScript(`(() => [...document.querySelectorAll('.provider-section-tabs button')].find((el) => el.textContent.trim() === 'Model')?.click())()`)
+  await wait(80)
+  const modelRows = await win.webContents.executeJavaScript(`(() => [...document.querySelectorAll('.codex-minimal-pop .provider-choice-row')].map((el) => el.textContent.trim()))()`)
+  await win.webContents.executeJavaScript(`(() => { document.querySelector('.codex-summary')?.click(); document.querySelector('.tabstrip-tools > button[title="More"]')?.click() })()`)
+  await wait(100)
+  const moreRows = await win.webContents.executeJavaScript(`(() => [...document.querySelectorAll('.shell-more-menu .tree-menu-item')].map((el) => el.textContent.replace(/\\s+/g, ' ').trim()))()`)
+  const moreImage = await win.webContents.capturePage()
+  const moreOut = path.join(os.tmpdir(), 'kaisola-shell-more.png')
+  fs.writeFileSync(moreOut, moreImage.toPNG())
+  console.log('EFFORT_UI=' + JSON.stringify({ clicked: opened, ...facts, speedRows, modelRows, moreRows, screenshot: out, moreScreenshot: moreOut }))
+  app.exit(opened && facts.tabs.join(',') === 'Model,Effort,Speed' && facts.rows.length === 5 && facts.checked === 'Ultra' && facts.note === null && speedRows.join(',') === 'Default,Fast' && modelRows.length === 3 && modelRows.every((row) => !/model$/i.test(row)) && moreRows.length === 5 ? 0 : 1)
 }).catch((error) => { console.error(error); app.exit(1) })

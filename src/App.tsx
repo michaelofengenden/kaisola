@@ -283,6 +283,11 @@ export default function App() {
         })
         if (m.running) {
           const pid = terminalOwnerMap(st)[m.id]
+          const owner = pid === st.activeProjectId ? st : pid ? st.projectSlices[pid] : undefined
+          const terminal = owner?.terminals.find((entry) => entry.id === m.id)
+          // A CLI agent holding the foreground is often merely waiting at its
+          // composer. Terminal.tsx emits the truthful prompt lifecycle instead.
+          if (terminal?.singletonKey?.startsWith('agent:')) return
           if (pid && pid !== st.activeProjectId) {
             const tab = st.projectTabs.find((t) => t.id === pid)
             if (tab && !tab.activity) st.setProjectActivity(pid, 'running')
@@ -398,6 +403,8 @@ export default function App() {
       const pid = projectIdForEvent(st, { cwd: ev.cwd, sessionId: ev.sessionId })
       const isActive = pid === st.activeProjectId
       const ws = isActive ? st.workspacePath : st.projectSlices[pid]?.workspacePath ?? null
+      const owner = isActive ? st : st.projectSlices[pid]
+      const claudeTerminal = owner?.terminals.find((terminal) => terminal.singletonKey === 'agent:claude-code')
       // ignore sessions running outside the owner's workspace (a no-prefix event
       // falls back to the active tab; drop it if its cwd isn't under that tree)
       if (ws && ev.cwd && ev.cwd !== ws && !ev.cwd.startsWith(`${ws}/`)) return
@@ -405,6 +412,8 @@ export default function App() {
       // this session, so a restart lands you back in the same chat
       if (ev.sessionId && ws) st.setClaudeSession(ws, ev.sessionId)
       if (ev.event === 'UserPromptSubmit') {
+        if (claudeTerminal) st.setTerminalMeta(claudeTerminal.id, { agentBusy: true, lastExit: null })
+        if (!isActive) st.setProjectActivity(pid, 'running')
         const label = ev.prompt ? `Claude: ${ev.prompt.slice(0, 42)}` : 'Claude turn'
         pushProjectFeed(pid, isActive, { at: ev.at, kind: 'prompt', text: ev.prompt || 'Prompt sent' })
         if (isActive) void st.snapshotWorkspace(label)
@@ -427,13 +436,13 @@ export default function App() {
       } else if (ev.event === 'Stop' || ev.event === 'Notification') {
         // Stop logs the finished turn; Notification is a mid-turn nudge. Either
         // way, if you're not looking, raise the "needs you" signal on the owner.
-        if (ev.event === 'Stop') pushProjectFeed(pid, isActive, { at: ev.at, kind: 'stop', text: 'Claude finished the turn' })
-        if (isActive) {
-          const claude = st.terminals.find((t) => t.singletonKey === 'agent:claude-code')
-          if (claude && !st.dockViews.includes(claude.id)) st.markNeedsYou(claude.id)
-        } else {
-          st.setProjectActivity(pid, 'needs-you')
+        if (ev.event === 'Stop') {
+          pushProjectFeed(pid, isActive, { at: ev.at, kind: 'stop', text: 'Claude finished the turn' })
+          if (claudeTerminal) st.setTerminalMeta(claudeTerminal.id, { agentBusy: false })
         }
+        const seen = isActive && claudeTerminal && st.dockViews.includes(claudeTerminal.id) && !document.hidden && document.hasFocus()
+        if (!seen && claudeTerminal) st.markNeedsYou(claudeTerminal.id, pid)
+        if (!isActive) st.setProjectActivity(pid, ev.event === 'Stop' ? 'completed' : 'needs-you')
         // native notification when you're NOT looking (window unfocused/hidden,
         // or the owning tab is in the background) — click brings the tab up
         if (!isActive || document.hidden || !document.hasFocus()) {

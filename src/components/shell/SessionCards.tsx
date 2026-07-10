@@ -312,8 +312,8 @@ export function SessionCards() {
               hue: sessionHue({ agentKey, folder: meta?.root ?? meta?.cwd ?? t.cwd }),
               // when the title already IS the repo, the sub line keeps only branch·path
               sub: sub && sub.repo === label ? { ...sub, repo: undefined } : sub,
-              running: !!meta?.running,
-              failed: !meta?.running && (meta?.lastExit ?? 0) > 0,
+              running: agentKey ? !!meta?.agentBusy : !!meta?.running,
+              failed: !(agentKey ? meta?.agentBusy : meta?.running) && (meta?.lastExit ?? 0) > 0,
               poppable: true,
               ports: meta?.ports,
             },

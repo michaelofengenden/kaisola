@@ -90,12 +90,11 @@ const mentionIcon = (kind: Mention['kind']): string =>
 const doneStatuses = new Set(['completed', 'failed', 'cancelled', 'canceled'])
 /** Streaming transcript flush cadence — ~12 renders/sec regardless of token rate. */
 const STREAM_FLUSH_MS = 80
-const EMPTY_DRAFT: AssistantDraft = { text: '', attachments: [], mentions: [], speed: 'balanced' }
+const EMPTY_DRAFT: AssistantDraft = { text: '', attachments: [], mentions: [], speed: 'default' }
 const EMPTY_QUEUE: QueuedAssistantPrompt[] = []
 const SPEED_OPTIONS = [
-  { value: 'fast', name: 'Fast', description: 'Lower effort, quicker turns' },
-  { value: 'balanced', name: 'Balanced', description: 'Default agent effort' },
-  { value: 'deep', name: 'Deep', description: 'More checking before answering' },
+  { value: 'default', name: 'Default' },
+  { value: 'fast', name: 'Fast' },
 ]
 const CLAUDE_EFFORT_OPTIONS = [
   { value: 'default', name: 'Default', description: 'Use this Claude model’s default effort' },
@@ -113,7 +112,7 @@ const CODEX_EFFORT_OPTIONS = [
   { value: 'max', name: 'Ultra', description: 'Maximum reasoning available for this model' },
   { value: 'ultra', name: 'Ultra', description: 'Maximum Codex reasoning · higher usage' },
 ]
-const isAssistantSpeed = (v: string): v is AssistantSpeed => v === 'fast' || v === 'balanced' || v === 'deep'
+const isAssistantSpeed = (v: string): v is AssistantSpeed => v === 'default' || v === 'fast'
 const isClaudeEffort = (v: string): v is ClaudeEffort => ['default', 'low', 'medium', 'high', 'xhigh', 'max'].includes(v)
 const isCodexEffort = (v: string): v is CodexEffort => ['low', 'medium', 'high', 'xhigh', 'max', 'ultra'].includes(v)
 const MAX_VISIBLE_TURN_TEXT = 320_000
@@ -145,7 +144,6 @@ const boundArtifacts = (artifacts: ToolArtifact[], preferNewest = false): ToolAr
 const speedGuidance = (speed: AssistantSpeed, nativeApplied: boolean): string => {
   if (nativeApplied) return ''
   if (speed === 'fast') return 'Kaisola speed: Fast. Prioritize a quick, concise answer and avoid broad exploration unless it is necessary.\n\n'
-  if (speed === 'deep') return 'Kaisola speed: Deep. Spend extra effort checking edge cases, tradeoffs, and likely failure modes before answering.\n\n'
   return ''
 }
 
@@ -183,16 +181,6 @@ function popoverPosition(button: HTMLButtonElement | null) {
     : { right: Math.max(8, window.innerWidth - rect.right), top: rect.bottom + 7, maxHeight: below }
 }
 
-function codexPopoverPosition(button: HTMLButtonElement | null) {
-  const base = popoverPosition(button)
-  const rect = button?.getBoundingClientRect()
-  if (!rect || window.innerWidth <= 680) return base
-  const width = Math.min(608, window.innerWidth - 16)
-  const left = Math.max(8, Math.min(rect.left, window.innerWidth - width - 8))
-  const { right: _right, ...vertical } = base
-  return { ...vertical, left }
-}
-
 /** Claude's own Faster → Smarter effort treatment, backed by a real reconnect. */
 function ClaudeEffortPicker({ value, options = CLAUDE_EFFORT_OPTIONS, busy, onSelect }: { value: ClaudeEffort; options?: typeof CLAUDE_EFFORT_OPTIONS; busy?: boolean; onSelect: (value: string) => void }) {
   const [open, setOpen] = useState(false)
@@ -223,13 +211,12 @@ function ClaudeEffortPicker({ value, options = CLAUDE_EFFORT_OPTIONS, busy, onSe
                 data-active={optionIndex === index}
                 data-past={optionIndex <= index || undefined}
                 onClick={() => { onSelect(option.value); setOpen(false) }}
-                title={`${option.name} — ${option.description}`}
+                title={option.name}
                 aria-label={`Set Claude effort to ${option.name}`}
                 aria-pressed={optionIndex === index}
               ><span /></button>
             ))}
           </div>
-          <p>{current?.description}</p>
         </div>,
         document.body,
       )}
@@ -237,7 +224,7 @@ function ClaudeEffortPicker({ value, options = CLAUDE_EFFORT_OPTIONS, busy, onSe
   )
 }
 
-/** Codex's compact Advanced panel. Effort is honest about adapter support. */
+/** One compact Codex menu: a single surface, three name-only lists. */
 function CodexAdvancedPicker({
   model,
   effort,
@@ -278,24 +265,22 @@ function CodexAdvancedPicker({
         <Icon name="ChevronDown" size={12} />
       </button>
       {open && createPortal(
-        <div ref={panel} className="provider-pop-stack" role="menu" aria-label="Codex controls" style={{ position: 'fixed', ...codexPopoverPosition(button.current) }}>
-          <div className="provider-pop codex-advanced-pop codex-main-menu">
+        <div ref={panel} className="provider-pop codex-minimal-pop" role="menu" aria-label="Codex controls" style={{ position: 'fixed', ...popoverPosition(button.current) }}>
+          <div className="provider-section-tabs" role="tablist">
             {([
-              ['model', 'Model', compactModel],
-              ['effort', 'Effort', currentEffort?.name ?? effortValue],
-              ['speed', 'Speed', speedName],
-            ] as const).map(([id, label, value]) => (
-              <button key={id} className="provider-menu-row" data-active={section === id} onMouseEnter={() => setSection(id)} onClick={() => setSection(id)} aria-haspopup="menu" aria-expanded={section === id}>
-                <span>{label}</span><strong>{value}</strong><Icon name="ChevronRight" size={14} />
+              ['model', 'Model'],
+              ['effort', 'Effort'],
+              ['speed', 'Speed'],
+            ] as const).map(([id, label]) => (
+              <button key={id} role="tab" aria-selected={section === id} data-active={section === id} onClick={() => setSection(id)}>
+                {label}
               </button>
             ))}
-            <div className="provider-menu-foot"><span>Advanced</span><Icon name="ChevronUp" size={13} /></div>
           </div>
-          <div className="provider-pop codex-submenu" role="menu" aria-label={`Codex ${section}`}>
-            <div className="provider-pop-head"><span className="faint">{section === 'model' ? 'Model' : section === 'effort' ? 'Effort' : 'Speed'}</span></div>
+          <div className="provider-choice-list" role="menu" aria-label={`Codex ${section}`}>
             {section === 'model' && model.options.map((option) => (
               <button key={option.value} className="provider-choice-row" role="menuitemradio" aria-checked={option.value === model.value} onClick={() => chooseModel(option.value)}>
-                <span><strong>{option.name}</strong>{option.description && <small>{option.description}</small>}</span><Icon name="Check" size={14} />
+                <span>{option.name}</span><Icon name="Check" size={14} />
               </button>
             ))}
             {section === 'effort' && effort && effortOptions.length > 0 && effortOptions.map((option) => (
@@ -303,27 +288,18 @@ function CodexAdvancedPicker({
                 <span>{option.name}</span><Icon name="Check" size={14} />
               </button>
             ))}
-            {section === 'effort' && (!effort || !effortOptions.length) && <p className="provider-capability-note">The installed Codex adapter does not expose live reasoning effort.</p>}
+            {section === 'effort' && (!effort || !effortOptions.length) && <span className="provider-empty">Default</span>}
             {section === 'speed' && SPEED_OPTIONS.map((option) => (
               <button key={option.value} className="provider-choice-row" role="menuitemradio" aria-checked={option.value === speed} onClick={() => chooseSpeed(option.value)}>
                 <span>{option.name}</span><Icon name="Check" size={14} />
               </button>
             ))}
-            <p className="provider-choice-note">
-              {section === 'effort'
-                ? currentEffort?.name === 'Ultra' ? 'Consumes usage limits faster' : currentEffort?.description
-                : section === 'speed' ? 'Fast mode reduces latency; effort remains separate.' : currentModel?.description}
-            </p>
           </div>
         </div>,
         document.body,
       )}
     </>
   )
-}
-const statusTone = (status?: string): string => {
-  const s = (status || 'pending').toLowerCase()
-  return s === 'completed' ? 'completed' : s === 'failed' ? 'failed' : s === 'cancelled' || s === 'canceled' ? 'cancelled' : 'running'
 }
 const activityKind = (text: string): { label: string; icon: string } => {
   if (/sub[-\s]?agent|delegate|task/i.test(text)) return { label: 'Subagent', icon: 'Bot' }
@@ -333,9 +309,8 @@ const activityKind = (text: string): { label: string; icon: string } => {
 const shortPath = (path?: string): string => {
   if (!path) return ''
   const parts = path.split('/').filter(Boolean)
-  return parts.length ? parts[parts.length - 1] : path
+  return parts[parts.length - 1] ?? path
 }
-
 /**
  * A blocked permission ask. When the tool call carries diff content, the card
  * shows the ACTUAL change (per-file hunks, +/− counts) — review the edit, not
@@ -557,14 +532,11 @@ function speedOptionValue(c: UiControl, speed: AssistantSpeed): string | null {
   const want =
     speed === 'fast'
       ? /fast|quick|low|minimal|light|none|short/
-      : speed === 'deep'
-        ? /deep|high|max|extended|thorough/
-        : /balanced|medium|auto|normal|standard|default/
+      : /balanced|medium|auto|normal|standard|default|off|false/
   const hit = c.options.find((o) => want.test(`${o.value} ${o.name}`.toLowerCase()))
   if (hit) return hit.value
-  if (speed === 'fast') return c.options[0]?.value ?? null
-  if (speed === 'deep') return c.options[c.options.length - 1]?.value ?? null
-  return c.options[Math.floor((c.options.length - 1) / 2)]?.value ?? null
+  if (speed === 'fast') return c.options[c.options.length - 1]?.value ?? null
+  return c.options[0]?.value ?? null
 }
 
 function displayedSpeed(c: UiControl | null, draft: AssistantSpeed): AssistantSpeed {
@@ -573,11 +545,10 @@ function displayedSpeed(c: UiControl | null, draft: AssistantSpeed): AssistantSp
   const value = `${c.value} ${selected?.name ?? ''}`.toLowerCase()
   if (/fast[-_ ]?mode/i.test(`${c.id} ${c.name}`)) {
     if (/\b(on|true|enabled|fast)\b/.test(value)) return 'fast'
-    return draft === 'fast' ? 'balanced' : draft
+    return draft === 'fast' ? 'default' : draft
   }
   if (/fast|quick|low|minimal|light/.test(value)) return 'fast'
-  if (/deep|high|max|extended|thorough/.test(value)) return 'deep'
-  return 'balanced'
+  return 'default'
 }
 
 function buildContext(): string {
@@ -618,9 +589,8 @@ export const Assistant = memo(function Assistant({ threadId }: { threadId: strin
   const setStoreThreadAgent = useKaisola((s) => s.setAssistantThreadAgent)
   const setThreadClaudeEffort = useKaisola((s) => s.setThreadClaudeEffort)
   const setThreadCodexEffort = useKaisola((s) => s.setThreadCodexEffort)
-  const project = useKaisola((s) => s.project)
-  const stage = useKaisola((s) => s.stage)
   const agentTerminals = useKaisola((s) => s.agentTerminals)
+  const terminalMeta = useKaisola((s) => s.terminalMeta)
   const setDockView = useKaisola((s) => s.setDockView)
 
   const [presets, setPresets] = useState<AcpPreset[]>([])
@@ -631,8 +601,6 @@ export const Assistant = memo(function Assistant({ threadId }: { threadId: strin
   const [authUrl, setAuthUrl] = useState<string | null>(null)
   // an OS file drag hovering the chat — the drop lands as attachment chips
   const [fileDropHover, setFileDropHover] = useState(false)
-  // the active "@query" being typed (null = the mention typeahead is closed)
-  const [mentionQuery, setMentionQuery] = useState<string | null>(null)
   const scrollRef = useRef<HTMLDivElement>(null)
   const inputRef = useRef<HTMLTextAreaElement>(null)
   // grow the composer to fit what's typed (capped); reset to one line when empty
@@ -778,18 +746,17 @@ export const Assistant = memo(function Assistant({ threadId }: { threadId: strin
     if (!codexAgent || !providerEffortControl || !active.codexEffort || active.codexEffort === codexEffort) return
     setThreadCodexEffort(active.id, codexEffort, projectId)
   }, [active.codexEffort, active.id, codexAgent, codexEffort, providerEffortControl, setThreadCodexEffort])
-  const codeAgent = /codex|claude/i.test(`${agentKey} ${agentName}`)
   const activityTools = arun.turns.filter((t) => t.kind === 'tool').slice(-8)
-  const activeToolCount = activityTools.filter((t) => !doneStatuses.has((t.status || '').toLowerCase())).length
-  const visibleToolCalls = activityTools.slice(-5).reverse()
+  const activeTools = activityTools.filter((t) => !doneStatuses.has((t.status || '').toLowerCase()))
+  const latestActivity = activeTools[activeTools.length - 1]
+  const latestActivityKind = latestActivity ? activityKind(latestActivity.text) : null
+  const subagentCount = activeTools.filter((call) => activityKind(call.text).label === 'Subagent').length
   const liveAgentTerminals = agentTerminals
     .filter((t) => t.agentKey === connectionKey || t.agentKey === agentKey || (!t.agentKey && t.agentName === agentName))
-    .slice(-4)
+    .filter((t) => terminalMeta[t.terminalId]?.running)
+    .slice(-3)
     .reverse()
-  const showAgentActivity = codeAgent || busy || activityTools.length > 0 || liveAgentTerminals.length > 0
-  const activitySubhead = activeToolCount || liveAgentTerminals.length
-    ? `${activeToolCount} active call${activeToolCount === 1 ? '' : 's'} · ${liveAgentTerminals.length} terminal task${liveAgentTerminals.length === 1 ? '' : 's'}`
-    : 'No subagents or background tasks yet'
+  const showLiveActivity = busy || activeTools.length > 0 || liveAgentTerminals.length > 0
 
   const updateRuntime = (id: string, fn: (r: Runtime) => Runtime) =>
     updateAssistantRuntime(id, fn, projectId)
@@ -806,65 +773,6 @@ export const Assistant = memo(function Assistant({ threadId }: { threadId: strin
       restart: true,
     })
     setNotice(`${preset.name} opened as a terminal session.`)
-  }
-
-  // @-mention context: type @ then filter papers / claims / hypotheses to attach
-  // their text to the next message (pure local — it only shapes the prompt).
-  const mentionCandidates = useMemo<Mention[]>(() => {
-    if (mentionQuery == null) return []
-    const q = mentionQuery.toLowerCase()
-    const papers = project.corpus
-      .filter((s): s is Paper => s.kind === 'paper')
-      .map((p) => ({ id: p.id, kind: 'paper' as const, label: p.title, text: `Paper “${p.title}”${p.abstract ? `: ${p.abstract.slice(0, 240)}` : ''}` }))
-    const claims = project.claimGraph.nodes.map((n) => ({ id: n.id, kind: 'claim' as const, label: n.label, text: `Claim “${n.label}”${n.detail ? `: ${n.detail}` : ''}` }))
-    const hyps = project.hypotheses.map((h) => ({ id: h.id, kind: 'hypothesis' as const, label: h.title, text: `Hypothesis “${h.title}”: ${h.claim}` }))
-    const runs = project.runs.map((r) => ({ id: r.id, kind: 'run' as const, label: r.label, text: `Run “${r.label}” status=${r.status}${r.summary ? `: ${r.summary}` : ''}` }))
-    const figures = project.figures.map((f) => ({ id: f.id, kind: 'figure' as const, label: f.title, text: `Figure “${f.title}”${f.caption ? `: ${f.caption}` : ''}` }))
-    return [...papers, ...claims, ...hyps, ...runs, ...figures].filter((c) => !q || c.label.toLowerCase().includes(q)).slice(0, 8)
-  }, [project, mentionQuery])
-
-  const contextLedger = useMemo(() => {
-    const rows = [
-      { id: 'stage', icon: 'Map', label: `Stage: ${stageMeta(stage).label}`, detail: 'Automatic first-message context' },
-      { id: 'autonomy', icon: 'ShieldCheck', label: `Autonomy: ${autonomy}`, detail: 'Controls what agents may do without approval' },
-    ]
-    if (project.name) rows.push({ id: 'project', icon: 'FolderOpen', label: project.name, detail: 'Project name' })
-    if (project.question) rows.push({ id: 'question', icon: 'HelpCircle', label: project.question, detail: 'Research question' })
-    if (project.campaign) rows.push({ id: 'campaign', icon: 'Target', label: project.campaign.title, detail: `${project.campaign.evaluator.metric} · ${project.campaign.status}` })
-    if (project.corpus.length) rows.push({ id: 'corpus', icon: 'Library', label: `${project.corpus.length} corpus source${project.corpus.length === 1 ? '' : 's'}`, detail: 'First 12 titles included on a new thread' })
-    for (const mention of mentions) rows.push({ id: `mention-${mention.id}`, icon: mentionIcon(mention.kind), label: mention.label, detail: `Pinned @${mention.kind}` })
-    for (const file of attachments) rows.push({ id: `file-${file}`, icon: 'Paperclip', label: file.split('/').pop() ?? file, detail: file })
-    return rows
-  }, [attachments, autonomy, mentions, project, stage])
-  const contextTokenEstimate = useMemo(
-    () => Math.ceil((buildContext().length + mentions.reduce((n, m) => n + m.text.length, 0) + attachments.join('\n').length) / 4),
-    [attachments, autonomy, mentions, project, stage],
-  )
-
-  const detectMention = (value: string, caret: number) => {
-    const m = value.slice(0, caret).match(/@([\w-]*)$/)
-    setMentionQuery(m ? m[1] : null)
-  }
-  const pickMention = (c: Mention) => {
-    const el = inputRef.current
-    const caret = el?.selectionStart ?? input.length
-    // drop the trailing "@query" the user typed, then attach the entity as a chip
-    setAssistantDraft(active.id, {
-      text: input.slice(0, caret).replace(/@([\w-]*)$/, '') + input.slice(caret),
-      mentions: mentions.some((x) => x.id === c.id) ? mentions : [...mentions, c],
-    }, projectId)
-    setMentionQuery(null)
-    setTimeout(() => inputRef.current?.focus(), 0)
-  }
-  // the composer's @ button — types an @ at the caret and opens the typeahead
-  const insertMention = () => {
-    const caret = inputRef.current?.selectionStart ?? input.length
-    const before = input.slice(0, caret)
-    const pad = before && !/\s$/.test(before) ? ' ' : ''
-    setAssistantDraft(active.id, { text: `${before}${pad}@${input.slice(caret)}` }, projectId)
-    setMentionQuery('')
-    const pos = before.length + pad.length + 1
-    setTimeout(() => { inputRef.current?.focus(); inputRef.current?.setSelectionRange(pos, pos) }, 0)
   }
 
   const refresh = () => bridge.acp.status([connectionKey]).then((s) => setAgents(s.agents))
@@ -1058,9 +966,7 @@ export const Assistant = memo(function Assistant({ threadId }: { threadId: strin
     const res = await bridge.acp.setConfigOption(connectionKey, speedControl.id, value)
     if (!res.ok && res.message) setNotice(res.message)
     refresh()
-    // Fast mode is a latency control, not deeper reasoning. Turning it off for
-    // Deep still needs Kaisola's explicit thoroughness guidance.
-    return res.ok && !(/fast[-_ ]?mode/i.test(`${speedControl.id} ${speedControl.name}`) && nextSpeed === 'deep')
+    return res.ok
   }
   const setSpeed = (value: string) => {
     if (!isAssistantSpeed(value)) return
@@ -1333,8 +1239,15 @@ export const Assistant = memo(function Assistant({ threadId }: { threadId: strin
       return { ...r, thinkStart: undefined, turns }
     })
     setThreadBusy(threadId, false, projectId)
-    // finished while the card is put away → amber "needs you" dot in the rail
-    if (!owningSlice()?.dockViews.includes(threadId)) useKaisola.getState().markNeedsYou(threadId, projectId)
+    // Working dots pulse; a finished unseen turn becomes a still dot until the
+    // owning tab/card is actually viewed and focused.
+    {
+      const state = useKaisola.getState()
+      const owner = owningSlice()
+      const seen = state.activeProjectId === projectId && !!owner?.dockOpen && !!owner?.dockViews.includes(threadId) && !document.hidden && document.hasFocus()
+      if (!seen) state.markNeedsYou(threadId, projectId)
+      if (state.activeProjectId !== projectId) state.setProjectActivity(projectId, res.ok ? 'completed' : 'failed')
+    }
     if (!res.ok) {
       // the prompt was rejected — roll back the optimistic user turn so the
       // transcript doesn't strand an undelivered message. ONLY when nothing
@@ -1511,53 +1424,19 @@ export const Assistant = memo(function Assistant({ threadId }: { threadId: strin
             <button className="btn-icon btn-sm" onClick={() => { setNotice(null); setAuthUrl(null) }}><Icon name="X" size={13} /></button>
           </div>
         )}
-        {showAgentActivity && (
-          <div className="agent-activity">
-            <div className="agent-activity-head">
-              <Icon name="Activity" size={14} />
-              <div className="grow">
-                <div className="agent-activity-title">{agentName} activity</div>
-                <div className="agent-activity-sub">{activitySubhead}</div>
-              </div>
-              <span className="agent-activity-pill" data-on={busy || activeToolCount > 0}>{busy || activeToolCount > 0 ? 'Running' : 'Idle'}</span>
-            </div>
-            {liveAgentTerminals.length > 0 && (
-              <div className="agent-activity-block">
-                <div className="agent-activity-label">Background terminals</div>
-                {liveAgentTerminals.map((term) => (
-                  <div key={term.terminalId} className="agent-activity-row agent-activity-terminal">
-                    <Icon name="TerminalSquare" size={12} />
-                    <div className="grow min0">
-                      <div className="truncate">{term.label || term.command || term.terminalId}</div>
-                      {(term.cwd || term.command) && <div className="agent-activity-meta truncate">{shortPath(term.cwd)}{term.cwd && term.command ? ' · ' : ''}{term.command}</div>}
-                    </div>
-                    <button className="btn btn-ghost btn-sm" onClick={() => setDockView(term.terminalId)}>Open</button>
-                  </div>
-                ))}
-              </div>
-            )}
-            {visibleToolCalls.length > 0 && (
-              <div className="agent-activity-block">
-                <div className="agent-activity-label">Subagents &amp; tool calls</div>
-                {visibleToolCalls.map((call, idx) => {
-                  const kind = activityKind(call.text)
-                  const tone = statusTone(call.status)
-                  return (
-                    <div key={`${call.toolId ?? call.text}-${idx}`} className="agent-activity-row agent-activity-call" data-status={tone}>
-                      <Icon name={kind.icon} size={12} />
-                      <span className="agent-activity-kind">{kind.label}</span>
-                      <span className="grow truncate">{call.text}</span>
-                      <span className="agent-activity-status">{call.status || 'pending'}</span>
-                    </div>
-                  )
-                })}
-              </div>
-            )}
-            {!liveAgentTerminals.length && !visibleToolCalls.length && (
-              <div className="agent-activity-empty">
-                Tool calls, delegated subagents, and background terminal commands will appear here as the agent works.
-              </div>
-            )}
+        {showLiveActivity && (
+          <div className="agent-livebar" aria-live="polite">
+            <span className="agent-live-dot" aria-hidden />
+            <Icon name={latestActivityKind?.icon ?? 'Sparkles'} size={12} />
+            <span className="grow truncate">
+              {latestActivity?.text || (liveAgentTerminals.length ? 'Running a terminal task' : `${agentName} is working`)}
+            </span>
+            {subagentCount > 0 && <span className="agent-live-pill"><Icon name="Bot" size={10} /> {subagentCount}</span>}
+            {liveAgentTerminals.map((term) => (
+              <button key={term.terminalId} className="agent-live-pill" onClick={() => setDockView(term.terminalId)} title={term.command || term.label || 'Open terminal'}>
+                <Icon name="TerminalSquare" size={10} /> {term.label || 'Terminal'}
+              </button>
+            ))}
           </div>
         )}
         {arun.turns.length === 0 && archivedPage.length === 0 && archivedCount === 0 && !notice && (
@@ -1654,45 +1533,13 @@ export const Assistant = memo(function Assistant({ threadId }: { threadId: strin
             </span>
             {queuedPrompts.slice(0, 4).map((q) => (
               <span key={q.id} className="queue-chip" title={q.text}>
-                <Icon name={q.speed === 'fast' ? 'Gauge' : q.speed === 'deep' ? 'Brain' : 'Circle'} size={10} />
+                <Icon name={q.speed === 'fast' ? 'Gauge' : 'Circle'} size={10} />
                 {q.text.length > 34 ? `${q.text.slice(0, 34)}…` : q.text}
                 <button onClick={() => removeQueuedAssistantPrompt(active.id, q.id)}><Icon name="X" size={9} /></button>
               </span>
             ))}
           </div>
         )}
-        {mentionQuery != null && mentionCandidates.length > 0 && (
-          <div className="mention-menu">
-            {mentionCandidates.map((c) => (
-              <button key={c.id} className="mention-item" onMouseDown={(e) => { e.preventDefault(); pickMention(c) }}>
-                <Icon name={mentionIcon(c.kind)} size={13} />
-                <span className="grow truncate">{c.label}</span>
-                <span className="faint mention-kind">{c.kind}</span>
-              </button>
-            ))}
-          </div>
-        )}
-        <details className="context-ledger">
-          <summary>
-            <Icon name="Database" size={12} />
-            {arun.usage
-              ? <>Context · {Math.round((arun.usage.used / arun.usage.size) * 100)}% of {Math.round(arun.usage.size / 1000)}k
-                  <span className="ctx-meter" data-hot={arun.usage.used / arun.usage.size > 0.7 || undefined}>
-                    <span className="ctx-meter-fill" style={{ width: `${Math.min(100, Math.round((arun.usage.used / arun.usage.size) * 100))}%` }} />
-                  </span>
-                  · {contextLedger.length} item{contextLedger.length === 1 ? '' : 's'}</>
-              : <>Context · {contextLedger.length} item{contextLedger.length === 1 ? '' : 's'} · ~{contextTokenEstimate} tokens</>}
-          </summary>
-          <div className="context-ledger-list">
-            {contextLedger.map((row) => (
-              <div key={row.id} className="context-ledger-row">
-                <Icon name={row.icon} size={12} className="muted" />
-                <span className="grow truncate">{row.label}</span>
-                <span className="faint truncate">{row.detail}</span>
-              </div>
-            ))}
-          </div>
-        </details>
         <textarea
           ref={inputRef}
           className="composer-input"
@@ -1703,13 +1550,8 @@ export const Assistant = memo(function Assistant({ threadId }: { threadId: strin
             if (raw.length > ASSISTANT_DRAFT_TEXT_LIMIT) setNotice(`Message limited to ${ASSISTANT_DRAFT_TEXT_LIMIT.toLocaleString()} characters. Attach long material as a file to preserve it in full.`)
             setAssistantDraft(active.id, { text: v }, projectId)
             autoGrow(e.currentTarget)
-            detectMention(v, Math.min(e.target.selectionStart ?? v.length, v.length))
           }}
           onKeyDown={(e) => {
-            if (mentionQuery != null && mentionCandidates.length > 0) {
-              if (e.key === 'Enter') { e.preventDefault(); pickMention(mentionCandidates[0]); return }
-              if (e.key === 'Escape') { e.preventDefault(); setMentionQuery(null); return }
-            }
             if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send() }
           }}
           placeholder={`Message ${agentName}…`}
@@ -1718,14 +1560,13 @@ export const Assistant = memo(function Assistant({ threadId }: { threadId: strin
         />
         <div className="composer-bar">
           <button className="composer-tool" onClick={attach} title="Attach files"><Icon name="Paperclip" size={14} /></button>
-          <button className="composer-tool" onClick={insertMention} title="Reference a paper, claim, hypothesis, run or figure"><Icon name="AtSign" size={14} /></button>
           {composerControls.map((c) => (
-            <Dropdown key={c.id} icon={CATEGORY_ICON[c.category]} value={c.value} options={c.options} onSelect={(v) => onControlChange(c, v)} title={c.name} />
+            <Dropdown key={c.id} icon={CATEGORY_ICON[c.category]} value={c.value} options={c.options.map(({ value, name }) => ({ value, name }))} onSelect={(v) => onControlChange(c, v)} title={c.name} />
           ))}
           {!claudeAgent && !codexAgent && <Dropdown icon="Gauge" value={speed} options={SPEED_OPTIONS} onSelect={setSpeed} title="Response speed" />}
           <span className="grow" />
           {claudeAgent && providerModelControl && (
-            <Dropdown icon="Sparkles" value={providerModelControl.value} options={providerModelControl.options} onSelect={(value) => void onControlChange(providerModelControl, value)} title="Claude model" align="right" />
+            <Dropdown icon="Sparkles" value={providerModelControl.value} options={providerModelControl.options.map(({ value, name }) => ({ value, name }))} onSelect={(value) => void onControlChange(providerModelControl, value)} title="Claude model" align="right" />
           )}
           {claudeAgent && <ClaudeEffortPicker value={claudeEffort} options={claudeEffortOptions} busy={busy} onSelect={(value) => void changeClaudeEffort(value)} />}
           {codexAgent && providerModelControl && (

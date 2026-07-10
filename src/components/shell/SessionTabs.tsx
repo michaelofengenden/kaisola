@@ -12,8 +12,8 @@ interface STab {
   icon: string
   label: string
   hue: string
-  /** Badge precedence mirrors the project tabs: needs-you > failed > running. */
-  state?: 'needs-you' | 'failed' | 'running'
+  /** Pulse while working; completed stays still until the session is viewed. */
+  state?: 'needs-you' | 'failed' | 'running' | 'completed'
   kind: 'thread' | 'term' | 'agentTerm' | 'panel'
   closable: boolean
   title?: string
@@ -36,6 +36,7 @@ export function SessionTabs() {
   const sessionGroups = useKaisola((s) => s.sessionGroups)
   const pinnedSessions = useKaisola((s) => s.pinnedSessions)
   const needsYou = useKaisola((s) => s.needsYou)
+  const pendingPermissions = useKaisola((s) => s.pendingPermissions)
   const dockViews = useKaisola((s) => s.dockViews)
   const dockOpen = useKaisola((s) => s.dockOpen)
   const switchSession = useKaisola((s) => s.switchSession)
@@ -71,7 +72,9 @@ export function SessionTabs() {
       icon: 'Sparkles',
       label,
       hue: sessionHue({ agentKey: t.agentKey }),
-      state: needsYou[t.id] ? 'needs-you' : t.busy ? 'running' : undefined,
+      state: pendingPermissions.some((permission) => permission.key === `${t.agentKey}::${t.id}`)
+        ? 'needs-you'
+        : t.busy ? 'running' : needsYou[t.id] ? 'completed' : undefined,
       kind: 'thread',
       closable: !pinnedSessions.includes(t.id),
       title: 'Double-click to rename',
@@ -80,18 +83,19 @@ export function SessionTabs() {
   terminals.forEach((t, i) => {
     const meta = terminalMeta[t.id]
     const agentKey = terminalAgentKey(t.singletonKey)
+    const working = agentKey ? !!meta?.agentBusy : !!meta?.running
     const label = terminalLabel(t, { meta, agents, index: i, count: terminals.length })
-    const failed = !meta?.running && (meta?.lastExit ?? 0) > 0
+    const failed = !working && (meta?.lastExit ?? 0) > 0
     tabs.set(t.id, {
       id: t.id,
       icon: 'SquareTerminal',
       label,
       hue: sessionHue({ agentKey, folder: meta?.root ?? meta?.cwd ?? t.cwd }),
-      state: needsYou[t.id] ? 'needs-you' : failed ? 'failed' : meta?.running ? 'running' : undefined,
+      state: failed ? 'failed' : working ? 'running' : needsYou[t.id] ? 'completed' : undefined,
       kind: 'term',
       closable: terminals.length > 1 && !pinnedSessions.includes(t.id),
       title: [
-        meta?.running && meta.fgProcess ? `running ${meta.fgProcess}` : null,
+        working && meta?.fgProcess ? `running ${meta.fgProcess}` : null,
         meta?.repo && `${meta.repo}${meta.branch ? ` ⎇ ${meta.branch}` : ''}`,
         meta?.cwd,
         'Double-click to rename',
@@ -107,7 +111,7 @@ export function SessionTabs() {
       icon: 'SquareTerminal',
       label: t.label || 'agent',
       hue: sessionHue({ agentKey: t.agentKey, folder: meta?.root ?? t.cwd }),
-      state: needsYou[t.terminalId] ? 'needs-you' : meta?.running ? 'running' : undefined,
+      state: meta?.running ? 'running' : needsYou[t.terminalId] ? 'completed' : undefined,
       kind: 'agentTerm',
       closable: true,
       title: `${t.agentName ?? 'agent'}: ${t.command ?? ''}`,
@@ -122,7 +126,7 @@ export function SessionTabs() {
         p.kind === 'git'
           ? sessionHue({ agentKey: 'git', folder: workspacePath })
           : sessionHue({ agentKey: urlHost(p.url) ?? 'browser' }),
-      state: needsYou[p.id] ? 'needs-you' : undefined,
+      state: needsYou[p.id] ? 'completed' : undefined,
       kind: 'panel',
       closable: !pinnedSessions.includes(p.id),
       title: p.kind === 'git' ? 'Stage & commit' : p.url,

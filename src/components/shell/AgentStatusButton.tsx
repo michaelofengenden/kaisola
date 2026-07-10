@@ -86,15 +86,29 @@ export function AgentStatusButton() {
   const openSettings = useKaisola((s) => s.setSettingsOpen)
   const workspacePath = useKaisola((s) => s.workspacePath)
   const requestFile = useKaisola((s) => s.requestFile)
+  const followAgent = useKaisola((s) => s.followAgent)
+  const toggleFollowAgent = useKaisola((s) => s.toggleFollowAgent)
   // primitive selectors (string/boolean) so the strip never re-renders on noise
   const busyKeys = useKaisola((s) => s.assistantThreads.filter((t) => t.busy).map((t) => t.agentKey).join(','))
   const anyBusy = useKaisola(
-    (s) => s.assistantThreads.some((t) => t.busy) || Object.values(s.agentRunning).some(Boolean),
+    (s) => s.assistantThreads.some((t) => t.busy) || Object.values(s.agentRunning).some(Boolean) || s.terminals.some((t) => !!s.terminalMeta[t.id]?.agentBusy),
   )
   // the Claude Code terminal: undefined = none, else "is claude in the fg?"
   const claudeRunning = useKaisola((s) => {
     const t = s.terminals.find((x) => x.singletonKey === 'agent:claude-code')
     return t ? /^claude\b/.test(s.terminalMeta[t.id]?.fgProcess ?? '') : undefined
+  })
+  const claudeBusy = useKaisola((s) => {
+    const t = s.terminals.find((x) => x.singletonKey === 'agent:claude-code')
+    return t ? !!s.terminalMeta[t.id]?.agentBusy : false
+  })
+  const codexRunning = useKaisola((s) => {
+    const t = s.terminals.find((x) => x.singletonKey?.startsWith('agent:codex'))
+    return t ? /^codex\b/.test(s.terminalMeta[t.id]?.fgProcess ?? '') : undefined
+  })
+  const codexBusy = useKaisola((s) => {
+    const t = s.terminals.find((x) => x.singletonKey?.startsWith('agent:codex'))
+    return t ? !!s.terminalMeta[t.id]?.agentBusy : false
   })
 
   const probeRemotes = (rows: McpServerRow[]) => {
@@ -157,10 +171,10 @@ export function AgentStatusButton() {
   if (!isDesktop) return null
 
   const busy = new Set(busyKeys.split(',').filter(Boolean))
-  const connectedCount = agents.filter((a) => a.connected).length + (claudeRunning ? 1 : 0)
+  const connectedCount = agents.filter((a) => a.connected).length + (claudeRunning ? 1 : 0) + (codexRunning ? 1 : 0)
   // quiet = nothing running, nothing asking for sign-in — the itemized rows
   // would all read the same, so a summary line carries them instead
-  const anyWorking = agents.some((a) => busy.has(a.key) || a.busy) || !!claudeRunning
+  const anyWorking = agents.some((a) => busy.has(a.key) || a.busy) || claudeBusy || codexBusy
   const anyAttention = anyWorking || agents.some((a) => !a.connected && a.authMethods?.length)
   const allQuiet = !anyAttention
   const offMenu = menu.filter((m) => m.kind === 'acp' && !agents.some((a) => (a.presetId ?? a.key) === m.id))
@@ -169,10 +183,11 @@ export function AgentStatusButton() {
   // hover keeps the full roster reachable while the panel stays one line
   const quietTitle = [
     ...(claudeRunning !== undefined ? ['Claude Code (terminal)'] : []),
+    ...(codexRunning !== undefined ? ['Codex CLI (terminal)'] : []),
     ...agents.map((a) => `${a.name ?? agentName(all, a.presetId ?? a.key) ?? a.key} (${a.connected ? 'connected' : 'off'})`),
     ...offMenu.map((m) => `${m.name} (off)`),
   ].join('\n')
-  const anyPresent = agents.length > 0 || claudeRunning !== undefined
+  const anyPresent = agents.length > 0 || claudeRunning !== undefined || codexRunning !== undefined
   const needsApproval = servers.some((r) => r.scope === 'project' && !r.approved)
   const probeFailed = servers.some((r) => r.enabled && r.kind !== 'stdio' && probes[r.name] && !probes[r.name].ok)
   const dotTone = probeFailed ? DOT.err
@@ -234,7 +249,7 @@ export function AgentStatusButton() {
               borderRadius: 'var(--r-full)',
               background: dotTone,
               boxShadow: '0 0 0 2px var(--bg-1)',
-              animation: anyBusy || claudeRunning ? 'queue-pulse 1.4s var(--ease-in-out) infinite' : undefined,
+              animation: anyBusy || claudeBusy || codexBusy ? 'queue-pulse 1.4s var(--ease-in-out) infinite' : undefined,
             }}
           />
         )}
@@ -255,6 +270,14 @@ export function AgentStatusButton() {
               <Icon name="CircuitBoard" size={13} />
               <span style={{ fontWeight: 600 }}>Agents</span>
               <span className="grow" />
+              <button
+                className="btn-icon btn-sm"
+                data-active={followAgent}
+                onClick={toggleFollowAgent}
+                title={followAgent ? 'Following files agents touch' : 'Follow files agents touch'}
+              >
+                <Icon name="Crosshair" size={12} />
+              </button>
               <button className="btn-icon btn-sm" onClick={() => void load()} title="Refresh">
                 <Icon name="RefreshCw" size={12} />
               </button>
@@ -266,7 +289,7 @@ export function AgentStatusButton() {
               <span className="faint" title={quietTitle || undefined}>
                 {[
                   quietConnected ? `${quietConnected} connected` : null,
-                  claudeRunning !== undefined ? 'terminal ready' : null,
+                  claudeRunning !== undefined || codexRunning !== undefined ? 'terminal ready' : null,
                   quietOff ? `${quietOff} off` : null,
                 ].filter(Boolean).join(' · ')} — all idle
               </span>
@@ -274,10 +297,19 @@ export function AgentStatusButton() {
             {!allQuiet && claudeRunning !== undefined && (
               <Row
                 tone={claudeRunning ? DOT.on : DOT.off}
-                pulse={claudeRunning}
+                pulse={claudeBusy}
                 name="Claude Code"
                 sub="terminal"
-                state={claudeRunning ? 'running' : 'idle'}
+                state={claudeBusy ? 'working…' : claudeRunning ? 'ready' : 'idle'}
+              />
+            )}
+            {!allQuiet && codexRunning !== undefined && (
+              <Row
+                tone={codexRunning ? DOT.on : DOT.off}
+                pulse={codexBusy}
+                name="Codex CLI"
+                sub="terminal"
+                state={codexBusy ? 'working…' : codexRunning ? 'ready' : 'idle'}
               />
             )}
             {!allQuiet && agents.map((a) => {
@@ -312,7 +344,7 @@ export function AgentStatusButton() {
             {!allQuiet && offMenu.map((m) => (
               <Row key={`off:${m.id}`} tone={DOT.off} name={m.name} sub="acp" state="off" title="Not connected — open a session from the + menu" />
             ))}
-            {claudeRunning === undefined && agents.length === 0 && menu.filter((m) => m.kind === 'acp').length === 0 && (
+            {claudeRunning === undefined && codexRunning === undefined && agents.length === 0 && menu.filter((m) => m.kind === 'acp').length === 0 && (
               <span className="faint">No agents connected — open a session from the + menu.</span>
             )}
 

@@ -193,10 +193,18 @@ function claudeSdkEnvironment(base, envOverride) {
   // or third-party-provider variable shadow the selected CLAUDE_CONFIG_DIR.
   for (const key of [
     'ANTHROPIC_API_KEY', 'ANTHROPIC_AUTH_TOKEN', 'ANTHROPIC_BASE_URL', 'ANTHROPIC_CUSTOM_HEADERS',
-    'CLAUDE_CODE_OAUTH_TOKEN', 'CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR',
+    'CLAUDE_CODE_OAUTH_TOKEN', 'CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR', 'CLAUDE_CONFIG_DIR',
     'CLAUDE_CODE_USE_BEDROCK', 'CLAUDE_CODE_USE_VERTEX', 'CLAUDE_CODE_USE_FOUNDRY',
   ]) delete env[key]
-  env.CLAUDE_CONFIG_DIR = base
+  // Claude's implicit/default profile is NOT equivalent to explicitly setting
+  // CLAUDE_CONFIG_DIR=~/.claude. The former reads the normal home-level
+  // ~/.claude.json + macOS Keychain OAuth entry; the latter selects an isolated
+  // profile whose state is ~/.claude/.claude.json. Forcing the explicit value
+  // therefore made a signed-in default account look logged out and returned
+  // rate_limits_available=false. Only isolated, user-added accounts need the
+  // variable on the SDK child.
+  const defaultBase = path.resolve(path.join(os.homedir(), '.claude'))
+  if (path.resolve(base) !== defaultBase) env.CLAUDE_CONFIG_DIR = base
   env.CLAUDE_AGENT_SDK_CLIENT_APP = `kaisola/${CLAUDE_SDK_VERSION}`
   env.CLAUDE_CODE_DISABLE_AUTO_MEMORY = '1'
   env.CLAUDE_CODE_DISABLE_BUNDLED_SKILLS = '1'
@@ -263,11 +271,24 @@ async function readClaudeSdkUsage(base, options = {}) {
     timer.unref?.()
   })
   try {
-    await Promise.race([query.initializationResult(), timeout])
+    const initialization = await Promise.race([query.initializationResult(), timeout])
     const method = query.usage_EXPERIMENTAL_MAY_CHANGE_DO_NOT_RELY_ON_THIS_API_YET
     if (typeof method !== 'function') throw new Error('This Claude Agent SDK version does not expose structured usage.')
     const raw = await Promise.race([method.call(query), timeout])
-    return normalizeClaudeSdkUsage(raw, options.now || Date.now())
+    const normalized = normalizeClaudeSdkUsage(raw, options.now || Date.now())
+    const account = initialization && initialization.account && typeof initialization.account === 'object'
+      ? initialization.account
+      : null
+    return {
+      ...normalized,
+      ...(typeof account?.email === 'string' && account.email.trim() ? { email: account.email.trim().slice(0, 320) } : {}),
+      ...(typeof account?.organization === 'string' && account.organization.trim() ? { organization: account.organization.trim().slice(0, 320) } : {}),
+      // The usage response is canonical (`max`, `pro`, …); initialization is a
+      // useful fallback for SDK revisions that temporarily omit that field.
+      ...(!normalized.subscriptionType && typeof account?.subscriptionType === 'string' && account.subscriptionType.trim()
+        ? { subscriptionType: account.subscriptionType.trim().replace(/^Claude\s+/i, '').toLowerCase() }
+        : {}),
+    }
   } finally {
     if (timer) clearTimeout(timer)
     abortController.abort()

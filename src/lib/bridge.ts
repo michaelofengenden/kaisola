@@ -418,9 +418,11 @@ export interface ClaudeExtraUsage {
 export interface ClaudeUsage {
   ok: boolean
   message?: string
+  email?: string
+  organization?: string
   source?: 'agent-sdk' | 'status-line' | 'transcripts' | 'unavailable'
   sourceLabel?: string
-  /** The structured SDK usage method is experimental; status-line fallback is stable. */
+  /** The structured SDK usage method is experimental; status-line data is a best-effort fallback. */
   experimental?: boolean
   updatedAt?: number
   stale?: boolean
@@ -545,7 +547,7 @@ export interface KaisolaBridge {
     accountInfo?(configDir?: string): Promise<{ ok: boolean; exists?: boolean; email?: string; org?: string }>
   }
   /** Subscription limits (the top-bar gauge). Codex uses app-server; Claude
-   * uses the official Agent SDK with documented status-line fallback. */
+   * uses the official Agent SDK with a best-effort status-line fallback. */
   usage?: {
     codex(codexHome?: string, force?: boolean): Promise<CodexUsage>
     /** force bypasses the five-minute main-process cache (manual refresh). */
@@ -632,6 +634,7 @@ export interface KaisolaBridge {
     /** Unmount xterm only; the pty continues and scrollback moves to disk. */
     detachRenderer(id: string, viewState?: { scrollFromBottom?: number; cols?: number; rows?: number }): Promise<{ ok: boolean }>
     diagnostics?(): Promise<Array<{ id: string; visible: boolean; ramBytes: number; diskBytes: number; pid?: number; exited: boolean }>>
+    codexSession(id: string, cwd?: string): Promise<{ ok: boolean; sessionId?: string; exact?: boolean; message?: string }>
     signal(id: string, signal?: string): Promise<{ ok: boolean }>
     kill(id: string): Promise<{ ok: boolean }>
     run(command: string, cwd?: string): Promise<CmdResult>
@@ -933,6 +936,9 @@ const webMock: KaisolaBridge = {
     },
     async diagnostics() {
       return []
+    },
+    async codexSession() {
+      return { ok: false, message: DESKTOP_ONLY }
     },
     async signal() {
       return { ok: false }

@@ -392,7 +392,7 @@
   color: var(--text-0);
 }
 
-/* background-activity badge, in precedence order: needs-you > failed > running */
+/* background activity: pulse only while working; completion stays still until viewed */
 .ptab-badge {
   width: 7px;
   height: 7px;
@@ -408,6 +408,10 @@
   display: block;
   background: var(--danger);
 }
+.ptab[data-state='completed'] .ptab-badge {
+  display: block;
+  background: var(--success);
+}
 .ptab[data-state='running'] .ptab-badge {
   display: block;
   background: var(--accent);
@@ -419,8 +423,7 @@
   }
 }
 
-/* the tool cluster at the strip's right end (palette · follow · layout ·
-   terminal · theme · settings) — chrome row, not an overlay */
+/* Four permanent controls: search · usage · agents · overflow. */
 .tabstrip-tools {
   display: flex;
   align-items: center;
@@ -433,20 +436,18 @@
 .tabstrip-tools * {
   -webkit-app-region: no-drag;
 }
-/* the tool cluster breathes in three groups — a hairline between intents
-   reads faster than nine equal icons in a row */
-.tools-sep {
-  width: 1px;
-  height: 14px;
-  margin: 0 var(--sp-1);
-  background: var(--border-faint);
-  flex-shrink: 0;
-}
 /* strip-resident icon buttons run a notch smaller than the app default —
    the 15px glyphs keep their size, the hit area stays comfortable */
 .tabstrip-tools .btn-icon {
   width: 28px;
   height: 28px;
+}
+.shell-more-menu { width: 210px; z-index: var(--z-popover); }
+.shell-more-menu .tree-menu-item kbd {
+  margin-left: auto;
+  color: var(--text-3);
+  font: inherit;
+  font-size: var(--fs-10);
 }
 /* the cross-project inbox (Settings → Interface): hidden at zero, a quiet
    bell + count otherwise; the menu is a right-anchored dropdown */
@@ -1201,7 +1202,7 @@
 .stab-split:hover {
   color: var(--text-0);
 }
-/* background-activity badge, in precedence order: needs-you > failed > running */
+/* session activity: pulse only while working; completion stays still until viewed */
 .stab-badge {
   width: 6px;
   height: 6px;
@@ -1216,6 +1217,10 @@
 .stab[data-state='failed'] .stab-badge {
   display: block;
   background: var(--danger);
+}
+.stab[data-state='completed'] .stab-badge {
+  display: block;
+  background: var(--success);
 }
 .stab[data-state='running'] .stab-badge {
   display: block;

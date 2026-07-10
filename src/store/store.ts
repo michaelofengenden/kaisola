@@ -84,6 +84,9 @@ export interface AgentFeedItem {
 export interface TerminalMeta {
   fgProcess?: string | null
   running?: boolean
+  /** A CLI agent has an unanswered prompt. Unlike `running` this settles when
+   * output goes quiet, so Codex/Claude tabs do not pulse forever while idle. */
+  agentBusy?: boolean
   cwd?: string | null
   root?: string | null
   repo?: string | null
@@ -184,7 +187,7 @@ export interface AssistantRuntime {
   usage?: { used: number; size: number }
 }
 
-export type AssistantSpeed = 'fast' | 'balanced' | 'deep'
+export type AssistantSpeed = 'default' | 'fast'
 
 export interface AssistantMention {
   id: string
@@ -411,7 +414,7 @@ export const ASSISTANT_DRAFT_TEXT_LIMIT = 1_000_000
 const ASSISTANT_DRAFT_ATTACHMENT_LIMIT = 64
 const ASSISTANT_DRAFT_MENTION_LIMIT = 64
 
-const emptyAssistantDraft = (speed: AssistantSpeed = 'balanced'): AssistantDraft => ({
+const emptyAssistantDraft = (speed: AssistantSpeed = 'default'): AssistantDraft => ({
   text: '',
   attachments: [],
   mentions: [],
@@ -434,11 +437,13 @@ const normalizeAssistantDraft = (draft?: Partial<AssistantDraft> | null): Assist
       .slice(0, ASSISTANT_DRAFT_MENTION_LIMIT)
       .map((mention) => ({ ...mention, id: mention.id.slice(0, 4000), label: mention.label.slice(0, 2000), text: mention.text.slice(0, 16_000) }))
     : [],
-  speed: draft?.speed === 'fast' || draft?.speed === 'deep' ? draft.speed : 'balanced',
+  // Legacy Balanced/Deep drafts migrate to the provider's normal speed. The
+  // product surface intentionally exposes only Default and Fast.
+  speed: draft?.speed === 'fast' ? 'fast' : 'default',
 })
 
 const assistantDraftIsEmpty = (draft: AssistantDraft) =>
-  !draft.text && draft.attachments.length === 0 && draft.mentions.length === 0 && draft.speed === 'balanced'
+  !draft.text && draft.attachments.length === 0 && draft.mentions.length === 0 && draft.speed === 'default'
 /** An ephemeral notification — EVENTS (done/failed/ready), never ongoing work.
  *  Session-scoped (not persisted); the Activity feed is the persistent record. */
 export interface Toast {
@@ -602,7 +607,7 @@ export interface ProjectTab {
   color?: string                // optional manual accent (GROUP_COLORS)
   createdAt: number
   /** Rolled-up background badge; cleared when the tab becomes active. */
-  activity?: 'running' | 'needs-you' | 'failed'
+  activity?: 'running' | 'completed' | 'needs-you' | 'failed'
 }
 /** A closed project on the undo stack (⌘⌥T reopens); in-memory, cap 8. */
 export interface ClosedProject {
@@ -883,6 +888,8 @@ interface KaisolaState {
   addAgentTerminal: (t: AgentTerminalSession) => void
   closeAgentTerminal: (terminalId: string) => void
   setTerminalMeta: (id: string, patch: TerminalMeta) => void
+  /** Persist the exact CLI-agent resume command used after restarts/updates. */
+  setTerminalResume: (id: string, boot: string) => void
   setTermDraft: (id: string, text: string) => void
   popOutTerminal: (id: string, title?: string, hue?: string) => void
   restorePoppedTerminal: (id: string) => void
@@ -2303,6 +2310,12 @@ export const useKaisola = create<KaisolaState>()(
       if (s.termDrafts[id] === text) return {}
       return { termDrafts: { ...s.termDrafts, [id]: text } }
     }),
+  setTerminalResume: (id, boot) =>
+    set((s) => ({
+      terminals: s.terminals.map((terminal) =>
+        terminal.id === id ? { ...terminal, restart: true, boot } : terminal,
+      ),
+    })),
   setTerminalMeta: (id, patch) =>
     set((s) => {
       // bail on no-ops: this fires on every OSC title / meta tick, and a
@@ -2315,17 +2328,16 @@ export const useKaisola = create<KaisolaState>()(
           return Array.isArray(v) ? Array.isArray(c) && v.join() === c.join() : c === v
         })
       if (same) return s
-      // A MANUALLY-started claude (plain terminal, user typed `claude`) used to
-      // vanish on restart: only `restart: true` rows persist their boot, and
+      // A MANUALLY-started CLI agent (plain terminal, user typed `claude` or
+      // `codex`) used to vanish on restart: only `restart: true` rows persist their boot, and
       // only `agent:`/`wt:` singletons track drafts. The fg-process signal
       // already tells us claude is running here — upgrade the row on the spot
       // (persisted `--continue` boot + an agent: key, so the existing restart
       // re-boot AND draft retype machinery take over with zero extra wiring).
       // When claude exits back to the shell the upgrade is undone, so a
       // terminal that merely visited claude doesn't resurrect it at next boot.
-      // NB `--continue` is cwd-scoped "most recent conversation" — without
-      // hooks armed a manual claude emits no session ids, so exact --resume
-      // isn't reachable for it; recovering the latest chat is the honest best.
+      // Claude hooks later upgrade --continue to an exact --resume. Codex's
+      // terminal-session probe does the same; --last is the safe fallback.
       let terminals = s.terminals
       if ('fgProcess' in patch) {
         const t = s.terminals.find((x) => x.id === id)
@@ -2341,6 +2353,20 @@ export const useKaisola = create<KaisolaState>()(
               : x,
           )
         } else if (t && t.singletonKey?.startsWith('agent:claude-cli-') && /^-?(zsh|bash|fish|sh)$/.test(fg)) {
+          terminals = s.terminals.map((x) =>
+            x.id === id ? { ...x, singletonKey: undefined, restart: undefined, boot: undefined } : x,
+          )
+        } else if (t && !t.singletonKey && !isLogin && /^codex\b/.test(fg)) {
+          terminals = s.terminals.map((x) =>
+            x.id === id
+              ? { ...x, singletonKey: `agent:codex-cli-${id}`, restart: true, boot: 'codex resume --last', name: x.name ?? 'Codex' }
+              : x,
+          )
+        } else if (t && t.singletonKey?.startsWith('agent:codex') && /^codex\b/.test(fg) && (!t.restart || !/^codex resume\b/.test(t.boot ?? ''))) {
+          terminals = s.terminals.map((x) =>
+            x.id === id ? { ...x, restart: true, boot: 'codex resume --last' } : x,
+          )
+        } else if (t && t.singletonKey?.startsWith('agent:codex-cli-') && /^-?(zsh|bash|fish|sh)$/.test(fg)) {
           terminals = s.terminals.map((x) =>
             x.id === id ? { ...x, singletonKey: undefined, restart: undefined, boot: undefined } : x,
           )

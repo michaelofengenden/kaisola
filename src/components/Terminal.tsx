@@ -5,7 +5,7 @@ import { SearchAddon } from '@xterm/addon-search'
 import { WebLinksAddon } from '@xterm/addon-web-links'
 import { WebglAddon } from '@xterm/addon-webgl'
 import { bridge, isDesktop } from '../lib/bridge'
-import { useKaisola, POP_TERMINAL_ID, type TermBackground } from '../store/store'
+import { useKaisola, terminalOwnerMap, POP_TERMINAL_ID, type TermBackground } from '../store/store'
 import { clockTime } from '../lib/format'
 import { Icon } from './Icon'
 
@@ -61,16 +61,16 @@ const LIGHT_THEME: ITheme = {
 // Keep these in sync with tokens.css [data-termbg] if --term-bg / --bg-1 change.
 const TERM_SURFACE: Record<TermBackground, { glass: { dark: string; light: string }; eco: { dark: string; light: string } }> = {
   ink: {
-    glass: { dark: '#0d0f13', light: '#f7f8fa' }, // = color-mix(in srgb, var(--term-bg) 45%, var(--bg-1))
-    eco: { dark: '#0b0d11', light: '#fbfcfd' }, // = var(--term-bg)
+    glass: { dark: '#0d0f13', light: '#ffffff' },
+    eco: { dark: '#0b0d11', light: '#ffffff' },
   },
   slate: {
-    glass: { dark: '#1c2027', light: '#f7f8fa' },
-    eco: { dark: '#191d24', light: '#fbfcfd' },
+    glass: { dark: '#1c2027', light: '#ffffff' },
+    eco: { dark: '#191d24', light: '#ffffff' },
   },
   paper: {
-    glass: { dark: '#f8f9fb', light: '#f7f8fa' },
-    eco: { dark: '#fbfcfd', light: '#fbfcfd' },
+    glass: { dark: '#ffffff', light: '#ffffff' },
+    eco: { dark: '#ffffff', light: '#ffffff' },
   },
 }
 const xtermTheme = (theme: 'dark' | 'light', eco: boolean, cursorColor = 'auto', termBg: TermBackground = 'ink') => {
@@ -215,6 +215,10 @@ export function Terminal({ id, attach = false, boot, cwd }: { id: string; attach
   // draft survival: the CLI composer's unsent text, reconstructed from
   // keystrokes (see trackDraft) — replayed into a resumed agent after restart
   const lastOutputAtRef = useRef(Date.now())
+  const agentTurnOpenRef = useRef(false)
+  const agentDoneTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const codexProbeTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const codexSessionRef = useRef<string | null>(null)
   // A hibernated xterm remounts around the same live CLI composer. Seed the
   // keystroke tracker from durable state so the next character appends to the
   // existing draft instead of replacing it with only the new suffix.
@@ -357,6 +361,50 @@ export function Terminal({ id, attach = false, boot, cwd }: { id: string; attach
     let unsubData = () => {}
     let unsubExit = () => {}
 
+    const finishAgentTurn = () => {
+      if (agentDoneTimerRef.current) clearTimeout(agentDoneTimerRef.current)
+      agentDoneTimerRef.current = null
+      if (!agentTurnOpenRef.current && !useKaisola.getState().terminalMeta[id]?.agentBusy) return
+      agentTurnOpenRef.current = false
+      const state = useKaisola.getState()
+      state.setTerminalMeta(id, { agentBusy: false })
+      const owner = terminalOwnerMap(state)[id]
+      if (!owner) return
+      const seen = owner === state.activeProjectId && state.dockOpen && state.dockViews.includes(id) && !document.hidden && document.hasFocus()
+      if (!seen) {
+        state.markNeedsYou(id, owner)
+        state.setProjectActivity(owner, 'completed')
+      }
+    }
+    const armAgentDone = () => {
+      if (!agentTurnOpenRef.current) return
+      if (agentDoneTimerRef.current) clearTimeout(agentDoneTimerRef.current)
+      agentDoneTimerRef.current = setTimeout(finishAgentTurn, 4500)
+    }
+    const captureCodexSession = () => {
+      const state = useKaisola.getState()
+      const record = state.terminals.find((terminal) => terminal.id === id)
+      if (!record?.singletonKey?.startsWith('agent:codex')) return
+      const liveCwd = state.terminalMeta[id]?.cwd ?? record.cwd ?? cwd
+      if (codexProbeTimerRef.current) return
+      codexProbeTimerRef.current = setTimeout(() => {
+        codexProbeTimerRef.current = null
+        void bridge.terminal.codexSession(id, liveCwd).then((result) => {
+          if (disposed || !result.ok || !result.sessionId || codexSessionRef.current === result.sessionId) return
+          codexSessionRef.current = result.sessionId
+          useKaisola.getState().setTerminalResume(id, `codex resume ${result.sessionId}`)
+        }).catch(() => {})
+      }, 900)
+    }
+    const beginAgentTurn = () => {
+      agentTurnOpenRef.current = true
+      const state = useKaisola.getState()
+      state.setTerminalMeta(id, { agentBusy: true, lastExit: null })
+      const owner = terminalOwnerMap(state)[id]
+      if (owner && owner !== state.activeProjectId) state.setProjectActivity(owner, 'running')
+      captureCodexSession()
+    }
+
     // ── blocks-lite: mark each command so scrollback has structure ──
     // Preferred source: OSC 133 shell-integration marks (A = prompt start,
     // D;<code> = command done) when the user's shell emits them; fallback:
@@ -380,9 +428,12 @@ export function Terminal({ id, attach = false, boot, cwd }: { id: string; attach
     // the Claude session's prompt TIMELINE: each hook prompt event pins a
     // marker at the current scrollback line — the rail's ticks jump there
     const offPrompts = bridge.claude.onEvent((ev) => {
-      if (disposed || ev.event !== 'UserPromptSubmit') return
+      if (disposed) return
       const rec = useKaisola.getState().terminals.find((t) => t.id === id)
       if (rec?.singletonKey !== 'agent:claude-code') return
+      if (ev.event === 'Stop') { finishAgentTurn(); return }
+      if (ev.event !== 'UserPromptSubmit') return
+      beginAgentTurn()
       const marker = term.registerMarker(0)
       if (!marker) return
       hookMarksLiveRef.current = true
@@ -504,8 +555,11 @@ export function Terminal({ id, attach = false, boot, cwd }: { id: string; attach
     // printable chars append, backspace trims, Enter submits (clears), and
     // claude's backslash+CR line continuation becomes a stored newline.
     // Arrow-key edits degrade fidelity (linear model) — accepted best-effort.
-    const isAgentTerm = () =>
-      !!useKaisola.getState().terminals.find((t) => t.id === id)?.singletonKey?.match(/^(agent|wt):/)
+    const isAgentTerm = () => {
+      const state = useKaisola.getState()
+      return !!state.terminals.find((t) => t.id === id)?.singletonKey?.match(/^(agent|wt):/)
+        || /^(claude|codex)\b/.test(state.terminalMeta[id]?.fgProcess ?? '')
+    }
     const flushDraft = () => useKaisola.getState().setTermDraft(id, draftBufRef.current)
     const trackDraft = (data: string) => {
       if (!isAgentTerm()) return
@@ -536,7 +590,10 @@ export function Terminal({ id, attach = false, boot, cwd }: { id: string; attach
             // rail works even when hook events never arrive (unarmed hooks,
             // non-claude agents). Hook marks win when both fire (see flag).
             const submitted = draftBufRef.current.trim()
-            if (submitted.length >= 3) pinTypedPromptMark(submitted)
+            if (submitted.length >= 3) {
+              pinTypedPromptMark(submitted)
+              beginAgentTurn()
+            }
             draftBufRef.current = ''
           }
           continue
@@ -569,7 +626,7 @@ export function Terminal({ id, attach = false, boot, cwd }: { id: string; attach
     // give up after 30s — the draft stays persisted for the next launch.
     armDraftRetypeRef.current = (bootStr: string) => {
       if (!useKaisola.getState().draftRestore) return // Settings → Interface switch
-      if (!/--resume|--continue/.test(bootStr)) return
+      if (!/--resume|--continue|\bcodex\s+resume\b/.test(bootStr)) return
       const saved = useKaisola.getState().termDrafts[id]
       if (!saved || saved.trim().length < 3 || !isAgentTerm()) return
       const born = Date.now()
@@ -608,6 +665,11 @@ export function Terminal({ id, attach = false, boot, cwd }: { id: string; attach
     const wire = () => {
       unsubData = bridge.terminal.onData(id, (data) => {
         lastOutputAtRef.current = Date.now() // draft retype waits for pty quiescence
+        if (agentTurnOpenRef.current) {
+          useKaisola.getState().setTerminalMeta(id, { agentBusy: true })
+          armAgentDone()
+          captureCodexSession()
+        }
         // hidden cards don't paint: buffer (capped) and replay on show —
         // parse + GPU render for a card nobody can see is pure battery drain
         if (visibleRef.current) {
@@ -623,7 +685,7 @@ export function Terminal({ id, attach = false, boot, cwd }: { id: string; attach
         }
         scanPorts(data)
       })
-      unsubExit = bridge.terminal.onExit(id, () => {})
+      unsubExit = bridge.terminal.onExit(id, finishAgentTurn)
       term.onData((data) => {
         bridge.terminal.write(id, data)
         if (!attach) trackInput(data)
@@ -712,6 +774,8 @@ export function Terminal({ id, attach = false, boot, cwd }: { id: string; attach
       }
       void bridge.terminal.detachRenderer(id, viewState)
       if (titleTimer) clearTimeout(titleTimer)
+      if (agentDoneTimerRef.current) clearTimeout(agentDoneTimerRef.current)
+      if (codexProbeTimerRef.current) clearTimeout(codexProbeTimerRef.current)
       window.removeEventListener('resize', onWinResize)
       host.removeEventListener('click', focus)
       ro.disconnect()
@@ -817,8 +881,13 @@ export function Terminal({ id, attach = false, boot, cwd }: { id: string; attach
         e.stopPropagation() // the window-level handler would open it as a file tab
         const paths = files.map((f) => bridge.pathForFile?.(f)).filter(Boolean) as string[]
         if (!paths.length) return
-        bridge.terminal.write(id, paths.map(shellQuote).join(' ') + ' ')
-        termRef.current?.focus()
+        const text = paths.map(shellQuote).join(' ') + ' '
+        const term = termRef.current
+        term?.focus()
+        // xterm.paste emits bracketed paste when the CLI enabled it. Direct IPC
+        // writes bypassed that protocol, so Codex/Claude TUIs ignored drops.
+        if (term) term.paste(text)
+        else bridge.terminal.write(id, text)
       }}
     >
       {/* prompt timeline for the Claude session — a tick per instigated turn */}

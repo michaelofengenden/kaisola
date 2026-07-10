@@ -5,7 +5,7 @@ import { useKaisola } from '../../store/store'
 import { Icon } from '../Icon'
 
 /** Top-bar usage gauge. Codex uses app-server; Claude uses the official Agent
- * SDK's structured `/usage` control, with documented status-line fallback.
+ * SDK's structured `/usage` control, with a best-effort status-line fallback.
  * Local transcript tokens remain a clearly secondary diagnostic. */
 
 const fmt = (n: number): string =>
@@ -132,7 +132,7 @@ export function LimitsButton() {
       setClaude(accountRows.map((row, i) => ({
         id: row.id,
         label: row.label,
-        email: i === 0 ? defaultInfo?.email : row.email,
+        email: usages[i]?.email ?? (i === 0 ? defaultInfo?.email : row.email),
         usage: usages[i],
       })))
     })().finally(() => { if (seq === seqRef.current) setClaudeLoading(false) })

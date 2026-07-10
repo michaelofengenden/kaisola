@@ -8,6 +8,7 @@ import { Dropdown, type DropOption } from '../Dropdown'
 import { WindowLights } from './WindowLights'
 import { InboxButton } from './InboxButton'
 import { ShellTools } from './AgentSidebar'
+import { terminalAgentKey } from '../../lib/sessionHue'
 
 const basename = (p: string | null | undefined) => (p ? p.split('/').filter(Boolean).pop() : undefined)
 const tabLabel = (t: { title?: string; workspacePath: string | null }) => t.title ?? basename(t.workspacePath) ?? 'New Project'
@@ -27,7 +28,7 @@ export function ProjectTabs() {
   // marks BACKGROUND tabs (setProjectActivity refuses the active one)
   const activeRunning = useKaisola(
     (s) =>
-      s.terminals.some((t) => s.terminalMeta[t.id]?.running) ||
+      s.terminals.some((t) => terminalAgentKey(t.singletonKey) ? s.terminalMeta[t.id]?.agentBusy : s.terminalMeta[t.id]?.running) ||
       s.agentTerminals.some((t) => s.terminalMeta[t.terminalId]?.running) ||
       s.assistantThreads.some((t) => t.busy),
   )

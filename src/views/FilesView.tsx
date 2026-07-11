@@ -3,8 +3,7 @@ import { useKaisola, type QuoteAnnotation } from '../store/store'
 import { bridge, isDesktop, type FsEntry, type FsReadMediaKind, type FsReadResult, type GitChange } from '../lib/bridge'
 import { extractOutline } from '../lib/outline'
 import { changedNewLines } from '../lib/lineDiff'
-import { computeTurnBlame, type BlameLine } from '../lib/turnBlame'
-import { relTime, countMatches } from '../lib/format'
+import { countMatches } from '../lib/format'
 import type { AnnotationRange, QuoteAction, ScrollMark } from '../components/CodeEditor'
 import { EmptyState } from '../components/EmptyState'
 import type { DocumentPreviewKind } from '../components/DocumentPreview'
@@ -919,44 +918,6 @@ export function FilesView() {
     [activePath, setEditorCursorLine],
   )
 
-  // ── agent-turn blame for the active file (checkpoint attribution) ──
-  const [blame, setBlame] = useState<{ path: string; lines: (BlameLine | null)[] } | null>(null)
-  useEffect(() => {
-    if (!workspacePath || !active || !activeIsText || active.loading || !repoCheckpoints.length) {
-      setBlame(null)
-      return
-    }
-    let cancelled = false
-    const path = active.path
-    const rel = relativePath(path)
-    const value = active.value
-    const timer = window.setTimeout(() => {
-      void computeTurnBlame(workspacePath, rel, value, repoCheckpoints).then((lines) => {
-        if (!cancelled) setBlame(lines ? { path, lines } : null)
-      })
-    }, 900)
-    return () => {
-      cancelled = true
-      window.clearTimeout(timer)
-    }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [workspacePath, active?.path, active?.value, activeIsText, repoCheckpoints])
-
-  const editorCursorLine = useKaisola((s) => s.editorCursorLine)
-  const [noteLine, setNoteLine] = useState<number | null>(null)
-  useEffect(() => {
-    setNoteLine(null)
-    if (editorCursorLine == null) return
-    const t = window.setTimeout(() => setNoteLine(editorCursorLine), 550) // Zed's delay pattern
-    return () => window.clearTimeout(t)
-  }, [editorCursorLine, activePath])
-  const inlineNote = useMemo(() => {
-    if (!blame || blame.path !== activePath || noteLine == null) return null
-    const b = blame.lines[noteLine - 1]
-    if (!b) return null
-    return { line: noteLine, text: `⟡ ${b.label}${b.at ? ` · ${relTime(b.at)}` : ''}` }
-  }, [blame, activePath, noteLine])
-
   const paneStyle = {
     '--fx-file-font': `${15 * liveZoom}px`,
     '--fx-code-font': `${13 * liveZoom}px`,
@@ -1024,7 +985,6 @@ export function FilesView() {
         textZoom={liveZoom}
         mergeBase={activeDiff ? diffBases[active.path] ?? '' : null}
         marks={marks}
-        inlineNote={inlineNote}
         annotations={annotationRanges}
         scrollRequest={editorScroll}
         initialLine={active.cursor}

@@ -1,6 +1,6 @@
 {
   "projectId": "kaisola-a9ab7",
-  "apiKey": "PASTE_FIREBASE_WEB_API_KEY",
+  "apiKey": "PASTE_FIREBASE_AUTH_ONLY_API_KEY",
   "googleClientId": "PASTE_GOOGLE_DESKTOP_CLIENT_ID.apps.googleusercontent.com",
   "serverUrl": "https://us-central1-kaisola-a9ab7.cloudfunctions.net/session"
 }

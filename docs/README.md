@@ -15,6 +15,8 @@ Phase-0 build was made from; iterate on them as the product evolves.
   trust badges, idea card, lab notebook, approval gate, agent feed).
 - **[ROADMAP.md](ROADMAP.md)** — Phases 0–4 with goals, features, and success
   criteria (what's real vs stubbed at each step).
+- **[BACKLOG.md](BACKLOG.md)** — the editable product inbox for rough feature
+  ideas, bugs, polish, performance work, and items ready for an agent.
 - **[domain-types.reference.ts](domain-types.reference.ts)** — a richer
   reference domain model with the Phase-2 enhancements (verification state,
   structured compute estimates, significance fields). The shipped source of

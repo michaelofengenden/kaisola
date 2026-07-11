@@ -24,13 +24,36 @@ Copy `electron/firebase-config.example.json` to
 `electron/firebase-config.json` and fill in:
 
 - `projectId`: `kaisola-a9ab7`
-- `apiKey`: Firebase **Web API Key** (public identifier, not a secret)
+- `apiKey`: a dedicated Firebase client key restricted to the APIs below
 - `googleClientId`: a Google OAuth client of type **Desktop app**
 - `serverUrl`: the deployed `session` function URL
 
 The same values can be supplied at build/runtime through
 `KAISOLA_FIREBASE_PROJECT_ID`, `KAISOLA_FIREBASE_API_KEY`,
 `KAISOLA_GOOGLE_CLIENT_ID`, and `KAISOLA_AUTH_SERVER_URL`.
+
+### API-key safety
+
+A desktop application's Firebase key is visible to anyone who downloads the
+app. It must therefore authorize only the Firebase APIs that the sign-in flow
+uses:
+
+- Identity Toolkit API (`identitytoolkit.googleapis.com`)
+- Token Service API (`securetoken.googleapis.com`)
+
+Never allow the Generative Language API (Gemini), Vertex AI, or another billed
+non-Firebase API on this key. Use a separate server-side credential for those
+services. If a client key ever allowed one of them, remove that API restriction
+and rotate the key before publishing another build.
+
+`electron/firebase-config.json` is generated and gitignored. For release
+builds, add the rotated Firebase-only key as the GitHub Actions repository
+secret `KAISOLA_FIREBASE_API_KEY`. Also add the Desktop OAuth JSON's
+`client_secret` as `KAISOLA_GOOGLE_CLIENT_SECRET`. The workflow writes both
+gitignored config files immediately before packaging. This keeps the values out
+of source history, but it does not make them secret inside the distributed
+desktop app—the Firebase API restrictions and OAuth PKCE are the security
+boundaries.
 
 Download the matching **Desktop app** OAuth credential JSON from Google Cloud
 and save it as `electron/google-oauth.json`. That file is gitignored; Kaisola

@@ -9,6 +9,9 @@ release/
 .env.local
 # Never put a service-account key or OAuth client secret in the app bundle.
 electron/google-oauth.json
+# Generated locally or by the release workflow. Although a Firebase client key
+# is public, keeping it out of source prevents accidental reuse for private APIs.
+electron/firebase-config.json
 **/*firebase-adminsdk*.json
 # generated UI screenshots (npm run shoot) — regenerate, don't track
 screenshots/

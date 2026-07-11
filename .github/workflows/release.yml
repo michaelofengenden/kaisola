@@ -16,6 +16,13 @@ jobs:
           node-version: 22
           cache: npm
       - run: npm ci
+      - name: Generate Firebase desktop config
+        run: node scripts/write-firebase-config.cjs
+        env:
+          # This must be a rotated client key restricted to Identity Toolkit
+          # and Token Service. Never reuse a Gemini/Generative Language key.
+          KAISOLA_FIREBASE_API_KEY: ${{ secrets.KAISOLA_FIREBASE_API_KEY }}
+          KAISOLA_GOOGLE_CLIENT_SECRET: ${{ secrets.KAISOLA_GOOGLE_CLIENT_SECRET }}
       # --publish never: the gh-release step below uploads the artifacts;
       # electron-builder must not try to publish on its own (it has no token)
       - run: npm run dist -- --publish never

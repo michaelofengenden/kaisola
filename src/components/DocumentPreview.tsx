@@ -11,7 +11,9 @@ import {
   type ReactNode,
 } from 'react'
 import ReactMarkdown from 'react-markdown'
+import { renderToStaticMarkup } from 'react-dom/server'
 import remarkGfm from 'remark-gfm'
+import TurndownService from 'turndown'
 import { bridge, type FsReadResult } from '../lib/bridge'
 
 export type DocumentPreviewKind = 'markdown' | 'html' | 'csv' | 'json'
@@ -22,6 +24,8 @@ interface DocumentPreviewProps {
   sourcePath?: string
   highlight?: string
   onEdit?: () => void
+  editable?: boolean
+  onChange?: (text: string) => void
   /** Outline jump for the RENDERED surface: scroll to the nth heading. */
   scrollHeading?: { index: number; seq: number } | null
 }
@@ -72,6 +76,53 @@ function markdownComponent(Tag: keyof JSX.IntrinsicElements, highlight: string) 
     return <T {...props}>{highlightChildren(children, highlight)}</T>
   }
   return Component
+}
+
+function EditableMarkdownSurface({ text, onChange }: { text: string; onChange?: (text: string) => void }) {
+  // contentEditable must own its descendants while the user types. Giving
+  // React a static HTML snapshot keeps reconciliation from replacing the
+  // browser's live selection or undo stack after each onInput state update.
+  const html = useRef<string | null>(null)
+  if (html.current === null) {
+    html.current = renderToStaticMarkup(<ReactMarkdown remarkPlugins={[remarkGfm]}>{text}</ReactMarkdown>)
+  }
+  const turndown = useMemo(() => {
+    const service = new TurndownService({
+      headingStyle: 'atx',
+      bulletListMarker: '-',
+      codeBlockStyle: 'fenced',
+      emDelimiter: '*',
+      strongDelimiter: '**',
+    })
+    service.addRule('strikethrough', {
+      filter: ['del', 's'],
+      replacement: (content) => `~~${content}~~`,
+    })
+    return service
+  }, [])
+
+  return (
+    <article
+      className="fx-doc-page md"
+      contentEditable
+      suppressContentEditableWarning
+      role="textbox"
+      aria-multiline="true"
+      aria-label="Edit Markdown document"
+      spellCheck
+      dangerouslySetInnerHTML={{ __html: html.current }}
+      onInput={(event) => {
+        const next = turndown.turndown(event.currentTarget.innerHTML).replace(/\n{3,}/g, '\n\n').trimEnd()
+        onChange?.(`${next}\n`)
+      }}
+      onKeyDown={(event) => {
+        if (event.key === 'Tab') {
+          event.preventDefault()
+          document.execCommand('insertText', false, '  ')
+        }
+      }}
+    />
+  )
 }
 
 function isSafeUrl(value: string, forImage = false) {
@@ -410,7 +461,7 @@ function MarkdownImage({ src, alt, title, sourcePath }: { src?: string; alt?: st
   )
 }
 
-export const DocumentPreview = memo(function DocumentPreview({ text, kind, sourcePath, highlight = '', onEdit, scrollHeading }: DocumentPreviewProps) {
+export const DocumentPreview = memo(function DocumentPreview({ text, kind, sourcePath, highlight = '', onEdit, editable = false, onChange, scrollHeading }: DocumentPreviewProps) {
   const html = useMemo(() => (kind === 'html' ? sanitizeHtml(text, highlight) : ''), [kind, text, highlight])
   const table = useMemo(() => kind === 'csv' ? parseTable(text, sourcePath?.toLowerCase().endsWith('.tsv') ? '\t' : ',') : null, [kind, text, sourcePath])
   const jsonTree = useMemo(() => kind === 'json' ? parseJsonPreview(text, sourcePath) : null, [kind, text, sourcePath])
@@ -466,10 +517,19 @@ export const DocumentPreview = memo(function DocumentPreview({ text, kind, sourc
     )
   }
 
-  const rich = (tag: keyof JSX.IntrinsicElements) => markdownComponent(tag, highlight) as never
+  const rich = (tag: keyof JSX.IntrinsicElements) => markdownComponent(tag, editable ? '' : highlight) as never
   return (
-    <div ref={rootRef} className="fx-doc fx-doc-markdown" onDoubleClick={onEdit}>
-      <article className="fx-doc-page md">
+    <div
+      ref={rootRef}
+      className="fx-doc fx-doc-markdown"
+      data-editing={editable || undefined}
+      onDoubleClick={editable ? undefined : onEdit}
+    >
+      {editable && <span className="fx-md-editing"><span /> Editing</span>}
+      {editable ? (
+        <EditableMarkdownSurface text={text} onChange={onChange} />
+      ) : (
+        <article className="fx-doc-page md">
         <ReactMarkdown
           remarkPlugins={[remarkGfm]}
           components={{
@@ -504,7 +564,8 @@ export const DocumentPreview = memo(function DocumentPreview({ text, kind, sourc
         >
           {text}
         </ReactMarkdown>
-      </article>
+        </article>
+      )}
     </div>
   )
 })

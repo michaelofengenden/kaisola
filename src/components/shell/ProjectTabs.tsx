@@ -267,7 +267,6 @@ function RailToggle({ side }: { side: 'left' | 'right' }) {
       aria-pressed={railOpen}
       title={`${action}  ⌘B`}
     >
-      <Icon name={side === 'right' ? (railOpen ? 'PanelRightClose' : 'PanelRightOpen') : (railOpen ? 'PanelLeftClose' : 'PanelLeftOpen')} size={14} />
       <span>File tree</span>
     </button>
   )

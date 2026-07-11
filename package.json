@@ -1,7 +1,7 @@
 {
   "name": "kaisola",
   "productName": "Kaisola",
-  "version": "0.1.46",
+  "version": "0.1.47",
   "private": true,
   "description": "Kaisola — a Research IDE. Move research from literature → hypotheses → experiments → results → paper, with a human reviewing every transition.",
   "type": "module",
@@ -185,6 +185,7 @@
     "react-dom": "^18.3.1",
     "react-markdown": "^9.1.0",
     "remark-gfm": "^4.0.1",
+    "turndown": "^7.2.4",
     "zustand": "^4.5.5"
   },
   "devDependencies": {
@@ -192,6 +193,7 @@
     "@types/node": "^22.9.0",
     "@types/react": "^18.3.12",
     "@types/react-dom": "^18.3.1",
+    "@types/turndown": "^5.0.6",
     "@vitejs/plugin-react": "^4.3.3",
     "concurrently": "^9.2.3",
     "cross-env": "^7.0.3",

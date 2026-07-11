@@ -716,6 +716,43 @@
   max-width: min(88ch, 100%);
   margin-inline: auto;
 }
+.fx-doc-markdown[data-editing] {
+  position: relative;
+  cursor: text;
+}
+.fx-doc-markdown[data-editing] .fx-doc-page {
+  min-height: calc(100% - var(--sp-6));
+  outline: none;
+  caret-color: var(--accent);
+}
+.fx-doc-markdown[data-editing] .fx-doc-page:focus {
+  border-radius: var(--r-3);
+  box-shadow: inset 2px 0 0 color-mix(in srgb, var(--accent) 42%, transparent);
+}
+.fx-md-editing {
+  position: sticky;
+  z-index: 2;
+  top: calc(-1 * var(--sp-5));
+  float: right;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 8px;
+  border: 1px solid var(--border-faint);
+  border-radius: var(--r-full);
+  background: color-mix(in srgb, var(--bg-1) 88%, transparent);
+  color: var(--text-3);
+  font-size: var(--fs-10);
+  font-weight: var(--fw-medium);
+  pointer-events: none;
+  backdrop-filter: blur(12px);
+}
+.fx-md-editing > span {
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: var(--accent);
+}
 @container (max-width: 760px) {
   .fx-doc-markdown {
     padding-inline: clamp(var(--sp-5), 3cqi, var(--sp-8));

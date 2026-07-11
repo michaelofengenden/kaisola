@@ -1274,6 +1274,24 @@ a^2 + b^2 = c^2
     await window.kaisola.fs.write(${JSON.stringify(path.join(fileUiRoot, 'beta-notes.md'))}, '# beta\\n\\nUpdated externally olive.\\n')
     await new Promise((r) => setTimeout(r, 750))
     const mdExternal = /Updated externally olive/.test(document.querySelector('.fx-doc-markdown')?.textContent || '')
+    document.querySelector('.fx-doc-markdown')?.dispatchEvent(new MouseEvent('dblclick', { bubbles: true, cancelable: true }))
+    await new Promise((r) => setTimeout(r, 180))
+    const cleanEditor = document.querySelector('.fx-doc-markdown[data-editing] .fx-doc-page[contenteditable="true"]')
+    const mdCleanEdit = !!cleanEditor && !!document.querySelector('.fx-md-editing') && !document.querySelector('.fx-doc-markdown .cm-editor')
+    if (cleanEditor) {
+      cleanEditor.innerHTML = '<h1>beta</h1><p>Edited cleanly olive.</p>'
+      cleanEditor.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertText', data: '.' }))
+    }
+    await new Promise((r) => setTimeout(r, 180))
+    const saveButton = [...document.querySelectorAll('.fx-save')].find((button) => !button.disabled)
+    saveButton?.click()
+    await new Promise((r) => setTimeout(r, 260))
+    const cleanSaved = await window.kaisola.fs.read(${JSON.stringify(path.join(fileUiRoot, 'beta-notes.md'))})
+    const mdCleanMarkdown = /^# beta\\n\\nEdited cleanly olive\\./.test(cleanSaved.content || '')
+    const previewButton = [...document.querySelectorAll('.fx-mode')].find((button) => /preview/i.test(button.textContent || ''))
+    previewButton?.click()
+    await new Promise((r) => setTimeout(r, 180))
+    const mdCleanPreview = /Edited cleanly olive\\./.test(document.querySelector('.fx-doc-markdown')?.textContent || '')
     const pane = document.querySelector('.fx-pane')
     const mdHeading = document.querySelector('.fx-doc-markdown h1')
     const mdHeadingBefore = mdHeading ? parseFloat(getComputedStyle(mdHeading).fontSize) : 0
@@ -1443,8 +1461,9 @@ a^2 + b^2 = c^2
     }
     // the shell renders identically when blurred (GLASS.blurKeepsGlass pins
     // that) — here we only pin that the file chrome keeps visible hairlines
-    const topBarBordersVisible =
-      cssAlpha(getComputedStyle(document.querySelector('.fx-toolbar')).borderBottomColor) > 0.05
+    const toolbarNode = document.querySelector('.fx-toolbar')
+    const topBarBordersVisible = !!toolbarNode &&
+      cssAlpha(getComputedStyle(toolbarNode).borderBottomColor) > 0.05
     st.setLayoutMode('studio')
     await new Promise((r) => setTimeout(r, 250))
     const shellGuttersDrag =
@@ -1482,6 +1501,9 @@ a^2 + b^2 = c^2
       mdImage,
       mdMark,
       mdExternal,
+      mdCleanEdit,
+      mdCleanMarkdown,
+      mdCleanPreview,
       htmlPreview,
       htmlSafe,
       texSource,
@@ -2125,6 +2147,7 @@ a^2 + b^2 = c^2
     if (!get().railOpen) get().toggleRail()
     await wait()
     const rightToggle = document.querySelector('.tabstrip-tools .rail-toggle[data-side="right"]')
+    const fileTreeTextOnly = /file tree/i.test(rightToggle?.textContent || '') && !rightToggle?.querySelector('svg')
     const tree = document.querySelector('.wsrail[data-side="right"]')
     const localClose = tree?.querySelector('.wsrail-head button[aria-label="Hide file tree"]')
     localClose?.click(); await wait()
@@ -2150,6 +2173,7 @@ a^2 + b^2 = c^2
     await wait()
     return {
       rightToggle: !!rightToggle,
+      fileTreeTextOnly,
       localClose: !!localClose,
       hidden,
       recoverySameSide: !!recoverySameSide,
@@ -3032,6 +3056,7 @@ a^2 + b^2 = c^2
       const autoOn = g().latexMode === true
       const autoMain = g().latexMain[ws] === ws + '/main.tex'
       const bar = !!document.querySelector('.fx-latexbar')
+      const topRow = !!document.querySelector('.fx-toolbar-main .fx-latexbar') && !document.querySelector('.fx-toolbar-sub .fx-latexbar')
       const noOverleafLink = !document.querySelector('.fx-latex-connect') &&
         ![...document.querySelectorAll('.fx-latexbar button')].some((btn) => /overleaf/i.test((btn.textContent || '') + ' ' + (btn.getAttribute('title') || '')))
       const waitFor = async (check, timeout = 8000) => {
@@ -3216,7 +3241,7 @@ a^2 + b^2 = c^2
       await new Promise((r) => setTimeout(r, 300))
       const dismissedSticks = g().latexMode === false
       g().setLatexMain(ws, null)
-      return { chip, offAtFirst, autoOn, autoMain, bar, noOverleafLink, buildShape, syncShape, pdfDblClickSync, pdfAutoBuildSynctex, pdfSourceZoomIndependent, uiBuildNoPdf, latexIssuePopoverContained, popDbg, buildGuard, barGone, dismissedSticks }
+      return { chip, offAtFirst, autoOn, autoMain, bar, topRow, noOverleafLink, buildShape, syncShape, pdfDblClickSync, pdfAutoBuildSynctex, pdfSourceZoomIndependent, uiBuildNoPdf, latexIssuePopoverContained, popDbg, buildGuard, barGone, dismissedSticks }
     })()`)
     fsx.rmSync(texRepo, { recursive: true, force: true })
   } catch (e) {
@@ -3515,7 +3540,7 @@ a^2 + b^2 = c^2
     !auth.hasUrl || auth.code !== 'ABCD-1234' || !auth.done ||
     !cards.cardPerView || !cards.chatLeftOfFiles || !cards.soloHeadSuppressed || !cards.noDockPanel || !cards.emptyMessageGone || !fschk.listed || !fschk.read || !fschk.wrote ||
     !fileui.hasSearch || fileui.resultCount < 1 || fileui.tabs < 1 || !fileui.alphaPreview || !fileui.previewReplaced || !fileui.betaPinned || !fileui.hasBeta || !fileui.activeBeta ||
-    !fileui.mdPreview || !fileui.mdImage || !fileui.mdMark || !fileui.mdExternal || !fileui.mdReadableChannel || !fileui.mdSplitFillsPane ||
+    !fileui.mdPreview || !fileui.mdImage || !fileui.mdMark || !fileui.mdExternal || !fileui.mdCleanEdit || !fileui.mdCleanMarkdown || !fileui.mdCleanPreview || !fileui.mdReadableChannel || !fileui.mdSplitFillsPane ||
     !fileui.htmlPreview || !fileui.htmlSafe || !fileui.texSource || !fileui.texEditable || !fileui.texNoPreview ||
     fileui.imageReadKind !== 'image' || !fileui.imageHasDataUrl || !fileui.imagePreview || !fileui.imageZoomed ||
     fileui.pdfReadKind !== 'pdf' || !fileui.pdfHasPreviewUrl || !fileui.pdfNoDataUrl || !fileui.pdfPreview || !fileui.pdfNoSidePane || !fileui.pdfZoomed || !fileui.pdfChromeCollapsed ||
@@ -3544,7 +3569,7 @@ a^2 + b^2 = c^2
     !autoname.named || !autoname.rowShows || !autoname.sticky || !autoname.manualWins || !autoname.termNamed ||
     !minimalUi.noSidebar || !minimalUi.noSidebarResize || !minimalUi.noStageNav || !minimalUi.hasSessionSidebar || !minimalUi.hasRail || !minimalUi.filesOnRight || !minimalUi.hasPlus || !minimalUi.hasFiles ||
     !tabLayouts.rendered || !tabLayouts.sidebarOk || !tabLayouts.shelfOk || !tabLayouts.bareOk || !tabLayouts.runwayOk || !tabLayouts.flatOk || !tabLayouts.compactOk || !tabLayouts.reciprocalToggle || !tabLayouts.verticalAddFlow || !tabLayouts.stateKept || !tabLayouts.staticPaint || !tabLayouts.accessible || !tabLayouts.sessionIdentity ||
-    !intuitiveLayoutControls.rightToggle || !intuitiveLayoutControls.localClose || !intuitiveLayoutControls.hidden || !intuitiveLayoutControls.recoverySameSide || !intuitiveLayoutControls.restored || !intuitiveLayoutControls.layoutNamed || !intuitiveLayoutControls.startsAsTop || !intuitiveLayoutControls.menuStayedOpen || !intuitiveLayoutControls.changedToLeft || !intuitiveLayoutControls.reversedInPlace || !intuitiveLayoutControls.layoutOnly || !intuitiveLayoutControls.previewDistinct ||
+    !intuitiveLayoutControls.rightToggle || !intuitiveLayoutControls.fileTreeTextOnly || !intuitiveLayoutControls.localClose || !intuitiveLayoutControls.hidden || !intuitiveLayoutControls.recoverySameSide || !intuitiveLayoutControls.restored || !intuitiveLayoutControls.layoutNamed || !intuitiveLayoutControls.startsAsTop || !intuitiveLayoutControls.menuStayedOpen || !intuitiveLayoutControls.changedToLeft || !intuitiveLayoutControls.reversedInPlace || !intuitiveLayoutControls.layoutOnly || !intuitiveLayoutControls.previewDistinct ||
     !realPointerLayout.firstWorked || !realPointerLayout.reverseWorked || !realPointerLayout.stayedInteractive ||
     !narrowAgentUi.rendered || !narrowAgentUi.narrow || !narrowAgentUi.containerAware || !narrowAgentUi.composerFits || !narrowAgentUi.sendVisible || !narrowAgentUi.footerFits || !narrowAgentUi.wraps ||
     !settings.settingsSeparate || !settings.hasAppearance || !settings.hasUsage || !settings.hasDiskResidency || !settings.hasTabLayout || !settings.extensionsInSettings || !settings.hasFilesButton || !settings.noSidebarControls || !settings.previewOpened || !settings.previewDismissed || !settings.usagePreviewOpened || !settings.usagePreviewDismissed ||
@@ -3565,7 +3590,7 @@ a^2 + b^2 = c^2
     !gitpanel.sawUnstaged || !gitpanel.sawStaged || !gitpanel.unstagedBack || !gitpanel.committed || !gitpanel.clean ||
     !gitpanel.logged || !gitpanel.inGrid || !gitpanel.rendered || !gitpanel.railRow || !gitpanel.closed ||
     !browser.opened || !browser.rendered || !browser.emptyState || !browser.urlKept || !browser.reused || !browser.bumped || !browser.closed ||
-    !latex.chip || !latex.offAtFirst || !latex.autoOn || !latex.autoMain || !latex.bar || !latex.noOverleafLink || !latex.buildShape || !latex.syncShape || !latex.pdfDblClickSync || !latex.pdfAutoBuildSynctex || !latex.pdfSourceZoomIndependent || !latex.uiBuildNoPdf || !latex.latexIssuePopoverContained || !latex.buildGuard ||
+    !latex.chip || !latex.offAtFirst || !latex.autoOn || !latex.autoMain || !latex.bar || !latex.topRow || !latex.noOverleafLink || !latex.buildShape || !latex.syncShape || !latex.pdfDblClickSync || !latex.pdfAutoBuildSynctex || !latex.pdfSourceZoomIndependent || !latex.uiBuildNoPdf || !latex.latexIssuePopoverContained || !latex.buildGuard ||
     !latex.barGone || !latex.dismissedSticks ||
     !groups.created || !groups.headEl || !groups.rowInGroup || !groups.collapsed || !groups.switched || !groups.cycled || !groups.dissolved ||
     !chrome.pinnedFirst || !chrome.pinnedSection || !chrome.unpinned || !chrome.dot || !chrome.cleared || !chrome.threadBack || !chrome.stacked || !chrome.termBack || !chrome.colored ||

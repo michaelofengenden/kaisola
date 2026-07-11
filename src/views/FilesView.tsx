@@ -1006,8 +1006,10 @@ export function FilesView() {
         text={active.value}
         kind={previewKind}
         sourcePath={active.path}
-        highlight={findText}
+        highlight={active.mode === 'edit' ? '' : findText}
         onEdit={editActivePreview}
+        editable={activeIsMd && active.mode === 'edit'}
+        onChange={activeIsMd ? setActiveValue : undefined}
         scrollHeading={previewScroll}
       />
     </Suspense>
@@ -1267,7 +1269,7 @@ export function FilesView() {
             <>
               {canPreview && <ModeBtn icon="Eye" label="Preview" active={active.mode === 'preview'} onClick={() => setActiveMode('preview')} />}
               {!canPreview && <ModeBtn icon="Eye" label="View" active={active.mode === 'preview'} onClick={() => setActiveMode('preview')} />}
-              <ModeBtn icon="Pencil" label={canPreview ? 'Source' : 'Edit'} active={active.mode === 'edit'} onClick={() => setActiveMode('edit')} />
+              <ModeBtn icon="Pencil" label={activeIsMd ? 'Edit' : canPreview ? 'Source' : 'Edit'} active={active.mode === 'edit'} onClick={() => setActiveMode('edit')} />
               {canPreview && <ModeBtn icon="Columns2" label="Split" active={active.mode === 'split'} onClick={() => setActiveMode('split')} />}
               {changes !== null && (
                 <ModeBtn
@@ -1320,8 +1322,7 @@ export function FilesView() {
           <div className="fx-toolbar fx-toolbar-main">
             {searchBox}
             {tabStrip}
-          </div>
-          <div className="fx-toolbar fx-toolbar-sub">
+            <span className="grow" />
             {latexMode && isDesktop && workspacePath ? (
               <LatexBar inline />
             ) : isDesktop && workspacePath ? (
@@ -1329,12 +1330,14 @@ export function FilesView() {
                 className="btn btn-sm fx-changes-chip"
                 data-active={latexMode}
                 onClick={() => setLatexMode(!latexMode)}
-                title={latexMode ? 'Leave LaTeX mode' : 'LaTeX mode — build the paper, inspect PDFs'}
+                title="LaTeX mode — build the paper, inspect PDFs"
               >
                 <Icon name="Sigma" size={13} />
                 LaTeX
               </button>
             ) : null}
+          </div>
+          <div className="fx-toolbar fx-toolbar-sub">
             <span className="grow" />
             {activeActions}
             {changes !== null && (
@@ -1418,6 +1421,8 @@ export function FilesView() {
                   <div className="fx-error"><Icon name="FileWarning" size={15} /> {active.readError}</div>
                 ) : mediaPreview ? (
                   mediaPreview
+                ) : activeIsMd && active.mode === 'edit' && documentPreview ? (
+                  documentPreview
                 ) : active.mode === 'preview' && inlinePreview ? (
                   inlinePreview
                 ) : active.mode === 'split' && inlinePreview ? (

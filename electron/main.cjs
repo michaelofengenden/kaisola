@@ -106,13 +106,18 @@ app.setName(APP_NAME)
 // The app has been renamed over its life (see git history); each rename moves
 // the default userData dir. Keep using the OLDEST existing dir so sessions,
 // the sqlite store, settings and keys survive every upgrade — new installs get
-// the current name.
+// the current name. Development gets its own profile so it can run beside the
+// installed app without sharing live sessions or tripping the instance lock.
 try {
-  for (const legacy of ['pasola', 'Pasola', 'Kiasola']) {
-    const legacyUserData = path.join(app.getPath('appData'), legacy)
-    if (fs.existsSync(legacyUserData)) {
-      app.setPath('userData', legacyUserData)
-      break
+  if (isDev) {
+    app.setPath('userData', path.join(app.getPath('appData'), `${APP_NAME} Dev`))
+  } else {
+    for (const legacy of ['pasola', 'Pasola', 'Kiasola']) {
+      const legacyUserData = path.join(app.getPath('appData'), legacy)
+      if (fs.existsSync(legacyUserData)) {
+        app.setPath('userData', legacyUserData)
+        break
+      }
     }
   }
 } catch {

@@ -180,7 +180,8 @@
 
   /* — Layout — */
   --rail-w: 60px;
-  --wsrail-w: 232px; /* left workspace rail: sessions + file tree */
+  --wsrail-w: 232px; /* file tree rail */
+  --sessionrail-w: 188px; /* vertical agent + terminal navigation */
   --sidebar-w: 264px;
   --inspector-w: 340px;
 

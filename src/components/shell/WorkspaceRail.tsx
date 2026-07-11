@@ -11,20 +11,34 @@ import { shellDrag } from './SessionCards'
  * outline and captured quotes). Sessions live only in the tab strip above the
  * cards — the strip is the one session list; no duplicate rail list here.
  */
-export function WorkspaceRail() {
+export function WorkspaceRail({ side = 'left' }: { side?: 'left' | 'right' }) {
   return (
-    <aside className="wsrail">
+    <aside className="wsrail" data-side={side} aria-label="Files sidebar">
+      <FileTreeHeader side={side} />
       <AgentPulse />
       <OutlineSection />
       <QuotesSection />
       <FilesTree />
-      <RailResize />
+      <RailResize side={side} />
     </aside>
   )
 }
 
+function FileTreeHeader({ side }: { side: 'left' | 'right' }) {
+  const toggleRail = useKaisola((s) => s.toggleRail)
+  return (
+    <div className="wsrail-head">
+      <Icon name="FolderTree" size={12} />
+      <span>File tree</span>
+      <button onClick={toggleRail} title="Hide file tree" aria-label="Hide file tree">
+        <Icon name={side === 'right' ? 'PanelRightClose' : 'PanelLeftClose'} size={13} />
+      </button>
+    </div>
+  )
+}
+
 /** Drag handle on the rail's right edge — stretch the files sidebar. */
-function RailResize() {
+function RailResize({ side }: { side: 'left' | 'right' }) {
   const setRailWidth = useKaisola((s) => s.setRailWidth)
   const start = (e: React.MouseEvent) => {
     e.preventDefault()
@@ -34,7 +48,7 @@ function RailResize() {
     const rail = (e.currentTarget as HTMLElement).parentElement
     const startX = e.clientX
     const startW = rail?.getBoundingClientRect().width ?? 232
-    const onMove = (ev: MouseEvent) => setRailWidth(startW + (ev.clientX - startX))
+    const onMove = (ev: MouseEvent) => setRailWidth(startW + (side === 'left' ? 1 : -1) * (ev.clientX - startX))
     const onUp = () => {
       shellDrag.end()
       window.removeEventListener('mousemove', onMove)

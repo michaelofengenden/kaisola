@@ -3,13 +3,12 @@ import { createPortal } from 'react-dom'
 import { useKaisola, dockShowsLiveCard } from '../../store/store'
 import { Icon } from '../Icon'
 import { LimitsButton } from './LimitsButton'
-import { openExtensionsCenter } from '../../lib/extensions'
 import { useClickAway } from '../../lib/useClickAway'
 
 /**
- * The permanent chrome stays deliberately small: find, usage, files, and one
- * overflow. Agent/MCP configuration lives in Settings instead of spending a
- * permanent top-bar slot.
+ * The permanent chrome stays deliberately small: find, usage, file preview,
+ * and one clearly named layout menu. Agent/MCP configuration lives in
+ * Settings instead of spending a permanent top-bar slot.
  */
 export function ShellTools() {
   const layoutMode = useKaisola((s) => s.layoutMode)
@@ -22,6 +21,8 @@ export function ShellTools() {
   const canvasOpen = useKaisola((s) => s.canvasOpen)
   const toggleCanvas = useKaisola((s) => s.toggleCanvas)
   const openSettings = useKaisola((s) => s.setSettingsOpen)
+  const tabLayout = useKaisola((s) => s.tabLayout)
+  const setTabLayout = useKaisola((s) => s.setTabLayout)
   const [open, setOpen] = useState(false)
   const [pos, setPos] = useState({ right: 8, top: 42 })
   const button = useRef<HTMLButtonElement>(null)
@@ -37,8 +38,6 @@ export function ShellTools() {
     }
     setOpen((value) => !value)
   }
-  const act = (fn: () => void) => { setOpen(false); fn() }
-
   return (
     <>
       <button className="btn-icon" onClick={() => openPalette()} title="Command palette  ⌘K">
@@ -46,39 +45,39 @@ export function ShellTools() {
       </button>
       <LimitsButton />
       <button
-        className="btn-icon"
+        className="btn-icon file-preview-toggle"
         data-active={layoutMode === 'studio' && canvasOpen}
         onClick={toggleCanvas}
-        title={canvasOpen && layoutMode === 'studio' ? 'Hide files  ⌘.' : 'Show files  ⌘.'}
-        aria-label={canvasOpen && layoutMode === 'studio' ? 'Hide files' : 'Show files'}
+        title={canvasOpen && layoutMode === 'studio' ? 'Hide file preview  ⌘.' : 'Show file preview  ⌘.'}
+        aria-label={canvasOpen && layoutMode === 'studio' ? 'Hide file preview' : 'Show file preview'}
       >
         <Icon name={canvasOpen && layoutMode === 'studio' ? 'PanelRightClose' : 'PanelRightOpen'} size={15} />
       </button>
-      <button ref={button} className="btn-icon" data-active={open} onClick={toggle} title="More">
-        <Icon name="Ellipsis" size={16} />
+      <button ref={button} className="shell-layout-trigger" data-active={open} onClick={toggle} title="Layout controls" aria-label="Layout controls" aria-expanded={open}>
+        <Icon name="PanelsTopLeft" size={14} />
+        <span>Layout</span>
       </button>
       {open && createPortal(
-          <div ref={panel} className="tree-menu shell-more-menu" style={{ position: 'fixed', right: pos.right, top: pos.top }}>
-            <button className="tree-menu-item" onClick={() => act(toggleLayoutMode)}>
+          <div ref={panel} className="tree-menu shell-more-menu" style={{ position: 'fixed', right: pos.right, top: pos.top }} aria-label="Layout controls">
+            <button className="tree-menu-item" onClick={() => setTabLayout(tabLayout === 'sidebar' ? 'bare' : 'sidebar')}>
+              <Icon name={tabLayout === 'sidebar' ? 'PanelTop' : 'PanelsTopLeft'} size={13} />
+              {tabLayout === 'sidebar' ? 'Move sessions to top' : 'Move sessions to left'}
+            </button>
+            <button className="tree-menu-item" onClick={toggleLayoutMode}>
               <Icon name={layoutMode === 'focus' ? 'PanelsTopLeft' : 'Focus'} size={13} />
-              {layoutMode === 'focus' ? 'Studio layout' : 'Focus layout'}
+              {layoutMode === 'focus' ? 'Show files and sessions' : 'Show files only'}
               <kbd>⌘⇧F</kbd>
             </button>
-            <button className="tree-menu-item" onClick={() => act(toggleDock)}>
-              <Icon name="SquareTerminal" size={13} /> {dockVisible && layoutMode === 'studio' ? 'Hide sessions' : 'Show sessions'}
+            <button className="tree-menu-item" onClick={toggleDock}>
+              <Icon name="SquareTerminal" size={13} /> {dockVisible && layoutMode === 'studio' ? 'Hide session panels' : 'Show session panels'}
               <kbd>⌘J</kbd>
-            </button>
-            <div className="tree-menu-sep" />
-            <button className="tree-menu-item" onClick={() => act(openExtensionsCenter)}>
-              <Icon name="Blocks" size={13} /> Extensions
-            </button>
-            <button className="tree-menu-item" onClick={() => act(() => openSettings(true))}>
-              <Icon name="Settings" size={13} /> Settings
-              <kbd>⌘,</kbd>
             </button>
           </div>,
         document.body,
       )}
+      <button className="btn-icon shell-settings-trigger" onClick={() => openSettings(true)} title="Settings  ⌘," aria-label="Open settings">
+        <Icon name="Settings" size={15} />
+      </button>
     </>
   )
 }

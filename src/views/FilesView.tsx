@@ -55,6 +55,23 @@ interface FileTab {
   unsupported: boolean
 }
 
+// Same-process project switching should paint the editor immediately. Persisted
+// file sessions intentionally store metadata only, but rereading every tab and
+// rebuilding every preview on each click made warm tab changes feel like cold
+// launches. Keep a small LRU of full in-memory sessions; disk reads still run in
+// the background after the cached frame is shown, so agent edits are refreshed.
+const FILE_SESSION_CACHE_CAP = 4
+const fileSessionCache = new Map<string, { tabs: FileTab[]; activePath: string | null }>()
+const rememberFileSession = (workspace: string, tabs: FileTab[], activePath: string | null) => {
+  fileSessionCache.delete(workspace)
+  fileSessionCache.set(workspace, { tabs, activePath })
+  while (fileSessionCache.size > FILE_SESSION_CACHE_CAP) {
+    const oldest = fileSessionCache.keys().next().value
+    if (oldest == null) break
+    fileSessionCache.delete(oldest)
+  }
+}
+
 interface PdfInfoState {
   pages: number
   width: number
@@ -214,6 +231,8 @@ export function FilesView() {
   const [liveZoom, setLiveZoom] = useState(fileTextZoom)
   const [pdfSourceZoom, setPdfSourceZoom] = useState(1)
   const tabsRef = useRef<FileTab[]>([])
+  const activePathRef = useRef<string | null>(null)
+  const sessionWorkspaceRef = useRef<string | null>(workspacePath)
   const externalDirtyRef = useRef(new Set<string>())
   const paneRef = useRef<HTMLDivElement>(null)
   const zoomRef = useRef(fileTextZoom)
@@ -264,7 +283,12 @@ export function FilesView() {
       st.setLatexMain(workspacePath, active.path)
     }
   }, [active, activeIsLatex, workspacePath])
-  useEffect(() => { tabsRef.current = tabs }, [tabs])
+  useEffect(() => {
+    tabsRef.current = tabs
+    activePathRef.current = activePath
+    const workspace = sessionWorkspaceRef.current
+    if (workspace) rememberFileSession(workspace, tabs, activePath)
+  }, [activePath, tabs])
   useEffect(() => {
     const next = clampFileZoom(fileTextZoom)
     // an EXTERNAL zoom change (⌘0 reset, another surface) wins over any
@@ -303,6 +327,12 @@ export function FilesView() {
     setSearchResults([])
     externalDirtyRef.current.clear()
 
+    const previousWorkspace = sessionWorkspaceRef.current
+    if (previousWorkspace && previousWorkspace !== workspacePath) {
+      rememberFileSession(previousWorkspace, tabsRef.current, activePathRef.current)
+    }
+    sessionWorkspaceRef.current = workspacePath
+
     const savedTabs = useKaisola.getState().fileTabs
     const savedActive = useKaisola.getState().openFilePath
     const restored = workspacePath
@@ -316,8 +346,15 @@ export function FilesView() {
       return () => { cancelled = true }
     }
 
-    setTabs(restored.map((tab) => ({ ...emptyFileTab(tab.path, isLatex(tab.path) ? 'edit' : tab.mode, tab.pinned ?? true), cursor: tab.cursor })))
-    setActivePath(savedActive && restored.some((tab) => tab.path === savedActive) ? savedActive : restored[0].path)
+    const cached = fileSessionCache.get(workspacePath)
+    const cachedTabs = cached?.tabs.filter((tab) => restored.some((saved) => saved.path === tab.path)) ?? []
+    const nextTabs = cachedTabs.length === restored.length
+      ? cachedTabs
+      : restored.map((tab) => ({ ...emptyFileTab(tab.path, isLatex(tab.path) ? 'edit' : tab.mode, tab.pinned ?? true), cursor: tab.cursor }))
+    const requestedActive = savedActive && restored.some((tab) => tab.path === savedActive) ? savedActive : restored[0].path
+    const nextActive = cached?.activePath && restored.some((tab) => tab.path === cached.activePath) ? cached.activePath : requestedActive
+    setTabs(nextTabs)
+    setActivePath(nextActive)
     queueMicrotask(() => { if (!cancelled) suppressSessionSyncRef.current = false })
 
     restored.forEach((tab) => {

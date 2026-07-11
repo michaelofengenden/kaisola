@@ -22,6 +22,7 @@ export function Dropdown({
   title,
   placeholder,
   align = 'left',
+  placement = 'auto',
 }: {
   value: string
   options: DropOption[]
@@ -30,6 +31,7 @@ export function Dropdown({
   title?: string
   placeholder?: string
   align?: 'left' | 'right'
+  placement?: 'auto' | 'bottom' | 'top'
 }) {
   const [open, setOpen] = useState(false)
   const [pos, setPos] = useState<{ left?: number; right?: number; top?: number; bottom?: number }>({})
@@ -45,7 +47,7 @@ export function Dropdown({
     // clipped at the right edge when opened from a right-docked rail)
     const menuW = menuRef.current?.offsetWidth ?? 240
     const menuH = menuRef.current?.offsetHeight ?? 0
-    const openDown = b.top < 360 // not enough room above → drop down
+    const openDown = placement === 'bottom' || (placement === 'auto' && b.top < 360)
     setPos({
       left: align === 'right' ? undefined : Math.max(pad, Math.min(b.left, window.innerWidth - menuW - pad)),
       right: align === 'right' ? Math.max(pad, window.innerWidth - b.right) : undefined,
@@ -57,11 +59,11 @@ export function Dropdown({
   useLayoutEffect(() => {
     if (open) place()
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [open])
+  }, [open, placement])
 
   useEffect(() => {
     if (!open) return
-    const onDoc = (e: MouseEvent) => {
+    const onDoc = (e: PointerEvent) => {
       const t = e.target as Node
       if (btnRef.current?.contains(t) || menuRef.current?.contains(t)) return
       setOpen(false)
@@ -77,11 +79,11 @@ export function Dropdown({
     // Capture phase is intentional: modal panels (Settings included) stop
     // bubbling pointer events at their surface. A bubble listener therefore
     // left the dropdown preview open when clicking another setting.
-    document.addEventListener('mousedown', onDoc, true)
+    document.addEventListener('pointerdown', onDoc, true)
     window.addEventListener('resize', onScrollResize)
     window.addEventListener('keydown', onKey, true)
     return () => {
-      document.removeEventListener('mousedown', onDoc, true)
+      document.removeEventListener('pointerdown', onDoc, true)
       window.removeEventListener('resize', onScrollResize)
       window.removeEventListener('keydown', onKey, true)
     }

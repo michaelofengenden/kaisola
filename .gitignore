@@ -7,6 +7,9 @@ release/
 .vite/
 .env
 .env.local
+# Never put a service-account key or OAuth client secret in the app bundle.
+electron/google-oauth.json
+**/*firebase-adminsdk*.json
 # generated UI screenshots (npm run shoot) — regenerate, don't track
 screenshots/
 

@@ -66,7 +66,7 @@ export function Onboarding() {
               </button>
               <button className="onboarding-local" disabled={busy} onClick={() => setStep('workspace')}>Continue locally</button>
             </div>
-            {status?.configured === false && <p className="onboarding-note">Google sign-in is ready in the app and will unlock when this build is linked to Kaisola’s Desktop OAuth client.</p>}
+            {status?.configured === false && <p className="onboarding-note">{status.message || 'Google sign-in is ready in the app and will unlock when this build is linked to Kaisola’s Desktop OAuth client.'}</p>}
             {message && <p className="onboarding-error">{message}</p>}
           </>
         ) : (

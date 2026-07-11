@@ -282,7 +282,7 @@ export function SessionCards() {
 
   return (
     <div className="dock-col">
-      {tabLayout !== 'compact' && <SessionTabs />}
+      {tabLayout !== 'compact' && tabLayout !== 'sidebar' && <SessionTabs />}
       <div
         ref={gridRef}
         className="session-grid"

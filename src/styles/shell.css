@@ -397,7 +397,8 @@
   }
 }
 
-/* Four permanent controls: search · usage · files · overflow. */
+/* Permanent controls: contextual file-tree toggle · search · usage · preview
+   · an explicitly named layout menu. */
 .tabstrip-tools {
   display: flex;
   align-items: center;
@@ -413,10 +414,122 @@
 /* strip-resident icon buttons run a notch smaller than the app default —
    the 15px glyphs keep their size, the hit area stays comfortable */
 .tabstrip-tools .btn-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
   width: 28px;
   height: 28px;
+  line-height: 0;
+  align-self: center;
 }
-.shell-more-menu { width: 210px; z-index: var(--z-popover); }
+.shell-layout-trigger,
+.tabstrip .rail-toggle {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 5px;
+  height: 28px;
+  padding: 0 8px 0 6px;
+  flex-shrink: 0;
+  border: 1px solid var(--border-faint);
+  border-radius: var(--r-2);
+  color: var(--text-2);
+  font-size: var(--fs-10);
+  font-weight: var(--fw-medium);
+  white-space: nowrap;
+  -webkit-app-region: no-drag;
+}
+.shell-layout-trigger:hover,
+.shell-layout-trigger[data-active='true'],
+.tabstrip .rail-toggle:hover {
+  color: var(--text-0);
+  border-color: color-mix(in srgb, var(--accent) 28%, var(--border));
+  background: var(--hover-overlay);
+}
+.app-account-avatar {
+  display: inline-grid;
+  place-items: center;
+  width: 28px;
+  height: 28px;
+  padding: 0;
+  flex: 0 0 28px;
+  overflow: hidden;
+  border: 1px solid var(--border);
+  border-radius: var(--r-full);
+  background: color-mix(in srgb, var(--accent) 10%, var(--bg-2));
+  color: var(--text-1);
+  font-size: var(--fs-11);
+  font-weight: var(--fw-semibold);
+  cursor: pointer;
+  -webkit-app-region: no-drag;
+}
+.app-account-avatar:hover,
+.app-account-avatar[data-open] {
+  border-color: color-mix(in srgb, var(--accent) 45%, var(--border));
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent) 10%, transparent);
+}
+.app-account-avatar img {
+  width: 100%;
+  height: 100%;
+  display: block;
+  object-fit: cover;
+}
+.app-account-menu {
+  z-index: var(--z-popover);
+  width: 260px;
+  padding: 6px;
+  border: 1px solid var(--border);
+  border-radius: var(--r-3);
+  background: var(--bg-2);
+  box-shadow: var(--shadow-pop);
+  -webkit-app-region: no-drag;
+}
+.app-account-card {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-3);
+  padding: var(--sp-3);
+  min-width: 0;
+}
+.app-account-avatar-large {
+  width: 36px;
+  height: 36px;
+  flex-basis: 36px;
+  cursor: default;
+}
+.app-account-copy {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  line-height: 1.35;
+}
+.app-account-copy strong { color: var(--text-0); font-size: var(--fs-12); }
+.app-account-copy > span { color: var(--text-2); font-size: var(--fs-11); }
+.app-account-copy small { color: var(--text-3); font-size: var(--fs-10); }
+.app-account-copy small[data-verified] { color: var(--success); }
+.app-account-menu > button {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-3);
+  width: 100%;
+  height: 30px;
+  padding: 0 var(--sp-3);
+  border-radius: var(--r-2);
+  color: var(--text-1);
+  font-size: var(--fs-12);
+  text-align: left;
+}
+.app-account-menu > button:hover { background: var(--hover-overlay); color: var(--text-0); }
+.shell-more-menu {
+  width: 210px;
+  z-index: var(--z-popover);
+  pointer-events: auto;
+  -webkit-app-region: no-drag !important;
+}
+.shell-more-menu * {
+  pointer-events: auto;
+  -webkit-app-region: no-drag !important;
+}
 .shell-more-menu .tree-menu-item kbd {
   margin-left: auto;
   color: var(--text-3);
@@ -483,25 +596,19 @@
   padding: 0 var(--sp-3) 0 var(--sp-2);
   flex-shrink: 0; /* the track shrinks, chrome never does */
 }
-/* sidebar toggle, in the Claude-app spot right of the lights — always lit
-   (text-1 at rest): at text-3 it dissolved into the glass and was unfindable */
+/* The file-tree toggle follows the tree's edge: left of project tabs for the
+   classic layout, inside the right tool cluster when the tree is on the right. */
 .tabstrip .rail-toggle {
-  -webkit-app-region: no-drag;
   align-self: center;
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  flex-shrink: 0; /* the track shrinks, chrome never does */
-  width: 26px;
-  height: 26px;
   margin-right: var(--sp-2);
-  border-radius: var(--r-2);
-  color: var(--text-1);
   transition: color var(--dur-1) var(--ease-out), background var(--dur-1) var(--ease-out);
 }
-.tabstrip .rail-toggle:hover {
-  color: var(--text-0);
-  background: var(--hover-overlay);
+.tabstrip-tools .rail-toggle[data-side='right'] {
+  margin-right: var(--sp-1);
+}
+.tabstrip .rail-toggle[data-open='true'] {
+  color: var(--text-1);
+  background: color-mix(in srgb, var(--accent) 6%, transparent);
 }
 
 /* the strip pushes the two absolutely-positioned overlays down by its height.
@@ -639,6 +746,7 @@
 /* the floating surfaces — side rails get a frosted macOS-style wash, while
    content surfaces stay denser for document/code readability. */
 .wsrail,
+.session-sidebar,
 .sidebar {
   background: transparent;
   border: 1px solid transparent;
@@ -652,6 +760,7 @@
   -webkit-app-region: drag;
 }
 .wsrail::before,
+.session-sidebar::before,
 .sidebar::before {
   content: '';
   position: absolute;
@@ -668,10 +777,12 @@
   box-shadow: inset 0 1px 0 rgb(255 255 255 / 22%);
 }
 :root[data-theme='dark'] .wsrail::before,
+:root[data-theme='dark'] .session-sidebar::before,
 :root[data-theme='dark'] .sidebar::before {
   box-shadow: inset 0 1px 0 rgb(255 255 255 / 7%);
 }
 .wsrail > *,
+.session-sidebar > *,
 .sidebar > * {
   position: relative;
   z-index: 1;
@@ -724,6 +835,14 @@
 }
 .app[data-sidebar='false'] .app-body[data-rail='closed'] {
   grid-template-columns: 1fr;
+}
+/* Split-sidebar navigation: sessions stay on the left while the project file
+   tree mirrors them on the right. ⌘B puts away only the file tree. */
+.app[data-sidebar='false'] .app-body[data-session-nav='sidebar'] {
+  grid-template-columns: var(--sessionrail-w) minmax(0, 1fr) var(--wsrail-w);
+}
+.app[data-sidebar='false'] .app-body[data-session-nav='sidebar'][data-rail='closed'] {
+  grid-template-columns: var(--sessionrail-w) minmax(0, 1fr);
 }
 .app-body[data-layout='focus'] {
   grid-template-columns: var(--sidebar-w) minmax(0, 1fr);
@@ -1088,6 +1207,28 @@
 }
 .stabs-track::-webkit-scrollbar {
   display: none;
+}
+.stabs-sidebar-toggle {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 5px;
+  width: auto;
+  min-width: 25px;
+  height: 25px;
+  padding: 0 8px 0 6px;
+  flex: 0 0 auto;
+  border: 1px solid color-mix(in srgb, var(--accent) 18%, var(--border-faint));
+  border-radius: var(--r-full);
+  background: color-mix(in srgb, var(--accent) 6%, transparent);
+  color: var(--text-2);
+  font-size: var(--fs-10);
+  font-weight: var(--fw-medium);
+}
+.stabs-sidebar-toggle:hover {
+  color: var(--text-0);
+  border-color: color-mix(in srgb, var(--accent) 36%, var(--border));
+  background: color-mix(in srgb, var(--accent) 11%, var(--hover-overlay));
 }
 /* The small turn-in marker makes the project → session nesting legible even
    when colors are muted or the user has several similarly colored projects. */
@@ -1540,6 +1681,7 @@
 }
 /* the chrome glass pseudos rest too — eco is solid everywhere */
 :root[data-perf='eco'] .wsrail::before,
+:root[data-perf='eco'] .session-sidebar::before,
 :root[data-perf='eco'] .sidebar::before {
   display: none;
 }
@@ -1606,7 +1748,125 @@
   overflow-x: hidden;
 }
 
-/* ── Workspace rail (left): sessions on top, the file tree below ─────────── */
+/* ── Vertical session navigation (default left sidebar) ────────────────── */
+.session-sidebar {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+}
+.session-sidebar-head {
+  display: flex;
+  align-items: center;
+  height: 34px;
+  padding: 0 var(--sp-3) 0 var(--sp-4);
+  color: var(--text-3);
+  font-size: var(--fs-10);
+  font-weight: var(--fw-semibold);
+  letter-spacing: var(--tracking-caps);
+  text-transform: uppercase;
+  flex-shrink: 0;
+}
+.session-sidebar-head > span { flex: 1; }
+.session-sidebar-head button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
+  width: auto;
+  min-width: 24px;
+  height: 24px;
+  padding: 0 7px 0 5px;
+  border: 1px solid var(--border-faint);
+  border-radius: var(--r-full);
+  color: var(--text-3);
+  font-size: var(--fs-9);
+  letter-spacing: 0;
+  text-transform: none;
+  -webkit-app-region: no-drag;
+}
+.session-sidebar-head button:hover {
+  color: var(--text-0);
+  background: var(--hover-overlay);
+}
+.session-sidebar .stabs[data-orientation='vertical'] {
+  flex: 1 1 auto;
+  width: 100%;
+  height: auto;
+  min-height: 0;
+  margin: 0;
+  padding: 0 var(--sp-2) var(--sp-3);
+  flex-direction: column;
+  align-items: stretch;
+  gap: var(--sp-2);
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  box-shadow: none;
+}
+.session-sidebar .stabs-project-anchor { display: none; }
+.session-sidebar .stabs-track {
+  flex: 0 1 auto;
+  min-height: 0;
+  max-height: calc(100% - 34px);
+  width: 100%;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 2px;
+  overflow-x: hidden;
+  overflow-y: auto;
+}
+.session-sidebar .stab,
+.session-sidebar .stabs[data-single='true'] .stab {
+  flex: 0 0 auto;
+  width: 100%;
+  min-width: 0;
+  max-width: none;
+  height: 30px;
+  padding: 0 var(--sp-3);
+  border-radius: var(--r-2);
+  background: transparent;
+  border-color: transparent;
+  box-shadow: none;
+}
+.session-sidebar .stab:hover {
+  background: var(--hover-overlay);
+  border-color: transparent;
+}
+.session-sidebar .stab[data-active='true'] {
+  color: var(--text-0);
+  background: color-mix(in srgb, var(--app-active-glass-tint) 22%, transparent);
+  border-color: transparent;
+  box-shadow: inset 2px 0 0 var(--sid, var(--accent));
+}
+.session-sidebar .stabs .drop-btn {
+  position: relative;
+  width: 100%;
+  height: 28px;
+  margin: 0;
+  border-color: transparent;
+  background: transparent;
+  color: var(--text-2);
+  justify-content: flex-start;
+  padding: 0 var(--sp-3);
+  flex-shrink: 0;
+}
+.session-sidebar .stabs .drop-btn:hover { background: var(--hover-overlay); }
+.session-sidebar .stabs .drop-btn::after {
+  content: 'New session';
+  margin-left: var(--sp-2);
+  font-size: var(--fs-12);
+}
+.session-sidebar .stabs .drop-btn::before {
+  content: '';
+  position: absolute;
+  left: var(--sp-3);
+  right: var(--sp-3);
+  top: -4px;
+  border-top: 1px solid var(--border-faint);
+}
+
+/* ── Workspace file rail (left in classic mode, right in sidebars mode) ── */
 .wsrail {
   display: flex;
   flex-direction: column;
@@ -1625,6 +1885,10 @@
   z-index: 6;
   -webkit-app-region: no-drag;
 }
+.wsrail[data-side='right'] > .wsrail-resize {
+  left: 0;
+  right: auto;
+}
 .wsrail > .wsrail-resize:hover {
   background: var(--accent-soft);
 }
@@ -1641,6 +1905,37 @@
   margin-top: var(--sp-3);
   padding: var(--sp-3) var(--sp-2) var(--sp-6);
   border-top: 1px solid transparent;
+}
+.wsrail-head {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  height: 34px;
+  padding: 0 var(--sp-2) 0 var(--sp-4);
+  flex: 0 0 34px;
+  color: var(--text-2);
+  font-size: var(--fs-10);
+  font-weight: var(--fw-semibold);
+  letter-spacing: var(--tracking-caps);
+  text-transform: uppercase;
+  border-bottom: 1px solid var(--border-faint);
+}
+.wsrail-head > span {
+  flex: 1;
+  min-width: 0;
+}
+.wsrail-head > button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 24px;
+  border-radius: var(--r-2);
+  color: var(--text-3);
+}
+.wsrail-head > button:hover {
+  color: var(--text-0);
+  background: var(--hover-overlay);
 }
 .wsrail-open {
   margin: var(--sp-1) var(--sp-2);

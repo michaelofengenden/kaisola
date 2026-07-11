@@ -21,6 +21,7 @@ import { ruleForRequest, ruleLabel } from '../lib/permissionRules'
 import { Icon } from './Icon'
 import { Dropdown } from './Dropdown'
 import { Markdown } from './Markdown'
+import { ProviderIcon } from './ProviderIcon'
 import { stageMeta } from '../lib/stages'
 import { clockTime, workedTime } from '../lib/format'
 import type { Paper } from '../domain/types'
@@ -446,12 +447,20 @@ const TurnRow = memo(function TurnRow({ t, i, agentName, showCaret, liveThinkSta
       </details>
     )
   }
+  const userTurn = t.kind === 'user'
   return (
     <div data-turn={i} className={`assistant-turn turn-${t.kind}`}>
-      <span className="turn-tag">
-        {t.kind === 'user' ? 'You' : agentName}
-        {t.at != null && <span className="turn-time">{clockTime(new Date(t.at).toISOString())}</span>}
-      </span>
+      <div className="turn-head">
+        <span className="turn-avatar" aria-hidden>
+          {userTurn
+            ? <Icon name="UserRound" size={11} />
+            : <ProviderIcon provider={agentName} name={agentName} size={11} />}
+        </span>
+        <span className="turn-tag">
+          {userTurn ? 'You' : agentName}
+          {t.at != null && <span className="turn-time">{clockTime(new Date(t.at).toISOString())}</span>}
+        </span>
+      </div>
       <div className="turn-text">
         {t.kind === 'assistant'
           ? (t.text ? <Markdown text={t.text} /> : (showCaret ? '▌' : ''))
@@ -887,13 +896,19 @@ export const Assistant = memo(function Assistant({ threadId }: { threadId: strin
     return off
   }, [connectionKey])
   // ── turn timeline (Codex-style): one tick per prompt, hover = card, click = jump ──
-  const prompts = useMemo(
-    () => arun.turns.map((t, i) => ({ turn: t, idx: i })).filter((x) => x.turn.kind === 'user'),
-    [arun.turns],
+  const displayedTurns = useMemo(
+    () => [
+      ...archivedPage.map((turn, i) => ({ turn, idx: i - archivedPage.length })),
+      ...arun.turns.map((turn, idx) => ({ turn, idx })),
+    ],
+    [archivedPage, arun.turns],
   )
-  const [railHover, setRailHover] = useState<{ n: number; y: number } | null>(null)
-  const [activePrompt, setActivePrompt] = useState(0)
+  const prompts = useMemo(() => displayedTurns.filter((x) => x.turn.kind === 'user'), [displayedTurns])
+  const turnTabsRef = useRef<HTMLDivElement>(null)
+  const [promptHover, setPromptHover] = useState<{ idx: number; left: number } | null>(null)
+  const [activePrompt, setActivePrompt] = useState<number | null>(null)
   const jumpToTurn = (idx: number) => {
+    setActivePrompt(idx)
     scrollRef.current
       ?.querySelector(`[data-turn="${idx}"]`)
       ?.scrollIntoView({ block: 'start', behavior: 'smooth' })
@@ -901,8 +916,9 @@ export const Assistant = memo(function Assistant({ threadId }: { threadId: strin
   /** The reply that followed a prompt — the hover card's preview. */
   const replyPreview = (promptIdx: number): { text: string; tools: number } => {
     let tools = 0
-    for (let i = promptIdx + 1; i < arun.turns.length; i++) {
-      const t = arun.turns[i]
+    const start = displayedTurns.findIndex((row) => row.idx === promptIdx)
+    for (let i = start + 1; i < displayedTurns.length; i++) {
+      const t = displayedTurns[i].turn
       if (t.kind === 'user') break
       if (t.kind === 'tool') tools++
       if (t.kind === 'assistant' && t.text) return { text: t.text.slice(0, 180), tools }
@@ -917,6 +933,14 @@ export const Assistant = memo(function Assistant({ threadId }: { threadId: strin
   // Idle/read-only transcripts still restore the exact saved reading offset.
   const openAtLivePrompt = busy || !!input.trim() || attachments.length > 0 || mentions.length > 0
   const stickRef = useRef(openAtLivePrompt || (assistantViewport(viewportKey)?.atBottom ?? true))
+  useEffect(() => {
+    const last = prompts[prompts.length - 1]?.idx ?? null
+    setActivePrompt((current) => {
+      if (last == null) return null
+      if (stickRef.current || current == null || !prompts.some((prompt) => prompt.idx === current)) return last
+      return current
+    })
+  }, [prompts])
   const restoringViewportRef = useRef(false)
   const saveViewport = (flush = false) => {
     const el = scrollRef.current
@@ -931,12 +955,12 @@ export const Assistant = memo(function Assistant({ threadId }: { threadId: strin
       stickRef.current = el.scrollHeight - el.scrollTop - el.clientHeight < 90
       saveViewport()
       // which prompt is above the fold — the rail's darkened tick
-      let active = 0
-      prompts.forEach((p, n) => {
+      let visiblePrompt = prompts[0]?.idx ?? null
+      prompts.forEach((p) => {
         const node = el.querySelector(`[data-turn="${p.idx}"]`) as HTMLElement | null
-        if (node && node.offsetTop <= el.scrollTop + 60) active = n
+        if (node && node.offsetTop <= el.scrollTop + 60) visiblePrompt = p.idx
       })
-      setActivePrompt(active)
+      setActivePrompt(visiblePrompt)
     }
   }
   useEffect(() => {
@@ -1605,7 +1629,7 @@ export const Assistant = memo(function Assistant({ threadId }: { threadId: strin
     <div
       className="assistant"
       data-thread-id={active.id}
-      data-rail={prompts.length > 1 || undefined}
+      data-prompt-tabs={prompts.length > 0 || undefined}
       data-file-drop={fileDropHover || undefined}
       onDragOver={(e) => {
         if (!e.dataTransfer?.types.includes('Files')) return
@@ -1628,25 +1652,47 @@ export const Assistant = memo(function Assistant({ threadId }: { threadId: strin
         inputRef.current?.focus()
       }}
     >
-      {/* the prompt timeline — every turn you instigated, one tick each */}
-      {prompts.length > 1 && (
-        <div className="turn-rail" onMouseLeave={() => setRailHover(null)}>
-          {prompts.slice(-24).map((p, n) => (
-            <button
-              key={p.idx}
-              className="turn-tick"
-              data-active={Math.max(0, prompts.length - 24) + n === activePrompt}
-              onMouseEnter={(e) => setRailHover({ n, y: (e.currentTarget as HTMLElement).offsetTop })}
-              onClick={() => jumpToTurn(p.idx)}
-              aria-label={p.turn.text.slice(0, 60)}
-            />
-          ))}
-          {railHover && (() => {
-            const p = prompts.slice(-24)[railHover.n]
+      {/* Every user prompt is a compact tab: click to jump within any agent. */}
+      {(prompts.length > 0 || canLoadArchive) && (
+        <div className="turn-tabs-wrap" ref={turnTabsRef} onMouseLeave={() => setPromptHover(null)}>
+          <div className="turn-tabs-title"><Icon name="MessagesSquare" size={11} /> Prompts</div>
+          <div className="turn-tabs" aria-label="Prompt history">
+            {canLoadArchive && (
+              <button
+                className="turn-tab turn-tab-history"
+                disabled={archiveLoading}
+                onClick={() => { void loadOlderTurns() }}
+                title="Load older prompts from Kaisola's disk archive"
+              >
+                <Icon name="History" size={10} />
+                <span>{archiveLoading ? 'Loading…' : `${Math.max(0, archivedCount - archivedPage.length)} older`}</span>
+              </button>
+            )}
+            {prompts.map((p, n) => (
+              <button
+                key={`${p.idx}-${p.turn.at ?? n}`}
+                className="turn-tab turn-tab-prompt"
+                data-active={p.idx === activePrompt}
+                aria-current={p.idx === activePrompt ? 'step' : undefined}
+                onMouseEnter={(e) => {
+                  const wrapWidth = turnTabsRef.current?.clientWidth ?? 340
+                  const left = e.currentTarget.offsetLeft - e.currentTarget.parentElement!.scrollLeft
+                  setPromptHover({ idx: p.idx, left: Math.max(0, Math.min(left, wrapWidth - 310)) })
+                }}
+                onClick={() => jumpToTurn(p.idx)}
+                title={p.turn.text}
+              >
+                <span className="turn-tab-index">{n + 1}</span>
+                <span className="turn-tab-text">{p.turn.text.replace(/\s+/g, ' ').trim() || 'Prompt'}</span>
+              </button>
+            ))}
+          </div>
+          {promptHover && (() => {
+            const p = prompts.find((candidate) => candidate.idx === promptHover.idx)
             if (!p) return null
             const reply = replyPreview(p.idx)
             return (
-              <div className="turn-pop" style={{ top: Math.max(0, railHover.y - 12) }}>
+              <div className="turn-pop" style={{ left: promptHover.left }}>
                 <div className="turn-pop-title">{p.turn.text}</div>
                 {reply.text && <div className="turn-pop-preview">{reply.text}</div>}
                 <div className="turn-pop-meta">
@@ -1661,7 +1707,7 @@ export const Assistant = memo(function Assistant({ threadId }: { threadId: strin
                       void st.restoreRepoCheckpoint(p.turn.checkpointId!).then(() => {
                         st.pushToast('success', 'Files restored to before this prompt. The agent doesn’t know — mention it in your next message.')
                       })
-                      setRailHover(null)
+                      setPromptHover(null)
                     }}
                     title="Reset the working tree to how it was before this prompt ran (conversation stays)"
                   >

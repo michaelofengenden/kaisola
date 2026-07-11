@@ -11,6 +11,7 @@ import { InboxButton } from './InboxButton'
 import { ShellTools } from './AgentSidebar'
 import { terminalAgentKey } from '../../lib/sessionHue'
 import { SessionTabs } from './SessionTabs'
+import { AppAccountButton } from './AppAccountButton'
 
 const basename = (p: string | null | undefined) => (p ? p.split('/').filter(Boolean).pop() : undefined)
 const tabLabel = (t: { title?: string; workspacePath: string | null }) => t.title ?? basename(t.workspacePath) ?? 'New Project'
@@ -111,7 +112,7 @@ export function ProjectTabs() {
   return (
     <div className="tabstrip" data-single={tabs.length === 1 || undefined}>
       <WindowLights />
-      <RailToggle />
+      {tabLayout !== 'sidebar' && <RailToggle side="left" />}
       <div className="tabstrip-track" role="tablist" ref={trackRef} onScroll={syncFade}>
         {tabs.map((tab, i) => {
           const active = tab.id === activeId
@@ -190,8 +191,10 @@ export function ProjectTabs() {
           never overlapping the session tabs below (App renders the floating
           fallback only where this strip doesn't exist: web + pop windows) */}
       <div className="tabstrip-tools">
+        {tabLayout === 'sidebar' && <RailToggle side="right" />}
         <InboxButton />
         <ShellTools />
+        <AppAccountButton />
       </div>
 
       {/* portalled to <body> — rendered in-strip it inherits a stacking context
@@ -250,17 +253,22 @@ export function ProjectTabs() {
  * Sidebar toggle in the Claude-app spot — right of the traffic lights.
  * Hides/shows the left workspace rail (files + outline); ⌘B does the same.
  */
-function RailToggle() {
+function RailToggle({ side }: { side: 'left' | 'right' }) {
   const railOpen = useKaisola((s) => s.railOpen)
   const toggleRail = useKaisola((s) => s.toggleRail)
+  const action = `${railOpen ? 'Hide' : 'Show'} file tree on ${side}`
   return (
     <button
       className="rail-toggle"
+      data-side={side}
+      data-open={railOpen || undefined}
       onClick={toggleRail}
-      aria-label={railOpen ? 'Hide sidebar' : 'Show sidebar'}
-      title={railOpen ? 'Hide sidebar  ⌘B' : 'Show sidebar  ⌘B'}
+      aria-label={action}
+      aria-pressed={railOpen}
+      title={`${action}  ⌘B`}
     >
-      <Icon name={railOpen ? 'PanelLeftClose' : 'PanelLeftOpen'} size={14} />
+      <Icon name={side === 'right' ? (railOpen ? 'PanelRightClose' : 'PanelRightOpen') : (railOpen ? 'PanelLeftClose' : 'PanelLeftOpen')} size={14} />
+      <span>File tree</span>
     </button>
   )
 }

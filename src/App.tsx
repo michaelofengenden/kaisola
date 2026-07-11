@@ -12,6 +12,7 @@ import { ProjectTabs } from './components/shell/ProjectTabs'
 import { ProjectLauncher } from './components/shell/ProjectLauncher'
 import { CommandPalette } from './components/shell/CommandPalette'
 import { SessionCards, shellDrag } from './components/shell/SessionCards'
+import { SessionSidebar } from './components/shell/SessionTabs'
 import { ProvenancePopover } from './components/Provenance'
 import { ReviewFocus } from './components/ReviewFocus'
 import { McpInstallModal } from './components/shell/McpInstallModal'
@@ -265,6 +266,7 @@ export default function App() {
   const setCanvasWidth = useKaisola((s) => s.setCanvasWidth)
   const railWidth = useKaisola((s) => s.railWidth)
   const railOpen = useKaisola((s) => s.railOpen)
+  const tabLayout = useKaisola((s) => s.tabLayout)
   const requestTerminal = useKaisola((s) => s.requestTerminal)
   const workspacePath = useKaisola((s) => s.workspacePath)
   const activeProjectId = useKaisola((s) => s.activeProjectId)
@@ -682,6 +684,7 @@ export default function App() {
 
   const studio = layoutMode === 'studio'
   const showCanvas = !studio || canvasOpen
+  const sidebarSessions = studio && tabLayout === 'sidebar'
 
   return (
     <div className="app" data-sidebar={false} data-layout={layoutMode}>
@@ -694,10 +697,12 @@ export default function App() {
       <div
         className="app-body"
         data-layout={layoutMode}
+        data-session-nav={sidebarSessions ? 'sidebar' : 'top'}
         data-rail={studio && !railOpen ? 'closed' : undefined}
         style={railWidth ? ({ '--wsrail-w': `${railWidth}px` } as CSSProperties) : undefined}
       >
-        {studio && railOpen && <WorkspaceRail />}
+        {sidebarSessions && <SessionSidebar />}
+        {studio && railOpen && !sidebarSessions && <WorkspaceRail />}
         {/* session cards on the left, the files/canvas card on the right
             (minimizable — when hidden the cards take the whole work row) */}
         <div className="work-row">
@@ -718,6 +723,7 @@ export default function App() {
             </div>
           )}
         </div>
+        {sidebarSessions && railOpen && <WorkspaceRail side="right" />}
       </div>
       {/* On desktop main windows the tool cluster lives IN the project tab
           strip (ProjectTabs) — same chrome row, no overlap with the session

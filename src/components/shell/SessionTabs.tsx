@@ -30,7 +30,7 @@ interface STab {
  * to rename, × (or middle-click) to close. The "+" session menu lives at the
  * end of the strip, Chrome's new-tab position.
  */
-export function SessionTabs() {
+export function SessionTabs({ orientation = 'horizontal' }: { orientation?: 'horizontal' | 'vertical' }) {
   const threads = useKaisola((s) => s.assistantThreads)
   const terminals = useKaisola((s) => s.terminals)
   const agentTerminals = useKaisola((s) => s.agentTerminals)
@@ -47,6 +47,7 @@ export function SessionTabs() {
   const pendingPermissions = useKaisola((s) => s.pendingPermissions)
   const dockViews = useKaisola((s) => s.dockViews)
   const dockOpen = useKaisola((s) => s.dockOpen)
+  const setTabLayout = useKaisola((s) => s.setTabLayout)
   const switchSession = useKaisola((s) => s.switchSession)
   const addDockSplit = useKaisola((s) => s.addDockSplit)
   const removeDockView = useKaisola((s) => s.removeDockView)
@@ -190,7 +191,9 @@ export function SessionTabs() {
     <div
       className="stabs"
       role="tablist"
+      aria-orientation={orientation}
       aria-label={`${projectLabel} sessions`}
+      data-orientation={orientation}
       data-project-id={activeProjectId}
       data-single={order.length === 1 || undefined}
       style={{ '--project-hue': projectHue } as CSSProperties}
@@ -272,7 +275,18 @@ export function SessionTabs() {
             )
           })}
       </div>
-      <NewSessionButton />
+      <NewSessionButton orientation={orientation} />
+      {orientation === 'horizontal' && (
+        <button
+          className="stabs-sidebar-toggle"
+          onClick={() => setTabLayout('sidebar')}
+          title="Move sessions to the left sidebar"
+          aria-label="Move sessions to the left sidebar"
+        >
+          <Icon name="PanelLeftOpen" size={12} />
+          <span>Sidebar</span>
+        </button>
+      )}
       {menu && (
         <div className="tree-menu-overlay" onMouseDown={() => setMenu(null)} onContextMenu={(e) => { e.preventDefault(); setMenu(null) }}>
           <div
@@ -353,12 +367,29 @@ export function SessionTabs() {
   )
 }
 
+/** The default session navigator: one slim, persistent rail on the left. */
+export function SessionSidebar() {
+  const setTabLayout = useKaisola((s) => s.setTabLayout)
+  return (
+    <aside className="session-sidebar" aria-label="Session sidebar">
+      <div className="session-sidebar-head">
+        <span>Sessions</span>
+        <button onClick={() => setTabLayout('bare')} title="Move sessions across the top">
+          <Icon name="PanelTop" size={13} />
+          <span>Top</span>
+        </button>
+      </div>
+      <SessionTabs orientation="vertical" />
+    </aside>
+  )
+}
+
 /**
  * The "+" session menu — agents first (the user picks WHICH one — no silent
  * default), then saved templates, the other session kinds, and the registry.
  * Its own component so the recents/template subscriptions don't storm the strip.
  */
-function NewSessionButton() {
+function NewSessionButton({ orientation }: { orientation: 'horizontal' | 'vertical' }) {
   const { menu } = useAgentRegistry()
   const requestTerminal = useKaisola((s) => s.requestTerminal)
   const openGitPanel = useKaisola((s) => s.openGitPanel)
@@ -397,6 +428,7 @@ function NewSessionButton() {
       onSelect={openSession}
       title="New session"
       align="left"
+      placement={orientation === 'vertical' ? 'bottom' : 'auto'}
     />
   )
 }

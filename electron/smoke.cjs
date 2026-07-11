@@ -188,10 +188,9 @@ app.whenReady().then(async () => {
   const rootChildren = await win.webContents.executeJavaScript(`document.getElementById('root').children.length`)
   const minimalShell = await win.webContents.executeJavaScript(`(() => ({
     noWorkflowSidebar: !document.querySelector('.sidebar') && !document.querySelector('.side-nav') && !document.querySelector('.side-section'),
-    // fresh installs open on the canvas alone (Traycer-style quiet start) —
-    // the rail is summoned with ⌘B / the strip's panel button
-    railHiddenByDefault: !document.querySelector('.wsrail'),
-    // sessions live ONLY in the tab strip — the rail is the project's files.
+    // fresh installs use the split composition: sessions left, files right.
+    splitSidebarsDefault: !!document.querySelector('.app-body[data-session-nav="sidebar"] > .session-sidebar') &&
+      !!document.querySelector('.app-body[data-session-nav="sidebar"] > .wsrail[data-side="right"]'),
     // the fresh shell is ONE session (the seed terminal; chats are opt-in)
     hasSessions: document.querySelectorAll('.stabs .stab').length >= 1,
     railFilesOnly: document.querySelectorAll('.wsrail .session-row').length === 0,
@@ -204,6 +203,50 @@ app.whenReady().then(async () => {
     // floating overlay remains only on web / pop windows)
     floatingTools: !!document.querySelector('.tabstrip-tools .btn-icon') && !document.querySelector('.float-tools'),
   }))()`)
+  win.webContents.send('app-auth:changed', {
+    ok: true,
+    configured: true,
+    serverVerified: true,
+    profile: {
+      provider: 'google',
+      id: 'smoke-user',
+      email: 'person@example.com',
+      name: 'Kaisola Tester',
+      avatarUrl: 'data:image/svg+xml,%3Csvg xmlns="http://www.w3.org/2000/svg" width="32" height="32"%3E%3Crect width="32" height="32" rx="16" fill="%2395a456"/%3E%3C/svg%3E',
+    },
+  })
+  await new Promise((r) => setTimeout(r, 100))
+  const accountUi = await win.webContents.executeJavaScript(`(async () => {
+    const avatar = document.querySelector('.tabstrip-tools .app-account-avatar')
+    avatar?.click()
+    await new Promise((resolve) => setTimeout(resolve, 60))
+    const menu = document.querySelector('.app-account-menu')
+    const result = {
+      avatar: !!avatar,
+      headshot: !!avatar?.querySelector('img'),
+      menu: !!menu && /Kaisola Tester/.test(menu.textContent || '') && /person@example.com/.test(menu.textContent || ''),
+      topRight: !!avatar && avatar.getBoundingClientRect().right > window.innerWidth - 50,
+      aligned: (() => {
+        const buttons = [...document.querySelectorAll('.tabstrip-tools > button')]
+        if (!buttons.length) return false
+        const rects = buttons.map((button) => button.getBoundingClientRect())
+        const centers = rects.map((rect) => rect.top + rect.height / 2)
+        const sameCenter = Math.max(...centers) - Math.min(...centers) <= 0.5
+        const sameHeight = rects.every((rect) => Math.abs(rect.height - 28) <= 0.5)
+        const iconsCentered = buttons.every((button) => {
+          const icon = button.querySelector('svg, img')
+          if (!icon) return true
+          const b = button.getBoundingClientRect()
+          const i = icon.getBoundingClientRect()
+          return Math.abs((b.top + b.height / 2) - (i.top + i.height / 2)) <= 0.5
+        })
+        return sameCenter && sameHeight && iconsCentered
+      })(),
+    }
+    avatar?.click()
+    return result
+  })()`)
+  console.log('ACCOUNT_UI=' + JSON.stringify(accountUi))
   // the empty-shell probe asserted the closed-by-default rail above — open it
   // now; every later section (tree, GLASS veils, drag regions) drives the rail
   await win.webContents.executeJavaScript(`(async () => {
@@ -407,7 +450,7 @@ app.whenReady().then(async () => {
 
   // 1) empty project — the minimal shell should land on the project launcher
   //    (open-a-folder empty state), not the old workflow nav.
-  const emptyOk = !!(minimalShell.noWorkflowSidebar && minimalShell.railHiddenByDefault && minimalShell.hasSessions && minimalShell.hasEmptyLauncher && minimalShell.stageFiles && minimalShell.studioDefault)
+  const emptyOk = !!(minimalShell.noWorkflowSidebar && minimalShell.splitSidebarsDefault && minimalShell.hasSessions && minimalShell.hasEmptyLauncher && minimalShell.stageFiles && minimalShell.studioDefault)
   console.log('EMPTY_MINIMAL=' + emptyOk)
 
   // 2) load the demo and confirm state still seeds correctly without exposing old views.
@@ -658,23 +701,25 @@ app.whenReady().then(async () => {
   })()`)
   console.log('ACP=' + JSON.stringify(acp))
 
-  // 7) the chat agent-switcher dropdown must open in a portal (not clipped) so
-  //    you can actually pick another chat agent — terminal-only agents stay in
-  //    the session + menu instead.
+  // 7) the + New Session menu opens in a portal (not clipped) and a pointer
+  //    anywhere outside it dismisses it immediately.
   const dd = await win.webContents.executeJavaScript(`(async () => {
-    // the fresh shell seeds no chat thread — this probe tests the thread UI
-    if (!window.__kaisola.getState().assistantThreads.length) window.__kaisola.getState().requestNewThread()
-    window.__kaisola.getState().setLayoutMode('studio')
-    window.__kaisola.getState().setDock(true, 'assistant')
-    await new Promise((r) => setTimeout(r, 200))
-    const btn = document.querySelector('.assistant-foot .drop-btn')
+    const get = () => window.__kaisola.getState()
+    const originalLayout = get().tabLayout
+    get().setTabLayout('sidebar')
+    await new Promise((r) => setTimeout(r, 100))
+    const btn = document.querySelector('.session-sidebar .stabs > .drop-btn')
     if (!btn) return { hasBtn: false }
     btn.click()
     await new Promise((r) => setTimeout(r, 150))
     const menu = document.querySelector('body > .drop-menu') || document.querySelector('.drop-menu')
     const items = document.querySelectorAll('.drop-menu .drop-item')
-    const out = { hasBtn: true, portal: !!(menu && menu.parentElement === document.body), items: items.length }
-    btn.click() // close it again — synthetic clicks never hit the click-outside handler
+    const portal = !!(menu && menu.parentElement === document.body)
+    document.querySelector('.canvas')?.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true }))
+    await new Promise((r) => setTimeout(r, 50))
+    const clickAway = !document.querySelector('.drop-menu')
+    get().setTabLayout(originalLayout)
+    const out = { hasBtn: true, newSession: /new session/i.test(btn.getAttribute('title') || ''), portal, items: items.length, clickAway }
     return out
   })()`)
   console.log('DROPDOWN=' + JSON.stringify(dd))
@@ -751,6 +796,8 @@ app.whenReady().then(async () => {
     if (!window.__kaisola.getState().assistantThreads.length) window.__kaisola.getState().requestNewThread('mock')
     const st = window.__kaisola.getState()
     st.setLayoutMode('studio')
+    st.setTabLayout('sidebar')
+    if (!st.railOpen) st.toggleRail()
     st.setDock(true, 'assistant')
     st.setAssistantThreadAgent(st.activeThreadId, 'mock')
     st.updateAssistantRuntime(st.activeThreadId, () => ({
@@ -781,8 +828,9 @@ app.whenReady().then(async () => {
       openBtn: !!card?.querySelector('button.agent-live-pill'),
       noContext: !document.querySelector('.context-ledger'),
       noMention: !document.querySelector('button[title^="Reference a paper"]'),
-      compactChrome: document.querySelectorAll('.tabstrip-tools > button').length <= 5,
-      overflow: !!document.querySelector('.tabstrip-tools > button[title="More"]'),
+      compactChrome: document.querySelectorAll('.tabstrip-tools > button').length <= 7,
+      layoutControl: !!document.querySelector('.tabstrip-tools > .shell-layout-trigger[title="Layout controls"]'),
+      settingsControl: !!document.querySelector('.tabstrip-tools > .shell-settings-trigger[aria-label="Open settings"]'),
     }
   })()`)
   console.log('ACTIVITY_UI=' + JSON.stringify(activityUi))
@@ -851,20 +899,51 @@ app.whenReady().then(async () => {
   console.log('BROKER_ACTIVITY=' + JSON.stringify(brokerActivity))
 
   // 7b-iii) ACP prose uses compact Markdown rhythm rather than preserving
-  // source blank lines on top of block margins.
+  // source blank lines on top of block margins. Local Markdown links route to
+  // the Files preview (and retain line hints) instead of leaving the app.
+  const agentLinkRoot = path.join(os.tmpdir(), 'kaisola-agent-link-smoke')
+  const agentLinkTarget = path.join(agentLinkRoot, 'linked-note.md')
+  fsx.mkdirSync(agentLinkRoot, { recursive: true })
+  fsx.writeFileSync(agentLinkTarget, Array.from({ length: 24 }, (_, i) => `line ${i + 1}`).join('\n'))
   const transcriptTypography = await win.webContents.executeJavaScript(`(async () => {
     const st = window.__kaisola.getState()
     const tid = st.activeThreadId
+    st.setWorkspace(${JSON.stringify(agentLinkRoot)})
     st.setAssistantThreadAgent(tid, 'mock')
     st.updateAssistantRuntime(tid, () => ({
       first: false,
-      turns: [{ kind: 'assistant', text: 'A concise paragraph.\\n\\n- First item\\n- Second item', at: Date.now() }],
+      turns: [
+        { kind: 'user', text: 'Inspect the linked note', at: Date.now() - 4000 },
+        { kind: 'assistant', text: ${JSON.stringify(`A concise paragraph.\n\n- First item\n- Second item\n\n[linked note](${agentLinkTarget}:17)`)}, at: Date.now() - 3000 },
+        { kind: 'user', text: 'Summarize the result', at: Date.now() - 2000 },
+        { kind: 'assistant', text: 'The note is ready to review.', at: Date.now() - 1000 },
+      ],
     }))
     st.setDockView(tid)
     await new Promise((resolve) => setTimeout(resolve, 120))
     const text = document.querySelector('.turn-assistant .turn-text')
     const stream = document.querySelector('.assistant-stream')
     const li = text?.querySelector('li')
+    const userText = document.querySelector('.turn-user .turn-text')
+    const userTurn = document.querySelector('.turn-user')
+    const agentTurn = document.querySelector('.turn-assistant')
+    const userRect = userText?.getBoundingClientRect()
+    const agentRect = text?.getBoundingClientRect()
+    const userTurnRect = userTurn?.getBoundingClientRect()
+    const agentTurnRect = agentTurn?.getBoundingClientRect()
+    const userStyle = userText ? getComputedStyle(userText) : null
+    const agentStyle = text ? getComputedStyle(text) : null
+    const roleAlignment = !!userTurnRect && !!agentTurnRect && userTurnRect.left > agentTurnRect.left && Math.abs(userTurnRect.right - agentTurnRect.right) < 2
+    const roleBackground = !!userStyle && !!agentStyle && userStyle.backgroundColor !== agentStyle.backgroundColor
+    const roleIcons = !!document.querySelector('.turn-user .turn-avatar svg') && !!document.querySelector('.turn-assistant .turn-avatar svg')
+    const differentiatedRoles = roleAlignment && roleBackground && roleIcons
+    const promptTabs = [...document.querySelectorAll('.turn-tab-prompt')]
+    promptTabs[0]?.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }))
+    await new Promise((resolve) => setTimeout(resolve, 80))
+    const localLink = text?.querySelector('a[data-local-file="true"]')
+    localLink?.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }))
+    await new Promise((resolve) => setTimeout(resolve, 240))
+    const afterLink = window.__kaisola.getState()
     const style = text ? getComputedStyle(text) : null
     return {
       rendered: !!text?.querySelector('.md p') && !!li,
@@ -872,6 +951,13 @@ app.whenReady().then(async () => {
       readableWidth: !!style?.maxWidth && style.maxWidth !== 'none' && parseFloat(style.maxWidth) <= 1100,
       compactStream: stream ? parseFloat(getComputedStyle(stream).rowGap) <= 10 : false,
       compactList: li ? parseFloat(getComputedStyle(li).marginBottom) <= 4 : false,
+      differentiatedRoles,
+      roleDebug: { roleAlignment, roleBackground, roleIcons, userLeft: userTurnRect?.left, agentLeft: agentTurnRect?.left, userBg: userStyle?.backgroundColor, agentBg: agentStyle?.backgroundColor },
+      promptTabs: promptTabs.length === 2 && promptTabs[0]?.getAttribute('data-active') === 'true',
+      promptTabsTopLeft: document.querySelector('.turn-tabs-wrap')?.nextElementSibling === stream,
+      localLink: !!localLink,
+      linkOpenedFiles: afterLink.stage === 'files' && afterLink.fileRequest?.path === ${JSON.stringify(agentLinkTarget)},
+      lineJump: afterLink.scrollRequest?.path === ${JSON.stringify(agentLinkTarget)} && afterLink.scrollRequest?.line === 17,
     }
   })()`)
   console.log('TRANSCRIPT_TYPOGRAPHY=' + JSON.stringify(transcriptTypography))
@@ -1441,12 +1527,14 @@ a^2 + b^2 = c^2
   })()`)
   console.log('FILEUI=' + JSON.stringify(fileui))
 
-  // 13) sessions live in the TAB STRIP above the cards (the rail is files
+  // 13) sessions live in the left vertical navigator (the right rail is files
   //     only); a new agent thread adds a tab there and focuses the dock pane.
   //     The dock itself carries no tab chrome; identity sits in the foot.
   const layout = await win.webContents.executeJavaScript(`(async () => {
     const st = window.__kaisola.getState()
     st.setLayoutMode('studio')
+    st.setTabLayout('sidebar')
+    if (!st.railOpen) st.toggleRail()
     st.setDock(true, 'assistant')
     await new Promise((r) => setTimeout(r, 150))
     const tabsN = () => document.querySelectorAll('.stabs .stab').length
@@ -1457,8 +1545,8 @@ a^2 + b^2 = c^2
     const after = tabsN()
     const s2 = window.__kaisola.getState()
     return {
-      sessionsInRail: before >= 2, // (strip) at least one agent thread + one terminal
-      hasRailTreeArea: !!document.querySelector('.wsrail .wsrail-files'),
+      sessionsInRail: before >= 2 && !!document.querySelector('.session-sidebar .stabs[aria-orientation="vertical"]'),
+      hasRailTreeArea: !!document.querySelector('.app-body > .wsrail[data-side="right"] .wsrail-files'),
       railHasNoSessions: document.querySelectorAll('.wsrail .session-row').length === 0,
       addsRow: after === before + 1,
       focusesNewThread: s2.dockViews.includes(s2.activeThreadId),
@@ -1583,7 +1671,7 @@ a^2 + b^2 = c^2
     get().setStage('corpus') // canvas shown
     await new Promise((r) => setTimeout(r, 120))
     const shownBefore = !!document.querySelector('.canvas-wrap')
-    const filesButton = document.querySelector('.tabstrip-tools [aria-label="Hide files"]')
+    const filesButton = document.querySelector('.tabstrip-tools [aria-label="Hide file preview"]')
     const hasBtn = !!filesButton
     filesButton?.click()
     await new Promise((r) => setTimeout(r, 120))
@@ -1707,6 +1795,37 @@ a^2 + b^2 = c^2
     }
   })()`)
   console.log('PROJTABS=' + JSON.stringify(projtabs))
+
+  // Warm project switching stays a small in-memory pointer swap: persistence
+  // shaping is postponed to browser idle time and the previous file session is
+  // restored from its small LRU rather than cold-reading every open file.
+  const projectSwitchPerf = await win.webContents.executeJavaScript(`(async () => {
+    const g = () => window.__kaisola.getState()
+    const original = g().activeProjectId
+    const hadFile = !!document.querySelector('.fx-tab[data-active="true"]')
+    const other = g().newProject({ path: null, focus: false })
+    const switchOnce = async (id) => {
+      const started = performance.now()
+      g().switchProject(id)
+      const syncMs = performance.now() - started
+      const loopStarted = performance.now()
+      await new Promise((resolve) => setTimeout(resolve, 0))
+      return { syncMs, loopMs: performance.now() - loopStarted }
+    }
+    const away = await switchOnce(other)
+    const back = await switchOnce(original)
+    await new Promise((resolve) => setTimeout(resolve, 80))
+    const warmFiles = !hadFile || !document.querySelector('.canvas .fx-loading')
+    g().closeProject(other, { force: true })
+    return {
+      syncMs: Math.max(away.syncMs, back.syncMs),
+      loopMs: Math.max(away.loopMs, back.loopMs),
+      responsive: Math.max(away.syncMs, back.syncMs) < 120 && Math.max(away.loopMs, back.loopMs) < 250,
+      warmFiles,
+      restored: g().activeProjectId === original,
+    }
+  })()`)
+  console.log('PROJECT_SWITCH_PERF=' + JSON.stringify(projectSwitchPerf))
 
   // 13e-iii) tear-off + recombine: appearance/drafts travel to the hidden new
   //           window, then the same project and PTYs merge back into the
@@ -1889,15 +2008,17 @@ a^2 + b^2 = c^2
   })()`)
   console.log('AUTONAME=' + JSON.stringify(autoname))
 
-  // 14) the old workflow sidebar is hidden for now; the workspace rail is the
-  //     only persistent side surface.
+  // 14) the old workflow sidebar is hidden; only the focused sessions/files
+  //     sidebars remain.
   const minimalUi = await win.webContents.executeJavaScript(`(async () => {
     await new Promise((r) => setTimeout(r, 120))
     return {
       noSidebar: !document.querySelector('.sidebar'),
       noSidebarResize: !document.querySelector('.sidebar-resize'),
       noStageNav: document.querySelectorAll('.side-nav-item').length === 0,
+      hasSessionSidebar: !!document.querySelector('.session-sidebar'),
       hasRail: !!document.querySelector('.wsrail'),
+      filesOnRight: !!document.querySelector('.app-body > .wsrail[data-side="right"]'),
       hasPlus: !!document.querySelector('.stabs .drop-btn'),
       hasFiles: !!document.querySelector('.wsrail-files'),
     }
@@ -1924,6 +2045,13 @@ a^2 + b^2 = c^2
       const style = shelf ? getComputedStyle(shelf) : null
       return { shelf, marker, session, style }
     }
+    get().setTabLayout('sidebar'); await wait()
+    const sidebar = inspect()
+    const sidebarOk = document.querySelectorAll('.stabs').length === 1 &&
+      !!document.querySelector('.session-sidebar > .stabs[aria-orientation="vertical"]') &&
+      !document.querySelector('.dock-col > .stabs') &&
+      !!document.querySelector('.app-body > .wsrail[data-side="right"]') && !!sidebar.session
+
     get().setTabLayout('shelf'); await wait()
     const shelf = inspect()
     const shelfOk = !!shelf.shelf && !!shelf.marker && shelf.marker.getBoundingClientRect().width >= 16 &&
@@ -1953,20 +2081,176 @@ a^2 + b^2 = c^2
       !!document.querySelector('.compact-session-slot > .stabs') && !document.querySelector('.dock-col > .stabs') &&
       !!compact.session
 
+    get().setTabLayout('bare'); await wait()
+    const toSidebar = document.querySelector('.stabs-sidebar-toggle')
+    const sidebarActionClear = /sidebar/i.test(toSidebar?.textContent || '')
+    toSidebar?.click(); await wait()
+    const verticalTabs = document.querySelector('.session-sidebar > .stabs[aria-orientation="vertical"]')
+    const verticalTrack = verticalTabs?.querySelector(':scope > .stabs-track')
+    const verticalAdd = verticalTabs?.querySelector(':scope > .drop-btn')
+    const addBelowLastTab = !!verticalTrack && verticalTrack.nextElementSibling === verticalAdd
+    verticalAdd?.click(); await wait()
+    const addMenu = document.querySelector('.drop-menu')
+    const addRect = verticalAdd?.getBoundingClientRect()
+    const menuRect = addMenu?.getBoundingClientRect()
+    const addOptionsBelow = !!addRect && !!menuRect && menuRect.top >= addRect.bottom - 1
+    verticalAdd?.click(); await wait()
+    const movedToSidebar = get().tabLayout === 'sidebar' && !!verticalTabs
+    const toTop = document.querySelector('.session-sidebar-head button')
+    const topActionClear = /top/i.test(toTop?.textContent || '')
+    toTop?.click(); await wait()
+    const movedBackTop = get().tabLayout === 'bare' && !!document.querySelector('.stabs-sidebar-toggle')
+    const reciprocalToggle = !!toSidebar && !!toTop && movedToSidebar && movedBackTop && sidebarActionClear && topActionClear
+    const verticalAddFlow = addBelowLastTab && addOptionsBelow
+
     const stateKept = get().terminals.map((t) => t.id).join('|') === termIds &&
       get().assistantThreads.map((t) => t.id).join('|') === threadIds &&
       get().assistantDrafts[active]?.text === 'layout-switch-draft'
-    const staticPaint = [shelf, bare, runway, flat, compact].every((v) => !v.style?.backdropFilter || v.style.backdropFilter === 'none')
-    const accessible = /sessions$/i.test(compact.shelf?.getAttribute('aria-label') || '')
+    const staticPaint = [sidebar, shelf, bare, runway, flat, compact].every((v) => !v.style?.backdropFilter || v.style.backdropFilter === 'none')
+    const accessible = /sessions$/i.test(compact.shelf?.getAttribute('aria-label') || '') && sidebar.shelf?.getAttribute('aria-orientation') === 'vertical'
     const sessionIdentity = !!compact.session?.style.getPropertyValue('--sid').trim()
     get().setTabLayout(original); await wait()
-    return { rendered: true, shelfOk, bareOk, runwayOk, flatOk, compactOk, stateKept, staticPaint, accessible, sessionIdentity }
+    return { rendered: true, sidebarOk, shelfOk, bareOk, runwayOk, flatOk, compactOk, reciprocalToggle, verticalAddFlow, stateKept, staticPaint, accessible, sessionIdentity }
   })()`)
   console.log('TAB_LAYOUTS=' + JSON.stringify(tabLayouts))
 
+  // 14b2) layout actions are reversible in place, and the file-tree control
+  //       follows a right-docked tree instead of living across the window.
+  const intuitiveLayoutControls = await win.webContents.executeJavaScript(`(async () => {
+    const get = () => window.__kaisola.getState()
+    const wait = () => new Promise((r) => setTimeout(r, 70))
+    const originalLayout = get().tabLayout
+    const originalRail = get().railOpen
+    get().setTabLayout('sidebar')
+    if (!get().railOpen) get().toggleRail()
+    await wait()
+    const rightToggle = document.querySelector('.tabstrip-tools .rail-toggle[data-side="right"]')
+    const tree = document.querySelector('.wsrail[data-side="right"]')
+    const localClose = tree?.querySelector('.wsrail-head button[aria-label="Hide file tree"]')
+    localClose?.click(); await wait()
+    const hidden = !document.querySelector('.wsrail') && get().railOpen === false
+    const recoverySameSide = document.querySelector('.tabstrip-tools .rail-toggle[data-side="right"]')
+    recoverySameSide?.click(); await wait()
+    const restored = !!document.querySelector('.wsrail[data-side="right"]') && get().railOpen === true
+
+    const layoutTrigger = document.querySelector('.shell-layout-trigger')
+    layoutTrigger?.click(); await wait()
+    const firstAction = () => document.querySelector('.shell-more-menu .tree-menu-item')
+    const startsAsTop = /move sessions to top/i.test(firstAction()?.textContent || '')
+    firstAction()?.click(); await wait()
+    const menuStayedOpen = !!document.querySelector('.shell-more-menu')
+    const changedToLeft = /move sessions to left/i.test(firstAction()?.textContent || '') && get().tabLayout !== 'sidebar'
+    firstAction()?.click(); await wait()
+    const reversedInPlace = get().tabLayout === 'sidebar' && /move sessions to top/i.test(firstAction()?.textContent || '')
+    const layoutOnly = !/extensions|settings/i.test(document.querySelector('.shell-more-menu')?.textContent || '')
+    layoutTrigger?.click(); await wait()
+
+    get().setTabLayout(originalLayout)
+    if (get().railOpen !== originalRail) get().toggleRail()
+    await wait()
+    return {
+      rightToggle: !!rightToggle,
+      localClose: !!localClose,
+      hidden,
+      recoverySameSide: !!recoverySameSide,
+      restored,
+      layoutNamed: /layout/i.test(layoutTrigger?.textContent || ''),
+      startsAsTop,
+      menuStayedOpen,
+      changedToLeft,
+      reversedInPlace,
+      layoutOnly,
+      previewDistinct: !!document.querySelector('.file-preview-toggle[aria-label*="file preview"]'),
+    }
+  })()`)
+  console.log('INTUITIVE_LAYOUT_CONTROLS=' + JSON.stringify(intuitiveLayoutControls))
+
+  // A DOM element.click() bypasses Chromium's frameless-window hit regions.
+  // Exercise the SAME inverse action with real pointer input so a menu that is
+  // visible but covered by a stale drag region cannot pass this test.
+  const pointerSetup = await win.webContents.executeJavaScript(`(async () => {
+    const get = () => window.__kaisola.getState()
+    const original = get().tabLayout
+    get().setTabLayout('sidebar')
+    await new Promise((r) => setTimeout(r, 70))
+    document.querySelector('.shell-layout-trigger')?.click()
+    await new Promise((r) => setTimeout(r, 70))
+    const action = document.querySelector('.shell-more-menu .tree-menu-item')
+    const rect = action?.getBoundingClientRect()
+    return { original, rect: rect ? { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 } : null }
+  })()`)
+  const realPointerLayout = { firstWorked: false, reverseWorked: false, stayedInteractive: false }
+  const pointerClick = async (point) => {
+    win.webContents.sendInputEvent({ type: 'mouseDown', x: Math.round(point.x), y: Math.round(point.y), button: 'left', clickCount: 1 })
+    win.webContents.sendInputEvent({ type: 'mouseUp', x: Math.round(point.x), y: Math.round(point.y), button: 'left', clickCount: 1 })
+    await new Promise((resolve) => setTimeout(resolve, 100))
+  }
+  if (pointerSetup.rect) {
+    await pointerClick(pointerSetup.rect)
+    const afterFirst = await win.webContents.executeJavaScript(`(() => {
+      const action = document.querySelector('.shell-more-menu .tree-menu-item')
+      const rect = action?.getBoundingClientRect()
+      return {
+        worked: window.__kaisola.getState().tabLayout !== 'sidebar' && /move sessions to left/i.test(action?.textContent || ''),
+        menu: !!document.querySelector('.shell-more-menu'),
+        rect: rect ? { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 } : null,
+      }
+    })()`)
+    realPointerLayout.firstWorked = afterFirst.worked
+    realPointerLayout.stayedInteractive = afterFirst.menu
+    if (afterFirst.rect) {
+      await pointerClick(afterFirst.rect)
+      realPointerLayout.reverseWorked = await win.webContents.executeJavaScript(`window.__kaisola.getState().tabLayout === 'sidebar'`)
+    }
+  }
+  await win.webContents.executeJavaScript(`(async () => {
+    window.__kaisola.getState().setTabLayout(${JSON.stringify(pointerSetup.original)})
+    document.querySelector('.shell-layout-trigger[data-active="true"]')?.click()
+    await new Promise((r) => setTimeout(r, 50))
+  })()`)
+  console.log('REAL_POINTER_LAYOUT=' + JSON.stringify(realPointerLayout))
+
+  // 14c) a narrow agent card wraps its composer and identity controls instead
+  //      of clipping the model picker or send/connection actions.
+  const narrowAgentUi = await win.webContents.executeJavaScript(`(async () => {
+    const assistant = document.querySelector('.assistant')
+    const card = assistant?.closest('.session-card')
+    if (!assistant || !card) return { rendered: false }
+    const originalStyle = card.getAttribute('style') || ''
+    card.style.width = '340px'
+    card.style.maxWidth = '340px'
+    card.style.justifySelf = 'start'
+    await new Promise((r) => setTimeout(r, 80))
+    const composer = assistant.querySelector('.composer')
+    const bar = assistant.querySelector('.composer-bar')
+    const send = assistant.querySelector('.composer-send')
+    const foot = assistant.querySelector('.assistant-foot')
+    const conn = assistant.querySelector('.foot-conn')
+    const within = (child, parent) => {
+      if (!child || !parent) return false
+      const c = child.getBoundingClientRect()
+      const p = parent.getBoundingClientRect()
+      return c.left >= p.left - 1 && c.right <= p.right + 1
+    }
+    const result = {
+      rendered: true,
+      narrow: assistant.getBoundingClientRect().width <= 342,
+      containerAware: getComputedStyle(assistant).containerType === 'inline-size',
+      composerFits: !!bar && bar.scrollWidth <= bar.clientWidth + 1,
+      sendVisible: within(send, composer),
+      footerFits: !!foot && foot.scrollWidth <= foot.clientWidth + 1 && within(conn, foot),
+      wraps: !!bar && getComputedStyle(bar).flexWrap === 'wrap',
+    }
+    card.setAttribute('style', originalStyle)
+    await new Promise((r) => setTimeout(r, 45))
+    return result
+  })()`)
+  console.log('NARROW_AGENT_UI=' + JSON.stringify(narrowAgentUi))
+
   // 15) settings exposes the appearance/layout configuration
   const settings = await win.webContents.executeJavaScript(`(async () => {
-    window.__kaisola.getState().setSettingsOpen(true)
+    const settingsButton = document.querySelector('.tabstrip-tools .shell-settings-trigger[aria-label="Open settings"]')
+    settingsButton?.click()
     await new Promise((r) => setTimeout(r, 150))
     // Zed-style settings: a nav of categories, one pane at a time
     const navNames = [...document.querySelectorAll('.settings-nav-item')].map((e) => e.textContent || '')
@@ -1982,8 +2266,11 @@ a^2 + b^2 = c^2
     const interfaceNav = [...document.querySelectorAll('.settings-nav-item')].find((e) => /Interface/.test(e.textContent || ''))
     interfaceNav?.click()
     await new Promise((r) => setTimeout(r, 50))
-    const hasTabLayout = /Tab layout/.test(document.querySelector('.settings-pane')?.textContent || '') &&
-      /Bare hierarchy/.test(document.querySelector('.settings-pane')?.textContent || '')
+    const hasTabLayout = /Session navigation/.test(document.querySelector('.settings-pane')?.textContent || '')
+    const extensionsNav = [...document.querySelectorAll('.settings-nav-item')].find((e) => /Extensions/.test(e.textContent || ''))
+    extensionsNav?.click()
+    await new Promise((r) => setTimeout(r, 40))
+    const extensionsInSettings = /Open Extensions/.test(document.querySelector('.settings-pane')?.textContent || '')
     const generalNav = [...document.querySelectorAll('.settings-nav-item')].find((e) => /General/.test(e.textContent || ''))
     generalNav?.click()
     await new Promise((r) => setTimeout(r, 30))
@@ -1992,20 +2279,20 @@ a^2 + b^2 = c^2
     dropdown?.click()
     await new Promise((r) => setTimeout(r, 50))
     const previewOpened = !!document.querySelector('.drop-menu')
-    document.querySelector('.settings-pane-head')?.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }))
+    document.querySelector('.settings-pane-head')?.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true }))
     await new Promise((r) => setTimeout(r, 50))
     const previewDismissed = !document.querySelector('.drop-menu')
     window.__kaisola.getState().setSettingsOpen(false)
     await new Promise((r) => setTimeout(r, 30))
     const usageButton = document.querySelector('[aria-label="Open Claude and Codex usage"]')
-    const filesButton = document.querySelector('[aria-label="Hide files"],[aria-label="Show files"]')
+    const filesButton = document.querySelector('[aria-label="Hide file preview"],[aria-label="Show file preview"]')
     usageButton?.click()
     await new Promise((r) => setTimeout(r, 30))
     const usagePreviewOpened = !!document.querySelector('.limits-panel')
     document.querySelector('.canvas')?.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true }))
     await new Promise((r) => setTimeout(r, 30))
     const usagePreviewDismissed = !document.querySelector('.limits-panel')
-    return { hasAppearance, hasUsage, hasDiskResidency, hasTabLayout, hasFilesButton: !!filesButton, noSidebarControls: !hasSidebarControls, previewOpened, previewDismissed, usagePreviewOpened, usagePreviewDismissed }
+    return { settingsSeparate: !!settingsButton, hasAppearance, hasUsage, hasDiskResidency, hasTabLayout, extensionsInSettings, hasFilesButton: !!filesButton, noSidebarControls: !hasSidebarControls, previewOpened, previewDismissed, usagePreviewOpened, usagePreviewDismissed }
   })()`)
   console.log('SETTINGS=' + JSON.stringify(settings))
 
@@ -2462,11 +2749,10 @@ a^2 + b^2 = c^2
     if (nav) nav.click()
     await new Promise((r) => setTimeout(r, 80))
     const body = (document.querySelector('.settings-pane') || {}).textContent || ''
-    // Zed-style settings: nine focused categories, exactly one active, no
-    // accordion folds left.
-    // exactly one active, no folds left
+    // Zed-style settings: ten focused categories (including Extensions),
+    // exactly one active, no accordion folds left.
     const tabsOk = document.querySelectorAll('.settings-fold').length === 0 &&
-      document.querySelectorAll('.settings-nav-item').length === 9 &&
+      document.querySelectorAll('.settings-nav-item').length === 10 &&
       document.querySelectorAll('.settings-nav-item[data-active="true"]').length === 1
     g().setSettingsOpen(false)
     g().setReasoningProvider('openai')
@@ -3203,7 +3489,7 @@ a^2 + b^2 = c^2
   const failed =
     !manualCodex.upgraded || !manualCodex.exact || !manualCodex.draftKept || !manualCodex.downgraded ||
     !manualClaude.upgraded || !manualClaude.draftKept || !manualClaude.toolKept || !manualClaude.downgraded ||
-    !rootChildren || !minimalShell.noWorkflowSidebar || !minimalShell.railHiddenByDefault || !minimalShell.hasSessions || !minimalShell.railFilesOnly || !minimalShell.hasEmptyLauncher || !minimalShell.stageFiles || !minimalShell.studioDefault || !minimalShell.floatingTools || !claudePrepared || !nativeWindow.rendererClippedMaterial || !icon.exists || !icon.usable || !icon.square || !icon.large || !glass.appSamplingLayer || !glass.chromeGlass || !glass.activeTintWhite || !glass.railLayerFlattened || !glass.contentGlassy || !glass.sessionGlassy || !glass.termGlassTint || !glass.blurKeepsGlass || !glass.lightsGray || !glass.nativeWindowRounding ||
+    !rootChildren || !minimalShell.noWorkflowSidebar || !minimalShell.splitSidebarsDefault || !minimalShell.hasSessions || !minimalShell.railFilesOnly || !minimalShell.hasEmptyLauncher || !minimalShell.stageFiles || !minimalShell.studioDefault || !minimalShell.floatingTools || !accountUi.avatar || !accountUi.headshot || !accountUi.menu || !accountUi.topRight || !accountUi.aligned || !claudePrepared || !nativeWindow.rendererClippedMaterial || !icon.exists || !icon.usable || !icon.square || !icon.large || !glass.appSamplingLayer || !glass.chromeGlass || !glass.activeTintWhite || !glass.railLayerFlattened || !glass.contentGlassy || !glass.sessionGlassy || !glass.termGlassTint || !glass.blurKeepsGlass || !glass.lightsGray || !glass.nativeWindowRounding ||
     !emptyOk || !demoOk ||
     !review.opened || !review.closed || !review.decided ||
     !term.run || !term.ptyOk || !term.cdWorks || !term.dock || !term.host || !term.lightComposerPalette ||
@@ -3215,13 +3501,13 @@ a^2 + b^2 = c^2
     acp.authCount < 1 || !acp.authOk || !acp.authUrlSeen || !acp.setModelOk || acp.modelAfter !== 'mock-mini' ||
     acp.reasoningAfter !== 'low' || !acp.gotThought || acp.tools < 1 ||
     // chat agents = presets minus terminal-only ones (Claude runs as a terminal)
-    !dd.hasBtn || !dd.portal || dd.items < 2 ||
+    !dd.hasBtn || !dd.newSession || !dd.portal || dd.items < 2 || !dd.clickAway ||
     !permrules.saved || !permrules.cascaded || !permrules.autoAnswered || !permrules.rejectCascade ||
     !sensitive.surfaced || !sensitive.stillPending || !sensitive.diffFlagged || sensitive.pendingAfter !== 0 ||
-    !activityUi.card || !activityUi.hasSubagent || !activityUi.hasTerminal || !activityUi.hasStatus || !activityUi.standardizedDot || !activityUi.openBtn || !activityUi.noContext || !activityUi.noMention || !activityUi.compactChrome || !activityUi.overflow ||
+    !activityUi.card || !activityUi.hasSubagent || !activityUi.hasTerminal || !activityUi.hasStatus || !activityUi.standardizedDot || !activityUi.openBtn || !activityUi.noContext || !activityUi.noMention || !activityUi.compactChrome || !activityUi.layoutControl || !activityUi.settingsControl ||
     !attentionUi.running || !attentionUi.pulse || !attentionUi.completed || !attentionUi.still || !attentionUi.cleared || !attentionUi.nativeAttention ||
     !brokerActivity.created || !brokerActivity.began || !brokerActivity.detached || !brokerActivity.settled || !brokerActivity.durable ||
-    !transcriptTypography.rendered || !transcriptTypography.normalWhitespace || !transcriptTypography.readableWidth || !transcriptTypography.compactStream || !transcriptTypography.compactList ||
+    !transcriptTypography.rendered || !transcriptTypography.normalWhitespace || !transcriptTypography.readableWidth || !transcriptTypography.compactStream || !transcriptTypography.compactList || !transcriptTypography.differentiatedRoles || !transcriptTypography.promptTabs || !transcriptTypography.promptTabsTopLeft || !transcriptTypography.localLink || !transcriptTypography.linkOpenedFiles || !transcriptTypography.lineJump ||
     !promptQueue.started || !promptQueue.queuedTwo || !promptQueue.compactCapsule || !promptQueue.queuePopover || !promptQueue.drained || !promptQueue.combinedOnce || !promptQueue.deliveredTogether || !promptQueue.newestSpeedWon ||
     !steer.started || !steer.neverQueued || !steer.steeredWhileBusy || !steer.twoUserTurns || !steer.followDelivered || !steer.baseDelivered || !steer.endedIdle ||
     !persist.stored || !persist.hasTheme || !persist.hasAgent || !persist.hasThread || !persist.hasChatTurn || !persist.hasDraft || !persist.draftBounded || !persist.hasCodexEffort || !persist.hasTabLayout ||
@@ -3251,13 +3537,17 @@ a^2 + b^2 = c^2
     !projtabs.backToFirst || !projtabs.firstRestored || !projtabs.parkedSecondOk ||
     !projtabs.domTwoTabs || !projtabs.domActiveOne ||
     !projtabs.closedGone || !projtabs.stackHas || !projtabs.reopened || !projtabs.reopenedTermsOk || !projtabs.reopenedGridOk || !projtabs.backToSingle || !projtabs.adaptiveSingle ||
+    !projectSwitchPerf.responsive || !projectSwitchPerf.warmFiles || !projectSwitchPerf.restored ||
     !windetach.spawned || !windetach.adopted || !windetach.termsMoved || !windetach.globalsMoved || !windetach.styleApplied || !windetach.draftMoved || !windetach.srcDropped ||
     !windetach.recombined || !windetach.insertedAtDrop || !windetach.termsSame || !windetach.pidsSame || !windetach.sourceClosed || !windetach.targetReused || !windetach.windowCountRestored ||
     !toggle.hasFig || !toggle.visibleAtRest || !toggle.putAway || !toggle.back || !toggle.hidesAll ||
     !autoname.named || !autoname.rowShows || !autoname.sticky || !autoname.manualWins || !autoname.termNamed ||
-    !minimalUi.noSidebar || !minimalUi.noSidebarResize || !minimalUi.noStageNav || !minimalUi.hasRail || !minimalUi.hasPlus || !minimalUi.hasFiles ||
-    !tabLayouts.rendered || !tabLayouts.shelfOk || !tabLayouts.bareOk || !tabLayouts.runwayOk || !tabLayouts.flatOk || !tabLayouts.compactOk || !tabLayouts.stateKept || !tabLayouts.staticPaint || !tabLayouts.accessible || !tabLayouts.sessionIdentity ||
-    !settings.hasAppearance || !settings.hasUsage || !settings.hasDiskResidency || !settings.hasTabLayout || !settings.hasFilesButton || !settings.noSidebarControls || !settings.previewOpened || !settings.previewDismissed || !settings.usagePreviewOpened || !settings.usagePreviewDismissed ||
+    !minimalUi.noSidebar || !minimalUi.noSidebarResize || !minimalUi.noStageNav || !minimalUi.hasSessionSidebar || !minimalUi.hasRail || !minimalUi.filesOnRight || !minimalUi.hasPlus || !minimalUi.hasFiles ||
+    !tabLayouts.rendered || !tabLayouts.sidebarOk || !tabLayouts.shelfOk || !tabLayouts.bareOk || !tabLayouts.runwayOk || !tabLayouts.flatOk || !tabLayouts.compactOk || !tabLayouts.reciprocalToggle || !tabLayouts.verticalAddFlow || !tabLayouts.stateKept || !tabLayouts.staticPaint || !tabLayouts.accessible || !tabLayouts.sessionIdentity ||
+    !intuitiveLayoutControls.rightToggle || !intuitiveLayoutControls.localClose || !intuitiveLayoutControls.hidden || !intuitiveLayoutControls.recoverySameSide || !intuitiveLayoutControls.restored || !intuitiveLayoutControls.layoutNamed || !intuitiveLayoutControls.startsAsTop || !intuitiveLayoutControls.menuStayedOpen || !intuitiveLayoutControls.changedToLeft || !intuitiveLayoutControls.reversedInPlace || !intuitiveLayoutControls.layoutOnly || !intuitiveLayoutControls.previewDistinct ||
+    !realPointerLayout.firstWorked || !realPointerLayout.reverseWorked || !realPointerLayout.stayedInteractive ||
+    !narrowAgentUi.rendered || !narrowAgentUi.narrow || !narrowAgentUi.containerAware || !narrowAgentUi.composerFits || !narrowAgentUi.sendVisible || !narrowAgentUi.footerFits || !narrowAgentUi.wraps ||
+    !settings.settingsSeparate || !settings.hasAppearance || !settings.hasUsage || !settings.hasDiskResidency || !settings.hasTabLayout || !settings.extensionsInSettings || !settings.hasFilesButton || !settings.noSidebarControls || !settings.previewOpened || !settings.previewDismissed || !settings.usagePreviewOpened || !settings.usagePreviewDismissed ||
     !extensionsUi.opened || extensionsUi.cards < 8 || !extensionsUi.hasFilters || !extensionsUi.csvInstalled || !extensionsUi.jsonInstalled ||
     !extensionsUi.persisted || !extensionsUi.defaultUninstallPersisted || !extensionsUi.csvPreview || !extensionsUi.jsonPreview || !extensionsUi.boundedJsonPreview || !extensionsUi.closed ||
     !devExtensionHotReload.registered || !devExtensionHotReload.updated || !devExtensionHotReload.visible ||

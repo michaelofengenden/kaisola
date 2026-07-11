@@ -1,0 +1,12 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // Kaisola is server-mediated. The Cloud Function uses the Admin SDK,
+    // which does not depend on client rules; desktop/web clients get no direct
+    // database access even when they hold a valid Firebase ID token.
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}

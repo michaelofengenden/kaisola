@@ -60,7 +60,7 @@ export type LayoutMode = 'focus' | 'studio'
 /** Appearance energy: native live glass or the opaque, still Eco shell. */
 export type PerfMode = 'glass' | 'eco'
 /** Project/session hierarchy treatment. Applied live per app window. */
-export type TabLayout = 'shelf' | 'bare' | 'runway' | 'flat' | 'compact'
+export type TabLayout = 'sidebar' | 'shelf' | 'bare' | 'runway' | 'flat' | 'compact'
 export type PaletteMode = 'commands' | 'files'
 
 /** A working-tree checkpoint — a real (hidden-ref) git commit of everything. */
@@ -1370,24 +1370,30 @@ const systemTheme = (): Theme =>
 // JSON.stringify of the whole store were a per-update main-thread tax — at
 // stream time that's per token. partialize is now IDENTITY (free); setItem
 // parks the latest raw-state REFERENCE (free — state objects are immutable)
-// and the slice walk + stringify + write run at most once per PERSIST_MS;
-// pagehide flushes synchronously so quitting never loses state. The blob
-// format on disk is unchanged ({ state, version }).
+// and the slice walk + stringify + write run at most once per PERSIST_MS, in a
+// browser idle window. Project navigation explicitly postpones a queued flush
+// so a large all-project snapshot can never compete with a tab switch for the
+// renderer thread. pagehide still flushes synchronously, so quitting loses no
+// state. The blob format on disk is unchanged ({ state, version }).
 const PERSIST_MS = 800
 let lastPersist: { name: string; value: string } | null = null
 let pendingPersist: { name: string; value: unknown } | null = null
 let persistTimer: number | null = null
+let persistIdle: number | null = null
 /** Shape the parked { state, version } envelope for disk: the raw live state
  * becomes the pruned/capped persist blob. Runs once per flush, not per set. */
 const shapePersist = (value: unknown) => {
   const v = value as { state: KaisolaState; version?: number }
   return { ...v, state: persistSnapshot(v.state) }
 }
+const cancelPersistSchedule = () => {
+  if (persistTimer != null) window.clearTimeout(persistTimer)
+  if (persistIdle != null) window.cancelIdleCallback(persistIdle)
+  persistTimer = null
+  persistIdle = null
+}
 const flushPersist = () => {
-  if (persistTimer != null) {
-    window.clearTimeout(persistTimer)
-    persistTimer = null
-  }
+  cancelPersistSchedule()
   if (!pendingPersist) return
   const { name, value } = pendingPersist
   pendingPersist = null
@@ -1396,13 +1402,26 @@ const flushPersist = () => {
   if (isDesktop) void bridge.db.set(name, json).catch(() => {})
   else localStorage.setItem(name, json)
 }
+const schedulePersist = () => {
+  if (persistTimer != null || persistIdle != null) return
+  persistTimer = window.setTimeout(() => {
+    persistTimer = null
+    persistIdle = window.requestIdleCallback(() => {
+      persistIdle = null
+      flushPersist()
+    }, { timeout: 4000 })
+  }, PERSIST_MS)
+}
+/** A click should paint before persistence does any all-project shaping. */
+const postponePersistForNavigation = () => {
+  if (persistTimer == null && persistIdle == null) return
+  cancelPersistSchedule()
+  if (pendingPersist) schedulePersist()
+}
 /** Durability barrier for ownership transfers and pagehide. The destination
  * must have the project on disk before it ACKs and lets the source delete it. */
 const flushPersistSync = () => {
-  if (persistTimer != null) {
-    window.clearTimeout(persistTimer)
-    persistTimer = null
-  }
+  cancelPersistSchedule()
   if (!pendingPersist) return
   const { name, value } = pendingPersist
   pendingPersist = null
@@ -1431,7 +1450,7 @@ const kaisolaStorage = {
   setItem: (name: string, value: unknown): void => {
     if (POP_TERMINAL_ID) return // pop windows are read-only viewers of the store
     pendingPersist = { name, value }
-    if (persistTimer == null) persistTimer = window.setTimeout(flushPersist, PERSIST_MS)
+    schedulePersist()
   },
   removeItem: (name: string): void => {
     if (POP_TERMINAL_ID) return
@@ -1444,10 +1463,7 @@ const kaisolaStorage = {
 /** A one-project tear-off that was recombined is about to close. Remove its
  * now-empty slot without pagehide resurrecting the stale adopted project. */
 const discardCurrentWindowStore = async () => {
-  if (persistTimer != null) {
-    window.clearTimeout(persistTimer)
-    persistTimer = null
-  }
+  cancelPersistSchedule()
   pendingPersist = null
   lastPersist = null
   const keys = [STORE_KEY, ...LEGACY_STORE_KEYS(STORE_KEY)]
@@ -2126,13 +2142,15 @@ export const useKaisola = create<KaisolaState>()(
   // click away; removed painted-glass installs migrate to Eco losslessly.
   perfMode: 'eco' as PerfMode,
   // Hierarchy by scale and spacing only: no arrow, shelf, or colored underline.
-  tabLayout: 'bare' as TabLayout,
+  // Sessions are primary navigation: keep them in a quiet left rail while
+  // the file tree mirrors them on the right. Horizontal treatments remain a
+  // live user choice in Settings and the shell overflow.
+  tabLayout: 'sidebar' as TabLayout,
   onboardingVersion: 0,
   railWidth: null,
-  // Traycer-style quiet start: fresh installs open on the canvas alone; ⌘B
-  // (or the strip's panel button) summons the rail. Existing installs keep
-  // their persisted choice.
-  railOpen: false,
+  // The default sidebar composition is intentionally visible: sessions left,
+  // files right. ⌘B can still put the file tree away independently.
+  railOpen: true,
   claudeSessions: {},
   claudeAccounts: [],
   claudeAccountId: '',
@@ -3320,7 +3338,7 @@ export const useKaisola = create<KaisolaState>()(
     void bridge.windowMode({ solidWindow: mode !== 'glass', ...(/^#[0-9a-fA-F]{6}$/.test(bg) ? { solidBg: bg } : {}) }).catch(() => {})
   },
   setTabLayout: (layout) => {
-    const value: TabLayout = ['shelf', 'bare', 'runway', 'flat', 'compact'].includes(layout) ? layout : 'bare'
+    const value: TabLayout = ['sidebar', 'shelf', 'bare', 'runway', 'flat', 'compact'].includes(layout) ? layout : 'sidebar'
     document.documentElement.dataset.tabLayout = value
     set({ tabLayout: value })
   },
@@ -4682,12 +4700,16 @@ export const useKaisola = create<KaisolaState>()(
     if (existing) s.switchProject(existing.id) // Chrome focus-existing
     else s.newProject({ path })
   },
-  switchProject: (targetId) =>
+  switchProject: (targetId) => {
+    postponePersistForNavigation()
     set((s) => {
       if (targetId === s.activeProjectId || !s.projectTabs.some((t) => t.id === targetId)) return s
       const outgoing = pick(s, PROJECT_SLICE_MEMORY_KEYS)
       const { [targetId]: incoming, ...restBg } = s.projectSlices
-      const target = incoming ? { ...freshSlice(targetId), ...incoming } : freshSlice(targetId)
+      // Live and rehydrated slices are already complete. Rebuilding a full
+      // fresh slice (including an empty research project) on every click was
+      // pure allocation and GC pressure in the hottest navigation path.
+      const target = incoming ?? freshSlice(targetId)
       return {
         activeProjectId: targetId,
         projectSlices: { ...restBg, [s.activeProjectId]: outgoing },
@@ -4695,7 +4717,8 @@ export const useKaisola = create<KaisolaState>()(
         ...target, // hoist the target's memory slice → live flat fields
         ...resetEphemeralCursors(), // bucket F defaults; bucket E left alone
       }
-    }),
+    })
+  },
   cycleProject: (dir) => {
     const s = get()
     const ids = s.projectTabs.map((t) => t.id)
@@ -4991,7 +5014,9 @@ export const useKaisola = create<KaisolaState>()(
       // them complete; only a store that never existed starts at zero.
       // v10: layout is project-scoped, so Studio/Focus never leaks to every
       // project tab and session/canvas visibility stays internally coherent.
-      version: 10,
+      // v11: the former default bare row becomes the split-sidebar default;
+      // explicitly selected shelf/runway/flat/compact layouts are preserved.
+      version: 11,
       migrate: (persisted, version) => {
         const toV7 = (p: unknown) => {
           const rec = p as Record<string, unknown>
@@ -5026,11 +5051,20 @@ export const useKaisola = create<KaisolaState>()(
           delete rec.layoutMode
           return p
         }
-        if (version >= 10) return persisted
-        if (version === 9) return toV10(persisted)
-        if (version === 8) return toV10(toV9(persisted))
-        if (version === 7) return toV10(toV9(toV8(persisted)))
-        if (version === 6) return toV10(toV9(toV8(toV7(persisted))))
+        const toV11 = (p: unknown) => {
+          const rec = p as Record<string, unknown>
+          if (rec && typeof rec === 'object' && (!rec.tabLayout || rec.tabLayout === 'bare')) {
+            rec.tabLayout = 'sidebar'
+            rec.railOpen = true
+          }
+          return p
+        }
+        if (version >= 11) return persisted
+        if (version === 10) return toV11(persisted)
+        if (version === 9) return toV11(toV10(persisted))
+        if (version === 8) return toV11(toV10(toV9(persisted)))
+        if (version === 7) return toV11(toV10(toV9(toV8(persisted))))
+        if (version === 6) return toV11(toV10(toV9(toV8(toV7(persisted)))))
         const flat = migrateFlatV5(persisted)
         const pid = uid('proj')
         const ws = flat.workspacePath ?? null
@@ -5043,7 +5077,7 @@ export const useKaisola = create<KaisolaState>()(
           const v = (flat as Record<string, unknown>)[k]
           if (v !== undefined) (base as Record<string, unknown>)[k] = v
         }
-        return toV10(toV9(toV8(toV7({
+        return toV11(toV10(toV9(toV8(toV7({
           ...pickGlobals(flat as Record<string, unknown>),
           // pickGlobals no longer knows ecoMode — hand it to toV7 explicitly
           ecoMode: (flat as Record<string, unknown>).ecoMode,
@@ -5051,7 +5085,7 @@ export const useKaisola = create<KaisolaState>()(
           activeProjectId: pid,
           projectSlices: { [pid]: sanitizeSliceForPersist(base) },
           recentProjects: ws ? [{ path: ws, name, at: Date.now() }] : [],
-        }))))
+        })))))
       },
       // split the persisted blob back apart SYNCHRONOUSLY (getItem is sync → no
       // rehydration flash). Spread `current` FIRST so action fns are never
@@ -5072,7 +5106,7 @@ export const useKaisola = create<KaisolaState>()(
           ...cur, // defaults + ACTION FUNCTIONS (must be first)
           ...pickGlobals(p), // bucket B + C
           perfMode: p.perfMode === 'glass' ? 'glass' : 'eco',
-          tabLayout: ['shelf', 'bare', 'runway', 'flat', 'compact'].includes(p.tabLayout) ? p.tabLayout : 'bare',
+          tabLayout: ['sidebar', 'shelf', 'bare', 'runway', 'flat', 'compact'].includes(p.tabLayout) ? p.tabLayout : 'sidebar',
           // pre-themeMode blobs carried only an explicit theme — honor it rather
           // than silently flipping existing users to system-following
           themeMode: (p as { themeMode?: ThemeMode }).themeMode ?? (p as { theme?: Theme }).theme ?? 'system',

@@ -226,6 +226,7 @@
   display: flex;
   flex-direction: column;
   min-height: 0;
+  container-type: inline-size;
 }
 /* inline rename input for a sidebar session row (double-click it) */
 .thread-rename {
@@ -284,7 +285,7 @@
 .acp-dot.off {
   background: var(--text-3);
 }
-/* ── turn timeline: a tick per prompt, hover = card, click = jump ────────── */
+/* ── prompt history: explicit tabs, hover = summary, click = jump ───────── */
 .assistant { position: relative; }
 /* an OS file drag over the chat: the drop lands as attachment chips */
 .assistant[data-file-drop]::after {
@@ -296,45 +297,101 @@
   pointer-events: none;
   z-index: 3;
 }
-.assistant[data-rail] .assistant-stream { padding-left: 24px; }
 .term-wrap[data-rail] .term-host { padding-left: 22px; }
-.turn-rail {
-  position: absolute;
-  left: 5px;
-  top: 14px;
+.turn-tabs-wrap {
+  position: relative;
   z-index: 7;
   display: flex;
-  flex-direction: column;
-  gap: 6px;
+  align-items: center;
+  min-height: 36px;
+  padding: 5px clamp(var(--sp-4), 1.5vw, var(--sp-6));
+  gap: var(--sp-3);
+  flex-shrink: 0;
+  border-bottom: 1px solid var(--border-faint);
+  background: color-mix(in srgb, var(--bg-1) 86%, transparent);
   -webkit-app-region: no-drag;
 }
-.turn-tick {
-  width: 13px;
-  height: 3px;
-  padding: 0;
+.turn-tabs-title {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  flex-shrink: 0;
+  color: var(--text-3);
+  font-size: var(--fs-10);
+  font-weight: var(--fw-semibold);
+  letter-spacing: .02em;
+}
+.turn-tabs {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  min-width: 0;
+  overflow-x: auto;
+  scrollbar-width: none;
+}
+.turn-tabs::-webkit-scrollbar { display: none; }
+.turn-tab {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  min-width: 0;
+  max-width: 174px;
+  height: 25px;
+  padding: 0 8px 0 6px;
+  flex: 0 0 auto;
+  border: 1px solid var(--border-faint);
   border-radius: var(--r-full);
-  background: color-mix(in srgb, var(--text-3) 40%, transparent);
+  background: color-mix(in srgb, var(--bg-2) 72%, transparent);
+  color: var(--text-2);
+  font-size: var(--fs-10);
   cursor: pointer;
-  transition: background var(--dur-1) var(--ease-out), width var(--dur-1) var(--ease-out);
+  transition: background var(--dur-1) var(--ease-out), border-color var(--dur-1) var(--ease-out), color var(--dur-1) var(--ease-out);
 }
-.turn-tick:hover {
-  width: 17px;
-  background: var(--text-1);
+.turn-tab:hover {
+  color: var(--text-0);
+  border-color: var(--border);
+  background: var(--bg-3);
 }
-.turn-tick[data-active='true'] {
-  width: 17px;
-  background: var(--text-0);
+.turn-tab[data-active='true'] {
+  color: var(--text-0);
+  border-color: color-mix(in srgb, var(--accent) 32%, var(--border));
+  background: color-mix(in srgb, var(--accent) 8%, var(--bg-2));
+}
+.turn-tab:disabled { opacity: .55; cursor: default; }
+.turn-tab-index {
+  display: grid;
+  place-items: center;
+  width: 15px;
+  height: 15px;
+  flex-shrink: 0;
+  border-radius: var(--r-full);
+  background: var(--bg-4);
+  color: var(--text-2);
+  font-family: var(--font-mono);
+  font-size: 9px;
+}
+.turn-tab[data-active='true'] .turn-tab-index {
+  background: var(--accent);
+  color: var(--bg-0);
+}
+.turn-tab-text {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.turn-tab-history {
+  color: var(--text-3);
 }
 .turn-pop {
   position: absolute;
-  left: 24px;
+  top: 33px;
   width: 300px;
   padding: var(--sp-4) var(--sp-5);
   background: var(--bg-2);
   border: 1px solid var(--border);
   border-radius: var(--r-3);
   box-shadow: var(--shadow-pop);
-  pointer-events: none;
+  pointer-events: auto;
   z-index: 8;
 }
 .turn-pop-title {
@@ -1001,6 +1058,81 @@ details.assistant-tool.tool-artifacts > summary::-webkit-details-marker { displa
 }
 .composer-send:hover { background: var(--accent-hover); }
 .composer-send:disabled { background: var(--bg-4); color: var(--text-3); }
+
+/* A split can make an agent card much narrower than the window. Respond to the
+   card itself (not the viewport): controls wrap into calm rows and the send
+   action remains visible instead of being clipped past the right edge. */
+@container (max-width: 620px) {
+  .composer {
+    margin-inline: var(--sp-3);
+  }
+  .composer-bar {
+    flex-wrap: wrap;
+    row-gap: 3px;
+    padding-inline: var(--sp-2);
+  }
+  .composer-bar > .grow {
+    display: none;
+  }
+  .composer-bar .drop-btn {
+    max-width: 132px;
+    min-width: 0;
+    padding-inline: 6px;
+  }
+  .composer-bar .drop-btn-label {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .provider-summary-btn {
+    max-width: 138px;
+    min-width: 0;
+    overflow: hidden;
+  }
+  .provider-summary-btn > span,
+  .provider-summary-btn > strong,
+  .provider-summary-btn > b {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .composer-send {
+    margin-left: auto;
+  }
+  .assistant-foot {
+    height: auto;
+    min-height: 32px;
+    padding: 4px var(--sp-3);
+    flex-wrap: wrap;
+    overflow: visible;
+  }
+  .assistant-foot > .grow {
+    display: none;
+  }
+  .assistant-foot .drop-btn {
+    max-width: 128px;
+    min-width: 0;
+  }
+  .assistant-foot .drop-btn-label {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .foot-conn {
+    margin-left: auto;
+    padding-right: 0;
+  }
+}
+
+@container (max-width: 360px) {
+  .composer-bar .drop-btn,
+  .provider-summary-btn {
+    max-width: 108px;
+  }
+  .assistant-foot .drop-btn {
+    max-width: 104px;
+  }
+}
 .composer-queue-send {
   background: var(--bg-4);
   color: var(--text-1);
@@ -1067,12 +1199,46 @@ details.assistant-tool.tool-artifacts > summary::-webkit-details-marker { displa
 .assistant-turn {
   display: flex;
   flex-direction: column;
-  gap: 3px;
+  gap: 5px;
+  min-width: 0;
+}
+.turn-user {
+  align-self: flex-end;
+  width: fit-content;
+  max-width: min(82%, 760px);
+}
+.turn-assistant {
+  align-self: stretch;
+  padding: 4px 0 8px;
+}
+.turn-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 18px;
+}
+.turn-user .turn-head {
+  justify-content: flex-end;
+  padding-right: 3px;
+}
+.turn-avatar {
+  display: inline-grid;
+  place-items: center;
+  width: 18px;
+  height: 18px;
+  flex: 0 0 18px;
+  border: 1px solid var(--border-faint);
+  border-radius: var(--r-full);
+  color: var(--text-2);
+  background: color-mix(in srgb, var(--bg-3) 82%, transparent);
+}
+.turn-user .turn-avatar {
+  color: var(--accent);
+  border-color: color-mix(in srgb, var(--accent) 24%, var(--border-faint));
+  background: color-mix(in srgb, var(--accent) 8%, var(--bg-2));
 }
 .turn-tag {
   font-size: var(--fs-10);
-  text-transform: uppercase;
-  letter-spacing: var(--tracking-caps);
   font-weight: var(--fw-semibold);
   color: var(--text-3);
 }
@@ -1099,10 +1265,23 @@ details.assistant-tool.tool-artifacts > summary::-webkit-details-marker { displa
 }
 .turn-user .turn-text {
   color: var(--text-0);
+  padding: 9px 12px;
+  border: 1px solid color-mix(in srgb, var(--accent) 18%, var(--border-faint));
+  border-radius: 15px 15px 4px 15px;
+  background: color-mix(in srgb, var(--accent) 7%, var(--bg-2));
+  box-shadow: 0 1px 0 color-mix(in srgb, var(--text-0) 3%, transparent);
 }
 .turn-assistant .turn-text {
   max-width: 96ch;
+  margin-left: 24px;
   white-space: normal; /* Markdown owns paragraph rhythm; don't preserve source blanks twice. */
+}
+
+@media (max-width: 760px) {
+  .turn-tabs-title { display: none; }
+  .turn-tabs-wrap { padding-inline: var(--sp-3); }
+  .turn-user { max-width: 92%; }
+  .turn-assistant .turn-text { margin-left: 0; }
 }
 
 /* ── Markdown (agent output) ─────────────────────────────────────────────── */

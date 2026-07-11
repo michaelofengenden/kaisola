@@ -9,6 +9,7 @@ import { Icon } from './Icon'
 import { GoogleIcon } from './ProviderIcon'
 import { Dropdown } from './Dropdown'
 import { UsageSettings } from './shell/LimitsButton'
+import { openExtensionsCenter } from '../lib/extensions'
 
 // Current Claude models (for the direct API path). Checked 2026-07-09.
 const CLAUDE_MODELS = [
@@ -141,6 +142,7 @@ const SECTIONS = [
   { id: 'general', name: 'General', icon: 'SlidersHorizontal' },
   { id: 'usage', name: 'Usage', icon: 'Gauge' },
   { id: 'interface', name: 'Interface', icon: 'PanelsTopLeft' },
+  { id: 'extensions', name: 'Extensions', icon: 'Blocks' },
   { id: 'terminal', name: 'Terminal', icon: 'SquareTerminal' },
   { id: 'agents', name: 'Agents', icon: 'Bot' },
   { id: 'guardrails', name: 'Guardrails', icon: 'ShieldCheck' },
@@ -155,6 +157,7 @@ const SECTION_DESC: Record<SectionId, string> = {
   general: 'Theme, native Live Glass or the lowest-memory Eco shell, and software updates.',
   usage: 'Live subscription windows for your signed-in Codex and Claude accounts.',
   interface: 'Tab hierarchy and the little conveniences — every one of them yours to tune.',
+  extensions: 'Languages, previews, themes, and local development integrations installed in Kaisola.',
   terminal: 'Every terminal card — font size, weight, typeface, and cursor color.',
   agents: 'The CLIs in your + menu. Each runs with your existing install and login — Kaisola never proxies a model.',
   guardrails: 'What agents may do without you: autonomy, saved permission rules, and protected files.',
@@ -197,10 +200,13 @@ function AppAccountRow() {
         {status?.profile ? (
           <>
             <span className="truncate" title={status.profile.email}>{status.profile.name || status.profile.email}</span>
+            <span className="faint" title={status.serverVerified ? 'Firebase ID token verified by the Kaisola server' : status.message}>
+              {status.serverVerified ? 'Server verified' : 'Verification pending'}
+            </span>
             <button className="btn btn-ghost btn-sm" disabled={busy} onClick={() => { void signOut() }}>Sign out</button>
           </>
         ) : (
-          <button className="btn btn-ghost btn-sm" disabled={busy || status?.configured === false} onClick={() => { void signIn() }}>
+          <button className="btn btn-ghost btn-sm" title={status?.configured === false ? status.message : undefined} disabled={busy || status?.configured === false} onClick={() => { void signIn() }}>
             {busy ? 'Opening Google…' : 'Sign in with Google'}
           </button>
         )}
@@ -529,11 +535,12 @@ export function Settings() {
             {section === 'interface' && (
               <>
                 <div className="settings-row">
-                  <span className="settings-row-label">Tab layout <span className="faint" style={{ fontWeight: 400 }}>· switches live</span></span>
+                  <span className="settings-row-label">Session navigation <span className="faint" style={{ fontWeight: 400 }}>· switches live</span></span>
                   <div className="settings-row-control">
                     <Dropdown
                       value={tabLayout}
                       options={[
+                        { value: 'sidebar', name: 'Sidebars · default' },
                         { value: 'shelf', name: 'Nested shelf' },
                         { value: 'bare', name: 'Bare hierarchy' },
                         { value: 'runway', name: 'Neutral runway' },
@@ -567,6 +574,25 @@ export function Settings() {
                   </div>
                 ))}
                 <p className="settings-note">Each switch also lives in settings.json — automate them like everything else.</p>
+              </>
+            )}
+
+            {section === 'extensions' && (
+              <>
+                <div className="settings-row">
+                  <span className="settings-row-label">Extension manager</span>
+                  <div className="settings-row-control">
+                    <button
+                      className="btn btn-primary btn-sm"
+                      onClick={() => { setOpen(false); openExtensionsCenter() }}
+                    >
+                      <Icon name="Blocks" size={13} /> Open Extensions
+                    </button>
+                  </div>
+                </div>
+                <p className="settings-note">
+                  Browse installed and available language support, previews, themes, and reviewed local integrations.
+                </p>
               </>
             )}
 

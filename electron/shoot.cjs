@@ -166,12 +166,12 @@ app.whenReady().then(async () => {
     await wait(300)
     for (const theme of ['light', 'dark']) {
       await setTheme(theme)
-      for (const layout of ['shelf', 'bare', 'runway', 'flat', 'compact']) {
+      for (const layout of ['sidebar', 'shelf', 'bare', 'runway', 'flat', 'compact']) {
         await js(`window.__kaisola.getState().setTabLayout(${JSON.stringify(layout)})`)
         await shot(`tab-layout-${layout}-${theme}`)
       }
     }
-    await js(`window.__kaisola.getState().setTabLayout('bare')`)
+    await js(`window.__kaisola.getState().setTabLayout('sidebar')`)
   } catch (e) {
     console.log('SHOOT_ERROR ' + (e && e.message || e))
   }

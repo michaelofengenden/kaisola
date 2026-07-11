@@ -151,12 +151,15 @@ export interface AppIdentity {
   id: string
   email: string
   name?: string
+  avatarUrl?: string
   signedInAt?: number
+  serverVerified?: boolean
 }
 export interface AppAuthStatus {
   ok?: boolean
   configured: boolean
   pending?: boolean
+  serverVerified?: boolean
   profile?: AppIdentity | null
   message?: string
 }

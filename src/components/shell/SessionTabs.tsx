@@ -8,6 +8,7 @@ import { Icon } from '../Icon'
 import { ProviderIcon } from '../ProviderIcon'
 import { Dropdown } from '../Dropdown'
 import { CostChip } from './CostChip'
+import { ShellSidebarFooter } from './ShellSidebarFooter'
 
 interface STab {
   id: string
@@ -284,7 +285,6 @@ export function SessionTabs({ orientation = 'horizontal' }: { orientation?: 'hor
           aria-label="Move sessions to the left sidebar"
         >
           <Icon name="PanelLeftOpen" size={12} />
-          <span>Sidebar</span>
         </button>
       )}
       {menu && (
@@ -374,12 +374,12 @@ export function SessionSidebar() {
     <aside className="session-sidebar" aria-label="Session sidebar">
       <div className="session-sidebar-head">
         <span>Sessions</span>
-        <button onClick={() => setTabLayout('bare')} title="Move sessions across the top">
+        <button onClick={() => setTabLayout('bare')} title="Move sessions across the top" aria-label="Move sessions across the top">
           <Icon name="PanelTop" size={13} />
-          <span>Top</span>
         </button>
       </div>
       <SessionTabs orientation="vertical" />
+      <ShellSidebarFooter />
     </aside>
   )
 }

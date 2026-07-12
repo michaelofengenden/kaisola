@@ -7,7 +7,7 @@ import { LimitsButton } from './LimitsButton'
  * and settings. Layout and agent configuration live in Settings instead of
  * spending permanent top-bar slots.
  */
-export function ShellTools() {
+export function ShellTools({ includeSettings = true }: { includeSettings?: boolean }) {
   const layoutMode = useKaisola((s) => s.layoutMode)
   const openPalette = useKaisola((s) => s.openPalette)
   const canvasOpen = useKaisola((s) => s.canvasOpen)
@@ -29,9 +29,11 @@ export function ShellTools() {
           <Icon name="PanelRightOpen" size={15} />
         </button>
       )}
-      <button className="btn-icon shell-settings-trigger" onClick={() => openSettings(true, 'interface')} title="Settings  ⌘," aria-label="Open settings">
-        <Icon name="Settings" size={15} />
-      </button>
+      {includeSettings && (
+        <button className="btn-icon shell-settings-trigger" onClick={() => openSettings(true, 'interface')} title="Settings  ⌘," aria-label="Open settings">
+          <Icon name="Settings" size={15} />
+        </button>
+      )}
     </>
   )
 }

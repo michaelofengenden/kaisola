@@ -7,11 +7,8 @@ import { useUpdateState } from '../../lib/updates'
 import { Icon } from '../Icon'
 import { Dropdown, type DropOption } from '../Dropdown'
 import { WindowLights } from './WindowLights'
-import { InboxButton } from './InboxButton'
-import { ShellTools } from './AgentSidebar'
 import { terminalAgentKey } from '../../lib/sessionHue'
 import { SessionTabs } from './SessionTabs'
-import { AppAccountButton } from './AppAccountButton'
 
 const basename = (p: string | null | undefined) => (p ? p.split('/').filter(Boolean).pop() : undefined)
 const tabLabel = (t: { title?: string; workspacePath: string | null }) => t.title ?? basename(t.workspacePath) ?? 'New Project'
@@ -112,7 +109,6 @@ export function ProjectTabs() {
   return (
     <div className="tabstrip" data-single={tabs.length === 1 || undefined}>
       <WindowLights />
-      {tabLayout !== 'sidebar' && <RailToggle side="left" />}
       <div className="tabstrip-track" role="tablist" ref={trackRef} onScroll={syncFade}>
         {tabs.map((tab, i) => {
           const active = tab.id === activeId
@@ -187,16 +183,6 @@ export function ProjectTabs() {
       )}
       <div className="tabstrip-fill" onDoubleClick={() => bridge.winCtl('zoom')} />
       <UpdatePill />
-      {/* the tool cluster rides the strip's right end — in the chrome row,
-          never overlapping the session tabs below (App renders the floating
-          fallback only where this strip doesn't exist: web + pop windows) */}
-      <div className="tabstrip-tools">
-        {tabLayout === 'sidebar' && <RailToggle side="right" />}
-        <InboxButton />
-        <ShellTools />
-        <AppAccountButton />
-      </div>
-
       {/* portalled to <body> — rendered in-strip it inherits a stacking context
           that loses to the session cards' glass layers and slides behind them */}
       {menu && createPortal(
@@ -246,29 +232,6 @@ export function ProjectTabs() {
         document.body,
       )}
     </div>
-  )
-}
-
-/**
- * Sidebar toggle in the Claude-app spot — right of the traffic lights.
- * Hides/shows the left workspace rail (files + outline); ⌘B does the same.
- */
-function RailToggle({ side }: { side: 'left' | 'right' }) {
-  const railOpen = useKaisola((s) => s.railOpen)
-  const toggleRail = useKaisola((s) => s.toggleRail)
-  if (railOpen) return null
-  const action = `Show file tree on ${side}`
-  return (
-    <button
-      className="rail-toggle"
-      data-side={side}
-      onClick={toggleRail}
-      aria-label={action}
-      aria-pressed={false}
-      title={`${action}  ⌘B`}
-    >
-      <Icon name="FolderTree" size={15} />
-    </button>
   )
 }
 

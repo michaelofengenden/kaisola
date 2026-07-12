@@ -397,52 +397,6 @@
   }
 }
 
-/* Permanent controls: contextual file-tree toggle · search · usage · preview
-   · settings. Layout choices live inside Settings → Interface. */
-.tabstrip-tools {
-  display: flex;
-  align-items: center;
-  align-self: center;
-  gap: var(--sp-1);
-  padding-right: var(--sp-2);
-  flex-shrink: 0; /* the track shrinks, chrome never does */
-  -webkit-app-region: no-drag;
-}
-.tabstrip-tools * {
-  -webkit-app-region: no-drag;
-}
-/* strip-resident icon buttons run a notch smaller than the app default —
-   the 15px glyphs keep their size, the hit area stays comfortable */
-.tabstrip-tools .btn-icon {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  width: 28px;
-  height: 28px;
-  line-height: 0;
-  align-self: center;
-}
-.tabstrip .rail-toggle {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  gap: 5px;
-  height: 28px;
-  padding: 0 8px 0 6px;
-  flex-shrink: 0;
-  border: 1px solid var(--border-faint);
-  border-radius: var(--r-2);
-  color: var(--text-2);
-  font-size: var(--fs-10);
-  font-weight: var(--fw-medium);
-  white-space: nowrap;
-  -webkit-app-region: no-drag;
-}
-.tabstrip .rail-toggle:hover {
-  color: var(--text-0);
-  border-color: color-mix(in srgb, var(--accent) 28%, var(--border));
-  background: var(--hover-overlay);
-}
 .app-account-avatar {
   display: inline-grid;
   place-items: center;
@@ -470,6 +424,44 @@
   height: 100%;
   display: block;
   object-fit: cover;
+}
+.app-account-avatar[data-label] {
+  display: inline-flex;
+  align-items: center;
+  width: auto;
+  max-width: 100%;
+  height: 28px;
+  padding: 0 var(--sp-2);
+  flex: 1 1 auto;
+  justify-content: flex-start;
+  gap: var(--sp-2);
+  overflow: hidden;
+  border-color: transparent;
+  border-radius: var(--r-2);
+  background: transparent;
+}
+.app-account-avatar[data-label] img,
+.app-account-avatar[data-label] .app-account-initial {
+  width: 22px;
+  height: 22px;
+  flex: 0 0 22px;
+  border-radius: var(--r-full);
+}
+.app-account-initial { display: inline-grid; place-items: center; }
+.app-account-avatar[data-label] .app-account-initial {
+  background: color-mix(in srgb, var(--accent) 12%, var(--bg-2));
+}
+.app-account-name {
+  min-width: 0;
+  color: var(--text-1);
+  font-size: var(--fs-12);
+  font-weight: var(--fw-medium);
+  line-height: 1;
+}
+.app-account-avatar[data-label]:hover,
+.app-account-avatar[data-label][data-open] {
+  background: var(--hover-overlay);
+  box-shadow: none;
 }
 .app-account-menu {
   z-index: var(--z-popover);
@@ -568,6 +560,50 @@
 .inbox-row-detail { flex-shrink: 0; color: var(--text-3); font-size: var(--fs-11); }
 .inbox-empty { padding: var(--sp-3); color: var(--text-3); font-size: var(--fs-12); }
 
+/* Global controls live with navigation, not in the project tab strip. The
+   active left sidebar owns this quiet two-row footer. */
+.shell-sidebar-footer {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  flex: 0 0 auto;
+  padding: var(--sp-2);
+  border-top: 1px solid var(--border-faint);
+  background: color-mix(in srgb, var(--bg-1) 28%, transparent);
+  -webkit-app-region: no-drag;
+}
+.shell-sidebar-footer-tools,
+.shell-sidebar-footer-account {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-1);
+  min-width: 0;
+}
+.shell-sidebar-footer-tools .btn-icon,
+.shell-sidebar-footer-account > .btn-icon {
+  width: 28px;
+  height: 28px;
+  flex: 0 0 28px;
+}
+.shell-sidebar-footer-tools .inbox-wrap { margin-left: auto; }
+.shell-sidebar-footer .inbox-menu {
+  top: auto;
+  bottom: calc(100% + 6px);
+  left: 0;
+  right: auto;
+}
+.shell-sidebar-footer[data-floating] {
+  position: absolute;
+  left: var(--sp-4);
+  bottom: var(--sp-4);
+  z-index: 18;
+  width: min(232px, calc(100% - 2 * var(--sp-4)));
+  border: 1px solid var(--border);
+  border-radius: var(--r-3);
+  background: var(--bg-2);
+  box-shadow: var(--shadow-2);
+}
+
 /* traffic lights ride at the strip's left — reuse the shared .lights/.light
    rules (below), just re-centered for the shorter strip. Visible in
    fullscreen too: with custom lights there's no native hover-reveal. */
@@ -576,18 +612,6 @@
   margin-top: 0;
   padding: 0 var(--sp-3) 0 var(--sp-2);
   flex-shrink: 0; /* the track shrinks, chrome never does */
-}
-/* The file-tree toggle follows the tree's edge: left of project tabs for the
-   classic layout, inside the right tool cluster when the tree is on the right. */
-.tabstrip .rail-toggle {
-  align-self: center;
-  width: 28px;
-  padding: 0;
-  margin-right: var(--sp-2);
-  transition: color var(--dur-1) var(--ease-out), background var(--dur-1) var(--ease-out);
-}
-.tabstrip-tools .rail-toggle[data-side='right'] {
-  margin-right: var(--sp-1);
 }
 /* the strip pushes the two absolutely-positioned overlays down by its height.
    .top-progress lives in components.css (imported before this file), so this
@@ -1190,23 +1214,22 @@
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  gap: 5px;
-  width: auto;
+  width: 25px;
   min-width: 25px;
   height: 25px;
-  padding: 0 8px 0 6px;
+  padding: 0;
   flex: 0 0 auto;
-  border: 1px solid color-mix(in srgb, var(--accent) 18%, var(--border-faint));
-  border-radius: var(--r-full);
-  background: color-mix(in srgb, var(--accent) 6%, transparent);
+  border: 1px solid var(--border-faint);
+  border-radius: var(--r-2);
+  background: transparent;
   color: var(--text-2);
   font-size: var(--fs-10);
   font-weight: var(--fw-medium);
 }
 .stabs-sidebar-toggle:hover {
   color: var(--text-0);
-  border-color: color-mix(in srgb, var(--accent) 36%, var(--border));
-  background: color-mix(in srgb, var(--accent) 11%, var(--hover-overlay));
+  border-color: var(--border);
+  background: var(--hover-overlay);
 }
 /* The small turn-in marker makes the project → session nesting legible even
    when colors are muted or the user has several similarly colored projects. */
@@ -1763,13 +1786,12 @@
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  gap: 4px;
-  width: auto;
+  width: 24px;
   min-width: 24px;
   height: 24px;
-  padding: 0 7px 0 5px;
+  padding: 0;
   border: 1px solid var(--border-faint);
-  border-radius: var(--r-full);
+  border-radius: var(--r-2);
   color: var(--text-3);
   font-size: var(--fs-9);
   letter-spacing: 0;

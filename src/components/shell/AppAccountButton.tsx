@@ -5,12 +5,12 @@ import { useKaisola } from '../../store/store'
 import { useClickAway } from '../../lib/useClickAway'
 import { Icon } from '../Icon'
 
-export function AppAccountButton() {
+export function AppAccountButton({ showLabel = false }: { showLabel?: boolean }) {
   const openSettings = useKaisola((s) => s.setSettingsOpen)
   const [status, setStatus] = useState<AppAuthStatus | null>(null)
   const [open, setOpen] = useState(false)
   const [imageBroken, setImageBroken] = useState(false)
-  const [pos, setPos] = useState({ right: 8, top: 42 })
+  const [pos, setPos] = useState<{ left?: number; right?: number; top?: number; bottom?: number }>({ right: 8, top: 42 })
   const button = useRef<HTMLButtonElement>(null)
   const panel = useRef<HTMLDivElement>(null)
   const close = useCallback(() => setOpen(false), [])
@@ -30,7 +30,14 @@ export function AppAccountButton() {
   const toggle = () => {
     if (!open) {
       const rect = button.current?.getBoundingClientRect()
-      if (rect) setPos({ right: Math.max(8, window.innerWidth - rect.right), top: rect.bottom + 6 })
+      if (rect) {
+        const horizontal = rect.left < 280
+          ? { left: Math.max(8, rect.left) }
+          : { right: Math.max(8, window.innerWidth - rect.right) }
+        setPos(rect.bottom > window.innerHeight * 0.62
+          ? { ...horizontal, bottom: window.innerHeight - rect.top + 6 }
+          : { ...horizontal, top: rect.bottom + 6 })
+      }
     }
     setOpen((value) => !value)
   }
@@ -44,6 +51,7 @@ export function AppAccountButton() {
       <button
         ref={button}
         className="app-account-avatar"
+        data-label={showLabel || undefined}
         data-open={open || undefined}
         onClick={toggle}
         title={`${profile.name || profile.email} · Kaisola account`}
@@ -51,15 +59,16 @@ export function AppAccountButton() {
       >
         {profile.avatarUrl && !imageBroken
           ? <img src={profile.avatarUrl} alt="" referrerPolicy="no-referrer" onError={() => setImageBroken(true)} />
-          : <span>{initial}</span>}
+          : <span className="app-account-initial">{initial}</span>}
+        {showLabel && <span className="app-account-name truncate">{profile.name || profile.email}</span>}
       </button>
       {open && createPortal(
-        <div ref={panel} className="app-account-menu" style={{ position: 'fixed', right: pos.right, top: pos.top }}>
+        <div ref={panel} className="app-account-menu" style={{ position: 'fixed', ...pos }}>
           <div className="app-account-card">
             <div className="app-account-avatar app-account-avatar-large" aria-hidden>
               {profile.avatarUrl && !imageBroken
                 ? <img src={profile.avatarUrl} alt="" referrerPolicy="no-referrer" onError={() => setImageBroken(true)} />
-                : <span>{initial}</span>}
+                : <span className="app-account-initial">{initial}</span>}
             </div>
             <div className="app-account-copy">
               <strong className="truncate">{profile.name || 'Kaisola account'}</strong>

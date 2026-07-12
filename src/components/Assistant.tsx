@@ -243,6 +243,61 @@ function popoverPosition(button: HTMLButtonElement | null) {
     : { right: Math.max(8, window.innerWidth - rect.right), top: rect.bottom + 7, maxHeight: below }
 }
 
+function composerAddPosition(button: HTMLButtonElement | null) {
+  const rect = button?.getBoundingClientRect()
+  if (!rect) return { left: 12, bottom: 56, maxHeight: 420 }
+  return {
+    left: Math.max(8, Math.min(rect.left, window.innerWidth - 348)),
+    bottom: Math.max(8, window.innerHeight - rect.top + 7),
+    maxHeight: Math.max(180, rect.top - 20),
+  }
+}
+
+function ComposerAddMenu({
+  papers,
+  sessions,
+  onFiles,
+  onPaper,
+  onSession,
+  onPlugins,
+}: {
+  papers: Paper[]
+  sessions: AssistantThread[]
+  onFiles: () => void
+  onPaper: (paper: Paper) => void
+  onSession: (thread: AssistantThread) => void
+  onPlugins: () => void
+}) {
+  const [open, setOpen] = useState(false)
+  const button = useRef<HTMLButtonElement>(null)
+  const panel = useRef<HTMLDivElement>(null)
+  useProviderPopover(open, setOpen, button, panel)
+  const choose = (action: () => void) => { action(); setOpen(false) }
+  return (
+    <>
+      <button ref={button} className="composer-tool composer-add" data-open={open || undefined} onClick={() => setOpen((value) => !value)} title="Add context" aria-label="Add files, plugins, papers, or prior sessions" aria-haspopup="menu" aria-expanded={open}>
+        <Icon name="Plus" size={16} />
+      </button>
+      {open && createPortal(
+        <div ref={panel} className="provider-pop composer-add-pop" role="menu" aria-label="Add context" style={{ position: 'fixed', ...composerAddPosition(button.current) }}>
+          <div className="composer-add-label">Add</div>
+          <button className="composer-add-row" role="menuitem" onClick={() => choose(onFiles)}><Icon name="Paperclip" size={15} /><span>Files</span></button>
+          <button className="composer-add-row" role="menuitem" onClick={() => choose(onPlugins)}><Icon name="Blocks" size={15} /><span>Plugins and integrations</span></button>
+          {papers.length > 0 && <div className="composer-add-label">Research papers</div>}
+          {papers.slice(0, 6).map((paper) => (
+            <button key={paper.id} className="composer-add-row" role="menuitem" onClick={() => choose(() => onPaper(paper))}><Icon name="FileText" size={15} /><span className="truncate">{paper.title}</span></button>
+          ))}
+          {sessions.length > 0 && <div className="composer-add-label">Prior sessions</div>}
+          {sessions.slice(0, 8).map((thread) => (
+            <button key={thread.id} className="composer-add-row" role="menuitem" onClick={() => choose(() => onSession(thread))}><Icon name="History" size={15} /><span className="truncate">{thread.name ?? thread.autoName ?? thread.agentKey}</span></button>
+          ))}
+        </div>,
+        document.body,
+      )}
+    </>
+  )
+}
+
 /** Claude's own Faster → Smarter effort treatment, backed by a real reconnect. */
 function ClaudeEffortPicker({ value, options = CLAUDE_EFFORT_OPTIONS, busy, onSelect }: { value: ClaudeEffort; options?: typeof CLAUDE_EFFORT_OPTIONS; busy?: boolean; onSelect: (value: string) => void }) {
   const [open, setOpen] = useState(false)
@@ -639,6 +694,7 @@ export const Assistant = memo(function Assistant({ threadId }: { threadId: strin
   const autonomy = useKaisola((s) => s.autonomy)
   const openSettings = useKaisola((s) => s.setSettingsOpen)
   const workspacePath = useKaisola((s) => s.workspacePath)
+  const project = useKaisola((s) => s.project)
   const projectId = useKaisola((s) => s.activeProjectId)
   const setWorkspace = useKaisola((s) => s.setWorkspace)
   const requestTerminal = useKaisola((s) => s.requestTerminal)
@@ -1614,6 +1670,32 @@ export const Assistant = memo(function Assistant({ threadId }: { threadId: strin
     const r = await bridge.pickFiles()
     if (r.ok && r.paths) setAssistantDraft(active.id, { attachments: [...new Set([...attachments, ...r.paths])] }, projectId)
   }
+  const attachPaper = (paper: Paper) => setAssistantDraft(active.id, {
+    mentions: [...mentions.filter((mention) => !(mention.kind === 'paper' && mention.id === paper.id)), {
+      id: paper.id,
+      kind: 'paper',
+      label: paper.title,
+      text: `${paper.title}${paper.authors.length ? ` — ${paper.authors.join(', ')}` : ''}${paper.summary || paper.abstract ? `: ${paper.summary ?? paper.abstract}` : ''}`,
+    }],
+  }, projectId)
+  const attachSession = (thread: AssistantThread) => {
+    const runtime = useKaisola.getState().assistantRuntimes[thread.id]
+    const transcript = (runtime?.turns ?? [])
+      .filter((turn) => (turn.kind === 'user' || turn.kind === 'assistant') && turn.text)
+      .slice(-12)
+      .map((turn) => `${turn.kind === 'user' ? 'User' : 'Agent'}: ${turn.text}`)
+      .join('\n')
+      .slice(0, 16_000)
+    const label = thread.name ?? thread.autoName ?? thread.agentKey
+    setAssistantDraft(active.id, {
+      mentions: [...mentions.filter((mention) => !(mention.kind === 'run' && mention.id === thread.id)), {
+        id: thread.id,
+        kind: 'run',
+        label,
+        text: `Prior Kaisola session “${label}”${transcript ? `:\n${transcript}` : ' (transcript currently stored on disk)'}`,
+      }],
+    }, projectId)
+  }
   // the foot's agent picker re-points the active thread to a different agent
   const setThreadAgent = (key: string) => {
     const preset = presets.find((p) => p.id === key)
@@ -1930,7 +2012,14 @@ export const Assistant = memo(function Assistant({ threadId }: { threadId: strin
           spellCheck={false}
         />
         <div className="composer-bar">
-          <button className="composer-tool" onClick={attach} title="Attach files"><Icon name="Paperclip" size={14} /></button>
+          <ComposerAddMenu
+            papers={project.corpus.filter((source): source is Paper => source.kind === 'paper')}
+            sessions={threads.filter((thread) => thread.id !== active.id)}
+            onFiles={() => { void attach() }}
+            onPaper={attachPaper}
+            onSession={attachSession}
+            onPlugins={() => openSettings(true, 'extensions')}
+          />
           {composerControls.map((c) => (
             <Dropdown key={c.id} icon={CATEGORY_ICON[c.category]} value={c.value} options={c.options.map(({ value, name }) => ({ value, name }))} onSelect={(v) => onControlChange(c, v)} title={c.name} />
           ))}

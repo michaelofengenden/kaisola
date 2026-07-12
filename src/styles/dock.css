@@ -752,12 +752,13 @@ details.assistant-tool.tool-artifacts > summary::-webkit-details-marker { displa
   flex-direction: column;
   flex-shrink: 0;
   z-index: 2;
-  transition: border-color var(--dur-2) var(--ease-out), box-shadow var(--dur-2) var(--ease-out);
+  transition: border-color var(--dur-2) var(--ease-out), box-shadow var(--dur-2) var(--ease-out), transform var(--dur-2) var(--ease-out);
 }
-/* the WHOLE box shines on focus — one seamless surface, no inner seam */
+/* Focus lifts the paper instead of tinting it green. */
 .composer:focus-within {
-  border-color: var(--accent);
-  box-shadow: var(--ring-glow);
+  border-color: var(--border-strong);
+  box-shadow: var(--shadow-3), inset 0 1px 0 color-mix(in srgb, white 48%, transparent);
+  transform: translateY(-1px);
 }
 .composer-input {
   resize: none;
@@ -870,6 +871,30 @@ details.assistant-tool.tool-artifacts > summary::-webkit-details-marker { displa
   flex-shrink: 0;
 }
 .composer-tool:hover { color: var(--text-0); background: var(--bg-3); }
+.composer-add[data-open='true'] { color: var(--text-0); background: var(--bg-3); }
+.composer-add-pop {
+  width: min(340px, calc(100vw - 16px));
+  padding: var(--sp-2);
+  overflow-y: auto;
+}
+.composer-add-label {
+  padding: var(--sp-2) var(--sp-3) var(--sp-1);
+  color: var(--text-3);
+  font-size: var(--fs-11);
+}
+.composer-add-row {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-3);
+  width: 100%;
+  min-height: 34px;
+  padding: 0 var(--sp-3);
+  border-radius: var(--r-2);
+  color: var(--text-1);
+  font-size: var(--fs-13);
+  text-align: left;
+}
+.composer-add-row:hover { color: var(--text-0); background: var(--hover-overlay); }
 .provider-summary-btn {
   height: 27px;
   display: inline-flex;

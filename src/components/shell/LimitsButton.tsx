@@ -88,7 +88,7 @@ interface ClaudeRow { id: string; label: string; email?: string; usage?: ClaudeU
 
 function UsageSurface({ embedded = false }: { embedded?: boolean }) {
   const [open, setOpen] = useState(embedded)
-  const [pos, setPos] = useState<{ right: number; top: number }>({ right: 12, top: 44 })
+  const [pos, setPos] = useState<{ left?: number; right?: number; top?: number; bottom?: number }>({ right: 12, top: 44 })
   const [codexLoading, setCodexLoading] = useState(false)
   const [claudeLoading, setClaudeLoading] = useState(false)
   const [codex, setCodex] = useState<CodexUsage | null>(null)
@@ -148,7 +148,14 @@ function UsageSurface({ embedded = false }: { embedded?: boolean }) {
   const toggle = () => {
     if (!open) {
       const r = btnRef.current?.getBoundingClientRect()
-      if (r) setPos({ right: Math.max(8, window.innerWidth - r.right), top: r.bottom + 6 })
+      if (r) {
+        const horizontal = r.left < 360
+          ? { left: Math.max(8, r.left) }
+          : { right: Math.max(8, window.innerWidth - r.right) }
+        setPos(r.bottom > window.innerHeight * 0.62
+          ? { ...horizontal, bottom: window.innerHeight - r.top + 6 }
+          : { ...horizontal, top: r.bottom + 6 })
+      }
       if (!bridge.smoke) void load()
     }
     setOpen(!open)
@@ -198,7 +205,7 @@ function UsageSurface({ embedded = false }: { embedded?: boolean }) {
       style={embedded ? {
         width: '100%', display: 'flex', flexDirection: 'column', gap: 16, fontSize: 'var(--fs-12)',
       } : {
-        position: 'fixed', right: pos.right, top: pos.top, width: 350, maxHeight: 'min(620px, calc(100vh - 70px))', overflowY: 'auto', zIndex: 'var(--z-menu, 900)' as never,
+        position: 'fixed', ...pos, width: 350, maxHeight: 'min(620px, calc(100vh - 70px))', overflowY: 'auto', zIndex: 'var(--z-menu, 900)' as never,
         background: 'var(--bg-3)', border: '1px solid var(--border)', borderRadius: 'var(--r-3, 10px)',
         boxShadow: 'var(--shadow-3, 0 12px 40px rgba(0,0,0,.4))', padding: '12px 14px',
         display: 'flex', flexDirection: 'column', gap: 13, fontSize: 'var(--fs-12)',

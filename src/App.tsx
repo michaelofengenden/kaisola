@@ -22,6 +22,7 @@ import { Toaster } from './components/Toaster'
 import { ExtensionsCenter } from './components/ExtensionsCenter'
 import { Onboarding } from './components/Onboarding'
 import { Icon } from './components/Icon'
+import { ShellSidebarFooter } from './components/shell/ShellSidebarFooter'
 
 import { FilesView } from './views/FilesView'
 
@@ -731,6 +732,7 @@ export default function App() {
           )}
         </div>
         {sidebarSessions && railOpen && <WorkspaceRail side="right" />}
+        {(!studio || (!sidebarSessions && !railOpen)) && <ShellSidebarFooter floating />}
       </div>
       {/* On desktop main windows the tool cluster lives IN the project tab
           strip (ProjectTabs) — same chrome row, no overlap with the session

@@ -1596,6 +1596,21 @@ details.assistant-tool.tool-artifacts > summary::-webkit-details-marker { displa
   color: var(--text-3);
 }
 
+.settings-layout-advanced {
+  margin: 0 var(--sp-2);
+  color: var(--text-2);
+  font-size: var(--fs-12);
+}
+.settings-layout-advanced > summary {
+  width: max-content;
+  padding: var(--sp-1) 0;
+  cursor: pointer;
+  color: var(--text-3);
+  user-select: none;
+}
+.settings-layout-advanced > summary:hover { color: var(--text-1); }
+.settings-layout-advanced > .settings-row { margin: var(--sp-2) calc(-1 * var(--sp-2)) 0; }
+
 .settings-customform {
   display: flex;
   align-items: center;

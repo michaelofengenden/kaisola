@@ -21,6 +21,7 @@ import { SignInCard } from './components/SignInCard'
 import { Toaster } from './components/Toaster'
 import { ExtensionsCenter } from './components/ExtensionsCenter'
 import { Onboarding } from './components/Onboarding'
+import { Icon } from './components/Icon'
 
 import { FilesView } from './views/FilesView'
 
@@ -262,6 +263,7 @@ export default function App() {
   const setStage = useKaisola((s) => s.setStage)
   const dockOpen = useKaisola((s) => s.dockOpen)
   const canvasOpen = useKaisola((s) => s.canvasOpen)
+  const toggleCanvas = useKaisola((s) => s.toggleCanvas)
   const canvasWidth = useKaisola((s) => s.canvasWidth)
   const setCanvasWidth = useKaisola((s) => s.setCanvasWidth)
   const railWidth = useKaisola((s) => s.railWidth)
@@ -709,6 +711,11 @@ export default function App() {
           {studio && <SessionCards />}
           {showCanvas && (
             <div className="canvas-wrap" style={studio && dockOpen && canvasWidth ? { flex: `0 0 ${canvasWidth}px` } : undefined}>
+              {studio && canvasOpen && (
+                <button className="btn-icon canvas-local-close" onClick={toggleCanvas} title="Hide file preview  ⌘." aria-label="Hide file preview">
+                  <Icon name="PanelRightClose" size={14} />
+                </button>
+              )}
               {studio && dockOpen && (
                 <div
                   className="canvas-resize"

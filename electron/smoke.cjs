@@ -225,6 +225,7 @@ app.whenReady().then(async () => {
       avatar: !!avatar,
       headshot: !!avatar?.querySelector('img'),
       menu: !!menu && /Kaisola Tester/.test(menu.textContent || '') && /person@example.com/.test(menu.textContent || ''),
+      usageInMenu: !!menu && /Usage/.test(menu.textContent || ''),
       topRight: !!avatar && avatar.getBoundingClientRect().right > window.innerWidth - 50,
       aligned: (() => {
         const buttons = [...document.querySelectorAll('.tabstrip-tools > button')]
@@ -829,7 +830,7 @@ app.whenReady().then(async () => {
       noContext: !document.querySelector('.context-ledger'),
       noMention: !document.querySelector('button[title^="Reference a paper"]'),
       compactChrome: document.querySelectorAll('.tabstrip-tools > button').length <= 7,
-      layoutControl: !!document.querySelector('.tabstrip-tools > .shell-layout-trigger[title="Layout controls"]'),
+      noLayoutControl: !document.querySelector('.tabstrip-tools > .shell-layout-trigger'),
       settingsControl: !!document.querySelector('.tabstrip-tools > .shell-settings-trigger[aria-label="Open settings"]'),
     }
   })()`)
@@ -1704,12 +1705,19 @@ a^2 + b^2 = c^2
     get().setStage('corpus') // canvas shown
     await new Promise((r) => setTimeout(r, 120))
     const shownBefore = !!document.querySelector('.canvas-wrap')
-    const filesButton = document.querySelector('.tabstrip-tools [aria-label="Hide file preview"]')
-    const hasBtn = !!filesButton
-    filesButton?.click()
+    const localClose = document.querySelector('.canvas-local-close[aria-label="Hide file preview"]')
+    const hasLocalClose = !!localClose
+    const noHeaderClose = !document.querySelector('.tabstrip-tools [aria-label="Hide file preview"]')
+    localClose?.click()
     await new Promise((r) => setTimeout(r, 120))
     const hidden = !document.querySelector('.canvas-wrap') && get().canvasOpen === false
+    const headerRestore = document.querySelector('.tabstrip-tools [aria-label="Show file preview"]')
+    const hasHeaderRestore = !!headerRestore
     const cardsStay = get().dockOpen && !!document.querySelector('.session-card[data-show="true"]')
+    headerRestore?.click()
+    await new Promise((r) => setTimeout(r, 120))
+    const restoredByHeader = !!document.querySelector('.canvas-wrap') && get().canvasOpen === true && !document.querySelector('.tabstrip-tools [aria-label="Show file preview"]')
+    get().toggleCanvas()
     get().setStage('claims') // navigating restores the main view
     await new Promise((r) => setTimeout(r, 120))
     const restoredByNav = !!document.querySelector('.canvas-wrap') && get().canvasOpen === true
@@ -1719,7 +1727,7 @@ a^2 + b^2 = c^2
     get().requestFile('/etc/hosts') // opening a file restores it too
     await new Promise((r) => setTimeout(r, 120))
     const restoredByFile = !!document.querySelector('.canvas-wrap') && get().canvasOpen === true
-    return { shownBefore, hasBtn, hidden, cardsStay, restoredByNav, restoredByFile }
+    return { shownBefore, hasLocalClose, noHeaderClose, hidden, hasHeaderRestore, restoredByHeader, cardsStay, restoredByNav, restoredByFile }
   })()`)
   console.log('CANVASMIN=' + JSON.stringify(canvasMin))
 
@@ -2147,70 +2155,99 @@ a^2 + b^2 = c^2
   })()`)
   console.log('TAB_LAYOUTS=' + JSON.stringify(tabLayouts))
 
-  // 14b2) layout actions are reversible in place, and the file-tree control
-  //       follows a right-docked tree instead of living across the window.
+  // 14b2) layout actions live together in Settings → Interface, remain
+  //       reversible, and the file-tree control follows a right-docked tree.
   const intuitiveLayoutControls = await win.webContents.executeJavaScript(`(async () => {
     const get = () => window.__kaisola.getState()
     const wait = () => new Promise((r) => setTimeout(r, 70))
     const originalLayout = get().tabLayout
+    const originalMode = get().layoutMode
+    const originalDock = get().dockOpen
     const originalRail = get().railOpen
     get().setTabLayout('sidebar')
     if (!get().railOpen) get().toggleRail()
     await wait()
-    const rightToggle = document.querySelector('.tabstrip-tools .rail-toggle[data-side="right"]')
-    const fileTreeIconOnly = !!rightToggle?.querySelector('svg') && !(rightToggle?.textContent || '').trim()
+    const noHeaderToggleWhileOpen = !document.querySelector('.tabstrip-tools .rail-toggle[data-side="right"]')
     const tree = document.querySelector('.wsrail[data-side="right"]')
     const localClose = tree?.querySelector('.wsrail-head button[aria-label="Hide file tree"]')
     localClose?.click(); await wait()
     const hidden = !document.querySelector('.wsrail') && get().railOpen === false
     const recoverySameSide = document.querySelector('.tabstrip-tools .rail-toggle[data-side="right"]')
+    const fileTreeIconOnly = !!recoverySameSide?.querySelector('svg') && !(recoverySameSide?.textContent || '').trim()
     recoverySameSide?.click(); await wait()
     const restored = !!document.querySelector('.wsrail[data-side="right"]') && get().railOpen === true
+    const recoveryGoneAfterRestore = !document.querySelector('.tabstrip-tools .rail-toggle[data-side="right"]')
 
-    const layoutTrigger = document.querySelector('.shell-layout-trigger')
-    layoutTrigger?.click(); await wait()
-    const firstAction = () => document.querySelector('.shell-more-menu .tree-menu-item')
-    const startsAsTop = /move sessions to top/i.test(firstAction()?.textContent || '')
-    firstAction()?.click(); await wait()
-    const menuStayedOpen = !!document.querySelector('.shell-more-menu')
-    const changedToLeft = /move sessions to left/i.test(firstAction()?.textContent || '') && get().tabLayout !== 'sidebar'
-    firstAction()?.click(); await wait()
-    const reversedInPlace = get().tabLayout === 'sidebar' && /move sessions to top/i.test(firstAction()?.textContent || '')
-    const layoutOnly = !/extensions|settings/i.test(document.querySelector('.shell-more-menu')?.textContent || '')
-    layoutTrigger?.click(); await wait()
+    const settingsTrigger = document.querySelector('.shell-settings-trigger')
+    settingsTrigger?.click(); await wait()
+    const settingsOwned = !!document.querySelector('.settings-row[data-setting="workspace-view"]') &&
+      !!document.querySelector('.settings-row[data-setting="session-panels"]') &&
+      !!document.querySelector('.settings-row[data-setting="session-placement"]')
+    const advancedStylesDisclosed = !!document.querySelector('.settings-layout-advanced [data-setting="advanced-session-style"]')
+    const startsInInterface = /Workspace view/.test(document.querySelector('.settings-pane')?.textContent || '')
+    const choose = async (setting, label) => {
+      document.querySelector('.settings-row[data-setting="' + setting + '"] .drop-btn')?.click()
+      await wait()
+      const option = [...document.querySelectorAll('.drop-menu .drop-item')].find((node) =>
+        (node.textContent || '').trim().includes(label),
+      )
+      option?.click()
+      await wait()
+      return !!option
+    }
+    const toFilesOnly = await choose('workspace-view', 'Files only') && get().layoutMode === 'focus'
+    const toFilesAndSessions = await choose('workspace-view', 'Files and sessions') && get().layoutMode === 'studio'
+    const panelsHidden = await choose('session-panels', 'Hidden') && get().dockOpen === false
+    const panelsShown = await choose('session-panels', 'Shown') && get().dockOpen === true
+    const movedToTop = await choose('session-placement', 'Across top') && get().tabLayout === 'bare'
+    const movedToLeft = await choose('session-placement', 'Left sidebar') && get().tabLayout === 'sidebar'
+    get().setSettingsOpen(false)
+    await wait()
+    get().openPalette('commands')
+    await wait()
+    const paletteText = document.querySelector('.palette')?.textContent || ''
+    const rareActionsInPalette = /Place sessions on the left/.test(paletteText) && /Use compact session row/.test(paletteText) && /file tree/.test(paletteText)
+    get().closePalette()
+    await wait()
 
     get().setTabLayout(originalLayout)
+    window.__kaisola.setState({ layoutMode: originalMode, dockOpen: originalDock })
     if (get().railOpen !== originalRail) get().toggleRail()
     await wait()
     return {
-      rightToggle: !!rightToggle,
+      noHeaderToggleWhileOpen,
       fileTreeIconOnly,
       localClose: !!localClose,
       hidden,
       recoverySameSide: !!recoverySameSide,
       restored,
-      layoutNamed: /layout/i.test(layoutTrigger?.textContent || ''),
-      startsAsTop,
-      menuStayedOpen,
-      changedToLeft,
-      reversedInPlace,
-      layoutOnly,
-      previewDistinct: !!document.querySelector('.file-preview-toggle[aria-label*="file preview"]'),
+      recoveryGoneAfterRestore,
+      noStandaloneLayout: !document.querySelector('.shell-layout-trigger'),
+      settingsOwned,
+      advancedStylesDisclosed,
+      startsInInterface,
+      workspaceReversible: toFilesOnly && toFilesAndSessions,
+      panelsReversible: panelsHidden && panelsShown,
+      placementReversible: movedToTop && movedToLeft,
+      rareActionsInPalette,
+      previewContextual: !!document.querySelector('.canvas-local-close') && !document.querySelector('.file-preview-toggle'),
     }
   })()`)
   console.log('INTUITIVE_LAYOUT_CONTROLS=' + JSON.stringify(intuitiveLayoutControls))
 
   // A DOM element.click() bypasses Chromium's frameless-window hit regions.
-  // Exercise the SAME inverse action with real pointer input so a menu that is
-  // visible but covered by a stale drag region cannot pass this test.
+  // Exercise Settings' layout dropdown with real pointer input so its portal
+  // cannot be visible yet covered by a stale drag region.
   const pointerSetup = await win.webContents.executeJavaScript(`(async () => {
     const get = () => window.__kaisola.getState()
     const original = get().tabLayout
     get().setTabLayout('sidebar')
     await new Promise((r) => setTimeout(r, 70))
-    document.querySelector('.shell-layout-trigger')?.click()
+    document.querySelector('.shell-settings-trigger')?.click()
     await new Promise((r) => setTimeout(r, 70))
-    const action = document.querySelector('.shell-more-menu .tree-menu-item')
+    document.querySelector('.settings-row[data-setting="session-placement"] .drop-btn')?.click()
+    await new Promise((r) => setTimeout(r, 70))
+    const action = [...document.querySelectorAll('.drop-menu .drop-item')].find((node) => /Across top/.test(node.textContent || ''))
     const rect = action?.getBoundingClientRect()
     return { original, rect: rect ? { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 } : null }
   })()`)
@@ -2222,12 +2259,14 @@ a^2 + b^2 = c^2
   }
   if (pointerSetup.rect) {
     await pointerClick(pointerSetup.rect)
-    const afterFirst = await win.webContents.executeJavaScript(`(() => {
-      const action = document.querySelector('.shell-more-menu .tree-menu-item')
+    const afterFirst = await win.webContents.executeJavaScript(`(async () => {
+      document.querySelector('.settings-row[data-setting="session-placement"] .drop-btn')?.click()
+      await new Promise((r) => setTimeout(r, 70))
+      const action = [...document.querySelectorAll('.drop-menu .drop-item')].find((node) => /Left sidebar/.test(node.textContent || ''))
       const rect = action?.getBoundingClientRect()
       return {
-        worked: window.__kaisola.getState().tabLayout !== 'sidebar' && /move sessions to left/i.test(action?.textContent || ''),
-        menu: !!document.querySelector('.shell-more-menu'),
+        worked: window.__kaisola.getState().tabLayout === 'bare',
+        menu: !!document.querySelector('.drop-menu'),
         rect: rect ? { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 } : null,
       }
     })()`)
@@ -2240,7 +2279,7 @@ a^2 + b^2 = c^2
   }
   await win.webContents.executeJavaScript(`(async () => {
     window.__kaisola.getState().setTabLayout(${JSON.stringify(pointerSetup.original)})
-    document.querySelector('.shell-layout-trigger[data-active="true"]')?.click()
+    window.__kaisola.getState().setSettingsOpen(false)
     await new Promise((r) => setTimeout(r, 50))
   })()`)
   console.log('REAL_POINTER_LAYOUT=' + JSON.stringify(realPointerLayout))
@@ -2289,7 +2328,10 @@ a^2 + b^2 = c^2
     await new Promise((r) => setTimeout(r, 150))
     // Zed-style settings: a nav of categories, one pane at a time
     const navNames = [...document.querySelectorAll('.settings-nav-item')].map((e) => e.textContent || '')
-    const hasAppearance = navNames.some((l) => /General/.test(l)) && /Theme/.test(document.querySelector('.settings-pane')?.textContent || '')
+    const startsInInterface = /Workspace view/.test(document.querySelector('.settings-pane')?.textContent || '')
+    const hasLayoutSettings = !!document.querySelector('[data-setting="workspace-view"]') && !!document.querySelector('[data-setting="session-panels"]') && !!document.querySelector('[data-setting="session-placement"]')
+    const hasAdvancedStyles = !!document.querySelector('.settings-layout-advanced [data-setting="advanced-session-style"]')
+    const hasAppearance = navNames.some((l) => /General/.test(l))
     const usageNav = [...document.querySelectorAll('.settings-nav-item')].find((e) => /Usage/.test(e.textContent || ''))
     usageNav?.click()
     await new Promise((r) => setTimeout(r, 50))
@@ -2301,7 +2343,7 @@ a^2 + b^2 = c^2
     const interfaceNav = [...document.querySelectorAll('.settings-nav-item')].find((e) => /Interface/.test(e.textContent || ''))
     interfaceNav?.click()
     await new Promise((r) => setTimeout(r, 50))
-    const hasTabLayout = /Session navigation/.test(document.querySelector('.settings-pane')?.textContent || '')
+    const hasTabLayout = /Session placement/.test(document.querySelector('.settings-pane')?.textContent || '')
     const extensionsNav = [...document.querySelectorAll('.settings-nav-item')].find((e) => /Extensions/.test(e.textContent || ''))
     extensionsNav?.click()
     await new Promise((r) => setTimeout(r, 40))
@@ -2319,15 +2361,17 @@ a^2 + b^2 = c^2
     const previewDismissed = !document.querySelector('.drop-menu')
     window.__kaisola.getState().setSettingsOpen(false)
     await new Promise((r) => setTimeout(r, 30))
-    const usageButton = document.querySelector('[aria-label="Open Claude and Codex usage"]')
-    const filesButton = document.querySelector('[aria-label="Hide file preview"],[aria-label="Show file preview"]')
-    usageButton?.click()
+    const avatar = document.querySelector('.app-account-avatar')
+    avatar?.click()
     await new Promise((r) => setTimeout(r, 30))
-    const usagePreviewOpened = !!document.querySelector('.limits-panel')
-    document.querySelector('.canvas')?.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true }))
+    const accountUsage = [...document.querySelectorAll('.app-account-menu > button')].find((button) => /^Usage$/.test((button.textContent || '').trim()))
+    const usageInAccount = !!accountUsage
+    accountUsage?.click()
     await new Promise((r) => setTimeout(r, 30))
-    const usagePreviewDismissed = !document.querySelector('.limits-panel')
-    return { settingsSeparate: !!settingsButton, hasAppearance, hasUsage, hasDiskResidency, hasTabLayout, extensionsInSettings, hasFilesButton: !!filesButton, noSidebarControls: !hasSidebarControls, previewOpened, previewDismissed, usagePreviewOpened, usagePreviewDismissed }
+    const accountUsageOpened = /Usage/.test(document.querySelector('.settings-pane-title')?.textContent || '') && !!document.querySelector('.settings-usage')
+    window.__kaisola.getState().setSettingsOpen(false)
+    const contextualFilesControl = !!document.querySelector('.canvas-local-close') && !document.querySelector('.tabstrip-tools [aria-label="Hide file preview"]')
+    return { settingsSeparate: !!settingsButton, startsInInterface, hasLayoutSettings, hasAdvancedStyles, noStandaloneLayout: !document.querySelector('.shell-layout-trigger'), hasAppearance, hasUsage, hasDiskResidency, hasTabLayout, extensionsInSettings, usageInAccount, accountUsageOpened, contextualFilesControl, noSidebarControls: !hasSidebarControls, previewOpened, previewDismissed }
   })()`)
   console.log('SETTINGS=' + JSON.stringify(settings))
 
@@ -3542,7 +3586,7 @@ a^2 + b^2 = c^2
   const failed =
     !manualCodex.upgraded || !manualCodex.exact || !manualCodex.draftKept || !manualCodex.downgraded ||
     !manualClaude.upgraded || !manualClaude.draftKept || !manualClaude.toolKept || !manualClaude.downgraded ||
-    !rootChildren || !minimalShell.noWorkflowSidebar || !minimalShell.splitSidebarsDefault || !minimalShell.hasSessions || !minimalShell.railFilesOnly || !minimalShell.hasEmptyLauncher || !minimalShell.stageFiles || !minimalShell.studioDefault || !minimalShell.floatingTools || !accountUi.avatar || !accountUi.headshot || !accountUi.menu || !accountUi.topRight || !accountUi.aligned || !claudePrepared || !nativeWindow.rendererClippedMaterial || !icon.exists || !icon.usable || !icon.square || !icon.large || !glass.appSamplingLayer || !glass.chromeGlass || !glass.activeTintWhite || !glass.railLayerFlattened || !glass.contentGlassy || !glass.sessionGlassy || !glass.termGlassTint || !glass.blurKeepsGlass || !glass.lightsGray || !glass.nativeWindowRounding ||
+    !rootChildren || !minimalShell.noWorkflowSidebar || !minimalShell.splitSidebarsDefault || !minimalShell.hasSessions || !minimalShell.railFilesOnly || !minimalShell.hasEmptyLauncher || !minimalShell.stageFiles || !minimalShell.studioDefault || !minimalShell.floatingTools || !accountUi.avatar || !accountUi.headshot || !accountUi.menu || !accountUi.usageInMenu || !accountUi.topRight || !accountUi.aligned || !claudePrepared || !nativeWindow.rendererClippedMaterial || !icon.exists || !icon.usable || !icon.square || !icon.large || !glass.appSamplingLayer || !glass.chromeGlass || !glass.activeTintWhite || !glass.railLayerFlattened || !glass.contentGlassy || !glass.sessionGlassy || !glass.termGlassTint || !glass.blurKeepsGlass || !glass.lightsGray || !glass.nativeWindowRounding ||
     !emptyOk || !demoOk ||
     !review.opened || !review.closed || !review.decided ||
     !term.run || !term.ptyOk || !term.cdWorks || !term.dock || !term.host || !term.lightComposerPalette ||
@@ -3557,7 +3601,7 @@ a^2 + b^2 = c^2
     !dd.hasBtn || !dd.newSession || !dd.portal || dd.items < 2 || !dd.clickAway ||
     !permrules.saved || !permrules.cascaded || !permrules.autoAnswered || !permrules.rejectCascade ||
     !sensitive.surfaced || !sensitive.stillPending || !sensitive.diffFlagged || sensitive.pendingAfter !== 0 ||
-    !activityUi.card || !activityUi.hasSubagent || !activityUi.hasTerminal || !activityUi.hasStatus || !activityUi.standardizedDot || !activityUi.openBtn || !activityUi.noContext || !activityUi.noMention || !activityUi.compactChrome || !activityUi.layoutControl || !activityUi.settingsControl ||
+    !activityUi.card || !activityUi.hasSubagent || !activityUi.hasTerminal || !activityUi.hasStatus || !activityUi.standardizedDot || !activityUi.openBtn || !activityUi.noContext || !activityUi.noMention || !activityUi.compactChrome || !activityUi.noLayoutControl || !activityUi.settingsControl ||
     !attentionUi.running || !attentionUi.pulse || !attentionUi.completed || !attentionUi.still || !attentionUi.cleared || !attentionUi.nativeAttention ||
     !brokerActivity.created || !brokerActivity.began || !brokerActivity.detached || !brokerActivity.settled || !brokerActivity.durable ||
     !transcriptTypography.rendered || !transcriptTypography.normalWhitespace || !transcriptTypography.readableWidth || !transcriptTypography.compactStream || !transcriptTypography.compactList || !transcriptTypography.differentiatedRoles || !transcriptTypography.promptRail || !transcriptTypography.promptRailMinimal || !transcriptTypography.localLink || !transcriptTypography.linkOpenedFiles || !transcriptTypography.lineJump ||
@@ -3583,7 +3627,7 @@ a^2 + b^2 = c^2
     !splits.one || !splits.appended || !splits.heads || !splits.stacked || !splits.besides || !splits.uncapped || !splits.closes ||
     !plus.hasBtn || !plus.noDrag || !plus.pronounced || !plus.hasTerminalOption || !plus.agentChoices || !plus.claudeOpensThread || !plus.claudeNoTerminal || !plus.claudeBrandIcon || !plus.openaiBrandIcon || !plus.adds ||
     !canvasR.hasHandle || !canvasR.sized || !canvasR.clampedMin || !canvasR.resets ||
-    !canvasMin.shownBefore || !canvasMin.hasBtn || !canvasMin.hidden || !canvasMin.cardsStay || !canvasMin.restoredByNav || !canvasMin.restoredByFile ||
+    !canvasMin.shownBefore || !canvasMin.hasLocalClose || !canvasMin.noHeaderClose || !canvasMin.hidden || !canvasMin.hasHeaderRestore || !canvasMin.restoredByHeader || !canvasMin.cardsStay || !canvasMin.restoredByNav || !canvasMin.restoredByFile ||
     !lights.three || !lights.bigger || !lights.corner || !lights.noDrag || !lights.ctlApi ||
     !projtabs.twoTabs || !projtabs.isSecondActive || !projtabs.termsDiffer || !projtabs.gridsDiffer || !projtabs.parkedFirstOk || !projtabs.runtimeRouted || !projtabs.activeRuntimeUntouched ||
     !projtabs.layoutIndependent || !projtabs.showSessionsWorks || !projtabs.hideFilesWorks || !projtabs.showFilesWorks || !projtabs.studioWorks || !projtabs.focusRestored ||
@@ -3597,10 +3641,10 @@ a^2 + b^2 = c^2
     !autoname.named || !autoname.rowShows || !autoname.sticky || !autoname.manualWins || !autoname.termNamed ||
     !minimalUi.noSidebar || !minimalUi.noSidebarResize || !minimalUi.noStageNav || !minimalUi.hasSessionSidebar || !minimalUi.hasRail || !minimalUi.filesOnRight || !minimalUi.hasPlus || !minimalUi.hasFiles ||
     !tabLayouts.rendered || !tabLayouts.sidebarOk || !tabLayouts.shelfOk || !tabLayouts.bareOk || !tabLayouts.runwayOk || !tabLayouts.flatOk || !tabLayouts.compactOk || !tabLayouts.reciprocalToggle || !tabLayouts.verticalAddFlow || !tabLayouts.stateKept || !tabLayouts.staticPaint || !tabLayouts.accessible || !tabLayouts.sessionIdentity ||
-    !intuitiveLayoutControls.rightToggle || !intuitiveLayoutControls.fileTreeIconOnly || !intuitiveLayoutControls.localClose || !intuitiveLayoutControls.hidden || !intuitiveLayoutControls.recoverySameSide || !intuitiveLayoutControls.restored || !intuitiveLayoutControls.layoutNamed || !intuitiveLayoutControls.startsAsTop || !intuitiveLayoutControls.menuStayedOpen || !intuitiveLayoutControls.changedToLeft || !intuitiveLayoutControls.reversedInPlace || !intuitiveLayoutControls.layoutOnly || !intuitiveLayoutControls.previewDistinct ||
+    !intuitiveLayoutControls.noHeaderToggleWhileOpen || !intuitiveLayoutControls.fileTreeIconOnly || !intuitiveLayoutControls.localClose || !intuitiveLayoutControls.hidden || !intuitiveLayoutControls.recoverySameSide || !intuitiveLayoutControls.restored || !intuitiveLayoutControls.recoveryGoneAfterRestore || !intuitiveLayoutControls.noStandaloneLayout || !intuitiveLayoutControls.settingsOwned || !intuitiveLayoutControls.advancedStylesDisclosed || !intuitiveLayoutControls.startsInInterface || !intuitiveLayoutControls.workspaceReversible || !intuitiveLayoutControls.panelsReversible || !intuitiveLayoutControls.placementReversible || !intuitiveLayoutControls.rareActionsInPalette || !intuitiveLayoutControls.previewContextual ||
     !realPointerLayout.firstWorked || !realPointerLayout.reverseWorked || !realPointerLayout.stayedInteractive ||
     !narrowAgentUi.rendered || !narrowAgentUi.narrow || !narrowAgentUi.containerAware || !narrowAgentUi.composerFits || !narrowAgentUi.sendVisible || !narrowAgentUi.footerFits || !narrowAgentUi.wraps ||
-    !settings.settingsSeparate || !settings.hasAppearance || !settings.hasUsage || !settings.hasDiskResidency || !settings.hasTabLayout || !settings.extensionsInSettings || !settings.hasFilesButton || !settings.noSidebarControls || !settings.previewOpened || !settings.previewDismissed || !settings.usagePreviewOpened || !settings.usagePreviewDismissed ||
+    !settings.settingsSeparate || !settings.startsInInterface || !settings.hasLayoutSettings || !settings.hasAdvancedStyles || !settings.noStandaloneLayout || !settings.hasAppearance || !settings.hasUsage || !settings.hasDiskResidency || !settings.hasTabLayout || !settings.extensionsInSettings || !settings.usageInAccount || !settings.accountUsageOpened || !settings.contextualFilesControl || !settings.noSidebarControls || !settings.previewOpened || !settings.previewDismissed ||
     !extensionsUi.opened || extensionsUi.cards < 8 || !extensionsUi.hasFilters || !extensionsUi.csvInstalled || !extensionsUi.jsonInstalled ||
     !extensionsUi.persisted || !extensionsUi.defaultUninstallPersisted || !extensionsUi.csvPreview || !extensionsUi.jsonPreview || !extensionsUi.boundedJsonPreview || !extensionsUi.closed ||
     !devExtensionHotReload.registered || !devExtensionHotReload.updated || !devExtensionHotReload.visible ||

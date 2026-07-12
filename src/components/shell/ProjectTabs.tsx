@@ -256,15 +256,15 @@ export function ProjectTabs() {
 function RailToggle({ side }: { side: 'left' | 'right' }) {
   const railOpen = useKaisola((s) => s.railOpen)
   const toggleRail = useKaisola((s) => s.toggleRail)
-  const action = `${railOpen ? 'Hide' : 'Show'} file tree on ${side}`
+  if (railOpen) return null
+  const action = `Show file tree on ${side}`
   return (
     <button
       className="rail-toggle"
       data-side={side}
-      data-open={railOpen || undefined}
       onClick={toggleRail}
       aria-label={action}
-      aria-pressed={railOpen}
+      aria-pressed={false}
       title={`${action}  ⌘B`}
     >
       <Icon name="FolderTree" size={15} />

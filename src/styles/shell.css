@@ -398,7 +398,7 @@
 }
 
 /* Permanent controls: contextual file-tree toggle · search · usage · preview
-   · an explicitly named layout menu. */
+   · settings. Layout choices live inside Settings → Interface. */
 .tabstrip-tools {
   display: flex;
   align-items: center;
@@ -422,7 +422,6 @@
   line-height: 0;
   align-self: center;
 }
-.shell-layout-trigger,
 .tabstrip .rail-toggle {
   display: inline-flex;
   align-items: center;
@@ -439,8 +438,6 @@
   white-space: nowrap;
   -webkit-app-region: no-drag;
 }
-.shell-layout-trigger:hover,
-.shell-layout-trigger[data-active='true'],
 .tabstrip .rail-toggle:hover {
   color: var(--text-0);
   border-color: color-mix(in srgb, var(--accent) 28%, var(--border));
@@ -520,22 +517,6 @@
   text-align: left;
 }
 .app-account-menu > button:hover { background: var(--hover-overlay); color: var(--text-0); }
-.shell-more-menu {
-  width: 210px;
-  z-index: var(--z-popover);
-  pointer-events: auto;
-  -webkit-app-region: no-drag !important;
-}
-.shell-more-menu * {
-  pointer-events: auto;
-  -webkit-app-region: no-drag !important;
-}
-.shell-more-menu .tree-menu-item kbd {
-  margin-left: auto;
-  color: var(--text-3);
-  font: inherit;
-  font-size: var(--fs-10);
-}
 /* the cross-project inbox (Settings → Interface): hidden at zero, a quiet
    bell + count otherwise; the menu is a right-anchored dropdown */
 .inbox-wrap { position: relative; }
@@ -608,11 +589,6 @@
 .tabstrip-tools .rail-toggle[data-side='right'] {
   margin-right: var(--sp-1);
 }
-.tabstrip .rail-toggle[data-open='true'] {
-  color: var(--text-1);
-  background: color-mix(in srgb, var(--accent) 6%, transparent);
-}
-
 /* the strip pushes the two absolutely-positioned overlays down by its height.
    .top-progress lives in components.css (imported before this file), so this
    later same-specificity rule wins on `top`; .app-body is grid row 2 already. */
@@ -1741,6 +1717,19 @@
 .canvas-resize:hover {
   background: var(--accent-soft);
 }
+.canvas-local-close {
+  position: absolute;
+  top: 6px;
+  right: 8px;
+  z-index: 8;
+  color: var(--text-3);
+  background: color-mix(in srgb, var(--bg-2) 82%, transparent);
+  border: 1px solid var(--border-faint);
+  -webkit-app-region: no-drag;
+}
+.canvas-local-close:hover { color: var(--text-0); background: var(--hover-overlay); }
+.canvas-local-close + .canvas-resize + .canvas .fx-toolbar-main,
+.canvas-local-close + .canvas .fx-toolbar-main { padding-right: 44px; }
 .canvas {
   flex: 1;
   min-width: 0;

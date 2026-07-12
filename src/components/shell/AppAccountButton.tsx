@@ -70,6 +70,9 @@ export function AppAccountButton() {
             </div>
           </div>
           <div className="tree-menu-sep" />
+          <button onClick={() => { setOpen(false); openSettings(true, 'usage') }}>
+            <Icon name="Gauge" size={13} /> Usage
+          </button>
           <button onClick={() => { setOpen(false); openSettings(true, 'general') }}>
             <Icon name="Settings" size={13} /> Account settings
           </button>

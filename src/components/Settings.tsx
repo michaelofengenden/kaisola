@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react'
-import { useKaisola, shellConfigDir, type ThemeMode, type PerfMode, type TabLayout, type CustomAgent, type TermBackground } from '../store/store'
+import { useKaisola, dockShowsLiveCard, shellConfigDir, type ThemeMode, type PerfMode, type TabLayout, type CustomAgent, type TermBackground } from '../store/store'
 import { bridge, isDesktop, type AcpAgent, type AppAuthStatus } from '../lib/bridge'
 import type { AutonomyLevel } from '../domain/types'
 import { useAgentRegistry, openAgentSession, type RegistryAgent } from '../lib/registry'
@@ -156,7 +156,7 @@ type SectionId = (typeof SECTIONS)[number]['id']
 const SECTION_DESC: Record<SectionId, string> = {
   general: 'Theme, native Live Glass or the lowest-memory Eco shell, and software updates.',
   usage: 'Live subscription windows for your signed-in Codex and Claude accounts.',
-  interface: 'Tab hierarchy and the little conveniences — every one of them yours to tune.',
+  interface: 'Workspace layout and quiet interface details.',
   extensions: 'Languages, previews, themes, and local development integrations installed in Kaisola.',
   terminal: 'Every terminal card — font size, weight, typeface, and cursor color.',
   agents: 'The CLIs in your + menu. Each runs with your existing install and login — Kaisola never proxies a model.',
@@ -227,6 +227,10 @@ export function Settings() {
   const themeMode = useKaisola((s) => s.themeMode)
   const setThemeMode = useKaisola((s) => s.setThemeMode)
   const perfMode = useKaisola((s) => s.perfMode)
+  const layoutMode = useKaisola((s) => s.layoutMode)
+  const setLayoutMode = useKaisola((s) => s.setLayoutMode)
+  const dockVisible = useKaisola((s) => s.dockOpen && dockShowsLiveCard(s))
+  const setDock = useKaisola((s) => s.setDock)
   const tabLayout = useKaisola((s) => s.tabLayout)
   const setTabLayout = useKaisola((s) => s.setTabLayout)
   const wordDiffs = useKaisola((s) => s.wordDiffs)
@@ -534,25 +538,72 @@ export function Settings() {
 
             {section === 'interface' && (
               <>
-                <div className="settings-row">
-                  <span className="settings-row-label">Session navigation <span className="faint" style={{ fontWeight: 400 }}>· switches live</span></span>
+                <div className="settings-row" data-setting="workspace-view">
+                  <span className="settings-row-label">Workspace view <span className="faint" style={{ fontWeight: 400 }}>· switches live</span></span>
                   <div className="settings-row-control">
                     <Dropdown
-                      value={tabLayout}
+                      value={layoutMode}
                       options={[
-                        { value: 'sidebar', name: 'Sidebars · default' },
-                        { value: 'shelf', name: 'Nested shelf' },
-                        { value: 'bare', name: 'Bare hierarchy' },
-                        { value: 'runway', name: 'Neutral runway' },
-                        { value: 'flat', name: 'Flat labels' },
-                        { value: 'compact', name: 'Compact row' },
+                        { value: 'studio', name: 'Files and sessions' },
+                        { value: 'focus', name: 'Files only' },
                       ]}
-                      onSelect={(v) => setTabLayout(v as TabLayout)}
+                      onSelect={(v) => setLayoutMode(v as 'studio' | 'focus')}
                       align="right"
-                      title="How project tabs and their sessions share the window chrome"
+                      title="Choose whether session panels share the workspace with your files"
                     />
                   </div>
                 </div>
+                <div className="settings-row" data-setting="session-panels">
+                  <span className="settings-row-label">Session panels <span className="faint" style={{ fontWeight: 400 }}>· agents and terminals</span></span>
+                  <div className="settings-row-control">
+                    <Dropdown
+                      value={dockVisible && layoutMode === 'studio' ? 'shown' : 'hidden'}
+                      options={[
+                        { value: 'shown', name: 'Shown' },
+                        { value: 'hidden', name: 'Hidden' },
+                      ]}
+                      onSelect={(v) => setDock(v === 'shown')}
+                      align="right"
+                      title="Show or hide agent and terminal panels"
+                    />
+                  </div>
+                </div>
+                <div className="settings-row" data-setting="session-placement">
+                  <span className="settings-row-label">Session placement <span className="faint" style={{ fontWeight: 400 }}>· left or top</span></span>
+                  <div className="settings-row-control">
+                    <Dropdown
+                      value={tabLayout === 'sidebar' ? 'left' : 'top'}
+                      options={[
+                        { value: 'left', name: 'Left sidebar · default' },
+                        { value: 'top', name: 'Across top' },
+                      ]}
+                      onSelect={(v) => setTabLayout(v === 'left' ? 'sidebar' : 'bare')}
+                      align="right"
+                      title="Choose whether session tabs appear on the left or across the top"
+                    />
+                  </div>
+                </div>
+                <details className="settings-layout-advanced">
+                  <summary>Advanced session styles</summary>
+                  <div className="settings-row" data-setting="advanced-session-style">
+                    <span className="settings-row-label">Top tab style <span className="faint" style={{ fontWeight: 400 }}>· optional</span></span>
+                    <div className="settings-row-control">
+                      <Dropdown
+                        value={tabLayout === 'sidebar' ? 'bare' : tabLayout}
+                        options={[
+                          { value: 'bare', name: 'Standard' },
+                          { value: 'shelf', name: 'Nested shelf' },
+                          { value: 'runway', name: 'Neutral runway' },
+                          { value: 'flat', name: 'Flat labels' },
+                          { value: 'compact', name: 'Compact row' },
+                        ]}
+                        onSelect={(v) => setTabLayout(v as TabLayout)}
+                        align="right"
+                        title="Optional presentation styles for top session tabs"
+                      />
+                    </div>
+                  </div>
+                </details>
                 {([
                   { label: 'Session cost chips', hint: 'what each Claude session cost', value: showCosts, set: setShowCosts, title: 'A quiet $ chip on Claude session cards — token totals on hover' },
                   { label: 'Cross-project inbox', hint: 'everything that needs you', value: inbox, set: setInbox, title: 'One bell in the tab strip rolling up waiting sessions and gates across every project tab' },

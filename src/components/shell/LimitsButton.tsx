@@ -181,6 +181,10 @@ function UsageSurface({ embedded = false }: { embedded?: boolean }) {
     claudePeak == null ? null : `Claude ${Math.round(claudePeak)}% peak`,
   ].filter(Boolean).join(' · ')
 
+  // Ordinary usage belongs in the account menu and Settings. Spend a header
+  // slot only when a subscription window is close enough to need attention.
+  if (!embedded && (peak == null || peak < 70)) return null
+
   const signInCodex = () => {
     requestTerminal('codex login', { name: 'Codex Login', restart: true })
     useKaisola.getState().setSettingsOpen(false)
@@ -306,7 +310,7 @@ function UsageSurface({ embedded = false }: { embedded?: boolean }) {
         data-active={open}
         onClick={toggle}
         title={usageTitle ? `Usage — ${usageTitle}` : 'Usage — Claude & Codex'}
-        aria-label="Open Claude and Codex usage"
+        aria-label="Usage limit warning"
         style={{ position: 'relative' }}
       >
         <Icon name="Gauge" size={15} />

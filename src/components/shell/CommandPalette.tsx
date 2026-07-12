@@ -46,6 +46,9 @@ export function CommandPalette() {
   const canvasOpen = useKaisola((s) => s.canvasOpen)
   const setDock = useKaisola((s) => s.setDock)
   const toggleCanvas = useKaisola((s) => s.toggleCanvas)
+  const railOpen = useKaisola((s) => s.railOpen)
+  const toggleRail = useKaisola((s) => s.toggleRail)
+  const setTabLayout = useKaisola((s) => s.setTabLayout)
   const runAgent = useKaisola((s) => s.runAgent)
   const runStageAgents = useKaisola((s) => s.runStageAgents)
   const enqueueStageAgents = useKaisola((s) => s.enqueueStageAgents)
@@ -289,6 +292,13 @@ export function CommandPalette() {
       { id: 'sessions-hide', group: 'Actions', label: 'Hide sessions', hint: 'Keep sessions running in the background', icon: 'PanelLeftClose', run: () => { setDock(false); close() } },
       { id: 'files-show', group: 'Actions', label: 'Show files', hint: 'Reveal the project canvas', icon: 'PanelRightOpen', run: () => { if (layoutMode === 'studio' && !canvasOpen) toggleCanvas(); close() } },
       { id: 'files-hide', group: 'Actions', label: 'Hide files', hint: 'Give the whole work row to sessions', icon: 'PanelRightClose', run: () => { if (layoutMode === 'focus' || canvasOpen) toggleCanvas(); close() } },
+      { id: 'file-tree-toggle', group: 'Layout', label: railOpen ? 'Hide file tree' : 'Show file tree', hint: 'The open pane owns its close button', icon: 'FolderTree', run: () => { toggleRail(); close() } },
+      { id: 'sessions-left', group: 'Layout', label: 'Place sessions on the left', icon: 'PanelsTopLeft', run: () => { setTabLayout('sidebar'); close() } },
+      { id: 'sessions-top', group: 'Layout', label: 'Place sessions across the top', icon: 'PanelTop', run: () => { setTabLayout('bare'); close() } },
+      { id: 'sessions-shelf', group: 'Layout', label: 'Use nested session shelf', icon: 'PanelTop', run: () => { setTabLayout('shelf'); close() } },
+      { id: 'sessions-runway', group: 'Layout', label: 'Use session runway', icon: 'PanelTop', run: () => { setTabLayout('runway'); close() } },
+      { id: 'sessions-flat', group: 'Layout', label: 'Use flat session labels', icon: 'PanelTop', run: () => { setTabLayout('flat'); close() } },
+      { id: 'sessions-compact', group: 'Layout', label: 'Use compact session row', icon: 'PanelTop', run: () => { setTabLayout('compact'); close() } },
     ]
     const autonomy: Command[] = (['observe', 'propose', 'execute', 'sprint'] as const).map((a) => ({
       id: `auto-${a}`,
@@ -320,7 +330,7 @@ export function CommandPalette() {
     }))
     return [...nav, ...workspace, ...agents, ...wfCmds, ...actions, ...history, ...autonomy]
   // `open` is a dep so each palette-open rebuilds the session-jump entries
-  }, [open, close, togglePalette, requestTerminal, workspacePath, followAgent, toggleFollowAgent, repoCheckpoints, snapshotWorkspace, restoreRepoCheckpoint, pushToast, runAgent, runStageAgents, enqueueStageAgents, workflows, runWorkflow, verifyCitations, buildCitationGraph, ingestAllPdfs, toggleTheme, setLayoutMode, setDock, toggleCanvas, layoutMode, canvasOpen, setAutonomy, loadDemo, clearProject, checkpoints, undoLast, restoreCheckpoint, proposals, focusProposal])
+  }, [open, close, togglePalette, requestTerminal, workspacePath, followAgent, toggleFollowAgent, repoCheckpoints, snapshotWorkspace, restoreRepoCheckpoint, pushToast, runAgent, runStageAgents, enqueueStageAgents, workflows, runWorkflow, verifyCitations, buildCitationGraph, ingestAllPdfs, toggleTheme, setLayoutMode, setDock, toggleCanvas, toggleRail, setTabLayout, layoutMode, canvasOpen, railOpen, setAutonomy, loadDemo, clearProject, checkpoints, undoLast, restoreCheckpoint, proposals, focusProposal])
 
   // ── ranked rows for the current mode ──
   const commandRows = useMemo(() => {

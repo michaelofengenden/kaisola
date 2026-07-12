@@ -27,9 +27,9 @@ export function WorkspaceRail({ side = 'left' }: { side?: 'left' | 'right' }) {
 function FileTreeHeader({ side }: { side: 'left' | 'right' }) {
   const toggleRail = useKaisola((s) => s.toggleRail)
   return (
-    <div className="wsrail-head">
+    <div className="wsrail-head" aria-label="File tree">
       <Icon name="FolderTree" size={12} />
-      <span>File tree</span>
+      <span className="grow" />
       <button onClick={toggleRail} title="Hide file tree" aria-label="Hide file tree">
         <Icon name={side === 'right' ? 'PanelRightClose' : 'PanelLeftClose'} size={13} />
       </button>

@@ -413,12 +413,78 @@ function setServerEnabled(workspace, scope, name, enabled) {
 // instead of making them re-type. Imports are SANITIZED RAW (never env-
 // expanded: baking ${VAR} secrets into our config file would leak them) and
 // arrive DISABLED — nothing arms without an explicit per-server toggle.
+function parseTomlScalar(raw) {
+  const value = String(raw || '').trim()
+  if (!value) return undefined
+  if (value.startsWith('"')) {
+    try { return JSON.parse(value) } catch { return undefined }
+  }
+  if (value.startsWith("'") && value.endsWith("'")) return value.slice(1, -1)
+  if (value === 'true') return true
+  if (value === 'false') return false
+  if (value.startsWith('[') && value.endsWith(']')) {
+    try {
+      const parsed = JSON.parse(value)
+      return Array.isArray(parsed) && parsed.every((item) => typeof item === 'string') ? parsed : undefined
+    } catch { return undefined }
+  }
+  return undefined
+}
+
+/** Minimal, bounded parser for Codex's documented [mcp_servers.*] TOML shape.
+ * It deliberately ignores the rest of config.toml and unsupported TOML
+ * syntax; we only need strings, string arrays, booleans, and nested env/header
+ * tables to safely discover existing servers. */
+function parseCodexMcpToml(text) {
+  const mcpServers = {}
+  let active = null
+  let section = null
+  const sectionRe = /^\[mcp_servers\.("(?:[^"\\]|\\.)*"|'[^']*'|[A-Za-z0-9_-]+)(?:\.(env|http_headers|env_http_headers))?\]$/
+  for (const rawLine of String(text || '').slice(0, 1_000_000).split(/\r?\n/).slice(0, 20_000)) {
+    const line = rawLine.trim()
+    if (!line || line.startsWith('#')) continue
+    const header = line.match(sectionRe)
+    if (header) {
+      const parsedName = parseTomlScalar(header[1])
+      active = typeof parsedName === 'string' ? parsedName : header[1]
+      section = header[2] || null
+      if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(active)) { active = null; continue }
+      mcpServers[active] ??= {}
+      continue
+    }
+    if (line.startsWith('[')) { active = null; section = null; continue }
+    if (!active) continue
+    const assignment = line.match(/^([A-Za-z0-9_-]+|"(?:[^"\\]|\\.)*")\s*=\s*(.+)$/)
+    if (!assignment) continue
+    const parsedKey = parseTomlScalar(assignment[1])
+    const key = typeof parsedKey === 'string' ? parsedKey : assignment[1]
+    const value = parseTomlScalar(assignment[2])
+    if (value === undefined) continue
+    const server = mcpServers[active]
+    if (section === 'env' && typeof value === 'string') (server.env ??= {})[key] = value
+    else if (section === 'http_headers' && typeof value === 'string') (server.headers ??= {})[key] = value
+    else if (section === 'env_http_headers' && typeof value === 'string' && /^[A-Z_][A-Z0-9_]*$/i.test(value)) (server.headers ??= {})[key] = `\${${value}}`
+    else if (!section && ['command', 'url', 'type', 'enabled', 'args', 'bearer_token_env_var'].includes(key)) server[key] = value
+  }
+  for (const server of Object.values(mcpServers)) {
+    if (typeof server.bearer_token_env_var === 'string' && /^[A-Z_][A-Z0-9_]*$/i.test(server.bearer_token_env_var)) {
+      ;(server.headers ??= {}).Authorization = `Bearer \${${server.bearer_token_env_var}}`
+    }
+    delete server.bearer_token_env_var
+  }
+  return { mcpServers }
+}
+
 function discoverySources() {
   const home = app.getPath('home')
   return [
     { origin: 'Cursor', file: path.join(home, '.cursor', 'mcp.json'), pick: (d) => d && d.mcpServers },
     { origin: 'Claude Desktop', file: path.join(home, 'Library', 'Application Support', 'Claude', 'claude_desktop_config.json'), pick: (d) => d && d.mcpServers },
     { origin: 'Claude CLI', file: path.join(home, '.claude.json'), pick: (d) => d && d.mcpServers },
+    { origin: 'Codex CLI', file: path.join(home, '.codex', 'config.toml'), load: (file) => parseCodexMcpToml(fs.readFileSync(file, 'utf8')), pick: (d) => d && d.mcpServers },
+    { origin: 'Gemini CLI', file: path.join(home, '.gemini', 'settings.json'), pick: (d) => d && d.mcpServers },
+    { origin: 'VS Code', file: path.join(home, 'Library', 'Application Support', 'Code', 'User', 'mcp.json'), pick: (d) => d && (d.servers || d.mcpServers) },
+    { origin: 'Windsurf', file: path.join(home, '.codeium', 'windsurf', 'mcp_config.json'), pick: (d) => d && d.mcpServers },
   ]
 }
 
@@ -460,7 +526,10 @@ function discoverExternal() {
   const found = []
   const seen = new Set()
   for (const src of discoverySources()) {
-    const { data } = readJson(src.file)
+    let data
+    if (src.load) {
+      try { data = src.load(src.file) } catch { data = null }
+    } else data = readJson(src.file).data
     const map = src.pick(data)
     if (!map || typeof map !== 'object' || Array.isArray(map)) continue
     for (const [name, raw] of Object.entries(map).slice(0, MAX_SERVERS_PER_SCOPE)) {
@@ -515,7 +584,7 @@ function ensureUserConfig() {
 const INSTALL_NAME_RE = /^[a-z0-9][a-z0-9_-]{0,39}$/i
 const MAX_INSTALL_CONFIG_BYTES = 64 * 1024
 const SECRET_NAME_RE = /(authorization|api[-_]?key|token|secret|password|credential)/i
-const ENV_PLACEHOLDER_RE = /^\$\{[A-Z_][A-Z0-9_]*\}$/i
+const ENV_PLACEHOLDER_RE = /^(?:Bearer\s+)?\$\{[A-Z_][A-Z0-9_]*\}$/i
 function containsLiteralSecret(config) {
   for (const field of ['env', 'headers']) {
     const values = config && config[field]
@@ -697,6 +766,10 @@ function removeUserServer(name, extensionId) {
 }
 
 function registerMcpCatalogHandlers(ipcMain) {
+  // Sync sibling-agent catalogs into Kaisola on every launch. Imports remain
+  // disabled until the user enables each server, so discovery never executes
+  // a newly found command or contacts a remote endpoint on its own.
+  try { importDiscovered() } catch { /* optional sibling configs */ }
   ipcMain.handle('mcp:server-add', (_e, { name, config, extensionId } = {}) => {
     try { return addUserServer(String(name ?? ''), config, extensionId == null ? undefined : String(extensionId)) } catch (err) {
       return { ok: false, message: String((err && err.message) || err) }
@@ -750,5 +823,5 @@ module.exports = {
   addUserServer,
   removeUserServer,
   writePrivateJson,
-  __test: { normalizeSpec, parseRpcBody, containsLiteralSecret, specHash, sanitizeRaw, storedSpecHash, planAddUserServer, planRemoveUserServer, writePrivateJson, claudeEntriesFromConfig },
+  __test: { normalizeSpec, parseRpcBody, containsLiteralSecret, specHash, sanitizeRaw, storedSpecHash, planAddUserServer, planRemoveUserServer, writePrivateJson, claudeEntriesFromConfig, parseCodexMcpToml },
 }

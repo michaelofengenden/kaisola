@@ -221,6 +221,58 @@ const TOOLS = [
   },
 ]
 
+// MCP is more than tool calls. Expose the same project context as native,
+// read-only resources and reusable prompts so clients that support those
+// protocol surfaces can integrate without inventing tool-call boilerplate.
+const RESOURCES = [
+  { uri: 'kaisola://project/overview', name: 'project-overview', title: 'Project overview', description: 'Active project, stage, workspace and research-object counts.' },
+  { uri: 'kaisola://project/corpus', name: 'project-corpus', title: 'Research corpus', description: 'Bounded list of papers, repositories, datasets and notes.' },
+  { uri: 'kaisola://project/hypotheses', name: 'project-hypotheses', title: 'Hypotheses', description: 'Current hypotheses and their research status.' },
+  { uri: 'kaisola://project/runs', name: 'project-runs', title: 'Experiment runs', description: 'Recent experiment and evaluation runs.' },
+  { uri: 'kaisola://agents/tasks', name: 'agent-tasks', title: 'Shared agent tasks', description: 'Open coordination work and findings shared across agents.' },
+].map((resource) => ({ ...resource, mimeType: 'application/json' }))
+
+const PROMPTS = [
+  {
+    name: 'orient_to_project',
+    title: 'Orient to this project',
+    description: 'Read the project and return a concise operational orientation before acting.',
+    arguments: [{ name: 'focus', description: 'Optional area or question to prioritize', required: false }],
+    text: ({ focus } = {}) => `Read kaisola://project/overview, kaisola://project/corpus, and kaisola://agents/tasks. Give a concise orientation: current stage, active research question, relevant sources, open work, and the safest next action.${focus ? ` Prioritize: ${String(focus).slice(0, 500)}.` : ''}`,
+  },
+  {
+    name: 'review_research_state',
+    title: 'Review research state',
+    description: 'Review hypotheses and experiment runs for gaps, contradictions and next tests.',
+    arguments: [],
+    text: () => 'Read kaisola://project/hypotheses and kaisola://project/runs. Identify unsupported hypotheses, contradictory evidence, missing controls, and the smallest useful next experiment. Post coordination work through the agent-task ledger; do not mutate project state directly.',
+  },
+  {
+    name: 'coordinate_agents',
+    title: 'Coordinate with other agents',
+    description: 'Check the shared ledger, claim relevant work, and leave a bounded handoff.',
+    arguments: [{ name: 'agent', description: 'Your agent name', required: false }],
+    text: ({ agent } = {}) => `Read kaisola://agents/tasks. Claim only work that fits your current session, report progress through agent_task_update, and leave precise results or blockers for the next agent.${agent ? ` Identify yourself as ${String(agent).slice(0, 120)}.` : ''}`,
+  },
+]
+
+function resourceData(uri) {
+  const s = storeState()
+  const p = (s && s.project) || {}
+  if (uri === 'kaisola://project/overview') return TOOLS.find((tool) => tool.name === 'project_overview').run()
+  if (uri === 'kaisola://project/corpus') {
+    return { items: (p.corpus || []).slice(0, 200).map((item) => ({ id: item.id, kind: item.kind, title: item.title, year: item.year, abstract: snip(item.abstract || item.summary, 1000) })) }
+  }
+  if (uri === 'kaisola://project/hypotheses') {
+    return { items: (p.hypotheses || []).slice(0, 200).map((item) => ({ id: item.id, title: item.title, claim: snip(item.claim, 1000), status: item.status })) }
+  }
+  if (uri === 'kaisola://project/runs') {
+    return { items: (p.runs || []).slice(-200).map((item) => ({ id: item.id, label: item.label, status: item.status, summary: snip(item.summary, 1000) })) }
+  }
+  if (uri === 'kaisola://agents/tasks') return { tasks: ledger.listTasks({ project: (s && s.workspacePath) || undefined }).slice(0, 200) }
+  return null
+}
+
 // ── JSON-RPC over Streamable HTTP ───────────────────────────────────────────
 function rpcResult(id, result) {
   return { jsonrpc: '2.0', id, result }
@@ -234,7 +286,11 @@ function handleRpc(msg) {
   if (method === 'initialize') {
     return rpcResult(id, {
       protocolVersion: PROTOCOL,
-      capabilities: { tools: { listChanged: false } },
+      capabilities: {
+        tools: { listChanged: false },
+        resources: { subscribe: false, listChanged: false },
+        prompts: { listChanged: false },
+      },
       serverInfo: { name: 'kaisola', title: 'Kaisola Research IDE', version: app.getVersion() },
       instructions: 'Kaisola project state (read) + the shared agent-task ledger (coordinate with other agents). Research state is human-gated: post findings as ledger tasks, never assume writes.',
     })
@@ -261,6 +317,25 @@ function handleRpc(msg) {
     } catch (err) {
       return rpcResult(id, { content: [{ type: 'text', text: `Tool failed: ${String((err && err.message) || err)}` }], isError: true })
     }
+  }
+  if (method === 'resources/list') return rpcResult(id, { resources: RESOURCES })
+  if (method === 'resources/templates/list') return rpcResult(id, { resourceTemplates: [] })
+  if (method === 'resources/read') {
+    const uri = String(params?.uri || '')
+    const data = resourceData(uri)
+    if (!data) return rpcError(id, -32602, `Unknown resource: ${uri}`)
+    return rpcResult(id, { contents: [{ uri, mimeType: 'application/json', text: JSON.stringify(data, null, 2).slice(0, 250_000) }] })
+  }
+  if (method === 'prompts/list') {
+    return rpcResult(id, { prompts: PROMPTS.map(({ text: _text, ...prompt }) => prompt) })
+  }
+  if (method === 'prompts/get') {
+    const prompt = PROMPTS.find((candidate) => candidate.name === params?.name)
+    if (!prompt) return rpcError(id, -32602, `Unknown prompt: ${params?.name}`)
+    return rpcResult(id, {
+      description: prompt.description,
+      messages: [{ role: 'user', content: { type: 'text', text: prompt.text(params?.arguments || {}) } }],
+    })
   }
   if (typeof method === 'string' && method.startsWith('notifications/')) return null // 202, no body
   return rpcError(id, -32601, `Method not implemented: ${method}`)
@@ -338,6 +413,8 @@ function registerMcpHandlers(ipcMain) {
     protocol: PROTOCOL,
     transport: 'streamable-http',
     toolCount: TOOLS.length,
+    resourceCount: RESOURCES.length,
+    promptCount: PROMPTS.length,
     humanGatedTools: TOOLS.filter((t) => t._meta && t._meta['anthropic/requiresUserInteraction']).map((t) => t.name),
     // only offer the config file once it's actually on disk — a boot line
     // pointing at a missing file would make claude error at launch

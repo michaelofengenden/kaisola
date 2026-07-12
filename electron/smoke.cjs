@@ -953,8 +953,12 @@ app.whenReady().then(async () => {
       compactList: li ? parseFloat(getComputedStyle(li).marginBottom) <= 4 : false,
       differentiatedRoles,
       roleDebug: { roleAlignment, roleBackground, roleIcons, userLeft: userTurnRect?.left, agentLeft: agentTurnRect?.left, userBg: userStyle?.backgroundColor, agentBg: agentStyle?.backgroundColor },
-      promptTabs: promptTabs.length === 2 && promptTabs[0]?.getAttribute('data-active') === 'true',
-      promptTabsTopLeft: document.querySelector('.turn-tabs-wrap')?.nextElementSibling === stream,
+      promptRail: promptTabs.length === 2 && promptTabs[0]?.getAttribute('data-active') === 'true',
+      promptRailMinimal: (() => {
+        const rail = document.querySelector('.turn-rail')
+        const style = rail ? getComputedStyle(rail) : null
+        return !!rail && rail.parentElement?.classList.contains('assistant') && style?.position === 'absolute' && !document.querySelector('.turn-tabs-wrap')
+      })(),
       localLink: !!localLink,
       linkOpenedFiles: afterLink.stage === 'files' && afterLink.fileRequest?.path === ${JSON.stringify(agentLinkTarget)},
       lineJump: afterLink.scrollRequest?.path === ${JSON.stringify(agentLinkTarget)} && afterLink.scrollRequest?.line === 17,
@@ -988,12 +992,10 @@ app.whenReady().then(async () => {
     get().enqueueAssistantPrompt(tid, { text: 'queue-smoke-third', attachments: [], mentions: [], speed: 'fast' })
     const queuedTwo = (get().assistantPromptQueues[tid] || []).length === 2
     await wait(80)
-    const queueCapsule = assistant?.querySelector('.composer-queue-capsule')
-    const compactCapsule = !!queueCapsule && !assistant?.querySelector('.composer-queue, .queue-chip')
-    queueCapsule?.click()
-    await wait(60)
-    const queuePopover = document.querySelectorAll('.queue-pop .queue-pop-row').length === 2
-    queueCapsule?.click()
+    const queueRows = [...(assistant?.querySelectorAll('.composer-queue-preview-row') || [])]
+    const inlinePreview = queueRows.length === 2 && !assistant?.querySelector('.composer-queue-capsule')
+    const aboveComposer = assistant?.querySelector('.composer-queue-preview')?.nextElementSibling?.classList.contains('composer-input') === true
+    const noQueueToast = ![...document.querySelectorAll('.toast')].some((node) => /queued prompt/i.test(node.textContent || ''))
     for (let i = 0; i < 180; i++) {
       const state = get()
       const threadBusy = state.assistantThreads.find((thread) => thread.id === tid)?.busy
@@ -1009,8 +1011,9 @@ app.whenReady().then(async () => {
     return {
       started,
       queuedTwo,
-      compactCapsule,
-      queuePopover,
+      inlinePreview,
+      aboveComposer,
+      noQueueToast,
       drained: !(state.assistantPromptQueues[tid] || []).length && !state.assistantThreads.find((thread) => thread.id === tid)?.busy,
       combinedOnce: users.length === 2 && combined.length === 1 && combined[0].text.indexOf('queue-smoke-second') < combined[0].text.indexOf('queue-smoke-third'),
       deliveredTogether: turns.some((turn) => turn.kind === 'assistant' && turn.text.includes('queue-smoke-second') && turn.text.includes('queue-smoke-third')),
@@ -2147,7 +2150,7 @@ a^2 + b^2 = c^2
     if (!get().railOpen) get().toggleRail()
     await wait()
     const rightToggle = document.querySelector('.tabstrip-tools .rail-toggle[data-side="right"]')
-    const fileTreeTextOnly = /file tree/i.test(rightToggle?.textContent || '') && !rightToggle?.querySelector('svg')
+    const fileTreeIconOnly = !!rightToggle?.querySelector('svg') && !(rightToggle?.textContent || '').trim()
     const tree = document.querySelector('.wsrail[data-side="right"]')
     const localClose = tree?.querySelector('.wsrail-head button[aria-label="Hide file tree"]')
     localClose?.click(); await wait()
@@ -2173,7 +2176,7 @@ a^2 + b^2 = c^2
     await wait()
     return {
       rightToggle: !!rightToggle,
-      fileTreeTextOnly,
+      fileTreeIconOnly,
       localClose: !!localClose,
       hidden,
       recoverySameSide: !!recoverySameSide,
@@ -2416,6 +2419,23 @@ a^2 + b^2 = c^2
   mcpConfigSecurity.private = !!generatedMcp && (fsx.statSync(generatedMcpPath).mode & 0o777) === 0o600
   mcpConfigSecurity.placeholder = generatedMcp.includes('${KAISOLA_SMOKE_MCP_TOKEN}')
   mcpConfigSecurity.notExpanded = !generatedMcp.includes(process.env.KAISOLA_SMOKE_MCP_TOKEN)
+  try {
+    const builtin = JSON.parse(generatedMcp).mcpServers.kaisola
+    const rpc = async (method, params) => {
+      const response = await fetch(builtin.url, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', ...builtin.headers },
+        body: JSON.stringify({ jsonrpc: '2.0', id: method, method, ...(params ? { params } : {}) }),
+      })
+      return response.json()
+    }
+    const initialized = await rpc('initialize', { protocolVersion: '2025-06-18', capabilities: {}, clientInfo: { name: 'smoke', version: '1' } })
+    const resources = await rpc('resources/list')
+    const prompts = await rpc('prompts/list')
+    mcpConfigSecurity.resources = resources?.result?.resources?.length ?? 0
+    mcpConfigSecurity.prompts = prompts?.result?.prompts?.length ?? 0
+    mcpConfigSecurity.fullSurface = !!initialized?.result?.capabilities?.resources && !!initialized?.result?.capabilities?.prompts
+  } catch { mcpConfigSecurity.fullSurface = false }
   await win.webContents.executeJavaScript(`window.kaisola.mcp.serverRemove('smoke-private')`)
   console.log('MCP_CONFIG_SECURITY=' + JSON.stringify(mcpConfigSecurity))
 
@@ -3532,8 +3552,8 @@ a^2 + b^2 = c^2
     !activityUi.card || !activityUi.hasSubagent || !activityUi.hasTerminal || !activityUi.hasStatus || !activityUi.standardizedDot || !activityUi.openBtn || !activityUi.noContext || !activityUi.noMention || !activityUi.compactChrome || !activityUi.layoutControl || !activityUi.settingsControl ||
     !attentionUi.running || !attentionUi.pulse || !attentionUi.completed || !attentionUi.still || !attentionUi.cleared || !attentionUi.nativeAttention ||
     !brokerActivity.created || !brokerActivity.began || !brokerActivity.detached || !brokerActivity.settled || !brokerActivity.durable ||
-    !transcriptTypography.rendered || !transcriptTypography.normalWhitespace || !transcriptTypography.readableWidth || !transcriptTypography.compactStream || !transcriptTypography.compactList || !transcriptTypography.differentiatedRoles || !transcriptTypography.promptTabs || !transcriptTypography.promptTabsTopLeft || !transcriptTypography.localLink || !transcriptTypography.linkOpenedFiles || !transcriptTypography.lineJump ||
-    !promptQueue.started || !promptQueue.queuedTwo || !promptQueue.compactCapsule || !promptQueue.queuePopover || !promptQueue.drained || !promptQueue.combinedOnce || !promptQueue.deliveredTogether || !promptQueue.newestSpeedWon ||
+    !transcriptTypography.rendered || !transcriptTypography.normalWhitespace || !transcriptTypography.readableWidth || !transcriptTypography.compactStream || !transcriptTypography.compactList || !transcriptTypography.differentiatedRoles || !transcriptTypography.promptRail || !transcriptTypography.promptRailMinimal || !transcriptTypography.localLink || !transcriptTypography.linkOpenedFiles || !transcriptTypography.lineJump ||
+    !promptQueue.started || !promptQueue.queuedTwo || !promptQueue.inlinePreview || !promptQueue.aboveComposer || !promptQueue.noQueueToast || !promptQueue.drained || !promptQueue.combinedOnce || !promptQueue.deliveredTogether || !promptQueue.newestSpeedWon ||
     !steer.started || !steer.neverQueued || !steer.steeredWhileBusy || !steer.twoUserTurns || !steer.followDelivered || !steer.baseDelivered || !steer.endedIdle ||
     !persist.stored || !persist.hasTheme || !persist.hasAgent || !persist.hasThread || !persist.hasChatTurn || !persist.hasDraft || !persist.draftBounded || !persist.hasCodexEffort || !persist.hasTabLayout ||
     !boot.hasId || !boot.ran ||
@@ -3569,14 +3589,14 @@ a^2 + b^2 = c^2
     !autoname.named || !autoname.rowShows || !autoname.sticky || !autoname.manualWins || !autoname.termNamed ||
     !minimalUi.noSidebar || !minimalUi.noSidebarResize || !minimalUi.noStageNav || !minimalUi.hasSessionSidebar || !minimalUi.hasRail || !minimalUi.filesOnRight || !minimalUi.hasPlus || !minimalUi.hasFiles ||
     !tabLayouts.rendered || !tabLayouts.sidebarOk || !tabLayouts.shelfOk || !tabLayouts.bareOk || !tabLayouts.runwayOk || !tabLayouts.flatOk || !tabLayouts.compactOk || !tabLayouts.reciprocalToggle || !tabLayouts.verticalAddFlow || !tabLayouts.stateKept || !tabLayouts.staticPaint || !tabLayouts.accessible || !tabLayouts.sessionIdentity ||
-    !intuitiveLayoutControls.rightToggle || !intuitiveLayoutControls.fileTreeTextOnly || !intuitiveLayoutControls.localClose || !intuitiveLayoutControls.hidden || !intuitiveLayoutControls.recoverySameSide || !intuitiveLayoutControls.restored || !intuitiveLayoutControls.layoutNamed || !intuitiveLayoutControls.startsAsTop || !intuitiveLayoutControls.menuStayedOpen || !intuitiveLayoutControls.changedToLeft || !intuitiveLayoutControls.reversedInPlace || !intuitiveLayoutControls.layoutOnly || !intuitiveLayoutControls.previewDistinct ||
+    !intuitiveLayoutControls.rightToggle || !intuitiveLayoutControls.fileTreeIconOnly || !intuitiveLayoutControls.localClose || !intuitiveLayoutControls.hidden || !intuitiveLayoutControls.recoverySameSide || !intuitiveLayoutControls.restored || !intuitiveLayoutControls.layoutNamed || !intuitiveLayoutControls.startsAsTop || !intuitiveLayoutControls.menuStayedOpen || !intuitiveLayoutControls.changedToLeft || !intuitiveLayoutControls.reversedInPlace || !intuitiveLayoutControls.layoutOnly || !intuitiveLayoutControls.previewDistinct ||
     !realPointerLayout.firstWorked || !realPointerLayout.reverseWorked || !realPointerLayout.stayedInteractive ||
     !narrowAgentUi.rendered || !narrowAgentUi.narrow || !narrowAgentUi.containerAware || !narrowAgentUi.composerFits || !narrowAgentUi.sendVisible || !narrowAgentUi.footerFits || !narrowAgentUi.wraps ||
     !settings.settingsSeparate || !settings.hasAppearance || !settings.hasUsage || !settings.hasDiskResidency || !settings.hasTabLayout || !settings.extensionsInSettings || !settings.hasFilesButton || !settings.noSidebarControls || !settings.previewOpened || !settings.previewDismissed || !settings.usagePreviewOpened || !settings.usagePreviewDismissed ||
     !extensionsUi.opened || extensionsUi.cards < 8 || !extensionsUi.hasFilters || !extensionsUi.csvInstalled || !extensionsUi.jsonInstalled ||
     !extensionsUi.persisted || !extensionsUi.defaultUninstallPersisted || !extensionsUi.csvPreview || !extensionsUi.jsonPreview || !extensionsUi.boundedJsonPreview || !extensionsUi.closed ||
     !devExtensionHotReload.registered || !devExtensionHotReload.updated || !devExtensionHotReload.visible ||
-    !mcpConfigSecurity.added || !mcpConfigSecurity.running || mcpConfigSecurity.tools < 1 || !mcpConfigSecurity.private || !mcpConfigSecurity.placeholder || !mcpConfigSecurity.notExpanded ||
+    !mcpConfigSecurity.added || !mcpConfigSecurity.running || mcpConfigSecurity.tools < 1 || !mcpConfigSecurity.private || !mcpConfigSecurity.placeholder || !mcpConfigSecurity.notExpanded || !mcpConfigSecurity.fullSurface || mcpConfigSecurity.resources < 1 || mcpConfigSecurity.prompts < 1 ||
     !dropfit.hasBtn || !dropfit.fits ||
     agentrun.added < 1 || agentrun.agentId !== 'hypothesis' || !agentrun.hasChanges || agentrun.status !== 'pending' ||
     approve.hypAdded < 1 || approve.createStatus !== 'approved' || !approve.patched ||

@@ -111,3 +111,29 @@ test('Claude handoff preserves secret placeholders instead of expanding them to 
   assert.equal(entries.local.env.API_TOKEN, '${API_TOKEN}')
   assert.equal(entries.off, undefined)
 })
+
+test('Codex MCP TOML discovery preserves env references and supported transports', () => {
+  const parsed = __test.parseCodexMcpToml(`
+[mcp_servers.docs]
+url = "https://developers.example.test/mcp"
+bearer_token_env_var = "DOCS_TOKEN"
+
+[mcp_servers.local]
+command = "/usr/bin/node"
+args = ["server.js", "--quiet"]
+
+[mcp_servers.local.env]
+API_TOKEN = "\${LOCAL_TOKEN}"
+
+[mcp_servers.remote.env_http_headers]
+"X-API-Key" = "REMOTE_KEY"
+
+[mcp_servers.remote]
+url = "https://remote.example.test/mcp"
+`)
+  assert.equal(parsed.mcpServers.docs.url, 'https://developers.example.test/mcp')
+  assert.equal(parsed.mcpServers.docs.headers.Authorization, 'Bearer ${DOCS_TOKEN}')
+  assert.deepEqual(parsed.mcpServers.local.args, ['server.js', '--quiet'])
+  assert.equal(parsed.mcpServers.local.env.API_TOKEN, '${LOCAL_TOKEN}')
+  assert.equal(parsed.mcpServers.remote.headers['X-API-Key'], '${REMOTE_KEY}')
+})

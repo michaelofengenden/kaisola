@@ -676,10 +676,6 @@ export const Assistant = memo(function Assistant({ threadId }: { threadId: strin
   const [fileDropHover, setFileDropHover] = useState(false)
   const scrollRef = useRef<HTMLDivElement>(null)
   const inputRef = useRef<HTMLTextAreaElement>(null)
-  const [queueOpen, setQueueOpen] = useState(false)
-  const queueButton = useRef<HTMLButtonElement>(null)
-  const queuePanel = useRef<HTMLDivElement>(null)
-  useProviderPopover(queueOpen, setQueueOpen, queueButton, queuePanel)
   // grow the composer to fit what's typed (capped); reset to one line when empty
   const autoGrow = (el: HTMLTextAreaElement) => { el.style.height = 'auto'; el.style.height = `${Math.min(el.scrollHeight, 160)}px` }
 
@@ -712,7 +708,6 @@ export const Assistant = memo(function Assistant({ threadId }: { threadId: strin
   const mentions = draft.mentions
   const speed = draft.speed
   useEffect(() => { if (inputRef.current && !input) inputRef.current.style.height = '' }, [input])
-  useEffect(() => { if (!queuedPrompts.length) setQueueOpen(false) }, [queuedPrompts.length])
   const permsForAgent = pendingPermissions.filter((p) => p.key === connectionKey)
   const arun: Runtime = liveRuntime ?? { turns: [], first: true }
   const [archivedPage, setArchivedPage] = useState<Turn[]>([])
@@ -904,8 +899,8 @@ export const Assistant = memo(function Assistant({ threadId }: { threadId: strin
     [archivedPage, arun.turns],
   )
   const prompts = useMemo(() => displayedTurns.filter((x) => x.turn.kind === 'user'), [displayedTurns])
-  const turnTabsRef = useRef<HTMLDivElement>(null)
-  const [promptHover, setPromptHover] = useState<{ idx: number; left: number } | null>(null)
+  const promptRailRef = useRef<HTMLDivElement>(null)
+  const [promptHover, setPromptHover] = useState<{ idx: number; top: number } | null>(null)
   const [activePrompt, setActivePrompt] = useState<number | null>(null)
   const jumpToTurn = (idx: number) => {
     setActivePrompt(idx)
@@ -1363,7 +1358,6 @@ export const Assistant = memo(function Assistant({ threadId }: { threadId: strin
     enqueueAssistantPrompt(active.id, prompt, undefined, projectId)
     clearAssistantDraft(active.id, { keepSpeed: true }, projectId)
     resetComposerHeight()
-    useKaisola.getState().pushToast('info', `Queued prompt for ${agentName}`)
   }
   const send = async () => {
     const prompt = currentPrompt()
@@ -1537,6 +1531,10 @@ export const Assistant = memo(function Assistant({ threadId }: { threadId: strin
       }
       return false
     }
+    // Wake the queue in the same microtask as turn settlement. Waiting for the
+    // busy=false React render made follow-ups feel noticeably sticky on fast
+    // Codex/Claude turns even though the queue was already ready in the store.
+    queueMicrotask(() => { void drainQueuedPrompts() })
     return true
   }
   // Queue pause semantics: reconnecting, a new enqueue, or a manual send
@@ -1589,7 +1587,6 @@ export const Assistant = memo(function Assistant({ threadId }: { threadId: strin
       if (canSteer) { void steerText({ ...EMPTY_DRAFT, text: text.trim(), speed }); return }
       queuePausedRef.current = false
       enqueueAssistantPrompt(active.id, { ...EMPTY_DRAFT, text: text.trim(), speed }, undefined, projectId)
-      useKaisola.getState().pushToast('info', `Queued prompt for ${agentName}`)
       return
     }
     void sendText(text).then((sent) => {
@@ -1598,7 +1595,6 @@ export const Assistant = memo(function Assistant({ threadId }: { threadId: strin
       if (!sent) {
         queuePausedRef.current = false
         enqueueAssistantPrompt(active.id, { ...EMPTY_DRAFT, text: text.trim(), speed }, undefined, projectId)
-        useKaisola.getState().pushToast('info', `Queued prompt for ${agentName}`)
       }
     })
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -1652,38 +1648,37 @@ export const Assistant = memo(function Assistant({ threadId }: { threadId: strin
         inputRef.current?.focus()
       }}
     >
-      {/* Every user prompt is a compact tab: click to jump within any agent. */}
+      {/* Prompt history stays out of the chrome: a quiet top-right rail reveals
+          previews on hover and still supports click-to-jump for every agent. */}
       {(prompts.length > 0 || canLoadArchive) && (
-        <div className="turn-tabs-wrap" ref={turnTabsRef} onMouseLeave={() => setPromptHover(null)}>
-          <div className="turn-tabs-title"><Icon name="MessagesSquare" size={11} /> Prompts</div>
-          <div className="turn-tabs" aria-label="Prompt history">
+        <div className="turn-rail" ref={promptRailRef} onMouseLeave={() => setPromptHover(null)} aria-label="Prompt history">
+          <div className="turn-rail-markers">
             {canLoadArchive && (
               <button
-                className="turn-tab turn-tab-history"
+                className="turn-rail-history"
                 disabled={archiveLoading}
                 onClick={() => { void loadOlderTurns() }}
                 title="Load older prompts from Kaisola's disk archive"
+                aria-label="Load older prompts"
               >
-                <Icon name="History" size={10} />
-                <span>{archiveLoading ? 'Loading…' : `${Math.max(0, archivedCount - archivedPage.length)} older`}</span>
+                <Icon name="History" size={11} />
               </button>
             )}
             {prompts.map((p, n) => (
               <button
                 key={`${p.idx}-${p.turn.at ?? n}`}
-                className="turn-tab turn-tab-prompt"
+                className="turn-rail-marker turn-tab-prompt"
                 data-active={p.idx === activePrompt}
                 aria-current={p.idx === activePrompt ? 'step' : undefined}
                 onMouseEnter={(e) => {
-                  const wrapWidth = turnTabsRef.current?.clientWidth ?? 340
-                  const left = e.currentTarget.offsetLeft - e.currentTarget.parentElement!.scrollLeft
-                  setPromptHover({ idx: p.idx, left: Math.max(0, Math.min(left, wrapWidth - 310)) })
+                  const railHeight = promptRailRef.current?.clientHeight ?? 260
+                  setPromptHover({ idx: p.idx, top: Math.max(0, Math.min(e.currentTarget.offsetTop - 12, railHeight - 150)) })
                 }}
                 onClick={() => jumpToTurn(p.idx)}
                 title={p.turn.text}
+                aria-label={`Prompt ${n + 1}: ${p.turn.text}`}
               >
-                <span className="turn-tab-index">{n + 1}</span>
-                <span className="turn-tab-text">{p.turn.text.replace(/\s+/g, ' ').trim() || 'Prompt'}</span>
+                <span />
               </button>
             ))}
           </div>
@@ -1692,7 +1687,7 @@ export const Assistant = memo(function Assistant({ threadId }: { threadId: strin
             if (!p) return null
             const reply = replyPreview(p.idx)
             return (
-              <div className="turn-pop" style={{ left: promptHover.left }}>
+              <div className="turn-pop" style={{ top: promptHover.top }}>
                 <div className="turn-pop-title">{p.turn.text}</div>
                 {reply.text && <div className="turn-pop-preview">{reply.text}</div>}
                 <div className="turn-pop-meta">
@@ -1850,6 +1845,20 @@ export const Assistant = memo(function Assistant({ threadId }: { threadId: strin
             ))}
           </div>
         )}
+        {queuedPrompts.length > 0 && (
+          <div className="composer-queue-preview" aria-label="Queued prompts">
+            {queuedPrompts.map((q, index) => (
+              <div key={q.id} className="composer-queue-preview-row" title={q.text}>
+                <span className="composer-queue-order">{index === 0 ? 'Next' : index + 1}</span>
+                <span className="composer-queue-text">{q.text}</span>
+                {q.speed === 'fast' && <Icon name="Gauge" size={10} />}
+                <button onClick={() => removeQueuedAssistantPrompt(active.id, q.id)} title="Remove queued prompt" aria-label="Remove queued prompt">
+                  <Icon name="X" size={10} />
+                </button>
+              </div>
+            ))}
+          </div>
+        )}
         <textarea
           ref={inputRef}
           className="composer-input"
@@ -1870,51 +1879,6 @@ export const Assistant = memo(function Assistant({ threadId }: { threadId: strin
         />
         <div className="composer-bar">
           <button className="composer-tool" onClick={attach} title="Attach files"><Icon name="Paperclip" size={14} /></button>
-          {queuedPrompts.length > 0 && (
-            <>
-              <button
-                ref={queueButton}
-                className="composer-queue-capsule"
-                data-open={queueOpen || undefined}
-                onClick={() => setQueueOpen((value) => !value)}
-                title={`${queuedPrompts.length} queued prompt${queuedPrompts.length === 1 ? '' : 's'}${queuedPrompts.length > 1 ? ' · sends together' : ''}`}
-                aria-haspopup="dialog"
-                aria-expanded={queueOpen}
-              >
-                <Icon name="ListChecks" size={12} />
-                <span>{queuedPrompts.length} queued</span>
-                <Icon name="ChevronUp" size={10} />
-              </button>
-              {queueOpen && createPortal(
-                <div
-                  ref={queuePanel}
-                  className="provider-pop queue-pop"
-                  role="dialog"
-                  aria-label="Queued prompts"
-                  style={{ position: 'fixed', ...popoverPosition(queueButton.current) }}
-                >
-                  <div className="provider-pop-head">
-                    <strong>Queued prompts</strong>
-                    <span className="grow" />
-                    <span className="faint">{queuedPrompts.length > 1 ? 'Sends together' : 'Sends next'}</span>
-                  </div>
-                  <div className="queue-pop-list">
-                    {queuedPrompts.map((q, index) => (
-                      <div key={q.id} className="queue-pop-row">
-                        <span className="queue-pop-index">{index + 1}</span>
-                        <span className="queue-pop-text" title={q.text}>{q.text}</span>
-                        {q.speed === 'fast' && <Icon name="Gauge" size={11} />}
-                        <button onClick={() => removeQueuedAssistantPrompt(active.id, q.id)} title="Remove queued prompt" aria-label="Remove queued prompt">
-                          <Icon name="X" size={11} />
-                        </button>
-                      </div>
-                    ))}
-                  </div>
-                </div>,
-                document.body,
-              )}
-            </>
-          )}
           {composerControls.map((c) => (
             <Dropdown key={c.id} icon={CATEGORY_ICON[c.category]} value={c.value} options={c.options.map(({ value, name }) => ({ value, name }))} onSelect={(v) => onControlChange(c, v)} title={c.name} />
           ))}

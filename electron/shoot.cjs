@@ -134,6 +134,27 @@ app.whenReady().then(async () => {
     await wait(800) // CodeMirror mount
     await shot('files-editor-light')
 
+    // Minimal assistant chrome: the prompt timeline is a top-right hover rail,
+    // and waiting follow-ups sit quietly above the composer instead of toasting.
+    await setStage('corpus')
+    await js(`(() => {
+      window.__kaisola.getState().requestNewThread('mock')
+      const st = window.__kaisola.getState()
+      const tid = st.activeThreadId
+      window.__kaisola.setState({ dockGrid: [[tid]], dockViews: [tid], dockOpen: true })
+      st.updateAssistantRuntime(tid, () => ({ first: false, turns: [
+        { kind: 'user', text: 'Summarize the strongest evidence for this hypothesis.', at: Date.now() - 60000 },
+        { kind: 'assistant', text: 'The current evidence converges on two reproducible findings, with one unresolved confound.', at: Date.now() - 55000 },
+        { kind: 'user', text: 'Turn the unresolved confound into the smallest useful experiment.', at: Date.now() - 30000 },
+        { kind: 'assistant', text: 'Use a paired ablation with the same seed and hold every preprocessing choice constant.', at: Date.now() - 25000 },
+      ] }))
+      st.setThreadBusy(tid, true)
+      st.enqueueAssistantPrompt(tid, { text: 'Check whether the control is already in the repo.', attachments: [], mentions: [], speed: 'default' })
+      st.enqueueAssistantPrompt(tid, { text: 'Then draft the exact command to run it.', attachments: [], mentions: [], speed: 'fast' })
+    })()`)
+    await wait(300)
+    await shot('assistant-queue-light')
+
     // the session-card grid — two agents side by side, a terminal stacked
     // below the second one (each session is its own movable card)
     await setStage('corpus')

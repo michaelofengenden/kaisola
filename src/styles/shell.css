@@ -600,6 +600,8 @@
    classic layout, inside the right tool cluster when the tree is on the right. */
 .tabstrip .rail-toggle {
   align-self: center;
+  width: 28px;
+  padding: 0;
   margin-right: var(--sp-2);
   transition: color var(--dur-1) var(--ease-out), background var(--dur-1) var(--ease-out);
 }

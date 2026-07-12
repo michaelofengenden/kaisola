@@ -1,8 +1,8 @@
 import { forwardRef } from 'react'
 import {
   AlertTriangle, AppWindow, ArrowDownToLine, ArrowLeft, ArrowRight, ArrowUp,
-  BadgeCheck, BarChart3, BellDot, Blocks, BookOpen, BookmarkPlus, Bot, Braces,
-  Brain, Camera, Check, CheckCircle2, ChevronDown, ChevronRight, ChevronUp,
+  BadgeCheck, BarChart3, Bell, BellDot, Blocks, BookOpen, BookmarkPlus, Bot, Braces,
+  Brain, Camera, Check, CheckCheck, CheckCircle2, ChevronDown, ChevronRight, ChevronUp,
   ChevronsUpDown, Circle, CircleAlert, CircleCheck, CircleDashed, CircleHelp,
   CircleX, CircuitBoard, ClipboardList, Code, Code2, Columns2, Columns3,
   Command, Compass, Copy, CornerDownRight, Crosshair, Crown, Database,
@@ -35,8 +35,8 @@ import type { LucideProps } from 'lucide-react'
  */
 const ICONS = {
   AlertTriangle, AppWindow, ArrowDownToLine, ArrowLeft, ArrowRight, ArrowUp,
-  BadgeCheck, BarChart3, BellDot, Blocks, BookOpen, BookmarkPlus, Bot, Braces,
-  Brain, Camera, Check, CheckCircle2, ChevronDown, ChevronRight, ChevronUp,
+  BadgeCheck, BarChart3, Bell, BellDot, Blocks, BookOpen, BookmarkPlus, Bot, Braces,
+  Brain, Camera, Check, CheckCheck, CheckCircle2, ChevronDown, ChevronRight, ChevronUp,
   ChevronsUpDown, Circle, CircleAlert, CircleCheck, CircleDashed, CircleHelp,
   CircleX, CircuitBoard, ClipboardList, Code, Code2, Columns2, Columns3,
   Command, Compass, Copy, CornerDownRight, Crosshair, Crown, Database,

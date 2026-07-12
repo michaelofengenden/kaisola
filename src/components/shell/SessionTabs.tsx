@@ -399,6 +399,8 @@ function NewSessionButton({ orientation }: { orientation: 'horizontal' | 'vertic
   const sessionTemplates = useKaisola((s) => s.sessionTemplates)
   const openSessionTemplate = useKaisola((s) => s.openSessionTemplate)
   const newWorktreeSession = useKaisola((s) => s.newWorktreeSession)
+  const closedStack = useKaisola((s) => s.closedStack)
+  const reopenClosedSession = useKaisola((s) => s.reopenClosedSession)
   const openSession = (value: string) => {
     if (value === 'terminal') { requestTerminal(); return }
     if (value === 'git') { openGitPanel(); return }
@@ -407,9 +409,22 @@ function NewSessionButton({ orientation }: { orientation: 'horizontal' | 'vertic
     if (value === 'worktree') { void newWorktreeSession(); return }
     if (value === 'registry') { setSettingsOpen(true, 'agents'); return }
     if (value.startsWith('tpl:')) { openSessionTemplate(value.slice(4)); return }
+    if (value.startsWith('closed:')) { reopenClosedSession(value.slice('closed:'.length)); return }
     const agent = menu.find((a) => a.id === value.slice('agent:'.length))
     if (agent) openAgentSession(agent)
   }
+  // recently-closed sessions reopen from here (⌘⇧T restores the newest);
+  // closed agent threads carry their acpSessionId, so a reopen also resumes
+  // the agent-side conversation
+  const recentlyClosed = closedStack.slice(0, 6).map((c) => {
+    const id = c.term?.id ?? c.thread?.id ?? c.panel?.id ?? ''
+    const label = c.thread
+      ? c.thread.name ?? c.thread.autoName ?? c.thread.agentKey
+      : c.term
+        ? c.term.name ?? c.term.autoName ?? 'Terminal'
+        : c.panel?.title ?? c.panel?.kind ?? 'Panel'
+    return { value: `closed:${id}`, name: `↩ ${label}` }
+  }).filter((option) => option.value !== 'closed:')
   return (
     <Dropdown
       icon="Plus"
@@ -423,6 +438,7 @@ function NewSessionButton({ orientation }: { orientation: 'horizontal' | 'vertic
         { value: 'git', name: 'Git commit' },
         { value: 'ledger', name: 'Agent tasks' },
         { value: 'browser', name: 'Browser' },
+        ...recentlyClosed,
         { value: 'registry', name: 'Add agents…' },
       ]}
       onSelect={openSession}

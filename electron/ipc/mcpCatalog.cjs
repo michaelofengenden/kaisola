@@ -108,6 +108,40 @@ function normalizeSpec(raw) {
   return null
 }
 
+// ── npx elision (bundled pinned packages) ────────────────────────────────────
+// Extension MCP servers ship as portable `npx -y pkg@version` specs. Each
+// agent session that spawns one keeps a resident `npm exec` wrapper alongside
+// the actual server — ~60 MB of idle npm per agent. When the exact pinned
+// version is bundled with Kaisola, emit a direct spawn of its bin under our
+// own binary in node mode instead (the ACP-bridge idiom in acpHandler).
+// Stored specs, approval/ownership hashes, and UI rows keep the raw npx
+// shape — the rewrite exists only in the session-emission wire shapes.
+const NPX_PASSTHROUGH_FLAGS = new Set(['-y', '--yes', '-q', '--quiet'])
+const NPX_PACKAGE_NAME_RE = /^(@[a-z0-9~][\w.-]*\/)?[a-z0-9~][\w.-]*$/i
+
+function directSpawnRewrite(command, args) {
+  if (command !== 'npx' || !Array.isArray(args)) return null
+  let i = 0
+  while (i < args.length && NPX_PASSTHROUGH_FLAGS.has(args[i])) i += 1
+  const spec = args[i]
+  if (typeof spec !== 'string' || !spec || spec.startsWith('-')) return null
+  const at = spec.lastIndexOf('@')
+  if (at <= 0) return null // unpinned — npx decides the version, so npx must run
+  const name = spec.slice(0, at)
+  const version = spec.slice(at + 1)
+  if (!NPX_PACKAGE_NAME_RE.test(name) || !/^[\w.-]+$/.test(version)) return null
+  const dir = path.join(__dirname, '..', '..', 'node_modules', ...name.split('/'))
+  let pkg
+  try { pkg = JSON.parse(fs.readFileSync(path.join(dir, 'package.json'), 'utf8')) } catch { return null }
+  if (pkg.version !== version) return null
+  const bin = typeof pkg.bin === 'string' ? pkg.bin
+    : pkg.bin && typeof pkg.bin === 'object' && !Array.isArray(pkg.bin) ? Object.values(pkg.bin)[0] : null
+  if (typeof bin !== 'string' || !bin) return null
+  const entry = path.join(dir, bin)
+  if (!fs.existsSync(entry)) return null
+  return { command: process.execPath, args: [entry, ...args.slice(i + 1)], env: { ELECTRON_RUN_AS_NODE: '1' } }
+}
+
 /** Stable hash of a spec — the approval key ingredient (edits re-prompt). */
 function specHash(spec) {
   const canon = spec.kind === 'stdio'
@@ -217,7 +251,10 @@ function acpEntries(workspace, caps = {}) {
   const out = []
   for (const [name, spec] of armedSpecs(workspace)) {
     if (spec.kind === 'stdio') {
-      out.push({ name, command: spec.command, args: spec.args, env: toPairs(spec.env) })
+      const direct = directSpawnRewrite(spec.command, spec.args)
+      out.push(direct
+        ? { name, command: direct.command, args: direct.args, env: toPairs({ ...spec.env, ...direct.env }) }
+        : { name, command: spec.command, args: spec.args, env: toPairs(spec.env) })
     } else if (spec.kind === 'http' ? caps.http : caps.sse) {
       out.push({ type: spec.kind, name, url: spec.url, headers: toPairs(spec.headers) })
     }
@@ -245,9 +282,12 @@ function claudeEntriesFromConfig(configData) {
     // from Kaisola's process environment onto disk.
     const spec = sanitizeRaw(raw)
     if (!spec) continue
-    entries[name] = spec.command
-      ? { command: spec.command, ...(spec.args && spec.args.length ? { args: spec.args } : {}), ...(spec.env && Object.keys(spec.env).length ? { env: spec.env } : {}) }
-      : { type: spec.type === 'sse' ? 'sse' : 'http', url: spec.url, ...(spec.headers && Object.keys(spec.headers).length ? { headers: spec.headers } : {}) }
+    const direct = spec.command ? directSpawnRewrite(spec.command, spec.args || []) : null
+    entries[name] = direct
+      ? { command: direct.command, args: direct.args, env: { ...(spec.env || {}), ...direct.env } }
+      : spec.command
+        ? { command: spec.command, ...(spec.args && spec.args.length ? { args: spec.args } : {}), ...(spec.env && Object.keys(spec.env).length ? { env: spec.env } : {}) }
+        : { type: spec.type === 'sse' ? 'sse' : 'http', url: spec.url, ...(spec.headers && Object.keys(spec.headers).length ? { headers: spec.headers } : {}) }
   }
   return entries
 }
@@ -823,5 +863,5 @@ module.exports = {
   addUserServer,
   removeUserServer,
   writePrivateJson,
-  __test: { normalizeSpec, parseRpcBody, containsLiteralSecret, specHash, sanitizeRaw, storedSpecHash, planAddUserServer, planRemoveUserServer, writePrivateJson, claudeEntriesFromConfig, parseCodexMcpToml },
+  __test: { normalizeSpec, parseRpcBody, containsLiteralSecret, specHash, sanitizeRaw, storedSpecHash, planAddUserServer, planRemoveUserServer, writePrivateJson, claudeEntriesFromConfig, parseCodexMcpToml, directSpawnRewrite },
 }

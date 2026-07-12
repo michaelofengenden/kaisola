@@ -10,7 +10,7 @@ import { useClickAway } from '../../lib/useClickAway'
  * asks in THIS project, parked permission asks and needs-you/failed badges on
  * every BACKGROUND project tab, plus ledger tasks sitting in review/blocked
  * (fetched when the menu opens). Clicking a row jumps there. The button hides
- * entirely at zero — chrome earns its pixels. Settings → Interface toggle.
+ * stays anchored at zero so navigation never jumps. Settings → Interface toggle.
  */
 
 interface Row {
@@ -52,7 +52,8 @@ export function InboxButton() {
       })
     }
     for (const p of pendingPermissions) {
-      rows.push({ key: `perm:${p.permId}`, icon: 'ShieldQuestion', label: p.title, detail: `${p.agent} · permission` })
+      // the connection key is `<agent>::<threadId>` — jump reveals the asking session
+      rows.push({ key: `perm:${p.permId}`, sessionId: p.key.split('::')[1], icon: 'ShieldQuestion', label: p.title, detail: `${p.agent} · permission` })
     }
     for (const tab of projectTabs) {
       if (tab.id === activeProjectId) continue
@@ -90,7 +91,7 @@ export function InboxButton() {
     }
   }, [open])
 
-  if (!enabled || (count === 0 && !open)) return null
+  if (!enabled) return null
 
   const jump = (row: Row) => {
     const st = useKaisola.getState()
@@ -109,8 +110,8 @@ export function InboxButton() {
         title="Everything that needs you, across every project tab"
         aria-label={`Inbox — ${count} waiting`}
       >
-        <Icon name="BellDot" size={14} />
-        <span className="inbox-count">{count}</span>
+        <Icon name={count > 0 ? 'BellDot' : 'Bell'} size={14} />
+        {count > 0 && <span className="inbox-count">{count}</span>}
       </button>
       {open && (
           <div ref={panelRef} className="inbox-menu">
@@ -129,6 +130,16 @@ export function InboxButton() {
                 <span className="inbox-row-detail truncate">ledger · {t.status}</span>
               </button>
             ))}
+            {rows.length > 0 && (
+              <button
+                className="inbox-row inbox-clear"
+                onClick={() => { useKaisola.getState().clearInbox(); setOpen(false) }}
+                title="Dismiss the waiting badges (permission asks stay until answered)"
+              >
+                <Icon name="CheckCheck" size={13} />
+                <span className="inbox-row-label">Clear all</span>
+              </button>
+            )}
           </div>
       )}
     </div>

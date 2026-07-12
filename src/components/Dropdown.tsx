@@ -34,7 +34,7 @@ export function Dropdown({
   placement?: 'auto' | 'bottom' | 'top'
 }) {
   const [open, setOpen] = useState(false)
-  const [pos, setPos] = useState<{ left?: number; right?: number; top?: number; bottom?: number }>({})
+  const [pos, setPos] = useState<{ left?: number; right?: number; top?: number; bottom?: number; maxHeight?: number }>({})
   const btnRef = useRef<HTMLButtonElement>(null)
   const menuRef = useRef<HTMLDivElement>(null)
   const current = options.find((o) => o.value === value)
@@ -52,7 +52,12 @@ export function Dropdown({
       left: align === 'right' ? undefined : Math.max(pad, Math.min(b.left, window.innerWidth - menuW - pad)),
       right: align === 'right' ? Math.max(pad, window.innerWidth - b.right) : undefined,
       ...(openDown
-        ? { top: Math.max(pad, Math.min(b.bottom + 6, window.innerHeight - menuH - pad)) }
+        ? placement === 'bottom'
+          // forced-below menus STAY below the trigger (the vertical sidebar's
+          // "+" flow depends on it) — a long option list shrinks and scrolls
+          // instead of sliding up over the button
+          ? { top: b.bottom + 6, maxHeight: Math.max(120, Math.min(340, window.innerHeight - b.bottom - 6 - pad)) }
+          : { top: Math.max(pad, Math.min(b.bottom + 6, window.innerHeight - menuH - pad)) }
         : { bottom: window.innerHeight - b.top + 6 }),
     })
   }

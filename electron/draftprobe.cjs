@@ -81,9 +81,23 @@ app.whenReady().then(async () => {
     return { id: t ? t.id : '', continued: !!t?.continued?.sameProcess, draftLeft: t ? st.termDrafts[t.id] ?? null : null }
   })()`)
   if (!out.id) { console.log('DRAFT=FAIL terminal not rehydrated'); app.exit(1); return }
+  // Reproduce the updater race: a new renderer updates an already-live agent's
+  // persisted resume command before foreground-process metadata arrives. The
+  // command must remain launch metadata, never become text in the live agent.
+  const bootGuard = await js(`(async () => {
+    const st = window.__kaisola.getState()
+    st.setTerminalMeta(${JSON.stringify(out.id)}, { fgProcess: null, running: false })
+    st.requestTerminal('echo BOOT_MUST_NOT_BECOME_CHAT && cat', { singletonKey: 'agent:probe', restart: true, name: 'Probe' })
+    await new Promise((resolve) => setTimeout(resolve, 60))
+    window.__kaisola.getState().setTerminalMeta(${JSON.stringify(out.id)}, { fgProcess: 'cat', running: true })
+    await new Promise((resolve) => setTimeout(resolve, 1000))
+    const row = window.__kaisola.getState().terminals.find((x) => x.id === ${JSON.stringify(out.id)})
+    return { pendingCleared: !row?.bootPending }
+  })()`)
   const snap = await js(`window.kaisola.terminal.snapshot(${JSON.stringify(out.id)})`)
-  const passed = out.continued && out.draftLeft === DRAFT && !snap.exited
-  console.log('DRAFT=' + (passed ? 'PASS' : 'FAIL') + ' ' + JSON.stringify({ continued: out.continued, draftLeft: out.draftLeft, tail: snap.output.slice(-200).replace(/\s+/g, ' ') }))
+  const bootStayedMetadata = bootGuard.pendingCleared && !snap.output.includes('BOOT_MUST_NOT_BECOME_CHAT')
+  const passed = out.continued && out.draftLeft === DRAFT && !snap.exited && bootStayedMetadata
+  console.log('DRAFT=' + (passed ? 'PASS' : 'FAIL') + ' ' + JSON.stringify({ continued: out.continued, draftLeft: out.draftLeft, bootStayedMetadata, tail: snap.output.slice(-200).replace(/\s+/g, ' ') }))
   await js(`window.kaisola.terminal.kill(${JSON.stringify(out.id)})`)
   await wait(200)
   app.exit(passed ? 0 : 1)

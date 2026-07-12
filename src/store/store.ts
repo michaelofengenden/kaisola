@@ -137,6 +137,10 @@ export interface AssistantThread {
   claudeEffort?: ClaudeEffort
   /** Native Codex app-server reasoning effort, restored on reconnect. */
   codexEffort?: CodexEffort
+  /** The agent's ACP permission mode (plan/default/acceptEdits/…). Captured on
+   * every change and message send, reapplied when the session reconnects —
+   * without it a restart silently falls back to the agent's default mode. */
+  permissionMode?: string
 }
 
 /** Diff/terminal artifacts a tool-call frame carries (ACP ToolCallContent). */
@@ -568,12 +572,16 @@ export const PROJECT_SLICE_PERSIST_KEYS = [
   'repoCheckpoints', 'followAgent', 'annotations', 'assistantThreads', 'assistantRuntimes',
   'assistantDrafts', 'assistantPromptQueues',
   'activeThreadId', 'terminals', 'panels', 'sessionGroups', 'pinnedSessions', 'worktreeSessions',
+  // recently-closed sessions persist (trimmed) so "reopen closed tab" still
+  // works after an app restart — agent threads keep their acpSessionId, so a
+  // restored thread resumes its agent-side session too
+  'closedStack',
   'latexMode', 'dockGrid', 'dockViews', 'dockColWeights', 'canvasWidth', 'canvasOpen', 'dockOpen',
 ] as const
 
 export const PROJECT_SLICE_MEMORY_KEYS = [
   ...PROJECT_SLICE_PERSIST_KEYS,
-  'agentFeed', 'needsYou', 'closedStack', 'pendingPermissions', 'agentTerminals', 'agentRunning',
+  'agentFeed', 'needsYou', 'pendingPermissions', 'agentTerminals', 'agentRunning',
   'agentQueueRunning', 'agentTasks', 'latexDismissed', 'checkpoints',
 ] as const
 
@@ -974,8 +982,14 @@ interface KaisolaState {
   setSessionGroupColor: (id: string, color?: string) => void
   /** Flag a session as waiting on the human (amber dot; cleared on view). */
   markNeedsYou: (id: string, projectId?: string) => void
+  /** Dismiss every waiting-on-you signal the inbox rolls up (active project's
+   * needs-you set + background tabs' needs-you/failed badges). Pending
+   * permission asks stay — they need an answer, not a dismissal. */
+  clearInbox: () => void
   /** ⌘⇧T — restore the most recently closed session. */
-  reopenClosedSession: () => void
+  /** Restore a closed session — the most recent by default, or a specific one
+   * from the recently-closed list (id = the closed term/thread/panel's id). */
+  reopenClosedSession: (id?: string) => void
   setOmniOpen: (open: boolean) => void
   setKeymapOverrides: (map: Record<string, string | null>) => void
   /** Send `text` to a thread as if typed in its composer (Assistant delivers). */
@@ -1004,6 +1018,7 @@ interface KaisolaState {
   setThreadAcpSession: (id: string, sessionId: string | undefined, projectId?: string) => void
   setThreadClaudeEffort: (id: string, effort: ClaudeEffort, projectId?: string) => void
   setThreadCodexEffort: (id: string, effort: CodexEffort, projectId?: string) => void
+  setThreadPermissionMode: (id: string, mode: string, projectId?: string) => void
   updateAssistantRuntime: (id: string, fn: (runtime: AssistantRuntime) => AssistantRuntime, projectId?: string) => void
   resetAssistantRuntime: (id: string, projectId?: string) => void
   setAssistantDraft: (id: string, patch: Partial<AssistantDraft>, projectId?: string) => void
@@ -1809,6 +1824,27 @@ function sanitizeSliceForPersist(slice: ProjectSliceMemory): ProjectSlicePersist
       .map((g) => ({ ...g, members: g.members.filter((m) => validIds.has(m)) }))
       .filter((g) => g.members.length),
     pinnedSessions: slice.pinnedSessions.filter((id) => validIds.has(id)),
+    // recently-closed history, kept light on disk: closed threads carry only a
+    // transcript tail (full history stays in main's archive), closed terminals
+    // shed live-only fields, dead same-process receipts are dropped
+    closedStack: (slice.closedStack ?? []).slice(0, 20).map((c) => {
+      if (c.kind === 'thread' && c.thread) {
+        return {
+          kind: c.kind,
+          at: c.at,
+          thread: { ...c.thread, busy: false },
+          ...(c.runtime ? { runtime: { turns: c.runtime.turns.slice(-ASSISTANT_ARCHIVE_TRIGGER_TURNS), first: c.runtime.first, ...(c.runtime.archivedTurns ? { archivedTurns: c.runtime.archivedTurns } : {}), ...(c.runtime.archiveEpoch ? { archiveEpoch: c.runtime.archiveEpoch } : {}) } } : {}),
+        }
+      }
+      if (c.kind === 'term' && c.term) {
+        return {
+          kind: c.kind,
+          at: c.at,
+          term: { id: c.term.id, name: c.term.name, autoName: c.term.autoName, cwd: c.term.cwd, singletonKey: c.term.singletonKey, restart: c.term.restart, boot: c.term.restart ? c.term.boot : undefined },
+        }
+      }
+      return c
+    }),
     // worktrees are DISK state that outlives their session — keep orphaned
     // entries (session closed, dir still there), cap only the orphans.
     worktreeSessions: Object.fromEntries([
@@ -2528,7 +2564,7 @@ export const useKaisola = create<KaisolaState>()(
         needsYou,
         // Chrome's undo-close: the record goes on the stack and the pty gets
         // a 60s grace before the deferred kill below reaps it
-        closedStack: closing ? [{ kind: 'term' as const, at: Date.now(), term: closing }, ...s.closedStack].slice(0, 8) : s.closedStack,
+        closedStack: closing ? [{ kind: 'term' as const, at: Date.now(), term: closing }, ...s.closedStack].slice(0, 20) : s.closedStack,
         ...gridState(grid.length ? grid : fallback ? [[fallback]] : [], grid.length || fallback ? {} : { dockOpen: false }),
       }
     })
@@ -2727,7 +2763,7 @@ export const useKaisola = create<KaisolaState>()(
       const fallback = s.terminals[0]?.id ?? s.assistantThreads[0]?.id
       return {
         panels,
-        closedStack: closing ? [{ kind: 'panel' as const, at: Date.now(), panel: closing }, ...s.closedStack].slice(0, 8) : s.closedStack,
+        closedStack: closing ? [{ kind: 'panel' as const, at: Date.now(), panel: closing }, ...s.closedStack].slice(0, 20) : s.closedStack,
         ...gridState(grid.length ? grid : fallback ? [[fallback]] : [], grid.length || fallback ? {} : { dockOpen: false }),
       }
     }),
@@ -2813,10 +2849,21 @@ export const useKaisola = create<KaisolaState>()(
     const pid = projectId ?? get().activeProjectId
     get().patchProject(pid, (sl) => (sl.needsYou[id] ? {} : { needsYou: { ...sl.needsYou, [id]: true } }))
   },
-  reopenClosedSession: () =>
+  clearInbox: () =>
+    set((s) => ({
+      needsYou: {},
+      projectSlices: Object.fromEntries(
+        Object.entries(s.projectSlices).map(([pid, sl]) => [pid, sl && Object.keys(sl.needsYou ?? {}).length ? { ...sl, needsYou: {} } : sl]),
+      ),
+      projectTabs: s.projectTabs.map((tab) => (tab.activity === 'needs-you' || tab.activity === 'failed' ? { ...tab, activity: undefined } : tab)),
+    })),
+  reopenClosedSession: (id) =>
     set((s) => {
-      const [top, ...rest] = s.closedStack
+      const top = id
+        ? s.closedStack.find((c) => (c.term?.id ?? c.thread?.id ?? c.panel?.id) === id)
+        : s.closedStack[0]
       if (!top) return s
+      const rest = s.closedStack.filter((c) => c !== top)
       if (top.kind === 'term' && top.term) {
         // a singleton (the claude terminal) may have been auto-recreated since
         // the close — never resurrect a SECOND copy, focus the live one
@@ -3093,7 +3140,7 @@ export const useKaisola = create<KaisolaState>()(
         activeThreadId,
         needsYou,
         closedStack: closing
-          ? [{ kind: 'thread' as const, at: Date.now(), thread: { ...closing, busy: false }, runtime }, ...s.closedStack].slice(0, 8)
+          ? [{ kind: 'thread' as const, at: Date.now(), thread: { ...closing, busy: false }, runtime }, ...s.closedStack].slice(0, 20)
           : s.closedStack,
         ...(grid.length
           ? gridState(grid)
@@ -3126,6 +3173,10 @@ export const useKaisola = create<KaisolaState>()(
   setThreadCodexEffort: (id, codexEffort, projectId) => {
     const pid = projectId ?? get().activeProjectId
     get().patchProject(pid, (sl) => ({ assistantThreads: sl.assistantThreads.map((t) => (t.id === id ? { ...t, codexEffort } : t)) }))
+  },
+  setThreadPermissionMode: (id, permissionMode, projectId) => {
+    const pid = projectId ?? get().activeProjectId
+    get().patchProject(pid, (sl) => ({ assistantThreads: sl.assistantThreads.map((t) => (t.id === id && t.permissionMode !== permissionMode ? { ...t, permissionMode } : t)) }))
   },
   updateAssistantRuntime: (id, fn, projectId) => {
     const pid = projectId ?? get().activeProjectId

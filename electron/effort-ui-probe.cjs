@@ -79,25 +79,33 @@ app.whenReady().then(async () => {
   const image = await win.webContents.capturePage()
   const out = path.join(os.tmpdir(), 'kaisola-codex-effort.png')
   fs.writeFileSync(out, image.toPNG())
+  // The matrix popover: model rows × effort columns on ONE surface (no tabs),
+  // the active row filled to its effort, speed as a segmented footer.
   const facts = await win.webContents.executeJavaScript(`(() => ({
-    opened: !!document.querySelector('.codex-minimal-pop'),
-    tabs: [...document.querySelectorAll('.provider-section-tabs button')].map((el) => el.textContent.trim()),
-    rows: [...document.querySelectorAll('.codex-minimal-pop .provider-choice-row')].map((el) => el.textContent.trim()),
-    checked: document.querySelector('.codex-minimal-pop [aria-checked="true"]')?.textContent.trim(),
-    note: document.querySelector('.provider-choice-note')?.textContent.trim() || null,
+    opened: !!document.querySelector('.matrix-pop'),
+    colLabels: [...document.querySelectorAll('.matrix-col-label')].map((el) => el.textContent.trim()),
+    modelRows: [...document.querySelectorAll('.matrix-model')].map((el) => el.textContent.trim()),
+    checked: document.querySelector('.matrix-cell[aria-checked="true"]')?.getAttribute('aria-label') ?? null,
+    fillWidth: document.querySelector('.matrix-track[data-active] .matrix-fill')?.style.width ?? null,
+    speedRows: [...document.querySelectorAll('.matrix-speed button')].map((el) => el.textContent.trim()),
+    speedActive: document.querySelector('.matrix-speed button[data-active]')?.textContent.trim() ?? null,
   }))()`)
-  await win.webContents.executeJavaScript(`(() => [...document.querySelectorAll('.provider-section-tabs button')].find((el) => el.textContent.trim() === 'Speed')?.click())()`)
+  // clicking any cell sets model AND effort in one gesture, then closes
+  await win.webContents.executeJavaScript(`(() => document.querySelector('.matrix-cell[aria-label="GPT-5.6-Terra at High effort"]')?.click())()`)
   await wait(80)
-  const speedRows = await win.webContents.executeJavaScript(`(() => [...document.querySelectorAll('.codex-minimal-pop .provider-choice-row')].map((el) => el.textContent.trim()))()`)
-  await win.webContents.executeJavaScript(`(() => [...document.querySelectorAll('.provider-section-tabs button')].find((el) => el.textContent.trim() === 'Model')?.click())()`)
-  await wait(80)
-  const modelRows = await win.webContents.executeJavaScript(`(() => [...document.querySelectorAll('.codex-minimal-pop .provider-choice-row')].map((el) => el.textContent.trim()))()`)
-  await win.webContents.executeJavaScript(`(() => { document.querySelector('.codex-summary')?.click(); document.querySelector('.tabstrip-tools > button[title="More"]')?.click() })()`)
-  await wait(100)
-  const moreRows = await win.webContents.executeJavaScript(`(() => [...document.querySelectorAll('.shell-more-menu .tree-menu-item')].map((el) => el.textContent.replace(/\\s+/g, ' ').trim()))()`)
-  const moreImage = await win.webContents.capturePage()
-  const moreOut = path.join(os.tmpdir(), 'kaisola-shell-more.png')
-  fs.writeFileSync(moreOut, moreImage.toPNG())
-  console.log('EFFORT_UI=' + JSON.stringify({ clicked: opened, ...facts, speedRows, modelRows, moreRows, screenshot: out, moreScreenshot: moreOut }))
-  app.exit(opened && facts.tabs.join(',') === 'Model,Effort,Speed' && facts.rows.length === 5 && facts.checked === 'Ultra' && facts.note === null && speedRows.join(',') === 'Default,Fast' && modelRows.length === 3 && modelRows.every((row) => !/model$/i.test(row)) && moreRows.length === 5 ? 0 : 1)
+  const closedAfterPick = await win.webContents.executeJavaScript(`(() => !document.querySelector('.matrix-pop'))()`)
+  console.log('EFFORT_UI=' + JSON.stringify({ clicked: opened, ...facts, closedAfterPick, screenshot: out }))
+  app.exit(
+    opened
+    && facts.opened
+    && facts.colLabels.join(',') === 'Light,Medium,High,Extra High,Ultra'
+    && facts.modelRows.length === 3
+    && facts.checked === 'GPT-5.6-Sol at Ultra effort'
+    && facts.fillWidth === '100%'
+    && facts.speedRows.join(',') === 'Default,Fast'
+    && facts.speedActive === 'Fast'
+    && closedAfterPick
+      ? 0
+      : 1,
+  )
 }).catch((error) => { console.error(error); app.exit(1) })

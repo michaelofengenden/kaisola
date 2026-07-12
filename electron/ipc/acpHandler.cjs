@@ -58,6 +58,11 @@ let permSeq = 0
 const pendingPermissions = new Map()
 const PERMISSION_TIMEOUT_MS = 300_000
 const CANCEL_GRACE_MS = 8_000
+// How long a finished turn waits for injected steer turns to settle. Real
+// adapters (claude-code-acp) may absorb an injected session/prompt into the
+// running turn and never answer its own JSON-RPC id — an unbounded wait here
+// wedged the whole connection (busy forever, every next prompt rejected).
+const STEER_FLUSH_MS = 2_000
 
 /** Auto-resolve (as cancel) and clear every inline permission a dying connection
  * left pending, telling its renderer to drop the now-orphaned card + needs-you
@@ -944,28 +949,45 @@ function registerAcpHandlers(ipcMain) {
     // which cancel/a newer prompt may have replaced) and clear only if still ours.
     const turn = { sender: event.sender, channel: `acp:update:${reqId}` }
     entry.current = turn
+    entry.turnSeq = (entry.turnSeq ?? 0) + 1
     entry.inFlightTurns = (entry.inFlightTurns ?? 0) + 1
     entry.steerPromises = [] // steering follow-ups injected while THIS turn runs
+    let signalTurnDone
+    entry.turnDone = new Promise((resolve) => { signalTurnDone = resolve })
+    // A finished turn holds its channel briefly so a steer that IS still
+    // streaming can flush — but only briefly. The adapter may never answer an
+    // injected prompt's own request id (promptQueueing absorbs it into the
+    // turn), and an unbounded allSettled here wedged the connection for good.
+    const flushSteers = async () => {
+      entry.turnEnding = true // refuse new steers into a turn that's over
+      signalTurnDone()
+      if (entry.steerPromises.length) {
+        await Promise.race([
+          Promise.allSettled(entry.steerPromises),
+          new Promise((resolve) => setTimeout(resolve, STEER_FLUSH_MS)),
+        ])
+      }
+    }
     try {
       const res = await entry.conn.prompt(text, images)
-      // A steering follow-up (acp:steer) rides this same channel and may still
-      // be streaming when the original turn's result lands — hold the channel
-      // (and the __done that ends the exchange) until every injected turn
-      // settles, so late steered output is never dropped on a cleared channel.
-      if (entry.steerPromises.length) await Promise.allSettled(entry.steerPromises)
+      await flushSteers()
       if (turn.sender && !turn.sender.isDestroyed()) {
         turn.sender.send(turn.channel, { __done: true, stopReason: res && res.stopReason })
       }
       return { ok: true, stopReason: res && res.stopReason }
     } catch (err) {
-      if (entry.steerPromises.length) await Promise.allSettled(entry.steerPromises)
+      await flushSteers()
       if (turn.sender && !turn.sender.isDestroyed()) turn.sender.send(turn.channel, { __done: true })
       return { ok: false, message: err.message }
     } finally {
       if (entry.current === turn) entry.current = { sender: null, channel: null }
       entry.steerPromises = []
-      entry.inFlightTurns = Math.max(0, (entry.inFlightTurns ?? 1) - 1)
-      if (entry.inFlightTurns === 0) clearCancelWatchdog(entry)
+      entry.turnEnding = false
+      // prompts are serialized by the guard above, so when a turn fully
+      // unwinds NOTHING is legitimately in flight — force-reset instead of
+      // decrementing so an unanswered steer can never strand the counter
+      entry.inFlightTurns = 0
+      clearCancelWatchdog(entry)
     }
   })
 
@@ -979,17 +1001,32 @@ function registerAcpHandlers(ipcMain) {
     const entry = entryFor(event.sender, agentKey)
     if (!entry || !entry.conn.alive) return { ok: false, message: 'Agent not connected.' }
     if (!entry.conn.supportsPromptQueue) return { ok: false, message: 'unsupported', unsupported: true }
-    if (!(entry.current && entry.current.channel)) return { ok: false, message: 'No active turn to steer.', noTurn: true }
+    // turnEnding: the turn's result already landed and only its flush window
+    // remains — a steer now would ride a channel about to close, so refuse it
+    // (the renderer falls back to the normal queue; nothing is lost)
+    if (!(entry.current && entry.current.channel) || entry.turnEnding) return { ok: false, message: 'No active turn to steer.', noTurn: true }
+    const seq = entry.turnSeq
+    const turnDone = entry.turnDone
     entry.inFlightTurns = (entry.inFlightTurns ?? 0) + 1
     const p = entry.conn.prompt(text, images)
     ;(entry.steerPromises ??= []).push(p.catch(() => {}))
     try {
-      const res = await p
-      return { ok: true, stopReason: res && res.stopReason }
-    } catch (err) {
-      return { ok: false, message: err.message }
+      // The adapter may absorb this injected prompt into the running turn and
+      // never answer its own request id. Never hang the renderer on that:
+      // once the owning turn ends (plus a short grace for a racing response),
+      // the steered text was either woven into the turn — its output already
+      // streamed on the shared channel — or the turn closed without it.
+      const settled = await Promise.race([
+        p.then((res) => ({ res })).catch((err) => ({ err })),
+        turnDone.then(() => new Promise((resolve) => setTimeout(resolve, STEER_FLUSH_MS))).then(() => ({ turnEnded: true })),
+      ])
+      if (settled.turnEnded) return { ok: true, stopReason: 'turn_ended' }
+      if (settled.err) return { ok: false, message: settled.err.message }
+      return { ok: true, stopReason: settled.res && settled.res.stopReason }
     } finally {
-      entry.inFlightTurns = Math.max(0, (entry.inFlightTurns ?? 1) - 1)
+      // the owning turn's finally force-resets the counter; only decrement if
+      // that turn is still the live one (never steal from a NEWER turn)
+      if (entry.turnSeq === seq) entry.inFlightTurns = Math.max(0, (entry.inFlightTurns ?? 1) - 1)
     }
   })
 

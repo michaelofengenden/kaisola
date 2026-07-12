@@ -158,13 +158,15 @@ const SPEED_OPTIONS = [
   { value: 'default', name: 'Default' },
   { value: 'fast', name: 'Fast' },
 ]
+// Claude's own effort vocabulary (low/medium/high/xhigh/max), labelled the way
+// the Claude app labels it — not Kaisola-invented names like "Light".
 const CLAUDE_EFFORT_OPTIONS = [
   { value: 'default', name: 'Default', description: 'Use this Claude model’s default effort' },
-  { value: 'low', name: 'Light', description: 'Fastest · minimal thinking' },
-  { value: 'medium', name: 'Medium', description: 'Moderate reasoning' },
-  { value: 'high', name: 'High', description: 'Deep reasoning' },
-  { value: 'xhigh', name: 'Extra High', description: 'More time for difficult work' },
-  { value: 'max', name: 'Max', description: 'Maximum available effort · higher usage' },
+  { value: 'low', name: 'Low', description: 'Fastest · minimal thinking' },
+  { value: 'medium', name: 'Medium', description: 'Balanced thinking for routine work' },
+  { value: 'high', name: 'High', description: 'Deep thinking' },
+  { value: 'xhigh', name: 'Extra High', description: 'Best for coding and agentic work' },
+  { value: 'max', name: 'Max', description: 'Maximum thinking · highest usage' },
 ]
 const CODEX_EFFORT_OPTIONS = [
   { value: 'low', name: 'Light', description: 'Fastest · minimal reasoning' },
@@ -238,9 +240,12 @@ function popoverPosition(button: HTMLButtonElement | null) {
   if (!rect) return { right: 12, bottom: 56 }
   const above = Math.max(120, rect.top - 14)
   const below = Math.max(120, window.innerHeight - rect.bottom - 14)
+  // right-anchored to the trigger, but never pushed past the LEFT window edge
+  // (the widest provider popover is 400px — clamp against it plus margins)
+  const right = Math.min(Math.max(8, window.innerWidth - rect.right), Math.max(8, window.innerWidth - 416))
   return above >= below
-    ? { right: Math.max(8, window.innerWidth - rect.right), bottom: Math.max(8, window.innerHeight - rect.top + 7), maxHeight: above }
-    : { right: Math.max(8, window.innerWidth - rect.right), top: rect.bottom + 7, maxHeight: below }
+    ? { right, bottom: Math.max(8, window.innerHeight - rect.top + 7), maxHeight: above }
+    : { right, top: rect.bottom + 7, maxHeight: below }
 }
 
 function composerAddPosition(button: HTMLButtonElement | null) {
@@ -288,7 +293,7 @@ function ComposerAddMenu({
             <button key={paper.id} className="composer-add-row" role="menuitem" onClick={() => choose(() => onPaper(paper))}><Icon name="FileText" size={15} /><span className="truncate">{paper.title}</span></button>
           ))}
           {sessions.length > 0 && <div className="composer-add-label">Prior sessions</div>}
-          {sessions.slice(0, 8).map((thread) => (
+          {sessions.slice(0, 12).map((thread) => (
             <button key={thread.id} className="composer-add-row" role="menuitem" onClick={() => choose(() => onSession(thread))}><Icon name="History" size={15} /><span className="truncate">{thread.name ?? thread.autoName ?? thread.agentKey}</span></button>
           ))}
         </div>,
@@ -298,42 +303,115 @@ function ComposerAddMenu({
   )
 }
 
-/** Claude's own Faster → Smarter effort treatment, backed by a real reconnect. */
-function ClaudeEffortPicker({ value, options = CLAUDE_EFFORT_OPTIONS, busy, onSelect }: { value: ClaudeEffort; options?: typeof CLAUDE_EFFORT_OPTIONS; busy?: boolean; onSelect: (value: string) => void }) {
+/**
+ * One matrix for both axes of an agent: model rows × effort columns. The
+ * active model's row carries a filled track to its effort — every other row
+ * waits as quiet dots. Clicking a cell sets model AND effort in one gesture;
+ * clicking a model name switches models and keeps the popover open. Speed
+ * (codex) rides as a small segmented footer — no tabs, no lever, one surface.
+ */
+function ModelEffortMatrix({
+  provider,
+  icon,
+  codexChrome,
+  models,
+  modelValue,
+  efforts,
+  effortValue,
+  speed,
+  onModel,
+  onEffort,
+  onSpeed,
+}: {
+  provider: string
+  icon: string
+  /** Keep the codex probe/test chrome classnames on the codex instance. */
+  codexChrome?: boolean
+  models: Array<{ value: string; name: string; description?: string }>
+  modelValue: string
+  efforts: Array<{ value: string; name: string; description?: string }>
+  effortValue: string
+  speed?: AssistantSpeed
+  onModel: (value: string) => void
+  onEffort: (value: string) => void
+  onSpeed?: (value: string) => void
+}) {
   const [open, setOpen] = useState(false)
   const button = useRef<HTMLButtonElement>(null)
   const panel = useRef<HTMLDivElement>(null)
   useProviderPopover(open, setOpen, button, panel)
-  const index = Math.max(0, options.findIndex((option) => option.value === value))
-  const current = options[index]
+  const rows = models.length ? models : [{ value: modelValue || '__current', name: provider }]
+  const effortIndex = Math.max(0, efforts.findIndex((option) => option.value === effortValue))
+  const currentModel = rows.find((option) => option.value === modelValue) ?? rows[0]
+  const currentEffort = efforts[effortIndex]
+  const chipModel = (currentModel?.name ?? modelValue).replace(/^GPT-/i, '').replaceAll('-', ' ')
+  const chooseCell = (model: string, effort: string) => {
+    if (models.length && model !== modelValue) onModel(model)
+    onEffort(effort)
+    setOpen(false)
+  }
   return (
     <>
-      <button ref={button} className="provider-summary-btn" data-open={open} disabled={busy} onClick={() => setOpen((state) => !state)} title="Claude effort" aria-haspopup="dialog" aria-expanded={open}>
-        <span>{current?.name ?? value}</span><Icon name="ChevronDown" size={12} />
+      <button ref={button} className={`provider-summary-btn matrix-summary${codexChrome ? ' codex-summary' : ''}`} data-open={open} onClick={() => setOpen((state) => !state)} title={`${provider} model and effort`} aria-haspopup="dialog" aria-expanded={open}>
+        <Icon name={icon} size={13} />
+        <span>{chipModel}</span>
+        <b>{currentEffort?.name ?? effortValue}</b>
+        <Icon name="ChevronDown" size={12} />
       </button>
       {open && createPortal(
-        <div ref={panel} className="provider-pop claude-effort-pop" role="dialog" aria-label="Claude effort" style={{ position: 'fixed', ...popoverPosition(button.current) }}>
-          <div className="provider-pop-head">
-            <span className="faint">Effort</span>
-            <strong>{current?.name ?? value}</strong>
-            <span className="grow" />
-            <Icon name="CircleHelp" size={14} className="faint" />
+        <div ref={panel} className={`provider-pop matrix-pop${codexChrome ? ' codex-minimal-pop' : ''}`} role="dialog" aria-label={`${provider} model and effort`} style={{ position: 'fixed', ...popoverPosition(button.current) }}>
+          <div className="matrix-grid" role="grid" aria-label={`${provider} model by effort`}>
+            <span className="matrix-corner" aria-hidden="true" />
+            <div className="matrix-header" style={{ gridTemplateColumns: `repeat(${Math.max(1, efforts.length)}, 1fr)` }} role="row">
+              {efforts.map((effort) => (
+                <span key={effort.value} className="matrix-col-label" data-active={effort.value === effortValue || undefined} title={effort.description}>{effort.name}</span>
+              ))}
+            </div>
+            {rows.map((model) => {
+              const activeRow = model.value === (models.length ? modelValue : model.value)
+              return (
+                <Fragment key={model.value}>
+                  <button
+                    className="matrix-model"
+                    data-active={activeRow || undefined}
+                    disabled={!models.length}
+                    onClick={() => { if (model.value !== modelValue) onModel(model.value) }}
+                    title={model.description ?? model.name}
+                    aria-label={`Switch to ${model.name}`}
+                  >{model.name}</button>
+                  <div className="matrix-track" data-active={activeRow || undefined} style={{ gridTemplateColumns: `repeat(${Math.max(1, efforts.length)}, 1fr)` }} role="row">
+                    {activeRow && efforts.length > 1 && (
+                      <span className="matrix-fill" style={{ width: `${(effortIndex / (efforts.length - 1)) * 100}%` }} aria-hidden="true" />
+                    )}
+                    {efforts.map((effort, index) => {
+                      const selected = activeRow && index === effortIndex
+                      return (
+                        <button
+                          key={effort.value}
+                          className="matrix-cell"
+                          data-active={selected || undefined}
+                          data-past={(activeRow && index <= effortIndex) || undefined}
+                          onClick={() => chooseCell(model.value, effort.value)}
+                          title={`${model.name} · ${effort.name}`}
+                          aria-label={`${model.name} at ${effort.name} effort`}
+                          aria-checked={selected}
+                          role="radio"
+                        ><span /></button>
+                      )
+                    })}
+                  </div>
+                </Fragment>
+              )
+            })}
           </div>
-          <div className="effort-axis"><span>Faster</span><span>Smarter</span></div>
-          <div className="effort-track" style={{ gridTemplateColumns: `repeat(${Math.max(1, options.length)}, 1fr)` }}>
-            <span className="effort-track-fill" style={{ width: `${options.length > 1 ? (index / (options.length - 1)) * 100 : 0}%` }} />
-            {options.map((option, optionIndex) => (
-              <button
-                key={option.value}
-                data-active={optionIndex === index}
-                data-past={optionIndex <= index || undefined}
-                onClick={() => { onSelect(option.value); setOpen(false) }}
-                title={option.name}
-                aria-label={`Set Claude effort to ${option.name}`}
-                aria-pressed={optionIndex === index}
-              ><span /></button>
-            ))}
-          </div>
+          {speed !== undefined && onSpeed && (
+            <div className="matrix-speed" role="radiogroup" aria-label="Response speed">
+              <span className="matrix-speed-label">Speed</span>
+              {SPEED_OPTIONS.map((option) => (
+                <button key={option.value} role="radio" aria-checked={speed === option.value} data-active={speed === option.value || undefined} onClick={() => onSpeed(option.value)}>{option.name}</button>
+              ))}
+            </div>
+          )}
         </div>,
         document.body,
       )}
@@ -341,83 +419,6 @@ function ClaudeEffortPicker({ value, options = CLAUDE_EFFORT_OPTIONS, busy, onSe
   )
 }
 
-/** One compact Codex menu: a single surface, three name-only lists. */
-function CodexAdvancedPicker({
-  model,
-  effort,
-  effortValue,
-  speed,
-  onModel,
-  onEffort,
-  onSpeed,
-}: {
-  model: UiControl
-  effort?: UiControl
-  effortValue: CodexEffort
-  speed: AssistantSpeed
-  onModel: (value: string) => void
-  onEffort: (value: string) => void
-  onSpeed: (value: string) => void
-}) {
-  const [open, setOpen] = useState(false)
-  const [section, setSection] = useState<'model' | 'effort' | 'speed'>('effort')
-  const button = useRef<HTMLButtonElement>(null)
-  const panel = useRef<HTMLDivElement>(null)
-  useProviderPopover(open, setOpen, button, panel)
-  const currentModel = model.options.find((option) => option.value === model.value)
-  const speedName = SPEED_OPTIONS.find((option) => option.value === speed)?.name ?? speed
-  const effortOptions = effort?.options.filter((option) => isCodexEffort(option.value)) ?? []
-  const currentEffort = effortOptions.find((option) => option.value === effortValue)
-    ?? CODEX_EFFORT_OPTIONS.find((option) => option.value === effortValue)
-  const compactModel = (currentModel?.name ?? model.value).replace(/^GPT-/i, '').replaceAll('-', ' ')
-  const chooseModel = (value: string) => { onModel(value); setOpen(false) }
-  const chooseEffort = (value: string) => { onEffort(value); setOpen(false) }
-  const chooseSpeed = (value: string) => { onSpeed(value); setOpen(false) }
-  return (
-    <>
-      <button ref={button} className="provider-summary-btn codex-summary" data-open={open} onClick={() => { setSection('effort'); setOpen((state) => !state) }} title="Codex model, effort, and speed" aria-haspopup="menu" aria-expanded={open}>
-        <Icon name="Zap" size={13} />
-        <span>{compactModel}</span>
-        <b>{currentEffort?.name ?? effortValue}</b>
-        <Icon name="ChevronDown" size={12} />
-      </button>
-      {open && createPortal(
-        <div ref={panel} className="provider-pop codex-minimal-pop" role="menu" aria-label="Codex controls" style={{ position: 'fixed', ...popoverPosition(button.current) }}>
-          <div className="provider-section-tabs" role="tablist">
-            {([
-              ['model', 'Model'],
-              ['effort', 'Effort'],
-              ['speed', 'Speed'],
-            ] as const).map(([id, label]) => (
-              <button key={id} role="tab" aria-selected={section === id} data-active={section === id} onClick={() => setSection(id)}>
-                {label}
-              </button>
-            ))}
-          </div>
-          <div className="provider-choice-list" role="menu" aria-label={`Codex ${section}`}>
-            {section === 'model' && model.options.map((option) => (
-              <button key={option.value} className="provider-choice-row" role="menuitemradio" aria-checked={option.value === model.value} onClick={() => chooseModel(option.value)}>
-                <span>{option.name}</span><Icon name="Check" size={14} />
-              </button>
-            ))}
-            {section === 'effort' && effort && effortOptions.length > 0 && effortOptions.map((option) => (
-              <button key={option.value} className="provider-choice-row" role="menuitemradio" aria-checked={option.value === effortValue} onClick={() => chooseEffort(option.value)}>
-                <span>{option.name}</span><Icon name="Check" size={14} />
-              </button>
-            ))}
-            {section === 'effort' && (!effort || !effortOptions.length) && <span className="provider-empty">Default</span>}
-            {section === 'speed' && SPEED_OPTIONS.map((option) => (
-              <button key={option.value} className="provider-choice-row" role="menuitemradio" aria-checked={option.value === speed} onClick={() => chooseSpeed(option.value)}>
-                <span>{option.name}</span><Icon name="Check" size={14} />
-              </button>
-            ))}
-          </div>
-        </div>,
-        document.body,
-      )}
-    </>
-  )
-}
 const activityKind = (text: string): { label: string; icon: string } => {
   if (/sub[-\s]?agent|delegate|task/i.test(text)) return { label: 'Subagent', icon: 'Bot' }
   if (/terminal|shell|command|exec|\bnpm\b|\bpnpm\b|\byarn\b|\bpython\b|\bnode\b|\bgit\b|\becho\b/i.test(text)) return { label: 'Command', icon: 'TerminalSquare' }
@@ -715,6 +716,7 @@ export const Assistant = memo(function Assistant({ threadId }: { threadId: strin
   const setStoreThreadAgent = useKaisola((s) => s.setAssistantThreadAgent)
   const setThreadClaudeEffort = useKaisola((s) => s.setThreadClaudeEffort)
   const setThreadCodexEffort = useKaisola((s) => s.setThreadCodexEffort)
+  const setThreadPermissionMode = useKaisola((s) => s.setThreadPermissionMode)
   const agentTerminals = useKaisola((s) => s.agentTerminals)
   const terminalMeta = useKaisola((s) => s.terminalMeta)
   const setDockView = useKaisola((s) => s.setDockView)
@@ -1053,6 +1055,10 @@ export const Assistant = memo(function Assistant({ threadId }: { threadId: strin
       else if (saved) el.scrollTop = Math.max(0, el.scrollHeight - el.clientHeight - saved.fromBottom)
     })
     observer.observe(el)
+    // A narrow split can rewrap a long draft and grow the composer without
+    // changing the transcript's own box immediately. Observe the textarea too
+    // so a bottom-pinned conversation stays at the live prompt during reflow.
+    if (inputRef.current) observer.observe(inputRef.current)
     return () => {
       cancelAnimationFrame(frame)
       window.clearTimeout(settleA)
@@ -1121,6 +1127,16 @@ export const Assistant = memo(function Assistant({ threadId }: { threadId: strin
         if (effortControl?.options.some((option) => option.value === active.codexEffort)) {
           const applied = await bridge.acp.setConfigOption(`${key}::${active.id}`, effortControl.id, active.codexEffort)
           if (!applied.ok) setNotice(applied.message ?? 'Codex effort could not be restored.')
+        }
+      }
+      // Permission mode is agent-side session state: a new or resumed session
+      // comes back in the agent's default mode. Reapply the thread's saved one.
+      if (active.permissionMode) {
+        const modeControl = controlList(res.controls ?? null).find((control) => control.kind === 'mode')
+        if (modeControl && modeControl.value !== active.permissionMode && modeControl.options.some((option) => option.value === active.permissionMode)) {
+          const applied = await bridge.acp.setMode(`${key}::${active.id}`, active.permissionMode)
+          if (!applied.ok) setNotice(applied.message ?? 'The saved permission mode could not be restored.')
+          else refresh()
         }
       }
       if (res.resumed) setNotice('Resumed the previous session.')
@@ -1215,7 +1231,12 @@ export const Assistant = memo(function Assistant({ threadId }: { threadId: strin
         ? await bridge.acp.setModel(connectionKey, value)
         : await bridge.acp.setConfigOption(connectionKey, c.id, value)
     if (!result.ok) setNotice(result.message ?? `${c.name} could not be changed.`)
-    else setNotice(null)
+    else {
+      setNotice(null)
+      // mode lives on the agent side of the session — persist the choice so
+      // reconnects/restarts reapply it instead of the agent's default
+      if (c.kind === 'mode') setThreadPermissionMode(active.id, value, projectId)
+    }
     refresh()
   }
   const applySpeed = async (nextSpeed: AssistantSpeed): Promise<boolean> => {
@@ -1418,10 +1439,10 @@ export const Assistant = memo(function Assistant({ threadId }: { threadId: strin
   const send = async () => {
     const prompt = currentPrompt()
     if (!prompt.text) return
-    // Steering agent + a turn in flight → inject NOW (arrives at the next tool
-    // boundary). Everything else keeps the queue-until-idle path.
+    // A turn in flight → the message QUEUES (the button says so). Each queued
+    // row carries an explicit Steer action for injecting it mid-turn; sending
+    // must never steer on its own — that made "queue" silently mean "send now".
     if (busy) {
-      if (canSteer) { clearAssistantDraft(active.id, { keepSpeed: true }, projectId); resetComposerHeight(); void steerText(prompt); return }
       queuePrompt(prompt); return
     }
     queuePausedRef.current = false
@@ -1479,6 +1500,13 @@ export const Assistant = memo(function Assistant({ threadId }: { threadId: strin
     if (!(await ensureAgentConnected())) return false
     if (wasTrimmed) setNotice(`Message limited to ${ASSISTANT_DRAFT_TEXT_LIMIT.toLocaleString()} characters to keep the IDE responsive. Attach long material as a file to preserve it in full.`)
     const threadId = active.id
+    // Snapshot the live permission mode with every send — the agent itself can
+    // flip modes mid-session (e.g. leaving plan mode), and only what's saved
+    // here survives a reconnect.
+    {
+      const liveMode = controls.find((c) => c.kind === 'mode')?.value
+      if (liveMode) setThreadPermissionMode(threadId, liveMode, projectId)
+    }
     if (owningSlice()?.assistantThreads.find((t) => t.id === threadId)?.busy) return false
     const first = (owningSlice()?.assistantRuntimes[threadId] ?? arun).first
     const files = prompt.attachments
@@ -1640,7 +1668,8 @@ export const Assistant = memo(function Assistant({ threadId }: { threadId: strin
     useKaisola.getState().clearOmniPrompt()
     const text = omniPrompt.text
     if (busy) {
-      if (canSteer) { void steerText({ ...EMPTY_DRAFT, text: text.trim(), speed }); return }
+      // same rule as the composer: busy → queue; steering is only ever the
+      // explicit per-row action on a queued prompt
       queuePausedRef.current = false
       enqueueAssistantPrompt(active.id, { ...EMPTY_DRAFT, text: text.trim(), speed }, undefined, projectId)
       return
@@ -1678,21 +1707,41 @@ export const Assistant = memo(function Assistant({ threadId }: { threadId: strin
       text: `${paper.title}${paper.authors.length ? ` — ${paper.authors.join(', ')}` : ''}${paper.summary || paper.abstract ? `: ${paper.summary ?? paper.abstract}` : ''}`,
     }],
   }, projectId)
-  const attachSession = (thread: AssistantThread) => {
+  // How much of a prior session rides along as context. Turns are capped
+  // individually so one giant paste can't crowd out the rest, and trimming
+  // keeps the TAIL — the most recent exchanges are the ones that matter.
+  const ATTACH_SESSION_TURNS = 60
+  const ATTACH_SESSION_CHARS = 80_000
+  const ATTACH_SESSION_TURN_CHARS = 6_000
+  const attachSession = async (thread: AssistantThread) => {
     const runtime = useKaisola.getState().assistantRuntimes[thread.id]
-    const transcript = (runtime?.turns ?? [])
-      .filter((turn) => (turn.kind === 'user' || turn.kind === 'assistant') && turn.text)
-      .slice(-12)
-      .map((turn) => `${turn.kind === 'user' ? 'User' : 'Agent'}: ${turn.text}`)
+    const usable = (turn: Turn) => (turn.kind === 'user' || turn.kind === 'assistant') && !!turn.text
+    let turns = (runtime?.turns ?? []).filter(usable)
+    // Older turns live in main's append-only archive, not the renderer page —
+    // pull the newest archived window so attaching a long/closed session
+    // carries real content instead of "(transcript currently stored on disk)".
+    if (turns.length < ATTACH_SESSION_TURNS && bridge.assistantArchive) {
+      try {
+        const scope = { projectId, threadId: thread.id, ...(runtime?.archiveEpoch ? { epoch: runtime.archiveEpoch } : {}) }
+        const page = await bridge.assistantArchive.page(scope, undefined, ATTACH_SESSION_TURNS)
+        if (page.ok) {
+          const archived = page.turns.map(archivedTurn).filter((turn): turn is Turn => !!turn && usable(turn))
+          turns = [...archived, ...turns]
+        }
+      } catch { /* live turns only */ }
+    }
+    const transcript = turns
+      .slice(-ATTACH_SESSION_TURNS)
+      .map((turn) => `${turn.kind === 'user' ? 'User' : 'Agent'}: ${turn.text.length > ATTACH_SESSION_TURN_CHARS ? `${turn.text.slice(0, ATTACH_SESSION_TURN_CHARS)} …` : turn.text}`)
       .join('\n')
-      .slice(0, 16_000)
+      .slice(-ATTACH_SESSION_CHARS)
     const label = thread.name ?? thread.autoName ?? thread.agentKey
     setAssistantDraft(active.id, {
       mentions: [...mentions.filter((mention) => !(mention.kind === 'run' && mention.id === thread.id)), {
         id: thread.id,
         kind: 'run',
         label,
-        text: `Prior Kaisola session “${label}”${transcript ? `:\n${transcript}` : ' (transcript currently stored on disk)'}`,
+        text: `Prior Kaisola session “${label}”${transcript ? `:\n${transcript}` : ' (no transcript recorded yet)'}`,
       }],
     }, projectId)
   }
@@ -2025,14 +2074,26 @@ export const Assistant = memo(function Assistant({ threadId }: { threadId: strin
           ))}
           {!claudeAgent && !codexAgent && <Dropdown icon="Gauge" value={speed} options={SPEED_OPTIONS} onSelect={setSpeed} title="Response speed" />}
           <span className="grow" />
-          {claudeAgent && providerModelControl && (
-            <Dropdown icon="Sparkles" value={providerModelControl.value} options={providerModelControl.options.map(({ value, name }) => ({ value, name }))} onSelect={(value) => void onControlChange(providerModelControl, value)} title="Claude model" align="right" />
+          {claudeAgent && (
+            <ModelEffortMatrix
+              provider="Claude"
+              icon="Sparkles"
+              models={providerModelControl?.options ?? []}
+              modelValue={providerModelControl?.value ?? ''}
+              efforts={claudeEffortOptions}
+              effortValue={claudeEffort}
+              onModel={(value) => { if (providerModelControl) void onControlChange(providerModelControl, value) }}
+              onEffort={(value) => void changeClaudeEffort(value)}
+            />
           )}
-          {claudeAgent && <ClaudeEffortPicker value={claudeEffort} options={claudeEffortOptions} busy={busy} onSelect={(value) => void changeClaudeEffort(value)} />}
           {codexAgent && providerModelControl && (
-            <CodexAdvancedPicker
-              model={providerModelControl}
-              effort={providerEffortControl}
+            <ModelEffortMatrix
+              provider="Codex"
+              icon="Zap"
+              codexChrome
+              models={providerModelControl.options}
+              modelValue={providerModelControl.value}
+              efforts={providerEffortControl?.options.filter((option) => isCodexEffort(option.value)) ?? CODEX_EFFORT_OPTIONS.filter((option) => option.value !== 'max')}
               effortValue={codexEffort}
               speed={liveSpeed}
               onModel={(value) => void onControlChange(providerModelControl, value)}

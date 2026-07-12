@@ -263,6 +263,7 @@ export function Terminal({ id, attach = false, boot, cwd }: { id: string; attach
   // boot delivery: `create` boots only FRESH ptys; a boot adopted while the pty
   // is already live arrives via the record's bootPending flag instead
   const bootPending = useKaisola((s) => s.terminals.find((t) => t.id === id)?.bootPending)
+  const foregroundProcess = useKaisola((s) => s.terminalMeta[id]?.fgProcess)
   const persistedContinuation = useKaisola((s) => s.terminals.find((t) => t.id === id)?.continued)
   const setTerminalContinuation = useKaisola((s) => s.setTerminalContinuation)
   // Agent-owned attach-only terminals are not durable TerminalSession rows;
@@ -270,6 +271,9 @@ export function Terminal({ id, attach = false, boot, cwd }: { id: string; attach
   const [attachedContinuation, setAttachedContinuation] = useState<TerminalContinuationStatus | null>(null)
   const continuation = persistedContinuation ?? attachedContinuation
   const [ptyReady, setPtyReady] = useState(false)
+  // A broker-owned pty can outlive the Electron renderer across an update.
+  // Pending boots must distinguish that live pty from a newly-created shell.
+  const ptyExistedRef = useRef(false)
   const bootSentRef = useRef(false)
   // what the create path actually typed (and when) — the adopted-boot effect
   // dedupes against it so a record update landing inside create's 700ms window
@@ -803,6 +807,7 @@ export function Terminal({ id, attach = false, boot, cwd }: { id: string; attach
           term.writeln('\x1b[38;2;225;106;106mTerminal unavailable.\x1b[0m')
           return
         }
+        ptyExistedRef.current = !!res.existed
         const receipt = continuedStatus(res)
         const state = useKaisola.getState()
         if (receipt) state.setTerminalContinuation(id, receipt)
@@ -903,6 +908,20 @@ export function Terminal({ id, attach = false, boot, cwd }: { id: string; attach
     if (!ptyReady || !bootPending) return
     const st = useKaisola.getState()
     const t = st.terminals.find((x) => x.id === id)
+    const processName = foregroundProcess?.split('/').pop()?.replace(/^-/, '') ?? ''
+    const idleShell = /^(zsh|bash|fish|sh)$/.test(processName)
+    // On update/restart, the broker can hand the new renderer the SAME live
+    // Claude/Codex pty. Metadata arrives just after create(), so wait for it;
+    // if an agent (or one of its child tools) still owns the foreground, the
+    // pending resume is only persisted launch metadata — never type it into
+    // the agent's message composer. A surviving idle shell may safely boot.
+    if (ptyExistedRef.current) {
+      if (!foregroundProcess) return
+      if (!idleShell) {
+        if (t?.singletonKey?.match(/^(agent|wt):/)) st.clearBootPending(id)
+        return
+      }
+    }
     st.clearBootPending(id)
     // bootPending is an explicit "write it now" (set only for already-live
     // ptys — new terminals boot via the create path), so a rerun of the SAME
@@ -923,7 +942,7 @@ export function Terminal({ id, attach = false, boot, cwd }: { id: string; attach
       bridge.terminal.write(id, line + '\n')
       armDraftRetypeRef.current(line)
     }, 700)
-  }, [ptyReady, bootPending, id])
+  }, [ptyReady, bootPending, id, foregroundProcess])
 
   // find-in-scrollback: amber matches, accent active match (proposed-API decorations)
   const findDecorations = {

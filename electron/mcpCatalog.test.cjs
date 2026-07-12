@@ -112,6 +112,30 @@ test('Claude handoff preserves secret placeholders instead of expanding them to 
   assert.equal(entries.off, undefined)
 })
 
+test('pinned npx specs rewrite to direct spawns of the bundled bin', () => {
+  const pinned = '@modelcontextprotocol/server-sequential-thinking@2025.12.18'
+  const direct = __test.directSpawnRewrite('npx', ['-y', pinned])
+  assert.ok(direct, 'bundled pinned package should rewrite')
+  assert.equal(direct.command, process.execPath)
+  assert.ok(fs.existsSync(direct.args[0]), `rewritten bin should exist: ${direct.args[0]}`)
+  assert.equal(direct.env.ELECTRON_RUN_AS_NODE, '1')
+
+  // anything not bundled at the exact pinned version keeps riding npx
+  assert.equal(__test.directSpawnRewrite('npx', ['-y', '@modelcontextprotocol/server-sequential-thinking@0.0.0']), null)
+  assert.equal(__test.directSpawnRewrite('npx', ['-y', '@modelcontextprotocol/server-sequential-thinking']), null)
+  assert.equal(__test.directSpawnRewrite('npx', ['-y', 'not-bundled-anywhere@1.0.0']), null)
+  assert.equal(__test.directSpawnRewrite('node', ['server.js']), null)
+
+  const entries = __test.claudeEntriesFromConfig({
+    mcpServers: { 'sequential-thinking': { command: 'npx', args: ['-y', pinned], env: { FOO: '${FOO}' } } },
+  })
+  const entry = entries['sequential-thinking']
+  assert.equal(entry.command, process.execPath)
+  assert.equal(entry.args[0], direct.args[0])
+  assert.equal(entry.env.ELECTRON_RUN_AS_NODE, '1')
+  assert.equal(entry.env.FOO, '${FOO}')
+})
+
 test('Codex MCP TOML discovery preserves env references and supported transports', () => {
   const parsed = __test.parseCodexMcpToml(`
 [mcp_servers.docs]

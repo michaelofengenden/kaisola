@@ -1077,11 +1077,10 @@ app.whenReady().then(async () => {
   })()`)
   console.log('PROMPT_QUEUE=' + JSON.stringify(promptQueue))
 
-  // 7c-ii) MID-TURN STEER — a promptQueueing agent (the mock advertises it)
-  //        gets follow-ups injected into the RUNNING turn, not queued until it
-  //        ends. Hold a first turn, click send again while busy, and prove the
-  //        second message reaches the agent immediately (never queued) and the
-  //        turn ends only after BOTH settle.
+  // 7c-ii) QUEUE THEN EXPLICIT STEER — submitting while a turn runs must QUEUE
+  //        the follow-up (auto-steer made "Queue prompt" silently mean "send
+  //        now"). The queued row's Steer button then injects it into the
+  //        RUNNING turn, and the turn ends only after BOTH settle.
   const steer = await win.webContents.executeJavaScript(`(async () => {
     const get = () => window.__kaisola.getState()
     const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
@@ -1099,15 +1098,20 @@ app.whenReady().then(async () => {
     send()?.click()
     let started = false
     for (let i = 0; i < 50; i++) { if (get().assistantThreads.find((t) => t.id === tid)?.busy) { started = true; break } await wait(20) }
-    // while busy, submit a follow-up — must STEER (go straight into the turn),
-    // not sit in the queue
+    // while busy, submit a follow-up — it must land in the QUEUE, untouched
     get().setAssistantDraft(tid, { text: 'steer-follow', attachments: [], mentions: [], speed: 'default' })
     await wait(40)
     send()?.click()
     await wait(120)
-    const midQueueEmpty = (get().assistantPromptQueues[tid] || []).length === 0
+    const queuedWhileBusy = (get().assistantPromptQueues[tid] || []).some((q) => q.text.includes('steer-follow'))
+      && !(get().assistantRuntimes[tid]?.turns || []).some((t) => t.kind === 'user' && t.text.includes('steer-follow'))
+    // the queued row's explicit Steer action injects it into the running turn
+    assistant?.querySelector('.composer-queue-steer')?.click()
+    await wait(120)
     const midUsers = (get().assistantRuntimes[tid]?.turns || []).filter((t) => t.kind === 'user')
-    const steeredWhileBusy = get().assistantThreads.find((t) => t.id === tid)?.busy && midUsers.some((t) => t.text.includes('steer-follow'))
+    const steeredWhileBusy = get().assistantThreads.find((t) => t.id === tid)?.busy
+      && midUsers.some((t) => t.text.includes('steer-follow'))
+      && (get().assistantPromptQueues[tid] || []).length === 0
     // let both turns settle
     for (let i = 0; i < 200; i++) {
       const s = get()
@@ -1121,7 +1125,7 @@ app.whenReady().then(async () => {
     const users = turns.filter((t) => t.kind === 'user')
     return {
       started,
-      neverQueued: midQueueEmpty,
+      queuedWhileBusy: !!queuedWhileBusy,
       steeredWhileBusy: !!steeredWhileBusy,
       twoUserTurns: users.length === 2 && users.some((t) => t.text.includes('steer-base')) && users.some((t) => t.text.includes('steer-follow')),
       followDelivered: turns.some((t) => t.kind === 'assistant' && t.text.includes('you said: steer-follow')),
@@ -2339,12 +2343,18 @@ a^2 + b^2 = c^2
     const assistant = document.querySelector('.assistant')
     const card = assistant?.closest('.session-card')
     if (!assistant || !card) return { rendered: false }
+    const state = window.__kaisola.getState()
+    const threadId = assistant.getAttribute('data-thread-id')
+    const originalDraft = threadId ? state.assistantDrafts[threadId] : null
+    const longDraft = 'This narrow composer must keep every word readable and scrollable after the card moves to the right. '.repeat(18)
+    if (threadId) state.setAssistantDraft(threadId, { text: longDraft })
     const originalStyle = card.getAttribute('style') || ''
     card.style.width = '340px'
     card.style.maxWidth = '340px'
     card.style.justifySelf = 'start'
     await new Promise((r) => setTimeout(r, 80))
     const composer = assistant.querySelector('.composer')
+    const input = assistant.querySelector('.composer-input')
     const bar = assistant.querySelector('.composer-bar')
     const send = assistant.querySelector('.composer-send')
     const foot = assistant.querySelector('.assistant-foot')
@@ -2355,6 +2365,11 @@ a^2 + b^2 = c^2
       const p = parent.getBoundingClientRect()
       return c.left >= p.left - 1 && c.right <= p.right + 1
     }
+    const inputStyle = input ? getComputedStyle(input) : null
+    const leftHeight = input?.clientHeight ?? 0
+    card.style.justifySelf = 'end'
+    await new Promise((r) => setTimeout(r, 60))
+    const sideAgnostic = !!input && input.value === longDraft && input.clientHeight === leftHeight
     const result = {
       rendered: true,
       narrow: assistant.getBoundingClientRect().width <= 342,
@@ -2363,12 +2378,46 @@ a^2 + b^2 = c^2
       sendVisible: within(send, composer),
       footerFits: !!foot && foot.scrollWidth <= foot.clientWidth + 1 && within(conn, foot),
       wraps: !!bar && getComputedStyle(bar).flexWrap === 'wrap',
+      draftReadable: !!input && input.value === longDraft && input.clientHeight >= 100,
+      draftScrollable: !!input && !!inputStyle && /auto|scroll/.test(inputStyle.overflowY) && input.scrollHeight >= input.clientHeight,
+      draftResponsive: !!inputStyle && inputStyle.fieldSizing === 'content',
+      sideAgnostic,
     }
+    if (threadId) state.setAssistantDraft(threadId, originalDraft ?? { text: '', attachments: [], mentions: [], speed: 'default' })
     card.setAttribute('style', originalStyle)
     await new Promise((r) => setTimeout(r, 45))
     return result
   })()`)
   console.log('NARROW_AGENT_UI=' + JSON.stringify(narrowAgentUi))
+
+  // 14d) the inbox stays anchored even at zero, then gains/loses only its
+  //      badge as attention arrives and is cleared.
+  const inboxAnchorUi = await win.webContents.executeJavaScript(`(async () => {
+    const st = window.__kaisola.getState()
+    const saved = { inbox: st.inbox, needsYou: st.needsYou, projectTabs: st.projectTabs, projectSlices: st.projectSlices }
+    st.setInbox(true)
+    window.__kaisola.setState({
+      needsYou: {},
+      projectTabs: st.projectTabs.map((tab) => ({ ...tab, activity: tab.activity === 'needs-you' || tab.activity === 'failed' ? undefined : tab.activity })),
+      projectSlices: Object.fromEntries(Object.entries(st.projectSlices).map(([id, slice]) => [id, slice ? { ...slice, needsYou: {} } : slice])),
+    })
+    await new Promise((r) => setTimeout(r, 80))
+    const zeroButton = document.querySelector('.shell-sidebar-footer .inbox-btn')
+    const anchoredAtZero = !!zeroButton && !zeroButton.querySelector('.inbox-count')
+    const sessionId = window.__kaisola.getState().activeThreadId
+    if (sessionId) window.__kaisola.getState().markNeedsYou(sessionId)
+    await new Promise((r) => setTimeout(r, 80))
+    const activeButton = document.querySelector('.shell-sidebar-footer .inbox-btn')
+    const badged = !!activeButton?.querySelector('.inbox-count')
+    window.__kaisola.getState().clearInbox()
+    await new Promise((r) => setTimeout(r, 80))
+    const clearedButton = document.querySelector('.shell-sidebar-footer .inbox-btn')
+    const staysAfterClear = !!clearedButton && !clearedButton.querySelector('.inbox-count')
+    window.__kaisola.setState(saved)
+    if (!saved.inbox) window.__kaisola.getState().setInbox(false)
+    return { anchoredAtZero, badged, staysAfterClear }
+  })()`)
+  console.log('INBOX_ANCHOR_UI=' + JSON.stringify(inboxAnchorUi))
 
   // 15) settings exposes the appearance/layout configuration
   const settings = await win.webContents.executeJavaScript(`(async () => {
@@ -3648,7 +3697,7 @@ a^2 + b^2 = c^2
     !brokerActivity.created || !brokerActivity.began || !brokerActivity.detached || !brokerActivity.settled || !brokerActivity.durable ||
     !transcriptTypography.rendered || !transcriptTypography.normalWhitespace || !transcriptTypography.readableWidth || !transcriptTypography.compactStream || !transcriptTypography.compactList || !transcriptTypography.differentiatedRoles || !transcriptTypography.promptRail || !transcriptTypography.promptRailMinimal || !transcriptTypography.localLink || !transcriptTypography.linkOpenedFiles || !transcriptTypography.lineJump ||
     !promptQueue.started || !promptQueue.queuedTwo || !promptQueue.inlinePreview || !promptQueue.aboveComposer || !promptQueue.attachedComposer || !promptQueue.queueActions || !promptQueue.noQueueToast || !promptQueue.drained || !promptQueue.combinedOnce || !promptQueue.deliveredTogether || !promptQueue.newestSpeedWon ||
-    !steer.started || !steer.neverQueued || !steer.steeredWhileBusy || !steer.twoUserTurns || !steer.followDelivered || !steer.baseDelivered || !steer.endedIdle ||
+    !steer.started || !steer.queuedWhileBusy || !steer.steeredWhileBusy || !steer.twoUserTurns || !steer.followDelivered || !steer.baseDelivered || !steer.endedIdle ||
     !persist.stored || !persist.hasTheme || !persist.hasAgent || !persist.hasThread || !persist.hasChatTurn || !persist.hasDraft || !persist.draftBounded || !persist.hasCodexEffort || !persist.hasTabLayout ||
     !boot.hasId || !boot.ran ||
     !auth.hasUrl || auth.code !== 'ABCD-1234' || !auth.done ||
@@ -3685,7 +3734,8 @@ a^2 + b^2 = c^2
     !tabLayouts.rendered || !tabLayouts.sidebarOk || !tabLayouts.shelfOk || !tabLayouts.bareOk || !tabLayouts.runwayOk || !tabLayouts.flatOk || !tabLayouts.compactOk || !tabLayouts.reciprocalToggle || !tabLayouts.verticalAddFlow || !tabLayouts.stateKept || !tabLayouts.staticPaint || !tabLayouts.accessible || !tabLayouts.sessionIdentity ||
     !intuitiveLayoutControls.noHeaderTools || !intuitiveLayoutControls.fileTreeIconOnly || !intuitiveLayoutControls.localClose || !intuitiveLayoutControls.hidden || !intuitiveLayoutControls.recoverySameSide || !intuitiveLayoutControls.restored || !intuitiveLayoutControls.recoveryGoneAfterRestore || !intuitiveLayoutControls.noStandaloneLayout || !intuitiveLayoutControls.settingsOwned || !intuitiveLayoutControls.advancedStylesDisclosed || !intuitiveLayoutControls.startsInInterface || !intuitiveLayoutControls.workspaceReversible || !intuitiveLayoutControls.panelsReversible || !intuitiveLayoutControls.placementReversible || !intuitiveLayoutControls.footerFollowsNavigation || !intuitiveLayoutControls.rareActionsInPalette || !intuitiveLayoutControls.previewContextual ||
     !realPointerLayout.firstWorked || !realPointerLayout.reverseWorked || !realPointerLayout.stayedInteractive ||
-    !narrowAgentUi.rendered || !narrowAgentUi.narrow || !narrowAgentUi.containerAware || !narrowAgentUi.composerFits || !narrowAgentUi.sendVisible || !narrowAgentUi.footerFits || !narrowAgentUi.wraps ||
+    !narrowAgentUi.rendered || !narrowAgentUi.narrow || !narrowAgentUi.containerAware || !narrowAgentUi.composerFits || !narrowAgentUi.sendVisible || !narrowAgentUi.footerFits || !narrowAgentUi.wraps || !narrowAgentUi.draftReadable || !narrowAgentUi.draftScrollable || !narrowAgentUi.draftResponsive || !narrowAgentUi.sideAgnostic ||
+    !inboxAnchorUi.anchoredAtZero || !inboxAnchorUi.badged || !inboxAnchorUi.staysAfterClear ||
     !settings.settingsSeparate || !settings.footerOwned || !settings.startsInInterface || !settings.hasLayoutSettings || !settings.hasAdvancedStyles || !settings.noStandaloneLayout || !settings.hasAppearance || !settings.hasUsage || !settings.hasDiskResidency || !settings.hasTabLayout || !settings.extensionsInSettings || !settings.contextualFilesControl || !settings.noSidebarControls || !settings.previewOpened || !settings.previewDismissed ||
     !extensionsUi.opened || extensionsUi.cards < 8 || !extensionsUi.hasFilters || !extensionsUi.csvInstalled || !extensionsUi.jsonInstalled ||
     !extensionsUi.persisted || !extensionsUi.defaultUninstallPersisted || !extensionsUi.csvPreview || !extensionsUi.jsonPreview || !extensionsUi.boundedJsonPreview || !extensionsUi.closed ||

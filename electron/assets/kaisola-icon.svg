@@ -1,45 +1,4 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" role="img" aria-label="Kaisola">
-  <defs>
-    <linearGradient id="kaisola-bg" x1="162" y1="96" x2="862" y2="942" gradientUnits="userSpaceOnUse">
-      <stop offset="0" stop-color="#fffdf6"/>
-      <stop offset="0.55" stop-color="#fff4df"/>
-      <stop offset="1" stop-color="#e8dcc2"/>
-    </linearGradient>
-    <radialGradient id="kaisola-glow" cx="0" cy="0" r="1" gradientUnits="userSpaceOnUse" gradientTransform="translate(354 214) rotate(58) scale(760)">
-      <stop offset="0" stop-color="#ffffff" stop-opacity="0.92"/>
-      <stop offset="0.58" stop-color="#ffffff" stop-opacity="0.18"/>
-      <stop offset="1" stop-color="#ffffff" stop-opacity="0"/>
-    </radialGradient>
-    <linearGradient id="kaisola-olive" x1="368" y1="138" x2="676" y2="878" gradientUnits="userSpaceOnUse">
-      <stop offset="0" stop-color="#6d8238"/>
-      <stop offset="0.58" stop-color="#4d641f"/>
-      <stop offset="1" stop-color="#354716"/>
-    </linearGradient>
-    <linearGradient id="kaisola-olive-soft" x1="382" y1="178" x2="628" y2="824" gradientUnits="userSpaceOnUse">
-      <stop offset="0" stop-color="#8aa05a" stop-opacity="0.32"/>
-      <stop offset="1" stop-color="#27370f" stop-opacity="0"/>
-    </linearGradient>
-    <filter id="stone-shadow" x="-22%" y="-18%" width="144%" height="136%" color-interpolation-filters="sRGB">
-      <feDropShadow dx="0" dy="16" stdDeviation="20" flood-color="#2d341d" flood-opacity="0.20"/>
-    </filter>
-    <filter id="tile-shadow" x="-6%" y="-6%" width="112%" height="112%" color-interpolation-filters="sRGB">
-      <feDropShadow dx="0" dy="10" stdDeviation="22" flood-color="#7b6a45" flood-opacity="0.18"/>
-    </filter>
-    <clipPath id="keystone-clip">
-      <path d="M518 139C606 143 661 222 678 344C690 431 684 622 661 733C637 849 570 891 501 876C407 856 356 759 348 628C340 490 361 316 400 223C428 157 469 137 518 139Z"/>
-    </clipPath>
-  </defs>
-
-  <rect x="0" y="0" width="1024" height="1024" rx="202" fill="url(#kaisola-bg)" filter="url(#tile-shadow)"/>
-  <rect x="0" y="0" width="1024" height="1024" rx="202" fill="url(#kaisola-glow)"/>
-  <rect x="24" y="24" width="976" height="976" rx="184" fill="none" stroke="#d7c9a9" stroke-opacity="0.64" stroke-width="6"/>
-
-  <g filter="url(#stone-shadow)">
-    <path d="M518 139C606 143 661 222 678 344C690 431 684 622 661 733C637 849 570 891 501 876C407 856 356 759 348 628C340 490 361 316 400 223C428 157 469 137 518 139Z" fill="url(#kaisola-olive)"/>
-    <path d="M520 168C584 176 625 241 637 345C648 441 640 653 618 746C598 831 548 858 502 842C428 817 392 737 386 624C378 490 401 324 436 232C456 181 488 164 520 168Z" fill="url(#kaisola-olive-soft)"/>
-    <g clip-path="url(#keystone-clip)">
-      <path d="M342 644C414 525 552 414 716 279" fill="none" stroke="#fff3df" stroke-width="42" stroke-linecap="round"/>
-      <path d="M412 594C496 668 594 751 684 844" fill="none" stroke="#fff3df" stroke-width="42" stroke-linecap="round"/>
-    </g>
-  </g>
+<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" viewBox="0 0 1024 1024" role="img" aria-label="Kaisola">
+  <title>Kaisola</title>
+  <image x="0" y="0" width="1024" height="1024" href="kaisola-icon.png" xlink:href="kaisola-icon.png"/>
 </svg>

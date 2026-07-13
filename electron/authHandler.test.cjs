@@ -110,3 +110,21 @@ test('Firebase callback context mismatch is rejected', async () => {
 test('OAuth callback page escapes diagnostic text', () => {
   assert.equal(__test.escapeHtml('<script>bad()</script>'), '&lt;script&gt;bad()&lt;/script&gt;')
 })
+
+test('only the initiating or replacement renderer can cancel Google OAuth', () => {
+  const owner = { id: 1, isDestroyed: () => false }
+  const peer = { id: 2, isDestroyed: () => false }
+  assert.equal(__test.canControlGoogleSession(null, peer), true)
+  assert.equal(__test.canControlGoogleSession({ sender: owner }, owner), true)
+  assert.equal(__test.canControlGoogleSession({ sender: owner }, peer), false)
+  owner.isDestroyed = () => true
+  assert.equal(__test.canControlGoogleSession({ sender: owner }, peer), true)
+})
+
+test('stale OAuth continuations cannot mutate or close a replacement attempt', () => {
+  const attemptA = { cancelled: true }
+  const attemptB = { cancelled: false }
+  assert.equal(__test.sameGoogleSession(attemptA, attemptA), true)
+  assert.equal(__test.sameGoogleSession(attemptB, attemptA), false)
+  assert.equal(__test.sameGoogleSession(null, attemptA), false)
+})

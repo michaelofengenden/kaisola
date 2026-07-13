@@ -1,4 +1,4 @@
-import { useEffect, useLayoutEffect, useRef, useState } from 'react'
+import { useEffect, useId, useLayoutEffect, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
 import { Icon } from './Icon'
 
@@ -20,24 +20,30 @@ export function Dropdown({
   onSelect,
   icon,
   title,
+  ariaLabel,
   placeholder,
   align = 'left',
   placement = 'auto',
+  disabled = false,
 }: {
   value: string
   options: DropOption[]
   onSelect: (value: string) => void
   icon?: string
   title?: string
+  ariaLabel?: string
   placeholder?: string
   align?: 'left' | 'right'
   placement?: 'auto' | 'bottom' | 'top'
+  disabled?: boolean
 }) {
   const [open, setOpen] = useState(false)
   const [pos, setPos] = useState<{ left?: number; right?: number; top?: number; bottom?: number; maxHeight?: number }>({})
   const btnRef = useRef<HTMLButtonElement>(null)
   const menuRef = useRef<HTMLDivElement>(null)
+  const menuId = useId()
   const current = options.find((o) => o.value === value)
+  const visibleValue = current?.name ?? placeholder ?? value
 
   const place = () => {
     const b = btnRef.current?.getBoundingClientRect()
@@ -68,6 +74,15 @@ export function Dropdown({
 
   useEffect(() => {
     if (!open) return
+    const frame = window.requestAnimationFrame(() => {
+      const items = [...(menuRef.current?.querySelectorAll<HTMLButtonElement>('[role="menuitemradio"]') ?? [])]
+      ;(items.find((item) => item.dataset.active === 'true') ?? items[0] ?? menuRef.current)?.focus()
+    })
+    return () => window.cancelAnimationFrame(frame)
+  }, [open])
+
+  useEffect(() => {
+    if (!open) return
     const onDoc = (e: PointerEvent) => {
       const t = e.target as Node
       if (btnRef.current?.contains(t) || menuRef.current?.contains(t)) return
@@ -80,6 +95,7 @@ export function Dropdown({
       if (e.key !== 'Escape') return
       e.stopPropagation()
       setOpen(false)
+      window.requestAnimationFrame(() => btnRef.current?.focus())
     }
     // Capture phase is intentional: modal panels (Settings included) stop
     // bubbling pointer events at their surface. A bubble listener therefore
@@ -94,25 +110,67 @@ export function Dropdown({
     }
   }, [open])
 
+  useEffect(() => {
+    if (disabled && open) setOpen(false)
+  }, [disabled, open])
+
+  const openFromKey = (event: React.KeyboardEvent<HTMLButtonElement>) => {
+    if (disabled || !['ArrowDown', 'ArrowUp', 'Home', 'End'].includes(event.key)) return
+    event.preventDefault()
+    setOpen(true)
+  }
+  const moveMenuFocus = (event: React.KeyboardEvent<HTMLDivElement>) => {
+    const items = [...(menuRef.current?.querySelectorAll<HTMLButtonElement>('[role="menuitemradio"]') ?? [])]
+    if (!items.length) return
+    const at = Math.max(0, items.indexOf(document.activeElement as HTMLButtonElement))
+    let next = at
+    if (event.key === 'ArrowDown') next = (at + 1) % items.length
+    else if (event.key === 'ArrowUp') next = (at - 1 + items.length) % items.length
+    else if (event.key === 'Home') next = 0
+    else if (event.key === 'End') next = items.length - 1
+    else if (event.key === 'Escape') {
+      event.preventDefault(); event.stopPropagation(); setOpen(false); window.requestAnimationFrame(() => btnRef.current?.focus()); return
+    } else if (event.key === 'Tab') {
+      setOpen(false); return
+    } else return
+    event.preventDefault()
+    items[next].focus()
+  }
+
   return (
     <>
-      <button ref={btnRef} className="drop-btn" onClick={() => setOpen((o) => !o)} title={title} data-open={open}>
+      <button
+        ref={btnRef}
+        className="drop-btn"
+        onClick={() => { if (!disabled) setOpen((o) => !o) }}
+        onKeyDown={openFromKey}
+        title={title}
+        disabled={disabled}
+        data-open={open}
+        aria-haspopup="menu"
+        aria-expanded={open}
+        aria-controls={open ? menuId : undefined}
+        aria-label={ariaLabel ? `${ariaLabel}: ${visibleValue}` : (!current?.name && !placeholder ? title : undefined)}
+      >
         {icon && <Icon name={icon} size={12} className="drop-btn-icon" />}
-        <span className="drop-btn-label">{current?.name ?? placeholder ?? value}</span>
+        <span className="drop-btn-label">{visibleValue}</span>
         <Icon name="ChevronDown" size={12} className="drop-caret" />
       </button>
       {open &&
         createPortal(
-          <div ref={menuRef} className="drop-menu" style={{ position: 'fixed', ...pos }} role="menu">
+          <div id={menuId} ref={menuRef} className="drop-menu" style={{ position: 'fixed', ...pos }} role="menu" tabIndex={-1} onKeyDown={moveMenuFocus}>
             {options.length === 0 && <div className="drop-empty faint">No options</div>}
             {options.map((o) => (
               <button
                 key={o.value}
                 className="drop-item"
                 data-active={o.value === value}
+                role="menuitemradio"
+                aria-checked={o.value === value}
                 onClick={() => {
                   onSelect(o.value)
                   setOpen(false)
+                  window.requestAnimationFrame(() => btnRef.current?.focus())
                 }}
               >
                 <Icon name="Check" size={12} className="drop-check" />

@@ -72,6 +72,9 @@ app.whenReady().then(async () => {
   registerWorktreeHandlers(ipcMain)
   ipcMain.handle('shell:glass', () => ({ supported: false, active: false, enabled: false }))
   ipcMain.handle('shell:window-mode', () => ({ wantSolid: true, liveSolid: true }))
+  ipcMain.handle('window:popped', () => ({ ok: true, termIds: [], states: [], closed: [] }))
+  ipcMain.handle('window:pop-closed-ack', () => ({ ok: false }))
+  ipcMain.on('window:terminal-state', () => {})
   ipcMain.handle('acp:presets', () => [
     { id: 'claude-code', name: 'Claude' },
     { id: 'codex', name: 'Codex' },
@@ -314,12 +317,34 @@ app.whenReady().then(async () => {
   const negotiated = await waitForPhase('plan-ready')
   if (negotiated) await clickAction()
   const assigned = await waitForPhase('assigned')
-  if (assigned) await clickAction()
+  // A double activation lands before React can disable the button. The
+  // durable compare-and-set operation journal must still create exactly one
+  // worktree per member (a component-local ref cannot guarantee this).
+  const doubleExecuteClaimed = assigned && await win.webContents.executeJavaScript(`(() => {
+    const action = document.querySelector('.group-action')
+    if (!action || action.disabled) return false
+    action.click()
+    action.click()
+    return true
+  })()`)
   const executed = await waitForPhase('execution-ready')
+  const isolatedWorktreeCount = executed
+    ? execFileSync('git', ['worktree', 'list', '--porcelain'], { cwd: workspace, encoding: 'utf8' }).split('\n').filter((line) => line.startsWith('worktree ')).length - 1
+    : -1
   if (executed) await clickAction()
   const reviewed = await waitForPhase('merge-ready')
   if (reviewed) await clickAction()
   const done = await waitForPhase('done')
+  let worktreeCleanupDone = false
+  for (let i = 0; i < 120; i++) {
+    const durableCleanup = await win.webContents.executeJavaScript(`(() => {
+      const group = window.__kaisola.getState().assistantThreads.find((thread) => thread.group)?.group
+      return !!group && !group.worktreeCleanup && Object.keys(group.worktrees ?? {}).length === 0
+    })()`)
+    const diskCount = execFileSync('git', ['worktree', 'list', '--porcelain'], { cwd: workspace, encoding: 'utf8' }).split('\n').filter((line) => line.startsWith('worktree ')).length - 1
+    if (durableCleanup && diskCount === 0) { worktreeCleanupDone = true; break }
+    await wait(50)
+  }
 
   const facts = await win.webContents.executeJavaScript(`(() => {
     const state = window.__kaisola.getState()
@@ -450,7 +475,21 @@ app.whenReady().then(async () => {
   const deleteKeys = [...promptCounts.keys()].filter((key) => key.includes('::'))
   const deleteTeardownOrdered = deleteKeys.length === 2 && deleteKeys.every((key) =>
     deleteLifecycle.filter((event) => event[1] === key).map((event) => event[0]).join(',') === 'cancel,close,disconnect')
-  const result = { configured, saturated, asked, stopped, paused, pausedPersisted: !!pausedPersisted, pausedScreenshot, pausedCloseReopen, continued, adoptedBusyRecovered, selectiveResume, ready, parkedBeforeNegotiation, connectCalls, negotiated, assigned, executed, reviewed, done, ...facts, persisted, siteScreenshot, screenshot, closeReopen, clickedDelete, switchedProjectId, deleted, projectSwitchSafe, archiveDeleteVerified, deleteTeardownOrdered, deleteLifecycle }
+  const sessionDraftRoundTrip = await win.webContents.executeJavaScript(`(() => {
+    const state = window.__kaisola.getState()
+    state.requestNewThread('codex')
+    const created = window.__kaisola.getState().assistantThreads.at(-1)
+    if (!created) return false
+    window.__kaisola.getState().setAssistantDraft(created.id, { text: 'preserve this draft' })
+    window.__kaisola.getState().enqueueAssistantPrompt(created.id, { text: 'preserve this queued follow-up', attachments: [], mentions: [], speed: 'default' })
+    window.__kaisola.getState().closeAssistantThread(created.id)
+    window.__kaisola.getState().reopenClosedSession(created.id)
+    const restored = window.__kaisola.getState()
+    return restored.assistantDrafts[created.id]?.text === 'preserve this draft'
+      && restored.assistantPromptQueues[created.id]?.[0]?.text === 'preserve this queued follow-up'
+      && restored.assistantThreads.find((thread) => thread.id === created.id)?.queuePaused === true
+  })()`)
+  const result = { configured, saturated, asked, stopped, paused, pausedPersisted: !!pausedPersisted, pausedScreenshot, pausedCloseReopen, continued, adoptedBusyRecovered, selectiveResume, ready, parkedBeforeNegotiation, connectCalls, negotiated, assigned, doubleExecuteClaimed, isolatedWorktreeCount, executed, reviewed, done, worktreeCleanupDone, ...facts, persisted, siteScreenshot, screenshot, closeReopen, clickedDelete, switchedProjectId, deleted, projectSwitchSafe, archiveDeleteVerified, deleteTeardownOrdered, sessionDraftRoundTrip, deleteLifecycle }
   console.log('GROUP_UI=' + JSON.stringify(result))
   app.exit(
     configured
@@ -469,9 +508,12 @@ app.whenReady().then(async () => {
     && connectCalls >= 4
     && negotiated
     && assigned
+    && doubleExecuteClaimed
+    && isolatedWorktreeCount === 2
     && executed
     && reviewed
     && done
+    && worktreeCleanupDone
     && facts.phase === 'done'
     && facts.visibleGroupTabs === 1
     && facts.leakedWorkerTabs === 0
@@ -479,7 +521,7 @@ app.whenReady().then(async () => {
     && facts.negotiations === 2
     && facts.reviews === 2
     && facts.executions === 2
-    && facts.worktrees === 2
+    && facts.worktrees === 0
     && facts.memberModels.join(',') === 'Claude Fast,Codex Deep'
     && facts.changedFiles.join(',') === 'claude-result.txt,codex-result.txt'
     && facts.roleContract.startsWith('Mission intent')
@@ -489,7 +531,7 @@ app.whenReady().then(async () => {
     && persisted.phase === 'done'
     && persisted.members === 2
     && persisted.integration === 'Integrated both reviewed branches and verified the shared acceptance tests.'
-    && persisted.worktrees === 2
+    && persisted.worktrees === 0
     && persisted.visible
     && closeReopen.ok
     && closeReopen.bundledThreads === 3
@@ -498,6 +540,7 @@ app.whenReady().then(async () => {
     && projectSwitchSafe
     && archiveDeleteVerified
     && deleteTeardownOrdered
+    && sessionDraftRoundTrip
       ? 0
       : 1,
   )

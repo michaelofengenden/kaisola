@@ -4,14 +4,15 @@
 // the UI is fully usable without Electron. Electron adds the native shell plus
 // the privileged "tools" the research IDE needs (model calls, filesystem,
 // running experiments) — all behind a locked-down preload bridge.
-const { app, BrowserWindow, dialog, ipcMain, Menu, nativeImage, nativeTheme, Notification, screen, shell } = require('electron')
+const { app, BrowserWindow, dialog, ipcMain, Menu, nativeImage, nativeTheme, Notification, screen, session, shell } = require('electron')
 const path = require('node:path')
 const fs = require('node:fs')
 const { registerModelHandlers } = require('./ipc/modelHandler.cjs')
 const { registerToolHandlers } = require('./ipc/toolHandler.cjs')
 const { registerSettingsHandlers } = require('./ipc/settingsHandler.cjs')
-const { registerTerminalHandlers, detachSessionBroker, setAppFocused, detachRendererOwner } = require('./ipc/terminalHandler.cjs')
+const { registerTerminalHandlers, detachSessionBroker, setAppFocused, forgetRendererOwner } = require('./ipc/terminalHandler.cjs')
 const { registerAcpHandlers, disposeAcp, acpRendererSwapState, acpRestartSafetyState, waitForAcpRestartSafe, acpProjectTransferState, transferAcpProject, releaseAcpRenderer } = require('./ipc/acpHandler.cjs')
+const { createPopMirrorCache, sanitizeTerminalMirror, tabListOwnsProject } = require('./ipc/terminalMirrorPolicy.cjs')
 const { registerAuthHandlers, disposeAuth } = require('./ipc/authHandler.cjs')
 const { registerFsHandlers, disposeFs } = require('./ipc/fsHandler.cjs')
 const { registerGrobidHandlers } = require('./ipc/grobidHandler.cjs')
@@ -30,10 +31,13 @@ const { registerUpdateHandlers } = require('./ipc/updateHandler.cjs')
 const { registerGlassHandlers, wireGlassEvents } = require('./ipc/glassHandler.cjs')
 const { registerAssistantArchiveHandlers } = require('./ipc/assistantArchive.cjs')
 const { registerAttentionHandlers } = require('./ipc/attentionHandler.cjs')
+const { hardenWebviewAttachment, installPermissionPolicy, isSafeWebUrl, isTrustedRendererUrl } = require('./ipc/securityPolicy.cjs')
 
 const DEV_URL = process.env.KAISOLA_DEV_URL ?? process.env.PASOLA_DEV_URL // set by `npm run electron:dev`
 const isDev = !!DEV_URL
 const APP_NAME = 'Kaisola'
+const rendererFile = path.join(__dirname, '..', 'dist', 'index.html')
+const trustedRendererContents = new WeakSet()
 const appIconPath = path.join(__dirname, 'assets', 'kaisola-icon.png')
 const macVibrancyType = 'under-window'
 const macVibrancy = process.platform === 'darwin'
@@ -41,6 +45,7 @@ const macVibrancy = process.platform === 'darwin'
   : {}
 let appIsQuitting = false
 let appCleanupStarted = false
+let appCleanupFinished = false
 let deferredQuitTask = null
 
 // ── Liquid Glass (macOS 26 "Tahoe"+) ─────────────────────────────────────────
@@ -374,6 +379,7 @@ function createWindow(opts = {}) {
       plugins: true, // Chromium's PDF viewer IS a plugin — without this the PDF iframe is blank
     },
   })
+  trustedRendererContents.add(win.webContents)
   win.__kaisolaPop = isPop
   win.__kaisolaSlot = opts.slot ? String(opts.slot) : null
   win.__kaisolaAdoptBoot = !!opts.adopt
@@ -381,11 +387,28 @@ function createWindow(opts = {}) {
   win.__kaisolaPendingTheme = null
   win.__kaisolaLastFocus = Date.now()
   win.webContents.on('did-start-loading', () => adoptionReadyWc.delete(win.webContents.id))
+  // A privileged preload is safe only while the top-level frame remains on the
+  // exact packaged entry (or the configured Vite origin in development).
+  const containRendererNavigation = (event, url) => {
+    if (!isTrustedRendererUrl(url, { devUrl: DEV_URL, rendererFile })) event.preventDefault()
+  }
+  win.webContents.on('will-navigate', containRendererNavigation)
+  win.webContents.on('will-redirect', containRendererNavigation)
+  // Strip every capability-bearing webview preference before Chromium creates
+  // the guest, and reject non-web URLs or attempts to escape the browser partition.
+  win.webContents.on('will-attach-webview', (event, webPreferences, params) => {
+    if (!hardenWebviewAttachment(webPreferences, params)) event.preventDefault()
+  })
   // browser-card guests: popups/target=_blank navigate the SAME webview —
   // never a new Electron window
   win.webContents.on('did-attach-webview', (_event, guest) => {
+    const containGuestNavigation = (event, url) => {
+      if (!isSafeWebUrl(url)) event.preventDefault()
+    }
+    guest.on('will-navigate', containGuestNavigation)
+    guest.on('will-redirect', containGuestNavigation)
     guest.setWindowOpenHandler(({ url }) => {
-      if (url.startsWith('http')) guest.loadURL(url).catch(() => {})
+      if (isSafeWebUrl(url)) guest.loadURL(url).catch(() => {})
       return { action: 'deny' }
     })
   })
@@ -407,6 +430,7 @@ function createWindow(opts = {}) {
   }
   if (opts.pop) {
     query.pop = String(opts.pop)
+    if (opts.projectId) query.project = String(opts.projectId).slice(0, 240)
     if (opts.title) query.title = String(opts.title).slice(0, 60)
     if (opts.hue) query.hue = String(opts.hue).slice(0, 60)
   }
@@ -496,7 +520,10 @@ function createWindow(opts = {}) {
     // React cleanup does not reliably run on window crashes/closes. Main owns
     // the authoritative fallback: keep processes alive, but release all hot
     // renderer resources and leases for this exact WebContents.
-    detachRendererOwner(rendererOwner)
+    // Do not clear broker ownership here: a live ACP turn can still need to
+    // read/release its command PTY after this renderer crashes. Forget only
+    // the dead event route; same-project replacement renderers adopt explicitly.
+    forgetRendererOwner(rendererOwner)
     releaseAcpRenderer(rendererOwner)
   })
   win.on('closed', () => {
@@ -544,7 +571,7 @@ function createWindow(opts = {}) {
 
   // open external links in the user's browser, never in-app
   win.webContents.setWindowOpenHandler(({ url }) => {
-    if (url.startsWith('http')) shell.openExternal(url)
+    if (isSafeWebUrl(url)) shell.openExternal(url)
     return { action: 'deny' }
   })
   return win
@@ -556,6 +583,51 @@ function createWindow(opts = {}) {
 // and it comes back as itself next launch. Pop windows host one terminal card.
 let nextSlot = 2
 const popWindows = new Map() // termId → BrowserWindow
+const popTerminalMirrors = createPopMirrorCache({ retentionMs: 10 * 60_000, maxClosed: 128 })
+
+function projectWindows(projectId) {
+  return BrowserWindow.getAllWindows().filter((win) =>
+    !win.__kaisolaPop && !win.isDestroyed() && !win.webContents.isDestroyed() &&
+    tabListOwnsProject(tabsByWc.get(win.webContents.id), projectId),
+  )
+}
+
+function sendTerminalMirror(win, payload) {
+  if (!win || win.__kaisolaPop || win.isDestroyed() || win.webContents.isDestroyed()) return false
+  if (!tabListOwnsProject(tabsByWc.get(win.webContents.id), payload.projectId)) return false
+  win.webContents.send('terminal:state-mirror', payload)
+  return true
+}
+
+function sendClosedPop(win, record) {
+  const state = record?.state
+  if (!state || !record.closed || !Number.isSafeInteger(record.revision)) return false
+  if (!win || win.__kaisolaPop || win.isDestroyed() || win.webContents.isDestroyed()) return false
+  if (!tabListOwnsProject(tabsByWc.get(win.webContents.id), state.projectId)) return false
+  win.webContents.send('pop:closed', { ...state, revision: record.revision })
+  return true
+}
+
+function replayPopRecord(win, record) {
+  return record.closed ? sendClosedPop(win, record) : sendTerminalMirror(win, record.state)
+}
+
+/** A project close removes its ownership capability from the last full window.
+ * Close its detached terminal windows immediately too; their broker grace
+ * releases are already scheduled by closeProject, so they must not re-dock or
+ * remain visible as dead cards after that grace expires. */
+function closeUnownedProjectPops(projectId) {
+  if (projectWindows(projectId).length) return 0
+  let closed = 0
+  for (const [termId, pop] of [...popWindows.entries()]) {
+    if (pop.__kaisolaProjectId !== projectId) continue
+    pop.__kaisolaDiscardOnClose = true
+    popTerminalMirrors.discard(termId)
+    if (!pop.isDestroyed()) pop.close()
+    closed++
+  }
+  return closed
+}
 
 ipcMain.handle('window:new', () => {
   createWindow({ slot: nextSlot++ })
@@ -570,6 +642,11 @@ const adoptionReadyWc = new Set() // renderer installed onAdoptProject listener
 const pendingTransferAcks = new Map() // transferId → { targetId, resolve, timer }
 const completedTransfers = new Map() // transferId → source window (until finish)
 let transferSeq = 0
+// Cross-renderer transfer still lacks a durable two-sided commit journal. Keep
+// the safe physical move of a lone window below, but fail closed before any
+// renderer/ACP ownership handoff until that transaction can survive either
+// renderer crashing between its two disk commits.
+const CROSS_RENDERER_PROJECT_TRANSFERS_ENABLED = false
 
 function transferPoint(at) {
   if (!at || !Number.isFinite(at.x) || !Number.isFinite(at.y)) return null
@@ -678,6 +755,14 @@ ipcMain.handle('window:detach-project', async (event, payload = {}) => {
     return { ok: true, target: 'same' }
   }
 
+  if (!CROSS_RENDERER_PROJECT_TRANSFERS_ENABLED) {
+    return {
+      ok: false,
+      disabled: true,
+      message: 'Moving a project between windows is temporarily unavailable while Kaisola protects its live sessions. A lone project can still be moved by dragging its window.',
+    }
+  }
+
   // ACP prompts stream through a request-specific renderer listener. Moving
   // between turns is lossless; moving mid-turn would strand that stream.
   const acpState = acpProjectTransferState(event.sender, payload.tab.id)
@@ -692,7 +777,7 @@ ipcMain.handle('window:detach-project', async (event, payload = {}) => {
 
   const targetKind = target ? 'existing' : 'new'
   if (!target) target = createWindow({ slot: freeSlot(), adopt: true, at: point })
-  const acpMove = transferAcpProject(event.sender, target.webContents, payload.tab.id)
+  const acpMove = await transferAcpProject(event.sender, target.webContents, payload.tab.id)
   if (!acpMove.ok) {
     if (targetKind === 'new') destroyDiscardedAdoptionWindow(target)
     return { ok: false, message: 'That project already has an agent connection in the destination window.' }
@@ -724,10 +809,11 @@ ipcMain.handle('window:detach-project', async (event, payload = {}) => {
   })
   if (!adopted) {
     pendingAdoptions.delete(target.webContents.id)
-    acpMove.rollback?.()
+    await acpMove.rollback?.()
     if (targetKind === 'new') destroyDiscardedAdoptionWindow(target)
     return { ok: false, message: 'The destination window did not accept the project; everything remains in this window.' }
   }
+  acpMove.commit?.()
 
   if (!target.isDestroyed()) {
     target.show()
@@ -751,23 +837,71 @@ ipcMain.handle('window:finish-transfer', (event, { transferId } = {}) => {
   return { ok: true }
 })
 
-ipcMain.handle('window:pop', (_e, { termId, title, hue } = {}) => {
+ipcMain.handle('window:pop', (event, { termId, title, hue, projectId } = {}) => {
   if (typeof termId !== 'string' || !termId) return { ok: false }
+  if (typeof projectId !== 'string' || !/^[A-Za-z0-9_-]{1,240}$/.test(projectId)) return { ok: false }
+  const source = BrowserWindow.fromWebContents(event.sender)
+  if (!source || source.__kaisolaPop || !tabListOwnsProject(tabsByWc.get(event.sender.id), projectId)) return { ok: false }
   const existing = popWindows.get(termId)
   if (existing && !existing.isDestroyed()) {
+    if (existing.__kaisolaProjectId !== projectId) return { ok: false }
     existing.focus()
     return { ok: true, existed: true }
   }
-  const win = createWindow({ pop: termId, title, hue })
+  // A pop-out is read-only, but it still needs the originating window's
+  // terminal row to recognize a manually launched CLI agent and capture its
+  // exact resume id. Rehydrate that slot rather than always reading slot 1.
+  const sourceSlot = source?.__kaisolaSlot ? Number(source.__kaisolaSlot) : undefined
+  const win = createWindow({ pop: termId, title, hue, projectId, slot: sourceSlot })
+  win.__kaisolaProjectId = projectId
+  popTerminalMirrors.activate(termId, projectId)
   popWindows.set(termId, win)
   win.on('closed', () => {
-    popWindows.delete(termId)
-    // the origin window re-adopts the card (and re-points the pty stream)
-    for (const w of BrowserWindow.getAllWindows()) {
-      if (!w.webContents.isDestroyed()) w.webContents.send('pop:closed', { termId })
+    if (popWindows.get(termId) === win) popWindows.delete(termId)
+    if (win.__kaisolaDiscardOnClose) {
+      popTerminalMirrors.discard(termId)
+      return
     }
+    // Keep the merged terminal state and close marker until the exact owning
+    // project ACKs this revision. A window-mode swap or a closed full shell can
+    // therefore rehydrate and re-dock later without losing draft/resume state.
+    const record = popTerminalMirrors.close(termId, projectId)
+    if (!record) return
+    for (const owner of projectWindows(projectId)) sendClosedPop(owner, record)
   })
   return { ok: true }
+})
+ipcMain.handle('window:popped', (event) => {
+  const win = BrowserWindow.fromWebContents(event.sender)
+  if (!win || win.__kaisolaPop) return { ok: false, termIds: [], states: [] }
+  const tabs = tabsByWc.get(event.sender.id)
+  const records = popTerminalMirrors.values().filter((record) => tabListOwnsProject(tabs, record.state.projectId))
+  return {
+    ok: true,
+    termIds: [...popWindows.entries()].filter(([, pop]) => tabListOwnsProject(tabs, pop.__kaisolaProjectId)).map(([termId]) => termId),
+    states: records.filter((record) => !record.closed).map((record) => record.state),
+    closed: records.filter((record) => record.closed).map((record) => ({ ...record.state, revision: record.revision })),
+  }
+})
+ipcMain.handle('window:pop-closed-ack', (event, ack = {}) => {
+  const win = BrowserWindow.fromWebContents(event.sender)
+  if (!win || win.__kaisolaPop || win.isDestroyed() || event.sender.isDestroyed()) return { ok: false }
+  if (typeof ack.termId !== 'string' || typeof ack.projectId !== 'string' || !Number.isSafeInteger(ack.revision)) return { ok: false }
+  if (!tabListOwnsProject(tabsByWc.get(event.sender.id), ack.projectId)) return { ok: false }
+  return { ok: popTerminalMirrors.acknowledge(ack) }
+})
+ipcMain.on('window:terminal-state', (event, raw) => {
+  const pop = BrowserWindow.fromWebContents(event.sender)
+  if (!pop || pop.isDestroyed() || !pop.__kaisolaPop || pop.__kaisolaDiscardOnClose) return
+  const terminalId = [...popWindows.entries()].find(([, win]) => win === pop)?.[0]
+  const projectId = pop.__kaisolaProjectId
+  const payload = sanitizeTerminalMirror(raw, terminalId, projectId)
+  if (!payload) return
+  if (!popTerminalMirrors.update(payload)) return
+  // A project can move to another full window while its terminal remains
+  // popped out. Route prompt-bearing state only to the full window whose
+  // registered tab list proves ownership; the cache covers renderer swaps.
+  for (const owner of projectWindows(projectId)) sendTerminalMirror(owner, payload)
 })
 
 // window controls for the renderer-drawn traffic lights
@@ -785,8 +919,23 @@ ipcMain.on('win:ctl', (e, action) => {
 // change; cache it per window and rebuild the menu so the Window menu mirrors it.
 ipcMain.on('tabs:changed', (e, list) => {
   if (e.sender.isDestroyed()) return
+  const previous = tabsByWc.get(e.sender.id)
   if (Array.isArray(list)) tabsByWc.set(e.sender.id, list)
   else tabsByWc.delete(e.sender.id)
+  if (Array.isArray(list)) {
+    const win = BrowserWindow.fromWebContents(e.sender)
+    for (const record of popTerminalMirrors.values()) replayPopRecord(win, record)
+    // A normal project close updates this live tab list. Window teardown and
+    // appearance swaps instead destroy WebContents without sending an empty
+    // list, so their intentionally surviving pop-outs are not mistaken for a
+    // closed project.
+    if (Array.isArray(previous)) {
+      const nextIds = new Set(list.map((tab) => tab?.id).filter((id) => typeof id === 'string'))
+      for (const tab of previous) {
+        if (typeof tab?.id === 'string' && !nextIds.has(tab.id)) closeUnownedProjectPops(tab.id)
+      }
+    }
+  }
   installAppMenu()
 })
 
@@ -909,6 +1058,21 @@ ipcMain.on('shell:app-theme', (e, theme) => {
 })
 
 if (hasSingleInstanceLock) app.whenReady().then(() => {
+  // Electron otherwise approves permission requests by default. Browser cards
+  // get no ambient permissions; the app renderer gets only its one required,
+  // explicitly enumerated permission while it remains on the trusted entry.
+  installPermissionPolicy(session.defaultSession, {
+    allowTrustedRenderer: true,
+    trustedContents: trustedRendererContents,
+    devUrl: DEV_URL,
+    rendererFile,
+  })
+  installPermissionPolicy(session.fromPartition('persist:browser'), {
+    allowTrustedRenderer: false,
+    trustedContents: trustedRendererContents,
+    devUrl: DEV_URL,
+    rendererFile,
+  })
   // paint the native material in the persisted app theme from the first frame
   const savedTheme = readShellPrefs().appTheme
   if (savedTheme === 'dark' || savedTheme === 'light' || savedTheme === 'system') nativeTheme.themeSource = savedTheme
@@ -1006,15 +1170,21 @@ app.on('before-quit', (event) => {
     return
   }
   appIsQuitting = true
+  if (appCleanupFinished) return
+  event.preventDefault()
   if (appCleanupStarted) return
   appCleanupStarted = true
-  // PTYs/CLI agents belong to the detached broker and continue through app
-  // replacement. Closing this authenticated client makes their hot tails flush
-  // to disk; the next main process reattaches to the same PIDs.
-  void detachSessionBroker()
-  disposeAcp()
-  disposeAuth()
-  disposeFs()
-  disposeClaudeHooks()
-  disposeMcp()
+  void (async () => {
+    // ACP command PTYs are connection-private and cannot be rediscovered after
+    // their adapter exits. Release those exact records while the authenticated
+    // broker socket is still live; user/CLI PTYs remain detached and continue.
+    await disposeAcp()
+    await detachSessionBroker()
+    disposeAuth()
+    disposeFs()
+    disposeClaudeHooks()
+    disposeMcp()
+    appCleanupFinished = true
+    app.quit()
+  })()
 })

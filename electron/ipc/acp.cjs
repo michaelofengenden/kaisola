@@ -529,7 +529,36 @@ class AcpConnection {
     if (this.sessionId) this.notify('session/cancel', { sessionId: this.sessionId })
   }
 
-  dispose() {
+  async releaseOwnedTerminals() {
+    const terminalIds = [...this.ownedTerminalIds]
+    const host = this.hooks.terminalHost
+    const results = await Promise.allSettled(terminalIds.map(async (terminalId) => {
+      if (!host?.release) throw new Error('terminal release hook unavailable')
+      try {
+        await host.release(terminalId)
+      } catch (releaseError) {
+        // A running process can race an adapter shutdown. Stop it, then retry
+        // the authoritative release so the broker record cannot remain dead
+        // but undiscoverable forever.
+        try { await host.kill?.(terminalId) } catch { /* retry release below */ }
+        try { await host.release(terminalId) } catch { throw releaseError }
+      }
+      this.ownedTerminalIds.delete(terminalId)
+    }))
+    return {
+      ok: results.every((result) => result.status === 'fulfilled'),
+      released: results.filter((result) => result.status === 'fulfilled').length,
+      failed: results.filter((result) => result.status === 'rejected').length,
+    }
+  }
+
+  async disposeAndWait() {
+    const terminals = await this.releaseOwnedTerminals()
+    this.dispose({ releaseTerminals: false })
+    return terminals
+  }
+
+  dispose({ releaseTerminals = true } = {}) {
     for (const { reject, timer } of this.pending.values()) {
       if (timer) clearTimeout(timer)
       reject(new Error('agent connection disposed'))
@@ -538,15 +567,7 @@ class AcpConnection {
     // Adapter parking/reconnect must not strand broker PTYs that the new ACP
     // connection cannot own. terminal/release is the protocol cleanup point;
     // the host implementation also kills a still-running command.
-    for (const terminalId of this.ownedTerminalIds) {
-      try {
-        Promise.resolve(this.hooks.terminalHost?.release(terminalId)).catch(() => {
-          try { return this.hooks.terminalHost?.kill(terminalId) } catch { return undefined }
-        }).catch(() => {})
-      } catch {
-        try { this.hooks.terminalHost?.kill(terminalId) } catch { /* best effort */ }
-      }
-    }
+    if (releaseTerminals) void this.releaseOwnedTerminals().catch(() => {})
     try {
       if (this.proc && this.proc.pid && process.platform !== 'win32') {
         const pgid = this.proc.pid

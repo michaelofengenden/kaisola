@@ -29,6 +29,10 @@ const configOptions = [
     options: modes.availableModes.map((m) => ({ value: m.id, name: m.name, description: m.description })) },
   { id: 'reasoning_effort', name: 'Reasoning Effort', description: 'How much the model thinks', category: 'thought_level', type: 'select', currentValue: 'high',
     options: [{ value: 'low', name: 'Low' }, { value: 'medium', name: 'Medium' }, { value: 'high', name: 'High' }, { value: 'max', name: 'Max' }] },
+  // Deliberately rejects Fast after a short wait. The renderer smoke uses this
+  // real awaited config preflight to race Stop -> immediate Close deterministically.
+  { id: 'response_speed', name: 'Response Speed', description: 'Mock delayed speed preflight', category: 'speed', type: 'select', currentValue: 'default',
+    options: [{ value: 'default', name: 'Default' }, { value: 'fast', name: 'Fast' }] },
 ]
 const authMethods = [{ id: 'oauth-mock', name: 'Log in with Mock', description: 'Authorize the mock agent (would open a browser)' }]
 
@@ -82,6 +86,10 @@ function dispatch(msg) {
     send({ jsonrpc: '2.0', id, result: {} })
     update(params.sessionId, { sessionUpdate: 'current_model_update', currentModelId: params.modelId })
   } else if (method === 'session/set_config_option') {
+    if (params.configId === 'response_speed' && params.value === 'fast') {
+      setTimeout(() => send({ jsonrpc: '2.0', id, error: { code: -32001, message: 'Mock delayed speed setting rejected' } }), 700)
+      return
+    }
     const o = configOptions.find((x) => x.id === params.configId); if (o) o.currentValue = params.value
     send({ jsonrpc: '2.0', id, result: {} })
     emitConfig(params.sessionId)

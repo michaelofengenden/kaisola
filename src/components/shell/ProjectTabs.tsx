@@ -120,8 +120,6 @@ export function ProjectTabs() {
               key={tab.id}
               ref={active ? activeRef : undefined}
               className="ptab"
-              role="tab"
-              aria-selected={active}
               data-project-id={tab.id}
               data-active={active}
               data-state={state}
@@ -137,14 +135,11 @@ export function ProjectTabs() {
                 if (out && dragRef.current === tab.id) void detachProjectToWindow(tab.id, { x: e.screenX, y: e.screenY })
                 dragRef.current = null
               }}
-              onClick={() => { if (editing !== tab.id) switchProject(tab.id) }}
-              onDoubleClick={() => beginRename(tab.id, label)}
               onMouseDown={(e) => { if (e.button === 1) e.preventDefault() }}
               onAuxClick={(e) => { if (e.button === 1) { e.preventDefault(); closeProject(tab.id) } }}
               onContextMenu={(e) => { e.preventDefault(); e.stopPropagation(); setMenu({ x: e.clientX, y: e.clientY, id: tab.id }) }}
               title={tab.workspacePath ?? label}
             >
-              <span className="ptab-badge" />
               {editing === tab.id ? (
                 <input
                   className="ptab-label"
@@ -162,12 +157,36 @@ export function ProjectTabs() {
                 />
               ) : (
                 <>
-                  <Icon name="Folder" size={13} className="ptab-icon" />
-                  <span className="ptab-label truncate">{label}</span>
+                  <button
+                    className="ptab-select"
+                    role="tab"
+                    aria-label={`Project ${label}`}
+                    aria-selected={active}
+                    tabIndex={active ? 0 : -1}
+                    onClick={() => switchProject(tab.id)}
+                    onKeyDown={(e) => {
+                      const keys = ['ArrowLeft', 'ArrowRight', 'Home', 'End']
+                      if (!keys.includes(e.key)) return
+                      e.preventDefault()
+                      const nextIndex = e.key === 'Home' ? 0
+                        : e.key === 'End' ? tabs.length - 1
+                          : (i + (e.key === 'ArrowRight' ? 1 : -1) + tabs.length) % tabs.length
+                      const next = tabs[nextIndex]
+                      if (!next) return
+                      switchProject(next.id)
+                      queueMicrotask(() => document.querySelector<HTMLButtonElement>(`.ptab[data-project-id="${CSS.escape(next.id)}"] > .ptab-select`)?.focus())
+                    }}
+                    onDoubleClick={() => beginRename(tab.id, label)}
+                  />
+                  <span className="ptab-content" aria-hidden="true">
+                    <span className="ptab-badge" />
+                    <Icon name="Folder" size={13} className="ptab-icon" />
+                    <span className="ptab-label truncate">{label}</span>
+                  </span>
                 </>
               )}
               {!loneEmpty && (
-                <button className="ptab-close" onClick={(e) => { e.stopPropagation(); closeProject(tab.id) }} title="Close tab">
+                <button className="ptab-close" onClick={(e) => { e.stopPropagation(); closeProject(tab.id) }} title="Close tab" aria-label={`Close project ${label}`}>
                   <Icon name="X" size={11} />
                 </button>
               )}
@@ -287,10 +306,12 @@ function NewProjectButton() {
   const newProject = useKaisola((s) => s.newProject)
   const openProjectFolder = useKaisola((s) => s.openProjectFolder)
   const reopenClosedProject = useKaisola((s) => s.reopenClosedProject)
+  const pushToast = useKaisola((s) => s.pushToast)
 
   const pickFolder = async () => {
     const r = await bridge.pickFolder()
     if (r.ok && r.path) openProjectFolder(r.path)
+    else if (r.message) pushToast('warn', r.message)
   }
 
   const options: DropOption[] = [

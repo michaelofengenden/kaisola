@@ -390,10 +390,25 @@ export interface TerminalMetaEvent {
   agentBusy?: boolean
   agentCompletedAt?: number | null
 }
+export interface TerminalMirrorState {
+  termId: string
+  projectId: string
+  meta?: Partial<Omit<TerminalMetaEvent, 'id'>> & { oscTitle?: string | null; lastExit?: number | null; ports?: number[] }
+  draft?: string
+  resume?: string
+}
+/** Revisioned close handoff retained by main until the exact project owner ACKs. */
+export interface PopClosedTerminalState extends TerminalMirrorState {
+  revision: number
+}
 /** A human-gated write from an agent (hypothesis_propose / claim_assert over MCP). */
 export interface McpProposalEvent {
+  proposalId: string
   kind: 'hypothesis' | 'claim'
   args: Record<string, unknown>
+  /** Exact persisted project capability that emitted this proposal. */
+  projectId: string
+  workspace: string
   at: number
 }
 
@@ -624,9 +639,9 @@ export interface KaisolaBridge {
   }
   /** The in-app MCP server every connected agent shares. */
   mcp?: {
-    info(): Promise<{ ok: boolean; url?: string | null; configPath?: string | null; protocol?: string; transport?: string; toolCount?: number; humanGatedTools?: string[]; configReady?: boolean; auth?: string | null; host?: string | null }>
+    info(context: { projectId: string; workspace: string }): Promise<{ ok: boolean; url?: string | null; configPath?: string | null; protocol?: string; transport?: string; toolCount?: number; humanGatedTools?: string[]; configReady?: boolean; auth?: string | null; host?: string | null; projectId?: string | null; message?: string }>
     /** An agent called a human-gated write tool → a pending Proposal. */
-    onProposal?(cb: (ev: McpProposalEvent) => void): () => void
+    onProposal?(cb: (ev: McpProposalEvent) => boolean): () => void
     /** External MCP servers: the workspace's .mcp.json (approval-gated) + the
      * user catalog. Armed servers ride every ACP session and the claude boot. */
     servers?(workspace: string | null): Promise<{ ok: boolean; servers: McpServerRow[]; userError?: string | null; projectError?: string | null; userConfigPath?: string; message?: string }>
@@ -678,26 +693,28 @@ export interface KaisolaBridge {
   settings: {
     setApiKey(key: string): Promise<{ ok: boolean; message?: string }>
     hasApiKey(): Promise<KeyStatus>
-    clearApiKey(): Promise<{ ok: boolean }>
+    clearApiKey(): Promise<{ ok: boolean; message?: string }>
     setOpenaiKey(key: string): Promise<{ ok: boolean; message?: string }>
     hasOpenaiKey(): Promise<KeyStatus>
-    clearOpenaiKey(): Promise<{ ok: boolean }>
+    clearOpenaiKey(): Promise<{ ok: boolean; message?: string }>
     /** Locations of the user config files (settings.json / keymap.json). */
     paths?(): Promise<{ dir: string; settings: string; keymap: string }>
   }
   terminal: {
-    create(id: string, cwd?: string, cols?: number, rows?: number): Promise<{ ok: boolean; cwd?: string; shell?: string; message?: string; existed?: boolean } & Partial<TermSnapshot>>
-    write(id: string, data: string): Promise<{ ok: boolean }>
-    agentTurn(id: string, busy: boolean): void
-    resize(id: string, cols: number, rows: number): Promise<{ ok: boolean }>
-    snapshot(id: string): Promise<TermSnapshot>
-    attach(id: string): Promise<TermSnapshot>
+    create(id: string, cwd: string | undefined, cols: number | undefined, rows: number | undefined, projectId: string): Promise<{ ok: boolean; cwd?: string; shell?: string; message?: string; existed?: boolean } & Partial<TermSnapshot>>
+    write(id: string, data: string, projectId: string): Promise<{ ok: boolean }>
+    agentTurn(id: string, busy: boolean, projectId: string): void
+    resize(id: string, cols: number, rows: number, projectId: string): Promise<{ ok: boolean }>
+    snapshot(id: string, projectId: string): Promise<TermSnapshot>
+    attach(id: string, projectId: string): Promise<TermSnapshot>
     /** Unmount xterm only; the pty continues and scrollback moves to disk. */
-    detachRenderer(id: string, viewState?: { scrollFromBottom?: number; cols?: number; rows?: number }): Promise<{ ok: boolean }>
-    diagnostics?(): Promise<Array<{ id: string; visible: boolean; ramBytes: number; diskBytes: number; pid?: number; exited: boolean }>>
-    codexSession(id: string, cwd?: string): Promise<{ ok: boolean; sessionId?: string; exact?: boolean; message?: string }>
-    signal(id: string, signal?: string): Promise<{ ok: boolean }>
-    kill(id: string): Promise<{ ok: boolean }>
+    detachRenderer(id: string, viewState: { scrollFromBottom?: number; cols?: number; rows?: number } | undefined, projectId: string): Promise<{ ok: boolean }>
+    diagnostics?(projectId: string): Promise<Array<{ id: string; visible: boolean; ramBytes: number; diskBytes: number; pid?: number; exited: boolean }>>
+    codexSession(id: string, cwd: string | undefined, projectId: string): Promise<{ ok: boolean; sessionId?: string; exact?: boolean; message?: string }>
+    signal(id: string, signal: string | undefined, projectId: string): Promise<{ ok: boolean }>
+    kill(id: string, projectId: string): Promise<{ ok: boolean }>
+    scheduleRelease(id: string, projectId: string, delayMs?: number): Promise<{ ok: boolean }>
+    cancelRelease(id: string, projectId: string): Promise<{ ok: boolean }>
     run(command: string, cwd?: string): Promise<CmdResult>
     onData(id: string, cb: (data: string) => void): () => void
     onExit(id: string, cb: (code: number) => void): () => void
@@ -720,6 +737,7 @@ export interface KaisolaBridge {
   appAuth: {
     status(): Promise<AppAuthStatus>
     signInGoogle(): Promise<AppAuthStatus>
+    cancelGoogle(): Promise<AppAuthStatus>
     signOut(): Promise<AppAuthStatus>
     onChanged(cb: (status: AppAuthStatus) => void): () => void
   }
@@ -744,12 +762,12 @@ export interface KaisolaBridge {
   }
   /** Git-worktree isolation for file-mutating coding agents (pure local git). */
   worktree: {
-    create(req: { repo: string; taskId: string }): Promise<{ ok: boolean; path?: string; branch?: string; base?: string; message?: string }>
+    create(req: { repo: string; taskId: string }): Promise<{ ok: boolean; path?: string; branch?: string; base?: string; baseBranch?: string; dirty?: boolean; message?: string }>
     /** `repo` lets main rehydrate a worktree it forgot across a relaunch. */
     finalize(req: { taskId: string; message?: string; repo?: string }): Promise<{ ok: boolean; committed?: boolean; sha?: string; message?: string }>
     diff(req: { taskId: string; repo?: string; ref?: string }): Promise<{ ok: boolean; patch?: string; files?: WorktreeFile[]; sha?: string; message?: string }>
     verify(req: { taskId: string; repo?: string; ref: string }): Promise<{ ok: boolean; drifted?: boolean; sha?: string; message?: string }>
-    merge(req: { taskId: string; repo?: string; ref?: string }): Promise<{ ok: boolean; conflicted?: boolean; drifted?: boolean; message?: string }>
+    merge(req: { taskId: string; repo?: string; ref?: string }): Promise<{ ok: boolean; conflicted?: boolean; drifted?: boolean; wrongBranch?: boolean; message?: string }>
     remove(req: { taskId: string; repo?: string }): Promise<{ ok: boolean; message?: string }>
     list(req: { repo: string }): Promise<{ ok: boolean; raw?: string }>
   }
@@ -762,7 +780,7 @@ export interface KaisolaBridge {
     run(
       req: { mode?: 'mock' | 'docker' | 'e2b'; image?: string; command?: string; cwd?: string; env?: Record<string, string> },
       onEvent: (e: SandboxEvent) => void,
-    ): Promise<{ ok: boolean; code?: number; message?: string }>
+    ): Promise<{ ok: boolean; code?: number; message?: string; outputDir?: string }>
   }
   db: {
     /** Synchronous read (so persist rehydration stays sync). */
@@ -796,8 +814,12 @@ export interface KaisolaBridge {
   /** Multi-window: full slot windows + terminal pop-outs + project-tab menu wiring. */
   windows?: {
     newWindow(): Promise<{ ok: boolean }>
-    pop(termId: string, title?: string, hue?: string): Promise<{ ok: boolean; existed?: boolean }>
-    onPopClosed(cb: (info: { termId: string }) => void): () => void
+    pop(termId: string, title: string | undefined, hue: string | undefined, projectId: string): Promise<{ ok: boolean; existed?: boolean }>
+    popped(): Promise<{ ok: boolean; termIds?: string[]; states?: TerminalMirrorState[]; closed?: PopClosedTerminalState[] }>
+    ackPopClosed(termId: string, projectId: string, revision: number): Promise<{ ok: boolean }>
+    onPopClosed(cb: (info: PopClosedTerminalState) => void): () => void
+    mirrorTerminalState(state: TerminalMirrorState): void
+    onTerminalState(cb: (state: TerminalMirrorState) => void): () => void
     /** Native File-menu New Tab (⌘T). */
     onNewTab(cb: () => void): () => void
     /** Native File-menu Close Tab (⌘W). */
@@ -1050,6 +1072,12 @@ const webMock: KaisolaBridge = {
     async kill() {
       return { ok: false }
     },
+    async scheduleRelease() {
+      return { ok: false }
+    },
+    async cancelRelease() {
+      return { ok: false }
+    },
     async run() {
       return { ok: false, message: DESKTOP_ONLY }
     },
@@ -1107,6 +1135,9 @@ const webMock: KaisolaBridge = {
     },
     async signInGoogle() {
       return { ok: false, configured: false, message: DESKTOP_ONLY }
+    },
+    async cancelGoogle() {
+      return { ok: true, configured: false, pending: false, profile: null }
     },
     async signOut() {
       return { ok: true, configured: false, profile: null }
@@ -1238,7 +1269,17 @@ const webMock: KaisolaBridge = {
     async pop() {
       return { ok: false }
     },
+    async popped() {
+      return { ok: true, termIds: [], states: [], closed: [] }
+    },
+    async ackPopClosed() {
+      return { ok: false }
+    },
     onPopClosed() {
+      return () => {}
+    },
+    mirrorTerminalState() {},
+    onTerminalState() {
       return () => {}
     },
     onNewTab() {

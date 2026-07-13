@@ -33,10 +33,10 @@ app.whenReady().then(async () => {
 
   // A real broker-owned PTY must remain the SAME process through the renderer
   // swap, not merely restart from a persisted command.
-  const created = await first.webContents.executeJavaScript(`window.kaisola.terminal.create('reapply-pty', undefined, 80, 24)`)
+  const created = await first.webContents.executeJavaScript(`window.kaisola.terminal.create('reapply-pty', undefined, 80, 24, window.__kaisola.getState().activeProjectId)`)
   if (!created?.ok || !created.pid) return fail('could not create broker PTY')
   await wait(900)
-  await first.webContents.executeJavaScript(`window.kaisola.terminal.write('reapply-pty', 'echo pty-rode-through\\r')`)
+  await first.webContents.executeJavaScript(`window.kaisola.terminal.write('reapply-pty', 'echo pty-rode-through\\r', window.__kaisola.getState().activeProjectId)`)
 
   const swapped = await first.webContents.executeJavaScript(
     `window.kaisola.windowMode({ solidWindow: true }).then(() => window.kaisola.reapplyWindow())`,
@@ -46,8 +46,8 @@ app.whenReady().then(async () => {
   await wait(3000)
   const after = BrowserWindow.getAllWindows().filter((w) => !w.isDestroyed())
   const next = after[0]
-  const snap = next ? await next.webContents.executeJavaScript(`window.kaisola.terminal.attach('reapply-pty')`) : null
-  const diagnostics = next ? await next.webContents.executeJavaScript(`window.kaisola.terminal.diagnostics()`) : []
+  const snap = next ? await next.webContents.executeJavaScript(`window.kaisola.terminal.attach('reapply-pty', window.__kaisola.getState().activeProjectId)`) : null
+  const diagnostics = next ? await next.webContents.executeJavaScript(`window.kaisola.terminal.diagnostics(window.__kaisola.getState().activeProjectId)`) : []
   const afterTerm = diagnostics.find((row) => row.id === 'reapply-pty')
   const material = next
     ? await next.webContents.executeJavaScript(`window.kaisola.glass()`)
@@ -60,7 +60,7 @@ app.whenReady().then(async () => {
   }
   console.log('REAPPLY=' + JSON.stringify(results))
   console.log('REAPPLY_RESULT=' + (Object.values(results).every(Boolean) ? 'PASS' : 'FAIL'))
-  if (next) await next.webContents.executeJavaScript(`window.kaisola.terminal.kill('reapply-pty')`)
+  if (next) await next.webContents.executeJavaScript(`window.kaisola.terminal.kill('reapply-pty', window.__kaisola.getState().activeProjectId)`)
   await wait(200)
   app.exit(Object.values(results).every(Boolean) ? 0 : 1)
 }).catch((error) => fail(String(error?.message || error)))

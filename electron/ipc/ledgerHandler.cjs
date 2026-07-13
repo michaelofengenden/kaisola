@@ -112,7 +112,7 @@ function postTask({ project, title, detail, createdBy, owner, dependsOn } = {}) 
   return { ok: true, task: out }
 }
 
-function updateTask({ id, status, owner, result, detail } = {}) {
+function updateTask({ id, status, owner, result, detail, project } = {}) {
   init()
   if (typeof id !== 'string' || !id) return { ok: false, message: 'id is required' }
   if (status != null && !STATUSES.has(status)) return { ok: false, message: `status must be one of: ${[...STATUSES].join(', ')}` }
@@ -121,6 +121,7 @@ function updateTask({ id, status, owner, result, detail } = {}) {
   if (db) {
     row = db.prepare('SELECT * FROM agent_tasks WHERE id = ?').get(id)
     if (!row) return { ok: false, message: 'no such task' }
+    if (typeof project === 'string' && row.project !== project) return { ok: false, message: 'no such task in this project' }
     if (status != null) row.status = status
     if (typeof owner === 'string') row.owner = owner.slice(0, 120)
     if (typeof result === 'string') row.result = result.slice(0, 8000)
@@ -131,6 +132,7 @@ function updateTask({ id, status, owner, result, detail } = {}) {
     const rows = readJson()
     row = rows.find((r) => r.id === id)
     if (!row) return { ok: false, message: 'no such task' }
+    if (typeof project === 'string' && row.project !== project) return { ok: false, message: 'no such task in this project' }
     if (status != null) row.status = status
     if (typeof owner === 'string') row.owner = owner.slice(0, 120)
     if (typeof result === 'string') row.result = result.slice(0, 8000)

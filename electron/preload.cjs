@@ -196,11 +196,15 @@ const bridge = {
   // async on purpose: a sendSync here would FREEZE the renderer forever if the
   // handler isn't registered (sendSync never returns without a listener)
   mcp: {
-    info: () => ipcRenderer.invoke('mcp:info'),
+    info: (context) => ipcRenderer.invoke('mcp:info', context),
     // an agent used a HUMAN-GATED write tool — the payload becomes a pending
     // Proposal in the renderer's review gate
     onProposal: (cb) => {
-      const listener = (_e, ev) => cb(ev)
+      const listener = (_e, ev) => {
+        let accepted = false
+        try { accepted = cb(ev) === true } catch { /* reject at the mutation boundary */ }
+        ipcRenderer.send('mcp:proposal-ack', { proposalId: ev?.proposalId, accepted })
+      }
       ipcRenderer.on('mcp:proposal', listener)
       return () => ipcRenderer.removeListener('mcp:proposal', listener)
     },
@@ -275,17 +279,19 @@ const bridge = {
 
   // ── terminal sessions (node-pty) ──
   terminal: {
-    create: (id, cwd, cols, rows) => ipcRenderer.invoke('terminal:create', { id, cwd, cols, rows }),
-    write: (id, data) => ipcRenderer.invoke('terminal:write', { id, data }),
-    agentTurn: (id, busy) => ipcRenderer.send('terminal:agent-turn', { id, busy }),
-    resize: (id, cols, rows) => ipcRenderer.invoke('terminal:resize', { id, cols, rows }),
-    snapshot: (id) => ipcRenderer.invoke('terminal:snapshot', { id }),
-    attach: (id) => ipcRenderer.invoke('terminal:attach', { id }),
-    detachRenderer: (id, viewState) => ipcRenderer.invoke('terminal:detachRenderer', { id, viewState }),
-    diagnostics: () => ipcRenderer.invoke('terminal:diagnostics'),
-    codexSession: (id, cwd) => ipcRenderer.invoke('terminal:codexSession', { id, cwd }),
-    signal: (id, signal) => ipcRenderer.invoke('terminal:signal', { id, signal }),
-    kill: (id) => ipcRenderer.invoke('terminal:kill', { id }),
+    create: (id, cwd, cols, rows, projectId) => ipcRenderer.invoke('terminal:create', { id, cwd, cols, rows, projectId }),
+    write: (id, data, projectId) => ipcRenderer.invoke('terminal:write', { id, data, projectId }),
+    agentTurn: (id, busy, projectId) => ipcRenderer.send('terminal:agent-turn', { id, busy, projectId }),
+    resize: (id, cols, rows, projectId) => ipcRenderer.invoke('terminal:resize', { id, cols, rows, projectId }),
+    snapshot: (id, projectId) => ipcRenderer.invoke('terminal:snapshot', { id, projectId }),
+    attach: (id, projectId) => ipcRenderer.invoke('terminal:attach', { id, projectId }),
+    detachRenderer: (id, viewState, projectId) => ipcRenderer.invoke('terminal:detachRenderer', { id, viewState, projectId }),
+    diagnostics: (projectId) => ipcRenderer.invoke('terminal:diagnostics', { projectId }),
+    codexSession: (id, cwd, projectId) => ipcRenderer.invoke('terminal:codexSession', { id, cwd, projectId }),
+    signal: (id, signal, projectId) => ipcRenderer.invoke('terminal:signal', { id, signal, projectId }),
+    kill: (id, projectId) => ipcRenderer.invoke('terminal:kill', { id, projectId }),
+    scheduleRelease: (id, projectId, delayMs) => ipcRenderer.invoke('terminal:schedule-release', { id, projectId, delayMs }),
+    cancelRelease: (id, projectId) => ipcRenderer.invoke('terminal:cancel-release', { id, projectId }),
     run: (command, cwd) => ipcRenderer.invoke('terminal:run', { command, cwd }),
     onData: (id, cb) => {
       const chan = `terminal:data:${id}`
@@ -336,6 +342,7 @@ const bridge = {
   appAuth: {
     status: () => ipcRenderer.invoke('app-auth:status'),
     signInGoogle: () => ipcRenderer.invoke('app-auth:google-start'),
+    cancelGoogle: () => ipcRenderer.invoke('app-auth:google-cancel'),
     signOut: () => ipcRenderer.invoke('app-auth:sign-out'),
     onChanged: (cb) => {
       const listener = (_e, status) => cb(status)
@@ -432,11 +439,19 @@ const bridge = {
   // ── multi-window: full slots (own persisted state) + terminal pop-outs ──
   windows: {
     newWindow: () => ipcRenderer.invoke('window:new'),
-    pop: (termId, title, hue) => ipcRenderer.invoke('window:pop', { termId, title, hue }),
+    pop: (termId, title, hue, projectId) => ipcRenderer.invoke('window:pop', { termId, title, hue, projectId }),
+    popped: () => ipcRenderer.invoke('window:popped'),
+    ackPopClosed: (termId, projectId, revision) => ipcRenderer.invoke('window:pop-closed-ack', { termId, projectId, revision }),
     onPopClosed: (cb) => {
       const listener = (_e, info) => cb(info)
       ipcRenderer.on('pop:closed', listener)
       return () => ipcRenderer.removeListener('pop:closed', listener)
+    },
+    mirrorTerminalState: (state) => ipcRenderer.send('window:terminal-state', state),
+    onTerminalState: (cb) => {
+      const listener = (_e, state) => cb(state)
+      ipcRenderer.on('terminal:state-mirror', listener)
+      return () => ipcRenderer.removeListener('terminal:state-mirror', listener)
     },
     // Chrome-style window transfer: main may reuse a window under the cursor
     // or create a hidden tear-off; explicit ready/adopted handshakes prevent

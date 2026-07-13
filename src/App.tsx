@@ -1,6 +1,6 @@
 import { useEffect, useRef, type CSSProperties, type MouseEvent as ReactMouseEvent } from 'react'
 import { useKaisola, sessionOrderIds, projectIdForEvent, terminalOwnerMap, POP_TERMINAL_ID, type AgentFeedItem, type ProjectTab, type ProjectTransferPayload } from './store/store'
-import { bridge, isDesktop } from './lib/bridge'
+import { bridge, isDesktop, type PopClosedTerminalState, type TerminalMirrorState } from './lib/bridge'
 import { uid, nowISO } from './domain/ids'
 import { requestIsSensitive, requestMatchesRules, allowOnceAnswer } from './lib/permissionRules'
 import { OmniBar } from './components/shell/OmniBar'
@@ -271,12 +271,10 @@ export default function App() {
   const sessionRailWidth = useKaisola((s) => s.sessionRailWidth)
   const railOpen = useKaisola((s) => s.railOpen)
   const tabLayout = useKaisola((s) => s.tabLayout)
-  const requestTerminal = useKaisola((s) => s.requestTerminal)
   const workspacePath = useKaisola((s) => s.workspacePath)
   const activeProjectId = useKaisola((s) => s.activeProjectId)
   // per-project arming (spec risk #5): a single boolean would arm Claude once
   // for the whole app and never in the second project — key by tab+workspace
-  const autoClaudeRef = useRef<Set<string>>(new Set())
   useKeybindings()
 
   // when the ACP agent runs a command it spawns a real pty — list it as a
@@ -303,10 +301,46 @@ export default function App() {
 
   // a pop-out window closed — its terminal card comes home (remount re-attaches
   // the pty stream and replays the scrollback snapshot)
-  useEffect(
-    () => bridge.windows?.onPopClosed?.(({ termId }) => useKaisola.getState().restorePoppedTerminal(termId)),
-    [],
-  )
+  useEffect(() => {
+    let alive = true
+    const closedDuringSync = new Set<string>()
+    const handledClosedRevisions = new Map<string, number>()
+    const applyTerminalMirror = (mirror: TerminalMirrorState) => {
+      const state = useKaisola.getState()
+      if (terminalOwnerMap(state)[mirror.termId] !== mirror.projectId) return
+      if (mirror.meta) state.setTerminalMeta(mirror.termId, mirror.meta)
+      if (Object.prototype.hasOwnProperty.call(mirror, 'draft')) state.setTermDraft(mirror.termId, mirror.draft ?? '')
+      if (typeof mirror.resume === 'string') state.setTerminalResume(mirror.termId, mirror.resume)
+    }
+    const acceptClosedPop = (closed: PopClosedTerminalState) => {
+      if (!closed || typeof closed.termId !== 'string' || typeof closed.projectId !== 'string' || !Number.isSafeInteger(closed.revision)) return
+      closedDuringSync.add(closed.termId)
+      const revisionKey = `${closed.projectId}\0${closed.termId}`
+      const owner = terminalOwnerMap(useKaisola.getState())[closed.termId]
+      // A tab registration can precede rehydration of its terminal row. Do not
+      // ACK away the only retained draft/resume snapshot until the exact terminal
+      // capability is present; tabs:changed/reopen will replay it later.
+      if (owner !== closed.projectId) return
+      if (handledClosedRevisions.get(revisionKey) !== closed.revision) {
+        handledClosedRevisions.set(revisionKey, closed.revision)
+        applyTerminalMirror(closed)
+        useKaisola.getState().restorePoppedTerminal(closed.termId)
+      }
+      // Main validates the live sender's tab capability plus this exact project
+      // and revision before dropping its retained handoff. Repeated delivery is
+      // intentional when a tabs registration races the first ACK.
+      void bridge.windows?.ackPopClosed?.(closed.termId, closed.projectId, closed.revision).catch(() => {})
+    }
+    const off = bridge.windows?.onPopClosed?.(acceptClosedPop)
+    void bridge.windows?.popped?.().then((result) => {
+      if (!alive || !result.ok) return
+      useKaisola.getState().syncPoppedTerminals((result.termIds ?? []).filter((id) => !closedDuringSync.has(id)))
+      for (const state of result.states ?? []) applyTerminalMirror(state)
+      for (const closed of result.closed ?? []) acceptClosedPop(closed)
+    }).catch(() => {})
+    const offState = bridge.windows?.onTerminalState?.(applyTerminalMirror)
+    return () => { alive = false; off?.(); offState?.() }
+  }, [])
 
   // native File/Window menu → store actions (⌘T new tab, ⌘W close active tab,
   // ⌘⌥T reopen, Window-menu tab click → activate). Menu accelerators fire
@@ -623,48 +657,6 @@ export default function App() {
   useEffect(() => {
     if (stage !== 'files') setStage('files')
   }, [setStage, stage])
-
-  useEffect(() => {
-    // wait for a workspace before auto-launching claude — spawning it in $HOME
-    // would let the agent read/edit the wrong tree for the whole session. Arm
-    // ONCE per project+workspace (a switch to a new tab arms it there too).
-    if (!isDesktop || !workspacePath) return
-    const key = `${activeProjectId}\0${workspacePath}`
-    if (autoClaudeRef.current.has(key)) return
-    autoClaudeRef.current.add(key)
-    void (async () => {
-      const before = useKaisola.getState()
-      const freshShell =
-        // 'focus' was the pre-rename default; 'studio' is the current one — a
-        // pristine store can carry either depending on when it was created.
-        (before.layoutMode === 'focus' || before.layoutMode === 'studio') &&
-        before.assistantThreads.length <= 1 &&
-        before.terminals.length === 1 &&
-        // the lone default card may be the thread (old stores), the terminal
-        // (terminal-first default), or NO card at all (the clean homescreen
-        // default) — all count as an untouched shell
-        (before.dockGrid.length === 0 ||
-          (before.dockGrid.length === 1 &&
-            before.dockGrid[0]?.length === 1 &&
-            (before.dockGrid[0]?.[0] === before.activeThreadId || before.dockGrid[0]?.[0] === before.terminals[0]?.id))) &&
-        !before.terminals.some((term) => term.singletonKey === 'agent:claude-code')
-
-      // the boot line (account env, --resume/--continue probing, hooks tap) is
-      // owned by the store so Settings' "apply account now" reuses it verbatim
-      const launched = await useKaisola.getState().launchClaude({ expect: { pid: activeProjectId, ws: workspacePath } })
-      if (!launched || !freshShell || bridge.smoke) return
-      queueMicrotask(() => {
-        const latest = useKaisola.getState()
-        const claude = latest.terminals.find((term) => term.singletonKey === 'agent:claude-code')
-        if (!claude) return
-        latest.setLayoutMode('studio')
-        latest.setDockView(claude.id)
-        for (const thread of latest.assistantThreads) {
-          useKaisola.getState().removeDockView(thread.id)
-        }
-      })
-    })()
-  }, [requestTerminal, workspacePath, activeProjectId])
 
   // the files/canvas card resizes from its left edge (its right edge is the
   // window) — drag left to widen; double-click resets to automatic sharing

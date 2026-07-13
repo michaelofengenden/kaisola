@@ -254,6 +254,32 @@
   transition: background var(--dur-2) var(--ease-out), color var(--dur-2) var(--ease-out),
     border-color var(--dur-2) var(--ease-out), transform 160ms var(--ease-out);
 }
+.ptab-select {
+  position: absolute;
+  inset: 0;
+  z-index: 1;
+  width: 100%;
+  height: 100%;
+  padding: 0;
+  border: 0;
+  border-radius: inherit;
+  background: transparent;
+}
+.ptab-select:focus-visible {
+  box-shadow: inset 0 0 0 2px color-mix(in srgb, var(--accent) 55%, transparent);
+}
+.ptab-content {
+  position: relative;
+  z-index: 1;
+  display: flex;
+  align-items: center;
+  gap: var(--sp-3);
+  flex: 1;
+  min-width: 0;
+  pointer-events: none;
+}
+.ptab > input,
+.ptab-close { position: relative; z-index: 2; }
 .ptab:hover {
   background: var(--hover-overlay);
   color: var(--text-1);
@@ -365,6 +391,7 @@
 .ptab-close:hover {
   color: var(--text-0);
 }
+.ptab-close:focus-visible { opacity: 1; }
 
 /* background activity: pulse only while working; completion stays still until viewed */
 .ptab-badge {
@@ -1288,6 +1315,33 @@
   transition: background var(--dur-2) var(--ease-out), color var(--dur-2) var(--ease-out),
     border-color var(--dur-2) var(--ease-out);
 }
+.stab-select {
+  position: absolute;
+  inset: 0;
+  z-index: 1;
+  width: 100%;
+  height: 100%;
+  padding: 0;
+  border: 0;
+  border-radius: inherit;
+  background: transparent;
+}
+.stab-select:focus-visible {
+  box-shadow: inset 0 0 0 2px color-mix(in srgb, var(--accent) 55%, transparent);
+}
+.stab-content {
+  position: relative;
+  z-index: 1;
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  flex: 1;
+  min-width: 0;
+  pointer-events: none;
+}
+.stab > input,
+.stab-close,
+.stab-split { position: relative; z-index: 2; }
 .stab:hover {
   background: var(--hover-overlay);
   color: var(--text-1);
@@ -1371,6 +1425,7 @@
 .stab-close:hover {
   color: var(--text-0);
 }
+.stab-close:focus-visible { opacity: 1; }
 /* the two-pane button: open this session BESIDE the showing cards (accent
    while its pane is up). Hidden until hover, like the close ×. */
 .stab-split {
@@ -1392,6 +1447,7 @@
 .stab-split:hover {
   color: var(--text-0);
 }
+.stab-split:focus-visible { opacity: 1; }
 /* session activity: pulse only while working; completion stays still until viewed */
 .stab-badge {
   width: var(--activity-dot-size);

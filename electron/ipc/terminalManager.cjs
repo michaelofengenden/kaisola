@@ -75,6 +75,7 @@ function setAppFocused(focused) {
 
 /** id → record */
 const terms = new Map()
+const releaseTimers = new Map()
 let spoolDir = path.join(os.tmpdir(), `kaisola-terminal-cache-${process.pid}`)
 let eventSink = null
 
@@ -165,6 +166,7 @@ function send(sender, channel, payload) {
  * and ACP terminal/output. Resolves exit via waitForExit().
  */
 function spawn({ id, command, args, cwd, env, outputByteLimit, cols, rows, sender }) {
+  cancelRelease(id)
   if (!pty) return null
   const prior = terms.get(id)
   if (prior) {
@@ -323,6 +325,7 @@ function resize(id, cols, rows) {
 
 /** Re-bind a record's output stream to a (possibly new) renderer webContents. */
 function setSender(id, sender) {
+  cancelRelease(id)
   const r = terms.get(id)
   if (!r) return null
   const priorSender = r.lastSender
@@ -365,7 +368,10 @@ function detachRenderer(id, sender, viewState) {
   r.pending = ''
   r.rendererVisible = false
   r.lastSender = r.sender || r.lastSender
-  r.sender = null
+  // Hiding xterm is not an ownership transfer. Keep the authenticated control
+  // owner so an ACP command can still read/wait/release its PTY while its card
+  // is hibernated. A destroyed renderer or disconnected Electron instance uses
+  // detachSender[Prefix] below, which explicitly clears this live owner.
   if (!r.detachedAt) r.detachedAt = Date.now()
   r.spool.setVisible(false, viewState)
   return true
@@ -378,7 +384,12 @@ function detachSender(sender) {
   let detached = 0
   for (const [id, r] of terms) {
     if (!r.sender || !sender || !sameSender(r.sender, sender)) continue
-    if (detachRenderer(id, r.sender)) detached++
+    const prior = r.sender
+    if (detachRenderer(id, prior)) {
+      r.lastSender = prior
+      r.sender = null
+      detached++
+    }
   }
   return detached
 }
@@ -390,9 +401,21 @@ function detachSenderPrefix(prefix) {
   let detached = 0
   for (const [id, r] of terms) {
     if (typeof r.sender !== 'string' || !r.sender.startsWith(prefix)) continue
-    if (detachRenderer(id, r.sender)) detached++
+    const prior = r.sender
+    if (detachRenderer(id, prior)) {
+      r.lastSender = prior
+      r.sender = null
+      detached++
+    }
   }
   return detached
+}
+
+function ownership(id) {
+  const r = terms.get(id)
+  return r
+    ? { exists: true, owner: senderId(r.sender), lastOwner: senderId(r.lastSender), exited: !!r.exited }
+    : { exists: false, owner: '', lastOwner: '', exited: true }
 }
 
 function snapshot(id) {
@@ -409,7 +432,7 @@ function snapshot(id) {
 
 function waitForExit(id) {
   const r = terms.get(id)
-  if (!r) return Promise.resolve({ exitCode: 0, signal: null })
+  if (!r) return Promise.reject(new Error('Terminal is no longer available.'))
   if (r.exited) return Promise.resolve(r.exitStatus)
   return new Promise((resolve) => r.waiters.push(resolve))
 }
@@ -427,12 +450,35 @@ function kill(id) {
 }
 
 function release(id) {
+  cancelRelease(id)
   const r = terms.get(id)
   if (r?.flushTimer) clearTimeout(r.flushTimer)
   if (r?.agentQuietTimer) clearTimeout(r.agentQuietTimer)
   kill(id)
   r?.spool.close({ remove: true })
   terms.delete(id)
+}
+
+/** Broker-owned close grace survives renderer crashes, appearance swaps, and
+ * full Electron restarts while the detached broker keeps the PTY alive. */
+function scheduleRelease(id, delayMs = 60_000) {
+  cancelRelease(id)
+  if (!terms.has(id)) return false
+  const timer = setTimeout(() => {
+    releaseTimers.delete(id)
+    release(id)
+  }, Math.max(1_000, Math.min(Number(delayMs) || 60_000, 5 * 60_000)))
+  timer.unref?.()
+  releaseTimers.set(id, timer)
+  return true
+}
+
+function cancelRelease(id) {
+  const timer = releaseTimers.get(id)
+  if (!timer) return false
+  clearTimeout(timer)
+  releaseTimers.delete(id)
+  return true
 }
 
 /** Track a terminal:run child so killAll() reaps it on quit; it auto-drops
@@ -450,6 +496,8 @@ function untrackChild(child) {
 }
 
 function killAll() {
+  for (const timer of releaseTimers.values()) clearTimeout(timer)
+  releaseTimers.clear()
   for (const r of terms.values()) {
     if (r.flushTimer) clearTimeout(r.flushTimer)
     if (r.agentQuietTimer) clearTimeout(r.agentQuietTimer)
@@ -489,7 +537,7 @@ function list() {
     try {
       proc = r.pty.process || ''
     } catch { /* pty backend may refuse mid-teardown */ }
-    out.push({ id: r.id, pid: r.pty.pid, process: proc, agentBusy: r.agentBusy, agentCompletedAt: r.agentCompletedAt })
+    out.push({ id: r.id, pid: r.pty.pid, process: proc, owner: senderId(r.sender), lastOwner: senderId(r.lastSender), agentBusy: r.agentBusy, agentCompletedAt: r.agentCompletedAt })
   }
   return out
 }
@@ -500,9 +548,10 @@ function diagnostics() {
     pid: r.pty && r.pty.pid,
     exited: r.exited,
     owner: senderId(r.sender),
+    lastOwner: senderId(r.lastSender),
     detachedAt: r.detachedAt,
     detachedBytes: r.detachedBytes,
   }))
 }
 
-module.exports = { available, has, isLive, spawn, write, agentTurn, resize, setSender, detachRenderer, detachSender, detachSenderPrefix, snapshot, waitForExit, kill, release, trackChild, untrackChild, killAll, list, setAppFocused, configureStorage, setEventSink, diagnostics }
+module.exports = { available, has, isLive, ownership, spawn, write, agentTurn, resize, setSender, detachRenderer, detachSender, detachSenderPrefix, snapshot, waitForExit, kill, release, scheduleRelease, cancelRelease, trackChild, untrackChild, killAll, list, setAppFocused, configureStorage, setEventSink, diagnostics }

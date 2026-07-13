@@ -5,11 +5,26 @@
 const MODEL = 'claude-opus-4-8'
 const API_URL = 'https://api.anthropic.com/v1/messages'
 const API_VERSION = '2023-06-01'
+const OPENAI_BASE_URL = 'https://api.openai.com/v1'
 
 const { getApiKey, getOpenaiKey } = require('./settingsHandler.cjs')
 
 function send(sender, channel, payload) {
   if (sender && !sender.isDestroyed()) sender.send(channel, payload)
+}
+
+function openAIEndpoint(req = {}, fallback = 'http://localhost:11434/v1') {
+  const raw = String(req.baseUrl || fallback).replace(/\/$/, '')
+  let url
+  try { url = new URL(raw) } catch { return { ok: false, message: 'The model endpoint is not a valid URL.' } }
+  if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password) {
+    return { ok: false, message: 'Model endpoints must use a plain HTTP or HTTPS URL without embedded credentials.' }
+  }
+  const baseUrl = `${url.origin}${url.pathname.replace(/\/$/, '')}`
+  if (req.useStoredKey && baseUrl !== OPENAI_BASE_URL) {
+    return { ok: false, message: 'The saved OpenAI key is only sent to https://api.openai.com/v1. Custom endpoints need their own explicit credential.' }
+  }
+  return { ok: true, baseUrl }
 }
 
 async function requestClaude({ system, messages, maxTokens, stream, model, tools, toolChoice }) {
@@ -62,7 +77,9 @@ function extractJsonObject(text) {
 
 // ── OpenAI-compatible (local Ollama / LM Studio / llama.cpp, or hosted) ──────
 async function callOpenAI(req) {
-  const baseUrl = (req.baseUrl || 'http://localhost:11434/v1').replace(/\/$/, '')
+  const endpoint = openAIEndpoint(req)
+  if (!endpoint.ok) return endpoint
+  const baseUrl = endpoint.baseUrl
   // hosted OpenAI reads the key from the keychain (main only); local needs none
   const apiKey = req.apiKey || (req.useStoredKey ? getOpenaiKey() : undefined)
   if (req.useStoredKey && !apiKey) return { ok: false, noKey: true, message: 'No OpenAI API key. Add one in Settings (⌘,).' }
@@ -85,6 +102,7 @@ async function callOpenAI(req) {
   try {
     res = await fetch(`${baseUrl}/chat/completions`, {
       method: 'POST',
+      redirect: 'error',
       headers: { 'content-type': 'application/json', ...(apiKey ? { authorization: `Bearer ${apiKey}` } : {}) },
       body: JSON.stringify(body),
     })
@@ -121,9 +139,11 @@ function getOpenAI() {
 // schema-perfect JSON, no tool-calling guesswork. The key is read from the
 // keychain in main; it never reaches the renderer.
 async function callOpenAISDK(req) {
+  const endpoint = openAIEndpoint(req, OPENAI_BASE_URL)
+  if (!endpoint.ok) return endpoint
   const apiKey = req.apiKey || (req.useStoredKey ? getOpenaiKey() : undefined)
   if (req.useStoredKey && !apiKey) return { ok: false, noKey: true, message: 'No OpenAI API key. Add one in Settings (⌘,).' }
-  const baseURL = (req.baseUrl || 'https://api.openai.com/v1').replace(/\/$/, '')
+  const baseURL = endpoint.baseUrl
   let client
   try {
     const OpenAI = getOpenAI()
@@ -211,4 +231,4 @@ function registerModelHandlers(ipcMain) {
   })
 }
 
-module.exports = { registerModelHandlers, MODEL }
+module.exports = { registerModelHandlers, MODEL, _modelTest: { openAIEndpoint } }

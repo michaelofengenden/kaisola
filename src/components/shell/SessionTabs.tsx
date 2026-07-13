@@ -9,6 +9,7 @@ import { ProviderIcon } from '../ProviderIcon'
 import { Dropdown } from '../Dropdown'
 import { CostChip } from './CostChip'
 import { ShellSidebarFooter } from './ShellSidebarFooter'
+import { isRunningMeshPhase } from '../../lib/meshPolicy'
 
 interface STab {
   id: string
@@ -175,6 +176,18 @@ export function SessionTabs({ orientation = 'horizontal' }: { orientation?: 'hor
   const closeTab = (t: STab) => {
     if (t.kind === 'thread') {
       const thread = threads.find((candidate) => candidate.id === t.id)
+      const ownedThreads = thread?.group
+        ? threads.filter((candidate) => candidate.id === thread.id || candidate.groupParentId === thread.id)
+        : thread ? [thread] : []
+      const ownedKeys = new Set(ownedThreads.map((candidate) => `${candidate.agentKey}::${candidate.id}`))
+      const activeWork = ownedThreads.some((candidate) => candidate.busy)
+        || !!thread?.group?.operation
+        || (!!thread?.group && isRunningMeshPhase(thread.group.phase) && !thread.group.paused)
+        || pendingPermissions.some((permission) => ownedKeys.has(permission.key))
+      if (activeWork) {
+        pushToast('warn', thread?.group ? 'Stop or pause this Mesh before closing it.' : 'Stop this agent and resolve its approval before closing the session.')
+        return
+      }
       const owned = thread?.group
         ? thread.group.members
         : thread ? [{ threadId: thread.id, agentKey: thread.agentKey }] : []
@@ -185,14 +198,16 @@ export function SessionTabs({ orientation = 'horizontal' }: { orientation?: 'hor
       closeThread(t.id)
     }
     else if (t.kind === 'term') closeTerminal(t.id)
-    else if (t.kind === 'agentTerm') {
-      closeAgentTerminal(t.id)
-      bridge.terminal.kill(t.id)
-    } else closePanel(t.id)
+    else if (t.kind === 'agentTerm') closeAgentTerminal(t.id)
+    else closePanel(t.id)
   }
   const deleteTab = async (t: STab) => {
     const thread = t.kind === 'thread' ? threads.find((candidate) => candidate.id === t.id) : undefined
     const label = thread?.group ? 'Mesh session' : t.kind === 'term' || t.kind === 'agentTerm' ? 'terminal session' : t.kind === 'panel' ? 'panel' : 'agent session'
+    if (thread?.group?.operation) {
+      pushToast('warn', 'Wait for the current Mesh transition to finish or recover before deleting this session.')
+      return
+    }
     if (!window.confirm(`Permanently delete this ${label}? This removes its saved conversation/session state. Workspace files and git worktrees are never deleted.`)) return
     setMenu(null)
     const owned = thread?.group
@@ -225,12 +240,16 @@ export function SessionTabs({ orientation = 'horizontal' }: { orientation?: 'hor
     const archives = await Promise.all(archiveScopes.map((scope) =>
       bridge.assistantArchive?.clear(scope).catch(() => ({ ok: false })) ?? Promise.resolve({ ok: true }),
     ))
-    if (t.kind === 'thread') closeThread(t.id, activeProjectId)
+    if (t.kind === 'thread') {
+      for (const candidate of owned) useKaisola.getState().setThreadBusy(candidate.id, false, activeProjectId)
+      if (thread?.group) useKaisola.getState().setGroupSession(thread.id, { paused: true, pausedAt: Date.now() }, activeProjectId)
+      closeThread(t.id, activeProjectId)
+    }
     else if (t.kind === 'term') closeTerminal(t.id, activeProjectId)
     else if (t.kind === 'agentTerm') closeAgentTerminal(t.id, activeProjectId)
     else closePanel(t.id, activeProjectId)
     forgetClosedSession(t.id, activeProjectId)
-    if (t.kind === 'term' || t.kind === 'agentTerm') void bridge.terminal.kill(t.id)
+    if (t.kind === 'term' || t.kind === 'agentTerm') void bridge.terminal.kill(t.id, activeProjectId).catch(() => {})
     const teardownFailed = teardown.some((result) => !result.cancelled.ok || !result.closed.ok || result.closed.closed !== true || !result.disconnected.ok)
     const archiveFailed = archives.some((result) => !result.ok)
     pushToast(teardownFailed || archiveFailed ? 'warn' : 'info', `${t.label} deleted. Workspace files were left untouched.${teardownFailed || archiveFailed ? ' Some provider history could not be confirmed removed.' : ''}`)
@@ -247,11 +266,12 @@ export function SessionTabs({ orientation = 'horizontal' }: { orientation?: 'hor
 
   const menuTab = menu ? tabs.get(menu.id) : undefined
   const menuPorts = menu ? terminalMeta[menu.id]?.ports ?? [] : []
+  const orderedTabs = order.map((id) => tabs.get(id)).filter((tab): tab is STab => !!tab)
 
   return (
     <div
       className="stabs"
-      role="tablist"
+      role="toolbar"
       aria-orientation={orientation}
       aria-label={`${projectLabel} sessions`}
       data-orientation={orientation}
@@ -263,36 +283,22 @@ export function SessionTabs({ orientation = 'horizontal' }: { orientation?: 'hor
         <Icon name="CornerDownRight" size={11} />
       </span>
       <div className="stabs-track">
-        {order
-          .map((id) => tabs.get(id))
-          .filter((t): t is STab => !!t)
-          .map((t) => {
+        {orderedTabs.map((t, index) => {
             const active = dockOpen && dockViews.includes(t.id)
+            const focusable = dockViews[dockViews.length - 1] === t.id || (!dockViews.length && index === 0)
             return (
               <div
                 key={t.id}
                 data-sid={t.id}
                 className="stab"
-                role="tab"
-                aria-selected={active}
                 data-active={active}
                 data-state={t.state}
                 style={{ '--sid': t.hue } as CSSProperties}
-                onClick={() => { if (editing !== t.id) switchSession(t.id) }}
-                onDoubleClick={() => {
-                  if (t.kind !== 'thread' && t.kind !== 'term') return
-                  setEditing(t.id)
-                  setEditValue(t.label)
-                }}
                 onMouseDown={(e) => { if (e.button === 1) e.preventDefault() }}
                 onAuxClick={(e) => { if (e.button === 1 && t.closable) { e.preventDefault(); closeTab(t) } }}
                 onContextMenu={(e) => { e.preventDefault(); e.stopPropagation(); setMenu({ x: e.clientX, y: e.clientY, id: t.id }) }}
                 title={t.title}
               >
-                <span className="stab-badge" />
-                {t.kind === 'thread' && t.agentKey
-                  ? <ProviderIcon provider={t.agentKey} name={t.label} size={12} className="stab-icon" />
-                  : <Icon name={t.icon} size={12} className="stab-icon" />}
                 {editing === t.id ? (
                   <input
                     className="stab-label"
@@ -309,10 +315,42 @@ export function SessionTabs({ orientation = 'horizontal' }: { orientation?: 'hor
                     style={{ background: 'transparent', border: 'none', outline: 'none', color: 'inherit', font: 'inherit', width: '100%', minWidth: 0 }}
                   />
                 ) : (
-                  <span className="stab-label truncate">{t.label}</span>
+                  <>
+                    <button
+                      className="stab-select"
+                      aria-label={`Open session ${t.label}`}
+                      aria-current={active ? 'true' : undefined}
+                      tabIndex={focusable ? 0 : -1}
+                      onClick={() => switchSession(t.id)}
+                      onKeyDown={(e) => {
+                        const backward = orientation === 'vertical' ? 'ArrowUp' : 'ArrowLeft'
+                        const forward = orientation === 'vertical' ? 'ArrowDown' : 'ArrowRight'
+                        if (![backward, forward, 'Home', 'End'].includes(e.key)) return
+                        e.preventDefault()
+                        const nextIndex = e.key === 'Home' ? 0
+                          : e.key === 'End' ? orderedTabs.length - 1
+                            : (index + (e.key === forward ? 1 : -1) + orderedTabs.length) % orderedTabs.length
+                        const next = orderedTabs[nextIndex]
+                        if (!next) return
+                        document.querySelector<HTMLButtonElement>(`.stab[data-sid="${CSS.escape(next.id)}"] > .stab-select`)?.focus()
+                      }}
+                      onDoubleClick={() => {
+                        if (t.kind !== 'thread' && t.kind !== 'term') return
+                        setEditing(t.id)
+                        setEditValue(t.label)
+                      }}
+                    />
+                    <span className="stab-content" aria-hidden="true">
+                      <span className="stab-badge" />
+                      {t.kind === 'thread' && t.agentKey
+                        ? <ProviderIcon provider={t.agentKey} name={t.label} size={12} className="stab-icon" />
+                        : <Icon name={t.icon} size={12} className="stab-icon" />}
+                      <span className="stab-label truncate">{t.label}</span>
+                      {t.continued && <span className="stab-continuity">Continued</span>}
+                      {t.kind === 'term' && <CostChip termId={t.id} />}
+                    </span>
+                  </>
                 )}
-                {t.continued && <span className="stab-continuity">Continued</span>}
-                {t.kind === 'term' && <CostChip termId={t.id} />}
                 {/* the two-pane button: open this session BESIDE what's showing
                     (a click on the tab itself swaps it into the current pane) */}
                 <button
@@ -324,11 +362,17 @@ export function SessionTabs({ orientation = 'horizontal' }: { orientation?: 'hor
                     else addDockSplit(t.id)
                   }}
                   title={active ? 'Put this pane away' : 'Open beside — view side by side'}
+                  aria-label={active ? `Put ${t.label} away` : `Open ${t.label} beside the current pane`}
                 >
                   <Icon name="Columns2" size={11} />
                 </button>
                 {t.closable && (
-                  <button className="stab-close" onClick={(e) => { e.stopPropagation(); closeTab(t) }} title="Close session — reopen from + or ⇧⌘T">
+                  <button
+                    className="stab-close"
+                    onClick={(e) => { e.stopPropagation(); closeTab(t) }}
+                    title={t.kind === 'agentTerm' ? 'Hide command output — agent keeps running' : 'Close session — reopen from + or ⇧⌘T'}
+                    aria-label={t.kind === 'agentTerm' ? `Hide command output for ${t.label}; agent keeps running` : `Close session ${t.label}`}
+                  >
                     <Icon name="X" size={10} />
                   </button>
                 )}
@@ -412,12 +456,14 @@ export function SessionTabs({ orientation = 'horizontal' }: { orientation?: 'hor
                     <Icon name="Globe" size={13} /> Open localhost:{port}
                   </button>
                 ))}
-                <button
-                  className="tree-menu-item"
-                  onClick={() => { popOutTerminal(menuTab.id, menuTab.label, menuTab.hue); setMenu(null) }}
-                >
-                  <Icon name="PictureInPicture2" size={13} /> Open in its own window
-                </button>
+                {menuTab.kind === 'term' && (
+                  <button
+                    className="tree-menu-item"
+                    onClick={() => { popOutTerminal(menuTab.id, menuTab.label, menuTab.hue); setMenu(null) }}
+                  >
+                    <Icon name="PictureInPicture2" size={13} /> Open in its own window
+                  </button>
+                )}
               </>
             )}
             {menuTab && <>

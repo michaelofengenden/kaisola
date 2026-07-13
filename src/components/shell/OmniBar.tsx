@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
-import { useKaisola, sessionOrderIds } from '../../store/store'
+import { useKaisola, sessionOrderIds, terminalOwnerMap } from '../../store/store'
 import { bridge } from '../../lib/bridge'
 import { fuzzyRank } from '../../lib/fuzzy'
 import { useAgentRegistry, agentName } from '../../lib/registry'
@@ -30,7 +30,9 @@ const URLish = /^(https?:\/\/\S+|localhost(:\d+)?(\/\S*)?|[\w.-]+\.[a-z]{2,}(:\d
 async function writeWhenReady(id: string, data: string) {
   useKaisola.getState().setDockView(id)
   for (let i = 0; i < 12; i++) {
-    const r = await bridge.terminal.write(id, data)
+    const state = useKaisola.getState()
+    const projectId = terminalOwnerMap(state)[id] ?? state.activeProjectId
+    const r = await bridge.terminal.write(id, data, projectId)
     if (r.ok) return true
     await new Promise((res) => setTimeout(res, 180))
   }

@@ -360,7 +360,7 @@ test('ACP status remains busy until a cancelled provider turn actually settles',
   }
 })
 
-test('idle project-scoped ACP connection and lease move between renderers without restart', () => {
+test('idle project-scoped ACP connection and lease move between renderers without restart', async () => {
   const from = { id: 801 }
   const to = { id: 802 }
   const scope = 'proj-transfer'
@@ -378,14 +378,14 @@ test('idle project-scoped ACP connection and lease move between renderers withou
   _acpTest.connectionLeases.set(oldKey, new Set(['thread-1']))
   try {
     assert.deepEqual(_acpTest.acpProjectTransferState(from, scope), { safe: true, busy: false, connecting: false, awaitingPermission: false })
-    const moved = _acpTest.transferAcpProject(from, to, scope)
+    const moved = await _acpTest.transferAcpProject(from, to, scope)
     assert.equal(moved.ok, true)
     assert.equal(moved.moved, 1)
     assert.equal(_acpTest.connections.has(oldKey), false)
     assert.equal(_acpTest.connections.get(newKey), entry)
     assert.equal(entry.sender, to)
     assert.deepEqual([..._acpTest.connectionLeases.get(newKey)], ['thread-1'])
-    moved.rollback()
+    await moved.rollback()
     assert.equal(_acpTest.connections.get(oldKey), entry)
     assert.equal(_acpTest.connections.has(newKey), false)
     assert.equal(entry.sender, from)
@@ -393,7 +393,7 @@ test('idle project-scoped ACP connection and lease move between renderers withou
     entry.current = { sender: from, channel: 'acp:update:busy' }
     entry.inFlightTurns = 1
     assert.deepEqual(_acpTest.acpProjectTransferState(from, scope), { safe: false, busy: true, connecting: false, awaitingPermission: false })
-    assert.equal(_acpTest.transferAcpProject(from, to, scope).ok, false)
+    assert.equal((await _acpTest.transferAcpProject(from, to, scope)).ok, false)
   } finally {
     _acpTest.connections.delete(oldKey)
     _acpTest.connections.delete(newKey)

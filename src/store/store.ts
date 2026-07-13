@@ -37,8 +37,13 @@ import { verifyCitation } from '../lib/verify'
 import { recomputeProvenanced, sectionTrust } from '../domain/trust'
 import { extractDoi, lookupOpenAlex, lookupOpenAlexByArxiv, resolveReferences } from '../lib/openalex'
 import { parseTei, locateQuote } from '../lib/grobid'
-import { bridge, isDesktop, acpScope, type AcpPermissionRequest, type McpProposalEvent, type WorktreeFile } from '../lib/bridge'
+import { bridge, isDesktop, acpScope, type AcpPermissionRequest, type McpProposalEvent, type TerminalMirrorState, type WorktreeFile } from '../lib/bridge'
 import { folderHue } from '../lib/sessionHue'
+import { canPopOutTerminal } from '../lib/terminalPopPolicy'
+import { terminalsAfterMeta } from '../lib/terminalMetaPolicy'
+import { projectTransferDataConflict, scopeProjectTransferGlobals } from '../lib/projectTransferPolicy'
+import { isRunningMeshPhase } from '../lib/meshPolicy'
+import { addQueuedPrompt, MAX_PERSISTED_QUEUED_PROMPTS } from '../lib/assistantQueuePolicy'
 import { lineHunks, applyHunks } from '../lib/wordDiff'
 import { forgetMountedTerminal } from '../components/Terminal'
 import {
@@ -137,9 +142,7 @@ export type GroupSessionPhase =
   | 'critiquing'
   | 'review-ready'
   | 'synthesizing'
-const runningGroupPhase = (phase: GroupSessionPhase) => [
-  'answering', 'negotiating', 'assigning', 'executing', 'reviewing', 'integrating', 'critiquing', 'synthesizing',
-].includes(phase)
+const runningGroupPhase = (phase: GroupSessionPhase) => isRunningMeshPhase(phase)
 export interface GroupSessionMember {
   threadId: string
   agentKey: string
@@ -171,11 +174,27 @@ export interface GroupSessionState {
   reviews?: Record<string, string>
   integration?: string
   worktrees?: Record<string, WorktreeSession>
+  /** Durable cleanup checkpoint. Clean merges can release worker checkouts as
+   * soon as integration starts; conflicted sets stay until the lead finishes. */
+  worktreeCleanup?: 'integrating' | 'done'
   changedFiles?: Record<string, WorktreeFile[]>
   /** Immutable candidate commits that cross-review actually inspected. */
   reviewedCommits?: Record<string, string>
   error?: string
   leadThreadId?: string
+  /** Durable compare-and-set lock for async stage boundaries. Component-local
+   * refs disappear on project switches/reloads and cannot serialize worktrees. */
+  operation?: {
+    id: string
+    ownerId: string
+    kind: 'continue' | 'execute' | 'review' | 'integrate'
+    phase: GroupSessionPhase
+    startedAt: number
+    /** Worktree task ids are journaled before git side effects begin. A fresh
+     * renderer can therefore remove even a checkout created milliseconds
+     * before the previous process died. */
+    plannedWorktrees?: Record<string, { taskId: string; repo: string }>
+  }
 }
 export interface AssistantThread {
   id: string
@@ -236,6 +255,9 @@ export interface AssistantTurn {
   checkpointId?: string
   /** User turns: how long the agent worked on this prompt (stamped at settle). */
   workedMs?: number
+  /** Present only while local preflight is still deciding whether this user
+   * turn may cross the provider boundary. It makes rollback identity exact. */
+  dispatchId?: string
 }
 
 /** One ACP plan entry — the agent's own todo list (whole-array replace). */
@@ -248,6 +270,9 @@ export interface PlanEntry {
 export interface AssistantRuntime {
   turns: AssistantTurn[]
   first: boolean
+  /** Durable transaction record for an optimistic user turn that has not yet
+   * reached the provider. Stop/reload/close can therefore restore it exactly. */
+  pendingDispatch?: AssistantPendingDispatch
   /** Turns evicted from the live window and preserved in the append-only
    * per-thread disk archive. Only explicit history paging hydrates them. */
   archivedTurns?: number
@@ -283,6 +308,20 @@ export interface AssistantRuntime {
     message?: string
   }
 }
+
+export interface AssistantPendingDispatch {
+  id: string
+  turnAt: number
+  turnText: string
+  startedAt: number
+  first: boolean
+  prompt: AssistantDraft
+  /** Composer sends return to the draft when it is still empty. Other sources
+   * (queue/Omni/Mesh) return to the paused queue. */
+  restoreToDraft: boolean
+}
+
+export type AssistantDispatchRecovery = 'none' | 'draft' | 'queue'
 
 export type AssistantSpeed = 'default' | 'fast'
 
@@ -427,6 +466,8 @@ export interface ClosedSession {
   term?: TerminalSession
   thread?: AssistantThread
   runtime?: AssistantRuntime
+  draft?: AssistantDraft
+  promptQueue?: QueuedAssistantPrompt[]
   /** A Mesh closes as one reversible bundle, including private workers. */
   groupThreads?: AssistantThread[]
   groupRuntimes?: Record<string, AssistantRuntime>
@@ -565,6 +606,26 @@ const normalizeAssistantDraft = (draft?: Partial<AssistantDraft> | null): Assist
       } }
     : {}),
 })
+
+const assistantDraftsEqual = (left: AssistantDraft, right: AssistantDraft): boolean =>
+  JSON.stringify(left) === JSON.stringify(right)
+
+const normalizePendingAssistantDispatch = (
+  pending?: Partial<AssistantPendingDispatch> | null,
+): AssistantPendingDispatch | undefined => {
+  if (!pending || typeof pending.id !== 'string' || !pending.id || !Number.isFinite(pending.turnAt)) return undefined
+  const prompt = normalizeAssistantDraft(pending.prompt)
+  if (!prompt.text.trim()) return undefined
+  return {
+    id: pending.id.slice(0, 200),
+    turnAt: Number(pending.turnAt),
+    turnText: typeof pending.turnText === 'string' ? pending.turnText.slice(0, ASSISTANT_DRAFT_TEXT_LIMIT + 300_000) : prompt.text,
+    startedAt: Number.isFinite(pending.startedAt) ? Number(pending.startedAt) : Number(pending.turnAt),
+    first: pending.first !== false,
+    prompt,
+    restoreToDraft: pending.restoreToDraft === true,
+  }
+}
 
 const assistantDraftIsEmpty = (draft: AssistantDraft) =>
   !draft.text && draft.attachments.length === 0 && draft.mentions.length === 0 && draft.speed === 'default'
@@ -1062,6 +1123,7 @@ interface KaisolaState {
   setTermDraft: (id: string, text: string) => void
   popOutTerminal: (id: string, title?: string, hue?: string) => void
   restorePoppedTerminal: (id: string) => void
+  syncPoppedTerminals: (ids: string[]) => void
   /** Open (or focus) the git commit panel card — one per window. */
   openGitPanel: () => void
   openLedgerPanel: () => void
@@ -1123,6 +1185,9 @@ interface KaisolaState {
   removeGroupMember: (id: string, threadId: string, projectId?: string) => void
   setGroupMemberModel: (id: string, threadId: string, modelId: string, modelLabel: string, projectId?: string) => void
   setGroupSession: (id: string, patch: Partial<GroupSessionState>, projectId?: string) => void
+  beginGroupOperation: (id: string, kind: NonNullable<GroupSessionState['operation']>['kind'], expectedPhase: GroupSessionPhase, ownerId: string, projectId?: string, plannedWorktrees?: Record<string, { taskId: string; repo: string }>) => string | undefined
+  groupOperationCurrent: (id: string, operationId: string, projectId?: string) => boolean
+  endGroupOperation: (id: string, operationId: string, projectId?: string) => void
   setGroupWorktrees: (id: string, worktrees: Record<string, WorktreeSession>, projectId?: string) => void
   clearGroupWorktreeSessions: (id: string, cwd: string, projectId?: string) => void
   setAssistantThreadCwd: (id: string, cwd: string | undefined, projectId?: string) => void
@@ -1138,16 +1203,37 @@ interface KaisolaState {
   setThreadPreferredModel: (id: string, modelId: string, modelLabel?: string, projectId?: string) => void
   setThreadPermissionMode: (id: string, mode: string, projectId?: string) => void
   setThreadQueuePaused: (id: string, paused: boolean, projectId?: string) => void
+  /** Atomically claim preflight, append its optimistic row, mark busy, and (for
+   * composer sends) clear the draft. No close/Stop observer can see half-state. */
+  beginAssistantDispatch: (
+    id: string,
+    prompt: AssistantDraft,
+    shownText: string,
+    opts?: {
+      clearDraft?: boolean
+      restoreToDraft?: boolean
+      /** Clear only the exact composer snapshot the caller sent. */
+      expectedDraft?: AssistantDraft
+      /** Remove these durable queue rows in the same transaction that records
+       * the recoverable preflight. */
+      claimQueueIds?: string[]
+    },
+    projectId?: string,
+  ) => AssistantPendingDispatch | undefined
+  /** Commit the provider boundary. False means Stop/close already won. */
+  commitAssistantDispatch: (id: string, dispatchId: string, projectId?: string) => boolean
+  /** Idempotently undo an uncommitted send and preserve its prompt. */
+  rollbackAssistantDispatch: (id: string, dispatchId?: string, opts?: { message?: string; stopReason?: string; pauseQueue?: boolean }, projectId?: string) => AssistantDispatchRecovery
   updateAssistantRuntime: (id: string, fn: (runtime: AssistantRuntime) => AssistantRuntime, projectId?: string) => void
   resetAssistantRuntime: (id: string, projectId?: string) => void
   setAssistantDraft: (id: string, patch: Partial<AssistantDraft>, projectId?: string) => void
   clearAssistantDraft: (id: string, opts?: { keepSpeed?: boolean }, projectId?: string) => void
-  enqueueAssistantPrompt: (id: string, prompt: AssistantDraft, opts?: { front?: boolean; resume?: boolean }, projectId?: string) => string
+  enqueueAssistantPrompt: (id: string, prompt: AssistantDraft, opts?: { front?: boolean; resume?: boolean; preserveAccepted?: boolean }, projectId?: string) => string | undefined
   dequeueAssistantPrompt: (id: string, projectId?: string) => QueuedAssistantPrompt | undefined
   /** Atomically remove every prompt waiting for a thread. The renderer merges
    * the returned batch into one ordered next turn. */
   takeAssistantPromptQueue: (id: string, projectId?: string) => QueuedAssistantPrompt[]
-  removeQueuedAssistantPrompt: (id: string, promptId: string) => void
+  removeQueuedAssistantPrompt: (id: string, promptId: string, projectId?: string) => void
   reorderAssistantThreads: (srcId: string, destId: string) => void
   setThreadBusy: (id: string, busy: boolean, projectId?: string) => void
   /** `pane` deep-links a Settings section (e.g. 'agents') — cleared on close. */
@@ -1214,7 +1300,7 @@ interface KaisolaState {
    * there to merge. (The context menu's direct merge stays for trusted work.) */
   proposeWorktreeSession: (sessionId: string) => Promise<void>
   /** An agent used a human-gated MCP write tool → a pending Proposal here. */
-  receiveMcpProposal: (ev: McpProposalEvent) => void
+  receiveMcpProposal: (ev: McpProposalEvent) => boolean
 
   // ── undo timeline (the checkpoint over the gate) ──
   /** Revert the project to a checkpoint, dropping it and everything newer. */
@@ -1461,8 +1547,32 @@ function splitPatch(patch: string): Record<string, string> {
 const WIN_PARAMS = typeof location !== 'undefined' ? new URLSearchParams(location.search) : null
 const WIN_SLOT = WIN_PARAMS?.get('win') ?? null
 export const POP_TERMINAL_ID = WIN_PARAMS?.get('pop') ?? null
+export const POP_PROJECT_ID = WIN_PARAMS?.get('project') ?? null
 export const POP_WINDOW_TITLE = WIN_PARAMS?.get('title') ?? null
 export const POP_WINDOW_HUE = WIN_PARAMS?.get('hue') ?? null
+let popMirrorPending: TerminalMirrorState | null = null
+let popMirrorTimer: number | null = null
+const flushPopTerminalMirror = () => {
+  if (popMirrorTimer != null) window.clearTimeout(popMirrorTimer)
+  popMirrorTimer = null
+  const pending = popMirrorPending
+  popMirrorPending = null
+  if (pending) bridge.windows?.mirrorTerminalState?.(pending)
+}
+const queuePopTerminalMirror = (patch: Omit<Partial<TerminalMirrorState>, 'termId' | 'projectId'>) => {
+  if (!POP_TERMINAL_ID || !POP_PROJECT_ID) return
+  const previous = popMirrorPending
+  popMirrorPending = {
+    termId: POP_TERMINAL_ID,
+    projectId: POP_PROJECT_ID,
+    ...(previous ?? {}),
+    ...patch,
+    ...(previous?.meta || patch.meta ? { meta: { ...(previous?.meta ?? {}), ...(patch.meta ?? {}) } } : {}),
+  }
+  // Keystroke-derived drafts can update once per character. One small merged
+  // relay per animation-sized window preserves fluency without IPC chatter.
+  if (popMirrorTimer == null) popMirrorTimer = window.setTimeout(flushPopTerminalMirror, 80)
+}
 // a tear-off adoption window boots PRISTINE on purpose: its (possibly stale)
 // slot state must not rehydrate under the adopted project — the first persist
 // then overwrites the slot key with the adopted state.
@@ -1611,6 +1721,8 @@ if (typeof window !== 'undefined' && !POP_TERMINAL_ID) {
       bridge.db.setSync(lastPersist.name, lastPersist.value)
     }
   })
+} else if (typeof window !== 'undefined' && POP_TERMINAL_ID) {
+  window.addEventListener('pagehide', flushPopTerminalMirror)
 }
 
 /**
@@ -1647,10 +1759,6 @@ export function sessionOrderIds(s: Pick<KaisolaState, 'assistantThreads' | 'term
 // prompt (nulled after delivery) made every other ask replay a stale seq and
 // get dropped by the consumer's guard
 let omniSeqCounter = 0
-// close→reopen→close: each close gets a token so a STALE 60s grace timer
-// can't kill the pty (or eat the stack entry) of a newer close
-const termCloseTokens = new Map<string, number>()
-
 /** Normalize a card grid (drop empty columns) and mirror it to the flat list. */
 function gridState(grid: string[][], extra: object = {}) {
   const g = grid.filter((col) => col.length)
@@ -1906,13 +2014,16 @@ function sanitizeSliceForPersist(slice: ProjectSliceMemory): ProjectSlicePersist
   const assistantRuntimes = Object.fromEntries(
     Object.entries(slice.assistantRuntimes)
       .filter(([id]) => assistantThreads.some((t) => t.id === id))
-      .map(([id, runtime]) => [id, {
+      .map(([id, runtime]) => {
+        const pendingDispatch = normalizePendingAssistantDispatch(runtime.pendingDispatch)
+        return [id, {
         // Match the live headroom: a quit just before a spill must not prune a
         // turn that has not crossed the archive spill threshold yet. A batch
         // awaiting fsync/ACK keeps its whole prefix so quit/ENOSPC cannot lose
         // data; it retries idempotently after rehydration.
-        turns: runtime.archiveBatch ? runtime.turns : assistantTail(runtime.turns, ASSISTANT_ARCHIVE_TRIGGER_TURNS),
+        turns: runtime.archiveBatch || pendingDispatch ? runtime.turns : assistantTail(runtime.turns, ASSISTANT_ARCHIVE_TRIGGER_TURNS),
         first: runtime.first,
+        ...(pendingDispatch ? { pendingDispatch } : {}),
         ...(runtime.archivedTurns ? { archivedTurns: runtime.archivedTurns } : {}),
         ...(runtime.archiveEpoch ? { archiveEpoch: runtime.archiveEpoch } : {}),
         ...(runtime.archiveBatch ? { archiveBatch: runtime.archiveBatch } : {}),
@@ -1925,7 +2036,8 @@ function sanitizeSliceForPersist(slice: ProjectSliceMemory): ProjectSlicePersist
           })),
           planUpdatedAt: runtime.planUpdatedAt,
         } : {}),
-      }]),
+        }]
+      }),
   )
   const liveThreadIds = new Set(assistantThreads.map((t) => t.id))
   const assistantDrafts = Object.fromEntries(
@@ -1942,7 +2054,7 @@ function sanitizeSliceForPersist(slice: ProjectSliceMemory): ProjectSlicePersist
         (Array.isArray(queue) ? queue : [])
           .map((q) => ({ ...normalizeAssistantDraft(q), id: q.id || uid('qp'), queuedAt: Number(q.queuedAt) || Date.now() }))
           .filter((q) => q.text.trim())
-          .slice(0, 20),
+          .slice(0, MAX_PERSISTED_QUEUED_PROMPTS),
       ])
       .filter(([, queue]) => (queue as QueuedAssistantPrompt[]).length),
   )
@@ -1989,7 +2101,7 @@ function sanitizeSliceForPersist(slice: ProjectSliceMemory): ProjectSlicePersist
           groupThreads: c.groupThreads.map((thread) => ({ ...thread, busy: false, queuePaused: true })),
           groupRuntimes: Object.fromEntries(Object.entries(c.groupRuntimes ?? {}).filter(([id]) => ids.has(id)).map(([id, runtime]) => [id, trimRuntime(runtime)])),
           groupDrafts: Object.fromEntries(Object.entries(c.groupDrafts ?? {}).filter(([id]) => ids.has(id)).map(([id, draft]) => [id, normalizeAssistantDraft(draft)])),
-          groupPromptQueues: Object.fromEntries(Object.entries(c.groupPromptQueues ?? {}).filter(([id]) => ids.has(id)).map(([id, queue]) => [id, queue.map((prompt) => ({ ...normalizeAssistantDraft(prompt), id: prompt.id, queuedAt: prompt.queuedAt })).slice(0, 20)])),
+          groupPromptQueues: Object.fromEntries(Object.entries(c.groupPromptQueues ?? {}).filter(([id]) => ids.has(id)).map(([id, queue]) => [id, queue.map((prompt) => ({ ...normalizeAssistantDraft(prompt), id: prompt.id, queuedAt: prompt.queuedAt })).slice(0, MAX_PERSISTED_QUEUED_PROMPTS)])),
         }
       }
       if (c.kind === 'thread' && c.thread) {
@@ -1998,6 +2110,8 @@ function sanitizeSliceForPersist(slice: ProjectSliceMemory): ProjectSlicePersist
           at: c.at,
           thread: { ...c.thread, busy: false },
           ...(c.runtime ? { runtime: { turns: assistantTail(c.runtime.turns, ASSISTANT_ARCHIVE_TRIGGER_TURNS), first: c.runtime.first, ...(c.runtime.archivedTurns ? { archivedTurns: c.runtime.archivedTurns } : {}), ...(c.runtime.archiveEpoch ? { archiveEpoch: c.runtime.archiveEpoch } : {}), ...(c.runtime.lastRun ? { lastRun: c.runtime.lastRun } : {}) } } : {}),
+          ...(c.draft ? { draft: normalizeAssistantDraft(c.draft) } : {}),
+          ...(c.promptQueue?.length ? { promptQueue: c.promptQueue.map((prompt) => ({ ...normalizeAssistantDraft(prompt), id: prompt.id, queuedAt: prompt.queuedAt })).slice(0, MAX_PERSISTED_QUEUED_PROMPTS) } : {}),
         }
       }
       if (c.kind === 'term' && c.term) {
@@ -2480,11 +2594,12 @@ export const useKaisola = create<KaisolaState>()(
   // active thread, 'terminal' the current/first terminal.
   setDock: (open, tab) =>
     set((s) => {
+      const dockableTerminal = s.terminals.find((terminal) => !poppedTerms.has(terminal.id))
       const focus =
         tab === 'assistant' && !s.dockViews.includes(s.activeThreadId)
           ? s.activeThreadId
-          : tab === 'terminal' && s.terminals.length && !s.terminals.some((t) => s.dockViews.includes(t.id))
-            ? s.terminals[0].id
+          : tab === 'terminal' && dockableTerminal && !s.terminals.some((t) => s.dockViews.includes(t.id))
+            ? dockableTerminal.id
             : null
       if (!open) return { dockOpen: false }
       if (focus) return gridState([[focus]], { dockOpen: true, layoutMode: 'studio' })
@@ -2493,21 +2608,25 @@ export const useKaisola = create<KaisolaState>()(
   // showing a session never tears down the layout you built — an unopened
   // session joins as a new card on the right. Viewing clears its amber dot.
   setDockView: (id) =>
-    set((s) => {
+    poppedTerms.has(id)
+      ? void bridge.windows?.pop?.(id, undefined, undefined, terminalOwnerMap(get())[id] ?? get().activeProjectId)
+      : set((s) => {
       const needsYou = { ...s.needsYou }
       delete needsYou[id]
       return s.dockViews.includes(id)
         ? { dockOpen: true, needsYou }
         : gridState([...s.dockGrid, [id]], { dockOpen: true, needsYou })
-    }),
+        }),
   addDockSplit: (id) =>
-    set((s) => {
+    poppedTerms.has(id)
+      ? void bridge.windows?.pop?.(id, undefined, undefined, terminalOwnerMap(get())[id] ?? get().activeProjectId)
+      : set((s) => {
       const needsYou = { ...s.needsYou }
       delete needsYou[id]
       return s.dockViews.includes(id)
         ? { dockOpen: true, needsYou }
         : gridState([...s.dockGrid, [id]], { dockOpen: true, needsYou })
-    }),
+        }),
   removeDockView: (id) =>
     set((s) => {
       const grid = gridWithout(s.dockGrid, id)
@@ -2581,7 +2700,7 @@ export const useKaisola = create<KaisolaState>()(
     const sid = get().claudeSessions[ws]
     const sessions = await bridge.claude.sessionExists?.(ws, sid ?? '', acct?.configDir)
     // the Kaisola MCP server (project state + agent-task ledger) rides along
-    const mcpPath = (await bridge.mcp?.info().catch(() => null))?.configPath
+    const mcpPath = (await bridge.mcp?.info({ projectId: pid, workspace: ws }).catch(() => null))?.configPath
     const q = (v: string) => `'${v.replace(/'/g, `'\\''`)}'`
     const resumeArg = sid && sessions?.exists ? `--resume ${q(sid)}` : sessions?.any ? '--continue' : ''
     // a fast tab switch may have moved on while we probed the folder
@@ -2714,6 +2833,11 @@ export const useKaisola = create<KaisolaState>()(
   },
   closeTerminal: (id, projectId) => {
     const owner = projectId ?? terminalOwnerMap(get())[id] ?? get().activeProjectId
+    if (poppedTerms.has(id)) {
+      void bridge.windows?.pop?.(id, undefined, undefined, owner)
+      get().pushToast('info', 'Close the detached terminal window before closing this session here.')
+      return
+    }
     get().patchProject(owner, (s) => {
       const closing = s.terminals.find((t) => t.id === id)
       const terminals = s.terminals.filter((t) => t.id !== id)
@@ -2736,22 +2860,15 @@ export const useKaisola = create<KaisolaState>()(
         ...gridState(grid.length ? grid : fallback ? [[fallback]] : [], grid.length || fallback ? {} : { dockOpen: false }),
       }
     })
-    const token = (termCloseTokens.get(id) ?? 0) + 1
-    termCloseTokens.set(id, token)
-    window.setTimeout(() => {
-      if (termCloseTokens.get(id) !== token) return // a NEWER close owns the grace now
-      termCloseTokens.delete(id) // grace resolved — don't let the Map grow per-close forever
-      const now = get()
-      if (projectFields(now, owner).terminals.some((t) => t.id === id)) return // reopened — keep the pty
-      // REAL close (survived the grace, not reopened): drop it from the
-      // ever-mounted Set too — the sibling termCloseTokens reap left it growing
-      // forever. Placed after the reopened guard so a kept terminal isn't forgotten.
-      forgetMountedTerminal(id)
-      void bridge.terminal.kill(id)
-      // Keep the lightweight reopen record after the live PTY grace expires.
-      // Reopening later starts a fresh shell in the saved cwd; Close stays
-      // reversible until the user explicitly chooses Delete permanently.
-    }, 60_000)
+    forgetMountedTerminal(id)
+    // The detached broker owns this timer. Renderer crashes, live appearance
+    // swaps, and app restarts cannot strand the accepted close anymore.
+    void bridge.terminal.scheduleRelease(id, owner, 60_000).catch(() => {
+      // Compatibility fallback for an older/unavailable broker.
+      window.setTimeout(() => {
+        if (!terminalOwnerMap(get())[id]) void bridge.terminal.kill(id, owner).catch(() => {})
+      }, 60_000)
+    })
   },
   renameTerminal: (id, name) =>
     set((s) => ({ terminals: s.terminals.map((t) => (t.id === id ? { ...t, name: name || undefined } : t)) })),
@@ -2775,7 +2892,8 @@ export const useKaisola = create<KaisolaState>()(
       }
     })
   },
-  setTermDraft: (id, text) =>
+  setTermDraft: (id, text) => {
+    if (id === POP_TERMINAL_ID) queuePopTerminalMirror({ draft: text })
     set((s) => {
       if (!text) {
         if (!(id in s.termDrafts)) return {}
@@ -2784,14 +2902,32 @@ export const useKaisola = create<KaisolaState>()(
       }
       if (s.termDrafts[id] === text) return {}
       return { termDrafts: { ...s.termDrafts, [id]: text } }
-    }),
-  setTerminalResume: (id, boot) =>
-    set((s) => ({
-      terminals: s.terminals.map((terminal) =>
-        terminal.id === id ? { ...terminal, restart: true, boot } : terminal,
-      ),
-    })),
-  setTerminalMeta: (id, patch) =>
+    })
+  },
+  setTerminalResume: (id, boot) => {
+    if (id === POP_TERMINAL_ID) queuePopTerminalMirror({ resume: boot })
+    set((s) => {
+      const owner = terminalOwnerMap(s)[id]
+      if (owner && owner !== s.activeProjectId) {
+        const slice = s.projectSlices[owner]
+        if (!slice) return {}
+        return {
+          projectSlices: {
+            ...s.projectSlices,
+            [owner]: {
+              ...slice,
+              terminals: slice.terminals.map((terminal) => terminal.id === id ? { ...terminal, restart: true, boot } : terminal),
+            },
+          },
+        }
+      }
+      return {
+        terminals: s.terminals.map((terminal) => terminal.id === id ? { ...terminal, restart: true, boot } : terminal),
+      }
+    })
+  },
+  setTerminalMeta: (id, patch) => {
+    if (id === POP_TERMINAL_ID) queuePopTerminalMirror({ meta: patch })
     set((s) => {
       // bail on no-ops: this fires on every OSC title / meta tick, and a
       // pointless set() re-renders every session surface (rail, tabs, cards)
@@ -2813,51 +2949,60 @@ export const useKaisola = create<KaisolaState>()(
       // terminal that merely visited claude doesn't resurrect it at next boot.
       // Claude hooks later upgrade --continue to an exact --resume. Codex's
       // terminal-session probe does the same; --last is the safe fallback.
-      let terminals = s.terminals
-      if ('fgProcess' in patch) {
-        const t = s.terminals.find((x) => x.id === id)
-        const fg = String(patch.fgProcess || '')
-        // NEVER adopt a login terminal (`claude /login`): stamping it with
-        // restart:true + `claude --continue` made the transient sign-in pane
-        // immortal — it re-persisted, re-booted, and refused to close.
-        const isLogin = /\/login\b/.test(t?.boot ?? '')
-        if (t && !t.singletonKey && !isLogin && /^claude\b/.test(fg)) {
-          terminals = s.terminals.map((x) =>
-            x.id === id
-              ? { ...x, singletonKey: `agent:claude-cli-${id}`, restart: true, boot: 'claude --continue', name: x.name ?? 'Claude' }
-              : x,
-          )
-        } else if (t && t.singletonKey?.startsWith('agent:claude-cli-') && /^-?(zsh|bash|fish|sh)$/.test(fg)) {
-          terminals = s.terminals.map((x) =>
-            x.id === id ? { ...x, singletonKey: undefined, restart: undefined, boot: undefined } : x,
-          )
-        } else if (t && !t.singletonKey && !isLogin && /^codex\b/.test(fg)) {
-          terminals = s.terminals.map((x) =>
-            x.id === id
-              ? { ...x, singletonKey: `agent:codex-cli-${id}`, restart: true, boot: 'codex resume --last', name: x.name ?? 'Codex' }
-              : x,
-          )
-        } else if (t && t.singletonKey?.startsWith('agent:codex') && /^codex\b/.test(fg) && (!t.restart || !/^codex resume\b/.test(t.boot ?? ''))) {
-          terminals = s.terminals.map((x) =>
-            x.id === id ? { ...x, restart: true, boot: 'codex resume --last' } : x,
-          )
-        } else if (t && t.singletonKey?.startsWith('agent:codex-cli-') && /^-?(zsh|bash|fish|sh)$/.test(fg)) {
-          terminals = s.terminals.map((x) =>
-            x.id === id ? { ...x, singletonKey: undefined, restart: undefined, boot: undefined } : x,
-          )
+      const owner = terminalOwnerMap(s)[id]
+      if (owner && owner !== s.activeProjectId) {
+        const slice = s.projectSlices[owner]
+        if (!slice) return { terminalMeta: { ...s.terminalMeta, [id]: { ...s.terminalMeta[id], ...patch } } }
+        const terminals = terminalsAfterMeta(slice.terminals, id, patch)
+        return {
+          terminalMeta: { ...s.terminalMeta, [id]: { ...s.terminalMeta[id], ...patch } },
+          ...(terminals !== slice.terminals
+            ? { projectSlices: { ...s.projectSlices, [owner]: { ...slice, terminals } } }
+            : {}),
         }
       }
+      const terminals = terminalsAfterMeta(s.terminals, id, patch)
       return {
         terminalMeta: { ...s.terminalMeta, [id]: { ...s.terminalMeta[id], ...patch } },
         ...(terminals !== s.terminals ? { terminals } : {}),
       }
-    }),
+    })
+  },
   // send a terminal card to its own window; the card leaves this window's grid
   // (one pty stream has ONE renderer at a time) and returns on pop close
   popOutTerminal: (id, title, hue) => {
+    const state = get()
+    const owner = terminalOwnerMap(state)[id]
+    if (!canPopOutTerminal(state, id)) {
+      state.pushToast('info', 'Agent command terminals stay here so the controlling agent can finish safely.')
+      return
+    }
+    if (!owner) return
     poppedTerms.add(id) // the pop now owns the pty (closeProject must not reap it)
-    get().removeDockView(id)
-    void bridge.windows?.pop?.(id, title, hue)
+    if (owner === state.activeProjectId) state.removeDockView(id)
+    else {
+      state.patchProject(owner, (slice) => {
+        const grid = gridWithout(slice.dockGrid, id)
+        const fallback = slice.terminals.find((terminal) => terminal.id !== id)?.id ?? slice.assistantThreads[0]?.id
+        return gridState(grid.length ? grid : fallback ? [[fallback]] : [], grid.length || fallback ? {} : { dockOpen: false })
+      })
+    }
+    // The pop rehydrates this window's read-only slot immediately. Cross the
+    // existing durability barrier first so its terminal row and unsent CLI
+    // draft cannot come from the store's normal 800 ms delayed snapshot.
+    flushPersistSync()
+    void bridge.windows?.pop?.(id, title, hue, owner).then((result) => {
+      if (result.ok) return
+      get().restorePoppedTerminal(id)
+      get().pushToast('warn', 'The terminal window could not be opened, so the session was restored here.')
+    }).catch(() => {
+      get().restorePoppedTerminal(id)
+      get().pushToast('warn', 'The terminal window could not be opened, so the session was restored here.')
+    })
+  },
+  syncPoppedTerminals: (ids) => {
+    poppedTerms.clear()
+    for (const id of ids) if (typeof id === 'string' && id) poppedTerms.add(id)
   },
   restorePoppedTerminal: (id) => {
     poppedTerms.delete(id)
@@ -2983,7 +3128,9 @@ export const useKaisola = create<KaisolaState>()(
   // Rail order = grouped sessions (group by group), then ungrouped — the same
   // order the rail draws, so ⌘1..9 match what the user sees
   switchSession: (id) =>
-    set((s) => {
+    poppedTerms.has(id)
+      ? void bridge.windows?.pop?.(id, undefined, undefined, terminalOwnerMap(get())[id] ?? get().activeProjectId)
+      : set((s) => {
       const viewedAt = Date.now()
       const needsYou = { ...s.needsYou }
       delete needsYou[id]
@@ -3000,7 +3147,7 @@ export const useKaisola = create<KaisolaState>()(
         ...gridState(s.dockGrid.map((col) => col.map((v) => (v === anchor ? id : v))), { dockOpen: true }),
         ...active,
       }
-    }),
+        }),
   cycleSession: (dir) => {
     const s = get()
     const order = sessionOrderIds(s)
@@ -3059,6 +3206,7 @@ export const useKaisola = create<KaisolaState>()(
         }
       }
       if (top.kind === 'term' && top.term) {
+        void bridge.terminal.cancelRelease(top.term.id, s.activeProjectId).catch(() => {})
         // a singleton (the claude terminal) may have been auto-recreated since
         // the close — never resurrect a SECOND copy, focus the live one
         const dupe = top.term.singletonKey
@@ -3080,12 +3228,19 @@ export const useKaisola = create<KaisolaState>()(
         }
       }
       if (top.kind === 'thread' && top.thread) {
+        const restoredThread = top.promptQueue?.length ? { ...top.thread, queuePaused: true } : top.thread
         return {
           closedStack: rest,
-          assistantThreads: [...s.assistantThreads, top.thread],
+          assistantThreads: [...s.assistantThreads, restoredThread],
           assistantRuntimes: top.runtime
             ? { ...s.assistantRuntimes, [top.thread.id]: top.runtime }
             : s.assistantRuntimes,
+          assistantDrafts: top.draft
+            ? { ...s.assistantDrafts, [top.thread.id]: normalizeAssistantDraft(top.draft) }
+            : s.assistantDrafts,
+          assistantPromptQueues: top.promptQueue?.length
+            ? { ...s.assistantPromptQueues, [top.thread.id]: top.promptQueue }
+            : s.assistantPromptQueues,
           activeThreadId: top.thread.id,
           ...gridState([...s.dockGrid, [top.thread.id]], { dockOpen: true }),
         }
@@ -3270,7 +3425,7 @@ export const useKaisola = create<KaisolaState>()(
     })
     if (s.terminals.some((t) => t.id === sessionId)) {
       s.closeTerminal(sessionId)
-      void bridge.terminal.kill(sessionId)
+      void bridge.terminal.kill(sessionId, s.activeProjectId).catch(() => {})
     } else if (s.assistantThreads.some((t) => t.id === sessionId)) {
       s.closeAssistantThread(sessionId)
     }
@@ -3391,6 +3546,34 @@ export const useKaisola = create<KaisolaState>()(
       ),
     }))
   },
+  beginGroupOperation: (id, kind, expectedPhase, ownerId, projectId, plannedWorktrees) => {
+    const pid = projectId ?? get().activeProjectId
+    const operation = { id: uid('mesh-op'), ownerId, kind, phase: expectedPhase, startedAt: Date.now(), ...(plannedWorktrees ? { plannedWorktrees } : {}) }
+    let claimed = false
+    get().patchProject(pid, (sl) => ({
+      assistantThreads: sl.assistantThreads.map((thread) => {
+        if (thread.id !== id || !thread.group || thread.group.phase !== expectedPhase || thread.group.operation) return thread
+        claimed = true
+        return { ...thread, group: { ...thread.group, operation } }
+      }),
+    }))
+    return claimed ? operation.id : undefined
+  },
+  groupOperationCurrent: (id, operationId, projectId) => {
+    const pid = projectId ?? get().activeProjectId
+    const group = projectFields(get(), pid).assistantThreads.find((thread) => thread.id === id)?.group
+    return group?.operation?.id === operationId && group.phase === group.operation.phase
+  },
+  endGroupOperation: (id, operationId, projectId) => {
+    const pid = projectId ?? get().activeProjectId
+    get().patchProject(pid, (sl) => ({
+      assistantThreads: sl.assistantThreads.map((thread) =>
+        thread.id === id && thread.group?.operation?.id === operationId
+          ? { ...thread, group: { ...thread.group, operation: undefined } }
+          : thread,
+      ),
+    }))
+  },
   setGroupWorktrees: (id, worktrees, projectId) => {
     const pid = projectId ?? get().activeProjectId
     get().patchProject(pid, (sl) => ({
@@ -3437,6 +3620,35 @@ export const useKaisola = create<KaisolaState>()(
   // and the + menu recreates a thread in one click
   closeAssistantThread: (id, projectId) => {
     const owner = projectId ?? get().activeProjectId
+    let before = projectFields(get(), owner)
+    let target = before.assistantThreads.find((thread) => thread.id === id)
+    let ownedIds = new Set([id, ...(target?.group ? before.assistantThreads.filter((thread) => thread.groupParentId === id).map((thread) => thread.id) : [])])
+    // A renderer may disappear after durable preflight was written but before
+    // its Stop closure unwound. Persisted threads rehydrate idle, so recover any
+    // such transaction before taking the recently-closed snapshot.
+    for (const ownedId of ownedIds) {
+      const thread = before.assistantThreads.find((candidate) => candidate.id === ownedId)
+      if (!thread?.busy && before.assistantRuntimes[ownedId]?.pendingDispatch) {
+        get().rollbackAssistantDispatch(ownedId, undefined, {
+          message: 'Stopped before the prompt was sent.',
+          pauseQueue: true,
+        }, owner)
+      }
+    }
+    before = projectFields(get(), owner)
+    target = before.assistantThreads.find((thread) => thread.id === id)
+    ownedIds = new Set([id, ...(target?.group ? before.assistantThreads.filter((thread) => thread.groupParentId === id).map((thread) => thread.id) : [])])
+    const activeWork = before.assistantThreads.some((thread) => ownedIds.has(thread.id) && thread.busy)
+      || (!!target?.group && !!target.group.operation)
+      || (!!target?.group && runningGroupPhase(target.group.phase) && !target.group.paused)
+      || before.pendingPermissions.some((permission) => {
+        const threadId = permission.key.slice(permission.key.lastIndexOf('::') + 2)
+        return ownedIds.has(threadId)
+      })
+    if (activeWork) {
+      get().pushToast('warn', target?.group ? 'Stop or pause this Mesh before closing it.' : 'Stop this agent and resolve its approval before closing the session.')
+      return
+    }
     get().patchProject(owner, (s) => {
       const closing = s.assistantThreads.find((t) => t.id === id)
       const closingIds = new Set([
@@ -3447,6 +3659,8 @@ export const useKaisola = create<KaisolaState>()(
       const assistantRuntimes = { ...s.assistantRuntimes }
       const rawRuntime = assistantRuntimes[id]
       const runtime = rawRuntime ? { ...rawRuntime, archivePending: undefined } : undefined
+      const closedDraft = s.assistantDrafts[id]
+      const closedQueue = s.assistantPromptQueues[id]
       const pendingGroupTargets = closing?.group && runningGroupPhase(closing.group.phase)
         ? (closing.group.stageTargets ?? closing.group.members.map((member) => member.threadId)).filter((threadId) => {
             const receipt = s.assistantRuntimes[threadId]?.lastRun
@@ -3519,7 +3733,14 @@ export const useKaisola = create<KaisolaState>()(
               groupPromptQueues,
             }, ...s.closedStack].slice(0, 20)
           : closing && !closing.groupParentId
-            ? [{ kind: 'thread' as const, at: Date.now(), thread: { ...closing, busy: false }, runtime }, ...s.closedStack].slice(0, 20)
+            ? [{
+                kind: 'thread' as const,
+                at: Date.now(),
+                thread: { ...closing, busy: false, queuePaused: closedQueue?.length ? true : closing.queuePaused },
+                runtime,
+                ...(closedDraft ? { draft: closedDraft } : {}),
+                ...(closedQueue?.length ? { promptQueue: closedQueue } : {}),
+              }, ...s.closedStack].slice(0, 20)
             : s.closedStack,
         ...(grid.length
           ? gridState(grid)
@@ -3574,6 +3795,152 @@ export const useKaisola = create<KaisolaState>()(
         : thread),
     }))
   },
+  beginAssistantDispatch: (id, promptInput, shownText, opts, projectId) => {
+    const pid = projectId ?? get().activeProjectId
+    const prompt = normalizeAssistantDraft(promptInput)
+    if (!prompt.text.trim()) return undefined
+    let started: AssistantPendingDispatch | undefined
+    get().patchProject(pid, (sl) => {
+      const thread = sl.assistantThreads.find((candidate) => candidate.id === id)
+      const runtime = sl.assistantRuntimes[id] ?? { turns: [], first: true }
+      if (!thread || thread.busy || thread.queuePaused || runtime.pendingDispatch) return {}
+      const claimQueueIds = [...new Set((opts?.claimQueueIds ?? []).filter((value): value is string => typeof value === 'string' && !!value))]
+      const queue = sl.assistantPromptQueues[id] ?? []
+      if (claimQueueIds.length && (
+        claimQueueIds.length !== opts?.claimQueueIds?.length
+        || claimQueueIds.some((claimId) => !queue.some((queued) => queued.id === claimId))
+      )) return {}
+      const turnAt = Date.now()
+      const dispatchId = uid('dispatch')
+      const pendingDispatch: AssistantPendingDispatch = {
+        id: dispatchId,
+        turnAt,
+        turnText: shownText,
+        startedAt: turnAt,
+        first: runtime.first,
+        prompt,
+        restoreToDraft: opts?.restoreToDraft === true,
+      }
+      const assistantDrafts = { ...sl.assistantDrafts }
+      const previous = normalizeAssistantDraft(sl.assistantDrafts[id])
+      const expected = opts?.expectedDraft ? normalizeAssistantDraft(opts.expectedDraft) : undefined
+      const clearCapturedDraft = opts?.clearDraft && (!expected || assistantDraftsEqual(previous, expected))
+      if (clearCapturedDraft) {
+        const cleared = emptyAssistantDraft(previous.speed)
+        if (assistantDraftIsEmpty(cleared)) delete assistantDrafts[id]
+        else assistantDrafts[id] = cleared
+      }
+      const assistantPromptQueues = { ...sl.assistantPromptQueues }
+      if (claimQueueIds.length) {
+        const claimed = new Set(claimQueueIds)
+        const remaining = queue.filter((queued) => !claimed.has(queued.id))
+        if (remaining.length) assistantPromptQueues[id] = remaining
+        else delete assistantPromptQueues[id]
+      }
+      started = pendingDispatch
+      return {
+        assistantThreads: sl.assistantThreads.map((candidate) => candidate.id === id
+          ? { ...candidate, busy: true, lastActivityAt: turnAt }
+          : candidate),
+        assistantRuntimes: {
+          ...sl.assistantRuntimes,
+          [id]: {
+            ...runtime,
+            turns: [...runtime.turns, { kind: 'user' as const, text: shownText, at: turnAt, dispatchId }],
+            pendingDispatch,
+          },
+        },
+        ...(clearCapturedDraft ? { assistantDrafts } : {}),
+        ...(claimQueueIds.length ? { assistantPromptQueues } : {}),
+      }
+    })
+    return started
+  },
+  commitAssistantDispatch: (id, dispatchId, projectId) => {
+    const pid = projectId ?? get().activeProjectId
+    let committed = false
+    get().updateAssistantRuntime(id, (runtime) => {
+      if (runtime.pendingDispatch?.id !== dispatchId) return runtime
+      committed = true
+      const { pendingDispatch: _pending, ...rest } = runtime
+      return {
+        ...rest,
+        first: false,
+        turns: runtime.turns.map((turn) => {
+          if (turn.dispatchId !== dispatchId) return turn
+          const { dispatchId: _dispatch, ...committedTurn } = turn
+          return committedTurn
+        }),
+      }
+    }, pid)
+    return committed
+  },
+  rollbackAssistantDispatch: (id, dispatchId, opts, projectId) => {
+    const pid = projectId ?? get().activeProjectId
+    let recovery: AssistantDispatchRecovery = 'none'
+    get().patchProject(pid, (sl) => {
+      const thread = sl.assistantThreads.find((candidate) => candidate.id === id)
+      const runtime = sl.assistantRuntimes[id]
+      const pending = runtime?.pendingDispatch
+      if (!thread || !runtime || !pending || (dispatchId && pending.id !== dispatchId)) return {}
+
+      const assistantDrafts = { ...sl.assistantDrafts }
+      const assistantPromptQueues = { ...sl.assistantPromptQueues }
+      const currentDraft = normalizeAssistantDraft(sl.assistantDrafts[id])
+      const draftHasContent = !!currentDraft.text || currentDraft.attachments.length > 0 || currentDraft.mentions.length > 0
+      if (pending.restoreToDraft && !draftHasContent) {
+        assistantDrafts[id] = normalizeAssistantDraft(pending.prompt)
+        recovery = 'draft'
+      } else {
+        const recoveredId = `qp-${pending.id}`
+        const current = (sl.assistantPromptQueues[id] ?? []).filter((queued) => queued.id !== recoveredId)
+        assistantPromptQueues[id] = [{
+          ...normalizeAssistantDraft(pending.prompt),
+          id: recoveredId,
+          queuedAt: Date.now(),
+        }, ...current]
+        recovery = 'queue'
+      }
+
+      const { pendingDispatch: _pending, ...rest } = runtime
+      const message = opts?.message ?? 'Stopped before the prompt was sent.'
+      const orchestration = pending.prompt.orchestration
+      return {
+        assistantThreads: sl.assistantThreads.map((candidate) => candidate.id === id
+          ? {
+              ...candidate,
+              busy: false,
+              queuePaused: opts?.pauseQueue || recovery === 'queue' ? true : candidate.queuePaused,
+              lastActivityAt: Date.now(),
+            }
+          : candidate),
+        assistantRuntimes: {
+          ...sl.assistantRuntimes,
+          [id]: {
+            ...rest,
+            turns: runtime.turns.filter((turn) => turn.dispatchId !== pending.id),
+            first: pending.first,
+            thinkStart: undefined,
+            lastRun: {
+              ...(orchestration ? {
+                attemptId: orchestration.attemptId,
+                groupId: orchestration.groupId,
+                phase: orchestration.phase,
+              } : {}),
+              startedAt: pending.startedAt,
+              finishedAt: Date.now(),
+              ok: false,
+              stopReason: opts?.stopReason ?? 'cancelled',
+              message,
+            },
+          },
+        },
+        assistantDrafts,
+        assistantPromptQueues,
+      }
+    })
+    return recovery
+  },
   updateAssistantRuntime: (id, fn, projectId) => {
     const pid = projectId ?? get().activeProjectId
     const slice = projectFields(get(), pid)
@@ -3583,7 +3950,7 @@ export const useKaisola = create<KaisolaState>()(
     const current = slice.assistantRuntimes[id] ?? { turns: [], first: true }
     let next = fn(current)
     let job: { scope: { projectId: string; threadId: string; epoch?: string }; batchId: string; count: number; turns: AssistantTurn[] } | null = null
-    if (assistantLiveStartIndex(next.turns) > 0 && !next.archivePending && bridge.assistantArchive) {
+    if (!next.pendingDispatch && assistantLiveStartIndex(next.turns) > 0 && !next.archivePending && bridge.assistantArchive) {
       const available = assistantLiveStartIndex(next.turns)
       const retryCount = next.archiveBatch?.count
       const count = retryCount && retryCount <= available ? retryCount : assistantArchiveBatchCount(next.turns)
@@ -3675,15 +4042,18 @@ export const useKaisola = create<KaisolaState>()(
   },
   enqueueAssistantPrompt: (id, prompt, opts, projectId) => {
     const queued: QueuedAssistantPrompt = { ...normalizeAssistantDraft(prompt), id: uid('qp'), queuedAt: Date.now() }
-    if (!queued.text.trim()) return queued.id
+    if (!queued.text.trim()) return undefined
     const pid = projectId ?? get().activeProjectId
+    let accepted = false
     get().patchProject(pid, (sl) => {
       // A cooperative cancellation can settle just after its session was
       // permanently deleted. Never resurrect an orphan outbox for a thread
       // that no longer belongs to the project slice.
       if (!sl.assistantThreads.some((thread) => thread.id === id)) return {}
       const current = sl.assistantPromptQueues[id] ?? []
-      const next = opts?.front ? [queued, ...current].slice(0, 20) : [...current, queued].slice(-20)
+      const next = addQueuedPrompt(current, queued, { front: opts?.front, preserveAccepted: opts?.preserveAccepted })
+      if (!next) return {}
+      accepted = true
       return {
         assistantPromptQueues: { ...sl.assistantPromptQueues, [id]: next },
         ...(opts?.resume === false ? {} : {
@@ -3693,7 +4063,7 @@ export const useKaisola = create<KaisolaState>()(
         }),
       }
     })
-    return queued.id
+    return accepted ? queued.id : undefined
   },
   dequeueAssistantPrompt: (id, projectId) => {
     const pid = projectId ?? get().activeProjectId
@@ -3721,14 +4091,16 @@ export const useKaisola = create<KaisolaState>()(
     })
     return queue
   },
-  removeQueuedAssistantPrompt: (id, promptId) =>
-    set((s) => {
-      const rest = (s.assistantPromptQueues[id] ?? []).filter((p) => p.id !== promptId)
-      const assistantPromptQueues = { ...s.assistantPromptQueues }
+  removeQueuedAssistantPrompt: (id, promptId, projectId) => {
+    const pid = projectId ?? get().activeProjectId
+    get().patchProject(pid, (sl) => {
+      const rest = (sl.assistantPromptQueues[id] ?? []).filter((p) => p.id !== promptId)
+      const assistantPromptQueues = { ...sl.assistantPromptQueues }
       if (rest.length) assistantPromptQueues[id] = rest
       else delete assistantPromptQueues[id]
       return { assistantPromptQueues }
-    }),
+    })
+  },
   reorderAssistantThreads: (srcId, destId) =>
     set((s) => {
       if (srcId === destId) return s
@@ -3747,6 +4119,14 @@ export const useKaisola = create<KaisolaState>()(
   setSettingsOpen: (open, pane) => set({ settingsOpen: open, settingsPane: open ? pane ?? null : null }),
   setAgentPreset: (id) => set({ agentPreset: id }),
   setWorkspace: (path) => {
+    const current = get().workspacePath
+    // The monolithic native smoke harness deliberately rotates one renderer
+    // through disposable fixture repos. Production never gets that flag and
+    // retains the one-project/one-workspace identity boundary.
+    if (path && current && path !== current && !bridge.smoke) {
+      get().pushToast('info', 'A project keeps one workspace so agent sessions cannot drift between folders. Open the other folder in a new project tab.')
+      return
+    }
     // a new folder gets a fresh LaTeX read: mode off, auto-detect re-armed;
     // the active tab's label + accent follow the folder, and it joins recents.
     set((s) => ({
@@ -4337,6 +4717,13 @@ export const useKaisola = create<KaisolaState>()(
   },
 
   receiveMcpProposal: (ev) => {
+    // Main routes MCP proposals only to windows persisting the exact project;
+    // validate again at the mutation boundary. This remains correct while a
+    // project is in a background tab or has moved to another OS window.
+    const owner = get()
+    const tab = owner.projectTabs.find((candidate) => candidate.id === ev.projectId)
+    const slice = ev.projectId === owner.activeProjectId ? owner : owner.projectSlices[ev.projectId]
+    if (!tab || !slice || tab.workspacePath !== ev.workspace || slice.workspacePath !== ev.workspace) return false
     const a = ev.args ?? {}
     const str = (v: unknown, cap = 4000) => (typeof v === 'string' ? v.slice(0, cap) : '')
     const from = str(a.from, 60)
@@ -4344,7 +4731,7 @@ export const useKaisola = create<KaisolaState>()(
     if (ev.kind === 'hypothesis') {
       const title = str(a.title, 200)
       const claim = str(a.claim)
-      if (!title || !claim) return
+      if (!title || !claim) return false
       const entity: Hypothesis = {
         id: uid('hyp'), title, claim,
         why: str(a.why), mvp: str(a.mvp),
@@ -4361,7 +4748,7 @@ export const useKaisola = create<KaisolaState>()(
       }
     } else if (ev.kind === 'claim') {
       const label = str(a.label, 300)
-      if (!label) return
+      if (!label) return false
       const nodeTypes = ['claim', 'method', 'dataset', 'metric', 'result', 'limitation', 'assumption', 'question', 'contradiction']
       const type = nodeTypes.includes(str(a.type, 30)) ? (str(a.type, 30) as GraphNode['type']) : 'claim'
       const entity: GraphNode = {
@@ -4376,11 +4763,27 @@ export const useKaisola = create<KaisolaState>()(
         evidence: [], status: 'pending', createdAt: nowISO(),
       }
     }
-    if (!proposal) return
+    if (!proposal) return false
     const p = proposal
-    set((s) => ({ project: { ...s.project, proposals: [...s.project.proposals, p] } }))
-    get().pushActivity(p.agentId, `${from || 'An agent'} submitted “${trim(p.title)}” for review (MCP).`, p.id)
-    get().pushToast('info', `${from || 'An agent'} proposed: ${trim(p.title)} — review to apply.`)
+    const text = `${from || 'An agent'} submitted “${trim(p.title)}” for review (MCP).`
+    get().patchProject(
+      ev.projectId,
+      (current) => ({
+        project: {
+          ...current.project,
+          proposals: [...(current.project.proposals ?? []), p],
+          activity: [
+            { id: uid('act'), agentId: p.agentId, state: 'done', text, at: nowISO(), proposalId: p.id },
+            ...(current.project.activity ?? []),
+          ],
+        },
+      }),
+      'needs-you',
+    )
+    if (ev.projectId === get().activeProjectId) {
+      get().pushToast('info', `${from || 'An agent'} proposed: ${trim(p.title)} — review to apply.`)
+    }
+    return true
   },
 
   proposeWorktreeSession: async (sessionId) => {
@@ -5043,7 +5446,19 @@ export const useKaisola = create<KaisolaState>()(
         ...sl.project,
         runs: sl.project.runs.map((r) =>
           r.id === runId
-            ? { ...r, status: res.ok ? 'done' : 'failed', endedAt: nowISO(), summary: res.ok ? 'Completed in the sandbox.' : res.message ?? `Exited ${res.code}` }
+            ? {
+                ...r,
+                status: res.ok ? 'done' : 'failed',
+                endedAt: nowISO(),
+                summary: res.ok ? 'Completed in the sandbox.' : res.message ?? `Exited ${res.code}`,
+                ...(res.outputDir ? { artifacts: [...r.artifacts, {
+                  id: uid('artifact'),
+                  type: 'file' as const,
+                  name: 'Sandbox working copy and outputs',
+                  path: res.outputDir,
+                  createdAt: nowISO(),
+                }] } : {}),
+              }
             : r,
         ),
         attempts: attemptId
@@ -5211,25 +5626,30 @@ export const useKaisola = create<KaisolaState>()(
     const ws = slice.workspacePath
     // 1) running-work confirm (skipped on force)
     if (!opts?.force) {
+      const liveAgentWork = slice.assistantThreads.some((thread) =>
+        thread.busy || (!!thread.group?.operation) || (!!thread.group && runningGroupPhase(thread.group.phase) && !thread.group.paused),
+      )
+      if (liveAgentWork || slice.pendingPermissions.length > 0) {
+        get().pushToast('warn', 'Stop active agents and resolve approvals before closing this project.')
+        return
+      }
       const running = slice.terminals.some((t) => s.terminalMeta[t.id]?.running)
       const dirty = isActive ? s.fileDirty : false // background fileDirty was reset on switch
       const unsaved = !!ws && Object.keys(s.unsavedBuffers).some((p) => p === ws || p.startsWith(`${ws}/`))
       const busy = running || slice.agentTerminals.length > 0 || slice.agentQueueRunning || dirty || unsaved
       if (busy && !window.confirm('This project has running agents or unsaved files. Close anyway?')) return
     }
-    // 2/3) grace-kill its ptys with the same 60s token guard as closeTerminal —
-    // skip any that a pop-out window currently owns (risk #4).
+    // 2/3) Grace-release every project PTY in the detached broker, including a
+    // pop-out. Reopening/reattaching cancels the timer; closing a pop after its
+    // source project no longer exists can therefore never orphan the process.
     for (const t of slice.terminals) {
-      if (poppedTerms.has(t.id)) continue
       const tid = t.id
-      const token = (termCloseTokens.get(tid) ?? 0) + 1
-      termCloseTokens.set(tid, token)
-      window.setTimeout(() => {
-        if (termCloseTokens.get(tid) !== token) return // a newer close/reopen owns it now
-        termCloseTokens.delete(tid)
-        if (terminalOwnerMap(get())[tid]) return // re-adopted by some tab (reopened)
-        void bridge.terminal.kill(tid)
-      }, 60_000)
+      forgetMountedTerminal(tid)
+      void bridge.terminal.scheduleRelease(tid, id, 60_000).catch(() => {
+        window.setTimeout(() => {
+          if (!terminalOwnerMap(get())[tid]) void bridge.terminal.kill(tid, id).catch(() => {})
+        }, 60_000)
+      })
     }
     // 4/5) drop the tab + slice; push undo; re-home if it was active.
     set((st) => {
@@ -5269,9 +5689,8 @@ export const useKaisola = create<KaisolaState>()(
       const top = tabId ? s.closedProjectStack.find((c) => c.tab.id === tabId) : s.closedProjectStack[0]
       if (!top) return s
       const rest = s.closedProjectStack.filter((c) => c !== top)
-      // cancel the pending grace-kills so live ptys re-attach (bump token → the
-      // stale timer no-ops); restart-flagged terminals reboot after the grace.
-      for (const t of top.slice.terminals) termCloseTokens.set(t.id, (termCloseTokens.get(t.id) ?? 0) + 1)
+      // Cancel broker-owned grace releases before the restored cards attach.
+      for (const t of top.slice.terminals) void bridge.terminal.cancelRelease(t.id, top.tab.id).catch(() => {})
       const outgoing = pick(s, PROJECT_SLICE_MEMORY_KEYS)
       const tab = { ...top.tab, activity: undefined }
       const target: ProjectSliceMemory = { ...freshSlice(tab.id), ...top.slice } // persist slice + memory defaults
@@ -5300,7 +5719,14 @@ export const useKaisola = create<KaisolaState>()(
     // ADOPT_BOOT deliberately skips rehydrating a possibly stale slot. Carry a
     // capped/sanitized copy of the real global preferences so its first frame
     // does not fall back to the default theme, glass mode, or terminal styling.
-    const globals = pickGlobals(persistSnapshot(s) as unknown as Record<string, unknown>) as Record<string, unknown>
+    const globals = scopeProjectTransferGlobals(
+      pickGlobals(persistSnapshot(s) as unknown as Record<string, unknown>) as Record<string, unknown>,
+      slice.workspacePath,
+      [
+        ...slice.terminals.map((terminal) => terminal.id),
+        ...slice.closedStack.filter((closed) => closed.kind === 'term').map((closed) => (closed as { term: { id: string } }).term.id),
+      ],
+    )
     const r = await bridge.windows.detachProject({
       tab: { ...tab, activity: undefined },
       slice: sanitizeSliceForPersist(slice),
@@ -5354,6 +5780,7 @@ export const useKaisola = create<KaisolaState>()(
         ...resetEphemeralCursors(),
       }
     })
+    if (removed) flushPersistSync()
     // Chrome closes a detached one-tab window once that tab lands back in an
     // existing window. Clear the throwaway slot first so restart cannot revive
     // a ghost copy; main closes only after this explicit source-side commit.
@@ -5366,22 +5793,24 @@ export const useKaisola = create<KaisolaState>()(
     const rawTab = payload?.tab
     const slice = payload?.slice
     if (!rawTab?.id || !slice) return false
-    // pop-out immunity carried over from the origin window
-    for (const tid of payload.popped ?? []) poppedTerms.add(tid)
     const takeBootGlobals = adoptBootGlobalsPending
-    if (takeBootGlobals) adoptBootGlobalsPending = false
     const pre = get()
     // a pristine boot (this window's lone empty launcher tab) is REPLACED,
     // Chrome-style — but its seeded terminal already spawned a real pty, and
     // dropping the tab without killing it would leak one shell per tear-off
     const preLone = pre.projectTabs.length === 1 ? pre.projectTabs[0] : null
     const prePristine = !!preLone && !preLone.workspacePath && !pre.workspacePath && pre.assistantThreads.length <= 1 && pre.terminals.length <= 1
+    if (!prePristine && projectTransferDataConflict(pre as unknown as Record<string, unknown>, payload.globals)) return false
+    if (takeBootGlobals) adoptBootGlobalsPending = false
+    // pop-out immunity carried over from the origin window only after every
+    // rejectable data-integrity check has passed.
+    for (const tid of payload.popped ?? []) poppedTerms.add(tid)
     const doomed = prePristine ? pre.terminals.filter((t) => !poppedTerms.has(t.id)).map((t) => t.id) : []
     let adopted = false
     set((s) => {
       if (s.projectTabs.some((t) => t.id === rawTab.id)) { adopted = true; return s } // idempotent ACK
-      // parity with reopen: cancel any pending grace-kills on these ptys
-      for (const t of slice.terminals ?? []) termCloseTokens.set(t.id, (termCloseTokens.get(t.id) ?? 0) + 1)
+      // Parity with reopen: adoption is an explicit keep-alive decision.
+      for (const t of slice.terminals ?? []) void bridge.terminal.cancelRelease(t.id, rawTab.id).catch(() => {})
       const tab = { ...rawTab, activity: undefined }
       const target: ProjectSliceMemory = { ...freshSlice(tab.id), ...slice }
       const globalPatch = globalsForAdoption(s, payload.globals, takeBootGlobals)
@@ -5411,7 +5840,7 @@ export const useKaisola = create<KaisolaState>()(
         ...resetEphemeralCursors(),
       }
     })
-    for (const tid of doomed) void bridge.terminal.kill(tid)
+    for (const tid of doomed) void bridge.terminal.kill(tid, pre.activeProjectId).catch(() => {})
     if (takeBootGlobals && adopted) {
       const after = get()
       document.documentElement.dataset.theme = after.theme

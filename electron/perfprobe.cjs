@@ -113,12 +113,12 @@ app.whenReady().then(async () => {
     // claude-shaped load: a ~10-line block redraw at ~12fps, not a one-cell
     // spinner — the TUI repaints its whole status/composer area per frame
     const spinner = `while :; do printf '\\033[H'; for i in 1 2 3 4 5 6 7 8 9 10; do printf '── streaming line %s %s ──────────────────────\\033[K\\n' "$i" "$RANDOM"; done; sleep 0.08; done\n`
-    await js(`window.kaisola.terminal.write(${JSON.stringify(termId)}, ${JSON.stringify(spinner)})`)
+    await js(`window.kaisola.terminal.write(${JSON.stringify(termId)}, ${JSON.stringify(spinner)}, window.__kaisola.getState().activeProjectId)`)
   }
   await wait(1500)
-  const len1 = termId ? await js(`window.kaisola.terminal.snapshot(${JSON.stringify(termId)}).then((snapshot) => snapshot.output.length)`) : 0
+  const len1 = termId ? await js(`window.kaisola.terminal.snapshot(${JSON.stringify(termId)}, window.__kaisola.getState().activeProjectId).then((snapshot) => snapshot.output.length)`) : 0
   await wait(1000)
-  const len2 = termId ? await js(`window.kaisola.terminal.snapshot(${JSON.stringify(termId)}).then((snapshot) => snapshot.output.length)`) : 0
+  const len2 = termId ? await js(`window.kaisola.terminal.snapshot(${JSON.stringify(termId)}, window.__kaisola.getState().activeProjectId).then((snapshot) => snapshot.output.length)`) : 0
   console.log(`PROBE_READY variant=${variant} pid=${process.pid} solid=${solidWindow} material=${material} term=${termId || 'NONE'} spinner=${len2 > len1 ? 'FLOWING' : 'STALLED'} (+${len2 - len1}b/s)`)
   const samples = []
   for (let i = 0; i < 8; i++) {

@@ -24,6 +24,7 @@ import { Markdown } from './Markdown'
 import { ProviderIcon } from './ProviderIcon'
 import { stageMeta } from '../lib/stages'
 import { clockTime, workedTime } from '../lib/format'
+import { isCurrentMeshOrchestration } from '../lib/meshPolicy'
 import type { Paper } from '../domain/types'
 
 type Turn = AssistantTurn
@@ -159,6 +160,19 @@ const mergeQueuedPrompts = (queue: QueuedAssistantPrompt[]): AssistantDraft => {
     speed: queue[queue.length - 1]?.speed ?? 'default',
     ...(oneAttempt ? { orchestration } : {}),
   }
+}
+
+/** Merge only one queue provenance at a time. In particular, a retry attempt
+ * must never coalesce with the stopped Mesh attempt immediately ahead of it. */
+const nextQueuedDispatchBatch = (queue: QueuedAssistantPrompt[]): QueuedAssistantPrompt[] => {
+  const first = queue[0]
+  if (!first) return []
+  const marker = first.orchestration
+  const compatible = (prompt: QueuedAssistantPrompt) => marker
+    ? prompt.orchestration?.groupId === marker.groupId && prompt.orchestration?.attemptId === marker.attemptId && prompt.orchestration?.phase === marker.phase
+    : !prompt.orchestration
+  const end = queue.findIndex((prompt) => !compatible(prompt))
+  return end < 0 ? queue : queue.slice(0, end)
 }
 const SPEED_OPTIONS = [
   { value: 'default', name: 'Default' },
@@ -742,6 +756,9 @@ export const Assistant = memo(function Assistant({ threadId }: { threadId: strin
   const setThreadPreferredModel = useKaisola((s) => s.setThreadPreferredModel)
   const setThreadPermissionMode = useKaisola((s) => s.setThreadPermissionMode)
   const setThreadQueuePaused = useKaisola((s) => s.setThreadQueuePaused)
+  const beginAssistantDispatch = useKaisola((s) => s.beginAssistantDispatch)
+  const commitAssistantDispatch = useKaisola((s) => s.commitAssistantDispatch)
+  const rollbackAssistantDispatch = useKaisola((s) => s.rollbackAssistantDispatch)
   const agentTerminals = useKaisola((s) => s.agentTerminals)
   const terminalMeta = useKaisola((s) => s.terminalMeta)
   const setDockView = useKaisola((s) => s.setDockView)
@@ -750,6 +767,11 @@ export const Assistant = memo(function Assistant({ threadId }: { threadId: strin
   const [agents, setAgents] = useState<AcpAgent[]>([])
   const [statusReadyKey, setStatusReadyKey] = useState('')
   const autoConnectAttemptRef = useRef<string | null>(null)
+  // A renderer-local dispatch generation closes the gap between the visible
+  // Stop button and the main process receiving session/prompt. Any awaited
+  // preprocessing must still own this generation immediately before dispatch.
+  const dispatchEpochRef = useRef(0)
+  const providerSwitchRef = useRef(false)
   const modelApplyAttemptRef = useRef<string | null>(null)
   const modelApplyRetriesRef = useRef<{ key: string; count: number }>({ key: '', count: 0 })
   // mirrors awaitingAuth so the window-focus reconnect listener (a stable
@@ -786,7 +808,6 @@ export const Assistant = memo(function Assistant({ threadId }: { threadId: strin
   const setAssistantDraft = useKaisola((s) => s.setAssistantDraft)
   const clearAssistantDraft = useKaisola((s) => s.clearAssistantDraft)
   const enqueueAssistantPrompt = useKaisola((s) => s.enqueueAssistantPrompt)
-  const takeAssistantPromptQueue = useKaisola((s) => s.takeAssistantPromptQueue)
   const removeQueuedAssistantPrompt = useKaisola((s) => s.removeQueuedAssistantPrompt)
   const agentKey = active.agentKey
   const claudeConfigDir = claudeAccounts.find((account) => account.id === claudeAccountId)?.configDir ?? null
@@ -1001,7 +1022,25 @@ export const Assistant = memo(function Assistant({ threadId }: { threadId: strin
     let live = true
     void Promise.allSettled([bridge.acp.status([connectionKey], projectId), bridge.acp.presets()]).then(([statusResult, presetResult]) => {
       if (!live) return
-      if (statusResult.status === 'fulfilled') setAgents(statusResult.value.agents)
+      if (statusResult.status === 'fulfilled') {
+        setAgents(statusResult.value.agents)
+        const adopted = statusResult.value.agents.find((agent) => agent.key === connectionKey)
+        const persistedBusy = owningSlice()?.assistantThreads.find((candidate) => candidate.id === active.id)?.busy
+        // After a renderer relaunch the request-specific stream listener no
+        // longer exists. Do not leave an invisible provider turn or permission
+        // gate alive: fail closed, pause delivery, and reconnect the resumable
+        // provider session on the user's next send.
+        if (adopted?.busy && !persistedBusy) {
+          dispatchEpochRef.current++
+          setThreadQueuePaused(active.id, true, projectId)
+          setNotice('A turn was interrupted by the app restart and was safely stopped. Send again to resume this session.')
+          void (async () => {
+            await bridge.acp.cancel(connectionKey, projectId).catch(() => ({ ok: false }))
+            await bridge.acp.disconnect(connectionKey, projectId).catch(() => ({ ok: false }))
+            if (live) setAgents((current) => current.filter((agent) => agent.key !== connectionKey))
+          })()
+        }
+      }
       if (presetResult.status === 'fulfilled') setPresets(presetResult.value)
       // Autoconnect must not race status: an idle connection may already be
       // alive in main after a renderer remount/window swap.
@@ -1527,16 +1566,39 @@ export const Assistant = memo(function Assistant({ threadId }: { threadId: strin
   })
   const drainingQueueRef = useRef(false)
   const queuePausedRef = useRef(queuePaused)
+  // If this card mounts with an uncommitted transaction, the prior renderer
+  // disappeared during preflight. Recover once; transactions started by this
+  // mounted instance have no boot marker and are left alone.
+  const bootPendingDispatchRef = useRef(arun.pendingDispatch?.id)
   const setQueuePaused = (paused: boolean) => {
     queuePausedRef.current = paused
     setThreadQueuePaused(active.id, paused, projectId)
   }
   useEffect(() => { queuePausedRef.current = queuePaused }, [queuePaused])
+  useEffect(() => {
+    const dispatchId = bootPendingDispatchRef.current
+    if (!dispatchId) return
+    bootPendingDispatchRef.current = undefined
+    const recovery = rollbackAssistantDispatch(active.id, dispatchId, {
+      message: 'Recovered a prompt that stopped before it was sent.',
+      pauseQueue: true,
+    }, projectId)
+    if (recovery !== 'none') {
+      queuePausedRef.current = true
+      setNotice(recovery === 'draft'
+        ? 'Your unsent prompt was restored after the interrupted preflight.'
+        : 'Your unsent prompt was restored to the paused queue.')
+    }
+  }, [active.id, projectId, rollbackAssistantDispatch])
   const queuePrompt = (prompt: AssistantDraft) => {
     if (!prompt.text.trim()) return
-    // A fresh user enqueue is an explicit resume after Stop/a delivery error.
+    const queuedId = enqueueAssistantPrompt(active.id, prompt, undefined, projectId)
+    if (!queuedId) {
+      setNotice('The queue is full. Let one prompt run or delete one before adding another.')
+      return
+    }
+    // A successfully accepted user enqueue is an explicit resume after Stop.
     setQueuePaused(false)
-    enqueueAssistantPrompt(active.id, prompt, undefined, projectId)
     clearAssistantDraft(active.id, { keepSpeed: true }, projectId)
     resetComposerHeight()
   }
@@ -1546,52 +1608,85 @@ export const Assistant = memo(function Assistant({ threadId }: { threadId: strin
     // A turn in flight → the message QUEUES (the button says so). Each queued
     // row carries an explicit Steer action for injecting it mid-turn; sending
     // must never steer on its own — that made "queue" silently mean "send now".
-    if (busy) {
+    if (busy || queuedPrompts.length > 0) {
       queuePrompt(prompt); return
     }
     setQueuePaused(false)
-    void sendText(prompt, { clearDraft: true, restoreOnFailure: true })
+    void sendText(prompt, { clearDraft: true, restoreOnFailure: true, expectedDraft: prompt })
   }
   /** Deliver a follow-up into the running turn (mid-turn steer). The user turn
    * is appended optimistically and the agent's steered reply streams after it on
    * the active turn's channel. On refusal (turn ended, or the agent can't queue
    * after all) it rolls back and falls back to the normal queue. */
-  const steerText = async (prompt: AssistantDraft) => {
+  const steeringIdsRef = useRef(new Set<string>())
+  const steerText = async (prompt: QueuedAssistantPrompt) => {
+    if (steeringIdsRef.current.has(prompt.id)) return
+    steeringIdsRef.current.add(prompt.id)
     const text = prompt.text.trim().slice(0, ASSISTANT_DRAFT_TEXT_LIMIT)
-    if (!text) return
+    if (!text) { steeringIdsRef.current.delete(prompt.id); return }
     const threadId = active.id
     const files = prompt.attachments
     const mns = prompt.mentions
     const refLine = [...mns.map((m) => `@${m.label}`), ...files.map((f) => `📎 ${f.split('/').pop() ?? ''}`)].join('  ·  ')
     const shownText = refLine ? `${text}\n\n${refLine}` : text
-    const userTurn: Turn = { kind: 'user', text: shownText, at: Date.now() }
-    updateRuntime(threadId, (r) => ({ ...r, turns: [...r.turns, userTurn] }))
     const mentionPrefix = mns.length ? `Referenced from the research project (use if relevant):\n${mns.map((m) => `- ${m.text}`).join('\n')}\n\n` : ''
     const filePrefix = files.length ? `Attached files (read them if relevant):\n${files.join('\n')}\n\n` : ''
-    const images = (
-      await Promise.all(
-        files
-          .filter((f) => /\.(png|jpe?g|gif|webp)$/i.test(f))
-          .map(async (f) => {
-            const r = await bridge.fs.readImage(f)
-            return r.ok && r.data && r.mimeType ? { mimeType: r.mimeType, data: r.data } : null
+    const steerEpoch = dispatchEpochRef.current
+    const steerStillCurrent = () => {
+      const owner = owningSlice()
+      const current = owner?.assistantThreads.find((candidate) => candidate.id === threadId)
+      const queued = owner?.assistantPromptQueues[threadId]?.some((candidate) => candidate.id === prompt.id)
+      return dispatchEpochRef.current === steerEpoch && !!current?.busy && !current.queuePaused && current.agentKey === agentKey && !!queued
+    }
+    try {
+      const images = (
+        await Promise.all(
+          files
+            .filter((f) => /\.(png|jpe?g|gif|webp)$/i.test(f))
+            .map(async (f) => {
+              const r = await bridge.fs.readImage(f)
+              return r.ok && r.data && r.mimeType ? { mimeType: r.mimeType, data: r.data } : null
+            }),
+        )
+      ).filter((i): i is { mimeType: string; data: string } => i !== null)
+      // The durable queue row is still present. Stop can therefore win this
+      // preflight without any local-only prompt state to lose.
+      if (!steerStillCurrent()) return
+      const dispatchId = `steer-${globalThis.crypto?.randomUUID?.() ?? `${Date.now()}-${Math.random()}`}`
+      const userTurn: Turn = { kind: 'user', text: shownText, at: Date.now(), dispatchId }
+      updateRuntime(threadId, (runtime) => ({ ...runtime, turns: [...runtime.turns, userTurn] }))
+      let res: { ok: boolean; message?: string }
+      try {
+        res = await bridge.acp.steer(connectionKey, `${mentionPrefix}${filePrefix}${text}`, images.length ? images : undefined, projectId)
+      } catch (error) {
+        res = { ok: false, message: String((error as Error)?.message ?? error) }
+      }
+      if (res.ok) {
+        removeQueuedAssistantPrompt(threadId, prompt.id, projectId)
+        updateRuntime(threadId, (runtime) => ({
+          ...runtime,
+          turns: runtime.turns.map((turn) => {
+            if (turn.dispatchId !== dispatchId) return turn
+            const { dispatchId: _dispatch, ...committed } = turn
+            return committed
           }),
-      )
-    ).filter((i): i is { mimeType: string; data: string } => i !== null)
-    const res = await bridge.acp.steer(connectionKey, `${mentionPrefix}${filePrefix}${text}`, images.length ? images : undefined, projectId)
-    if (!res.ok) {
-      // the turn ended between the busy check and delivery (noTurn), or the
-      // agent can't queue after all — undo the optimistic turn and enqueue it so
-      // the normal drain sends it as the next turn (nothing is lost)
-      updateRuntime(threadId, (r) => (r.turns[r.turns.length - 1] === userTurn ? { ...r, turns: r.turns.slice(0, -1) } : r))
-      setQueuePaused(false)
-      enqueueAssistantPrompt(threadId, prompt, undefined, projectId)
+        }))
+      } else {
+        updateRuntime(threadId, (runtime) => ({ ...runtime, turns: runtime.turns.filter((turn) => turn.dispatchId !== dispatchId) }))
+        if (res.message && steerStillCurrent()) setNotice(res.message)
+      }
+    } catch (error) {
+      // Image preparation failed before provider delivery. Keep the original
+      // row exactly where it is; Stop may already have paused that queue.
+      if (steerStillCurrent()) setNotice(String((error as Error)?.message ?? 'The queued attachment could not be prepared.'))
+    } finally {
+      steeringIdsRef.current.delete(prompt.id)
     }
   }
   /** The composer's send, callable with explicit text (the ⌘L bar uses it). */
   const sendText = async (
     promptOrText: string | AssistantDraft,
-    opts: { clearDraft?: boolean; restoreOnFailure?: boolean } = {},
+    opts: { clearDraft?: boolean; restoreOnFailure?: boolean; expectedDraft?: AssistantDraft; claimQueueIds?: string[] } = {},
   ): Promise<boolean> => {
     const rawPrompt: AssistantDraft =
       typeof promptOrText === 'string'
@@ -1600,8 +1695,18 @@ export const Assistant = memo(function Assistant({ threadId }: { threadId: strin
     const wasTrimmed = rawPrompt.text.length > ASSISTANT_DRAFT_TEXT_LIMIT
     const prompt: AssistantDraft = { ...rawPrompt, text: rawPrompt.text.slice(0, ASSISTANT_DRAFT_TEXT_LIMIT) }
     if (!prompt.text) return false
+    // Queued Mesh work is scoped to one durable stage attempt. Treat an old
+    // attempt as already handled so the queue drain never restores it after a
+    // Stop -> Continue retry minted a replacement.
+    const meshAttemptIsCurrent = () => isCurrentMeshOrchestration(prompt.orchestration, owningSlice()?.assistantThreads ?? [])
+    const discardClaimedStaleAttempt = () => {
+      for (const promptId of opts.claimQueueIds ?? []) removeQueuedAssistantPrompt(active.id, promptId, projectId)
+    }
+    if (!meshAttemptIsCurrent()) { discardClaimedStaleAttempt(); return true }
+    if (providerSwitchRef.current) return false
     if (owningSlice()?.assistantThreads.find((t) => t.id === active.id)?.busy) return false
     if (!(await ensureAgentConnected())) return false
+    if (!meshAttemptIsCurrent()) { discardClaimedStaleAttempt(); return true }
     if (owningSlice()?.assistantThreads.find((t) => t.id === active.id)?.queuePaused) return false
     if (wasTrimmed) setNotice(`Message limited to ${ASSISTANT_DRAFT_TEXT_LIMIT.toLocaleString()} characters to keep the IDE responsive. Attach long material as a file to preserve it in full.`)
     const threadId = active.id
@@ -1613,15 +1718,31 @@ export const Assistant = memo(function Assistant({ threadId }: { threadId: strin
       if (liveMode) setThreadPermissionMode(threadId, liveMode, projectId)
     }
     if (owningSlice()?.assistantThreads.find((t) => t.id === threadId)?.busy) return false
-    const first = (owningSlice()?.assistantRuntimes[threadId] ?? arun).first
+    if (providerSwitchRef.current) return false
     const files = prompt.attachments
     const mns = prompt.mentions
     const refLine = [...mns.map((m) => `@${m.label}`), ...files.map((f) => `📎 ${f.split('/').pop() ?? ''}`)].join('  ·  ')
     const shownText = refLine ? `${prompt.text}\n\n${refLine}` : prompt.text
-    autoNameThread(threadId, prompt.text, projectId) // first message → the session's topic title
-    const userTurn: Turn = { kind: 'user', text: shownText, at: Date.now() }
-    updateRuntime(threadId, (r) => ({ ...r, turns: [...r.turns, userTurn], first: false }))
-    setThreadBusy(threadId, true, projectId)
+    const dispatchEpoch = ++dispatchEpochRef.current
+    // This single store transaction is the durable preflight boundary: Stop,
+    // Close, persistence, and the transcript can never observe a cleared draft
+    // without also knowing exactly how to restore its optimistic user row.
+    const pendingDispatch = beginAssistantDispatch(threadId, prompt, shownText, {
+      clearDraft: opts.clearDraft,
+      restoreToDraft: opts.restoreOnFailure,
+      expectedDraft: opts.expectedDraft,
+      claimQueueIds: opts.claimQueueIds,
+    }, projectId)
+    // A queue claim can lose only to another synchronous queue/store action.
+    // The authoritative rows therefore remain durable and need no local retry.
+    if (!pendingDispatch) return !!opts.claimQueueIds?.length
+    const first = pendingDispatch.first
+    const userTurn: Turn = {
+      kind: 'user',
+      text: pendingDispatch.turnText,
+      at: pendingDispatch.turnAt,
+      dispatchId: pendingDispatch.id,
+    }
     // per-prompt checkpoint (Claude Code's /rewind grammar): snap the working
     // tree BEFORE the agent acts, attach the id to this turn — the turn rail
     // grows a "Restore files" affordance. Non-blocking: the snapshot races the
@@ -1632,31 +1753,62 @@ export const Assistant = memo(function Assistant({ threadId }: { threadId: strin
         if (!ckpt) return
         updateRuntime(threadId, (r) => ({
           ...r,
-          turns: r.turns.map((x) => (x.kind === 'user' && x.at === turnAt ? { ...x, checkpointId: ckpt.id } : x)),
+          turns: r.turns.map((x) => (x.kind === 'user' && x.at === turnAt && (!x.dispatchId || x.dispatchId === pendingDispatch.id) ? { ...x, checkpointId: ckpt.id } : x)),
         }))
       })
     }
     if (opts.clearDraft) {
-      clearAssistantDraft(threadId, { keepSpeed: true }, projectId)
       resetComposerHeight()
     }
     const mentionPrefix = mns.length ? `Referenced from the research project (use if relevant):\n${mns.map((m) => `- ${m.text}`).join('\n')}\n\n` : ''
     const filePrefix = files.length ? `Attached files (read them if relevant):\n${files.join('\n')}\n\n` : ''
-    const nativeSpeedApplied = await applySpeed(prompt.speed)
+    const dispatchInvalid = () => {
+      const owner = owningSlice()
+      const current = owner?.assistantThreads.find((candidate) => candidate.id === threadId)
+      return dispatchEpochRef.current !== dispatchEpoch || providerSwitchRef.current || !current?.busy || !!current.queuePaused || current.agentKey !== agentKey
+    }
+    const settleBeforeDispatch = (message: string, stopReason = 'cancelled') => {
+      const recovery = rollbackAssistantDispatch(threadId, pendingDispatch.id, { message, stopReason }, projectId)
+      if (recovery !== 'none') setNotice(message)
+      if (recovery === 'queue') {
+        queuePausedRef.current = true
+        useKaisola.getState().pushToast('info', 'Stopped prompt kept in the paused queue')
+      }
+      // Preflight rollback now preserves the prompt itself. Report it handled so
+      // queue/Omni callers do not enqueue a duplicate after Stop already won.
+      return true
+    }
+    let nativeSpeedApplied = false
+    try {
+      nativeSpeedApplied = await applySpeed(prompt.speed)
+    } catch (error) {
+      return settleBeforeDispatch(String((error as Error)?.message ?? 'The provider setting could not be applied.'), 'preflight_failed')
+    }
+    if (dispatchInvalid()) return settleBeforeDispatch('Stopped before the prompt was sent.')
     const payload = `${speedGuidance(prompt.speed, nativeSpeedApplied)}${usageWarningContext()}${first ? `${buildContext()}\n\n` : ''}${mentionPrefix}${filePrefix}${prompt.text}`
     // image attachments ALSO ride as real ACP image blocks (pixels, not a
     // path) for agents that take them; the path stays in filePrefix above as
     // the text-only fallback. Unreadable/oversized images just stay paths.
-    const images = (
-      await Promise.all(
-        files
-          .filter((f) => /\.(png|jpe?g|gif|webp)$/i.test(f))
-          .map(async (f) => {
-            const r = await bridge.fs.readImage(f)
-            return r.ok && r.data && r.mimeType ? { mimeType: r.mimeType, data: r.data } : null
-          }),
-      )
-    ).filter((i): i is { mimeType: string; data: string } => i !== null)
+    let images: Array<{ mimeType: string; data: string }> = []
+    try {
+      images = (
+        await Promise.all(
+          files
+            .filter((f) => /\.(png|jpe?g|gif|webp)$/i.test(f))
+            .map(async (f) => {
+              const r = await bridge.fs.readImage(f)
+              return r.ok && r.data && r.mimeType ? { mimeType: r.mimeType, data: r.data } : null
+            }),
+        )
+      ).filter((i): i is { mimeType: string; data: string } => i !== null)
+    } catch (error) {
+      return settleBeforeDispatch(String((error as Error)?.message ?? 'An image attachment could not be prepared.'), 'preflight_failed')
+    }
+    if (dispatchInvalid()) return settleBeforeDispatch('Stopped before the prompt was sent.')
+    // Every preflight completed and this generation still owns the thread.
+    // From this point onward the prompt may reach the provider.
+    if (!commitAssistantDispatch(threadId, pendingDispatch.id, projectId)) return true
+    autoNameThread(threadId, prompt.text, projectId) // first delivered attempt → topic title
     const stream = makeOnUpdate(threadId)
     let res: { ok: boolean; stopReason?: string; message?: string }
     try {
@@ -1665,6 +1817,10 @@ export const Assistant = memo(function Assistant({ threadId }: { threadId: strin
       res = { ok: false, message: String((err as Error)?.message ?? err) }
     }
     stream.flush() // drain any buffered tail before settling the turn
+    // Stop/provider changes can invalidate this closure while main settles a
+    // cooperative cancellation. A stale completion must never clear or write
+    // into a newer provider turn for the same thread.
+    if (dispatchEpochRef.current !== dispatchEpoch) return false
     updateRuntime(threadId, (r) => {
       let turns = r.turns
       if (r.thinkStart != null) {
@@ -1677,8 +1833,8 @@ export const Assistant = memo(function Assistant({ threadId }: { threadId: strin
       // stamp how long the agent worked on this prompt (rendered as a quiet
       // "Worked for X" row when the exchange settles; steered follow-ups fold
       // into the original exchange's span, which is what a reader expects).
-      // Only on success: the !res.ok rollback below matches userTurn by
-      // IDENTITY, which a remap here would silently break.
+      // Only on success: a rejected prompt is removed below when no response
+      // followed it, even if checkpoint metadata replaced the turn object.
       const completed = res.ok && (!res.stopReason || res.stopReason === 'end_turn')
       if (completed && userTurn.at != null) {
         const startedAt = userTurn.at
@@ -1736,9 +1892,18 @@ export const Assistant = memo(function Assistant({ threadId }: { threadId: strin
       // transcript doesn't strand an undelivered message. ONLY when nothing
       // streamed after it (the mid-turn / not-connected rejections reply nothing):
       // if the agent crashed mid-reply, keep the [user, partial-reply] pair coherent.
-      updateRuntime(threadId, (r) =>
-        r.turns[r.turns.length - 1] === userTurn ? { ...r, turns: r.turns.slice(0, -1), first } : r,
-      )
+      updateRuntime(threadId, (r) => {
+        let index = -1
+        for (let i = r.turns.length - 1; i >= 0; i--) {
+          const turn = r.turns[i]
+          if (turn.kind === 'user' && turn.at === userTurn.at && turn.text === userTurn.text) { index = i; break }
+        }
+        // If anything streamed after the user row, keep the partial exchange.
+        // Otherwise remove it even when the async checkpoint replaced identity.
+        return index >= 0 && index === r.turns.length - 1
+          ? { ...r, turns: r.turns.slice(0, index), first }
+          : r
+      })
       if (res.message) { setNotice(res.message); refresh() }
       if (opts.restoreOnFailure) {
         const cur = owningSlice()?.assistantDrafts[threadId] ?? EMPTY_DRAFT
@@ -1773,18 +1938,24 @@ export const Assistant = memo(function Assistant({ threadId }: { threadId: strin
         const thread = owner?.assistantThreads.find((candidate) => candidate.id === active.id)
         const waiting = owner?.assistantPromptQueues[active.id] ?? EMPTY_QUEUE
         if (!thread || thread.busy || thread.queuePaused || waiting.length === 0) return
-        const batch = takeAssistantPromptQueue(active.id, projectId)
+        const batch = nextQueuedDispatchBatch(waiting)
         if (!batch.length) return
         const combined = mergeQueuedPrompts(batch)
-        const sent = await sendText(combined)
+        const sent = await sendText(combined, { claimQueueIds: batch.map((prompt) => prompt.id) })
         if (!sent) {
           // Pause BEFORE restoring so the queue-length render cannot race an
           // immediate retry. A new user enqueue or reconnect resumes it.
           setQueuePaused(true)
-          enqueueAssistantPrompt(active.id, combined, { front: true, resume: false }, projectId)
+          const latestQueue = owningSlice()?.assistantPromptQueues[active.id] ?? []
+          const originalsRemain = batch.every((prompt) => latestQueue.some((queued) => queued.id === prompt.id))
+          if (!originalsRemain) {
+            enqueueAssistantPrompt(active.id, combined, { front: true, resume: false, preserveAccepted: true }, projectId)
+          }
           useKaisola.getState().pushToast('warn', `${agentName} queue paused — send or queue a prompt to resume`)
           return
         }
+        const remaining = owningSlice()?.assistantPromptQueues[active.id] ?? []
+        if (batch.every((prompt) => remaining.some((queued) => queued.id === prompt.id))) return
         // Anything typed while that combined prompt ran is now waiting in the
         // store and is picked up by this same loop without needing a re-render.
       }
@@ -1802,36 +1973,61 @@ export const Assistant = memo(function Assistant({ threadId }: { threadId: strin
   const omniSeqRef = useRef(0)
   useEffect(() => {
     if (!omniPrompt || omniPrompt.threadId !== threadId || omniPrompt.seq === omniSeqRef.current) return
-    omniSeqRef.current = omniPrompt.seq
-    useKaisola.getState().clearOmniPrompt()
     const text = omniPrompt.text
-    if (busy) {
+    if (busy || queuedPrompts.length > 0) {
       // same rule as the composer: busy → queue; steering is only ever the
       // explicit per-row action on a queued prompt
+      const queuedId = enqueueAssistantPrompt(active.id, { ...EMPTY_DRAFT, text: text.trim(), speed }, undefined, projectId)
+      if (!queuedId) {
+        setNotice('The queue is full. Your command-bar prompt is still waiting and will retry when space opens.')
+        return
+      }
+      omniSeqRef.current = omniPrompt.seq
+      useKaisola.getState().clearOmniPrompt()
       setQueuePaused(false)
-      enqueueAssistantPrompt(active.id, { ...EMPTY_DRAFT, text: text.trim(), speed }, undefined, projectId)
       return
     }
+    omniSeqRef.current = omniPrompt.seq
     void sendText(text).then((sent) => {
       // never swallow a ⌘L prompt: a race-y busy flip QUEUES it (review
       // finding #4 — it used to be dropped with a misleading toast)
-      if (!sent) {
+      if (sent) {
+        useKaisola.getState().clearOmniPrompt()
+        return
+      }
+      const queuedId = enqueueAssistantPrompt(active.id, { ...EMPTY_DRAFT, text: text.trim(), speed }, undefined, projectId)
+      if (queuedId) {
+        useKaisola.getState().clearOmniPrompt()
         setQueuePaused(false)
-        enqueueAssistantPrompt(active.id, { ...EMPTY_DRAFT, text: text.trim(), speed }, undefined, projectId)
+      } else {
+        omniSeqRef.current = 0
+        setNotice('The queue is full. Your command-bar prompt is still waiting and will retry when space opens.')
       }
     })
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [omniPrompt, threadId])
+  }, [omniPrompt, threadId, busy, queuedPrompts.length])
   const cancelActive = () => {
     // Stop means STOP: pause the queue too, or flipping busy would auto-fire
     // the next queued prompt the instant the user aborts (review finding #2)
+    dispatchEpochRef.current++
+    queuePausedRef.current = true
+    const recovery = rollbackAssistantDispatch(active.id, undefined, {
+      message: 'Stopped before the prompt was sent.',
+      pauseQueue: true,
+    }, projectId)
+    if (recovery === 'none') setThreadQueuePaused(active.id, true, projectId)
     if (queuedPrompts.length > 0) {
-      setQueuePaused(true)
       useKaisola.getState().pushToast('info', 'Queue paused — send or queue a prompt to resume')
+    } else if (recovery === 'queue') {
+      useKaisola.getState().pushToast('info', 'Stopped prompt kept in the paused queue')
     }
     void bridge.acp.cancel(connectionKey, projectId)
-    setThreadBusy(active.id, false, projectId)
-    updateRuntime(active.id, (r) => ({ ...r, thinkStart: undefined }))
+    if (recovery === 'none') {
+      setThreadBusy(active.id, false, projectId)
+      updateRuntime(active.id, (r) => ({ ...r, thinkStart: undefined }))
+    } else {
+      setNotice('Stopped before the prompt was sent.')
+    }
   }
   const attach = async () => {
     const r = await bridge.pickFiles()
@@ -1884,10 +2080,37 @@ export const Assistant = memo(function Assistant({ threadId }: { threadId: strin
     }, projectId)
   }
   // the foot's agent picker re-points the active thread to a different agent
-  const setThreadAgent = (key: string) => {
+  const setThreadAgent = async (key: string) => {
     const preset = presets.find((p) => p.id === key)
     if (preset?.terminalOnly) { openTerminalPreset(preset); return }
-    setStoreThreadAgent(active.id, key); resetAssistantRuntime(active.id, projectId); refresh()
+    if (key === agentKey || providerSwitchRef.current) return
+    const owner = owningSlice()
+    const current = owner?.assistantThreads.find((candidate) => candidate.id === active.id)
+    if (current?.busy || (owner?.assistantPromptQueues[active.id]?.length ?? 0) > 0 || permsForAgent.length > 0) {
+      useKaisola.getState().pushToast('warn', 'Stop this agent and clear its queued prompts before changing providers.')
+      return
+    }
+    providerSwitchRef.current = true
+    try {
+      const status = await bridge.acp.status([connectionKey], projectId).catch(() => ({ ok: false, agents: [] }))
+      if (status.agents.some((agent) => agent.key === connectionKey && agent.busy)) {
+        useKaisola.getState().pushToast('warn', 'The provider is still finishing a turn. Stop it before switching.')
+        return
+      }
+      dispatchEpochRef.current++
+      const disconnected = await bridge.acp.disconnect(connectionKey, projectId).catch(() => ({ ok: false }))
+      if (!disconnected.ok) {
+        useKaisola.getState().pushToast('warn', 'The current provider could not be disconnected safely.')
+        return
+      }
+      const latest = owningSlice()?.assistantThreads.find((candidate) => candidate.id === active.id)
+      if (!latest || latest.busy || latest.agentKey !== agentKey) return
+      setStoreThreadAgent(active.id, key)
+      resetAssistantRuntime(active.id, projectId)
+      setAgents([])
+    } finally {
+      providerSwitchRef.current = false
+    }
   }
 
   return (
@@ -2109,7 +2332,6 @@ export const Assistant = memo(function Assistant({ threadId }: { threadId: strin
                           setNotice(`${agentName} will receive this next; mid-turn steering is not available for this connection.`)
                           return
                         }
-                        removeQueuedAssistantPrompt(active.id, q.id)
                         void steerText(q)
                       }}
                       title={canSteer ? `Steer ${agentName} now` : `${agentName} will receive this next; mid-turn steering is unavailable`}
@@ -2122,7 +2344,7 @@ export const Assistant = memo(function Assistant({ threadId }: { threadId: strin
                   )}
                   <button
                     className="composer-queue-action"
-                    onClick={() => removeQueuedAssistantPrompt(active.id, q.id)}
+                    onClick={() => removeQueuedAssistantPrompt(active.id, q.id, projectId)}
                     title="Delete queued prompt"
                     aria-label="Delete queued prompt"
                   >
@@ -2136,7 +2358,7 @@ export const Assistant = memo(function Assistant({ threadId }: { threadId: strin
                         inputRef.current?.focus()
                         return
                       }
-                      removeQueuedAssistantPrompt(active.id, q.id)
+                      removeQueuedAssistantPrompt(active.id, q.id, projectId)
                       setAssistantDraft(active.id, {
                         text: q.text,
                         attachments: q.attachments,
@@ -2287,8 +2509,9 @@ export const Assistant = memo(function Assistant({ threadId }: { threadId: strin
           onSelect={setThreadAgent}
           title="Agent for this thread"
           align="left"
+          disabled={busy || queuedPrompts.length > 0 || permsForAgent.length > 0}
         />
-        <button className="foot-ws drop-btn" onClick={pickWorkspace} title={sessionCwd ?? 'Choose a workspace folder for the agent'}>
+        <button className="foot-ws drop-btn" onClick={pickWorkspace} disabled={busy} title={sessionCwd ?? 'Choose a workspace folder for the agent'}>
           <Icon name="Folder" size={12} className="drop-btn-icon" />
           <span className="drop-btn-label">{sessionCwd ? sessionCwd.split('/').filter(Boolean).pop() : 'Workspace'}</span>
         </button>

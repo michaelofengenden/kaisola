@@ -35,6 +35,9 @@ app.whenReady().then(async () => {
   require('./ipc/assistantArchive.cjs').registerAssistantArchiveHandlers(ipcMain, path.join(userData, 'assistant-archives'))
   ipcMain.handle('shell:glass', () => ({ supported: false, active: false, enabled: false }))
   ipcMain.handle('shell:window-mode', () => ({ wantSolid: true, liveSolid: true }))
+  ipcMain.handle('window:popped', () => ({ ok: true, termIds: [], states: [], closed: [] }))
+  ipcMain.handle('window:pop-closed-ack', () => ({ ok: false }))
+  ipcMain.on('window:terminal-state', () => {})
   ipcMain.handle('app-auth:status', () => ({
     ok: true,
     configured: true,

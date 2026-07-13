@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { useKaisola, dockShowsLiveCard, shellConfigDir, type ThemeMode, type PerfMode, type TabLayout, type CustomAgent, type TermBackground } from '../store/store'
 import { bridge, isDesktop, type AcpAgent, type AppAuthStatus } from '../lib/bridge'
 import type { AutonomyLevel } from '../domain/types'
@@ -10,6 +10,7 @@ import { GoogleIcon } from './ProviderIcon'
 import { Dropdown } from './Dropdown'
 import { UsageSettings } from './shell/LimitsButton'
 import { openExtensionsCenter } from '../lib/extensions'
+import { useModalFocus } from '../lib/useModalFocus'
 
 // Current Claude models (for the direct API path). Checked 2026-07-09.
 const CLAUDE_MODELS = [
@@ -97,6 +98,7 @@ function ClaudeAccountsBlock() {
           <div style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
             <input
               className="input"
+              aria-label="New Claude account label"
               value={label}
               onChange={(e) => setLabel(e.target.value)}
               placeholder="Add account — label (e.g. Work)"
@@ -118,6 +120,7 @@ function ClaudeAccountsBlock() {
         <span className="settings-row-label">This project uses</span>
         <div className="settings-row-control">
           <Dropdown
+            ariaLabel="Claude account for this project"
             value={accountId}
             options={[
               { value: '', name: 'Default account', description: '~/.claude' },
@@ -137,20 +140,27 @@ function ClaudeAccountsBlock() {
   )
 }
 
-/** The Zed-style settings nav — one entry per pane. */
+/** A small information architecture keeps the rail scannable as capabilities
+ * grow; on narrow windows the same entries become one horizontal category bar. */
 const SECTIONS = [
   { id: 'general', name: 'General', icon: 'SlidersHorizontal' },
-  { id: 'usage', name: 'Usage', icon: 'Gauge' },
   { id: 'interface', name: 'Interface', icon: 'PanelsTopLeft' },
-  { id: 'extensions', name: 'Extensions', icon: 'Blocks' },
   { id: 'terminal', name: 'Terminal', icon: 'SquareTerminal' },
   { id: 'agents', name: 'Agents', icon: 'Bot' },
+  { id: 'usage', name: 'Usage', icon: 'Gauge' },
   { id: 'guardrails', name: 'Guardrails', icon: 'ShieldCheck' },
-  { id: 'models', name: 'Models & API keys', icon: 'KeyRound' },
+  { id: 'models', name: 'Models & keys', icon: 'KeyRound' },
+  { id: 'extensions', name: 'Extensions', icon: 'Blocks' },
   { id: 'literature', name: 'Literature', icon: 'BookOpen' },
   { id: 'advanced', name: 'Advanced', icon: 'Braces' },
 ] as const
 type SectionId = (typeof SECTIONS)[number]['id']
+const SECTION_GROUPS: ReadonlyArray<{ name: string; ids: readonly SectionId[] }> = [
+  { name: 'Workspace', ids: ['general', 'interface', 'terminal'] },
+  { name: 'Agents', ids: ['agents', 'usage', 'guardrails', 'models'] },
+  { name: 'Integrations', ids: ['extensions', 'literature'] },
+  { name: 'System', ids: ['advanced'] },
+]
 
 /** One quiet line under each pane title — sparse panes read as designed, not empty. */
 const SECTION_DESC: Record<SectionId, string> = {
@@ -172,6 +182,29 @@ const slug = (s: string) =>
 /** Cursor color chips: the olive is the pre-0.1.7 accent look. */
 const CURSOR_COLORS = ['#95a456', '#5aa9e6', '#d8a44a', '#e16a6a', '#5ec5c0']
 
+function SettingsToggle({ checked, onChange, label, title, disabled = false }: {
+  checked: boolean
+  onChange: (checked: boolean) => void
+  label: string
+  title?: string
+  disabled?: boolean
+}) {
+  return (
+    <button
+      type="button"
+      className="settings-toggle"
+      role="switch"
+      aria-checked={checked}
+      aria-label={label}
+      title={title}
+      disabled={disabled}
+      onClick={() => onChange(!checked)}
+    >
+      <span aria-hidden="true" />
+    </button>
+  )
+}
+
 function AppAccountRow() {
   const [status, setStatus] = useState<AppAuthStatus | null>(null)
   const [busy, setBusy] = useState(false)
@@ -183,14 +216,22 @@ function AppAccountRow() {
   }, [])
   const signIn = async () => {
     setBusy(true)
-    const next = await bridge.appAuth.signInGoogle()
-    setStatus((current) => ({ ...(current ?? { configured: next.configured }), ...next }))
-    if (!next.ok) setBusy(false)
+    try {
+      const next = await bridge.appAuth.signInGoogle()
+      setStatus((current) => ({ ...(current ?? { configured: next.configured }), ...next }))
+      if (!next.ok) setBusy(false)
+    } catch {
+      setBusy(false)
+    }
   }
   const signOut = async () => {
     setBusy(true)
     setStatus(await bridge.appAuth.signOut())
     setBusy(false)
+  }
+  const cancelSignIn = async () => {
+    setBusy(false)
+    try { setStatus(await bridge.appAuth.cancelGoogle()) } catch { /* remain in local mode */ }
   }
   return (
     <div className="settings-row">
@@ -205,9 +246,11 @@ function AppAccountRow() {
             </span>
             <button className="btn btn-ghost btn-sm" disabled={busy} onClick={() => { void signOut() }}>Sign out</button>
           </>
+        ) : status?.configured === false ? (
+          <span className="faint" title={status.message}>Local mode</span>
         ) : (
-          <button className="btn btn-ghost btn-sm" title={status?.configured === false ? status.message : undefined} disabled={busy || status?.configured === false} onClick={() => { void signIn() }}>
-            {busy ? 'Opening Google…' : 'Sign in with Google'}
+          <button className="btn btn-ghost btn-sm" onClick={() => { void (busy ? cancelSignIn() : signIn()) }}>
+            {busy ? 'Cancel sign-in' : 'Sign in with Google'}
           </button>
         )}
       </div>
@@ -293,6 +336,8 @@ export function Settings() {
   const [agents, setAgents] = useState<AcpAgent[]>([])
   const [glass, setGlass] = useState<{ supported: boolean; active: boolean; enabled: boolean } | null>(null)
   const [section, setSection] = useState<SectionId>('general')
+  const dialogRef = useRef<HTMLDivElement>(null)
+  useModalFocus(open, dialogRef)
   const [hiddenResidents, setHiddenResidents] = useState(() => {
     const value = Number(localStorage.getItem('kaisola:hidden-terminal-residents') ?? 0)
     return Number.isFinite(value) ? Math.min(8, Math.max(0, Math.round(value))) : 0
@@ -396,14 +441,16 @@ export function Settings() {
     else setOaMsg(r.message || 'Could not save.')
   }
   const clearKey = async () => {
-    await bridge.settings.clearApiKey()
-    setKeyMsg('Key removed from the keychain.')
-    void bridge.settings.hasApiKey().then((s) => { setPresent(s.present); setFromEnv(!!s.fromEnv) })
+    const result = await bridge.settings.clearApiKey()
+    const state = await bridge.settings.hasApiKey()
+    setPresent(state.present); setFromEnv(!!state.fromEnv)
+    setKeyMsg(result.ok && !state.present ? 'Key removed from the keychain.' : result.message ?? 'The key could not be removed.')
   }
   const clearOaKey = async () => {
-    await bridge.settings.clearOpenaiKey()
-    setOaMsg('Key removed from the keychain.')
-    void bridge.settings.hasOpenaiKey().then((s) => setOaPresent(s.present))
+    const result = await bridge.settings.clearOpenaiKey()
+    const state = await bridge.settings.hasOpenaiKey()
+    setOaPresent(state.present)
+    setOaMsg(result.ok && !state.present ? 'Key removed from the keychain.' : result.message ?? 'The key could not be removed.')
   }
 
   const inMenu = new Set(menu.map((a) => a.id))
@@ -445,7 +492,7 @@ export function Settings() {
               <Icon name={on ? 'MessageSquarePlus' : 'Plug'} size={12} /> {on ? 'New chat' : 'Connect'}
             </button>
           )}
-          <Dropdown icon="Ellipsis" value="" placeholder="" options={overflow} onSelect={onOverflow} align="right" title="More" />
+          <Dropdown icon="Ellipsis" value="" placeholder="" options={overflow} onSelect={onOverflow} align="right" title="More" ariaLabel={`More actions for ${a.name}`} />
         </div>
       </div>
     )
@@ -453,21 +500,41 @@ export function Settings() {
 
   return (
     <div className="focus-scrim" onMouseDown={() => setOpen(false)}>
-      <div className="settings-panel-v2 settings-panel-v3" onMouseDown={(e) => e.stopPropagation()}>
+      <div
+        ref={dialogRef}
+        className="settings-panel-v2 settings-panel-v3"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="settings-title"
+        tabIndex={-1}
+        onMouseDown={(e) => e.stopPropagation()}
+      >
         <header className="settings-head">
           <Icon name="Settings" size={14} className="muted" />
-          <span className="grow">Settings</span>
+          <span className="grow" id="settings-title">Settings</span>
           <button className="btn-icon btn-sm" onClick={() => setOpen(false)} aria-label="Close"><Icon name="X" size={14} /></button>
         </header>
         <div className="settings-body-v3">
-          {/* Zed-style: categories on the left, one pane at a time on the right */}
-          <nav className="settings-nav">
-            {SECTIONS.map((s) => (
-              <button key={s.id} className="settings-nav-item" data-active={section === s.id} onClick={() => setSection(s.id)}>
-                <Icon name={s.icon} size={14} />
-                <span className="truncate">{s.name}</span>
-              </button>
-            ))}
+          <nav className="settings-nav" aria-label="Settings categories">
+            {SECTION_GROUPS.map((group) => <div className="settings-nav-group" key={group.name}>
+              <div className="settings-nav-group-label">{group.name}</div>
+              {group.ids.map((id) => {
+                const s = SECTIONS.find((candidate) => candidate.id === id)!
+                return (
+                <button
+                  key={s.id}
+                  className="settings-nav-item"
+                  data-active={section === s.id}
+                  data-modal-autofocus={section === s.id ? true : undefined}
+                  aria-current={section === s.id ? 'page' : undefined}
+                  onClick={() => setSection(s.id)}
+                >
+                  <Icon name={s.icon} size={14} />
+                  <span className="truncate">{s.name}</span>
+                </button>
+                )
+              })}
+            </div>)}
           </nav>
           <div className="settings-pane">
             <div className="settings-pane-head">
@@ -481,21 +548,20 @@ export function Settings() {
                 <div className="settings-row">
                   <span className="settings-row-label">Theme</span>
                   <div className="settings-row-control">
-                    <Dropdown value={themeMode} options={[{ value: 'system', name: 'System' }, { value: 'light', name: 'Light' }, { value: 'dark', name: 'Dark' }]} onSelect={(v) => setThemeMode(v as ThemeMode)} align="right" title="System follows macOS appearance, including scheduled switches" />
+                    <Dropdown value={themeMode} options={[{ value: 'system', name: 'System' }, { value: 'light', name: 'Light' }, { value: 'dark', name: 'Dark' }]} onSelect={(v) => setThemeMode(v as ThemeMode)} align="right" title="System follows macOS appearance, including scheduled switches" ariaLabel="Theme" />
                   </div>
                 </div>
                 {glass?.supported && (
                   <div className="settings-row">
                     <span className="settings-row-label">Liquid Glass <span className="faint" style={{ fontWeight: 400 }}>· relaunch to apply</span></span>
                     <div className="settings-row-control">
-                      <Dropdown
-                        value={glass.enabled ? 'on' : 'off'}
-                        options={[{ value: 'on', name: 'On' }, { value: 'off', name: 'Off' }]}
-                        onSelect={(v) => {
-                          void bridge.glass({ enabled: v === 'on' }).then(setGlass)
+                      <SettingsToggle
+                        checked={glass.enabled}
+                        label="Liquid Glass"
+                        onChange={(enabled) => {
+                          void bridge.glass({ enabled }).then(setGlass)
                           pushToast('info', 'Liquid Glass applies on the next launch.')
                         }}
-                        align="right"
                         title="Apple's glass material behind the shell"
                       />
                     </div>
@@ -518,6 +584,7 @@ export function Settings() {
                       </button>
                     )}
                     <Dropdown
+                      ariaLabel="Appearance energy"
                       value={perfMode}
                       options={[
                         { value: 'glass', name: 'Live Glass' },
@@ -542,6 +609,7 @@ export function Settings() {
                   <span className="settings-row-label">Workspace view <span className="faint" style={{ fontWeight: 400 }}>· switches live</span></span>
                   <div className="settings-row-control">
                     <Dropdown
+                      ariaLabel="Workspace view"
                       value={layoutMode}
                       options={[
                         { value: 'studio', name: 'Files and sessions' },
@@ -557,6 +625,7 @@ export function Settings() {
                   <span className="settings-row-label">Session panels <span className="faint" style={{ fontWeight: 400 }}>· agents and terminals</span></span>
                   <div className="settings-row-control">
                     <Dropdown
+                      ariaLabel="Session panels"
                       value={dockVisible && layoutMode === 'studio' ? 'shown' : 'hidden'}
                       options={[
                         { value: 'shown', name: 'Shown' },
@@ -572,6 +641,7 @@ export function Settings() {
                   <span className="settings-row-label">Session placement <span className="faint" style={{ fontWeight: 400 }}>· left or top</span></span>
                   <div className="settings-row-control">
                     <Dropdown
+                      ariaLabel="Session placement"
                       value={tabLayout === 'sidebar' ? 'left' : 'top'}
                       options={[
                         { value: 'left', name: 'Left sidebar · default' },
@@ -589,6 +659,7 @@ export function Settings() {
                     <span className="settings-row-label">Top tab style <span className="faint" style={{ fontWeight: 400 }}>· optional</span></span>
                     <div className="settings-row-control">
                       <Dropdown
+                        ariaLabel="Top tab style"
                         value={tabLayout === 'sidebar' ? 'bare' : tabLayout}
                         options={[
                           { value: 'bare', name: 'Standard' },
@@ -614,11 +685,10 @@ export function Settings() {
                   <div className="settings-row" key={row.label}>
                     <span className="settings-row-label">{row.label} <span className="faint" style={{ fontWeight: 400 }}>· {row.hint}</span></span>
                     <div className="settings-row-control">
-                      <Dropdown
-                        value={row.value ? 'on' : 'off'}
-                        options={[{ value: 'on', name: 'On' }, { value: 'off', name: 'Off' }]}
-                        onSelect={(v) => row.set(v === 'on')}
-                        align="right"
+                      <SettingsToggle
+                        checked={row.value}
+                        onChange={row.set}
+                        label={row.label}
                         title={row.title}
                       />
                     </div>
@@ -653,6 +723,7 @@ export function Settings() {
                   <span className="settings-row-label">Font</span>
                   <div className="settings-row-control">
                     <Dropdown
+                      ariaLabel="Terminal font size"
                       value={String(termFontSize)}
                       options={[10, 11, 12, 13, 14, 15, 16].map((n) => ({ value: String(n), name: `${n} px` }))}
                       onSelect={(v) => setTermFontSize(Number(v))}
@@ -660,6 +731,7 @@ export function Settings() {
                       title="Size — ⌘+ / ⌘− anywhere"
                     />
                     <Dropdown
+                      ariaLabel="Terminal font weight"
                       value={String(termFontWeight)}
                       options={[{ value: '400', name: 'Regular' }, { value: '500', name: 'Medium' }, { value: '700', name: 'Bold' }]}
                       onSelect={(v) => setTermFontWeight(Number(v))}
@@ -667,6 +739,7 @@ export function Settings() {
                       title="Weight"
                     />
                     <Dropdown
+                      ariaLabel="Terminal font family"
                       value={termFontFamily}
                       options={[
                         { value: 'JetBrains Mono', name: 'JetBrains Mono' },
@@ -686,6 +759,7 @@ export function Settings() {
                   <span className="settings-row-label">Background</span>
                   <div className="settings-row-control">
                     <Dropdown
+                      ariaLabel="Terminal background"
                       value={termBackground}
                       options={[
                         { value: 'paper', name: 'Paper (white)' },
@@ -727,6 +801,7 @@ export function Settings() {
                     ))}
                     <input
                       type="color"
+                      aria-label="Custom terminal cursor color"
                       title="Custom color"
                       value={termCursorColor.startsWith('#') ? termCursorColor : '#d6dae2'}
                       onChange={(e) => setTermCursorColor(e.target.value)}
@@ -748,6 +823,7 @@ export function Settings() {
                     custom entry, with the JSON escape hatch alongside */}
                 <div className="agent-add-row">
                   <Dropdown
+                    ariaLabel="Add agent"
                     icon="Plus"
                     value=""
                     placeholder="Add agent"
@@ -770,9 +846,10 @@ export function Settings() {
                 {adding && (
                   <>
                     <div className="settings-customform">
-                      <input className="input" value={newName} onChange={(e) => setNewName(e.target.value)} placeholder="Name" spellCheck={false} autoFocus />
+                      <input className="input" value={newName} onChange={(e) => setNewName(e.target.value)} placeholder="Name" spellCheck={false} autoFocus aria-label="Custom agent name" />
                       <input
                         className="input settings-input-full"
+                        aria-label="Custom agent command"
                         value={newCmd}
                         onChange={(e) => setNewCmd(e.target.value)}
                         placeholder={newKind === 'acp' ? 'command --acp   (speaks ACP on stdio)' : 'command to run in a terminal'}
@@ -780,6 +857,7 @@ export function Settings() {
                         onKeyDown={(e) => { if (e.key === 'Enter') addCustom() }}
                       />
                       <Dropdown
+                        ariaLabel="Custom agent connection type"
                         value={newKind}
                         options={[{ value: 'terminal', name: 'Terminal' }, { value: 'acp', name: 'ACP chat' }]}
                         onSelect={(v) => setNewKind(v as 'terminal' | 'acp')}
@@ -799,17 +877,16 @@ export function Settings() {
                 <div className="settings-row">
                   <span className="settings-row-label">Claude terminal model <span className="faint" style={{ fontWeight: 400 }}>· the prepared per-project session</span></span>
                   <div className="settings-row-control">
-                    <Dropdown value={claudeTerminalModel} options={CLAUDE_TERMINAL_MODELS} onSelect={setClaudeTerminalModel} align="right" title="Passed as --model; aliases resolve to the newest release" />
+                    <Dropdown value={claudeTerminalModel} options={CLAUDE_TERMINAL_MODELS} onSelect={setClaudeTerminalModel} align="right" title="Passed as --model; aliases resolve to the newest release" ariaLabel="Claude terminal model" />
                   </div>
                 </div>
                 <div className="settings-row">
                   <span className="settings-row-label">Fast mode <span className="faint" style={{ fontWeight: 400 }}>· Opus ↯ up to 2.5× faster, premium pricing</span></span>
                   <div className="settings-row-control">
-                    <Dropdown
-                      value={claudeFastMode ? 'on' : 'off'}
-                      options={[{ value: 'on', name: 'On' }, { value: 'off', name: 'Off' }]}
-                      onSelect={(v) => setClaudeFastMode(v === 'on')}
-                      align="right"
+                    <SettingsToggle
+                      checked={claudeFastMode}
+                      onChange={setClaudeFastMode}
+                      label="Claude fast mode"
                       title="Injected as fastMode:true via the terminal's --settings file"
                     />
                   </div>
@@ -828,13 +905,13 @@ export function Settings() {
                 <div className="settings-row">
                   <span className="settings-row-label">Agent autonomy <span className="faint" style={{ fontWeight: 400 }}>· this project</span></span>
                   <div className="settings-row-control">
-                    <Dropdown value={autonomy} options={[{ value: 'observe', name: 'Observe' }, { value: 'propose', name: 'Propose' }, { value: 'execute', name: 'Execute' }, { value: 'sprint', name: 'Sprint' }]} onSelect={(v) => setAutonomy(v as AutonomyLevel)} align="right" title="Observe auto-rejects; Propose asks; Execute/Sprint auto-allow" />
+                    <Dropdown value={autonomy} options={[{ value: 'observe', name: 'Observe' }, { value: 'propose', name: 'Propose' }, { value: 'execute', name: 'Execute' }, { value: 'sprint', name: 'Sprint' }]} onSelect={(v) => setAutonomy(v as AutonomyLevel)} align="right" title="Observe auto-rejects; Propose asks; Execute/Sprint auto-allow" ariaLabel="Agent autonomy for this project" />
                   </div>
                 </div>
                 <div className="settings-row">
                   <span className="settings-row-label">Default autonomy <span className="faint" style={{ fontWeight: 400 }}>· every new project starts here</span></span>
                   <div className="settings-row-control">
-                    <Dropdown value={defaultAutonomy} options={[{ value: 'observe', name: 'Observe' }, { value: 'propose', name: 'Propose' }, { value: 'execute', name: 'Execute' }, { value: 'sprint', name: 'Sprint' }]} onSelect={(v) => setDefaultAutonomy(v as AutonomyLevel)} align="right" title="Set auto permissions once, for every agent every time — Execute/Sprint auto-allow; the Claude terminal mirrors it (acceptEdits / bypassPermissions)" />
+                    <Dropdown value={defaultAutonomy} options={[{ value: 'observe', name: 'Observe' }, { value: 'propose', name: 'Propose' }, { value: 'execute', name: 'Execute' }, { value: 'sprint', name: 'Sprint' }]} onSelect={(v) => setDefaultAutonomy(v as AutonomyLevel)} align="right" title="Set auto permissions once, for every agent every time — Execute/Sprint auto-allow; the Claude terminal mirrors it (acceptEdits / bypassPermissions)" ariaLabel="Default agent autonomy" />
                   </div>
                 </div>
                 <p className="settings-note">
@@ -849,7 +926,7 @@ export function Settings() {
                       <span className="faint" style={{ fontWeight: 400 }}> · {r.action}</span>
                     </span>
                     <div className="settings-row-control">
-                      <button className="btn-icon btn-sm" onClick={() => removePermissionRule(r.id)} title="Delete rule — ask again">
+                      <button className="btn-icon btn-sm" onClick={() => removePermissionRule(r.id)} title="Delete rule — ask again" aria-label={`Delete permission rule for ${r.resource}`}>
                         <Icon name="Trash2" size={13} />
                       </button>
                     </div>
@@ -860,7 +937,7 @@ export function Settings() {
                     <Icon name="ShieldAlert" size={14} className="muted" />
                     <span className="settings-row-label"><span className="mono">{g}</span></span>
                     <div className="settings-row-control">
-                      <button className="btn-icon btn-sm" onClick={() => setSensitiveGlobs(sensitiveGlobs.filter((x) => x !== g))} title="Remove glob">
+                      <button className="btn-icon btn-sm" onClick={() => setSensitiveGlobs(sensitiveGlobs.filter((x) => x !== g))} title="Remove glob" aria-label={`Remove sensitive file pattern ${g}`}>
                         <Icon name="Trash2" size={13} />
                       </button>
                     </div>
@@ -869,6 +946,7 @@ export function Settings() {
                 <div className="settings-keyrow">
                   <input
                     className="input settings-input-full"
+                    aria-label="New sensitive file pattern"
                     value={newGlob}
                     onChange={(e) => setNewGlob(e.target.value)}
                     placeholder="**/credentials*.json"
@@ -890,6 +968,7 @@ export function Settings() {
                   <span className="settings-row-label">Reasoning provider</span>
                   <div className="settings-row-control">
                     <Dropdown
+                      ariaLabel="Reasoning provider"
                       value={reasoningProvider}
                       options={[
                         { value: 'codex', name: 'Codex (subscription)' },
@@ -912,25 +991,25 @@ export function Settings() {
                     <div className="settings-row">
                       <span className="settings-row-label">Model</span>
                       <div className="settings-row-control">
-                        <input className="input settings-input-md" value={openaiModel} onChange={(e) => setOpenaiModel(e.target.value)} placeholder="gpt-4o-mini" spellCheck={false} />
+                        <input className="input settings-input-md" value={openaiModel} onChange={(e) => setOpenaiModel(e.target.value)} placeholder="gpt-4o-mini" spellCheck={false} aria-label="OpenAI model" />
                       </div>
                     </div>
                     <div className="settings-row">
                       <span className="settings-row-label">Endpoint</span>
                       <div className="settings-row-control">
-                        <input className="input settings-input-md" value={openaiBaseUrl} onChange={(e) => setOpenaiBaseUrl(e.target.value)} placeholder="https://api.openai.com/v1" spellCheck={false} />
+                        <input className="input settings-input-md" value={openaiBaseUrl} onChange={(e) => setOpenaiBaseUrl(e.target.value)} placeholder="https://api.openai.com/v1" spellCheck={false} aria-label="OpenAI endpoint" />
                       </div>
                     </div>
                     {isDesktop && (
                       <div className="settings-keyrow">
-                        <input className="input settings-input-full" type="password" value={oaKey} onChange={(e) => setOaKey(e.target.value)} placeholder={oaPresent ? 'OpenAI key saved — replace…' : 'sk-…'} spellCheck={false} />
+                        <input className="input settings-input-full" type="password" value={oaKey} onChange={(e) => setOaKey(e.target.value)} placeholder={oaPresent ? 'OpenAI key saved — replace…' : 'sk-…'} spellCheck={false} aria-label="OpenAI API key" />
                         <button className="btn btn-primary btn-sm" onClick={() => void saveOaKey()} disabled={!oaKey.trim()}><Icon name="Check" size={13} /> Save</button>
                         {oaPresent && (
                           <button className="btn btn-ghost btn-sm" onClick={() => void clearOaKey()} title="Remove the stored OpenAI key"><Icon name="Trash2" size={13} /> Remove</button>
                         )}
                       </div>
                     )}
-                    {oaMsg && <div className="settings-msg">{oaMsg}</div>}
+                    {oaMsg && <div className="settings-msg" role="status" aria-live="polite">{oaMsg}</div>}
                   </>
                 )}
                 {reasoningProvider === 'local' && (
@@ -938,13 +1017,13 @@ export function Settings() {
                     <div className="settings-row">
                       <span className="settings-row-label">Endpoint</span>
                       <div className="settings-row-control">
-                        <input className="input settings-input-md" value={localBaseUrl} onChange={(e) => setLocalBaseUrl(e.target.value)} placeholder="http://localhost:11434/v1" spellCheck={false} />
+                        <input className="input settings-input-md" value={localBaseUrl} onChange={(e) => setLocalBaseUrl(e.target.value)} placeholder="http://localhost:11434/v1" spellCheck={false} aria-label="Local model endpoint" />
                       </div>
                     </div>
                     <div className="settings-row">
                       <span className="settings-row-label">Model</span>
                       <div className="settings-row-control">
-                        <input className="input settings-input-md" value={localModel} onChange={(e) => setLocalModel(e.target.value)} placeholder="llama3.1" spellCheck={false} />
+                        <input className="input settings-input-md" value={localModel} onChange={(e) => setLocalModel(e.target.value)} placeholder="llama3.1" spellCheck={false} aria-label="Local model name" />
                       </div>
                     </div>
                     <p className="settings-note">Ollama, LM Studio, llama.cpp — any OpenAI-compatible endpoint. Nothing leaves your machine.</p>
@@ -956,7 +1035,7 @@ export function Settings() {
                 <div className="settings-row">
                   <span className="settings-row-label">Claude model <span className="faint" style={{ fontWeight: 400 }}>· direct API</span></span>
                   <div className="settings-row-control">
-                    <Dropdown value={claudeModel} options={CLAUDE_MODELS} onSelect={setClaudeModel} align="right" title="Claude model" />
+                    <Dropdown value={claudeModel} options={CLAUDE_MODELS} onSelect={setClaudeModel} align="right" title="Claude model" ariaLabel="Claude direct API model" />
                   </div>
                 </div>
                 <div className={`settings-status ${present ? 'on' : 'off'}`}>
@@ -965,14 +1044,14 @@ export function Settings() {
                 </div>
                 {isDesktop && (
                   <div className="settings-keyrow">
-                    <input className="input settings-input-full" type="password" value={key} onChange={(e) => setKey(e.target.value)} placeholder="sk-ant-…" spellCheck={false} />
+                    <input className="input settings-input-full" type="password" value={key} onChange={(e) => setKey(e.target.value)} placeholder="sk-ant-…" spellCheck={false} aria-label="Anthropic API key" />
                     <button className="btn btn-primary btn-sm" onClick={() => void saveKey()} disabled={!key.trim()}><Icon name="Check" size={13} /> Save</button>
                     {present && !fromEnv && (
                       <button className="btn btn-ghost btn-sm" onClick={() => void clearKey()} title="Remove the stored Anthropic key"><Icon name="Trash2" size={13} /> Remove</button>
                     )}
                   </div>
                 )}
-                {keyMsg && <div className="settings-msg">{keyMsg}</div>}
+                {keyMsg && <div className="settings-msg" role="status" aria-live="polite">{keyMsg}</div>}
               </>
             )}
 
@@ -981,14 +1060,14 @@ export function Settings() {
                 <div className="settings-row">
                   <span className="settings-row-label">GROBID endpoint</span>
                   <div className="settings-row-control">
-                    <input className="input settings-input-md" value={grobidEndpoint} onChange={(e) => setGrobidEndpoint(e.target.value)} placeholder="http://localhost:8070" spellCheck={false} />
+                    <input className="input settings-input-md" value={grobidEndpoint} onChange={(e) => setGrobidEndpoint(e.target.value)} placeholder="http://localhost:8070" spellCheck={false} aria-label="GROBID endpoint" />
                   </div>
                 </div>
                 <p className="settings-note">Empty turns PDF ingestion off — “Ingest PDFs (GROBID)” needs an endpoint here.</p>
                 <div className="settings-row">
                   <span className="settings-row-label">OpenAlex email <span className="faint" style={{ fontWeight: 400 }}>· polite pool</span></span>
                   <div className="settings-row-control">
-                    <input className="input settings-input-md" value={openAlexMailto} onChange={(e) => setOpenAlexMailto(e.target.value)} placeholder="you@lab.edu" spellCheck={false} />
+                    <input className="input settings-input-md" value={openAlexMailto} onChange={(e) => setOpenAlexMailto(e.target.value)} placeholder="you@lab.edu" spellCheck={false} aria-label="OpenAlex contact email" />
                   </div>
                 </div>
                 <p className="settings-note">A contact email joins OpenAlex's polite pool, raising your rate limits.</p>
@@ -1001,6 +1080,7 @@ export function Settings() {
                   <span className="settings-row-label">Hidden terminal renderers <span className="faint" style={{ fontWeight: 400 }}>· processes always continue</span></span>
                   <div className="settings-row-control">
                     <Dropdown
+                      ariaLabel="Hidden terminal renderers"
                       value={String(hiddenResidents)}
                       options={[
                         { value: '0', name: 'Disk only', description: 'Lowest memory; reconstruct hidden terminal views from disk' },

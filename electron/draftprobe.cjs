@@ -94,11 +94,11 @@ app.whenReady().then(async () => {
     const row = window.__kaisola.getState().terminals.find((x) => x.id === ${JSON.stringify(out.id)})
     return { pendingCleared: !row?.bootPending }
   })()`)
-  const snap = await js(`window.kaisola.terminal.snapshot(${JSON.stringify(out.id)})`)
+  const snap = await js(`window.kaisola.terminal.snapshot(${JSON.stringify(out.id)}, window.__kaisola.getState().activeProjectId)`)
   const bootStayedMetadata = bootGuard.pendingCleared && !snap.output.includes('BOOT_MUST_NOT_BECOME_CHAT')
   const passed = out.continued && out.draftLeft === DRAFT && !snap.exited && bootStayedMetadata
   console.log('DRAFT=' + (passed ? 'PASS' : 'FAIL') + ' ' + JSON.stringify({ continued: out.continued, draftLeft: out.draftLeft, bootStayedMetadata, tail: snap.output.slice(-200).replace(/\s+/g, ' ') }))
-  await js(`window.kaisola.terminal.kill(${JSON.stringify(out.id)})`)
+  await js(`window.kaisola.terminal.kill(${JSON.stringify(out.id)}, window.__kaisola.getState().activeProjectId)`)
   await wait(200)
   app.exit(passed ? 0 : 1)
 })

@@ -94,6 +94,34 @@
 .onboarding-error { color: #b64545; }
 .onboarding-account { display: flex; align-items: center; gap: 7px; margin-top: 22px; color: #8a8f98; font-size: 12px; }
 
+/* Terminal pop-outs and restored windows can legitimately reopen at their
+ * 420×280 minimum. Keep the first-run action reachable there instead of
+ * centering a tall card whose buttons fall below the viewport. */
+@media (max-height: 520px) {
+  .onboarding {
+    place-items: start center;
+    padding: 12px 16px;
+    overflow-y: auto;
+  }
+
+  .onboarding-card { margin: auto 0; }
+  .onboarding-mark {
+    width: 34px;
+    height: 34px;
+    margin-bottom: 10px;
+    border-radius: 11px;
+  }
+  .onboarding-kicker { margin-bottom: 4px; font-size: 11px; }
+  .onboarding h1 { font-size: clamp(23px, 7vw, 30px); }
+  .onboarding-copy { margin: 8px 0 12px; font-size: 13px; line-height: 1.4; }
+  .onboarding-actions { gap: 6px; }
+  .onboarding-google,
+  .onboarding-local { min-height: 38px; font-size: 13px; }
+  .onboarding-note,
+  .onboarding-error { margin-top: 8px; font-size: 10.5px; line-height: 1.35; }
+  .onboarding-account { margin-top: 10px; }
+}
+
 @keyframes onboarding-in {
   from { opacity: 0; transform: translateY(8px); }
   to { opacity: 1; transform: translateY(0); }

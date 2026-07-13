@@ -17,6 +17,17 @@ const os = require('node:os')
 const path = require('node:path')
 
 const MAX_BUFFER = 32 * 1024 * 1024
+const COMMIT_ID_RE = /^[0-9a-f]{40}(?:[0-9a-f]{24})?$/i
+const isCommitId = (value) => {
+  if (typeof value !== 'string') return false
+  const match = COMMIT_ID_RE.exec(value)
+  return match?.[0] === value
+}
+const invalidCheckpoint = () => ({
+  ok: false,
+  invalidCheckpoint: true,
+  message: 'Checkpoint must be an exact commit id.',
+})
 
 function git(cwd, args, env) {
   return new Promise((resolve) => {
@@ -85,12 +96,14 @@ async function ensureShadow(root) {
 
 /** Does the shadow have this object? Legacy checkpoints live in the real repo. */
 async function inShadow(root, sha) {
+  if (!isCommitId(sha)) return false
   const r = await sgit(root, ['cat-file', '-e', `${sha}^{commit}`])
   return r.ok
 }
 
 /** Point the shadow's MAIN index at a snapshot tree (status diffs against it). */
 async function ensureIndexAt(root, sha) {
+  if (!isCommitId(sha)) return false
   const dir = shadowDirFor(root)
   if (shadowIndexAt.get(dir) === sha) return true
   const r = await sgit(root, ['read-tree', sha])
@@ -144,6 +157,7 @@ async function snapshot(root, label) {
 /** name-status list of what changed since a SHADOW snapshot (status-based:
  *  stat-cache fast after the first pass, and untracked files just work). */
 async function shadowChanges(root, sha) {
+  if (!isCommitId(sha)) return invalidCheckpoint()
   return withIndexLock(root, async () => {
     if (!(await ensureIndexAt(root, sha))) return { ok: false, message: 'checkpoint not found' }
     const st = await sgit(root, ['status', '--porcelain=v1', '-z', '--untracked-files=all'])
@@ -166,6 +180,7 @@ async function shadowChanges(root, sha) {
 // ── legacy (pre-shadow) checkpoints: commits on hidden refs in the REAL repo ──
 
 async function legacyChanges(root, sha) {
+  if (!isCommitId(sha)) return invalidCheckpoint()
   const seen = new Set()
   const files = []
   const st = await git(root, ['status', '--porcelain=v1', '-z', '--untracked-files=all'])
@@ -219,6 +234,7 @@ async function legacyChanges(root, sha) {
 }
 
 async function changesFor(root, sha) {
+  if (!isCommitId(sha)) return invalidCheckpoint()
   return (await inShadow(root, sha)) ? shadowChanges(root, sha) : legacyChanges(root, sha)
 }
 
@@ -257,9 +273,10 @@ function registerGitHandlers(ipcMain) {
   })
 
   ipcMain.handle('git:changes', async (_e, { cwd, sha } = {}) => {
+    if (sha !== undefined && sha !== null && !isCommitId(sha)) return invalidCheckpoint()
     const root = cwd && (await repoRoot(cwd))
     if (!root) return { ok: false, notRepo: true }
-    if (sha) return changesFor(root, sha)
+    if (sha !== undefined && sha !== null) return changesFor(root, sha)
     // no checkpoint yet → uncommitted changes vs the REAL repo's HEAD
     // (--no-renames: keep -z output one record per file — see git:status)
     const st = await git(root, ['status', '--porcelain=v1', '-z', '--no-renames', '--untracked-files=all'])
@@ -273,6 +290,10 @@ function registerGitHandlers(ipcMain) {
 
   // a file's content at a snapshot — the base buffer for the merge view
   ipcMain.handle('git:show', async (_e, { cwd, sha, file } = {}) => {
+    // The checkpoint/turn-blame path accepts only immutable commit IDs. The
+    // Git panel additionally needs these two fixed, non-option sentinels for
+    // its HEAD and index sides; no renderer-provided arbitrary rev syntax.
+    if (!isCommitId(sha) && sha !== 'HEAD' && sha !== ':0') return invalidCheckpoint()
     const root = cwd && (await repoRoot(cwd))
     if (!root) return { ok: false, notRepo: true }
     const rel = path.isAbsolute(file) ? path.relative(root, file) : file
@@ -379,6 +400,9 @@ function registerGitHandlers(ipcMain) {
   // Restore the working tree to a snapshot. Files present-now-but-absent-then
   // go to the Trash (recoverable), never rm. The user's index is untouched.
   ipcMain.handle('git:restore', async (_e, { cwd, sha } = {}) => {
+    // Validate before loading Electron, resolving a repo, invoking Git, or
+    // touching Trash. Option-like/corrupt persisted refs are inert.
+    if (!isCommitId(sha)) return invalidCheckpoint()
     const { shell } = require('electron')
     const root = cwd && (await repoRoot(cwd))
     if (!root) return { ok: false, notRepo: true }
@@ -387,27 +411,45 @@ function registerGitHandlers(ipcMain) {
     if (!ch.ok) return ch
     let restored = 0
     let trashed = 0
+    const paths = ch.files.filter((f) => f.status !== 'A').map((f) => `:(literal)${f.path}`)
+    const restore = await withIndexLock(root, async () => {
+      try {
+        for (let i = 0; i < paths.length; i += 200) {
+          const batch = paths.slice(i, i + 200)
+          // legacy (real-repo) snapshots: `git restore --worktree` — `checkout <sha> --`
+          // would also stage every restored file into the user's real index
+          const co = shadow
+            ? await sgit(root, ['checkout', sha, '--', ...batch])
+            : await git(root, ['restore', '--source', sha, '--worktree', '--', ...batch])
+          if (!co.ok) {
+            return {
+              ok: false,
+              message: (co.stderr.trim() || 'Git could not restore every checkpoint file.').slice(0, 500),
+              failedPaths: batch.map((literalPath) => literalPath.replace(/^:\(literal\)/, '')),
+            }
+          }
+          restored += batch.length
+        }
+        return { ok: true }
+      } finally {
+        // checkout mutates the shadow index. Force the next status/restore to
+        // re-read the checkpoint even when a later batch failed.
+        if (shadow) shadowIndexAt.delete(shadowDirFor(root))
+      }
+    })
+    if (!restore.ok) return { ...restore, restored, trashed: 0 }
+    // Only remove files that did not exist in the checkpoint after every
+    // tracked file was restored successfully. A checkout/index failure can no
+    // longer trash user files and then falsely report success.
     for (const f of ch.files) {
       if (f.status !== 'A') continue
       try {
         await shell.trashItem(path.join(root, f.path))
         trashed += 1
-      } catch { /* already gone */ }
-    }
-    const paths = ch.files.filter((f) => f.status !== 'A').map((f) => `:(literal)${f.path}`)
-    await withIndexLock(root, async () => {
-      for (let i = 0; i < paths.length; i += 200) {
-        const batch = paths.slice(i, i + 200)
-        // legacy (real-repo) snapshots: `git restore --worktree` — `checkout <sha> --`
-        // would also stage every restored file into the user's real index
-        const co = shadow
-          ? await sgit(root, ['checkout', sha, '--', ...batch])
-          : await git(root, ['restore', '--source', sha, '--worktree', '--', ...batch])
-        if (co.ok) restored += batch.length
+      } catch (error) {
+        return { ok: false, restored, trashed, message: `Checkpoint files were restored, but ${f.path} could not be moved to Trash: ${String(error?.message ?? error)}` }
       }
-      // the shadow index tracked the restore via checkout; re-aim to be exact
-      if (shadow) shadowIndexAt.delete(shadowDirFor(root))
-    })
+    }
     return { ok: true, restored, trashed }
   })
 }

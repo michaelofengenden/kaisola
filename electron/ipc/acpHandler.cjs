@@ -70,17 +70,72 @@ let acpTermSeq = 0
 // autonomy is PER-CONNECTION (entry.autonomy) — this is only the initial default
 // a connect uses when the renderer didn't send one.
 const DEFAULT_AUTONOMY = 'propose'
-// sensitive-file guardrails (Zed's pattern): agents' fs channel refuses these.
-// The renderer owns the list (Settings) and pushes updates; defaults mirror it.
-let sensitiveGlobs = ['**/.env*', '**/*.pem', '**/*.key', '**/*.cert', '**/*.crt', '**/.dev.vars', '**/secrets.yml']
+// Sensitive-file guardrails (Zed's pattern): agents' fs channel refuses these.
+// Each renderer owns its own bounded list. A process-global mutable list let one
+// live window silently change another window's filesystem policy.
+const DEFAULT_SENSITIVE_GLOBS = Object.freeze(['**/.env*', '**/*.pem', '**/*.key', '**/*.cert', '**/*.crt', '**/.dev.vars', '**/secrets.yml'])
+const MAX_SENSITIVE_GLOBS = 64
+const MAX_SENSITIVE_GLOB_LENGTH = 512
+const MAX_SENSITIVE_GLOB_INPUTS = MAX_SENSITIVE_GLOBS * 4
+const sensitiveGlobsBySender = new Map()
+
+function sanitizeSensitiveGlobs(value) {
+  if (!Array.isArray(value)) return null
+  const clean = []
+  const seen = new Set()
+  for (const raw of value.slice(0, MAX_SENSITIVE_GLOB_INPUTS)) {
+    if (typeof raw !== 'string') continue
+    // NUL cannot occur in a filesystem path. Preserve other characters,
+    // including newlines, because renderer and main deliberately use the same
+    // case-insensitive dotAll wildcard semantics.
+    const glob = raw.replaceAll('\0', '').trim().slice(0, MAX_SENSITIVE_GLOB_LENGTH)
+    if (!glob || seen.has(glob)) continue
+    seen.add(glob)
+    clean.push(glob)
+    if (clean.length >= MAX_SENSITIVE_GLOBS) break
+  }
+  return Object.freeze(clean)
+}
+
+function sensitiveGlobsForSender(sender) {
+  return (sender && sensitiveGlobsBySender.get(sender)) || DEFAULT_SENSITIVE_GLOBS
+}
+
+/** Bind an entry to a renderer and reset its policy to that renderer's list.
+ * Adoption must never carry the previous window's custom guardrails forward. */
+function bindEntryToSender(entry, sender) {
+  entry.sender = sender
+  entry.sensitiveGlobs = sensitiveGlobsForSender(sender)
+  return entry
+}
+
+function setRendererSensitiveGlobs(sender, value) {
+  const clean = sanitizeSensitiveGlobs(value)
+  if (!sender || !clean) return null
+  sensitiveGlobsBySender.set(sender, clean)
+  // Update only entries owned by this exact WebContents object. Renderer ids
+  // can be reused after destruction; id equality must not inherit old policy.
+  for (const entry of connections.values()) {
+    if (entry.sender === sender) entry.sensitiveGlobs = clean
+  }
+  for (const task of connectTasks.values()) {
+    if (task.sender === sender && task.entry) task.entry.sensitiveGlobs = clean
+  }
+  return clean
+}
+
+function clearRendererSensitiveGlobs(sender) {
+  if (!sender) return false
+  return sensitiveGlobsBySender.delete(sender)
+}
 // MUST mirror src/lib/permissionRules.ts `wildcardMatch` (the canonical spec):
 // same flags 'is' (case-insensitive + dotAll) so a newline-containing path the
 // renderer flags sensitive is refused here too, not silently allowed.
 const globRe = (g) =>
   new RegExp('^' + g.split('*').map((s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('.*') + '$', 'is')
-function isSensitivePath(p) {
+function isSensitivePath(p, globs = DEFAULT_SENSITIVE_GLOBS) {
   const s = String(p || '')
-  return sensitiveGlobs.some(
+  return globs.some(
     (g) => globRe(g).test(s) || (g.startsWith('**/') && (globRe(g.slice(3)).test(s) || globRe('*' + g.slice(2)).test(s))),
   )
 }
@@ -142,6 +197,9 @@ const connections = new Map()
 const connectTasks = new Map() // internalKey -> completion gate (dedup handshakes)
 const ikey = (sender, presetId) => `${sender.id}|${presetId}`
 const entryFor = (sender, presetId) => connections.get(ikey(sender, presetId))
+const terminalOwnerMoves = new WeakSet()
+const projectMoves = new Set()
+const projectMoveKey = (sender, scope) => `${sender?.id ?? 'none'}|${scope || ''}`
 let processLedger = null
 const connectionLeases = new Map() // internalKey -> Set<renderer thread id>
 const idleTimers = new Map()
@@ -169,6 +227,10 @@ function scheduleIdlePark(internalKey, requestedMs) {
     if ((connectionLeases.get(internalKey)?.size ?? 0) > 0) return
     const entry = connections.get(internalKey)
     if (!entry || !entry.conn || !entry.conn.alive) return
+    if (terminalOwnerMoves.has(entry)) {
+      scheduleIdlePark(internalKey, delay)
+      return
+    }
     // Conservative gate: only an agent that promised session/load and has a
     // durable session id may park. Never stop a turn or a permission wait.
     if (!canIdlePark(entry)) {
@@ -291,7 +353,7 @@ function acpProjectTransferState(sender, scope) {
 /** Rekey idle ACP connections + leases to a receiving renderer without
  * restarting their adapter processes. Returns an exact rollback for a failed
  * renderer adoption. */
-function transferAcpProject(fromSender, toSender, scope) {
+async function transferAcpProject(fromSender, toSender, scope) {
   const state = acpProjectTransferState(fromSender, scope)
   if (!state.safe) return { ok: false, ...state }
   const moves = [...connections.entries()].filter(
@@ -299,6 +361,54 @@ function transferAcpProject(fromSender, toSender, scope) {
   ).map(([oldKey, entry]) => ({ oldKey, newKey: ikey(toSender, entry.meta.key || entry.meta.presetId), entry }))
   if (moves.some(({ newKey, entry }) => connections.has(newKey) && connections.get(newKey) !== entry)) {
     return { ok: false, collision: true }
+  }
+  if (moves.some(({ entry }) => terminalOwnerMoves.has(entry))) return { ok: false, busy: true }
+  const sourceMoveKey = projectMoveKey(fromSender, scope)
+  const targetMoveKey = projectMoveKey(toSender, scope)
+  if (projectMoves.has(sourceMoveKey) || projectMoves.has(targetMoveKey)) return { ok: false, busy: true }
+  for (const { entry } of moves) terminalOwnerMoves.add(entry)
+  projectMoves.add(sourceMoveKey)
+  projectMoves.add(targetMoveKey)
+  let settled = false
+  const unlock = () => {
+    if (settled) return
+    settled = true
+    for (const { entry } of moves) terminalOwnerMoves.delete(entry)
+    projectMoves.delete(sourceMoveKey)
+    projectMoves.delete(targetMoveKey)
+  }
+  const transferred = []
+  try {
+    for (const move of moves) {
+      const result = await transferEntryTerminalOwnership(move.entry, toSender)
+      if (!result.ok) {
+        for (const prior of [...transferred].reverse()) {
+          await transferEntryTerminalOwnership(prior.entry, fromSender).catch(() => ({ ok: false }))
+        }
+        unlock()
+        return { ok: false, terminalTransfer: true, message: result.message }
+      }
+      transferred.push(move)
+    }
+    // IPC stays live while broker handoffs await. Revalidate the authoritative
+    // turn/permission state and exact map identity before changing ownership.
+    const finalState = acpProjectTransferState(fromSender, scope)
+    const intact = moves.every(({ oldKey, entry }) =>
+      connections.get(oldKey) === entry && (entry.sender === fromSender || entry.sender?.id === fromSender?.id),
+    )
+    if (!finalState.safe || !intact) {
+      for (const prior of [...transferred].reverse()) {
+        await transferEntryTerminalOwnership(prior.entry, fromSender).catch(() => ({ ok: false }))
+      }
+      unlock()
+      return { ok: false, stale: true, ...finalState }
+    }
+  } catch (error) {
+    for (const prior of [...transferred].reverse()) {
+      await transferEntryTerminalOwnership(prior.entry, fromSender).catch(() => ({ ok: false }))
+    }
+    unlock()
+    return { ok: false, terminalTransfer: true, message: String(error?.message || error) }
   }
   const apply = (forward) => {
     for (const move of moves) {
@@ -310,14 +420,53 @@ function transferAcpProject(fromSender, toSender, scope) {
       clearIdleTimer(toKey)
       connectionLeases.delete(fromKey)
       connections.delete(fromKey)
-      move.entry.sender = owner
+      bindEntryToSender(move.entry, owner)
       connections.set(toKey, move.entry)
       if (leases?.size) connectionLeases.set(toKey, new Set(leases))
       else scheduleIdlePark(toKey)
     }
   }
   apply(true)
-  return { ok: true, moved: moves.length, rollback: () => apply(false) }
+  return {
+    ok: true,
+    moved: moves.length,
+    commit: () => { unlock(); return { ok: true } },
+    rollback: async () => {
+      if (settled) return { ok: false, settled: true }
+      const collision = moves.some(({ oldKey, entry }) => connections.has(oldKey) && connections.get(oldKey) !== entry)
+      if (collision) {
+        // Never overwrite a replacement source connection. End only the moved
+        // duplicate; its terminal host still knows the exact current owners
+        // and releases them before the adapter process is reaped.
+        for (const move of moves) {
+          if (connections.get(move.newKey) === move.entry) connections.delete(move.newKey)
+          connectionLeases.delete(move.newKey)
+          clearIdleTimer(move.newKey)
+          cancelPendingFor(move.entry)
+          clearCancelWatchdog(move.entry)
+          move.entry.conn.dispose()
+        }
+        unlock()
+        return { ok: false, collision: true, disposed: true }
+      }
+      for (const move of [...moves].reverse()) {
+        const result = await transferEntryTerminalOwnership(move.entry, fromSender)
+        if (!result.ok) {
+          for (const stale of moves) {
+            if (connections.get(stale.newKey) === stale.entry) connections.delete(stale.newKey)
+            connectionLeases.delete(stale.newKey)
+            clearIdleTimer(stale.newKey)
+            stale.entry.conn.dispose()
+          }
+          unlock()
+          return { ok: false, message: result.message, disposed: true }
+        }
+      }
+      apply(false)
+      unlock()
+      return { ok: true }
+    },
+  }
 }
 
 /** Renderer destruction is not guaranteed to run React effect cleanup. Clear
@@ -325,6 +474,10 @@ function transferAcpProject(fromSender, toSender, scope) {
  * conservative idle timer without stopping any live turn. */
 function releaseAcpRenderer(sender) {
   if (!sender) return 0
+  // Entries keep their last policy while orphaned. Remove only the destroyed
+  // renderer's lookup record; adoption explicitly rebinds to the new owner's
+  // policy (or the safe defaults) through bindEntryToSender.
+  clearRendererSensitiveGlobs(sender)
   let released = 0
   for (const [internalKey, entry] of connections) {
     if (entry.sender !== sender && entry.sender?.id !== sender.id) continue
@@ -688,11 +841,22 @@ function resolveConfig(config) {
   return { presetId: p.id, name: p.name, command: p.command, args: p.args, env: p.env, modern: p.modern, adapterVersion: p.adapterVersion }
 }
 
-function buildTerminalHost(entry, sessionCwd, agentKey, agentName) {
-  return {
+function buildTerminalHost(entry, sessionCwd, agentKey, agentName, projectId, brokerClient = sessionBroker()) {
+  // A broker PTY is owned by the renderer that created (or explicitly
+  // adopted) it. Keep that owner per terminal instead of consulting the
+  // mutable entry.sender: a renderer can crash or a project can move while an
+  // ACP adapter still owns completed command terminals that it must release.
+  const controlOwners = new Map()
+  const controlOwner = (terminalId) => {
+    const owner = controlOwners.get(terminalId)
+    if (!owner) throw new Error('Agent terminal ownership is unavailable.')
+    return owner
+  }
+  const host = {
     async create({ command, args, env, cwd, outputByteLimit }) {
       const terminalId = `acp-term-${++acpTermSeq}`
-      const created = await sessionBroker().terminal('create', entry.sender, {
+      const owner = entry.sender
+      const created = await brokerClient.terminal('create', owner, {
         id: terminalId,
         command,
         args,
@@ -701,20 +865,60 @@ function buildTerminalHost(entry, sessionCwd, agentKey, agentName) {
         outputByteLimit,
         cols: 100,
         rows: 30,
+        projectId,
       }, { timeoutMs: 20_000 })
       if (!created?.ok) throw new Error(created?.message || 'Could not start the agent terminal.')
+      controlOwners.set(terminalId, owner)
       const label = [command, ...(args || [])].join(' ').slice(0, 80)
       sendTo(entry, 'acp:terminal', { terminalId, command, label, cwd: cwd || sessionCwd, agentKey, agentName })
       return { terminalId }
     },
     async output(terminalId) {
-      const s = await sessionBroker().terminal('output', entry.sender, { id: terminalId })
+      const s = await brokerClient.terminal('output', controlOwner(terminalId), { id: terminalId, projectId })
       return { output: s.output, truncated: !!s.truncated, exitStatus: s.exitStatus }
     },
-    waitForExit(terminalId) { return sessionBroker().terminal('waitForExit', entry.sender, { id: terminalId }, { timeoutMs: 0 }) },
-    kill(terminalId) { return sessionBroker().terminal('kill', entry.sender, { id: terminalId }) },
-    release(terminalId) { return sessionBroker().terminal('release', entry.sender, { id: terminalId }) },
+    waitForExit(terminalId) { return brokerClient.terminal('waitForExit', controlOwner(terminalId), { id: terminalId, projectId }, { timeoutMs: 0 }) },
+    kill(terminalId) { return brokerClient.terminal('kill', controlOwner(terminalId), { id: terminalId, projectId }) },
+    async release(terminalId) {
+      const result = await brokerClient.terminal('release', controlOwner(terminalId), { id: terminalId, projectId }, { timeoutMs: 3_000 })
+      controlOwners.delete(terminalId)
+      return result
+    },
+    async transferOwnership(terminalIds, toSender) {
+      const moved = []
+      try {
+        for (const terminalId of terminalIds) {
+          const fromSender = controlOwner(terminalId)
+          if (fromSender === toSender) continue
+          await brokerClient.terminal('attach', toSender, { id: terminalId, projectId })
+          controlOwners.set(terminalId, toSender)
+          moved.push({ terminalId, fromSender })
+        }
+        return { ok: true, moved: moved.length }
+      } catch (error) {
+        // Attach is a same-project capability handoff. Put every completed
+        // handoff back before reporting failure so host and broker can never
+        // disagree about which renderer may clean up the PTY.
+        for (const move of moved.reverse()) {
+          try {
+            await brokerClient.terminal('attach', move.fromSender, { id: move.terminalId, projectId })
+            controlOwners.set(move.terminalId, move.fromSender)
+          } catch { /* preserve the first failure for diagnostics */ }
+        }
+        return { ok: false, message: String(error?.message || error) }
+      }
+    },
   }
+  return host
+}
+
+async function transferEntryTerminalOwnership(entry, toSender) {
+  const terminalIds = [...(entry?.conn?.ownedTerminalIds || [])]
+  if (!terminalIds.length) return { ok: true, moved: 0 }
+  if (!entry?.terminalHost?.transferOwnership) {
+    return { ok: false, message: 'Agent terminal ownership cannot be transferred safely.' }
+  }
+  return entry.terminalHost.transferOwnership(terminalIds, toSender)
 }
 
 function friendly(resolved, err, stderrTail) {
@@ -768,7 +972,7 @@ function registerAcpHandlers(ipcMain) {
   // ONLY orphaned connections (their window's webContents destroyed) are
   // adopted by the caller — so agents survive a window close/reopen on macOS,
   // while a second live window can never hijack the first window's agents.
-  ipcMain.handle('acp:status', (event, { clientKeys, scope } = {}) => {
+  ipcMain.handle('acp:status', async (event, { clientKeys, scope } = {}) => {
     const requested = Array.isArray(clientKeys) ? new Set(clientKeys.filter((key) => typeof key === 'string')) : null
     for (const [k, entry] of [...connections.entries()]) {
       if (!entry.sender || entry.sender.isDestroyed()) {
@@ -777,12 +981,17 @@ function registerAcpHandlers(ipcMain) {
         if (scope && entry.meta?.scope && entry.meta.scope !== scope) continue
         if (requested && !requested.has(bareKey)) continue
         const nk = ikey(event.sender, rendererKey)
-        if (!connections.has(nk)) {
+        if (!connections.has(nk) && !terminalOwnerMoves.has(entry)) {
+          terminalOwnerMoves.add(entry)
+          const terminalMove = await transferEntryTerminalOwnership(entry, event.sender)
+            .catch((error) => ({ ok: false, message: String(error?.message || error) }))
+          terminalOwnerMoves.delete(entry)
+          if (!terminalMove.ok) continue
           const oldLeases = connectionLeases.get(k)
           clearIdleTimer(k)
           connectionLeases.delete(k)
           connections.delete(k)
-          entry.sender = event.sender
+          bindEntryToSender(entry, event.sender)
           connections.set(nk, entry)
           if (oldLeases?.size) connectionLeases.set(nk, new Set(oldLeases))
           if ((connectionLeases.get(nk)?.size ?? 0) === 0) scheduleIdlePark(nk)
@@ -826,6 +1035,9 @@ function registerAcpHandlers(ipcMain) {
     // two independent connections/sessions. The composed key is what the
     // renderer echoes back on every later call (bridge.ts scopes/unscopes it).
     const scope = typeof config.scope === 'string' && config.scope ? config.scope : ''
+    if (scope && projectMoves.has(projectMoveKey(event.sender, scope))) {
+      return { ok: false, moving: true, message: 'This project is moving to another window. Try again in a moment.' }
+    }
     const clientKey = typeof config.clientKey === 'string' && config.clientKey.length <= 240 && !config.clientKey.includes('@@')
       ? config.clientKey
       : resolved.presetId
@@ -863,7 +1075,7 @@ function registerAcpHandlers(ipcMain) {
     // entry.sender tracks the CURRENT window (acp:status rebinds it), so these
     // callbacks keep reaching the renderer after a window close/reopen
     const processToken = processLedger ? processLedger.newToken() : null
-    const entry = { conn: null, meta: null, sender: event.sender, controls: { modes: null, configOptions: [] }, availableCommands: [], current: { sender: null, channel: null }, inFlightTurns: 0, cancelRequested: false, autonomy: config.autonomy || DEFAULT_AUTONOMY, processToken }
+    const entry = bindEntryToSender({ conn: null, terminalHost: null, meta: null, controls: { modes: null, configOptions: [] }, availableCommands: [], current: { sender: null, channel: null }, inFlightTurns: 0, cancelRequested: false, autonomy: config.autonomy || DEFAULT_AUTONOMY, processToken }, event.sender)
     connectTask.entry = entry
 
     // per-connection env on top of the preset's (e.g. CLAUDE_CONFIG_DIR / CODEX_HOME
@@ -891,12 +1103,24 @@ function registerAcpHandlers(ipcMain) {
     const sessionMeta = resolved.presetId === 'claude-code' && CLAUDE_EFFORTS.has(config.claudeEffort)
       ? { claudeCode: { options: { effort: config.claudeEffort } } }
       : null
+    const terminalHost = buildTerminalHost(entry, sessionCwd, key, resolved.name, scope)
+    entry.terminalHost = terminalHost
     const conn = new AcpConnection(
       // every ACP agent gets the shared Kaisola MCP server (project state +
       // agent-task ledger) plus the workspace's armed external servers
       // (.mcp.json approved + user catalog). The connection filters remote
       // entries per the agent's declared mcp capabilities at session time.
-      { command: resolved.command, args: resolved.args, env, cwd: sessionCwd, sessionMeta, mcpServers: [mcpHttpEntry(), ...acpEntries(sessionCwd, { http: true, sse: true })].filter(Boolean) },
+      {
+        command: resolved.command,
+        args: resolved.args,
+        env,
+        cwd: sessionCwd,
+        sessionMeta,
+        mcpServers: [
+          mcpHttpEntry({ projectId: config.scope, workspace: sessionCwd, sender: entry.sender }),
+          ...acpEntries(sessionCwd, { http: true, sse: true }),
+        ].filter(Boolean),
+      },
       {
         onUpdate: (params) => {
           const update = params && params.update ? params.update : params
@@ -966,8 +1190,8 @@ function registerAcpHandlers(ipcMain) {
             })
           })
         },
-        terminalHost: buildTerminalHost(entry, sessionCwd, key, resolved.name),
-        fsGuard: (p) => !isSensitivePath(p),
+        terminalHost,
+        fsGuard: (p) => !isSensitivePath(p, entry.sensitiveGlobs),
         onSpawn: ({ pid, pgid, command }) => processLedger?.recordSpawn({ token: processToken, pid, pgid, presetId: resolved.presetId, command }),
         onProcessExit: () => processLedger?.recordExit(processToken),
       },
@@ -1021,6 +1245,7 @@ function registerAcpHandlers(ipcMain) {
   ipcMain.handle('acp:prompt', async (event, { agentKey, reqId, text, images } = {}) => {
     const entry = entryFor(event.sender, agentKey)
     if (!entry || !entry.conn.alive) return { ok: false, message: 'Agent not connected.' }
+    if (terminalOwnerMoves.has(entry)) return { ok: false, moving: true, message: 'This project is moving to another window. Try again in a moment.' }
     if (entry.current.channel || (entry.inFlightTurns ?? 0) > 0) return { ok: false, message: 'The previous agent turn is still stopping — send again in a moment.' }
     entry.cancelRequested = false
     // identity token: acp:cancel may null entry.current to free the composer for a
@@ -1113,18 +1338,21 @@ function registerAcpHandlers(ipcMain) {
   ipcMain.handle('acp:setMode', async (event, { agentKey, modeId } = {}) => {
     const entry = entryFor(event.sender, agentKey)
     if (!entry || !entry.conn.alive) return { ok: false, message: 'Agent not connected.' }
+    if (terminalOwnerMoves.has(entry)) return { ok: false, moving: true }
     try { await entry.conn.setMode(modeId); return { ok: true } } catch (err) { return { ok: false, message: err.message } }
   })
 
   ipcMain.handle('acp:setConfigOption', async (event, { agentKey, configId, value } = {}) => {
     const entry = entryFor(event.sender, agentKey)
     if (!entry || !entry.conn.alive) return { ok: false, message: 'Agent not connected.' }
+    if (terminalOwnerMoves.has(entry)) return { ok: false, moving: true }
     try { await entry.conn.setConfigOption(configId, value); return { ok: true } } catch (err) { return { ok: false, message: err.message } }
   })
 
   ipcMain.handle('acp:setModel', async (event, { agentKey, modelId } = {}) => {
     const entry = entryFor(event.sender, agentKey)
     if (!entry || !entry.conn.alive) return { ok: false, message: 'Agent not connected.' }
+    if (terminalOwnerMoves.has(entry)) return { ok: false, moving: true }
     try { await entry.conn.setModel(modelId); return { ok: true } } catch (err) { return { ok: false, message: err.message } }
   })
 
@@ -1135,6 +1363,7 @@ function registerAcpHandlers(ipcMain) {
   ipcMain.handle('acp:authenticate', async (event, { agentKey, methodId } = {}) => {
     const entry = entryFor(event.sender, agentKey)
     if (!entry) return { ok: false, message: 'Agent not connected.' }
+    if (terminalOwnerMoves.has(entry)) return { ok: false, moving: true }
     // never send a methodId the agent didn't advertise — agents answer an
     // unknown/absent id with a bare JSON-RPC "Invalid params", which is
     // useless to a human. Fall back to the first advertised method.
@@ -1150,9 +1379,10 @@ function registerAcpHandlers(ipcMain) {
     return { ok: true }
   })
 
-  // renderer-owned guardrail globs (Settings → Agents)
-  ipcMain.on('acp:guardrails', (_e, globs) => {
-    if (Array.isArray(globs)) sensitiveGlobs = globs.filter((g) => typeof g === 'string' && g.trim())
+  // Renderer-owned guardrail globs (Settings → Agents). Never let one live
+  // WebContents mutate the filesystem policy of another.
+  ipcMain.on('acp:guardrails', (event, globs) => {
+    setRendererSensitiveGlobs(event.sender, globs)
   })
 
   // live autonomy dial: apply to EVERY connection this window owns (keys start
@@ -1214,6 +1444,7 @@ function registerAcpHandlers(ipcMain) {
   ipcMain.handle('acp:close-session', async (event, { agentKey } = {}) => {
     const entry = entryFor(event.sender, agentKey)
     if (!entry?.conn?.alive) return { ok: true, closed: false }
+    if (terminalOwnerMoves.has(entry)) return { ok: false, closed: false, moving: true }
     if (!entry.conn.canCloseSession) return { ok: true, closed: false }
     try {
       const result = await entry.conn.closeSession()
@@ -1233,6 +1464,7 @@ function registerAcpHandlers(ipcMain) {
     clearIdleTimer(internalKey)
     connectionLeases.delete(internalKey)
     const entry = connections.get(internalKey)
+    if (entry && terminalOwnerMoves.has(entry)) return { ok: false, moving: true }
     if (entry) {
       cancelPendingFor(entry) // drop any inline cards before the connection goes away
       clearCancelWatchdog(entry)
@@ -1243,14 +1475,16 @@ function registerAcpHandlers(ipcMain) {
   })
 }
 
-function disposeAcp() {
+async function disposeAcp() {
   for (const timer of idleTimers.values()) clearTimeout(timer)
   idleTimers.clear()
   connectionLeases.clear()
-  for (const e of connections.values()) { clearCancelWatchdog(e); e.conn.dispose() }
-  for (const task of connectTasks.values()) task.entry?.conn?.dispose()
+  const entries = new Set([...connections.values(), ...[...connectTasks.values()].map((task) => task.entry).filter(Boolean)])
+  for (const entry of entries) clearCancelWatchdog(entry)
+  await Promise.allSettled([...entries].map((entry) => entry.conn?.disposeAndWait?.() ?? Promise.resolve(entry.conn?.dispose())))
   connections.clear()
   connectTasks.clear()
+  sensitiveGlobsBySender.clear()
 }
 
 module.exports = {
@@ -1289,6 +1523,14 @@ module.exports = {
     acpProjectTransferState,
     transferAcpProject,
     releaseAcpRenderer,
+    sanitizeSensitiveGlobs,
+    sensitiveGlobsForSender,
+    setRendererSensitiveGlobs,
+    clearRendererSensitiveGlobs,
+    bindEntryToSender,
+    buildTerminalHost,
+    transferEntryTerminalOwnership,
+    isSensitivePath,
     resolveBundledCodexExecutable,
     resolveBundledClaudeExecutable,
   },

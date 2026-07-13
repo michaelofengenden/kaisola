@@ -361,7 +361,6 @@ export function SessionCards() {
               hue: sessionHue({ agentKey: t.agentKey, folder: meta?.root ?? meta?.cwd ?? t.cwd }),
               sub: showMetaFor(t.terminalId, t.cwd) ? metaLine(meta) : null,
               running: !!meta?.running,
-              poppable: true,
             },
           )
         }),

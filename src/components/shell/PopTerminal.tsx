@@ -1,5 +1,5 @@
 import { useEffect } from 'react'
-import { POP_WINDOW_HUE, POP_WINDOW_TITLE, useKaisola } from '../../store/store'
+import { POP_PROJECT_ID, POP_WINDOW_HUE, POP_WINDOW_TITLE, useKaisola } from '../../store/store'
 import { bridge } from '../../lib/bridge'
 import { Terminal } from '../Terminal'
 import { Icon } from '../Icon'
@@ -16,6 +16,29 @@ export function PopTerminal({ termId }: { termId: string }) {
   useEffect(() => {
     document.documentElement.dataset.theme = theme
   }, [theme])
+  useEffect(() => {
+    const offMeta = bridge.terminal.onMeta((meta) => {
+      if (meta.id !== termId) return
+      useKaisola.getState().setTerminalMeta(termId, {
+        fgProcess: meta.fgProcess,
+        running: meta.running,
+        cwd: meta.cwd,
+        root: meta.root,
+        repo: meta.repo,
+        branch: meta.branch,
+        ...(typeof meta.agentBusy === 'boolean' ? { agentBusy: meta.agentBusy } : {}),
+        ...(meta.agentCompletedAt != null ? { agentCompletedAt: meta.agentCompletedAt } : {}),
+      })
+    })
+    const offActivity = bridge.terminal.onAgentActivity((activity) => {
+      if (activity.id !== termId) return
+      useKaisola.getState().setTerminalMeta(termId, {
+        agentBusy: activity.busy,
+        ...(activity.completedAt != null ? { agentCompletedAt: activity.completedAt } : {}),
+      })
+    })
+    return () => { offMeta(); offActivity() }
+  }, [termId])
   const title = POP_WINDOW_TITLE || meta?.repo || 'Terminal'
   const sub = meta?.branch ? `${meta.repo ?? ''} ⎇ ${meta.branch}` : meta?.cwd
   return (
@@ -33,7 +56,7 @@ export function PopTerminal({ termId }: { termId: string }) {
           <span className="grow" />
         </div>
         <div className="dock-pane-term">
-          <Terminal id={termId} attach />
+          <Terminal id={termId} attach projectId={POP_PROJECT_ID ?? undefined} />
         </div>
       </div>
     </div>

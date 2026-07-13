@@ -93,6 +93,10 @@ app.whenReady().then(async () => {
   // Liquid Glass prefs are cosmetic; the smoke shell answers with "unsupported"
   ipcMain.handle('shell:glass', () => ({ supported: false, active: false, enabled: false }))
   ipcMain.handle('shell:window-mode', () => ({ wantSolid: false, liveSolid: false }))
+  ipcMain.handle('window:popped', () => ({ ok: true, termIds: [], states: [], closed: [] }))
+  ipcMain.handle('window:pop-closed-ack', () => ({ ok: false }))
+  ipcMain.handle('window:pop', () => ({ ok: false }))
+  ipcMain.on('window:terminal-state', () => {})
   worktree.registerWorktreeHandlers(ipcMain)
 
   // Transactional tear-off/recombine replica: delivery waits for the renderer
@@ -267,24 +271,17 @@ app.whenReady().then(async () => {
     return !!document.querySelector('.wsrail')
   })()`)
   const autonomy = await win.webContents.executeJavaScript(`(document.querySelector('.autonomy-seg[data-active="true"]')||{}).innerText || ''`)
-  // auto-claude waits for a workspace (never boots the agent in $HOME): absent
-  // before one is chosen, prepared with the workspace as cwd right after.
+  // Opening a folder is not permission to spend tokens or start a provider.
+  // Claude remains opt-in through New session after a workspace is chosen.
   const claudeRoot = path.join(os.tmpdir(), 'kaisola-claude-smoke')
   fsx.mkdirSync(claudeRoot, { recursive: true })
-  const claudePrepared = await win.webContents.executeJavaScript(`(async () => {
+  const claudeOptIn = await win.webContents.executeJavaScript(`(async () => {
     const st = window.__kaisola.getState()
     const before = st.terminals.some((term) => term.singletonKey === 'agent:claude-code')
     st.setWorkspace(${JSON.stringify(claudeRoot)})
-    // the boot line is prepared asynchronously (hooks tap arms first)
     await new Promise((r) => setTimeout(r, 600))
-    const t = window.__kaisola.getState().terminals.find((term) => term.singletonKey === 'agent:claude-code')
-    // boot = \`claude\`, plus \`--settings '<hooks file>'\` when the tap armed,
-    // plus \`--mcp-config '<kaisola server>'\` when the MCP server is up, plus
-    // \`--resume <sid>\` / \`--continue\` when the workspace has history; a
-    // non-default account prefixes CLAUDE_CONFIG_DIR
-    const bootOk = !!t && typeof t.boot === 'string' &&
-      /^(CLAUDE_CONFIG_DIR=("[^"]+"|'[^']+') )?claude( --settings '[^']+')?( --mcp-config '[^']+')?( --resume '[^']+'| --continue)?$/.test(t.boot)
-    return !!(!before && t && bootOk && t.restart === true && t.name === 'Claude' && t.cwd === ${JSON.stringify(claudeRoot)})
+    const after = window.__kaisola.getState().terminals.some((term) => term.singletonKey === 'agent:claude-code')
+    return !before && !after
   })()`)
   const nativeWindow = {
     frame: false,
@@ -453,7 +450,7 @@ app.whenReady().then(async () => {
   console.log('ROOT_CHILDREN=' + rootChildren)
   console.log('MINIMAL_SHELL=' + JSON.stringify(minimalShell))
   console.log('AUTONOMY_DEFAULT=' + autonomy)
-  console.log('CLAUDE_DEFAULT=' + claudePrepared)
+  console.log('CLAUDE_OPT_IN=' + claudeOptIn)
   console.log('NATIVE_WINDOW=' + JSON.stringify(nativeWindow))
   console.log('ICON=' + JSON.stringify(icon))
   console.log('GLASS=' + JSON.stringify(glass))
@@ -504,13 +501,13 @@ app.whenReady().then(async () => {
     let buf = ''
     const id = 'smoke-pty'
     const off = window.kaisola.terminal.onData(id, d => { buf += d })
-    const cr = await window.kaisola.terminal.create(id, undefined, 80, 24)
+    const cr = await window.kaisola.terminal.create(id, undefined, 80, 24, st.activeProjectId)
     await new Promise(r => setTimeout(r, 500))
-    await window.kaisola.terminal.write(id, 'cd /tmp\\r')
+    await window.kaisola.terminal.write(id, 'cd /tmp\\r', st.activeProjectId)
     await new Promise(r => setTimeout(r, 300))
-    await window.kaisola.terminal.write(id, 'pwd\\r')
+    await window.kaisola.terminal.write(id, 'pwd\\r', st.activeProjectId)
     await new Promise(r => setTimeout(r, 600))
-    off(); window.kaisola.terminal.kill(id)
+    off(); window.kaisola.terminal.kill(id, st.activeProjectId)
     st.setTheme(previousTheme)
     return {
       run: !!(runRes && runRes.ok && (runRes.stdout||'').includes('pasola-run-ok')),
@@ -533,7 +530,7 @@ app.whenReady().then(async () => {
     st.setLayoutMode('studio')
     st.setDock(true, 'terminal')
     const terminal = st.terminals.find((row) => st.dockViews.includes(row.id)) || st.terminals[0]
-    await window.kaisola.terminal.write(terminal.id, "i=0; while [ $i -lt 180 ]; do echo viewport-$i; i=$((i+1)); done\\r")
+    await window.kaisola.terminal.write(terminal.id, "i=0; while [ $i -lt 180 ]; do echo viewport-$i; i=$((i+1)); done\\r", st.activeProjectId)
     await wait(700)
     const termViewport = document.querySelector('[data-terminal-id="' + terminal.id + '"] .xterm-viewport')
     if (termViewport) termViewport.scrollTop = termViewport.scrollHeight
@@ -601,26 +598,26 @@ app.whenReady().then(async () => {
     Object.defineProperty(document, 'hidden', { configurable: true, get: () => forcedHidden })
     document.dispatchEvent(new Event('visibilitychange'))
     await wait(1500) // terminal create + one-shot boot
-    const before = (await window.kaisola.terminal.diagnostics()).find((row) => row.id === id)
+    const before = (await window.kaisola.terminal.diagnostics(st.activeProjectId)).find((row) => row.id === id)
     const hostBefore = document.querySelector('.term-wrap[data-terminal-id="' + id + '"]')
 
     forcedHidden = true
     document.dispatchEvent(new Event('visibilitychange'))
     await wait(1550) // > WINDOW_HIBERNATE_GRACE_MS
     const asleepHost = document.querySelector('.term-wrap[data-terminal-id="' + id + '"]')
-    const asleepDiag = (await window.kaisola.terminal.diagnostics()).find((row) => row.id === id)
+    const asleepDiag = (await window.kaisola.terminal.diagnostics(st.activeProjectId)).find((row) => row.id === id)
     const rendererReleased = asleepHost?.getAttribute('data-renderer-awake') === 'false' && asleepDiag?.visible === false
-    await window.kaisola.terminal.write(id, 'echo hidden-output\\r')
+    await window.kaisola.terminal.write(id, 'echo hidden-output\\r', st.activeProjectId)
     await wait(300)
-    const detachedSnap = await window.kaisola.terminal.snapshot(id)
+    const detachedSnap = await window.kaisola.terminal.snapshot(id, st.activeProjectId)
     const spooled = (detachedSnap.output || '').includes('hidden-output')
 
     forcedHidden = false
     document.dispatchEvent(new Event('visibilitychange'))
     await wait(750)
     const awakeHost = document.querySelector('.term-wrap[data-terminal-id="' + id + '"]')
-    const after = (await window.kaisola.terminal.diagnostics()).find((row) => row.id === id)
-    const snap = await window.kaisola.terminal.snapshot(id)
+    const after = (await window.kaisola.terminal.diagnostics(st.activeProjectId)).find((row) => row.id === id)
+    const snap = await window.kaisola.terminal.snapshot(id, st.activeProjectId)
     const samePid = !!before?.pid && before.pid === after?.pid && !after?.exited
     const replayed = (snap.output || '').includes('hidden-output')
     const reattached = awakeHost?.getAttribute('data-renderer-awake') === 'true' && after?.visible === true
@@ -641,7 +638,7 @@ app.whenReady().then(async () => {
 
     if (originalHidden) Object.defineProperty(document, 'hidden', originalHidden)
     else delete document.hidden
-    await window.kaisola.terminal.kill(id)
+    await window.kaisola.terminal.kill(id, st.activeProjectId)
     st.closeTerminal(id)
     return {
       mounted: !!hostBefore && before?.visible === true,
@@ -677,31 +674,34 @@ app.whenReady().then(async () => {
     // Claude is an ACP chat agent (the + menu opens a thread); the prepared
     // per-project TERMINAL still exists separately (claudePrepared covers it)
     const claudeTerminal = !!(claude && !claude.terminalOnly && claude.name === 'Claude')
-    const conn = await window.kaisola.acp.connect({ presetId: 'mock' })
+    const current = window.__kaisola.getState()
+    const scope = current.activeProjectId
+    const conn = await window.kaisola.acp.connect({ presetId: 'mock', scope, cwd: current.workspacePath })
     if (!conn.ok) return { presets: presets.length, claudeTerminal, connect: false, message: conn.message }
+    const agentKey = conn.key
     const authCount = (conn.authMethods || []).length
     // standard ACP set_model (Gemini-style), set_config_option (codex-style), and authenticate
-    const setModelRes = await window.kaisola.acp.setModel('mock', 'mock-mini')
-    const setCfgRes = await window.kaisola.acp.setConfigOption('mock', 'reasoning_effort', 'low')
+    const setModelRes = await window.kaisola.acp.setModel(agentKey, 'mock-mini')
+    const setCfgRes = await window.kaisola.acp.setConfigOption(agentKey, 'reasoning_effort', 'low')
     let authUrlSeen = false
     const offN = window.kaisola.acp.onNotice((n) => { if (n.url) authUrlSeen = true })
-    const authRes = await window.kaisola.acp.authenticate('mock', 'oauth-mock')
+    const authRes = await window.kaisola.acp.authenticate(agentKey, 'oauth-mock')
     await new Promise((r) => setTimeout(r, 250))
     offN()
     let streamed = '', thought = '', tools = 0, termEvents = 0
     const offT = window.kaisola.acp.onTerminal(() => { termEvents++ })
-    const res = await window.kaisola.acp.prompt('mock', 'ping', (u) => {
+    const res = await window.kaisola.acp.prompt(agentKey, 'ping', (u) => {
       if (u.sessionUpdate === 'agent_message_chunk') streamed += (u.content && u.content.text) || ''
       else if (u.sessionUpdate === 'agent_thought_chunk') thought += (u.content && u.content.text) || ''
       else if (u.sessionUpdate === 'tool_call' || u.sessionUpdate === 'tool_call_update') tools++
     })
     offT()
-    const st = await window.kaisola.acp.status()
-    const c = (st.agents.find((a) => a.key === 'mock') || {}).controls || {}
+    const st = await window.kaisola.acp.status([agentKey], scope)
+    const c = (st.agents.find((a) => a.key === agentKey) || {}).controls || {}
     const modelAfter = (c.models || {}).currentModelId
     const reasoningAfter = ((c.configOptions || []).find((o) => o.id === 'reasoning_effort') || {}).currentValue
-    const cancelOk = (await window.kaisola.acp.cancel('mock')).ok
-    await window.kaisola.acp.disconnect('mock')
+    const cancelOk = (await window.kaisola.acp.cancel(agentKey)).ok
+    await window.kaisola.acp.disconnect(agentKey)
     return {
       presets: presets.length, claudeTerminal, connect: true, ok: !!res.ok, key: conn.key, cancelOk: !!cancelOk,
       authCount, authOk: !!authRes.ok, authUrlSeen, setModelOk: !!setModelRes.ok, setCfgOk: !!setCfgRes.ok,
@@ -740,7 +740,8 @@ app.whenReady().then(async () => {
   const permrules = await win.webContents.executeJavaScript(`(async () => {
     const st = window.__kaisola.getState()
     const prevWs = st.workspacePath
-    st.setWorkspace('/tmp/permrules-ws')
+    const ruleWs = prevWs || '/tmp/permrules-ws'
+    if (!prevWs) st.setWorkspace(ruleWs)
     const g = () => window.__kaisola.getState()
     const ask = (permId, kind, title) => ({ permId, key: 'mock', agent: 'Mock', title, kind,
       options: [
@@ -753,7 +754,7 @@ app.whenReady().then(async () => {
     g().pushPermission(ask('p3', 'edit', 'Edit notes.md'))
     g().alwaysAllowPermission('p1')
     const afterAlways = g().pendingPermissions.map((p) => p.permId)
-    const saved = g().permissionRules.some((r) => r.workspace === '/tmp/permrules-ws' && r.action === 'execute' && r.resource === 'git *')
+    const saved = g().permissionRules.some((r) => r.workspace === ruleWs && r.action === 'execute' && r.resource === 'git *')
     const cascaded = afterAlways.length === 1 && afterAlways[0] === 'p3' // p2 resolved retroactively
     // a NEW matching ask is auto-answered — no card
     g().receivePermission(ask('p4', 'execute', 'git log'))
@@ -763,8 +764,7 @@ app.whenReady().then(async () => {
     g().answerPermission('p3', { optionId: 'r1' }, { cascadeReject: true })
     const pendingAfter = g().pendingPermissions.length
     // cleanup
-    g().permissionRules.filter((r) => r.workspace === '/tmp/permrules-ws').forEach((r) => g().removePermissionRule(r.id))
-    st.setWorkspace(prevWs)
+    g().permissionRules.filter((r) => r.workspace === ruleWs && r.resource === 'git *').forEach((r) => g().removePermissionRule(r.id))
     return { saved, cascaded, autoAnswered, rejectCascade: pendingAfter === 0, pendingAfter }
   })()`)
   console.log('PERMRULES=' + JSON.stringify(permrules))
@@ -774,27 +774,28 @@ app.whenReady().then(async () => {
   const sensitive = await win.webContents.executeJavaScript(`(async () => {
     const st = window.__kaisola.getState()
     const prevWs = st.workspacePath
-    st.setWorkspace('/tmp/sensitive-ws')
+    const ruleWs = prevWs || '/tmp/sensitive-ws'
+    if (!prevWs) st.setWorkspace(ruleWs)
     const g = () => window.__kaisola.getState()
     const ask = (permId, kind, title, diffs) => ({ permId, key: 'mock', agent: 'Mock', title, kind, diffs,
       options: [{ optionId: 'a1', name: 'Allow', kind: 'allow_once' }, { optionId: 'r1', name: 'Deny', kind: 'reject_once' }] })
     // a rule that WOULD cover cat — the sensitive path must beat it
     g().pushPermission(ask('s0', 'execute', 'cat README.md'))
     g().alwaysAllowPermission('s0')
+    const baselineRuleIds = new Set(g().permissionRules.map((r) => r.id))
     g().receivePermission(ask('s1', 'execute', 'cat .env.local'))
     const p1 = g().pendingPermissions.find((p) => p.permId === 's1')
     const surfaced = !!p1 && p1.sensitive === true
     g().alwaysAllowPermission('s1')
     const stillPending = g().pendingPermissions.some((p) => p.permId === 's1') // refused to make a rule
-    const noSensitiveRule = !g().permissionRules.some((r) => r.resource === 'cat *' && r.workspace !== '/tmp/sensitive-ws')
+    const noSensitiveRule = g().permissionRules.every((r) => baselineRuleIds.has(r.id))
     // diff-shaped sensitive ask (edit kind carries the path in diffs)
     g().receivePermission(ask('s2', 'edit', 'Edit config', [{ path: 'conf/secrets.yml', oldText: '', newText: 'x' }]))
     const diffFlagged = g().pendingPermissions.find((p) => p.permId === 's2')?.sensitive === true
     // cleanup
     g().answerPermission('s1', { optionId: 'a1' })
     g().answerPermission('s2', { optionId: 'r1' }, { cascadeReject: true })
-    g().permissionRules.filter((r) => r.workspace === '/tmp/sensitive-ws').forEach((r) => g().removePermissionRule(r.id))
-    st.setWorkspace(prevWs)
+    g().permissionRules.filter((r) => r.workspace === ruleWs && r.resource === 'cat *').forEach((r) => g().removePermissionRule(r.id))
     return { surfaced, stillPending, diffFlagged, noSensitiveRule, pendingAfter: g().pendingPermissions.length }
   })()`)
   console.log('SENSITIVE=' + JSON.stringify(sensitive))
@@ -925,16 +926,17 @@ app.whenReady().then(async () => {
     const off = window.kaisola.terminal.onAgentActivity((event) => {
       if (event.id === id) events.push(event)
     })
-    const created = await window.kaisola.terminal.create(id, '/tmp', 80, 24)
-    window.kaisola.terminal.agentTurn(id, true)
+    const projectId = window.__kaisola.getState().activeProjectId
+    const created = await window.kaisola.terminal.create(id, '/tmp', 80, 24, projectId)
+    window.kaisola.terminal.agentTurn(id, true, projectId)
     await new Promise((resolve) => setTimeout(resolve, 160))
-    const detached = await window.kaisola.terminal.detachRenderer(id)
+    const detached = await window.kaisola.terminal.detachRenderer(id, undefined, projectId)
     for (let i = 0; i < 32 && !events.some((event) => !event.busy && event.completedAt); i++) {
       await new Promise((resolve) => setTimeout(resolve, 180))
     }
-    const snapshot = await window.kaisola.terminal.snapshot(id)
+    const snapshot = await window.kaisola.terminal.snapshot(id, projectId)
     off()
-    await window.kaisola.terminal.kill(id)
+    await window.kaisola.terminal.kill(id, projectId)
     return {
       created: !!created.ok,
       began: events.some((event) => event.busy),
@@ -1136,6 +1138,85 @@ app.whenReady().then(async () => {
     }
   })()`)
   console.log('STEER=' + JSON.stringify(steer))
+
+  // 7c-iii) STOP DURING AWAITED PREFLIGHT -> IMMEDIATE CLOSE. The mock's Fast
+  // config request stays pending for 700ms. Stop and close in the same renderer
+  // task; the recently-closed snapshot must contain the restored draft, never
+  // the optimistic unsent row. Reopening before the await settles must remain
+  // stable when the stale continuation eventually resumes.
+  const preflightStopClose = await win.webContents.executeJavaScript(`(async () => {
+    const get = () => window.__kaisola.getState()
+    const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
+    const marker = 'preflight-stop-close-regression'
+    get().requestNewThread('mock')
+    const tid = get().activeThreadId
+    get().setDockView(tid)
+
+    let assistant = null
+    let connectButton = null
+    for (let i = 0; i < 80; i++) {
+      assistant = document.querySelector('.assistant[data-thread-id="' + tid + '"]')
+      connectButton = assistant?.querySelector('.assistant-foot .foot-link')
+      if (connectButton) break
+      await wait(50)
+    }
+    // Ordinary transcripts connect lazily. Drive the real Connect control first
+    // so the subsequent Send render owns the mock's native speed control.
+    connectButton?.click()
+    let speedReady = false
+    for (let i = 0; i < 100; i++) {
+      const status = await window.kaisola.acp.status(['mock::' + tid], get().activeProjectId)
+      // Raw preload summaries retain the internal @@project scope suffix; the
+      // renderer bridge strips it before Assistant sees the same connection.
+      const controls = status.agents.find((agent) => agent.key.startsWith('mock::' + tid))?.controls
+      if (controls?.configOptions?.some((option) => option.id === 'response_speed')) { speedReady = true; break }
+      await wait(50)
+    }
+    await wait(160) // refresh() -> local controls -> Send closure with applySpeed
+    get().setAssistantDraft(tid, { text: marker, attachments: [], mentions: [], speed: 'fast' })
+    await wait(80)
+    assistant = document.querySelector('.assistant[data-thread-id="' + tid + '"]')
+    assistant?.querySelector('.composer-send:not(.composer-stop)')?.click()
+
+    let pendingSeen = false
+    for (let i = 0; i < 80; i++) {
+      const state = get()
+      if (state.assistantThreads.find((thread) => thread.id === tid)?.busy && state.assistantRuntimes[tid]?.pendingDispatch) {
+        pendingSeen = true
+        break
+      }
+      await wait(25)
+    }
+    const stop = assistant?.querySelector('.composer-stop')
+    stop?.click()
+    // Deliberately no await: this is the original same-tick close race.
+    get().closeAssistantThread(tid)
+
+    const closed = get().closedStack.find((entry) => entry.thread?.id === tid)
+    const closedTurns = closed?.runtime?.turns || []
+    const closedClean = !!closed && !closed.runtime?.pendingDispatch && !closedTurns.some((turn) => turn.text.includes(marker))
+    const closedDraft = closed?.draft?.text === marker
+    const closedImmediately = !get().assistantThreads.some((thread) => thread.id === tid)
+
+    get().reopenClosedSession(tid)
+    const reopenedNow = get()
+    const reopenedDraft = reopenedNow.assistantDrafts[tid]?.text === marker
+    const reopenedClean = !reopenedNow.assistantRuntimes[tid]?.pendingDispatch &&
+      !(reopenedNow.assistantRuntimes[tid]?.turns || []).some((turn) => turn.text.includes(marker))
+    await wait(950)
+    const settled = get()
+    const turns = settled.assistantRuntimes[tid]?.turns || []
+    const staleContinuationIgnored = settled.assistantDrafts[tid]?.text === marker &&
+      !settled.assistantRuntimes[tid]?.pendingDispatch &&
+      !turns.some((turn) => turn.text.includes(marker)) &&
+      !(settled.assistantPromptQueues[tid] || []).some((prompt) => prompt.text.includes(marker)) &&
+      !settled.assistantThreads.find((thread) => thread.id === tid)?.busy
+    const firstPreserved = settled.assistantRuntimes[tid]?.first === true
+    get().closeAssistantThread(tid)
+    get().forgetClosedSession(tid)
+    return { speedReady, pendingSeen, stopRendered: !!stop, closedImmediately, closedClean, closedDraft, reopenedDraft, reopenedClean, staleContinuationIgnored, firstPreserved }
+  })()`)
+  console.log('PREFLIGHT_STOP_CLOSE=' + JSON.stringify(preflightStopClose))
 
   // 8) persistence — the store writes to the durable main-process DB (SQLite,
   //    JSON fallback). Verify the blob round-trips + which backend is active.
@@ -1943,9 +2024,9 @@ a^2 + b^2 = c^2
     await new Promise((r) => setTimeout(r, 250))
     const movedTermIds = g().terminals.map((t) => t.id)
     if (movedTermIds[0]) g().setTermDraft(movedTermIds[0], 'detach-smoke-draft')
-    if (movedTermIds[0]) await window.kaisola.terminal.create(movedTermIds[0], undefined, 80, 24)
+    if (movedTermIds[0]) await window.kaisola.terminal.create(movedTermIds[0], undefined, 80, 24, pid)
     await new Promise((r) => setTimeout(r, 80))
-    const diagnosticsBefore = await window.kaisola.terminal.diagnostics()
+    const diagnosticsBefore = await window.kaisola.terminal.diagnostics(pid)
     await g().detachProjectToWindow(pid)
     await new Promise((r) => setTimeout(r, 200))
     return { pid, prefs, movedTermIds, diagnosticsBefore, srcTabsAfter: g().projectTabs.length, srcStillHasIt: g().projectTabs.some((t) => t.id === pid), srcTabsBefore: before }
@@ -2013,7 +2094,7 @@ a^2 + b^2 = c^2
       while (Date.now() - t4 < 15000) {
         merged = await win.webContents.executeJavaScript(`(async () => {
           const s = window.__kaisola.getState()
-          return { tabIds: s.projectTabs.map((t) => t.id), active: s.activeProjectId, termIds: s.terminals.map((t) => t.id), draft: s.termDrafts[${JSON.stringify(detachInfo.movedTermIds[0] || '')}], diagnostics: await window.kaisola.terminal.diagnostics() }
+          return { tabIds: s.projectTabs.map((t) => t.id), active: s.activeProjectId, termIds: s.terminals.map((t) => t.id), draft: s.termDrafts[${JSON.stringify(detachInfo.movedTermIds[0] || '')}], diagnostics: await window.kaisola.terminal.diagnostics(s.activeProjectId) }
         })()`).catch(() => null)
         if (merged?.tabIds?.includes(detachInfo.pid)) break
         await new Promise((r) => setTimeout(r, 150))
@@ -2558,10 +2639,15 @@ a^2 + b^2 = c^2
       command: 'node', args: ['server.js'], env: { API_TOKEN: '\${KAISOLA_SMOKE_MCP_TOKEN}' },
     })
     await new Promise((r) => setTimeout(r, 80))
-    const info = await window.kaisola.mcp.info()
-    return { added: !!added?.ok, running: !!info?.ok, tools: info?.toolCount }
+    const state = window.__kaisola.getState()
+    const info = await window.kaisola.mcp.info({ projectId: state.activeProjectId, workspace: state.workspacePath })
+    return { added: !!added?.ok, running: !!info?.ok, tools: info?.toolCount, configPath: info?.configPath }
   })()`)
-  const generatedMcpPath = path.join(SMOKE_USERDATA, 'kaisola-mcp.json')
+  const generatedMcpPath = typeof mcpConfigSecurity.configPath === 'string'
+    && path.dirname(mcpConfigSecurity.configPath) === SMOKE_USERDATA
+    && /^kaisola-mcp-[0-9a-f]{24}\.json$/.test(path.basename(mcpConfigSecurity.configPath))
+    ? mcpConfigSecurity.configPath
+    : path.join(SMOKE_USERDATA, 'missing-mcp-config.json')
   const generatedMcp = fsx.existsSync(generatedMcpPath) ? fsx.readFileSync(generatedMcpPath, 'utf8') : ''
   mcpConfigSecurity.private = !!generatedMcp && (fsx.statSync(generatedMcpPath).mode & 0o777) === 0o600
   mcpConfigSecurity.placeholder = generatedMcp.includes('${KAISOLA_SMOKE_MCP_TOKEN}')
@@ -2582,6 +2668,25 @@ a^2 + b^2 = c^2
     mcpConfigSecurity.resources = resources?.result?.resources?.length ?? 0
     mcpConfigSecurity.prompts = prompts?.result?.prompts?.length ?? 0
     mcpConfigSecurity.fullSurface = !!initialized?.result?.capabilities?.resources && !!initialized?.result?.capabilities?.prompts
+    const gated = await rpc('tools/call', {
+      name: 'hypothesis_propose',
+      arguments: { title: 'MCP scope smoke', claim: 'This must remain pending until reviewed.', from: 'smoke' },
+    })
+    await new Promise((r) => setTimeout(r, 80))
+    const routed = await win.webContents.executeJavaScript(`(() => {
+      const state = window.__kaisola.getState()
+      const proposal = state.project.proposals.find((item) => item.title === 'Hypothesis: MCP scope smoke')
+      const applied = state.project.hypotheses.some((item) => item.title === 'MCP scope smoke')
+      if (proposal) state.rejectProposal(proposal.id)
+      return { pending: proposal?.status === 'pending', applied }
+    })()`)
+    mcpConfigSecurity.proposalGated = gated?.result?.structuredContent?.status === 'pending_human_review' && routed.pending && !routed.applied
+    const denied = await fetch(builtin.url, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', Authorization: `Bearer ${'0'.repeat(64)}` },
+      body: JSON.stringify({ jsonrpc: '2.0', id: 'denied', method: 'ping' }),
+    })
+    mcpConfigSecurity.badBearerDenied = denied.status === 401
   } catch { mcpConfigSecurity.fullSurface = false }
   await win.webContents.executeJavaScript(`window.kaisola.mcp.serverRemove('smoke-private')`)
   console.log('MCP_CONFIG_SECURITY=' + JSON.stringify(mcpConfigSecurity))
@@ -3681,7 +3786,7 @@ a^2 + b^2 = c^2
   const failed =
     !manualCodex.upgraded || !manualCodex.exact || !manualCodex.draftKept || !manualCodex.downgraded ||
     !manualClaude.upgraded || !manualClaude.draftKept || !manualClaude.toolKept || !manualClaude.downgraded ||
-    !rootChildren || !minimalShell.noWorkflowSidebar || !minimalShell.splitSidebarsDefault || !minimalShell.hasSessions || !minimalShell.railFilesOnly || !minimalShell.hasEmptyLauncher || !minimalShell.stageFiles || !minimalShell.studioDefault || !minimalShell.sidebarFooter || !accountUi.avatar || !accountUi.headshot || !accountUi.menu || !accountUi.usageInMenu || !accountUi.usageOpened || !accountUi.avatarOnly || !accountUi.bottomLeft || !accountUi.menuAbove || !accountUi.menuFits || !accountUi.aligned || !claudePrepared || !nativeWindow.rendererClippedMaterial || !icon.exists || !icon.usable || !icon.square || !icon.large || !glass.appSamplingLayer || !glass.chromeGlass || !glass.activeTintWhite || !glass.railLayerFlattened || !glass.contentGlassy || !glass.sessionGlassy || !glass.termGlassTint || !glass.blurKeepsGlass || !glass.lightsGray || !glass.nativeWindowRounding ||
+    !rootChildren || !minimalShell.noWorkflowSidebar || !minimalShell.splitSidebarsDefault || !minimalShell.hasSessions || !minimalShell.railFilesOnly || !minimalShell.hasEmptyLauncher || !minimalShell.stageFiles || !minimalShell.studioDefault || !minimalShell.sidebarFooter || !accountUi.avatar || !accountUi.headshot || !accountUi.menu || !accountUi.usageInMenu || !accountUi.usageOpened || !accountUi.avatarOnly || !accountUi.bottomLeft || !accountUi.menuAbove || !accountUi.menuFits || !accountUi.aligned || !claudeOptIn || !nativeWindow.rendererClippedMaterial || !icon.exists || !icon.usable || !icon.square || !icon.large || !glass.appSamplingLayer || !glass.chromeGlass || !glass.activeTintWhite || !glass.railLayerFlattened || !glass.contentGlassy || !glass.sessionGlassy || !glass.termGlassTint || !glass.blurKeepsGlass || !glass.lightsGray || !glass.nativeWindowRounding ||
     !emptyOk || !demoOk ||
     !review.opened || !review.closed || !review.decided ||
     !term.run || !term.ptyOk || !term.cdWorks || !term.dock || !term.host || !term.lightComposerPalette ||
@@ -3703,6 +3808,7 @@ a^2 + b^2 = c^2
     !transcriptTypography.rendered || !transcriptTypography.normalWhitespace || !transcriptTypography.readableWidth || !transcriptTypography.compactStream || !transcriptTypography.compactList || !transcriptTypography.differentiatedRoles || !transcriptTypography.promptRail || !transcriptTypography.promptRailMinimal || !transcriptTypography.localLink || !transcriptTypography.linkOpenedFiles || !transcriptTypography.lineJump ||
     !promptQueue.started || !promptQueue.queuedTwo || !promptQueue.inlinePreview || !promptQueue.aboveComposer || !promptQueue.attachedComposer || !promptQueue.queueActions || !promptQueue.noQueueToast || !promptQueue.drained || !promptQueue.combinedOnce || !promptQueue.deliveredTogether || !promptQueue.newestSpeedWon ||
     !steer.started || !steer.queuedWhileBusy || !steer.steeredWhileBusy || !steer.twoUserTurns || !steer.followDelivered || !steer.baseDelivered || !steer.endedIdle ||
+    !preflightStopClose.speedReady || !preflightStopClose.pendingSeen || !preflightStopClose.stopRendered || !preflightStopClose.closedImmediately || !preflightStopClose.closedClean || !preflightStopClose.closedDraft || !preflightStopClose.reopenedDraft || !preflightStopClose.reopenedClean || !preflightStopClose.staleContinuationIgnored || !preflightStopClose.firstPreserved ||
     !persist.stored || !persist.hasTheme || !persist.hasAgent || !persist.hasThread || !persist.hasChatTurn || !persist.hasDraft || !persist.draftBounded || !persist.hasCodexEffort || !persist.hasTabLayout ||
     !boot.hasId || !boot.ran ||
     !auth.hasUrl || auth.code !== 'ABCD-1234' || !auth.done ||
@@ -3745,7 +3851,7 @@ a^2 + b^2 = c^2
     !extensionsUi.opened || extensionsUi.cards < 8 || !extensionsUi.hasFilters || !extensionsUi.csvInstalled || !extensionsUi.jsonInstalled ||
     !extensionsUi.persisted || !extensionsUi.defaultUninstallPersisted || !extensionsUi.csvPreview || !extensionsUi.jsonPreview || !extensionsUi.boundedJsonPreview || !extensionsUi.closed ||
     !devExtensionHotReload.registered || !devExtensionHotReload.updated || !devExtensionHotReload.visible ||
-    !mcpConfigSecurity.added || !mcpConfigSecurity.running || mcpConfigSecurity.tools < 1 || !mcpConfigSecurity.private || !mcpConfigSecurity.placeholder || !mcpConfigSecurity.notExpanded || !mcpConfigSecurity.fullSurface || mcpConfigSecurity.resources < 1 || mcpConfigSecurity.prompts < 1 ||
+    !mcpConfigSecurity.added || !mcpConfigSecurity.running || mcpConfigSecurity.tools < 1 || !mcpConfigSecurity.private || !mcpConfigSecurity.placeholder || !mcpConfigSecurity.notExpanded || !mcpConfigSecurity.fullSurface || mcpConfigSecurity.resources < 1 || mcpConfigSecurity.prompts < 1 || !mcpConfigSecurity.proposalGated || !mcpConfigSecurity.badBearerDenied ||
     !dropfit.hasBtn || !dropfit.fits ||
     agentrun.added < 1 || agentrun.agentId !== 'hypothesis' || !agentrun.hasChanges || agentrun.status !== 'pending' ||
     approve.hypAdded < 1 || approve.createStatus !== 'approved' || !approve.patched ||
@@ -3793,7 +3899,7 @@ a^2 + b^2 = c^2
   // The harness calls app.exit directly (production's before-quit hooks do not
   // run here). Reap exact owned groups so repeated smoke runs never manufacture
   // the very PPID-1 adapter leak the lifecycle suite guards against.
-  disposeAcp()
+  await disposeAcp()
   killAllSessions()
   await new Promise((resolve) => setTimeout(resolve, 250))
   app.exit(failed ? 1 : 0)

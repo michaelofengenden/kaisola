@@ -268,9 +268,17 @@ function closeGoogleSession() {
   const current = googleSession
   googleSession = null
   if (!current) return
+  current.cancelled = true
   clearTimeout(current.timer)
   try { current.server.close() } catch { /* already closed */ }
 }
+
+function canControlGoogleSession(session, sender) {
+  if (!session) return true
+  return session.sender === sender || !session.sender || session.sender.isDestroyed?.()
+}
+
+const sameGoogleSession = (current, attempt) => !!attempt && current === attempt
 
 function registerAuthHandlers(ipcMain) {
   ipcMain.handle('auth:start', (event, { id, command, args } = {}) => {
@@ -356,7 +364,11 @@ function registerAuthHandlers(ipcMain) {
     if (configIssue || !firebase.projectId || !firebase.apiKey || !firebase.serverUrl) {
       return { ok: false, configured: false, message: configIssue || 'This build is missing its Firebase configuration.' }
     }
-    if (googleSession) return { ok: true, configured: true, pending: true }
+    if (googleSession) {
+      return canControlGoogleSession(googleSession, event.sender)
+        ? { ok: true, configured: true, pending: true }
+        : { ok: false, configured: true, pending: true, message: 'Google sign-in is already open in another Kaisola window.' }
+    }
 
     const context = b64url(crypto.randomBytes(24))
     const sender = event.sender
@@ -376,14 +388,20 @@ function registerAuthHandlers(ipcMain) {
       return { ok: false, configured: true, message: 'Could not open the secure local OAuth callback.' }
     }
     const redirectUri = `http://localhost:${address.port}/oauth/callback`
+    const session = { server, timer: null, sender, sessionId: null, cancelled: false }
     const timer = setTimeout(() => {
+      if (googleSession !== session || session.cancelled) return
       if (!sender.isDestroyed()) sender.send('app-auth:changed', { ok: false, message: 'Google sign-in timed out.' })
       closeGoogleSession()
     }, 5 * 60 * 1000)
     if (timer.unref) timer.unref()
-    googleSession = { server, timer }
+    session.timer = timer
+    googleSession = session
 
     server.on('request', async (req, res) => {
+      // Lexically bind the server to the attempt that created it. A cancelled
+      // server callback must never capture or close a replacement attempt.
+      const requestSession = session
       try {
         const url = new URL(req.url || '/', redirectUri)
         if (url.pathname !== '/oauth/callback') {
@@ -394,12 +412,15 @@ function registerAuthHandlers(ipcMain) {
         if (oauthError) throw new Error(oauthError === 'access_denied' ? 'Google sign-in was cancelled.' : `Google sign-in failed: ${oauthError}`)
         const postBody = url.search.slice(1)
         if (!postBody || postBody.length > 20_000) throw new Error('The Google sign-in callback was empty or too large.')
-        const firebaseSession = await firebaseSignInWithAuthResponse({ requestUri: redirectUri, postBody, sessionId: googleSession?.sessionId, context }, firebase)
+        if (!requestSession || requestSession.cancelled) throw new Error('Google sign-in was cancelled.')
+        const firebaseSession = await firebaseSignInWithAuthResponse({ requestUri: redirectUri, postBody, sessionId: requestSession.sessionId, context }, firebase)
+        if (requestSession.cancelled || !sameGoogleSession(googleSession, requestSession)) throw new Error('Google sign-in was cancelled.')
+        const serverUser = await verifyServerSession(firebaseSession.idToken, firebase)
+        if (requestSession.cancelled || !sameGoogleSession(googleSession, requestSession)) throw new Error('Google sign-in was cancelled.')
         firebaseTokenCache = {
           idToken: firebaseSession.idToken,
           expiresAt: Date.now() + Math.max(60, Number(firebaseSession.expiresIn) || 3600) * 1000,
         }
-        const serverUser = await verifyServerSession(firebaseSession.idToken, firebase)
         firebaseSessionGeneration += 1
         writeFirebaseSession(firebaseSession.refreshToken)
         const claims = decodeIdToken(firebaseSession.idToken) || {}
@@ -417,25 +438,34 @@ function registerAuthHandlers(ipcMain) {
         res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' }).end(callbackPage(true, 'You can close this tab and return to the app.'))
         if (!sender.isDestroyed()) sender.send('app-auth:changed', { ok: true, configured: true, serverVerified: true, profile })
       } catch (error) {
-        firebaseTokenCache = null
+        if (sameGoogleSession(googleSession, requestSession)) firebaseTokenCache = null
         const message = String(error?.message || error)
         res.writeHead(400, { 'content-type': 'text/html; charset=utf-8' }).end(callbackPage(false, `${message} Return to Kaisola and try again.`))
-        if (!sender.isDestroyed()) sender.send('app-auth:changed', { ok: false, configured: true, message })
+        if (!requestSession?.cancelled && !sender.isDestroyed()) sender.send('app-auth:changed', { ok: false, configured: true, message })
       } finally {
-        closeGoogleSession()
+        if (sameGoogleSession(googleSession, requestSession)) closeGoogleSession()
       }
     })
 
     try {
       const { authUri, sessionId } = await createFirebaseAuthUri(redirectUri, context, firebase)
-      if (!googleSession) throw new Error('The local Google sign-in session closed before it could start.')
-      googleSession.sessionId = sessionId
+      if (!sameGoogleSession(googleSession, session) || session.cancelled) throw new Error('The local Google sign-in session closed before it could start.')
+      session.sessionId = sessionId
       await shell.openExternal(authUri)
+      if (!sameGoogleSession(googleSession, session) || session.cancelled) return { ok: false, configured: true, pending: false, message: 'Google sign-in was cancelled.' }
       return { ok: true, configured: true, pending: true }
     } catch (error) {
-      closeGoogleSession()
+      if (sameGoogleSession(googleSession, session)) closeGoogleSession()
       return { ok: false, configured: true, message: String(error?.message || error) }
     }
+  })
+
+  ipcMain.handle('app-auth:google-cancel', (event) => {
+    if (!canControlGoogleSession(googleSession, event.sender)) {
+      return { ok: false, configured: firebaseConfigured(), pending: true, message: 'Google sign-in belongs to another Kaisola window.' }
+    }
+    closeGoogleSession()
+    return { ok: true, configured: firebaseConfigured(), pending: false, profile: readIdentity() }
   })
 
   ipcMain.handle('app-auth:sign-out', () => {
@@ -457,5 +487,5 @@ function disposeAuth() {
 module.exports = {
   registerAuthHandlers,
   disposeAuth,
-  __test: { decodeIdToken, createFirebaseAuthUri, firebaseSignInWithAuthResponse, escapeHtml, isTerminalRefreshError, readPublicConfig },
+  __test: { decodeIdToken, createFirebaseAuthUri, firebaseSignInWithAuthResponse, escapeHtml, isTerminalRefreshError, readPublicConfig, canControlGoogleSession, sameGoogleSession },
 }

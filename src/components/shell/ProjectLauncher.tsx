@@ -12,6 +12,7 @@ import { Icon } from '../Icon'
 export function ProjectLauncher() {
   const recentProjects = useKaisola((s) => s.recentProjects)
   const setWorkspace = useKaisola((s) => s.setWorkspace)
+  const pushToast = useKaisola((s) => s.pushToast)
 
   // a folder that's already open in another tab focuses THAT tab (Chrome's
   // dedupe, same as the + menu) — the now-redundant empty tab closes itself
@@ -29,6 +30,7 @@ export function ProjectLauncher() {
   const open = async () => {
     const r = await bridge.pickFolder()
     if (r.ok && r.path) openPath(r.path)
+    else if (r.message) pushToast('warn', r.message)
   }
 
   return (

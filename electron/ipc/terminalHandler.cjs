@@ -7,6 +7,7 @@ const fs = require('node:fs/promises')
 const { spawn, execFile } = require('node:child_process')
 const { BrowserWindow, app } = require('electron')
 const { configureSessionBroker, sessionBroker } = require('./sessionBrokerClient.cjs')
+const { terminalOwnerParts } = require('./securityPolicy.cjs')
 
 // terminal:run cap: a non-terminating command (dev server, tail -f, blocked on
 // stdin) never fires 'close', so without this the invoke Promise hangs forever.
@@ -55,10 +56,13 @@ const jsonStringField = (text, field) => {
 /** Resolve a live Codex TUI to its exact rollout. First ask the foreground
  * process which JSONL it has open (exact even with many sessions); fall back to
  * the newest CLI/TUI rollout for this cwd if lsof races startup. */
-async function codexSession(id, cwd) {
+async function codexSession(id, cwd, sender = null, projectId) {
   let terminals = []
-  try { terminals = await broker().terminal('list', null, {}, { timeoutMs: 5000 }) } catch { /* semantic fallback below */ }
+  try { terminals = await broker().terminal('list', sender, { projectId }, { timeoutMs: 5000 }) } catch { /* semantic fallback below */ }
   const live = terminals.find((terminal) => terminal.id === id)
+  // Renderer callers must prove this terminal belongs to their exact live
+  // window+project capability before the rollout fallback scans local files.
+  if (sender && !live) return { ok: false, message: 'Terminal is unavailable in this project.' }
   if (live?.pid) {
     const foreground = Number(String(await execOut('ps', ['-o', 'tpgid=', '-p', String(live.pid)]) || '').trim())
     if (foreground > 0) {
@@ -182,7 +186,10 @@ async function pollMeta() {
         agentCompletedAt: next.agentCompletedAt,
       }
       for (const win of BrowserWindow.getAllWindows()) {
-        if (!win.webContents.isDestroyed()) win.webContents.send('terminal:meta', payload)
+        const owner = terminalOwnerParts(t.owner)
+        if (!win.webContents.isDestroyed() && owner?.instanceId === broker().instanceId && owner.ownerId === String(win.webContents.id)) {
+          win.webContents.send('terminal:meta', payload)
+        }
       }
     }
   }
@@ -228,29 +235,31 @@ function registerTerminalHandlers(ipcMain) {
   // first terminal/CLI/ACP-terminal request adopts an existing broker or starts
   // one; closing the last session lets that helper retire again.
 
-  ipcMain.handle('terminal:create', async (event, { id, cwd, cols, rows } = {}) => {
-    const result = await broker().terminal('create', event.sender, { id, cwd: cwd || os.homedir(), cols, rows }, { timeoutMs: 20_000 })
+  ipcMain.handle('terminal:create', async (event, { id, cwd, cols, rows, projectId } = {}) => {
+    const result = await broker().terminal('create', event.sender, { id, cwd: cwd || os.homedir(), cols, rows, projectId }, { timeoutMs: 20_000 })
     if (!result?.ok) return result || { ok: false, message: 'could not start terminal' }
     ensureMetaPolling()
     return { ...result, cwd: cwd || os.homedir(), shell: process.env.SHELL || '/bin/zsh' }
   })
 
-  ipcMain.handle('terminal:write', (event, { id, data } = {}) => broker().terminal('write', event.sender, { id, data }))
-  ipcMain.on('terminal:agent-turn', (event, { id, busy } = {}) => {
-    void broker().terminal('agentTurn', event.sender, { id, busy }, { timeoutMs: 3000 }).catch(() => {})
+  ipcMain.handle('terminal:write', (event, { id, data, projectId } = {}) => broker().terminal('write', event.sender, { id, data, projectId }))
+  ipcMain.on('terminal:agent-turn', (event, { id, busy, projectId } = {}) => {
+    void broker().terminal('agentTurn', event.sender, { id, busy, projectId }, { timeoutMs: 3000 }).catch(() => {})
   })
-  ipcMain.handle('terminal:resize', (event, { id, cols, rows } = {}) => broker().terminal('resize', event.sender, { id, cols, rows }))
-  ipcMain.handle('terminal:snapshot', (event, { id } = {}) => broker().terminal('snapshot', event.sender, { id }))
-  ipcMain.handle('terminal:detachRenderer', (event, { id, viewState } = {}) => broker().terminal('detachRenderer', event.sender, { id, viewState }))
-  ipcMain.handle('terminal:diagnostics', () => broker().terminal('diagnostics', null))
-  ipcMain.handle('terminal:codexSession', (_event, { id, cwd } = {}) => codexSession(id, cwd))
-  ipcMain.handle('terminal:signal', (event, { id } = {}) => broker().terminal('signal', event.sender, { id }))
-  ipcMain.handle('terminal:kill', (event, { id } = {}) => broker().terminal('release', event.sender, { id }))
+  ipcMain.handle('terminal:resize', (event, { id, cols, rows, projectId } = {}) => broker().terminal('resize', event.sender, { id, cols, rows, projectId }))
+  ipcMain.handle('terminal:snapshot', (event, { id, projectId } = {}) => broker().terminal('snapshot', event.sender, { id, projectId }))
+  ipcMain.handle('terminal:detachRenderer', (event, { id, viewState, projectId } = {}) => broker().terminal('detachRenderer', event.sender, { id, viewState, projectId }))
+  ipcMain.handle('terminal:diagnostics', (event, { projectId } = {}) => broker().terminal('diagnostics', event.sender, { projectId }))
+  ipcMain.handle('terminal:codexSession', (event, { id, cwd, projectId } = {}) => codexSession(id, cwd, event.sender, projectId))
+  ipcMain.handle('terminal:signal', (event, { id, projectId } = {}) => broker().terminal('signal', event.sender, { id, projectId }))
+  ipcMain.handle('terminal:kill', (event, { id, projectId } = {}) => broker().terminal('release', event.sender, { id, projectId }))
+  ipcMain.handle('terminal:schedule-release', (event, { id, projectId, delayMs } = {}) => broker().terminal('scheduleRelease', event.sender, { id, projectId, delayMs }))
+  ipcMain.handle('terminal:cancel-release', (event, { id, projectId } = {}) => broker().terminal('cancelRelease', event.sender, { id, projectId }))
 
   // when a renderer (re)attaches to an existing session, re-point its stream
   // (agent-spawned ptys arrive this way — make sure they're polled too)
-  ipcMain.handle('terminal:attach', async (event, { id } = {}) => {
-    const result = await broker().terminal('attach', event.sender, { id })
+  ipcMain.handle('terminal:attach', async (event, { id, projectId } = {}) => {
+    const result = await broker().terminal('attach', event.sender, { id, projectId })
     ensureMetaPolling()
     return result
   })
@@ -315,8 +324,8 @@ function killAllSessions() {
   }
 }
 
-function detachRendererOwner(sender) {
-  return broker().detachOwner(sender)
+function forgetRendererOwner(sender) {
+  return broker().forgetOwner(sender)
 }
 
 /** Normal app quit/update: close only Electron's authenticated socket. The
@@ -337,6 +346,6 @@ module.exports = {
   killAllSessions,
   detachSessionBroker,
   setAppFocused,
-  detachRendererOwner,
+  forgetRendererOwner,
   __test: { codexIdFromPath, jsonStringField, codexSession },
 }

@@ -84,6 +84,7 @@ export function AgentStatusButton() {
   const btnRef = useRef<HTMLButtonElement | null>(null)
   const { all, menu } = useAgentRegistry()
   const openSettings = useKaisola((s) => s.setSettingsOpen)
+  const projectId = useKaisola((s) => s.activeProjectId)
   const workspacePath = useKaisola((s) => s.workspacePath)
   const requestFile = useKaisola((s) => s.requestFile)
   const followAgent = useKaisola((s) => s.followAgent)
@@ -121,7 +122,9 @@ export function AgentStatusButton() {
   const load = async () => {
     const [st, info, srv, disc] = await Promise.all([
       bridge.acp.status().catch(() => ({ ok: false, agents: [] as AcpAgent[] })),
-      bridge.mcp?.info().catch(() => null) ?? Promise.resolve(null),
+      workspacePath
+        ? (bridge.mcp?.info({ projectId, workspace: workspacePath }).catch(() => null) ?? Promise.resolve(null))
+        : Promise.resolve(null),
       bridge.mcp?.servers?.(workspacePath).catch(() => null) ?? Promise.resolve(null),
       bridge.mcp?.discover?.().catch(() => null) ?? Promise.resolve(null),
     ])
@@ -152,7 +155,7 @@ export function AgentStatusButton() {
       window.clearTimeout(timer)
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [workspacePath])
+  }, [projectId, workspacePath])
 
   useEffect(() => {
     if (!open) return

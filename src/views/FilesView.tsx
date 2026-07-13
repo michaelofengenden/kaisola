@@ -186,6 +186,7 @@ export function FilesView() {
   const extensionRevision = useExtensionRevision()
   const workspacePath = useKaisola((s) => s.workspacePath)
   const setWorkspace = useKaisola((s) => s.setWorkspace)
+  const openProjectFolder = useKaisola((s) => s.openProjectFolder)
   const fileRequest = useKaisola((s) => s.fileRequest)
   const fileTextZoom = useKaisola((s) => s.fileTextZoom)
   const setOpenFile = useKaisola((s) => s.setOpenFile)
@@ -859,9 +860,11 @@ export function FilesView() {
   }, [])
 
   const openFolder = async () => {
-    if (anyDirty && !window.confirm('Discard unsaved file changes before switching folders?')) return
     const r = await bridge.pickFolder()
-    if (r.ok && r.path) setWorkspace(r.path)
+    if (r.ok && r.path) {
+      if (workspacePath) openProjectFolder(r.path)
+      else setWorkspace(r.path)
+    } else if (r.message) pushToast('warn', r.message)
   }
 
   const relativePath = (path: string) =>

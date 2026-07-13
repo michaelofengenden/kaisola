@@ -5,17 +5,25 @@
 const { app, shell, dialog, BrowserWindow } = require('electron')
 const path = require('node:path')
 const fs = require('node:fs/promises')
+const { isSafeWebUrl } = require('./securityPolicy.cjs')
 
 function workspaceRoot() {
   return path.join(app.getPath('userData'), 'workspaces')
 }
 
 /** Keep file IO inside the workspace — never let the renderer escape it. */
-function safeResolve(relPath) {
-  const root = workspaceRoot()
+function safeResolve(relPath, root = workspaceRoot()) {
   const resolved = path.resolve(root, relPath)
-  if (!resolved.startsWith(root)) throw new Error('Path escapes the workspace')
+  const relative = path.relative(root, resolved)
+  if (relative === '..' || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) {
+    throw new Error('Path escapes the workspace')
+  }
   return resolved
+}
+
+function pathContains(parent, child) {
+  const relative = path.relative(parent, child)
+  return relative === '' || (!relative.startsWith(`..${path.sep}`) && relative !== '..' && !path.isAbsolute(relative))
 }
 
 function registerToolHandlers(ipcMain) {
@@ -30,7 +38,7 @@ function registerToolHandlers(ipcMain) {
     const chosen = path.resolve(res.filePaths[0])
     // never let the agent work in (or above) Kaisola itself — it could modify the app
     const appRoot = path.resolve(app.getAppPath())
-    if (chosen === appRoot || appRoot.startsWith(chosen + path.sep)) {
+    if (pathContains(appRoot, chosen) || pathContains(chosen, appRoot)) {
       return { ok: false, message: 'That folder contains Kaisola itself — pick a different project folder so the agent can’t modify the app.' }
     }
     return { ok: true, path: chosen }
@@ -78,9 +86,10 @@ function registerToolHandlers(ipcMain) {
   })
 
   ipcMain.handle('kaisola:openExternal', async (_e, url) => {
-    if (typeof url === 'string' && url.startsWith('http')) await shell.openExternal(url)
+    if (!isSafeWebUrl(url)) return { ok: false, message: 'Only http and https links can be opened.' }
+    await shell.openExternal(url)
     return { ok: true }
   })
 }
 
-module.exports = { registerToolHandlers }
+module.exports = { registerToolHandlers, __test: { pathContains, safeResolve } }

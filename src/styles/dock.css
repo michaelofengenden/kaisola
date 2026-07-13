@@ -700,6 +700,7 @@ details.assistant-tool.tool-artifacts > summary::-webkit-details-marker { displa
 }
 .drop-btn:hover,
 .drop-btn[data-open='true'] { background: var(--bg-3); }
+.drop-btn:disabled { opacity: .5; cursor: not-allowed; }
 .drop-btn-icon { color: var(--text-3); }
 .drop-caret { color: var(--text-3); }
 .drop-menu {
@@ -1907,6 +1908,16 @@ details.assistant-tool.tool-artifacts > summary::-webkit-details-marker { displa
   background: color-mix(in srgb, var(--bg-1) 45%, transparent);
   overflow-y: auto;
 }
+.settings-nav-group { display: flex; flex-direction: column; gap: 2px; }
+.settings-nav-group + .settings-nav-group { margin-top: var(--sp-3); }
+.settings-nav-group-label {
+  padding: 0 var(--sp-3) var(--sp-1);
+  color: var(--text-3);
+  font-size: var(--fs-10);
+  font-weight: var(--fw-semibold);
+  letter-spacing: .06em;
+  text-transform: uppercase;
+}
 .settings-nav-item {
   display: flex;
   align-items: center;
@@ -1928,6 +1939,32 @@ details.assistant-tool.tool-artifacts > summary::-webkit-details-marker { displa
   background: color-mix(in srgb, var(--bg-4) 80%, transparent);
 }
 .settings-nav-item[data-active='true'] svg { color: var(--accent); }
+.settings-toggle {
+  position: relative;
+  width: 34px;
+  height: 20px;
+  flex: 0 0 auto;
+  padding: 0;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--r-full);
+  background: var(--bg-4);
+  transition: background var(--dur-1) ease, border-color var(--dur-1) ease;
+}
+.settings-toggle > span {
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  background: var(--text-on-accent, #fff);
+  box-shadow: 0 1px 3px rgb(0 0 0 / 22%);
+  transition: transform var(--dur-1) var(--ease-out);
+}
+.settings-toggle[aria-checked='true'] { background: var(--accent); border-color: var(--accent); }
+.settings-toggle[aria-checked='true'] > span { transform: translateX(14px); }
+.settings-toggle:focus-visible { outline: 2px solid color-mix(in srgb, var(--accent) 45%, transparent); outline-offset: 2px; }
+.settings-toggle:disabled { opacity: .45; cursor: not-allowed; }
 .settings-pane {
   overflow-y: auto;
   min-height: 0;
@@ -1975,6 +2012,60 @@ details.assistant-tool.tool-artifacts > summary::-webkit-details-marker { displa
   padding: var(--sp-2);
 }
 .settings-customform .input:first-child { width: 130px; flex-shrink: 0; }
+
+@media (max-width: 620px) {
+  .settings-panel-v3 {
+    width: min(calc(100vw - 16px), 760px);
+    height: min(100vh - 20px, 720px);
+    border-radius: var(--r-4);
+  }
+  .settings-body-v3 { grid-template-columns: minmax(0, 1fr); grid-template-rows: auto minmax(0, 1fr); }
+  .settings-nav {
+    flex-direction: row;
+    align-items: center;
+    gap: 3px;
+    padding: var(--sp-2) var(--sp-3);
+    border-right: 0;
+    border-bottom: 1px solid var(--border-faint);
+    overflow-x: auto;
+    overflow-y: hidden;
+    scrollbar-width: none;
+  }
+  .settings-nav::-webkit-scrollbar { display: none; }
+  .settings-nav-group { display: contents; }
+  .settings-nav-group-label { display: none; }
+  .settings-nav-item { flex: 0 0 auto; height: 30px; padding-inline: var(--sp-3); }
+  .settings-pane { padding: var(--sp-4); }
+  .settings-panel-v2 .settings-keyrow,
+  .settings-customform { flex-wrap: wrap; }
+  .settings-panel-v2 .settings-keyrow > *,
+  .settings-customform > * { min-width: 0; max-width: 100%; }
+  .settings-input-md { width: min(220px, 100%); }
+}
+
+@media (max-width: 440px) {
+  .focus-scrim { padding: 0; }
+  .settings-panel-v3 { width: calc(100vw - 8px); height: calc(100vh - 8px); border-radius: var(--r-3); }
+  .settings-pane { padding: var(--sp-3); gap: var(--sp-2); }
+  .settings-pane-head { padding-inline: var(--sp-1); }
+  .settings-row {
+    align-items: flex-start;
+    flex-wrap: wrap;
+    gap: var(--sp-2);
+    min-width: 0;
+    padding: var(--sp-2);
+  }
+  .settings-row-label { flex-basis: calc(100% - 48px); line-height: var(--lh-snug); }
+  .settings-row-control { min-width: 0; max-width: 100%; margin-left: auto; flex-wrap: wrap; justify-content: flex-end; }
+  .settings-row-control:has(.drop-btn + .drop-btn) { width: 100%; }
+  .settings-row-control .input { min-width: 0; max-width: 100%; }
+  .settings-panel-v2 .agent-conn-row { flex-wrap: wrap; }
+  .agent-conn-row .agent-kind { margin-left: 20px; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .settings-panel-v2, .settings-toggle, .settings-toggle > span { animation: none; transition: none; }
+}
 
 /* ── Git commit panel card ──────────────────────────────────────────────── */
 .git-panel {

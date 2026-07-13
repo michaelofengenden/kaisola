@@ -1,8 +1,9 @@
-import { memo, useEffect, useMemo, useRef, useState } from 'react'
+import { memo, useEffect, useMemo, useState } from 'react'
 import { Assistant, PermissionCard } from './Assistant'
 import { Icon } from './Icon'
 import { ProviderIcon } from './ProviderIcon'
 import { bridge, type AcpAgent, type AcpControls, type AcpPreset, type WorktreeFile } from '../lib/bridge'
+import { meshWorktreeTaskId, newMeshWorktreeBatchId } from '../lib/meshWorktreeId'
 import {
   useKaisola,
   type AssistantDraft,
@@ -17,6 +18,7 @@ import {
 const EMPTY_DRAFT: AssistantDraft = { text: '', attachments: [], mentions: [], speed: 'default' }
 const MAX_SHARED_TEXT = 28_000
 const MAX_GROUP_MEMBERS = 6
+const MESH_RENDERER_OWNER = `mesh-renderer-${globalThis.crypto?.randomUUID?.() ?? Math.random().toString(36).slice(2)}`
 const CLAUDE_EFFORTS: Array<{ value: ClaudeEffort; label: string }> = [
   { value: 'low', label: 'Low effort' },
   { value: 'medium', label: 'Medium effort' },
@@ -112,7 +114,11 @@ export const GroupAssistant = memo(function GroupAssistant({ threadId }: { threa
   const claudeAccountId = useKaisola((state) => state.claudeAccountId)
   const enqueue = useKaisola((state) => state.enqueueAssistantPrompt)
   const takeQueue = useKaisola((state) => state.takeAssistantPromptQueue)
+  const rollbackAssistantDispatch = useKaisola((state) => state.rollbackAssistantDispatch)
   const setGroup = useKaisola((state) => state.setGroupSession)
+  const beginGroupOperation = useKaisola((state) => state.beginGroupOperation)
+  const groupOperationCurrent = useKaisola((state) => state.groupOperationCurrent)
+  const endGroupOperation = useKaisola((state) => state.endGroupOperation)
   const addGroupMember = useKaisola((state) => state.addGroupMember)
   const removeGroupMember = useKaisola((state) => state.removeGroupMember)
   const setGroupMemberModel = useKaisola((state) => state.setGroupMemberModel)
@@ -126,25 +132,103 @@ export const GroupAssistant = memo(function GroupAssistant({ threadId }: { threa
   const answerPermission = useKaisola((state) => state.answerPermission)
   const alwaysAllowPermission = useKaisola((state) => state.alwaysAllowPermission)
   const requestNewGroup = useKaisola((state) => state.requestNewGroup)
-  const pushToast = useKaisola((state) => state.pushToast)
-  const [draft, setDraft] = useState('')
-  const [transitioning, setTransitioning] = useState(false)
-  const transitionLock = useRef(false)
-  const beginTransition = () => {
-    if (transitionLock.current) return false
-    transitionLock.current = true
-    setTransitioning(true)
-    return true
-  }
-  const endTransition = () => {
-    transitionLock.current = false
-    setTransitioning(false)
-  }
+  const setWorkspace = useKaisola((state) => state.setWorkspace)
+  const meshDraft = useKaisola((state) => state.assistantDrafts[threadId] ?? EMPTY_DRAFT)
+  const setAssistantDraft = useKaisola((state) => state.setAssistantDraft)
+  const clearAssistantDraft = useKaisola((state) => state.clearAssistantDraft)
+  const draft = meshDraft.text
+  const setDraft = (text: string) => setAssistantDraft(threadId, { text }, projectId)
   const [agents, setAgents] = useState<AcpAgent[]>([])
   const [presets, setPresets] = useState<AcpPreset[]>([])
+  const [recoveryNonce, setRecoveryNonce] = useState(0)
+  const [cleanupFailed, setCleanupFailed] = useState(false)
   const group = thread?.group
+  const transitioning = !!group?.operation
   const members = group?.members ?? []
   const phase = group?.phase ?? 'idle'
+  const startOperation = (
+    kind: NonNullable<GroupSessionState['operation']>['kind'],
+    expectedPhase: GroupSessionPhase,
+    plannedWorktrees?: Record<string, { taskId: string; repo: string }>,
+  ) => beginGroupOperation(threadId, kind, expectedPhase, MESH_RENDERER_OWNER, projectId, plannedWorktrees)
+  const operationStillCurrent = (operationId: string) => groupOperationCurrent(threadId, operationId, projectId)
+
+  // A full renderer reload cannot resume an in-JS async transition. Project
+  // remounts in the same renderer retain this owner id and let the original
+  // operation finish. A foreign execute lock owns a pre-side-effect journal,
+  // so recovery removes every planned task id before making retry available.
+  useEffect(() => {
+    const operation = group?.operation
+    if (!operation || operation.ownerId === MESH_RENDERER_OWNER) return
+    let cancelled = false
+    const recover = async () => {
+      setCleanupFailed(false)
+      // A changed phase is the durable commit point. For example, executing
+      // means its worktrees and outboxes were recorded; integrating means the
+      // lead prompt was recorded. Only a transition still at its source phase
+      // needs side-effect rollback.
+      if (group?.phase !== operation.phase) {
+        endGroupOperation(threadId, operation.id, projectId)
+        return
+      }
+      const plan = operation.kind === 'execute' ? operation.plannedWorktrees : undefined
+      if (plan && Object.keys(plan).length) {
+        let pending = Object.values(plan)
+        for (let attempt = 0; attempt < 3 && pending.length; attempt++) {
+          const settled = await Promise.all(pending.map(async (entry) => ({
+            entry,
+            result: await bridge.worktree.remove({ taskId: entry.taskId, repo: entry.repo }).catch(() => ({ ok: false })),
+          })))
+          pending = settled.filter((item) => !item.result.ok).map((item) => item.entry)
+        }
+        if (cancelled) return
+        if (pending.length) {
+          setCleanupFailed(true)
+          setGroup(threadId, { error: `Kaisola could not finish cleaning ${pending.length} interrupted Mesh worktree${pending.length === 1 ? '' : 's'}. Retry cleanup; execution remains locked so no checkout is orphaned.` }, projectId)
+          return
+        }
+        const repo = Object.values(plan)[0]?.repo
+        if (repo) clearGroupWorktreeSessions(threadId, repo, projectId)
+        setGroup(threadId, { worktrees: undefined, changedFiles: undefined, reviewedCommits: undefined }, projectId)
+      }
+      endGroupOperation(threadId, operation.id, projectId)
+      const detail = operation.kind === 'integrate'
+        ? 'Completed merges are safe to retry by immutable commit; inspect git status first in case git itself was interrupted.'
+        : 'Its durable checkpoint is intact.'
+      setGroup(threadId, { error: `Kaisola recovered an interrupted ${operation.kind} transition. ${detail} Review the checkpoint, then retry.` }, projectId)
+    }
+    void recover()
+    return () => { cancelled = true }
+  }, [clearGroupWorktreeSessions, endGroupOperation, group?.operation, group?.phase, projectId, recoveryNonce, setGroup, threadId])
+  const worktreeCleanupReady = group?.worktreeCleanup === 'integrating'
+    ? phase === 'integrating' || phase === 'done'
+    : group?.worktreeCleanup === 'done' && phase === 'done'
+  useEffect(() => {
+    if (!worktreeCleanupReady || !group?.worktrees) return
+    let cancelled = false
+    setCleanupFailed(false)
+    const clean = async () => {
+      let pending = Object.values(group.worktrees ?? {})
+      const repo = pending[0]?.repo
+      for (let attempt = 0; attempt < 3 && pending.length; attempt++) {
+        const settled = await Promise.all(pending.map(async (entry) => ({
+          entry,
+          result: await bridge.worktree.remove({ taskId: entry.taskId, repo: entry.repo }).catch(() => ({ ok: false })),
+        })))
+        pending = settled.filter((item) => !item.result.ok).map((item) => item.entry)
+      }
+      if (cancelled) return
+      if (pending.length) {
+        setCleanupFailed(true)
+        setGroup(threadId, { error: `${pending.length} temporary Mesh worktree${pending.length === 1 ? '' : 's'} could not be removed. The task ids remain saved; retry cleanup when git is available.` }, projectId)
+        return
+      }
+      if (repo) clearGroupWorktreeSessions(threadId, repo, projectId)
+      setGroup(threadId, { worktrees: undefined, worktreeCleanup: undefined }, projectId)
+    }
+    void clean()
+    return () => { cancelled = true }
+  }, [clearGroupWorktreeSessions, group?.worktrees, projectId, recoveryNonce, setGroup, threadId, worktreeCleanupReady])
   const groupPermissions = pendingPermissions.filter((permission) =>
     members.some((member) => permission.key === `${member.agentKey}::${member.threadId}`),
   )
@@ -200,8 +284,9 @@ export const GroupAssistant = memo(function GroupAssistant({ threadId }: { threa
     if (!receipt || !group?.stageAttemptId || receipt.attemptId !== group.stageAttemptId) return undefined
     return receipt
   }
-  const stageValue = (member: GroupSessionMember) => runReceipt(member)?.text?.trim()
-    || responseAfter(runtimes[member.threadId], group?.baselines?.[member.threadId] ?? 0, thread?.lastActivityAt)
+  const stageValue = (member: GroupSessionMember) => group?.stageAttemptId
+    ? runReceipt(member)?.text?.trim() ?? ''
+    : responseAfter(runtimes[member.threadId], group?.baselines?.[member.threadId] ?? 0, thread?.lastActivityAt)
   const memberStatus = (member: GroupSessionMember) => {
     const receipt = runReceipt(member)
     if (receipt?.ok && stageValue(member)) return 'succeeded' as const
@@ -265,6 +350,11 @@ export const GroupAssistant = memo(function GroupAssistant({ threadId }: { threa
     for (const member of pending) {
       setThreadQueuePaused(member.threadId, true, projectId)
       takeQueue(member.threadId, projectId)
+      rollbackAssistantDispatch(member.threadId, undefined, {
+        message: 'Stopped before the prompt was sent.',
+        stopReason: 'cancelled',
+        pauseQueue: true,
+      }, projectId)
     }
     await Promise.all(pending.map((member) =>
       bridge.acp.cancel(`${member.agentKey}::${member.threadId}`, projectId).catch(() => ({ ok: false })),
@@ -354,12 +444,18 @@ export const GroupAssistant = memo(function GroupAssistant({ threadId }: { threa
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [group?.stageAttemptId, group?.paused, phase, threadId])
 
-  const queueStage = (nextPhase: GroupSessionPhase, prompts: Record<string, string>, targets = members) => {
+  const queueStage = (
+    nextPhase: GroupSessionPhase,
+    prompts: Record<string, string>,
+    targets = members,
+    transitionPatch: Partial<GroupSessionState> = {},
+  ) => {
     const startedAt = Date.now()
     const attemptId = newAttemptId()
     const baselines = Object.fromEntries(targets.map((member) => [member.threadId, startedAt]))
     const stagePrompts = Object.fromEntries(targets.flatMap((member) => prompts[member.threadId] ? [[member.threadId, prompts[member.threadId]] as const] : []))
     setGroup(threadId, {
+      ...transitionPatch,
       phase: nextPhase,
       baselines,
       stageAttemptId: attemptId,
@@ -392,7 +488,8 @@ export const GroupAssistant = memo(function GroupAssistant({ threadId }: { threa
       setGroup(threadId, { paused: undefined, pausedAt: undefined, pausedPending: undefined, error: undefined }, projectId)
       return
     }
-    if (!beginTransition()) return
+    const operationId = startOperation('continue', phase)
+    if (!operationId) return
     try {
       // session/cancel is cooperative: its IPC acknowledgement can precede the
       // provider turn's terminal receipt. A renderer restart also clears its
@@ -413,12 +510,14 @@ export const GroupAssistant = memo(function GroupAssistant({ threadId }: { threa
         }
       }
       let authoritative = await providerState()
+      if (!operationStillCurrent(operationId)) return
       const liveBusy = () => new Set(useKaisola.getState().assistantThreads
         .filter((candidate) => initialPending.some((member) => member.threadId === candidate.id) && candidate.busy)
         .map((candidate) => candidate.id))
       const oldTurnMembers = initialPending.filter((member) => liveBusy().has(member.threadId) || authoritative.busy.has(keyFor(member)))
       if (oldTurnMembers.length) {
         await Promise.all(oldTurnMembers.map((member) => bridge.acp.cancel(keyFor(member), projectId).catch(() => ({ ok: false }))))
+        if (!operationStillCurrent(operationId)) return
       }
       const deadline = Date.now() + 8_000
       while (Date.now() < deadline) {
@@ -432,9 +531,21 @@ export const GroupAssistant = memo(function GroupAssistant({ threadId }: { threa
       )
       if (stuck.length) {
         await Promise.all(stuck.map((member) => bridge.acp.disconnect(keyFor(member), projectId).catch(() => ({ ok: false }))))
+        if (!operationStillCurrent(operationId)) return
         const settleDeadline = Date.now() + 2_000
         while (Date.now() < settleDeadline && stuck.some((member) => useKaisola.getState().assistantThreads.find((thread) => thread.id === member.threadId)?.busy)) {
           await new Promise((resolve) => window.setTimeout(resolve, 50))
+        }
+        authoritative = await providerState()
+        const stillBusy = liveBusy()
+        const unsettled = stuck.filter((member) =>
+          !authoritative.known || stillBusy.has(member.threadId) || authoritative.busy.has(keyFor(member)),
+        )
+        if (unsettled.length) {
+          setGroup(threadId, {
+            error: `Kaisola could not prove ${unsettled.map((member) => member.label).join(', ')} stopped. The Mesh remains paused; wait for the provider to settle, then Continue again.`,
+          }, projectId)
+          return
         }
       }
       const latest = useKaisola.getState().assistantThreads.find((candidate) => candidate.id === threadId)?.group
@@ -457,14 +568,18 @@ export const GroupAssistant = memo(function GroupAssistant({ threadId }: { threa
       }
       queueStage(phase, group.stagePrompts, retryPending)
     } finally {
-      endTransition()
+      endGroupOperation(threadId, operationId, projectId)
     }
   }
 
   const askBoth = () => {
     const task = draft.trim()
     if (!task || members.length < 2) return
-    setDraft('')
+    if (!workspacePath) {
+      setGroup(threadId, { error: 'Choose one project folder before starting Mesh.' }, projectId)
+      return
+    }
+    clearAssistantDraft(threadId, undefined, projectId)
     setGroup(threadId, {
       task,
       answers: {},
@@ -475,6 +590,7 @@ export const GroupAssistant = memo(function GroupAssistant({ threadId }: { threa
       integration: undefined,
       synthesis: undefined,
       worktrees: undefined,
+      worktreeCleanup: undefined,
       changedFiles: undefined,
       reviewedCommits: undefined,
       leadThreadId: undefined,
@@ -484,6 +600,20 @@ export const GroupAssistant = memo(function GroupAssistant({ threadId }: { threa
       member.threadId,
       `You are ${member.label}, scouting independently inside a bounded Kaisola team protocol. Analyze the task before seeing the other scout's view. Do not edit files. Return: your model of the problem, a proposed approach, risks, likely ownership boundaries, and observable acceptance criteria.\n\nMission:\n${task}`,
     ])))
+  }
+
+  const chooseMeshWorkspace = async () => {
+    try {
+      const result = await bridge.pickFolder()
+      if (result.ok && result.path) {
+        setWorkspace(result.path)
+        setGroup(threadId, { error: undefined }, projectId)
+      } else if (result.message) {
+        setGroup(threadId, { error: result.message }, projectId)
+      }
+    } catch (error) {
+      setGroup(threadId, { error: String((error as Error)?.message ?? 'The folder picker could not open.') }, projectId)
+    }
   }
 
   const negotiate = () => {
@@ -512,38 +642,99 @@ export const GroupAssistant = memo(function GroupAssistant({ threadId }: { threa
       if (!workspacePath) setGroup(threadId, { error: 'Open a git workspace before isolated execution.' }, projectId)
       return
     }
-    if (!beginTransition()) return
+    const repo = workspacePath
+    const batch = newMeshWorktreeBatchId()
+    const plannedWorktrees = Object.fromEntries(members.map((member, index) => [member.threadId, {
+      taskId: meshWorktreeTaskId(batch, index),
+      repo,
+    }]))
+    // Persist every deterministic task id in the operation CAS before the
+    // first git worktree side effect. Crash recovery can now reach checkouts
+    // even if the create reply never made it back to this renderer.
+    const operationId = startOperation('execute', 'assigned', plannedWorktrees)
+    if (!operationId) return
+    let releaseOperation = true
+    const handoffRecovery = (message: string) => {
+      const state = useKaisola.getState()
+      const slice = state.activeProjectId === projectId ? state : state.projectSlices[projectId]
+      const current = slice?.assistantThreads.find((candidate) => candidate.id === threadId)?.group?.operation
+      if (current?.id !== operationId) return
+      releaseOperation = false
+      setGroup(threadId, { operation: { ...current, ownerId: `mesh-recovery-${operationId}` }, error: message }, projectId)
+    }
     try {
-      const attempts = await Promise.all(members.map(async (member, index) => {
-        const taskId = `group-${Date.now().toString(36)}-${index}`
-        const result = await bridge.worktree.create({ repo: workspacePath, taskId })
-        return { member, taskId, result }
-      }))
-      const failed = attempts.find((attempt) => !attempt.result.ok || !attempt.result.path)
-      if (failed) {
-        await Promise.all(attempts.filter((attempt) => attempt.result.ok).map((attempt) => bridge.worktree.remove({ taskId: attempt.taskId, repo: workspacePath })))
-        setGroup(threadId, { error: failed.result.message ?? 'Could not create isolated worktrees.' }, projectId)
+      const attempts: Array<{ member: GroupSessionMember; taskId: string; result: Awaited<ReturnType<typeof bridge.worktree.create>> }> = []
+      const created: Record<string, WorktreeSession> = {}
+      // Incremental recording closes the successful-reply → all-created gap;
+      // the pre-journal above closes the smaller process-crash gap around each
+      // individual create call.
+      for (const member of members) {
+        const taskId = plannedWorktrees[member.threadId].taskId
+        const result = await bridge.worktree.create({ repo, taskId })
+        attempts.push({ member, taskId, result })
+        if (result.ok && result.path) {
+          created[member.threadId] = {
+            taskId,
+            path: result.path,
+            branch: result.branch ?? `pz/${taskId}`,
+            repo,
+          }
+          setGroupWorktrees(threadId, { ...created }, projectId)
+        }
+        if (!result.ok || !result.path) break
+      }
+      if (!operationStillCurrent(operationId)) {
+        await Promise.all(Object.values(plannedWorktrees).map((entry) => bridge.worktree.remove(entry)))
         return
       }
-      const worktrees = Object.fromEntries(attempts.map(({ member, taskId, result }) => [member.threadId, {
-        taskId,
-        path: result.path!,
-        branch: result.branch ?? `pz/${taskId}`,
-        repo: workspacePath,
-      } satisfies WorktreeSession]))
+      const failed = attempts.find((attempt) => !attempt.result.ok || !attempt.result.path)
+      if (failed || attempts.length !== members.length) {
+        const cleanup = await Promise.all(Object.values(plannedWorktrees).map((entry) => bridge.worktree.remove(entry)))
+        if (!operationStillCurrent(operationId)) return
+        const cleaned = cleanup.every((result) => result.ok)
+        if (cleaned) {
+          clearGroupWorktreeSessions(threadId, repo, projectId)
+          setGroup(threadId, { worktrees: undefined, changedFiles: undefined, reviewedCommits: undefined }, projectId)
+        } else {
+          handoffRecovery('A Mesh worktree could not be created and cleanup is incomplete. Execution remains locked while recovery retries every journaled checkout.')
+        }
+        setGroup(threadId, {
+          error: cleaned
+            ? failed?.result.message ?? 'Could not create isolated worktrees.'
+            : 'A Mesh worktree could not be created and cleanup is incomplete. Retry after the interrupted-operation recovery finishes.',
+        }, projectId)
+        return
+      }
+      const worktrees = created
       setGroupWorktrees(threadId, worktrees, projectId)
       setGroup(threadId, { reviewedCommits: undefined, changedFiles: undefined }, projectId)
       await Promise.all(members.map((member) => bridge.acp.disconnect(`${member.agentKey}::${member.threadId}`, projectId).catch(() => ({ ok: false }))))
+      if (!operationStillCurrent(operationId)) return
       queueStage('executing', Object.fromEntries(members.map((member) => [member.threadId,
         `Execute only your named assignment from the approved role contract. You are the sole write owner of this isolated worktree: ${worktrees[member.threadId].path}. Do not work on the peer's assignment or main checkout. Honor shared invariants, run relevant tests, and stop if the contract is ambiguous or requires overlapping ownership. Finish with: files changed, tests run, unresolved risks, and integration notes.\n\nMission:\n${group.task ?? ''}\n\nApproved role contract:\n${group.jointPlan}`,
       ])))
+    } catch (error) {
+      const cleanup = await Promise.all(Object.values(plannedWorktrees).map((entry) => bridge.worktree.remove(entry).catch(() => ({ ok: false }))))
+      if (cleanup.every((result) => result.ok)) {
+        clearGroupWorktreeSessions(threadId, repo, projectId)
+        setGroup(threadId, {
+          worktrees: undefined,
+          changedFiles: undefined,
+          reviewedCommits: undefined,
+          error: String((error as Error)?.message ?? 'Could not create isolated worktrees.'),
+        }, projectId)
+      } else {
+        handoffRecovery('Mesh creation was interrupted and cleanup is incomplete. Execution remains locked while recovery retries every journaled checkout.')
+      }
     } finally {
-      endTransition()
+      if (releaseOperation) endGroupOperation(threadId, operationId, projectId)
     }
   }
 
   const crossReview = async () => {
-    if (!group?.worktrees || !beginTransition()) return
+    if (!group?.worktrees) return
+    const operationId = startOperation('review', 'execution-ready')
+    if (!operationId) return
     try {
       const diffs = await Promise.all(members.map(async (member) => {
         const wt = group.worktrees?.[member.threadId]
@@ -560,9 +751,15 @@ export const GroupAssistant = memo(function GroupAssistant({ threadId }: { threa
           : { ok: false, message: finalized.message ?? `Could not freeze ${member.label}'s candidate.` }
         return { member, wt, result }
       }))
+      if (!operationStillCurrent(operationId)) return
       const failed = diffs.find((item) => !item.result.ok)
       if (failed) {
         setGroup(threadId, { error: failed.result.message ?? 'Could not inspect a worker diff.' }, projectId)
+        return
+      }
+      const oversized = diffs.find((item) => (item.result.patch?.length ?? 0) > MAX_SHARED_TEXT)
+      if (oversized) {
+        setGroup(threadId, { error: `${oversized.member.label}'s frozen patch is too large for a complete Mesh review. Split the assignment into smaller commits before integration.` }, projectId)
         return
       }
       const changedFiles = Object.fromEntries(diffs.map((item) => [item.member.threadId, (item.result.files ?? []) as WorktreeFile[]]))
@@ -572,11 +769,11 @@ export const GroupAssistant = memo(function GroupAssistant({ threadId }: { threa
         const peer = members[(reviewerIndex + 1) % members.length]
         const peerDiff = diffs.find((item) => item.member.threadId === peer.threadId)!
         return [reviewer.threadId,
-          `Cross-review ${peer.label}'s implementation as an independent verifier. Do not edit either worktree. Check the approved role boundary, correctness, tests, regressions, security, and integration risk. Challenge claims with concrete evidence from the patch or peer worktree. Return: verdict, blocking findings, non-blocking findings, and required integration checks.\n\nMission:\n${group.task ?? ''}\n\nApproved role contract:\n${group.jointPlan ?? ''}\n\n${peer.label} execution report:\n${group.executions?.[peer.threadId] ?? ''}\n\nPeer worktree: ${peerDiff.wt?.path ?? ''}\n\nPatch:\n${(peerDiff.result.patch ?? '').slice(-MAX_SHARED_TEXT)}`,
+          `Cross-review ${peer.label}'s implementation as an independent verifier. Do not edit either worktree. You are reviewing immutable commit ${peerDiff.result.sha}. Check every changed file in the complete patch below, the approved role boundary, correctness, tests, regressions, security, and integration risk. Return: reviewed commit SHA; verdict; blocking findings; non-blocking findings; required integration checks.\n\nMission:\n${group.task ?? ''}\n\nApproved role contract:\n${group.jointPlan ?? ''}\n\n${peer.label} execution report:\n${group.executions?.[peer.threadId] ?? ''}\n\nPeer worktree: ${peerDiff.wt?.path ?? ''}\n\nComplete patch:\n${peerDiff.result.patch ?? ''}`,
         ]
       })))
     } finally {
-      endTransition()
+      endGroupOperation(threadId, operationId, projectId)
     }
   }
 
@@ -584,7 +781,8 @@ export const GroupAssistant = memo(function GroupAssistant({ threadId }: { threa
     if (!group?.worktrees || !workspacePath) return
     const lead = members.find((member) => member.threadId === group.leadThreadId) ?? members.find((member) => /codex/i.test(member.agentKey)) ?? members[members.length - 1]
     if (!lead) return
-    if (!beginTransition()) return
+    const operationId = startOperation('integrate', 'merge-ready')
+    if (!operationId) return
     try {
       const candidates = members.map((member) => ({
         member,
@@ -596,12 +794,19 @@ export const GroupAssistant = memo(function GroupAssistant({ threadId }: { threa
         setGroup(threadId, { phase: 'execution-ready', reviews: undefined, reviewedCommits: undefined, error: `${missing.member.label}'s reviewed commit is missing. Cross-review the stage again.` }, projectId)
         return
       }
+      const repos = new Set(candidates.map((candidate) => candidate.wt?.repo).filter(Boolean))
+      const repo = repos.size === 1 ? [...repos][0]! : ''
+      if (!repo || repo !== workspacePath) {
+        setGroup(threadId, { error: 'Mesh workspace identity changed. Reopen the original repository before integrating; no commit was merged.' }, projectId)
+        return
+      }
       // Verify the entire frozen set before mutating main. merge() repeats this
       // immediately before each git merge to close the check/use race.
       const preflight = await Promise.all(candidates.map(async (candidate) => ({
         candidate,
         result: await bridge.worktree.verify({ taskId: candidate.wt.taskId, repo: candidate.wt.repo, ref: candidate.reviewedSha! }),
       })))
+      if (!operationStillCurrent(operationId)) return
       const rejected = preflight.find((item) => !item.result.ok)
       if (rejected) {
         if (rejected.result.drifted) {
@@ -621,7 +826,9 @@ export const GroupAssistant = memo(function GroupAssistant({ threadId }: { threa
       for (let index = 0; index < candidates.length; index++) {
         const { member, wt } = candidates[index]
         const reviewedSha = candidates[index].reviewedSha!
+        if (!operationStillCurrent(operationId)) return
         const merged = await bridge.worktree.merge({ taskId: wt.taskId, repo: wt.repo, ref: reviewedSha })
+        if (!operationStillCurrent(operationId)) return
         if (!merged.ok) {
           if (!merged.conflicted) {
             if (merged.drifted) {
@@ -641,26 +848,21 @@ export const GroupAssistant = memo(function GroupAssistant({ threadId }: { threa
           break
         }
       }
-      if (!conflict) {
-        const cleanup = await Promise.all(members.map((member) => {
-          const wt = group.worktrees![member.threadId]
-          return bridge.worktree.remove({ taskId: wt.taskId, repo: wt.repo })
-        }))
-        const cleanupFailure = cleanup.find((result) => !result.ok)
-        if (cleanupFailure) {
-          pushToast('warn', `The reviewed changes merged, but a temporary worktree could not be removed${cleanupFailure.message ? ` — ${cleanupFailure.message}` : ''}.`)
-        } else {
-          clearGroupWorktreeSessions(threadId, workspacePath, projectId)
-        }
-      }
-      setThreadCwd(lead.threadId, workspacePath, projectId)
+      setThreadCwd(lead.threadId, repo, projectId)
       setGroup(threadId, { leadThreadId: lead.threadId }, projectId)
       await bridge.acp.disconnect(`${lead.agentKey}::${lead.threadId}`, projectId).catch(() => ({ ok: false }))
+      if (!operationStillCurrent(operationId)) return
+      // Persist the integration stage and cleanup checkpoint before removing a
+      // single checkout. A crash can now resume the lead prompt and cleanup,
+      // instead of retrying already-merged candidates from merge-ready.
       queueStage('integrating', {
-        [lead.threadId]: `You are the sole integration owner in the main workspace: ${workspacePath}. The workers' exact reviewed commits were merged where possible. Inspect git status before acting. ${conflict || 'All reviewed commits merged cleanly.'}${manualCommits.length ? ` Reproduce and resolve the aborted conflict, then merge only these immutable reviewed commit IDs (never their mutable branch names): ${manualCommits.join('; ')}.` : ''} Reconcile only integration issues, run the approved acceptance tests plus relevant regression checks, and leave the main workspace in a coherent finished state. Finish with a concise implementation summary, exact tests, and any remaining human decision.\n\nMission:\n${group.task ?? ''}\n\nRole contract:\n${group.jointPlan ?? ''}\n\nExecution reports:\n${memberPacket(members, group.executions)}\n\nCross-reviews:\n${memberPacket(members, group.reviews)}`,
-      }, [lead])
+        [lead.threadId]: `You are the sole integration owner in the main workspace: ${repo}. The workers' exact reviewed commits were merged where possible. Inspect git status before acting. ${conflict || 'All reviewed commits merged cleanly.'}${manualCommits.length ? ` Reproduce and resolve the aborted conflict, then merge only these immutable reviewed commit IDs (never their mutable branch names): ${manualCommits.join('; ')}.` : ''} Reconcile only integration issues, run the approved acceptance tests plus relevant regression checks, and leave the main workspace in a coherent finished state. Finish with a concise implementation summary, exact tests, and any remaining human decision.\n\nMission:\n${group.task ?? ''}\n\nRole contract:\n${group.jointPlan ?? ''}\n\nExecution reports:\n${memberPacket(members, group.executions)}\n\nCross-reviews:\n${memberPacket(members, group.reviews)}`,
+      // A conflict leaves reviewed commits reachable only from their worker
+      // branches until the integration owner proves otherwise. Retain every
+      // checkout/branch instead of auto-deleting the last recovery refs.
+      }, [lead], { worktreeCleanup: conflict ? undefined : 'integrating' })
     } finally {
-      endTransition()
+      endGroupOperation(threadId, operationId, projectId)
     }
   }
 
@@ -729,7 +931,7 @@ export const GroupAssistant = memo(function GroupAssistant({ threadId }: { threa
         <span className="group-mark"><Icon name="Network" size={14} /></span>
         <div><strong>Kaisola Mesh</strong><small>{members.length} agents · scout · align · divide · verify · integrate</small></div>
         <span className="grow" />
-        <span className="group-phase" data-running={running || undefined}>{group.paused ? 'Paused' : phaseLabel[phase]}</span>
+        <span className="group-phase" data-running={running || undefined} role="status" aria-live="polite" aria-atomic="true">{group.paused ? 'Paused' : phaseLabel[phase]}</span>
       </header>
 
       <div className="group-stream">
@@ -738,7 +940,7 @@ export const GroupAssistant = memo(function GroupAssistant({ threadId }: { threa
             <Icon name="Network" size={24} />
             <strong>One mission, multiple models, explicit ownership.</strong>
             <p>Mesh lets a bounded team scout independently, negotiate one role split, work in isolated git worktrees, cross-review, and hand one integration owner the final merge.</p>
-            <small>Every state-changing boundary waits for your approval.</small>
+            <small>Every Mesh stage transition waits for your approval.</small>
             <div className="group-roster" aria-label="Mesh participants">
               {members.map((member) => {
                 const key = `${member.agentKey}::${member.threadId}`
@@ -753,6 +955,7 @@ export const GroupAssistant = memo(function GroupAssistant({ threadId }: { threa
                   <span className="truncate">{member.label}</span>
                   <select
                     className="group-model-select"
+                    aria-label={`Model for ${member.label}`}
                     value={value}
                     disabled={!control?.options.length}
                     onChange={(event) => { void chooseModel(member, event.target.value) }}
@@ -780,6 +983,7 @@ export const GroupAssistant = memo(function GroupAssistant({ threadId }: { threa
               })}
               <select
                 className="group-add-member"
+                aria-label="Add another model to this Mesh"
                 value=""
                 disabled={members.length >= MAX_GROUP_MEMBERS}
                 onChange={(event) => {
@@ -793,7 +997,7 @@ export const GroupAssistant = memo(function GroupAssistant({ threadId }: { threa
             </div>
           </div>
         )}
-        {group.error && <div className="group-error"><Icon name="AlertTriangle" size={13} />{group.error}</div>}
+        {group.error && <div className="group-error" role="alert"><Icon name="AlertTriangle" size={13} />{group.error}</div>}
         {!group.paused && groupPermissions.length > 0 && <section className="group-permissions" aria-label="Mesh permission requests">
           <h3><Icon name="ShieldQuestion" size={13} /> Mesh needs your approval</h3>
           {groupPermissions.map((permission) => <PermissionCard
@@ -850,7 +1054,10 @@ export const GroupAssistant = memo(function GroupAssistant({ threadId }: { threa
       </div>
 
       <footer className="group-composer">
-        {phase === 'idle' && <><textarea value={draft} onChange={(event) => setDraft(event.target.value)} placeholder="Give Claude and Codex one mission…" rows={2} /><button className="group-primary" onClick={askBoth} disabled={!draft.trim()} title="Start independent scouting"><Icon name="ArrowUp" size={15} /></button></>}
+        {cleanupFailed && <button className="group-action" onClick={() => setRecoveryNonce((value) => value + 1)}><Icon name="RefreshCw" size={14} /> Retry safe worktree cleanup</button>}
+        {phase === 'idle' && <><textarea value={draft} onChange={(event) => setDraft(event.target.value)} placeholder="Give Claude and Codex one mission…" aria-label="Mesh mission" rows={2} />{workspacePath
+          ? <button className="group-primary" onClick={askBoth} disabled={!draft.trim()} title="Start independent scouting" aria-label="Start independent scouting"><Icon name="ArrowUp" size={15} /></button>
+          : <button className="group-primary" onClick={() => { void chooseMeshWorkspace() }} title="Choose one project folder before starting Mesh" aria-label="Choose a project folder before starting Mesh"><Icon name="FolderOpen" size={15} /></button>}</>}
         {phase === 'ready' && <button className="group-action" onClick={negotiate}><Icon name="MessageSquarePlus" size={14} /> Compare approaches and negotiate roles</button>}
         {(phase === 'plan-ready' || phase === 'review-ready') && <button className="group-action" onClick={writeRoleContract}><Icon name="ClipboardList" size={14} /> Approve negotiation and write role contract</button>}
         {phase === 'assigned' && <button className="group-action" onClick={() => void executeIsolated()} disabled={transitioning}><Icon name="GitBranch" size={14} /> Approve plan and create isolated worktrees</button>}
@@ -858,11 +1065,11 @@ export const GroupAssistant = memo(function GroupAssistant({ threadId }: { threa
         {phase === 'merge-ready' && <button className="group-action" onClick={() => void integrate()} disabled={transitioning}><Icon name="GitMerge" size={14} /> Approve and integrate reviewed work</button>}
         {phase === 'done' && <button className="group-action" onClick={requestNewGroup}><Icon name="Plus" size={14} /> Start another group session</button>}
         {group.paused && <button className="group-action" onClick={() => { void continueStage() }} disabled={transitioning}><Icon name="Play" size={14} /> {transitioning ? 'Waiting for agents to stop…' : `Continue ${group.pausedPending?.length ? `${group.pausedPending.length} unfinished ${group.pausedPending.length === 1 ? 'agent' : 'agents'}` : 'stage'}`}</button>}
-        {(running || transitioning) && <span className="group-running"><span className="session-busy" /> {transitioning ? 'Preparing safe transition' : phaseLabel[phase]}…</span>}
+        {(running || transitioning) && <span className="group-running" role="status" aria-live="polite"><span className="session-busy" /> {transitioning ? 'Preparing safe transition' : phaseLabel[phase]}…</span>}
         {running && <button className="group-stop" onClick={() => { void pauseStage() }} title="Stop all unfinished Mesh agents and keep this checkpoint"><Icon name="Square" size={11} /> Stop</button>}
       </footer>
 
-      <div className="group-workers" aria-hidden="true">
+      <div className="group-workers" aria-hidden="true" ref={(element) => element?.setAttribute('inert', '')}>
         {members.map((member) => <Assistant key={member.threadId} threadId={member.threadId} />)}
       </div>
     </div>

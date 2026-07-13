@@ -213,6 +213,7 @@ interface TreeMenuState {
 function FilesTree() {
   const workspacePath = useKaisola((s) => s.workspacePath)
   const setWorkspace = useKaisola((s) => s.setWorkspace)
+  const openProjectFolder = useKaisola((s) => s.openProjectFolder)
   const requestFile = useKaisola((s) => s.requestFile)
   const openFilePath = useKaisola((s) => s.openFilePath)
   const pushToast = useKaisola((s) => s.pushToast)
@@ -356,9 +357,11 @@ function FilesTree() {
     })
 
   const changeFolder = async () => {
-    if (useKaisola.getState().fileDirty && !window.confirm('Discard unsaved changes to the open file?')) return
     const r = await bridge.pickFolder()
-    if (r.ok && r.path) setWorkspace(r.path)
+    if (r.ok && r.path) {
+      if (workspacePath) openProjectFolder(r.path)
+      else setWorkspace(r.path)
+    } else if (r.message) pushToast('warn', r.message)
   }
 
   const relativePath = (p: string) =>
@@ -481,7 +484,7 @@ function FilesTree() {
             className="fx-root"
             onClick={changeFolder}
             onContextMenu={(ev) => onRowMenu(ev, { path: workspacePath, dir: true, root: true })}
-            title={`${workspacePath}${gitBranch ? ` · ${gitBranch}` : ''} — click to change folder`}
+            title={`${workspacePath}${gitBranch ? ` · ${gitBranch}` : ''} — click to open another project`}
           >
             <Icon name="Folder" size={13} className="fx-icon" />
             <span className="truncate">{workspacePath.split('/').filter(Boolean).pop()}</span>

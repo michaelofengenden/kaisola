@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from 'react'
 import { useKaisola } from '../store/store'
 import { bridge, type AuthEvent } from '../lib/bridge'
 import { Icon } from './Icon'
+import { useModalFocus } from '../lib/useModalFocus'
 
 /**
  * In-app device-code sign-in. Runs the CLI's device-auth headlessly and shows
@@ -14,6 +15,8 @@ export function SignInCard() {
   const [ev, setEv] = useState<AuthEvent | null>(null)
   const [copied, setCopied] = useState(false)
   const idRef = useRef<string | null>(null)
+  const dialogRef = useRef<HTMLDivElement>(null)
+  useModalFocus(!!signIn, dialogRef)
 
   useEffect(() => {
     if (!signIn) return
@@ -45,11 +48,11 @@ export function SignInCard() {
 
   return (
     <div className="focus-scrim" onMouseDown={close}>
-      <div className="signin-card" onMouseDown={(e) => e.stopPropagation()}>
+      <div ref={dialogRef} className="signin-card" role="dialog" aria-modal="true" aria-labelledby="signin-title" tabIndex={-1} onMouseDown={(e) => e.stopPropagation()}>
         <header className="focus-head">
           <Icon name="KeyRound" size={14} className="muted" />
-          <span className="grow">Sign in to {signIn.name}</span>
-          <button className="btn-icon btn-sm" onClick={close}><Icon name="X" size={14} /></button>
+          <span className="grow" id="signin-title">Sign in to {signIn.name}</span>
+          <button className="btn-icon btn-sm" onClick={close} aria-label="Close sign in"><Icon name="X" size={14} /></button>
         </header>
 
         <div className="signin-body">
@@ -99,7 +102,7 @@ export function SignInCard() {
               <div className="signin-waiting faint">
                 <Icon name="LoaderCircle" size={13} className="spin" /> Waiting for you to authorize…
               </div>
-              {ev?.url && <a className="signin-link mono faint" onClick={() => bridge.openExternal(ev.url!)}>{ev.url}</a>}
+              {ev?.url && <button className="signin-link mono faint" onClick={() => bridge.openExternal(ev.url!)}>{ev.url}</button>}
 
               <button className="btn btn-ghost btn-sm signin-cancel" onClick={close}>Cancel</button>
             </>

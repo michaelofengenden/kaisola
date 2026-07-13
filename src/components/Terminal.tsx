@@ -206,7 +206,7 @@ function continuedStatus(snapshot: Partial<TermSnapshot>): TerminalContinuationS
  * `attach` binds to an existing agent-owned session without owning its lifecycle.
  * The palette follows the app theme.
  */
-export function Terminal({ id, attach = false, boot, cwd }: { id: string; attach?: boolean; boot?: string; cwd?: string }) {
+export function Terminal({ id, attach = false, boot, cwd, projectId: projectIdOverride }: { id: string; attach?: boolean; boot?: string; cwd?: string; projectId?: string }) {
   const hostRef = useRef<HTMLDivElement>(null)
   const termRef = useRef<XTerm | null>(null)
   const searchRef = useRef<SearchAddon | null>(null)
@@ -223,6 +223,10 @@ export function Terminal({ id, attach = false, boot, cwd }: { id: string; attach
   const [, setPromptTick] = useState(0)
   const [railHover, setRailHover] = useState<{ n: number; y: number } | null>(null)
   const theme = useKaisola((s) => s.theme)
+  // Terminal capabilities are scoped to the project that owns this id, not
+  // merely whichever tab is active. Hidden warm cards can belong to a parked
+  // project slice, and popped/transferred cards keep this same project id.
+  const projectId = useKaisola((s) => projectIdOverride ?? terminalOwnerMap(s)[id] ?? s.activeProjectId)
   const ecoMode = useKaisola((s) => s.perfMode === 'eco')
   const termFontSize = useKaisola((s) => s.termFontSize)
   const termFontFamily = useKaisola((s) => s.termFontFamily)
@@ -354,10 +358,10 @@ export function Terminal({ id, attach = false, boot, cwd }: { id: string; attach
         term.options.fontFamily = fontStack(termFontFamily)
         term.options.fontWeight = termFontWeight as 400 | 500 | 700
         fitRef.current?.fit()
-        bridge.terminal.resize(id, term.cols, term.rows)
+        void bridge.terminal.resize(id, term.cols, term.rows, projectId).catch(() => {})
       })
     } catch { /* transient */ }
-  }, [termFontSize, termFontFamily, termFontWeight, id])
+  }, [termFontSize, termFontFamily, termFontWeight, id, projectId])
 
   useEffect(() => {
     if (!isDesktop || !hostRef.current || !rendererAwake) return
@@ -451,7 +455,7 @@ export function Terminal({ id, attach = false, boot, cwd }: { id: string; attach
       agentTurnOpenRef.current = false
       const state = useKaisola.getState()
       state.setTerminalMeta(id, { agentBusy: false })
-      bridge.terminal.agentTurn(id, false)
+      bridge.terminal.agentTurn(id, false, projectId)
     }
     const armAgentDone = () => {
       if (!agentTurnOpenRef.current) return
@@ -466,7 +470,7 @@ export function Terminal({ id, attach = false, boot, cwd }: { id: string; attach
       if (codexProbeTimerRef.current) return
       codexProbeTimerRef.current = setTimeout(() => {
         codexProbeTimerRef.current = null
-        void bridge.terminal.codexSession(id, liveCwd).then((result) => {
+        void bridge.terminal.codexSession(id, liveCwd, projectId).then((result) => {
           if (disposed || !result.ok || !result.sessionId || codexSessionRef.current === result.sessionId) return
           codexSessionRef.current = result.sessionId
           useKaisola.getState().setTerminalResume(id, `codex resume ${result.sessionId}`)
@@ -477,7 +481,7 @@ export function Terminal({ id, attach = false, boot, cwd }: { id: string; attach
       agentTurnOpenRef.current = true
       const state = useKaisola.getState()
       state.setTerminalMeta(id, { agentBusy: true, lastExit: null })
-      bridge.terminal.agentTurn(id, true)
+      bridge.terminal.agentTurn(id, true, projectId)
       const owner = terminalOwnerMap(state)[id]
       if (owner && owner !== state.activeProjectId) state.setProjectActivity(owner, 'running')
       captureCodexSession()
@@ -564,7 +568,7 @@ export function Terminal({ id, attach = false, boot, cwd }: { id: string; attach
       // swallowed by its TUI); a bare shell prompt shows a continuation
       // line, which is also a newline, not a submit
       if (ev.type === 'keydown' && ev.key === 'Enter' && ev.shiftKey && !ev.metaKey && !ev.ctrlKey && !ev.altKey) {
-        bridge.terminal.write(id, '\\\r')
+        void bridge.terminal.write(id, '\\\r', projectId).catch(() => {})
         trackDraftRef.current('\\\r') // direct write bypasses term.onData — feed the draft tracker too
         return false
       }
@@ -713,7 +717,7 @@ export function Terminal({ id, attach = false, boot, cwd }: { id: string; attach
         if (draftBufRef.current) return // the user is already typing — leave them be
         if (Date.now() - born > 30_000) return
         if (Date.now() - born > 3000 && Date.now() - lastOutputAtRef.current > 2000) {
-          bridge.terminal.write(id, saved.replaceAll('\n', '\\\r'))
+          void bridge.terminal.write(id, saved.replaceAll('\n', '\\\r'), projectId).catch(() => {})
           draftBufRef.current = saved // the composer now holds it — track edits from here
           return
         }
@@ -765,11 +769,11 @@ export function Terminal({ id, attach = false, boot, cwd }: { id: string; attach
       })
       unsubExit = bridge.terminal.onExit(id, finishAgentTurn)
       term.onData((data) => {
-        bridge.terminal.write(id, data)
+        void bridge.terminal.write(id, data, projectId).catch(() => {})
         if (!attach) trackInput(data)
         trackDraft(data)
       })
-      bridge.terminal.resize(id, term.cols, term.rows)
+      void bridge.terminal.resize(id, term.cols, term.rows, projectId).catch(() => {})
     }
 
     const restoreSnapshot = (snap: Partial<TermSnapshot>) => {
@@ -793,15 +797,17 @@ export function Terminal({ id, attach = false, boot, cwd }: { id: string; attach
     }
 
     if (attach) {
-      bridge.terminal.attach(id).then((snap) => {
+      void bridge.terminal.attach(id, projectId).then((snap) => {
         if (disposed) return
         const receipt = continuedStatus(snap)
         if (receipt) setAttachedContinuation(receipt)
         restoreSnapshot(snap)
         wire()
+      }).catch(() => {
+        if (!disposed) term.writeln('\x1b[38;2;225;106;106mSession unavailable in this project.\x1b[0m')
       })
     } else {
-      bridge.terminal.create(id, cwd, term.cols, term.rows).then((res) => {
+      void bridge.terminal.create(id, cwd, term.cols, term.rows, projectId).then((res) => {
         if (disposed) return
         if (!res.ok) {
           term.writeln('\x1b[38;2;225;106;106mTerminal unavailable.\x1b[0m')
@@ -835,12 +841,14 @@ export function Terminal({ id, attach = false, boot, cwd }: { id: string; attach
               if (!line) return
               // dedupe against the CLEAN boot — the typed line may carry the wipe
               lastBootRef.current = { boot: line, at: Date.now() }
-              bridge.terminal.write(id, bootLine(line, rec?.singletonKey) + '\n')
+              void bridge.terminal.write(id, bootLine(line, rec?.singletonKey) + '\n', projectId).catch(() => {})
               armDraftRetypeRef.current(line)
             }, 700)
           }
         }
         setPtyReady(true)
+      }).catch(() => {
+        if (!disposed) term.writeln('\x1b[38;2;225;106;106mTerminal unavailable in this project.\x1b[0m')
       })
     }
 
@@ -848,7 +856,7 @@ export function Terminal({ id, attach = false, boot, cwd }: { id: string; attach
       try {
         preserveTerminalViewport(term, () => {
           fit.fit()
-          bridge.terminal.resize(id, term.cols, term.rows)
+          void bridge.terminal.resize(id, term.cols, term.rows, projectId).catch(() => {})
         })
       } catch {
         /* ignore */
@@ -871,7 +879,7 @@ export function Terminal({ id, attach = false, boot, cwd }: { id: string; attach
         cols: term.cols,
         rows: term.rows,
       }
-      void bridge.terminal.detachRenderer(id, viewState)
+      void bridge.terminal.detachRenderer(id, viewState, projectId).catch(() => {})
       if (titleTimer) clearTimeout(titleTimer)
       if (agentDoneTimerRef.current) clearTimeout(agentDoneTimerRef.current)
       if (codexProbeTimerRef.current) clearTimeout(codexProbeTimerRef.current)
@@ -898,7 +906,7 @@ export function Terminal({ id, attach = false, boot, cwd }: { id: string; attach
     // cwd is intentionally NOT a dep: it only matters at spawn time, and a
     // record cwd change must never tear down a live session mid-run
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [id, attach, rendererAwake])
+  }, [id, attach, rendererAwake, projectId])
 
   // deliver a boot adopted after the pty went live (see bootPending). The shell
   // was spawned before the terminal had a cwd, so cd to it as a user would.
@@ -939,10 +947,10 @@ export function Terminal({ id, attach = false, boot, cwd }: { id: string; attach
     if (t?.boot && lastBootRef.current?.boot === t.boot && Date.now() - lastBootRef.current.at < 10_000) return
     bootSentRef.current = true
     setTimeout(() => {
-      bridge.terminal.write(id, line + '\n')
+      void bridge.terminal.write(id, line + '\n', projectId).catch(() => {})
       armDraftRetypeRef.current(line)
     }, 700)
-  }, [ptyReady, bootPending, id, foregroundProcess])
+  }, [ptyReady, bootPending, id, foregroundProcess, projectId])
 
   // find-in-scrollback: amber matches, accent active match (proposed-API decorations)
   const findDecorations = {
@@ -1006,7 +1014,7 @@ export function Terminal({ id, attach = false, boot, cwd }: { id: string; attach
         // xterm.paste emits bracketed paste when the CLI enabled it. Direct IPC
         // writes bypassed that protocol, so Codex/Claude TUIs ignored drops.
         if (term) term.paste(text)
-        else bridge.terminal.write(id, text)
+        else void bridge.terminal.write(id, text, projectId).catch(() => {})
       }}
     >
       {/* prompt timeline for the Claude session — a tick per instigated turn */}

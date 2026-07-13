@@ -996,17 +996,17 @@ export const Assistant = memo(function Assistant({ threadId }: { threadId: strin
     })
     return () => { live = false }
   }, [connectionKey])
-  const keepAgentHot = busy || permsForAgent.length > 0
   useEffect(() => {
-    // A visible but idle transcript does not need a live Node/CLI adapter. The
-    // resumable provider session is the durable state, so main parks it after
-    // a short grace and reconnects on the next send. Active turns and approval
-    // prompts always hold the lease and therefore cannot be parked.
-    void bridge.acp.lease(connectionKey, threadId, keepAgentHot, 30_000, projectId)
+    // A mounted transcript is an open user session, so keep its adapter live.
+    // Parking is reserved for sessions that actually leave the rendered
+    // workspace (closed, another project, or otherwise unmounted). Releasing
+    // every idle visible agent stranded externally queued Mesh stages and made
+    // ordinary follow-ups pay an avoidable reconnect cost.
+    void bridge.acp.lease(connectionKey, threadId, true, 30_000, projectId)
     return () => {
       void bridge.acp.lease(connectionKey, threadId, false, 30_000, projectId)
     }
-  }, [connectionKey, keepAgentHot, projectId, threadId])
+  }, [connectionKey, projectId, threadId])
   useEffect(() => { const off = bridge.acp.onControls(() => refresh()); return off }, [connectionKey])
   useEffect(() => {
     const off = bridge.acp.onCommands((info) => {
@@ -1716,9 +1716,14 @@ export const Assistant = memo(function Assistant({ threadId }: { threadId: strin
   // resumes; Stop pauses so cancelling never auto-fires the next instruction.
   useEffect(() => { if (connected) queuePausedRef.current = false }, [connected])
   const drainQueuedPrompts = async () => {
-    if (!connected || queuePausedRef.current || drainingQueueRef.current) return
+    if (queuePausedRef.current || drainingQueueRef.current) return
     drainingQueueRef.current = true
     try {
+      // Queue producers such as Mesh and the command palette live outside this
+      // component. Always probe/reconnect before draining: renderer connection
+      // state can be stale after an idle park, restart, or explicit stage
+      // transition disconnect. The queued prompt remains durable on failure.
+      if (!(await ensureAgentConnected())) return
       // Keep ownership in one async loop. A ref alone cannot wake React after
       // finally; the old one-shot effect therefore stranded item 2 forever.
       while (!queuePausedRef.current) {
@@ -1746,7 +1751,7 @@ export const Assistant = memo(function Assistant({ threadId }: { threadId: strin
     }
   }
   useEffect(() => {
-    if (!connected || busy || queuePausedRef.current || drainingQueueRef.current || queuedPrompts.length === 0) return
+    if (busy || queuePausedRef.current || drainingQueueRef.current || queuedPrompts.length === 0) return
     void drainQueuedPrompts()
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [connected, busy, queuedPrompts.length, active.id])

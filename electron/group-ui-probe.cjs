@@ -38,7 +38,9 @@ const { registerWorktreeHandlers } = require('./ipc/worktreeHandler.cjs')
 
 const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
 const connected = new Set()
+let connectCalls = 0
 const selectedModels = new Map()
+const bareAgentKey = (key) => String(key ?? '').split('@@')[0]
 const controlsFor = (key) => {
   const provider = key.startsWith('claude') ? 'claude' : 'codex'
   const options = provider === 'claude'
@@ -64,15 +66,17 @@ app.whenReady().then(async () => {
     agents: (clientKeys ?? []).map((key) => ({ key, presetId: key.split('::')[0], name: key.startsWith('claude') ? 'Claude' : 'Codex', connected: connected.has(key), controls: controlsFor(key) })),
   }))
   ipcMain.handle('acp:connect', (_event, config) => {
-    const key = config.clientKey
+    const key = bareAgentKey(config.clientKey)
+    connectCalls += 1
     connected.add(key)
     return { ok: true, agent: { key, connected: true, sessionId: `session-${key}` }, controls: controlsFor(key) }
   })
-  ipcMain.handle('acp:disconnect', (_event, key) => {
-    connected.delete(key)
+  ipcMain.handle('acp:disconnect', (_event, { agentKey } = {}) => {
+    connected.delete(bareAgentKey(agentKey))
     return { ok: true }
   })
   ipcMain.handle('acp:prompt', async (event, { agentKey, reqId, text }) => {
+    if (!connected.has(bareAgentKey(agentKey))) return { ok: false, message: 'Probe adapter is parked.' }
     const provider = agentKey.startsWith('claude') ? 'Claude' : 'Codex'
     let reply = `${provider} independent proposal with an ownership boundary and acceptance tests.`
     if (/only role-negotiation round/.test(text)) {
@@ -165,6 +169,11 @@ app.whenReady().then(async () => {
     return false
   }
   const ready = await waitForPhase('ready')
+  // Reproduce the production failure: both scouts are finished, their adapter
+  // processes park, and the renderer still has an optimistic connected badge.
+  // Negotiation must probe, reconnect, and drain its durable prompts.
+  if (ready) connected.clear()
+  const parkedBeforeNegotiation = ready && connected.size === 0
   if (ready) await clickAction()
   const negotiated = await waitForPhase('plan-ready')
   if (negotiated) await clickAction()
@@ -214,12 +223,14 @@ app.whenReady().then(async () => {
   const image = await win.webContents.capturePage()
   const screenshot = path.join(os.tmpdir(), 'kaisola-group-session.png')
   fs.writeFileSync(screenshot, image.toPNG())
-  const result = { configured, asked, ready, negotiated, assigned, executed, reviewed, done, ...facts, persisted, screenshot }
+  const result = { configured, asked, ready, parkedBeforeNegotiation, connectCalls, negotiated, assigned, executed, reviewed, done, ...facts, persisted, screenshot }
   console.log('GROUP_UI=' + JSON.stringify(result))
   app.exit(
     configured
     && asked
     && ready
+    && parkedBeforeNegotiation
+    && connectCalls >= 4
     && negotiated
     && assigned
     && executed

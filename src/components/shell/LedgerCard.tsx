@@ -23,6 +23,10 @@ const age = (at: number): string => {
   return m < 1 ? 'now' : m < 60 ? `${m}m` : m < 60 * 24 ? `${Math.round(m / 60)}h` : `${Math.round(m / 1440)}d`
 }
 
+const resolveTask = (id: string, status: 'done' | 'rejected') => {
+  void bridge.ledger?.update({ id, status })
+}
+
 export function LedgerCard() {
   const workspacePath = useKaisola((s) => s.workspacePath)
   const [tasks, setTasks] = useState<LedgerTask[]>([])
@@ -50,10 +54,6 @@ export function LedgerCard() {
       createdBy: 'human',
     }).then(() => { setTitle(''); setOwner('') })
   }
-  const resolve = (id: string, status: 'done' | 'rejected') => {
-    void bridge.ledger?.update({ id, status })
-  }
-
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 8, height: '100%', padding: '10px 12px', overflow: 'hidden', fontSize: 'var(--fs-12)' }}>
       <div style={{ display: 'flex', gap: 6 }}>
@@ -76,7 +76,7 @@ export function LedgerCard() {
           spellCheck={false}
           title="Address a specific agent, e.g. claude / codex (optional)"
         />
-        <button className="btn btn-primary btn-sm" disabled={!title.trim()} onClick={post} title="Post to the shared ledger — agents see it via agent_tasks_list">
+        <button type="button" className="btn btn-primary btn-sm" disabled={!title.trim()} onClick={post} title="Post to the shared ledger — agents see it via agent_tasks_list" aria-label="Post task to shared ledger">
           <Icon name="Send" size={12} />
         </button>
       </div>
@@ -105,10 +105,10 @@ export function LedgerCard() {
               <span className="grow" />
               {t.status !== 'done' && t.status !== 'rejected' && (
                 <>
-                  <button className="btn-icon btn-sm" onClick={() => resolve(t.id, 'done')} title="Mark done">
+                  <button type="button" className="btn-icon btn-sm" onClick={() => resolveTask(t.id, 'done')} title="Mark done" aria-label={`Mark ${t.title} done`}>
                     <Icon name="Check" size={12} />
                   </button>
-                  <button className="btn-icon btn-sm" onClick={() => resolve(t.id, 'rejected')} title="Reject">
+                  <button type="button" className="btn-icon btn-sm" onClick={() => resolveTask(t.id, 'rejected')} title="Reject" aria-label={`Reject ${t.title}`}>
                     <Icon name="X" size={12} />
                   </button>
                 </>

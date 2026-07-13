@@ -2,14 +2,16 @@ import { Suspense, lazy, useEffect, useRef, useState, type CSSProperties, type D
 import { useShallow } from 'zustand/react/shallow'
 import { useKaisola, type TerminalMeta } from '../../store/store'
 import { sessionHue, terminalAgentKey } from '../../lib/sessionHue'
+import { everMountedTerminals, hiddenTerminalResidentCap } from '../../lib/terminalResidency'
 import { useAgentRegistry } from '../../lib/registry'
 import { urlHost, terminalLabel, threadLabel } from '@/lib/sessionLabel'
-import { Terminal, everMountedTerminals, hiddenTerminalResidentCap } from '../Terminal'
+import { Terminal } from '../Terminal'
 import { BrowserCard } from './BrowserCard'
 import { LedgerCard } from './LedgerCard'
 import { SessionTabs } from './SessionTabs'
 import { Icon } from '../Icon'
 import { ProviderIcon } from '../ProviderIcon'
+import { shellDrag } from './shellDrag'
 
 // Git diff rendering pulls in CodeMirror. Keep it out of the initial shell
 // bundle; Files and Commit share the same lazy editor chunk on first use.
@@ -18,16 +20,6 @@ const GitPanel = lazy(() => import('./GitPanel').then((module) => ({ default: mo
 // card, not at boot (the default shell is a lone agent terminal now).
 const Assistant = lazy(() => import('../Assistant').then((module) => ({ default: module.Assistant })))
 const GroupAssistant = lazy(() => import('../GroupAssistant').then((module) => ({ default: module.GroupAssistant })))
-
-/**
- * While ANY shell drag runs (card heads, column grips, the canvas edge),
- * iframes/webviews must stop eating pointer events — a PDF or browser card
- * under the cursor otherwise freezes the drag mid-flight.
- */
-export const shellDrag = {
-  start: () => document.body.setAttribute('data-shell-drag', '1'),
-  end: () => document.body.removeAttribute('data-shell-drag'),
-}
 
 const homeTilde = (p: string) => p.replace(/^\/Users\/[^/]+/, '~')
 
@@ -102,6 +94,7 @@ export function SessionCards() {
     useShallow((s) => Object.values(s.projectSlices).flatMap((sl) => sl.agentTerminals.filter((t) => warmTerminalIds.has(t.terminalId)))),
   )
   const { all: agents } = useAgentRegistry()
+  const threadById = new Map(threads.map((thread) => [thread.id, thread]))
   const dragRef = useRef<string | null>(null)
   const gridRef = useRef<HTMLDivElement>(null)
   const [drop, setDrop] = useState<{ id: string; edge: Edge } | null>(null)
@@ -245,6 +238,7 @@ export function SessionCards() {
             <span className="grow" />
             {idn?.ports?.map((port) => (
               <button
+                type="button"
                 key={port}
                 className="pane-port"
                 onClick={() => useKaisola.getState().openBrowserPanel(`http://localhost:${port}`)}
@@ -255,14 +249,16 @@ export function SessionCards() {
             ))}
             {idn?.poppable && (
               <button
+                type="button"
                 className="pane-head-close pane-head-pop"
                 onClick={() => popOutTerminal(id, label, idn.hue)}
                 title="Open in its own window"
+                aria-label={`Open ${label} in its own window`}
               >
                 <Icon name="PictureInPicture2" size={11} />
               </button>
             )}
-            <button className="pane-head-close" onClick={() => removeDockView(id)} title="Close this card">
+            <button type="button" className="pane-head-close" onClick={() => removeDockView(id)} title="Close this card" aria-label={`Close ${label} card`}>
               <Icon name="X" size={11} />
             </button>
           </div>
@@ -300,23 +296,39 @@ export function SessionCards() {
           style={{ left: `${frac * 100}%` }}
           onMouseDown={(e) => startColResize(e, i)}
           onDoubleClick={() => setDockColWeights(null)}
+          onKeyDown={(event) => {
+            if (event.key === 'Home') { event.preventDefault(); setDockColWeights(null); return }
+            if (event.key !== 'ArrowLeft' && event.key !== 'ArrowRight') return
+            event.preventDefault()
+            const next = [...weights]
+            const delta = event.key === 'ArrowLeft' ? -0.1 : 0.1
+            const shift = Math.max(-(next[i] - 0.2), Math.min(next[i + 1] - 0.2, delta))
+            next[i] += shift
+            next[i + 1] -= shift
+            setDockColWeights(next)
+          }}
+          role="separator"
+          aria-label={`Resize session columns ${i + 1} and ${i + 2}`}
+          aria-orientation="vertical"
+          tabIndex={0}
           title="Drag to resize · double-click to reset"
         />
       ))}
-      {threads.filter((thread) => !thread.groupParentId).map((t, i) => {
+      {threads.flatMap((t, i) => {
+        if (t.groupParentId) return []
         const label = threadLabel(t, agents, threads, i)
         const body = pos.has(t.id)
           ? <Suspense fallback={<div className="fx-loading aurora"><span className="shimmer-text">Loading chat…</span></div>}>
               {t.group ? <GroupAssistant threadId={t.id} /> : <Assistant threadId={t.id} />}
             </Suspense>
           : null
-        return card(t.id, t.group ? 'Network' : 'Sparkles', label, body, {
+        return [card(t.id, t.group ? 'Network' : 'Sparkles', label, body, {
           hue: sessionHue({ agentKey: t.group ? 'group' : t.agentKey }),
           agentKey: t.group ? undefined : t.agentKey,
           running: t.group
-            ? t.group.members.some((member) => threads.find((thread) => thread.id === member.threadId)?.busy)
+            ? t.group.members.some((member) => threadById.get(member.threadId)?.busy)
             : t.busy,
-        })
+        })]
       })}
       {/* live + ghost terminal cards share ONE array expression on purpose:
           React matches keys only within the same child slot, so a terminal

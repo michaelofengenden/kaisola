@@ -98,7 +98,10 @@ async function fetchWork(url: string): Promise<OpenAlexResult | null> {
     if (!title) return null
     return {
       title,
-      authors: (w.authorships ?? []).map((a) => a.author?.display_name ?? '').filter(Boolean),
+      authors: (w.authorships ?? []).flatMap((authorship) => {
+        const name = authorship.author?.display_name
+        return name ? [name] : []
+      }),
       abstract: reconstructAbstract(w.abstract_inverted_index) || undefined,
       year: w.publication_year,
       venue: w.primary_location?.source?.display_name,

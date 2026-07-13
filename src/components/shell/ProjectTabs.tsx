@@ -135,14 +135,12 @@ export function ProjectTabs() {
                 if (out && dragRef.current === tab.id) void detachProjectToWindow(tab.id, { x: e.screenX, y: e.screenY })
                 dragRef.current = null
               }}
-              onMouseDown={(e) => { if (e.button === 1) e.preventDefault() }}
-              onAuxClick={(e) => { if (e.button === 1) { e.preventDefault(); closeProject(tab.id) } }}
-              onContextMenu={(e) => { e.preventDefault(); e.stopPropagation(); setMenu({ x: e.clientX, y: e.clientY, id: tab.id }) }}
               title={tab.workspacePath ?? label}
             >
               {editing === tab.id ? (
                 <input
                   className="ptab-label"
+                  aria-label="Project name"
                   value={editValue}
                   autoFocus
                   onChange={(e) => setEditValue(e.target.value)}
@@ -153,17 +151,20 @@ export function ProjectTabs() {
                     if (e.key === 'Enter') commitRename()
                     if (e.key === 'Escape') setEditing(null)
                   }}
-                  style={{ background: 'transparent', border: 'none', outline: 'none', color: 'inherit', font: 'inherit', width: '100%', minWidth: 0 }}
+                  style={{ background: 'transparent', border: 'none', color: 'inherit', font: 'inherit', width: '100%', minWidth: 0 }}
                 />
               ) : (
                 <>
-                  <button
+                  <button type="button"
                     className="ptab-select"
                     role="tab"
                     aria-label={`Project ${label}`}
                     aria-selected={active}
                     tabIndex={active ? 0 : -1}
                     onClick={() => switchProject(tab.id)}
+                    onMouseDown={(e) => { if (e.button === 1) e.preventDefault() }}
+                    onAuxClick={(e) => { if (e.button === 1) { e.preventDefault(); closeProject(tab.id) } }}
+                    onContextMenu={(e) => { e.preventDefault(); e.stopPropagation(); setMenu({ x: e.clientX, y: e.clientY, id: tab.id }) }}
                     onKeyDown={(e) => {
                       const keys = ['ArrowLeft', 'ArrowRight', 'Home', 'End']
                       if (!keys.includes(e.key)) return
@@ -186,7 +187,7 @@ export function ProjectTabs() {
                 </>
               )}
               {!loneEmpty && (
-                <button className="ptab-close" onClick={(e) => { e.stopPropagation(); closeProject(tab.id) }} title="Close tab" aria-label={`Close project ${label}`}>
+                <button type="button" className="ptab-close" onClick={(e) => { e.stopPropagation(); closeProject(tab.id) }} title="Close tab" aria-label={`Close project ${label}`}>
                   <Icon name="X" size={11} />
                 </button>
               )}
@@ -206,13 +207,20 @@ export function ProjectTabs() {
       {/* portalled to <body> — rendered in-strip it inherits a stacking context
           that loses to the session cards' glass layers and slides behind them */}
       {menu && createPortal(
-        <div className="tree-menu-overlay" onMouseDown={() => setMenu(null)} onContextMenu={(e) => { e.preventDefault(); setMenu(null) }}>
+        <>
+          <button
+            type="button"
+            className="tree-menu-overlay"
+            aria-label="Close project menu"
+            onMouseDown={() => setMenu(null)}
+            onContextMenu={(e) => { e.preventDefault(); setMenu(null) }}
+            style={{ background: 'transparent', border: 'none', padding: 0 }}
+          />
           <div
             className="tree-menu"
-            style={{ left: Math.min(menu.x, window.innerWidth - 220), top: Math.min(menu.y, window.innerHeight - 200) }}
-            onMouseDown={(e) => e.stopPropagation()}
+            style={{ left: Math.min(menu.x, window.innerWidth - 220), top: Math.min(menu.y, window.innerHeight - 200), zIndex: 'calc(var(--z-palette) + 1)' }}
           >
-            <button
+            <button type="button"
               className="tree-menu-item"
               onClick={() => { const t = tabs.find((t) => t.id === menu.id); if (t) beginRename(t.id, tabLabel(t)); setMenu(null) }}
             >
@@ -222,33 +230,35 @@ export function ProjectTabs() {
             {/* Chrome-style color chips (GROUP_COLORS) + a reset-to-auto swatch */}
             <div style={{ display: 'flex', gap: 6, padding: '4px 10px', alignItems: 'center' }}>
               {GROUP_COLORS.map((c) => (
-                <button
+                <button type="button"
                   key={c}
                   title="Set tab color"
+                  aria-label={`Set tab color to ${c}`}
                   onClick={() => { setProjectColor(menu.id, c); setMenu(null) }}
                   style={{ width: 14, height: 14, borderRadius: '50%', background: c, border: 'none', cursor: 'pointer', padding: 0 }}
                 />
               ))}
-              <button
+              <button type="button"
                 title="Auto color"
+                aria-label="Use automatic tab color"
                 onClick={() => { setProjectColor(menu.id, undefined); setMenu(null) }}
                 style={{ width: 14, height: 14, borderRadius: '50%', background: 'transparent', border: '1px solid var(--border-strong)', cursor: 'pointer', padding: 0 }}
               />
             </div>
             <div className="tree-menu-sep" />
-            <button className="tree-menu-item" onClick={() => { void detachProjectToWindow(menu.id); setMenu(null) }}>
+            <button type="button" className="tree-menu-item" onClick={() => { void detachProjectToWindow(menu.id); setMenu(null) }}>
               <Icon name="AppWindow" size={13} /> Move to new window
             </button>
-            <button className="tree-menu-item" onClick={() => { closeProject(menu.id); setMenu(null) }}>
+            <button type="button" className="tree-menu-item" onClick={() => { closeProject(menu.id); setMenu(null) }}>
               <Icon name="X" size={13} /> Close tab
             </button>
             {tabs.length > 1 && (
-              <button className="tree-menu-item" onClick={() => { closeOthers(menu.id); setMenu(null) }}>
+              <button type="button" className="tree-menu-item" onClick={() => { closeOthers(menu.id); setMenu(null) }}>
                 <Icon name="X" size={13} /> Close other tabs
               </button>
             )}
           </div>
-        </div>,
+        </>,
         document.body,
       )}
     </div>
@@ -258,6 +268,25 @@ export function ProjectTabs() {
 type ViewTransitionDocument = Document & {
   startViewTransition?: (update: () => void) => { finished: Promise<unknown> }
 }
+
+const runViewTransition = (kind: string, update: () => void) => {
+  const doc = document as ViewTransitionDocument
+  const reduced = window.matchMedia?.('(prefers-reduced-motion: reduce)').matches
+  if (!doc.startViewTransition || reduced) {
+    update()
+    return
+  }
+  document.documentElement.dataset.panelTransition = kind
+  const view = doc.startViewTransition(update)
+  const clearTransition = () => {
+    if (document.documentElement.dataset.panelTransition === kind) delete document.documentElement.dataset.panelTransition
+  }
+  // A superseding navigation can reject `finished`; cleanup should be the
+  // same in either case and must not leave an unhandled promise behind.
+  void view.finished.then(clearTransition, clearTransition)
+}
+
+const togglePreview = () => runViewTransition('preview-right', () => useKaisola.getState().toggleCanvas())
 
 /**
  * The project tree and document canvas stay addressable in one stable place.
@@ -272,24 +301,7 @@ function ViewControls() {
   const treeVisible = layoutMode === 'studio' && railOpen
   const previewVisible = layoutMode === 'focus' || canvasOpen
 
-  const transition = (kind: string, update: () => void) => {
-    const doc = document as ViewTransitionDocument
-    const reduced = window.matchMedia?.('(prefers-reduced-motion: reduce)').matches
-    if (!doc.startViewTransition || reduced) {
-      update()
-      return
-    }
-    document.documentElement.dataset.panelTransition = kind
-    const view = doc.startViewTransition(update)
-    const clearTransition = () => {
-      if (document.documentElement.dataset.panelTransition === kind) delete document.documentElement.dataset.panelTransition
-    }
-    // A superseding navigation can reject `finished`; cleanup should be the
-    // same in either case and must not leave an unhandled promise behind.
-    void view.finished.then(clearTransition, clearTransition)
-  }
-
-  const toggleTree = () => transition(tabLayout === 'sidebar' ? 'tree-right' : 'tree-left', () => {
+  const toggleTree = () => runViewTransition(tabLayout === 'sidebar' ? 'tree-right' : 'tree-left', () => {
     const state = useKaisola.getState()
     if (state.layoutMode !== 'studio') {
       state.setLayoutMode('studio')
@@ -298,11 +310,9 @@ function ViewControls() {
     }
     state.toggleRail()
   })
-  const togglePreview = () => transition('preview-right', () => useKaisola.getState().toggleCanvas())
-
   return (
     <div className="tabstrip-view-controls" role="group" aria-label="Workspace panels">
-      <button
+      <button type="button"
         data-active={treeVisible || undefined}
         aria-pressed={treeVisible}
         aria-label={treeVisible ? 'Hide file tree' : 'Show file tree'}
@@ -311,7 +321,7 @@ function ViewControls() {
       >
         <Icon name={treeVisible ? 'PanelLeftClose' : 'PanelLeftOpen'} size={15} />
       </button>
-      <button
+      <button type="button"
         data-active={previewVisible || undefined}
         aria-pressed={previewVisible}
         aria-label={previewVisible ? 'Hide file preview' : 'Show file preview'}
@@ -351,7 +361,7 @@ function UpdatePill() {
   }
   if (u.type !== 'ready') return null
   return (
-    <button
+    <button type="button"
       className="update-pill"
       disabled={!!u.checkingForLatest}
       onClick={() => void bridge.update?.install()}
@@ -404,7 +414,7 @@ function NewProjectButton() {
   // the project menu (open folder / recents / reopen closed)
   return (
     <div className="tabstrip-new">
-      <button className="tabstrip-new-btn" onClick={() => newProject({ path: null, focus: true })} title="New tab  ⌘T">
+      <button type="button" className="tabstrip-new-btn" onClick={() => newProject({ path: null, focus: true })} title="New tab  ⌘T" aria-label="New project tab">
         <Icon name="Plus" size={14} />
       </button>
       <Dropdown value="" placeholder="" options={options} onSelect={onSelect} title="Open a project…" align="left" />

@@ -1504,6 +1504,10 @@
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+.stab input.stab-label:focus-visible {
+  border-radius: var(--r-1);
+  box-shadow: 0 0 0 2px var(--accent-soft), inset 0 0 0 1px var(--accent);
+}
 .stab-continuity {
   flex-shrink: 0;
   color: var(--success);
@@ -1917,7 +1921,8 @@
   z-index: 6;
   -webkit-app-region: no-drag;
 }
-.canvas-resize:hover {
+.canvas-resize:hover,
+.canvas-resize:focus-visible {
   background: var(--accent-soft);
 }
 .canvas {
@@ -1956,7 +1961,8 @@
   z-index: 6;
   -webkit-app-region: no-drag;
 }
-.session-sidebar > .session-sidebar-resize:hover { background: var(--accent-soft); }
+.session-sidebar > .session-sidebar-resize:hover,
+.session-sidebar > .session-sidebar-resize:focus-visible { background: var(--accent-soft); }
 .session-sidebar-head {
   display: flex;
   align-items: center;

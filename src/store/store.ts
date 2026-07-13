@@ -45,7 +45,7 @@ import { projectTransferDataConflict, scopeProjectTransferGlobals } from '../lib
 import { isRunningMeshPhase } from '../lib/meshPolicy'
 import { addQueuedPrompt, MAX_PERSISTED_QUEUED_PROMPTS } from '../lib/assistantQueuePolicy'
 import { lineHunks, applyHunks } from '../lib/wordDiff'
-import { forgetMountedTerminal } from '../components/Terminal'
+import { forgetMountedTerminal } from '../lib/terminalResidency'
 import {
   allowOnceAnswer,
   rejectOnceAnswer,
@@ -1515,8 +1515,7 @@ const CHECKPOINT_CAP = 25
 /** Deep-clone for a checkpoint snapshot so the undo timeline can't be poisoned by
  * later in-place nested mutation (makes the immutability invariant real, not a
  * convention). structuredClone is available in Electron/modern browsers. */
-const cloneProject = (p: Project): Project =>
-  typeof structuredClone === 'function' ? structuredClone(p) : (JSON.parse(JSON.stringify(p)) as Project)
+const cloneProject = (project: Project): Project => structuredClone(project)
 /** Prepend a pre-mutation snapshot to the undo timeline, capped to the last N. */
 function pushCheckpoint(state: KaisolaState, label: string, kind: Checkpoint['kind']): Checkpoint[] {
   const entry: Checkpoint = { id: uid('ckpt'), at: nowISO(), label, kind, snapshot: cloneProject(state.project) }
@@ -1743,15 +1742,17 @@ function titleFrom(text: string, max = 34): string | undefined {
  */
 export function sessionOrderIds(s: Pick<KaisolaState, 'assistantThreads' | 'terminals' | 'agentTerminals' | 'panels' | 'sessionGroups' | 'pinnedSessions'>): string[] {
   const natural = [
-    ...s.assistantThreads.filter((t) => !t.groupParentId).map((t) => t.id),
+    ...s.assistantThreads.flatMap((thread) => thread.groupParentId ? [] : [thread.id]),
     ...s.terminals.map((t) => t.id),
     ...s.agentTerminals.map((t) => t.terminalId),
     ...s.panels.map((p) => p.id),
   ]
   const alive = new Set(natural)
   const pinned = s.pinnedSessions.filter((id) => alive.has(id))
-  const grouped = s.sessionGroups.flatMap((g) => g.members).filter((id) => alive.has(id) && !pinned.includes(id))
-  const rest = natural.filter((id) => !pinned.includes(id) && !grouped.includes(id))
+  const pinnedIds = new Set(pinned)
+  const grouped = s.sessionGroups.flatMap((group) => group.members.filter((id) => alive.has(id) && !pinnedIds.has(id)))
+  const groupedIds = new Set(grouped)
+  const rest = natural.filter((id) => !pinnedIds.has(id) && !groupedIds.has(id))
   return [...pinned, ...grouped, ...rest]
 }
 
@@ -1766,7 +1767,10 @@ function gridState(grid: string[][], extra: object = {}) {
 }
 /** A grid with every occurrence of `id` removed (empty columns dropped). */
 const gridWithout = (grid: string[][], id: string) =>
-  grid.map((col) => col.filter((v) => v !== id)).filter((col) => col.length)
+  grid.flatMap((column) => {
+    const remaining = column.filter((value) => value !== id)
+    return remaining.length ? [remaining] : []
+  })
 
 /** Every id the card grid can actually render — threads, terminals (plain and
  * agent-spawned), and panels. Grid ids outside this set paint nothing. */
@@ -1795,7 +1799,10 @@ function visibleDockState(
   extra: Record<string, unknown> = {},
 ) {
   const live = liveSessionIds(s)
-  const grid = s.dockGrid.map((col) => col.filter((id) => live.has(id))).filter((col) => col.length)
+  const grid = s.dockGrid.flatMap((column) => {
+    const visible = column.filter((id) => live.has(id))
+    return visible.length ? [visible] : []
+  })
   if (grid.length) return gridState(grid, { dockOpen: true, ...extra })
   const thread = s.assistantThreads.find((entry) => entry.id === s.activeThreadId) ?? s.assistantThreads[0]
   const id = thread?.id ?? s.terminals[0]?.id ?? s.agentTerminals[0]?.terminalId ?? s.panels[0]?.id
@@ -1892,7 +1899,10 @@ const pruneSliceGrid = <T extends Partial<ProjectSlicePersist>>(slice: T): T => 
     ...(slice.terminals ?? []).map((t) => t.id),
     ...(slice.panels ?? []).map((p) => p.id),
   ])
-  const grid = (slice.dockGrid ?? []).map((col) => col.filter((id) => live.has(id))).filter((col) => col.length)
+  const grid = (slice.dockGrid ?? []).flatMap((column) => {
+    const visible = column.filter((id) => live.has(id))
+    return visible.length ? [visible] : []
+  })
   if (!grid.length && slice.dockOpen) {
     const seed = slice.assistantThreads?.[0]?.id ?? slice.terminals?.[0]?.id ?? slice.panels?.[0]?.id
     if (seed) return { ...slice, dockGrid: [[seed]], dockViews: [seed] }
@@ -2005,18 +2015,21 @@ function sanitizeSliceForPersist(slice: ProjectSliceMemory): ProjectSlicePersist
     ...terminals.map((t) => t.id),
     ...panels.map((p) => p.id),
   ])
-  const dockGrid = slice.dockGrid.map((col) => col.filter((id) => validIds.has(id))).filter((col) => col.length)
+  const liveThreadIds = new Set(assistantThreads.map((thread) => thread.id))
+  const dockGrid = slice.dockGrid.flatMap((column) => {
+    const visible = column.filter((id) => validIds.has(id))
+    return visible.length ? [visible] : []
+  })
   const activeThreadId = assistantThreads.some((t) => t.id === slice.activeThreadId)
     ? slice.activeThreadId
     : assistantThreads[0]?.id ?? ''
   const fallbackCard = assistantThreads[0]?.id ?? terminals[0]?.id
   const sessionGrid = gridState(dockGrid.length ? dockGrid : slice.dockOpen && fallbackCard ? [[fallbackCard]] : [])
   const assistantRuntimes = Object.fromEntries(
-    Object.entries(slice.assistantRuntimes)
-      .filter(([id]) => assistantThreads.some((t) => t.id === id))
-      .map(([id, runtime]) => {
+    Object.entries(slice.assistantRuntimes).flatMap(([id, runtime]) => {
+        if (!liveThreadIds.has(id)) return []
         const pendingDispatch = normalizePendingAssistantDispatch(runtime.pendingDispatch)
-        return [id, {
+        return [[id, {
         // Match the live headroom: a quit just before a spill must not prune a
         // turn that has not crossed the archive spill threshold yet. A batch
         // awaiting fsync/ACK keeps its whole prefix so quit/ENOSPC cannot lose
@@ -2036,27 +2049,25 @@ function sanitizeSliceForPersist(slice: ProjectSliceMemory): ProjectSlicePersist
           })),
           planUpdatedAt: runtime.planUpdatedAt,
         } : {}),
-        }]
+        }]]
       }),
   )
-  const liveThreadIds = new Set(assistantThreads.map((t) => t.id))
   const assistantDrafts = Object.fromEntries(
-    Object.entries(slice.assistantDrafts ?? {})
-      .filter(([id]) => liveThreadIds.has(id))
-      .map(([id, draft]) => [id, normalizeAssistantDraft(draft)])
-      .filter(([, draft]) => !assistantDraftIsEmpty(draft as AssistantDraft)),
+    Object.entries(slice.assistantDrafts ?? {}).flatMap(([id, draft]) => {
+      if (!liveThreadIds.has(id)) return []
+      const normalized = normalizeAssistantDraft(draft)
+      return assistantDraftIsEmpty(normalized) ? [] : [[id, normalized]]
+    }),
   )
   const assistantPromptQueues = Object.fromEntries(
-    Object.entries(slice.assistantPromptQueues ?? {})
-      .filter(([id]) => liveThreadIds.has(id))
-      .map(([id, queue]) => [
-        id,
-        (Array.isArray(queue) ? queue : [])
-          .map((q) => ({ ...normalizeAssistantDraft(q), id: q.id || uid('qp'), queuedAt: Number(q.queuedAt) || Date.now() }))
-          .filter((q) => q.text.trim())
-          .slice(0, MAX_PERSISTED_QUEUED_PROMPTS),
-      ])
-      .filter(([, queue]) => (queue as QueuedAssistantPrompt[]).length),
+    Object.entries(slice.assistantPromptQueues ?? {}).flatMap(([id, queue]) => {
+      if (!liveThreadIds.has(id)) return []
+      const normalized = (Array.isArray(queue) ? queue : []).flatMap((prompt) => {
+        const item = { ...normalizeAssistantDraft(prompt), id: prompt.id || uid('qp'), queuedAt: Number(prompt.queuedAt) || Date.now() }
+        return item.text.trim() ? [item] : []
+      }).slice(0, MAX_PERSISTED_QUEUED_PROMPTS)
+      return normalized.length ? [[id, normalized]] : []
+    }),
   )
   return {
     project: slice.project,
@@ -2077,9 +2088,10 @@ function sanitizeSliceForPersist(slice: ProjectSliceMemory): ProjectSlicePersist
     activeThreadId,
     terminals,
     panels,
-    sessionGroups: slice.sessionGroups
-      .map((g) => ({ ...g, members: g.members.filter((m) => validIds.has(m)) }))
-      .filter((g) => g.members.length),
+    sessionGroups: slice.sessionGroups.flatMap((group) => {
+      const members = group.members.filter((id) => validIds.has(id))
+      return members.length ? [{ ...group, members }] : []
+    }),
     pinnedSessions: slice.pinnedSessions.filter((id) => validIds.has(id)),
     // recently-closed history, kept light on disk: closed threads carry only a
     // transcript tail (full history stays in main's archive), closed terminals
@@ -2099,9 +2111,9 @@ function sanitizeSliceForPersist(slice: ProjectSliceMemory): ProjectSlicePersist
           at: c.at,
           thread: { ...c.thread, busy: false },
           groupThreads: c.groupThreads.map((thread) => ({ ...thread, busy: false, queuePaused: true })),
-          groupRuntimes: Object.fromEntries(Object.entries(c.groupRuntimes ?? {}).filter(([id]) => ids.has(id)).map(([id, runtime]) => [id, trimRuntime(runtime)])),
-          groupDrafts: Object.fromEntries(Object.entries(c.groupDrafts ?? {}).filter(([id]) => ids.has(id)).map(([id, draft]) => [id, normalizeAssistantDraft(draft)])),
-          groupPromptQueues: Object.fromEntries(Object.entries(c.groupPromptQueues ?? {}).filter(([id]) => ids.has(id)).map(([id, queue]) => [id, queue.map((prompt) => ({ ...normalizeAssistantDraft(prompt), id: prompt.id, queuedAt: prompt.queuedAt })).slice(0, MAX_PERSISTED_QUEUED_PROMPTS)])),
+          groupRuntimes: Object.fromEntries(Object.entries(c.groupRuntimes ?? {}).flatMap(([id, runtime]) => ids.has(id) ? [[id, trimRuntime(runtime)]] : [])),
+          groupDrafts: Object.fromEntries(Object.entries(c.groupDrafts ?? {}).flatMap(([id, draft]) => ids.has(id) ? [[id, normalizeAssistantDraft(draft)]] : [])),
+          groupPromptQueues: Object.fromEntries(Object.entries(c.groupPromptQueues ?? {}).flatMap(([id, queue]) => ids.has(id) ? [[id, queue.map((prompt) => ({ ...normalizeAssistantDraft(prompt), id: prompt.id, queuedAt: prompt.queuedAt })).slice(0, MAX_PERSISTED_QUEUED_PROMPTS)]] : [])),
         }
       }
       if (c.kind === 'thread' && c.thread) {
@@ -2197,7 +2209,7 @@ function persistSnapshot(s: KaisolaState) {
       const live = new Set<string>([
         ...s.terminals.map((t) => t.id),
         ...Object.values(s.projectSlices).flatMap((sl) => (sl.terminals ?? []).map((t) => t.id)),
-        ...s.closedStack.filter((c) => c.kind === 'term').map((c) => (c as { term: { id: string } }).term.id),
+        ...s.closedStack.flatMap((closed) => closed.kind === 'term' ? [(closed as { term: { id: string } }).term.id] : []),
       ])
       return Object.fromEntries(Object.entries(s.termDrafts).filter(([id]) => live.has(id)))
     })(),
@@ -2319,9 +2331,10 @@ function migrateFlatV5(persisted: unknown): Partial<KaisolaState> {
     ...terminals.map((t) => t.id),
     ...panels.map((p) => p.id),
   ])
-  const dockGrid = (state.dockGrid ?? [[assistantThreads[0]?.id ?? terminals[0].id]])
-    .map((col) => col.filter((id) => validIds.has(id)))
-    .filter((col) => col.length)
+  const dockGrid = (state.dockGrid ?? [[assistantThreads[0]?.id ?? terminals[0].id]]).flatMap((column) => {
+    const visible = column.filter((id) => validIds.has(id))
+    return visible.length ? [visible] : []
+  })
   const activeThreadId = assistantThreads.some((t) => t.id === state.activeThreadId)
     ? state.activeThreadId!
     : assistantThreads[0]?.id ?? ''
@@ -2341,9 +2354,10 @@ function migrateFlatV5(persisted: unknown): Partial<KaisolaState> {
     panels,
     customAgents: state.customAgents ?? [],
     enabledAgents: state.enabledAgents ?? ['claude-code', 'codex', 'opencode'],
-    sessionGroups: (state.sessionGroups ?? [])
-      .map((g) => ({ ...g, members: g.members.filter((m) => validIds.has(m)) }))
-      .filter((g) => g.members.length),
+    sessionGroups: (state.sessionGroups ?? []).flatMap((group) => {
+      const members = group.members.filter((id) => validIds.has(id))
+      return members.length ? [{ ...group, members }] : []
+    }),
     pinnedSessions: (state.pinnedSessions ?? []).filter((id) => validIds.has(id)),
     sessionTemplates: state.sessionTemplates ?? [],
     worktreeSessions: state.worktreeSessions ?? {},
@@ -2595,10 +2609,11 @@ export const useKaisola = create<KaisolaState>()(
   setDock: (open, tab) =>
     set((s) => {
       const dockableTerminal = s.terminals.find((terminal) => !poppedTerms.has(terminal.id))
+      const visibleDockIds = new Set(s.dockViews)
       const focus =
-        tab === 'assistant' && !s.dockViews.includes(s.activeThreadId)
+        tab === 'assistant' && !visibleDockIds.has(s.activeThreadId)
           ? s.activeThreadId
-          : tab === 'terminal' && dockableTerminal && !s.terminals.some((t) => s.dockViews.includes(t.id))
+          : tab === 'terminal' && dockableTerminal && !s.terminals.some((terminal) => visibleDockIds.has(terminal.id))
             ? dockableTerminal.id
             : null
       if (!open) return { dockOpen: false }
@@ -3101,27 +3116,27 @@ export const useKaisola = create<KaisolaState>()(
     })),
   // ── Chrome-style session groups ──
   createSessionGroup: (name, members) =>
-    set((s) => ({
-      sessionGroups: [
-        // a session lives in at most one group — pull members out of others
-        ...s.sessionGroups.map((g) => ({ ...g, members: g.members.filter((m) => !members.includes(m)) })),
-        { id: uid('grp'), name: name.trim() || 'Group', members },
-      ].filter((g) => g.members.length),
-    })),
+    set((s) => {
+      const assignedIds = new Set(members)
+      const sessionGroups = s.sessionGroups.flatMap((group) => {
+        const remaining = group.members.filter((id) => !assignedIds.has(id))
+        return remaining.length ? [{ ...group, members: remaining }] : []
+      })
+      sessionGroups.push({ id: uid('grp'), name: name.trim() || 'Group', members })
+      return { sessionGroups }
+    }),
   renameSessionGroup: (id, name) =>
     set((s) => ({ sessionGroups: s.sessionGroups.map((g) => (g.id === id ? { ...g, name: name.trim() || g.name } : g)) })),
   toggleSessionGroupCollapsed: (id) =>
     set((s) => ({ sessionGroups: s.sessionGroups.map((g) => (g.id === id ? { ...g, collapsed: !g.collapsed } : g)) })),
   assignToGroup: (sessionId, groupId) =>
     set((s) => ({
-      sessionGroups: s.sessionGroups
-        .map((g) => ({
-          ...g,
-          members: g.id === groupId
-            ? [...g.members.filter((m) => m !== sessionId), sessionId]
-            : g.members.filter((m) => m !== sessionId),
-        }))
-        .filter((g) => g.members.length),
+      sessionGroups: s.sessionGroups.flatMap((group) => {
+        const members = group.id === groupId
+          ? [...group.members.filter((id) => id !== sessionId), sessionId]
+          : group.members.filter((id) => id !== sessionId)
+        return members.length ? [{ ...group, members }] : []
+      }),
     })),
   removeSessionGroup: (id) =>
     set((s) => ({ sessionGroups: s.sessionGroups.filter((g) => g.id !== id) })),
@@ -3153,11 +3168,12 @@ export const useKaisola = create<KaisolaState>()(
     const order = sessionOrderIds(s)
     if (order.length < 2) return
     const anchor = s.dockViews[0] ?? order[0]
+    const visibleDockIds = new Set(s.dockViews)
     const at = Math.max(0, order.indexOf(anchor))
     // the next session that isn't already showing (skips no-op hops)
     for (let step = 1; step < order.length; step++) {
       const next = order[(at + dir * step + order.length * step) % order.length]
-      if (!s.dockViews.includes(next)) { s.switchSession(next); return }
+      if (!visibleDockIds.has(next)) { s.switchSession(next); return }
     }
   },
   togglePinSession: (id) =>
@@ -3510,11 +3526,12 @@ export const useKaisola = create<KaisolaState>()(
       const parent = sl.assistantThreads.find((thread) => thread.id === id && thread.group)
       if (!parent?.group || parent.group.phase !== 'idle' || parent.group.members.length <= 2) return {}
       return {
-        assistantThreads: sl.assistantThreads
-          .filter((thread) => thread.id !== threadId)
-          .map((thread) => thread.id === id && thread.group
+        assistantThreads: sl.assistantThreads.flatMap((thread) => {
+          if (thread.id === threadId) return []
+          return [thread.id === id && thread.group
             ? { ...thread, group: { ...thread.group, members: thread.group.members.filter((member) => member.threadId !== threadId) } }
-            : thread),
+            : thread]
+        }),
       }
     })
   },
@@ -3588,7 +3605,7 @@ export const useKaisola = create<KaisolaState>()(
   clearGroupWorktreeSessions: (id, cwd, projectId) => {
     const pid = projectId ?? get().activeProjectId
     get().patchProject(pid, (sl) => {
-      const memberIds = new Set(sl.assistantThreads.filter((thread) => thread.groupParentId === id).map((thread) => thread.id))
+      const memberIds = new Set(sl.assistantThreads.flatMap((thread) => thread.groupParentId === id ? [thread.id] : []))
       const worktreeSessions = { ...sl.worktreeSessions }
       for (const memberId of memberIds) delete worktreeSessions[memberId]
       return {
@@ -3622,12 +3639,13 @@ export const useKaisola = create<KaisolaState>()(
     const owner = projectId ?? get().activeProjectId
     let before = projectFields(get(), owner)
     let target = before.assistantThreads.find((thread) => thread.id === id)
-    let ownedIds = new Set([id, ...(target?.group ? before.assistantThreads.filter((thread) => thread.groupParentId === id).map((thread) => thread.id) : [])])
+    let ownedIds = new Set([id, ...(target?.group ? before.assistantThreads.flatMap((thread) => thread.groupParentId === id ? [thread.id] : []) : [])])
     // A renderer may disappear after durable preflight was written but before
     // its Stop closure unwound. Persisted threads rehydrate idle, so recover any
     // such transaction before taking the recently-closed snapshot.
+    const threadById = new Map(before.assistantThreads.map((thread) => [thread.id, thread]))
     for (const ownedId of ownedIds) {
-      const thread = before.assistantThreads.find((candidate) => candidate.id === ownedId)
+      const thread = threadById.get(ownedId)
       if (!thread?.busy && before.assistantRuntimes[ownedId]?.pendingDispatch) {
         get().rollbackAssistantDispatch(ownedId, undefined, {
           message: 'Stopped before the prompt was sent.',
@@ -3637,7 +3655,7 @@ export const useKaisola = create<KaisolaState>()(
     }
     before = projectFields(get(), owner)
     target = before.assistantThreads.find((thread) => thread.id === id)
-    ownedIds = new Set([id, ...(target?.group ? before.assistantThreads.filter((thread) => thread.groupParentId === id).map((thread) => thread.id) : [])])
+    ownedIds = new Set([id, ...(target?.group ? before.assistantThreads.flatMap((thread) => thread.groupParentId === id ? [thread.id] : []) : [])])
     const activeWork = before.assistantThreads.some((thread) => ownedIds.has(thread.id) && thread.busy)
       || (!!target?.group && !!target.group.operation)
       || (!!target?.group && runningGroupPhase(target.group.phase) && !target.group.paused)
@@ -3653,7 +3671,7 @@ export const useKaisola = create<KaisolaState>()(
       const closing = s.assistantThreads.find((t) => t.id === id)
       const closingIds = new Set([
         id,
-        ...(closing?.group ? s.assistantThreads.filter((thread) => thread.groupParentId === id).map((thread) => thread.id) : []),
+        ...(closing?.group ? s.assistantThreads.flatMap((thread) => thread.groupParentId === id ? [thread.id] : []) : []),
       ])
       const next = s.assistantThreads.filter((t) => !closingIds.has(t.id))
       const assistantRuntimes = { ...s.assistantRuntimes }
@@ -3673,7 +3691,7 @@ export const useKaisola = create<KaisolaState>()(
           })
         : undefined
       const groupThreads = closing?.group
-        ? s.assistantThreads.filter((thread) => closingIds.has(thread.id)).map((thread) => ({
+        ? s.assistantThreads.flatMap((thread) => closingIds.has(thread.id) ? [{
             ...thread,
             busy: false,
             queuePaused: true,
@@ -3687,7 +3705,7 @@ export const useKaisola = create<KaisolaState>()(
                     : thread.group.pausedPending,
                 } }
               : {}),
-          }))
+          }] : [])
         : []
       const groupRuntimes = Object.fromEntries(groupThreads.map((thread) => {
         const value = s.assistantRuntimes[thread.id]
@@ -4365,7 +4383,10 @@ export const useKaisola = create<KaisolaState>()(
   removePermissionRule: (id) =>
     set((s) => ({ permissionRules: s.permissionRules.filter((r) => r.id !== id) })),
   setSensitiveGlobs: (globs) => {
-    const clean = globs.map((g) => g.trim()).filter(Boolean)
+    const clean = globs.flatMap((glob) => {
+      const trimmed = glob.trim()
+      return trimmed ? [trimmed] : []
+    })
     set({ sensitiveGlobs: clean })
     bridge.acp.setGuardrails?.(clean) // main enforces on the agents' fs channel
   },
@@ -4584,15 +4605,17 @@ export const useKaisola = create<KaisolaState>()(
       if (!winner || winner.status !== 'pending') return {}
       const siblingIds = new Set(
         winner.groupId
-          ? state.project.proposals
-              .filter((p) => p.groupId === winner.groupId && p.id !== winnerId && p.status === 'pending')
-              .map((p) => p.id)
+          ? state.project.proposals.flatMap((proposal) => (
+              proposal.groupId === winner.groupId && proposal.id !== winnerId && proposal.status === 'pending'
+                ? [proposal.id]
+                : []
+            ))
           : [],
       )
       const siblingTaskIds = new Set(
-        state.project.proposals
-          .filter((p) => siblingIds.has(p.id) && p.taskId)
-          .map((p) => p.taskId as string),
+        state.project.proposals.flatMap((proposal) => (
+          siblingIds.has(proposal.id) && proposal.taskId ? [proposal.taskId] : []
+        )),
       )
       const applied = applyProposal(state.project, winner)
       const at = nowISO()
@@ -4627,7 +4650,8 @@ export const useKaisola = create<KaisolaState>()(
 
   synthesizeProposals: (proposalIds) =>
     set((state) => {
-      const selected = state.project.proposals.filter((p) => proposalIds.includes(p.id) && p.status === 'pending')
+      const selectedIds = new Set(proposalIds)
+      const selected = state.project.proposals.filter((proposal) => selectedIds.has(proposal.id) && proposal.status === 'pending')
       if (selected.length < 2) return {}
       const groupId = selected[0].groupId
       const alreadySynthesized = groupId
@@ -4934,9 +4958,7 @@ export const useKaisola = create<KaisolaState>()(
       get().pushActivity('human', `No agents are assigned to the ${s} stage.`)
       return
     }
-    for (const id of ids) {
-      await get().runAgent(id)
-    }
+    await Promise.all(ids.map((id) => get().runAgent(id)))
   },
 
   enqueueAgent: (agentId, opts) => {
@@ -5006,12 +5028,13 @@ export const useKaisola = create<KaisolaState>()(
           // tag/count the EXACT proposals this run produced (by id, not by index)
           // — immune to concurrent appends (worktree patches, foreground runs).
           const producedIds = await get().runAgent(task.agentId, undefined, pid)
+          const producedIdSet = new Set(producedIds)
           get().patchProject(pid, (sl) => ({
             project: producedIds.length
               ? {
                   ...sl.project,
                   proposals: sl.project.proposals.map((p) =>
-                    producedIds.includes(p.id) ? { ...p, groupId: p.groupId ?? groupId, taskId: p.taskId ?? id } : p,
+                    producedIdSet.has(p.id) ? { ...p, groupId: p.groupId ?? groupId, taskId: p.taskId ?? id } : p,
                   ),
                 }
               : sl.project,
@@ -5125,66 +5148,70 @@ export const useKaisola = create<KaisolaState>()(
       // grobidText (full text via GROBID) is richest; falls back to abstract + summary
       return p ? `${p.title} ${p.abstract ?? ''} ${p.summary ?? ''} ${p.grobidText ?? ''}` : ''
     }
-    let checked = 0
-    let verified = 0
     // Only UPGRADE: corroborate currently-unverified citations against the source
     // we have (abstract + summary). A human/agent-verified citation was checked
     // against full text, which we cannot reproduce from an abstract — so we never
     // downgrade it here.
-    const verifyLinks = async (links: ProvenanceLink[], claim: string): Promise<{ next: ProvenanceLink[]; changed: boolean }> => {
-      let changed = false
-      const next: ProvenanceLink[] = []
-      for (const link of links) {
+    const verifyLinks = async (links: ProvenanceLink[], claim: string): Promise<{ next: ProvenanceLink[]; changed: boolean; checked: number; verified: number }> => {
+      const results = await Promise.all(links.map(async (link) => {
         if (link.kind === 'citation' && link.quote) {
           const r = await verifyCitation({ quote: link.quote, claim, sourceText: sourceText(link.sourceId) })
           const wasUnverified = !link.verified
-          if (wasUnverified) checked++
           const becameVerified = wasUnverified && r.verified
-          if (becameVerified) verified++
           // attach stance on every quoted citation; only UPGRADE verified. Don't
           // downgrade an already-verified citation's stance just because its full-
           // text quote isn't in the abstract we have — only (re)label when found.
           const stance = link.verified && !r.quoteFound ? link.stance : r.stance
-          if (becameVerified || link.stance !== stance) changed = true
-          next.push({ ...link, stance, ...(becameVerified ? { verified: true } : {}) })
-        } else {
-          next.push(link)
+          return {
+            link: { ...link, stance, ...(becameVerified ? { verified: true } : {}) } as ProvenanceLink,
+            changed: becameVerified || link.stance !== stance,
+            checked: wasUnverified ? 1 : 0,
+            verified: becameVerified ? 1 : 0,
+          }
         }
+        return { link, changed: false, checked: 0, verified: 0 }
+      }))
+      return {
+        next: results.map((result) => result.link),
+        changed: results.some((result) => result.changed),
+        checked: results.reduce((total, result) => total + result.checked, 0),
+        verified: results.reduce((total, result) => total + result.verified, 0),
       }
-      return { next, changed }
-    }
-    let anyChanged = false
-    const nodes: GraphNode[] = []
-    for (const node of project.claimGraph.nodes) {
-      const { next, changed } = await verifyLinks(node.provenance, `${node.label} ${node.detail ?? ''}`)
-      if (changed) anyChanged = true
-      nodes.push(changed ? recomputeProvenanced({ ...node, provenance: next }) : node)
-    }
-    const hyps: Hypothesis[] = []
-    for (const h of project.hypotheses) {
-      const { next, changed } = await verifyLinks(h.provenance, `${h.title}. ${h.claim}`)
-      if (changed) anyChanged = true
-      hyps.push(changed ? recomputeProvenanced({ ...h, provenance: next }) : h)
     }
     // also verify the manuscript's inline claims — the Manuscript "Verify" button
     // lives there, so it must actually re-check those citations.
-    let msChanged = false
-    const sections: typeof project.manuscript.sections = []
-    for (const sec of project.manuscript.sections) {
-      const claims: typeof sec.claims = []
-      let secChanged = false
-      for (const c of sec.claims) {
-        const { next, changed } = await verifyLinks(c.provenance, c.text)
-        if (changed) { secChanged = true; claims.push(recomputeProvenanced({ ...c, provenance: next })) }
-        else claims.push(c)
-      }
-      if (secChanged) {
-        msChanged = true
-        anyChanged = true
-        const updated = { ...sec, claims }
-        sections.push({ ...updated, trust: sectionTrust(updated) })
-      } else sections.push(sec)
-    }
+    const [nodeResults, hypothesisResults, sectionResults] = await Promise.all([
+      Promise.all(project.claimGraph.nodes.map(async (node) => {
+        const result = await verifyLinks(node.provenance, `${node.label} ${node.detail ?? ''}`)
+        return { ...result, value: result.changed ? recomputeProvenanced({ ...node, provenance: result.next }) : node }
+      })),
+      Promise.all(project.hypotheses.map(async (hypothesis) => {
+        const result = await verifyLinks(hypothesis.provenance, `${hypothesis.title}. ${hypothesis.claim}`)
+        return { ...result, value: result.changed ? recomputeProvenanced({ ...hypothesis, provenance: result.next }) : hypothesis }
+      })),
+      Promise.all(project.manuscript.sections.map(async (section) => {
+        const claimResults = await Promise.all(section.claims.map(async (claim) => {
+          const result = await verifyLinks(claim.provenance, claim.text)
+          return { ...result, value: result.changed ? recomputeProvenanced({ ...claim, provenance: result.next }) : claim }
+        }))
+        const changed = claimResults.some((result) => result.changed)
+        const claims = claimResults.map((result) => result.value)
+        const updated = changed ? { ...section, claims } : section
+        return {
+          value: changed ? { ...updated, trust: sectionTrust(updated) } : section,
+          changed,
+          checked: claimResults.reduce((total, result) => total + result.checked, 0),
+          verified: claimResults.reduce((total, result) => total + result.verified, 0),
+        }
+      })),
+    ])
+    const nodes: GraphNode[] = nodeResults.map((result) => result.value)
+    const hyps: Hypothesis[] = hypothesisResults.map((result) => result.value)
+    const sections = sectionResults.map((result) => result.value)
+    const checked = [...nodeResults, ...hypothesisResults, ...sectionResults].reduce((total, result) => total + result.checked, 0)
+    const verified = [...nodeResults, ...hypothesisResults, ...sectionResults].reduce((total, result) => total + result.verified, 0)
+    const anyChanged = [...nodeResults, ...hypothesisResults, ...sectionResults].some((result) => result.changed)
+    const msChanged = sectionResults.some((result) => result.changed)
     const manuscript = msChanged ? { ...project.manuscript, sections } : project.manuscript
     get().patchProject(pid, (sl) => ({ project: { ...sl.project, claimGraph: { ...sl.project.claimGraph, nodes }, hypotheses: hyps, manuscript } }))
     const verifyMsg = checked
@@ -5262,7 +5289,14 @@ export const useKaisola = create<KaisolaState>()(
       return
     }
     get().pushActivity('citation', `Ingesting ${papers.length} PDF${papers.length === 1 ? '' : 's'} via GROBID…`)
-    for (const p of papers) await get().ingestPaperPdf(p.id, pid)
+    const queue = [...papers]
+    const ingestNext = async (): Promise<void> => {
+      const paper = queue.shift()
+      if (!paper) return
+      await get().ingestPaperPdf(paper.id, pid)
+      return ingestNext()
+    }
+    await Promise.all(Array.from({ length: Math.min(3, papers.length) }, () => ingestNext()))
     const ingested = projectFields(get(), pid).project.corpus.filter((s): s is Paper => s.kind === 'paper' && !!s.grobidText).length
     get().pushActivity('citation', `PDF ingestion complete — ${ingested}/${papers.length} paper${papers.length === 1 ? '' : 's'} have full text.`)
   },
@@ -5715,7 +5749,7 @@ export const useKaisola = create<KaisolaState>()(
     if (!slice) return
     // pop-out immunity must TRAVEL with the project (the new window's
     // closeProject would otherwise reap a pop-out it doesn't know about)
-    const popped = slice.terminals.filter((t) => poppedTerms.has(t.id)).map((t) => t.id)
+    const popped = slice.terminals.flatMap((terminal) => poppedTerms.has(terminal.id) ? [terminal.id] : [])
     // ADOPT_BOOT deliberately skips rehydrating a possibly stale slot. Carry a
     // capped/sanitized copy of the real global preferences so its first frame
     // does not fall back to the default theme, glass mode, or terminal styling.
@@ -5724,7 +5758,7 @@ export const useKaisola = create<KaisolaState>()(
       slice.workspacePath,
       [
         ...slice.terminals.map((terminal) => terminal.id),
-        ...slice.closedStack.filter((closed) => closed.kind === 'term').map((closed) => (closed as { term: { id: string } }).term.id),
+        ...slice.closedStack.flatMap((closed) => closed.kind === 'term' ? [(closed as { term: { id: string } }).term.id] : []),
       ],
     )
     const r = await bridge.windows.detachProject({
@@ -5805,7 +5839,7 @@ export const useKaisola = create<KaisolaState>()(
     // pop-out immunity carried over from the origin window only after every
     // rejectable data-integrity check has passed.
     for (const tid of payload.popped ?? []) poppedTerms.add(tid)
-    const doomed = prePristine ? pre.terminals.filter((t) => !poppedTerms.has(t.id)).map((t) => t.id) : []
+    const doomed = prePristine ? pre.terminals.flatMap((terminal) => poppedTerms.has(terminal.id) ? [] : [terminal.id]) : []
     let adopted = false
     set((s) => {
       if (s.projectTabs.some((t) => t.id === rawTab.id)) { adopted = true; return s } // idempotent ACK

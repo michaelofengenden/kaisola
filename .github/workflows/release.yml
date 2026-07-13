@@ -10,8 +10,10 @@ jobs:
   mac:
     runs-on: macos-14 # Apple Silicon
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      # Pin action code to immutable commits so a moved upstream tag cannot
+      # silently change what runs inside the release job.
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 22
           cache: npm
@@ -22,13 +24,24 @@ jobs:
           # This must be a rotated client key restricted to Identity Toolkit
           # and Token Service. Never reuse a Gemini/Generative Language key.
           KAISOLA_FIREBASE_API_KEY: ${{ secrets.KAISOLA_FIREBASE_API_KEY }}
+      - name: Require release signing and notarization credentials
+        env:
+          CSC_LINK: ${{ secrets.CSC_LINK }}
+          CSC_KEY_PASSWORD: ${{ secrets.CSC_KEY_PASSWORD }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          set -euo pipefail
+          for name in CSC_LINK CSC_KEY_PASSWORD APPLE_ID APPLE_APP_SPECIFIC_PASSWORD APPLE_TEAM_ID; do
+            test -n "${!name:-}" || { echo "Missing required release credential: $name" >&2; exit 1; }
+          done
       # --publish never: the gh-release step below uploads the artifacts;
       # electron-builder must not try to publish on its own (it has no token)
       - run: npm run dist -- --publish never
         env:
-          # Developer ID signing + notarization. If the secrets are unset,
-          # electron-builder falls back to skipping both (adhoc-sign.cjs then
-          # covers the signature) — the build still succeeds.
+          # Developer ID signing + notarization. The release job requires these
+          # above; only local packaging may fall back to an ad-hoc signature.
           CSC_LINK: ${{ secrets.CSC_LINK }}
           CSC_KEY_PASSWORD: ${{ secrets.CSC_KEY_PASSWORD }}
           APPLE_ID: ${{ secrets.APPLE_ID }}
@@ -36,7 +49,16 @@ jobs:
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
       # stable-named copy so the site can link releases/latest/download/Kaisola.dmg
       - run: cp release/Kaisola-*.dmg release/Kaisola.dmg
-      - uses: softprops/action-gh-release@v2
+      - name: Create and verify release checksums
+        run: |
+          set -euo pipefail
+          for artifact in release/*.dmg release/*.zip release/latest-mac.yml; do
+            shasum -a 256 "$artifact" > "$artifact.sha256"
+          done
+          for checksum in release/*.sha256; do
+            shasum -a 256 --check "$checksum"
+          done
+      - uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
           # latest-mac.yml is the auto-update manifest — the installed app
           # (electron-updater) polls it to learn a new version exists
@@ -44,4 +66,5 @@ jobs:
             release/*.dmg
             release/*.zip
             release/latest-mac.yml
+            release/*.sha256
           generate_release_notes: true

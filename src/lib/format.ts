@@ -1,5 +1,8 @@
 /** Formatting helpers — dates, relative time, numbers. */
 
+const RELATIVE_TIME_FORMAT = new Intl.RelativeTimeFormat('en', { numeric: 'auto' })
+const COMPACT_NUMBER_FORMAT = new Intl.NumberFormat('en', { notation: 'compact', maximumFractionDigits: 1 })
+
 export function relTime(iso: string, now = Date.now()): string {
   const t = new Date(iso).getTime()
   const diff = Math.round((t - now) / 1000)
@@ -13,10 +16,9 @@ export function relTime(iso: string, now = Date.now()): string {
     [31557600, 'month'],
     [Infinity, 'year'],
   ]
-  const rtf = new Intl.RelativeTimeFormat('en', { numeric: 'auto' })
   let prev = 1
   for (const [limit, unit] of units) {
-    if (abs < limit) return rtf.format(Math.round(diff / prev), unit)
+    if (abs < limit) return RELATIVE_TIME_FORMAT.format(Math.round(diff / prev), unit)
     prev = limit
   }
   return iso
@@ -43,7 +45,7 @@ export function workedTime(ms: number): string {
 export function compactNumber(n?: number): string {
   if (n == null) return '—'
   if (n < 1000) return String(n)
-  return new Intl.NumberFormat('en', { notation: 'compact', maximumFractionDigits: 1 }).format(n)
+  return COMPACT_NUMBER_FORMAT.format(n)
 }
 
 export function authorList(authors: string[], max = 3): string {

@@ -153,4 +153,4 @@ export function agentById(id: string): Agent | undefined {
   return undefined
 }
 
-export const AGENTS: Agent[] = SIDEBAR_AGENT_IDS.map((id) => agentById(id)!).filter(Boolean)
+export const AGENTS: Agent[] = SIDEBAR_AGENT_IDS.map((id) => agentById(id)!)

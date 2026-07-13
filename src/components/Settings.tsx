@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react'
+import { useEffect, useRef, useState, type CSSProperties } from 'react'
 import { useKaisola, dockShowsLiveCard, shellConfigDir, type ThemeMode, type PerfMode, type TabLayout, type CustomAgent, type TermBackground } from '../store/store'
 import { bridge, isDesktop, type AcpAgent, type AppAuthStatus } from '../lib/bridge'
 import type { AutonomyLevel } from '../domain/types'
@@ -78,11 +78,11 @@ function ClaudeAccountsBlock() {
       <span style={{ fontWeight: 500 }}>{a.label}</span>
       <span className="faint truncate" title={a.dir}>{a.email ?? 'not signed in'}</span>
       <span className="grow" />
-      <button className="btn btn-ghost btn-sm" onClick={() => signIn(a.removable ? { configDir: a.dir, label: a.label } : undefined)} title={`Sign in in a terminal (${a.dir})`}>
+      <button type="button" className="btn btn-ghost btn-sm" onClick={() => signIn(a.removable ? { configDir: a.dir, label: a.label } : undefined)} title={`Sign in in a terminal (${a.dir})`}>
         Sign in
       </button>
       {a.removable && (
-        <button className="btn-icon btn-sm" onClick={() => removeAccount(a.id)} title="Remove account (keeps its files on disk)">
+        <button type="button" className="btn-icon btn-sm" onClick={() => removeAccount(a.id)} title="Remove account (keeps its files on disk)" aria-label={`Remove ${a.label} account`}>
           <Icon name="X" size={13} />
         </button>
       )}
@@ -105,7 +105,7 @@ function ClaudeAccountsBlock() {
               spellCheck={false}
               onKeyDown={(e) => { if (e.key === 'Enter' && newDir) { addAccount(label, newDir); setLabel('') } }}
             />
-            <button
+            <button type="button"
               className="btn btn-primary btn-sm"
               disabled={!newDir}
               onClick={() => { addAccount(label, newDir); setLabel('') }}
@@ -181,6 +181,29 @@ const slug = (s: string) =>
 
 /** Cursor color chips: the olive is the pre-0.1.7 accent look. */
 const CURSOR_COLORS = ['#95a456', '#5aa9e6', '#d8a44a', '#e16a6a', '#5ec5c0']
+const CURSOR_SWATCH_STYLE = {
+  width: 14,
+  height: 14,
+  borderRadius: '50%',
+  cursor: 'pointer',
+  padding: 0,
+  border: 'none',
+  outlineOffset: 2,
+} satisfies CSSProperties
+const AUTO_CURSOR_SWATCH_STYLE = {
+  ...CURSOR_SWATCH_STYLE,
+  background: 'var(--text-1)',
+  border: '1px solid var(--border-strong)',
+} satisfies CSSProperties
+const SETTINGS_DIALOG_STYLE = {
+  width: '100vw',
+  maxWidth: 'none',
+  height: '100vh',
+  maxHeight: 'none',
+  margin: 0,
+  border: 'none',
+  padding: '11vh 0 0',
+} satisfies CSSProperties
 
 function SettingsToggle({ checked, onChange, label, title, disabled = false }: {
   checked: boolean
@@ -244,12 +267,12 @@ function AppAccountRow() {
             <span className="faint" title={status.serverVerified ? 'Firebase ID token verified by the Kaisola server' : status.message}>
               {status.serverVerified ? 'Server verified' : 'Verification pending'}
             </span>
-            <button className="btn btn-ghost btn-sm" disabled={busy} onClick={() => { void signOut() }}>Sign out</button>
+            <button type="button" className="btn btn-ghost btn-sm" disabled={busy} onClick={() => { void signOut() }}>Sign out</button>
           </>
         ) : status?.configured === false ? (
           <span className="faint" title={status.message}>Local mode</span>
         ) : (
-          <button className="btn btn-ghost btn-sm" onClick={() => { void (busy ? cancelSignIn() : signIn()) }}>
+          <button type="button" className="btn btn-ghost btn-sm" onClick={() => { void (busy ? cancelSignIn() : signIn()) }}>
             {busy ? 'Cancel sign-in' : 'Sign in with Google'}
           </button>
         )}
@@ -336,8 +359,23 @@ export function Settings() {
   const [agents, setAgents] = useState<AcpAgent[]>([])
   const [glass, setGlass] = useState<{ supported: boolean; active: boolean; enabled: boolean } | null>(null)
   const [section, setSection] = useState<SectionId>('general')
-  const dialogRef = useRef<HTMLDivElement>(null)
-  useModalFocus(open, dialogRef)
+  const nativeDialogRef = useRef<HTMLDialogElement>(null)
+  const panelRef = useRef<HTMLDivElement>(null)
+  useEffect(() => {
+    if (!open) return
+    const dialog = nativeDialogRef.current
+    if (!dialog) return
+    const onBackdropMouseDown = (event: MouseEvent) => {
+      if (event.target === dialog) setOpen(false)
+    }
+    dialog.addEventListener('mousedown', onBackdropMouseDown)
+    if (!dialog.open) dialog.showModal()
+    return () => {
+      dialog.removeEventListener('mousedown', onBackdropMouseDown)
+      if (dialog.open) dialog.close()
+    }
+  }, [open, setOpen])
+  useModalFocus(open, panelRef)
   const [hiddenResidents, setHiddenResidents] = useState(() => {
     const value = Number(localStorage.getItem('kaisola:hidden-terminal-residents') ?? 0)
     return Number.isFinite(value) ? Math.min(8, Math.max(0, Math.round(value))) : 0
@@ -380,13 +418,6 @@ export function Settings() {
     const onCtrl = bridge.acp.onControls(() => void refresh())
     return () => { onCtrl() }
   }, [open])
-
-  useEffect(() => {
-    if (!open) return
-    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') setOpen(false) }
-    document.addEventListener('keydown', onKey)
-    return () => document.removeEventListener('keydown', onKey)
-  }, [open, setOpen])
 
   if (!open) return null
 
@@ -486,9 +517,9 @@ export function Settings() {
           </span>
           <span className="agent-kind">{a.kind === 'acp' ? 'ACP · stdio' : 'Terminal'}</span>
           {a.kind === 'terminal' ? (
-            <button className="btn btn-primary btn-sm" onClick={() => openAgent(a)}><Icon name="SquareTerminal" size={12} /> Open</button>
+            <button type="button" className="btn btn-primary btn-sm" onClick={() => openAgent(a)}><Icon name="SquareTerminal" size={12} /> Open</button>
           ) : (
-            <button className="btn btn-primary btn-sm" onClick={() => openAgent(a)}>
+            <button type="button" className="btn btn-primary btn-sm" onClick={() => openAgent(a)}>
               <Icon name={on ? 'MessageSquarePlus' : 'Plug'} size={12} /> {on ? 'New chat' : 'Connect'}
             </button>
           )}
@@ -499,20 +530,22 @@ export function Settings() {
   }
 
   return (
-    <div className="focus-scrim" onMouseDown={() => setOpen(false)}>
+    <dialog
+      ref={nativeDialogRef}
+      className="focus-scrim"
+      style={SETTINGS_DIALOG_STYLE}
+      aria-labelledby="settings-title"
+      onCancel={(event) => { event.preventDefault(); setOpen(false) }}
+    >
       <div
-        ref={dialogRef}
+        ref={panelRef}
         className="settings-panel-v2 settings-panel-v3"
-        role="dialog"
-        aria-modal="true"
-        aria-labelledby="settings-title"
         tabIndex={-1}
-        onMouseDown={(e) => e.stopPropagation()}
       >
         <header className="settings-head">
           <Icon name="Settings" size={14} className="muted" />
           <span className="grow" id="settings-title">Settings</span>
-          <button className="btn-icon btn-sm" onClick={() => setOpen(false)} aria-label="Close"><Icon name="X" size={14} /></button>
+          <button type="button" className="btn-icon btn-sm" onClick={() => setOpen(false)} aria-label="Close"><Icon name="X" size={14} /></button>
         </header>
         <div className="settings-body-v3">
           <nav className="settings-nav" aria-label="Settings categories">
@@ -521,7 +554,7 @@ export function Settings() {
               {group.ids.map((id) => {
                 const s = SECTIONS.find((candidate) => candidate.id === id)!
                 return (
-                <button
+                <button type="button"
                   key={s.id}
                   className="settings-nav-item"
                   data-active={section === s.id}
@@ -571,7 +604,7 @@ export function Settings() {
                   <span className="settings-row-label">Appearance energy <span className="faint" style={{ fontWeight: 400 }}>· by GPU cost</span></span>
                   <div className="settings-row-control">
                     {windowModeMismatch && (
-                      <button
+                      <button type="button"
                         className="settings-chip"
                         onClick={() => {
                           void bridge.reapplyWindow().then((result) => {
@@ -703,7 +736,7 @@ export function Settings() {
                 <div className="settings-row">
                   <span className="settings-row-label">Extension manager</span>
                   <div className="settings-row-control">
-                    <button
+                    <button type="button"
                       className="btn btn-primary btn-sm"
                       onClick={() => { setOpen(false); openExtensionsCenter() }}
                     >
@@ -775,27 +808,25 @@ export function Settings() {
                 <div className="settings-row">
                   <span className="settings-row-label">Cursor color</span>
                   <div className="settings-row-control" style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
-                    <button
+                    <button type="button"
                       title="Match text color (default)"
+                      aria-label="Use automatic terminal cursor color"
                       onClick={() => setTermCursorColor('auto')}
                       style={{
-                        width: 14, height: 14, borderRadius: '50%', cursor: 'pointer', padding: 0,
-                        background: 'var(--text-1)',
-                        border: '1px solid var(--border-strong)',
+                        ...AUTO_CURSOR_SWATCH_STYLE,
                         outline: termCursorColor === 'auto' ? '2px solid var(--text-1)' : 'none',
-                        outlineOffset: 2,
                       }}
                     />
                     {CURSOR_COLORS.map((c) => (
-                      <button
+                      <button type="button"
                         key={c}
                         title={c}
+                        aria-label={`Use ${c} terminal cursor color`}
                         onClick={() => setTermCursorColor(c)}
                         style={{
-                          width: 14, height: 14, borderRadius: '50%', background: c, border: 'none',
-                          cursor: 'pointer', padding: 0,
+                          ...CURSOR_SWATCH_STYLE,
+                          background: c,
                           outline: termCursorColor === c ? '2px solid var(--text-1)' : 'none',
-                          outlineOffset: 2,
                         }}
                       />
                     ))}
@@ -839,7 +870,7 @@ export function Settings() {
                     title="Install from the registry, or add any CLI as a custom agent"
                   />
                   <span className="grow" />
-                  <button className="btn btn-ghost btn-sm" onClick={() => void openConfigFile('settings')} title="customAgents / enabledAgents in settings.json — the automatable escape hatch">
+                  <button type="button" className="btn btn-ghost btn-sm" onClick={() => void openConfigFile('settings')} title="customAgents / enabledAgents in settings.json — the automatable escape hatch">
                     <Icon name="Braces" size={12} /> Edit in settings.json
                   </button>
                 </div>
@@ -864,10 +895,10 @@ export function Settings() {
                         align="right"
                         title="How this agent runs"
                       />
-                      <button className="btn btn-primary btn-sm" disabled={!newName.trim() || !newCmd.trim()} onClick={addCustom}>
+                      <button type="button" className="btn btn-primary btn-sm" disabled={!newName.trim() || !newCmd.trim()} onClick={addCustom}>
                         <Icon name="Check" size={12} /> Add
                       </button>
-                      <button className="btn-icon btn-sm" onClick={() => setAdding(false)} title="Cancel"><Icon name="X" size={13} /></button>
+                      <button type="button" className="btn-icon btn-sm" onClick={() => setAdding(false)} title="Cancel" aria-label="Cancel adding custom agent"><Icon name="X" size={13} /></button>
                     </div>
                     <p className="settings-note">Runs this command on your machine with your login — only add agents you trust.</p>
                   </>
@@ -926,7 +957,7 @@ export function Settings() {
                       <span className="faint" style={{ fontWeight: 400 }}> · {r.action}</span>
                     </span>
                     <div className="settings-row-control">
-                      <button className="btn-icon btn-sm" onClick={() => removePermissionRule(r.id)} title="Delete rule — ask again" aria-label={`Delete permission rule for ${r.resource}`}>
+                      <button type="button" className="btn-icon btn-sm" onClick={() => removePermissionRule(r.id)} title="Delete rule — ask again" aria-label={`Delete permission rule for ${r.resource}`}>
                         <Icon name="Trash2" size={13} />
                       </button>
                     </div>
@@ -937,7 +968,7 @@ export function Settings() {
                     <Icon name="ShieldAlert" size={14} className="muted" />
                     <span className="settings-row-label"><span className="mono">{g}</span></span>
                     <div className="settings-row-control">
-                      <button className="btn-icon btn-sm" onClick={() => setSensitiveGlobs(sensitiveGlobs.filter((x) => x !== g))} title="Remove glob" aria-label={`Remove sensitive file pattern ${g}`}>
+                      <button type="button" className="btn-icon btn-sm" onClick={() => setSensitiveGlobs(sensitiveGlobs.filter((x) => x !== g))} title="Remove glob" aria-label={`Remove sensitive file pattern ${g}`}>
                         <Icon name="Trash2" size={13} />
                       </button>
                     </div>
@@ -955,7 +986,7 @@ export function Settings() {
                       if (e.key === 'Enter' && newGlob.trim()) { setSensitiveGlobs([...sensitiveGlobs, newGlob.trim()]); setNewGlob('') }
                     }}
                   />
-                  <button className="btn btn-sm" disabled={!newGlob.trim()} onClick={() => { setSensitiveGlobs([...sensitiveGlobs, newGlob.trim()]); setNewGlob('') }}>
+                  <button type="button" className="btn btn-sm" disabled={!newGlob.trim()} onClick={() => { setSensitiveGlobs([...sensitiveGlobs, newGlob.trim()]); setNewGlob('') }}>
                     <Icon name="Plus" size={12} /> Add
                   </button>
                 </div>
@@ -1003,9 +1034,9 @@ export function Settings() {
                     {isDesktop && (
                       <div className="settings-keyrow">
                         <input className="input settings-input-full" type="password" value={oaKey} onChange={(e) => setOaKey(e.target.value)} placeholder={oaPresent ? 'OpenAI key saved — replace…' : 'sk-…'} spellCheck={false} aria-label="OpenAI API key" />
-                        <button className="btn btn-primary btn-sm" onClick={() => void saveOaKey()} disabled={!oaKey.trim()}><Icon name="Check" size={13} /> Save</button>
+                        <button type="button" className="btn btn-primary btn-sm" onClick={() => void saveOaKey()} disabled={!oaKey.trim()}><Icon name="Check" size={13} /> Save</button>
                         {oaPresent && (
-                          <button className="btn btn-ghost btn-sm" onClick={() => void clearOaKey()} title="Remove the stored OpenAI key"><Icon name="Trash2" size={13} /> Remove</button>
+                          <button type="button" className="btn btn-ghost btn-sm" onClick={() => void clearOaKey()} title="Remove the stored OpenAI key"><Icon name="Trash2" size={13} /> Remove</button>
                         )}
                       </div>
                     )}
@@ -1045,9 +1076,9 @@ export function Settings() {
                 {isDesktop && (
                   <div className="settings-keyrow">
                     <input className="input settings-input-full" type="password" value={key} onChange={(e) => setKey(e.target.value)} placeholder="sk-ant-…" spellCheck={false} aria-label="Anthropic API key" />
-                    <button className="btn btn-primary btn-sm" onClick={() => void saveKey()} disabled={!key.trim()}><Icon name="Check" size={13} /> Save</button>
+                    <button type="button" className="btn btn-primary btn-sm" onClick={() => void saveKey()} disabled={!key.trim()}><Icon name="Check" size={13} /> Save</button>
                     {present && !fromEnv && (
-                      <button className="btn btn-ghost btn-sm" onClick={() => void clearKey()} title="Remove the stored Anthropic key"><Icon name="Trash2" size={13} /> Remove</button>
+                      <button type="button" className="btn btn-ghost btn-sm" onClick={() => void clearKey()} title="Remove the stored Anthropic key"><Icon name="Trash2" size={13} /> Remove</button>
                     )}
                   </div>
                 )}
@@ -1102,8 +1133,8 @@ export function Settings() {
                 <div className="settings-row">
                   <span className="settings-row-label">Configuration files</span>
                   <div className="settings-row-control">
-                    <button className="btn btn-ghost btn-sm" onClick={() => void openConfigFile('settings')}><Icon name="Settings" size={12} /> settings.json</button>
-                    <button className="btn btn-ghost btn-sm" onClick={() => void openConfigFile('keymap')}><Icon name="Keyboard" size={12} /> keymap.json</button>
+                    <button type="button" className="btn btn-ghost btn-sm" onClick={() => void openConfigFile('settings')}><Icon name="Settings" size={12} /> settings.json</button>
+                    <button type="button" className="btn btn-ghost btn-sm" onClick={() => void openConfigFile('keymap')}><Icon name="Keyboard" size={12} /> keymap.json</button>
                   </div>
                 </div>
                 <p className="settings-note">Disk only is the default. Running terminals, agent processes, drafts, scrollback, and histories continue; only invisible renderer canvases are released.</p>
@@ -1113,7 +1144,7 @@ export function Settings() {
           </div>
         </div>
       </div>
-    </div>
+    </dialog>
   )
 }
 
@@ -1145,7 +1176,7 @@ function UpdatesRow() {
         <div className="settings-row-control">
           <span className="faint" title={error ?? undefined}>{status}</span>
           {(u.type === 'ready' || u.type === 'installing') && (
-            <button
+            <button type="button"
               className="btn btn-primary btn-sm"
               disabled={u.type === 'installing' || !!u.checkingForLatest}
               onClick={() => void bridge.update?.install()}
@@ -1154,7 +1185,7 @@ function UpdatesRow() {
               <Icon name="ArrowDownToLine" size={12} /> Restart to update
             </button>
           )}
-          <button
+          <button type="button"
             className="btn btn-sm"
             disabled={checking || u.type === 'downloading' || u.type === 'installing'}
             onClick={() => void bridge.update?.check()}

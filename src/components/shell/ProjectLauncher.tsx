@@ -38,13 +38,13 @@ export function ProjectLauncher() {
       <div className="plaunch-panel">
         <h1 className="plaunch-title">Open a project</h1>
         <p className="plaunch-sub">Pick a folder to start a workspace in this tab.</p>
-        <button className="plaunch-open" onClick={() => void open()}>
+        <button type="button" className="plaunch-open" onClick={() => void open()}>
           <Icon name="FolderOpen" size={14} /> Open folder…
         </button>
         {recentProjects.length > 0 && (
           <div className="plaunch-recents">
             {recentProjects.map((r) => (
-              <button key={r.path} className="plaunch-recent" onClick={() => openPath(r.path)} title={r.path}>
+              <button type="button" key={r.path} className="plaunch-recent" onClick={() => openPath(r.path)} title={r.path}>
                 <Icon name="Folder" size={16} className="plaunch-recent-icon" style={{ color: folderHue(r.path) }} />
                 <span className="plaunch-recent-body">
                   <span className="plaunch-recent-name">{r.name}</span>

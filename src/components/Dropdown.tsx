@@ -12,7 +12,9 @@ export interface DropOption {
  * A small composer dropdown (the "Auto / Default / Max" controls + the agent
  * picker). The menu renders in a portal with fixed positioning so it is NEVER
  * clipped by an overflow ancestor (that was the bug that made agent-switching
- * impossible inside the scrolling thread-tab bar).
+ * impossible inside the scrolling thread-tab bar). Native modal dialogs make
+ * body-level portals inert, so a dialog-owned trigger portals into that dialog's
+ * top-layer subtree instead.
  */
 export function Dropdown({
   value,
@@ -140,6 +142,7 @@ export function Dropdown({
   return (
     <>
       <button
+        type="button"
         ref={btnRef}
         className="drop-btn"
         onClick={() => { if (!disabled) setOpen((o) => !o) }}
@@ -162,6 +165,7 @@ export function Dropdown({
             {options.length === 0 && <div className="drop-empty faint">No options</div>}
             {options.map((o) => (
               <button
+                type="button"
                 key={o.value}
                 className="drop-item"
                 data-active={o.value === value}
@@ -181,7 +185,7 @@ export function Dropdown({
               </button>
             ))}
           </div>,
-          document.body,
+          btnRef.current?.closest('dialog') ?? document.body,
         )}
     </>
   )

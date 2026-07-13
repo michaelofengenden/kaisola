@@ -4,7 +4,8 @@ import { bridge, isDesktop, type FsEntry } from '../../lib/bridge'
 import { Icon } from '../Icon'
 import { fileIcon } from '../../lib/fileIcon'
 import { AGENTS_TEMPLATE } from '../../lib/agentsTemplate'
-import { shellDrag } from './SessionCards'
+import { useClickAway } from '../../lib/useClickAway'
+import { shellDrag } from './shellDrag'
 import { ShellSidebarFooter } from './ShellSidebarFooter'
 
 /**
@@ -57,10 +58,27 @@ function RailResize({ side }: { side: 'left' | 'right' }) {
     window.addEventListener('mousemove', onMove)
     window.addEventListener('mouseup', onUp)
   }
+  const resizeByKeyboard = (e: React.KeyboardEvent<HTMLDivElement>) => {
+    if (e.key === 'Enter' || e.key === ' ') {
+      e.preventDefault()
+      setRailWidth(null)
+      return
+    }
+    const movement = e.key === 'ArrowLeft' ? -16 : e.key === 'ArrowRight' ? 16 : 0
+    if (!movement) return
+    e.preventDefault()
+    const currentWidth = e.currentTarget.parentElement?.getBoundingClientRect().width ?? 232
+    setRailWidth(currentWidth + (side === 'left' ? movement : -movement))
+  }
   return (
     <div
       className="wsrail-resize"
+      role="separator"
+      aria-label={`Resize ${side} files sidebar`}
+      aria-orientation="vertical"
+      tabIndex={0}
       onMouseDown={start}
+      onKeyDown={resizeByKeyboard}
       onDoubleClick={() => setRailWidth(null)}
       title="Drag to resize · double-click to reset"
     />
@@ -99,8 +117,8 @@ function OutlineSection() {
       </summary>
       <div className="rail-sec-body rail-outline">
         {outline.map((h, i) => (
-          <button
-            key={`${h.line}-${i}`}
+          <button type="button"
+            key={`${h.line}-${h.level}-${h.text}`}
             ref={i === activeIdx ? activeRef : undefined}
             className="rail-outline-item"
             data-active={i === activeIdx}
@@ -143,11 +161,11 @@ function QuotesSection() {
       <div className="rail-sec-body rail-quotes">
         {mine.slice(-40).reverse().map((a) => (
           <div key={a.id} className="rail-quote" style={{ '--annot-color': a.color } as React.CSSProperties}>
-            <button className="rail-quote-main" onClick={() => jump(a)} title={`${a.quote}\n— ${a.path.split('/').pop()}:${a.line}`}>
+            <button type="button" className="rail-quote-main" onClick={() => jump(a)} title={`${a.quote}\n— ${a.path.split('/').pop()}:${a.line}`}>
               <span className="rail-quote-text">{a.quote}</span>
               <span className="rail-quote-src truncate">{a.path.split('/').pop()} · {a.line}</span>
             </button>
-            <button className="rail-quote-x" onClick={() => removeAnnotation(a.id)} title="Remove quote">
+            <button type="button" className="rail-quote-x" onClick={() => removeAnnotation(a.id)} title="Remove quote" aria-label="Remove quote">
               <Icon name="X" size={10} />
             </button>
           </div>
@@ -174,7 +192,7 @@ function AgentPulse() {
   const speaker = latest.kind === 'prompt' ? 'You' : latest.kind === 'tool' || latest.kind === 'stop' ? 'Claude' : null
   const line = latest.kind === 'stop' ? 'finished the turn' : latest.text
   return (
-    <button
+    <button type="button"
       className="agent-pulse"
       data-running={running}
       onClick={() => { if (latest.path) requestFile(latest.path) }}
@@ -190,6 +208,7 @@ function AgentPulse() {
  * its expanded folders) instantly instead of repainting from an empty rail;
  * a background refresh then reconciles anything that changed while away. */
 const treeCache = new Map<string, { children: Record<string, FsEntry[]>; expanded: Set<string> }>()
+const parentOf = (path: string) => path.slice(0, path.lastIndexOf('/')) || '/'
 
 /** One right-click menu invocation: what it targets and where it floats. */
 interface TreeMenuState {
@@ -229,6 +248,10 @@ function FilesTree() {
   const [nameValue, setNameValue] = useState('')
   const expandedRef = useRef(expanded)
   const childrenRef = useRef(children)
+  const menuTriggerRef = useRef<HTMLElement>(null)
+  const menuRef = useRef<HTMLDivElement>(null)
+  const closeMenu = useCallback(() => { setMenu(null); setNaming(null); setNameValue('') }, [])
+  useClickAway(!!menu, closeMenu, menuTriggerRef, menuRef)
 
   const loadDir = useCallback(async (dir: string) => {
     const r = await bridge.fs.list(dir)
@@ -289,7 +312,8 @@ function FilesTree() {
 
   useEffect(() => {
     if (!workspacePath || !isDesktop) return
-    return bridge.fs.watch(workspacePath, () => setWatchSeq((n) => n + 1))
+    const unwatch = bridge.fs.watch(workspacePath, () => setWatchSeq((n) => n + 1))
+    return () => unwatch()
   }, [workspacePath])
 
   useEffect(() => {
@@ -319,7 +343,7 @@ function FilesTree() {
     for (const dir of expandedRef.current) {
       if (childrenRef.current[dir]) dirs.add(dir)
     }
-    dirs.forEach((dir) => { void loadDir(dir) })
+    for (const path of dirs) void loadDir(path)
   }, [loadDir, watchSeq, workspacePath])
 
   useEffect(() => {
@@ -344,13 +368,16 @@ function FilesTree() {
     }
   }, [query, watchSeq, workspacePath])
 
-  const toggle = (dir: string) =>
+  const toggle = (dir: string) => {
+    const directoryToLoad = !expanded.has(dir) && !children[dir] ? dir : null
     setExpanded((e) => {
       const n = new Set(e)
       if (n.has(dir)) n.delete(dir)
-      else { n.add(dir); if (!children[dir]) loadDir(dir) }
+      else n.add(dir)
       return n
     })
+    if (directoryToLoad) void loadDir(directoryToLoad)
+  }
 
   const changeFolder = async () => {
     const r = await bridge.pickFolder()
@@ -372,11 +399,10 @@ function FilesTree() {
   }
 
   // ── context-menu file operations ──
-  const parentOf = (p: string) => p.slice(0, p.lastIndexOf('/')) || '/'
-  const closeMenu = () => { setMenu(null); setNaming(null); setNameValue('') }
   const refreshAround = (p: string) => {
     void loadDir(parentOf(p))
-    if (childrenRef.current[p]) void loadDir(p)
+    const loadedDirectory = childrenRef.current[p] ? p : null
+    if (loadedDirectory) void loadDir(loadedDirectory)
   }
   const submitName = async () => {
     if (!naming) return
@@ -406,21 +432,21 @@ function FilesTree() {
     if (!existing.ok || !String(existing.content ?? '').trim()) {
       const w = await bridge.fs.write(target, AGENTS_TEMPLATE)
       if (!w.ok) { pushToast('error', w.message ?? 'Could not create AGENTS.md.'); closeMenu(); return }
-      void loadDir(dir)
+      void loadDir(parentOf(target))
       setExpanded((ex) => new Set(ex).add(dir))
     }
     requestFile(target, 'edit', { pinned: true })
     closeMenu()
   }
-  const trashEntry = async (p: string) => {
-    const r = await bridge.fs.trash(p)
-    if (r.ok) pushToast('success', `Moved ${p.split('/').pop()} to Trash`)
+  const trashEntry = async (entry: TreeMenuState) => {
+    const r = await bridge.fs.trash(entry.path)
+    if (r.ok) pushToast('success', `Moved ${entry.path.split('/').pop()} to Trash`)
     else pushToast('error', r.message ?? 'Could not delete.')
-    refreshAround(p)
+    refreshAround(entry.path)
     closeMenu()
   }
 
-  const onRowMenu = (e: React.MouseEvent, entry: { path: string; dir: boolean; root?: boolean }) => {
+  const onRowMenu = (entry: { path: string; dir: boolean; root?: boolean }, e: React.MouseEvent) => {
     e.preventDefault()
     e.stopPropagation()
     setNaming(null)
@@ -436,7 +462,6 @@ function FilesTree() {
       if (!kids || kids.length !== 1 || !kids[0].dir) break
       tail = kids[0]
       label += `/${tail.name}`
-      if (!children[tail.path]) void loadDir(tail.path)
     }
     return { label, tail }
   }
@@ -448,14 +473,14 @@ function FilesTree() {
       const tint = gitTint(e.dir ? rowEntry : e)
       return (
         <div key={e.path}>
-          <button
+          <button type="button"
             className="fx-row"
             style={{ paddingLeft: depth * 13 + 8 }}
             data-active={openFilePath === e.path}
             data-git={tint}
             onClick={() => (e.dir ? toggle(rowEntry.path) : requestFile(e.path))}
             onDoubleClick={() => { if (!e.dir) requestFile(e.path, 'edit', { pinned: true }) }}
-            onContextMenu={(ev) => onRowMenu(ev, { path: rowEntry.path, dir: e.dir })}
+            onContextMenu={(ev) => onRowMenu({ path: rowEntry.path, dir: e.dir }, ev)}
             title={e.dir ? fold!.label : `${e.name} — click previews · double-click pins & edits`}
           >
             {e.dir
@@ -476,10 +501,10 @@ function FilesTree() {
     <div className="wsrail-files">
       {workspacePath ? (
         <>
-          <button
+          <button type="button"
             className="fx-root"
             onClick={changeFolder}
-            onContextMenu={(ev) => onRowMenu(ev, { path: workspacePath, dir: true, root: true })}
+            onContextMenu={(ev) => onRowMenu({ path: workspacePath, dir: true, root: true }, ev)}
             title={`${workspacePath}${gitBranch ? ` · ${gitBranch}` : ''} — click to open another project`}
           >
             <Icon name="Folder" size={13} className="fx-icon" />
@@ -495,7 +520,7 @@ function FilesTree() {
           <label className="fx-rail-search">
             <Icon name="Search" size={12} />
             <input value={query} onChange={(e) => setQuery(e.target.value)} placeholder="Search files" spellCheck={false} />
-            {query && <button onClick={() => setQuery('')} title="Clear"><Icon name="X" size={11} /></button>}
+            {query && <button type="button" onClick={() => setQuery('')} title="Clear" aria-label="Clear file search"><Icon name="X" size={11} /></button>}
           </label>
           {query.trim() ? (
             <div className="fx-rail-results">
@@ -504,7 +529,7 @@ function FilesTree() {
               ) : results.length ? (
                 <>
                   {results.map((e) => (
-                    <button
+                    <button type="button"
                       key={e.path}
                       className="fx-row"
                       data-active={openFilePath === e.path}
@@ -526,14 +551,15 @@ function FilesTree() {
           ) : renderDir(workspacePath, 0)}
         </>
       ) : (
-        <button className="btn btn-sm wsrail-open" onClick={changeFolder}>
+        <button type="button" className="btn btn-sm wsrail-open" onClick={changeFolder}>
           <Icon name="FolderOpen" size={13} /> Open folder
         </button>
       )}
 
       {menu && (
-        <div className="tree-menu-overlay" onMouseDown={closeMenu} onContextMenu={(e) => { e.preventDefault(); closeMenu() }}>
+        <div className="tree-menu-overlay">
           <div
+            ref={menuRef}
             className="tree-menu"
             style={{ left: Math.min(menu.x, window.innerWidth - 230), top: Math.min(menu.y, window.innerHeight - 260) }}
             onMouseDown={(e) => e.stopPropagation()}
@@ -551,42 +577,42 @@ function FilesTree() {
                   }}
                   spellCheck={false}
                 />
-                <button onClick={() => void submitName()} title="Confirm"><Icon name="Check" size={12} /></button>
+                <button type="button" onClick={() => void submitName()} title="Confirm" aria-label="Confirm file name"><Icon name="Check" size={12} /></button>
               </div>
             ) : (
               <>
-                <button className="tree-menu-item" onClick={() => { setNaming({ mode: 'newfile', target: menu.path, isDir: menu.isDir }); setNameValue('') }}>
+                <button type="button" className="tree-menu-item" onClick={() => { setNaming({ mode: 'newfile', target: menu.path, isDir: menu.isDir }); setNameValue('') }}>
                   <Icon name="FilePlus2" size={13} /> New file…
                 </button>
-                <button className="tree-menu-item" onClick={() => { setNaming({ mode: 'newfolder', target: menu.path, isDir: menu.isDir }); setNameValue('') }}>
+                <button type="button" className="tree-menu-item" onClick={() => { setNaming({ mode: 'newfolder', target: menu.path, isDir: menu.isDir }); setNameValue('') }}>
                   <Icon name="FolderPlus" size={13} /> New folder…
                 </button>
                 {menu.isDir && (
-                  <button className="tree-menu-item" onClick={() => void scaffoldAgentsMd(menu.path)}>
+                  <button type="button" className="tree-menu-item" onClick={() => void scaffoldAgentsMd(menu.path)}>
                     <Icon name="Bot" size={13} /> AGENTS.md
                   </button>
                 )}
                 {!menu.isRoot && (
                   <>
                     <div className="tree-menu-sep" />
-                    <button className="tree-menu-item" onClick={() => { setNaming({ mode: 'rename', target: menu.path, isDir: menu.isDir }); setNameValue(menu.path.split('/').pop() ?? '') }}>
+                    <button type="button" className="tree-menu-item" onClick={() => { setNaming({ mode: 'rename', target: menu.path, isDir: menu.isDir }); setNameValue(menu.path.split('/').pop() ?? '') }}>
                       <Icon name="PenLine" size={13} /> Rename…
                     </button>
-                    <button className="tree-menu-item tree-menu-danger" onClick={() => void trashEntry(menu.path)}>
+                    <button type="button" className="tree-menu-item tree-menu-danger" onClick={() => void trashEntry(menu)}>
                       <Icon name="Trash2" size={13} /> Move to Trash
                     </button>
                   </>
                 )}
                 <div className="tree-menu-sep" />
-                <button className="tree-menu-item" onClick={() => { void navigator.clipboard.writeText(menu.path); closeMenu() }}>
+                <button type="button" className="tree-menu-item" onClick={() => { void navigator.clipboard.writeText(menu.path); closeMenu() }}>
                   <Icon name="Copy" size={13} /> Copy path
                 </button>
                 {!menu.isRoot && (
-                  <button className="tree-menu-item" onClick={() => { void navigator.clipboard.writeText(relativePath(menu.path)); closeMenu() }}>
+                  <button type="button" className="tree-menu-item" onClick={() => { void navigator.clipboard.writeText(relativePath(menu.path)); closeMenu() }}>
                     <Icon name="Copy" size={13} /> Copy relative path
                   </button>
                 )}
-                <button className="tree-menu-item" onClick={() => { void bridge.fs.reveal(menu.path); closeMenu() }}>
+                <button type="button" className="tree-menu-item" onClick={() => { void bridge.fs.reveal(menu.path); closeMenu() }}>
                   <Icon name="Eye" size={13} /> Reveal in Finder
                 </button>
               </>

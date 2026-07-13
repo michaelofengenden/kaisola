@@ -7,7 +7,7 @@ import { MergeView } from '@codemirror/merge'
 import { useKaisola } from '../../store/store'
 import { bridge, isDesktop, type GitStageEntry, type GitLogEntry } from '../../lib/bridge'
 import { Icon } from '../Icon'
-import { languageFor, highlightStyle, baseTheme } from '../CodeEditor'
+import { languageFor, highlightStyle, baseTheme } from '../codeEditorConfig'
 
 const fileExt = (p: string) => (p.includes('.') ? p.split('.').pop() : undefined)
 
@@ -53,7 +53,7 @@ export function GitPanel() {
   const workspacePath = useKaisola((s) => s.workspacePath)
   const pushToast = useKaisola((s) => s.pushToast)
   const [branch, setBranch] = useState<string | null>(null)
-  const [root, setRoot] = useState<string | null>(null)
+  const rootRef = useRef<string | null>(null)
   const [notRepo, setNotRepo] = useState(false)
   const [staged, setStaged] = useState<GitStageEntry[]>([])
   const [unstaged, setUnstaged] = useState<GitStageEntry[]>([])
@@ -80,7 +80,7 @@ export function GitPanel() {
       return
     }
     setNotRepo(false)
-    setRoot(r.root ?? null)
+    rootRef.current = r.root ?? null
     setBranch(r.branch ?? null)
     setStaged(r.staged ?? [])
     setUnstaged(r.unstaged ?? [])
@@ -113,6 +113,7 @@ export function GitPanel() {
   }
 
   const openDiff = async (entry: GitStageEntry, stagedSide: boolean) => {
+    const root = rootRef.current
     if (!root) return
     const seq = ++openSeq.current
     const abs = `${root}/${entry.path}`
@@ -153,17 +154,18 @@ export function GitPanel() {
 
   const fileRow = (entry: GitStageEntry, stagedSide: boolean) => (
     <div key={`${stagedSide ? 's' : 'u'}:${entry.path}`} className="git-file-row" data-active={diff?.path === entry.path}>
-      <button className="git-file-main" onClick={() => void openDiff(entry, stagedSide)} title={entry.conflicted ? `${entry.path} — merge conflict: resolve in the file, then stage` : `${entry.path} — view diff`}>
+      <button type="button" className="git-file-main" onClick={() => void openDiff(entry, stagedSide)} title={entry.conflicted ? `${entry.path} — merge conflict: resolve in the file, then stage` : `${entry.path} — view diff`}>
         <span className="fx-change-code" data-code={entry.conflicted ? 'D' : entry.status}>{entry.status}</span>
         <span className="truncate">{entry.path}</span>
         {entry.conflicted && <span className="git-conflict-tag">conflict</span>}
       </button>
       {!entry.conflicted && (
-        <button
+        <button type="button"
           className="git-file-act"
           disabled={busy}
           onClick={() => void act(() => (stagedSide ? bridge.git.unstage(workspacePath, [entry.path]) : bridge.git.stage(workspacePath, [entry.path])))}
           title={stagedSide ? 'Unstage' : 'Stage'}
+          aria-label={`${stagedSide ? 'Unstage' : 'Stage'} ${entry.path}`}
         >
           <Icon name={stagedSide ? 'Minus' : 'Plus'} size={12} />
         </button>
@@ -178,7 +180,7 @@ export function GitPanel() {
         <span className="git-branch truncate">{branch ?? '(no branch)'}</span>
         <span className="grow" />
         {diff && (
-          <button className="btn btn-ghost btn-sm" onClick={() => setDiff(null)}>
+          <button type="button" className="btn btn-ghost btn-sm" onClick={() => setDiff(null)}>
             <Icon name="ArrowLeft" size={12} /> Files
           </button>
         )}
@@ -196,10 +198,10 @@ export function GitPanel() {
               <div className="git-group">
                 <div className="git-group-head">
                   <span className="grow">Changes · {unstaged.length}</span>
-                  <button
+                  <button type="button"
                     className="git-group-act"
                     disabled={busy || unstaged.every((f) => f.conflicted)}
-                    onClick={() => void act(() => bridge.git.stage(workspacePath, unstaged.filter((f) => !f.conflicted).map((f) => f.path)))}
+                    onClick={() => void act(() => bridge.git.stage(workspacePath, unstaged.flatMap((file) => file.conflicted ? [] : [file.path])))}
                   >
                     Stage all
                   </button>
@@ -211,7 +213,7 @@ export function GitPanel() {
               <div className="git-group">
                 <div className="git-group-head">
                   <span className="grow">Staged · {staged.length}</span>
-                  <button
+                  <button type="button"
                     className="git-group-act"
                     disabled={busy}
                     onClick={() => void act(() => bridge.git.unstage(workspacePath, staged.map((f) => f.path)))}
@@ -237,7 +239,7 @@ export function GitPanel() {
                 if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') void commit()
               }}
             />
-            <button
+            <button type="button"
               className="btn btn-primary btn-sm git-commit-btn"
               disabled={busy || !message.trim() || !staged.length}
               onClick={() => void commit()}

@@ -7,6 +7,7 @@ import { WebglAddon } from '@xterm/addon-webgl'
 import { bridge, isDesktop, type TermSnapshot } from '../lib/bridge'
 import { useKaisola, terminalOwnerMap, POP_TERMINAL_ID, type TermBackground, type TerminalContinuationStatus } from '../store/store'
 import { clockTime } from '../lib/format'
+import { touchMountedTerminal } from '../lib/terminalResidency'
 import { Icon } from './Icon'
 
 // xterm needs concrete hex (no CSS vars). These mirror --term-bg in tokens.css:
@@ -52,6 +53,12 @@ const LIGHT_THEME: ITheme = {
   cyan: '#1f8f88',
   white: '#3b3f48',
   brightWhite: '#16181d',
+}
+const FIND_DECORATIONS = {
+  matchBackground: '#d8a44a55',
+  activeMatchBackground: '#95a45688',
+  matchOverviewRuler: '#d8a44a',
+  activeMatchColorOverviewRuler: '#95a456',
 }
 // The xterm surface is ALWAYS opaque (allowTransparency stays off): a transparent
 // WebGL surface forces an extra GPU compose every frame the terminal paints — the
@@ -128,33 +135,6 @@ const shellQuote = (s: string) => `'${s.replace(/'/g, "'\\''")}'`
  * only on the line typed into the pty. */
 const bootLine = (boot: string, singletonKey?: string) =>
   singletonKey?.startsWith('agent:') ? `printf '\\033[2J\\033[3J\\033[H'; ${boot}` : boot
-
-/** Terminal ids that have mounted an xterm in THIS renderer. SessionCards keeps
- * exactly these alive as hidden ghost cards across project switches — a switch
- * back re-shows a live xterm instead of replaying the whole pty snapshot. Never
- * seeds NEW ptys: an id lands here only after its terminal actually mounted. */
-export const everMountedTerminals = new Set<string>()
-
-/** Hidden xterms kept warm for instant back-switches. Everything beyond this
- * small LRU is unmounted; its pty keeps running with disk-backed scrollback. */
-export const hiddenTerminalResidentCap = (mode: 'glass' | 'eco' = 'eco') => {
-  const saved = localStorage.getItem('kaisola:hidden-terminal-residents')
-  const fallback = mode === 'eco' ? 0 : 1
-  const n = Number(saved ?? fallback)
-  return Number.isFinite(n) ? Math.min(8, Math.max(0, Math.round(n))) : fallback
-}
-
-export const touchMountedTerminal = (id: string) => {
-  everMountedTerminals.delete(id)
-  everMountedTerminals.add(id)
-}
-
-/** Drop a terminal id from the ever-mounted Set — call ONLY on a real terminal
- * close (store's closeTerminal reap), never on a React unmount: the Set must
- * survive tab-hide remounts, and only a genuine close should shrink it. */
-export const forgetMountedTerminal = (id: string) => {
-  everMountedTerminals.delete(id)
-}
 
 /** Window visibility has two phases: stop painting immediately, then fully
  * dispose/detach the renderer after a short grace. The broker PTY is untouched. */
@@ -242,28 +222,19 @@ export function Terminal({ id, attach = false, boot, cwd, projectId: projectIdOv
   const { visible: docVisible, rendererAwake } = useDocumentTerminalLifecycle()
   const visible = cardShown && docVisible
   const visibleRef = useRef(visible)
-  visibleRef.current = visible
   const cardShownRef = useRef(cardShown)
-  cardShownRef.current = cardShown
   // the WebGL renderer lives only while the card is shown — a hidden card
   // paints nothing, so holding a GPU context (and its glyph atlas) for it is
   // pure drain, and freed contexts keep many-session grids under the GL cap
   const glCtlRef = useRef<{ attach: () => void; drop: () => void } | null>(null)
   const pendingRef = useRef<{ chunks: string[]; bytes: number }>({ chunks: [], bytes: 0 })
   const themeRef = useRef(theme)
-  themeRef.current = theme
   const ecoRef = useRef(ecoMode)
-  ecoRef.current = ecoMode
   const fontSizeRef = useRef(termFontSize)
-  fontSizeRef.current = termFontSize
   const fontFamilyRef = useRef(termFontFamily)
-  fontFamilyRef.current = termFontFamily
   const fontWeightRef = useRef(termFontWeight)
-  fontWeightRef.current = termFontWeight
   const cursorColorRef = useRef(termCursorColor)
-  cursorColorRef.current = termCursorColor
   const termBgRef = useRef(termBackground)
-  termBgRef.current = termBackground
   // boot delivery: `create` boots only FRESH ptys; a boot adopted while the pty
   // is already live arrives via the record's bootPending flag instead
   const bootPending = useKaisola((s) => s.terminals.find((t) => t.id === id)?.bootPending)
@@ -275,6 +246,7 @@ export function Terminal({ id, attach = false, boot, cwd, projectId: projectIdOv
   const [attachedContinuation, setAttachedContinuation] = useState<TerminalContinuationStatus | null>(null)
   const continuation = persistedContinuation ?? attachedContinuation
   const [ptyReady, setPtyReady] = useState(false)
+  const [freshBootRequest, setFreshBootRequest] = useState<{ fallbackBoot?: string; requestedAt: number } | null>(null)
   // A broker-owned pty can outlive the Electron renderer across an update.
   // Pending boots must distinguish that live pty from a newly-created shell.
   const ptyExistedRef = useRef(false)
@@ -285,10 +257,13 @@ export function Terminal({ id, attach = false, boot, cwd, projectId: projectIdOv
   const lastBootRef = useRef<{ boot: string; at: number } | null>(null)
   // draft survival: the CLI composer's unsent text, reconstructed from
   // keystrokes (see trackDraft) — replayed into a resumed agent after restart
-  const lastOutputAtRef = useRef(Date.now())
+  const lastOutputAtRef = useRef<number | null>(null)
+  if (lastOutputAtRef.current === null) lastOutputAtRef.current = Date.now()
   const agentTurnOpenRef = useRef(false)
   const agentDoneTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const codexProbeTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const focusTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const draftRetypeTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const codexSessionRef = useRef<string | null>(null)
   // A hibernated xterm remounts around the same live CLI composer. Seed the
   // keystroke tracker from durable state so the next character appends to the
@@ -296,6 +271,18 @@ export function Terminal({ id, attach = false, boot, cwd, projectId: projectIdOv
   const draftBufRef = useRef(useKaisola.getState().termDrafts[id] ?? '')
   const trackDraftRef = useRef<(data: string) => void>(() => {})
   const armDraftRetypeRef = useRef<(bootStr: string) => void>(() => {})
+
+  useEffect(() => {
+    visibleRef.current = visible
+    cardShownRef.current = cardShown
+    themeRef.current = theme
+    ecoRef.current = ecoMode
+    fontSizeRef.current = termFontSize
+    fontFamilyRef.current = termFontFamily
+    fontWeightRef.current = termFontWeight
+    cursorColorRef.current = termCursorColor
+    termBgRef.current = termBackground
+  }, [visible, cardShown, theme, ecoMode, termFontSize, termFontFamily, termFontWeight, termCursorColor, termBackground])
 
   // One-time means one actually visible glance, not “eight seconds elapsed in
   // a minimized window.” If the app exits first, the persisted receipt returns.
@@ -306,7 +293,7 @@ export function Terminal({ id, attach = false, boot, cwd, projectId: projectIdOv
       setAttachedContinuation(null)
     }, 8000)
     return () => window.clearTimeout(timer)
-  }, [visible, continuation?.at, persistedContinuation, id, setTerminalContinuation])
+  }, [visible, continuation, persistedContinuation, id, setTerminalContinuation])
 
   // keep the live terminal's palette in sync with the app theme + energy saver
   useEffect(() => {
@@ -576,7 +563,11 @@ export function Terminal({ id, attach = false, boot, cwd, projectId: projectIdOv
       // ⌘F — search the scrollback (Terminal.app parity)
       if (ev.key.toLowerCase() === 'f' && !ev.shiftKey) {
         setFindOpen(true)
-        setTimeout(() => findInputRef.current?.focus(), 0)
+        if (focusTimerRef.current) clearTimeout(focusTimerRef.current)
+        focusTimerRef.current = setTimeout(() => {
+          focusTimerRef.current = null
+          findInputRef.current?.focus()
+        }, 0)
         return false
       }
       // ⌘+ / ⌘− / ⌘0 — font zoom, persisted across every terminal
@@ -716,14 +707,22 @@ export function Terminal({ id, attach = false, boot, cwd, projectId: projectIdOv
         if (disposed) return
         if (draftBufRef.current) return // the user is already typing — leave them be
         if (Date.now() - born > 30_000) return
-        if (Date.now() - born > 3000 && Date.now() - lastOutputAtRef.current > 2000) {
+        if (Date.now() - born > 3000 && Date.now() - (lastOutputAtRef.current ?? born) > 2000) {
           void bridge.terminal.write(id, saved.replaceAll('\n', '\\\r'), projectId).catch(() => {})
           draftBufRef.current = saved // the composer now holds it — track edits from here
           return
         }
-        setTimeout(tryType, 500)
+        if (draftRetypeTimerRef.current) clearTimeout(draftRetypeTimerRef.current)
+        draftRetypeTimerRef.current = setTimeout(() => {
+          draftRetypeTimerRef.current = null
+          tryType()
+        }, 500)
       }
-      setTimeout(tryType, 3200)
+      if (draftRetypeTimerRef.current) clearTimeout(draftRetypeTimerRef.current)
+      draftRetypeTimerRef.current = setTimeout(() => {
+        draftRetypeTimerRef.current = null
+        tryType()
+      }, 3200)
     }
 
     // dev-server detection: a URL/port in the output becomes a chip on the
@@ -771,7 +770,7 @@ export function Terminal({ id, attach = false, boot, cwd, projectId: projectIdOv
       term.onData((data) => {
         void bridge.terminal.write(id, data, projectId).catch(() => {})
         if (!attach) trackInput(data)
-        trackDraft(data)
+        trackDraftRef.current(data)
       })
       void bridge.terminal.resize(id, term.cols, term.rows, projectId).catch(() => {})
     }
@@ -832,18 +831,7 @@ export function Terminal({ id, attach = false, boot, cwd, projectId: projectIdOv
           useKaisola.getState().clearBootPending(id)
           if (!bootSentRef.current) {
             bootSentRef.current = true
-            setTimeout(() => {
-              if (disposed) return
-              const st = useKaisola.getState()
-              st.clearBootPending(id) // an update that landed during the wait is delivered right here
-              const rec = st.terminals.find((t) => t.id === id)
-              const line = rec?.boot ?? boot
-              if (!line) return
-              // dedupe against the CLEAN boot — the typed line may carry the wipe
-              lastBootRef.current = { boot: line, at: Date.now() }
-              void bridge.terminal.write(id, bootLine(line, rec?.singletonKey) + '\n', projectId).catch(() => {})
-              armDraftRetypeRef.current(line)
-            }, 700)
+            setFreshBootRequest({ fallbackBoot: boot, requestedAt: Date.now() })
           }
         }
         setPtyReady(true)
@@ -883,6 +871,13 @@ export function Terminal({ id, attach = false, boot, cwd, projectId: projectIdOv
       if (titleTimer) clearTimeout(titleTimer)
       if (agentDoneTimerRef.current) clearTimeout(agentDoneTimerRef.current)
       if (codexProbeTimerRef.current) clearTimeout(codexProbeTimerRef.current)
+      if (focusTimerRef.current) clearTimeout(focusTimerRef.current)
+      if (draftRetypeTimerRef.current) clearTimeout(draftRetypeTimerRef.current)
+      focusTimerRef.current = null
+      draftRetypeTimerRef.current = null
+      setFreshBootRequest(null)
+      trackDraftRef.current = () => {}
+      armDraftRetypeRef.current = () => {}
       window.removeEventListener('resize', onWinResize)
       host.removeEventListener('click', focus)
       ro.disconnect()
@@ -907,6 +902,27 @@ export function Terminal({ id, attach = false, boot, cwd, projectId: projectIdOv
     // record cwd change must never tear down a live session mid-run
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [id, attach, rendererAwake, projectId])
+
+  // A fresh PTY needs one short shell-startup delay before its boot line is
+  // written. Keep that delay in its own lifecycle so an unmount/rebuild always
+  // cancels the pending write instead of leaving the mount effect to own an
+  // asynchronous timer created from inside the broker response callback.
+  useEffect(() => {
+    if (!freshBootRequest) return
+    const timer = window.setTimeout(() => {
+      setFreshBootRequest(null)
+      const st = useKaisola.getState()
+      st.clearBootPending(id) // an update that landed during the wait is delivered right here
+      const rec = st.terminals.find((t) => t.id === id)
+      const line = rec?.boot ?? freshBootRequest.fallbackBoot
+      if (!line) return
+      // dedupe against the CLEAN boot — the typed line may carry the wipe
+      lastBootRef.current = { boot: line, at: Date.now() }
+      void bridge.terminal.write(id, bootLine(line, rec?.singletonKey) + '\n', projectId).catch(() => {})
+      armDraftRetypeRef.current(line)
+    }, 700)
+    return () => window.clearTimeout(timer)
+  }, [freshBootRequest, id, projectId])
 
   // deliver a boot adopted after the pty went live (see bootPending). The shell
   // was spawned before the terminal had a cwd, so cd to it as a user would.
@@ -946,23 +962,17 @@ export function Terminal({ id, attach = false, boot, cwd, projectId: projectIdOv
     // Deliberate reruns (LaTeX rebuild) come much later and pass the window.
     if (t?.boot && lastBootRef.current?.boot === t.boot && Date.now() - lastBootRef.current.at < 10_000) return
     bootSentRef.current = true
-    setTimeout(() => {
+    const bootTimer = window.setTimeout(() => {
       void bridge.terminal.write(id, line + '\n', projectId).catch(() => {})
       armDraftRetypeRef.current(line)
     }, 700)
+    return () => window.clearTimeout(bootTimer)
   }, [ptyReady, bootPending, id, foregroundProcess, projectId])
 
-  // find-in-scrollback: amber matches, accent active match (proposed-API decorations)
-  const findDecorations = {
-    matchBackground: '#d8a44a55',
-    activeMatchBackground: '#95a45688',
-    matchOverviewRuler: '#d8a44a',
-    activeMatchColorOverviewRuler: '#95a456',
-  }
   const findNext = (back = false) => {
     if (!findQuery) return
-    if (back) searchRef.current?.findPrevious(findQuery, { decorations: findDecorations })
-    else searchRef.current?.findNext(findQuery, { decorations: findDecorations })
+    if (back) searchRef.current?.findPrevious(findQuery, { decorations: FIND_DECORATIONS })
+    else searchRef.current?.findNext(findQuery, { decorations: FIND_DECORATIONS })
   }
   const closeFind = () => {
     setFindOpen(false)
@@ -1006,7 +1016,10 @@ export function Terminal({ id, attach = false, boot, cwd, projectId: projectIdOv
         if (!files.length) return
         e.preventDefault()
         e.stopPropagation() // the window-level handler would open it as a file tab
-        const paths = files.map((f) => bridge.pathForFile?.(f)).filter(Boolean) as string[]
+        const paths = files.flatMap((file) => {
+          const path = bridge.pathForFile?.(file)
+          return path ? [path] : []
+        })
         if (!paths.length) return
         const text = paths.map(shellQuote).join(' ') + ' '
         const term = termRef.current
@@ -1022,7 +1035,8 @@ export function Terminal({ id, attach = false, boot, cwd, projectId: projectIdOv
         <div className="turn-rail" onMouseLeave={() => setRailHover(null)}>
           {promptMarks.map((p, n) => (
             <button
-              key={`${p.at}-${n}`}
+              type="button"
+              key={`${p.at}:${p.text}`}
               className="turn-tick"
               onMouseEnter={(e) => setRailHover({ n, y: (e.currentTarget as HTMLElement).offsetTop })}
               onClick={() => termRef.current?.scrollToLine(p.marker.line)}
@@ -1053,15 +1067,15 @@ export function Terminal({ id, attach = false, boot, cwd, projectId: projectIdOv
             placeholder="Find in terminal"
             spellCheck={false}
           />
-          <button onClick={() => findNext(true)} title="Previous  ⇧⏎"><Icon name="ChevronUp" size={12} /></button>
-          <button onClick={() => findNext(false)} title="Next  ⏎"><Icon name="ChevronDown" size={12} /></button>
-          <button onClick={closeFind} title="Close  esc"><Icon name="X" size={12} /></button>
+          <button type="button" onClick={() => findNext(true)} title="Previous  ⇧⏎" aria-label="Previous match"><Icon name="ChevronUp" size={12} /></button>
+          <button type="button" onClick={() => findNext(false)} title="Next  ⏎" aria-label="Next match"><Icon name="ChevronDown" size={12} /></button>
+          <button type="button" onClick={closeFind} title="Close  esc" aria-label="Close search"><Icon name="X" size={12} /></button>
         </div>
       )}
       {continuation && visible && (
         <button
+          type="button"
           className="term-continuity"
-          role="status"
           aria-live="polite"
           onClick={() => {
             if (persistedContinuation) setTerminalContinuation(id, undefined)

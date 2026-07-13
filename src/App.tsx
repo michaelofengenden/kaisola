@@ -11,7 +11,8 @@ import { WorkspaceRail } from './components/shell/WorkspaceRail'
 import { ProjectTabs } from './components/shell/ProjectTabs'
 import { ProjectLauncher } from './components/shell/ProjectLauncher'
 import { CommandPalette } from './components/shell/CommandPalette'
-import { SessionCards, shellDrag } from './components/shell/SessionCards'
+import { SessionCards } from './components/shell/SessionCards'
+import { shellDrag } from './components/shell/shellDrag'
 import { SessionSidebar } from './components/shell/SessionTabs'
 import { ProvenancePopover } from './components/Provenance'
 import { ReviewFocus } from './components/ReviewFocus'
@@ -712,6 +713,17 @@ export default function App() {
                   className="canvas-resize"
                   onMouseDown={startCanvasResize}
                   onDoubleClick={() => setCanvasWidth(null)}
+                  onKeyDown={(event) => {
+                    if (event.key === 'Home') { event.preventDefault(); setCanvasWidth(null); return }
+                    if (event.key !== 'ArrowLeft' && event.key !== 'ArrowRight') return
+                    event.preventDefault()
+                    const next = (canvasWidth ?? 600) + (event.key === 'ArrowLeft' ? -20 : 20)
+                    setCanvasWidth(Math.max(320, Math.min(window.innerWidth - 360, next)))
+                  }}
+                  role="separator"
+                  aria-label="Resize document canvas"
+                  aria-orientation="vertical"
+                  tabIndex={0}
                   title="Drag to resize · double-click to reset"
                 />
               )}

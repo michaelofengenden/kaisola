@@ -49,7 +49,9 @@ export function ProposalCard({ proposal, hideActions }: { proposal: Proposal; hi
   // changeId → hunk indexes the human UNCHECKED (default: everything kept)
   const [dropped, setDropped] = useState<Record<string, Set<number>>>({})
   const editable = useMemo(
-    () => proposal.changes.filter(canEditChange).map((c) => ({ change: c, hunks: lineHunks(c.before!, c.after!) })),
+    () => proposal.changes.flatMap((change) => (
+      canEditChange(change) ? [{ change, hunks: lineHunks(change.before!, change.after!) }] : []
+    )),
     [proposal.changes],
   )
   const anyDropped = Object.values(dropped).some((s) => s.size > 0)
@@ -67,7 +69,11 @@ export function ProposalCard({ proposal, hideActions }: { proposal: Proposal; hi
     for (const { change, hunks } of editable) {
       const drop = dropped[change.id]
       if (!drop || drop.size === 0) continue
-      keep[change.id] = hunks.map((_, i) => i).filter((i) => !drop.has(i))
+      const keptIndexes: number[] = []
+      for (let index = 0; index < hunks.length; index++) {
+        if (!drop.has(index)) keptIndexes.push(index)
+      }
+      keep[change.id] = keptIndexes
     }
     approvePartial(proposal.id, keep)
   }
@@ -97,7 +103,7 @@ export function ProposalCard({ proposal, hideActions }: { proposal: Proposal; hi
             <div key={change.id} className="proposal-hunks-change">
               <span className="caps">{change.label} · keep which parts?</span>
               {hunks.map((h, i) => (
-                <label key={i} className="proposal-hunk">
+                <label key={`${change.id}:${h.aStart}`} className="proposal-hunk">
                   <input
                     type="checkbox"
                     checked={!dropped[change.id]?.has(i)}
@@ -139,12 +145,13 @@ export function ProposalCard({ proposal, hideActions }: { proposal: Proposal; hi
         </div>
       ) : hideActions ? null : (
         <div className="proposal-actions">
-          <button className="btn btn-primary btn-sm" onClick={approveNow}>
+          <button type="button" className="btn btn-primary btn-sm" onClick={approveNow}>
             <Icon name={isFilePatch ? 'GitMerge' : 'Check'} size={13} />{' '}
             {isFilePatch ? 'Merge' : anyDropped ? 'Approve kept hunks' : 'Approve'}
           </button>
           {editable.length > 0 && (
             <button
+              type="button"
               className={`btn btn-sm${editing ? ' btn-active' : ''}`}
               onClick={() => setEditing((e) => !e)}
               title="Choose which hunks of this change to accept"
@@ -152,7 +159,7 @@ export function ProposalCard({ proposal, hideActions }: { proposal: Proposal; hi
               <Icon name="Pencil" size={13} /> Edit
             </button>
           )}
-          <button className="btn btn-danger btn-sm" onClick={() => reject(proposal.id)}>
+          <button type="button" className="btn btn-danger btn-sm" onClick={() => reject(proposal.id)}>
             <Icon name="X" size={13} /> Reject
           </button>
         </div>

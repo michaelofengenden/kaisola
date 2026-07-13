@@ -1,9 +1,10 @@
-import { useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
 import { bridge, isDesktop, type AcpAgent, type McpProbeResult, type McpServerRow } from '../../lib/bridge'
 import { useKaisola } from '../../store/store'
 import { useAgentRegistry, agentName } from '../../lib/registry'
 import { Icon } from '../Icon'
+import { useClickAway } from '../../lib/useClickAway'
 
 /**
  * Top-bar agent & MCP health — the pattern no surveyed IDE ships cleanly:
@@ -63,7 +64,7 @@ function Row({ tone, pulse, name, sub, state, title, action }: {
       {action && (
         <>
           <span className="grow" />
-          <button className="btn btn-ghost btn-sm" style={{ height: 20, padding: '0 6px', flexShrink: 0 }} onClick={action.onClick}>
+          <button type="button" className="btn btn-ghost btn-sm" style={{ height: 20, padding: '0 6px', flexShrink: 0 }} onClick={action.onClick}>
             {action.label}
           </button>
         </>
@@ -82,6 +83,9 @@ export function AgentStatusButton() {
   const [probes, setProbes] = useState<Record<string, McpProbeResult>>({})
   const [discovered, setDiscovered] = useState<Array<{ name: string; origin: string }>>([])
   const btnRef = useRef<HTMLButtonElement | null>(null)
+  const panelRef = useRef<HTMLDivElement | null>(null)
+  const closePopover = useCallback(() => setOpen(false), [])
+  useClickAway(open, closePopover, btnRef, panelRef)
   const { all, menu } = useAgentRegistry()
   const openSettings = useKaisola((s) => s.setSettingsOpen)
   const projectId = useKaisola((s) => s.activeProjectId)
@@ -90,7 +94,11 @@ export function AgentStatusButton() {
   const followAgent = useKaisola((s) => s.followAgent)
   const toggleFollowAgent = useKaisola((s) => s.toggleFollowAgent)
   // primitive selectors (string/boolean) so the strip never re-renders on noise
-  const busyKeys = useKaisola((s) => s.assistantThreads.filter((t) => t.busy).map((t) => t.agentKey).join(','))
+  const busyKeys = useKaisola((s) => {
+    const keys: string[] = []
+    for (const thread of s.assistantThreads) if (thread.busy) keys.push(thread.agentKey)
+    return keys.join(',')
+  })
   const anyBusy = useKaisola(
     (s) => s.assistantThreads.some((t) => t.busy) || Object.values(s.agentRunning).some(Boolean) || s.terminals.some((t) => !!s.terminalMeta[t.id]?.agentBusy),
   )
@@ -159,13 +167,10 @@ export function AgentStatusButton() {
 
   useEffect(() => {
     if (!open) return
-    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') setOpen(false) }
-    window.addEventListener('keydown', onKey)
     // while open, the panel is LIVE — a steady poll under the event triggers,
     // so busy/connected states never read stale ("the activity doesn't stay")
     const iv = window.setInterval(() => void load(), 2500)
     return () => {
-      window.removeEventListener('keydown', onKey)
       window.clearInterval(iv)
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -233,12 +238,14 @@ export function AgentStatusButton() {
   return (
     <>
       <button
+        type="button"
         ref={btnRef}
         className="btn-icon"
         data-active={open}
         onClick={toggle}
         style={{ position: 'relative' }}
         title={`Agents & MCP — ${connectedCount ? `${connectedCount} connected` : anyPresent ? 'nothing connected' : 'no agents yet'}${needsApproval ? ' · a project MCP server needs approval' : ''}`}
+        aria-label="Agent and MCP status"
       >
         <Icon name="CircuitBoard" size={15} />
         {dotTone && (
@@ -259,30 +266,27 @@ export function AgentStatusButton() {
         )}
       </button>
       {open && createPortal(
-        <div className="tree-menu-overlay" onMouseDown={() => setOpen(false)}>
+        <div className="tree-menu-overlay">
           <div
-            style={{
-              position: 'fixed', right: pos.right, top: pos.top, width: 252, zIndex: 'var(--z-menu, 900)' as never,
-              background: 'var(--bg-3)', border: '1px solid var(--border)', borderRadius: 'var(--r-3, 10px)',
-              boxShadow: 'var(--shadow-3, 0 12px 40px rgba(0,0,0,.4))', padding: '10px 12px',
-              display: 'flex', flexDirection: 'column', gap: 8, fontSize: 'var(--fs-12)',
-              maxHeight: '70vh', overflowY: 'auto',
-            }}
-            onMouseDown={(e) => e.stopPropagation()}
+            ref={panelRef}
+            className="agent-status-popover"
+            style={{ right: pos.right, top: pos.top }}
           >
             <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
               <Icon name="CircuitBoard" size={13} />
               <span style={{ fontWeight: 600 }}>Agents</span>
               <span className="grow" />
               <button
+                type="button"
                 className="btn-icon btn-sm"
                 data-active={followAgent}
                 onClick={toggleFollowAgent}
                 title={followAgent ? 'Following files agents touch' : 'Follow files agents touch'}
+                aria-label={followAgent ? 'Stop following files agents touch' : 'Follow files agents touch'}
               >
                 <Icon name="Crosshair" size={12} />
               </button>
-              <button className="btn-icon btn-sm" onClick={() => void load()} title="Refresh">
+              <button type="button" className="btn-icon btn-sm" onClick={() => void load()} title="Refresh" aria-label="Refresh agent and MCP status">
                 <Icon name="RefreshCw" size={12} />
               </button>
             </div>
@@ -356,7 +360,7 @@ export function AgentStatusButton() {
             <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
               <span style={{ fontWeight: 600 }}>MCP servers</span>
               <span className="grow" />
-              <button className="btn btn-ghost btn-sm" style={{ height: 20, padding: '0 6px' }} onClick={() => void addServer()} title="Edit the user server catalog (JSON) — servers here follow you across projects">
+              <button type="button" className="btn btn-ghost btn-sm" style={{ height: 20, padding: '0 6px' }} onClick={() => void addServer()} title="Edit the user server catalog (JSON) — servers here follow you across projects">
                 <Icon name="Plus" size={11} /> Add
               </button>
             </div>
@@ -394,6 +398,7 @@ export function AgentStatusButton() {
             )}
             {discovered.length > 0 && (
               <button
+                type="button"
                 className="btn btn-ghost btn-sm"
                 style={{ justifyContent: 'flex-start', gap: 6 }}
                 onClick={async () => { await bridge.mcp?.importDiscovered?.(); void load() }}
@@ -404,6 +409,7 @@ export function AgentStatusButton() {
             )}
 
             <button
+              type="button"
               className="btn btn-ghost btn-sm"
               style={{ justifyContent: 'flex-start', gap: 6, marginTop: 2 }}
               onClick={() => { setOpen(false); openSettings(true, 'agents') }}

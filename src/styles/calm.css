@@ -189,6 +189,23 @@
   inset: 0;
   z-index: var(--z-palette);
 }
+
+.agent-status-popover {
+  position: fixed;
+  width: 252px;
+  z-index: var(--z-menu, 900);
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  max-height: 70vh;
+  padding: 10px 12px;
+  overflow-y: auto;
+  border: 1px solid var(--border);
+  border-radius: var(--r-3, 10px);
+  background: var(--bg-3);
+  box-shadow: var(--shadow-3, 0 12px 40px rgba(0, 0, 0, 0.4));
+  font-size: var(--fs-12);
+}
 .tree-menu {
   position: fixed;
   min-width: 190px;

@@ -52,7 +52,7 @@ function WindowBar({ label, usedPercent, resetsAt, color = 'var(--accent)' }: {
         </span>
       </div>
       <div style={{ height: 5, borderRadius: 'var(--r-full)', background: 'var(--bg-inset)', overflow: 'hidden' }}>
-        <div style={{ width: `${pct}%`, height: '100%', borderRadius: 'var(--r-full)', background: tone, transition: 'width 180ms ease-out' }} />
+        <div style={{ width: '100%', height: '100%', borderRadius: 'var(--r-full)', background: tone, transform: `scaleX(${pct / 100})`, transformOrigin: 'left', transition: 'transform 180ms ease-out' }} />
       </div>
     </div>
   )
@@ -71,21 +71,29 @@ function ClaudeActivity({ label, sums }: { label: string; sums?: ClaudeTokenSums
   )
 }
 
+const EXTRA_AMOUNT_FORMATTERS = new Map<string, Intl.NumberFormat>()
+
 const extraAmount = (value: number | undefined, currency?: string): string => {
   if (value == null) return '—'
   try {
-    return new Intl.NumberFormat(undefined, {
-      style: currency ? 'currency' : 'decimal',
-      currency: currency || undefined,
-      maximumFractionDigits: 2,
-    }).format(value)
+    const key = currency || 'decimal'
+    let formatter = EXTRA_AMOUNT_FORMATTERS.get(key)
+    if (!formatter) {
+      formatter = new Intl.NumberFormat(undefined, {
+        style: currency ? 'currency' : 'decimal',
+        currency: currency || undefined,
+        maximumFractionDigits: 2,
+      })
+      EXTRA_AMOUNT_FORMATTERS.set(key, formatter)
+    }
+    return formatter.format(value)
   } catch {
     return `${value.toFixed(2)}${currency ? ` ${currency}` : ''}`
   }
 }
 
 interface ClaudeRow { id: string; label: string; email?: string; usage?: ClaudeUsage }
-const AGENT_USAGE_KEY = 'kaisola:agent-usage-warning'
+const AGENT_USAGE_KEY = 'kaisola:agent-usage-warning:v1'
 
 function UsageSurface({ embedded = false }: { embedded?: boolean }) {
   const [open, setOpen] = useState(embedded)
@@ -205,7 +213,7 @@ function UsageSurface({ embedded = false }: { embedded?: boolean }) {
     row.usage?.limits?.fiveHour?.usedPercent,
     row.usage?.limits?.sevenDay?.usedPercent,
     ...(row.usage?.limits?.modelScoped?.map((model) => model.usedPercent) ?? []),
-  ]).filter((value): value is number => value != null)
+  ].flatMap((value) => value == null ? [] : [value]))
   const claudePeak = claudePercents.length ? Math.max(...claudePercents) : null
   const peak = codexPeak == null ? claudePeak : claudePeak == null ? codexPeak : Math.max(codexPeak, claudePeak)
   const indicator = (codexLoading || claudeLoading) && peak == null
@@ -244,7 +252,7 @@ function UsageSurface({ embedded = false }: { embedded?: boolean }) {
         <span style={{ fontWeight: 600 }}>Usage</span>
         <span className="faint">Updated {relativeTime(updatedAt)}</span>
         <span className="grow" />
-        <button className="btn-icon btn-sm" onClick={() => void load(true)} title="Refresh usage (bypass cache)" disabled={codexLoading || claudeLoading}>
+        <button type="button" className="btn-icon btn-sm" onClick={() => void load(true)} title="Refresh usage (bypass cache)" aria-label="Refresh usage" disabled={codexLoading || claudeLoading}>
           <Icon name="RefreshCw" size={12} />
         </button>
       </div>
@@ -263,7 +271,7 @@ function UsageSurface({ embedded = false }: { embedded?: boolean }) {
           <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
             <span className="faint grow">{codexLoading ? 'Reading Codex limits…' : codex?.message ?? 'Not available'}</span>
             {codex?.authRequired && !codexLoading && (
-              <button className="btn btn-primary btn-sm" onClick={signInCodex}>Sign in again</button>
+              <button type="button" className="btn btn-primary btn-sm" onClick={signInCodex}>Sign in again</button>
             )}
           </div>
         )}
@@ -339,7 +347,7 @@ function UsageSurface({ embedded = false }: { embedded?: boolean }) {
 
   return (
     <>
-      {!embedded && <button
+      {!embedded && <button type="button"
         ref={btnRef}
         className="btn-icon"
         data-active={open}

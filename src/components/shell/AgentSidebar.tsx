@@ -12,12 +12,12 @@ export function ShellTools({ includeSettings = true }: { includeSettings?: boole
   const openSettings = useKaisola((s) => s.setSettingsOpen)
   return (
     <>
-      <button className="btn-icon" onClick={() => openPalette()} title="Command palette  ⌘K">
+      <button type="button" className="btn-icon" onClick={() => openPalette()} title="Command palette  ⌘K" aria-label="Open command palette">
         <Icon name="Search" size={15} />
       </button>
       <LimitsButton />
       {includeSettings && (
-        <button className="btn-icon shell-settings-trigger" onClick={() => openSettings(true)} title="Settings  ⌘," aria-label="Open settings">
+        <button type="button" className="btn-icon shell-settings-trigger" onClick={() => openSettings(true)} title="Settings  ⌘," aria-label="Open settings">
           <Icon name="Settings" size={15} />
         </button>
       )}

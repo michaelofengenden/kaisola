@@ -1,7 +1,17 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState, type CSSProperties } from 'react'
 import { useKaisola } from '../../store/store'
 import { bridge, isDesktop } from '../../lib/bridge'
 import { Icon } from '../Icon'
+
+const MCP_DIALOG_STYLE = {
+  width: '100vw',
+  maxWidth: 'none',
+  height: '100vh',
+  maxHeight: 'none',
+  margin: 0,
+  border: 'none',
+  padding: '11vh 0 0',
+} satisfies CSSProperties
 
 /**
  * The trust gate for kaisola://mcp/install deeplinks (Cursor's install-link
@@ -14,12 +24,30 @@ import { Icon } from '../Icon'
 export function McpInstallModal() {
   const [req, setReq] = useState<{ name: string; config: Record<string, unknown> } | null>(null)
   const [busyMsg, setBusyMsg] = useState<string | null>(null)
+  const dialogRef = useRef<HTMLDialogElement>(null)
 
   useEffect(() => {
     const sub = bridge.mcp?.onInstallRequest
     if (!isDesktop || !sub) return
     return sub((r) => setReq(r))
   }, [])
+  useEffect(() => {
+    if (!req) return
+    const dialog = dialogRef.current
+    if (!dialog) return
+    const onBackdropMouseDown = (event: MouseEvent) => {
+      if (event.target === dialog) {
+        setReq(null)
+        setBusyMsg(null)
+      }
+    }
+    dialog.addEventListener('mousedown', onBackdropMouseDown)
+    if (!dialog.open) dialog.showModal()
+    return () => {
+      dialog.removeEventListener('mousedown', onBackdropMouseDown)
+      if (dialog.open) dialog.close()
+    }
+  }, [req])
 
   if (!req) return null
   const cfg = req.config
@@ -38,12 +66,18 @@ export function McpInstallModal() {
   }
 
   return (
-    <div className="focus-scrim" onMouseDown={close}>
-      <div className="focus-panel mcp-install" onMouseDown={(e) => e.stopPropagation()}>
+    <dialog
+      ref={dialogRef}
+      className="focus-scrim"
+      style={MCP_DIALOG_STYLE}
+      aria-labelledby="mcp-install-title"
+      onCancel={(event) => { event.preventDefault(); close() }}
+    >
+      <div className="focus-panel mcp-install">
         <header className="focus-head">
           <Icon name="PackagePlus" size={14} className="muted" />
-          <span className="grow">Add MCP server “{req.name}”?</span>
-          <button className="btn-icon btn-sm" onClick={close} aria-label="Close">
+          <span className="grow" id="mcp-install-title">Add MCP server “{req.name}”?</span>
+          <button type="button" className="btn-icon btn-sm" onClick={close} aria-label="Close">
             <Icon name="X" size={14} />
           </button>
         </header>
@@ -68,12 +102,12 @@ export function McpInstallModal() {
           {busyMsg && <p className="mcp-install-msg">{busyMsg}</p>}
         </div>
         <div className="mcp-install-actions">
-          <button className="btn btn-primary btn-sm" onClick={() => void install()}>
+          <button type="button" className="btn btn-primary btn-sm" onClick={() => void install()}>
             <Icon name="Check" size={13} /> Install
           </button>
-          <button className="btn btn-sm" onClick={close}>Cancel</button>
+          <button type="button" className="btn btn-sm" onClick={close}>Cancel</button>
         </div>
       </div>
-    </div>
+    </dialog>
   )
 }

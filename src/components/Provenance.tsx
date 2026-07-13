@@ -22,7 +22,7 @@ export function ProvenanceChip({
   const show = useKaisola((s) => s.showProvenance)
   if (links.length === 0) {
     return (
-      <button className="prov-chip prov-chip-empty" title="No evidence attached" disabled>
+      <button type="button" className="prov-chip prov-chip-empty" title="No evidence attached" disabled>
         <Icon name="Unlink" size={11} />
         unsupported
       </button>
@@ -30,6 +30,7 @@ export function ProvenanceChip({
   }
   return (
     <button
+      type="button"
       className="prov-chip"
       onClick={(e) => {
         const r = (e.currentTarget as HTMLElement).getBoundingClientRect()
@@ -48,7 +49,7 @@ export function ProvenancePopover() {
   const target = useKaisola((s) => s.provenance)
   const project = useKaisola((s) => s.project)
   const hide = useKaisola((s) => s.hideProvenance)
-  const ref = useRef<HTMLDivElement>(null)
+  const ref = useRef<HTMLDialogElement>(null)
 
   useEffect(() => {
     if (!target) return
@@ -72,17 +73,17 @@ export function ProvenancePopover() {
   const left = Math.min(x, window.innerWidth - 380)
 
   return (
-    <div
+    <dialog
+      open
       ref={ref}
       className="prov-pop"
-      style={{ left, top: y }}
-      role="dialog"
+      style={{ left, top: y, margin: 0, padding: 0 }}
       aria-label="Evidence"
     >
       <header className="prov-pop-head">
         <Icon name="ShieldCheck" size={13} />
         <span className="grow truncate">{target.title}</span>
-        <button className="btn-icon btn-sm" onClick={hide} aria-label="Close">
+        <button type="button" className="btn-icon btn-sm" onClick={hide} aria-label="Close evidence">
           <Icon name="X" size={13} />
         </button>
       </header>
@@ -127,6 +128,6 @@ export function ProvenancePopover() {
       <footer className="prov-pop-foot faint">
         Every claim must link to a citation, result, derivation, dataset, or note.
       </footer>
-    </div>
+    </dialog>
   )
 }

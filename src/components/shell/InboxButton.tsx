@@ -40,9 +40,13 @@ export function InboxButton() {
   const rows: Row[] = []
   if (enabled) {
     const st = useKaisola.getState()
+    const terminalById = new Map<string, (typeof st.terminals)[number]>()
+    const threadById = new Map<string, (typeof st.assistantThreads)[number]>()
+    for (const terminal of st.terminals) terminalById.set(terminal.id, terminal)
+    for (const thread of st.assistantThreads) threadById.set(thread.id, thread)
     for (const id of Object.keys(needsYou)) {
-      const term = st.terminals.find((t) => t.id === id)
-      const thread = st.assistantThreads.find((t) => t.id === id)
+      const term = terminalById.get(id)
+      const thread = threadById.get(id)
       rows.push({
         key: `ny:${id}`,
         sessionId: id,
@@ -55,7 +59,7 @@ export function InboxButton() {
       // Mesh workers are private tabs; their permission UI is aggregated on the
       // visible parent, so Inbox must never jump to the clipped child surface.
       const childId = p.key.split('::')[1]
-      const child = st.assistantThreads.find((thread) => thread.id === childId)
+      const child = threadById.get(childId)
       rows.push({ key: `perm:${p.permId}`, sessionId: child?.groupParentId ?? childId, icon: 'ShieldQuestion', label: p.title, detail: `${p.agent} · permission` })
     }
     for (const tab of projectTabs) {
@@ -107,6 +111,7 @@ export function InboxButton() {
   return (
     <div className="inbox-wrap">
       <button
+        type="button"
         ref={buttonRef}
         className="inbox-btn"
         onClick={() => setOpen((o) => !o)}
@@ -120,14 +125,14 @@ export function InboxButton() {
           <div ref={panelRef} className="inbox-menu">
             {rows.length === 0 && ledgerRows.length === 0 && <div className="inbox-empty">Nothing needs you.</div>}
             {rows.map((row) => (
-              <button key={row.key} className="inbox-row" onClick={() => jump(row)}>
+              <button type="button" key={row.key} className="inbox-row" onClick={() => jump(row)}>
                 <Icon name={row.icon} size={13} />
                 <span className="inbox-row-label truncate">{row.label}</span>
                 {row.detail && <span className="inbox-row-detail truncate">{row.detail}</span>}
               </button>
             ))}
             {ledgerRows.map((t) => (
-              <button key={`lg:${t.id}`} className="inbox-row" onClick={() => jump({ key: '', ledger: true, icon: '', label: '' })}>
+              <button type="button" key={`lg:${t.id}`} className="inbox-row" onClick={() => jump({ key: '', ledger: true, icon: '', label: '' })}>
                 <Icon name="ClipboardList" size={13} />
                 <span className="inbox-row-label truncate">{t.title}</span>
                 <span className="inbox-row-detail truncate">ledger · {t.status}</span>
@@ -135,6 +140,7 @@ export function InboxButton() {
             ))}
             {rows.length > 0 && (
               <button
+                type="button"
                 className="inbox-row inbox-clear"
                 onClick={() => { useKaisola.getState().clearInbox(); setOpen(false) }}
                 title="Dismiss the waiting badges (permission asks stay until answered)"

@@ -137,9 +137,11 @@ function applySettings(raw: unknown) {
   }
   if (Array.isArray(cfg.sessionTemplates)) {
     const existing = useKaisola.getState().sessionTemplates.filter((t) => !String(t.id).startsWith('cfg-'))
-    const fromFile = (cfg.sessionTemplates as SessionTemplate[])
-      .filter((t) => t && typeof t.name === 'string')
-      .map((t, i) => ({ ...t, id: `cfg-${t.id ?? i}` }))
+    const fromFile = (cfg.sessionTemplates as SessionTemplate[]).flatMap((template, index) => (
+      template && typeof template.name === 'string'
+        ? [{ ...template, id: `cfg-${template.id ?? index}` }]
+        : []
+    ))
     useKaisola.setState({ sessionTemplates: [...existing, ...fromFile] })
   }
 }

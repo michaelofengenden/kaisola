@@ -100,8 +100,11 @@ const EMPTY_MARKDOWN_SELECTION: MarkdownSelectionState = {
   ordered: false,
 }
 
-function markdownHtml(text: string) {
-  return renderToStaticMarkup(<ReactMarkdown remarkPlugins={[remarkGfm]}>{text}</ReactMarkdown>)
+function sanitizeMarkdownHtml(text: string) {
+  // ReactMarkdown escapes raw HTML by default. Run its serialized output
+  // through the same allowlist sanitizer as HTML previews as a second trust
+  // boundary before either contentEditable HTML sink receives it.
+  return sanitizeHtml(renderToStaticMarkup(<ReactMarkdown remarkPlugins={[remarkGfm]}>{text}</ReactMarkdown>), '')
 }
 
 function selectionBlock(node: Node | null, root: HTMLElement): MarkdownSelectionState['block'] {
@@ -141,8 +144,8 @@ function EditableMarkdownSurface({ text, sourcePath, onChange }: { text: string;
   // contentEditable must own its descendants while the user types. Giving
   // React a static HTML snapshot keeps reconciliation from replacing the
   // browser's live selection or undo stack after each onInput state update.
-  const html = useRef<string | null>(null)
-  if (html.current === null) html.current = markdownHtml(text)
+  const sanitizedMarkup = useRef<string | null>(null)
+  if (sanitizedMarkup.current === null) sanitizedMarkup.current = sanitizeMarkdownHtml(text)
   const surfaceRef = useRef<HTMLElement>(null)
   const savedRange = useRef<Range | null>(null)
   const emittedText = useRef(text)
@@ -216,9 +219,9 @@ function EditableMarkdownSurface({ text, sourcePath, onChange }: { text: string;
   useEffect(() => {
     const surface = surfaceRef.current
     if (!surface || text === emittedText.current || surface.contains(document.activeElement)) return
-    const next = markdownHtml(text)
+    const next = sanitizeMarkdownHtml(text)
     surface.innerHTML = next
-    html.current = next
+    sanitizedMarkup.current = next
     emittedText.current = text
     void hydrateEditableImages(surface, sourcePath)
   }, [sourcePath, text])
@@ -265,10 +268,10 @@ function EditableMarkdownSurface({ text, sourcePath, onChange }: { text: string;
   return (
     <>
       <div className="fx-md-toolbar" role="toolbar" aria-label="Markdown formatting">
-        <button onMouseDown={(event) => event.preventDefault()} onClick={() => runCommand('undo')} title="Undo  ⌘Z" aria-label="Undo">
+        <button type="button" onMouseDown={(event) => event.preventDefault()} onClick={() => runCommand('undo')} title="Undo  ⌘Z" aria-label="Undo">
           <Icon name="Undo2" size={14} />
         </button>
-        <button onMouseDown={(event) => event.preventDefault()} onClick={() => runCommand('redo')} title="Redo  ⇧⌘Z" aria-label="Redo">
+        <button type="button" onMouseDown={(event) => event.preventDefault()} onClick={() => runCommand('redo')} title="Redo  ⇧⌘Z" aria-label="Redo">
           <Icon name="Redo2" size={14} />
         </button>
         <span className="fx-md-toolbar-sep" />
@@ -287,29 +290,29 @@ function EditableMarkdownSurface({ text, sourcePath, onChange }: { text: string;
           <option value="pre">Code block</option>
         </select>
         <span className="fx-md-toolbar-sep" />
-        <button data-active={selectionState.bold || undefined} onMouseDown={(event) => event.preventDefault()} onClick={() => runCommand('bold')} title="Bold  ⌘B" aria-label="Bold">
+        <button type="button" data-active={selectionState.bold || undefined} onMouseDown={(event) => event.preventDefault()} onClick={() => runCommand('bold')} title="Bold  ⌘B" aria-label="Bold">
           <Icon name="Bold" size={14} />
         </button>
-        <button data-active={selectionState.italic || undefined} onMouseDown={(event) => event.preventDefault()} onClick={() => runCommand('italic')} title="Italic  ⌘I" aria-label="Italic">
+        <button type="button" data-active={selectionState.italic || undefined} onMouseDown={(event) => event.preventDefault()} onClick={() => runCommand('italic')} title="Italic  ⌘I" aria-label="Italic">
           <Icon name="Italic" size={14} />
         </button>
-        <button data-active={selectionState.strike || undefined} onMouseDown={(event) => event.preventDefault()} onClick={() => runCommand('strikeThrough')} title="Strikethrough" aria-label="Strikethrough">
+        <button type="button" data-active={selectionState.strike || undefined} onMouseDown={(event) => event.preventDefault()} onClick={() => runCommand('strikeThrough')} title="Strikethrough" aria-label="Strikethrough">
           <Icon name="Strikethrough" size={14} />
         </button>
-        <button onMouseDown={(event) => event.preventDefault()} onClick={createLink} title="Add link" aria-label="Add link">
+        <button type="button" onMouseDown={(event) => event.preventDefault()} onClick={createLink} title="Add link" aria-label="Add link">
           <Icon name="Link2" size={14} />
         </button>
         <span className="fx-md-toolbar-sep" />
-        <button data-active={selectionState.unordered || undefined} onMouseDown={(event) => event.preventDefault()} onClick={() => runCommand('insertUnorderedList')} title="Bulleted list" aria-label="Bulleted list">
+        <button type="button" data-active={selectionState.unordered || undefined} onMouseDown={(event) => event.preventDefault()} onClick={() => runCommand('insertUnorderedList')} title="Bulleted list" aria-label="Bulleted list">
           <Icon name="List" size={14} />
         </button>
-        <button data-active={selectionState.ordered || undefined} onMouseDown={(event) => event.preventDefault()} onClick={() => runCommand('insertOrderedList')} title="Numbered list" aria-label="Numbered list">
+        <button type="button" data-active={selectionState.ordered || undefined} onMouseDown={(event) => event.preventDefault()} onClick={() => runCommand('insertOrderedList')} title="Numbered list" aria-label="Numbered list">
           <Icon name="ListOrdered" size={14} />
         </button>
-        <button onMouseDown={(event) => event.preventDefault()} onClick={() => runCommand('formatBlock', '<blockquote>')} title="Quote" aria-label="Quote">
+        <button type="button" onMouseDown={(event) => event.preventDefault()} onClick={() => runCommand('formatBlock', '<blockquote>')} title="Quote" aria-label="Quote">
           <Icon name="Quote" size={14} />
         </button>
-        <button onMouseDown={(event) => event.preventDefault()} onClick={() => runCommand('formatBlock', '<pre>')} title="Code block" aria-label="Code block">
+        <button type="button" onMouseDown={(event) => event.preventDefault()} onClick={() => runCommand('formatBlock', '<pre>')} title="Code block" aria-label="Code block">
           <Icon name="Code2" size={14} />
         </button>
         <span className="fx-md-editing"><span /> Editing Markdown</span>
@@ -323,7 +326,7 @@ function EditableMarkdownSurface({ text, sourcePath, onChange }: { text: string;
         aria-multiline="true"
         aria-label="Edit Markdown document"
         spellCheck
-        dangerouslySetInnerHTML={{ __html: html.current }}
+        dangerouslySetInnerHTML={{ __html: sanitizedMarkup.current }}
         onInput={syncMarkdown}
         onKeyUp={captureSelection}
         onMouseUp={captureSelection}
@@ -417,9 +420,10 @@ function assetDirFor(sourcePath: string) {
 }
 
 function droppedMedia(event: DragEvent) {
-  return Array.from(event.dataTransfer?.files ?? [])
-    .map((file) => ({ name: file.name, path: bridge.pathForFile?.(file) ?? '' }))
-    .filter((f) => f.path && (IMAGE_DROP.test(f.path) || VIDEO_DROP.test(f.path)))
+  return Array.from(event.dataTransfer?.files ?? []).flatMap((file) => {
+    const item = { name: file.name, path: bridge.pathForFile?.(file) ?? '' }
+    return item.path && (IMAGE_DROP.test(item.path) || VIDEO_DROP.test(item.path)) ? [item] : []
+  })
 }
 
 function escapeAttr(value: string) {
@@ -580,7 +584,7 @@ const JSON_CHILD_LIMIT = 200
  * makes the worst-case DOM finite even when a small JSON file contains a very
  * broad or deeply nested structure.
  */
-export function buildPreviewJsonTree(value: unknown): { root: PreviewJsonNode; truncated: boolean; nodes: number } {
+function buildPreviewJsonTree(value: unknown): { root: PreviewJsonNode; truncated: boolean; nodes: number } {
   const makeNode = (item: unknown): PreviewJsonNode => {
     if (Array.isArray(item)) return { kind: 'array', total: item.length, children: [], truncated: false }
     if (item !== null && typeof item === 'object') return { kind: 'object', total: Object.keys(item as object).length, children: [], truncated: false }
@@ -719,6 +723,14 @@ function MarkdownImage({ src, alt, title, sourcePath }: { src?: string; alt?: st
   )
 }
 
+function MarkdownPreviewLink({ href, children, highlight }: { href?: string; children?: ReactNode; highlight: string }) {
+  const open = (event: React.MouseEvent<HTMLAnchorElement>) => {
+    event.preventDefault()
+    if (href) bridge.openExternal(href)
+  }
+  return <a href={href} onClick={open}>{highlightChildren(children, highlight)}</a>
+}
+
 export const DocumentPreview = memo(function DocumentPreview({ text, kind, sourcePath, highlight = '', onEdit, editable = false, onChange, scrollHeading }: DocumentPreviewProps) {
   const html = useMemo(() => (kind === 'html' ? sanitizeHtml(text, highlight) : ''), [kind, text, highlight])
   const table = useMemo(() => kind === 'csv' ? parseTable(text, sourcePath?.toLowerCase().endsWith('.tsv') ? '\t' : ',') : null, [kind, text, sourcePath])
@@ -828,17 +840,7 @@ export const DocumentPreview = memo(function DocumentPreview({ text, kind, sourc
         <ReactMarkdown
           remarkPlugins={[remarkGfm]}
           components={{
-            a: ({ href, children }) => (
-              <a
-                href={href}
-                onClick={(e) => {
-                  e.preventDefault()
-                  if (href) bridge.openExternal(href)
-                }}
-              >
-                {highlightChildren(children, highlight)}
-              </a>
-            ),
+            a: ({ href, children }) => <MarkdownPreviewLink href={href} highlight={highlight}>{children}</MarkdownPreviewLink>,
             img: ({ src, alt, title }) => (
               <MarkdownImage src={src} alt={alt} title={title} sourcePath={sourcePath} />
             ),

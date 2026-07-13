@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { useEffect, useMemo, useRef, useState, type CSSProperties } from 'react'
 import { useKaisola, sessionOrderIds, terminalOwnerMap } from '../../store/store'
 import { bridge } from '../../lib/bridge'
 import { fuzzyRank } from '../../lib/fuzzy'
@@ -20,6 +20,15 @@ interface OmniAction {
 // working (bbc.co.uk, example.fr, x.tech); a path or scheme always wins as a URL.
 const BARE_FILE = /^[\w-]+(\.[\w-]+)*\.(tsx?|jsx?|mjs|cjs|json|mdx?|py|rb|go|rs|css|s[ac]ss|less|html?|xml|txt|ya?ml|toml|lock|sh|zsh|bash|env|log|c|h|hpp|cpp|cc|java|kt|php|swift|sql|csv|tsv|svg|png|jpe?g|gif|webp|pdf|ipynb)$/i
 const URLish = /^(https?:\/\/\S+|localhost(:\d+)?(\/\S*)?|[\w.-]+\.[a-z]{2,}(:\d+)?(\/\S*)?)$/i
+const OMNI_DIALOG_STYLE: CSSProperties = {
+  width: '100vw',
+  maxWidth: 'none',
+  height: '100vh',
+  maxHeight: 'none',
+  margin: 0,
+  border: 'none',
+  padding: '18vh 0 0',
+}
 
 /**
  * Write to a terminal's pty, retrying until it exists — a put-away terminal
@@ -58,19 +67,32 @@ export function OmniBar() {
   const { all: agents } = useAgentRegistry()
   const [q, setQ] = useState('')
   const [active, setActive] = useState(0)
+  const dialogRef = useRef<HTMLDialogElement>(null)
   const inputRef = useRef<HTMLInputElement>(null)
 
   useEffect(() => {
     if (open) {
+      const dialog = dialogRef.current
+      const onBackdropMouseDown = (event: MouseEvent) => {
+        if (event.target === dialog) setOpen(false)
+      }
+      dialog?.addEventListener('mousedown', onBackdropMouseDown)
+      if (dialog && !dialog.open) dialog.showModal()
       setQ('')
       setActive(0)
-      setTimeout(() => inputRef.current?.focus(), 0)
+      const focusTimer = setTimeout(() => inputRef.current?.focus(), 0)
+      return () => {
+        clearTimeout(focusTimer)
+        dialog?.removeEventListener('mousedown', onBackdropMouseDown)
+        if (dialog?.open) dialog.close()
+      }
     }
-  }, [open])
+  }, [open, setOpen])
 
   const actions = useMemo<OmniAction[]>(() => {
     if (!open) return []
     const s = useKaisola.getState()
+    const visibleDockIds = new Set(dockViews)
     const close = () => setOpen(false)
     const text = q.trim()
     const bare = text.replace(/^[$!]\s*/, '')
@@ -87,9 +109,10 @@ export function OmniBar() {
       if (p) return { label: p.kind === 'git' ? 'Commit' : p.title ?? p.url ?? 'Browser', icon: p.kind === 'git' ? 'GitCommitHorizontal' : 'Globe' }
       return null
     }
-    const sessions = sessionOrderIds(s)
-      .map((id) => ({ id, ...(labelOf(id) ?? { label: '', icon: '' }) }))
-      .filter((x) => x.label)
+    const sessions = sessionOrderIds(s).flatMap((id) => {
+      const label = labelOf(id)
+      return label ? [{ id, ...label }] : []
+    })
     const jumps: OmniAction[] = (text
       ? fuzzyRank(text, sessions, (x) => x.label).map((r) => r.item)
       : sessions
@@ -108,7 +131,7 @@ export function OmniBar() {
     // run in a PLAIN shell — an agent-singleton terminal is a REPL, and shell
     // text typed into claude would become a prompt, not an exec
     const plain = terminals.filter((t) => !t.singletonKey?.startsWith('agent:') && !t.singletonKey?.startsWith('wt:'))
-    const termTarget = plain.find((t) => dockViews.includes(t.id)) ?? plain[0]
+    const termTarget = plain.find((t) => visibleDockIds.has(t.id)) ?? plain[0]
     const run: OmniAction = {
       id: 'run',
       icon: 'SquareTerminal',
@@ -123,7 +146,7 @@ export function OmniBar() {
 
     // ask an agent — the first visible thread, else the claude terminal's pty,
     // else a fresh thread on the first ACP agent in the menu
-    const threadTarget = threads.find((t) => dockViews.includes(t.id)) ?? threads[0]
+    const threadTarget = threads.find((t) => visibleDockIds.has(t.id)) ?? threads[0]
     const claudeTerm = terminals.find((t) => t.singletonKey === 'agent:claude-code')
     const ask: OmniAction = {
       id: 'ask',
@@ -172,8 +195,6 @@ export function OmniBar() {
     return [...jumps, ask, run]
   }, [open, q, threads, terminals, agentTerminals, panels, dockViews, agents, setOpen])
 
-  useEffect(() => { setActive(0) }, [q])
-
   if (!open) return null
 
   const onKey = (e: React.KeyboardEvent) => {
@@ -184,15 +205,21 @@ export function OmniBar() {
   }
 
   return (
-    <div className="palette-overlay omni-overlay" onMouseDown={() => setOpen(false)}>
-      <div className="omni" onMouseDown={(e) => e.stopPropagation()}>
+    <dialog
+      ref={dialogRef}
+      className="palette-overlay omni-overlay"
+      style={OMNI_DIALOG_STYLE}
+      aria-label="Quick actions"
+      onCancel={(e) => { e.preventDefault(); setOpen(false) }}
+    >
+      <div className="omni">
         <div className="omni-inputrow">
           <Icon name="Command" size={14} className="muted" />
           <input
             ref={inputRef}
             className="omni-input"
             value={q}
-            onChange={(e) => setQ(e.target.value)}
+            onChange={(e) => { setQ(e.target.value); setActive(0) }}
             onKeyDown={onKey}
             placeholder="Jump to a session · ask an agent · $ run a command · open a URL"
             spellCheck={false}
@@ -201,7 +228,7 @@ export function OmniBar() {
         {actions.length > 0 && (
           <div className="omni-list">
             {actions.map((a, i) => (
-              <button
+              <button type="button"
                 key={a.id}
                 className="palette-item omni-item"
                 data-active={i === active}
@@ -216,6 +243,6 @@ export function OmniBar() {
           </div>
         )}
       </div>
-    </div>
+    </dialog>
   )
 }

@@ -51,8 +51,10 @@ const turnsAfter = (runtime: AssistantRuntime | undefined, baseline = 0, legacyS
 
 const responseAfter = (runtime: AssistantRuntime | undefined, baseline = 0, legacyStartedAt = 0): string =>
   turnsAfter(runtime, baseline, legacyStartedAt)
-    .filter((turn) => turn.kind === 'assistant' && turn.text.trim())
-    .map((turn) => turn.text.trim())
+    .flatMap((turn) => {
+      const text = turn.text.trim()
+      return turn.kind === 'assistant' && text ? [text] : []
+    })
     .join('\n\n')
     .slice(-MAX_SHARED_TEXT)
 
@@ -144,7 +146,7 @@ export const GroupAssistant = memo(function GroupAssistant({ threadId }: { threa
   const [cleanupFailed, setCleanupFailed] = useState(false)
   const group = thread?.group
   const transitioning = !!group?.operation
-  const members = group?.members ?? []
+  const members = useMemo(() => group?.members ?? [], [group?.members])
   const phase = group?.phase ?? 'idle'
   const startOperation = (
     kind: NonNullable<GroupSessionState['operation']>['kind'],
@@ -498,6 +500,7 @@ export const GroupAssistant = memo(function GroupAssistant({ threadId }: { threa
       // cannot prove quiescence, fail closed by recycling the adapter.
       const keyFor = (member: GroupSessionMember) => `${member.agentKey}::${member.threadId}`
       const pendingKeys = new Set(initialPending.map(keyFor))
+      const pendingThreadIds = new Set(initialPending.map((member) => member.threadId))
       const providerState = async () => {
         try {
           const status = await bridge.acp.status([...pendingKeys], projectId)
@@ -511,9 +514,9 @@ export const GroupAssistant = memo(function GroupAssistant({ threadId }: { threa
       }
       let authoritative = await providerState()
       if (!operationStillCurrent(operationId)) return
-      const liveBusy = () => new Set(useKaisola.getState().assistantThreads
-        .filter((candidate) => initialPending.some((member) => member.threadId === candidate.id) && candidate.busy)
-        .map((candidate) => candidate.id))
+      const liveBusy = () => new Set(useKaisola.getState().assistantThreads.flatMap((candidate) =>
+        pendingThreadIds.has(candidate.id) && candidate.busy ? [candidate.id] : [],
+      ))
       const oldTurnMembers = initialPending.filter((member) => liveBusy().has(member.threadId) || authoritative.busy.has(keyFor(member)))
       if (oldTurnMembers.length) {
         await Promise.all(oldTurnMembers.map((member) => bridge.acp.cancel(keyFor(member), projectId).catch(() => ({ ok: false }))))
@@ -975,10 +978,10 @@ export const GroupAssistant = memo(function GroupAssistant({ threadId }: { threa
                       .filter((option) => !effort || effort.options.some((providerOption) => providerOption.value === option.value))
                       .map((option) => <option value={option.value} key={option.value}>{option.label}</option>)}
                   </select>}
-                  {members.length > 2 && <button className="btn-icon" onClick={() => {
+                  {members.length > 2 && <button type="button" className="btn-icon" onClick={() => {
                     void bridge.acp.disconnect(`${member.agentKey}::${member.threadId}`, projectId)
                     removeGroupMember(threadId, member.threadId, projectId)
-                  }} title={`Remove ${member.label}`}><Icon name="X" size={12} /></button>}
+                  }} title={`Remove ${member.label}`} aria-label={`Remove ${member.label}`}><Icon name="X" size={12} /></button>}
                 </div>
               })}
               <select
@@ -1054,19 +1057,19 @@ export const GroupAssistant = memo(function GroupAssistant({ threadId }: { threa
       </div>
 
       <footer className="group-composer">
-        {cleanupFailed && <button className="group-action" onClick={() => setRecoveryNonce((value) => value + 1)}><Icon name="RefreshCw" size={14} /> Retry safe worktree cleanup</button>}
+        {cleanupFailed && <button type="button" className="group-action" onClick={() => setRecoveryNonce((value) => value + 1)}><Icon name="RefreshCw" size={14} /> Retry safe worktree cleanup</button>}
         {phase === 'idle' && <><textarea value={draft} onChange={(event) => setDraft(event.target.value)} placeholder="Give Claude and Codex one mission…" aria-label="Mesh mission" rows={2} />{workspacePath
-          ? <button className="group-primary" onClick={askBoth} disabled={!draft.trim()} title="Start independent scouting" aria-label="Start independent scouting"><Icon name="ArrowUp" size={15} /></button>
-          : <button className="group-primary" onClick={() => { void chooseMeshWorkspace() }} title="Choose one project folder before starting Mesh" aria-label="Choose a project folder before starting Mesh"><Icon name="FolderOpen" size={15} /></button>}</>}
-        {phase === 'ready' && <button className="group-action" onClick={negotiate}><Icon name="MessageSquarePlus" size={14} /> Compare approaches and negotiate roles</button>}
-        {(phase === 'plan-ready' || phase === 'review-ready') && <button className="group-action" onClick={writeRoleContract}><Icon name="ClipboardList" size={14} /> Approve negotiation and write role contract</button>}
-        {phase === 'assigned' && <button className="group-action" onClick={() => void executeIsolated()} disabled={transitioning}><Icon name="GitBranch" size={14} /> Approve plan and create isolated worktrees</button>}
-        {phase === 'execution-ready' && <button className="group-action" onClick={() => void crossReview()} disabled={transitioning}><Icon name="ScanSearch" size={14} /> Cross-review both implementations</button>}
-        {phase === 'merge-ready' && <button className="group-action" onClick={() => void integrate()} disabled={transitioning}><Icon name="GitMerge" size={14} /> Approve and integrate reviewed work</button>}
-        {phase === 'done' && <button className="group-action" onClick={requestNewGroup}><Icon name="Plus" size={14} /> Start another group session</button>}
-        {group.paused && <button className="group-action" onClick={() => { void continueStage() }} disabled={transitioning}><Icon name="Play" size={14} /> {transitioning ? 'Waiting for agents to stop…' : `Continue ${group.pausedPending?.length ? `${group.pausedPending.length} unfinished ${group.pausedPending.length === 1 ? 'agent' : 'agents'}` : 'stage'}`}</button>}
+          ? <button type="button" className="group-primary" onClick={askBoth} disabled={!draft.trim()} title="Start independent scouting" aria-label="Start independent scouting"><Icon name="ArrowUp" size={15} /></button>
+          : <button type="button" className="group-primary" onClick={() => { void chooseMeshWorkspace() }} title="Choose one project folder before starting Mesh" aria-label="Choose a project folder before starting Mesh"><Icon name="FolderOpen" size={15} /></button>}</>}
+        {phase === 'ready' && <button type="button" className="group-action" onClick={negotiate}><Icon name="MessageSquarePlus" size={14} /> Compare approaches and negotiate roles</button>}
+        {(phase === 'plan-ready' || phase === 'review-ready') && <button type="button" className="group-action" onClick={writeRoleContract}><Icon name="ClipboardList" size={14} /> Approve negotiation and write role contract</button>}
+        {phase === 'assigned' && <button type="button" className="group-action" onClick={() => void executeIsolated()} disabled={transitioning}><Icon name="GitBranch" size={14} /> Approve plan and create isolated worktrees</button>}
+        {phase === 'execution-ready' && <button type="button" className="group-action" onClick={() => void crossReview()} disabled={transitioning}><Icon name="ScanSearch" size={14} /> Cross-review both implementations</button>}
+        {phase === 'merge-ready' && <button type="button" className="group-action" onClick={() => void integrate()} disabled={transitioning}><Icon name="GitMerge" size={14} /> Approve and integrate reviewed work</button>}
+        {phase === 'done' && <button type="button" className="group-action" onClick={requestNewGroup}><Icon name="Plus" size={14} /> Start another group session</button>}
+        {group.paused && <button type="button" className="group-action" onClick={() => { void continueStage() }} disabled={transitioning}><Icon name="Play" size={14} /> {transitioning ? 'Waiting for agents to stop…' : `Continue ${group.pausedPending?.length ? `${group.pausedPending.length} unfinished ${group.pausedPending.length === 1 ? 'agent' : 'agents'}` : 'stage'}`}</button>}
         {(running || transitioning) && <span className="group-running" role="status" aria-live="polite"><span className="session-busy" /> {transitioning ? 'Preparing safe transition' : phaseLabel[phase]}…</span>}
-        {running && <button className="group-stop" onClick={() => { void pauseStage() }} title="Stop all unfinished Mesh agents and keep this checkpoint"><Icon name="Square" size={11} /> Stop</button>}
+        {running && <button type="button" className="group-stop" onClick={() => { void pauseStage() }} title="Stop all unfinished Mesh agents and keep this checkpoint"><Icon name="Square" size={11} /> Stop</button>}
       </footer>
 
       <div className="group-workers" aria-hidden="true" ref={(element) => element?.setAttribute('inert', '')}>

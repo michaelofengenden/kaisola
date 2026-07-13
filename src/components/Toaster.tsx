@@ -42,7 +42,7 @@ function ToastItem({
     <div className="toast" data-kind={kind} role="status">
       <span className="toast-accent" />
       <span className="toast-text" title={text}>{text}</span>
-      <button className="toast-dismiss" onClick={() => onDismiss(id)} aria-label="Dismiss">
+      <button type="button" className="toast-dismiss" onClick={() => onDismiss(id)} aria-label="Dismiss notification">
         <Icon name="X" size={12} />
       </button>
     </div>

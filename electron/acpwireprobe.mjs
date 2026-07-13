@@ -3,33 +3,16 @@
 // HttpHeader[] ({name,value} pairs). Speaks raw line-delimited JSON-RPC to
 // the real agent binaries, old shape vs new shape vs none.
 import { spawn } from 'node:child_process'
+import { randomBytes, timingSafeEqual } from 'node:crypto'
 import http from 'node:http'
+import path from 'node:path'
+import { fileURLToPath } from 'node:url'
 
-const CWD = '/Users/michaelofengenden/Documents/Kaisola'
+const CWD = path.dirname(path.dirname(fileURLToPath(import.meta.url)))
 const AGENTS = [
   { id: 'claude', cmd: 'npx', args: ['-y', '@zed-industries/claude-code-acp'] },
   { id: 'codex', cmd: 'npx', args: ['-y', '@zed-industries/codex-acp'] },
 ]
-
-// a stand-in MCP endpoint so agents that eagerly dial the URL get a socket
-const mcpSrv = http.createServer((req, res) => {
-  let body = ''
-  req.on('data', (d) => (body += d))
-  req.on('end', () => {
-    let id = null
-    try { id = JSON.parse(body).id ?? null } catch { /* notification */ }
-    res.setHeader('content-type', 'application/json')
-    res.end(JSON.stringify({ jsonrpc: '2.0', id, result: { capabilities: {}, protocolVersion: '2025-03-26', serverInfo: { name: 'probe', version: '0' } } }))
-  })
-})
-await new Promise((r) => mcpSrv.listen(0, '127.0.0.1', r))
-const url = `http://127.0.0.1:${mcpSrv.address().port}/`
-
-const SHAPES = {
-  oldObj: [{ type: 'http', name: 'kaisola', url, headers: { Authorization: 'Bearer probe' } }],
-  newArr: [{ type: 'http', name: 'kaisola', url, headers: [{ name: 'Authorization', value: 'Bearer probe' }] }],
-  none: [],
-}
 
 function once(agent, shapeName, mcpServers) {
   return new Promise((resolve) => {
@@ -83,10 +66,134 @@ function once(agent, shapeName, mcpServers) {
   })
 }
 
-for (const agent of AGENTS) {
-  for (const [name, servers] of Object.entries(SHAPES)) {
-    const r = await once(agent, name, servers)
-    console.log(JSON.stringify(r))
+const MAX_REQUEST_BYTES = 1024 * 1024
+// This probe is for native ACP clients only. An empty exact allowlist means any
+// browser Origin is rejected after parsing; native requests omit Origin.
+const ALLOWED_BROWSER_ORIGINS = new Set()
+
+const sendJson = (res, statusCode, body) => {
+  res.statusCode = statusCode
+  res.setHeader('content-type', 'application/json')
+  res.end(JSON.stringify(body))
+}
+
+const hasAllowedOrigin = (origin) => {
+  if (origin == null) return true
+  try {
+    return ALLOWED_BROWSER_ORIGINS.has(new URL(origin).origin)
+  } catch {
+    return false
   }
 }
-mcpSrv.close()
+
+const hasValidToken = (authorization, token) => {
+  const actual = Buffer.from(typeof authorization === 'string' ? authorization : '', 'utf8')
+  const expected = Buffer.from(`Bearer ${token}`, 'utf8')
+  return actual.length === expected.length && timingSafeEqual(actual, expected)
+}
+
+const rpcResult = (message) => {
+  if (message.method === 'initialize') {
+    return {
+      capabilities: {},
+      protocolVersion: '2025-03-26',
+      serverInfo: { name: 'probe', version: '0' },
+    }
+  }
+  if (message.method === 'ping') return {}
+  if (message.method === 'tools/list') return { tools: [] }
+  if (message.method === 'resources/list') return { resources: [] }
+  if (message.method === 'prompts/list') return { prompts: [] }
+  return null
+}
+
+export function createProbeServer(token) {
+  if (typeof token !== 'string' || token.length < 32) throw new Error('Probe token must contain at least 32 characters')
+  return http.createServer((req, res) => {
+    if (req.method !== 'POST' || req.url !== '/') {
+      res.statusCode = 404
+      res.end()
+      return
+    }
+    if (!hasAllowedOrigin(req.headers.origin)) {
+      sendJson(res, 403, { error: 'Browser origins are not allowed' })
+      return
+    }
+    if (!hasValidToken(req.headers.authorization, token)) {
+      sendJson(res, 401, { error: 'Invalid probe token' })
+      return
+    }
+
+    let body = ''
+    let tooLarge = false
+    req.on('data', (chunk) => {
+      if (tooLarge) return
+      body += chunk
+      if (Buffer.byteLength(body, 'utf8') > MAX_REQUEST_BYTES) {
+        tooLarge = true
+        body = ''
+      }
+    })
+    req.on('end', () => {
+      if (tooLarge) {
+        sendJson(res, 413, { error: 'Probe request is too large' })
+        return
+      }
+      let message
+      try {
+        message = JSON.parse(body)
+      } catch {
+        sendJson(res, 400, { error: 'Invalid JSON' })
+        return
+      }
+      if (message?.jsonrpc !== '2.0' || typeof message.method !== 'string') {
+        sendJson(res, 400, { error: 'Invalid JSON-RPC request' })
+        return
+      }
+      if (message.method === 'notifications/initialized' && message.id == null) {
+        res.statusCode = 202
+        res.end()
+        return
+      }
+      const result = rpcResult(message)
+      if (result == null) {
+        sendJson(res, 200, { jsonrpc: '2.0', id: message.id ?? null, error: { code: -32601, message: 'Method not found' } })
+        return
+      }
+      sendJson(res, 200, { jsonrpc: '2.0', id: message.id ?? null, result })
+    })
+  })
+}
+
+async function main() {
+  const probeToken = randomBytes(32).toString('base64url')
+  const mcpSrv = createProbeServer(probeToken)
+  await new Promise((resolve, reject) => {
+    mcpSrv.once('error', reject)
+    mcpSrv.listen(0, '127.0.0.1', resolve)
+  })
+  const address = mcpSrv.address()
+  if (!address || typeof address === 'string') throw new Error('Probe server did not receive a TCP address')
+  const url = `http://127.0.0.1:${address.port}/`
+
+  const shapes = {
+    oldObj: [{ type: 'http', name: 'kaisola', url, headers: { Authorization: `Bearer ${probeToken}` } }],
+    newArr: [{ type: 'http', name: 'kaisola', url, headers: [{ name: 'Authorization', value: `Bearer ${probeToken}` }] }],
+    none: [],
+  }
+
+  try {
+    for (const agent of AGENTS) {
+      for (const [name, servers] of Object.entries(shapes)) {
+        const result = await once(agent, name, servers)
+        console.log(JSON.stringify(result))
+      }
+    }
+  } finally {
+    await new Promise((resolve, reject) => mcpSrv.close((error) => error ? reject(error) : resolve()))
+  }
+}
+
+if (process.argv[1] && fileURLToPath(import.meta.url) === path.resolve(process.argv[1])) {
+  await main()
+}

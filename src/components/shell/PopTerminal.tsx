@@ -49,7 +49,7 @@ export function PopTerminal({ termId }: { termId: string }) {
         style={POP_WINDOW_HUE ? ({ '--sid': POP_WINDOW_HUE } as React.CSSProperties) : undefined}
       >
         <div className="pane-head pop-head">
-          <button className="pop-light" onClick={() => bridge.winCtl('close')} title="Close — the card returns to its window" />
+          <button type="button" className="pop-light" onClick={() => bridge.winCtl('close')} title="Close — the card returns to its window" aria-label="Close popped-out terminal" />
           <Icon name="SquareTerminal" size={12} className="pane-head-icon" />
           <span className="pane-head-title truncate">{title}</span>
           {sub && <span className="pane-head-sub truncate">{sub}</span>}

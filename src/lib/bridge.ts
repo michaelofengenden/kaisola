@@ -1363,9 +1363,10 @@ function scopeAcp(acp: KaisolaBridge['acp']): KaisolaBridge['acp'] {
     status: async (clientKeys, explicitScope) => {
       const scopeForCall = explicitScope ?? (acpScope.current || undefined)
       const res = await acp.status(clientKeys, scopeForCall)
-      const agents = (res.agents ?? [])
-        .map((a) => { const { key, scope } = splitScopedKey(a.key); return { ...a, key, scope } })
-        .filter((a) => !a.scope || a.scope === (scopeForCall ?? ''))
+      const agents = (res.agents ?? []).flatMap((agent) => {
+        const { key, scope } = splitScopedKey(agent.key)
+        return !scope || scope === (scopeForCall ?? '') ? [{ ...agent, key, scope }] : []
+      })
       return { ...res, agents }
     },
     connect: (config) => acp.connect({ ...config, scope: config.scope ?? (acpScope.current || undefined) }),

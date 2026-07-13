@@ -1,5 +1,6 @@
-import { useEffect, useRef } from 'react'
+import { useCallback, useEffect, useRef } from 'react'
 import { useKaisola } from '../store/store'
+import { useClickAway } from '../lib/useClickAway'
 import { ProposalCard } from './ProposalCard'
 import { Icon } from './Icon'
 import type { Proposal } from '../domain/types'
@@ -29,6 +30,7 @@ export function ReviewFocus() {
   const pickWinner = useKaisola((s) => s.pickWinner)
   const synthesizeProposals = useKaisola((s) => s.synthesizeProposals)
   const panelRef = useRef<HTMLDivElement>(null)
+  const dismissTriggerRef = useRef<HTMLElement>(null)
   // j/k hunk cursor — DOM-walked ([data-hunknav]) so it needs no state coupling
   const navRef = useRef(-1)
 
@@ -43,6 +45,8 @@ export function ReviewFocus() {
   const canSynthesize = isCompare && !competing.some((p) => p.agentId === 'human')
   const pending = proposal?.status === 'pending'
   const isFilePatch = !!proposal?.changes.some((c) => c.entityType === 'file')
+  const dismiss = useCallback(() => close(null), [close])
+  useClickAway(!!id, dismiss, dismissTriggerRef, panelRef)
 
   useEffect(() => { navRef.current = -1 }, [id])
   useEffect(() => {
@@ -51,7 +55,6 @@ export function ReviewFocus() {
     // (merge for file patches), r rejects, Esc dismisses without deciding.
     // Compare mode keeps a/r off — picking a winner must stay deliberate.
     const onKey = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') { close(null); return }
       if (e.metaKey || e.ctrlKey || e.altKey) return
       const t = e.target as HTMLElement | null
       if (t?.closest('input, textarea, select, [contenteditable="true"]')) return
@@ -80,22 +83,22 @@ export function ReviewFocus() {
     }
     document.addEventListener('keydown', onKey)
     return () => document.removeEventListener('keydown', onKey)
-  }, [id, close, isCompare, pending, isFilePatch, proposal])
+  }, [id, isCompare, pending, isFilePatch, proposal])
 
   if (!id || !proposal) return null
 
   return (
-    <div className="focus-scrim" onMouseDown={() => close(null)}>
-      <div ref={panelRef} className={`focus-panel${isCompare ? ' focus-panel-wide' : ''}`} onMouseDown={(e) => e.stopPropagation()}>
+    <div className="focus-scrim">
+      <div ref={panelRef} className={`focus-panel${isCompare ? ' focus-panel-wide' : ''}`}>
         <header className="focus-head">
           <Icon name={isCompare ? 'Columns3' : 'GitPullRequestArrow'} size={14} className="muted" />
           <span className="grow">{isCompare ? `Best-of-${competing.length}: pick the winner — the rest are rejected` : 'Review decision'}</span>
           {canSynthesize && (
-            <button className="btn btn-sm" onClick={() => synthesizeProposals(competing.map((p) => p.id))}>
+            <button type="button" className="btn btn-sm" onClick={() => synthesizeProposals(competing.map((p) => p.id))}>
               <Icon name="GitMerge" size={13} /> Synthesize
             </button>
           )}
-          <button className="btn-icon btn-sm" onClick={() => close(null)} aria-label="Close">
+          <button type="button" className="btn-icon btn-sm" onClick={() => close(null)} aria-label="Close review">
             <Icon name="X" size={14} />
           </button>
         </header>
@@ -106,7 +109,7 @@ export function ReviewFocus() {
                 <div key={p.id} className="compare-col">
                   <div className="compare-col-head">
                     <span className="compare-seed">Option {i + 1}</span>
-                    <button className="btn btn-primary btn-sm" onClick={() => pickWinner(p.id)}>
+                    <button type="button" className="btn btn-primary btn-sm" onClick={() => pickWinner(p.id)}>
                       <Icon name="Crown" size={13} /> Pick this
                     </button>
                   </div>

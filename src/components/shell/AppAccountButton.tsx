@@ -9,7 +9,7 @@ export function AppAccountButton({ showLabel = false }: { showLabel?: boolean })
   const openSettings = useKaisola((s) => s.setSettingsOpen)
   const [status, setStatus] = useState<AppAuthStatus | null>(null)
   const [open, setOpen] = useState(false)
-  const [imageBroken, setImageBroken] = useState(false)
+  const [failedAvatarUrl, setFailedAvatarUrl] = useState<string | null>(null)
   const [pos, setPos] = useState<{ left?: number; right?: number; top?: number; bottom?: number }>({ right: 8, top: 42 })
   const button = useRef<HTMLButtonElement>(null)
   const panel = useRef<HTMLDivElement>(null)
@@ -22,10 +22,9 @@ export function AppAccountButton({ showLabel = false }: { showLabel?: boolean })
     const off = bridge.appAuth.onChanged((next) => { if (alive) setStatus(next) })
     return () => { alive = false; off() }
   }, [])
-  useEffect(() => { setImageBroken(false) }, [status?.profile?.avatarUrl])
-
   const profile = status?.profile
   if (!profile) return null
+  const imageBroken = failedAvatarUrl === profile.avatarUrl
   const initial = (profile.name || profile.email).trim().charAt(0).toUpperCase() || 'U'
   const toggle = () => {
     if (!open) {
@@ -48,7 +47,7 @@ export function AppAccountButton({ showLabel = false }: { showLabel?: boolean })
 
   return (
     <>
-      <button
+      <button type="button"
         ref={button}
         className="app-account-avatar"
         data-label={showLabel || undefined}
@@ -58,7 +57,7 @@ export function AppAccountButton({ showLabel = false }: { showLabel?: boolean })
         aria-label="Kaisola account"
       >
         {profile.avatarUrl && !imageBroken
-          ? <img src={profile.avatarUrl} alt="" referrerPolicy="no-referrer" onError={() => setImageBroken(true)} />
+          ? <img src={profile.avatarUrl} alt="" referrerPolicy="no-referrer" onError={() => setFailedAvatarUrl(profile.avatarUrl ?? null)} />
           : <span className="app-account-initial">{initial}</span>}
         {showLabel && <span className="app-account-name truncate">{profile.name || profile.email}</span>}
       </button>
@@ -71,7 +70,7 @@ export function AppAccountButton({ showLabel = false }: { showLabel?: boolean })
           <div className="app-account-card">
             <div className="app-account-avatar app-account-avatar-large" aria-hidden>
               {profile.avatarUrl && !imageBroken
-                ? <img src={profile.avatarUrl} alt="" referrerPolicy="no-referrer" onError={() => setImageBroken(true)} />
+                ? <img src={profile.avatarUrl} alt="" referrerPolicy="no-referrer" onError={() => setFailedAvatarUrl(profile.avatarUrl ?? null)} />
                 : <span className="app-account-initial">{initial}</span>}
             </div>
             <div className="app-account-copy">
@@ -83,13 +82,13 @@ export function AppAccountButton({ showLabel = false }: { showLabel?: boolean })
             </div>
           </div>
           <div className="tree-menu-sep" />
-          <button onClick={() => { setOpen(false); openSettings(true, 'usage') }}>
+          <button type="button" onClick={() => { setOpen(false); openSettings(true, 'usage') }}>
             <Icon name="Gauge" size={13} /> Usage
           </button>
-          <button onClick={() => { setOpen(false); openSettings(true, 'general') }}>
+          <button type="button" onClick={() => { setOpen(false); openSettings(true, 'general') }}>
             <Icon name="Settings" size={13} /> Account settings
           </button>
-          <button onClick={() => { void signOut() }}>
+          <button type="button" onClick={() => { void signOut() }}>
             <Icon name="LogOut" size={13} /> Sign out
           </button>
         </div>

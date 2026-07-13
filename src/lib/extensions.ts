@@ -109,12 +109,12 @@ export function extensionCatalogSources(): ExtensionCatalogSource[] {
 }
 
 const defaultInstalled = () => Object.fromEntries(
-  BUILTIN_EXTENSIONS.filter((extension) => extension.defaultInstalled).map((extension) => [extension.id, {
+  BUILTIN_EXTENSIONS.flatMap((extension) => extension.defaultInstalled ? [[extension.id, {
     version: extension.version,
     installedAt: 0,
     enabled: true,
     source: 'bundled' as const,
-  }]),
+  }] as const] : []),
 )
 
 function readState(): ExtensionState {
@@ -263,11 +263,11 @@ export async function hydrateExtensions(): Promise<string[]> {
 
 function cleanExtensions(value: unknown) {
   if (!Array.isArray(value)) return []
-  return value
-    .filter((item): item is string => typeof item === 'string')
-    .map((item) => item.toLowerCase().replace(/^\./, '').trim())
-    .filter((item) => /^[a-z0-9][a-z0-9+_-]{0,15}$/.test(item))
-    .slice(0, 24)
+  return value.flatMap((item) => {
+    if (typeof item !== 'string') return []
+    const extension = item.toLowerCase().replace(/^\./, '').trim()
+    return /^[a-z0-9][a-z0-9+_-]{0,15}$/.test(extension) ? [extension] : []
+  }).slice(0, 24)
 }
 
 function cleanStrings(value: unknown, limit = 128) {

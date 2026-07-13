@@ -41,7 +41,7 @@ export function LatexBar({ inline = false }: { inline?: boolean } = {}) {
     let cancelled = false
     void bridge.fs.search(workspacePath, '.tex').then(async (r) => {
       if (cancelled) return
-      const found = (r.entries ?? []).filter((e: FsEntry) => !e.dir && e.path.endsWith('.tex')).map((e) => e.path)
+      const found = (r.entries ?? []).flatMap((entry: FsEntry) => !entry.dir && entry.path.endsWith('.tex') ? [entry.path] : [])
       setTexFiles(found)
       // a persisted main that no longer exists (renamed/moved since) must not
       // shadow the real files — Build against it fails with "Pick a .tex"
@@ -183,6 +183,7 @@ export function LatexBar({ inline = false }: { inline?: boolean } = {}) {
 
   const issues = result && !result.ok ? result.errors ?? [] : []
   const issueStyle = inline ? issueFrame ?? { visibility: 'hidden' } : undefined
+  const issueKeyCounts = new Map<string, number>()
 
   const issuesView = result && !result.ok && (
     <div className={`fx-latex-issues${inline ? ' fx-latex-issues-popover' : ''}`} style={issueStyle}>
@@ -190,7 +191,7 @@ export function LatexBar({ inline = false }: { inline?: boolean } = {}) {
         <div className="fx-latex-issue fx-latex-missing">
           <Icon name="PackageX" size={13} />
           <span className="grow">{result.message} {result.hint}</span>
-          <button
+          <button type="button"
             className="btn btn-sm"
             onClick={() => requestTerminal('brew install tectonic', { cwd: workspacePath, name: 'Install TeX' })}
             title="Installs tectonic — a small self-contained engine that fetches packages on demand"
@@ -200,14 +201,19 @@ export function LatexBar({ inline = false }: { inline?: boolean } = {}) {
         </div>
       ) : (
         <>
-          {issues.map((e, i) => (
-            <button key={i} className="fx-latex-issue" onClick={() => jumpTo(e.file, e.line)} disabled={!e.file} title={e.file ? 'Jump to the line' : undefined}>
-              <Icon name="CircleAlert" size={12} className="fx-latex-issue-icon" />
-              {e.file && <span className="fx-latex-loc">{relTo(workspacePath, e.file)}{e.line ? `:${e.line}` : ''}</span>}
-              <span className="truncate">{e.message}</span>
-              {e.hint && <span className="fx-latex-hint">{e.hint}</span>}
-            </button>
-          ))}
+          {issues.map((issue) => {
+            const identity = JSON.stringify([issue.file ?? '', issue.line ?? '', issue.message, issue.hint ?? ''])
+            const occurrence = issueKeyCounts.get(identity) ?? 0
+            issueKeyCounts.set(identity, occurrence + 1)
+            return (
+              <button type="button" key={`${identity}:${occurrence}`} className="fx-latex-issue" onClick={() => jumpTo(issue.file, issue.line)} disabled={!issue.file} title={issue.file ? 'Jump to the line' : undefined}>
+                <Icon name="CircleAlert" size={12} className="fx-latex-issue-icon" />
+                {issue.file && <span className="fx-latex-loc">{relTo(workspacePath, issue.file)}{issue.line ? `:${issue.line}` : ''}</span>}
+                <span className="truncate">{issue.message}</span>
+                {issue.hint && <span className="fx-latex-hint">{issue.hint}</span>}
+              </button>
+            )
+          })}
           {!issues.length && <div className="fx-latex-issue"><Icon name="CircleAlert" size={12} className="fx-latex-issue-icon" /><span className="truncate">{result.message}</span></div>}
           {(summarizing || summary) && (
             <div className="fx-latex-summary">
@@ -236,11 +242,11 @@ export function LatexBar({ inline = false }: { inline?: boolean } = {}) {
         ) : !inline ? (
           <span className="faint">No .tex files here yet</span>
         ) : null}
-        <button className="btn btn-sm" onClick={() => void build()} disabled={!buildTarget || building} title={buildTarget ? `Compile ${relTo(workspacePath, buildTarget)} with SyncTeX` : 'Compile headlessly — errors come back parsed'}>
+        <button type="button" className="btn btn-sm" onClick={() => void build()} disabled={!buildTarget || building} title={buildTarget ? `Compile ${relTo(workspacePath, buildTarget)} with SyncTeX` : 'Compile headlessly — errors come back parsed'}>
           {building ? <Icon name="LoaderCircle" size={12} className="spin" /> : <Icon name="Play" size={12} />}
           {!inline && ' Build'}
         </button>
-        <button className="btn btn-sm" onClick={() => void openPdf()} disabled={!buildTarget} title={buildTarget ? `Open ${relTo(workspacePath, buildTarget.replace(/\.tex$/, '.pdf'))}` : 'Open the built PDF'}>
+        <button type="button" className="btn btn-sm" onClick={() => void openPdf()} disabled={!buildTarget} title={buildTarget ? `Open ${relTo(workspacePath, buildTarget.replace(/\.tex$/, '.pdf'))}` : 'Open the built PDF'}>
           <Icon name="FileText" size={12} />
           {!inline && ' PDF'}
         </button>
@@ -248,7 +254,7 @@ export function LatexBar({ inline = false }: { inline?: boolean } = {}) {
         {!inline && <span className="grow" />}
         {/* the ONLY mouse path out of LaTeX mode — latexMode persists across
             relaunches, so without this the mode is a one-way door */}
-        <button className="btn-icon btn-sm" onClick={() => setLatexMode(false)} title="Leave LaTeX mode">
+        <button type="button" className="btn-icon btn-sm" onClick={() => setLatexMode(false)} title="Leave LaTeX mode" aria-label="Leave LaTeX mode">
           <Icon name="X" size={13} />
         </button>
       </div>

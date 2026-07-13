@@ -1,4 +1,4 @@
-import { useState, type CSSProperties, type MouseEvent as ReactMouseEvent } from 'react'
+import { useCallback, useRef, useState, type CSSProperties, type MouseEvent as ReactMouseEvent } from 'react'
 import { useKaisola, sessionOrderIds } from '../../store/store'
 import { bridge } from '../../lib/bridge'
 import { sessionHue, terminalAgentKey } from '../../lib/sessionHue'
@@ -10,6 +10,7 @@ import { Dropdown } from '../Dropdown'
 import { CostChip } from './CostChip'
 import { ShellSidebarFooter } from './ShellSidebarFooter'
 import { isRunningMeshPhase } from '../../lib/meshPolicy'
+import { useClickAway } from '../../lib/useClickAway'
 
 interface STab {
   id: string
@@ -86,9 +87,17 @@ export function SessionTabs({ orientation = 'horizontal' }: { orientation?: 'hor
   // right-click a tab → the session menu (pin, template, groups, worktree) —
   // this strip is the ONLY session list now, so it owns what the rail used to
   const [menu, setMenu] = useState<{ x: number; y: number; id: string } | null>(null)
+  const menuTriggerRef = useRef<HTMLElement>(null)
+  const menuRef = useRef<HTMLDivElement>(null)
+  const closeMenu = useCallback(() => setMenu(null), [])
+  useClickAway(!!menu, closeMenu, menuTriggerRef, menuRef)
 
   const tabs = new Map<string, STab>()
-  threads.filter((thread) => !thread.groupParentId).forEach((t, i) => {
+  const pinnedSessionIds = new Set(pinnedSessions)
+  const dockViewIds = new Set(dockViews)
+  for (let i = 0; i < threads.length; i += 1) {
+    const t = threads[i]
+    if (t.groupParentId) continue
     const label = threadLabel(t, agents, threads, i)
     const permissionKeys = t.group
       ? new Set(t.group.members.map((member) => `${member.agentKey}::${member.threadId}`))
@@ -103,10 +112,10 @@ export function SessionTabs({ orientation = 'horizontal' }: { orientation?: 'hor
         ? 'needs-you'
         : t.busy ? 'running' : needsYou[t.id] ? 'completed' : undefined,
       kind: 'thread',
-      closable: !pinnedSessions.includes(t.id),
+      closable: !pinnedSessionIds.has(t.id),
       title: 'Double-click to rename',
     })
-  })
+  }
   terminals.forEach((t, i) => {
     const meta = terminalMeta[t.id]
     const agentKey = terminalAgentKey(t.singletonKey)
@@ -122,7 +131,7 @@ export function SessionTabs({ orientation = 'horizontal' }: { orientation?: 'hor
       hue: sessionHue({ agentKey, folder: meta?.root ?? meta?.cwd ?? t.cwd }),
       state: failed ? 'failed' : working ? 'running' : needsYou[t.id] ? 'completed' : undefined,
       kind: 'term',
-      closable: !pinnedSessions.includes(t.id),
+      closable: !pinnedSessionIds.has(t.id),
       continued: !!t.continued?.sameProcess,
       title: [
         t.continued?.sameProcess ? 'Continued — same process across the update' : null,
@@ -159,7 +168,7 @@ export function SessionTabs({ orientation = 'horizontal' }: { orientation?: 'hor
           : sessionHue({ agentKey: urlHost(p.url) ?? 'browser' }),
       state: needsYou[p.id] ? 'completed' : undefined,
       kind: 'panel',
-      closable: !pinnedSessions.includes(p.id),
+      closable: !pinnedSessionIds.has(p.id),
       title: p.kind === 'git' ? 'Stage & commit' : p.url,
     })
   })
@@ -266,7 +275,10 @@ export function SessionTabs({ orientation = 'horizontal' }: { orientation?: 'hor
 
   const menuTab = menu ? tabs.get(menu.id) : undefined
   const menuPorts = menu ? terminalMeta[menu.id]?.ports ?? [] : []
-  const orderedTabs = order.map((id) => tabs.get(id)).filter((tab): tab is STab => !!tab)
+  const orderedTabs = order.flatMap((id) => {
+    const tab = tabs.get(id)
+    return tab ? [tab] : []
+  })
 
   return (
     <div
@@ -284,7 +296,7 @@ export function SessionTabs({ orientation = 'horizontal' }: { orientation?: 'hor
       </span>
       <div className="stabs-track">
         {orderedTabs.map((t, index) => {
-            const active = dockOpen && dockViews.includes(t.id)
+            const active = dockOpen && dockViewIds.has(t.id)
             const focusable = dockViews[dockViews.length - 1] === t.id || (!dockViews.length && index === 0)
             return (
               <div
@@ -294,9 +306,6 @@ export function SessionTabs({ orientation = 'horizontal' }: { orientation?: 'hor
                 data-active={active}
                 data-state={t.state}
                 style={{ '--sid': t.hue } as CSSProperties}
-                onMouseDown={(e) => { if (e.button === 1) e.preventDefault() }}
-                onAuxClick={(e) => { if (e.button === 1 && t.closable) { e.preventDefault(); closeTab(t) } }}
-                onContextMenu={(e) => { e.preventDefault(); e.stopPropagation(); setMenu({ x: e.clientX, y: e.clientY, id: t.id }) }}
                 title={t.title}
               >
                 {editing === t.id ? (
@@ -308,20 +317,25 @@ export function SessionTabs({ orientation = 'horizontal' }: { orientation?: 'hor
                     onBlur={commitRename}
                     onClick={(e) => e.stopPropagation()}
                     onDoubleClick={(e) => e.stopPropagation()}
+                    aria-label={`Rename ${t.label}`}
                     onKeyDown={(e) => {
                       if (e.key === 'Enter') commitRename()
                       if (e.key === 'Escape') setEditing(null)
                     }}
-                    style={{ background: 'transparent', border: 'none', outline: 'none', color: 'inherit', font: 'inherit', width: '100%', minWidth: 0 }}
+                    style={{ background: 'transparent', border: 'none', color: 'inherit', font: 'inherit', width: '100%', minWidth: 0 }}
                   />
                 ) : (
                   <>
                     <button
+                      type="button"
                       className="stab-select"
                       aria-label={`Open session ${t.label}`}
                       aria-current={active ? 'true' : undefined}
                       tabIndex={focusable ? 0 : -1}
                       onClick={() => switchSession(t.id)}
+                      onMouseDown={(e) => { if (e.button === 1) e.preventDefault() }}
+                      onAuxClick={(e) => { if (e.button === 1 && t.closable) { e.preventDefault(); closeTab(t) } }}
+                      onContextMenu={(e) => { e.preventDefault(); e.stopPropagation(); setMenu({ x: e.clientX, y: e.clientY, id: t.id }) }}
                       onKeyDown={(e) => {
                         const backward = orientation === 'vertical' ? 'ArrowUp' : 'ArrowLeft'
                         const forward = orientation === 'vertical' ? 'ArrowDown' : 'ArrowRight'
@@ -354,6 +368,7 @@ export function SessionTabs({ orientation = 'horizontal' }: { orientation?: 'hor
                 {/* the two-pane button: open this session BESIDE what's showing
                     (a click on the tab itself swaps it into the current pane) */}
                 <button
+                  type="button"
                   className="stab-split"
                   data-on={active}
                   onClick={(e) => {
@@ -368,6 +383,7 @@ export function SessionTabs({ orientation = 'horizontal' }: { orientation?: 'hor
                 </button>
                 {t.closable && (
                   <button
+                    type="button"
                     className="stab-close"
                     onClick={(e) => { e.stopPropagation(); closeTab(t) }}
                     title={t.kind === 'agentTerm' ? 'Hide command output — agent keeps running' : 'Close session — reopen from + or ⇧⌘T'}
@@ -383,6 +399,7 @@ export function SessionTabs({ orientation = 'horizontal' }: { orientation?: 'hor
       <NewSessionButton orientation={orientation} />
       {orientation === 'horizontal' && (
         <button
+          type="button"
           className="stabs-sidebar-toggle"
           onClick={() => setTabLayout('sidebar')}
           title="Move sessions to the left sidebar"
@@ -392,58 +409,60 @@ export function SessionTabs({ orientation = 'horizontal' }: { orientation?: 'hor
         </button>
       )}
       {menu && (
-        <div className="tree-menu-overlay" onMouseDown={() => setMenu(null)} onContextMenu={(e) => { e.preventDefault(); setMenu(null) }}>
+        <div className="tree-menu-overlay" onContextMenu={(e) => e.preventDefault()}>
           <div
+            ref={menuRef}
             className="tree-menu"
             style={{ left: Math.min(menu.x, window.innerWidth - 220), top: Math.min(menu.y, window.innerHeight - 220) }}
-            onMouseDown={(e) => e.stopPropagation()}
           >
             <button
+              type="button"
               className="tree-menu-item"
               onClick={() => {
-                if (dockOpen && dockViews.includes(menu.id)) removeDockView(menu.id)
+                if (dockOpen && dockViewIds.has(menu.id)) removeDockView(menu.id)
                 else addDockSplit(menu.id)
                 setMenu(null)
               }}
             >
-              <Icon name="Columns2" size={13} /> {dockOpen && dockViews.includes(menu.id) ? 'Put pane away' : 'Open beside'}
+              <Icon name="Columns2" size={13} /> {dockOpen && dockViewIds.has(menu.id) ? 'Put pane away' : 'Open beside'}
             </button>
-            <button className="tree-menu-item" onClick={() => { togglePinSession(menu.id); setMenu(null) }}>
-              <Icon name={pinnedSessions.includes(menu.id) ? 'PinOff' : 'Pin'} size={13} />
-              {pinnedSessions.includes(menu.id) ? 'Unpin' : 'Pin'}
+            <button type="button" className="tree-menu-item" onClick={() => { togglePinSession(menu.id); setMenu(null) }}>
+              <Icon name={pinnedSessionIds.has(menu.id) ? 'PinOff' : 'Pin'} size={13} />
+              {pinnedSessionIds.has(menu.id) ? 'Unpin' : 'Pin'}
             </button>
-            <button className="tree-menu-item" onClick={() => { saveSessionTemplate(menu.id); setMenu(null) }}>
+            <button type="button" className="tree-menu-item" onClick={() => { saveSessionTemplate(menu.id); setMenu(null) }}>
               <Icon name="BookmarkPlus" size={13} /> Save as template
             </button>
             <div className="tree-menu-sep" />
-            {sessionGroups
-              .filter((g) => !g.members.includes(menu.id))
-              .map((g) => (
-                <button key={g.id} className="tree-menu-item" onClick={() => { assignToGroup(menu.id, g.id); setMenu(null) }}>
-                  <Icon name="FolderInput" size={13} /> Move to “{g.name}”
-                </button>
-              ))}
+            {sessionGroups.flatMap((group) => (
+              group.members.includes(menu.id) ? [] : [
+                <button type="button" key={group.id} className="tree-menu-item" onClick={() => { assignToGroup(menu.id, group.id); setMenu(null) }}>
+                  <Icon name="FolderInput" size={13} /> Move to “{group.name}”
+                </button>,
+              ]
+            ))}
             <button
+              type="button"
               className="tree-menu-item"
               onClick={() => { createSessionGroup(`Group ${sessionGroups.length + 1}`, [menu.id]); setMenu(null) }}
             >
               <Icon name="FolderPlus" size={13} /> New group
             </button>
             {sessionGroups.some((g) => g.members.includes(menu.id)) && (
-              <button className="tree-menu-item" onClick={() => { assignToGroup(menu.id, null); setMenu(null) }}>
+              <button type="button" className="tree-menu-item" onClick={() => { assignToGroup(menu.id, null); setMenu(null) }}>
                 <Icon name="FolderMinus" size={13} /> Remove from group
               </button>
             )}
             {worktreeSessions[menu.id] && (
               <>
                 <div className="tree-menu-sep" />
-                <button className="tree-menu-item" onClick={() => { void proposeWorktreeSession(menu.id); setMenu(null) }}>
+                <button type="button" className="tree-menu-item" onClick={() => { void proposeWorktreeSession(menu.id); setMenu(null) }}>
                   <Icon name="FileDiff" size={13} /> Review changes as proposal
                 </button>
-                <button className="tree-menu-item" onClick={() => { void mergeWorktreeSession(menu.id); setMenu(null) }}>
+                <button type="button" className="tree-menu-item" onClick={() => { void mergeWorktreeSession(menu.id); setMenu(null) }}>
                   <Icon name="GitMerge" size={13} /> Merge worktree back
                 </button>
-                <button className="tree-menu-item tree-menu-danger" onClick={() => { void removeWorktreeSession(menu.id); setMenu(null) }}>
+                <button type="button" className="tree-menu-item tree-menu-danger" onClick={() => { void removeWorktreeSession(menu.id); setMenu(null) }}>
                   <Icon name="Trash2" size={13} /> Remove worktree
                 </button>
               </>
@@ -452,12 +471,13 @@ export function SessionTabs({ orientation = 'horizontal' }: { orientation?: 'hor
               <>
                 <div className="tree-menu-sep" />
                 {menuPorts.map((port) => (
-                  <button key={port} className="tree-menu-item" onClick={() => { openBrowserPanel(`http://localhost:${port}`); setMenu(null) }}>
+                  <button type="button" key={port} className="tree-menu-item" onClick={() => { openBrowserPanel(`http://localhost:${port}`); setMenu(null) }}>
                     <Icon name="Globe" size={13} /> Open localhost:{port}
                   </button>
                 ))}
                 {menuTab.kind === 'term' && (
                   <button
+                    type="button"
                     className="tree-menu-item"
                     onClick={() => { popOutTerminal(menuTab.id, menuTab.label, menuTab.hue); setMenu(null) }}
                   >
@@ -468,7 +488,7 @@ export function SessionTabs({ orientation = 'horizontal' }: { orientation?: 'hor
             )}
             {menuTab && <>
               <div className="tree-menu-sep" />
-              <button className="tree-menu-item tree-menu-danger" onClick={() => { void deleteTab(menuTab) }}>
+              <button type="button" className="tree-menu-item tree-menu-danger" onClick={() => { void deleteTab(menuTab) }}>
                 <Icon name="Trash2" size={13} /> Delete permanently…
               </button>
             </>}
@@ -502,7 +522,7 @@ export function SessionSidebar() {
     <aside className="session-sidebar" aria-label="Session sidebar">
       <div className="session-sidebar-head">
         <span>Sessions</span>
-        <button onClick={() => setTabLayout('bare')} title="Move sessions across the top" aria-label="Move sessions across the top">
+        <button type="button" onClick={() => setTabLayout('bare')} title="Move sessions across the top" aria-label="Move sessions across the top">
           <Icon name="PanelTop" size={13} />
         </button>
       </div>
@@ -512,6 +532,17 @@ export function SessionSidebar() {
         className="session-sidebar-resize"
         onMouseDown={startResize}
         onDoubleClick={() => setSessionRailWidth(null)}
+        onKeyDown={(event) => {
+          if (event.key === 'Home') { event.preventDefault(); setSessionRailWidth(null); return }
+          if (event.key !== 'ArrowLeft' && event.key !== 'ArrowRight') return
+          event.preventDefault()
+          const current = event.currentTarget.parentElement?.getBoundingClientRect().width ?? 188
+          setSessionRailWidth(current + (event.key === 'ArrowLeft' ? -20 : 20))
+        }}
+        role="separator"
+        aria-label="Resize session sidebar"
+        aria-orientation="vertical"
+        tabIndex={0}
         title="Drag to resize sessions · double-click to reset"
       />
     </aside>
@@ -551,15 +582,15 @@ function NewSessionButton({ orientation }: { orientation: 'horizontal' | 'vertic
   // recently-closed sessions reopen from here (⌘⇧T restores the newest);
   // closed agent threads carry their acpSessionId, so a reopen also resumes
   // the agent-side conversation
-  const recentlyClosed = closedStack.slice(0, 6).map((c) => {
+  const recentlyClosed = closedStack.slice(0, 6).flatMap((c) => {
     const id = c.term?.id ?? c.thread?.id ?? c.panel?.id ?? ''
     const label = c.thread
       ? c.thread.name ?? c.thread.autoName ?? c.thread.agentKey
       : c.term
         ? c.term.name ?? c.term.autoName ?? 'Terminal'
         : c.panel?.title ?? c.panel?.kind ?? 'Panel'
-    return { value: `closed:${id}`, name: `↩ ${label}` }
-  }).filter((option) => option.value !== 'closed:')
+    return id ? [{ value: `closed:${id}`, name: `↩ ${label}` }] : []
+  })
   const codex = menu.find((agent) => agent.id === 'codex')
   const claude = menu.find((agent) => agent.id === 'claude-code')
   const otherAgents = menu.filter((agent) => agent.id !== 'codex' && agent.id !== 'claude-code')

@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { useEffect, useMemo, useRef, useState, type CSSProperties } from 'react'
 import { useKaisola, sessionOrderIds, type PaletteMode } from '../../store/store'
 import { bridge, isDesktop } from '../../lib/bridge'
 import { AGENTS } from '../../agents/registry'
@@ -18,6 +18,16 @@ interface Command {
   icon: string
   run: () => void
 }
+
+const PALETTE_DIALOG_STYLE = {
+  width: '100vw',
+  maxWidth: 'none',
+  height: '100vh',
+  maxHeight: 'none',
+  margin: 0,
+  border: 'none',
+  padding: '14vh 0 0',
+} satisfies CSSProperties
 
 /** Matched-character emphasis for fuzzy results. */
 function Runs({ text, indices }: { text: string; indices: number[] }) {
@@ -82,6 +92,7 @@ export function CommandPalette() {
   const [files, setFiles] = useState<string[]>([])
   const [filesTruncated, setFilesTruncated] = useState(false)
   const [backlogPath, setBacklogPath] = useState<string | null>(null)
+  const dialogRef = useRef<HTMLDialogElement>(null)
   const inputRef = useRef<HTMLInputElement>(null)
   const listRef = useRef<HTMLDivElement>(null)
 
@@ -100,11 +111,22 @@ export function CommandPalette() {
 
   useEffect(() => {
     if (open) {
+      const dialog = dialogRef.current
+      const onBackdropMouseDown = (event: MouseEvent) => {
+        if (event.target === dialog) close()
+      }
+      dialog?.addEventListener('mousedown', onBackdropMouseDown)
+      if (dialog && !dialog.open) dialog.showModal()
       setQ('')
       setActive(0)
-      setTimeout(() => inputRef.current?.focus(), 0)
+      const focusTimer = setTimeout(() => inputRef.current?.focus(), 0)
+      return () => {
+        clearTimeout(focusTimer)
+        dialog?.removeEventListener('mousedown', onBackdropMouseDown)
+        if (dialog?.open) dialog.close()
+      }
     }
-  }, [open, mode])
+  }, [open, mode, close])
 
   // the file finder's candidate set: one walk per palette-open, matched locally
   useEffect(() => {
@@ -148,7 +170,10 @@ export function CommandPalette() {
       })),
     ]
     const byId = new Map(naturalSessions.map((x) => [x.id, x]))
-    const sessionEntries = sessionOrderIds(st).map((id) => byId.get(id)).filter(Boolean) as typeof naturalSessions
+    const sessionEntries = sessionOrderIds(st).flatMap((id) => {
+      const session = byId.get(id)
+      return session ? [session] : []
+    })
     const supervise: Command = {
       id: 'run-stage',
       group: 'Run agent',
@@ -209,9 +234,9 @@ export function CommandPalette() {
       },
       { id: 'wt-session', group: 'Navigate', label: 'New agent in a fresh worktree', hint: 'Isolated checkout — merge back when it’s good', icon: 'GitBranchPlus', run: () => { void useKaisola.getState().newWorktreeSession(); close() } },
       // worktrees whose session was closed still exist on disk — offer cleanup
-      ...Object.entries(st.worktreeSessions)
-        .filter(([sid]) => !st.terminals.some((t) => t.id === sid) && !st.assistantThreads.some((t) => t.id === sid))
-        .map(([sid, wt]) => ({
+      ...Object.entries(st.worktreeSessions).flatMap(([sid, wt]) => {
+        if (st.terminals.some((t) => t.id === sid) || st.assistantThreads.some((t) => t.id === sid)) return []
+        return [{
           id: `wt-orphan-${sid}`,
           group: 'Navigate',
           label: `Remove leftover worktree ⎇ ${wt.branch}`,
@@ -232,7 +257,8 @@ export function CommandPalette() {
             })
             close()
           },
-        })),
+        }]
+      }),
       ...(st.closedStack.length
         ? [{ id: 'reopen', group: 'Navigate', label: 'Reopen closed session', hint: '⌘⇧T', icon: 'Undo2', run: () => { useKaisola.getState().reopenClosedSession(); close() } }]
         : []),
@@ -380,21 +406,20 @@ export function CommandPalette() {
   const fileRows = useMemo(() => {
     if (mode !== 'files') return []
     const t = q.trim()
+    const recentSet = new Set(recents)
     if (!t) {
-      const rest = files.filter((f) => !recents.includes(f))
-      return [...recents, ...rest].slice(0, 30).map((f) => ({ item: f, hit: { score: 0, indices: [] as number[] }, recent: recents.includes(f) }))
+      const rest = files.filter((f) => !recentSet.has(f))
+      return [...recents, ...rest].slice(0, 30).map((f) => ({ item: f, hit: { score: 0, indices: [] as number[] }, recent: recentSet.has(f) }))
     }
     return fuzzyRank(t, files, (f) => f, 50).map((r) => ({ ...r, recent: false }))
   }, [mode, q, files, recents])
 
   const rowCount = mode === 'files' ? fileRows.length : commandRows.length
+  const activeIndex = active >= 0 && active < rowCount ? active : 0
 
   useEffect(() => {
-    if (active >= rowCount) setActive(0)
-  }, [rowCount, active])
-  useEffect(() => {
     listRef.current?.querySelector('[data-active="true"]')?.scrollIntoView({ block: 'nearest' })
-  }, [active])
+  }, [activeIndex])
 
   const openFile = (rel: string, pinned: boolean) => {
     if (!workspacePath) return
@@ -403,8 +428,8 @@ export function CommandPalette() {
   }
 
   // group commands for browsing when the query is empty; ranked flat when not.
-  // visualRows mirrors the RENDERED order exactly — `active` indexes the rows as
-  // drawn, so Enter must run visualRows[active], never the unordered commandRows
+  // visualRows mirrors the RENDERED order exactly — activeIndex points at the
+  // drawn row, so Enter never runs the unordered commandRows array.
   // (the group buckets are a permutation of the flat array).
   const grouped = mode === 'commands' && !q.trim()
   const groups = grouped
@@ -417,10 +442,10 @@ export function CommandPalette() {
 
   const runActive = (e?: { metaKey?: boolean }) => {
     if (mode === 'files') {
-      const row = fileRows[active]
+      const row = fileRows[activeIndex]
       if (row) openFile(row.item, !!e?.metaKey)
     } else {
-      visualRows[active]?.item.run()
+      visualRows[activeIndex]?.item.run()
     }
   }
 
@@ -429,10 +454,10 @@ export function CommandPalette() {
   let flatIndex = -1
 
   const commandRow = (r: (typeof commandRows)[number], idx: number) => (
-    <button
+    <button type="button"
       key={r.item.id}
       className="palette-item"
-      data-active={idx === active}
+      data-active={idx === activeIndex}
       onMouseEnter={() => setActive(idx)}
       onClick={() => r.item.run()}
     >
@@ -445,8 +470,14 @@ export function CommandPalette() {
   )
 
   return (
-    <div className="palette-overlay" onMouseDown={close}>
-      <div className="palette" role="dialog" aria-label={mode === 'files' ? 'Go to file' : 'Command palette'} onMouseDown={(e) => e.stopPropagation()}>
+    <dialog
+      ref={dialogRef}
+      className="palette-overlay"
+      style={PALETTE_DIALOG_STYLE}
+      aria-label={mode === 'files' ? 'Go to file' : 'Command palette'}
+      onCancel={(event) => { event.preventDefault(); close() }}
+    >
+      <div className="palette">
         <div className="palette-search">
           <Icon name={mode === 'files' ? 'FileSearch' : 'Search'} size={16} className="muted" />
           <input
@@ -456,6 +487,7 @@ export function CommandPalette() {
             value={q}
             onChange={(e) => {
               const v = e.target.value
+              setActive(0)
               // VS Code muscle memory: '>' at the start of ⌘P = command mode
               if (mode === 'files' && v.startsWith('>')) {
                 togglePalette('commands')
@@ -487,13 +519,17 @@ export function CommandPalette() {
               const name = r.item.split('/').pop() ?? r.item
               const dir = r.item.slice(0, r.item.length - name.length).replace(/\/$/, '')
               const nameStart = r.item.length - name.length
-              const nameIdx = r.hit.indices.filter((i) => i >= nameStart).map((i) => i - nameStart)
-              const dirIdx = r.hit.indices.filter((i) => i < nameStart)
+              const nameIdx: number[] = []
+              const dirIdx: number[] = []
+              for (const index of r.hit.indices) {
+                if (index >= nameStart) nameIdx.push(index - nameStart)
+                else dirIdx.push(index)
+              }
               return (
-                <button
+                <button type="button"
                   key={r.item}
                   className="palette-item"
-                  data-active={idx === active}
+                  data-active={idx === activeIndex}
                   onMouseEnter={() => setActive(idx)}
                   onClick={(e) => openFile(r.item, e.metaKey)}
                   title={`${r.item} — Enter previews · ⌘Enter pins & edits`}
@@ -540,6 +576,6 @@ export function CommandPalette() {
           )}
         </div>
       </div>
-    </div>
+    </dialog>
   )
 }

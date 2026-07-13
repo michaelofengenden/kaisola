@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { useEffect, useMemo, useRef, useState, type CSSProperties } from 'react'
 import { bridge, isDesktop } from '../lib/bridge'
 import {
   extensionCatalog,
@@ -25,9 +25,27 @@ const STATUS: Array<{ id: StatusFilter; label: string }> = [
   { id: 'not-installed', label: 'Not Installed' },
 ]
 
+const EXTENSIONS_DIALOG_STYLE = {
+  width: '100vw',
+  maxWidth: 'none',
+  height: '100vh',
+  maxHeight: 'none',
+  margin: 0,
+  border: 'none',
+  padding: 0,
+} satisfies CSSProperties
+const REVIEW_DIALOG_STYLE = { ...EXTENSIONS_DIALOG_STYLE, padding: 24 } satisfies CSSProperties
+
+const DOWNLOAD_FORMATTER = new Intl.NumberFormat('en-US')
+
 function formatDownloads(value = 0) {
-  return new Intl.NumberFormat('en-US').format(value)
+  return DOWNLOAD_FORMATTER.format(value)
 }
+
+// MCP server names are not extension identities. A same-named user server may
+// have a different command or may be deliberately user-owned; only the
+// extension installation record decides this card's state.
+const installed = (extension: ExtensionManifest) => isExtensionInstalled(extension.id)
 
 function contributionSummary(extension: ExtensionManifest) {
   const contributions = extension.contributions
@@ -51,16 +69,38 @@ function InstallReview({
 }) {
   const mcp = extension.contributions?.mcpServers ?? []
   const development = !!extension.sourcePath
+  const dialogRef = useRef<HTMLDialogElement>(null)
+  const onCancelRef = useRef(onCancel)
+  useEffect(() => { onCancelRef.current = onCancel }, [onCancel])
+  useEffect(() => {
+    const dialog = dialogRef.current
+    if (!dialog) return
+    const onBackdropMouseDown = (event: MouseEvent) => {
+      if (event.target === dialog) onCancelRef.current()
+    }
+    dialog.addEventListener('mousedown', onBackdropMouseDown)
+    if (!dialog.open) dialog.showModal()
+    return () => {
+      dialog.removeEventListener('mousedown', onBackdropMouseDown)
+      if (dialog.open) dialog.close()
+    }
+  }, [])
   return (
-    <div className="ext-review-scrim" onMouseDown={onCancel}>
-      <section className="ext-review" onMouseDown={(event) => event.stopPropagation()}>
+    <dialog
+      ref={dialogRef}
+      className="ext-review-scrim"
+      style={REVIEW_DIALOG_STYLE}
+      aria-labelledby="extension-install-title"
+      onCancel={(event) => { event.preventDefault(); onCancel() }}
+    >
+      <section className="ext-review">
         <header>
           <div className="ext-mark" data-kind="development"><Icon name="Blocks" size={19} /></div>
           <div className="grow">
-            <strong>Install “{extension.name}”?</strong>
+            <strong id="extension-install-title">Install “{extension.name}”?</strong>
             <p>{extension.id} · v{extension.version}</p>
           </div>
-          <button className="btn-icon btn-sm" onClick={onCancel} aria-label="Close"><Icon name="X" size={14} /></button>
+          <button type="button" className="btn-icon btn-sm" onClick={onCancel} aria-label="Close"><Icon name="X" size={14} /></button>
         </header>
         <div className="ext-review-body">
           <p className="ext-trust-note">
@@ -80,14 +120,14 @@ function InstallReview({
           ))}
         </div>
         <footer>
-          <button className="btn btn-sm" onClick={onCancel}>Cancel</button>
-          <button className="btn btn-primary btn-sm" disabled={busy} onClick={onInstall}>
+          <button type="button" className="btn btn-sm" onClick={onCancel}>Cancel</button>
+          <button type="button" className="btn btn-primary btn-sm" disabled={busy} onClick={onInstall}>
             <Icon name={busy ? 'LoaderCircle' : 'PackagePlus'} size={13} className={busy ? 'spin' : undefined} />
             {busy ? 'Installing…' : 'Install extension'}
           </button>
         </footer>
       </section>
-    </div>
+    </dialog>
   )
 }
 
@@ -125,7 +165,7 @@ function ExtensionCard({
         </div>
       </div>
       <aside className="ext-card-side">
-        <button
+        <button type="button"
           className={installed ? 'btn btn-sm ext-uninstall' : 'btn btn-primary btn-sm ext-install'}
           disabled={busy}
           onClick={() => onToggle(extension, !installed)}
@@ -144,11 +184,11 @@ function ExtensionCard({
         </span>
         <div className="ext-links">
           {extension.repository ? (
-            <button onClick={() => void bridge.openExternal(extension.repository!)} title="Open source repository" aria-label="Open source repository">
+            <button type="button" onClick={() => void bridge.openExternal(extension.repository!)} title="Open source repository" aria-label="Open source repository">
               <Icon name="Github" size={17} />
             </button>
           ) : <span />}
-          <button title={contributionSummary(extension) || extension.id} aria-label="Extension details"><Icon name="Ellipsis" size={17} /></button>
+          <button type="button" title={contributionSummary(extension) || extension.id} aria-label="Extension details"><Icon name="Ellipsis" size={17} /></button>
         </div>
       </aside>
     </article>
@@ -169,6 +209,7 @@ export function ExtensionsCenter() {
   const [busy, setBusy] = useState<string | null>(null)
   const [pendingInstall, setPendingInstall] = useState<ExtensionManifest | null>(null)
   const [manifestWarnings, setManifestWarnings] = useState<string[]>([])
+  const dialogRef = useRef<HTMLDialogElement>(null)
   const searchRef = useRef<HTMLInputElement>(null)
   const extensionState = useExtensions()
   const workspace = useKaisola((state) => state.workspacePath)
@@ -188,16 +229,15 @@ export function ExtensionsCenter() {
   }, [])
   useEffect(() => {
     if (!open) return
-    const onKey = (event: KeyboardEvent) => {
-      if (event.key === 'Escape') {
-        if (pendingInstall) setPendingInstall(null)
-        else setOpen(false)
-      }
-    }
-    window.addEventListener('keydown', onKey)
+    const dialog = dialogRef.current
+    if (!dialog) return
+    if (!dialog.open) dialog.showModal()
     const timer = window.setTimeout(() => searchRef.current?.focus(), 40)
-    return () => { window.removeEventListener('keydown', onKey); window.clearTimeout(timer) }
-  }, [open, pendingInstall])
+    return () => {
+      window.clearTimeout(timer)
+      if (dialog.open) dialog.close()
+    }
+  }, [open])
 
   const catalog = useMemo(() => extensionCatalog(), [extensionState.revision])
   const categories = useMemo<CategoryFilter[]>(() => [
@@ -207,11 +247,6 @@ export function ExtensionsCenter() {
   useEffect(() => {
     if (!categories.includes(category)) setCategory('All')
   }, [categories, category])
-  // MCP server names are not extension identities. A same-named user server may
-  // have a different command or may be deliberately user-owned; only the
-  // extension installation record decides this card's state.
-  const installed = (extension: ExtensionManifest) => isExtensionInstalled(extension.id)
-
   const visible = useMemo(() => {
     const needle = query.trim().toLowerCase()
     return catalog.filter((extension) => {
@@ -312,31 +347,41 @@ export function ExtensionsCenter() {
 
   if (!open) return null
   return (
-    <div className="extensions-surface" role="dialog" aria-modal="true" aria-label="Extensions">
+    <dialog
+      ref={dialogRef}
+      className="extensions-surface"
+      style={EXTENSIONS_DIALOG_STYLE}
+      aria-label="Extensions"
+      onCancel={(event) => {
+        event.preventDefault()
+        if (pendingInstall) setPendingInstall(null)
+        else setOpen(false)
+      }}
+    >
       <header className="extensions-head">
         <div>
           <h1>Extensions</h1>
           <p>Languages, previews, and tools—installed locally and reviewable.</p>
         </div>
         <div className="extensions-head-actions">
-          <button className="btn btn-sm" onClick={() => void chooseDev()}><Icon name="PackagePlus" size={14} /> Install Dev Extension</button>
-          <button className="btn-icon" onClick={() => setOpen(false)} aria-label="Close extensions"><Icon name="X" size={17} /></button>
+          <button type="button" className="btn btn-sm" onClick={() => void chooseDev()}><Icon name="PackagePlus" size={14} /> Install Dev Extension</button>
+          <button type="button" className="btn-icon" onClick={() => setOpen(false)} aria-label="Close extensions"><Icon name="X" size={17} /></button>
         </div>
       </header>
       <div className="extensions-filters">
         <label className="extensions-search">
           <Icon name="Search" size={18} />
           <input ref={searchRef} value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Search extensions…" />
-          {query && <button onClick={() => setQuery('')} aria-label="Clear search"><Icon name="X" size={14} /></button>}
+          {query && <button type="button" onClick={() => setQuery('')} aria-label="Clear search"><Icon name="X" size={14} /></button>}
         </label>
         <div className="extensions-status" role="tablist">
           {STATUS.map((item) => (
-            <button key={item.id} data-active={status === item.id} onClick={() => setStatus(item.id)}>{item.label}</button>
+            <button type="button" key={item.id} data-active={status === item.id} onClick={() => setStatus(item.id)}>{item.label}</button>
           ))}
         </div>
       </div>
       <nav className="extensions-categories" aria-label="Extension categories">
-        {categories.map((item) => <button key={item} data-active={category === item} onClick={() => setCategory(item)}>{item}</button>)}
+        {categories.map((item) => <button type="button" key={item} data-active={category === item} onClick={() => setCategory(item)}>{item}</button>)}
       </nav>
       <main className="extensions-list">
         {manifestWarnings.map((warning) => (
@@ -367,6 +412,6 @@ export function ExtensionsCenter() {
         <span>{visible.length} of {catalog.length} extensions</span>
       </footer>
       {pendingInstall && <InstallReview extension={pendingInstall} busy={busy === pendingInstall.id} onCancel={() => setPendingInstall(null)} onInstall={() => void confirmInstall()} />}
-    </div>
+    </dialog>
   )
 }

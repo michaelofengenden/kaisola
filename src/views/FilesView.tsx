@@ -1,4 +1,4 @@
-import { Suspense, lazy, useCallback, useEffect, useMemo, useRef, useState, type CSSProperties, type MouseEvent as ReactMouseEvent } from 'react'
+import { Suspense, lazy, useCallback, useEffect, useMemo, useReducer, useRef, useState, type CSSProperties, type MouseEvent as ReactMouseEvent } from 'react'
 import { useKaisola, type QuoteAnnotation } from '../store/store'
 import { bridge, isDesktop, type FsEntry, type FsReadMediaKind, type FsReadResult, type GitChange } from '../lib/bridge'
 import { extractOutline } from '../lib/outline'
@@ -85,6 +85,51 @@ interface PdfPageImage {
   scale: number
   /** The zoom bucket this render belongs to; zooming re-renders at the new dpi. */
   renderedFor: number
+}
+
+interface PdfRasterState {
+  info: PdfInfoState | null
+  message: string | null
+  nativeFallback: boolean
+  activePage: number
+  pages: Record<number, PdfPageImage>
+}
+
+type PdfRasterAction =
+  | { type: 'reset'; keepActivePage: boolean }
+  | { type: 'infoLoaded'; info: PdfInfoState }
+  | { type: 'failed'; message: string }
+  | { type: 'pageLoaded'; page: number; image: PdfPageImage; clearFallback: boolean }
+  | { type: 'showFallback' }
+  | { type: 'activePageChanged'; page: number }
+
+const initialPdfRasterState: PdfRasterState = {
+  info: null,
+  message: null,
+  nativeFallback: false,
+  activePage: 1,
+  pages: {},
+}
+
+const pdfRasterReducer = (state: PdfRasterState, action: PdfRasterAction): PdfRasterState => {
+  switch (action.type) {
+    case 'reset':
+      return { ...initialPdfRasterState, activePage: action.keepActivePage ? state.activePage : 1, pages: {} }
+    case 'infoLoaded':
+      return { ...state, info: action.info }
+    case 'failed':
+      return { ...state, message: action.message, nativeFallback: true }
+    case 'pageLoaded':
+      return {
+        ...state,
+        pages: { ...state.pages, [action.page]: action.image },
+        nativeFallback: action.clearFallback ? false : state.nativeFallback,
+      }
+    case 'showFallback':
+      return { ...state, nativeFallback: true }
+    case 'activePageChanged':
+      return state.activePage === action.page ? state : { ...state, activePage: action.page }
+  }
 }
 
 const fileName = (path: string) => path.split('/').pop() || path
@@ -175,6 +220,14 @@ const tabWithReadResult = (current: FileTab, r: FsReadResult): FileTab => {
   // of a clean tab doesn't churn effects/renders downstream
   const keys: (keyof FileTab)[] = ['loading', 'value', 'baseline', 'readError', 'mediaKind', 'mime', 'dataUrl', 'previewUrl', 'mtimeMs', 'size', 'unsupported', 'mode']
   return keys.every((k) => next[k] === current[k]) ? current : next
+}
+const withUnsaved = (tab: FileTab): FileTab => {
+  if (!isTextTab(tab) || tab.loading || tab.readError) return tab
+  const stored = useKaisola.getState().unsavedBuffers[tab.path]
+  if (stored != null && stored !== tab.baseline && tab.value === tab.baseline) {
+    return { ...tab, value: stored, pinned: true }
+  }
+  return tab
 }
 
 /**
@@ -271,7 +324,6 @@ export function FilesView() {
 
   useEffect(() => { setFileDirty(anyDirty) }, [anyDirty, setFileDirty])
   useEffect(() => { setOpenFile(activePath) }, [activePath, setOpenFile])
-  useEffect(() => { setFindText('') }, [activePath])
   // LaTeX auto-detect: opening a .tex flips the shell into LaTeX mode (unless
   // the user dismissed the bar), and a \documentclass file becomes the build
   // target when none is chosen for this workspace yet
@@ -325,6 +377,8 @@ export function FilesView() {
     suppressSessionSyncRef.current = true
     setQuery('')
     setSearchResults([])
+    setFindText('')
+    setPdfSourcePath(null)
     externalDirtyRef.current.clear()
 
     const previousWorkspace = sessionWorkspaceRef.current
@@ -370,17 +424,6 @@ export function FilesView() {
     return () => { cancelled = true }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [workspacePath])
-
-  // continue where you left off: a persisted unsaved buffer overlays the disk
-  // content (and pins the tab) — quitting mid-edit no longer loses work
-  const withUnsaved = (tab: FileTab): FileTab => {
-    if (!isTextTab(tab) || tab.loading || tab.readError) return tab
-    const stored = useKaisola.getState().unsavedBuffers[tab.path]
-    if (stored != null && stored !== tab.baseline && tab.value === tab.baseline) {
-      return { ...tab, value: stored, pinned: true }
-    }
-    return tab
-  }
 
   const applyZoomVars = useCallback((zoom: number) => {
     const pane = paneRef.current
@@ -485,7 +528,9 @@ export function FilesView() {
       const pane = paneRef.current
       return !!pane && target instanceof Node && pane.contains(target)
     }
-    const zoomByWheel = (e: WheelEvent) => {
+    const onWheel = (e: WheelEvent) => {
+      if (!e.ctrlKey || !isInPane(e.target)) return
+      e.preventDefault()
       const normalizedDelta = e.deltaMode === 1 ? e.deltaY * 16 : e.deltaMode === 2 ? e.deltaY * 240 : e.deltaY
       const target = e.target instanceof Element ? e.target : null
       if (target?.closest('.fx-pdf-source-pane')) {
@@ -501,11 +546,6 @@ export function FilesView() {
         zoomRef.current * Math.exp(-normalizedDelta * 0.0035),
         scroller ? { scroller, x: e.clientX, y: e.clientY } : undefined,
       )
-    }
-    const onWheel = (e: WheelEvent) => {
-      if (!e.ctrlKey || !isInPane(e.target)) return
-      e.preventDefault()
-      zoomByWheel(e)
     }
     const onGestureStart = (e: Event) => {
       const target = e.target instanceof Element ? e.target : null
@@ -561,13 +601,14 @@ export function FilesView() {
 
   useEffect(() => {
     if (!workspacePath || !isDesktop) return
-    return bridge.fs.watch(workspacePath, (ev) => {
+    const unwatch = bridge.fs.watch(workspacePath, (ev) => {
       if (ev.error) return
       for (const event of ev.events ?? []) {
         if (event.path) watchChangedRef.current.add(event.path)
       }
       setWatchSeq((n) => n + 1)
     })
+    return () => unwatch()
   }, [workspacePath])
 
   // "Changes · N" — what moved since the last checkpoint (or HEAD when none)
@@ -670,7 +711,11 @@ export function FilesView() {
     const pinned = opts?.pinned ?? false
     setSearchOpen(false)
     setQuery('')
-    setActivePath(path)
+    if (path !== activePath) {
+      setFindText('')
+      setPdfSourcePath(null)
+    }
+    setActivePath(() => path)
 
     const exists = tabs.some((t) => t.path === path)
     if (exists) {
@@ -699,7 +744,7 @@ export function FilesView() {
       }),
     )
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [tabs])
+  }, [activePath, tabs])
 
   const ensureTextTab = useCallback(async (path: string, line?: number) => {
     setTabs((prev) => {
@@ -765,7 +810,7 @@ export function FilesView() {
 
   // the workspace tree (left rail) asks for files through the store
   const openRef = useRef(open)
-  openRef.current = open
+  useEffect(() => { openRef.current = open }, [open])
   useEffect(() => {
     if (fileRequest) void openRef.current(fileRequest.path, fileRequest.mode, { pinned: fileRequest.pinned ?? fileRequest.mode === 'edit' })
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -800,6 +845,10 @@ export function FilesView() {
     const nextActive = activePath === path ? next[idx]?.path ?? next[idx - 1]?.path ?? null : activePath
     setTabs(next)
     setActivePath(nextActive)
+    if (activePath === path) {
+      setFindText('')
+      setPdfSourcePath(null)
+    }
     // diff mode is per-OPEN-tab state — a later reopen must start clean, not in
     // checkpoint-diff mode against a stale base
     setDiffPaths((prev) => {
@@ -847,7 +896,7 @@ export function FilesView() {
 
   // Cmd/Ctrl+S saves even when focus is outside the editor.
   const saveRef = useRef(save)
-  saveRef.current = save
+  useEffect(() => { saveRef.current = save }, [save])
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 's') {
@@ -1021,10 +1070,6 @@ export function FilesView() {
   const activeLatexPdf = activeLatexMain?.replace(/\.tex$/i, '.pdf')
   const pdfSourceTab = pdfSourcePath ? tabs.find((t) => t.path === pdfSourcePath) ?? null : null
 
-  useEffect(() => {
-    if (active?.mediaKind !== 'pdf') setPdfSourcePath(null)
-  }, [active?.mediaKind, active?.path])
-
   // one build at a time; a save landing mid-build queues exactly one trailing
   // rebuild so the LAST save always ends up on screen
   const buildInFlight = useRef(false)
@@ -1060,7 +1105,7 @@ export function FilesView() {
     if (!pdfSourceTab || !isTextTab(pdfSourceTab) || pdfSourceTab.loading || pdfSourceTab.value === pdfSourceTab.baseline || !isLatex(pdfSourceTab.path)) return
     const timer = window.setTimeout(() => { void savePath(pdfSourceTab.path, { toast: false }) }, 1200)
     return () => window.clearTimeout(timer)
-  }, [pdfSourceTab?.baseline, pdfSourceTab?.loading, pdfSourceTab?.path, pdfSourceTab?.value, savePath])
+  }, [pdfSourceTab, savePath])
 
   // every committed save (auto, ⌘S, the pane's Save button) — and a watcher
   // re-read after an external edit — moves the baseline; each move rebuilds
@@ -1072,7 +1117,7 @@ export function FilesView() {
     // first sight of this pane (fresh open) is not a save — don't build for it
     if (!prev || prev.path !== pdfSourceTab.path || prev.baseline === pdfSourceTab.baseline) return
     void buildMain()
-  }, [buildMain, pdfSourceTab?.baseline, pdfSourceTab?.loading, pdfSourceTab?.path])
+  }, [buildMain, pdfSourceTab])
 
   // latexSyncEnabled covers ANY pdf in the workspace: syncFromPdf handles
   // every miss itself — no SyncTeX data builds the SIBLING .tex and retries,
@@ -1114,17 +1159,17 @@ export function FilesView() {
         {pdfSourceDirty && <span className="fx-dirty" title="Unsaved changes" />}
         {pdfSourceBuilding && <Icon name="LoaderCircle" size={12} className="spin muted" />}
         <span className="grow" />
-        <button
+        <button type="button"
           className="fx-zoom-pill"
           onClick={() => setLivePdfSourceZoom(1)}
           title="Pinch over this source pane to zoom it independently. Click to reset."
         >
           {Math.round(pdfSourceZoom * 100)}%
         </button>
-        <button className="btn-icon btn-sm" onClick={() => void savePath(pdfSourceTab.path)} disabled={!pdfSourceDirty || pdfSourceTab.saving} title="Save source">
+        <button type="button" className="btn-icon btn-sm" onClick={() => void savePath(pdfSourceTab.path)} disabled={!pdfSourceDirty || pdfSourceTab.saving} title="Save source" aria-label="Save PDF source">
           <Icon name={pdfSourceTab.saving ? 'LoaderCircle' : 'Check'} size={12} className={pdfSourceTab.saving ? 'spin' : undefined} />
         </button>
-        <button className="btn-icon btn-sm" onClick={() => setPdfSourcePath(null)} title="Close source pane">
+        <button type="button" className="btn-icon btn-sm" onClick={() => setPdfSourcePath(null)} title="Close source pane" aria-label="Close PDF source pane">
           <Icon name="X" size={12} />
         </button>
       </div>
@@ -1167,7 +1212,7 @@ export function FilesView() {
         spellCheck={false}
       />
       {query && (
-        <button className="fx-search-clear" onClick={() => { setQuery(''); setSearchResults([]) }} title="Clear search">
+        <button type="button" className="fx-search-clear" onClick={() => { setQuery(''); setSearchResults([]) }} title="Clear search" aria-label="Clear file search">
           <Icon name="X" size={12} />
         </button>
       )}
@@ -1178,7 +1223,7 @@ export function FilesView() {
           ) : searchResults.length ? (
             <>
               {searchResults.map((result) => (
-                <button
+                <button type="button"
                   key={result.path}
                   className="fx-search-result"
                   onMouseDown={(e) => { e.preventDefault(); void open(result.path) }}
@@ -1204,12 +1249,18 @@ export function FilesView() {
       {tabs.map((tab) => {
         const tabDirty = isTextTab(tab) && tab.value !== tab.baseline
         return (
-          <button
+          <button type="button"
             key={tab.path}
             className="fx-tab"
             data-active={tab.path === activePath}
             data-preview={!tab.pinned || undefined}
-            onClick={() => setActivePath(tab.path)}
+            onClick={() => {
+              if (tab.path !== activePath) {
+                setFindText('')
+                setPdfSourcePath(null)
+              }
+              setActivePath(tab.path)
+            }}
             onDoubleClick={() => pinTab(tab.path)}
             title={tab.pinned ? tab.path : `${tab.path} — preview · double-click to pin`}
           >
@@ -1218,7 +1269,16 @@ export function FilesView() {
             {tabDirty && <span className="fx-dirty" title="Unsaved changes" />}
             <span
               className="fx-tab-close"
+              role="button"
+              tabIndex={0}
+              aria-label={`Close ${fileName(tab.path)}`}
               onClick={(e) => { e.stopPropagation(); closeTab(tab.path) }}
+              onKeyDown={(e) => {
+                if (e.key !== 'Enter' && e.key !== ' ') return
+                e.preventDefault()
+                e.stopPropagation()
+                closeTab(tab.path)
+              }}
               title="Close tab"
             >
               <Icon name="X" size={11} />
@@ -1231,7 +1291,7 @@ export function FilesView() {
 
   const activeActions = active && (
     <div className="fx-inline-actions">
-      <button
+      <button type="button"
         className="fx-zoom-pill"
         onClick={() => setLiveFileZoom(1, 20)}
         title={activeIsMedia ? 'Pinch on the trackpad to zoom the media. Click to reset.' : 'Pinch on the trackpad to zoom file text. Click to reset.'}
@@ -1249,7 +1309,7 @@ export function FilesView() {
           />
           {findText && <span className="fx-find-count">{findMatches}</span>}
           {findText && (
-            <button onClick={() => setFindText('')} title="Clear find">
+            <button type="button" onClick={() => setFindText('')} title="Clear find" aria-label="Clear document search">
               <Icon name="X" size={11} />
             </button>
           )}
@@ -1287,7 +1347,7 @@ export function FilesView() {
         </div>
       )}
       {activeIsText && (
-        <button className="btn btn-sm fx-save" disabled={!dirty || active.saving} onClick={save} title="Save  ⌘S">
+        <button type="button" className="btn btn-sm fx-save" disabled={!dirty || active.saving} onClick={save} title="Save  ⌘S">
           <Icon name={active.saving ? 'LoaderCircle' : 'Check'} size={13} className={active.saving ? 'spin' : ''} />
           {active.saving ? 'Saving' : 'Save'}
         </button>
@@ -1306,7 +1366,7 @@ export function FilesView() {
     return (
       <div className="view files-view">
         <div className="fx-blank">
-          <button className="btn btn-sm" onClick={openFolder}><Icon name="FolderOpen" size={13} /> Open folder</button>
+          <button type="button" className="btn btn-sm" onClick={openFolder}><Icon name="FolderOpen" size={13} /> Open folder</button>
         </div>
       </div>
     )
@@ -1329,7 +1389,7 @@ export function FilesView() {
             {latexMode && isDesktop && workspacePath ? (
               <LatexBar inline />
             ) : isDesktop && workspacePath ? (
-              <button
+              <button type="button"
                 className="btn btn-sm fx-changes-chip"
                 data-active={latexMode}
                 onClick={() => setLatexMode(!latexMode)}
@@ -1345,7 +1405,7 @@ export function FilesView() {
             {activeActions}
             {changes !== null && (
               <div className="fx-changes-wrap">
-                <button
+                <button type="button"
                   className="btn btn-sm fx-changes-chip fx-toolbar-icon"
                   data-active={changesOpen}
                   onClick={() => setChangesOpen((o) => !o)}
@@ -1360,7 +1420,7 @@ export function FilesView() {
                       <span className="grow truncate">
                         {lastCkpt ? `Since checkpoint · ${lastCkpt.label}` : 'Vs HEAD — no checkpoint yet'}
                       </span>
-                      <button
+                      <button type="button"
                         className="btn btn-ghost btn-sm"
                         onClick={() => { void snapshotWorkspace('Manual checkpoint'); setChangesOpen(false) }}
                         title="Snapshot the whole working tree now"
@@ -1368,7 +1428,7 @@ export function FilesView() {
                         <Icon name="Camera" size={12} /> Checkpoint
                       </button>
                       {lastCkpt && (
-                        <button
+                        <button type="button"
                           className="btn btn-ghost btn-sm"
                           onClick={() => { void restoreRepoCheckpoint(lastCkpt.id); setChangesOpen(false) }}
                           title={`Rewind every file to “${lastCkpt.label}”`}
@@ -1376,7 +1436,7 @@ export function FilesView() {
                           <Icon name="History" size={12} /> Restore
                         </button>
                       )}
-                      <button
+                      <button type="button"
                         className="btn btn-ghost btn-sm"
                         onClick={() => { useKaisola.getState().openGitPanel(); setChangesOpen(false) }}
                         title="Stage & commit these changes — the commit panel opens as a card"
@@ -1386,7 +1446,7 @@ export function FilesView() {
                     </div>
                     {changes.length === 0 && <div className="fx-search-empty">No changes.</div>}
                     {changes.slice(0, 40).map((c) => (
-                      <button
+                      <button type="button"
                         key={c.path}
                         className="fx-search-result"
                         onMouseDown={(e) => {
@@ -1408,7 +1468,7 @@ export function FilesView() {
                 )}
               </div>
             )}
-            <button className="btn btn-sm fx-toolbar-icon" onClick={openFolder} title={workspacePath}>
+            <button type="button" className="btn btn-sm fx-toolbar-icon" onClick={openFolder} title={workspacePath} aria-label="Open another project folder">
               <Icon name="FolderOpen" size={13} />
             </button>
           </div>
@@ -1505,11 +1565,7 @@ function PdfRasterPreview({
   latexSyncEnabled?: boolean
   onPdfSync?: (req: { pdfPath: string; page: number; x: number; y: number }) => void
 }) {
-  const [info, setInfo] = useState<PdfInfoState | null>(null)
-  const [message, setMessage] = useState<string | null>(null)
-  const [nativeFallback, setNativeFallback] = useState(false)
-  const [activePage, setActivePage] = useState(1)
-  const [pages, setPages] = useState<Record<number, PdfPageImage>>({})
+  const [{ info, message, nativeFallback, activePage, pages }, dispatchPdf] = useReducer(pdfRasterReducer, initialPdfRasterState)
   const loadingRef = useRef<Set<string>>(new Set())
   const scrollerRef = useRef<HTMLDivElement>(null)
   // a hard failure (no poppler, render error) latches the native fallback;
@@ -1528,21 +1584,16 @@ function PdfRasterPreview({
     let cancelled = false
     const prevPath = identityRef.current.path
     identityRef.current = { path: tab.path, version }
-    setInfo(null)
-    setMessage(null)
-    setNativeFallback(false)
     errorLatchedRef.current = false
     // a rebuild of the SAME file keeps the reading position; a new file starts at 1
-    setActivePage((p) => (prevPath === tab.path ? p : 1))
-    setPages({})
+    dispatchPdf({ type: 'reset', keepActivePage: prevPath === tab.path })
     loadingRef.current.clear()
     void bridge.fs.pdfInfo(tab.path).then((r) => {
       if (cancelled) return
-      if (r.ok && r.pages && r.width && r.height) setInfo({ pages: r.pages, width: r.width, height: r.height })
+      if (r.ok && r.pages && r.width && r.height) dispatchPdf({ type: 'infoLoaded', info: { pages: r.pages, width: r.width, height: r.height } })
       else {
-        setMessage(r.message ?? 'Could not inspect this PDF.')
         errorLatchedRef.current = true
-        setNativeFallback(true)
+        dispatchPdf({ type: 'failed', message: r.message ?? 'Could not inspect this PDF.' })
       }
     })
     return () => { cancelled = true }
@@ -1562,14 +1613,17 @@ function PdfRasterPreview({
       // previous PDF's pixels (or its error) into the new state
       if (identityRef.current.path !== requestedFor.path || identityRef.current.version !== requestedFor.version) return
       if (!r.ok || !r.url) {
-        setMessage(r.message ?? 'Could not render this PDF page.')
         errorLatchedRef.current = true
-        setNativeFallback(true)
+        dispatchPdf({ type: 'failed', message: r.message ?? 'Could not render this PDF page.' })
         return
       }
-      setPages((current) => ({ ...current, [page]: { url: r.url!, width: r.width ?? 0, height: r.height ?? 0, scale: r.scale ?? renderScale * 2, renderedFor: scaleBucket } }))
-      // the raster arrived — leave the slow-page fallback if no hard error hit
-      if (page === 1 && !errorLatchedRef.current) setNativeFallback(false)
+      dispatchPdf({
+        type: 'pageLoaded',
+        page,
+        image: { url: r.url, width: r.width ?? 0, height: r.height ?? 0, scale: r.scale ?? renderScale * 2, renderedFor: scaleBucket },
+        // the raster arrived — leave the slow-page fallback if no hard error hit
+        clearFallback: page === 1 && !errorLatchedRef.current,
+      })
     })
   }, [info, pages, renderScale, scaleBucket, tab.path, version])
 
@@ -1581,7 +1635,7 @@ function PdfRasterPreview({
   useEffect(() => {
     if (!info || pages[1] || nativeFallback) return
     const timer = window.setTimeout(() => {
-      if (!pages[1]) setNativeFallback(true)
+      if (!pages[1]) dispatchPdf({ type: 'showFallback' })
     }, 3200)
     return () => window.clearTimeout(timer)
   }, [info, nativeFallback, pages])
@@ -1600,7 +1654,7 @@ function PdfRasterPreview({
         next = Number(node.dataset.page || activePage)
       }
     }
-    if (Number.isFinite(next) && next !== activePage) setActivePage(next)
+    if (Number.isFinite(next) && next !== activePage) dispatchPdf({ type: 'activePageChanged', page: next })
   }, [activePage])
 
   const onDoubleClick = useCallback((e: ReactMouseEvent<HTMLDivElement>) => {
@@ -1627,6 +1681,11 @@ function PdfRasterPreview({
   // previewUrl is a stable per-path token — the ?v= buster makes the iframe
   // actually reload after a rebuild (a data: url must never be suffixed)
   const nativeSrc = tab.previewUrl ? `${tab.previewUrl}?v=${version}` : tab.dataUrl
+  const totalPages = info?.pages ?? 0
+  const pageSlots = useMemo(
+    () => Array.from({ length: totalPages }, (_, offset) => ({ page: offset + 1, key: `${tab.path}#page-${offset + 1}` })),
+    [tab.path, totalPages],
+  )
   if (nativeFallback && nativeSrc) {
     return (
       <div className="fx-media fx-media-pdf">
@@ -1634,6 +1693,7 @@ function PdfRasterPreview({
           className="fx-pdf-frame"
           src={`${nativeSrc}#view=FitH&navpanes=0&pagemode=none`}
           title={message ? `${fileName(tab.path)} — native fallback: ${message}` : fileName(tab.path)}
+          sandbox="allow-scripts allow-downloads"
         />
       </div>
     )
@@ -1660,8 +1720,7 @@ function PdfRasterPreview({
       title={latexSyncEnabled ? 'Double-click the PDF page to jump to the source line' : undefined}
     >
       <div className="fx-pdf-pages">
-        {Array.from({ length: info.pages }, (_, i) => {
-          const page = i + 1
+        {pageSlots.map(({ page, key }) => {
           const image = pages[page]
           // rendered pages know their true size — mixed-size documents (a
           // landscape figure page) must not be squashed to page 1's box
@@ -1670,7 +1729,7 @@ function PdfRasterPreview({
             : `${info.width} / ${info.height}`
           return (
             <div
-              key={page}
+              key={key}
               className="fx-pdf-page"
               data-page={page}
               style={{ width: pageWidth, aspectRatio: ratio }}
@@ -1693,7 +1752,7 @@ function PdfRasterPreview({
 
 function ModeBtn({ icon, label, active, onClick }: { icon: string; label: string; active: boolean; onClick: () => void }) {
   return (
-    <button className="fx-mode" data-active={active} onClick={onClick} title={label}>
+    <button type="button" className="fx-mode" data-active={active} onClick={onClick} title={label}>
       <Icon name={icon} size={12} />
       <span>{label}</span>
     </button>

@@ -117,16 +117,18 @@ export function BrowserCard({ id }: { id: string }) {
   return (
     <div className="web-panel">
       <div className="web-bar">
-        <button className="btn-icon btn-sm" disabled={!nav.back} onClick={() => viewRef.current?.goBack()} title="Back">
+        <button type="button" className="btn-icon btn-sm" disabled={!nav.back} onClick={() => viewRef.current?.goBack()} title="Back" aria-label="Go back">
           <Icon name="ArrowLeft" size={13} />
         </button>
-        <button className="btn-icon btn-sm" disabled={!nav.fwd} onClick={() => viewRef.current?.goForward()} title="Forward">
+        <button type="button" className="btn-icon btn-sm" disabled={!nav.fwd} onClick={() => viewRef.current?.goForward()} title="Forward" aria-label="Go forward">
           <Icon name="ArrowRight" size={13} />
         </button>
         <button
+          type="button"
           className="btn-icon btn-sm"
           onClick={() => (nav.loading ? viewRef.current?.stop() : viewRef.current?.reload())}
           title={nav.loading ? 'Stop' : 'Reload'}
+          aria-label={nav.loading ? 'Stop loading' : 'Reload page'}
         >
           <Icon name={nav.loading ? 'X' : 'RotateCw'} size={12} />
         </button>
@@ -140,16 +142,20 @@ export function BrowserCard({ id }: { id: string }) {
           spellCheck={false}
         />
         <button
+          type="button"
           className="btn-icon btn-sm"
           onClick={() => viewRef.current?.openDevTools()}
           title="Web Inspector"
+          aria-label="Open Web Inspector"
         >
           <Icon name="Code" size={13} />
         </button>
         <button
+          type="button"
           className="btn-icon btn-sm"
           onClick={() => { if (panel?.url) void bridge.openExternal(panel.url) }}
           title="Open in your browser"
+          aria-label="Open in your browser"
         >
           <Icon name="ExternalLink" size={13} />
         </button>

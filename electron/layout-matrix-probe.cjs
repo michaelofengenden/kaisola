@@ -129,9 +129,10 @@ app.whenReady().then(async () => {
 
   const wide = await inspect('wide-mixed')
 
-  // The local preview close must be the top hit target, not a draggable canvas.
+  // The permanent top-right preview switch must be a real hit target inside
+  // the frameless window drag row.
   const closePoint = await win.webContents.executeJavaScript(`(() => {
-    const button = document.querySelector('.canvas-local-close')
+    const button = document.querySelector('.tabstrip-view-controls [aria-label="Hide file preview"]')
     const rect = button?.getBoundingClientRect()
     if (!button || !rect) return null
     const x = Math.round(rect.left + rect.width / 2)
@@ -142,13 +143,13 @@ app.whenReady().then(async () => {
     win.webContents.sendInputEvent({ type: 'mouseDown', x: closePoint.x, y: closePoint.y, button: 'left', clickCount: 1 })
     win.webContents.sendInputEvent({ type: 'mouseUp', x: closePoint.x, y: closePoint.y, button: 'left', clickCount: 1 })
   }
-  await wait(180)
+  await wait(300)
   const canvasClosed = await win.webContents.executeJavaScript(`!window.__kaisola.getState().canvasOpen`)
-  await win.webContents.executeJavaScript(`document.querySelector('[aria-label="Show file preview"]')?.click()`)
-  await wait(180)
+  await win.webContents.executeJavaScript(`document.querySelector('.tabstrip-view-controls [aria-label="Show file preview"]')?.click()`)
+  await wait(300)
   const canvasRestored = await win.webContents.executeJavaScript(`window.__kaisola.getState().canvasOpen`)
 
-  // Markdown enters the clean rich editor without the old inset accent bar.
+  // Markdown enters the clean rich editor with the authoring toolbar.
   await win.webContents.executeJavaScript(`window.__kaisola.getState().requestFile(${JSON.stringify(markdownFixture)}, 'preview', { pinned: true })`)
   await wait(240)
   await win.webContents.executeJavaScript(`document.querySelector('.fx-doc-markdown')?.dispatchEvent(new MouseEvent('dblclick', { bubbles: true }))`)
@@ -158,7 +159,9 @@ app.whenReady().then(async () => {
     const page = root?.querySelector('.fx-doc-page')
     if (!root || !page) return false
     page.focus()
-    return !getComputedStyle(page).boxShadow.includes('inset')
+    return !getComputedStyle(page).boxShadow.includes('inset') &&
+      !!root.querySelector('.fx-md-toolbar[role="toolbar"]') &&
+      !!root.querySelector('.fx-md-toolbar [aria-label="Bold"]')
   })()`)
 
   // Real pointer drag: Sessions stretches, Files remains unchanged.

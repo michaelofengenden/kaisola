@@ -317,7 +317,7 @@ export function CommandPalette() {
       { id: 'sessions-hide', group: 'Actions', label: 'Hide sessions', hint: 'Keep sessions running in the background', icon: 'PanelLeftClose', run: () => { setDock(false); close() } },
       { id: 'files-show', group: 'Actions', label: 'Show files', hint: 'Reveal the project canvas', icon: 'PanelRightOpen', run: () => { if (layoutMode === 'studio' && !canvasOpen) toggleCanvas(); close() } },
       { id: 'files-hide', group: 'Actions', label: 'Hide files', hint: 'Give the whole work row to sessions', icon: 'PanelRightClose', run: () => { if (layoutMode === 'focus' || canvasOpen) toggleCanvas(); close() } },
-      { id: 'file-tree-toggle', group: 'Layout', label: railOpen ? 'Hide file tree' : 'Show file tree', hint: 'The open pane owns its close button', icon: 'FolderTree', run: () => { toggleRail(); close() } },
+      { id: 'file-tree-toggle', group: 'Layout', label: railOpen ? 'Hide file tree' : 'Show file tree', hint: 'Also available in the top-right panel controls', icon: 'FolderTree', run: () => { toggleRail(); close() } },
       { id: 'sessions-left', group: 'Layout', label: 'Place sessions on the left', icon: 'PanelsTopLeft', run: () => { setTabLayout('sidebar'); close() } },
       { id: 'sessions-top', group: 'Layout', label: 'Place sessions across the top', icon: 'PanelTop', run: () => { setTabLayout('bare'); close() } },
       { id: 'sessions-shelf', group: 'Layout', label: 'Use nested session shelf', icon: 'PanelTop', run: () => { setTabLayout('shelf'); close() } },

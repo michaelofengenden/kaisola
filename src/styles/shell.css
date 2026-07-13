@@ -230,6 +230,88 @@
   background: transparent;
 }
 
+/* Stable, Codex-style file-tree / file-preview switches at the far right.
+   Their slots never collapse, so the controls do not jump when a panel does. */
+.tabstrip-view-controls {
+  align-self: center;
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  height: 30px;
+  padding: 2px;
+  margin-left: var(--sp-1);
+  flex: 0 0 auto;
+  border: 1px solid color-mix(in srgb, var(--border-faint) 72%, transparent);
+  border-radius: var(--r-3);
+  background: color-mix(in srgb, var(--bg-1) 36%, transparent);
+  -webkit-app-region: no-drag;
+}
+.tabstrip-view-controls > button {
+  display: inline-grid;
+  place-items: center;
+  width: 24px;
+  height: 24px;
+  border-radius: var(--r-2);
+  color: var(--text-3);
+  transition: color var(--dur-2) var(--ease-out), background var(--dur-2) var(--ease-out),
+    box-shadow var(--dur-2) var(--ease-out), transform var(--dur-2) var(--ease-out);
+}
+.tabstrip-view-controls > button:hover {
+  color: var(--text-0);
+  background: var(--hover-overlay);
+}
+.tabstrip-view-controls > button:active { transform: scale(0.94); }
+.tabstrip-view-controls > button[data-active] {
+  color: var(--text-1);
+  background: color-mix(in srgb, var(--bg-3) 74%, transparent);
+  box-shadow: inset 0 0 0 1px var(--border-faint);
+}
+
+/* Named snapshots give conditionally mounted panels a real exit transition.
+   The rest of the shell immediately takes its new layout underneath. */
+.wsrail { view-transition-name: kaisola-file-tree; }
+.canvas-wrap { view-transition-name: kaisola-file-preview; }
+:root[data-panel-transition]::view-transition-old(root),
+:root[data-panel-transition]::view-transition-new(root) {
+  animation: none;
+  mix-blend-mode: normal;
+}
+::view-transition-group(kaisola-file-tree),
+::view-transition-group(kaisola-file-preview) {
+  animation-duration: 240ms;
+  animation-timing-function: var(--ease-out);
+}
+:root[data-panel-transition='tree-left']::view-transition-old(kaisola-file-tree) {
+  animation: panel-exit-left 170ms var(--ease-in-out) both;
+}
+:root[data-panel-transition='tree-left']::view-transition-new(kaisola-file-tree) {
+  animation: panel-enter-left 240ms var(--ease-out) both;
+}
+:root[data-panel-transition='tree-right']::view-transition-old(kaisola-file-tree),
+:root[data-panel-transition='preview-right']::view-transition-old(kaisola-file-preview) {
+  animation: panel-exit-right 170ms var(--ease-in-out) both;
+}
+:root[data-panel-transition='tree-right']::view-transition-new(kaisola-file-tree),
+:root[data-panel-transition='preview-right']::view-transition-new(kaisola-file-preview) {
+  animation: panel-enter-right 240ms var(--ease-out) both;
+}
+@keyframes panel-enter-left {
+  from { opacity: 0; transform: translateX(-12px) scale(0.985); }
+  to { opacity: 1; transform: translateX(0) scale(1); }
+}
+@keyframes panel-exit-left {
+  from { opacity: 1; transform: translateX(0) scale(1); }
+  to { opacity: 0; transform: translateX(-9px) scale(0.99); }
+}
+@keyframes panel-enter-right {
+  from { opacity: 0; transform: translateX(12px) scale(0.985); }
+  to { opacity: 1; transform: translateX(0) scale(1); }
+}
+@keyframes panel-exit-right {
+  from { opacity: 1; transform: translateX(0) scale(1); }
+  to { opacity: 0; transform: translateX(9px) scale(0.99); }
+}
+
 /* a tab: sits at flex-basis 200px, shrinks to 54px, then the track scrolls */
 .ptab {
   flex: 0 1 auto;
@@ -546,7 +628,16 @@
 /* the cross-project inbox (Settings → Interface): anchored at zero, otherwise a
    quiet icon matching its .btn-icon neighbours with a small corner count —
    the old accent pill floated loudly above the footer and misaligned its row */
-.inbox-wrap { position: relative; }
+.inbox-wrap {
+  position: relative;
+  display: grid;
+  place-items: center;
+  width: 28px;
+  height: 28px;
+  flex: 0 0 28px;
+  align-self: center;
+  line-height: 0;
+}
 .inbox-btn {
   position: relative;
   display: inline-flex;
@@ -554,6 +645,8 @@
   justify-content: center;
   width: 28px;
   height: 28px;
+  padding: 0;
+  line-height: 0;
   border-radius: var(--r-2);
   color: var(--text-2);
   cursor: pointer;
@@ -635,6 +728,10 @@
   width: 28px;
   height: 28px;
   flex: 0 0 28px;
+}
+.shell-sidebar-footer-tools > button,
+.shell-sidebar-footer-tools > .inbox-wrap {
+  align-self: center;
 }
 /* the popover anchors to the footer itself, spanning its width, so it can
    never clip at the panel edge no matter where the (centered) bell sits */
@@ -1823,18 +1920,6 @@
 .canvas-resize:hover {
   background: var(--accent-soft);
 }
-.canvas-local-close {
-  position: absolute;
-  top: 6px;
-  right: 8px;
-  z-index: 8;
-  color: var(--text-3);
-  background: color-mix(in srgb, var(--bg-2) 82%, transparent);
-  border: 1px solid var(--border-faint);
-  -webkit-app-region: no-drag;
-}
-.canvas-local-close:hover { color: var(--text-0); background: var(--hover-overlay); }
-.canvas-wrap:has(.canvas-local-close) .fx-toolbar-main { padding-right: 44px; }
 .canvas {
   flex: 1;
   min-width: 0;
@@ -1842,6 +1927,16 @@
   background: var(--bg-1);
   overflow-y: auto;
   overflow-x: hidden;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .tabstrip-view-controls > button { transition: none; }
+  ::view-transition-group(kaisola-file-tree),
+  ::view-transition-group(kaisola-file-preview),
+  ::view-transition-old(kaisola-file-tree),
+  ::view-transition-new(kaisola-file-tree),
+  ::view-transition-old(kaisola-file-preview),
+  ::view-transition-new(kaisola-file-preview) { animation: none; }
 }
 
 /* ── Vertical session navigation (default left sidebar) ────────────────── */

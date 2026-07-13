@@ -202,6 +202,7 @@ export function ProjectTabs() {
       )}
       <div className="tabstrip-fill" onDoubleClick={() => bridge.winCtl('zoom')} />
       <UpdatePill />
+      <ViewControls />
       {/* portalled to <body> — rendered in-strip it inherits a stacking context
           that loses to the session cards' glass layers and slides behind them */}
       {menu && createPortal(
@@ -250,6 +251,75 @@ export function ProjectTabs() {
         </div>,
         document.body,
       )}
+    </div>
+  )
+}
+
+type ViewTransitionDocument = Document & {
+  startViewTransition?: (update: () => void) => { finished: Promise<unknown> }
+}
+
+/**
+ * The project tree and document canvas stay addressable in one stable place.
+ * View Transitions animate entry and exit without keeping a hidden editor or
+ * terminal subtree mounted just for an exit animation.
+ */
+function ViewControls() {
+  const layoutMode = useKaisola((s) => s.layoutMode)
+  const tabLayout = useKaisola((s) => s.tabLayout)
+  const railOpen = useKaisola((s) => s.railOpen)
+  const canvasOpen = useKaisola((s) => s.canvasOpen)
+  const treeVisible = layoutMode === 'studio' && railOpen
+  const previewVisible = layoutMode === 'focus' || canvasOpen
+
+  const transition = (kind: string, update: () => void) => {
+    const doc = document as ViewTransitionDocument
+    const reduced = window.matchMedia?.('(prefers-reduced-motion: reduce)').matches
+    if (!doc.startViewTransition || reduced) {
+      update()
+      return
+    }
+    document.documentElement.dataset.panelTransition = kind
+    const view = doc.startViewTransition(update)
+    const clearTransition = () => {
+      if (document.documentElement.dataset.panelTransition === kind) delete document.documentElement.dataset.panelTransition
+    }
+    // A superseding navigation can reject `finished`; cleanup should be the
+    // same in either case and must not leave an unhandled promise behind.
+    void view.finished.then(clearTransition, clearTransition)
+  }
+
+  const toggleTree = () => transition(tabLayout === 'sidebar' ? 'tree-right' : 'tree-left', () => {
+    const state = useKaisola.getState()
+    if (state.layoutMode !== 'studio') {
+      state.setLayoutMode('studio')
+      if (!state.railOpen) state.toggleRail()
+      return
+    }
+    state.toggleRail()
+  })
+  const togglePreview = () => transition('preview-right', () => useKaisola.getState().toggleCanvas())
+
+  return (
+    <div className="tabstrip-view-controls" role="group" aria-label="Workspace panels">
+      <button
+        data-active={treeVisible || undefined}
+        aria-pressed={treeVisible}
+        aria-label={treeVisible ? 'Hide file tree' : 'Show file tree'}
+        title={`${treeVisible ? 'Hide' : 'Show'} file tree  ⌘B`}
+        onClick={toggleTree}
+      >
+        <Icon name={treeVisible ? 'PanelLeftClose' : 'PanelLeftOpen'} size={15} />
+      </button>
+      <button
+        data-active={previewVisible || undefined}
+        aria-pressed={previewVisible}
+        aria-label={previewVisible ? 'Hide file preview' : 'Show file preview'}
+        title={`${previewVisible ? 'Hide' : 'Show'} file preview  ⌘.`}
+        onClick={togglePreview}
+      >
+        <Icon name={previewVisible ? 'PanelRightClose' : 'PanelRightOpen'} size={15} />
+      </button>
     </div>
   )
 }

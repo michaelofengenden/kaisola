@@ -3,6 +3,7 @@ import {
   cloneElement,
   isValidElement,
   memo,
+  useCallback,
   useEffect,
   useMemo,
   useRef,
@@ -17,6 +18,7 @@ import remarkGfm from 'remark-gfm'
 import TurndownService from 'turndown'
 import { bridge, type FsReadResult } from '../lib/bridge'
 import { useKaisola } from '../store/store'
+import { Icon } from './Icon'
 
 export type DocumentPreviewKind = 'markdown' | 'html' | 'csv' | 'json'
 
@@ -80,14 +82,71 @@ function markdownComponent(Tag: keyof JSX.IntrinsicElements, highlight: string) 
   return Component
 }
 
-function EditableMarkdownSurface({ text, onChange }: { text: string; onChange?: (text: string) => void }) {
+type MarkdownSelectionState = {
+  block: 'p' | 'h1' | 'h2' | 'h3' | 'blockquote' | 'pre'
+  bold: boolean
+  italic: boolean
+  strike: boolean
+  unordered: boolean
+  ordered: boolean
+}
+
+const EMPTY_MARKDOWN_SELECTION: MarkdownSelectionState = {
+  block: 'p',
+  bold: false,
+  italic: false,
+  strike: false,
+  unordered: false,
+  ordered: false,
+}
+
+function markdownHtml(text: string) {
+  return renderToStaticMarkup(<ReactMarkdown remarkPlugins={[remarkGfm]}>{text}</ReactMarkdown>)
+}
+
+function selectionBlock(node: Node | null, root: HTMLElement): MarkdownSelectionState['block'] {
+  const element = node instanceof Element ? node : node?.parentElement
+  const block = element?.closest('h1, h2, h3, blockquote, pre, p')
+  if (!block || !root.contains(block)) return 'p'
+  const tag = block.tagName.toLowerCase()
+  return ['h1', 'h2', 'h3', 'blockquote', 'pre'].includes(tag) ? tag as MarkdownSelectionState['block'] : 'p'
+}
+
+function markdownSelectionEqual(a: MarkdownSelectionState, b: MarkdownSelectionState) {
+  return a.block === b.block && a.bold === b.bold && a.italic === b.italic && a.strike === b.strike && a.unordered === b.unordered && a.ordered === b.ordered
+}
+
+async function hydrateEditableImages(root: HTMLElement, sourcePath?: string) {
+  const images = Array.from(root.querySelectorAll<HTMLImageElement>('img[src]'))
+  await Promise.all(images.map(async (image) => {
+    const original = image.dataset.markdownSrc ?? image.getAttribute('src') ?? ''
+    if (!original || image.dataset.markdownHydrated === 'true' || isRemoteOrDataImage(original)) return
+    const localPath = resolveMarkdownAsset(sourcePath, original)
+    if (!localPath) return
+    image.dataset.markdownSrc = original
+    image.dataset.markdownHydrated = 'true'
+    const first = await bridge.fs.read(localPath)
+    let url = imageUrlFrom(first)
+    if (!url) {
+      const stripped = stripUrlDecorations(original)
+      const fallback = stripped === original ? null : resolveMarkdownAsset(sourcePath, stripped)
+      if (fallback) url = imageUrlFrom(await bridge.fs.read(fallback))
+    }
+    if (url) image.src = url
+    else image.dataset.markdownHydrated = 'failed'
+  }))
+}
+
+function EditableMarkdownSurface({ text, sourcePath, onChange }: { text: string; sourcePath?: string; onChange?: (text: string) => void }) {
   // contentEditable must own its descendants while the user types. Giving
   // React a static HTML snapshot keeps reconciliation from replacing the
   // browser's live selection or undo stack after each onInput state update.
   const html = useRef<string | null>(null)
-  if (html.current === null) {
-    html.current = renderToStaticMarkup(<ReactMarkdown remarkPlugins={[remarkGfm]}>{text}</ReactMarkdown>)
-  }
+  if (html.current === null) html.current = markdownHtml(text)
+  const surfaceRef = useRef<HTMLElement>(null)
+  const savedRange = useRef<Range | null>(null)
+  const emittedText = useRef(text)
+  const [selectionState, setSelectionState] = useState<MarkdownSelectionState>(EMPTY_MARKDOWN_SELECTION)
   const turndown = useMemo(() => {
     const service = new TurndownService({
       headingStyle: 'atx',
@@ -100,30 +159,184 @@ function EditableMarkdownSurface({ text, onChange }: { text: string; onChange?: 
       filter: ['del', 's'],
       replacement: (content) => `~~${content}~~`,
     })
+    // Local images are hydrated to a data URL for the editing surface. Keep
+    // their original markdown path on the node so saving never expands the
+    // file into a multi-megabyte data URI.
+    service.addRule('kaisola-image', {
+      filter: 'img',
+      replacement: (_content, node) => {
+        const element = node as HTMLElement
+        const src = element.dataset.markdownSrc ?? element.getAttribute('src') ?? ''
+        const alt = (element.getAttribute('alt') ?? '').replace(/\]/g, '\\]')
+        const title = element.getAttribute('title')
+        return src ? `![${alt}](${src}${title ? ` \"${title.replace(/\"/g, '\\\"')}\"` : ''})` : ''
+      },
+    })
     return service
   }, [])
 
+  const syncMarkdown = useCallback(() => {
+    const surface = surfaceRef.current
+    if (!surface) return
+    const next = turndown.turndown(surface.innerHTML).replace(/\n{3,}/g, '\n\n').trimEnd()
+    const markdown = next ? `${next}\n` : ''
+    emittedText.current = markdown
+    onChange?.(markdown)
+    void hydrateEditableImages(surface, sourcePath)
+  }, [onChange, sourcePath, turndown])
+
+  const captureSelection = useCallback(() => {
+    const surface = surfaceRef.current
+    const selection = window.getSelection()
+    if (!surface || !selection?.rangeCount || !selection.anchorNode || !surface.contains(selection.anchorNode)) return
+    savedRange.current = selection.getRangeAt(0).cloneRange()
+    const next: MarkdownSelectionState = {
+      block: selectionBlock(selection.anchorNode, surface),
+      bold: document.queryCommandState('bold'),
+      italic: document.queryCommandState('italic'),
+      strike: document.queryCommandState('strikeThrough'),
+      unordered: document.queryCommandState('insertUnorderedList'),
+      ordered: document.queryCommandState('insertOrderedList'),
+    }
+    setSelectionState((current) => markdownSelectionEqual(current, next) ? current : next)
+  }, [])
+
+  useEffect(() => {
+    const surface = surfaceRef.current
+    if (surface) void hydrateEditableImages(surface, sourcePath)
+  }, [sourcePath])
+
+  useEffect(() => {
+    document.addEventListener('selectionchange', captureSelection)
+    return () => document.removeEventListener('selectionchange', captureSelection)
+  }, [captureSelection])
+
+  // Watcher-driven changes can land while Edit is open. Reconcile them when
+  // this surface did not originate the update and the user is not typing.
+  useEffect(() => {
+    const surface = surfaceRef.current
+    if (!surface || text === emittedText.current || surface.contains(document.activeElement)) return
+    const next = markdownHtml(text)
+    surface.innerHTML = next
+    html.current = next
+    emittedText.current = text
+    void hydrateEditableImages(surface, sourcePath)
+  }, [sourcePath, text])
+
+  const restoreSelection = () => {
+    const surface = surfaceRef.current
+    const selection = window.getSelection()
+    if (!surface || !selection) return false
+    surface.focus()
+    selection.removeAllRanges()
+    const range = savedRange.current
+    if (range && surface.contains(range.startContainer)) selection.addRange(range)
+    else {
+      const end = document.createRange()
+      end.selectNodeContents(surface)
+      end.collapse(false)
+      selection.addRange(end)
+    }
+    return true
+  }
+
+  const runCommand = (command: string, value?: string) => {
+    if (!restoreSelection()) return
+    document.execCommand(command, false, value)
+    syncMarkdown()
+    captureSelection()
+  }
+
+  const createLink = () => {
+    if (!restoreSelection()) return
+    const href = window.prompt('Link URL')?.trim()
+    if (!href) return
+    if (!isSafeUrl(href)) {
+      useKaisola.getState().pushToast('warn', 'Use an http(s), mail, anchor, or relative link.')
+      return
+    }
+    const selection = window.getSelection()
+    if (selection && !selection.isCollapsed) document.execCommand('createLink', false, href)
+    else document.execCommand('insertHTML', false, `<a href="${escapeAttr(href)}">${escapeAttr(href)}</a>`)
+    syncMarkdown()
+    captureSelection()
+  }
+
   return (
-    <article
-      className="fx-doc-page md"
-      contentEditable
-      suppressContentEditableWarning
-      role="textbox"
-      aria-multiline="true"
-      aria-label="Edit Markdown document"
-      spellCheck
-      dangerouslySetInnerHTML={{ __html: html.current }}
-      onInput={(event) => {
-        const next = turndown.turndown(event.currentTarget.innerHTML).replace(/\n{3,}/g, '\n\n').trimEnd()
-        onChange?.(`${next}\n`)
-      }}
-      onKeyDown={(event) => {
-        if (event.key === 'Tab') {
+    <>
+      <div className="fx-md-toolbar" role="toolbar" aria-label="Markdown formatting">
+        <button onMouseDown={(event) => event.preventDefault()} onClick={() => runCommand('undo')} title="Undo  ⌘Z" aria-label="Undo">
+          <Icon name="Undo2" size={14} />
+        </button>
+        <button onMouseDown={(event) => event.preventDefault()} onClick={() => runCommand('redo')} title="Redo  ⇧⌘Z" aria-label="Redo">
+          <Icon name="Redo2" size={14} />
+        </button>
+        <span className="fx-md-toolbar-sep" />
+        <select
+          value={selectionState.block}
+          aria-label="Text style"
+          title="Text style"
+          onMouseDown={captureSelection}
+          onChange={(event) => runCommand('formatBlock', `<${event.target.value}>`)}
+        >
+          <option value="p">Body</option>
+          <option value="h1">Heading 1</option>
+          <option value="h2">Heading 2</option>
+          <option value="h3">Heading 3</option>
+          <option value="blockquote">Quote</option>
+          <option value="pre">Code block</option>
+        </select>
+        <span className="fx-md-toolbar-sep" />
+        <button data-active={selectionState.bold || undefined} onMouseDown={(event) => event.preventDefault()} onClick={() => runCommand('bold')} title="Bold  ⌘B" aria-label="Bold">
+          <Icon name="Bold" size={14} />
+        </button>
+        <button data-active={selectionState.italic || undefined} onMouseDown={(event) => event.preventDefault()} onClick={() => runCommand('italic')} title="Italic  ⌘I" aria-label="Italic">
+          <Icon name="Italic" size={14} />
+        </button>
+        <button data-active={selectionState.strike || undefined} onMouseDown={(event) => event.preventDefault()} onClick={() => runCommand('strikeThrough')} title="Strikethrough" aria-label="Strikethrough">
+          <Icon name="Strikethrough" size={14} />
+        </button>
+        <button onMouseDown={(event) => event.preventDefault()} onClick={createLink} title="Add link" aria-label="Add link">
+          <Icon name="Link2" size={14} />
+        </button>
+        <span className="fx-md-toolbar-sep" />
+        <button data-active={selectionState.unordered || undefined} onMouseDown={(event) => event.preventDefault()} onClick={() => runCommand('insertUnorderedList')} title="Bulleted list" aria-label="Bulleted list">
+          <Icon name="List" size={14} />
+        </button>
+        <button data-active={selectionState.ordered || undefined} onMouseDown={(event) => event.preventDefault()} onClick={() => runCommand('insertOrderedList')} title="Numbered list" aria-label="Numbered list">
+          <Icon name="ListOrdered" size={14} />
+        </button>
+        <button onMouseDown={(event) => event.preventDefault()} onClick={() => runCommand('formatBlock', '<blockquote>')} title="Quote" aria-label="Quote">
+          <Icon name="Quote" size={14} />
+        </button>
+        <button onMouseDown={(event) => event.preventDefault()} onClick={() => runCommand('formatBlock', '<pre>')} title="Code block" aria-label="Code block">
+          <Icon name="Code2" size={14} />
+        </button>
+        <span className="fx-md-editing"><span /> Editing Markdown</span>
+      </div>
+      <article
+        ref={surfaceRef}
+        className="fx-doc-page md"
+        contentEditable
+        suppressContentEditableWarning
+        role="textbox"
+        aria-multiline="true"
+        aria-label="Edit Markdown document"
+        spellCheck
+        dangerouslySetInnerHTML={{ __html: html.current }}
+        onInput={syncMarkdown}
+        onKeyUp={captureSelection}
+        onMouseUp={captureSelection}
+        onKeyDown={(event) => {
+          if (event.key !== 'Tab') return
           event.preventDefault()
-          document.execCommand('insertText', false, '  ')
-        }
-      }}
-    />
+          const selection = window.getSelection()
+          const inList = selection?.anchorNode && (selection.anchorNode instanceof Element ? selection.anchorNode : selection.anchorNode.parentElement)?.closest('li')
+          document.execCommand(inList ? (event.shiftKey ? 'outdent' : 'indent') : 'insertText', false, inList ? undefined : '  ')
+          syncMarkdown()
+        }}
+      />
+    </>
   )
 }
 
@@ -228,7 +441,9 @@ function insertHtmlAtPoint(root: HTMLElement | null, range: Range | null, htmlCh
     end.collapse(false)
     selection.addRange(end)
   }
-  return document.execCommand('insertHTML', false, htmlChunk)
+  const inserted = document.execCommand('insertHTML', false, htmlChunk)
+  if (inserted) surface.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertFromDrop' }))
+  return inserted
 }
 
 function sanitizeHtml(raw: string, query: string) {
@@ -606,9 +821,8 @@ export const DocumentPreview = memo(function DocumentPreview({ text, kind, sourc
       onDragOver={onMediaDragOver}
       onDrop={onMediaDrop}
     >
-      {editable && <span className="fx-md-editing"><span /> Editing</span>}
       {editable ? (
-        <EditableMarkdownSurface text={text} onChange={onChange} />
+        <EditableMarkdownSurface text={text} sourcePath={sourcePath} onChange={onChange} />
       ) : (
         <article className="fx-doc-page md">
         <ReactMarkdown

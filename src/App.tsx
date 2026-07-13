@@ -264,7 +264,6 @@ export default function App() {
   const setStage = useKaisola((s) => s.setStage)
   const dockOpen = useKaisola((s) => s.dockOpen)
   const canvasOpen = useKaisola((s) => s.canvasOpen)
-  const toggleCanvas = useKaisola((s) => s.toggleCanvas)
   const canvasWidth = useKaisola((s) => s.canvasWidth)
   const setCanvasWidth = useKaisola((s) => s.setCanvasWidth)
   const railWidth = useKaisola((s) => s.railWidth)
@@ -719,22 +718,14 @@ export default function App() {
               <main className="canvas">
                 <StageView />
               </main>
-              {/* Render after the draggable canvas. Electron resolves app-region
-                  overlaps in DOM order; placing this last keeps it clickable. */}
-              {studio && canvasOpen && (
-                <button className="btn-icon canvas-local-close" onClick={toggleCanvas} title="Hide file preview  ⌘." aria-label="Hide file preview">
-                  <Icon name="PanelRightClose" size={14} />
-                </button>
-              )}
             </div>
           )}
         </div>
         {sidebarSessions && railOpen && <WorkspaceRail side="right" />}
         {(!studio || (!sidebarSessions && !railOpen)) && <ShellSidebarFooter floating />}
       </div>
-      {/* On desktop main windows the tool cluster lives IN the project tab
-          strip (ProjectTabs) — same chrome row, no overlap with the session
-          tabs. This floating fallback covers web + pop windows only. AFTER
+      {/* Desktop main windows keep their permanent panel switches in the
+          project strip. This utility fallback covers web + pop windows only. AFTER
           .app-body on purpose: the body is a drag surface, and Chromium
           builds the window's draggable region in order — a drag rect that comes
           later paves over an earlier no-drag island. Rendering the tools last

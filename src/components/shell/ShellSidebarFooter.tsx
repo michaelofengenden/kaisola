@@ -9,8 +9,6 @@ import { InboxButton } from './InboxButton'
  * The avatar is identity enough here; the full account lives in its popover.
  */
 export function ShellSidebarFooter({ floating = false }: { floating?: boolean }) {
-  const railOpen = useKaisola((s) => s.railOpen)
-  const toggleRail = useKaisola((s) => s.toggleRail)
   const openSettings = useKaisola((s) => s.setSettingsOpen)
 
   return (
@@ -20,11 +18,6 @@ export function ShellSidebarFooter({ floating = false }: { floating?: boolean })
         <button className="btn-icon shell-settings-trigger" onClick={() => openSettings(true)} title="Settings  ⌘," aria-label="Open settings">
           <Icon name="Settings" size={15} />
         </button>
-        {!railOpen && (
-          <button className="btn-icon" onClick={toggleRail} title="Show file tree  ⌘B" aria-label="Show file tree">
-            <Icon name="FolderTree" size={15} />
-          </button>
-        )}
         <ShellTools includeSettings={false} />
         <InboxButton />
       </div>

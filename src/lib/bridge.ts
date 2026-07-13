@@ -201,6 +201,11 @@ export interface AcpControls {
   models?: AcpModelsField | null
   configOptions: AcpConfigOption[]
 }
+export interface AcpCommand {
+  name: string
+  description: string
+  inputHint?: string
+}
 export interface AcpAuthMethod {
   id: string
   name: string
@@ -212,6 +217,7 @@ export interface AcpAgent {
   presetId?: string
   connected: boolean
   controls?: AcpControls
+  availableCommands?: AcpCommand[]
   authMethods?: AcpAuthMethod[]
   /** Project id the connection is scoped to ('' = unscoped/legacy). */
   scope?: string
@@ -512,6 +518,8 @@ export interface AcpConnectConfig {
   scope?: string
   /** Extra env for the spawned agent (e.g. CLAUDE_CONFIG_DIR per account). */
   env?: Record<string, string>
+  /** Selected Claude credential root; null explicitly removes an ambient shell override. */
+  claudeConfigDir?: string | null
   /** Resume this session id via session/load when the agent supports it —
    * restart continuity; a stale id silently falls back to a fresh session. */
   resumeSessionId?: string
@@ -533,6 +541,8 @@ export interface UpdateState {
   checkError?: string | null
   /** True while checking whether an already-downloaded build is still latest. */
   checkingForLatest?: boolean
+  /** A bounded latest-feed check observed continuous version churn; restart is blocked. */
+  feedUnstable?: boolean
   /** Last successful release-feed check (epoch milliseconds). */
   checkedAt?: number | null
   /** The running build's version. */
@@ -569,6 +579,7 @@ export interface KaisolaBridge {
     steer(agentKey: string, text: string, images?: { mimeType: string; data: string }[], scope?: string): Promise<{ ok: boolean; stopReason?: string; message?: string; unsupported?: boolean; noTurn?: boolean }>
     onNotice(cb: (n: AcpNotice) => void): () => void
     onControls(cb: (info: { key: string; controls: AcpControls }) => void): () => void
+    onCommands(cb: (info: { key: string; commands: AcpCommand[] }) => void): () => void
     onTerminal(cb: (info: AcpTerminalInfo) => void): () => void
     onPermission(cb: (req: AcpPermissionRequest) => void): () => void
     /** Main auto-resolved a pending permission (timeout / connection death). */
@@ -913,6 +924,9 @@ const webMock: KaisolaBridge = {
       return () => {}
     },
     onControls() {
+      return () => {}
+    },
+    onCommands() {
       return () => {}
     },
     onTerminal() {
@@ -1319,6 +1333,11 @@ function scopeAcp(acp: KaisolaBridge['acp']): KaisolaBridge['acp'] {
       }),
     onControls: (cb) =>
       acp.onControls((info) => {
+        const { key, scope } = splitScopedKey(info.key)
+        if (scopeIsCurrent(scope)) cb({ ...info, key })
+      }),
+    onCommands: (cb) =>
+      acp.onCommands((info) => {
         const { key, scope } = splitScopedKey(info.key)
         if (scopeIsCurrent(scope)) cb({ ...info, key })
       }),

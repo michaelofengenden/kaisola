@@ -168,7 +168,14 @@ export function SessionTabs({ orientation = 'horizontal' }: { orientation?: 'hor
   })
 
   const closeTab = (t: STab) => {
-    if (t.kind === 'thread') closeThread(t.id)
+    if (t.kind === 'thread') {
+      const thread = threads.find((candidate) => candidate.id === t.id)
+      const owned = thread?.group
+        ? thread.group.members
+        : thread ? [{ threadId: thread.id, agentKey: thread.agentKey }] : []
+      for (const member of owned) void bridge.acp.disconnect(`${member.agentKey}::${member.threadId}`)
+      closeThread(t.id)
+    }
     else if (t.kind === 'term') closeTerminal(t.id)
     else if (t.kind === 'agentTerm') {
       closeAgentTerminal(t.id)
@@ -460,7 +467,7 @@ function NewSessionButton({ orientation }: { orientation: 'horizontal' | 'vertic
         { value: 'terminal', name: 'New terminal' },
         ...(codex ? [{ value: `agent:${codex.id}`, name: codex.name }] : []),
         ...(claude ? [{ value: `agent:${claude.id}`, name: claude.name }] : []),
-        { value: 'group', name: 'Claude + Codex group' },
+        { value: 'group', name: 'Kaisola Mesh' },
         ...otherAgents.map((a) => ({ value: `agent:${a.id}`, name: a.name })),
         ...sessionTemplates.map((t) => ({ value: `tpl:${t.id}`, name: `▸ ${t.name}` })),
         { value: 'worktree', name: 'Agent in a worktree' },

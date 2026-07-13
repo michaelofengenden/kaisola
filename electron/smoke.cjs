@@ -218,7 +218,7 @@ app.whenReady().then(async () => {
   await new Promise((r) => setTimeout(r, 100))
   const accountUi = await win.webContents.executeJavaScript(`(async () => {
     const footer = document.querySelector('.session-sidebar > .shell-sidebar-footer')
-    const avatar = footer?.querySelector('.app-account-avatar[data-label="true"]')
+    const avatar = footer?.querySelector('.app-account-avatar')
     avatar?.click()
     await new Promise((resolve) => setTimeout(resolve, 60))
     const menu = document.querySelector('.app-account-menu')
@@ -227,7 +227,7 @@ app.whenReady().then(async () => {
       headshot: !!avatar?.querySelector('img'),
       menu: !!menu && /Kaisola Tester/.test(menu.textContent || '') && /person@example.com/.test(menu.textContent || ''),
       usageInMenu: !!menu && /Usage/.test(menu.textContent || ''),
-      labeled: /Kaisola Tester/.test(avatar?.textContent || ''),
+      avatarOnly: !/Kaisola Tester/.test(avatar?.textContent || ''),
       bottomLeft: (() => {
         if (!footer) return false
         const rail = document.querySelector('.session-sidebar')?.getBoundingClientRect()
@@ -237,7 +237,7 @@ app.whenReady().then(async () => {
       menuAbove: !!menu && !!avatar && menu.getBoundingClientRect().bottom <= avatar.getBoundingClientRect().top,
       menuFits: !!menu && menu.getBoundingClientRect().left >= 8 && menu.getBoundingClientRect().right <= window.innerWidth - 8,
       aligned: (() => {
-        const row = footer?.querySelector('.shell-sidebar-footer-account')
+        const row = footer?.querySelector('.shell-sidebar-footer-tools')
         const buttons = [...(row?.querySelectorAll(':scope > button') || [])]
         if (!row || buttons.length < 2) return false
         const rects = buttons.map((button) => button.getBoundingClientRect())
@@ -1019,8 +1019,8 @@ app.whenReady().then(async () => {
   const promptQueue = await win.webContents.executeJavaScript(`(async () => {
     const get = () => window.__kaisola.getState()
     const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
+    get().setWorkspace(${JSON.stringify(claudeRoot)})
     const tid = get().activeThreadId
-    get().setWorkspace('/tmp/pasola-smoke')
     get().setAssistantThreadAgent(tid, 'mock')
     get().resetAssistantRuntime(tid)
     get().setDockView(tid)
@@ -1084,8 +1084,8 @@ app.whenReady().then(async () => {
   const steer = await win.webContents.executeJavaScript(`(async () => {
     const get = () => window.__kaisola.getState()
     const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
+    get().setWorkspace(${JSON.stringify(claudeRoot)})
     const tid = get().activeThreadId
-    get().setWorkspace('/tmp/pasola-smoke')
     get().setAssistantThreadAgent(tid, 'mock')
     get().resetAssistantRuntime(tid)
     get().setDockView(tid)
@@ -2230,11 +2230,14 @@ a^2 + b^2 = c^2
 
     const settingsTrigger = document.querySelector('.shell-settings-trigger')
     settingsTrigger?.click(); await wait()
+    const startsInGeneral = /Appearance/.test(document.querySelector('.settings-pane')?.textContent || '')
+    const interfaceNav = [...document.querySelectorAll('.settings-nav-item')].find((node) => /Interface/.test(node.textContent || ''))
+    interfaceNav?.click()
+    await wait()
     const settingsOwned = !!document.querySelector('.settings-row[data-setting="workspace-view"]') &&
       !!document.querySelector('.settings-row[data-setting="session-panels"]') &&
       !!document.querySelector('.settings-row[data-setting="session-placement"]')
     const advancedStylesDisclosed = !!document.querySelector('.settings-layout-advanced [data-setting="advanced-session-style"]')
-    const startsInInterface = /Workspace view/.test(document.querySelector('.settings-pane')?.textContent || '')
     const choose = async (setting, label) => {
       document.querySelector('.settings-row[data-setting="' + setting + '"] .drop-btn')?.click()
       await wait()
@@ -2277,7 +2280,7 @@ a^2 + b^2 = c^2
       noStandaloneLayout: !document.querySelector('.shell-layout-trigger'),
       settingsOwned,
       advancedStylesDisclosed,
-      startsInInterface,
+      startsInGeneral,
       workspaceReversible: toFilesOnly && toFilesAndSessions,
       panelsReversible: panelsHidden && panelsShown,
       placementReversible: movedToTop && movedToLeft,
@@ -2297,6 +2300,8 @@ a^2 + b^2 = c^2
     get().setTabLayout('sidebar')
     await new Promise((r) => setTimeout(r, 70))
     document.querySelector('.shell-settings-trigger')?.click()
+    await new Promise((r) => setTimeout(r, 70))
+    ;[...document.querySelectorAll('.settings-nav-item')].find((node) => /Interface/.test(node.textContent || ''))?.click()
     await new Promise((r) => setTimeout(r, 70))
     document.querySelector('.settings-row[data-setting="session-placement"] .drop-btn')?.click()
     await new Promise((r) => setTimeout(r, 70))
@@ -2426,9 +2431,7 @@ a^2 + b^2 = c^2
     await new Promise((r) => setTimeout(r, 150))
     // Zed-style settings: a nav of categories, one pane at a time
     const navNames = [...document.querySelectorAll('.settings-nav-item')].map((e) => e.textContent || '')
-    const startsInInterface = /Workspace view/.test(document.querySelector('.settings-pane')?.textContent || '')
-    const hasLayoutSettings = !!document.querySelector('[data-setting="workspace-view"]') && !!document.querySelector('[data-setting="session-panels"]') && !!document.querySelector('[data-setting="session-placement"]')
-    const hasAdvancedStyles = !!document.querySelector('.settings-layout-advanced [data-setting="advanced-session-style"]')
+    const startsInGeneral = /Appearance/.test(document.querySelector('.settings-pane')?.textContent || '')
     const hasAppearance = navNames.some((l) => /General/.test(l))
     const usageNav = [...document.querySelectorAll('.settings-nav-item')].find((e) => /Usage/.test(e.textContent || ''))
     usageNav?.click()
@@ -2441,6 +2444,8 @@ a^2 + b^2 = c^2
     const interfaceNav = [...document.querySelectorAll('.settings-nav-item')].find((e) => /Interface/.test(e.textContent || ''))
     interfaceNav?.click()
     await new Promise((r) => setTimeout(r, 50))
+    const hasLayoutSettings = !!document.querySelector('[data-setting="workspace-view"]') && !!document.querySelector('[data-setting="session-panels"]') && !!document.querySelector('[data-setting="session-placement"]')
+    const hasAdvancedStyles = !!document.querySelector('.settings-layout-advanced [data-setting="advanced-session-style"]')
     const hasTabLayout = /Session placement/.test(document.querySelector('.settings-pane')?.textContent || '')
     const extensionsNav = [...document.querySelectorAll('.settings-nav-item')].find((e) => /Extensions/.test(e.textContent || ''))
     extensionsNav?.click()
@@ -2461,7 +2466,7 @@ a^2 + b^2 = c^2
     await new Promise((r) => setTimeout(r, 30))
     const contextualFilesControl = !!document.querySelector('.canvas-local-close') && !document.querySelector('.tabstrip [aria-label="Hide file preview"]')
     const footerOwned = !!settingsButton && !document.querySelector('.tabstrip-tools')
-    return { settingsSeparate: !!settingsButton, footerOwned, startsInInterface, hasLayoutSettings, hasAdvancedStyles, noStandaloneLayout: !document.querySelector('.shell-layout-trigger'), hasAppearance, hasUsage, hasDiskResidency, hasTabLayout, extensionsInSettings, contextualFilesControl, noSidebarControls: !hasSidebarControls, previewOpened, previewDismissed }
+    return { settingsSeparate: !!settingsButton, footerOwned, startsInGeneral, hasLayoutSettings, hasAdvancedStyles, noStandaloneLayout: !document.querySelector('.shell-layout-trigger'), hasAppearance, hasUsage, hasDiskResidency, hasTabLayout, extensionsInSettings, contextualFilesControl, noSidebarControls: !hasSidebarControls, previewOpened, previewDismissed }
   })()`)
   console.log('SETTINGS=' + JSON.stringify(settings))
 
@@ -3676,7 +3681,7 @@ a^2 + b^2 = c^2
   const failed =
     !manualCodex.upgraded || !manualCodex.exact || !manualCodex.draftKept || !manualCodex.downgraded ||
     !manualClaude.upgraded || !manualClaude.draftKept || !manualClaude.toolKept || !manualClaude.downgraded ||
-    !rootChildren || !minimalShell.noWorkflowSidebar || !minimalShell.splitSidebarsDefault || !minimalShell.hasSessions || !minimalShell.railFilesOnly || !minimalShell.hasEmptyLauncher || !minimalShell.stageFiles || !minimalShell.studioDefault || !minimalShell.sidebarFooter || !accountUi.avatar || !accountUi.headshot || !accountUi.menu || !accountUi.usageInMenu || !accountUi.usageOpened || !accountUi.labeled || !accountUi.bottomLeft || !accountUi.menuAbove || !accountUi.menuFits || !accountUi.aligned || !claudePrepared || !nativeWindow.rendererClippedMaterial || !icon.exists || !icon.usable || !icon.square || !icon.large || !glass.appSamplingLayer || !glass.chromeGlass || !glass.activeTintWhite || !glass.railLayerFlattened || !glass.contentGlassy || !glass.sessionGlassy || !glass.termGlassTint || !glass.blurKeepsGlass || !glass.lightsGray || !glass.nativeWindowRounding ||
+    !rootChildren || !minimalShell.noWorkflowSidebar || !minimalShell.splitSidebarsDefault || !minimalShell.hasSessions || !minimalShell.railFilesOnly || !minimalShell.hasEmptyLauncher || !minimalShell.stageFiles || !minimalShell.studioDefault || !minimalShell.sidebarFooter || !accountUi.avatar || !accountUi.headshot || !accountUi.menu || !accountUi.usageInMenu || !accountUi.usageOpened || !accountUi.avatarOnly || !accountUi.bottomLeft || !accountUi.menuAbove || !accountUi.menuFits || !accountUi.aligned || !claudePrepared || !nativeWindow.rendererClippedMaterial || !icon.exists || !icon.usable || !icon.square || !icon.large || !glass.appSamplingLayer || !glass.chromeGlass || !glass.activeTintWhite || !glass.railLayerFlattened || !glass.contentGlassy || !glass.sessionGlassy || !glass.termGlassTint || !glass.blurKeepsGlass || !glass.lightsGray || !glass.nativeWindowRounding ||
     !emptyOk || !demoOk ||
     !review.opened || !review.closed || !review.decided ||
     !term.run || !term.ptyOk || !term.cdWorks || !term.dock || !term.host || !term.lightComposerPalette ||
@@ -3732,11 +3737,11 @@ a^2 + b^2 = c^2
     !autoname.named || !autoname.rowShows || !autoname.sticky || !autoname.manualWins || !autoname.termNamed ||
     !minimalUi.noSidebar || !minimalUi.noSidebarResize || !minimalUi.noStageNav || !minimalUi.hasSessionSidebar || !minimalUi.hasRail || !minimalUi.filesOnRight || !minimalUi.hasPlus || !minimalUi.hasFiles ||
     !tabLayouts.rendered || !tabLayouts.sidebarOk || !tabLayouts.shelfOk || !tabLayouts.bareOk || !tabLayouts.runwayOk || !tabLayouts.flatOk || !tabLayouts.compactOk || !tabLayouts.reciprocalToggle || !tabLayouts.verticalAddFlow || !tabLayouts.stateKept || !tabLayouts.staticPaint || !tabLayouts.accessible || !tabLayouts.sessionIdentity ||
-    !intuitiveLayoutControls.noHeaderTools || !intuitiveLayoutControls.fileTreeIconOnly || !intuitiveLayoutControls.localClose || !intuitiveLayoutControls.hidden || !intuitiveLayoutControls.recoverySameSide || !intuitiveLayoutControls.restored || !intuitiveLayoutControls.recoveryGoneAfterRestore || !intuitiveLayoutControls.noStandaloneLayout || !intuitiveLayoutControls.settingsOwned || !intuitiveLayoutControls.advancedStylesDisclosed || !intuitiveLayoutControls.startsInInterface || !intuitiveLayoutControls.workspaceReversible || !intuitiveLayoutControls.panelsReversible || !intuitiveLayoutControls.placementReversible || !intuitiveLayoutControls.footerFollowsNavigation || !intuitiveLayoutControls.rareActionsInPalette || !intuitiveLayoutControls.previewContextual ||
+    !intuitiveLayoutControls.noHeaderTools || !intuitiveLayoutControls.fileTreeIconOnly || !intuitiveLayoutControls.localClose || !intuitiveLayoutControls.hidden || !intuitiveLayoutControls.recoverySameSide || !intuitiveLayoutControls.restored || !intuitiveLayoutControls.recoveryGoneAfterRestore || !intuitiveLayoutControls.noStandaloneLayout || !intuitiveLayoutControls.settingsOwned || !intuitiveLayoutControls.advancedStylesDisclosed || !intuitiveLayoutControls.startsInGeneral || !intuitiveLayoutControls.workspaceReversible || !intuitiveLayoutControls.panelsReversible || !intuitiveLayoutControls.placementReversible || !intuitiveLayoutControls.footerFollowsNavigation || !intuitiveLayoutControls.rareActionsInPalette || !intuitiveLayoutControls.previewContextual ||
     !realPointerLayout.firstWorked || !realPointerLayout.reverseWorked || !realPointerLayout.stayedInteractive ||
     !narrowAgentUi.rendered || !narrowAgentUi.narrow || !narrowAgentUi.containerAware || !narrowAgentUi.composerFits || !narrowAgentUi.sendVisible || !narrowAgentUi.footerFits || !narrowAgentUi.wraps || !narrowAgentUi.draftReadable || !narrowAgentUi.draftScrollable || !narrowAgentUi.draftResponsive || !narrowAgentUi.sideAgnostic ||
     !inboxAnchorUi.anchoredAtZero || !inboxAnchorUi.badged || !inboxAnchorUi.staysAfterClear ||
-    !settings.settingsSeparate || !settings.footerOwned || !settings.startsInInterface || !settings.hasLayoutSettings || !settings.hasAdvancedStyles || !settings.noStandaloneLayout || !settings.hasAppearance || !settings.hasUsage || !settings.hasDiskResidency || !settings.hasTabLayout || !settings.extensionsInSettings || !settings.contextualFilesControl || !settings.noSidebarControls || !settings.previewOpened || !settings.previewDismissed ||
+    !settings.settingsSeparate || !settings.footerOwned || !settings.startsInGeneral || !settings.hasLayoutSettings || !settings.hasAdvancedStyles || !settings.noStandaloneLayout || !settings.hasAppearance || !settings.hasUsage || !settings.hasDiskResidency || !settings.hasTabLayout || !settings.extensionsInSettings || !settings.contextualFilesControl || !settings.noSidebarControls || !settings.previewOpened || !settings.previewDismissed ||
     !extensionsUi.opened || extensionsUi.cards < 8 || !extensionsUi.hasFilters || !extensionsUi.csvInstalled || !extensionsUi.jsonInstalled ||
     !extensionsUi.persisted || !extensionsUi.defaultUninstallPersisted || !extensionsUi.csvPreview || !extensionsUi.jsonPreview || !extensionsUi.boundedJsonPreview || !extensionsUi.closed ||
     !devExtensionHotReload.registered || !devExtensionHotReload.updated || !devExtensionHotReload.visible ||

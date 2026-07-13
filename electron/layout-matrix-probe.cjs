@@ -11,6 +11,8 @@ const userData = path.join(os.tmpdir(), 'kaisola-layout-matrix')
 const workspace = path.join(userData, 'workspace')
 fs.rmSync(userData, { recursive: true, force: true })
 fs.mkdirSync(workspace, { recursive: true })
+const markdownFixture = path.join(workspace, 'BACKLOG.md')
+fs.writeFileSync(markdownFixture, '# Backlog title\n\n- [ ] Keep editing calm.\n')
 app.setPath('userData', userData)
 
 const registrations = [
@@ -143,6 +145,19 @@ app.whenReady().then(async () => {
   await wait(180)
   const canvasRestored = await win.webContents.executeJavaScript(`window.__kaisola.getState().canvasOpen`)
 
+  // Markdown enters the clean rich editor without the old inset accent bar.
+  await win.webContents.executeJavaScript(`window.__kaisola.getState().requestFile(${JSON.stringify(markdownFixture)}, 'preview', { pinned: true })`)
+  await wait(240)
+  await win.webContents.executeJavaScript(`document.querySelector('.fx-doc-markdown')?.dispatchEvent(new MouseEvent('dblclick', { bubbles: true }))`)
+  await wait(220)
+  const markdownEditing = await win.webContents.executeJavaScript(`(() => {
+    const root = document.querySelector('.fx-doc-markdown[data-editing]')
+    const page = root?.querySelector('.fx-doc-page')
+    if (!root || !page) return false
+    page.focus()
+    return !getComputedStyle(page).boxShadow.includes('inset')
+  })()`)
+
   // Real pointer drag: Sessions stretches, Files remains unchanged.
   const resizeStart = await win.webContents.executeJavaScript(`(() => {
     const handle = document.querySelector('.session-sidebar-resize')
@@ -178,7 +193,7 @@ app.whenReady().then(async () => {
   await win.webContents.executeJavaScript(`document.querySelector('.settings-head [aria-label="Close"]')?.click()`)
 
   // Account menu closes even when the away-click lands on a native drag area.
-  await win.webContents.executeJavaScript(`document.querySelector('.app-account-avatar[data-label]')?.click()`)
+  await win.webContents.executeJavaScript(`document.querySelector('.shell-sidebar-footer [aria-label="Kaisola account"]')?.click()`)
   await wait(120)
   const accountOpened = await win.webContents.executeJavaScript(`!!document.querySelector('.app-account-menu')`)
   const away = await win.webContents.executeJavaScript(`(() => {
@@ -191,6 +206,13 @@ app.whenReady().then(async () => {
   }
   await wait(120)
   const accountClosed = await win.webContents.executeJavaScript(`!document.querySelector('.app-account-menu')`)
+  const footerSingleRow = await win.webContents.executeJavaScript(`(() => {
+    const footer = document.querySelector('.shell-sidebar-footer')
+    const controls = [...footer?.querySelectorAll('button') ?? []]
+    if (!footer || controls.length < 4 || footer.querySelector('.app-account-name')) return false
+    const tops = controls.map((control) => Math.round(control.getBoundingClientRect().top))
+    return Math.max(...tops) - Math.min(...tops) <= 2
+  })()`)
 
   // Medium: two columns remain legible beside files and both rails.
   win.setSize(1180, 760)
@@ -237,12 +259,14 @@ app.whenReady().then(async () => {
     closePoint,
     canvasClosed,
     canvasRestored,
+    markdownEditing,
     widthsBefore,
     widthsAfter,
     newSessionOrder,
     settingsGeneral,
     accountOpened,
     accountClosed,
+    footerSingleRow,
     medium,
     compact,
     top,
@@ -260,11 +284,13 @@ app.whenReady().then(async () => {
     && closePoint?.topmost
     && canvasClosed
     && canvasRestored
+    && markdownEditing
     && resized
     && orderOk
     && settingsGeneral
     && accountOpened
     && accountClosed
+    && footerSingleRow
     && top.horizontalTabs
     && topStripScrolls
       ? 0

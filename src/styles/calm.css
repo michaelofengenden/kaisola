@@ -727,7 +727,7 @@
 }
 .fx-doc-markdown[data-editing] .fx-doc-page:focus {
   border-radius: var(--r-3);
-  box-shadow: inset 2px 0 0 color-mix(in srgb, var(--accent) 42%, transparent);
+  box-shadow: 0 0 0 1px color-mix(in srgb, var(--border-strong) 48%, transparent);
 }
 .fx-md-editing {
   position: sticky;

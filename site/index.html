@@ -3,428 +3,441 @@
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
-<title>Kaisola — every agent is a tab</title>
-<meta name="description" content="Kaisola is a research IDE that works like a browser for AI agents — Claude Code, Codex, Gemini, any CLI — side by side on glass, with a human reviewing every step." />
-<meta property="og:title" content="Kaisola — every agent is a tab" />
-<meta property="og:description" content="The research IDE that's a browser for AI agents." />
+<title>Kaisola — files, agents, and terminals in one workspace</title>
+<meta name="description" content="Kaisola is a files-first desktop IDE for working with Codex, Claude, terminals, Markdown, and LaTeX in one local workspace." />
+<meta name="theme-color" content="#f5f5f1" media="(prefers-color-scheme: light)" />
+<meta name="theme-color" content="#0b0c0e" media="(prefers-color-scheme: dark)" />
+<meta property="og:title" content="Kaisola — files first, agents alongside" />
+<meta property="og:description" content="A desktop IDE for files, Codex, Claude, terminals, Markdown, and LaTeX." />
+<meta property="og:type" content="website" />
+<meta property="og:url" content="https://kaisola.com/" />
 <meta property="og:image" content="https://kaisola.com/assets/kaisola-icon.png" />
 <meta property="og:image:width" content="1024" />
 <meta property="og:image:height" content="1024" />
 <meta property="og:image:alt" content="Kaisola app icon" />
 <meta name="twitter:card" content="summary" />
+<meta name="twitter:title" content="Kaisola — files first, agents alongside" />
+<meta name="twitter:description" content="A desktop IDE for files, Codex, Claude, terminals, Markdown, and LaTeX." />
 <meta name="twitter:image" content="https://kaisola.com/assets/kaisola-icon.png" />
 <link rel="icon" type="image/png" href="assets/kaisola-icon.png" />
 <link rel="apple-touch-icon" href="assets/kaisola-icon.png" />
 <style>
-  /* ── Kaisola site tokens — extends the app's tokens.css (dark-first, one olive) ── */
   :root {
-    --ground: #0a0b0d;
-    --ground-2: #0e1014;
-    --panel: rgba(20, 22, 28, 0.72);
-    --panel-solid: #14161c;
-    --border: #23262f;
-    --border-faint: #1c1f26;
-    --ink: #f3f4f6;
-    --ink-2: #c4c8d2;
-    --ink-3: #8b909d;
-    --olive: #95a456;
-    --olive-hi: #b9c77e;
-    --olive-deep: #7e8c45;
-    --olive-soft: rgba(149, 164, 86, 0.16);
-    --olive-line: rgba(149, 164, 86, 0.42);
-    --live: #54c08a;
-    --keycap-bg: #1a1d25;
-    --keycap-edge: #2f3340;
-    --term-bg: #0b0d11;
-    --shadow: 0 30px 80px rgba(0, 0, 0, 0.55);
-    --glass-tint: rgba(14, 16, 20, 0.55);
-    --hero-wash: radial-gradient(1200px 520px at 50% -8%, rgba(149, 164, 86, 0.14), transparent 64%);
-    --font-ui: 'Inter', system-ui, -apple-system, 'Segoe UI', sans-serif;
-    --font-serif: 'Source Serif 4', 'New York', ui-serif, Georgia, serif;
-    --font-mono: 'JetBrains Mono', ui-monospace, 'SF Mono', Menlo, monospace;
-    color-scheme: dark;
-  }
-  @media (prefers-color-scheme: light) {
-    :root {
-      --ground: #f4f4f0;
-      --ground-2: #ffffff;
-      --panel: rgba(255, 255, 255, 0.78);
-      --panel-solid: #ffffff;
-      --border: #dcded4;
-      --border-faint: #e7e8e0;
-      --ink: #1c1e17;
-      --ink-2: #4a4d42;
-      --ink-3: #7d8073;
-      --olive: #7e8c45;
-      --olive-hi: #95a456;
-      --olive-deep: #67743a;
-      --olive-soft: rgba(126, 140, 69, 0.14);
-      --olive-line: rgba(126, 140, 69, 0.4);
-      --keycap-bg: #ffffff;
-      --keycap-edge: #d3d5c9;
-      --term-bg: #14161c;
-      --shadow: 0 30px 70px rgba(38, 42, 24, 0.18);
-      --glass-tint: rgba(255, 255, 255, 0.5);
-      --hero-wash: radial-gradient(1200px 520px at 50% -8%, rgba(126, 140, 69, 0.16), transparent 64%);
-      color-scheme: light;
-    }
-  }
-  :root[data-theme='dark'] {
-    --ground: #0a0b0d; --ground-2: #0e1014; --panel: rgba(20, 22, 28, 0.72); --panel-solid: #14161c;
-    --border: #23262f; --border-faint: #1c1f26; --ink: #f3f4f6; --ink-2: #c4c8d2; --ink-3: #8b909d;
-    --olive: #95a456; --olive-hi: #b9c77e; --olive-deep: #7e8c45; --olive-soft: rgba(149, 164, 86, 0.16);
-    --olive-line: rgba(149, 164, 86, 0.42); --live: #54c08a; --keycap-bg: #1a1d25; --keycap-edge: #2f3340;
-    --term-bg: #0b0d11; --shadow: 0 30px 80px rgba(0, 0, 0, 0.55); --glass-tint: rgba(14, 16, 20, 0.55);
-    --hero-wash: radial-gradient(1200px 520px at 50% -8%, rgba(149, 164, 86, 0.14), transparent 64%);
-    color-scheme: dark;
-  }
-  :root[data-theme='light'] {
-    --ground: #f4f4f0; --ground-2: #ffffff; --panel: rgba(255, 255, 255, 0.78); --panel-solid: #ffffff;
-    --border: #dcded4; --border-faint: #e7e8e0; --ink: #1c1e17; --ink-2: #4a4d42; --ink-3: #7d8073;
-    --olive: #7e8c45; --olive-hi: #95a456; --olive-deep: #67743a; --olive-soft: rgba(126, 140, 69, 0.14);
-    --olive-line: rgba(126, 140, 69, 0.4); --live: #54c08a; --keycap-bg: #ffffff; --keycap-edge: #d3d5c9;
-    --term-bg: #14161c; --shadow: 0 30px 70px rgba(38, 42, 24, 0.18); --glass-tint: rgba(255, 255, 255, 0.5);
-    --hero-wash: radial-gradient(1200px 520px at 50% -8%, rgba(126, 140, 69, 0.16), transparent 64%);
+    --ground: #f5f5f1;
+    --ground-deep: #ecece5;
+    --panel: rgba(255, 255, 252, 0.82);
+    --panel-solid: #fff;
+    --ink: #191b17;
+    --ink-2: #4e5148;
+    --ink-3: #7b7e73;
+    --line: #dcded5;
+    --line-soft: rgba(38, 42, 30, 0.08);
+    --olive: #76843e;
+    --olive-bright: #8e9e4d;
+    --olive-ink: #4c5726;
+    --olive-soft: rgba(118, 132, 62, 0.12);
+    --olive-line: rgba(118, 132, 62, 0.34);
+    --green: #2e9b6e;
+    --shadow: 0 28px 80px rgba(30, 33, 22, 0.15);
+    --shadow-small: 0 14px 34px rgba(30, 33, 22, 0.09);
+    --sans: Inter, ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    --serif: "Iowan Old Style", "Palatino Linotype", Palatino, Georgia, serif;
+    --mono: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
     color-scheme: light;
   }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --ground: #0b0c0e;
+      --ground-deep: #111317;
+      --panel: rgba(20, 22, 27, 0.82);
+      --panel-solid: #14161b;
+      --ink: #f3f4f0;
+      --ink-2: #c3c6bc;
+      --ink-3: #898e82;
+      --line: #292d34;
+      --line-soft: rgba(255, 255, 255, 0.07);
+      --olive: #a6b569;
+      --olive-bright: #bfcc82;
+      --olive-ink: #d0d99e;
+      --olive-soft: rgba(166, 181, 105, 0.13);
+      --olive-line: rgba(166, 181, 105, 0.35);
+      --green: #56c391;
+      --shadow: 0 30px 88px rgba(0, 0, 0, 0.55);
+      --shadow-small: 0 15px 36px rgba(0, 0, 0, 0.32);
+      color-scheme: dark;
+    }
+  }
 
-  * { box-sizing: border-box; margin: 0; }
+  * { box-sizing: border-box; }
   html { scroll-behavior: smooth; }
   body {
+    margin: 0;
     background: var(--ground);
     color: var(--ink);
-    font-family: var(--font-ui);
+    font-family: var(--sans);
     font-size: 16px;
-    line-height: 1.6;
+    line-height: 1.55;
     -webkit-font-smoothing: antialiased;
     overflow-x: hidden;
   }
-  img { max-width: 100%; display: block; }
+  img { display: block; max-width: 100%; }
   a { color: inherit; }
+  button, a { -webkit-tap-highlight-color: transparent; }
   ::selection { background: var(--olive-soft); }
+  .wrap { width: min(1160px, calc(100% - 48px)); margin: 0 auto; }
 
-  .wrap { max-width: 1080px; margin: 0 auto; padding: 0 28px; }
-
-  /* ── nav ── */
   .nav {
-    position: sticky; top: 0; z-index: 40;
-    backdrop-filter: blur(18px) saturate(1.3);
-    -webkit-backdrop-filter: blur(18px) saturate(1.3);
-    background: var(--glass-tint);
-    border-bottom: 1px solid var(--border-faint);
+    position: sticky;
+    top: 0;
+    z-index: 20;
+    background: color-mix(in srgb, var(--ground) 77%, transparent);
+    border-bottom: 1px solid var(--line-soft);
+    backdrop-filter: blur(20px) saturate(1.2);
+    -webkit-backdrop-filter: blur(20px) saturate(1.2);
   }
-  .nav-in { display: flex; align-items: center; gap: 28px; height: 58px; }
-  .mark { display: flex; align-items: center; gap: 10px; font-weight: 650; letter-spacing: -0.01em; text-decoration: none; font-size: 17px; }
-  .keystone { width: 20px; height: 20px; flex: none; }
-  .nav-links { display: flex; gap: 22px; margin-left: auto; align-items: center; }
-  .nav-links a:not(.btn) { text-decoration: none; color: var(--ink-3); font-size: 14px; transition: color 0.15s; }
-  .nav-links a:not(.btn):hover, .nav-links a:not(.btn):focus-visible { color: var(--ink); }
-  .btn {
-    display: inline-flex; align-items: center; gap: 8px;
-    background: var(--olive); color: #fff; border: none; cursor: pointer;
-    padding: 9px 18px; border-radius: 10px; font-size: 14px; font-weight: 600;
-    text-decoration: none; letter-spacing: 0.01em;
-    box-shadow: 0 1px 0 rgba(255,255,255,0.12) inset, 0 6px 18px var(--olive-soft);
-    transition: background 0.15s, transform 0.15s;
+  .nav-inner { height: 62px; display: flex; align-items: center; gap: 24px; }
+  .brand { display: inline-flex; align-items: center; gap: 10px; font-weight: 670; text-decoration: none; letter-spacing: -0.02em; }
+  .brand img { width: 24px; height: 24px; border-radius: 7px; }
+  .nav-links { display: flex; align-items: center; gap: 24px; margin-left: auto; }
+  .nav-links > a:not(.button) { color: var(--ink-3); font-size: 14px; text-decoration: none; }
+  .nav-links > a:not(.button):hover { color: var(--ink); }
+  .button {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 8px;
+    min-height: 42px;
+    padding: 0 18px;
+    border: 1px solid var(--olive);
+    border-radius: 11px;
+    background: var(--olive);
+    color: #fff;
+    box-shadow: 0 8px 24px var(--olive-soft);
+    font-size: 14px;
+    font-weight: 650;
+    text-decoration: none;
+    transition: transform .16s ease, background .16s ease, border-color .16s ease;
   }
-  .btn:hover { background: var(--olive-hi); transform: translateY(-1px); }
-  .btn:focus-visible, a:focus-visible { outline: 2px solid var(--olive); outline-offset: 3px; border-radius: 6px; }
-  .btn.ghost { background: transparent; color: var(--ink-2); border: 1px solid var(--border); box-shadow: none; }
-  .btn.ghost:hover { border-color: var(--olive-line); color: var(--ink); background: var(--olive-soft); }
+  .button:hover { background: var(--olive-bright); border-color: var(--olive-bright); transform: translateY(-1px); }
+  .button.secondary { background: transparent; border-color: var(--line); color: var(--ink); box-shadow: none; }
+  .button.secondary:hover { border-color: var(--olive-line); background: var(--olive-soft); }
+  a:focus-visible { outline: 2px solid var(--olive); outline-offset: 3px; border-radius: 8px; }
 
-  /* ── hero ── */
-  .hero { position: relative; padding: 92px 0 30px; text-align: center; background: var(--hero-wash); }
-  .eyebrow {
-    font-family: var(--font-mono); font-size: 12px; letter-spacing: 0.14em; text-transform: uppercase;
-    color: var(--olive); display: inline-flex; align-items: center; gap: 8px;
+  .hero {
+    position: relative;
+    padding: 108px 0 72px;
+    text-align: center;
+    background:
+      radial-gradient(800px 430px at 50% 6%, var(--olive-soft), transparent 72%),
+      linear-gradient(to bottom, transparent, var(--ground));
   }
-  .eyebrow::before { content: ''; width: 22px; height: 1px; background: var(--olive-line); }
-  .eyebrow::after { content: ''; width: 22px; height: 1px; background: var(--olive-line); }
-  h1 {
-    font-family: var(--font-serif); font-weight: 560; font-size: clamp(44px, 7.2vw, 78px);
-    line-height: 1.04; letter-spacing: -0.022em; margin: 22px auto 18px; max-width: 15ch; text-wrap: balance;
+  .kicker {
+    display: inline-flex;
+    align-items: center;
+    gap: 9px;
+    color: var(--olive-ink);
+    font-family: var(--mono);
+    font-size: 11px;
+    font-weight: 650;
+    letter-spacing: .12em;
+    text-transform: uppercase;
   }
-  h1 em { font-style: italic; color: var(--olive); }
-  .lede { font-size: 19px; color: var(--ink-2); max-width: 56ch; margin: 0 auto 34px; text-wrap: balance; }
-  .lede code { font-family: var(--font-mono); font-size: 16px; color: var(--ink); }
-  .cta-row { display: flex; gap: 12px; justify-content: center; align-items: center; flex-wrap: wrap; margin-bottom: 12px; }
-  .cta-note { font-size: 13px; color: var(--ink-3); font-family: var(--font-mono); }
+  .kicker::before { content: ""; width: 7px; height: 7px; border-radius: 50%; background: var(--green); box-shadow: 0 0 0 5px color-mix(in srgb, var(--green) 14%, transparent); }
+  h1, h2 { margin: 0; font-family: var(--serif); font-weight: 520; letter-spacing: -.035em; text-wrap: balance; }
+  h1 { max-width: 12ch; margin: 22px auto 20px; font-size: clamp(48px, 8vw, 88px); line-height: .98; }
+  h1 em { color: var(--olive-ink); font-style: italic; }
+  .lede { max-width: 660px; margin: 0 auto; color: var(--ink-2); font-size: clamp(17px, 2vw, 20px); text-wrap: balance; }
+  .actions { display: flex; justify-content: center; flex-wrap: wrap; gap: 11px; margin: 32px 0 14px; }
+  .fine { color: var(--ink-3); font-family: var(--mono); font-size: 12px; }
 
-  /* ── the product window: agent tabs riding a glass frame ── */
-  .window {
-    margin: 56px auto 0; max-width: 1060px; text-align: left;
-    border-radius: 18px; border: 1px solid var(--border);
-    background: var(--panel);
-    backdrop-filter: blur(20px);
-    -webkit-backdrop-filter: blur(20px);
+  .product-frame {
+    position: relative;
+    margin: 62px auto 0;
+    padding: 7px;
+    border: 1px solid var(--line);
+    border-radius: 22px;
+    background: color-mix(in srgb, var(--panel-solid) 85%, transparent);
     box-shadow: var(--shadow);
     overflow: hidden;
-    animation: rise 0.9s cubic-bezier(0.2, 0.7, 0.2, 1) 0.15s backwards;
   }
-  .shot { position: relative; background: var(--ground-2); }
-  .shot img { width: 100%; height: auto; }
-  .shot .light-img { display: none; }
-  @media (prefers-color-scheme: light) { .shot .dark-img { display: none; } .shot .light-img { display: block; } }
-  :root[data-theme='dark'] .shot .dark-img { display: block !important; } :root[data-theme='dark'] .shot .light-img { display: none !important; }
-  :root[data-theme='light'] .shot .dark-img { display: none !important; } :root[data-theme='light'] .shot .light-img { display: block !important; }
+  .product-frame::before { content: ""; position: absolute; inset: 0; border-radius: inherit; box-shadow: inset 0 1px rgba(255,255,255,.4); pointer-events: none; }
+  .product-frame img { width: 100%; border-radius: 15px; }
+  .product-frame .light { display: block; }
+  .product-frame .dark { display: none; }
+  @media (prefers-color-scheme: dark) { .product-frame .light { display: none; } .product-frame .dark { display: block; } }
+  .product-caption { display: grid; grid-template-columns: repeat(3, 1fr); gap: 1px; margin-top: 1px; background: var(--line-soft); border-radius: 0 0 14px 14px; overflow: hidden; }
+  .product-caption div { padding: 16px 18px; background: var(--panel-solid); text-align: left; }
+  .product-caption b { display: block; margin-bottom: 2px; font-size: 13px; }
+  .product-caption span { color: var(--ink-3); font-size: 12px; }
 
-  @keyframes rise { from { opacity: 0; transform: translateY(26px); } }
-    @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.35; } }
-  @media (prefers-reduced-motion: reduce) { .window { animation: none; } }
+  section { padding: 104px 0; border-top: 1px solid var(--line-soft); }
+  .section-head { max-width: 670px; margin-bottom: 50px; }
+  .section-head.center { margin-inline: auto; text-align: center; }
+  h2 { font-size: clamp(34px, 5vw, 54px); line-height: 1.04; }
+  .section-head p { margin: 15px 0 0; color: var(--ink-2); font-size: 18px; text-wrap: balance; }
+  .eyebrow { display: block; margin-bottom: 13px; color: var(--olive-ink); font-family: var(--mono); font-size: 11px; font-weight: 700; letter-spacing: .12em; text-transform: uppercase; }
 
-  /* ── sections ── */
-  section { padding: 96px 0; }
-  .sect-head { max-width: 640px; margin-bottom: 52px; }
-  .sect-head.center { margin-left: auto; margin-right: auto; text-align: center; }
-  h2 { font-family: var(--font-serif); font-weight: 560; font-size: clamp(30px, 4vw, 42px); letter-spacing: -0.018em; line-height: 1.12; margin-bottom: 14px; text-wrap: balance; }
-  .sect-head p { color: var(--ink-2); font-size: 17px; }
+  .layer-grid { display: grid; grid-template-columns: 1.15fr .85fr; gap: 20px; }
+  .layer-card, .feature-card, .privacy-card {
+    border: 1px solid var(--line);
+    border-radius: 18px;
+    background: var(--panel);
+    box-shadow: 0 1px 0 rgba(255,255,255,.25) inset;
+  }
+  .layer-card { padding: 30px; }
+  .layer-card.primary { grid-row: span 2; }
+  .layer-card h3, .feature-card h3, .privacy-card h3 { margin: 0 0 8px; font-size: 19px; letter-spacing: -.02em; }
+  .layer-card p, .feature-card p, .privacy-card p { margin: 0; color: var(--ink-2); font-size: 14.5px; }
+  .mini-rail { display: grid; gap: 7px; margin-top: 28px; padding: 14px; border: 1px solid var(--line-soft); border-radius: 13px; background: var(--ground); }
+  .mini-tab { display: flex; align-items: center; gap: 9px; min-height: 38px; padding: 0 12px; border-radius: 9px; color: var(--ink-2); font-size: 13px; }
+  .mini-tab.active { background: var(--panel-solid); color: var(--ink); box-shadow: var(--shadow-small); }
+  .mini-tab i { width: 7px; height: 7px; border-radius: 50%; background: var(--olive); }
+  .mini-tab small { margin-left: auto; color: var(--ink-3); font-family: var(--mono); }
+  .path { display: flex; gap: 8px; align-items: center; margin-top: 22px; color: var(--ink-3); font-family: var(--mono); font-size: 12px; }
+  .path span { color: var(--ink); }
 
-  .thesis { border-top: 1px solid var(--border-faint); }
-  .cols { display: grid; grid-template-columns: repeat(3, 1fr); gap: 20px; }
-  .col-card {
-    border: 1px solid var(--border); border-radius: 16px; padding: 26px 24px;
-    background: var(--panel); backdrop-filter: blur(12px); -webkit-backdrop-filter: blur(12px);
-    transition: transform 0.2s, border-color 0.2s;
+  .team { background: linear-gradient(180deg, var(--olive-soft), transparent 68%); }
+  .protocol {
+    display: grid;
+    grid-template-columns: repeat(6, 1fr);
+    gap: 8px;
+    margin-top: 30px;
+    padding: 10px;
+    border: 1px solid var(--olive-line);
+    border-radius: 17px;
+    background: var(--panel);
   }
-  .col-card:hover { transform: translateY(-3px); border-color: var(--olive-line); }
-  .col-card h3 { font-size: 17px; font-weight: 650; margin: 14px 0 8px; letter-spacing: -0.01em; }
-  .col-card p { font-size: 14.5px; color: var(--ink-2); }
-  .glyph {
-    width: 38px; height: 38px; border-radius: 11px; display: grid; place-items: center;
-    background: var(--olive-soft); border: 1px solid var(--olive-line); color: var(--olive);
-  }
-  .glyph svg { width: 19px; height: 19px; }
+  .step { position: relative; min-height: 124px; padding: 18px 16px; border-radius: 11px; background: var(--panel-solid); }
+  .step::after { content: "→"; position: absolute; top: 18px; right: -8px; z-index: 2; color: var(--olive); font-family: var(--mono); }
+  .step:last-child::after { display: none; }
+  .step b { display: block; margin-bottom: 9px; color: var(--olive-ink); font-family: var(--mono); font-size: 11px; letter-spacing: .05em; text-transform: uppercase; }
+  .step span { color: var(--ink-2); font-size: 13px; line-height: 1.4; }
+  .gate { display: flex; align-items: center; justify-content: center; gap: 10px; margin-top: 17px; color: var(--ink-3); font-size: 13px; }
+  .gate::before, .gate::after { content: ""; width: 44px; height: 1px; background: var(--olive-line); }
 
-  /* ── feature grid ── */
-  .grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 20px; }
-  .feat {
-    border: 1px solid var(--border); border-radius: 16px; padding: 24px;
-    background: var(--panel-solid); overflow: hidden; position: relative;
-  }
-  .feat h3 { font-size: 16px; font-weight: 650; margin-bottom: 6px; display: flex; align-items: center; gap: 9px; }
-  .feat p { font-size: 14.5px; color: var(--ink-2); max-width: 58ch; }
-  .feat .tag { font-family: var(--font-mono); font-size: 10.5px; letter-spacing: 0.1em; text-transform: uppercase; color: var(--olive); }
-  kbd {
-    font-family: var(--font-mono); font-size: 12px; color: var(--ink-2);
-    background: var(--keycap-bg); border: 1px solid var(--keycap-edge); border-bottom-width: 2px;
-    border-radius: 6px; padding: 2px 7px 3px; white-space: nowrap;
-  }
-  .term {
-    margin-top: 16px; background: var(--term-bg); color: #c4c8d2; border-radius: 10px;
-    font-family: var(--font-mono); font-size: 12.5px; line-height: 1.7; padding: 14px 16px;
-    border: 1px solid rgba(255,255,255,0.06); overflow-x: auto;
-  }
-  .term .p { color: #95a456; } .term .c { color: #5a5f6b; }
-  .agents-row { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 16px; }
-  .chip {
-    font-family: var(--font-mono); font-size: 12px; color: var(--ink-2);
-    border: 1px solid var(--border); border-radius: 999px; padding: 5px 12px;
-    display: inline-flex; align-items: center; gap: 7px;
-  }
-  .chip i { width: 6px; height: 6px; border-radius: 50%; background: var(--olive); font-style: normal; }
+  .features { display: grid; grid-template-columns: repeat(3, 1fr); gap: 18px; }
+  .feature-card { min-height: 220px; padding: 26px; }
+  .feature-card .label { display: inline-flex; margin-bottom: 32px; padding: 4px 8px; border: 1px solid var(--line); border-radius: 7px; color: var(--ink-3); font-family: var(--mono); font-size: 10px; letter-spacing: .08em; text-transform: uppercase; }
+  .feature-card code, .privacy-card code { color: var(--olive-ink); font-family: var(--mono); font-size: .92em; }
 
-  /* ── research / provenance (the quiet, serif moat section) ── */
-  .moat { border-top: 1px solid var(--border-faint); background: linear-gradient(to bottom, var(--olive-soft) -60%, transparent 26%); }
-  .moat-grid { display: grid; grid-template-columns: 1.05fr 0.95fr; gap: 56px; align-items: center; }
-  .moat .prose { font-family: var(--font-serif); font-size: 19px; line-height: 1.65; color: var(--ink-2); }
-  .moat .prose strong { color: var(--ink); font-weight: 600; }
-  .traj {
-    font-family: var(--font-mono); font-size: 12.5px; color: var(--ink-3);
-    margin-top: 26px; line-height: 2; letter-spacing: 0.01em;
-  }
-  .traj b { color: var(--olive); font-weight: 500; }
-  .moat img { width: 100%; height: auto; border-radius: 14px; border: 1px solid var(--border); box-shadow: var(--shadow); }
-  .claim {
-    margin-top: 22px; border-left: 3px solid var(--olive); padding: 10px 16px;
-    background: var(--olive-soft); border-radius: 0 10px 10px 0; font-size: 14px; color: var(--ink-2);
-  }
-  .claim .lock { font-family: var(--font-mono); font-size: 11px; color: var(--olive); letter-spacing: 0.08em; text-transform: uppercase; }
+  .writing-grid { display: grid; grid-template-columns: .8fr 1.2fr; gap: 40px; align-items: center; }
+  .writing-copy p { color: var(--ink-2); font-size: 17px; }
+  .writing-list { display: grid; gap: 15px; margin-top: 28px; }
+  .writing-list div { padding-left: 17px; border-left: 2px solid var(--olive-line); }
+  .writing-list b { display: block; font-size: 14px; }
+  .writing-list span { color: var(--ink-3); font-size: 13px; }
+  .editor-shot { padding: 7px; border: 1px solid var(--line); border-radius: 18px; background: var(--panel-solid); box-shadow: var(--shadow-small); }
+  .editor-shot img { width: 100%; border-radius: 12px; }
 
-  /* ── download ── */
-  .dl { text-align: center; border-top: 1px solid var(--border-faint); }
-  .dl .btn { font-size: 16px; padding: 13px 26px; border-radius: 12px; }
-  .dl-or { margin: 22px 0 0; font-size: 14px; color: var(--ink-2); }
-  .dl .term { display: inline-block; text-align: left; margin-top: 10px; user-select: all; -webkit-user-select: all; }
-  .fineprint { margin-top: 18px; font-size: 13px; color: var(--ink-3); }
-  .fineprint code { font-family: var(--font-mono); background: var(--keycap-bg); border: 1px solid var(--keycap-edge); border-radius: 5px; padding: 1px 6px; }
+  .privacy { background: var(--ground-deep); }
+  .privacy-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 18px; }
+  .privacy-card { padding: 26px; background: var(--panel-solid); }
+  .privacy-card .number { display: block; margin-bottom: 28px; color: var(--olive); font-family: var(--mono); font-size: 12px; }
 
-  footer { border-top: 1px solid var(--border-faint); padding: 34px 0 60px; color: var(--ink-3); font-size: 13.5px; }
-  .foot-in { display: flex; align-items: center; gap: 20px; flex-wrap: wrap; }
-  .foot-in a { color: var(--ink-3); text-decoration: none; } .foot-in a:hover { color: var(--ink); }
-  .foot-in .mark { font-size: 15px; color: var(--ink-2); }
-  .spacer { flex: 1; }
+  .download { text-align: center; }
+  .install { display: inline-flex; max-width: 100%; margin-top: 18px; padding: 13px 17px; border: 1px solid var(--line); border-radius: 10px; background: var(--panel-solid); color: var(--ink-2); font-family: var(--mono); font-size: 12px; text-align: left; overflow-x: auto; user-select: all; }
+  footer { padding: 34px 0 56px; border-top: 1px solid var(--line-soft); color: var(--ink-3); font-size: 13px; }
+  .footer-inner { display: flex; align-items: center; gap: 20px; flex-wrap: wrap; }
+  .footer-inner .brand { color: var(--ink-2); font-size: 14px; }
+  .footer-inner .spacer { flex: 1; }
+  .footer-inner > a:not(.brand) { text-decoration: none; }
+  .footer-inner > a:hover { color: var(--ink); }
 
-  @media (max-width: 880px) {
-    .cols, .grid, .moat-grid { grid-template-columns: 1fr; }
-    .moat-grid { gap: 30px; }
-    section { padding: 68px 0; }
-    .nav-links a.quiet { display: none; }
+  @media (max-width: 920px) {
+    .layer-grid, .writing-grid { grid-template-columns: 1fr; }
+    .layer-card.primary { grid-row: auto; }
+    .features, .privacy-grid { grid-template-columns: repeat(2, 1fr); }
+    .protocol { grid-template-columns: repeat(3, 1fr); }
+    .step:nth-child(3)::after { display: none; }
   }
+  @media (max-width: 640px) {
+    .wrap { width: min(100% - 28px, 1160px); }
+    .nav-inner { height: 56px; }
+    .nav-links .quiet { display: none; }
+    .nav-links { gap: 12px; }
+    .nav-links .button { min-height: 36px; padding-inline: 13px; }
+    .hero { padding-top: 78px; }
+    h1 { font-size: clamp(45px, 15vw, 68px); }
+    .product-caption { grid-template-columns: 1fr; }
+    section { padding: 76px 0; }
+    .features, .privacy-grid, .protocol { grid-template-columns: 1fr; }
+    .step::after { content: "↓"; top: auto; right: 18px; bottom: -11px; }
+    .step:nth-child(3)::after { display: block; }
+    .step:last-child::after { display: none; }
+    .feature-card { min-height: auto; }
+    .footer-inner .spacer { display: none; }
+  }
+  @media (prefers-reduced-motion: reduce) { html { scroll-behavior: auto; } .button { transition: none; } }
 </style>
 </head>
 <body>
 
-<nav class="nav" aria-label="Main">
-  <div class="wrap nav-in">
-    <a class="mark" href="#">
-      <img class="keystone" src="assets/kaisola-icon.png" alt="" width="22" height="22" style="border-radius:6px" />
+<nav class="nav" aria-label="Main navigation">
+  <div class="wrap nav-inner">
+    <a class="brand" href="#top" aria-label="Kaisola home">
+      <img src="assets/kaisola-icon.png" alt="" width="24" height="24" />
       Kaisola
     </a>
     <div class="nav-links">
-      <a class="quiet" href="#agents">Agents</a>
-      <a class="quiet" href="#ide">The IDE</a>
-      <a class="quiet" href="#research">Research</a>
+      <a class="quiet" href="#workspace">Workspace</a>
+      <a class="quiet" href="#team">Group sessions</a>
+      <a class="quiet" href="#privacy">Privacy</a>
       <a href="https://github.com/michaelofengend/kaisola" rel="noopener">GitHub</a>
-      <a class="btn" href="#download">Download</a>
+      <a class="button" href="#download">Download</a>
     </div>
   </div>
 </nav>
 
-<header class="hero">
-  <div class="wrap">
-    <span class="eyebrow">a browser for AI agents</span>
-    <h1>Every agent is <em>a tab.</em></h1>
-    <p class="lede">
-      Kaisola is a research IDE that works like a browser for coding agents —
-      <code>claude</code>, <code>codex</code>, <code>gemini</code>, any CLI — running as you,
-      side by side on glass. Group them, pin them, <code>⌘1–9</code> between them,
-      and review every change before it lands.
-    </p>
-    <div class="cta-row">
-      <a class="btn" href="https://github.com/michaelofengend/kaisola/releases/latest/download/Kaisola.dmg">Download for macOS</a>
-      <a class="btn ghost" href="https://github.com/michaelofengend/kaisola" rel="noopener">Star on GitHub</a>
-    </div>
-    <div class="cta-note">free &amp; open-source · Apple Silicon · your own CLIs &amp; auth · keys stay in the keychain</div>
+<main id="top">
+  <header class="hero">
+    <div class="wrap">
+      <span class="kicker">Files-first desktop IDE</span>
+      <h1>Files first. <em>Agents alongside.</em></h1>
+      <p class="lede">Kaisola puts your source files, Markdown, LaTeX, terminals, Codex, and Claude in one quiet workspace—so you can read the work, direct the agents, and stay in control.</p>
+      <div class="actions">
+        <a class="button" href="https://github.com/michaelofengend/kaisola/releases/latest/download/Kaisola.dmg">Download for macOS</a>
+        <a class="button secondary" href="https://github.com/michaelofengend/kaisola" rel="noopener">View source</a>
+      </div>
+      <div class="fine">free and open source · macOS 13+ · Apple Silicon</div>
 
-    <div class="window" role="img" aria-label="The Kaisola desktop app: a grid of agent session cards over a glass shell">
-      <div class="shot">
-        <img class="dark-img" src="assets/hero-dark.jpg" width="1600" height="969" alt="Kaisola dark theme: agent session cards side by side" />
-        <img class="light-img" src="assets/hero-light.jpg" width="1600" height="969" alt="Kaisola light theme: agent session cards side by side" />
-      </div>
-    </div>
-  </div>
-</header>
-
-<section class="thesis" id="agents">
-  <div class="wrap">
-    <div class="sect-head">
-      <h2>Your agents already live in terminals. Give them a browser.</h2>
-      <p>Chrome made pages tabs. Kaisola makes <em>agent sessions</em> tabs — with the same muscle memory.</p>
-    </div>
-    <div class="cols">
-      <div class="col-card">
-        <div class="glyph"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><rect x="3" y="4" width="18" height="16" rx="3"/><path d="M3 9h18M8 4v5"/></svg></div>
-        <h3>Sessions are tabs</h3>
-        <p>Every agent, terminal, git panel, and embedded browser is a card you can pin, group, split, and cycle with <span style="font-family:var(--font-mono)">⌘1–9</span> — pinned tabs, tab groups, and ⌘⇧T reopen included.</p>
-      </div>
-      <div class="col-card">
-        <div class="glyph"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M4 19V5a2 2 0 0 1 2-2h12a2 2 0 0 1 2 2v14"/><path d="M2 19h20M9 7h6M9 11h6"/></svg></div>
-        <h3>Projects are tabs</h3>
-        <p>A Chrome-style strip across the very top holds your repos. Switch projects like switching sites — agents in background projects keep working, and a badge tells you when one needs you.</p>
-      </div>
-      <div class="col-card">
-        <div class="glyph"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M12 3l8 4.5v9L12 21l-8-4.5v-9L12 3z"/><path d="M12 12l8-4.5M12 12v9M12 12L4 7.5"/></svg></div>
-        <h3>Yours, on glass</h3>
-        <p>Bring your own <span style="font-family:var(--font-mono)">claude</span>, <span style="font-family:var(--font-mono)">codex</span>, <span style="font-family:var(--font-mono)">opencode</span> — Kaisola never proxies a model. Logins run in real TTYs; keys live in the macOS keychain; the shell is native liquid glass.</p>
-      </div>
-    </div>
-  </div>
-</section>
-
-<section id="ide">
-  <div class="wrap">
-    <div class="sect-head">
-      <h2>A real IDE underneath.</h2>
-      <p>Not a wrapper around a chat box — terminals, git, files, and builds are first-class.</p>
-    </div>
-    <div class="grid">
-      <div class="feat">
-        <span class="tag">Terminals</span>
-        <h3>Real ptys, not simulations</h3>
-        <p>node-pty terminals with WebGL rendering: the shell draws its own prompt, colors and interactive programs just work. When an agent runs a command, its terminal appears beside it — watch, or take over.</p>
-        <div class="term"><span class="p">❯</span> claude <span class="c"># boots signed-in, in your workspace</span><br /><span class="p">❯</span> git worktree add ../fix-123 <span class="c"># isolated agent sandboxes</span></div>
-      </div>
-      <div class="feat">
-        <span class="tag">Agent registry</span>
-        <h3>Ten CLIs, one <kbd>+</kbd> menu</h3>
-        <p>Built-in presets for the agents you already pay for — each runs the official CLI with your existing install and auth. Add anything else as a custom entry, ACP or terminal.</p>
-        <div class="agents-row">
-          <span class="chip"><i></i>Claude Code</span><span class="chip"><i></i>Codex</span><span class="chip"><i></i>Gemini</span><span class="chip"><i></i>OpenCode</span><span class="chip"><i></i>Qwen</span><span class="chip"><i></i>Aider</span><span class="chip"><i></i>Goose</span><span class="chip"><i></i>Amp</span><span class="chip"><i></i>Kimi</span><span class="chip"><i></i>Crush</span>
+      <div class="product-frame" aria-label="Kaisola workspace preview">
+        <img class="light" src="assets/hero-light.jpg" width="1600" height="969" alt="Kaisola with a vertical session rail, agent and terminal panels, and a file editor" />
+        <img class="dark" src="assets/hero-dark.jpg" width="1600" height="969" alt="Kaisola in dark mode with agent sessions, terminals, and files in one workspace" />
+        <div class="product-caption" aria-hidden="true">
+          <div><b>Vertical sessions</b><span>Codex, Claude, and terminals stay visible.</span></div>
+          <div><b>Flexible files</b><span>Keep the file tree left or right.</span></div>
+          <div><b>Project tabs</b><span>Switch repos without losing your place.</span></div>
         </div>
       </div>
-      <div class="feat">
-        <span class="tag">Git</span>
-        <h3>Commit beside the agent that made the change</h3>
-        <p>A commit panel card: browse changes, stage hunks, side-by-side diffs, commit — without leaving the window. Checkpoints snapshot the working tree before every agent turn, so any turn is one click to rewind.</p>
-      </div>
-      <div class="feat">
-        <span class="tag">Safety</span>
-        <h3>Permission cards, not YOLO mode</h3>
-        <p>Agent asks are inline cards with allow-rules you control; sensitive-file globs are enforced below the agent — it can't read what you've fenced off. Autonomy is a ladder (Observe → Propose → Execute), not a switch.</p>
-      </div>
-      <div class="feat">
-        <span class="tag">Writing</span>
-        <h3>LaTeX mode</h3>
-        <p>Open a <span style="font-family:var(--font-mono)">.tex</span> workspace and the shell leans into paper-writing: latexmk builds, PDF preview with SyncTeX jumps, and Overleaf sync.</p>
-      </div>
-      <div class="feat">
-        <span class="tag">Keyboard-first</span>
-        <h3>The whole shell on home row</h3>
-        <p><kbd>⌘L</kbd> talk to any agent · <kbd>⌘K</kbd> palette · <kbd>⌘P</kbd> files · <kbd>⌘J</kbd> cards · <kbd>⌘1–9</kbd> sessions · <kbd>⌃Tab</kbd> cycle — every chord rebindable from <span style="font-family:var(--font-mono)">keymap.json</span>.</p>
-      </div>
     </div>
-  </div>
-</section>
+  </header>
 
-<section class="moat" id="research">
-  <div class="wrap moat-grid">
-    <div>
-      <h2>Built for research that has to hold up.</h2>
-      <p class="prose">
-        Underneath the shell is a research IDE. The primitive isn't the paper — it's the
-        <strong>trajectory</strong>: corpus to claims to hypotheses to experiments to manuscript.
-        Every claim links to its evidence — a citation, a result, a derivation — and carries a
-        computed <strong>trust</strong> level. Agents never mutate your work: they file
-        <strong>proposals</strong>, rendered as research diffs, and <strong>you approve every transition</strong>.
-      </p>
-      <div class="traj">corpus → claims → questions → hypotheses →<br />experiments → runs → results → <b>manuscript</b></div>
-      <div class="claim">
-        <span class="lock">unsupported claim</span><br />
-        “Latency improves 3.2× under timer ablation” — no linked result. Kaisola flags it inline until evidence exists.
+  <section id="workspace">
+    <div class="wrap">
+      <div class="section-head">
+        <span class="eyebrow">One workspace, arranged your way</span>
+        <h2>The code stays central.</h2>
+        <p>Sessions live in a vertical rail by default, while files can sit on either side. Move sessions across the top, resize the rail, or focus the editor when you need more room.</p>
+      </div>
+      <div class="layer-grid">
+        <article class="layer-card primary">
+          <h3>Sessions that behave like workspace tools</h3>
+          <p>Start a terminal, Codex thread, Claude thread, or Kaisola Mesh from the same menu. Reorder sessions, split them side by side, and return to saved conversations after a restart.</p>
+          <div class="mini-rail" aria-hidden="true">
+            <div class="mini-tab active"><i></i> Review the auth flow <small>Codex</small></div>
+            <div class="mini-tab"><i></i> Refine the Markdown editor <small>Claude</small></div>
+            <div class="mini-tab"><i></i> Ship the next release <small>Team</small></div>
+            <div class="mini-tab"><i></i> npm run typecheck <small>Terminal</small></div>
+          </div>
+        </article>
+        <article class="layer-card">
+          <h3>Projects remain independent</h3>
+          <p>Each project keeps its own folder, sessions, layout, and active work. Background work can continue while you move between project tabs.</p>
+          <div class="path" aria-hidden="true">Project <span>kaisola / src</span></div>
+        </article>
+        <article class="layer-card">
+          <h3>Recovery from local state</h3>
+          <p>Drafts, layouts, and session metadata persist to disk. Reopening Kaisola restores the workspace without turning your project folder into app storage.</p>
+          <div class="path" aria-hidden="true">State <span>on this Mac</span></div>
+        </article>
       </div>
     </div>
-    <div>
-      <img src="assets/editor-detail-light.jpg" width="960" height="1166" alt="The Kaisola editor pane: a stylesheet open in edit view with view, diff, and save controls" loading="lazy" />
-    </div>
-  </div>
-</section>
+  </section>
 
-<section class="dl" id="download">
-  <div class="wrap">
-    <div class="sect-head center">
-      <h2>On your Mac in under a minute.</h2>
-      <p>Free and open-source. Bring your own agent CLIs — Kaisola never sees your keys.</p>
+  <section class="team" id="team">
+    <div class="wrap">
+      <div class="section-head center">
+        <span class="eyebrow">Kaisola Mesh</span>
+        <h2>Multiple models. One controlled implementation.</h2>
+        <p>Start with Claude and Codex, add more participants, and select each provider's live model. A Mesh gives the team a shared mission, but not a shared checkout: Kaisola coordinates the handoffs and keeps state-changing stages behind your approval.</p>
+      </div>
+      <div class="protocol" aria-label="Group collaboration protocol">
+        <div class="step"><b>01 Scout</b><span>Both agents analyze independently before seeing the other approach.</span></div>
+        <div class="step"><b>02 Align</b><span>They compare risks, interfaces, and acceptance criteria.</span></div>
+        <div class="step"><b>03 Assign</b><span>A role contract gives each subsystem one owner.</span></div>
+        <div class="step"><b>04 Build</b><span>Each agent works in its own isolated git worktree.</span></div>
+        <div class="step"><b>05 Verify</b><span>Each agent reviews the other candidate and records findings.</span></div>
+        <div class="step"><b>06 Integrate</b><span>A single integration owner merges and runs final checks.</span></div>
+      </div>
+      <div class="gate">human approval at every state-changing boundary</div>
     </div>
-    <a class="btn" href="https://github.com/michaelofengend/kaisola/releases/latest/download/Kaisola.dmg">Download Kaisola.dmg</a>
-    <div class="dl-or">or install from the terminal:</div>
-    <div class="term"><span class="p">❯</span> curl -fsSL https://kaisola.com/install.sh | sh</div>
-    <p class="fineprint">
-      macOS 13+ · Apple Silicon · signed &amp; notarized ·
-      <a href="https://github.com/michaelofengend/kaisola/releases" rel="noopener">all releases</a>
-    </p>
-  </div>
-</section>
+  </section>
+
+  <section id="agents">
+    <div class="wrap">
+      <div class="section-head">
+        <span class="eyebrow">Agents without the terminal tax</span>
+        <h2>Rich agent sessions, backed by real CLIs.</h2>
+        <p>Codex and Claude connect through the Agent Client Protocol, giving Kaisola structured messages, tool activity, plans, permission requests, queues, and resumable sessions.</p>
+      </div>
+      <div class="features">
+        <article class="feature-card"><span class="label">ACP</span><h3>Codex and Claude, first-class</h3><p>Read agent output as a conversation while retaining access to the underlying CLI session and its workspace context.</p></article>
+        <article class="feature-card"><span class="label">Terminal</span><h3>A real PTY when you need it</h3><p>Interactive shells and programs run through <code>node-pty</code>. Watch commands as they run or open a terminal of your own beside the agent.</p></article>
+        <article class="feature-card"><span class="label">Queue</span><h3>Keep the next instruction close</h3><p>Follow-up messages sit above the composer while an agent is busy. Steer supported sessions mid-turn, or let the queue deliver next.</p></article>
+        <article class="feature-card"><span class="label">MCP</span><h3>One tool surface across agents</h3><p>Project and user MCP servers can travel with supported agent sessions, while the Kaisola MCP bridge exposes workspace context and gated proposals.</p></article>
+        <article class="feature-card"><span class="label">Extensions</span><h3>Grow the editor deliberately</h3><p>Install language, grammar, preview, and MCP contributions from Settings. Bundled extensions cover common code, data, document, and media formats.</p></article>
+        <article class="feature-card"><span class="label">Control</span><h3>Permission modes stay visible</h3><p>Choose how much an agent may do per session. Requests and tool activity remain part of the conversation instead of disappearing behind a spinner.</p></article>
+      </div>
+    </div>
+  </section>
+
+  <section id="writing">
+    <div class="wrap writing-grid">
+      <div class="writing-copy">
+        <span class="eyebrow">Code and documents</span>
+        <h2>Write in the format the work requires.</h2>
+        <p>Kaisola treats readable documents and source code as parts of the same project—not separate destinations.</p>
+        <div class="writing-list">
+          <div><b>Markdown that stays readable</b><span>Rendered GitHub-flavored preview with a clean, direct editing mode.</span></div>
+          <div><b>LaTeX that stays inspectable</b><span>Build with local tooling, read parsed errors, and inspect the resulting PDF.</span></div>
+          <div><b>Useful previews out of the box</b><span>PDF, images, CSV/TSV tables, and JSON trees alongside ordinary text editing.</span></div>
+        </div>
+      </div>
+      <div class="editor-shot">
+        <img src="assets/editor-light.jpg" width="1200" height="726" alt="Kaisola file tree, agent panel, and source editor" loading="lazy" />
+      </div>
+    </div>
+  </section>
+
+  <section class="privacy" id="privacy">
+    <div class="wrap">
+      <div class="section-head">
+        <span class="eyebrow">Local by default</span>
+        <h2>Your workspace does not depend on a Kaisola model cloud.</h2>
+        <p>Kaisola coordinates software installed on your Mac. Your project and working state remain local, and signing into a Kaisola profile is optional.</p>
+      </div>
+      <div class="privacy-grid">
+        <article class="privacy-card"><span class="number">01</span><h3>Use your existing agent accounts</h3><p>Codex and Claude authenticate through their own CLIs. Kaisola does not proxy those agent prompts through a separate Kaisola model service.</p></article>
+        <article class="privacy-card"><span class="number">02</span><h3>Continue locally</h3><p>Google sign-in is optional. You can open projects, edit files, run terminals, and use configured agents without creating a Kaisola profile.</p></article>
+        <article class="privacy-card"><span class="number">03</span><h3>OS-backed credential storage</h3><p>If you do use Google sign-in, its durable refresh credential is encrypted in the main process with Electron <code>safeStorage</code> and is not exposed to the renderer.</p></article>
+      </div>
+    </div>
+  </section>
+
+  <section class="download" id="download">
+    <div class="wrap">
+      <div class="section-head center">
+        <span class="eyebrow">Open source for macOS</span>
+        <h2>Bring your folder. Keep your tools.</h2>
+        <p>Install Kaisola, connect the agent CLIs you already use, and arrange the workspace around the work in front of you.</p>
+      </div>
+      <div class="actions">
+        <a class="button" href="https://github.com/michaelofengend/kaisola/releases/latest/download/Kaisola.dmg">Download Kaisola.dmg</a>
+        <a class="button secondary" href="https://github.com/michaelofengend/kaisola/releases" rel="noopener">All releases</a>
+      </div>
+      <div class="install">curl -fsSL https://kaisola.com/install.sh | sh</div>
+      <p class="fine">macOS 13+ · Apple Silicon · source available on GitHub</p>
+    </div>
+  </section>
+</main>
 
 <footer>
-  <div class="wrap foot-in">
-    <span class="mark">
-      <img class="keystone" src="assets/kaisola-icon.png" alt="" width="16" height="16" style="width:16px;height:16px;border-radius:4px" />
-      Kaisola
-    </span>
-    <span>The research IDE that's a browser for AI agents.</span>
+  <div class="wrap footer-inner">
+    <a class="brand" href="#top"><img src="assets/kaisola-icon.png" alt="" width="20" height="20" />Kaisola</a>
+    <span>Files first. Agents alongside.</span>
     <span class="spacer"></span>
     <a href="https://github.com/michaelofengend/kaisola" rel="noopener">GitHub</a>
-    <a href="mailto:pazalouie@gmail.com">Contact</a>
+    <a href="https://github.com/michaelofengend/kaisola/releases" rel="noopener">Releases</a>
   </div>
 </footer>
 

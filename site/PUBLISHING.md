@@ -17,12 +17,13 @@ artifact and deploys it. No build step, no branch juggling.
 - The custom domain lives in the repo's Pages settings (the `CNAME` file here is
   a belt-and-suspenders copy).
 
-Keep `assets/hero-*.jpg` under ~250 KB each, and update `og:image` in
-`index.html` if the asset layout changes.
+Keep `assets/hero-*.jpg` reasonably compressed, and update their alt text and
+the page copy whenever the screenshots are regenerated. Update `og:image` in
+`index.html` if the social-preview asset changes.
 
 ## Later
 
 - Replace the GitHub release link with a versioned `download.kaisola.com` redirect.
 - Add a changelog page fed from GitHub releases.
-- Regenerate screenshots after the project-tabs feature lands (the tab strip is
-  the hero motif — the real thing should match).
+- Regenerate the product screenshots after a substantial shell or session-layout
+  change so the public site continues to match the shipped app.

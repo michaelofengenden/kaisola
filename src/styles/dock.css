@@ -559,6 +559,11 @@ details.assistant-tool.tool-artifacts > summary::-webkit-details-marker { displa
   background: var(--bg-2);
   font-size: var(--fs-12);
 }
+.plan-shelf {
+  flex: 0 0 auto;
+  margin: 8px clamp(var(--sp-5), 2vw, var(--sp-8)) 0;
+  min-width: 0;
+}
 .plan-strip > summary {
   display: flex;
   align-items: center;
@@ -741,6 +746,31 @@ details.assistant-tool.tool-artifacts > summary::-webkit-details-marker { displa
   margin: var(--sp-3) var(--sp-5) var(--sp-2);
   flex-shrink: 0;
 }
+.composer-command-palette {
+  max-height: min(360px, 42vh);
+  margin: 0 8px -2px;
+  overflow: auto;
+  padding: 6px;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: var(--bg-1);
+  box-shadow: var(--shadow-2);
+}
+.composer-command-palette > button {
+  width: 100%;
+  min-width: 0;
+  display: grid;
+  grid-template-columns: minmax(86px, auto) minmax(100px, 1fr) minmax(0, auto);
+  align-items: center;
+  gap: 9px;
+  padding: 7px 8px;
+  border-radius: 8px;
+  color: var(--text-2);
+  text-align: left;
+}
+.composer-command-palette > button:hover { color: var(--text-0); background: var(--hover-overlay); }
+.composer-command-palette code { color: var(--text-0); font-size: var(--fs-12); }
+.composer-command-palette small { color: var(--text-3); font-size: var(--fs-10); }
 .composer {
   position: relative;
   margin: 0;
@@ -1116,6 +1146,39 @@ details.assistant-tool.tool-artifacts > summary::-webkit-details-marker { displa
 .group-empty strong { color: var(--text-0); font-size: var(--fs-16); font-weight: var(--fw-semibold); }
 .group-empty p { max-width: 460px; margin: 0; line-height: 1.55; }
 .group-empty small { color: var(--text-3); }
+.group-roster {
+  width: min(520px, 100%);
+  margin-top: 8px;
+  padding: 8px;
+  border: 1px solid var(--border-faint);
+  border-radius: 12px;
+  background: color-mix(in srgb, var(--bg-1) 78%, transparent);
+  text-align: left;
+}
+.group-roster-row {
+  min-width: 0;
+  min-height: 34px;
+  display: grid;
+  grid-template-columns: 18px minmax(64px, 1fr) minmax(110px, 1.4fr) 24px;
+  align-items: center;
+  gap: 7px;
+  padding: 3px 4px;
+}
+.group-roster-row + .group-roster-row { border-top: 1px solid var(--border-faint); }
+.group-roster-row select,
+.group-add-member {
+  min-width: 0;
+  height: 27px;
+  border: 1px solid var(--border-faint);
+  border-radius: 7px;
+  padding: 0 7px;
+  background: var(--bg-2);
+  color: var(--text-1);
+  font-size: var(--fs-11);
+}
+.group-roster-row select:disabled { color: var(--text-3); opacity: .72; }
+.group-roster-row .btn-icon { width: 24px; height: 24px; }
+.group-add-member { width: 100%; margin-top: 5px; border-style: dashed; color: var(--text-2); }
 .group-task {
   width: min(680px, 92%);
   margin: 0 0 22px auto;
@@ -1151,6 +1214,7 @@ details.assistant-tool.tool-artifacts > summary::-webkit-details-marker { displa
 .group-final > header { display: flex; align-items: center; gap: 7px; margin-bottom: 9px; }
 .group-result > header strong,
 .group-final > header strong { font-size: var(--fs-12); font-weight: var(--fw-semibold); }
+.group-model-label { min-width: 0; margin-left: auto; color: var(--text-3); font-size: var(--fs-10); font-weight: var(--fw-regular); }
 .group-result p { max-height: 420px; overflow: auto; padding-right: 4px; color: var(--text-1); }
 .group-waiting { color: var(--text-3); font-size: var(--fs-12); }
 .group-review,
@@ -1250,6 +1314,7 @@ details.assistant-tool.tool-artifacts > summary::-webkit-details-marker { displa
   .group-head small { display: none; }
   .group-results { grid-template-columns: minmax(0, 1fr); }
   .group-result p { max-height: 300px; }
+  .group-roster-row { grid-template-columns: 18px minmax(52px, 1fr) minmax(84px, 1.4fr) 24px; }
 }
 .provider-setting-head,
 .provider-setting-row { display: flex; align-items: center; gap: 8px; padding: 9px 2px 7px; font-size: var(--fs-12); }

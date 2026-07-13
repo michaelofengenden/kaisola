@@ -74,6 +74,7 @@ async function main() {
   // Normal update: the early downloaded event is NOT enough to arm Restart.
   const firstDownload = deferred()
   updater.scenarios.push({ available: true, version: '1.1.0', download: firstDownload })
+  updater.scenarios.push({ available: true, version: '1.1.0' })
   const firstCheck = controller.check()
   await turn()
   updater.emit('download-progress', { percent: 63.7 })
@@ -104,6 +105,8 @@ async function main() {
   const replacement = deferred()
   updater.manualDownload = replacement
   updater.scenarios.push({ available: true, version: '1.2.0' })
+  updater.scenarios.push({ available: true, version: '1.2.0' }) // replacement settles, feed is stable
+  updater.scenarios.push({ available: true, version: '1.2.0' }) // install's final verification
   const refresh = controller.recheck()
   await turn()
   assert.equal(controller.snapshot().type, 'downloading')
@@ -124,6 +127,48 @@ async function main() {
   assert.equal(controller.snapshot().type, 'ready')
   assert.match(controller.snapshot().checkError, /Quit and reopen Kaisola/)
 
+  // Several missed releases collapse into one download chain and one restart.
+  const chainUpdater = new FakeUpdater()
+  const chainEvents = new EventEmitter()
+  const chain = createUpdateController({ autoUpdater: chainUpdater, appVersion: '1.0.0', appEmitter: chainEvents })
+  const chainInitial = deferred()
+  chainUpdater.manualDownload = { promise: Promise.resolve([]) }
+  chainUpdater.scenarios.push(
+    { available: true, version: '1.1.0', download: chainInitial },
+    { available: true, version: '1.2.0' },
+    { available: true, version: '1.4.0' },
+    { available: true, version: '1.4.0' },
+  )
+  const chainCheck = chain.check()
+  await turn()
+  chainInitial.resolve([])
+  assert.equal((await chainCheck).ok, true)
+  assert.equal(chain.snapshot().version, '1.4.0')
+  chainUpdater.scenarios.push({ available: true, version: '1.4.0' })
+  assert.equal((await chain.install()).ok, true)
+  assert.equal(chainUpdater.quitCalls, 1)
+  chain.dispose()
+
+  // A continuously changing feed never restarts into a known-superseded build.
+  const unstableUpdater = new FakeUpdater()
+  const unstableEvents = new EventEmitter()
+  const unstable = createUpdateController({ autoUpdater: unstableUpdater, appVersion: '1.0.0', appEmitter: unstableEvents })
+  const unstableInitial = deferred()
+  unstableUpdater.manualDownload = { promise: Promise.resolve([]) }
+  unstableUpdater.scenarios.push(
+    { available: true, version: '1.1.0', download: unstableInitial },
+    ...['1.2.0', '1.3.0', '1.4.0', '1.5.0', '1.6.0'].map((version) => ({ available: true, version })),
+  )
+  const unstableCheck = unstable.check()
+  await turn()
+  unstableInitial.resolve([])
+  assert.equal((await unstableCheck).unstable, true)
+  unstableUpdater.scenarios.push(...['1.7.0', '1.8.0', '1.9.0', '1.10.0', '1.11.0'].map((version) => ({ available: true, version })))
+  const unstableInstall = await unstable.install()
+  assert.equal(unstableInstall.deferred, true)
+  assert.equal(unstableUpdater.quitCalls, 0)
+  unstable.dispose()
+
   // Active ACP work is a fail-closed restart gate. The downloaded update stays
   // ready, and quitAndInstall is never called merely because the wait timed out.
   const guardedUpdater = new FakeUpdater()
@@ -138,11 +183,13 @@ async function main() {
   })
   const guardedDownload = deferred()
   guardedUpdater.scenarios.push({ available: true, version: '1.1.0', download: guardedDownload })
+  guardedUpdater.scenarios.push({ available: true, version: '1.1.0' })
   const guardedCheck = guarded.check()
   await turn()
   guardedUpdater.emit('update-downloaded', { version: '1.1.0' })
   guardedDownload.resolve([])
   await guardedCheck
+  guardedUpdater.scenarios.push({ available: true, version: '1.1.0' })
   const guardedInstall = guarded.install()
   await turn()
   assert.equal(guarded.snapshot().type, 'installing')
@@ -156,6 +203,7 @@ async function main() {
   assert.match(guarded.snapshot().checkError, /Agent work is still active/)
 
   guardResult = Promise.resolve({ ok: true, safe: true })
+  guardedUpdater.scenarios.push({ available: true, version: '1.1.0' })
   assert.equal((await guarded.install()).ok, true)
   assert.equal(guardedUpdater.quitCalls, 1)
   guarded.dispose()

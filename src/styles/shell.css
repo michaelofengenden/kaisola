@@ -585,31 +585,29 @@
 .inbox-empty { padding: var(--sp-3); color: var(--text-3); font-size: var(--fs-12); }
 
 /* Global controls live with navigation, not in the project tab strip. The
-   active left sidebar owns this quiet two-row footer. */
+   active left sidebar owns one quiet utility row. */
 .shell-sidebar-footer {
   display: flex;
-  flex-direction: column;
-  gap: 3px;
   flex: 0 0 auto;
   padding: var(--sp-2);
   border-top: 1px solid var(--border-faint);
   background: color-mix(in srgb, var(--bg-1) 28%, transparent);
   -webkit-app-region: no-drag;
 }
-.shell-sidebar-footer-tools,
-.shell-sidebar-footer-account {
+.shell-sidebar-footer-tools {
   display: flex;
   align-items: center;
   gap: var(--sp-1);
   min-width: 0;
+  width: 100%;
 }
 .shell-sidebar-footer-tools .btn-icon,
-.shell-sidebar-footer-account > .btn-icon {
+.shell-sidebar-footer-tools > .btn-icon {
   width: 28px;
   height: 28px;
   flex: 0 0 28px;
 }
-.shell-sidebar-footer-tools .inbox-wrap { margin-left: auto; }
+.shell-sidebar-footer-tools .app-account-trigger { width: 28px; min-width: 28px; padding: 0; }
 .shell-sidebar-footer .inbox-menu {
   top: auto;
   bottom: calc(100% + 6px);

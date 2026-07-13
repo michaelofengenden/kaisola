@@ -85,6 +85,7 @@ const extraAmount = (value: number | undefined, currency?: string): string => {
 }
 
 interface ClaudeRow { id: string; label: string; email?: string; usage?: ClaudeUsage }
+const AGENT_USAGE_KEY = 'kaisola:agent-usage-warning'
 
 function UsageSurface({ embedded = false }: { embedded?: boolean }) {
   const [open, setOpen] = useState(embedded)
@@ -169,6 +170,33 @@ function UsageSurface({ embedded = false }: { embedded?: boolean }) {
     void load(false, true)
   }, [load])
 
+  useEffect(() => {
+    if (bridge.smoke) return
+    const refresh = () => { if (document.visibilityState === 'visible') void load(false, true) }
+    const timer = window.setInterval(refresh, 5 * 60_000)
+    window.addEventListener('focus', refresh)
+    return () => { window.clearInterval(timer); window.removeEventListener('focus', refresh) }
+  }, [load])
+
+  useEffect(() => {
+    if (!updatedAt) return
+    const rows: Array<{ label: string; usedPercent: number; resetsAt?: number }> = []
+    if (codex?.ok) {
+      if ((codex.primary?.usedPercent ?? 0) >= 50) rows.push({ label: 'Codex current session', usedPercent: codex.primary!.usedPercent!, resetsAt: codex.primary?.resetsAt })
+      if ((codex.secondary?.usedPercent ?? 0) >= 50) rows.push({ label: 'Codex weekly', usedPercent: codex.secondary!.usedPercent!, resetsAt: codex.secondary?.resetsAt })
+    }
+    for (const account of claude) {
+      const limits = account.usage?.limits
+      if ((limits?.fiveHour?.usedPercent ?? 0) >= 50) rows.push({ label: `Claude ${account.label} current session`, usedPercent: limits!.fiveHour!.usedPercent!, resetsAt: limits?.fiveHour?.resetsAt })
+      if ((limits?.sevenDay?.usedPercent ?? 0) >= 50) rows.push({ label: `Claude ${account.label} weekly`, usedPercent: limits!.sevenDay!.usedPercent!, resetsAt: limits?.sevenDay?.resetsAt })
+      for (const model of limits?.modelScoped ?? []) if ((model.usedPercent ?? 0) >= 50) rows.push({ label: `Claude ${account.label} ${model.label}`, usedPercent: model.usedPercent!, resetsAt: model.resetsAt })
+    }
+    try {
+      if (rows.length) localStorage.setItem(AGENT_USAGE_KEY, JSON.stringify({ at: Date.now(), rows }))
+      else localStorage.removeItem(AGENT_USAGE_KEY)
+    } catch { /* optional agent context cache */ }
+  }, [claude, codex, updatedAt])
+
   useClickAway(open && !embedded, close, btnRef, panelRef)
 
   if (!isDesktop || !bridge.usage) return null
@@ -182,15 +210,15 @@ function UsageSurface({ embedded = false }: { embedded?: boolean }) {
   const peak = codexPeak == null ? claudePeak : claudePeak == null ? codexPeak : Math.max(codexPeak, claudePeak)
   const indicator = (codexLoading || claudeLoading) && peak == null
     ? 'var(--text-3)'
-    : peak == null ? 'var(--text-3)' : peak >= 90 ? 'var(--danger)' : peak >= 70 ? 'var(--warn)' : 'var(--success)'
+    : peak == null ? 'var(--text-3)' : peak >= 90 ? 'var(--danger)' : peak >= 70 ? 'var(--warn)' : peak >= 50 ? 'var(--accent)' : 'var(--success)'
   const usageTitle = [
-    codexPeak == null ? null : `Codex ${Math.round(codexPeak)}% peak`,
-    claudePeak == null ? null : `Claude ${Math.round(claudePeak)}% peak`,
+    codexPeak == null ? null : `Codex ${Math.round(100 - codexPeak)}% remaining`,
+    claudePeak == null ? null : `Claude ${Math.round(100 - claudePeak)}% remaining`,
   ].filter(Boolean).join(' · ')
 
   // Ordinary usage belongs in the account menu and Settings. Spend a header
   // slot only when a subscription window is close enough to need attention.
-  if (!embedded && (peak == null || peak < 70)) return null
+  if (!embedded && (peak == null || peak < 50)) return null
 
   const signInCodex = () => {
     requestTerminal('codex login', { name: 'Codex Login', restart: true })

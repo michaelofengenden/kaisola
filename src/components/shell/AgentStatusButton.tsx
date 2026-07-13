@@ -175,7 +175,7 @@ export function AgentStatusButton() {
   // quiet = nothing running, nothing asking for sign-in — the itemized rows
   // would all read the same, so a summary line carries them instead
   const anyWorking = agents.some((a) => busy.has(a.key) || a.busy) || claudeBusy || codexBusy
-  const anyAttention = anyWorking || agents.some((a) => !a.connected && a.authMethods?.length)
+  const anyAttention = anyWorking
   const allQuiet = !anyAttention
   const offMenu = menu.filter((m) => m.kind === 'acp' && !agents.some((a) => (a.presetId ?? a.key) === m.id))
   const quietConnected = agents.filter((a) => a.connected).length
@@ -316,8 +316,8 @@ export function AgentStatusButton() {
             {!allQuiet && agents.map((a) => {
               // busy: renderer thread state OR main's per-connection truth
               const working = busy.has(a.key) || !!a.busy
-              const tone = a.connected ? DOT.on : a.authMethods?.length ? DOT.warn : DOT.off
-              const state = working ? 'working…' : a.connected ? 'connected' : a.authMethods?.length ? 'sign-in needed' : 'disconnected'
+              const tone = a.connected ? DOT.on : DOT.off
+              const state = working ? 'working…' : a.connected ? 'connected' : 'disconnected'
               const cwdName = a.cwd?.split('/').filter(Boolean).pop()
               // the connection's full identity rides the tooltip (main reports
               // session id, autonomy, MCP handoff, resume/image capabilities)

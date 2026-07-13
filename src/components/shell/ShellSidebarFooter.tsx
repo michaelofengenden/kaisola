@@ -5,9 +5,8 @@ import { AppAccountButton } from './AppAccountButton'
 import { InboxButton } from './InboxButton'
 
 /**
- * Cursor/ChatGPT-style global controls: utilities above, identity and Settings
- * at the very bottom. The active left sidebar owns this footer; when neither
- * sidebar exists, App renders the same component as a compact recovery dock.
+ * One quiet utility row at the bottom of whichever left sidebar is active.
+ * The avatar is identity enough here; the full account lives in its popover.
  */
 export function ShellSidebarFooter({ floating = false }: { floating?: boolean }) {
   const railOpen = useKaisola((s) => s.railOpen)
@@ -24,10 +23,8 @@ export function ShellSidebarFooter({ floating = false }: { floating?: boolean })
         )}
         <ShellTools includeSettings={false} />
         <InboxButton />
-      </div>
-      <div className="shell-sidebar-footer-account">
-        <AppAccountButton showLabel />
         <span className="grow" />
+        <AppAccountButton />
         <button className="btn-icon shell-settings-trigger" onClick={() => openSettings(true)} title="Settings  ⌘," aria-label="Open settings">
           <Icon name="Settings" size={15} />
         </button>

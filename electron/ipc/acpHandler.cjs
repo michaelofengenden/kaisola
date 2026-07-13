@@ -16,6 +16,7 @@ const { AcpProcessLedger } = require('./acpProcessLedger.cjs')
 const { resolveBundledCodexExecutable, resolveBundledClaudeExecutable } = require('./nativeAgentPaths.cjs')
 
 const URL_RE = /https?:\/\/[^\s"'<>)]+/
+const AUTH_TEXT_RE = /\b(auth(?:entication|orization|orize)?|oauth|log[ -]?in|sign[ -]?in|device code)\b/i
 
 /** Send to a connection's CURRENT renderer, skipping destroyed windows. */
 function sendTo(entry, channel, payload) {
@@ -31,6 +32,36 @@ function surfaceAuthUrl(entry, name, key, url) {
   if (entry.recentAuthAt && Date.now() - entry.recentAuthAt < 180_000 && !(process.env.KAISOLA_SMOKE || process.env.PASOLA_SMOKE)) {
     shell.openExternal(url).catch(() => {})
   }
+}
+
+function sanitizedCommands(value) {
+  if (!Array.isArray(value)) return []
+  return value.slice(0, 160).flatMap((command) => {
+    if (!command || typeof command.name !== 'string') return []
+    const name = command.name.trim().replace(/^\/+/, '').slice(0, 100)
+    if (!name || !/^[\w$][\w$.-]*$/.test(name)) return []
+    return [{
+      name,
+      description: typeof command.description === 'string' ? command.description.trim().slice(0, 500) : '',
+      inputHint: typeof command.input?.hint === 'string' ? command.input.hint.trim().slice(0, 240) : undefined,
+    }]
+  })
+}
+
+function authUrlFromNotice(notice, recentAuthAt, at = Date.now()) {
+  if (!notice || typeof notice.text !== 'string') return null
+  const match = notice.text.match(URL_RE)
+  if (!match) return null
+  if (notice.kind === 'auth') return match[0]
+  return recentAuthAt && at - recentAuthAt < 180_000 && AUTH_TEXT_RE.test(notice.text) ? match[0] : null
+}
+
+function authUrlFromUpdate(update, recentAuthAt, at = Date.now()) {
+  if (!recentAuthAt || at - recentAuthAt >= 180_000 || !update || typeof update !== 'object') return null
+  const text = typeof update.content?.text === 'string'
+    ? update.content.text
+    : typeof update.text === 'string' ? update.text : ''
+  return text ? authUrlFromNotice({ kind: 'stderr', text }, recentAuthAt, at) : null
 }
 
 const MOCK_AGENT = path.join(__dirname, '..', 'acp-mock-agent.cjs')
@@ -687,6 +718,7 @@ function agentSummary(sender) {
     .map((e) => ({
       key: (e.meta && (e.meta.key || e.meta.presetId)), name: e.meta && e.meta.name, presetId: e.meta && e.meta.presetId,
       connected: !!(e.conn && e.conn.alive), controls: e.controls,
+      availableCommands: e.availableCommands || [],
       authMethods: (e.conn && e.conn.authMethods) || [],
       sessionId: e.meta && e.meta.sessionId,
       scope: e.meta && e.meta.scope,
@@ -800,11 +832,16 @@ function registerAcpHandlers(ipcMain) {
       connections.delete(internalKey)
     }
     const sessionCwd = config.cwd || os.homedir()
+    let workspaceReady = false
+    try { workspaceReady = fs.statSync(sessionCwd).isDirectory() } catch { /* moved, deleted, or inaccessible */ }
+    if (!workspaceReady) {
+      return { ok: false, message: `Workspace folder is unavailable: ${sessionCwd}` }
+    }
     let stderrTail = ''
     // entry.sender tracks the CURRENT window (acp:status rebinds it), so these
     // callbacks keep reaching the renderer after a window close/reopen
     const processToken = processLedger ? processLedger.newToken() : null
-    const entry = { conn: null, meta: null, sender: event.sender, controls: { modes: null, configOptions: [] }, current: { sender: null, channel: null }, inFlightTurns: 0, autonomy: config.autonomy || DEFAULT_AUTONOMY, processToken }
+    const entry = { conn: null, meta: null, sender: event.sender, controls: { modes: null, configOptions: [] }, availableCommands: [], current: { sender: null, channel: null }, inFlightTurns: 0, autonomy: config.autonomy || DEFAULT_AUTONOMY, processToken }
     connectTask.entry = entry
 
     // per-connection env on top of the preset's (e.g. CLAUDE_CONFIG_DIR / CODEX_HOME
@@ -812,6 +849,11 @@ function registerAcpHandlers(ipcMain) {
     let env = config.env && typeof config.env === 'object'
       ? { ...(resolved.env || {}), ...config.env }
       : resolved.env
+    if (resolved.presetId === 'claude-code' && Object.prototype.hasOwnProperty.call(config, 'claudeConfigDir')) {
+      env = { ...(env || {}) }
+      if (typeof config.claudeConfigDir === 'string' && config.claudeConfigDir.trim()) env.CLAUDE_CONFIG_DIR = config.claudeConfigDir.trim()
+      else delete env.CLAUDE_CONFIG_DIR
+    }
     if (resolved.presetId === 'codex' && !resolved.modern) {
       const shim = codexCompatHome(env && env.CODEX_HOME)
       if (shim) env = { ...(env || {}), CODEX_HOME: shim }
@@ -835,9 +877,15 @@ function registerAcpHandlers(ipcMain) {
       { command: resolved.command, args: resolved.args, env, cwd: sessionCwd, sessionMeta, mcpServers: [mcpHttpEntry(), ...acpEntries(sessionCwd, { http: true, sse: true })].filter(Boolean) },
       {
         onUpdate: (params) => {
-          try { const m = JSON.stringify(params).match(URL_RE); if (m) surfaceAuthUrl(entry, resolved.name, key, m[0]) } catch { /* noop */ }
+          const update = params && params.update ? params.update : params
+          const authUrl = authUrlFromUpdate(update, entry.recentAuthAt)
+          if (authUrl) surfaceAuthUrl(entry, resolved.name, key, authUrl)
+          if (update && update.sessionUpdate === 'available_commands_update') {
+            entry.availableCommands = sanitizedCommands(update.availableCommands)
+            sendTo(entry, 'acp:commands', { key, commands: entry.availableCommands })
+          }
           if (entry.current.channel && entry.current.sender && !entry.current.sender.isDestroyed()) {
-            entry.current.sender.send(entry.current.channel, params && params.update ? params.update : params)
+            entry.current.sender.send(entry.current.channel, update)
           }
         },
         onNotice: (n) => {
@@ -846,8 +894,8 @@ function registerAcpHandlers(ipcMain) {
           // their resolvers + needs-you badge leak until the 5-min timeout
           if (n && n.kind === 'exit') { cancelPendingFor(entry); clearCancelWatchdog(entry) }
           sendTo(entry, 'acp:notice', { agent: resolved.name, key, ...n })
-          const m = n && n.text && n.text.match(URL_RE)
-          if (m) surfaceAuthUrl(entry, resolved.name, key, m[0])
+          const authUrl = authUrlFromNotice(n, entry.recentAuthAt)
+          if (authUrl) surfaceAuthUrl(entry, resolved.name, key, authUrl)
         },
         onControls: (controls) => {
           entry.controls = freshenControls(resolved.presetId, controls, { modern: !!resolved.modern })
@@ -1165,6 +1213,9 @@ module.exports = {
   codexPreset,
   newestCodexExecutable,
   freshenControls,
+  sanitizedCommands,
+  authUrlFromNotice,
+  authUrlFromUpdate,
   _acpTest: {
     connections,
     connectTasks,

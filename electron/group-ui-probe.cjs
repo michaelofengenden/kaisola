@@ -38,6 +38,14 @@ const { registerWorktreeHandlers } = require('./ipc/worktreeHandler.cjs')
 
 const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
 const connected = new Set()
+const selectedModels = new Map()
+const controlsFor = (key) => {
+  const provider = key.startsWith('claude') ? 'claude' : 'codex'
+  const options = provider === 'claude'
+    ? [{ modelId: 'claude-default', name: 'Claude Default' }, { modelId: 'claude-fast', name: 'Claude Fast' }]
+    : [{ modelId: 'codex-default', name: 'Codex Default' }, { modelId: 'codex-deep', name: 'Codex Deep' }]
+  return { modes: null, configOptions: [], models: { currentModelId: selectedModels.get(key) ?? options[0].modelId, availableModels: options } }
+}
 
 app.whenReady().then(async () => {
   registerModelHandlers(ipcMain); registerToolHandlers(ipcMain); registerSettingsHandlers(ipcMain)
@@ -53,12 +61,12 @@ app.whenReady().then(async () => {
   ])
   ipcMain.handle('acp:status', (_event, { clientKeys } = {}) => ({
     ok: true,
-    agents: (clientKeys ?? []).map((key) => ({ key, presetId: key.split('::')[0], name: key.startsWith('claude') ? 'Claude' : 'Codex', connected: connected.has(key), controls: null })),
+    agents: (clientKeys ?? []).map((key) => ({ key, presetId: key.split('::')[0], name: key.startsWith('claude') ? 'Claude' : 'Codex', connected: connected.has(key), controls: controlsFor(key) })),
   }))
   ipcMain.handle('acp:connect', (_event, config) => {
     const key = config.clientKey
     connected.add(key)
-    return { ok: true, agent: { key, connected: true, sessionId: `session-${key}` }, controls: null }
+    return { ok: true, agent: { key, connected: true, sessionId: `session-${key}` }, controls: controlsFor(key) }
   })
   ipcMain.handle('acp:disconnect', (_event, key) => {
     connected.delete(key)
@@ -85,7 +93,11 @@ app.whenReady().then(async () => {
     event.sender.send(`acp:update:${reqId}`, { __done: true })
     return { ok: true, stopReason: 'end_turn' }
   })
-  for (const channel of ['acp:lease', 'acp:setMode', 'acp:setModel', 'acp:setConfigOption', 'acp:set-autonomy', 'acp:cancel']) {
+  ipcMain.handle('acp:setModel', (_event, { agentKey, modelId }) => {
+    selectedModels.set(String(agentKey).split('@@')[0], modelId)
+    return { ok: true }
+  })
+  for (const channel of ['acp:lease', 'acp:setMode', 'acp:setConfigOption', 'acp:set-autonomy', 'acp:cancel']) {
     ipcMain.handle(channel, () => ({ ok: true }))
   }
   ipcMain.handle('acp:diagnostics', () => ({}))
@@ -108,6 +120,17 @@ app.whenReady().then(async () => {
     state.requestNewGroup()
   })()`)
   await wait(700)
+
+  const configured = await win.webContents.executeJavaScript(`(() => {
+    const selects = [...document.querySelectorAll('.group-roster-row select')]
+    if (selects.length !== 2 || selects.some((select) => select.options.length < 2)) return false
+    selects.forEach((select) => {
+      select.value = select.options[select.options.length - 1].value
+      select.dispatchEvent(new Event('change', { bubbles: true }))
+    })
+    return !!document.querySelector('.group-add-member')
+  })()`)
+  await wait(180)
 
   const asked = await win.webContents.executeJavaScript(`(() => {
     const input = document.querySelector('.group-composer textarea')
@@ -170,6 +193,7 @@ app.whenReady().then(async () => {
     changedFiles: Object.values(group?.group?.changedFiles ?? {}).flat().map((file) => file.path).sort(),
     integration: group?.group?.integration,
     error: group?.group?.error,
+    memberModels: group?.group?.members.map((member) => member.modelLabel),
     workerCount: document.querySelectorAll('.group-workers .assistant').length,
     }
   })()`)
@@ -190,10 +214,11 @@ app.whenReady().then(async () => {
   const image = await win.webContents.capturePage()
   const screenshot = path.join(os.tmpdir(), 'kaisola-group-session.png')
   fs.writeFileSync(screenshot, image.toPNG())
-  const result = { asked, ready, negotiated, assigned, executed, reviewed, done, ...facts, persisted, screenshot }
+  const result = { configured, asked, ready, negotiated, assigned, executed, reviewed, done, ...facts, persisted, screenshot }
   console.log('GROUP_UI=' + JSON.stringify(result))
   app.exit(
-    asked
+    configured
+    && asked
     && ready
     && negotiated
     && assigned
@@ -208,6 +233,7 @@ app.whenReady().then(async () => {
     && facts.reviews === 2
     && facts.executions === 2
     && facts.worktrees === 2
+    && facts.memberModels.join(',') === 'Claude Fast,Codex Deep'
     && facts.changedFiles.join(',') === 'claude-result.txt,codex-result.txt'
     && facts.roleContract.startsWith('Mission intent')
     && facts.integration === 'Integrated both reviewed branches and verified the shared acceptance tests.'

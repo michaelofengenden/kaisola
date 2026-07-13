@@ -2,7 +2,7 @@ import { memo, useEffect, useMemo, useState } from 'react'
 import { Assistant } from './Assistant'
 import { Icon } from './Icon'
 import { ProviderIcon } from './ProviderIcon'
-import { bridge, type WorktreeFile } from '../lib/bridge'
+import { bridge, type AcpAgent, type AcpControls, type AcpPreset, type WorktreeFile } from '../lib/bridge'
 import {
   useKaisola,
   type AssistantDraft,
@@ -15,6 +15,15 @@ import {
 const EMPTY_DRAFT: AssistantDraft = { text: '', attachments: [], mentions: [], speed: 'default' }
 const MAX_SHARED_TEXT = 28_000
 type CandidateDiff = { ok: boolean; patch?: string; files?: WorktreeFile[]; message?: string }
+
+const modelControl = (controls?: AcpControls) => {
+  if (controls?.models) return {
+    value: controls.models.currentModelId,
+    options: controls.models.availableModels.map((model) => ({ value: model.modelId, name: model.name })),
+  }
+  const config = controls?.configOptions.find((option) => option.category === 'model' || /model/i.test(option.id))
+  return config ? { value: config.currentValue, options: config.options } : null
+}
 
 const responseAfter = (runtime: AssistantRuntime | undefined, baseline = 0): string =>
   (runtime?.turns ?? [])
@@ -71,6 +80,9 @@ export const GroupAssistant = memo(function GroupAssistant({ threadId }: { threa
   const workspacePath = useKaisola((state) => state.workspacePath)
   const enqueue = useKaisola((state) => state.enqueueAssistantPrompt)
   const setGroup = useKaisola((state) => state.setGroupSession)
+  const addGroupMember = useKaisola((state) => state.addGroupMember)
+  const removeGroupMember = useKaisola((state) => state.removeGroupMember)
+  const setGroupMemberModel = useKaisola((state) => state.setGroupMemberModel)
   const setGroupWorktrees = useKaisola((state) => state.setGroupWorktrees)
   const clearGroupWorktreeSessions = useKaisola((state) => state.clearGroupWorktreeSessions)
   const setThreadCwd = useKaisola((state) => state.setAssistantThreadCwd)
@@ -79,9 +91,24 @@ export const GroupAssistant = memo(function GroupAssistant({ threadId }: { threa
   const pushToast = useKaisola((state) => state.pushToast)
   const [draft, setDraft] = useState('')
   const [transitioning, setTransitioning] = useState(false)
+  const [agents, setAgents] = useState<AcpAgent[]>([])
+  const [presets, setPresets] = useState<AcpPreset[]>([])
   const group = thread?.group
   const members = group?.members ?? []
   const phase = group?.phase ?? 'idle'
+
+  useEffect(() => {
+    if (!group || phase !== 'idle') return
+    let live = true
+    const keys = members.map((member) => `${member.agentKey}::${member.threadId}`)
+    const refreshRoster = () => {
+      void bridge.acp.status(keys).then((result) => { if (live) setAgents(result.agents) }).catch(() => {})
+    }
+    refreshRoster()
+    void bridge.acp.presets().then((rows) => { if (live) setPresets(rows) }).catch(() => {})
+    const timer = window.setInterval(refreshRoster, 1_500)
+    return () => { live = false; window.clearInterval(timer) }
+  }, [group, members, phase])
 
   const liveValues = (saved?: Record<string, string>) => Object.fromEntries(
     members.map((member) => [member.threadId, memberText(member, saved, runtimes, group?.baselines)]),
@@ -191,9 +218,9 @@ export const GroupAssistant = memo(function GroupAssistant({ threadId }: { threa
   const negotiate = () => {
     if (!group?.answers) return
     queueStage('negotiating', Object.fromEntries(members.map((member) => {
-      const peer = members.find((candidate) => candidate.threadId !== member.threadId)
+      const peers = members.filter((candidate) => candidate.threadId !== member.threadId)
       return [member.threadId,
-        `You are ${member.label} in the only role-negotiation round. Compare your proposal with ${peer?.label ?? 'your peer'}'s proposal. Do not edit files. Recommend two orthogonal assignments with one owner each, explicit interfaces, acceptance tests, integration order, stop conditions, and any disagreement the coordinator must resolve. Acknowledge what you accept from the peer rather than silently assuming agreement.\n\nMission:\n${group.task ?? ''}\n\nYour proposal:\n${group.answers?.[member.threadId] ?? ''}\n\nPeer proposal:\n${peer ? group.answers?.[peer.threadId] ?? '' : ''}`,
+        `You are ${member.label} in the only role-negotiation round. Compare your proposal with every peer proposal below. Do not edit files. Recommend orthogonal assignments with one owner each, explicit interfaces, acceptance tests, integration order, stop conditions, and any disagreement the coordinator must resolve. Acknowledge what you accept from peers rather than silently assuming agreement.\n\nMission:\n${group.task ?? ''}\n\nYour proposal:\n${group.answers?.[member.threadId] ?? ''}\n\nPeer proposals:\n${memberPacket(peers, group.answers)}`,
       ]
     })))
   }
@@ -205,7 +232,7 @@ export const GroupAssistant = memo(function GroupAssistant({ threadId }: { threa
     setGroup(threadId, { leadThreadId: lead.threadId }, projectId)
     const packet = `INDEPENDENT SCOUTS\n${memberPacket(members, group.answers)}\n\nNEGOTIATION\n${memberPacket(members, group.negotiations)}`.slice(-MAX_SHARED_TEXT * 2)
     queueStage('assigning', {
-      [lead.threadId]: `Act as the coordinator, not an implementer yet. Resolve the bounded negotiation into one role contract. Do not edit files. Use these exact headings: Mission intent; Shared invariants; Claude assignment; Codex assignment; Integration order; Acceptance tests; Stop and escalation conditions. Assign orthogonal work, one owner per subsystem/file boundary, and identify any shared interface that must be agreed before execution.\n\nMission:\n${group.task ?? ''}\n\nTeam packet:\n${packet}`,
+      [lead.threadId]: `Act as the coordinator, not an implementer yet. Resolve the bounded negotiation into one role contract. Do not edit files. Use these exact headings: Mission intent; Shared invariants; Assignments; Integration order; Acceptance tests; Stop and escalation conditions. Name every participant and assign orthogonal work with one owner per subsystem/file boundary. Identify any shared interface that must be agreed before execution.\n\nMission:\n${group.task ?? ''}\n\nTeam packet:\n${packet}`,
     }, [lead])
   }
 
@@ -270,8 +297,8 @@ export const GroupAssistant = memo(function GroupAssistant({ threadId }: { threa
       }
       const changedFiles = Object.fromEntries(diffs.map((item) => [item.member.threadId, (item.result.files ?? []) as WorktreeFile[]]))
       setGroup(threadId, { changedFiles }, projectId)
-      queueStage('reviewing', Object.fromEntries(members.map((reviewer) => {
-        const peer = members.find((member) => member.threadId !== reviewer.threadId)!
+      queueStage('reviewing', Object.fromEntries(members.map((reviewer, reviewerIndex) => {
+        const peer = members[(reviewerIndex + 1) % members.length]
         const peerDiff = diffs.find((item) => item.member.threadId === peer.threadId)!
         return [reviewer.threadId,
           `Cross-review ${peer.label}'s implementation as an independent verifier. Do not edit either worktree. Check the approved role boundary, correctness, tests, regressions, security, and integration risk. Challenge claims with concrete evidence from the patch or peer worktree. Return: verdict, blocking findings, non-blocking findings, and required integration checks.\n\nMission:\n${group.task ?? ''}\n\nApproved role contract:\n${group.jointPlan ?? ''}\n\n${peer.label} execution report:\n${group.executions?.[peer.threadId] ?? ''}\n\nPeer worktree: ${peerDiff.wt?.path ?? ''}\n\nPatch:\n${(peerDiff.result.patch ?? '').slice(-MAX_SHARED_TEXT)}`,
@@ -340,12 +367,21 @@ export const GroupAssistant = memo(function GroupAssistant({ threadId }: { threa
   const running = runningPhases.has(phase)
   const negotiated = group.negotiations ?? group.critiques
   const finalText = group.integration ?? group.synthesis
+  const participantPresets = presets.filter((preset) => !preset.hidden && !preset.terminalOnly && preset.id !== 'group')
+  const chooseModel = async (member: GroupSessionMember, value: string) => {
+    const key = `${member.agentKey}::${member.threadId}`
+    const control = modelControl(agents.find((agent) => agent.key === key)?.controls)
+    const label = control?.options.find((option) => option.value === value)?.name ?? value
+    const result = await bridge.acp.setModel(key, value).catch(() => ({ ok: false, message: 'The model selection could not be sent.' }))
+    if (result.ok) setGroupMemberModel(threadId, member.threadId, value, label, projectId)
+    else setGroup(threadId, { error: result.message ?? `Could not select ${label} for ${member.label}.` }, projectId)
+  }
 
   return (
     <div className="group-assistant" data-phase={phase}>
       <header className="group-head">
         <span className="group-mark"><Icon name="Network" size={14} /></span>
-        <div><strong>Claude + Codex</strong><small>Scout · align · divide · verify · integrate</small></div>
+        <div><strong>Kaisola Mesh</strong><small>{members.length} agents · scout · align · divide · verify · integrate</small></div>
         <span className="grow" />
         <span className="group-phase" data-running={running || undefined}>{phaseLabel[phase]}</span>
       </header>
@@ -354,9 +390,44 @@ export const GroupAssistant = memo(function GroupAssistant({ threadId }: { threa
         {!group.task && (
           <div className="group-empty">
             <Icon name="Network" size={24} />
-            <strong>One mission, two perspectives, explicit ownership.</strong>
-            <p>The agents scout independently, negotiate one role split, work in isolated git worktrees, cross-review, and hand one integration owner the final merge.</p>
+            <strong>One mission, multiple models, explicit ownership.</strong>
+            <p>Mesh lets a bounded team scout independently, negotiate one role split, work in isolated git worktrees, cross-review, and hand one integration owner the final merge.</p>
             <small>Every state-changing boundary waits for your approval.</small>
+            <div className="group-roster" aria-label="Mesh participants">
+              {members.map((member) => {
+                const key = `${member.agentKey}::${member.threadId}`
+                const control = modelControl(agents.find((agent) => agent.key === key)?.controls)
+                const value = control?.value ?? member.modelId ?? ''
+                return <div className="group-roster-row" key={member.threadId}>
+                  <ProviderIcon provider={member.agentKey} name={member.label} size={14} />
+                  <span className="truncate">{member.label}</span>
+                  <select
+                    value={value}
+                    disabled={!control?.options.length}
+                    onChange={(event) => { void chooseModel(member, event.target.value) }}
+                    title={control ? `Model for ${member.label}` : `${member.label} is connecting`}
+                  >
+                    {!value && <option value="">Provider default</option>}
+                    {(control?.options ?? []).map((option) => <option value={option.value} key={option.value}>{option.name}</option>)}
+                  </select>
+                  {members.length > 2 && <button className="btn-icon" onClick={() => {
+                    void bridge.acp.disconnect(`${member.agentKey}::${member.threadId}`)
+                    removeGroupMember(threadId, member.threadId, projectId)
+                  }} title={`Remove ${member.label}`}><Icon name="X" size={12} /></button>}
+                </div>
+              })}
+              <select
+                className="group-add-member"
+                value=""
+                onChange={(event) => {
+                  const preset = participantPresets.find((row) => row.id === event.target.value)
+                  if (preset) addGroupMember(threadId, preset.id, preset.name, projectId)
+                }}
+              >
+                <option value="">+ Add another model</option>
+                {participantPresets.map((preset) => <option value={preset.id} key={preset.id}>{preset.name}</option>)}
+              </select>
+            </div>
           </div>
         )}
         {group.error && <div className="group-error"><Icon name="AlertTriangle" size={13} />{group.error}</div>}
@@ -438,7 +509,7 @@ function GroupPair({
       {members.map((member) => {
         const busy = active && childThreads.find((thread) => thread.id === member.threadId)?.busy
         return <article className={compact ? undefined : 'group-result'} key={`${title}:${member.threadId}`}>
-          <header><ProviderIcon provider={member.agentKey} name={member.label} size={compact ? 13 : 15} /><strong>{member.label}</strong>{busy && <span className="session-busy" />}</header>
+          <header><ProviderIcon provider={member.agentKey} name={member.label} size={compact ? 13 : 15} /><strong>{member.label}</strong>{member.modelLabel && <small className="group-model-label truncate">{member.modelLabel}</small>}{busy && <span className="session-busy" />}</header>
           <p>{values[member.threadId] || (active ? 'Working…' : 'No response recorded')}</p>
         </article>
       })}

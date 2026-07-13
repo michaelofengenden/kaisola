@@ -141,6 +141,8 @@ export interface GroupSessionMember {
   threadId: string
   agentKey: string
   label: string
+  modelId?: string
+  modelLabel?: string
 }
 export interface GroupSessionState {
   members: GroupSessionMember[]
@@ -169,6 +171,8 @@ export interface AssistantThread {
   /** Derived from the first message's topic; display fallback. */
   autoName?: string
   busy: boolean
+  lastActivityAt?: number
+  lastViewedAt?: number
   /** Session cwd override (worktree sessions) — falls back to the workspace. */
   cwd?: string
   /** The agent-side ACP session id — reconnects after a restart try
@@ -179,6 +183,9 @@ export interface AssistantThread {
   claudeEffort?: ClaudeEffort
   /** Native Codex app-server reasoning effort, restored on reconnect. */
   codexEffort?: CodexEffort
+  /** Durable ACP model choice, reapplied after the adapter reconnects. */
+  preferredModel?: string
+  preferredModelLabel?: string
   /** The agent's ACP permission mode (plan/default/acceptEdits/…). Captured on
    * every change and message send, reapplied when the session reconnects —
    * without it a restart silently falls back to the agent's default mode. */
@@ -239,6 +246,7 @@ export interface AssistantRuntime {
   thinkStart?: number
   /** The agent's live plan (sessionUpdate:'plan'), replaced wholesale per frame. */
   plan?: PlanEntry[]
+  planUpdatedAt?: number
   /** The agent's REAL context window (ACP usage_update), when it reports one. */
   usage?: { used: number; size: number }
 }
@@ -1059,6 +1067,9 @@ interface KaisolaState {
   closeSignIn: () => void
   requestNewThread: (agentKey?: string) => void
   requestNewGroup: () => void
+  addGroupMember: (id: string, agentKey: string, label?: string, projectId?: string) => void
+  removeGroupMember: (id: string, threadId: string, projectId?: string) => void
+  setGroupMemberModel: (id: string, threadId: string, modelId: string, modelLabel: string, projectId?: string) => void
   setGroupSession: (id: string, patch: Partial<GroupSessionState>, projectId?: string) => void
   setGroupWorktrees: (id: string, worktrees: Record<string, WorktreeSession>, projectId?: string) => void
   clearGroupWorktreeSessions: (id: string, cwd: string, projectId?: string) => void
@@ -1072,6 +1083,7 @@ interface KaisolaState {
   setThreadAcpSession: (id: string, sessionId: string | undefined, projectId?: string) => void
   setThreadClaudeEffort: (id: string, effort: ClaudeEffort, projectId?: string) => void
   setThreadCodexEffort: (id: string, effort: CodexEffort, projectId?: string) => void
+  setThreadPreferredModel: (id: string, modelId: string, modelLabel?: string, projectId?: string) => void
   setThreadPermissionMode: (id: string, mode: string, projectId?: string) => void
   updateAssistantRuntime: (id: string, fn: (runtime: AssistantRuntime) => AssistantRuntime, projectId?: string) => void
   resetAssistantRuntime: (id: string, projectId?: string) => void
@@ -1735,12 +1747,29 @@ const ASSISTANT_LIVE_TURNS = 40
 const ASSISTANT_ARCHIVE_TRIGGER_TURNS = 48
 const ASSISTANT_ARCHIVE_BATCH_TURNS = 40
 const ASSISTANT_ARCHIVE_BATCH_BYTES = 8 * 1024 * 1024
+const ASSISTANT_LIVE_BYTES = 6 * 1024 * 1024
 const utf8 = new TextEncoder()
+const assistantTurnBytes = (turn: AssistantTurn): number => {
+  try { return utf8.encode(JSON.stringify(turn)).byteLength + 80 } catch { return ASSISTANT_LIVE_BYTES }
+}
+const assistantLiveStartIndex = (turns: AssistantTurn[], maxTurns = ASSISTANT_LIVE_TURNS, maxBytes = ASSISTANT_LIVE_BYTES): number => {
+  let bytes = 0
+  let kept = 0
+  for (let index = turns.length - 1; index >= 0; index--) {
+    const size = assistantTurnBytes(turns[index])
+    if (kept >= maxTurns || (kept >= 2 && bytes + size > maxBytes)) return index + 1
+    bytes += size
+    kept++
+  }
+  return 0
+}
+const assistantTail = (turns: AssistantTurn[], maxTurns = ASSISTANT_LIVE_TURNS, maxBytes = ASSISTANT_LIVE_BYTES) =>
+  turns.slice(assistantLiveStartIndex(turns, maxTurns, maxBytes))
 /** Select a count-bounded and byte-bounded prefix while retaining the latest
  * compact live window. One oversize record is still attempted; if main rejects it,
  * the durable retry marker preserves it rather than dropping data. */
 const assistantArchiveBatchCount = (turns: AssistantTurn[]): number => {
-  const available = Math.min(ASSISTANT_ARCHIVE_BATCH_TURNS, Math.max(0, turns.length - ASSISTANT_LIVE_TURNS))
+  const available = Math.min(ASSISTANT_ARCHIVE_BATCH_TURNS, assistantLiveStartIndex(turns))
   let count = 0
   let bytes = 0
   for (let i = 0; i < available; i++) {
@@ -1829,11 +1858,19 @@ function sanitizeSliceForPersist(slice: ProjectSliceMemory): ProjectSlicePersist
         // turn that has not crossed the archive spill threshold yet. A batch
         // awaiting fsync/ACK keeps its whole prefix so quit/ENOSPC cannot lose
         // data; it retries idempotently after rehydration.
-        turns: runtime.archiveBatch ? runtime.turns : runtime.turns.slice(-ASSISTANT_ARCHIVE_TRIGGER_TURNS),
+        turns: runtime.archiveBatch ? runtime.turns : assistantTail(runtime.turns, ASSISTANT_ARCHIVE_TRIGGER_TURNS),
         first: runtime.first,
         ...(runtime.archivedTurns ? { archivedTurns: runtime.archivedTurns } : {}),
         ...(runtime.archiveEpoch ? { archiveEpoch: runtime.archiveEpoch } : {}),
         ...(runtime.archiveBatch ? { archiveBatch: runtime.archiveBatch } : {}),
+        ...(runtime.plan?.length ? {
+          plan: runtime.plan.slice(0, 100).map((entry) => ({
+            content: String(entry.content ?? '').slice(0, 4000),
+            status: String(entry.status ?? 'pending').slice(0, 40),
+            ...(entry.priority ? { priority: String(entry.priority).slice(0, 80) } : {}),
+          })),
+          planUpdatedAt: runtime.planUpdatedAt,
+        } : {}),
       }]),
   )
   const liveThreadIds = new Set(assistantThreads.map((t) => t.id))
@@ -1887,7 +1924,7 @@ function sanitizeSliceForPersist(slice: ProjectSliceMemory): ProjectSlicePersist
           kind: c.kind,
           at: c.at,
           thread: { ...c.thread, busy: false },
-          ...(c.runtime ? { runtime: { turns: c.runtime.turns.slice(-ASSISTANT_ARCHIVE_TRIGGER_TURNS), first: c.runtime.first, ...(c.runtime.archivedTurns ? { archivedTurns: c.runtime.archivedTurns } : {}), ...(c.runtime.archiveEpoch ? { archiveEpoch: c.runtime.archiveEpoch } : {}) } } : {}),
+          ...(c.runtime ? { runtime: { turns: assistantTail(c.runtime.turns, ASSISTANT_ARCHIVE_TRIGGER_TURNS), first: c.runtime.first, ...(c.runtime.archivedTurns ? { archivedTurns: c.runtime.archivedTurns } : {}), ...(c.runtime.archiveEpoch ? { archiveEpoch: c.runtime.archiveEpoch } : {}) } } : {}),
         }
       }
       if (c.kind === 'term' && c.term) {
@@ -2867,10 +2904,12 @@ export const useKaisola = create<KaisolaState>()(
   // order the rail draws, so ⌘1..9 match what the user sees
   switchSession: (id) =>
     set((s) => {
+      const viewedAt = Date.now()
       const needsYou = { ...s.needsYou }
       delete needsYou[id]
       const active = {
         needsYou,
+        assistantThreads: s.assistantThreads.map((thread) => thread.id === id ? { ...thread, lastViewedAt: viewedAt } : thread),
         activeThreadId: s.assistantThreads.some((t) => t.id === id) ? id : s.activeThreadId,
       }
       if (s.dockViews.includes(id)) return { dockOpen: true, ...active }
@@ -3172,7 +3211,7 @@ export const useKaisola = create<KaisolaState>()(
       return {
         assistantThreads: [
           ...s.assistantThreads,
-          { id, agentKey: 'group', name: 'Claude + Codex', busy: false, group: { members, phase: 'idle' } },
+          { id, agentKey: 'group', name: 'Kaisola Mesh', busy: false, group: { members, phase: 'idle' } },
           ...members.map((member) => ({
             id: member.threadId,
             agentKey: member.agentKey,
@@ -3185,6 +3224,57 @@ export const useKaisola = create<KaisolaState>()(
         ...gridState([...s.dockGrid, [id]], { dockOpen: true }),
       }
     }),
+  addGroupMember: (id, agentKey, label, projectId) => {
+    const pid = projectId ?? get().activeProjectId
+    const threadId = uid('thr')
+    get().patchProject(pid, (sl) => {
+      const parent = sl.assistantThreads.find((thread) => thread.id === id && thread.group)
+      if (!parent?.group || parent.group.phase !== 'idle') return {}
+      const baseLabel = label?.trim() || agentKey
+      const count = parent.group.members.filter((member) => member.label === baseLabel || member.label.startsWith(`${baseLabel} `)).length
+      const member: GroupSessionMember = { threadId, agentKey, label: count ? `${baseLabel} ${count + 1}` : baseLabel }
+      return {
+        assistantThreads: [
+          ...sl.assistantThreads.map((thread) => thread.id === id && thread.group
+            ? { ...thread, group: { ...thread.group, members: [...thread.group.members, member] } }
+            : thread),
+          { id: threadId, agentKey, name: member.label, busy: false, groupParentId: id },
+        ],
+      }
+    })
+  },
+  removeGroupMember: (id, threadId, projectId) => {
+    const pid = projectId ?? get().activeProjectId
+    get().patchProject(pid, (sl) => {
+      const parent = sl.assistantThreads.find((thread) => thread.id === id && thread.group)
+      if (!parent?.group || parent.group.phase !== 'idle' || parent.group.members.length <= 2) return {}
+      return {
+        assistantThreads: sl.assistantThreads
+          .filter((thread) => thread.id !== threadId)
+          .map((thread) => thread.id === id && thread.group
+            ? { ...thread, group: { ...thread.group, members: thread.group.members.filter((member) => member.threadId !== threadId) } }
+            : thread),
+      }
+    })
+  },
+  setGroupMemberModel: (id, threadId, modelId, modelLabel, projectId) => {
+    const pid = projectId ?? get().activeProjectId
+    get().patchProject(pid, (sl) => ({
+      assistantThreads: sl.assistantThreads.map((thread) => {
+        if (thread.id === threadId) return { ...thread, preferredModel: modelId, preferredModelLabel: modelLabel }
+        if (thread.id === id && thread.group) return {
+          ...thread,
+          group: {
+            ...thread.group,
+            members: thread.group.members.map((member) => member.threadId === threadId
+              ? { ...member, modelId, modelLabel }
+              : member),
+          },
+        }
+        return thread
+      }),
+    }))
+  },
   setGroupSession: (id, patch, projectId) => {
     const pid = projectId ?? get().activeProjectId
     get().patchProject(pid, (sl) => ({
@@ -3232,6 +3322,7 @@ export const useKaisola = create<KaisolaState>()(
       delete needsYou[id]
       return {
         activeThreadId: id,
+        assistantThreads: s.assistantThreads.map((thread) => thread.id === id ? { ...thread, lastViewedAt: Date.now() } : thread),
         needsYou,
         ...(s.dockViews.includes(id) ? { dockOpen: true } : gridState([...s.dockGrid, [id]], { dockOpen: true })),
       }
@@ -3308,6 +3399,14 @@ export const useKaisola = create<KaisolaState>()(
     const pid = projectId ?? get().activeProjectId
     get().patchProject(pid, (sl) => ({ assistantThreads: sl.assistantThreads.map((t) => (t.id === id ? { ...t, codexEffort } : t)) }))
   },
+  setThreadPreferredModel: (id, preferredModel, preferredModelLabel, projectId) => {
+    const pid = projectId ?? get().activeProjectId
+    get().patchProject(pid, (sl) => ({
+      assistantThreads: sl.assistantThreads.map((thread) => thread.id === id
+        ? { ...thread, preferredModel, preferredModelLabel }
+        : thread),
+    }))
+  },
   setThreadPermissionMode: (id, permissionMode, projectId) => {
     const pid = projectId ?? get().activeProjectId
     get().patchProject(pid, (sl) => ({ assistantThreads: sl.assistantThreads.map((t) => (t.id === id && t.permissionMode !== permissionMode ? { ...t, permissionMode } : t)) }))
@@ -3321,8 +3420,8 @@ export const useKaisola = create<KaisolaState>()(
     const current = slice.assistantRuntimes[id] ?? { turns: [], first: true }
     let next = fn(current)
     let job: { scope: { projectId: string; threadId: string; epoch?: string }; batchId: string; count: number; turns: AssistantTurn[] } | null = null
-    if (next.turns.length > ASSISTANT_ARCHIVE_TRIGGER_TURNS && !next.archivePending && bridge.assistantArchive) {
-      const available = Math.max(0, next.turns.length - ASSISTANT_LIVE_TURNS)
+    if (assistantLiveStartIndex(next.turns) > 0 && !next.archivePending && bridge.assistantArchive) {
+      const available = assistantLiveStartIndex(next.turns)
       const retryCount = next.archiveBatch?.count
       const count = retryCount && retryCount <= available ? retryCount : assistantArchiveBatchCount(next.turns)
       if (count > 0) {
@@ -3371,7 +3470,7 @@ export const useKaisola = create<KaisolaState>()(
             turns: runtime.turns.slice(pending.count),
             archivedTurns: result.count,
           }
-          shouldContinue = next.turns.length > ASSISTANT_ARCHIVE_TRIGGER_TURNS
+          shouldContinue = assistantLiveStartIndex(next.turns) > 0
           return { assistantRuntimes: { ...sl.assistantRuntimes, [id]: next } }
         })
         // A burst may have grown while fsync was in flight. Drain another bounded
@@ -3469,7 +3568,7 @@ export const useKaisola = create<KaisolaState>()(
     }),
   setThreadBusy: (id, busy, projectId) => {
     const pid = projectId ?? get().activeProjectId
-    get().patchProject(pid, (sl) => ({ assistantThreads: sl.assistantThreads.map((t) => (t.id === id ? { ...t, busy } : t)) }))
+    get().patchProject(pid, (sl) => ({ assistantThreads: sl.assistantThreads.map((t) => (t.id === id ? { ...t, busy, lastActivityAt: Date.now() } : t)) }))
   },
   setSettingsOpen: (open, pane) => set({ settingsOpen: open, settingsPane: open ? pane ?? null : null }),
   setAgentPreset: (id) => set({ agentPreset: id }),

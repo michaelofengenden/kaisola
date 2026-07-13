@@ -79,6 +79,11 @@ const bridge = {
       ipcRenderer.on('acp:controls', listener)
       return () => ipcRenderer.removeListener('acp:controls', listener)
     },
+    onCommands: (cb) => {
+      const listener = (_e, info) => cb(info)
+      ipcRenderer.on('acp:commands', listener)
+      return () => ipcRenderer.removeListener('acp:commands', listener)
+    },
     /** Fires when an agent opens a terminal to run a command (show it live). */
     onTerminal: (cb) => {
       const listener = (_e, info) => cb(info)

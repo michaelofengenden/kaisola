@@ -688,6 +688,20 @@ function buildContext(): string {
   ].filter(Boolean).join('\n')
 }
 
+function usageWarningContext(): string {
+  try {
+    const cached = JSON.parse(localStorage.getItem('kaisola:agent-usage-warning') || 'null') as {
+      at?: number
+      rows?: Array<{ label?: string; usedPercent?: number; resetsAt?: number }>
+    } | null
+    if (!cached?.at || Date.now() - cached.at > 15 * 60_000 || !cached.rows?.length) return ''
+    const limits = cached.rows
+      .filter((row) => typeof row.label === 'string' && typeof row.usedPercent === 'number')
+      .map((row) => `${row.label}: ${Math.max(0, Math.round(100 - row.usedPercent!))}% remaining${row.resetsAt ? `, resets ${new Date(row.resetsAt * 1000).toLocaleString()}` : ''}`)
+    return limits.length ? `Kaisola usage warning (budget your work accordingly):\n${limits.join('\n')}\n\n` : ''
+  } catch { return '' }
+}
+
 // memo'd: every thread's card stays mounted side by side, and SessionCards
 // re-renders often — a card whose threadId hasn't changed must not re-render
 // (its own runtime subscription below wakes it when ITS content changes)
@@ -695,8 +709,11 @@ export const Assistant = memo(function Assistant({ threadId }: { threadId: strin
   const autonomy = useKaisola((s) => s.autonomy)
   const openSettings = useKaisola((s) => s.setSettingsOpen)
   const workspacePath = useKaisola((s) => s.workspacePath)
+  const claudeAccounts = useKaisola((s) => s.claudeAccounts)
+  const claudeAccountId = useKaisola((s) => s.claudeAccountId)
   const project = useKaisola((s) => s.project)
   const projectId = useKaisola((s) => s.activeProjectId)
+  const focusedThreadId = useKaisola((s) => s.activeThreadId)
   const setWorkspace = useKaisola((s) => s.setWorkspace)
   const requestTerminal = useKaisola((s) => s.requestTerminal)
   const openSignIn = useKaisola((s) => s.openSignIn)
@@ -716,6 +733,7 @@ export const Assistant = memo(function Assistant({ threadId }: { threadId: strin
   const setStoreThreadAgent = useKaisola((s) => s.setAssistantThreadAgent)
   const setThreadClaudeEffort = useKaisola((s) => s.setThreadClaudeEffort)
   const setThreadCodexEffort = useKaisola((s) => s.setThreadCodexEffort)
+  const setThreadPreferredModel = useKaisola((s) => s.setThreadPreferredModel)
   const setThreadPermissionMode = useKaisola((s) => s.setThreadPermissionMode)
   const agentTerminals = useKaisola((s) => s.agentTerminals)
   const terminalMeta = useKaisola((s) => s.terminalMeta)
@@ -725,6 +743,8 @@ export const Assistant = memo(function Assistant({ threadId }: { threadId: strin
   const [agents, setAgents] = useState<AcpAgent[]>([])
   const [statusReadyKey, setStatusReadyKey] = useState('')
   const autoConnectAttemptRef = useRef<string | null>(null)
+  const modelApplyAttemptRef = useRef<string | null>(null)
+  const modelApplyRetriesRef = useRef<{ key: string; count: number }>({ key: '', count: 0 })
   // mirrors awaitingAuth so the window-focus reconnect listener (a stable
   // closure) reads the live value without re-subscribing on every toggle
   const awaitingAuthRef = useRef(false)
@@ -748,6 +768,9 @@ export const Assistant = memo(function Assistant({ threadId }: { threadId: strin
     threads.find((t) => t.id === threadId) ??
     threads[0] ??
     ({ id: threadId, agentKey: 'codex', busy: false } as AssistantThread)
+  const parentGroupPhase = active.groupParentId
+    ? threads.find((thread) => thread.id === active.groupParentId)?.group?.phase
+    : undefined
   const sessionCwd = active.cwd ?? workspacePath
   const draft = useKaisola((s) => s.assistantDrafts[active.id] ?? EMPTY_DRAFT)
   const queuedPrompts = useKaisola((s) => s.assistantPromptQueues[active.id] ?? EMPTY_QUEUE)
@@ -757,6 +780,7 @@ export const Assistant = memo(function Assistant({ threadId }: { threadId: strin
   const takeAssistantPromptQueue = useKaisola((s) => s.takeAssistantPromptQueue)
   const removeQueuedAssistantPrompt = useKaisola((s) => s.removeQueuedAssistantPrompt)
   const agentKey = active.agentKey
+  const claudeConfigDir = claudeAccounts.find((account) => account.id === claudeAccountId)?.configDir ?? null
   // Provider sessions are per assistant thread, not merely per provider. Two
   // Codex cards in one project therefore retain independent contexts and
   // resume ids when hidden adapters park to disk.
@@ -777,6 +801,7 @@ export const Assistant = memo(function Assistant({ threadId }: { threadId: strin
   const [archiveGap, setArchiveGap] = useState(false)
   const archiveRequestRef = useRef(0)
   const archiveRetryAttemptRef = useRef('')
+  const recentArchiveHydratedRef = useRef('')
   const archiveScope = useMemo(() => ({
     projectId,
     threadId: active.id,
@@ -836,10 +861,27 @@ export const Assistant = memo(function Assistant({ threadId }: { threadId: strin
       if (archiveRequestRef.current === request) setArchiveLoading(false)
     }
   }
+  useEffect(() => {
+    const recentAt = Math.max(active.lastActivityAt ?? 0, active.lastViewedAt ?? 0)
+    if (active.groupParentId || focusedThreadId !== active.id || !archiveTotal || !recentAt || Date.now() - recentAt > 24 * 60 * 60_000) return
+    if (recentArchiveHydratedRef.current === archiveScopeKey) return
+    recentArchiveHydratedRef.current = archiveScopeKey
+    void loadOlderTurns(true)
+    // Hydrate one bounded recent page only when archive metadata arrives.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [active.groupParentId, active.id, active.lastActivityAt, active.lastViewedAt, archiveScopeKey, archiveTotal, focusedThreadId])
   const agentPreset = presets.find((p) => p.id === agentKey)
   const agentName = agentPreset?.name ?? agentKey
   const aState = agents.find((a) => a.key === connectionKey)
   const connected = !!aState?.connected
+  const availableCommands = aState?.availableCommands ?? []
+  const commandToken = input.match(/^([/$])([^\s]*)$/)
+  const commandChoices = commandToken
+    ? availableCommands.filter((command) => {
+      const prefix = command.name.startsWith('$') ? '$' : '/'
+      return prefix === commandToken[1] && command.name.replace(/^\$/, '').toLowerCase().includes(commandToken[2].toLowerCase())
+    }).slice(0, 12)
+    : []
   // Native prompt queueing (claude-code-acp) → a follow-up sent mid-turn is
   // STEERED into the running turn at the next tool boundary, instead of waiting
   // out the whole turn. Agents without it keep the queue-until-idle behavior.
@@ -913,6 +955,36 @@ export const Assistant = memo(function Assistant({ threadId }: { threadId: strin
 
   const refresh = () => bridge.acp.status([connectionKey]).then((s) => setAgents(s.agents))
   useEffect(() => {
+    const desired = active.preferredModel
+    if (!connected) { modelApplyAttemptRef.current = null; return }
+    if (!desired || !providerModelControl || providerModelControl.value === desired) {
+      modelApplyAttemptRef.current = null
+      modelApplyRetriesRef.current = { key: '', count: 0 }
+      return
+    }
+    if (!providerModelControl.options.some((option) => option.value === desired)) return
+    const attempt = `${connectionKey}:${desired}`
+    if (modelApplyRetriesRef.current.key !== attempt) modelApplyRetriesRef.current = { key: attempt, count: 0 }
+    if (modelApplyRetriesRef.current.count >= 3) return
+    if (modelApplyAttemptRef.current === attempt) return
+    modelApplyAttemptRef.current = attempt
+    void bridge.acp.setModel(connectionKey, desired).then((result) => {
+      modelApplyAttemptRef.current = null
+      if (result.ok) {
+        modelApplyRetriesRef.current = { key: attempt, count: 0 }
+        void refresh()
+        return
+      }
+      modelApplyRetriesRef.current = { key: attempt, count: modelApplyRetriesRef.current.count + 1 }
+      setNotice(result.message ?? `Could not restore ${active.preferredModelLabel ?? desired}; retrying.`)
+      window.setTimeout(() => setAgents((current) => [...current]), 1_500 * modelApplyRetriesRef.current.count)
+    }).catch(() => {
+      modelApplyAttemptRef.current = null
+      modelApplyRetriesRef.current = { key: attempt, count: modelApplyRetriesRef.current.count + 1 }
+      window.setTimeout(() => setAgents((current) => [...current]), 1_500 * modelApplyRetriesRef.current.count)
+    })
+  }, [active.preferredModel, connected, connectionKey, providerModelControl])
+  useEffect(() => {
     let live = true
     void Promise.allSettled([bridge.acp.status([connectionKey]), bridge.acp.presets()]).then(([statusResult, presetResult]) => {
       if (!live) return
@@ -930,12 +1002,19 @@ export const Assistant = memo(function Assistant({ threadId }: { threadId: strin
     // resumable provider session is the durable state, so main parks it after
     // a short grace and reconnects on the next send. Active turns and approval
     // prompts always hold the lease and therefore cannot be parked.
-    void bridge.acp.lease(connectionKey, threadId, keepAgentHot, 90_000, projectId)
+    void bridge.acp.lease(connectionKey, threadId, keepAgentHot, 30_000, projectId)
     return () => {
-      void bridge.acp.lease(connectionKey, threadId, false, 90_000, projectId)
+      void bridge.acp.lease(connectionKey, threadId, false, 30_000, projectId)
     }
   }, [connectionKey, keepAgentHot, projectId, threadId])
   useEffect(() => { const off = bridge.acp.onControls(() => refresh()); return off }, [connectionKey])
+  useEffect(() => {
+    const off = bridge.acp.onCommands((info) => {
+      if (info.key !== connectionKey) return
+      setAgents((current) => current.map((agent) => agent.key === connectionKey ? { ...agent, availableCommands: info.commands } : agent))
+    })
+    return off
+  }, [connectionKey])
   // many agents print an OAuth URL to authorize — surface it as an openable link
   useEffect(() => {
     const off = bridge.acp.onNotice((n) => {
@@ -1112,7 +1191,7 @@ export const Assistant = memo(function Assistant({ threadId }: { threadId: strin
     const res = await bridge.acp.connect(
       custom
         ? { presetId: key, clientKey: `${key}::${active.id}`, name: custom.name, command: custom.command, args: custom.args, autonomy, cwd, resumeSessionId, claudeEffort: effort, forceReconnect: opts.forceReconnect }
-        : { presetId: key, clientKey: `${key}::${active.id}`, autonomy, cwd, resumeSessionId, claudeEffort: effort, forceReconnect: opts.forceReconnect },
+        : { presetId: key, clientKey: `${key}::${active.id}`, autonomy, cwd, resumeSessionId, claudeEffort: effort, forceReconnect: opts.forceReconnect, ...(key === 'claude-code' ? { claudeConfigDir } : {}) },
     )
     if (res.ok) {
       setNotice(null); refresh()
@@ -1156,7 +1235,14 @@ export const Assistant = memo(function Assistant({ threadId }: { threadId: strin
       setAgents(status.agents)
       agentReady = status.agents.some((agent) => agent.key === connectionKey && agent.connected)
     } catch { /* fall back to the last renderer-known state */ }
-    return agentReady || connect(agentKey)
+    if (agentReady) return true
+    try {
+      const result = await connect(agentKey)
+      return result
+    } catch (error) {
+      setNotice(`Could not connect: ${String((error as Error)?.message ?? error)}`)
+      return false
+    }
   }
   // Sign in: a clean in-app device-code card where available (codex), else fall
   // back to running the CLI's login in a terminal.
@@ -1207,23 +1293,20 @@ export const Assistant = memo(function Assistant({ threadId }: { threadId: strin
   useEffect(() => {
     if (!signInOpen) void reconnectAfterAuth()
   }, [signInOpen, reconnectAfterAuth])
-  // A fresh thread just TRIES to connect: the CLIs cache their logins on disk
-  // (claude/codex), so most threads should come up Connected without anyone
-  // touching "Sign in" — clicking it used to be the only visible path, and for
-  // Claude that path is a `claude /login` terminal, which read as broken when
-  // the user was already signed in. Never auto-runs when no workspace is set
-  // (connect() would pop the folder picker); failures land in the notice line
-  // and the explicit Sign in button remains.
+  // Ordinary transcripts connect lazily on Send/control interaction. Mesh
+  // workers connect while its setup surface is open so their live model
+  // catalogs can be configured; safe idle adapters are still parked by main.
   useEffect(() => {
+    if (!active.groupParentId || parentGroupPhase !== 'idle') return
     if (statusReadyKey !== connectionKey || connected || busy || !sessionCwd) return
     const preset = presets.find((p) => p.id === agentKey)
     const custom = useKaisola.getState().customAgents.find((a) => a.id === agentKey && a.kind === 'acp')
     if ((!preset || preset.terminalOnly) && !custom) return
-    const attempt = `${threadId}|${agentKey}|${sessionCwd}`
+    const attempt = `${threadId}|${agentKey}|${sessionCwd}|${agentKey === 'claude-code' ? claudeConfigDir ?? 'default' : ''}`
     if (autoConnectAttemptRef.current === attempt) return
     autoConnectAttemptRef.current = attempt
     void connect(agentKey)
-  }, [agentKey, connected, busy, connectionKey, presets, statusReadyKey, threadId, sessionCwd])
+  }, [active.groupParentId, agentKey, connected, busy, claudeConfigDir, connectionKey, parentGroupPhase, presets, statusReadyKey, threadId, sessionCwd])
   const onControlChange = async (c: UiControl, value: string) => {
     if (!(await ensureAgentConnected())) return
     const result = c.kind === 'mode'
@@ -1234,6 +1317,10 @@ export const Assistant = memo(function Assistant({ threadId }: { threadId: strin
     if (!result.ok) setNotice(result.message ?? `${c.name} could not be changed.`)
     else {
       setNotice(null)
+      if (c.kind === 'model') {
+        const label = c.options.find((option) => option.value === value)?.name
+        setThreadPreferredModel(active.id, value, label, projectId)
+      }
       // mode lives on the agent side of the session — persist the choice so
       // reconnects/restarts reapply it instead of the agent's default
       if (c.kind === 'mode') setThreadPermissionMode(active.id, value, projectId)
@@ -1393,7 +1480,7 @@ export const Assistant = memo(function Assistant({ threadId }: { threadId: strin
         // the agent's own todo list — whole-array replace per frame (Zed's
         // update_plan semantics), rendered as the pinned strip, never a turn
         const entries = (u as { entries?: PlanEntry[] }).entries
-        if (Array.isArray(entries)) updateRuntime(threadId, (r) => ({ ...r, plan: entries.slice(0, 100).map((entry) => ({ ...entry, content: String(entry.content ?? '').slice(0, 4000) })) }))
+        if (Array.isArray(entries)) updateRuntime(threadId, (r) => ({ ...r, plan: entries.slice(0, 100).map((entry) => ({ ...entry, content: String(entry.content ?? '').slice(0, 4000) })), planUpdatedAt: Date.now() }))
       } else if (kind === 'tool_call') {
         const tc = u as { toolCallId?: string; title?: string; kind?: string; status?: string }
         const toolId = typeof tc.toolCallId === 'string' ? tc.toolCallId.slice(0, 4000) : undefined
@@ -1539,7 +1626,7 @@ export const Assistant = memo(function Assistant({ threadId }: { threadId: strin
     const mentionPrefix = mns.length ? `Referenced from the research project (use if relevant):\n${mns.map((m) => `- ${m.text}`).join('\n')}\n\n` : ''
     const filePrefix = files.length ? `Attached files (read them if relevant):\n${files.join('\n')}\n\n` : ''
     const nativeSpeedApplied = await applySpeed(prompt.speed)
-    const payload = `${speedGuidance(prompt.speed, nativeSpeedApplied)}${first ? `${buildContext()}\n\n` : ''}${mentionPrefix}${filePrefix}${prompt.text}`
+    const payload = `${speedGuidance(prompt.speed, nativeSpeedApplied)}${usageWarningContext()}${first ? `${buildContext()}\n\n` : ''}${mentionPrefix}${filePrefix}${prompt.text}`
     // image attachments ALSO ride as real ACP image blocks (pixels, not a
     // path) for agents that take them; the path stays in filePrefix above as
     // the text-only fallback. Unreadable/oversized images just stay paths.
@@ -1849,6 +1936,7 @@ export const Assistant = memo(function Assistant({ threadId }: { threadId: strin
           })()}
         </div>
       )}
+      {(arun.plan?.length ?? 0) > 0 && <div className="plan-shelf"><PlanStrip plan={arun.plan!} /></div>}
       <div className="assistant-stream" ref={scrollRef} onScroll={onStreamScroll}>
         {notice && (
           <div className="assistant-nokey">
@@ -1887,7 +1975,6 @@ export const Assistant = memo(function Assistant({ threadId }: { threadId: strin
             ))}
           </div>
         )}
-        {(arun.plan?.length ?? 0) > 0 && <PlanStrip plan={arun.plan!} />}
         {canLoadArchive && (
           <button
             className="assistant-load-history"
@@ -2025,6 +2112,25 @@ export const Assistant = memo(function Assistant({ threadId }: { threadId: strin
             ))}
           </div>
         )}
+        {commandChoices.length > 0 && (
+          <div className="composer-command-palette" role="listbox" aria-label={`${agentName} commands`}>
+            {commandChoices.map((command) => {
+              const token = command.name.startsWith('$') ? command.name : `/${command.name}`
+              return <button
+                key={command.name}
+                role="option"
+                onClick={() => {
+                  setAssistantDraft(active.id, { text: `${token}${command.inputHint ? ' ' : ''}` }, projectId)
+                  requestAnimationFrame(() => inputRef.current?.focus())
+                }}
+              >
+                <code>{token}</code>
+                <span className="truncate">{command.description}</span>
+                {command.inputHint && <small className="truncate">{command.inputHint}</small>}
+              </button>
+            })}
+          </div>
+        )}
         <div className="composer">
         {attachments.length > 0 && (
           <div className="composer-attach">
@@ -2144,11 +2250,7 @@ export const Assistant = memo(function Assistant({ threadId }: { threadId: strin
           <span className={`acp-dot ${connected ? 'on' : 'off'}`} />
           {connected ? (
             'Connected'
-          ) : (() => { const p = presets.find((x) => x.id === agentKey); return p?.login || p?.deviceLogin })() ? (
-            <button className="foot-link" onClick={signIn}>Offline · Sign in</button>
-          ) : (
-            'Offline'
-          )}
+          ) : <button className="foot-link" onClick={() => { void connect(agentKey) }}>{active.acpSessionId ? 'Parked · Resume' : 'Offline · Connect'}</button>}
         </span>
       </div>
     </div>

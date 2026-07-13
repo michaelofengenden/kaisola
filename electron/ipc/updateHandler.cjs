@@ -57,6 +57,7 @@ function createUpdateController({
     message: null,
     checkError: null,
     checkingForLatest: false,
+    feedUnstable: false,
     checkedAt: null,
     appVersion,
     revision: 0,
@@ -170,6 +171,62 @@ function createUpdateController({
     return current
   }
 
+  const ensureLatestDownloaded = async (initialVersion = state.version ?? appVersion) => {
+    let pendingVersion = initialVersion
+    for (let round = 0; round < 5; round++) {
+      operation = 'ready-check'
+      lastCheckAt = now()
+      setState({ checkingForLatest: true, checkError: null, message: null })
+      autoUpdater.autoDownload = false
+      try {
+        const result = await autoUpdater.checkForUpdates()
+        if (!result) throw new Error('The updater is unavailable in this build.')
+        const version = result.updateInfo?.version ?? result.versionInfo?.version
+        const checkedAt = now()
+        if (version && newer(version, pendingVersion)) {
+          operation = 'replacement-download'
+          autoUpdater.autoDownload = true
+          setState({
+            type: 'downloading',
+            version,
+            percent: 0,
+            message: 'Downloading newer update…',
+            checkError: null,
+            checkingForLatest: false,
+            checkedAt,
+          })
+          await autoUpdater.downloadUpdate()
+          pendingVersion = version
+          finishReady(version)
+          continue
+        }
+        setState({ type: 'ready', version: pendingVersion, checkingForLatest: false, feedUnstable: false, checkedAt, checkError: null, message: null })
+        return { ok: true, version: pendingVersion, updateAvailable: pendingVersion !== initialVersion }
+      } catch (err) {
+        const message = messageOf(err)
+        setState({
+          type: 'ready',
+          version: pendingVersion,
+          percent: 100,
+          checkingForLatest: false,
+          checkError: message,
+          message: null,
+        })
+        return { ok: false, version: pendingVersion, message }
+      } finally {
+        autoUpdater.autoDownload = true
+      }
+    }
+    setState({
+      type: 'ready',
+      version: pendingVersion,
+      checkingForLatest: false,
+      feedUnstable: true,
+      checkError: 'The release feed kept changing. Restart is paused; check once more to confirm the newest build.',
+    })
+    return { ok: false, unstable: true, version: pendingVersion, message: 'Release feed did not stabilize.' }
+  }
+
   const check = () => startTask(async () => {
     operation = 'check'
     lastCheckAt = now()
@@ -185,6 +242,7 @@ function createUpdateController({
         operation = 'download'
         await result.downloadPromise
         finishReady(version)
+        return await ensureLatestDownloaded(version)
       } else if (result.isUpdateAvailable) {
         // Defensive path for updater implementations configured not to auto
         // download. Kaisola sets autoDownload=true, but this keeps the state
@@ -193,6 +251,7 @@ function createUpdateController({
         setState({ type: 'downloading', version, percent: 0, message: 'Downloading update…' })
         await autoUpdater.downloadUpdate()
         finishReady(version)
+        return await ensureLatestDownloaded(version)
       } else {
         setState({ type: 'idle', version: null, percent: 0, message: null, checkError: null })
       }
@@ -203,51 +262,7 @@ function createUpdateController({
     }
   })
 
-  const refreshReady = () => startTask(async () => {
-    const pendingVersion = state.version ?? appVersion
-    operation = 'ready-check'
-    lastCheckAt = now()
-    setState({ checkingForLatest: true, checkError: null, message: null })
-    autoUpdater.autoDownload = false
-    try {
-      const result = await autoUpdater.checkForUpdates()
-      if (!result) throw new Error('The updater is unavailable in this build.')
-      const version = result.updateInfo?.version ?? result.versionInfo?.version
-      const checkedAt = now()
-      if (version && newer(version, pendingVersion)) {
-        operation = 'replacement-download'
-        autoUpdater.autoDownload = true
-        setState({
-          type: 'downloading',
-          version,
-          percent: 0,
-          message: 'Downloading newer update…',
-          checkError: null,
-          checkingForLatest: false,
-          checkedAt,
-        })
-        // Keep activeTask alive through the WHOLE replacement download. The
-        // old implementation cleared its probe flag before this await, letting
-        // Restart race an incomplete replacement.
-        await autoUpdater.downloadUpdate()
-        finishReady(version)
-        return { ok: true, version, updateAvailable: true }
-      }
-      setState({
-        type: 'ready',
-        checkingForLatest: false,
-        checkedAt,
-        checkError: null,
-        message: null,
-      })
-      return { ok: true, version: pendingVersion, updateAvailable: false }
-    } catch (err) {
-      recordError(err)
-      return { ok: false, message: messageOf(err) }
-    } finally {
-      autoUpdater.autoDownload = true
-    }
-  })
+  const refreshReady = () => startTask(() => ensureLatestDownloaded())
 
   const busy = () => !!activeTask || state.type === 'checking' || state.type === 'downloading' || state.type === 'installing'
   const recheck = () => {
@@ -262,6 +277,11 @@ function createUpdateController({
     // disables Restart during that short check. Serialize here as the hard
     // guarantee: never quit while a newer replacement is still downloading.
     if (activeTask) await activeTask
+    const verification = state.type === 'ready' ? await refreshReady() : null
+    if (activeTask) await activeTask
+    if (verification?.unstable || state.feedUnstable) {
+      return { ok: false, deferred: true, message: state.checkError ?? 'The newest release could not be confirmed.' }
+    }
     if (state.type !== 'ready') {
       const message = 'No fully prepared update is ready to install.'
       if (state.type !== 'error') setState({ checkError: message })
@@ -383,6 +403,7 @@ function registerUpdateHandlers(ipcMain, options = {}) {
     message: null,
     checkError: null,
     checkingForLatest: false,
+    feedUnstable: false,
     checkedAt: null,
     appVersion: app.getVersion(),
     revision: 0,

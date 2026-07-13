@@ -125,6 +125,23 @@ app.whenReady().then(async () => {
   })()`)
   await wait(700)
 
+  // A real long-lived agent often already owns the full 40-turn live window.
+  // Mesh boundaries must remain monotonic while old turns page out instead of
+  // relying on an array length that can no longer increase.
+  const saturated = await win.webContents.executeJavaScript(`(() => {
+    const state = window.__kaisola.getState()
+    const group = state.assistantThreads.find((thread) => thread.group)
+    const before = Date.now() - 60_000
+    for (const member of group?.group?.members ?? []) {
+      state.updateAssistantRuntime(member.threadId, (runtime) => ({
+        ...runtime,
+        turns: Array.from({ length: 40 }, (_, index) => ({ kind: 'assistant', text: 'prior turn ' + index, at: before + index })),
+      }))
+    }
+    const after = window.__kaisola.getState()
+    return (group?.group?.members ?? []).every((member) => after.assistantRuntimes[member.threadId]?.turns.length === 40)
+  })()`)
+
   const configured = await win.webContents.executeJavaScript(`(() => {
     const selects = [...document.querySelectorAll('.group-roster-row select')]
     if (selects.length !== 2 || selects.some((select) => select.options.length < 2)) return false
@@ -223,10 +240,11 @@ app.whenReady().then(async () => {
   const image = await win.webContents.capturePage()
   const screenshot = path.join(os.tmpdir(), 'kaisola-group-session.png')
   fs.writeFileSync(screenshot, image.toPNG())
-  const result = { configured, asked, ready, parkedBeforeNegotiation, connectCalls, negotiated, assigned, executed, reviewed, done, ...facts, persisted, screenshot }
+  const result = { configured, saturated, asked, ready, parkedBeforeNegotiation, connectCalls, negotiated, assigned, executed, reviewed, done, ...facts, persisted, screenshot }
   console.log('GROUP_UI=' + JSON.stringify(result))
   app.exit(
     configured
+    && saturated
     && asked
     && ready
     && parkedBeforeNegotiation

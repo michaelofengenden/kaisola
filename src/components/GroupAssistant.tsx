@@ -25,9 +25,20 @@ const modelControl = (controls?: AcpControls) => {
   return config ? { value: config.currentValue, options: config.options } : null
 }
 
-const responseAfter = (runtime: AssistantRuntime | undefined, baseline = 0): string =>
-  (runtime?.turns ?? [])
-    .slice(baseline)
+const TURN_TIME_BASELINE = 1_000_000_000_000
+const turnsAfter = (runtime: AssistantRuntime | undefined, baseline = 0, legacyStartedAt = 0) => {
+  const turns = runtime?.turns ?? []
+  // Current stages store a wall-clock boundary because the live runtime is a
+  // rolling 40-turn window. Array indexes stop advancing once that window is
+  // full. Older persisted Mesh sessions stored an index; their parent thread's
+  // lastActivityAt is the stage start and safely migrates them in place.
+  if (baseline >= TURN_TIME_BASELINE) return turns.filter((turn) => (turn.at ?? 0) >= baseline)
+  if (legacyStartedAt >= TURN_TIME_BASELINE) return turns.filter((turn) => (turn.at ?? 0) >= legacyStartedAt)
+  return turns.slice(baseline)
+}
+
+const responseAfter = (runtime: AssistantRuntime | undefined, baseline = 0, legacyStartedAt = 0): string =>
+  turnsAfter(runtime, baseline, legacyStartedAt)
     .filter((turn) => turn.kind === 'assistant' && turn.text.trim())
     .map((turn) => turn.text.trim())
     .join('\n\n')
@@ -59,8 +70,9 @@ function memberText(
   saved: Record<string, string> | undefined,
   runtimes: Record<string, AssistantRuntime>,
   baselines: Record<string, number> | undefined,
+  legacyStartedAt: number | undefined,
 ) {
-  return saved?.[member.threadId] ?? responseAfter(runtimes[member.threadId], baselines?.[member.threadId] ?? 0)
+  return saved?.[member.threadId] ?? responseAfter(runtimes[member.threadId], baselines?.[member.threadId] ?? 0, legacyStartedAt)
 }
 
 const memberPacket = (members: GroupSessionMember[], values?: Record<string, string>) =>
@@ -111,7 +123,7 @@ export const GroupAssistant = memo(function GroupAssistant({ threadId }: { threa
   }, [group, members, phase])
 
   const liveValues = (saved?: Record<string, string>) => Object.fromEntries(
-    members.map((member) => [member.threadId, memberText(member, saved, runtimes, group?.baselines)]),
+    members.map((member) => [member.threadId, memberText(member, saved, runtimes, group?.baselines, thread?.lastActivityAt)]),
   )
   const currentAnswers = useMemo(
     () => liveValues(group?.answers),
@@ -137,10 +149,10 @@ export const GroupAssistant = memo(function GroupAssistant({ threadId }: { threa
   const stageSettled = (targets: GroupSessionMember[]) => targets.every((member) => {
     const child = childThreads.find((candidate) => candidate.id === member.threadId)
     const baseline = group?.baselines?.[member.threadId] ?? 0
-    return !!child && !child.busy && !!responseAfter(runtimes[member.threadId], baseline)
+    return !!child && !child.busy && !!responseAfter(runtimes[member.threadId], baseline, thread?.lastActivityAt)
   })
   const stageValues = (targets: GroupSessionMember[]) => Object.fromEntries(
-    targets.map((member) => [member.threadId, responseAfter(runtimes[member.threadId], group?.baselines?.[member.threadId] ?? 0)]),
+    targets.map((member) => [member.threadId, responseAfter(runtimes[member.threadId], group?.baselines?.[member.threadId] ?? 0, thread?.lastActivityAt)]),
   )
 
   // Promote only after every addressed worker returned a real assistant turn.
@@ -160,7 +172,7 @@ export const GroupAssistant = memo(function GroupAssistant({ threadId }: { threa
     } else if (phase === 'assigning' || legacyAssigning) {
       const lead = members.find((member) => member.threadId === group.leadThreadId) ?? members[members.length - 1]
       if (lead && stageSettled([lead])) {
-        setGroup(threadId, { phase: 'assigned', jointPlan: responseAfter(runtimes[lead.threadId], group.baselines?.[lead.threadId] ?? 0), baselines: undefined }, projectId)
+        setGroup(threadId, { phase: 'assigned', jointPlan: responseAfter(runtimes[lead.threadId], group.baselines?.[lead.threadId] ?? 0, thread?.lastActivityAt), baselines: undefined }, projectId)
         setBusy(threadId, false, projectId)
       }
     } else if (phase === 'executing' && stageSettled(members)) {
@@ -172,7 +184,7 @@ export const GroupAssistant = memo(function GroupAssistant({ threadId }: { threa
     } else if (phase === 'integrating') {
       const lead = members.find((member) => member.threadId === group.leadThreadId) ?? members[members.length - 1]
       if (lead && stageSettled([lead])) {
-        const integration = responseAfter(runtimes[lead.threadId], group.baselines?.[lead.threadId] ?? 0)
+        const integration = responseAfter(runtimes[lead.threadId], group.baselines?.[lead.threadId] ?? 0, thread?.lastActivityAt)
         setGroup(threadId, { phase: 'done', integration, synthesis: integration, baselines: undefined }, projectId)
         setBusy(threadId, false, projectId)
       }
@@ -182,7 +194,8 @@ export const GroupAssistant = memo(function GroupAssistant({ threadId }: { threa
   }, [childThreads, group, members, phase, projectId, runtimes, setBusy, setGroup, threadId])
 
   const queueStage = (nextPhase: GroupSessionPhase, prompts: Record<string, string>, targets = members) => {
-    const baselines = Object.fromEntries(targets.map((member) => [member.threadId, runtimes[member.threadId]?.turns.length ?? 0]))
+    const startedAt = Date.now()
+    const baselines = Object.fromEntries(targets.map((member) => [member.threadId, startedAt]))
     setGroup(threadId, { phase: nextPhase, baselines, error: undefined }, projectId)
     setBusy(threadId, true, projectId)
     for (const member of targets) {

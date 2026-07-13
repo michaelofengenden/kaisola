@@ -148,7 +148,7 @@ export interface GroupSessionState {
   members: GroupSessionMember[]
   phase: GroupSessionPhase
   task?: string
-  /** Child turn counts captured before a stage, used to isolate its response. */
+  /** Stage-start timestamps used to isolate responses in rolling child runtimes. */
   baselines?: Record<string, number>
   answers?: Record<string, string>
   negotiations?: Record<string, string>

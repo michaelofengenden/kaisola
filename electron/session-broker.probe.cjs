@@ -165,7 +165,42 @@ async function main() {
   }
 }
 
-main().catch((error) => {
+async function smokeCleanupProbe() {
+  const userData = fs.mkdtempSync(path.join(os.tmpdir(), 'kaisola-broker-smoke-probe-'))
+  const client = new SessionBrokerClient({
+    userData,
+    execPath: process.env.KAISOLA_BROKER_EXEC_PATH || process.execPath,
+    brokerScript: process.env.KAISOLA_BROKER_SCRIPT || path.join(__dirname, 'session-broker.cjs'),
+    appVersion: 'probe-smoke',
+    smoke: true,
+  })
+  let brokerPid = null
+  try {
+    brokerPid = (await client.connect()).pid
+    const created = await client.terminal('create', sender(501), {
+      id: 'abrupt-probe-exit',
+      command: process.platform === 'win32' ? process.env.ComSpec : '/bin/sh',
+      args: process.platform === 'win32' ? ['/d', '/s', '/c', 'ping -t 127.0.0.1 >nul'] : ['-c', 'while :; do sleep 1; done'],
+      cwd: process.cwd(), cols: 80, rows: 24, projectId: PROJECT_ALPHA,
+    })
+    if (!created?.ok) throw new Error('smoke cleanup terminal did not start')
+    await client.disconnect()
+    let alive = true
+    for (let i = 0; i < 40; i++) {
+      await wait(100)
+      try { process.kill(brokerPid, 0) } catch { alive = false; break }
+    }
+    if (alive) throw new Error('smoke broker survived its last probe client')
+    console.log('SESSION_BROKER_SMOKE_CLEANUP=PASS')
+  } finally {
+    if (brokerPid) {
+      try { process.kill(brokerPid, 0); await client.shutdown() } catch { /* already reaped */ }
+    }
+    fs.rmSync(userData, { recursive: true, force: true })
+  }
+}
+
+main().then(smokeCleanupProbe).catch((error) => {
   console.error(error?.stack || error)
   process.exitCode = 1
 })

@@ -4,10 +4,11 @@ const { app, BrowserWindow, ipcMain } = require('electron')
 const fs = require('node:fs')
 const os = require('node:os')
 const path = require('node:path')
+const { killAllSessions } = require('./ipc/terminalHandler.cjs')
 
 process.env.KAISOLA_SMOKE = '1'
 app.disableHardwareAcceleration()
-const userData = path.join(os.tmpdir(), 'kaisola-layout-matrix')
+const userData = path.join(os.tmpdir(), `kaisola-layout-matrix-${process.pid}`)
 const workspace = path.join(userData, 'workspace')
 fs.rmSync(userData, { recursive: true, force: true })
 fs.mkdirSync(workspace, { recursive: true })
@@ -310,8 +311,7 @@ app.whenReady().then(async () => {
   const resized = (widthsAfter.sessions ?? 0) >= (widthsBefore.sessions ?? 0) + 60 && Math.abs((widthsAfter.files ?? 0) - (widthsBefore.files ?? 0)) <= 2
   const orderOk = /New terminal/.test(newSessionOrder[0] ?? '') && /Codex/.test(newSessionOrder[1] ?? '') && /Claude/.test(newSessionOrder[2] ?? '')
   const layoutsOk = [wide, medium, compact, top].every((view) => view.bodyFits && view.sidebarFits !== false && view.cardsFit && view.controlsFit)
-  app.exit(
-    layoutsOk
+  const passed = layoutsOk
     && wide.cardCount >= 5
     && Object.values(wide.visibleKinds).every(Boolean)
     && closePoint?.topmost
@@ -330,7 +330,12 @@ app.whenReady().then(async () => {
     && terminalUsesWorkspace
     && top.horizontalTabs
     && topStripScrolls
-      ? 0
-      : 1,
-  )
-}).catch((error) => { console.error(error); app.exit(1) })
+  killAllSessions()
+  await wait(250)
+  app.exit(passed ? 0 : 1)
+}).catch(async (error) => {
+  console.error(error)
+  killAllSessions()
+  await wait(250)
+  app.exit(1)
+})

@@ -426,6 +426,7 @@ class SessionBrokerClient {
       logFile: this.logFile,
       startedAt,
       version: this.appVersion,
+      smoke: this.smoke,
     })
     const env = { ...process.env, ELECTRON_RUN_AS_NODE: '1', KAISOLA_SESSION_BROKER: '1' }
     delete env.KAISOLA_DEV_URL

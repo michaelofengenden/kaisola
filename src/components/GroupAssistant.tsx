@@ -1,4 +1,4 @@
-import { memo, useEffect, useMemo, useState } from 'react'
+import { memo, useEffect, useMemo, useRef, useState } from 'react'
 import { Assistant, PermissionCard } from './Assistant'
 import { Icon } from './Icon'
 import { ProviderIcon } from './ProviderIcon'
@@ -144,6 +144,7 @@ export const GroupAssistant = memo(function GroupAssistant({ threadId }: { threa
   const [presets, setPresets] = useState<AcpPreset[]>([])
   const [recoveryNonce, setRecoveryNonce] = useState(0)
   const [cleanupFailed, setCleanupFailed] = useState(false)
+  const autoFlowRef = useRef('')
   const group = thread?.group
   const transitioning = !!group?.operation
   const members = useMemo(() => group?.members ?? [], [group?.members])
@@ -869,8 +870,29 @@ export const GroupAssistant = memo(function GroupAssistant({ threadId }: { threa
     }
   }
 
+  // Fluid mode removes low-value clicks between read-only stages. Mutating
+  // boundaries remain explicit: creating worktrees and integrating commits
+  // still require the buttons rendered in the composer below.
+  useEffect(() => {
+    if (!group || (group.flow ?? 'fluid') !== 'fluid' || group.paused || group.error || transitioning) return
+    if (phase !== 'ready' && phase !== 'plan-ready' && phase !== 'review-ready' && phase !== 'execution-ready') return
+    const token = `${phase}:${group.stageAttemptId ?? 'settled'}`
+    if (autoFlowRef.current === token) return
+    autoFlowRef.current = token
+    const timer = window.setTimeout(() => {
+      const live = useKaisola.getState().assistantThreads.find((candidate) => candidate.id === threadId)?.group
+      if (!live || live.phase !== phase || (live.flow ?? 'fluid') !== 'fluid' || live.paused || live.error || live.operation) return
+      if (phase === 'ready') negotiate()
+      else if (phase === 'plan-ready' || phase === 'review-ready') writeRoleContract()
+      else void crossReview()
+    }, 180)
+    return () => window.clearTimeout(timer)
+  }, [group, phase, threadId, transitioning])
+
   if (!thread || !group) return null
   const running = runningPhases.has(phase) && !group.paused
+  const fluidAdvancing = (group.flow ?? 'fluid') === 'fluid'
+    && (phase === 'ready' || phase === 'plan-ready' || phase === 'review-ready' || phase === 'execution-ready')
   const negotiated = group.negotiations ?? group.critiques
   const finalText = group.integration ?? group.synthesis
   const participantPresets = presets.filter((preset) => !preset.hidden && !preset.terminalOnly && preset.id !== 'group')
@@ -932,8 +954,14 @@ export const GroupAssistant = memo(function GroupAssistant({ threadId }: { threa
     <div className="group-assistant" data-phase={phase}>
       <header className="group-head">
         <span className="group-mark"><Icon name="Network" size={14} /></span>
-        <div><strong>Kaisola Mesh</strong><small>{members.length} agents · scout · align · divide · verify · integrate</small></div>
+        <div className="group-head-copy"><strong>Mesh</strong><small>{members.length} participants · shared mission, isolated work</small></div>
         <span className="grow" />
+        <div className="group-presence" aria-label="Mesh participants">
+          {members.slice(0, 4).map((member) => <span key={member.threadId} title={`${member.label} · ${currentMemberStatuses[member.threadId]}`} data-status={currentMemberStatuses[member.threadId]}>
+            <ProviderIcon provider={member.agentKey} name={member.label} size={12} />
+          </span>)}
+          {members.length > 4 && <span className="group-presence-more">+{members.length - 4}</span>}
+        </div>
         <span className="group-phase" data-running={running || undefined} role="status" aria-live="polite" aria-atomic="true">{group.paused ? 'Paused' : phaseLabel[phase]}</span>
       </header>
 
@@ -941,9 +969,16 @@ export const GroupAssistant = memo(function GroupAssistant({ threadId }: { threa
         {!group.task && (
           <div className="group-empty">
             <Icon name="Network" size={24} />
-            <strong>One mission, multiple models, explicit ownership.</strong>
-            <p>Mesh lets a bounded team scout independently, negotiate one role split, work in isolated git worktrees, cross-review, and hand one integration owner the final merge.</p>
-            <small>Every Mesh stage transition waits for your approval.</small>
+            <strong>Start a focused agent group.</strong>
+            <p>Participants compare approaches, agree on ownership, work in isolated branches, and cross-review before one controlled integration.</p>
+            <div className="group-mode" role="group" aria-label="Mesh flow mode">
+              <button type="button" data-active={(group.flow ?? 'fluid') === 'fluid' || undefined} onClick={() => setGroup(threadId, { flow: 'fluid' }, projectId)}>
+                <Icon name="Zap" size={12} /><span><strong>Fluid</strong><small>Analysis flows; write gates pause</small></span>
+              </button>
+              <button type="button" data-active={group.flow === 'guided' || undefined} onClick={() => setGroup(threadId, { flow: 'guided' }, projectId)}>
+                <Icon name="ListChecks" size={12} /><span><strong>Guided</strong><small>Pause at every stage</small></span>
+              </button>
+            </div>
             <div className="group-roster" aria-label="Mesh participants">
               {members.map((member) => {
                 const key = `${member.agentKey}::${member.threadId}`
@@ -1017,7 +1052,7 @@ export const GroupAssistant = memo(function GroupAssistant({ threadId }: { threa
             }}
           />)}
         </section>}
-        {group.task && <section className="group-task"><span>Mission</span><p>{group.task}</p></section>}
+        {group.task && <section className="group-task"><span>You · mission</span><p>{group.task}</p></section>}
 
         {(phase !== 'idle' || group.answers) && (
           <GroupPair title="Independent scouts" members={members} values={currentAnswers} childThreads={childThreads} statuses={currentMemberStatuses} active={phase === 'answering'} />
@@ -1027,12 +1062,12 @@ export const GroupAssistant = memo(function GroupAssistant({ threadId }: { threa
         )}
         {(group.jointPlan || phase === 'assigning' || phase === 'synthesizing') && (
           <section className="group-final group-contract">
-            <header><Icon name="ClipboardList" size={14} /><strong>Role contract</strong></header>
+            <header><Icon name="ClipboardList" size={14} /><strong>Role contract</strong><span>System receipt</span></header>
             <p>{group.jointPlan || 'Coordinator is resolving ownership, interfaces, tests, and stop conditions…'}</p>
           </section>
         )}
         {(group.worktrees || phase === 'executing' || group.executions) && (
-          <section className="group-execution">
+          <section className="group-execution group-stage">
             <h3>Isolated execution</h3>
             {members.map((member) => {
               const wt = group.worktrees?.[member.threadId]
@@ -1050,7 +1085,7 @@ export const GroupAssistant = memo(function GroupAssistant({ threadId }: { threa
         )}
         {(phase === 'integrating' || finalText) && (
           <section className="group-final">
-            <header><Icon name="CheckCircle2" size={14} /><strong>Integrated result</strong></header>
+            <header><Icon name="CheckCircle2" size={14} /><strong>Integrated result</strong><span>System receipt</span></header>
             <p>{finalText || 'The integration owner is reconciling branches and running the shared acceptance tests…'}</p>
           </section>
         )}
@@ -1058,16 +1093,17 @@ export const GroupAssistant = memo(function GroupAssistant({ threadId }: { threa
 
       <footer className="group-composer">
         {cleanupFailed && <button type="button" className="group-action" onClick={() => setRecoveryNonce((value) => value + 1)}><Icon name="RefreshCw" size={14} /> Retry safe worktree cleanup</button>}
-        {phase === 'idle' && <><textarea value={draft} onChange={(event) => setDraft(event.target.value)} placeholder="Give Claude and Codex one mission…" aria-label="Mesh mission" rows={2} />{workspacePath
+        {phase === 'idle' && <><textarea value={draft} onChange={(event) => setDraft(event.target.value)} placeholder="Give this group one mission…" aria-label="Mesh mission" rows={2} />{workspacePath
           ? <button type="button" className="group-primary" onClick={askBoth} disabled={!draft.trim()} title="Start independent scouting" aria-label="Start independent scouting"><Icon name="ArrowUp" size={15} /></button>
           : <button type="button" className="group-primary" onClick={() => { void chooseMeshWorkspace() }} title="Choose one project folder before starting Mesh" aria-label="Choose a project folder before starting Mesh"><Icon name="FolderOpen" size={15} /></button>}</>}
-        {phase === 'ready' && <button type="button" className="group-action" onClick={negotiate}><Icon name="MessageSquarePlus" size={14} /> Compare approaches and negotiate roles</button>}
-        {(phase === 'plan-ready' || phase === 'review-ready') && <button type="button" className="group-action" onClick={writeRoleContract}><Icon name="ClipboardList" size={14} /> Approve negotiation and write role contract</button>}
+        {phase === 'ready' && group.flow === 'guided' && <button type="button" className="group-action" onClick={negotiate}><Icon name="MessageSquarePlus" size={14} /> Continue to role negotiation</button>}
+        {(phase === 'plan-ready' || phase === 'review-ready') && group.flow === 'guided' && <button type="button" className="group-action" onClick={writeRoleContract}><Icon name="ClipboardList" size={14} /> Approve negotiation and write role contract</button>}
         {phase === 'assigned' && <button type="button" className="group-action" onClick={() => void executeIsolated()} disabled={transitioning}><Icon name="GitBranch" size={14} /> Approve plan and create isolated worktrees</button>}
-        {phase === 'execution-ready' && <button type="button" className="group-action" onClick={() => void crossReview()} disabled={transitioning}><Icon name="ScanSearch" size={14} /> Cross-review both implementations</button>}
+        {phase === 'execution-ready' && group.flow === 'guided' && <button type="button" className="group-action" onClick={() => void crossReview()} disabled={transitioning}><Icon name="ScanSearch" size={14} /> Cross-review implementations</button>}
         {phase === 'merge-ready' && <button type="button" className="group-action" onClick={() => void integrate()} disabled={transitioning}><Icon name="GitMerge" size={14} /> Approve and integrate reviewed work</button>}
-        {phase === 'done' && <button type="button" className="group-action" onClick={requestNewGroup}><Icon name="Plus" size={14} /> Start another group session</button>}
+        {phase === 'done' && <button type="button" className="group-action" onClick={requestNewGroup}><Icon name="Plus" size={14} /> New Mesh</button>}
         {group.paused && <button type="button" className="group-action" onClick={() => { void continueStage() }} disabled={transitioning}><Icon name="Play" size={14} /> {transitioning ? 'Waiting for agents to stop…' : `Continue ${group.pausedPending?.length ? `${group.pausedPending.length} unfinished ${group.pausedPending.length === 1 ? 'agent' : 'agents'}` : 'stage'}`}</button>}
+        {fluidAdvancing && <span className="group-running" role="status" aria-live="polite"><span className="session-busy" /> Continuing safe analysis…</span>}
         {(running || transitioning) && <span className="group-running" role="status" aria-live="polite"><span className="session-busy" /> {transitioning ? 'Preparing safe transition' : phaseLabel[phase]}…</span>}
         {running && <button type="button" className="group-stop" onClick={() => { void pauseStage() }} title="Stop all unfinished Mesh agents and keep this checkpoint"><Icon name="Square" size={11} /> Stop</button>}
       </footer>
@@ -1096,20 +1132,20 @@ function GroupPair({
   active: boolean
   compact?: boolean
 }) {
-  return <section className={compact ? 'group-review' : 'group-results-wrap'}>
+  return <section className={`${compact ? 'group-review' : 'group-results-wrap'} group-stage`}>
     <h3>{title}</h3>
-    <div className={compact ? undefined : 'group-results'}>
+    <div className={compact ? 'group-messages' : 'group-results group-messages'}>
       {members.map((member) => {
         const busy = active && childThreads.find((thread) => thread.id === member.threadId)?.busy
         const status = statuses[member.threadId]
-        if (compact) return <article className="group-review-card" key={`${title}:${member.threadId}`}>
+        if (compact) return <article className="group-review-card group-message" key={`${title}:${member.threadId}`}>
           <ProviderIcon provider={member.agentKey} name={member.label} size={13} />
           <div className="group-review-copy">
             <header><strong>{member.label}</strong>{member.modelLabel && <small className="group-model-label truncate">{member.modelLabel}</small>}<span className="group-member-status" data-status={status}>{status}</span>{busy && <span className="session-busy" />}</header>
             <p>{values[member.threadId] || (active ? 'Working…' : 'No response recorded')}</p>
           </div>
         </article>
-        return <article className="group-result" key={`${title}:${member.threadId}`}>
+        return <article className="group-result group-message" key={`${title}:${member.threadId}`}>
           <header><ProviderIcon provider={member.agentKey} name={member.label} size={15} /><strong>{member.label}</strong>{member.modelLabel && <small className="group-model-label truncate">{member.modelLabel}</small>}<span className="group-member-status" data-status={status}>{status}</span>{busy && <span className="session-busy" />}</header>
           <p>{values[member.threadId] || (active ? 'Working…' : 'No response recorded')}</p>
         </article>

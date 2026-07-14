@@ -17,7 +17,7 @@ trap cleanup EXIT
 
 echo "Downloading Kaisola…"
 curl -fL --progress-bar -o "$tmp/Kaisola.dmg" \
-  "https://github.com/michaelofengend/kaisola/releases/latest/download/Kaisola.dmg"
+  "https://github.com/michaelofengenden/kaisola/releases/latest/download/Kaisola.dmg"
 
 echo "Installing to /Applications…"
 mnt=$(hdiutil attach "$tmp/Kaisola.dmg" -nobrowse -noautoopen -readonly | grep -o '/Volumes/.*' | tail -1)

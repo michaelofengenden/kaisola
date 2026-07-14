@@ -176,6 +176,18 @@ const SECTION_DESC: Record<SectionId, string> = {
   literature: 'Sources for the research corpus: PDF ingestion and citation lookups.',
   advanced: 'Disk-first renderer caching and editable JSON settings and keybindings.',
 }
+const SECTION_KEYWORDS: Record<SectionId, string> = {
+  general: 'appearance theme light dark system liquid glass eco energy update account',
+  interface: 'layout workspace panels sidebar tabs costs inbox diffs drafts wallpaper split',
+  terminal: 'shell font size weight family cursor background',
+  agents: 'provider cli acp codex claude custom connect login',
+  usage: 'subscription limits tokens windows account',
+  guardrails: 'autonomy permissions protected sensitive files approval rules',
+  models: 'api keys reasoning provider local openai anthropic model',
+  extensions: 'languages previews themes integrations plugins',
+  literature: 'pdf citations grobid openalex corpus sources',
+  advanced: 'renderer memory cache json keybindings hidden terminals',
+}
 
 const slug = (s: string) =>
   s.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 24) || 'agent'
@@ -203,7 +215,7 @@ const SETTINGS_DIALOG_STYLE = {
   maxHeight: 'none',
   margin: 0,
   border: 'none',
-  padding: '11vh 0 0',
+  padding: '7vh 0 0',
 } satisfies CSSProperties
 
 function SettingsToggle({ checked, onChange, label, title, disabled = false }: {
@@ -364,8 +376,10 @@ export function Settings() {
   const [agents, setAgents] = useState<AcpAgent[]>([])
   const [glass, setGlass] = useState<{ supported: boolean; active: boolean; enabled: boolean } | null>(null)
   const [section, setSection] = useState<SectionId>('general')
+  const [search, setSearch] = useState('')
   const nativeDialogRef = useRef<HTMLDialogElement>(null)
   const panelRef = useRef<HTMLDivElement>(null)
+  const searchRef = useRef<HTMLInputElement>(null)
   useEffect(() => {
     if (!open) return
     const dialog = nativeDialogRef.current
@@ -413,7 +427,7 @@ export function Settings() {
 
   useEffect(() => {
     if (!open) return
-    setKeyMsg(null); setKey(''); setOaMsg(null); setOaKey(''); setAdding(false)
+    setKeyMsg(null); setKey(''); setOaMsg(null); setOaKey(''); setAdding(false); setSearch('')
     const pane = useKaisola.getState().settingsPane
     setSection(SECTIONS.some((s) => s.id === pane) ? (pane as SectionId) : 'general')
     void refresh()
@@ -492,6 +506,21 @@ export function Settings() {
   const inMenu = new Set(menu.map((a) => a.id))
   const available = registry.filter((a) => !a.custom && !inMenu.has(a.id))
   const rules = permissionRules.filter((r) => r.workspace === workspacePath)
+  const normalizedSearch = search.trim().toLocaleLowerCase()
+  const matchingSections = SECTIONS.filter((candidate) => !normalizedSearch
+    || `${candidate.name} ${SECTION_DESC[candidate.id]} ${SECTION_KEYWORDS[candidate.id]}`.toLocaleLowerCase().includes(normalizedSearch))
+  const matchingIds = new Set(matchingSections.map((candidate) => candidate.id))
+  const chooseSection = (id: SectionId) => {
+    setSection(id)
+    useKaisola.getState().setSettingsOpen(true, id)
+  }
+  const updateSearch = (value: string) => {
+    setSearch(value)
+    const normalized = value.trim().toLocaleLowerCase()
+    if (!normalized) return
+    const first = SECTIONS.find((candidate) => `${candidate.name} ${SECTION_DESC[candidate.id]} ${SECTION_KEYWORDS[candidate.id]}`.toLocaleLowerCase().includes(normalized))
+    if (first) chooseSection(first.id)
+  }
 
   const agentRow = (a: RegistryAgent) => {
     const on = a.kind === 'acp' && isConnected(a.id)
@@ -546,17 +575,40 @@ export function Settings() {
         ref={panelRef}
         className="settings-panel-v2 settings-panel-v3"
         tabIndex={-1}
+        onKeyDown={(event) => {
+          if ((event.metaKey || event.ctrlKey) && event.key.toLocaleLowerCase() === 'f') {
+            event.preventDefault()
+            searchRef.current?.focus()
+          }
+        }}
       >
         <header className="settings-head">
           <Icon name="Settings" size={14} className="muted" />
-          <span className="grow" id="settings-title">Settings</span>
+          <span id="settings-title">Settings</span>
+          <label className="settings-search">
+            <Icon name="Search" size={12} />
+            <input
+              ref={searchRef}
+              value={search}
+              onChange={(event) => updateSearch(event.target.value)}
+              onKeyDown={(event) => { if (event.key === 'Escape' && search) { event.preventDefault(); setSearch('') } }}
+              placeholder="Search settings"
+              aria-label="Search settings"
+              spellCheck={false}
+            />
+            <kbd>⌘F</kbd>
+          </label>
+          <span className="grow" />
           <button type="button" className="btn-icon btn-sm" onClick={() => setOpen(false)} aria-label="Close"><Icon name="X" size={14} /></button>
         </header>
         <div className="settings-body-v3">
           <nav className="settings-nav" aria-label="Settings categories">
-            {SECTION_GROUPS.map((group) => <div className="settings-nav-group" key={group.name}>
+            {SECTION_GROUPS.map((group) => {
+              const ids = group.ids.filter((id) => matchingIds.has(id))
+              if (!ids.length) return null
+              return <div className="settings-nav-group" key={group.name}>
               <div className="settings-nav-group-label">{group.name}</div>
-              {group.ids.map((id) => {
+              {ids.map((id) => {
                 const s = SECTIONS.find((candidate) => candidate.id === id)!
                 return (
                 <button type="button"
@@ -565,14 +617,15 @@ export function Settings() {
                   data-active={section === s.id}
                   data-modal-autofocus={section === s.id ? true : undefined}
                   aria-current={section === s.id ? 'page' : undefined}
-                  onClick={() => setSection(s.id)}
+                  onClick={() => chooseSection(s.id)}
                 >
                   <Icon name={s.icon} size={14} />
                   <span className="truncate">{s.name}</span>
                 </button>
                 )
               })}
-            </div>)}
+            </div>})}
+            {matchingSections.length === 0 && <div className="settings-search-empty" role="status">No settings found</div>}
           </nav>
           <div className="settings-pane">
             <div className="settings-pane-head">
@@ -583,10 +636,16 @@ export function Settings() {
             {section === 'general' && (
               <>
                 <AppAccountRow />
-                <div className="settings-row">
-                  <span className="settings-row-label">Theme</span>
-                  <div className="settings-row-control">
-                    <Dropdown value={themeMode} options={[{ value: 'system', name: 'System' }, { value: 'light', name: 'Light' }, { value: 'dark', name: 'Dark' }]} onSelect={(v) => setThemeMode(v as ThemeMode)} align="right" title="System follows macOS appearance, including scheduled switches" ariaLabel="Theme" />
+                <div className="settings-choice-block">
+                  <div className="settings-choice-head"><span>Theme</span><small>System follows macOS appearance</small></div>
+                  <div className="settings-choice-grid" role="group" aria-label="Theme">
+                    {([
+                      { value: 'system', name: 'System', detail: 'Follow this Mac', icon: 'Monitor' },
+                      { value: 'light', name: 'Light', detail: 'Quiet paper', icon: 'Sun' },
+                      { value: 'dark', name: 'Dark', detail: 'Low-light ink', icon: 'Moon' },
+                    ] as const).map((choice) => <button type="button" key={choice.value} data-active={themeMode === choice.value || undefined} aria-pressed={themeMode === choice.value} onClick={() => setThemeMode(choice.value as ThemeMode)}>
+                      <Icon name={choice.icon} size={14} /><span><strong>{choice.name}</strong><small>{choice.detail}</small></span>
+                    </button>)}
                   </div>
                 </div>
                 {glass?.supported && (
@@ -605,9 +664,8 @@ export function Settings() {
                     </div>
                   </div>
                 )}
-                <div className="settings-row">
-                  <span className="settings-row-label">Appearance energy <span className="faint" style={{ fontWeight: 400 }}>· by GPU cost</span></span>
-                  <div className="settings-row-control">
+                <div className="settings-choice-block">
+                  <div className="settings-choice-head"><span>Appearance energy</span><small>Live Glass measured within 1% of Eco in the paired probe</small>
                     {windowModeMismatch && (
                       <button type="button"
                         className="settings-chip"
@@ -621,17 +679,14 @@ export function Settings() {
                         Apply now
                       </button>
                     )}
-                    <Dropdown
-                      ariaLabel="Appearance energy"
-                      value={perfMode}
-                      options={[
-                        { value: 'glass', name: 'Live Glass' },
-                        { value: 'eco', name: 'Eco saver' },
-                      ]}
-                      onSelect={(v) => setPerfMode(v as PerfMode)}
-                      align="right"
-                      title="Live Glass uses the native macOS material. Eco saver is pure white, opaque, still, and keeps hidden renderers on disk."
-                    />
+                  </div>
+                  <div className="settings-choice-grid settings-choice-grid-two" role="group" aria-label="Appearance energy">
+                    {([
+                      { value: 'glass', name: 'Live Glass', detail: 'Native chrome · fluid', icon: 'Sparkles' },
+                      { value: 'eco', name: 'Eco', detail: 'Opaque · lowest memory', icon: 'Leaf' },
+                    ] as const).map((choice) => <button type="button" key={choice.value} data-active={perfMode === choice.value || undefined} aria-pressed={perfMode === choice.value} onClick={() => setPerfMode(choice.value as PerfMode)}>
+                      <Icon name={choice.icon} size={14} /><span><strong>{choice.name}</strong><small>{choice.detail}</small></span>
+                    </button>)}
                   </div>
                 </div>
                 <p className="settings-note">Switching modes reopens only this window. Commands stay alive; projects, layouts, drafts, scrollback, and agent history rehydrate from disk.</p>
@@ -714,7 +769,7 @@ export function Settings() {
                   </div>
                 </details>
                 {([
-                  { label: 'Session cost chips', hint: 'what each Claude session cost', value: showCosts, set: setShowCosts, title: 'A quiet $ chip on Claude session cards — token totals on hover' },
+                  { label: 'Session cost chips', hint: 'what each agent session cost', value: showCosts, set: setShowCosts, title: 'A quiet $ chip on supported agent session cards — token totals on hover' },
                   { label: 'Cross-project inbox', hint: 'everything that needs you', value: inbox, set: setInbox, title: 'One bell in the tab strip rolling up waiting sessions and gates across every project tab' },
                   { label: 'Word-level diff highlights', hint: 'changed words light up', value: wordDiffs, set: setWordDiffs, title: 'Research diffs mark the exact words that changed, not just the lines' },
                   { label: 'Restore CLI drafts', hint: 'unsent text survives restarts', value: draftRestore, set: setDraftRestore, title: 'A draft typed into a CLI agent is retyped into the resumed session after a restart' },

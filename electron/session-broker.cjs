@@ -37,6 +37,7 @@ function readLaunch() {
 }
 
 const config = readLaunch()
+const smoke = config.smoke === true
 process.umask(0o077)
 mgr.configureStorage(config.storageDir)
 
@@ -67,6 +68,7 @@ function tokenMatches(candidate) {
 const clients = new Map() // app instance id -> authenticated socket record
 let noClientTimer = null
 let shuttingDown = false
+let everConnected = false
 
 function send(socket, frame) {
   if (!socket || socket.destroyed) return
@@ -102,6 +104,14 @@ function clearNoClientTimer() {
 
 function scheduleNoClientExit() {
   clearNoClientTimer()
+  // Probe brokers must never outlive a crashed or abruptly-exited harness.
+  // Production deliberately preserves live PTYs across UI restarts; the
+  // authenticated launch flag makes this stricter teardown test-only.
+  if (smoke && everConnected && clients.size === 0) {
+    noClientTimer = setTimeout(() => gracefulExit(true), 250)
+    noClientTimer.unref?.()
+    return
+  }
   // Connected Electron main must not pin an otherwise empty ~60 MB helper.
   // A later terminal request transparently starts/adopts a broker again.
   // Dead-but-unreleased records still carry a snapshot, so wait for release.
@@ -301,6 +311,7 @@ function handleLine(client, line) {
     if (prior && prior.socket !== client.socket) prior.socket.destroy()
     client.instanceId = instanceId
     client.authenticated = true
+    everConnected = true
     clients.set(instanceId, client)
     clearNoClientTimer()
     send(client.socket, { type: 'hello', ok: true, protocol: PROTOCOL, securityEpoch: SECURITY_EPOCH, pid: process.pid, startedAt: config.startedAt, version: config.version })

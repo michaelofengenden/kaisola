@@ -153,6 +153,10 @@ export interface GroupSessionMember {
 export interface GroupSessionState {
   members: GroupSessionMember[]
   phase: GroupSessionPhase
+  /** Fluid advances read-only analysis stages automatically. Guided pauses at
+   * every stage boundary. Repository-mutating worktree and merge gates remain
+   * explicit in both modes. */
+  flow?: 'fluid' | 'guided'
   task?: string
   /** Stage-start timestamps used to isolate responses in rolling child runtimes. */
   baselines?: Record<string, number>
@@ -1237,7 +1241,7 @@ interface KaisolaState {
   removeQueuedAssistantPrompt: (id: string, promptId: string, projectId?: string) => void
   reorderAssistantThreads: (srcId: string, destId: string) => void
   setThreadBusy: (id: string, busy: boolean, projectId?: string) => void
-  /** `pane` deep-links a Settings section (e.g. 'agents') — cleared on close. */
+  /** `pane` deep-links a Settings section (e.g. 'agents'); the last section is remembered on close. */
   setSettingsOpen: (open: boolean, pane?: string) => void
   setAgentPreset: (id: string) => void
   setWorkspace: (path: string | null) => void
@@ -1765,6 +1769,22 @@ let omniSeqCounter = 0
 function gridState(grid: string[][], extra: object = {}) {
   const g = grid.filter((col) => col.length)
   return { dockGrid: g, dockViews: g.flat(), ...extra }
+}
+/** Focus a session in the primary card without destroying intentional splits.
+ * Opening and splitting are separate actions: ordinary opens replace the
+ * first visible card; `addDockSplit` is the only additive path. */
+function focusedDockState(
+  s: Pick<KaisolaState, 'dockGrid' | 'dockViews'>,
+  id: string,
+  extra: object = {},
+) {
+  if (s.dockViews.includes(id)) return { dockOpen: true, ...extra }
+  const primary = s.dockViews[0]
+  if (!primary) return gridState([[id]], { dockOpen: true, ...extra })
+  return gridState(
+    s.dockGrid.map((column) => column.map((value) => value === primary ? id : value)),
+    { dockOpen: true, ...extra },
+  )
 }
 /** A grid with every occurrence of `id` removed (empty columns dropped). */
 const gridWithout = (grid: string[][], id: string) =>
@@ -2622,8 +2642,9 @@ export const useKaisola = create<KaisolaState>()(
       if (focus) return gridState([[focus]], { dockOpen: true, layoutMode: 'studio' })
       return visibleDockState(s, { layoutMode: 'studio' })
     }),
-  // showing a session never tears down the layout you built — an unopened
-  // session joins as a new card on the right. Viewing clears its amber dot.
+  // An ordinary open focuses the primary card; the explicit split affordance
+  // below is the only way to add another simultaneous pane. Viewing clears
+  // the session's amber dot.
   setDockView: (id) =>
     poppedTerms.has(id)
       ? void bridge.windows?.pop?.(id, undefined, undefined, terminalOwnerMap(get())[id] ?? get().activeProjectId)
@@ -2632,7 +2653,7 @@ export const useKaisola = create<KaisolaState>()(
       delete needsYou[id]
       return s.dockViews.includes(id)
         ? { dockOpen: true, needsYou }
-        : gridState([...s.dockGrid, [id]], { dockOpen: true, needsYou })
+        : focusedDockState(s, id, { needsYou })
         }),
   addDockSplit: (id) =>
     poppedTerms.has(id)
@@ -2640,9 +2661,15 @@ export const useKaisola = create<KaisolaState>()(
       : set((s) => {
       const needsYou = { ...s.needsYou }
       delete needsYou[id]
-      return s.dockViews.includes(id)
-        ? { dockOpen: true, needsYou }
-        : gridState([...s.dockGrid, [id]], { dockOpen: true, needsYou })
+      if (s.dockViews.includes(id)) return { dockOpen: true, needsYou }
+      // The one-click split affordance protects readable width: two columns
+      // maximum, then additional explicitly-opened sessions stack in the
+      // shorter column. Dragging a card edge remains the advanced escape hatch.
+      if (s.dockGrid.length < 2) return gridState([...s.dockGrid, [id]], { dockOpen: true, needsYou })
+      const next = s.dockGrid.map((column) => [...column])
+      const target = next.reduce((best, column, index) => column.length < next[best].length ? index : best, 0)
+      next[target].push(id)
+      return gridState(next, { dockOpen: true, needsYou })
         }),
   removeDockView: (id) =>
     set((s) => {
@@ -2789,7 +2816,6 @@ export const useKaisola = create<KaisolaState>()(
       if (existing) {
         const adopted = existing === defaultTerminal
         const boot = opts?.restart && command ? command : existing.boot
-        const grid = s.dockViews.includes(existing.id) ? s.dockGrid : [...s.dockGrid, [existing.id]]
         return {
           terminals: s.terminals.map((t) =>
             t.id === existing.id
@@ -2811,7 +2837,7 @@ export const useKaisola = create<KaisolaState>()(
                 }
               : t,
           ),
-          ...(reveal ? gridState(grid, { dockOpen: true }) : {}),
+          ...(reveal ? focusedDockState(s, existing.id) : {}),
         }
       }
       const id = uid('term')
@@ -2828,7 +2854,7 @@ export const useKaisola = create<KaisolaState>()(
           name: opts?.name,
           autoName,
         }],
-        ...(reveal ? gridState([...s.dockGrid, [id]], { dockOpen: true }) : {}),
+        ...(reveal ? focusedDockState(s, id) : {}),
       }
     }),
   clearBootPending: (id) =>
@@ -3057,19 +3083,17 @@ export const useKaisola = create<KaisolaState>()(
   openGitPanel: () =>
     set((s) => {
       const id = 'panel-git'
-      const grid = s.dockViews.includes(id) ? s.dockGrid : [...s.dockGrid, [id]]
       return {
         panels: s.panels.some((p) => p.id === id) ? s.panels : [...s.panels, { id, kind: 'git' as const }],
-        ...gridState(grid, { dockOpen: true }),
+        ...focusedDockState(s, id),
       }
     }),
   openLedgerPanel: () =>
     set((s) => {
       const id = 'panel-ledger'
-      const grid = s.dockViews.includes(id) ? s.dockGrid : [...s.dockGrid, [id]]
       return {
         panels: s.panels.some((p) => p.id === id) ? s.panels : [...s.panels, { id, kind: 'ledger' as const }],
-        ...gridState(grid, { dockOpen: true }),
+        ...focusedDockState(s, id),
       }
     }),
   openBrowserPanel: (url) =>
@@ -3080,16 +3104,15 @@ export const useKaisola = create<KaisolaState>()(
       // preview refreshes in place) instead of stacking near-identical browsers
       const existing = target ? s.panels.find((p) => p.kind === 'browser' && origin(p.url) === target) : undefined
       if (existing) {
-        const grid = s.dockViews.includes(existing.id) ? s.dockGrid : [...s.dockGrid, [existing.id]]
         return {
           panels: s.panels.map((p) => (p.id === existing.id ? { ...p, url: url ?? p.url, seq: (p.seq ?? 0) + 1 } : p)),
-          ...gridState(grid, { dockOpen: true }),
+          ...focusedDockState(s, existing.id),
         }
       }
       const id = uid('web')
       return {
         panels: [...s.panels, { id, kind: 'browser' as const, url }],
-        ...gridState([...s.dockGrid, [id]], { dockOpen: true }),
+        ...focusedDockState(s, id),
       }
     }),
   closePanel: (id, projectId) => {
@@ -3212,7 +3235,7 @@ export const useKaisola = create<KaisolaState>()(
         if (s.assistantThreads.some((thread) => thread.id === top.thread!.id)) {
           return {
             closedStack: rest,
-            ...gridState(s.dockViews.includes(top.thread.id) ? s.dockGrid : [...s.dockGrid, [top.thread.id]], { dockOpen: true }),
+            ...focusedDockState(s, top.thread.id),
           }
         }
         const groupThreads = top.groupThreads.map((thread) => ({ ...thread, busy: false, queuePaused: true }))
@@ -3223,7 +3246,7 @@ export const useKaisola = create<KaisolaState>()(
           assistantDrafts: { ...s.assistantDrafts, ...(top.groupDrafts ?? {}) },
           assistantPromptQueues: { ...s.assistantPromptQueues, ...(top.groupPromptQueues ?? {}) },
           activeThreadId: top.thread.id,
-          ...gridState([...s.dockGrid, [top.thread.id]], { dockOpen: true }),
+          ...focusedDockState(s, top.thread.id),
         }
       }
       if (top.kind === 'term' && top.term) {
@@ -3237,7 +3260,7 @@ export const useKaisola = create<KaisolaState>()(
           const focus = dupe?.id ?? top.term.id
           return {
             closedStack: rest,
-            ...gridState(s.dockViews.includes(focus) ? s.dockGrid : [...s.dockGrid, [focus]], { dockOpen: true }),
+            ...focusedDockState(s, focus),
           }
         }
         // within the grace window the pty is still alive — the remounting
@@ -3245,7 +3268,7 @@ export const useKaisola = create<KaisolaState>()(
         return {
           closedStack: rest,
           terminals: [...s.terminals, top.term],
-          ...gridState([...s.dockGrid, [top.term.id]], { dockOpen: true }),
+          ...focusedDockState(s, top.term.id),
         }
       }
       if (top.kind === 'thread' && top.thread) {
@@ -3263,7 +3286,7 @@ export const useKaisola = create<KaisolaState>()(
             ? { ...s.assistantPromptQueues, [top.thread.id]: top.promptQueue }
             : s.assistantPromptQueues,
           activeThreadId: top.thread.id,
-          ...gridState([...s.dockGrid, [top.thread.id]], { dockOpen: true }),
+          ...focusedDockState(s, top.thread.id),
         }
       }
       if (top.kind === 'panel' && top.panel) {
@@ -3272,13 +3295,13 @@ export const useKaisola = create<KaisolaState>()(
         if (s.panels.some((p) => p.id === top.panel!.id)) {
           return {
             closedStack: rest,
-            ...gridState(s.dockViews.includes(top.panel.id) ? s.dockGrid : [...s.dockGrid, [top.panel.id]], { dockOpen: true }),
+            ...focusedDockState(s, top.panel.id),
           }
         }
         return {
           closedStack: rest,
           panels: [...s.panels, top.panel],
-          ...gridState([...s.dockGrid, [top.panel.id]], { dockOpen: true }),
+          ...focusedDockState(s, top.panel.id),
         }
       }
       return { closedStack: rest }
@@ -3393,7 +3416,7 @@ export const useKaisola = create<KaisolaState>()(
       set((st) => ({
         assistantThreads: [...st.assistantThreads, { id, agentKey: agent, busy: false, cwd: r.path }],
         activeThreadId: id,
-        ...gridState([...st.dockGrid, [id]], { dockOpen: true }),
+        ...focusedDockState(st, id),
       }))
     }
     queueMicrotask(() => {
@@ -3470,15 +3493,15 @@ export const useKaisola = create<KaisolaState>()(
     }),
   openSignIn: (payload) => set({ signIn: payload }),
   closeSignIn: () => set({ signIn: null }),
-  // every new agent gets its OWN card beside the current ones — add as many
-  // as you want from the rail's +
+  // New sessions focus the primary card. They remain live in the session rail;
+  // the adjacent split button is the deliberate side-by-side action.
   requestNewThread: (agentKey) =>
     set((s) => {
       const id = uid('thr')
       return {
         assistantThreads: [...s.assistantThreads, { id, agentKey: agentKey ?? s.agentPreset, busy: false }],
         activeThreadId: id,
-        ...gridState([...s.dockGrid, [id]], { dockOpen: true }),
+        ...focusedDockState(s, id),
       }
     }),
   requestNewGroup: () =>
@@ -3493,7 +3516,7 @@ export const useKaisola = create<KaisolaState>()(
       return {
         assistantThreads: [
           ...s.assistantThreads,
-          { id, agentKey: 'group', name: 'Kaisola Mesh', busy: false, group: { members, phase: 'idle' } },
+          { id, agentKey: 'group', name: 'Mesh', busy: false, group: { members, phase: 'idle', flow: 'fluid' } },
           ...members.map((member) => ({
             id: member.threadId,
             agentKey: member.agentKey,
@@ -3503,7 +3526,7 @@ export const useKaisola = create<KaisolaState>()(
           })),
         ],
         activeThreadId: id,
-        ...gridState([...s.dockGrid, [id]], { dockOpen: true }),
+        ...focusedDockState(s, id),
       }
     }),
   addGroupMember: (id, agentKey, label, projectId) => {
@@ -3635,7 +3658,7 @@ export const useKaisola = create<KaisolaState>()(
         activeThreadId: id,
         assistantThreads: s.assistantThreads.map((thread) => thread.id === id ? { ...thread, lastViewedAt: Date.now() } : thread),
         needsYou,
-        ...(s.dockViews.includes(id) ? { dockOpen: true } : gridState([...s.dockGrid, [id]], { dockOpen: true })),
+        ...focusedDockState(s, id),
       }
     }),
   // closing the LAST chat thread is allowed — this is a terminal-first shell,
@@ -4139,7 +4162,12 @@ export const useKaisola = create<KaisolaState>()(
     const pid = projectId ?? get().activeProjectId
     get().patchProject(pid, (sl) => ({ assistantThreads: sl.assistantThreads.map((t) => (t.id === id ? { ...t, busy, lastActivityAt: Date.now() } : t)) }))
   },
-  setSettingsOpen: (open, pane) => set({ settingsOpen: open, settingsPane: open ? pane ?? null : null }),
+  // Remember the last pane across closes; opening without a destination
+  // returns to it, while contextual links can still jump to a named pane.
+  setSettingsOpen: (open, pane) => set((s) => ({
+    settingsOpen: open,
+    settingsPane: pane ?? s.settingsPane,
+  })),
   setAgentPreset: (id) => set({ agentPreset: id }),
   setWorkspace: (path) => {
     const current = get().workspacePath

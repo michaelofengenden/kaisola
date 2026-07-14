@@ -265,9 +265,14 @@ export function ProjectTabs() {
   )
 }
 
-type ViewTransitionDocument = Document & {
-  startViewTransition?: (update: () => void) => { finished: Promise<unknown> }
+type PanelViewTransition = {
+  finished: Promise<unknown>
+  skipTransition?: () => void
 }
+type ViewTransitionDocument = Document & {
+  startViewTransition?: (update: () => void) => PanelViewTransition
+}
+let activePanelTransition: PanelViewTransition | null = null
 
 const runViewTransition = (kind: string, update: () => void) => {
   const doc = document as ViewTransitionDocument
@@ -276,9 +281,35 @@ const runViewTransition = (kind: string, update: () => void) => {
     update()
     return
   }
+  // Panel buttons are intentionally fast to click. Chromium can still be
+  // animating the previous tree/preview transition when the inverse action
+  // arrives; finish that paint immediately so the newer state change is never
+  // dropped behind an in-flight snapshot.
+  if (activePanelTransition) {
+    activePanelTransition.skipTransition?.()
+    activePanelTransition = null
+    delete document.documentElement.dataset.panelTransition
+    update()
+    return
+  }
   document.documentElement.dataset.panelTransition = kind
-  const view = doc.startViewTransition(update)
+  let updated = false
+  const applyOnce = () => {
+    if (updated) return
+    updated = true
+    update()
+  }
+  let view: PanelViewTransition
+  try {
+    view = doc.startViewTransition(applyOnce)
+    activePanelTransition = view
+  } catch {
+    applyOnce()
+    delete document.documentElement.dataset.panelTransition
+    return
+  }
   const clearTransition = () => {
+    if (activePanelTransition === view) activePanelTransition = null
     if (document.documentElement.dataset.panelTransition === kind) delete document.documentElement.dataset.panelTransition
   }
   // A superseding navigation can reject `finished`; cleanup should be the

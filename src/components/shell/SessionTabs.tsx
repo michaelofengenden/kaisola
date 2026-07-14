@@ -1,4 +1,4 @@
-import { useCallback, useRef, useState, type CSSProperties, type MouseEvent as ReactMouseEvent } from 'react'
+import { useCallback, useRef, useState, type CSSProperties, type PointerEvent as ReactPointerEvent } from 'react'
 import { useKaisola, sessionOrderIds } from '../../store/store'
 import { bridge } from '../../lib/bridge'
 import { sessionHue, terminalAgentKey } from '../../lib/sessionHue'
@@ -33,7 +33,7 @@ interface STab {
  * to rename, × (or middle-click) to close. The "+" session menu lives at the
  * end of the strip, Chrome's new-tab position.
  */
-export function SessionTabs({ orientation = 'horizontal' }: { orientation?: 'horizontal' | 'vertical' }) {
+export function SessionTabs({ orientation = 'horizontal', filter = '' }: { orientation?: 'horizontal' | 'vertical'; filter?: string }) {
   const threads = useKaisola((s) => s.assistantThreads)
   const terminals = useKaisola((s) => s.terminals)
   const agentTerminals = useKaisola((s) => s.agentTerminals)
@@ -87,7 +87,7 @@ export function SessionTabs({ orientation = 'horizontal' }: { orientation?: 'hor
   // right-click a tab → the session menu (pin, template, groups, worktree) —
   // this strip is the ONLY session list now, so it owns what the rail used to
   const [menu, setMenu] = useState<{ x: number; y: number; id: string } | null>(null)
-  const menuTriggerRef = useRef<HTMLElement>(null)
+  const menuTriggerRef = useRef<HTMLElement | null>(null)
   const menuRef = useRef<HTMLDivElement>(null)
   const closeMenu = useCallback(() => setMenu(null), [])
   useClickAway(!!menu, closeMenu, menuTriggerRef, menuRef)
@@ -275,10 +275,14 @@ export function SessionTabs({ orientation = 'horizontal' }: { orientation?: 'hor
 
   const menuTab = menu ? tabs.get(menu.id) : undefined
   const menuPorts = menu ? terminalMeta[menu.id]?.ports ?? [] : []
+  const normalizedFilter = filter.trim().toLocaleLowerCase()
   const orderedTabs = order.flatMap((id) => {
     const tab = tabs.get(id)
-    return tab ? [tab] : []
+    if (!tab) return []
+    if (normalizedFilter && !`${tab.label} ${tab.title ?? ''} ${tab.kind}`.toLocaleLowerCase().includes(normalizedFilter)) return []
+    return [tab]
   })
+  const activeVisible = orderedTabs.some((tab) => dockViewIds.has(tab.id))
 
   return (
     <div
@@ -288,7 +292,7 @@ export function SessionTabs({ orientation = 'horizontal' }: { orientation?: 'hor
       aria-label={`${projectLabel} sessions`}
       data-orientation={orientation}
       data-project-id={activeProjectId}
-      data-single={order.length === 1 || undefined}
+      data-single={orderedTabs.length === 1 || undefined}
       style={{ '--project-hue': projectHue } as CSSProperties}
     >
       <span className="stabs-project-anchor" aria-hidden="true" title={`${projectLabel} sessions`}>
@@ -297,7 +301,7 @@ export function SessionTabs({ orientation = 'horizontal' }: { orientation?: 'hor
       <div className="stabs-track">
         {orderedTabs.map((t, index) => {
             const active = dockOpen && dockViewIds.has(t.id)
-            const focusable = dockViews[dockViews.length - 1] === t.id || (!dockViews.length && index === 0)
+            const focusable = dockViews[dockViews.length - 1] === t.id || (!activeVisible && index === 0)
             return (
               <div
                 key={t.id}
@@ -335,7 +339,12 @@ export function SessionTabs({ orientation = 'horizontal' }: { orientation?: 'hor
                       onClick={() => switchSession(t.id)}
                       onMouseDown={(e) => { if (e.button === 1) e.preventDefault() }}
                       onAuxClick={(e) => { if (e.button === 1 && t.closable) { e.preventDefault(); closeTab(t) } }}
-                      onContextMenu={(e) => { e.preventDefault(); e.stopPropagation(); setMenu({ x: e.clientX, y: e.clientY, id: t.id }) }}
+                      onContextMenu={(e) => {
+                        e.preventDefault()
+                        e.stopPropagation()
+                        menuTriggerRef.current = e.currentTarget
+                        setMenu({ x: e.clientX, y: e.clientY, id: t.id })
+                      }}
                       onKeyDown={(e) => {
                         const backward = orientation === 'vertical' ? 'ArrowUp' : 'ArrowLeft'
                         const forward = orientation === 'vertical' ? 'ArrowDown' : 'ArrowRight'
@@ -395,6 +404,9 @@ export function SessionTabs({ orientation = 'horizontal' }: { orientation?: 'hor
               </div>
             )
           })}
+        {orientation === 'vertical' && normalizedFilter && orderedTabs.length === 0 && (
+          <div className="session-filter-empty" role="status">No matching sessions</div>
+        )}
       </div>
       <NewSessionButton orientation={orientation} />
       {orientation === 'horizontal' && (
@@ -503,20 +515,25 @@ export function SessionTabs({ orientation = 'horizontal' }: { orientation?: 'hor
 export function SessionSidebar() {
   const setTabLayout = useKaisola((s) => s.setTabLayout)
   const setSessionRailWidth = useKaisola((s) => s.setSessionRailWidth)
-  const startResize = (event: ReactMouseEvent<HTMLDivElement>) => {
+  const [filter, setFilter] = useState('')
+  const startResize = (event: ReactPointerEvent<HTMLDivElement>) => {
     event.preventDefault()
+    const handle = event.currentTarget
+    handle.setPointerCapture(event.pointerId)
     document.body.setAttribute('data-shell-drag', '1')
-    const sidebar = event.currentTarget.parentElement
+    const sidebar = handle.parentElement
     const startX = event.clientX
     const startWidth = sidebar?.getBoundingClientRect().width ?? 188
-    const onMove = (move: MouseEvent) => setSessionRailWidth(startWidth + move.clientX - startX)
+    const onMove = (move: PointerEvent) => setSessionRailWidth(startWidth + move.clientX - startX)
     const onUp = () => {
       document.body.removeAttribute('data-shell-drag')
-      window.removeEventListener('mousemove', onMove)
-      window.removeEventListener('mouseup', onUp)
+      handle.removeEventListener('pointermove', onMove)
+      handle.removeEventListener('pointerup', onUp)
+      handle.removeEventListener('pointercancel', onUp)
     }
-    window.addEventListener('mousemove', onMove)
-    window.addEventListener('mouseup', onUp)
+    handle.addEventListener('pointermove', onMove)
+    handle.addEventListener('pointerup', onUp)
+    handle.addEventListener('pointercancel', onUp)
   }
   return (
     <aside className="session-sidebar" aria-label="Session sidebar">
@@ -526,11 +543,23 @@ export function SessionSidebar() {
           <Icon name="PanelTop" size={13} />
         </button>
       </div>
-      <SessionTabs orientation="vertical" />
+      <label className="session-filter">
+        <Icon name="Search" size={12} />
+        <input
+          value={filter}
+          onChange={(event) => setFilter(event.target.value)}
+          onKeyDown={(event) => { if (event.key === 'Escape') { event.preventDefault(); setFilter('') } }}
+          placeholder="Filter sessions"
+          aria-label="Filter sessions"
+          spellCheck={false}
+        />
+        {filter && <button type="button" onClick={() => setFilter('')} aria-label="Clear session filter" title="Clear"><Icon name="X" size={11} /></button>}
+      </label>
+      <SessionTabs orientation="vertical" filter={filter} />
       <ShellSidebarFooter />
       <div
         className="session-sidebar-resize"
-        onMouseDown={startResize}
+        onPointerDown={startResize}
         onDoubleClick={() => setSessionRailWidth(null)}
         onKeyDown={(event) => {
           if (event.key === 'Home') { event.preventDefault(); setSessionRailWidth(null); return }
@@ -603,7 +632,7 @@ function NewSessionButton({ orientation }: { orientation: 'horizontal' | 'vertic
         { value: 'terminal', name: 'New terminal' },
         ...(codex ? [{ value: `agent:${codex.id}`, name: codex.name }] : []),
         ...(claude ? [{ value: `agent:${claude.id}`, name: claude.name }] : []),
-        { value: 'group', name: 'Kaisola Mesh' },
+        { value: 'group', name: 'Mesh', description: 'A coordinated agent group with explicit write gates' },
         ...otherAgents.map((a) => ({ value: `agent:${a.id}`, name: a.name })),
         ...sessionTemplates.map((t) => ({ value: `tpl:${t.id}`, name: `▸ ${t.name}` })),
         { value: 'worktree', name: 'Agent in a worktree' },

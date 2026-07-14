@@ -12,7 +12,7 @@ artifact and deploys it. No build step, no branch juggling.
 
 - **Domain**: `kaisola.com`, registered at Spaceship (Spaceship nameservers).
   DNS is set in the Spaceship dashboard: the four Pages `A` records on the apex
-  (`185.199.108.153` … `.111`) and `CNAME www → michaelofengend.github.io`.
+  (`185.199.108.153` … `.111`) and `CNAME www → michaelofengenden.github.io`.
 - **HTTPS**: enforced; cert managed by GitHub.
 - The custom domain lives in the repo's Pages settings (the `CNAME` file here is
   a belt-and-suspenders copy).

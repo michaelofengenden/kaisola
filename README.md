@@ -11,8 +11,8 @@
 
 <p align="center">
   <a href="https://kaisola.com">Website</a> ·
-  <a href="https://github.com/michaelofengend/kaisola/releases/latest/download/Kaisola.dmg">Download for macOS</a> ·
-  <a href="https://github.com/michaelofengend/kaisola/releases">Releases</a> ·
+  <a href="https://github.com/michaelofengenden/kaisola/releases/latest/download/Kaisola.dmg">Download for macOS</a> ·
+  <a href="https://github.com/michaelofengenden/kaisola/releases">Releases</a> ·
   <a href="docs/">Docs</a>
 </p>
 
@@ -84,7 +84,7 @@ flow and configuration boundaries.
 
 ## Install
 
-Download [Kaisola.dmg](https://github.com/michaelofengend/kaisola/releases/latest/download/Kaisola.dmg)
+Download [Kaisola.dmg](https://github.com/michaelofengenden/kaisola/releases/latest/download/Kaisola.dmg)
 and drag Kaisola to Applications, or install the latest release from the
 terminal:
 

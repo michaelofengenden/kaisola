@@ -378,7 +378,7 @@ kbd,
   }
 }
 
-/* ── Aurora wash — one ambient, slow gradient behind a "loading" moment ──── */
+/* ── Static loading wash — no live blur layer or full-surface repaint ────── */
 .aurora { position: relative; overflow: hidden; }
 .aurora > * { position: relative; z-index: 1; }
 .aurora::before {
@@ -388,10 +388,7 @@ kbd,
   background:
     radial-gradient(42% 42% at 28% 32%, color-mix(in oklch, var(--accent), transparent 45%), transparent 60%),
     radial-gradient(44% 40% at 72% 74%, color-mix(in oklch, var(--accent) 72%, var(--info)), transparent 62%);
-  filter: blur(64px) saturate(1.05);
-  opacity: 0.4;
-  background-size: 200% 200%;
-  animation: aurora-drift 22s var(--ease-in-out) infinite alternate;
+  opacity: 0.28;
 }
 
 /* ── Toaster — ephemeral event notifications (bottom-right, calm) ─────────── */

@@ -108,31 +108,38 @@ export function SessionCards() {
 
   // drag the divider between column i and i+1 — pure weight transfer, so the
   // other columns keep their size
-  const startColResize = (e: React.MouseEvent, i: number) => {
+  const startColResize = (e: React.PointerEvent<HTMLDivElement>, i: number) => {
     e.preventDefault()
     const el = gridRef.current
     if (!el) return
+    const handle = e.currentTarget
+    handle.setPointerCapture(e.pointerId)
     shellDrag.start()
     const total = weights.reduce((a, b) => a + b, 0)
-    const pxPerWeight = el.getBoundingClientRect().width / total
+    const gridWidth = el.getBoundingClientRect().width
+    const pxPerWeight = gridWidth / total
+    const pairTotal = weights[i] + weights[i + 1]
+    const minWeight = Math.min(pairTotal / 2, Math.max(0.2, 280 / Math.max(1, pxPerWeight)))
     const startX = e.clientX
     const left0 = weights[i]
     const right0 = weights[i + 1]
-    const onMove = (ev: MouseEvent) => {
+    const onMove = (ev: PointerEvent) => {
       const d = (ev.clientX - startX) / pxPerWeight
       const next = [...weights]
-      const shift = Math.max(-(left0 - 0.2), Math.min(right0 - 0.2, d))
+      const shift = Math.max(-(left0 - minWeight), Math.min(right0 - minWeight, d))
       next[i] = left0 + shift
       next[i + 1] = right0 - shift
       setDockColWeights(next)
     }
     const onUp = () => {
       shellDrag.end()
-      window.removeEventListener('mousemove', onMove)
-      window.removeEventListener('mouseup', onUp)
+      handle.removeEventListener('pointermove', onMove)
+      handle.removeEventListener('pointerup', onUp)
+      handle.removeEventListener('pointercancel', onUp)
     }
-    window.addEventListener('mousemove', onMove)
-    window.addEventListener('mouseup', onUp)
+    handle.addEventListener('pointermove', onMove)
+    handle.addEventListener('pointerup', onUp)
+    handle.addEventListener('pointercancel', onUp)
   }
 
   // identity chrome earns its pixels only under AMBIGUITY: when every session
@@ -294,7 +301,7 @@ export function SessionCards() {
           key={`colgrip-${i}`}
           className="grid-col-resize"
           style={{ left: `${frac * 100}%` }}
-          onMouseDown={(e) => startColResize(e, i)}
+          onPointerDown={(e) => startColResize(e, i)}
           onDoubleClick={() => setDockColWeights(null)}
           onKeyDown={(event) => {
             if (event.key === 'Home') { event.preventDefault(); setDockColWeights(null); return }
@@ -302,7 +309,9 @@ export function SessionCards() {
             event.preventDefault()
             const next = [...weights]
             const delta = event.key === 'ArrowLeft' ? -0.1 : 0.1
-            const shift = Math.max(-(next[i] - 0.2), Math.min(next[i + 1] - 0.2, delta))
+            const pxPerWeight = (gridRef.current?.getBoundingClientRect().width ?? 1) / Math.max(0.01, next.reduce((sum, value) => sum + value, 0))
+            const minWeight = Math.min((next[i] + next[i + 1]) / 2, Math.max(0.2, 280 / Math.max(1, pxPerWeight)))
+            const shift = Math.max(-(next[i] - minWeight), Math.min(next[i + 1] - minWeight, delta))
             next[i] += shift
             next[i + 1] -= shift
             setDockColWeights(next)

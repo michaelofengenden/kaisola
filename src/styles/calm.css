@@ -76,8 +76,7 @@
   position: sticky;
   top: 0;
   z-index: var(--z-sticky);
-  background: color-mix(in srgb, var(--bg-1) 90%, transparent);
-  backdrop-filter: blur(8px);
+  background: color-mix(in srgb, var(--bg-1) 97%, var(--bg-0));
   flex-shrink: 0;
 }
 .wb-tab {
@@ -778,10 +777,8 @@
   scrollbar-width: none;
   border: 1px solid color-mix(in srgb, var(--border) 76%, transparent);
   border-radius: var(--r-4);
-  background: color-mix(in srgb, var(--bg-1) 90%, transparent);
+  background: color-mix(in srgb, var(--bg-1) 97%, var(--bg-0));
   box-shadow: var(--shadow-1);
-  backdrop-filter: blur(16px) saturate(1.1);
-  -webkit-backdrop-filter: blur(16px) saturate(1.1);
   cursor: default;
   -webkit-app-region: no-drag;
 }
@@ -1503,7 +1500,6 @@ a.tag-quiet:hover {
   inset: 0;
   z-index: var(--z-palette);
   background: rgba(0, 0, 0, 0.45);
-  backdrop-filter: blur(3px);
   display: flex;
   align-items: flex-start;
   justify-content: center;

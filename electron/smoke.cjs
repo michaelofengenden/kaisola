@@ -1764,8 +1764,9 @@ a^2 + b^2 = c^2
   })()`)
   console.log('LAYOUT=' + JSON.stringify(layout))
 
-  // 13b) the session-card GRID — new sessions join as their own card (no cap),
-  //      and a card can be placed below/above/beside another (drag-to-place).
+  // 13b) the session-card GRID — ordinary navigation focuses one readable
+  //      card; the explicit split control can arrange more, with two columns
+  //      maximum and additional sessions stacked in the shorter column.
   const splits = await win.webContents.executeJavaScript(`(async () => {
     const get = () => window.__kaisola.getState()
     const shown = () => document.querySelectorAll('.session-card[data-show="true"]').length
@@ -1775,10 +1776,13 @@ a^2 + b^2 = c^2
     for (const v of get().dockViews.filter((x) => x !== a1)) get().removeDockView(v)
     await new Promise((r) => setTimeout(r, 150))
     const one = get().dockViews.length === 1 && shown() === 1
-    get().requestTerminal() // a new terminal joins BESIDE — it never replaces
+    get().requestTerminal() // an ordinary new session becomes the focused card
     await new Promise((r) => setTimeout(r, 150))
     const tNew = get().terminals[get().terminals.length - 1].id
-    const appended = get().dockViews.length === 2 && shown() === 2
+    const focusesByDefault = get().dockViews.length === 1 && get().dockViews[0] === tNew && shown() === 1
+    get().addDockSplit(a1)
+    await new Promise((r) => setTimeout(r, 120))
+    const explicitSplit = get().dockViews.length === 2 && get().dockGrid.length === 2 && shown() === 2
     const heads = document.querySelectorAll('.pane-head').length === 2
     // place the terminal BELOW the chat — one column, stacked
     get().placeDockView(tNew, a1, 'bottom')
@@ -1790,17 +1794,23 @@ a^2 + b^2 = c^2
     await new Promise((r) => setTimeout(r, 120))
     const g2 = get().dockGrid
     const besides = g2.length === 2 && g2[0][0] === a1 && g2[1][0] === tNew
-    // a third and fourth card both appear — no 3-card cap
-    get().addDockSplit(get().terminals[0].id)
+    // A new thread focuses again; explicit additions can still expose four
+    // sessions, bounded to a readable two-column grid.
     get().requestNewThread()
+    const newest = get().activeThreadId
+    const oldTerminal = get().terminals.find((terminal) => terminal.id !== tNew)?.id
+    get().addDockSplit(a1)
+    get().addDockSplit(tNew)
+    if (oldTerminal) get().addDockSplit(oldTerminal)
     await new Promise((r) => setTimeout(r, 150))
-    const uncapped = get().dockViews.length === 4 && shown() === 4
+    const explicitFour = !!oldTerminal && get().dockViews.length === 4 && shown() === 4
+      && get().dockGrid.length === 2 && Math.max(...get().dockGrid.map((column) => column.length)) === 2
     get().removeDockView(tNew)
-    get().removeDockView(get().activeThreadId)
-    get().removeDockView(get().terminals[0].id)
+    get().removeDockView(newest)
+    if (oldTerminal) get().removeDockView(oldTerminal)
     await new Promise((r) => setTimeout(r, 120))
     const closes = get().dockViews.length === 1 && shown() === 1
-    return { one, appended, heads, stacked, besides, uncapped, closes }
+    return { one, focusesByDefault, explicitSplit, heads, stacked, besides, explicitFour, closes }
   })()`)
   console.log('SPLITS=' + JSON.stringify(splits))
 
@@ -2351,11 +2361,17 @@ a^2 + b^2 = c^2
     const restored = !!document.querySelector('.wsrail[data-side="right"]') && get().railOpen === true
 
     const settingsTrigger = document.querySelector('.shell-settings-trigger')
-    settingsTrigger?.click(); await wait()
-    const startsInGeneral = /Appearance/.test(document.querySelector('.settings-pane')?.textContent || '')
+    get().setSettingsOpen(true, 'general'); await wait()
+    const opensRequestedGeneral = /Appearance/.test(document.querySelector('.settings-pane')?.textContent || '')
+    get().setSettingsOpen(false); await wait()
+    document.querySelector('.shell-settings-trigger')?.click(); await wait()
+    const footerReopensLast = /Appearance/.test(document.querySelector('.settings-pane')?.textContent || '')
     const interfaceNav = [...document.querySelectorAll('.settings-nav-item')].find((node) => /Interface/.test(node.textContent || ''))
     interfaceNav?.click()
     await wait()
+    get().setSettingsOpen(false); await wait()
+    document.querySelector('.shell-settings-trigger')?.click(); await wait()
+    const remembersInterface = /Interface/.test(document.querySelector('.settings-pane-title')?.textContent || '')
     const settingsOwned = !!document.querySelector('.settings-row[data-setting="workspace-view"]') &&
       !!document.querySelector('.settings-row[data-setting="session-panels"]') &&
       !!document.querySelector('.settings-row[data-setting="session-placement"]')
@@ -2402,7 +2418,9 @@ a^2 + b^2 = c^2
       noStandaloneLayout: !document.querySelector('.shell-layout-trigger'),
       settingsOwned,
       advancedStylesDisclosed,
-      startsInGeneral,
+      opensRequestedGeneral,
+      footerReopensLast,
+      remembersInterface,
       workspaceReversible: toFilesOnly && toFilesAndSessions,
       panelsReversible: panelsHidden && panelsShown,
       placementReversible: movedToTop && movedToLeft,
@@ -2468,11 +2486,18 @@ a^2 + b^2 = c^2
   // 14c) a narrow agent card wraps its composer and identity controls instead
   //      of clipping the model picker or send/connection actions.
   const narrowAgentUi = await win.webContents.executeJavaScript(`(async () => {
-    const assistant = document.querySelector('.assistant')
+    const state = window.__kaisola.getState()
+    let threadId = state.assistantThreads.find((thread) => !thread.group && !thread.groupParentId)?.id
+    if (!threadId) {
+      state.requestNewThread()
+      threadId = window.__kaisola.getState().activeThreadId
+    } else {
+      state.setActiveThread(threadId)
+    }
+    await new Promise((r) => setTimeout(r, 80))
+    const assistant = document.querySelector('.assistant[data-thread-id="' + CSS.escape(threadId) + '"]')
     const card = assistant?.closest('.session-card')
     if (!assistant || !card) return { rendered: false }
-    const state = window.__kaisola.getState()
-    const threadId = assistant.getAttribute('data-thread-id')
     const originalDraft = threadId ? state.assistantDrafts[threadId] : null
     const longDraft = 'This narrow composer must keep every word readable and scrollable after the card moves to the right. '.repeat(18)
     if (threadId) state.setAssistantDraft(threadId, { text: longDraft })
@@ -2549,12 +2574,15 @@ a^2 + b^2 = c^2
 
   // 15) settings exposes the appearance/layout configuration
   const settings = await win.webContents.executeJavaScript(`(async () => {
+    const expectedPane = window.__kaisola.getState().settingsPane || 'general'
     const settingsButton = document.querySelector('.shell-sidebar-footer .shell-settings-trigger[aria-label="Open settings"]')
     settingsButton?.click()
     await new Promise((r) => setTimeout(r, 150))
     // Zed-style settings: a nav of categories, one pane at a time
     const navNames = [...document.querySelectorAll('.settings-nav-item')].map((e) => e.textContent || '')
-    const startsInGeneral = /Appearance/.test(document.querySelector('.settings-pane')?.textContent || '')
+    const activePane = document.querySelector('.settings-nav-item[aria-current="page"]')?.textContent?.trim().toLocaleLowerCase() || ''
+    const expectedName = expectedPane === 'guardrails' ? 'guardrails' : expectedPane === 'models' ? 'models & keys' : expectedPane
+    const reopensRemembered = activePane.includes(expectedName)
     const hasAppearance = navNames.some((l) => /General/.test(l))
     const usageNav = [...document.querySelectorAll('.settings-nav-item')].find((e) => /Usage/.test(e.textContent || ''))
     usageNav?.click()
@@ -2578,19 +2606,17 @@ a^2 + b^2 = c^2
     generalNav?.click()
     await new Promise((r) => setTimeout(r, 30))
     const hasSidebarControls = /Sidebar/.test(document.querySelector('.settings-panel-v2')?.textContent || '')
-    const dropdown = document.querySelector('.settings-pane .drop-btn')
-    dropdown?.click()
-    await new Promise((r) => setTimeout(r, 50))
-    const previewOpened = !!document.querySelector('.drop-menu')
-    document.querySelector('.settings-pane-head')?.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true }))
-    await new Promise((r) => setTimeout(r, 50))
-    const previewDismissed = !document.querySelector('.drop-menu')
+    const searchInput = document.querySelector('.settings-search input')
+    document.querySelector('.settings-panel-v2')?.dispatchEvent(new KeyboardEvent('keydown', { key: 'f', metaKey: true, bubbles: true }))
+    await new Promise((r) => setTimeout(r, 20))
+    const keyboardSearchFocus = document.activeElement === searchInput
+    const visualChoices = document.querySelectorAll('.settings-choice-grid button').length >= 5
     window.__kaisola.getState().setSettingsOpen(false)
     await new Promise((r) => setTimeout(r, 30))
     const permanentFilesControls = document.querySelectorAll('.tabstrip-view-controls > button').length === 2 &&
       !document.querySelector('.canvas-local-close, .file-preview-toggle, .wsrail-head button')
     const footerOwned = !!settingsButton && !document.querySelector('.tabstrip .shell-settings-trigger')
-    return { settingsSeparate: !!settingsButton, footerOwned, startsInGeneral, hasLayoutSettings, hasAdvancedStyles, noStandaloneLayout: !document.querySelector('.shell-layout-trigger'), hasAppearance, hasUsage, hasDiskResidency, hasTabLayout, extensionsInSettings, permanentFilesControls, noSidebarControls: !hasSidebarControls, previewOpened, previewDismissed }
+    return { settingsSeparate: !!settingsButton, footerOwned, reopensRemembered, hasLayoutSettings, hasAdvancedStyles, noStandaloneLayout: !document.querySelector('.shell-layout-trigger'), hasAppearance, hasUsage, hasDiskResidency, hasTabLayout, extensionsInSettings, permanentFilesControls, noSidebarControls: !hasSidebarControls, keyboardSearchFocus, visualChoices }
   })()`)
   console.log('SETTINGS=' + JSON.stringify(settings))
 
@@ -3870,7 +3896,7 @@ a^2 + b^2 = c^2
     !fileui.fileTabsPersisted || !fileui.fileZoomPersisted ||
     !layout.sessionsInRail || !layout.hasRailTreeArea || !layout.railHasNoSessions || !layout.addsRow || !layout.focusesNewThread || !layout.noDockChrome ||
     !layout.hasFoot || !layout.footWs || !layout.footConn ||
-    !splits.one || !splits.appended || !splits.heads || !splits.stacked || !splits.besides || !splits.uncapped || !splits.closes ||
+    !splits.one || !splits.focusesByDefault || !splits.explicitSplit || !splits.heads || !splits.stacked || !splits.besides || !splits.explicitFour || !splits.closes ||
     !plus.hasBtn || !plus.noDrag || !plus.pronounced || !plus.hasTerminalOption || !plus.agentChoices || !plus.claudeOpensThread || !plus.claudeNoTerminal || !plus.claudeBrandIcon || !plus.openaiBrandIcon || !plus.adds ||
     !canvasR.hasHandle || !canvasR.sized || !canvasR.clampedMin || !canvasR.resets ||
     !canvasMin.shownBefore || !canvasMin.permanentTopControl || !canvasMin.hidden || !canvasMin.permanentRestore || !canvasMin.restoredByTop || !canvasMin.cardsStay || !canvasMin.restoredByNav || !canvasMin.restoredByFile ||
@@ -3887,11 +3913,11 @@ a^2 + b^2 = c^2
     !autoname.named || !autoname.rowShows || !autoname.sticky || !autoname.manualWins || !autoname.termNamed ||
     !minimalUi.noSidebar || !minimalUi.noSidebarResize || !minimalUi.noStageNav || !minimalUi.hasSessionSidebar || !minimalUi.hasRail || !minimalUi.filesOnRight || !minimalUi.hasPlus || !minimalUi.hasFiles ||
     !tabLayouts.rendered || !tabLayouts.sidebarOk || !tabLayouts.shelfOk || !tabLayouts.bareOk || !tabLayouts.runwayOk || !tabLayouts.flatOk || !tabLayouts.compactOk || !tabLayouts.reciprocalToggle || !tabLayouts.verticalAddFlow || !tabLayouts.stateKept || !tabLayouts.staticPaint || !tabLayouts.accessible || !tabLayouts.sessionIdentity ||
-    !intuitiveLayoutControls.permanentTopControls || !intuitiveLayoutControls.fileTreeIconOnly || !intuitiveLayoutControls.noLocalClose || !intuitiveLayoutControls.hidden || !intuitiveLayoutControls.topRestore || !intuitiveLayoutControls.restored || !intuitiveLayoutControls.noFooterRecovery || !intuitiveLayoutControls.noStandaloneLayout || !intuitiveLayoutControls.settingsOwned || !intuitiveLayoutControls.advancedStylesDisclosed || !intuitiveLayoutControls.startsInGeneral || !intuitiveLayoutControls.workspaceReversible || !intuitiveLayoutControls.panelsReversible || !intuitiveLayoutControls.placementReversible || !intuitiveLayoutControls.footerFollowsNavigation || !intuitiveLayoutControls.rareActionsInPalette || !intuitiveLayoutControls.previewPermanent ||
+    !intuitiveLayoutControls.permanentTopControls || !intuitiveLayoutControls.fileTreeIconOnly || !intuitiveLayoutControls.noLocalClose || !intuitiveLayoutControls.hidden || !intuitiveLayoutControls.topRestore || !intuitiveLayoutControls.restored || !intuitiveLayoutControls.noFooterRecovery || !intuitiveLayoutControls.noStandaloneLayout || !intuitiveLayoutControls.settingsOwned || !intuitiveLayoutControls.advancedStylesDisclosed || !intuitiveLayoutControls.opensRequestedGeneral || !intuitiveLayoutControls.footerReopensLast || !intuitiveLayoutControls.remembersInterface || !intuitiveLayoutControls.workspaceReversible || !intuitiveLayoutControls.panelsReversible || !intuitiveLayoutControls.placementReversible || !intuitiveLayoutControls.footerFollowsNavigation || !intuitiveLayoutControls.rareActionsInPalette || !intuitiveLayoutControls.previewPermanent ||
     !realPointerLayout.firstWorked || !realPointerLayout.reverseWorked || !realPointerLayout.stayedInteractive ||
     !narrowAgentUi.rendered || !narrowAgentUi.narrow || !narrowAgentUi.containerAware || !narrowAgentUi.composerFits || !narrowAgentUi.sendVisible || !narrowAgentUi.footerFits || !narrowAgentUi.wraps || !narrowAgentUi.draftReadable || !narrowAgentUi.draftScrollable || !narrowAgentUi.draftResponsive || !narrowAgentUi.sideAgnostic ||
     !inboxAnchorUi.anchoredAtZero || !inboxAnchorUi.badged || !inboxAnchorUi.staysAfterClear ||
-    !settings.settingsSeparate || !settings.footerOwned || !settings.startsInGeneral || !settings.hasLayoutSettings || !settings.hasAdvancedStyles || !settings.noStandaloneLayout || !settings.hasAppearance || !settings.hasUsage || !settings.hasDiskResidency || !settings.hasTabLayout || !settings.extensionsInSettings || !settings.permanentFilesControls || !settings.noSidebarControls || !settings.previewOpened || !settings.previewDismissed ||
+    !settings.settingsSeparate || !settings.footerOwned || !settings.reopensRemembered || !settings.hasLayoutSettings || !settings.hasAdvancedStyles || !settings.noStandaloneLayout || !settings.hasAppearance || !settings.hasUsage || !settings.hasDiskResidency || !settings.hasTabLayout || !settings.extensionsInSettings || !settings.permanentFilesControls || !settings.noSidebarControls || !settings.keyboardSearchFocus || !settings.visualChoices ||
     !extensionsUi.opened || extensionsUi.cards < 8 || !extensionsUi.hasFilters || !extensionsUi.csvInstalled || !extensionsUi.jsonInstalled ||
     !extensionsUi.persisted || !extensionsUi.defaultUninstallPersisted || !extensionsUi.csvPreview || !extensionsUi.jsonPreview || !extensionsUi.boundedJsonPreview || !extensionsUi.closed ||
     !devExtensionHotReload.registered || !devExtensionHotReload.updated || !devExtensionHotReload.visible ||

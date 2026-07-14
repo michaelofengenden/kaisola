@@ -3,12 +3,12 @@
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
-<title>Kaisola — Codex, Claude, terminals, and Mesh in one workspace</title>
-<meta name="description" content="Kaisola is a local desktop workspace for directing Codex, Claude, terminals, and controlled cross-provider agent teams." />
-<meta name="theme-color" content="#f5f5f1" media="(prefers-color-scheme: light)" />
-<meta name="theme-color" content="#0b0c0e" media="(prefers-color-scheme: dark)" />
-<meta property="og:title" content="Kaisola — your agents, one controlled workspace" />
-<meta property="og:description" content="Direct Codex and Claude, run real CLIs, and coordinate cross-provider teams without giving up control." />
+<title>Kaisola — one workspace for agent work</title>
+<meta name="description" content="Kaisola is a fast local workspace for agent threads, terminals, files, and coordinated Mesh sessions." />
+<meta name="theme-color" content="#ffffff" media="(prefers-color-scheme: light)" />
+<meta name="theme-color" content="#090909" media="(prefers-color-scheme: dark)" />
+<meta property="og:title" content="Kaisola — one workspace for agent work" />
+<meta property="og:description" content="Keep agent threads, terminals, files, and coordinated Mesh sessions focused in one local workspace." />
 <meta property="og:type" content="website" />
 <meta property="og:url" content="https://kaisola.com/" />
 <meta property="og:image" content="https://kaisola.com/assets/mesh-control-light.jpg" />
@@ -16,8 +16,8 @@
 <meta property="og:image:height" content="1000" />
 <meta property="og:image:alt" content="A paused Kaisola Mesh with Claude complete and Codex ready to continue" />
 <meta name="twitter:card" content="summary_large_image" />
-<meta name="twitter:title" content="Kaisola — your agents, one controlled workspace" />
-<meta name="twitter:description" content="Direct Codex and Claude, run real CLIs, and coordinate cross-provider teams without giving up control." />
+<meta name="twitter:title" content="Kaisola — one workspace for agent work" />
+<meta name="twitter:description" content="Keep agent threads, terminals, files, and coordinated Mesh sessions focused in one local workspace." />
 <meta name="twitter:image" content="https://kaisola.com/assets/mesh-control-light.jpg" />
 <link rel="icon" type="image/png" href="assets/kaisola-icon.png" />
 <link rel="apple-touch-icon" href="assets/kaisola-icon.png" />
@@ -90,10 +90,8 @@
     position: sticky;
     top: 0;
     z-index: 20;
-    background: color-mix(in srgb, var(--ground) 77%, transparent);
+    background: var(--ground);
     border-bottom: 1px solid var(--line-soft);
-    backdrop-filter: blur(20px) saturate(1.2);
-    -webkit-backdrop-filter: blur(20px) saturate(1.2);
   }
   .nav-inner { height: 62px; display: flex; align-items: center; gap: 24px; }
   .brand { display: inline-flex; align-items: center; gap: 10px; font-weight: 670; text-decoration: none; letter-spacing: -0.02em; }
@@ -158,7 +156,6 @@
     z-index: -1;
     border-radius: 50%;
     background: radial-gradient(ellipse, color-mix(in srgb, var(--ground) 86%, transparent) 25%, color-mix(in srgb, var(--ground) 58%, transparent) 58%, transparent 76%);
-    filter: blur(9px);
     pointer-events: none;
   }
   .kicker {
@@ -300,6 +297,95 @@
     .footer-inner .spacer { display: none; }
   }
   @media (prefers-reduced-motion: reduce) { html { scroll-behavior: auto; } .button { transition: none; } .hero-language-curtain { opacity: .42; } }
+
+  /* 0.1.66 — a deliberately monochrome, product-first site. */
+  :root {
+    --ground: #fff;
+    --ground-deep: #f5f5f5;
+    --panel: #fff;
+    --panel-solid: #fff;
+    --ink: #111;
+    --ink-2: #4a4a4a;
+    --ink-3: #777;
+    --line: #dedede;
+    --line-soft: rgba(0, 0, 0, .08);
+    --olive: #111;
+    --olive-bright: #2c2c2c;
+    --olive-ink: #111;
+    --olive-soft: rgba(0, 0, 0, .055);
+    --olive-line: rgba(0, 0, 0, .22);
+    --green: #111;
+    --shadow: 0 28px 80px rgba(0, 0, 0, .11);
+    --shadow-small: 0 12px 32px rgba(0, 0, 0, .07);
+    --serif: var(--sans);
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --ground: #090909;
+      --ground-deep: #111;
+      --panel: #101010;
+      --panel-solid: #111;
+      --ink: #f5f5f5;
+      --ink-2: #b7b7b7;
+      --ink-3: #838383;
+      --line: #2b2b2b;
+      --line-soft: rgba(255, 255, 255, .09);
+      --olive: #f3f3f3;
+      --olive-bright: #fff;
+      --olive-ink: #f5f5f5;
+      --olive-soft: rgba(255, 255, 255, .06);
+      --olive-line: rgba(255, 255, 255, .23);
+      --green: #f5f5f5;
+    }
+  }
+  .nav {
+    background: var(--ground);
+    backdrop-filter: none;
+    -webkit-backdrop-filter: none;
+  }
+  .brand img { filter: grayscale(1); }
+  .button {
+    border-color: var(--ink);
+    border-radius: 999px;
+    background: var(--ink);
+    color: var(--ground);
+    box-shadow: none;
+  }
+  .button:hover { border-color: var(--ink); background: var(--ink); opacity: .82; }
+  .button.secondary { border-color: var(--line); background: transparent; color: var(--ink); }
+  .hero { padding-top: 132px; background: var(--ground); }
+  .hero-language-curtain, .hero-copy::before { display: none; }
+  .hero-copy { width: min(860px, 100%); padding-top: 0; }
+  .kicker {
+    padding: 6px 10px;
+    border: 1px solid var(--line);
+    border-radius: 999px;
+    color: var(--ink-2);
+    letter-spacing: .08em;
+  }
+  .kicker::before { width: 5px; height: 5px; background: var(--ink); box-shadow: none; }
+  h1, h2 { font-family: var(--sans); font-style: normal; font-weight: 650; letter-spacing: -.055em; }
+  h1 { max-width: 11ch; line-height: .94; }
+  h1 em { color: var(--ink); font-style: normal; }
+  .lede { max-width: 690px; line-height: 1.48; }
+  .product-frame { border-radius: 18px; background: var(--panel-solid); }
+  .product-frame img { border-radius: 12px; }
+  .product-caption div { background: var(--ground); }
+  section { padding-block: 112px; }
+  .section-head { max-width: 720px; }
+  .eyebrow { color: var(--ink-3); }
+  .layer-card, .feature-card, .privacy-card, .protocol, .mesh-shot, .editor-shot {
+    background: var(--panel-solid);
+    box-shadow: none;
+  }
+  .team { background: var(--ground-deep); }
+  .step { background: var(--ground); }
+  .step::after, .step b { color: var(--ink-3); }
+  .gate::before, .gate::after { background: var(--line); }
+  .mini-tab.active { box-shadow: 0 1px 5px rgba(0, 0, 0, .07); }
+  .mini-tab i { background: var(--ink); }
+  .install { border-color: var(--line); background: var(--ground-deep); }
+  @media (prefers-reduced-transparency: reduce), (prefers-contrast: more) { .nav { background: var(--ground); } }
 </style>
 </head>
 <body>
@@ -314,7 +400,7 @@
       <a class="quiet" href="#agents">Agents</a>
       <a class="quiet" href="#team">Mesh</a>
       <a class="quiet" href="#privacy">Privacy</a>
-      <a href="https://github.com/michaelofengend/kaisola" rel="noopener">GitHub</a>
+      <a href="https://github.com/michaelofengenden/kaisola" rel="noopener">GitHub</a>
       <a class="button" href="#download">Download</a>
     </div>
   </div>
@@ -322,15 +408,14 @@
 
 <main id="top">
   <header class="hero">
-    <canvas class="hero-language-curtain" data-language-curtain aria-hidden="true"></canvas>
     <div class="wrap">
       <div class="hero-copy">
-        <span class="kicker">Local multi-agent workspace</span>
-        <h1>Your agents. <em>One controlled workspace.</em></h1>
-        <p class="lede">Direct Codex and Claude, work through their real CLIs, or give a cross-provider Mesh one mission. Stop the team, inspect what finished, and continue only the unfinished work.</p>
+        <span class="kicker">The local agent workspace</span>
+        <h1>One place to run the work.</h1>
+        <p class="lede">Keep agent threads, terminals, files, and coordinated Mesh sessions in one fast workspace. Focus by default. Split only when you ask.</p>
         <div class="actions">
-          <a class="button" href="https://github.com/michaelofengend/kaisola/releases/latest/download/Kaisola.dmg">Download for macOS</a>
-          <a class="button secondary" href="https://github.com/michaelofengend/kaisola" rel="noopener">View source</a>
+          <a class="button" href="https://github.com/michaelofengenden/kaisola/releases/latest/download/Kaisola.dmg">Download for macOS</a>
+          <a class="button secondary" href="https://github.com/michaelofengenden/kaisola" rel="noopener">View source</a>
         </div>
         <div class="fine">free and open source · macOS 13+ · Apple Silicon</div>
       </div>
@@ -338,9 +423,9 @@
       <div class="product-frame" aria-label="Kaisola Mesh control preview">
         <img src="assets/mesh-control-light.jpg" width="1600" height="1000" alt="A paused Kaisola Mesh where Claude has finished and Codex can continue without repeating completed work" />
         <div class="product-caption" aria-hidden="true">
-          <div><b>Stop without losing progress</b><span>Completed agents stay completed.</span></div>
-          <div><b>Continue selectively</b><span>Retry only unfinished participants.</span></div>
-          <div><b>Provider-native control</b><span>Choose live models and effort per agent.</span></div>
+          <div><b>One readable timeline</b><span>Mission, participants, stages, and receipts.</span></div>
+          <div><b>Safe write gates</b><span>Analysis flows; repository changes wait.</span></div>
+          <div><b>Durable progress</b><span>Pause, reopen, and continue unfinished work.</span></div>
         </div>
       </div>
     </div>
@@ -349,8 +434,8 @@
   <section id="agents">
     <div class="wrap">
       <div class="section-head">
-        <span class="eyebrow">Agents without the terminal tax</span>
-        <h2>Rich agent sessions, backed by real CLIs.</h2>
+        <span class="eyebrow">Agent sessions</span>
+        <h2>Rich conversations. Real local tools.</h2>
         <p>Codex and Claude connect through the Agent Client Protocol. Kaisola gives their native sessions a shared, inspectable surface for messages, plans, tools, permissions, queues, models, and effort.</p>
       </div>
       <div class="features">
@@ -367,9 +452,9 @@
   <section class="team" id="team">
     <div class="wrap">
       <div class="section-head center">
-        <span class="eyebrow">Kaisola Mesh</span>
-        <h2>Multiple models. One controlled implementation.</h2>
-        <p>Start with Claude and Codex, add up to six participants, and choose each provider's live model and effort. A Mesh gives the team a shared mission, not a shared checkout: Kaisola coordinates bounded handoffs and keeps state-changing stages behind your approval.</p>
+        <span class="eyebrow">Mesh</span>
+        <h2>A group conversation with real boundaries.</h2>
+        <p>Start with two participants or add up to six. Fluid mode carries analysis and review forward; isolated worktrees and final integration remain explicit decisions.</p>
       </div>
       <div class="protocol" aria-label="Group collaboration protocol">
         <div class="step"><b>01 Scout</b><span>Both agents analyze independently before seeing the other approach.</span></div>
@@ -389,14 +474,14 @@
   <section id="workspace">
     <div class="wrap">
       <div class="section-head">
-        <span class="eyebrow">One workspace, arranged your way</span>
-        <h2>The work stays legible.</h2>
-        <p>Agents, terminals, and Mesh sessions live in a vertical rail by default, while files can sit on either side. Split sessions side by side or focus the editor when the code needs more room.</p>
+        <span class="eyebrow">A focus-first workspace</span>
+        <h2>Thirty sessions. One readable surface.</h2>
+        <p>Every session stays live and searchable in the rail. Opening one changes focus; the split control is a deliberate choice when comparison matters.</p>
       </div>
       <div class="layer-grid">
         <article class="layer-card primary">
-          <h3>Sessions that behave like workspace tools</h3>
-          <p>Start a terminal, Codex thread, Claude thread, or Mesh from the same menu. Reorder sessions, split them side by side, close them for later, or permanently delete their saved state.</p>
+          <h3>Sessions that scale without panel sprawl</h3>
+          <p>Start a terminal, agent thread, or Mesh from one menu. Search, pin, group, focus, split, reopen, or permanently delete saved state without multiplying panes by accident.</p>
           <div class="mini-rail" aria-hidden="true">
             <div class="mini-tab active"><i></i> Review the auth flow <small>Codex</small></div>
             <div class="mini-tab"><i></i> Refine the Markdown editor <small>Claude</small></div>
@@ -455,12 +540,12 @@
     <div class="wrap">
       <div class="section-head center">
         <span class="eyebrow">Open source for macOS</span>
-        <h2>Bring your folder. Keep your tools.</h2>
-        <p>Install Kaisola, connect the agent CLIs you already use, and arrange the workspace around the work in front of you.</p>
+        <h2>Bring a folder. Start working.</h2>
+        <p>Install Kaisola, connect the CLIs you already use, and keep the workspace focused on what is in front of you.</p>
       </div>
       <div class="actions">
-        <a class="button" href="https://github.com/michaelofengend/kaisola/releases/latest/download/Kaisola.dmg">Download Kaisola.dmg</a>
-        <a class="button secondary" href="https://github.com/michaelofengend/kaisola/releases" rel="noopener">All releases</a>
+        <a class="button" href="https://github.com/michaelofengenden/kaisola/releases/latest/download/Kaisola.dmg">Download Kaisola.dmg</a>
+        <a class="button secondary" href="https://github.com/michaelofengenden/kaisola/releases" rel="noopener">All releases</a>
       </div>
       <div class="install">curl -fsSL https://kaisola.com/install.sh | sh</div>
       <p class="fine">macOS 13+ · Apple Silicon · source available on GitHub</p>
@@ -471,13 +556,12 @@
 <footer>
   <div class="wrap footer-inner">
     <a class="brand" href="#top"><img src="assets/kaisola-icon.png" alt="" width="20" height="20" />Kaisola</a>
-    <span>Your agents. One controlled workspace.</span>
+    <span>One workspace for agent work.</span>
     <span class="spacer"></span>
-    <a href="https://github.com/michaelofengend/kaisola" rel="noopener">GitHub</a>
-    <a href="https://github.com/michaelofengend/kaisola/releases" rel="noopener">Releases</a>
+    <a href="https://github.com/michaelofengenden/kaisola" rel="noopener">GitHub</a>
+    <a href="https://github.com/michaelofengenden/kaisola/releases" rel="noopener">Releases</a>
   </div>
 </footer>
 
-<script src="language-curtain.js" defer></script>
 </body>
 </html>

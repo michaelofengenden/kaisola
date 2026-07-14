@@ -1099,9 +1099,7 @@
   gap: var(--sp-1);
   padding: 2px;
   border-radius: var(--r-3);
-  background: color-mix(in srgb, var(--bg-1) 78%, transparent);
-  backdrop-filter: blur(8px);
-  -webkit-backdrop-filter: blur(8px);
+  background: color-mix(in srgb, var(--bg-1) 96%, var(--bg-0));
   -webkit-app-region: no-drag;
 }
 .float-tools * {
@@ -1805,6 +1803,7 @@
   z-index: 6;
   border-radius: var(--r-full);
   -webkit-app-region: no-drag;
+  touch-action: none;
 }
 .grid-col-resize:hover {
   background: var(--accent-soft);
@@ -1960,6 +1959,7 @@
   cursor: ew-resize;
   z-index: 6;
   -webkit-app-region: no-drag;
+  touch-action: none;
 }
 .session-sidebar > .session-sidebar-resize:hover,
 .session-sidebar > .session-sidebar-resize:focus-visible { background: var(--accent-soft); }
@@ -1995,6 +1995,53 @@
 .session-sidebar-head button:hover {
   color: var(--text-0);
   background: var(--hover-overlay);
+}
+.session-filter {
+  min-width: 0;
+  height: 30px;
+  margin: 0 var(--sp-2) var(--sp-2);
+  padding: 0 var(--sp-2);
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  flex: 0 0 auto;
+  border: 1px solid transparent;
+  border-radius: var(--r-2);
+  background: color-mix(in srgb, var(--bg-2) 68%, transparent);
+  color: var(--text-3);
+  -webkit-app-region: no-drag;
+}
+.session-filter:focus-within {
+  border-color: var(--border-strong);
+  background: var(--bg-2);
+  color: var(--text-2);
+}
+.session-filter input {
+  min-width: 0;
+  flex: 1;
+  border: 0;
+  outline: 0;
+  background: transparent;
+  color: var(--text-1);
+  font: inherit;
+  font-size: var(--fs-11);
+}
+.session-filter input::placeholder { color: var(--text-3); }
+.session-filter button {
+  width: 20px;
+  height: 20px;
+  display: grid;
+  place-items: center;
+  padding: 0;
+  border-radius: var(--r-full);
+  color: var(--text-3);
+}
+.session-filter button:hover { color: var(--text-0); background: var(--hover-overlay); }
+.session-filter-empty {
+  padding: var(--sp-5) var(--sp-3);
+  color: var(--text-3);
+  font-size: var(--fs-11);
+  text-align: center;
 }
 .session-sidebar .stabs[data-orientation='vertical'] {
   flex: 1 1 auto;
@@ -2286,7 +2333,6 @@
   inset: 0;
   z-index: var(--z-palette);
   background: rgba(0, 0, 0, 0.4);
-  backdrop-filter: blur(3px);
   display: flex;
   justify-content: center;
   align-items: flex-start;
@@ -2604,6 +2650,20 @@
 }
 @media (prefers-reduced-motion: reduce) {
   .session-needs { animation: none; }
+}
+
+/* Native glass is already sampled once by the window. Accessibility modes
+   receive solid navigation chrome and stronger separators, never another CSS
+   blur/compositing layer. */
+@media (prefers-reduced-transparency: reduce), (prefers-contrast: more) {
+  .app::before { background: var(--bg-0); }
+  .wsrail,
+  .session-sidebar,
+  .sidebar { border-color: var(--border); background: var(--bg-1); }
+  .wsrail::before,
+  .session-sidebar::before,
+  .sidebar::before { display: none; }
+  .tabstrip { background: var(--bg-1); border-bottom: 1px solid var(--border); }
 }
 .session-pinned {
   border-bottom: 1px solid var(--border-faint);

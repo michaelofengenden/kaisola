@@ -26,7 +26,7 @@ app.setPath('userData', userData)
 const { registerModelHandlers } = require('./ipc/modelHandler.cjs')
 const { registerToolHandlers } = require('./ipc/toolHandler.cjs')
 const { registerSettingsHandlers } = require('./ipc/settingsHandler.cjs')
-const { registerTerminalHandlers } = require('./ipc/terminalHandler.cjs')
+const { registerTerminalHandlers, killAllSessions } = require('./ipc/terminalHandler.cjs')
 const { registerAuthHandlers } = require('./ipc/authHandler.cjs')
 const { registerFsHandlers } = require('./ipc/fsHandler.cjs')
 const { registerDbHandlers } = require('./ipc/dbHandler.cjs')
@@ -187,6 +187,9 @@ app.whenReady().then(async () => {
     state.clearProject()
     state.setWorkspace(${JSON.stringify(workspace)})
     state.requestNewGroup()
+    const next = window.__kaisola.getState()
+    const group = next.assistantThreads.find((thread) => thread.group)
+    if (group) next.setGroupSession(group.id, { flow: 'guided' })
   })()`)
   await wait(700)
 
@@ -243,6 +246,14 @@ app.whenReady().then(async () => {
     for (let i = 0; i < 120; i++) {
       const current = await win.webContents.executeJavaScript(`document.querySelector('.group-assistant')?.getAttribute('data-phase')`)
       if (current === phase) return true
+      await wait(50)
+    }
+    return false
+  }
+  const waitForAnyPhase = async (phases) => {
+    for (let i = 0; i < 120; i++) {
+      const current = await win.webContents.executeJavaScript(`document.querySelector('.group-assistant')?.getAttribute('data-phase')`)
+      if (phases.includes(current)) return true
       await wait(50)
     }
     return false
@@ -313,10 +324,18 @@ app.whenReady().then(async () => {
   // Negotiation must probe, reconnect, and drain its durable prompts.
   if (ready) connected.clear()
   const parkedBeforeNegotiation = ready && connected.size === 0
-  if (ready) await clickAction()
-  const negotiated = await waitForPhase('plan-ready')
-  if (negotiated) await clickAction()
+  // Switch from the fully manual control path into Fluid mode at a settled
+  // checkpoint. Negotiation and role-contract drafting must advance without
+  // synthetic button clicks, including reconnecting the parked adapters.
+  const fluidEnabled = ready && await win.webContents.executeJavaScript(`(() => {
+    const state = window.__kaisola.getState()
+    const group = state.assistantThreads.find((thread) => thread.group)
+    if (!group) return false
+    state.setGroupSession(group.id, { flow: 'fluid' })
+    return true
+  })()`)
   const assigned = await waitForPhase('assigned')
+  const negotiated = assigned
   // A double activation lands before React can disable the button. The
   // durable compare-and-set operation journal must still create exactly one
   // worktree per member (a component-local ref cannot guarantee this).
@@ -327,11 +346,12 @@ app.whenReady().then(async () => {
     action.click()
     return true
   })()`)
-  const executed = await waitForPhase('execution-ready')
+  const executed = await waitForAnyPhase(['execution-ready', 'reviewing', 'merge-ready'])
   const isolatedWorktreeCount = executed
     ? execFileSync('git', ['worktree', 'list', '--porcelain'], { cwd: workspace, encoding: 'utf8' }).split('\n').filter((line) => line.startsWith('worktree ')).length - 1
     : -1
-  if (executed) await clickAction()
+  // Fluid mode auto-starts the read-only cross-review stage. Integration is
+  // still a state-changing gate and remains the explicit click below.
   const reviewed = await waitForPhase('merge-ready')
   if (reviewed) await clickAction()
   const done = await waitForPhase('done')
@@ -367,6 +387,7 @@ app.whenReady().then(async () => {
     workerReceipts: Object.fromEntries(workerIds.map((id) => [id, state.assistantRuntimes[id]?.lastRun])),
     workerTails: Object.fromEntries(workerIds.map((id) => [id, (state.assistantRuntimes[id]?.turns ?? []).slice(-4).map((turn) => ({ kind: turn.kind, at: turn.at, text: turn.text?.slice(0, 120) }))])),
     memberModels: group?.group?.members.map((member) => member.modelLabel),
+    flow: group?.group?.flow,
     workerCount: document.querySelectorAll('.group-workers .assistant').length,
     compactGeometry: [...document.querySelectorAll('.group-review-card')].every((card) => {
       const copy = card.querySelector('.group-review-copy')
@@ -440,7 +461,7 @@ app.whenReady().then(async () => {
     window.confirm = () => true
     const state = window.__kaisola.getState()
     const group = state.assistantThreads.find((thread) => thread.group)
-    const tab = group && document.querySelector('.stab[data-sid="' + group.id + '"]')
+    const tab = group && document.querySelector('.stab[data-sid="' + group.id + '"] > .stab-select')
     if (!tab) return { opened: false }
     tab.dispatchEvent(new MouseEvent('contextmenu', { bubbles: true, cancelable: true, clientX: 140, clientY: 120 }))
     return { opened: true, originProjectId: state.activeProjectId, groupId: group.id }
@@ -489,10 +510,9 @@ app.whenReady().then(async () => {
       && restored.assistantPromptQueues[created.id]?.[0]?.text === 'preserve this queued follow-up'
       && restored.assistantThreads.find((thread) => thread.id === created.id)?.queuePaused === true
   })()`)
-  const result = { configured, saturated, asked, stopped, paused, pausedPersisted: !!pausedPersisted, pausedScreenshot, pausedCloseReopen, continued, adoptedBusyRecovered, selectiveResume, ready, parkedBeforeNegotiation, connectCalls, negotiated, assigned, doubleExecuteClaimed, isolatedWorktreeCount, executed, reviewed, done, worktreeCleanupDone, ...facts, persisted, siteScreenshot, screenshot, closeReopen, clickedDelete, switchedProjectId, deleted, projectSwitchSafe, archiveDeleteVerified, deleteTeardownOrdered, sessionDraftRoundTrip, deleteLifecycle }
+  const result = { configured, saturated, asked, stopped, paused, pausedPersisted: !!pausedPersisted, pausedScreenshot, pausedCloseReopen, continued, adoptedBusyRecovered, selectiveResume, ready, parkedBeforeNegotiation, fluidEnabled, connectCalls, negotiated, assigned, doubleExecuteClaimed, isolatedWorktreeCount, executed, reviewed, done, worktreeCleanupDone, ...facts, persisted, siteScreenshot, screenshot, closeReopen, openedDeleteMenu, clickedDelete, switchedProjectId, deleted, projectSwitchSafe, archiveDeleteVerified, deleteTeardownOrdered, sessionDraftRoundTrip, deleteLifecycle }
   console.log('GROUP_UI=' + JSON.stringify(result))
-  app.exit(
-    configured
+  const passed = configured
     && saturated
     && asked
     && stopped
@@ -505,6 +525,7 @@ app.whenReady().then(async () => {
     && selectiveResume.map((entry) => entry.join(':')).join(',') === 'claude-code:1,codex:2'
     && ready
     && parkedBeforeNegotiation
+    && fluidEnabled
     && connectCalls >= 4
     && negotiated
     && assigned
@@ -523,6 +544,7 @@ app.whenReady().then(async () => {
     && facts.executions === 2
     && facts.worktrees === 0
     && facts.memberModels.join(',') === 'Claude Fast,Codex Deep'
+    && facts.flow === 'fluid'
     && facts.changedFiles.join(',') === 'claude-result.txt,codex-result.txt'
     && facts.roleContract.startsWith('Mission intent')
     && facts.integration === 'Integrated both reviewed branches and verified the shared acceptance tests.'
@@ -541,7 +563,12 @@ app.whenReady().then(async () => {
     && archiveDeleteVerified
     && deleteTeardownOrdered
     && sessionDraftRoundTrip
-      ? 0
-      : 1,
-  )
-}).catch((error) => { console.error(error); app.exit(1) })
+  killAllSessions()
+  await wait(250)
+  app.exit(passed ? 0 : 1)
+}).catch(async (error) => {
+  console.error(error)
+  killAllSessions()
+  await wait(250)
+  app.exit(1)
+})

@@ -5,8 +5,11 @@
   display: grid;
   place-items: center;
   padding: 28px;
-  color: #17181b;
-  background: #fff;
+  color: #24221d;
+  background:
+    radial-gradient(circle at 18% 12%, rgb(255 255 255 / 72%), transparent 34%),
+    repeating-linear-gradient(88deg, rgb(79 70 45 / 1.8%) 0 1px, transparent 1px 5px),
+    #f3f0e7;
   -webkit-app-region: no-drag;
   overflow: hidden;
 }
@@ -17,17 +20,24 @@
   width: 100%;
   height: 100%;
   pointer-events: none;
-  mask-image: linear-gradient(90deg, transparent 43%, rgb(0 0 0 / 28%) 52%, #000 72%);
-  opacity: .62;
+  mask-image: linear-gradient(180deg, #000 0%, rgb(0 0 0 / 82%) 43%, rgb(0 0 0 / 64%) 57%, #000 100%);
+  opacity: .74;
 }
 
 .onboarding-card {
   position: relative;
   z-index: 1;
-  width: min(440px, 100%);
+  width: min(520px, 100%);
   display: flex;
   flex-direction: column;
   align-items: center;
+  padding: 42px clamp(24px, 4vw, 52px);
+  border: 1px solid rgb(73 68 52 / 12%);
+  border-radius: 30px;
+  background: rgb(250 248 241 / 78%);
+  box-shadow: 0 28px 80px rgb(58 52 35 / 13%), inset 0 1px rgb(255 255 255 / 76%);
+  backdrop-filter: blur(10px) saturate(.82);
+  -webkit-backdrop-filter: blur(10px) saturate(.82);
   text-align: center;
   animation: onboarding-in 260ms var(--ease-out) both;
 }
@@ -39,14 +49,14 @@
   place-items: center;
   margin-bottom: 28px;
   color: #fff;
-  background: #17181b;
+  background: #25241f;
   border-radius: 13px;
   box-shadow: 0 8px 24px rgb(0 0 0 / 12%);
 }
 
 .onboarding-kicker {
   margin-bottom: 10px;
-  color: #7b808a;
+  color: #777568;
   font-size: 13px;
   font-weight: 600;
   letter-spacing: .02em;
@@ -62,7 +72,7 @@
 .onboarding-copy {
   max-width: 420px;
   margin: 16px 0 30px;
-  color: #6f7580;
+  color: #706f66;
   font-size: 15px;
   line-height: 1.6;
 }
@@ -94,7 +104,7 @@
 .onboarding-google:hover:not(:disabled) { background: #f8f9fa; border-color: #c9ced7; }
 .onboarding-google:disabled { opacity: .48; cursor: default; }
 .onboarding-local { color: #707580; }
-.onboarding-local:hover:not(:disabled) { color: #202124; background: #f5f6f7; }
+.onboarding-local:hover:not(:disabled) { color: #202124; background: rgb(229 226 215 / 72%); }
 
 .onboarding-note,
 .onboarding-error {
@@ -118,6 +128,11 @@
   }
 
   .onboarding-card { margin: auto 0; }
+  .onboarding-card {
+    width: min(470px, 100%);
+    padding: 16px 20px;
+    border-radius: 20px;
+  }
   .onboarding-mark {
     width: 34px;
     height: 34px;
@@ -136,7 +151,9 @@
 }
 
 @media (max-width: 720px) {
-  .onboarding-beads { opacity: .22; mask-image: linear-gradient(90deg, transparent 25%, #000); }
+  .onboarding { padding: 18px; }
+  .onboarding-card { padding-inline: 22px; }
+  .onboarding-beads { opacity: .44; }
 }
 
 @keyframes onboarding-in {
@@ -146,5 +163,5 @@
 
 @media (prefers-reduced-motion: reduce) {
   .onboarding-card { animation: none; }
-  .onboarding-beads { opacity: .28; }
+  .onboarding-beads { opacity: .42; }
 }

@@ -125,11 +125,41 @@
 
   .hero {
     position: relative;
+    isolation: isolate;
+    overflow: hidden;
     padding: 108px 0 72px;
     text-align: center;
     background:
       radial-gradient(800px 430px at 50% 6%, var(--olive-soft), transparent 72%),
       linear-gradient(to bottom, transparent, var(--ground));
+  }
+  .hero-language-curtain {
+    position: absolute;
+    inset: 0 0 auto;
+    z-index: -1;
+    width: 100%;
+    height: min(760px, 100%);
+    pointer-events: none;
+    opacity: .58;
+    mask-image: linear-gradient(to bottom, #000 0%, #000 72%, transparent 100%);
+    -webkit-mask-image: linear-gradient(to bottom, #000 0%, #000 72%, transparent 100%);
+  }
+  .hero .wrap { position: relative; z-index: 1; }
+  .hero-copy {
+    position: relative;
+    width: min(790px, 100%);
+    margin: 0 auto;
+    padding: 30px clamp(20px, 5vw, 56px) 32px;
+  }
+  .hero-copy::before {
+    content: "";
+    position: absolute;
+    inset: -36px -70px;
+    z-index: -1;
+    border-radius: 50%;
+    background: radial-gradient(ellipse, color-mix(in srgb, var(--ground) 86%, transparent) 25%, color-mix(in srgb, var(--ground) 58%, transparent) 58%, transparent 76%);
+    filter: blur(9px);
+    pointer-events: none;
   }
   .kicker {
     display: inline-flex;
@@ -256,6 +286,9 @@
     .nav-links { gap: 12px; }
     .nav-links .button { min-height: 36px; padding-inline: 13px; }
     .hero { padding-top: 78px; }
+    .hero-language-curtain { height: 620px; opacity: .42; }
+    .hero-copy { padding-inline: 5px; }
+    .hero-copy::before { inset-inline: -24px; }
     h1 { font-size: clamp(45px, 15vw, 68px); }
     .product-caption { grid-template-columns: 1fr; }
     section { padding: 76px 0; }
@@ -266,7 +299,7 @@
     .feature-card { min-height: auto; }
     .footer-inner .spacer { display: none; }
   }
-  @media (prefers-reduced-motion: reduce) { html { scroll-behavior: auto; } .button { transition: none; } }
+  @media (prefers-reduced-motion: reduce) { html { scroll-behavior: auto; } .button { transition: none; } .hero-language-curtain { opacity: .42; } }
 </style>
 </head>
 <body>
@@ -289,15 +322,18 @@
 
 <main id="top">
   <header class="hero">
+    <canvas class="hero-language-curtain" data-language-curtain aria-hidden="true"></canvas>
     <div class="wrap">
-      <span class="kicker">Local multi-agent workspace</span>
-      <h1>Your agents. <em>One controlled workspace.</em></h1>
-      <p class="lede">Direct Codex and Claude, work through their real CLIs, or give a cross-provider Mesh one mission. Stop the team, inspect what finished, and continue only the unfinished work.</p>
-      <div class="actions">
-        <a class="button" href="https://github.com/michaelofengend/kaisola/releases/latest/download/Kaisola.dmg">Download for macOS</a>
-        <a class="button secondary" href="https://github.com/michaelofengend/kaisola" rel="noopener">View source</a>
+      <div class="hero-copy">
+        <span class="kicker">Local multi-agent workspace</span>
+        <h1>Your agents. <em>One controlled workspace.</em></h1>
+        <p class="lede">Direct Codex and Claude, work through their real CLIs, or give a cross-provider Mesh one mission. Stop the team, inspect what finished, and continue only the unfinished work.</p>
+        <div class="actions">
+          <a class="button" href="https://github.com/michaelofengend/kaisola/releases/latest/download/Kaisola.dmg">Download for macOS</a>
+          <a class="button secondary" href="https://github.com/michaelofengend/kaisola" rel="noopener">View source</a>
+        </div>
+        <div class="fine">free and open source · macOS 13+ · Apple Silicon</div>
       </div>
-      <div class="fine">free and open source · macOS 13+ · Apple Silicon</div>
 
       <div class="product-frame" aria-label="Kaisola Mesh control preview">
         <img src="assets/mesh-control-light.jpg" width="1600" height="1000" alt="A paused Kaisola Mesh where Claude has finished and Codex can continue without repeating completed work" />
@@ -442,5 +478,6 @@
   </div>
 </footer>
 
+<script src="language-curtain.js" defer></script>
 </body>
 </html>

@@ -1,17 +1,64 @@
 import { useEffect, useRef } from 'react'
 
-interface Bead {
-  x: number
-  restX: number
-  y: number
-  vx: number
-  color: string
-  radius: number
+interface LanguageGlyphs {
+  language: string
+  glyphs: readonly string[]
 }
 
-const COLUMNS = 32
-const ROWS = 16
-const COLORS = ['#75853b', '#a3ad45', '#c3aa4f', '#bf7255', '#588074']
+interface Bead {
+  x: number
+  y: number
+  restX: number
+  restY: number
+  vx: number
+  vy: number
+  column: number
+  row: number
+  glyph: string
+  language: string
+  color: string
+  fontSize: number
+}
+
+/** Graphemes from research and knowledge words, mixed within every strand. */
+const LANGUAGES: readonly LanguageGlyphs[] = [
+  { language: 'English', glyphs: ['r', 'e', 's', 'q'] },
+  { language: 'French', glyphs: ['é', 'ç', 'œ', 'à'] },
+  { language: 'Portuguese', glyphs: ['ã', 'ç', 'ê', 'õ'] },
+  { language: 'Arabic', glyphs: ['ب', 'ح', 'ث', 'ع', 'ل', 'م'] },
+  { language: 'Chinese', glyphs: ['研', '究', '知', '识'] },
+  { language: 'Korean', glyphs: ['연', '구', '지', '식'] },
+  { language: 'Sanskrit', glyphs: ['अ', 'नु', 'ज्ञा', 'नम्'] },
+  { language: 'Spanish', glyphs: ['ó', 'ñ', 'í', 's'] },
+  { language: 'German', glyphs: ['F', 'o', 'ß', 'W'] },
+  { language: 'Japanese', glyphs: ['探', '究', '知', '識'] },
+  { language: 'Hindi', glyphs: ['खो', 'ज', 'ज्ञा', 'न'] },
+  { language: 'Greek', glyphs: ['έ', 'ρ', 'γ', 'ν', 'ώ'] },
+  { language: 'Hebrew', glyphs: ['מ', 'ח', 'ק', 'ר', 'י', 'ד'] },
+  { language: 'Swahili', glyphs: ['u', 't', 'f', 'm'] },
+  { language: 'Russian', glyphs: ['и', 'с', 'л', 'з', 'н'] },
+  { language: 'Turkish', glyphs: ['ş', 'ı', 'ğ', 'ç'] },
+  { language: 'Persian', glyphs: ['پ', 'ژ', 'و', 'ه', 'ش'] },
+  { language: 'Bengali', glyphs: ['গ', 'বে', 'ষ', 'ণা', 'জ্ঞা'] },
+  { language: 'Tamil', glyphs: ['ஆ', 'ரா', 'ய்', 'அ', 'றி'] },
+  { language: 'Amharic', glyphs: ['ም', 'ር', 'እ', 'ው', 'ቀ'] },
+  { language: 'Māori', glyphs: ['ā', 'ū', 'wh', 'ng'] },
+  { language: 'Vietnamese', glyphs: ['ê', 'ứ', 'ệ', 'ứ'] },
+  { language: 'Thai', glyphs: ['วิ', 'จั', 'ย', 'รู้'] },
+  { language: 'Urdu', glyphs: ['ت', 'ح', 'ق', 'ی', 'ع'] },
+  { language: 'Indonesian', glyphs: ['p', 'e', 't', 'n'] },
+  { language: 'Tagalog', glyphs: ['p', 'n', 'l', 'k'] },
+  { language: 'Georgian', glyphs: ['კ', 'ვ', 'ლ', 'ც', 'ო'] },
+  { language: 'Armenian', glyphs: ['հ', 'ե', 'տ', 'գ', 'ի'] },
+  { language: 'Yoruba', glyphs: ['ì', 'wá', 'dí', 'mọ̀'] },
+  { language: 'Irish', glyphs: ['t', 'a', 'i', 'e'] },
+  { language: 'Basque', glyphs: ['i', 'k', 'e', 'z'] },
+  { language: 'Welsh', glyphs: ['y', 'm', 'ch', 'w'] },
+]
+
+const COLORS = ['#4c4b42', '#5d5a4c', '#6c6049', '#4d5b52', '#66554a']
+
+const clamp = (value: number, low: number, high: number) => Math.max(low, Math.min(high, value))
 
 export function OnboardingBeads() {
   const canvasRef = useRef<HTMLCanvasElement>(null)
@@ -24,6 +71,8 @@ export function OnboardingBeads() {
 
     const reducedMotion = window.matchMedia('(prefers-reduced-motion: reduce)').matches
     const beads: Bead[] = []
+    let columns = 0
+    let rows = 0
     let width = 0
     let height = 0
     let frame = 0
@@ -43,19 +92,30 @@ export function OnboardingBeads() {
       context.setTransform(dpr, 0, 0, dpr, 0, 0)
 
       beads.length = 0
-      const spacingX = Math.max(15, Math.min(21, width / 64))
-      const startX = Math.max(width * 0.58, width - (COLUMNS + 2) * spacingX)
-      const spacingY = height / (ROWS - 1)
-      for (let column = 0; column < COLUMNS; column += 1) {
-        for (let row = 0; row < ROWS; row += 1) {
-          const restX = startX + column * spacingX
+      columns = clamp(Math.round(width / 41), 16, 36)
+      const spacingX = width / Math.max(1, columns - 1)
+      const spacingY = clamp(height / 38, 19, 25)
+      rows = Math.ceil((height + spacingY * 2) / spacingY)
+
+      for (let column = 0; column < columns; column += 1) {
+        const restX = column * spacingX
+        const stagger = (column % 4) * spacingY * 0.24
+        for (let row = 0; row < rows; row += 1) {
+          const lexicon = LANGUAGES[(column * 7 + row * 11) % LANGUAGES.length]
+          const restY = -spacingY + row * spacingY + stagger
           beads.push({
             x: restX,
+            y: restY,
             restX,
-            y: row * spacingY + (column % 2 ? spacingY * 0.3 : 0),
+            restY,
             vx: 0,
+            vy: 0,
+            column,
+            row,
+            glyph: lexicon.glyphs[(row * 5 + column * 3) % lexicon.glyphs.length],
+            language: lexicon.language,
             color: COLORS[(column * 3 + row) % COLORS.length],
-            radius: 2.6 + ((column + row * 2) % 4) * 0.32,
+            fontSize: 9.4 + ((column + row * 2) % 4) * 0.7,
           })
         }
       }
@@ -63,68 +123,89 @@ export function OnboardingBeads() {
 
     const draw = () => {
       context.clearRect(0, 0, width, height)
-      context.lineWidth = 0.7
-      context.globalAlpha = 0.23
-      for (let column = 0; column < COLUMNS; column += 1) {
-        const first = beads[column * ROWS]
+      context.lineWidth = 0.55
+      context.globalAlpha = 0.16
+      for (let column = 0; column < columns; column += 1) {
+        const first = beads[column * rows]
         if (!first) continue
         context.beginPath()
-        context.moveTo(first.x, -8)
-        for (let row = 0; row < ROWS; row += 1) {
-          const bead = beads[column * ROWS + row]
+        context.moveTo(first.restX, -8)
+        for (let row = 0; row < rows; row += 1) {
+          const bead = beads[column * rows + row]
           context.lineTo(bead.x, bead.y)
         }
-        context.strokeStyle = '#697050'
+        context.strokeStyle = '#575b45'
         context.stroke()
       }
-      context.globalAlpha = 0.78
+
+      context.textAlign = 'center'
+      context.textBaseline = 'middle'
       for (const bead of beads) {
-        context.beginPath()
-        context.arc(bead.x, bead.y, bead.radius, 0, Math.PI * 2)
+        if (bead.y < -18 || bead.y > height + 18) continue
+        context.globalAlpha = bead.row === 0 ? 0.76 : 0.5 + ((bead.column + bead.row) % 3) * 0.07
         context.fillStyle = bead.color
-        context.fill()
+        context.font = `500 ${bead.fontSize}px ui-serif, "Noto Serif", "Noto Sans", "Apple Symbols", Georgia, serif`
+        context.fillText(bead.glyph, bead.x, bead.y)
       }
       context.globalAlpha = 1
     }
 
     const tick = (now: number) => {
-      const step = Math.min(2, (now - last) / 16.67)
+      const step = Math.min(1.8, (now - last) / 16.67)
       last = now
       const pointerActive = Number.isFinite(pointerX) && Number.isFinite(pointerY)
-      const radius = 118
-      for (let column = 0; column < COLUMNS; column += 1) {
-        for (let row = 0; row < ROWS; row += 1) {
-          const index = column * ROWS + row
+      const influenceRadius = clamp(Math.min(width, height) * 0.25, 130, 220)
+
+      for (let column = 0; column < columns; column += 1) {
+        for (let row = 0; row < rows; row += 1) {
+          const index = column * rows + row
           const bead = beads[index]
           const above = row > 0 ? beads[index - 1] : null
-          const below = row + 1 < ROWS ? beads[index + 1] : null
-          let force = (bead.restX - bead.x) * 0.038
-          if (above) force += (above.x - bead.x) * 0.045
-          if (below) force += (below.x - bead.x) * 0.045
+          const below = row + 1 < rows ? beads[index + 1] : null
+          const drift = Math.sin(now * 0.00028 + column * 0.71 + row * 0.04) * 1.8
+          const anchorStrength = row === 0 ? 0.2 : 0.026
+          let forceX = (bead.restX + drift - bead.x) * anchorStrength
+          let forceY = (bead.restY - bead.y) * (row === 0 ? 0.22 : 0.055)
+
+          if (above) {
+            forceX += (above.x - bead.x) * 0.062
+            forceY += ((above.y + (bead.restY - above.restY)) - bead.y) * 0.028
+          }
+          if (below) {
+            forceX += (below.x - bead.x) * 0.062
+            forceY += ((below.y - (below.restY - bead.restY)) - bead.y) * 0.028
+          }
+
           if (pointerActive) {
-            const dx = bead.x - pointerX
-            const dy = bead.y - pointerY
-            const distance = Math.hypot(dx, dy)
-            if (distance < radius) {
-              const pressure = (1 - distance / radius) ** 2
-              force += (dx >= 0 ? 1 : -1) * pressure * 2.8
+            const dx = pointerX - bead.x
+            const dy = pointerY - bead.y
+            const distance = Math.max(1, Math.hypot(dx, dy))
+            if (distance < influenceRadius) {
+              const pressure = (1 - distance / influenceRadius) ** 2
+              forceX += (dx / distance) * pressure * 2.7
+              forceY += (dy / distance) * pressure * 0.82
             }
           }
-          bead.vx = (bead.vx + force * step) * (0.86 ** step)
+
+          bead.vx = (bead.vx + forceX * step) * (0.875 ** step)
+          bead.vy = (bead.vy + forceY * step) * (0.855 ** step)
         }
       }
-      for (const bead of beads) bead.x += bead.vx * step
+
+      for (const bead of beads) {
+        bead.x += bead.vx * step
+        bead.y += bead.vy * step
+      }
       draw()
       frame = window.requestAnimationFrame(tick)
     }
 
     const onPointerMove = (event: PointerEvent) => {
-      const bounds = canvas.getBoundingClientRect()
+      const bounds = host.getBoundingClientRect()
       pointerX = event.clientX - bounds.left
       pointerY = event.clientY - bounds.top
     }
-    const clearPointer = (event: PointerEvent) => {
-      if (event.relatedTarget) return
+    const clearPointer = () => {
       pointerX = Number.NaN
       pointerY = Number.NaN
     }
@@ -140,15 +221,15 @@ export function OnboardingBeads() {
     resize.observe(host)
     rebuild()
     draw()
-    window.addEventListener('pointermove', onPointerMove, { passive: true })
-    window.addEventListener('pointerout', clearPointer, { passive: true })
+    host.addEventListener('pointermove', onPointerMove, { passive: true })
+    host.addEventListener('pointerleave', clearPointer, { passive: true })
     document.addEventListener('visibilitychange', onVisibility)
     if (!reducedMotion) frame = window.requestAnimationFrame(tick)
     return () => {
       resize.disconnect()
       window.cancelAnimationFrame(frame)
-      window.removeEventListener('pointermove', onPointerMove)
-      window.removeEventListener('pointerout', clearPointer)
+      host.removeEventListener('pointermove', onPointerMove)
+      host.removeEventListener('pointerleave', clearPointer)
       document.removeEventListener('visibilitychange', onVisibility)
     }
   }, [])

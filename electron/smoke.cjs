@@ -1768,8 +1768,8 @@ a^2 + b^2 = c^2
   console.log('LAYOUT=' + JSON.stringify(layout))
 
   // 13b) the session-card GRID — ordinary navigation focuses one readable
-  //      card; the explicit split control can arrange more, with two columns
-  //      maximum and additional sessions stacked in the shorter column.
+  //      card; the first explicit pair stacks vertically at full width. A
+  //      third session opens the second column, then shorter columns fill.
   const splits = await win.webContents.executeJavaScript(`(async () => {
     const get = () => window.__kaisola.getState()
     const shown = () => document.querySelectorAll('.session-card[data-show="true"]').length
@@ -1785,7 +1785,7 @@ a^2 + b^2 = c^2
     const focusesByDefault = get().dockViews.length === 1 && get().dockViews[0] === tNew && shown() === 1
     get().addDockSplit(a1)
     await new Promise((r) => setTimeout(r, 120))
-    const explicitSplit = get().dockViews.length === 2 && get().dockGrid.length === 2 && shown() === 2
+    const explicitSplit = get().dockViews.length === 2 && get().dockGrid.length === 1 && get().dockGrid[0].length === 2 && shown() === 2
     const heads = document.querySelectorAll('.pane-head').length === 2
     // place the terminal BELOW the chat — one column, stacked
     get().placeDockView(tNew, a1, 'bottom')

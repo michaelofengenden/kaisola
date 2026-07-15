@@ -1602,6 +1602,10 @@ details.assistant-tool.tool-artifacts > summary::-webkit-details-marker { displa
   flex-direction: column;
   gap: 10px;
 }
+.assistant-stream:focus { outline: none; }
+.assistant-stream:focus-visible {
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--accent) 32%, transparent);
+}
 /* centered, calm empty state — the pane should feel open, not instructional */
 .assistant-empty {
   flex: 1;

@@ -17,7 +17,7 @@ const { registerAuthHandlers, disposeAuth } = require('./ipc/authHandler.cjs')
 const { registerFsHandlers, disposeFs } = require('./ipc/fsHandler.cjs')
 const { registerGrobidHandlers } = require('./ipc/grobidHandler.cjs')
 const { registerSandboxHandlers } = require('./ipc/sandboxHandler.cjs')
-const { registerDbHandlers } = require('./ipc/dbHandler.cjs')
+const { registerDbHandlers, dbGet, dbKeys, dbMutate } = require('./ipc/dbHandler.cjs')
 const { registerCodexHandlers } = require('./ipc/codexHandler.cjs')
 const { registerWorktreeHandlers } = require('./ipc/worktreeHandler.cjs')
 const { registerGitHandlers } = require('./ipc/gitHandler.cjs')
@@ -32,6 +32,21 @@ const { registerGlassHandlers, wireGlassEvents } = require('./ipc/glassHandler.c
 const { registerAssistantArchiveHandlers } = require('./ipc/assistantArchive.cjs')
 const { registerAttentionHandlers } = require('./ipc/attentionHandler.cjs')
 const { hardenWebviewAttachment, installPermissionPolicy, isSafeWebUrl, isTrustedRendererUrl } = require('./ipc/securityPolicy.cjs')
+const {
+  MANIFEST_KEY: WINDOW_MANIFEST_KEY,
+  OPEN_AT_QUIT,
+  PARKED,
+  idForSlot,
+  mostRecentParked,
+  occupiedSlots,
+  parseManifest,
+  removeEntry: removeManifestEntry,
+  restoreCandidates,
+  serializeManifest,
+  slotFromStoreKey,
+  storeKeysForSlot,
+  upsertEntry: upsertManifestEntry,
+} = require('./ipc/windowManifestPolicy.cjs')
 
 const DEV_URL = process.env.KAISOLA_DEV_URL ?? process.env.PASOLA_DEV_URL // set by `npm run electron:dev`
 const isDev = !!DEV_URL
@@ -136,7 +151,12 @@ try {
 const hasSingleInstanceLock = app.requestSingleInstanceLock()
 if (!hasSingleInstanceLock) app.quit()
 else app.on('second-instance', () => {
-  const win = BrowserWindow.getFocusedWindow() ?? BrowserWindow.getAllWindows().find((candidate) => !candidate.isDestroyed())
+  if (!app.isReady()) {
+    void app.whenReady().then(() => { focusSavedWindow(activateSavedWindows()) })
+    return
+  }
+  const focused = BrowserWindow.getFocusedWindow()
+  const win = focused && !focused.__kaisolaPop && !focused.__kaisolaDeleteBoot ? focused : activateSavedWindows()
   if (!win) return
   if (win.isMinimized()) win.restore()
   win.show()
@@ -209,7 +229,18 @@ function installAppMenu() {
         {
           label: 'New Window',
           accelerator: 'CmdOrCtrl+Shift+N',
-          click: () => createWindow({ slot: nextSlot++ }),
+          click: () => {
+            try { createWindow({ slot: freeSlot() }) }
+            catch {
+              void dialog.showMessageBox({
+                type: 'warning',
+                title: 'New window was not opened',
+                message: 'Kaisola could not verify which saved window slots are occupied.',
+                detail: 'No saved session was changed. Check that the app data directory is readable, then try again.',
+                buttons: ['OK'],
+              })
+            }
+          },
         },
         {
           label: 'New Tab',
@@ -287,12 +318,12 @@ const pendingOpenFiles = []
 let rendererReady = false
 function deliverOpenFile(filePath) {
   // never hand OS file-opens to a pop-out window — it has no Files surface
-  const win = BrowserWindow.getAllWindows().find((w) => !w.webContents.getURL().includes('pop=')) ?? null
+  const win = BrowserWindow.getAllWindows().find((w) => !w.__kaisolaPop && !w.__kaisolaDeleteBoot && !w.isDestroyed()) ?? null
   if (!win || !rendererReady) {
     pendingOpenFiles.push(filePath)
     // only pop-outs left (macOS keeps the app alive) → nothing would ever drain
     // the queue; spawn a full window whose did-finish-load delivers the file
-    if (!win && app.isReady()) createWindow({ slot: nextSlot++ })
+    if (!win && app.isReady()) activateSavedWindows()
     return
   }
   if (win.isMinimized()) win.restore()
@@ -313,10 +344,13 @@ const { parseInstallUrl } = require('./ipc/mcpCatalog.cjs')
 const pendingInstalls = []
 let installsReady = false
 function deliverInstall(req) {
-  const win = BrowserWindow.getFocusedWindow() ?? BrowserWindow.getAllWindows().find((w) => !w.webContents.isDestroyed())
+  const focused = BrowserWindow.getFocusedWindow()
+  const win = focused && !focused.__kaisolaPop && !focused.__kaisolaDeleteBoot
+    ? focused
+    : BrowserWindow.getAllWindows().find((w) => !w.__kaisolaPop && !w.__kaisolaDeleteBoot && !w.webContents.isDestroyed())
   if (!win || !installsReady) {
     pendingInstalls.push(req)
-    if (!win && app.isReady()) createWindow({ slot: nextSlot++ })
+    if (!win && app.isReady()) activateSavedWindows()
     return
   }
   if (win.isMinimized()) win.restore()
@@ -344,6 +378,11 @@ ipcMain.on('mcp:install-ready', (e) => {
 function createWindow(opts = {}) {
   const appIcon = loadAppIcon()
   const isPop = !!opts.pop
+  const slot = opts.slot == null ? null : Number(opts.slot)
+  const savedEntry = opts.savedEntry ?? null
+  const savedId = !isPop && !opts.untracked ? (opts.savedId ?? idForSlot(slot)) : null
+  const existingSaved = savedId ? liveSavedWindows.get(savedId) : null
+  if (existingSaved && !existingSaved.isDestroyed()) return existingSaved
   // Eco mode wants an OPAQUE window (occlusion culling returns,
   // no vibrancy tax) — transparency is a creation-time option, so the
   // renderer persists its preference in shell-prefs and it lands here on the
@@ -354,10 +393,12 @@ function createWindow(opts = {}) {
   const solidWin = isPop || readShellPrefs().solidWindow === true
   const solidBgRaw = readShellPrefs().solidBg
   const solidBg = /^#[0-9a-fA-F]{6}$/.test(solidBgRaw || '') ? solidBgRaw : '#0b0d11'
+  const restoreBounds = !isPop ? savedEntry?.bounds : null
   const win = new BrowserWindow({
-    ...(opts.adopt ? { show: false } : {}),
-    width: isPop ? 760 : 1440,
-    height: isPop ? 520 : 920,
+    ...((opts.adopt || opts.restore || opts.deleteBoot) ? { show: false } : {}),
+    width: restoreBounds?.width ?? (isPop ? 760 : 1440),
+    height: restoreBounds?.height ?? (isPop ? 520 : 920),
+    ...(restoreBounds ? { x: restoreBounds.x, y: restoreBounds.y } : {}),
     minWidth: isPop ? 420 : 1040,
     minHeight: isPop ? 280 : 680,
     title: isPop ? `${APP_NAME} — ${opts.title || 'Terminal'}` : `${APP_NAME} — Research IDE`,
@@ -381,11 +422,16 @@ function createWindow(opts = {}) {
   })
   trustedRendererContents.add(win.webContents)
   win.__kaisolaPop = isPop
-  win.__kaisolaSlot = opts.slot ? String(opts.slot) : null
+  win.__kaisolaSlot = slot == null ? null : String(slot)
+  win.__kaisolaSavedId = savedId
+  win.__kaisolaDeleteBoot = !!opts.deleteBoot
+  win.__kaisolaSuppressPark = false
+  win.__kaisolaDeleting = false
   win.__kaisolaAdoptBoot = !!opts.adopt
   win.__kaisolaPendingAdoption = !!opts.adopt
   win.__kaisolaPendingTheme = null
   win.__kaisolaLastFocus = Date.now()
+  if (savedId) trackSavedWindow(win, { entry: savedEntry, persist: !opts.deleteBoot })
   win.webContents.on('did-start-loading', () => adoptionReadyWc.delete(win.webContents.id))
   // A privileged preload is safe only while the top-level frame remains on the
   // exact packaged entry (or the configured Vite origin in development).
@@ -419,6 +465,7 @@ function createWindow(opts = {}) {
   nativeGlass.fallback = solidWin ? 'solid' : 'vibrancy'
   if (opts.slot) query.win = String(opts.slot)
   if (opts.adopt) query.adopt = '1' // tear-off adoption: boot pristine, never rehydrate the slot
+  if (opts.deleteBoot) query.deleteWindow = '1' // hydrate state, but mount only the deletion transaction listener
   if (opts.at && Number.isFinite(opts.at.x) && Number.isFinite(opts.at.y)) {
     // land the torn-off window under the drop point, clamped to that display
     const disp = screen.getDisplayNearestPoint({ x: Math.round(opts.at.x), y: Math.round(opts.at.y) })
@@ -453,6 +500,11 @@ function createWindow(opts = {}) {
   }
   win.once('ready-to-show', () => {
     if (!solidWin && tryLiquidGlass(win) && typeof win.setVibrancy === 'function') win.setVibrancy(null)
+    if (opts.restore && !opts.deleteBoot && !win.isDestroyed()) {
+      if (savedEntry?.maximized) win.maximize()
+      if (savedEntry?.fullScreen) win.setFullScreen(true)
+      win.show()
+    }
   })
   syncMacMaterial()
   // vibrancy nap: the under-window material keeps sampling the desktop even
@@ -495,9 +547,25 @@ function createWindow(opts = {}) {
   const wcId = win.webContents.id
   const rendererOwner = win.webContents
   win.on('close', (event) => {
-    if (appIsQuitting) return
+    if (appIsQuitting) {
+      if (win.__kaisolaSavedId) persistWindowSnapshot(win, OPEN_AT_QUIT)
+      return
+    }
+    if (win.__kaisolaSuppressPark || win.__kaisolaDeleting || win.__kaisolaDeleteBoot) return
     const state = acpRendererSwapState(rendererOwner)
-    if (state.safe) return
+    if (state.safe) {
+      if (win.__kaisolaSavedId && !persistWindowSnapshot(win, PARKED)) {
+        event.preventDefault()
+        void dialog.showMessageBox(win, {
+          type: 'warning',
+          title: 'Window was not closed',
+          message: 'Kaisola could not save this window safely.',
+          detail: 'Your sessions are still open. Try closing the window again after checking that the app data directory is writable.',
+          buttons: ['OK'],
+        })
+      }
+      return
+    }
     // A normal macOS window close is not an app quit. Preserve the live turn
     // and its request-specific stream listener instead of silently creating a
     // transcript/provider-context fork on reopen.
@@ -517,6 +585,7 @@ function createWindow(opts = {}) {
   })
   rendererOwner.once('destroyed', () => {
     adoptionReadyWc.delete(rendererOwner.id)
+    clearDeleteRendererWaiters(rendererOwner.id)
     // React cleanup does not reliably run on window crashes/closes. Main owns
     // the authoritative fallback: keep processes alive, but release all hot
     // renderer resources and leases for this exact WebContents.
@@ -532,6 +601,8 @@ function createWindow(opts = {}) {
     tabsByWc.delete(wcId)
     pendingAdoptions.delete(wcId)
     adoptionReadyWc.delete(wcId)
+    clearDeleteRendererWaiters(wcId)
+    untrackSavedWindow(win)
     if (!isPop) installAppMenu()
   })
 
@@ -550,7 +621,7 @@ function createWindow(opts = {}) {
     syncMacMaterial()
     sendWinState()
     // pop-out windows can't host file opens — leave the queue for a full shell
-    if (!isPop) {
+    if (!isPop && !opts.deleteBoot) {
       rendererReady = true
       for (const p of pendingOpenFiles.splice(0)) {
         win.webContents.send('files:open-external', { path: p })
@@ -581,9 +652,195 @@ function createWindow(opts = {}) {
 // Full windows are numbered slots (2, 3, …) so each keeps ITS OWN persisted
 // store — a second window is a fresh shell you point at a different folder,
 // and it comes back as itself next launch. Pop windows host one terminal card.
-let nextSlot = 2
+let windowManifest = []
+let windowManifestLoaded = false
+let windowManifestWritable = true
+let windowDeleteTransactions = 0
+let windowDeleteQuitRequested = false
+const liveSavedWindows = new Map() // manifest id → full BrowserWindow
+const deleteReadyWc = new Set()
+const pendingDeleteReady = new Map() // webContents.id → resolver
+const pendingDeleteAcks = new Map() // transaction id → { senderId, resolve, timer }
+const deletingSavedWindows = new Set()
 const popWindows = new Map() // termId → BrowserWindow
 const popTerminalMirrors = createPopMirrorCache({ retentionMs: 10 * 60_000, maxClosed: 128 })
+
+function broadcastSavedWindowsChanged() {
+  for (const win of BrowserWindow.getAllWindows()) {
+    if (win.__kaisolaPop || win.isDestroyed() || win.webContents.isDestroyed()) continue
+    win.webContents.send('window:saved-changed')
+  }
+}
+
+function commitWindowManifest(next) {
+  if (!windowManifestWritable) return false
+  const clean = parseManifest({ version: 1, entries: next })
+  try {
+    dbMutate({ set: { [WINDOW_MANIFEST_KEY]: serializeManifest(clean) } })
+  } catch {
+    return false
+  }
+  windowManifest = clean
+  try { broadcastSavedWindowsChanged() } catch { /* list IPC remains authoritative */ }
+  return true
+}
+
+function loadWindowManifest() {
+  if (windowManifestLoaded) return windowManifest
+  windowManifestLoaded = true
+  let raw = null
+  try { raw = dbGet(WINDOW_MANIFEST_KEY) } catch {
+    // Never overwrite an unreadable manifest with an empty one. The primary UI
+    // can still open, but close/delete stays fail-closed until a clean relaunch.
+    windowManifestWritable = false
+    return windowManifest
+  }
+  let entries = parseManifest(raw)
+  const known = new Set(entries.map((entry) => entry.id))
+  let changed = raw == null
+  let discovered = []
+  try {
+    discovered = [...new Set(dbKeys().map(slotFromStoreKey).filter((slot) => slot !== undefined))]
+  } catch { /* DB enumeration is migration-only; freeSlot still probes keys */ }
+  const now = Date.now()
+  for (let index = 0; index < discovered.length; index++) {
+    const slot = discovered[index]
+    const id = idForSlot(slot)
+    if (known.has(id)) continue
+    // Before the manifest existed, only the primary window was known to open
+    // automatically. Preserve every numbered store as parked rather than
+    // guessing that it was visible at the previous quit.
+    entries = upsertManifestEntry(entries, {
+      slot,
+      state: raw == null && slot == null ? OPEN_AT_QUIT : PARKED,
+      updatedAt: now - discovered.length + index,
+    })
+    known.add(id)
+    changed = true
+  }
+  windowManifest = entries
+  if (changed) {
+    try { dbMutate({ set: { [WINDOW_MANIFEST_KEY]: serializeManifest(entries) } }) } catch { /* UI can still run; later lifecycle writes retry */ }
+  }
+  return windowManifest
+}
+
+function savedWindowBounds(win) {
+  try {
+    return win.isMaximized() || win.isFullScreen() ? win.getNormalBounds() : win.getBounds()
+  } catch {
+    return undefined
+  }
+}
+
+function persistWindowSnapshot(win, state, patch = {}) {
+  const id = win?.__kaisolaSavedId
+  if (!id || win.__kaisolaDeleteBoot || win.isDestroyed()) return true
+  const current = windowManifest.find((entry) => entry.id === id)
+  const slot = win.__kaisolaSlot == null ? null : Number(win.__kaisolaSlot)
+  const next = upsertManifestEntry(windowManifest, {
+    ...current,
+    ...patch,
+    slot,
+    state,
+    bounds: savedWindowBounds(win) ?? current?.bounds,
+    maximized: win.isMaximized(),
+    fullScreen: win.isFullScreen(),
+    updatedAt: Date.now(),
+  })
+  return commitWindowManifest(next)
+}
+
+function scheduleWindowSnapshot(win) {
+  if (!win.__kaisolaSavedId || win.__kaisolaDeleteBoot || win.__kaisolaDeleting || win.isDestroyed()) return
+  if (win.__kaisolaManifestTimer) clearTimeout(win.__kaisolaManifestTimer)
+  win.__kaisolaManifestTimer = setTimeout(() => {
+    win.__kaisolaManifestTimer = null
+    persistWindowSnapshot(win, OPEN_AT_QUIT)
+  }, 220)
+  win.__kaisolaManifestTimer.unref?.()
+}
+
+function trackSavedWindow(win, { entry, persist = true } = {}) {
+  const id = win.__kaisolaSavedId
+  if (!id) return
+  liveSavedWindows.set(id, win)
+  win.on('move', () => scheduleWindowSnapshot(win))
+  win.on('resize', () => scheduleWindowSnapshot(win))
+  win.on('maximize', () => scheduleWindowSnapshot(win))
+  win.on('unmaximize', () => scheduleWindowSnapshot(win))
+  win.on('enter-full-screen', () => scheduleWindowSnapshot(win))
+  win.on('leave-full-screen', () => scheduleWindowSnapshot(win))
+  if (persist) persistWindowSnapshot(win, OPEN_AT_QUIT, entry ?? {})
+}
+
+function untrackSavedWindow(win) {
+  if (win.__kaisolaManifestTimer) clearTimeout(win.__kaisolaManifestTimer)
+  win.__kaisolaManifestTimer = null
+  const id = win.__kaisolaSavedId
+  if (id && liveSavedWindows.get(id) === win) liveSavedWindows.delete(id)
+}
+
+function fullWindows() {
+  return BrowserWindow.getAllWindows().filter((win) => !win.__kaisolaPop && !win.isDestroyed())
+}
+
+function visibleFullWindows() {
+  return fullWindows().filter((win) => !win.__kaisolaDeleteBoot && win.isVisible())
+}
+
+function focusSavedWindow(win) {
+  if (!win || win.isDestroyed()) return null
+  if (win.isMinimized()) win.restore()
+  if (!win.webContents.isLoadingMainFrame()) win.show()
+  win.focus()
+  return win
+}
+
+function reopenSavedEntry(entry, { deleteBoot = false } = {}) {
+  const existing = liveSavedWindows.get(entry.id)
+  if (existing && !existing.isDestroyed()) return deleteBoot ? existing : focusSavedWindow(existing)
+  return createWindow({
+    ...(entry.slot == null ? {} : { slot: entry.slot }),
+    savedId: entry.id,
+    savedEntry: entry,
+    restore: true,
+    deleteBoot,
+  })
+}
+
+function restoreSavedWindowsOnLaunch() {
+  loadWindowManifest()
+  const candidates = restoreCandidates(windowManifest, new Set(liveSavedWindows.keys()))
+  for (const entry of candidates) reopenSavedEntry(entry)
+  if (!candidates.length) activateSavedWindows()
+  return candidates.length
+}
+
+function activateSavedWindows() {
+  loadWindowManifest()
+  const visible = visibleFullWindows().sort((a, b) => (b.__kaisolaLastFocus || 0) - (a.__kaisolaLastFocus || 0))[0]
+  if (visible) return focusSavedWindow(visible)
+  const live = fullWindows().filter((win) => !win.__kaisolaDeleteBoot)[0]
+  if (live) return focusSavedWindow(live)
+  const parked = mostRecentParked(windowManifest)
+  if (parked) return reopenSavedEntry(parked)
+  const unrestored = restoreCandidates(windowManifest, new Set(liveSavedWindows.keys()))[0]
+  if (unrestored) return reopenSavedEntry(unrestored)
+  return createWindow({ savedId: 'primary' })
+}
+
+function savedWindowList(sender) {
+  loadWindowManifest()
+  return windowManifest.map((entry) => {
+    const live = liveSavedWindows.get(entry.id)
+    return {
+      ...entry,
+      open: !!live && !live.isDestroyed() && !live.__kaisolaDeleteBoot,
+      current: !!live && live.webContents === sender,
+    }
+  })
+}
 
 function projectWindows(projectId) {
   return BrowserWindow.getAllWindows().filter((win) =>
@@ -630,8 +887,58 @@ function closeUnownedProjectPops(projectId) {
 }
 
 ipcMain.handle('window:new', () => {
-  createWindow({ slot: nextSlot++ })
-  return { ok: true }
+  try {
+    createWindow({ slot: freeSlot() })
+    return { ok: true }
+  } catch {
+    return { ok: false, message: 'Kaisola could not verify a free saved-window slot.' }
+  }
+})
+
+let windowDeleteSeq = 0
+
+function clearDeleteRendererWaiters(senderId) {
+  deleteReadyWc.delete(senderId)
+  const ready = pendingDeleteReady.get(senderId)
+  if (ready) {
+    pendingDeleteReady.delete(senderId)
+    ready(false)
+  }
+  for (const [transactionId, pending] of pendingDeleteAcks) {
+    if (pending.senderId !== senderId) continue
+    pendingDeleteAcks.delete(transactionId)
+    clearTimeout(pending.timer)
+    pending.resolve({ ok: false, message: 'The saved window closed before teardown completed.' })
+  }
+}
+
+ipcMain.on('window:delete-ready', (event) => {
+  const win = BrowserWindow.fromWebContents(event.sender)
+  // A pristine tear-off renderer announces readiness before its project
+  // adoption commits the saved slot. Retain that readiness for the moment the
+  // same trusted full window becomes manifest-owned.
+  if (!win || win.__kaisolaPop) return
+  deleteReadyWc.add(event.sender.id)
+  const ready = pendingDeleteReady.get(event.sender.id)
+  if (ready) {
+    pendingDeleteReady.delete(event.sender.id)
+    ready(true)
+  }
+})
+
+ipcMain.on('window:prepare-delete-ack', (event, payload = {}) => {
+  const pending = pendingDeleteAcks.get(payload.transactionId)
+  if (!pending || pending.senderId !== event.sender.id) return
+  pendingDeleteAcks.delete(payload.transactionId)
+  clearTimeout(pending.timer)
+  const projectIds = Array.isArray(payload.projectIds)
+    ? payload.projectIds.filter((id) => typeof id === 'string' && /^[A-Za-z0-9_-]{1,240}$/.test(id)).slice(0, 1_000)
+    : []
+  pending.resolve({
+    ok: payload.ok === true,
+    projectIds,
+    ...(typeof payload.message === 'string' ? { message: payload.message.slice(0, 500) } : {}),
+  })
 })
 
 // Transactional Chrome-style project transfers. A drop over another Kaisola
@@ -704,17 +1011,20 @@ ipcMain.on('window:adopt-complete', (event, { transferId, ok } = {}) => {
 })
 // a torn-off window persists under its slot — NEVER hand it a slot that already
 // holds a saved session, or the first persist silently destroys that session.
-// (window:new keeps plain sequential slots on purpose: reopening slot 2 is how
-// a saved second window — or a previously torn-off project — comes back.)
+// New windows allocate only truly free slots; saved windows reopen through the
+// manifest IPC with their exact original slot and without adoption semantics.
 function freeSlot() {
-  const { dbGet } = require('./ipc/dbHandler.cjs')
-  const taken = (n) => {
-    try { return dbGet(`kaisola-store-w${n}`) != null || dbGet(`pasola-store-w${n}`) != null } catch { return false }
-  }
-  let n = nextSlot
-  while (taken(n)) n++
-  nextSlot = n + 1
-  return n
+  loadWindowManifest()
+  const manifestSlots = occupiedSlots(windowManifest)
+  const liveSlots = new Set(fullWindows().flatMap((win) => win.__kaisolaSlot == null ? [] : [Number(win.__kaisolaSlot)]))
+  // Enumerate atomically and fail closed. Guessing on an unreadable DB could
+  // hand a new renderer a slot whose first persist overwrites user state.
+  const storedSlots = new Set(dbKeys().map(slotFromStoreKey).filter((slot) => Number.isSafeInteger(slot)))
+  const taken = (n) => manifestSlots.has(n) || liveSlots.has(n) || storedSlots.has(n)
+  let n = 2
+  while (n <= 999_999 && taken(n)) n++
+  if (n <= 999_999) return n
+  throw new Error('No saved-window slot is available.')
 }
 function destroyDiscardedAdoptionWindow(win) {
   if (!win) return
@@ -776,7 +1086,11 @@ ipcMain.handle('window:detach-project', async (event, payload = {}) => {
   }
 
   const targetKind = target ? 'existing' : 'new'
-  if (!target) target = createWindow({ slot: freeSlot(), adopt: true, at: point })
+  if (!target) {
+    try { target = createWindow({ slot: freeSlot(), adopt: true, untracked: true, at: point }) } catch {
+      return { ok: false, message: 'Kaisola could not verify a free saved-window slot, so the project stayed here.' }
+    }
+  }
   const acpMove = await transferAcpProject(event.sender, target.webContents, payload.tab.id)
   if (!acpMove.ok) {
     if (targetKind === 'new') destroyDiscardedAdoptionWindow(target)
@@ -816,6 +1130,10 @@ ipcMain.handle('window:detach-project', async (event, payload = {}) => {
   acpMove.commit?.()
 
   if (!target.isDestroyed()) {
+    if (targetKind === 'new' && !target.__kaisolaSavedId) {
+      target.__kaisolaSavedId = idForSlot(Number(target.__kaisolaSlot))
+      trackSavedWindow(target)
+    }
     target.show()
     target.focus()
   }
@@ -924,6 +1242,13 @@ ipcMain.on('tabs:changed', (e, list) => {
   else tabsByWc.delete(e.sender.id)
   if (Array.isArray(list)) {
     const win = BrowserWindow.fromWebContents(e.sender)
+    const active = list.find((tab) => tab?.active) ?? list[0]
+    if (win?.__kaisolaSavedId && !win.__kaisolaDeleteBoot) {
+      persistWindowSnapshot(win, OPEN_AT_QUIT, {
+        title: typeof active?.title === 'string' ? active.title : undefined,
+        projectCount: list.length,
+      })
+    }
     for (const record of popTerminalMirrors.values()) replayPopRecord(win, record)
     // A normal project close updates this live tab list. Window teardown and
     // appearance swaps instead destroy WebContents without sending an empty
@@ -944,6 +1269,9 @@ ipcMain.on('win:set-title', (e, title) => {
   const win = BrowserWindow.fromWebContents(e.sender)
   if (!win || win.isDestroyed()) return
   win.setTitle(typeof title === 'string' && title ? `${title} — ${APP_NAME}` : APP_NAME)
+  if (win.__kaisolaSavedId && !win.__kaisolaDeleteBoot && typeof title === 'string' && title) {
+    persistWindowSnapshot(win, OPEN_AT_QUIT, { title })
+  }
 })
 
 // Liquid Glass preference — read by Settings, applied on next launch
@@ -1016,10 +1344,19 @@ ipcMain.handle('shell:reapply-window', (e) => {
   const bounds = win.isFullScreen() ? win.getNormalBounds() : win.getBounds()
   const wasMaximized = win.isMaximized()
   const wasFullScreen = win.isFullScreen()
+  const savedId = win.__kaisolaSavedId
+  const savedEntry = windowManifest.find((entry) => entry.id === savedId)
   windowModeSwapCount++
   reapplyingWindows++
+  win.__kaisolaSuppressPark = true
+  if (savedId) persistWindowSnapshot(win, OPEN_AT_QUIT)
   win.once('closed', () => {
-    const next = createWindow(slot ? { slot: Number(slot) } : {})
+    const next = createWindow({
+      ...(slot ? { slot: Number(slot) } : {}),
+      ...(savedId ? { savedId } : {}),
+      ...(savedEntry ? { savedEntry: { ...savedEntry, bounds, maximized: wasMaximized, fullScreen: wasFullScreen } } : {}),
+      restore: true,
+    })
     if (bounds) next.setBounds(bounds)
     next.once('ready-to-show', () => {
       if (wasMaximized) next.maximize()
@@ -1099,6 +1436,7 @@ if (hasSingleInstanceLock) app.whenReady().then(() => {
   registerGrobidHandlers(ipcMain)
   registerSandboxHandlers(ipcMain)
   registerDbHandlers(ipcMain)
+  loadWindowManifest()
   registerCodexHandlers(ipcMain)
   registerWorktreeHandlers(ipcMain)
   registerGitHandlers(ipcMain)
@@ -1112,16 +1450,16 @@ if (hasSingleInstanceLock) app.whenReady().then(() => {
   registerGlassHandlers(ipcMain)
   registerAssistantArchiveHandlers(ipcMain, path.join(app.getPath('userData'), 'assistant-archives'))
   registerAttentionHandlers(ipcMain, { app, BrowserWindow, Notification })
-  createWindow()
+  restoreSavedWindowsOnLaunch()
   app.on('activate', () => {
-    if (BrowserWindow.getAllWindows().length === 0) createWindow()
+    if (visibleFullWindows().length === 0) activateSavedWindows()
   })
 })
 
 app.on('window-all-closed', () => {
   // A mode swap closes the old renderer before constructing its replacement.
   // Do not treat that intentional gap as an application quit on Windows/Linux.
-  if (process.platform !== 'darwin' && reapplyingWindows === 0) app.quit()
+  if (process.platform !== 'darwin' && reapplyingWindows === 0 && windowDeleteTransactions === 0) app.quit()
 })
 
 // Energy: while the user works elsewhere, terminals stream in a slower profile
@@ -1167,6 +1505,22 @@ app.on('before-quit', (event) => {
         }
       })
     }
+    return
+  }
+  let manifestSaved = true
+  for (const win of fullWindows()) {
+    if (!win.__kaisolaDeleting && !win.__kaisolaDeleteBoot && !persistWindowSnapshot(win, OPEN_AT_QUIT)) manifestSaved = false
+  }
+  if (!manifestSaved) {
+    event.preventDefault()
+    appIsQuitting = false
+    void dialog.showMessageBox({
+      type: 'warning',
+      title: 'Kaisola stayed open',
+      message: 'The open-window list could not be saved safely.',
+      detail: 'No window was closed. Check that the app data directory is writable, then quit again.',
+      buttons: ['OK'],
+    }).catch(() => {})
     return
   }
   appIsQuitting = true

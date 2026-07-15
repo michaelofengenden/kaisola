@@ -27,8 +27,7 @@
     "postinstall": "node scripts/postinstall.cjs",
     "dist": "vite build && node scripts/package.cjs",
     "dist:dir": "vite build && electron-builder --dir",
-    "release:fast": "node scripts/release-fast.cjs",
-    "doctor": "npx react-doctor@latest"
+    "release:fast": "node scripts/release-fast.cjs"
   },
   "build": {
     "appId": "app.kaisola.desktop",
@@ -207,7 +206,6 @@
     "cross-env": "^7.0.3",
     "electron": "^39.8.5",
     "electron-builder": "^26.15.3",
-    "react-doctor": "^0.7.7",
     "typescript": "^5.6.3",
     "vite": "^7.3.6",
     "wait-on": "^8.0.5"

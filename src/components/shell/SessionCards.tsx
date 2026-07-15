@@ -98,13 +98,20 @@ export function SessionCards() {
   const dragRef = useRef<string | null>(null)
   const gridRef = useRef<HTMLDivElement>(null)
   const [drop, setDrop] = useState<{ id: string; edge: Edge } | null>(null)
+  const [maximizedId, setMaximizedId] = useState<string | null>(null)
+  useEffect(() => {
+    if (maximizedId && !grid.some((column) => column.includes(maximizedId))) setMaximizedId(null)
+  }, [grid, maximizedId])
 
   if (!open) return null
 
+  const displayGrid = maximizedId ? [[maximizedId]] : grid
+
   // column widths: stored fr weights when they match the current column count,
   // equal shares otherwise (adding/removing a card resets to equal)
-  const weights =
-    dockColWeights && dockColWeights.length === grid.length ? dockColWeights : grid.map(() => 1)
+  const weights = maximizedId
+    ? [1]
+    : dockColWeights && dockColWeights.length === displayGrid.length ? dockColWeights : displayGrid.map(() => 1)
 
   // drag the divider between column i and i+1 — pure weight transfer, so the
   // other columns keep their size
@@ -161,9 +168,9 @@ export function SessionCards() {
 
   // uneven stacks share one grid: rows = lcm of the column heights, so a
   // lone card spans what two stacked neighbours split between them
-  const rows = grid.reduce((m, col) => lcm(m, col.length), 1)
+  const rows = displayGrid.reduce((m, col) => lcm(m, col.length), 1)
   const pos = new Map<string, { col: number; row: number; span: number }>()
-  grid.forEach((col, ci) =>
+  displayGrid.forEach((col, ci) =>
     col.forEach((id, ri) => {
       const span = rows / col.length
       pos.set(id, { col: ci + 1, row: ri * span + 1, span })
@@ -188,13 +195,15 @@ export function SessionCards() {
     // The session tab already carries identity + working/completed state. A
     // second title bar earns its height only when there are multiple movable
     // cards or meaningful cross-workspace metadata.
-    const showHead = !!p && (!soloCard || !!idn?.sub)
+    const showHead = !!p && (!soloCard || !!idn?.sub || !!maximizedId || grid.flat().length > 1)
     return (
       <div
         key={id}
         className="session-card"
+        data-session-id={id}
         data-show={!!p}
         data-headless={!!p && !showHead || undefined}
+        data-maximized={maximizedId === id || undefined}
         data-drop={drop?.id === id && dragRef.current && dragRef.current !== id ? drop.edge : undefined}
         style={{
           ...(p ? { gridColumn: p.col, gridRow: `${p.row} / span ${p.span}` } : {}),
@@ -203,6 +212,7 @@ export function SessionCards() {
         onDragOver={(e) => {
           if (!dragRef.current || dragRef.current === id) return
           e.preventDefault()
+          e.dataTransfer.dropEffect = 'move'
           const edge = edgeAt(e, e.currentTarget)
           setDrop((d) => (d?.id === id && d.edge === edge ? d : { id, edge }))
         }}
@@ -219,8 +229,13 @@ export function SessionCards() {
         {showHead && (
           <div
             className="pane-head"
-            draggable
-            onDragStart={() => { dragRef.current = id; shellDrag.start() }}
+            draggable={!maximizedId}
+            onDragStart={(event) => {
+              dragRef.current = id
+              event.dataTransfer.effectAllowed = 'move'
+              event.dataTransfer.setData('text/plain', id)
+              shellDrag.start()
+            }}
             onDragEnd={() => { dragRef.current = null; setDrop(null); shellDrag.end() }}
             title="Drag onto another card's edge to place it there"
           >
@@ -265,8 +280,18 @@ export function SessionCards() {
                 <Icon name="PictureInPicture2" size={11} />
               </button>
             )}
-            <button type="button" className="pane-head-close" onClick={() => removeDockView(id)} title="Close this card" aria-label={`Close ${label} card`}>
-              <Icon name="X" size={11} />
+            <button
+              type="button"
+              className="pane-head-close"
+              draggable={false}
+              onClick={() => setMaximizedId(maximizedId === id ? null : id)}
+              title={maximizedId === id ? 'Restore card layout' : 'Maximize this card'}
+              aria-label={maximizedId === id ? `Restore ${label} card layout` : `Maximize ${label} card`}
+            >
+              <Icon name={maximizedId === id ? 'Minimize2' : 'Maximize2'} size={11} />
+            </button>
+            <button type="button" className="pane-head-close" draggable={false} onClick={() => { if (maximizedId === id) setMaximizedId(null); removeDockView(id) }} title="Minimize this card" aria-label={`Minimize ${label} card`}>
+              <Icon name="Minus" size={11} />
             </button>
           </div>
         )}

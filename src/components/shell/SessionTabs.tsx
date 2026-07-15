@@ -46,12 +46,14 @@ export function SessionTabs({ orientation = 'horizontal', filter = '' }: { orien
   const activeProject = useKaisola((s) => s.projectTabs.find((project) => project.id === s.activeProjectId))
   const sessionGroups = useKaisola((s) => s.sessionGroups)
   const pinnedSessions = useKaisola((s) => s.pinnedSessions)
+  const sessionOrder = useKaisola((s) => s.sessionOrder)
   const needsYou = useKaisola((s) => s.needsYou)
   const pendingPermissions = useKaisola((s) => s.pendingPermissions)
   const dockViews = useKaisola((s) => s.dockViews)
   const dockOpen = useKaisola((s) => s.dockOpen)
   const setTabLayout = useKaisola((s) => s.setTabLayout)
   const switchSession = useKaisola((s) => s.switchSession)
+  const reorderSessions = useKaisola((s) => s.reorderSessions)
   const addDockSplit = useKaisola((s) => s.addDockSplit)
   const removeDockView = useKaisola((s) => s.removeDockView)
   const popOutTerminal = useKaisola((s) => s.popOutTerminal)
@@ -89,6 +91,7 @@ export function SessionTabs({ orientation = 'horizontal', filter = '' }: { orien
   const [menu, setMenu] = useState<{ x: number; y: number; id: string } | null>(null)
   const menuTriggerRef = useRef<HTMLElement | null>(null)
   const menuRef = useRef<HTMLDivElement>(null)
+  const dragRef = useRef<string | null>(null)
   const closeMenu = useCallback(() => setMenu(null), [])
   useClickAway(!!menu, closeMenu, menuTriggerRef, menuRef)
 
@@ -180,6 +183,7 @@ export function SessionTabs({ orientation = 'horizontal', filter = '' }: { orien
     panels,
     sessionGroups,
     pinnedSessions,
+    sessionOrder,
   })
 
   const closeTab = (t: STab) => {
@@ -311,6 +315,27 @@ export function SessionTabs({ orientation = 'horizontal', filter = '' }: { orien
                 data-state={t.state}
                 style={{ '--sid': t.hue } as CSSProperties}
                 title={t.title}
+                draggable={editing !== t.id}
+                onDragStart={(event) => {
+                  dragRef.current = t.id
+                  event.dataTransfer.effectAllowed = 'move'
+                  event.dataTransfer.setData('text/plain', t.id)
+                  event.currentTarget.setAttribute('data-dragging', 'true')
+                }}
+                onDragOver={(event) => {
+                  if (!dragRef.current || dragRef.current === t.id) return
+                  event.preventDefault()
+                  event.dataTransfer.dropEffect = 'move'
+                }}
+                onDrop={(event) => {
+                  event.preventDefault()
+                  if (dragRef.current && dragRef.current !== t.id) reorderSessions(dragRef.current, t.id)
+                  dragRef.current = null
+                }}
+                onDragEnd={(event) => {
+                  event.currentTarget.removeAttribute('data-dragging')
+                  dragRef.current = null
+                }}
               >
                 {editing === t.id ? (
                   <input

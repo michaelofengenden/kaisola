@@ -81,7 +81,7 @@ app.whenReady().then(async () => {
     return false
   }
   await wait(900)
-  await win.webContents.executeJavaScript(`(() => {
+  const initialLayoutPolicy = await win.webContents.executeJavaScript(`(() => {
     const state = window.__kaisola.getState()
     state.clearProject()
     state.setWorkspace(${JSON.stringify(workspace)})
@@ -95,6 +95,12 @@ app.whenReady().then(async () => {
     state.setRailWidth(280)
     const now = window.__kaisola.getState()
     const visibleThreads = now.assistantThreads.filter((thread) => !thread.groupParentId)
+    const soloThread = visibleThreads.find((thread) => !thread.group)
+    if (soloThread) now.updateAssistantRuntime(soloThread.id, (runtime) => ({
+      ...runtime,
+      turns: [{ kind: 'assistant', at: Date.now(), text: 'A compact Codex response remains fully scrollable inside its two-line viewport. '.repeat(18) }],
+      first: false,
+    }))
     const ids = [
       visibleThreads.find((thread) => thread.group)?.id,
       now.terminals[0]?.id,
@@ -102,7 +108,12 @@ app.whenReady().then(async () => {
       now.panels.find((panel) => panel.kind === 'git')?.id,
       now.panels.find((panel) => panel.kind === 'browser')?.id,
     ].filter(Boolean)
+    window.__kaisola.setState({ dockGrid: [[ids[0]]], dockViews: [ids[0]], dockOpen: true, canvasOpen: true })
+    window.__kaisola.getState().addDockSplit(ids[1])
+    const paired = window.__kaisola.getState().dockGrid
+    const stackedPair = paired.length === 1 && paired[0]?.join(',') === ids.slice(0, 2).join(',')
     window.__kaisola.setState({ dockGrid: [[ids[0], ids[1], ids[4]], [ids[2], ids[3]]], dockViews: ids, dockOpen: true, canvasOpen: true })
+    return { stackedPair, ids }
   })()`)
   await wait(1000)
 
@@ -140,6 +151,49 @@ app.whenReady().then(async () => {
   })()`)
 
   const wide = await inspect('wide-mixed')
+  const condensedChat = await win.webContents.executeJavaScript(`(() => {
+    const body = document.querySelector('.assistant:not(.group-workers .assistant) .assistant-turn.turn-condensed .turn-text')
+    return !!body && body.clientHeight <= 48 && body.scrollHeight > body.clientHeight && getComputedStyle(body).overflowY === 'auto'
+  })()`)
+  const sessionDrag = await win.webContents.executeJavaScript(`(() => {
+    const known = ${JSON.stringify(initialLayoutPolicy.ids)}
+    const source = document.querySelector('.stab[data-sid="' + known[known.length - 1] + '"]')
+    const target = document.querySelector('.stab[data-sid="' + known[0] + '"]')
+    if (!source || !target) return { ok: false }
+    const transfer = new DataTransfer()
+    source.dispatchEvent(new DragEvent('dragstart', { bubbles: true, cancelable: true, dataTransfer: transfer }))
+    target.dispatchEvent(new DragEvent('dragover', { bubbles: true, cancelable: true, dataTransfer: transfer }))
+    target.dispatchEvent(new DragEvent('drop', { bubbles: true, cancelable: true, dataTransfer: transfer }))
+    source.dispatchEvent(new DragEvent('dragend', { bubbles: true, cancelable: true, dataTransfer: transfer }))
+    return {
+      ok: window.__kaisola.getState().sessionOrder[0] === known[known.length - 1],
+      effectAllowed: transfer.effectAllowed,
+      dropEffect: transfer.dropEffect,
+    }
+  })()`)
+  const maximizeStarted = await win.webContents.executeJavaScript(`(() => {
+    const button = document.querySelector('.session-card[data-show="true"] [aria-label^="Maximize "]')
+    if (!button) return false
+    button.click()
+    return true
+  })()`)
+  await wait(120)
+  const maximized = await win.webContents.executeJavaScript(`document.querySelectorAll('.session-card[data-show="true"]').length === 1 && !!document.querySelector('.session-card[data-maximized="true"] [aria-label^="Restore "]')`)
+  await win.webContents.executeJavaScript(`document.querySelector('.session-card[data-maximized="true"] [aria-label^="Restore "]')?.click()`)
+  await wait(120)
+  const restoredCards = await win.webContents.executeJavaScript(`document.querySelectorAll('.session-card[data-show="true"]').length`)
+  const minimizedId = await win.webContents.executeJavaScript(`(() => {
+    const button = document.querySelector('.session-card[data-show="true"] [aria-label^="Minimize "]')
+    const card = button?.closest('.session-card')
+    if (!button || !card) return ''
+    button.click()
+    return card.dataset.sessionId || ''
+  })()`)
+  await wait(120)
+  const minimized = minimizedId && await win.webContents.executeJavaScript(`!window.__kaisola.getState().dockViews.includes(${JSON.stringify(minimizedId)})`)
+  if (minimizedId) await win.webContents.executeJavaScript(`window.__kaisola.getState().addDockSplit(${JSON.stringify(minimizedId)})`)
+  await wait(120)
+  const cardLayoutControls = { maximizeStarted, maximized, restoredCards, minimized: !!minimized }
   const savedWindowsControl = await win.webContents.executeJavaScript(`!!document.querySelector('.tabstrip [aria-label="Saved windows"]')`)
   const terminalUsesWorkspace = await win.webContents.executeJavaScript(`window.__kaisola.getState().terminals.find((terminal) => terminal.name === 'Shell matrix')?.cwd === ${JSON.stringify(workspace)}`)
 
@@ -298,6 +352,10 @@ app.whenReady().then(async () => {
 
   const result = {
     wide,
+    condensedChat,
+    initialLayoutPolicy,
+    sessionDrag,
+    cardLayoutControls,
     savedWindowsControl,
     terminalUsesWorkspace,
     closePoint,
@@ -326,6 +384,13 @@ app.whenReady().then(async () => {
   const layoutsOk = [wide, medium, compact, top].every((view) => view.bodyFits && view.sidebarFits !== false && view.cardsFit && view.controlsFit)
   const passed = layoutsOk
     && wide.cardCount >= 5
+    && condensedChat
+    && initialLayoutPolicy.stackedPair
+    && sessionDrag.ok
+    && cardLayoutControls.maximizeStarted
+    && cardLayoutControls.maximized
+    && cardLayoutControls.restoredCards >= 5
+    && cardLayoutControls.minimized
     && Object.values(wide.visibleKinds).every(Boolean)
     && savedWindowsControl
     && closePoint?.topmost

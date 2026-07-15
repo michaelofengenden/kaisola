@@ -1415,6 +1415,7 @@
   transition: background var(--dur-2) var(--ease-out), color var(--dur-2) var(--ease-out),
     border-color var(--dur-2) var(--ease-out);
 }
+.stab[data-dragging='true'] { opacity: .48; }
 .stab-select {
   position: absolute;
   inset: 0;

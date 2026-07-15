@@ -500,6 +500,8 @@ export interface WorktreeSession {
   path: string
   branch: string
   repo: string
+  /** Exact commit the isolated assignment branched from. */
+  base?: string
 }
 
 /**
@@ -740,7 +742,7 @@ export const PROJECT_SLICE_PERSIST_KEYS = [
   'project', 'stage', 'layoutMode', 'workspacePath', 'autonomy', 'agentPreset', 'claudeAccountId', 'fileTabs', 'openFilePath',
   'repoCheckpoints', 'followAgent', 'annotations', 'assistantThreads', 'assistantRuntimes',
   'assistantDrafts', 'assistantPromptQueues',
-  'activeThreadId', 'terminals', 'panels', 'sessionGroups', 'pinnedSessions', 'worktreeSessions',
+  'activeThreadId', 'terminals', 'panels', 'sessionGroups', 'pinnedSessions', 'sessionOrder', 'worktreeSessions',
   // recently-closed sessions persist (trimmed) so "reopen closed tab" still
   // works after an app restart — agent threads keep their acpSessionId, so a
   // restored thread resumes its agent-side session too
@@ -911,6 +913,8 @@ interface KaisolaState {
   sessionGroups: SessionGroup[]
   /** Pinned session ids — top of the rail, close hidden (Chrome pinned tabs). */
   pinnedSessions: string[]
+  /** User-defined session order shared by tabs, shortcuts, and the palette. */
+  sessionOrder: string[]
   /** Recently closed sessions, newest first (⌘⇧T reopens; term ptys get a 60s grace). */
   closedStack: ClosedSession[]
   /** Sessions waiting on the human: permission pending or turn finished unseen. */
@@ -1165,6 +1169,8 @@ interface KaisolaState {
   switchSession: (id: string) => void
   /** Ctrl+Tab / Ctrl+Shift+Tab — cycle the focused card through sessions. */
   cycleSession: (dir: 1 | -1) => void
+  /** Move one session before another in the shared tab/shortcut order. */
+  reorderSessions: (srcId: string, destId: string) => void
   togglePinSession: (id: string) => void
   setSessionGroupColor: (id: string, color?: string) => void
   /** Flag a session as waiting on the human (amber dot; cleared on view). */
@@ -1759,7 +1765,7 @@ function titleFrom(text: string, max = 34): string | undefined {
  * and the rail itself all share: pinned first, then grouped (group by
  * group), then everything else in natural order.
  */
-export function sessionOrderIds(s: Pick<KaisolaState, 'assistantThreads' | 'terminals' | 'agentTerminals' | 'panels' | 'sessionGroups' | 'pinnedSessions'>): string[] {
+export function sessionOrderIds(s: Pick<KaisolaState, 'assistantThreads' | 'terminals' | 'agentTerminals' | 'panels' | 'sessionGroups' | 'pinnedSessions'> & { sessionOrder?: string[] }): string[] {
   const natural = [
     ...s.assistantThreads.flatMap((thread) => thread.groupParentId ? [] : [thread.id]),
     ...s.terminals.map((t) => t.id),
@@ -1767,11 +1773,14 @@ export function sessionOrderIds(s: Pick<KaisolaState, 'assistantThreads' | 'term
     ...s.panels.map((p) => p.id),
   ]
   const alive = new Set(natural)
-  const pinned = s.pinnedSessions.filter((id) => alive.has(id))
-  const pinnedIds = new Set(pinned)
-  const grouped = s.sessionGroups.flatMap((group) => group.members.filter((id) => alive.has(id) && !pinnedIds.has(id)))
+  const custom = (s.sessionOrder ?? []).filter((id, index, order) => alive.has(id) && order.indexOf(id) === index)
+  const customIds = new Set(custom)
+  const ordered = [...custom, ...natural.filter((id) => !customIds.has(id))]
+  const pinnedIds = new Set(s.pinnedSessions.filter((id) => alive.has(id)))
+  const pinned = ordered.filter((id) => pinnedIds.has(id))
+  const grouped = s.sessionGroups.flatMap((group) => ordered.filter((id) => group.members.includes(id) && !pinnedIds.has(id)))
   const groupedIds = new Set(grouped)
-  const rest = natural.filter((id) => !pinnedIds.has(id) && !groupedIds.has(id))
+  const rest = ordered.filter((id) => !pinnedIds.has(id) && !groupedIds.has(id))
   return [...pinned, ...grouped, ...rest]
 }
 
@@ -1906,6 +1915,7 @@ const freshSlice = (pid: string, path: string | null = null): ProjectSliceMemory
     panels: [],
     sessionGroups: [],
     pinnedSessions: [],
+    sessionOrder: [],
     worktreeSessions: {},
     latexMode: false,
     // a NEW empty tab is a clean homescreen — just the launcher, no cards; a
@@ -2128,6 +2138,7 @@ function sanitizeSliceForPersist(slice: ProjectSliceMemory): ProjectSlicePersist
       return members.length ? [{ ...group, members }] : []
     }),
     pinnedSessions: slice.pinnedSessions.filter((id) => validIds.has(id)),
+    sessionOrder: slice.sessionOrder.filter((id) => validIds.has(id)),
     // recently-closed history, kept light on disk: closed threads carry only a
     // transcript tail (full history stays in main's archive), closed terminals
     // shed live-only fields, dead same-process receipts are dropped
@@ -2395,6 +2406,7 @@ function migrateFlatV5(persisted: unknown): Partial<KaisolaState> {
       return members.length ? [{ ...group, members }] : []
     }),
     pinnedSessions: (state.pinnedSessions ?? []).filter((id) => validIds.has(id)),
+    sessionOrder: (state.sessionOrder ?? []).filter((id) => validIds.has(id)),
     sessionTemplates: state.sessionTemplates ?? [],
     worktreeSessions: state.worktreeSessions ?? {},
     latexMode: state.latexMode ?? false,
@@ -2447,6 +2459,7 @@ export const useKaisola = create<KaisolaState>()(
   enabledAgents: ['claude-code', 'codex', 'opencode'],
   sessionGroups: [],
   pinnedSessions: [],
+  sessionOrder: [],
   closedStack: [],
   needsYou: {},
   keymapOverrides: {},
@@ -2681,6 +2694,12 @@ export const useKaisola = create<KaisolaState>()(
       // The one-click split affordance protects readable width: two columns
       // maximum, then additional explicitly-opened sessions stack in the
       // shorter column. Dragging a card edge remains the advanced escape hatch.
+      // Two panes are easiest to scan as a vertical pair: both keep the full
+      // card width and divide the available height. A third pane starts the
+      // second column; later panes fill whichever column is shorter.
+      if (s.dockGrid.length === 1 && s.dockGrid[0].length === 1) {
+        return gridState([[...s.dockGrid[0], id]], { dockOpen: true, needsYou })
+      }
       if (s.dockGrid.length < 2) return gridState([...s.dockGrid, [id]], { dockOpen: true, needsYou })
       const next = s.dockGrid.map((column) => [...column])
       const target = next.reduce((best, column, index) => column.length < next[best].length ? index : best, 0)
@@ -3220,6 +3239,17 @@ export const useKaisola = create<KaisolaState>()(
       if (!visibleDockIds.has(next)) { s.switchSession(next); return }
     }
   },
+  reorderSessions: (srcId, destId) =>
+    set((s) => {
+      if (srcId === destId) return s
+      const order = sessionOrderIds(s)
+      const from = order.indexOf(srcId)
+      const to = order.indexOf(destId)
+      if (from < 0 || to < 0) return s
+      const [moved] = order.splice(from, 1)
+      order.splice(to, 0, moved)
+      return { sessionOrder: order }
+    }),
   togglePinSession: (id) =>
     set((s) => ({
       pinnedSessions: s.pinnedSessions.includes(id)

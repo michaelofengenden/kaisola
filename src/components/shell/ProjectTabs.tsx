@@ -125,8 +125,15 @@ export function ProjectTabs() {
               data-state={state}
               style={{ '--ptab-hue': tab.color ?? tab.hue } as CSSProperties}
               draggable={editing !== tab.id}
-              onDragStart={() => (dragRef.current = tab.id)}
-              onDragOver={(e) => e.preventDefault()}
+              onDragStart={(event) => {
+                dragRef.current = tab.id
+                event.dataTransfer.effectAllowed = 'move'
+                event.dataTransfer.setData('text/plain', tab.id)
+              }}
+              onDragOver={(event) => {
+                event.preventDefault()
+                event.dataTransfer.dropEffect = 'move'
+              }}
               onDrop={() => { if (dragRef.current) reorderProjects(dragRef.current, tab.id); dragRef.current = null }}
               onDragEnd={(e) => {
                 // Dropped outside THIS window: main hit-tests other Kaisola tab

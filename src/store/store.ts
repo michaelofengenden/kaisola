@@ -758,6 +758,15 @@ export const PROJECT_SLICE_MEMORY_KEYS = [
  * of the app theme. Keep the color math in Terminal.tsx + tokens.css in sync. */
 export type TermBackground = 'ink' | 'slate' | 'paper'
 
+/** Terminal line-spacing presets: compact keeps the font's natural cell height
+ * (the pre-setting density), comfortable is the default, airy the loosest.
+ * Values outside this range distort TUI geometry, so the setter clamps to it. */
+export const TERM_LINE_HEIGHTS = { compact: 1.0, comfortable: 1.2, airy: 1.25 } as const
+export const clampTermLineHeight = (value: number | null | undefined): number =>
+  typeof value === 'number' && Number.isFinite(value)
+    ? Math.min(TERM_LINE_HEIGHTS.airy, Math.max(TERM_LINE_HEIGHTS.compact, value))
+    : TERM_LINE_HEIGHTS.comfortable
+
 /** A named Claude subscription: an isolated CLAUDE_CONFIG_DIR the Claude CLI
  * runs under. Projects bind to one by id (''= the default ~/.claude), so two
  * project tabs can run two different subscriptions side by side. */
@@ -794,7 +803,7 @@ const claudeSettingsFlags = (s: Pick<KaisolaState, 'claudeFastMode' | 'defaultAu
 
 const GLOBAL_KEYS = [
   'theme', 'themeMode', 'agentModels', 'fileTextZoom', 'termFontSize', 'termFontFamily',
-  'termFontWeight', 'termCursorColor', 'termBackground', 'customAgents', 'enabledAgents', 'sessionTemplates', 'claudeModel', 'reasoningProvider',
+  'termFontWeight', 'termCursorColor', 'termBackground', 'termLineHeight', 'customAgents', 'enabledAgents', 'sessionTemplates', 'claudeModel', 'reasoningProvider',
   'localBaseUrl', 'localModel', 'openaiBaseUrl', 'openaiModel', 'openAlexMailto', 'grobidEndpoint',
   'sandboxMode', 'workflows', 'automationsEnabled', 'perfMode', 'tabLayout', 'railWidth', 'sessionRailWidth', 'railOpen', 'claudeSessions',
   'wordDiffs', 'showCosts', 'inbox', 'draftRestore', 'wallpaperTint', 'claudeAccounts',
@@ -1000,6 +1009,10 @@ interface KaisolaState {
   termCursorColor: string
   /** Terminal surface tone: ink (near-black) / slate / paper (white). Persisted. */
   termBackground: TermBackground
+  /** Terminal line spacing (xterm lineHeight multiplier) — see
+   * TERM_LINE_HEIGHTS. Spacing only: font family/size/weight are untouched.
+   * Persisted. */
+  termLineHeight: number
   /** Working-tree checkpoints (newest first) — hidden-ref git commits taken
    * before each Claude turn and on demand. Scoped to workspacePath. */
   repoCheckpoints: RepoCheckpoint[]
@@ -1256,6 +1269,7 @@ interface KaisolaState {
   setTermFontWeight: (weight: number) => void
   setTermCursorColor: (color: string) => void
   setTermBackground: (bg: TermBackground) => void
+  setTermLineHeight: (height: number | null) => void
   toggleRail: () => void
   snapshotWorkspace: (label: string, projectId?: string) => Promise<RepoCheckpoint | null>
   restoreRepoCheckpoint: (id: string) => Promise<void>
@@ -2191,6 +2205,7 @@ function persistSnapshot(s: KaisolaState) {
     termFontWeight: s.termFontWeight,
     termCursorColor: s.termCursorColor,
     termBackground: s.termBackground,
+    termLineHeight: s.termLineHeight,
     permissionRules: s.permissionRules.slice(-200),
     sensitiveGlobs: s.sensitiveGlobs,
     customAgents: s.customAgents,
@@ -2511,6 +2526,7 @@ export const useKaisola = create<KaisolaState>()(
   // ink follows the app theme: dark app → dark terminal with light text.
   // paper (light-in-dark) is an explicit Settings choice, never the default.
   termBackground: 'ink' as TermBackground,
+  termLineHeight: TERM_LINE_HEIGHTS.comfortable,
   repoCheckpoints: [],
   agentFeed: [],
   followAgent: false,
@@ -4241,6 +4257,7 @@ export const useKaisola = create<KaisolaState>()(
     document.documentElement.dataset.termbg = v // tokens.css keys --term-bg off this
     set({ termBackground: v })
   },
+  setTermLineHeight: (height) => set({ termLineHeight: clampTermLineHeight(height) }),
   toggleRail: () => set((s) => ({ railOpen: !s.railOpen })),
 
   // ── working-tree checkpoints (Zed-style restore points, via hidden git refs) ──

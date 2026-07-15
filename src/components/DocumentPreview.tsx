@@ -104,8 +104,54 @@ const EMPTY_MARKDOWN_SELECTION: MarkdownSelectionState = {
 function sanitizeMarkdownHtml(text: string) {
   // ReactMarkdown escapes raw HTML by default. Run its serialized output
   // through the same allowlist sanitizer as HTML previews as a second trust
-  // boundary before either contentEditable HTML sink receives it.
-  return sanitizeHtml(renderToStaticMarkup(<ReactMarkdown remarkPlugins={[remarkGfm]}>{text}</ReactMarkdown>), '')
+  // boundary before either contentEditable HTML sink receives it. Destinations
+  // are stashed FIRST: under a packaged file: origin the sanitizer strips the
+  // document's own relative src/href (correct for live URLs, fatal for the
+  // save round-trip), so Turndown reads the inert data-markdown-* copy back.
+  return sanitizeHtml(preserveMarkdownDestinations(renderToStaticMarkup(<ReactMarkdown remarkPlugins={[remarkGfm]}>{text}</ReactMarkdown>)), '')
+}
+
+/** Markdown-destination policy, independent of the window origin. isSafeUrl
+ * resolves against location.href, so in the packaged app (file: origin) every
+ * relative destination becomes an unsafe file: URL — right answer for live
+ * DOM sinks, wrong one for the document's own text. A destination passing
+ * this check is preserved as markdown TEXT only; rendering it still goes
+ * through the unchanged sanitizer and bridge.fs reads. */
+function isSafeMarkdownDestination(value: string, forImage = false) {
+  const trimmed = value.trim()
+  if (!trimmed) return false
+  if (trimmed.startsWith('#')) return true
+  if (trimmed.startsWith('//')) return false // scheme-relative — not a document path
+  const scheme = /^[a-zA-Z][a-zA-Z0-9+.-]*:/.exec(trimmed)?.[0].toLowerCase()
+  if (!scheme) return true // relative or root-absolute path — the document's own asset space
+  if (forImage && scheme === 'data:') return trimmed.startsWith('data:image/')
+  return scheme === 'http:' || scheme === 'https:' || scheme === 'mailto:' || scheme === 'tel:'
+}
+
+/** Copy each valid markdown destination onto its node before sanitizeHtml can
+ * strip it. The stash is an inert data attribute — file:, javascript:, and
+ * unapproved data: destinations are never stashed, so nothing the sanitizer
+ * blocks gains a second life. */
+function preserveMarkdownDestinations(html: string) {
+  const parsed = new DOMParser().parseFromString(html, 'text/html')
+  const root = parsed.body || parsed.createElement('body')
+  root.querySelectorAll('img[src]').forEach((image) => {
+    const src = image.getAttribute('src') ?? ''
+    if (isSafeMarkdownDestination(src, true)) image.setAttribute('data-markdown-src', src)
+  })
+  root.querySelectorAll('a[href]').forEach((anchor) => {
+    const href = anchor.getAttribute('href') ?? ''
+    if (isSafeMarkdownDestination(href)) anchor.setAttribute('data-markdown-href', href)
+  })
+  return root.innerHTML
+}
+
+/** CommonMark inline destinations cannot carry whitespace (ASCII spaces,
+ * U+202F in macOS screenshot names…) or stray parens/angle brackets.
+ * Percent-encode exactly those code points; existing %-escapes untouched. */
+function encodeMarkdownDestination(value: string) {
+  return value.replace(/[\s()<>]/g, (ch) =>
+    Array.from(new TextEncoder().encode(ch), (byte) => `%${byte.toString(16).toUpperCase().padStart(2, '0')}`).join(''))
 }
 
 function selectionBlock(node: Node | null, root: HTMLElement): MarkdownSelectionState['block'] {
@@ -121,7 +167,9 @@ function markdownSelectionEqual(a: MarkdownSelectionState, b: MarkdownSelectionS
 }
 
 async function hydrateEditableImages(root: HTMLElement, sourcePath?: string) {
-  const images = Array.from(root.querySelectorAll<HTMLImageElement>('img[src]'))
+  // no [src] filter: under a file: origin the sanitizer strips relative srcs,
+  // leaving the destination only in the data-markdown-src stash
+  const images = Array.from(root.querySelectorAll<HTMLImageElement>('img'))
   await Promise.all(images.map(async (image) => {
     const original = image.dataset.markdownSrc ?? image.getAttribute('src') ?? ''
     if (!original || image.dataset.markdownHydrated === 'true' || isRemoteOrDataImage(original)) return
@@ -183,7 +231,19 @@ function EditableMarkdownSurface({
         const src = element.dataset.markdownSrc ?? element.getAttribute('src') ?? ''
         const alt = (element.getAttribute('alt') ?? '').replace(/\]/g, '\\]')
         const title = element.getAttribute('title')
-        return src ? `![${alt}](${src}${title ? ` \"${title.replace(/\"/g, '\\\"')}\"` : ''})` : ''
+        return src ? `![${alt}](${encodeMarkdownDestination(src)}${title ? ` \"${title.replace(/\"/g, '\\\"')}\"` : ''})` : ''
+      },
+    })
+    // Links mirror images: the live href may be sanitizer-stripped (relative
+    // destinations under a file: origin), so the markdown destination rides
+    // in data-markdown-href and wins over whatever the DOM still carries.
+    service.addRule('kaisola-link', {
+      filter: (node) => node.nodeName === 'A' && Boolean((node as HTMLElement).dataset.markdownHref ?? node.getAttribute('href')),
+      replacement: (content, node) => {
+        const element = node as HTMLElement
+        const href = element.dataset.markdownHref ?? element.getAttribute('href') ?? ''
+        const title = element.getAttribute('title')
+        return `[${content}](${encodeMarkdownDestination(href)}${title ? ` \"${title.replace(/\"/g, '\\\"')}\"` : ''})`
       },
     })
     return service
@@ -265,13 +325,15 @@ function EditableMarkdownSurface({
     if (!restoreSelection()) return
     const href = window.prompt('Link URL')?.trim()
     if (!href) return
-    if (!isSafeUrl(href)) {
+    // the markdown policy, not isSafeUrl: a relative link is valid document
+    // text even when the packaged file: origin makes it an unsafe live URL
+    if (!isSafeMarkdownDestination(href)) {
       useKaisola.getState().pushToast('warn', 'Use an http(s), mail, anchor, or relative link.')
       return
     }
     const selection = window.getSelection()
     if (selection && !selection.isCollapsed) document.execCommand('createLink', false, href)
-    else document.execCommand('insertHTML', false, `<a href="${escapeAttr(href)}">${escapeAttr(href)}</a>`)
+    else document.execCommand('insertHTML', false, `<a href="${escapeAttr(href)}" data-markdown-href="${escapeAttr(href)}">${escapeAttr(href)}</a>`)
     syncMarkdown()
     captureSelection()
   }
@@ -889,7 +951,12 @@ export const DocumentPreview = memo(function DocumentPreview({ text, kind, sourc
       } else {
         const href = escapeAttr(encodeURI(`${rel}/${copied.name}`))
         const label = escapeAttr(copied.name.replace(/\.[^.]+$/, ''))
-        chunks.push(IMAGE_DROP.test(stripUrlDecorations(copied.name)) ? `<img src="${href}" alt="${label}">` : `<a href="${href}">${label}</a>`)
+        // stash the destination at insert time — under a file: origin the live
+        // src/href can't load (and may be stripped), but the save path reads
+        // the data-markdown-* copy regardless of hydration timing
+        chunks.push(IMAGE_DROP.test(stripUrlDecorations(copied.name))
+          ? `<img src="${href}" data-markdown-src="${href}" alt="${label}">`
+          : `<a href="${href}" data-markdown-href="${href}">${label}</a>`)
       }
     }
     if (!chunks.length) return

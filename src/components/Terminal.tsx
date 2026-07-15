@@ -5,7 +5,7 @@ import { SearchAddon } from '@xterm/addon-search'
 import { WebLinksAddon } from '@xterm/addon-web-links'
 import { WebglAddon } from '@xterm/addon-webgl'
 import { bridge, isDesktop, type TermSnapshot } from '../lib/bridge'
-import { useKaisola, terminalOwnerMap, POP_TERMINAL_ID, type TermBackground, type TerminalContinuationStatus } from '../store/store'
+import { useKaisola, terminalOwnerMap, clampTermLineHeight, POP_TERMINAL_ID, type TermBackground, type TerminalContinuationStatus } from '../store/store'
 import { clockTime } from '../lib/format'
 import { touchMountedTerminal } from '../lib/terminalResidency'
 import { Icon } from './Icon'
@@ -212,6 +212,8 @@ export function Terminal({ id, attach = false, boot, cwd, projectId: projectIdOv
   const termFontSize = useKaisola((s) => s.termFontSize)
   const termFontFamily = useKaisola((s) => s.termFontFamily)
   const termFontWeight = useKaisola((s) => s.termFontWeight)
+  // clamp at read too — a hand-edited persisted value must never distort TUI geometry
+  const termLineHeight = useKaisola((s) => clampTermLineHeight(s.termLineHeight))
   const termCursorColor = useKaisola((s) => s.termCursorColor)
   const termBackground = useKaisola((s) => s.termBackground)
   const setTermFontSize = useKaisola((s) => s.setTermFontSize)
@@ -234,6 +236,7 @@ export function Terminal({ id, attach = false, boot, cwd, projectId: projectIdOv
   const fontSizeRef = useRef(termFontSize)
   const fontFamilyRef = useRef(termFontFamily)
   const fontWeightRef = useRef(termFontWeight)
+  const lineHeightRef = useRef(termLineHeight)
   const cursorColorRef = useRef(termCursorColor)
   const termBgRef = useRef(termBackground)
   // boot delivery: `create` boots only FRESH ptys; a boot adopted while the pty
@@ -281,9 +284,10 @@ export function Terminal({ id, attach = false, boot, cwd, projectId: projectIdOv
     fontSizeRef.current = termFontSize
     fontFamilyRef.current = termFontFamily
     fontWeightRef.current = termFontWeight
+    lineHeightRef.current = termLineHeight
     cursorColorRef.current = termCursorColor
     termBgRef.current = termBackground
-  }, [visible, cardShown, theme, ecoMode, termFontSize, termFontFamily, termFontWeight, termCursorColor, termBackground])
+  }, [visible, cardShown, theme, ecoMode, termFontSize, termFontFamily, termFontWeight, termLineHeight, termCursorColor, termBackground])
 
   // One-time means one actually visible glance, not “eight seconds elapsed in
   // a minimized window.” If the app exits first, the persisted receipt returns.
@@ -345,11 +349,12 @@ export function Terminal({ id, attach = false, boot, cwd, projectId: projectIdOv
         term.options.fontSize = termFontSize
         term.options.fontFamily = fontStack(termFontFamily)
         term.options.fontWeight = termFontWeight as 400 | 500 | 700
+        term.options.lineHeight = termLineHeight
         fitRef.current?.fit()
         void bridge.terminal.resize(id, term.cols, term.rows, projectId).catch(() => {})
       })
     } catch { /* transient */ }
-  }, [termFontSize, termFontFamily, termFontWeight, id, projectId])
+  }, [termFontSize, termFontFamily, termFontWeight, termLineHeight, id, projectId])
 
   useEffect(() => {
     if (!isDesktop || !hostRef.current || !rendererAwake) return
@@ -362,8 +367,9 @@ export function Terminal({ id, attach = false, boot, cwd, projectId: projectIdOv
       // glyphs read thin — 500 restores the fullness DOM text gets for free
       fontWeight: fontWeightRef.current as 400 | 500 | 700,
       fontWeightBold: 700,
-      // 1.0 = the font's natural cell height, matching Terminal.app/iTerm density
-      lineHeight: 1.0,
+      // line spacing (Settings → Terminal): compact 1.0 is the font's natural
+      // cell height (Terminal.app/iTerm density); the default sits airier
+      lineHeight: lineHeightRef.current,
       cursorBlink: !attach,
       // ⌥-click jumps the prompt cursor to the clicked spot (iTerm parity) —
       // xterm synthesizes the arrow-key presses; plain click stays selection

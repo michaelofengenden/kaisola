@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState, type CSSProperties } from 'react'
-import { useKaisola, dockShowsLiveCard, shellConfigDir, type ThemeMode, type PerfMode, type TabLayout, type CustomAgent, type TermBackground } from '../store/store'
+import { useKaisola, dockShowsLiveCard, shellConfigDir, clampTermLineHeight, TERM_LINE_HEIGHTS, type ThemeMode, type PerfMode, type TabLayout, type CustomAgent, type TermBackground } from '../store/store'
 import { bridge, isDesktop, type AcpAgent, type AppAuthStatus } from '../lib/bridge'
 import type { AutonomyLevel } from '../domain/types'
 import { useAgentRegistry, openAgentSession, type RegistryAgent } from '../lib/registry'
@@ -342,6 +342,8 @@ export function Settings() {
   const setTermFontFamily = useKaisola((s) => s.setTermFontFamily)
   const termFontWeight = useKaisola((s) => s.termFontWeight)
   const setTermFontWeight = useKaisola((s) => s.setTermFontWeight)
+  const termLineHeight = useKaisola((s) => clampTermLineHeight(s.termLineHeight))
+  const setTermLineHeight = useKaisola((s) => s.setTermLineHeight)
   const termCursorColor = useKaisola((s) => s.termCursorColor)
   const setTermCursorColor = useKaisola((s) => s.setTermCursorColor)
   const termBackground = useKaisola((s) => s.termBackground)
@@ -845,6 +847,23 @@ export function Settings() {
                       onSelect={setTermFontFamily}
                       align="right"
                       title="Typeface"
+                    />
+                  </div>
+                </div>
+                <div className="settings-row">
+                  <span className="settings-row-label">Line spacing</span>
+                  <div className="settings-row-control">
+                    <Dropdown
+                      ariaLabel="Terminal line spacing"
+                      value={String(termLineHeight)}
+                      options={[
+                        { value: String(TERM_LINE_HEIGHTS.compact), name: 'Compact' },
+                        { value: String(TERM_LINE_HEIGHTS.comfortable), name: 'Comfortable' },
+                        { value: String(TERM_LINE_HEIGHTS.airy), name: 'Airy' },
+                      ]}
+                      onSelect={(v) => setTermLineHeight(Number(v))}
+                      align="right"
+                      title="Space between lines — the typeface itself is unchanged"
                     />
                   </div>
                 </div>

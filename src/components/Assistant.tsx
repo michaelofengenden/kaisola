@@ -558,8 +558,14 @@ const TurnRow = memo(function TurnRow({ t, i, agentName, showCaret, liveThinkSta
     )
   }
   const userTurn = t.kind === 'user'
+  const condensed = t.kind === 'assistant' && !showCaret && /claude|codex|openai/i.test(agentName)
   return (
-    <div data-turn={i} data-transcript-row={rowKey} className={`assistant-turn turn-${t.kind}`}>
+    <div
+      data-turn={i}
+      data-transcript-row={rowKey}
+      data-condensed={condensed || undefined}
+      className={`assistant-turn turn-${t.kind}${condensed ? ' turn-condensed' : ''}`}
+    >
       <div className="turn-head">
         <span className="turn-avatar" aria-hidden>
           {userTurn
@@ -571,7 +577,11 @@ const TurnRow = memo(function TurnRow({ t, i, agentName, showCaret, liveThinkSta
           {t.at != null && <span className="turn-time">{clockTime(new Date(t.at).toISOString())}</span>}
         </span>
       </div>
-      <div className="turn-text">
+      <div
+        className="turn-text"
+        tabIndex={condensed ? 0 : undefined}
+        aria-label={condensed ? `${agentName} response; scroll to read the full response` : undefined}
+      >
         {t.kind === 'assistant'
           ? (t.text ? <Markdown text={t.text} /> : (showCaret ? '▌' : ''))
           : t.text}

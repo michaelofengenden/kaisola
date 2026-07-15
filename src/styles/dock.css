@@ -1299,9 +1299,11 @@ details.assistant-tool.tool-artifacts > summary::-webkit-details-marker { displa
 .group-result p {
   width: fit-content;
   max-width: min(680px, calc(100% - 22px));
-  max-height: 420px;
+  max-height: calc(1.55em * 2);
   margin-left: 22px;
   overflow: auto;
+  overscroll-behavior: contain;
+  scrollbar-gutter: stable;
   padding: 9px 11px;
   border-radius: 4px 13px 13px 13px;
   background: var(--bg-2);
@@ -1322,6 +1324,10 @@ details.assistant-tool.tool-artifacts > summary::-webkit-details-marker { displa
   border-radius: 4px 13px 13px 13px;
   background: var(--bg-2);
   color: var(--text-2);
+  max-height: calc(1.55em * 2);
+  overflow: auto;
+  overscroll-behavior: contain;
+  scrollbar-gutter: stable;
 }
 .group-member-status {
   flex: none;
@@ -1384,9 +1390,11 @@ details.assistant-tool.tool-artifacts > summary::-webkit-details-marker { displa
 .group-execution article p {
   width: fit-content;
   max-width: calc(100% - 22px);
-  max-height: 240px;
+  max-height: calc(1.55em * 2);
   margin-left: 22px;
   overflow: auto;
+  overscroll-behavior: contain;
+  scrollbar-gutter: stable;
   padding: 9px 11px;
   border-radius: 4px 13px 13px 13px;
   background: var(--bg-2);
@@ -1453,7 +1461,7 @@ details.assistant-tool.tool-artifacts > summary::-webkit-details-marker { displa
 .group-workers { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); pointer-events: none; opacity: 0; }
 @container (max-width: 620px) {
   .group-head small { display: none; }
-  .group-result p { max-height: 300px; }
+  .group-result p { max-height: calc(1.55em * 2); }
   .group-roster-row { grid-template-columns: 18px minmax(52px, .8fr) minmax(76px, 1.2fr) minmax(76px, 1fr) 24px; gap: 5px; }
   .group-member-status { display: none; }
 }
@@ -1733,6 +1741,19 @@ details.assistant-tool.tool-artifacts > summary::-webkit-details-marker { displa
   max-width: 96ch;
   margin-left: 24px;
   white-space: normal; /* Markdown owns paragraph rhythm; don't preserve source blanks twice. */
+}
+.turn-assistant.turn-condensed .turn-text {
+  max-block-size: calc(1.55em * 2);
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  scrollbar-gutter: stable;
+  scrollbar-width: thin;
+}
+.turn-assistant.turn-condensed .turn-text:focus-visible,
+.group-message p:focus-visible,
+.group-execution article p:focus-visible {
+  outline: 1px solid color-mix(in srgb, var(--accent) 48%, var(--border));
+  outline-offset: 2px;
 }
 
 @media (max-width: 760px) {

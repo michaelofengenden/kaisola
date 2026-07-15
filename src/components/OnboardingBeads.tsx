@@ -92,9 +92,9 @@ export function OnboardingBeads() {
       context.setTransform(dpr, 0, 0, dpr, 0, 0)
 
       beads.length = 0
-      columns = clamp(Math.round(width / 29), 20, 50)
+      columns = clamp(Math.round(width / 25), 24, 64)
       const spacingX = width / Math.max(1, columns - 1)
-      const spacingY = clamp(height / 50, 15, 20)
+      const spacingY = clamp(height / 68, 10.5, 15)
       rows = Math.ceil((height + spacingY * 2) / spacingY)
 
       for (let column = 0; column < columns; column += 1) {
@@ -162,8 +162,8 @@ export function OnboardingBeads() {
           const bead = beads[index]
           const above = row > 0 ? beads[index - 1] : null
           const below = row + 1 < rows ? beads[index + 1] : null
-          const drift = Math.sin(now * 0.00028 + column * 0.71 + row * 0.04) * 1.8
-          const anchorStrength = row === 0 ? 0.2 : 0.026
+          const drift = Math.sin(now * 0.00024 + column * 0.71 + row * 0.04) * 1.55
+          const anchorStrength = row === 0 ? 0.18 : 0.022
           let forceX = (bead.restX + drift - bead.x) * anchorStrength
           let forceY = (bead.restY - bead.y) * (row === 0 ? 0.22 : 0.055)
 
@@ -182,13 +182,15 @@ export function OnboardingBeads() {
             const distance = Math.max(1, Math.hypot(dx, dy))
             if (distance < influenceRadius) {
               const pressure = (1 - distance / influenceRadius) ** 2
-              forceX += (dx / distance) * pressure * 2.7
-              forceY += (dy / distance) * pressure * 0.82
+              // Repel from the pointer. The previous sign pulled the strands
+              // toward it, which made the curtain bunch under the cursor.
+              forceX -= (dx / distance) * pressure * 2.45
+              forceY -= (dy / distance) * pressure * 0.72
             }
           }
 
-          bead.vx = (bead.vx + forceX * step) * (0.875 ** step)
-          bead.vy = (bead.vy + forceY * step) * (0.855 ** step)
+          bead.vx = (bead.vx + forceX * step) * (0.895 ** step)
+          bead.vy = (bead.vy + forceY * step) * (0.885 ** step)
         }
       }
 

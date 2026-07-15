@@ -31,22 +31,38 @@ function init() {
     const getStmt = db.prepare('SELECT value FROM kv WHERE key = ?')
     const setStmt = db.prepare('INSERT INTO kv (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value')
     const delStmt = db.prepare('DELETE FROM kv WHERE key = ?')
+    const keysStmt = db.prepare('SELECT key FROM kv')
+    const mutate = db.transaction(({ set = {}, delete: deleted = [] } = {}) => {
+      for (const [key, value] of Object.entries(set)) setStmt.run(key, value)
+      for (const key of deleted) delStmt.run(key)
+    })
     backend = {
       kind: 'sqlite',
       get: (k) => { const r = getStmt.get(k); return r ? r.value : null },
       set: (k, v) => { setStmt.run(k, v) },
       del: (k) => { delStmt.run(k) },
+      keys: () => keysStmt.all().map((row) => row.key),
+      mutate,
     }
   } catch (err) {
     const file = path.join(dir, 'pasola-store.json')
-    const read = () => { try { return JSON.parse(fs.readFileSync(file, 'utf8')) } catch { return {} } }
+    const read = (strict = false) => {
+      try { return JSON.parse(fs.readFileSync(file, 'utf8')) }
+      catch (readError) {
+        if (readError?.code === 'ENOENT') return {}
+        if (strict) throw readError
+        return {}
+      }
+    }
     // atomic write (temp + rename) so a crash mid-write can't corrupt the store
-    const write = (obj) => {
+    const write = (obj, strict = false) => {
       try {
         const tmp = `${file}.${process.pid}.tmp`
         fs.writeFileSync(tmp, JSON.stringify(obj))
         fs.renameSync(tmp, file)
-      } catch { /* best-effort */ }
+      } catch (writeError) {
+        if (strict) throw writeError
+      }
     }
     backend = {
       kind: 'json',
@@ -54,6 +70,13 @@ function init() {
       get: (k) => { const o = read(); return k in o ? o[k] : null },
       set: (k, v) => { const o = read(); o[k] = v; write(o) },
       del: (k) => { const o = read(); delete o[k]; write(o) },
+      keys: () => Object.keys(read(true)),
+      mutate: ({ set = {}, delete: deleted = [] } = {}) => {
+        const next = read(true)
+        for (const [key, value] of Object.entries(set)) next[key] = value
+        for (const key of deleted) delete next[key]
+        write(next, true)
+      },
     }
   }
   return backend
@@ -82,5 +105,8 @@ function registerDbHandlers(ipcMain) {
 module.exports = {
   registerDbHandlers,
   dbGet: (key) => init().get(key),
+  dbSet: (key, value) => init().set(key, value),
   dbDel: (key) => init().del(key),
+  dbKeys: () => init().keys(),
+  dbMutate: (mutation) => init().mutate(mutation),
 }

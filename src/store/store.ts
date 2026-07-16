@@ -43,6 +43,8 @@ import { canPopOutTerminal } from '../lib/terminalPopPolicy'
 import { terminalsAfterMeta } from '../lib/terminalMetaPolicy'
 import { projectTransferDataConflict, scopeProjectTransferGlobals } from '../lib/projectTransferPolicy'
 import { isRunningMeshPhase } from '../lib/meshPolicy'
+import type { IdeaMessage } from '../lib/ideaCycle'
+export type { IdeaMessage } from '../lib/ideaCycle'
 import { addQueuedPrompt, MAX_PERSISTED_QUEUED_PROMPTS } from '../lib/assistantQueuePolicy'
 import { lineHunks, applyHunks } from '../lib/wordDiff'
 import { forgetMountedTerminal } from '../lib/terminalResidency'
@@ -138,6 +140,11 @@ export type GroupSessionPhase =
   | 'merge-ready'
   | 'integrating'
   | 'done'
+  // Idea mode: one concurrent answer pass, one concurrent reaction pass, then
+  // settled until the next user message. No repository stages are reachable.
+  | 'idea-initial'
+  | 'idea-reacting'
+  | 'idea-ready'
   // Rehydration compatibility for the first group-session prototype.
   | 'critiquing'
   | 'review-ready'
@@ -157,6 +164,18 @@ export interface GroupSessionState {
    * every stage boundary. Repository-mutating worktree and merge gates remain
    * explicit in both modes. */
   flow?: 'fluid' | 'guided'
+  /** Build runs the full contract → worktree → review pipeline. Idea is a
+   * bounded read-only group discussion; it never reaches repository stages.
+   * Orthogonal to `flow`, which only paces Build's analysis stages. */
+  purpose?: 'build' | 'idea'
+  /** Ordered Idea-mode transcript, appended in completion order. */
+  ideaTranscript?: IdeaMessage[]
+  /** Per member: transcript length at that member's last prompt dispatch.
+   * Later entries not authored by the member are unseen — forwarded with the
+   * next cycle so nobody misses a peer message. */
+  ideaSeen?: Record<string, number>
+  /** The bounded cycle minted by the latest Idea-mode user message. */
+  ideaCycleId?: string
   task?: string
   /** Stage-start timestamps used to isolate responses in rolling child runtimes. */
   baselines?: Record<string, number>

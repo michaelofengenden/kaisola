@@ -7,6 +7,9 @@ export const RUNNING_MESH_PHASES = [
   'integrating',
   'critiquing',
   'synthesizing',
+  // Idea mode's two bounded passes.
+  'idea-initial',
+  'idea-reacting',
 ] as const
 
 const runningMeshPhases = new Set<string>(RUNNING_MESH_PHASES)

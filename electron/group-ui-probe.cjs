@@ -49,6 +49,8 @@ let largeReviewRouted = false
 const selectedModels = new Map()
 const selectedEfforts = new Map()
 const promptCounts = new Map()
+const ideaPrompts = []
+const ideaCounts = new Map()
 const bareAgentKey = (key) => String(key ?? '').split('@@')[0]
 const controlsFor = (key) => {
   const provider = key.startsWith('claude') ? 'claude' : 'codex'
@@ -115,7 +117,17 @@ app.whenReady().then(async () => {
     const count = (promptCounts.get(key) ?? 0) + 1
     promptCounts.set(key, count)
     let reply = `${provider} independent proposal with an ownership boundary and acceptance tests. `.repeat(12).trim()
-    if (/only role-negotiation round/.test(text)) {
+    if (/group idea chat/.test(text)) {
+      const n = (ideaCounts.get(`${key}:initial`) ?? 0) + 1
+      ideaCounts.set(`${key}:initial`, n)
+      ideaPrompts.push([key, 'initial', text])
+      reply = `${provider} initial thought #${n}`
+    } else if (/React once to the group/.test(text)) {
+      const n = (ideaCounts.get(`${key}:reaction`) ?? 0) + 1
+      ideaCounts.set(`${key}:reaction`, n)
+      ideaPrompts.push([key, 'reaction', text])
+      reply = `${provider} reaction building #${n}`
+    } else if (/only role-negotiation round/.test(text)) {
       reply = `${provider} accepts the peer constraint and proposes an orthogonal role split.`
     } else if (/Act as the coordinator/.test(text)) {
       reply = 'Mission intent\nShared invariants\nClaude assignment\nCodex assignment\nIntegration order\nAcceptance tests\nStop and escalation conditions'
@@ -134,7 +146,10 @@ app.whenReady().then(async () => {
       reply = `${provider} verifier verdict: pass; ownership and integration checks are satisfied.\n\nMESH_REVIEW_RECEIPT\n${receipt ?? '{}'}`
     }
     const firstScout = /scouting independently/.test(text) && count === 1
-    await wait(firstScout ? (provider === 'Claude' ? 55 : 520) : 35)
+    // Idea initials get split latencies so the transcript's chronological
+    // completion order is observable (Claude lands first).
+    const ideaInitial = /group idea chat/.test(text)
+    await wait(firstScout ? (provider === 'Claude' ? 55 : 520) : ideaInitial ? (provider === 'Claude' ? 30 : 160) : 35)
     if (cancelled.delete(key)) return { ok: true, stopReason: 'cancelled' }
     event.sender.send(`acp:update:${reqId}`, { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: reply } })
     event.sender.send(`acp:update:${reqId}`, { __done: true })
@@ -570,7 +585,81 @@ app.whenReady().then(async () => {
       && restored.assistantPromptQueues[created.id]?.[0]?.text === 'preserve this queued follow-up'
       && restored.assistantThreads.find((thread) => thread.id === created.id)?.queuePaused === true
   })()`)
-  const result = { configured, effortWire, saturated, asked, stopped, paused, pausedPersisted: !!pausedPersisted, pausedScreenshot, pausedCloseReopen, continued, adoptedBusyRecovered, selectiveResume, ready, parkedBeforeNegotiation, fluidEnabled, connectCalls, negotiated, assigned, doubleExecuteClaimed, isolatedWorktreeCount, executed, reviewed, largeReviewRouted, done, worktreeCleanupDone, ...facts, persisted, invalidReviewStoppedMerge, staleReviewRecovery, siteScreenshot, screenshot, closeReopen, openedDeleteMenu, clickedDelete, switchedProjectId, deleted, projectSwitchSafe, archiveDeleteVerified, deleteTeardownOrdered, sessionDraftRoundTrip, deleteLifecycle }
+  // ── Idea mode: bounded group-chat cycles, zero repository machinery ──────
+  const ideaStarted = await win.webContents.executeJavaScript(`(() => {
+    const state = window.__kaisola.getState()
+    state.setWorkspace(${JSON.stringify(workspace)})
+    state.requestNewGroup()
+    const next = window.__kaisola.getState()
+    const group = next.assistantThreads.find((thread) => thread.group && thread.group.phase === 'idle')
+    if (!group) return false
+    next.setGroupSession(group.id, { purpose: 'idea' })
+    return true
+  })()`)
+  await wait(400)
+  const sendIdeaMessage = async (text) => win.webContents.executeJavaScript(`(() => {
+    const input = document.querySelector('.group-composer textarea')
+    const send = document.querySelector('.group-primary')
+    if (!input || !send) return false
+    const setter = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value').set
+    setter.call(input, ${JSON.stringify(text)})
+    input.dispatchEvent(new Event('input', { bubbles: true }))
+    send.click()
+    return true
+  })()`)
+  const ideaAsked = ideaStarted && await sendIdeaMessage('Pitch: a plugin bazaar for Kaisola.')
+  const ideaCycle1 = ideaAsked && await waitForPhase('idea-ready')
+  const ideaFacts1 = await win.webContents.executeJavaScript(`(() => {
+    const state = window.__kaisola.getState()
+    const group = state.assistantThreads.find((thread) => thread.group?.purpose === 'idea')
+    const transcript = group?.group?.ideaTranscript ?? []
+    return {
+      phase: group?.group?.phase,
+      kinds: transcript.map((message) => message.kind).join(','),
+      initialOrder: transcript.filter((message) => message.kind === 'initial').map((message) => message.label).join(','),
+      domMessages: document.querySelectorAll('.group-idea-msg').length,
+      worktrees: Object.keys(group?.group?.worktrees ?? {}).length,
+      buildSections: document.querySelectorAll('.group-results-wrap, .group-execution, .group-contract').length,
+    }
+  })()`)
+  const ideaAskedAgain = ideaCycle1 && await sendIdeaMessage('Second push: how would pricing work?')
+  const ideaCycle2 = ideaAskedAgain && await waitForPhase('idea-ready')
+  // A settled cycle must stay settled: no automatic second reaction pass.
+  await wait(800)
+  const ideaFacts2 = await win.webContents.executeJavaScript(`(() => {
+    const state = window.__kaisola.getState()
+    const group = state.assistantThreads.find((thread) => thread.group?.purpose === 'idea')
+    const transcript = group?.group?.ideaTranscript ?? []
+    return {
+      phase: group?.group?.phase,
+      kinds: transcript.map((message) => message.kind).join(','),
+      domMessages: document.querySelectorAll('.group-idea-msg').length,
+    }
+  })()`)
+  const ideaWorktreesOnDisk = execFileSync('git', ['worktree', 'list', '--porcelain'], { cwd: workspace, encoding: 'utf8' })
+    .split('\n').filter((line) => line.startsWith('worktree ')).length - 1
+  const ideaSeq = {}
+  for (const [key, kind, text] of ideaPrompts) { (ideaSeq[key.split('::')[0]] ??= []).push([kind, text]) }
+  const ideaPromptTotal = ideaPrompts.length
+  const ideaFlow = ['claude-code', 'codex'].every((preset) => {
+    const seq = ideaSeq[preset] ?? []
+    if (seq.map((entry) => entry[0]).join(',') !== 'initial,reaction,initial,reaction') return false
+    const own = preset === 'claude-code' ? 'Claude' : 'Codex'
+    const peer = preset === 'claude-code' ? 'Codex' : 'Claude'
+    return !seq[0][1].includes('initial thought') // first pass carries no peer content
+      && seq[0][1].includes('Pitch: a plugin bazaar')
+      && seq[1][1].includes(`${peer} initial thought #1`) // reaction sees every peer initial…
+      && !seq[1][1].includes(`${own} initial thought`) // …but never the member's own
+      && seq[1][1].includes('Pitch: a plugin bazaar') // …plus the original user message
+      && seq[2][1].includes(`${peer} reaction building #1`) // unseen carryover into cycle 2
+      && !seq[2][1].includes(`${own} reaction building`)
+      && !seq[2][1].includes('initial thought #1') // already seen in cycle 1's reaction pass
+      && seq[2][1].includes('pricing')
+      && seq[3][1].includes(`${peer} initial thought #2`)
+      && seq[3][1].includes('pricing')
+  })
+
+  const result = { configured, effortWire, saturated, asked, stopped, paused, pausedPersisted: !!pausedPersisted, pausedScreenshot, pausedCloseReopen, continued, adoptedBusyRecovered, selectiveResume, ready, parkedBeforeNegotiation, fluidEnabled, connectCalls, negotiated, assigned, doubleExecuteClaimed, isolatedWorktreeCount, executed, reviewed, largeReviewRouted, done, worktreeCleanupDone, ...facts, persisted, invalidReviewStoppedMerge, staleReviewRecovery, siteScreenshot, screenshot, closeReopen, openedDeleteMenu, clickedDelete, switchedProjectId, deleted, projectSwitchSafe, archiveDeleteVerified, deleteTeardownOrdered, sessionDraftRoundTrip, ideaStarted, ideaAsked, ideaCycle1, ideaFacts1, ideaCycle2, ideaFacts2, ideaWorktreesOnDisk, ideaPromptTotal, ideaFlow, deleteLifecycle }
   console.log('GROUP_UI=' + JSON.stringify(result))
   const passed = configured
     && effortWire === 'claude-code:xhigh,codex:xhigh'
@@ -629,6 +718,22 @@ app.whenReady().then(async () => {
     && archiveDeleteVerified
     && deleteTeardownOrdered
     && sessionDraftRoundTrip
+    && ideaStarted
+    && ideaAsked
+    && ideaCycle1
+    && ideaFacts1.phase === 'idea-ready'
+    && ideaFacts1.kinds === 'user,initial,initial,reaction,reaction'
+    && ideaFacts1.initialOrder === 'Claude,Codex'
+    && ideaFacts1.domMessages === 5
+    && ideaFacts1.worktrees === 0
+    && ideaFacts1.buildSections === 0
+    && ideaCycle2
+    && ideaFacts2.phase === 'idea-ready'
+    && ideaFacts2.kinds === 'user,initial,initial,reaction,reaction,user,initial,initial,reaction,reaction'
+    && ideaFacts2.domMessages === 10
+    && ideaWorktreesOnDisk === 0
+    && ideaPromptTotal === 8
+    && ideaFlow
   killAllSessions()
   await wait(250)
   app.exit(passed ? 0 : 1)

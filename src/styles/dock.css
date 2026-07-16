@@ -1368,15 +1368,41 @@ details.assistant-tool.tool-artifacts > summary::-webkit-details-marker { displa
   border-radius: 14px;
   background: color-mix(in srgb, var(--accent) 4%, var(--bg-1));
 }
-.group-final > header > span {
-  margin-left: auto;
-  color: var(--text-3);
-  font-size: var(--fs-9);
-  font-weight: var(--fw-medium);
-  text-transform: uppercase;
-  letter-spacing: .05em;
-}
 .group-contract { border-color: var(--border); background: var(--bg-2); }
+/* Idea mode: one chronological chat column. User bubbles sit right; agent
+   messages reuse the shared bubble radius so the surface reads as one room. */
+.group-idea { display: flex; flex-direction: column; gap: 10px; margin-top: 4px; }
+.group-idea-msg { min-width: 0; display: flex; flex-direction: column; gap: 4px; }
+.group-idea-msg > header { display: flex; align-items: center; gap: 6px; }
+.group-idea-msg > header strong { font-size: var(--fs-11); font-weight: var(--fw-semibold); }
+.group-idea-tag {
+  padding: 1px 5px;
+  border-radius: var(--r-full);
+  background: var(--bg-3);
+  color: var(--text-3);
+  font-size: 9px;
+  line-height: 16px;
+}
+.group-idea-msg > p {
+  width: fit-content;
+  max-width: min(680px, calc(100% - 22px));
+  max-height: calc(1.55em * 6);
+  margin: 0 0 0 22px;
+  overflow: auto;
+  overscroll-behavior: contain;
+  scrollbar-gutter: stable;
+  padding: 9px 11px;
+  border-radius: 4px 13px 13px 13px;
+  background: var(--bg-2);
+  color: var(--text-1);
+  white-space: pre-wrap;
+}
+.group-idea-msg[data-author='user'] { align-items: flex-end; }
+.group-idea-msg[data-author='user'] > p {
+  margin: 0;
+  border-radius: 13px 4px 13px 13px;
+  background: color-mix(in srgb, var(--accent) 9%, var(--bg-2));
+}
 .group-execution { margin-top: 22px; padding-top: 0; border-top: 0; }
 .group-execution article {
   min-width: 0;

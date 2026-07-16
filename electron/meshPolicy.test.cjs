@@ -5,6 +5,10 @@ test('Mesh lifecycle policy blocks close while running and rejects stale stage a
   const { isCurrentMeshOrchestration, isRunningMeshPhase } = await import('../src/lib/meshPolicy.ts')
   assert.equal(isRunningMeshPhase('executing'), true)
   assert.equal(isRunningMeshPhase('execution-ready'), false)
+  // Idea mode's two passes are running stages; its settled state is not.
+  assert.equal(isRunningMeshPhase('idea-initial'), true)
+  assert.equal(isRunningMeshPhase('idea-reacting'), true)
+  assert.equal(isRunningMeshPhase('idea-ready'), false)
 
   const marker = { groupId: 'mesh-parent', attemptId: 'attempt-1', phase: 'executing' }
   assert.equal(isCurrentMeshOrchestration(marker, [{

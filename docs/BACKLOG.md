@@ -8,4 +8,4 @@
 
 \- also can we make it so I can add multiple subscriptions of claude code/codex? such that I can stay signed in to all of them, and whenever I login to one on terminal or through mcp I can choose very easily?
 
-\-
+\- can we make opencode

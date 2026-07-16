@@ -19,3 +19,5 @@ also for some reason search and notifs arn't even/aligned on the same exact line
 also for some reason in dark mode codex's cli in terminal input message is white where it should be like it is for claude code. if I open a new cli through codex than it does make it dark automatically. 
 
 ![Screenshot 2026-07-16 at 12.33.40 AM](backlog-media/Screenshot%202026-07-16%20at%2012.33.40%E2%80%AFAM.png#kaisola-width=52)
+
+Also I generall

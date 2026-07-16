@@ -16,6 +16,6 @@ also for some reason search and notifs arn't even/aligned on the same exact line
 
 ![Screenshot 2026-07-16 at 12.31.16 AM](backlog-media/Screenshot%202026-07-16%20at%2012.31.16%E2%80%AFAM.png#kaisola-width=40)
 
-also for some reason in dark mode codex's 
+also for some reason in dark mode codex's cli in terminal 
 
 ![Screenshot 2026-07-16 at 12.33.40 AM](backlog-media/Screenshot%202026-07-16%20at%2012.33.40%E2%80%AFAM.png#kaisola-width=52)

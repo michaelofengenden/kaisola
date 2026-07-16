@@ -1,1 +1,1 @@
-should switch the buttons for file
+should switch the buttons for file preview and filetree, since

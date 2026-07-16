@@ -18,4 +18,4 @@ also images within MD files should be movable as they are in other forms like go
 
 also for some reason search and notifs arn't even/aligned on the same exact line still... why is this should we switch them? do you see how the notification button line appears a slightly lower than the top of the magnifying glass symbol?:
 
-![Screenshot 2026-07-16 at 12.31.16 AM](backlog-media/Screenshot%202026-07-16%20at%2012.31.16%E2%80%AFAM.png#kaisola-width=31)
+![Screenshot 2026-07-16 at 12.31.16 AM](backlog-media/Screenshot%202026-07-16%20at%2012.31.16%E2%80%AFAM.png#kaisola-width=40)

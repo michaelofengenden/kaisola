@@ -2,4 +2,4 @@
 
 \- most of the time that I open a terminal session I'll open up a CLI agent on it, can we make it so the terminal name will become the CLI + 3-4 word summary of first prompt? 
 
-\- how
+\- how could I see my usage of kimi k3 plan on opencode?

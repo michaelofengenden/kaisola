@@ -412,17 +412,32 @@ export function FilesView() {
     setActivePath(nextActive)
     queueMicrotask(() => { if (!cancelled) suppressSessionSyncRef.current = false })
 
-    restored.forEach((tab) => {
+    const refresh = () => restored.forEach((tab) => {
       void bridge.fs.read(tab.path).then((r) => {
         if (cancelled) return
-        setTabs((prev) => prev.map((current) => {
-          if (current.path !== tab.path) return current
-          return withUnsaved(tabWithReadResult(current, r))
-        }))
+        setTabs((prev) => {
+          let changed = false
+          const next = prev.map((current) => {
+            if (current.path !== tab.path) return current
+            const refreshed = withUnsaved(tabWithReadResult(current, r))
+            if (refreshed !== current) changed = true
+            return refreshed
+          })
+          return changed ? next : prev
+        })
       })
     })
+    // A warm switch already has the complete cached frame. Validate it from
+    // disk after a short settle window instead of allocating/readback-churning
+    // through every project the user merely passes over. The cleanup cancels
+    // transient projects; the project they stop on still refreshes normally.
+    const cachedComplete = cachedTabs.length === restored.length && cachedTabs.every((tab) => !tab.loading)
+    const refreshTimer = window.setTimeout(refresh, cachedComplete ? 140 : 0)
 
-    return () => { cancelled = true }
+    return () => {
+      cancelled = true
+      window.clearTimeout(refreshTimer)
+    }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [workspacePath])
 
@@ -820,8 +835,11 @@ export function FilesView() {
   useEffect(() => { openRef.current = open }, [open])
   useEffect(() => {
     if (fileRequest) void openRef.current(fileRequest.path, fileRequest.mode, { pinned: fileRequest.pinned ?? fileRequest.mode === 'edit' })
+    // `seq` is project-local and commonly restarts at 1 after a switch. The
+    // request object itself is new for every intent, so keying the effect to its
+    // identity prevents a same-seq request in the next project from being lost.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [fileRequest?.seq])
+  }, [fileRequest])
 
   const setActiveMode = useCallback((mode: Mode) => {
     if (!activePath) return

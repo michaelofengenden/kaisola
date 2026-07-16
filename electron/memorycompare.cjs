@@ -1,44 +1,83 @@
-// Repeatable, real-renderer Live Glass vs Eco memory comparison.
+// Five-run, real-renderer memory audit: Eco, Live Glass, and lifecycle retention.
 // Build first, then run: npm run memory:compare
 const { spawn } = require('node:child_process')
 const path = require('node:path')
 const electron = require('electron')
 
 const probe = path.join(__dirname, 'perfprobe.cjs')
-const rounds = Math.max(1, Math.min(5, Number(process.env.KAISOLA_MEMORY_ROUNDS) || 2))
+const rounds = Math.max(1, Math.min(7, Number(process.env.KAISOLA_MEMORY_ROUNDS) || 5))
 
-function run(variant) {
+function run(scenario) {
   return new Promise((resolve, reject) => {
-    const child = spawn(electron, [probe, variant], { stdio: ['ignore', 'pipe', 'pipe'] })
+    const env = { ...process.env }
+    delete env.ELECTRON_RUN_AS_NODE
+    const child = spawn(electron, [probe, scenario], { stdio: ['ignore', 'pipe', 'pipe'], env })
     let output = ''
     child.stdout.on('data', (chunk) => { output += chunk; process.stdout.write(chunk) })
     child.stderr.on('data', (chunk) => { output += chunk; process.stderr.write(chunk) })
     child.on('error', reject)
     child.on('exit', (code) => {
-      const match = [...output.matchAll(/PROBE_MEMORY=(\{[^\n]+\})/g)].at(-1)
-      if (code !== 0 || !match) { reject(new Error(`Memory probe ${variant} failed (${code}).`)); return }
-      try { resolve(JSON.parse(match[1])) } catch (error) { reject(error) }
+      const pattern = scenario === 'LIFE' ? /MEMORY_LIFECYCLE=(\{[^\n]+\})/g : /PROBE_MEMORY=(\{[^\n]+\})/g
+      const match = [...output.matchAll(pattern)].at(-1)
+      if (!match) { reject(new Error(`Memory probe ${scenario} produced no result (${code}).`)); return }
+      try {
+        const parsed = JSON.parse(match[1])
+        if (scenario !== 'LIFE' && code !== 0) { reject(new Error(`Memory probe ${scenario} failed (${code}).`)); return }
+        resolve(parsed)
+      } catch (error) { reject(error) }
     })
   })
 }
 
+const percentile = (values, fraction) => {
+  const sorted = [...values].sort((a, b) => a - b)
+  return sorted[Math.max(0, Math.ceil(sorted.length * fraction) - 1)] ?? 0
+}
+const round = (value) => Math.round(value * 10) / 10
+const summary = (values) => {
+  const median = percentile(values, 0.5)
+  const deviations = values.map((value) => Math.abs(value - median))
+  return {
+    medianMiB: round(median),
+    madMiB: round(percentile(deviations, 0.5)),
+    minMiB: round(Math.min(...values)),
+    maxMiB: round(Math.max(...values)),
+    dispersionMiB: round(Math.max(...values) - Math.min(...values)),
+  }
+}
+
 ;(async () => {
-  const results = { E: [], G: [] }
-  for (let i = 0; i < rounds; i++) {
+  const results = { E: [], G: [], LIFE: [] }
+  for (let i = 0; i < rounds; i += 1) {
     results.E.push(await run('E'))
     results.G.push(await run('G'))
+    results.LIFE.push(await run('LIFE'))
   }
-  const median = (rows) => {
-    const sorted = rows.map((row) => row.medianMiB).sort((a, b) => a - b)
-    const middle = Math.floor(sorted.length / 2)
-    return sorted.length % 2 ? sorted[middle] : (sorted[middle - 1] + sorted[middle]) / 2
+  const eco = summary(results.E.map((row) => row.medianMiB))
+  const glass = summary(results.G.map((row) => row.medianMiB))
+  const pairedDeltasMiB = results.G.map((row, index) => round(row.medianMiB - results.E[index].medianMiB))
+  const lifecycleOverhead = summary(results.LIFE.map((row) => row.overheadMiB))
+  const lifecycleRetained = summary(results.LIFE.map((row) => row.retained.medianMiB))
+  const result = {
+    rounds,
+    material: {
+      eco,
+      glass,
+      deltaMiB: round(pairedDeltasMiB.reduce((sum, value) => sum + value, 0) / pairedDeltasMiB.length),
+      pairedDeltasMiB,
+    },
+    lifecycle: {
+      retained: lifecycleRetained,
+      overhead: lifecycleOverhead,
+      monotonicRuns: results.LIFE.filter((row) => row.monotonicRetainedGrowth).length,
+      thresholdPasses: results.LIFE.filter((row) => row.overheadMiB <= row.thresholdMiB).length,
+    },
+    pass: rounds >= 5
+      && results.LIFE.every((row) => row.pass && !row.monotonicRetainedGrowth && row.overheadMiB <= row.thresholdMiB),
+    results,
   }
-  const ecoMiB = median(results.E)
-  const glassMiB = median(results.G)
-  const pairedDeltasMiB = results.G.map((row, index) => Math.round((row.medianMiB - results.E[index].medianMiB) * 10) / 10)
-  const deltaMiB = Math.round((pairedDeltasMiB.reduce((sum, value) => sum + value, 0) / pairedDeltasMiB.length) * 10) / 10
-  const percent = ecoMiB > 0 ? Math.round(deltaMiB / ecoMiB * 1000) / 10 : 0
-  console.log('MEMORY_COMPARE=' + JSON.stringify({ rounds, ecoMiB, glassMiB, deltaMiB, percent, pairedDeltasMiB, results }))
+  console.log('MEMORY_COMPARE=' + JSON.stringify(result))
+  if (!result.pass) process.exitCode = 1
 })().catch((error) => {
   console.error('MEMORY_COMPARE=FAIL', error)
   process.exitCode = 1

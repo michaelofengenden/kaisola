@@ -10,7 +10,7 @@ can be fixed further as well, the settings can just included inside the profile
 
 \-  Also images inside md files should be more easily movable and deletable and writing aroundable. For example the image below is stuck and I can't write text underneath it. 
 
-  
+also the mesh is
 
 ![image](backlog-media/image.png#kaisola-width=48)
 

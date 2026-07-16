@@ -4,4 +4,4 @@
 
 \- how could I see my usage of kimi k3 plan on opencode? Is there a way to add it to our usage button, 
 
-\- also maybe we add two buttons next to
+\- also maybe we add two buttons next to notifcations, (usage, little usage pop up, and

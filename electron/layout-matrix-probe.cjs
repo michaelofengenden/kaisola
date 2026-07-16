@@ -295,7 +295,10 @@ app.whenReady().then(async () => {
   const footerSingleRow = await win.webContents.executeJavaScript(`(() => {
     const footer = document.querySelector('.shell-sidebar-footer')
     const controls = [...footer?.querySelectorAll('button') ?? []]
-    if (!footer || controls.length < 4 || footer.querySelector('.app-account-name')) return false
+    // Guaranteed row: search, inbox, avatar. The usage gauge only joins when a
+    // subscription window needs attention, and the gear now lives in the
+    // profile menu.
+    if (!footer || controls.length < 3 || footer.querySelector('.app-account-name')) return false
     const tops = controls.map((control) => Math.round(control.getBoundingClientRect().top))
     return Math.max(...tops) - Math.min(...tops) <= 2
   })()`)

@@ -268,10 +268,14 @@ app.whenReady().then(async () => {
   const newSessionOrder = await win.webContents.executeJavaScript(`[...document.querySelectorAll('.drop-menu .drop-item')].slice(0, 3).map((item) => item.textContent.trim())`)
   await win.webContents.executeJavaScript(`document.body.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true }))`)
 
-  // Settings opens on General from the ordinary footer button.
-  await win.webContents.executeJavaScript(`document.querySelector('.shell-sidebar-footer .shell-settings-trigger')?.click()`)
+  // Settings lives in the profile menu (no standalone footer gear) and a
+  // fresh session opens it on General.
+  await win.webContents.executeJavaScript(`document.querySelector('.shell-sidebar-footer [aria-label="Kaisola account"]')?.click()`)
+  await wait(120)
+  const noFooterGear = await win.webContents.executeJavaScript(`!document.querySelector('.shell-sidebar-footer .shell-settings-trigger')`)
+  await win.webContents.executeJavaScript(`document.querySelector('.app-account-menu .shell-settings-trigger')?.click()`)
   await wait(160)
-  const settingsGeneral = await win.webContents.executeJavaScript(`document.querySelector('.settings-nav-item[data-active="true"]')?.textContent.trim() === 'General'`)
+  const settingsGeneral = noFooterGear && await win.webContents.executeJavaScript(`document.querySelector('.settings-nav-item[data-active="true"]')?.textContent.trim() === 'General'`)
   await win.webContents.executeJavaScript(`document.querySelector('.settings-head [aria-label="Close"]')?.click()`)
 
   // Account menu closes even when the away-click lands on a native drag area.

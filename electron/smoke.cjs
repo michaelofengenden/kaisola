@@ -237,6 +237,7 @@ app.whenReady().then(async () => {
       headshot: !!avatar?.querySelector('img'),
       menu: !!menu && /Kaisola Tester/.test(menu.textContent || '') && /person@example.com/.test(menu.textContent || ''),
       usageInMenu: !!menu && /Usage/.test(menu.textContent || ''),
+      settingsInMenu: !!menu?.querySelector('.shell-settings-trigger'),
       avatarOnly: !/Kaisola Tester/.test(avatar?.textContent || ''),
       bottomLeft: (() => {
         if (!footer) return false
@@ -847,7 +848,7 @@ app.whenReady().then(async () => {
       noMention: !document.querySelector('button[title^="Reference a paper"]'),
       compactChrome: !document.querySelector('.tabstrip-tools') && !!document.querySelector('.shell-sidebar-footer'),
       noLayoutControl: !document.querySelector('.shell-layout-trigger'),
-      settingsControl: !!document.querySelector('.shell-sidebar-footer .shell-settings-trigger[aria-label="Open settings"]'),
+      settingsControl: !document.querySelector('.shell-sidebar-footer .shell-settings-trigger') && !!document.querySelector('.shell-sidebar-footer .app-account-avatar'),
       addContext: !!document.querySelector('.composer-add[aria-label*="Add files"]'),
     }
   })()`)
@@ -2363,17 +2364,22 @@ a^2 + b^2 = c^2
     topRestore?.click(); await new Promise((r) => setTimeout(r, 300))
     const restored = !!document.querySelector('.wsrail[data-side="right"]') && get().railOpen === true
 
-    const settingsTrigger = document.querySelector('.shell-settings-trigger')
+    // The footer gear moved into the profile popover; remembered-pane reopen
+    // now rides the menu's Settings row.
+    const openSettingsFromProfile = async () => {
+      document.querySelector('.shell-sidebar-footer .app-account-avatar')?.click(); await wait()
+      document.querySelector('.app-account-menu .shell-settings-trigger')?.click(); await wait()
+    }
     get().setSettingsOpen(true, 'general'); await wait()
     const opensRequestedGeneral = /Appearance/.test(document.querySelector('.settings-pane')?.textContent || '')
     get().setSettingsOpen(false); await wait()
-    document.querySelector('.shell-settings-trigger')?.click(); await wait()
+    await openSettingsFromProfile()
     const footerReopensLast = /Appearance/.test(document.querySelector('.settings-pane')?.textContent || '')
     const interfaceNav = [...document.querySelectorAll('.settings-nav-item')].find((node) => /Interface/.test(node.textContent || ''))
     interfaceNav?.click()
     await wait()
     get().setSettingsOpen(false); await wait()
-    document.querySelector('.shell-settings-trigger')?.click(); await wait()
+    await openSettingsFromProfile()
     const remembersInterface = /Interface/.test(document.querySelector('.settings-pane-title')?.textContent || '')
     const settingsOwned = !!document.querySelector('.settings-row[data-setting="workspace-view"]') &&
       !!document.querySelector('.settings-row[data-setting="session-panels"]') &&
@@ -2443,7 +2449,7 @@ a^2 + b^2 = c^2
     const original = get().tabLayout
     get().setTabLayout('sidebar')
     await new Promise((r) => setTimeout(r, 70))
-    document.querySelector('.shell-settings-trigger')?.click()
+    get().setSettingsOpen(true)
     await new Promise((r) => setTimeout(r, 70))
     ;[...document.querySelectorAll('.settings-nav-item')].find((node) => /Interface/.test(node.textContent || ''))?.click()
     await new Promise((r) => setTimeout(r, 70))
@@ -2578,7 +2584,9 @@ a^2 + b^2 = c^2
   // 15) settings exposes the appearance/layout configuration
   const settings = await win.webContents.executeJavaScript(`(async () => {
     const expectedPane = window.__kaisola.getState().settingsPane || 'general'
-    const settingsButton = document.querySelector('.shell-sidebar-footer .shell-settings-trigger[aria-label="Open settings"]')
+    document.querySelector('.shell-sidebar-footer .app-account-avatar')?.click()
+    await new Promise((r) => setTimeout(r, 80))
+    const settingsButton = document.querySelector('.app-account-menu .shell-settings-trigger')
     settingsButton?.click()
     await new Promise((r) => setTimeout(r, 150))
     // Zed-style settings: a nav of categories, one pane at a time
@@ -2618,7 +2626,7 @@ a^2 + b^2 = c^2
     await new Promise((r) => setTimeout(r, 30))
     const permanentFilesControls = document.querySelectorAll('.tabstrip-view-controls > button').length === 2 &&
       !document.querySelector('.canvas-local-close, .file-preview-toggle, .wsrail-head button')
-    const footerOwned = !!settingsButton && !document.querySelector('.tabstrip .shell-settings-trigger')
+    const footerOwned = !document.querySelector('.shell-sidebar-footer .shell-settings-trigger') && !document.querySelector('.tabstrip .shell-settings-trigger')
     return { settingsSeparate: !!settingsButton, footerOwned, reopensRemembered, hasLayoutSettings, hasAdvancedStyles, noStandaloneLayout: !document.querySelector('.shell-layout-trigger'), hasAppearance, hasUsage, hasDiskResidency, hasTabLayout, extensionsInSettings, permanentFilesControls, noSidebarControls: !hasSidebarControls, keyboardSearchFocus, visualChoices }
   })()`)
   console.log('SETTINGS=' + JSON.stringify(settings))
@@ -3858,7 +3866,7 @@ a^2 + b^2 = c^2
   const failed =
     !manualCodex.upgraded || !manualCodex.exact || !manualCodex.draftKept || !manualCodex.downgraded ||
     !manualClaude.upgraded || !manualClaude.draftKept || !manualClaude.toolKept || !manualClaude.downgraded ||
-    !rootChildren || !minimalShell.noWorkflowSidebar || !minimalShell.splitSidebarsDefault || !minimalShell.hasSessions || !minimalShell.railFilesOnly || !minimalShell.hasEmptyLauncher || !minimalShell.stageFiles || !minimalShell.studioDefault || !minimalShell.sidebarFooter || !minimalShell.topViewControls || !accountUi.avatar || !accountUi.headshot || !accountUi.menu || !accountUi.usageInMenu || !accountUi.usageOpened || !accountUi.avatarOnly || !accountUi.bottomLeft || !accountUi.menuAbove || !accountUi.menuFits || !accountUi.aligned || !claudeOptIn || !nativeWindow.rendererClippedMaterial || !icon.exists || !icon.usable || !icon.square || !icon.large || !glass.appSamplingLayer || !glass.chromeGlass || !glass.activeTintWhite || !glass.railLayerFlattened || !glass.contentGlassy || !glass.sessionGlassy || !glass.termGlassTint || !glass.blurKeepsGlass || !glass.lightsGray || !glass.nativeWindowRounding ||
+    !rootChildren || !minimalShell.noWorkflowSidebar || !minimalShell.splitSidebarsDefault || !minimalShell.hasSessions || !minimalShell.railFilesOnly || !minimalShell.hasEmptyLauncher || !minimalShell.stageFiles || !minimalShell.studioDefault || !minimalShell.sidebarFooter || !minimalShell.topViewControls || !accountUi.avatar || !accountUi.headshot || !accountUi.menu || !accountUi.usageInMenu || !accountUi.settingsInMenu || !accountUi.usageOpened || !accountUi.avatarOnly || !accountUi.bottomLeft || !accountUi.menuAbove || !accountUi.menuFits || !accountUi.aligned || !claudeOptIn || !nativeWindow.rendererClippedMaterial || !icon.exists || !icon.usable || !icon.square || !icon.large || !glass.appSamplingLayer || !glass.chromeGlass || !glass.activeTintWhite || !glass.railLayerFlattened || !glass.contentGlassy || !glass.sessionGlassy || !glass.termGlassTint || !glass.blurKeepsGlass || !glass.lightsGray || !glass.nativeWindowRounding ||
     !emptyOk || !demoOk ||
     !review.opened || !review.closed || !review.decided ||
     !term.run || !term.ptyOk || !term.cdWorks || !term.dock || !term.host || !term.lightComposerPalette ||

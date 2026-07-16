@@ -85,11 +85,13 @@ export function AppAccountButton({ showLabel = false }: { showLabel?: boolean })
             </div>
           </div>
           <div className="tree-menu-sep" />
+          {/* The row's standalone gear moved here; opening without a pane
+              keeps its remembered-last-pane behavior. */}
+          <button type="button" className="shell-settings-trigger" onClick={() => { setOpen(false); openSettings(true) }}>
+            <Icon name="Settings" size={13} /> Settings
+          </button>
           <button type="button" onClick={() => { setOpen(false); openSettings(true, 'usage') }}>
             <Icon name="Gauge" size={13} /> Usage
-          </button>
-          <button type="button" onClick={() => { setOpen(false); openSettings(true, 'general') }}>
-            <Icon name="Settings" size={13} /> Account settings
           </button>
           <button type="button" onClick={() => { void signOut() }}>
             <Icon name="LogOut" size={13} /> Sign out

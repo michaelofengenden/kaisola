@@ -320,12 +320,32 @@ export function Terminal({ id, attach = false, boot, cwd, projectId: projectIdOv
     try { term.options.cursorBlink = visible && !attach } catch { /* mid-teardown */ }
     if (!visible) return
     const p = pendingRef.current
-    if (!p.chunks.length) return
-    const chunk = p.chunks.join('')
-    p.chunks = []
-    p.bytes = 0
-    term.write(chunk)
-  }, [visible, attach])
+    if (p.chunks.length) {
+      const chunk = p.chunks.join('')
+      p.chunks = []
+      p.bytes = 0
+      term.write(chunk)
+    }
+    // A restored/ghost terminal can become visible before its card finishes
+    // its grid layout. xterm then keeps the live buffer but paints a zero- or
+    // stale-sized viewport until an OS resize happens. Re-run the same
+    // fit+refresh boundary after two paints so history is visible immediately.
+    let secondFrame = 0
+    const firstFrame = requestAnimationFrame(() => {
+      secondFrame = requestAnimationFrame(() => {
+        if (termRef.current !== term || !visibleRef.current) return
+        try {
+          preserveTerminalViewport(term, () => fitRef.current?.fit())
+          term.refresh(0, Math.max(0, term.rows - 1))
+          void bridge.terminal.resize(id, term.cols, term.rows, projectId).catch(() => {})
+        } catch { /* renderer changed again before paint */ }
+      })
+    })
+    return () => {
+      cancelAnimationFrame(firstFrame)
+      if (secondFrame) cancelAnimationFrame(secondFrame)
+    }
+  }, [visible, attach, id, projectId])
 
   // The GPU renderer follows the CARD in Glass mode. Eco deliberately leaves
   // xterm on its built-in CPU renderer: agent/terminal work is text-heavy and

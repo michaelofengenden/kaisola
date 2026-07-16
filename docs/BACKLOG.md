@@ -20,4 +20,4 @@ also for some reason in dark mode codex's cli in terminal input message is white
 
 ![Screenshot 2026-07-16 at 12.33.40 AM](backlog-media/Screenshot%202026-07-16%20at%2012.33.40%E2%80%AFAM.png#kaisola-width=52)
 
-Also I generally want to optimize our app for using terminal CLI agens
+Also I generally want to optimize our app for using terminal CLI agents as they're generally more powerful than MCP

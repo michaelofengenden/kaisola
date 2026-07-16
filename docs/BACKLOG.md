@@ -10,4 +10,8 @@ can be fixed further as well, the settings can just included inside the profile
 
 \-  Also images inside md files should be more easily movable and deletable and writing aroundable. For example the image below is stuck and I can't write text underneath it. 
 
+  
+
+  
+
 ![Screenshot 2026-07-15 at 5.23.05 PM](backlog-media/Screenshot%202026-07-15%20at%205.23.05%E2%80%AFPM.png#kaisola-width=20)

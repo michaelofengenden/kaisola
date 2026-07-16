@@ -50,7 +50,7 @@ const bridge = {
     setConfigOption: (agentKey, configId, value) => ipcRenderer.invoke('acp:setConfigOption', { agentKey, configId, value }),
     authenticate: (agentKey, methodId) => ipcRenderer.invoke('acp:authenticate', { agentKey, methodId }),
     /** Send a prompt to agentKey; onUpdate(update) streams session/update payloads. */
-    prompt: (agentKey, text, onUpdate, images) => {
+    prompt: (agentKey, text, onUpdate, images, _scope, options) => {
       const reqId = `p${++seq}`
       const chan = `acp:update:${reqId}`
       let done = false
@@ -84,7 +84,7 @@ const bridge = {
       }
       ipcRenderer.on(chan, listener)
       const prompt = new Promise((resolve, reject) => { resolvePrompt = resolve; rejectPrompt = reject })
-      ipcRenderer.invoke('acp:prompt', { agentKey, reqId, text, images }).then((value) => {
+      ipcRenderer.invoke('acp:prompt', { agentKey, reqId, text, images, readOnly: options?.readOnly === true }).then((value) => {
         result = value
         resultReady = true
         settle()
@@ -422,6 +422,9 @@ const bridge = {
     },
   },
 
+  browser: {
+    releaseGuest: (guestId) => ipcRenderer.invoke('browser:release-guest', { guestId }),
+  },
   openExternal: (url) => ipcRenderer.invoke('kaisola:openExternal', url),
   pickFolder: () => ipcRenderer.invoke('kaisola:pickFolder'),
   pickFiles: () => ipcRenderer.invoke('kaisola:pickFiles'),

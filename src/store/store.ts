@@ -170,10 +170,10 @@ export interface GroupSessionState {
   purpose?: 'build' | 'idea'
   /** Ordered Idea-mode transcript, appended in completion order. */
   ideaTranscript?: IdeaMessage[]
-  /** Per member: transcript length at that member's last prompt dispatch.
-   * Later entries not authored by the member are unseen — forwarded with the
-   * next cycle so nobody misses a peer message. */
-  ideaSeen?: Record<string, number>
+  /** Per member: stable id of the last transcript message included in a
+   * prompt. Numeric values are accepted only as a legacy migration shape.
+   * Message ids survive bounded-array trimming; array offsets do not. */
+  ideaSeen?: Record<string, string | number>
   /** The bounded cycle minted by the latest Idea-mode user message. */
   ideaCycleId?: string
   task?: string
@@ -362,8 +362,10 @@ export interface AssistantDraft {
   attachments: string[]
   mentions: AssistantMention[]
   speed: AssistantSpeed
-  /** Private idempotency metadata for a prompt dispatched by Mesh. */
-  orchestration?: { groupId: string; attemptId: string; phase: GroupSessionPhase }
+  /** Private idempotency metadata for a prompt dispatched by Mesh. Idea-mode
+   * prompts carry `readOnly` so renderer and main process both enforce the
+   * discussion-only boundary. */
+  orchestration?: { groupId: string; attemptId: string; phase: GroupSessionPhase; readOnly?: boolean }
 }
 
 export interface QueuedAssistantPrompt extends AssistantDraft {
@@ -631,6 +633,7 @@ const normalizeAssistantDraft = (draft?: Partial<AssistantDraft> | null): Assist
         groupId: draft.orchestration.groupId.slice(0, 200),
         attemptId: draft.orchestration.attemptId.slice(0, 200),
         phase: draft.orchestration.phase,
+        ...(draft.orchestration.readOnly === true ? { readOnly: true } : {}),
       } }
     : {}),
 })
@@ -848,6 +851,12 @@ export interface ProjectTab {
   createdAt: number
   /** Rolled-up background badge; cleared when the tab becomes active. */
   activity?: 'running' | 'completed' | 'needs-you' | 'failed'
+  /**
+   * A never-focused, workspace-less background tab. Perf probes and callers
+   * may stage these briefly; until the tab is focused or mutated it owns no
+   * renderer, PTY, or user-restorable state and can be discarded on close.
+   */
+  transientBlank?: true
 }
 /** A closed project on the undo stack (⌘⌥T reopens); in-memory, cap 8. */
 export interface ClosedProject {
@@ -5692,6 +5701,7 @@ export const useKaisola = create<KaisolaState>()(
         id: pid,
         workspacePath: path,
         ...(path == null && blanks > 0 ? { title: `New Project ${blanks + 1}` } : {}),
+        ...(!focus && path == null ? { transientBlank: true as const } : {}),
         hue: folderHue(path ?? pid),
         createdAt: Date.now(),
       }
@@ -5730,7 +5740,7 @@ export const useKaisola = create<KaisolaState>()(
       return {
         activeProjectId: targetId,
         projectSlices: { ...restBg, [s.activeProjectId]: outgoing },
-        projectTabs: s.projectTabs.map((t) => (t.id === targetId ? { ...t, activity: undefined } : t)),
+        projectTabs: s.projectTabs.map((t) => (t.id === targetId ? { ...t, activity: undefined, transientBlank: undefined } : t)),
         ...target, // hoist the target's memory slice → live flat fields
         ...resetEphemeralCursors(), // bucket F defaults; bucket E left alone
       }
@@ -5755,11 +5765,11 @@ export const useKaisola = create<KaisolaState>()(
       return { projectTabs: arr }
     }),
   renameProjectTab: (id, title) =>
-    set((s) => ({ projectTabs: s.projectTabs.map((t) => (t.id === id ? { ...t, title: title?.trim() || undefined } : t)) })),
+    set((s) => ({ projectTabs: s.projectTabs.map((t) => (t.id === id ? { ...t, title: title?.trim() || undefined, transientBlank: undefined } : t)) })),
   setProjectColor: (id, color) =>
-    set((s) => ({ projectTabs: s.projectTabs.map((t) => (t.id === id ? { ...t, color } : t)) })),
+    set((s) => ({ projectTabs: s.projectTabs.map((t) => (t.id === id ? { ...t, color, transientBlank: undefined } : t)) })),
   setProjectActivity: (id, badge) =>
-    set((s) => (id === s.activeProjectId ? s : { projectTabs: s.projectTabs.map((t) => (t.id === id ? { ...t, activity: badge } : t)) })),
+    set((s) => (id === s.activeProjectId ? s : { projectTabs: s.projectTabs.map((t) => (t.id === id ? { ...t, activity: badge, transientBlank: undefined } : t)) })),
   closeProject: (id, opts) => {
     const s = get()
     const tab = s.projectTabs.find((t) => t.id === id)
@@ -5768,6 +5778,7 @@ export const useKaisola = create<KaisolaState>()(
     const slice = isActive ? pick(s, PROJECT_SLICE_MEMORY_KEYS) : s.projectSlices[id]
     if (!slice) return
     const ws = slice.workspacePath
+    const discardTransientBlank = !isActive && tab.transientBlank === true
     // 1) running-work confirm (skipped on force)
     if (!opts?.force) {
       const liveAgentWork = slice.assistantThreads.some((thread) =>
@@ -5786,19 +5797,23 @@ export const useKaisola = create<KaisolaState>()(
     // 2/3) Grace-release every project PTY in the detached broker, including a
     // pop-out. Reopening/reattaching cancels the timer; closing a pop after its
     // source project no longer exists can therefore never orphan the process.
-    for (const t of slice.terminals) {
-      const tid = t.id
-      forgetMountedTerminal(tid)
-      void bridge.terminal.scheduleRelease(tid, id, 60_000).catch(() => {
-        window.setTimeout(() => {
-          if (!terminalOwnerMap(get())[tid]) void bridge.terminal.kill(tid, id).catch(() => {})
-        }, 60_000)
-      })
+    if (!discardTransientBlank) {
+      for (const t of slice.terminals) {
+        const tid = t.id
+        forgetMountedTerminal(tid)
+        void bridge.terminal.scheduleRelease(tid, id, 60_000).catch(() => {
+          window.setTimeout(() => {
+            if (!terminalOwnerMap(get())[tid]) void bridge.terminal.kill(tid, id).catch(() => {})
+          }, 60_000)
+        })
+      }
     }
     // 4/5) drop the tab + slice; push undo; re-home if it was active.
     set((st) => {
       const projectTabs = st.projectTabs.filter((t) => t.id !== id)
-      const closedProjectStack = [{ at: Date.now(), tab, slice: sanitizeSliceForPersist(slice) }, ...st.closedProjectStack].slice(0, 8)
+      const closedProjectStack = discardTransientBlank
+        ? st.closedProjectStack
+        : [{ at: Date.now(), tab, slice: sanitizeSliceForPersist(slice) }, ...st.closedProjectStack].slice(0, 8)
       const projectSlices = { ...st.projectSlices }
       delete projectSlices[id]
       if (!isActive) return { projectTabs, projectSlices, closedProjectStack }
@@ -5998,7 +6013,7 @@ export const useKaisola = create<KaisolaState>()(
   },
   locateProject: (id, newPath) => {
     set((s) => {
-      const projectTabs = s.projectTabs.map((t) => (t.id === id ? { ...t, workspacePath: newPath, hue: folderHue(newPath) } : t))
+      const projectTabs = s.projectTabs.map((t) => (t.id === id ? { ...t, workspacePath: newPath, hue: folderHue(newPath), transientBlank: undefined } : t))
       if (id === s.activeProjectId) return { projectTabs, workspacePath: newPath } // keep sessions/layout
       const slice = s.projectSlices[id]
       if (!slice) return { projectTabs }
@@ -6020,9 +6035,13 @@ export const useKaisola = create<KaisolaState>()(
       if (pid === s.activeProjectId) return updater(pick(s, PROJECT_SLICE_MEMORY_KEYS)) as Partial<KaisolaState>
       const slice = s.projectSlices[pid]
       if (!slice) return s // unknown/closed project — drop the write
+      const patch = updater(slice)
+      const touched = Object.keys(patch).length > 0
       return {
-        projectSlices: { ...s.projectSlices, [pid]: { ...slice, ...updater(slice) } },
-        projectTabs: badge ? s.projectTabs.map((t) => (t.id === pid ? { ...t, activity: badge } : t)) : s.projectTabs,
+        projectSlices: { ...s.projectSlices, [pid]: { ...slice, ...patch } },
+        projectTabs: badge || touched
+          ? s.projectTabs.map((t) => (t.id === pid ? { ...t, ...(badge ? { activity: badge } : {}), transientBlank: undefined } : t))
+          : s.projectTabs,
       }
     }),
   }),

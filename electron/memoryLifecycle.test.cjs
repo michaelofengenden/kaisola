@@ -249,6 +249,24 @@ test('Codex effort labels preserve provider wire values and expose the modern Ul
   assert.equal(retainedMax.configOptions[0].currentValue, 'max')
 })
 
+test('Idea mode selects only provider-declared read-only controls', () => {
+  assert.deepEqual(_acpTest.readOnlyModeForControls({
+    modes: {
+      currentModeId: 'auto',
+      availableModes: [{ id: 'auto', name: 'Default' }, { id: 'read-only', name: 'Ask for approval' }],
+    },
+    configOptions: [],
+  }), { modeId: 'read-only', previousModeId: 'auto' })
+  assert.deepEqual(_acpTest.readOnlyModeForControls({
+    modes: null,
+    configOptions: [{ id: 'mode', category: 'mode', currentValue: 'default', options: [{ value: 'default', name: 'Default' }, { value: 'plan', name: 'Plan' }] }],
+  }), { modeId: 'plan', previousModeId: 'default' })
+  assert.equal(_acpTest.readOnlyModeForControls({
+    modes: { currentModeId: 'auto', availableModes: [{ id: 'auto', name: 'Default' }] },
+    configOptions: [],
+  }), null)
+})
+
 test('modern Codex live catalog is authoritative and legacy hardcoding cannot invent models', () => {
   const controls = freshenControls('codex', {
     modes: null,

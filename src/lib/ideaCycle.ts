@@ -45,18 +45,32 @@ export function mergeIdeaMessages(
   return merged.slice(-MAX_IDEA_MESSAGES)
 }
 
-/** Messages this member has neither authored nor been shown. `seen` holds the
- * transcript length recorded at the member's previous prompt dispatch, so a
- * new cycle forwards exactly the peer messages that arrived since. */
+/** Messages this member has neither authored nor been shown. New state stores
+ * the last delivered message id. Legacy numeric offsets remain readable, but
+ * an offset at/past the bounded window fails open to the current transcript so
+ * trimming can never hide a new message again. */
 export function unseenIdeaMessages(
   transcript: readonly IdeaMessage[],
-  seen: Record<string, number> | undefined,
+  seen: Record<string, string | number> | undefined,
   memberThreadId: string,
 ): IdeaMessage[] {
+  const cursor = seen?.[memberThreadId]
+  let start = 0
+  if (typeof cursor === 'string') {
+    const index = transcript.findIndex((message) => message.id === cursor)
+    // A trimmed-away cursor means context was lost, so replay the bounded
+    // window rather than silently omitting a fresh message.
+    start = index >= 0 ? index + 1 : 0
+  } else if (typeof cursor === 'number' && cursor >= 0 && cursor < transcript.length) {
+    start = cursor
+  }
   return transcript
-    .slice(Math.max(0, seen?.[memberThreadId] ?? 0))
+    .slice(start)
     .filter((message) => message.authorId !== memberThreadId)
 }
+
+export const ideaSeenCursor = (transcript: readonly IdeaMessage[]): string | undefined =>
+  transcript[transcript.length - 1]?.id
 
 const packet = (messages: readonly IdeaMessage[]): string =>
   messages.map((message) => `${message.label}:\n${message.text}`).join('\n\n---\n\n').slice(-MAX_IDEA_PROMPT_TEXT)

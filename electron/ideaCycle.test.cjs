@@ -37,8 +37,8 @@ test('Idea transcript merge is idempotent and ordered by completion', async () =
   assert.equal(mergeIdeaMessages([], flood).length, MAX_IDEA_MESSAGES)
 })
 
-test('Per-member seen state forwards exactly the unseen peer messages', async () => {
-  const { mergeIdeaMessages, unseenIdeaMessages } = await import('../src/lib/ideaCycle.ts')
+test('Per-member stable cursor forwards exactly the unseen peer messages', async () => {
+  const { ideaSeenCursor, mergeIdeaMessages, unseenIdeaMessages } = await import('../src/lib/ideaCycle.ts')
   // Cycle 1: user message, both initials, both reactions.
   const cycle1 = mergeIdeaMessages([], [
     msg('c1', 'user', 'user', 'first idea', 1),
@@ -49,7 +49,7 @@ test('Per-member seen state forwards exactly the unseen peer messages', async ()
   ])
   // Reaction prompts were dispatched when the transcript held 3 entries
   // (user + both initials); reactions landed after.
-  const seen = { claude: 3, codex: 3 }
+  const seen = { claude: ideaSeenCursor(cycle1.slice(0, 3)), codex: ideaSeenCursor(cycle1.slice(0, 3)) }
   const cycle2 = mergeIdeaMessages(cycle1, [msg('c2', 'user', 'user', 'second idea', 6)])
   const claudeUnseen = unseenIdeaMessages(cycle2, seen, 'claude')
   // Claude never saw codex's reaction; its own reaction is excluded.
@@ -58,6 +58,20 @@ test('Per-member seen state forwards exactly the unseen peer messages', async ()
   assert.deepEqual(codexUnseen.map((m) => m.id), ['c1:reaction:claude', 'c2:user'])
   // A missing seen record forwards everything not self-authored.
   assert.equal(unseenIdeaMessages(cycle2, undefined, 'claude').length, 4)
+})
+
+test('Stable cursors do not lose a message when the transcript trims at 400', async () => {
+  const { ideaSeenCursor, MAX_IDEA_MESSAGES, mergeIdeaMessages, unseenIdeaMessages } = await import('../src/lib/ideaCycle.ts')
+  const full = mergeIdeaMessages([], Array.from({ length: MAX_IDEA_MESSAGES }, (_, i) => msg(`c${i}`, 'user', 'user', `m${i}`, i)))
+  const seen = { claude: ideaSeenCursor(full) }
+  const next = mergeIdeaMessages(full, [msg('fresh', 'user', 'user', 'must survive rollover', MAX_IDEA_MESSAGES + 1)])
+  assert.equal(next.length, MAX_IDEA_MESSAGES)
+  assert.deepEqual(unseenIdeaMessages(next, seen, 'claude').map((message) => message.id), ['fresh:user'])
+
+  // Legacy length cursors at the cap fail open and migrate safely instead of
+  // returning an empty slice that hides the fresh message.
+  const legacy = unseenIdeaMessages(next, { claude: MAX_IDEA_MESSAGES }, 'claude')
+  assert.equal(legacy.at(-1)?.id, 'fresh:user')
 })
 
 test('Idea prompts carry the right context and nothing more', async () => {

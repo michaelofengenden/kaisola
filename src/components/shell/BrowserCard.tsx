@@ -28,6 +28,7 @@ interface WebviewEl extends HTMLElement {
   openDevTools(): void
   isDevToolsOpened(): boolean
   closeDevTools(): void
+  getWebContentsId(): number
 }
 
 /** "localhost:3000" → http://…; bare domains → https://…; URLs pass through. */
@@ -87,6 +88,10 @@ export function BrowserCard({ id }: { id: string }) {
       view.removeEventListener('page-title-updated', onTitle as EventListener)
       view.removeEventListener('did-start-loading', onStart)
       view.removeEventListener('did-stop-loading', onStop)
+      try {
+        const guestId = view.getWebContentsId()
+        if (Number.isInteger(guestId)) void bridge.browser?.releaseGuest(guestId).catch(() => {})
+      } catch { /* guest may already be gone during window teardown */ }
     }
     // bootUrl: the webview mounts only once a url exists — re-wire then
   }, [id, setPanelState, bootUrl])

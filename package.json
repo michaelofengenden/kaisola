@@ -1,7 +1,7 @@
 {
   "name": "kaisola",
   "productName": "Kaisola",
-  "version": "0.1.69",
+  "version": "0.1.70",
   "private": true,
   "description": "Kaisola — a Research IDE. Move research from literature → hypotheses → experiments → results → paper, with a human reviewing every transition.",
   "type": "module",
@@ -22,6 +22,8 @@
     "shoot": "vite build && electron electron/shoot.cjs",
     "group:probe": "vite build && electron electron/group-ui-probe.cjs",
     "layout:probe": "vite build && electron electron/layout-matrix-probe.cjs",
+    "markdown:probe": "vite build && electron electron/markdown-image-probe.cjs",
+    "navigation:probe": "vite build && electron electron/perfprobe.cjs NAV",
     "site:probe": "electron electron/site-ui-probe.cjs",
     "rebuild": "electron-rebuild -f -w node-pty -w better-sqlite3",
     "postinstall": "node scripts/postinstall.cjs",

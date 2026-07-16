@@ -609,7 +609,14 @@ export interface KaisolaBridge {
     setModel(agentKey: string, modelId: string, scope?: string): Promise<{ ok: boolean; message?: string }>
     setConfigOption(agentKey: string, configId: string, value: string, scope?: string): Promise<{ ok: boolean; message?: string }>
     authenticate(agentKey: string, methodId: string, scope?: string): Promise<{ ok: boolean; pending?: boolean; message?: string }>
-    prompt(agentKey: string, text: string, onUpdate: (u: AcpUpdate) => void, images?: { mimeType: string; data: string }[], scope?: string): Promise<{ ok: boolean; stopReason?: string; message?: string }>
+    prompt(
+      agentKey: string,
+      text: string,
+      onUpdate: (u: AcpUpdate) => void,
+      images?: { mimeType: string; data: string }[],
+      scope?: string,
+      options?: { readOnly?: boolean },
+    ): Promise<{ ok: boolean; stopReason?: string; message?: string }>
     /** Inject a follow-up into an agent's already-running turn (mid-turn steer).
      * `unsupported`/`noTurn` signal the caller to fall back to normal enqueue. */
     steer(agentKey: string, text: string, images?: { mimeType: string; data: string }[], scope?: string): Promise<{ ok: boolean; stopReason?: string; message?: string; unsupported?: boolean; noTurn?: boolean }>
@@ -817,6 +824,11 @@ export interface KaisolaBridge {
     set(key: string, value: string): Promise<{ ok: boolean; message?: string }>
     del(key: string): Promise<{ ok: boolean }>
     kind(): Promise<{ kind: 'sqlite' | 'json'; reason?: string }>
+  }
+  /** Embedded Chromium guests are explicitly released when their card is
+   * hidden or closed so no headless renderer survives an unmount. */
+  browser?: {
+    releaseGuest(guestId: number): Promise<{ ok: boolean }>
   }
   openExternal(url: string): Promise<{ ok: boolean }>
   pickFolder(): Promise<{ ok: boolean; path?: string; message?: string }>
@@ -1281,6 +1293,11 @@ const webMock: KaisolaBridge = {
       return { kind: 'json' as const }
     },
   },
+  browser: {
+    async releaseGuest() {
+      return { ok: true }
+    },
+  },
   async openExternal(url) {
     window.open(url, '_blank', 'noopener')
     return { ok: true }
@@ -1435,7 +1452,7 @@ function scopeAcp(acp: KaisolaBridge['acp']): KaisolaBridge['acp'] {
     setModel: (k, m, scope) => acp.setModel(scopedKeyFor(k, scope), m),
     setConfigOption: (k, c, v, scope) => acp.setConfigOption(scopedKeyFor(k, scope), c, v),
     authenticate: (k, m, scope) => acp.authenticate(scopedKeyFor(k, scope), m),
-    prompt: (k, text, onUpdate, images, scope) => acp.prompt(scopedKeyFor(k, scope), text, onUpdate, images),
+    prompt: (k, text, onUpdate, images, scope, options) => acp.prompt(scopedKeyFor(k, scope), text, onUpdate, images, undefined, options),
     steer: (k, text, images, scope) => acp.steer(scopedKeyFor(k, scope), text, images),
     onNotice: (cb) =>
       acp.onNotice((n) => {

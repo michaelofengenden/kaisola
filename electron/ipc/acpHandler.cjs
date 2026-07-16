@@ -756,6 +756,37 @@ const labelCodexApproval = (option) => option && CODEX_APPROVAL_LABELS[option.va
   ? { ...option, ...CODEX_APPROVAL_LABELS[option.value || option.id] }
   : option
 
+/** Pick a provider-declared mode that actually constrains mutations. Values
+ * remain provider-native: Codex exposes read-only, while Claude exposes plan.
+ * If an adapter declares neither, Idea mode fails closed instead of trusting
+ * prompt prose as a security boundary. */
+function readOnlyModeForControls(controls) {
+  const standard = controls?.modes && Array.isArray(controls.modes.availableModes)
+    ? {
+        current: controls.modes.currentModeId,
+        options: controls.modes.availableModes.map((option) => ({
+          value: option.id,
+          name: option.name,
+        })),
+      }
+    : null
+  const config = Array.isArray(controls?.configOptions)
+    ? controls.configOptions.find((option) => (option.category === 'mode' || option.id === 'mode') && Array.isArray(option.options))
+    : null
+  const control = standard || (config ? { current: config.currentValue, options: config.options } : null)
+  if (!control) return null
+  const exact = ['read-only', 'readonly', 'read_only', 'plan']
+  const selected = exact
+    .map((value) => control.options.find((option) => String(option.value ?? option.id).toLowerCase() === value))
+    .find(Boolean)
+    || control.options.find((option) => /read\s*-?\s*only|planning?\b/i.test(`${option.value ?? option.id} ${option.name ?? ''}`))
+  if (!selected) return null
+  return {
+    modeId: String(selected.value ?? selected.id),
+    previousModeId: typeof control.current === 'string' ? control.current : null,
+  }
+}
+
 /** Merge the current model lineup into an adapter's declared controls. */
 function freshenControls(presetId, controls, { modern = false } = {}) {
   try {
@@ -1242,7 +1273,7 @@ function registerAcpHandlers(ipcMain) {
     }
   })
 
-  ipcMain.handle('acp:prompt', async (event, { agentKey, reqId, text, images } = {}) => {
+  ipcMain.handle('acp:prompt', async (event, { agentKey, reqId, text, images, readOnly } = {}) => {
     const entry = entryFor(event.sender, agentKey)
     if (!entry || !entry.conn.alive) return { ok: false, message: 'Agent not connected.' }
     if (terminalOwnerMoves.has(entry)) return { ok: false, moving: true, message: 'This project is moving to another window. Try again in a moment.' }
@@ -1258,6 +1289,8 @@ function registerAcpHandlers(ipcMain) {
     entry.steerPromises = [] // steering follow-ups injected while THIS turn runs
     let signalTurnDone
     entry.turnDone = new Promise((resolve) => { signalTurnDone = resolve })
+    const constrainedMode = readOnly === true ? readOnlyModeForControls(entry.controls) : null
+    let restoreModeId = null
     // A finished turn holds its channel briefly so a steer that IS still
     // streaming can flush — but only briefly. The adapter may never answer an
     // injected prompt's own request id (promptQueueing absorbs it into the
@@ -1273,6 +1306,13 @@ function registerAcpHandlers(ipcMain) {
       }
     }
     try {
+      if (readOnly === true) {
+        if (!constrainedMode) throw new Error('This agent does not expose a read-only mode required by Mesh Idea mode.')
+        if (constrainedMode.previousModeId !== constrainedMode.modeId) {
+          await entry.conn.setMode(constrainedMode.modeId)
+          restoreModeId = constrainedMode.previousModeId
+        }
+      }
       const res = await entry.conn.prompt(text, images)
       await flushSteers()
       if (turn.sender && !turn.sender.isDestroyed()) {
@@ -1284,6 +1324,9 @@ function registerAcpHandlers(ipcMain) {
       if (turn.sender && !turn.sender.isDestroyed()) turn.sender.send(turn.channel, { __done: true })
       return { ok: false, message: err.message }
     } finally {
+      if (restoreModeId && entry.conn.alive) {
+        try { await entry.conn.setMode(restoreModeId) } catch { /* fail safe: remaining read-only is safer than widening silently */ }
+      }
       if (entry.current === turn) entry.current = { sender: null, channel: null }
       entry.steerPromises = []
       entry.turnEnding = false
@@ -1533,5 +1576,6 @@ module.exports = {
     isSensitivePath,
     resolveBundledCodexExecutable,
     resolveBundledClaudeExecutable,
+    readOnlyModeForControls,
   },
 }

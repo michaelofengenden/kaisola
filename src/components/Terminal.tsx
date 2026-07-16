@@ -327,16 +327,17 @@ export function Terminal({ id, attach = false, boot, cwd, projectId: projectIdOv
     term.write(chunk)
   }, [visible, attach])
 
-  // the GPU renderer follows the CARD, not the window: putting a card away
-  // frees its GL context; occlusion alone keeps it (re-showing the window
-  // must not pay a per-terminal context rebuild)
+  // The GPU renderer follows the CARD in Glass mode. Eco deliberately leaves
+  // xterm on its built-in CPU renderer: agent/terminal work is text-heavy and
+  // should not reserve a GL context when the user has asked to save energy.
+  // Putting a card away frees its context in either mode.
   useEffect(() => {
-    if (cardShown) {
+    if (cardShown && !ecoMode) {
       touchMountedTerminal(id)
       glCtlRef.current?.attach()
     }
     else glCtlRef.current?.drop()
-  }, [cardShown, id])
+  }, [cardShown, ecoMode, id])
 
   // font settings (Settings → Terminal, plus ⌘+/⌘−/⌘0) apply LIVE to every
   // terminal — the renderer rebuilds its glyph atlas and the pty re-fits
@@ -441,9 +442,10 @@ export function Terminal({ id, attach = false, boot, cwd, projectId: projectIdOv
     term.open(hostRef.current)
     touchMountedTerminal(id)
     // GPU renderer when available (the pty stays byte-identical without it).
-    // Its dispose() is NOT idempotent and crashes inside term.dispose() (seen
-    // under StrictMode's dev double-mount) — so we dispose it ourselves first,
-    // exactly once, and never let the addon manager hit a live GL renderer.
+    // Its dispose() is not idempotent. Hiding a card disposes the addon before
+    // xterm later walks its addon manager, so guard the addon's own method;
+    // otherwise the second dispose throws and can abort the rest of xterm's
+    // cleanup, retaining listeners and buffers across project switches.
     // Attach/drop follows card visibility (glCtlRef): hidden cards hold no
     // GL context, so ghost cards and put-away sessions cost RAM, not GPU.
     let gl: WebglAddon | null = null
@@ -458,15 +460,23 @@ export function Terminal({ id, attach = false, boot, cwd, projectId: projectIdOv
     const attachWebgl = () => {
       if (gl) return
       try {
-        gl = new WebglAddon()
-        gl.onContextLoss(() => dropWebgl())
-        term.loadAddon(gl)
+        const candidate = new WebglAddon()
+        const dispose = candidate.dispose.bind(candidate)
+        let disposed = false
+        candidate.dispose = () => {
+          if (disposed) return
+          disposed = true
+          dispose()
+        }
+        gl = candidate
+        candidate.onContextLoss(() => dropWebgl())
+        term.loadAddon(candidate)
       } catch {
         gl = null // canvas/DOM renderer fallback
       }
     }
     glCtlRef.current = { attach: attachWebgl, drop: dropWebgl }
-    if (cardShownRef.current) attachWebgl()
+    if (cardShownRef.current && !ecoRef.current) attachWebgl()
     fit.fit()
 
     let disposed = false

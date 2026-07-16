@@ -3,6 +3,7 @@
 const { spawn } = require('node:child_process')
 const path = require('node:path')
 const electron = require('electron')
+const { evaluateLifecycleComparison } = require('./memoryAudit.cjs')
 
 const probe = path.join(__dirname, 'perfprobe.cjs')
 const rounds = Math.max(1, Math.min(7, Number(process.env.KAISOLA_MEMORY_ROUNDS) || 5))
@@ -58,6 +59,7 @@ const summary = (values) => {
   const pairedDeltasMiB = results.G.map((row, index) => round(row.medianMiB - results.E[index].medianMiB))
   const lifecycleOverhead = summary(results.LIFE.map((row) => row.overheadMiB))
   const lifecycleRetained = summary(results.LIFE.map((row) => row.retained.medianMiB))
+  const lifecycleAudit = evaluateLifecycleComparison(results.LIFE, rounds)
   const result = {
     rounds,
     material: {
@@ -69,11 +71,9 @@ const summary = (values) => {
     lifecycle: {
       retained: lifecycleRetained,
       overhead: lifecycleOverhead,
-      monotonicRuns: results.LIFE.filter((row) => row.monotonicRetainedGrowth).length,
-      thresholdPasses: results.LIFE.filter((row) => row.overheadMiB <= row.thresholdMiB).length,
+      ...lifecycleAudit,
     },
-    pass: rounds >= 5
-      && results.LIFE.every((row) => row.pass && !row.monotonicRetainedGrowth && row.overheadMiB <= row.thresholdMiB),
+    pass: lifecycleAudit.pass,
     results,
   }
   console.log('MEMORY_COMPARE=' + JSON.stringify(result))

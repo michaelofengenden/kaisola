@@ -80,6 +80,9 @@ function hardenWebviewAttachment(webPreferences, params) {
   webPreferences.allowRunningInsecureContent = false
   webPreferences.webviewTag = false
   webPreferences.plugins = false
+  // A hidden guest should stop timers/painting while React tears it down.
+  // Explicit guest release in main remains the authoritative lifecycle gate.
+  webPreferences.backgroundThrottling = true
   if (params.partition !== 'persist:browser' || !isSafeWebUrl(params.src)) return false
   params.partition = 'persist:browser'
   return true

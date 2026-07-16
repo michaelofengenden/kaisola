@@ -32,6 +32,7 @@ const { registerGlassHandlers, wireGlassEvents } = require('./ipc/glassHandler.c
 const { registerAssistantArchiveHandlers } = require('./ipc/assistantArchive.cjs')
 const { registerAttentionHandlers } = require('./ipc/attentionHandler.cjs')
 const { hardenWebviewAttachment, installPermissionPolicy, isSafeWebUrl, isTrustedRendererUrl } = require('./ipc/securityPolicy.cjs')
+const { BrowserGuestRegistry } = require('./ipc/browserGuestRegistry.cjs')
 const {
   MANIFEST_KEY: WINDOW_MANIFEST_KEY,
   OPEN_AT_QUIT,
@@ -172,6 +173,7 @@ function loadAppIcon() {
 // keep it per full window so the Window menu can mirror the FOCUSED window's
 // tabs (the application menu is global on macOS).
 const tabsByWc = new Map() // webContents.id → { id, title, active }[]
+const browserGuests = new BrowserGuestRegistry()
 
 // tab:* menu actions only make sense in a full window with a tab strip — never
 // a pop-out (pop windows carry `pop=` in their URL and have no strip).
@@ -448,6 +450,7 @@ function createWindow(opts = {}) {
   // browser-card guests: popups/target=_blank navigate the SAME webview —
   // never a new Electron window
   win.webContents.on('did-attach-webview', (_event, guest) => {
+    browserGuests.attach(win.webContents, guest)
     const containGuestNavigation = (event, url) => {
       if (!isSafeWebUrl(url)) event.preventDefault()
     }
@@ -594,6 +597,7 @@ function createWindow(opts = {}) {
     // the dead event route; same-project replacement renderers adopt explicitly.
     forgetRendererOwner(rendererOwner)
     releaseAcpRenderer(rendererOwner)
+    browserGuests.releaseOwner(rendererOwner)
   })
   win.on('closed', () => {
     nativeGlass.active = false
@@ -1653,6 +1657,9 @@ if (hasSingleInstanceLock) app.whenReady().then(() => {
   }
   registerModelHandlers(ipcMain)
   registerToolHandlers(ipcMain)
+  ipcMain.handle('browser:release-guest', (event, { guestId } = {}) => ({
+    ok: browserGuests.release(event.sender, guestId),
+  }))
   registerSettingsHandlers(ipcMain)
   registerTerminalHandlers(ipcMain)
   registerAcpHandlers(ipcMain)

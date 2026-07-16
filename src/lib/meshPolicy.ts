@@ -21,6 +21,7 @@ export interface MeshOrchestrationMarker {
   groupId: string
   attemptId: string
   phase: string
+  readOnly?: boolean
 }
 
 interface MeshParentThread {

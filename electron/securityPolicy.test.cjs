@@ -68,6 +68,7 @@ test('webview attachment is restricted to http(s), the browser partition, and sa
   assert.equal(preferences.sandbox, true)
   assert.equal(preferences.webSecurity, true)
   assert.equal(preferences.plugins, false)
+  assert.equal(preferences.backgroundThrottling, true)
 
   assert.equal(hardenWebviewAttachment({}, { src: 'file:///etc/passwd', partition: 'persist:browser' }), false)
   assert.equal(hardenWebviewAttachment({}, { src: 'https://example.com/', partition: 'persist:other' }), false)

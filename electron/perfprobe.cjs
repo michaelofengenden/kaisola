@@ -24,6 +24,7 @@ const { registerClaudeHooksHandlers } = require('./ipc/claudeHooksHandler.cjs')
 const { registerUpdateHandlers } = require('./ipc/updateHandler.cjs')
 const { registerExtensionHandlers } = require('./ipc/extensionHandler.cjs')
 const { registerAssistantArchiveHandlers } = require('./ipc/assistantArchive.cjs')
+const { evaluateLifecycleRun } = require('./memoryAudit.cjs')
 const worktree = require('./ipc/worktreeHandler.cjs')
 
 process.env.KAISOLA_SMOKE = '1'
@@ -305,10 +306,39 @@ async function runLifecycleProbe(win) {
   await waitForRenderer(warmWindow, `document.querySelector('.app')`)
   warmWindow.destroy()
   const gcExposed = await execute(win, `typeof window.gc === 'function'`)
-  await execute(win, `window.gc?.()`)
-  await wait(1_000)
-  const baseline = await memorySample()
+  // Compare settled retention at every point. A single renderer GC followed
+  // by 350 ms measured Chromium's deferred allocator work as though it were a
+  // leak, while the final sample received two GCs and three seconds to settle.
+  // Keep the cap and monotonic-growth gate strict, but give the baseline,
+  // checkpoints, and final result the same collection protocol.
+  const settledMemorySample = async () => {
+    await execute(win, `window.gc?.()`)
+    await wait(1_000)
+    await execute(win, `window.gc?.()`)
+    await wait(1_000)
+    return memorySample(3, 80)
+  }
+  const lifecycleDiagnostics = () => execute(win, `(() => {
+    const state = window.__kaisola.getState()
+    const memory = performance.memory
+    return {
+      usedJsHeapMiB: memory ? Math.round(memory.usedJSHeapSize / 104857.6) / 10 : null,
+      totalJsHeapMiB: memory ? Math.round(memory.totalJSHeapSize / 104857.6) / 10 : null,
+      domNodes: document.getElementsByTagName('*').length,
+      canvases: document.querySelectorAll('canvas').length,
+      xterms: document.querySelectorAll('.xterm').length,
+      projectTabs: state.projectTabs.length,
+      projectSlices: Object.keys(state.projectSlices).length,
+      closedProjects: state.closedProjectStack.length,
+      terminalMeta: Object.keys(state.terminalMeta).length,
+      termRemounts: Object.keys(state.termRemounts).length,
+      termDrafts: Object.keys(state.termDrafts).length,
+    }
+  })()`)
+  const baseline = await settledMemorySample()
+  const baselineDiagnostics = await lifecycleDiagnostics()
   const checkpoints = []
+  const checkpointDiagnostics = []
   for (let batch = 0; batch < 5; batch += 1) {
     await execute(win, `(() => {
       const state = window.__kaisola.getState()
@@ -317,9 +347,8 @@ async function runLifecycleProbe(win) {
       for (const id of ids) state.closeProject(id)
     })()`)
     await switchSequence(win, projects, switchesPerBatch, batch)
-    await execute(win, `window.gc?.()`)
-    await wait(350)
-    checkpoints.push(await memorySample(3, 80))
+    checkpoints.push(await settledMemorySample())
+    checkpointDiagnostics.push(await lifecycleDiagnostics())
   }
   const teardownWindows = []
   for (let i = 0; i < 3; i += 1) {
@@ -329,34 +358,33 @@ async function runLifecycleProbe(win) {
     teardownWindows.push(extra)
   }
   for (const extra of teardownWindows) extra.destroy()
-  await execute(win, `window.gc?.()`)
-  await wait(1_500)
-  await execute(win, `window.gc?.()`)
-  await wait(1_500)
-  const retained = await memorySample()
-  const retainedSeries = checkpoints.map((sample) => sample.medianMiB)
-  const monotonic = retainedSeries.length > 1 && retainedSeries.slice(1).every((value, index) => value > retainedSeries[index] + 1)
-  const overheadMiB = round(retained.medianMiB - baseline.medianMiB)
-  const thresholdMiB = round(Math.max(30, baseline.medianMiB * 0.1))
+  const retained = await settledMemorySample()
+  const retainedDiagnostics = await lifecycleDiagnostics()
   const continuity = []
   for (const project of projects) continuity.push(await continuityFor(win, project))
+  const audit = evaluateLifecycleRun({
+    baseline,
+    baselineDiagnostics,
+    checkpoints,
+    checkpointDiagnostics,
+    retained,
+    retainedDiagnostics,
+    continuity,
+  })
   const result = {
     scenario: 'lifecycle',
     baseline,
+    baselineDiagnostics,
     checkpoints,
+    checkpointDiagnostics,
     retained,
-    retainedSeriesMiB: retainedSeries,
-    overheadMiB,
-    thresholdMiB,
-    monotonicRetainedGrowth: monotonic,
+    retainedDiagnostics,
+    ...audit,
     cycles: { warmupSwitches: 45, projectOpenClose: openClosePerBatch * 5, warmSwitches: switchesPerBatch * 5, osWindowOpenClose: teardownWindows.length },
     gcExposed,
     residentCap,
     continuity,
   }
-  result.pass = !monotonic
-    && overheadMiB <= thresholdMiB
-    && result.continuity.every((row) => row.pidStable && row.output && row.draft && row.agent && row.activeFile && row.notificationSetting)
   console.log('MEMORY_LIFECYCLE=' + JSON.stringify(result))
   return result.pass
 }

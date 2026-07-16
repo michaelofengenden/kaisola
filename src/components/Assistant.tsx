@@ -1915,6 +1915,7 @@ export const Assistant = memo(function Assistant({ threadId }: { threadId: strin
     const wasTrimmed = rawPrompt.text.length > ASSISTANT_DRAFT_TEXT_LIMIT
     const prompt: AssistantDraft = { ...rawPrompt, text: rawPrompt.text.slice(0, ASSISTANT_DRAFT_TEXT_LIMIT) }
     if (!prompt.text) return false
+    const readOnlyDispatch = prompt.orchestration?.readOnly === true
     // Queued Mesh work is scoped to one durable stage attempt. Treat an old
     // attempt as already handled so the queue drain never restores it after a
     // Stop -> Continue retry minted a replacement.
@@ -1933,7 +1934,7 @@ export const Assistant = memo(function Assistant({ threadId }: { threadId: strin
     // Snapshot the live permission mode with every send — the agent itself can
     // flip modes mid-session (e.g. leaving plan mode), and only what's saved
     // here survives a reconnect.
-    {
+    if (!readOnlyDispatch) {
       const liveMode = controls.find((c) => c.kind === 'mode')?.value
       if (liveMode) setThreadPermissionMode(threadId, liveMode, projectId)
     }
@@ -1967,7 +1968,7 @@ export const Assistant = memo(function Assistant({ threadId }: { threadId: strin
     // tree BEFORE the agent acts, attach the id to this turn — the turn rail
     // grows a "Restore files" affordance. Non-blocking: the snapshot races the
     // prompt harmlessly (it captures pre-turn state either way, git is fast).
-    {
+    if (!readOnlyDispatch) {
       const turnAt = userTurn.at
       void useKaisola.getState().snapshotWorkspace(`Before “${prompt.text.slice(0, 40)}”`, projectId).then((ckpt) => {
         if (!ckpt) return
@@ -2031,7 +2032,14 @@ export const Assistant = memo(function Assistant({ threadId }: { threadId: strin
     const stream = makeOnUpdate(threadId)
     let res: { ok: boolean; stopReason?: string; message?: string }
     try {
-      res = await bridge.acp.prompt(connectionKey, payload, stream.onUpdate, images.length ? images : undefined, projectId)
+      res = await bridge.acp.prompt(
+        connectionKey,
+        payload,
+        stream.onUpdate,
+        images.length ? images : undefined,
+        projectId,
+        { readOnly: readOnlyDispatch },
+      )
     } catch (err) {
       res = { ok: false, message: String((err as Error)?.message ?? err) }
     }

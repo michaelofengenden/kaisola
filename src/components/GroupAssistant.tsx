@@ -6,6 +6,7 @@ import {
   ideaInitialPrompt,
   ideaMessageId,
   ideaReactionPrompt,
+  ideaSeenCursor,
   mergeIdeaMessages,
   unseenIdeaMessages,
   type IdeaMessage,
@@ -185,6 +186,12 @@ export const GroupAssistant = memo(function GroupAssistant({ threadId }: { threa
   const members = useMemo(() => group?.members ?? [], [group?.members])
   const phase = group?.phase ?? 'idle'
   const purpose = group?.purpose ?? 'build'
+  const requestedReworkMembers = useMemo(() => {
+    const candidateIds = new Set(Object.values(group?.reviewReceipts ?? {})
+      .filter((receipt) => receipt.verdict === 'changes-requested')
+      .map((receipt) => receipt.candidateThreadId))
+    return members.filter((member) => candidateIds.has(member.threadId))
+  }, [group?.reviewReceipts, members])
   const startOperation = (
     kind: NonNullable<GroupSessionState['operation']>['kind'],
     expectedPhase: GroupSessionPhase,
@@ -528,7 +535,8 @@ export const GroupAssistant = memo(function GroupAssistant({ threadId }: { threa
       const seen = { ...(group.ideaSeen ?? {}) }
       const prompts = Object.fromEntries(members.map((member) => {
         const peerInitials = initials.filter((message) => message.authorId !== member.threadId)
-        seen[member.threadId] = transcript.length
+        const cursor = ideaSeenCursor(transcript)
+        if (cursor) seen[member.threadId] = cursor
         return [member.threadId, ideaReactionPrompt(member.label, userText, peerInitials)]
       }))
       queueStage('idea-reacting', prompts, members, { ideaTranscript: transcript, ideaSeen: seen })
@@ -596,7 +604,12 @@ export const GroupAssistant = memo(function GroupAssistant({ threadId }: { threa
       if (text) enqueue(member.threadId, {
         ...EMPTY_DRAFT,
         text,
-        orchestration: { groupId: threadId, attemptId, phase: nextPhase },
+        orchestration: {
+          groupId: threadId,
+          attemptId,
+          phase: nextPhase,
+          ...((nextPhase === 'idea-initial' || nextPhase === 'idea-reacting') ? { readOnly: true } : {}),
+        },
       }, undefined, projectId)
     }
   }
@@ -751,7 +764,8 @@ export const GroupAssistant = memo(function GroupAssistant({ threadId }: { threa
       // Unseen = the new message plus peer messages from earlier cycles this
       // member was never shown (e.g. reactions that landed after its own).
       const unseen = unseenIdeaMessages(transcript, group?.ideaSeen, member.threadId)
-      seen[member.threadId] = transcript.length
+      const cursor = ideaSeenCursor(transcript)
+      if (cursor) seen[member.threadId] = cursor
       const peerLabels = members.filter((peer) => peer.threadId !== member.threadId).map((peer) => peer.label)
       return [member.threadId, ideaInitialPrompt(member.label, peerLabels, unseen)]
     }))
@@ -943,6 +957,31 @@ export const GroupAssistant = memo(function GroupAssistant({ threadId }: { threa
     } finally {
       endGroupOperation(threadId, operationId, projectId)
     }
+  }
+
+  /** A changes-requested receipt is terminal for that immutable commit.
+   * Return the findings to its owner and mint a corrected candidate before
+   * cross-reviewing again; re-sending the same SHA only repeats the verdict. */
+  const resumeRequestedChanges = () => {
+    if (!group?.worktrees || !requestedReworkMembers.length) return
+    const prompts = Object.fromEntries(requestedReworkMembers.map((member) => {
+      const reviewEntry = Object.entries(group.reviewReceipts ?? {})
+        .find(([, receipt]) => receipt.candidateThreadId === member.threadId && receipt.verdict === 'changes-requested')
+      const receipt = reviewEntry?.[1]
+      const reviewerText = reviewEntry ? group.reviews?.[reviewEntry[0]] : undefined
+      const findings = receipt?.blockingFindings?.length
+        ? receipt.blockingFindings.map((finding, index) => `${index + 1}. ${finding}`).join('\n')
+        : 'Review the verifier report and address every blocking item.'
+      const wt = group.worktrees?.[member.threadId]
+      return [member.threadId,
+        `Revise only your own frozen Mesh candidate in ${wt?.path ?? 'your assigned worktree'}. The previous immutable commit ${receipt?.reviewedCommit ?? group.reviewedCommits?.[member.threadId] ?? '(unknown)'} received changes-requested. Address every blocking finding below, keep the peer worktree and main untouched, add regression coverage, and commit the corrected candidate. Finish with files changed, tests run, unresolved risks, and integration notes.\n\nBlocking findings:\n${findings}${reviewerText ? `\n\nVerifier report:\n${reviewerText.slice(-MAX_SHARED_TEXT)}` : ''}`,
+      ]
+    }))
+    queueStage('executing', prompts, requestedReworkMembers, {
+      changedFiles: undefined,
+      reviewedCommits: undefined,
+      reviewReceipts: undefined,
+    })
   }
 
   const integrate = async () => {
@@ -1344,7 +1383,8 @@ export const GroupAssistant = memo(function GroupAssistant({ threadId }: { threa
         {phase === 'ready' && group.flow === 'guided' && <button type="button" className="group-action" onClick={negotiate}><Icon name="MessageSquarePlus" size={14} /> Negotiate roles</button>}
         {(phase === 'plan-ready' || phase === 'review-ready') && group.flow === 'guided' && <button type="button" className="group-action" onClick={writeRoleContract}><Icon name="ClipboardList" size={14} /> Write role contract</button>}
         {phase === 'assigned' && <button type="button" className="group-action" onClick={() => void executeIsolated()} disabled={transitioning}><Icon name="GitBranch" size={14} /> Approve plan · create worktrees</button>}
-        {phase === 'execution-ready' && (group.flow === 'guided' || !!group.error) && <button type="button" className="group-action" onClick={() => void crossReview()} disabled={transitioning}><Icon name="ScanSearch" size={14} /> {group.error ? 'Retry cross-review' : 'Cross-review'}</button>}
+        {phase === 'execution-ready' && requestedReworkMembers.length > 0 && <button type="button" className="group-action" onClick={resumeRequestedChanges} disabled={transitioning}><Icon name="Wrench" size={14} /> Apply requested changes</button>}
+        {phase === 'execution-ready' && requestedReworkMembers.length === 0 && (group.flow === 'guided' || !!group.error) && <button type="button" className="group-action" onClick={() => void crossReview()} disabled={transitioning}><Icon name="ScanSearch" size={14} /> {group.error ? 'Retry cross-review' : 'Cross-review'}</button>}
         {phase === 'merge-ready' && <button type="button" className="group-action" onClick={() => void integrate()} disabled={transitioning}><Icon name="GitMerge" size={14} /> Integrate reviewed work</button>}
         {phase === 'done' && <button type="button" className="group-action" onClick={requestNewGroup}><Icon name="Plus" size={14} /> New Mesh</button>}
         {group.paused && <button type="button" className="group-action" onClick={() => { void continueStage() }} disabled={transitioning}><Icon name="Play" size={14} /> {transitioning ? 'Waiting for agents to stop…' : `Continue ${group.pausedPending?.length ? `${group.pausedPending.length} unfinished ${group.pausedPending.length === 1 ? 'agent' : 'agents'}` : 'stage'}`}</button>}

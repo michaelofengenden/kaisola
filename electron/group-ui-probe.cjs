@@ -486,7 +486,29 @@ app.whenReady().then(async () => {
   await win.webContents.executeJavaScript(`(() => {
     const state = window.__kaisola.getState()
     const group = state.assistantThreads.find((thread) => thread.group)
-    if (group) state.setGroupSession(group.id, { phase: 'done', error: undefined })
+    if (!group) return
+    const [reviewer, candidate] = group.group.members
+    state.setGroupSession(group.id, {
+      phase: 'execution-ready',
+      error: 'Review returned changes-requested.',
+      reviewReceipts: {
+        [reviewer.threadId]: {
+          candidateThreadId: candidate.threadId,
+          reviewedCommit: 'probe-candidate',
+          verdict: 'changes-requested',
+          reviewedFiles: ['probe.txt'],
+          tests: ['probe'],
+          blockingFindings: ['Fix the candidate before reviewing again.'],
+        },
+      },
+    })
+  })()`)
+  await wait(100)
+  const changesRequestedRoutesToRework = await win.webContents.executeJavaScript(`/Apply requested changes/.test(document.querySelector('.group-action')?.textContent ?? '') && !/Retry cross-review/.test(document.querySelector('.group-action')?.textContent ?? '')`)
+  await win.webContents.executeJavaScript(`(() => {
+    const state = window.__kaisola.getState()
+    const group = state.assistantThreads.find((thread) => thread.group)
+    if (group) state.setGroupSession(group.id, { phase: 'done', error: undefined, reviewReceipts: undefined })
   })()`)
   await wait(80)
   const siteScreenshot = await captureAsset('mesh-light.jpg', '.group-execution')
@@ -586,6 +608,7 @@ app.whenReady().then(async () => {
       && restored.assistantThreads.find((thread) => thread.id === created.id)?.queuePaused === true
   })()`)
   // ── Idea mode: bounded group-chat cycles, zero repository machinery ──────
+  const ideaCheckpointBaseline = await win.webContents.executeJavaScript(`window.__kaisola.getState().repoCheckpoints.length`)
   const ideaStarted = await win.webContents.executeJavaScript(`(() => {
     const state = window.__kaisola.getState()
     state.setWorkspace(${JSON.stringify(workspace)})
@@ -634,6 +657,7 @@ app.whenReady().then(async () => {
       phase: group?.group?.phase,
       kinds: transcript.map((message) => message.kind).join(','),
       domMessages: document.querySelectorAll('.group-idea-msg').length,
+      checkpoints: state.repoCheckpoints.length,
     }
   })()`)
   const ideaWorktreesOnDisk = execFileSync('git', ['worktree', 'list', '--porcelain'], { cwd: workspace, encoding: 'utf8' })
@@ -659,7 +683,7 @@ app.whenReady().then(async () => {
       && seq[3][1].includes('pricing')
   })
 
-  const result = { configured, effortWire, saturated, asked, stopped, paused, pausedPersisted: !!pausedPersisted, pausedScreenshot, pausedCloseReopen, continued, adoptedBusyRecovered, selectiveResume, ready, parkedBeforeNegotiation, fluidEnabled, connectCalls, negotiated, assigned, doubleExecuteClaimed, isolatedWorktreeCount, executed, reviewed, largeReviewRouted, done, worktreeCleanupDone, ...facts, persisted, invalidReviewStoppedMerge, staleReviewRecovery, siteScreenshot, screenshot, closeReopen, openedDeleteMenu, clickedDelete, switchedProjectId, deleted, projectSwitchSafe, archiveDeleteVerified, deleteTeardownOrdered, sessionDraftRoundTrip, ideaStarted, ideaAsked, ideaCycle1, ideaFacts1, ideaCycle2, ideaFacts2, ideaWorktreesOnDisk, ideaPromptTotal, ideaFlow, deleteLifecycle }
+  const result = { configured, effortWire, saturated, asked, stopped, paused, pausedPersisted: !!pausedPersisted, pausedScreenshot, pausedCloseReopen, continued, adoptedBusyRecovered, selectiveResume, ready, parkedBeforeNegotiation, fluidEnabled, connectCalls, negotiated, assigned, doubleExecuteClaimed, isolatedWorktreeCount, executed, reviewed, largeReviewRouted, done, worktreeCleanupDone, ...facts, persisted, invalidReviewStoppedMerge, staleReviewRecovery, changesRequestedRoutesToRework, siteScreenshot, screenshot, closeReopen, openedDeleteMenu, clickedDelete, switchedProjectId, deleted, projectSwitchSafe, archiveDeleteVerified, deleteTeardownOrdered, sessionDraftRoundTrip, ideaCheckpointBaseline, ideaStarted, ideaAsked, ideaCycle1, ideaFacts1, ideaCycle2, ideaFacts2, ideaWorktreesOnDisk, ideaPromptTotal, ideaFlow, deleteLifecycle }
   console.log('GROUP_UI=' + JSON.stringify(result))
   const passed = configured
     && effortWire === 'claude-code:xhigh,codex:xhigh'
@@ -710,6 +734,7 @@ app.whenReady().then(async () => {
     && persisted.visible
     && invalidReviewStoppedMerge
     && staleReviewRecovery
+    && changesRequestedRoutesToRework
     && closeReopen.ok
     && closeReopen.bundledThreads === 3
     && clickedDelete
@@ -731,6 +756,7 @@ app.whenReady().then(async () => {
     && ideaFacts2.phase === 'idea-ready'
     && ideaFacts2.kinds === 'user,initial,initial,reaction,reaction,user,initial,initial,reaction,reaction'
     && ideaFacts2.domMessages === 10
+    && ideaFacts2.checkpoints === ideaCheckpointBaseline
     && ideaWorktreesOnDisk === 0
     && ideaPromptTotal === 8
     && ideaFlow

@@ -16,4 +16,4 @@ also images within MD files should be movable as they are in other forms like go
 
   
 
-also for some reason search and notifs arn't even
+also for some reason search and notifs arn't even/aligned on the same exact line still... why is this should we switch them?

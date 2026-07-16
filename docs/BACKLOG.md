@@ -10,12 +10,10 @@ Would also like to make this possibly look more elegant, minamilist, and clean, 
 
 ![Screenshot 2026-07-16 at 12.29.30 AM](backlog-media/Screenshot%202026-07-16%20at%2012.29.30%E2%80%AFAM.png#kaisola-width=72)
 
-  
-
 also images within MD files should be movable as they are in other forms like google docs where it follows a typing cursor. 
-
-  
 
 also for some reason search and notifs arn't even/aligned on the same exact line still... why is this should we switch them? do you see how the notification button line appears a slightly lower than the top of the magnifying glass symbol?:
 
 ![Screenshot 2026-07-16 at 12.31.16 AM](backlog-media/Screenshot%202026-07-16%20at%2012.31.16%E2%80%AFAM.png#kaisola-width=40)
+
+![Screenshot 2026-07-16 at 12.33.40 AM](backlog-media/Screenshot%202026-07-16%20at%2012.33.40%E2%80%AFAM.png)

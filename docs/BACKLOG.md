@@ -6,6 +6,8 @@
 
 ![Screenshot 2026-07-15 at 5.23.05 PM](backlog-media/Screenshot%202026-07-15%20at%205.23.05%E2%80%AFPM.png#kaisola-width=58)
 
-can be fixed further as well, the settings can just included inside the profile of the user, and the notifications and search button need to be on the same level.  Also images inside md files should be more easily movable and deletable and writing aroundable. 
+can be fixed further as well, the settings can just included inside the profile of the user, and the notifications and search button need to be on the same level. 
+
+\-  Also images inside md files should be more easily movable and deletable and writing aroundable. 
 
 ![Screenshot 2026-07-15 at 5.23.05 PM](backlog-media/Screenshot%202026-07-15%20at%205.23.05%E2%80%AFPM.png#kaisola-width=20)

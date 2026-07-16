@@ -213,19 +213,25 @@ app.whenReady().then(async () => {
       !!document.querySelector('.tabstrip-view-controls [aria-label="Hide file tree"]') &&
       !!document.querySelector('.tabstrip-view-controls [aria-label="Hide file preview"]'),
   }))()`)
-  win.webContents.send('app-auth:changed', {
-    ok: true,
-    configured: true,
-    serverVerified: true,
-    profile: {
-      provider: 'google',
-      id: 'smoke-user',
-      email: 'person@example.com',
-      name: 'Kaisola Tester',
-      avatarUrl: 'data:image/svg+xml,%3Csvg xmlns="http://www.w3.org/2000/svg" width="32" height="32"%3E%3Crect width="32" height="32" rx="16" fill="%2395a456"/%3E%3C/svg%3E',
-    },
-  })
-  await new Promise((r) => setTimeout(r, 100))
+  // A footer remount (layout/tab-layout switches) refetches the real auth
+  // status and drops this injected profile, so profile-menu sections below
+  // re-inject before interacting.
+  const injectAuthProfile = async () => {
+    win.webContents.send('app-auth:changed', {
+      ok: true,
+      configured: true,
+      serverVerified: true,
+      profile: {
+        provider: 'google',
+        id: 'smoke-user',
+        email: 'person@example.com',
+        name: 'Kaisola Tester',
+        avatarUrl: 'data:image/svg+xml,%3Csvg xmlns="http://www.w3.org/2000/svg" width="32" height="32"%3E%3Crect width="32" height="32" rx="16" fill="%2395a456"/%3E%3C/svg%3E',
+      },
+    })
+    await new Promise((r) => setTimeout(r, 100))
+  }
+  await injectAuthProfile()
   const accountUi = await win.webContents.executeJavaScript(`(async () => {
     const footer = document.querySelector('.session-sidebar > .shell-sidebar-footer')
     const avatar = footer?.querySelector('.app-account-avatar')
@@ -809,6 +815,7 @@ app.whenReady().then(async () => {
 
   // 7b) current agent work is ONE compact live line (the transcript owns
   //     history); subagents and live terminals remain directly reachable.
+  await injectAuthProfile()
   const activityUi = await win.webContents.executeJavaScript(`(async () => {
     // the fresh shell seeds no chat thread — this probe exercises one
     if (!window.__kaisola.getState().assistantThreads.length) window.__kaisola.getState().requestNewThread('mock')
@@ -2342,6 +2349,7 @@ a^2 + b^2 = c^2
 
   // 14b2) layout actions remain reversible and the structural switches stay
   //       in the same top-right slots regardless of panel visibility.
+  await injectAuthProfile()
   const intuitiveLayoutControls = await win.webContents.executeJavaScript(`(async () => {
     const get = () => window.__kaisola.getState()
     const wait = () => new Promise((r) => setTimeout(r, 70))
@@ -2582,6 +2590,7 @@ a^2 + b^2 = c^2
   console.log('INBOX_ANCHOR_UI=' + JSON.stringify(inboxAnchorUi))
 
   // 15) settings exposes the appearance/layout configuration
+  await injectAuthProfile()
   const settings = await win.webContents.executeJavaScript(`(async () => {
     const expectedPane = window.__kaisola.getState().settingsPane || 'general'
     document.querySelector('.shell-sidebar-footer .app-account-avatar')?.click()

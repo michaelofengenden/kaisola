@@ -12,4 +12,4 @@ Would also like to make this possibly look more elegant, minamilist, and clean, 
 
   
 
-also images within MD files should be movable as they are in
+also images within MD files should be movable as they are in other forms like google docs where th

@@ -261,6 +261,13 @@ export interface AcpTerminalInfo {
 /** An agent is blocked waiting for the human — rendered as an inline card. */
 export interface AcpPermissionRequest {
   permId: string
+  /** Main-owned immutable revision; permission responses must echo it exactly. */
+  revision: number
+  /** Whether the bounded display payload contains all provider-supplied context. */
+  completeness: 'complete' | 'truncated' | 'redacted' | 'unavailable'
+  projectId: string
+  targetId: string
+  sessionId?: string
   key: string
   agent: string
   title: string

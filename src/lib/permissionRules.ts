@@ -85,8 +85,9 @@ export function pathIsSensitive(globs: string[], pathish: string): boolean {
 /** A permission request touching sensitive files (title text or diff paths). */
 export function requestIsSensitive(
   globs: string[],
-  req: Pick<AcpPermissionRequest, 'title' | 'diffs'>,
+  req: Pick<AcpPermissionRequest, 'title' | 'diffs' | 'sensitive'>,
 ): boolean {
+  if (req.sensitive) return true
   if ((req.diffs ?? []).some((d) => pathIsSensitive(globs, d.path))) return true
   // commands name their targets in the title — scan its tokens
   return (req.title || '')

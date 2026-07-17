@@ -5,7 +5,7 @@
 const path = require('node:path')
 const os = require('node:os')
 const fs = require('node:fs')
-const { randomUUID, createHash } = require('node:crypto')
+const { createHash } = require('node:crypto')
 const { execFileSync } = require('node:child_process')
 const { shell, app } = require('electron')
 const { AcpConnection } = require('./acp.cjs')
@@ -15,6 +15,7 @@ const { acpEntries } = require('./mcpCatalog.cjs')
 const { sessionBroker } = require('./sessionBrokerClient.cjs')
 const { AcpProcessLedger } = require('./acpProcessLedger.cjs')
 const { resolveBundledCodexExecutable, resolveBundledClaudeExecutable } = require('./nativeAgentPaths.cjs')
+const { AcpSessionService, createAcpActorCapability, hasActiveTurn } = require('./acpSessionService.cjs')
 
 const URL_RE = /https?:\/\/[^\s"'<>)]+/
 const AUTH_TEXT_RE = /\b(auth(?:entication|orization|orize)?|oauth|log[ -]?in|sign[ -]?in|device code)\b/i
@@ -140,8 +141,19 @@ function isSensitivePath(p, globs = DEFAULT_SENSITIVE_GLOBS) {
     (g) => globRe(g).test(s) || (g.startsWith('**/') && (globRe(g.slice(3)).test(s) || globRe('*' + g.slice(2)).test(s))),
   )
 }
-// inline permission cards: permId → { resolve, timer, entry } for the agent's
-// blocked request (entry lets us clean up a dying connection's cards)
+
+/** Snapshot the existing renderer sensitive-path decision before display
+ * bounding can truncate a very long title/path. This does not widen policy: it
+ * uses the same per-entry globs, wildcard semantics, and title tokenization. */
+function permissionTouchesSensitive(entry, toolCall) {
+  const globs = entry?.sensitiveGlobs || DEFAULT_SENSITIVE_GLOBS
+  const content = Array.isArray(toolCall?.content) ? toolCall.content : []
+  if (content.some((block) => block?.type === 'diff' && isSensitivePath(block.path, globs))) return true
+  const title = typeof toolCall?.title === 'string' ? toolCall.title : typeof toolCall?.kind === 'string' ? toolCall.kind : ''
+  return title.split(/\s+/).some((token) => isSensitivePath(token.replace(/^['"]|['"]$/g, ''), globs))
+}
+// Kept module-private and exposed only under `_acpTest`. Production callers use
+// AcpSessionService methods; no pending resolver map crosses that API boundary.
 const pendingPermissions = new Map()
 const PERMISSION_TIMEOUT_MS = 300_000
 const CANCEL_GRACE_MS = 8_000
@@ -151,17 +163,8 @@ const CANCEL_GRACE_MS = 8_000
 // wedged the whole connection (busy forever, every next prompt rejected).
 const STEER_FLUSH_MS = 2_000
 
-/** Auto-resolve (as cancel) and clear every inline permission a dying connection
- * left pending, telling its renderer to drop the now-orphaned card + needs-you
- * badge. Idempotent — an already-answered/timed-out permId is simply absent. */
-function cancelPendingFor(entry) {
-  for (const [permId, p] of pendingPermissions) {
-    if (p.entry !== entry) continue
-    clearTimeout(p.timer)
-    pendingPermissions.delete(permId)
-    p.resolve('cancel')
-    sendTo(entry, 'acp:permission-resolved', { permId })
-  }
+function cancelPendingFor(entry, reason) {
+  return acpSessionService.cancelPendingFor(entry, reason)
 }
 
 /** Decisions that never need a renderer round-trip. Cancellation wins over
@@ -175,15 +178,11 @@ function immediatePermissionDecision(entry) {
 }
 
 function beginEntryCancellation(entry) {
-  if (!entry) return false
-  entry.cancelRequested = (entry.inFlightTurns ?? 0) > 0 || !!entry.current?.channel
-  cancelPendingFor(entry)
-  return entry.cancelRequested
+  return acpSessionService.beginEntryCancellation(entry)
 }
 
 function clearCancelWatchdog(entry) {
-  if (entry?.cancelWatchdog) clearTimeout(entry.cancelWatchdog)
-  if (entry) entry.cancelWatchdog = null
+  return acpSessionService.clearCancelWatchdog(entry)
 }
 
 /**
@@ -212,6 +211,74 @@ const ACP_IDLE_MS = (() => {
   return Number.isFinite(n) ? Math.min(24 * 60 * 60_000, Math.max(30_000, Math.round(n))) : 5 * 60_000
 })()
 
+function targetCapability(agentKey) {
+  const targetId = typeof agentKey === 'string' ? agentKey : ''
+  const separator = targetId.lastIndexOf('@@')
+  return {
+    targetId,
+    projectId: separator < 0 ? '' : targetId.slice(separator + 2),
+  }
+}
+
+function desktopActor(sender, projectId) {
+  return createAcpActorCapability({
+    id: `desktop:${String(sender?.id ?? '')}`,
+    surface: 'desktop',
+    projectId,
+    ownerId: String(sender?.id ?? ''),
+    capabilities: ['observe', 'agent-control'],
+  })
+}
+
+/** Compatibility channels stay in the IPC adapter. The service emits the same
+ * immutable permission event to this desktop sink and every companion
+ * subscriber, while turn deltas are unwrapped for the existing request channel. */
+function deliverDesktopSessionEvent(entry, event) {
+  if (event.type === 'agent.turn.delta') {
+    sendTo(entry, `acp:update:${event.turnId}`, event.delta)
+    return true
+  }
+  if (event.type === 'agent.turn.completed') {
+    sendTo(entry, `acp:update:${event.turnId}`, {
+      __done: true,
+      ...(event.stopReason ? { stopReason: event.stopReason } : {}),
+    })
+    return true
+  }
+  if (event.type === 'agent.permission.requested') {
+    sendTo(entry, 'acp:permission', event)
+    return true
+  }
+  if (event.type === 'agent.permission.resolved') {
+    // Old probe-shaped pending records have no revision/display payload. Keep
+    // their exact legacy shape without weakening real permission receipts.
+    sendTo(entry, 'acp:permission-resolved', event.revision == null ? { permId: event.permId } : event)
+    return true
+  }
+  return false
+}
+
+const acpSessionService = new AcpSessionService({
+  connections,
+  pendingPermissions,
+  permissionTimeoutMs: PERMISSION_TIMEOUT_MS,
+  cancelGraceMs: CANCEL_GRACE_MS,
+  steerFlushMs: STEER_FLUSH_MS,
+  isMoving: (entry) => terminalOwnerMoves.has(entry),
+  readOnlyModeForControls,
+  onDesktopEvent: deliverDesktopSessionEvent,
+  onCancelTimeout: ({ entry, internalKey, targetId }) => {
+    connectionLeases.delete(internalKey)
+    clearIdleTimer(internalKey)
+    sendTo(entry, 'acp:notice', {
+      agent: entry.meta?.name,
+      key: targetId,
+      kind: 'cancel-timeout',
+      text: 'The agent did not stop cleanly; Kaisola safely ended its owned process group. Send again to resume.',
+    })
+  },
+})
+
 function clearIdleTimer(internalKey) {
   const timer = idleTimers.get(internalKey)
   if (timer) clearTimeout(timer)
@@ -235,7 +302,7 @@ function scheduleIdlePark(internalKey, requestedMs) {
     // Conservative gate: only an agent that promised session/load and has a
     // durable session id may park. Never stop a turn or a permission wait.
     if (!canIdlePark(entry)) {
-      const temporarilyBusy = (entry.inFlightTurns ?? 0) > 0 || !!entry.current?.channel || [...pendingPermissions.values()].some((p) => p.entry === entry)
+      const temporarilyBusy = (entry.inFlightTurns ?? 0) > 0 || hasActiveTurn(entry) || [...pendingPermissions.values()].some((p) => p.entry === entry)
       if (temporarilyBusy) scheduleIdlePark(internalKey, delay)
       return
     }
@@ -248,7 +315,7 @@ function scheduleIdlePark(internalKey, requestedMs) {
 
 function canIdlePark(entry) {
   const awaitingPermission = [...pendingPermissions.values()].some((p) => p.entry === entry)
-  return !!entry && (entry.inFlightTurns ?? 0) === 0 && !entry.current?.channel && !awaitingPermission && !!entry.conn?.alive && !!(entry.conn.canResumeSession || entry.conn.canLoadSession) && !!entry.meta?.sessionId
+  return !!entry && (entry.inFlightTurns ?? 0) === 0 && !hasActiveTurn(entry) && !awaitingPermission && !!entry.conn?.alive && !!(entry.conn.canResumeSession || entry.conn.canLoadSession) && !!entry.meta?.sessionId
 }
 
 /** A renderer-window swap is safe only while its ACP sessions are between
@@ -258,7 +325,7 @@ function canIdlePark(entry) {
 function acpRendererSwapState(sender) {
   const owned = [...connections.values()].filter((entry) => entry.sender === sender)
   const connecting = [...connectTasks.values()].some((task) => task.sender === sender || task.sender?.id === sender?.id)
-  const busy = connecting || owned.some((entry) => (entry.inFlightTurns ?? 0) > 0 || !!entry.current?.channel)
+  const busy = connecting || owned.some((entry) => (entry.inFlightTurns ?? 0) > 0 || hasActiveTurn(entry))
   const awaitingPermission = [...pendingPermissions.values()].some((pending) => pending.entry?.sender === sender)
   return { safe: !busy && !awaitingPermission, busy, connecting, awaitingPermission }
 }
@@ -273,7 +340,7 @@ function acpRestartSafetyState() {
   for (const entry of connections.values()) {
     const entryTurns = Math.max(0, Number(entry.inFlightTurns) || 0)
     inFlightTurns += entryTurns
-    if (entryTurns > 0 || !!entry.current?.channel) activeConnections++
+    if (entryTurns > 0 || hasActiveTurn(entry)) activeConnections++
   }
 
   const connectingCount = connectTasks.size
@@ -344,7 +411,7 @@ function acpProjectTransferState(sender, scope) {
   const connecting = [...connectTasks.entries()].some(
     ([key, task]) => (task.sender === sender || task.sender?.id === sender?.id) && key.endsWith(`@@${scope}`),
   )
-  const busy = connecting || owned.some((entry) => (entry.inFlightTurns ?? 0) > 0 || !!entry.current?.channel)
+  const busy = connecting || owned.some((entry) => (entry.inFlightTurns ?? 0) > 0 || hasActiveTurn(entry))
   const awaitingPermission = [...pendingPermissions.values()].some(
     (pending) => (pending.entry?.sender === sender || pending.entry?.sender?.id === sender?.id) && pending.entry?.meta?.scope === scope,
   )
@@ -443,7 +510,7 @@ async function transferAcpProject(fromSender, toSender, scope) {
           if (connections.get(move.newKey) === move.entry) connections.delete(move.newKey)
           connectionLeases.delete(move.newKey)
           clearIdleTimer(move.newKey)
-          cancelPendingFor(move.entry)
+          cancelPendingFor(move.entry, 'project_transfer_failed')
           clearCancelWatchdog(move.entry)
           move.entry.conn.dispose()
         }
@@ -482,7 +549,7 @@ function releaseAcpRenderer(sender) {
   let released = 0
   for (const [internalKey, entry] of connections) {
     if (entry.sender !== sender && entry.sender?.id !== sender.id) continue
-    cancelPendingFor(entry)
+    cancelPendingFor(entry, 'renderer_released')
     connectionLeases.delete(internalKey)
     clearIdleTimer(internalKey)
     scheduleIdlePark(internalKey)
@@ -983,11 +1050,11 @@ function agentSummary(sender) {
       canLoadSession: !!(e.conn && e.conn.canLoadSession),
       promptImages: !!(e.conn && e.conn.promptImageOk),
       promptQueue: !!(e.conn && e.conn.supportsPromptQueue),
-      // cancel clears the renderer stream channel immediately, but the
+      // cancel clears the renderer-neutral active turn immediately, but the
       // provider promise can remain alive until its cooperative cancellation
       // settles (or the watchdog reaps it). Report both so restart recovery
       // never dispatches a replacement turn into that old connection.
-      busy: !!(e.current && e.current.channel) || (e.inFlightTurns ?? 0) > 0,
+      busy: hasActiveTurn(e) || (e.inFlightTurns ?? 0) > 0,
       autonomy: e.autonomy,
     }))
 }
@@ -1059,7 +1126,7 @@ function registerAcpHandlers(ipcMain) {
   ipcMain.handle('acp:diagnostics', () => ({
     idleMs: ACP_IDLE_MS,
     directAdapters: presets().filter((p) => p.direct).map((p) => ({ id: p.id, version: p.adapterVersion, command: p.command, args: p.args })),
-    connections: [...connections.entries()].map(([key, e]) => ({ key, pid: e.conn?.proc?.pid, busy: !!e.current?.channel, inFlightTurns: e.inFlightTurns ?? 0, canLoadSession: !!e.conn?.canLoadSession, sessionId: e.meta?.sessionId, leases: connectionLeases.get(key)?.size ?? 0 })),
+    connections: [...connections.entries()].map(([key, e]) => ({ key, pid: e.conn?.proc?.pid, busy: hasActiveTurn(e), inFlightTurns: e.inFlightTurns ?? 0, canLoadSession: !!e.conn?.canLoadSession, sessionId: e.meta?.sessionId, leases: connectionLeases.get(key)?.size ?? 0 })),
     ledger: processLedger?.diagnostics(),
   }))
 
@@ -1096,7 +1163,10 @@ function registerAcpHandlers(ipcMain) {
     }
     // a reconnect replaces THIS window's session only — never another window's
     if (connections.has(internalKey)) {
-      connections.get(internalKey).conn.dispose()
+      const replaced = connections.get(internalKey)
+      cancelPendingFor(replaced, 'reconnected')
+      clearCancelWatchdog(replaced)
+      replaced.conn.dispose()
       connections.delete(internalKey)
     }
     const sessionCwd = config.cwd || os.homedir()
@@ -1109,7 +1179,7 @@ function registerAcpHandlers(ipcMain) {
     // entry.sender tracks the CURRENT window (acp:status rebinds it), so these
     // callbacks keep reaching the renderer after a window close/reopen
     const processToken = processLedger ? processLedger.newToken() : null
-    const entry = bindEntryToSender({ conn: null, terminalHost: null, meta: null, controls: { modes: null, configOptions: [] }, availableCommands: [], current: { sender: null, channel: null }, inFlightTurns: 0, cancelRequested: false, autonomy: config.autonomy || DEFAULT_AUTONOMY, processToken }, event.sender)
+    const entry = bindEntryToSender({ conn: null, terminalHost: null, meta: null, controls: { modes: null, configOptions: [] }, availableCommands: [], current: { actorId: null, turnId: null }, inFlightTurns: 0, cancelRequested: false, autonomy: config.autonomy || DEFAULT_AUTONOMY, processToken }, event.sender)
     connectTask.entry = entry
 
     // per-connection env on top of the preset's (e.g. CLAUDE_CONFIG_DIR / CODEX_HOME
@@ -1169,15 +1239,13 @@ function registerAcpHandlers(ipcMain) {
             entry.availableCommands = sanitizedCommands(update.availableCommands)
             sendTo(entry, 'acp:commands', { key, commands: entry.availableCommands })
           }
-          if (entry.current.channel && entry.current.sender && !entry.current.sender.isDestroyed()) {
-            entry.current.sender.send(entry.current.channel, update)
-          }
+          acpSessionService.publishUpdate(entry, update)
         },
         onNotice: (n) => {
           if (n && n.kind === 'stderr' && n.text) stderrTail = (stderrTail + n.text).slice(-600)
           // the agent process died — drop any inline cards it left pending, else
           // their resolvers + needs-you badge leak until the 5-min timeout
-          if (n && n.kind === 'exit') { cancelPendingFor(entry); clearCancelWatchdog(entry) }
+          if (n && n.kind === 'exit') { cancelPendingFor(entry, 'agent_exit'); clearCancelWatchdog(entry) }
           sendTo(entry, 'acp:notice', { agent: resolved.name, key, ...n })
           const authUrl = authUrlFromNotice(n, entry.recentAuthAt)
           if (authUrl) surfaceAuthUrl(entry, resolved.name, key, authUrl)
@@ -1195,38 +1263,16 @@ function registerAcpHandlers(ipcMain) {
           // live dial (acp:set-autonomy) can lower it mid-turn to stop this agent
           const immediate = immediatePermissionDecision(entry)
           if (immediate) return immediate
-          // no live window to ask → fail CLOSED, never silently allow
-          if (!entry.sender || entry.sender.isDestroyed()) return 'cancel'
           const toolCall = (params && params.toolCall) || {}
-          const permId = `perm-${randomUUID()}`
-          // diff-shaped content (OpenCode sends one diff block per file) —
-          // the card renders the ACTUAL change, not just a tool name
-          const diffs = (Array.isArray(toolCall.content) ? toolCall.content : [])
-            .filter((c) => c && c.type === 'diff' && typeof c.path === 'string')
-            .slice(0, 8)
-            .map((c) => ({
-              path: c.path,
-              oldText: typeof c.oldText === 'string' ? c.oldText.slice(0, 40_000) : '',
-              newText: typeof c.newText === 'string' ? c.newText.slice(0, 40_000) : '',
-            }))
-          return await new Promise((resolve) => {
-            const timer = setTimeout(() => {
-              pendingPermissions.delete(permId)
-              resolve('cancel') // nobody answered — never silently allow
-              // symmetrical to the acp:permission emit below: clear the orphaned
-              // inline card + needs-you badge the renderer is still showing
-              sendTo(entry, 'acp:permission-resolved', { permId })
-            }, PERMISSION_TIMEOUT_MS)
-            pendingPermissions.set(permId, { resolve, timer, entry })
-            sendTo(entry, 'acp:permission', {
-              permId,
-              key,
-              agent: resolved.name,
-              title: toolCall.title || toolCall.kind || 'Agent action',
-              kind: toolCall.kind,
-              options: (params && params.options) || [],
-              diffs,
-            })
+          // The service retains the exact frozen display event beside the
+          // resolver. If neither a desktop nor companion subscriber exists it
+          // returns cancel immediately, preserving the old fail-closed path.
+          return acpSessionService.requestPermission(entry, {
+            key,
+            agent: resolved.name,
+            toolCall,
+            options: (params && params.options) || [],
+            sensitive: permissionTouchesSensitive(entry, toolCall),
           })
         },
         terminalHost,
@@ -1281,70 +1327,15 @@ function registerAcpHandlers(ipcMain) {
     }
   })
 
-  ipcMain.handle('acp:prompt', async (event, { agentKey, reqId, text, images, readOnly } = {}) => {
-    const entry = entryFor(event.sender, agentKey)
-    if (!entry || !entry.conn.alive) return { ok: false, message: 'Agent not connected.' }
-    if (terminalOwnerMoves.has(entry)) return { ok: false, moving: true, message: 'This project is moving to another window. Try again in a moment.' }
-    if (entry.current.channel || (entry.inFlightTurns ?? 0) > 0) return { ok: false, message: 'The previous agent turn is still stopping — send again in a moment.' }
-    entry.cancelRequested = false
-    // identity token: acp:cancel may null entry.current to free the composer for a
-    // hung agent, so read the __done target from this local turn (not entry.current,
-    // which cancel/a newer prompt may have replaced) and clear only if still ours.
-    const turn = { sender: event.sender, channel: `acp:update:${reqId}` }
-    entry.current = turn
-    entry.turnSeq = (entry.turnSeq ?? 0) + 1
-    entry.inFlightTurns = (entry.inFlightTurns ?? 0) + 1
-    entry.steerPromises = [] // steering follow-ups injected while THIS turn runs
-    let signalTurnDone
-    entry.turnDone = new Promise((resolve) => { signalTurnDone = resolve })
-    const constrainedMode = readOnly === true ? readOnlyModeForControls(entry.controls) : null
-    let restoreModeId = null
-    // A finished turn holds its channel briefly so a steer that IS still
-    // streaming can flush — but only briefly. The adapter may never answer an
-    // injected prompt's own request id (promptQueueing absorbs it into the
-    // turn), and an unbounded allSettled here wedged the connection for good.
-    const flushSteers = async () => {
-      entry.turnEnding = true // refuse new steers into a turn that's over
-      signalTurnDone()
-      if (entry.steerPromises.length) {
-        await Promise.race([
-          Promise.allSettled(entry.steerPromises),
-          new Promise((resolve) => setTimeout(resolve, STEER_FLUSH_MS)),
-        ])
-      }
-    }
-    try {
-      if (readOnly === true) {
-        if (!constrainedMode) throw new Error('This agent does not expose a read-only mode required by Mesh Idea mode.')
-        if (constrainedMode.previousModeId !== constrainedMode.modeId) {
-          await entry.conn.setMode(constrainedMode.modeId)
-          restoreModeId = constrainedMode.previousModeId
-        }
-      }
-      const res = await entry.conn.prompt(text, images)
-      await flushSteers()
-      if (turn.sender && !turn.sender.isDestroyed()) {
-        turn.sender.send(turn.channel, { __done: true, stopReason: res && res.stopReason })
-      }
-      return { ok: true, stopReason: res && res.stopReason }
-    } catch (err) {
-      await flushSteers()
-      if (turn.sender && !turn.sender.isDestroyed()) turn.sender.send(turn.channel, { __done: true })
-      return { ok: false, message: err.message }
-    } finally {
-      if (restoreModeId && entry.conn.alive) {
-        try { await entry.conn.setMode(restoreModeId) } catch { /* fail safe: remaining read-only is safer than widening silently */ }
-      }
-      if (entry.current === turn) entry.current = { sender: null, channel: null }
-      entry.steerPromises = []
-      entry.turnEnding = false
-      // prompts are serialized by the guard above, so when a turn fully
-      // unwinds NOTHING is legitimately in flight — force-reset instead of
-      // decrementing so an unanswered steer can never strand the counter
-      entry.inFlightTurns = 0
-      entry.cancelRequested = false
-      clearCancelWatchdog(entry)
-    }
+  ipcMain.handle('acp:prompt', (event, { agentKey, reqId, text, images, readOnly } = {}) => {
+    const target = targetCapability(agentKey)
+    return acpSessionService.prompt(desktopActor(event.sender, target.projectId), {
+      ...target,
+      turnId: reqId,
+      text,
+      images,
+      readOnly,
+    })
   })
 
   // Mid-turn STEER: deliver a follow-up to an agent whose turn is already
@@ -1353,44 +1344,14 @@ function registerAcpHandlers(ipcMain) {
   // rides the active turn's channel, and the original acp:prompt above holds
   // that channel open until this settles. Refused (so the renderer falls back
   // to normal enqueue) when the agent can't queue or there's no active turn.
-  ipcMain.handle('acp:steer', async (event, { agentKey, text, images } = {}) => {
-    const entry = entryFor(event.sender, agentKey)
-    if (!entry || !entry.conn.alive) return { ok: false, message: 'Agent not connected.' }
-    if (!entry.conn.supportsPromptQueue) return { ok: false, message: 'unsupported', unsupported: true }
-    // turnEnding: the turn's result already landed and only its flush window
-    // remains — a steer now would ride a channel about to close, so refuse it
-    // (the renderer falls back to the normal queue; nothing is lost)
-    if (!(entry.current && entry.current.channel) || entry.turnEnding) return { ok: false, message: 'No active turn to steer.', noTurn: true }
-    const seq = entry.turnSeq
-    const turnDone = entry.turnDone
-    entry.inFlightTurns = (entry.inFlightTurns ?? 0) + 1
-    const p = entry.conn.prompt(text, images)
-    ;(entry.steerPromises ??= []).push(p.catch(() => {}))
-    try {
-      // The adapter may absorb this injected prompt into the running turn and
-      // never answer its own request id. Never hang the renderer on that:
-      // once the owning turn ends (plus a short grace for a racing response),
-      // the steered text was either woven into the turn — its output already
-      // streamed on the shared channel — or the turn closed without it.
-      const settled = await Promise.race([
-        p.then((res) => ({ res })).catch((err) => ({ err })),
-        turnDone.then(() => new Promise((resolve) => setTimeout(resolve, STEER_FLUSH_MS))).then(() => ({ turnEnded: true })),
-      ])
-      if (settled.turnEnded) return { ok: true, stopReason: 'turn_ended' }
-      if (settled.err) return { ok: false, message: settled.err.message }
-      return { ok: true, stopReason: settled.res && settled.res.stopReason }
-    } finally {
-      // the owning turn's finally force-resets the counter; only decrement if
-      // that turn is still the live one (never steal from a NEWER turn)
-      if (entry.turnSeq === seq) entry.inFlightTurns = Math.max(0, (entry.inFlightTurns ?? 1) - 1)
-    }
+  ipcMain.handle('acp:steer', (event, { agentKey, text, images } = {}) => {
+    const target = targetCapability(agentKey)
+    return acpSessionService.steer(desktopActor(event.sender, target.projectId), { ...target, text, images })
   })
 
-  ipcMain.handle('acp:setMode', async (event, { agentKey, modeId } = {}) => {
-    const entry = entryFor(event.sender, agentKey)
-    if (!entry || !entry.conn.alive) return { ok: false, message: 'Agent not connected.' }
-    if (terminalOwnerMoves.has(entry)) return { ok: false, moving: true }
-    try { await entry.conn.setMode(modeId); return { ok: true } } catch (err) { return { ok: false, message: err.message } }
+  ipcMain.handle('acp:setMode', (event, { agentKey, modeId } = {}) => {
+    const target = targetCapability(agentKey)
+    return acpSessionService.setMode(desktopActor(event.sender, target.projectId), { ...target, modeId })
   })
 
   ipcMain.handle('acp:setConfigOption', async (event, { agentKey, configId, value } = {}) => {
@@ -1447,49 +1408,31 @@ function registerAcpHandlers(ipcMain) {
     return { ok: true }
   })
 
-  // the inline card's answer — 'allow' | 'reject' | a concrete optionId
-  ipcMain.handle('acp:permission:respond', (event, { permId, optionId, decision } = {}) => {
-    const pending = pendingPermissions.get(permId)
-    if (!pending) return { ok: false }
-    if (pending.entry?.sender !== event.sender && pending.entry?.sender?.id !== event.sender?.id) return { ok: false }
-    pendingPermissions.delete(permId)
-    clearTimeout(pending.timer)
-    pending.resolve(optionId ? { optionId } : decision === 'reject' ? 'reject' : 'allow')
-    return { ok: true }
+  // The preload echoes the immutable project/target/revision delivered with the
+  // card. The context fallback keeps older renderers fail-closed during upgrade.
+  ipcMain.handle('acp:permission:respond', (event, { permId, projectId, targetId, expectedRevision, optionId, decision } = {}) => {
+    const hintedProject = typeof projectId === 'string' ? projectId : ''
+    const identityActor = desktopActor(event.sender, hintedProject)
+    const context = acpSessionService.permissionContext(identityActor, permId)
+    const resolvedProject = typeof projectId === 'string' ? projectId : context?.projectId
+    const resolvedTarget = typeof targetId === 'string' ? targetId : context?.targetId
+    const resolvedRevision = Number.isSafeInteger(expectedRevision) ? expectedRevision : context?.revision
+    if (typeof resolvedProject !== 'string' || typeof resolvedTarget !== 'string' || !resolvedTarget) {
+      return { ok: false, status: 'stale', message: 'Permission is stale or unavailable.' }
+    }
+    return acpSessionService.respondPermission(desktopActor(event.sender, resolvedProject), {
+      projectId: resolvedProject,
+      targetId: resolvedTarget,
+      permId,
+      expectedRevision: resolvedRevision,
+      optionId,
+      decision,
+    })
   })
 
   ipcMain.handle('acp:cancel', (event, { agentKey } = {}) => {
-    const internalKey = ikey(event.sender, agentKey)
-    const entry = entryFor(event.sender, agentKey)
-    // Stop is a fail-closed boundary. A permission prompt must become
-    // unactionable as soon as cancellation is requested, not several seconds
-    // later when the stuck-turn watchdog reaps the adapter. Otherwise a human
-    // can approve a state-changing tool after Mesh has visibly paused.
-    if (entry) beginEntryCancellation(entry)
-    entry?.conn.cancel()
-    // a hung agent may ACK session/cancel but neither finish nor exit, so the
-    // prompt's promise never settles and its finally never clears the lock —
-    // free it here so the composer isn't wedged. The in-flight prompt's finally
-    // is identity-guarded (only clears if entry.current is still its own turn),
-    // so this can't double-clear or stomp a newer turn.
-    if (entry && entry.current.channel) entry.current = { sender: null, channel: null }
-    if (entry && (entry.inFlightTurns ?? 0) > 0 && !entry.cancelWatchdog) {
-      entry.cancelWatchdog = setTimeout(() => {
-        entry.cancelWatchdog = null
-        if ((entry.inFlightTurns ?? 0) <= 0) return
-        // Some adapters acknowledge cancel but never settle session/prompt.
-        // Reap this exact owned group after a grace period; its durable session
-        // id lets the next send reconnect without mixing old/new turn streams.
-        cancelPendingFor(entry)
-        entry.conn.dispose()
-        if (connections.get(internalKey) === entry) connections.delete(internalKey)
-        connectionLeases.delete(internalKey)
-        clearIdleTimer(internalKey)
-        sendTo(entry, 'acp:notice', { agent: entry.meta?.name, key: agentKey, kind: 'cancel-timeout', text: 'The agent did not stop cleanly; Kaisola safely ended its owned process group. Send again to resume.' })
-      }, CANCEL_GRACE_MS)
-      entry.cancelWatchdog.unref?.()
-    }
-    return { ok: true }
+    const target = targetCapability(agentKey)
+    return acpSessionService.cancel(desktopActor(event.sender, target.projectId), target)
   })
 
   ipcMain.handle('acp:close-session', async (event, { agentKey } = {}) => {
@@ -1517,7 +1460,7 @@ function registerAcpHandlers(ipcMain) {
     const entry = connections.get(internalKey)
     if (entry && terminalOwnerMoves.has(entry)) return { ok: false, moving: true }
     if (entry) {
-      cancelPendingFor(entry) // drop any inline cards before the connection goes away
+      cancelPendingFor(entry, 'disconnected') // drop any inline cards before the connection goes away
       clearCancelWatchdog(entry)
       entry.conn.dispose()
       connections.delete(internalKey)
@@ -1531,7 +1474,10 @@ async function disposeAcp() {
   idleTimers.clear()
   connectionLeases.clear()
   const entries = new Set([...connections.values(), ...[...connectTasks.values()].map((task) => task.entry).filter(Boolean)])
-  for (const entry of entries) clearCancelWatchdog(entry)
+  for (const entry of entries) {
+    cancelPendingFor(entry, 'app_disposed')
+    clearCancelWatchdog(entry)
+  }
   await Promise.allSettled([...entries].map((entry) => entry.conn?.disposeAndWait?.() ?? Promise.resolve(entry.conn?.dispose())))
   connections.clear()
   connectTasks.clear()
@@ -1540,6 +1486,7 @@ async function disposeAcp() {
 
 module.exports = {
   registerAcpHandlers,
+  acpSessionService,
   disposeAcp,
   acpRendererSwapState,
   acpRestartSafetyState,

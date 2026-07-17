@@ -4,6 +4,10 @@
 const { contextBridge, ipcRenderer, webUtils } = require('electron')
 
 let seq = 0
+// Response-only capability context echoed from main. The sanitized display
+// payload itself remains main-authoritative; this cache never invents scope or
+// revision from renderer state.
+const acpPermissionContexts = new Map()
 
 const bridge = {
   env: 'electron',
@@ -134,18 +138,30 @@ const bridge = {
     },
     /** An agent is blocked on a permission — render the inline card. */
     onPermission: (cb) => {
-      const listener = (_e, req) => cb(req)
+      const listener = (_e, req) => {
+        if (req && typeof req.permId === 'string' && typeof req.projectId === 'string' && typeof req.targetId === 'string' && Number.isSafeInteger(req.revision)) {
+          acpPermissionContexts.set(req.permId, {
+            projectId: req.projectId,
+            targetId: req.targetId,
+            expectedRevision: req.revision,
+          })
+        }
+        cb(req)
+      }
       ipcRenderer.on('acp:permission', listener)
       return () => ipcRenderer.removeListener('acp:permission', listener)
     },
     /** Main auto-resolved a pending permission (timeout / connection death) — drop the card. */
     onPermissionResolved: (cb) => {
-      const listener = (_e, { permId }) => cb(permId)
+      const listener = (_e, { permId }) => {
+        acpPermissionContexts.delete(permId)
+        cb(permId)
+      }
       ipcRenderer.on('acp:permission-resolved', listener)
       return () => ipcRenderer.removeListener('acp:permission-resolved', listener)
     },
     respondPermission: (permId, answer) =>
-      ipcRenderer.invoke('acp:permission:respond', { permId, ...answer }),
+      ipcRenderer.invoke('acp:permission:respond', { permId, ...acpPermissionContexts.get(permId), ...answer }),
     setGuardrails: (globs) => ipcRenderer.send('acp:guardrails', globs),
   },
 

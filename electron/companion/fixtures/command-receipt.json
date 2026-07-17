@@ -1,0 +1,17 @@
+{
+  "v": 1,
+  "kind": "receipt",
+  "desktopId": "desktop-michael-mac",
+  "deviceId": "device-michael-iphone",
+  "connectionId": "connection-alpha-1",
+  "epoch": "desktop-epoch-7",
+  "seq": 16,
+  "id": "receipt-command-1",
+  "sentAt": 1784250001600,
+  "body": {
+    "type": "command.receipt",
+    "commandId": "command-1",
+    "status": "applied",
+    "message": "Permission rejected."
+  }
+}

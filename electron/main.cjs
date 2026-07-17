@@ -5,6 +5,7 @@
 // the privileged "tools" the research IDE needs (model calls, filesystem,
 // running experiments) — all behind a locked-down preload bridge.
 const { app, BrowserWindow, dialog, ipcMain, Menu, nativeImage, nativeTheme, Notification, screen, session, shell } = require('electron')
+const crypto = require('node:crypto')
 const path = require('node:path')
 const fs = require('node:fs')
 const { registerModelHandlers } = require('./ipc/modelHandler.cjs')
@@ -31,6 +32,9 @@ const { registerUpdateHandlers } = require('./ipc/updateHandler.cjs')
 const { registerGlassHandlers, wireGlassEvents } = require('./ipc/glassHandler.cjs')
 const { registerAssistantArchiveHandlers } = require('./ipc/assistantArchive.cjs')
 const { registerAttentionHandlers } = require('./ipc/attentionHandler.cjs')
+const { registerCompanionProjectionHandlers } = require('./companion/projectionHandler.cjs')
+const { CompanionProjectionStore, projectionStoreKey } = require('./companion/projectionStore.cjs')
+const { CompanionDesktopState } = require('./companion/desktopState.cjs')
 const { hardenWebviewAttachment, installPermissionPolicy, isSafeWebUrl, isTrustedRendererUrl } = require('./ipc/securityPolicy.cjs')
 const { BrowserGuestRegistry } = require('./ipc/browserGuestRegistry.cjs')
 const {
@@ -63,6 +67,10 @@ let appIsQuitting = false
 let appCleanupStarted = false
 let appCleanupFinished = false
 let deferredQuitTask = null
+const companionDesktopEpoch = crypto.randomUUID()
+let companionWindowGeneration = 0
+let companionProjectionStore = null
+let companionDesktopState = null
 
 // ── Liquid Glass (macOS 26 "Tahoe"+) ─────────────────────────────────────────
 // Darwin 25 == macOS 26. When the native module is present and supported, the
@@ -426,6 +434,7 @@ function createWindow(opts = {}) {
   win.__kaisolaPop = isPop
   win.__kaisolaSlot = slot == null ? null : String(slot)
   win.__kaisolaSavedId = savedId
+  win.__kaisolaCompanionGeneration = null
   win.__kaisolaDeleteBoot = !!opts.deleteBoot
   win.__kaisolaSuppressPark = false
   win.__kaisolaDeleting = false
@@ -434,7 +443,21 @@ function createWindow(opts = {}) {
   win.__kaisolaPendingTheme = null
   win.__kaisolaLastFocus = Date.now()
   if (savedId) trackSavedWindow(win, { entry: savedEntry, persist: !opts.deleteBoot })
-  win.webContents.on('did-start-loading', () => adoptionReadyWc.delete(win.webContents.id))
+  win.webContents.on('did-start-loading', () => {
+    adoptionReadyWc.delete(win.webContents.id)
+    if (!isPop && savedId) {
+      const previousGeneration = win.__kaisolaCompanionGeneration
+      if (Number.isSafeInteger(previousGeneration)) {
+        try { companionProjectionStore?.markStale(savedId, previousGeneration) } catch { /* next publish repairs freshness */ }
+      }
+      win.__kaisolaCompanionGeneration = ++companionWindowGeneration
+    }
+  })
+  win.once('closed', () => {
+    if (!isPop && savedId && Number.isSafeInteger(win.__kaisolaCompanionGeneration)) {
+      try { companionProjectionStore?.markStale(savedId, win.__kaisolaCompanionGeneration) } catch { /* persisted data remains fail-closed next epoch */ }
+    }
+  })
   // A privileged preload is safe only while the top-level frame remains on the
   // exact packaged entry (or the configured Vite origin in development).
   const containRendererNavigation = (event, url) => {
@@ -1111,7 +1134,7 @@ async function deleteSavedWindow(event, id) {
         try {
           dbMutate({
             set: { [WINDOW_MANIFEST_KEY]: serializeManifest(nextManifest) },
-            delete: storeKeysForSlot(entry.slot),
+            delete: [...storeKeysForSlot(entry.slot), projectionStoreKey(id)],
           })
         } catch {
           try {
@@ -1126,6 +1149,7 @@ async function deleteSavedWindow(event, id) {
         // notifications and orphan pop cleanup are best-effort follow-ups and
         // must never turn a successful durable deletion into a false rollback.
         windowManifest = nextManifest
+        try { companionDesktopState?.projectionRemoved(id) } catch { /* replay can recover from the next full snapshot */ }
         for (const projectId of prepared.projectIds ?? []) {
           try { closeUnownedProjectPops(projectId) } catch { /* next launch also excludes the deleted owner */ }
         }
@@ -1668,6 +1692,22 @@ if (hasSingleInstanceLock) app.whenReady().then(() => {
   registerGrobidHandlers(ipcMain)
   registerSandboxHandlers(ipcMain)
   registerDbHandlers(ipcMain)
+  companionProjectionStore = new CompanionProjectionStore({
+    epoch: companionDesktopEpoch,
+    get: dbGet,
+    set: (key, value) => dbMutate({ set: { [key]: value } }),
+    del: (key) => dbMutate({ delete: [key] }),
+    keys: dbKeys,
+  })
+  companionDesktopState = new CompanionDesktopState({
+    epoch: companionDesktopEpoch,
+    projectionStore: companionProjectionStore,
+  })
+  registerCompanionProjectionHandlers(ipcMain, {
+    BrowserWindow,
+    store: companionProjectionStore,
+    onPublished: (windowId, result) => companionDesktopState.projectionPublished(windowId, result),
+  })
   loadWindowManifest()
   registerCodexHandlers(ipcMain)
   registerWorktreeHandlers(ipcMain)

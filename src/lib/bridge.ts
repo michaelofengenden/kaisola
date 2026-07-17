@@ -934,6 +934,11 @@ export interface KaisolaBridge {
     notify(payload: { title: string; body?: string; projectId?: string; sessionId?: string }): void
     onOpen(cb: (payload: { projectId?: string; sessionId?: string }) => void): () => void
   }
+  /** Publish the normalized mobile-companion display projection. Main validates
+   * it again and stores it per saved window; raw Zustand state is never valid. */
+  companion: {
+    publishProjection(projection: unknown, sync?: boolean): boolean
+  }
   /** In-app software updates — the GitHub releases feed via electron-updater. */
   update?: {
     /** Snapshot for late subscribers (the pill mounts after events may have fired). */
@@ -1427,6 +1432,9 @@ const webMock: KaisolaBridge = {
     setCount() {},
     notify() {},
     onOpen() { return () => {} },
+  },
+  companion: {
+    publishProjection() { return false },
   },
   winCtl() {
     /* the browser owns its own window chrome */

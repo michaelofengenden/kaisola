@@ -13,6 +13,7 @@ const { StringDecoder } = require('node:string_decoder')
 // no trustworthy project label to migrate for already-running PTYs.
 const PROTOCOL = 2
 const SECURITY_EPOCH = 1
+const TERMINAL_OBSERVE_FEATURE = 'terminal-observe-v1'
 const LEGACY_UNSCOPED_PROTOCOL = 1
 // A terminal snapshot may legally carry 8 MiB of UTF-8 output; JSON escaping
 // can roughly double that. Keep one bounded envelope that can carry the
@@ -496,6 +497,10 @@ class SessionBrokerClient {
     return this.request(`terminal.${method}`, { ...params, ownerId }, options)
   }
 
+  supports(feature) {
+    return Array.isArray(this.hello?.features) && this.hello.features.includes(feature)
+  }
+
   async detachOwner(sender) {
     if (!sender) return { ok: false }
     try { return await this.terminal('detachOwner', sender, {}, { timeoutMs: 3000 }) }
@@ -542,5 +547,6 @@ module.exports = {
   resetSessionBrokerForTests,
   PROTOCOL,
   SECURITY_EPOCH,
+  TERMINAL_OBSERVE_FEATURE,
   __test: { LEGACY_UNSCOPED_PROTOCOL, requestBrokerControl, validateBrokerHello },
 }

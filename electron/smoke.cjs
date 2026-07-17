@@ -12,7 +12,7 @@ const { registerAuthHandlers } = require('./ipc/authHandler.cjs')
 const { registerFsHandlers } = require('./ipc/fsHandler.cjs')
 const { registerGrobidHandlers } = require('./ipc/grobidHandler.cjs')
 const { registerSandboxHandlers } = require('./ipc/sandboxHandler.cjs')
-const { registerDbHandlers } = require('./ipc/dbHandler.cjs')
+const { registerDbHandlers, dbGet, dbKeys, dbMutate } = require('./ipc/dbHandler.cjs')
 const { registerCodexHandlers } = require('./ipc/codexHandler.cjs')
 const { registerGitHandlers } = require('./ipc/gitHandler.cjs')
 const { registerLatexHandlers } = require('./ipc/latexHandler.cjs')
@@ -24,6 +24,8 @@ const { registerMcpHandlers } = require('./ipc/mcpServer.cjs')
 const { registerExtensionHandlers } = require('./ipc/extensionHandler.cjs')
 const { registerGlassHandlers } = require('./ipc/glassHandler.cjs')
 const { registerAssistantArchiveHandlers } = require('./ipc/assistantArchive.cjs')
+const { CompanionProjectionStore } = require('./companion/projectionStore.cjs')
+const { registerCompanionProjectionHandlers } = require('./companion/projectionHandler.cjs')
 const { AcpProcessLedger } = require('./ipc/acpProcessLedger.cjs')
 const worktree = require('./ipc/worktreeHandler.cjs')
 
@@ -79,6 +81,14 @@ app.whenReady().then(async () => {
   registerGrobidHandlers(ipcMain)
   registerSandboxHandlers(ipcMain)
   registerDbHandlers(ipcMain)
+  const companionProjectionStore = new CompanionProjectionStore({
+    epoch: `smoke-desktop-${process.pid}`,
+    get: dbGet,
+    set: (key, value) => dbMutate({ set: { [key]: value } }),
+    del: (key) => dbMutate({ delete: [key] }),
+    keys: dbKeys,
+  })
+  registerCompanionProjectionHandlers(ipcMain, { BrowserWindow, store: companionProjectionStore })
   registerCodexHandlers(ipcMain)
   registerGitHandlers(ipcMain)
   registerLatexHandlers(ipcMain)
@@ -110,6 +120,11 @@ app.whenReady().then(async () => {
   const ackWaiters = new Map()
   const completedTransfers = new Map()
   let smokeTransferSeq = 0
+  let smokeCompanionGeneration = 0
+  const identifyCompanionWindow = (window, id) => {
+    window.__kaisolaSavedId = id
+    window.__kaisolaCompanionGeneration = ++smokeCompanionGeneration
+  }
   ipcMain.on('window:adopt-ready', (e) => {
     adoptionReady.add(e.sender.id)
     const a = pendingAdoptions.get(e.sender.id)
@@ -140,6 +155,7 @@ app.whenReady().then(async () => {
         webPreferences: { preload: path.join(__dirname, 'preload.cjs'), contextIsolation: true, nodeIntegration: false, webviewTag: true, plugins: true },
       })
       target.__smokeAdopt = true
+      identifyCompanionWindow(target, `smoke-detach-${target.webContents.id}`)
       void target.loadFile(path.join(__dirname, '..', 'dist', 'index.html'), { query: { adopt: '1', win: 'detach-smoke' } })
     }
     const transferId = `smoke-transfer-${++smokeTransferSeq}`
@@ -174,6 +190,7 @@ app.whenReady().then(async () => {
     ...(process.platform === 'darwin' ? { vibrancy: SMOKE_MAC_VIBRANCY, visualEffectState: 'active', roundedCorners: true } : {}),
     webPreferences: { preload: path.join(__dirname, 'preload.cjs'), contextIsolation: true, nodeIntegration: false, webviewTag: true, plugins: true },
   })
+  identifyCompanionWindow(win, 'smoke-primary')
   win.webContents.on('console-message', (_e, level, message) => {
     if (level >= 3) errors.push(`console.error: ${message}`)
   })
@@ -191,6 +208,17 @@ app.whenReady().then(async () => {
   // the store now persists to localStorage — clear it so the run starts empty
   await win.webContents.executeJavaScript(`(() => { try { localStorage.removeItem('kaisola-store') } catch (e) {} ; window.__kaisola.getState().clearProject() })()`)
   await new Promise((r) => setTimeout(r, 200))
+
+  const companionRecord = companionProjectionStore.load('smoke-primary')
+  const companionProjection = {
+    published: companionRecord?.projection?.projectionKind === 'kaisola.companion.projection',
+    live: companionRecord?.projection?.freshness === 'live',
+    revisioned: Number.isSafeInteger(companionRecord?.projection?.revision) && companionRecord.projection.revision >= 1,
+    board: companionRecord?.projection?.board?.columns?.map((column) => column.id).join(',') === 'running,waiting,done',
+    normalized: !JSON.stringify(companionRecord?.projection ?? {}).includes('workspacePath'),
+    isolated: !JSON.stringify(companionRecord?.projection ?? {}).includes(SMOKE_USERDATA),
+  }
+  console.log('COMPANION_PROJECTION=' + JSON.stringify(companionProjection))
 
   const rootChildren = await win.webContents.executeJavaScript(`document.getElementById('root').children.length`)
   const minimalShell = await win.webContents.executeJavaScript(`(() => ({
@@ -3913,6 +3941,7 @@ a^2 + b^2 = c^2
   console.log('RESTART_AGENT=' + JSON.stringify(restartAgent))
 
   const failed =
+    !companionProjection.published || !companionProjection.live || !companionProjection.revisioned || !companionProjection.board || !companionProjection.normalized || !companionProjection.isolated ||
     !restartAgent.created || !restartAgent.restarted || !restartAgent.remounted || !restartAgent.resumeKept || !restartAgent.draftKept ||
     !manualCodex.upgraded || !manualCodex.exact || !manualCodex.draftKept || !manualCodex.downgraded ||
     !manualClaude.upgraded || !manualClaude.draftKept || !manualClaude.toolKept || !manualClaude.downgraded ||

@@ -1,0 +1,31 @@
+{
+  "v": 1,
+  "kind": "event",
+  "desktopId": "desktop-michael-mac",
+  "deviceId": "device-michael-iphone",
+  "connectionId": "connection-alpha-1",
+  "epoch": "desktop-epoch-7",
+  "seq": 15,
+  "id": "event-permission-15",
+  "sentAt": 1784250001500,
+  "body": {
+    "type": "agent.permission.requested",
+    "projectId": "project-kaisola",
+    "sessionId": "session-review",
+    "permId": "permission-1",
+    "revision": 1,
+    "agent": "Claude",
+    "title": "Edit terminal subscription policy",
+    "options": [
+      { "id": "allow-once", "label": "Allow once" },
+      { "id": "reject", "label": "Reject" }
+    ],
+    "diffs": [
+      {
+        "relativePath": "electron/ipc/terminalManager.cjs",
+        "oldText": "one owner",
+        "newText": "one owner plus observers"
+      }
+    ]
+  }
+}

@@ -6,6 +6,7 @@ import { requestIsSensitive, requestMatchesRules, allowOnceAnswer } from './lib/
 import { OmniBar } from './components/shell/OmniBar'
 import { loadUserConfig, watchUserConfig } from './lib/userConfig'
 import { initGlassWash } from './lib/glassWash'
+import { CompanionProjectionRevisions } from './lib/companionProjection'
 import { ShellTools } from './components/shell/AgentSidebar'
 import { WorkspaceRail } from './components/shell/WorkspaceRail'
 import { ProjectTabs } from './components/shell/ProjectTabs'
@@ -228,6 +229,46 @@ function AttentionSync() {
     const state = useKaisola.getState()
     for (const id of visibleUnread.split('\0')) state.setDockView(id)
   }, [visibleUnread])
+  return null
+}
+
+/** Publish only meaningful, normalized display changes. Main validates and
+ * persists again; pagehide synchronously flushes a pending final revision. */
+function CompanionProjectionSync() {
+  useEffect(() => {
+    const revisions = new CompanionProjectionRevisions()
+    let timer: number | null = null
+
+    const changedProjection = () => revisions.next(useKaisola.getState(), Date.now())
+    const publishChanged = () => {
+      timer = null
+      try {
+        const projection = changedProjection()
+        if (projection) bridge.companion.publishProjection(projection)
+      } catch { /* malformed legacy state stays local and cannot break the UI */ }
+    }
+    const schedule = () => {
+      if (timer != null) return
+      timer = window.setTimeout(publishChanged, 120)
+    }
+    const flushForPagehide = () => {
+      if (timer != null) window.clearTimeout(timer)
+      timer = null
+      try {
+        const projection = changedProjection() ?? revisions.current()
+        if (projection) bridge.companion.publishProjection(projection, true)
+      } catch { /* fail closed; the prior persisted projection remains stale-safe */ }
+    }
+
+    const unsubscribe = useKaisola.subscribe(schedule)
+    window.addEventListener('pagehide', flushForPagehide)
+    publishChanged()
+    return () => {
+      flushForPagehide()
+      unsubscribe()
+      window.removeEventListener('pagehide', flushForPagehide)
+    }
+  }, [])
   return null
 }
 
@@ -805,6 +846,7 @@ function KaisolaApp() {
       {isDesktop && !POP_TERMINAL_ID && <SavedWindows />}
       {isDesktop && <TabMenuSync />}
       {isDesktop && !POP_TERMINAL_ID && <AttentionSync />}
+      {isDesktop && !POP_TERMINAL_ID && <CompanionProjectionSync />}
       <TopProgress />
       <div
         className="app-body"

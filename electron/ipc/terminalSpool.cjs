@@ -58,7 +58,7 @@ function readTail(file, bytes) {
 }
 
 class TerminalSpool {
-  constructor({ dir, id, diskCap = DEFAULT_DISK_CAP, hotCap = DEFAULT_HOT_CAP, queueCap = DEFAULT_QUEUE_CAP, retentionCap = null }) {
+  constructor({ dir, id, diskCap = DEFAULT_DISK_CAP, hotCap = DEFAULT_HOT_CAP, queueCap = DEFAULT_QUEUE_CAP, retentionCap = null, fresh = false }) {
     this.id = String(id)
     this.diskCap = diskCap
     this.hotCap = hotCap
@@ -76,6 +76,11 @@ class TerminalSpool {
     this.file = path.join(dir, `${base}.log`)
     this.prevFile = path.join(dir, `${base}.prev.log`)
     this.metaFile = path.join(dir, `${base}.json`)
+    if (fresh) {
+      for (const file of [this.file, this.prevFile, this.metaFile]) {
+        try { fs.unlinkSync(file) } catch { /* absent or already unavailable */ }
+      }
+    }
     this.fallbackChunks = []
     this.fallbackLen = 0
     this.diskError = null

@@ -3,10 +3,11 @@
 // colors/interactive apps work. The renderer (xterm.js) forwards raw bytes.
 const os = require('node:os')
 const path = require('node:path')
+const crypto = require('node:crypto')
 const fs = require('node:fs/promises')
 const { spawn, execFile } = require('node:child_process')
 const { BrowserWindow, app } = require('electron')
-const { configureSessionBroker, sessionBroker } = require('./sessionBrokerClient.cjs')
+const { configureSessionBroker, sessionBroker, TERMINAL_OBSERVE_FEATURE } = require('./sessionBrokerClient.cjs')
 const { terminalOwnerParts } = require('./securityPolicy.cjs')
 
 // terminal:run cap: a non-terminating command (dev server, tail -f, blocked on
@@ -328,6 +329,52 @@ function forgetRendererOwner(sender) {
   return broker().forgetOwner(sender)
 }
 
+/** Internal-only observer path used by the future companion gateway. It never
+ * enters ipcMain/preload, and its broker method cannot adopt terminal owner. */
+async function subscribeTerminalObserver({
+  id,
+  projectId,
+  subscriberId,
+  streamEpoch,
+  afterOffset,
+  maxQueueBytes,
+  onEvent,
+}) {
+  if (typeof onEvent !== 'function') throw new Error('terminal observer callback is required')
+  if (typeof id !== 'string' || !id || typeof projectId !== 'string' || !projectId) throw new Error('terminal observer target is invalid')
+  const digest = crypto.createHash('sha256').update(`${subscriberId || 'device'}\0${id}\0${projectId}`).digest('hex').slice(0, 24)
+  const sender = {
+    id: `companion-${digest}`,
+    isDestroyed: () => false,
+    send: (channel, payload) => onEvent({ channel, payload }),
+  }
+  await broker().connect()
+  if (!broker().supports(TERMINAL_OBSERVE_FEATURE)) {
+    return { ok: false, unavailable: true, message: 'The running session broker will support phone observation after its current terminals finish.' }
+  }
+  const result = await broker().terminal('subscribe', sender, {
+    id,
+    projectId,
+    streamEpoch,
+    afterOffset,
+    maxQueueBytes,
+  })
+  if (!result?.ok) {
+    broker().unregisterOwner(sender)
+    return result
+  }
+  let closed = false
+  return {
+    ...result,
+    unsubscribe: async () => {
+      if (closed) return { ok: true, removed: false }
+      closed = true
+      try { return await broker().terminal('unsubscribe', sender, { id, projectId }, { timeoutMs: 3_000 }) }
+      finally { broker().unregisterOwner(sender) }
+    },
+  }
+}
+
 /** Normal app quit/update: close only Electron's authenticated socket. The
  * detached broker and every PTY continue, writing unseen output to disk. */
 function detachSessionBroker() {
@@ -347,5 +394,6 @@ module.exports = {
   detachSessionBroker,
   setAppFocused,
   forgetRendererOwner,
+  subscribeTerminalObserver,
   __test: { codexIdFromPath, jsonStringField, codexSession },
 }

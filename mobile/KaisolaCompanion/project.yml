@@ -1,0 +1,63 @@
+name: KaisolaCompanion
+
+options:
+  bundleIdPrefix: app.kaisola
+  deploymentTarget:
+    iOS: "17.0"
+  groupSortPosition: top
+
+settings:
+  base:
+    SWIFT_VERSION: "6.0"
+    CURRENT_PROJECT_VERSION: 1
+    MARKETING_VERSION: 0.1.0
+    DEVELOPMENT_TEAM: ""
+
+targets:
+  KaisolaCompanion:
+    type: application
+    platform: iOS
+    sources:
+      - path: KaisolaCompanion
+      - path: ../../electron/companion/fixtures
+        buildPhase: resources
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: app.kaisola.companion
+        TARGETED_DEVICE_FAMILY: "1"
+        GENERATE_INFOPLIST_FILE: YES
+        INFOPLIST_KEY_CFBundleDisplayName: Kaisola
+        INFOPLIST_KEY_LSApplicationCategoryType: public.app-category.productivity
+        INFOPLIST_KEY_UIApplicationSceneManifest_Generation: YES
+        INFOPLIST_KEY_UILaunchScreen_Generation: YES
+        SUPPORTS_MACCATALYST: NO
+        CODE_SIGN_STYLE: Automatic
+
+  KaisolaCompanionTests:
+    type: bundle.unit-test
+    platform: iOS
+    sources:
+      - path: KaisolaCompanionTests
+      - path: ../../electron/companion/fixtures
+        buildPhase: resources
+    dependencies:
+      - target: KaisolaCompanion
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: app.kaisola.companion.tests
+        GENERATE_INFOPLIST_FILE: YES
+        CODE_SIGN_STYLE: Automatic
+
+schemes:
+  KaisolaCompanion:
+    build:
+      targets:
+        KaisolaCompanion: all
+        KaisolaCompanionTests: [test]
+    run:
+      config: Debug
+    test:
+      config: Debug
+      gatherCoverageData: true
+      targets:
+        - name: KaisolaCompanionTests

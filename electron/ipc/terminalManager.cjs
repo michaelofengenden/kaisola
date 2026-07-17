@@ -6,8 +6,11 @@
 const os = require('node:os')
 const path = require('node:path')
 const fs = require('node:fs')
+const crypto = require('node:crypto')
 const { agentEnv } = require('./shellEnv.cjs')
 const { TerminalSpool, DEFAULT_HOT_CAP } = require('./terminalSpool.cjs')
+const { TerminalObservers } = require('./terminalObservers.cjs')
+const { TerminalCursor, isUtf8Boundary } = require('../companion/terminalCursor.cjs')
 
 let pty = null
 let ptyLoadAttempted = false
@@ -66,6 +69,7 @@ const FLUSH_MS_FOCUSED = 16
 const FLUSH_MS_BLURRED = 100
 let flushMs = FLUSH_MS_FOCUSED
 const FLUSH_CAP = 65_536 // a burst bigger than this flushes immediately
+const OBSERVER_CHUNK_BYTES = 64 * 1024
 const AGENT_QUIET_MS = 4500
 
 /** main.cjs calls this on app focus/blur — the stream profile follows. */
@@ -152,12 +156,33 @@ function sameSender(a, b) {
   return !!aa && aa === bb
 }
 
-function send(sender, channel, payload) {
+function send(sender, channel, payload, options) {
   if (eventSink) {
-    eventSink(sender, channel, payload)
-    return
+    return eventSink(sender, channel, payload, options) !== false
   }
-  if (sender && !sender.isDestroyed?.()) sender.send(channel, payload)
+  if (sender && !sender.isDestroyed?.()) {
+    sender.send(channel, payload)
+    return true
+  }
+  return false
+}
+
+/** Split a pty callback into bounded frames without cutting a UTF-8 codepoint. */
+function splitUtf8(value, maxBytes = OBSERVER_CHUNK_BYTES) {
+  const cap = Math.max(4, Math.floor(Number(maxBytes) || OBSERVER_CHUNK_BYTES))
+  const buffer = Buffer.from(String(value ?? ''), 'utf8')
+  const chunks = []
+  for (let start = 0; start < buffer.length;) {
+    let end = Math.min(buffer.length, start + cap)
+    while (end < buffer.length && end > start && !isUtf8Boundary(buffer, end)) end--
+    if (end === start) {
+      end = Math.min(buffer.length, start + cap)
+      while (end < buffer.length && !isUtf8Boundary(buffer, end)) end++
+    }
+    chunks.push(buffer.subarray(start, end).toString('utf8'))
+    start = end
+  }
+  return chunks
 }
 
 /**
@@ -173,6 +198,7 @@ function spawn({ id, command, args, cwd, env, outputByteLimit, cols, rows, sende
     if (!prior.exited) return prior
     // a dead pty is not a session — drop the record and spawn fresh under the
     // same id, so a reloaded window gets a working shell instead of a corpse
+    prior.spool.close({ remove: true })
     terms.delete(id)
   }
   const shell = process.env.SHELL || '/bin/zsh'
@@ -188,6 +214,8 @@ function spawn({ id, command, args, cwd, env, outputByteLimit, cols, rows, sende
     cwd: startCwd,
     env: terminalEnv(env),
   })
+  const streamEpoch = crypto.randomUUID()
+  const cursor = new TerminalCursor({ streamEpoch })
   const rec = {
     id,
     pty: p,
@@ -197,6 +225,7 @@ function spawn({ id, command, args, cwd, env, outputByteLimit, cols, rows, sende
     spool: new TerminalSpool({
       dir: spoolDir,
       id,
+      fresh: true,
       ...(retainedOutputBytes == null ? {} : {
         diskCap: Math.max(1, retainedOutputBytes),
         hotCap: Math.max(1, Math.min(DEFAULT_HOT_CAP, retainedOutputBytes)),
@@ -205,6 +234,8 @@ function spawn({ id, command, args, cwd, env, outputByteLimit, cols, rows, sende
       }),
     }),
     outputByteLimit: retainedOutputBytes,
+    cursor,
+    observers: null,
     rendererVisible: true,
     pending: '', // coalesced-but-unsent output (already part of the ring)
     flushTimer: null,
@@ -224,12 +255,23 @@ function spawn({ id, command, args, cwd, env, outputByteLimit, cols, rows, sende
     agentCompletedAt: null,
     agentQuietTimer: null,
   }
+  rec.observers = new TerminalObservers({
+    terminalId: id,
+    deliver: (subscriber, channel, payload, options) => send(subscriber, channel, payload, options),
+  })
   const broadcastAgentActivity = () => {
     send(rec.sender || rec.lastSender, 'terminal:agent-activity', {
       id,
       busy: rec.agentBusy,
       completedAt: rec.agentCompletedAt,
     })
+    rec.observers.broadcast('terminal:observer-activity', {
+      id,
+      streamEpoch: rec.cursor.streamEpoch,
+      offset: rec.cursor.nextOffset,
+      busy: rec.agentBusy,
+      completedAt: rec.agentCompletedAt,
+    }, { streamEpoch: rec.cursor.streamEpoch, endOffset: rec.cursor.nextOffset })
   }
   const settleAgentTurn = () => {
     if (rec.agentQuietTimer) clearTimeout(rec.agentQuietTimer)
@@ -268,6 +310,13 @@ function spawn({ id, command, args, cwd, env, outputByteLimit, cols, rows, sende
   rec.flushPending = flushPending
   p.onData((data) => {
     rec.spool.push(data)
+    for (const piece of splitUtf8(data)) {
+      const chunk = rec.cursor.append(piece)
+      rec.observers.broadcast('terminal:observer-output', { id, ...chunk }, {
+        streamEpoch: rec.cursor.streamEpoch,
+        endOffset: chunk.endOffset,
+      })
+    }
     if (!rec.rendererVisible) rec.detachedBytes += Buffer.byteLength(data)
     if (rec.rendererVisible) {
       rec.pending += data
@@ -283,6 +332,12 @@ function spawn({ id, command, args, cwd, env, outputByteLimit, cols, rows, sende
     rec.exitStatus = { exitCode: exitCode ?? 0, signal: signal ?? null }
     settleAgentTurn()
     send(rec.sender, `terminal:exit:${id}`, rec.exitStatus.exitCode)
+    rec.observers.broadcast('terminal:observer-exit', {
+      id,
+      streamEpoch: rec.cursor.streamEpoch,
+      offset: rec.cursor.nextOffset,
+      exitStatus: rec.exitStatus,
+    }, { streamEpoch: rec.cursor.streamEpoch, endOffset: rec.cursor.nextOffset })
     rec.waiters.forEach((w) => w(rec.exitStatus))
     rec.waiters = []
   })
@@ -295,6 +350,7 @@ function spawn({ id, command, args, cwd, env, outputByteLimit, cols, rows, sende
     // listener is wired (Electron drops it) and never reach the renderer.
     const warn = `\r\n\x1b[33m⚠ working directory not found:\x1b[0m ${cwd}\r\n\x1b[33m  started in ${os.homedir()} instead — this session is NOT isolated.\x1b[0m\r\n\r\n`
     rec.spool.push(warn)
+    rec.cursor.append(warn)
   }
   return rec
 }
@@ -420,14 +476,68 @@ function ownership(id) {
 
 function snapshot(id) {
   const r = terms.get(id)
-  if (!r) return { output: '', exited: true, exitStatus: null }
+  if (!r) return { output: '', startOffset: 0, endOffset: 0, streamEpoch: null, truncated: false, exited: true, exitStatus: null }
+  const retained = r.spool.snapshot(r.outputByteLimit ?? OUTPUT_CAP)
+  const outputBytes = Buffer.byteLength(retained.output, 'utf8')
   return {
-    ...r.spool.snapshot(r.outputByteLimit ?? OUTPUT_CAP),
+    ...retained,
+    streamEpoch: r.cursor.streamEpoch,
+    startOffset: Math.max(0, r.cursor.nextOffset - outputBytes),
+    endOffset: r.cursor.nextOffset,
     exited: r.exited,
     exitStatus: r.exitStatus,
     agentBusy: r.agentBusy,
     agentCompletedAt: r.agentCompletedAt,
   }
+}
+
+function resumeFromSnapshot(current, streamEpoch, afterOffset) {
+  if (streamEpoch == null && afterOffset == null) return { mode: 'snapshot', snapshot: current }
+  if (typeof streamEpoch !== 'string' || !streamEpoch || !Number.isSafeInteger(afterOffset) || afterOffset < 0) {
+    throw new Error('invalid terminal observer cursor')
+  }
+  if (streamEpoch !== current.streamEpoch) return { mode: 'snapshot', resetReason: 'epoch_mismatch', snapshot: current }
+  if (afterOffset > current.endOffset) return { mode: 'snapshot', resetReason: 'cursor_ahead', snapshot: current }
+  if (afterOffset < current.startOffset) return { mode: 'snapshot', resetReason: 'event_gap', snapshot: current }
+  if (afterOffset === current.endOffset) {
+    return { mode: 'current', cursor: { streamEpoch: current.streamEpoch, offset: current.endOffset } }
+  }
+  const output = Buffer.from(current.output, 'utf8')
+  const relative = afterOffset - current.startOffset
+  if (!isUtf8Boundary(output, relative)) {
+    return { mode: 'snapshot', resetReason: 'invalid_utf8_boundary', snapshot: current }
+  }
+  return {
+    mode: 'snapshot',
+    snapshot: {
+      ...current,
+      output: output.subarray(relative).toString('utf8'),
+      startOffset: afterOffset,
+      truncated: current.truncated || afterOffset > 0,
+    },
+  }
+}
+
+function subscribe(id, subscriber, { streamEpoch, afterOffset, maxQueueBytes } = {}) {
+  const r = terms.get(id)
+  if (!r) return { ok: false, message: 'Terminal is no longer available.' }
+  r.observers.subscribe(subscriber, { maxQueueBytes })
+  try {
+    return { ok: true, ...resumeFromSnapshot(snapshot(id), streamEpoch, afterOffset) }
+  } catch (error) {
+    r.observers.unsubscribe(subscriber)
+    throw error
+  }
+}
+
+function unsubscribe(id, subscriber) {
+  return terms.get(id)?.observers.unsubscribe(subscriber) ?? false
+}
+
+function unsubscribeSubscriberPrefix(prefix) {
+  let removed = 0
+  for (const r of terms.values()) removed += r.observers.unsubscribePrefix(prefix)
+  return removed
 }
 
 function waitForExit(id) {
@@ -551,7 +661,11 @@ function diagnostics() {
     lastOwner: senderId(r.lastSender),
     detachedAt: r.detachedAt,
     detachedBytes: r.detachedBytes,
+    streamEpoch: r.cursor.streamEpoch,
+    endOffset: r.cursor.nextOffset,
+    observerCount: r.observers.stats().subscribers,
+    pausedObserverCount: r.observers.stats().paused,
   }))
 }
 
-module.exports = { available, has, isLive, ownership, spawn, write, agentTurn, resize, setSender, detachRenderer, detachSender, detachSenderPrefix, snapshot, waitForExit, kill, release, scheduleRelease, cancelRelease, trackChild, untrackChild, killAll, list, setAppFocused, configureStorage, setEventSink, diagnostics }
+module.exports = { available, has, isLive, ownership, spawn, write, agentTurn, resize, setSender, detachRenderer, detachSender, detachSenderPrefix, snapshot, subscribe, unsubscribe, unsubscribeSubscriberPrefix, waitForExit, kill, release, scheduleRelease, cancelRelease, trackChild, untrackChild, killAll, list, setAppFocused, configureStorage, setEventSink, diagnostics, __test: { resumeFromSnapshot, splitUtf8 } }

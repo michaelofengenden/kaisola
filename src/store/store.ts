@@ -895,7 +895,7 @@ export interface RecentProject {
   at: number
 }
 
-interface KaisolaState {
+export interface KaisolaState {
   project: Project
 
   // ── navigation / ui ──

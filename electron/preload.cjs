@@ -530,6 +530,16 @@ const bridge = {
       return () => ipcRenderer.removeListener('attention:open', listener)
     },
   },
+  // Renderer → main carries only the normalized, allowlisted companion view.
+  // The pagehide path is synchronous so the last meaningful revision reaches
+  // main before Chromium tears down this window.
+  companion: {
+    publishProjection: (projection, sync = false) => {
+      if (sync) return ipcRenderer.sendSync('companion:publish-projection', projection)?.ok === true
+      ipcRenderer.send('companion:publish-projection', projection)
+      return true
+    },
+  },
   // in-app software updates (electron-updater ↔ the GitHub releases feed)
   update: {
     state: () => ipcRenderer.invoke('update:state'),

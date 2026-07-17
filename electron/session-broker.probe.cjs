@@ -66,7 +66,7 @@ async function main() {
       command: process.platform === 'win32' ? process.env.ComSpec : '/bin/sh',
       args: process.platform === 'win32'
         ? ['/d', '/s', '/c', 'echo scope-ready & ping -t 127.0.0.1 >nul']
-        : ['-c', 'printf "scope-ready\\n"; while :; do sleep 1; done'],
+        : ['-c', 'printf "scope-ready\\n"; while IFS= read -r line; do printf "scope:%s\\n" "$line"; done'],
       cwd: process.cwd(),
       cols: 80,
       rows: 24,
@@ -80,6 +80,54 @@ async function main() {
     const handoff = await secondClient.terminal('attach', sender(303), { id: 'project-scope-boundary', projectId: PROJECT_ALPHA })
     const handoffInventory = await secondClient.terminal('diagnostics', sender(303), { projectId: PROJECT_ALPHA })
     const priorOwnerDeniedAfterHandoff = await denied(secondClient.terminal('snapshot', sender(301), { id: 'project-scope-boundary', projectId: PROJECT_ALPHA }))
+
+    // A companion observer is a read-only same-project subscription. It sees
+    // offset-aware output but never enters owner/lastOwner, cannot use ordinary
+    // terminal methods, and reconnects from its last byte cursor.
+    const observerEvents = []
+    const observer = {
+      id: 304,
+      isDestroyed: () => false,
+      send: (channel, payload) => observerEvents.push({ channel, payload }),
+    }
+    const ownershipBeforeObserve = (await secondClient.terminal('diagnostics', sender(303), { projectId: PROJECT_ALPHA }))
+      .find((row) => row.id === 'project-scope-boundary')
+    const observed = await secondClient.terminal('subscribe', observer, {
+      id: 'project-scope-boundary',
+      projectId: PROJECT_ALPHA,
+      maxQueueBytes: 128 * 1024,
+    })
+    const crossProjectSubscribeDenied = await denied(secondClient.terminal('subscribe', sender(305), {
+      id: 'project-scope-boundary',
+      projectId: PROJECT_BETA,
+    }))
+    const observerWriteDenied = await denied(secondClient.terminal('write', observer, {
+      id: 'project-scope-boundary',
+      projectId: PROJECT_ALPHA,
+      data: 'must-not-run\r',
+    }))
+    if (process.platform !== 'win32') {
+      await secondClient.terminal('write', sender(303), { id: 'project-scope-boundary', projectId: PROJECT_ALPHA, data: 'observer-probe\r' })
+      for (let i = 0; i < 30 && !observerEvents.some((event) => event.channel === 'terminal:observer-output' && String(event.payload?.data).includes('scope:observer-probe')); i++) await wait(50)
+    }
+    const outputEvents = observerEvents.filter((event) => event.channel === 'terminal:observer-output')
+    const observerText = outputEvents.map((event) => String(event.payload?.data ?? '')).join('')
+    const observerOffsetsOrdered = outputEvents.every((event, index) => index === 0 || outputEvents[index - 1].payload.endOffset === event.payload.startOffset)
+    const lastOutput = outputEvents.at(-1)?.payload
+    const ownerSnapshotAfterObserve = await secondClient.terminal('snapshot', sender(303), { id: 'project-scope-boundary', projectId: PROJECT_ALPHA })
+    await secondClient.terminal('unsubscribe', observer, { id: 'project-scope-boundary', projectId: PROJECT_ALPHA })
+    const resumeEpoch = lastOutput?.streamEpoch ?? observed.snapshot?.streamEpoch
+    const resumeOffset = lastOutput?.endOffset ?? observed.snapshot?.endOffset
+    const resumedObserver = await secondClient.terminal('subscribe', observer, {
+      id: 'project-scope-boundary',
+      projectId: PROJECT_ALPHA,
+      streamEpoch: resumeEpoch,
+      afterOffset: resumeOffset,
+    })
+    await secondClient.terminal('unsubscribe', observer, { id: 'project-scope-boundary', projectId: PROJECT_ALPHA })
+    secondClient.unregisterOwner(observer)
+    const ownershipAfterObserve = (await secondClient.terminal('diagnostics', sender(303), { projectId: PROJECT_ALPHA }))
+      .find((row) => row.id === 'project-scope-boundary')
     await secondClient.terminal('release', sender(303), { id: 'project-scope-boundary', projectId: PROJECT_ALPHA })
 
     // Close grace lives in the broker, not a renderer timer. It can be armed
@@ -115,6 +163,14 @@ async function main() {
       sameProjectReadDeniedBeforeAttach,
       explicitSameProjectHandoff: !!scoped?.ok && !handoff?.exited && handoffInventory.some((row) => row.id === 'project-scope-boundary' && row.pid === scoped.pid),
       previousOwnerRevokedAfterHandoff: priorOwnerDeniedAfterHandoff,
+      terminalCursorMetadata: typeof first.streamEpoch === 'string' && first.streamEpoch === second.streamEpoch && Number.isSafeInteger(second.startOffset) && Number.isSafeInteger(second.endOffset),
+      observerSubscribed: observed?.ok === true && (observed.mode === 'snapshot' || observed.mode === 'current'),
+      observerOutputOrdered: process.platform === 'win32' || (!!lastOutput && observerText.includes('scope:observer-probe') && observerOffsetsOrdered && lastOutput.endOffset > lastOutput.startOffset),
+      desktopObserverOutputAgrees: process.platform === 'win32' || (observerText.includes('scope:observer-probe') && String(ownerSnapshotAfterObserve.output).includes('scope:observer-probe')),
+      observerCursorResumed: resumedObserver?.ok === true && (resumedObserver.mode === 'current' || resumedObserver.snapshot?.startOffset >= (resumeOffset ?? 0)),
+      observerNeverOwned: ownershipBeforeObserve?.owner === ownershipAfterObserve?.owner && ownershipBeforeObserve?.lastOwner === ownershipAfterObserve?.lastOwner,
+      crossProjectSubscribeDenied,
+      observerWriteDenied,
       brokerOwnedCloseGrace: !!grace?.ok && graceScheduled.ok && graceCancelled.ok && graceStillThere && graceReaped,
       privateSpawnHelper: process.platform !== 'darwin' || (() => {
         try {

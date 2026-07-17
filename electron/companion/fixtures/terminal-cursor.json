@@ -1,0 +1,14 @@
+{
+  "streamEpoch": "terminal-epoch-3",
+  "chunks": [
+    { "data": "abc", "startOffset": 0, "endOffset": 3 },
+    { "data": "🙂", "startOffset": 3, "endOffset": 7 },
+    { "data": "\r\n", "startOffset": 7, "endOffset": 9 }
+  ],
+  "snapshot": {
+    "output": "🙂\r\n",
+    "startOffset": 3,
+    "endOffset": 9,
+    "truncated": true
+  }
+}

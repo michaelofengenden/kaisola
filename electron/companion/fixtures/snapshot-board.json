@@ -1,0 +1,132 @@
+{
+  "v": 1,
+  "kind": "snapshot",
+  "desktopId": "desktop-michael-mac",
+  "deviceId": "device-michael-iphone",
+  "connectionId": "connection-alpha-1",
+  "epoch": "desktop-epoch-7",
+  "seq": 12,
+  "id": "snapshot-12",
+  "sentAt": 1784250001200,
+  "body": {
+    "type": "snapshot.projects",
+    "revision": 12,
+    "projection": {
+      "projectionKind": "kaisola.companion.projection",
+      "revision": 12,
+      "generatedAt": 1784250001200,
+      "freshness": "live",
+      "projects": [
+        {
+          "id": "project-kaisola",
+          "name": "Kaisola",
+          "repo": "Kaisola",
+          "branch": "main",
+          "connection": "live",
+          "lastContactAt": 1784250001200,
+          "counts": { "running": 1, "waiting": 1, "done": 1, "failed": 0 }
+        }
+      ],
+      "sessions": [
+        {
+          "id": "session-codex",
+          "projectId": "project-kaisola",
+          "kind": "agent",
+          "title": "Build mobile companion protocol",
+          "status": "running",
+          "boardLane": "running",
+          "needsYou": false,
+          "unread": false,
+          "updatedAt": 1784250001100,
+          "provider": "Codex",
+          "summary": "Writing the bounded event log"
+        },
+        {
+          "id": "session-review",
+          "projectId": "project-kaisola",
+          "kind": "agent",
+          "title": "Review terminal permissions",
+          "status": "waiting",
+          "boardLane": "waiting",
+          "needsYou": true,
+          "unread": true,
+          "updatedAt": 1784250001000,
+          "provider": "Claude",
+          "summary": "Approval needed for one file edit"
+        },
+        {
+          "id": "session-done",
+          "projectId": "project-kaisola",
+          "kind": "terminal",
+          "title": "Build verification",
+          "status": "done",
+          "boardLane": "done",
+          "needsYou": false,
+          "unread": true,
+          "updatedAt": 1784250000900,
+          "summary": "npm run build passed"
+        }
+      ],
+      "attention": [],
+      "permissions": [],
+      "board": {
+        "columns": [
+          {
+            "id": "running",
+            "title": "Running",
+            "count": 1,
+            "cards": [
+              {
+                "id": "session-codex",
+                "type": "session",
+                "projectId": "project-kaisola",
+                "title": "Build mobile companion protocol",
+                "status": "running",
+                "needsYou": false,
+                "updatedAt": 1784250001100,
+                "provider": "Codex",
+                "summary": "Writing the bounded event log"
+              }
+            ]
+          },
+          {
+            "id": "waiting",
+            "title": "Needs You",
+            "sourceLabel": "Waiting for review",
+            "count": 1,
+            "cards": [
+              {
+                "id": "session-review",
+                "type": "session",
+                "projectId": "project-kaisola",
+                "title": "Review terminal permissions",
+                "status": "waiting",
+                "needsYou": true,
+                "updatedAt": 1784250001000,
+                "provider": "Claude",
+                "summary": "Approval needed for one file edit"
+              }
+            ]
+          },
+          {
+            "id": "done",
+            "title": "Done",
+            "count": 1,
+            "cards": [
+              {
+                "id": "session-done",
+                "type": "session",
+                "projectId": "project-kaisola",
+                "title": "Build verification",
+                "status": "done",
+                "needsYou": false,
+                "updatedAt": 1784250000900,
+                "summary": "npm run build passed"
+              }
+            ]
+          }
+        ]
+      }
+    }
+  }
+}

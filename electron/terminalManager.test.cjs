@@ -8,3 +8,29 @@ test('waiting on a released ACP terminal never fabricates a successful exit', as
     /no longer available/i,
   )
 })
+
+test('observer chunks and resume snapshots preserve UTF-8 byte boundaries', () => {
+  const { splitUtf8, resumeFromSnapshot } = terminalManager.__test
+  assert.deepEqual(splitUtf8('abc🙂\r\n', 4), ['abc', '🙂', '\r\n'])
+  const snapshot = {
+    streamEpoch: 'stream-1',
+    output: '🙂\r\n',
+    startOffset: 3,
+    endOffset: 9,
+    truncated: true,
+    exited: false,
+    exitStatus: null,
+  }
+  assert.deepEqual(resumeFromSnapshot(snapshot, 'stream-1', 9), {
+    mode: 'current',
+    cursor: { streamEpoch: 'stream-1', offset: 9 },
+  })
+  assert.deepEqual(resumeFromSnapshot(snapshot, 'stream-1', 7).snapshot, {
+    ...snapshot,
+    output: '\r\n',
+    startOffset: 7,
+  })
+  assert.equal(resumeFromSnapshot(snapshot, 'stream-1', 2).resetReason, 'event_gap')
+  assert.equal(resumeFromSnapshot(snapshot, 'stream-old', 9).resetReason, 'epoch_mismatch')
+  assert.equal(resumeFromSnapshot(snapshot, 'stream-1', 4).resetReason, 'invalid_utf8_boundary')
+})

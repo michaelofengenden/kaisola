@@ -17,6 +17,7 @@ const { terminalOwnerAllowed, terminalOwnerParts } = require('./ipc/securityPoli
 
 const PROTOCOL = 2
 const SECURITY_EPOCH = 1
+const FEATURES = Object.freeze(['terminal-observe-v1'])
 const MAX_FRAME = 20 * 1024 * 1024
 const NO_CLIENT_EXIT_MS = 30_000
 
@@ -70,9 +71,16 @@ let noClientTimer = null
 let shuttingDown = false
 let everConnected = false
 
-function send(socket, frame) {
-  if (!socket || socket.destroyed) return
-  try { socket.write(`${JSON.stringify(frame)}\n`) } catch { /* reconnect replays snapshots */ }
+function send(socket, frame, { maxQueueBytes, force = false } = {}) {
+  if (!socket || socket.destroyed) return false
+  try {
+    const encoded = `${JSON.stringify(frame)}\n`
+    const frameBytes = Buffer.byteLength(encoded, 'utf8')
+    if (!force && Number.isFinite(maxQueueBytes) && socket.writableLength + frameBytes > maxQueueBytes) return false
+    return socket.write(encoded)
+  } catch {
+    return false // reconnect replays snapshots
+  }
 }
 
 const LEGACY_PROJECT_SCOPE = 'legacy'
@@ -123,15 +131,16 @@ function scheduleNoClientExit() {
 function detachInstance(instanceId) {
   if (!instanceId) return
   mgr.detachSenderPrefix(`${instanceId}|`)
+  mgr.unsubscribeSubscriberPrefix(`${instanceId}|`)
   scheduleNoClientExit()
 }
 
-mgr.setEventSink((owner, channel, payload) => {
+mgr.setEventSink((owner, channel, payload, options) => {
   const parts = terminalOwnerParts(owner)
-  if (!parts) return
+  if (!parts) return false
   const client = clients.get(parts.instanceId)
-  if (!client) return
-  send(client.socket, { type: 'event', ownerId: parts.ownerId, channel, payload })
+  if (!client) return false
+  return send(client.socket, { type: 'event', ownerId: parts.ownerId, channel, payload }, options)
 })
 
 async function dispatch(client, method, params = {}) {
@@ -159,7 +168,7 @@ async function dispatch(client, method, params = {}) {
   }
   switch (method) {
     case 'broker.status':
-      return { ok: true, protocol: PROTOCOL, securityEpoch: SECURITY_EPOCH, pid: process.pid, startedAt: config.startedAt, version: config.version, terminals: mgr.diagnostics() }
+      return { ok: true, protocol: PROTOCOL, securityEpoch: SECURITY_EPOCH, features: FEATURES, pid: process.pid, startedAt: config.startedAt, version: config.version, terminals: mgr.diagnostics() }
     case 'broker.shutdown':
       setTimeout(() => gracefulExit(true), 20).unref?.()
       return { ok: true }
@@ -201,6 +210,22 @@ async function dispatch(client, method, params = {}) {
         ? { ...continuity, acrossRestart: true, reattachedAt: Date.now(), brokerPid: process.pid }
         : null
       return { ...mgr.snapshot(id), continuation }
+    }
+    case 'terminal.subscribe': {
+      if (admin) throw new Error('terminal observer requires an exact project capability')
+      const id = terminalId()
+      requireAllowed(id, true)
+      return mgr.subscribe(id, owner, {
+        streamEpoch: params.streamEpoch,
+        afterOffset: params.afterOffset,
+        maxQueueBytes: params.maxQueueBytes,
+      })
+    }
+    case 'terminal.unsubscribe': {
+      if (admin) throw new Error('terminal observer requires an exact project capability')
+      const id = terminalId()
+      requireAllowed(id, true)
+      return { ok: true, removed: mgr.unsubscribe(id, owner) }
     }
     case 'terminal.detachRenderer': {
       const id = terminalId()
@@ -314,7 +339,7 @@ function handleLine(client, line) {
     everConnected = true
     clients.set(instanceId, client)
     clearNoClientTimer()
-    send(client.socket, { type: 'hello', ok: true, protocol: PROTOCOL, securityEpoch: SECURITY_EPOCH, pid: process.pid, startedAt: config.startedAt, version: config.version })
+    send(client.socket, { type: 'hello', ok: true, protocol: PROTOCOL, securityEpoch: SECURITY_EPOCH, features: FEATURES, pid: process.pid, startedAt: config.startedAt, version: config.version })
     return
   }
   if (frame?.type !== 'request' || typeof frame.id !== 'string' || typeof frame.method !== 'string') return

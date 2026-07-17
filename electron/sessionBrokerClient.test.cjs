@@ -9,6 +9,7 @@ const {
   SessionBrokerClient,
   PROTOCOL,
   SECURITY_EPOCH,
+  TERMINAL_OBSERVE_FEATURE,
   __test: { LEGACY_UNSCOPED_PROTOCOL, requestBrokerControl, validateBrokerHello },
 } = require('./ipc/sessionBrokerClient.cjs')
 
@@ -66,6 +67,14 @@ test('renderer crash forgets only event routing, not broker terminal ownership',
   assert.equal(client.owners.get('77'), sender)
   assert.deepEqual(client.forgetOwner(sender), { ok: true })
   assert.equal(client.owners.has('77'), false)
+})
+
+test('terminal observation is used only when the live broker advertises it', (t) => {
+  const client = clientFixture(t)
+  client.hello = { features: [TERMINAL_OBSERVE_FEATURE] }
+  assert.equal(client.supports(TERMINAL_OBSERVE_FEATURE), true)
+  client.hello = { features: [] }
+  assert.equal(client.supports(TERMINAL_OBSERVE_FEATURE), false)
 })
 
 test('legacy retirement control authenticates with protocol 1 and only requests shutdown', async () => {

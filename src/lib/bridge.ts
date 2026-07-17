@@ -396,6 +396,7 @@ export interface TerminalMirrorState {
   meta?: Partial<Omit<TerminalMetaEvent, 'id'>> & { oscTitle?: string | null; lastExit?: number | null; ports?: number[] }
   draft?: string
   resume?: string
+  promptTitle?: string
 }
 /** Revisioned close handoff retained by main until the exact project owner ACKs. */
 export interface PopClosedTerminalState extends TerminalMirrorState {
@@ -490,6 +491,29 @@ export interface CodexUsage {
   secondary?: CodexWindow | null
   updatedAt?: number
 }
+export interface OpenCodeUsageModel {
+  model: string
+  messages?: string
+  input?: string
+  output?: string
+  cacheRead?: string
+  cacheWrite?: string
+  cost?: string
+}
+export interface OpenCodeUsage {
+  ok: boolean
+  message?: string
+  sessions?: number
+  messages?: number
+  days?: number
+  cost?: string
+  input?: string
+  output?: string
+  cacheRead?: string
+  cacheWrite?: string
+  models?: OpenCodeUsageModel[]
+  updatedAt?: number
+}
 export interface ClaudeTokenSums { input: number; output: number; cacheRead: number; cacheWrite: number }
 export interface ClaudeLimitWindow { usedPercent?: number; resetsAt?: number }
 export interface ClaudeModelLimit extends ClaudeLimitWindow { label: string }
@@ -555,6 +579,8 @@ export interface AcpConnectConfig {
   env?: Record<string, string>
   /** Selected Claude credential root; null explicitly removes an ambient shell override. */
   claudeConfigDir?: string | null
+  /** Selected Codex credential root; null explicitly removes an ambient shell override. */
+  codexHome?: string | null
   /** Resume this session id via session/load when the agent supports it —
    * restart continuity; a stale id silently falls back to a fresh session. */
   resumeSessionId?: string
@@ -651,6 +677,8 @@ export interface KaisolaBridge {
    * uses the official Agent SDK with a best-effort status-line fallback. */
   usage?: {
     codex(codexHome?: string, force?: boolean): Promise<CodexUsage>
+    /** Local OpenCode stats (tokens/cost); not a provider subscription quota. */
+    opencode(force?: boolean): Promise<OpenCodeUsage>
     /** force bypasses the five-minute main-process cache (manual refresh). */
     claude(configDir?: string, force?: boolean, exactOnly?: boolean): Promise<ClaudeUsage>
     /** Per-session token sums grouped by model — the $ chip on session cards. */

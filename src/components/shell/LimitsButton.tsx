@@ -1,13 +1,13 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
-import { bridge, isDesktop, type ClaudeTokenSums, type ClaudeUsage, type CodexUsage } from '../../lib/bridge'
+import { bridge, isDesktop, type ClaudeTokenSums, type ClaudeUsage, type CodexUsage, type OpenCodeUsage } from '../../lib/bridge'
 import { useClickAway } from '../../lib/useClickAway'
-import { useKaisola } from '../../store/store'
+import { shellConfigDir, useKaisola } from '../../store/store'
 import { Icon } from '../Icon'
 
 /** Top-bar usage gauge. Codex uses app-server; Claude uses the official Agent
  * SDK's structured `/usage` control, with a best-effort status-line fallback.
- * Local transcript tokens remain a clearly secondary diagnostic. */
+ * OpenCode and transcript tokens remain clearly secondary local diagnostics. */
 
 const fmt = (n: number): string =>
   n >= 1e9 ? `${(n / 1e9).toFixed(1)}B`
@@ -93,6 +93,7 @@ const extraAmount = (value: number | undefined, currency?: string): string => {
 }
 
 interface ClaudeRow { id: string; label: string; email?: string; usage?: ClaudeUsage }
+interface CodexRow { id: string; label: string; codexHome?: string; usage?: CodexUsage }
 const AGENT_USAGE_KEY = 'kaisola:agent-usage-warning:v1'
 
 function UsageSurface({ embedded = false }: { embedded?: boolean }) {
@@ -100,7 +101,9 @@ function UsageSurface({ embedded = false }: { embedded?: boolean }) {
   const [pos, setPos] = useState<{ left?: number; right?: number; top?: number; bottom?: number }>({ right: 12, top: 44 })
   const [codexLoading, setCodexLoading] = useState(false)
   const [claudeLoading, setClaudeLoading] = useState(false)
-  const [codex, setCodex] = useState<CodexUsage | null>(null)
+  const [openCodeLoading, setOpenCodeLoading] = useState(false)
+  const [codex, setCodex] = useState<CodexRow[]>([])
+  const [openCode, setOpenCode] = useState<OpenCodeUsage | null>(null)
   const [claude, setClaude] = useState<ClaudeRow[]>([])
   const [updatedAt, setUpdatedAt] = useState(0)
   const btnRef = useRef<HTMLButtonElement | null>(null)
@@ -113,10 +116,15 @@ function UsageSurface({ embedded = false }: { embedded?: boolean }) {
   const load = useCallback(async (force = false, exactOnly = false) => {
     if (!bridge.usage) return
     const seq = ++seqRef.current
-    const accounts = useKaisola.getState().claudeAccounts
+    const state = useKaisola.getState()
+    const accounts = state.claudeAccounts
     const accountRows = [
       { id: '__default__', label: 'Default', configDir: undefined as string | undefined, email: undefined as string | undefined },
       ...accounts.map((a) => ({ id: a.id, label: a.label, configDir: a.configDir, email: a.email })),
+    ]
+    const codexRows = [
+      { id: '__default__', label: 'Default', codexHome: undefined as string | undefined },
+      ...state.codexAccounts.map((account) => ({ id: account.id, label: account.label, codexHome: account.codexHome })),
     ]
 
     // Keep the last good values visible during refresh, but immediately reflect
@@ -127,15 +135,26 @@ function UsageSurface({ embedded = false }: { embedded?: boolean }) {
       email: row.email ?? previous.find((p) => p.id === row.id)?.email,
       usage: previous.find((p) => p.id === row.id)?.usage,
     })))
+    setCodex((previous) => codexRows.map((row) => ({ ...row, usage: previous.find((item) => item.id === row.id)?.usage })))
     setCodexLoading(true)
     setClaudeLoading(true)
+    setOpenCodeLoading(!exactOnly)
 
     // Do not put these in one Promise.all: a missing Codex executable used to
     // hold the already-finished Claude result hostage for the full timeout.
-    const codexTask = bridge.usage.codex(undefined, force)
-      .catch((err) => ({ ok: false, message: String((err as Error)?.message || err || 'Unavailable') } as CodexUsage))
-      .then((result) => { if (seq === seqRef.current) setCodex(result) })
+    const codexTask = Promise.all(codexRows.map((row) => bridge.usage!.codex(row.codexHome, force)
+      .catch((err) => ({ ok: false, message: String((err as Error)?.message || err || 'Unavailable') } as CodexUsage))))
+      .then((usages) => {
+        if (seq === seqRef.current) setCodex(codexRows.map((row, index) => ({ ...row, usage: usages[index] })))
+      })
       .finally(() => { if (seq === seqRef.current) setCodexLoading(false) })
+
+    const openCodeTask = exactOnly
+      ? Promise.resolve()
+      : bridge.usage.opencode(force)
+        .catch((err) => ({ ok: false, message: String((err as Error)?.message || err || 'Unavailable') } as OpenCodeUsage))
+        .then((usage) => { if (seq === seqRef.current) setOpenCode(usage) })
+        .finally(() => { if (seq === seqRef.current) setOpenCodeLoading(false) })
 
     const claudeTask = (async () => {
       const infoTask = bridge.claude.accountInfo?.().catch(() => undefined) ?? Promise.resolve(undefined)
@@ -150,7 +169,7 @@ function UsageSurface({ embedded = false }: { embedded?: boolean }) {
       })))
     })().finally(() => { if (seq === seqRef.current) setClaudeLoading(false) })
 
-    await Promise.allSettled([codexTask, claudeTask])
+    await Promise.allSettled([codexTask, openCodeTask, claudeTask])
     if (seq === seqRef.current) setUpdatedAt(Date.now())
   }, [])
 
@@ -189,9 +208,11 @@ function UsageSurface({ embedded = false }: { embedded?: boolean }) {
   useEffect(() => {
     if (!updatedAt) return
     const rows: Array<{ label: string; usedPercent: number; resetsAt?: number }> = []
-    if (codex?.ok) {
-      if ((codex.primary?.usedPercent ?? 0) >= 50) rows.push({ label: 'Codex current session', usedPercent: codex.primary!.usedPercent!, resetsAt: codex.primary?.resetsAt })
-      if ((codex.secondary?.usedPercent ?? 0) >= 50) rows.push({ label: 'Codex weekly', usedPercent: codex.secondary!.usedPercent!, resetsAt: codex.secondary?.resetsAt })
+    for (const account of codex) {
+      const usage = account.usage
+      if (!usage?.ok) continue
+      if ((usage.primary?.usedPercent ?? 0) >= 50) rows.push({ label: `Codex ${account.label} current session`, usedPercent: usage.primary!.usedPercent!, resetsAt: usage.primary?.resetsAt })
+      if ((usage.secondary?.usedPercent ?? 0) >= 50) rows.push({ label: `Codex ${account.label} weekly`, usedPercent: usage.secondary!.usedPercent!, resetsAt: usage.secondary?.resetsAt })
     }
     for (const account of claude) {
       const limits = account.usage?.limits
@@ -208,7 +229,8 @@ function UsageSurface({ embedded = false }: { embedded?: boolean }) {
   useClickAway(open && !embedded, close, btnRef, panelRef)
 
   if (!isDesktop || !bridge.usage) return null
-  const codexPeak = codex?.ok ? Math.max(codex.primary?.usedPercent ?? 0, codex.secondary?.usedPercent ?? 0) : null
+  const codexPercents = codex.flatMap((row) => [row.usage?.primary?.usedPercent, row.usage?.secondary?.usedPercent].flatMap((value) => value == null ? [] : [value]))
+  const codexPeak = codexPercents.length ? Math.max(...codexPercents) : null
   const claudePercents = claude.flatMap((row) => [
     row.usage?.limits?.fiveHour?.usedPercent,
     row.usage?.limits?.sevenDay?.usedPercent,
@@ -216,7 +238,7 @@ function UsageSurface({ embedded = false }: { embedded?: boolean }) {
   ].flatMap((value) => value == null ? [] : [value]))
   const claudePeak = claudePercents.length ? Math.max(...claudePercents) : null
   const peak = codexPeak == null ? claudePeak : claudePeak == null ? codexPeak : Math.max(codexPeak, claudePeak)
-  const indicator = (codexLoading || claudeLoading) && peak == null
+  const indicator = (codexLoading || claudeLoading || openCodeLoading) && peak == null
     ? 'var(--text-3)'
     : peak == null ? 'var(--text-3)' : peak >= 90 ? 'var(--danger)' : peak >= 70 ? 'var(--warn)' : peak >= 50 ? 'var(--accent)' : 'var(--success)'
   const usageTitle = [
@@ -224,12 +246,9 @@ function UsageSurface({ embedded = false }: { embedded?: boolean }) {
     claudePeak == null ? null : `Claude ${Math.round(100 - claudePeak)}% remaining`,
   ].filter(Boolean).join(' · ')
 
-  // Ordinary usage belongs in the account menu and Settings. Spend a header
-  // slot only when a subscription window is close enough to need attention.
-  if (!embedded && (peak == null || peak < 50)) return null
-
-  const signInCodex = () => {
-    requestTerminal('codex login', { name: 'Codex Login', restart: true })
+  const signInCodex = (row: CodexRow) => {
+    const prefix = row.codexHome ? `mkdir -p ${shellConfigDir(row.codexHome)} && CODEX_HOME=${shellConfigDir(row.codexHome)} ` : ''
+    requestTerminal(`${prefix}codex login`, { name: row.id === '__default__' ? 'Codex Login' : `Codex login · ${row.label}` })
     useKaisola.getState().setSettingsOpen(false)
     setOpen(false)
   }
@@ -252,7 +271,7 @@ function UsageSurface({ embedded = false }: { embedded?: boolean }) {
         <span style={{ fontWeight: 600 }}>Usage</span>
         <span className="faint">Updated {relativeTime(updatedAt)}</span>
         <span className="grow" />
-        <button type="button" className="btn-icon btn-sm" onClick={() => void load(true)} title="Refresh usage (bypass cache)" aria-label="Refresh usage" disabled={codexLoading || claudeLoading}>
+        <button type="button" className="btn-icon btn-sm" onClick={() => void load(true)} title="Refresh usage (bypass cache)" aria-label="Refresh usage" disabled={codexLoading || claudeLoading || openCodeLoading}>
           <Icon name="RefreshCw" size={12} />
         </button>
       </div>
@@ -260,21 +279,57 @@ function UsageSurface({ embedded = false }: { embedded?: boolean }) {
       <section style={{ display: 'flex', flexDirection: 'column', gap: 9 }} aria-label="Codex usage">
         <div style={{ display: 'flex', alignItems: 'center', gap: 7 }}>
           <span style={{ fontWeight: 600 }}>Codex</span>
-          <span className="faint truncate">{codex?.ok ? [codex.email, codex.plan].filter(Boolean).join(' · ') : ''}</span>
+          <span className="faint">subscription limits</span>
         </div>
-        {codex?.ok ? (
+        {codex.map((row) => {
+          const usage = row.usage
+          return (
+            <div key={row.id} style={{ display: 'flex', flexDirection: 'column', gap: 7 }}>
+              <div style={{ display: 'flex', alignItems: 'baseline', gap: 7, minWidth: 0 }}>
+                <span style={{ fontWeight: 500 }}>{row.label}</span>
+                <span className="faint truncate" title={usage?.email}>{usage?.ok ? [usage.email, usage.plan].filter(Boolean).join(' · ') : ''}</span>
+              </div>
+              {usage?.ok ? (
+                <>
+                  <WindowBar label="Current session" usedPercent={usage.primary?.usedPercent} resetsAt={usage.primary?.resetsAt} color="var(--success)" />
+                  <WindowBar label="Weekly" usedPercent={usage.secondary?.usedPercent} resetsAt={usage.secondary?.resetsAt} color="var(--accent)" />
+                </>
+              ) : (
+                <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                  <span className="faint grow">{codexLoading && !usage ? 'Reading Codex limits…' : usage?.message ?? 'Not available'}</span>
+                  {usage?.authRequired && !codexLoading && <button type="button" className="btn btn-primary btn-sm" onClick={() => signInCodex(row)}>Sign in again</button>}
+                </div>
+              )}
+            </div>
+          )
+        })}
+      </section>
+
+      <div style={{ height: 1, background: 'var(--border)' }} />
+
+      <section style={{ display: 'flex', flexDirection: 'column', gap: 8 }} aria-label="OpenCode and Kimi usage">
+        <div style={{ display: 'flex', alignItems: 'center', gap: 7 }}>
+          <span style={{ fontWeight: 600 }}>OpenCode · Kimi</span>
+          <span className="faint">last 7 days</span>
+        </div>
+        {openCode?.ok ? (
           <>
-            <WindowBar label="Current session" usedPercent={codex.primary?.usedPercent} resetsAt={codex.primary?.resetsAt} color="var(--success)" />
-            <WindowBar label="Weekly" usedPercent={codex.secondary?.usedPercent} resetsAt={codex.secondary?.resetsAt} color="var(--accent)" />
+            <div style={{ display: 'flex', justifyContent: 'space-between', gap: 12 }}>
+              <span>{openCode.sessions ?? 0} sessions · {openCode.messages ?? 0} messages</span>
+              <span className="faint">{openCode.cost ?? '$0.00'}</span>
+            </div>
+            <div style={{ display: 'flex', justifyContent: 'space-between', gap: 12, minWidth: 0 }}>
+              <span className="truncate" style={{ minWidth: 0 }} title={openCode.models?.map((model) => model.model).join(', ')}>{openCode.models?.[0]?.model ?? 'All models'}</span>
+              <span className="faint" style={{ flexShrink: 0, textAlign: 'right' }}>{openCode.input ?? '—'} in · {openCode.output ?? '—'} out · {openCode.cacheRead ?? '—'} cached</span>
+            </div>
+            <span className="faint" style={{ fontSize: 'var(--fs-10, 10px)', lineHeight: 1.35 }}>
+              Local OpenCode activity, not Kimi membership quota. Kimi exposes the plan percentage in its account console.
+            </span>
+            <button type="button" className="btn btn-ghost btn-sm" style={{ alignSelf: 'flex-start' }} onClick={() => void bridge.openExternal('https://www.kimi.com/code')}>
+              Open Kimi quota
+            </button>
           </>
-        ) : (
-          <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-            <span className="faint grow">{codexLoading ? 'Reading Codex limits…' : codex?.message ?? 'Not available'}</span>
-            {codex?.authRequired && !codexLoading && (
-              <button type="button" className="btn btn-primary btn-sm" onClick={signInCodex}>Sign in again</button>
-            )}
-          </div>
-        )}
+        ) : <span className="faint">{openCodeLoading ? 'Reading OpenCode stats…' : openCode?.message ?? 'No OpenCode activity available'}</span>}
       </section>
 
       <div style={{ height: 1, background: 'var(--border)' }} />
@@ -352,8 +407,8 @@ function UsageSurface({ embedded = false }: { embedded?: boolean }) {
         className="btn-icon"
         data-active={open}
         onClick={toggle}
-        title={usageTitle ? `Usage — ${usageTitle}` : 'Usage — Claude & Codex'}
-        aria-label="Usage limit warning"
+        title={usageTitle ? `Usage — ${usageTitle}` : 'Usage — Codex, Claude, OpenCode & Kimi'}
+        aria-label="Open usage"
         style={{ position: 'relative' }}
       >
         <Icon name="Gauge" size={15} />

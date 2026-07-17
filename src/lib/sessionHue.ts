@@ -38,5 +38,10 @@ export function sessionHue(opts: { agentKey?: string | null; folder?: string | n
 
 /** Agent key for a terminal record (singletonKey 'agent:<id>' convention). */
 export function terminalAgentKey(singletonKey?: string): string | undefined {
-  return singletonKey?.startsWith('agent:') ? singletonKey.slice('agent:'.length) : undefined
+  if (!singletonKey?.startsWith('agent:')) return undefined
+  const raw = singletonKey.slice('agent:'.length).split('::')[0]
+  // Compatibility for terminal rows promoted before the scoped-key convention.
+  if (raw.startsWith('claude-cli-')) return 'claude-code'
+  if (raw.startsWith('codex-cli-')) return 'codex'
+  return raw
 }

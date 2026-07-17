@@ -5,7 +5,7 @@
 const path = require('node:path')
 const os = require('node:os')
 const fs = require('node:fs')
-const { randomUUID } = require('node:crypto')
+const { randomUUID, createHash } = require('node:crypto')
 const { execFileSync } = require('node:child_process')
 const { shell, app } = require('electron')
 const { AcpConnection } = require('./acp.cjs')
@@ -18,6 +18,7 @@ const { resolveBundledCodexExecutable, resolveBundledClaudeExecutable } = requir
 
 const URL_RE = /https?:\/\/[^\s"'<>)]+/
 const AUTH_TEXT_RE = /\b(auth(?:entication|orization|orize)?|oauth|log[ -]?in|sign[ -]?in|device code)\b/i
+const expandHome = (value) => typeof value === 'string' ? value.replace(/^~(?=\/|$)/, os.homedir()) : value
 
 /** Send to a connection's CURRENT renderer, skipping destroyed windows. */
 function sendTo(entry, channel, payload) {
@@ -666,6 +667,7 @@ function presets() {
     // inline permission cards, the autonomy dial. No wrapper package needed.
     { id: 'opencode', name: 'OpenCode', command: 'opencode', args: ['acp'],
       login: 'opencode auth login', installCmd: 'npm i -g opencode-ai',
+      terminalCommand: 'opencode --mini --replay-limit 60',
       docs: 'https://opencode.ai/docs', builtin: false },
     { id: 'gemini', name: 'Gemini', command: 'gemini', args: ['--experimental-acp'],
       login: 'gemini', installCmd: 'npm i -g @google/gemini-cli',
@@ -851,11 +853,12 @@ function freshenControls(presetId, controls, { modern = false } = {}) {
 // keep ultra untouched. Drop this once codex-acp parses the new levels.
 function codexCompatHome(overrideHome) {
   try {
-    const home = overrideHome || process.env.CODEX_HOME || path.join(os.homedir(), '.codex')
+    const home = expandHome(overrideHome || process.env.CODEX_HOME || path.join(os.homedir(), '.codex'))
     const cfg = fs.readFileSync(path.join(home, 'config.toml'), 'utf8')
     const m = cfg.match(/^(\s*model_reasoning_effort\s*=\s*")(ultra|max)(")/m)
     if (!m) return null
-    const shim = path.join(app.getPath('userData'), 'codex-acp-home')
+    const profile = createHash('sha256').update(path.resolve(home)).digest('hex').slice(0, 12)
+    const shim = path.join(app.getPath('userData'), `codex-acp-home-${profile}`)
     fs.mkdirSync(shim, { recursive: true })
     for (const entry of fs.readdirSync(home)) {
       if (entry === 'config.toml') continue
@@ -1118,6 +1121,11 @@ function registerAcpHandlers(ipcMain) {
       env = { ...(env || {}) }
       if (typeof config.claudeConfigDir === 'string' && config.claudeConfigDir.trim()) env.CLAUDE_CONFIG_DIR = config.claudeConfigDir.trim()
       else delete env.CLAUDE_CONFIG_DIR
+    }
+    if (resolved.presetId === 'codex' && Object.prototype.hasOwnProperty.call(config, 'codexHome')) {
+      env = { ...(env || {}) }
+      if (typeof config.codexHome === 'string' && config.codexHome.trim()) env.CODEX_HOME = expandHome(config.codexHome.trim())
+      else delete env.CODEX_HOME
     }
     if (resolved.presetId === 'codex' && !resolved.modern) {
       const shim = codexCompatHome(env && env.CODEX_HOME)

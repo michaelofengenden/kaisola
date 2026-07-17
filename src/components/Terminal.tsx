@@ -10,6 +10,7 @@ import { clockTime } from '../lib/format'
 import { touchMountedTerminal } from '../lib/terminalResidency'
 import { Icon } from './Icon'
 import { terminalFileLinkCandidates } from '../lib/terminalFileLinks'
+import { terminalCliProfileForProcess } from '../lib/terminalAgent'
 
 // xterm needs concrete hex (no CSS vars). These mirror --term-bg in tokens.css:
 // the terminal sits a touch darker than the app surface in BOTH themes.
@@ -404,6 +405,10 @@ export function Terminal({ id, attach = false, boot, cwd, projectId: projectIdOv
       scrollback: 5000,
       // lift low-contrast ANSI colors (dim grays on glass) to a readable floor
       minimumContrastRatio: 3,
+      // TUI-heavy agents (notably OpenCode) use box drawing, powerline joins,
+      // and overlapping emoji. Let xterm rescale these instead of clipping them.
+      customGlyphs: true,
+      rescaleOverlappingGlyphs: true,
       theme: xtermTheme(themeRef.current, ecoRef.current, cursorColorRef.current, termBgRef.current),
     })
     termRef.current = term
@@ -573,6 +578,7 @@ export function Terminal({ id, attach = false, boot, cwd, projectId: projectIdOv
       if (ev.event === 'Stop') { finishAgentTurn(); return }
       if (ev.event !== 'UserPromptSubmit') return
       beginAgentTurn()
+      if (ev.prompt) useKaisola.getState().autoNameTerminal(id, ev.prompt, projectId)
       const marker = term.registerMarker(0)
       if (!marker) return
       hookMarksLiveRef.current = true
@@ -701,7 +707,7 @@ export function Terminal({ id, attach = false, boot, cwd, projectId: projectIdOv
     const isAgentTerm = () => {
       const state = useKaisola.getState()
       return !!state.terminals.find((t) => t.id === id)?.singletonKey?.match(/^(agent|wt):/)
-        || /^(claude|codex)\b/.test(state.terminalMeta[id]?.fgProcess ?? '')
+        || !!terminalCliProfileForProcess(state.terminalMeta[id]?.fgProcess)
     }
     const flushDraft = () => useKaisola.getState().setTermDraft(id, draftBufRef.current)
     const trackDraft = (data: string) => {
@@ -734,6 +740,7 @@ export function Terminal({ id, attach = false, boot, cwd, projectId: projectIdOv
             // non-claude agents). Hook marks win when both fire (see flag).
             const submitted = draftBufRef.current.trim()
             if (submitted.length >= 3) {
+              useKaisola.getState().autoNameTerminal(id, submitted, projectId)
               pinTypedPromptMark(submitted)
               beginAgentTurn()
             }

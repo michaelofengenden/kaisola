@@ -1,3 +1,5 @@
+import { isTransientTerminalCliKey, terminalCliProfileForProcess, terminalCliSingletonKey } from './terminalAgent.ts'
+
 interface TerminalMetaPatch {
   fgProcess?: string | null
 }
@@ -18,19 +20,20 @@ export function terminalsAfterMeta<T extends TerminalRow>(terminals: T[], id: st
   const fg = String(patch.fgProcess || '')
   const isLogin = /\/login\b/.test(terminal?.boot ?? '')
   const replace = (next: Partial<T>) => terminals.map((entry) => entry.id === id ? { ...entry, ...next } : entry)
-  if (terminal && !terminal.singletonKey && !isLogin && /^claude\b/.test(fg)) {
-    return replace({ singletonKey: `agent:claude-cli-${id}`, restart: true, boot: 'claude --continue', name: terminal.name ?? 'Claude' } as Partial<T>)
+  const profile = terminalCliProfileForProcess(fg)
+  if (terminal && !terminal.singletonKey && !isLogin && profile) {
+    return replace({
+      singletonKey: terminalCliSingletonKey(profile, id),
+      restart: profile.resume ? true : undefined,
+      boot: profile.resume,
+      name: terminal.name ?? profile.name,
+    } as Partial<T>)
   }
-  if (terminal?.singletonKey?.startsWith('agent:claude-cli-') && /^-?(zsh|bash|fish|sh)$/.test(fg)) {
-    return replace({ singletonKey: undefined, restart: undefined, boot: undefined } as Partial<T>)
-  }
-  if (terminal && !terminal.singletonKey && !isLogin && /^codex\b/.test(fg)) {
-    return replace({ singletonKey: `agent:codex-cli-${id}`, restart: true, boot: 'codex resume --last', name: terminal.name ?? 'Codex' } as Partial<T>)
-  }
-  if (terminal?.singletonKey?.startsWith('agent:codex') && /^codex\b/.test(fg) && (!terminal.restart || !/^codex resume\b/.test(terminal.boot ?? ''))) {
+  const promotedCodex = terminal?.singletonKey?.startsWith('agent:codex')
+  if (terminal && promotedCodex && /^codex\b/.test(fg) && (!terminal.restart || !/^codex resume\b/.test(terminal.boot ?? ''))) {
     return replace({ restart: true, boot: 'codex resume --last' } as Partial<T>)
   }
-  if (terminal?.singletonKey?.startsWith('agent:codex-cli-') && /^-?(zsh|bash|fish|sh)$/.test(fg)) {
+  if (isTransientTerminalCliKey(terminal?.singletonKey) && /^-?(zsh|bash|fish|sh)$/.test(fg)) {
     return replace({ singletonKey: undefined, restart: undefined, boot: undefined } as Partial<T>)
   }
   return terminals

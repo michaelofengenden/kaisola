@@ -425,6 +425,7 @@ function KaisolaApp() {
       if (mirror.meta) state.setTerminalMeta(mirror.termId, mirror.meta)
       if (Object.prototype.hasOwnProperty.call(mirror, 'draft')) state.setTermDraft(mirror.termId, mirror.draft ?? '')
       if (typeof mirror.resume === 'string') state.setTerminalResume(mirror.termId, mirror.resume)
+      if (typeof mirror.promptTitle === 'string') state.autoNameTerminal(mirror.termId, mirror.promptTitle, mirror.projectId)
     }
     const acceptClosedPop = (closed: PopClosedTerminalState) => {
       if (!closed || typeof closed.termId !== 'string' || typeof closed.projectId !== 'string' || !Number.isSafeInteger(closed.revision)) return

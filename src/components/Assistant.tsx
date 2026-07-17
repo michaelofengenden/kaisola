@@ -776,6 +776,8 @@ export const Assistant = memo(function Assistant({ threadId }: { threadId: strin
   const workspacePath = useKaisola((s) => s.workspacePath)
   const claudeAccounts = useKaisola((s) => s.claudeAccounts)
   const claudeAccountId = useKaisola((s) => s.claudeAccountId)
+  const codexAccounts = useKaisola((s) => s.codexAccounts)
+  const codexAccountId = useKaisola((s) => s.codexAccountId)
   const project = useKaisola((s) => s.project)
   const projectId = useKaisola((s) => s.activeProjectId)
   const focusedThreadId = useKaisola((s) => s.activeThreadId)
@@ -853,6 +855,7 @@ export const Assistant = memo(function Assistant({ threadId }: { threadId: strin
   const removeQueuedAssistantPrompt = useKaisola((s) => s.removeQueuedAssistantPrompt)
   const agentKey = active.agentKey
   const claudeConfigDir = claudeAccounts.find((account) => account.id === claudeAccountId)?.configDir ?? null
+  const codexHome = codexAccounts.find((account) => account.id === codexAccountId)?.codexHome ?? null
   // Provider sessions are per assistant thread, not merely per provider. Two
   // Codex cards in one project therefore retain independent contexts and
   // resume ids when hidden adapters park to disk.
@@ -1463,7 +1466,17 @@ export const Assistant = memo(function Assistant({ threadId }: { threadId: strin
     const res = await bridge.acp.connect(
       custom
         ? { presetId: key, clientKey: `${key}::${active.id}`, name: custom.name, command: custom.command, args: custom.args, autonomy, cwd, resumeSessionId, claudeEffort: effort, forceReconnect: opts.forceReconnect }
-        : { presetId: key, clientKey: `${key}::${active.id}`, autonomy, cwd, resumeSessionId, claudeEffort: effort, forceReconnect: opts.forceReconnect, ...(key === 'claude-code' ? { claudeConfigDir } : {}) },
+        : {
+            presetId: key,
+            clientKey: `${key}::${active.id}`,
+            autonomy,
+            cwd,
+            resumeSessionId,
+            claudeEffort: effort,
+            forceReconnect: opts.forceReconnect,
+            ...(key === 'claude-code' ? { claudeConfigDir } : {}),
+            ...(key === 'codex' ? { codexHome } : {}),
+          },
     )
     if (res.ok) {
       setNotice(null); refresh()
@@ -1495,7 +1508,7 @@ export const Assistant = memo(function Assistant({ threadId }: { threadId: strin
     }
     else setNotice(res.message ?? 'Could not connect.')
     return res.ok
-  }, [active.acpSessionId, active.agentKey, active.claudeEffort, active.codexEffort, active.id, active.permissionMode, autonomy, claudeConfigDir, openTerminalPreset, pickWorkspace, presets, projectId, refresh, sessionCwd])
+  }, [active.acpSessionId, active.agentKey, active.claudeEffort, active.codexEffort, active.id, active.permissionMode, autonomy, claudeConfigDir, codexHome, openTerminalPreset, pickWorkspace, presets, projectId, refresh, sessionCwd])
   const ensureAgentConnected = async (): Promise<boolean> => {
     // Main may have parked this idle adapter to reclaim its CLI/Node memory
     // while the transcript stayed mounted. A cheap status probe distinguishes

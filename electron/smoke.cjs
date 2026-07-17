@@ -2238,9 +2238,17 @@ a^2 + b^2 = c^2
     await new Promise((r) => setTimeout(r, 120))
     const term = get().terminals[get().terminals.length - 1]
     const termNamed = !!term.autoName && term.autoName.startsWith('Echo train-model-v2')
+    get().requestTerminal(undefined, { name: 'Codex', singletonKey: 'agent:codex::smoke-title' })
+    const agentTerm = get().terminals[get().terminals.length - 1]
+    get().autoNameTerminal(agentTerm.id, 'fix the flaky parser tests without touching snapshots')
+    get().autoNameTerminal(agentTerm.id, 'this later prompt must not replace the topic')
+    const promptTitle = agentTerm.id && get().terminals.find((t) => t.id === agentTerm.id)?.promptTitle === 'Fix the flaky parser'
+    get().renameTerminal(agentTerm.id, 'Parser manual')
+    const terminalManualWins = get().terminals.find((t) => t.id === agentTerm.id)?.name === 'Parser manual' && !get().terminals.find((t) => t.id === agentTerm.id)?.promptTitle
     get().closeAssistantThread(tid)
     get().closeTerminal(term.id)
-    return { named, rowShows, sticky, manualWins, termNamed }
+    get().closeTerminal(agentTerm.id)
+    return { named, rowShows, sticky, manualWins, termNamed, promptTitle, terminalManualWins }
   })()`)
   console.log('AUTONAME=' + JSON.stringify(autoname))
 
@@ -2257,6 +2265,8 @@ a^2 + b^2 = c^2
       filesOnRight: !!document.querySelector('.app-body > .wsrail[data-side="right"]'),
       hasPlus: !!document.querySelector('.stabs .drop-btn'),
       hasFiles: !!document.querySelector('.wsrail-files'),
+      hasUsage: !!document.querySelector('button[aria-label="Open usage"]'),
+      hasTheme: !!document.querySelector('button[aria-label="Toggle color theme"]'),
     }
   })()`)
   console.log('MINIMAL_UI=' + JSON.stringify(minimalUi))
@@ -3961,8 +3971,8 @@ a^2 + b^2 = c^2
     !windetach.spawned || !windetach.adopted || !windetach.termsMoved || !windetach.globalsMoved || !windetach.styleApplied || !windetach.draftMoved || !windetach.srcDropped ||
     !windetach.recombined || !windetach.insertedAtDrop || !windetach.termsSame || !windetach.pidsSame || !windetach.sourceClosed || !windetach.targetReused || !windetach.windowCountRestored ||
     !toggle.hasFig || !toggle.visibleAtRest || !toggle.putAway || !toggle.back || !toggle.hidesAll ||
-    !autoname.named || !autoname.rowShows || !autoname.sticky || !autoname.manualWins || !autoname.termNamed ||
-    !minimalUi.noSidebar || !minimalUi.noSidebarResize || !minimalUi.noStageNav || !minimalUi.hasSessionSidebar || !minimalUi.hasRail || !minimalUi.filesOnRight || !minimalUi.hasPlus || !minimalUi.hasFiles ||
+    !autoname.named || !autoname.rowShows || !autoname.sticky || !autoname.manualWins || !autoname.termNamed || !autoname.promptTitle || !autoname.terminalManualWins ||
+    !minimalUi.noSidebar || !minimalUi.noSidebarResize || !minimalUi.noStageNav || !minimalUi.hasSessionSidebar || !minimalUi.hasRail || !minimalUi.filesOnRight || !minimalUi.hasPlus || !minimalUi.hasFiles || !minimalUi.hasUsage || !minimalUi.hasTheme ||
     !tabLayouts.rendered || !tabLayouts.sidebarOk || !tabLayouts.shelfOk || !tabLayouts.bareOk || !tabLayouts.runwayOk || !tabLayouts.flatOk || !tabLayouts.compactOk || !tabLayouts.reciprocalToggle || !tabLayouts.verticalAddFlow || !tabLayouts.stateKept || !tabLayouts.staticPaint || !tabLayouts.accessible || !tabLayouts.sessionIdentity ||
     !intuitiveLayoutControls.permanentTopControls || !intuitiveLayoutControls.fileTreeIconOnly || !intuitiveLayoutControls.noLocalClose || !intuitiveLayoutControls.hidden || !intuitiveLayoutControls.topRestore || !intuitiveLayoutControls.restored || !intuitiveLayoutControls.noFooterRecovery || !intuitiveLayoutControls.noStandaloneLayout || !intuitiveLayoutControls.settingsOwned || !intuitiveLayoutControls.advancedStylesDisclosed || !intuitiveLayoutControls.opensRequestedGeneral || !intuitiveLayoutControls.footerReopensLast || !intuitiveLayoutControls.remembersInterface || !intuitiveLayoutControls.workspaceReversible || !intuitiveLayoutControls.panelsReversible || !intuitiveLayoutControls.placementReversible || !intuitiveLayoutControls.footerFollowsNavigation || !intuitiveLayoutControls.rareActionsInPalette || !intuitiveLayoutControls.previewPermanent ||
     !realPointerLayout.firstWorked || !realPointerLayout.reverseWorked || !realPointerLayout.stayedInteractive ||

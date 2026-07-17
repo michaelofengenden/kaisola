@@ -142,6 +142,108 @@ function ClaudeAccountsBlock() {
   )
 }
 
+/** Codex mirrors Claude's account isolation with CODEX_HOME. The selection is
+ * project-scoped and is shared by ACP, terminal launches, login, and usage. */
+function CodexAccountsBlock() {
+  const accounts = useKaisola((s) => s.codexAccounts)
+  const accountId = useKaisola((s) => s.codexAccountId)
+  const setAccountId = useKaisola((s) => s.setCodexAccountId)
+  const addAccount = useKaisola((s) => s.addCodexAccount)
+  const removeAccount = useKaisola((s) => s.removeCodexAccount)
+  const requestTerminal = useKaisola((s) => s.requestTerminal)
+  const workspacePath = useKaisola((s) => s.workspacePath)
+  const projectId = useKaisola((s) => s.activeProjectId)
+  const pushToast = useKaisola((s) => s.pushToast)
+  const [label, setLabel] = useState('')
+  const slug = label.trim().toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '')
+  const newHome = slug ? `~/.codex-${slug}` : ''
+  const shellPrefix = (codexHome?: string) => codexHome ? `CODEX_HOME=${shellConfigDir(codexHome)} ` : ''
+  const signIn = (profile?: { label: string; codexHome: string }) => {
+    const prefix = shellPrefix(profile?.codexHome)
+    const mkdir = profile ? `mkdir -p ${shellConfigDir(profile.codexHome)} && ` : ''
+    requestTerminal(`${mkdir}${prefix}codex login`, {
+      cwd: workspacePath ?? undefined,
+      name: profile ? `Codex login · ${profile.label}` : 'Codex login',
+    })
+  }
+  const openCli = (profile?: { id: string; label: string; codexHome: string }) => {
+    requestTerminal(`${shellPrefix(profile?.codexHome)}codex`, {
+      cwd: workspacePath ?? undefined,
+      name: profile ? `Codex · ${profile.label}` : 'Codex',
+      singletonKey: `agent:codex::profile:${profile?.id || 'default'}:${projectId}`,
+      restart: true,
+    })
+  }
+  const bindProject = (id: string) => {
+    setAccountId(id)
+    const state = useKaisola.getState()
+    for (const thread of state.assistantThreads.filter((candidate) => candidate.agentKey === 'codex')) {
+      void bridge.acp.disconnect(`codex::${thread.id}`, projectId).catch(() => {})
+    }
+    const name = id ? accounts.find((account) => account.id === id)?.label ?? 'account' : 'the default account'
+    pushToast('info', `Codex will reconnect under ${name}. Existing transcripts stay with their sessions.`)
+  }
+  const row = (profile: { id: string; label: string; codexHome: string; removable: boolean }) => (
+    <div key={profile.id || 'default'} style={{ display: 'flex', alignItems: 'center', gap: 8, minWidth: 0 }}>
+      <Icon name="UserRound" size={12} />
+      <span style={{ fontWeight: 500 }}>{profile.label}</span>
+      <span className="faint truncate" title={profile.codexHome}>{profile.codexHome}</span>
+      <span className="grow" />
+      <button type="button" className="btn btn-ghost btn-sm" onClick={() => signIn(profile.removable ? profile : undefined)}>Sign in</button>
+      <button type="button" className="btn btn-ghost btn-sm" onClick={() => openCli(profile.removable ? profile : undefined)}><Icon name="SquareTerminal" size={11} /> CLI</button>
+      {profile.removable && (
+        <button type="button" className="btn-icon btn-sm" onClick={() => removeAccount(profile.id)} title="Remove account (keeps its files on disk)" aria-label={`Remove ${profile.label} account`}>
+          <Icon name="X" size={13} />
+        </button>
+      )}
+    </div>
+  )
+  return (
+    <>
+      <div className="settings-row">
+        <span className="settings-row-label">Codex accounts</span>
+        <div className="settings-row-control" style={{ display: 'flex', flexDirection: 'column', alignItems: 'stretch', gap: 6, minWidth: 0 }}>
+          {row({ id: '', label: 'Default', codexHome: '~/.codex', removable: false })}
+          {accounts.map((account) => row({ ...account, removable: true }))}
+          <div style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
+            <input
+              className="input"
+              aria-label="New Codex account label"
+              value={label}
+              onChange={(event) => setLabel(event.target.value)}
+              placeholder="Add account — label (e.g. Work)"
+              spellCheck={false}
+              onKeyDown={(event) => { if (event.key === 'Enter' && newHome) { addAccount(label, newHome); setLabel('') } }}
+            />
+            <button type="button" className="btn btn-primary btn-sm" disabled={!newHome} onClick={() => { addAccount(label, newHome); setLabel('') }} title={newHome ? `Creates an isolated ${newHome}` : 'Give the account a label first'}>
+              <Icon name="Plus" size={12} /> Add
+            </button>
+          </div>
+        </div>
+      </div>
+      <div className="settings-row">
+        <span className="settings-row-label">This project uses</span>
+        <div className="settings-row-control">
+          <Dropdown
+            ariaLabel="Codex account for this project"
+            value={accountId}
+            options={[
+              { value: '', name: 'Default account', description: '~/.codex' },
+              ...accounts.map((account) => ({ value: account.id, name: account.label, description: account.codexHome })),
+            ]}
+            onSelect={bindProject}
+            align="right"
+            title="Which Codex subscription this project's sessions run under"
+          />
+        </div>
+      </div>
+      <p className="settings-note">
+        Each profile is an isolated CODEX_HOME. Pick one per project; ACP chats, CLI login, terminal sessions, and the Usage panel use that same account.
+      </p>
+    </>
+  )
+}
+
 /** A small information architecture keeps the rail scannable as capabilities
  * grow; on narrow windows the same entries become one horizontal category bar. */
 const SECTIONS = [
@@ -533,12 +635,22 @@ export function Settings() {
     const overflow = [
       ...(a.installCmd ? [{ value: 'install', name: 'Install CLI', description: a.installCmd }] : []),
       ...(a.login || a.deviceLogin ? [{ value: 'signin', name: 'Sign in', description: a.deviceLogin ? 'Device-code login' : a.login }] : []),
+      ...(a.kind === 'acp' && a.terminalCommand ? [{ value: 'cli', name: 'Open CLI', description: a.terminalCommand }] : []),
       ...(a.docs ? [{ value: 'docs', name: 'Docs' }] : []),
       { value: 'remove', name: a.custom ? 'Remove agent' : 'Remove from + menu', description: on ? 'Existing chat sessions stay open' : undefined },
     ]
     const onOverflow = (value: string) => {
       if (value === 'install') runInTerminal(a.installCmd, `${a.name} Install`)
       else if (value === 'signin') signIn(a)
+      else if (value === 'cli' && a.terminalCommand) {
+        requestTerminal(a.terminalCommand, {
+          cwd: workspacePath ?? undefined,
+          name: `${a.name} CLI`,
+          singletonKey: `agent:${a.id}::cli:launcher:${Date.now().toString(36)}`,
+          restart: true,
+        })
+        setOpen(false)
+      }
       else if (value === 'docs') void bridge.openExternal(a.docs!)
       else if (value === 'remove') {
         if (a.custom) removeCustomAgent(a.id)
@@ -822,7 +934,7 @@ export function Settings() {
                     <Dropdown
                       ariaLabel="Terminal font size"
                       value={String(termFontSize)}
-                      options={[10, 11, 12, 13, 14, 15, 16].map((n) => ({ value: String(n), name: `${n} px` }))}
+                      options={[8, 9, 10, 11, 12, 13, 14, 15, 16].map((n) => ({ value: String(n), name: `${n} px` }))}
                       onSelect={(v) => setTermFontSize(Number(v))}
                       align="right"
                       title="Size — ⌘+ / ⌘− anywhere"
@@ -984,6 +1096,8 @@ export function Settings() {
                     <p className="settings-note">Runs this command on your machine with your login — only add agents you trust.</p>
                   </>
                 )}
+                <CodexAccountsBlock />
+                <div className="hr" />
                 <ClaudeAccountsBlock />
                 <div className="hr" />
                 <div className="settings-row">

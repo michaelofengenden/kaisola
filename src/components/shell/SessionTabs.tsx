@@ -678,6 +678,16 @@ function NewSessionButton({ orientation }: { orientation: 'horizontal' | 'vertic
     if (value === 'registry') { setSettingsOpen(true, 'agents'); return }
     if (value.startsWith('tpl:')) { openSessionTemplate(value.slice(4)); return }
     if (value.startsWith('closed:')) { reopenClosedSession(value.slice('closed:'.length)); return }
+    if (value.startsWith('cli:')) {
+      const agent = menu.find((candidate) => candidate.id === value.slice('cli:'.length))
+      if (agent?.terminalCommand) requestTerminal(agent.terminalCommand, {
+        cwd: useKaisola.getState().workspacePath ?? undefined,
+        name: `${agent.name} CLI`,
+        singletonKey: `agent:${agent.id}::cli:launcher:${Date.now().toString(36)}`,
+        restart: true,
+      })
+      return
+    }
     const agent = menu.find((a) => a.id === value.slice('agent:'.length))
     if (agent) openAgentSession(agent)
   }
@@ -707,6 +717,11 @@ function NewSessionButton({ orientation }: { orientation: 'horizontal' | 'vertic
         ...(claude ? [{ value: `agent:${claude.id}`, name: claude.name }] : []),
         { value: 'group', name: 'Mesh', description: 'A coordinated agent group with explicit write gates' },
         ...otherAgents.map((a) => ({ value: `agent:${a.id}`, name: a.name })),
+        ...menu.filter((agent) => agent.kind === 'acp' && agent.terminalCommand).map((agent) => ({
+          value: `cli:${agent.id}`,
+          name: `${agent.name} CLI`,
+          description: 'Compact terminal renderer',
+        })),
         ...sessionTemplates.map((t) => ({ value: `tpl:${t.id}`, name: `▸ ${t.name}` })),
         { value: 'worktree', name: 'Agent in a worktree' },
         { value: 'git', name: 'Git commit' },

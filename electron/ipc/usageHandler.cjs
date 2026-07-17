@@ -9,6 +9,9 @@
 //   official 5h/7d fields when that experimental control changes or is offline;
 //   local JSONL token sums remain a secondary diagnostic only.
 //
+// • OpenCode — its local `stats` command supplies recent model activity. This
+//   is deliberately presented as a diagnostic, never as Kimi plan quota.
+//
 // Keep both paths non-blocking. In particular, transcript trees can be large;
 // synchronous reads here freeze Electron's main process and make every window
 // look hung while the Limits panel is open.
@@ -29,6 +32,8 @@ const CLAUDE_TREE_ENTRY_CAP = 20_000
 const CLAUDE_SDK_VERSION = '0.3.205'
 const CLAUDE_LIMIT_CACHE_MS = 5 * 60_000
 const CODEX_LIMIT_CACHE_MS = 60_000
+const OPENCODE_LIMIT_CACHE_MS = 5 * 60_000
+const OPENCODE_TIMEOUT_MS = 15_000
 const CLAUDE_LIMIT_TIMEOUT_MS = 15_000
 const CLAUDE_STATUS_READ_CAP = 768 * 1024
 
@@ -37,6 +42,7 @@ const CLAUDE_STATUS_READ_CAP = 768 * 1024
 // needless memory spike. Per-account cache entries retain the last good result.
 const claudeLimitCache = new Map()
 const codexLimitCache = new Map()
+let opencodeUsageCache = null
 const knownClaudeConfigs = new Map()
 let claudeReadQueue = Promise.resolve()
 let claudeRefreshTimer = null
@@ -457,6 +463,117 @@ async function codexSubscriptionUsage(codexHome, options = {}) {
   }
 }
 
+const stripAnsi = (value) => String(value || '')
+  .replace(/\x1b\][^\x07]*(?:\x07|\x1b\\)/g, '')
+  .replace(/\x1b\[[0-?]*[ -\/]*[@-~]/g, '')
+
+/** Parse the stable, human-facing `opencode stats` table. OpenCode exposes
+ * local tokens/cost here; it does not claim these are Kimi membership quota
+ * percentages, so the renderer labels them as an activity diagnostic. */
+function parseOpenCodeStats(stdout) {
+  const lines = stripAnsi(stdout).split(/\r?\n/).map((line) => line
+    .replace(/^[│┃]\s?/, '')
+    .replace(/\s?[│┃]$/, '')
+    .trim())
+  const value = (label) => {
+    const line = lines.find((candidate) => candidate.startsWith(label) && /\s{2,}/.test(candidate.slice(label.length)))
+    return line ? line.slice(label.length).trim() : undefined
+  }
+  const count = (label) => {
+    const raw = value(label)
+    if (!raw) return undefined
+    const parsed = Number(raw.replace(/,/g, ''))
+    return Number.isFinite(parsed) ? parsed : undefined
+  }
+  const modelStart = lines.findIndex((line) => line === 'MODEL USAGE')
+  const modelEnd = lines.findIndex((line, index) => index > modelStart && line === 'TOOL USAGE')
+  const modelLines = modelStart >= 0 ? lines.slice(modelStart + 1, modelEnd > modelStart ? modelEnd : undefined) : []
+  const models = []
+  let current = null
+  for (const line of modelLines) {
+    if (/^[\w.-]+\/[\w./-]+$/.test(line)) {
+      current = { model: line }
+      models.push(current)
+      continue
+    }
+    if (!current) continue
+    const match = line.match(/^(Messages|Input Tokens|Output Tokens|Cache Read|Cache Write|Cost)\s{2,}(.+)$/)
+    if (!match) continue
+    const key = ({ Messages: 'messages', 'Input Tokens': 'input', 'Output Tokens': 'output', 'Cache Read': 'cacheRead', 'Cache Write': 'cacheWrite', Cost: 'cost' })[match[1]]
+    current[key] = match[2].trim()
+  }
+  const sessions = count('Sessions')
+  const messages = count('Messages')
+  if (sessions == null && messages == null && !models.length) return { ok: false, message: 'OpenCode returned no readable usage statistics.' }
+  return {
+    ok: true,
+    sessions,
+    messages,
+    days: count('Days'),
+    cost: value('Total Cost'),
+    input: value('Input'),
+    output: value('Output'),
+    cacheRead: value('Cache Read'),
+    cacheWrite: value('Cache Write'),
+    models,
+    updatedAt: Date.now(),
+  }
+}
+
+function openCodeUsage(options = {}) {
+  if (!options.spawnImpl && (process.env.KAISOLA_SMOKE || process.env.PASOLA_SMOKE)) {
+    return Promise.resolve({ ok: false, message: 'OpenCode usage disabled during smoke tests.' })
+  }
+  return new Promise((resolve) => {
+    const spawnImpl = options.spawnImpl || spawn
+    let proc
+    let timer = null
+    let stdout = ''
+    let stderr = ''
+    let settled = false
+    const done = (result) => {
+      if (settled) return
+      settled = true
+      clearTimeout(timer)
+      try { proc?.kill() } catch { /* already exited */ }
+      resolve(result)
+    }
+    try {
+      proc = spawnImpl(options.command || 'opencode', ['stats', '--pure', '--days', '7', '--models', '12'], {
+        env: options.env || agentEnv(),
+        stdio: ['ignore', 'pipe', 'pipe'],
+      })
+    } catch (err) {
+      resolve({ ok: false, message: /ENOENT/.test(messageOf(err)) ? 'OpenCode CLI not found on PATH.' : messageOf(err) })
+      return
+    }
+    timer = setTimeout(() => done({ ok: false, message: 'OpenCode stats timed out.' }), options.timeoutMs || OPENCODE_TIMEOUT_MS)
+    timer.unref?.()
+    proc.stdout.on('data', (chunk) => { if (stdout.length < 256_000) stdout += chunk.toString() })
+    proc.stderr.on('data', (chunk) => { if (stderr.length < 8_000) stderr += chunk.toString() })
+    proc.on('error', (err) => done({ ok: false, message: /ENOENT/.test(messageOf(err)) ? 'OpenCode CLI not found on PATH.' : messageOf(err) }))
+    proc.on('close', (code) => done(code === 0 ? parseOpenCodeStats(stdout) : { ok: false, message: tail(stderr) || `OpenCode stats exited with code ${code}.` }))
+  })
+}
+
+async function openCodeActivityUsage(options = {}) {
+  const now = options.now || Date.now()
+  if (opencodeUsageCache?.inFlight) return opencodeUsageCache.inFlight
+  if (!options.force && opencodeUsageCache && now - opencodeUsageCache.refreshedAt < OPENCODE_LIMIT_CACHE_MS) return opencodeUsageCache.value
+  const reader = options.reader || openCodeUsage
+  const inFlight = Promise.resolve(reader(options.readerOptions || {}))
+  opencodeUsageCache = { ...opencodeUsageCache, inFlight }
+  try {
+    const value = await inFlight
+    opencodeUsageCache = { value, refreshedAt: now, inFlight: null }
+    return value
+  } catch (err) {
+    const value = { ok: false, message: messageOf(err) }
+    opencodeUsageCache = { value, refreshedAt: now, inFlight: null }
+    return value
+  }
+}
+
 const zeroTokens = () => ({ input: 0, output: 0, cacheRead: 0, cacheWrite: 0 })
 
 /** Recursively collect Claude's main + subagent JSONL transcripts. Newer
@@ -727,6 +844,7 @@ async function claudeSessionUsage(configDir, sessionId) {
 
 function registerUsageHandlers(ipcMain) {
   ipcMain.handle('usage:codex', async (_e, { codexHome, force } = {}) => codexSubscriptionUsage(codexHome, { force: force === true }))
+  ipcMain.handle('usage:opencode', async (_e, { force } = {}) => openCodeActivityUsage({ force: force === true }))
   ipcMain.handle('usage:claude', async (_e, { configDir, force, exactOnly } = {}) => {
     try { return await claudeSubscriptionUsage(configDir, { force: force === true, background: exactOnly === true }) } catch (err) { return { ok: false, message: messageOf(err) } }
   })
@@ -742,6 +860,9 @@ module.exports = {
   codexSubscriptionUsage,
   codexRateLimitSnapshot,
   normalizeCodexFailure,
+  openCodeUsage,
+  openCodeActivityUsage,
+  parseOpenCodeStats,
   claudeUsage,
   claudeSubscriptionUsage,
   claudeSessionUsage,
@@ -752,6 +873,7 @@ module.exports = {
   _clearClaudeUsageCacheForTests() {
     claudeLimitCache.clear()
     codexLimitCache.clear()
+    opencodeUsageCache = null
     knownClaudeConfigs.clear()
     claudeReadQueue = Promise.resolve()
   },

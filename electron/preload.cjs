@@ -176,6 +176,7 @@ const bridge = {
   // ── subscription limits (the top-bar gauge) ──
   usage: {
     codex: (codexHome, force = false) => ipcRenderer.invoke('usage:codex', { codexHome, force }),
+    opencode: (force = false) => ipcRenderer.invoke('usage:opencode', { force }),
     claude: (configDir, force = false, exactOnly = false) => ipcRenderer.invoke('usage:claude', { configDir, force, exactOnly }),
     claudeSession: (configDir, sessionId) => ipcRenderer.invoke('usage:claudeSession', { configDir, sessionId }),
   },

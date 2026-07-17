@@ -41,6 +41,7 @@ import { bridge, isDesktop, acpScope, type AcpPermissionRequest, type McpProposa
 import { folderHue } from '../lib/sessionHue'
 import { canPopOutTerminal } from '../lib/terminalPopPolicy'
 import { terminalsAfterMeta } from '../lib/terminalMetaPolicy'
+import { terminalPromptTitle } from '../lib/terminalAgent'
 import { projectTransferDataConflict, scopeProjectTransferGlobals } from '../lib/projectTransferPolicy'
 import { isRunningMeshPhase } from '../lib/meshPolicy'
 import type { IdeaMessage } from '../lib/ideaCycle'
@@ -419,6 +420,8 @@ export interface TerminalSession {
   name?: string
   /** Derived from the command being run; display fallback. */
   autoName?: string
+  /** Three-to-four-word topic derived once from the first submitted CLI prompt. */
+  promptTitle?: string
   /** One-shot receipt that the detached broker handed this exact live PTY to
    * a new app instance. Persisted until the user has actually seen it. */
   continued?: TerminalContinuationStatus
@@ -764,7 +767,7 @@ function provenanceKey(link: ProvenanceLink): string {
  * reset-on-switch ephemeral cursor (bucket F, rebuilt) — see `resetEphemeralCursors`.
  */
 export const PROJECT_SLICE_PERSIST_KEYS = [
-  'project', 'stage', 'layoutMode', 'workspacePath', 'autonomy', 'agentPreset', 'claudeAccountId', 'fileTabs', 'openFilePath',
+  'project', 'stage', 'layoutMode', 'workspacePath', 'autonomy', 'agentPreset', 'claudeAccountId', 'codexAccountId', 'fileTabs', 'openFilePath',
   'repoCheckpoints', 'followAgent', 'annotations', 'assistantThreads', 'assistantRuntimes',
   'assistantDrafts', 'assistantPromptQueues',
   'activeThreadId', 'terminals', 'panels', 'sessionGroups', 'pinnedSessions', 'sessionOrder', 'worktreeSessions',
@@ -806,6 +809,15 @@ export interface ClaudeAccount {
   email?: string
 }
 
+/** A named Codex subscription: an isolated CODEX_HOME. Projects bind to one
+ * profile, so ACP chats, terminal login, CLI sessions, and usage all agree. */
+export interface CodexAccount {
+  id: string
+  label: string
+  /** Absolute (or ~-prefixed) CODEX_HOME for this subscription. */
+  codexHome: string
+}
+
 /** Render a config dir for a shell line: `~/x` becomes "$HOME/x" (the CLI does
  * NOT expand a literal ~ arriving via an env var), anything else is
  * single-quoted verbatim. */
@@ -833,7 +845,7 @@ const GLOBAL_KEYS = [
   'termFontWeight', 'termCursorColor', 'termBackground', 'termLineHeight', 'customAgents', 'enabledAgents', 'sessionTemplates', 'claudeModel', 'reasoningProvider',
   'localBaseUrl', 'localModel', 'openaiBaseUrl', 'openaiModel', 'openAlexMailto', 'grobidEndpoint',
   'sandboxMode', 'workflows', 'automationsEnabled', 'perfMode', 'tabLayout', 'railWidth', 'sessionRailWidth', 'railOpen', 'claudeSessions',
-  'wordDiffs', 'showCosts', 'inbox', 'draftRestore', 'wallpaperTint', 'claudeAccounts',
+  'wordDiffs', 'showCosts', 'inbox', 'draftRestore', 'wallpaperTint', 'claudeAccounts', 'codexAccounts',
   'claudeTerminalModel', 'claudeFastMode', 'defaultAutonomy',
   'permissionRules', 'sensitiveGlobs', 'latexMain', 'unsavedBuffers', 'termDrafts', 'onboardingVersion',
 ] as const
@@ -1036,6 +1048,10 @@ interface KaisolaState {
    * + persisted: the Claude session in one project tab never runs under
    * another tab's subscription. */
   claudeAccountId: string
+  /** Named Codex subscriptions — each an isolated CODEX_HOME. */
+  codexAccounts: CodexAccount[]
+  /** This project's Codex profile id ('' = default ~/.codex). */
+  codexAccountId: string
   termFontSize: number
   /** Terminal typeface — a curated mono list in Settings (persisted). */
   termFontFamily: string
@@ -1160,6 +1176,9 @@ interface KaisolaState {
    * account — the auto-launch and Settings' "apply account now" both use it.
    * `expect` aborts if the active project/workspace moved during the probes. */
   launchClaude: (opts?: { reveal?: boolean; expect?: { pid: string; ws: string } }) => Promise<boolean>
+  setCodexAccountId: (id: string) => void
+  addCodexAccount: (label: string, codexHome: string) => void
+  removeCodexAccount: (id: string) => void
   setDockColWeights: (weights: number[] | null) => void
   setDockRowWeights: (weights: number[] | null) => void
   /** Minimize/restore the main view — when minimized the work row is all cards. */
@@ -1170,7 +1189,8 @@ interface KaisolaState {
   setTerminalContinuation: (id: string, status?: TerminalContinuationStatus, projectId?: string) => void
   closeTerminal: (id: string, projectId?: string) => void
   renameTerminal: (id: string, name?: string) => void
-  /** Auto-title a terminal from the command it's running (manual name wins). */
+  /** Set the first-prompt topic of a CLI terminal; subsequent prompts are ignored. */
+  autoNameTerminal: (id: string, text: string, projectId?: string) => void
   addAgentTerminal: (t: AgentTerminalSession) => void
   closeAgentTerminal: (terminalId: string, projectId?: string) => void
   setTerminalMeta: (id: string, patch: TerminalMeta) => void
@@ -1937,6 +1957,7 @@ const freshSlice = (pid: string, path: string | null = null): ProjectSliceMemory
     autonomy: 'propose',
     agentPreset: 'codex',
     claudeAccountId: '',
+    codexAccountId: '',
     fileTabs: [],
     openFilePath: null,
     repoCheckpoints: [],
@@ -2078,6 +2099,7 @@ function sanitizeSliceForPersist(slice: ProjectSliceMemory): ProjectSlicePersist
     id: t.id,
     name: t.name,
     autoName: t.autoName,
+    promptTitle: t.promptTitle,
     cwd: t.cwd,
     singletonKey: t.singletonKey,
     restart: t.restart,
@@ -2158,6 +2180,7 @@ function sanitizeSliceForPersist(slice: ProjectSliceMemory): ProjectSlicePersist
     autonomy: slice.autonomy,
     agentPreset: slice.agentPreset,
     claudeAccountId: slice.claudeAccountId,
+    codexAccountId: slice.codexAccountId,
     fileTabs: slice.fileTabs,
     openFilePath: slice.openFilePath,
     repoCheckpoints: slice.repoCheckpoints.slice(0, 40),
@@ -2213,7 +2236,7 @@ function sanitizeSliceForPersist(slice: ProjectSliceMemory): ProjectSlicePersist
         return {
           kind: c.kind,
           at: c.at,
-          term: { id: c.term.id, name: c.term.name, autoName: c.term.autoName, cwd: c.term.cwd, singletonKey: c.term.singletonKey, restart: c.term.restart, boot: c.term.restart ? c.term.boot : undefined },
+          term: { id: c.term.id, name: c.term.name, autoName: c.term.autoName, promptTitle: c.term.promptTitle, cwd: c.term.cwd, singletonKey: c.term.singletonKey, restart: c.term.restart, boot: c.term.restart ? c.term.boot : undefined },
         }
       }
       return c
@@ -2285,6 +2308,7 @@ function persistSnapshot(s: KaisolaState) {
     railOpen: s.railOpen,
     claudeSessions: s.claudeSessions,
     claudeAccounts: s.claudeAccounts,
+    codexAccounts: s.codexAccounts,
     claudeTerminalModel: s.claudeTerminalModel,
     claudeFastMode: s.claudeFastMode,
     defaultAutonomy: s.defaultAutonomy,
@@ -2396,6 +2420,7 @@ function migrateFlatV5(persisted: unknown): Partial<KaisolaState> {
         id: t.id,
         name: t.name,
         autoName: t.autoName,
+        promptTitle: t.promptTitle,
         cwd: t.cwd,
         singletonKey: t.singletonKey,
         restart: t.restart,
@@ -2571,7 +2596,9 @@ export const useKaisola = create<KaisolaState>()(
   claudeSessions: {},
   claudeAccounts: [],
   claudeAccountId: '',
-  termFontSize: 12,
+  codexAccounts: [],
+  codexAccountId: '',
+  termFontSize: 10,
   termFontFamily: 'JetBrains Mono',
   termFontWeight: 500,
   termCursorColor: 'auto',
@@ -2801,6 +2828,20 @@ export const useKaisola = create<KaisolaState>()(
     })),
   setClaudeAccountEmail: (id, email) =>
     set((s) => ({ claudeAccounts: s.claudeAccounts.map((a) => (a.id === id ? { ...a, email } : a)) })),
+  setCodexAccountId: (id) => set({ codexAccountId: id || '' }),
+  addCodexAccount: (label, codexHome) =>
+    set((s) => {
+      const lbl = label.trim() || 'Account'
+      const home = codexHome.trim()
+      if (!home || s.codexAccounts.some((account) => account.codexHome === home)) return s
+      const id = `cx-${Date.now().toString(36)}`
+      return { codexAccounts: [...s.codexAccounts, { id, label: lbl, codexHome: home }] }
+    }),
+  removeCodexAccount: (id) =>
+    set((s) => ({
+      codexAccounts: s.codexAccounts.filter((account) => account.id !== id),
+      codexAccountId: s.codexAccountId === id ? '' : s.codexAccountId,
+    })),
   launchClaude: async (opts) => {
     const st = get()
     const ws = st.workspacePath
@@ -2993,7 +3034,19 @@ export const useKaisola = create<KaisolaState>()(
     })
   },
   renameTerminal: (id, name) =>
-    set((s) => ({ terminals: s.terminals.map((t) => (t.id === id ? { ...t, name: name || undefined } : t)) })),
+    set((s) => ({ terminals: s.terminals.map((t) => (t.id === id ? { ...t, name: name || undefined, ...(name ? { promptTitle: undefined } : {}) } : t)) })),
+  autoNameTerminal: (id, text, projectId) => {
+    const topic = terminalPromptTitle(text)
+    if (!topic) return
+    if (id === POP_TERMINAL_ID) queuePopTerminalMirror({ promptTitle: topic })
+    const state = get()
+    const owner = projectId ?? terminalOwnerMap(state)[id] ?? state.activeProjectId
+    state.patchProject(owner, (slice) => ({
+      terminals: slice.terminals.map((terminal) =>
+        terminal.id === id && !terminal.promptTitle ? { ...terminal, promptTitle: topic } : terminal,
+      ),
+    }))
+  },
   // an agent-spawned terminal opens BESIDE what you're doing — its own card,
   // never stealing the one you're in
   addAgentTerminal: (t) =>
@@ -3030,6 +3083,11 @@ export const useKaisola = create<KaisolaState>()(
     if (id === POP_TERMINAL_ID) queuePopTerminalMirror({ resume: boot })
     set((s) => {
       const owner = terminalOwnerMap(s)[id]
+      const current = (owner && owner !== s.activeProjectId ? s.projectSlices[owner]?.terminals : s.terminals)?.find((terminal) => terminal.id === id)
+      // Preserve an isolated Codex profile when the generic session probe
+      // upgrades its initial launch into an exact resume command.
+      const profilePrefix = current?.boot?.match(/^(CODEX_HOME=(?:"[^"]*"|'[^']*'|\S+)\s+)/)?.[1] ?? ''
+      const nextBoot = profilePrefix && /^codex\s+resume\b/.test(boot) ? `${profilePrefix}${boot}` : boot
       if (owner && owner !== s.activeProjectId) {
         const slice = s.projectSlices[owner]
         if (!slice) return {}
@@ -3038,13 +3096,13 @@ export const useKaisola = create<KaisolaState>()(
             ...s.projectSlices,
             [owner]: {
               ...slice,
-              terminals: slice.terminals.map((terminal) => terminal.id === id ? { ...terminal, restart: true, boot } : terminal),
+              terminals: slice.terminals.map((terminal) => terminal.id === id ? { ...terminal, restart: true, boot: nextBoot } : terminal),
             },
           },
         }
       }
       return {
-        terminals: s.terminals.map((terminal) => terminal.id === id ? { ...terminal, restart: true, boot } : terminal),
+        terminals: s.terminals.map((terminal) => terminal.id === id ? { ...terminal, restart: true, boot: nextBoot } : terminal),
       }
     })
   },
@@ -4361,7 +4419,7 @@ export const useKaisola = create<KaisolaState>()(
     document.documentElement.dataset.tabLayout = value
     set({ tabLayout: value })
   },
-  setTermFontSize: (size) => set({ termFontSize: size == null ? 12 : Math.min(18, Math.max(9, Math.round(size))) }),
+  setTermFontSize: (size) => set({ termFontSize: size == null ? 10 : Math.min(18, Math.max(8, Math.round(size))) }),
   setTermFontFamily: (family) => set({ termFontFamily: family || 'JetBrains Mono' }),
   setTermFontWeight: (weight) => set({ termFontWeight: [400, 500, 700].includes(weight) ? weight : 500 }),
   setTermCursorColor: (color) =>
@@ -6111,7 +6169,9 @@ export const useKaisola = create<KaisolaState>()(
       // project tab and session/canvas visibility stays internally coherent.
       // v11: the former default bare row becomes the split-sidebar default;
       // explicitly selected shelf/runway/flat/compact layouts are preserved.
-      version: 11,
+      // v12: the terminal's former 12px default becomes the denser 10px card
+      // default. Deliberate non-default sizes stay untouched; 8–18 remains live.
+      version: 12,
       migrate: (persisted, version) => {
         const toV7 = (p: unknown) => {
           const rec = p as Record<string, unknown>
@@ -6154,12 +6214,18 @@ export const useKaisola = create<KaisolaState>()(
           }
           return p
         }
-        if (version >= 11) return persisted
-        if (version === 10) return toV11(persisted)
-        if (version === 9) return toV11(toV10(persisted))
-        if (version === 8) return toV11(toV10(toV9(persisted)))
-        if (version === 7) return toV11(toV10(toV9(toV8(persisted))))
-        if (version === 6) return toV11(toV10(toV9(toV8(toV7(persisted)))))
+        const toV12 = (p: unknown) => {
+          const rec = p as Record<string, unknown>
+          if (rec && typeof rec === 'object' && (rec.termFontSize == null || rec.termFontSize === 12)) rec.termFontSize = 10
+          return p
+        }
+        if (version >= 12) return persisted
+        if (version === 11) return toV12(persisted)
+        if (version === 10) return toV12(toV11(persisted))
+        if (version === 9) return toV12(toV11(toV10(persisted)))
+        if (version === 8) return toV12(toV11(toV10(toV9(persisted))))
+        if (version === 7) return toV12(toV11(toV10(toV9(toV8(persisted)))))
+        if (version === 6) return toV12(toV11(toV10(toV9(toV8(toV7(persisted))))))
         const flat = migrateFlatV5(persisted)
         const pid = uid('proj')
         const ws = flat.workspacePath ?? null
@@ -6172,7 +6238,7 @@ export const useKaisola = create<KaisolaState>()(
           const v = (flat as Record<string, unknown>)[k]
           if (v !== undefined) (base as Record<string, unknown>)[k] = v
         }
-        return toV11(toV10(toV9(toV8(toV7({
+        return toV12(toV11(toV10(toV9(toV8(toV7({
           ...pickGlobals(flat as Record<string, unknown>),
           // pickGlobals no longer knows ecoMode — hand it to toV7 explicitly
           ecoMode: (flat as Record<string, unknown>).ecoMode,
@@ -6180,7 +6246,7 @@ export const useKaisola = create<KaisolaState>()(
           activeProjectId: pid,
           projectSlices: { [pid]: sanitizeSliceForPersist(base) },
           recentProjects: ws ? [{ path: ws, name, at: Date.now() }] : [],
-        })))))
+        }))))))
       },
       // split the persisted blob back apart SYNCHRONOUSLY (getItem is sync → no
       // rehydration flash). Spread `current` FIRST so action fns are never

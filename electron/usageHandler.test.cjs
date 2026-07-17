@@ -12,6 +12,7 @@ const {
   codexSubscriptionUsage,
   codexRateLimitSnapshot,
   normalizeCodexFailure,
+  parseOpenCodeStats,
   claudeUsage,
   claudeSessionUsage,
   claudeSubscriptionUsage,
@@ -21,6 +22,35 @@ const {
   _clearClaudeUsageCacheForTests,
 } = require('./ipc/usageHandler.cjs')
 const { _buildSettingsForTests, _hasCustomStatusLineForTests } = require('./ipc/claudeHooksHandler.cjs')
+
+test('OpenCode stats parser reports local Kimi activity without inventing quota percentages', () => {
+  const result = parseOpenCodeStats(`
+│Sessions                                            137 │
+│Messages                                            149 │
+│Days                                                  7 │
+│Total Cost                                        $0.00 │
+│Input                                            616.6K │
+│Output                                            38.6K │
+│Cache Read                                        12.4M │
+│Cache Write                                           0 │
+│                      MODEL USAGE                       │
+│ kimi-for-coding/k3                                     │
+│  Messages                                          142 │
+│  Input Tokens                                   616.6K │
+│  Output Tokens                                   38.6K │
+│  Cache Read                                      12.4M │
+│  Cache Write                                         0 │
+│  Cost                                          $0.0000 │
+│                      TOOL USAGE                        │
+`)
+  assert.equal(result.ok, true)
+  assert.equal(result.sessions, 137)
+  assert.equal(result.messages, 149)
+  assert.equal(result.cacheRead, '12.4M')
+  assert.equal(result.models[0].model, 'kimi-for-coding/k3')
+  assert.equal(result.models[0].messages, '142')
+  assert.equal('usedPercent' in result, false)
+})
 
 function mockCodexSpawn(responses, capture = {}) {
   return (command, args, options) => {

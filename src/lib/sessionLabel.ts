@@ -27,9 +27,10 @@ export function terminalLabel(
 ): string {
   const agentKey = terminalAgentKey(t.singletonKey)
   const folder = opts?.meta?.repo ?? (opts?.meta?.cwd ?? t.cwd)?.split('/').filter(Boolean).pop()
+  const agent = t.name ?? (agentKey ? agentName(opts?.agents ?? [], agentKey) ?? agentKey : undefined)
+  if (agent && agentKey && t.promptTitle) return `${agent} · ${t.promptTitle}`
   return (
-    t.name ??
-    (agentKey ? agentName(opts?.agents ?? [], agentKey) ?? agentKey : undefined) ??
+    agent ??
     t.autoName ??
     folder ??
     ((opts?.count ?? 1) > 1 ? `Terminal ${(opts?.index ?? 0) + 1}` : 'Terminal')

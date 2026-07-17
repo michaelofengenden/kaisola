@@ -2,4 +2,4 @@
 
   
 
-\- sometimes when I copy paste a bunch of text with spaces from some output it copies and pastes it into the Command CLI agent terminal on kaisola as a bunch of messages instead of qu
+\- sometimes when I copy paste a bunch of text with spaces from some output it copies and pastes it into the Command CLI agent terminal on kaisola as a bunch of messages instead of a single message and then it ends up queing

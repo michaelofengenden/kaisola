@@ -41,13 +41,22 @@ function noticeKind(payload) {
   return 'completed'
 }
 
-function registerAttentionHandlers(ipcMain, { app, BrowserWindow, Notification, service = null }) {
+function scopedActiveCount(service, projectSets) {
+  const projects = new Set()
+  for (const ids of projectSets.values()) for (const id of ids) projects.add(id)
+  if (service?.activeCount) return boundedCount(service.activeCount(projects))
+  if (!service?.activeEvents) return service?.stats ? boundedCount(service.stats().active) : 0
+  return service.activeEvents().reduce((count, event) => count + Number(projects.has(event.projectId)), 0)
+}
+
+function registerAttentionHandlers(ipcMain, { app, BrowserWindow, Notification, service = null, platform = process.platform }) {
   const surfaceOwners = new Map()
+  const surfaceProjects = new Map()
   const surfaceRenderers = new Set()
   const syncBadge = () => {
-    if (process.platform !== 'darwin' || !app.dock?.setBadge) return
-    const total = service?.stats
-      ? service.stats().active
+    if (platform !== 'darwin' || !app.dock?.setBadge) return
+    const total = service
+      ? scopedActiveCount(service, surfaceProjects)
       : [...attentionByRenderer.values()].reduce((sum, count) => sum + count, 0)
     app.dock.setBadge(total > 0 ? String(Math.min(999, total)) : '')
   }
@@ -95,7 +104,7 @@ function registerAttentionHandlers(ipcMain, { app, BrowserWindow, Notification, 
       })
     })
     notice.show()
-    if (!BrowserWindow.getFocusedWindow() && process.platform === 'darwin' && app.dock?.bounce) {
+    if (!BrowserWindow.getFocusedWindow() && platform === 'darwin' && app.dock?.bounce) {
       app.dock.bounce('informational')
     }
   }
@@ -134,16 +143,24 @@ function registerAttentionHandlers(ipcMain, { app, BrowserWindow, Notification, 
         visibleSessionIds: raw.visibleSessionIds,
         projects: raw.projects,
       })
+      const projects = new Set()
+      if (exactId(raw.projectId, 240)) projects.add(raw.projectId)
+      for (const item of Array.isArray(raw.projects) ? raw.projects.slice(0, 64) : []) {
+        if (exactId(item?.projectId, 240)) projects.add(item.projectId)
+      }
+      surfaceProjects.set(windowId, projects)
+      syncBadge()
     } catch { /* malformed renderer projection is ignored */ }
     if (!surfaceRenderers.has(event.sender.id)) {
       surfaceRenderers.add(event.sender.id)
       event.sender.once('destroyed', () => {
         surfaceRenderers.delete(event.sender.id)
-        forget(event.sender)
         if (surfaceOwners.get(windowId) === event.sender.id) {
           surfaceOwners.delete(windowId)
+          surfaceProjects.delete(windowId)
           service.removeSurface(windowId)
         }
+        forget(event.sender)
       })
     }
   })
@@ -172,6 +189,9 @@ function registerAttentionHandlers(ipcMain, { app, BrowserWindow, Notification, 
     const payload = safeNotice(raw)
     if (!payload || event.sender.isDestroyed()) return
     if (service && payload.projectId) {
+      // ACP permission requests already enter through handleAcpEvent with the
+      // authoritative permId. A renderer echo must never create a second source.
+      if (payload.kind === 'permission') return
       const owner = BrowserWindow.fromWebContents(event.sender)
       const now = Date.now()
       try {
@@ -212,7 +232,7 @@ function registerAttentionHandlers(ipcMain, { app, BrowserWindow, Notification, 
       })
     })
     notice.show()
-    if (!BrowserWindow.getFocusedWindow() && process.platform === 'darwin' && app.dock?.bounce) {
+    if (!BrowserWindow.getFocusedWindow() && platform === 'darwin' && app.dock?.bounce) {
       app.dock.bounce('informational')
     }
   })
@@ -220,4 +240,4 @@ function registerAttentionHandlers(ipcMain, { app, BrowserWindow, Notification, 
   return () => unsubscribe?.()
 }
 
-module.exports = { boundedCount, exactId, noticeKind, safeNotice, registerAttentionHandlers }
+module.exports = { boundedCount, exactId, noticeKind, safeNotice, scopedActiveCount, registerAttentionHandlers }

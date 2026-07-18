@@ -28,7 +28,7 @@ function safeLimit(value, label) {
   return value
 }
 
-function cloneJson(value, label) {
+function encodeJson(value, label) {
   let encoded
   try {
     encoded = JSON.stringify(value)
@@ -36,7 +36,7 @@ function cloneJson(value, label) {
     fail('invalid_event', `${label} must be JSON serializable`)
   }
   if (encoded === undefined) fail('invalid_event', `${label} must be JSON serializable`)
-  return { value: JSON.parse(encoded), encoded }
+  return encoded
 }
 
 function safeId(value, label) {
@@ -70,16 +70,25 @@ class CompanionEventLog {
 
     const seq = this.currentSeq + 1
     const eventId = id == null ? `event-${seq}` : safeId(id, 'id')
-    const cleanPayload = cloneJson(payload, 'payload').value
-    const event = { epoch: this.epoch, seq, id: eventId, at, type, payload: cleanPayload }
-    const bytes = Buffer.byteLength(JSON.stringify(event), 'utf8')
+    const encoded = encodeJson({ epoch: this.epoch, seq, id: eventId, at, type, payload }, 'event')
+    const bytes = Buffer.byteLength(encoded, 'utf8')
     if (bytes > this.maxBytes) fail('event_too_large', 'event exceeds the replay byte limit')
 
     this.currentSeq = seq
-    this.events.push({ event, bytes })
+    this.events.push({ seq, encoded, bytes })
     this.totalBytes += bytes
     this.#trimToLimits()
-    return cloneJson(event, 'event').value
+    return JSON.parse(encoded)
+  }
+
+  /** Advance the durable cursor without retaining or serializing a payload.
+   * The next client behind this boundary receives a coherent snapshot. */
+  invalidate() {
+    this.currentSeq++
+    this.droppedThrough = this.currentSeq
+    this.events = []
+    this.totalBytes = 0
+    return this.currentSeq
   }
 
   replay({ epoch, afterSeq }) {
@@ -90,8 +99,8 @@ class CompanionEventLog {
     if (afterSeq < this.droppedThrough) return this.#snapshotRequired('event_gap')
 
     const events = this.events
-      .filter(({ event }) => event.seq > afterSeq)
-      .map(({ event }) => cloneJson(event, 'event').value)
+      .filter((event) => event.seq > afterSeq)
+      .map((event) => JSON.parse(event.encoded))
     return {
       kind: 'replay',
       epoch: this.epoch,
@@ -115,10 +124,10 @@ class CompanionEventLog {
     if (this.acknowledgements.size === 0) return 0
     const pruneThrough = Math.min(...this.acknowledgements.values())
     let pruned = 0
-    while (this.events.length > 0 && this.events[0].event.seq <= pruneThrough) {
+    while (this.events.length > 0 && this.events[0].seq <= pruneThrough) {
       const removed = this.events.shift()
       this.totalBytes -= removed.bytes
-      this.droppedThrough = Math.max(this.droppedThrough, removed.event.seq)
+      this.droppedThrough = Math.max(this.droppedThrough, removed.seq)
       pruned++
     }
     return pruned
@@ -134,7 +143,7 @@ class CompanionEventLog {
       epoch: this.epoch,
       currentSeq: this.currentSeq,
       droppedThrough: this.droppedThrough,
-      earliestSeq: this.events[0]?.event.seq ?? this.currentSeq + 1,
+      earliestSeq: this.events[0]?.seq ?? this.currentSeq + 1,
       retainedEvents: this.events.length,
       retainedBytes: this.totalBytes,
       activeClients: this.acknowledgements.size,
@@ -149,7 +158,7 @@ class CompanionEventLog {
       reason,
       epoch: this.epoch,
       currentSeq: this.currentSeq,
-      earliestSeq: this.events[0]?.event.seq ?? this.currentSeq + 1,
+      earliestSeq: this.events[0]?.seq ?? this.currentSeq + 1,
     }
   }
 
@@ -157,7 +166,7 @@ class CompanionEventLog {
     while (this.events.length > this.maxEvents || this.totalBytes > this.maxBytes) {
       const removed = this.events.shift()
       this.totalBytes -= removed.bytes
-      this.droppedThrough = Math.max(this.droppedThrough, removed.event.seq)
+      this.droppedThrough = Math.max(this.droppedThrough, removed.seq)
     }
   }
 }

@@ -78,6 +78,16 @@ test('epoch mismatch, cursor ahead, and pruned gaps request a replacement snapsh
   assert.deepEqual(restarted.replay({ epoch: 'desktop-epoch-new', afterSeq: 0 }).events, [])
 })
 
+test('an unretained event advances a snapshot boundary without serializing a payload', () => {
+  const events = log()
+  events.append({ type: 'desktop.status', payload: { connected: true }, at: 1 })
+  assert.equal(events.invalidate(), 2)
+  assert.equal(events.stats().retainedEvents, 0)
+  assert.equal(events.stats().droppedThrough, 2)
+  assert.equal(events.replay({ epoch: 'desktop-epoch-test', afterSeq: 1 }).reason, 'event_gap')
+  assert.deepEqual(events.replay({ epoch: 'desktop-epoch-test', afterSeq: 2 }).events, [])
+})
+
 test('payloads are copied, event types are allowlisted, and oversized events are rejected', () => {
   const events = log({ maxBytes: 200 })
   const payload = { state: 'online' }
@@ -105,4 +115,3 @@ test('a synthetic million-event stream remains strictly bounded', { timeout: 30_
   assert.ok(stats.retainedBytes <= 8 * 1024)
   assert.equal(stats.droppedThrough + stats.retainedEvents, stats.currentSeq)
 })
-

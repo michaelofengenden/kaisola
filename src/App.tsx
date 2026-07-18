@@ -670,15 +670,9 @@ function KaisolaApp() {
         // fall back to the agentKey→project heuristic
         const pid = req.scope || projectIdForEvent(st, { agentKey: req.key })
         const slice = st.projectSlices[pid]
-        const announce = () => {
-          if (pid === st.activeProjectId && !document.hidden && document.hasFocus()) return
-          const tab = st.projectTabs.find((project) => project.id === pid)
-          notifyAgent(`${req.agent} needs you`, tab ? projectLabel(tab) : req.title, pid, req.key.split('::')[1], {
-            sourceId: req.permId,
-            kind: 'permission',
-          })
-        }
-        if (pid === st.activeProjectId || !slice) { st.receivePermission(req); announce(); return }
+        // Main owns the canonical permission attention record and native notice
+        // for this permId. The renderer only maintains the inline card.
+        if (pid === st.activeProjectId || !slice) { st.receivePermission(req); return }
         if (requestIsSensitive(st.sensitiveGlobs, req)) {
           st.patchProject(
             pid,
@@ -688,7 +682,6 @@ function KaisolaApp() {
             }),
             'needs-you',
           )
-          announce()
           return
         }
         if (requestMatchesRules(st.permissionRules, slice.workspacePath, req)) {
@@ -703,7 +696,6 @@ function KaisolaApp() {
           }),
           'needs-you',
         )
-        announce()
       }),
       // main resolved a pending ask itself (5-min timeout, or the agent died
       // while it was pending) — drop the inline card the composer is still showing

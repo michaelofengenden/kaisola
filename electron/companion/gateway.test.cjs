@@ -19,6 +19,8 @@ function setup({
   attentionService,
   ledgerAdapter,
   deviceCapabilities = ['observe'],
+  enabledCapabilities = ['observe'],
+  logger,
 } = {}) {
   let now = 1_784_250_001_200
   const records = new Map()
@@ -40,6 +42,8 @@ function setup({
     acpSessionService,
     attentionService,
     ledgerAdapter,
+    enabledCapabilities,
+    logger,
     now: () => now,
   })
   const transport = new LoopbackCompanionTransport({ ...(queueBytes ? { maxQueueBytes: queueBytes } : {}) })
@@ -123,6 +127,24 @@ test('reconnect from an acknowledged cursor receives only the ordered live suffi
   assert.equal(reconnect.stats().lastSentSeq, 2)
 })
 
+test('a fully caught-up reconnect advances its sent cursor and never replays retained events twice', async () => {
+  const first = setup()
+  first.publish()
+  await first.transport.sendFromDevice(first.hello())
+  first.transport.receiveForDevice()
+  first.session.close('device_reconnect')
+
+  const reconnectTransport = new LoopbackCompanionTransport()
+  const reconnect = first.gateway.attach(reconnectTransport, { deviceId: 'device-michael-iphone', capabilities: ['observe'] })
+  await reconnectTransport.sendFromDevice(first.hello({ lastAck: 1 }))
+  assert.deepEqual(reconnectTransport.receiveForDevice().map(({ kind }) => kind), ['hello'])
+  assert.equal(reconnect.stats().lastSentSeq, 1)
+
+  assert.equal(reconnect.synchronize(), true)
+  assert.deepEqual(reconnectTransport.receiveForDevice(), [])
+  assert.equal(reconnect.stats().lastSentSeq, 1)
+})
+
 test('coherent snapshots merge authoritative ACP sessions, permissions, and ledger review state', async () => {
   const seenActors = []
   const acpSessionService = {
@@ -184,6 +206,131 @@ test('coherent snapshots merge authoritative ACP sessions, permissions, and ledg
     attention: false,
     ledger: true,
   })
+})
+
+test('ACP and ledger merge failures drop only offending entries and keep the connection usable', async () => {
+  const large = 'x'.repeat(16 * 1024)
+  const permission = (permId) => ({
+    type: 'agent.permission.requested',
+    permId,
+    revision: 1,
+    completeness: 'complete',
+    projectId: 'project-kaisola',
+    targetId: 'codex-space',
+    sessionId: 'session-space',
+    agent: '   ',
+    title: '\t ',
+    options: [{ optionId: 'allow', name: '   ' }],
+    diffs: Array.from({ length: 8 }, (_, index) => ({
+      path: `src/large-${index}.ts`,
+      oldText: large,
+      newText: large,
+    })),
+  })
+  const acpSessionService = {
+    sessionSummaries: () => [{
+      projectId: 'project-kaisola',
+      targetId: 'codex-space',
+      sessionId: 'session-space',
+      provider: '   ',
+      name: ' \n ',
+      busy: false,
+    }],
+    pendingPermissionEvents: () => [permission('perm-large-1'), permission('perm-large-2')],
+  }
+  const ledgerAdapter = {
+    listTasks: () => [{
+      id: 'task-whitespace',
+      projectId: 'project-kaisola',
+      status: 'review',
+      title: '   ',
+      updatedAt: 1_784_250_001_150,
+    }],
+  }
+  const diagnostics = []
+  const { desktopState, gateway, hello, publish, session, transport } = setup({
+    acpSessionService,
+    ledgerAdapter,
+    logger: { warn: (message) => diagnostics.push(message) },
+  })
+  publish()
+
+  await transport.sendFromDevice(hello())
+  const snapshot = transport.receiveForDevice().find((frame) => frame.kind === 'snapshot')
+  assert.ok(snapshot)
+  assert.equal(session.stats().closed, false)
+  assert.equal(snapshot.body.projection.sessions.find(({ id }) => id === 'session-space').title, 'Agent')
+  assert.deepEqual(snapshot.body.projection.permissions.map(({ permId }) => permId), ['perm-large-1'])
+  assert.equal(snapshot.body.projection.permissions[0].agent, 'Agent')
+  assert.equal(snapshot.body.projection.permissions[0].title, 'Agent action')
+  assert.equal(snapshot.body.projection.permissions[0].options[0].label, 'allow')
+  assert.equal(snapshot.body.projection.attention.find(({ id }) => id === 'attention-task-whitespace').title, 'Review agent result')
+  assert.ok(gateway.stats().adapterErrors >= 1)
+  assert.ok(diagnostics.length >= 1)
+  assert.ok(diagnostics.every((message) => Buffer.byteLength(message, 'utf8') <= 512))
+
+  desktopState.eventLog.invalidate()
+  assert.equal(session.synchronize(), true)
+  assert.equal(session.stats().closed, false)
+  assert.ok(transport.receiveForDevice().some((frame) => frame.kind === 'snapshot'))
+})
+
+test('live permission events use the exact snapshot redaction boundary', async () => {
+  const permission = {
+    type: 'agent.permission.requested',
+    permId: 'perm-redaction',
+    revision: 7,
+    completeness: 'complete',
+    projectId: 'project-kaisola',
+    targetId: 'codex-authority',
+    sessionId: 'session-authority',
+    attentionSessionId: 'session-authority',
+    key: 'codex-authority@@project-kaisola',
+    agent: 'Codex',
+    title: 'Review diff',
+    kind: 'edit',
+    sensitive: true,
+    requestedAt: 1_784_250_001_100,
+    options: [{ optionId: 'reject', name: 'Reject' }],
+    diffs: [
+      { path: 'src/safe.ts', oldText: `old-${'a'.repeat(20 * 1024)}`, newText: `new-${'b'.repeat(20 * 1024)}` },
+      { path: '/Users/michael/private.ts', oldText: 'secret old', newText: 'secret new' },
+    ],
+  }
+  const acpSessionService = {
+    sessionSummaries: () => [{
+      projectId: 'project-kaisola',
+      targetId: 'codex-authority',
+      sessionId: 'session-authority',
+      provider: 'codex',
+      name: 'Codex authority',
+      busy: false,
+    }],
+    pendingPermissionEvents: () => [permission],
+  }
+  const { desktopState, gateway, hello, publish, transport } = setup({ acpSessionService })
+  publish()
+  await transport.sendFromDevice(hello())
+  const snapshotPermission = transport.receiveForDevice()
+    .find((frame) => frame.kind === 'snapshot').body.projection.permissions[0]
+
+  gateway.acpSessionEvent(permission)
+  await Promise.resolve()
+  const live = transport.receiveForDevice().find((frame) => frame.kind === 'event' && frame.body.type === 'agent.permission.requested')
+  assert.ok(live)
+  assert.deepEqual(live.body, { type: 'agent.permission.requested', ...snapshotPermission })
+  assert.equal(live.body.completeness, 'redacted')
+  assert.equal(live.body.diffs.length, 1)
+  assert.equal(live.body.diffs[0].relativePath, 'src/safe.ts')
+  assert.ok(live.body.diffs[0].oldText.length <= 16 * 1024)
+  assert.ok(live.body.diffs[0].newText.length <= 16 * 1024)
+  assert.equal(JSON.stringify(live.body).includes('/Users/'), false)
+  assert.equal(Object.hasOwn(live.body, 'key'), false)
+  assert.equal(Object.hasOwn(live.body, 'sensitive'), false)
+
+  const before = desktopState.stats().eventLog.currentSeq
+  assert.equal(gateway.acpSessionEvent({ ...permission, permId: 'perm-forbidden', metadata: { token: 'never-mobile' } }), null)
+  assert.equal(desktopState.stats().eventLog.currentSeq, before)
 })
 
 test('observe stream commands deliver bounded snapshots and live output, then unsubscribe exactly', async () => {
@@ -294,6 +441,40 @@ test('command routing uses negotiated session capabilities, not wider device gra
   }))
   assert.equal(result.status, 'rejected')
   assert.match(result.message, /not granted/)
+})
+
+test('agent commands filter terminal-control from ACP actors and return normal receipts', async () => {
+  const actors = []
+  const acpSessionService = {
+    sessionSummaries: () => [],
+    pendingPermissionEvents: () => [],
+    cancel(actor) {
+      actors.push(actor)
+      return { ok: true, status: 'applied', message: 'Agent cancelled.' }
+    },
+  }
+  const capabilities = ['observe', 'agent-control', 'terminal-control']
+  const { hello, publish, session, transport } = setup({
+    acpSessionService,
+    deviceCapabilities: capabilities,
+    enabledCapabilities: capabilities,
+  })
+  publish()
+  await transport.sendFromDevice(hello({ capabilities }))
+  transport.receiveForDevice()
+
+  const result = await transport.sendFromDevice(command({
+    type: 'agent.cancel',
+    commandId: 'agent-cancel-all-capabilities',
+    capability: 'agent-control',
+    targetId: 'session-codex',
+  }))
+  assert.equal(result.status, 'applied')
+  assert.equal(session.stats().closed, false)
+  assert.deepEqual(actors[0].capabilities, ['observe', 'agent-control'])
+  const receipt = transport.receiveForDevice().find((frame) => frame.kind === 'receipt')
+  assert.equal(receipt.body.status, 'applied')
+  assert.equal(receipt.body.message, 'Agent cancelled.')
 })
 
 test('observe-only device cannot use a well-formed agent or terminal command', async () => {

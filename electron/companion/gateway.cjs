@@ -8,11 +8,11 @@ const {
   validateIdentifier,
 } = require('./protocol.cjs')
 const { CompanionCommandRouter } = require('./commandRouter.cjs')
-const { safeRelativePath, sanitizeProjection } = require('./redaction.cjs')
+const { sanitizeAcpPermissionEvent, sanitizeProjection } = require('./redaction.cjs')
 const { createAcpActorCapability } = require('../ipc/acpSessionService.cjs')
 const { createAttentionActorCapability } = require('../ipc/attentionService.cjs')
 
-const PERMISSION_COMPLETENESS_RANK = Object.freeze({ complete: 0, truncated: 1, redacted: 2, unavailable: 3 })
+const ACP_ACTOR_CAPABILITIES = new Set(['observe', 'agent-control'])
 
 function grantedCapabilities(device, requested) {
   const granted = new Set(validateCapabilities(device.capabilities ?? []))
@@ -29,20 +29,38 @@ function validId(value, label, max = 240) {
 }
 
 function acpActor(deviceId, projectId, capabilities = ['observe']) {
+  const acceptedCapabilities = validateCapabilities(Array.isArray(capabilities) ? capabilities : [])
+    .filter((capability) => ACP_ACTOR_CAPABILITIES.has(capability))
   return createAcpActorCapability({
     id: `companion-${deviceId}`,
     surface: 'companion',
     projectId,
-    capabilities,
+    capabilities: acceptedCapabilities,
   })
 }
 
-function mergeAcpProjection(projection, acpSessionService, { actorId = 'gateway', now = Date.now } = {}) {
+function normalizedText(value, fallback, max) {
+  if (typeof value !== 'string') return fallback
+  const text = value.replace(/[\0\x08\x0b\x0c\x0e-\x1f\x7f]/g, '').trim()
+  return text ? text.slice(0, max) : fallback
+}
+
+function tryProjectionEntry(projection, patch, { source, entryId, onDiagnostic } = {}) {
+  try {
+    return sanitizeProjection({ ...projection, ...patch })
+  } catch (error) {
+    onDiagnostic?.({ source, entryId, error })
+    return null
+  }
+}
+
+function mergeAcpProjection(projection, acpSessionService, {
+  actorId = 'gateway',
+  now = Date.now,
+  onDiagnostic,
+} = {}) {
   if (!acpSessionService?.sessionSummaries || !acpSessionService?.pendingPermissionEvents) return projection
-  const sessions = projection.sessions.map((session) => ({ ...session }))
-  const bySessionId = new Map(sessions.map((session) => [session.id, session]))
-  const authoritativeProjects = new Set()
-  const pending = []
+  let merged = projection
 
   for (const project of projection.projects) {
     let summaries
@@ -51,17 +69,24 @@ function mergeAcpProjection(projection, acpSessionService, { actorId = 'gateway'
       const actor = acpActor(actorId, project.id)
       summaries = acpSessionService.sessionSummaries(actor)
       permissionEvents = acpSessionService.pendingPermissionEvents(actor)
-      authoritativeProjects.add(project.id)
-    } catch {
+    } catch (error) {
+      onDiagnostic?.({ source: 'acp.project', entryId: project.id, error })
       continue
     }
+
+    const withoutRendererPermissions = tryProjectionEntry(merged, {
+      permissions: merged.permissions.filter((permission) => permission.projectId !== project.id),
+    }, { source: 'acp.permissions', entryId: project.id, onDiagnostic })
+    if (withoutRendererPermissions) merged = withoutRendererPermissions
 
     for (const summary of Array.isArray(summaries) ? summaries : []) {
       if (!summary || summary.projectId !== project.id) continue
       const candidates = [summary.sessionId, summary.targetId]
         .map((id, index) => validId(id, `acp.session.${index}`, 240))
         .filter(Boolean)
+      const bySessionId = new Map(merged.sessions.map((session) => [session.id, session]))
       let session = candidates.map((id) => bySessionId.get(id)).find((item) => item?.projectId === project.id)
+      let added = false
       if (!session) {
         const id = candidates.find((candidate) => !bySessionId.has(candidate))
         if (!id) continue
@@ -69,76 +94,60 @@ function mergeAcpProjection(projection, acpSessionService, { actorId = 'gateway'
           id,
           projectId: project.id,
           kind: 'agent',
-          title: String(summary.name || summary.provider || 'Agent').slice(0, 240),
+          title: normalizedText(summary.name, normalizedText(summary.provider, 'Agent', 120), 240),
           status: summary.busy === true ? 'running' : 'idle',
           needsYou: false,
           unread: false,
           updatedAt: Number.isSafeInteger(projection.generatedAt) ? projection.generatedAt : now(),
         }
-        sessions.push(session)
-        bySessionId.set(id, session)
+        added = true
+      } else {
+        session = { ...session }
       }
       if (summary.busy === true) session.status = 'running'
       else if (session.status === 'running') session.status = 'idle'
-      if (typeof summary.provider === 'string' && summary.provider) session.provider = summary.provider.slice(0, 120)
-      if ((!session.title || session.title === 'Agent') && typeof summary.name === 'string' && summary.name) {
-        session.title = summary.name.slice(0, 240)
+      const provider = normalizedText(summary.provider, '', 120)
+      const name = normalizedText(summary.name, '', 240)
+      if (provider) session.provider = provider
+      if (session.title === 'Agent' && name) {
+        session.title = name
       }
+      const sessions = added
+        ? [...merged.sessions, session]
+        : merged.sessions.map((item) => item.id === session.id ? session : item)
+      const next = tryProjectionEntry(merged, { sessions }, {
+        source: 'acp.session',
+        entryId: candidates[0] || project.id,
+        onDiagnostic,
+      })
+      if (next) merged = next
     }
 
     for (const event of Array.isArray(permissionEvents) ? permissionEvents : []) {
       if (!event || event.projectId !== project.id) continue
-      const permId = validId(event.permId, 'acp.permission.permId', 240)
-      if (!permId) continue
       const sessionId = [event.attentionSessionId, event.sessionId, event.targetId]
         .map((id, index) => validId(id, `acp.permission.session.${index}`, 240))
-        .find((id) => bySessionId.get(id)?.projectId === project.id)
-      const diffs = []
-      let contextReduced = false
-      for (const diff of Array.isArray(event.diffs) ? event.diffs.slice(0, 8) : []) {
-        try {
-          diffs.push({
-            relativePath: safeRelativePath(diff?.relativePath ?? diff?.path, 'acp.permission.diff.relativePath'),
-            oldText: typeof diff?.oldText === 'string' ? diff.oldText.slice(0, 16 * 1024) : '',
-            newText: typeof diff?.newText === 'string' ? diff.newText.slice(0, 16 * 1024) : '',
-          })
-        } catch { contextReduced = true /* absolute or unsafe paths never enter the projection */ }
+        .find((id) => merged.sessions.some((session) => session.id === id && session.projectId === project.id))
+      let cleanEvent
+      try {
+        cleanEvent = sanitizeAcpPermissionEvent(event, {
+          projectId: project.id,
+          sessionId,
+          requestedAt: Number.isSafeInteger(projection.generatedAt) ? projection.generatedAt : now(),
+        })
+        if (!sessionId) delete cleanEvent.sessionId
+      } catch (error) {
+        onDiagnostic?.({ source: 'acp.permission', entryId: validId(event.permId, 'acp.permission.permId', 240) || project.id, error })
+        continue
       }
-      const options = (Array.isArray(event.options) ? event.options : []).slice(0, 12).flatMap((option) => {
-        const id = validId(option?.id ?? option?.optionId, 'acp.permission.optionId', 120)
-        if (!id) { contextReduced = true; return [] }
-        return [{ id, label: String(option?.label ?? option?.name ?? id).slice(0, 160) }]
-      })
-      let completeness = Object.hasOwn(PERMISSION_COMPLETENESS_RANK, event.completeness)
-        ? event.completeness
-        : 'unavailable'
-      if (contextReduced && PERMISSION_COMPLETENESS_RANK[completeness] < PERMISSION_COMPLETENESS_RANK.redacted) {
-        completeness = 'redacted'
-      }
-      const targetId = validId(event.targetId, 'acp.permission.targetId', 240)
-      pending.push({
-        permId,
-        projectId: project.id,
-        ...(targetId ? { targetId } : {}),
-        ...(sessionId ? { sessionId } : {}),
-        agent: String(event.agent || 'Agent').slice(0, 120),
-        title: String(event.title || 'Agent action').slice(0, 240),
-        requestedAt: Number.isSafeInteger(event.requestedAt) && event.requestedAt >= 0
-          ? event.requestedAt
-          : Number.isSafeInteger(projection.generatedAt) ? projection.generatedAt : now(),
-        ...(Number.isSafeInteger(event.revision) && event.revision >= 0 ? { revision: event.revision } : {}),
-        completeness,
-        ...(typeof event.kind === 'string' && event.kind ? { kind: event.kind.slice(0, 80) } : {}),
-        options,
-        diffs,
-      })
+      const { type: _type, ...permission } = cleanEvent
+      const next = tryProjectionEntry(merged, {
+        permissions: [...merged.permissions, permission],
+      }, { source: 'acp.permission', entryId: permission.permId, onDiagnostic })
+      if (next) merged = next
     }
   }
-
-  const permissions = projection.permissions
-    .filter((permission) => !authoritativeProjects.has(permission.projectId))
-    .concat(pending)
-  return sanitizeProjection({ ...projection, sessions, permissions })
+  return merged
 }
 
 function ledgerProjectId(task, projects) {
@@ -148,39 +157,44 @@ function ledgerProjectId(task, projects) {
   return matches.length === 1 ? matches[0].id : null
 }
 
-function mergeLedgerProjection(projection, ledgerAdapter) {
+function mergeLedgerProjection(projection, ledgerAdapter, { onDiagnostic } = {}) {
   if (typeof ledgerAdapter?.listTasks !== 'function') return projection
   let tasks
-  try { tasks = ledgerAdapter.listTasks() } catch { return projection }
+  try { tasks = ledgerAdapter.listTasks() } catch (error) {
+    onDiagnostic?.({ source: 'ledger.adapter', entryId: 'list', error })
+    return projection
+  }
   if (!Array.isArray(tasks)) return projection
-  const attention = projection.attention.map((item) => ({ ...item }))
-  const ids = new Set(attention.map((item) => item.id))
+  let merged = projection
   for (const task of tasks.slice(0, 200)) {
     if (task?.status !== 'review' && task?.status !== 'blocked') continue
-    const projectId = ledgerProjectId(task, projection.projects)
+    const projectId = ledgerProjectId(task, merged.projects)
     const taskId = validId(task?.id, 'ledger.taskId', 200)
     if (!projectId || !taskId) continue
     const createdAt = Number.isSafeInteger(task.updatedAt) && task.updatedAt >= 0
       ? task.updatedAt
-      : Number.isSafeInteger(task.createdAt) && task.createdAt >= 0 ? task.createdAt : projection.generatedAt
-    const title = String(task.title || (task.status === 'review' ? 'Review agent result' : 'Agent task blocked')).slice(0, 240)
-    if (attention.some((item) => item.projectId === projectId && item.kind === task.status && item.title === title && item.createdAt === createdAt)) continue
+      : Number.isSafeInteger(task.createdAt) && task.createdAt >= 0 ? task.createdAt : merged.generatedAt
+    const fallbackTitle = task.status === 'review' ? 'Review agent result' : 'Agent task blocked'
+    const title = normalizedText(task.title, fallbackTitle, 240)
+    if (merged.attention.some((item) => item.projectId === projectId && item.kind === task.status && item.title === title && item.createdAt === createdAt)) continue
     const id = validId(`attention-${taskId}`, 'ledger.attentionId', 240)
-    if (!id || ids.has(id)) continue
-    ids.add(id)
-    attention.push({
+    if (!id || merged.attention.some((item) => item.id === id)) continue
+    const detail = normalizedText(task.result || task.detail, '', 240)
+    const item = {
       id,
       projectId,
       kind: task.status,
       title,
       createdAt,
       severity: task.status === 'blocked' ? 'warning' : 'info',
-      ...((typeof task.result === 'string' && task.result) || (typeof task.detail === 'string' && task.detail)
-        ? { detail: String(task.result || task.detail).slice(0, 240) }
-        : {}),
-    })
+      ...(detail ? { detail } : {}),
+    }
+    const next = tryProjectionEntry(merged, {
+      attention: [...merged.attention, item],
+    }, { source: 'ledger.task', entryId: taskId, onDiagnostic })
+    if (next) merged = next
   }
-  return sanitizeProjection({ ...projection, attention })
+  return merged
 }
 
 class CompanionGatewaySession {
@@ -280,6 +294,7 @@ class CompanionGatewaySession {
       if (!sent) return false
       this.lastSentSeq = event.seq
     }
+    this.lastSentSeq = result.toSeq
     return true
   }
 
@@ -319,6 +334,7 @@ class CompanionGateway {
     ledgerAdapter = null,
     enabledCapabilities = ['observe'],
     now = Date.now,
+    logger = console,
   } = {}) {
     this.desktopId = validateIdentifier(desktopId, 'desktopId')
     this.epoch = validateIdentifier(epoch, 'epoch')
@@ -332,11 +348,13 @@ class CompanionGateway {
     this.ledgerAdapter = ledgerAdapter
     this.enabledCapabilities = validateCapabilities(enabledCapabilities)
     this.now = now
+    this.logger = logger && typeof logger.warn === 'function' ? logger : console
     this.sessions = new Set()
     this.cleanupTasks = new Set()
     this.syncQueued = false
     this.disposed = false
     this.adapterErrors = 0
+    this.loggedDiagnostics = new Set()
 
     this.commandRouter = commandRouter ?? new CompanionCommandRouter({
       enabledCapabilities: this.enabledCapabilities,
@@ -363,8 +381,21 @@ class CompanionGateway {
     const result = this.stateHub.synchronize(cursor)
     if (result.kind !== 'snapshot') return result
     let projection = result.projection
-    projection = mergeAcpProjection(projection, this.acpSessionService, { actorId: this.desktopId, now: this.now })
-    projection = mergeLedgerProjection(projection, this.ledgerAdapter)
+    const onDiagnostic = (diagnostic) => this.#recordAdapterDiagnostic(diagnostic)
+    try {
+      projection = mergeAcpProjection(projection, this.acpSessionService, {
+        actorId: this.desktopId,
+        now: this.now,
+        onDiagnostic,
+      })
+    } catch (error) {
+      this.#recordAdapterDiagnostic({ source: 'acp.merge', entryId: 'snapshot', error })
+    }
+    try {
+      projection = mergeLedgerProjection(projection, this.ledgerAdapter, { onDiagnostic })
+    } catch (error) {
+      this.#recordAdapterDiagnostic({ source: 'ledger.merge', entryId: 'snapshot', error })
+    }
     return { ...result, projection, revision: projection.revision }
   }
 
@@ -377,7 +408,7 @@ class CompanionGateway {
   }
 
   acpSessionEvent(event) {
-    return this.stateHub.acpSessionEvent?.(event) ?? null
+    return this.stateHub.acpSessionEvent?.(event, { recordReplay: this.sessions.size > 0 }) ?? null
   }
 
   terminalAttention(event) {
@@ -547,6 +578,20 @@ class CompanionGateway {
         try { session.synchronize() } catch { session.close('synchronization_failed') }
       }
     })
+  }
+
+  #recordAdapterDiagnostic({ source = 'adapter', entryId = 'unknown', error } = {}) {
+    this.adapterErrors++
+    const cleanSource = normalizedText(String(source), 'adapter', 80).replace(/[^A-Za-z0-9_.:-]/g, '_')
+    const cleanEntryId = normalizedText(String(entryId), 'unknown', 160).replace(/[^A-Za-z0-9_.:@-]/g, '_')
+    const code = normalizedText(error?.code, 'adapter_error', 80).replace(/[^A-Za-z0-9_.:-]/g, '_')
+    const key = `${cleanSource}:${cleanEntryId}:${code}`
+    if (this.loggedDiagnostics.has(key) || this.loggedDiagnostics.size >= 32) return
+    this.loggedDiagnostics.add(key)
+    const detail = normalizedText(error?.message, 'Adapter projection was rejected.', 240)
+    try {
+      this.logger.warn(`[companion] dropped ${cleanSource} entry ${cleanEntryId} (${code}): ${detail}`.slice(0, 512))
+    } catch { /* diagnostics cannot affect companion availability */ }
   }
 
   #trackCleanup(promise) {

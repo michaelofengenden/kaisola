@@ -167,6 +167,22 @@ function cleanSession(raw) {
   }
 }
 
+function sessionsEqual(left, right) {
+  if (left.size !== right.size) return false
+  const leftEntries = left.entries()
+  const rightEntries = right.entries()
+  while (true) {
+    const a = leftEntries.next()
+    const b = rightEntries.next()
+    if (a.done || b.done) return a.done === b.done
+    if (a.value[0] !== b.value[0]) return false
+    const aSession = a.value[1]
+    const bSession = b.value[1]
+    const keys = new Set([...Object.keys(aSession), ...Object.keys(bSession)])
+    for (const key of keys) if (aSession[key] !== bSession[key]) return false
+  }
+}
+
 class AttentionService {
   constructor({
     get = () => null,
@@ -176,8 +192,9 @@ class AttentionService {
     maxActive = DEFAULT_MAX_ACTIVE,
     maxSessions = DEFAULT_MAX_SESSIONS,
     retentionMs = DEFAULT_RETENTION_MS,
+    queueMicrotaskFn = queueMicrotask,
   } = {}) {
-    if (typeof get !== 'function' || typeof set !== 'function' || typeof now !== 'function') {
+    if (typeof get !== 'function' || typeof set !== 'function' || typeof now !== 'function' || typeof queueMicrotaskFn !== 'function') {
       throw new Error('Attention service storage is invalid.')
     }
     if (![maxRecords, maxActive, maxSessions, retentionMs].every((value) => Number.isSafeInteger(value) && value > 0)) {
@@ -190,6 +207,7 @@ class AttentionService {
     this.maxActive = Math.min(maxActive, maxRecords)
     this.maxSessions = maxSessions
     this.retentionMs = retentionMs
+    this.queueMicrotask = queueMicrotaskFn
     this.records = new Map()
     this.sourceIndex = new Map()
     this.sessions = new Map()
@@ -197,6 +215,8 @@ class AttentionService {
     this.projectionSources = new Map()
     this.subscribers = new Set()
     this.revision = 0
+    this.persistDirty = false
+    this.persistQueued = false
     this.#load()
   }
 
@@ -613,13 +633,13 @@ class AttentionService {
         .sort((a, b) => b[1].updatedAt - a[1].updatedAt)
         .slice(0, this.maxSessions),
     )
-    const sessionsChanged = JSON.stringify([...this.sessions]) !== JSON.stringify([...boundedSessions])
+    const sessionsChanged = !sessionsEqual(this.sessions, boundedSessions)
     this.sessions = boundedSessions
     if (sessionsChanged) {
       this.revision++
       this.#persist()
     }
-    return this.boardState()
+    return { ok: true, revision: this.revision, sessionsChanged }
   }
 
   mergeProjection(projection) {
@@ -713,6 +733,15 @@ class AttentionService {
       .map(publicEvent)
   }
 
+  activeCount(projectIds) {
+    const projects = projectIds instanceof Set ? projectIds : new Set(Array.isArray(projectIds) ? projectIds : [])
+    let count = 0
+    for (const record of this.records.values()) {
+      if (record.status === 'active' && projects.has(record.projectId)) count++
+    }
+    return count
+  }
+
   stats() {
     return {
       revision: this.revision,
@@ -725,6 +754,19 @@ class AttentionService {
       maxSessions: this.maxSessions,
       retentionMs: this.retentionMs,
     }
+  }
+
+  flushPersistence() {
+    if (!this.persistDirty) return false
+    const value = JSON.stringify({
+      storeVersion: STORE_VERSION,
+      revision: this.revision,
+      records: [...this.records.values()],
+      sessions: [...this.sessions.values()],
+    })
+    this.set(STORE_KEY, value)
+    this.persistDirty = false
+    return true
   }
 
   #upsertSession(input) {
@@ -851,13 +893,13 @@ class AttentionService {
   }
 
   #persist() {
-    const value = JSON.stringify({
-      storeVersion: STORE_VERSION,
-      revision: this.revision,
-      records: [...this.records.values()],
-      sessions: [...this.sessions.values()],
+    this.persistDirty = true
+    if (this.persistQueued) return
+    this.persistQueued = true
+    this.queueMicrotask(() => {
+      this.persistQueued = false
+      try { this.flushPersistence() } catch { /* keep dirty and retry on the next mutation or shutdown flush */ }
     })
-    this.set(STORE_KEY, value)
   }
 }
 

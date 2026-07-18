@@ -252,7 +252,7 @@ test('phone acknowledgement is exact, project-scoped, and stable when desktop fo
   assert.deepEqual(service.activeEvents().map(({ id }) => id), [b.event.id])
 })
 
-test('persisted projection rebuilds attention after restart without resurrecting acknowledged events', () => {
+test('persisted projection rebuilds attention after restart without resurrecting acknowledged events', async () => {
   const first = serviceHarness()
   const records = [{ windowId: 'saved-primary', projection: { ...projection(), permissions: [] } }]
   first.service.synchronizeProjections(records)
@@ -260,17 +260,52 @@ test('persisted projection rebuilds attention after restart without resurrecting
   assert.equal(initial.length, 2)
   const sessionEvent = initial.find((event) => event.sessionId === 'session-a' && event.kind === 'completed')
   assert.ok(sessionEvent)
+  await Promise.resolve()
 
   const restarted = serviceHarness({ storage: first.storage })
   assert.deepEqual(restarted.service.activeEvents().map(({ id }) => id).sort(), initial.map(({ id }) => id).sort())
   restarted.service.synchronizeProjections(records)
   assert.equal(restarted.service.stats().active, 2)
   assert.equal(restarted.service.acknowledge(actor('project-a'), { projectId: 'project-a', eventId: sessionEvent.id }).status, 'applied')
+  await Promise.resolve()
 
   const afterAckRestart = serviceHarness({ storage: first.storage })
   afterAckRestart.service.synchronizeProjections(records)
   assert.equal(afterAckRestart.service.activeEvents().some(({ id }) => id === sessionEvent.id), false)
   assert.equal(afterAckRestart.service.stats().active, 1)
+})
+
+test('attention persistence coalesces synchronous bursts and projection sync returns no discarded board clone', async () => {
+  const storage = new Map()
+  const writes = []
+  let now = 1_784_250_000_000
+  const service = new AttentionService({
+    get: (key) => storage.get(key) ?? null,
+    set: (key, value) => { writes.push({ key, value }); storage.set(key, value) },
+    now: () => ++now,
+  })
+  const syncResult = service.synchronizeProjections([{ windowId: 'saved-primary', projection: projection() }])
+  assert.equal(syncResult.ok, true)
+  assert.equal(Object.hasOwn(syncResult, 'projects'), false)
+  assert.equal(Object.hasOwn(syncResult, 'attention'), false)
+  for (let index = 0; index < 20; index++) {
+    service.handleTerminalEvent({
+      projectId: 'project-a',
+      sessionId: `terminal-burst-${index}`,
+      completedAt: ++now,
+      streamEpoch: `stream-${index}`,
+      offset: index,
+    })
+  }
+  assert.equal(writes.length, 0)
+  await Promise.resolve()
+  assert.equal(writes.length, 1)
+
+  service.handleAcpEvent(completion('project-a', 'session-after-flush', 'turn-after-flush'))
+  service.handleAcpEvent(completion('project-a', 'session-after-flush-2', 'turn-after-flush-2'))
+  assert.equal(writes.length, 1)
+  await Promise.resolve()
+  assert.equal(writes.length, 2)
 })
 
 test('attention records, active events, and future board session state remain bounded', () => {

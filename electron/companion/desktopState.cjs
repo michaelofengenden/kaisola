@@ -2,7 +2,7 @@
 
 const { CompanionEventLog } = require('./eventLog.cjs')
 const { validateIdentifier } = require('./protocol.cjs')
-const { PROJECTION_KIND, sanitizeProjection } = require('./redaction.cjs')
+const { PROJECTION_KIND, sanitizeAcpPermissionEvent, sanitizeProjection } = require('./redaction.cjs')
 const { DEFAULT_SNAPSHOT_BYTES, makeBoundedSnapshot } = require('./terminalCursor.cjs')
 
 const ACP_EVENT_TYPES = new Set([
@@ -11,15 +11,6 @@ const ACP_EVENT_TYPES = new Set([
   'agent.permission.requested',
   'agent.permission.resolved',
 ])
-const MAX_AUTHORITY_EVENT_BYTES = 512 * 1024
-
-function boundedClone(value, maxBytes = MAX_AUTHORITY_EVENT_BYTES) {
-  let encoded
-  try { encoded = JSON.stringify(value) } catch { return null }
-  if (!encoded || Buffer.byteLength(encoded, 'utf8') > maxBytes) return null
-  try { return JSON.parse(encoded) } catch { return null }
-}
-
 function optionalText(value, max) {
   if (typeof value !== 'string') return undefined
   const text = value.replace(/[\0\x08\x0b\x0c\x0e-\x1f\x7f]/g, '').trim()
@@ -212,13 +203,26 @@ class CompanionDesktopState {
       : projection
   }
 
-  acpSessionEvent(event) {
+  acpSessionEvent(event, { recordReplay = true } = {}) {
     if (!event || !ACP_EVENT_TYPES.has(event.type) || typeof event.projectId !== 'string' || !event.projectId) return null
-    const clean = boundedClone(event)
-    if (!clean) return null
+    let clean = event
+    if (event.type === 'agent.permission.requested') {
+      try {
+        clean = sanitizeAcpPermissionEvent(event, { requestedAt: this.now() })
+      } catch {
+        this.attentionService?.handleAcpEvent?.(event)
+        return null
+      }
+    }
+    if (!recordReplay) {
+      this.eventLog.invalidate()
+      this.attentionService?.handleAcpEvent?.(event)
+      return null
+    }
     const { type, ...payload } = clean
-    const appended = this.#append({ type, payload, at: this.now() })
-    this.attentionService?.handleAcpEvent?.(clean)
+    let appended
+    try { appended = this.#append({ type, payload, at: this.now() }) } catch { appended = null }
+    this.attentionService?.handleAcpEvent?.(event)
     return appended
   }
 

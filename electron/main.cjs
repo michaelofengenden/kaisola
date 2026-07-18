@@ -1841,6 +1841,7 @@ app.on('before-quit', (event) => {
     // ACP command PTYs are connection-private and cannot be rediscovered after
     // their adapter exits. Release those exact records while the authenticated
     // broker socket is still live; user/CLI PTYs remain detached and continue.
+    try { attentionService?.flushPersistence?.() } catch { /* earlier durable state remains available */ }
     await companionGateway?.dispose()
     await disposeAcp()
     await detachSessionBroker()

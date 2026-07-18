@@ -9,7 +9,7 @@ const { CompanionProjectionStore } = require('./projectionStore.cjs')
 
 const golden = JSON.parse(fs.readFileSync(path.join(__dirname, 'fixtures', 'snapshot-board.json'), 'utf8')).body.projection
 
-function setup() {
+function setup({ attentionService = null } = {}) {
   let time = 1_000
   const records = new Map()
   const projectionStore = new CompanionProjectionStore({
@@ -20,7 +20,7 @@ function setup() {
     keys: () => [...records.keys()],
     now: () => time,
   })
-  const state = new CompanionDesktopState({ epoch: 'desktop-epoch-current', projectionStore, now: () => time })
+  const state = new CompanionDesktopState({ epoch: 'desktop-epoch-current', projectionStore, attentionService, now: () => time })
   return { state, projectionStore, setTime: (value) => { time = value } }
 }
 
@@ -114,6 +114,26 @@ test('authoritative terminal snapshots, ACP events, and ledger updates share one
   assert.equal(replay.events[0].payload.output, 'ready\n')
   assert.equal(replay.events[1].payload.delta.text, 'working')
   assert.equal(replay.events[2].payload.task.status, 'review')
+})
+
+test('ACP deltas skip replay cloning with no companion while attention authority still observes them', () => {
+  const observed = []
+  const { state } = setup({ attentionService: { handleAcpEvent: (event) => observed.push(event) } })
+  const event = {
+    type: 'agent.turn.delta',
+    projectId: 'project-kaisola',
+    targetId: 'codex-session',
+    turnId: 'turn-no-device',
+    delta: { text: 'working' },
+  }
+  assert.equal(state.acpSessionEvent(event, { recordReplay: false }), null)
+  assert.equal(state.stats().eventLog.currentSeq, 1)
+  assert.equal(state.stats().eventLog.droppedThrough, 1)
+  assert.equal(state.stats().eventLog.retainedEvents, 0)
+  assert.equal(observed[0], event)
+
+  state.acpSessionEvent(event)
+  assert.equal(state.stats().eventLog.currentSeq, 2)
 })
 
 test('gateway terminal snapshots are byte-bounded before entering replay', () => {

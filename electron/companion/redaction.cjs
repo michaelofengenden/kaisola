@@ -43,6 +43,7 @@ const TURN_KINDS = new Set(['user', 'assistant', 'thought', 'tool'])
 const ATTENTION_KINDS = new Set(['permission', 'question', 'review', 'blocked', 'failed', 'completed'])
 const SEVERITIES = new Set(['info', 'warning', 'critical'])
 const PERMISSION_COMPLETENESS = new Set(['complete', 'truncated', 'redacted', 'unavailable'])
+const PERMISSION_COMPLETENESS_RANK = Object.freeze({ complete: 0, truncated: 1, redacted: 2, unavailable: 3 })
 
 class CompanionProjectionError extends Error {
   constructor(code, message) {
@@ -108,6 +109,98 @@ function safeRelativePath(value, label) {
     projectionFail('unsafe_path', `${label} must be workspace-relative`)
   }
   return text.replace(/\\/g, '/')
+}
+
+function optionalId(value, label, max = 240) {
+  if (value == null) return undefined
+  try { return safeId(value, label, max) } catch { return undefined }
+}
+
+function displayText(value, fallback, label, max = MAX_DISPLAY) {
+  if (typeof value !== 'string') return fallback
+  return safeString(value, label, max, { optional: true }) ?? fallback
+}
+
+/** Normalize the authoritative ACP permission event once for both snapshot and
+ * live-event delivery. Provider-only fields stay desktop-side, unsafe paths are
+ * omitted, and any context loss is reflected in completeness. */
+function sanitizeAcpPermissionEvent(raw, {
+  projectId = raw?.projectId,
+  sessionId,
+  requestedAt = Date.now(),
+} = {}) {
+  const event = plain(raw, 'agent.permission.requested')
+  if (event.type !== 'agent.permission.requested') projectionFail('invalid_projection', 'ACP permission event type is invalid')
+  assertNoForbiddenKeys(event)
+
+  const cleanProjectId = safeId(projectId, 'acp.permission.projectId')
+  const permId = safeId(event.permId, 'acp.permission.permId')
+  let contextReduced = false
+  let completeness = PERMISSION_COMPLETENESS.has(event.completeness) ? event.completeness : 'unavailable'
+  const mark = (state) => {
+    if (PERMISSION_COMPLETENESS_RANK[state] > PERMISSION_COMPLETENESS_RANK[completeness]) completeness = state
+  }
+
+  const rawDiffs = Array.isArray(event.diffs) ? event.diffs : []
+  if (!Array.isArray(event.diffs) || rawDiffs.length > 8) mark(rawDiffs.length > 8 ? 'truncated' : 'redacted')
+  const diffs = []
+  for (const [index, rawDiff] of rawDiffs.slice(0, 8).entries()) {
+    if (!isPlainObject(rawDiff)) { contextReduced = true; continue }
+    let relativePath
+    try {
+      relativePath = safeRelativePath(rawDiff.relativePath ?? rawDiff.path, `acp.permission.diffs.${index}.relativePath`)
+    } catch {
+      contextReduced = true
+      continue
+    }
+    const oldText = typeof rawDiff.oldText === 'string'
+      ? safeString(rawDiff.oldText, 'acp.permission.diff.oldText', MAX_DIFF_TEXT, { optional: true }) ?? ''
+      : ''
+    const newText = typeof rawDiff.newText === 'string'
+      ? safeString(rawDiff.newText, 'acp.permission.diff.newText', MAX_DIFF_TEXT, { optional: true }) ?? ''
+      : ''
+    if (typeof rawDiff.oldText !== 'string' || typeof rawDiff.newText !== 'string') contextReduced = true
+    if (rawDiff.oldText?.length > MAX_DIFF_TEXT || rawDiff.newText?.length > MAX_DIFF_TEXT) mark('truncated')
+    diffs.push({ relativePath, oldText, newText })
+  }
+
+  const rawOptions = Array.isArray(event.options) ? event.options : []
+  if (!Array.isArray(event.options) || rawOptions.length > 12) mark(rawOptions.length > 12 ? 'truncated' : 'redacted')
+  const options = []
+  for (const [index, rawOption] of rawOptions.slice(0, 12).entries()) {
+    if (!isPlainObject(rawOption)) { contextReduced = true; continue }
+    const id = optionalId(rawOption.id ?? rawOption.optionId, `acp.permission.options.${index}.id`, 120)
+    if (!id) { contextReduced = true; continue }
+    options.push({
+      id,
+      label: displayText(rawOption.label ?? rawOption.name, id, `acp.permission.options.${index}.label`, 160),
+    })
+  }
+  if (contextReduced) mark('redacted')
+
+  const cleanSessionId = optionalId(
+    sessionId ?? event.attentionSessionId ?? event.sessionId ?? event.targetId,
+    'acp.permission.sessionId',
+  )
+  const targetId = optionalId(event.targetId, 'acp.permission.targetId')
+  const fallbackRequestedAt = Number.isSafeInteger(requestedAt) && requestedAt >= 0 ? requestedAt : Date.now()
+  return {
+    type: 'agent.permission.requested',
+    permId,
+    projectId: cleanProjectId,
+    ...(targetId ? { targetId } : {}),
+    ...(cleanSessionId ? { sessionId: cleanSessionId } : {}),
+    agent: displayText(event.agent, 'Agent', 'acp.permission.agent', 120),
+    title: displayText(event.title, 'Agent action', 'acp.permission.title'),
+    requestedAt: Number.isSafeInteger(event.requestedAt) && event.requestedAt >= 0 ? event.requestedAt : fallbackRequestedAt,
+    ...(Number.isSafeInteger(event.revision) && event.revision >= 0 ? { revision: event.revision } : {}),
+    completeness,
+    ...(typeof event.kind === 'string' && safeString(event.kind, 'acp.permission.kind', 80, { optional: true })
+      ? { kind: safeString(event.kind, 'acp.permission.kind', 80, { optional: true }) }
+      : {}),
+    options,
+    diffs,
+  }
 }
 
 function normalizedStatus(session) {
@@ -353,5 +446,6 @@ module.exports = {
   boardLaneFor,
   buildBoard,
   safeRelativePath,
+  sanitizeAcpPermissionEvent,
   sanitizeProjection,
 }

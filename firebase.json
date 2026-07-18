@@ -5,5 +5,12 @@
   },
   "firestore": {
     "rules": "firestore.rules"
+  },
+  "hosting": {
+    "public": "hosting",
+    "ignore": ["firebase.json", "**/.*", "**/node_modules/**"],
+    "rewrites": [
+      { "source": "/companion-auth", "destination": "/companion-auth.html" }
+    ]
   }
 }

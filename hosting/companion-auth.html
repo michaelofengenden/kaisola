@@ -1,0 +1,50 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Signing in to Kaisola…</title>
+  <style>
+    html, body { height: 100%; margin: 0; }
+    body {
+      display: grid; place-items: center;
+      font-family: -apple-system, system-ui, sans-serif;
+      background: #0e1014; color: #f2f3ef;
+    }
+    .box { text-align: center; }
+    .mark {
+      width: 56px; height: 56px; border-radius: 16px; margin: 0 auto 18px;
+      background: linear-gradient(150deg, #a4b364, #6d7b3e);
+      display: grid; place-items: center;
+    }
+    .mark div { width: 24px; height: 24px;
+      background:
+        radial-gradient(circle at 25% 25%, #0e1014 5px, transparent 6px),
+        radial-gradient(circle at 75% 25%, #0e1014 5px, transparent 6px),
+        radial-gradient(circle at 25% 75%, #0e1014 5px, transparent 6px),
+        radial-gradient(circle at 75% 75%, #0e1014 5px, transparent 6px);
+    }
+    p { color: #969c88; font-size: 14px; }
+    a { color: #a4b364; }
+  </style>
+</head>
+<body>
+  <div class="box">
+    <div class="mark"><div></div></div>
+    <p id="msg">Returning you to Kaisola…</p>
+    <p style="font-size:12px"><a id="fallback" href="#">Tap here if nothing happens</a></p>
+  </div>
+  <script>
+    // Firebase Auth redirects here (an authorized web.app/firebaseapp.com
+    // domain) after Google sign-in. We immediately bounce the full OAuth
+    // result to the app's custom scheme, which ASWebAuthenticationSession
+    // intercepts. No credential is stored or inspected here — it only forwards.
+    (function () {
+      var target = 'kaisola://auth' + window.location.search + window.location.hash;
+      document.getElementById('fallback').setAttribute('href', target);
+      // Use replace so this bounce page never enters history.
+      window.location.replace(target);
+    })();
+  </script>
+</body>
+</html>

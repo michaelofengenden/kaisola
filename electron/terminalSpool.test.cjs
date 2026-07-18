@@ -50,6 +50,25 @@ test('a mode reset drops it from the prefix and defaults are never replayed', (t
   assert.match(snap.modePrefix, /\x1b\[\?25l/, 'hidden cursor is non-default and replayed')
 })
 
+test('RIS and DECSTR full resets clear tracked modes, even split across chunks', (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'kaisola-terminal-spool-test-'))
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }))
+  const spool = new TerminalSpool({ dir, id: 'modes-ris', hotCap: 64, queueCap: 32 })
+  spool.push('\x1b[?1000h\x1b[?2004h')
+  spool.push('\x1b') // RIS split across a chunk boundary (`reset` after a TUI crash)
+  spool.push('c')
+  spool.push('x'.repeat(4096))
+  assert.equal(spool.snapshot(64).modePrefix, '', 'RIS clears every tracked mode')
+
+  const soft = new TerminalSpool({ dir, id: 'modes-decstr', hotCap: 64, queueCap: 32 })
+  soft.push('\x1b[?1003h')
+  soft.push('\x1b[!')
+  soft.push('p') // DECSTR split across a chunk boundary
+  soft.push('\x1b[?2004h') // re-enabled after the soft reset — must survive
+  soft.push('x'.repeat(4096))
+  assert.equal(soft.snapshot(64).modePrefix, '\x1b[?2004h', 'DECSTR clears prior modes; later enables survive')
+})
+
 test('mode sequences split across push chunks and multi-param lists still track', (t) => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'kaisola-terminal-spool-test-'))
   t.after(() => fs.rmSync(dir, { recursive: true, force: true }))

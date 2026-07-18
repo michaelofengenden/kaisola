@@ -27,8 +27,11 @@ function safeBase(id) {
 // as line-by-line submits (?2004 lost).
 const TRACKED_DEC_MODES = new Set([1, 25, 1000, 1002, 1003, 1004, 1006, 2004])
 const DEC_MODE_DEFAULTS = { 25: true } // cursor visible; every other tracked mode defaults off
-const DEC_MODE_RE = /\x1b\[\?([0-9;]+)([hl])/g
-const DEC_CARRY_RE = /\x1b(?:\[(?:\?[0-9;]{0,12})?)?$/
+// Also match RIS (ESC c) and DECSTR (CSI ! p): `reset` after a crashed TUI
+// emits these instead of individual DECRST sequences, and replaying stale
+// mouse/paste enables into a remounted terminal corrupts every click.
+const DEC_MODE_RE = /\x1b\[\?([0-9;]+)([hl])|\x1bc|\x1b\[!p/g
+const DEC_CARRY_RE = /\x1b(?:\[(?:[?!][0-9;]{0,12})?)?$/
 
 function atomicJson(file, value) {
   const tmp = `${file}.${process.pid}.tmp`
@@ -116,6 +119,10 @@ class TerminalSpool {
     DEC_MODE_RE.lastIndex = 0
     let m
     while ((m = DEC_MODE_RE.exec(text))) {
+      if (m[1] == null) { // RIS or DECSTR — every private mode reverts to default
+        this.decModes.clear()
+        continue
+      }
       const set = m[2] === 'h'
       for (const param of m[1].split(';')) {
         const mode = Number(param)

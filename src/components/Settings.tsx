@@ -9,6 +9,7 @@ import { Icon } from './Icon'
 import { GoogleIcon } from './ProviderIcon'
 import { Dropdown } from './Dropdown'
 import { UsageSettings } from './shell/LimitsButton'
+import { CompanionSettings } from './settings/CompanionSettings'
 import { openExtensionsCenter } from '../lib/extensions'
 import { useModalFocus } from '../lib/useModalFocus'
 import { signOutToOnboarding } from '../lib/signOut'
@@ -254,6 +255,7 @@ const SECTIONS = [
   { id: 'usage', name: 'Usage', icon: 'Gauge' },
   { id: 'guardrails', name: 'Guardrails', icon: 'ShieldCheck' },
   { id: 'models', name: 'Models & keys', icon: 'KeyRound' },
+  { id: 'companion', name: 'Companion', icon: 'Smartphone' },
   { id: 'extensions', name: 'Extensions', icon: 'Blocks' },
   { id: 'literature', name: 'Literature', icon: 'BookOpen' },
   { id: 'advanced', name: 'Advanced', icon: 'Braces' },
@@ -262,7 +264,7 @@ type SectionId = (typeof SECTIONS)[number]['id']
 const SECTION_GROUPS: ReadonlyArray<{ name: string; ids: readonly SectionId[] }> = [
   { name: 'Workspace', ids: ['general', 'interface', 'terminal'] },
   { name: 'Agents', ids: ['agents', 'usage', 'guardrails', 'models'] },
-  { name: 'Integrations', ids: ['extensions', 'literature'] },
+  { name: 'Integrations', ids: ['companion', 'extensions', 'literature'] },
   { name: 'System', ids: ['advanced'] },
 ]
 
@@ -278,6 +280,7 @@ const SECTION_DESC: Record<SectionId, string> = {
   models: 'Where AI features think, and the API keys they use — keys live in the OS keychain.',
   literature: 'Sources for the research corpus: PDF ingestion and citation lookups.',
   advanced: 'Disk-first renderer caching and editable JSON settings and keybindings.',
+  companion: 'Pair an iPhone to watch and safely control these sessions. Off until you turn it on.',
 }
 const SECTION_KEYWORDS: Record<SectionId, string> = {
   general: 'appearance theme light dark system liquid glass eco energy update account',
@@ -290,6 +293,7 @@ const SECTION_KEYWORDS: Record<SectionId, string> = {
   extensions: 'languages previews themes integrations plugins',
   literature: 'pdf citations grobid openalex corpus sources',
   advanced: 'renderer memory cache json keybindings hidden terminals',
+  companion: 'iphone mobile pair pairing device qr companion phone remote observe control revoke',
 }
 
 const slug = (s: string) =>
@@ -1280,6 +1284,8 @@ export function Settings() {
                 {keyMsg && <div className="settings-msg" role="status" aria-live="polite">{keyMsg}</div>}
               </>
             )}
+
+            {section === 'companion' && <CompanionSettings />}
 
             {section === 'literature' && (
               <>

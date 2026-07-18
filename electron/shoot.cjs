@@ -121,7 +121,7 @@ app.whenReady().then(async () => {
 
     // Settings — every tab, both themes for the default tab
     await setTheme('light')
-    for (const tab of ['general', 'interface', 'agents', 'models']) {
+    for (const tab of ['general', 'interface', 'agents', 'models', 'companion']) {
       await openSettings(tab); await shot(`settings-${tab}-light`)
     }
     await js(`(() => {

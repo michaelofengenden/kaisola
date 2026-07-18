@@ -54,6 +54,40 @@ export interface KeyStatus {
   present: boolean
   fromEnv?: boolean
 }
+
+// ── Companion (mobile pairing) ──────────────────────────────────────────────
+export type CompanionCapability = 'observe' | 'agent-control' | 'terminal-control'
+export interface CompanionDevice {
+  deviceId: string
+  name: string
+  capabilities: CompanionCapability[]
+  pairedAt: number
+  lastSeenAt?: number
+  connected: boolean
+}
+export interface CompanionState {
+  /** LAN listener + Bonjour advertisement running. Off by default. */
+  enabled: boolean
+  listening: boolean
+  /** Human diagnostic string — never a raw key, token, port, or path. */
+  status: string
+  devices: CompanionDevice[]
+}
+export interface CompanionPairingStart {
+  pairingId: string
+  /** Opaque QR payload string to encode; contains no long-lived secret. */
+  qrPayload: string
+  expiresAt: number
+}
+/** Pairing lifecycle, surfaced to the Settings sheet. `sas` (four words) is
+ * present at the confirm step; both surfaces must show the same phrase. */
+export interface CompanionPairingEvent {
+  pairingId: string
+  phase: 'awaiting' | 'confirm' | 'paired' | 'expired' | 'failed'
+  sas?: string
+  deviceName?: string
+  message?: string
+}
 /** One changed file in a worktree diff. */
 export interface WorktreeFile {
   path: string
@@ -954,6 +988,24 @@ export interface KaisolaBridge {
    * it again and stores it per saved window; raw Zustand state is never valid. */
   companion: {
     publishProjection(projection: unknown, sync?: boolean): boolean
+    /** Current pairing/transport state for the Settings pane. */
+    getState(): Promise<CompanionState>
+    /** Enable/disable the LAN listener + Bonjour advertisement. Disabled by
+     * default; enabling starts the _kaisola._tcp service. */
+    setEnabled(enabled: boolean): Promise<CompanionState>
+    /** Begin a single-use pairing. Returns the QR payload to render and the
+     * short expiry; the SAS to confirm arrives via onPairingEvent. */
+    startPairing(opts: { capabilities: CompanionCapability[] }): Promise<CompanionPairingStart>
+    /** Confirm the short authentication phrase both surfaces display. */
+    confirmPairing(pairingId: string): Promise<{ ok: boolean; message?: string }>
+    /** Abandon an in-flight pairing (sheet closed, wrong phrase, expiry). */
+    cancelPairing(pairingId: string): Promise<{ ok: boolean }>
+    /** Revoke a paired device: closes live connections, drops its key. */
+    revokeDevice(deviceId: string): Promise<CompanionState>
+    /** Rename a paired device row. */
+    renameDevice(deviceId: string, name: string): Promise<CompanionState>
+    onState(cb: (state: CompanionState) => void): () => void
+    onPairingEvent(cb: (event: CompanionPairingEvent) => void): () => void
   }
   /** In-app software updates — the GitHub releases feed via electron-updater. */
   update?: {
@@ -1455,6 +1507,15 @@ const webMock: KaisolaBridge = {
   },
   companion: {
     publishProjection() { return false },
+    async getState() { return { enabled: false, listening: false, status: 'Companion is desktop-only.', devices: [] } },
+    async setEnabled() { return { enabled: false, listening: false, status: 'Companion is desktop-only.', devices: [] } },
+    async startPairing() { return { pairingId: '', qrPayload: '', expiresAt: 0 } },
+    async confirmPairing() { return { ok: false } },
+    async cancelPairing() { return { ok: false } },
+    async revokeDevice() { return { enabled: false, listening: false, status: 'Companion is desktop-only.', devices: [] } },
+    async renameDevice() { return { enabled: false, listening: false, status: 'Companion is desktop-only.', devices: [] } },
+    onState() { return () => {} },
+    onPairingEvent() { return () => {} },
   },
   winCtl() {
     /* the browser owns its own window chrome */

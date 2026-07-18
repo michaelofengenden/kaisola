@@ -3175,10 +3175,10 @@ a^2 + b^2 = c^2
     if (nav) nav.click()
     await new Promise((r) => setTimeout(r, 80))
     const body = (document.querySelector('.settings-pane') || {}).textContent || ''
-    // Zed-style settings: ten focused categories (including Extensions),
-    // exactly one active, no accordion folds left.
+    // Zed-style settings: eleven focused categories (Companion joined
+    // Integrations), exactly one active, no accordion folds left.
     const tabsOk = document.querySelectorAll('.settings-fold').length === 0 &&
-      document.querySelectorAll('.settings-nav-item').length === 10 &&
+      document.querySelectorAll('.settings-nav-item').length === 11 &&
       document.querySelectorAll('.settings-nav-item[data-active="true"]').length === 1
     g().setSettingsOpen(false)
     g().setReasoningProvider('openai')

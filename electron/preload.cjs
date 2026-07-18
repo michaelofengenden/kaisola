@@ -574,6 +574,23 @@ const bridge = {
       ipcRenderer.send('companion:publish-projection', projection)
       return true
     },
+    getState: () => ipcRenderer.invoke('companion:getState'),
+    setEnabled: (enabled) => ipcRenderer.invoke('companion:setEnabled', { enabled }),
+    startPairing: (opts) => ipcRenderer.invoke('companion:startPairing', opts),
+    confirmPairing: (pairingId) => ipcRenderer.invoke('companion:confirmPairing', { pairingId }),
+    cancelPairing: (pairingId) => ipcRenderer.invoke('companion:cancelPairing', { pairingId }),
+    revokeDevice: (deviceId) => ipcRenderer.invoke('companion:revokeDevice', { deviceId }),
+    renameDevice: (deviceId, name) => ipcRenderer.invoke('companion:renameDevice', { deviceId, name }),
+    onState: (cb) => {
+      const listener = (_e, state) => cb(state)
+      ipcRenderer.on('companion:state', listener)
+      return () => ipcRenderer.removeListener('companion:state', listener)
+    },
+    onPairingEvent: (cb) => {
+      const listener = (_e, event) => cb(event)
+      ipcRenderer.on('companion:pairing-event', listener)
+      return () => ipcRenderer.removeListener('companion:pairing-event', listener)
+    },
   },
   // in-app software updates (electron-updater ↔ the GitHub releases feed)
   update: {

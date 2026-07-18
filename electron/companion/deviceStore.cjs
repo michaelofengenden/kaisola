@@ -244,12 +244,27 @@ class CompanionDeviceStore extends EventEmitter {
     return clone(next)
   }
 
+  renameDevice(deviceId, displayName) {
+    const existing = this.devices.get(String(deviceId))
+    if (!existing) fail('unknown_device', 'device is not paired')
+    if (typeof displayName !== 'string') fail('invalid_name', 'device name is invalid')
+    const name = displayName.trim()
+    if (!name || name.length > 80 || /[\0-\x1f\x7f]/.test(name)) fail('invalid_name', 'device name is invalid')
+    if (name === existing.displayName) return clone(existing)
+    const next = { ...existing, displayName: name }
+    this.devices.set(next.deviceId, next)
+    try { this.#persist() } catch (error) { this.devices.set(existing.deviceId, existing); throw error }
+    this.emit('renamed', clone(next))
+    return clone(next)
+  }
+
   markSeen(deviceId) {
     const existing = this.devices.get(String(deviceId))
     if (!existing) return false
     const next = { ...existing, lastSeenAt: Math.max(existing.lastSeenAt, this.now()) }
     this.devices.set(next.deviceId, next)
     try { this.#persist() } catch (error) { this.devices.set(existing.deviceId, existing); throw error }
+    this.emit('seen', clone(next))
     return true
   }
 
@@ -261,13 +276,21 @@ class CompanionDeviceStore extends EventEmitter {
     let records = this.connections.get(id)
     if (!records) { records = new Map(); this.connections.set(id, records) }
     records.set(token, close)
+    if (records.size === 1) this.emit('connected', { deviceId: id })
     return () => {
       const current = this.connections.get(id)
       if (!current) return false
       const deleted = current.delete(token)
-      if (!current.size) this.connections.delete(id)
+      if (!current.size) {
+        this.connections.delete(id)
+        if (deleted) this.emit('disconnected', { deviceId: id })
+      }
       return deleted
     }
+  }
+
+  isConnected(deviceId) {
+    return (this.connections.get(String(deviceId))?.size ?? 0) > 0
   }
 
   #closeConnections(deviceId, reason) {
@@ -278,6 +301,7 @@ class CompanionDeviceStore extends EventEmitter {
     for (const close of records.values()) {
       try { close(reason); closed++ } catch { /* revocation remains authoritative */ }
     }
+    this.emit('disconnected', { deviceId })
     return closed
   }
 

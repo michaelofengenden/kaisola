@@ -4,7 +4,7 @@
 // the UI is fully usable without Electron. Electron adds the native shell plus
 // the privileged "tools" the research IDE needs (model calls, filesystem,
 // running experiments) — all behind a locked-down preload bridge.
-const { app, BrowserWindow, dialog, ipcMain, Menu, nativeImage, nativeTheme, Notification, screen, session, shell } = require('electron')
+const { app, BrowserWindow, dialog, ipcMain, Menu, nativeImage, nativeTheme, Notification, safeStorage, screen, session, shell } = require('electron')
 const crypto = require('node:crypto')
 const path = require('node:path')
 const fs = require('node:fs')
@@ -33,11 +33,10 @@ const { registerGlassHandlers, wireGlassEvents } = require('./ipc/glassHandler.c
 const { registerAssistantArchiveHandlers } = require('./ipc/assistantArchive.cjs')
 const { registerAttentionHandlers } = require('./ipc/attentionHandler.cjs')
 const { AttentionService } = require('./ipc/attentionService.cjs')
+const { registerCompanionHandlers } = require('./ipc/companionHandler.cjs')
 const { registerCompanionProjectionHandlers } = require('./companion/projectionHandler.cjs')
 const { CompanionProjectionStore, projectionStoreKey } = require('./companion/projectionStore.cjs')
 const { CompanionDesktopState } = require('./companion/desktopState.cjs')
-const { CompanionGateway } = require('./companion/gateway.cjs')
-const { CompanionStateHub } = require('./companion/stateHub.cjs')
 const { hardenWebviewAttachment, installPermissionPolicy, isSafeWebUrl, isTrustedRendererUrl } = require('./ipc/securityPolicy.cjs')
 const { BrowserGuestRegistry } = require('./ipc/browserGuestRegistry.cjs')
 const {
@@ -71,11 +70,11 @@ let appCleanupStarted = false
 let appCleanupFinished = false
 let deferredQuitTask = null
 const companionDesktopEpoch = crypto.randomUUID()
-const companionDesktopId = `desktop-${crypto.randomUUID()}`
 let companionWindowGeneration = 0
 let companionProjectionStore = null
 let companionDesktopState = null
 let companionGateway = null
+let companionHandler = null
 let attentionService = null
 
 // ── Liquid Glass (macOS 26 "Tahoe"+) ─────────────────────────────────────────
@@ -1714,18 +1713,23 @@ if (hasSingleInstanceLock) app.whenReady().then(() => {
     projectionStore: companionProjectionStore,
     attentionService,
   })
-  companionGateway = new CompanionGateway({
-    desktopId: companionDesktopId,
-    epoch: companionDesktopEpoch,
-    stateHub: new CompanionStateHub({ desktopState: companionDesktopState }),
-    terminalObserver: subscribeTerminalObserver,
-    acpSessionService,
-    attentionService,
-    ledgerAdapter: { listTasks },
-    // Task 7 is deliberately observe-only. Later phases may enable control
-    // only after paired device records and terminal leases exist.
-    enabledCapabilities: ['observe'],
+  companionHandler = registerCompanionHandlers(ipcMain, {
+    app,
+    BrowserWindow,
+    safeStorage,
+    desktopState: companionDesktopState,
+    gatewayOptions: {
+      epoch: companionDesktopEpoch,
+      terminalObserver: subscribeTerminalObserver,
+      acpSessionService,
+      attentionService,
+      ledgerAdapter: { listTasks },
+      // Task 7 is deliberately observe-only. Later phases may enable control
+      // only after paired device records and terminal leases exist.
+      enabledCapabilities: ['observe'],
+    },
   })
+  companionGateway = companionHandler.gateway
   setAcpSessionEventSink((event) => companionGateway.acpSessionEvent(event))
   setTerminalAttentionSink((event) => companionGateway.terminalAttention(event))
   setLedgerEventSink((event) => companionGateway.ledgerEvent(event))
@@ -1848,7 +1852,7 @@ app.on('before-quit', (event) => {
     // their adapter exits. Release those exact records while the authenticated
     // broker socket is still live; user/CLI PTYs remain detached and continue.
     try { attentionService?.flushPersistence?.() } catch { /* earlier durable state remains available */ }
-    await companionGateway?.dispose()
+    await companionHandler?.dispose()
     await disposeAcp()
     await detachSessionBroker()
     disposeAuth()

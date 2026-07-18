@@ -410,6 +410,7 @@ class BonjourCompanionTransport extends EventEmitter {
       if (frame.type === 'pair.start') {
         response = this.pairingManager.startPairing({ qrPayload: frame.qrPayload, connectionId: frame.connectionId, message1: frame.message1 })
         state.kind = 'pair'
+        state.pairingId = response.pairingId
       } else if (frame.type === 'resume.start') {
         response = this.pairingManager.startResume({ deviceId: frame.deviceId, connectionId: frame.connectionId, message1: frame.message1 })
         state.kind = 'resume'
@@ -439,7 +440,12 @@ class BonjourCompanionTransport extends EventEmitter {
       if (state.kind === 'resume') this.#activate(state)
       else {
         state.phase = 'awaiting_sas_confirmation'
-        this.emit('pairingPhrase', { sessionId: state.sessionId, device: state.pairingDetails.device, sas: state.pairingDetails.sas })
+        this.emit('pairingPhrase', {
+          pairingId: state.pairingId,
+          sessionId: state.sessionId,
+          device: state.pairingDetails.device,
+          sas: state.pairingDetails.sas,
+        })
       }
       return
     }
@@ -454,16 +460,28 @@ class BonjourCompanionTransport extends EventEmitter {
     throw new Error('handshake frame is out of order')
   }
 
-  confirmPairing(sessionId) {
-    const state = this.pairingSockets.get(String(sessionId))
+  confirmPairing(pairingId) {
+    const id = String(pairingId)
+    const state = [...this.pairingSockets.values()].find((candidate) => candidate.pairingId === id)
+      ?? this.pairingSockets.get(id)
     if (!state || state.closed || state.kind !== 'pair' || state.phase !== 'awaiting_sas_confirmation') return false
-    const result = this.pairingManager.confirmLocalSas(sessionId)
+    const result = this.pairingManager.confirmLocalSas(state.sessionId)
     if (!writeWireFrame(state.socket, result.sasFrame)) { this.#closeState(state, 'slow_client'); return false }
     if (result.paired) {
       if (!writeWireFrame(state.socket, result.pairedFrame)) { this.#closeState(state, 'slow_client'); return false }
       this.#activate(state)
     }
     return true
+  }
+
+  cancelPairing(pairingId, reason = 'pairing_cancelled') {
+    const id = String(pairingId)
+    let cancelled = false
+    for (const state of [...this.pairingSockets.values()]) {
+      if (state.pairingId !== id || state.kind !== 'pair' || state.authenticated) continue
+      cancelled = this.#closeState(state, reason) || cancelled
+    }
+    return this.pairingManager.cancelPairing(id) || cancelled
   }
 
   #activate(state) {
@@ -480,7 +498,12 @@ class BonjourCompanionTransport extends EventEmitter {
     state.secureTransport = secureTransport
     state.unregisterDeviceConnection = this.deviceStore.registerConnection(authenticated.device.deviceId, (reason) => secureTransport.close(reason))
     state.gatewaySession = this.gateway.attach(secureTransport, authenticated.device)
-    this.emit('authenticated', { deviceId: authenticated.device.deviceId, connectionId: authenticated.connectionId, mode: authenticated.kind })
+    this.emit('authenticated', {
+      deviceId: authenticated.device.deviceId,
+      connectionId: authenticated.connectionId,
+      mode: authenticated.kind,
+      ...(authenticated.kind === 'pair' ? { pairingId: state.pairingId } : {}),
+    })
   }
 
   #closeState(state, reason) {
@@ -502,6 +525,9 @@ class BonjourCompanionTransport extends EventEmitter {
       state.secureTransport.closeReason = reason
     }
     try { if (!state.socket.destroyed) state.socket.destroy() } catch { /* already closed */ }
+    if (state.kind === 'pair' && !state.authenticated && state.pairingId) {
+      this.emit('pairingFailed', { pairingId: state.pairingId, reason })
+    }
     return true
   }
 

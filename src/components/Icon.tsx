@@ -19,7 +19,7 @@ import {
   Play, Plug, Plus, Quote, Redo2, RefreshCw, RotateCcw, RotateCw, Search, Send,
   ScanSearch, ServerCog, Settings, Settings2, ShieldAlert, ShieldCheck, ShieldQuestion,
   Sigma, SlidersHorizontal, Sparkles, Square, SquareTerminal, StickyNote, Strikethrough,
-  SunMoon, Target, Terminal, TerminalSquare, ThumbsDown, ThumbsUp, Timer,
+  Smartphone, SunMoon, Target, Terminal, TerminalSquare, ThumbsDown, ThumbsUp, Timer,
   Trash2, TriangleAlert, Undo2, Unlink, User, UserRound, Workflow, Wrench, X,
   XCircle, Zap,
 } from 'lucide-react'
@@ -53,7 +53,7 @@ const ICONS = {
   Play, Plug, Plus, Quote, Redo2, RefreshCw, RotateCcw, RotateCw, Search, Send,
   ScanSearch, ServerCog, Settings, Settings2, ShieldAlert, ShieldCheck, ShieldQuestion,
   Sigma, SlidersHorizontal, Sparkles, Square, SquareTerminal, StickyNote, Strikethrough,
-  SunMoon, Target, Terminal, TerminalSquare, ThumbsDown, ThumbsUp, Timer,
+  Smartphone, SunMoon, Target, Terminal, TerminalSquare, ThumbsDown, ThumbsUp, Timer,
   Trash2, TriangleAlert, Undo2, Unlink, User, UserRound, Workflow, Wrench, X,
   XCircle, Zap,
 } as const

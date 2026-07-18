@@ -171,7 +171,12 @@ class CompanionPairingManager {
       transportHint: normalizeTransportHint(transportHint),
       expiresAt: this.now() + expiresInMs,
     }, { now: this.now(), clockSkewMs: 0, expectedDesktopId: desktop.id })
-    this.offers.set(payload.pairingNonce, { payload, replaceDeviceId, expiresAt: payload.expiresAt })
+    this.offers.set(payload.pairingNonce, {
+      pairingId: payload.pairingNonce,
+      payload,
+      replaceDeviceId,
+      expiresAt: payload.expiresAt,
+    })
     return JSON.parse(JSON.stringify(payload))
   }
 
@@ -190,6 +195,7 @@ class CompanionPairingManager {
     const sessionId = `pair-${this.randomUUID()}`
     this.sessions.set(sessionId, {
       sessionId,
+      pairingId: offer.pairingId,
       kind: 'pair',
       state: 'awaiting_message_3',
       expiresAt: Math.min(clean.expiresAt, this.now() + HANDSHAKE_TIMEOUT_MS),
@@ -202,7 +208,7 @@ class CompanionPairingManager {
       remoteKeyConfirmed: false,
       completed: false,
     })
-    return { sessionId, message2: b64url(responder.writeMessage2()) }
+    return { sessionId, pairingId: offer.pairingId, message2: b64url(responder.writeMessage2()) }
   }
 
   startResume({ deviceId, connectionId, message1 } = {}) {
@@ -283,6 +289,7 @@ class CompanionPairingManager {
       kind: session.kind,
       device: { id: peer.id, displayName: peer.displayName },
       confirmationFrame: session.desktopConfirmationFrame,
+      ...(session.kind === 'pair' ? { pairingId: session.pairingId } : {}),
       ...(session.kind === 'pair' ? { sas: session.sas } : {}),
     }
   }
@@ -352,6 +359,22 @@ class CompanionPairingManager {
 
   releaseSession(sessionId) {
     return this.sessions.delete(String(sessionId))
+  }
+
+  cancelPairing(pairingId) {
+    const id = String(pairingId)
+    let cancelled = false
+    for (const [nonce, offer] of this.offers) {
+      if (offer.pairingId !== id) continue
+      this.offers.delete(nonce)
+      cancelled = true
+    }
+    for (const [sessionId, session] of this.sessions) {
+      if (session.kind !== 'pair' || session.pairingId !== id || session.completed) continue
+      this.sessions.delete(sessionId)
+      cancelled = true
+    }
+    return cancelled
   }
 
   prune() {

@@ -37,6 +37,18 @@ class CompanionStateHub {
     return this.desktopState.acknowledge(clientId, seq)
   }
 
+  acknowledgeAttention(actor, target) {
+    if (!this.desktopState.acknowledgeAttention) {
+      return { ok: false, status: 'unavailable', message: 'Attention authority is unavailable.' }
+    }
+    return this.desktopState.acknowledgeAttention(actor, target)
+  }
+
+  subscribe(listener) {
+    if (!this.desktopState.subscribe) return () => false
+    return this.desktopState.subscribe(listener)
+  }
+
   disconnect(clientId) {
     validateIdentifier(clientId, 'clientId')
     return this.desktopState.disconnect?.(clientId) ?? false

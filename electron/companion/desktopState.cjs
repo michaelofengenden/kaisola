@@ -4,18 +4,25 @@ const { CompanionEventLog } = require('./eventLog.cjs')
 const { PROJECTION_KIND, sanitizeProjection } = require('./redaction.cjs')
 
 class CompanionDesktopState {
-  constructor({ epoch, projectionStore, now = Date.now, eventLog } = {}) {
+  constructor({ epoch, projectionStore, attentionService = null, now = Date.now, eventLog } = {}) {
     if (!projectionStore?.list) throw new Error('companion projection store is required')
     this.projectionStore = projectionStore
+    this.attentionService = attentionService
     this.now = now
     this.eventLog = eventLog ?? new CompanionEventLog({ epoch })
     this.snapshotRevision = 0
+    this.listeners = new Set()
+    this.unsubscribeAttention = attentionService?.subscribe?.((event) => {
+      const { type, ...payload } = event
+      if (type !== 'attention.raised' && type !== 'attention.cleared') return
+      this.#append({ type, payload, at: event.createdAt ?? event.clearedAt ?? this.now() })
+    }) ?? null
   }
 
   projectionPublished(windowId, result) {
     if (!result?.ok || !result.projection || result.duplicate || result.stale) return null
     this.snapshotRevision++
-    return this.eventLog.append({
+    const event = this.#append({
       type: 'project.updated',
       payload: {
         windowId,
@@ -24,15 +31,19 @@ class CompanionDesktopState {
       },
       at: this.now(),
     })
+    this.attentionService?.synchronizeProjections?.(this.projectionStore.list())
+    return event
   }
 
   projectionRemoved(windowId) {
     this.snapshotRevision++
-    return this.eventLog.append({
+    const event = this.#append({
       type: 'project.updated',
       payload: { windowId, removed: true, revision: this.snapshotRevision },
       at: this.now(),
     })
+    this.attentionService?.synchronizeProjections?.(this.projectionStore.list())
+    return event
   }
 
   terminalObserverEvent(projectId, { channel, payload } = {}) {
@@ -81,11 +92,12 @@ class CompanionDesktopState {
         reason: payload.reason,
       }
     } else return null
-    return this.eventLog.append({ type, payload: cleanPayload, at: this.now() })
+    return this.#append({ type, payload: cleanPayload, at: this.now() })
   }
 
   snapshot() {
     const records = this.projectionStore.list()
+    this.attentionService?.synchronizeProjections?.(records)
     const projectOwner = new Map()
     const projects = []
     for (const record of records) {
@@ -122,7 +134,7 @@ class CompanionDesktopState {
 
     const maxRevision = records.reduce((max, record) => Math.max(max, record.projection.revision), 0)
     this.snapshotRevision = Math.max(this.snapshotRevision, maxRevision)
-    return sanitizeProjection({
+    const projection = sanitizeProjection({
       projectionKind: PROJECTION_KIND,
       revision: this.snapshotRevision,
       generatedAt: this.now(),
@@ -132,6 +144,35 @@ class CompanionDesktopState {
       attention,
       permissions,
     })
+    return this.attentionService
+      ? sanitizeProjection(this.attentionService.mergeProjection(projection))
+      : projection
+  }
+
+  attentionEvent(event) {
+    return this.attentionService?.handleAcpEvent?.(event) ?? null
+  }
+
+  ledgerAttention(event) {
+    return this.attentionService?.handleLedgerEvent?.(event) ?? null
+  }
+
+  acknowledgeAttention(actor, target) {
+    if (!this.attentionService?.acknowledge) {
+      return { ok: false, status: 'unavailable', message: 'Attention authority is unavailable.' }
+    }
+    return this.attentionService.acknowledge(actor, target)
+  }
+
+  subscribe(listener) {
+    if (typeof listener !== 'function') throw new Error('desktop state subscriber is invalid')
+    this.listeners.add(listener)
+    let active = true
+    return () => {
+      if (!active) return false
+      active = false
+      return this.listeners.delete(listener)
+    }
   }
 
   replay(cursor) {
@@ -147,7 +188,19 @@ class CompanionDesktopState {
   }
 
   stats() {
-    return { snapshotRevision: this.snapshotRevision, eventLog: this.eventLog.stats() }
+    return {
+      snapshotRevision: this.snapshotRevision,
+      eventLog: this.eventLog.stats(),
+      ...(this.attentionService?.stats ? { attention: this.attentionService.stats() } : {}),
+    }
+  }
+
+  #append(event) {
+    const appended = this.eventLog.append(event)
+    for (const listener of this.listeners) {
+      try { listener(appended) } catch { /* one gateway cannot break state */ }
+    }
+    return appended
   }
 }
 

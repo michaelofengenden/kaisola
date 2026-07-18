@@ -140,7 +140,7 @@ mgr.setEventSink((owner, channel, payload, options) => {
   if (!parts) return false
   const client = clients.get(parts.instanceId)
   if (!client) return false
-  return send(client.socket, { type: 'event', ownerId: parts.ownerId, channel, payload }, options)
+  return send(client.socket, { type: 'event', ownerId: parts.ownerId, projectId: parts.projectId, channel, payload }, options)
 })
 
 async function dispatch(client, method, params = {}) {

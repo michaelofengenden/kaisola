@@ -8,6 +8,7 @@ const {
   validateIdentifier,
 } = require('./protocol.cjs')
 const { CompanionCommandRouter } = require('./commandRouter.cjs')
+const { createAttentionActorCapability } = require('../ipc/attentionService.cjs')
 
 function grantedCapabilities(device, requested) {
   const granted = new Set(validateCapabilities(device.capabilities ?? []))
@@ -141,16 +142,39 @@ class CompanionGatewaySession {
 }
 
 class CompanionGateway {
-  constructor({ desktopId, epoch, stateHub, commandRouter = new CompanionCommandRouter(), now = Date.now } = {}) {
+  constructor({ desktopId, epoch, stateHub, commandRouter, now = Date.now } = {}) {
     this.desktopId = validateIdentifier(desktopId, 'desktopId')
     this.epoch = validateIdentifier(epoch, 'epoch')
     if (!stateHub?.synchronize || !stateHub?.acknowledge) throw new Error('companion state hub is required')
-    if (!commandRouter?.route) throw new Error('companion command router is required')
     if (typeof now !== 'function') throw new Error('companion gateway clock is invalid')
     this.stateHub = stateHub
-    this.commandRouter = commandRouter
+    this.commandRouter = commandRouter ?? new CompanionCommandRouter({
+      enabledCapabilities: ['observe'],
+      handlers: {
+        'attention.ack': ({ device, command }) => stateHub.acknowledgeAttention(
+          createAttentionActorCapability({
+            id: `companion-${device.deviceId}`,
+            surface: 'companion',
+            projectId: command.projectId,
+            capabilities: device.capabilities,
+          }),
+          { projectId: command.projectId, eventId: command.targetId, reason: 'companion_acknowledged' },
+        ),
+      },
+    })
+    if (!this.commandRouter?.route) throw new Error('companion command router is required')
     this.now = now
     this.sessions = new Set()
+    this.syncQueued = false
+    this.unsubscribeState = stateHub.subscribe?.((event) => {
+      if (event?.type !== 'attention.raised' && event?.type !== 'attention.cleared') return
+      if (this.syncQueued) return
+      this.syncQueued = true
+      queueMicrotask(() => {
+        this.syncQueued = false
+        for (const session of this.sessions) session.synchronize()
+      })
+    }) ?? null
   }
 
   attach(transport, device) {

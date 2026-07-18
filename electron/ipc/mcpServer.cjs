@@ -360,7 +360,7 @@ const TOOLS = [
     run: ({ title, detail, owner, from } = {}, context) => {
       const s = storeState(context)
       if (!s?.workspacePath) return { ok: false, message: 'Project state is unavailable.' }
-      return ledger.postTask({ project: (s && s.workspacePath) || undefined, title, detail, owner, createdBy: from })
+      return ledger.postTask({ project: (s && s.workspacePath) || undefined, projectId: context?.projectId, title, detail, owner, createdBy: from })
     },
   },
   {
@@ -423,7 +423,7 @@ const TOOLS = [
     run: (args = {}, context) => {
       const s = storeState(context)
       if (!s?.workspacePath) return { ok: false, message: 'Project state is unavailable.' }
-      return ledger.updateTask({ ...args, project: s.workspacePath })
+      return ledger.updateTask({ ...args, project: s.workspacePath, projectId: context?.projectId })
     },
   },
 ]

@@ -73,7 +73,7 @@ test('terminal output caps preserve zero and truncate only at UTF-8 boundaries',
     const discardedStats = discard.stats()
     assert.equal(discardedStats.ramBytes, 0)
     assert.equal(discardedStats.diskBytes, 0)
-    assert.deepEqual(discard.snapshot(0), { output: '', truncated: true, viewState: null })
+    assert.deepEqual(discard.snapshot(0), { output: '', truncated: true, viewState: null, modePrefix: '' })
   } finally {
     fs.rmSync(dir, { recursive: true, force: true })
   }

@@ -163,14 +163,20 @@ function pushProjectFeed(pid: string, isActive: boolean, item: Omit<AgentFeedIte
 // Deduped per project within a short window so a chatty turn doesn't stack
 // notification banners.
 const lastNotifyAt = new Map<string, number>()
-function notifyAgent(title: string, body: string, pid: string, sessionId?: string) {
+function notifyAgent(
+  title: string,
+  body: string,
+  pid: string,
+  sessionId?: string,
+  event?: { sourceId?: string; kind?: 'permission' | 'question' | 'review' | 'blocked' | 'failed' | 'completed'; createdAt?: number },
+) {
   if (bridge.smoke) return
   const now = Date.now()
   const key = `${pid}\0${sessionId ?? ''}`
   if (now - (lastNotifyAt.get(key) ?? 0) < 15_000) return
   lastNotifyAt.set(key, now)
   if (bridge.attention) {
-    bridge.attention.notify({ title, body, projectId: pid, sessionId })
+    bridge.attention.notify({ title, body, projectId: pid, sessionId, ...event })
     return
   }
   if (typeof Notification === 'undefined') return
@@ -194,12 +200,32 @@ function AttentionSync() {
     return count(state) + Object.values(state.projectSlices).reduce((sum, slice) => sum + count(slice), 0)
   })
   const visibleUnread = useKaisola((state) => state.dockViews.filter((id) => state.needsYou[id]).join('\0'))
+  const surface = useKaisola((state) => JSON.stringify({
+    projectId: state.activeProjectId,
+    visibleSessionIds: state.dockOpen ? state.dockViews : [],
+    projects: state.projectTabs.map((tab) => ({
+      projectId: tab.id,
+      alias: (tab.id === state.activeProjectId ? state.workspacePath : state.projectSlices[tab.id]?.workspacePath) ?? undefined,
+    })),
+  }))
 
   useEffect(() => {
     bridge.attention?.setCount(unreadCount)
   }, [unreadCount])
 
   useEffect(() => {
+    const clearSessionAttention = (projectId: string, sessionId: string) => {
+      const state = useKaisola.getState()
+      const owner = projectId === state.activeProjectId ? state : state.projectSlices[projectId]
+      if (!owner?.needsYou[sessionId]) return
+      const remaining = Object.keys(owner.needsYou).filter((id) => id !== sessionId)
+      state.patchProject(projectId, (slice) => {
+        const needsYou = { ...slice.needsYou }
+        delete needsYou[sessionId]
+        return { needsYou }
+      })
+      if (remaining.length === 0) state.setProjectActivity(projectId, undefined)
+    }
     const acknowledgeVisible = () => {
       if (document.hidden || !document.hasFocus()) return
       const state = useKaisola.getState()
@@ -207,22 +233,57 @@ function AttentionSync() {
         if (state.needsYou[id]) state.setDockView(id)
       }
     }
-    const off = bridge.attention?.onOpen(({ projectId, sessionId }) => {
+    const off = bridge.attention?.onOpen(({ eventId, projectId, sessionId }) => {
       const state = useKaisola.getState()
+      if (eventId && projectId) void bridge.attention?.acknowledge({ projectId, eventId })
       if (projectId && state.projectTabs.some((tab) => tab.id === projectId)) state.switchProject(projectId)
       if (sessionId) useKaisola.getState().switchSession(sessionId)
       acknowledgeVisible()
+    })
+    const offRaised = bridge.attention?.onRaised(({ projectId, sessionId, kind }) => {
+      if (!sessionId) return
+      const state = useKaisola.getState()
+      if (!state.projectTabs.some((tab) => tab.id === projectId)) return
+      state.markNeedsYou(sessionId, projectId)
+      if (projectId !== state.activeProjectId) state.setProjectActivity(projectId, kind === 'failed' ? 'failed' : 'needs-you')
+    })
+    const offCleared = bridge.attention?.onCleared(({ projectId, sessionId }) => {
+      if (sessionId) clearSessionAttention(projectId, sessionId)
     })
     window.addEventListener('focus', acknowledgeVisible)
     document.addEventListener('visibilitychange', acknowledgeVisible)
     acknowledgeVisible()
     return () => {
       off?.()
+      offRaised?.()
+      offCleared?.()
       window.removeEventListener('focus', acknowledgeVisible)
       document.removeEventListener('visibilitychange', acknowledgeVisible)
       bridge.attention?.setCount(0)
     }
   }, [])
+
+  useEffect(() => {
+    const base = JSON.parse(surface) as {
+      projectId: string
+      visibleSessionIds: string[]
+      projects: Array<{ projectId: string; alias?: string }>
+    }
+    const sync = () => bridge.attention?.syncSurface({
+      ...base,
+      documentVisible: !document.hidden,
+      documentFocused: document.hasFocus(),
+    })
+    window.addEventListener('focus', sync)
+    window.addEventListener('blur', sync)
+    document.addEventListener('visibilitychange', sync)
+    sync()
+    return () => {
+      window.removeEventListener('focus', sync)
+      window.removeEventListener('blur', sync)
+      document.removeEventListener('visibilitychange', sync)
+    }
+  }, [surface])
 
   useEffect(() => {
     if (!visibleUnread || document.hidden || !document.hasFocus()) return
@@ -560,7 +621,11 @@ function KaisolaApp() {
             ? 'Codex'
             : terminal?.name ?? 'Agent'
         const tab = st.projectTabs.find((project) => project.id === pid)
-        notifyAgent(`${provider} finished`, tab ? projectLabel(tab) : 'Kaisola', pid, activity.id)
+        notifyAgent(`${provider} finished`, tab ? projectLabel(tab) : 'Kaisola', pid, activity.id, {
+          sourceId: `terminal:${activity.id}:${activity.completedAt}`,
+          kind: 'completed',
+          createdAt: activity.completedAt ?? undefined,
+        })
       }
       const offMeta = bridge.terminal.onMeta((m) => {
         const st = useKaisola.getState()
@@ -608,7 +673,10 @@ function KaisolaApp() {
         const announce = () => {
           if (pid === st.activeProjectId && !document.hidden && document.hasFocus()) return
           const tab = st.projectTabs.find((project) => project.id === pid)
-          notifyAgent(`${req.agent} needs you`, tab ? projectLabel(tab) : req.title, pid, req.key.split('::')[1])
+          notifyAgent(`${req.agent} needs you`, tab ? projectLabel(tab) : req.title, pid, req.key.split('::')[1], {
+            sourceId: req.permId,
+            kind: 'permission',
+          })
         }
         if (pid === st.activeProjectId || !slice) { st.receivePermission(req); announce(); return }
         if (requestIsSensitive(st.sensitiveGlobs, req)) {
@@ -754,6 +822,11 @@ function KaisolaApp() {
             tab ? projectLabel(tab) : 'Kaisola',
             pid,
             claudeTerminal?.id,
+            {
+              sourceId: `claude:${ev.sessionId ?? claudeTerminal?.id ?? 'session'}:${ev.at}:${ev.event}`,
+              kind: ev.event === 'Stop' ? 'completed' : 'question',
+              createdAt: ev.at,
+            },
           )
         }
       }

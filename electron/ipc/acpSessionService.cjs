@@ -92,6 +92,9 @@ function sanitizePermissionEvent({ permId, revision, entry, agent, key, toolCall
     if (COMPLETENESS_RANK[state] > COMPLETENESS_RANK[completeness]) completeness = state
   }
   const identity = identityFor(entry)
+  const attentionSessionId = typeof entry?.current?.attentionSessionId === 'string' && entry.current.attentionSessionId
+    ? entry.current.attentionSessionId
+    : undefined
   const call = toolCall && typeof toolCall === 'object' && !Array.isArray(toolCall) ? toolCall : null
   if (!call) mark('unavailable')
 
@@ -159,6 +162,7 @@ function sanitizePermissionEvent({ permId, revision, entry, agent, key, toolCall
     projectId: identity.projectId,
     targetId: identity.targetId,
     ...(identity.sessionId ? { sessionId: identity.sessionId } : {}),
+    ...(attentionSessionId ? { attentionSessionId } : {}),
     key: typeof key === 'string' && key ? key : identity.targetId,
     agent: cleanAgent,
     title,
@@ -392,7 +396,7 @@ class AcpSessionService {
     return cloneReceipt(receipt)
   }
 
-  async prompt(actor, { projectId, targetId, turnId, text, images, readOnly } = {}) {
+  async prompt(actor, { projectId, targetId, turnId, text, images, readOnly, attentionSessionId } = {}) {
     const resolved = this.#controlEntry(actor, { projectId, targetId })
     if (resolved.error) return resolved.error
     const { entry, actor: cleanActor } = resolved
@@ -402,9 +406,12 @@ class AcpSessionService {
       return this.#failure('rejected', 'The previous agent turn is still stopping — send again in a moment.')
     }
     if (typeof turnId !== 'string' || !turnId || turnId.length > 500) return this.#failure('rejected', 'Agent turn id is invalid.')
+    if (attentionSessionId != null && (typeof attentionSessionId !== 'string' || !attentionSessionId || attentionSessionId.length > 240 || /[\0-\x1f\x7f]/.test(attentionSessionId))) {
+      return this.#failure('rejected', 'Agent attention session id is invalid.')
+    }
 
     entry.cancelRequested = false
-    const turn = { actorId: cleanActor.id, targetId, turnId }
+    const turn = { actorId: cleanActor.id, targetId, turnId, ...(attentionSessionId ? { attentionSessionId } : {}) }
     entry.current = turn
     entry.turnSeq = (entry.turnSeq ?? 0) + 1
     entry.inFlightTurns = (entry.inFlightTurns ?? 0) + 1
@@ -633,8 +640,10 @@ class AcpSessionService {
       projectId: identity.projectId,
       targetId: identity.targetId,
       ...(identity.sessionId ? { sessionId: identity.sessionId } : {}),
+      ...(turn.attentionSessionId ? { attentionSessionId: turn.attentionSessionId } : {}),
       turnId: turn.turnId,
       ok,
+      ...(entry.meta?.name ? { agent: entry.meta.name } : {}),
       ...(stopReason ? { stopReason } : {}),
     }))
   }

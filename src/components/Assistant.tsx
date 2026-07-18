@@ -2051,7 +2051,7 @@ export const Assistant = memo(function Assistant({ threadId }: { threadId: strin
         stream.onUpdate,
         images.length ? images : undefined,
         projectId,
-        { readOnly: readOnlyDispatch },
+        { readOnly: readOnlyDispatch, attentionSessionId: active.groupParentId ?? threadId },
       )
     } catch (err) {
       res = { ok: false, message: String((err as Error)?.message ?? err) }
@@ -2125,6 +2125,9 @@ export const Assistant = memo(function Assistant({ threadId }: { threadId: strin
           body: projectName,
           projectId,
           sessionId: attentionId,
+          sourceId: `agent:${attentionId}:${userTurn.at ?? pendingDispatch.id}`,
+          kind: res.ok && (!res.stopReason || res.stopReason === 'end_turn') ? 'completed' : 'failed',
+          createdAt: Date.now(),
         })
       }
       if (state.activeProjectId !== projectId) state.setProjectActivity(projectId, res.ok && (!res.stopReason || res.stopReason === 'end_turn') ? 'completed' : 'failed')

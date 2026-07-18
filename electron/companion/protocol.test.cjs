@@ -64,11 +64,28 @@ test('commands require the exact capability, project, target, and envelope ident
   assert.deepEqual(validateEnvelope(base), base)
   assert.equal(requiredCapability('terminal.write'), 'terminal-control')
   assert.equal(requiredCapability('agent.prompt'), 'agent-control')
+  assert.equal(requiredCapability('attention.ack'), 'observe')
   assert.equal(requiredCapability('terminal.kill'), null)
   assert.throws(() => validateEnvelope({ ...base, body: { ...base.body, capability: 'observe' } }), /requires terminal-control/)
   assert.throws(() => validateEnvelope({ ...base, body: { ...base.body, commandId: 'other-command' } }), /does not match/)
   assert.throws(() => validateEnvelope({ ...base, body: { ...base.body, projectId: '' } }), /projectId is invalid/)
   assert.throws(() => validateEnvelope({ ...base, body: { ...base.body, type: 'terminal.kill' } }), /unsupported command/)
+
+  const attentionAck = {
+    ...base,
+    id: 'attention-command',
+    body: {
+      type: 'attention.ack',
+      commandId: 'attention-command',
+      projectId: 'project-kaisola',
+      targetId: 'attention-f00dcafe',
+      capability: 'observe',
+      payload: {},
+    },
+  }
+  assert.deepEqual(validateEnvelope(attentionAck), attentionAck)
+  assert.throws(() => validateEnvelope({ ...attentionAck, body: { ...attentionAck.body, targetId: '' } }), /targetId is invalid/)
+  assert.throws(() => validateEnvelope({ ...attentionAck, body: { ...attentionAck.body, capability: 'agent-control' } }), /requires observe/)
 })
 
 test('decoder bounds bytes before JSON parsing and rejects malformed bodies', () => {

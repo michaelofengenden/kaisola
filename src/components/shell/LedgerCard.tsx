@@ -23,12 +23,13 @@ const age = (at: number): string => {
   return m < 1 ? 'now' : m < 60 ? `${m}m` : m < 60 * 24 ? `${Math.round(m / 60)}h` : `${Math.round(m / 1440)}d`
 }
 
-const resolveTask = (id: string, status: 'done' | 'rejected') => {
-  void bridge.ledger?.update({ id, status })
+const resolveTask = (id: string, projectId: string, status: 'done' | 'rejected') => {
+  void bridge.ledger?.update({ id, projectId, status })
 }
 
 export function LedgerCard() {
   const workspacePath = useKaisola((s) => s.workspacePath)
+  const projectId = useKaisola((s) => s.activeProjectId)
   const [tasks, setTasks] = useState<LedgerTask[]>([])
   const [title, setTitle] = useState('')
   const [owner, setOwner] = useState('')
@@ -49,6 +50,7 @@ export function LedgerCard() {
     if (!t) return
     void bridge.ledger?.post({
       project: workspacePath ?? undefined,
+      projectId,
       title: t,
       owner: owner.trim() || undefined,
       createdBy: 'human',
@@ -105,10 +107,10 @@ export function LedgerCard() {
               <span className="grow" />
               {t.status !== 'done' && t.status !== 'rejected' && (
                 <>
-                  <button type="button" className="btn-icon btn-sm" onClick={() => resolveTask(t.id, 'done')} title="Mark done" aria-label={`Mark ${t.title} done`}>
+                  <button type="button" className="btn-icon btn-sm" onClick={() => resolveTask(t.id, projectId, 'done')} title="Mark done" aria-label={`Mark ${t.title} done`}>
                     <Icon name="Check" size={12} />
                   </button>
-                  <button type="button" className="btn-icon btn-sm" onClick={() => resolveTask(t.id, 'rejected')} title="Reject" aria-label={`Reject ${t.title}`}>
+                  <button type="button" className="btn-icon btn-sm" onClick={() => resolveTask(t.id, projectId, 'rejected')} title="Reject" aria-label={`Reject ${t.title}`}>
                     <Icon name="X" size={12} />
                   </button>
                 </>

@@ -11,8 +11,8 @@ const fs = require('node:fs')
 const { registerModelHandlers } = require('./ipc/modelHandler.cjs')
 const { registerToolHandlers } = require('./ipc/toolHandler.cjs')
 const { registerSettingsHandlers } = require('./ipc/settingsHandler.cjs')
-const { registerTerminalHandlers, detachSessionBroker, setAppFocused, forgetRendererOwner } = require('./ipc/terminalHandler.cjs')
-const { registerAcpHandlers, disposeAcp, acpRendererSwapState, acpRestartSafetyState, waitForAcpRestartSafe, acpProjectTransferState, transferAcpProject, releaseAcpRenderer } = require('./ipc/acpHandler.cjs')
+const { registerTerminalHandlers, detachSessionBroker, setAppFocused, forgetRendererOwner, setTerminalAttentionSink } = require('./ipc/terminalHandler.cjs')
+const { registerAcpHandlers, disposeAcp, acpRendererSwapState, acpRestartSafetyState, waitForAcpRestartSafe, acpProjectTransferState, transferAcpProject, releaseAcpRenderer, setAcpSessionEventSink } = require('./ipc/acpHandler.cjs')
 const { createPopMirrorCache, sanitizeTerminalMirror, tabListOwnsProject } = require('./ipc/terminalMirrorPolicy.cjs')
 const { registerAuthHandlers, disposeAuth } = require('./ipc/authHandler.cjs')
 const { registerFsHandlers, disposeFs } = require('./ipc/fsHandler.cjs')
@@ -25,13 +25,14 @@ const { registerGitHandlers } = require('./ipc/gitHandler.cjs')
 const { registerLatexHandlers } = require('./ipc/latexHandler.cjs')
 const { registerClaudeHooksHandlers, disposeClaudeHooks } = require('./ipc/claudeHooksHandler.cjs')
 const { registerUsageHandlers } = require('./ipc/usageHandler.cjs')
-const { registerLedgerHandlers } = require('./ipc/ledgerHandler.cjs')
+const { registerLedgerHandlers, setLedgerEventSink } = require('./ipc/ledgerHandler.cjs')
 const { registerMcpHandlers, disposeMcp } = require('./ipc/mcpServer.cjs')
 const { registerExtensionHandlers } = require('./ipc/extensionHandler.cjs')
 const { registerUpdateHandlers } = require('./ipc/updateHandler.cjs')
 const { registerGlassHandlers, wireGlassEvents } = require('./ipc/glassHandler.cjs')
 const { registerAssistantArchiveHandlers } = require('./ipc/assistantArchive.cjs')
 const { registerAttentionHandlers } = require('./ipc/attentionHandler.cjs')
+const { AttentionService } = require('./ipc/attentionService.cjs')
 const { registerCompanionProjectionHandlers } = require('./companion/projectionHandler.cjs')
 const { CompanionProjectionStore, projectionStoreKey } = require('./companion/projectionStore.cjs')
 const { CompanionDesktopState } = require('./companion/desktopState.cjs')
@@ -71,6 +72,7 @@ const companionDesktopEpoch = crypto.randomUUID()
 let companionWindowGeneration = 0
 let companionProjectionStore = null
 let companionDesktopState = null
+let attentionService = null
 
 // ── Liquid Glass (macOS 26 "Tahoe"+) ─────────────────────────────────────────
 // Darwin 25 == macOS 26. When the native module is present and supported, the
@@ -1692,6 +1694,10 @@ if (hasSingleInstanceLock) app.whenReady().then(() => {
   registerGrobidHandlers(ipcMain)
   registerSandboxHandlers(ipcMain)
   registerDbHandlers(ipcMain)
+  attentionService = new AttentionService({
+    get: dbGet,
+    set: (key, value) => dbMutate({ set: { [key]: value } }),
+  })
   companionProjectionStore = new CompanionProjectionStore({
     epoch: companionDesktopEpoch,
     get: dbGet,
@@ -1702,7 +1708,11 @@ if (hasSingleInstanceLock) app.whenReady().then(() => {
   companionDesktopState = new CompanionDesktopState({
     epoch: companionDesktopEpoch,
     projectionStore: companionProjectionStore,
+    attentionService,
   })
+  setAcpSessionEventSink((event) => companionDesktopState.attentionEvent(event))
+  setTerminalAttentionSink((event) => attentionService.handleTerminalEvent(event))
+  setLedgerEventSink((event) => attentionService.handleLedgerEvent({ task: event.task }))
   registerCompanionProjectionHandlers(ipcMain, {
     BrowserWindow,
     store: companionProjectionStore,
@@ -1721,7 +1731,7 @@ if (hasSingleInstanceLock) app.whenReady().then(() => {
   registerUpdateHandlers(ipcMain, { waitForRestartSafe: waitForAcpRestartSafe })
   registerGlassHandlers(ipcMain)
   registerAssistantArchiveHandlers(ipcMain, path.join(app.getPath('userData'), 'assistant-archives'))
-  registerAttentionHandlers(ipcMain, { app, BrowserWindow, Notification })
+  registerAttentionHandlers(ipcMain, { app, BrowserWindow, Notification, service: attentionService })
   restoreSavedWindowsOnLaunch()
   app.on('activate', () => {
     if (visibleFullWindows().length === 0) activateSavedWindows()

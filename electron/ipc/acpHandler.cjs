@@ -162,6 +162,11 @@ const CANCEL_GRACE_MS = 8_000
 // running turn and never answer its own JSON-RPC id — an unbounded wait here
 // wedged the whole connection (busy forever, every next prompt rejected).
 const STEER_FLUSH_MS = 2_000
+let acpSessionEventSink = null
+
+function setAcpSessionEventSink(sink) {
+  acpSessionEventSink = typeof sink === 'function' ? sink : null
+}
 
 function cancelPendingFor(entry, reason) {
   return acpSessionService.cancelPendingFor(entry, reason)
@@ -234,6 +239,7 @@ function desktopActor(sender, projectId) {
  * immutable permission event to this desktop sink and every companion
  * subscriber, while turn deltas are unwrapped for the existing request channel. */
 function deliverDesktopSessionEvent(entry, event) {
+  try { acpSessionEventSink?.(event) } catch { /* attention cannot break provider delivery */ }
   if (event.type === 'agent.turn.delta') {
     sendTo(entry, `acp:update:${event.turnId}`, event.delta)
     return true
@@ -1327,7 +1333,7 @@ function registerAcpHandlers(ipcMain) {
     }
   })
 
-  ipcMain.handle('acp:prompt', (event, { agentKey, reqId, text, images, readOnly } = {}) => {
+  ipcMain.handle('acp:prompt', (event, { agentKey, reqId, text, images, readOnly, attentionSessionId } = {}) => {
     const target = targetCapability(agentKey)
     return acpSessionService.prompt(desktopActor(event.sender, target.projectId), {
       ...target,
@@ -1335,6 +1341,7 @@ function registerAcpHandlers(ipcMain) {
       text,
       images,
       readOnly,
+      attentionSessionId,
     })
   })
 
@@ -1487,6 +1494,7 @@ async function disposeAcp() {
 module.exports = {
   registerAcpHandlers,
   acpSessionService,
+  setAcpSessionEventSink,
   disposeAcp,
   acpRendererSwapState,
   acpRestartSafetyState,

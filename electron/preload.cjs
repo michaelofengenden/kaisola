@@ -88,7 +88,14 @@ const bridge = {
       }
       ipcRenderer.on(chan, listener)
       const prompt = new Promise((resolve, reject) => { resolvePrompt = resolve; rejectPrompt = reject })
-      ipcRenderer.invoke('acp:prompt', { agentKey, reqId, text, images, readOnly: options?.readOnly === true }).then((value) => {
+      ipcRenderer.invoke('acp:prompt', {
+        agentKey,
+        reqId,
+        text,
+        images,
+        readOnly: options?.readOnly === true,
+        attentionSessionId: options?.attentionSessionId,
+      }).then((value) => {
         result = value
         resultReady = true
         settle()
@@ -540,10 +547,22 @@ const bridge = {
   attention: {
     setCount: (count) => ipcRenderer.send('attention:count', count),
     notify: (payload) => ipcRenderer.send('attention:notify', payload),
+    syncSurface: (payload) => ipcRenderer.send('attention:surface', payload),
+    acknowledge: (payload) => ipcRenderer.invoke('attention:ack', payload),
     onOpen: (cb) => {
       const listener = (_e, payload) => cb(payload)
       ipcRenderer.on('attention:open', listener)
       return () => ipcRenderer.removeListener('attention:open', listener)
+    },
+    onRaised: (cb) => {
+      const listener = (_e, payload) => cb(payload)
+      ipcRenderer.on('attention:raised', listener)
+      return () => ipcRenderer.removeListener('attention:raised', listener)
+    },
+    onCleared: (cb) => {
+      const listener = (_e, payload) => cb(payload)
+      ipcRenderer.on('attention:cleared', listener)
+      return () => ipcRenderer.removeListener('attention:cleared', listener)
     },
   },
   // Renderer → main carries only the normalized, allowlisted companion view.

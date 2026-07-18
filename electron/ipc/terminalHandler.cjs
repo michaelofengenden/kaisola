@@ -16,6 +16,12 @@ const { terminalOwnerParts } = require('./securityPolicy.cjs')
 const RUN_TIMEOUT_MS = 120_000
 const runChildren = new Set()
 let brokerClient = null
+let terminalAttentionSink = null
+const terminalProjects = new Map()
+
+function setTerminalAttentionSink(sink) {
+  terminalAttentionSink = typeof sink === 'function' ? sink : null
+}
 
 function broker() {
   return brokerClient || sessionBroker()
@@ -232,6 +238,27 @@ function registerTerminalHandlers(ipcMain) {
     appVersion: app.getVersion(),
     smoke: !!(process.env.KAISOLA_SMOKE || process.env.PASOLA_SMOKE),
   })
+  brokerClient.setEventSink?.(({ projectId, channel, payload }) => {
+    if (!terminalAttentionSink || typeof channel !== 'string') return
+    const id = typeof payload?.id === 'string'
+      ? payload.id
+      : channel.startsWith('terminal:exit:') ? channel.slice('terminal:exit:'.length) : null
+    const exactProjectId = typeof projectId === 'string' && projectId !== 'legacy'
+      ? projectId
+      : id ? terminalProjects.get(id) : null
+    if (!id || !exactProjectId) return
+    if (channel === 'terminal:agent-activity') {
+      terminalAttentionSink({
+        projectId: exactProjectId,
+        sessionId: id,
+        busy: payload?.busy === true,
+        completedAt: payload?.completedAt,
+      })
+    } else if (channel === `terminal:exit:${id}`) {
+      terminalAttentionSink({ projectId: exactProjectId, sessionId: id, exitCode: Number(payload) })
+      terminalProjects.delete(id)
+    }
+  })
   // Lazy by design: file-only work should not pay for a helper process. The
   // first terminal/CLI/ACP-terminal request adopts an existing broker or starts
   // one; closing the last session lets that helper retire again.
@@ -239,6 +266,11 @@ function registerTerminalHandlers(ipcMain) {
   ipcMain.handle('terminal:create', async (event, { id, cwd, cols, rows, projectId } = {}) => {
     const result = await broker().terminal('create', event.sender, { id, cwd: cwd || os.homedir(), cols, rows, projectId }, { timeoutMs: 20_000 })
     if (!result?.ok) return result || { ok: false, message: 'could not start terminal' }
+    if (typeof id === 'string' && typeof projectId === 'string') {
+      terminalProjects.delete(id)
+      terminalProjects.set(id, projectId)
+      while (terminalProjects.size > 500) terminalProjects.delete(terminalProjects.keys().next().value)
+    }
     ensureMetaPolling()
     return { ...result, cwd: cwd || os.homedir(), shell: process.env.SHELL || '/bin/zsh' }
   })
@@ -261,6 +293,11 @@ function registerTerminalHandlers(ipcMain) {
   // (agent-spawned ptys arrive this way — make sure they're polled too)
   ipcMain.handle('terminal:attach', async (event, { id, projectId } = {}) => {
     const result = await broker().terminal('attach', event.sender, { id, projectId })
+    if (result?.ok && typeof id === 'string' && typeof projectId === 'string') {
+      terminalProjects.delete(id)
+      terminalProjects.set(id, projectId)
+      while (terminalProjects.size > 500) terminalProjects.delete(terminalProjects.keys().next().value)
+    }
     ensureMetaPolling()
     return result
   })
@@ -395,5 +432,6 @@ module.exports = {
   setAppFocused,
   forgetRendererOwner,
   subscribeTerminalObserver,
+  setTerminalAttentionSink,
   __test: { codexIdFromPath, jsonStringField, codexSession },
 }

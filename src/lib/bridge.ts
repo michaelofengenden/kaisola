@@ -454,6 +454,7 @@ export interface McpProbeResult {
 export interface LedgerTask {
   id: string
   project?: string | null
+  projectId?: string
   title: string
   detail?: string
   status: 'open' | 'claimed' | 'in_progress' | 'blocked' | 'review' | 'done' | 'rejected' | string
@@ -652,7 +653,7 @@ export interface KaisolaBridge {
       onUpdate: (u: AcpUpdate) => void,
       images?: { mimeType: string; data: string }[],
       scope?: string,
-      options?: { readOnly?: boolean },
+      options?: { readOnly?: boolean; attentionSessionId?: string },
     ): Promise<{ ok: boolean; stopReason?: string; message?: string }>
     /** Inject a follow-up into an agent's already-running turn (mid-turn steer).
      * `unsupported`/`noTurn` signal the caller to fall back to normal enqueue. */
@@ -699,8 +700,8 @@ export interface KaisolaBridge {
    * Kaisola MCP server); the human sees every change in the activity feed. */
   ledger?: {
     list(args?: { project?: string; status?: string }): Promise<{ ok: boolean; tasks: LedgerTask[] }>
-    post(args: { project?: string; title: string; detail?: string; owner?: string; createdBy?: string }): Promise<{ ok: boolean; task?: LedgerTask; message?: string }>
-    update(args: { id: string; status?: string; owner?: string; result?: string }): Promise<{ ok: boolean; task?: LedgerTask; message?: string }>
+    post(args: { project?: string; projectId?: string; title: string; detail?: string; owner?: string; createdBy?: string }): Promise<{ ok: boolean; task?: LedgerTask; message?: string }>
+    update(args: { id: string; projectId?: string; status?: string; owner?: string; result?: string }): Promise<{ ok: boolean; task?: LedgerTask; message?: string }>
     onEvent(cb: (ev: { type: 'posted' | 'updated'; task: LedgerTask }) => void): () => void
   }
   /** The in-app MCP server every connected agent shares. */
@@ -942,8 +943,12 @@ export interface KaisolaBridge {
   /** Native macOS attention surface: dock badge + clickable notifications. */
   attention?: {
     setCount(count: number): void
-    notify(payload: { title: string; body?: string; projectId?: string; sessionId?: string }): void
-    onOpen(cb: (payload: { projectId?: string; sessionId?: string }) => void): () => void
+    notify(payload: { title: string; body?: string; projectId?: string; sessionId?: string; sourceId?: string; kind?: 'permission' | 'question' | 'review' | 'blocked' | 'failed' | 'completed'; createdAt?: number }): void
+    syncSurface(payload: { projectId: string; visibleSessionIds: string[]; documentVisible: boolean; documentFocused: boolean; projects: Array<{ projectId: string; alias?: string }> }): void
+    acknowledge(payload: { projectId: string; eventId: string }): Promise<{ ok: boolean; status?: string; message?: string }>
+    onOpen(cb: (payload: { eventId?: string; projectId?: string; sessionId?: string }) => void): () => void
+    onRaised(cb: (payload: { eventId: string; projectId: string; sessionId?: string; kind: string }) => void): () => void
+    onCleared(cb: (payload: { eventId: string; projectId: string; sessionId?: string; kind: string }) => void): () => void
   }
   /** Publish the normalized mobile-companion display projection. Main validates
    * it again and stores it per saved window; raw Zustand state is never valid. */
@@ -1442,7 +1447,11 @@ const webMock: KaisolaBridge = {
   attention: {
     setCount() {},
     notify() {},
+    syncSurface() {},
+    async acknowledge() { return { ok: false } },
     onOpen() { return () => {} },
+    onRaised() { return () => {} },
+    onCleared() { return () => {} },
   },
   companion: {
     publishProjection() { return false },

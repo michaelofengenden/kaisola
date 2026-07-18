@@ -174,6 +174,11 @@ class SessionBrokerClient {
     this.connecting = null
     this.closing = false
     this.hello = null
+    this.eventSink = null
+  }
+
+  setEventSink(sink) {
+    this.eventSink = typeof sink === 'function' ? sink : null
   }
 
   registerOwner(sender) {
@@ -220,6 +225,7 @@ class SessionBrokerClient {
       return
     }
     if (frame?.type === 'event') {
+      try { this.eventSink?.({ ownerId: frame.ownerId, projectId: frame.projectId, channel: frame.channel, payload: frame.payload }) } catch { /* observers cannot break renderer routing */ }
       const owner = this.owners.get(String(frame.ownerId))
       if (owner && !owner.isDestroyed?.()) owner.send(frame.channel, frame.payload)
     }

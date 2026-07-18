@@ -14,6 +14,11 @@ const STATUSES = new Set(['open', 'claimed', 'in_progress', 'blocked', 'review',
 let db = null // better-sqlite3, or null → JSON-file fallback
 let jsonPath = null
 let seq = 0
+let ledgerEventSink = null
+
+function setLedgerEventSink(sink) {
+  ledgerEventSink = typeof sink === 'function' ? sink : null
+}
 
 function dbPath() {
   return path.join(app.getPath('userData'), 'kaisola-ledger.sqlite3')
@@ -52,6 +57,7 @@ function writeJson(rows) {
 }
 
 function broadcast(event) {
+  try { ledgerEventSink?.(event) } catch { /* attention cannot break the ledger */ }
   for (const win of BrowserWindow.getAllWindows()) {
     if (!win.webContents.isDestroyed()) win.webContents.send('ledger:event', event)
   }
@@ -83,7 +89,7 @@ function listTasks({ project, status } = {}) {
   return rows.map(rowOut)
 }
 
-function postTask({ project, title, detail, createdBy, owner, dependsOn } = {}) {
+function postTask({ project, projectId, title, detail, createdBy, owner, dependsOn } = {}) {
   init()
   const t = String(title || '').trim().slice(0, 300)
   if (!t) return { ok: false, message: 'title is required' }
@@ -107,12 +113,12 @@ function postTask({ project, title, detail, createdBy, owner, dependsOn } = {}) 
   } else {
     const rows = readJson(); rows.push(row); writeJson(rows)
   }
-  const out = rowOut(row)
+  const out = { ...rowOut(row), ...(typeof projectId === 'string' ? { projectId } : {}) }
   broadcast({ type: 'posted', task: out })
   return { ok: true, task: out }
 }
 
-function updateTask({ id, status, owner, result, detail, project } = {}) {
+function updateTask({ id, status, owner, result, detail, project, projectId } = {}) {
   init()
   if (typeof id !== 'string' || !id) return { ok: false, message: 'id is required' }
   if (status != null && !STATUSES.has(status)) return { ok: false, message: `status must be one of: ${[...STATUSES].join(', ')}` }
@@ -140,7 +146,7 @@ function updateTask({ id, status, owner, result, detail, project } = {}) {
     row.updated_at = now
     writeJson(rows)
   }
-  const out = rowOut(row)
+  const out = { ...rowOut(row), ...(typeof projectId === 'string' ? { projectId } : {}) }
   broadcast({ type: 'updated', task: out })
   return { ok: true, task: out }
 }
@@ -151,4 +157,4 @@ function registerLedgerHandlers(ipcMain) {
   ipcMain.handle('ledger:update', (_e, args) => updateTask(args || {}))
 }
 
-module.exports = { registerLedgerHandlers, listTasks, postTask, updateTask }
+module.exports = { registerLedgerHandlers, listTasks, postTask, updateTask, setLedgerEventSink }

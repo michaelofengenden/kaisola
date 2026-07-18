@@ -100,6 +100,7 @@ test('desktop and companion subscribers receive the same ordered turn stream', a
     projectId: PROJECT,
     targetId: TARGET,
     turnId: 'turn-1',
+    attentionSessionId: 'thread-visible-1',
     text: 'Ship the service',
   })
 
@@ -113,6 +114,7 @@ test('desktop and companion subscribers receive the same ordered turn stream', a
   ])
   assert.equal(h.desktopEvents[0], phoneEvents[0])
   assert.deepEqual(phoneEvents.map((event) => event.turnId), ['turn-1', 'turn-1', 'turn-1'])
+  assert.equal(phoneEvents[2].attentionSessionId, 'thread-visible-1')
   assert.deepEqual(h.entry.current, { actorId: null, turnId: null })
   assert.equal('sender' in h.entry.current, false)
   assert.deepEqual(h.service.sessionSummaries(companion(PROJECT, 'observer', ['observe']))[0], {

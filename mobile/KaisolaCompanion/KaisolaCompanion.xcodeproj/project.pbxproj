@@ -11,6 +11,7 @@
 		275432D529916BD0A755B063 /* stale-revision-error.json in Resources */ = {isa = PBXBuildFile; fileRef = 6EED132F2C6069F2431D6C28 /* stale-revision-error.json */; };
 		284F19847EB5DA253C09A74B /* KaisolaCompanionApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = CAE45291BDB007777F7C5D9D /* KaisolaCompanionApp.swift */; };
 		2CF946846F770D846CF496A8 /* CompanionModels.swift in Sources */ = {isa = PBXBuildFile; fileRef = 25FF5E9EE50F0B47F4A36A04 /* CompanionModels.swift */; };
+		2F6E004D5F5513F3D3FA4E85 /* crypto-noise-xx-v1.json in Resources */ = {isa = PBXBuildFile; fileRef = 7D7C0E68F5BA06C2B3197DEC /* crypto-noise-xx-v1.json */; };
 		3607DA57F576C5CC858FB1F5 /* protocol-mismatch.json in Resources */ = {isa = PBXBuildFile; fileRef = 5FA9249683775B12F12B0ABB /* protocol-mismatch.json */; };
 		3BB2686931DA8EC347B240D2 /* command-receipt.json in Resources */ = {isa = PBXBuildFile; fileRef = E1AEC14B1A2D0CEB6CDF0D07 /* command-receipt.json */; };
 		4232AA0DDBC1B9F8561B27AB /* protocol-mismatch.json in Resources */ = {isa = PBXBuildFile; fileRef = 5FA9249683775B12F12B0ABB /* protocol-mismatch.json */; };
@@ -21,6 +22,7 @@
 		5A92D5E5F43D4CC09CA9F5A0 /* command-receipt.json in Resources */ = {isa = PBXBuildFile; fileRef = E1AEC14B1A2D0CEB6CDF0D07 /* command-receipt.json */; };
 		607BAB76F3F9B3B9A04F7FDA /* CompanionPreviewData.swift in Sources */ = {isa = PBXBuildFile; fileRef = AD396B7001732DDC07EC0878 /* CompanionPreviewData.swift */; };
 		640ADF1A2342CAB85C83DA76 /* Components.swift in Sources */ = {isa = PBXBuildFile; fileRef = 74907E2AA6DEFB4DE3F3A1F5 /* Components.swift */; };
+		65A92AD4DC26322E25C3F29C /* crypto-noise-xx-v1.json in Resources */ = {isa = PBXBuildFile; fileRef = 7D7C0E68F5BA06C2B3197DEC /* crypto-noise-xx-v1.json */; };
 		6612C75946F4425079C2F403 /* hello.json in Resources */ = {isa = PBXBuildFile; fileRef = 39E6EFBC687AFC544D2A0758 /* hello.json */; };
 		6B34D071320508AF0A05C519 /* TerminalSessionView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9918CA0A5650E1A28829E741 /* TerminalSessionView.swift */; };
 		70C41EF5C10BA01EF07F632F /* permission-requested.json in Resources */ = {isa = PBXBuildFile; fileRef = B033B705F8829D1F00E5611E /* permission-requested.json */; };
@@ -28,6 +30,7 @@
 		85D524D0AD7BCB46556D1DD5 /* snapshot-board.json in Resources */ = {isa = PBXBuildFile; fileRef = C12FD715842B93B073324EF0 /* snapshot-board.json */; };
 		85EF6FD4832E9C492AEC9EC0 /* AgentSessionView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1CC89D2B67726BE7E2C087DB /* AgentSessionView.swift */; };
 		93F5BD069A0700CEFFAF314D /* terminal-output.json in Resources */ = {isa = PBXBuildFile; fileRef = D99A39F1417D084BCB902598 /* terminal-output.json */; };
+		A65F91BF6BD9DD28932BBA85 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = F3E24D7D1EC4E30B65BD94A2 /* Assets.xcassets */; };
 		A93E88B2C3CB81E6786489F0 /* terminal-output.json in Resources */ = {isa = PBXBuildFile; fileRef = D99A39F1417D084BCB902598 /* terminal-output.json */; };
 		AC2E226862D76BB83513201C /* hello.json in Resources */ = {isa = PBXBuildFile; fileRef = 39E6EFBC687AFC544D2A0758 /* hello.json */; };
 		AC871C80111F68A72A00571B /* SessionsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 01FF0D8B88D7B3360A938A15 /* SessionsView.swift */; };
@@ -65,6 +68,7 @@
 		6EED132F2C6069F2431D6C28 /* stale-revision-error.json */ = {isa = PBXFileReference; lastKnownFileType = text.json; path = "stale-revision-error.json"; sourceTree = "<group>"; };
 		6FC8DDA36658D1F7FA09BC13 /* DevicesView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DevicesView.swift; sourceTree = "<group>"; };
 		74907E2AA6DEFB4DE3F3A1F5 /* Components.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Components.swift; sourceTree = "<group>"; };
+		7D7C0E68F5BA06C2B3197DEC /* crypto-noise-xx-v1.json */ = {isa = PBXFileReference; lastKnownFileType = text.json; path = "crypto-noise-xx-v1.json"; sourceTree = "<group>"; };
 		9918CA0A5650E1A28829E741 /* TerminalSessionView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TerminalSessionView.swift; sourceTree = "<group>"; };
 		AC552FAB4C3E746B92613FAD /* KaisolaTheme.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KaisolaTheme.swift; sourceTree = "<group>"; };
 		AD396B7001732DDC07EC0878 /* CompanionPreviewData.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CompanionPreviewData.swift; sourceTree = "<group>"; };
@@ -76,6 +80,7 @@
 		D99A39F1417D084BCB902598 /* terminal-output.json */ = {isa = PBXFileReference; lastKnownFileType = text.json; path = "terminal-output.json"; sourceTree = "<group>"; };
 		E1AEC14B1A2D0CEB6CDF0D07 /* command-receipt.json */ = {isa = PBXFileReference; lastKnownFileType = text.json; path = "command-receipt.json"; sourceTree = "<group>"; };
 		F10B41590DFE608508B80BB1 /* KaisolaCompanionTests.xctest */ = {isa = PBXFileReference; includeInIndex = 0; lastKnownFileType = wrapper.cfbundle; path = KaisolaCompanionTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
+		F3E24D7D1EC4E30B65BD94A2 /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
 		FF8146910ED9B45E8A6689A9 /* NeedsYouView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NeedsYouView.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
@@ -102,6 +107,7 @@
 			children = (
 				BAD6C8487CA84F964A165DF8 /* agent-delta.json */,
 				E1AEC14B1A2D0CEB6CDF0D07 /* command-receipt.json */,
+				7D7C0E68F5BA06C2B3197DEC /* crypto-noise-xx-v1.json */,
 				39E6EFBC687AFC544D2A0758 /* hello.json */,
 				B033B705F8829D1F00E5611E /* permission-requested.json */,
 				5FA9249683775B12F12B0ABB /* protocol-mismatch.json */,
@@ -178,6 +184,7 @@
 				B80FD1A29FCA6106E3EAEE7C /* Preview */,
 				F6063D447899A29FE0116307 /* Store */,
 				70AFD67F2F494A9FFA0D1DEB /* UI */,
+				F3E24D7D1EC4E30B65BD94A2 /* Assets.xcassets */,
 			);
 			path = KaisolaCompanion;
 			sourceTree = "<group>";
@@ -318,6 +325,7 @@
 			files = (
 				78FB0FA0BB3ECE8BBE2A1CAD /* agent-delta.json in Resources */,
 				3BB2686931DA8EC347B240D2 /* command-receipt.json in Resources */,
+				2F6E004D5F5513F3D3FA4E85 /* crypto-noise-xx-v1.json in Resources */,
 				AC2E226862D76BB83513201C /* hello.json in Resources */,
 				4841BA1218D3E4663C6C83DB /* permission-requested.json in Resources */,
 				3607DA57F576C5CC858FB1F5 /* protocol-mismatch.json in Resources */,
@@ -332,8 +340,10 @@
 			isa = PBXResourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				A65F91BF6BD9DD28932BBA85 /* Assets.xcassets in Resources */,
 				01CE4D4B98D9C3E6223D723F /* agent-delta.json in Resources */,
 				5A92D5E5F43D4CC09CA9F5A0 /* command-receipt.json in Resources */,
+				65A92AD4DC26322E25C3F29C /* crypto-noise-xx-v1.json in Resources */,
 				6612C75946F4425079C2F403 /* hello.json in Resources */,
 				70C41EF5C10BA01EF07F632F /* permission-requested.json in Resources */,
 				4232AA0DDBC1B9F8561B27AB /* protocol-mismatch.json in Resources */,
@@ -471,6 +481,7 @@
 				CODE_SIGN_STYLE = Automatic;
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_KEY_CFBundleDisplayName = Kaisola;
+				INFOPLIST_KEY_ITSAppUsesNonExemptEncryption = NO;
 				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.productivity";
 				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
 				INFOPLIST_KEY_UILaunchScreen_Generation = YES;
@@ -478,6 +489,7 @@
 					"$(inherited)",
 					"@executable_path/Frameworks",
 				);
+				MARKETING_VERSION = 0.1.0;
 				PRODUCT_BUNDLE_IDENTIFIER = com.kaisola.companion;
 				SDKROOT = iphoneos;
 				SUPPORTS_MACCATALYST = NO;
@@ -559,6 +571,7 @@
 				CODE_SIGN_STYLE = Automatic;
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_KEY_CFBundleDisplayName = Kaisola;
+				INFOPLIST_KEY_ITSAppUsesNonExemptEncryption = NO;
 				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.productivity";
 				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
 				INFOPLIST_KEY_UILaunchScreen_Generation = YES;
@@ -566,6 +579,7 @@
 					"$(inherited)",
 					"@executable_path/Frameworks",
 				);
+				MARKETING_VERSION = 0.1.0;
 				PRODUCT_BUNDLE_IDENTIFIER = com.kaisola.companion;
 				SDKROOT = iphoneos;
 				SUPPORTS_MACCATALYST = NO;

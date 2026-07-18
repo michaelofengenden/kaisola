@@ -95,12 +95,17 @@ const xtermTheme = (theme: 'dark' | 'light', eco: boolean, cursorColor = 'auto',
 
 /** xterm may reflow its buffer when its palette, font, or fitted geometry
  * changes. Preserve the user's distance from the live prompt through both the
- * synchronous update and the next paint instead of snapping to row zero. */
-const preserveTerminalViewport = (term: XTerm, mutate: () => void) => {
+ * synchronous update and the next paint instead of snapping to row zero.
+ * `pinned` is the sticky follow intent: wrapped-line reflow drifts the
+ * measured distance by a row or two across repeated tab-squish fits, so a
+ * distance threshold alone silently unpins a terminal the user never
+ * scrolled — only a deliberate scroll may unpin. */
+const preserveTerminalViewport = (term: XTerm, mutate: () => void, pinned?: boolean) => {
   const fromBottom = Math.max(0, term.buffer.active.baseY - term.buffer.active.viewportY)
+  const stick = pinned ?? fromBottom <= 1
   const restore = () => {
     try {
-      if (fromBottom <= 1) term.scrollToBottom()
+      if (stick) term.scrollToBottom()
       else term.scrollToLine(Math.max(0, term.buffer.active.baseY - fromBottom))
     } catch { /* renderer mid-rebuild */ }
   }
@@ -338,7 +343,7 @@ export function Terminal({ id, attach = false, boot, cwd, projectId: projectIdOv
       secondFrame = requestAnimationFrame(() => {
         if (termRef.current !== term || !visibleRef.current) return
         try {
-          preserveTerminalViewport(term, () => fitRef.current?.fit())
+          preserveTerminalViewport(term, () => fitRef.current?.fit(), followOutputRef.current)
           term.refresh(0, Math.max(0, term.rows - 1))
           void bridge.terminal.resize(id, term.cols, term.rows, projectId).catch(() => {})
         } catch { /* renderer changed again before paint */ }
@@ -362,6 +367,10 @@ export function Terminal({ id, attach = false, boot, cwd, projectId: projectIdOv
     else glCtlRef.current?.drop()
   }, [cardShown, ecoMode, id])
 
+  // Sticky follow intent: true while the terminal should stay pinned to the
+  // live prompt. Only deliberate user scrolls (wheel up, find, rail/mark
+  // jumps) unpin; resizes, tab switches, and remounts never do.
+  const followOutputRef = useRef(true)
   // font settings (Settings → Terminal, plus ⌘+/⌘−/⌘0) apply LIVE to every
   // terminal — the renderer rebuilds its glyph atlas and the pty re-fits
   const fitRef = useRef<FitAddon | null>(null)
@@ -376,7 +385,7 @@ export function Terminal({ id, attach = false, boot, cwd, projectId: projectIdOv
         term.options.lineHeight = termLineHeight
         fitRef.current?.fit()
         void bridge.terminal.resize(id, term.cols, term.rows, projectId).catch(() => {})
-      })
+      }, followOutputRef.current)
     } catch { /* transient */ }
   }, [termFontSize, termFontFamily, termFontWeight, termLineHeight, id, projectId])
 
@@ -666,8 +675,13 @@ export function Terminal({ id, attach = false, boot, cwd, projectId: projectIdOv
       const prev = [...live].reverse().find((m) => m.marker.line < viewTop)
       const next = live.find((m) => m.marker.line > viewTop)
       const target = ev.key === 'ArrowUp' ? prev ?? live[0] : next
-      if (target) term.scrollToLine(target.marker.line)
-      else if (ev.key === 'ArrowDown') term.scrollToBottom()
+      if (target) {
+        followOutputRef.current = false
+        term.scrollToLine(target.marker.line)
+      } else if (ev.key === 'ArrowDown') {
+        followOutputRef.current = true
+        term.scrollToBottom()
+      }
       return false
     })
 
@@ -862,6 +876,7 @@ export function Terminal({ id, attach = false, boot, cwd, projectId: projectIdOv
       const restoreView = () => {
         const fromBottom = Number(snap.viewState?.scrollFromBottom)
         if (Number.isFinite(fromBottom)) {
+          followOutputRef.current = fromBottom <= 1
           try {
             if (fromBottom <= 1) term.scrollToBottom()
             else term.scrollToLine(Math.max(0, term.buffer.active.baseY - fromBottom))
@@ -923,7 +938,7 @@ export function Terminal({ id, attach = false, boot, cwd, projectId: projectIdOv
         preserveTerminalViewport(term, () => {
           fit.fit()
           void bridge.terminal.resize(id, term.cols, term.rows, projectId).catch(() => {})
-        })
+        }, followOutputRef.current)
       } catch {
         /* ignore */
       }
@@ -935,13 +950,24 @@ export function Terminal({ id, attach = false, boot, cwd, projectId: projectIdOv
     const host = hostRef.current
     const focus = () => term.focus()
     host.addEventListener('click', focus)
+    // A wheel gesture is the user stating where they want to look: unpin when
+    // it lands above the live prompt, re-pin when it returns to the bottom.
+    const onWheel = () => requestAnimationFrame(() => {
+      if (termRef.current !== term) return
+      followOutputRef.current = term.buffer.active.baseY - term.buffer.active.viewportY <= 1
+    })
+    host.addEventListener('wheel', onWheel, { passive: true })
 
     return () => {
       disposed = true
       // Persist the viewport before xterm releases its scrollback. This only
       // detaches the renderer; a running shell/agent is never killed.
       const viewState = {
-        scrollFromBottom: Math.max(0, term.buffer.active.baseY - term.buffer.active.viewportY),
+        // A pinned terminal persists 0 regardless of measured drift, so the
+        // next mount lands on the live prompt, not two rows above it.
+        scrollFromBottom: followOutputRef.current
+          ? 0
+          : Math.max(0, term.buffer.active.baseY - term.buffer.active.viewportY),
         cols: term.cols,
         rows: term.rows,
       }
@@ -958,6 +984,7 @@ export function Terminal({ id, attach = false, boot, cwd, projectId: projectIdOv
       armDraftRetypeRef.current = () => {}
       window.removeEventListener('resize', onWinResize)
       host.removeEventListener('click', focus)
+      host.removeEventListener('wheel', onWheel)
       ro.disconnect()
       unsubData()
       unsubExit()
@@ -1049,6 +1076,7 @@ export function Terminal({ id, attach = false, boot, cwd, projectId: projectIdOv
 
   const findNext = (back = false) => {
     if (!findQuery) return
+    followOutputRef.current = false // jumping to a match is a deliberate look-away
     if (back) searchRef.current?.findPrevious(findQuery, { decorations: FIND_DECORATIONS })
     else searchRef.current?.findNext(findQuery, { decorations: FIND_DECORATIONS })
   }
@@ -1056,7 +1084,9 @@ export function Terminal({ id, attach = false, boot, cwd, projectId: projectIdOv
     setFindOpen(false)
     setFindQuery('')
     searchRef.current?.clearDecorations()
-    termRef.current?.focus()
+    const term = termRef.current
+    if (term) followOutputRef.current = term.buffer.active.baseY - term.buffer.active.viewportY <= 1
+    term?.focus()
   }
 
   if (!isDesktop) {
@@ -1117,7 +1147,10 @@ export function Terminal({ id, attach = false, boot, cwd, projectId: projectIdOv
               key={`${p.at}:${p.text}`}
               className="turn-tick"
               onMouseEnter={(e) => setRailHover({ n, y: (e.currentTarget as HTMLElement).offsetTop })}
-              onClick={() => termRef.current?.scrollToLine(p.marker.line)}
+              onClick={() => {
+                followOutputRef.current = false
+                termRef.current?.scrollToLine(p.marker.line)
+              }}
               aria-label={p.text.slice(0, 60)}
             />
           ))}

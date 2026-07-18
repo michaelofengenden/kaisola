@@ -4,7 +4,6 @@ import SwiftUI
 /// Recent — each card a tap from the real session. Replaces the orb dashboard.
 struct HomeView: View {
     @EnvironmentObject private var store: CompanionStore
-    @EnvironmentObject private var auth: AuthModel
     @Environment(\.colorScheme) private var colorScheme
 
     var onOpenSession: (CompanionSession) -> Void = { _ in }

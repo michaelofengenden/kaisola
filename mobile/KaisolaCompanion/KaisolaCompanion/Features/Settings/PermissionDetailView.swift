@@ -147,7 +147,11 @@ struct DiffCard: View {
 #Preview {
     let store = CompanionStore.preview()
     return NavigationStack {
-        PermissionDetailView(permission: store.permissions.first!)
+        if let permission = store.permissions.first {
+            PermissionDetailView(permission: permission)
+        } else {
+            Text("No pending permission")
+        }
     }
     .environmentObject(store)
 }

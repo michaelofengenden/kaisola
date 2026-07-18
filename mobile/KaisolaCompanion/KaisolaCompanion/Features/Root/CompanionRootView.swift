@@ -7,13 +7,17 @@ struct CompanionRootView: View {
 
     @EnvironmentObject private var store: CompanionStore
     @EnvironmentObject private var auth: AuthModel
-    // KAISOLA_UI_TAB lets a screenshot launch open a specific tab.
+    // KAISOLA_UI_TAB lets a screenshot launch open a specific tab (debug only).
     @State private var selection: Tab = {
+        #if DEBUG
         switch ProcessInfo.processInfo.environment["KAISOLA_UI_TAB"] {
         case "settings": return .settings
         case "sessions": return .sessions
         default: return .home
         }
+        #else
+        return .home
+        #endif
     }()
     @State private var homePath = NavigationPath()
     @State private var sessionsPath = NavigationPath()
@@ -31,7 +35,7 @@ struct CompanionRootView: View {
                     .transition(.opacity)
             }
         }
-        .animation(.smooth(duration: 0.35), value: auth.isSignedIn)
+        .animation(.smooth(duration: 0.35), value: auth.phase)
     }
 
     private var signedInShell: some View {
@@ -102,16 +106,30 @@ struct CompanionRootView: View {
     }
 }
 
-/// Brief launch state while the Keychain refresh token is checked.
+/// Brief launch state while the Keychain refresh token is checked. Shows a
+/// quiet progress cue after a beat so a slow network restore never reads as a
+/// frozen logo.
 struct SplashView: View {
+    @State private var showProgress = false
+
     var body: some View {
         ZStack {
             AmbientBackdrop()
-            RoundedRectangle(cornerRadius: 20, style: .continuous)
-                .fill(LinearGradient(colors: [KaisolaTheme.electric, KaisolaTheme.accent], startPoint: .topLeading, endPoint: .bottomTrailing))
-                .frame(width: 64, height: 64)
-                .overlay { Image(systemName: "square.grid.2x2.fill").font(.system(size: 27, weight: .medium)).foregroundStyle(KaisolaTheme.darkFrame) }
-                .shadow(color: KaisolaTheme.accent.opacity(0.4), radius: 20, y: 8)
+            VStack(spacing: 22) {
+                RoundedRectangle(cornerRadius: 20, style: .continuous)
+                    .fill(LinearGradient(colors: [KaisolaTheme.electric, KaisolaTheme.accent], startPoint: .topLeading, endPoint: .bottomTrailing))
+                    .frame(width: 64, height: 64)
+                    .overlay { Image(systemName: "square.grid.2x2.fill").font(.system(size: 27, weight: .medium)).foregroundStyle(KaisolaTheme.darkFrame) }
+                    .shadow(color: KaisolaTheme.accent.opacity(0.4), radius: 20, y: 8)
+                ProgressView()
+                    .tint(.secondary)
+                    .opacity(showProgress ? 1 : 0)
+                    .accessibilityLabel("Signing in")
+            }
+        }
+        .task {
+            try? await Task.sleep(for: .milliseconds(500))
+            withAnimation(.easeIn) { showProgress = true }
         }
     }
 }

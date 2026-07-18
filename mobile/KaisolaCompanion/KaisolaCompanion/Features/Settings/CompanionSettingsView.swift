@@ -101,9 +101,9 @@ struct CompanionSettingsView: View {
         }
     }
 
-    private var macName: String {
-        store.projects.first?.name.isEmpty == false ? "Michael's MacBook Pro" : "Michael's MacBook Pro"
-    }
+    // Neutral label until a real paired-device name arrives from the desktop
+    // (pairing is wired in a later task). Never a hardcoded personal name.
+    private let macName = "Your Mac"
     private var accessLabel: String {
         if store.canControlTerminals { return "Full control" }
         if store.canControlAgents { return "Agent control" }

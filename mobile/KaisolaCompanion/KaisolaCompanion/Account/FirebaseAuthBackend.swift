@@ -283,6 +283,13 @@ final class FirebaseAuthBackend: AuthBackend {
         } catch let error as FirebaseAuthError where error.isTerminalRefreshFailure {
             try? vault.clear()
             return nil
+        } catch {
+            // A transient refresh failure (network blip, 5xx) must NOT log the
+            // user out — mirror the desktop and keep the cached identity. The
+            // Keychain is untouched, so the next launch retries cleanly.
+            if Task.isCancelled { throw CancellationError() }
+            if let cachedAccount { return cachedAccount }
+            throw error
         }
 
         try vault.updateRefreshToken(refreshed.refreshToken ?? refreshToken)

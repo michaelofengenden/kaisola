@@ -1,0 +1,204 @@
+{
+  "schema": "kaisola.noise-xx.v1",
+  "description": "Deterministic cross-language Task 8 transcript. Private seeds are test-only and MUST NOT be used in production.",
+  "protocol": "Noise_XX_25519_ChaChaPoly_SHA256",
+  "protocolVersion": 1,
+  "roles": { "initiator": "device", "responder": "desktop" },
+  "messageOrder": [
+    "device -> desktop: e",
+    "desktop -> device: e, ee, encrypted s, es, encrypted Ed25519 transcript proof",
+    "device -> desktop: encrypted s, se, encrypted Ed25519 transcript proof"
+  ],
+  "identities": {
+    "desktop": {
+      "id": "desktop-vector-20260717",
+      "displayName": "Michael Mac",
+      "ed25519Seed": "0101010101010101010101010101010101010101010101010101010101010101",
+      "x25519StaticSeed": "0202020202020202020202020202020202020202020202020202020202020202",
+      "identityPublic": "iojj3XQJ8ZX9UtstPLpdcspnCb8dlBIb83SIAbQPb1w",
+      "x25519StaticPublic": "zo060cy2M-x7cMF4FKXHbs0CloUFDTRHRboFhw5YfVk",
+      "signedKeyRecord": {
+        "desktopId": "desktop-vector-20260717",
+        "role": "desktop",
+        "x25519StaticPublic": "zo060cy2M-x7cMF4FKXHbs0CloUFDTRHRboFhw5YfVk",
+        "signature": "FO7ikbzzMh9IsgygcQKl6IsKNVgpPgE5AGqC9Do_6HQIjZd3aos9FnvjzLJnKGWF6wECSffqWD6BQPSOoK2aBQ"
+      }
+    },
+    "device": {
+      "id": "device-vector-iphone",
+      "displayName": "Michael's iPhone",
+      "ed25519Seed": "0303030303030303030303030303030303030303030303030303030303030303",
+      "x25519StaticSeed": "0404040404040404040404040404040404040404040404040404040404040404",
+      "identityPublic": "7UkoxijRwsbq6QM4kFmVYSlZJzpcY_k2NsFGFKyHN9E",
+      "x25519StaticPublic": "rAGyIJ6GNU-4UyN7XeD0-rE8f8v0M6YcAZNpYX_s8Qs",
+      "signedKeyRecord": {
+        "deviceId": "device-vector-iphone",
+        "role": "device",
+        "x25519StaticPublic": "rAGyIJ6GNU-4UyN7XeD0-rE8f8v0M6YcAZNpYX_s8Qs",
+        "signature": "rgaXm_knXj5BG3_vuGYuZHVOnGFQtcgXZzcW-onsl8EVbbXKiOEJc3DPNnluZlYdJSS1sgUEIl26IOyOn7w1BQ"
+      }
+    }
+  },
+  "ephemeralSeeds": {
+    "device": "0505050505050505050505050505050505050505050505050505050505050505",
+    "desktop": "0606060606060606060606060606060606060606060606060606060606060606"
+  },
+  "qrPayload": {
+    "type": "kaisola-companion-pairing",
+    "protocolVersion": 1,
+    "noiseProtocol": "Noise_XX_25519_ChaChaPoly_SHA256",
+    "desktopId": "desktop-vector-20260717",
+    "identityPublic": "iojj3XQJ8ZX9UtstPLpdcspnCb8dlBIb83SIAbQPb1w",
+    "keyRecord": {
+      "desktopId": "desktop-vector-20260717",
+      "role": "desktop",
+      "x25519StaticPublic": "zo060cy2M-x7cMF4FKXHbs0CloUFDTRHRboFhw5YfVk",
+      "signature": "FO7ikbzzMh9IsgygcQKl6IsKNVgpPgE5AGqC9Do_6HQIjZd3aos9FnvjzLJnKGWF6wECSffqWD6BQPSOoK2aBQ"
+    },
+    "pairingNonce": "BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc",
+    "requestedCapabilities": ["observe"],
+    "transportHint": { "service": "_kaisola._tcp", "protocol": "tcp" },
+    "expiresAt": 1784250120000
+  },
+  "pins": {
+    "desktop": {
+      "id": "desktop-vector-20260717",
+      "identityPublic": "iojj3XQJ8ZX9UtstPLpdcspnCb8dlBIb83SIAbQPb1w",
+      "x25519StaticPublic": "zo060cy2M-x7cMF4FKXHbs0CloUFDTRHRboFhw5YfVk"
+    }
+  },
+  "handshake": {
+    "context": {
+      "v": 1,
+      "mode": "pair",
+      "protocol": "Noise_XX_25519_ChaChaPoly_SHA256",
+      "desktopId": "desktop-vector-20260717",
+      "connectionId": "connection-vector-0001",
+      "qrHash": "C6l9NP34-E_WDRLWJswCCFTpYf_c_Ym5w1BP8MBT5c8"
+    },
+    "prologue": "a2Fpc29sYS1jb21wYW5pb24tbm9pc2UtcHJvbG9ndWUtdjEAeyJjb25uZWN0aW9uSWQiOiJjb25uZWN0aW9uLXZlY3Rvci0wMDAxIiwiZGVza3RvcElkIjoiZGVza3RvcC12ZWN0b3ItMjAyNjA3MTciLCJtb2RlIjoicGFpciIsInByb3RvY29sIjoiTm9pc2VfWFhfMjU1MTlfQ2hhQ2hhUG9seV9TSEEyNTYiLCJxckhhc2giOiJDNmw5TlAzNC1FX1dEUkxXSnN3Q0NGVHBZZl9jX1ltNXcxQlA4TUJUNWM4IiwidiI6MX0",
+    "message1": "UKYUCbHd0DJemxa3AOcZ6XcsBwALG9d4bpB8ZT0gSV0",
+    "message2": "9bLW5g-Ud-MQwpgtqqbJE2wQihd3xZR-RI-jfWgXRVfD4DALrF_IYuaw41lPAHZgSPstw3wr0A2o9Ez09Ta_98-qpva6FhuWFB9SdVhz6d-xKeoPYzSWeq6OyXHIM7mh1qmnG5jKM4Gx4hcrcrKxDTGsC6PLpUCAjcVG4pIr2D_a1kUeh7DrxDaq0P38AAwK62H04wJptdXrO6QGJLfqlfO2du7dwz4mPdnIAwNAc-tCUXtU1lTYguoK8BVjh3oR5XAzowTY4G5pwsTBkcS4vOdqM9806b_NCkJr-WpZZ7CsfPs_kIcUM9A52vDin11Ir9G7vLpAHnckFGguxN4MJU_T3mtZHFqD4eF0D_HigDv53Vef65g2xnG5qF6KQmTXShk9kdh3EJwKmiCNaG8VI6dZe6RVYC0I4K6Mxo3sQd1z2F9JLN3bIZGOIi_jEHaYPzNoTIO_qLGLVaQRn8qrw5QbkhWLLlX1tLsZNB9CxDeBYpQgwqJ9IgaebdJbUIPihQ17PF2YfAOmEgaYEkX96kZumQ3yunULMpbBcPlIBPvp3iNEysCMB8wUrm8gdGzDC6jsgR--5vjArCfV9F4A1uXMA3FNP-gIsqDMdYAHyyrokfY7taSHtXBbn0gCVfrKoBVtB0t7BhE-1KMe2_ImzDVFme5c2jsN9-oi2toNbWW0JGb6VVVxUppHb0B7umZPPcnbqzOMBQNV_2T298gLvIbeyOi_tEczSnJQyH6r",
+    "message3": "6GYkWCVehspnc-VCP23KLaK2q5qougC6QfXpHpJdvk7kJLlB-PuisUbX9ITzxivxXlwKGY4r24dmWZTtrFJ6oVMTaQZk-4_XfzV4NA7a_Goy1-xk4-YsKIx5B2jXCw_ifbv2Mc2hXDDnBdmkJaCvArEZpJNjb0_yDdUhTGUX3HO5bs2x77TaMyDw82plYb-WnHlHday-PkAloRPk90MRZCSUH7qV-q4goHyQzfmlv8eeUy7mVewaB75x8wPh5t6sKPbxQMdP4pasyH1yC45Oa2g6giaKM1ajVlb6YFmOdTradN_u17CdacvQC3iWBVIyvuvnV4DzNK-3Wot3oh7BaRCI95Lqqn7-wKImB5KpIGlHl9Pg1YHs60W1NhnclT6avNsjMyGiYO_HXAaLPoyyqpJOJepfQg9byoZbm_TeGJy0sK2xFQ_obGAQsXBXtlF_Es6ryYCMd7GgQViaouetjiEt8kLctqC_Noh4_KnkNOxXoVmsas0inrUegm4dAIhwXHKY0IW_38yjkfTelBHVWqgz3OM1lM85TqAgIngrSaxE1EbJhAgAo2ACtz0Wts9gI63f94BjH96UCqeeulv4uFvqt8cfsbU5nwtnwVBIvvS-n-2ZIBqWLHE57w5U_G-_g2iMHJ1fL5yXrFkA4C2RA98SwckPXiIHEiK_3FSaJ6t_E5lDztUR_JQ5Ja_b",
+    "finalHash": "iLERO4IxMs8FOZclU72i1tFcX6QoKKpQ4jpRxzGDNoU",
+    "splitKeys": [
+      "dLe_YXmzP-VSwRL5qvWICnrmHeIqXy1HVQUCB-IC48g",
+      "-6qL8UG5NkkdZWs-BYcmRdUhKwg2n_5r0dQgdEjAGGU"
+    ]
+  },
+  "proofs": {
+    "desktop": {
+      "id": "desktop-vector-20260717",
+      "role": "desktop",
+      "displayName": "Michael Mac",
+      "identityPublic": "iojj3XQJ8ZX9UtstPLpdcspnCb8dlBIb83SIAbQPb1w",
+      "x25519StaticPublic": "zo060cy2M-x7cMF4FKXHbs0CloUFDTRHRboFhw5YfVk",
+      "keyRecord": {
+        "desktopId": "desktop-vector-20260717",
+        "role": "desktop",
+        "x25519StaticPublic": "zo060cy2M-x7cMF4FKXHbs0CloUFDTRHRboFhw5YfVk",
+        "signature": "FO7ikbzzMh9IsgygcQKl6IsKNVgpPgE5AGqC9Do_6HQIjZd3aos9FnvjzLJnKGWF6wECSffqWD6BQPSOoK2aBQ"
+      }
+    },
+    "device": {
+      "id": "device-vector-iphone",
+      "role": "device",
+      "displayName": "Michael's iPhone",
+      "identityPublic": "7UkoxijRwsbq6QM4kFmVYSlZJzpcY_k2NsFGFKyHN9E",
+      "x25519StaticPublic": "rAGyIJ6GNU-4UyN7XeD0-rE8f8v0M6YcAZNpYX_s8Qs",
+      "keyRecord": {
+        "deviceId": "device-vector-iphone",
+        "role": "device",
+        "x25519StaticPublic": "rAGyIJ6GNU-4UyN7XeD0-rE8f8v0M6YcAZNpYX_s8Qs",
+        "signature": "rgaXm_knXj5BG3_vuGYuZHVOnGFQtcgXZzcW-onsl8EVbbXKiOEJc3DPNnluZlYdJSS1sgUEIl26IOyOn7w1BQ"
+      }
+    }
+  },
+  "connection": {
+    "desktopId": "desktop-vector-20260717",
+    "deviceId": "device-vector-iphone",
+    "connectionId": "connection-vector-0001",
+    "keys": {
+      "deviceToDesktop": "U3N5jtQ0OZu7nOxr8Hf8BRNHtsxtaLOA8oo7kl0Yfl4",
+      "desktopToDevice": "Ljy0OD6WdCENSTPXMpIUXG25iJSnUJqU43Y8HcgLxas"
+    }
+  },
+  "keyConfirmation": {
+    "desktopFrame": {
+      "v": 1,
+      "desktopId": "desktop-vector-20260717",
+      "deviceId": "device-vector-iphone",
+      "connectionId": "connection-vector-0001",
+      "direction": "desktop-to-device",
+      "counter": "0",
+      "ciphertextLength": 102,
+      "ciphertext": "YUF9ifSqJzxWD3tB7Ee2g_3b5u_K0Iq3hHj1-qanLXKQCMceasI7YCTAh70n0afCYHxkORg2E5gcDVsM3ym2IqFXPmvXAQ68tahMwxRBho7GW28yEnjk9nPZ4y1g3-kX3Xt4ZrRkKNqDrpPNdpnFWSN1raSyYA"
+    },
+    "deviceFrame": {
+      "v": 1,
+      "desktopId": "desktop-vector-20260717",
+      "deviceId": "device-vector-iphone",
+      "connectionId": "connection-vector-0001",
+      "direction": "device-to-desktop",
+      "counter": "0",
+      "ciphertextLength": 101,
+      "ciphertext": "oGYsG2PB00LT0hQDz1Pvm5L2rh5uLWIf6e06r24OU5_6yWxtgWvdO1zcs8_yh4wlMI4EoPYK0lwfhJyLtpbxJlxkE-g5v1xpYc5wXTYFuTNNHSluStHPrwMapAH9IMZWA3E3vCf4bjjTNxccPTi8qejzPRJ8"
+    },
+    "firstApplicationCounter": "1"
+  },
+  "sas": {
+    "phrase": "calm-willow amber-anchor rapid-meadow coral-comet",
+    "words": ["calm-willow", "amber-anchor", "rapid-meadow", "coral-comet"],
+    "entropyBits": 32,
+    "bytes": "LgDZRA"
+  },
+  "application": {
+    "plaintext": {
+      "v": 1,
+      "kind": "hello",
+      "body": { "type": "hello", "role": "device", "capabilities": ["observe"] }
+    },
+    "frame": {
+      "v": 1,
+      "desktopId": "desktop-vector-20260717",
+      "deviceId": "device-vector-iphone",
+      "connectionId": "connection-vector-0001",
+      "direction": "device-to-desktop",
+      "counter": "1",
+      "ciphertextLength": 89,
+      "ciphertext": "ulWkG7ndWVmw7KJX-mE9WCcB9Oms1hFYnyFfrIdRshZmrhC94h3spNOeYcmnoNEdWMRbiRyXKCNPoviiV4fQ1u0aphmUW9SSeI4kee3URU7AI94fAPMbp18rgBmPFHiMhpivXooThTJN"
+    },
+    "nonce": "AAAAAAEAAAAAAAAA",
+    "aad": "eyJjaXBoZXJ0ZXh0TGVuZ3RoIjo4OSwiY29ubmVjdGlvbklkIjoiY29ubmVjdGlvbi12ZWN0b3ItMDAwMSIsImNvdW50ZXIiOiIxIiwiZGVza3RvcElkIjoiZGVza3RvcC12ZWN0b3ItMjAyNjA3MTciLCJkZXZpY2VJZCI6ImRldmljZS12ZWN0b3ItaXBob25lIiwiZGlyZWN0aW9uIjoiZGV2aWNlLXRvLWRlc2t0b3AiLCJ2IjoxfQ"
+  },
+  "replay": { "acceptedCounter": "1", "repeatedCounterError": "replay_or_out_of_order" },
+  "clockSkew": {
+    "expiresAt": 1784250120000,
+    "phoneAllowanceMs": 30000,
+    "phoneAtExpiresPlus20000": "accepted",
+    "phoneAtExpiresPlus30001": "pairing_expired",
+    "desktopAtExpiresPlus1": "pairing_expired"
+  },
+  "simultaneousPairing": {
+    "pairingNonce": "BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc",
+    "firstClaim": "accepted_and_nonce_consumed",
+    "secondClaim": "pairing_offer_unavailable",
+    "failedFirstHandshakeRestoresOffer": false
+  },
+  "rePair": {
+    "sameDeviceId": "device-vector-iphone",
+    "newEd25519Seed": "4747474747474747474747474747474747474747474747474747474747474747",
+    "newX25519StaticSeed": "4848484848484848484848484848484848484848484848484848484848484848",
+    "oldIdentityPublic": "7UkoxijRwsbq6QM4kFmVYSlZJzpcY_k2NsFGFKyHN9E",
+    "oldX25519StaticPublic": "rAGyIJ6GNU-4UyN7XeD0-rE8f8v0M6YcAZNpYX_s8Qs",
+    "newIdentityPublic": "4oqJcHUzMr1y_vQT5rCy7xtKrdp6osFB8jNxKmh2s1E",
+    "newX25519StaticPublic": "kXeyMnjL8PPRfDbyrMm1XpyF-HsiClOG7DcNZj4g4zc",
+    "expected": {
+      "requiresExplicitReplacementOffer": true,
+      "closesOldLiveConnections": true,
+      "removesOldPublicKeys": true,
+      "oldIdentityCanResume": false,
+      "countersResetOnlyUnderNewConnectionKeys": true
+    }
+  }
+}

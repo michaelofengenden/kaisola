@@ -69,6 +69,22 @@ test('RIS and DECSTR full resets clear tracked modes, even split across chunks',
   assert.equal(soft.snapshot(64).modePrefix, '\x1b[?2004h', 'DECSTR clears prior modes; later enables survive')
 })
 
+test('long multi-param mode sequences survive a split at every position', (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'kaisola-terminal-spool-test-'))
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }))
+  const seq = '\x1b[?1000;1002;1003;1004;1006;2004h' // longer than any fixed 16-char carry window
+  for (let cut = 1; cut < seq.length; cut++) {
+    const spool = new TerminalSpool({ dir, id: `modes-cut-${cut}`, hotCap: 64, queueCap: 32 })
+    spool.push(seq.slice(0, cut))
+    spool.push(seq.slice(cut))
+    spool.push('x'.repeat(4096))
+    const prefix = spool.snapshot(64).modePrefix
+    for (const mode of [1000, 1002, 1003, 1004, 1006, 2004]) {
+      assert.ok(prefix.includes(`\x1b[?${mode}h`), `mode ${mode} tracked when split at ${cut}`)
+    }
+  }
+})
+
 test('mode sequences split across push chunks and multi-param lists still track', (t) => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'kaisola-terminal-spool-test-'))
   t.after(() => fs.rmSync(dir, { recursive: true, force: true }))

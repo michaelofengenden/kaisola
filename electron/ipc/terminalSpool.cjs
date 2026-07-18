@@ -31,7 +31,11 @@ const DEC_MODE_DEFAULTS = { 25: true } // cursor visible; every other tracked mo
 // emits these instead of individual DECRST sequences, and replaying stale
 // mouse/paste enables into a remounted terminal corrupts every click.
 const DEC_MODE_RE = /\x1b\[\?([0-9;]+)([hl])|\x1bc|\x1b\[!p/g
-const DEC_CARRY_RE = /\x1b(?:\[(?:[?!][0-9;]{0,12})?)?$/
+// The carry must hold the longest incomplete sequence we track (multi-param
+// DECSET like ?1000;1002;1003;1004;1006;2004 is ~34 chars) — a window smaller
+// than the sequence drops its ESC prefix and silently loses the modes.
+const DEC_CARRY_MAX = 48
+const DEC_CARRY_RE = /\x1b(?:\[(?:[?!][0-9;]{0,40})?)?$/
 
 function atomicJson(file, value) {
   const tmp = `${file}.${process.pid}.tmp`
@@ -129,7 +133,7 @@ class TerminalSpool {
         if (TRACKED_DEC_MODES.has(mode)) this.decModes.set(mode, set)
       }
     }
-    const carry = text.slice(-16).match(DEC_CARRY_RE)
+    const carry = text.slice(-DEC_CARRY_MAX).match(DEC_CARRY_RE)
     this.decCarry = carry ? carry[0] : ''
   }
 

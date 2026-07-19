@@ -169,7 +169,16 @@ actor CompanionIdentityKeychain {
         let present = try Account.allCases.map(hasItem)
         let context = LAContext()
         context.localizedCancelTitle = "Cancel"
-        _ = try await context.evaluatePolicy(.deviceOwnerAuthentication, localizedReason: reason)
+        #if DEBUG
+        // The passcode-less pairing simulator can't satisfy device auth; the
+        // automated pairing harness skips it. Never compiled into release.
+        let skipDeviceAuth = ProcessInfo.processInfo.environment["KAISOLA_SKIP_LA"] == "1"
+        #else
+        let skipDeviceAuth = false
+        #endif
+        if !skipDeviceAuth {
+            _ = try await context.evaluatePolicy(.deviceOwnerAuthentication, localizedReason: reason)
+        }
         if present.allSatisfy({ !$0 }) {
             let identity = try CompanionIdentity(
                 id: "device-\(UUID().uuidString.lowercased())",

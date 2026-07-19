@@ -147,6 +147,10 @@ final class CompanionConnectionCoordinator: ObservableObject {
             .sink { [weak self] sas in
                 guard let self, case .connecting = self.pairingPhase else { return }
                 self.pairingPhase = .confirm(sas)
+                #if DEBUG
+                // Automated pairing harness: confirm the SAS without a tap.
+                if ProcessInfo.processInfo.environment["KAISOLA_AUTOSAS"] == "1" { self.confirmSAS() }
+                #endif
             }
             .store(in: &cancellables)
         client.$pairedDesktop

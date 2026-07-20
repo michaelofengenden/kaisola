@@ -26,6 +26,7 @@ async function main() {
   }
   let firstClient = null
   let secondClient = null
+  let recoveredClient = null
   try {
     firstClient = new SessionBrokerClient(config)
     const firstHello = await firstClient.connect()
@@ -57,6 +58,32 @@ async function main() {
       rows: 24,
       projectId: PROJECT_ALPHA,
     })
+
+    // macOS can reap an old AF_UNIX pathname from its per-user temp directory
+    // while the broker still owns the listening inode and every PTY. The
+    // broker must republish that path in place so a new app instance can adopt
+    // the exact process instead of forcing a destructive broker restart.
+    const brokerInfoFile = path.join(userData, 'session-broker', 'broker.json')
+    const brokerInfo = JSON.parse(fs.readFileSync(brokerInfoFile, 'utf8'))
+    let socketPathRestored = process.platform === 'win32'
+    let recoveredHello = secondHello
+    let recoveredTerminal = second
+    let recoveredTerminalPid = second.pid
+    if (process.platform !== 'win32') {
+      fs.unlinkSync(brokerInfo.socketPath)
+      for (let i = 0; i < 60 && !fs.existsSync(brokerInfo.socketPath); i++) await wait(50)
+      socketPathRestored = fs.existsSync(brokerInfo.socketPath)
+      if (socketPathRestored) {
+        recoveredClient = new SessionBrokerClient(config)
+        recoveredHello = await recoveredClient.connect()
+        recoveredTerminal = await recoveredClient.terminal('attach', sender(203), {
+          id: 'restart-continuity',
+          projectId: PROJECT_ALPHA,
+        })
+        recoveredTerminalPid = (await recoveredClient.terminal('diagnostics', sender(203), { projectId: PROJECT_ALPHA }))
+          .find((row) => row.id === 'restart-continuity')?.pid
+      }
+    }
 
     // A live renderer cannot inspect or operate another renderer's PTY, even
     // when it guesses the id. Same-project attach/create is the sole explicit
@@ -154,6 +181,10 @@ async function main() {
       restartMarked: second.continuation?.acrossRestart === true,
       detachedOutputReplayed: String(second.output || '').includes('during'),
       duplicateBootPrevented: !String(second.output || '').includes('respawned'),
+      missingSocketPathRepublished: socketPathRestored,
+      socketRecoveryKeptBroker: recoveredHello.pid === secondHello.pid,
+      socketRecoveryKeptTerminal: recoveredTerminalPid === second.pid,
+      socketRecoveryReplayedOutput: String(recoveredTerminal.output || '').includes('during'),
       detachedTerminalNotInventoried: !detachedInventory.some((row) => row.id === 'restart-continuity'),
       brokerEnvironmentStripped: process.platform === 'win32' || String(second.output || '').includes('run-as-node=unset broker-env=unset'),
       crossProjectNotInventoried: !crossProjectInventory.some((row) => row.id === 'project-scope-boundary'),
@@ -214,7 +245,8 @@ async function main() {
     })
     console.log('SESSION_BROKER_RESULT=PASS')
   } finally {
-    if (secondClient) await secondClient.shutdown()
+    if (recoveredClient) await recoveredClient.shutdown()
+    else if (secondClient) await secondClient.shutdown()
     else if (firstClient) await firstClient.shutdown()
     await wait(100)
     fs.rmSync(userData, { recursive: true, force: true })

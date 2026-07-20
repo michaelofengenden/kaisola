@@ -20,6 +20,12 @@ const SECURITY_EPOCH = 1
 const FEATURES = Object.freeze(['terminal-observe-v1'])
 const MAX_FRAME = 20 * 1024 * 1024
 const NO_CLIENT_EXIT_MS = 30_000
+// macOS may reap old entries from its per-user temporary directory even while
+// a process still has the AF_UNIX listener open. The broker and every PTY stay
+// alive, but a replacement app cannot reach that now-unlinked listener. Check
+// the pathname cheaply and publish a replacement listener without disturbing
+// existing authenticated connections or terminal processes.
+const SOCKET_PATH_CHECK_MS = 1_000
 
 function readLaunch() {
   const marker = process.argv.indexOf('--launch')
@@ -352,7 +358,7 @@ function handleLine(client, line) {
   )
 }
 
-const server = net.createServer((socket) => {
+function acceptClient(socket) {
   socket.setNoDelay(true)
   const client = { socket, authenticated: false, instanceId: null, buffer: '', decoder: new StringDecoder('utf8') }
   socket.on('data', (chunk) => {
@@ -376,16 +382,81 @@ const server = net.createServer((socket) => {
     }
   })
   socket.on('error', () => {})
-})
+}
+
+const servers = new Set()
+let server = null
+let socketRecoveryPending = false
+let socketPathTimer = null
+
+function brokerInfo() {
+  return {
+    protocol: PROTOCOL,
+    securityEpoch: SECURITY_EPOCH,
+    pid: process.pid,
+    socketPath: config.socketPath,
+    token: config.token,
+    startedAt: config.startedAt,
+    version: config.version,
+  }
+}
+
+function configureServer(candidate, { recovery = false } = {}) {
+  servers.add(candidate)
+  candidate.once('close', () => servers.delete(candidate))
+  candidate.on('error', (error) => {
+    log(`${recovery ? 'relisten' : 'listen'} ${error?.code || ''} ${error?.stack || error}`)
+    if (recovery) {
+      socketRecoveryPending = false
+      try { candidate.close() } catch { /* failed listeners may already be closed */ }
+      return
+    }
+    cleanupFiles()
+    process.exit(error?.code === 'EPERM' ? 77 : 1)
+  })
+  return candidate
+}
+
+function publishListener({ recovered = false } = {}) {
+  if (process.platform !== 'win32') try { fs.chmodSync(config.socketPath, 0o600) } catch { /* token still gates */ }
+  atomicJson(config.infoFile, brokerInfo())
+  log(`${recovered ? 'recovered socket' : 'ready'} pid=${process.pid} protocol=${PROTOCOL} version=${config.version}`)
+}
+
+function socketPathState() {
+  if (process.platform === 'win32') return 'present'
+  try { return fs.lstatSync(config.socketPath).isSocket() ? 'present' : 'unsafe' } catch (error) {
+    return error?.code === 'ENOENT' ? 'missing' : 'unknown'
+  }
+}
+
+function recoverMissingSocketPath() {
+  if (shuttingDown || socketRecoveryPending || socketPathState() !== 'missing') return
+  socketRecoveryPending = true
+  const previous = server
+  const candidate = configureServer(net.createServer(acceptClient), { recovery: true })
+  // Node unlinks an AF_UNIX server's remembered pathname when close() starts.
+  // Close the inaccessible listener BEFORE binding its replacement; reversing
+  // this order would let the old close remove the newly published path. Any
+  // accepted app sockets keep draining, and terminalManager continues to own
+  // every PTY throughout the listener swap.
+  if (previous && previous !== candidate) try { previous.close() } catch {}
+  server = candidate
+  candidate.listen(config.socketPath, () => {
+    if (shuttingDown) {
+      try { candidate.close() } catch {}
+      socketRecoveryPending = false
+      return
+    }
+    socketRecoveryPending = false
+    publishListener({ recovered: true })
+  })
+}
 
 // Listen failures (sandbox policy, stale platform pipe state, path limits) are
 // startup diagnostics, not uncaught session failures. Record them directly so
 // the parent can surface the real reason instead of a generic timeout.
-server.on('error', (error) => {
-  log(`listen ${error?.code || ''} ${error?.stack || error}`)
-  cleanupFiles()
-  process.exit(error?.code === 'EPERM' ? 77 : 1)
-})
+server = configureServer(net.createServer(acceptClient))
 
 function cleanupFiles() {
   if (process.platform !== 'win32') try { fs.unlinkSync(config.socketPath) } catch { /* absent */ }
@@ -397,11 +468,18 @@ function gracefulExit(killSessions) {
   if (shuttingDown) return
   shuttingDown = true
   clearNoClientTimer()
+  if (socketPathTimer) clearInterval(socketPathTimer)
+  socketPathTimer = null
   if (killSessions) mgr.killAll()
   else for (const client of clients.values()) detachInstance(client.instanceId)
   for (const client of clients.values()) client.socket.destroy()
   clients.clear()
-  server.close(() => {
+  const active = server
+  for (const candidate of servers) {
+    if (candidate === active) continue
+    try { candidate.close() } catch {}
+  }
+  active.close(() => {
     cleanupFiles()
     process.exit(0)
   })
@@ -423,16 +501,10 @@ try {
 
 if (process.platform !== 'win32') try { fs.unlinkSync(config.socketPath) } catch { /* stale */ }
 server.listen(config.socketPath, () => {
-  if (process.platform !== 'win32') try { fs.chmodSync(config.socketPath, 0o600) } catch { /* token still gates */ }
-  atomicJson(config.infoFile, {
-    protocol: PROTOCOL,
-    securityEpoch: SECURITY_EPOCH,
-    pid: process.pid,
-    socketPath: config.socketPath,
-    token: config.token,
-    startedAt: config.startedAt,
-    version: config.version,
-  })
-  log(`ready pid=${process.pid} protocol=${PROTOCOL} version=${config.version}`)
+  publishListener()
+  if (process.platform !== 'win32') {
+    socketPathTimer = setInterval(recoverMissingSocketPath, SOCKET_PATH_CHECK_MS)
+    socketPathTimer.unref?.()
+  }
   scheduleNoClientExit()
 })

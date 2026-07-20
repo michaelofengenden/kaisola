@@ -51,6 +51,7 @@ final class CompanionConnectionCoordinator: ObservableObject {
     @Published private(set) var accountOffers: [CompanionAccountOffer] = []
     @Published private(set) var accountLookupInProgress = false
     @Published private(set) var controlledTerminalIds: Set<String> = []
+    @Published private(set) var terminalStreamIssues: [String: String] = [:]
     /// Drives presentation of the pairing sheet from anywhere in the app.
     @Published var wantsPairing = false
 
@@ -67,6 +68,9 @@ final class CompanionConnectionCoordinator: ObservableObject {
     private var pairingTimeoutTask: Task<Void, Never>?
     private var accountLookupID: UUID?
     private var cancellables: Set<AnyCancellable> = []
+    private var resumeInProgress = false
+    private var connectionWanted = false
+    private var lifecycleIntentVersion = 0
     private struct TerminalLease {
         let projectId: String
         let terminalId: String
@@ -113,10 +117,16 @@ final class CompanionConnectionCoordinator: ObservableObject {
         do {
             let identity = try await resolveIdentity()
             self.pendingPayload = payload
+            connectionWanted = true
+            lifecycleIntentVersion &+= 1
             activePairingNonce = payload.pairingNonce
             pairingPhase = .connecting
             armPairingTimeout(for: payload)
-            client.transport.startDiscovery(preferred: payload.transportHint)
+            client.transport.startDiscovery(
+                preferred: payload.transportHint,
+                desktopId: payload.desktopId,
+                force: true
+            )
             _ = identity
         } catch {
             pairingPhase = .failed(Self.identityMessage(error))
@@ -201,28 +211,63 @@ final class CompanionConnectionCoordinator: ObservableObject {
         pairingTimeoutTask?.cancel()
         pairingTimeoutTask = nil
         pairingPhase = .idle
-        if !isPaired { client.transport.stop() }
+        if !isPaired {
+            connectionWanted = false
+            lifecycleIntentVersion &+= 1
+            client.transport.stop()
+        }
     }
 
     /// On launch (or when returning to foreground) reconnect to the known Mac.
-    func connectIfPaired() async {
+    func connectIfPaired(force: Bool = false) async {
         guard let desktop = pairedDesktop else { return }
+        connectionWanted = true
+        lifecycleIntentVersion &+= 1
+        if !force {
+            switch client.transport.state {
+            case .discovering, .connecting, .handshaking, .live, .reconnecting:
+                return
+            case .idle:
+                break
+            }
+        }
+        guard !resumeInProgress else { return }
+        resumeInProgress = true
+        defer { resumeInProgress = false }
+        store.connection = .reconnecting
         do {
             let identity = try await resolveIdentity()
+            guard connectionWanted else { return }
             // Resume deltas only when this process still holds the projection
             // that cursor acknowledges. A cold launch sends no cursor and gets
             // a coherent snapshot instead of a green-but-empty board.
             try client.configureResume(desktop: desktop, identity: identity, cursor: store.lastAckCursor)
-            client.transport.startDiscovery(preferred: desktop.transportHint)
+            client.transport.startDiscovery(
+                preferred: desktop.transportHint,
+                desktopId: desktop.desktopId,
+                force: force
+            )
         } catch {
-            store.connection = .offline
+            store.connection = store.projects.isEmpty ? .offline : .stale
         }
     }
 
+    /// User-visible recovery is always available, while ordinary lifecycle
+    /// calls remain idempotent and cannot cancel an in-flight secure resume.
+    func reconnect() async {
+        await connectIfPaired(force: true)
+    }
+
     /// Start/stop the live byte stream for a terminal session being viewed.
-    func setTerminalStream(projectId: String, sessionId: String, subscribed: Bool) {
+    func setTerminalStream(projectId: String, sessionId: String, subscribed: Bool, force: Bool = false) {
         guard !store.isPreview else { return }
-        try? client.setStreamSubscription(projectId: projectId, sessionId: sessionId, subscribed: subscribed)
+        terminalStreamIssues.removeValue(forKey: sessionId)
+        try? client.setStreamSubscription(
+            projectId: projectId,
+            sessionId: sessionId,
+            subscribed: subscribed,
+            force: force
+        )
     }
 
     func sendAgentMessage(to session: CompanionSession, text: String) async -> Bool {
@@ -442,17 +487,25 @@ final class CompanionConnectionCoordinator: ObservableObject {
     /// Called before iOS snapshots/backgrounds the UI. Leases are best-effort
     /// released, then local authorization and the socket are dropped.
     func suspend() async {
+        connectionWanted = false
+        lifecycleIntentVersion &+= 1
+        let intent = lifecycleIntentVersion
         let sessions = terminalLeases.values.compactMap { lease in store.session(for: lease.terminalId) }
         for session in sessions { await releaseTerminalControl(session) }
         clearLocalTerminalControls()
         controlAuthorization.lock()
         guard !store.isPreview else { return }
+        // If the app became active while lease cleanup was awaiting the Mac,
+        // the newer foreground intent owns the socket. Do not stop it here.
+        guard !connectionWanted, lifecycleIntentVersion == intent else { return }
         client.transport.stop()
-        store.connection = .offline
+        store.connection = store.projects.isEmpty ? .offline : .stale
     }
 
     /// Forget the paired Mac and drop the connection.
     func unpair() {
+        connectionWanted = false
+        lifecycleIntentVersion &+= 1
         clearLocalTerminalControls()
         controlAuthorization.lock()
         persistence.clear()
@@ -471,6 +524,11 @@ final class CompanionConnectionCoordinator: ObservableObject {
     // MARK: Wiring
 
     private func observe() {
+        client.onStreamIssue = { [weak self] sessionId, message in
+            guard let self else { return }
+            if let message { self.terminalStreamIssues[sessionId] = message }
+            else { self.terminalStreamIssues.removeValue(forKey: sessionId) }
+        }
         client.transport.$state
             .receive(on: RunLoop.main)
             .sink { [weak self] state in self?.handleTransportState(state) }
@@ -522,6 +580,7 @@ final class CompanionConnectionCoordinator: ObservableObject {
         activePairingNonce = nil
         persistence.save(desktop)
         pairedDesktop = desktop
+        connectionWanted = true
         pairingPhase = .paired
     }
 

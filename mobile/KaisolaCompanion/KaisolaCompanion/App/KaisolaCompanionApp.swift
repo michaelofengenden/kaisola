@@ -20,9 +20,13 @@ struct KaisolaCompanionApp: App {
                 .environmentObject(coordinator)
                 .tint(KaisolaTheme.accent)
                 .task {
+                    let reconnect = Task { @MainActor in
+                        guard !Self.usePreviewStore else { return }
+                        await coordinator.connectIfPaired()
+                    }
                     await auth.restore()
                     guard !Self.usePreviewStore else { return }
-                    await coordinator.connectIfPaired()
+                    await reconnect.value
                     await Self.autoPairIfRequested(coordinator)
                 }
                 .onChange(of: scenePhase) { _, phase in

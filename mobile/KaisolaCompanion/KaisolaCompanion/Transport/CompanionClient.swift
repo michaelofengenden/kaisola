@@ -24,6 +24,7 @@ final class CompanionClient: ObservableObject {
     var onPairedDesktop: ((CompanionPairedDesktop) -> Void)?
     var onAckCursor: ((CompanionAckCursor) -> Void)?
     var onCapabilities: ((Set<CompanionCapability>) -> Void)?
+    var onStreamIssue: ((String, String?) -> Void)?
 
     let transport: CompanionTransport
 
@@ -44,6 +45,9 @@ final class CompanionClient: ObservableObject {
         let sessionId: String
     }
     private var desiredStreamSubscriptions: Set<StreamSubscription> = []
+    private var activeStreamSubscriptions: Set<StreamSubscription> = []
+    private var streamSubscriptionTasks: [StreamSubscription: Task<Void, Never>] = [:]
+    private var streamSubscriptionGenerations: [StreamSubscription: Int] = [:]
     private var pendingCommands: [String: CheckedContinuation<CompanionReceiptBody, Error>] = [:]
     private var commandTimeouts: [String: Task<Void, Never>] = [:]
 
@@ -53,7 +57,10 @@ final class CompanionClient: ObservableObject {
         transport.onStateChange = { [weak self] state in
             guard let self else { return }
             self.onTransportState?(state)
-            if state != .live { self.failPendingCommands(with: CompanionCommandError.unavailable) }
+            if state != .live {
+                self.resetActiveStreamSubscriptions()
+                self.failPendingCommands(with: CompanionCommandError.unavailable)
+            }
             if state == .handshaking, case .resume = self.mode {
                 do { try self.startHandshake() } catch { self.fail(error) }
             }
@@ -113,14 +120,90 @@ final class CompanionClient: ObservableObject {
     /// Subscribe to (or unsubscribe from) a terminal's live byte stream. The
     /// desktop filters terminal.output to subscribed sessions, so the phone must
     /// ask before deltas flow — the snapshot arrives regardless.
-    func setStreamSubscription(projectId: String, sessionId: String, subscribed: Bool) throws {
+    func setStreamSubscription(
+        projectId: String,
+        sessionId: String,
+        subscribed: Bool,
+        force: Bool = false
+    ) throws {
         let subscription = StreamSubscription(projectId: projectId, sessionId: sessionId)
-        let changed: Bool
-        if subscribed { changed = desiredStreamSubscriptions.insert(subscription).inserted }
-        else { changed = desiredStreamSubscriptions.remove(subscription) != nil }
-        guard changed else { return }
-        guard transport.state == .live else { return }
-        try sendStreamSubscription(subscription, subscribed: subscribed)
+        if subscribed {
+            desiredStreamSubscriptions.insert(subscription)
+            onStreamIssue?(sessionId, nil)
+            guard transport.state == .live else { return }
+            if force { invalidateStreamSubscription(subscription) }
+            startStreamSubscription(subscription)
+        } else {
+            let wasDesired = desiredStreamSubscriptions.remove(subscription) != nil
+            let wasActive = activeStreamSubscriptions.contains(subscription)
+            invalidateStreamSubscription(subscription)
+            onStreamIssue?(sessionId, nil)
+            guard wasDesired || wasActive else { return }
+            guard transport.state == .live else { return }
+            try sendStreamSubscription(subscription, subscribed: false)
+        }
+    }
+
+    private func startStreamSubscription(_ subscription: StreamSubscription) {
+        guard transport.state == .live,
+              desiredStreamSubscriptions.contains(subscription),
+              !activeStreamSubscriptions.contains(subscription),
+              streamSubscriptionTasks[subscription] == nil else { return }
+        let generation = (streamSubscriptionGenerations[subscription] ?? 0) + 1
+        streamSubscriptionGenerations[subscription] = generation
+        streamSubscriptionTasks[subscription] = Task { @MainActor [weak self] in
+            guard let self else { return }
+            var lastMessage = "The terminal stream did not start."
+            for attempt in 0..<3 {
+                guard !Task.isCancelled,
+                      self.transport.state == .live,
+                      self.desiredStreamSubscriptions.contains(subscription),
+                      self.streamSubscriptionGenerations[subscription] == generation else { return }
+                do {
+                    let receipt = try await self.performCommand(
+                        type: "stream.subscribe",
+                        projectId: subscription.projectId,
+                        targetId: subscription.sessionId,
+                        capability: .observe,
+                        timeout: .seconds(4)
+                    )
+                    if receipt.status == .accepted || receipt.status == .applied {
+                        guard self.desiredStreamSubscriptions.contains(subscription),
+                              self.streamSubscriptionGenerations[subscription] == generation else { return }
+                        self.activeStreamSubscriptions.insert(subscription)
+                        self.onStreamIssue?(subscription.sessionId, nil)
+                        break
+                    }
+                    lastMessage = receipt.message ?? lastMessage
+                } catch {
+                    lastMessage = (error as? LocalizedError)?.errorDescription ?? lastMessage
+                }
+                if attempt < 2 {
+                    do { try await Task.sleep(for: .milliseconds(750 * (attempt + 1))) }
+                    catch { return }
+                }
+            }
+            guard self.streamSubscriptionGenerations[subscription] == generation else { return }
+            self.streamSubscriptionTasks[subscription] = nil
+            if self.desiredStreamSubscriptions.contains(subscription),
+               !self.activeStreamSubscriptions.contains(subscription),
+               self.transport.state == .live {
+                self.onStreamIssue?(subscription.sessionId, lastMessage)
+            }
+        }
+    }
+
+    private func invalidateStreamSubscription(_ subscription: StreamSubscription) {
+        streamSubscriptionGenerations[subscription] = (streamSubscriptionGenerations[subscription] ?? 0) + 1
+        streamSubscriptionTasks.removeValue(forKey: subscription)?.cancel()
+        activeStreamSubscriptions.remove(subscription)
+    }
+
+    private func resetActiveStreamSubscriptions() {
+        activeStreamSubscriptions.removeAll()
+        for subscription in Array(streamSubscriptionTasks.keys) {
+            invalidateStreamSubscription(subscription)
+        }
     }
 
     private func sendStreamSubscription(_ subscription: StreamSubscription, subscribed: Bool) throws {
@@ -430,7 +513,7 @@ final class CompanionClient: ObservableObject {
         try sendSecureFrame(channel.encrypt(CompanionProtocolCodec.encode(envelope)))
         transport.markLive()
         for subscription in desiredStreamSubscriptions {
-            try sendStreamSubscription(subscription, subscribed: true)
+            startStreamSubscription(subscription)
         }
     }
 

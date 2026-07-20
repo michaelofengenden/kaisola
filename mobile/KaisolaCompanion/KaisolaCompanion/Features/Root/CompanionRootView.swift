@@ -70,12 +70,41 @@ struct CompanionRootView: View {
         .tint(KaisolaTheme.accent)
         .toolbarBackground(.ultraThinMaterial, for: .tabBar)
         .toolbarBackground(.visible, for: .tabBar)
+        .safeAreaInset(edge: .top, spacing: 0) { connectionRecoveryBar }
         .overlay(alignment: .bottom) { receiptToast }
         .sheet(isPresented: Binding(
             get: { coordinator.wantsPairing },
             set: { coordinator.wantsPairing = $0 }
         )) {
             PairingFlowView()
+        }
+    }
+
+    @ViewBuilder private var connectionRecoveryBar: some View {
+        if coordinator.isPaired, !store.isPreview, store.connection != .live {
+            Button {
+                Task { await coordinator.reconnect() }
+            } label: {
+                HStack(spacing: 8) {
+                    ProgressView()
+                        .controlSize(.mini)
+                        .tint(KaisolaTheme.accent)
+                    Text(store.connection == .stale ? "Cached · reconnecting to Mac" : "Connecting to Mac")
+                        .font(.caption.weight(.medium))
+                    Spacer(minLength: 8)
+                    Image(systemName: "arrow.clockwise")
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(KaisolaTheme.accent)
+                }
+                .foregroundStyle(.secondary)
+                .padding(.horizontal, 16)
+                .frame(height: 38)
+                .background(.ultraThinMaterial)
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel("Reconnect to Mac")
+            .accessibilityHint("Retries the secure connection now")
         }
     }
 

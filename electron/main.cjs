@@ -1713,6 +1713,13 @@ if (hasSingleInstanceLock) app.whenReady().then(() => {
     epoch: companionDesktopEpoch,
     projectionStore: companionProjectionStore,
     attentionService,
+    windowLabel: (windowId) => {
+      loadWindowManifest()
+      const entry = windowManifest.find((candidate) => candidate.id === windowId)
+      if (entry?.title) return entry.title
+      if (entry?.slot != null) return `Window ${entry.slot}`
+      return windowId === 'primary' ? 'Main window' : 'Window'
+    },
   })
   companionHandler = registerCompanionHandlers(ipcMain, {
     app,

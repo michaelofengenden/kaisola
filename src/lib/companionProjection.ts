@@ -92,6 +92,8 @@ const timestamp = (...values: unknown[]): number => {
   return 0
 }
 
+const latestTimestamp = (...values: unknown[]): number => Math.max(0, ...values.map((value) => timestamp(value)))
+
 const assistantStatus = (thread: AssistantThread, runtime: AssistantRuntime | undefined, needsYou: boolean): CompanionStatus => {
   if (needsYou) return 'waiting'
   if (thread.busy) return 'running'
@@ -106,14 +108,13 @@ const terminalStatus = (
   activitySource: 'shell' | 'cli-agent' | 'managed-agent' = 'shell',
 ): CompanionStatus => {
   if (needsYou) return 'waiting'
-  // Modern brokers publish agentBusy for completion notifications, but Codex
-  // can pause longer than the quiet-time threshold between tool calls. A
-  // recognized CLI that still owns the foreground PTY remains a live board
-  // session even when that finer-grained signal has settled to false.
+  // A foreground Codex/Claude process can sit at its composer for hours. Only
+  // the broker-owned prompt lifecycle means the CLI is actively responding;
+  // process presence means the session is available, not running.
   const active = activitySource === 'managed-agent'
     ? meta?.running
     : activitySource === 'cli-agent'
-      ? (meta?.agentBusy === true || meta?.running === true)
+      ? meta?.agentBusy
       : meta?.agentBusy
   if (active) return 'running'
   if (typeof meta?.lastExit === 'number') return meta.lastExit === 0 ? 'done' : 'failed'
@@ -146,6 +147,16 @@ const turnProjection = (runtime: AssistantRuntime | undefined) => (runtime?.turn
     ...(turn.status ? { status: display(turn.status, '', 80) } : {}),
     ...(Number.isSafeInteger(turn.at) && Number(turn.at) >= 0 ? { at: Number(turn.at) } : {}),
   }))
+
+const assistantResponseAt = (runtime: AssistantRuntime | undefined): number => latestTimestamp(
+  runtime?.lastRun?.finishedAt,
+  ...(runtime?.turns ?? [])
+    .filter((turn) => turn.kind === 'assistant' || turn.kind === 'tool')
+    .map((turn) => turn.at),
+)
+
+const terminalResponseAt = (meta: KaisolaState['terminalMeta'][string] | undefined): number =>
+  latestTimestamp(meta?.agentRespondedAt, meta?.agentCompletedAt)
 
 const relativeDiffPath = (rawPath: unknown, workspacePath: string | null): string | null => {
   if (typeof rawPath !== 'string' || !rawPath.trim()) return null
@@ -248,7 +259,9 @@ export function buildCompanionProjection(
         status: assistantStatus(thread, runtime, needsYou),
         needsYou,
         unread: needsYou,
-        updatedAt: timestamp(thread.lastActivityAt, runtime?.lastRun?.finishedAt, runtime?.lastRun?.startedAt, tab.createdAt),
+        // Activity clocks represent agent replies, never session creation or a
+        // user dispatch. A session with no response yet intentionally reports 0.
+        updatedAt: assistantResponseAt(runtime),
         provider: display(thread.agentKey, 'Agent', 120),
         ...(thread.preferredModel ? { model: display(thread.preferredModel, '', 120) } : {}),
         ...(thread.permissionMode ? { mode: display(thread.permissionMode, '', 80) } : {}),
@@ -273,7 +286,7 @@ export function buildCompanionProjection(
         status: terminalStatus(meta, needsYou, terminalActivitySource(terminal)),
         needsYou,
         unread: needsYou,
-        updatedAt: timestamp(meta?.agentCompletedAt, tab.createdAt),
+        updatedAt: terminalResponseAt(meta),
         ...(terminalProvider(terminal) ? { provider: terminalProvider(terminal) } : {}),
         ...(meta?.branch ? { branch: display(meta.branch, '', 240) } : {}),
         ...(meta?.fgProcess ? { summary: display(meta.fgProcess, '', 240) } : {}),
@@ -292,7 +305,7 @@ export function buildCompanionProjection(
         status: terminalStatus(meta, needsYou, 'managed-agent'),
         needsYou,
         unread: needsYou,
-        updatedAt: timestamp(meta?.agentCompletedAt, tab.createdAt),
+        updatedAt: terminalResponseAt(meta),
         provider: display(terminal.agentName ?? terminal.agentKey, 'Agent', 120),
         ...(meta?.branch ? { branch: display(meta.branch, '', 240) } : {}),
         ...(meta?.fgProcess ? { summary: display(meta.fgProcess, '', 240) } : {}),
@@ -308,7 +321,7 @@ export function buildCompanionProjection(
         status: 'idle',
         needsYou: false,
         unread: false,
-        updatedAt: tab.createdAt,
+        updatedAt: 0,
       })
     }
 

@@ -1,27 +1,30 @@
 import SwiftUI
 
-/// The home tab: attention before noise. A Needs You band, then Running, then
-/// Recent — each card a tap from the real session. Replaces the orb dashboard.
+/// The home tab is intentionally sparse: exceptions, work happening now, and
+/// the latest replies. Full history stays one tap away in Sessions.
 struct HomeView: View {
     @EnvironmentObject private var store: CompanionStore
     @EnvironmentObject private var coordinator: CompanionConnectionCoordinator
-    @Environment(\.colorScheme) private var colorScheme
 
     var onOpenSession: (CompanionSession) -> Void = { _ in }
     var onOpenPermission: (CompanionPermission) -> Void = { _ in }
 
     private var running: [CompanionSession] {
-        store.visibleSessions.filter { $0.status == .running }
-            .sorted { ($0.startedAt ?? $0.updatedAt) > ($1.startedAt ?? $1.updatedAt) }
-    }
-    private var recent: [CompanionSession] {
-        store.visibleSessions.filter { $0.status == .done || $0.status == .failed }
+        activitySessions.filter { $0.status == .running }
             .sorted { $0.updatedAt > $1.updatedAt }
-            .prefix(6).map { $0 }
+    }
+    private var latest: [CompanionSession] {
+        activitySessions.filter { ($0.status == .idle || $0.status == .done) && $0.updatedAt > 0 }
+            .sorted { $0.updatedAt > $1.updatedAt }
+            .prefix(5).map { $0 }
+    }
+    private var activitySessions: [CompanionSession] {
+        store.visibleSessions.filter { $0.kind != .panel }
     }
     private var summaryLine: String {
-        let n = store.needsYouCount, r = running.count, d = recent.count
-        return "\(n) need\(n == 1 ? "s" : "") you · \(r) running · \(d) recent"
+        let n = store.needsYouCount, r = running.count
+        if n == 0 && r == 0 { return "Everything is quiet" }
+        return "\(n) need\(n == 1 ? "s" : "") you · \(r) running"
     }
 
     private var showConnectPrompt: Bool {
@@ -37,7 +40,6 @@ struct HomeView: View {
             ScrollView {
                 VStack(alignment: .leading, spacing: 14) {
                     header
-                    connectionPill
 
                     if store.needsYouCount > 0 {
                         SectionHeading(title: "Needs you", count: store.needsYouCount, color: KaisolaTheme.waiting)
@@ -48,6 +50,17 @@ struct HomeView: View {
                             }
                             .buttonStyle(QuietPressStyle())
                         }
+                        ForEach(store.attention) { item in
+                            if let sessionId = item.sessionId,
+                               let session = store.session(for: sessionId) {
+                                Button { onOpenSession(session) } label: {
+                                    AttentionSummaryCard(item: item, project: store.project(for: item.projectId))
+                                }
+                                .buttonStyle(QuietPressStyle())
+                            } else {
+                                AttentionSummaryCard(item: item, project: store.project(for: item.projectId))
+                            }
+                        }
                         ForEach(waitingOrFailedSessions) { session in
                             Button { onOpenSession(session) } label: {
                                 SessionCard(session: session, project: store.project(for: session.projectId))
@@ -56,11 +69,9 @@ struct HomeView: View {
                         }
                     }
 
-                    SectionHeading(title: "Running", count: running.count, color: KaisolaTheme.accent)
-                        .padding(.top, 6)
-                    if running.isEmpty {
-                        EmptyLane(text: "Nothing running. Start an agent on your Mac.")
-                    } else {
+                    if !running.isEmpty {
+                        SectionHeading(title: "Running", count: running.count, color: KaisolaTheme.accent)
+                            .padding(.top, 6)
                         ForEach(running) { session in
                             Button { onOpenSession(session) } label: {
                                 SessionCard(session: session, project: store.project(for: session.projectId))
@@ -69,10 +80,10 @@ struct HomeView: View {
                         }
                     }
 
-                    if !recent.isEmpty {
-                        SectionHeading(title: "Recent", count: recent.count, color: KaisolaTheme.done)
+                    if !latest.isEmpty {
+                        SectionHeading(title: "Latest replies", count: latest.count, color: KaisolaTheme.done)
                             .padding(.top, 6)
-                        ForEach(recent) { session in
+                        ForEach(latest) { session in
                             Button { onOpenSession(session) } label: {
                                 SessionCard(session: session, project: store.project(for: session.projectId))
                             }
@@ -120,41 +131,52 @@ struct HomeView: View {
     }
 
     private var waitingOrFailedSessions: [CompanionSession] {
-        let represented = Set(store.permissions.compactMap(\.sessionId))
-        return store.visibleSessions.filter {
+        let represented = Set(store.permissions.compactMap(\.sessionId) + store.attention.compactMap(\.sessionId))
+        return activitySessions.filter {
             ($0.status == .waiting || $0.status == .failed) && !represented.contains($0.id)
         }
     }
 
     private var header: some View {
-        Text(summaryLine)
-            .font(.subheadline.weight(.medium))
-            .foregroundStyle(.secondary)
-            .padding(.top, 2)
-    }
-
-    private var connectionPill: some View {
-        HStack(spacing: 7) {
-            PulseDot(color: store.connection == .live ? KaisolaTheme.done : KaisolaTheme.electric,
-                     animated: store.connection == .live, size: 5)
-            Text(connectionLabel)
-                .font(.caption.weight(.medium))
+        HStack(spacing: 10) {
+            Text(summaryLine)
+                .font(.subheadline.weight(.medium))
                 .foregroundStyle(.secondary)
+            Spacer()
+            if store.connection == .live || store.isPreview {
+                HStack(spacing: 6) {
+                    PulseDot(color: store.connection == .live ? KaisolaTheme.done : KaisolaTheme.electric,
+                             animated: store.connection == .live, size: 4)
+                    Text(store.connection == .live ? "LIVE" : "PREVIEW")
+                        .font(.system(size: 9, weight: .semibold, design: .monospaced))
+                        .tracking(0.7)
+                }
+                .foregroundStyle(.secondary)
+            }
         }
-        .padding(.horizontal, 11)
-        .padding(.vertical, 6)
-        .background(KaisolaTheme.panel(for: colorScheme), in: Capsule())
-        .overlay { Capsule().stroke(KaisolaTheme.border(for: colorScheme), lineWidth: 0.5) }
+        .padding(.top, 2)
     }
+}
 
-    private var connectionLabel: String {
-        switch store.connection {
-        case .live: "Live · connected to your Mac"
-        case .reconnecting: "Reconnecting…"
-        case .stale: "Cached · reconnecting"
-        case .offline: "Offline"
-        case .preview: "Local preview"
+private struct AttentionSummaryCard: View {
+    let item: CompanionAttention
+    let project: CompanionProject?
+
+    var body: some View {
+        HStack(spacing: 12) {
+            Circle()
+                .fill(item.severity == "critical" ? KaisolaTheme.failed : KaisolaTheme.waiting)
+                .frame(width: 7, height: 7)
+            VStack(alignment: .leading, spacing: 4) {
+                Text(item.title).font(.subheadline.weight(.semibold)).lineLimit(1)
+                Text([project?.name, item.kind.capitalized].compactMap { $0 }.joined(separator: " · "))
+                    .font(.caption).foregroundStyle(.secondary).lineLimit(1)
+            }
+            Spacer(minLength: 8)
+            Image(systemName: item.sessionId == nil ? "circle" : "chevron.right")
+                .font(.caption2.weight(.semibold)).foregroundStyle(.quaternary)
         }
+        .kaisolaCard(padding: 14)
     }
 }
 

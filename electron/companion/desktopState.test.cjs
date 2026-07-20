@@ -20,7 +20,13 @@ function setup({ attentionService = null } = {}) {
     keys: () => [...records.keys()],
     now: () => time,
   })
-  const state = new CompanionDesktopState({ epoch: 'desktop-epoch-current', projectionStore, attentionService, now: () => time })
+  const state = new CompanionDesktopState({
+    epoch: 'desktop-epoch-current',
+    projectionStore,
+    attentionService,
+    windowLabel: (windowId) => windowId === 'saved-primary' ? 'Kaisola' : 'Research',
+    now: () => time,
+  })
   return { state, projectionStore, setTime: (value) => { time = value } }
 }
 
@@ -36,6 +42,11 @@ test('published projections feed bounded replay and a rebuilt mobile board snaps
     { id: 'waiting', count: 1 },
     { id: 'done', count: 1 },
   ])
+  assert.deepEqual(
+    state.snapshot().projects.map(({ windowId, windowName }) => ({ windowId, windowName })),
+    [{ windowId: 'saved-primary', windowName: 'Kaisola' }],
+  )
+  assert.equal(event.payload.projection.sessions[0].windowId, 'saved-primary')
 })
 
 test('latest window wins a moved project without duplicating sessions', () => {

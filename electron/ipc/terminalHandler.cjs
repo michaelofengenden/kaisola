@@ -190,7 +190,13 @@ async function pollMeta() {
   for (const t of live) {
     const prev = metaCache.get(t.id) || {}
     const processIdentity = await foregroundProcessIdentity(t)
-    const next = { ...prev, process: processIdentity, agentBusy: !!t.agentBusy, agentCompletedAt: t.agentCompletedAt || null }
+    const next = {
+      ...prev,
+      process: processIdentity,
+      agentBusy: !!t.agentBusy,
+      agentCompletedAt: t.agentCompletedAt || null,
+      agentRespondedAt: t.agentRespondedAt || null,
+    }
     const cwd = cwds.get(t.pid)
     if (cwd) next.cwd = cwd
     if (next.cwd && next.cwd !== prev.cwd) {
@@ -203,7 +209,7 @@ async function pollMeta() {
       next.root = git.root
       next.branch = git.branch
     }
-    if (next.process !== prev.process || next.cwd !== prev.cwd || next.branch !== prev.branch || next.root !== prev.root || next.agentBusy !== prev.agentBusy || next.agentCompletedAt !== prev.agentCompletedAt) {
+    if (next.process !== prev.process || next.cwd !== prev.cwd || next.branch !== prev.branch || next.root !== prev.root || next.agentBusy !== prev.agentBusy || next.agentCompletedAt !== prev.agentCompletedAt || next.agentRespondedAt !== prev.agentRespondedAt) {
       metaCache.set(t.id, next)
       const payload = {
         id: t.id,
@@ -215,6 +221,7 @@ async function pollMeta() {
         branch: next.branch || null,
         agentBusy: next.agentBusy,
         agentCompletedAt: next.agentCompletedAt,
+        agentRespondedAt: next.agentRespondedAt,
       }
       for (const win of BrowserWindow.getAllWindows()) {
         const owner = terminalOwnerParts(t.owner)

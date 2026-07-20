@@ -37,4 +37,25 @@ final class TransportFramingTests: XCTestCase {
             service: "_kaisola._tcp", protocol: "tcp", host: "192.168.1.23", port: 0
         )))
     }
+
+    @MainActor
+    func testPairedDesktopSelectsItsExactBonjourService() {
+        let desktopId = "desktop-12345678-90ab-cdef"
+        let other = CompanionDiscoveredDesktop(
+            endpoint: .service(name: "Kaisola-someone-else", type: "_kaisola._tcp", domain: "local", interface: nil),
+            name: "Kaisola-someone-else"
+        )
+        let wantedName = CompanionTransport.serviceInstanceName(for: desktopId)
+        let wanted = CompanionDiscoveredDesktop(
+            endpoint: .service(name: wantedName, type: "_kaisola._tcp", domain: "local", interface: nil),
+            name: wantedName
+        )
+
+        XCTAssertEqual(wantedName, "Kaisola-345678-90ab-cdef")
+        XCTAssertEqual(
+            CompanionTransport.preferredDesktop(in: [other, wanted], desktopId: desktopId)?.name,
+            wantedName
+        )
+        XCTAssertNil(CompanionTransport.preferredDesktop(in: [other], desktopId: desktopId))
+    }
 }

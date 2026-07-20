@@ -7,6 +7,7 @@ struct TerminalSessionView: View {
     @State private var changingControl = false
     @State private var pendingPaste: Data?
     @State private var confirmPaste = false
+    @State private var streamWaitExpired = false
 
     let sessionId: String
 
@@ -23,13 +24,28 @@ struct TerminalSessionView: View {
                     streamStatus(session)
                     ZStack {
                         KaisolaTheme.terminalBackground
-                        if terminalOutput(session).isEmpty {
+                        if !hasTerminalSnapshot(session) {
                             VStack(spacing: 9) {
-                                ProgressView().tint(KaisolaTheme.accent)
-                                Text(store.connection == .live ? "Waiting for terminal output…" : store.connection.title)
+                                if streamIssue(session) == nil && !streamWaitExpired {
+                                    ProgressView().tint(KaisolaTheme.accent)
+                                } else {
+                                    Image(systemName: "arrow.clockwise")
+                                        .foregroundStyle(KaisolaTheme.accent)
+                                }
+                                Text(streamMessage(session))
                                     .font(.caption)
                                     .foregroundStyle(.secondary)
+                                if store.connection == .live && (streamIssue(session) != nil || streamWaitExpired) {
+                                    Button("Reload terminal") {
+                                        requestStream(session, force: true)
+                                    }
+                                    .font(.caption.weight(.semibold))
+                                    .buttonStyle(.bordered)
+                                    .tint(KaisolaTheme.accent)
+                                }
                             }
+                            .multilineTextAlignment(.center)
+                            .padding(.horizontal, 28)
                         }
                         CompanionTerminalSurface(
                             output: terminalOutput(session),
@@ -40,7 +56,7 @@ struct TerminalSessionView: View {
                                 Task { await coordinator.resizeTerminal(session, cols: cols, rows: rows) }
                             }
                         )
-                        .opacity(terminalOutput(session).isEmpty ? 0 : 1)
+                        .opacity(hasTerminalSnapshot(session) ? 1 : 0)
                     }
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
 
@@ -48,7 +64,20 @@ struct TerminalSessionView: View {
                 }
                 .background(KaisolaTheme.terminalBackground)
                 .task(id: session.id) {
+                    requestStream(session)
+                    do { try await Task.sleep(for: .seconds(5)) } catch { return }
+                    if store.connection == .live,
+                       let current = store.session(for: session.id),
+                       !hasTerminalSnapshot(current) {
+                        streamWaitExpired = true
+                    }
+                }
+                .onChange(of: store.connection) { previous, current in
+                    guard previous != .live, current == .live else { return }
                     coordinator.setTerminalStream(projectId: session.projectId, sessionId: session.id, subscribed: true)
+                }
+                .onChange(of: session.terminalStreamEpoch) { _, epoch in
+                    if epoch != nil { streamWaitExpired = false }
                 }
                 .onDisappear {
                     coordinator.setTerminalStream(projectId: session.projectId, sessionId: session.id, subscribed: false)
@@ -89,6 +118,30 @@ struct TerminalSessionView: View {
         // bytes. A terminal line feed does not imply carriage return, so use
         // CRLF here to avoid every fallback line drifting farther right.
         session.terminalOutput ?? (session.terminalLines ?? []).joined(separator: "\r\n")
+    }
+
+    private func hasTerminalSnapshot(_ session: CompanionSession) -> Bool {
+        session.terminalStreamEpoch != nil || !terminalOutput(session).isEmpty
+    }
+
+    private func streamIssue(_ session: CompanionSession) -> String? {
+        coordinator.terminalStreamIssues[session.id]
+    }
+
+    private func streamMessage(_ session: CompanionSession) -> String {
+        if store.connection != .live { return store.connection.title }
+        if let issue = streamIssue(session) { return issue }
+        return streamWaitExpired ? "The Mac has not sent this terminal yet." : "Loading terminal…"
+    }
+
+    private func requestStream(_ session: CompanionSession, force: Bool = false) {
+        streamWaitExpired = false
+        coordinator.setTerminalStream(
+            projectId: session.projectId,
+            sessionId: session.id,
+            subscribed: true,
+            force: force
+        )
     }
 
     private func streamStatus(_ session: CompanionSession) -> some View {

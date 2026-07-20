@@ -64,17 +64,6 @@ export function ProjectTabs() {
     ),
   )
   const switchProject = useKaisola((s) => s.switchProject)
-  const boardOpen = useKaisola((s) => s.boardOpen)
-  const setBoardOpen = useKaisola((s) => s.setBoardOpen)
-  // One number, recomputed only when the count itself changes: pending
-  // permissions + unread needs-you across the active slice and every parked one.
-  const boardNeeds = useKaisola((s) => {
-    let count = s.pendingPermissions.length + Object.keys(s.needsYou).length
-    for (const slice of Object.values(s.projectSlices)) {
-      count += slice.pendingPermissions.length + Object.keys(slice.needsYou).length
-    }
-    return count
-  })
   const closeProject = useKaisola((s) => s.closeProject)
   const reorderProjects = useKaisola((s) => s.reorderProjects)
   const renameProjectTab = useKaisola((s) => s.renameProjectTab)
@@ -120,19 +109,6 @@ export function ProjectTabs() {
   return (
     <div className="tabstrip" data-single={tabs.length === 1 || undefined}>
       <WindowLights />
-      <button
-        type="button"
-        className="board-tab"
-        data-active={boardOpen || undefined}
-        onClick={() => setBoardOpen(!boardOpen)}
-        title="Board — everything running, what needs you"
-        aria-label={boardNeeds > 0 ? `Board, ${boardNeeds} need you` : 'Board'}
-        aria-pressed={boardOpen}
-      >
-        <Icon name="PanelsTopLeft" size={13} />
-        <span className="board-tab-label">Board</span>
-        {boardNeeds > 0 && <span className="board-tab-badge">{boardNeeds > 99 ? '99+' : boardNeeds}</span>}
-      </button>
       <div className="tabstrip-track" role="tablist" ref={trackRef} onScroll={syncFade}>
         {tabs.map((tab, i) => {
           const active = tab.id === activeId

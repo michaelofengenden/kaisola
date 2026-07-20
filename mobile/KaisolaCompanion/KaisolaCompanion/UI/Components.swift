@@ -133,51 +133,36 @@ struct SessionCard: View {
     let project: CompanionProject?
 
     var body: some View {
-        HStack(spacing: 13) {
-            RoundedRectangle(cornerRadius: 2, style: .continuous)
-                .fill(KaisolaTheme.color(for: session.status))
-                .frame(width: 3, height: 49)
-                .shadow(color: KaisolaTheme.color(for: session.status).opacity(0.35), radius: 5)
+        HStack(spacing: 12) {
+            Image(systemName: icon)
+                .font(.system(size: 12, weight: .semibold))
+                .foregroundStyle(KaisolaTheme.color(for: session.status))
+                .frame(width: 30, height: 30)
+                .background(KaisolaTheme.color(for: session.status).opacity(0.10), in: Circle())
 
-            VStack(alignment: .leading, spacing: 6) {
-                HStack(alignment: .firstTextBaseline, spacing: 8) {
-                    Image(systemName: icon)
-                        .font(.caption.weight(.semibold))
-                        .foregroundStyle(KaisolaTheme.color(for: session.status))
-                    Text(session.title)
-                        .font(.subheadline.weight(.semibold))
-                        .foregroundStyle(.primary)
-                        .lineLimit(1)
-                    Spacer(minLength: 6)
-                    StatusBadge(status: session.status)
-                }
-
-                if let summary = session.summary {
-                    Text(summary)
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                        .lineLimit(1)
-                }
-
-                HStack(spacing: 6) {
-                    Text(session.provider ?? session.kind.rawValue.capitalized)
-                    if let project {
-                        Text("/")
-                        Text(project.name)
-                    }
-                    Spacer(minLength: 4)
-                    Text(relativeTime)
-                }
-                .font(.system(size: 10, weight: .medium, design: .monospaced))
-                .foregroundStyle(.tertiary)
-                .lineLimit(1)
+            VStack(alignment: .leading, spacing: 4) {
+                Text(session.title)
+                    .font(.subheadline.weight(.semibold))
+                    .foregroundStyle(.primary)
+                    .lineLimit(1)
+                Text(contextLine)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
             }
 
+            Spacer(minLength: 8)
+            VStack(alignment: .trailing, spacing: 5) {
+                StatusBadge(status: session.status)
+                Text(relativeTime)
+                    .font(.system(size: 9.5, weight: .medium, design: .monospaced))
+                    .foregroundStyle(.tertiary)
+            }
             Image(systemName: "chevron.right")
                 .font(.caption2.weight(.semibold))
                 .foregroundStyle(.quaternary)
         }
-        .kaisolaCard(padding: 14)
+        .kaisolaCard(padding: 13)
         .contentShape(Rectangle())
     }
 
@@ -190,8 +175,16 @@ struct SessionCard: View {
     }
 
     private var relativeTime: String {
+        guard session.updatedAt > 0 else { return "NO REPLY" }
         let date = Date(timeIntervalSince1970: TimeInterval(session.updatedAt) / 1_000)
         return date.formatted(.relative(presentation: .named, unitsStyle: .abbreviated))
+    }
+
+    private var contextLine: String {
+        let parts = [project?.name, session.provider].compactMap { value in
+            value?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false ? value : nil
+        }
+        return parts.isEmpty ? session.kind.rawValue.capitalized : parts.joined(separator: " · ")
     }
 }
 

@@ -836,9 +836,16 @@ export function Terminal({ id, attach = false, boot, cwd, projectId: projectIdOv
 
     const wire = () => {
       unsubData = bridge.terminal.onData(id, (data) => {
-        lastOutputAtRef.current = Date.now() // draft retype waits for pty quiescence
+        const responseAt = Date.now()
+        lastOutputAtRef.current = responseAt // draft retype waits for pty quiescence
         if (agentTurnOpenRef.current) {
-          useKaisola.getState().setTerminalMeta(id, { agentBusy: true })
+          const previous = useKaisola.getState().terminalMeta[id]?.agentRespondedAt ?? 0
+          // One clock tick per second keeps phone activity current without
+          // republishing the projection for every streamed terminal chunk.
+          useKaisola.getState().setTerminalMeta(id, {
+            agentBusy: true,
+            ...(responseAt - previous >= 1_000 ? { agentRespondedAt: responseAt } : {}),
+          })
           armAgentDone()
           captureCodexSession()
         }
@@ -867,10 +874,11 @@ export function Terminal({ id, attach = false, boot, cwd, projectId: projectIdOv
     }
 
     const restoreSnapshot = (snap: Partial<TermSnapshot>) => {
-      if (typeof snap.agentBusy === 'boolean' || snap.agentCompletedAt != null) {
+      if (typeof snap.agentBusy === 'boolean' || snap.agentCompletedAt != null || snap.agentRespondedAt != null) {
         useKaisola.getState().setTerminalMeta(id, {
           ...(typeof snap.agentBusy === 'boolean' ? { agentBusy: snap.agentBusy } : {}),
           ...(snap.agentCompletedAt != null ? { agentCompletedAt: snap.agentCompletedAt } : {}),
+          ...(snap.agentRespondedAt != null ? { agentRespondedAt: snap.agentRespondedAt } : {}),
         })
       }
       const restoreView = () => {

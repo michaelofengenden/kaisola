@@ -36,7 +36,9 @@ final class CompanionStore: ObservableObject {
         self.sessions = sessions
         self.attention = attention
         self.permissions = permissions
-        self.selectedProjectId = selectedProjectId ?? projects.first?.id
+        // Nil is a real "all projects" scope, not a missing default. Starting
+        // there keeps Home totals honest after launch and reconnect.
+        self.selectedProjectId = selectedProjectId
         self.isPreview = isPreview
         capabilities = Set<CompanionCapability>([.observe]
             + (canControlAgents ? [.agentControl] : [])
@@ -96,9 +98,12 @@ final class CompanionStore: ObservableObject {
             sessions = snapshot.projection.sessions
             attention = snapshot.projection.attention
             permissions = snapshot.projection.permissions
-            projectIdsByWindowId = [:]
-            if selectedProjectId == nil || !projects.contains(where: { $0.id == selectedProjectId }) {
-                selectedProjectId = projects.first?.id
+            projectIdsByWindowId = Dictionary(grouping: projects.compactMap { project in
+                project.windowId.map { ($0, project.id) }
+            }, by: \.0).mapValues { Set($0.map(\.1)) }
+            if let selectedProjectId,
+               !projects.contains(where: { $0.id == selectedProjectId }) {
+                self.selectedProjectId = nil
             }
             connection = snapshot.projection.freshness == "live" ? .live : .stale
         case .event:
@@ -158,8 +163,10 @@ final class CompanionStore: ObservableObject {
                       let index = sessions.firstIndex(where: { $0.id == sessionId }) {
                 if let busy = fields["busy"]?.boolValue {
                     sessions[index].status = busy ? .running : .idle
+                    if !busy {
+                        sessions[index].updatedAt = fields["completedAt"]?.intValue ?? envelope.sentAt
+                    }
                 }
-                sessions[index].updatedAt = envelope.sentAt
                 sessions[index].terminalStreamEpoch = fields["streamEpoch"]?.stringValue
                 sessions[index].terminalEndOffset = fields["offset"]?.intValue
             }
@@ -228,7 +235,6 @@ final class CompanionStore: ObservableObject {
                 sessions[index].terminalOutput = ""
                 sessions[index].terminalStreamEpoch = fields["streamEpoch"]?.stringValue
                 sessions[index].terminalEndOffset = fields["endOffset"]?.intValue
-                sessions[index].updatedAt = envelope.sentAt
             }
         case "terminal.exit":
             if let terminalId = fields["terminalId"]?.stringValue,
@@ -243,7 +249,17 @@ final class CompanionStore: ObservableObject {
     }
 
     private func merge(projection: CompanionProjection, windowId: String?) {
-        let projectIds = Set(projection.projects.map(\.id))
+        var incomingProjects = projection.projects
+        var incomingSessions = projection.sessions
+        if let windowId {
+            for index in incomingProjects.indices {
+                if incomingProjects[index].windowId == nil { incomingProjects[index].windowId = windowId }
+            }
+            for index in incomingSessions.indices {
+                if incomingSessions[index].windowId == nil { incomingSessions[index].windowId = windowId }
+            }
+        }
+        let projectIds = Set(incomingProjects.map(\.id))
         if let windowId {
             let removedProjectIds = (projectIdsByWindowId[windowId] ?? []).subtracting(projectIds)
             removeProjects(withIds: removedProjectIds)
@@ -254,11 +270,11 @@ final class CompanionStore: ObservableObject {
             projectIdsByWindowId[windowId] = projectIds
         }
         let existingSessions = Dictionary(uniqueKeysWithValues: sessions.map { ($0.id, $0) })
-        let reconciledSessions = projection.sessions.map { incoming in
+        let reconciledSessions = incomingSessions.map { incoming in
             reconcile(incoming: incoming, existing: existingSessions[incoming.id])
         }
         projects.removeAll { projectIds.contains($0.id) }
-        projects.append(contentsOf: projection.projects)
+        projects.append(contentsOf: incomingProjects)
         sessions.removeAll { projectIds.contains($0.projectId) }
         sessions.append(contentsOf: reconciledSessions)
         attention.removeAll { projectIds.contains($0.projectId) }
@@ -337,7 +353,7 @@ final class CompanionStore: ObservableObject {
             if projectIdsByWindowId[owner]?.isEmpty == true { projectIdsByWindowId.removeValue(forKey: owner) }
         }
         if let selectedProjectId, projectIds.contains(selectedProjectId) {
-            self.selectedProjectId = projects.first?.id
+            self.selectedProjectId = nil
         }
     }
 
@@ -391,7 +407,9 @@ final class CompanionStore: ObservableObject {
         sessions[index].terminalLines = bounded.components(separatedBy: "\n")
         sessions[index].terminalStreamEpoch = streamEpoch
         sessions[index].terminalEndOffset = endOffset
-        sessions[index].updatedAt = sentAt
+        // The initial bounded snapshot replays historical bytes. Only a live
+        // suffix is a new response and may advance the activity clock.
+        if !replace { sessions[index].updatedAt = sentAt }
     }
 
     var needsYouCount: Int {

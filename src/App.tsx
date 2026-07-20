@@ -9,7 +9,6 @@ import { initGlassWash } from './lib/glassWash'
 import { CompanionProjectionRevisions } from './lib/companionProjection'
 import { ShellTools } from './components/shell/AgentSidebar'
 import { WorkspaceRail } from './components/shell/WorkspaceRail'
-import { BoardView } from './components/board/BoardView'
 import { ProjectTabs } from './components/shell/ProjectTabs'
 import { SavedWindows } from './components/shell/SavedWindows'
 import { ProjectLauncher } from './components/shell/ProjectLauncher'
@@ -468,7 +467,6 @@ function registerWindowDeletionHandler() {
 
 function KaisolaApp() {
   const layoutMode = useKaisola((s) => s.layoutMode)
-  const boardOpen = useKaisola((s) => s.boardOpen)
   const stage = useKaisola((s) => s.stage)
   const setStage = useKaisola((s) => s.setStage)
   const dockOpen = useKaisola((s) => s.dockOpen)
@@ -638,6 +636,7 @@ function KaisolaApp() {
           root: m.root,
           repo: m.repo,
           branch: m.branch,
+          agentRespondedAt: m.agentRespondedAt,
         })
         if (typeof m.agentBusy === 'boolean') {
           applyAgentActivity({ id: m.id, busy: m.agentBusy, completedAt: m.agentCompletedAt })
@@ -925,7 +924,6 @@ function KaisolaApp() {
           ...(sessionRailWidth ? { '--sessionrail-w': `${sessionRailWidth}px` } : {}),
         } as CSSProperties) : undefined}
       >
-        {boardOpen ? <BoardView /> : <>
         {sidebarSessions && <SessionSidebar />}
         {studio && railOpen && !sidebarSessions && <WorkspaceRail />}
         {/* session cards on the left, the files/canvas card on the right
@@ -961,7 +959,6 @@ function KaisolaApp() {
         </div>
         {sidebarSessions && railOpen && <WorkspaceRail side="right" />}
         {(!studio || (!sidebarSessions && !railOpen)) && <ShellSidebarFooter floating />}
-        </>}
       </div>
       {/* Desktop main windows keep their permanent panel switches in the
           project strip. This utility fallback covers web + pop windows only. AFTER

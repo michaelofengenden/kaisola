@@ -293,6 +293,7 @@ final class ProtocolFixtureTests: XCTestCase {
     @MainActor
     func testSnapshotRequiredResetsTerminalBufferAndCursorBeforeNextOutput() throws {
         let store = try liveStoreFromSnapshot()
+        let originalReplyAt = try XCTUnwrap(store.session(for: "session-done")?.updatedAt)
         try store.apply(event(
             type: "terminal.snapshot",
             seq: 13,
@@ -321,6 +322,7 @@ final class ProtocolFixtureTests: XCTestCase {
         XCTAssertEqual(terminal.terminalLines, [])
         XCTAssertEqual(terminal.terminalStreamEpoch, "terminal-epoch-new")
         XCTAssertEqual(terminal.terminalEndOffset, 40)
+        XCTAssertEqual(terminal.updatedAt, originalReplyAt, "historical snapshots are not new CLI replies")
 
         try store.apply(event(
             type: "terminal.output",
@@ -337,7 +339,38 @@ final class ProtocolFixtureTests: XCTestCase {
         terminal = try XCTUnwrap(store.session(for: "session-done"))
         XCTAssertEqual(terminal.terminalLines, ["fresh"])
         XCTAssertEqual(terminal.terminalEndOffset, 45)
+        XCTAssertGreaterThan(terminal.updatedAt, originalReplyAt, "live terminal bytes advance the reply clock")
         XCTAssertEqual(store.connection, .live)
+    }
+
+    @MainActor
+    func testCLIBusyStateDoesNotPretendToBeAReplyTimestamp() throws {
+        let store = try liveStoreFromSnapshot()
+        let originalReplyAt = try XCTUnwrap(store.session(for: "session-done")?.updatedAt)
+        try store.apply(event(
+            type: "session.updated",
+            seq: 13,
+            fields: [
+                "projectId": .string("project-kaisola"),
+                "sessionId": .string("session-done"),
+                "busy": .bool(true),
+            ]
+        ))
+        XCTAssertEqual(store.session(for: "session-done")?.status, .running)
+        XCTAssertEqual(store.session(for: "session-done")?.updatedAt, originalReplyAt)
+
+        try store.apply(event(
+            type: "session.updated",
+            seq: 14,
+            fields: [
+                "projectId": .string("project-kaisola"),
+                "sessionId": .string("session-done"),
+                "busy": .bool(false),
+                "completedAt": .integer(1_784_250_009_999),
+            ]
+        ))
+        XCTAssertEqual(store.session(for: "session-done")?.status, .idle)
+        XCTAssertEqual(store.session(for: "session-done")?.updatedAt, 1_784_250_009_999)
     }
 
     @MainActor

@@ -603,6 +603,7 @@ function sanitizeSession(raw, index, projects) {
     unread: safeBool(session.unread),
     updatedAt: safeTime(session.updatedAt, `sessions.${index}.updatedAt`),
   }
+  if (session.windowId != null) clean.windowId = safeId(session.windowId, 'session.windowId', 160)
   clean.boardLane = boardLaneFor(clean)
   if (session.provider != null) clean.provider = safeString(session.provider, 'session.provider', 120, { optional: true })
   if (session.model != null) clean.model = safeString(session.model, 'session.model', 120, { optional: true })
@@ -759,6 +760,8 @@ function sanitizeProjection(input) {
       name: safeString(project.name, `projects.${index}.name`),
       connection: PROJECT_CONNECTIONS.has(project.connection) ? project.connection : 'offline',
       lastContactAt: safeTime(project.lastContactAt, `projects.${index}.lastContactAt`),
+      ...(project.windowId == null ? {} : { windowId: safeId(project.windowId, `projects.${index}.windowId`, 160) }),
+      ...(project.windowName == null ? {} : { windowName: safeString(project.windowName, `projects.${index}.windowName`, 240, { optional: true }) }),
       ...(project.repo == null ? {} : { repo: safeString(project.repo, `projects.${index}.repo`, 240, { optional: true }) }),
       ...(project.branch == null ? {} : { branch: safeString(project.branch, `projects.${index}.branch`, 240, { optional: true }) }),
     }

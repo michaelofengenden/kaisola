@@ -28,6 +28,7 @@ export function PopTerminal({ termId }: { termId: string }) {
         branch: meta.branch,
         ...(typeof meta.agentBusy === 'boolean' ? { agentBusy: meta.agentBusy } : {}),
         ...(meta.agentCompletedAt != null ? { agentCompletedAt: meta.agentCompletedAt } : {}),
+        ...(meta.agentRespondedAt != null ? { agentRespondedAt: meta.agentRespondedAt } : {}),
       })
     })
     const offActivity = bridge.terminal.onAgentActivity((activity) => {

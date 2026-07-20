@@ -99,6 +99,9 @@ export interface TerminalMeta {
   agentBusy?: boolean
   /** Broker timestamp for deduplicating completion receipts across reconnects. */
   agentCompletedAt?: number | null
+  /** Most recent bytes produced by an agent CLI. This is response activity,
+   * unlike `running`, which only says a foreground process still owns the PTY. */
+  agentRespondedAt?: number | null
   cwd?: string | null
   root?: string | null
   repo?: string | null
@@ -1037,10 +1040,6 @@ export interface KaisolaState {
   sessionRailWidth: number | null
   /** Left workspace rail visibility — the strip button / ⌘B (persisted). */
   railOpen: boolean
-  /** The Board surface (all-project running/needs-you/done cockpit). Shell
-   * state, not a ProjectTab: opening it never disturbs project layouts, and
-   * any project switch closes it. */
-  boardOpen: boolean
   /** Last Claude Code session id per workspace (from the hooks tap) — the
    * auto-launch resumes it (`claude --resume`) so a restart lands you back
    * in the same conversation. Persisted; capped. */
@@ -1276,7 +1275,6 @@ export interface KaisolaState {
   clearGroupWorktreeSessions: (id: string, cwd: string, projectId?: string) => void
   setAssistantThreadCwd: (id: string, cwd: string | undefined, projectId?: string) => void
   setActiveThread: (id: string) => void
-  setBoardOpen: (open: boolean) => void
   closeAssistantThread: (id: string, projectId?: string) => void
   renameAssistantThread: (id: string, name?: string) => void
   /** Auto-title a thread from its first message's topic (manual name wins). */
@@ -2598,7 +2596,6 @@ export const useKaisola = create<KaisolaState>()(
   // The default sidebar composition is intentionally visible: sessions left,
   // files right. ⌘B can still put the file tree away independently.
   railOpen: true,
-  boardOpen: false,
   claudeSessions: {},
   claudeAccounts: [],
   claudeAccountId: '',
@@ -4437,7 +4434,6 @@ export const useKaisola = create<KaisolaState>()(
   },
   setTermLineHeight: (height) => set({ termLineHeight: clampTermLineHeight(height) }),
   toggleRail: () => set((s) => ({ railOpen: !s.railOpen })),
-  setBoardOpen: (open) => set({ boardOpen: open }),
 
   // ── working-tree checkpoints (Zed-style restore points, via hidden git refs) ──
   snapshotWorkspace: async (label, projectId) => {
@@ -5841,11 +5837,7 @@ export const useKaisola = create<KaisolaState>()(
     postponePersistForNavigation()
     set((s) => {
       if (!s.projectTabs.some((t) => t.id === targetId)) return s
-      // The Board sits above the active project rather than becoming a second
-      // project selection. Clicking the already-active project must therefore
-      // surface that project again; treating it as a no-op trapped users on the
-      // Board until they first visited some other project.
-      if (targetId === s.activeProjectId) return s.boardOpen ? { boardOpen: false } : s
+      if (targetId === s.activeProjectId) return s
       const outgoing = pick(s, PROJECT_SLICE_MEMORY_KEYS)
       const { [targetId]: incoming, ...restBg } = s.projectSlices
       // Live and rehydrated slices are already complete. Rebuilding a full
@@ -5856,7 +5848,6 @@ export const useKaisola = create<KaisolaState>()(
         activeProjectId: targetId,
         projectSlices: { ...restBg, [s.activeProjectId]: outgoing },
         projectTabs: s.projectTabs.map((t) => (t.id === targetId ? { ...t, activity: undefined, transientBlank: undefined } : t)),
-        boardOpen: false, // picking a project always surfaces that project
         ...target, // hoist the target's memory slice → live flat fields
         ...resetEphemeralCursors(), // bucket F defaults; bucket E left alone
       }

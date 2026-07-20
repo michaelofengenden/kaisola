@@ -9,6 +9,10 @@ struct AgentSessionView: View {
     let sessionId: String
 
     private var session: CompanionSession? { store.session(for: sessionId) }
+    private var transcriptRevision: String {
+        guard let session, let last = session.turns?.last else { return "empty:\(session?.updatedAt ?? 0)" }
+        return "\(session.turns?.count ?? 0):\(last.wireId ?? last.role.rawValue):\(last.text.utf8.count):\(last.status ?? ""):\(session.updatedAt)"
+    }
 
     var body: some View {
         ZStack {
@@ -29,8 +33,20 @@ struct AgentSessionView: View {
                         .padding(.bottom, 74)
                     }
                     .scrollIndicators(.hidden)
-                    .onChange(of: session.turns?.count ?? 0) {
-                        withAnimation(.easeOut(duration: 0.25)) { proxy.scrollTo("bottom", anchor: .bottom) }
+                    .defaultScrollAnchor(.bottom)
+                    .onAppear {
+                        Task { @MainActor in
+                            await Task.yield()
+                            proxy.scrollTo("bottom", anchor: .bottom)
+                        }
+                    }
+                    .onChange(of: transcriptRevision) {
+                        Task { @MainActor in
+                            await Task.yield()
+                            withAnimation(.easeOut(duration: 0.18)) {
+                                proxy.scrollTo("bottom", anchor: .bottom)
+                            }
+                        }
                     }
                 }
                 .safeAreaInset(edge: .bottom) { composer(session) }

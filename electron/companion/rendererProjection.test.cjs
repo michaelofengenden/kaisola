@@ -56,6 +56,7 @@ test('renderer projection includes the board facts but never absolute paths or r
   const clean = sanitizeProjection(raw)
   assert.equal(clean.projects[0].name, 'Kaisola')
   assert.equal(clean.sessions.find((session) => session.id === 'thread-1').status, 'running')
+  assert.equal(clean.sessions.find((session) => session.id === 'thread-1').updatedAt, 29)
   assert.equal(clean.sessions.find((session) => session.id === 'terminal-codex').status, 'waiting')
   assert.deepEqual(clean.permissions[0].diffs.map((diff) => diff.relativePath), ['src/App.tsx'])
   assert.equal(JSON.stringify(raw).includes('/Users/test'), false)
@@ -85,36 +86,41 @@ test('sensitive permission diffs and terminal command lines stay desktop-only', 
   assert.equal(JSON.stringify(raw).includes('never-mobile'), false)
 })
 
-test('board follows live CLI metadata from current and compatibility brokers', () => {
+test('board distinguishes an available CLI process from an actively responding agent', () => {
   const compatibility = state()
   compatibility.needsYou = {}
   compatibility.terminalMeta['terminal-codex'] = { running: true, fgProcess: 'codex' }
   let raw = buildCompanionProjection(compatibility, { revision: 1, generatedAt: 100 })
-  assert.equal(raw.sessions.find((session) => session.id === 'terminal-codex').status, 'running')
+  assert.equal(raw.sessions.find((session) => session.id === 'terminal-codex').status, 'idle')
 
-  // Quiet-time completion is useful for notifications, but an open Codex TUI
-  // still owns a live terminal session and must remain visible on the board.
+  // An open Codex TUI remains an available session, but it is not "running"
+  // while it is sitting at the composer between prompts.
   compatibility.terminalMeta['terminal-codex'] = { running: true, agentBusy: false, fgProcess: 'codex' }
   raw = buildCompanionProjection(compatibility, { revision: 2, generatedAt: 101 })
+  assert.equal(raw.sessions.find((session) => session.id === 'terminal-codex').status, 'idle')
+
+  compatibility.terminalMeta['terminal-codex'] = { running: true, agentBusy: true, agentRespondedAt: 88, fgProcess: 'codex' }
+  raw = buildCompanionProjection(compatibility, { revision: 3, generatedAt: 102 })
   assert.equal(raw.sessions.find((session) => session.id === 'terminal-codex').status, 'running')
+  assert.equal(raw.sessions.find((session) => session.id === 'terminal-codex').updatedAt, 88)
 
   // The live Kaisola shape for a manually-launched npm Codex TUI may report
   // `node` and have no promoted singleton key. Its explicit Codex identity is
   // still enough to keep the running terminal on the board.
   compatibility.terminals.push({ id: 'terminal-manual-codex', name: 'Kaisola — codex' })
   compatibility.terminalMeta['terminal-manual-codex'] = { running: true, agentBusy: false, fgProcess: 'node' }
-  raw = buildCompanionProjection(compatibility, { revision: 3, generatedAt: 102 })
+  raw = buildCompanionProjection(compatibility, { revision: 4, generatedAt: 103 })
   assert.deepEqual(
     raw.sessions.find((session) => session.id === 'terminal-manual-codex'),
     {
       id: 'terminal-manual-codex', projectId: 'project-kaisola', kind: 'terminal',
-      title: 'Kaisola — codex', status: 'running', needsYou: false, unread: false,
-      updatedAt: 10, provider: 'Codex', summary: 'node',
+      title: 'Kaisola — codex', status: 'idle', needsYou: false, unread: false,
+      updatedAt: 0, provider: 'Codex', summary: 'node',
     },
   )
 
   compatibility.agentTerminals = [{ terminalId: 'managed-agent', agentName: 'Runner', label: 'Review' }]
   compatibility.terminalMeta['managed-agent'] = { running: true, fgProcess: 'runner' }
-  raw = buildCompanionProjection(compatibility, { revision: 4, generatedAt: 103 })
+  raw = buildCompanionProjection(compatibility, { revision: 5, generatedAt: 104 })
   assert.equal(raw.sessions.find((session) => session.id === 'managed-agent').status, 'running')
 })

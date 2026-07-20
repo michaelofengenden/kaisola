@@ -30,6 +30,8 @@ final class ProjectionFixtureTests: XCTestCase {
         XCTAssertTrue(store.isPreview)
         XCTAssertTrue(store.canControlAgents)
         XCTAssertTrue(store.canControlTerminals)
+        XCTAssertNil(store.selectedProjectId)
+        XCTAssertEqual(store.visibleSessions.count, store.sessions.count)
         XCTAssertEqual(counts.running, 2)
         XCTAssertEqual(counts.waiting, 1)
         XCTAssertEqual(counts.done, 1)

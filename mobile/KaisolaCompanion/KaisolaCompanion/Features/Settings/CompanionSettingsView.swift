@@ -110,6 +110,11 @@ struct CompanionSettingsView: View {
                 SettingsRow(icon: "eye", label: "Access", action: { showAccessDetails = true }) {
                     Text(accessLabel).font(.caption).foregroundStyle(.secondary)
                 }
+                if !connected {
+                    SettingsRow(icon: "arrow.clockwise", label: "Reconnect", tint: KaisolaTheme.accent) {
+                        Task { await coordinator.reconnect() }
+                    }
+                }
                 SettingsRow(icon: "trash", label: "Unpair this Mac", destructive: false) {
                     confirmUnpair = true
                 }

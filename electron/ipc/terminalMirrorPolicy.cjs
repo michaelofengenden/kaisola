@@ -25,10 +25,11 @@ function sanitizeTerminalMirror(value, expectedTerminalId, expectedProjectId) {
     for (const key of ['running', 'agentBusy']) {
       if (typeof value.meta[key] === 'boolean') meta[key] = value.meta[key]
     }
-    if (own(value.meta, 'agentCompletedAt')) {
-      const at = Number(value.meta.agentCompletedAt)
-      if (value.meta.agentCompletedAt === null) meta.agentCompletedAt = null
-      else if (Number.isFinite(at) && at >= 0) meta.agentCompletedAt = Math.round(at)
+    for (const key of ['agentCompletedAt', 'agentRespondedAt']) {
+      if (!own(value.meta, key)) continue
+      const at = Number(value.meta[key])
+      if (value.meta[key] === null) meta[key] = null
+      else if (Number.isFinite(at) && at >= 0) meta[key] = Math.round(at)
     }
     if (own(value.meta, 'lastExit')) {
       const exit = Number(value.meta.lastExit)

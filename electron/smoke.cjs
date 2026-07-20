@@ -228,6 +228,9 @@ app.whenReady().then(async () => {
       !!document.querySelector('.app-body[data-session-nav="sidebar"] > .wsrail[data-side="right"]'),
     // the fresh shell is ONE session (the seed terminal; chats are opt-in)
     hasSessions: document.querySelectorAll('.stabs .stab').length >= 1,
+    noBoard: !document.querySelector('.board-tab') &&
+      !document.querySelector('.board') &&
+      typeof window.__kaisola.getState().setBoardOpen === 'undefined',
     railFilesOnly: document.querySelectorAll('.wsrail .session-row').length === 0,
     // with no workspace bound (fresh empty tab) the canvas shows the project
     // launcher (open-a-folder empty state), not the file view.
@@ -974,6 +977,7 @@ app.whenReady().then(async () => {
     const projectId = window.__kaisola.getState().activeProjectId
     const created = await window.kaisola.terminal.create(id, '/tmp', 80, 24, projectId)
     window.kaisola.terminal.agentTurn(id, true, projectId)
+    await window.kaisola.terminal.write(id, 'printf agent-response-clock\\r', projectId)
     await new Promise((resolve) => setTimeout(resolve, 160))
     const detached = await window.kaisola.terminal.detachRenderer(id, undefined, projectId)
     for (let i = 0; i < 32 && !events.some((event) => !event.busy && event.completedAt); i++) {
@@ -988,6 +992,8 @@ app.whenReady().then(async () => {
       detached: !!detached.ok,
       settled: events.some((event) => !event.busy && !!event.completedAt),
       durable: snapshot.agentBusy === false && Number(snapshot.agentCompletedAt) > 0,
+      responseClock: Number(snapshot.agentRespondedAt) > 0
+        && Number(snapshot.agentRespondedAt) <= Number(snapshot.agentCompletedAt),
     }
   })()`)
   console.log('BROKER_ACTIVITY=' + JSON.stringify(brokerActivity))
@@ -1985,13 +1991,6 @@ a^2 + b^2 = c^2
     const firstId = g().activeProjectId
     const firstTerms = g().terminals.map((t) => t.id).sort().join()
     const firstGrid = JSON.stringify(g().dockGrid)
-    // Board is an overview over the selected project. Clicking that same
-    // project must always leave the overview and surface its window again.
-    g().setBoardOpen(true)
-    await wait(40)
-    document.querySelector('.ptab[data-active="true"] > .ptab-select')?.click()
-    await wait(40)
-    const activeProjectExitsBoard = g().activeProjectId === firstId && !g().boardOpen
     g().setLayoutMode('focus')
     const firstFocus = g().layoutMode === 'focus' && g().canvasOpen
     // 1) open a SECOND project tab (fresh slice, its own seeded terminal + dock)
@@ -2058,7 +2057,6 @@ a^2 + b^2 = c^2
     const backToSingle = g().projectTabs.length === startTabs && g().activeProjectId === firstId
     const adaptiveSingle = !!document.querySelector('.tabstrip[data-single="true"] .ptab')
     return {
-      activeProjectExitsBoard,
       twoTabs, isSecondActive, termsDiffer, gridsDiffer, parkedFirstOk, runtimeRouted, activeRuntimeUntouched,
       layoutIndependent, showSessionsWorks, hideFilesWorks, showFilesWorks, studioWorks, focusRestored,
       backToFirst, firstRestored, parkedSecondOk,
@@ -3953,7 +3951,7 @@ a^2 + b^2 = c^2
     !restartAgent.created || !restartAgent.restarted || !restartAgent.remounted || !restartAgent.resumeKept || !restartAgent.draftKept ||
     !manualCodex.upgraded || !manualCodex.exact || !manualCodex.draftKept || !manualCodex.downgraded ||
     !manualClaude.upgraded || !manualClaude.draftKept || !manualClaude.toolKept || !manualClaude.downgraded ||
-    !rootChildren || !minimalShell.noWorkflowSidebar || !minimalShell.splitSidebarsDefault || !minimalShell.hasSessions || !minimalShell.railFilesOnly || !minimalShell.hasEmptyLauncher || !minimalShell.stageFiles || !minimalShell.studioDefault || !minimalShell.sidebarFooter || !minimalShell.topViewControls || !accountUi.avatar || !accountUi.headshot || !accountUi.menu || !accountUi.usageInMenu || !accountUi.settingsInMenu || !accountUi.usageOpened || !accountUi.avatarOnly || !accountUi.bottomLeft || !accountUi.menuAbove || !accountUi.menuFits || !accountUi.aligned || !claudeOptIn || !nativeWindow.rendererClippedMaterial || !icon.exists || !icon.usable || !icon.square || !icon.large || !glass.appSamplingLayer || !glass.chromeGlass || !glass.activeTintWhite || !glass.railLayerFlattened || !glass.contentGlassy || !glass.sessionGlassy || !glass.termGlassTint || !glass.blurKeepsGlass || !glass.lightsGray || !glass.nativeWindowRounding ||
+    !rootChildren || !minimalShell.noWorkflowSidebar || !minimalShell.splitSidebarsDefault || !minimalShell.hasSessions || !minimalShell.noBoard || !minimalShell.railFilesOnly || !minimalShell.hasEmptyLauncher || !minimalShell.stageFiles || !minimalShell.studioDefault || !minimalShell.sidebarFooter || !minimalShell.topViewControls || !accountUi.avatar || !accountUi.headshot || !accountUi.menu || !accountUi.usageInMenu || !accountUi.settingsInMenu || !accountUi.usageOpened || !accountUi.avatarOnly || !accountUi.bottomLeft || !accountUi.menuAbove || !accountUi.menuFits || !accountUi.aligned || !claudeOptIn || !nativeWindow.rendererClippedMaterial || !icon.exists || !icon.usable || !icon.square || !icon.large || !glass.appSamplingLayer || !glass.chromeGlass || !glass.activeTintWhite || !glass.railLayerFlattened || !glass.contentGlassy || !glass.sessionGlassy || !glass.termGlassTint || !glass.blurKeepsGlass || !glass.lightsGray || !glass.nativeWindowRounding ||
     !emptyOk || !demoOk ||
     !review.opened || !review.closed || !review.decided ||
     !term.run || !term.ptyOk || !term.cdWorks || !term.dock || !term.host || !term.lightComposerPalette ||
@@ -3971,7 +3969,7 @@ a^2 + b^2 = c^2
     !activityUi.card || !activityUi.hasSubagent || !activityUi.hasTerminal || !activityUi.hasStatus || !activityUi.standardizedDot || !activityUi.openBtn || !activityUi.noContext || !activityUi.noMention || !activityUi.compactChrome || !activityUi.noLayoutControl || !activityUi.settingsControl || !activityUi.addContext ||
     !composerAddUi.button || !composerAddUi.menu || !composerAddUi.files || !composerAddUi.plugins || !composerAddUi.sessions || !composerAddUi.noPaperPin || !composerAddUi.opensAbove || !composerAddUi.elevatedFocus ||
     !attentionUi.running || !attentionUi.pulse || !attentionUi.completed || !attentionUi.still || !attentionUi.cleared || !attentionUi.nativeAttention ||
-    !brokerActivity.created || !brokerActivity.began || !brokerActivity.detached || !brokerActivity.settled || !brokerActivity.durable ||
+    !brokerActivity.created || !brokerActivity.began || !brokerActivity.detached || !brokerActivity.settled || !brokerActivity.durable || !brokerActivity.responseClock ||
     !transcriptTypography.rendered || !transcriptTypography.normalWhitespace || !transcriptTypography.readableWidth || !transcriptTypography.compactStream || !transcriptTypography.compactList || !transcriptTypography.differentiatedRoles || !transcriptTypography.promptRail || !transcriptTypography.promptRailMinimal || !transcriptTypography.localLink || !transcriptTypography.linkOpenedFiles || !transcriptTypography.lineJump ||
     !promptQueue.started || !promptQueue.queuedTwo || !promptQueue.inlinePreview || !promptQueue.aboveComposer || !promptQueue.attachedComposer || !promptQueue.queueActions || !promptQueue.noQueueToast || !promptQueue.drained || !promptQueue.combinedOnce || !promptQueue.deliveredTogether || !promptQueue.newestSpeedWon ||
     !steer.started || !steer.queuedWhileBusy || !steer.steeredWhileBusy || !steer.twoUserTurns || !steer.followDelivered || !steer.baseDelivered || !steer.endedIdle ||
@@ -3999,7 +3997,7 @@ a^2 + b^2 = c^2
     !canvasR.hasHandle || !canvasR.sized || !canvasR.clampedMin || !canvasR.resets ||
     !canvasMin.shownBefore || !canvasMin.permanentTopControl || !canvasMin.hidden || !canvasMin.permanentRestore || !canvasMin.restoredByTop || !canvasMin.cardsStay || !canvasMin.restoredByNav || !canvasMin.restoredByFile ||
     !lights.three || !lights.bigger || !lights.corner || !lights.noDrag || !lights.ctlApi ||
-    !projtabs.activeProjectExitsBoard || !projtabs.twoTabs || !projtabs.isSecondActive || !projtabs.termsDiffer || !projtabs.gridsDiffer || !projtabs.parkedFirstOk || !projtabs.runtimeRouted || !projtabs.activeRuntimeUntouched ||
+    !projtabs.twoTabs || !projtabs.isSecondActive || !projtabs.termsDiffer || !projtabs.gridsDiffer || !projtabs.parkedFirstOk || !projtabs.runtimeRouted || !projtabs.activeRuntimeUntouched ||
     !projtabs.layoutIndependent || !projtabs.showSessionsWorks || !projtabs.hideFilesWorks || !projtabs.showFilesWorks || !projtabs.studioWorks || !projtabs.focusRestored ||
     !projtabs.backToFirst || !projtabs.firstRestored || !projtabs.parkedSecondOk ||
     !projtabs.domTwoTabs || !projtabs.domActiveOne ||

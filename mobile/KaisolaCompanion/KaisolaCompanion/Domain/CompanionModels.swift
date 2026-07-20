@@ -59,6 +59,8 @@ struct CompanionProject: Identifiable, Codable, Hashable, Sendable {
     var connection: String
     var lastContactAt: Int64
     var counts: CompanionProjectCounts?
+    var windowId: String? = nil
+    var windowName: String? = nil
 }
 
 struct CompanionTurn: Identifiable, Codable, Hashable, Sendable {
@@ -109,6 +111,7 @@ struct CompanionSession: Identifiable, Codable, Hashable, Sendable {
     var terminalOutput: String? = nil
     var terminalStreamEpoch: String? = nil
     var terminalEndOffset: Int64? = nil
+    var windowId: String? = nil
 }
 
 struct CompanionAttention: Identifiable, Codable, Hashable, Sendable {

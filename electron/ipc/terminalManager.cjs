@@ -257,6 +257,7 @@ function spawn({ id, command, args, cwd, env, outputByteLimit, cols, rows, sende
     // xterm/React renderer, but their turn still settles and notifies the app.
     agentBusy: false,
     agentCompletedAt: null,
+    agentRespondedAt: null,
     agentQuietTimer: null,
   }
   rec.observers = new TerminalObservers({
@@ -314,6 +315,12 @@ function spawn({ id, command, args, cwd, env, outputByteLimit, cols, rows, sende
   rec.flushPending = flushPending
   p.onData((data) => {
     rec.spool.push(data)
+    if (rec.agentBusy) {
+      const responseAt = Date.now()
+      if (!rec.agentRespondedAt || responseAt - rec.agentRespondedAt >= 1_000) {
+        rec.agentRespondedAt = responseAt
+      }
+    }
     for (const piece of splitUtf8(data)) {
       const chunk = rec.cursor.append(piece)
       rec.observers.broadcast('terminal:observer-output', { id, ...chunk }, {
@@ -494,6 +501,7 @@ function snapshot(id) {
     exitStatus: r.exitStatus,
     agentBusy: r.agentBusy,
     agentCompletedAt: r.agentCompletedAt,
+    agentRespondedAt: r.agentRespondedAt,
   }
 }
 
@@ -653,7 +661,7 @@ function list() {
     try {
       proc = r.pty.process || ''
     } catch { /* pty backend may refuse mid-teardown */ }
-    out.push({ id: r.id, pid: r.pty.pid, process: proc, cols: r.cols, rows: r.rows, owner: senderId(r.sender), lastOwner: senderId(r.lastSender), agentBusy: r.agentBusy, agentCompletedAt: r.agentCompletedAt })
+    out.push({ id: r.id, pid: r.pty.pid, process: proc, cols: r.cols, rows: r.rows, owner: senderId(r.sender), lastOwner: senderId(r.lastSender), agentBusy: r.agentBusy, agentCompletedAt: r.agentCompletedAt, agentRespondedAt: r.agentRespondedAt })
   }
   return out
 }

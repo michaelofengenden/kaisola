@@ -110,15 +110,6 @@ app.whenReady().then(async () => {
     await js(`window.__kaisola.getState().pushToast('info','Workflow “Literature pass” — 2 steps queued')`)
     await shot('toast-light')
 
-    // Board — the all-project cockpit surface, both themes
-    for (const theme of ['light', 'dark']) {
-      await setTheme(theme)
-      await js(`window.__kaisola.setState({ boardOpen: true, needsYou: { 'demo-board-item': true } })`)
-      await wait(150)
-      await shot(`board-${theme}`)
-    }
-    await js(`window.__kaisola.setState({ boardOpen: false, needsYou: {} })`)
-
     // Settings — every tab, both themes for the default tab
     await setTheme('light')
     for (const tab of ['general', 'interface', 'agents', 'models', 'companion']) {

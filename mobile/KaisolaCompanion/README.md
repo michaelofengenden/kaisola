@@ -2,7 +2,7 @@
 
 This is the native, iPhone-first Kaisola Companion. It signs in with the same
 Firebase/Google account as the desktop, pairs to a specific Mac with a signed
-short-lived offer and four-word verification, and mirrors the live board,
+short-lived offer and four-word verification, and mirrors live activity,
 agent transcripts, and terminal streams over an encrypted LAN link.
 
 Every newly paired phone remains observe-only by default. In desktop Settings →
@@ -29,9 +29,18 @@ Pairing has three coordinated paths:
   end-to-end encrypted; Firebase never receives terminal content or keys.
 - QR embeds the current direct LAN address and port for immediate connection.
 - Bonjour remains active as discovery and reconnect fallback when an address
-  changes. Transient reconnects replay from the in-memory acknowledged cursor
-  and restore active terminal subscriptions; a cold launch requests a coherent
-  fresh snapshot.
+  changes. Discovery prefers the stable identity of the paired Mac instead of
+  trusting a stale QR address. Foregrounding and cold relaunches reconnect
+  automatically, while the visible reload action forces an immediate retry.
+  Transient reconnects replay from the acknowledged cursor and restore active
+  terminal subscriptions with receipt-aware retries; a cold launch requests a
+  coherent fresh snapshot.
+
+Home and Sessions use the timestamp of the latest agent or CLI response—not
+session creation—and only label a session Running while it is actively
+responding. Activity is grouped by desktop window and project. Agent transcripts
+and terminal streams follow new output to the bottom while preserving manual
+scrollback.
 
 ## Open in Xcode
 

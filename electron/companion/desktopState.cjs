@@ -18,10 +18,11 @@ function optionalText(value, max) {
 }
 
 class CompanionDesktopState {
-  constructor({ epoch, projectionStore, attentionService = null, now = Date.now, eventLog } = {}) {
+  constructor({ epoch, projectionStore, attentionService = null, windowLabel = null, now = Date.now, eventLog } = {}) {
     if (!projectionStore?.list) throw new Error('companion projection store is required')
     this.projectionStore = projectionStore
     this.attentionService = attentionService
+    this.windowLabel = typeof windowLabel === 'function' ? windowLabel : null
     this.now = now
     this.eventLog = eventLog ?? new CompanionEventLog({ epoch })
     this.snapshotRevision = 0
@@ -41,7 +42,7 @@ class CompanionDesktopState {
       payload: {
         windowId,
         revision: result.projection.revision,
-        projection: result.projection,
+        projection: this.#projectionForWindow(windowId, result.projection),
       },
       at: this.now(),
     })
@@ -180,7 +181,7 @@ class CompanionDesktopState {
       for (const project of record.projection.projects) {
         if (projectOwner.has(project.id)) continue
         projectOwner.set(project.id, record.windowId)
-        projects.push(project)
+        projects.push(this.#projectForWindow(record.windowId, project))
       }
     }
 
@@ -194,7 +195,7 @@ class CompanionDesktopState {
       for (const session of record.projection.sessions) {
         if (projectOwner.get(session.projectId) !== record.windowId || sessionIds.has(session.id)) continue
         sessionIds.add(session.id)
-        sessions.push(session)
+        sessions.push({ ...session, windowId: record.windowId })
       }
       for (const item of record.projection.attention) {
         if (projectOwner.get(item.projectId) !== record.windowId || attentionIds.has(item.id)) continue
@@ -223,6 +224,23 @@ class CompanionDesktopState {
     return this.attentionService
       ? sanitizeProjection(this.attentionService.mergeProjection(projection))
       : projection
+  }
+
+  #projectForWindow(windowId, project) {
+    const name = optionalText(this.windowLabel?.(windowId), 240)
+    return {
+      ...project,
+      windowId,
+      ...(name ? { windowName: name } : {}),
+    }
+  }
+
+  #projectionForWindow(windowId, projection) {
+    return sanitizeProjection({
+      ...projection,
+      projects: projection.projects.map((project) => this.#projectForWindow(windowId, project)),
+      sessions: projection.sessions.map((session) => ({ ...session, windowId })),
+    })
   }
 
   acpSessionEvent(event, { recordReplay = true } = {}) {

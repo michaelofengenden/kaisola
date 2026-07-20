@@ -3140,10 +3140,23 @@ body[data-shell-drag='1'] object {
 }
 .companion-pair-title { margin: 0; font-size: var(--fs-14); color: var(--text-0); }
 .companion-qr {
-  width: 200px; height: 200px; margin: 0 auto;
+  display: block;
+  width: min(264px, 100%); height: auto; aspect-ratio: 1; margin: 0 auto;
   border-radius: var(--r-2);
-  border: 8px solid #fff;
   background: #fff;
+}
+.companion-qr-fallback {
+  max-height: 160px;
+  overflow: auto;
+  padding: var(--sp-3);
+  border: 1px solid var(--border);
+  border-radius: var(--r-2);
+  background: var(--hover-overlay);
+  color: var(--text-2);
+  font-size: var(--fs-10);
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+  user-select: text;
 }
 .companion-sas {
   font-family: var(--font-mono);

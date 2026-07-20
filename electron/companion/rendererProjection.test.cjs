@@ -84,3 +84,22 @@ test('sensitive permission diffs and terminal command lines stay desktop-only', 
   assert.deepEqual(raw.permissions[0].diffs, [])
   assert.equal(JSON.stringify(raw).includes('never-mobile'), false)
 })
+
+test('board follows live CLI metadata from current and compatibility brokers', () => {
+  const compatibility = state()
+  compatibility.needsYou = {}
+  compatibility.terminalMeta['terminal-codex'] = { running: true, fgProcess: 'codex' }
+  let raw = buildCompanionProjection(compatibility, { revision: 1, generatedAt: 100 })
+  assert.equal(raw.sessions.find((session) => session.id === 'terminal-codex').status, 'running')
+
+  // A precise modern-broker idle signal wins over the coarse fact that Codex
+  // still owns the foreground process and is waiting at its composer.
+  compatibility.terminalMeta['terminal-codex'] = { running: true, agentBusy: false, fgProcess: 'codex' }
+  raw = buildCompanionProjection(compatibility, { revision: 2, generatedAt: 101 })
+  assert.equal(raw.sessions.find((session) => session.id === 'terminal-codex').status, 'idle')
+
+  compatibility.agentTerminals = [{ terminalId: 'managed-agent', agentName: 'Runner', label: 'Review' }]
+  compatibility.terminalMeta['managed-agent'] = { running: true, fgProcess: 'runner' }
+  raw = buildCompanionProjection(compatibility, { revision: 3, generatedAt: 102 })
+  assert.equal(raw.sessions.find((session) => session.id === 'managed-agent').status, 'running')
+})

@@ -1985,6 +1985,13 @@ a^2 + b^2 = c^2
     const firstId = g().activeProjectId
     const firstTerms = g().terminals.map((t) => t.id).sort().join()
     const firstGrid = JSON.stringify(g().dockGrid)
+    // Board is an overview over the selected project. Clicking that same
+    // project must always leave the overview and surface its window again.
+    g().setBoardOpen(true)
+    await wait(40)
+    document.querySelector('.ptab[data-active="true"] > .ptab-select')?.click()
+    await wait(40)
+    const activeProjectExitsBoard = g().activeProjectId === firstId && !g().boardOpen
     g().setLayoutMode('focus')
     const firstFocus = g().layoutMode === 'focus' && g().canvasOpen
     // 1) open a SECOND project tab (fresh slice, its own seeded terminal + dock)
@@ -2051,6 +2058,7 @@ a^2 + b^2 = c^2
     const backToSingle = g().projectTabs.length === startTabs && g().activeProjectId === firstId
     const adaptiveSingle = !!document.querySelector('.tabstrip[data-single="true"] .ptab')
     return {
+      activeProjectExitsBoard,
       twoTabs, isSecondActive, termsDiffer, gridsDiffer, parkedFirstOk, runtimeRouted, activeRuntimeUntouched,
       layoutIndependent, showSessionsWorks, hideFilesWorks, showFilesWorks, studioWorks, focusRestored,
       backToFirst, firstRestored, parkedSecondOk,
@@ -3991,7 +3999,7 @@ a^2 + b^2 = c^2
     !canvasR.hasHandle || !canvasR.sized || !canvasR.clampedMin || !canvasR.resets ||
     !canvasMin.shownBefore || !canvasMin.permanentTopControl || !canvasMin.hidden || !canvasMin.permanentRestore || !canvasMin.restoredByTop || !canvasMin.cardsStay || !canvasMin.restoredByNav || !canvasMin.restoredByFile ||
     !lights.three || !lights.bigger || !lights.corner || !lights.noDrag || !lights.ctlApi ||
-    !projtabs.twoTabs || !projtabs.isSecondActive || !projtabs.termsDiffer || !projtabs.gridsDiffer || !projtabs.parkedFirstOk || !projtabs.runtimeRouted || !projtabs.activeRuntimeUntouched ||
+    !projtabs.activeProjectExitsBoard || !projtabs.twoTabs || !projtabs.isSecondActive || !projtabs.termsDiffer || !projtabs.gridsDiffer || !projtabs.parkedFirstOk || !projtabs.runtimeRouted || !projtabs.activeRuntimeUntouched ||
     !projtabs.layoutIndependent || !projtabs.showSessionsWorks || !projtabs.hideFilesWorks || !projtabs.showFilesWorks || !projtabs.studioWorks || !projtabs.focusRestored ||
     !projtabs.backToFirst || !projtabs.firstRestored || !projtabs.parkedSecondOk ||
     !projtabs.domTwoTabs || !projtabs.domActiveOne ||

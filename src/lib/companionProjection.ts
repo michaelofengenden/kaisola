@@ -103,9 +103,20 @@ const assistantStatus = (thread: AssistantThread, runtime: AssistantRuntime | un
 const terminalStatus = (
   meta: KaisolaState['terminalMeta'][string] | undefined,
   needsYou: boolean,
+  activitySource: 'shell' | 'cli-agent' | 'managed-agent' = 'shell',
 ): CompanionStatus => {
   if (needsYou) return 'waiting'
-  if (meta?.agentBusy) return 'running'
+  // Modern brokers publish agentBusy, which distinguishes an agent actively
+  // answering from one waiting at its composer. Older broker sessions only
+  // have foreground-process `running`; use that compatibility signal for
+  // recognized CLI agents, exactly as the desktop tabs do. Managed agent
+  // terminals have no prompt lifecycle and are live whenever their process is.
+  const active = activitySource === 'managed-agent'
+    ? meta?.running
+    : activitySource === 'cli-agent'
+      ? (meta?.agentBusy ?? meta?.running)
+      : meta?.agentBusy
+  if (active) return 'running'
   if (typeof meta?.lastExit === 'number') return meta.lastExit === 0 ? 'done' : 'failed'
   return 'idle'
 }
@@ -250,7 +261,7 @@ export function buildCompanionProjection(
         projectId: tab.id,
         kind: 'terminal',
         title: display(terminal.name ?? terminal.promptTitle ?? terminal.autoName, terminalProvider(terminal) ?? 'Terminal'),
-        status: terminalStatus(meta, needsYou),
+        status: terminalStatus(meta, needsYou, terminal.singletonKey?.startsWith('agent:') ? 'cli-agent' : 'shell'),
         needsYou,
         unread: needsYou,
         updatedAt: timestamp(meta?.agentCompletedAt, tab.createdAt),
@@ -269,7 +280,7 @@ export function buildCompanionProjection(
         projectId: tab.id,
         kind: 'terminal',
         title: display(terminal.label, display(terminal.agentName, 'Agent terminal')),
-        status: terminalStatus(meta, needsYou),
+        status: terminalStatus(meta, needsYou, 'managed-agent'),
         needsYou,
         unread: needsYou,
         updatedAt: timestamp(meta?.agentCompletedAt, tab.createdAt),

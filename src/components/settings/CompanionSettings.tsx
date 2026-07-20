@@ -1,5 +1,6 @@
-import { useEffect, useRef, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import { bridge } from '../../lib/bridge'
+import { createPairingQrGraphic } from '../../lib/pairingQr'
 import type {
   CompanionState,
   CompanionPairingEvent,
@@ -7,28 +8,15 @@ import type {
 } from '../../lib/bridge'
 import { Icon } from '../Icon'
 
-/** Minimal, dependency-free QR: renders the payload as an SVG matrix. Kept
- * tiny — the payload is short and the phone camera reads a plain module grid.
- * (A full QR encoder lives behind this shape if we later need error
- * correction; the alpha pairs over a trusted short-range camera.) */
 function QrCode({ text }: { text: string }) {
-  // Simple deterministic module grid from the payload bytes — good enough for a
-  // close-range scan of a short opaque token; swapped for a real encoder before
-  // remote pairing ships. Falls back to selectable text if anything is off.
-  const size = 29
-  const cells: boolean[] = []
-  let h = 2166136261
-  for (let i = 0; i < size * size; i++) {
-    h ^= text.charCodeAt(i % text.length) + i
-    h = Math.imul(h, 16777619)
-    cells.push(((h >>> (i % 13)) & 1) === 1)
-  }
+  const graphic = useMemo(() => {
+    try { return createPairingQrGraphic(text) } catch { return null }
+  }, [text])
+  if (!graphic) return <code className="companion-qr-fallback">{text}</code>
   return (
-    <svg className="companion-qr" viewBox={`0 0 ${size} ${size}`} role="img" aria-label="Pairing QR code" shapeRendering="crispEdges">
-      <rect width={size} height={size} fill="#fff" />
-      {cells.map((on, i) => on && (
-        <rect key={i} x={i % size} y={Math.floor(i / size)} width={1} height={1} fill="#000" />
-      ))}
+    <svg className="companion-qr" viewBox={`0 0 ${graphic.size} ${graphic.size}`} role="img" aria-label="Pairing QR code" shapeRendering="crispEdges">
+      <rect width={graphic.size} height={graphic.size} fill="#fff" />
+      <path d={graphic.path} fill="#000" />
     </svg>
   )
 }
@@ -48,6 +36,7 @@ export function CompanionSettings() {
   const [pairing, setPairing] = useState<(CompanionPairingStart & { event?: CompanionPairingEvent }) | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [renaming, setRenaming] = useState<{ id: string; value: string } | null>(null)
+  const [pairingCodeCopied, setPairingCodeCopied] = useState(false)
   const pairingRef = useRef<string | null>(null)
 
   useEffect(() => {
@@ -77,6 +66,7 @@ export function CompanionSettings() {
 
   const startPairing = async () => {
     setError(null)
+    setPairingCodeCopied(false)
     try {
       const started = await bridge.companion.startPairing({ capabilities: ['observe'] })
       pairingRef.current = started.pairingId
@@ -89,9 +79,19 @@ export function CompanionSettings() {
     if (pairing) void bridge.companion.cancelPairing(pairing.pairingId).catch(() => {})
     pairingRef.current = null
     setPairing(null)
+    setPairingCodeCopied(false)
   }
   const confirmPairing = () => {
     if (pairing) void bridge.companion.confirmPairing(pairing.pairingId).catch(() => {})
+  }
+  const copyPairingCode = async () => {
+    if (!pairing) return
+    try {
+      await navigator.clipboard.writeText(pairing.qrPayload)
+      setPairingCodeCopied(true)
+    } catch {
+      setError('Could not copy the pairing code. Try scanning it instead.')
+    }
   }
 
   const commitRename = async () => {
@@ -210,6 +210,9 @@ export function CompanionSettings() {
                 <p className="settings-note">Open the app on your iPhone and scan this code. It expires shortly.</p>
                 <QrCode text={pairing.qrPayload} />
                 <div className="companion-pair-actions">
+                  <button type="button" className="btn" onClick={copyPairingCode}>
+                    {pairingCodeCopied ? 'Copied' : 'Copy code'}
+                  </button>
                   <button type="button" className="btn" onClick={cancelPairing}>Cancel</button>
                 </div>
               </>

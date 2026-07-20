@@ -5840,7 +5840,12 @@ export const useKaisola = create<KaisolaState>()(
   switchProject: (targetId) => {
     postponePersistForNavigation()
     set((s) => {
-      if (targetId === s.activeProjectId || !s.projectTabs.some((t) => t.id === targetId)) return s
+      if (!s.projectTabs.some((t) => t.id === targetId)) return s
+      // The Board sits above the active project rather than becoming a second
+      // project selection. Clicking the already-active project must therefore
+      // surface that project again; treating it as a no-op trapped users on the
+      // Board until they first visited some other project.
+      if (targetId === s.activeProjectId) return s.boardOpen ? { boardOpen: false } : s
       const outgoing = pick(s, PROJECT_SLICE_MEMORY_KEYS)
       const { [targetId]: incoming, ...restBg } = s.projectSlices
       // Live and rehydrated slices are already complete. Rebuilding a full

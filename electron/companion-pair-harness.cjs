@@ -286,7 +286,7 @@ async function main() {
     const status = await transport.enable()
     const qrPayload = pairingManager.createOffer({
       requestedCapabilities: ['observe'],
-      transportHint: { service: '_kaisola._tcp', protocol: 'tcp' },
+      transportHint: transport.pairingTransportHint(),
     })
     const names = serviceNames(deviceStore.desktopIdentity().id)
 

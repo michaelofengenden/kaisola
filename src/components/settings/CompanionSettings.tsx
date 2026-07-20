@@ -206,8 +206,8 @@ export function CompanionSettings() {
               </>
             ) : (
               <>
-                <h3 className="companion-pair-title">Scan with Kaisola Companion</h3>
-                <p className="settings-note">Open the app on your iPhone and scan this code. It expires shortly.</p>
+                <h3 className="companion-pair-title">Pair with Kaisola Companion</h3>
+                <p className="settings-note">Scan this code, or tap “Find my Mac” on an iPhone signed in to the same account. It expires shortly.</p>
                 <QrCode text={pairing.qrPayload} />
                 <div className="companion-pair-actions">
                   <button type="button" className="btn" onClick={copyPairingCode}>

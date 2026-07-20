@@ -18,6 +18,13 @@ struct CompanionPairingTransportHint: Codable, Hashable, Sendable {
         case service, `protocol`, host, port
     }
 
+    init(service: String, protocol: String, host: String? = nil, port: Int? = nil) {
+        self.service = service
+        self.protocol = `protocol`
+        self.host = host
+        self.port = port
+    }
+
     init(from decoder: Decoder) throws {
         let dynamic = try decoder.container(keyedBy: PairingCodingKey.self)
         let allowed = Set(CodingKeys.allCases.map(\.rawValue))
@@ -137,6 +144,7 @@ struct CompanionPairedDesktop: Codable, Hashable, Sendable {
     let identityPublic: String
     let x25519StaticPublic: String
     let capabilities: [CompanionCapability]
+    let transportHint: CompanionPairingTransportHint?
 
     var pin: CompanionIdentityPin {
         CompanionIdentityPin(

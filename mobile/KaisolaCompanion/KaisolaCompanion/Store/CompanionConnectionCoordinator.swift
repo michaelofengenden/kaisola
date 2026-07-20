@@ -23,7 +23,12 @@ struct UserDefaultsPairedDesktopStore: PairedDesktopPersisting {
         guard let data = try? JSONEncoder().encode(desktop) else { return }
         defaults.set(data, forKey: key)
     }
-    func clear() { defaults.removeObject(forKey: key) }
+    func clear() {
+        defaults.removeObject(forKey: key)
+        // Cursors from builds that persisted them are deliberately discarded.
+        // A cold launch has no matching in-memory projection to replay onto.
+        defaults.removeObject(forKey: "com.kaisola.companion.replay-cursor.v1")
+    }
 }
 
 /// The orchestration layer: owns the device identity, the wire client, the live
@@ -43,6 +48,8 @@ final class CompanionConnectionCoordinator: ObservableObject {
 
     @Published private(set) var pairingPhase: PairingPhase = .idle
     @Published private(set) var pairedDesktop: CompanionPairedDesktop?
+    @Published private(set) var accountOffers: [CompanionAccountOffer] = []
+    @Published private(set) var accountLookupInProgress = false
     /// Drives presentation of the pairing sheet from anywhere in the app.
     @Published var wantsPairing = false
 
@@ -51,8 +58,12 @@ final class CompanionConnectionCoordinator: ObservableObject {
     private let client: CompanionClient
     private let keychain: CompanionIdentityKeychain
     private let persistence: PairedDesktopPersisting
+    private let accountRendezvous: any CompanionAccountRendezvousServing
     private var identity: CompanionIdentity?
     private var pendingPayload: CompanionPairingPayload?
+    private var activePairingNonce: String?
+    private var pairingTimeoutTask: Task<Void, Never>?
+    private var accountLookupID: UUID?
     private var cancellables: Set<AnyCancellable> = []
 
     var isPaired: Bool { pairedDesktop != nil }
@@ -60,11 +71,13 @@ final class CompanionConnectionCoordinator: ObservableObject {
     init(
         client: CompanionClient = CompanionClient(transport: CompanionTransport(autoConnect: true)),
         keychain: CompanionIdentityKeychain = CompanionIdentityKeychain(),
-        persistence: PairedDesktopPersisting = UserDefaultsPairedDesktopStore()
+        persistence: PairedDesktopPersisting = UserDefaultsPairedDesktopStore(),
+        accountRendezvous: any CompanionAccountRendezvousServing = CompanionAccountRendezvousService()
     ) {
         self.client = client
         self.keychain = keychain
         self.persistence = persistence
+        self.accountRendezvous = accountRendezvous
         self.store = CompanionStore.live(client: client)
         self.pairedDesktop = persistence.load()
         observe()
@@ -79,11 +92,16 @@ final class CompanionConnectionCoordinator: ObservableObject {
             return
         }
         pairingPhase = .preparing
+        accountOffers = []
+        accountLookupID = nil
+        accountLookupInProgress = false
         do {
             let identity = try await resolveIdentity()
             self.pendingPayload = payload
+            activePairingNonce = payload.pairingNonce
             pairingPhase = .connecting
-            client.transport.startDiscovery()
+            armPairingTimeout(for: payload)
+            client.transport.startDiscovery(preferred: payload.transportHint)
             _ = identity
         } catch {
             pairingPhase = .failed(Self.identityMessage(error))
@@ -93,7 +111,59 @@ final class CompanionConnectionCoordinator: ObservableObject {
     /// Open the pairing sheet fresh.
     func presentPairing() {
         pairingPhase = .idle
+        accountOffers = []
         wantsPairing = true
+    }
+
+    /// Find a short-lived offer published by a signed-in Mac. The account is
+    /// rendezvous only: the connection still uses the signed pairing payload,
+    /// local transport, Noise handshake, and four-word verification.
+    func findAccountMac(idToken: String) async {
+        let lookupID = UUID()
+        accountLookupID = lookupID
+        accountLookupInProgress = true
+        accountOffers = []
+        defer {
+            if accountLookupID == lookupID {
+                accountLookupInProgress = false
+                accountLookupID = nil
+            }
+        }
+        do {
+            var offers: [CompanionAccountOffer] = []
+            for attempt in 0..<4 {
+                guard accountLookupID == lookupID else { return }
+                offers = try await accountRendezvous.listOffers(idToken: idToken)
+                if !offers.isEmpty { break }
+                if attempt < 3 { try await Task.sleep(for: .milliseconds(650)) }
+            }
+            guard accountLookupID == lookupID else { return }
+            if offers.count == 1, let offer = offers.first {
+                await pair(with: offer.payload)
+            } else if offers.isEmpty {
+                pairingPhase = .failed("No Mac is waiting to pair. On your Mac, open Settings → Companion and choose Pair a device.")
+            } else {
+                accountOffers = offers
+                pairingPhase = .idle
+            }
+        } catch is CancellationError {
+            return
+        } catch {
+            guard accountLookupID == lookupID else { return }
+            pairingPhase = .failed(
+                (error as? LocalizedError)?.errorDescription ?? "Account pairing is temporarily unavailable."
+            )
+        }
+    }
+
+    func pair(with offer: CompanionAccountOffer) async {
+        await pair(with: offer.payload)
+    }
+
+    func reportAccountPairingError(_ error: Error) {
+        pairingPhase = .failed(
+            (error as? LocalizedError)?.errorDescription ?? "Kaisola couldn't refresh your sign-in. Try again."
+        )
     }
 
     /// A scanned/pasted string that wasn't a valid pairing code.
@@ -109,6 +179,12 @@ final class CompanionConnectionCoordinator: ObservableObject {
     /// Abandon an in-flight pairing.
     func cancelPairing() {
         pendingPayload = nil
+        activePairingNonce = nil
+        accountLookupID = nil
+        accountLookupInProgress = false
+        accountOffers = []
+        pairingTimeoutTask?.cancel()
+        pairingTimeoutTask = nil
         pairingPhase = .idle
         if !isPaired { client.transport.stop() }
     }
@@ -118,8 +194,11 @@ final class CompanionConnectionCoordinator: ObservableObject {
         guard let desktop = pairedDesktop else { return }
         do {
             let identity = try await resolveIdentity()
-            try client.configureResume(desktop: desktop, identity: identity, cursor: client.ackCursor)
-            client.transport.startDiscovery()
+            // Resume deltas only when this process still holds the projection
+            // that cursor acknowledges. A cold launch sends no cursor and gets
+            // a coherent snapshot instead of a green-but-empty board.
+            try client.configureResume(desktop: desktop, identity: identity, cursor: store.lastAckCursor)
+            client.transport.startDiscovery(preferred: desktop.transportHint)
         } catch {
             store.connection = .offline
         }
@@ -136,6 +215,12 @@ final class CompanionConnectionCoordinator: ObservableObject {
         persistence.clear()
         pairedDesktop = nil
         pendingPayload = nil
+        activePairingNonce = nil
+        accountLookupID = nil
+        accountLookupInProgress = false
+        accountOffers = []
+        pairingTimeoutTask?.cancel()
+        pairingTimeoutTask = nil
         pairingPhase = .idle
         client.transport.stop()
     }
@@ -152,6 +237,8 @@ final class CompanionConnectionCoordinator: ObservableObject {
             .receive(on: RunLoop.main)
             .sink { [weak self] sas in
                 guard let self, case .connecting = self.pairingPhase else { return }
+                self.pairingTimeoutTask?.cancel()
+                self.pairingTimeoutTask = nil
                 self.pairingPhase = .confirm(sas)
                 #if DEBUG
                 // Automated pairing harness: confirm the SAS without a tap.
@@ -186,6 +273,9 @@ final class CompanionConnectionCoordinator: ObservableObject {
     }
 
     private func handlePaired(_ desktop: CompanionPairedDesktop) {
+        pairingTimeoutTask?.cancel()
+        pairingTimeoutTask = nil
+        activePairingNonce = nil
         persistence.save(desktop)
         pairedDesktop = desktop
         pairingPhase = .paired
@@ -202,13 +292,19 @@ final class CompanionConnectionCoordinator: ObservableObject {
     }
 
     private func fail(_ error: Error) {
-        pairingPhase = .failed(Self.identityMessage(error))
+        pairingTimeoutTask?.cancel()
+        pairingTimeoutTask = nil
+        activePairingNonce = nil
+        pairingPhase = .failed(Self.pairingMessage(error))
     }
 
     private func failIfPairing(_ message: String) {
         switch pairingPhase {
         case .connecting, .preparing, .confirm:
-            pairingPhase = .failed("Pairing didn't complete. Move closer to your Mac and try again.")
+            pairingTimeoutTask?.cancel()
+            pairingTimeoutTask = nil
+            activePairingNonce = nil
+            pairingPhase = .failed("The secure handshake didn't complete. Start a fresh code on your Mac and try again.")
         default:
             break
         }
@@ -225,5 +321,28 @@ final class CompanionConnectionCoordinator: ObservableObject {
     private static func identityMessage(_ error: Error) -> String {
         if error is CancellationError { return "Sign-in was cancelled." }
         return "Couldn't unlock this device's secure identity. Try again."
+    }
+
+    private static func pairingMessage(_ error: Error) -> String {
+        if error is CancellationError { return "Pairing was cancelled." }
+        return "The secure handshake didn't complete. Start a fresh code on your Mac and try again."
+    }
+
+    private func armPairingTimeout(for payload: CompanionPairingPayload) {
+        pairingTimeoutTask?.cancel()
+        let now = Int64(Date.now.timeIntervalSince1970 * 1_000)
+        let remaining = max(1_000, min(payload.expiresAt - now, 45_000))
+        pairingTimeoutTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(for: .milliseconds(remaining))
+            guard !Task.isCancelled,
+                  let self,
+                  case .connecting = self.pairingPhase,
+                  self.activePairingNonce == payload.pairingNonce else { return }
+            self.activePairingNonce = nil
+            self.client.transport.stop()
+            self.pairingPhase = .failed(
+                "Couldn't reach this Mac. Keep Companion on and put both devices on the same Wi-Fi, then try again."
+            )
+        }
     }
 }

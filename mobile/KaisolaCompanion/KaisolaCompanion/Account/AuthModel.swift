@@ -32,6 +32,9 @@ protocol AuthBackend: AnyObject {
     func restore() async throws -> AuthAccount?
     /// Interactive Google sign-in; returns the account on success.
     func signInWithGoogle() async throws -> AuthAccount
+    /// A fresh Firebase ID token for short-lived same-account services. The
+    /// token never leaves the native account layer except as bearer auth.
+    func freshIDToken() async throws -> String
     /// Clear the Keychain, session, and any cached state.
     func signOut() async
 }
@@ -83,6 +86,11 @@ final class AuthModel: ObservableObject {
         phase = .signedOut
     }
 
+    func freshIDToken() async throws -> String {
+        guard isSignedIn else { throw FirebaseAuthError.invalidSavedSession }
+        return try await backend.freshIDToken()
+    }
+
     /// Dismiss a `.failed` phase back to the sign-in screen.
     func clearError() {
         if case .failed = phase { phase = .signedOut }
@@ -114,6 +122,7 @@ final class PreviewAuthBackend: AuthBackend {
         try? await Task.sleep(for: .milliseconds(400))
         return scriptedAccount
     }
+    func freshIDToken() async throws -> String { "preview-firebase-id-token" }
     func signOut() async { startSignedIn = false }
 }
 

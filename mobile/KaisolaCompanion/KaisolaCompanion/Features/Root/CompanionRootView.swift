@@ -88,6 +88,10 @@ struct CompanionRootView: View {
     /// after a live pairing populates the store. Inert in release.
     private func deepLinkForScreenshots() async {
         #if DEBUG
+        if ProcessInfo.processInfo.environment["KAISOLA_UI_PAIRING"] == "1" {
+            coordinator.presentPairing()
+            return
+        }
         let kind = ProcessInfo.processInfo.environment["KAISOLA_UI_DEEPLINK"]
         let wantKind: CompanionSessionKind? = kind == "agent" ? .agent : kind == "terminal" ? .terminal : nil
         guard let wantKind else { return }

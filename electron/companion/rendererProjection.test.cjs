@@ -92,14 +92,29 @@ test('board follows live CLI metadata from current and compatibility brokers', (
   let raw = buildCompanionProjection(compatibility, { revision: 1, generatedAt: 100 })
   assert.equal(raw.sessions.find((session) => session.id === 'terminal-codex').status, 'running')
 
-  // A precise modern-broker idle signal wins over the coarse fact that Codex
-  // still owns the foreground process and is waiting at its composer.
+  // Quiet-time completion is useful for notifications, but an open Codex TUI
+  // still owns a live terminal session and must remain visible on the board.
   compatibility.terminalMeta['terminal-codex'] = { running: true, agentBusy: false, fgProcess: 'codex' }
   raw = buildCompanionProjection(compatibility, { revision: 2, generatedAt: 101 })
-  assert.equal(raw.sessions.find((session) => session.id === 'terminal-codex').status, 'idle')
+  assert.equal(raw.sessions.find((session) => session.id === 'terminal-codex').status, 'running')
+
+  // The live Kaisola shape for a manually-launched npm Codex TUI may report
+  // `node` and have no promoted singleton key. Its explicit Codex identity is
+  // still enough to keep the running terminal on the board.
+  compatibility.terminals.push({ id: 'terminal-manual-codex', name: 'Kaisola — codex' })
+  compatibility.terminalMeta['terminal-manual-codex'] = { running: true, agentBusy: false, fgProcess: 'node' }
+  raw = buildCompanionProjection(compatibility, { revision: 3, generatedAt: 102 })
+  assert.deepEqual(
+    raw.sessions.find((session) => session.id === 'terminal-manual-codex'),
+    {
+      id: 'terminal-manual-codex', projectId: 'project-kaisola', kind: 'terminal',
+      title: 'Kaisola — codex', status: 'running', needsYou: false, unread: false,
+      updatedAt: 10, provider: 'Codex', summary: 'node',
+    },
+  )
 
   compatibility.agentTerminals = [{ terminalId: 'managed-agent', agentName: 'Runner', label: 'Review' }]
   compatibility.terminalMeta['managed-agent'] = { running: true, fgProcess: 'runner' }
-  raw = buildCompanionProjection(compatibility, { revision: 3, generatedAt: 102 })
+  raw = buildCompanionProjection(compatibility, { revision: 4, generatedAt: 103 })
   assert.equal(raw.sessions.find((session) => session.id === 'managed-agent').status, 'running')
 })

@@ -106,15 +106,14 @@ const terminalStatus = (
   activitySource: 'shell' | 'cli-agent' | 'managed-agent' = 'shell',
 ): CompanionStatus => {
   if (needsYou) return 'waiting'
-  // Modern brokers publish agentBusy, which distinguishes an agent actively
-  // answering from one waiting at its composer. Older broker sessions only
-  // have foreground-process `running`; use that compatibility signal for
-  // recognized CLI agents, exactly as the desktop tabs do. Managed agent
-  // terminals have no prompt lifecycle and are live whenever their process is.
+  // Modern brokers publish agentBusy for completion notifications, but Codex
+  // can pause longer than the quiet-time threshold between tool calls. A
+  // recognized CLI that still owns the foreground PTY remains a live board
+  // session even when that finer-grained signal has settled to false.
   const active = activitySource === 'managed-agent'
     ? meta?.running
     : activitySource === 'cli-agent'
-      ? (meta?.agentBusy ?? meta?.running)
+      ? (meta?.agentBusy === true || meta?.running === true)
       : meta?.agentBusy
   if (active) return 'running'
   if (typeof meta?.lastExit === 'number') return meta.lastExit === 0 ? 'done' : 'failed'
@@ -126,6 +125,16 @@ const terminalProvider = (terminal: TerminalSession): string | undefined => {
   if (/claude/i.test(identity)) return 'Claude'
   if (/codex|openai/i.test(identity)) return 'Codex'
   return terminal.name ? display(terminal.name, 'Terminal', 120) : undefined
+}
+
+const terminalActivitySource = (terminal: TerminalSession): 'shell' | 'cli-agent' => {
+  if (terminal.singletonKey?.startsWith('agent:')) return 'cli-agent'
+  // Some package-installed CLIs own the PTY through a `node` wrapper, so the
+  // broker cannot promote them from fgProcess alone. Preserve an explicit
+  // Codex/Claude terminal identity as the compatibility signal; this matches
+  // the terminal card's provider label and the real manually-launched shape.
+  const provider = terminalProvider(terminal)
+  return provider === 'Codex' || provider === 'Claude' ? 'cli-agent' : 'shell'
 }
 
 const turnProjection = (runtime: AssistantRuntime | undefined) => (runtime?.turns ?? [])
@@ -261,7 +270,7 @@ export function buildCompanionProjection(
         projectId: tab.id,
         kind: 'terminal',
         title: display(terminal.name ?? terminal.promptTitle ?? terminal.autoName, terminalProvider(terminal) ?? 'Terminal'),
-        status: terminalStatus(meta, needsYou, terminal.singletonKey?.startsWith('agent:') ? 'cli-agent' : 'shell'),
+        status: terminalStatus(meta, needsYou, terminalActivitySource(terminal)),
         needsYou,
         unread: needsYou,
         updatedAt: timestamp(meta?.agentCompletedAt, tab.createdAt),

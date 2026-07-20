@@ -367,6 +367,21 @@ final class FirebaseAuthBackend: AuthBackend {
         return account
     }
 
+    func freshIDToken() async throws -> String {
+        guard let refreshToken = try vault.refreshToken() else {
+            throw FirebaseAuthError.invalidSavedSession
+        }
+        let configuration = try resolvedConfiguration()
+        do {
+            let refreshed = try await refresh(refreshToken, configuration: configuration)
+            try vault.updateRefreshToken(refreshed.refreshToken ?? refreshToken)
+            return refreshed.idToken
+        } catch let error as FirebaseAuthError where error.isTerminalRefreshFailure {
+            try? vault.clear()
+            throw error
+        }
+    }
+
     func signOut() async {
         webAuthenticationSession?.cancel()
         webAuthenticationSession = nil

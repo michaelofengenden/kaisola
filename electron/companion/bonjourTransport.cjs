@@ -141,6 +141,26 @@ function localIpv4Addresses(networkInterfaces = os.networkInterfaces()) {
   return [...addresses]
 }
 
+function preferredLocalIpv4Address(networkInterfaces = os.networkInterfaces()) {
+  const candidates = []
+  for (const [name, entries] of Object.entries(networkInterfaces)) {
+    for (const entry of entries ?? []) {
+      if (entry.family !== 'IPv4' || entry.internal) continue
+      const address = entry.address
+      const privateAddress = /^(?:10\.|192\.168\.|172\.(?:1[6-9]|2\d|3[01])\.)/.test(address)
+      const linkLocal = /^169\.254\./.test(address)
+      const interfaceRank = name === 'en0' ? 0
+        : /^en\d+$/.test(name) ? 10
+          : /^bridge\d+$/.test(name) ? 20
+            : /^utun\d+$/.test(name) ? 80
+              : 40
+      candidates.push({ address, rank: interfaceRank + (privateAddress ? 0 : linkLocal ? 30 : 15) })
+    }
+  }
+  candidates.sort((left, right) => left.rank - right.rank || left.address.localeCompare(right.address))
+  return candidates[0]?.address ?? null
+}
+
 class MinimalMdnsAdvertiser {
   constructor({ socketFactory = (options) => dgram.createSocket(options), networkInterfaces = os.networkInterfaces, logger } = {}) {
     this.socketFactory = socketFactory
@@ -542,6 +562,19 @@ class BonjourCompanionTransport extends EventEmitter {
       unauthenticatedClients: this.unauthenticatedClients,
     }
   }
+
+  pairingTransportHint() {
+    const status = this.status()
+    if (!status.enabled || !Number.isSafeInteger(status.port)) {
+      return { service: '_kaisola._tcp', protocol: 'tcp' }
+    }
+    const host = preferredLocalIpv4Address()
+    return {
+      service: '_kaisola._tcp',
+      protocol: 'tcp',
+      ...(host ? { host, port: status.port } : {}),
+    }
+  }
 }
 
 module.exports = {
@@ -563,6 +596,7 @@ module.exports = {
   encodeMdnsResponse,
   encodeWireFrame,
   localIpv4Addresses,
+  preferredLocalIpv4Address,
   parseDnsQuestions,
   serviceNames,
   writeWireFrame,

@@ -36,10 +36,13 @@ GoogleService-Info.plist**:
 - The **refresh token lives in the Keychain** behind device authentication;
   the short-lived idToken is exchanged for a Kaisola session and refreshed on
   demand. Sign-out clears the Keychain, the session, and the local cache.
-- Account identity is **separate from device pairing**. LAN pairing (Task 8)
-  still secures the actual channel to a specific Mac. Signing in is required to
-  enter the app (the ChatGPT-style gate) and is the identity remote mode (Phase
-  3) will reuse; pairing is what authorizes a given Mac.
+- Account identity does **not** authorize the device channel. It can now act as
+  a rendezvous: while the desktop pairing sheet is open, the Mac publishes its
+  signed, short-lived LAN offer under the authenticated Firebase UID and the
+  iPhone can retrieve it with “Find my Mac.” QR remains available. In both
+  cases the same Noise XX handshake, pinned desktop identity, and four-word SAS
+  authorize the Mac; Firebase never relays terminal data, private keys, or a
+  durable control credential.
 
 ## UX direction — ChatGPT/Codex-class, native, thumb-first
 

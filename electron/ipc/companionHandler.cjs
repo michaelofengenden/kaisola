@@ -69,6 +69,7 @@ class CompanionHandler {
     gateway,
     transport,
     transportFactory,
+    accountRendezvous = null,
     now = Date.now,
     pairingTtlMs = DEFAULT_PAIRING_TTL_MS,
     setTimer = setTimeout,
@@ -83,6 +84,7 @@ class CompanionHandler {
     this.setTimer = setTimer
     this.clearTimer = clearTimer
     this.logger = logger
+    this.accountRendezvous = accountRendezvous
     this.enabled = false
     this.startFailed = false
     this.disposed = false
@@ -214,9 +216,11 @@ class CompanionHandler {
     await this.transition.catch(() => {})
     if (this.disposed || !this.getState().listening) throw new Error('Enable Companion before pairing a device.')
     const requestedCapabilities = validateCapabilities(capabilities, { defaultObserve: true })
+    const transportHint = this.transport.pairingTransportHint?.()
+      ?? { service: '_kaisola._tcp', protocol: 'tcp' }
     const payload = this.pairingManager.createOffer({
       requestedCapabilities,
-      transportHint: { service: '_kaisola._tcp', protocol: 'tcp' },
+      transportHint,
       expiresInMs: this.pairingTtlMs,
     })
     const pairingId = payload.pairingNonce
@@ -241,6 +245,7 @@ class CompanionHandler {
     record.timer?.unref?.()
     this.activePairings.set(pairingId, record)
     this.#broadcast(PAIRING_CHANNEL, { pairingId, phase: 'awaiting' })
+    this.#publishAccountOffer(record, payload)
     return { pairingId, qrPayload: JSON.stringify(payload), expiresAt: payload.expiresAt }
   }
 
@@ -268,6 +273,7 @@ class CompanionHandler {
     if (!record) return { ok: false }
     this.activePairings.delete(id)
     if (record.timer) this.clearTimer(record.timer)
+    this.#withdrawAccountOffer(record)
     try { this.transport.cancelPairing?.(id, 'pairing_cancelled') } catch { /* offer cancellation below remains authoritative */ }
     this.pairingManager.cancelPairing?.(id)
     return { ok: true }
@@ -299,6 +305,7 @@ class CompanionHandler {
     this.disposed = true
     for (const [pairingId, record] of this.activePairings) {
       if (record.timer) this.clearTimer(record.timer)
+      this.#withdrawAccountOffer(record)
       this.pairingManager.cancelPairing?.(pairingId)
     }
     this.activePairings.clear()
@@ -360,8 +367,28 @@ class CompanionHandler {
     if (!record) return false
     this.activePairings.delete(pairingId)
     if (record.timer) this.clearTimer(record.timer)
+    this.#withdrawAccountOffer(record)
     this.#broadcast(PAIRING_CHANNEL, event)
     return true
+  }
+
+  #publishAccountOffer(record, payload) {
+    if (!this.accountRendezvous?.publishOffer) return
+    void Promise.resolve(this.accountRendezvous.publishOffer(payload)).then((published) => {
+      if (!published) return
+      const current = this.activePairings.get(record.pairingId)
+      if (current === record) {
+        record.accountPublished = true
+        return
+      }
+      void Promise.resolve(this.accountRendezvous.withdrawOffer?.(record.pairingId)).catch(() => {})
+    }).catch(() => {})
+  }
+
+  #withdrawAccountOffer(record) {
+    if (!record?.accountPublished || !this.accountRendezvous?.withdrawOffer) return
+    record.accountPublished = false
+    void Promise.resolve(this.accountRendezvous.withdrawOffer(record.pairingId)).catch(() => {})
   }
 
   #emitState() {

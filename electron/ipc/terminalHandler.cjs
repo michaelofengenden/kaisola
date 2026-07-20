@@ -49,6 +49,28 @@ function execOut(cmd, args) {
   })
 }
 
+/** node-pty reports the foreground process-group leader. Package-installed
+ * JavaScript CLIs often make that leader `node`, even though the command the
+ * user launched is Codex. Reduce only known wrappers to a safe identity; never
+ * expose the full command line (which may contain private arguments). */
+function wrappedCliProcess(processName, commandLine) {
+  const leaf = path.basename(String(processName || '')).replace(/^-/, '').toLowerCase()
+  if (!['node', 'bun', 'deno'].includes(leaf)) return processName || ''
+  const command = String(commandLine || '')
+  if (/(?:^|[\s/])codex(?:\.js)?(?:\s|$)/i.test(command)) return 'codex'
+  return processName || ''
+}
+
+async function foregroundProcessIdentity(terminal) {
+  const raw = terminal?.process || ''
+  const leaf = path.basename(raw).replace(/^-/, '').toLowerCase()
+  if (!['node', 'bun', 'deno'].includes(leaf) || !terminal?.pid) return raw
+  const foreground = Number(String(await execOut('ps', ['-o', 'tpgid=', '-p', String(terminal.pid)]) || '').trim())
+  if (!(foreground > 0)) return raw
+  const commandLine = await execOut('ps', ['-o', 'command=', '-p', String(foreground)])
+  return wrappedCliProcess(raw, commandLine)
+}
+
 const CODEX_SESSION_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
 const codexIdFromPath = (file) => {
   const match = path.basename(file).match(/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\.jsonl$/i)
@@ -166,7 +188,8 @@ async function pollMeta() {
   const cwds = await cwdOfPids(pollable.map((t) => t.pid))
   for (const t of live) {
     const prev = metaCache.get(t.id) || {}
-    const next = { ...prev, process: t.process, agentBusy: !!t.agentBusy, agentCompletedAt: t.agentCompletedAt || null }
+    const processIdentity = await foregroundProcessIdentity(t)
+    const next = { ...prev, process: processIdentity, agentBusy: !!t.agentBusy, agentCompletedAt: t.agentCompletedAt || null }
     const cwd = cwds.get(t.pid)
     if (cwd) next.cwd = cwd
     if (next.cwd && next.cwd !== prev.cwd) {
@@ -433,5 +456,5 @@ module.exports = {
   forgetRendererOwner,
   subscribeTerminalObserver,
   setTerminalAttentionSink,
-  __test: { codexIdFromPath, jsonStringField, codexSession },
+  __test: { codexIdFromPath, jsonStringField, codexSession, wrappedCliProcess },
 }

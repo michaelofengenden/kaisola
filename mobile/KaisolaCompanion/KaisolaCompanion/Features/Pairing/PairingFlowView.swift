@@ -5,6 +5,7 @@ import SwiftUI
 /// the coordinator's pairing phase.
 struct PairingFlowView: View {
     @EnvironmentObject private var coordinator: CompanionConnectionCoordinator
+    @EnvironmentObject private var auth: AuthModel
     @Environment(\.dismiss) private var dismiss
     @Environment(\.colorScheme) private var colorScheme
     @State private var showPaste = false
@@ -28,7 +29,7 @@ struct PairingFlowView: View {
                 if paired { DispatchQueue.main.asyncAfter(deadline: .now() + 0.9) { dismiss() } }
             }
         }
-        .interactiveDismissDisabled(isBusy)
+        .interactiveDismissDisabled(isBusy || coordinator.accountLookupInProgress)
     }
 
     private var isPaired: Bool { if case .paired = coordinator.pairingPhase { return true }; return false }
@@ -56,6 +57,12 @@ struct PairingFlowView: View {
 
     private var scanStep: some View {
         VStack(spacing: 18) {
+            accountPairingControl
+            HStack(spacing: 12) {
+                Rectangle().fill(Color.secondary.opacity(0.2)).frame(height: 0.5)
+                Text("or").font(.caption).foregroundStyle(.tertiary)
+                Rectangle().fill(Color.secondary.opacity(0.2)).frame(height: 0.5)
+            }
             if QRScannerView.isSupported && !showPaste {
                 QRScannerView { code in scan(code) }
                     .frame(maxWidth: .infinity)
@@ -73,6 +80,47 @@ struct PairingFlowView: View {
                 Label(message, systemImage: "exclamationmark.triangle.fill")
                     .font(.footnote).foregroundStyle(KaisolaTheme.failed)
                     .multilineTextAlignment(.leading)
+            }
+        }
+    }
+
+    @ViewBuilder private var accountPairingControl: some View {
+        if coordinator.accountOffers.isEmpty {
+            Button(action: findAccountMac) {
+                HStack(spacing: 9) {
+                    if coordinator.accountLookupInProgress {
+                        ProgressView().controlSize(.small).tint(KaisolaTheme.darkFrame)
+                    } else {
+                        Image(systemName: "person.crop.circle.badge.checkmark")
+                    }
+                    Text(coordinator.accountLookupInProgress ? "Finding your Mac…" : "Find my Mac")
+                        .font(.subheadline.weight(.semibold))
+                }
+                .frame(maxWidth: .infinity).frame(height: 48)
+                .foregroundStyle(KaisolaTheme.darkFrame)
+                .background(KaisolaTheme.accent, in: RoundedRectangle(cornerRadius: 13, style: .continuous))
+            }
+            .buttonStyle(QuietPressStyle())
+            .disabled(coordinator.accountLookupInProgress)
+        } else {
+            VStack(spacing: 8) {
+                Text("Choose a Mac").font(.footnote.weight(.semibold)).foregroundStyle(.secondary)
+                ForEach(coordinator.accountOffers) { offer in
+                    Button {
+                        Task { await coordinator.pair(with: offer) }
+                    } label: {
+                        HStack {
+                            Image(systemName: "desktopcomputer")
+                            Text(offer.desktopName).lineLimit(1)
+                            Spacer()
+                            Image(systemName: "chevron.right").font(.caption.weight(.semibold))
+                        }
+                        .font(.subheadline.weight(.medium))
+                        .padding(.horizontal, 15).frame(height: 48)
+                        .background(KaisolaTheme.raised(for: colorScheme), in: RoundedRectangle(cornerRadius: 13, style: .continuous))
+                    }
+                    .buttonStyle(QuietPressStyle()).foregroundStyle(.primary)
+                }
             }
         }
     }
@@ -159,5 +207,16 @@ struct PairingFlowView: View {
             return
         }
         Task { await coordinator.pair(with: payload) }
+    }
+
+    private func findAccountMac() {
+        Task {
+            do {
+                let token = try await auth.freshIDToken()
+                await coordinator.findAccountMac(idToken: token)
+            } catch {
+                coordinator.reportAccountPairingError(error)
+            }
+        }
     }
 }

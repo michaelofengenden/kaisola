@@ -15,6 +15,7 @@ const {
   encodeMdnsResponse,
   encodeWireFrame,
   localIpv4Addresses,
+  preferredLocalIpv4Address,
   parseDnsQuestions,
 } = require('./bonjourTransport.cjs')
 const { CompanionDeviceStore } = require('./deviceStore.cjs')
@@ -189,6 +190,10 @@ test('minimal in-repo mDNS encoding advertises PTR, SRV, TXT, and local-interfac
     en0: [{ family: 'IPv4', internal: false, address: '192.168.1.23' }],
     lo0: [{ family: 'IPv4', internal: true, address: '127.0.0.1' }],
   }), ['192.168.1.23'])
+  assert.equal(preferredLocalIpv4Address({
+    utun4: [{ family: 'IPv4', internal: false, address: '100.64.0.4' }],
+    en0: [{ family: 'IPv4', internal: false, address: '192.168.1.23' }],
+  }), '192.168.1.23')
 })
 
 test('Bonjour listener and advertisement remain disabled until the explicit enable call', async (t) => {
@@ -206,6 +211,11 @@ test('Bonjour listener and advertisement remain disabled until the explicit enab
   assert.equal(enabled.enabled, true)
   assert.ok(enabled.port > 0)
   assert.deepEqual(advertiser.starts, [{ desktopId: store.desktopIdentity().id, port: enabled.port }])
+  const hint = service.pairingTransportHint()
+  assert.equal(hint.service, '_kaisola._tcp')
+  assert.equal(hint.protocol, 'tcp')
+  assert.equal(hint.port, enabled.port)
+  if (hint.host != null) assert.match(hint.host, /^\d{1,3}(?:\.\d{1,3}){3}$/)
   assert.equal(await service.disable(), true)
   assert.equal(advertiser.stops, 1)
   assert.equal(service.status().enabled, false)

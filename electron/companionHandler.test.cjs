@@ -68,6 +68,12 @@ class FakeTransport extends EventEmitter {
     return true
   }
 
+  pairingTransportHint() {
+    return this.enabled
+      ? { service: '_kaisola._tcp', protocol: 'tcp', host: '192.168.1.23', port: 49321 }
+      : { service: '_kaisola._tcp', protocol: 'tcp' }
+  }
+
   status() {
     return {
       enabled: this.enabled,
@@ -102,7 +108,7 @@ function phoneRecord(seed = 51, deviceId = 'device-handler-iphone') {
   }
 }
 
-function setup(t, { now = 1_784_250_100_000 } = {}) {
+function setup(t, { now = 1_784_250_100_000, accountRendezvous = null } = {}) {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'kaisola-companion-handler-'))
   const handlers = new Map()
   const removedHandlers = []
@@ -139,6 +145,7 @@ function setup(t, { now = 1_784_250_100_000 } = {}) {
     BrowserWindow,
     safeStorage: fakeSafeStorage(),
     gateway,
+    accountRendezvous,
     now: () => now,
     transportFactory: (options) => {
       transport = new FakeTransport(options)
@@ -189,7 +196,12 @@ test('startPairing returns one opaque QR payload and expiry, then emits awaiting
   assert.equal(payload.pairingNonce, started.pairingId)
   assert.equal(payload.expiresAt, started.expiresAt)
   assert.deepEqual(payload.requestedCapabilities, ['observe', 'agent-control'])
-  assert.deepEqual(payload.transportHint, { service: '_kaisola._tcp', protocol: 'tcp' })
+  assert.deepEqual(payload.transportHint, {
+    service: '_kaisola._tcp',
+    protocol: 'tcp',
+    host: '192.168.1.23',
+    port: 49321,
+  })
   assert.deepEqual(sent.find((entry) => entry.channel === 'companion:pairing-event')?.payload, {
     pairingId: started.pairingId,
     phase: 'awaiting',
@@ -213,6 +225,25 @@ test('startPairing returns one opaque QR payload and expiry, then emits awaiting
   assert.deepEqual(await handler.cancelPairing(started.pairingId), { ok: false })
   assert.deepEqual(transport.cancelled, [{ pairingId: started.pairingId, reason: 'pairing_cancelled' }])
   assert.equal(handler.pairingManager.stats().offers, 0)
+})
+
+test('a pairing offer is published for the signed-in account and withdrawn on cancellation', async (t) => {
+  const published = []
+  const withdrawn = []
+  const accountRendezvous = {
+    async publishOffer(payload) { published.push(payload); return true },
+    async withdrawOffer(nonce) { withdrawn.push(nonce); return true },
+  }
+  const { handler } = setup(t, { accountRendezvous })
+  await handler.setEnabled(true)
+  const started = await handler.startPairing()
+  await new Promise((resolve) => setImmediate(resolve))
+  assert.equal(published.length, 1)
+  assert.equal(published[0].pairingNonce, started.pairingId)
+
+  assert.deepEqual(await handler.cancelPairing(started.pairingId), { ok: true })
+  await new Promise((resolve) => setImmediate(resolve))
+  assert.deepEqual(withdrawn, [started.pairingId])
 })
 
 test('revoke closes every live connection, drops the device row, and rename persists safe display metadata', async (t) => {

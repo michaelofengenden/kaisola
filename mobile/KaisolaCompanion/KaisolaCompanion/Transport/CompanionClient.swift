@@ -10,6 +10,7 @@ final class CompanionClient: ObservableObject {
     var onEnvelope: ((CompanionEnvelope) -> Void)?
     var onTransportState: ((CompanionTransportState) -> Void)?
     var onPairedDesktop: ((CompanionPairedDesktop) -> Void)?
+    var onAckCursor: ((CompanionAckCursor) -> Void)?
 
     let transport: CompanionTransport
 
@@ -25,6 +26,11 @@ final class CompanionClient: ObservableObject {
     private var remoteSASConfirmed = false
     private var outboundSeq: Int64 = 0
     private(set) var ackCursor: CompanionAckCursor?
+    private struct StreamSubscription: Hashable {
+        let projectId: String
+        let sessionId: String
+    }
+    private var desiredStreamSubscriptions: Set<StreamSubscription> = []
 
     init(transport: CompanionTransport = CompanionTransport()) {
         self.transport = transport
@@ -36,13 +42,27 @@ final class CompanionClient: ObservableObject {
                 do { try self.startHandshake() } catch { self.fail(error) }
             }
         }
-        transport.onError = { [weak self] error in self?.fail(error) }
+        transport.onError = { [weak self] error in
+            guard let self else { return }
+            switch self.transport.state {
+            case .discovering, .connecting, .live, .reconnecting:
+                // Direct endpoint and Bonjour failures are recoverable. The
+                // transport keeps racing/retrying them without invalidating the
+                // single-use offer or flashing a terminal error in the UI.
+                break
+            case .idle, .handshaking:
+                self.fail(error)
+            }
+        }
     }
 
     func beginPairing(payload: CompanionPairingPayload, identity: CompanionIdentity) throws {
         try payload.validate()
         guard identity.role == .device else { throw CompanionCryptoError.roleMismatch }
         self.identity = identity
+        pairedDesktop = nil
+        ackCursor = nil
+        desiredStreamSubscriptions.removeAll()
         mode = .pairing(payload)
         try startHandshake()
     }
@@ -78,7 +98,15 @@ final class CompanionClient: ObservableObject {
     /// desktop filters terminal.output to subscribed sessions, so the phone must
     /// ask before deltas flow — the snapshot arrives regardless.
     func setStreamSubscription(projectId: String, sessionId: String, subscribed: Bool) throws {
-        guard let channel, let context = connectionContext, transport.state == .live else {
+        let subscription = StreamSubscription(projectId: projectId, sessionId: sessionId)
+        if subscribed { desiredStreamSubscriptions.insert(subscription) }
+        else { desiredStreamSubscriptions.remove(subscription) }
+        guard transport.state == .live else { return }
+        try sendStreamSubscription(subscription, subscribed: subscribed)
+    }
+
+    private func sendStreamSubscription(_ subscription: StreamSubscription, subscribed: Bool) throws {
+        guard let channel, let context = connectionContext else {
             throw CompanionWireError.connectionUnavailable
         }
         let commandId = "cmd-\(UUID().uuidString.lowercased())"
@@ -86,8 +114,8 @@ final class CompanionClient: ObservableObject {
         let body = CompanionCommandBody(
             type: subscribed ? "stream.subscribe" : "stream.unsubscribe",
             commandId: commandId,
-            projectId: projectId,
-            targetId: sessionId,
+            projectId: subscription.projectId,
+            targetId: subscription.sessionId,
             capability: .observe,
             expectedRevision: nil,
             payload: nil
@@ -121,6 +149,7 @@ final class CompanionClient: ObservableObject {
         )
         try sendSecureFrame(channel.encrypt(CompanionProtocolCodec.encode(envelope)))
         ackCursor = cursor
+        onAckCursor?(cursor)
     }
 
     private func startHandshake() throws {
@@ -298,7 +327,8 @@ final class CompanionClient: ObservableObject {
                 desktopId: payload.desktopId,
                 identityPublic: payload.identityPublic,
                 x25519StaticPublic: payload.keyRecord.x25519StaticPublic,
-                capabilities: CompanionCapability.allCases.filter(granted.contains)
+                capabilities: CompanionCapability.allCases.filter(granted.contains),
+                transportHint: payload.transportHint
             )
             pairedDesktop = desktop
             mode = .resume(desktop)
@@ -335,6 +365,9 @@ final class CompanionClient: ObservableObject {
         )
         try sendSecureFrame(channel.encrypt(CompanionProtocolCodec.encode(envelope)))
         transport.markLive()
+        for subscription in desiredStreamSubscriptions {
+            try sendStreamSubscription(subscription, subscribed: true)
+        }
     }
 
     private func receiveApplicationFrame(_ data: Data) throws {

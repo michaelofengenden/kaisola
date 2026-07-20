@@ -43,14 +43,19 @@ final class CompanionTransport: ObservableObject {
     private var reconnectWorkItem: DispatchWorkItem?
     private var intentionallyStopped = true
     private let autoConnect: Bool
+    private var preferredEndpoint: NWEndpoint?
 
     init(autoConnect: Bool = true) {
         self.autoConnect = autoConnect
     }
 
-    func startDiscovery() {
+    func startDiscovery(preferred hint: CompanionPairingTransportHint? = nil) {
         stopResources()
         intentionallyStopped = false
+        reconnectAttempt = 0
+        preferredEndpoint = Self.directEndpoint(from: hint)
+        selectedEndpoint = nil
+        discoveredDesktops = []
         transition(to: .discovering)
         let parameters = NWParameters.tcp
         parameters.includePeerToPeer = true
@@ -66,11 +71,15 @@ final class CompanionTransport: ObservableObject {
                 guard let self else { return }
                 if case let .failed(error) = newState {
                     self.onError?(error)
-                    self.scheduleReconnect()
+                    if self.connection == nil { self.scheduleReconnect() }
                 }
             }
         }
         browser.start(queue: queue)
+        if let preferredEndpoint {
+            selectedEndpoint = preferredEndpoint
+            connect(to: preferredEndpoint, reconnecting: false)
+        }
     }
 
     func connect(to desktop: CompanionDiscoveredDesktop) {
@@ -105,6 +114,7 @@ final class CompanionTransport: ObservableObject {
         intentionallyStopped = true
         stopResources()
         selectedEndpoint = nil
+        preferredEndpoint = nil
         discoveredDesktops = []
         transition(to: .idle)
     }
@@ -121,7 +131,7 @@ final class CompanionTransport: ObservableObject {
         discoveredDesktops = desktops
         guard autoConnect, connection == nil, let first = desktops.first else { return }
         selectedEndpoint = first.endpoint
-        connect(to: first.endpoint, reconnecting: false)
+        connect(to: first.endpoint, reconnecting: state == .reconnecting)
     }
 
     private func connect(to endpoint: NWEndpoint, reconnecting: Bool) {
@@ -143,6 +153,13 @@ final class CompanionTransport: ObservableObject {
                     self.receiveNext(on: connection)
                 case let .failed(error):
                     self.onError?(error)
+                    self.connection = nil
+                    self.selectedEndpoint = nil
+                    if let discovered = self.discoveredDesktops.first {
+                        self.selectedEndpoint = discovered.endpoint
+                        self.connect(to: discovered.endpoint, reconnecting: true)
+                        return
+                    }
                     self.scheduleReconnect()
                 case .cancelled:
                     if !self.intentionallyStopped { self.scheduleReconnect() }
@@ -194,6 +211,14 @@ final class CompanionTransport: ObservableObject {
                 guard let self, !self.intentionallyStopped else { return }
                 if let endpoint = self.selectedEndpoint {
                     self.connect(to: endpoint, reconnecting: true)
+                } else if let discovered = self.discoveredDesktops.first {
+                    self.selectedEndpoint = discovered.endpoint
+                    self.connect(to: discovered.endpoint, reconnecting: true)
+                } else if let preferred = self.preferredEndpoint {
+                    self.selectedEndpoint = preferred
+                    self.connect(to: preferred, reconnecting: true)
+                } else if self.browser != nil {
+                    self.transition(to: .discovering)
                 } else {
                     self.startDiscovery()
                 }
@@ -216,5 +241,14 @@ final class CompanionTransport: ObservableObject {
         guard state != newState else { return }
         state = newState
         onStateChange?(newState)
+    }
+
+    static func directEndpoint(from hint: CompanionPairingTransportHint?) -> NWEndpoint? {
+        guard let host = hint?.host?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !host.isEmpty,
+              let portValue = hint?.port,
+              (1...65_535).contains(portValue),
+              let port = NWEndpoint.Port(rawValue: UInt16(portValue)) else { return nil }
+        return .hostPort(host: NWEndpoint.Host(host), port: port)
     }
 }

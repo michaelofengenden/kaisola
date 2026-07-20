@@ -14,7 +14,7 @@ const { registerSettingsHandlers } = require('./ipc/settingsHandler.cjs')
 const { registerTerminalHandlers, detachSessionBroker, setAppFocused, forgetRendererOwner, subscribeTerminalObserver, setTerminalAttentionSink } = require('./ipc/terminalHandler.cjs')
 const { registerAcpHandlers, acpSessionService, disposeAcp, acpRendererSwapState, acpRestartSafetyState, waitForAcpRestartSafe, acpProjectTransferState, transferAcpProject, releaseAcpRenderer, setAcpSessionEventSink } = require('./ipc/acpHandler.cjs')
 const { createPopMirrorCache, sanitizeTerminalMirror, tabListOwnsProject } = require('./ipc/terminalMirrorPolicy.cjs')
-const { registerAuthHandlers, disposeAuth } = require('./ipc/authHandler.cjs')
+const { registerAuthHandlers, disposeAuth, currentFirebaseIdToken, readPublicConfig } = require('./ipc/authHandler.cjs')
 const { registerFsHandlers, disposeFs } = require('./ipc/fsHandler.cjs')
 const { registerGrobidHandlers } = require('./ipc/grobidHandler.cjs')
 const { registerSandboxHandlers } = require('./ipc/sandboxHandler.cjs')
@@ -34,6 +34,7 @@ const { registerAssistantArchiveHandlers } = require('./ipc/assistantArchive.cjs
 const { registerAttentionHandlers } = require('./ipc/attentionHandler.cjs')
 const { AttentionService } = require('./ipc/attentionService.cjs')
 const { registerCompanionHandlers } = require('./ipc/companionHandler.cjs')
+const { CompanionAccountRendezvous } = require('./companion/accountRendezvous.cjs')
 const { registerCompanionProjectionHandlers } = require('./companion/projectionHandler.cjs')
 const { CompanionProjectionStore, projectionStoreKey } = require('./companion/projectionStore.cjs')
 const { CompanionDesktopState } = require('./companion/desktopState.cjs')
@@ -1718,6 +1719,10 @@ if (hasSingleInstanceLock) app.whenReady().then(() => {
     BrowserWindow,
     safeStorage,
     desktopState: companionDesktopState,
+    accountRendezvous: new CompanionAccountRendezvous({
+      tokenProvider: currentFirebaseIdToken,
+      configProvider: readPublicConfig,
+    }),
     gatewayOptions: {
       epoch: companionDesktopEpoch,
       terminalObserver: subscribeTerminalObserver,

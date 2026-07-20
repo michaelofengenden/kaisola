@@ -487,5 +487,7 @@ function disposeAuth() {
 module.exports = {
   registerAuthHandlers,
   disposeAuth,
+  currentFirebaseIdToken,
+  readPublicConfig,
   __test: { decodeIdToken, createFirebaseAuthUri, firebaseSignInWithAuthResponse, escapeHtml, isTerminalRefreshError, readPublicConfig, canControlGoogleSession, sameGoogleSession },
 }

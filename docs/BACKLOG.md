@@ -4,4 +4,8 @@
 
 \- ~~sometimes when I copy paste a bunch of text with spaces from some output it copies and pastes it into the Command CLI agent terminal on kaisola as a bunch of messages instead of a single message and then it ends up queing messages~~ — **fixed 2026-07-17** (bracketed-paste mode state was lost on terminal remount; spool now tracks and replays DEC modes — commits `1207c96`, `0ec43a6`, `cc90f09`).
 
-\- ~~when switching between windows or resizing terminal/agent tabs, I would like for the terminal not get scrolled up, the cli agent should stay at the recent outputs~~ — **fixed 2026-07-17** (sticky follow-intent: only deliberate scrolls unpin; resizes/tab-switches/remounts keep the terminal pinned to live output — commit `ea35821`).
+\- ~~when switching between windows or resizing terminal/agent tabs, I would like for the terminal not get scrolled up, the cli agent should stay at the recent outputs~~ — **fixed 2026-07-17** (sticky follow-intent: only deliberate scrolls unpin; resizes/tab-switches/remounts keep the terminal pinned to live output — commit `ea35821`)
+
+  
+
+\- the clicking between windows and

@@ -1,8 +1,8 @@
 # Kaisola → Swift-native — migration design
 
 **Date:** 2026-07-20
-**Status:** design (strategy). Each phase below gets its own spec + implementation
-plan before it is built.
+**Status:** design (strategy), rev 2 (incorporates a repo-grounded plan-review).
+Each phase below gets its own spec + implementation plan before it is built.
 
 ## Why
 
@@ -13,192 +13,257 @@ Two goals, chosen together:
    hosting the whole React UI + WebGL glass + xterm + CodeMirror, a 252 MB
    Electron main, a 128 MB GPU helper, a 49 MB utility helper, and the 77 MB
    Node session-broker. Electron pays a **fresh ~350 MB Chromium renderer per
-   window**; three project windows is ~1.6 GB. The repo's whole "glass energy
-   modes" effort exists because Electron/WebGL is power-hungry.
+   window**; three project windows is ~1.6 GB.
 2. **One shared Swift core across Mac + iPhone.** The companion already holds
    ~2k lines of protocol, crypto, and domain models in Swift. Promoting that to
    a shared package means a feature is written once and ships to both.
 
-**Targets (success metrics):**
+**Targets — treated as measured gates, not asserted facts (see Verification):**
 
 | | One window | Each extra window | Cold launch |
 |---|---|---|---|
 | Today (Electron) | ~880 MB | +~350 MB | ~1–3 s |
-| Hybrid native (goal) | **≤ 450 MB** | **+~60 MB** | **≤ 0.6 s** |
-| Fully native (goal) | **≤ 250 MB** | **+~40 MB** | **≤ 0.4 s** |
-
-Verified with an analog of the existing `electron/memorycompare.cjs`, plus a
-native RSS probe, run on the same demo session.
+| Hybrid native (goal) | ≤ 450 MB *(only if Electron-main is NOT the host — see Decision A)* | +~60 MB | ≤ 0.6 s |
+| Fully native (goal) | ≤ 250 MB *(incl. the PTY daemon + any offscreen WebKit)* | +~40 MB | ≤ 0.4 s |
 
 ## Strategy: hybrid strangler → fully native
 
 **Never a big-bang rewrite.** The Electron app is the daily driver and keeps
 shipping until the native app is demonstrably better. The native app grows by
-*strangling* — it drives the existing, battle-tested Node backends over their
-current socket protocols first, then ports each backend and each web view to
-Swift one at a time. Every phase ships something usable.
+*strangling* — it drives existing, battle-tested backends first, then ports each
+to Swift one at a time. Every phase ships something usable.
 
-The accelerant: Kaisola's backend is **already split into detached Node
-subprocesses talking over sockets** — the durable `session-broker` (node-pty),
-the loopback MCP server, and (post-Task-5) the renderer-neutral
-`AcpSessionService`. A native shell can speak those same protocols on day one.
+### Current-architecture reality (corrected)
+
+The one accelerant that is genuinely a detached, socket-speaking, durable
+service today is the **session-broker** (`session-broker.cjs`, spawned
+`detached:true` via `ELECTRON_RUN_AS_NODE`). The others are **not** detached and
+cannot simply be "pointed at" from Swift:
+
+- **ACP** is an in-memory service (`AcpSessionService`) owned by `acpHandler` in
+  Electron **main**; the adapter subprocess uses stdio pipes tied to main and is
+  **disposed on app shutdown** (`acpHandler.cjs`, `acp.cjs`).
+- **MCP** is a loopback HTTP server running inside Electron **main** that routes
+  human-gated proposals through `BrowserWindow`, **destroyed at shutdown**
+  (`mcpServer.cjs`).
+- **Companion host** depends on Electron `BrowserWindow`, `safeStorage`, and IPC
+  (`companionHandler.cjs`).
+
+This changes the plan materially and drives **Decision A** below.
+
+## Key open decisions (resolve before the dependent phase)
+
+- **Decision A — the control-plane host.** For the hybrid to reuse ACP/MCP/
+  companion, we must pick one: **(A1)** extract a standalone, authenticated Node
+  *control-plane host* (broker + ACP + MCP + companion) that both Electron and
+  native drive over sockets; **(A2)** pull the full ACP/MCP/companion Swift ports
+  forward into the hybrid; or **(A3)** run Electron-main headless as the host —
+  which largely defeats the hybrid memory target and is therefore only a
+  throwaway bootstrap. Leaning A1. **Blocks Phase 2 and Phase 4.**
+- **Decision B — distribution & sandbox.** Developer ID / non-sandboxed vs App
+  Sandbox. Kaisola needs arbitrary user-selected repo access and launches shells,
+  git, adapters, compilers, and CLIs. Sandbox ⇒ persistent security-scoped
+  bookmarks + helper-inheritance design; non-sandbox ⇒ the durable PTY daemon is
+  a broad same-user execution capability to be secured deliberately. A per-user
+  **LaunchAgent** (not a system LaunchDaemon) fits; `SMAppService` has its own
+  registration/authorization + bundle-replacement caveats. **Blocks the daemon.**
+- **Decision C — data coexistence.** Electron and native must not corrupt shared
+  state while both ship (see State workstream). Choose separate stores +
+  one-way import, or a single store with a documented write-arbitration owner.
+- **Decision D — broker → daemon cutover.** How live PTYs migrate from the Node
+  broker to a Swift daemon (see invariant #1). PTY master FDs belong to the
+  owning process and cannot be handed over; options are dual-broker drain, a
+  zero-live-session cutover gate, or keeping the Node broker indefinitely.
 
 ## Non-negotiable invariants — *maintain functionality*
 
-These behaviors must survive the migration. They are acceptance criteria on
-every phase, and the cutover gate.
+Acceptance criteria on every phase and the cutover gate.
 
 ### 1. Durable terminal & agent CLI runs survive app update/restart (headline)
 
-**Today:** `electron/session-broker.cjs` runs as a **detached process** (not the
-renderer, not the app window). It owns the `node-pty` PTYs and a disk-backed
-scrollback spool, exposes a unix-socket protocol (`sessionBrokerClient.cjs`),
-and lets a renderer **reattach by `{streamEpoch, byteOffset}` cursor** after the
-window or the whole app restarts. So an in-flight `claude` / `codex` run keeps
-running while you update Kaisola; the relaunched app reattaches to the live PTY
-with continuous scrollback.
+**Today (precisely):** `session-broker.cjs` runs as a detached process, owns the
+`node-pty` PTYs and a disk-backed scrollback spool, and lets a client re-own a
+terminal after the window or whole app restarts. So an in-flight `claude`/`codex`
+run keeps running while you update Kaisola and the relaunched app re-attaches.
 
-**This must not regress.** How native preserves it:
+**Scope of the guarantee (must be stated, not implied):**
 
-- **Phases 1–4 reuse the *same* Node broker.** The native macOS app reimplements
-  only the small *client* (`sessionBrokerClient`) in Swift and talks to the
-  identical broker over its existing socket + reattach protocol. Durability is
-  literally unchanged because it is the same process.
-- **Full-native port (Phase 5)** replaces the Node broker with a **Swift durable
-  PTY daemon** — a helper process (launchd-managed login item / `SMAppService`,
-  or a detached helper with an XPC endpoint) that owns `forkpty` PTYs + the disk
-  spool + the same `{streamEpoch, byteOffset}` reattach protocol and epoch
-  semantics. The app connects on launch and reattaches by cursor, identical to
-  today. The daemon is versioned independently of the app so an app update never
-  kills a running PTY.
+- **Survives:** app-window close/reopen, full app quit/relaunch, and app *update*
+  — because the broker process outlives them.
+- **Does NOT survive:** a broker/daemon crash, `SIGTERM`/`SIGINT` to the broker,
+  user logout, or reboot — those kill every PTY today. Neither Node detachment
+  nor launchd restart changes that. The invariant is *"survives app lifecycle
+  events,"* not *"survives host death."*
+- **History is bounded, not infinite.** Default disk spool ≈16 MiB; the reattach
+  snapshot tail ≈1 MiB. The guarantee is *continuous retained history with an
+  explicit truncation/gap marker* — not complete history.
 
-**Explicit test (runs every phase):** start a real `claude`/`codex` CLI in a
-terminal, trigger an app update/relaunch of the *shell*, confirm the run
-continued uninterrupted and the reattached view shows continuous scrollback with
-no lost or duplicated bytes.
+**Byte-perfect reattach is new work, not free.** The desktop primary path
+`terminal.attach` returns a **snapshot without a cursor**; only the read-only
+observer path `terminal.subscribe` accepts `{streamEpoch, afterOffset}`. Output
+emitted between the snapshot boundary and the live-listener install has no
+offset reconciliation in the desktop protocol today. The Swift client must
+therefore implement **atomic snapshot-plus-subscribe** (or offset every live
+frame and resume from an acknowledged cursor). "Same broker" preserves the PTY
+*process*; it does not by itself prove no-loss/no-duplication.
+
+**How native preserves it:**
+
+- **Phases 1–4 reuse the *same* Node broker** (the client is reimplemented in
+  Swift; the broker process is unchanged), *plus* the atomic snapshot+subscribe
+  fix above so reattach is byte-safe on desktop too.
+- **Full-native (Phase 5)** introduces a Swift durable PTY daemon. It **cannot
+  hot-swap** a live Node broker (FDs are non-transferable), so cutover follows
+  **Decision D** — dual-broker drain (old sessions stay on Node until empty; new
+  sessions start on Swift) or a zero-live-session gate. Note the existing v1→v2
+  broker migration deliberately kills live PTYs because ownership metadata can't
+  be migrated — the Swift daemon must instead offer N/N+1 protocol compatibility
+  and rollback.
+
+**Explicit test (every phase):** start a real `claude`/`codex` CLI, trigger an
+actual **Sparkle-style app update** (not just a shell relaunch), confirm the run
+continued and the reattached view is byte-continuous up to the retention marker.
 
 ### 2. The rest of the parity list
 
-Each must reach behavioral parity before cutover:
+Behavioral parity required before cutover. This is enforced by conformance
+tests, not just a checklist (see Verification):
 
-- **Multi-project windows** with drag **tear-off / recombine** across windows;
-  per-project workspace + session sets; **saved-window restore** on relaunch.
-- **Agent lifecycle:** ACP Claude/Codex connect, prompt, **mid-turn steer**,
-  cancel, **adoption/resume** of an existing session, one-turn serialization,
-  provider queue capability, read-only mode, **sensitive-file handling**, the
-  cancel watchdog — all exactly as today.
-- **Permissions & autonomy:** the pending-permission model, allow-once/reject,
-  saved rules, protected globs, autonomy levels — unchanged semantics.
-- **Board + attention authority:** the all-project running / needs-you / done
-  surface and native notifications.
-- **Companion gateway:** the phone-pairing + live-stream host (Noise XX,
-  pairing, gateway) keeps working — this already lives partly in Swift and is a
-  natural early beneficiary of the shared core.
-- **MCP loopback server:** the built-in agent-facing tool server keeps serving
-  project bearer capabilities.
-- **Visual parity:** the glass / painted / eco look and per-mode energy behavior
-  (as native `NSVisualEffectView` blur — cheaper than the WebGL compose it
-  replaces), light/dark/solid, the accent system.
-- **Keybindings** (rebindable `keymap.json`), **Firebase Google auth**, **git**
-  integration, and **document/editor fidelity** (markdown, code, PDF, math,
-  diagrams).
-- **Auto-update** of the app itself (electron-updater today → Sparkle or the
-  native updater), with the durable daemon surviving the swap.
+- **Multi-project windows** with tear-off/recombine; per-project workspace +
+  session sets; **saved-window restore** (transactional manifest today).
+- **Agent lifecycle:** ACP Claude/Codex connect, prompt, mid-turn steer, cancel,
+  **adoption/resume**, one-turn serialization, provider queue, read-only mode,
+  sensitive-file handling, cancel watchdog.
+- **Permissions & autonomy:** pending-permission model, allow-once/reject, saved
+  rules, protected globs, autonomy levels.
+- **Board + attention authority** and native notifications.
+- **Companion gateway** (phone pairing + live stream: Noise XX, pairing).
+- **MCP loopback server** serving project bearer capabilities.
+- **Visual parity:** glass/painted/eco (native `NSVisualEffectView`), light/dark/
+  solid, accents.
+- **Keybindings** (`keymap.json`), **Firebase Google auth**, **git**, and
+  **document/editor fidelity**.
+- **Auto-update** with the durable broker/daemon surviving the swap.
+- **The long tail** (must each get an owner/phase/test entry, not be dropped):
+  browser / dev-server session cards, assistant archives + unsaved buffers,
+  extensions / custom languages / previews / external MCP config, worktrees,
+  sandboxed execution, Claude hooks, usage meters, GROBID, LaTeX + SyncTeX, deep
+  links, file associations, asset import, native menus, and safe **secrets
+  migration** (API keys, Firebase refresh token, companion identity/device
+  secrets, pairing state) out of Electron `safeStorage`.
+
+## State & storage workstream (pulled early — not "Phase 5, mechanical")
+
+State is authoritative and cross-cutting, not a late detail: Zustand hydrates
+**synchronously** through Electron-main SQLite (`dbHandler`), saved-window
+restore/delete uses a transactional manifest, and legacy localStorage-only state
+still has migration handling. Because Phase 2 (board/windows) and Phase 3 (the
+React island still expecting the ~1,600-line renderer bridge) both depend on it,
+the storage design — **GRDB schema + version ownership, legacy import, rollback,
+and Electron/native coexistence (Decision C)** — must be specified **before**
+daily-driver parity, or two apps will write the same data under incompatible
+assumptions.
 
 ## Architecture
 
 ```
 KaisolaCore  (one Swift package — shared, macOS + iOS targets)
-  ├─ Protocol · Crypto · Domain models      ← promote from the companion (~2k lines, done)
+  ├─ Protocol · Crypto · Domain models      ← promote from the companion (~2k lines)
   ├─ Session / agent / projection / board model
-  ├─ Backend clients: BrokerClient · AcpClient · McpClient (talk to today's Node services)
-  └─ Wire codecs, cursors, reconciliation
+  ├─ Backend clients: BrokerClient · (AcpClient · McpClient via the control-plane host, Decision A)
+  └─ Wire codecs, cursors (atomic snapshot+subscribe), reconciliation
 
 Kaisola (macOS)  — new AppKit/SwiftUI target on KaisolaCore
-  ├─ Shell        → windows, tabs/tear-off, board, sessions, settings (SwiftUI/AppKit)
-  ├─ Terminal     → SwiftTerm (already a dependency), fed by the durable broker
-  ├─ Agents/ACP   → Swift JSON-RPC over Process (or the Node ACP service as a bridge first)
-  ├─ Auth/model   → FirebaseAuthBackend (Swift, done) + provider REST (URLSession)
-  └─ Editor+Docs  → WKWebView hosting today's React first → native later
-
+  ├─ Shell · Terminal (SwiftTerm) · Agents/ACP · Auth/model · Editor+Docs (WKWebView first)
 Kaisola Companion (iOS)  — existing app, re-based onto KaisolaCore
 
-Backends (strangled last):
-  session-broker (Node/node-pty)  → Swift durable PTY daemon (XPC/launchd)
-  MCP server (Node)               → Swift, or kept as a small subprocess
+Backends:
+  session-broker (Node/node-pty, detached, durable)  → Swift PTY daemon (Decision D)
+  ACP + MCP + companion host                         → control-plane host (Decision A)
 ```
 
-## Fully-native component map (the detail)
+## Fully-native component map (corrected)
 
-The hybrid keeps three non-native things; going fully native ports each. One has
-a caveat (mermaid).
-
-| Piece today | Native replacement | Difficulty / notes |
+| Piece today | Native replacement | Reality check |
 |---|---|---|
-| Terminal / node-pty | **SwiftTerm** (already added, `1.15.0`) over a native `forkpty`; durable **Swift PTY daemon** for persistence | Medium — terminal itself proven in the iOS app |
-| Code editor (CodeMirror) | **CodeEditSourceEditor** (TextKit 2 + **tree-sitter** highlighting) — adopt, don't build | Medium-high — the biggest piece |
-| ACP agents (Node stdio) | Swift `Process` + JSON-RPC over pipes; `AcpSessionService` is the seam | Medium |
-| Markdown / code docs | **swift-markdown** → native views; code blocks reuse the editor highlighter | Low-medium |
-| PDF | **PDFKit** | Trivial |
-| Math (KaTeX) | **SwiftMath** (LaTeX rendering) | Medium |
-| Mermaid diagrams | ⚠️ no native lib — render **offscreen WebKit → SVG**, display natively; or drop | The long pole |
-| Storage (better-sqlite3) | **GRDB.swift** | Mechanical |
-| MCP server | Swift port, **or keep the small Node subprocess** (loopback, on-demand) | Optional / last |
-| Model APIs (Anthropic JS SDK) | URLSession REST | Easy |
-| Firebase auth | `FirebaseAuthBackend` (Swift) | Done |
-
-**"100% zero-web" is achievable except mermaid**, where a tiny offscreen
-render-to-SVG island is the pragmatic answer. The editor is the real work;
-adopting CodeEditSourceEditor keeps it tractable.
+| Terminal / node-pty | **SwiftTerm** (1.15.0, pinned) + Swift PTY daemon | iOS use ≠ macOS proof: keyboard/IME, a11y, mouse/focus modes, SIGWINCH, big scrollback, paste, streaming perf need macOS validation |
+| Code editor (CodeMirror) | **CodeEditSourceEditor** (TextKit 2 + tree-sitter) | ⚠️ upstream says *not production-ready* — needs a parity spike + a WKWebView/CodeMirror-island fallback |
+| ACP agents (stdio) | Swift `Process` + JSON-RPC | Underestimated: framing, backpressure, adapter discovery/versioning, process groups + watchdogs, permission settlement, terminal callbacks, MCP capability injection, adoption/resume, read-only, multi-window ownership |
+| Documents | swift-markdown + PDFKit + native views | swift-markdown = *parsing only*. Parity also needs editable markdown, HTML sanitization, asset import/reorder/resize, file watching, LaTeX+SyncTeX, raster-PDF fallback, split PDF/source, git merge views, media/browser sessions |
+| Math (KaTeX) | **SwiftMath** | Medium |
+| Mermaid | offscreen WebKit → SVG | **Not a current dependency** — net-new/optional, not a parity item. If added: pinned JS, CSP/no-network, SVG sanitization, CPU/input limits |
+| Storage (better-sqlite3) | **GRDB.swift** | See State workstream — not mechanical; coexistence + migration |
+| MCP server | Swift, or kept as a small subprocess | Via Decision A |
+| Model APIs | URLSession REST | Easy |
+| Firebase auth | `FirebaseAuthBackend` | ⚠️ **iOS-only today** (UIKit/`UIApplication`); needs a macOS adaptation + migration from Electron `safeStorage` |
 
 ## Will it be faster/smoother?
 
-Yes, on the things that make an app *feel* fast — **launch, new-window speed,
-streaming/scroll smoothness, glass at low GPU cost, battery/thermals, and
-staying smooth under load** (the `Terminal.tsx` comments call the transparent
-WebGL surface *"the app's dominant cost while an agent streams"*). It will **not**
-change agent/model latency (network- and CLI-bound) or make typing in the editor
-meaningfully faster than CodeMirror (native wins there are memory, not speed).
+Yes on launch, new-window speed, streaming/scroll smoothness, glass at low GPU
+cost, and battery/thermals (the transparent WebGL surface is *"the app's dominant
+cost while an agent streams"* per `Terminal.tsx`). It will **not** change agent/
+model latency or make editor typing meaningfully faster than CodeMirror (the
+editor win is memory, not speed).
 
-## Migration phases
+## Migration phases (re-scoped; several were too large as one phase)
 
-Each phase ships and is independently valuable. **Electron stays the daily driver
-until Phase 4 parity; cut over only when the native app is the better daily
-driver.** Each phase gets its own spec + writing-plans cycle.
+Electron stays the daily driver until parity. Each phase gets its own spec.
 
-0. **Extract KaisolaCore**; re-base the iOS companion on it (keeps the companion
-   green, proves the package boundary).
-1. **Native macOS shell spike:** open a project → native **SwiftTerm** terminal
-   driven by the **existing Node broker**. Measure launch + RSS. Run the
-   *durable-run-survives-restart* test against the same broker. (Proves the feel,
-   the code-share, and invariant #1 for free.)
-2. **Agents/ACP sessions** native; **Board + session list** in SwiftUI;
-   **multi-window + tear-off**.
-3. **Editor + doc views** via the **WKWebView bridge** (reuse today's React);
-   native↔web messaging; files + git.
-4. **Settings, auth, model/provider, MCP, companion gateway** → **daily-driver
-   parity**; dogfood; run the full parity checklist.
-5. **Full-native port:** the web island (editor→CodeEditSourceEditor,
-   math→SwiftMath, mermaid→offscreen-SVG, docs→swift-markdown/PDFKit) and the
-   Node backends (broker→**Swift PTY daemon**, ACP→Swift, MCP→Swift or kept);
-   **drop Electron**; hit the full-native memory targets.
+0. **Extract KaisolaCore**; re-base the iOS companion on it. *(Sound, isolated.)*
+1. **Terminal spike** — native SwiftTerm driven by the existing Node broker.
+   *Explicitly a spike/sidecar* until we solve broker packaging (a standalone
+   signed Node runtime + `node-pty`/native-module closure, since the broker is
+   Electron-in-node-mode today) and reproduce the user-data-path discovery. Land
+   the atomic snapshot+subscribe reattach here and run the update test.
+2. **Control-plane host (Decision A) + native ACP/Board/windows.** "Native ACP"
+   = native session UI over the host; the full Swift ACP port is Phase 5. Needs
+   the State workstream (board/windows depend on authoritative state).
+3. **Editor + docs via WKWebView bridge** — prerequisite work first: native
+   files/git plumbing (or the control-plane host) and a **versioned** native↔web
+   messaging bridge; this reuses the ~1,600-line renderer bridge, not an
+   isolated editor.
+4. **Daily-driver parity** — auth (macOS Firebase + secrets migration), settings,
+   provider, MCP, companion, updates, notifications. Treated as *several*
+   strangler slices, each individually gated, not one step.
+5. **Full native** — independently gated ports: broker→Swift daemon (Decision D),
+   ACP→Swift, MCP→Swift, editor, markdown, math, PDF, (optional) mermaid; drop
+   Electron; hit full-native memory gates.
 
-## Risks & mitigations
+## Risks & mitigations (expanded)
 
-- **Editor parity** (CodeMirror is rich) → adopt CodeEditSourceEditor; accept a
-  WKWebView phase; port opportunistically.
-- **Mermaid** has no native renderer → offscreen-SVG island; acceptable, isolated.
-- **Broker persistence across app update** (invariant #1) → reuse the proven Node
-  broker through Phase 4; the Phase-5 Swift daemon mirrors its exact protocol and
-  is version-independent of the app; the explicit restart test gates it.
-- **Feature-parity drift** → Electron keeps shipping; a written parity checklist
-  gates cutover; no cutover until native is the better daily driver.
-- **Scope** → decomposed into phase-specs; this doc is strategy only.
+- **Editor** — CodeEditSourceEditor isn't production-ready → parity spike +
+  WKWebView/CodeMirror fallback; don't name it *the* path until proven.
+- **Document parity** is much larger than one table row → its own spec.
+- **Broker packaging** (Phase 1) → standalone signed Node runtime + native-module
+  closure, or accept a dev sidecar until solved.
+- **Broker→daemon cutover** (Decision D) → drain, not hot-swap; N/N+1 compat +
+  rollback; real update test.
+- **Data coexistence** (Decision C) → write-arbitration owner or separate stores.
+- **Security** (Decision B) → sandbox choice, LaunchAgent, client auth, code-sign
+  validation, env inheritance, socket/XPC perms, spool cleanup, companion-issued
+  terminal-control policy.
+- **Parity drift** → conformance tests + fixtures, not a prose checklist.
+
+## Verification (targets are gates, with a defined methodology)
+
+- **Memory** — a native analog of `memorycompare.cjs` that sums the Swift app +
+  WebKit content/GPU/network processes + Node broker/control-plane + native
+  daemon, handles model processes consistently, and records **physical
+  footprint** (not just summed RSS, which counts shared pages differently across
+  Electron/WebKit/native). Report median/p95 across cold/warm caches, fresh vs.
+  already-running broker, and restored-windows workloads.
+- **Perf** — cold-launch milestone defined explicitly; plus CPU, frame pacing,
+  energy impact, terminal throughput, and a **sustained-stream battery** test
+  (the whole motivation).
+- **Parity** — shared protocol fixtures, record/replay traces, golden state
+  migrations, and dual-client conformance tests; **every** capability in the
+  invariant list gets an owner / phase / test entry.
 
 ## Out of scope here
 
-Windows/Linux native (Electron already handles cross-platform; native is
-macOS-first). Any single mega-implementation — the next step is a detailed spec +
-plan for **Phase 0 (KaisolaCore) + the Phase 1 terminal spike**, which together
-prove the architecture, the code-share, the memory win, and the durable-run
-invariant with the least risk.
+Windows/Linux native (Electron keeps cross-platform; native is macOS-first). Any
+single mega-implementation. **Next step:** detailed specs + plans for **Phase 0
+(KaisolaCore)** and **the Phase 1 terminal spike** — including a concrete
+resolution of Decision A's bootstrap and the broker-packaging question — since
+together they prove the architecture, the code-share, the memory win, and the
+durable-run invariant with the least risk.

@@ -37,12 +37,13 @@ const DEC_MODE_RE = /\x1b\[\?([0-9;]+)([hl])|\x1bc|\x1b\[!p/g
 const DEC_CARRY_MAX = 48
 const DEC_CARRY_RE = /\x1b(?:\[(?:[?!][0-9;]{0,40})?)?$/
 
-function atomicJson(file, value) {
-  const tmp = `${file}.${process.pid}.tmp`
-  fs.writeFileSync(tmp, JSON.stringify(value), { mode: 0o600 })
-  fs.renameSync(tmp, file)
-  try { fs.chmodSync(file, 0o600) } catch { /* best effort */ }
-}
+const { atomicJson } = require('./brokerWire.cjs')
+
+// On-disk meta layout version. Readers treat an unknown version as "no prior
+// state" (matching projectionStore's fail-closed-to-absent behavior) so the
+// format can evolve — or be written by the future Swift runtime — without
+// silently misreading a restructured viewState/decModes shape.
+const META_VERSION = 1
 
 /** Return at most `bytes` from the end without starting inside a multi-byte
  * UTF-8 code point. ACP explicitly requires character-boundary truncation. */
@@ -106,7 +107,7 @@ class TerminalSpool {
     this.decCarry = ''
     try {
       const m = JSON.parse(fs.readFileSync(this.metaFile, 'utf8'))
-      if (m && m.id === this.id) {
+      if (m && m.id === this.id && (m.v == null || m.v === META_VERSION)) {
         this.viewState = m.viewState || null
         if (m.decModes && typeof m.decModes === 'object') {
           for (const [mode, set] of Object.entries(m.decModes)) {
@@ -241,7 +242,7 @@ class TerminalSpool {
   }
 
   persistMeta() {
-    try { atomicJson(this.metaFile, { id: this.id, viewState: this.viewState, decModes: Object.fromEntries(this.decModes), touchedAt: Date.now() }) } catch { /* cache failure is non-fatal */ }
+    try { atomicJson(this.metaFile, { v: META_VERSION, id: this.id, viewState: this.viewState, decModes: Object.fromEntries(this.decModes), touchedAt: Date.now() }) } catch { /* cache failure is non-fatal */ }
   }
 
   snapshot(outputCap = DEFAULT_HOT_CAP) {

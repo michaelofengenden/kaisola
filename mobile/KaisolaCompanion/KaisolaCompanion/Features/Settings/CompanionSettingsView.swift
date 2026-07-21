@@ -12,8 +12,6 @@ struct CompanionSettingsView: View {
     @State private var showMacDetails = false
     @State private var showAccessDetails = false
 
-    var onPairNewMac: () -> Void = {}
-
     var body: some View {
         ZStack {
             AmbientBackdrop()

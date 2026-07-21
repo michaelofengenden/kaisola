@@ -159,8 +159,14 @@ function drain() {
   // keep the tap from growing without bound across long sessions
   if (stat.size > EVENTS_CAP_BYTES) {
     try {
-      fs.truncateSync(tail.file, 0)
-      tail.offset = 0
+      // Reset only if nothing arrived since this drain read to `stat.size`:
+      // truncating a file the hook process just appended to would silently
+      // drop those lines. If it grew, the next drain consumes the growth and
+      // retries the reset.
+      if (fs.statSync(tail.file).size === stat.size) {
+        fs.truncateSync(tail.file, 0)
+        tail.offset = 0
+      }
     } catch { /* next drain retries */ }
   }
 }

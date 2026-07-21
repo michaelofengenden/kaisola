@@ -42,6 +42,11 @@ const COMMAND_CAPABILITIES = Object.freeze({
 const RECEIPT_STATUSES = new Set(['accepted', 'applied', 'rejected', 'stale', 'unavailable', 'timed_out'])
 const TOP_LEVEL_FIELDS = new Set(['v', 'kind', 'desktopId', 'deviceId', 'connectionId', 'epoch', 'seq', 'id', 'sentAt', 'body'])
 const ID_RE = /^[A-Za-z0-9][A-Za-z0-9._:@-]*$/
+// The single bounded identifier grammar (desktopId/deviceId/connectionId/epoch)
+// every companion module and the Swift side must agree on. Derived from
+// MAX_ID_LENGTH so the bound has one source. crypto/pairing/deviceStore/
+// kaisolaLinkClient consume this instead of hand-copying the pattern.
+const IDENTIFIER_RE = new RegExp(`^[A-Za-z0-9][A-Za-z0-9._:@-]{0,${MAX_ID_LENGTH - 1}}$`)
 
 class CompanionProtocolError extends Error {
   constructor(code, message) {
@@ -228,6 +233,7 @@ module.exports = {
   COMMAND_CAPABILITIES,
   CompanionProtocolError,
   EVENT_TYPES,
+  IDENTIFIER_RE,
   KINDS,
   MAX_FRAME_BYTES,
   PROTOCOL_MINOR,

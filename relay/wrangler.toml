@@ -5,6 +5,12 @@ workers_dev = true
 preview_urls = false
 
 [vars]
+# The deployed `session` Cloud Function. Its {region}-{projectId} MUST match the
+# same three other places this identity is duplicated (there is no shared config
+# across these separate deploy targets): the iOS bundle
+# (mobile/.../Account/FirebaseAuthConfig.json `serverUrl`), the desktop config
+# (electron/firebase-config.example.json), and the functions deploy
+# (.firebaserc projectId + functions/index.js setGlobalOptions region).
 FIREBASE_SESSION_URL = "https://us-central1-kaisola-a9ab7.cloudfunctions.net/session"
 
 [[durable_objects.bindings]]

@@ -11,6 +11,7 @@ const {
   privateKeyFromPkcs8,
   verifySignedKeyRecord,
 } = require('./crypto.cjs')
+const { IDENTIFIER_RE } = require('./protocol.cjs')
 
 const STORE_VERSION = 1
 const MAX_STORE_BYTES = 1024 * 1024
@@ -31,7 +32,7 @@ function fail(code, message) {
 }
 
 function validateId(value, label) {
-  if (typeof value !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9._:@-]{0,159}$/.test(value)) fail('invalid_record', `${label} is invalid`)
+  if (typeof value !== 'string' || !IDENTIFIER_RE.test(value)) fail('invalid_record', `${label} is invalid`)
   return value
 }
 

@@ -40,6 +40,13 @@ final class CompanionClient: ObservableObject {
     private var remoteSASConfirmed = false
     private var outboundSeq: Int64 = 0
     private(set) var ackCursor: CompanionAckCursor?
+    // Epoch observed on THIS connection's inbound frames. The desktop
+    // regenerates its epoch every launch and rejects any command whose epoch
+    // differs, so after a resume across a desktop restart the persisted
+    // ackCursor epoch is stale. We learn the live epoch from the first inbound
+    // frame (the desktop's hello reply carries it) and gate outbound commands
+    // on it — otherwise the first stream.subscribe tears the connection down.
+    private var liveEpoch: String?
     private struct StreamSubscription: Hashable {
         let projectId: String
         let sessionId: String
@@ -259,15 +266,24 @@ final class CompanionClient: ObservableObject {
             expectedRevision: expectedRevision,
             payload: payload
         )
-        return try await withCheckedThrowingContinuation { continuation in
-            pendingCommands[commandId] = continuation
-            commandTimeouts[commandId] = Task { @MainActor [weak self] in
-                try? await Task.sleep(for: timeout)
-                guard !Task.isCancelled else { return }
-                self?.finishCommand(commandId, result: .failure(CompanionCommandError.timedOut))
+        return try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { continuation in
+                pendingCommands[commandId] = continuation
+                commandTimeouts[commandId] = Task { @MainActor [weak self] in
+                    try? await Task.sleep(for: timeout)
+                    guard !Task.isCancelled else { return }
+                    self?.finishCommand(commandId, result: .failure(CompanionCommandError.timedOut))
+                }
+                do { try sendCommand(body) }
+                catch { finishCommand(commandId, result: .failure(error)) }
             }
-            do { try sendCommand(body) }
-            catch { finishCommand(commandId, result: .failure(error)) }
+        } onCancel: {
+            // Without this the continuation lingers until a receipt or the 15s
+            // timeout arrives even after its caller is cancelled — long enough
+            // for a cancelled lease-renewal to resume and resurrect the lease.
+            Task { @MainActor [weak self] in
+                self?.finishCommand(commandId, result: .failure(CancellationError()))
+            }
         }
     }
 
@@ -279,7 +295,12 @@ final class CompanionClient: ObservableObject {
             desktopId: context.desktopId,
             deviceId: context.deviceId,
             connectionId: context.connectionId,
-            epoch: ackCursor?.epoch ?? "initial",
+            // Prefer the epoch learned from this connection's inbound frames
+            // over the persisted resume cursor, which is stale after a desktop
+            // restart. Commands are only ever sent after the first inbound frame
+            // (subscriptions are gated, other commands are user-driven), so
+            // liveEpoch is populated in every realistic path.
+            epoch: liveEpoch ?? ackCursor?.epoch ?? "initial",
             seq: outboundSeq,
             id: body.commandId,
             sentAt: Self.nowMilliseconds,
@@ -316,6 +337,8 @@ final class CompanionClient: ObservableObject {
         sessionId = nil
         localSASConfirmed = false
         remoteSASConfirmed = false
+        // Each connection learns its epoch afresh from the first inbound frame.
+        liveEpoch = nil
 
         let connectionId = "connection-\(UUID().uuidString.lowercased())"
         let desktopId: String
@@ -516,6 +539,12 @@ final class CompanionClient: ObservableObject {
         )
         try sendSecureFrame(channel.encrypt(CompanionProtocolCodec.encode(envelope)))
         transport.markLive()
+        // Do NOT issue stream.subscribe yet: the live epoch is still unknown on
+        // a fresh resume. The subscriptions are flushed once the first inbound
+        // frame establishes this connection's epoch (see receiveApplicationFrame).
+    }
+
+    private func flushDesiredStreamSubscriptions() {
         for subscription in desiredStreamSubscriptions {
             startStreamSubscription(subscription)
         }
@@ -525,6 +554,13 @@ final class CompanionClient: ObservableObject {
         guard let channel else { throw CompanionWireError.connectionUnavailable }
         let secure = try JSONDecoder().decode(CompanionSecureFrame.self, from: data)
         let envelope = try CompanionProtocolCodec.decode(channel.decrypt(secure))
+        // First inbound frame on this connection tells us the desktop's current
+        // epoch. Adopt it for outbound commands and only now fire the deferred
+        // stream subscriptions, so they can never carry a stale (rejected) epoch.
+        if liveEpoch == nil {
+            liveEpoch = envelope.epoch
+            flushDesiredStreamSubscriptions()
+        }
         if envelope.kind == .hello {
             let hello = try envelope.body.decode(CompanionHelloBody.self)
             guard hello.role == .desktop,

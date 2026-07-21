@@ -6,6 +6,7 @@ import { requestIsSensitive, requestMatchesRules, allowOnceAnswer } from './lib/
 import { OmniBar } from './components/shell/OmniBar'
 import { loadUserConfig, watchUserConfig } from './lib/userConfig'
 import { initGlassWash } from './lib/glassWash'
+import { isRunningMeshPhase } from './lib/meshPolicy'
 import { CompanionProjectionRevisions } from './lib/companionProjection'
 import { ShellTools } from './components/shell/AgentSidebar'
 import { WorkspaceRail } from './components/shell/WorkspaceRail'
@@ -362,8 +363,6 @@ function TabMenuSync() {
   return null
 }
 
-const WINDOW_DELETE_GROUP_PHASES = new Set(['answering', 'negotiating', 'assigning', 'executing', 'reviewing', 'integrating', 'critiquing', 'synthesizing'])
-
 const windowStoreKeys = () => {
   const slot = new URLSearchParams(location.search).get('win')
   const suffix = slot ? `-w${slot}` : ''
@@ -376,7 +375,7 @@ function windowDeletionBlocker() {
     const slice = tab.id === state.activeProjectId ? state : state.projectSlices[tab.id]
     if (!slice) continue
     if (slice.pendingPermissions.length > 0) return 'Resolve pending agent approvals before deleting this window.'
-    if (slice.assistantThreads.some((thread) => thread.busy || !!thread.group?.operation || (!!thread.group && !thread.group.paused && WINDOW_DELETE_GROUP_PHASES.has(thread.group.phase)))) {
+    if (slice.assistantThreads.some((thread) => thread.busy || !!thread.group?.operation || (!!thread.group && !thread.group.paused && isRunningMeshPhase(thread.group.phase)))) {
       return 'Stop active agent turns before deleting this window.'
     }
     if (Object.values(slice.assistantPromptQueues).some((queue) => queue.length > 0) || slice.agentQueueRunning || Object.values(slice.agentRunning).some(Boolean)) {

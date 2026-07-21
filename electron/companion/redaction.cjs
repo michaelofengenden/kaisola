@@ -2,17 +2,18 @@
 
 const path = require('node:path')
 const { isPlainObject, validateIdentifier } = require('./protocol.cjs')
+// One home for the projection size limits, shared with the renderer builder
+// (src/lib/companionProjection.ts) so the values the renderer applies and the
+// values this sanitizer fail-closes on can never drift apart.
+const LIMITS = require('./projectionLimits.json')
 
 const PROJECTION_KIND = 'kaisola.companion.projection'
 const MAX_PROJECTION_BYTES = 512 * 1024
-const MAX_PROJECTS = 64
-const MAX_SESSIONS = 500
-const MAX_ATTENTION = 200
-const MAX_PERMISSIONS = 50
-const MAX_TURNS_PER_SESSION = 40
-const MAX_TURN_TEXT = 16 * 1024
-const MAX_DIFF_TEXT = 16 * 1024
-const MAX_DISPLAY = 240
+const {
+  MAX_PROJECTS, MAX_SESSIONS, MAX_ATTENTION, MAX_PERMISSIONS,
+  MAX_TURNS_PER_SESSION, MAX_TURN_TEXT, MAX_DIFF_TEXT, MAX_DISPLAY,
+  MAX_PERMISSION_OPTIONS, MAX_PERMISSION_DIFFS, MAX_PATH,
+} = LIMITS
 const MAX_ACP_COLLECTION = 64
 const MAX_ACP_EVENT_BYTES = 512 * 1024
 
@@ -132,7 +133,7 @@ function unsafePath(text) {
 }
 
 function safeRelativePath(value, label) {
-  const text = safeString(value, label, 1024)
+  const text = safeString(value, label, MAX_PATH)
   if (!text || unsafePath(text)) {
     projectionFail('unsafe_path', `${label} must be workspace-relative`)
   }
@@ -161,7 +162,7 @@ function strictText(value, label, max, { optional = false, empty = false } = {})
 }
 
 function strictRelativePath(value, label) {
-  const text = strictText(value, label, 1024)
+  const text = strictText(value, label, MAX_PATH)
   if (unsafePath(text)) {
     projectionFail('unsafe_path', `${label} must be workspace-relative`)
   }
@@ -499,9 +500,9 @@ function sanitizeAcpPermissionEvent(raw, {
   }
 
   const rawDiffs = Array.isArray(event.diffs) ? event.diffs : []
-  if (!Array.isArray(event.diffs) || rawDiffs.length > 8) mark(rawDiffs.length > 8 ? 'truncated' : 'redacted')
+  if (!Array.isArray(event.diffs) || rawDiffs.length > MAX_PERMISSION_DIFFS) mark(rawDiffs.length > MAX_PERMISSION_DIFFS ? 'truncated' : 'redacted')
   const diffs = []
-  for (const [index, rawDiff] of rawDiffs.slice(0, 8).entries()) {
+  for (const [index, rawDiff] of rawDiffs.slice(0, MAX_PERMISSION_DIFFS).entries()) {
     if (!isPlainObject(rawDiff)) { contextReduced = true; continue }
     assertAllowedKeys(rawDiff, new Set(['type', 'path', 'relativePath', 'oldText', 'newText']), `agent.permission.requested.diffs.${index}`)
     let relativePath
@@ -523,9 +524,9 @@ function sanitizeAcpPermissionEvent(raw, {
   }
 
   const rawOptions = Array.isArray(event.options) ? event.options : []
-  if (!Array.isArray(event.options) || rawOptions.length > 12) mark(rawOptions.length > 12 ? 'truncated' : 'redacted')
+  if (!Array.isArray(event.options) || rawOptions.length > MAX_PERMISSION_OPTIONS) mark(rawOptions.length > MAX_PERMISSION_OPTIONS ? 'truncated' : 'redacted')
   const options = []
-  for (const [index, rawOption] of rawOptions.slice(0, 12).entries()) {
+  for (const [index, rawOption] of rawOptions.slice(0, MAX_PERMISSION_OPTIONS).entries()) {
     if (!isPlainObject(rawOption)) { contextReduced = true; continue }
     assertAllowedKeys(rawOption, new Set(['id', 'optionId', 'label', 'name', 'kind']), `agent.permission.requested.options.${index}`)
     const id = optionalId(rawOption.id ?? rawOption.optionId, `acp.permission.options.${index}.id`, 120)
@@ -666,14 +667,14 @@ function sanitizePermission(raw, index, projects, sessions) {
     clean.sessionId = sessionId
   }
   if (item.kind != null) clean.kind = safeString(item.kind, 'permission.kind', 80, { optional: true })
-  clean.options = (Array.isArray(item.options) ? item.options : []).slice(0, 12).map((rawOption, optionIndex) => {
+  clean.options = (Array.isArray(item.options) ? item.options : []).slice(0, MAX_PERMISSION_OPTIONS).map((rawOption, optionIndex) => {
     const option = plain(rawOption, `permissions.${index}.options.${optionIndex}`)
     return {
       id: safeId(option.id, `permissions.${index}.options.${optionIndex}.id`, 120),
       label: safeString(option.label, `permissions.${index}.options.${optionIndex}.label`, 160),
     }
   })
-  clean.diffs = (Array.isArray(item.diffs) ? item.diffs : []).slice(0, 8).map((rawDiff, diffIndex) => {
+  clean.diffs = (Array.isArray(item.diffs) ? item.diffs : []).slice(0, MAX_PERMISSION_DIFFS).map((rawDiff, diffIndex) => {
     const diff = plain(rawDiff, `permissions.${index}.diffs.${diffIndex}`)
     return {
       relativePath: safeRelativePath(diff.relativePath, `permissions.${index}.diffs.${diffIndex}.relativePath`),

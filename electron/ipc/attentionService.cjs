@@ -444,7 +444,13 @@ class AttentionService {
       return this.clearSource({ projectId, source: 'permission', sourceId: event.permId, reason: event.resolution || 'permission_resolved' })
     }
     if (event.type === 'agent.turn.completed' && event.turnId) {
-      const failed = event.ok !== true || (event.stopReason && event.stopReason !== 'end_turn')
+      // A user-initiated Stop resolves the turn with ok:true and stopReason
+      // 'cancelled'. That is a deliberate action, not a failure: marking the
+      // session failed and raising a critical needs-you (which auto-clear
+      // misses when the cancel came from another window or the phone) would
+      // alarm the user about the thing they just did on purpose.
+      const cancelled = event.stopReason === 'cancelled'
+      const failed = event.ok !== true || (event.stopReason && event.stopReason !== 'end_turn' && !cancelled)
       const sessionId = attentionSessionId
       const existing = sessionId ? this.sessions.get(sessionKey(projectId, sessionId)) : null
       const sessionTitle = event.title || existing?.title || event.agent || event.targetId || 'Agent'
@@ -460,6 +466,7 @@ class AttentionService {
         provider,
         windowId: this.windowIdForProject(projectId) || undefined,
       })
+      if (cancelled && !failed) return null
       return this.raise({
         projectId,
         sessionId,

@@ -155,11 +155,13 @@ struct CompanionRootView: View {
             .overlay { Capsule().stroke(Color.primary.opacity(0.08), lineWidth: 0.5) }
             .padding(.bottom, 62)
             .transition(.move(edge: .bottom).combined(with: .opacity))
-            .onAppear {
-                Task { @MainActor in
-                    try? await Task.sleep(for: .seconds(2.2))
-                    withAnimation(.smooth) { store.previewReceipt = nil }
-                }
+            // Key the dismissal on the message so a rapid second toast restarts
+            // the timer instead of inheriting the first's — .onAppear would not
+            // refire when only the text changes, cutting the new message short.
+            .task(id: receipt) {
+                try? await Task.sleep(for: .seconds(2.2))
+                guard !Task.isCancelled else { return }
+                withAnimation(.smooth) { store.previewReceipt = nil }
             }
         }
     }

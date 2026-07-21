@@ -5,6 +5,7 @@
 const { app, safeStorage } = require('electron')
 const path = require('node:path')
 const fs = require('node:fs')
+const { writePrivateFile } = require('./privateWrite.cjs')
 
 // A named secret: env var wins (dev/CI), then the keychain-encrypted file. The
 // renderer can set / probe / clear it, but only the main process reads it.
@@ -41,7 +42,9 @@ function registerSettingsHandlers(ipcMain) {
       if (!safeStorage.isEncryptionAvailable()) {
         return { ok: false, message: 'OS keychain encryption unavailable on this machine.' }
       }
-      fs.writeFileSync(keyPath(name), safeStorage.encryptString(key.trim()))
+      // Atomic + 0o600 like every other credential file: a crash mid-write
+      // must not truncate the saved key, and it should not be group-readable.
+      writePrivateFile(keyPath(name), safeStorage.encryptString(key.trim()))
       return { ok: true }
     } catch (err) {
       return { ok: false, message: String(err.message || err) }

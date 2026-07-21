@@ -11,7 +11,15 @@ function loadProjectionModule() {
   const filename = path.join(__dirname, '..', '..', 'src', 'lib', 'companionProjection.ts')
   const source = fs.readFileSync(filename, 'utf8')
   const output = ts.transpileModule(source, {
-    compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022 },
+    // esModuleInterop + resolveJsonModule mirror the real Vite build so a
+    // `import LIMITS from './x.json'` default-import resolves to the JSON object
+    // (Vite handles this natively) instead of an undefined `.default`.
+    compilerOptions: {
+      module: ts.ModuleKind.CommonJS,
+      target: ts.ScriptTarget.ES2022,
+      esModuleInterop: true,
+      resolveJsonModule: true,
+    },
     fileName: filename,
     reportDiagnostics: true,
   })

@@ -129,19 +129,6 @@ class CompanionEventLog {
     return acknowledged
   }
 
-  pruneAcknowledged() {
-    if (this.acknowledgements.size === 0) return 0
-    const pruneThrough = Math.min(...this.acknowledgements.values())
-    let pruned = 0
-    while (this.events.length > 0 && this.events[0].seq <= pruneThrough) {
-      const removed = this.events.shift()
-      this.totalBytes -= removed.bytes
-      this.droppedThrough = Math.max(this.droppedThrough, removed.seq)
-      pruned++
-    }
-    return pruned
-  }
-
   dropClient(clientId) {
     safeId(clientId, 'clientId')
     return this.acknowledgements.delete(clientId)

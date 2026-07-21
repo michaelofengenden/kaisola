@@ -7,10 +7,18 @@ enum CompanionWireError: Error, Equatable {
 }
 
 struct CompanionLengthFrameDecoder: Sendable {
+    // Largest length-framed secure frame, derived from the same secure-plaintext
+    // cap the desktop uses (electron/companion/bonjourTransport.cjs:
+    // ceil((plaintext + 16) * 4/3) + 2048). Derived rather than hard-coded so
+    // raising the plaintext cap for larger terminal snapshots can never leave
+    // the two ends disagreeing on the maximum accepted frame.
+    static let defaultMaximumFrameBytes =
+        Int((Double(CompanionCrypto.maximumSecurePlaintextBytes + 16) * 4 / 3).rounded(.up)) + 2048
+
     private(set) var buffer = Data()
     let maximumFrameBytes: Int
 
-    init(maximumFrameBytes: Int = 1_400_000) {
+    init(maximumFrameBytes: Int = CompanionLengthFrameDecoder.defaultMaximumFrameBytes) {
         self.maximumFrameBytes = maximumFrameBytes
     }
 
@@ -28,7 +36,7 @@ struct CompanionLengthFrameDecoder: Sendable {
         return frames
     }
 
-    static func encode(_ payload: Data, maximumFrameBytes: Int = 1_400_000) throws -> Data {
+    static func encode(_ payload: Data, maximumFrameBytes: Int = CompanionLengthFrameDecoder.defaultMaximumFrameBytes) throws -> Data {
         guard !payload.isEmpty, payload.count <= maximumFrameBytes, payload.count <= Int(UInt32.max) else {
             throw CompanionWireError.frameTooLarge
         }

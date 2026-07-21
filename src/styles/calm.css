@@ -1091,7 +1091,7 @@
   user-select: none;
 }
 .fx-md-image-action:hover,
-.fx-md-image-action:focus-visible { background: var(--bg-hover); color: var(--text-1); outline: none; }
+.fx-md-image-action:focus-visible { background: var(--hover-overlay); color: var(--text-1); outline: none; }
 .fx-md-image-delete:hover,
 .fx-md-image-delete:focus-visible { color: var(--danger); }
 .fx-md-image-shell:hover .fx-md-image-grip,

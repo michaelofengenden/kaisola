@@ -1,6 +1,6 @@
 import { memo, useEffect, useMemo, useRef, useState } from 'react'
 import { Assistant, PermissionCard } from './Assistant'
-import { isClaudeEffort, isCodexEffort } from '../lib/providerEffort'
+import { isClaudeEffort, isCodexEffort, CLAUDE_MESH_EFFORT_OPTIONS } from '../lib/providerEffort'
 import { RUNNING_MESH_PHASES } from '../lib/meshPolicy'
 import {
   ideaInitialPrompt,
@@ -32,15 +32,6 @@ const EMPTY_DRAFT: AssistantDraft = { text: '', attachments: [], mentions: [], s
 const MAX_SHARED_TEXT = 28_000
 const MAX_GROUP_MEMBERS = 6
 const MESH_RENDERER_OWNER = `mesh-renderer-${globalThis.crypto?.randomUUID?.() ?? Math.random().toString(36).slice(2)}`
-/** Fallback list for a Claude adapter that reports no live effort control;
- * providers that do report one render their own options untranslated. */
-const CLAUDE_EFFORTS: Array<{ value: ClaudeEffort; name: string }> = [
-  { value: 'low', name: 'Low' },
-  { value: 'medium', name: 'Medium' },
-  { value: 'high', name: 'High' },
-  { value: 'xhigh', name: 'Extra high' },
-  { value: 'max', name: 'Max' },
-]
 type CandidateDiff = { ok: boolean; reviewMode?: 'inline' | 'manifest'; patch?: string; patchBytes?: number; files?: WorktreeFile[]; sha?: string; base?: string; message?: string }
 
 const reviewMaterial = (result: CandidateDiff, worktreePath: string) => {
@@ -1254,7 +1245,7 @@ export const GroupAssistant = memo(function GroupAssistant({ threadId }: { threa
                 const child = childThreads.find((candidate) => candidate.id === member.threadId)
                 const effort = effortControl(agent?.controls)
                 const claudeMember = /claude/i.test(member.agentKey)
-                const effortChoices = effort?.options ?? (claudeMember ? CLAUDE_EFFORTS : [])
+                const effortChoices = effort?.options ?? (claudeMember ? CLAUDE_MESH_EFFORT_OPTIONS : [])
                 const effortValue = effort?.currentValue
                   ?? (claudeMember ? child?.claudeEffort : child?.codexEffort)
                   ?? 'high'

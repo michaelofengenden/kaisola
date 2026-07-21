@@ -19,6 +19,12 @@ const { AcpSessionService, createAcpActorCapability, hasActiveTurn } = require('
 
 const URL_RE = /https?:\/\/[^\s"'<>)]+/
 const AUTH_TEXT_RE = /\b(auth(?:entication|orization|orize)?|oauth|log[ -]?in|sign[ -]?in|device code)\b/i
+// How long after an explicit sign-in request agent output is still treated as
+// part of that auth flow (URL auto-open + auth-text promotion).
+const AUTH_RECENCY_MS = 180_000
+// Separator in the project-scoped ACP wire key `<presetId>${SCOPE_SEP}<projectId>`.
+// MUST match bridge.ts's SCOPE_SEP on the renderer side.
+const SCOPE_SEP = '@@'
 const expandHome = (value) => typeof value === 'string' ? value.replace(/^~(?=\/|$)/, os.homedir()) : value
 
 /** Send to a connection's CURRENT renderer, skipping destroyed windows. */
@@ -32,7 +38,7 @@ function surfaceAuthUrl(entry, name, key, url) {
   entry.lastAuthUrl = url
   sendTo(entry, 'acp:notice', { agent: name, key, kind: 'auth', text: 'Authorize in your browser', url })
   // if a sign-in was just requested, open it for the user (never during smoke tests)
-  if (entry.recentAuthAt && Date.now() - entry.recentAuthAt < 180_000 && !(process.env.KAISOLA_SMOKE || process.env.PASOLA_SMOKE)) {
+  if (entry.recentAuthAt && Date.now() - entry.recentAuthAt < AUTH_RECENCY_MS && !(process.env.KAISOLA_SMOKE || process.env.PASOLA_SMOKE)) {
     shell.openExternal(url).catch(() => {})
   }
 }
@@ -56,11 +62,11 @@ function authUrlFromNotice(notice, recentAuthAt, at = Date.now()) {
   const match = notice.text.match(URL_RE)
   if (!match) return null
   if (notice.kind === 'auth') return match[0]
-  return recentAuthAt && at - recentAuthAt < 180_000 && AUTH_TEXT_RE.test(notice.text) ? match[0] : null
+  return recentAuthAt && at - recentAuthAt < AUTH_RECENCY_MS && AUTH_TEXT_RE.test(notice.text) ? match[0] : null
 }
 
 function authUrlFromUpdate(update, recentAuthAt, at = Date.now()) {
-  if (!recentAuthAt || at - recentAuthAt >= 180_000 || !update || typeof update !== 'object') return null
+  if (!recentAuthAt || at - recentAuthAt >= AUTH_RECENCY_MS || !update || typeof update !== 'object') return null
   const text = typeof update.content?.text === 'string'
     ? update.content.text
     : typeof update.text === 'string' ? update.text : ''
@@ -79,7 +85,10 @@ const DEFAULT_SENSITIVE_GLOBS = Object.freeze(['**/.env*', '**/*.pem', '**/*.key
 const MAX_SENSITIVE_GLOBS = 64
 const MAX_SENSITIVE_GLOB_LENGTH = 512
 const MAX_SENSITIVE_GLOB_INPUTS = MAX_SENSITIVE_GLOBS * 4
-const sensitiveGlobsBySender = new Map()
+// WeakMap keyed by the WebContents object: a renderer that crashes or is
+// destroyed without an explicit acp:release must not pin its glob list (and
+// the WebContents itself) in memory for the app's lifetime.
+let sensitiveGlobsBySender = new WeakMap()
 
 function sanitizeSensitiveGlobs(value) {
   if (!Array.isArray(value)) return null
@@ -218,10 +227,15 @@ const ACP_IDLE_MS = (() => {
 
 function targetCapability(agentKey) {
   const targetId = typeof agentKey === 'string' ? agentKey : ''
-  const separator = targetId.lastIndexOf('@@')
+  // Wire key is `<presetId>${SCOPE_SEP}<projectId>` and the composer guarantees
+  // the presetId cannot itself contain the separator (see acp:connect below),
+  // so the FIRST separator is the real split — matching the renderer's
+  // splitScopedKey (bridge.ts). Using lastIndexOf here would mis-split a
+  // projectId that ever contained the separator.
+  const separator = targetId.indexOf(SCOPE_SEP)
   return {
     targetId,
-    projectId: separator < 0 ? '' : targetId.slice(separator + 2),
+    projectId: separator < 0 ? '' : targetId.slice(separator + SCOPE_SEP.length),
   }
 }
 
@@ -415,7 +429,7 @@ function acpProjectTransferState(sender, scope) {
     (entry) => (entry.sender === sender || entry.sender?.id === sender?.id) && entry.meta?.scope === scope,
   )
   const connecting = [...connectTasks.entries()].some(
-    ([key, task]) => (task.sender === sender || task.sender?.id === sender?.id) && key.endsWith(`@@${scope}`),
+    ([key, task]) => (task.sender === sender || task.sender?.id === sender?.id) && key.endsWith(`${SCOPE_SEP}${scope}`),
   )
   const busy = connecting || owned.some((entry) => (entry.inFlightTurns ?? 0) > 0 || hasActiveTurn(entry))
   const awaitingPermission = [...pendingPermissions.values()].some(
@@ -1084,7 +1098,7 @@ function registerAcpHandlers(ipcMain) {
     for (const [k, entry] of [...connections.entries()]) {
       if (!entry.sender || entry.sender.isDestroyed()) {
         const rendererKey = entry.meta && (entry.meta.key || entry.meta.presetId)
-        const bareKey = typeof rendererKey === 'string' ? rendererKey.split('@@')[0] : rendererKey
+        const bareKey = typeof rendererKey === 'string' ? rendererKey.split(SCOPE_SEP)[0] : rendererKey
         if (scope && entry.meta?.scope && entry.meta.scope !== scope) continue
         if (requested && !requested.has(bareKey)) continue
         const nk = ikey(event.sender, rendererKey)
@@ -1145,10 +1159,10 @@ function registerAcpHandlers(ipcMain) {
     if (scope && projectMoves.has(projectMoveKey(event.sender, scope))) {
       return { ok: false, moving: true, message: 'This project is moving to another window. Try again in a moment.' }
     }
-    const clientKey = typeof config.clientKey === 'string' && config.clientKey.length <= 240 && !config.clientKey.includes('@@')
+    const clientKey = typeof config.clientKey === 'string' && config.clientKey.length <= 240 && !config.clientKey.includes(SCOPE_SEP)
       ? config.clientKey
       : resolved.presetId
-    const key = scope ? `${clientKey}@@${scope}` : clientKey
+    const key = scope ? `${clientKey}${SCOPE_SEP}${scope}` : clientKey
     const internalKey = ikey(event.sender, key)
     // Autoconnect and an immediate Send can arrive together. Serialize by the
     // authoritative main-process key so only one adapter/process ledger entry
@@ -1312,8 +1326,14 @@ function registerAcpHandlers(ipcMain) {
         const session = await conn.newSession()
         return session
       })()
-      const timeout = new Promise((_, rej) => setTimeout(() => rej(new Error('TIMEOUT')), CONNECT_TIMEOUT_MS))
-      const session = await Promise.race([handshake, timeout])
+      let connectTimer = null
+      const timeout = new Promise((_, rej) => { connectTimer = setTimeout(() => rej(new Error('TIMEOUT')), CONNECT_TIMEOUT_MS) })
+      let session
+      try {
+        session = await Promise.race([handshake, timeout])
+      } finally {
+        clearTimeout(connectTimer)
+      }
       if (connectTask.cancelled || event.sender.isDestroyed()) {
         conn.dispose()
         return { ok: false, message: 'The window closed while the agent was connecting.' }
@@ -1392,7 +1412,9 @@ function registerAcpHandlers(ipcMain) {
     entry.recentAuthAt = Date.now()
     entry.lastAuthUrl = null
     const call = entry.conn.authenticate(mid).then(() => ({ done: true })).catch((err) => ({ err: err.message }))
-    const quick = await Promise.race([call, new Promise((r) => setTimeout(() => r({ pending: true }), 2500))])
+    let quickTimer = null
+    const quick = await Promise.race([call, new Promise((r) => { quickTimer = setTimeout(() => r({ pending: true }), 2500) })])
+    clearTimeout(quickTimer)
     if (quick.err) return { ok: false, message: quick.err }
     if (quick.pending) return { ok: true, pending: true } // browser flow in progress; URL opens via surfaceAuthUrl
     return { ok: true }
@@ -1488,7 +1510,7 @@ async function disposeAcp() {
   await Promise.allSettled([...entries].map((entry) => entry.conn?.disposeAndWait?.() ?? Promise.resolve(entry.conn?.dispose())))
   connections.clear()
   connectTasks.clear()
-  sensitiveGlobsBySender.clear()
+  sensitiveGlobsBySender = new WeakMap()
 }
 
 module.exports = {

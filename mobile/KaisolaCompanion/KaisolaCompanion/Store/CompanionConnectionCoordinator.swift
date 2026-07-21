@@ -1,6 +1,13 @@
 import Combine
 import Foundation
 
+/// Terminal-control limits the desktop enforces authoritatively
+/// (electron/companion/terminalControl.cjs). Mirrored here only to fail fast
+/// with a clear message before a doomed round-trip; keep in sync with that file.
+enum CompanionTerminalLimits {
+    static let maxInputBytes = 16 * 1024
+}
+
 /// Persists the one paired desktop so the app reconnects after relaunch.
 @MainActor
 protocol PairedDesktopPersisting {
@@ -428,7 +435,7 @@ final class CompanionConnectionCoordinator: ObservableObject {
     }
 
     func sendTerminalInput(_ data: Data, to session: CompanionSession) async -> Bool {
-        guard !data.isEmpty, data.count <= 16 * 1024 else {
+        guard !data.isEmpty, data.count <= CompanionTerminalLimits.maxInputBytes else {
             store.showActionMessage("Terminal input is too large. Paste 16 KB or less.")
             return false
         }
@@ -655,6 +662,11 @@ final class CompanionConnectionCoordinator: ObservableObject {
                         self.dropTerminalLease(key: key, terminalId: current.terminalId)
                         return
                     }
+                    // The user (or a background release) may have dropped this
+                    // lease while the renew round-trip was in flight. Re-check
+                    // before re-inserting so an accepted renewal cannot resurrect
+                    // a lease that was already released.
+                    guard !Task.isCancelled, self.terminalLeases[key] != nil else { return }
                     self.terminalLeases[key] = renewed
                 } catch {
                     self.dropTerminalLease(key: key, terminalId: current.terminalId)

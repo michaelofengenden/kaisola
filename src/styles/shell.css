@@ -4,6 +4,17 @@
    generous space, one quiet accent.
    ========================================================================== */
 
+/* The rail-veil tint defaults live on :root, NOT on .app: glassWash.ts
+   overrides --wash-rail-color as an inline style on <html>, and a declaration
+   on .app (the veils' closest declaring ancestor) would silently shadow that
+   override — leaving the wallpaper-sampled wash permanently inert. */
+:root {
+  --wash-rail-color: 255 254 254;
+}
+:root[data-theme='dark'] {
+  --wash-rail-color: 11 12 17;
+}
+
 /* The shell is a quiet tinted field; the rail, main page and sidebar float on
    it as rounded cards (Codex-style) reaching the very top — no chrome rows.
    The traffic lights live in the rail card, the tool cluster in the sidebar. */
@@ -20,8 +31,9 @@
      sampling (glassWash.ts) retints it so the chrome tracks the desktop.
      RAIL ONLY now: the tab strip carries no veil — it sits on the bare glass
      field (.app::before spans its row), so the window top reads as one
-     uninterrupted pane and stops costing its own composited layer. */
-  --wash-rail-color: 255 254 254;
+     uninterrupted pane and stops costing its own composited layer.
+     (--wash-rail-color itself is declared on :root above so glassWash.ts can
+     override it.) */
   --wash-rail-alpha: 24%;
   /* frost grain for native Live Glass chrome only. Eco hides the pseudo. */
   --frost-grain: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='96' height='96'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='2' stitchTiles='stitch'/%3E%3CfeColorMatrix type='matrix' values='0 0 0 0 0.5 0 0 0 0 0.5 0 0 0 0 0.5 0 0 0 0.04 0'/%3E%3C/filter%3E%3Crect width='96' height='96' filter='url(%23n)'/%3E%3C/svg%3E");
@@ -92,8 +104,8 @@
   /* dark text-on-glass needs a bit more ink under 12px terminal type */
   --session-glass-alpha: 64%;
   /* dark rail veil (see the light-theme block): near-opaque ink — that's
-     what the dark blur chrome measured as, and what keeps rail text readable */
-  --wash-rail-color: 11 12 17;
+     what the dark blur chrome measured as, and what keeps rail text readable.
+     (color lives on :root[data-theme='dark'] above for the glassWash override) */
   --wash-rail-alpha: 70%;
 }
 

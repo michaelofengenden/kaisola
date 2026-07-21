@@ -24,8 +24,8 @@ import { Markdown } from './Markdown'
 import { ProviderIcon } from './ProviderIcon'
 import { stageMeta } from '../lib/stages'
 import { clockTime, workedTime } from '../lib/format'
-import { isCurrentMeshOrchestration } from '../lib/meshPolicy'
-import { isClaudeEffort, isCodexEffort } from '../lib/providerEffort'
+import { isCurrentMeshOrchestration, isRunningMeshPhase } from '../lib/meshPolicy'
+import { isClaudeEffort, isCodexEffort, CLAUDE_EFFORT_OPTIONS, CODEX_EFFORT_OPTIONS } from '../lib/providerEffort'
 import type { Paper } from '../domain/types'
 
 type Turn = AssistantTurn
@@ -209,24 +209,6 @@ const nextQueuedDispatchBatch = (queue: QueuedAssistantPrompt[]): QueuedAssistan
 const SPEED_OPTIONS = [
   { value: 'default', name: 'Default' },
   { value: 'fast', name: 'Fast' },
-]
-// Claude's own effort vocabulary (low/medium/high/xhigh/max), labelled the way
-// the Claude app labels it — not Kaisola-invented names like "Light".
-const CLAUDE_EFFORT_OPTIONS = [
-  { value: 'default', name: 'Default', description: 'Use this Claude model’s default effort' },
-  { value: 'low', name: 'Low', description: 'Fastest · minimal thinking' },
-  { value: 'medium', name: 'Medium', description: 'Balanced thinking for routine work' },
-  { value: 'high', name: 'High', description: 'Deep thinking' },
-  { value: 'xhigh', name: 'Extra High', description: 'Best for coding and agentic work' },
-  { value: 'max', name: 'Max', description: 'Maximum thinking · highest usage' },
-]
-const CODEX_EFFORT_OPTIONS = [
-  { value: 'low', name: 'Light', description: 'Fastest · minimal reasoning' },
-  { value: 'medium', name: 'Medium', description: 'Balanced reasoning' },
-  { value: 'high', name: 'High', description: 'Deep reasoning' },
-  { value: 'xhigh', name: 'Extra High', description: 'More time for difficult work' },
-  { value: 'max', name: 'Ultra', description: 'Maximum reasoning available for this model' },
-  { value: 'ultra', name: 'Ultra', description: 'Maximum Codex reasoning · higher usage' },
 ]
 const isAssistantSpeed = (v: string): v is AssistantSpeed => v === 'default' || v === 'fast'
 const MAX_VISIBLE_TURN_TEXT = 320_000
@@ -869,7 +851,7 @@ export const Assistant = memo(function Assistant({ threadId }: { threadId: strin
   useEffect(() => { if (inputRef.current && !input) inputRef.current.style.height = '' }, [input])
   const permsForAgent = pendingPermissions.filter((p) => p.key === connectionKey)
   const holdAdapterLease = !active.groupParentId || parentGroupPhase === 'idle' || (
-    !!parentGroupPhase && !parentGroupPaused && ['answering', 'negotiating', 'assigning', 'executing', 'reviewing', 'integrating', 'critiquing', 'synthesizing'].includes(parentGroupPhase)
+    !parentGroupPaused && isRunningMeshPhase(parentGroupPhase)
   ) || permsForAgent.length > 0
   const arun: Runtime = liveRuntime ?? { turns: [], first: true }
   const [archivedPage, setArchivedPage] = useState<ArchivedRow[]>([])
@@ -2748,7 +2730,7 @@ export const Assistant = memo(function Assistant({ threadId }: { threadId: strin
               codexChrome
               models={providerModelControl.options}
               modelValue={providerModelControl.value}
-              efforts={providerEffortControl?.options.filter((option) => isCodexEffort(option.value)) ?? CODEX_EFFORT_OPTIONS.filter((option) => option.value !== 'max')}
+              efforts={providerEffortControl?.options.filter((option) => isCodexEffort(option.value)) ?? CODEX_EFFORT_OPTIONS}
               effortValue={codexEffort}
               speed={liveSpeed}
               onModel={(value) => void onControlChange(providerModelControl, value)}

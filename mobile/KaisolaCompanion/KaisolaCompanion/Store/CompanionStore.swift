@@ -272,7 +272,10 @@ final class CompanionStore: ObservableObject {
             }
             projectIdsByWindowId[windowId] = projectIds
         }
-        let existingSessions = Dictionary(uniqueKeysWithValues: sessions.map { ($0.id, $0) })
+        // Non-trapping: a session id can transiently appear under two projects
+        // across partial projections, and uniqueKeysWithValues would crash
+        // (uncatchable) past the do/catch that is meant to degrade gracefully.
+        let existingSessions = Dictionary(sessions.map { ($0.id, $0) }, uniquingKeysWith: { _, latest in latest })
         let reconciledSessions = incomingSessions.map { incoming in
             reconcile(incoming: incoming, existing: existingSessions[incoming.id])
         }

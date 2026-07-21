@@ -7,15 +7,28 @@ const { onRequest } = require('firebase-functions/v2/https')
 const { setGlobalOptions } = require('firebase-functions/v2/options')
 
 initializeApp()
+// This {region} + the .firebaserc projectId are the authoritative source of the
+// `session` endpoint URL that is re-typed verbatim in the relay (wrangler.toml
+// FIREBASE_SESSION_URL), the iOS bundle (FirebaseAuthConfig.json serverUrl), and
+// the desktop config — keep those three in sync when either changes here.
 setGlobalOptions({ region: 'us-central1', maxInstances: 10 })
+
+// Max bearer-token length; mirrors the relay's MAX_AUTH_TOKEN_BYTES.
+const MAX_BEARER_TOKEN_LENGTH = 20_000
+// Header value the relay sends to skip the per-reconnect Firestore write.
+// MUST equal relay/src/index.js RELAY_TICKET_PURPOSE, or every relay reconnect
+// silently resumes doing a users/{uid} get + set (a billing-sensitive path).
+const RELAY_TICKET_PURPOSE = 'relay-ticket'
+// Max live rendezvous offers per account (matches the 'list' fetch bound).
+const MAX_COMPANION_OFFERS = 16
 
 function bearerToken(header) {
   const match = String(header || '').match(/^Bearer\s+([^\s]+)$/i)
-  return match && match[1].length <= 20_000 ? match[1] : null
+  return match && match[1].length <= MAX_BEARER_TOKEN_LENGTH ? match[1] : null
 }
 
 function isRelayTicketVerification(req) {
-  return req.get('x-kaisola-purpose') === 'relay-ticket'
+  return req.get('x-kaisola-purpose') === RELAY_TICKET_PURPOSE
 }
 
 function plainObject(value) {
@@ -157,6 +170,29 @@ exports.companionRendezvous = onRequest({ cors: false, invoker: 'public' }, asyn
     const offers = getFirestore().collection('users').doc(decoded.uid).collection('companionOffers')
     if (action === 'publish') {
       const offer = validateCompanionOffer(req.body?.offer)
+      // Sweep expired offers on the write path too (not only on 'list') and
+      // cap live offers per account, so a desktop that only ever publishes
+      // cannot accumulate offer docs without bound and expired offers always
+      // get a TTL-like backstop.
+      const now = Date.now()
+      const existing = await offers.orderBy('expiresAt', 'desc').limit(MAX_COMPANION_OFFERS + 1).get()
+      let live = 0
+      const expired = []
+      for (const document of existing.docs) {
+        if (document.id === offer.nonce) continue
+        const data = document.data()
+        if (!Number.isSafeInteger(data.expiresAt) || data.expiresAt <= now) expired.push(document.ref)
+        else live += 1
+      }
+      if (expired.length) {
+        const batch = getFirestore().batch()
+        for (const ref of expired) batch.delete(ref)
+        await batch.commit().catch(() => {})
+      }
+      if (live >= MAX_COMPANION_OFFERS) {
+        res.status(429).json({ ok: false, message: 'Too many pending pairings. Try again shortly.' })
+        return
+      }
       await offers.doc(offer.nonce).set({
         desktopId: offer.desktopId,
         desktopName: offer.desktopName,

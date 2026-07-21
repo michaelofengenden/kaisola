@@ -496,6 +496,12 @@ export const GROUP_COLORS = ['#8a8f98', '#4a7dbd', '#c25e5e', '#c2a24e', '#5f9e6
 
 /** A recently closed session (⌘⇧T brings it back, Chrome-style). */
 export const CLOSED_SESSION_RETENTION_MS = 7 * 24 * 60 * 60 * 1_000
+/** How many closed sessions the reopen stack keeps per project. */
+export const CLOSED_STACK_LIMIT = 20
+/** Grace window a closing terminal's PTY is held before the broker releases
+ * it. Passed to the detached broker (terminal.scheduleRelease) AND used for
+ * the compatibility fallback timer, so both must be the same value. */
+export const TERMINAL_GRACE_MS = 60_000
 export interface ClosedSession {
   kind: 'term' | 'thread' | 'group' | 'panel'
   at: number
@@ -2095,6 +2101,23 @@ const assistantArchiveBatchId = (
   return `v1-${baseCount}-${turns.length}-${length}-${hash}`
 }
 
+/** Clear a removed account's binding from every background project slice so no
+ * parked tab is left pointing at an account that no longer exists (the active
+ * project is handled separately on the root state). */
+function clearAccountBinding(
+  slices: Record<string, ProjectSliceMemory>,
+  field: 'claudeAccountId' | 'codexAccountId',
+  id: string,
+): Record<string, ProjectSliceMemory> {
+  let changed = false
+  const next: Record<string, ProjectSliceMemory> = {}
+  for (const [key, slice] of Object.entries(slices)) {
+    if (slice[field] === id) { next[key] = { ...slice, [field]: '' }; changed = true }
+    else next[key] = slice
+  }
+  return changed ? next : slices
+}
+
 /** Today's per-slice pruning (extracted from `partialize`): projects a live slice
  * onto the durable persist keys, dropping transient bucket-D fields and capping
  * the heavy arrays / healing the grid. Pure — safe for any slice, active or not. */
@@ -2207,7 +2230,7 @@ function sanitizeSliceForPersist(slice: ProjectSliceMemory): ProjectSlicePersist
     // recently-closed history, kept light on disk: closed threads carry only a
     // transcript tail (full history stays in main's archive), closed terminals
     // shed live-only fields, dead same-process receipts are dropped
-    closedStack: (slice.closedStack ?? []).filter((closed) => Date.now() - closed.at < CLOSED_SESSION_RETENTION_MS).slice(0, 20).map((c) => {
+    closedStack: (slice.closedStack ?? []).filter((closed) => Date.now() - closed.at < CLOSED_SESSION_RETENTION_MS).slice(0, CLOSED_STACK_LIMIT).map((c) => {
       if (c.kind === 'group' && c.thread && c.groupThreads) {
         const ids = new Set(c.groupThreads.map((thread) => thread.id))
         const trimRuntime = (runtime: AssistantRuntime) => ({
@@ -2828,8 +2851,11 @@ export const useKaisola = create<KaisolaState>()(
   removeClaudeAccount: (id) =>
     set((s) => ({
       claudeAccounts: s.claudeAccounts.filter((a) => a.id !== id),
-      // a project bound to the removed account falls back to the default (~/.claude)
+      // a project bound to the removed account falls back to the default
+      // (~/.claude) — clear the binding on the active project AND every
+      // background tab's slice so none is left pointing at a deleted account
       claudeAccountId: s.claudeAccountId === id ? '' : s.claudeAccountId,
+      projectSlices: clearAccountBinding(s.projectSlices, 'claudeAccountId', id),
     })),
   setClaudeAccountEmail: (id, email) =>
     set((s) => ({ claudeAccounts: s.claudeAccounts.map((a) => (a.id === id ? { ...a, email } : a)) })),
@@ -2846,6 +2872,7 @@ export const useKaisola = create<KaisolaState>()(
     set((s) => ({
       codexAccounts: s.codexAccounts.filter((account) => account.id !== id),
       codexAccountId: s.codexAccountId === id ? '' : s.codexAccountId,
+      projectSlices: clearAccountBinding(s.projectSlices, 'codexAccountId', id),
     })),
   launchClaude: async (opts) => {
     const st = get()
@@ -3023,19 +3050,19 @@ export const useKaisola = create<KaisolaState>()(
         terminals,
         needsYou,
         // Chrome's undo-close: the record goes on the stack and the pty gets
-        // a 60s grace before the deferred kill below reaps it
-        closedStack: closing ? [{ kind: 'term' as const, at: Date.now(), term: closing }, ...s.closedStack].slice(0, 20) : s.closedStack,
+        // a grace window before the deferred kill below reaps it
+        closedStack: closing ? [{ kind: 'term' as const, at: Date.now(), term: closing }, ...s.closedStack].slice(0, CLOSED_STACK_LIMIT) : s.closedStack,
         ...gridState(grid.length ? grid : fallback ? [[fallback]] : [], grid.length || fallback ? {} : { dockOpen: false }),
       }
     })
     forgetMountedTerminal(id)
     // The detached broker owns this timer. Renderer crashes, live appearance
     // swaps, and app restarts cannot strand the accepted close anymore.
-    void bridge.terminal.scheduleRelease(id, owner, 60_000).catch(() => {
+    void bridge.terminal.scheduleRelease(id, owner, TERMINAL_GRACE_MS).catch(() => {
       // Compatibility fallback for an older/unavailable broker.
       window.setTimeout(() => {
         if (!terminalOwnerMap(get())[id]) void bridge.terminal.kill(id, owner).catch(() => {})
-      }, 60_000)
+      }, TERMINAL_GRACE_MS)
     })
   },
   renameTerminal: (id, name) =>
@@ -3306,7 +3333,7 @@ export const useKaisola = create<KaisolaState>()(
       const fallback = s.terminals[0]?.id ?? s.assistantThreads[0]?.id
       return {
         panels,
-        closedStack: closing ? [{ kind: 'panel' as const, at: Date.now(), panel: closing }, ...s.closedStack].slice(0, 20) : s.closedStack,
+        closedStack: closing ? [{ kind: 'panel' as const, at: Date.now(), panel: closing }, ...s.closedStack].slice(0, CLOSED_STACK_LIMIT) : s.closedStack,
         ...gridState(grid.length ? grid : fallback ? [[fallback]] : [], grid.length || fallback ? {} : { dockOpen: false }),
       }
     })
@@ -3970,7 +3997,7 @@ export const useKaisola = create<KaisolaState>()(
               groupRuntimes,
               groupDrafts,
               groupPromptQueues,
-            }, ...s.closedStack].slice(0, 20)
+            }, ...s.closedStack].slice(0, CLOSED_STACK_LIMIT)
           : closing && !closing.groupParentId
             ? [{
                 kind: 'thread' as const,
@@ -3979,7 +4006,7 @@ export const useKaisola = create<KaisolaState>()(
                 runtime,
                 ...(closedDraft ? { draft: closedDraft } : {}),
                 ...(closedQueue?.length ? { promptQueue: closedQueue } : {}),
-              }, ...s.closedStack].slice(0, 20)
+              }, ...s.closedStack].slice(0, CLOSED_STACK_LIMIT)
             : s.closedStack,
         ...(grid.length
           ? gridState(grid)
@@ -5910,10 +5937,10 @@ export const useKaisola = create<KaisolaState>()(
       for (const t of slice.terminals) {
         const tid = t.id
         forgetMountedTerminal(tid)
-        void bridge.terminal.scheduleRelease(tid, id, 60_000).catch(() => {
+        void bridge.terminal.scheduleRelease(tid, id, TERMINAL_GRACE_MS).catch(() => {
           window.setTimeout(() => {
             if (!terminalOwnerMap(get())[tid]) void bridge.terminal.kill(tid, id).catch(() => {})
-          }, 60_000)
+          }, TERMINAL_GRACE_MS)
         })
       }
     }

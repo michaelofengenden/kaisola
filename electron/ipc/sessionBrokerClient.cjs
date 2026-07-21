@@ -7,18 +7,9 @@ const os = require('node:os')
 const path = require('node:path')
 const { spawn } = require('node:child_process')
 const { StringDecoder } = require('node:string_decoder')
+const { PROTOCOL, SECURITY_EPOCH, TERMINAL_OBSERVE_FEATURE, MAX_FRAME, atomicJson } = require('./brokerWire.cjs')
 
-// Protocol 1 shipped without project-scoped terminal ownership. It must never
-// be reused by a build which promises project isolation: the legacy broker has
-// no trustworthy project label to migrate for already-running PTYs.
-const PROTOCOL = 2
-const SECURITY_EPOCH = 1
-const TERMINAL_OBSERVE_FEATURE = 'terminal-observe-v1'
 const LEGACY_UNSCOPED_PROTOCOL = 1
-// A terminal snapshot may legally carry 8 MiB of UTF-8 output; JSON escaping
-// can roughly double that. Keep one bounded envelope that can carry the
-// documented payload without turning a valid response into a reconnect loop.
-const MAX_FRAME = 20 * 1024 * 1024
 const CONNECT_TIMEOUT_MS = 8_000
 const LEGACY_RETIRE_TIMEOUT_MS = 5_000
 // Darwin's sockaddr_un.sun_path is short (104 bytes including the terminator).
@@ -28,14 +19,6 @@ const LEGACY_RETIRE_TIMEOUT_MS = 5_000
 const SAFE_UNIX_SOCKET_PATH_BYTES = 100
 
 function sleep(ms) { return new Promise((resolve) => setTimeout(resolve, ms)) }
-
-function atomicJson(file, value) {
-  fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 })
-  const tmp = `${file}.${process.pid}.tmp`
-  fs.writeFileSync(tmp, JSON.stringify(value), { mode: 0o600 })
-  fs.renameSync(tmp, file)
-  try { fs.chmodSync(file, 0o600) } catch { /* best effort */ }
-}
 
 function readJson(file) {
   try { return JSON.parse(fs.readFileSync(file, 'utf8')) } catch { return null }

@@ -12,7 +12,14 @@ struct PermissionDetailView: View {
     @State private var resolving = false
 
     private var canDecide: Bool {
-        store.canControlAgents && (permission.completeness ?? "complete") == "complete"
+        // Must mirror coordinator.respond(to:option:)'s preconditions exactly:
+        // it also requires a sessionId and revision, so a complete permission
+        // that lacks either would otherwise show tappable Allow/Reject that
+        // dead-end with a "review on the Mac" toast instead of resolving.
+        store.canControlAgents
+            && permission.sessionId != nil
+            && permission.revision != nil
+            && (permission.completeness ?? "complete") == "complete"
     }
 
     var body: some View {

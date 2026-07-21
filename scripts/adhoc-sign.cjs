@@ -13,7 +13,15 @@ exports.default = async function adhocSign(context) {
     context.appOutDir,
     `${context.packager.appInfo.productFilename}.app`
   );
-  const entitlements = path.join(__dirname, '..', 'node_modules', 'app-builder-lib', 'templates', 'entitlements.mac.plist');
+  // Resolve through the real module layout (pnpm / nested npm can hoist
+  // app-builder-lib somewhere other than the top-level node_modules) instead
+  // of a hand-built path, and fail with a clear message if the template moved.
+  let entitlements;
+  try {
+    entitlements = require.resolve('app-builder-lib/templates/entitlements.mac.plist');
+  } catch {
+    throw new Error('adhoc-sign: could not locate app-builder-lib/templates/entitlements.mac.plist — its install layout may have changed. Update this hook to the new template path.');
+  }
   const sh = (cmd) => execSync(cmd, { stdio: 'inherit' });
   // codesign refuses bundles containing Finder metadata ("resource fork,
   // Finder information, or similar detritus not allowed"). package.cjs stages

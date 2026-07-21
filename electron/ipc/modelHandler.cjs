@@ -55,7 +55,10 @@ async function requestClaude({ system, messages, maxTokens, stream, model, tools
 // ── Anthropic (paid API) ─────────────────────────────────────────────────────
 async function callAnthropic(req) {
   const res = await requestClaude({ ...req, stream: false })
-  if (res.ok === false) return res // noKey passthrough
+  // Discriminate on shape, not `.ok`: a fetch Response for any non-2xx reply
+  // also has ok === false, and a raw Response is not structured-cloneable
+  // across ipcMain.handle — the renderer would lose the real error text.
+  if (!(res instanceof Response)) return res // noKey passthrough
   if (!res.ok) return { ok: false, status: res.status, message: await res.text() }
   const data = await res.json()
   const blocks = data.content || []
@@ -188,7 +191,7 @@ function registerModelHandlers(ipcMain) {
     const chan = `model:chunk:${id}`
     try {
       const res = await requestClaude({ ...req, stream: true })
-      if (res.ok === false) {
+      if (!(res instanceof Response)) {
         send(sender, chan, { done: true, error: res.message, noKey: res.noKey })
         return res
       }

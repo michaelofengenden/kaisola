@@ -47,21 +47,19 @@ test('count and byte limits force a snapshot for a slow client', () => {
   assert.equal(byteBounded.stats().retainedEvents, 1)
 })
 
-test('ACK pruning waits for the slowest active client and ignores stale ACK regression', () => {
+test('acknowledgements clamp to the latest cursor, ignore stale regression, and drop per client', () => {
   const events = log()
   for (let index = 1; index <= 5; index++) {
     events.append({ type: 'desktop.status', payload: { index }, at: index })
   }
-  events.acknowledge('phone-fast', 5)
-  events.acknowledge('phone-slow', 2)
-  assert.equal(events.pruneAcknowledged(), 2)
-  assert.equal(events.stats().earliestSeq, 3)
+  assert.equal(events.acknowledge('phone-fast', 5), 5)
+  assert.equal(events.acknowledge('phone-slow', 2), 2)
   assert.equal(events.acknowledge('phone-slow', 1), 2)
-  assert.equal(events.pruneAcknowledged(), 0)
-
   assert.equal(events.dropClient('phone-slow'), true)
-  assert.equal(events.pruneAcknowledged(), 3)
-  assert.equal(events.stats().retainedEvents, 0)
+  // Acknowledgements never destroy replayable history; retention is governed
+  // solely by the maxEvents/maxBytes caps so a not-yet-acking client can
+  // still resume without a snapshot reset.
+  assert.equal(events.stats().retainedEvents, 5)
 })
 
 test('epoch mismatch, cursor ahead, and pruned gaps request a replacement snapshot', () => {

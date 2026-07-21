@@ -16,6 +16,16 @@ enum KaisolaLinkError: LocalizedError, Equatable {
     }
 }
 
+/// Kaisola Link relay wire limits. MUST match the desktop
+/// (electron/companion/linkProtocol.cjs) and the relay worker (relay/src/index.js):
+/// the relay wraps a device payload in a mux frame toward the desktop, so a
+/// device may send at most the message ceiling minus that frame overhead.
+enum KaisolaLinkLimits {
+    static let maxRelayMessageBytes = 2 * 1_024 * 1_024
+    static let muxFrameOverhead = 64
+    static let maxDevicePayloadBytes = maxRelayMessageBytes - muxFrameOverhead
+}
+
 @MainActor
 final class KaisolaLinkConnection {
     enum Event {
@@ -108,7 +118,7 @@ final class KaisolaLinkConnection {
     }
 
     func send(_ data: Data) throws {
-        guard !data.isEmpty, data.count <= 2 * 1_024 * 1_024 - 64,
+        guard !data.isEmpty, data.count <= KaisolaLinkLimits.maxDevicePayloadBytes,
               let webSocket, isActive else { throw KaisolaLinkError.disconnected }
         let expectedGeneration = generation
         let prior = sendTail
@@ -181,7 +191,7 @@ final class KaisolaLinkConnection {
                 guard isCurrent(expectedGeneration), task === webSocket else { return }
                 switch message {
                 case let .data(data):
-                    guard !data.isEmpty, data.count <= 2 * 1_024 * 1_024 - 64 else {
+                    guard !data.isEmpty, data.count <= KaisolaLinkLimits.maxDevicePayloadBytes else {
                         throw KaisolaLinkError.invalidResponse
                     }
                     onEvent?(.data(data))

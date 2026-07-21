@@ -14,6 +14,11 @@ const { agentEnv } = require('./shellEnv.cjs')
 const PROTOCOL_VERSION = 1
 const MAX_JSON_LINE_BYTES = 16 * 1024 * 1024
 const MAX_TEXT_FILE_BYTES = 8 * 1024 * 1024
+// Default/maximum retained bytes for an agent-owned terminal. Same value as
+// MAX_TEXT_FILE_BYTES today, but a separate constant: the file-read cap and
+// the terminal-output cap are independent knobs (and the broker snapshot
+// envelope in brokerWire.cjs is sized against this one).
+const MAX_TERMINAL_OUTPUT_BYTES = 8 * 1024 * 1024
 const REQUEST_TIMEOUT_MS = 120_000
 const MAX_TERMINAL_ENV_VARS = 256
 const MAX_TERMINAL_ENV_VALUE_BYTES = 1024 * 1024
@@ -36,10 +41,10 @@ const terminalEnvObject = (input) => {
 }
 
 const terminalOutputLimit = (input) => {
-  if (input == null) return MAX_TEXT_FILE_BYTES
+  if (input == null) return MAX_TERMINAL_OUTPUT_BYTES
   const n = Number(input)
-  if (!Number.isFinite(n)) return MAX_TEXT_FILE_BYTES
-  return Math.max(0, Math.min(Math.floor(n), MAX_TEXT_FILE_BYTES))
+  if (!Number.isFinite(n)) return MAX_TERMINAL_OUTPUT_BYTES
+  return Math.max(0, Math.min(Math.floor(n), MAX_TERMINAL_OUTPUT_BYTES))
 }
 
 const isInside = (root, candidate) => {
@@ -215,7 +220,7 @@ class AcpConnection {
         reject(new Error(`${method} timed out after ${timeoutMs}ms`))
       }, timeoutMs) : null
       timer?.unref?.()
-      this.pending.set(id, { resolve, reject, timer })
+      this.pending.set(id, { resolve, reject, timer, prompt: method === 'session/prompt' })
       if (!this._write({ jsonrpc: '2.0', id, method, params })) {
         if (timer) clearTimeout(timer)
         this.pending.delete(id)
@@ -527,6 +532,22 @@ class AcpConnection {
 
   cancel() {
     if (this.sessionId) this.notify('session/cancel', { sessionId: this.sessionId })
+  }
+
+  /** Reject any session/prompt requests still pending after their turn fully
+   * settled. promptQueueing adapters absorb injected (steer) prompts into the
+   * running turn and may never answer their JSON-RPC ids; without this sweep
+   * each absorbed steer would leave a pending record and an un-settleable
+   * promise behind for the connection's lifetime. Callers already ignore
+   * these promises, and a late adapter response for a swept id is dropped
+   * harmlessly by _dispatch. */
+  abandonSettledTurnPrompts() {
+    for (const [id, entry] of [...this.pending]) {
+      if (!entry.prompt) continue
+      this.pending.delete(id)
+      if (entry.timer) clearTimeout(entry.timer)
+      entry.reject(new Error('session/prompt was absorbed by a completed turn'))
+    }
   }
 
   async releaseOwnedTerminals() {

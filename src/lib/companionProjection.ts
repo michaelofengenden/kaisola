@@ -8,11 +8,22 @@ import type {
   TerminalSession,
 } from '../store/store'
 import type { AcpPermissionRequest } from './bridge'
+// Shared with the Electron sanitizer (electron/companion/redaction.cjs) so the
+// caps the renderer applies here and the caps redaction fail-closes on stay
+// one definition. Mirrored into the Swift core during the port.
+import LIMITS from '../../electron/companion/projectionLimits.json'
 
 export const COMPANION_PROJECTION_KIND = 'kaisola.companion.projection' as const
 
 type CompanionStatus = 'idle' | 'running' | 'waiting' | 'done' | 'failed'
-type ProjectSlice = KaisolaState | ProjectSliceMemory
+type ProjectSlice = ProjectionInput | ProjectSliceMemory
+
+/** The narrow slice of application state the projection actually reads. Typed
+ * as its own input (not the full KaisolaState) so a future headless KaisolaCore
+ * can produce it without porting the entire renderer store shape first. The
+ * live store is assignable to this, so today's call sites are unchanged. */
+export type ProjectionInput =
+  Pick<KaisolaState, 'projectTabs' | 'projectSlices' | 'activeProjectId' | 'terminalMeta'> & ProjectSliceMemory
 
 export interface CompanionProjection {
   projectionKind: typeof COMPANION_PROJECTION_KIND
@@ -80,7 +91,7 @@ const projectLabel = (tab: ProjectTab): string => {
   return display(parts.at(-1), 'New Project')
 }
 
-const projectSlice = (state: KaisolaState, projectId: string): ProjectSlice | undefined =>
+const projectSlice = (state: ProjectionInput, projectId: string): ProjectSlice | undefined =>
   projectId === state.activeProjectId ? state : state.projectSlices[projectId]
 
 const timestamp = (...values: unknown[]): number => {
@@ -107,17 +118,15 @@ const assistantStatus = (thread: AssistantThread, runtime: AssistantRuntime | un
 const terminalStatus = (
   meta: KaisolaState['terminalMeta'][string] | undefined,
   needsYou: boolean,
-  activitySource: 'shell' | 'cli-agent' | 'managed-agent' = 'shell',
+  managed = false,
 ): CompanionStatus => {
   if (needsYou) return 'waiting'
   // A foreground Codex/Claude process can sit at its composer for hours. Only
   // the broker-owned prompt lifecycle means the CLI is actively responding;
-  // process presence means the session is available, not running.
-  const active = activitySource === 'managed-agent'
-    ? meta?.running
-    : activitySource === 'cli-agent'
-      ? meta?.agentBusy
-      : meta?.agentBusy
+  // process presence means the session is available, not running. Manually
+  // launched CLIs and plain shells alike are "running" only while agentBusy;
+  // a Kaisola-managed agent tracks its own running flag instead.
+  const active = managed ? meta?.running : meta?.agentBusy
   if (active) return 'running'
   if (typeof meta?.lastExit === 'number') return meta.lastExit === 0 ? 'done' : 'failed'
   return 'idle'
@@ -130,22 +139,12 @@ const terminalProvider = (terminal: TerminalSession): string | undefined => {
   return terminal.name ? display(terminal.name, 'Terminal', 120) : undefined
 }
 
-const terminalActivitySource = (terminal: TerminalSession): 'shell' | 'cli-agent' => {
-  if (terminal.singletonKey?.startsWith('agent:')) return 'cli-agent'
-  // Some package-installed CLIs own the PTY through a `node` wrapper, so the
-  // broker cannot promote them from fgProcess alone. Preserve an explicit
-  // Codex/Claude terminal identity as the compatibility signal; this matches
-  // the terminal card's provider label and the real manually-launched shape.
-  const provider = terminalProvider(terminal)
-  return provider === 'Codex' || provider === 'Claude' ? 'cli-agent' : 'shell'
-}
-
 const turnProjection = (runtime: AssistantRuntime | undefined) => (runtime?.turns ?? [])
   .filter((turn) => typeof turn.text === 'string' && !!turn.text.trim())
-  .slice(-40)
+  .slice(-LIMITS.MAX_TURNS_PER_SESSION)
   .map((turn) => ({
     kind: turn.kind,
-    text: display(turn.text, '', 16 * 1024),
+    text: display(turn.text, "", LIMITS.MAX_TURN_TEXT),
     ...(turn.status ? { status: display(turn.status, '', 80) } : {}),
     ...(Number.isSafeInteger(turn.at) && Number(turn.at) >= 0 ? { at: Number(turn.at) } : {}),
   }))
@@ -171,7 +170,7 @@ const relativeDiffPath = (rawPath: unknown, workspacePath: string | null): strin
   }
   relative = relative.replace(/^\.\//, '')
   if (!relative || relative.startsWith('/') || relative.split('/').includes('..')) return null
-  return relative.slice(0, 1024)
+  return relative.slice(0, LIMITS.MAX_PATH)
 }
 
 const permissionProjection = (
@@ -190,7 +189,7 @@ const permissionProjection = (
     title: display(permission.title, 'Permission requested'),
     ...(permission.kind ? { kind: display(permission.kind, '', 80) } : {}),
     requestedAt,
-    options: (permission.options ?? []).slice(0, 12).map((option) => ({
+    options: (permission.options ?? []).slice(0, LIMITS.MAX_PERMISSION_OPTIONS).map((option) => ({
       id: option.optionId,
       label: display(option.name, 'Option', 160),
     })),
@@ -201,10 +200,10 @@ const permissionProjection = (
       const relativePath = relativeDiffPath(diff.path, slice.workspacePath)
       return relativePath ? [{
         relativePath,
-        oldText: display(diff.oldText, '', 16 * 1024),
-        newText: display(diff.newText, '', 16 * 1024),
+        oldText: display(diff.oldText, "", LIMITS.MAX_DIFF_TEXT),
+        newText: display(diff.newText, "", LIMITS.MAX_DIFF_TEXT),
       }] : []
-    }).slice(0, 8),
+    }).slice(0, LIMITS.MAX_PERMISSION_DIFFS),
   }
 }
 
@@ -222,7 +221,7 @@ const taskAttention = (task: AgentTask, projectId: string, fallbackAt: number): 
 }
 
 export function buildCompanionProjection(
-  state: KaisolaState,
+  state: ProjectionInput,
   { revision, generatedAt }: { revision: number; generatedAt: number },
 ): CompanionProjection {
   const sessions: CompanionProjection['sessions'] = []
@@ -230,7 +229,7 @@ export function buildCompanionProjection(
   const permissions: CompanionProjection['permissions'] = []
   const projects: CompanionProjection['projects'] = []
 
-  for (const tab of state.projectTabs.slice(0, 64)) {
+  for (const tab of state.projectTabs.slice(0, LIMITS.MAX_PROJECTS)) {
     const slice = projectSlice(state, tab.id)
     if (!slice) continue
     const terminalIds = [
@@ -248,7 +247,7 @@ export function buildCompanionProjection(
     })
 
     for (const thread of slice.assistantThreads) {
-      if (sessions.length >= 500) break
+      if (sessions.length >= LIMITS.MAX_SESSIONS) break
       const runtime = slice.assistantRuntimes[thread.id]
       const needsYou = !!slice.needsYou[thread.id]
       const turns = turnProjection(runtime)
@@ -276,7 +275,7 @@ export function buildCompanionProjection(
 
     const seenTerminals = new Set<string>()
     for (const terminal of slice.terminals) {
-      if (sessions.length >= 500 || seenTerminals.has(terminal.id)) continue
+      if (sessions.length >= LIMITS.MAX_SESSIONS || seenTerminals.has(terminal.id)) continue
       seenTerminals.add(terminal.id)
       const meta = state.terminalMeta[terminal.id]
       const needsYou = !!slice.needsYou[terminal.id]
@@ -285,7 +284,7 @@ export function buildCompanionProjection(
         projectId: tab.id,
         kind: 'terminal',
         title: display(terminal.name ?? terminal.promptTitle ?? terminal.autoName, terminalProvider(terminal) ?? 'Terminal'),
-        status: terminalStatus(meta, needsYou, terminalActivitySource(terminal)),
+        status: terminalStatus(meta, needsYou),
         needsYou,
         unread: needsYou,
         updatedAt: terminalResponseAt(meta),
@@ -298,7 +297,7 @@ export function buildCompanionProjection(
       })
     }
     for (const terminal of slice.agentTerminals) {
-      if (sessions.length >= 500 || seenTerminals.has(terminal.terminalId)) continue
+      if (sessions.length >= LIMITS.MAX_SESSIONS || seenTerminals.has(terminal.terminalId)) continue
       seenTerminals.add(terminal.terminalId)
       const meta = state.terminalMeta[terminal.terminalId]
       const needsYou = !!slice.needsYou[terminal.terminalId]
@@ -307,7 +306,7 @@ export function buildCompanionProjection(
         projectId: tab.id,
         kind: 'terminal',
         title: display(terminal.label, display(terminal.agentName, 'Agent terminal')),
-        status: terminalStatus(meta, needsYou, 'managed-agent'),
+        status: terminalStatus(meta, needsYou, true),
         needsYou,
         unread: needsYou,
         updatedAt: terminalResponseAt(meta),
@@ -320,7 +319,7 @@ export function buildCompanionProjection(
       })
     }
     for (const panel of slice.panels) {
-      if (sessions.length >= 500) break
+      if (sessions.length >= LIMITS.MAX_SESSIONS) break
       sessions.push({
         id: panel.id,
         projectId: tab.id,
@@ -333,12 +332,12 @@ export function buildCompanionProjection(
       })
     }
 
-    for (const permission of slice.pendingPermissions.slice(0, 50)) {
+    for (const permission of slice.pendingPermissions.slice(0, LIMITS.MAX_PERMISSIONS)) {
       permissions.push(permissionProjection(permission, tab.id, slice, tab))
     }
     for (const task of slice.agentTasks) {
       const item = taskAttention(task, tab.id, tab.createdAt)
-      if (item && attention.length < 200) attention.push(item)
+      if (item && attention.length < LIMITS.MAX_ATTENTION) attention.push(item)
     }
   }
 

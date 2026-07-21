@@ -1,6 +1,7 @@
 'use strict'
 
 const crypto = require('node:crypto')
+const { IDENTIFIER_RE } = require('./protocol.cjs')
 
 const NOISE_PROTOCOL = 'Noise_XX_25519_ChaChaPoly_SHA256'
 const PROTOCOL_VERSION = 1
@@ -74,7 +75,7 @@ function fromB64url(value, bytes, label = 'value') {
 }
 
 function validateId(value, label = 'id') {
-  if (typeof value !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9._:@-]{0,159}$/.test(value)) {
+  if (typeof value !== 'string' || !IDENTIFIER_RE.test(value)) {
     fail('invalid_identity', `${label} is invalid`)
   }
   return value

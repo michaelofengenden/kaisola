@@ -24,6 +24,7 @@ const { app, BrowserWindow } = require('electron')
 const { dbGet } = require('./dbHandler.cjs')
 const ledger = require('./ledgerHandler.cjs')
 const catalog = require('./mcpCatalog.cjs')
+const { storeKeysForSlot, slotFromStoreKey } = require('./windowManifestPolicy.cjs')
 
 const MAX_CAPABILITIES = 128
 const capabilities = new Map() // bearer token -> immutable project context
@@ -236,6 +237,14 @@ function candidateStoreKeys(context) {
       keys.add(storeKeyForWindow(win))
     }
   } catch { /* tests and shutdown can have no BrowserWindow implementation */ }
+  // Expand every candidate through the shared legacy spellings (kiasola-/
+  // pasola-): a window restored or parked before the rename keeps its
+  // snapshot under a legacy key until its next persist, and MCP reads must
+  // still find that project instead of silently reporting it absent.
+  for (const key of [...keys]) {
+    const slot = slotFromStoreKey(key)
+    if (slot !== undefined) for (const spelling of storeKeysForSlot(slot)) keys.add(spelling)
+  }
   return [...keys]
 }
 

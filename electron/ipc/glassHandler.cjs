@@ -79,17 +79,27 @@ async function loadWallpaper(p) {
   const digest = crypto.createHash('sha256').update(cacheKey).digest('hex').slice(0, 24)
   const cached = path.join(os.tmpdir(), `kaisola-wp-avg96-${digest}.jpg`)
   if (!fs.existsSync(cached)) {
-    const ok = await exec('/usr/bin/sips', ['-s', 'format', 'jpeg', '-s', 'formatOptions', '72', '--resampleWidth', '96', p, '--out', cached], 15000)
+    // sips writes to a temp path first: writing straight to the final cache
+    // path means a killed/timed-out sips leaves a truncated JPEG that
+    // existsSync then treats as valid forever for this wallpaper version.
+    const temp = `${cached}.${process.pid}.tmp`
+    const ok = await exec('/usr/bin/sips', ['-s', 'format', 'jpeg', '-s', 'formatOptions', '72', '--resampleWidth', '96', p, '--out', temp], 15000)
     if (ok == null) {
+      try { fs.unlinkSync(temp) } catch { /* nothing written */ }
       // Non-mac/test fallback: still cap the retained nativeImage immediately.
       const direct = nativeImage.createFromPath(p)
       if (direct.isEmpty()) return null
       const size = direct.getSize()
       return size.width > 96 ? direct.resize({ width: 96 }) : direct
     }
+    try { fs.renameSync(temp, cached) } catch { try { fs.unlinkSync(temp) } catch { /* already gone */ } }
   }
   const img = nativeImage.createFromPath(cached)
-  if (img.isEmpty()) return null
+  if (img.isEmpty()) {
+    // A bad cache entry must not stick: drop it so the next call regenerates.
+    try { fs.unlinkSync(cached) } catch { /* best effort */ }
+    return null
+  }
   return img
 }
 

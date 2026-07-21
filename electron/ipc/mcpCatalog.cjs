@@ -42,22 +42,7 @@ function readJson(file) {
     return { data: null, error: missing ? null : `Invalid JSON in ${path.basename(file)}: ${String(err.message || err)}`, exists: !missing }
   }
 }
-function writePrivateJson(file, data) {
-  fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 })
-  const json = JSON.stringify(data, null, 2)
-  const temp = `${file}.tmp.${process.pid}.${Date.now()}.${crypto.randomBytes(4).toString('hex')}`
-  try {
-    fs.writeFileSync(temp, json, { mode: 0o600 })
-    // An existing file can have inherited permissive bits; rename preserves the
-    // freshly-created temp file's private mode on POSIX.
-    try { fs.chmodSync(temp, 0o600) } catch { /* Windows / restrictive FS */ }
-    fs.renameSync(temp, file)
-    try { fs.chmodSync(file, 0o600) } catch { /* Windows / restrictive FS */ }
-  } catch (err) {
-    try { fs.unlinkSync(temp) } catch { /* no temp / already renamed */ }
-    throw err
-  }
-}
+const { writePrivateJson } = require('./privateWrite.cjs')
 
 // ── spec normalization ───────────────────────────────────────────────────────
 /** Expand ${VAR} from the process env (Claude Code's .mcp.json convention). */

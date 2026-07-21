@@ -237,17 +237,6 @@ struct NeedsYouCard: View {
     }
 }
 
-struct EmptyLane: View {
-    let text: String
-    var body: some View {
-        Text(text)
-            .font(.footnote)
-            .foregroundStyle(.tertiary)
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .padding(.vertical, 6)
-    }
-}
-
 #Preview {
     let store = CompanionStore.preview()
     let coordinator = CompanionConnectionCoordinator(store: store)

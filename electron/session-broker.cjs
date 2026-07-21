@@ -14,11 +14,9 @@ const path = require('node:path')
 const { StringDecoder } = require('node:string_decoder')
 const mgr = require('./ipc/terminalManager.cjs')
 const { terminalOwnerAllowed, terminalOwnerParts } = require('./ipc/securityPolicy.cjs')
+const { PROTOCOL, SECURITY_EPOCH, TERMINAL_OBSERVE_FEATURE, MAX_FRAME, atomicJson } = require('./ipc/brokerWire.cjs')
 
-const PROTOCOL = 2
-const SECURITY_EPOCH = 1
-const FEATURES = Object.freeze(['terminal-observe-v1'])
-const MAX_FRAME = 20 * 1024 * 1024
+const FEATURES = Object.freeze([TERMINAL_OBSERVE_FEATURE])
 const NO_CLIENT_EXIT_MS = 30_000
 // macOS may reap old entries from its per-user temporary directory even while
 // a process still has the AF_UNIX listener open. The broker and every PTY stay
@@ -56,14 +54,6 @@ function log(message) {
     }
     fs.appendFileSync(config.logFile, `${new Date().toISOString()} ${message}\n`, { mode: 0o600 })
   } catch { /* diagnostics must never stop sessions */ }
-}
-
-function atomicJson(file, value) {
-  fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 })
-  const tmp = `${file}.${process.pid}.tmp`
-  fs.writeFileSync(tmp, JSON.stringify(value), { mode: 0o600 })
-  fs.renameSync(tmp, file)
-  try { fs.chmodSync(file, 0o600) } catch { /* best effort */ }
 }
 
 function tokenMatches(candidate) {
@@ -419,7 +409,11 @@ function configureServer(candidate, { recovery = false } = {}) {
 
 function publishListener({ recovered = false } = {}) {
   if (process.platform !== 'win32') try { fs.chmodSync(config.socketPath, 0o600) } catch { /* token still gates */ }
-  atomicJson(config.infoFile, brokerInfo())
+  // Info-file publication is diagnostics/rendezvous, not session state. A
+  // transient write failure (ENOSPC, unwritable userData) during socket-path
+  // recovery must degrade — letting it escape into uncaughtException would
+  // gracefulExit(true) and kill every live PTY over a bookkeeping file.
+  try { atomicJson(config.infoFile, brokerInfo()) } catch (error) { log(`publish info failed ${error?.code || ''} ${error?.message || error}`) }
   log(`${recovered ? 'recovered socket' : 'ready'} pid=${process.pid} protocol=${PROTOCOL} version=${config.version}`)
 }
 

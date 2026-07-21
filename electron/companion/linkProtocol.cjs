@@ -5,7 +5,14 @@ const MUX_OPEN = 1
 const MUX_DATA = 2
 const MUX_CLOSE = 3
 const MAX_RELAY_MESSAGE_BYTES = 2 * 1024 * 1024
-const CHANNEL_RE = /^[A-Za-z0-9_-]{22}$/
+const CHANNEL_ID_BYTES = 22
+const CHANNEL_RE = new RegExp(`^[A-Za-z0-9_-]{${CHANNEL_ID_BYTES}}$`)
+// Bytes the relay adds when wrapping a device payload into a mux frame toward
+// the desktop: a 3-byte header (version + type + channelLength) plus the
+// channel id. Reserved as a conservative round margin so a device never emits
+// a payload that, once framed, exceeds MAX_RELAY_MESSAGE_BYTES.
+const MUX_FRAME_OVERHEAD = 64
+const MAX_RELAY_DEVICE_PAYLOAD_BYTES = MAX_RELAY_MESSAGE_BYTES - MUX_FRAME_OVERHEAD
 
 function asBuffer(value) {
   if (Buffer.isBuffer(value)) return value
@@ -36,9 +43,12 @@ function decodeMuxFrame(value) {
 }
 
 module.exports = {
+  CHANNEL_ID_BYTES,
+  MAX_RELAY_DEVICE_PAYLOAD_BYTES,
   MAX_RELAY_MESSAGE_BYTES,
   MUX_CLOSE,
   MUX_DATA,
+  MUX_FRAME_OVERHEAD,
   MUX_OPEN,
   MUX_VERSION,
   decodeMuxFrame,

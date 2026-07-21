@@ -49,6 +49,8 @@ const { hardenWebviewAttachment, installPermissionPolicy, isSafeWebUrl, isTruste
 const { BrowserGuestRegistry } = require('./ipc/browserGuestRegistry.cjs')
 const {
   MANIFEST_KEY: WINDOW_MANIFEST_KEY,
+  MIN_SLOT,
+  MAX_SLOT,
   OPEN_AT_QUIT,
   PARKED,
   idForSlot,
@@ -1094,11 +1096,24 @@ async function deleteSavedWindow(event, id) {
   const entry = windowManifest.find((candidate) => candidate.id === id)
   if (!entry) return { ok: false, missing: true, message: 'That saved window was already deleted.' }
   if (deletingSavedWindows.has(id)) return { ok: false, busy: true, message: 'That saved window is already being deleted.' }
+  // Claim the id BEFORE the async confirm dialog. Two delete requests from
+  // different windows could otherwise both pass the has() check while their
+  // dialogs sit open, then double-run the delete transaction on a stale entry.
+  // Every return below the claim must release it (the main path's finally does).
+  deletingSavedWindows.add(id)
+  const releaseDeleteClaim = () => {
+    deletingSavedWindows.delete(id)
+    if (windowDeleteQuitRequested && deletingSavedWindows.size === 0) {
+      windowDeleteQuitRequested = false
+      app.quit()
+    }
+  }
   let target = liveSavedWindows.get(id)
   const wasLive = !!target && !target.isDestroyed() && !target.__kaisolaDeleteBoot
   if (wasLive) {
     const safety = acpRendererSwapState(target.webContents)
     if (!safety.safe) {
+      releaseDeleteClaim()
       return {
         ok: false,
         busy: true,
@@ -1124,16 +1139,21 @@ async function deleteSavedWindow(event, id) {
   const confirmation = requester && !requester.isDestroyed()
     ? await dialog.showMessageBox(requester, options)
     : await dialog.showMessageBox(options)
-  if (confirmation.response !== 0) return { ok: false, cancelled: true }
+  if (confirmation.response !== 0) {
+    releaseDeleteClaim()
+    return { ok: false, cancelled: true }
+  }
 
   // The dialog is asynchronous; a turn could have started while it was open.
   target = liveSavedWindows.get(id)
   if (target && !target.isDestroyed() && !target.__kaisolaDeleteBoot) {
     const safety = acpRendererSwapState(target.webContents)
-    if (!safety.safe) return { ok: false, busy: true, awaitingPermission: safety.awaitingPermission, message: 'Agent work started, so the window was not deleted.' }
+    if (!safety.safe) {
+      releaseDeleteClaim()
+      return { ok: false, busy: true, awaitingPermission: safety.awaitingPermission, message: 'Agent work started, so the window was not deleted.' }
+    }
   }
 
-  deletingSavedWindows.add(id)
   let deleteBoot = false
   let countedTransaction = false
   let backup
@@ -1379,9 +1399,9 @@ function freeSlot() {
   // hand a new renderer a slot whose first persist overwrites user state.
   const storedSlots = new Set(dbKeys().map(slotFromStoreKey).filter((slot) => Number.isSafeInteger(slot)))
   const taken = (n) => manifestSlots.has(n) || liveSlots.has(n) || storedSlots.has(n)
-  let n = 2
-  while (n <= 999_999 && taken(n)) n++
-  if (n <= 999_999) return n
+  let n = MIN_SLOT
+  while (n <= MAX_SLOT && taken(n)) n++
+  if (n <= MAX_SLOT) return n
   throw new Error('No saved-window slot is available.')
 }
 function destroyDiscardedAdoptionWindow(win) {
@@ -1390,7 +1410,7 @@ function destroyDiscardedAdoptionWindow(win) {
   const discard = () => {
     if (!slot) return
     const { dbDel } = require('./ipc/dbHandler.cjs')
-    for (const key of [`kaisola-store-w${slot}`, `kiasola-store-w${slot}`, `pasola-store-w${slot}`]) {
+    for (const key of storeKeysForSlot(slot)) {
       try { dbDel(key) } catch { /* best-effort failed-transfer cleanup */ }
     }
   }
@@ -1930,6 +1950,12 @@ if (hasSingleInstanceLock) app.whenReady().then(async () => {
       return windowId === 'primary' ? 'Main window' : 'Window'
     },
   })
+  // Companion setup must degrade, not abort launch: CompanionDeviceStore's
+  // constructor throws on a corrupt/undecryptable identity store, and without
+  // this guard that skips everything below — window restore and a dozen
+  // unrelated handler registrations. Mirrors the recoverProjectTransfers
+  // guard above; the phone simply shows unpaired until the store is repaired.
+  try {
   companionHandler = registerCompanionHandlers(ipcMain, {
     app,
     BrowserWindow,
@@ -1964,13 +1990,18 @@ if (hasSingleInstanceLock) app.whenReady().then(async () => {
     },
   })
   companionGateway = companionHandler.gateway
-  setAcpSessionEventSink((event) => companionGateway.acpSessionEvent(event))
-  setTerminalAttentionSink((event) => companionGateway.terminalAttention(event))
-  setLedgerEventSink((event) => companionGateway.ledgerEvent(event))
+  } catch (error) {
+    console.error('[companion] disabled: handler construction failed', error)
+    companionHandler = null
+    companionGateway = null
+  }
+  setAcpSessionEventSink((event) => companionGateway?.acpSessionEvent(event))
+  setTerminalAttentionSink((event) => companionGateway?.terminalAttention(event))
+  setLedgerEventSink((event) => companionGateway?.ledgerEvent(event))
   registerCompanionProjectionHandlers(ipcMain, {
     BrowserWindow,
     store: companionProjectionStore,
-    onPublished: (windowId, result) => companionGateway.projectionPublished(windowId, result),
+    onPublished: (windowId, result) => companionGateway?.projectionPublished(windowId, result),
   })
   loadWindowManifest()
   registerCodexHandlers(ipcMain)
@@ -1992,7 +2023,10 @@ if (hasSingleInstanceLock) app.whenReady().then(async () => {
     service: attentionService,
     projectIdsForWindow: (win) => companionDesktopState.projectIdsForWindow(win.__kaisolaSavedId),
   })
-  const companionState = await companionHandler.restore()
+  let companionState = { enabled: false }
+  if (companionHandler) {
+    try { companionState = await companionHandler.restore() } catch (error) { console.error('[companion] restore failed', error) }
+  }
   const refreshCompanion = () => { void companionHandler?.refresh() }
   powerMonitor.on('resume', refreshCompanion)
   powerMonitor.on('unlock-screen', refreshCompanion)
@@ -2095,15 +2129,22 @@ app.on('before-quit', (event) => {
     // ACP command PTYs are connection-private and cannot be rediscovered after
     // their adapter exits. Release those exact records while the authenticated
     // broker socket is still live; user/CLI PTYs remain detached and continue.
-    try { attentionService?.flushPersistence?.() } catch { /* earlier durable state remains available */ }
-    await companionHandler?.dispose()
-    await disposeAcp()
-    await detachSessionBroker()
-    disposeAuth()
-    disposeFs()
-    disposeClaudeHooks()
-    disposeMcp()
-    appCleanupFinished = true
-    app.quit()
+    // Every step is individually guarded and the quit itself sits in a finally:
+    // this quit was already preventDefault()ed and appCleanupStarted latched,
+    // so a single rejected teardown would otherwise strand the app unquittable
+    // (and skip the broker detach for every step after the failure).
+    try {
+      try { attentionService?.flushPersistence?.() } catch { /* earlier durable state remains available */ }
+      try { await companionHandler?.dispose() } catch { /* socket teardown best effort */ }
+      try { await disposeAcp() } catch { /* adapter teardown best effort */ }
+      try { await detachSessionBroker() } catch { /* PTYs stay owned by the detached broker */ }
+      try { disposeAuth() } catch { /* best effort */ }
+      try { disposeFs() } catch { /* best effort */ }
+      try { disposeClaudeHooks() } catch { /* best effort */ }
+      try { disposeMcp() } catch { /* best effort */ }
+    } finally {
+      appCleanupFinished = true
+      app.quit()
+    }
   })()
 })

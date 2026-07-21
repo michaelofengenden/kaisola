@@ -23,6 +23,52 @@ const dragEndedOutsideWindow = (event: ReactDragEvent<HTMLElement>) => {
 const basename = (p: string | null | undefined) => (p ? p.split('/').filter(Boolean).pop() : undefined)
 const tabLabel = (t: { title?: string; workspacePath: string | null }) => t.title ?? basename(t.workspacePath) ?? 'New Project'
 
+/** Project drag-reorder / tear-off, inline rename, and close-others — shared by
+ * both navigation layouts (Top strip and Left tree) so their identical project
+ * management logic lives once. Returns the rename edit state plus a
+ * `dragHandlers(id)` factory for the draggable node. */
+function useProjectNav() {
+  const tabs = useKaisola((s) => s.projectTabs)
+  const reorderProjects = useKaisola((s) => s.reorderProjects)
+  const detachProjectToWindow = useKaisola((s) => s.detachProjectToWindow)
+  const renameProjectTab = useKaisola((s) => s.renameProjectTab)
+  const closeProject = useKaisola((s) => s.closeProject)
+  const [editing, setEditing] = useState<string | null>(null)
+  const [editValue, setEditValue] = useState('')
+  const dragRef = useRef<string | null>(null)
+
+  const beginRename = (id: string, label: string) => { setEditing(id); setEditValue(label) }
+  const commitRename = () => {
+    if (editing) renameProjectTab(editing, editValue.trim() || undefined)
+    setEditing(null)
+  }
+  const closeOthers = (id: string) => {
+    // snapshot first — closeProject mutates projectTabs as it re-homes
+    for (const tab of tabs.filter((candidate) => candidate.id !== id)) closeProject(tab.id)
+  }
+  const dragHandlers = (id: string) => ({
+    onDragStart: (event: ReactDragEvent<HTMLElement>) => {
+      dragRef.current = id
+      event.dataTransfer.effectAllowed = 'move'
+      event.dataTransfer.setData('text/plain', id)
+    },
+    onDragOver: (event: ReactDragEvent<HTMLElement>) => {
+      event.preventDefault()
+      event.dataTransfer.dropEffect = 'move'
+    },
+    onDrop: () => { if (dragRef.current) reorderProjects(dragRef.current, id); dragRef.current = null },
+    onDragEnd: (event: ReactDragEvent<HTMLElement>) => {
+      // Dropped outside THIS window: main hit-tests other Kaisola tab strips
+      // first (recombine), otherwise creates a tear-off there.
+      const out = dragEndedOutsideWindow(event)
+      if (out && dragRef.current === id) void detachProjectToWindow(id, { x: event.screenX, y: event.screenY })
+      dragRef.current = null
+    },
+  })
+
+  return { editing, editValue, setEditValue, beginRename, commitRename, closeOthers, dragHandlers }
+}
+
 /** One low-churn project activity selector shared by both navigation modes. */
 function useProjectTabStates() {
   return useKaisola(
@@ -78,17 +124,12 @@ export function ProjectTabs() {
   // feed line and pty tick, which re-rendered the whole strip during streams.
   const tabStates = useProjectTabStates()
   const switchProject = useKaisola((s) => s.switchProject)
-  const closeProject = useKaisola((s) => s.closeProject)
-  const reorderProjects = useKaisola((s) => s.reorderProjects)
-  const renameProjectTab = useKaisola((s) => s.renameProjectTab)
   const setProjectColor = useKaisola((s) => s.setProjectColor)
   const detachProjectToWindow = useKaisola((s) => s.detachProjectToWindow)
+  const { editing, editValue, setEditValue, beginRename, commitRename, closeOthers, dragHandlers } = useProjectNav()
 
-  const [editing, setEditing] = useState<string | null>(null)
-  const [editValue, setEditValue] = useState('')
   const [menu, setMenu] = useState<{ x: number; y: number; id: string } | null>(null)
   const [expandedProjectId, setExpandedProjectId] = useState<string | null>(null)
-  const dragRef = useRef<string | null>(null)
   const activeRef = useRef<HTMLDivElement>(null)
   const trackRef = useRef<HTMLDivElement>(null)
   const previousActiveId = useRef(activeId)
@@ -120,16 +161,6 @@ export function ProjectTabs() {
     return () => window.removeEventListener('resize', syncFade)
   }, [])
 
-  const beginRename = (id: string, label: string) => { setEditing(id); setEditValue(label) }
-  const commitRename = () => {
-    if (editing) renameProjectTab(editing, editValue.trim() || undefined)
-    setEditing(null)
-  }
-  const closeOthers = (id: string) => {
-    // snapshot first — closeProject mutates projectTabs as it re-homes
-    for (const t of tabs.filter((t) => t.id !== id)) closeProject(t.id)
-  }
-
   return (
     <div className="tabstrip" data-single={tabs.length === 1 || undefined}>
       <WindowLights />
@@ -150,23 +181,7 @@ export function ProjectTabs() {
               data-state={state}
               style={{ '--ptab-hue': tab.color ?? tab.hue } as CSSProperties}
               draggable={editing !== tab.id}
-              onDragStart={(event) => {
-                dragRef.current = tab.id
-                event.dataTransfer.effectAllowed = 'move'
-                event.dataTransfer.setData('text/plain', tab.id)
-              }}
-              onDragOver={(event) => {
-                event.preventDefault()
-                event.dataTransfer.dropEffect = 'move'
-              }}
-              onDrop={() => { if (dragRef.current) reorderProjects(dragRef.current, tab.id); dragRef.current = null }}
-              onDragEnd={(e) => {
-                // Dropped outside THIS window: main hit-tests other Kaisola tab
-                // strips first (recombine), otherwise creates a tear-off there.
-                const out = dragEndedOutsideWindow(e)
-                if (out && dragRef.current === tab.id) void detachProjectToWindow(tab.id, { x: e.screenX, y: e.screenY })
-                dragRef.current = null
-              }}
+              {...dragHandlers(tab.id)}
               title={tab.workspacePath ?? label}
             >
               {editing === tab.id ? (
@@ -323,13 +338,11 @@ export function ProjectSessionSidebar() {
   const activeId = useKaisola((s) => s.activeProjectId)
   const tabStates = useProjectTabStates()
   const switchProject = useKaisola((s) => s.switchProject)
-  const closeProject = useKaisola((s) => s.closeProject)
-  const reorderProjects = useKaisola((s) => s.reorderProjects)
-  const renameProjectTab = useKaisola((s) => s.renameProjectTab)
   const setProjectColor = useKaisola((s) => s.setProjectColor)
   const detachProjectToWindow = useKaisola((s) => s.detachProjectToWindow)
   const setTabLayout = useKaisola((s) => s.setTabLayout)
   const setSessionRailWidth = useKaisola((s) => s.setSessionRailWidth)
+  const { editing, editValue, setEditValue, beginRename, commitRename, closeOthers, dragHandlers } = useProjectNav()
   const sessionCount = useKaisola((s) =>
     s.assistantThreads.reduce((count, thread) => count + (thread.groupParentId ? 0 : 1), 0)
       + s.terminals.length
@@ -337,23 +350,12 @@ export function ProjectSessionSidebar() {
       + s.panels.length,
   )
   const [collapsed, setCollapsed] = useState(false)
-  const [editing, setEditing] = useState<string | null>(null)
-  const [editValue, setEditValue] = useState('')
   const [filter, setFilter] = useState('')
   const [menu, setMenu] = useState<{ x: number; y: number; id: string } | null>(null)
-  const dragRef = useRef<string | null>(null)
 
   useEffect(() => { setCollapsed(false); setFilter('') }, [activeId])
   useEffect(() => { if (sessionCount <= 20 && filter) setFilter('') }, [filter, sessionCount])
 
-  const beginRename = (id: string, label: string) => { setEditing(id); setEditValue(label) }
-  const commitRename = () => {
-    if (editing) renameProjectTab(editing, editValue.trim() || undefined)
-    setEditing(null)
-  }
-  const closeOthers = (id: string) => {
-    for (const tab of tabs.filter((candidate) => candidate.id !== id)) closeProject(tab.id)
-  }
   const selectProject = (id: string) => {
     if (id === activeId) setCollapsed((value) => !value)
     else {
@@ -411,18 +413,7 @@ export function ProjectSessionSidebar() {
               role="treeitem"
               aria-expanded={expanded}
               draggable={editing !== tab.id}
-              onDragStart={(event) => {
-                dragRef.current = tab.id
-                event.dataTransfer.effectAllowed = 'move'
-                event.dataTransfer.setData('text/plain', tab.id)
-              }}
-              onDragOver={(event) => { event.preventDefault(); event.dataTransfer.dropEffect = 'move' }}
-              onDrop={() => { if (dragRef.current) reorderProjects(dragRef.current, tab.id); dragRef.current = null }}
-              onDragEnd={(event) => {
-                const out = dragEndedOutsideWindow(event)
-                if (out && dragRef.current === tab.id) void detachProjectToWindow(tab.id, { x: event.screenX, y: event.screenY })
-                dragRef.current = null
-              }}
+              {...dragHandlers(tab.id)}
             >
               <div className="project-tree-row" data-active={active || undefined}>
                 <button type="button" className="project-tree-disclosure" onClick={() => selectProject(tab.id)} aria-label={`${expanded ? 'Collapse' : 'Expand'} ${label}`}>

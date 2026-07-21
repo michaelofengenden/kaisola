@@ -45,5 +45,5 @@ export function estimate(models: ModelSums[]): { usd: number; known: boolean; to
   return { usd, known, tokens }
 }
 
-export const fmtUsd = (v: number): string => (v >= 10 ? `$${v.toFixed(0)}` : v >= 1 ? `$${v.toFixed(2)}` : `$${v.toFixed(2)}`)
+export const fmtUsd = (v: number): string => (v >= 10 ? `$${v.toFixed(0)}` : `$${v.toFixed(2)}`)
 export const fmtTok = (n: number): string => (n >= 1_000_000 ? `${(n / 1_000_000).toFixed(1)}M` : n >= 1000 ? `${(n / 1000).toFixed(1)}k` : String(n))

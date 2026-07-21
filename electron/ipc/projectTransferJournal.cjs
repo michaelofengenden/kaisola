@@ -4,6 +4,7 @@ const {
   idForSlot,
   parseManifest,
   removeEntry: removeManifestEntry,
+  safeSlot,
   serializeManifest,
   storeKeysForSlot,
 } = require('./windowManifestPolicy.cjs')
@@ -16,10 +17,14 @@ const VALID_ID = /^[A-Za-z0-9_-]{1,240}$/
 
 const canonicalStoreKey = (slot) => storeKeysForSlot(slot)[0]
 
-function safeSlot(value) {
-  if (value == null) return null
-  const slot = Number(value)
-  return Number.isSafeInteger(slot) && slot >= 2 && slot <= 999_999 ? slot : undefined
+/** Persist-envelope version of a raw store blob, or null when absent. */
+function persistVersionOf(raw) {
+  try {
+    const version = JSON.parse(raw)?.version
+    return Number.isSafeInteger(version) ? version : null
+  } catch {
+    return null
+  }
 }
 
 function validStoreRaw(raw) {
@@ -51,10 +56,18 @@ function recoveredProjectId(transferId) {
  * other project's slice. This is the crash-recovery equivalent of the
  * renderer's post-ACK removal and is deliberately idempotent.
  */
-function removeProjectFromStoreRaw(raw, projectId, transferId) {
+function removeProjectFromStoreRaw(raw, projectId, transferId, expectedPersistVersion = null) {
   const checked = validStoreRaw(raw)
   if (checked === undefined || checked === null) throw new Error('Project transfer source store is unavailable.')
   const envelope = JSON.parse(checked)
+  // This function hand-edits the renderer's persisted slice shape
+  // (projectTabs/projectSlices/activeProjectId). If the envelope was written
+  // by a different persist version than the one captured at prepare time, the
+  // shape may have migrated — refuse rather than guess. Callers fall back to
+  // the exact sourceAfterRaw preimage captured when the shape was known-good.
+  if (expectedPersistVersion != null && envelope.version !== expectedPersistVersion) {
+    throw new Error('Project transfer store version changed since the journal record was prepared.')
+  }
   const state = envelope.state
   const tabs = Array.isArray(state.projectTabs) ? state.projectTabs : null
   if (!tabs) throw new Error('Project transfer source has no valid tab list.')
@@ -104,6 +117,7 @@ function sanitizeRecord(raw) {
     closeSource: raw.closeSource === true,
     phase: raw.phase,
     createdAt: Number.isSafeInteger(raw.createdAt) ? raw.createdAt : Date.now(),
+    persistVersion: Number.isSafeInteger(raw.persistVersion) ? raw.persistVersion : null,
     sourceBeforeRaw,
     sourceAfterRaw,
     targetBeforeRaw,
@@ -142,6 +156,7 @@ function prepareProjectTransfer({ get, mutate, transferId, projectId, sourceSlot
     closeSource,
     phase: 'prepared',
     createdAt: Date.now(),
+    persistVersion: persistVersionOf(source.value),
     sourceBeforeRaw: source.value,
     sourceAfterRaw,
     targetBeforeRaw: target?.value ?? null,
@@ -206,7 +221,7 @@ function finishProjectTransfer({ get, mutate, transferId, manifestKey, projectio
   } else {
     const source = readWindowStore(get, record.sourceSlot)?.value ?? record.sourceBeforeRaw
     let sourceAfterRaw
-    try { sourceAfterRaw = removeProjectFromStoreRaw(source, record.projectId, record.transferId) }
+    try { sourceAfterRaw = removeProjectFromStoreRaw(source, record.projectId, record.transferId, record.persistVersion) }
     catch { sourceAfterRaw = record.sourceAfterRaw }
     deleted.push(...storeKeysForSlot(record.sourceSlot))
     set[canonicalStoreKey(record.sourceSlot)] = sourceAfterRaw
@@ -266,7 +281,7 @@ function recoverProjectTransfers({ get, mutate, manifestKey, projectionKey }) {
     } else {
       const current = valueForSlot(record.sourceSlot, record.sourceBeforeRaw)
       let next
-      try { next = removeProjectFromStoreRaw(current, record.projectId, record.transferId) }
+      try { next = removeProjectFromStoreRaw(current, record.projectId, record.transferId, record.persistVersion) }
       catch { next = record.sourceAfterRaw }
       writeSlot(record.sourceSlot, next)
     }

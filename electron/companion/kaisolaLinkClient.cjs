@@ -2,7 +2,7 @@
 
 const { EventEmitter } = require('node:events')
 const {
-  MAX_RELAY_MESSAGE_BYTES,
+  MAX_RELAY_DEVICE_PAYLOAD_BYTES,
   MUX_CLOSE,
   MUX_DATA,
   MUX_OPEN,
@@ -16,7 +16,7 @@ const RETRY_BASE_MS = 1_000
 const RETRY_MAX_MS = 30_000
 const HEARTBEAT_MS = 20_000
 const SOCKET_READY_TIMEOUT_MS = 10_000
-const IDENTIFIER = /^[A-Za-z0-9][A-Za-z0-9._:@-]{0,159}$/
+const { IDENTIFIER_RE: IDENTIFIER } = require('./protocol.cjs')
 
 function relayBaseUrl(config) {
   const value = config?.relayUrl
@@ -58,7 +58,7 @@ class RelayVirtualSocket extends EventEmitter {
   write(value) {
     if (this.destroyed) throw new Error('relay socket is closed')
     const bytes = Buffer.isBuffer(value) ? value : Buffer.from(value)
-    if (!bytes.length || bytes.length > MAX_RELAY_MESSAGE_BYTES - 64 || !this.client.sendChannel(this.channelId, bytes)) {
+    if (!bytes.length || bytes.length > MAX_RELAY_DEVICE_PAYLOAD_BYTES || !this.client.sendChannel(this.channelId, bytes)) {
       throw new Error('relay socket is unavailable')
     }
     return this.writableLength < MAX_BUFFERED_BYTES

@@ -9,6 +9,7 @@ const http = require('node:http')
 const path = require('node:path')
 const { app, safeStorage, shell } = require('electron')
 const { agentEnv } = require('./shellEnv.cjs')
+const { writePrivateFile, writePrivateJson } = require('./privateWrite.cjs')
 
 const sessions = new Map() // id → child
 const ANSI = /\x1b\[[0-9;]*m/g
@@ -119,11 +120,7 @@ function readIdentity() {
 }
 
 function writeIdentity(profile) {
-  const file = identityPath()
-  fs.mkdirSync(path.dirname(file), { recursive: true })
-  const tmp = `${file}.${process.pid}.tmp`
-  fs.writeFileSync(tmp, JSON.stringify(profile, null, 2), { mode: 0o600 })
-  fs.renameSync(tmp, file)
+  writePrivateJson(identityPath(), profile)
 }
 
 function readFirebaseSession() {
@@ -139,11 +136,7 @@ function readFirebaseSession() {
 
 function writeFirebaseSession(refreshToken) {
   if (!safeStorage.isEncryptionAvailable()) throw new Error('OS keychain encryption is unavailable; Kaisola cannot store a secure sign-in session.')
-  const file = firebaseSessionPath()
-  fs.mkdirSync(path.dirname(file), { recursive: true })
-  const tmp = `${file}.${process.pid}.tmp`
-  fs.writeFileSync(tmp, safeStorage.encryptString(JSON.stringify({ refreshToken })), { mode: 0o600 })
-  fs.renameSync(tmp, file)
+  writePrivateFile(firebaseSessionPath(), safeStorage.encryptString(JSON.stringify({ refreshToken })))
 }
 
 function clearFirebaseSession() {

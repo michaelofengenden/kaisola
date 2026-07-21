@@ -17,6 +17,7 @@
 const path = require('path')
 const fs = require('fs')
 const { app } = require('electron')
+const { writePrivateFile } = require('./privateWrite.cjs')
 
 let backend = null
 
@@ -57,9 +58,7 @@ function init() {
     // atomic write (temp + rename) so a crash mid-write can't corrupt the store
     const write = (obj, strict = false) => {
       try {
-        const tmp = `${file}.${process.pid}.tmp`
-        fs.writeFileSync(tmp, JSON.stringify(obj))
-        fs.renameSync(tmp, file)
+        writePrivateFile(file, JSON.stringify(obj))
       } catch (writeError) {
         if (strict) throw writeError
       }

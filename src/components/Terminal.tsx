@@ -120,6 +120,11 @@ const preserveTerminalViewport = (term: XTerm, mutate: () => void, pinned?: bool
  * buffer only makes re-showing the card parse megabytes it will immediately
  * scroll away, which is what made tab switches stutter. */
 const HIDDEN_BUF_CAP = 512_000
+// dev-server detection in terminal output → a browser-card chip. The cutoff is
+// the start of the OS ephemeral range (macOS assigns CLIENT ports 49152–65535,
+// the access-log noise this guards); fixed dev ports below it still get a chip.
+const DEV_PORT_RE = /(?:localhost|127\.0\.0\.1|0\.0\.0\.0):(\d{2,5})/
+const EPHEMERAL_PORT_MIN = 49152
 /** Minimize/hide can be a momentary Mission Control transition. Wait briefly
  * before paying the teardown/replay cost; a genuinely hidden window then owns
  * zero xterm canvases, glyph atlases, listeners, or renderer scrollback. */
@@ -819,16 +824,12 @@ export function Terminal({ id, attach = false, boot, cwd, projectId: projectIdOv
 
     // dev-server detection: a URL/port in the output becomes a chip on the
     // card head that opens (or re-points) a browser card beside this terminal
-    const PORT_RE = /(?:localhost|127\.0\.0\.1|0\.0\.0\.0):(\d{2,5})/
     const scanPorts = (data: string) => {
       if (!data.includes(':')) return
-      const m = data.match(PORT_RE)
+      const m = data.match(DEV_PORT_RE)
       if (!m) return
       const port = Number(m[1])
-      // skip only the OS ephemeral range — macOS assigns CLIENT ports from
-      // 49152–65535 (the access-log noise this guards). Dev servers below it
-      // (3000/5173/8080, and high-but-fixed ports up to 49151) still get a chip.
-      if (!port || port >= 49152) return
+      if (!port || port >= EPHEMERAL_PORT_MIN) return
       const st = useKaisola.getState()
       const ports = st.terminalMeta[id]?.ports ?? []
       if (ports[0] === port) return

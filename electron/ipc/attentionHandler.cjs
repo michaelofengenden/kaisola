@@ -214,6 +214,12 @@ function registerAttentionHandlers(ipcMain, {
       // authoritative permId. A renderer echo must never create a second source.
       if (payload.kind === 'permission') return
       const owner = BrowserWindow.fromWebContents(event.sender)
+      // Same ownership gate as attention:ack / attention:surface / showNotice:
+      // a window may raise (and thereby project to the phone) attention only
+      // for projects it actually owns — this was the one renderer entry point
+      // missing the check.
+      if (!owner || owner.isDestroyed?.() || owner.__kaisolaPop || !owner.__kaisolaSavedId) return
+      if (!ownedProjectsFor(owner).has(payload.projectId)) return
       const now = Date.now()
       try {
         service.raise({
@@ -238,6 +244,9 @@ function registerAttentionHandlers(ipcMain, {
     lastNoticeAt.set(noticeKey, now)
     if (lastNoticeAt.size > 512) {
       for (const [key, at] of lastNoticeAt) if (now - at > 60_000) lastNoticeAt.delete(key)
+      // Hard cap like notifiedEventIds: age-based sweeping alone lets the map
+      // grow without bound when 512+ distinct keys appear inside one minute.
+      while (lastNoticeAt.size > 512) lastNoticeAt.delete(lastNoticeAt.keys().next().value)
     }
     const owner = BrowserWindow.fromWebContents(event.sender)
     if (!owner || owner.isDestroyed()) return

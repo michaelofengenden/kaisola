@@ -4,10 +4,16 @@ const OPEN_AT_QUIT = 'open_at_quit'
 const PARKED = 'parked'
 const VALID_STATES = new Set([OPEN_AT_QUIT, PARKED])
 
+// Saved-window slot range. freeSlot allocation (main.cjs) and every slot
+// sanitizer must agree: a slot handed out above the sanitizers' cap would be
+// dropped on the next parseManifest, orphaning that window's numbered store.
+const MIN_SLOT = 2
+const MAX_SLOT = 999_999
+
 const safeSlot = (value) => {
   if (value == null) return null
   const slot = Number(value)
-  return Number.isSafeInteger(slot) && slot >= 2 && slot <= 999_999 ? slot : undefined
+  return Number.isSafeInteger(slot) && slot >= MIN_SLOT && slot <= MAX_SLOT ? slot : undefined
 }
 
 const idForSlot = (slot) => slot == null ? 'primary' : `slot-${slot}`
@@ -114,6 +120,9 @@ const slotFromStoreKey = (key) => {
 module.exports = {
   MANIFEST_KEY,
   MANIFEST_VERSION,
+  MIN_SLOT,
+  MAX_SLOT,
+  safeSlot,
   OPEN_AT_QUIT,
   PARKED,
   idForSlot,

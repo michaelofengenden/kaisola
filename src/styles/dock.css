@@ -849,7 +849,7 @@ details.assistant-tool.tool-artifacts > summary::-webkit-details-marker { displa
   border-bottom: 0;
   border-radius: var(--r-4) var(--r-4) 0 0;
   background: color-mix(in srgb, var(--bg-2) 96%, transparent);
-  box-shadow: 0 -5px 24px color-mix(in srgb, var(--shadow-color) 9%, transparent);
+  box-shadow: 0 -5px 24px color-mix(in srgb, #000 9%, transparent);
   color: var(--text-1);
   z-index: 1;
 }
@@ -1346,7 +1346,7 @@ details.assistant-tool.tool-artifacts > summary::-webkit-details-marker { displa
 .group-member-status[data-status='ready'] { color: var(--success); }
 .group-member-status[data-status='failed'],
 .group-member-status[data-status='cancelled'] { color: var(--danger); }
-.group-member-status[data-status='paused'] { color: var(--warning, #d8a44a); }
+.group-member-status[data-status='paused'] { color: var(--warn); }
 .group-error {
   display: flex;
   align-items: center;
@@ -1360,7 +1360,7 @@ details.assistant-tool.tool-artifacts > summary::-webkit-details-marker { displa
   font-size: var(--fs-11);
 }
 .group-permissions { margin-bottom: 16px; }
-.group-permissions > h3 { display: flex; align-items: center; gap: 6px; margin: 0 0 8px; color: var(--warning, #d8a44a); font-size: var(--fs-11); font-weight: var(--fw-semibold); }
+.group-permissions > h3 { display: flex; align-items: center; gap: 6px; margin: 0 0 8px; color: var(--warn); font-size: var(--fs-11); font-weight: var(--fw-semibold); }
 .group-permissions .perm-card { margin-bottom: 8px; }
 .group-final {
   padding: 15px;
@@ -1626,7 +1626,7 @@ details.assistant-tool.tool-artifacts > summary::-webkit-details-marker { displa
   color: var(--text-1);
 }
 .composer-queue-send:hover {
-  background: var(--bg-5);
+  background: var(--bg-4);
 }
 .assistant-stream {
   flex: 1;
@@ -2540,7 +2540,7 @@ details.assistant-tool.tool-artifacts > summary::-webkit-details-marker { displa
   background: var(--accent);
   transition: width var(--dur-2) var(--ease-out);
 }
-.ctx-meter[data-hot] .ctx-meter-fill { background: var(--warning, #d8a44a); }
+.ctx-meter[data-hot] .ctx-meter-fill { background: var(--warn); }
 
 /* the MCP install trust modal (kaisola://mcp/install deeplinks) */
 .mcp-install { max-width: 520px; }
@@ -2564,7 +2564,7 @@ details.assistant-tool.tool-artifacts > summary::-webkit-details-marker { displa
 }
 .mcp-install-row { display: flex; align-items: center; gap: var(--sp-3); min-width: 0; font-size: var(--fs-12); }
 .mcp-install-row code { font-family: var(--font-mono); font-size: var(--fs-11); color: var(--text-1); min-width: 0; }
-.mcp-install-msg { font-size: var(--fs-12); color: var(--warning, #d8a44a); }
+.mcp-install-msg { font-size: var(--fs-12); color: var(--warn); }
 .mcp-install-actions { display: flex; gap: var(--sp-2); padding: 0 var(--sp-5) var(--sp-4); }
 
 /* turn-rail restore (per-prompt checkpoints — the /rewind grammar) */

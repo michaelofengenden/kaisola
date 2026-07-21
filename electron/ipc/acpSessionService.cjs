@@ -482,6 +482,10 @@ class AcpSessionService {
       }
       if (entry.current === turn) entry.current = { actorId: null, turnId: null }
       entry.steerPromises = []
+      // Steers absorbed into the finished turn never get their own JSON-RPC
+      // answer; drop their pending records now that flushSteers gave any
+      // stragglers their grace window.
+      try { entry.conn?.abandonSettledTurnPrompts?.() } catch { /* sweep is best effort */ }
       entry.turnEnding = false
       entry.inFlightTurns = 0
       entry.cancelRequested = false

@@ -82,12 +82,17 @@ function mergeAcpProjection(projection, acpSessionService, {
     }, { source: 'acp.permissions', entryId: project.id, onDiagnostic })
     if (withoutRendererPermissions) merged = withoutRendererPermissions
 
+    // The lookup map must reflect merged.sessions AFTER sanitization (session
+    // objects are rewritten by tryProjectionEntry), so it can only be reused
+    // across summaries that did not change the projection — rebuild lazily on
+    // the first summary after an applied change instead of on every summary.
+    let bySessionId = null
     for (const summary of Array.isArray(summaries) ? summaries : []) {
       if (!summary || summary.projectId !== project.id) continue
       const candidates = [summary.sessionId, summary.targetId]
         .map((id, index) => validId(id, `acp.session.${index}`, 240))
         .filter(Boolean)
-      const bySessionId = new Map(merged.sessions.map((session) => [session.id, session]))
+      if (!bySessionId) bySessionId = new Map(merged.sessions.map((session) => [session.id, session]))
       let session = candidates.map((id) => bySessionId.get(id)).find((item) => item?.projectId === project.id)
       let added = false
       if (!session) {
@@ -123,7 +128,10 @@ function mergeAcpProjection(projection, acpSessionService, {
         entryId: candidates[0] || project.id,
         onDiagnostic,
       })
-      if (next) merged = next
+      if (next) {
+        merged = next
+        bySessionId = null
+      }
     }
 
     for (const event of Array.isArray(permissionEvents) ? permissionEvents : []) {
@@ -866,6 +874,14 @@ class CompanionGateway {
       try {
         await stream.setup
         if (typeof stream.subscription?.unsubscribe === 'function') await stream.subscription.unsubscribe()
+      } catch (error) {
+        // Tearing down a dead or never-established observer must not reject:
+        // #subscribeTerminal awaits this promise unguarded, and an escaped
+        // rejection rides the frame-processing chain all the way to
+        // #closeState('authentication_failed'), dropping the phone's whole
+        // authenticated connection over one transient broker hiccup — the
+        // exact broker-restart window the product is designed to survive.
+        this.#recordAdapterDiagnostic({ source: 'terminal.dispose', entryId: stream.key, error })
       } finally {
         if (this.terminalStreams.get(stream.key) === stream) this.terminalStreams.delete(stream.key)
       }
@@ -898,7 +914,12 @@ class CompanionGateway {
     const cleanEntryId = normalizedText(String(entryId), 'unknown', 160).replace(/[^A-Za-z0-9_.:@-]/g, '_')
     const code = normalizedText(error?.code, 'adapter_error', 80).replace(/[^A-Za-z0-9_.:-]/g, '_')
     const key = `${cleanSource}:${cleanEntryId}:${code}`
-    if (this.loggedDiagnostics.has(key) || this.loggedDiagnostics.size >= 32) return
+    if (this.loggedDiagnostics.has(key)) return
+    // Bound the dedup set by evicting the oldest key instead of permanently
+    // silencing all future diagnostics once 32 distinct keys have been seen.
+    if (this.loggedDiagnostics.size >= 32) {
+      this.loggedDiagnostics.delete(this.loggedDiagnostics.values().next().value)
+    }
     this.loggedDiagnostics.add(key)
     const detail = normalizedText(error?.message, 'Adapter projection was rejected.', 240)
     try {

@@ -50,6 +50,13 @@ function sanitizeTerminalMirror(value, expectedTerminalId, expectedProjectId) {
     result.resume = value.resume.slice(0, 2048)
     changed = true
   }
+  // Part of the declared TerminalMirrorState contract (bridge.ts): the pop
+  // renderer's autoNameTerminal sends the short topic here and the owner
+  // window applies it as the terminal name. Same bound as oscTitle.
+  if (own(value, 'promptTitle') && typeof value.promptTitle === 'string') {
+    result.promptTitle = value.promptTitle.slice(0, 240)
+    changed = true
+  }
   return changed ? result : null
 }
 

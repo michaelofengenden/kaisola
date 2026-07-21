@@ -1,11 +1,25 @@
 const MAX_AUTH_TOKEN_BYTES = 20_000
 const MAX_REQUEST_BYTES = 8 * 1024
+const MAX_SESSION_RESPONSE_BYTES = 64 * 1024
 const MAX_RELAY_MESSAGE_BYTES = 2 * 1024 * 1024
+// Bytes the relay adds when framing a device payload toward the desktop
+// (3-byte mux header + channel id); reserved as a conservative round margin so
+// a device payload can never exceed MAX_RELAY_MESSAGE_BYTES once wrapped.
+// MUST match electron/companion/linkProtocol.cjs and the mobile KaisolaLinkLimits.
+const MUX_FRAME_OVERHEAD = 64
+const MAX_RELAY_DEVICE_PAYLOAD_BYTES = MAX_RELAY_MESSAGE_BYTES - MUX_FRAME_OVERHEAD
 const MAX_BUFFERED_BYTES = 4 * 1024 * 1024
 const MAX_DESKTOPS_PER_ACCOUNT = 8
 const MAX_DEVICES_PER_ACCOUNT = 16
+// Active outstanding tickets per account room. The expiry sweep lists with the
+// SAME limit, so if these two ever diverge the cap would silently stop holding.
+const MAX_ACTIVE_TICKETS = 64
 const TICKET_TTL_MS = 60_000
 const TICKET_PREFIX = 'ticket:'
+// Header the relay sends so the session-verify function can skip the per-call
+// Firestore write. functions/index.js keys its write-skip off this EXACT value;
+// changing one side silently re-enables the Firestore write on every reconnect.
+const RELAY_TICKET_PURPOSE = 'relay-ticket'
 
 export const MUX_VERSION = 1
 export const MUX_OPEN = 1
@@ -96,12 +110,12 @@ export async function verifyFirebaseSession(token, endpoint, fetchImpl = fetch) 
       authorization: `Bearer ${token}`,
       'content-type': 'application/json',
       'user-agent': 'Kaisola-Link/1',
-      'x-kaisola-purpose': 'relay-ticket',
+      'x-kaisola-purpose': RELAY_TICKET_PURPOSE,
     },
     body: '{}',
   })
   const text = await response.text()
-  if (!response.ok || new TextEncoder().encode(text).byteLength > 64 * 1024) throw new Error('invalid_session')
+  if (!response.ok || new TextEncoder().encode(text).byteLength > MAX_SESSION_RESPONSE_BYTES) throw new Error('invalid_session')
   let payload
   try { payload = JSON.parse(text) } catch { throw new Error('invalid_session') }
   const uid = payload?.ok === true && typeof payload?.user?.uid === 'string' && IDENTIFIER.test(payload.user.uid)
@@ -207,7 +221,7 @@ export class KaisolaLinkRoom {
     }
     const now = Date.now()
     const activeTickets = await this.#clearExpiredTickets(now)
-    if (activeTickets >= 64) return jsonResponse(429, { ok: false })
+    if (activeTickets >= MAX_ACTIVE_TICKETS) return jsonResponse(429, { ok: false })
     const ticket = randomToken(32)
     const digest = base64url(await sha256(ticket))
     const expiresAt = now + TICKET_TTL_MS
@@ -216,7 +230,7 @@ export class KaisolaLinkRoom {
   }
 
   async #clearExpiredTickets(now) {
-    const tickets = await this.ctx.storage.list({ prefix: TICKET_PREFIX, limit: 64 })
+    const tickets = await this.ctx.storage.list({ prefix: TICKET_PREFIX, limit: MAX_ACTIVE_TICKETS })
     const stale = []
     for (const [key, value] of tickets) {
       if (!Number.isSafeInteger(value?.expiresAt) || value.expiresAt <= now) stale.push(key)
@@ -316,7 +330,7 @@ export class KaisolaLinkRoom {
     }
     const bytes = asBytes(message)
     if (!bytes || bytes.byteLength < 1
-        || bytes.byteLength > (metadata.role === 'device' ? MAX_RELAY_MESSAGE_BYTES - 64 : MAX_RELAY_MESSAGE_BYTES)) {
+        || bytes.byteLength > (metadata.role === 'device' ? MAX_RELAY_DEVICE_PAYLOAD_BYTES : MAX_RELAY_MESSAGE_BYTES)) {
       close(socket, 1009, 'message_too_large')
       return
     }

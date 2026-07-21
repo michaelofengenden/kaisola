@@ -17,6 +17,7 @@ const {
   verifySignedKeyRecord,
 } = require('./crypto.cjs')
 const { validateCapabilities } = require('./deviceStore.cjs')
+const { IDENTIFIER_RE } = require('./protocol.cjs')
 
 const QR_TYPE = 'kaisola-companion-pairing'
 const DEFAULT_PAIRING_TTL_MS = 2 * 60 * 1000
@@ -39,7 +40,7 @@ function fail(code, message) {
 }
 
 function validateId(value, label) {
-  if (typeof value !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9._:@-]{0,159}$/.test(value)) fail('invalid_pairing_payload', `${label} is invalid`)
+  if (typeof value !== 'string' || !IDENTIFIER_RE.test(value)) fail('invalid_pairing_payload', `${label} is invalid`)
   return value
 }
 

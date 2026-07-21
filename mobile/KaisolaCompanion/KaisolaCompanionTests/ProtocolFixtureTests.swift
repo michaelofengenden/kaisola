@@ -464,4 +464,55 @@ final class ProtocolFixtureTests: XCTestCase {
         let url = try XCTUnwrap(Bundle(for: Self.self).url(forResource: name, withExtension: "json"))
         return try Data(contentsOf: url)
     }
+
+    // MARK: - Cross-language protocol table contract
+
+    /// The companion envelope vocabulary is hand-maintained twice (protocol.cjs
+    /// on desktop, CompanionProtocol.swift here). Both sides assert against the
+    /// checked-in canonical electron/companion/protocolTables.json, so a kind /
+    /// event / command / capability / status added or renamed on one platform
+    /// fails CI until the other platform (and the JSON) is updated too.
+    private struct ProtocolTables: Decodable {
+        let kinds: [String]
+        let capabilities: [String]
+        let eventTypes: [String]
+        let snapshotTypes: [String]
+        let commandCapabilities: [String: String]
+        let receiptStatuses: [String]
+    }
+
+    private func canonicalTables() throws -> ProtocolTables {
+        // Read the repo-root JSON relative to this source file so the test needs
+        // no bundled resource / project-file wiring.
+        let repoRoot = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()  // KaisolaCompanionTests
+            .deletingLastPathComponent()  // KaisolaCompanion
+            .deletingLastPathComponent()  // mobile
+            .deletingLastPathComponent()  // repo root
+        let url = repoRoot
+            .appendingPathComponent("electron/companion/protocolTables.json")
+        return try JSONDecoder().decode(ProtocolTables.self, from: Data(contentsOf: url))
+    }
+
+    func testSwiftProtocolEnumsMatchCanonicalTables() throws {
+        let tables = try canonicalTables()
+        XCTAssertEqual(
+            Set(CompanionEnvelopeKind.allCases.map(\.rawValue)), Set(tables.kinds),
+            "CompanionEnvelopeKind drifted from protocolTables.json")
+        XCTAssertEqual(
+            Set(CompanionCapability.allCases.map(\.rawValue)), Set(tables.capabilities),
+            "CompanionCapability drifted from protocolTables.json")
+        XCTAssertEqual(
+            CompanionEnvelope.eventTypes, Set(tables.eventTypes),
+            "CompanionEnvelope.eventTypes drifted from protocolTables.json")
+        XCTAssertEqual(
+            Set(CompanionReceiptStatus.allCases.map(\.rawValue)), Set(tables.receiptStatuses),
+            "CompanionReceiptStatus drifted from protocolTables.json")
+
+        let swiftCommandCapabilities = Dictionary(
+            uniqueKeysWithValues: CompanionEnvelope.commandCapabilities.map { ($0.key, $0.value.rawValue) })
+        XCTAssertEqual(
+            swiftCommandCapabilities, tables.commandCapabilities,
+            "CompanionEnvelope.commandCapabilities drifted from protocolTables.json")
+    }
 }

@@ -1,5 +1,12 @@
 /**
- * Kaisola domain model — the typed research trajectory. SINGLE SOURCE OF TRUTH.
+ * Kaisola domain model — the typed research trajectory. ASPIRATIONAL REFERENCE,
+ * NOT the source of truth.
+ *
+ * ⚠️ The shipped, authoritative domain model is `src/domain/types.ts`. This file
+ * is a richer forward-looking sketch (Phase-2 verification state, structured
+ * compute estimates, significance fields) and has DIVERGED from the live types
+ * in type-incompatible ways — it is not imported by any code. Do NOT port
+ * KaisolaCore types from this file; derive them from `src/domain/types.ts`.
  *
  * The primitive of Kaisola is NOT the paper. It is the research trajectory:
  *

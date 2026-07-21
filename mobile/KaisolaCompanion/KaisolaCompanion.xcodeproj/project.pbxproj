@@ -59,7 +59,6 @@
 		B62C43E8C819D04C80937850 /* PermissionDetailView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 28B48A98A402AFCF0AC70DFF /* PermissionDetailView.swift */; };
 		B79F1C0759B990C99E3AC10A /* CompanionTerminalSurface.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0557383CBDC384292EEEC85A /* CompanionTerminalSurface.swift */; };
 		B9088611B522B95205402BF5 /* ControlAuthorization.swift in Sources */ = {isa = PBXBuildFile; fileRef = D0AE7045A735E3CA553A49D7 /* ControlAuthorization.swift */; };
-		BD90ABBC1EEA7D2BAD8C38CB /* NowView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 674185F4949ADFE5AFBDCA4D /* NowView.swift */; };
 		C245C5F9F6C3777FACD34AF2 /* stale-revision-error.json in Resources */ = {isa = PBXBuildFile; fileRef = 6EED132F2C6069F2431D6C28 /* stale-revision-error.json */; };
 		C40EB939F9E54A14DB6492EF /* LengthFraming.swift in Sources */ = {isa = PBXBuildFile; fileRef = C6F6D271749DB37E8FAF6B46 /* LengthFraming.swift */; };
 		C87E890E3CE2EDEB7A55A1D1 /* KaisolaLinkConnectionTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = BC08C97AA0B6D438828C025E /* KaisolaLinkConnectionTests.swift */; };
@@ -116,7 +115,6 @@
 		5AFFAB4BF741FC53C399ABCA /* HomeView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HomeView.swift; sourceTree = "<group>"; };
 		5FA9249683775B12F12B0ABB /* protocol-mismatch.json */ = {isa = PBXFileReference; lastKnownFileType = text.json; path = "protocol-mismatch.json"; sourceTree = "<group>"; };
 		60926D0AB90F0026708BE1AA /* CompanionConnectionCoordinator.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CompanionConnectionCoordinator.swift; sourceTree = "<group>"; };
-		674185F4949ADFE5AFBDCA4D /* NowView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NowView.swift; sourceTree = "<group>"; };
 		69685CD5FB38B8FE593B9819 /* terminal-control-command.json */ = {isa = PBXFileReference; lastKnownFileType = text.json; path = "terminal-control-command.json"; sourceTree = "<group>"; };
 		6EED132F2C6069F2431D6C28 /* stale-revision-error.json */ = {isa = PBXFileReference; lastKnownFileType = text.json; path = "stale-revision-error.json"; sourceTree = "<group>"; };
 		74907E2AA6DEFB4DE3F3A1F5 /* Components.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Components.swift; sourceTree = "<group>"; };
@@ -166,7 +164,6 @@
 			isa = PBXGroup;
 			children = (
 				5AFFAB4BF741FC53C399ABCA /* HomeView.swift */,
-				674185F4949ADFE5AFBDCA4D /* NowView.swift */,
 			);
 			path = Now;
 			sourceTree = "<group>";
@@ -560,7 +557,6 @@
 				B219E2A44715999A43C5DB73 /* KaisolaTheme.swift in Sources */,
 				C40EB939F9E54A14DB6492EF /* LengthFraming.swift in Sources */,
 				5CC11648ED4D54E8876D0F0E /* NoiseXX.swift in Sources */,
-				BD90ABBC1EEA7D2BAD8C38CB /* NowView.swift in Sources */,
 				25C8ECCEE6F53FAA4C95E6A8 /* PairingFlowView.swift in Sources */,
 				F4DCF538350A442D857FFDA4 /* PairingModels.swift in Sources */,
 				B62C43E8C819D04C80937850 /* PermissionDetailView.swift in Sources */,

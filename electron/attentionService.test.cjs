@@ -237,9 +237,14 @@ test('permission projection dedupes the main event and resolution clears its can
   assert.equal(service.activeEvents('project-a').some((event) => event.kind === 'permission'), false)
 })
 
-test('agent stops become failures and ledger review or blocked occurrences replace and resolve exactly', () => {
+test('user cancels stay quiet, real failures raise, and ledger review or blocked occurrences replace and resolve exactly', () => {
   const { service, tick } = serviceHarness()
-  const failed = service.handleAcpEvent({ ...completion('project-a', 'session-a', 'turn-failed'), stopReason: 'cancelled' })
+  // A user-initiated Stop (ok:true + stopReason 'cancelled') is deliberate:
+  // the session leaves 'running' but no needs-you attention is raised.
+  const cancelled = service.handleAcpEvent({ ...completion('project-a', 'session-a', 'turn-cancelled'), stopReason: 'cancelled' })
+  assert.equal(cancelled, null)
+  assert.equal(service.boardState().sessions.find((session) => session.id === 'session-a')?.status, 'done')
+  const failed = service.handleAcpEvent(completion('project-a', 'session-a', 'turn-failed', false))
   assert.equal(failed.event.kind, 'failed')
 
   const reviewAt = tick()

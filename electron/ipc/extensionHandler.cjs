@@ -4,8 +4,8 @@
 // becomes an executable module or an unrestricted contribution.
 const fs = require('node:fs')
 const path = require('node:path')
-const crypto = require('node:crypto')
 const { app, BrowserWindow } = require('electron')
+const { writePrivateFile } = require('./privateWrite.cjs')
 
 const MAX_STATE_BYTES = 512 * 1024
 const MAX_MANIFEST_BYTES = 128 * 1024
@@ -38,20 +38,9 @@ function readState() {
 }
 
 function writeState(state) {
-  const file = statePath()
-  fs.mkdirSync(path.dirname(file), { recursive: true })
   const json = JSON.stringify({ schemaVersion: 1, installed: state.installed, development: state.development }, null, 2)
   if (Buffer.byteLength(json) > MAX_STATE_BYTES) throw new Error('Extension state is too large.')
-  const temp = `${file}.tmp.${process.pid}.${Date.now()}.${crypto.randomBytes(4).toString('hex')}`
-  try {
-    fs.writeFileSync(temp, json, { mode: 0o600 })
-    try { fs.chmodSync(temp, 0o600) } catch { /* Windows / restrictive FS */ }
-    fs.renameSync(temp, file)
-    try { fs.chmodSync(file, 0o600) } catch { /* Windows / restrictive FS */ }
-  } catch (err) {
-    try { fs.unlinkSync(temp) } catch { /* missing / already renamed */ }
-    throw err
-  }
+  writePrivateFile(statePath(), json)
 }
 
 const strings = (value, limit = 128) => Array.isArray(value)

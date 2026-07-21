@@ -1,0 +1,16 @@
+name = "kaisola-link"
+main = "src/index.js"
+compatibility_date = "2026-07-20"
+workers_dev = true
+preview_urls = false
+
+[vars]
+FIREBASE_SESSION_URL = "https://us-central1-kaisola-a9ab7.cloudfunctions.net/session"
+
+[[durable_objects.bindings]]
+name = "LINK_ROOMS"
+class_name = "KaisolaLinkRoom"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["KaisolaLinkRoom"]

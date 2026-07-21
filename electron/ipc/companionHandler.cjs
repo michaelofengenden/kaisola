@@ -12,6 +12,7 @@ const {
 } = require('../companion/pairing.cjs')
 const { BonjourCompanionTransport, DEFAULT_COMPANION_PORT } = require('../companion/bonjourTransport.cjs')
 const { CompanionGateway } = require('../companion/gateway.cjs')
+const { KaisolaLinkClient } = require('../companion/kaisolaLinkClient.cjs')
 const { CompanionStateHub } = require('../companion/stateHub.cjs')
 const { CompanionPreferenceStore } = require('../companion/preferenceStore.cjs')
 
@@ -30,6 +31,7 @@ const DEVICE_STORE_EVENTS = Object.freeze([
 const HANDLER_CHANNELS = Object.freeze([
   'companion:getState',
   'companion:setEnabled',
+  'companion:refresh',
   'companion:startPairing',
   'companion:confirmPairing',
   'companion:cancelPairing',
@@ -75,6 +77,8 @@ class CompanionHandler {
     gateway,
     transport,
     transportFactory,
+    linkClient,
+    linkOptions,
     accountRendezvous = null,
     now = Date.now,
     pairingTtlMs = DEFAULT_PAIRING_TTL_MS,
@@ -142,6 +146,17 @@ class CompanionHandler {
     if (!this.transport?.enable || !this.transport?.disable || !this.transport?.status) {
       throw new Error('companion transport is invalid')
     }
+    this.linkClient = linkClient ?? (linkOptions ? new KaisolaLinkClient({
+      ...linkOptions,
+      desktopId: this.deviceStore.desktopIdentity().id,
+      acceptSocket: (socket) => this.transport.acceptSocket(socket),
+      logger,
+    }) : null)
+    if (this.linkClient && (!this.transport.acceptSocket || !this.linkClient.enable || !this.linkClient.disable || !this.linkClient.status)) {
+      throw new Error('Kaisola Link transport is invalid')
+    }
+    this.linkStateListener = () => this.#emitState()
+    this.linkClient?.on?.('state', this.linkStateListener)
     this.storeListeners = new Map()
     for (const eventName of DEVICE_STORE_EVENTS) {
       const listener = () => this.#emitState()
@@ -174,6 +189,7 @@ class CompanionHandler {
     this.ipcMain = ipcMain
     ipcMain.handle('companion:getState', () => this.getState())
     ipcMain.handle('companion:setEnabled', (_event, input) => this.setEnabled(input?.enabled ?? input))
+    ipcMain.handle('companion:refresh', () => this.refresh())
     ipcMain.handle('companion:startPairing', (_event, input) => this.startPairing(input))
     ipcMain.handle('companion:confirmPairing', (_event, input) => this.confirmPairing(input?.pairingId ?? input))
     ipcMain.handle('companion:cancelPairing', (_event, input) => this.cancelPairing(input?.pairingId ?? input))
@@ -186,6 +202,8 @@ class CompanionHandler {
   getState() {
     let transportStatus = null
     try { transportStatus = this.transport.status() } catch { /* fixed diagnostic below */ }
+    let linkStatus = null
+    try { linkStatus = this.linkClient?.status?.() ?? null } catch { /* fixed diagnostic below */ }
     const listening = this.enabled === true && transportStatus?.enabled === true
     const devices = this.deviceStore.listDevices().map((device) => ({
       deviceId: device.deviceId,
@@ -197,17 +215,34 @@ class CompanionHandler {
     }))
     const connected = devices.reduce((count, device) => count + Number(device.connected), 0)
     const tailscaleAvailable = listening && transportStatus?.tailscaleAvailable === true
+    const linkAvailable = linkStatus?.configured === true
+    const linkConnected = linkStatus?.connected === true
+    const linkReady = linkConnected && listening
+    const linkPhase = ['off', 'connecting', 'ready', 'reconnecting', 'auth-required', 'unreachable', 'unavailable'].includes(linkStatus?.phase)
+      ? linkStatus.phase
+      : 'unavailable'
     let status
     if (!this.desiredEnabled) status = 'Companion is off. No local-network listener is running.'
+    else if (connected > 0) status = `${connected} paired ${connected === 1 ? 'device is' : 'devices are'} connected.`
+    else if (this.startFailed && linkAvailable) status = 'Kaisola Link and the local listener are reconnecting.'
+    else if (linkReady) status = 'Ready nearby over LAN or away through Kaisola Link.'
+    else if (tailscaleAvailable) status = 'Ready nearby over LAN or away through Tailscale.'
+    else if (linkPhase === 'auth-required') status = 'Listening nearby. Sign in to use Kaisola Link away from this network.'
     else if (this.startFailed) status = 'Companion is reconnecting to the local network.'
     else if (!listening) status = 'Companion is starting on the local network.'
-    else if (connected === 0 && tailscaleAvailable) status = 'Ready nearby over LAN or away through Tailscale.'
-    else if (connected === 0) status = 'Listening for paired devices on your local network.'
-    else status = `${connected} paired ${connected === 1 ? 'device is' : 'devices are'} connected.`
+    else if (linkAvailable) status = 'Listening nearby; Kaisola Link is reconnecting automatically.'
+    else status = 'Listening for paired devices on your local network.'
     return {
       enabled: this.desiredEnabled,
       listening,
-      remote: { kind: 'tailscale', available: tailscaleAvailable },
+      remote: this.linkClient ? {
+        kind: 'kaisola-link',
+        available: linkAvailable || tailscaleAvailable,
+        linkAvailable,
+        connected: linkReady,
+        phase: linkPhase,
+        tailscaleAvailable,
+      } : { kind: 'tailscale', available: tailscaleAvailable },
       status,
       devices,
     }
@@ -224,6 +259,7 @@ class CompanionHandler {
         await this.#startListening()
       } else {
         this.#cancelRetry()
+        this.linkClient?.disable?.()
         this.enabled = false
         this.startFailed = false
         try { await this.transport.disable() } catch {
@@ -262,6 +298,7 @@ class CompanionHandler {
   async refresh() {
     return this.#enqueueTransition(async () => {
       if (this.disposed || !this.desiredEnabled) return this.getState()
+      this.linkClient?.refresh?.()
       if (this.getState().listening && typeof this.transport.refresh === 'function') {
         try {
           await this.transport.refresh()
@@ -387,9 +424,11 @@ class CompanionHandler {
       this.pairingManager.cancelPairing?.(pairingId)
     }
     this.activePairings.clear()
+    try { this.linkClient?.disable?.() } catch { /* link teardown is best-effort */ }
     try { await this.transport.disable() } catch { /* gateway disposal remains authoritative */ }
     for (const [eventName, listener] of this.storeListeners) this.deviceStore.off?.(eventName, listener)
     for (const [eventName, listener] of Object.entries(this.transportListeners)) this.transport.off?.(eventName, listener)
+    this.linkClient?.off?.('state', this.linkStateListener)
     if (this.ipcMain?.removeHandler) for (const channel of HANDLER_CHANNELS) this.ipcMain.removeHandler(channel)
     await this.gateway.dispose?.()
     return true
@@ -404,6 +443,7 @@ class CompanionHandler {
   async #startListening() {
     if (this.disposed || !this.desiredEnabled) return false
     this.#cancelRetry()
+    this.linkClient?.enable?.()
     try {
       await this.transport.enable()
       this.enabled = this.transport.status()?.enabled === true

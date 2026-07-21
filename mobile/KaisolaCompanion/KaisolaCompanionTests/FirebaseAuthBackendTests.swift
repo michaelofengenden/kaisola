@@ -8,7 +8,8 @@ final class FirebaseAuthBackendTests: XCTestCase {
         {
           "projectId": "kaisola-a9ab7",
           "apiKey": "AIzaSyAiqyY5bzsa7j5E1rP-iKYXaQFH8iFUJwY",
-          "serverUrl": "https://us-central1-kaisola-a9ab7.cloudfunctions.net/session"
+          "serverUrl": "https://us-central1-kaisola-a9ab7.cloudfunctions.net/session",
+          "relayUrl": "https://kaisola-link.example.workers.dev"
         }
         """#.utf8)
 
@@ -20,6 +21,7 @@ final class FirebaseAuthBackendTests: XCTestCase {
             configuration.serverURL,
             URL(string: "https://us-central1-kaisola-a9ab7.cloudfunctions.net/session")
         )
+        XCTAssertEqual(configuration.relayURL, URL(string: "https://kaisola-link.example.workers.dev"))
     }
 
     func testConfigurationRejectsNonHTTPSVerificationServer() {
@@ -28,6 +30,19 @@ final class FirebaseAuthBackendTests: XCTestCase {
           "projectId": "kaisola-a9ab7",
           "apiKey": "AIzaSyAiqyY5bzsa7j5E1rP-iKYXaQFH8iFUJwY",
           "serverUrl": "http://localhost/session"
+        }
+        """#.utf8)
+
+        XCTAssertThrowsError(try FirebaseAuthConfiguration.parse(data))
+    }
+
+    func testConfigurationRejectsNonHTTPSRelay() {
+        let data = Data(#"""
+        {
+          "projectId": "kaisola-a9ab7",
+          "apiKey": "AIzaSyAiqyY5bzsa7j5E1rP-iKYXaQFH8iFUJwY",
+          "serverUrl": "https://us-central1-kaisola-a9ab7.cloudfunctions.net/session",
+          "relayUrl": "http://link.example"
         }
         """#.utf8)
 

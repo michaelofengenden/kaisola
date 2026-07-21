@@ -11,6 +11,13 @@ test('server accepts one bounded Bearer token and rejects malformed headers', ()
   assert.equal(__test.bearerToken(`Bearer ${'x'.repeat(20_001)}`), null)
 })
 
+test('relay ticket verification is explicitly marked so reconnects avoid profile writes', () => {
+  const request = (value) => ({ get: (name) => name === 'x-kaisola-purpose' ? value : undefined })
+  assert.equal(__test.isRelayTicketVerification(request('relay-ticket')), true)
+  assert.equal(__test.isRelayTicketVerification(request('other')), false)
+  assert.equal(__test.isRelayTicketVerification(request(undefined)), false)
+})
+
 test('account rendezvous accepts only short-lived direct-LAN pairing offers', () => {
   const now = 1_784_250_000_000
   const offer = {

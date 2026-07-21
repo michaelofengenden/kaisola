@@ -33,6 +33,7 @@ const relSeen = (at?: number): string => {
 export function CompanionSettings() {
   const [state, setState] = useState<CompanionState | null>(null)
   const [busy, setBusy] = useState(false)
+  const [retrying, setRetrying] = useState(false)
   const [pairing, setPairing] = useState<(CompanionPairingStart & { event?: CompanionPairingEvent }) | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [renaming, setRenaming] = useState<{ id: string; value: string } | null>(null)
@@ -75,6 +76,13 @@ export function CompanionSettings() {
     } catch (e) {
       setError(e instanceof Error ? e.message : 'Could not start pairing.')
     }
+  }
+
+  const retryConnection = async () => {
+    setRetrying(true); setError(null)
+    try { setState(await bridge.companion.refresh()) }
+    catch (e) { setError(e instanceof Error ? e.message : 'Could not retry Companion routes.') }
+    finally { setRetrying(false) }
   }
   const cancelPairing = () => {
     if (pairing) void bridge.companion.cancelPairing(pairing.pairingId).catch(() => {})
@@ -123,6 +131,20 @@ export function CompanionSettings() {
 
   const devices = state.devices
   const phase = pairing?.event?.phase
+  const linkAvailable = state.remote?.kind === 'kaisola-link' && state.remote.linkAvailable === true
+  const linkConnected = state.remote?.kind === 'kaisola-link' && state.remote.connected === true
+  const tailscaleAvailable = state.remote?.kind === 'kaisola-link'
+    ? state.remote.tailscaleAvailable === true
+    : state.remote?.available === true
+  const awayLabel = linkConnected
+    ? 'Kaisola Link ready'
+    : linkAvailable && state.remote?.phase === 'auth-required'
+      ? 'Sign in to restore Link'
+      : linkAvailable
+        ? 'Kaisola Link automatic'
+        : tailscaleAvailable
+          ? 'Tailscale ready'
+          : 'Nearby only'
 
   return (
     <>
@@ -152,8 +174,23 @@ export function CompanionSettings() {
         <div className="settings-row companion-remote-row">
           <span className="settings-row-label">Away from this network</span>
           <div className="settings-row-control">
-            {state.remote?.available ? (
-              <span className="companion-route-ready"><span aria-hidden /> Tailscale ready</span>
+            <span className="companion-route-ready" data-ready={linkConnected || tailscaleAvailable || undefined}>
+              <span aria-hidden /> {awayLabel}
+            </span>
+            {linkAvailable && !linkConnected && state.remote?.phase !== 'auth-required' && (
+              <button type="button" className="btn btn-sm" disabled={retrying} onClick={() => void retryConnection()}>
+                {retrying ? 'Trying…' : 'Retry'}
+              </button>
+            )}
+          </div>
+        </div>
+      )}
+      {state.enabled && (
+        <div className="settings-row companion-remote-row">
+          <span className="settings-row-label">Optional private route</span>
+          <div className="settings-row-control">
+            {tailscaleAvailable ? (
+              <span className="companion-route-ready" data-ready><span aria-hidden /> Tailscale ready</span>
             ) : (
               <button type="button" className="btn btn-sm" onClick={() => void bridge.openExternal('https://tailscale.com/download/mac')}>
                 Add Tailscale
@@ -162,8 +199,8 @@ export function CompanionSettings() {
           </div>
         </div>
       )}
-      {state.enabled && !state.remote?.available && (
-        <p className="settings-note">Optional and free for personal use. Install Tailscale on this Mac and your iPhone, then open Kaisola once nearby so the phone learns its private route.</p>
+      {state.enabled && !linkAvailable && (
+        <p className="settings-note">Kaisola Link becomes automatic when this build is configured and you are signed in. Tailscale—or a Headscale server through the Tailscale app—can be used as a private route.</p>
       )}
 
       {error && <p className="settings-note companion-error" role="alert">{error}</p>}
@@ -264,7 +301,7 @@ export function CompanionSettings() {
             ) : (
               <>
                 <h3 className="companion-pair-title">Pair with Kaisola Companion</h3>
-                <p className="settings-note">Scan this code, or tap “Find my Mac” on an iPhone signed in to the same account. It expires shortly{state.remote?.available ? ' and includes your private Tailscale route' : ''}.</p>
+                <p className="settings-note">Scan this code, or tap “Find my Mac” on an iPhone signed in to the same account. It expires shortly{linkAvailable ? '; Kaisola Link can complete pairing away from this network' : tailscaleAvailable ? ' and includes your private Tailscale route' : ''}.</p>
                 <QrCode text={pairing.qrPayload} />
                 <div className="companion-pair-actions">
                   <button type="button" className="btn" onClick={copyPairingCode}>

@@ -6,7 +6,7 @@ the exact agent and terminal sessions running in Kaisola on the Mac.
 **Design:** `docs/superpowers/specs/2026-07-17-mobile-companion-design.md`
 
 **Sequence:** protocol spine → same-network read-only iPhone alpha → guarded
-control → LAN-first/Tailscale remote access and push → release hardening. Do not start with a broad
+control → LAN-first multipath remote access and push → release hardening. Do not start with a broad
 mobile UI clone or expose an existing local port.
 
 ## Global invariants
@@ -337,7 +337,7 @@ desktop typing, cross-project denial, and output order.
 permissioned; a real terminal can be controlled; every race has a deterministic
 receipt and no duplicated command.
 
-## Phase 3 — private remote access and APNs
+## Phase 3 — automatic remote access and APNs
 
 ### Task 15: Stable LAN-first listener and signed private route — implemented
 
@@ -355,23 +355,40 @@ listener port.
 tailnet interface; signed hint validation; existing-pair hello refresh; no raw
 private address in renderer state.
 
-### Task 16: iOS LAN-first/Tailscale route election — implemented
+### Task 16: iOS LAN-first multipath route election — implemented
 
 Use the same `NWConnection` framing and Noise channel on both endpoints. Keep
 Bonjour active, prefer the paired Mac on the LAN, fall back to the signed
 Tailscale endpoint after a bounded failure or immediately on cellular, remember
 that route through reconnects, and prefer Bonjour again once the Mac is visible.
 
-No Cloud Run service, public listener, router forwarding, provider credential,
-or new Kaisola cloud bill is part of this path. Remote reachability requires
-both devices in the permitted tailnet and the Mac awake with Tailscale active,
-Kaisola open, and Companion enabled.
+Kaisola Link is the automatic third path when LAN and the optional private route
+are unavailable. The phone and Mac authenticate separately with the existing
+Firebase session, exchange one-use tickets, then run the unchanged framed Noise
+channel through an opaque WebSocket multiplexer. No router forwarding or public
+Mac listener is involved. Remote reachability requires the Mac awake and online
+with Kaisola open and Companion enabled.
 
-**Verify:** direct endpoint and tailnet endpoint fixtures; Wi-Fi/cellular path
+**Verify:** direct, tailnet, and Link endpoint fixtures; Wi-Fi/cellular path
 changes; stale office address; app kill/foreground; Mac sleep/wake; Tailscale
-direct and DERP connection types; revoke while remote; bounded replay continuity.
+direct and DERP connection types; relay reconnect/replacement; revoke while
+remote; bounded replay continuity.
 
-### Task 17: APNs attention hints — pending
+### Task 17: Kaisola Link blind relay — implemented
+
+Deploy one hibernating Durable Object per pseudonymous account key. Verify each
+ticket request with the existing Firebase session service, issue random one-use
+60-second tickets, and cap tickets, peers, message size, and buffered bytes. The
+relay sees routing metadata and ciphertext sizes/timing only; it never receives
+Noise keys, terminates the companion protocol, stores transcripts, or retries
+commands. Desktop and iPhone reconnect clients retain the same grants, replay
+cursors, command receipts, and terminal leases used on direct TCP.
+
+**Verify:** ticket replay rejection; cross-account isolation; role and identifier
+validation; binary framing and slow-consumer bounds; desktop replacement; relay
+restart; encrypted end-to-end session through a deployed room.
+
+### Task 18: APNs attention hints — pending
 
 Add APNs registration, privacy-safe notification categories, and deep links to
 current session state. Push is a wake-up/attention hint only: it carries no
@@ -402,7 +419,7 @@ the recorded budget.
 ### Task 19: Performance, accessibility, and product polish
 
 Measure—not infer—local/remote latency, reconnect loss, desktop idle CPU/memory,
-phone energy, cache sizes, and direct/tailnet bandwidth. Add support diagnostics that are
+phone energy, cache sizes, and direct/tailnet/Link bandwidth. Add support diagnostics that are
 useful without exposing secrets.
 
 Complete one-handed ergonomics, Dynamic Type, VoiceOver, Reduce Motion, color
@@ -414,7 +431,7 @@ offline/stale language.
 1. Internal signed iPhone build and local alpha.
 2. TestFlight read-only alpha.
 3. TestFlight guarded-control alpha for explicitly granted devices.
-4. Tailscale remote-access beta, followed by privacy-safe push.
+4. Multipath remote-access beta, followed by privacy-safe push.
 5. App Store/privacy disclosures and desktop release only after compatibility
    gates are automated.
 

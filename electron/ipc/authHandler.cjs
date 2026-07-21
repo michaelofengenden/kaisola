@@ -81,10 +81,12 @@ function readPublicConfig() {
     fileConfig.serverUrl ||
     (projectId ? `https://us-central1-${projectId}.cloudfunctions.net/session` : ''),
   ).trim()
+  const relayUrl = String(process.env.KAISOLA_LINK_URL || fileConfig.relayUrl || '').trim()
   return {
     projectId: /^[a-z0-9][a-z0-9-]{4,60}$/.test(projectId) ? projectId : null,
     apiKey: /^[a-zA-Z0-9_-]{20,200}$/.test(apiKey) ? apiKey : null,
     serverUrl: /^https:\/\//.test(serverUrl) ? serverUrl : null,
+    relayUrl: /^https:\/\//.test(relayUrl) ? relayUrl : null,
   }
 }
 

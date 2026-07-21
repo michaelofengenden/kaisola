@@ -593,6 +593,7 @@ const bridge = {
     },
     getState: () => ipcRenderer.invoke('companion:getState'),
     setEnabled: (enabled) => ipcRenderer.invoke('companion:setEnabled', { enabled }),
+    refresh: () => ipcRenderer.invoke('companion:refresh'),
     startPairing: (opts) => ipcRenderer.invoke('companion:startPairing', opts),
     confirmPairing: (pairingId) => ipcRenderer.invoke('companion:confirmPairing', { pairingId }),
     cancelPairing: (pairingId) => ipcRenderer.invoke('companion:cancelPairing', { pairingId }),

@@ -380,7 +380,7 @@ class BonjourCompanionTransport extends EventEmitter {
 
   async enable() {
     if (this.enabled) return this.status()
-    const server = this.serverFactory((socket) => this.#accept(socket))
+    const server = this.serverFactory((socket) => this.acceptSocket(socket))
     this.server = server
     const listen = (port) => new Promise((resolve, reject) => {
       const onError = (error) => { server.off('listening', onListening); reject(error) }
@@ -438,7 +438,12 @@ class BonjourCompanionTransport extends EventEmitter {
     return this.status()
   }
 
-  #accept(socket) {
+  /** Accept a byte-stream socket from TCP or an authenticated outer relay.
+   * The companion Noise handshake remains the only authority either way. */
+  acceptSocket(socket) {
+    if (!socket?.on || typeof socket.write !== 'function' || typeof socket.destroy !== 'function') {
+      throw new Error('companion socket is invalid')
+    }
     if (!this.enabled && !this.server) { socket.destroy(); return }
     if (this.unauthenticatedClients >= this.maxUnauthenticatedClients) { socket.destroy(); return }
     this.unauthenticatedClients++

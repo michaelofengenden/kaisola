@@ -2,11 +2,11 @@
 
 **Date:** 2026-07-17
 
-**Status:** signed pairing, guarded control, native terminal viewing, LAN
-transport, and LAN-first/Tailscale fallback are implemented. Revised
-2026-07-20 to replace the proposed Cloud Run relay with a private tailnet route:
-the Mac stays authoritative, Bonjour remains first, and the existing Noise
-channel authenticates and encrypts the direct TCP stream on either path.
+**Status:** signed pairing, guarded control, native terminal viewing, and
+LAN-first multipath transport are implemented. Revised 2026-07-20 to add
+Kaisola Link as an automatic away-network fallback after Bonjour/LAN and an
+optional Tailscale or Headscale private route. The Mac stays authoritative and
+the existing Noise channel authenticates and encrypts the stream on every path.
 
 **Working assumption:** iPhone first; the wire protocol remains platform-neutral
 
@@ -164,12 +164,12 @@ tools. The companion surface gets its own smaller protocol and threat model.
 └───────────────────────┬────────────────────────────────┘
                         │ companion protocol
                  E2EE frames + receipts
-              ┌─────────┴──────────┐
-              │                    │
-       direct LAN transport   private tailnet fallback
-       Bonjour + NWConnection  Tailscale IP + NWConnection
-              │                    │
-              └─────────┬──────────┘
+       ┌──────────────┬───────────────┬────────────────┐
+       │              │               │
+  direct LAN     private route   Kaisola Link relay
+  Bonjour/TCP    Tailscale/TCP   opaque WebSockets
+       │              │               │
+       └──────────────┴───────┬───────┴────────────────┘
                         │
 ┌───────────────────────┴────── Mac ─────────────────────┐
 │ Companion Gateway (Electron main)                      │
@@ -373,11 +373,11 @@ and the user retypes.
   the LAN service falls back to an ephemeral port and disables the off-network
   hint for that run rather than advertising an unreachable route.
 
-### Remote mode — optional Tailscale fallback
+### Remote mode — private route, then Kaisola Link
 
-- Tailscale runs on the Mac and iPhone under the user's own tailnet. Kaisola
-  does not deploy, meter, or administer a Cloud Run relay and does not open a
-  router port.
+- Tailscale is optional. It can run against Tailscale's control plane or a
+  user-managed Headscale server; Kaisola does not open a router port or manage
+  either VPN.
 - The desktop detects its Tailscale interface and includes its private address
   only in the signed pairing offer and authenticated encrypted hello. Existing
   pairs securely refresh this route the next time they connect locally, so an
@@ -391,9 +391,18 @@ and the user retypes.
   leases, and desktop-side revocation. Tailscale's WireGuard tunnel is an
   additional private network layer, not a replacement for Kaisola's device
   authentication or application encryption.
-- Remote access requires the Mac to remain awake and online with Tailscale
-  connected, Kaisola open, and Companion enabled. A sleeping Mac is honestly
-  shown as unreachable; Wake-on-LAN is not implied.
+- When neither direct route is reachable, both signed-in apps request separate
+  one-use 60-second tickets from Kaisola Link. A hibernating account-scoped
+  Durable Object multiplexes bounded binary messages between the selected Mac
+  and phone. It never terminates Noise, parses the companion protocol, or
+  persists transcript bytes. Firebase ID tokens authorize only ticket issuance
+  and are never placed in WebSocket URLs.
+- Route election is LAN/Bonjour first, optional tailnet second, and Kaisola Link
+  third. A healthy path is sticky; path changes and foreground recovery trigger
+  bounded reconnect and the same cursor/snapshot reconciliation.
+- Remote access requires the Mac to remain awake and online with Kaisola open
+  and Companion enabled. A sleeping Mac is honestly shown as unreachable;
+  Wake-on-LAN is not implied.
 
 ### Background
 
@@ -431,9 +440,9 @@ so reconnect always performs state reconciliation.
    bound metadata.
 5. Directional monotonic counters reject replays and nonce reuse. New connection
    ids derive new keys and reset counters safely.
-6. Remote access requires the already paired, unrevoked device keys and grants,
-   plus network reachability through the user's tailnet. A Firebase account or
-   membership in the tailnet alone cannot pair or control a Mac.
+6. Remote access requires the already paired, unrevoked device keys and grants.
+   A Firebase account, relay ticket, or tailnet membership alone cannot pair or
+   control a Mac.
 
 The handshake is a reviewed Noise pattern (Noise `XX` with QR-pinned static
 keys is the working choice; the final pattern is fixed at Task 8 with published
@@ -442,10 +451,10 @@ confirmation, SAS derivation entropy, nonce/AAD construction, clock skew,
 simultaneous-pairing, and re-pair behavior) — not a bespoke construction. It is
 security-reviewed before any control capability ships.
 
-Tailscale's coordination service and any DERP fallback can observe connectivity
-metadata such as timing and approximate encrypted traffic volume, but Kaisola's
-Noise plaintext and session keys never leave the paired endpoints. The privacy
-copy should say this plainly.
+Tailscale/Headscale infrastructure and Kaisola Link can observe connectivity
+metadata such as account-scoped routing, timing, and approximate encrypted
+traffic volume. Kaisola's Noise plaintext and session keys never leave the
+paired endpoints. The privacy copy should say this plainly.
 
 ## Threat model and required controls
 
@@ -454,6 +463,7 @@ copy should say this plainly.
 | Lost/unlocked phone | Face ID on re-entry, Keychain keys, per-device revoke, short inactivity lock |
 | Malicious LAN peer | Single-use pairing, mutual key proof, E2EE, replay counters, no trust-by-IP |
 | Compromised tailnet peer or routed path | Per-device Noise authentication, end-to-end encryption, grants, and immediate Mac-side revoke |
+| Compromised Kaisola Link relay | Opaque bounded frames only, Noise E2EE, one-use tickets, pseudonymous account rooms, no transcript persistence |
 | Cross-project action | Immutable project capability on every command and service lookup |
 | Replayed approval/input | Command idempotency + encrypted sequence + current permission revision |
 | Phone steals desktop PTY | Non-owning observer plus explicit expiring control lease |
@@ -462,7 +472,7 @@ copy should say this plainly.
 | Unbounded output/slow phone | Byte cursors, bounded queues, gap-to-snapshot backpressure |
 | Desktop/phone version skew | Independent protocol version and fail-closed capability negotiation |
 
-Device revocation closes live tailnet/direct connections, invalidates future
+Device revocation closes live relay/tailnet/direct connections, invalidates future
 commands, and removes the device public key. It does not delete project data,
 and it cannot reach into an offline phone: content already cached there — which
 may itself contain secrets that appeared in terminal output, prompts, or diffs;
@@ -543,7 +553,9 @@ slice, not in Slice E.
 ### Slice D — remote-anywhere and push
 
 - Signed LAN-first/Tailscale route hints on the stable desktop listener.
-- Path-aware direct/tailnet election and bounded reconnect/resume.
+- Account-authorized, one-use Kaisola Link tickets and a blind hibernating
+  WebSocket multiplexer that reuses the exact Noise stream.
+- Path-aware direct/tailnet/Link election and bounded reconnect/resume.
 - Optional APNs completion/needs-you notifications in a later pass.
 - Network-switch and desktop-restart chaos tests.
 
@@ -590,6 +602,8 @@ The feature is not done because a phone displayed a terminal. It is done when:
   [iOS install](https://tailscale.com/docs/install/ios), and
   [pricing](https://tailscale.com/pricing). The transport remains correct whether
   Tailscale establishes a direct WireGuard path or uses an encrypted DERP relay.
+- Cloudflare Durable Objects: [hibernation WebSocket API](https://developers.cloudflare.com/durable-objects/best-practices/websockets/)
+  and [limits/pricing](https://developers.cloudflare.com/durable-objects/platform/pricing/).
 - Firebase: [Google sign-in on Apple platforms](https://firebase.google.com/docs/auth/ios/google-signin).
 - Node: [`node:crypto`](https://nodejs.org/api/crypto.html) support for X25519
   and ChaCha20-Poly1305.

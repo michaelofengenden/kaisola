@@ -29,6 +29,9 @@ jobs:
           # This must be a rotated client key restricted to Identity Toolkit
           # and Token Service. Never reuse a Gemini/Generative Language key.
           KAISOLA_FIREBASE_API_KEY: ${{ secrets.KAISOLA_FIREBASE_API_KEY }}
+          # Public endpoint only; authentication remains a short-lived Firebase
+          # token exchanged for a one-use relay ticket.
+          KAISOLA_LINK_URL: https://kaisola-link.michaelofengend.workers.dev
       - name: Require release signing and notarization credentials
         env:
           CSC_LINK: ${{ secrets.CSC_LINK }}

@@ -1939,6 +1939,10 @@ if (hasSingleInstanceLock) app.whenReady().then(async () => {
       tokenProvider: currentFirebaseIdToken,
       configProvider: readPublicConfig,
     }),
+    linkOptions: {
+      tokenProvider: currentFirebaseIdToken,
+      configProvider: readPublicConfig,
+    },
     setBackgroundLaunchEnabled: (enabled) => {
       // A paired phone should find its Mac after a login/restart even before a
       // Kaisola window is opened. Development never mutates the user's login

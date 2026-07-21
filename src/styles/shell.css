@@ -3078,8 +3078,9 @@ body[data-shell-drag='1'] object {
   width: 7px;
   height: 7px;
   border-radius: var(--r-full);
-  background: #7c9a5f;
+  background: var(--text-3);
 }
+.companion-route-ready[data-ready] > span { background: #7c9a5f; }
 .companion-devices { display: flex; flex-direction: column; gap: var(--sp-2); margin: var(--sp-2) 0; }
 .companion-device {
   display: flex;

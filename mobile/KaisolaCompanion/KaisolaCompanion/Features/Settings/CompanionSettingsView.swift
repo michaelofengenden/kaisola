@@ -46,7 +46,12 @@ struct CompanionSettingsView: View {
         }
         .navigationTitle("Settings")
         .confirmationDialog("Sign out of Kaisola?", isPresented: $confirmSignOut, titleVisibility: .visible) {
-            Button("Sign out", role: .destructive) { Task { await auth.signOut() } }
+            Button("Sign out", role: .destructive) {
+                Task {
+                    await coordinator.suspend()
+                    await auth.signOut()
+                }
+            }
             Button("Cancel", role: .cancel) {}
         } message: {
             Text("This clears your account and cached sessions from this phone.")
@@ -62,6 +67,8 @@ struct CompanionSettingsView: View {
                 name: macName,
                 connected: store.connection == .live,
                 connectionTitle: store.connection.title,
+                route: coordinator.activeRoute,
+                onReconnect: { Task { await coordinator.reconnect() } },
                 onUnpair: { confirmUnpair = true }
             )
         }
@@ -103,9 +110,12 @@ struct CompanionSettingsView: View {
                 SettingsRow(icon: "laptopcomputer", label: macName, action: { showMacDetails = true }) {
                     HStack(spacing: 6) {
                         Circle().fill(connected ? KaisolaTheme.done : Color.secondary).frame(width: 7, height: 7)
-                        Text(connected ? "Connected" : store.connection.title)
+                        Text(connected ? coordinator.activeRoute.title : store.connection.title)
                             .font(.caption).foregroundStyle(.secondary)
                     }
+                }
+                SettingsRow(icon: "link", label: "Kaisola Link", action: { showMacDetails = true }) {
+                    Text("Automatic").font(.caption).foregroundStyle(.secondary)
                 }
                 SettingsRow(icon: "eye", label: "Access", action: { showAccessDetails = true }) {
                     Text(accessLabel).font(.caption).foregroundStyle(.secondary)
@@ -198,6 +208,8 @@ private struct CompanionMacDetailView: View {
     let name: String
     let connected: Bool
     let connectionTitle: String
+    let route: CompanionTransportRoute
+    let onReconnect: () -> Void
     let onUnpair: () -> Void
     @Environment(\.colorScheme) private var colorScheme
 
@@ -211,19 +223,25 @@ private struct CompanionMacDetailView: View {
                     .frame(width: 70, height: 70)
                     .background(KaisolaTheme.panel(for: colorScheme), in: RoundedRectangle(cornerRadius: 20, style: .continuous))
                 Text(name).font(.title3.weight(.semibold))
-                Label(connected ? "Connected" : connectionTitle, systemImage: connected ? "checkmark.circle.fill" : "wifi.slash")
+                Label(connected ? route.title : connectionTitle, systemImage: connected ? "checkmark.circle.fill" : "wifi.slash")
                     .font(.subheadline)
                     .foregroundStyle(connected ? KaisolaTheme.done : .secondary)
-                Text("Your Mac remains authoritative for every session. The phone reconnects through its paired cryptographic identity; no terminal is moved or duplicated.")
+                Text("Kaisola chooses nearby Wi-Fi first, then your private route, then encrypted Kaisola Link. Your Mac remains authoritative for every session.")
                     .font(.footnote)
                     .foregroundStyle(.secondary)
                     .multilineTextAlignment(.center)
                     .padding(.horizontal, 22)
-                Link(destination: URL(string: "https://apps.apple.com/app/tailscale/id1470499037")!) {
-                    Label("Add free remote access", systemImage: "network.badge.shield.half.filled")
+                Button(action: onReconnect) {
+                    Label("Reconnect now", systemImage: "arrow.clockwise")
                         .font(.subheadline.weight(.semibold))
                 }
-                Text("Install Tailscale on this iPhone and your Mac, sign into the same personal account, and Kaisola will keep using LAN first.")
+                Link(destination: URL(string: "https://apps.apple.com/app/tailscale/id1470499037")!) {
+                    Label("Install Tailscale", systemImage: "network.badge.shield.half.filled")
+                        .font(.subheadline.weight(.semibold))
+                }
+                Link("Use a Headscale server", destination: URL(string: "https://tailscale.com/docs/how-to/set-up-custom-control-server")!)
+                    .font(.caption.weight(.medium))
+                Text("Both are optional. Once the Tailscale app is connected on this iPhone and Mac, Kaisola detects the private route automatically.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .multilineTextAlignment(.center)

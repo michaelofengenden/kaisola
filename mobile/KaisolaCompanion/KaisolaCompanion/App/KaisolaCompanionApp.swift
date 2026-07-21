@@ -20,13 +20,14 @@ struct KaisolaCompanionApp: App {
                 .environmentObject(coordinator)
                 .tint(KaisolaTheme.accent)
                 .task {
-                    let reconnect = Task { @MainActor in
-                        guard !Self.usePreviewStore else { return }
-                        await coordinator.connectIfPaired()
-                    }
                     await auth.restore()
                     guard !Self.usePreviewStore else { return }
-                    await reconnect.value
+                    let relayURL = (try? FirebaseAuthConfiguration.load())?.relayURL
+                    coordinator.configureKaisolaLink(
+                        baseURL: relayURL,
+                        tokenProvider: { try await auth.freshIDToken() }
+                    )
+                    await coordinator.connectIfPaired()
                     await Self.autoPairIfRequested(coordinator)
                 }
                 .onChange(of: scenePhase) { _, phase in

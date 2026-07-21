@@ -1,5 +1,6 @@
 {
   "projectId": "kaisola-a9ab7",
   "apiKey": "AIzaSyAiqyY5bzsa7j5E1rP-iKYXaQFH8iFUJwY",
-  "serverUrl": "https://us-central1-kaisola-a9ab7.cloudfunctions.net/session"
+  "serverUrl": "https://us-central1-kaisola-a9ab7.cloudfunctions.net/session",
+  "relayUrl": "https://kaisola-link.michaelofengend.workers.dev"
 }

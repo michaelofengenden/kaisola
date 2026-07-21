@@ -10,6 +10,7 @@ const serverUrl = String(
   process.env.KAISOLA_AUTH_SERVER_URL ||
     `https://us-central1-${projectId}.cloudfunctions.net/session`,
 ).trim()
+const relayUrl = String(process.env.KAISOLA_LINK_URL || '').trim()
 
 if (!/^[a-z0-9][a-z0-9-]{4,60}$/.test(projectId)) {
   throw new Error('KAISOLA_FIREBASE_PROJECT_ID is missing or invalid.')
@@ -20,10 +21,13 @@ if (!/^[a-zA-Z0-9_-]{20,200}$/.test(apiKey)) {
 if (!/^https:\/\//.test(serverUrl)) {
   throw new Error('KAISOLA_AUTH_SERVER_URL must be an HTTPS URL.')
 }
+if (relayUrl && !/^https:\/\//.test(relayUrl)) {
+  throw new Error('KAISOLA_LINK_URL must be an HTTPS URL.')
+}
 
 fs.writeFileSync(
   output,
-  `${JSON.stringify({ projectId, apiKey, serverUrl }, null, 2)}\n`,
+  `${JSON.stringify({ projectId, apiKey, serverUrl, ...(relayUrl ? { relayUrl } : {}) }, null, 2)}\n`,
   { mode: 0o600 },
 )
 console.log('Generated Firebase desktop config for packaging.')

@@ -52,6 +52,7 @@ final class CompanionConnectionCoordinator: ObservableObject {
     @Published private(set) var accountLookupInProgress = false
     @Published private(set) var controlledTerminalIds: Set<String> = []
     @Published private(set) var terminalStreamIssues: [String: String] = [:]
+    @Published private(set) var activeRoute: CompanionTransportRoute = .none
     /// Drives presentation of the pairing sheet from anywhere in the app.
     @Published var wantsPairing = false
 
@@ -84,6 +85,13 @@ final class CompanionConnectionCoordinator: ObservableObject {
 
     var isPaired: Bool { pairedDesktop != nil }
 
+    func configureKaisolaLink(
+        baseURL: URL?,
+        tokenProvider: KaisolaLinkConnection.TokenProvider?
+    ) {
+        client.transport.configureKaisolaLink(baseURL: baseURL, tokenProvider: tokenProvider)
+    }
+
     init(
         client: CompanionClient = CompanionClient(transport: CompanionTransport(autoConnect: true)),
         keychain: CompanionIdentityKeychain = CompanionIdentityKeychain(),
@@ -115,7 +123,7 @@ final class CompanionConnectionCoordinator: ObservableObject {
         accountLookupID = nil
         accountLookupInProgress = false
         do {
-            _ = try await resolveIdentity()
+            let identity = try await resolveIdentity()
             self.pendingPayload = payload
             connectionWanted = true
             lifecycleIntentVersion &+= 1
@@ -125,6 +133,7 @@ final class CompanionConnectionCoordinator: ObservableObject {
             client.transport.startDiscovery(
                 preferred: payload.transportHint,
                 desktopId: payload.desktopId,
+                deviceId: identity.id,
                 force: true
             )
         } catch {
@@ -247,6 +256,7 @@ final class CompanionConnectionCoordinator: ObservableObject {
             client.transport.startDiscovery(
                 preferred: desktop.transportHint,
                 desktopId: desktop.desktopId,
+                deviceId: identity.id,
                 force: force
             )
         } catch {
@@ -535,6 +545,10 @@ final class CompanionConnectionCoordinator: ObservableObject {
             .receive(on: RunLoop.main)
             .sink { [weak self] state in self?.handleTransportState(state) }
             .store(in: &cancellables)
+        client.transport.$route
+            .receive(on: RunLoop.main)
+            .sink { [weak self] route in self?.activeRoute = route }
+            .store(in: &cancellables)
         client.$sas
             .compactMap { $0 }
             .receive(on: RunLoop.main)
@@ -727,7 +741,7 @@ final class CompanionConnectionCoordinator: ObservableObject {
             self.activePairingNonce = nil
             self.client.transport.stop()
             self.pairingPhase = .failed(
-                "Couldn't reach this Mac. Keep Companion on and put both devices on the same Wi-Fi, then try again."
+                "Couldn't reach this Mac. Keep Kaisola Companion on and make sure the Mac is online, then try again."
             )
         }
     }

@@ -18,6 +18,22 @@ enum CompanionTransportState: String, Codable, Hashable, Sendable {
     }
 }
 
+enum CompanionTransportRoute: String, Codable, Hashable, Sendable {
+    case none
+    case lan
+    case tailscale
+    case kaisolaLink
+
+    var title: String {
+        switch self {
+        case .none: "Automatic"
+        case .lan: "Nearby"
+        case .tailscale: "Private"
+        case .kaisolaLink: "Kaisola Link"
+        }
+    }
+}
+
 struct CompanionDiscoveredDesktop: Identifiable, Hashable, @unchecked Sendable {
     let endpoint: NWEndpoint
     let name: String
@@ -29,6 +45,7 @@ struct CompanionDiscoveredDesktop: Identifiable, Hashable, @unchecked Sendable {
 final class CompanionTransport: ObservableObject {
     @Published private(set) var state: CompanionTransportState = .idle
     @Published private(set) var discoveredDesktops: [CompanionDiscoveredDesktop] = []
+    @Published private(set) var route: CompanionTransportRoute = .none
 
     var onWireFrame: ((Data) throws -> Void)?
     var onStateChange: ((CompanionTransportState) -> Void)?
@@ -39,6 +56,7 @@ final class CompanionTransport: ObservableObject {
     private var pathMonitor: NWPathMonitor?
     private var lastPathSignature: String?
     private var connection: NWConnection?
+    private let linkConnection = KaisolaLinkConnection()
     private var decoder = CompanionLengthFrameDecoder()
     private var selectedEndpoint: NWEndpoint?
     private var connectionEndpoint: NWEndpoint?
@@ -51,27 +69,48 @@ final class CompanionTransport: ObservableObject {
     private var preferredEndpoint: NWEndpoint?
     private var tailscaleEndpoint: NWEndpoint?
     private var targetDesktopId: String?
+    private var targetDeviceId: String?
     private var preferTailscale = false
+    private var preferLink = false
+    private var linkBaseURL: URL?
+    private var linkTokenProvider: KaisolaLinkConnection.TokenProvider?
 
     init(autoConnect: Bool = true) {
         self.autoConnect = autoConnect
+        linkConnection.onEvent = { [weak self] event in
+            self?.handleLinkEvent(event)
+        }
+    }
+
+    func configureKaisolaLink(
+        baseURL: URL?,
+        tokenProvider: KaisolaLinkConnection.TokenProvider?
+    ) {
+        linkBaseURL = baseURL.flatMap { KaisolaLinkConnection.ticketURL(baseURL: $0) == nil ? nil : $0 }
+        linkTokenProvider = tokenProvider
+        if !intentionallyStopped, state != .live, connection == nil, !linkConnection.isActive {
+            nudgeReconnect()
+        }
     }
 
     func startDiscovery(
         preferred hint: CompanionPairingTransportHint? = nil,
         desktopId: String? = nil,
+        deviceId: String? = nil,
         force: Bool = false
     ) {
         let nextPreferred = Self.directEndpoint(from: hint)
         let nextTailscale = Self.tailscaleEndpoint(from: hint)
         let normalizedDesktopId = desktopId?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let normalizedDeviceId = deviceId?.trimmingCharacters(in: .whitespacesAndNewlines)
         let sameTarget = targetDesktopId == normalizedDesktopId
+            && targetDeviceId == normalizedDeviceId
             && Self.endpointKey(preferredEndpoint) == Self.endpointKey(nextPreferred)
             && Self.endpointKey(tailscaleEndpoint) == Self.endpointKey(nextTailscale)
         // App launch and scene activation can arrive together. Reasserting the
         // same target must not cancel a healthy connection or its handshake.
         if !force, !intentionallyStopped, sameTarget, browser != nil {
-            if state == .live || connection != nil { return }
+            if state == .live || connection != nil || linkConnection.isActive { return }
             connectBestAvailable(reconnecting: state == .reconnecting)
             return
         }
@@ -82,7 +121,9 @@ final class CompanionTransport: ObservableObject {
         preferredEndpoint = nextPreferred
         tailscaleEndpoint = nextTailscale
         targetDesktopId = normalizedDesktopId
+        targetDeviceId = normalizedDeviceId
         preferTailscale = false
+        preferLink = false
         selectedEndpoint = nil
         discoveredDesktops = []
         transition(to: .discovering)
@@ -95,6 +136,9 @@ final class CompanionTransport: ObservableObject {
             preferTailscale = true
             selectedEndpoint = tailscaleEndpoint
             connect(to: tailscaleEndpoint, reconnecting: false)
+        } else if canUseLink {
+            preferLink = true
+            connectLink(reconnecting: false)
         }
     }
 
@@ -116,7 +160,7 @@ final class CompanionTransport: ObservableObject {
                     guard self.browser === browser else { return }
                     self.browser = nil
                     self.onError?(error)
-                    if self.connection == nil { self.scheduleReconnect() }
+                    if self.connection == nil && !self.linkConnection.isActive { self.scheduleReconnect() }
                 }
             }
         }
@@ -126,6 +170,7 @@ final class CompanionTransport: ObservableObject {
     func connect(to desktop: CompanionDiscoveredDesktop) {
         intentionallyStopped = false
         preferTailscale = false
+        preferLink = false
         selectedEndpoint = desktop.endpoint
         reconnectAttempt = 0
         connect(to: desktop.endpoint, reconnecting: false)
@@ -136,7 +181,7 @@ final class CompanionTransport: ObservableObject {
     /// cancelling a TCP/Noise handshake that is still inside its deadline.
     func nudgeReconnect() {
         guard !intentionallyStopped, state != .live else { return }
-        if connection != nil { return }
+        if connection != nil || linkConnection.isReady { return }
         reconnectWorkItem?.cancel()
         reconnectWorkItem = nil
         reconnectAttempt = 0
@@ -158,6 +203,10 @@ final class CompanionTransport: ObservableObject {
             throw CompanionWireError.connectionUnavailable
         }
         let framed = try CompanionLengthFrameDecoder.encode(payload)
+        if route == .kaisolaLink {
+            try linkConnection.send(framed)
+            return
+        }
         guard let connection else { throw CompanionWireError.connectionUnavailable }
         connection.send(content: framed, completion: .contentProcessed { [weak self, weak connection] error in
             guard let error else { return }
@@ -177,7 +226,10 @@ final class CompanionTransport: ObservableObject {
         preferredEndpoint = nil
         tailscaleEndpoint = nil
         targetDesktopId = nil
+        targetDeviceId = nil
         preferTailscale = false
+        preferLink = false
+        route = .none
         discoveredDesktops = []
         transition(to: .idle)
     }
@@ -198,8 +250,9 @@ final class CompanionTransport: ObservableObject {
         // update used to cancel the in-flight secure resume before it could
         // become live. The existing deadline/failure path chooses this Bonjour
         // candidate immediately if the current direct endpoint is actually stale.
-        guard Self.mayAdoptDiscoveredEndpoint(hasConnection: connection != nil) else { return }
+        guard Self.mayAdoptDiscoveredEndpoint(hasConnection: connection != nil || linkConnection.isReady) else { return }
         preferTailscale = false
+        preferLink = false
         selectedEndpoint = candidate.endpoint
         connect(to: candidate.endpoint, reconnecting: state == .reconnecting)
     }
@@ -208,9 +261,11 @@ final class CompanionTransport: ObservableObject {
         reconnectWorkItem?.cancel()
         connectionDeadlineWorkItem?.cancel()
         alternateFallbackWorkItem?.cancel()
+        linkConnection.cancel(notify: false)
         connection?.cancel()
         decoder = CompanionLengthFrameDecoder()
         connectionEndpoint = endpoint
+        route = isTailscale(endpoint) ? .tailscale : .lan
         transition(to: reconnecting ? .reconnecting : .connecting)
 
         let parameters = NWParameters.tcp
@@ -247,8 +302,15 @@ final class CompanionTransport: ObservableObject {
                     }
                     if !self.isTailscale(failedEndpoint), let tailscale = self.tailscaleEndpoint {
                         self.preferTailscale = true
+                        self.preferLink = false
                         self.selectedEndpoint = tailscale
                         self.connect(to: tailscale, reconnecting: true)
+                        return
+                    }
+                    if self.canUseLink {
+                        self.preferTailscale = false
+                        self.preferLink = true
+                        self.connectLink(reconnecting: true)
                         return
                     }
                     self.scheduleReconnect()
@@ -297,9 +359,11 @@ final class CompanionTransport: ObservableObject {
         connectionDeadlineWorkItem = nil
         alternateFallbackWorkItem?.cancel()
         alternateFallbackWorkItem = nil
+        linkConnection.cancel(notify: false)
         connection?.cancel()
         connection = nil
         connectionEndpoint = nil
+        route = .none
         transition(to: .reconnecting)
         reconnectWorkItem?.cancel()
         let delay = min(pow(2.0, Double(reconnectAttempt)), 30.0)
@@ -315,6 +379,8 @@ final class CompanionTransport: ObservableObject {
                 } else if self.preferTailscale, let tailscale = self.tailscaleEndpoint {
                     self.selectedEndpoint = tailscale
                     self.connect(to: tailscale, reconnecting: true)
+                } else if self.preferLink, self.canUseLink {
+                    self.connectLink(reconnecting: true)
                 } else if let preferred = self.preferredEndpoint {
                     self.selectedEndpoint = preferred
                     self.connect(to: preferred, reconnecting: true)
@@ -322,6 +388,9 @@ final class CompanionTransport: ObservableObject {
                     self.preferTailscale = true
                     self.selectedEndpoint = tailscale
                     self.connect(to: tailscale, reconnecting: true)
+                } else if self.canUseLink {
+                    self.preferLink = true
+                    self.connectLink(reconnecting: true)
                 } else if let endpoint = self.selectedEndpoint {
                     self.connect(to: endpoint, reconnecting: true)
                 } else if self.browser != nil {
@@ -351,6 +420,8 @@ final class CompanionTransport: ObservableObject {
         connection?.cancel()
         connection = nil
         connectionEndpoint = nil
+        linkConnection.cancel(notify: false)
+        route = .none
     }
 
     private func connectBestAvailable(reconnecting: Bool) {
@@ -362,6 +433,8 @@ final class CompanionTransport: ObservableObject {
         } else if preferTailscale, let tailscaleEndpoint {
             selectedEndpoint = tailscaleEndpoint
             connect(to: tailscaleEndpoint, reconnecting: reconnecting)
+        } else if preferLink, canUseLink {
+            connectLink(reconnecting: reconnecting)
         } else if let preferredEndpoint {
             selectedEndpoint = preferredEndpoint
             connect(to: preferredEndpoint, reconnecting: reconnecting)
@@ -369,21 +442,30 @@ final class CompanionTransport: ObservableObject {
             preferTailscale = true
             selectedEndpoint = tailscaleEndpoint
             connect(to: tailscaleEndpoint, reconnecting: reconnecting)
+        } else if canUseLink {
+            preferLink = true
+            connectLink(reconnecting: reconnecting)
         } else {
             transition(to: .discovering)
         }
     }
 
     private func armAlternateFallback(for direct: NWConnection, after seconds: TimeInterval = 1.8) {
-        guard let tailscaleEndpoint, !isTailscale(connectionEndpoint) else { return }
+        guard !isTailscale(connectionEndpoint), tailscaleEndpoint != nil || canUseLink else { return }
         alternateFallbackWorkItem?.cancel()
         let item = DispatchWorkItem { [weak self, weak direct] in
             Task { @MainActor [weak self, weak direct] in
                 guard let self, let direct, direct === self.connection,
                       self.state == .connecting || self.state == .reconnecting else { return }
-                self.preferTailscale = true
-                self.selectedEndpoint = tailscaleEndpoint
-                self.connect(to: tailscaleEndpoint, reconnecting: true)
+                if let tailscaleEndpoint = self.tailscaleEndpoint {
+                    self.preferTailscale = true
+                    self.preferLink = false
+                    self.selectedEndpoint = tailscaleEndpoint
+                    self.connect(to: tailscaleEndpoint, reconnecting: true)
+                } else {
+                    self.preferLink = true
+                    self.connectLink(reconnecting: true)
+                }
             }
         }
         alternateFallbackWorkItem = item
@@ -417,8 +499,16 @@ final class CompanionTransport: ObservableObject {
                     self.connect(to: tailscale, reconnecting: self.state != .discovering)
                     return
                 }
+                if path.usesInterfaceType(.cellular), self.canUseLink,
+                   self.route != .kaisolaLink {
+                    self.preferTailscale = false
+                    self.preferLink = true
+                    self.connectLink(reconnecting: self.state != .discovering)
+                    return
+                }
                 guard previous != nil, previous != signature else { return }
                 self.preferTailscale = false
+                self.preferLink = false
                 self.connectionDeadlineWorkItem?.cancel()
                 self.connectionDeadlineWorkItem = nil
                 self.connection?.cancel()
@@ -443,8 +533,13 @@ final class CompanionTransport: ObservableObject {
                       self.state == .connecting || self.state == .reconnecting || self.state == .handshaking else { return }
                 if !self.isTailscale(self.connectionEndpoint), let tailscale = self.tailscaleEndpoint {
                     self.preferTailscale = true
+                    self.preferLink = false
                     self.selectedEndpoint = tailscale
                     self.connect(to: tailscale, reconnecting: true)
+                } else if self.canUseLink {
+                    self.preferTailscale = false
+                    self.preferLink = true
+                    self.connectLink(reconnecting: true)
                 } else {
                     self.scheduleReconnect()
                 }
@@ -454,10 +549,89 @@ final class CompanionTransport: ObservableObject {
         DispatchQueue.main.asyncAfter(deadline: .now() + seconds, execute: item)
     }
 
+    private var canUseLink: Bool {
+        linkBaseURL != nil
+            && linkTokenProvider != nil
+            && targetDesktopId?.isEmpty == false
+            && targetDeviceId?.isEmpty == false
+    }
+
+    private func connectLink(reconnecting: Bool) {
+        guard let baseURL = linkBaseURL,
+              let tokenProvider = linkTokenProvider,
+              let desktopId = targetDesktopId,
+              let deviceId = targetDeviceId else {
+            scheduleReconnect()
+            return
+        }
+        reconnectWorkItem?.cancel()
+        reconnectWorkItem = nil
+        connectionDeadlineWorkItem?.cancel()
+        connectionDeadlineWorkItem = nil
+        alternateFallbackWorkItem?.cancel()
+        alternateFallbackWorkItem = nil
+        connection?.cancel()
+        connection = nil
+        connectionEndpoint = nil
+        selectedEndpoint = nil
+        decoder = CompanionLengthFrameDecoder()
+        route = .kaisolaLink
+        transition(to: reconnecting ? .reconnecting : .connecting)
+        linkConnection.connect(
+            baseURL: baseURL,
+            desktopId: desktopId,
+            deviceId: deviceId,
+            tokenProvider: tokenProvider
+        )
+    }
+
+    private func handleLinkEvent(_ event: KaisolaLinkConnection.Event) {
+        guard !intentionallyStopped, route == .kaisolaLink else { return }
+        switch event {
+        case .ready:
+            guard state != .live else { return }
+            decoder = CompanionLengthFrameDecoder()
+            reconnectAttempt = 0
+            transition(to: .handshaking)
+            armLinkHandshakeDeadline()
+        case .waiting:
+            connectionDeadlineWorkItem?.cancel()
+            connectionDeadlineWorkItem = nil
+            decoder = CompanionLengthFrameDecoder()
+            if state != .reconnecting { transition(to: .reconnecting) }
+        case let .data(data):
+            do {
+                for frame in try decoder.push(data) { try onWireFrame?(frame) }
+            } catch {
+                onError?(error)
+                scheduleReconnect()
+            }
+        case let .failed(error):
+            onError?(error)
+            scheduleReconnect()
+        case .closed:
+            scheduleReconnect()
+        }
+    }
+
     private func transition(to newState: CompanionTransportState) {
         guard state != newState else { return }
         state = newState
         onStateChange?(newState)
+    }
+
+    private func armLinkHandshakeDeadline(after seconds: TimeInterval = 8) {
+        connectionDeadlineWorkItem?.cancel()
+        let item = DispatchWorkItem { [weak self] in
+            Task { @MainActor [weak self] in
+                guard let self, !self.intentionallyStopped,
+                      self.route == .kaisolaLink,
+                      self.state == .handshaking else { return }
+                self.scheduleReconnect()
+            }
+        }
+        connectionDeadlineWorkItem = item
+        DispatchQueue.main.asyncAfter(deadline: .now() + seconds, execute: item)
     }
 
     static func directEndpoint(from hint: CompanionPairingTransportHint?) -> NWEndpoint? {

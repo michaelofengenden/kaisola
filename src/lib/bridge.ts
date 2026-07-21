@@ -71,8 +71,16 @@ export interface CompanionState {
   listening: boolean
   /** Human diagnostic string — never a raw key, token, port, or path. */
   status: string
-  /** Optional private-network route. Raw host and port never enter renderer diagnostics. */
-  remote?: { kind: 'tailscale'; available: boolean }
+  /** Away-network route health. Raw hosts, ports, tickets, and account identifiers
+   * never enter renderer diagnostics. */
+  remote?: {
+    kind: 'tailscale' | 'kaisola-link'
+    available: boolean
+    linkAvailable?: boolean
+    connected?: boolean
+    phase?: 'off' | 'connecting' | 'ready' | 'reconnecting' | 'auth-required' | 'unreachable' | 'unavailable'
+    tailscaleAvailable?: boolean
+  }
   devices: CompanionDevice[]
 }
 export interface CompanionPairingStart {
@@ -1006,6 +1014,9 @@ export interface KaisolaBridge {
     /** Enable/disable the LAN listener + Bonjour advertisement. Disabled by
      * default; enabling starts the _kaisola._tcp service. */
     setEnabled(enabled: boolean): Promise<CompanionState>
+    /** Retry every configured path immediately without changing the saved
+     * enabled preference. */
+    refresh(): Promise<CompanionState>
     /** Begin a single-use pairing. Returns the QR payload to render and the
      * short expiry; the SAS to confirm arrives via onPairingEvent. */
     startPairing(opts: { capabilities: CompanionCapability[] }): Promise<CompanionPairingStart>
@@ -1540,6 +1551,7 @@ const webMock: KaisolaBridge = {
     publishProjection() { return false },
     async getState() { return { enabled: false, listening: false, status: 'Companion is desktop-only.', devices: [] } },
     async setEnabled() { return { enabled: false, listening: false, status: 'Companion is desktop-only.', devices: [] } },
+    async refresh() { return { enabled: false, listening: false, status: 'Companion is desktop-only.', devices: [] } },
     async startPairing() { return { pairingId: '', qrPayload: '', expiresAt: 0 } },
     async confirmPairing() { return { ok: false } },
     async cancelPairing() { return { ok: false } },

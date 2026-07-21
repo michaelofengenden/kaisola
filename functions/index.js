@@ -14,6 +14,10 @@ function bearerToken(header) {
   return match && match[1].length <= 20_000 ? match[1] : null
 }
 
+function isRelayTicketVerification(req) {
+  return req.get('x-kaisola-purpose') === 'relay-ticket'
+}
+
 function plainObject(value) {
   return !!value && typeof value === 'object' && !Array.isArray(value)
 }
@@ -112,15 +116,20 @@ exports.session = onRequest({ cors: false, invoker: 'public' }, async (req, res)
   }
   try {
     const decoded = await getAuth().verifyIdToken(token, true)
-    const ref = getFirestore().collection('users').doc(decoded.uid)
-    const existing = await ref.get()
-    await ref.set({
-      email: decoded.email || null,
-      name: decoded.name || null,
-      provider: decoded.firebase?.sign_in_provider || null,
-      lastSeenAt: FieldValue.serverTimestamp(),
-      ...(!existing.exists ? { createdAt: FieldValue.serverTimestamp() } : {}),
-    }, { merge: true })
+    // Relay reconnects can happen repeatedly during network transitions. They
+    // need revocation-aware token verification, but not a Firestore profile
+    // read/write on every one-use ticket request.
+    if (!isRelayTicketVerification(req)) {
+      const ref = getFirestore().collection('users').doc(decoded.uid)
+      const existing = await ref.get()
+      await ref.set({
+        email: decoded.email || null,
+        name: decoded.name || null,
+        provider: decoded.firebase?.sign_in_provider || null,
+        lastSeenAt: FieldValue.serverTimestamp(),
+        ...(!existing.exists ? { createdAt: FieldValue.serverTimestamp() } : {}),
+      }, { merge: true })
+    }
     res.status(200).json({
       ok: true,
       user: { uid: decoded.uid, email: decoded.email || null, name: decoded.name || null },
@@ -209,4 +218,4 @@ exports.companionRendezvous = onRequest({ cors: false, invoker: 'public' }, asyn
   }
 })
 
-exports.__test = { bearerToken, validateCompanionOffer }
+exports.__test = { bearerToken, isRelayTicketVerification, validateCompanionOffer }

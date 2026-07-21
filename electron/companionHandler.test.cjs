@@ -64,6 +64,11 @@ class FakeTransport extends EventEmitter {
     return this.status()
   }
 
+  acceptSocket(socket) {
+    this.acceptedSocket = socket
+    return socket
+  }
+
   confirmPairing(pairingId) {
     this.confirmed.push(pairingId)
     return true
@@ -95,6 +100,46 @@ class FakeTransport extends EventEmitter {
   }
 }
 
+class FakeLinkClient extends EventEmitter {
+  constructor() {
+    super()
+    this.enableCalls = 0
+    this.disableCalls = 0
+    this.refreshCalls = 0
+    this.phase = 'off'
+  }
+
+  enable() {
+    this.enableCalls++
+    this.phase = 'ready'
+    this.emit('state', this.status())
+    return this.status()
+  }
+
+  disable() {
+    this.disableCalls++
+    this.phase = 'off'
+    this.emit('state', this.status())
+    return this.status()
+  }
+
+  refresh() {
+    this.refreshCalls++
+    return this.status()
+  }
+
+  status() {
+    return {
+      configured: true,
+      connected: this.phase === 'ready',
+      phase: this.phase,
+      channels: 0,
+      accountKey: 'must-not-enter-renderer-state',
+      websocketUrl: 'wss://relay.invalid/v1/connect/private-ticket',
+    }
+  }
+}
+
 function phoneRecord(seed = 51, deviceId = 'device-handler-iphone') {
   const identity = identityFromSeeds({
     id: deviceId,
@@ -121,6 +166,7 @@ function setup(t, {
   directory: suppliedDirectory = null,
   setBackgroundLaunchEnabled = null,
   makeTransport = null,
+  linkClient = null,
   retryBaseMs,
   retryMaxMs,
 } = {}) {
@@ -166,6 +212,7 @@ function setup(t, {
       transport = makeTransport ? makeTransport(options) : new FakeTransport(options)
       return transport
     },
+    linkClient,
     setBackgroundLaunchEnabled,
     retryBaseMs,
     retryMaxMs,
@@ -204,6 +251,8 @@ test('enable then getState reflects a live loopback-and-LAN listener without exp
   assert.equal(enabled.listening, true)
   assert.equal(enabled.status, 'Listening for paired devices on your local network.')
   assert.deepEqual(await handlers.get('companion:getState')(), enabled)
+  assert.deepEqual(await handlers.get('companion:refresh')(), enabled)
+  assert.equal(transport.refreshCalls, 1)
   assert.equal(JSON.stringify(enabled).includes('49321'), false)
   assert.deepEqual(JSON.parse(fs.readFileSync(path.join(directory, 'companion', 'settings.json'), 'utf8')), {
     v: 1,
@@ -272,6 +321,48 @@ test('active Tailscale is reported without exposing its address or listener port
   assert.equal(JSON.stringify(state).includes('49321'), false)
   const pairing = await handler.startPairing()
   assert.equal(JSON.parse(pairing.qrPayload).transportHint.tailscaleHost, '100.90.1.14')
+})
+
+test('Kaisola Link follows Companion lifecycle and exposes only bounded route health', async (t) => {
+  const linkClient = new FakeLinkClient()
+  const { handler } = setup(t, { linkClient })
+  const state = await handler.setEnabled(true)
+  assert.equal(linkClient.enableCalls, 1)
+  assert.deepEqual(state.remote, {
+    kind: 'kaisola-link',
+    available: true,
+    linkAvailable: true,
+    connected: true,
+    phase: 'ready',
+    tailscaleAvailable: false,
+  })
+  assert.match(state.status, /away through Kaisola Link/)
+  assert.equal(JSON.stringify(state).includes('private-ticket'), false)
+  assert.equal(JSON.stringify(state).includes('must-not-enter-renderer-state'), false)
+
+  await handler.refresh()
+  assert.equal(linkClient.refreshCalls, 1)
+  await handler.setEnabled(false)
+  assert.equal(linkClient.disableCalls, 1)
+})
+
+test('a relay socket is not reported ready until the local secure gateway can accept it', async (t) => {
+  class FailedTransport extends FakeTransport {
+    async enable() {
+      this.enableCalls++
+      throw new Error('listener unavailable')
+    }
+  }
+  const linkClient = new FakeLinkClient()
+  const { handler } = setup(t, {
+    linkClient,
+    makeTransport: (options) => new FailedTransport(options),
+  })
+  const state = await handler.setEnabled(true)
+  assert.equal(state.listening, false)
+  assert.equal(state.remote.connected, false)
+  assert.match(state.status, /reconnecting/)
+  assert.doesNotMatch(state.status, /Ready/)
 })
 
 test('wake refresh republishes the listener without dropping its connection', async (t) => {

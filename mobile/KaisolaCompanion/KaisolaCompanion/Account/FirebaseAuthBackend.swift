@@ -8,6 +8,14 @@ struct FirebaseAuthConfiguration: Equatable, Sendable {
     let projectId: String
     let apiKey: String
     let serverURL: URL
+    let relayURL: URL?
+
+    init(projectId: String, apiKey: String, serverURL: URL, relayURL: URL? = nil) {
+        self.projectId = projectId
+        self.apiKey = apiKey
+        self.serverURL = serverURL
+        self.relayURL = relayURL
+    }
 
     static func load(from bundle: Bundle = .main) throws -> FirebaseAuthConfiguration {
         guard let url = bundle.url(forResource: "FirebaseAuthConfig", withExtension: "json")
@@ -28,6 +36,7 @@ struct FirebaseAuthConfiguration: Equatable, Sendable {
         let projectId = decoded.projectId.trimmingCharacters(in: .whitespacesAndNewlines)
         let apiKey = decoded.apiKey.trimmingCharacters(in: .whitespacesAndNewlines)
         let serverURLText = decoded.serverURL.trimmingCharacters(in: .whitespacesAndNewlines)
+        let relayURLText = decoded.relayURL?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         let projectRange = projectId.range(
             of: #"^[a-z0-9][a-z0-9-]{4,60}$"#,
             options: .regularExpression
@@ -40,21 +49,32 @@ struct FirebaseAuthConfiguration: Equatable, Sendable {
               apiKeyRange == apiKey.startIndex..<apiKey.endIndex,
               let serverURL = URL(string: serverURLText),
               serverURL.scheme?.lowercased() == "https",
-              serverURL.host?.isEmpty == false else {
+              serverURL.host?.isEmpty == false,
+              relayURLText.isEmpty || (
+                URL(string: relayURLText)?.scheme?.lowercased() == "https"
+                    && URL(string: relayURLText)?.host?.isEmpty == false
+              ) else {
             throw FirebaseAuthError.invalidConfiguration
         }
-        return FirebaseAuthConfiguration(projectId: projectId, apiKey: apiKey, serverURL: serverURL)
+        return FirebaseAuthConfiguration(
+            projectId: projectId,
+            apiKey: apiKey,
+            serverURL: serverURL,
+            relayURL: relayURLText.isEmpty ? nil : URL(string: relayURLText)
+        )
     }
 
     private struct RawConfiguration: Decodable {
         let projectId: String
         let apiKey: String
         let serverURL: String
+        let relayURL: String?
 
         private enum CodingKeys: String, CodingKey {
             case projectId
             case apiKey
             case serverURL = "serverUrl"
+            case relayURL = "relayUrl"
         }
     }
 }

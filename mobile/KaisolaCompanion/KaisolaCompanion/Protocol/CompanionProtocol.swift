@@ -176,6 +176,7 @@ struct CompanionEnvelope: Codable, Hashable, Sendable {
                 throw CompanionProtocolError.invalidNumber("body.lastAck")
             }
             try Self.validateCapabilities(hello.capabilities)
+            try hello.transportHint?.validate()
         } else if kind == .snapshot {
             if let value = body.fields["revision"] {
                 guard let revision = value.intValue,
@@ -285,13 +286,20 @@ struct CompanionHelloBody: Codable, Hashable, Sendable {
     let protocolMinor: Int?
     let capabilities: [CompanionCapability]
     let lastAck: Int64?
+    let transportHint: CompanionPairingTransportHint?
 
-    init(role: CompanionPeerRole, capabilities: [CompanionCapability], lastAck: Int64? = nil) {
+    init(
+        role: CompanionPeerRole,
+        capabilities: [CompanionCapability],
+        lastAck: Int64? = nil,
+        transportHint: CompanionPairingTransportHint? = nil
+    ) {
         type = "hello"
         self.role = role
         protocolMinor = CompanionEnvelope.protocolMinor
         self.capabilities = capabilities
         self.lastAck = lastAck
+        self.transportHint = transportHint
     }
 }
 

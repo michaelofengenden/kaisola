@@ -14,7 +14,7 @@ export function ShellSidebarFooter({ floating = false, topbar = false }: { float
   return (
     <div className="shell-sidebar-footer" data-floating={floating || undefined} data-topbar={topbar || undefined} aria-label="Workspace controls">
       <div className="shell-sidebar-footer-tools">
-        <ShellTools includeSettings={!topbar} includeUsage={!topbar} />
+        <ShellTools includeSettings={false} includeUsage={false} />
         <InboxButton />
         <button type="button" className="btn-icon" onClick={toggleTheme} title={`Switch to ${theme === 'dark' ? 'light' : 'dark'} theme`} aria-label="Toggle color theme">
           <Icon name="SunMoon" size={15} />

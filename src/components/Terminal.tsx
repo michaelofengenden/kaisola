@@ -67,8 +67,9 @@ const FIND_DECORATIONS = {
 // app's dominant cost while an agent streams. Glass BAKES the old translucent look
 // (45% --term-bg over the opaque --bg-1 card) into a solid color, so it's visually
 // identical to the old transparent surface but never re-composited; eco stays flat
-// --term-bg. The termBackground setting (ink / slate / paper) picks the tone;
-// 'paper' is light regardless of app theme and swaps to the light text palette.
+// --term-bg. The termBackground setting (ink / slate / paper) picks the tone in
+// light mode. Dark mode is a strict app-wide invariant: even a saved `paper`
+// preference resolves to ink so no terminal can become a white island.
 // Keep these in sync with tokens.css [data-termbg] if --term-bg / --bg-1 change.
 const TERM_SURFACE: Record<TermBackground, { glass: { dark: string; light: string }; eco: { dark: string; light: string } }> = {
   ink: {
@@ -80,16 +81,16 @@ const TERM_SURFACE: Record<TermBackground, { glass: { dark: string; light: strin
     eco: { dark: '#191d24', light: '#ffffff' },
   },
   paper: {
-    glass: { dark: '#ffffff', light: '#ffffff' },
-    eco: { dark: '#ffffff', light: '#ffffff' },
+    glass: { dark: '#0d0f13', light: '#ffffff' },
+    eco: { dark: '#0b0d11', light: '#ffffff' },
   },
 }
 const xtermTheme = (theme: 'dark' | 'light', eco: boolean, cursorColor = 'auto', termBg: TermBackground = 'ink') => {
-  // paper is a light surface even in the dark app — text must flip with it
-  const lightSurface = theme === 'light' || termBg === 'paper'
+  const resolvedTermBg: TermBackground = theme === 'dark' && termBg === 'paper' ? 'ink' : termBg
+  const lightSurface = theme === 'light'
   const base = lightSurface ? LIGHT_THEME : DARK_THEME
   const t = cursorColor === 'auto' ? base : { ...base, cursor: cursorColor }
-  const surface = TERM_SURFACE[termBg] ?? TERM_SURFACE.paper
+  const surface = TERM_SURFACE[resolvedTermBg] ?? TERM_SURFACE.ink
   return { ...t, background: (eco ? surface.eco : surface.glass)[theme] }
 }
 
@@ -1114,6 +1115,7 @@ export function Terminal({ id, attach = false, boot, cwd, projectId: projectIdOv
       data-rail={promptMarks.length > 1 || undefined}
       data-file-drop={fileDropHover || undefined}
       data-terminal-theme={theme}
+      data-terminal-background={livePalette.background}
       data-ansi-black={livePalette.black}
       data-terminal-id={id}
       data-renderer-awake={rendererAwake}

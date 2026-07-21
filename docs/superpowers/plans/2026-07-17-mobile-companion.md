@@ -6,7 +6,7 @@ the exact agent and terminal sessions running in Kaisola on the Mac.
 **Design:** `docs/superpowers/specs/2026-07-17-mobile-companion-design.md`
 
 **Sequence:** protocol spine → same-network read-only iPhone alpha → guarded
-control → remote relay and push → release hardening. Do not start with a broad
+control → LAN-first/Tailscale remote access and push → release hardening. Do not start with a broad
 mobile UI clone or expose an existing local port.
 
 ## Global invariants
@@ -17,7 +17,7 @@ mobile UI clone or expose an existing local port.
 - No mobile observer may adopt/steal the renderer's terminal owner.
 - Every service lookup includes the immutable project id and target id.
 - Permission response is exactly-once and fail-closed.
-- No terminal/agent plaintext enters relay logs, analytics, crash metadata, or
+- No terminal/agent plaintext enters network diagnostics, analytics, crash metadata, or
   push payloads.
 - No unbounded replay/event/output queue.
 - All code-facing protocol additions include Node fixtures; cross-language
@@ -337,59 +337,53 @@ desktop typing, cross-project denial, and output order.
 permissioned; a real terminal can be controlled; every race has a deterministic
 receipt and no duplicated command.
 
-## Phase 3 — remote relay and APNs
+## Phase 3 — private remote access and APNs
 
-### Task 15: Firebase device registration API
+### Task 15: Stable LAN-first listener and signed private route — implemented
 
-Extend `functions/index.js` with narrowly scoped authenticated endpoints for:
+Keep Bonjour and the signed LAN endpoint as the primary path. Listen on a stable
+port when available, detect a local Tailscale interface without shelling out,
+and include that private address only in signed/authenticated transport hints.
+If the stable port is unavailable, preserve LAN on an ephemeral port and fail
+closed by omitting the remote hint.
 
-- register/revoke phone push token and public device metadata;
-- register desktop online routing presence;
-- authorize one paired device/desktop room under the same verified UID;
-- request a debounced APNs attention notification by opaque event id.
+The authenticated desktop hello refreshes the hint for an existing paired
+phone. Renderer state may expose only route availability—not the address or
+listener port.
 
-Keep Firestore client rules deny-all. Admin-owned records must not contain
-session plaintext, private keys, pairing secrets, terminal output, prompts,
-diffs, paths, provider tokens, or MCP data.
+**Verify:** fixed-port success and collision fallback; LAN address excludes the
+tailnet interface; signed hint validation; existing-pair hello refresh; no raw
+private address in renderer state.
 
-Add emulator/unit tests for UID isolation, revoked device, malformed/oversized
-input, token rotation, rate limits, and replay.
+### Task 16: iOS LAN-first/Tailscale route election — implemented
 
-### Task 16: Opaque Cloud Run WebSocket relay
+Use the same `NWConnection` framing and Noise channel on both endpoints. Keep
+Bonjour active, prefer the paired Mac on the LAN, fall back to the signed
+Tailscale endpoint after a bounded failure or immediately on cellular, remember
+that route through reconnects, and prefer Bonjour again once the Mac is visible.
 
-Add a separately deployable relay service rather than stretching the request/
-response Firebase Function into a long-lived socket server.
+No Cloud Run service, public listener, router forwarding, provider credential,
+or new Kaisola cloud bill is part of this path. Remote reachability requires
+both devices in the permitted tailnet and the Mac awake with Tailscale active,
+Kaisola open, and Companion enabled.
 
-Requirements:
+**Verify:** direct endpoint and tailnet endpoint fixtures; Wi-Fi/cellular path
+changes; stale office address; app kill/foreground; Mac sleep/wake; Tailscale
+direct and DERP connection types; revoke while remote; bounded replay continuity.
 
-- Firebase bearer verification and registered-device lookup;
-- desktop/phone room routing within one UID;
-- opaque encrypted binary payloads only;
-- payload/rate/connection caps and no plaintext body logs;
-- proactive client reconnect before platform timeout;
-- no correctness dependence on best-effort session affinity;
-- one-instance alpha configuration, with a documented synchronization migration
-  before horizontal scale.
+### Task 17: APNs attention hints — pending
 
-Tests include recorded-ciphertext non-decryptability at the relay, UID/room
-isolation, revoked live device, forced relay restart, 55-minute reconnect,
-out-of-order/duplicate network delivery, and offline desktop.
+Add APNs registration, privacy-safe notification categories, and deep links to
+current session state. Push is a wake-up/attention hint only: it carries no
+terminal output, prompts, diffs, paths, secrets, or authoritative completion
+state, and opening/foreground reconciliation remains mandatory.
 
-### Task 17: iOS remote transport and APNs
+**Chaos matrix:** Wi-Fi↔cellular, Tailscale direct↔DERP, VPN on/off, Mac
+sleep/wake, Electron restart, phone kill/relaunch, delayed/missing/duplicate
+push, revoked device, expired Firebase token, version skew.
 
-Add Firebase Auth/Google sign-in, `URLSessionWebSocketTask`, relay transport, APNs
-registration, privacy-safe notification categories, and deep links to current
-session state. Direct and relay transports feed the same protocol store.
-
-Backgrounding closes live streaming. Notification delivery never marks state
-complete; opening/foreground reconciliation does.
-
-**Chaos matrix:** Wi-Fi↔cellular, VPN on/off, relay rollout, Mac sleep/wake,
-Electron restart, phone kill/relaunch, delayed/missing/duplicate push, revoked
-device, expired Firebase token, version skew.
-
-**Exit gate for Phase 3:** remote anywhere works across the chaos matrix; relay
-and push logs contain no session plaintext; battery and bandwidth stay within
+**Exit gate for Phase 3:** remote anywhere works across the chaos matrix;
+diagnostics and push logs contain no session plaintext; battery and bandwidth stay within
 the recorded budget.
 
 ## Phase 4 — release hardening
@@ -400,7 +394,7 @@ the recorded budget.
 - Cross-language crypto test vectors and dependency audit.
 - Lost-phone/revoke drill and account-revocation drill.
 - Terminal escape/OSC/link fuzzing.
-- Relay log/crash/analytics redaction audit.
+- Connection log/crash/analytics redaction audit.
 - iOS Data Protection, Keychain accessibility, backup exclusion, screenshot/app
   switcher privacy choice, and Face ID fallback review.
 - External review before enabling terminal control beyond a small alpha.
@@ -408,7 +402,7 @@ the recorded budget.
 ### Task 19: Performance, accessibility, and product polish
 
 Measure—not infer—local/remote latency, reconnect loss, desktop idle CPU/memory,
-phone energy, cache sizes, and relay bandwidth. Add support diagnostics that are
+phone energy, cache sizes, and direct/tailnet bandwidth. Add support diagnostics that are
 useful without exposing secrets.
 
 Complete one-handed ergonomics, Dynamic Type, VoiceOver, Reduce Motion, color
@@ -420,7 +414,7 @@ offline/stale language.
 1. Internal signed iPhone build and local alpha.
 2. TestFlight read-only alpha.
 3. TestFlight guarded-control alpha for explicitly granted devices.
-4. Remote relay/push beta with rate/cost monitoring.
+4. Tailscale remote-access beta, followed by privacy-safe push.
 5. App Store/privacy disclosures and desktop release only after compatibility
    gates are automated.
 

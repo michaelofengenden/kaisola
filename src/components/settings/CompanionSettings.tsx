@@ -148,6 +148,24 @@ export function CompanionSettings() {
           : 'When on, this Mac advertises a private, encrypted service on your local network so a paired iPhone can watch these sessions. Nothing is exposed until a device is paired.'}
       </p>
 
+      {state.enabled && (
+        <div className="settings-row companion-remote-row">
+          <span className="settings-row-label">Away from this network</span>
+          <div className="settings-row-control">
+            {state.remote?.available ? (
+              <span className="companion-route-ready"><span aria-hidden /> Tailscale ready</span>
+            ) : (
+              <button type="button" className="btn btn-sm" onClick={() => void bridge.openExternal('https://tailscale.com/download/mac')}>
+                Add Tailscale
+              </button>
+            )}
+          </div>
+        </div>
+      )}
+      {state.enabled && !state.remote?.available && (
+        <p className="settings-note">Optional and free for personal use. Install Tailscale on this Mac and your iPhone, then open Kaisola once nearby so the phone learns its private route.</p>
+      )}
+
       {error && <p className="settings-note companion-error" role="alert">{error}</p>}
 
       {state.enabled && (
@@ -246,7 +264,7 @@ export function CompanionSettings() {
             ) : (
               <>
                 <h3 className="companion-pair-title">Pair with Kaisola Companion</h3>
-                <p className="settings-note">Scan this code, or tap “Find my Mac” on an iPhone signed in to the same account. It expires shortly.</p>
+                <p className="settings-note">Scan this code, or tap “Find my Mac” on an iPhone signed in to the same account. It expires shortly{state.remote?.available ? ' and includes your private Tailscale route' : ''}.</p>
                 <QrCode text={pairing.qrPayload} />
                 <div className="companion-pair-actions">
                   <button type="button" className="btn" onClick={copyPairingCode}>

@@ -45,13 +45,17 @@ function validateId(value, label) {
 
 function normalizeTransportHint(value) {
   if (!value || typeof value !== 'object' || Array.isArray(value)) fail('invalid_pairing_payload', 'transportHint is invalid')
-  const allowed = new Set(['service', 'protocol', 'host', 'port'])
+  const allowed = new Set(['service', 'protocol', 'host', 'port', 'tailscaleHost'])
   if (Object.keys(value).some((key) => !allowed.has(key))) fail('invalid_pairing_payload', 'transportHint is invalid')
   if (value.service !== '_kaisola._tcp' || value.protocol !== 'tcp') fail('invalid_pairing_payload', 'transportHint is invalid')
   const output = { service: value.service, protocol: value.protocol }
   if (value.host != null) {
     if (typeof value.host !== 'string' || value.host.length < 1 || value.host.length > 253 || /[\0\r\n]/.test(value.host)) fail('invalid_pairing_payload', 'transport host is invalid')
     output.host = value.host
+  }
+  if (value.tailscaleHost != null) {
+    if (typeof value.tailscaleHost !== 'string' || value.tailscaleHost.length < 1 || value.tailscaleHost.length > 253 || /[\0\r\n]/.test(value.tailscaleHost)) fail('invalid_pairing_payload', 'Tailscale transport host is invalid')
+    output.tailscaleHost = value.tailscaleHost
   }
   if (value.port != null) {
     if (!Number.isSafeInteger(value.port) || value.port < 1 || value.port > 65535) fail('invalid_pairing_payload', 'transport port is invalid')

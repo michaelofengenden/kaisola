@@ -756,25 +756,28 @@
   box-shadow: none;
 }
 .fx-md-toolbar {
-  position: sticky;
-  z-index: 3;
-  top: calc(-1 * var(--sp-4));
   display: flex;
   align-items: center;
   gap: 2px;
-  width: 100%;
-  max-width: min(88ch, 100%);
-  min-height: 38px;
-  margin: 0 auto var(--sp-4);
-  padding: 2px 0 5px;
+  width: max-content;
+  max-width: calc(100vw - 24px);
+  min-height: 36px;
+  margin: 0;
+  padding: 3px;
   overflow-x: auto;
   scrollbar-width: none;
-  border: 0;
-  border-bottom: 1px solid var(--border-faint);
-  border-radius: 0;
-  background: color-mix(in srgb, var(--bg-1) 97%, transparent);
-  box-shadow: none;
+  border: 1px solid var(--border);
+  border-radius: var(--r-3);
+  background: color-mix(in srgb, var(--bg-2) 96%, transparent);
+  box-shadow: var(--shadow-3);
   cursor: default;
+  -webkit-app-region: no-drag;
+}
+.fx-md-format-popover {
+  position: fixed;
+  z-index: 90;
+  max-width: calc(100vw - 24px);
+  animation: menu-in var(--dur-1) var(--ease-out);
   -webkit-app-region: no-drag;
 }
 .fx-md-toolbar::-webkit-scrollbar { display: none; }

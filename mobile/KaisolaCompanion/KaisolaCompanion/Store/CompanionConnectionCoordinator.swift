@@ -115,7 +115,7 @@ final class CompanionConnectionCoordinator: ObservableObject {
         accountLookupID = nil
         accountLookupInProgress = false
         do {
-            let identity = try await resolveIdentity()
+            _ = try await resolveIdentity()
             self.pendingPayload = payload
             connectionWanted = true
             lifecycleIntentVersion &+= 1
@@ -127,7 +127,6 @@ final class CompanionConnectionCoordinator: ObservableObject {
                 desktopId: payload.desktopId,
                 force: true
             )
-            _ = identity
         } catch {
             pairingPhase = .failed(Self.identityMessage(error))
         }
@@ -225,7 +224,10 @@ final class CompanionConnectionCoordinator: ObservableObject {
         lifecycleIntentVersion &+= 1
         if !force {
             switch client.transport.state {
-            case .discovering, .connecting, .handshaking, .live, .reconnecting:
+            case .discovering, .reconnecting:
+                client.transport.nudgeReconnect()
+                return
+            case .connecting, .handshaking, .live:
                 return
             case .idle:
                 break

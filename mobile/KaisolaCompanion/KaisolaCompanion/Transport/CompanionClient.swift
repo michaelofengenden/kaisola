@@ -533,6 +533,9 @@ final class CompanionClient: ObservableObject {
                 throw CompanionCryptoError.authenticationFailed
             }
             let granted = Set(hello.capabilities)
+            if let transportHint = hello.transportHint {
+                try transportHint.validate()
+            }
             onCapabilities?(granted)
             if let current = pairedDesktop {
                 let updated = CompanionPairedDesktop(
@@ -540,7 +543,7 @@ final class CompanionClient: ObservableObject {
                     identityPublic: current.identityPublic,
                     x25519StaticPublic: current.x25519StaticPublic,
                     capabilities: CompanionCapability.allCases.filter(granted.contains),
-                    transportHint: current.transportHint
+                    transportHint: hello.transportHint ?? current.transportHint
                 )
                 pairedDesktop = updated
                 mode = .resume(updated)

@@ -1,5 +1,5 @@
 import { useEffect, useRef, type CSSProperties, type MouseEvent as ReactMouseEvent } from 'react'
-import { useKaisola, sessionOrderIds, projectIdForEvent, terminalOwnerMap, POP_TERMINAL_ID, type AgentFeedItem, type ProjectTab, type ProjectTransferPayload } from './store/store'
+import { flushPersistSync, useKaisola, sessionOrderIds, projectIdForEvent, terminalOwnerMap, POP_TERMINAL_ID, type AgentFeedItem, type ProjectTab, type ProjectTransferPayload } from './store/store'
 import { bridge, isDesktop, type PopClosedTerminalState, type TerminalMirrorState } from './lib/bridge'
 import { uid, nowISO } from './domain/ids'
 import { requestIsSensitive, requestMatchesRules, allowOnceAnswer } from './lib/permissionRules'
@@ -572,6 +572,11 @@ function KaisolaApp() {
       w?.onActivateTab?.((id) => useKaisola.getState().switchProject(id)),
       w?.onNavigationLayout?.((layout) => useKaisola.getState().setTabLayout(layout)),
       w?.onOpenSettings?.((pane) => useKaisola.getState().setSettingsOpen(true, pane)),
+      w?.onPrepareAdoption?.((transferId) => {
+        if (!transferId) return
+        flushPersistSync()
+        w.adoptionPrepared(transferId)
+      }),
       // Chrome-style transfer: insert at the cursor's tab-strip position, apply
       // atomically, then ACK. The source keeps its copy until this succeeds.
       w?.onAdoptProject?.((raw) => {

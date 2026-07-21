@@ -19,6 +19,13 @@ const { registerFsHandlers, disposeFs } = require('./ipc/fsHandler.cjs')
 const { registerGrobidHandlers } = require('./ipc/grobidHandler.cjs')
 const { registerSandboxHandlers } = require('./ipc/sandboxHandler.cjs')
 const { registerDbHandlers, dbGet, dbKeys, dbMutate } = require('./ipc/dbHandler.cjs')
+const {
+  abortProjectTransfer,
+  finishProjectTransfer,
+  markProjectTransferCommitted,
+  prepareProjectTransfer,
+  recoverProjectTransfers,
+} = require('./ipc/projectTransferJournal.cjs')
 const { registerCodexHandlers } = require('./ipc/codexHandler.cjs')
 const { registerWorktreeHandlers } = require('./ipc/worktreeHandler.cjs')
 const { registerGitHandlers } = require('./ipc/gitHandler.cjs')
@@ -653,6 +660,7 @@ function createWindow(opts = {}) {
   })
   rendererOwner.once('destroyed', () => {
     adoptionReadyWc.delete(rendererOwner.id)
+    clearAdoptionPreparationWaiters(rendererOwner.id)
     clearDeleteRendererWaiters(rendererOwner.id)
     // React cleanup does not reliably run on window crashes/closes. Main owns
     // the authoritative fallback: keep processes alive, but release all hot
@@ -671,6 +679,7 @@ function createWindow(opts = {}) {
     navigationByWc.delete(wcId)
     pendingAdoptions.delete(wcId)
     adoptionReadyWc.delete(wcId)
+    clearAdoptionPreparationWaiters(wcId)
     clearDeleteRendererWaiters(wcId)
     untrackSavedWindow(win)
     if (!isPop) installAppMenu()
@@ -1242,14 +1251,11 @@ ipcMain.handle('window:delete-saved', (event, { id } = {}) => deleteSavedWindow(
 // The source keeps its project until the receiver applies it and ACKs.
 const pendingAdoptions = new Map() // target webContents.id → adoption payload
 const adoptionReadyWc = new Set() // renderer installed onAdoptProject listener
+const pendingAdoptionPreparations = new Map() // target webContents.id → transferId
+const pendingPreparationAcks = new Map() // transferId → { targetId, resolve, timer }
 const pendingTransferAcks = new Map() // transferId → { targetId, resolve, timer }
-const completedTransfers = new Map() // transferId → source window (until finish)
+const completedTransfers = new Map() // transferId → source window + recovery timer
 let transferSeq = 0
-// Cross-renderer transfer still lacks a durable two-sided commit journal. Keep
-// the safe physical move of a lone window below, but fail closed before any
-// renderer/ACP ownership handoff until that transaction can survive either
-// renderer crashing between its two disk commits.
-const CROSS_RENDERER_PROJECT_TRANSFERS_ENABLED = false
 
 function transferPoint(at) {
   if (!at || !Number.isFinite(at.x) || !Number.isFinite(at.y)) return null
@@ -1285,12 +1291,64 @@ function deliverAdoption(target, adoption) {
   return true
 }
 
+function deliverAdoptionPreparation(target, transferId) {
+  if (target.isDestroyed() || target.webContents.isDestroyed()) return false
+  if (!adoptionReadyWc.has(target.webContents.id)) {
+    pendingAdoptionPreparations.set(target.webContents.id, transferId)
+    return true
+  }
+  target.webContents.send('tab:prepare-adoption', { transferId })
+  return true
+}
+
+function requestAdoptionPreparation(target, transferId) {
+  return new Promise((resolve) => {
+    const timer = setTimeout(() => {
+      const pending = pendingPreparationAcks.get(transferId)
+      if (!pending) return
+      pendingPreparationAcks.delete(transferId)
+      pendingAdoptionPreparations.delete(pending.targetId)
+      resolve(false)
+    }, 15_000)
+    pendingPreparationAcks.set(transferId, { targetId: target.webContents.id, resolve, timer })
+    if (!deliverAdoptionPreparation(target, transferId)) {
+      clearTimeout(timer)
+      pendingPreparationAcks.delete(transferId)
+      resolve(false)
+    }
+  })
+}
+
+function clearAdoptionPreparationWaiters(webContentsId) {
+  pendingAdoptionPreparations.delete(webContentsId)
+  for (const [transferId, pending] of pendingPreparationAcks) {
+    if (pending.targetId !== webContentsId) continue
+    pendingPreparationAcks.delete(transferId)
+    clearTimeout(pending.timer)
+    pending.resolve(false)
+  }
+}
+
 ipcMain.on('window:adopt-ready', (event) => {
   adoptionReadyWc.add(event.sender.id)
+  const preparation = pendingAdoptionPreparations.get(event.sender.id)
+  if (preparation) {
+    pendingAdoptionPreparations.delete(event.sender.id)
+    if (!event.sender.isDestroyed()) event.sender.send('tab:prepare-adoption', { transferId: preparation })
+  }
   const adoption = pendingAdoptions.get(event.sender.id)
   if (!adoption) return
   pendingAdoptions.delete(event.sender.id)
   if (!event.sender.isDestroyed()) event.sender.send('tab:adopt', adoption)
+})
+
+ipcMain.on('window:adoption-prepared', (event, { transferId } = {}) => {
+  const pending = pendingPreparationAcks.get(transferId)
+  if (!pending || pending.targetId !== event.sender.id) return
+  pendingPreparationAcks.delete(transferId)
+  pendingAdoptionPreparations.delete(event.sender.id)
+  clearTimeout(pending.timer)
+  pending.resolve(true)
 })
 
 ipcMain.on('window:adopt-complete', (event, { transferId, ok } = {}) => {
@@ -1342,6 +1400,64 @@ function destroyDiscardedAdoptionWindow(win) {
   win.once('closed', discard)
   win.destroy()
 }
+
+function applyTransferManifest(result) {
+  if (!Array.isArray(result?.manifest)) return
+  windowManifest = result.manifest
+  windowManifestLoaded = true
+  try { broadcastSavedWindowsChanged() } catch { /* manifest IPC remains authoritative */ }
+}
+
+function abortTransferAndRestoreTarget(transferId, target, { reload = false } = {}) {
+  let result = { ok: false }
+  try {
+    result = abortProjectTransfer({
+      get: dbGet,
+      mutate: dbMutate,
+      transferId,
+      manifestKey: WINDOW_MANIFEST_KEY,
+      projectionKey: projectionStoreKey,
+    })
+    applyTransferManifest(result)
+  } catch { /* launch recovery retains the prepared journal if this write failed */ }
+  if (reload && result.ok && target && !target.isDestroyed() && !target.webContents.isDestroyed()) {
+    target.webContents.reload()
+  }
+  return result.ok
+}
+
+function finalizeCompletedTransfer(transferId, sourceId, { fallback = false } = {}) {
+  const completed = completedTransfers.get(transferId)
+  if (!completed || completed.sourceId !== sourceId) return { ok: false }
+  completedTransfers.delete(transferId)
+  clearTimeout(completed.timer)
+  let result
+  try {
+    result = finishProjectTransfer({
+      get: dbGet,
+      mutate: dbMutate,
+      transferId,
+      manifestKey: WINDOW_MANIFEST_KEY,
+      projectionKey: projectionStoreKey,
+    })
+  } catch {
+    return { ok: false }
+  }
+  if (!result.ok) return result
+  applyTransferManifest(result)
+  if (result.record.closeSource) {
+    completed.source.__kaisolaSuppressPark = true
+    setImmediate(() => {
+      if (!completed.source.isDestroyed()) completed.source.close()
+    })
+  } else if (fallback && !completed.source.isDestroyed() && !completed.source.webContents.isDestroyed()) {
+    // A source renderer that never sent its completion ACK must not keep a
+    // stale in-memory duplicate after main repairs the authoritative store.
+    completed.source.webContents.reload()
+  }
+  return result
+}
+
 ipcMain.handle('window:detach-project', async (event, payload = {}) => {
   if (!payload.tab?.id || !payload.slice) return { ok: false, message: 'That project could not be moved.' }
   const source = BrowserWindow.fromWebContents(event.sender)
@@ -1365,14 +1481,6 @@ ipcMain.handle('window:detach-project', async (event, payload = {}) => {
     return { ok: true, target: 'same' }
   }
 
-  if (!CROSS_RENDERER_PROJECT_TRANSFERS_ENABLED) {
-    return {
-      ok: false,
-      disabled: true,
-      message: 'Moving a project between windows is temporarily unavailable while Kaisola protects its live sessions. A lone project can still be moved by dragging its window.',
-    }
-  }
-
   // ACP prompts stream through a request-specific renderer listener. Moving
   // between turns is lossless; moving mid-turn would strand that stream.
   const acpState = acpProjectTransferState(event.sender, payload.tab.id)
@@ -1391,13 +1499,36 @@ ipcMain.handle('window:detach-project', async (event, payload = {}) => {
       return { ok: false, message: 'Kaisola could not verify a free saved-window slot, so the project stayed here.' }
     }
   }
+  const transferId = `project-transfer-${Date.now()}-${++transferSeq}`
+  const closeSource = targetKind === 'existing' && source.__kaisolaAdoptBoot === true && payload.sourceTabCount === 1
+  const targetPrepared = await requestAdoptionPreparation(target, transferId)
+  if (!targetPrepared) {
+    if (targetKind === 'new') destroyDiscardedAdoptionWindow(target)
+    return { ok: false, message: 'The destination window did not become ready; the project stayed here.' }
+  }
+  try {
+    prepareProjectTransfer({
+      get: dbGet,
+      mutate: dbMutate,
+      transferId,
+      projectId: payload.tab.id,
+      sourceSlot: source.__kaisolaSlot == null ? null : Number(source.__kaisolaSlot),
+      targetSlot: target.__kaisolaSlot == null ? null : Number(target.__kaisolaSlot),
+      targetKind,
+      closeSource,
+    })
+  } catch (error) {
+    if (targetKind === 'new') destroyDiscardedAdoptionWindow(target)
+    return { ok: false, message: String(error?.message || 'Kaisola could not safely journal that project move.') }
+  }
+
   const acpMove = await transferAcpProject(event.sender, target.webContents, payload.tab.id)
   if (!acpMove.ok) {
+    abortTransferAndRestoreTarget(transferId, target)
     if (targetKind === 'new') destroyDiscardedAdoptionWindow(target)
     return { ok: false, message: 'That project already has an agent connection in the destination window.' }
   }
 
-  const transferId = `project-transfer-${Date.now()}-${++transferSeq}`
   const targetBounds = target.getBounds()
   const adoption = {
     tab: payload.tab,
@@ -1424,35 +1555,49 @@ ipcMain.handle('window:detach-project', async (event, payload = {}) => {
   if (!adopted) {
     pendingAdoptions.delete(target.webContents.id)
     await acpMove.rollback?.()
-    if (targetKind === 'new') destroyDiscardedAdoptionWindow(target)
+    abortTransferAndRestoreTarget(transferId, target, { reload: targetKind === 'existing' })
+    if (targetKind === 'new') {
+      target.__kaisolaSuppressPark = true
+      destroyDiscardedAdoptionWindow(target)
+    }
     return { ok: false, message: 'The destination window did not accept the project; everything remains in this window.' }
   }
-  acpMove.commit?.()
 
   if (!target.isDestroyed()) {
     if (targetKind === 'new' && !target.__kaisolaSavedId) {
       target.__kaisolaSavedId = idForSlot(Number(target.__kaisolaSlot))
       trackSavedWindow(target)
     }
+  }
+  try {
+    markProjectTransferCommitted({ get: dbGet, mutate: dbMutate, transferId })
+  } catch {
+    await acpMove.rollback?.()
+    abortTransferAndRestoreTarget(transferId, target, { reload: targetKind === 'existing' })
+    if (targetKind === 'new') {
+      target.__kaisolaSuppressPark = true
+      destroyDiscardedAdoptionWindow(target)
+    }
+    return { ok: false, message: 'Kaisola could not commit that move safely, so the project stayed in its original window.' }
+  }
+  acpMove.commit?.()
+
+  if (!target.isDestroyed()) {
     target.show()
     target.focus()
   }
-  const closeSource = targetKind === 'existing' && source.__kaisolaAdoptBoot === true && payload.sourceTabCount === 1
-  if (closeSource) {
-    completedTransfers.set(transferId, { source, sourceId: event.sender.id })
-    setTimeout(() => completedTransfers.delete(transferId), 30_000).unref?.()
-  }
+  const completed = { source, sourceId: event.sender.id, timer: null }
+  completed.timer = setTimeout(() => {
+    finalizeCompletedTransfer(transferId, completed.sourceId, { fallback: true })
+  }, 30_000)
+  completed.timer.unref?.()
+  completedTransfers.set(transferId, completed)
   return { ok: true, transferId, target: targetKind, closeSource }
 })
 
 ipcMain.handle('window:finish-transfer', (event, { transferId } = {}) => {
-  const completed = completedTransfers.get(transferId)
-  if (!completed || completed.sourceId !== event.sender.id) return { ok: false }
-  completedTransfers.delete(transferId)
-  setImmediate(() => {
-    if (!completed.source.isDestroyed()) completed.source.close()
-  })
-  return { ok: true }
+  const result = finalizeCompletedTransfer(transferId, event.sender.id)
+  return { ok: result.ok === true }
 })
 
 ipcMain.handle('window:pop', (event, { termId, title, hue, projectId } = {}) => {
@@ -1749,6 +1894,19 @@ if (hasSingleInstanceLock) app.whenReady().then(async () => {
   registerGrobidHandlers(ipcMain)
   registerSandboxHandlers(ipcMain)
   registerDbHandlers(ipcMain)
+  try {
+    const recoveredTransfers = recoverProjectTransfers({
+      get: dbGet,
+      mutate: dbMutate,
+      manifestKey: WINDOW_MANIFEST_KEY,
+      projectionKey: projectionStoreKey,
+    })
+    applyTransferManifest(recoveredTransfers)
+  } catch (error) {
+    // Leave the journal intact and fail closed on future transfers. A later
+    // launch can retry without guessing which renderer owned the project.
+    console.error('[project-transfer] recovery failed', error)
+  }
   attentionService = new AttentionService({
     get: dbGet,
     set: (key, value) => dbMutate({ set: { [key]: value } }),

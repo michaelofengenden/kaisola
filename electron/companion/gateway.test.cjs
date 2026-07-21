@@ -22,6 +22,7 @@ function setup({
   ledgerAdapter,
   deviceCapabilities = ['observe'],
   enabledCapabilities = ['observe'],
+  transportHintProvider,
   logger,
 } = {}) {
   let now = 1_784_250_001_200
@@ -46,6 +47,7 @@ function setup({
     attentionService,
     ledgerAdapter,
     enabledCapabilities,
+    transportHintProvider,
     logger,
     now: () => now,
   })
@@ -113,6 +115,17 @@ test('first loopback connection receives desktop hello and a coherent board snap
     { id: 'done', count: 1 },
   ])
   assert.equal(session.stats().lastSentSeq, 1)
+})
+
+test('desktop hello securely refreshes the current LAN and Tailscale routes', async () => {
+  const transportHint = {
+    service: '_kaisola._tcp', protocol: 'tcp', host: '192.168.1.23', tailscaleHost: '100.90.1.14', port: 49321,
+  }
+  const { hello, publish, transport } = setup({ transportHintProvider: () => transportHint })
+  publish()
+  await transport.sendFromDevice(hello())
+  const desktopHello = transport.receiveForDevice().find((frame) => frame.kind === 'hello')
+  assert.deepEqual(desktopHello.body.transportHint, transportHint)
 })
 
 test('reconnect from an acknowledged cursor receives only the ordered live suffix', async () => {

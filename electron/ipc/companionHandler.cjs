@@ -10,7 +10,7 @@ const {
   CompanionPairingManager,
   DEFAULT_PAIRING_TTL_MS,
 } = require('../companion/pairing.cjs')
-const { BonjourCompanionTransport } = require('../companion/bonjourTransport.cjs')
+const { BonjourCompanionTransport, DEFAULT_COMPANION_PORT } = require('../companion/bonjourTransport.cjs')
 const { CompanionGateway } = require('../companion/gateway.cjs')
 const { CompanionStateHub } = require('../companion/stateHub.cjs')
 const { CompanionPreferenceStore } = require('../companion/preferenceStore.cjs')
@@ -122,6 +122,10 @@ class CompanionHandler {
       ...gatewayOptions,
       desktopId: this.deviceStore.desktopIdentity().id,
       stateHub: this.stateHub,
+      // The provider is evaluated only after the listener is alive. This lets
+      // already-paired phones learn a newly installed Tailscale route in the
+      // authenticated hello without weakening or repeating pairing.
+      transportHintProvider: () => this.transport?.pairingTransportHint?.(),
     })
     this.pairingManager = pairingManager ?? new CompanionPairingManager({ deviceStore: this.deviceStore, now })
 
@@ -130,7 +134,7 @@ class CompanionHandler {
       pairingManager: this.pairingManager,
       deviceStore: this.deviceStore,
       host: '0.0.0.0',
-      port: 0,
+      port: DEFAULT_COMPANION_PORT,
       logger,
     }
     this.transport = transport
@@ -138,7 +142,6 @@ class CompanionHandler {
     if (!this.transport?.enable || !this.transport?.disable || !this.transport?.status) {
       throw new Error('companion transport is invalid')
     }
-
     this.storeListeners = new Map()
     for (const eventName of DEVICE_STORE_EVENTS) {
       const listener = () => this.#emitState()
@@ -193,13 +196,21 @@ class CompanionHandler {
       connected: this.deviceStore.isConnected?.(device.deviceId) === true,
     }))
     const connected = devices.reduce((count, device) => count + Number(device.connected), 0)
+    const tailscaleAvailable = listening && transportStatus?.tailscaleAvailable === true
     let status
-    if (this.startFailed) status = 'Companion is reconnecting to the local network.'
-    else if (!this.desiredEnabled) status = 'Companion is off. No local-network listener is running.'
+    if (!this.desiredEnabled) status = 'Companion is off. No local-network listener is running.'
+    else if (this.startFailed) status = 'Companion is reconnecting to the local network.'
     else if (!listening) status = 'Companion is starting on the local network.'
+    else if (connected === 0 && tailscaleAvailable) status = 'Ready nearby over LAN or away through Tailscale.'
     else if (connected === 0) status = 'Listening for paired devices on your local network.'
     else status = `${connected} paired ${connected === 1 ? 'device is' : 'devices are'} connected.`
-    return { enabled: this.desiredEnabled, listening, status, devices }
+    return {
+      enabled: this.desiredEnabled,
+      listening,
+      remote: { kind: 'tailscale', available: tailscaleAvailable },
+      status,
+      devices,
+    }
   }
 
   async setEnabled(value) {
@@ -265,7 +276,10 @@ class CompanionHandler {
 
   async startPairing({ capabilities = CAPABILITIES } = {}) {
     await this.transition.catch(() => {})
-    if (this.disposed || !this.getState().listening) throw new Error('Enable Companion before pairing a device.')
+    const state = this.getState()
+    if (this.disposed || !state.listening) {
+      throw new Error('Enable Companion before pairing a device.')
+    }
     const requestedCapabilities = validateCapabilities(capabilities, { defaultObserve: true })
     const transportHint = this.transport.pairingTransportHint?.()
       ?? { service: '_kaisola._tcp', protocol: 'tcp' }

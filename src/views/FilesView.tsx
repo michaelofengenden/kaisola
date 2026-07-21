@@ -289,6 +289,8 @@ export function FilesView() {
   const externalDirtyRef = useRef(new Set<string>())
   const localWriteEchoRef = useRef(new Map<string, { content: string; at: number }>())
   const paneRef = useRef<HTMLDivElement>(null)
+  const findInputRef = useRef<HTMLInputElement>(null)
+  const lastContentSurfaceRef = useRef<'preview' | 'editor' | null>(null)
   const zoomRef = useRef(fileTextZoom)
   const pendingZoomRef = useRef(fileTextZoom)
   const zoomFrameRef = useRef<number | null>(null)
@@ -949,6 +951,21 @@ export function FilesView() {
     return () => window.removeEventListener('keydown', onKey)
   }, [])
 
+  // Route Command-F to the rendered document only when that is the last file
+  // surface the user touched. Split/source editing keeps its own editor find.
+  useEffect(() => {
+    const onKey = (event: KeyboardEvent) => {
+      if (!(event.metaKey || event.ctrlKey) || event.key.toLowerCase() !== 'f') return
+      if (lastContentSurfaceRef.current !== 'preview' || !active || !previewKind || active.mode === 'edit') return
+      event.preventDefault()
+      event.stopPropagation()
+      findInputRef.current?.focus()
+      findInputRef.current?.select()
+    }
+    window.addEventListener('keydown', onKey, true)
+    return () => window.removeEventListener('keydown', onKey, true)
+  }, [active, previewKind])
+
   // Markdown behaves like a document editor: after the user pauses, every
   // dirty Markdown tab is committed quietly. Cmd+S remains an immediate save.
   useEffect(() => {
@@ -1381,6 +1398,7 @@ export function FilesView() {
         <div className="fx-doc-find">
           <Icon name="Search" size={12} className="muted" />
           <input
+            ref={findInputRef}
             value={findText}
             onChange={(e) => setFindText(e.target.value)}
             placeholder="Find in document"
@@ -1564,7 +1582,13 @@ export function FilesView() {
         {active ? (
           <>
             <div className={`fx-viewer${pdfSourcePane ? ' fx-viewer-pdf-split' : ''}`}>
-              <div className={pdfSourcePane ? 'fx-pdf-main-pane' : 'fx-viewer-main'}>
+              <div
+                className={pdfSourcePane ? 'fx-pdf-main-pane' : 'fx-viewer-main'}
+                onPointerDownCapture={(event) => {
+                  const target = event.target
+                  lastContentSurfaceRef.current = target instanceof Element && target.closest('.fx-doc') ? 'preview' : 'editor'
+                }}
+              >
                 {active.loading ? (
                   <div className="fx-loading aurora"><span className="shimmer-text">Loading…</span></div>
                 ) : active.readError ? (

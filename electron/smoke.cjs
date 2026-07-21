@@ -550,12 +550,20 @@ app.whenReady().then(async () => {
   const term = await win.webContents.executeJavaScript(`(async () => {
     const st = window.__kaisola.getState()
     const previousTheme = st.theme
+    const previousTermBackground = st.termBackground
     st.setLayoutMode('studio')
     st.setDock(true, 'terminal')
     st.setTheme('light')
     await new Promise(r => setTimeout(r, 150))
     const lightHosts = [...document.querySelectorAll('.term-wrap[data-terminal-theme="light"]')]
     const lightComposerPalette = lightHosts.length > 0 && lightHosts.every((host) => host.dataset.ansiBlack === '#eef0f4')
+    st.setTermBackground('paper')
+    st.setTheme('dark')
+    await new Promise(r => setTimeout(r, 150))
+    const darkHosts = [...document.querySelectorAll('.term-wrap[data-terminal-theme="dark"]')]
+    const darkPaperInvariant = darkHosts.length > 0 && darkHosts.every((host) =>
+      ['#0d0f13', '#0b0d11'].includes(host.dataset.terminalBackground) && host.dataset.ansiBlack === '#14161c'
+    ) && getComputedStyle(document.documentElement).getPropertyValue('--term-bg').trim() === '#0b0d11'
     const runRes = await window.kaisola.terminal.run('echo pasola-run-ok')
     let buf = ''
     const id = 'smoke-pty'
@@ -567,6 +575,7 @@ app.whenReady().then(async () => {
     await window.kaisola.terminal.write(id, 'pwd\\r', st.activeProjectId)
     await new Promise(r => setTimeout(r, 600))
     off(); window.kaisola.terminal.kill(id, st.activeProjectId)
+    st.setTermBackground(previousTermBackground)
     st.setTheme(previousTheme)
     return {
       run: !!(runRes && runRes.ok && (runRes.stdout||'').includes('pasola-run-ok')),
@@ -575,6 +584,7 @@ app.whenReady().then(async () => {
       dock: !!document.querySelector('.session-card'),
       host: !!document.querySelector('.term-host'),
       lightComposerPalette,
+      darkPaperInvariant,
     }
   })()`)
   console.log('TERMINAL=' + JSON.stringify(term))
@@ -901,7 +911,8 @@ app.whenReady().then(async () => {
       noMention: !document.querySelector('button[title^="Reference a paper"]'),
       compactChrome: !document.querySelector('.tabstrip-tools') && !!document.querySelector('.shell-sidebar-footer'),
       noLayoutControl: !document.querySelector('.shell-layout-trigger'),
-      settingsControl: !!document.querySelector('.shell-sidebar-footer .shell-settings-trigger[aria-label="Open settings"]') && !!document.querySelector('.shell-sidebar-footer .app-account-avatar'),
+      profileControl: !document.querySelector('.shell-sidebar-footer .shell-settings-trigger[aria-label="Open settings"]') &&
+        !!document.querySelector('.shell-sidebar-footer .app-account-avatar'),
       addContext: !!document.querySelector('.composer-add[aria-label*="Add files"]'),
     }
   })()`)
@@ -1497,7 +1508,9 @@ a^2 + b^2 = c^2
     document.querySelector('.fx-doc-markdown')?.dispatchEvent(new MouseEvent('dblclick', { bubbles: true, cancelable: true }))
     await new Promise((r) => setTimeout(r, 180))
     const cleanEditor = document.querySelector('.fx-doc-markdown[data-editing] .fx-doc-page[contenteditable="true"]')
-    const mdCleanEdit = !!cleanEditor && !!document.querySelector('.fx-md-editing') && !document.querySelector('.fx-doc-markdown .cm-editor')
+    const mdCleanEdit = !!cleanEditor && !document.querySelector('.fx-doc-markdown .cm-editor')
+    cleanEditor?.dispatchEvent(new MouseEvent('contextmenu', { bubbles: true, cancelable: true, clientX: 180, clientY: 180 }))
+    await new Promise((r) => setTimeout(r, 40))
     const mdAuthoringToolbar = !!document.querySelector('.fx-md-toolbar[role="toolbar"]') &&
       !!document.querySelector('.fx-md-toolbar [aria-label="Text style"]') &&
       !!document.querySelector('.fx-md-toolbar [aria-label="Bold"]') &&
@@ -1530,6 +1543,10 @@ a^2 + b^2 = c^2
     previewButton?.click()
     await new Promise((r) => setTimeout(r, 180))
     const mdCleanPreview = /Edited cleanly olive\\./.test(document.querySelector('.fx-doc-markdown')?.textContent || '')
+    document.querySelector('.fx-doc-markdown')?.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true, cancelable: true }))
+    window.dispatchEvent(new KeyboardEvent('keydown', { key: 'f', metaKey: true, bubbles: true, cancelable: true }))
+    await new Promise((r) => setTimeout(r, 30))
+    const mdCommandFind = document.activeElement === document.querySelector('.fx-doc-find input')
     const pane = document.querySelector('.fx-pane')
     const mdHeading = document.querySelector('.fx-doc-markdown h1')
     const mdHeadingBefore = mdHeading ? parseFloat(getComputedStyle(mdHeading).fontSize) : 0
@@ -1750,6 +1767,7 @@ a^2 + b^2 = c^2
       mdCleanMarkdown,
       mdAutosaved,
       mdCleanPreview,
+      mdCommandFind,
       htmlPreview,
       htmlSafe,
       texSource,
@@ -2323,7 +2341,8 @@ a^2 + b^2 = c^2
       filesOnRight: !!document.querySelector('.app-body > .wsrail[data-side="right"]'),
       hasPlus: !!document.querySelector('.stabs .drop-btn'),
       hasFiles: !!document.querySelector('.wsrail-files'),
-      hasUsage: !!document.querySelector('button[aria-label="Open usage"]'),
+      usageInProfile: !document.querySelector('.shell-sidebar-footer button[aria-label="Open usage"]') &&
+        !document.querySelector('.shell-sidebar-footer button[aria-label="Open settings"]'),
       hasTheme: !!document.querySelector('button[aria-label="Toggle color theme"]'),
     }
   })()`)
@@ -2352,8 +2371,24 @@ a^2 + b^2 = c^2
       !document.querySelector('.tabstrip, .top-session-row')
     const hierarchy = !!activeProject?.querySelector(':scope > .project-tree-row + .project-tree-children') &&
       document.querySelectorAll('.project-tree-node[data-project-id]').length === get().projectTabs.length
-    const leftUtilities = !!document.querySelector('.project-sidebar-bottom .shell-sidebar-footer .shell-settings-trigger') &&
-      !!document.querySelector('.project-sidebar-bottom .tabstrip-view-controls')
+    const leftUtilities = (() => {
+      const bottom = document.querySelector('.project-sidebar-bottom')
+      const view = bottom?.querySelector('.tabstrip-view-controls')
+      const footer = bottom?.querySelector('.shell-sidebar-footer')
+      if (!bottom || !view || !footer || footer.querySelector('.shell-settings-trigger, [aria-label="Open usage"]')) return false
+      const a = view.getBoundingClientRect()
+      const b = footer.getBoundingClientRect()
+      return Math.abs((a.top + a.height / 2) - (b.top + b.height / 2)) <= 1
+    })()
+    const activeProjectButton = activeProject?.querySelector(':scope > .project-tree-row > .project-tree-select')
+    activeProjectButton?.dispatchEvent(new MouseEvent('dblclick', { bubbles: true, cancelable: true }))
+    await wait()
+    const doubleClickDoesNotRename = !document.querySelector('.project-tree-rename')
+    activeProjectButton?.dispatchEvent(new MouseEvent('contextmenu', { bubbles: true, cancelable: true, clientX: 180, clientY: 180 }))
+    await wait()
+    const contextMenuRenames = [...document.querySelectorAll('.tree-menu .tree-menu-item')].some((item) => /Rename/.test(item.textContent || ''))
+    document.querySelector('.tree-menu-overlay')?.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true }))
+    await wait()
 
     // A project remains selectable after returning to it, and selecting the
     // active parent simply collapses/re-expands its children.
@@ -2417,7 +2452,7 @@ a^2 + b^2 = c^2
     const topSession = document.querySelector('.top-project-session-group .stab[data-active="true"], .top-project-session-group .stab')
     const sessionIdentity = !!topSession?.style.getPropertyValue('--sid').trim()
     get().setTabLayout(original); await wait()
-    return { rendered: true, leftOk, topOk, hierarchy, leftUtilities, topUtilities, projectRoundTrip, reciprocalToggle, verticalAddFlow, stateKept, staticPaint, accessible, sessionIdentity }
+    return { rendered: true, leftOk, topOk, hierarchy, leftUtilities, topUtilities, doubleClickDoesNotRename, contextMenuRenames, projectRoundTrip, reciprocalToggle, verticalAddFlow, stateKept, staticPaint, accessible, sessionIdentity }
   })()`)
   console.log('TAB_LAYOUTS=' + JSON.stringify(tabLayouts))
 
@@ -2446,9 +2481,10 @@ a^2 + b^2 = c^2
     topRestore?.click(); await new Promise((r) => setTimeout(r, 300))
     const restored = !!document.querySelector('.wsrail[data-side="right"]') && get().railOpen === true
 
-    // The direct gear and native Settings command both reopen the last pane.
+    // The profile menu and native Settings command both reopen the last pane.
     const openSettingsDirect = async () => {
-      document.querySelector('.shell-sidebar-footer .shell-settings-trigger[aria-label="Open settings"]')?.click(); await wait()
+      document.querySelector('.shell-sidebar-footer .app-account-avatar')?.click(); await wait()
+      document.querySelector('.app-account-menu .shell-settings-trigger')?.click(); await wait()
     }
     get().setSettingsOpen(true, 'general'); await wait()
     const opensRequestedGeneral = /Appearance/.test(document.querySelector('.settings-pane')?.textContent || '')
@@ -2698,7 +2734,10 @@ a^2 + b^2 = c^2
   await injectAuthProfile()
   const settings = await win.webContents.executeJavaScript(`(async () => {
     const expectedPane = window.__kaisola.getState().settingsPane || 'general'
-    const settingsButton = document.querySelector('.shell-sidebar-footer .shell-settings-trigger[aria-label="Open settings"]')
+    const avatar = document.querySelector('.shell-sidebar-footer .app-account-avatar')
+    avatar?.click()
+    await new Promise((r) => setTimeout(r, 60))
+    const settingsButton = document.querySelector('.app-account-menu .shell-settings-trigger')
     settingsButton?.click()
     await new Promise((r) => setTimeout(r, 150))
     // Zed-style settings: a nav of categories, one pane at a time
@@ -2741,8 +2780,9 @@ a^2 + b^2 = c^2
     await new Promise((r) => setTimeout(r, 30))
     const permanentFilesControls = document.querySelectorAll('.tabstrip-view-controls > button').length === 2 &&
       !document.querySelector('.canvas-local-close, .file-preview-toggle, .wsrail-head button')
-    const directSettings = !!document.querySelector('.shell-sidebar-footer .shell-settings-trigger[aria-label="Open settings"]')
-    return { settingsSeparate: !!settingsButton, directSettings, reopensRemembered, hasLayoutSettings, noAdvancedStyles, noStandaloneLayout: !document.querySelector('.shell-layout-trigger'), hasAppearance, hasUsage, hasDiskResidency, hasTabLayout, extensionsInSettings, updatesInSettings, permanentFilesControls, noSidebarControls: !hasSidebarControls, keyboardSearchFocus, visualChoices }
+    const settingsInProfile = !!settingsButton && !!avatar &&
+      !document.querySelector('.shell-sidebar-footer .shell-settings-trigger[aria-label="Open settings"]')
+    return { settingsInProfile, profileReopensRemembered: reopensRemembered, hasLayoutSettings, noAdvancedStyles, noStandaloneLayout: !document.querySelector('.shell-layout-trigger'), hasAppearance, hasUsage, hasDiskResidency, hasTabLayout, extensionsInSettings, updatesInSettings, permanentFilesControls, noSidebarControls: !hasSidebarControls, keyboardSearchFocus, visualChoices }
   })()`)
   console.log('SETTINGS=' + JSON.stringify(settings))
 
@@ -4018,7 +4058,7 @@ a^2 + b^2 = c^2
     !rootChildren || !minimalShell.noWorkflowSidebar || !minimalShell.splitSidebarsDefault || !minimalShell.hasSessions || !minimalShell.noBoard || !minimalShell.railFilesOnly || !minimalShell.hasEmptyLauncher || !minimalShell.stageFiles || !minimalShell.studioDefault || !minimalShell.controlsFollowLeft || !minimalShell.permanentViewControls || !accountUi.avatar || !accountUi.headshot || !accountUi.menu || !accountUi.usageInMenu || !accountUi.settingsInMenu || !accountUi.usageOpened || !accountUi.avatarOnly || !accountUi.anchoredToLayout || !accountUi.menuAdjacent || !accountUi.menuFits || !accountUi.aligned || !claudeOptIn || !nativeWindow.rendererClippedMaterial || !icon.exists || !icon.usable || !icon.square || !icon.large || !glass.appSamplingLayer || !glass.chromeGlass || !glass.activeTintWhite || !glass.railLayerFlattened || !glass.contentGlassy || !glass.sessionGlassy || !glass.termGlassTint || !glass.blurKeepsGlass || !glass.lightsGray || !glass.nativeWindowRounding ||
     !emptyOk || !demoOk ||
     !review.opened || !review.closed || !review.decided ||
-    !term.run || !term.ptyOk || !term.cdWorks || !term.dock || !term.host || !term.lightComposerPalette ||
+    !term.run || !term.ptyOk || !term.cdWorks || !term.dock || !term.host || !term.lightComposerPalette || !term.darkPaperInvariant ||
     !viewportPersistence.terminalBottomKept || !viewportPersistence.assistantBottomAfterReflow || !viewportPersistence.assistantBottomAfterRemount || !viewportPersistence.draftKept ||
     !terminalContinuity.mounted || !terminalContinuity.rendererReleased || !terminalContinuity.reattached || !terminalContinuity.samePid || !terminalContinuity.spooled || !terminalContinuity.replayed || !terminalContinuity.bootOnce ||
     !terminalContinuity.receiptPersisted || !terminalContinuity.tabReceipt || !terminalContinuity.receiptShown || !terminalContinuity.receiptCleared ||
@@ -4030,7 +4070,7 @@ a^2 + b^2 = c^2
     !dd.hasBtn || !dd.newSession || !dd.portal || dd.items < 2 || !dd.clickAway ||
     !permrules.saved || !permrules.cascaded || !permrules.autoAnswered || !permrules.rejectCascade ||
     !sensitive.surfaced || !sensitive.stillPending || !sensitive.diffFlagged || sensitive.pendingAfter !== 0 ||
-    !activityUi.card || !activityUi.hasSubagent || !activityUi.hasTerminal || !activityUi.hasStatus || !activityUi.standardizedDot || !activityUi.openBtn || !activityUi.noContext || !activityUi.noMention || !activityUi.compactChrome || !activityUi.noLayoutControl || !activityUi.settingsControl || !activityUi.addContext ||
+    !activityUi.card || !activityUi.hasSubagent || !activityUi.hasTerminal || !activityUi.hasStatus || !activityUi.standardizedDot || !activityUi.openBtn || !activityUi.noContext || !activityUi.noMention || !activityUi.compactChrome || !activityUi.noLayoutControl || !activityUi.profileControl || !activityUi.addContext ||
     !composerAddUi.button || !composerAddUi.menu || !composerAddUi.files || !composerAddUi.plugins || !composerAddUi.sessions || !composerAddUi.noPaperPin || !composerAddUi.opensAbove || !composerAddUi.elevatedFocus ||
     !attentionUi.running || !attentionUi.pulse || !attentionUi.completed || !attentionUi.still || !attentionUi.cleared || !attentionUi.nativeAttention ||
     !brokerActivity.created || !brokerActivity.began || !brokerActivity.detached || !brokerActivity.settled || !brokerActivity.durable || !brokerActivity.responseClock ||
@@ -4043,7 +4083,7 @@ a^2 + b^2 = c^2
     !auth.hasUrl || auth.code !== 'ABCD-1234' || !auth.done ||
     !cards.cardPerView || !cards.chatLeftOfFiles || !cards.soloHeadSuppressed || !cards.noDockPanel || !cards.emptyMessageGone || !fschk.listed || !fschk.read || !fschk.wrote || !fschk.pasted ||
     !fileui.hasSearch || fileui.resultCount < 1 || fileui.tabs < 1 || !fileui.alphaPreview || !fileui.previewReplaced || !fileui.betaPinned || !fileui.hasBeta || !fileui.activeBeta ||
-    !fileui.mdPreview || !fileui.mdImage || !fileui.mdVideo || !fileui.mdMark || !fileui.mdExternal || !fileui.mdCleanEdit || !fileui.mdAuthoringToolbar || !fileui.mdBoldCommand || !fileui.mdCleanMarkdown || !fileui.mdAutosaved || !fileui.mdCleanPreview || !fileui.mdReadableChannel || !fileui.mdSplitFillsPane ||
+    !fileui.mdPreview || !fileui.mdImage || !fileui.mdVideo || !fileui.mdMark || !fileui.mdExternal || !fileui.mdCleanEdit || !fileui.mdAuthoringToolbar || !fileui.mdBoldCommand || !fileui.mdCleanMarkdown || !fileui.mdAutosaved || !fileui.mdCleanPreview || !fileui.mdCommandFind || !fileui.mdReadableChannel || !fileui.mdSplitFillsPane ||
     !fileui.htmlPreview || !fileui.htmlSafe || !fileui.texSource || !fileui.texEditable || !fileui.texNoPreview ||
     fileui.imageReadKind !== 'image' || !fileui.imageHasDataUrl || !fileui.imagePreview || !fileui.imageZoomed ||
     fileui.videoReadKind !== 'video' || !fileui.videoHasPreviewUrl || !fileui.videoPreview ||
@@ -4071,14 +4111,14 @@ a^2 + b^2 = c^2
     !windetach.recombined || !windetach.insertedAtDrop || !windetach.termsSame || !windetach.pidsSame || !windetach.sourceClosed || !windetach.targetReused || !windetach.windowCountRestored ||
     !toggle.hasFig || !toggle.quietAtRest || !toggle.putAway || !toggle.back || !toggle.hidesAll ||
     !autoname.named || !autoname.rowShows || !autoname.sticky || !autoname.manualWins || !autoname.termNamed || !autoname.promptTitle || !autoname.terminalManualWins ||
-    !minimalUi.noSidebar || !minimalUi.noSidebarResize || !minimalUi.noStageNav || !minimalUi.hasSessionSidebar || !minimalUi.hasProjectParents || !minimalUi.sessionsNested || !minimalUi.hasRail || !minimalUi.filesOnRight || !minimalUi.hasPlus || !minimalUi.hasFiles || !minimalUi.hasUsage || !minimalUi.hasTheme ||
-    !tabLayouts.rendered || !tabLayouts.leftOk || !tabLayouts.topOk || !tabLayouts.hierarchy || !tabLayouts.leftUtilities || !tabLayouts.topUtilities || !tabLayouts.projectRoundTrip || !tabLayouts.reciprocalToggle || !tabLayouts.verticalAddFlow || !tabLayouts.stateKept || !tabLayouts.staticPaint || !tabLayouts.accessible || !tabLayouts.sessionIdentity ||
+    !minimalUi.noSidebar || !minimalUi.noSidebarResize || !minimalUi.noStageNav || !minimalUi.hasSessionSidebar || !minimalUi.hasProjectParents || !minimalUi.sessionsNested || !minimalUi.hasRail || !minimalUi.filesOnRight || !minimalUi.hasPlus || !minimalUi.hasFiles || !minimalUi.usageInProfile || !minimalUi.hasTheme ||
+    !tabLayouts.rendered || !tabLayouts.leftOk || !tabLayouts.topOk || !tabLayouts.hierarchy || !tabLayouts.leftUtilities || !tabLayouts.topUtilities || !tabLayouts.doubleClickDoesNotRename || !tabLayouts.contextMenuRenames || !tabLayouts.projectRoundTrip || !tabLayouts.reciprocalToggle || !tabLayouts.verticalAddFlow || !tabLayouts.stateKept || !tabLayouts.staticPaint || !tabLayouts.accessible || !tabLayouts.sessionIdentity ||
     !intuitiveLayoutControls.permanentViewControls || !intuitiveLayoutControls.fileTreeIconOnly || !intuitiveLayoutControls.noLocalClose || !intuitiveLayoutControls.hidden || !intuitiveLayoutControls.topRestore || !intuitiveLayoutControls.restored || !intuitiveLayoutControls.noFooterRecovery || !intuitiveLayoutControls.noStandaloneLayout || !intuitiveLayoutControls.settingsOwned || !intuitiveLayoutControls.onlyTwoNavigationLayouts || !intuitiveLayoutControls.opensRequestedGeneral || !intuitiveLayoutControls.directReopensLast || !intuitiveLayoutControls.remembersInterface || !intuitiveLayoutControls.workspaceReversible || !intuitiveLayoutControls.panelsReversible || !intuitiveLayoutControls.navigationReversible || !intuitiveLayoutControls.controlsFollowLayout || !intuitiveLayoutControls.rareActionsInPalette || !intuitiveLayoutControls.previewPermanent ||
     !realPointerLayout.firstWorked || !realPointerLayout.reverseWorked || !realPointerLayout.stayedInteractive ||
     !nativeNavigationMenu.top || !nativeNavigationMenu.left || !nativeNavigationMenu.updates ||
     !narrowAgentUi.rendered || !narrowAgentUi.narrow || !narrowAgentUi.containerAware || !narrowAgentUi.composerFits || !narrowAgentUi.sendVisible || !narrowAgentUi.footerFits || !narrowAgentUi.wraps || !narrowAgentUi.draftReadable || !narrowAgentUi.draftScrollable || !narrowAgentUi.draftResponsive || !narrowAgentUi.sideAgnostic ||
     !inboxAnchorUi.anchoredAtZero || !inboxAnchorUi.badged || !inboxAnchorUi.staysAfterClear ||
-    !settings.settingsSeparate || !settings.directSettings || !settings.reopensRemembered || !settings.hasLayoutSettings || !settings.noAdvancedStyles || !settings.noStandaloneLayout || !settings.hasAppearance || !settings.hasUsage || !settings.hasDiskResidency || !settings.hasTabLayout || !settings.extensionsInSettings || !settings.updatesInSettings || !settings.permanentFilesControls || !settings.noSidebarControls || !settings.keyboardSearchFocus || !settings.visualChoices ||
+    !settings.settingsInProfile || !settings.profileReopensRemembered || !settings.hasLayoutSettings || !settings.noAdvancedStyles || !settings.noStandaloneLayout || !settings.hasAppearance || !settings.hasUsage || !settings.hasDiskResidency || !settings.hasTabLayout || !settings.extensionsInSettings || !settings.updatesInSettings || !settings.permanentFilesControls || !settings.noSidebarControls || !settings.keyboardSearchFocus || !settings.visualChoices ||
     !extensionsUi.opened || extensionsUi.cards < 8 || !extensionsUi.hasFilters || !extensionsUi.csvInstalled || !extensionsUi.jsonInstalled ||
     !extensionsUi.persisted || !extensionsUi.defaultUninstallPersisted || !extensionsUi.csvPreview || !extensionsUi.jsonPreview || !extensionsUi.boundedJsonPreview || !extensionsUi.closed ||
     !devExtensionHotReload.registered || !devExtensionHotReload.updated || !devExtensionHotReload.visible ||

@@ -4,6 +4,7 @@ import SwiftUI
 /// apps: no form, no chrome, the same Google account the desktop uses.
 struct SignInView: View {
     @EnvironmentObject private var auth: AuthModel
+    @Environment(\.colorScheme) private var colorScheme
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var appeared = false
 
@@ -55,7 +56,7 @@ struct SignInView: View {
 
                 googleButton
 
-                Text("Signing in links this phone to your Kaisola account. Pairing to a specific Mac happens next, over your local network.")
+                Text("Signing in links this phone to your Kaisola account. Pairing to a specific Mac happens next over an encrypted connection.")
                     .font(.caption2)
                     .foregroundStyle(.tertiary)
                     .multilineTextAlignment(.center)
@@ -96,7 +97,7 @@ struct SignInView: View {
                 if isSigningIn {
                     ProgressView()
                         .controlSize(.small)
-                        .tint(.black)
+                        .tint(colorScheme == .dark ? KaisolaTheme.accent : .black)
                 } else {
                     GoogleGlyph()
                         .frame(width: 18, height: 18)
@@ -104,10 +105,17 @@ struct SignInView: View {
                 Text(isSigningIn ? "Signing in…" : "Continue with Google")
                     .font(.system(size: 16, weight: .semibold))
             }
-            .foregroundStyle(.black)
+            .foregroundStyle(colorScheme == .dark ? Color.primary : .black)
             .frame(maxWidth: .infinity)
             .frame(height: 52)
-            .background(Color.white, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+            .background(
+                colorScheme == .dark ? KaisolaTheme.darkRaised : Color.white,
+                in: RoundedRectangle(cornerRadius: 14, style: .continuous)
+            )
+            .overlay {
+                RoundedRectangle(cornerRadius: 14, style: .continuous)
+                    .stroke(colorScheme == .dark ? KaisolaTheme.darkBorder : Color.black.opacity(0.08), lineWidth: 0.5)
+            }
         }
         .buttonStyle(QuietPressStyle())
         .disabled(isSigningIn)

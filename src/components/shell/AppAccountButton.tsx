@@ -85,8 +85,8 @@ export function AppAccountButton({ showLabel = false }: { showLabel?: boolean })
             </div>
           </div>
           <div className="tree-menu-sep" />
-          {/* Account details retain a Settings route too; the shell also keeps
-              a direct gear for fast, one-click access. */}
+          {/* Lower-frequency workspace controls live with the account so both
+              navigation layouts can keep a single compact utility row. */}
           <button type="button" className="shell-settings-trigger" onClick={() => { setOpen(false); openSettings(true) }}>
             <Icon name="Settings" size={13} /> Settings
           </button>

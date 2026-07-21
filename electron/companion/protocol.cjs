@@ -106,12 +106,26 @@ function validateCapabilities(value, label = 'capabilities') {
   return [...unique]
 }
 
+function validateTransportHint(value, label = 'transportHint') {
+  assertPlainObject(value, label)
+  assertAllowedKeys(value, new Set(['service', 'protocol', 'host', 'port', 'tailscaleHost']), label)
+  if (value.service !== '_kaisola._tcp' || value.protocol !== 'tcp') fail('invalid_transport', `${label} is invalid`)
+  for (const field of ['host', 'tailscaleHost']) {
+    if (value[field] != null && (typeof value[field] !== 'string' || value[field].length < 1 || value[field].length > 253 || /[\0\r\n]/.test(value[field]))) {
+      fail('invalid_transport', `${label}.${field} is invalid`)
+    }
+  }
+  if (value.port != null) safeInteger(value.port, `${label}.port`, { min: 1, max: 65_535 })
+  return JSON.parse(encoded(value))
+}
+
 function validateHello(body) {
   if (body.type !== 'hello') fail('unknown_type', 'hello frame type is invalid')
   if (body.role !== 'desktop' && body.role !== 'device') fail('invalid_role', 'hello role is invalid')
   if (body.protocolMinor != null) safeInteger(body.protocolMinor, 'body.protocolMinor', { max: 10_000 })
   if (body.lastAck != null) safeInteger(body.lastAck, 'body.lastAck')
   validateCapabilities(body.capabilities ?? [])
+  if (body.transportHint != null) validateTransportHint(body.transportHint, 'body.transportHint')
 }
 
 function validateEvent(body) {
@@ -229,4 +243,5 @@ module.exports = {
   validateCapabilities,
   validateEnvelope,
   validateIdentifier,
+  validateTransportHint,
 }

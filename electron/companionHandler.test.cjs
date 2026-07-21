@@ -90,6 +90,7 @@ class FakeTransport extends EventEmitter {
       internalPath: '/private/secret/companion.sock',
       connections: 0,
       unauthenticatedClients: 0,
+      tailscaleAvailable: false,
     }
   }
 }
@@ -181,11 +182,12 @@ test('Companion IPC is registered default-disabled without starting a LAN listen
   const { handler, handlers, transport } = setup(t)
   assert.deepEqual([...handlers.keys()], [...HANDLER_CHANNELS])
   assert.equal(transport.options.host, '0.0.0.0')
-  assert.equal(transport.options.port, 0)
+  assert.equal(transport.options.port, 49321)
   assert.equal(transport.enableCalls, 0)
   assert.deepEqual(handler.getState(), {
     enabled: false,
     listening: false,
+    remote: { kind: 'tailscale', available: false },
     status: 'Companion is off. No local-network listener is running.',
     devices: [],
   })
@@ -251,6 +253,25 @@ test('a transient listener failure keeps intent on and heals automatically', asy
   await new Promise((resolve) => setTimeout(resolve, 160))
   assert.equal(transport.enableCalls, 2)
   assert.equal(handler.getState().listening, true)
+})
+
+test('active Tailscale is reported without exposing its address or listener port', async (t) => {
+  class TailscaleTransport extends FakeTransport {
+    status() { return { ...super.status(), tailscaleAvailable: this.enabled } }
+    pairingTransportHint() {
+      return this.enabled
+        ? { service: '_kaisola._tcp', protocol: 'tcp', host: '192.168.1.23', tailscaleHost: '100.90.1.14', port: 49321 }
+        : { service: '_kaisola._tcp', protocol: 'tcp' }
+    }
+  }
+  const { handler } = setup(t, { makeTransport: (options) => new TailscaleTransport(options) })
+  const state = await handler.setEnabled(true)
+  assert.equal(state.remote.available, true)
+  assert.match(state.status, /LAN or away through Tailscale/)
+  assert.equal(JSON.stringify(state).includes('100.90.1.14'), false)
+  assert.equal(JSON.stringify(state).includes('49321'), false)
+  const pairing = await handler.startPairing()
+  assert.equal(JSON.parse(pairing.qrPayload).transportHint.tailscaleHost, '100.90.1.14')
 })
 
 test('wake refresh republishes the listener without dropping its connection', async (t) => {

@@ -270,7 +270,7 @@ const SECTION_GROUPS: ReadonlyArray<{ name: string; ids: readonly SectionId[] }>
 
 /** One quiet line under each pane title — sparse panes read as designed, not empty. */
 const SECTION_DESC: Record<SectionId, string> = {
-  general: 'Theme, native Live Glass or the lowest-memory Eco shell, and software updates.',
+  general: 'Theme, one clear shell appearance, and software updates.',
   usage: 'Live subscription windows for your signed-in Codex and Claude accounts.',
   interface: 'Workspace layout and quiet interface details.',
   extensions: 'Languages, previews, themes, and local development integrations installed in Kaisola.',
@@ -543,10 +543,24 @@ export function Settings() {
     void refresh()
     void bridge.settings.hasApiKey().then((s) => { setPresent(s.present); setFromEnv(!!s.fromEnv) })
     void bridge.settings.hasOpenaiKey().then((s) => setOaPresent(s.present))
-    if (isDesktop) void bridge.glass().then(setGlass)
+    if (isDesktop) void bridge.glass().then((current) => {
+      const wanted = perfMode === 'glass'
+      if (current.supported && current.enabled !== wanted) {
+        void bridge.glass({ enabled: wanted }).then(setGlass).catch(() => setGlass(current))
+      } else setGlass(current)
+    })
     const onCtrl = bridge.acp.onControls(() => void refresh())
     return () => { onCtrl() }
   }, [open])
+
+  const chooseAppearance = (mode: PerfMode) => {
+    setPerfMode(mode)
+    if (!isDesktop || !glass?.supported) return
+    // `perfMode` is the single user-facing appearance preference. Keep the
+    // native macOS material in lockstep instead of exposing a second switch
+    // that can contradict Glass/Eco.
+    void bridge.glass({ enabled: mode === 'glass' }).then(setGlass).catch(() => {})
+  }
 
   if (!open) return null
 
@@ -768,25 +782,9 @@ export function Settings() {
                     </button>)}
                   </div>
                 </div>
-                {glass?.supported && (
-                  <div className="settings-row">
-                    <span className="settings-row-label">Liquid Glass <span className="faint" style={{ fontWeight: 400 }}>· relaunch to apply</span></span>
-                    <div className="settings-row-control">
-                      <SettingsToggle
-                        checked={glass.enabled}
-                        label="Liquid Glass"
-                        onChange={(enabled) => {
-                          void bridge.glass({ enabled }).then(setGlass)
-                          pushToast('info', 'Liquid Glass applies on the next launch.')
-                        }}
-                        title="Apple's glass material behind the shell"
-                      />
-                    </div>
-                  </div>
-                )}
                 <div className="settings-choice-block">
-                  <div className="settings-choice-head"><span>Appearance energy</span><small>Live Glass measured within 1% of Eco in the paired probe</small>
-                    {windowModeMismatch && (
+                  <div className="settings-choice-head"><span>Appearance</span><small>Choose the shell material once</small>
+                    {(windowModeMismatch || (glass?.supported === true && glass.active !== (perfMode === 'glass'))) && (
                       <button type="button"
                         className="settings-chip"
                         onClick={() => {
@@ -800,16 +798,16 @@ export function Settings() {
                       </button>
                     )}
                   </div>
-                  <div className="settings-choice-grid settings-choice-grid-two" role="group" aria-label="Appearance energy">
+                  <div className="settings-choice-grid settings-choice-grid-two" role="group" aria-label="Appearance">
                     {([
-                      { value: 'glass', name: 'Live Glass', detail: 'Native chrome · fluid', icon: 'Sparkles' },
+                      { value: 'glass', name: 'Glass', detail: glass?.supported ? 'Native material · fluid' : 'Translucent · fluid', icon: 'Sparkles' },
                       { value: 'eco', name: 'Eco', detail: 'Opaque · lowest memory', icon: 'Leaf' },
-                    ] as const).map((choice) => <button type="button" key={choice.value} data-active={perfMode === choice.value || undefined} aria-pressed={perfMode === choice.value} onClick={() => setPerfMode(choice.value as PerfMode)}>
+                    ] as const).map((choice) => <button type="button" key={choice.value} data-active={perfMode === choice.value || undefined} aria-pressed={perfMode === choice.value} onClick={() => chooseAppearance(choice.value as PerfMode)}>
                       <Icon name={choice.icon} size={14} /><span><strong>{choice.name}</strong><small>{choice.detail}</small></span>
                     </button>)}
                   </div>
                 </div>
-                <p className="settings-note">Switching modes reopens only this window. Commands stay alive; projects, layouts, drafts, scrollback, and agent history rehydrate from disk.</p>
+                <p className="settings-note">Applying an appearance reopens only this window. Commands stay alive; projects, drafts, scrollback, and agent history remain on disk.</p>
                 {isDesktop && <UpdatesRow />}
               </>
             )}
@@ -965,13 +963,13 @@ export function Settings() {
                       ariaLabel="Terminal background"
                       value={termBackground}
                       options={[
-                        { value: 'paper', name: 'Paper (white)' },
+                        { value: 'paper', name: 'Paper (light mode)' },
                         { value: 'slate', name: 'Slate' },
                         { value: 'ink', name: 'Ink (dark)' },
                       ]}
                       onSelect={(v) => setTermBackground(v as TermBackground)}
                       align="right"
-                      title="Terminal surface tone — independent of the app theme"
+                      title="Terminal surface tone — dark mode always keeps terminals dark"
                     />
                   </div>
                 </div>

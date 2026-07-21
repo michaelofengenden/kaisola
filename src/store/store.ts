@@ -1749,7 +1749,7 @@ const postponePersistForNavigation = () => {
 }
 /** Durability barrier for ownership transfers and pagehide. The destination
  * must have the project on disk before it ACKs and lets the source delete it. */
-const flushPersistSync = () => {
+export const flushPersistSync = () => {
   cancelPersistSchedule()
   if (!pendingPersist) return
   const { name, value } = pendingPersist
@@ -5995,6 +5995,9 @@ export const useKaisola = create<KaisolaState>()(
         ...slice.closedStack.flatMap((closed) => closed.kind === 'term' ? [(closed as { term: { id: string } }).term.id] : []),
       ],
     )
+    // Main's crash journal snapshots this exact source store before any
+    // ownership handoff. Cross that durability barrier before invoking it.
+    flushPersistSync()
     const r = await bridge.windows.detachProject({
       tab: { ...tab, activity: undefined },
       slice: sanitizeSliceForPersist(slice),
@@ -6052,8 +6055,8 @@ export const useKaisola = create<KaisolaState>()(
     // Chrome closes a detached one-tab window once that tab lands back in an
     // existing window. Clear the throwaway slot first so restart cannot revive
     // a ghost copy; main closes only after this explicit source-side commit.
-    if (removed && sourceBecameEmpty && r.closeSource && ADOPT_BOOT && r.transferId) {
-      await discardCurrentWindowStore()
+    if (r.transferId) {
+      if (removed && sourceBecameEmpty && r.closeSource && ADOPT_BOOT) await discardCurrentWindowStore()
       await bridge.windows.finishTransfer(r.transferId).catch(() => {})
     }
   },

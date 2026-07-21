@@ -71,6 +71,8 @@ export interface CompanionState {
   listening: boolean
   /** Human diagnostic string — never a raw key, token, port, or path. */
   status: string
+  /** Optional private-network route. Raw host and port never enter renderer diagnostics. */
+  remote?: { kind: 'tailscale'; available: boolean }
   devices: CompanionDevice[]
 }
 export interface CompanionPairingStart {
@@ -976,8 +978,11 @@ export interface KaisolaBridge {
       transferId?: string
       dropX?: number
     }) => void): () => void
+    /** Flush the destination's current store before main journals its preimage. */
+    onPrepareAdoption(cb: (transferId: string) => void): () => void
     /** Listener is installed; main may now deliver a queued adoption safely. */
     adoptionReady(): void
+    adoptionPrepared(transferId: string): void
     adoptionComplete(transferId: string, ok: boolean): void
     /** Source-side commit after removal; closes a now-empty detached window. */
     finishTransfer(transferId: string): Promise<{ ok: boolean }>
@@ -1506,7 +1511,13 @@ const webMock: KaisolaBridge = {
     onAdoptProject() {
       return () => {}
     },
+    onPrepareAdoption() {
+      return () => {}
+    },
     adoptionReady() {
+      /* no native windows on web */
+    },
+    adoptionPrepared() {
       /* no native windows on web */
     },
     adoptionComplete() {

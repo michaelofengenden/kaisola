@@ -97,5 +97,6 @@ local-network / camera permissions get an explicit recovery path.
 
 ## Out of scope here
 
-Control (prompt/steer/terminal input — Phase 2), remote relay + APNs (Phase 3),
-Android. This milestone is the signed-in, LAN, read-only alpha.
+Control (prompt/steer/terminal input — Phase 2), LAN-first/Tailscale remote
+access + APNs (Phase 3), Android. This milestone is the signed-in, LAN,
+read-only alpha.

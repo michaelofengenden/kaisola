@@ -13,16 +13,24 @@ struct CompanionPairingTransportHint: Codable, Hashable, Sendable {
     let `protocol`: String
     let host: String?
     let port: Int?
+    let tailscaleHost: String?
 
     private enum CodingKeys: String, CodingKey, CaseIterable {
-        case service, `protocol`, host, port
+        case service, `protocol`, host, port, tailscaleHost
     }
 
-    init(service: String, protocol: String, host: String? = nil, port: Int? = nil) {
+    init(
+        service: String,
+        protocol: String,
+        host: String? = nil,
+        port: Int? = nil,
+        tailscaleHost: String? = nil
+    ) {
         self.service = service
         self.protocol = `protocol`
         self.host = host
         self.port = port
+        self.tailscaleHost = tailscaleHost
     }
 
     init(from decoder: Decoder) throws {
@@ -36,6 +44,22 @@ struct CompanionPairingTransportHint: Codable, Hashable, Sendable {
         `protocol` = try container.decode(String.self, forKey: .protocol)
         host = try container.decodeIfPresent(String.self, forKey: .host)
         port = try container.decodeIfPresent(Int.self, forKey: .port)
+        tailscaleHost = try container.decodeIfPresent(String.self, forKey: .tailscaleHost)
+    }
+
+    func validate() throws {
+        let validHost: (String?) -> Bool = { value in
+            value.map {
+                !$0.isEmpty && $0.count <= 253 && !$0.contains(where: { "\0\r\n".contains($0) })
+            } ?? true
+        }
+        guard service == "_kaisola._tcp",
+              `protocol` == "tcp",
+              validHost(host),
+              validHost(tailscaleHost),
+              port.map({ (1...65_535).contains($0) }) ?? true else {
+            throw CompanionCryptoError.invalidIdentity("transportHint")
+        }
     }
 }
 
@@ -99,15 +123,12 @@ struct CompanionPairingPayload: Codable, Hashable, Sendable {
               requestedCapabilities.contains(.observe),
               Set(requestedCapabilities).count == requestedCapabilities.count,
               requestedCapabilities.count <= CompanionCapability.allCases.count,
-              transportHint.service == "_kaisola._tcp",
-              transportHint.protocol == "tcp",
-              transportHint.host.map({ !$0.isEmpty && $0.count <= 253 && !$0.contains(where: { "\0\r\n".contains($0) }) }) ?? true,
-              transportHint.port.map({ (1...65_535).contains($0) }) ?? true,
               expiresAt >= 0,
               expiresAt <= 9_007_199_254_740_991,
               clockSkewMilliseconds >= 0 else {
             throw CompanionCryptoError.invalidIdentity("pairing payload")
         }
+        try transportHint.validate()
         guard try CanonicalJSON.data(from: self).count <= 16 * 1_024 else {
             throw CompanionCryptoError.frameTooLarge
         }

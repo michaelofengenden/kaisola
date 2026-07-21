@@ -26,15 +26,24 @@ final class TransportFramingTests: XCTestCase {
             service: "_kaisola._tcp",
             protocol: "tcp",
             host: "192.168.1.23",
-            port: 49_321
+            port: 49_321,
+            tailscaleHost: "100.90.1.14"
         )
         guard case let .hostPort(host, port)? = CompanionTransport.directEndpoint(from: hint) else {
             return XCTFail("Expected a direct host and port endpoint")
         }
         XCTAssertEqual(String(describing: host), "192.168.1.23")
         XCTAssertEqual(port.rawValue, 49_321)
+        guard case let .hostPort(tailscaleHost, tailscalePort)? = CompanionTransport.tailscaleEndpoint(from: hint) else {
+            return XCTFail("Expected a Tailscale host and port endpoint")
+        }
+        XCTAssertEqual(String(describing: tailscaleHost), "100.90.1.14")
+        XCTAssertEqual(tailscalePort.rawValue, 49_321)
         XCTAssertNil(CompanionTransport.directEndpoint(from: CompanionPairingTransportHint(
             service: "_kaisola._tcp", protocol: "tcp", host: "192.168.1.23", port: 0
+        )))
+        XCTAssertNil(CompanionTransport.tailscaleEndpoint(from: CompanionPairingTransportHint(
+            service: "_kaisola._tcp", protocol: "tcp", port: 0, tailscaleHost: "100.90.1.14"
         )))
     }
 

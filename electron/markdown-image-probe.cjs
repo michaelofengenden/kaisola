@@ -116,7 +116,7 @@ app.whenReady().then(async () => {
     }
   })()`) : null
 
-  const interactions = mounted ? await js(`(() => {
+  const interactions = mounted ? await js(`(async () => {
     const surface = document.querySelector('.fx-doc-markdown[data-editing] .fx-doc-page')
     const validImageCount = () => [...surface.querySelectorAll('[data-markdown-image-shell]')].filter((shell) => shell.querySelector('img')?.dataset.markdownSrc).length
     const first = surface.querySelector('[data-markdown-image-shell]')
@@ -155,11 +155,19 @@ app.whenReady().then(async () => {
     const trailing = [...surface.querySelectorAll('[data-markdown-image-shell]')].find((shell) => shell.querySelector('img')?.alt === 'Trailing')
     trailing.querySelector('[data-markdown-image-action="delete"]').click()
     const deleted = validImageCount() === 1
-    document.querySelector('.fx-md-toolbar [aria-label="Undo"]').click()
+    const useFormatting = async (label) => {
+      surface.dispatchEvent(new MouseEvent('contextmenu', { bubbles: true, cancelable: true, clientX: 180, clientY: 180 }))
+      await new Promise(requestAnimationFrame)
+      const button = document.querySelector('.fx-md-toolbar [aria-label="' + label + '"]')
+      if (!button) throw new Error('Formatting action did not open: ' + label)
+      button.click()
+      await new Promise(requestAnimationFrame)
+    }
+    await useFormatting('Undo')
     const undone = validImageCount() === 2
-    document.querySelector('.fx-md-toolbar [aria-label="Redo"]').click()
+    await useFormatting('Redo')
     const redone = validImageCount() === 1
-    document.querySelector('.fx-md-toolbar [aria-label="Undo"]').click()
+    await useFormatting('Undo')
     const restored = [...surface.querySelectorAll('[data-markdown-image-shell]')].find((shell) => shell.querySelector('img')?.alt === 'Trailing')
     restored.focus()
     restored.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true, cancelable: true }))

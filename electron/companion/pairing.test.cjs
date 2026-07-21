@@ -129,6 +129,21 @@ test('single-use QR binds the signed desktop record, requested observe capabilit
   assert.throws(() => manager.startPairing({ qrPayload: payload, connectionId: 'connection-claim-once', message1 }), (error) => error.code === 'pairing_offer_unavailable')
 })
 
+test('pairing signs and validates the optional Tailscale fallback without widening transport fields', (t) => {
+  const { manager, now } = setup(t)
+  const payload = manager.createOffer({
+    transportHint: {
+      service: '_kaisola._tcp', protocol: 'tcp', host: '192.168.1.23', tailscaleHost: '100.90.1.14', port: 49321,
+    },
+  })
+  assert.equal(payload.transportHint.host, '192.168.1.23')
+  assert.equal(payload.transportHint.tailscaleHost, '100.90.1.14')
+  assert.deepEqual(validatePairingPayload(payload, { now: now() }), payload)
+  assert.throws(() => manager.createOffer({
+    transportHint: { ...payload.transportHint, publicHost: 'example.test' },
+  }), /transportHint is invalid/)
+})
+
 test('QR expiry allows a bounded phone clock skew but desktop consumption uses authoritative strict time', (t) => {
   const { desktop, manager, setNow } = setup(t)
   const payload = manager.createOffer({ expiresInMs: 10_000 })

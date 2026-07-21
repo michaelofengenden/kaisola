@@ -329,6 +329,7 @@ function EditableMarkdownSurface({
   const imageDropRef = useRef<HTMLElement | null>(null)
   const imageHistoryRef = useRef<{ undo: Array<{ before: string; after: string }>; redo: Array<{ before: string; after: string }> }>({ undo: [], redo: [] })
   const [selectionState, setSelectionState] = useState<MarkdownSelectionState>(EMPTY_MARKDOWN_SELECTION)
+  const [formattingMenu, setFormattingMenu] = useState<{ left: number; top: number } | null>(null)
   const turndown = useMemo(() => {
     const service = new TurndownService({
       headingStyle: 'atx',
@@ -514,6 +515,27 @@ function EditableMarkdownSurface({
     return () => document.removeEventListener('selectionchange', captureSelection)
   }, [captureSelection])
 
+  useEffect(() => {
+    if (!formattingMenu) return
+    const closeFromPointer = (event: PointerEvent) => {
+      const target = event.target
+      if (target instanceof Element && target.closest('.fx-md-format-popover')) return
+      setFormattingMenu(null)
+    }
+    const close = () => setFormattingMenu(null)
+    const closeFromKey = (event: KeyboardEvent) => { if (event.key === 'Escape') close() }
+    window.addEventListener('pointerdown', closeFromPointer, true)
+    window.addEventListener('keydown', closeFromKey)
+    window.addEventListener('resize', close)
+    window.addEventListener('scroll', close, true)
+    return () => {
+      window.removeEventListener('pointerdown', closeFromPointer, true)
+      window.removeEventListener('keydown', closeFromKey)
+      window.removeEventListener('resize', close)
+      window.removeEventListener('scroll', close, true)
+    }
+  }, [formattingMenu])
+
   // Watcher-driven changes can land while Edit is open. Reconcile them when
   // this surface did not originate the update and the user is not typing.
   useEffect(() => {
@@ -550,6 +572,7 @@ function EditableMarkdownSurface({
     document.execCommand(command, false, value)
     syncMarkdown()
     captureSelection()
+    setFormattingMenu(null)
   }
 
   const createLink = () => {
@@ -567,6 +590,23 @@ function EditableMarkdownSurface({
     else document.execCommand('insertHTML', false, `<a href="${escapeAttr(href)}" data-markdown-href="${escapeAttr(href)}">${escapeAttr(href)}</a>`)
     syncMarkdown()
     captureSelection()
+    setFormattingMenu(null)
+  }
+
+  const showFormattingMenu = (clientX: number, clientY: number) => {
+    const width = 430
+    const height = 46
+    setFormattingMenu({
+      left: Math.max(12, Math.min(clientX, window.innerWidth - width - 12)),
+      top: Math.max(12, Math.min(clientY + 7, window.innerHeight - height - 12)),
+    })
+  }
+
+  const handleFormattingContextMenu = (event: React.MouseEvent<HTMLElement>) => {
+    event.preventDefault()
+    event.stopPropagation()
+    captureSelection()
+    showFormattingMenu(event.clientX, event.clientY)
   }
 
   const startImageResize = (event: React.PointerEvent<HTMLElement>) => {
@@ -696,6 +736,14 @@ function EditableMarkdownSurface({
     const shell = target.closest<HTMLElement>('[data-markdown-image-shell]')
     const action = target.closest<HTMLElement>('[data-markdown-image-action]')
     const resize = target.closest<HTMLElement>('[data-markdown-image-resize]')
+    if (event.key === 'ContextMenu' || (event.shiftKey && event.key === 'F10')) {
+      event.preventDefault()
+      captureSelection()
+      const rect = savedRange.current?.getBoundingClientRect()
+      const surfaceRect = surfaceRef.current?.getBoundingClientRect()
+      showFormattingMenu(rect?.left ?? surfaceRect?.left ?? 20, rect?.bottom ?? surfaceRect?.top ?? 20)
+      return
+    }
     if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === 'z') {
       const applied = applyImageHistory(event.shiftKey ? 'redo' : 'undo')
       if (applied) event.preventDefault()
@@ -756,6 +804,7 @@ function EditableMarkdownSurface({
 
   return (
     <>
+      {formattingMenu && <div className="fx-md-format-popover" style={formattingMenu} onContextMenu={(event) => event.preventDefault()}>
       <div className="fx-md-toolbar" role="toolbar" aria-label="Markdown formatting">
         <button type="button" onMouseDown={(event) => event.preventDefault()} onClick={() => runCommand('undo')} title="Undo  ⌘Z" aria-label="Undo">
           <Icon name="Undo2" size={14} />
@@ -804,8 +853,8 @@ function EditableMarkdownSurface({
         <button type="button" onMouseDown={(event) => event.preventDefault()} onClick={() => runCommand('formatBlock', '<pre>')} title="Code block" aria-label="Code block">
           <Icon name="Code2" size={14} />
         </button>
-        <span className="fx-md-editing"><span /> Editing Markdown</span>
       </div>
+      </div>}
       <article
         ref={surfaceRef}
         className="fx-doc-page md"
@@ -814,6 +863,7 @@ function EditableMarkdownSurface({
         role="textbox"
         aria-multiline="true"
         aria-label="Edit Markdown document"
+        aria-keyshortcuts="Shift+F10"
         spellCheck
         dangerouslySetInnerHTML={{ __html: sanitizedMarkup.current }}
         onInput={() => {
@@ -833,6 +883,7 @@ function EditableMarkdownSurface({
         onKeyUp={captureSelection}
         onMouseUp={captureSelection}
         onKeyDown={handleEditableKeyDown}
+        onContextMenu={handleFormattingContextMenu}
       />
     </>
   )

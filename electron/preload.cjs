@@ -512,7 +512,13 @@ const bridge = {
       ipcRenderer.on('tab:adopt', listener)
       return () => ipcRenderer.removeListener('tab:adopt', listener)
     },
+    onPrepareAdoption: (cb) => {
+      const listener = (_e, { transferId } = {}) => cb(transferId)
+      ipcRenderer.on('tab:prepare-adoption', listener)
+      return () => ipcRenderer.removeListener('tab:prepare-adoption', listener)
+    },
     adoptionReady: () => ipcRenderer.send('window:adopt-ready'),
+    adoptionPrepared: (transferId) => ipcRenderer.send('window:adoption-prepared', { transferId }),
     adoptionComplete: (transferId, ok) => ipcRenderer.send('window:adopt-complete', { transferId, ok }),
     finishTransfer: (transferId) => ipcRenderer.invoke('window:finish-transfer', { transferId }),
     // ── project tabs: native File/Window menu ⇄ the renderer's tab strip ──

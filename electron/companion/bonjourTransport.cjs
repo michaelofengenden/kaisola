@@ -8,6 +8,7 @@ const {
   MAX_SECURE_PLAINTEXT_BYTES,
   PROTOCOL_VERSION,
 } = require('./crypto.cjs')
+const { isTailscaleIpv4, tailscaleIpv4Address } = require('./tailscale.cjs')
 
 const SERVICE_TYPE = '_kaisola._tcp.local'
 const MDNS_ADDRESS = '224.0.0.251'
@@ -18,8 +19,12 @@ const MAX_MDNS_PACKET_BYTES = 9000
 const MAX_UNAUTHENTICATED_CLIENTS = 8
 const MAX_HANDSHAKE_WIRE_BYTES = 64 * 1024
 const MAX_SECURE_WIRE_BYTES = Math.ceil((MAX_SECURE_PLAINTEXT_BYTES + 16) * 4 / 3) + 2048
-const MAX_SOCKET_QUEUE_BYTES = 1024 * 1024
+// One encrypted protocol envelope expands when its ciphertext is base64-wrapped
+// into the Noise wire object. The queue must admit one maximum legal frame or
+// the nominal protocol limit becomes unreachable (especially off-network).
+const MAX_SOCKET_QUEUE_BYTES = MAX_SECURE_WIRE_BYTES + 4
 const AUTHENTICATION_TIMEOUT_MS = 30 * 1000
+const DEFAULT_COMPANION_PORT = 49321
 
 function dnsName(value) {
   const labels = String(value).replace(/\.$/, '').split('.')
@@ -135,7 +140,10 @@ function localIpv4Addresses(networkInterfaces = os.networkInterfaces()) {
   const addresses = new Set()
   for (const entries of Object.values(networkInterfaces)) {
     for (const entry of entries ?? []) {
-      if (entry.family === 'IPv4' && !entry.internal) addresses.add(entry.address)
+      // Tailscale is a unicast fallback, not a Bonjour LAN interface. Keeping
+      // it out of multicast A records makes local Wi-Fi the deterministic
+      // first route whenever both devices are nearby.
+      if (entry.family === 'IPv4' && !entry.internal && !isTailscaleIpv4(entry.address)) addresses.add(entry.address)
     }
   }
   return [...addresses]
@@ -147,6 +155,7 @@ function preferredLocalIpv4Address(networkInterfaces = os.networkInterfaces()) {
     for (const entry of entries ?? []) {
       if (entry.family !== 'IPv4' || entry.internal) continue
       const address = entry.address
+      if (isTailscaleIpv4(address)) continue
       const privateAddress = /^(?:10\.|192\.168\.|172\.(?:1[6-9]|2\d|3[01])\.)/.test(address)
       const linkLocal = /^169\.254\./.test(address)
       const interfaceRank = name === 'en0' ? 0
@@ -338,6 +347,8 @@ class BonjourCompanionTransport extends EventEmitter {
     port = 0,
     serverFactory = (handler) => net.createServer(handler),
     advertiserFactory = () => new MinimalMdnsAdvertiser(),
+    localHostProvider = preferredLocalIpv4Address,
+    tailscaleHostProvider = tailscaleIpv4Address,
     maxUnauthenticatedClients = MAX_UNAUTHENTICATED_CLIENTS,
     authenticationTimeoutMs = AUTHENTICATION_TIMEOUT_MS,
     logger,
@@ -353,6 +364,8 @@ class BonjourCompanionTransport extends EventEmitter {
     this.port = port
     this.serverFactory = serverFactory
     this.advertiserFactory = advertiserFactory
+    this.localHostProvider = localHostProvider
+    this.tailscaleHostProvider = tailscaleHostProvider
     this.maxUnauthenticatedClients = maxUnauthenticatedClients
     this.authenticationTimeoutMs = authenticationTimeoutMs
     this.logger = logger
@@ -362,20 +375,31 @@ class BonjourCompanionTransport extends EventEmitter {
     this.connections = new Set()
     this.pairingSockets = new Map()
     this.unauthenticatedClients = 0
+    this.stablePort = false
   }
 
   async enable() {
     if (this.enabled) return this.status()
     const server = this.serverFactory((socket) => this.#accept(socket))
     this.server = server
-    await new Promise((resolve, reject) => {
+    const listen = (port) => new Promise((resolve, reject) => {
       const onError = (error) => { server.off('listening', onListening); reject(error) }
       const onListening = () => { server.off('error', onError); resolve() }
       server.once('error', onError)
       server.once('listening', onListening)
-      server.listen({ host: this.host, port: this.port })
+      server.listen({ host: this.host, port })
     })
+    try {
+      await listen(this.port)
+    } catch (error) {
+      // A stale development process must not take local Companion down. Fall
+      // back to an ephemeral LAN port, but deliberately withhold the remote
+      // hint because only the stable port can survive a restart.
+      if (this.port === 0 || error?.code !== 'EADDRINUSE') throw error
+      await listen(0)
+    }
     const address = server.address()
+    this.stablePort = this.port !== 0 && address?.port === this.port
     this.advertiser = this.advertiserFactory()
     try {
       await this.advertiser.start({ desktopId: this.deviceStore.desktopIdentity().id, port: address.port })
@@ -393,6 +417,7 @@ class BonjourCompanionTransport extends EventEmitter {
   async disable() {
     if (!this.server && !this.enabled) return false
     this.enabled = false
+    this.stablePort = false
     for (const state of [...this.connections]) this.#closeState(state, 'companion_disabled')
     this.pairingSockets.clear()
     const advertiser = this.advertiser
@@ -587,6 +612,7 @@ class BonjourCompanionTransport extends EventEmitter {
       port: address && typeof address === 'object' ? address.port : null,
       connections: this.connections.size,
       unauthenticatedClients: this.unauthenticatedClients,
+      tailscaleAvailable: this.enabled && this.stablePort && !!this.tailscaleHostProvider?.(),
     }
   }
 
@@ -595,11 +621,13 @@ class BonjourCompanionTransport extends EventEmitter {
     if (!status.enabled || !Number.isSafeInteger(status.port)) {
       return { service: '_kaisola._tcp', protocol: 'tcp' }
     }
-    const host = preferredLocalIpv4Address()
+    const host = this.localHostProvider?.()
+    const tailscaleHost = this.stablePort ? this.tailscaleHostProvider?.() : null
     return {
       service: '_kaisola._tcp',
       protocol: 'tcp',
       ...(host ? { host, port: status.port } : {}),
+      ...(tailscaleHost ? { tailscaleHost, port: status.port } : {}),
     }
   }
 }
@@ -609,6 +637,7 @@ module.exports = {
   BonjourCompanionTransport,
   LengthFrameDecoder,
   MAX_HANDSHAKE_WIRE_BYTES,
+  DEFAULT_COMPANION_PORT,
   MAX_MDNS_PACKET_BYTES,
   MAX_SECURE_WIRE_BYTES,
   MAX_SOCKET_QUEUE_BYTES,

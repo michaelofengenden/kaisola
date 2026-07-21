@@ -235,16 +235,18 @@ app.whenReady().then(async () => {
   await wait(300)
   const canvasRestored = await win.webContents.executeJavaScript(`window.__kaisola.getState().canvasOpen`)
 
-  // Markdown enters the clean rich editor with the authoring toolbar.
+  // Markdown enters the clean rich editor; formatting appears contextually.
   await win.webContents.executeJavaScript(`window.__kaisola.getState().requestFile(${JSON.stringify(markdownFixture)}, 'preview', { pinned: true })`)
   await waitForSelector('.fx-doc-markdown')
   await win.webContents.executeJavaScript(`document.querySelector('.fx-doc-markdown')?.dispatchEvent(new MouseEvent('dblclick', { bubbles: true }))`)
   await waitForSelector('.fx-doc-markdown[data-editing]')
-  const markdownEditing = await win.webContents.executeJavaScript(`(() => {
+  const markdownEditing = await win.webContents.executeJavaScript(`(async () => {
     const root = document.querySelector('.fx-doc-markdown[data-editing]')
     const page = root?.querySelector('.fx-doc-page')
     if (!root || !page) return false
     page.focus()
+    page.dispatchEvent(new MouseEvent('contextmenu', { bubbles: true, cancelable: true, clientX: 180, clientY: 180 }))
+    await new Promise(requestAnimationFrame)
     return getComputedStyle(page).boxShadow === 'none' &&
       !!root.querySelector('.fx-md-toolbar[role="toolbar"]') &&
       !!root.querySelector('.fx-md-toolbar [aria-label="Bold"]')
@@ -286,9 +288,11 @@ app.whenReady().then(async () => {
   const newSessionOrder = await win.webContents.executeJavaScript(`[...document.querySelectorAll('.drop-menu .drop-item')].slice(0, 3).map((item) => item.textContent.trim())`)
   await win.webContents.executeJavaScript(`document.body.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true }))`)
 
-  // Settings is a direct utility in both layouts and a fresh session opens it
-  // on General; the profile menu remains a secondary route.
-  const directSettings = await win.webContents.executeJavaScript(`(() => { const button = document.querySelector('.shell-sidebar-footer .shell-settings-trigger'); button?.click(); return !!button })()`)
+  // Lower-frequency controls live in the account menu so the permanent footer
+  // remains one compact row. A fresh session still opens Settings on General.
+  await win.webContents.executeJavaScript(`document.querySelector('.shell-sidebar-footer [aria-label="Kaisola account"]')?.click()`)
+  await wait(100)
+  const directSettings = await win.webContents.executeJavaScript(`(() => { const button = document.querySelector('.app-account-menu .shell-settings-trigger'); button?.click(); return !!button })()`)
   await wait(160)
   const settingsGeneral = directSettings && await win.webContents.executeJavaScript(`document.querySelector('.settings-nav-item[data-active="true"]')?.textContent.trim() === 'General'`)
   await win.webContents.executeJavaScript(`document.querySelector('.settings-head [aria-label="Close"]')?.click()`)
@@ -310,8 +314,11 @@ app.whenReady().then(async () => {
   const footerSingleRow = await win.webContents.executeJavaScript(`(() => {
     const footer = document.querySelector('.shell-sidebar-footer')
     const controls = [...footer?.querySelectorAll('button') ?? []]
-    // Guaranteed row: search, usage, settings, inbox, theme, and avatar.
-    if (!footer || controls.length < 5 || footer.querySelector('.app-account-name')) return { ok: false, reason: 'missing footer controls' }
+    // Guaranteed row: search, inbox, theme, and avatar. Usage/settings live in
+    // the profile menu so this row remains intentionally sparse.
+    if (!footer || controls.length < 4 || footer.querySelector('.app-account-name') ||
+        footer.querySelector('[aria-label="Open usage"]') || footer.querySelector('[aria-label="Open settings"]') ||
+        !footer.querySelector('.app-account-avatar')) return { ok: false, reason: 'missing footer controls' }
     const tops = controls.map((control) => Math.round(control.getBoundingClientRect().top))
     const searchIcon = footer.querySelector('[aria-label="Open command palette"] svg')
     const bellIcon = footer.querySelector('.inbox-btn svg')

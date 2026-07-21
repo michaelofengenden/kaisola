@@ -86,7 +86,7 @@ function memoryNetwork() {
   }
 }
 
-function setup(t) {
+function setup(t, { port = 0, localHostProvider = () => '192.168.1.23', tailscaleHostProvider = () => null } = {}) {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'kaisola-bonjour-'))
   t.after(() => fs.rmSync(directory, { recursive: true, force: true }))
   const desktop = identityFromSeeds({
@@ -131,8 +131,11 @@ function setup(t) {
     pairingManager: manager,
     deviceStore: store,
     host: '127.0.0.1',
+    port,
     serverFactory: network.serverFactory,
     advertiserFactory: () => advertiser,
+    localHostProvider,
+    tailscaleHostProvider,
   })
   t.after(async () => { await service.disable() })
   return { advertiser, desktop, phone, store, manager, gateway, inbound, network, service, attachedTransport: () => attachedTransport }
@@ -190,6 +193,7 @@ test('minimal in-repo mDNS encoding advertises PTR, SRV, TXT, and local-interfac
   assert.ok(response.includes(Buffer.from([192, 168, 1, 23])))
   assert.deepEqual(localIpv4Addresses({
     en0: [{ family: 'IPv4', internal: false, address: '192.168.1.23' }],
+    utun4: [{ family: 'IPv4', internal: false, address: '100.90.1.14' }],
     lo0: [{ family: 'IPv4', internal: true, address: '127.0.0.1' }],
   }), ['192.168.1.23'])
   assert.equal(preferredLocalIpv4Address({
@@ -207,6 +211,7 @@ test('Bonjour listener and advertisement remain disabled until the explicit enab
     port: null,
     connections: 0,
     unauthenticatedClients: 0,
+    tailscaleAvailable: false,
   })
   assert.equal(advertiser.starts.length, 0)
   const enabled = await service.enable()
@@ -225,6 +230,23 @@ test('Bonjour listener and advertisement remain disabled until the explicit enab
   assert.equal(await service.disable(), true)
   assert.equal(advertiser.stops, 1)
   assert.equal(service.status().enabled, false)
+})
+
+test('stable listener publishes LAN first plus a signed Tailscale fallback', async (t) => {
+  const { service } = setup(t, {
+    port: 49321,
+    localHostProvider: () => '192.168.1.23',
+    tailscaleHostProvider: () => '100.90.1.14',
+  })
+  const enabled = await service.enable()
+  assert.equal(enabled.tailscaleAvailable, true)
+  assert.deepEqual(service.pairingTransportHint(), {
+    service: '_kaisola._tcp',
+    protocol: 'tcp',
+    host: '192.168.1.23',
+    port: 49321,
+    tailscaleHost: '100.90.1.14',
+  })
 })
 
 test('direct TCP resume performs Noise XX, explicit key confirmation, encrypted gateway frames, replay defense, and live revocation', async (t) => {

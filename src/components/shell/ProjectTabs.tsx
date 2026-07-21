@@ -1,4 +1,4 @@
-import { Fragment, useEffect, useRef, useState, type CSSProperties, type PointerEvent as ReactPointerEvent } from 'react'
+import { Fragment, useEffect, useRef, useState, type CSSProperties, type DragEvent as ReactDragEvent, type PointerEvent as ReactPointerEvent } from 'react'
 import { createPortal } from 'react-dom'
 import { useShallow } from 'zustand/react/shallow'
 import { useKaisola, GROUP_COLORS } from '../../store/store'
@@ -10,6 +10,15 @@ import { terminalAgentKey } from '../../lib/sessionHue'
 import { SessionTabs } from './SessionTabs'
 import { ShellSidebarFooter } from './ShellSidebarFooter'
 import { SavedWindows } from './SavedWindows'
+
+const dragEndedOutsideWindow = (event: ReactDragEvent<HTMLElement>) => {
+  const clientOutside = event.clientX < -8 || event.clientY < -8
+    || event.clientX > window.innerWidth + 8 || event.clientY > window.innerHeight + 8
+  const screenOutside = event.screenX < window.screenX - 8 || event.screenY < window.screenY - 8
+    || event.screenX > window.screenX + window.outerWidth + 8
+    || event.screenY > window.screenY + window.outerHeight + 8
+  return clientOutside || screenOutside
+}
 
 const basename = (p: string | null | undefined) => (p ? p.split('/').filter(Boolean).pop() : undefined)
 const tabLabel = (t: { title?: string; workspacePath: string | null }) => t.title ?? basename(t.workspacePath) ?? 'New Project'
@@ -154,7 +163,7 @@ export function ProjectTabs() {
               onDragEnd={(e) => {
                 // Dropped outside THIS window: main hit-tests other Kaisola tab
                 // strips first (recombine), otherwise creates a tear-off there.
-                const out = e.clientX < -8 || e.clientY < -8 || e.clientX > window.innerWidth + 8 || e.clientY > window.innerHeight + 8
+                const out = dragEndedOutsideWindow(e)
                 if (out && dragRef.current === tab.id) void detachProjectToWindow(tab.id, { x: e.screenX, y: e.screenY })
                 dragRef.current = null
               }}
@@ -208,7 +217,6 @@ export function ProjectTabs() {
                       switchProject(next.id)
                       queueMicrotask(() => document.querySelector<HTMLButtonElement>(`.ptab[data-project-id="${CSS.escape(next.id)}"] > .ptab-select`)?.focus())
                     }}
-                    onDoubleClick={() => beginRename(tab.id, label)}
                   />
                   <span className="ptab-content" aria-hidden="true">
                     <span className="ptab-badge" />
@@ -410,7 +418,11 @@ export function ProjectSessionSidebar() {
               }}
               onDragOver={(event) => { event.preventDefault(); event.dataTransfer.dropEffect = 'move' }}
               onDrop={() => { if (dragRef.current) reorderProjects(dragRef.current, tab.id); dragRef.current = null }}
-              onDragEnd={() => { dragRef.current = null }}
+              onDragEnd={(event) => {
+                const out = dragEndedOutsideWindow(event)
+                if (out && dragRef.current === tab.id) void detachProjectToWindow(tab.id, { x: event.screenX, y: event.screenY })
+                dragRef.current = null
+              }}
             >
               <div className="project-tree-row" data-active={active || undefined}>
                 <button type="button" className="project-tree-disclosure" onClick={() => selectProject(tab.id)} aria-label={`${expanded ? 'Collapse' : 'Expand'} ${label}`}>
@@ -435,7 +447,6 @@ export function ProjectSessionSidebar() {
                     className="project-tree-select"
                     aria-current={active ? 'page' : undefined}
                     onClick={() => selectProject(tab.id)}
-                    onDoubleClick={() => beginRename(tab.id, label)}
                     onContextMenu={(event) => { event.preventDefault(); setMenu({ x: event.clientX, y: event.clientY, id: tab.id }) }}
                     title={tab.workspacePath ?? label}
                   >

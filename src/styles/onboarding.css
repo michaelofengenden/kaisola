@@ -115,6 +115,45 @@
 .onboarding-error { color: #b64545; }
 .onboarding-account { display: flex; align-items: center; gap: 7px; margin-top: 22px; color: #8a8f98; font-size: 12px; }
 
+/* Onboarding is part of the application, not a separate light landing page.
+   Keep its entire chrome on the same dark roles when the app is dark. */
+:root[data-theme='dark'] .onboarding {
+  color: var(--text-0);
+  background:
+    radial-gradient(circle at 18% 12%, rgb(149 164 86 / 8%), transparent 34%),
+    repeating-linear-gradient(88deg, rgb(255 255 255 / 1.2%) 0 1px, transparent 1px 5px),
+    var(--bg-0);
+}
+:root[data-theme='dark'] .onboarding-card {
+  border-color: var(--border);
+  background: var(--bg-1);
+  box-shadow: 0 28px 80px rgb(0 0 0 / 34%), inset 0 1px rgb(255 255 255 / 3%);
+}
+:root[data-theme='dark'] .onboarding-mark {
+  color: var(--bg-0);
+  background: var(--accent);
+}
+:root[data-theme='dark'] .onboarding-kicker,
+:root[data-theme='dark'] .onboarding-copy,
+:root[data-theme='dark'] .onboarding-note,
+:root[data-theme='dark'] .onboarding-account { color: var(--text-2); }
+:root[data-theme='dark'] .onboarding-google {
+  color: var(--text-0);
+  background: var(--bg-3);
+  border-color: var(--border-strong);
+  box-shadow: none;
+}
+:root[data-theme='dark'] .onboarding-google:hover:not(:disabled) {
+  color: var(--text-0);
+  background: var(--bg-4);
+  border-color: var(--accent-line);
+}
+:root[data-theme='dark'] .onboarding-local { color: var(--text-2); }
+:root[data-theme='dark'] .onboarding-local:hover:not(:disabled) {
+  color: var(--text-0);
+  background: var(--hover-overlay);
+}
+
 /* Terminal pop-outs and restored windows can legitimately reopen at their
  * 420×280 minimum. Keep the first-run action reachable there instead of
  * centering a tall card whose buttons fall below the viewport. */

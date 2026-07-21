@@ -2,14 +2,11 @@
 
 **Date:** 2026-07-17
 
-**Status:** desktop observation spine and fixture-only native preview complete;
-live pairing and transport not started. Revised 2026-07-17 after GPT-5.6 sol
-design review rounds 1–2 (19 findings folded in: lease acquisition contract
-with `leaseId` generations, server-enforced permission completeness,
-at-most-once semantics, epoch lifecycle, Ed25519↔X25519 handshake binding,
-capability scope, event-driven revocation with 60 s relay bound, OSC hardening,
-global 5 MiB / 7-day phone cache bounds, earlier security/accessibility gating,
-concrete budgets).
+**Status:** signed pairing, guarded control, native terminal viewing, LAN
+transport, and LAN-first/Tailscale fallback are implemented. Revised
+2026-07-20 to replace the proposed Cloud Run relay with a private tailnet route:
+the Mac stays authoritative, Bonjour remains first, and the existing Noise
+channel authenticates and encrypts the direct TCP stream on either path.
 
 **Working assumption:** iPhone first; the wire protocol remains platform-neutral
 
@@ -51,8 +48,8 @@ companion protocol.
    blobs never cross the companion boundary.
 6. **Mobile actions are receipts.** Every action has an idempotency key, target,
    scope, result, and visible audit receipt.
-7. **Bounded by design.** Terminal history, replay buffers, mobile cache, relay
-   queues, and notification frequency all have explicit caps.
+7. **Bounded by design.** Terminal history, replay buffers, mobile cache,
+   transport queues, and notification frequency all have explicit caps.
 
 ## V1 experience
 
@@ -169,8 +166,8 @@ tools. The companion surface gets its own smaller protocol and threat model.
                  E2EE frames + receipts
               ┌─────────┴──────────┐
               │                    │
-       direct LAN transport   opaque relay transport
-       Bonjour + NWConnection  WSS + Firebase identity
+       direct LAN transport   private tailnet fallback
+       Bonjour + NWConnection  Tailscale IP + NWConnection
               │                    │
               └─────────┬──────────┘
                         │
@@ -364,7 +361,7 @@ and the user retypes.
 
 ## Connectivity and lifecycle
 
-### Direct mode — first phone vertical slice
+### Direct mode — default path
 
 - Desktop advertises `_kaisola._tcp` through Bonjour only while Companion is
   enabled.
@@ -372,30 +369,31 @@ and the user retypes.
   framework, and connects with a length-framed TCP transport.
 - Application-layer encryption and pairing authenticate every frame; LAN trust
   is never assumed.
-- This proves real phone rendering and control without first deploying relay
-  infrastructure.
+- The listener prefers stable TCP port `49321`; if that port is already in use,
+  the LAN service falls back to an ephemeral port and disables the off-network
+  hint for that run rather than advertising an unreachable route.
 
-### Remote mode — after the direct slice (single-instance alpha until a real synchronization layer lands)
+### Remote mode — optional Tailscale fallback
 
-- Desktop and phone each make outbound `wss:` connections to a small Cloud Run
-  relay authenticated by Firebase ID tokens and registered device ids.
-- The relay routes opaque encrypted envelopes. It cannot decrypt terminal or
-  agent content and does not persist session transcripts.
-- Routing uses a minimal authenticated outer layer: the Firebase-verified
-  identity binds each connection to registered desktop/device records and one
-  room per UID; outer routing ids are rate-limited and checked against
-  revocation on connect. Revocation propagation is event-driven — the desktop
-  both rejects the revoked device immediately itself and notifies the
-  registry/relay to drop its live connections — with a periodic recheck as
-  fallback, bounding worst-case relay propagation at 60 seconds. The
-  authoritative gate is always the Mac: even a not-yet-dropped relay connection
-  cannot execute anything after desktop-side revocation. APNs token registration,
-  rotation, targeting, and anti-spam authorization live beside the device
-  registry, never inside the encrypted payload path.
-- Clients proactively rotate/reconnect before Cloud Run's request timeout and
-  resume from acknowledged sequence numbers.
-- Initial rollout can run one bounded instance. A multi-instance release adds
-  a real synchronization layer; best-effort session affinity is not correctness.
+- Tailscale runs on the Mac and iPhone under the user's own tailnet. Kaisola
+  does not deploy, meter, or administer a Cloud Run relay and does not open a
+  router port.
+- The desktop detects its Tailscale interface and includes its private address
+  only in the signed pairing offer and authenticated encrypted hello. Existing
+  pairs securely refresh this route the next time they connect locally, so an
+  install does not require re-pairing.
+- The phone always keeps Bonjour discovery active. It uses the paired Mac's LAN
+  endpoint first, switches to the tailnet address immediately on cellular or
+  after a bounded failed LAN attempt, remembers that choice through reconnects,
+  and prefers Bonjour again on the next reconnect once the paired Mac is
+  visible. A healthy live socket is not churned merely to change routes.
+- Both paths feed the same framed TCP/Noise protocol, replay cursors, grants,
+  leases, and desktop-side revocation. Tailscale's WireGuard tunnel is an
+  additional private network layer, not a replacement for Kaisola's device
+  authentication or application encryption.
+- Remote access requires the Mac to remain awake and online with Tailscale
+  connected, Kaisola open, and Companion enabled. A sleeping Mac is honestly
+  shown as unreachable; Wake-on-LAN is not implied.
 
 ### Background
 
@@ -403,10 +401,10 @@ When iOS backgrounds:
 
 - live terminal/agent streaming disconnects cleanly;
 - the desktop continues running and spooling exactly as it does today;
-- completion/needs-you state produces a debounced server notification request;
-- APNs payload contains an opaque event id and privacy-safe label, never terminal
-  output, diffs, prompts, workspace paths, or credentials;
-- opening the notification reconnects and retrieves current encrypted state.
+- live streaming stops and is reconciled from the bounded cursor when the app
+  foregrounds again;
+- a future APNs layer may carry only an opaque event id and privacy-safe label,
+  never terminal output, diffs, prompts, workspace paths, or credentials.
 
 Push is an attention hint, not a durable event bus. Delivery is not guaranteed,
 so reconnect always performs state reconciliation.
@@ -433,9 +431,9 @@ so reconnect always performs state reconciliation.
    bound metadata.
 5. Directional monotonic counters reject replays and nonce reuse. New connection
    ids derive new keys and reset counters safely.
-6. Remote relay access also requires a current Firebase identity for the same
-   account and an unrevoked paired-device record. Account login alone cannot
-   pair or control a Mac.
+6. Remote access requires the already paired, unrevoked device keys and grants,
+   plus network reachability through the user's tailnet. A Firebase account or
+   membership in the tailnet alone cannot pair or control a Mac.
 
 The handshake is a reviewed Noise pattern (Noise `XX` with QR-pinned static
 keys is the working choice; the final pattern is fixed at Task 8 with published
@@ -444,8 +442,10 @@ confirmation, SAS derivation entropy, nonce/AAD construction, clock skew,
 simultaneous-pairing, and re-pair behavior) — not a bespoke construction. It is
 security-reviewed before any control capability ships.
 
-The relay still observes connection timing, approximate ciphertext sizes, and
-device routing ids. The privacy copy should say this plainly.
+Tailscale's coordination service and any DERP fallback can observe connectivity
+metadata such as timing and approximate encrypted traffic volume, but Kaisola's
+Noise plaintext and session keys never leave the paired endpoints. The privacy
+copy should say this plainly.
 
 ## Threat model and required controls
 
@@ -453,7 +453,7 @@ device routing ids. The privacy copy should say this plainly.
 |---|---|
 | Lost/unlocked phone | Face ID on re-entry, Keychain keys, per-device revoke, short inactivity lock |
 | Malicious LAN peer | Single-use pairing, mutual key proof, E2EE, replay counters, no trust-by-IP |
-| Compromised relay | End-to-end encryption; relay never receives session keys or plaintext |
+| Compromised tailnet peer or routed path | Per-device Noise authentication, end-to-end encryption, grants, and immediate Mac-side revoke |
 | Cross-project action | Immutable project capability on every command and service lookup |
 | Replayed approval/input | Command idempotency + encrypted sequence + current permission revision |
 | Phone steals desktop PTY | Non-owning observer plus explicit expiring control lease |
@@ -462,7 +462,7 @@ device routing ids. The privacy copy should say this plainly.
 | Unbounded output/slow phone | Byte cursors, bounded queues, gap-to-snapshot backpressure |
 | Desktop/phone version skew | Independent protocol version and fail-closed capability negotiation |
 
-Device revocation closes live relay/direct connections, invalidates future
+Device revocation closes live tailnet/direct connections, invalidates future
 commands, and removes the device public key. It does not delete project data,
 and it cannot reach into an offline phone: content already cached there — which
 may itself contain secrets that appeared in terminal output, prompts, or diffs;
@@ -493,7 +493,7 @@ snapshot, and cleared on sign-out or unpair.
 
 Initial hard budgets (tune with measurements; the caps themselves never go
 away): replay log ≤ 5,000 events and ≤ 2 MiB per device; structured-turn
-projection ≤ 200 turns per session; ≤ 8 observers per terminal; relay send
+projection ≤ 200 turns per session; ≤ 8 observers per terminal; transport send
 queue ≤ 1 MiB per connection with disconnect-on-overflow; notification debounce
 ≥ 30 s per session; audit log ≤ 10,000 entries / 30 days; paste cap 32 KiB with
 confirmation above 2 KiB.
@@ -506,7 +506,7 @@ confirmation above 2 KiB.
 - Add a redacted project/session projection and main-owned event log.
 - Add offset-aware non-owning terminal subscriptions.
 - Add deterministic crypto/protocol fixtures and a loopback client.
-- No LAN listener, relay, or phone app yet.
+- No LAN listener, remote route, or phone app yet.
 
 **Exit:** the loopback client can reconnect, obtain one coherent snapshot,
 follow real terminal output without stealing desktop ownership, and prove all
@@ -542,13 +542,15 @@ slice, not in Slice E.
 
 ### Slice D — remote-anywhere and push
 
-- Cloud Run opaque relay, Firebase device registration, WebSocket reconnection.
-- APNs completion/needs-you notifications.
+- Signed LAN-first/Tailscale route hints on the stable desktop listener.
+- Path-aware direct/tailnet election and bounded reconnect/resume.
+- Optional APNs completion/needs-you notifications in a later pass.
 - Network-switch and desktop-restart chaos tests.
 
 **Exit:** the same live session survives Wi-Fi → cellular → Wi-Fi and desktop
-renderer restart; the relay cannot decrypt recorded test envelopes; push opens
-the exact current session without carrying sensitive content.
+renderer restart; neither a tailnet peer nor a routed observer can authenticate
+or decrypt recorded Kaisola envelopes; any later push opens the exact current
+session without carrying sensitive content.
 
 ### Slice E — polish and release
 
@@ -558,7 +560,7 @@ the exact current session without carrying sensitive content.
   an equivalent privacy-preserving login (e.g. Sign in with Apple) alongside
   Google sign-in unless an exception applies.
 - Battery/CPU/memory measurements and security review.
-- Product docs, support diagnostics, staged rollout, crash/relay observability
+- Product docs, support diagnostics, staged rollout, connection observability
   with plaintext redaction.
 
 ## Definition of “highly well”
@@ -567,7 +569,7 @@ The feature is not done because a phone displayed a terminal. It is done when:
 
 - desktop and phone demonstrably control one session rather than forks;
 - every sensitive action is scoped, authenticated, idempotent, and receipted;
-- a compromised relay cannot read session content;
+- a compromised network path or unrelated tailnet peer cannot read session content;
 - backgrounding and reconnect are normal tested flows;
 - permission decisions resolve at most once, never twice, and fail closed;
 - terminal history and all queues remain bounded under a slow/disconnected phone;
@@ -584,9 +586,10 @@ The feature is not done because a phone displayed a terminal. It is done when:
   [Bonjour/Network framework](https://developer.apple.com/documentation/technotes/tn3151-choosing-the-right-networking-api),
   [CryptoKit ChaChaPoly](https://developer.apple.com/documentation/cryptokit/chachapoly),
   and [Keychain key storage](https://developer.apple.com/documentation/cryptokit/storing-cryptokit-keys-in-the-keychain).
-- Google Cloud: [Cloud Run WebSockets](https://docs.cloud.google.com/run/docs/triggering/websockets)
-  and [request timeouts](https://docs.cloud.google.com/run/docs/configuring/request-timeout),
-  including mandatory reconnect behavior and non-authoritative session affinity.
+- Tailscale: [connection types](https://tailscale.com/docs/reference/connection-types),
+  [iOS install](https://tailscale.com/docs/install/ios), and
+  [pricing](https://tailscale.com/pricing). The transport remains correct whether
+  Tailscale establishes a direct WireGuard path or uses an encrypted DERP relay.
 - Firebase: [Google sign-in on Apple platforms](https://firebase.google.com/docs/auth/ios/google-signin).
 - Node: [`node:crypto`](https://nodejs.org/api/crypto.html) support for X25519
   and ChaCha20-Poly1305.

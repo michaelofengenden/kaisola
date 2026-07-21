@@ -31,7 +31,7 @@ struct CompanionSettingsView: View {
                         }
                     }
 
-                    Text("Kaisola Companion · encrypted local connection")
+                    Text("Kaisola Companion · encrypted private connection")
                         .font(.caption2)
                         .foregroundStyle(.tertiary)
                         .frame(maxWidth: .infinity)
@@ -219,6 +219,15 @@ private struct CompanionMacDetailView: View {
                     .foregroundStyle(.secondary)
                     .multilineTextAlignment(.center)
                     .padding(.horizontal, 22)
+                Link(destination: URL(string: "https://apps.apple.com/app/tailscale/id1470499037")!) {
+                    Label("Add free remote access", systemImage: "network.badge.shield.half.filled")
+                        .font(.subheadline.weight(.semibold))
+                }
+                Text("Install Tailscale on this iPhone and your Mac, sign into the same personal account, and Kaisola will keep using LAN first.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .multilineTextAlignment(.center)
+                    .padding(.horizontal, 26)
                 Spacer()
                 Button("Unpair this Mac", role: .destructive, action: onUnpair)
                     .font(.subheadline.weight(.semibold))

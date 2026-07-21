@@ -6,6 +6,7 @@ const {
   validateCapabilities,
   validateEnvelope,
   validateIdentifier,
+  validateTransportHint,
 } = require('./protocol.cjs')
 const { CompanionCommandRouter } = require('./commandRouter.cjs')
 const { sanitizeAcpPermissionEvent, sanitizeProjection } = require('./redaction.cjs')
@@ -277,6 +278,7 @@ class CompanionGatewaySession {
       role: 'desktop',
       protocolMinor: PROTOCOL_MINOR,
       capabilities: this.capabilities,
+      ...this.gateway.currentTransportHint(),
     }, this.#nextId('hello'), 0)
     const cursor = frame.body.lastAck == null ? null : { epoch: frame.epoch, afterSeq: frame.body.lastAck }
     const synchronization = this.gateway.synchronize(cursor)
@@ -351,6 +353,7 @@ class CompanionGateway {
     attentionService = null,
     ledgerAdapter = null,
     enabledCapabilities = ['observe'],
+    transportHintProvider = null,
     now = Date.now,
     logger = console,
   } = {}) {
@@ -359,6 +362,7 @@ class CompanionGateway {
     if (!stateHub?.synchronize || !stateHub?.acknowledge) throw new Error('companion state hub is required')
     if (terminalObserver != null && typeof terminalObserver !== 'function') throw new Error('companion terminal observer is invalid')
     if (typeof now !== 'function') throw new Error('companion gateway clock is invalid')
+    if (transportHintProvider != null && typeof transportHintProvider !== 'function') throw new Error('companion transport hint provider is invalid')
     this.stateHub = stateHub
     this.terminalObserver = terminalObserver
     this.terminalControl = terminalControlAdapter
@@ -368,6 +372,7 @@ class CompanionGateway {
     this.attentionService = attentionService
     this.ledgerAdapter = ledgerAdapter
     this.enabledCapabilities = validateCapabilities(enabledCapabilities)
+    this.transportHintProvider = transportHintProvider
     this.now = now
     this.logger = logger && typeof logger.warn === 'function' ? logger : console
     this.sessions = new Set()
@@ -397,6 +402,15 @@ class CompanionGateway {
     transport.bindGateway((frame) => session.receive(frame))
     this.sessions.add(session)
     return session
+  }
+
+  currentTransportHint() {
+    if (!this.transportHintProvider) return {}
+    try {
+      return { transportHint: validateTransportHint(this.transportHintProvider()) }
+    } catch {
+      return {}
+    }
   }
 
   synchronize(cursor) {

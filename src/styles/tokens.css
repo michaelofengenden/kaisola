@@ -26,7 +26,9 @@
   /* Terminal surface tone (Settings → Terminal → Background). Mirrors
      TERM_SURFACE in Terminal.tsx — xterm needs the same values as concrete hex. */
   &[data-termbg='slate'] { --term-bg: #191d24; }
-  &[data-termbg='paper'] { --term-bg: #ffffff; }
+  /* A saved Paper preference remains useful when returning to light mode, but
+     it may never punch a white terminal through the dark application shell. */
+  &[data-termbg='paper'] { --term-bg: #0b0d11; }
 
   /* — Surfaces & borders — */
   --surface: #14161c;

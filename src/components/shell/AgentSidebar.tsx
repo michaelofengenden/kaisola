@@ -4,9 +4,8 @@ import { LimitsButton } from './LimitsButton'
 
 /**
  * The global utility cluster stays deliberately small: find, usage, and
- * settings. Top navigation keeps only frequent actions here; Usage and
- * Settings remain available from the adjacent account menu. Left navigation
- * has enough room for the full utility set at the foot of the project tree.
+ * settings. Both navigation modes keep only frequent actions here; Usage and
+ * Settings live in the adjacent account menu so the chrome stays one line.
  */
 export function ShellTools({
   includeSettings = true,

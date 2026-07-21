@@ -46,6 +46,20 @@ test('protocol mismatch, unknown top-level fields, and control characters fail c
   })
   assert.throws(() => validateEnvelope({ ...fixture('hello.json'), brokerToken: 'secret' }), /not allowed/)
   assert.throws(() => validateEnvelope({ ...fixture('hello.json'), deviceId: 'bad\nvalue' }), /deviceId is invalid/)
+  const hello = fixture('hello.json')
+  assert.deepEqual(validateEnvelope({
+    ...hello,
+    body: {
+      ...hello.body,
+      transportHint: {
+        service: '_kaisola._tcp', protocol: 'tcp', host: '192.168.1.23', tailscaleHost: '100.90.1.14', port: 49321,
+      },
+    },
+  }).body.transportHint.tailscaleHost, '100.90.1.14')
+  assert.throws(() => validateEnvelope({
+    ...hello,
+    body: { ...hello.body, transportHint: { service: '_kaisola._tcp', protocol: 'tcp', tailscaleHost: 'bad\nvalue', port: 49321 } },
+  }), /tailscaleHost is invalid/)
 })
 
 test('commands require the exact capability, project, target, and envelope identity', () => {

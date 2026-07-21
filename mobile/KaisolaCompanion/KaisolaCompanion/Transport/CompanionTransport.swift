@@ -36,6 +36,8 @@ final class CompanionTransport: ObservableObject {
 
     private let queue = DispatchQueue(label: "com.kaisola.companion.transport", qos: .userInitiated)
     private var browser: NWBrowser?
+    private var pathMonitor: NWPathMonitor?
+    private var lastPathSignature: String?
     private var connection: NWConnection?
     private var decoder = CompanionLengthFrameDecoder()
     private var selectedEndpoint: NWEndpoint?
@@ -43,10 +45,13 @@ final class CompanionTransport: ObservableObject {
     private var reconnectAttempt = 0
     private var reconnectWorkItem: DispatchWorkItem?
     private var connectionDeadlineWorkItem: DispatchWorkItem?
+    private var alternateFallbackWorkItem: DispatchWorkItem?
     private var intentionallyStopped = true
     private let autoConnect: Bool
     private var preferredEndpoint: NWEndpoint?
+    private var tailscaleEndpoint: NWEndpoint?
     private var targetDesktopId: String?
+    private var preferTailscale = false
 
     init(autoConnect: Bool = true) {
         self.autoConnect = autoConnect
@@ -58,9 +63,11 @@ final class CompanionTransport: ObservableObject {
         force: Bool = false
     ) {
         let nextPreferred = Self.directEndpoint(from: hint)
+        let nextTailscale = Self.tailscaleEndpoint(from: hint)
         let normalizedDesktopId = desktopId?.trimmingCharacters(in: .whitespacesAndNewlines)
         let sameTarget = targetDesktopId == normalizedDesktopId
             && Self.endpointKey(preferredEndpoint) == Self.endpointKey(nextPreferred)
+            && Self.endpointKey(tailscaleEndpoint) == Self.endpointKey(nextTailscale)
         // App launch and scene activation can arrive together. Reasserting the
         // same target must not cancel a healthy connection or its handshake.
         if !force, !intentionallyStopped, sameTarget, browser != nil {
@@ -73,14 +80,21 @@ final class CompanionTransport: ObservableObject {
         intentionallyStopped = false
         reconnectAttempt = 0
         preferredEndpoint = nextPreferred
+        tailscaleEndpoint = nextTailscale
         targetDesktopId = normalizedDesktopId
+        preferTailscale = false
         selectedEndpoint = nil
         discoveredDesktops = []
         transition(to: .discovering)
+        startPathMonitor()
         startBrowser()
         if let preferredEndpoint {
             selectedEndpoint = preferredEndpoint
             connect(to: preferredEndpoint, reconnecting: false)
+        } else if let tailscaleEndpoint {
+            preferTailscale = true
+            selectedEndpoint = tailscaleEndpoint
+            connect(to: tailscaleEndpoint, reconnecting: false)
         }
     }
 
@@ -111,9 +125,22 @@ final class CompanionTransport: ObservableObject {
 
     func connect(to desktop: CompanionDiscoveredDesktop) {
         intentionallyStopped = false
+        preferTailscale = false
         selectedEndpoint = desktop.endpoint
         reconnectAttempt = 0
         connect(to: desktop.endpoint, reconnecting: false)
+    }
+
+    /// Lifecycle callbacks can arrive while the transport is already marked
+    /// reconnecting. Give that existing attempt an immediate nudge without
+    /// cancelling a TCP/Noise handshake that is still inside its deadline.
+    func nudgeReconnect() {
+        guard !intentionallyStopped, state != .live else { return }
+        if connection != nil { return }
+        reconnectWorkItem?.cancel()
+        reconnectWorkItem = nil
+        reconnectAttempt = 0
+        connectBestAvailable(reconnecting: true)
     }
 
     func markLive() {
@@ -121,14 +148,17 @@ final class CompanionTransport: ObservableObject {
         connectionDeadlineWorkItem?.cancel()
         connectionDeadlineWorkItem = nil
         reconnectAttempt = 0
+        alternateFallbackWorkItem?.cancel()
+        alternateFallbackWorkItem = nil
         transition(to: .live)
     }
 
     func send(_ payload: Data) throws {
-        guard let connection, state == .handshaking || state == .live else {
+        guard state == .handshaking || state == .live else {
             throw CompanionWireError.connectionUnavailable
         }
         let framed = try CompanionLengthFrameDecoder.encode(payload)
+        guard let connection else { throw CompanionWireError.connectionUnavailable }
         connection.send(content: framed, completion: .contentProcessed { [weak self, weak connection] error in
             guard let error else { return }
             Task { @MainActor [weak self, weak connection] in
@@ -145,7 +175,9 @@ final class CompanionTransport: ObservableObject {
         selectedEndpoint = nil
         connectionEndpoint = nil
         preferredEndpoint = nil
+        tailscaleEndpoint = nil
         targetDesktopId = nil
+        preferTailscale = false
         discoveredDesktops = []
         transition(to: .idle)
     }
@@ -167,6 +199,7 @@ final class CompanionTransport: ObservableObject {
         // become live. The existing deadline/failure path chooses this Bonjour
         // candidate immediately if the current direct endpoint is actually stale.
         guard Self.mayAdoptDiscoveredEndpoint(hasConnection: connection != nil) else { return }
+        preferTailscale = false
         selectedEndpoint = candidate.endpoint
         connect(to: candidate.endpoint, reconnecting: state == .reconnecting)
     }
@@ -174,6 +207,7 @@ final class CompanionTransport: ObservableObject {
     private func connect(to endpoint: NWEndpoint, reconnecting: Bool) {
         reconnectWorkItem?.cancel()
         connectionDeadlineWorkItem?.cancel()
+        alternateFallbackWorkItem?.cancel()
         connection?.cancel()
         decoder = CompanionLengthFrameDecoder()
         connectionEndpoint = endpoint
@@ -206,8 +240,15 @@ final class CompanionTransport: ObservableObject {
                     self.selectedEndpoint = nil
                     if let discovered = self.preferredDiscoveredDesktop(),
                        Self.endpointKey(discovered.endpoint) != Self.endpointKey(failedEndpoint) {
+                        self.preferTailscale = false
                         self.selectedEndpoint = discovered.endpoint
                         self.connect(to: discovered.endpoint, reconnecting: true)
+                        return
+                    }
+                    if !self.isTailscale(failedEndpoint), let tailscale = self.tailscaleEndpoint {
+                        self.preferTailscale = true
+                        self.selectedEndpoint = tailscale
+                        self.connect(to: tailscale, reconnecting: true)
                         return
                     }
                     self.scheduleReconnect()
@@ -220,6 +261,7 @@ final class CompanionTransport: ObservableObject {
         }
         connection.start(queue: queue)
         armConnectionDeadline(for: connection)
+        armAlternateFallback(for: connection)
     }
 
     private func receiveNext(on connection: NWConnection) {
@@ -253,6 +295,8 @@ final class CompanionTransport: ObservableObject {
         guard !intentionallyStopped else { return }
         connectionDeadlineWorkItem?.cancel()
         connectionDeadlineWorkItem = nil
+        alternateFallbackWorkItem?.cancel()
+        alternateFallbackWorkItem = nil
         connection?.cancel()
         connection = nil
         connectionEndpoint = nil
@@ -265,11 +309,19 @@ final class CompanionTransport: ObservableObject {
                 guard let self, !self.intentionallyStopped else { return }
                 if self.browser == nil { self.startBrowser() }
                 if let discovered = self.preferredDiscoveredDesktop() {
+                    self.preferTailscale = false
                     self.selectedEndpoint = discovered.endpoint
                     self.connect(to: discovered.endpoint, reconnecting: true)
+                } else if self.preferTailscale, let tailscale = self.tailscaleEndpoint {
+                    self.selectedEndpoint = tailscale
+                    self.connect(to: tailscale, reconnecting: true)
                 } else if let preferred = self.preferredEndpoint {
                     self.selectedEndpoint = preferred
                     self.connect(to: preferred, reconnecting: true)
+                } else if let tailscale = self.tailscaleEndpoint {
+                    self.preferTailscale = true
+                    self.selectedEndpoint = tailscale
+                    self.connect(to: tailscale, reconnecting: true)
                 } else if let endpoint = self.selectedEndpoint {
                     self.connect(to: endpoint, reconnecting: true)
                 } else if self.browser != nil {
@@ -289,8 +341,13 @@ final class CompanionTransport: ObservableObject {
         reconnectWorkItem = nil
         connectionDeadlineWorkItem?.cancel()
         connectionDeadlineWorkItem = nil
+        alternateFallbackWorkItem?.cancel()
+        alternateFallbackWorkItem = nil
         browser?.cancel()
         browser = nil
+        pathMonitor?.cancel()
+        pathMonitor = nil
+        lastPathSignature = nil
         connection?.cancel()
         connection = nil
         connectionEndpoint = nil
@@ -299,14 +356,79 @@ final class CompanionTransport: ObservableObject {
     private func connectBestAvailable(reconnecting: Bool) {
         if browser == nil { startBrowser() }
         if let discovered = preferredDiscoveredDesktop() {
+            preferTailscale = false
             selectedEndpoint = discovered.endpoint
             connect(to: discovered.endpoint, reconnecting: reconnecting)
+        } else if preferTailscale, let tailscaleEndpoint {
+            selectedEndpoint = tailscaleEndpoint
+            connect(to: tailscaleEndpoint, reconnecting: reconnecting)
         } else if let preferredEndpoint {
             selectedEndpoint = preferredEndpoint
             connect(to: preferredEndpoint, reconnecting: reconnecting)
+        } else if let tailscaleEndpoint {
+            preferTailscale = true
+            selectedEndpoint = tailscaleEndpoint
+            connect(to: tailscaleEndpoint, reconnecting: reconnecting)
         } else {
             transition(to: .discovering)
         }
+    }
+
+    private func armAlternateFallback(for direct: NWConnection, after seconds: TimeInterval = 1.8) {
+        guard let tailscaleEndpoint, !isTailscale(connectionEndpoint) else { return }
+        alternateFallbackWorkItem?.cancel()
+        let item = DispatchWorkItem { [weak self, weak direct] in
+            Task { @MainActor [weak self, weak direct] in
+                guard let self, let direct, direct === self.connection,
+                      self.state == .connecting || self.state == .reconnecting else { return }
+                self.preferTailscale = true
+                self.selectedEndpoint = tailscaleEndpoint
+                self.connect(to: tailscaleEndpoint, reconnecting: true)
+            }
+        }
+        alternateFallbackWorkItem = item
+        DispatchQueue.main.asyncAfter(deadline: .now() + seconds, execute: item)
+    }
+
+    private func isTailscale(_ endpoint: NWEndpoint?) -> Bool {
+        Self.endpointKey(endpoint) == Self.endpointKey(tailscaleEndpoint)
+    }
+
+    private func startPathMonitor() {
+        guard pathMonitor == nil else { return }
+        let monitor = NWPathMonitor()
+        pathMonitor = monitor
+        monitor.pathUpdateHandler = { [weak self, weak monitor] path in
+            Task { @MainActor [weak self, weak monitor] in
+                guard let self, let monitor, monitor === self.pathMonitor, !self.intentionallyStopped else { return }
+                let signature = [
+                    path.status == .satisfied ? "online" : path.status == .requiresConnection ? "waiting" : "offline",
+                    path.usesInterfaceType(.wifi) ? "wifi" : "",
+                    path.usesInterfaceType(.cellular) ? "cellular" : "",
+                    path.usesInterfaceType(.wiredEthernet) ? "wired" : "",
+                ].joined(separator: ":")
+                let previous = self.lastPathSignature
+                self.lastPathSignature = signature
+                guard path.status == .satisfied, self.state != .live else { return }
+                if path.usesInterfaceType(.cellular), let tailscale = self.tailscaleEndpoint,
+                   !self.isTailscale(self.connectionEndpoint) {
+                    self.preferTailscale = true
+                    self.selectedEndpoint = tailscale
+                    self.connect(to: tailscale, reconnecting: self.state != .discovering)
+                    return
+                }
+                guard previous != nil, previous != signature else { return }
+                self.preferTailscale = false
+                self.connectionDeadlineWorkItem?.cancel()
+                self.connectionDeadlineWorkItem = nil
+                self.connection?.cancel()
+                self.connection = nil
+                self.connectionEndpoint = nil
+                self.selectedEndpoint = nil
+                self.nudgeReconnect()
+            }
+        }
+        monitor.start(queue: queue)
     }
 
     private func preferredDiscoveredDesktop() -> CompanionDiscoveredDesktop? {
@@ -319,7 +441,13 @@ final class CompanionTransport: ObservableObject {
             Task { @MainActor [weak self, weak connection] in
                 guard let self, let connection, connection === self.connection,
                       self.state == .connecting || self.state == .reconnecting || self.state == .handshaking else { return }
-                self.scheduleReconnect()
+                if !self.isTailscale(self.connectionEndpoint), let tailscale = self.tailscaleEndpoint {
+                    self.preferTailscale = true
+                    self.selectedEndpoint = tailscale
+                    self.connect(to: tailscale, reconnecting: true)
+                } else {
+                    self.scheduleReconnect()
+                }
             }
         }
         connectionDeadlineWorkItem = item
@@ -334,6 +462,15 @@ final class CompanionTransport: ObservableObject {
 
     static func directEndpoint(from hint: CompanionPairingTransportHint?) -> NWEndpoint? {
         guard let host = hint?.host?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !host.isEmpty,
+              let portValue = hint?.port,
+              (1...65_535).contains(portValue),
+              let port = NWEndpoint.Port(rawValue: UInt16(portValue)) else { return nil }
+        return .hostPort(host: NWEndpoint.Host(host), port: port)
+    }
+
+    static func tailscaleEndpoint(from hint: CompanionPairingTransportHint?) -> NWEndpoint? {
+        guard let host = hint?.tailscaleHost?.trimmingCharacters(in: .whitespacesAndNewlines),
               !host.isEmpty,
               let portValue = hint?.port,
               (1...65_535).contains(portValue),

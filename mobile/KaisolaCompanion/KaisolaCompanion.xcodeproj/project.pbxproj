@@ -8,6 +8,7 @@
 
 /* Begin PBXBuildFile section */
 		01CE4D4B98D9C3E6223D723F /* agent-delta.json in Resources */ = {isa = PBXBuildFile; fileRef = BAD6C8487CA84F964A165DF8 /* agent-delta.json */; };
+		05F82150CB592AD995A31D7D /* CompanionTerminalSurfaceTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = B0C84646A00B84861C0E3616 /* CompanionTerminalSurfaceTests.swift */; };
 		06B7334BB43F48C26F51E158 /* JSONValue.swift in Sources */ = {isa = PBXBuildFile; fileRef = 080DF1108C5BA892C7F13309 /* JSONValue.swift */; };
 		1AEEAC91EF2A1670DB8D1BF1 /* CompanionIdentity.swift in Sources */ = {isa = PBXBuildFile; fileRef = 98DE11C5FAB40CD2B4715652 /* CompanionIdentity.swift */; };
 		25C8ECCEE6F53FAA4C95E6A8 /* PairingFlowView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1AAC3C9EB656689D67259D3E /* PairingFlowView.swift */; };
@@ -128,6 +129,7 @@
 		AD396B7001732DDC07EC0878 /* CompanionPreviewData.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CompanionPreviewData.swift; sourceTree = "<group>"; };
 		AF99755F918FE5467BF72EC9 /* SecureFrameChannel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SecureFrameChannel.swift; sourceTree = "<group>"; };
 		B033B705F8829D1F00E5611E /* permission-requested.json */ = {isa = PBXFileReference; lastKnownFileType = text.json; path = "permission-requested.json"; sourceTree = "<group>"; };
+		B0C84646A00B84861C0E3616 /* CompanionTerminalSurfaceTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CompanionTerminalSurfaceTests.swift; sourceTree = "<group>"; };
 		B48B16F368714573C910DEA0 /* KaisolaCompanion.app */ = {isa = PBXFileReference; includeInIndex = 0; lastKnownFileType = wrapper.application; path = KaisolaCompanion.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		BAD6C8487CA84F964A165DF8 /* agent-delta.json */ = {isa = PBXFileReference; lastKnownFileType = text.json; path = "agent-delta.json"; sourceTree = "<group>"; };
 		C12FD715842B93B073324EF0 /* snapshot-board.json */ = {isa = PBXFileReference; lastKnownFileType = text.json; path = "snapshot-board.json"; sourceTree = "<group>"; };
@@ -333,6 +335,7 @@
 			isa = PBXGroup;
 			children = (
 				0FF79DE9CC775AE35916D16B /* CompanionAccountRendezvousTests.swift */,
+				B0C84646A00B84861C0E3616 /* CompanionTerminalSurfaceTests.swift */,
 				485B243F17DF73AB60584C92 /* CryptoNoiseVectorTests.swift */,
 				8B5BD3EA8BD42770A248DD57 /* FirebaseAuthBackendTests.swift */,
 				154C7BA59E2B46D5CA6441B7 /* ProjectionFixtureTests.swift */,
@@ -512,6 +515,7 @@
 			buildActionMask = 2147483647;
 			files = (
 				AA16C1D4BED8BCBD03E42D6A /* CompanionAccountRendezvousTests.swift in Sources */,
+				05F82150CB592AD995A31D7D /* CompanionTerminalSurfaceTests.swift in Sources */,
 				8CEF7D6FCA7B1BAF7B93641E /* CryptoNoiseVectorTests.swift in Sources */,
 				57358CCC88313352F26D6EDA /* FirebaseAuthBackendTests.swift in Sources */,
 				F018EAC0AB3C96491F3A2225 /* ProjectionFixtureTests.swift in Sources */,
@@ -605,7 +609,7 @@
 				CLANG_WARN_UNREACHABLE_CODE = YES;
 				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
 				COPY_PHASE_STRIP = NO;
-				CURRENT_PROJECT_VERSION = 1;
+				CURRENT_PROJECT_VERSION = 2;
 				DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym";
 				DEVELOPMENT_TEAM = KBD9RS8425;
 				ENABLE_NS_ASSERTIONS = NO;
@@ -619,7 +623,7 @@
 				GCC_WARN_UNUSED_FUNCTION = YES;
 				GCC_WARN_UNUSED_VARIABLE = YES;
 				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
-				MARKETING_VERSION = 0.3.6;
+				MARKETING_VERSION = 0.3.7;
 				MTL_ENABLE_DEBUG_INFO = NO;
 				MTL_FAST_MATH = YES;
 				PRODUCT_NAME = "$(TARGET_NAME)";
@@ -671,7 +675,7 @@
 					"$(inherited)",
 					"@executable_path/Frameworks",
 				);
-				MARKETING_VERSION = 0.3.6;
+				MARKETING_VERSION = 0.3.7;
 				PRODUCT_BUNDLE_IDENTIFIER = com.kaisola.companion;
 				SDKROOT = iphoneos;
 				SUPPORTS_MACCATALYST = NO;
@@ -713,7 +717,7 @@
 				CLANG_WARN_UNREACHABLE_CODE = YES;
 				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
 				COPY_PHASE_STRIP = NO;
-				CURRENT_PROJECT_VERSION = 1;
+				CURRENT_PROJECT_VERSION = 2;
 				DEBUG_INFORMATION_FORMAT = dwarf;
 				DEVELOPMENT_TEAM = KBD9RS8425;
 				ENABLE_STRICT_OBJC_MSGSEND = YES;
@@ -733,7 +737,7 @@
 				GCC_WARN_UNUSED_FUNCTION = YES;
 				GCC_WARN_UNUSED_VARIABLE = YES;
 				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
-				MARKETING_VERSION = 0.3.6;
+				MARKETING_VERSION = 0.3.7;
 				MTL_ENABLE_DEBUG_INFO = INCLUDE_SOURCE;
 				MTL_FAST_MATH = YES;
 				ONLY_ACTIVE_ARCH = YES;
@@ -768,7 +772,7 @@
 					"$(inherited)",
 					"@executable_path/Frameworks",
 				);
-				MARKETING_VERSION = 0.3.6;
+				MARKETING_VERSION = 0.3.7;
 				PRODUCT_BUNDLE_IDENTIFIER = com.kaisola.companion;
 				SDKROOT = iphoneos;
 				SUPPORTS_MACCATALYST = NO;

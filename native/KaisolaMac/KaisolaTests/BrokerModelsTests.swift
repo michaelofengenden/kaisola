@@ -17,7 +17,8 @@ final class BrokerModelsTests: XCTestCase {
                     "endOffset": .integer(99),
                 ]),
             ]),
-            live: .array([])
+            live: .array([]),
+            expectedHello: hello
         )
 
         XCTAssertEqual(status.terminals.count, 1)
@@ -31,7 +32,8 @@ final class BrokerModelsTests: XCTestCase {
             diagnostics: .array([
                 .object(["id": .string("orphan"), "owner": .string("")]),
             ]),
-            live: .array([])
+            live: .array([]),
+            expectedHello: hello
         )
         XCTAssertTrue(status.terminals.isEmpty)
     }
@@ -53,7 +55,12 @@ final class BrokerModelsTests: XCTestCase {
             "securityEpoch": .integer(1),
         ])
         XCTAssertThrowsError(
-            try BrokerStatus(status: drifted, diagnostics: .array([]), live: .array([]))
+            try BrokerStatus(
+                status: drifted,
+                diagnostics: .array([]),
+                live: .array([]),
+                expectedHello: hello
+            )
         ) { error in
             XCTAssertEqual(error as? BrokerClientError, .malformedResponse)
         }
@@ -65,5 +72,20 @@ final class BrokerModelsTests: XCTestCase {
             "protocol": .integer(2),
             "securityEpoch": .integer(1),
         ])
+    }
+
+    private var hello: BrokerHello {
+        BrokerHello(
+            protocolVersion: 2,
+            securityEpoch: 1,
+            implementationVersion: 1,
+            packageSchema: nil,
+            packageVersion: nil,
+            features: [],
+            pid: 1_234,
+            startedAt: 1_784_250_001_000,
+            version: "test",
+            serverEnforcedObserver: true
+        )
     }
 }

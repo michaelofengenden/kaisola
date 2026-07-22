@@ -1,11 +1,15 @@
 import Foundation
 import XCTest
 @testable import KaisolaBrokerProtocol
+import KaisolaTestSupport
 
 final class BrokerWireTests: XCTestCase {
     func testConstantsMatchTheShippingNodeBroker() {
         XCTAssertEqual(BrokerWire.protocolVersion, 2)
         XCTAssertEqual(BrokerWire.securityEpoch, 1)
+        XCTAssertEqual(BrokerWire.implementationVersion, 1)
+        XCTAssertEqual(BrokerWire.helperPackageSchema, 1)
+        XCTAssertEqual(BrokerWire.compatibleImplementationVersions, 1...2)
         XCTAssertEqual(BrokerWire.terminalObserveFeature, "terminal-observe-v1")
         XCTAssertEqual(BrokerWire.observerRoleFeature, "observer-role-v1")
         XCTAssertEqual(BrokerWire.observerMethods, [
@@ -16,6 +20,43 @@ final class BrokerWireTests: XCTestCase {
             "terminal.unsubscribe",
         ])
         XCTAssertEqual(BrokerWire.maximumFrameBytes, 56 * 1_024 * 1_024)
+    }
+
+    func testCrossLanguageCompatibilityMatrix() throws {
+        struct Fixture: Decodable {
+            struct Combination: Decodable {
+                let name: String
+                let protocolVersion: Int
+                let securityEpoch: Int
+                let implementationVersion: Int?
+                let supported: Bool
+
+                enum CodingKeys: String, CodingKey {
+                    case name
+                    case protocolVersion = "protocol"
+                    case securityEpoch, implementationVersion, supported
+                }
+            }
+
+            let schemaVersion: Int
+            let combinations: [Combination]
+        }
+
+        let url = try RepositoryFixtures.brokerFixture(named: "compatibility-v1")
+        let fixture = try JSONDecoder().decode(Fixture.self, from: Data(contentsOf: url))
+        XCTAssertEqual(fixture.schemaVersion, 1)
+        XCTAssertFalse(fixture.combinations.isEmpty)
+        for row in fixture.combinations {
+            XCTAssertEqual(
+                BrokerWire.accepts(
+                    protocolVersion: row.protocolVersion,
+                    securityEpoch: row.securityEpoch,
+                    implementationVersion: row.implementationVersion
+                ),
+                row.supported,
+                row.name
+            )
+        }
     }
 
     func testDecoderHandlesSplitAndCoalescedFrames() throws {

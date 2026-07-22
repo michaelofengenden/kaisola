@@ -29,7 +29,7 @@ let package = Package(
         ),
         .testTarget(
             name: "KaisolaBrokerProtocolTests",
-            dependencies: ["KaisolaBrokerProtocol"]
+            dependencies: ["KaisolaBrokerProtocol", "KaisolaTestSupport"]
         ),
     ]
 )

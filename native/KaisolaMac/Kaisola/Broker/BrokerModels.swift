@@ -5,6 +5,9 @@ import KaisolaCore
 struct BrokerHello: Equatable, Sendable {
     let protocolVersion: Int
     let securityEpoch: Int
+    let implementationVersion: Int
+    let packageSchema: Int?
+    let packageVersion: String?
     let features: Set<String>
     let pid: Int32
     let startedAt: Int64
@@ -15,12 +18,42 @@ struct BrokerHello: Equatable, Sendable {
 struct BrokerStatus: Equatable, Sendable {
     let terminals: [BrokerTerminalRecord]
 
-    init(status: JSONValue, diagnostics: JSONValue, live: JSONValue) throws {
+    init(
+        status: JSONValue,
+        diagnostics: JSONValue,
+        live: JSONValue,
+        expectedHello: BrokerHello
+    ) throws {
         guard let statusObject = status.objectValue,
               statusObject["ok"]?.boolValue == true,
-              statusObject["protocol"]?.intValue == Int64(BrokerWire.protocolVersion),
-              statusObject["securityEpoch"]?.intValue == Int64(BrokerWire.securityEpoch) else {
+              let protocolVersion = statusObject["protocol"]?.intValue.flatMap(Int.init(exactly:)),
+              let securityEpoch = statusObject["securityEpoch"]?.intValue.flatMap(Int.init(exactly:)),
+              BrokerWire.accepts(
+                  protocolVersion: protocolVersion,
+                  securityEpoch: securityEpoch,
+                  implementationVersion: statusObject["implementationVersion"]?.intValue.flatMap(Int.init(exactly:))
+              ) else {
             throw BrokerClientError.malformedResponse
+        }
+        if let pid = statusObject["pid"]?.intValue,
+           pid != Int64(expectedHello.pid) {
+            throw BrokerClientError.identityChanged
+        }
+        if let startedAt = statusObject["startedAt"]?.intValue,
+           startedAt != expectedHello.startedAt {
+            throw BrokerClientError.identityChanged
+        }
+        if let implementationVersion = statusObject["implementationVersion"]?.intValue,
+           implementationVersion != Int64(expectedHello.implementationVersion) {
+            throw BrokerClientError.identityChanged
+        }
+        if let packageSchema = statusObject["packageSchema"]?.intValue,
+           packageSchema != expectedHello.packageSchema.map(Int64.init) {
+            throw BrokerClientError.identityChanged
+        }
+        if let packageVersion = statusObject["packageVersion"]?.stringValue,
+           packageVersion != expectedHello.packageVersion {
+            throw BrokerClientError.identityChanged
         }
         guard let diagnosticValues = diagnostics.arrayValue,
               let liveValues = live.arrayValue else {
@@ -187,6 +220,7 @@ enum BrokerClientError: Error, Equatable, LocalizedError {
     case authenticationRejected
     case protocolMismatch
     case securityEpochMismatch
+    case implementationMismatch
     case identityChanged
     case observeFeatureMissing
     case connectionTimedOut
@@ -204,6 +238,7 @@ enum BrokerClientError: Error, Equatable, LocalizedError {
         case .authenticationRejected: "The broker rejected the private observer handshake."
         case .protocolMismatch: "The running broker protocol is incompatible and was left untouched."
         case .securityEpochMismatch: "The running broker lacks project-scoped isolation."
+        case .implementationMismatch: "The running broker implementation is outside this preview's compatibility window."
         case .identityChanged: "The broker identity changed during the handshake."
         case .observeFeatureMissing: "The running broker does not advertise terminal observation."
         case .connectionTimedOut: "The private broker did not complete its observer handshake in time."

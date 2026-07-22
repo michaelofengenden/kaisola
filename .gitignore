@@ -41,3 +41,5 @@ kaisola_icon_concepts/
 **/DerivedData/
 **/xcuserdata/
 *.xcuserstate
+native/KaisolaMac/.artifacts/
+native/KaisolaMac/ResourceGates/results/

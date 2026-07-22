@@ -7,6 +7,12 @@ import Foundation
 public enum BrokerWire {
     public static let protocolVersion = 2
     public static let securityEpoch = 1
+    public static let implementationVersion = 1
+    public static let helperPackageSchema = 1
+    /// Protocol-2 implementation N and N+1 are additive-compatible. A future
+    /// implementation that needs a wire break must increment `protocolVersion`
+    /// rather than widening this range silently.
+    public static let compatibleImplementationVersions = 1...2
     public static let terminalObserveFeature = "terminal-observe-v1"
     public static let observerRoleFeature = "observer-role-v1"
     public static let observerMethods: Set<String> = [
@@ -17,6 +23,18 @@ public enum BrokerWire {
         "terminal.unsubscribe",
     ]
     public static let maximumFrameBytes = 56 * 1_024 * 1_024
+
+    public static func accepts(
+        protocolVersion: Int,
+        securityEpoch: Int,
+        implementationVersion: Int?
+    ) -> Bool {
+        guard protocolVersion == self.protocolVersion,
+              securityEpoch == self.securityEpoch else { return false }
+        // Protocol-2 brokers shipped before independent implementation
+        // metadata. They are implementation N for compatibility purposes.
+        return compatibleImplementationVersions.contains(implementationVersion ?? 1)
+    }
 }
 
 public enum BrokerWireError: Error, Equatable, Sendable {

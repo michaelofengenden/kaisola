@@ -1,0 +1,29 @@
+{
+  "schemaVersion": 1,
+  "metric": {
+    "family": "macOS-footprint",
+    "name": "total footprint",
+    "source": "/usr/bin/footprint JSON",
+    "unit": "byte"
+  },
+  "minimumSamples": 5,
+  "workloads": [
+    {
+      "id": "one-window-idle-terminal-existing-broker",
+      "description": "One restored project window and one idle terminal with an already-running broker."
+    },
+    {
+      "id": "one-window-streaming-terminal-existing-broker",
+      "description": "One project window and one continuously streaming terminal with an already-running broker."
+    },
+    {
+      "id": "three-restored-project-windows-existing-broker",
+      "description": "Three restored project windows with an already-running broker."
+    },
+    {
+      "id": "one-window-idle-terminal-fresh-broker",
+      "description": "One restored project window and one idle terminal after the app starts a fresh broker."
+    }
+  ],
+  "countingPolicy": "Measure each app root and its complete descendant process tree, then add the detached broker and control-plane PIDs explicitly. Use the top-level total footprint from one footprint invocation so Electron and native share one metric family and shared regions are handled consistently."
+}

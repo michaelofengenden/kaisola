@@ -11,6 +11,9 @@ final class ObserveOnlyBrokerClientTests: XCTestCase {
 
         let hello = try await client.connect(to: brokerInfo)
         XCTAssertTrue(hello.serverEnforcedObserver)
+        XCTAssertEqual(hello.implementationVersion, BrokerWire.implementationVersion)
+        XCTAssertEqual(hello.packageSchema, BrokerWire.helperPackageSchema)
+        XCTAssertEqual(hello.packageVersion, "1.0.0")
         let frames = await transport.sentFrames()
         let sent = try XCTUnwrap(frames.first?.objectValue)
         XCTAssertEqual(sent["type"]?.stringValue, "hello")
@@ -31,12 +34,82 @@ final class ObserveOnlyBrokerClientTests: XCTestCase {
     }
 
     func testOldProtocolTwoBrokerStaysUsableUnderTheLocalTypedPolicy() async throws {
-        let transport = ScriptedBrokerTransport(helloAccess: nil, advertiseObserverRole: false)
+        let transport = ScriptedBrokerTransport(
+            helloAccess: nil,
+            advertiseObserverRole: false,
+            implementationVersion: nil,
+            packageSchema: nil,
+            packageVersion: nil
+        )
         let client = ObserveOnlyBrokerClient(transport: transport, operationTimeoutNanoseconds: 100_000_000)
 
-        let hello = try await client.connect(to: brokerInfo)
+        let hello = try await client.connect(to: legacyBrokerInfo)
         XCTAssertFalse(hello.serverEnforcedObserver)
+        XCTAssertEqual(hello.implementationVersion, 1)
         await client.disconnect()
+    }
+
+    func testAdditiveNPlusOneBrokerIsAcceptedButFutureImplementationIsRefused() async throws {
+        let compatible = ObserveOnlyBrokerClient(
+            transport: ScriptedBrokerTransport(implementationVersion: 2),
+            operationTimeoutNanoseconds: 100_000_000
+        )
+        var info = brokerInfo
+        info = BrokerInfo(
+            protocolVersion: info.protocolVersion,
+            securityEpoch: info.securityEpoch,
+            implementationVersion: 2,
+            packageSchema: info.packageSchema,
+            packageVersion: info.packageVersion,
+            pid: info.pid,
+            socketPath: info.socketPath,
+            token: info.token,
+            startedAt: info.startedAt,
+            version: info.version
+        )
+        let compatibleHello = try await compatible.connect(to: info)
+        XCTAssertEqual(compatibleHello.implementationVersion, 2)
+        await compatible.disconnect()
+
+        let future = ObserveOnlyBrokerClient(
+            transport: ScriptedBrokerTransport(implementationVersion: 3),
+            operationTimeoutNanoseconds: 100_000_000
+        )
+        do {
+            _ = try await future.connect(to: legacyBrokerInfo)
+            XCTFail("An implementation beyond the declared N/N+1 window must be refused")
+        } catch {
+            XCTAssertEqual(error as? BrokerClientError, .implementationMismatch)
+        }
+    }
+
+    func testHelloAndStatusCannotDriftFromPublishedBrokerIdentity() async throws {
+        let changedHello = ObserveOnlyBrokerClient(
+            transport: ScriptedBrokerTransport(packageVersion: "2.0.0"),
+            operationTimeoutNanoseconds: 100_000_000
+        )
+        do {
+            _ = try await changedHello.connect(to: brokerInfo)
+            XCTFail("A package identity change between metadata and hello must be refused")
+        } catch {
+            XCTAssertEqual(error as? BrokerClientError, .identityChanged)
+        }
+
+        let changedStatus = ObserveOnlyBrokerClient(
+            transport: ScriptedBrokerTransport(
+                replyToRequests: true,
+                statusImplementationVersion: 2
+            ),
+            operationTimeoutNanoseconds: 100_000_000
+        )
+        _ = try await changedStatus.connect(to: brokerInfo)
+        do {
+            _ = try await changedStatus.inventory()
+            XCTFail("A broker identity change after hello must be refused")
+        } catch {
+            XCTAssertEqual(error as? BrokerClientError, .identityChanged)
+        }
+        await changedStatus.disconnect()
     }
 
     func testHandshakeAndReadRequestsAreTimeBounded() async throws {
@@ -96,6 +169,21 @@ final class ObserveOnlyBrokerClientTests: XCTestCase {
         BrokerInfo(
             protocolVersion: BrokerWire.protocolVersion,
             securityEpoch: BrokerWire.securityEpoch,
+            implementationVersion: BrokerWire.implementationVersion,
+            packageSchema: BrokerWire.helperPackageSchema,
+            packageVersion: "1.0.0",
+            pid: 12_345,
+            socketPath: "/tmp/kaisola-observer-test.sock",
+            token: String(repeating: "a", count: 64),
+            startedAt: 1_784_250_001_000,
+            version: "test"
+        )
+    }
+
+    private var legacyBrokerInfo: BrokerInfo {
+        BrokerInfo(
+            protocolVersion: BrokerWire.protocolVersion,
+            securityEpoch: BrokerWire.securityEpoch,
             pid: 12_345,
             socketPath: "/tmp/kaisola-observer-test.sock",
             token: String(repeating: "a", count: 64),
@@ -110,6 +198,10 @@ private actor ScriptedBrokerTransport: BrokerByteTransport {
     private let helloAccess: String?
     private let advertiseObserverRole: Bool
     private let replyToRequests: Bool
+    private let implementationVersion: Int?
+    private let packageSchema: Int?
+    private let packageVersion: String?
+    private let statusImplementationVersion: Int?
     private var frames: [JSONValue] = []
     private var incoming: [Data?] = []
     private var waiter: CheckedContinuation<Data?, Never>?
@@ -118,12 +210,20 @@ private actor ScriptedBrokerTransport: BrokerByteTransport {
         replyToHello: Bool = true,
         helloAccess: String? = nil,
         advertiseObserverRole: Bool = false,
-        replyToRequests: Bool = false
+        replyToRequests: Bool = false,
+        implementationVersion: Int? = BrokerWire.implementationVersion,
+        packageSchema: Int? = BrokerWire.helperPackageSchema,
+        packageVersion: String? = "1.0.0",
+        statusImplementationVersion: Int? = nil
     ) {
         self.replyToHello = replyToHello
         self.helloAccess = helloAccess
         self.advertiseObserverRole = advertiseObserverRole
         self.replyToRequests = replyToRequests
+        self.implementationVersion = implementationVersion
+        self.packageSchema = packageSchema
+        self.packageVersion = packageVersion
+        self.statusImplementationVersion = statusImplementationVersion
     }
 
     func connect(path: String) async throws {}
@@ -145,6 +245,11 @@ private actor ScriptedBrokerTransport: BrokerByteTransport {
                 "startedAt": .integer(1_784_250_001_000),
                 "version": .string("test"),
             ]
+            if let implementationVersion {
+                fields["implementationVersion"] = .integer(Int64(implementationVersion))
+            }
+            if let packageSchema { fields["packageSchema"] = .integer(Int64(packageSchema)) }
+            if let packageVersion { fields["packageVersion"] = .string(packageVersion) }
             if let helloAccess { fields["access"] = .string(helloAccess) }
             deliver(try encoded(.object(fields)))
             return
@@ -158,11 +263,19 @@ private actor ScriptedBrokerTransport: BrokerByteTransport {
         let result: JSONValue
         switch method {
         case "broker.status":
-            result = .object([
+            var status: [String: JSONValue] = [
                 "ok": .bool(true),
                 "protocol": .integer(Int64(BrokerWire.protocolVersion)),
                 "securityEpoch": .integer(Int64(BrokerWire.securityEpoch)),
-            ])
+                "pid": .integer(12_345),
+                "startedAt": .integer(1_784_250_001_000),
+            ]
+            if let value = statusImplementationVersion ?? implementationVersion {
+                status["implementationVersion"] = .integer(Int64(value))
+            }
+            if let packageSchema { status["packageSchema"] = .integer(Int64(packageSchema)) }
+            if let packageVersion { status["packageVersion"] = .string(packageVersion) }
+            result = .object(status)
         case "terminal.diagnostics":
             result = .array([.object([
                 "id": .string("terminal:codex-1"),

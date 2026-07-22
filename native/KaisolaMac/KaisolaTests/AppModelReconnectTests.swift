@@ -72,7 +72,7 @@ private final class Fixture {
         _ = chmod(root.path, 0o700)
         client = ReconnectBrokerClient(failingConnectAttempts: failingConnectAttempts)
         model = AppModel(
-            locator: FixedBrokerLocator(info: Self.brokerInfo),
+            brokerPreparer: LocatedBrokerInfoPreparer(locator: FixedBrokerLocator(info: Self.brokerInfo)),
             client: client,
             cursorStore: TerminalCursorStore(fileURL: root.appendingPathComponent("cursors.json")),
             reconnectBackoff: BrokerReconnectBackoff(
@@ -132,6 +132,9 @@ private actor ReconnectBrokerClient: ObserveOnlyBrokerServing {
         return BrokerHello(
             protocolVersion: BrokerWire.protocolVersion,
             securityEpoch: BrokerWire.securityEpoch,
+            implementationVersion: BrokerWire.implementationVersion,
+            packageSchema: nil,
+            packageVersion: nil,
             features: [BrokerWire.terminalObserveFeature, BrokerWire.observerRoleFeature],
             pid: info.pid,
             startedAt: info.startedAt,
@@ -141,7 +144,19 @@ private actor ReconnectBrokerClient: ObserveOnlyBrokerServing {
     }
 
     func inventory() async throws -> BrokerStatus {
-        try BrokerStatus(
+        let expectedHello = BrokerHello(
+            protocolVersion: BrokerWire.protocolVersion,
+            securityEpoch: BrokerWire.securityEpoch,
+            implementationVersion: BrokerWire.implementationVersion,
+            packageSchema: nil,
+            packageVersion: nil,
+            features: [BrokerWire.terminalObserveFeature, BrokerWire.observerRoleFeature],
+            pid: 12_345,
+            startedAt: 1_784_250_001_000,
+            version: "test",
+            serverEnforcedObserver: true
+        )
+        return try BrokerStatus(
             status: .object([
                 "ok": .bool(true),
                 "protocol": .integer(Int64(BrokerWire.protocolVersion)),
@@ -157,7 +172,8 @@ private actor ReconnectBrokerClient: ObserveOnlyBrokerServing {
             live: .array([.object([
                 "id": .string("terminal:codex-1"),
                 "pid": .integer(123),
-            ])])
+            ])]),
+            expectedHello: expectedHello
         )
     }
 

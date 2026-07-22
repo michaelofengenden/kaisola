@@ -9,12 +9,32 @@ on:
       - '.github/workflows/swift-contracts.yml'
       - 'native/**'
       - 'mobile/KaisolaCompanion/**'
+      - 'protocol/broker/**'
+      - 'electron/session-broker.cjs'
+      - 'electron/ipc/brokerWire.cjs'
+      - 'electron/ipc/terminalManager.cjs'
+      - 'electron/ipc/terminalObservers.cjs'
+      - 'electron/ipc/terminalSpool.cjs'
+      - 'scripts/download-native-node-runtime.cjs'
+      - 'scripts/native-*.cjs'
+      - 'package.json'
+      - 'package-lock.json'
       - 'electron/companion/fixtures/**'
   pull_request:
     paths:
       - '.github/workflows/swift-contracts.yml'
       - 'native/**'
       - 'mobile/KaisolaCompanion/**'
+      - 'protocol/broker/**'
+      - 'electron/session-broker.cjs'
+      - 'electron/ipc/brokerWire.cjs'
+      - 'electron/ipc/terminalManager.cjs'
+      - 'electron/ipc/terminalObservers.cjs'
+      - 'electron/ipc/terminalSpool.cjs'
+      - 'scripts/download-native-node-runtime.cjs'
+      - 'scripts/native-*.cjs'
+      - 'package.json'
+      - 'package-lock.json'
       - 'electron/companion/fixtures/**'
 
 permissions:
@@ -23,13 +43,30 @@ permissions:
 jobs:
   verify:
     runs-on: macos-15
-    timeout-minutes: 35
+    timeout-minutes: 50
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: 22
+          cache: npm
       - name: Record Apple toolchain
         run: |
           swift --version
           xcodebuild -version
+      - name: Install exact Node helper dependencies
+        run: npm ci --prefer-offline --no-audit --no-fund
+        env:
+          KAISOLA_SKIP_NATIVE_REBUILD: '1'
+      - name: Download checksum-pinned universal Node runtimes
+        run: npm run native:helper:download
+      - name: Test native packaging, compatibility, and resource policies
+        run: >-
+          ELECTRON_RUN_AS_NODE=1 npx electron --test
+          electron/brokerCompatibility.test.cjs
+          electron/nativeBrokerPackage.test.cjs
+          electron/nativeReleasePreflight.test.cjs
+          electron/nativeResourceGate.test.cjs
       - name: Test shared Swift contracts
         run: swift test --package-path native/KaisolaCore
       - name: Compile optimized iPhone app against KaisolaCore
@@ -67,11 +104,22 @@ jobs:
           xcodebuild
           -project native/KaisolaMac/KaisolaMac.xcodeproj
           -scheme KaisolaMacPreview
-          -configuration Release
-          -destination 'platform=macOS'
+          -configuration LocalRelease
+          -destination 'generic/platform=macOS'
           -derivedDataPath "$RUNNER_TEMP/kaisola-mac"
-          CODE_SIGNING_ALLOWED=NO
+          ARCHS='arm64 x86_64'
+          ONLY_ACTIVE_ARCH=NO
+          CODE_SIGN_IDENTITY=-
           build
+      - name: Verify sealed universal native package
+        run: >-
+          npm run native:preflight --
+          --app "$RUNNER_TEMP/kaisola-mac/Build/Products/LocalRelease/KaisolaMacPreview.app"
+      - name: Prove packaged broker and PTY continuity
+        run: >-
+          npm run native:helper:probe --
+          "$RUNNER_TEMP/kaisola-mac/Build/Products/LocalRelease/KaisolaMacPreview.app/Contents/Resources/BrokerHelper"
+          --require-signed-host
       - name: Compile native macOS preview test bundle
         run: >-
           xcodebuild

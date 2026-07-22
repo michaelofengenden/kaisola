@@ -17,6 +17,8 @@ const { terminalOwnerAllowed, terminalOwnerParts } = require('./ipc/securityPoli
 const {
   PROTOCOL,
   SECURITY_EPOCH,
+  BROKER_IMPLEMENTATION_VERSION,
+  BROKER_PACKAGE_SCHEMA,
   TERMINAL_OBSERVE_FEATURE,
   OBSERVER_ROLE_FEATURE,
   OBSERVER_ACCESS,
@@ -176,7 +178,19 @@ async function dispatch(client, method, params = {}) {
   }
   switch (method) {
     case 'broker.status':
-      return { ok: true, protocol: PROTOCOL, securityEpoch: SECURITY_EPOCH, features: FEATURES, pid: process.pid, startedAt: config.startedAt, version: config.version, terminals: mgr.diagnostics() }
+      return {
+        ok: true,
+        protocol: PROTOCOL,
+        securityEpoch: SECURITY_EPOCH,
+        implementationVersion: BROKER_IMPLEMENTATION_VERSION,
+        packageSchema: Number(config.packageSchema) || BROKER_PACKAGE_SCHEMA,
+        packageVersion: typeof config.packageVersion === 'string' ? config.packageVersion : null,
+        features: FEATURES,
+        pid: process.pid,
+        startedAt: config.startedAt,
+        version: config.version,
+        terminals: mgr.diagnostics(),
+      }
     case 'broker.shutdown':
       setTimeout(() => gracefulExit(true), 20).unref?.()
       return { ok: true }
@@ -353,7 +367,20 @@ function handleLine(client, line) {
     everConnected = true
     clients.set(instanceId, client)
     clearNoClientTimer()
-    send(client.socket, { type: 'hello', ok: true, protocol: PROTOCOL, securityEpoch: SECURITY_EPOCH, features: FEATURES, access, pid: process.pid, startedAt: config.startedAt, version: config.version })
+    send(client.socket, {
+      type: 'hello',
+      ok: true,
+      protocol: PROTOCOL,
+      securityEpoch: SECURITY_EPOCH,
+      implementationVersion: BROKER_IMPLEMENTATION_VERSION,
+      packageSchema: Number(config.packageSchema) || BROKER_PACKAGE_SCHEMA,
+      packageVersion: typeof config.packageVersion === 'string' ? config.packageVersion : null,
+      features: FEATURES,
+      access,
+      pid: process.pid,
+      startedAt: config.startedAt,
+      version: config.version,
+    })
     return
   }
   if (frame?.type !== 'request' || typeof frame.id !== 'string' || typeof frame.method !== 'string') return
@@ -401,6 +428,9 @@ function brokerInfo() {
   return {
     protocol: PROTOCOL,
     securityEpoch: SECURITY_EPOCH,
+    implementationVersion: BROKER_IMPLEMENTATION_VERSION,
+    packageSchema: Number(config.packageSchema) || BROKER_PACKAGE_SCHEMA,
+    packageVersion: typeof config.packageVersion === 'string' ? config.packageVersion : null,
     pid: process.pid,
     socketPath: config.socketPath,
     token: config.token,

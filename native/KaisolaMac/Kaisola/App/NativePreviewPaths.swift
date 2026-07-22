@@ -8,6 +8,9 @@ enum NativePreviewPaths {
     static let terminalCursorStore = applicationSupportDirectory
         .appendingPathComponent("terminal-cursors-v1.json", isDirectory: false)
 
+    static let helperRegistrationRecord = applicationSupportDirectory
+        .appendingPathComponent("broker-helper-registration-v1", isDirectory: false)
+
     static func prepareApplicationSupport(at directory: URL = applicationSupportDirectory) throws {
         var metadata = stat()
         if lstat(directory.path, &metadata) == 0 {

@@ -7,6 +7,14 @@ enum KaisolaMacMain {
     private static let appDelegate = KaisolaMacAppDelegate()
 
     static func main() {
+        // This mode intentionally returns before touching user state or the
+        // broker. dyld must still load every linked framework first, making it
+        // a cheap packaging check for hardened-runtime/library-validation
+        // failures in CI and release preflight.
+        if ProcessInfo.processInfo.arguments.dropFirst().contains("--launch-probe") {
+            print("KAISOLA_NATIVE_LAUNCH_PROBE=PASS")
+            return
+        }
         let application = NSApplication.shared
         application.setActivationPolicy(.regular)
         application.delegate = appDelegate
@@ -17,6 +25,7 @@ enum KaisolaMacMain {
 @MainActor
 final class KaisolaMacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private let model = AppModel()
+    private let updateController = NativeUpdateController()
     private var window: NSWindow?
     private var wakeObserver: NSObjectProtocol?
 
@@ -24,6 +33,7 @@ final class KaisolaMacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDele
         // Preview-owned state stays separate from every historical Electron
         // profile. Broker discovery is explicitly read-only and lives elsewhere.
         try? NativePreviewPaths.prepareApplicationSupport()
+        installMainMenu()
         let content = RootShellView()
             .environmentObject(model)
 
@@ -73,5 +83,51 @@ final class KaisolaMacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDele
 
     func windowWillClose(_ notification: Notification) {
         Task { await model.disconnect() }
+    }
+
+    @objc private func checkForUpdates(_ sender: Any?) {
+        updateController.checkForUpdates(sender)
+    }
+
+    private func installMainMenu() {
+        let mainMenu = NSMenu()
+        let applicationItem = NSMenuItem()
+        mainMenu.addItem(applicationItem)
+
+        let applicationMenu = NSMenu()
+        applicationMenu.addItem(
+            withTitle: "About Kaisola Native Preview",
+            action: #selector(NSApplication.orderFrontStandardAboutPanel(_:)),
+            keyEquivalent: ""
+        )
+        let updateItem = applicationMenu.addItem(
+            withTitle: "Check for Updates…",
+            action: #selector(checkForUpdates(_:)),
+            keyEquivalent: ""
+        )
+        updateItem.target = self
+        updateItem.isEnabled = updateController.availability.canCheck
+        updateItem.toolTip = updateController.availability.detail
+        applicationMenu.addItem(.separator())
+        applicationMenu.addItem(
+            withTitle: "Hide Kaisola Native Preview",
+            action: #selector(NSApplication.hide(_:)),
+            keyEquivalent: "h"
+        )
+        applicationMenu.addItem(.separator())
+        applicationMenu.addItem(
+            withTitle: "Quit Kaisola Native Preview",
+            action: #selector(NSApplication.terminate(_:)),
+            keyEquivalent: "q"
+        )
+        applicationItem.submenu = applicationMenu
+
+        let editItem = NSMenuItem()
+        let editMenu = NSMenu(title: "Edit")
+        editMenu.addItem(withTitle: "Copy", action: #selector(NSText.copy(_:)), keyEquivalent: "c")
+        editMenu.addItem(withTitle: "Select All", action: #selector(NSText.selectAll(_:)), keyEquivalent: "a")
+        editItem.submenu = editMenu
+        mainMenu.addItem(editItem)
+        NSApp.mainMenu = mainMenu
     }
 }

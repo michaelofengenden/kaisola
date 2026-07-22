@@ -41,7 +41,7 @@ final class AppModel: ObservableObject {
     @Published var selectedSessionID: String?
     @Published private(set) var terminalDocument = TerminalDocument.empty
 
-    private let locator: BrokerInfoLocating
+    private let brokerPreparer: any BrokerInfoPreparing
     private let client: any ObserveOnlyBrokerServing
     private let cursorStore: TerminalCursorStore
     private let reconnectBackoff: BrokerReconnectBackoff
@@ -57,7 +57,7 @@ final class AppModel: ObservableObject {
     private let observerOwnerID = "native-preview"
 
     init(
-        locator: BrokerInfoLocating = BrokerInfoLocator.live(),
+        brokerPreparer: any BrokerInfoPreparing = BrokerStartupCoordinator.live(),
         client: any ObserveOnlyBrokerServing = ObserveOnlyBrokerClient(),
         cursorStore: TerminalCursorStore = TerminalCursorStore(fileURL: NativePreviewPaths.terminalCursorStore),
         reconnectBackoff: BrokerReconnectBackoff = BrokerReconnectBackoff(),
@@ -68,7 +68,7 @@ final class AppModel: ObservableObject {
             Double.random(in: -1...1)
         }
     ) {
-        self.locator = locator
+        self.brokerPreparer = brokerPreparer
         self.client = client
         self.cursorStore = cursorStore
         self.reconnectBackoff = reconnectBackoff
@@ -196,7 +196,7 @@ final class AppModel: ObservableObject {
         connectionState = reconnectAttempt.map { .reconnecting(attempt: $0 + 1) } ?? .connecting
 
         do {
-            let info = try locator.locate()
+            let info = try await brokerPreparer.prepare()
             activeBrokerIdentity = info.persistenceIdentity
             await client.setEventHandler { [weak self] event in
                 Task { @MainActor in self?.consume(event) }

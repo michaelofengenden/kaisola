@@ -6,6 +6,11 @@ options:
     macOS: "14.0"
   groupSortPosition: top
 
+configs:
+  Debug: debug
+  LocalRelease: release
+  Release: release
+
 settings:
   base:
     SWIFT_VERSION: "6.0"
@@ -19,19 +24,51 @@ packages:
   SwiftTerm:
     url: https://github.com/migueldeicaza/SwiftTerm.git
     exactVersion: 1.15.0
+  Sparkle:
+    url: https://github.com/sparkle-project/Sparkle.git
+    exactVersion: 2.9.2
 
 targets:
+  KaisolaBrokerBootstrap:
+    type: tool
+    platform: macOS
+    sources:
+      - path: BrokerBootstrap
+      - path: Shared
+    dependencies:
+      - package: KaisolaCore
+        product: KaisolaBrokerProtocol
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.kaisola.mac.preview.broker-bootstrap
+        PRODUCT_MODULE_NAME: KaisolaBrokerBootstrap
+        PRODUCT_NAME: KaisolaBrokerBootstrap
+        GENERATE_INFOPLIST_FILE: YES
+        ENABLE_APP_SANDBOX: NO
+        CODE_SIGN_STYLE: Automatic
+      configs:
+        LocalRelease:
+          ENABLE_HARDENED_RUNTIME: YES
+        Release:
+          ENABLE_HARDENED_RUNTIME: YES
+
   KaisolaMacPreview:
     type: application
     platform: macOS
     sources:
       - path: Kaisola
+      - path: Shared
     dependencies:
+      - target: KaisolaBrokerBootstrap
+        embed: false
+        link: false
       - package: KaisolaCore
         product: KaisolaCore
       - package: KaisolaCore
         product: KaisolaBrokerProtocol
       - package: SwiftTerm
+      - package: Sparkle
+        product: Sparkle
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.kaisola.mac.preview
@@ -40,8 +77,57 @@ targets:
         INFOPLIST_KEY_CFBundleDisplayName: Kaisola Native Preview
         INFOPLIST_KEY_LSApplicationCategoryType: public.app-category.developer-tools
         INFOPLIST_KEY_NSHighResolutionCapable: YES
+        INFOPLIST_KEY_SUEnableAutomaticChecks: NO
+        INFOPLIST_KEY_SUAutomaticallyUpdate: NO
+        INFOPLIST_KEY_SUFeedURL: $(KAISOLA_SPARKLE_FEED_URL)
+        INFOPLIST_KEY_SUPublicEDKey: $(KAISOLA_SPARKLE_PUBLIC_ED_KEY)
+        KAISOLA_SPARKLE_FEED_URL: ""
+        KAISOLA_SPARKLE_PUBLIC_ED_KEY: ""
         ENABLE_APP_SANDBOX: NO
         CODE_SIGN_STYLE: Automatic
+      configs:
+        LocalRelease:
+          CODE_SIGN_ENTITLEMENTS: BrokerHelper/LocalPreview.entitlements
+          ENABLE_HARDENED_RUNTIME: YES
+        Release:
+          ENABLE_HARDENED_RUNTIME: YES
+    postBuildScripts:
+      - name: Package standalone broker helper
+        basedOnDependencyAnalysis: false
+        script: |
+          set -euo pipefail
+          launch_agents="${TARGET_BUILD_DIR}/${CONTENTS_FOLDER_PATH}/Library/LaunchAgents"
+          mkdir -p "${launch_agents}"
+          cp "${SRCROOT}/BrokerHelper/com.kaisola.mac.preview.broker-bootstrap.plist" "${launch_agents}/com.kaisola.mac.preview.broker-bootstrap.plist"
+
+          if [[ "${CONFIGURATION}" != "Release" && "${CONFIGURATION}" != "LocalRelease" && "${KAISOLA_PACKAGE_BROKER_HELPER:-0}" != "1" ]]; then
+            exit 0
+          fi
+
+          runtime_arm64="${KAISOLA_NODE_RUNTIME_ARM64:-${SRCROOT}/.artifacts/node-v22.23.1-darwin-arm64/bin/node}"
+          runtime_x64="${KAISOLA_NODE_RUNTIME_X86_64:-${SRCROOT}/.artifacts/node-v22.23.1-darwin-x64/bin/node}"
+          if [[ ! -x "${runtime_arm64}" ]]; then
+            echo "Missing pinned arm64 Node runtime. Run: node scripts/download-native-node-runtime.cjs arm64" >&2
+            exit 1
+          fi
+
+          args=(
+            --output "${TARGET_BUILD_DIR}/${UNLOCALIZED_RESOURCES_FOLDER_PATH}/BrokerHelper"
+            --runtime-arm64 "${runtime_arm64}"
+            --bootstrap "${BUILT_PRODUCTS_DIR}/KaisolaBrokerBootstrap"
+            --entitlements "${SRCROOT}/BrokerHelper/BrokerHelper.entitlements"
+          )
+          if [[ " ${ARCHS} " == *" x86_64 "* ]]; then
+            if [[ ! -x "${runtime_x64}" ]]; then
+              echo "Missing pinned x86_64 Node runtime. Run: node scripts/download-native-node-runtime.cjs x86_64" >&2
+              exit 1
+            fi
+            args+=(--runtime-x86_64 "${runtime_x64}")
+          fi
+          if [[ -n "${EXPANDED_CODE_SIGN_IDENTITY:-}" ]]; then
+            args+=(--sign-identity "${EXPANDED_CODE_SIGN_IDENTITY}" --require-signatures)
+          fi
+          /usr/bin/env node "${SRCROOT}/../../scripts/native-broker-package.cjs" "${args[@]}"
 
   KaisolaMacPreviewTests:
     type: bundle.unit-test
@@ -50,6 +136,7 @@ targets:
       - path: KaisolaTests
     dependencies:
       - target: KaisolaMacPreview
+      - package: SwiftTerm
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.kaisola.mac.preview.tests

@@ -1,0 +1,61 @@
+{
+  "schemaVersion": 1,
+  "policy": {
+    "protocol": 2,
+    "securityEpoch": 1,
+    "implementationMinimum": 1,
+    "implementationMaximum": 2,
+    "missingImplementationMeans": 1
+  },
+  "combinations": [
+    {
+      "name": "old Electron client with old protocol-2 broker",
+      "protocol": 2,
+      "securityEpoch": 1,
+      "implementationVersion": 1,
+      "supported": true
+    },
+    {
+      "name": "native client with pre-version-field protocol-2 broker",
+      "protocol": 2,
+      "securityEpoch": 1,
+      "implementationVersion": null,
+      "supported": true
+    },
+    {
+      "name": "current clients with current packaged broker",
+      "protocol": 2,
+      "securityEpoch": 1,
+      "implementationVersion": 1,
+      "supported": true
+    },
+    {
+      "name": "rollback client with additive N-plus-1 broker",
+      "protocol": 2,
+      "securityEpoch": 1,
+      "implementationVersion": 2,
+      "supported": true
+    },
+    {
+      "name": "implementation beyond the declared coexistence window",
+      "protocol": 2,
+      "securityEpoch": 1,
+      "implementationVersion": 3,
+      "supported": false
+    },
+    {
+      "name": "future wire protocol requires an explicit client update",
+      "protocol": 3,
+      "securityEpoch": 1,
+      "implementationVersion": 2,
+      "supported": false
+    },
+    {
+      "name": "future security epoch is never assumed compatible",
+      "protocol": 2,
+      "securityEpoch": 2,
+      "implementationVersion": 1,
+      "supported": false
+    }
+  ]
+}

@@ -11,6 +11,14 @@ const path = require('node:path')
 // no trustworthy project label to migrate for already-running PTYs.
 const PROTOCOL = 2
 const SECURITY_EPOCH = 1
+// These versions are deliberately independent from the desktop app version.
+// The implementation version describes broker behavior within the protocol-2
+// compatibility envelope. The package schema describes the signed helper
+// layout used by the native preview. Neither value is permission to replace a
+// live broker; clients must adopt a compatible live process and defer helper
+// upgrades until its terminal inventory is empty.
+const BROKER_IMPLEMENTATION_VERSION = 1
+const BROKER_PACKAGE_SCHEMA = 1
 const TERMINAL_OBSERVE_FEATURE = 'terminal-observe-v1'
 const OBSERVER_ROLE_FEATURE = 'observer-role-v1'
 const OBSERVER_ACCESS = 'observer'
@@ -45,9 +53,20 @@ function brokerMethodAllowedForAccess(access, method) {
   return access !== OBSERVER_ACCESS || observerMethodAllowed(method)
 }
 
+function brokerVersionsCompatible({ protocol, securityEpoch, implementationVersion }) {
+  if (Number(protocol) !== PROTOCOL || Number(securityEpoch) !== SECURITY_EPOCH) return false
+  // Protocol-2 brokers predating this additive field are implementation N.
+  const implementation = implementationVersion == null ? BROKER_IMPLEMENTATION_VERSION : Number(implementationVersion)
+  return Number.isInteger(implementation)
+    && implementation >= BROKER_IMPLEMENTATION_VERSION
+    && implementation <= BROKER_IMPLEMENTATION_VERSION + 1
+}
+
 module.exports = {
   PROTOCOL,
   SECURITY_EPOCH,
+  BROKER_IMPLEMENTATION_VERSION,
+  BROKER_PACKAGE_SCHEMA,
   TERMINAL_OBSERVE_FEATURE,
   OBSERVER_ROLE_FEATURE,
   OBSERVER_ACCESS,
@@ -56,4 +75,5 @@ module.exports = {
   atomicJson,
   observerMethodAllowed,
   brokerMethodAllowedForAccess,
+  brokerVersionsCompatible,
 }

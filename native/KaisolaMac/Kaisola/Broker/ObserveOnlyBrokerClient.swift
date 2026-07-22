@@ -87,12 +87,18 @@ actor ObserveOnlyBrokerClient: ObserveOnlyBrokerServing {
     }
 
     func inventory() async throws -> BrokerStatus {
+        guard let hello else { throw BrokerClientError.notConnected }
         // These are typed read methods. The raw request encoder stays private,
         // so application code cannot represent or emit an arbitrary method.
         let status = try await request(.status, params: .object(["ownerId": .string("0")]))
         let diagnostics = try await request(.diagnostics, params: .object(["ownerId": .string("0")]))
         let live = try await request(.list, params: .object(["ownerId": .string("0")]))
-        return try BrokerStatus(status: status, diagnostics: diagnostics, live: live)
+        return try BrokerStatus(
+            status: status,
+            diagnostics: diagnostics,
+            live: live,
+            expectedHello: hello
+        )
     }
 
     func subscribe(
@@ -223,7 +229,24 @@ actor ObserveOnlyBrokerClient: ObserveOnlyBrokerServing {
             guard object["securityEpoch"]?.intValue == Int64(BrokerWire.securityEpoch) else {
                 throw BrokerClientError.securityEpochMismatch
             }
-            guard object["pid"]?.intValue == Int64(info.pid) else { throw BrokerClientError.identityChanged }
+            let advertisedImplementation = object["implementationVersion"]?.intValue.flatMap(Int.init(exactly:))
+            guard BrokerWire.accepts(
+                protocolVersion: BrokerWire.protocolVersion,
+                securityEpoch: BrokerWire.securityEpoch,
+                implementationVersion: advertisedImplementation
+            ) else {
+                throw BrokerClientError.implementationMismatch
+            }
+            let implementationVersion = advertisedImplementation ?? BrokerWire.implementationVersion
+            let packageSchema = object["packageSchema"]?.intValue.flatMap(Int.init(exactly:))
+            let packageVersion = object["packageVersion"]?.stringValue
+            guard object["pid"]?.intValue == Int64(info.pid),
+                  object["startedAt"]?.intValue == info.startedAt,
+                  info.implementationVersion == nil || info.implementationVersion == implementationVersion,
+                  info.packageSchema == nil || info.packageSchema == packageSchema,
+                  info.packageVersion == nil || info.packageVersion == packageVersion else {
+                throw BrokerClientError.identityChanged
+            }
             let features = Set(object["features"]?.arrayValue?.compactMap(\.stringValue) ?? [])
             guard features.contains(BrokerWire.terminalObserveFeature) else {
                 throw BrokerClientError.observeFeatureMissing
@@ -235,6 +258,9 @@ actor ObserveOnlyBrokerClient: ObserveOnlyBrokerServing {
             let hello = BrokerHello(
                 protocolVersion: BrokerWire.protocolVersion,
                 securityEpoch: BrokerWire.securityEpoch,
+                implementationVersion: implementationVersion,
+                packageSchema: packageSchema,
+                packageVersion: packageVersion,
                 features: features,
                 pid: info.pid,
                 startedAt: object["startedAt"]?.intValue ?? info.startedAt,

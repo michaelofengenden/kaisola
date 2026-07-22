@@ -216,6 +216,22 @@ scrollback. Cold launches still request the full retained broker snapshot, using
 the persisted cursor only to surface an explicit retention gap. The remaining
 Phase 1 work starts with helper packaging below.
 
+**Local implementation integrated 2026-07-21:** LocalRelease and Release builds now stage a
+manifested Node 22.23.1 + node-pty 1.1.0 helper with pinned upstream checksums,
+universal arm64/x86_64 Node and Swift bootstrap executables, architecture-
+specific native modules, nested hashes/modes/designated requirements, and a
+per-user `SMAppService` LaunchAgent. The Swift verifier checks the intact outer
+application seal before trusting the nested manifest and refuses symlinks,
+unmanifested files, writable code, invalid architecture/version ranges, or
+signature drift. The launcher adopts compatible live brokers, defers package
+replacement while they are live, and removes rendezvous files only after a
+second identity/liveness check. Shared Node/Swift fixtures pin protocol,
+security epoch, implementation N/N+1, and helper package schema independently.
+The ad-hoc `LocalRelease` signing profile now carries only the library-
+validation exception needed to load Sparkle without a Team ID; the Developer
+ID `Release` profile forbids that exception. Preflight executes a side-effect-
+free native launch probe so a sealed but unloadable framework cannot pass.
+
 Bundle a signed standalone Node runtime and the exact `node-pty` dependency
 closure. Add a per-user helper registration and a broker launcher/adopter that
 never replaces an incompatible live broker automatically.
@@ -233,6 +249,20 @@ paths, first launch, update, rollback, login relaunch, and zero-live cleanup.
 
 ### Task 1.6: Add native updating and the real continuity gate
 
+**Local implementation integrated 2026-07-21:** Sparkle 2.9.2 is exact-pinned
+for a separate native-preview channel. The updater starts only with an HTTPS
+appcast without credentials/fragment and an exact 32-byte Ed25519 public key;
+missing or partial configuration fails closed. A packaged-helper probe now runs
+one real node-pty terminal through N → N+1 → rollback-N observer replacement,
+proves the broker and terminal PIDs remain stable, resumes each exact byte
+cursor, and requires the combined numbered output to be continuous. The Swift
+client revalidates protocol/security/implementation/package identity on the
+live hello and status frames rather than trusting rendezvous metadata alone.
+
+The actual signed Sparkle update with real Claude and Codex processes remains a
+distribution gate and is not satisfied by the synthetic client-replacement
+probe.
+
 Integrate Sparkle for the native preview channel. Run a packaged update while a
 real Claude CLI and a real Codex CLI emit uniquely numbered output. Confirm the
 same PIDs survive and the post-update view contains a continuous retained
@@ -241,6 +271,25 @@ sequence or an explicit retention-gap marker.
 Repeat with an old broker/new client combination and a rolled-back client.
 
 ### Task 1.7: Resource and interaction gate
+
+**Harnesses integrated 2026-07-21:** `scripts/native-resource-gate.cjs` measures
+Electron and native with the same top-level `total footprint` byte metric from
+one `/usr/bin/footprint -j` invocation, follows complete app process trees, adds
+detached helpers explicitly, records median/p95, and refuses mismatched metric
+families or workloads. Versioned workloads and an evidence-scoped interaction
+matrix live under `native/KaisolaMac/ResourceGates`.
+
+Automated tests cover the 56 MiB frame envelope, >56 MiB streaming batches,
+sync backpressure, an 8 MiB retained-output boundary, split UTF-8, ANSI modes,
+8,192-line capped SwiftTerm scrollback, Unicode terminal widths, and resize/
+reflow. The exact sealed universal `LocalRelease` artifact also passed its
+side-effect-free launch probe and direct AppKit/accessibility-tree inspection:
+the named shell/status/reconnect/sidebar controls were exposed, sidebar
+hide/show worked, and the preview correctly remained read-only rather than
+replacing an older live Electron broker without observation support. Paired
+native/Electron captures and packaged selection/copy/search, VoiceOver,
+appearance, multiple-window, and sustained-GUI inspections remain open release
+evidence.
 
 Implement a native physical-footprint probe that counts the app, WebKit helpers,
 broker, control plane, and any other bundled helper consistently. Remeasure the

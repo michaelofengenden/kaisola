@@ -7,7 +7,16 @@ const os = require('node:os')
 const path = require('node:path')
 const { spawn } = require('node:child_process')
 const { StringDecoder } = require('node:string_decoder')
-const { PROTOCOL, SECURITY_EPOCH, TERMINAL_OBSERVE_FEATURE, MAX_FRAME, atomicJson } = require('./brokerWire.cjs')
+const {
+  PROTOCOL,
+  SECURITY_EPOCH,
+  BROKER_IMPLEMENTATION_VERSION,
+  BROKER_PACKAGE_SCHEMA,
+  TERMINAL_OBSERVE_FEATURE,
+  MAX_FRAME,
+  atomicJson,
+  brokerVersionsCompatible,
+} = require('./brokerWire.cjs')
 
 const LEGACY_UNSCOPED_PROTOCOL = 1
 const CONNECT_TIMEOUT_MS = 8_000
@@ -68,6 +77,9 @@ function validateBrokerHello(frame, info) {
   }
   if (frame.securityEpoch !== SECURITY_EPOCH) {
     throw new Error('session broker does not advertise project-scoped terminal isolation')
+  }
+  if (!brokerVersionsCompatible(frame)) {
+    throw new Error('session broker implementation is outside this client compatibility window')
   }
   if (Number.isInteger(Number(info?.pid)) && Number(frame.pid) !== Number(info.pid)) {
     throw new Error('session broker identity changed during handshake')
@@ -432,6 +444,9 @@ class SessionBrokerClient {
     atomicJson(launchFile, {
       protocol: PROTOCOL,
       securityEpoch: SECURITY_EPOCH,
+      implementationVersion: BROKER_IMPLEMENTATION_VERSION,
+      packageSchema: BROKER_PACKAGE_SCHEMA,
+      packageVersion: null,
       token,
       socketPath: this.socketPath,
       infoFile: this.infoFile,
@@ -454,7 +469,18 @@ class SessionBrokerClient {
     let earlyExit = null
     child.once('exit', (code, signal) => { earlyExit = { code, signal } })
     child.unref()
-    const info = { protocol: PROTOCOL, securityEpoch: SECURITY_EPOCH, pid: child.pid, socketPath: this.socketPath, token, startedAt, version: this.appVersion }
+    const info = {
+      protocol: PROTOCOL,
+      securityEpoch: SECURITY_EPOCH,
+      implementationVersion: BROKER_IMPLEMENTATION_VERSION,
+      packageSchema: BROKER_PACKAGE_SCHEMA,
+      packageVersion: null,
+      pid: child.pid,
+      socketPath: this.socketPath,
+      token,
+      startedAt,
+      version: this.appVersion,
+    }
     const deadline = Date.now() + CONNECT_TIMEOUT_MS
     let lastError = null
     while (Date.now() < deadline) {

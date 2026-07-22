@@ -77,12 +77,15 @@ test('release preflight distinguishes local and hardened Developer ID signatures
     developerID: true,
     teamIdentifier: 'TEAM123456',
     hardenedRuntime: true,
+    secureTimestamp: false,
   })
+  assert.equal(parseCodeSignature('CodeDirectory v=20500 size=123 flags=0x10000(runtime) hashes=1+7 location=embedded\nAuthority=Developer ID Application: Kaisola Labs (TEAM123456)\nTeamIdentifier=TEAM123456\nTimestamp=Jul 22, 2026 at 1:00:00 AM').secureTimestamp, true)
   assert.deepEqual(parseCodeSignature('CodeDirectory v=20400 size=123 flags=0x2(adhoc) hashes=1+7 location=embedded\nTeamIdentifier=not set'), {
     authorities: [],
     developerID: false,
     teamIdentifier: null,
     hardenedRuntime: false,
+    secureTimestamp: false,
   })
 })
 

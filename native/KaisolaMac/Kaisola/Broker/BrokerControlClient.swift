@@ -80,7 +80,10 @@ actor BrokerControlClient: BrokerControlServing {
             "type": .string("hello"),
             "protocol": .integer(Int64(BrokerWire.protocolVersion)),
             "token": .string(info.token),
-            "instanceId": .string(ownerID),
+            // The broker validates instanceId as a UUID shape; the durable
+            // owner identity travels in request params instead, and reattach
+            // is authorized by project capability rather than instance.
+            "instanceId": .string(UUID().uuidString.lowercased()),
             "appVersion": .string(Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "native-preview"),
             "access": .string("controller"),
         ])

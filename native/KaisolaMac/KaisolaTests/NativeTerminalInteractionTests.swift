@@ -105,6 +105,23 @@ final class NativeTerminalInteractionTests: XCTestCase {
         XCTAssertFalse(ReadOnlyTerminalView.shouldClaimFocus(currentFirstResponder: findBarField, window: window))
     }
 
+    func testOwnedSurfaceForwardsKeyboardBytesToInputCallback() {
+        let coordinator = NativeTerminalSurface.Coordinator()
+        var captured: [String] = []
+        coordinator.onInput = { captured.append($0) }
+        let view = OwnedTerminalView(
+            frame: .zero,
+            font: NSFont.monospacedSystemFont(ofSize: 13, weight: .regular)
+        )
+        view.terminalDelegate = coordinator
+
+        // The owned view forwards the Terminal engine's outbound bytes (the
+        // path keyboard input travels) to the delegate; the coordinator turns
+        // them into an onInput string bound to the broker controller write.
+        view.send(source: view.getTerminal(), data: ArraySlice(Array("ls -la\r".utf8)))
+        XCTAssertEqual(captured, ["ls -la\r"])
+    }
+
     func testReadOnlyViewStillDropsAllPTYBoundBytes() {
         let view = ReadOnlyTerminalView(
             frame: .zero,

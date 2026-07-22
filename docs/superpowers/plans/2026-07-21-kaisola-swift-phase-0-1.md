@@ -352,6 +352,24 @@ and multiple windows.
 compatibility matrix, physical-footprint report, stress results, and no changes
 to Electron terminal ownership.
 
+**Distribution gates closed 2026-07-22 (v0.1.93):** the release pipeline now
+builds the native preview in a parallel macos-15 job, re-signs Sparkle's
+SPM-embedded helpers (vendor ad-hoc signatures fail notarization), holds every
+embedded-framework Mach-O to Developer ID + hardened runtime + secure
+timestamp in preflight before the Apple round trip, and publishes an
+immutable-named notarized zip beside the Electron artifacts.
+`KaisolaMacPreview-0.1.93-b11001.zip` verified: checksum, stapled ticket,
+`spctl` "Notarized Developer ID", and a quarantined LaunchServices launch that
+ran translocated from an AppTranslocation mount without dialogs. The rolling
+`native-preview` release now hosts the locally-signed appcast, and a real
+Sparkle update ran end to end on the installed preview: 0.1.88 build 101
+checked the HTTPS feed, verified the EdDSA signature, downloaded, installed,
+and relaunched as notarized 0.1.93 build 11001 with staple and Gatekeeper
+intact. Remaining open evidence: the installed-app Electron footprint
+baseline (still awaiting the daily driver's natural broker turnover), the
+VoiceOver/Full-Keyboard-Access judgment rows, and a true clean-user-account
+login test.
+
 **Accepted follow-ups from the 2026-07-22 adversarial review** (recorded, not
 blocking Phase 1): the native preview build currently runs inside the Electron
 release job, so a native-only or notarization outage would delay an Electron

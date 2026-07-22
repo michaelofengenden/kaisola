@@ -19,6 +19,14 @@ The only broker methods admitted by the local transport policy are:
 - `terminal.subscribe`
 - `terminal.unsubscribe`
 
+Transient socket loss is recovered with capped exponential backoff and jitter.
+The app reconnects after wake and when an offline preview returns to the
+foreground, then resumes from the exact in-memory UTF-8 byte cursor. Cursor
+checkpoints are stored separately under the native bundle directory with mode
+`0600` and are scoped by a hash of the broker identity plus project and terminal
+ids. A cold launch still requests the broker's full retained snapshot; the disk
+cursor is used only to identify and disclose a real retention gap.
+
 Generate and verify the project with:
 
 ```bash

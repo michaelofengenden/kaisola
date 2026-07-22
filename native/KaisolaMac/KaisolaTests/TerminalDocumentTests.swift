@@ -65,4 +65,53 @@ final class TerminalDocumentTests: XCTestCase {
         )
         XCTAssertTrue(document.truncated)
     }
+
+    func testCursorResumeAppendsAnExactSuffixWithoutDroppingVisibleScrollback() throws {
+        let initial = try TerminalSnapshot(value: .object([
+            "streamEpoch": .string("epoch"),
+            "output": .string("hello"),
+            "startOffset": .integer(0),
+            "endOffset": .integer(5),
+        ]))
+        let suffix = try TerminalSnapshot(value: .object([
+            "streamEpoch": .string("epoch"),
+            "output": .string(" world"),
+            "startOffset": .integer(5),
+            "endOffset": .integer(11),
+            // The broker marks cursor-relative snapshots as truncated because
+            // they omit the prefix; the UI already owns that exact prefix.
+            "truncated": .bool(true),
+        ]))
+        let document = TerminalDocument.empty
+            .applying(.snapshot(initial, resetReason: nil), sessionID: "t1")
+            .applying(.snapshot(suffix, resetReason: nil), sessionID: "t1")
+
+        XCTAssertEqual(document.output, "hello world")
+        XCTAssertEqual(document.cursor, TerminalCursor(streamEpoch: "epoch", offset: 11))
+        XCTAssertFalse(document.truncated)
+    }
+
+    func testResetSnapshotReplacesAnIncompatibleVisiblePrefix() throws {
+        let current = TerminalDocument(
+            sessionID: "t1",
+            output: "old",
+            cursor: TerminalCursor(streamEpoch: "old-epoch", offset: 3),
+            truncated: false,
+            exited: false,
+            errorMessage: nil
+        )
+        let replacement = try TerminalSnapshot(value: .object([
+            "streamEpoch": .string("new-epoch"),
+            "output": .string("new"),
+            "startOffset": .integer(0),
+            "endOffset": .integer(3),
+        ]))
+        let document = current.applying(
+            .snapshot(replacement, resetReason: "epoch_mismatch"),
+            sessionID: "t1"
+        )
+
+        XCTAssertEqual(document.output, "new")
+        XCTAssertTrue(document.truncated)
+    }
 }

@@ -1,4 +1,5 @@
 import Darwin
+import CryptoKit
 import Foundation
 import KaisolaBrokerProtocol
 
@@ -30,6 +31,23 @@ struct BrokerInfo: Decodable, Equatable, Sendable {
         guard token.count == 64, token.allSatisfy(\.isHexDigit) else {
             throw BrokerDiscoveryError.invalidMetadata
         }
+    }
+
+    /// A non-secret, stable scope for native resume cursors. The broker token
+    /// is random and changes with a replacement broker, so hashing it keeps a
+    /// cursor from one PTY owner from ever being replayed against another.
+    var persistenceIdentity: String {
+        let material = [
+            String(protocolVersion),
+            String(securityEpoch),
+            String(pid),
+            String(startedAt),
+            socketPath,
+            token,
+        ].joined(separator: "\u{0}")
+        return SHA256.hash(data: Data(material.utf8))
+            .map { String(format: "%02x", $0) }
+            .joined()
     }
 }
 

@@ -110,6 +110,63 @@ final class BrokerDiscoveryTests: XCTestCase {
     func testNativeStateUsesItsDistinctBundleDirectory() {
         XCTAssertTrue(NativePreviewPaths.applicationSupportDirectory.path.hasSuffix("/com.kaisola.mac.preview"))
         XCTAssertFalse(NativePreviewPaths.applicationSupportDirectory.path.hasSuffix("/Kaisola"))
+        XCTAssertEqual(
+            NativePreviewPaths.terminalCursorStore.deletingLastPathComponent(),
+            NativePreviewPaths.applicationSupportDirectory
+        )
+    }
+
+    func testCursorIdentityIsStableForOneBrokerAndChangesWithItsSecret() {
+        let first = BrokerInfo(
+            protocolVersion: 2,
+            securityEpoch: 1,
+            pid: 123,
+            socketPath: "/tmp/broker.sock",
+            token: String(repeating: "a", count: 64),
+            startedAt: 456,
+            version: "one"
+        )
+        let renamed = BrokerInfo(
+            protocolVersion: 2,
+            securityEpoch: 1,
+            pid: 123,
+            socketPath: "/tmp/broker.sock",
+            token: String(repeating: "a", count: 64),
+            startedAt: 456,
+            version: "two"
+        )
+        let replacement = BrokerInfo(
+            protocolVersion: 2,
+            securityEpoch: 1,
+            pid: 123,
+            socketPath: "/tmp/broker.sock",
+            token: String(repeating: "b", count: 64),
+            startedAt: 456,
+            version: "two"
+        )
+
+        XCTAssertEqual(first.persistenceIdentity, renamed.persistenceIdentity)
+        XCTAssertNotEqual(first.persistenceIdentity, replacement.persistenceIdentity)
+        XCTAssertEqual(first.persistenceIdentity.count, 64)
+    }
+
+    func testNativeStatePreparationRejectsSymlinkWithoutChmoddingItsTarget() throws {
+        let target = root.appendingPathComponent("external-native-state", isDirectory: true)
+        try FileManager.default.createDirectory(
+            at: target,
+            withIntermediateDirectories: true,
+            attributes: [.posixPermissions: 0o755]
+        )
+        _ = chmod(target.path, 0o755)
+        let link = root.appendingPathComponent("native-state-link", isDirectory: true)
+        try FileManager.default.createSymbolicLink(at: link, withDestinationURL: target)
+
+        XCTAssertThrowsError(try NativePreviewPaths.prepareApplicationSupport(at: link)) { error in
+            XCTAssertEqual(error as? NativePreviewPathError, .unsafeApplicationSupport)
+        }
+        var metadata = stat()
+        XCTAssertEqual(lstat(target.path, &metadata), 0)
+        XCTAssertEqual(metadata.st_mode & 0o777, 0o755)
     }
 
     private func makeProfile(_ name: String) throws -> URL {

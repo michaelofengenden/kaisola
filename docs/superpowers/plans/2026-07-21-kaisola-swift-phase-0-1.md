@@ -207,6 +207,15 @@ output while broker ownership diagnostics remain unchanged.
 
 ### Task 1.5: Package the durable helper
 
+**Integrated through Task 1.4 (2026-07-21):** the observer now queries
+`broker.status`, `terminal.list`, and `terminal.diagnostics`; retries private
+socket loss with capped jittered backoff; reopens on wake/foreground; persists
+0600 cursor checkpoints scoped by broker identity, project, and terminal; and
+appends exact cursor-relative suffixes without replacing already-visible
+scrollback. Cold launches still request the full retained broker snapshot, using
+the persisted cursor only to surface an explicit retention gap. The remaining
+Phase 1 work starts with helper packaging below.
+
 Bundle a signed standalone Node runtime and the exact `node-pty` dependency
 closure. Add a per-user helper registration and a broker launcher/adopter that
 never replaces an incompatible live broker automatically.

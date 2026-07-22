@@ -12,14 +12,18 @@
 		15B7789EF6CCF94F2416E478 /* KaisolaBrokerProtocol in Frameworks */ = {isa = PBXBuildFile; productRef = 35E6E0DC943424C3E5094F7F /* KaisolaBrokerProtocol */; };
 		4409329EA3927EEB31069A19 /* KaisolaCore in Frameworks */ = {isa = PBXBuildFile; productRef = E25CBD38778593D118AEFD33 /* KaisolaCore */; };
 		4997F3C7792E645608D19132 /* BrokerInfo.swift in Sources */ = {isa = PBXBuildFile; fileRef = 16F343A1F0C6E1A6F95DB932 /* BrokerInfo.swift */; };
+		51632AA5B21B3F1D0BF0A4F4 /* BrokerReconnectBackoff.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8A7A17FC91F373F5881DB97C /* BrokerReconnectBackoff.swift */; };
 		5AF29A34E38E013439C5835A /* SwiftTerm in Frameworks */ = {isa = PBXBuildFile; productRef = BC5B996E0136696A21E890DC /* SwiftTerm */; };
+		6A358DDF102C7984D29FD806 /* TerminalCursorStoreTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 96E5D09B49E862C088D584E8 /* TerminalCursorStoreTests.swift */; };
 		6B76FFE3C1F1E11155040E2F /* RootShellView.swift in Sources */ = {isa = PBXBuildFile; fileRef = CBB83EF128840150F6F7103D /* RootShellView.swift */; };
 		6DFF60157687B575AD4176D7 /* UnixBrokerTransport.swift in Sources */ = {isa = PBXBuildFile; fileRef = C1139547AB3E3B3A9C7AAEDA /* UnixBrokerTransport.swift */; };
 		98DAE6676A641D45F023DA05 /* NativePreviewPaths.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6E78A73E4BF5DABAB5BF6826 /* NativePreviewPaths.swift */; };
 		A06CBCBD9882375F104D2ACA /* ObserveOnlyBrokerClientTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 96F1989B7416C050648E9CAB /* ObserveOnlyBrokerClientTests.swift */; };
+		A5F88CF039D35506FC38BDC3 /* BrokerReconnectBackoffTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A451FC25E152BC8B61FB5702 /* BrokerReconnectBackoffTests.swift */; };
 		AA39C33375202BD9300CE951 /* BrokerModelsTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 991FCF32D009E1236EBF19A5 /* BrokerModelsTests.swift */; };
 		ACC0996E20F391DC8E473C42 /* AppModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = 45799AC8A5D80828BB3EB235 /* AppModel.swift */; };
 		ADCD5776327E816820F93512 /* BrokerDiscoveryTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9F5A8717F4788368FDE60F93 /* BrokerDiscoveryTests.swift */; };
+		ADF15F7FA4CF4D7D2FA753AE /* TerminalCursorStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = 44220D13FC4D0265D132F67A /* TerminalCursorStore.swift */; };
 		B2E80671AD073A985161ED40 /* ObserveOnlyBrokerPolicyTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7DE33FAC2761474B7B6A46A2 /* ObserveOnlyBrokerPolicyTests.swift */; };
 		C5D7FD2E209D40C0C1CB9724 /* NoBoardBoundaryTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = AF52791E7FB87F94AF30DBD2 /* NoBoardBoundaryTests.swift */; };
 		C8DC030B09CC7E0BDA1FEF96 /* ObserveOnlyBrokerPolicy.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5D434A4435BCB68FD69050A4 /* ObserveOnlyBrokerPolicy.swift */; };
@@ -27,6 +31,7 @@
 		D478A5901D0C96CE5D108C4A /* TerminalDocument.swift in Sources */ = {isa = PBXBuildFile; fileRef = 13BFA68C0E2E3E83379B2835 /* TerminalDocument.swift */; };
 		E2A8476205D4F2F478EBCA17 /* NativeTerminalSurface.swift in Sources */ = {isa = PBXBuildFile; fileRef = E66C339455BFF598A81C41DE /* NativeTerminalSurface.swift */; };
 		EC396A9F5333AD82AA272705 /* TerminalDocumentTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 346DC3875261051CDA13A916 /* TerminalDocumentTests.swift */; };
+		F0340491DE4B839A15E2B447 /* AppModelReconnectTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9971B075277E2DD1494755BE /* AppModelReconnectTests.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -45,15 +50,20 @@
 		2788B54E3ABEA6DC3BB724F1 /* KaisolaCore */ = {isa = PBXFileReference; lastKnownFileType = folder; name = KaisolaCore; path = ../KaisolaCore; sourceTree = SOURCE_ROOT; };
 		346DC3875261051CDA13A916 /* TerminalDocumentTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TerminalDocumentTests.swift; sourceTree = "<group>"; };
 		422CC0F5A9B0FD425C41BBA7 /* KaisolaMacPreview.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = KaisolaMacPreview.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		44220D13FC4D0265D132F67A /* TerminalCursorStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TerminalCursorStore.swift; sourceTree = "<group>"; };
 		45799AC8A5D80828BB3EB235 /* AppModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppModel.swift; sourceTree = "<group>"; };
 		5D434A4435BCB68FD69050A4 /* ObserveOnlyBrokerPolicy.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ObserveOnlyBrokerPolicy.swift; sourceTree = "<group>"; };
 		6E78A73E4BF5DABAB5BF6826 /* NativePreviewPaths.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NativePreviewPaths.swift; sourceTree = "<group>"; };
 		7DE33FAC2761474B7B6A46A2 /* ObserveOnlyBrokerPolicyTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ObserveOnlyBrokerPolicyTests.swift; sourceTree = "<group>"; };
+		8A7A17FC91F373F5881DB97C /* BrokerReconnectBackoff.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BrokerReconnectBackoff.swift; sourceTree = "<group>"; };
 		8D98396E44670C6412BE1415 /* BrokerModels.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BrokerModels.swift; sourceTree = "<group>"; };
 		93A5794337909F4D5F4C7A54 /* KaisolaMacPreviewTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = KaisolaMacPreviewTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
+		96E5D09B49E862C088D584E8 /* TerminalCursorStoreTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TerminalCursorStoreTests.swift; sourceTree = "<group>"; };
 		96F1989B7416C050648E9CAB /* ObserveOnlyBrokerClientTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ObserveOnlyBrokerClientTests.swift; sourceTree = "<group>"; };
 		991FCF32D009E1236EBF19A5 /* BrokerModelsTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BrokerModelsTests.swift; sourceTree = "<group>"; };
+		9971B075277E2DD1494755BE /* AppModelReconnectTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppModelReconnectTests.swift; sourceTree = "<group>"; };
 		9F5A8717F4788368FDE60F93 /* BrokerDiscoveryTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BrokerDiscoveryTests.swift; sourceTree = "<group>"; };
+		A451FC25E152BC8B61FB5702 /* BrokerReconnectBackoffTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BrokerReconnectBackoffTests.swift; sourceTree = "<group>"; };
 		AF52791E7FB87F94AF30DBD2 /* NoBoardBoundaryTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NoBoardBoundaryTests.swift; sourceTree = "<group>"; };
 		C1139547AB3E3B3A9C7AAEDA /* UnixBrokerTransport.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = UnixBrokerTransport.swift; sourceTree = "<group>"; };
 		CA0225E687EE0462F0D9C548 /* ObserveOnlyBrokerClient.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ObserveOnlyBrokerClient.swift; sourceTree = "<group>"; };
@@ -135,11 +145,14 @@
 		C91771205CA39A4F31928CFA /* KaisolaTests */ = {
 			isa = PBXGroup;
 			children = (
+				9971B075277E2DD1494755BE /* AppModelReconnectTests.swift */,
 				9F5A8717F4788368FDE60F93 /* BrokerDiscoveryTests.swift */,
 				991FCF32D009E1236EBF19A5 /* BrokerModelsTests.swift */,
+				A451FC25E152BC8B61FB5702 /* BrokerReconnectBackoffTests.swift */,
 				AF52791E7FB87F94AF30DBD2 /* NoBoardBoundaryTests.swift */,
 				96F1989B7416C050648E9CAB /* ObserveOnlyBrokerClientTests.swift */,
 				7DE33FAC2761474B7B6A46A2 /* ObserveOnlyBrokerPolicyTests.swift */,
+				96E5D09B49E862C088D584E8 /* TerminalCursorStoreTests.swift */,
 				346DC3875261051CDA13A916 /* TerminalDocumentTests.swift */,
 			);
 			path = KaisolaTests;
@@ -150,8 +163,10 @@
 			children = (
 				16F343A1F0C6E1A6F95DB932 /* BrokerInfo.swift */,
 				8D98396E44670C6412BE1415 /* BrokerModels.swift */,
+				8A7A17FC91F373F5881DB97C /* BrokerReconnectBackoff.swift */,
 				CA0225E687EE0462F0D9C548 /* ObserveOnlyBrokerClient.swift */,
 				5D434A4435BCB68FD69050A4 /* ObserveOnlyBrokerPolicy.swift */,
+				44220D13FC4D0265D132F67A /* TerminalCursorStore.swift */,
 				C1139547AB3E3B3A9C7AAEDA /* UnixBrokerTransport.swift */,
 			);
 			path = Broker;
@@ -257,12 +272,14 @@
 				ACC0996E20F391DC8E473C42 /* AppModel.swift in Sources */,
 				4997F3C7792E645608D19132 /* BrokerInfo.swift in Sources */,
 				143B9FBEC29D4FD6104DD505 /* BrokerModels.swift in Sources */,
+				51632AA5B21B3F1D0BF0A4F4 /* BrokerReconnectBackoff.swift in Sources */,
 				D03FE4B6FB7FD213CB76997A /* KaisolaMacAppDelegate.swift in Sources */,
 				98DAE6676A641D45F023DA05 /* NativePreviewPaths.swift in Sources */,
 				E2A8476205D4F2F478EBCA17 /* NativeTerminalSurface.swift in Sources */,
 				0B95CB6DB59DBD720A65A98E /* ObserveOnlyBrokerClient.swift in Sources */,
 				C8DC030B09CC7E0BDA1FEF96 /* ObserveOnlyBrokerPolicy.swift in Sources */,
 				6B76FFE3C1F1E11155040E2F /* RootShellView.swift in Sources */,
+				ADF15F7FA4CF4D7D2FA753AE /* TerminalCursorStore.swift in Sources */,
 				D478A5901D0C96CE5D108C4A /* TerminalDocument.swift in Sources */,
 				6DFF60157687B575AD4176D7 /* UnixBrokerTransport.swift in Sources */,
 			);
@@ -272,11 +289,14 @@
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				F0340491DE4B839A15E2B447 /* AppModelReconnectTests.swift in Sources */,
 				ADCD5776327E816820F93512 /* BrokerDiscoveryTests.swift in Sources */,
 				AA39C33375202BD9300CE951 /* BrokerModelsTests.swift in Sources */,
+				A5F88CF039D35506FC38BDC3 /* BrokerReconnectBackoffTests.swift in Sources */,
 				C5D7FD2E209D40C0C1CB9724 /* NoBoardBoundaryTests.swift in Sources */,
 				A06CBCBD9882375F104D2ACA /* ObserveOnlyBrokerClientTests.swift in Sources */,
 				B2E80671AD073A985161ED40 /* ObserveOnlyBrokerPolicyTests.swift in Sources */,
+				6A358DDF102C7984D29FD806 /* TerminalCursorStoreTests.swift in Sources */,
 				EC396A9F5333AD82AA272705 /* TerminalDocumentTests.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;

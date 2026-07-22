@@ -67,6 +67,31 @@ final class ObserveOnlyBrokerClientTests: XCTestCase {
         await requestClient.disconnect()
     }
 
+    func testInventoryUsesEveryPlannedReadSurfaceInOrder() async throws {
+        let transport = ScriptedBrokerTransport(
+            helloAccess: "observer",
+            advertiseObserverRole: true,
+            replyToRequests: true
+        )
+        let client = ObserveOnlyBrokerClient(
+            transport: transport,
+            operationTimeoutNanoseconds: 100_000_000
+        )
+        _ = try await client.connect(to: brokerInfo)
+
+        let inventory = try await client.inventory()
+        let methods = await transport.sentFrames().compactMap {
+            $0.objectValue?["method"]?.stringValue
+        }
+
+        XCTAssertEqual(
+            methods,
+            ["broker.status", "terminal.diagnostics", "terminal.list"]
+        )
+        XCTAssertEqual(inventory.terminals.map(\.id), ["terminal:codex-1"])
+        await client.disconnect()
+    }
+
     private var brokerInfo: BrokerInfo {
         BrokerInfo(
             protocolVersion: BrokerWire.protocolVersion,
@@ -84,6 +109,7 @@ private actor ScriptedBrokerTransport: BrokerByteTransport {
     private let replyToHello: Bool
     private let helloAccess: String?
     private let advertiseObserverRole: Bool
+    private let replyToRequests: Bool
     private var frames: [JSONValue] = []
     private var incoming: [Data?] = []
     private var waiter: CheckedContinuation<Data?, Never>?
@@ -91,11 +117,13 @@ private actor ScriptedBrokerTransport: BrokerByteTransport {
     init(
         replyToHello: Bool = true,
         helloAccess: String? = nil,
-        advertiseObserverRole: Bool = false
+        advertiseObserverRole: Bool = false,
+        replyToRequests: Bool = false
     ) {
         self.replyToHello = replyToHello
         self.helloAccess = helloAccess
         self.advertiseObserverRole = advertiseObserverRole
+        self.replyToRequests = replyToRequests
     }
 
     func connect(path: String) async throws {}
@@ -104,24 +132,59 @@ private actor ScriptedBrokerTransport: BrokerByteTransport {
         guard let newline = data.firstIndex(of: 0x0A) else { throw BrokerClientError.malformedResponse }
         let frame = try JSONDecoder().decode(JSONValue.self, from: data[..<newline])
         frames.append(frame)
-        guard replyToHello, frame.objectValue?["type"]?.stringValue == "hello" else { return }
+        if replyToHello, frame.objectValue?["type"]?.stringValue == "hello" {
+            var features: [JSONValue] = [.string(BrokerWire.terminalObserveFeature)]
+            if advertiseObserverRole { features.append(.string(BrokerWire.observerRoleFeature)) }
+            var fields: [String: JSONValue] = [
+                "type": .string("hello"),
+                "ok": .bool(true),
+                "protocol": .integer(Int64(BrokerWire.protocolVersion)),
+                "securityEpoch": .integer(Int64(BrokerWire.securityEpoch)),
+                "features": .array(features),
+                "pid": .integer(12_345),
+                "startedAt": .integer(1_784_250_001_000),
+                "version": .string("test"),
+            ]
+            if let helloAccess { fields["access"] = .string(helloAccess) }
+            deliver(try encoded(.object(fields)))
+            return
+        }
 
-        var features: [JSONValue] = [.string(BrokerWire.terminalObserveFeature)]
-        if advertiseObserverRole { features.append(.string(BrokerWire.observerRoleFeature)) }
-        var fields: [String: JSONValue] = [
-            "type": .string("hello"),
+        guard replyToRequests,
+              let object = frame.objectValue,
+              object["type"]?.stringValue == "request",
+              let id = object["id"]?.stringValue,
+              let method = object["method"]?.stringValue else { return }
+        let result: JSONValue
+        switch method {
+        case "broker.status":
+            result = .object([
+                "ok": .bool(true),
+                "protocol": .integer(Int64(BrokerWire.protocolVersion)),
+                "securityEpoch": .integer(Int64(BrokerWire.securityEpoch)),
+            ])
+        case "terminal.diagnostics":
+            result = .array([.object([
+                "id": .string("terminal:codex-1"),
+                "owner": .string("instance|42|project.one"),
+                "pid": .integer(123),
+                "streamEpoch": .string("epoch"),
+                "endOffset": .integer(0),
+            ])])
+        case "terminal.list":
+            result = .array([.object([
+                "id": .string("terminal:codex-1"),
+                "pid": .integer(123),
+            ])])
+        default:
+            return
+        }
+        deliver(try encoded(.object([
+            "type": .string("response"),
+            "id": .string(id),
             "ok": .bool(true),
-            "protocol": .integer(Int64(BrokerWire.protocolVersion)),
-            "securityEpoch": .integer(Int64(BrokerWire.securityEpoch)),
-            "features": .array(features),
-            "pid": .integer(12_345),
-            "startedAt": .integer(1_784_250_001_000),
-            "version": .string("test"),
-        ]
-        if let helloAccess { fields["access"] = .string(helloAccess) }
-        var response = try JSONEncoder().encode(JSONValue.object(fields))
-        response.append(0x0A)
-        deliver(response)
+            "result": result,
+        ])))
     }
 
     func receive(maximumBytes: Int) async throws -> Data? {
@@ -135,6 +198,12 @@ private actor ScriptedBrokerTransport: BrokerByteTransport {
     }
 
     func sentFrames() -> [JSONValue] { frames }
+
+    private func encoded(_ frame: JSONValue) throws -> Data {
+        var data = try JSONEncoder().encode(frame)
+        data.append(0x0A)
+        return data
+    }
 
     private func deliver(_ data: Data?) {
         if let waiter {

@@ -18,6 +18,7 @@ enum KaisolaMacMain {
 final class KaisolaMacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private let model = AppModel()
     private var window: NSWindow?
+    private var wakeObserver: NSObjectProtocol?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         // Preview-owned state stays separate from every historical Electron
@@ -44,7 +45,26 @@ final class KaisolaMacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDele
         NSApp.activate(ignoringOtherApps: true)
         self.window = window
 
+        wakeObserver = NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.didWakeNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor in await self?.model.recoverAfterWake() }
+        }
+
         Task { await model.reload() }
+    }
+
+    func applicationDidBecomeActive(_ notification: Notification) {
+        model.resumeIfNeeded()
+    }
+
+    func applicationWillTerminate(_ notification: Notification) {
+        if let wakeObserver {
+            NSWorkspace.shared.notificationCenter.removeObserver(wakeObserver)
+        }
+        wakeObserver = nil
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {

@@ -2,7 +2,21 @@ import Foundation
 import KaisolaBrokerProtocol
 import KaisolaCore
 
-actor ObserveOnlyBrokerClient {
+protocol ObserveOnlyBrokerServing: Sendable {
+    func setEventHandler(_ handler: (@Sendable (BrokerEvent) -> Void)?) async
+    func setDisconnectHandler(_ handler: (@Sendable (any Error) -> Void)?) async
+    func connect(to info: BrokerInfo) async throws -> BrokerHello
+    func inventory() async throws -> BrokerStatus
+    func subscribe(
+        to terminal: BrokerTerminalRecord,
+        ownerID: String,
+        cursor: TerminalCursor?
+    ) async throws -> TerminalSubscriptionResult
+    func unsubscribe(from terminal: BrokerTerminalRecord, ownerID: String) async throws
+    func disconnect() async
+}
+
+actor ObserveOnlyBrokerClient: ObserveOnlyBrokerServing {
     typealias EventHandler = @Sendable (BrokerEvent) -> Void
     typealias DisconnectHandler = @Sendable (any Error) -> Void
 
@@ -28,11 +42,11 @@ actor ObserveOnlyBrokerClient {
         self.operationTimeoutNanoseconds = operationTimeoutNanoseconds
     }
 
-    func setEventHandler(_ handler: EventHandler?) {
+    func setEventHandler(_ handler: EventHandler?) async {
         eventHandler = handler
     }
 
-    func setDisconnectHandler(_ handler: DisconnectHandler?) {
+    func setDisconnectHandler(_ handler: DisconnectHandler?) async {
         disconnectHandler = handler
     }
 
@@ -75,9 +89,10 @@ actor ObserveOnlyBrokerClient {
     func inventory() async throws -> BrokerStatus {
         // These are typed read methods. The raw request encoder stays private,
         // so application code cannot represent or emit an arbitrary method.
+        let status = try await request(.status, params: .object(["ownerId": .string("0")]))
         let diagnostics = try await request(.diagnostics, params: .object(["ownerId": .string("0")]))
         let live = try await request(.list, params: .object(["ownerId": .string("0")]))
-        return try BrokerStatus(diagnostics: diagnostics, live: live)
+        return try BrokerStatus(status: status, diagnostics: diagnostics, live: live)
     }
 
     func subscribe(

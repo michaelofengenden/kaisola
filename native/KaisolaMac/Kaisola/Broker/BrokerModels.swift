@@ -1,4 +1,5 @@
 import Foundation
+import KaisolaBrokerProtocol
 import KaisolaCore
 
 struct BrokerHello: Equatable, Sendable {
@@ -14,7 +15,13 @@ struct BrokerHello: Equatable, Sendable {
 struct BrokerStatus: Equatable, Sendable {
     let terminals: [BrokerTerminalRecord]
 
-    init(diagnostics: JSONValue, live: JSONValue) throws {
+    init(status: JSONValue, diagnostics: JSONValue, live: JSONValue) throws {
+        guard let statusObject = status.objectValue,
+              statusObject["ok"]?.boolValue == true,
+              statusObject["protocol"]?.intValue == Int64(BrokerWire.protocolVersion),
+              statusObject["securityEpoch"]?.intValue == Int64(BrokerWire.securityEpoch) else {
+            throw BrokerClientError.malformedResponse
+        }
         guard let diagnosticValues = diagnostics.arrayValue,
               let liveValues = live.arrayValue else {
             throw BrokerClientError.malformedResponse

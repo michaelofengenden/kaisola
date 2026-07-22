@@ -5,6 +5,7 @@ import XCTest
 final class BrokerModelsTests: XCTestCase {
     func testStatusExtractsExactProjectCapabilityFromOwner() throws {
         let status = try BrokerStatus(
+            status: validStatus,
             diagnostics: .array([
                 .object([
                     "id": .string("terminal:codex-7"),
@@ -26,6 +27,7 @@ final class BrokerModelsTests: XCTestCase {
 
     func testStatusDropsTerminalWithoutExactProjectCapability() throws {
         let status = try BrokerStatus(
+            status: validStatus,
             diagnostics: .array([
                 .object(["id": .string("orphan"), "owner": .string("")]),
             ]),
@@ -42,5 +44,26 @@ final class BrokerModelsTests: XCTestCase {
             "endOffset": .integer(1),
         ])
         XCTAssertThrowsError(try TerminalSnapshot(value: invalid))
+    }
+
+    func testStatusRejectsAProtocolDriftBeforeUsingInventory() {
+        let drifted: JSONValue = .object([
+            "ok": .bool(true),
+            "protocol": .integer(99),
+            "securityEpoch": .integer(1),
+        ])
+        XCTAssertThrowsError(
+            try BrokerStatus(status: drifted, diagnostics: .array([]), live: .array([]))
+        ) { error in
+            XCTAssertEqual(error as? BrokerClientError, .malformedResponse)
+        }
+    }
+
+    private var validStatus: JSONValue {
+        .object([
+            "ok": .bool(true),
+            "protocol": .integer(2),
+            "securityEpoch": .integer(1),
+        ])
     }
 }

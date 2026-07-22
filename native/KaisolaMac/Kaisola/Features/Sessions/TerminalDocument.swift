@@ -33,6 +33,25 @@ struct TerminalDocument: Equatable, Sendable {
     func applying(_ result: TerminalSubscriptionResult, sessionID: String) -> TerminalDocument {
         switch result {
         case let .snapshot(snapshot, resetReason):
+            // A cursor-based resubscribe returns only bytes after the cursor.
+            // Preserve the already-rendered prefix when the broker proves the
+            // suffix is exactly contiguous; reset snapshots still replace it.
+            if resetReason == nil,
+               self.sessionID == sessionID,
+               let cursor,
+               cursor.streamEpoch == snapshot.streamEpoch,
+               cursor.offset == snapshot.startOffset {
+                var document = self
+                document.output.append(snapshot.output)
+                document.cursor = TerminalCursor(
+                    streamEpoch: snapshot.streamEpoch,
+                    offset: snapshot.endOffset
+                )
+                document.exited = snapshot.exited
+                document.errorMessage = nil
+                document.trimRetainedOutputIfNeeded()
+                return document
+            }
             var document = TerminalDocument(
                 sessionID: sessionID,
                 output: snapshot.output,

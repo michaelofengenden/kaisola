@@ -114,7 +114,7 @@ jobs:
             DEVELOPMENT_TEAM="${APPLE_TEAM_ID}" \
             OTHER_CODE_SIGN_FLAGS=--timestamp \
             MARKETING_VERSION="${GITHUB_REF_NAME#v}" \
-            CURRENT_PROJECT_VERSION="$(git rev-list --count HEAD)" \
+            CURRENT_PROJECT_VERSION="$((1000 + GITHUB_RUN_NUMBER))" \
             KAISOLA_SPARKLE_FEED_URL='https://github.com/michaelofengenden/kaisola/releases/download/native-preview/appcast.xml' \
             KAISOLA_SPARKLE_PUBLIC_ED_KEY='FAk/3R33fKfyvsHiUKiNctprqxw/Y/guajgQXGb8r60=' \
             build

@@ -80,7 +80,11 @@ final class NativeTerminalInteractionTests: XCTestCase {
         XCTAssertTrue(value?.hasSuffix("tail-marker") ?? false)
     }
 
-    func testSurfaceClaimsFirstResponderWhenJoiningWindow() {
+    // First-responder claims cannot be asserted end to end on a headless CI
+    // runner (windows never become key), so the decision is a pure function:
+    // claim focus only from the window or its bare content view, and never
+    // steal it from a control the user is in — the sidebar or the find bar.
+    func testFocusClaimDecisionClaimsOnlyIdleWindows() {
         let window = NSWindow(
             contentRect: NSRect(x: 0, y: 0, width: 400, height: 300),
             styleMask: [.titled],
@@ -88,12 +92,14 @@ final class NativeTerminalInteractionTests: XCTestCase {
             defer: false
         )
         defer { window.close() }
-        let view = ReadOnlyTerminalView(
-            frame: NSRect(x: 0, y: 0, width: 400, height: 300),
-            font: NSFont.monospacedSystemFont(ofSize: 13, weight: .regular)
-        )
-        window.contentView?.addSubview(view)
-        XCTAssertTrue(window.firstResponder === view)
+
+        XCTAssertTrue(ReadOnlyTerminalView.shouldClaimFocus(currentFirstResponder: nil, window: window))
+        XCTAssertTrue(ReadOnlyTerminalView.shouldClaimFocus(currentFirstResponder: window, window: window))
+        XCTAssertTrue(ReadOnlyTerminalView.shouldClaimFocus(currentFirstResponder: window.contentView, window: window))
+
+        let findBarField = NSTextField(frame: .zero)
+        window.contentView?.addSubview(findBarField)
+        XCTAssertFalse(ReadOnlyTerminalView.shouldClaimFocus(currentFirstResponder: findBarField, window: window))
     }
 
     func testReadOnlyViewStillDropsAllPTYBoundBytes() {

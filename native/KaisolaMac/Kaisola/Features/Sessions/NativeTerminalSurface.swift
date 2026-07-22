@@ -123,10 +123,19 @@ final class ReadOnlyTerminalView: TerminalView {
 
     override func send(source: Terminal, data: ArraySlice<UInt8>) {}
 
+    /// Claim keyboard focus only from the window itself or its bare content
+    /// view — never from a control the user is actually in (the sidebar list
+    /// or the find bar's text field).
+    static func shouldClaimFocus(currentFirstResponder: NSResponder?, window: NSWindow) -> Bool {
+        currentFirstResponder == nil
+            || currentFirstResponder === window
+            || currentFirstResponder === window.contentView
+    }
+
     override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
         guard let window else { return }
-        if window.firstResponder is NSWindow || window.firstResponder === window.contentView {
+        if Self.shouldClaimFocus(currentFirstResponder: window.firstResponder, window: window) {
             window.makeFirstResponder(self)
         }
     }

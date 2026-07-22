@@ -352,6 +352,16 @@ and multiple windows.
 compatibility matrix, physical-footprint report, stress results, and no changes
 to Electron terminal ownership.
 
+**Accepted follow-ups from the 2026-07-22 adversarial review** (recorded, not
+blocking Phase 1): the native preview build currently runs inside the Electron
+release job, so a native-only or notarization outage would delay an Electron
+release until reran or reverted — splitting it into an independent job with an
+Electron-only publication path is queued for the next workflow pass. The
+terminal accessibility value exposes the raw retained stream rather than
+SwiftTerm's rendered display model, so ANSI-heavy sessions read poorly under
+VoiceOver; deriving the value from the parsed buffer belongs with the
+VoiceOver judgment rows.
+
 ## Repository-wide verification floor
 
 Run after each integration milestone:

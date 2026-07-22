@@ -72,7 +72,9 @@ async function install(architecture) {
 
 ;(async () => {
   const requested = process.argv.slice(2)
-  const architectures = requested.length ? requested : ['arm64', 'x86_64']
+  const architectures = requested.length === 0 || requested.includes('all')
+    ? ['arm64', 'x86_64']
+    : requested
   for (const architecture of architectures) await install(architecture)
 })().catch((error) => {
   console.error(`NATIVE_NODE_RUNTIME=FAIL ${error.message}`)

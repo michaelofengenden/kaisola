@@ -438,7 +438,7 @@ export function Terminal({ id, attach = false, boot, cwd, projectId: projectIdOv
     // started) open as a browser CARD beside this terminal; everything else
     // goes to the user's real browser. Pop-out windows have no card grid and
     // a read-only store — there the external browser is the only real target.
-    term.loadAddon(new WebLinksAddon((_e, uri) => {
+    const openWebUri = (uri: string) => {
       try {
         const host = new URL(uri).hostname
         if (!POP_TERMINAL_ID && (host === 'localhost' || host === '127.0.0.1' || host === '0.0.0.0')) {
@@ -449,7 +449,44 @@ export function Terminal({ id, attach = false, boot, cwd, projectId: projectIdOv
         }
       } catch { /* fall through to the external browser */ }
       void bridge.openExternal(uri)
-    }))
+    }
+    const openLocalFromTerminal = (path: string, line?: number) => {
+      const state = useKaisola.getState()
+      const record = state.terminals.find((item) => item.id === id)
+      const base = state.terminalMeta[id]?.cwd ?? record?.cwd ?? cwd ?? state.workspacePath ?? undefined
+      void bridge.fs.resolvePath(path, base).then((resolved) => {
+        if (!resolved.ok || !resolved.path) {
+          state.pushToast('warn', `File not found: ${path}`)
+          return
+        }
+        if (resolved.dir) {
+          void bridge.fs.reveal(resolved.path)
+          return
+        }
+        state.requestFile(resolved.path)
+        if (line) window.setTimeout(() => state.requestScroll(resolved.path!, line), 180)
+      })
+    }
+    term.loadAddon(new WebLinksAddon((_e, uri) => openWebUri(uri)))
+    // OSC 8 hyperlinks: agent CLIs wrap paths and URLs in these escapes, and
+    // without a handler xterm renders them as dead text. The visible text is
+    // often just a basename, so the regex provider below cannot cover them.
+    term.options.linkHandler = {
+      allowNonHttpProtocols: true,
+      activate: (_event, uri) => {
+        if (/^https?:\/\//i.test(uri)) {
+          openWebUri(uri)
+          return
+        }
+        if (/^file:\/\//i.test(uri)) {
+          try {
+            const url = new URL(uri)
+            const lineFragment = url.hash.match(/^#L?(\d+)/i)
+            openLocalFromTerminal(decodeURIComponent(url.pathname), lineFragment ? Number(lineFragment[1]) : undefined)
+          } catch { /* malformed link — ignore */ }
+        }
+      },
+    }
     term.registerLinkProvider({
       provideLinks(bufferLineNumber, callback) {
         const value = term.buffer.active.getLine(bufferLineNumber - 1)?.translateToString(true) ?? ''
@@ -460,23 +497,7 @@ export function Terminal({ id, attach = false, boot, cwd, projectId: projectIdOv
           },
           text: candidate.text,
           decorations: { pointerCursor: true, underline: true },
-          activate: () => {
-            const state = useKaisola.getState()
-            const record = state.terminals.find((item) => item.id === id)
-            const base = state.terminalMeta[id]?.cwd ?? record?.cwd ?? cwd ?? state.workspacePath ?? undefined
-            void bridge.fs.resolvePath(candidate.path, base).then((resolved) => {
-              if (!resolved.ok || !resolved.path) {
-                state.pushToast('warn', `File not found: ${candidate.path}`)
-                return
-              }
-              if (resolved.dir) {
-                void bridge.fs.reveal(resolved.path)
-                return
-              }
-              state.requestFile(resolved.path)
-              if (candidate.line) window.setTimeout(() => state.requestScroll(resolved.path!, candidate.line!), 180)
-            })
-          },
+          activate: () => openLocalFromTerminal(candidate.path, candidate.line),
         }))
         callback(links.length ? links : undefined)
       },

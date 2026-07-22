@@ -20,6 +20,7 @@ import { diffHunks, diffStat } from '../lib/lineDiff'
 import { ruleForRequest, ruleLabel } from '../lib/permissionRules'
 import { Icon } from './Icon'
 import { Dropdown } from './Dropdown'
+import { LinkifiedText } from './LinkifiedText'
 import { Markdown } from './Markdown'
 import { ProviderIcon } from './ProviderIcon'
 import { stageMeta } from '../lib/stages'
@@ -479,7 +480,7 @@ const TurnRow = memo(function TurnRow({ t, i, agentName, showCaret, liveThinkSta
     const head = (
       <>
         <Icon name={t.status === 'completed' ? 'CheckCircle2' : t.status === 'failed' ? 'XCircle' : 'Wrench'} size={11} />
-        {t.text}{t.status && t.status !== 'completed' && <span className="tool-status">{t.status}</span>}
+        <LinkifiedText text={t.text} />{t.status && t.status !== 'completed' && <span className="tool-status">{t.status}</span>}
       </>
     )
     if (!arts.length) {

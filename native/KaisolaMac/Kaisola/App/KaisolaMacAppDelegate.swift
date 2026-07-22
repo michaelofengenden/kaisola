@@ -89,12 +89,18 @@ final class KaisolaMacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDele
         updateController.checkForUpdates(sender)
     }
 
+    @objc private func newTerminalSession(_ sender: Any?) {
+        RootShellView.promptForNewTerminal(model: model)
+    }
+
     private func installMainMenu() {
         NSApp.mainMenu = Self.makeMainMenu(
             updateTarget: self,
             updateAction: #selector(checkForUpdates(_:)),
             updateEnabled: updateController.availability.canCheck,
-            updateDetail: updateController.availability.detail
+            updateDetail: updateController.availability.detail,
+            newTerminalTarget: self,
+            newTerminalAction: #selector(newTerminalSession(_:))
         )
     }
 
@@ -105,7 +111,9 @@ final class KaisolaMacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDele
         updateTarget: AnyObject?,
         updateAction: Selector?,
         updateEnabled: Bool,
-        updateDetail: String?
+        updateDetail: String?,
+        newTerminalTarget: AnyObject? = nil,
+        newTerminalAction: Selector? = nil
     ) -> NSMenu {
         let mainMenu = NSMenu()
         let applicationItem = NSMenuItem()
@@ -138,6 +146,17 @@ final class KaisolaMacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDele
             keyEquivalent: "q"
         )
         applicationItem.submenu = applicationMenu
+
+        let fileItem = NSMenuItem()
+        let fileMenu = NSMenu(title: "File")
+        let newTerminal = fileMenu.addItem(
+            withTitle: "New Terminal Session…",
+            action: newTerminalAction,
+            keyEquivalent: "t"
+        )
+        newTerminal.target = newTerminalTarget
+        fileItem.submenu = fileMenu
+        mainMenu.addItem(fileItem)
 
         let editItem = NSMenuItem()
         let editMenu = NSMenu(title: "Edit")

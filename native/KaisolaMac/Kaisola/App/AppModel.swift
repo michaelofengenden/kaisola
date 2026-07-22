@@ -40,9 +40,17 @@ final class AppModel: ObservableObject {
     @Published private(set) var sessions: [BrokerTerminalRecord] = []
     @Published var selectedSessionID: String?
     @Published private(set) var terminalDocument = TerminalDocument.empty
+    /// Terminals this app created and may mutate. Everything else stays
+    /// strictly observed no matter what the UI asks for.
+    @Published private(set) var ownedTerminalIDs: Set<String> = []
+    /// Whether the connected broker accepted a controller connection; older
+    /// brokers stay observe-only and hide every mutation affordance.
+    @Published private(set) var controlAvailable = false
 
     private let brokerPreparer: any BrokerInfoPreparing
     private let client: any ObserveOnlyBrokerServing
+    private let controlClient: any BrokerControlServing
+    private let sessionStore: NativeSessionStore
     private let cursorStore: TerminalCursorStore
     private let reconnectBackoff: BrokerReconnectBackoff
     private let sleep: @Sendable (UInt64) async throws -> Void
@@ -59,6 +67,8 @@ final class AppModel: ObservableObject {
     init(
         brokerPreparer: any BrokerInfoPreparing = BrokerStartupCoordinator.live(),
         client: any ObserveOnlyBrokerServing = ObserveOnlyBrokerClient(),
+        controlClient: any BrokerControlServing = BrokerControlClient(),
+        sessionStore: NativeSessionStore = NativeSessionStore(),
         cursorStore: TerminalCursorStore = TerminalCursorStore(fileURL: NativePreviewPaths.terminalCursorStore),
         reconnectBackoff: BrokerReconnectBackoff = BrokerReconnectBackoff(),
         sleep: @escaping @Sendable (UInt64) async throws -> Void = {
@@ -70,6 +80,8 @@ final class AppModel: ObservableObject {
     ) {
         self.brokerPreparer = brokerPreparer
         self.client = client
+        self.controlClient = controlClient
+        self.sessionStore = sessionStore
         self.cursorStore = cursorStore
         self.reconnectBackoff = reconnectBackoff
         self.sleep = sleep
@@ -77,9 +89,18 @@ final class AppModel: ObservableObject {
     }
 
     var projects: [(name: String, sessions: [BrokerTerminalRecord])] {
-        Dictionary(grouping: sessions, by: \.projectID)
-            .map { (name: $0.key, sessions: $0.value.sorted { $0.title < $1.title }) }
+        let ownedNames = Dictionary(
+            uniqueKeysWithValues: sessionStore.sessions().map {
+                ($0.projectID, ($0.cwd as NSString).lastPathComponent)
+            }
+        )
+        return Dictionary(grouping: sessions, by: \.projectID)
+            .map { (name: ownedNames[$0.key] ?? $0.key, sessions: $0.value.sorted { $0.title < $1.title }) }
             .sorted { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
+    }
+
+    func isOwned(_ terminalID: String) -> Bool {
+        ownedTerminalIDs.contains(terminalID)
     }
 
     func reload() async {
@@ -177,6 +198,127 @@ final class AppModel: ObservableObject {
         }
     }
 
+    // MARK: - Native terminal ownership (Phase 2)
+
+    /// Creates a shell the native app owns in the given directory, registers
+    /// it durably, and selects it. The PTY lives on the broker, so it survives
+    /// this app quitting, updating, or crashing exactly like Electron's do.
+    func createTerminal(inDirectory directory: URL) async {
+        guard controlAvailable else { return }
+        let cwd = directory.path
+        let projectID = NativeSessionStore.projectID(forDirectory: cwd)
+        let terminalID = NativeSessionStore.terminalID(projectID: projectID)
+        let shell = ProcessInfo.processInfo.environment["SHELL"] ?? "/bin/zsh"
+        do {
+            _ = try await controlClient.createTerminal(
+                projectID: projectID,
+                terminalID: terminalID,
+                command: shell,
+                arguments: ["-il"],
+                cwd: cwd,
+                columns: 100,
+                rows: 30
+            )
+            sessionStore.upsert(NativeOwnedSession(
+                id: terminalID,
+                projectID: projectID,
+                cwd: cwd,
+                title: (cwd as NSString).lastPathComponent,
+                createdAt: Int64(Date().timeIntervalSince1970 * 1_000)
+            ))
+            ownedTerminalIDs.insert(terminalID)
+            await refreshInventory()
+            selectedSessionID = terminalID
+            await select(terminalID)
+        } catch {
+            terminalDocument = .failure(sessionID: terminalID, message: error.kaisolaSafeDescription)
+        }
+    }
+
+    /// Keyboard bytes from an owned session's surface. Ownership is re-checked
+    /// here so no UI wiring mistake can ever write to an observed terminal.
+    func sendInput(_ data: String, to terminalID: String) {
+        guard controlAvailable, isOwned(terminalID),
+              let record = sessions.first(where: { $0.id == terminalID }) else { return }
+        let projectID = record.projectID
+        Task { try? await controlClient.write(projectID: projectID, terminalID: terminalID, data: data) }
+    }
+
+    func resizeTerminal(_ terminalID: String, columns: Int, rows: Int) {
+        guard controlAvailable, isOwned(terminalID),
+              let record = sessions.first(where: { $0.id == terminalID }) else { return }
+        let projectID = record.projectID
+        Task { try? await controlClient.resize(projectID: projectID, terminalID: terminalID, columns: columns, rows: rows) }
+    }
+
+    /// Ends an owned session for good: the PTY dies and the registry entry is
+    /// removed. (App quit is different — quitting detaches and the shell keeps
+    /// running on the broker.)
+    func endSession(_ terminalID: String) async {
+        guard isOwned(terminalID),
+              let record = sessions.first(where: { $0.id == terminalID }) else { return }
+        try? await controlClient.kill(projectID: record.projectID, terminalID: terminalID)
+        sessionStore.remove(terminalID: terminalID)
+        ownedTerminalIDs.remove(terminalID)
+        if selectedSessionID == terminalID {
+            selectedSessionID = nil
+            await select(nil)
+        }
+        await refreshInventory()
+    }
+
+    /// Refresh the session list from the broker without disturbing streams.
+    func refreshInventory() async {
+        guard connectionState.isConnected else { return }
+        if let status = try? await client.inventory() {
+            sessions = status.terminals
+        }
+    }
+
+    /// After the observer connects, bring up the controller lane and re-own
+    /// the terminals this app created in earlier runs. Any registry entry the
+    /// broker no longer knows is pruned.
+    private func restoreOwnedSessions(info: BrokerInfo) async {
+        controlAvailable = false
+        ownedTerminalIDs = []
+        do {
+            try await controlClient.connect(to: info, ownerID: sessionStore.ownerID())
+        } catch {
+            // Observation continues against brokers that refuse control.
+            return
+        }
+        controlAvailable = true
+        var owned: Set<String> = []
+        for stored in sessionStore.sessions() {
+            guard let record = sessions.first(where: { $0.id == stored.id }) else {
+                sessionStore.remove(terminalID: stored.id)
+                continue
+            }
+            if record.exited {
+                owned.insert(stored.id)
+                continue
+            }
+            do {
+                try await controlClient.attach(projectID: stored.projectID, terminalID: stored.id)
+                owned.insert(stored.id)
+            } catch {
+                // Another controller holds it; leave it observed.
+            }
+        }
+        ownedTerminalIDs = owned
+    }
+
+    /// App-quit path: detach so owned shells keep running on the broker, then
+    /// drop the controller connection.
+    func releaseOwnedSessionsForQuit() async {
+        guard controlAvailable else { return }
+        for stored in sessionStore.sessions() where ownedTerminalIDs.contains(stored.id) {
+            try? await controlClient.detachOwner(projectID: stored.projectID, terminalID: stored.id)
+        }
+        await controlClient.disconnect()
+        controlAvailable = false
+    }
+
     func disconnect() async {
         shouldReconnect = false
         connectionGeneration &+= 1
@@ -185,6 +327,7 @@ final class AppModel: ObservableObject {
         cursorSaveTask?.cancel()
         cursorSaveTask = nil
         await persistCurrentCursor()
+        await releaseOwnedSessionsForQuit()
         if let selectedSession, connectionState.isConnected {
             try? await client.unsubscribe(from: selectedSession, ownerID: observerOwnerID)
         }
@@ -226,6 +369,7 @@ final class AppModel: ObservableObject {
                 pid: hello.pid,
                 serverEnforcedObserver: hello.serverEnforcedObserver
             )
+            await restoreOwnedSessions(info: info)
             let preferredID = selectedSessionID.flatMap { selected in
                 sessions.contains(where: { $0.id == selected }) ? selected : nil
             } ?? sessions.first?.id

@@ -6,6 +6,11 @@ struct NativeTerminalSurface: NSViewRepresentable {
     let output: String
     let streamEpoch: String?
     let endOffset: Int64?
+    // Input exists only for sessions the native app owns; observed sessions
+    // keep the sealed read-only view whose send path is compiled away.
+    var isOwned: Bool = false
+    var onInput: ((String) -> Void)? = nil
+    var onResize: ((_ columns: Int, _ rows: Int) -> Void)? = nil
 
     func makeCoordinator() -> Coordinator {
         Coordinator()
@@ -13,22 +18,30 @@ struct NativeTerminalSurface: NSViewRepresentable {
 
     func makeNSView(context: Context) -> ReadOnlyTerminalView {
         let font = NSFont.monospacedSystemFont(ofSize: 13, weight: .regular)
-        let view = ReadOnlyTerminalView(frame: .zero, font: font)
+        let view: ReadOnlyTerminalView = isOwned
+            ? OwnedTerminalView(frame: .zero, font: font)
+            : ReadOnlyTerminalView(frame: .zero, font: font)
         view.terminalDelegate = context.coordinator
         view.configureNativeColors()
-        view.allowMouseReporting = false
+        view.allowMouseReporting = isOwned
         view.linkReporting = .implicit
         view.optionAsMetaKey = false
-        view.setAccessibilityLabel("Read-only terminal output")
+        view.setAccessibilityLabel(isOwned ? "Terminal" : "Read-only terminal output")
+        context.coordinator.onInput = onInput
+        context.coordinator.onResize = onResize
         context.coordinator.apply(output: output, epoch: streamEpoch, endOffset: endOffset, to: view)
         return view
     }
 
     func updateNSView(_ view: ReadOnlyTerminalView, context: Context) {
+        context.coordinator.onInput = onInput
+        context.coordinator.onResize = onResize
         context.coordinator.apply(output: output, epoch: streamEpoch, endOffset: endOffset, to: view)
     }
 
     final class Coordinator: NSObject, TerminalViewDelegate {
+        var onInput: ((String) -> Void)?
+        var onResize: ((_ columns: Int, _ rows: Int) -> Void)?
         private var renderedEpoch: String?
         private var renderedStartOffset: Int64?
         private var renderedEndOffset: Int64?
@@ -92,8 +105,17 @@ struct NativeTerminalSurface: NSViewRepresentable {
             return String(output[stringIndex...])
         }
 
-        func send(source: TerminalView, data: ArraySlice<UInt8>) {}
-        func sizeChanged(source: TerminalView, newCols: Int, newRows: Int) {}
+        func send(source: TerminalView, data: ArraySlice<UInt8>) {
+            // Reached only from OwnedTerminalView: the read-only subclass
+            // swallows every byte before the delegate can see it.
+            guard let onInput, !data.isEmpty else { return }
+            onInput(String(decoding: data, as: UTF8.self))
+        }
+
+        func sizeChanged(source: TerminalView, newCols: Int, newRows: Int) {
+            guard newCols > 0, newRows > 0 else { return }
+            onResize?(newCols, newRows)
+        }
         func setTerminalTitle(source: TerminalView, title: String) {}
         func hostCurrentDirectoryUpdate(source: TerminalView, directory: String?) {}
         func scrolled(source: TerminalView, position: Double) {}
@@ -114,7 +136,7 @@ struct NativeTerminalSurface: NSViewRepresentable {
 /// flow from this view back to a PTY. The view claims keyboard focus when it
 /// joins a window so Copy/Select All/Find reach it without a mouse, and exposes
 /// the retained tail of the buffer as a read-only accessibility value.
-final class ReadOnlyTerminalView: TerminalView {
+class ReadOnlyTerminalView: TerminalView {
     static let accessibilityTailLimit = 8_000
 
     // Copy-on-write reference updated per stream apply in O(1); the bounded
@@ -148,5 +170,14 @@ final class ReadOnlyTerminalView: TerminalView {
     override func accessibilityRole() -> NSAccessibility.Role? { .textArea }
     override func accessibilityValue() -> Any? {
         String(accessibilitySource.suffix(Self.accessibilityTailLimit))
+    }
+}
+
+/// The writable variant for native-owned sessions: SwiftTerm's normal input
+/// path stays intact and lands in the delegate's `send`, which the surface
+/// forwards to the broker controller connection.
+final class OwnedTerminalView: ReadOnlyTerminalView {
+    override func send(source: Terminal, data: ArraySlice<UInt8>) {
+        terminalDelegate?.send(source: self, data: data)
     }
 }

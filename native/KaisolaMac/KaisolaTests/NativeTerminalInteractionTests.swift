@@ -91,6 +91,9 @@ final class NativeTerminalInteractionTests: XCTestCase {
             backing: .buffered,
             defer: false
         )
+        // NSWindow defaults to release-when-closed; under ARC that would
+        // double-release when the test also owns the reference.
+        window.isReleasedWhenClosed = false
         defer { window.close() }
 
         XCTAssertTrue(ReadOnlyTerminalView.shouldClaimFocus(currentFirstResponder: nil, window: window))

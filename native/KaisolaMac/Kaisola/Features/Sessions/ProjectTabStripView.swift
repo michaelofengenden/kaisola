@@ -1,18 +1,19 @@
 import SwiftUI
 import UniformTypeIdentifiers
 
-/// A horizontal strip of project tabs plus a Chats pill, for the top-bar
-/// layout. Clicking a tab makes it the active project; **dragging** a tab with
+/// A horizontal strip of project tabs for the top-bar layout. Chats, Mesh runs,
+/// and terminals live in the active project's surface strip underneath instead
+/// of floating in a global bucket. Clicking a tab makes it the active project;
+/// **dragging** a tab with
 /// the pointer reorders it live (the reorder-on-hover pattern), replacing the
 /// former Move Left / Move Right menu items.
 ///
 /// A drop-in replacement for the former `ProjectTabStrip`: identical inputs
 /// (plus `reorder`) and byte-for-byte identical chip visuals — tint dot,
-/// working-count badge, selected capsule, Chats pill, and "+" button all keep
+/// working-count badge, selected capsule, and "+" button all keep
 /// the same fonts, paddings, and 40 pt strip height.
 struct ProjectTabStripView: View {
     let projects: [AppModel.ProjectGroup]
-    let chatCount: Int
     @Binding var selected: String?
     let menu: (AppModel.ProjectGroup) -> AnyView
     let openFolder: () -> Void
@@ -29,13 +30,6 @@ struct ProjectTabStripView: View {
     var body: some View {
         ScrollView(.horizontal, showsIndicators: false) {
             HStack(spacing: 6) {
-                if chatCount > 0 {
-                    Label("\(chatCount) Chats", systemImage: "bubble.left.and.text.bubble.right")
-                        .font(.caption)
-                        .padding(.horizontal, 10)
-                        .padding(.vertical, 5)
-                        .background(.quaternary, in: Capsule())
-                }
                 ForEach(projects) { project in
                     Button {
                         selected = project.name

@@ -34,6 +34,7 @@ final class KaisolaMacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDele
     private var wakeObserver: NSObjectProtocol?
     private var agentsObserver: NSObjectProtocol?
     private var runInTerminalObserver: NSObjectProtocol?
+    private let runtimeSmoke = ProcessInfo.processInfo.environment["KAISOLA_NATIVE_RUNTIME_SMOKE"] == "1"
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         // Preview-owned state stays separate from every historical Electron
@@ -91,9 +92,11 @@ final class KaisolaMacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDele
             backing: .buffered,
             defer: false
         )
-        window.title = "Kaisola Native Preview"
+        window.title = "Kaisola Preview"
         window.titlebarAppearsTransparent = true
         window.titleVisibility = .hidden
+        window.isOpaque = false
+        window.backgroundColor = .clear
         window.minSize = NSSize(width: 760, height: 480)
         window.isReleasedWhenClosed = false
         // Cascade extra windows so they do not stack exactly.
@@ -108,7 +111,12 @@ final class KaisolaMacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDele
         window.delegate = self
         window.makeKeyAndOrderFront(nil)
         windowModels[ObjectIdentifier(window)] = model
-        Task { await model.reload() }
+        // The release pipeline's real-bundle smoke loads AppKit, SwiftUI,
+        // notifications, settings, and every linked framework, but deliberately
+        // skips broker discovery so it cannot leave a CI helper behind.
+        if !runtimeSmoke {
+            Task { await model.reload() }
+        }
         return window
     }
 
@@ -420,11 +428,12 @@ final class KaisolaMacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDele
     ) -> NSMenu {
         let mainMenu = NSMenu()
         let applicationItem = NSMenuItem()
+        applicationItem.title = "Kaisola Preview"
         mainMenu.addItem(applicationItem)
 
         let applicationMenu = NSMenu()
         applicationMenu.addItem(
-            withTitle: "About Kaisola Native Preview",
+            withTitle: "About Kaisola Preview",
             action: #selector(NSApplication.orderFrontStandardAboutPanel(_:)),
             keyEquivalent: ""
         )
@@ -445,13 +454,13 @@ final class KaisolaMacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDele
         settingsItem.target = nil   // first responder → the app delegate
         applicationMenu.addItem(.separator())
         applicationMenu.addItem(
-            withTitle: "Hide Kaisola Native Preview",
+            withTitle: "Hide Kaisola Preview",
             action: #selector(NSApplication.hide(_:)),
             keyEquivalent: "h"
         )
         applicationMenu.addItem(.separator())
         applicationMenu.addItem(
-            withTitle: "Quit Kaisola Native Preview",
+            withTitle: "Quit Kaisola Preview",
             action: #selector(NSApplication.terminate(_:)),
             keyEquivalent: "q"
         )
@@ -598,7 +607,7 @@ final class KaisolaMacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDele
         let helpItem = NSMenuItem()
         helpItem.title = "Help"
         let helpMenu = NSMenu(title: "Help")
-        let help = helpMenu.addItem(withTitle: "Kaisola Native Preview Help", action: #selector(KaisolaMacAppDelegate.openHelp(_:)), keyEquivalent: "?")
+        let help = helpMenu.addItem(withTitle: "Kaisola Preview Help", action: #selector(KaisolaMacAppDelegate.openHelp(_:)), keyEquivalent: "?")
         help.target = nil   // first responder → the app delegate
         helpItem.submenu = helpMenu
         mainMenu.addItem(helpItem)

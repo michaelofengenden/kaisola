@@ -80,6 +80,10 @@ struct RootShellView: View {
             }
         }
         .preferredColorScheme(settings.appearance.colorScheme)
+        .background {
+            WorkspaceBackdropView(mode: settings.workspaceBackdrop)
+                .ignoresSafeArea()
+        }
         .sheet(item: Binding(get: { renameTarget.map(RenameID.init) }, set: { renameTarget = $0?.id })) { target in
             RenameSheet(text: $renameText) { newTitle in
                 model.renameSession(target.id, to: newTitle)
@@ -88,7 +92,7 @@ struct RootShellView: View {
                 renameTarget = nil
             }
             .onAppear {
-                renameText = model.sessions.first(where: { $0.id == target.id })?.title ?? ""
+                renameText = model.editableSessionTitle(for: target.id)
             }
         }
         .sheet(item: Binding(get: { renameProjectTarget.map(RenameID.init) }, set: { renameProjectTarget = $0?.id })) { target in
@@ -180,41 +184,48 @@ struct RootShellView: View {
     private var leftTreeLayout: some View {
         NavigationSplitView {
             List(selection: sidebarSelection) {
-                if !model.chats.isEmpty {
-                    Section("Chats") {
-                        ForEach(model.chats) { chat in
-                            ChatRow(chat: chat)
-                                .tag(Optional(chat.id))
-                                .contextMenu {
-                                    Button("Close Chat", role: .destructive) { model.closeChat(chat.id) }
-                                }
-                        }
-                    }
-                }
-                if !model.meshes.isEmpty {
-                    Section("Mesh") {
-                        ForEach(model.meshes) { mesh in
-                            Label(mesh.title, systemImage: "circle.hexagongrid.fill")
-                                .tag(Optional(mesh.id))
-                                .contextMenu {
-                                    Button("Close Mesh", role: .destructive) { requestCloseMesh(mesh) }
-                                }
-                        }
-                    }
-                }
                 ForEach(model.projects) { project in
+                    let chats = model.chats(in: project.id)
+                    let meshes = model.meshes(in: project.id)
                     Section(isExpanded: expansionBinding(project.id)) {
-                        ForEach(project.sessions) { session in
-                            sessionRow(session)
+                        if !chats.isEmpty {
+                            ProjectSurfaceHeader(title: "Chats", systemImage: "bubble.left.and.text.bubble.right")
+                            ForEach(chats) { chat in
+                                ChatRow(chat: chat)
+                                    .tag(Optional(chat.id))
+                                    .contextMenu {
+                                        Button("Close Chat", role: .destructive) { model.closeChat(chat.id) }
+                                    }
+                            }
                         }
-                        if project.sessions.isEmpty {
-                            Text("No sessions yet")
+                        if !meshes.isEmpty {
+                            ProjectSurfaceHeader(title: "Mesh", systemImage: "circle.hexagongrid.fill")
+                            ForEach(meshes) { mesh in
+                                MeshRow(mesh: mesh)
+                                    .tag(Optional(mesh.id))
+                                    .contextMenu {
+                                        Button("Close Mesh", role: .destructive) { requestCloseMesh(mesh) }
+                                    }
+                            }
+                        }
+                        if !project.sessions.isEmpty {
+                            ProjectSurfaceHeader(title: "Sessions", systemImage: "terminal")
+                            ForEach(project.sessions) { session in
+                                sessionRow(session)
+                            }
+                        }
+                        if project.sessions.isEmpty, chats.isEmpty, meshes.isEmpty {
+                            Text("No activity yet")
                                 .font(.caption).foregroundStyle(.tertiary)
                         }
                     } header: {
                         HStack(spacing: 6) {
                             if let tint = ProjectTint.color(project.colorHex) {
                                 Circle().fill(tint).frame(width: 8, height: 8)
+                            } else {
+                                Image(systemName: "folder.fill")
+                                    .font(.caption)
+                                    .foregroundStyle(.tertiary)
                             }
                             Text(project.name)
                             if project.workingCount > 0 {
@@ -231,6 +242,11 @@ struct RootShellView: View {
                 }
             }
             .listStyle(.sidebar)
+            .scrollContentBackground(.hidden)
+            .background {
+                SidebarBackdropView(appearance: settings.sidebarAppearance)
+                    .ignoresSafeArea()
+            }
             .navigationSplitViewColumnWidth(min: 190, ideal: 235, max: 300)
             .safeAreaInset(edge: .bottom) { footer }
             .accessibilityLabel("Projects, chats, and terminal sessions")
@@ -246,7 +262,6 @@ struct RootShellView: View {
         VStack(spacing: 0) {
             ProjectTabStripView(
                 projects: model.projects,
-                chatCount: model.chats.count,
                 selected: activeProjectBinding,
                 menu: { project in AnyView(self.projectContextMenu(project)) },
                 openFolder: { RootShellView.promptForOpenFolder(model: model) },
@@ -263,7 +278,8 @@ struct RootShellView: View {
             SessionStrip(
                 model: model,
                 projectName: activeProjectName,
-                rename: { renameTarget = $0 }
+                rename: { renameTarget = $0 },
+                closeMesh: requestCloseMesh
             )
             Divider()
             detailPane
@@ -276,7 +292,7 @@ struct RootShellView: View {
     }
 
     private var activeProjectBinding: Binding<String?> {
-        Binding(get: { activeProjectName }, set: { model.selectedProjectName = $0 })
+        Binding(get: { activeProjectName }, set: { model.activateProject(named: $0) })
     }
 
     /// Collapsed project sections, persisted per project id.
@@ -330,6 +346,7 @@ struct RootShellView: View {
     private func sessionRow(_ session: BrokerTerminalRecord) -> some View {
         SessionRow(
             session: session,
+            title: model.sessionTitle(for: session),
             owned: model.isOwned(session.id),
             agent: model.agentProfile(for: session.id),
             branch: model.branch(for: session.id),
@@ -397,10 +414,10 @@ struct RootShellView: View {
         } else if let chat = model.chats.first(where: { $0.id == model.selectedChatID }) {
             AcpChatView(conversation: chat.conversation)
                 .id(chat.id)
-                .background(Color(nsColor: .windowBackgroundColor))
+                .background { WorkspaceBackdropView(mode: settings.workspaceBackdrop) }
         } else {
             terminalContent
-                .background(Color(nsColor: .windowBackgroundColor))
+                .background { WorkspaceBackdropView(mode: settings.workspaceBackdrop) }
         }
     }
 
@@ -571,7 +588,7 @@ struct RootShellView: View {
     private func tabChip(id: String, isPrimary: Bool) -> some View {
         HStack(spacing: 5) {
             Image(systemName: "terminal").font(.caption2)
-            Text(model.sessions.first { $0.id == id }?.title ?? id)
+            Text(model.sessionTitle(for: id))
                 .font(.caption.weight(isPrimary ? .semibold : .regular))
                 .lineLimit(1)
             if !isPrimary {
@@ -608,6 +625,7 @@ struct RootShellView: View {
                 fontSize: settings.terminalFontSize,
                 fontFamily: settings.terminalFontFamily,
                 fontWeight: settings.terminalFontWeight,
+                paletteMode: settings.terminalPalette,
                 lightSurface: colorScheme == .light,
                 onInput: owned ? { data in
                     guard let sessionID else { return }
@@ -647,6 +665,7 @@ struct RootShellView: View {
                 fontSize: settings.terminalFontSize,
                 fontFamily: settings.terminalFontFamily,
                 fontWeight: settings.terminalFontWeight,
+                paletteMode: settings.terminalPalette,
                 lightSurface: colorScheme == .light,
                 onInput: owned ? { data in model.sendInput(data, to: splitID) } : nil,
                 onResize: owned ? { columns, rows in model.resizeTerminal(splitID, columns: columns, rows: rows) } : nil,
@@ -657,24 +676,84 @@ struct RootShellView: View {
     }
 }
 
-/// The session row for the active project, in the top-bar layout.
+/// Every live surface for the active project, in the top-bar layout. Chats and
+/// Mesh runs intentionally share this row with terminals so project tabs are a
+/// real workspace boundary rather than decoration.
 private struct SessionStrip: View {
     @ObservedObject var model: AppModel
     let projectName: String?
     let rename: (String) -> Void
+    let closeMesh: (MeshSession) -> Void
 
-    private var sessions: [BrokerTerminalRecord] {
-        model.projects.first { $0.name == projectName }?.sessions ?? []
+    private var project: AppModel.ProjectGroup? {
+        model.projects.first { $0.name == projectName }
+    }
+
+    private var sessions: [BrokerTerminalRecord] { project?.sessions ?? [] }
+    private var chats: [AcpChatHandle] {
+        project.map { model.chats(in: $0.id) } ?? []
+    }
+    private var meshes: [MeshSession] {
+        project.map { model.meshes(in: $0.id) } ?? []
     }
 
     var body: some View {
         ScrollView(.horizontal, showsIndicators: false) {
             HStack(spacing: 8) {
-                if sessions.isEmpty {
-                    Text("No sessions in this project")
+                if sessions.isEmpty, chats.isEmpty, meshes.isEmpty {
+                    Text("No activity in this project")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                         .padding(.horizontal, 8)
+                }
+                ForEach(chats) { chat in
+                    Button { model.selectChat(chat.id) } label: {
+                        HStack(spacing: 6) {
+                            Image(systemName: "bubble.left.and.text.bubble.right")
+                            Text(chat.conversation.title).lineLimit(1)
+                            if chat.conversation.isRunning {
+                                ProgressView().controlSize(.mini).scaleEffect(0.55)
+                            }
+                        }
+                        .font(.callout)
+                        .padding(.horizontal, 10)
+                        .padding(.vertical, 5)
+                        .background(
+                            model.selectedChatID == chat.id
+                                ? AnyShapeStyle(Color.accentColor.opacity(0.16)) : AnyShapeStyle(.clear),
+                            in: RoundedRectangle(cornerRadius: 7)
+                        )
+                    }
+                    .buttonStyle(.plain)
+                    .contextMenu {
+                        Button("Close Chat", role: .destructive) { model.closeChat(chat.id) }
+                    }
+                }
+                ForEach(meshes) { mesh in
+                    Button { model.selectMesh(mesh.id) } label: {
+                        HStack(spacing: 6) {
+                            Image(systemName: "circle.hexagongrid.fill")
+                                .foregroundStyle(.purple)
+                            Text(mesh.title).lineLimit(1)
+                            if mesh.stage != "Idle" {
+                                Text(mesh.stage)
+                                    .font(.caption2)
+                                    .foregroundStyle(.secondary)
+                            }
+                        }
+                        .font(.callout)
+                        .padding(.horizontal, 10)
+                        .padding(.vertical, 5)
+                        .background(
+                            model.selectedMeshID == mesh.id
+                                ? AnyShapeStyle(Color.purple.opacity(0.14)) : AnyShapeStyle(.clear),
+                            in: RoundedRectangle(cornerRadius: 7)
+                        )
+                    }
+                    .buttonStyle(.plain)
+                    .contextMenu {
+                        Button("Close Mesh", role: .destructive) { closeMesh(mesh) }
+                    }
                 }
                 ForEach(sessions) { session in
                     Button {
@@ -684,7 +763,7 @@ private struct SessionStrip: View {
                         HStack(spacing: 6) {
                             Image(systemName: model.agentProfile(for: session.id)?.symbol
                                 ?? (model.isOwned(session.id) ? "terminal.fill" : "terminal"))
-                            Text(session.title).lineLimit(1)
+                            Text(model.sessionTitle(for: session)).lineLimit(1)
                         }
                         .font(.callout)
                         .padding(.horizontal, 10)
@@ -743,6 +822,39 @@ private struct ChatRow: View {
     }
 }
 
+private struct MeshRow: View {
+    @ObservedObject var mesh: MeshSession
+
+    var body: some View {
+        HStack(spacing: 9) {
+            Image(systemName: "circle.hexagongrid.fill")
+                .foregroundStyle(.purple)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(mesh.title).lineLimit(1)
+                Text(mesh.stage == "Idle" ? "Ready" : mesh.stage)
+                    .font(.caption)
+                    .foregroundStyle(mesh.stage == "Idle" ? Color.secondary : Color.purple)
+            }
+        }
+        .padding(.vertical, 2)
+        .accessibilityElement(children: .combine)
+    }
+}
+
+private struct ProjectSurfaceHeader: View {
+    let title: String
+    let systemImage: String
+
+    var body: some View {
+        Label(title, systemImage: systemImage)
+            .font(.caption2.weight(.semibold))
+            .textCase(.uppercase)
+            .foregroundStyle(.tertiary)
+            .padding(.top, 4)
+            .accessibilityAddTraits(.isHeader)
+    }
+}
+
 /// Identifiable wrapper so a session id can drive a `.sheet(item:)`.
 private struct RenameID: Identifiable { let id: String }
 
@@ -776,6 +888,7 @@ private struct RenameSheet: View {
 
 private struct SessionRow: View {
     let session: BrokerTerminalRecord
+    let title: String
     let owned: Bool
     let agent: AgentProfile?
     var branch: String?
@@ -795,7 +908,7 @@ private struct SessionRow: View {
             }
             .frame(width: 18)
             VStack(alignment: .leading, spacing: 2) {
-                Text(session.title)
+                Text(title)
                     .lineLimit(1)
                 Text(sessionDetail)
                     .font(.caption)
@@ -870,7 +983,7 @@ private struct ConnectionFooter: View {
     var body: some View {
         HStack(spacing: 8) {
             VStack(alignment: .leading, spacing: 2) {
-                Text("Native preview")
+                Text("Kaisola Preview")
                     .font(.caption.weight(.semibold))
                 Text(state.title)
                     .font(.caption2)

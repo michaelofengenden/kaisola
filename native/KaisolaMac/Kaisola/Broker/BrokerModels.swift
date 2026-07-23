@@ -86,6 +86,11 @@ struct BrokerTerminalRecord: Identifiable, Equatable, Hashable, Sendable {
     let exited: Bool
     let streamEpoch: String?
     let endOffset: Int64
+    /// Stable controller identity encoded in the broker's capability string.
+    /// Retained so a native install can safely recover its registry after a
+    /// profile switch without treating unrelated observed terminals as owned.
+    let currentOwnerID: String?
+    let lastOwnerID: String?
     var agentActivity: AgentActivity
 
     var title: String {
@@ -111,6 +116,8 @@ struct BrokerTerminalRecord: Identifiable, Equatable, Hashable, Sendable {
         self.exited = object["exited"]?.boolValue ?? false
         self.streamEpoch = object["streamEpoch"]?.stringValue
         self.endOffset = object["endOffset"]?.intValue ?? 0
+        self.currentOwnerID = Self.stableOwnerID(from: owner)
+        self.lastOwnerID = Self.stableOwnerID(from: lastOwner)
         let busy = (live?["agentBusy"] ?? object["agentBusy"])?.boolValue ?? false
         if busy {
             self.agentActivity = .working
@@ -128,6 +135,8 @@ struct BrokerTerminalRecord: Identifiable, Equatable, Hashable, Sendable {
         exited: Bool,
         streamEpoch: String?,
         endOffset: Int64,
+        currentOwnerID: String? = nil,
+        lastOwnerID: String? = nil,
         agentActivity: AgentActivity = .idle
     ) {
         self.id = id
@@ -136,7 +145,13 @@ struct BrokerTerminalRecord: Identifiable, Equatable, Hashable, Sendable {
         self.exited = exited
         self.streamEpoch = streamEpoch
         self.endOffset = endOffset
+        self.currentOwnerID = currentOwnerID
+        self.lastOwnerID = lastOwnerID
         self.agentActivity = agentActivity
+    }
+
+    func wasOwned(by stableOwnerID: String) -> Bool {
+        currentOwnerID == stableOwnerID || lastOwnerID == stableOwnerID
     }
 
     private static func projectID(from owner: String?) -> String? {
@@ -150,6 +165,17 @@ struct BrokerTerminalRecord: Identifiable, Equatable, Hashable, Sendable {
         } else {
             return nil
         }
+        guard candidate.range(of: #"^[a-zA-Z0-9_.:-]{1,160}$"#, options: .regularExpression) != nil else {
+            return nil
+        }
+        return candidate
+    }
+
+    private static func stableOwnerID(from owner: String?) -> String? {
+        guard let owner, !owner.isEmpty else { return nil }
+        let pieces = owner.split(separator: "|", omittingEmptySubsequences: false)
+        guard pieces.count >= 3 else { return nil }
+        let candidate = String(pieces[1])
         guard candidate.range(of: #"^[a-zA-Z0-9_.:-]{1,160}$"#, options: .regularExpression) != nil else {
             return nil
         }

@@ -112,6 +112,10 @@ function terminalEnv(extra) {
     SHELL_SESSIONS_DISABLE: '1',
     TERM_PROGRAM: 'Kaisola',
     TERM_PROGRAM_VERSION: '1',
+    // zsh otherwise paints an inverse-video "%" when a fresh PTY redraws
+    // after its first resize. Native Terminal hides that implementation
+    // marker; keeping it empty gives new Kaisola shells the same clean start.
+    PROMPT_EOL_MARK: '',
   })
   delete env.TERM_SESSION_ID
   delete env.SHELL_SESSION_DID_INIT
@@ -684,4 +688,4 @@ function diagnostics() {
   }))
 }
 
-module.exports = { available, has, isLive, ownership, spawn, write, agentTurn, resize, setSender, detachRenderer, detachSender, detachSenderPrefix, snapshot, subscribe, unsubscribe, unsubscribeSubscriberPrefix, waitForExit, kill, release, scheduleRelease, cancelRelease, trackChild, untrackChild, killAll, list, setAppFocused, configureStorage, setEventSink, diagnostics, __test: { resumeFromSnapshot, splitUtf8 } }
+module.exports = { available, has, isLive, ownership, spawn, write, agentTurn, resize, setSender, detachRenderer, detachSender, detachSenderPrefix, snapshot, subscribe, unsubscribe, unsubscribeSubscriberPrefix, waitForExit, kill, release, scheduleRelease, cancelRelease, trackChild, untrackChild, killAll, list, setAppFocused, configureStorage, setEventSink, diagnostics, __test: { resumeFromSnapshot, splitUtf8, terminalEnv } }

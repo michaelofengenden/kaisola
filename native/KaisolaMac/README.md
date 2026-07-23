@@ -1,23 +1,56 @@
 # Kaisola native macOS preview
 
-This is the reversible Phase 1 native shell. It has its own bundle identifier
-(`com.kaisola.mac.preview`), application-support directory, updater channel,
-and cursor store. Electron remains the daily driver. The preview never writes
-Electron state and never owns, resizes, signals, writes to, or kills a terminal.
+This is the native Swift/AppKit workspace preview. It has its own bundle
+identifier (`com.kaisola.mac.preview`), application-support directory, updater
+channel, and cursor store. Electron remains usable alongside it. Electron-owned
+terminals are observed through the sealed read-only lane; native-created
+terminals use a separate authenticated controller lane and remain durable on the
+detached broker across app quit/relaunch/update.
 
-The running broker must advertise `terminal-observe-v1`. If an older broker is
-still preserving live PTYs without that feature, the preview refuses to replace
-it and shows a bounded offline explanation. Electron and the iPhone Companion
-remain usable; after those old sessions drain, Electron can safely launch the
-current observer-capable broker.
+The app now includes project tabs/tree navigation, native terminals and agent
+sessions, ACP chats, project-scoped Mesh, file tree/preview/editor, Git and PR
+flows, settings/accounts/MCP, multi-window layouts, notifications, browser
+cards, and the other tracked agent-workspace parity surfaces.
 
-The only broker methods admitted by the local transport policy are:
+## Open the current source
 
-- `terminal.list`
-- `terminal.diagnostics`
-- `broker.status`
-- `terminal.subscribe`
-- `terminal.unsubscribe`
+From the repository root:
+
+```bash
+npm run native:dev
+```
+
+That command incrementally builds the current checkout into a Spotlight-hidden
+`.noindex` DerivedData folder, installs exactly one canonical app at
+`~/Applications/Kaisola Preview.app`, starts/reuses the native-only **Kaisola
+Native** broker, and launches it. It passes the package version into the Debug
+bundle, so the app no longer appears to be a generic `0.1.0` build.
+
+Useful variants:
+
+```bash
+npm run native:dev -- --launch-only
+npm run native:dev -- --clean-legacy
+KAISOLA_NATIVE_BROKER_PROFILE=development npm run native:dev
+```
+
+`--launch-only` skips the incremental build. Every run removes raw Xcode build
+products from Launch Services and re-registers only the canonical app.
+`--clean-legacy` additionally moves old installed copies and reproducible raw
+build/test products to Trash; it never touches Electron's
+`/Applications/Kaisola.app` or broker-owned PTYs.
+
+Finder and Spotlight launches use that same native-only route for Debug builds,
+so opening the canonical preview outside the script does not silently switch
+broker profiles. The explicit `development` variant uses **Kaisola Dev** when a
+clean-room broker is useful. If the local terminal registry ever lags a broker
+handoff, the app reclaims only live terminals carrying this exact installation's
+authenticated stable-owner identity and belonging to an already-open project;
+everything else remains observe-only.
+
+The broker transport keeps observation and mutation deliberately separate.
+The read-only lane admits inventory/diagnostic/subscribe operations; the
+controller lane is capability-bound to native-owned project sessions.
 
 Transient socket loss is recovered with capped exponential backoff and jitter.
 The app reconnects after wake and when an offline preview returns to the

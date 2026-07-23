@@ -190,4 +190,67 @@ final class NativeSessionStoreTests: XCTestCase {
         XCTAssertEqual(store.sessions().first?.id, "term-1")
         XCTAssertEqual(store.projects().count, 1)
     }
+
+    func testRecoverOwnedSessionsRequiresExactStableOwnerAndKnownProject() throws {
+        let project = store.openProject(directory: "/tmp/recover-owned")
+        let stableOwnerID = store.ownerID()
+        let record = BrokerTerminalRecord(
+            id: "term-\(project.id)-recovered",
+            projectID: project.id,
+            pid: 4_321,
+            exited: false,
+            streamEpoch: "epoch",
+            endOffset: 42,
+            lastOwnerID: stableOwnerID
+        )
+
+        let recovered = store.recoverOwnedSessions(from: [record], now: 123_456)
+
+        let session = try XCTUnwrap(recovered.first)
+        XCTAssertEqual(recovered.count, 1)
+        XCTAssertEqual(session.id, record.id)
+        XCTAssertEqual(session.projectID, project.id)
+        XCTAssertEqual(session.cwd, project.path)
+        XCTAssertEqual(session.title, project.name)
+        XCTAssertEqual(session.createdAt, 123_456)
+        XCTAssertEqual(store.sessions(), recovered)
+        XCTAssertTrue(store.recoverOwnedSessions(from: [record]).isEmpty)
+    }
+
+    func testRecoverOwnedSessionsRejectsObservedExitedAndUnknownProjectRecords() {
+        let project = store.openProject(directory: "/tmp/recover-guarded")
+        let stableOwnerID = store.ownerID()
+        let observed = BrokerTerminalRecord(
+            id: "term-observed",
+            projectID: project.id,
+            pid: 1,
+            exited: false,
+            streamEpoch: nil,
+            endOffset: 0,
+            lastOwnerID: "another-install"
+        )
+        let exited = BrokerTerminalRecord(
+            id: "term-exited",
+            projectID: project.id,
+            pid: nil,
+            exited: true,
+            streamEpoch: nil,
+            endOffset: 0,
+            lastOwnerID: stableOwnerID
+        )
+        let unknownProject = BrokerTerminalRecord(
+            id: "term-unknown-project",
+            projectID: "nproj_missing",
+            pid: 2,
+            exited: false,
+            streamEpoch: nil,
+            endOffset: 0,
+            currentOwnerID: stableOwnerID
+        )
+
+        XCTAssertTrue(
+            store.recoverOwnedSessions(from: [observed, exited, unknownProject]).isEmpty
+        )
+        XCTAssertTrue(store.sessions().isEmpty)
+    }
 }

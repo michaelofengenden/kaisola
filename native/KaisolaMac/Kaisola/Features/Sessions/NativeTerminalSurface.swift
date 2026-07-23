@@ -21,7 +21,9 @@ struct NativeTerminalSurface: NSViewRepresentable {
     var fontSize: Double = NativePreviewSettings.terminalFontDefault
     var fontFamily: String = TerminalFontOptions.systemMonoSentinel
     var fontWeight: String = "regular"
-    /// Paper palette on light appearances, ink on dark (Electron parity).
+    /// Native macOS Terminal by default; Kaisola keeps Electron palette parity.
+    var paletteMode: TerminalPaletteMode = .native
+    /// Paper palette on light appearances, ink on dark.
     var lightSurface: Bool = false
     var onInput: ((String) -> Void)? = nil
     var onResize: ((_ columns: Int, _ rows: Int) -> Void)? = nil
@@ -38,7 +40,7 @@ struct NativeTerminalSurface: NSViewRepresentable {
             ? OwnedTerminalView(frame: .zero, font: font)
             : ReadOnlyTerminalView(frame: .zero, font: font)
         view.terminalDelegate = context.coordinator
-        view.configureKaisolaTheme(light: lightSurface)
+        view.configureTerminalTheme(light: lightSurface, mode: paletteMode)
         view.allowMouseReporting = isOwned
         view.linkReporting = .implicit
         view.optionAsMetaKey = false
@@ -58,10 +60,14 @@ struct NativeTerminalSurface: NSViewRepresentable {
         if view.font.fontName != desired.fontName || abs(view.font.pointSize - desired.pointSize) > 0.1 {
             view.font = desired
         }
-        if view.isLightTheme != lightSurface {
-            view.configureKaisolaTheme(light: lightSurface)
+        if view.themeKey != Self.themeKey(light: lightSurface, mode: paletteMode) {
+            view.configureTerminalTheme(light: lightSurface, mode: paletteMode)
         }
         context.coordinator.apply(output: output, epoch: streamEpoch, endOffset: endOffset, to: view)
+    }
+
+    private static func themeKey(light: Bool, mode: TerminalPaletteMode) -> String {
+        "\(mode.rawValue):\(light ? "light" : "dark")"
     }
 
     final class Coordinator: NSObject, TerminalViewDelegate {
@@ -275,15 +281,17 @@ class ReadOnlyTerminalView: TerminalView {
         }
     }
 
-    /// Which palette is installed, so appearance flips reconfigure exactly once.
+    /// Which palette is installed, so appearance/palette flips reconfigure once.
     private(set) var isLightTheme = false
+    private(set) var themeKey = ""
 
-    /// Installs the Kaisola palette (matched to the Electron xterm themes):
-    /// ink on dark appearances, paper on light — instead of SwiftTerm's
-    /// OS-default black-on-white.
-    func configureKaisolaTheme(light: Bool = false) {
-        let palette = TerminalTheme.palette(light: light)
+    /// Installs either the clean native palette or the Electron-matched Kaisola
+    /// palette. Both remain fully opaque so glass chrome never compromises a
+    /// terminal's contrast.
+    func configureTerminalTheme(light: Bool = false, mode: TerminalPaletteMode = .native) {
+        let palette = TerminalTheme.palette(light: light, mode: mode)
         isLightTheme = light
+        themeKey = "\(mode.rawValue):\(light ? "light" : "dark")"
         installColors(palette.ansi)
         nativeForegroundColor = palette.foreground
         nativeBackgroundColor = palette.background

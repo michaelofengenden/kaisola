@@ -40,6 +40,18 @@ struct SettingsView: View {
                     Text(mode.title).tag(mode)
                 }
             }
+            Picker("Project sidebar", selection: $settings.sidebarAppearance) {
+                ForEach(SidebarAppearance.allCases) { mode in
+                    Text(mode.title).tag(mode)
+                }
+            }
+            Picker("Workspace background", selection: $settings.workspaceBackdrop) {
+                ForEach(WorkspaceBackdropMode.allCases) { mode in
+                    Text(mode.title).tag(mode)
+                }
+            }
+            Text("Glass keeps project navigation light; System is the cleanest workspace canvas. Terminal panes always stay opaque for readability.")
+                .font(.caption).foregroundStyle(.secondary)
             Toggle("Native notifications", isOn: Binding(
                 get: { NotificationBridge.shared.enabled },
                 set: { NotificationBridge.shared.enabled = $0 }
@@ -85,10 +97,13 @@ struct SettingsView: View {
             Picker("Weight", selection: $settings.terminalFontWeight) {
                 ForEach(TerminalFontOptions.weightChoices, id: \.raw) { Text($0.title).tag($0.raw) }
             }
-            LabeledContent("Palette") {
-                Text("Terminals follow the app appearance: ink on dark, paper on light (Electron parity).")
-                    .font(.caption).foregroundStyle(.secondary)
+            Picker("Palette", selection: $settings.terminalPalette) {
+                ForEach(TerminalPaletteMode.allCases) { mode in
+                    Text(mode.title).tag(mode)
+                }
             }
+            Text("macOS Terminal is the quiet native default. Kaisola uses the richer Electron-matched ANSI palette.")
+                .font(.caption).foregroundStyle(.secondary)
         }
         .formStyle(.grouped)
         .padding(6)

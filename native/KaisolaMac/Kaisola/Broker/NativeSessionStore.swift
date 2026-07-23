@@ -98,6 +98,39 @@ struct NativeSessionStore: Sendable {
         read()?.sessions ?? []
     }
 
+    /// Repair a lost/stale local registry only from the broker's authenticated
+    /// stable-owner capability. This is intentionally narrower than matching
+    /// the `nproj_` namespace: unrelated native installs remain observed.
+    /// A persisted open project supplies the cwd because broker diagnostics do
+    /// not expose it. Existing records (including titles/agent ids) win.
+    @discardableResult
+    func recoverOwnedSessions(
+        from records: [BrokerTerminalRecord],
+        now: Int64 = Int64(Date().timeIntervalSince1970 * 1_000)
+    ) -> [NativeOwnedSession] {
+        guard var payload = read(), !payload.ownerID.isEmpty else { return [] }
+        let projectsByID = Dictionary(uniqueKeysWithValues: (payload.projects ?? []).map { ($0.id, $0) })
+        var known = Set(payload.sessions.map(\.id))
+        var recovered: [NativeOwnedSession] = []
+
+        for record in records where !record.exited && !known.contains(record.id) {
+            guard record.wasOwned(by: payload.ownerID),
+                  let project = projectsByID[record.projectID] else { continue }
+            let session = NativeOwnedSession(
+                id: record.id,
+                projectID: record.projectID,
+                cwd: project.path,
+                title: project.name,
+                createdAt: now
+            )
+            payload.sessions.append(session)
+            known.insert(record.id)
+            recovered.append(session)
+        }
+        if !recovered.isEmpty { write(payload) }
+        return recovered
+    }
+
     // MARK: - Opened project tabs
 
     func projects() -> [OpenProject] {

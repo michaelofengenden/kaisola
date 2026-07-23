@@ -125,6 +125,11 @@ actor BrokerControlClient: BrokerControlServing {
             "command": .string(command),
             "args": .array(arguments.map(JSONValue.string)),
             "cwd": .string(cwd),
+            // Native shells should open at the prompt, without zsh's inverse
+            // partial-line marker during the initial PTY resize. This is a
+            // fixed, non-secret environment value; account secrets still use
+            // the short-lived 0600 file in AppModel and never enter argv/wire.
+            "env": .object(["PROMPT_EOL_MARK": .string("")]),
             "cols": .integer(Int64(columns)),
             "rows": .integer(Int64(rows)),
         ]))

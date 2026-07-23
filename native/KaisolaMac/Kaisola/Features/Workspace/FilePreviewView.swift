@@ -314,6 +314,7 @@ struct FilePreviewView: View {
 /// The workspace rail: a lazy file tree for the active project (⌘B). Clicking a
 /// file opens it in the preview pane.
 struct WorkspaceRailView: View {
+    @EnvironmentObject private var settings: NativePreviewSettings
     let root: URL
     let openFile: (URL) -> Void
 
@@ -336,7 +337,9 @@ struct WorkspaceRailView: View {
             .padding(.vertical, 6)
         }
         .frame(width: 230)
-        .background(.background.secondary)
+        .background {
+            SidebarBackdropView(appearance: settings.sidebarAppearance)
+        }
         .id(refreshToken)
         .onChange(of: watcher.changeToken) { _, _ in refreshToken += 1 }
         .contextMenu {

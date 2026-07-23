@@ -19,13 +19,28 @@ final class NativePreviewSettingsTests: XCTestCase {
         let settings = NativePreviewSettings(defaults: defaults)
         XCTAssertEqual(settings.navigationLayout, .leftTree)
         XCTAssertEqual(settings.appearance, .system)
+        XCTAssertEqual(settings.sidebarAppearance, .glass)
+        XCTAssertEqual(settings.workspaceBackdrop, .system)
+        XCTAssertEqual(settings.terminalPalette, .native)
 
         settings.navigationLayout = .topBar
         settings.appearance = .dark
+        settings.sidebarAppearance = .solid
+        settings.workspaceBackdrop = .tinted
+        settings.terminalPalette = .kaisola
 
         let reloaded = NativePreviewSettings(defaults: defaults)
         XCTAssertEqual(reloaded.navigationLayout, .topBar)
         XCTAssertEqual(reloaded.appearance, .dark)
+        XCTAssertEqual(reloaded.sidebarAppearance, .solid)
+        XCTAssertEqual(reloaded.workspaceBackdrop, .tinted)
+        XCTAssertEqual(reloaded.terminalPalette, .kaisola)
+    }
+
+    func testVisualChoiceTitlesRemainUserFacing() {
+        XCTAssertEqual(SidebarAppearance.glass.title, "Glass")
+        XCTAssertEqual(WorkspaceBackdropMode.tinted.title, "Tinted")
+        XCTAssertEqual(TerminalPaletteMode.native.title, "macOS Terminal")
     }
 
     func testAppearanceMapsToColorSchemeAndNSAppearance() {
@@ -74,6 +89,7 @@ final class NativePreviewSettingsTests: XCTestCase {
         let menu = KaisolaMacAppDelegate.makeMainMenu(
             updateTarget: nil, updateAction: nil, updateEnabled: false, updateDetail: nil
         )
+        XCTAssertEqual(menu.items.first?.title, "Kaisola Preview")
         let windowMenu = try XCTUnwrap(menu.item(withTitle: "Window")?.submenu)
         XCTAssertNotNil(windowMenu.items.first { $0.title == "Minimize" && $0.keyEquivalent == "m" })
         XCTAssertNotNil(windowMenu.items.first { $0.title == "Bring All to Front" })

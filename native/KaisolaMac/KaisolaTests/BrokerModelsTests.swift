@@ -23,7 +23,52 @@ final class BrokerModelsTests: XCTestCase {
 
         XCTAssertEqual(status.terminals.count, 1)
         XCTAssertEqual(status.terminals[0].projectID, "kaisola.project-1")
+        XCTAssertEqual(status.terminals[0].currentOwnerID, "42")
+        XCTAssertNil(status.terminals[0].lastOwnerID)
+        XCTAssertTrue(status.terminals[0].wasOwned(by: "42"))
         XCTAssertEqual(status.terminals[0].title, "codex-7")
+    }
+
+    func testStatusExtractsStableOwnerFromLastOwnerOnly() throws {
+        let status = try BrokerStatus(
+            status: validStatus,
+            diagnostics: .array([
+                .object([
+                    "id": .string("terminal:zsh"),
+                    "owner": .string(""),
+                    "lastOwner": .string("old-instance|native-install-7|nproj_example"),
+                    "exited": .bool(false),
+                ]),
+            ]),
+            live: .array([]),
+            expectedHello: hello
+        )
+
+        let terminal = try XCTUnwrap(status.terminals.first)
+        XCTAssertEqual(terminal.projectID, "nproj_example")
+        XCTAssertNil(terminal.currentOwnerID)
+        XCTAssertEqual(terminal.lastOwnerID, "native-install-7")
+        XCTAssertTrue(terminal.wasOwned(by: "native-install-7"))
+        XCTAssertFalse(terminal.wasOwned(by: "another-install"))
+    }
+
+    func testLegacyCapabilityDoesNotClaimAStableOwner() throws {
+        let status = try BrokerStatus(
+            status: validStatus,
+            diagnostics: .array([
+                .object([
+                    "id": .string("terminal:legacy"),
+                    "owner": .string("old-instance|legacy-project"),
+                ]),
+            ]),
+            live: .array([]),
+            expectedHello: hello
+        )
+
+        let terminal = try XCTUnwrap(status.terminals.first)
+        XCTAssertEqual(terminal.projectID, "legacy")
+        XCTAssertNil(terminal.currentOwnerID)
+        XCTAssertFalse(terminal.wasOwned(by: "legacy-project"))
     }
 
     func testStatusDropsTerminalWithoutExactProjectCapability() throws {

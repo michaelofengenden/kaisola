@@ -1,7 +1,7 @@
 {
   "name": "kaisola",
   "productName": "Kaisola",
-  "version": "0.1.100",
+  "version": "0.1.101",
   "private": true,
   "description": "Kaisola — a Research IDE. Move research from literature → hypotheses → experiments → results → paper, with a human reviewing every transition.",
   "type": "module",
@@ -22,6 +22,8 @@
     "companion:link-probe": "env -u ELECTRON_RUN_AS_NODE electron electron/companion-link-live-probe.cjs",
     "memory:compare": "node electron/memorycompare.cjs",
     "native:resource": "node scripts/native-resource-gate.cjs",
+    "native:dev": "./scripts/native-preview-dev.sh",
+    "native:launch-smoke": "node scripts/native-launch-smoke.cjs",
     "native:preflight": "node scripts/native-release-preflight.cjs",
     "native:helper:download": "node scripts/download-native-node-runtime.cjs all",
     "native:helper:probe": "node scripts/native-broker-helper-probe.cjs",

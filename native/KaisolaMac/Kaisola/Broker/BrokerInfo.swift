@@ -111,6 +111,12 @@ protocol BrokerInfoLocating: Sendable {
 }
 
 struct BrokerInfoLocator: BrokerInfoLocating, Sendable {
+    enum PreviewProfile: String, Sendable {
+        case native
+        case development
+        case installed
+    }
+
     static let installedProfileNames = ["pasola", "Pasola", "Kiasola", "Kaisola"]
     static let developmentProfileName = "Kaisola Dev"
     /// The native app's OWN broker profile — used when Electron's broker exists
@@ -119,6 +125,27 @@ struct BrokerInfoLocator: BrokerInfoLocating, Sendable {
     /// every session on it) is left untouched.
     static let nativeOwnProfileName = "Kaisola Native"
     static let maximumMetadataBytes: off_t = 64 * 1_024
+
+    /// Debug previews opened from Finder/Spotlight cannot inherit the launch
+    /// script's environment. Point them directly at the native-only broker so
+    /// a direct launch and the canonical launcher see the same durable PTYs.
+    /// Signed releases retain installed-profile discovery + native fallback.
+    static var defaultPreviewProfile: PreviewProfile {
+        let environment = ProcessInfo.processInfo.environment
+        if let explicit = environment["KAISOLA_NATIVE_BROKER_PROFILE"],
+           let profile = PreviewProfile(rawValue: explicit) {
+            return profile
+        }
+        // Backward compatibility for older development launcher scripts.
+        if environment["KAISOLA_NATIVE_USE_DEV_PROFILE"] == "1" {
+            return .development
+        }
+        #if DEBUG
+        return .native
+        #else
+        return .installed
+        #endif
+    }
 
     let userDataCandidates: [URL]
     let currentUserID: uid_t
@@ -143,6 +170,22 @@ struct BrokerInfoLocator: BrokerInfoLocating, Sendable {
                 support.appendingPathComponent($0, isDirectory: true)
             }
         )
+    }
+
+    /// Profile routing for the native UI. A clean-room development broker stays
+    /// explicitly available without making ordinary Debug launches fork state.
+    static func preview(
+        fileManager: FileManager = .default,
+        profile: PreviewProfile = BrokerInfoLocator.defaultPreviewProfile
+    ) -> BrokerInfoLocator {
+        switch profile {
+        case .native:
+            nativeOwn(fileManager: fileManager)
+        case .development:
+            live(fileManager: fileManager, developmentProfile: true)
+        case .installed:
+            live(fileManager: fileManager, developmentProfile: false)
+        }
     }
 
     /// Locator for the native app's own separate broker profile.

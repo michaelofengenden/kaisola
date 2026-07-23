@@ -31,6 +31,32 @@ final class BrokerDiscoveryTests: XCTestCase {
         XCTAssertFalse(BrokerInfoLocator.installedProfileNames.contains("com.kaisola.mac.preview"))
     }
 
+    func testDebugPreviewDefaultsToItsNativeOnlyProfile() {
+        #if DEBUG
+        XCTAssertEqual(BrokerInfoLocator.defaultPreviewProfile, .native)
+        XCTAssertEqual(
+            BrokerInfoLocator.preview().userDataCandidates.map(\.lastPathComponent),
+            [BrokerInfoLocator.nativeOwnProfileName]
+        )
+        #endif
+    }
+
+    func testCleanDevelopmentRouteRemainsExplicitlyAvailable() {
+        XCTAssertEqual(
+            BrokerInfoLocator.preview(profile: .development)
+                .userDataCandidates.map(\.lastPathComponent),
+            [BrokerInfoLocator.developmentProfileName]
+        )
+    }
+
+    func testReleaseRouteCanStillSelectInstalledProfilesExplicitly() {
+        XCTAssertEqual(
+            BrokerInfoLocator.live(developmentProfile: false)
+                .userDataCandidates.map(\.lastPathComponent),
+            BrokerInfoLocator.installedProfileNames
+        )
+    }
+
     func testEachHistoricalAndCurrentProfileCanResolveTheLiveBroker() throws {
         for (index, name) in BrokerInfoLocator.installedProfileNames.enumerated() {
             // The shipping profile names intentionally differ only by case for

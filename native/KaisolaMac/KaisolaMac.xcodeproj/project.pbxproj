@@ -1071,7 +1071,7 @@
 				ENABLE_HARDENED_RUNTIME = YES;
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_FILE = Kaisola/App/Info.plist;
-				INFOPLIST_KEY_CFBundleDisplayName = "Kaisola Native Preview";
+				INFOPLIST_KEY_CFBundleDisplayName = "Kaisola Preview";
 				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.developer-tools";
 				INFOPLIST_KEY_NSHighResolutionCapable = YES;
 				KAISOLA_SPARKLE_FEED_URL = "";
@@ -1095,7 +1095,7 @@
 				ENABLE_APP_SANDBOX = NO;
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_FILE = Kaisola/App/Info.plist;
-				INFOPLIST_KEY_CFBundleDisplayName = "Kaisola Native Preview";
+				INFOPLIST_KEY_CFBundleDisplayName = "Kaisola Preview";
 				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.developer-tools";
 				INFOPLIST_KEY_NSHighResolutionCapable = YES;
 				KAISOLA_SPARKLE_FEED_URL = "";
@@ -1262,7 +1262,7 @@
 				ENABLE_HARDENED_RUNTIME = YES;
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_FILE = Kaisola/App/Info.plist;
-				INFOPLIST_KEY_CFBundleDisplayName = "Kaisola Native Preview";
+				INFOPLIST_KEY_CFBundleDisplayName = "Kaisola Preview";
 				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.developer-tools";
 				INFOPLIST_KEY_NSHighResolutionCapable = YES;
 				KAISOLA_SPARKLE_FEED_URL = "";

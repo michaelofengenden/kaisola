@@ -113,6 +113,9 @@ final class AppModel: ObservableObject {
 
     /// Keeps the per-chat usage observers alive for this window's lifetime.
     private var usageObservers = Set<AnyCancellable>()
+    /// Child surfaces are observable objects of their own. Relay their live
+    /// state changes so project activity badges and tabs update immediately.
+    private var surfaceObservers: [String: AnyCancellable] = [:]
     /// The separate native-profile broker used when Electron's is incompatible.
     private let fallbackPreparer: (any BrokerInfoPreparing)?
     /// True when this window is connected to the app's own separate broker
@@ -141,32 +144,80 @@ final class AppModel: ObservableObject {
             uniquingKeysWith: { first, _ in first }
         )
         let sessionsByProject = Dictionary(grouping: sessions, by: \.projectID)
+        let chatsByProject = Dictionary(grouping: chats, by: \.projectID)
+        let meshesByProject = Dictionary(grouping: meshes, by: \.projectID)
         let pins = SessionPinStore().pins()
 
         func group(for id: String) -> ProjectGroup {
             let sessions = AppModel.pinnedOrder(sessionsByProject[id] ?? [], pinned: pins)
+            let projectChats = chatsByProject[id] ?? []
+            let projectMeshes = meshesByProject[id] ?? []
             let name = openedByID[id]?.name
                 ?? ownedByID[id].map { ($0.cwd as NSString).lastPathComponent }
+                ?? projectChats.first?.workspaceDirectory.lastPathComponent
+                ?? projectMeshes.first?.baseDirectory.lastPathComponent
                 ?? id
             let directory = openedByID[id].map { URL(fileURLWithPath: $0.path) }
                 ?? ownedByID[id].map { URL(fileURLWithPath: $0.cwd) }
-            let working = sessions.filter { record in
+                ?? projectChats.first?.workspaceDirectory
+                ?? projectMeshes.first?.baseDirectory
+            let terminalWorking = sessions.filter { record in
                 if case .working = record.agentActivity, !record.exited { return true }
                 return false
             }.count
+            let chatWorking = projectChats.filter(\.conversation.isRunning).count
+            let meshWorking = projectMeshes.reduce(into: 0) { count, mesh in
+                count += mesh.columns.filter(\.conversation.isRunning).count
+            }
             return ProjectGroup(
                 id: id, name: name, directory: directory, sessions: sessions,
-                colorHex: openedByID[id]?.colorHex, workingCount: working
+                colorHex: openedByID[id]?.colorHex,
+                workingCount: terminalWorking + chatWorking + meshWorking
             )
         }
 
         // Opened tabs keep their persisted (user-reordered) sequence; projects
-        // that only exist through live sessions follow, sorted by name.
+        // that only exist through live sessions/chats/Mesh follow, sorted by
+        // name. Closing a tab therefore never orphans an active surface.
         let openedGroups = opened.map { group(for: $0.id) }
-        let sessionOnly = Set(sessionsByProject.keys).subtracting(opened.map(\.id))
+        let liveProjectIDs = Set(sessionsByProject.keys)
+            .union(chatsByProject.keys)
+            .union(meshesByProject.keys)
+        let sessionOnly = liveProjectIDs.subtracting(opened.map(\.id))
             .map(group(for:))
             .sorted { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
         return openedGroups + sessionOnly
+    }
+
+    func chats(in projectID: String) -> [AcpChatHandle] {
+        chats.filter { $0.projectID == projectID }
+    }
+
+    func meshes(in projectID: String) -> [MeshSession] {
+        meshes.filter { $0.projectID == projectID }
+    }
+
+    /// Switch the top-level workspace context. A surface from another project
+    /// must not remain visible under the newly selected tab.
+    func activateProject(named name: String?) {
+        selectedProjectName = name
+        guard let name, let project = projects.first(where: { $0.name == name }) else { return }
+
+        if let chatID = selectedChatID,
+           chats.first(where: { $0.id == chatID })?.projectID != project.id {
+            selectedChatID = nil
+        }
+        if let meshID = selectedMeshID,
+           meshes.first(where: { $0.id == meshID })?.projectID != project.id {
+            selectedMeshID = nil
+        }
+        if let sessionID = selectedSessionID,
+           sessions.first(where: { $0.id == sessionID })?.projectID != project.id {
+            Task { await select(nil) }
+        }
+        previewedFileURL = nil
+        previewedFileLine = nil
+        browserCardURL = nil
     }
 
     func setProjectColor(id: String, colorHex: String?) {
@@ -262,6 +313,8 @@ final class AppModel: ObservableObject {
     /// broker-durable terminals). Selecting the chat shows its conversation.
     func openChat(_ agent: AgentProfile, inDirectory directory: URL) {
         guard let adapter = AcpAdapter.forAgent(agent.id) else { return }
+        let project = sessionStore.openProject(directory: directory.path)
+        selectedProjectName = project.name
         let chatID = "chat-\(UUID().uuidString.lowercased().prefix(8))"
         let mcp = McpConfigStore(workspace: directory).servers()
         let conversation = AcpConversation(
@@ -306,8 +359,17 @@ final class AppModel: ObservableObject {
             if self.selectedChatID == chatID, appActive { return }
             AttentionCenter.shared.notify(kind: kind, targetID: chatID, title: title, detail: detail)
         }
-        chats.append(AcpChatHandle(id: chatID, agentID: agent.id, conversation: conversation))
+        chats.append(AcpChatHandle(
+            id: chatID,
+            agentID: agent.id,
+            workspaceDirectory: directory,
+            conversation: conversation
+        ))
+        surfaceObservers[chatID] = conversation.objectWillChange.sink { [weak self] _ in
+            self?.objectWillChange.send()
+        }
         selectedChatID = chatID
+        selectedMeshID = nil
         selectedSessionID = nil
     }
 
@@ -316,12 +378,17 @@ final class AppModel: ObservableObject {
             chat.conversation.stop()
         }
         chats.removeAll { $0.id == chatID }
+        surfaceObservers.removeValue(forKey: chatID)?.cancel()
         if selectedChatID == chatID { selectedChatID = nil }
     }
 
     func selectChat(_ chatID: String?) {
         selectedChatID = chatID
         if let chatID {
+            if let projectID = chats.first(where: { $0.id == chatID })?.projectID,
+               let project = projects.first(where: { $0.id == projectID }) {
+                selectedProjectName = project.name
+            }
             selectedSessionID = nil
             selectedMeshID = nil
             AttentionCenter.shared.clear(targetID: chatID)
@@ -339,11 +406,16 @@ final class AppModel: ObservableObject {
     func openMesh(inDirectory directory: URL, staged: Bool = false, idea: Bool = false) {
         let agents = AgentRegistry.all.filter { AcpAdapter.forAgent($0.id) != nil }
         guard !agents.isEmpty else { return }
+        let project = sessionStore.openProject(directory: directory.path)
+        selectedProjectName = project.name
         let mesh = MeshSession(
             baseDirectory: directory,
             mode: staged ? .staged : .flat,
             purpose: idea ? .idea : .build
         )
+        surfaceObservers[mesh.id] = mesh.objectWillChange.sink { [weak self] _ in
+            self?.objectWillChange.send()
+        }
         meshes.append(mesh)
         selectedMeshID = mesh.id
         selectedChatID = nil
@@ -362,12 +434,17 @@ final class AppModel: ObservableObject {
     func closeMesh(_ meshID: String) {
         meshes.first { $0.id == meshID }?.shutdown()
         meshes.removeAll { $0.id == meshID }
+        surfaceObservers.removeValue(forKey: meshID)?.cancel()
         if selectedMeshID == meshID { selectedMeshID = nil }
     }
 
     func selectMesh(_ meshID: String?) {
         selectedMeshID = meshID
-        if meshID != nil {
+        if let meshID {
+            if let projectID = meshes.first(where: { $0.id == meshID })?.projectID,
+               let project = projects.first(where: { $0.id == projectID }) {
+                selectedProjectName = project.name
+            }
             selectedChatID = nil
             selectedSessionID = nil
         }
@@ -386,6 +463,7 @@ final class AppModel: ObservableObject {
             mesh.shutdown()
         }
         meshes.removeAll()
+        surfaceObservers.removeAll()
         await disconnect()
     }
 
@@ -459,6 +537,11 @@ final class AppModel: ObservableObject {
         let retainedDocument = terminalDocument.sessionID == next.id ? terminalDocument : .empty
         selectedSession = next
         selectedSessionID = next.id
+        if let project = projects.first(where: { $0.id == next.projectID }) {
+            selectedProjectName = project.name
+        }
+        selectedChatID = nil
+        selectedMeshID = nil
         sessionStore.recordSelectedSession(next.id)
         AttentionCenter.shared.clear(targetID: next.id)
         guard connectionState.isConnected else {
@@ -650,6 +733,62 @@ final class AppModel: ObservableObject {
         return AgentRegistry.profile(id: agentID)
     }
 
+    /// Human-readable navigation title. Broker ids are intentionally opaque;
+    /// plain shells use a project-local ordinal while agent and custom names
+    /// keep their persisted title.
+    func sessionTitle(for record: BrokerTerminalRecord) -> String {
+        Self.sessionDisplayTitle(
+            for: record,
+            visibleRecords: sessions,
+            storedSessions: sessionStore.sessions()
+        )
+    }
+
+    func sessionTitle(for terminalID: String) -> String {
+        guard let record = sessions.first(where: { $0.id == terminalID }) else {
+            return sessionStore.sessions().first(where: { $0.id == terminalID })?.title ?? terminalID
+        }
+        return sessionTitle(for: record)
+    }
+
+    /// The rename field edits the persisted base title, not a generated
+    /// "Terminal 2" navigation label.
+    func editableSessionTitle(for terminalID: String) -> String {
+        sessionStore.sessions().first(where: { $0.id == terminalID })?.title
+            ?? sessions.first(where: { $0.id == terminalID })?.title
+            ?? ""
+    }
+
+    static func sessionDisplayTitle(
+        for record: BrokerTerminalRecord,
+        visibleRecords: [BrokerTerminalRecord],
+        storedSessions: [NativeOwnedSession]
+    ) -> String {
+        let storedByID = Dictionary(uniqueKeysWithValues: storedSessions.map { ($0.id, $0) })
+        guard let stored = storedByID[record.id] else { return record.title }
+
+        let folder = (stored.cwd as NSString).lastPathComponent
+        let defaultTitle = stored.agentID
+            .flatMap { AgentRegistry.profile(id: $0)?.name }
+            .map { "\($0) · \(folder)" } ?? folder
+        guard stored.title == defaultTitle, stored.agentID == nil else {
+            return stored.title
+        }
+
+        let plainShellIDs = visibleRecords.compactMap { visible -> String? in
+            guard visible.projectID == record.projectID,
+                  let candidate = storedByID[visible.id],
+                  candidate.agentID == nil,
+                  candidate.title == (candidate.cwd as NSString).lastPathComponent else { return nil }
+            return visible.id
+        }
+        guard plainShellIDs.count > 1,
+              let index = plainShellIDs.firstIndex(of: record.id) else {
+            return "Terminal"
+        }
+        return "Terminal \(index + 1)"
+    }
+
     /// Rename an owned session's sidebar title.
     func renameSession(_ terminalID: String, to title: String) {
         let trimmed = title.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -821,8 +960,9 @@ final class AppModel: ObservableObject {
     }
 
     /// After the observer connects, bring up the controller lane and re-own
-    /// the terminals this app created in earlier runs. Any registry entry the
-    /// broker no longer knows is pruned.
+    /// the terminals this app created in earlier runs. Registry entries from a
+    /// different still-draining broker are retained; an authenticated broker
+    /// owner capability can repair records lost during a profile switch.
     private func restoreOwnedSessions(info: BrokerInfo) async {
         controlAvailable = false
         ownedTerminalIDs = []
@@ -833,10 +973,12 @@ final class AppModel: ObservableObject {
             return
         }
         controlAvailable = true
+        sessionStore.recoverOwnedSessions(from: sessions)
         var owned: Set<String> = []
         for stored in sessionStore.sessions() {
             guard let record = sessions.first(where: { $0.id == stored.id }) else {
-                sessionStore.remove(terminalID: stored.id)
+                // This record may belong to the other broker in a dual-broker
+                // drain. Absence from the current inventory is not deletion.
                 continue
             }
             if record.exited {

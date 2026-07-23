@@ -42,7 +42,7 @@ actor BrokerStartupCoordinator: BrokerInfoPreparing {
 
     static func live() -> BrokerStartupCoordinator {
         BrokerStartupCoordinator(
-            locator: .live(),
+            locator: .preview(),
             launcher: BrokerBootstrapClient()
         )
     }

@@ -244,6 +244,11 @@ jobs:
             shasum -a 256 "$artifact_name" > "$artifact_name.sha256"
             shasum -a 256 --check "$artifact_name.sha256"
           )
+      - name: Smoke-launch final native preview bundle
+        run: |
+          npm run native:launch-smoke -- \
+            --app "$RUNNER_TEMP/kaisola-native-unpack/KaisolaMacPreview.app" \
+            --seconds 10
       - name: Clean up native signing keychain
         if: ${{ always() }}
         run: |

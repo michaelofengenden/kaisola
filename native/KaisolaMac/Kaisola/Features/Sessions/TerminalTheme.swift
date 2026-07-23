@@ -1,10 +1,9 @@
 import AppKit
 import SwiftTerm
 
-/// The terminal palettes, matched to the Electron renderer's xterm themes
-/// (src/components/Terminal.tsx DARK_THEME / LIGHT_THEME) so the native
-/// surface reads as the same product: ink on a dark appearance, paper on a
-/// light one — exactly like Electron's lightSurface switch.
+/// Terminal palettes. The native mode uses the restrained white/near-black
+/// canvas and familiar ANSI colors of macOS Terminal. The Kaisola mode retains
+/// the Electron renderer's richer ink/paper palette.
 enum TerminalTheme {
     struct Palette {
         let background: NSColor
@@ -12,6 +11,30 @@ enum TerminalTheme {
         let cursor: NSColor
         let selection: NSColor
         let ansi: [SwiftTerm.Color]
+    }
+
+    /// A clean macOS Terminal-like light canvas. System semantic colors are
+    /// resolved under the app's effective appearance at application time.
+    static var nativeLight: Palette {
+        Palette(
+            background: .textBackgroundColor,
+            foreground: .textColor,
+            cursor: .textColor,
+            selection: .selectedTextBackgroundColor.withAlphaComponent(0.48),
+            ansi: nativeANSI(dark: false)
+        )
+    }
+
+    /// A clean dark terminal canvas, without the extra blue-gray cast of the
+    /// product palette.
+    static var nativeDark: Palette {
+        Palette(
+            background: color(0x1E1E1E),
+            foreground: color(0xF2F2F2),
+            cursor: color(0xF2F2F2),
+            selection: color(0x6A8ACD, alpha: 0.38),
+            ansi: nativeANSI(dark: true)
+        )
     }
 
     /// DARK_THEME (ink). Values from Terminal.tsx / TERM_SURFACE.ink.
@@ -47,8 +70,28 @@ enum TerminalTheme {
         )
     }
 
-    static func palette(light: Bool) -> Palette {
-        light ? Self.light : Self.dark
+    static func palette(light: Bool, mode: TerminalPaletteMode) -> Palette {
+        switch mode {
+        case .native: light ? nativeLight : nativeDark
+        case .kaisola: light ? Self.light : Self.dark
+        }
+    }
+
+    private static func nativeANSI(dark: Bool) -> [SwiftTerm.Color] {
+        let values = dark
+            ? [
+                0x000000, 0xC91B00, 0x00C200, 0xC7C400,
+                0x0225C7, 0xCA30C7, 0x00C5C7, 0xC7C7C7,
+                0x686868, 0xFF6E67, 0x5EFB6E, 0xFFFC67,
+                0x6871FF, 0xFF77FF, 0x60FDFF, 0xFFFFFF,
+            ]
+            : [
+                0x000000, 0xC23621, 0x25BC24, 0xADAD27,
+                0x492EE1, 0xD338D3, 0x33BBC8, 0xCBCCCD,
+                0x818383, 0xFC391F, 0x31E722, 0xEAEC23,
+                0x5833FF, 0xF935F8, 0x14F0F0, 0xE9EBEB,
+            ]
+        return values.map(term)
     }
 
     private static func color(_ rgb: Int, alpha: CGFloat = 1) -> NSColor {

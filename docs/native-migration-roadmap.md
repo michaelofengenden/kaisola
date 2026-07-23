@@ -25,7 +25,7 @@ optional pending a scope decision.
 - **ACP chat surface**: native conversational Claude/Codex over the Agent Client Protocol — streaming messages, thinking blocks, tool-call cards, live plan, usage, model picker, inline permission prompts (`Kaisola/Acp/*`: AcpClient/AcpConversation/AcpChatView). Adapters spawned via `npx @latest`. Proven end-to-end against a real spawned mock agent.
 - **MCP**: per-workspace server registry producing the `session/new` mcpServers array with correct stdio/http/sse shapes, capability-filtered (`scripts/native-mcp-registry.cjs`).
 - **Adapter/MCP version currency**: adapters + MCP packages resolved to latest and continuously updated (`scripts/agent-adapter-versions.cjs`, `agent-adapter-update.cjs`).
-- **Terminal theming** matched to the Electron xterm palette (`TerminalTheme.swift`).
+- **Terminal theming** offers a clean macOS Terminal palette by default plus the Electron-matched Kaisola xterm palette (`TerminalTheme.swift`).
 - Detached-broker **reconnect/backoff**, wake/foreground recovery (`BrokerStartupCoordinator.swift`, `BrokerReconnectBackoff.swift`).
 - Distribution: Developer ID signing, notarization, stapling, Sparkle updates from a signed appcast (`NativeUpdateController.swift`, release pipeline).
 - Companion **protocol + crypto** shared library (`KaisolaCore/{Protocol,Security,Domain}`) — already consumed by the iPhone app.
@@ -39,7 +39,7 @@ optional pending a scope decision.
 |---|---|---|---|
 | Multi-window (independent workspaces, ⌘⇧N) | DONE | P0 | each window its own AppModel + broker observer connection (`KaisolaMacAppDelegate.makeWindow`) |
 | Two navigation layouts (Left tree vs Top bar), live-switchable | DONE | P0 | `NativePreviewSettings.navigationLayout`; View menu; persisted |
-| Project tabs (Chrome-style, drag-reorder, rename, color, activity badges) | DONE | P0 | open/rename/close/relocate, tint colors, working-count activity badges, Move Left/Right reorder (persisted) + pointer drag-reorder (v0.1.99) |
+| Project tabs (Chrome-style, drag-reorder, rename, color, activity badges) | DONE | P0 | open/rename/close/relocate, tint colors, aggregate terminal/chat/Mesh activity, pointer drag-reorder; every chat and Mesh run is nested under its project in both nav modes |
 | Session tabs / dock-grid (draggable columns, split, close, pop) | DONE | P0 | in-window splits (up to 4 panes, each its own live subscription; owned panes fully interactive), tab bar with promote/close, Open in Split context menu, pop-out to window; pointer drag-reorder of panes deferred |
 | Full macOS menu bar (App/File/Edit/View/Window/Help + accelerators) | DONE | P0 | App (Settings ⌘,)/File (Open Recent, reopen ⌘⇧T/⌘⌥T)/Edit/View (layout, appearance, font ⌘±)/Window (saved layouts, NSApp.windowsMenu)/Help |
 | Session groups (named, tinted, collapsible; pinned) | PARTIAL | P1 | projects are the grouping: named (rename), tinted (colorHex), collapsible (persisted); session pinning shipped v0.1.99 (Pin/Unpin, pinned-first ordering); ad-hoc cross-project groups deferred |
@@ -52,7 +52,7 @@ optional pending a scope decision.
 | Focus vs Studio layout mode | NEW | P2 | Studio is legacy research surface |
 | OmniBar (⌘L) | DONE | P2 | native ⌘L overlay: message the focused agent from anywhere (connect-poll deferred delivery) |
 | Keymap overrides (`keymap.json`) | NEW | P2 | |
-| Onboarding flow | NEW | P2 | |
+| Onboarding flow | DONE | P2 | first-run native walkthrough; can be reopened from Help |
 
 ## 2. Terminal features
 
@@ -61,18 +61,18 @@ optional pending a scope decision.
 | PTY create/write/resize/kill/signal | DONE | P0 | |
 | Observation (list/subscribe/diagnostics) | DONE | P0 | |
 | PTY continuity across restart / detached broker | DONE | P0 | broker contract + reattach-on-relaunch + selection restore; retained-tail marker in the surface |
-| Theming (dark/light/eco, tones, cursor color) | DONE | P1 | app-wide light/dark/system; terminals follow the appearance (Electron DARK_THEME/LIGHT_THEME both ported, live-switch); eco n/a natively |
+| Theming (dark/light/eco, tones, cursor color) | DONE | P1 | app-wide light/dark/system; clean macOS Terminal palette is default, Electron-matched Kaisola palette remains selectable and both live-switch with appearance |
 | Fonts (family/size ⌘±/weight/line-height) | PARTIAL | P1 | size ⌘+/⌘−/⌘0 + family/weight pickers persisted (v0.1.99); line-height deferred |
 | Search in scrollback | DONE | P1 | SwiftTerm ⌘F find bar (Edit ▸ Find) |
 | Links: URLs + OSC 8 hyperlinks | DONE | P1 | implicit link detection + OSC 8; http(s) → browser, file:// → reveal in Finder |
 | Rename / auto-name / prompt title | PARTIAL | P1 | manual rename + agent·folder auto-name + live OSC title auto-tracking until manually renamed (v0.1.99) |
 | Agent detection / meta (process, cwd, branch, ports, exit) | PARTIAL | P0 | agent id + live activity + exit + git-branch + foreground process + listening ports on rows (TTL scans, v0.1.99) |
-| Scroll pinning / bracketed paste / clipboard | NEW | P1 | |
-| File links in output → open in editor | NEW | P2 | `terminalFileLinks.ts` |
+| Scroll pinning / bracketed paste / clipboard | DONE | P1 | deliberate-scroll follow intent, SwiftTerm bracketed-mode replay, native selection/copy/paste |
+| File links in output → open in editor | DONE | P2 | OSC 8 and path citations open the confined file preview at the cited line; ⇧⌘O opens externally |
 | Browser-card on localhost dev ports | DONE | P2 | confined WKWebView card; localhost links from terminals/chats open it (v0.1.99) |
 | Blocks / OSC 133 prompt marks | NEW | P2 | |
 | CLI draft survival (retype into resumed agent) | NEW | P2 | |
-| Pop-out terminal to window | NEW | P2 | |
+| Pop-out terminal to window | DONE | P2 | session context menu opens an independent native window on the same durable PTY |
 
 ## 3. Agent surfaces
 
@@ -94,7 +94,7 @@ optional pending a scope decision.
 | Turn checkpoints / restore (pre-turn git snapshot) | DONE | P1 | git stash create/store before each turn (clean-tree skip); header clock menu restores with confirm |
 | Slash commands / available commands | DONE | P1 | available_commands_update → '/' fuzzy autocomplete in the composer |
 | ACP terminals (agent-spawned, watch/take over) | DONE | P1 | `AcpTerminalHost`: terminal/create…release answered, bounded live output rendered in tool cards; take-over n/a (app-scoped processes) |
-| Kaisola Mesh (group agents: scout→contract→execute→review→integrate) | PARTIAL | P1 | v1 fan-out + isolated worktrees + diff review; v0.1.99 adds staged scout→execute pipeline, idea (brainstorm) mode, role chips, review summaries, and one-click Integrate (git apply --3way) |
+| Kaisola Mesh (group agents: scout→contract→execute→review→integrate) | DONE | P1 | project-scoped fan-out, isolated worktrees, flat/staged/idea modes, role chips, diff review, summaries, and one-click Integrate (`git apply --3way`) |
 | Transcript archive / paging | DONE | P2 | windowed transcript (120 rows + Show earlier), per-chat drafts persisted (v0.1.99) |
 | @-mentions (project entities) | NEW | P2 | research-tied |
 | Reasoning providers (domain research agents) | NEW | P2 | legacy |
@@ -118,9 +118,9 @@ optional pending a scope decision.
 
 | Section | Status | Pri | Notes |
 |---|---|---|---|
-| General (theme, updates, onboarding) | DONE | P0 (theme) / P1 | Settings ⌘, General tab: layout, appearance, notifications, external editor, update check; first-run onboarding sheet (v0.1.99) |
+| General (theme, updates, onboarding) | DONE | P0 (theme) / P1 | Settings ⌘, General tab: layout, appearance, Glass/Solid sidebar, System/Glass/Tinted workspace backdrop, notifications, external editor, updates; first-run onboarding |
 | Guardrails (sensitive globs, permission rules, autonomy) | DONE | P0 | sensitive globs + permission rules (`AcpPermissionRules`) + ACP session-mode picker (plan/default/acceptEdits/bypass) |
-| Terminal (font/size/weight/line-height/tone/cursor) | PARTIAL | P1 | font-size slider + family/weight pickers (v0.1.99) |
+| Terminal (font/size/weight/line-height/tone/cursor) | PARTIAL | P1 | font-size slider + family/weight and macOS Terminal/Kaisola palette pickers; line-height remains deferred |
 | Agents (add custom terminal/ACP, enable presets, models) | PARTIAL | P1 | adapter roster + account isolation (app-wide AND per-project) + custom agent registration + device-code sign-in card (v0.1.99) |
 | Models & keys (API keys keychain, provider, base URLs) | PARTIAL | P1 | Anthropic/OpenAI keys in the login keychain, injected into agent env (v0.1.99); provider/base-URL config deferred |
 | Usage (Codex/Claude/OpenCode gauges, limits) | PARTIAL | P1 | per-chat context usage + session-wide usage center (per-chat gauges, turn counts, Settings tab + footer chip, v0.1.99) |
@@ -136,7 +136,7 @@ optional pending a scope decision.
 |---|---|---|---|
 | Claude accounts (isolated CLAUDE_CONFIG_DIR, per-project) | PARTIAL | P1 | app-wide override + per-project scoping (project wins per key; plain shells carry the env too, v0.1.99) |
 | Codex accounts (isolated CODEX_HOME, per-project) | PARTIAL | P1 | app-wide override + per-project scoping (project wins per key; plain shells carry the env too, v0.1.99) |
-| Device-code sign-in card | NEW | P1 | |
+| Device-code sign-in card | DONE | P1 | one-click command card launches sign-in in a project/account-scoped native terminal |
 | API keys (Anthropic/OpenAI keychain) | DONE | P1 | data-protection keychain store, Settings tab, env injection (v0.1.99) |
 | MCP servers (per-workspace, add/probe/import, carried into agents) | PARTIAL | P2 | per-workspace registry in Settings, exact Electron wire shapes, carried into chats+Mesh (v0.1.99); probe/import deferred |
 | Extensions | NEW | P2 | |
@@ -162,7 +162,7 @@ against the Electron host.
 |---|---|---|---|
 | Auto-updates (Sparkle) | DONE | P1 | signed appcast, real update verified |
 | Theme / dark-mode invariant (dark/light/system) | DONE | P0 | `NativePreviewSettings.appearance` drives SwiftUI colorScheme + NSApp appearance; View menu |
-| Liquid Glass / vibrancy (NSGlassEffectView + fallback) | PARTIAL | P1 | SwiftUI materials on bars/cards/popovers + sidebar vibrancy; dedicated glass mode deferred |
+| Liquid Glass / vibrancy (NSGlassEffectView + fallback) | DONE | P1 | persisted Glass/Solid project sidebar and file rail, selectable Glass workspace backdrop, opaque terminal contrast surface |
 | Perf/energy mode (glass vs eco) | PARTIAL | P1 | n/a natively at preview scale — no web renderer to throttle; revisit if profiling says otherwise |
 | Wallpaper tint sampling | NEW | P2 | |
 | Window mode / traffic lights / relaunch | PARTIAL | P1 | |
@@ -176,7 +176,7 @@ against the Electron host.
 | Git panel (status/stage/commit/diff/log/restore) | DONE | P1 | panel: status/stage/unstage/commit + inline tinted diffs + history + confirmed Discard (git restore) |
 | Working-tree checkpoints (pre-turn git snapshots) | DONE | P1 | per-turn stash snapshots + restore (chat header) |
 | Git worktree sessions (isolated checkout per agent; Mesh) | DONE | P1 | Mesh columns each get a kaisola-mesh-* worktree; namespace-guarded cleanup |
-| Whole-app local persistence (layouts, drafts, metadata) | DONE | P0 | layout/appearance/font/rail/globs/accounts (UserDefaults), projects/colors/order/recents/closed-stacks/selection (`NativeSessionStore`), saved windows, window frames |
+| Whole-app local persistence (layouts, drafts, metadata) | DONE | P0 | layout/appearance/sidebar/backdrop/terminal palette/font/rail/globs/accounts (UserDefaults), projects/colors/order/recents/closed-stacks/selection (`NativeSessionStore`), saved windows, window frames |
 | Agent task ledger | NEW | P2 | |
 | Embedded browser cards | DONE | P2 | `BrowserCardView` confined WKWebView (v0.1.99) |
 | LaTeX mode | NEW | P2 | |

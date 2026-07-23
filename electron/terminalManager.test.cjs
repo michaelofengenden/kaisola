@@ -34,3 +34,11 @@ test('observer chunks and resume snapshots preserve UTF-8 byte boundaries', () =
   assert.equal(resumeFromSnapshot(snapshot, 'stream-old', 9).resetReason, 'epoch_mismatch')
   assert.equal(resumeFromSnapshot(snapshot, 'stream-1', 4).resetReason, 'invalid_utf8_boundary')
 })
+
+test('fresh terminals suppress zsh partial-line markers without losing the shell environment', () => {
+  const env = terminalManager.__test.terminalEnv({ KAISOLA_TEST_VALUE: 'present' })
+  assert.equal(env.PROMPT_EOL_MARK, '')
+  assert.equal(env.KAISOLA_TEST_VALUE, 'present')
+  assert.equal(env.TERM, 'xterm-256color')
+  assert.equal(env.TERM_PROGRAM, 'Kaisola')
+})

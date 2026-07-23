@@ -13,8 +13,8 @@ enum NavigationLayout: String, CaseIterable, Identifiable, Sendable {
     var title: String { self == .leftTree ? "Left Tree" : "Top Bar" }
 }
 
-/// Appearance mode. Follows the system by default; Kaisola keeps terminals dark
-/// regardless, but the shell chrome honors this.
+/// Appearance mode. Follows the system by default; shell chrome and the chosen
+/// terminal palette both resolve against it.
 enum AppearanceMode: String, CaseIterable, Identifiable, Sendable {
     case system
     case light
@@ -46,6 +46,45 @@ enum AppearanceMode: String, CaseIterable, Identifiable, Sendable {
     }
 }
 
+/// Sidebar treatment. Glass is the native-preview default; Solid is retained
+/// for maximum contrast and Reduce Transparency-style preferences.
+enum SidebarAppearance: String, CaseIterable, Identifiable, Sendable {
+    case glass
+    case solid
+
+    var id: String { rawValue }
+    var title: String { self == .glass ? "Glass" : "Solid" }
+}
+
+/// The canvas behind workspace surfaces. Terminals keep an opaque, legible
+/// palette; this backdrop is visible through navigation chrome, empty states,
+/// chats, and lightweight utilities.
+enum WorkspaceBackdropMode: String, CaseIterable, Identifiable, Sendable {
+    case system
+    case glass
+    case tinted
+
+    var id: String { rawValue }
+    var title: String {
+        switch self {
+        case .system: "System"
+        case .glass: "Glass"
+        case .tinted: "Tinted"
+        }
+    }
+}
+
+/// Terminal color choices. Native is deliberately the default: a quiet
+/// white/near-black macOS Terminal canvas. Kaisola preserves the richer
+/// Electron-matched palette for users who prefer it.
+enum TerminalPaletteMode: String, CaseIterable, Identifiable, Sendable {
+    case native
+    case kaisola
+
+    var id: String { rawValue }
+    var title: String { self == .native ? "macOS Terminal" : "Kaisola" }
+}
+
 /// App-wide preview settings, persisted in UserDefaults under the preview's own
 /// suite so they never touch any Electron profile.
 @MainActor
@@ -63,6 +102,14 @@ final class NativePreviewSettings: ObservableObject {
         }
     }
 
+    @Published var sidebarAppearance: SidebarAppearance {
+        didSet { defaults.set(sidebarAppearance.rawValue, forKey: Keys.sidebarAppearance) }
+    }
+
+    @Published var workspaceBackdrop: WorkspaceBackdropMode {
+        didSet { defaults.set(workspaceBackdrop.rawValue, forKey: Keys.workspaceBackdrop) }
+    }
+
     /// Terminal font size (⌘+/⌘−/⌘0), clamped to a readable range.
     @Published var terminalFontSize: Double {
         didSet { defaults.set(terminalFontSize, forKey: Keys.terminalFontSize) }
@@ -78,6 +125,10 @@ final class NativePreviewSettings: ObservableObject {
 
     @Published var terminalFontWeight: String {
         didSet { defaults.set(terminalFontWeight, forKey: Keys.terminalFontWeight) }
+    }
+
+    @Published var terminalPalette: TerminalPaletteMode {
+        didSet { defaults.set(terminalPalette.rawValue, forKey: Keys.terminalPalette) }
     }
 
     /// Whether the workspace rail (file tree, ⌘B) is shown.
@@ -137,9 +188,12 @@ final class NativePreviewSettings: ObservableObject {
     private enum Keys {
         static let layout = "navigationLayout"
         static let appearance = "appearanceMode"
+        static let sidebarAppearance = "sidebarAppearance"
+        static let workspaceBackdrop = "workspaceBackdrop"
         static let terminalFontSize = "terminalFontSize"
         static let terminalFontFamily = "terminalFontFamily"
         static let terminalFontWeight = "terminalFontWeight"
+        static let terminalPalette = "terminalPalette"
         static let workspaceRail = "workspaceRailVisible"
         static let sensitiveGlobs = "sensitiveGlobs"
         static let claudeConfigDir = "claudeConfigDir"
@@ -151,6 +205,8 @@ final class NativePreviewSettings: ObservableObject {
         self.defaults = defaults
         navigationLayout = defaults.string(forKey: Keys.layout).flatMap(NavigationLayout.init) ?? .leftTree
         appearance = defaults.string(forKey: Keys.appearance).flatMap(AppearanceMode.init) ?? .system
+        sidebarAppearance = defaults.string(forKey: Keys.sidebarAppearance).flatMap(SidebarAppearance.init) ?? .glass
+        workspaceBackdrop = defaults.string(forKey: Keys.workspaceBackdrop).flatMap(WorkspaceBackdropMode.init) ?? .system
         let stored = defaults.double(forKey: Keys.terminalFontSize)
         terminalFontSize = stored > 0
             ? min(max(stored, Self.terminalFontRange.lowerBound), Self.terminalFontRange.upperBound)
@@ -158,6 +214,7 @@ final class NativePreviewSettings: ObservableObject {
         workspaceRailVisible = defaults.object(forKey: Keys.workspaceRail) as? Bool ?? false
         terminalFontFamily = defaults.string(forKey: Keys.terminalFontFamily) ?? TerminalFontOptions.systemMonoSentinel
         terminalFontWeight = defaults.string(forKey: Keys.terminalFontWeight) ?? "regular"
+        terminalPalette = defaults.string(forKey: Keys.terminalPalette).flatMap(TerminalPaletteMode.init) ?? .native
         sensitiveGlobs = defaults.stringArray(forKey: Keys.sensitiveGlobs) ?? AcpPermissionRules.defaultSensitiveGlobs
         claudeConfigDir = defaults.string(forKey: Keys.claudeConfigDir) ?? ""
         codexHome = defaults.string(forKey: Keys.codexHome) ?? ""
@@ -178,5 +235,48 @@ final class NativePreviewSettings: ObservableObject {
 
     func resetTerminalFont() {
         terminalFontSize = Self.terminalFontDefault
+    }
+}
+
+/// Reusable material used by both the project sidebar and the workspace file
+/// rail, keeping the two left-hand navigation surfaces visually coherent.
+struct SidebarBackdropView: View {
+    let appearance: SidebarAppearance
+
+    @ViewBuilder
+    var body: some View {
+        switch appearance {
+        case .glass:
+            Rectangle().fill(.ultraThinMaterial)
+        case .solid:
+            Color(nsColor: .controlBackgroundColor)
+        }
+    }
+}
+
+struct WorkspaceBackdropView: View {
+    let mode: WorkspaceBackdropMode
+
+    @ViewBuilder
+    var body: some View {
+        switch mode {
+        case .system:
+            Color(nsColor: .windowBackgroundColor)
+        case .glass:
+            Rectangle().fill(.thinMaterial)
+        case .tinted:
+            ZStack {
+                Color(nsColor: .windowBackgroundColor)
+                LinearGradient(
+                    colors: [
+                        Color.accentColor.opacity(0.11),
+                        Color.purple.opacity(0.055),
+                        Color.clear,
+                    ],
+                    startPoint: .topLeading,
+                    endPoint: .bottomTrailing
+                )
+            }
+        }
     }
 }

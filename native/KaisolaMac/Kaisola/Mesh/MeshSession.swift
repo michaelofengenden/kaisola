@@ -1,3 +1,4 @@
+import Combine
 import Foundation
 
 /// How a Mesh fans work out. `.flat` (v1 default) sends the SAME prompt to every
@@ -63,6 +64,9 @@ final class MeshSession: ObservableObject, Identifiable {
     let baseDirectory: URL
     let mode: MeshMode
     let purpose: MeshPurpose
+    var projectID: String {
+        NativeSessionStore.projectID(forDirectory: baseDirectory.path)
+    }
     @Published private(set) var columns: [Column] = []
     /// Non-nil when isolation was requested but unavailable (not a repo).
     @Published private(set) var isolationNote: String?
@@ -72,6 +76,9 @@ final class MeshSession: ObservableObject, Identifiable {
     @Published private(set) var stage: String = "Idle"
 
     private let fileManager = FileManager.default
+    /// Relay each column's live conversation state through this Mesh object so
+    /// parent project navigation can show accurate working activity.
+    private var columnObservers = Set<AnyCancellable>()
     /// Drives the staged / idea handoff; cancelled on shutdown and restarted on
     /// each new staged/idea send.
     private var stageTask: Task<Void, Never>?
@@ -158,6 +165,9 @@ final class MeshSession: ObservableObject, Identifiable {
                 mcpServers: mcp,
                 sensitiveGlobs: NativePreviewSettings.shared.sensitiveGlobs
             )
+            conversation.objectWillChange
+                .sink { [weak self] _ in self?.objectWillChange.send() }
+                .store(in: &columnObservers)
             columns.append(Column(
                 id: "\(id)-\(agent.id)",
                 agent: agent,

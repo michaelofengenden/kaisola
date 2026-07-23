@@ -82,7 +82,7 @@ targets:
         # only honors an allowlist of INFOPLIST_KEY_* names and silently drops
         # the SU* ones.
         INFOPLIST_FILE: Kaisola/App/Info.plist
-        INFOPLIST_KEY_CFBundleDisplayName: Kaisola Native Preview
+        INFOPLIST_KEY_CFBundleDisplayName: Kaisola Preview
         INFOPLIST_KEY_LSApplicationCategoryType: public.app-category.developer-tools
         INFOPLIST_KEY_NSHighResolutionCapable: YES
         KAISOLA_SPARKLE_FEED_URL: ""

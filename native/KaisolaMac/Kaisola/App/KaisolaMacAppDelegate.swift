@@ -24,10 +24,13 @@ enum KaisolaMacMain {
 
 @MainActor
 final class KaisolaMacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
-    private let model = AppModel()
     private let settings = NativePreviewSettings.shared
     private let updateController = NativeUpdateController()
-    private var window: NSWindow?
+    // Each window is an independent workspace with its own AppModel and broker
+    // observer connection — the broker's coexistence contract makes concurrent
+    // observers safe. Keyed by the NSWindow so menu actions target the key one.
+    private var windowModels: [ObjectIdentifier: AppModel] = [:]
+    private var windowCounter = 0
     private var wakeObserver: NSObjectProtocol?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -36,6 +39,26 @@ final class KaisolaMacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDele
         try? NativePreviewPaths.prepareApplicationSupport()
         settings.applyAppearance()
         installMainMenu()
+        _ = makeWindow()
+        NSApp.activate(ignoringOtherApps: true)
+
+        wakeObserver = NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.didWakeNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor in
+                for model in self?.windowModels.values ?? [:].values {
+                    await model.recoverAfterWake()
+                }
+            }
+        }
+    }
+
+    /// Create a fresh, independent workspace window.
+    @discardableResult
+    private func makeWindow() -> NSWindow {
+        let model = AppModel()
         let content = RootShellView()
             .environmentObject(model)
             .environmentObject(settings)
@@ -50,27 +73,31 @@ final class KaisolaMacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDele
         window.titlebarAppearsTransparent = true
         window.titleVisibility = .hidden
         window.minSize = NSSize(width: 760, height: 480)
-        window.center()
-        window.setFrameAutosaveName("KaisolaNativePreview.MainWindow")
+        window.isReleasedWhenClosed = false
+        // Cascade extra windows so they do not stack exactly.
+        if windowCounter == 0 {
+            window.center()
+            window.setFrameAutosaveName("KaisolaNativePreview.MainWindow")
+        } else {
+            window.cascadeTopLeft(from: NSPoint(x: 40 * CGFloat(windowCounter), y: 40 * CGFloat(windowCounter)))
+        }
+        windowCounter += 1
         window.contentView = NSHostingView(rootView: content)
         window.delegate = self
         window.makeKeyAndOrderFront(nil)
-        NSApp.activate(ignoringOtherApps: true)
-        self.window = window
-
-        wakeObserver = NSWorkspace.shared.notificationCenter.addObserver(
-            forName: NSWorkspace.didWakeNotification,
-            object: nil,
-            queue: .main
-        ) { [weak self] _ in
-            Task { @MainActor in await self?.model.recoverAfterWake() }
-        }
-
+        windowModels[ObjectIdentifier(window)] = model
         Task { await model.reload() }
+        return window
+    }
+
+    /// The AppModel for the frontmost window (menu-command target).
+    private func keyModel() -> AppModel? {
+        if let key = NSApp.keyWindow, let model = windowModels[ObjectIdentifier(key)] { return model }
+        return windowModels.values.first
     }
 
     func applicationDidBecomeActive(_ notification: Notification) {
-        model.resumeIfNeeded()
+        for model in windowModels.values { model.resumeIfNeeded() }
     }
 
     func applicationWillTerminate(_ notification: Notification) {
@@ -85,7 +112,13 @@ final class KaisolaMacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDele
     }
 
     func windowWillClose(_ notification: Notification) {
+        guard let window = notification.object as? NSWindow,
+              let model = windowModels.removeValue(forKey: ObjectIdentifier(window)) else { return }
         Task { await model.disconnect() }
+    }
+
+    @objc private func newWindow(_ sender: Any?) {
+        makeWindow()
     }
 
     @objc private func checkForUpdates(_ sender: Any?) {
@@ -93,17 +126,18 @@ final class KaisolaMacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDele
     }
 
     @objc private func newTerminalSession(_ sender: Any?) {
+        guard let model = keyModel() else { return }
         RootShellView.promptForNewTerminal(model: model)
     }
 
     @objc private func newAgentSession(_ sender: Any?) {
-        guard let item = sender as? NSMenuItem,
+        guard let item = sender as? NSMenuItem, let model = keyModel(),
               let agent = AgentRegistry.profile(id: item.representedObject as? String ?? "") else { return }
         RootShellView.promptForNewAgent(agent, model: model)
     }
 
     @objc private func newChatSession(_ sender: Any?) {
-        guard let item = sender as? NSMenuItem,
+        guard let item = sender as? NSMenuItem, let model = keyModel(),
               let agent = AgentRegistry.profile(id: item.representedObject as? String ?? "") else { return }
         RootShellView.promptForNewChat(agent, model: model)
     }
@@ -141,6 +175,8 @@ final class KaisolaMacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDele
             updateAction: #selector(checkForUpdates(_:)),
             updateEnabled: updateController.availability.canCheck,
             updateDetail: updateController.availability.detail,
+            newWindowTarget: self,
+            newWindowAction: #selector(newWindow(_:)),
             newTerminalTarget: self,
             newTerminalAction: #selector(newTerminalSession(_:)),
             newAgentTarget: self,
@@ -163,6 +199,8 @@ final class KaisolaMacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDele
         updateAction: Selector?,
         updateEnabled: Bool,
         updateDetail: String?,
+        newWindowTarget: AnyObject? = nil,
+        newWindowAction: Selector? = nil,
         newTerminalTarget: AnyObject? = nil,
         newTerminalAction: Selector? = nil,
         newAgentTarget: AnyObject? = nil,
@@ -208,9 +246,16 @@ final class KaisolaMacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDele
         applicationItem.submenu = applicationMenu
 
         let fileItem = NSMenuItem()
+        fileItem.title = "File"
         let fileMenu = NSMenu(title: "File")
+        if let newWindowAction {
+            let item = fileMenu.addItem(withTitle: "New Window", action: newWindowAction, keyEquivalent: "n")
+            item.keyEquivalentModifierMask = [.command, .shift]
+            item.target = newWindowTarget
+            fileMenu.addItem(.separator())
+        }
         if let newChatAction {
-            let chatItem = fileMenu.addItem(withTitle: "New Chat", action: nil, keyEquivalent: "n")
+            let chatItem = fileMenu.addItem(withTitle: "New Chat", action: nil, keyEquivalent: "")
             let chatMenu = NSMenu(title: "New Chat")
             for agent in AgentRegistry.all where AcpAdapter.forAgent(agent.id) != nil {
                 let item = chatMenu.addItem(withTitle: "Chat with \(agent.name)", action: newChatAction, keyEquivalent: "")

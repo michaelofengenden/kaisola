@@ -37,6 +37,17 @@ final class NativePreviewSettingsTests: XCTestCase {
         XCTAssertEqual(AppearanceMode.light.nsAppearance?.name, .aqua)
     }
 
+    func testFileMenuCarriesNewWindowWithShortcut() throws {
+        let menu = KaisolaMacAppDelegate.makeMainMenu(
+            updateTarget: nil, updateAction: nil, updateEnabled: false, updateDetail: nil,
+            newWindowTarget: nil, newWindowAction: #selector(NSResponder.doCommand(by:))
+        )
+        let fileMenu = try XCTUnwrap(menu.item(withTitle: "File")?.submenu)
+        let newWindow = try XCTUnwrap(fileMenu.items.first { $0.title == "New Window" })
+        XCTAssertEqual(newWindow.keyEquivalent, "n")
+        XCTAssertEqual(newWindow.keyEquivalentModifierMask, [.command, .shift])
+    }
+
     func testViewMenuCarriesLayoutAndAppearanceToggles() throws {
         let menu = KaisolaMacAppDelegate.makeMainMenu(
             updateTarget: nil, updateAction: nil, updateEnabled: false, updateDetail: nil,

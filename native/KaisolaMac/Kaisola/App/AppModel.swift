@@ -79,7 +79,7 @@ final class AppModel: ObservableObject {
         brokerPreparer: any BrokerInfoPreparing = BrokerStartupCoordinator.live(),
         fallbackPreparer: (any BrokerInfoPreparing)? = BrokerStartupCoordinator(
             locator: .nativeOwn(),
-            launcher: BrokerBootstrapClient()
+            launcher: BrokerBootstrapClient(directOnly: true)
         ),
         client: any ObserveOnlyBrokerServing = ObserveOnlyBrokerClient(),
         controlClient: any BrokerControlServing = BrokerControlClient(),

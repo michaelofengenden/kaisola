@@ -10,15 +10,22 @@ actor BrokerBootstrapClient: BrokerHelperLaunching {
     private let bundle: Bundle
     private let registrationRecordURL: URL
     private let environment: [String: String]
+    /// Always spawn the sealed bootstrap directly instead of going through the
+    /// SMAppService agent. The fallback (separate native broker) uses this: the
+    /// bootstrap double-forks a broker that provably outlives the app, and it
+    /// needs no login-item registration/approval.
+    private let directOnly: Bool
 
     init(
         bundle: Bundle = .main,
         registrationRecordURL: URL = NativePreviewPaths.helperRegistrationRecord,
-        environment: [String: String] = ProcessInfo.processInfo.environment
+        environment: [String: String] = ProcessInfo.processInfo.environment,
+        directOnly: Bool = false
     ) {
         self.bundle = bundle
         self.registrationRecordURL = registrationRecordURL
         self.environment = environment
+        self.directOnly = directOnly
     }
 
     func packageManifest() throws -> BrokerHelperManifest {
@@ -27,7 +34,7 @@ actor BrokerBootstrapClient: BrokerHelperLaunching {
 
     func launch(configurationURL: URL) async throws -> Int32 {
         let package = try verifiedPackage()
-        if environment["KAISOLA_NATIVE_DIRECT_HELPER"] == "1" {
+        if directOnly || environment["KAISOLA_NATIVE_DIRECT_HELPER"] == "1" {
             return try directLaunch(package: package, configurationURL: configurationURL)
         }
         try ensureRegistered(packageVersion: package.manifest.packageVersion)

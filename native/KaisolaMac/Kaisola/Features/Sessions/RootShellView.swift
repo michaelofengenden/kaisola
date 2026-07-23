@@ -836,6 +836,14 @@ private struct ConnectionFooter: View {
                 Text(state.title)
                     .font(.caption2)
                     .foregroundStyle(.secondary)
+                // Never hide WHY: offline/connected detail lives here now that
+                // the detail-pane status bar is gone.
+                if let detail = state.detail {
+                    Text(detail)
+                        .font(.caption2)
+                        .foregroundStyle(.tertiary)
+                        .lineLimit(2)
+                }
             }
             Spacer()
             if let newMesh {

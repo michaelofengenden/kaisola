@@ -25,6 +25,7 @@ enum KaisolaMacMain {
 @MainActor
 final class KaisolaMacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private let model = AppModel()
+    private let settings = NativePreviewSettings.shared
     private let updateController = NativeUpdateController()
     private var window: NSWindow?
     private var wakeObserver: NSObjectProtocol?
@@ -33,9 +34,11 @@ final class KaisolaMacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDele
         // Preview-owned state stays separate from every historical Electron
         // profile. Broker discovery is explicitly read-only and lives elsewhere.
         try? NativePreviewPaths.prepareApplicationSupport()
+        settings.applyAppearance()
         installMainMenu()
         let content = RootShellView()
             .environmentObject(model)
+            .environmentObject(settings)
 
         let window = NSWindow(
             contentRect: NSRect(x: 0, y: 0, width: 1_080, height: 700),
@@ -105,6 +108,33 @@ final class KaisolaMacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDele
         RootShellView.promptForNewChat(agent, model: model)
     }
 
+    @objc private func setNavigationLayout(_ sender: Any?) {
+        guard let item = sender as? NSMenuItem,
+              let layout = (item.representedObject as? String).flatMap(NavigationLayout.init) else { return }
+        settings.navigationLayout = layout
+        refreshMenuStates()
+    }
+
+    @objc private func setAppearanceMode(_ sender: Any?) {
+        guard let item = sender as? NSMenuItem,
+              let mode = (item.representedObject as? String).flatMap(AppearanceMode.init) else { return }
+        settings.appearance = mode
+        refreshMenuStates()
+    }
+
+    /// Reflect the current layout/appearance selection as menu checkmarks.
+    private func refreshMenuStates() {
+        for item in NSApp.mainMenu?.item(withTitle: "View")?.submenu?.items ?? [] {
+            if let raw = item.representedObject as? String {
+                if NavigationLayout(rawValue: raw) != nil {
+                    item.state = raw == settings.navigationLayout.rawValue ? .on : .off
+                } else if AppearanceMode(rawValue: raw) != nil {
+                    item.state = raw == settings.appearance.rawValue ? .on : .off
+                }
+            }
+        }
+    }
+
     private func installMainMenu() {
         NSApp.mainMenu = Self.makeMainMenu(
             updateTarget: self,
@@ -116,7 +146,12 @@ final class KaisolaMacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDele
             newAgentTarget: self,
             newAgentAction: #selector(newAgentSession(_:)),
             newChatTarget: self,
-            newChatAction: #selector(newChatSession(_:))
+            newChatAction: #selector(newChatSession(_:)),
+            viewTarget: self,
+            layoutAction: #selector(setNavigationLayout(_:)),
+            appearanceAction: #selector(setAppearanceMode(_:)),
+            currentLayout: settings.navigationLayout.rawValue,
+            currentAppearance: settings.appearance.rawValue
         )
     }
 
@@ -133,7 +168,12 @@ final class KaisolaMacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDele
         newAgentTarget: AnyObject? = nil,
         newAgentAction: Selector? = nil,
         newChatTarget: AnyObject? = nil,
-        newChatAction: Selector? = nil
+        newChatAction: Selector? = nil,
+        viewTarget: AnyObject? = nil,
+        layoutAction: Selector? = nil,
+        appearanceAction: Selector? = nil,
+        currentLayout: String = NavigationLayout.leftTree.rawValue,
+        currentAppearance: String = AppearanceMode.system.rawValue
     ) -> NSMenu {
         let mainMenu = NSMenu()
         let applicationItem = NSMenuItem()
@@ -218,6 +258,35 @@ final class KaisolaMacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDele
 
         editItem.submenu = editMenu
         mainMenu.addItem(editItem)
+
+        if let layoutAction, let appearanceAction {
+            let viewItem = NSMenuItem()
+            viewItem.title = "View"
+            let viewMenu = NSMenu(title: "View")
+            viewMenu.addItem(sectionHeader("Navigation Layout"))
+            for layout in NavigationLayout.allCases {
+                let item = viewMenu.addItem(withTitle: layout.title, action: layoutAction, keyEquivalent: "")
+                item.target = viewTarget
+                item.representedObject = layout.rawValue
+                item.state = layout.rawValue == currentLayout ? .on : .off
+            }
+            viewMenu.addItem(.separator())
+            viewMenu.addItem(sectionHeader("Appearance"))
+            for mode in AppearanceMode.allCases {
+                let item = viewMenu.addItem(withTitle: mode.title, action: appearanceAction, keyEquivalent: "")
+                item.target = viewTarget
+                item.representedObject = mode.rawValue
+                item.state = mode.rawValue == currentAppearance ? .on : .off
+            }
+            viewItem.submenu = viewMenu
+            mainMenu.addItem(viewItem)
+        }
         return mainMenu
+    }
+
+    private static func sectionHeader(_ title: String) -> NSMenuItem {
+        let item = NSMenuItem(title: title, action: nil, keyEquivalent: "")
+        item.isEnabled = false
+        return item
     }
 }

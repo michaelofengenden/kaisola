@@ -3,6 +3,7 @@ import SwiftUI
 
 struct RootShellView: View {
     @EnvironmentObject private var model: AppModel
+    @EnvironmentObject private var settings: NativePreviewSettings
     @State private var renameTarget: String?
     @State private var renameText: String = ""
 
@@ -17,6 +18,30 @@ struct RootShellView: View {
     }
 
     var body: some View {
+        Group {
+            switch settings.navigationLayout {
+            case .leftTree: leftTreeLayout
+            case .topBar: topBarLayout
+            }
+        }
+        .preferredColorScheme(settings.appearance.colorScheme)
+        .sheet(item: Binding(get: { renameTarget.map(RenameID.init) }, set: { renameTarget = $0?.id })) { target in
+            RenameSheet(text: $renameText) { newTitle in
+                model.renameSession(target.id, to: newTitle)
+                renameTarget = nil
+            } cancel: {
+                renameTarget = nil
+            }
+            .onAppear {
+                renameText = model.sessions.first(where: { $0.id == target.id })?.title ?? ""
+            }
+        }
+    }
+
+    // MARK: - Layouts
+
+    /// Nested project→session tree in a left sidebar (the default).
+    private var leftTreeLayout: some View {
         NavigationSplitView {
             List(selection: sidebarSelection) {
                 if !model.chats.isEmpty {
@@ -33,68 +58,98 @@ struct RootShellView: View {
                 ForEach(model.projects, id: \.name) { project in
                     Section(project.name) {
                         ForEach(project.sessions) { session in
-                            SessionRow(
-                                session: session,
-                                owned: model.isOwned(session.id),
-                                agent: model.agentProfile(for: session.id)
-                            )
-                            .tag(Optional(session.id))
-                            .contextMenu {
-                                if model.isOwned(session.id) {
-                                    Button("Rename…") { renameTarget = session.id }
-                                    if !session.exited {
-                                        Button("End Session", role: .destructive) {
-                                            Task { await model.endSession(session.id) }
-                                        }
-                                    }
-                                }
-                            }
+                            sessionRow(session)
                         }
                     }
                 }
             }
             .listStyle(.sidebar)
             .navigationSplitViewColumnWidth(min: 190, ideal: 235, max: 300)
-            .safeAreaInset(edge: .bottom) {
-                ConnectionFooter(
-                    state: model.connectionState,
-                    canCreate: model.controlAvailable,
-                    reload: { Task { await model.reload() } },
-                    newTerminal: { RootShellView.promptForNewTerminal(model: model) },
-                    newAgent: { agent in RootShellView.promptForNewAgent(agent, model: model) },
-                    newChat: { agent in RootShellView.promptForNewChat(agent, model: model) }
-                )
-            }
+            .safeAreaInset(edge: .bottom) { footer }
             .accessibilityLabel("Projects, chats, and terminal sessions")
         } detail: {
-            if let chat = model.chats.first(where: { $0.id == model.selectedChatID }) {
-                AcpChatView(conversation: chat.conversation)
-                    .id(chat.id)
-                    .background(Color(nsColor: .windowBackgroundColor))
-            } else {
-                VStack(spacing: 0) {
-                    StatusBar(
-                        state: model.connectionState,
-                        ownsSelection: model.selectedSessionID.map(model.isOwned) ?? false
-                    )
-                    Divider()
-                    terminalContent
-                }
-                .background(Color(nsColor: .windowBackgroundColor))
-            }
+            detailPane
         }
         .navigationSplitViewStyle(.balanced)
-        .sheet(item: Binding(get: { renameTarget.map(RenameID.init) }, set: { renameTarget = $0?.id })) { target in
-            RenameSheet(text: $renameText) { newTitle in
-                model.renameSession(target.id, to: newTitle)
-                renameTarget = nil
-            } cancel: {
-                renameTarget = nil
-            }
-            .onAppear {
-                renameText = model.sessions.first(where: { $0.id == target.id })?.title ?? ""
+    }
+
+    /// A project tab strip over a session row, then the detail pane (Electron's
+    /// "Top bar" mode).
+    private var topBarLayout: some View {
+        VStack(spacing: 0) {
+            ProjectTabStrip(
+                projects: model.projects.map(\.name),
+                chatCount: model.chats.count,
+                selected: activeProjectBinding
+            )
+            Divider()
+            SessionStrip(
+                model: model,
+                projectName: activeProjectName,
+                rename: { renameTarget = $0 }
+            )
+            Divider()
+            detailPane
+            footer
+        }
+    }
+
+    private var activeProjectName: String? {
+        model.selectedProjectName ?? model.projects.first?.name
+    }
+
+    private var activeProjectBinding: Binding<String?> {
+        Binding(get: { activeProjectName }, set: { model.selectedProjectName = $0 })
+    }
+
+    @ViewBuilder
+    private func sessionRow(_ session: BrokerTerminalRecord) -> some View {
+        SessionRow(
+            session: session,
+            owned: model.isOwned(session.id),
+            agent: model.agentProfile(for: session.id)
+        )
+        .tag(Optional(session.id))
+        .contextMenu {
+            if model.isOwned(session.id) {
+                Button("Rename…") { renameTarget = session.id }
+                if !session.exited {
+                    Button("End Session", role: .destructive) {
+                        Task { await model.endSession(session.id) }
+                    }
+                }
             }
         }
+    }
+
+    @ViewBuilder
+    private var detailPane: some View {
+        if let chat = model.chats.first(where: { $0.id == model.selectedChatID }) {
+            AcpChatView(conversation: chat.conversation)
+                .id(chat.id)
+                .background(Color(nsColor: .windowBackgroundColor))
+        } else {
+            VStack(spacing: 0) {
+                StatusBar(
+                    state: model.connectionState,
+                    ownsSelection: model.selectedSessionID.map(model.isOwned) ?? false
+                )
+                Divider()
+                terminalContent
+            }
+            .background(Color(nsColor: .windowBackgroundColor))
+        }
+    }
+
+    private var footer: some View {
+        ConnectionFooter(
+            state: model.connectionState,
+            canCreate: model.controlAvailable,
+            reload: { Task { await model.reload() } },
+            newTerminal: { RootShellView.promptForNewTerminal(model: model) },
+            newAgent: { agent in RootShellView.promptForNewAgent(agent, model: model) },
+            newChat: { agent in RootShellView.promptForNewChat(agent, model: model) }
+        )
     }
 
     /// Folder picker → new owned shell in that directory. Reused by the File
@@ -176,6 +231,106 @@ struct RootShellView: View {
                 }
             }
         }
+    }
+}
+
+/// A horizontal strip of project tabs plus a Chats pill, for the top-bar
+/// layout. Clicking a tab makes it the active project.
+private struct ProjectTabStrip: View {
+    let projects: [String]
+    let chatCount: Int
+    @Binding var selected: String?
+
+    var body: some View {
+        ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: 6) {
+                if chatCount > 0 {
+                    Label("\(chatCount) Chats", systemImage: "bubble.left.and.text.bubble.right")
+                        .font(.caption)
+                        .padding(.horizontal, 10)
+                        .padding(.vertical, 5)
+                        .background(.quaternary, in: Capsule())
+                }
+                ForEach(projects, id: \.self) { name in
+                    Button {
+                        selected = name
+                    } label: {
+                        Text(name)
+                            .font(.callout.weight(selected == name ? .semibold : .regular))
+                            .padding(.horizontal, 12)
+                            .padding(.vertical, 5)
+                            .background(
+                                selected == name ? AnyShapeStyle(Color.accentColor.opacity(0.18)) : AnyShapeStyle(.clear),
+                                in: Capsule()
+                            )
+                    }
+                    .buttonStyle(.plain)
+                }
+                Spacer(minLength: 0)
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 6)
+        }
+        .frame(height: 40)
+    }
+}
+
+/// The session row for the active project, in the top-bar layout.
+private struct SessionStrip: View {
+    @ObservedObject var model: AppModel
+    let projectName: String?
+    let rename: (String) -> Void
+
+    private var sessions: [BrokerTerminalRecord] {
+        model.projects.first { $0.name == projectName }?.sessions ?? []
+    }
+
+    var body: some View {
+        ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: 8) {
+                if sessions.isEmpty {
+                    Text("No sessions in this project")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .padding(.horizontal, 8)
+                }
+                ForEach(sessions) { session in
+                    Button {
+                        model.selectChat(nil)
+                        Task { await model.select(session.id) }
+                    } label: {
+                        HStack(spacing: 6) {
+                            Image(systemName: model.agentProfile(for: session.id)?.symbol
+                                ?? (model.isOwned(session.id) ? "terminal.fill" : "terminal"))
+                            Text(session.title).lineLimit(1)
+                        }
+                        .font(.callout)
+                        .padding(.horizontal, 10)
+                        .padding(.vertical, 5)
+                        .background(
+                            model.selectedSessionID == session.id
+                                ? AnyShapeStyle(.quaternary) : AnyShapeStyle(.clear),
+                            in: RoundedRectangle(cornerRadius: 7)
+                        )
+                    }
+                    .buttonStyle(.plain)
+                    .contextMenu {
+                        if model.isOwned(session.id) {
+                            Button("Rename…") { rename(session.id) }
+                            if !session.exited {
+                                Button("End Session", role: .destructive) {
+                                    Task { await model.endSession(session.id) }
+                                }
+                            }
+                        }
+                    }
+                }
+                Spacer(minLength: 0)
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 6)
+        }
+        .frame(height: 40)
     }
 }
 

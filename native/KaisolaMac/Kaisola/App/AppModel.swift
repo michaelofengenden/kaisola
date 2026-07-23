@@ -50,6 +50,8 @@ final class AppModel: ObservableObject {
     /// independently of the broker (the adapter is a child of this app).
     @Published private(set) var chats: [AcpChatHandle] = []
     @Published var selectedChatID: String?
+    /// The project tab shown in the top-bar layout. Nil means the first project.
+    @Published var selectedProjectName: String?
 
     private let brokerPreparer: any BrokerInfoPreparing
     private let client: any ObserveOnlyBrokerServing

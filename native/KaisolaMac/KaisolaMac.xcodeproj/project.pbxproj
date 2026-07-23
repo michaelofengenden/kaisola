@@ -28,6 +28,7 @@
 		51632AA5B21B3F1D0BF0A4F4 /* BrokerReconnectBackoff.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8A7A17FC91F373F5881DB97C /* BrokerReconnectBackoff.swift */; };
 		59BCC3DD2AF57DF38A059A59 /* NativeSessionStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1DBE251CF21C42D3D77AA57C /* NativeSessionStore.swift */; };
 		5AF29A34E38E013439C5835A /* SwiftTerm in Frameworks */ = {isa = PBXBuildFile; productRef = BC5B996E0136696A21E890DC /* SwiftTerm */; };
+		5BDE35CC5251CC2B24071508 /* NativePreviewSettings.swift in Sources */ = {isa = PBXBuildFile; fileRef = 081788CB50A2F8085E0929CE /* NativePreviewSettings.swift */; };
 		5D6DA237FF6F32B1A2A8DB04 /* AcpConversation.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3ACF651DE22A050B1D4AF49C /* AcpConversation.swift */; };
 		6A358DDF102C7984D29FD806 /* TerminalCursorStoreTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 96E5D09B49E862C088D584E8 /* TerminalCursorStoreTests.swift */; };
 		6B76FFE3C1F1E11155040E2F /* RootShellView.swift in Sources */ = {isa = PBXBuildFile; fileRef = CBB83EF128840150F6F7103D /* RootShellView.swift */; };
@@ -66,6 +67,7 @@
 		E6781527DAD43EDB96DBD461 /* BrokerHelperPackage.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3CE14B47B11FF8AEDD22CC1A /* BrokerHelperPackage.swift */; };
 		E9490372FB17DD1367607FA9 /* BrokerLaunchConfiguration.swift in Sources */ = {isa = PBXBuildFile; fileRef = 58663742F2D4497A3D234BF7 /* BrokerLaunchConfiguration.swift */; };
 		EC396A9F5333AD82AA272705 /* TerminalDocumentTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 346DC3875261051CDA13A916 /* TerminalDocumentTests.swift */; };
+		ECFF15A752EF728A9A020FA1 /* NativePreviewSettingsTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6AE795C503468AA7CEC0D736 /* NativePreviewSettingsTests.swift */; };
 		F0340491DE4B839A15E2B447 /* AppModelReconnectTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9971B075277E2DD1494755BE /* AppModelReconnectTests.swift */; };
 		F284EEE4E31C73067657316E /* NativeUpdateConfiguration.swift in Sources */ = {isa = PBXBuildFile; fileRef = 269A1E4D253C170CBDB084CA /* NativeUpdateConfiguration.swift */; };
 		F774445B10D3A672F5B0783A /* SwiftTerm in Frameworks */ = {isa = PBXBuildFile; productRef = F40F74418FEEC6E2A1A8223F /* SwiftTerm */; };
@@ -90,6 +92,7 @@
 
 /* Begin PBXFileReference section */
 		03184EF0234187AC455C546D /* BrokerStartupCoordinator.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BrokerStartupCoordinator.swift; sourceTree = "<group>"; };
+		081788CB50A2F8085E0929CE /* NativePreviewSettings.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NativePreviewSettings.swift; sourceTree = "<group>"; };
 		0B4786B001B694E8168114CB /* KaisolaBrokerBootstrap */ = {isa = PBXFileReference; includeInIndex = 0; path = KaisolaBrokerBootstrap; sourceTree = BUILT_PRODUCTS_DIR; };
 		13BFA68C0E2E3E83379B2835 /* TerminalDocument.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TerminalDocument.swift; sourceTree = "<group>"; };
 		16F343A1F0C6E1A6F95DB932 /* BrokerInfo.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BrokerInfo.swift; sourceTree = "<group>"; };
@@ -112,6 +115,7 @@
 		5C89B154EE5DAF4AFF41692D /* NativeTerminalInteractionTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NativeTerminalInteractionTests.swift; sourceTree = "<group>"; };
 		5D434A4435BCB68FD69050A4 /* ObserveOnlyBrokerPolicy.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ObserveOnlyBrokerPolicy.swift; sourceTree = "<group>"; };
 		6647914275EC9AD4E4A1C04B /* BrokerBootstrapMain.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BrokerBootstrapMain.swift; sourceTree = "<group>"; };
+		6AE795C503468AA7CEC0D736 /* NativePreviewSettingsTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NativePreviewSettingsTests.swift; sourceTree = "<group>"; };
 		6E78A73E4BF5DABAB5BF6826 /* NativePreviewPaths.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NativePreviewPaths.swift; sourceTree = "<group>"; };
 		7DE33FAC2761474B7B6A46A2 /* ObserveOnlyBrokerPolicyTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ObserveOnlyBrokerPolicyTests.swift; sourceTree = "<group>"; };
 		87E8CB81899E1EDA02B677F9 /* AcpClientTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AcpClientTests.swift; sourceTree = "<group>"; };
@@ -277,6 +281,7 @@
 				FBDFA0DF725244691C0496A5 /* Info.plist */,
 				D624AF2C46BA83B73A21F0B3 /* KaisolaMacAppDelegate.swift */,
 				6E78A73E4BF5DABAB5BF6826 /* NativePreviewPaths.swift */,
+				081788CB50A2F8085E0929CE /* NativePreviewSettings.swift */,
 			);
 			path = App;
 			sourceTree = "<group>";
@@ -294,6 +299,7 @@
 				991FCF32D009E1236EBF19A5 /* BrokerModelsTests.swift */,
 				A451FC25E152BC8B61FB5702 /* BrokerReconnectBackoffTests.swift */,
 				A7E57351BA3A72C99024DAEC /* BrokerStartupCoordinatorTests.swift */,
+				6AE795C503468AA7CEC0D736 /* NativePreviewSettingsTests.swift */,
 				5C89B154EE5DAF4AFF41692D /* NativeTerminalInteractionTests.swift */,
 				FA616801D125F0ACE1E5A177 /* NativeUpdateConfigurationTests.swift */,
 				AF52791E7FB87F94AF30DBD2 /* NoBoardBoundaryTests.swift */,
@@ -520,6 +526,7 @@
 				B5B4FC5437DED715B8B1883F /* BrokerStartupCoordinator.swift in Sources */,
 				D03FE4B6FB7FD213CB76997A /* KaisolaMacAppDelegate.swift in Sources */,
 				98DAE6676A641D45F023DA05 /* NativePreviewPaths.swift in Sources */,
+				5BDE35CC5251CC2B24071508 /* NativePreviewSettings.swift in Sources */,
 				59BCC3DD2AF57DF38A059A59 /* NativeSessionStore.swift in Sources */,
 				E2A8476205D4F2F478EBCA17 /* NativeTerminalSurface.swift in Sources */,
 				F284EEE4E31C73067657316E /* NativeUpdateConfiguration.swift in Sources */,
@@ -548,6 +555,7 @@
 				AA39C33375202BD9300CE951 /* BrokerModelsTests.swift in Sources */,
 				A5F88CF039D35506FC38BDC3 /* BrokerReconnectBackoffTests.swift in Sources */,
 				084F36B58D6099BB7087351A /* BrokerStartupCoordinatorTests.swift in Sources */,
+				ECFF15A752EF728A9A020FA1 /* NativePreviewSettingsTests.swift in Sources */,
 				970B14F97569D7C4D1267587 /* NativeTerminalInteractionTests.swift in Sources */,
 				500B3ACA2C51DF78516C55F0 /* NativeUpdateConfigurationTests.swift in Sources */,
 				C5D7FD2E209D40C0C1CB9724 /* NoBoardBoundaryTests.swift in Sources */,

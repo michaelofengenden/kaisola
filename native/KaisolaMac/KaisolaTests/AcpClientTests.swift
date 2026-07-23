@@ -64,7 +64,10 @@ final class AcpClientTests: XCTestCase {
         XCTAssertTrue(conversation.isConnected)
 
         conversation.send("hello")
-        let deadline = Date().addingTimeInterval(3)
+        // Generous deadline: dispatch awaits a pre-turn git checkpoint before the
+        // prompt is even sent, and a loaded CI runner can make that first git
+        // spawn slow. A too-tight bound flakes on latency, not on a real stall.
+        let deadline = Date().addingTimeInterval(15)
         while conversation.isRunning || !conversation.rows.contains(where: { if case .message = $0 { return true } else { return false } }) {
             if Date() > deadline { XCTFail("stream did not complete"); break }
             try await Task.sleep(nanoseconds: 20_000_000)

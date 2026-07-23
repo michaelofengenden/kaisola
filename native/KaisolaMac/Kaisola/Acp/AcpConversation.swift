@@ -52,6 +52,14 @@ final class AcpConversation: ObservableObject {
     /// row's Identifiable id, so `retryFailed` can re-send the exact payload
     /// (attachments included) rather than a text-only prompt.
     private var failedSends: [String: (text: String, attachments: [AcpAttachment])] = [:]
+
+    /// Streams client events to `consume` IN ORDER. The client fires its handler
+    /// from an actor off the main thread; yielding into one AsyncStream (drained
+    /// by a single MainActor task) preserves event order — spawning a separate
+    /// `Task { @MainActor }` per event does not, so a `tool_call_update` could
+    /// race ahead of its `tool_call`, or `turnEnded` ahead of the message chunks.
+    private var eventContinuation: AsyncStream<AcpEvent>.Continuation?
+    private var eventConsumerTask: Task<Void, Never>?
     /// Pre-turn working-tree snapshots (git stash create), restorable from the
     /// header. Present only when the workspace is a git repo with changes.
     @Published private(set) var checkpoints: [TurnCheckpoint] = []
@@ -136,8 +144,17 @@ final class AcpConversation: ObservableObject {
     }
 
     func start() async {
-        await client.setEventHandler { [weak self] event in
-            Task { @MainActor in self?.consume(event) }
+        // One ordered pipe from the client's (off-main) event handler to the
+        // MainActor consumer: yields preserve order, and a single draining task
+        // consumes them serially. The handler captures the continuation (not
+        // self) so it stays Sendable without touching main-actor state.
+        let (stream, continuation) = AsyncStream<AcpEvent>.makeStream(bufferingPolicy: .unbounded)
+        eventContinuation = continuation
+        eventConsumerTask = Task { @MainActor [weak self] in
+            for await event in stream { self?.consume(event) }
+        }
+        await client.setEventHandler { event in
+            continuation.yield(event)
         }
         await client.configureFsGuard(sensitiveGlobs: sensitiveGlobs)
         do {
@@ -392,6 +409,10 @@ final class AcpConversation: ObservableObject {
     }
 
     func stop() {
+        eventContinuation?.finish()
+        eventContinuation = nil
+        eventConsumerTask?.cancel()
+        eventConsumerTask = nil
         Task { await client.stop() }
     }
 

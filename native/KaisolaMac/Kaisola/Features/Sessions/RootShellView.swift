@@ -6,6 +6,7 @@ struct RootShellView: View {
     @EnvironmentObject private var settings: NativePreviewSettings
     @State private var renameTarget: String?
     @State private var renameText: String = ""
+    @State private var gitRepo: URL?
 
     private var sidebarSelection: Binding<String?> {
         Binding(
@@ -34,6 +35,19 @@ struct RootShellView: View {
             }
             .onAppear {
                 renameText = model.sessions.first(where: { $0.id == target.id })?.title ?? ""
+            }
+        }
+        .sheet(item: Binding(get: { gitRepo.map(GitRepoID.init) }, set: { gitRepo = $0?.url })) { repo in
+            VStack(spacing: 0) {
+                HStack {
+                    Text(repo.url.lastPathComponent).font(.headline)
+                    Spacer()
+                    Button("Done") { gitRepo = nil }.keyboardShortcut(.defaultAction)
+                }
+                .padding(12)
+                Divider()
+                GitPanelView(repoRoot: repo.url)
+                    .frame(width: 520, height: 460)
             }
         }
     }
@@ -113,6 +127,9 @@ struct RootShellView: View {
         .contextMenu {
             if model.isOwned(session.id) {
                 Button("Rename…") { renameTarget = session.id }
+                if let dir = model.directory(for: session.id) {
+                    Button("Git Panel…") { gitRepo = dir }
+                }
                 if !session.exited {
                     Button("End Session", role: .destructive) {
                         Task { await model.endSession(session.id) }
@@ -363,6 +380,9 @@ private struct ChatRow: View {
 
 /// Identifiable wrapper so a session id can drive a `.sheet(item:)`.
 private struct RenameID: Identifiable { let id: String }
+
+/// Identifiable wrapper so a repo URL can drive a `.sheet(item:)`.
+private struct GitRepoID: Identifiable { let url: URL; var id: String { url.path } }
 
 private struct RenameSheet: View {
     @Binding var text: String

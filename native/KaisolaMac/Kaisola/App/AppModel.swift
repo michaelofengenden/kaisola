@@ -110,6 +110,12 @@ final class AppModel: ObservableObject {
         ownedTerminalIDs.contains(terminalID)
     }
 
+    /// The working directory of an owned session (for the Git panel). Observed
+    /// Electron terminals have no known local directory here.
+    func directory(for terminalID: String) -> URL? {
+        sessionStore.sessions().first { $0.id == terminalID }.map { URL(fileURLWithPath: $0.cwd) }
+    }
+
     // MARK: - ACP chats
 
     /// Open a new ACP chat with the given agent in a directory. The adapter is

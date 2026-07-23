@@ -9,6 +9,8 @@
 /* Begin PBXBuildFile section */
 		084F36B58D6099BB7087351A /* BrokerStartupCoordinatorTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A7E57351BA3A72C99024DAEC /* BrokerStartupCoordinatorTests.swift */; };
 		0B95CB6DB59DBD720A65A98E /* ObserveOnlyBrokerClient.swift in Sources */ = {isa = PBXBuildFile; fileRef = CA0225E687EE0462F0D9C548 /* ObserveOnlyBrokerClient.swift */; };
+		0D03FEEA4FCFE67D5204F5BE /* GitServiceTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 73C156565BA4025A74960AD9 /* GitServiceTests.swift */; };
+		0D3E13FDB264A6EBAE5510BE /* GitPanelView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9586CAAF5EE496B213F01998 /* GitPanelView.swift */; };
 		0D4A39DA0B681BD534EA239F /* AcpAdapterResolver.swift in Sources */ = {isa = PBXBuildFile; fileRef = BC20168C86DDDBA7D70222F3 /* AcpAdapterResolver.swift */; };
 		143B9FBEC29D4FD6104DD505 /* BrokerModels.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8D98396E44670C6412BE1415 /* BrokerModels.swift */; };
 		15B7789EF6CCF94F2416E478 /* KaisolaBrokerProtocol in Frameworks */ = {isa = PBXBuildFile; productRef = 35E6E0DC943424C3E5094F7F /* KaisolaBrokerProtocol */; };
@@ -62,6 +64,7 @@
 		D1A6765808A570660500E109 /* AcpClientTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 87E8CB81899E1EDA02B677F9 /* AcpClientTests.swift */; };
 		D2FF6C769EE7E9EAA8AAC903 /* SwiftTermStressTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4C1E742D2099046E14888F80 /* SwiftTermStressTests.swift */; };
 		D478A5901D0C96CE5D108C4A /* TerminalDocument.swift in Sources */ = {isa = PBXBuildFile; fileRef = 13BFA68C0E2E3E83379B2835 /* TerminalDocument.swift */; };
+		E194962BA4576600B9DA79DE /* GitService.swift in Sources */ = {isa = PBXBuildFile; fileRef = 616586FF6B1EBC62BE203518 /* GitService.swift */; };
 		E2A8476205D4F2F478EBCA17 /* NativeTerminalSurface.swift in Sources */ = {isa = PBXBuildFile; fileRef = E66C339455BFF598A81C41DE /* NativeTerminalSurface.swift */; };
 		E6654BD397157414CD77460C /* AcpProcessIntegrationTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9FAD1CF1DFF4378CF3677E4A /* AcpProcessIntegrationTests.swift */; };
 		E6781527DAD43EDB96DBD461 /* BrokerHelperPackage.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3CE14B47B11FF8AEDD22CC1A /* BrokerHelperPackage.swift */; };
@@ -114,9 +117,11 @@
 		58663742F2D4497A3D234BF7 /* BrokerLaunchConfiguration.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BrokerLaunchConfiguration.swift; sourceTree = "<group>"; };
 		5C89B154EE5DAF4AFF41692D /* NativeTerminalInteractionTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NativeTerminalInteractionTests.swift; sourceTree = "<group>"; };
 		5D434A4435BCB68FD69050A4 /* ObserveOnlyBrokerPolicy.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ObserveOnlyBrokerPolicy.swift; sourceTree = "<group>"; };
+		616586FF6B1EBC62BE203518 /* GitService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GitService.swift; sourceTree = "<group>"; };
 		6647914275EC9AD4E4A1C04B /* BrokerBootstrapMain.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BrokerBootstrapMain.swift; sourceTree = "<group>"; };
 		6AE795C503468AA7CEC0D736 /* NativePreviewSettingsTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NativePreviewSettingsTests.swift; sourceTree = "<group>"; };
 		6E78A73E4BF5DABAB5BF6826 /* NativePreviewPaths.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NativePreviewPaths.swift; sourceTree = "<group>"; };
+		73C156565BA4025A74960AD9 /* GitServiceTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GitServiceTests.swift; sourceTree = "<group>"; };
 		7DE33FAC2761474B7B6A46A2 /* ObserveOnlyBrokerPolicyTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ObserveOnlyBrokerPolicyTests.swift; sourceTree = "<group>"; };
 		87E8CB81899E1EDA02B677F9 /* AcpClientTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AcpClientTests.swift; sourceTree = "<group>"; };
 		8A7A17FC91F373F5881DB97C /* BrokerReconnectBackoff.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BrokerReconnectBackoff.swift; sourceTree = "<group>"; };
@@ -125,6 +130,7 @@
 		8FD5419F311EE385C8A43CD8 /* BrokerBootstrapService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BrokerBootstrapService.swift; sourceTree = "<group>"; };
 		90A94C83E7A4D1EB77644187 /* kaisola-icon.icns */ = {isa = PBXFileReference; lastKnownFileType = image.icns; path = "kaisola-icon.icns"; sourceTree = "<group>"; };
 		93A5794337909F4D5F4C7A54 /* KaisolaMacPreviewTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = KaisolaMacPreviewTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
+		9586CAAF5EE496B213F01998 /* GitPanelView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GitPanelView.swift; sourceTree = "<group>"; };
 		96E5D09B49E862C088D584E8 /* TerminalCursorStoreTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TerminalCursorStoreTests.swift; sourceTree = "<group>"; };
 		96F1989B7416C050648E9CAB /* ObserveOnlyBrokerClientTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ObserveOnlyBrokerClientTests.swift; sourceTree = "<group>"; };
 		991FCF32D009E1236EBF19A5 /* BrokerModelsTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BrokerModelsTests.swift; sourceTree = "<group>"; };
@@ -204,6 +210,7 @@
 				C131D090B01AB3367C562B7E /* App */,
 				E67FF59E24CA8E30D69906E5 /* Broker */,
 				B2BF6C29213F0CDAC2846C62 /* Features */,
+				68463A4C18DB7D5892F72F4E /* Git */,
 				503C81FECD70EE66D684E00B /* Updates */,
 			);
 			path = Kaisola;
@@ -235,6 +242,15 @@
 				5245B06FDE5E37D212A59E72 /* NativeUpdateController.swift */,
 			);
 			path = Updates;
+			sourceTree = "<group>";
+		};
+		68463A4C18DB7D5892F72F4E /* Git */ = {
+			isa = PBXGroup;
+			children = (
+				9586CAAF5EE496B213F01998 /* GitPanelView.swift */,
+				616586FF6B1EBC62BE203518 /* GitService.swift */,
+			);
+			path = Git;
 			sourceTree = "<group>";
 		};
 		6E798A0DDEE2A309AAC04C49 /* Packages */ = {
@@ -299,6 +315,7 @@
 				991FCF32D009E1236EBF19A5 /* BrokerModelsTests.swift */,
 				A451FC25E152BC8B61FB5702 /* BrokerReconnectBackoffTests.swift */,
 				A7E57351BA3A72C99024DAEC /* BrokerStartupCoordinatorTests.swift */,
+				73C156565BA4025A74960AD9 /* GitServiceTests.swift */,
 				6AE795C503468AA7CEC0D736 /* NativePreviewSettingsTests.swift */,
 				5C89B154EE5DAF4AFF41692D /* NativeTerminalInteractionTests.swift */,
 				FA616801D125F0ACE1E5A177 /* NativeUpdateConfigurationTests.swift */,
@@ -524,6 +541,8 @@
 				143B9FBEC29D4FD6104DD505 /* BrokerModels.swift in Sources */,
 				51632AA5B21B3F1D0BF0A4F4 /* BrokerReconnectBackoff.swift in Sources */,
 				B5B4FC5437DED715B8B1883F /* BrokerStartupCoordinator.swift in Sources */,
+				0D3E13FDB264A6EBAE5510BE /* GitPanelView.swift in Sources */,
+				E194962BA4576600B9DA79DE /* GitService.swift in Sources */,
 				D03FE4B6FB7FD213CB76997A /* KaisolaMacAppDelegate.swift in Sources */,
 				98DAE6676A641D45F023DA05 /* NativePreviewPaths.swift in Sources */,
 				5BDE35CC5251CC2B24071508 /* NativePreviewSettings.swift in Sources */,
@@ -555,6 +574,7 @@
 				AA39C33375202BD9300CE951 /* BrokerModelsTests.swift in Sources */,
 				A5F88CF039D35506FC38BDC3 /* BrokerReconnectBackoffTests.swift in Sources */,
 				084F36B58D6099BB7087351A /* BrokerStartupCoordinatorTests.swift in Sources */,
+				0D03FEEA4FCFE67D5204F5BE /* GitServiceTests.swift in Sources */,
 				ECFF15A752EF728A9A020FA1 /* NativePreviewSettingsTests.swift in Sources */,
 				970B14F97569D7C4D1267587 /* NativeTerminalInteractionTests.swift in Sources */,
 				500B3ACA2C51DF78516C55F0 /* NativeUpdateConfigurationTests.swift in Sources */,

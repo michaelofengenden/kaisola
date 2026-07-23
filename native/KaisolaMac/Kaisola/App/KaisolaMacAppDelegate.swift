@@ -93,6 +93,12 @@ final class KaisolaMacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDele
         RootShellView.promptForNewTerminal(model: model)
     }
 
+    @objc private func newAgentSession(_ sender: Any?) {
+        guard let item = sender as? NSMenuItem,
+              let agent = AgentRegistry.profile(id: item.representedObject as? String ?? "") else { return }
+        RootShellView.promptForNewAgent(agent, model: model)
+    }
+
     private func installMainMenu() {
         NSApp.mainMenu = Self.makeMainMenu(
             updateTarget: self,
@@ -100,7 +106,9 @@ final class KaisolaMacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDele
             updateEnabled: updateController.availability.canCheck,
             updateDetail: updateController.availability.detail,
             newTerminalTarget: self,
-            newTerminalAction: #selector(newTerminalSession(_:))
+            newTerminalAction: #selector(newTerminalSession(_:)),
+            newAgentTarget: self,
+            newAgentAction: #selector(newAgentSession(_:))
         )
     }
 
@@ -113,7 +121,9 @@ final class KaisolaMacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDele
         updateEnabled: Bool,
         updateDetail: String?,
         newTerminalTarget: AnyObject? = nil,
-        newTerminalAction: Selector? = nil
+        newTerminalAction: Selector? = nil,
+        newAgentTarget: AnyObject? = nil,
+        newAgentAction: Selector? = nil
     ) -> NSMenu {
         let mainMenu = NSMenu()
         let applicationItem = NSMenuItem()
@@ -155,6 +165,16 @@ final class KaisolaMacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDele
             keyEquivalent: "t"
         )
         newTerminal.target = newTerminalTarget
+        if let newAgentAction {
+            let agentItem = fileMenu.addItem(withTitle: "New Agent Session", action: nil, keyEquivalent: "")
+            let agentMenu = NSMenu(title: "New Agent Session")
+            for agent in AgentRegistry.all {
+                let item = agentMenu.addItem(withTitle: agent.name, action: newAgentAction, keyEquivalent: "")
+                item.target = newAgentTarget
+                item.representedObject = agent.id
+            }
+            agentItem.submenu = agentMenu
+        }
         fileItem.submenu = fileMenu
         mainMenu.addItem(fileItem)
 

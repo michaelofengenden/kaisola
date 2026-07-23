@@ -122,6 +122,54 @@ final class NativeTerminalInteractionTests: XCTestCase {
         XCTAssertEqual(captured, ["ls -la\r"])
     }
 
+    func testHistoricalTerminalQueriesNeverLeakRepliesIntoLiveShell() {
+        let coordinator = NativeTerminalSurface.Coordinator()
+        var captured: [String] = []
+        coordinator.onInput = { captured.append($0) }
+        let view = OwnedTerminalView(
+            frame: NSRect(x: 0, y: 0, width: 640, height: 320),
+            font: NSFont.monospacedSystemFont(ofSize: 13, weight: .regular)
+        )
+        view.terminalDelegate = coordinator
+        view.configureTerminalTheme(light: true, mode: .native)
+
+        // These are the exact families seen in the corrupted prompt screenshot:
+        // cursor position plus foreground/background color queries. Replaying a
+        // retained snapshot must render them without writing their answers back
+        // into the shell that produced the snapshot earlier.
+        coordinator.apply(
+            output: "prompt % \u{1B}[6n\u{1B}]10;?\u{7}\u{1B}]11;?\u{7}",
+            epoch: "epoch-a",
+            endOffset: 29,
+            to: view
+        )
+        XCTAssertTrue(captured.isEmpty)
+    }
+
+    func testFreshTerminalQueryStillReceivesAReply() {
+        let coordinator = NativeTerminalSurface.Coordinator()
+        var captured: [String] = []
+        coordinator.onInput = { captured.append($0) }
+        let view = OwnedTerminalView(
+            frame: NSRect(x: 0, y: 0, width: 640, height: 320),
+            font: NSFont.monospacedSystemFont(ofSize: 13, weight: .regular)
+        )
+        view.terminalDelegate = coordinator
+        view.configureTerminalTheme(light: true, mode: .native)
+
+        coordinator.apply(output: "", epoch: "epoch-a", endOffset: 0, to: view)
+        let query = "\u{1B}[6n"
+        coordinator.apply(
+            output: query,
+            epoch: "epoch-a",
+            endOffset: Int64(query.utf8.count),
+            to: view
+        )
+
+        XCTAssertFalse(captured.isEmpty)
+        XCTAssertTrue(captured.joined().contains("R"))
+    }
+
     func testReadOnlyViewStillDropsAllPTYBoundBytes() {
         let view = ReadOnlyTerminalView(
             frame: .zero,

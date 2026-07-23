@@ -31,25 +31,26 @@ final class AppModelProjectContextTests: XCTestCase {
 
     @MainActor
     func testSingleProjectIsUnambiguousContext() {
-        let (model, store) = makeModel()
-        _ = store.openProject(directory: "/tmp/ctx-solo")
+        let (model, _) = makeModel()
+        model.openProject(directory: URL(fileURLWithPath: "/tmp/ctx-solo", isDirectory: true))
         XCTAssertEqual(model.currentProjectDirectory?.lastPathComponent, "ctx-solo")
     }
 
     @MainActor
     func testSelectedProjectNameWins() {
-        let (model, store) = makeModel()
-        _ = store.openProject(directory: "/tmp/ctx-alpha")
-        _ = store.openProject(directory: "/tmp/ctx-beta")
+        let (model, _) = makeModel()
+        model.openProject(directory: URL(fileURLWithPath: "/tmp/ctx-alpha", isDirectory: true))
+        model.openProject(directory: URL(fileURLWithPath: "/tmp/ctx-beta", isDirectory: true))
         model.selectedProjectName = "ctx-beta"
         XCTAssertEqual(model.currentProjectDirectory?.lastPathComponent, "ctx-beta")
     }
 
     @MainActor
     func testAmbiguousWithoutSelectionReturnsNil() {
-        let (model, store) = makeModel()
-        _ = store.openProject(directory: "/tmp/ctx-one")
-        _ = store.openProject(directory: "/tmp/ctx-two")
+        let (model, _) = makeModel()
+        model.openProject(directory: URL(fileURLWithPath: "/tmp/ctx-one", isDirectory: true))
+        model.openProject(directory: URL(fileURLWithPath: "/tmp/ctx-two", isDirectory: true))
+        model.activateProject(id: nil)
         // Two projects, nothing selected → no unambiguous context.
         XCTAssertNil(model.currentProjectDirectory)
     }
@@ -66,13 +67,14 @@ final class AppModelProjectContextTests: XCTestCase {
         XCTAssertEqual(project.directory?.path, directory.path)
         XCTAssertEqual(model.chats(in: project.id).count, 1)
         XCTAssertEqual(model.chats.first?.projectID, project.id)
+        XCTAssertEqual(model.selectedProjectID, project.id)
         XCTAssertEqual(model.selectedProjectName, project.name)
 
         if let chatID = model.chats.first?.id { model.closeChat(chatID) }
     }
 
     @MainActor
-    func testSwitchingProjectDoesNotLeakAnotherProjectsChat() throws {
+    func testSwitchingProjectRestoresASurfaceInsideThatProject() throws {
         let (model, _) = makeModel()
         let agent = try XCTUnwrap(AgentRegistry.all.first { AcpAdapter.forAgent($0.id) != nil })
         let first = URL(fileURLWithPath: "/tmp/ctx-chat-a", isDirectory: true)
@@ -80,12 +82,15 @@ final class AppModelProjectContextTests: XCTestCase {
         model.openChat(agent, inDirectory: first)
         let firstChat = try XCTUnwrap(model.chats.first)
         model.openChat(agent, inDirectory: second)
+        let secondChat = try XCTUnwrap(model.chats.last)
         let secondProject = try XCTUnwrap(model.projects.first { $0.directory?.path == second.path })
 
         model.selectChat(firstChat.id)
         XCTAssertEqual(model.selectedChatID, firstChat.id)
-        model.activateProject(named: secondProject.name)
-        XCTAssertNil(model.selectedChatID)
+        model.activateProject(id: secondProject.id)
+        XCTAssertEqual(model.selectedProjectID, secondProject.id)
+        XCTAssertEqual(model.selectedChatID, secondChat.id)
+        XCTAssertNotEqual(model.selectedChatID, firstChat.id)
 
         for chat in model.chats { model.closeChat(chat.id) }
     }

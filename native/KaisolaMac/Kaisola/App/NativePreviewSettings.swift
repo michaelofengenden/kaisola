@@ -274,12 +274,17 @@ struct SidebarBackdropView: View {
                 NativeVisualEffectView(material: .sidebar)
                 LinearGradient(
                     colors: [
-                        Color.white.opacity(colorScheme == .dark ? 0.025 : 0.18),
-                        Color.accentColor.opacity(colorScheme == .dark ? 0.055 : 0.035),
+                        Color.white.opacity(colorScheme == .dark ? 0.045 : 0.075),
+                        Color.accentColor.opacity(colorScheme == .dark ? 0.065 : 0.025),
                         Color.clear,
                     ],
                     startPoint: .topLeading,
                     endPoint: .bottomTrailing
+                )
+                LinearGradient(
+                    colors: [Color.white.opacity(colorScheme == .dark ? 0.02 : 0.13), .clear],
+                    startPoint: .top,
+                    endPoint: UnitPoint(x: 0.5, y: 0.26)
                 )
             }
         case .solid:

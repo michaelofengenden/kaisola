@@ -20,6 +20,7 @@ struct CommandPaletteView: View {
 
     @State private var query = ""
     @State private var selection = 0
+    @State private var projectFiles: [String] = []
     @FocusState private var searchFocused: Bool
 
     var body: some View {
@@ -62,6 +63,13 @@ struct CommandPaletteView: View {
         .overlay(RoundedRectangle(cornerRadius: 12).strokeBorder(.quaternary))
         .shadow(radius: 24, y: 8)
         .onAppear { searchFocused = true }
+        .task(id: model.currentProjectDirectory?.standardizedFileURL.path) {
+            guard let root = model.currentProjectDirectory else {
+                projectFiles = []
+                return
+            }
+            projectFiles = await ProjectFileIndex.shared.files(for: root)
+        }
         .onKeyPress(.downArrow) { move(1); return .handled }
         .onKeyPress(.upArrow) { move(-1); return .handled }
         .onKeyPress(.escape) { isPresented = false; return .handled }
@@ -101,7 +109,7 @@ struct CommandPaletteView: View {
     /// Fuzzy file candidates from the active project (bounded, TTL-cached).
     private func fileItems() -> [PaletteItem] {
         guard let root = model.currentProjectDirectory else { return [] }
-        return ProjectFileIndex.shared.files(for: root).map { relative in
+        return projectFiles.map { relative in
             PaletteItem(id: "file.\(relative)", title: relative, subtitle: "File", systemImage: "doc.text") {
                 model.previewedFileURL = root.appendingPathComponent(relative)
             }
@@ -177,7 +185,7 @@ struct CommandPaletteView: View {
         }
 
         // Quick Actions for the active project run straight from the palette.
-        if let active = model.projects.first(where: { $0.name == (model.selectedProjectName ?? model.projects.first?.name) }),
+        if let active = model.projects.first(where: { $0.id == (model.selectedProjectID ?? model.projects.first?.id) }),
            let activeDir = active.directory {
             for action in QuickActionStore().actions(forProject: active.id) {
                 items.append(PaletteItem(
@@ -193,7 +201,7 @@ struct CommandPaletteView: View {
 
         for project in model.projects {
             items.append(PaletteItem(id: "project.\(project.id)", title: project.name, subtitle: "Project", systemImage: "folder.fill") {
-                model.selectedProjectName = project.name
+                model.activateProject(id: project.id)
             })
         }
         for session in model.sessions {

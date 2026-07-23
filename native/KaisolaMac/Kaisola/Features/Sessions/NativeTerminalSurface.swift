@@ -78,6 +78,15 @@ struct NativeTerminalSurface: NSViewRepresentable {
         private var renderedStartOffset: Int64?
         private var renderedEndOffset: Int64?
         private var hasRendered = false
+        /// Reconstructing a terminal view means feeding retained PTY history
+        /// through SwiftTerm again. That history can contain cursor/color/device
+        /// queries. SwiftTerm correctly answers those queries through `send`,
+        /// but answering a historical query a second time injects replies such
+        /// as `ESC[1;1R` and `OSC 11;rgb:...` into the *live* shell. The shell is
+        /// usually back at a prompt by then, so the replies become visible input
+        /// and corrupt the next command. Suppress only reconstruction replies;
+        /// fresh incremental output still receives normal terminal responses.
+        private var suppressReplayReplies = false
 
         // Sticky-scroll pinning (Electron parity). While `userUnpinned` is false
         // the surface snaps back to the newest output after every feed so it
@@ -99,7 +108,7 @@ struct NativeTerminalSurface: NSViewRepresentable {
             let startOffset = endOffset.map { $0 - outputBytes }
 
             if !hasRendered {
-                if !output.isEmpty { feed(output, to: view) }
+                if !output.isEmpty { feed(output, to: view, suppressReplies: true) }
                 renderedEpoch = epoch
                 renderedStartOffset = startOffset
                 renderedEndOffset = endOffset
@@ -122,7 +131,7 @@ struct NativeTerminalSurface: NSViewRepresentable {
                     let bytesToSkip = oldEnd - newStart
                     if let suffix = outputSuffix(output, droppingUTF8Bytes: bytesToSkip),
                        Int64(suffix.utf8.count) == newEnd - oldEnd {
-                        feed(suffix, to: view)
+                        feed(suffix, to: view, suppressReplies: false)
                         renderedStartOffset = newStart
                         renderedEndOffset = newEnd
                         return
@@ -136,7 +145,7 @@ struct NativeTerminalSurface: NSViewRepresentable {
                 // prior scroll targeted the now-discarded scrollback, so re-pin to
                 // live output (Electron parity: remounts follow the newest bytes).
                 userUnpinned = false
-                if !output.isEmpty { feed(output, to: view) }
+                if !output.isEmpty { feed(output, to: view, suppressReplies: true) }
             }
             renderedEpoch = epoch
             renderedStartOffset = startOffset
@@ -151,9 +160,13 @@ struct NativeTerminalSurface: NSViewRepresentable {
         /// scroll callback the terminal emits during this window is treated as
         /// output-driven, never as a user scroll.
         @MainActor
-        private func feed(_ text: String, to view: ReadOnlyTerminalView) {
+        private func feed(_ text: String, to view: ReadOnlyTerminalView, suppressReplies: Bool) {
             isFeeding = true
-            defer { isFeeding = false }
+            suppressReplayReplies = suppressReplies
+            defer {
+                suppressReplayReplies = false
+                isFeeding = false
+            }
             view.feed(text: text)
             if !userUnpinned {
                 view.scrollToLiveBottom()
@@ -173,7 +186,7 @@ struct NativeTerminalSurface: NSViewRepresentable {
         func send(source: TerminalView, data: ArraySlice<UInt8>) {
             // Reached only from OwnedTerminalView: the read-only subclass
             // swallows every byte before the delegate can see it.
-            guard let onInput, !data.isEmpty else { return }
+            guard !suppressReplayReplies, let onInput, !data.isEmpty else { return }
             onInput(String(decoding: data, as: UTF8.self))
         }
 

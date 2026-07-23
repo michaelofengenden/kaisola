@@ -54,6 +54,10 @@ final class AppModel: ObservableObject {
     @Published var selectedChatID: String?
     /// The project tab shown in the top-bar layout. Nil means the first project.
     @Published var selectedProjectName: String?
+    /// Stable project identity used by interactive tabs/headers. Names are user
+    /// editable and can collide, so routing actions by display name made some
+    /// project tabs appear unclickable or target the wrong folder.
+    @Published private(set) var selectedProjectID: String?
     /// A file opened from the workspace rail / palette; non-nil replaces the
     /// detail pane with the preview/editor until closed.
     @Published var previewedFileURL: URL?
@@ -77,10 +81,21 @@ final class AppModel: ObservableObject {
     private var reconnectTask: Task<Void, Never>?
     private var cursorSaveTask: Task<Void, Never>?
     private var inventoryRefreshTask: Task<Void, Never>?
+    private var terminalResizeTasks: [String: Task<Void, Never>] = [:]
+    private var terminalResizeGeneration: [String: Int] = [:]
+    private var lastTerminalSize: [String: String] = [:]
     private var connectionGeneration = 0
     private var shouldReconnect = false
     private var hasStarted = false
     private let observerOwnerID = "native-preview"
+
+    /// Disk-backed navigation state is cached in memory. `projects` is read by
+    /// many SwiftUI branches on every streamed terminal update; decoding two
+    /// JSON files repeatedly there turned normal output into main-thread I/O
+    /// and was the largest source of the spinning cursor after opening folders.
+    var persistedOpenProjects: [OpenProject] = []
+    var persistedOwnedSessions: [NativeOwnedSession] = []
+    var persistedPinnedIDs: Set<String> = []
 
     init(
         brokerPreparer: any BrokerInfoPreparing = BrokerStartupCoordinator.live(),
@@ -109,6 +124,9 @@ final class AppModel: ObservableObject {
         self.reconnectBackoff = reconnectBackoff
         self.sleep = sleep
         self.jitter = jitter
+        persistedOpenProjects = sessionStore.projects()
+        persistedOwnedSessions = sessionStore.sessions()
+        persistedPinnedIDs = SessionPinStore().pins()
     }
 
     /// Keeps the per-chat usage observers alive for this window's lifetime.
@@ -137,16 +155,16 @@ final class AppModel: ObservableObject {
     }
 
     var projects: [ProjectGroup] {
-        let opened = sessionStore.projects()
+        let opened = persistedOpenProjects
         let openedByID = Dictionary(uniqueKeysWithValues: opened.map { ($0.id, $0) })
         let ownedByID = Dictionary(
-            sessionStore.sessions().map { ($0.projectID, $0) },
+            persistedOwnedSessions.map { ($0.projectID, $0) },
             uniquingKeysWith: { first, _ in first }
         )
         let sessionsByProject = Dictionary(grouping: sessions, by: \.projectID)
         let chatsByProject = Dictionary(grouping: chats, by: \.projectID)
         let meshesByProject = Dictionary(grouping: meshes, by: \.projectID)
-        let pins = SessionPinStore().pins()
+        let pins = persistedPinnedIDs
 
         func group(for id: String) -> ProjectGroup {
             let sessions = AppModel.pinnedOrder(sessionsByProject[id] ?? [], pinned: pins)
@@ -189,6 +207,15 @@ final class AppModel: ObservableObject {
         return openedGroups + sessionOnly
     }
 
+    /// Refresh the small persisted navigation snapshot at explicit mutation or
+    /// inventory boundaries — never during SwiftUI view evaluation.
+    func refreshPersistedNavigationState(publish: Bool = true) {
+        persistedOpenProjects = sessionStore.projects()
+        persistedOwnedSessions = sessionStore.sessions()
+        persistedPinnedIDs = SessionPinStore().pins()
+        if publish { objectWillChange.send() }
+    }
+
     func chats(in projectID: String) -> [AcpChatHandle] {
         chats.filter { $0.projectID == projectID }
     }
@@ -197,46 +224,75 @@ final class AppModel: ObservableObject {
         meshes.filter { $0.projectID == projectID }
     }
 
-    /// Switch the top-level workspace context. A surface from another project
-    /// must not remain visible under the newly selected tab.
-    func activateProject(named name: String?) {
-        selectedProjectName = name
-        guard let name, let project = projects.first(where: { $0.name == name }) else { return }
-
-        if let chatID = selectedChatID,
-           chats.first(where: { $0.id == chatID })?.projectID != project.id {
-            selectedChatID = nil
+    /// Switch the top-level workspace context by stable id, then restore a real
+    /// surface inside it. A project click is therefore an action, not a label
+    /// highlight that leaves another project's terminal visible underneath.
+    func activateProject(id: String?) {
+        guard let id, let project = projects.first(where: { $0.id == id }) else {
+            selectedProjectID = nil
+            selectedProjectName = nil
+            return
         }
-        if let meshID = selectedMeshID,
-           meshes.first(where: { $0.id == meshID })?.projectID != project.id {
-            selectedMeshID = nil
-        }
-        if let sessionID = selectedSessionID,
-           sessions.first(where: { $0.id == sessionID })?.projectID != project.id {
-            Task { await select(nil) }
-        }
+        selectedProjectID = project.id
+        selectedProjectName = project.name
         previewedFileURL = nil
         previewedFileLine = nil
         browserCardURL = nil
+
+        let selectedChatBelongsHere = selectedChatID.flatMap { selected in
+            chats.first(where: { $0.id == selected })?.projectID
+        } == project.id
+        let selectedMeshBelongsHere = selectedMeshID.flatMap { selected in
+            meshes.first(where: { $0.id == selected })?.projectID
+        } == project.id
+        let selectedTerminalBelongsHere = selectedSessionID.flatMap { selected in
+            sessions.first(where: { $0.id == selected })?.projectID
+        } == project.id
+        guard !selectedChatBelongsHere, !selectedMeshBelongsHere, !selectedTerminalBelongsHere else { return }
+
+        selectedChatID = nil
+        selectedMeshID = nil
+        if let terminal = project.sessions.first(where: { !$0.exited }) ?? project.sessions.first {
+            Task { await select(terminal.id) }
+        } else if let chat = chats(in: project.id).first {
+            selectChat(chat.id)
+        } else if let mesh = meshes(in: project.id).first {
+            selectMesh(mesh.id)
+        } else {
+            Task { await select(nil) }
+        }
+    }
+
+    /// Name-based compatibility for saved-window state and older callers.
+    func activateProject(named name: String?) {
+        guard let name else { activateProject(id: nil); return }
+        if let project = projects.first(where: { $0.name == name }) {
+            activateProject(id: project.id)
+        } else {
+            selectedProjectID = nil
+            selectedProjectName = name
+        }
     }
 
     func setProjectColor(id: String, colorHex: String?) {
         sessionStore.setProjectColor(id: id, colorHex: colorHex)
-        objectWillChange.send()
+        refreshPersistedNavigationState()
     }
 
     func moveProject(id: String, delta: Int) {
         sessionStore.moveProject(id: id, delta: delta)
-        objectWillChange.send()
+        refreshPersistedNavigationState()
     }
 
     func moveProject(id: String, toIndex: Int) {
         sessionStore.moveProject(id: id, toIndex: toIndex)
-        objectWillChange.send()
+        refreshPersistedNavigationState()
     }
 
     func relocateProject(id: String, to directory: URL) {
         if let relocated = sessionStore.relocateProject(id: id, toDirectory: directory.path) {
+            refreshPersistedNavigationState(publish: false)
+            selectedProjectID = relocated.id
             selectedProjectName = relocated.name
         }
         objectWillChange.send()
@@ -253,6 +309,8 @@ final class AppModel: ObservableObject {
     /// Open a folder as a project tab (persists even with no sessions).
     func openProject(directory: URL) {
         let project = sessionStore.openProject(directory: directory.path)
+        refreshPersistedNavigationState(publish: false)
+        selectedProjectID = project.id
         selectedProjectName = project.name
         objectWillChange.send()
     }
@@ -261,6 +319,8 @@ final class AppModel: ObservableObject {
         let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
         sessionStore.renameProject(id: id, name: trimmed)
+        refreshPersistedNavigationState(publish: false)
+        if selectedProjectID == id { selectedProjectName = trimmed }
         objectWillChange.send()
     }
 
@@ -268,12 +328,20 @@ final class AppModel: ObservableObject {
     /// just removes the tab from the persisted list.
     func closeProject(id: String) {
         sessionStore.closeProject(id: id)
+        refreshPersistedNavigationState(publish: false)
+        if selectedProjectID == id {
+            let fallback = projects.first { $0.id != id }
+            selectedProjectID = fallback?.id
+            selectedProjectName = fallback?.name
+        }
         objectWillChange.send()
     }
 
     /// Restore the most recently closed project tab (⌘⇧T) and select it.
     func reopenLastClosedProject() {
         if let restored = sessionStore.reopenLastClosedProject() {
+            refreshPersistedNavigationState(publish: false)
+            selectedProjectID = restored.id
             selectedProjectName = restored.name
         }
         objectWillChange.send()
@@ -284,7 +352,7 @@ final class AppModel: ObservableObject {
     /// The working directory of an owned session (for the Git panel). Observed
     /// Electron terminals have no known local directory here.
     func directory(for terminalID: String) -> URL? {
-        sessionStore.sessions().first { $0.id == terminalID }.map { URL(fileURLWithPath: $0.cwd) }
+        persistedOwnedSessions.first { $0.id == terminalID }.map { URL(fileURLWithPath: $0.cwd) }
     }
 
     /// The directory of the project the user is currently working in, used to
@@ -292,6 +360,11 @@ final class AppModel: ObservableObject {
     /// forcing a folder picker every time (matching the Electron workflow).
     /// Nil only when there's genuinely no project context to infer.
     var currentProjectDirectory: URL? {
+        if let id = selectedProjectID,
+           let project = projects.first(where: { $0.id == id }),
+           let directory = project.directory {
+            return directory
+        }
         if let name = selectedProjectName,
            let project = projects.first(where: { $0.name == name }),
            let directory = project.directory {
@@ -314,6 +387,8 @@ final class AppModel: ObservableObject {
     func openChat(_ agent: AgentProfile, inDirectory directory: URL) {
         guard let adapter = AcpAdapter.forAgent(agent.id) else { return }
         let project = sessionStore.openProject(directory: directory.path)
+        refreshPersistedNavigationState(publish: false)
+        selectedProjectID = project.id
         selectedProjectName = project.name
         let chatID = "chat-\(UUID().uuidString.lowercased().prefix(8))"
         let mcp = McpConfigStore(workspace: directory).servers()
@@ -387,6 +462,7 @@ final class AppModel: ObservableObject {
         if let chatID {
             if let projectID = chats.first(where: { $0.id == chatID })?.projectID,
                let project = projects.first(where: { $0.id == projectID }) {
+                selectedProjectID = project.id
                 selectedProjectName = project.name
             }
             selectedSessionID = nil
@@ -407,6 +483,8 @@ final class AppModel: ObservableObject {
         let agents = AgentRegistry.all.filter { AcpAdapter.forAgent($0.id) != nil }
         guard !agents.isEmpty else { return }
         let project = sessionStore.openProject(directory: directory.path)
+        refreshPersistedNavigationState(publish: false)
+        selectedProjectID = project.id
         selectedProjectName = project.name
         let mesh = MeshSession(
             baseDirectory: directory,
@@ -443,6 +521,7 @@ final class AppModel: ObservableObject {
         if let meshID {
             if let projectID = meshes.first(where: { $0.id == meshID })?.projectID,
                let project = projects.first(where: { $0.id == projectID }) {
+                selectedProjectID = project.id
                 selectedProjectName = project.name
             }
             selectedChatID = nil
@@ -538,6 +617,7 @@ final class AppModel: ObservableObject {
         selectedSession = next
         selectedSessionID = next.id
         if let project = projects.first(where: { $0.id == next.projectID }) {
+            selectedProjectID = project.id
             selectedProjectName = project.name
         }
         selectedChatID = nil
@@ -680,6 +760,7 @@ final class AppModel: ObservableObject {
             ))
             // Ensure the session's folder is a persistent project tab.
             sessionStore.openProject(directory: cwd)
+            refreshPersistedNavigationState(publish: false)
             ownedTerminalIDs.insert(terminalID)
             await refreshInventory()
             selectedSessionID = terminalID
@@ -728,7 +809,7 @@ final class AppModel: ObservableObject {
     /// The agent profile a session runs, or nil for a plain shell / observed
     /// Electron terminal.
     func agentProfile(for terminalID: String) -> AgentProfile? {
-        guard let stored = sessionStore.sessions().first(where: { $0.id == terminalID }),
+        guard let stored = persistedOwnedSessions.first(where: { $0.id == terminalID }),
               let agentID = stored.agentID else { return nil }
         return AgentRegistry.profile(id: agentID)
     }
@@ -740,13 +821,13 @@ final class AppModel: ObservableObject {
         Self.sessionDisplayTitle(
             for: record,
             visibleRecords: sessions,
-            storedSessions: sessionStore.sessions()
+            storedSessions: persistedOwnedSessions
         )
     }
 
     func sessionTitle(for terminalID: String) -> String {
         guard let record = sessions.first(where: { $0.id == terminalID }) else {
-            return sessionStore.sessions().first(where: { $0.id == terminalID })?.title ?? terminalID
+            return persistedOwnedSessions.first(where: { $0.id == terminalID })?.title ?? terminalID
         }
         return sessionTitle(for: record)
     }
@@ -754,7 +835,7 @@ final class AppModel: ObservableObject {
     /// The rename field edits the persisted base title, not a generated
     /// "Terminal 2" navigation label.
     func editableSessionTitle(for terminalID: String) -> String {
-        sessionStore.sessions().first(where: { $0.id == terminalID })?.title
+        persistedOwnedSessions.first(where: { $0.id == terminalID })?.title
             ?? sessions.first(where: { $0.id == terminalID })?.title
             ?? ""
     }
@@ -793,17 +874,17 @@ final class AppModel: ObservableObject {
     func renameSession(_ terminalID: String, to title: String) {
         let trimmed = title.trimmingCharacters(in: .whitespacesAndNewlines)
         guard isOwned(terminalID), !trimmed.isEmpty,
-              var stored = sessionStore.sessions().first(where: { $0.id == terminalID }) else { return }
+              var stored = persistedOwnedSessions.first(where: { $0.id == terminalID }) else { return }
         stored.title = trimmed
         sessionStore.upsert(stored)
-        objectWillChange.send()
+        refreshPersistedNavigationState()
     }
 
     /// A live OSC title from an owned session's terminal (SwiftTerm's
     /// setTerminalTitle). Auto-names the session unless the user renamed it.
     func applyAutoTitle(_ rawTitle: String, to terminalID: String) {
         guard isOwned(terminalID),
-              let stored = sessionStore.sessions().first(where: { $0.id == terminalID }) else { return }
+              let stored = persistedOwnedSessions.first(where: { $0.id == terminalID }) else { return }
         let agentName = agentProfile(for: terminalID)?.name
         let folder = (stored.cwd as NSString).lastPathComponent
         guard let auto = SessionTitleTracker.autoTitle(fromOSC: rawTitle, agentName: agentName, folder: folder) else { return }
@@ -814,7 +895,7 @@ final class AppModel: ObservableObject {
             userRenamed: sessionStore.hasCustomTitle(terminalID, defaultTitle: defaultTitle)
         ) else { return }
         sessionStore.applyAutoTitle(auto, terminalID: terminalID)
-        objectWillChange.send()
+        refreshPersistedNavigationState()
     }
 
     /// Keyboard bytes from an owned session's surface. Ownership is re-checked
@@ -838,7 +919,34 @@ final class AppModel: ObservableObject {
         guard controlAvailable, isOwned(terminalID),
               let record = sessions.first(where: { $0.id == terminalID }) else { return }
         let projectID = record.projectID
-        Task { try? await controlClient.resize(projectID: projectID, terminalID: terminalID, columns: columns, rows: rows) }
+        let sizeKey = "\(columns)x\(rows)"
+        guard lastTerminalSize[terminalID] != sizeKey || terminalResizeTasks[terminalID] != nil else { return }
+        let generation = (terminalResizeGeneration[terminalID] ?? 0) + 1
+        terminalResizeGeneration[terminalID] = generation
+        terminalResizeTasks[terminalID]?.cancel()
+        terminalResizeTasks[terminalID] = Task { [weak self] in
+            // AppKit emits a burst of transient dimensions during live resize,
+            // minimize, zoom, and equal-grid relayout. Send only the settled
+            // latest size so stale async requests cannot arrive out of order and
+            // make SwiftTerm reflow against yesterday's width.
+            try? await Task.sleep(nanoseconds: 40_000_000)
+            guard !Task.isCancelled, let self,
+                  self.terminalResizeGeneration[terminalID] == generation else { return }
+            do {
+                try await self.controlClient.resize(
+                    projectID: projectID,
+                    terminalID: terminalID,
+                    columns: columns,
+                    rows: rows
+                )
+                guard self.terminalResizeGeneration[terminalID] == generation else { return }
+                self.lastTerminalSize[terminalID] = sizeKey
+                self.terminalResizeTasks[terminalID] = nil
+            } catch {
+                guard self.terminalResizeGeneration[terminalID] == generation else { return }
+                self.terminalResizeTasks[terminalID] = nil
+            }
+        }
     }
 
     /// Ends an owned session for good: the PTY dies and the registry entry is
@@ -850,7 +958,7 @@ final class AppModel: ObservableObject {
         // Remember enough to recreate it (⌘⌥T), but do not mutate the local
         // registry unless the broker confirms the permanent close (or a
         // timeout races with a close that inventory can already prove).
-        let closedSession = sessionStore.sessions()
+        let closedSession = persistedOwnedSessions
             .first(where: { $0.id == terminalID })
             .map { ClosedSession(cwd: $0.cwd, agentID: $0.agentID, title: $0.title) }
         // terminal.kill leaves an exited diagnostic record behind; release is
@@ -868,6 +976,10 @@ final class AppModel: ObservableObject {
             sessionStore.pushClosedSession(closedSession)
         }
         sessionStore.remove(terminalID: terminalID)
+        refreshPersistedNavigationState(publish: false)
+        terminalResizeTasks.removeValue(forKey: terminalID)?.cancel()
+        terminalResizeGeneration.removeValue(forKey: terminalID)
+        lastTerminalSize.removeValue(forKey: terminalID)
         ownedTerminalIDs.remove(terminalID)
         if selectedSessionID == terminalID {
             selectedSessionID = nil
@@ -892,6 +1004,7 @@ final class AppModel: ObservableObject {
     /// The `list()` rows carry agent busy/completed fields, so this keeps every
     /// row's agent status current, not just the subscribed one.
     func refreshInventory() async {
+        refreshPersistedNavigationState(publish: false)
         guard connectionState.isConnected else { return }
         if let status = try? await client.inventory() {
             sessions = status.terminals
@@ -928,14 +1041,14 @@ final class AppModel: ObservableObject {
     private var lastBranchScan = Date.distantPast
 
     func branch(for terminalID: String) -> String? {
-        guard let cwd = sessionStore.sessions().first(where: { $0.id == terminalID })?.cwd else { return nil }
+        guard let cwd = persistedOwnedSessions.first(where: { $0.id == terminalID })?.cwd else { return nil }
         return branchesByCwd[cwd]
     }
 
     private func refreshBranches() {
         guard Date().timeIntervalSince(lastBranchScan) > 10 else { return }
         lastBranchScan = Date()
-        let cwds = Set(sessionStore.sessions().map(\.cwd))
+        let cwds = Set(persistedOwnedSessions.map(\.cwd))
         guard !cwds.isEmpty else { return }
         Task.detached(priority: .utility) { [weak self] in
             var result: [String: String] = [:]
@@ -989,8 +1102,9 @@ final class AppModel: ObservableObject {
         }
         controlAvailable = true
         sessionStore.recoverOwnedSessions(from: sessions)
+        refreshPersistedNavigationState(publish: false)
         var owned: Set<String> = []
-        for stored in sessionStore.sessions() {
+        for stored in persistedOwnedSessions {
             guard let record = sessions.first(where: { $0.id == stored.id }) else {
                 // This record may belong to the other broker in a dual-broker
                 // drain. Absence from the current inventory is not deletion.
@@ -1014,7 +1128,7 @@ final class AppModel: ObservableObject {
     /// drop the controller connection.
     func releaseOwnedSessionsForQuit() async {
         guard controlAvailable else { return }
-        for stored in sessionStore.sessions() where ownedTerminalIDs.contains(stored.id) {
+        for stored in persistedOwnedSessions where ownedTerminalIDs.contains(stored.id) {
             try? await controlClient.detachOwner(projectID: stored.projectID, terminalID: stored.id)
         }
         await controlClient.disconnect()
@@ -1028,6 +1142,10 @@ final class AppModel: ObservableObject {
         reconnectTask = nil
         inventoryRefreshTask?.cancel()
         inventoryRefreshTask = nil
+        for task in terminalResizeTasks.values { task.cancel() }
+        terminalResizeTasks.removeAll()
+        terminalResizeGeneration.removeAll()
+        lastTerminalSize.removeAll()
         cursorSaveTask?.cancel()
         cursorSaveTask = nil
         await persistCurrentCursor()

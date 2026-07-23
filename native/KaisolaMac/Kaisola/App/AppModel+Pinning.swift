@@ -4,26 +4,25 @@ import Foundation
 /// Session pinning: favorites the user floats to the top of their project
 /// group (Electron parity). State lives in a standalone `SessionPinStore`.
 ///
-/// The store is created per call (a cheap file read/write) rather than held as
-/// extension state — a Swift extension can't add stored properties, so there's
-/// no place to cache a single store instance here.
+/// Reads use AppModel's in-memory snapshot so streamed output never triggers
+/// disk I/O during view evaluation; writes refresh that snapshot immediately.
 extension AppModel {
     /// Toggle a session's pinned state, then republish so the sidebar reorders.
     func togglePin(_ terminalID: String) {
         let store = SessionPinStore()
-        store.setPinned(terminalID, !store.isPinned(terminalID))
-        objectWillChange.send()
+        store.setPinned(terminalID, !persistedPinnedIDs.contains(terminalID))
+        refreshPersistedNavigationState()
     }
 
     /// Whether a session is pinned to the top of its project group.
     func isPinned(_ terminalID: String) -> Bool {
-        SessionPinStore().isPinned(terminalID)
+        persistedPinnedIDs.contains(terminalID)
     }
 
     /// Order sessions for display: pinned rows first, then by title, stable
     /// within each group by original position.
     func pinnedSort(_ sessions: [BrokerTerminalRecord]) -> [BrokerTerminalRecord] {
-        AppModel.pinnedOrder(sessions, pinned: SessionPinStore().pins())
+        AppModel.pinnedOrder(sessions, pinned: persistedPinnedIDs)
     }
 
     /// Pure ordering behind `pinnedSort` with pin membership supplied

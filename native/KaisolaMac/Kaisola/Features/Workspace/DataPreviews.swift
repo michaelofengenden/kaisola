@@ -483,21 +483,29 @@ private struct JsonNodeRow: View {
 
 // MARK: - HTML
 
-/// Renders a local `.html`/`.htm` file in a JavaScript-disabled WKWebView whose
-/// navigation is confined to `file://` URLs inside the file's own directory —
-/// anything else is handed to the system browser. Mirrors `BrowserCardView`'s
-/// confinement pattern; meant to sit inside `FilePreviewView`, which supplies
-/// the outer file chrome, so this adds only a compact status header.
+/// Renders a local `.html`/`.htm` file in an ephemeral WKWebView. Project-local
+/// assets and scripts work by default, the header exposes an immediate JS kill
+/// switch, and top-level navigation remains confined to the project root.
+/// Explicit external links are handed to the system browser. This is embedded
+/// in `FilePreviewView`, which supplies the outer file chrome.
 struct HtmlFilePreview: View {
     let fileURL: URL
+    let readAccessRoot: URL?
 
     @State private var reloadToken = 0
+    @State private var allowsJavaScript = true
 
     var body: some View {
         VStack(spacing: 0) {
             header
             Divider()
-            ConfinedFileWebView(fileURL: fileURL, reloadToken: reloadToken)
+            ConfinedFileWebView(
+                fileURL: fileURL,
+                readAccessRoot: readAccessRoot,
+                allowsJavaScript: allowsJavaScript,
+                reloadToken: reloadToken
+            )
+            .id("\(fileURL.path)|js:\(allowsJavaScript)")
         }
         .background(Color(nsColor: .windowBackgroundColor))
     }
@@ -506,7 +514,7 @@ struct HtmlFilePreview: View {
         HStack(spacing: 10) {
             Image(systemName: "chevron.left.forwardslash.chevron.right")
                 .foregroundStyle(.secondary)
-            Text("Rendered HTML · JS off")
+            Text("Interactive HTML · isolated")
                 .font(.subheadline.weight(.medium))
             Text(fileURL.lastPathComponent)
                 .font(.subheadline)
@@ -514,6 +522,10 @@ struct HtmlFilePreview: View {
                 .lineLimit(1)
                 .truncationMode(.middle)
             Spacer(minLength: 12)
+            Toggle("JS", isOn: $allowsJavaScript)
+                .toggleStyle(.switch)
+                .controlSize(.mini)
+                .help("Allow scripts from this local project preview")
             Button {
                 reloadToken &+= 1
             } label: {
@@ -531,13 +543,14 @@ struct HtmlFilePreview: View {
     }
 }
 
-/// A WKWebView that renders a local HTML file read-only: JavaScript is disabled,
-/// the data store is non-persistent, read access is granted only to the file's
-/// directory, and link navigation is confined to `file://` targets inside that
-/// directory. Off-scope top-level navigations open in the system browser;
-/// off-scope subframes are dropped.
+/// A WKWebView with a non-persistent data store and project-confined file
+/// access. JavaScript follows the visible preview toggle. Explicit off-scope
+/// top-level links open in the system browser; other off-scope navigations are
+/// dropped.
 private struct ConfinedFileWebView: NSViewRepresentable {
     let fileURL: URL
+    let readAccessRoot: URL?
+    let allowsJavaScript: Bool
     let reloadToken: Int
 
     func makeCoordinator() -> Coordinator {
@@ -548,16 +561,19 @@ private struct ConfinedFileWebView: NSViewRepresentable {
         let configuration = WKWebViewConfiguration()
         // Ephemeral: rendering a local file must not touch on-disk cookies/cache.
         configuration.websiteDataStore = .nonPersistent()
-        // JS off: the preview is display-only; no page scripts execute.
+        // The web view is ephemeral and file-confined. Interactive mode is on
+        // by default so local app previews render like their Electron iframe;
+        // the header exposes a one-click JS kill switch.
         let pagePreferences = WKWebpagePreferences()
-        pagePreferences.allowsContentJavaScript = false
+        pagePreferences.allowsContentJavaScript = allowsJavaScript
         configuration.defaultWebpagePreferences = pagePreferences
+        configuration.preferences.javaScriptCanOpenWindowsAutomatically = false
 
         let webView = WKWebView(frame: .zero, configuration: configuration)
         webView.navigationDelegate = context.coordinator
         webView.setValue(false, forKey: "drawsBackground")
 
-        let directory = fileURL.deletingLastPathComponent()
+        let directory = effectiveReadAccessRoot
         let coordinator = context.coordinator
         coordinator.directory = directory
         coordinator.loadedURL = fileURL
@@ -570,7 +586,7 @@ private struct ConfinedFileWebView: NSViewRepresentable {
         let coordinator = context.coordinator
         // Retargeted at a different file (the pane was reused for another doc).
         if coordinator.loadedURL != fileURL {
-            let directory = fileURL.deletingLastPathComponent()
+            let directory = effectiveReadAccessRoot
             coordinator.directory = directory
             coordinator.loadedURL = fileURL
             webView.loadFileURL(fileURL, allowingReadAccessTo: directory)
@@ -580,6 +596,13 @@ private struct ConfinedFileWebView: NSViewRepresentable {
             coordinator.reloadToken = reloadToken
             webView.reload()
         }
+    }
+
+    private var effectiveReadAccessRoot: URL {
+        let fallback = fileURL.deletingLastPathComponent()
+        guard let candidate = readAccessRoot?.standardizedFileURL,
+              Coordinator.isContained(fileURL, in: candidate) else { return fallback }
+        return candidate
     }
 
     final class Coordinator: NSObject, WKNavigationDelegate {
@@ -599,14 +622,14 @@ private struct ConfinedFileWebView: NSViewRepresentable {
                 decisionHandler(.cancel)
                 return
             }
-            // Confine to file:// URLs inside the document's own directory (this
+            // Confine to file:// URLs inside the chosen project read root (this
             // also admits the initial load of the file itself).
             if target.isFileURL, let directory, Self.isContained(target, in: directory) {
                 decisionHandler(.allow)
                 return
             }
             // Off-scope navigation. Hand ONLY an explicit user click on an
-            // http(s) link to the real browser — a meta refresh, a JS-less
+            // http(s) link to the real browser — a meta refresh, a scripted
             // redirect, or a custom-scheme navigation (all `.other`) must never
             // auto-launch an external app just because the file was previewed.
             let isTopLevel = navigationAction.targetFrame?.isMainFrame ?? true

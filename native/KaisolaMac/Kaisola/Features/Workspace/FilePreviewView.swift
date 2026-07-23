@@ -39,6 +39,9 @@ enum FilePreviewContent: Equatable {
 /// binary/oversized files degrade to a clear notice.
 struct FilePreviewView: View {
     let url: URL
+    /// Project root grants HTML previews access to their own relative assets
+    /// (styles, scripts, images) without granting the rest of the filesystem.
+    let workspaceRoot: URL?
     let close: () -> Void
 
     @Environment(\.colorScheme) private var colorScheme
@@ -58,6 +61,9 @@ struct FilePreviewView: View {
     @State private var displayedURL: URL?
     /// A navigation/close blocked on unsaved changes, awaiting the user.
     @State private var pendingAction: PendingAction?
+    @State private var isLoading = false
+    @State private var loadTask: Task<Void, Never>?
+    @State private var highlightTask: Task<Void, Never>?
 
     private enum PendingAction: Equatable {
         case navigate(URL)
@@ -70,7 +76,19 @@ struct FilePreviewView: View {
         VStack(spacing: 0) {
             header
             Divider()
-            body(for: content)
+            ZStack {
+                body(for: content)
+                if isLoading {
+                    VStack(spacing: 10) {
+                        ProgressView().controlSize(.small)
+                        Text("Opening \((displayedURL ?? url).lastPathComponent)…")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                    .padding(18)
+                    .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 12))
+                }
+            }
         }
         .background(Color(nsColor: .textBackgroundColor))
         .onAppear { displayedURL = url; load() }
@@ -90,6 +108,10 @@ struct FilePreviewView: View {
         .onChange(of: colorScheme) { _, _ in refreshHighlight() }
         .onChange(of: isEditingText) { _, editing in if !editing { refreshHighlight() } }
         .onChange(of: draft) { _, _ in if !isEditingText { refreshHighlight() } }
+        .onDisappear {
+            loadTask?.cancel()
+            highlightTask?.cancel()
+        }
         .confirmationDialog(
             "Unsaved changes",
             isPresented: Binding(get: { pendingAction != nil }, set: { if !$0 { pendingAction = nil } })
@@ -205,12 +227,7 @@ struct FilePreviewView: View {
             if showMarkdownSource {
                 editor
             } else {
-                ScrollView {
-                    Text(Self.renderMarkdown(draft))
-                        .textSelection(.enabled)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .padding(16)
-                }
+                MarkdownDocumentView(source: draft)
             }
         case .image:
             if let image = NSImage(contentsOf: displayedURL ?? url) {
@@ -227,7 +244,7 @@ struct FilePreviewView: View {
         case let .json(text):
             JsonPreview(text: text)
         case .html:
-            HtmlFilePreview(fileURL: displayedURL ?? url)
+            HtmlFilePreview(fileURL: displayedURL ?? url, readAccessRoot: workspaceRoot)
         case let .tooLarge(size):
             ContentUnavailableView(
                 "File too large to preview",
@@ -249,19 +266,30 @@ struct FilePreviewView: View {
     }
 
     private func load() {
-        content = FilePreviewContent.load(url: displayedURL ?? url)
-        switch content {
-        case let .text(text), let .markdown(text):
-            draft = text
-            savedText = text
-        default:
-            draft = ""
-            savedText = ""
+        loadTask?.cancel()
+        highlightTask?.cancel()
+        let target = displayedURL ?? url
+        isLoading = true
+        loadTask = Task {
+            let loaded = await Task.detached(priority: .userInitiated) {
+                FilePreviewContent.load(url: target)
+            }.value
+            guard !Task.isCancelled, target == (displayedURL ?? url) else { return }
+            content = loaded
+            switch loaded {
+            case let .text(text), let .markdown(text):
+                draft = text
+                savedText = text
+            default:
+                draft = ""
+                savedText = ""
+            }
+            // Every newly opened file starts in read mode.
+            isEditingText = false
+            saveError = nil
+            isLoading = false
+            refreshHighlight()
         }
-        // Every newly opened file starts in read mode.
-        isEditingText = false
-        saveError = nil
-        refreshHighlight()
     }
 
     /// Rebuild the syntax-highlighted rendering of `draft` for the current file
@@ -269,6 +297,7 @@ struct FilePreviewView: View {
     /// back to a plain monospaced rendering. Pure and cheap — the highlighter
     /// caps and degrades on its own.
     private func refreshHighlight() {
+        highlightTask?.cancel()
         guard case .text = content else {
             highlighted = AttributedString(draft)
             return
@@ -279,7 +308,14 @@ struct FilePreviewView: View {
             return
         }
         let theme: SyntaxHighlighter.Theme = colorScheme == .dark ? .dark : .light
-        highlighted = SyntaxHighlighter.highlight(draft, language: language, theme: theme)
+        let source = draft
+        highlightTask = Task {
+            let result = await Task.detached(priority: .utility) {
+                SyntaxHighlighter.highlight(source, language: language, theme: theme)
+            }.value
+            guard !Task.isCancelled, source == draft else { return }
+            highlighted = result
+        }
     }
 
     /// Write the draft to disk. Returns whether the write succeeded, so callers
@@ -306,8 +342,286 @@ struct FilePreviewView: View {
     nonisolated static func renderMarkdown(_ text: String) -> AttributedString {
         (try? AttributedString(
             markdown: text,
-            options: AttributedString.MarkdownParsingOptions(interpretedSyntax: .inlineOnlyPreservingWhitespace)
+            options: AttributedString.MarkdownParsingOptions(interpretedSyntax: .full)
         )) ?? AttributedString(text)
+    }
+}
+
+/// Small native Markdown document model. `Text(AttributedString(markdown:))`
+/// renders inline emphasis but ignores most block presentation intents, which
+/// is why headings, lists, quotes, tables, and fenced code previously collapsed
+/// into an almost-plain paragraph. This parser preserves those structural
+/// blocks while still delegating inline Markdown to Foundation.
+struct MarkdownDocument: Equatable, Sendable {
+    enum Block: Equatable, Sendable {
+        case heading(level: Int, text: String)
+        case paragraph(String)
+        case listItem(indent: Int, marker: String, text: String)
+        case quote(String)
+        case code(language: String?, text: String)
+        case table(headers: [String], rows: [[String]])
+        case rule
+    }
+
+    let blocks: [Block]
+
+    static func parse(_ source: String) -> MarkdownDocument {
+        let lines = source.replacingOccurrences(of: "\r\n", with: "\n")
+            .replacingOccurrences(of: "\r", with: "\n")
+            .split(separator: "\n", omittingEmptySubsequences: false)
+            .map(String.init)
+        var blocks: [Block] = []
+        var index = 0
+        var paragraph: [String] = []
+
+        func flushParagraph() {
+            guard !paragraph.isEmpty else { return }
+            blocks.append(.paragraph(paragraph.joined(separator: " ")))
+            paragraph.removeAll(keepingCapacity: true)
+        }
+
+        while index < lines.count {
+            let line = lines[index]
+            let trimmed = line.trimmingCharacters(in: .whitespaces)
+            if trimmed.isEmpty {
+                flushParagraph()
+                index += 1
+                continue
+            }
+            if trimmed.hasPrefix("```") || trimmed.hasPrefix("~~~") {
+                flushParagraph()
+                let fence = String(trimmed.prefix(3))
+                let languageToken = trimmed.dropFirst(3).trimmingCharacters(in: .whitespaces)
+                var code: [String] = []
+                index += 1
+                while index < lines.count,
+                      !lines[index].trimmingCharacters(in: .whitespaces).hasPrefix(fence) {
+                    code.append(lines[index])
+                    index += 1
+                }
+                if index < lines.count { index += 1 }
+                blocks.append(.code(
+                    language: languageToken.isEmpty ? nil : languageToken,
+                    text: code.joined(separator: "\n")
+                ))
+                continue
+            }
+            if let heading = heading(in: trimmed) {
+                flushParagraph()
+                blocks.append(.heading(level: heading.level, text: heading.text))
+                index += 1
+                continue
+            }
+            if isRule(trimmed) {
+                flushParagraph()
+                blocks.append(.rule)
+                index += 1
+                continue
+            }
+            if let item = listItem(in: line) {
+                flushParagraph()
+                blocks.append(.listItem(indent: item.indent, marker: item.marker, text: item.text))
+                index += 1
+                continue
+            }
+            if trimmed.hasPrefix(">") {
+                flushParagraph()
+                var quote: [String] = []
+                while index < lines.count {
+                    let candidate = lines[index].trimmingCharacters(in: .whitespaces)
+                    guard candidate.hasPrefix(">") else { break }
+                    quote.append(String(candidate.dropFirst()).trimmingCharacters(in: .whitespaces))
+                    index += 1
+                }
+                blocks.append(.quote(quote.joined(separator: "\n")))
+                continue
+            }
+            if index + 1 < lines.count,
+               line.contains("|"),
+               isTableSeparator(lines[index + 1]) {
+                flushParagraph()
+                let headers = tableCells(line)
+                var rows: [[String]] = []
+                index += 2
+                while index < lines.count, lines[index].contains("|"), !lines[index].trimmingCharacters(in: .whitespaces).isEmpty {
+                    rows.append(tableCells(lines[index]))
+                    index += 1
+                }
+                blocks.append(.table(headers: headers, rows: Array(rows.prefix(100))))
+                continue
+            }
+            paragraph.append(trimmed)
+            index += 1
+        }
+        flushParagraph()
+        return MarkdownDocument(blocks: blocks)
+    }
+
+    private static func heading(in line: String) -> (level: Int, text: String)? {
+        let hashes = line.prefix { $0 == "#" }.count
+        guard (1...6).contains(hashes), line.dropFirst(hashes).first == " " else { return nil }
+        return (hashes, line.dropFirst(hashes + 1).trimmingCharacters(in: .whitespaces))
+    }
+
+    private static func isRule(_ line: String) -> Bool {
+        let compact = line.filter { !$0.isWhitespace }
+        guard compact.count >= 3, let first = compact.first, first == "-" || first == "*" || first == "_" else { return false }
+        return compact.allSatisfy { $0 == first }
+    }
+
+    private static func listItem(in line: String) -> (indent: Int, marker: String, text: String)? {
+        let leading = line.prefix { $0 == " " || $0 == "\t" }
+        let indent = leading.reduce(0) { $0 + ($1 == "\t" ? 2 : 1) } / 2
+        let body = line.dropFirst(leading.count)
+        for bullet in ["- ", "* ", "+ "] where body.hasPrefix(bullet) {
+            return (indent, "•", String(body.dropFirst(2)))
+        }
+        let digits = body.prefix { $0.isNumber }
+        guard !digits.isEmpty, body.dropFirst(digits.count).hasPrefix(". ") else { return nil }
+        return (indent, "\(digits).", String(body.dropFirst(digits.count + 2)))
+    }
+
+    private static func tableCells(_ line: String) -> [String] {
+        var value = line.trimmingCharacters(in: .whitespaces)
+        if value.hasPrefix("|") { value.removeFirst() }
+        if value.hasSuffix("|") { value.removeLast() }
+        return value.split(separator: "|", omittingEmptySubsequences: false)
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+    }
+
+    private static func isTableSeparator(_ line: String) -> Bool {
+        let cells = tableCells(line)
+        guard !cells.isEmpty else { return false }
+        return cells.allSatisfy { cell in
+            let core = cell.trimmingCharacters(in: CharacterSet(charactersIn: ":"))
+            return core.count >= 3 && core.allSatisfy { $0 == "-" }
+        }
+    }
+}
+
+private struct MarkdownDocumentView: View {
+    let source: String
+
+    private var document: MarkdownDocument { MarkdownDocument.parse(source) }
+
+    var body: some View {
+        ScrollView {
+            LazyVStack(alignment: .leading, spacing: 14) {
+                ForEach(Array(document.blocks.enumerated()), id: \.offset) { _, block in
+                    blockView(block)
+                }
+            }
+            .frame(maxWidth: 880, alignment: .leading)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.horizontal, 28)
+            .padding(.vertical, 24)
+        }
+        .textSelection(.enabled)
+    }
+
+    @ViewBuilder
+    private func blockView(_ block: MarkdownDocument.Block) -> some View {
+        switch block {
+        case let .heading(level, text):
+            Text(inline(text))
+                .font(headingFont(level))
+                .padding(.top, level <= 2 ? 8 : 2)
+        case let .paragraph(text):
+            Text(inline(text))
+                .font(.body)
+                .lineSpacing(4)
+        case let .listItem(indent, marker, text):
+            HStack(alignment: .firstTextBaseline, spacing: 9) {
+                Text(marker)
+                    .font(.body.monospacedDigit())
+                    .foregroundStyle(.secondary)
+                    .frame(minWidth: 18, alignment: .trailing)
+                Text(inline(text)).lineSpacing(3)
+            }
+            .padding(.leading, CGFloat(indent) * 20)
+        case let .quote(text):
+            HStack(alignment: .top, spacing: 12) {
+                RoundedRectangle(cornerRadius: 2)
+                    .fill(Color.accentColor.opacity(0.75))
+                    .frame(width: 3)
+                Text(inline(text))
+                    .italic()
+                    .foregroundStyle(.secondary)
+                    .lineSpacing(4)
+            }
+            .padding(.vertical, 4)
+        case let .code(language, text):
+            VStack(alignment: .leading, spacing: 0) {
+                if let language {
+                    Text(language.uppercased())
+                        .font(.caption2.weight(.semibold))
+                        .foregroundStyle(.secondary)
+                        .padding(.horizontal, 12)
+                        .padding(.top, 9)
+                }
+                ScrollView(.horizontal, showsIndicators: false) {
+                    Text(verbatim: text)
+                        .font(.system(.callout, design: .monospaced))
+                        .lineSpacing(3)
+                        .padding(12)
+                }
+            }
+            .background(.quaternary.opacity(0.55), in: RoundedRectangle(cornerRadius: 10))
+            .overlay(RoundedRectangle(cornerRadius: 10).strokeBorder(.quaternary))
+        case let .table(headers, rows):
+            MarkdownTable(headers: headers, rows: rows)
+        case .rule:
+            Divider().padding(.vertical, 4)
+        }
+    }
+
+    private func inline(_ text: String) -> AttributedString {
+        (try? AttributedString(
+            markdown: text,
+            options: .init(interpretedSyntax: .inlineOnlyPreservingWhitespace)
+        )) ?? AttributedString(text)
+    }
+
+    private func headingFont(_ level: Int) -> Font {
+        switch level {
+        case 1: .largeTitle.bold()
+        case 2: .title.bold()
+        case 3: .title2.weight(.semibold)
+        case 4: .title3.weight(.semibold)
+        default: .headline
+        }
+    }
+}
+
+private struct MarkdownTable: View {
+    let headers: [String]
+    let rows: [[String]]
+
+    var body: some View {
+        ScrollView(.horizontal, showsIndicators: false) {
+            Grid(horizontalSpacing: 0, verticalSpacing: 0) {
+                GridRow { cells(headers, header: true) }
+                ForEach(Array(rows.enumerated()), id: \.offset) { index, row in
+                    GridRow { cells(row, header: false) }
+                        .background(index.isMultiple(of: 2) ? Color.primary.opacity(0.025) : .clear)
+                }
+            }
+            .overlay(RoundedRectangle(cornerRadius: 8).strokeBorder(.quaternary))
+            .clipShape(RoundedRectangle(cornerRadius: 8))
+        }
+    }
+
+    @ViewBuilder
+    private func cells(_ values: [String], header: Bool) -> some View {
+        ForEach(Array(values.enumerated()), id: \.offset) { _, value in
+            Text(value)
+                .font(header ? .callout.weight(.semibold) : .callout)
+                .frame(minWidth: 100, maxWidth: 280, alignment: .leading)
+                .padding(.horizontal, 10)
+                .padding(.vertical, 8)
+                .background(header ? Color.primary.opacity(0.07) : .clear)
+                .overlay(alignment: .trailing) { Divider() }
+        }
     }
 }
 
@@ -320,16 +634,17 @@ struct WorkspaceRailView: View {
     let close: () -> Void
 
     @State private var expanded: Set<String> = []
-    @State private var refreshToken = 0
     @State private var searchText = ""
     /// Live FSEvents watcher — agent writes refresh the tree automatically.
     @StateObject private var watcher: WorkspaceWatcher
+    @StateObject private var tree: WorkspaceTreeModel
 
     init(root: URL, openFile: @escaping (URL) -> Void, close: @escaping () -> Void) {
         self.root = root
         self.openFile = openFile
         self.close = close
         _watcher = StateObject(wrappedValue: WorkspaceWatcher(root: root))
+        _tree = StateObject(wrappedValue: WorkspaceTreeModel(root: root))
     }
 
     var body: some View {
@@ -353,7 +668,7 @@ struct WorkspaceRailView: View {
                     .buttonStyle(.borderless)
                     .help("Refresh files")
                     Button(action: close) {
-                        Image(systemName: "sidebar.left")
+                        Image(systemName: "sidebar.right")
                     }
                     .buttonStyle(.borderless)
                     .help("Close file browser (Command-B)")
@@ -379,12 +694,18 @@ struct WorkspaceRailView: View {
                     }
                     .padding(.vertical, 6)
                 }
-            } else if filteredFiles.isEmpty {
+            } else if tree.isSearching {
+                VStack(spacing: 10) {
+                    ProgressView().controlSize(.small)
+                    Text("Indexing files…").font(.caption).foregroundStyle(.secondary)
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else if tree.searchResults.isEmpty {
                 ContentUnavailableView.search(text: searchText)
             } else {
                 ScrollView {
                     LazyVStack(alignment: .leading, spacing: 1) {
-                        ForEach(filteredFiles, id: \.self) { path in
+                        ForEach(tree.searchResults, id: \.self) { path in
                             Button {
                                 openFile(root.appendingPathComponent(path))
                             } label: {
@@ -413,14 +734,18 @@ struct WorkspaceRailView: View {
         .background {
             SidebarBackdropView(appearance: settings.sidebarAppearance)
         }
-        .overlay(alignment: .trailing) {
+        .overlay(alignment: .leading) {
             Rectangle()
                 .fill(Color(nsColor: .separatorColor).opacity(0.8))
                 .frame(width: 1)
-                .shadow(color: .black.opacity(0.12), radius: 2, x: 1)
+                .shadow(color: .black.opacity(0.12), radius: 2, x: -1)
         }
-        .id(refreshToken)
-        .onChange(of: watcher.changeToken) { _, _ in refreshToken += 1 }
+        .task { tree.load(root) }
+        .onChange(of: searchText) { _, query in tree.search(query) }
+        .onChange(of: watcher.changeToken) { _, _ in
+            tree.refresh(expandedDirectories: expanded.map { URL(fileURLWithPath: $0, isDirectory: true) })
+            tree.search(searchText)
+        }
         .contextMenu {
             Button("Refresh", action: refresh)
             Button("New AGENTS.md") {
@@ -428,7 +753,7 @@ struct WorkspaceRailView: View {
                 if !FileManager.default.fileExists(atPath: target.path) {
                     try? Self.agentsTemplate.write(to: target, atomically: true, encoding: .utf8)
                     ProjectFileIndex.shared.invalidate()
-                    refreshToken += 1
+                    tree.refresh(expandedDirectories: expanded.map { URL(fileURLWithPath: $0, isDirectory: true) })
                 }
                 openFile(target)
             }
@@ -436,17 +761,10 @@ struct WorkspaceRailView: View {
         .accessibilityLabel("Workspace files")
     }
 
-    private var filteredFiles: [String] {
-        let needle = searchText.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !needle.isEmpty else { return [] }
-        return Array(ProjectFileIndex.shared.files(for: root)
-            .filter { $0.localizedCaseInsensitiveContains(needle) }
-            .prefix(200))
-    }
-
     private func refresh() {
         ProjectFileIndex.shared.invalidate()
-        refreshToken += 1
+        tree.refresh(expandedDirectories: expanded.map { URL(fileURLWithPath: $0, isDirectory: true) })
+        tree.search(searchText)
     }
 
     /// Starter AGENTS.md dropped at the project root — the emerging convention
@@ -475,18 +793,33 @@ struct WorkspaceRailView: View {
 
     @ViewBuilder
     private func nodeRows(for directory: URL, depth: Int) -> some View {
-        ForEach(ProjectFiles.children(of: directory)) { node in
-            nodeRow(node, depth: depth)
-            if node.isDirectory, expanded.contains(node.id) {
-                AnyView(nodeRows(for: node.url, depth: depth + 1))
+        if let nodes = tree.children(of: directory) {
+            ForEach(nodes) { node in
+                nodeRow(node, depth: depth)
+                if node.isDirectory, expanded.contains(node.id) {
+                    AnyView(nodeRows(for: node.url, depth: depth + 1))
+                }
             }
+        } else {
+            HStack(spacing: 7) {
+                ProgressView().controlSize(.mini)
+                Text("Loading…").font(.caption).foregroundStyle(.tertiary)
+            }
+            .padding(.leading, CGFloat(depth) * 14 + 12)
+            .padding(.vertical, 6)
+            .task { tree.load(directory) }
         }
     }
 
     private func nodeRow(_ node: FileNode, depth: Int) -> some View {
         Button {
             if node.isDirectory {
-                if expanded.contains(node.id) { expanded.remove(node.id) } else { expanded.insert(node.id) }
+                if expanded.contains(node.id) {
+                    expanded.remove(node.id)
+                } else {
+                    expanded.insert(node.id)
+                    tree.load(node.url)
+                }
             } else {
                 openFile(node.url)
             }

@@ -32,7 +32,7 @@ struct ProjectTabStripView: View {
             HStack(spacing: 6) {
                 ForEach(projects) { project in
                     Button {
-                        selected = project.name
+                        selected = project.id
                     } label: {
                         chipLabel(project)
                     }
@@ -75,7 +75,7 @@ struct ProjectTabStripView: View {
                 Circle().fill(tint).frame(width: 7, height: 7)
             }
             Text(project.name)
-                .font(.callout.weight(selected == project.name ? .semibold : .regular))
+                .font(.callout.weight(selected == project.id ? .semibold : .regular))
             if project.workingCount > 0 {
                 Text("\(project.workingCount)")
                     .font(.caption2.weight(.bold))
@@ -87,7 +87,7 @@ struct ProjectTabStripView: View {
         .padding(.horizontal, 12)
         .padding(.vertical, 5)
         .background(
-            selected == project.name ? AnyShapeStyle(Color.accentColor.opacity(0.18)) : AnyShapeStyle(.clear),
+            selected == project.id ? AnyShapeStyle(Color.accentColor.opacity(0.18)) : AnyShapeStyle(.clear),
             in: Capsule()
         )
     }

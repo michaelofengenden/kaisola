@@ -227,24 +227,50 @@ struct RootShellView: View {
                                 .font(.caption).foregroundStyle(.tertiary)
                         }
                     } header: {
-                        HStack(spacing: 6) {
-                            if let tint = ProjectTint.color(project.colorHex) {
-                                Circle().fill(tint).frame(width: 8, height: 8)
-                            } else {
-                                Image(systemName: "folder.fill")
-                                    .font(.caption)
-                                    .foregroundStyle(.tertiary)
+                        HStack(spacing: 5) {
+                            Button {
+                                model.activateProject(id: project.id)
+                            } label: {
+                                HStack(spacing: 6) {
+                                    if let tint = ProjectTint.color(project.colorHex) {
+                                        Circle().fill(tint).frame(width: 8, height: 8)
+                                    } else {
+                                        Image(systemName: "folder.fill")
+                                            .font(.caption)
+                                            .foregroundStyle(.tertiary)
+                                    }
+                                    Text(project.name)
+                                    if project.workingCount > 0 {
+                                        Text("\(project.workingCount)")
+                                            .font(.caption2.weight(.bold))
+                                            .padding(.horizontal, 5).padding(.vertical, 1)
+                                            .background(Color.accentColor.opacity(0.9), in: Capsule())
+                                            .foregroundStyle(.white)
+                                            .accessibilityLabel("\(project.workingCount) agents working")
+                                    }
+                                    Spacer(minLength: 4)
+                                }
+                                .contentShape(Rectangle())
                             }
-                            Text(project.name)
-                            if project.workingCount > 0 {
-                                Text("\(project.workingCount)")
-                                    .font(.caption2.weight(.bold))
-                                    .padding(.horizontal, 5).padding(.vertical, 1)
-                                    .background(Color.accentColor.opacity(0.9), in: Capsule())
-                                    .foregroundStyle(.white)
-                                    .accessibilityLabel("\(project.workingCount) agents working")
+                            .buttonStyle(.plain)
+                            .accessibilityLabel("Open \(project.name) project")
+                            Menu {
+                                projectLaunchMenu(project)
+                            } label: {
+                                Image(systemName: "plus.circle")
+                                    .foregroundStyle(.secondary)
                             }
+                            .menuStyle(.borderlessButton)
+                            .fixedSize()
+                            .help("New session in \(project.name)")
                         }
+                        .padding(.vertical, 2)
+                        .background(
+                            activeProjectID == project.id
+                                ? AnyShapeStyle(Color.accentColor.opacity(0.10))
+                                : AnyShapeStyle(.clear),
+                            in: RoundedRectangle(cornerRadius: 7)
+                        )
                         .contextMenu { projectContextMenu(project) }
                     }
                 }
@@ -285,7 +311,7 @@ struct RootShellView: View {
                 reorder: { model.moveProject(id: $0, toIndex: $1) }
             )
             Divider()
-            if let active = model.projects.first(where: { $0.name == activeProjectName }),
+            if let active = model.projects.first(where: { $0.id == activeProjectID }),
                let activeDir = active.directory {
                 QuickActionsBar(projectID: active.id, projectName: active.name) { action in
                     Task { await model.runQuickAction(action, inProject: activeDir) }
@@ -294,7 +320,7 @@ struct RootShellView: View {
             }
             SessionStrip(
                 model: model,
-                projectName: activeProjectName,
+                projectID: activeProjectID,
                 rename: { renameTarget = $0 },
                 closeMesh: requestCloseMesh
             )
@@ -305,11 +331,19 @@ struct RootShellView: View {
     }
 
     private var activeProjectName: String? {
-        model.selectedProjectName ?? model.projects.first?.name
+        model.projects.first(where: { $0.id == activeProjectID })?.name
+            ?? model.selectedProjectName
+            ?? model.projects.first?.name
+    }
+
+    private var activeProjectID: String? {
+        model.selectedProjectID
+            ?? model.selectedProjectName.flatMap { name in model.projects.first(where: { $0.name == name })?.id }
+            ?? model.projects.first?.id
     }
 
     private var activeProjectBinding: Binding<String?> {
-        Binding(get: { activeProjectName }, set: { model.activateProject(named: $0) })
+        Binding(get: { activeProjectID }, set: { model.activateProject(id: $0) })
     }
 
     private var projectSidebarHeader: some View {
@@ -326,6 +360,25 @@ struct RootShellView: View {
                 }
                 .buttonStyle(.borderless)
                 .help("Open project folder")
+                Menu {
+                    if splitCandidates.isEmpty {
+                        Button("No other live sessions") {}.disabled(true)
+                    } else {
+                        ForEach(splitCandidates) { session in
+                            Button {
+                                Task { await model.openInSplit(session.id) }
+                            } label: {
+                                Label(model.sessionTitle(for: session), systemImage: "terminal")
+                            }
+                        }
+                    }
+                } label: {
+                    Image(systemName: "rectangle.split.2x1")
+                }
+                .menuStyle(.borderlessButton)
+                .fixedSize()
+                .disabled(model.terminalDocument.sessionID == nil || model.splitOrder.count >= AppModel.maxSplitPanes)
+                .help("Open another session beside this one")
                 Button {
                     settings.workspaceRailVisible.toggle()
                 } label: {
@@ -364,6 +417,8 @@ struct RootShellView: View {
     /// The shared project context menu: rename, tint, reorder, relocate, close.
     @ViewBuilder
     func projectContextMenu(_ project: AppModel.ProjectGroup) -> some View {
+        projectLaunchMenu(project)
+        Divider()
         Button("Rename Project…") { renameProjectTarget = project.id; renameText = project.name }
         Menu("Color") {
             Button("None") { model.setProjectColor(id: project.id, colorHex: nil) }
@@ -380,6 +435,47 @@ struct RootShellView: View {
         }
         Divider()
         Button("Close Project", role: .destructive) { model.closeProject(id: project.id) }
+    }
+
+    /// Session creation is anchored to the project whose menu was clicked — it
+    /// never falls back to whichever project happened to be selected before the
+    /// click. This is the Electron workflow for running different CLIs in
+    /// different folders without reopening a folder picker each time.
+    @ViewBuilder
+    private func projectLaunchMenu(_ project: AppModel.ProjectGroup) -> some View {
+        if let directory = project.directory {
+            Button {
+                model.activateProject(id: project.id)
+                Task { await model.createTerminal(inDirectory: directory) }
+            } label: {
+                Label("New Terminal", systemImage: "terminal")
+            }
+            ForEach(AgentRegistry.all) { agent in
+                Button {
+                    model.activateProject(id: project.id)
+                    Task { await model.createAgentSession(agent, inDirectory: directory) }
+                } label: {
+                    Label("New \(agent.name) Terminal", systemImage: agent.symbol)
+                }
+            }
+            Divider()
+            ForEach(AgentRegistry.all.filter { AcpAdapter.forAgent($0.id) != nil }) { agent in
+                Button {
+                    model.activateProject(id: project.id)
+                    model.openChat(agent, inDirectory: directory)
+                } label: {
+                    Label("Chat with \(agent.name)", systemImage: "bubble.left.and.bubble.right")
+                }
+            }
+            Button {
+                model.activateProject(id: project.id)
+                model.openMesh(inDirectory: directory)
+            } label: {
+                Label("New Mesh", systemImage: "circle.hexagongrid.fill")
+            }
+        } else {
+            Button("Folder unavailable") {}.disabled(true)
+        }
     }
 
     @MainActor
@@ -454,114 +550,37 @@ struct RootShellView: View {
 
     @ViewBuilder
     private var detailPane: some View {
-        VStack(spacing: 0) {
-            workspaceToolbar
-            Divider()
-            HSplitView {
-                if settings.workspaceRailVisible, let root = model.currentProjectDirectory {
-                    // .id(root) gives the rail a fresh identity per project so its
-                    // @StateObject FSEvents watcher re-targets the new directory
-                    // (a persisted StateObject would keep watching the old root).
-                    WorkspaceRailView(
-                        root: root,
-                        openFile: { model.previewedFileURL = $0 },
-                        close: { settings.workspaceRailVisible = false }
-                    )
-                    .id(root)
-                }
-                detailContent
-                    .frame(minWidth: 360, maxWidth: .infinity, maxHeight: .infinity)
+        HSplitView {
+            detailContent
+                .frame(minWidth: 420, maxWidth: .infinity, maxHeight: .infinity)
+            if settings.workspaceRailVisible, let root = model.currentProjectDirectory {
+                // Files live on the right, matching the editor/reference rail in
+                // the Electron workspace and leaving the project hierarchy as the
+                // sole navigation surface on the left.
+                WorkspaceRailView(
+                    root: root,
+                    openFile: { model.previewedFileURL = $0 },
+                    close: { settings.workspaceRailVisible = false }
+                )
+                .id(root)
             }
         }
-    }
-
-    private var workspaceToolbar: some View {
-        HStack(spacing: 9) {
-            Button {
-                settings.workspaceRailVisible.toggle()
-            } label: {
-                Image(systemName: settings.workspaceRailVisible ? "sidebar.left" : "sidebar.right")
-            }
-            .buttonStyle(.borderless)
-            .help(settings.workspaceRailVisible ? "Hide file browser (Command-B)" : "Show file browser (Command-B)")
-            .accessibilityLabel(settings.workspaceRailVisible ? "Hide file browser" : "Show file browser")
-
-            Image(systemName: activeSurfaceSymbol)
-                .foregroundStyle(.secondary)
-            Text(activeSurfaceTitle)
-                .font(.callout.weight(.semibold))
-                .lineLimit(1)
-            Spacer(minLength: 8)
-
-            Menu {
-                if splitCandidates.isEmpty {
-                    Button("No other sessions available") {}
-                        .disabled(true)
-                } else {
-                    ForEach(splitCandidates) { session in
-                        Button {
-                            Task { await model.openInSplit(session.id) }
-                        } label: {
-                            Label(model.sessionTitle(for: session), systemImage: "terminal")
-                        }
-                    }
-                }
-            } label: {
-                Label("Add Pane", systemImage: "rectangle.split.2x1")
-            }
-            .menuStyle(.borderlessButton)
-            .fixedSize()
-            .disabled(model.terminalDocument.sessionID == nil || model.splitOrder.count >= AppModel.maxSplitPanes)
-            .help("View another live session beside this one")
-            .accessibilityLabel("Add session pane")
-
-            Button { showPalette = true } label: {
-                Image(systemName: "command.square")
-            }
-            .buttonStyle(.borderless)
-            .help("Command palette (Command-K)")
-
-            Button { showSettings = true } label: {
-                Image(systemName: "gearshape")
-            }
-            .buttonStyle(.borderless)
-            .help("Settings")
-            .accessibilityLabel("Open in-app settings")
-        }
-        .controlSize(.small)
-        .padding(.horizontal, 12)
-        .frame(height: 38)
-        .background(.bar)
     }
 
     private var splitCandidates: [BrokerTerminalRecord] {
         let primaryID = model.terminalDocument.sessionID
-        let sessions = model.projects.first(where: { $0.name == activeProjectName })?.sessions ?? model.sessions
+        let sessions = model.projects.first(where: { $0.id == activeProjectID })?.sessions ?? model.sessions
         return sessions.filter {
             !$0.exited && $0.id != primaryID && model.splitDocuments[$0.id] == nil
         }
     }
 
-    private var activeSurfaceTitle: String {
-        if let file = model.previewedFileURL { return file.lastPathComponent }
-        if let mesh = model.meshes.first(where: { $0.id == model.selectedMeshID }) { return mesh.title }
-        if let chat = model.chats.first(where: { $0.id == model.selectedChatID }) { return chat.conversation.title }
-        if let id = model.terminalDocument.sessionID { return model.sessionTitle(for: id) }
-        return activeProjectName ?? "Workspace"
-    }
-
-    private var activeSurfaceSymbol: String {
-        if model.previewedFileURL != nil { return "doc.text" }
-        if model.selectedMeshID != nil { return "circle.hexagongrid.fill" }
-        if model.selectedChatID != nil { return "bubble.left.and.text.bubble.right" }
-        if model.terminalDocument.sessionID != nil { return "terminal" }
-        return "square.grid.2x2"
-    }
-
     @ViewBuilder
     private var detailContent: some View {
         if let fileURL = model.previewedFileURL {
-            FilePreviewView(url: fileURL) { model.previewedFileURL = nil }
+            FilePreviewView(url: fileURL, workspaceRoot: model.currentProjectDirectory) {
+                model.previewedFileURL = nil
+            }
         } else if let mesh = model.meshes.first(where: { $0.id == model.selectedMeshID }) {
             MeshView(mesh: mesh)
                 .id(mesh.id)
@@ -718,16 +737,42 @@ struct RootShellView: View {
     /// squeezing every terminal into an unreadable horizontal strip.
     private var terminalPaneGrid: some View {
         let columns = TerminalPaneGrid.columns(for: paneIDs)
-        return HSplitView {
-            ForEach(columns.indices, id: \.self) { columnIndex in
-                let column = columns[columnIndex]
-                if column.count == 1, let id = column.first {
+        return GeometryReader { geometry in
+            let dividerWidth: CGFloat = columns.count > 1 ? 1 : 0
+            let availableWidth = max(0, geometry.size.width - dividerWidth * CGFloat(columns.count - 1))
+            let columnWidth = columns.isEmpty ? 0 : availableWidth / CGFloat(columns.count)
+            HStack(spacing: 0) {
+                ForEach(columns.indices, id: \.self) { columnIndex in
+                    terminalColumn(columns[columnIndex])
+                        .frame(width: columnWidth, height: geometry.size.height)
+                    if columnIndex < columns.count - 1 {
+                        Rectangle()
+                            .fill(Color(nsColor: .separatorColor))
+                            .frame(width: dividerWidth)
+                    }
+                }
+            }
+        }
+    }
+
+    /// Equal geometry is intentional: SwiftUI split views persist stale divider
+    /// positions across minimize/zoom/remount and were reopening a two-pane view
+    /// at roughly 2/3 + 1/3. A deterministic grid always starts and remains at
+    /// the visual midpoint, while SwiftTerm receives one coherent resize per
+    /// pane instead of a cascade of intermediate sizes.
+    private func terminalColumn(_ ids: [String]) -> some View {
+        GeometryReader { geometry in
+            let dividerHeight: CGFloat = ids.count > 1 ? 1 : 0
+            let availableHeight = max(0, geometry.size.height - dividerHeight * CGFloat(ids.count - 1))
+            let paneHeight = ids.isEmpty ? 0 : availableHeight / CGFloat(ids.count)
+            VStack(spacing: 0) {
+                ForEach(Array(ids.enumerated()), id: \.element) { index, id in
                     terminalPane(id)
-                } else {
-                    VSplitView {
-                        ForEach(column, id: \.self) { id in
-                            terminalPane(id)
-                        }
+                        .frame(width: geometry.size.width, height: paneHeight)
+                    if index < ids.count - 1 {
+                        Rectangle()
+                            .fill(Color(nsColor: .separatorColor))
+                            .frame(height: dividerHeight)
                     }
                 }
             }
@@ -869,22 +914,37 @@ private struct InAppSettingsSheet: View {
     var body: some View {
         VStack(spacing: 0) {
             HStack(spacing: 9) {
-                Image(systemName: "gearshape.fill")
-                    .foregroundStyle(Color.accentColor)
+                ZStack {
+                    RoundedRectangle(cornerRadius: 9)
+                        .fill(Color.accentColor.gradient)
+                    Image(systemName: "slider.horizontal.3")
+                        .foregroundStyle(.white)
+                }
+                .frame(width: 32, height: 32)
                 VStack(alignment: .leading, spacing: 1) {
-                    Text("Kaisola Settings")
-                        .font(.headline)
-                    Text("Workspace, terminal, agents, MCP, and guardrails")
+                    Text("Settings")
+                        .font(.title3.weight(.semibold))
+                    Text("Everything applies instantly")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
                 Spacer()
-                Button("Done", action: dismiss)
+                Button(action: dismiss) {
+                    HStack(spacing: 6) {
+                        Text("Done")
+                        Image(systemName: "checkmark")
+                            .font(.caption.weight(.bold))
+                    }
+                    .padding(.horizontal, 12)
+                    .frame(height: 30)
+                    .background(.quaternary.opacity(0.55), in: Capsule())
+                }
+                    .buttonStyle(.plain)
                     .keyboardShortcut(.defaultAction)
             }
-            .padding(.horizontal, 16)
-            .frame(height: 52)
-            .background(.bar)
+            .padding(.horizontal, 18)
+            .frame(height: 58)
+            .background(.ultraThinMaterial)
             Divider()
             SettingsView(
                 settings: settings,
@@ -919,12 +979,12 @@ enum TerminalPaneGrid {
 /// real workspace boundary rather than decoration.
 private struct SessionStrip: View {
     @ObservedObject var model: AppModel
-    let projectName: String?
+    let projectID: String?
     let rename: (String) -> Void
     let closeMesh: (MeshSession) -> Void
 
     private var project: AppModel.ProjectGroup? {
-        model.projects.first { $0.name == projectName }
+        model.projects.first { $0.id == projectID }
     }
 
     private var sessions: [BrokerTerminalRecord] { project?.sessions ?? [] }
@@ -1236,20 +1296,17 @@ private struct ConnectionFooter: View {
 
     var body: some View {
         HStack(spacing: 8) {
+            Circle()
+                .fill(state.isConnected ? Color.green : Color.orange)
+                .frame(width: 7, height: 7)
             VStack(alignment: .leading, spacing: 2) {
-                Text("Kaisola Preview")
+                Text("Kaisola")
                     .font(.caption.weight(.semibold))
-                Text(state.title)
+                Text(state.detail ?? state.title)
                     .font(.caption2)
                     .foregroundStyle(.secondary)
-                // Never hide WHY: offline/connected detail lives here now that
-                // the detail-pane status bar is gone.
-                if let detail = state.detail {
-                    Text(detail)
-                        .font(.caption2)
-                        .foregroundStyle(.tertiary)
-                        .lineLimit(2)
-                }
+                    .lineLimit(1)
+                    .truncationMode(.middle)
             }
             Spacer()
             if usage.totalPeakTokens > 0 {
@@ -1352,7 +1409,9 @@ private struct ConnectionFooter: View {
             .help("Reconnect without changing terminal ownership")
             .accessibilityLabel("Reconnect to terminal broker")
         }
-        .padding(12)
-        .background(.bar)
+        .padding(.horizontal, 12)
+        .frame(height: 52)
+        .background(.ultraThinMaterial)
+        .overlay(alignment: .top) { Divider() }
     }
 }

@@ -41,8 +41,8 @@ final class OmniBarDispatchTests: XCTestCase {
     /// chat in that project.
     @MainActor
     func testTargetDescriptionNamesNewChatInSingleProject() {
-        let (model, store) = makeModel()
-        _ = store.openProject(directory: "/tmp/omnibar-solo")
+        let (model, _) = makeModel()
+        model.openProject(directory: URL(fileURLWithPath: "/tmp/omnibar-solo", isDirectory: true))
         let description = OmniBarDispatch.targetDescription(model: model)
         XCTAssertTrue(
             description.contains("omnibar-solo"),

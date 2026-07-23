@@ -68,4 +68,39 @@ final class WorkspaceFilesTests: XCTestCase {
         let rendered = FilePreviewView.renderMarkdown("plain **bold** text")
         XCTAssertFalse(String(rendered.characters).isEmpty)
     }
+
+    func testMarkdownDocumentPreservesBlockStructure() {
+        let document = MarkdownDocument.parse("""
+        # Heading
+
+        Paragraph with **bold** text.
+
+        - first
+        1. second
+
+        > quoted
+
+        ```swift
+        let answer = 42
+        ```
+
+        | Name | Value |
+        | --- | --- |
+        | alpha | 1 |
+        """)
+
+        XCTAssertTrue(document.blocks.contains(.heading(level: 1, text: "Heading")))
+        XCTAssertTrue(document.blocks.contains(.listItem(indent: 0, marker: "•", text: "first")))
+        XCTAssertTrue(document.blocks.contains(.listItem(indent: 0, marker: "1.", text: "second")))
+        XCTAssertTrue(document.blocks.contains(.quote("quoted")))
+        XCTAssertTrue(document.blocks.contains(.code(language: "swift", text: "let answer = 42")))
+        XCTAssertTrue(document.blocks.contains(.table(headers: ["Name", "Value"], rows: [["alpha", "1"]])))
+    }
+
+    func testDirectorySymlinkIsNotRecursivelyIndexed() throws {
+        let loop = root.appendingPathComponent("loop", isDirectory: true)
+        try FileManager.default.createSymbolicLink(at: loop, withDestinationURL: root)
+        XCTAssertFalse(ProjectFiles.children(of: root).contains { $0.name == "loop" })
+        XCTAssertEqual(Set(ProjectFiles.enumerate(root: root)), ["README.md", "src/main.swift"])
+    }
 }

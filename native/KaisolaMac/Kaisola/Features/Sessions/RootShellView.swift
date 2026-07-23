@@ -8,6 +8,7 @@ struct RootShellView: View {
     @State private var renameProjectTarget: String?
     @State private var renameText: String = ""
     @State private var gitRepo: URL?
+    @State private var showPalette = false
 
     private var sidebarSelection: Binding<String?> {
         Binding(
@@ -57,6 +58,23 @@ struct RootShellView: View {
                 Divider()
                 GitPanelView(repoRoot: repo.url)
                     .frame(width: 520, height: 460)
+            }
+        }
+        .background(
+            Button(action: { showPalette.toggle() }) { EmptyView() }
+                .keyboardShortcut("k", modifiers: .command)
+                .accessibilityLabel("Command Palette")
+        )
+        .overlay {
+            if showPalette {
+                ZStack(alignment: .top) {
+                    Color.black.opacity(0.18)
+                        .ignoresSafeArea()
+                        .onTapGesture { showPalette = false }
+                    CommandPaletteView(model: model, settings: settings, isPresented: $showPalette)
+                        .padding(.top, 72)
+                }
+                .transition(.opacity)
             }
         }
     }

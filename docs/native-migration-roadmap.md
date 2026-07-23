@@ -47,7 +47,7 @@ optional pending a scope decision.
 | Saved windows (persist/reopen/delete named states) | NEW | P1 | `SavedWindows.tsx` |
 | Project rename / relocate / recents | PARTIAL | P1 | rename done (`AppModel.renameProject` + Rename Project sheet); relocate/recents still to add |
 | Workspace rail (file tree, ⌘B) | NEW | P1 | `WorkspaceRail.tsx` |
-| Command palette (⌘K/⌘P, fuzzy files + actions) | NEW | P1 | `CommandPalette.tsx` |
+| Command palette (⌘K/⌘P, fuzzy files + actions) | PARTIAL | P1 | ⌘K palette: fuzzy actions (new terminal/agent/chat, open folder), view toggles (layout/appearance), jump-to project/session/chat; arrow-nav + Enter/Esc; pure `FuzzyMatch` scorer. Fuzzy *file* search still to add |
 | Detach project to new window / adopt | NEW | P2 | renderer-to-renderer transfer; complex |
 | Focus vs Studio layout mode | NEW | P2 | Studio is legacy research surface |
 | OmniBar (⌘L) | NEW | P2 | `OmniBar.tsx` |

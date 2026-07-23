@@ -41,7 +41,12 @@ struct NativeSessionStore: Sendable {
         var ownerID: String
         var sessions: [NativeOwnedSession]
         var projects: [OpenProject]?
+        /// Recently closed project tabs, newest last, bounded — powers
+        /// Reopen Closed Project (⌘⇧T).
+        var closedProjects: [OpenProject]?
     }
+
+    private let closedStackCap = 10
 
     let fileURL: URL
 
@@ -78,8 +83,13 @@ struct NativeSessionStore: Sendable {
     func openProject(directory path: String) -> OpenProject {
         let id = Self.projectID(forDirectory: path)
         var payload = read() ?? Payload(ownerID: ownerID(), sessions: [], projects: [])
+        // Re-opening a folder retires any stale closed-stack entry for it.
+        payload.closedProjects?.removeAll { $0.id == id }
         var projects = payload.projects ?? []
-        if let existing = projects.first(where: { $0.id == id }) { return existing }
+        if let existing = projects.first(where: { $0.id == id }) {
+            write(payload)
+            return existing
+        }
         let project = OpenProject(
             id: id,
             path: (path as NSString).standardizingPath,
@@ -102,8 +112,34 @@ struct NativeSessionStore: Sendable {
 
     func closeProject(id: String) {
         guard var payload = read() else { return }
+        if let closed = payload.projects?.first(where: { $0.id == id }) {
+            var stack = payload.closedProjects ?? []
+            stack.removeAll { $0.id == id }   // no duplicates; most-recent wins
+            stack.append(closed)
+            if stack.count > closedStackCap { stack.removeFirst(stack.count - closedStackCap) }
+            payload.closedProjects = stack
+        }
         payload.projects?.removeAll { $0.id == id }
         write(payload)
+    }
+
+    /// Restore the most recently closed project tab, removing it from the stack.
+    /// Returns the restored project, or nil if the stack is empty.
+    @discardableResult
+    func reopenLastClosedProject() -> OpenProject? {
+        guard var payload = read(), var stack = payload.closedProjects, let restored = stack.popLast() else { return nil }
+        var projects = payload.projects ?? []
+        if !projects.contains(where: { $0.id == restored.id }) {
+            projects.append(restored)
+        }
+        payload.projects = projects
+        payload.closedProjects = stack
+        write(payload)
+        return restored
+    }
+
+    func closedProjects() -> [OpenProject] {
+        read()?.closedProjects ?? []
     }
 
     func owns(terminalID: String) -> Bool {

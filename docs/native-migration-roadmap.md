@@ -43,7 +43,7 @@ optional pending a scope decision.
 | Session tabs / dock-grid (draggable columns, split, close, pop) | PARTIAL | P0 | top-bar layout has a session strip; dock-grid/split/pop to add |
 | Full macOS menu bar (App/File/Edit/View/Window/Help + accelerators) | PARTIAL | P0 | App/File/Edit/View done (New Window/Chat/Agent/Terminal, layout+appearance); Window/Help to add |
 | Session groups (named, tinted, collapsible; pinned) | NEW | P1 | `SessionGroup` |
-| Reopen closed session/project (⌘⇧T / ⌘⌥T, 7-day stack) | NEW | P1 | `closedStack` |
+| Reopen closed session/project (⌘⇧T / ⌘⌥T, 7-day stack) | PARTIAL | P1 | Reopen Closed Project (⌘⇧T) — bounded closed-stack in `NativeSessionStore`, File menu + palette; reopen-closed-session still to add |
 | Saved windows (persist/reopen/delete named states) | NEW | P1 | `SavedWindows.tsx` |
 | Project rename / relocate / recents | PARTIAL | P1 | rename done (`AppModel.renameProject` + Rename Project sheet); relocate/recents still to add |
 | Workspace rail (file tree, ⌘B) | NEW | P1 | `WorkspaceRail.tsx` |

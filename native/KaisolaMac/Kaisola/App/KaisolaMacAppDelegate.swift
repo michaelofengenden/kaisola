@@ -126,6 +126,10 @@ final class KaisolaMacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDele
         RootShellView.promptForOpenFolder(model: model)
     }
 
+    @objc private func reopenClosedProject(_ sender: Any?) {
+        keyModel()?.reopenLastClosedProject()
+    }
+
     @objc private func checkForUpdates(_ sender: Any?) {
         updateController.checkForUpdates(sender)
     }
@@ -184,6 +188,8 @@ final class KaisolaMacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDele
             newWindowAction: #selector(newWindow(_:)),
             openFolderTarget: self,
             openFolderAction: #selector(openFolder(_:)),
+            reopenClosedProjectTarget: self,
+            reopenClosedProjectAction: #selector(reopenClosedProject(_:)),
             newTerminalTarget: self,
             newTerminalAction: #selector(newTerminalSession(_:)),
             newAgentTarget: self,
@@ -210,6 +216,8 @@ final class KaisolaMacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDele
         newWindowAction: Selector? = nil,
         openFolderTarget: AnyObject? = nil,
         openFolderAction: Selector? = nil,
+        reopenClosedProjectTarget: AnyObject? = nil,
+        reopenClosedProjectAction: Selector? = nil,
         newTerminalTarget: AnyObject? = nil,
         newTerminalAction: Selector? = nil,
         newAgentTarget: AnyObject? = nil,
@@ -266,6 +274,13 @@ final class KaisolaMacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDele
         if let openFolderAction {
             let item = fileMenu.addItem(withTitle: "Open Folder…", action: openFolderAction, keyEquivalent: "o")
             item.target = openFolderTarget
+        }
+        if let reopenClosedProjectAction {
+            let item = fileMenu.addItem(withTitle: "Reopen Closed Project", action: reopenClosedProjectAction, keyEquivalent: "t")
+            item.keyEquivalentModifierMask = [.command, .shift]
+            item.target = reopenClosedProjectTarget
+        }
+        if openFolderAction != nil || reopenClosedProjectAction != nil {
             fileMenu.addItem(.separator())
         }
         if let newChatAction {

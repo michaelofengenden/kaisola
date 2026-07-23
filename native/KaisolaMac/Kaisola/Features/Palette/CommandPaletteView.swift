@@ -131,6 +131,11 @@ struct CommandPaletteView: View {
         items.append(PaletteItem(id: "action.openFolder", title: "Open Folder…", subtitle: "Action · ⌘O", systemImage: "folder") {
             RootShellView.promptForOpenFolder(model: model)
         })
+        if model.hasClosedProjects {
+            items.append(PaletteItem(id: "action.reopenClosedProject", title: "Reopen Closed Project", subtitle: "Action · ⇧⌘T", systemImage: "arrow.uturn.backward") {
+                model.reopenLastClosedProject()
+            })
+        }
 
         for layout in NavigationLayout.allCases {
             items.append(PaletteItem(id: "layout.\(layout.rawValue)", title: "Layout: \(layout.title)", subtitle: "View", systemImage: "sidebar.squares.left") {

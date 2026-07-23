@@ -155,6 +155,16 @@ final class AppModel: ObservableObject {
         objectWillChange.send()
     }
 
+    /// Restore the most recently closed project tab (⌘⇧T) and select it.
+    func reopenLastClosedProject() {
+        if let restored = sessionStore.reopenLastClosedProject() {
+            selectedProjectName = restored.name
+        }
+        objectWillChange.send()
+    }
+
+    var hasClosedProjects: Bool { !sessionStore.closedProjects().isEmpty }
+
     /// The working directory of an owned session (for the Git panel). Observed
     /// Electron terminals have no known local directory here.
     func directory(for terminalID: String) -> URL? {

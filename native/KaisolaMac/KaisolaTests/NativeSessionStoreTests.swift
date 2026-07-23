@@ -70,6 +70,39 @@ final class NativeSessionStoreTests: XCTestCase {
         XCTAssertFalse(ids.contains(drop.id))
     }
 
+    func testCloseThenReopenRestoresMostRecentProject() {
+        let a = store.openProject(directory: "/tmp/alpha")
+        let b = store.openProject(directory: "/tmp/beta")
+        store.closeProject(id: a.id)
+        store.closeProject(id: b.id)
+        XCTAssertTrue(store.projects().isEmpty)
+
+        // ⌘⇧T restores newest-first: beta, then alpha.
+        let first = store.reopenLastClosedProject()
+        XCTAssertEqual(first?.id, b.id)
+        XCTAssertEqual(store.projects().map(\.id), [b.id])
+        let second = store.reopenLastClosedProject()
+        XCTAssertEqual(second?.id, a.id)
+        XCTAssertNil(store.reopenLastClosedProject())   // stack drained
+    }
+
+    func testReopenPersistsClosedStackAcrossInstances() {
+        let a = store.openProject(directory: "/tmp/persisted-closed")
+        store.closeProject(id: a.id)
+        let reopened = NativeSessionStore(fileURL: fileURL)
+        XCTAssertEqual(reopened.closedProjects().map(\.id), [a.id])
+        XCTAssertEqual(reopened.reopenLastClosedProject()?.id, a.id)
+    }
+
+    func testReopeningAFolderDirectlyRetiresItsClosedEntry() {
+        let a = store.openProject(directory: "/tmp/gamma")
+        store.closeProject(id: a.id)
+        XCTAssertFalse(store.closedProjects().isEmpty)
+        // Opening the same folder again should clear the stale closed entry.
+        _ = store.openProject(directory: "/tmp/gamma")
+        XCTAssertTrue(store.closedProjects().isEmpty)
+    }
+
     func testOpenProjectDoesNotDisturbOwnedSessions() {
         let session = NativeOwnedSession(
             id: "term-1",

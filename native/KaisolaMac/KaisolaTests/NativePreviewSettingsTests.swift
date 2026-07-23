@@ -59,6 +59,17 @@ final class NativePreviewSettingsTests: XCTestCase {
         XCTAssertEqual(openFolder.keyEquivalentModifierMask, [.command])
     }
 
+    func testFileMenuCarriesReopenClosedProjectWithShortcut() throws {
+        let menu = KaisolaMacAppDelegate.makeMainMenu(
+            updateTarget: nil, updateAction: nil, updateEnabled: false, updateDetail: nil,
+            reopenClosedProjectTarget: nil, reopenClosedProjectAction: #selector(NSResponder.doCommand(by:))
+        )
+        let fileMenu = try XCTUnwrap(menu.item(withTitle: "File")?.submenu)
+        let reopen = try XCTUnwrap(fileMenu.items.first { $0.title == "Reopen Closed Project" })
+        XCTAssertEqual(reopen.keyEquivalent, "t")
+        XCTAssertEqual(reopen.keyEquivalentModifierMask, [.command, .shift])
+    }
+
     func testViewMenuCarriesLayoutAndAppearanceToggles() throws {
         let menu = KaisolaMacAppDelegate.makeMainMenu(
             updateTarget: nil, updateAction: nil, updateEnabled: false, updateDetail: nil,

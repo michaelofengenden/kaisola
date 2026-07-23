@@ -1,0 +1,4 @@
+module KaisolaCore {
+header "KaisolaCore-Swift.h"
+export *
+}

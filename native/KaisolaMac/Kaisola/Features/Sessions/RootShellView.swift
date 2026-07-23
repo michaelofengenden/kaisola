@@ -209,44 +209,50 @@ struct RootShellView: View {
         )
     }
 
-    /// Folder picker → new owned shell in that directory. Reused by the File
-    /// menu and the sidebar button.
+    /// New owned shell in the active project (or a picked folder when there's no
+    /// project context). Reused by the File menu and the sidebar button.
     @MainActor
     static func promptForNewTerminal(model: AppModel) {
-        guard let directory = chooseDirectory(prompt: "Open Terminal Here") else { return }
+        guard let directory = model.currentProjectDirectory
+            ?? chooseDirectory(prompt: "Open Terminal Here", startingAt: model.currentProjectDirectory) else { return }
         Task { await model.createTerminal(inDirectory: directory) }
     }
 
-    /// Folder picker → new agent session running the agent's CLI there.
+    /// New agent session running the agent's CLI in the active project (or a
+    /// picked folder).
     @MainActor
     static func promptForNewAgent(_ agent: AgentProfile, model: AppModel) {
-        guard let directory = chooseDirectory(prompt: "Start \(agent.name) Here") else { return }
+        guard let directory = model.currentProjectDirectory
+            ?? chooseDirectory(prompt: "Start \(agent.name) Here", startingAt: model.currentProjectDirectory) else { return }
         Task { await model.createAgentSession(agent, inDirectory: directory) }
     }
 
-    /// Folder picker → open a folder as a project tab (no session yet).
+    /// Folder picker → open a folder as a project tab (no session yet). This one
+    /// always prompts — its whole purpose is choosing a new folder.
     @MainActor
     static func promptForOpenFolder(model: AppModel) {
-        guard let directory = chooseDirectory(prompt: "Open Project") else { return }
+        guard let directory = chooseDirectory(prompt: "Open Project", startingAt: model.currentProjectDirectory) else { return }
         model.openProject(directory: directory)
     }
 
-    /// Folder picker → new ACP chat conversation with the agent there.
+    /// New ACP chat with the agent in the active project (or a picked folder).
     @MainActor
     static func promptForNewChat(_ agent: AgentProfile, model: AppModel) {
-        guard AcpAdapter.forAgent(agent.id) != nil,
-              let directory = chooseDirectory(prompt: "Chat with \(agent.name) Here") else { return }
+        guard AcpAdapter.forAgent(agent.id) != nil else { return }
+        guard let directory = model.currentProjectDirectory
+            ?? chooseDirectory(prompt: "Chat with \(agent.name) Here", startingAt: model.currentProjectDirectory) else { return }
         model.openChat(agent, inDirectory: directory)
     }
 
     @MainActor
-    private static func chooseDirectory(prompt: String) -> URL? {
+    private static func chooseDirectory(prompt: String, startingAt: URL? = nil) -> URL? {
         let panel = NSOpenPanel()
         panel.canChooseFiles = false
         panel.canChooseDirectories = true
         panel.allowsMultipleSelection = false
         panel.prompt = prompt
         panel.message = "Choose the folder for the new session."
+        if let startingAt { panel.directoryURL = startingAt }
         guard panel.runModal() == .OK else { return nil }
         return panel.urls.first
     }

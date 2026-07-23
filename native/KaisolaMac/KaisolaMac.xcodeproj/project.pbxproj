@@ -34,6 +34,7 @@
 		5BAC96791477731891D5DB47 /* PermissionRuleStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3D06ED8A6604C6BD4447869A /* PermissionRuleStore.swift */; };
 		5BDE35CC5251CC2B24071508 /* NativePreviewSettings.swift in Sources */ = {isa = PBXBuildFile; fileRef = 081788CB50A2F8085E0929CE /* NativePreviewSettings.swift */; };
 		5D6DA237FF6F32B1A2A8DB04 /* AcpConversation.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3ACF651DE22A050B1D4AF49C /* AcpConversation.swift */; };
+		640841FC93C7BCB00DFFA219 /* AppModelProjectContextTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 07063F75FCF57994E572B99C /* AppModelProjectContextTests.swift */; };
 		6A358DDF102C7984D29FD806 /* TerminalCursorStoreTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 96E5D09B49E862C088D584E8 /* TerminalCursorStoreTests.swift */; };
 		6B76FFE3C1F1E11155040E2F /* RootShellView.swift in Sources */ = {isa = PBXBuildFile; fileRef = CBB83EF128840150F6F7103D /* RootShellView.swift */; };
 		6DFF60157687B575AD4176D7 /* UnixBrokerTransport.swift in Sources */ = {isa = PBXBuildFile; fileRef = C1139547AB3E3B3A9C7AAEDA /* UnixBrokerTransport.swift */; };
@@ -104,6 +105,7 @@
 
 /* Begin PBXFileReference section */
 		03184EF0234187AC455C546D /* BrokerStartupCoordinator.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BrokerStartupCoordinator.swift; sourceTree = "<group>"; };
+		07063F75FCF57994E572B99C /* AppModelProjectContextTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppModelProjectContextTests.swift; sourceTree = "<group>"; };
 		081788CB50A2F8085E0929CE /* NativePreviewSettings.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NativePreviewSettings.swift; sourceTree = "<group>"; };
 		0A75F9D9A2E3D4F6821B1F0A /* AcpToolArtifactsTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AcpToolArtifactsTests.swift; sourceTree = "<group>"; };
 		0B4786B001B694E8168114CB /* KaisolaBrokerBootstrap */ = {isa = PBXFileReference; includeInIndex = 0; path = KaisolaBrokerBootstrap; sourceTree = BUILT_PRODUCTS_DIR; };
@@ -337,6 +339,7 @@
 				757C6A4EEAF0C23D949EF4A5 /* AcpPermissionRulesTests.swift */,
 				9FAD1CF1DFF4378CF3677E4A /* AcpProcessIntegrationTests.swift */,
 				0A75F9D9A2E3D4F6821B1F0A /* AcpToolArtifactsTests.swift */,
+				07063F75FCF57994E572B99C /* AppModelProjectContextTests.swift */,
 				9971B075277E2DD1494755BE /* AppModelReconnectTests.swift */,
 				CD40F6DB5889F51004BEF1C9 /* BrokerControlClientTests.swift */,
 				9F5A8717F4788368FDE60F93 /* BrokerDiscoveryTests.swift */,
@@ -608,6 +611,7 @@
 				965405BD43BA9C3BBEF15AD7 /* AcpPermissionRulesTests.swift in Sources */,
 				E6654BD397157414CD77460C /* AcpProcessIntegrationTests.swift in Sources */,
 				C490492DC4C65C9BCA0842C0 /* AcpToolArtifactsTests.swift in Sources */,
+				640841FC93C7BCB00DFFA219 /* AppModelProjectContextTests.swift in Sources */,
 				F0340491DE4B839A15E2B447 /* AppModelReconnectTests.swift in Sources */,
 				CFA09B2F2E24E8EFF4E27E32 /* BrokerControlClientTests.swift in Sources */,
 				ADCD5776327E816820F93512 /* BrokerDiscoveryTests.swift in Sources */,

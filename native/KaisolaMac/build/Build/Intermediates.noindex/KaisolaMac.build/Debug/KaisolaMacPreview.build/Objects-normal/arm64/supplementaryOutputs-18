@@ -1,0 +1,30 @@
+{
+  "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/Kaisola/Broker/ObserveOnlyBrokerClient.swift" : {
+    "const-values" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/ObserveOnlyBrokerClient.swiftconstvalues",
+    "dependencies" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/ObserveOnlyBrokerClient.d",
+    "diagnostics" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/ObserveOnlyBrokerClient.dia",
+    "object" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/ObserveOnlyBrokerClient.o",
+    "swift-dependencies" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/ObserveOnlyBrokerClient.swiftdeps"
+  },
+  "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/Kaisola/Features/Sessions/NativeTerminalSurface.swift" : {
+    "const-values" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/NativeTerminalSurface.swiftconstvalues",
+    "dependencies" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/NativeTerminalSurface.d",
+    "diagnostics" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/NativeTerminalSurface.dia",
+    "object" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/NativeTerminalSurface.o",
+    "swift-dependencies" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/NativeTerminalSurface.swiftdeps"
+  },
+  "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/Kaisola/Updates/NativeUpdateConfiguration.swift" : {
+    "const-values" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/NativeUpdateConfiguration.swiftconstvalues",
+    "dependencies" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/NativeUpdateConfiguration.d",
+    "diagnostics" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/NativeUpdateConfiguration.dia",
+    "object" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/NativeUpdateConfiguration.o",
+    "swift-dependencies" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/NativeUpdateConfiguration.swiftdeps"
+  },
+  "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/Kaisola/Updates/NativeUpdateController.swift" : {
+    "const-values" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/NativeUpdateController.swiftconstvalues",
+    "dependencies" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/NativeUpdateController.d",
+    "diagnostics" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/NativeUpdateController.dia",
+    "object" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/NativeUpdateController.o",
+    "swift-dependencies" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/NativeUpdateController.swiftdeps"
+  }
+}

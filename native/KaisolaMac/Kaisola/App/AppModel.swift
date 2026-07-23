@@ -171,6 +171,25 @@ final class AppModel: ObservableObject {
         sessionStore.sessions().first { $0.id == terminalID }.map { URL(fileURLWithPath: $0.cwd) }
     }
 
+    /// The directory of the project the user is currently working in, used to
+    /// default new terminals/agents/chats to the active project instead of
+    /// forcing a folder picker every time (matching the Electron workflow).
+    /// Nil only when there's genuinely no project context to infer.
+    var currentProjectDirectory: URL? {
+        if let name = selectedProjectName,
+           let project = projects.first(where: { $0.name == name }),
+           let directory = project.directory {
+            return directory
+        }
+        if let sessionID = selectedSessionID, let directory = directory(for: sessionID) {
+            return directory
+        }
+        // With a single project open, that's unambiguously the context.
+        let all = projects
+        if all.count == 1 { return all.first?.directory }
+        return nil
+    }
+
     // MARK: - ACP chats
 
     /// Open a new ACP chat with the given agent in a directory. The adapter is

@@ -1,0 +1,44 @@
+{
+  "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/SourcePackages/checkouts/SwiftTerm/Sources/SwiftTerm/EscapeSequences.swift" : {
+    "const-values" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/SwiftTerm.build/Debug/SwiftTerm.build/Objects-normal/arm64/EscapeSequences.swiftconstvalues",
+    "dependencies" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/SwiftTerm.build/Debug/SwiftTerm.build/Objects-normal/arm64/EscapeSequences.d",
+    "diagnostics" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/SwiftTerm.build/Debug/SwiftTerm.build/Objects-normal/arm64/EscapeSequences.dia",
+    "object" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/SwiftTerm.build/Debug/SwiftTerm.build/Objects-normal/arm64/EscapeSequences.o",
+    "swift-dependencies" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/SwiftTerm.build/Debug/SwiftTerm.build/Objects-normal/arm64/EscapeSequences.swiftdeps"
+  },
+  "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/SourcePackages/checkouts/SwiftTerm/Sources/SwiftTerm/ExtensionsTerminal.swift" : {
+    "const-values" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/SwiftTerm.build/Debug/SwiftTerm.build/Objects-normal/arm64/ExtensionsTerminal.swiftconstvalues",
+    "dependencies" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/SwiftTerm.build/Debug/SwiftTerm.build/Objects-normal/arm64/ExtensionsTerminal.d",
+    "diagnostics" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/SwiftTerm.build/Debug/SwiftTerm.build/Objects-normal/arm64/ExtensionsTerminal.dia",
+    "object" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/SwiftTerm.build/Debug/SwiftTerm.build/Objects-normal/arm64/ExtensionsTerminal.o",
+    "swift-dependencies" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/SwiftTerm.build/Debug/SwiftTerm.build/Objects-normal/arm64/ExtensionsTerminal.swiftdeps"
+  },
+  "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/SourcePackages/checkouts/SwiftTerm/Sources/SwiftTerm/File.swift" : {
+    "const-values" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/SwiftTerm.build/Debug/SwiftTerm.build/Objects-normal/arm64/File.swiftconstvalues",
+    "dependencies" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/SwiftTerm.build/Debug/SwiftTerm.build/Objects-normal/arm64/File.d",
+    "diagnostics" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/SwiftTerm.build/Debug/SwiftTerm.build/Objects-normal/arm64/File.dia",
+    "object" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/SwiftTerm.build/Debug/SwiftTerm.build/Objects-normal/arm64/File.o",
+    "swift-dependencies" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/SwiftTerm.build/Debug/SwiftTerm.build/Objects-normal/arm64/File.swiftdeps"
+  },
+  "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/SourcePackages/checkouts/SwiftTerm/Sources/SwiftTerm/HangulInput.swift" : {
+    "const-values" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/SwiftTerm.build/Debug/SwiftTerm.build/Objects-normal/arm64/HangulInput.swiftconstvalues",
+    "dependencies" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/SwiftTerm.build/Debug/SwiftTerm.build/Objects-normal/arm64/HangulInput.d",
+    "diagnostics" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/SwiftTerm.build/Debug/SwiftTerm.build/Objects-normal/arm64/HangulInput.dia",
+    "object" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/SwiftTerm.build/Debug/SwiftTerm.build/Objects-normal/arm64/HangulInput.o",
+    "swift-dependencies" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/SwiftTerm.build/Debug/SwiftTerm.build/Objects-normal/arm64/HangulInput.swiftdeps"
+  },
+  "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/SourcePackages/checkouts/SwiftTerm/Sources/SwiftTerm/HeadlessTerminal.swift" : {
+    "const-values" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/SwiftTerm.build/Debug/SwiftTerm.build/Objects-normal/arm64/HeadlessTerminal.swiftconstvalues",
+    "dependencies" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/SwiftTerm.build/Debug/SwiftTerm.build/Objects-normal/arm64/HeadlessTerminal.d",
+    "diagnostics" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/SwiftTerm.build/Debug/SwiftTerm.build/Objects-normal/arm64/HeadlessTerminal.dia",
+    "object" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/SwiftTerm.build/Debug/SwiftTerm.build/Objects-normal/arm64/HeadlessTerminal.o",
+    "swift-dependencies" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/SwiftTerm.build/Debug/SwiftTerm.build/Objects-normal/arm64/HeadlessTerminal.swiftdeps"
+  },
+  "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/SourcePackages/checkouts/SwiftTerm/Sources/SwiftTerm/KittyGraphics.swift" : {
+    "const-values" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/SwiftTerm.build/Debug/SwiftTerm.build/Objects-normal/arm64/KittyGraphics.swiftconstvalues",
+    "dependencies" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/SwiftTerm.build/Debug/SwiftTerm.build/Objects-normal/arm64/KittyGraphics.d",
+    "diagnostics" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/SwiftTerm.build/Debug/SwiftTerm.build/Objects-normal/arm64/KittyGraphics.dia",
+    "object" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/SwiftTerm.build/Debug/SwiftTerm.build/Objects-normal/arm64/KittyGraphics.o",
+    "swift-dependencies" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/SwiftTerm.build/Debug/SwiftTerm.build/Objects-normal/arm64/KittyGraphics.swiftdeps"
+  }
+}

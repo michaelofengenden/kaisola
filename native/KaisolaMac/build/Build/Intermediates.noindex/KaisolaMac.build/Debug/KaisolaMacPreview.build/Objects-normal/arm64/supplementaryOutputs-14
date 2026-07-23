@@ -1,0 +1,30 @@
+{
+  "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/Kaisola/Broker/BrokerControlClient.swift" : {
+    "const-values" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/BrokerControlClient.swiftconstvalues",
+    "dependencies" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/BrokerControlClient.d",
+    "diagnostics" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/BrokerControlClient.dia",
+    "object" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/BrokerControlClient.o",
+    "swift-dependencies" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/BrokerControlClient.swiftdeps"
+  },
+  "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/Kaisola/Broker/BrokerInfo.swift" : {
+    "const-values" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/BrokerInfo.swiftconstvalues",
+    "dependencies" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/BrokerInfo.d",
+    "diagnostics" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/BrokerInfo.dia",
+    "object" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/BrokerInfo.o",
+    "swift-dependencies" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/BrokerInfo.swiftdeps"
+  },
+  "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/Shared/BrokerBootstrapXPC.swift" : {
+    "const-values" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/BrokerBootstrapXPC.swiftconstvalues",
+    "dependencies" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/BrokerBootstrapXPC.d",
+    "diagnostics" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/BrokerBootstrapXPC.dia",
+    "object" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/BrokerBootstrapXPC.o",
+    "swift-dependencies" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/BrokerBootstrapXPC.swiftdeps"
+  },
+  "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/Shared/BrokerHelperPackage.swift" : {
+    "const-values" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/BrokerHelperPackage.swiftconstvalues",
+    "dependencies" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/BrokerHelperPackage.d",
+    "diagnostics" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/BrokerHelperPackage.dia",
+    "object" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/BrokerHelperPackage.o",
+    "swift-dependencies" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/BrokerHelperPackage.swiftdeps"
+  }
+}

@@ -1,0 +1,399 @@
+{
+  "" : {
+    "diagnostics" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/KaisolaMacPreview-primary.dia",
+    "emit-module-dependencies" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/KaisolaMacPreview-primary-emit-module.d",
+    "emit-module-diagnostics" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/KaisolaMacPreview-primary-emit-module.dia",
+    "pch" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/KaisolaMacPreview-primary-Bridging-header.pch",
+    "swift-dependencies" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/KaisolaMacPreview-primary.swiftdeps"
+  },
+  "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/Kaisola/Acp/AcpAdapterResolver.swift" : {
+    "const-values" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/AcpAdapterResolver.swiftconstvalues",
+    "dependencies" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/AcpAdapterResolver.d",
+    "diagnostics" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/AcpAdapterResolver.dia",
+    "index-unit-output-path" : "/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/AcpAdapterResolver.o",
+    "llvm-bc" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/AcpAdapterResolver.bc",
+    "object" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/AcpAdapterResolver.o",
+    "swift-dependencies" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/AcpAdapterResolver.swiftdeps",
+    "swiftmodule" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/AcpAdapterResolver~partial.swiftmodule"
+  },
+  "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/Kaisola/Acp/AcpChatHandle.swift" : {
+    "const-values" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/AcpChatHandle.swiftconstvalues",
+    "dependencies" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/AcpChatHandle.d",
+    "diagnostics" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/AcpChatHandle.dia",
+    "index-unit-output-path" : "/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/AcpChatHandle.o",
+    "llvm-bc" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/AcpChatHandle.bc",
+    "object" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/AcpChatHandle.o",
+    "swift-dependencies" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/AcpChatHandle.swiftdeps",
+    "swiftmodule" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/AcpChatHandle~partial.swiftmodule"
+  },
+  "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/Kaisola/Acp/AcpChatView.swift" : {
+    "const-values" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/AcpChatView.swiftconstvalues",
+    "dependencies" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/AcpChatView.d",
+    "diagnostics" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/AcpChatView.dia",
+    "index-unit-output-path" : "/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/AcpChatView.o",
+    "llvm-bc" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/AcpChatView.bc",
+    "object" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/AcpChatView.o",
+    "swift-dependencies" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/AcpChatView.swiftdeps",
+    "swiftmodule" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/AcpChatView~partial.swiftmodule"
+  },
+  "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/Kaisola/Acp/AcpClient.swift" : {
+    "const-values" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/AcpClient.swiftconstvalues",
+    "dependencies" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/AcpClient.d",
+    "diagnostics" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/AcpClient.dia",
+    "index-unit-output-path" : "/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/AcpClient.o",
+    "llvm-bc" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/AcpClient.bc",
+    "object" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/AcpClient.o",
+    "swift-dependencies" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/AcpClient.swiftdeps",
+    "swiftmodule" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/AcpClient~partial.swiftmodule"
+  },
+  "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/Kaisola/Acp/AcpConversation.swift" : {
+    "const-values" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/AcpConversation.swiftconstvalues",
+    "dependencies" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/AcpConversation.d",
+    "diagnostics" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/AcpConversation.dia",
+    "index-unit-output-path" : "/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/AcpConversation.o",
+    "llvm-bc" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/AcpConversation.bc",
+    "object" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/AcpConversation.o",
+    "swift-dependencies" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/AcpConversation.swiftdeps",
+    "swiftmodule" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/AcpConversation~partial.swiftmodule"
+  },
+  "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/Kaisola/Acp/AcpDiff.swift" : {
+    "const-values" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/AcpDiff.swiftconstvalues",
+    "dependencies" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/AcpDiff.d",
+    "diagnostics" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/AcpDiff.dia",
+    "index-unit-output-path" : "/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/AcpDiff.o",
+    "llvm-bc" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/AcpDiff.bc",
+    "object" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/AcpDiff.o",
+    "swift-dependencies" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/AcpDiff.swiftdeps",
+    "swiftmodule" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/AcpDiff~partial.swiftmodule"
+  },
+  "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/Kaisola/Acp/AcpModels.swift" : {
+    "const-values" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/AcpModels.swiftconstvalues",
+    "dependencies" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/AcpModels.d",
+    "diagnostics" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/AcpModels.dia",
+    "index-unit-output-path" : "/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/AcpModels.o",
+    "llvm-bc" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/AcpModels.bc",
+    "object" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/AcpModels.o",
+    "swift-dependencies" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/AcpModels.swiftdeps",
+    "swiftmodule" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/AcpModels~partial.swiftmodule"
+  },
+  "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/Kaisola/Acp/AcpPermissionRules.swift" : {
+    "const-values" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/AcpPermissionRules.swiftconstvalues",
+    "dependencies" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/AcpPermissionRules.d",
+    "diagnostics" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/AcpPermissionRules.dia",
+    "index-unit-output-path" : "/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/AcpPermissionRules.o",
+    "llvm-bc" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/AcpPermissionRules.bc",
+    "object" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/AcpPermissionRules.o",
+    "swift-dependencies" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/AcpPermissionRules.swiftdeps",
+    "swiftmodule" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/AcpPermissionRules~partial.swiftmodule"
+  },
+  "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/Kaisola/Acp/AcpProcessTransport.swift" : {
+    "const-values" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/AcpProcessTransport.swiftconstvalues",
+    "dependencies" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/AcpProcessTransport.d",
+    "diagnostics" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/AcpProcessTransport.dia",
+    "index-unit-output-path" : "/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/AcpProcessTransport.o",
+    "llvm-bc" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/AcpProcessTransport.bc",
+    "object" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/AcpProcessTransport.o",
+    "swift-dependencies" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/AcpProcessTransport.swiftdeps",
+    "swiftmodule" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/AcpProcessTransport~partial.swiftmodule"
+  },
+  "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/Kaisola/Acp/PermissionRuleStore.swift" : {
+    "const-values" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/PermissionRuleStore.swiftconstvalues",
+    "dependencies" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/PermissionRuleStore.d",
+    "diagnostics" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/PermissionRuleStore.dia",
+    "index-unit-output-path" : "/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/PermissionRuleStore.o",
+    "llvm-bc" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/PermissionRuleStore.bc",
+    "object" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/PermissionRuleStore.o",
+    "swift-dependencies" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/PermissionRuleStore.swiftdeps",
+    "swiftmodule" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/PermissionRuleStore~partial.swiftmodule"
+  },
+  "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/Kaisola/App/AppModel.swift" : {
+    "const-values" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/AppModel.swiftconstvalues",
+    "dependencies" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/AppModel.d",
+    "diagnostics" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/AppModel.dia",
+    "index-unit-output-path" : "/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/AppModel.o",
+    "llvm-bc" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/AppModel.bc",
+    "object" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/AppModel.o",
+    "swift-dependencies" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/AppModel.swiftdeps",
+    "swiftmodule" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/AppModel~partial.swiftmodule"
+  },
+  "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/Kaisola/App/KaisolaMacAppDelegate.swift" : {
+    "const-values" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/KaisolaMacAppDelegate.swiftconstvalues",
+    "dependencies" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/KaisolaMacAppDelegate.d",
+    "diagnostics" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/KaisolaMacAppDelegate.dia",
+    "index-unit-output-path" : "/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/KaisolaMacAppDelegate.o",
+    "llvm-bc" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/KaisolaMacAppDelegate.bc",
+    "object" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/KaisolaMacAppDelegate.o",
+    "swift-dependencies" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/KaisolaMacAppDelegate.swiftdeps",
+    "swiftmodule" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/KaisolaMacAppDelegate~partial.swiftmodule"
+  },
+  "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/Kaisola/App/NativePreviewPaths.swift" : {
+    "const-values" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/NativePreviewPaths.swiftconstvalues",
+    "dependencies" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/NativePreviewPaths.d",
+    "diagnostics" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/NativePreviewPaths.dia",
+    "index-unit-output-path" : "/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/NativePreviewPaths.o",
+    "llvm-bc" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/NativePreviewPaths.bc",
+    "object" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/NativePreviewPaths.o",
+    "swift-dependencies" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/NativePreviewPaths.swiftdeps",
+    "swiftmodule" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/NativePreviewPaths~partial.swiftmodule"
+  },
+  "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/Kaisola/App/NativePreviewSettings.swift" : {
+    "const-values" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/NativePreviewSettings.swiftconstvalues",
+    "dependencies" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/NativePreviewSettings.d",
+    "diagnostics" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/NativePreviewSettings.dia",
+    "index-unit-output-path" : "/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/NativePreviewSettings.o",
+    "llvm-bc" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/NativePreviewSettings.bc",
+    "object" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/NativePreviewSettings.o",
+    "swift-dependencies" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/NativePreviewSettings.swiftdeps",
+    "swiftmodule" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/NativePreviewSettings~partial.swiftmodule"
+  },
+  "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/Kaisola/Broker/AgentRegistry.swift" : {
+    "const-values" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/AgentRegistry.swiftconstvalues",
+    "dependencies" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/AgentRegistry.d",
+    "diagnostics" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/AgentRegistry.dia",
+    "index-unit-output-path" : "/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/AgentRegistry.o",
+    "llvm-bc" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/AgentRegistry.bc",
+    "object" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/AgentRegistry.o",
+    "swift-dependencies" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/AgentRegistry.swiftdeps",
+    "swiftmodule" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/AgentRegistry~partial.swiftmodule"
+  },
+  "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/Kaisola/Broker/BrokerBootstrapClient.swift" : {
+    "const-values" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/BrokerBootstrapClient.swiftconstvalues",
+    "dependencies" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/BrokerBootstrapClient.d",
+    "diagnostics" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/BrokerBootstrapClient.dia",
+    "index-unit-output-path" : "/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/BrokerBootstrapClient.o",
+    "llvm-bc" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/BrokerBootstrapClient.bc",
+    "object" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/BrokerBootstrapClient.o",
+    "swift-dependencies" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/BrokerBootstrapClient.swiftdeps",
+    "swiftmodule" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/BrokerBootstrapClient~partial.swiftmodule"
+  },
+  "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/Kaisola/Broker/BrokerControlClient.swift" : {
+    "const-values" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/BrokerControlClient.swiftconstvalues",
+    "dependencies" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/BrokerControlClient.d",
+    "diagnostics" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/BrokerControlClient.dia",
+    "index-unit-output-path" : "/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/BrokerControlClient.o",
+    "llvm-bc" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/BrokerControlClient.bc",
+    "object" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/BrokerControlClient.o",
+    "swift-dependencies" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/BrokerControlClient.swiftdeps",
+    "swiftmodule" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/BrokerControlClient~partial.swiftmodule"
+  },
+  "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/Kaisola/Broker/BrokerInfo.swift" : {
+    "const-values" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/BrokerInfo.swiftconstvalues",
+    "dependencies" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/BrokerInfo.d",
+    "diagnostics" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/BrokerInfo.dia",
+    "index-unit-output-path" : "/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/BrokerInfo.o",
+    "llvm-bc" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/BrokerInfo.bc",
+    "object" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/BrokerInfo.o",
+    "swift-dependencies" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/BrokerInfo.swiftdeps",
+    "swiftmodule" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/BrokerInfo~partial.swiftmodule"
+  },
+  "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/Kaisola/Broker/BrokerModels.swift" : {
+    "const-values" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/BrokerModels.swiftconstvalues",
+    "dependencies" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/BrokerModels.d",
+    "diagnostics" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/BrokerModels.dia",
+    "index-unit-output-path" : "/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/BrokerModels.o",
+    "llvm-bc" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/BrokerModels.bc",
+    "object" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/BrokerModels.o",
+    "swift-dependencies" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/BrokerModels.swiftdeps",
+    "swiftmodule" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/BrokerModels~partial.swiftmodule"
+  },
+  "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/Kaisola/Broker/BrokerReconnectBackoff.swift" : {
+    "const-values" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/BrokerReconnectBackoff.swiftconstvalues",
+    "dependencies" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/BrokerReconnectBackoff.d",
+    "diagnostics" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/BrokerReconnectBackoff.dia",
+    "index-unit-output-path" : "/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/BrokerReconnectBackoff.o",
+    "llvm-bc" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/BrokerReconnectBackoff.bc",
+    "object" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/BrokerReconnectBackoff.o",
+    "swift-dependencies" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/BrokerReconnectBackoff.swiftdeps",
+    "swiftmodule" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/BrokerReconnectBackoff~partial.swiftmodule"
+  },
+  "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/Kaisola/Broker/BrokerStartupCoordinator.swift" : {
+    "const-values" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/BrokerStartupCoordinator.swiftconstvalues",
+    "dependencies" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/BrokerStartupCoordinator.d",
+    "diagnostics" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/BrokerStartupCoordinator.dia",
+    "index-unit-output-path" : "/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/BrokerStartupCoordinator.o",
+    "llvm-bc" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/BrokerStartupCoordinator.bc",
+    "object" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/BrokerStartupCoordinator.o",
+    "swift-dependencies" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/BrokerStartupCoordinator.swiftdeps",
+    "swiftmodule" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/BrokerStartupCoordinator~partial.swiftmodule"
+  },
+  "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/Kaisola/Broker/NativeSessionStore.swift" : {
+    "const-values" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/NativeSessionStore.swiftconstvalues",
+    "dependencies" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/NativeSessionStore.d",
+    "diagnostics" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/NativeSessionStore.dia",
+    "index-unit-output-path" : "/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/NativeSessionStore.o",
+    "llvm-bc" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/NativeSessionStore.bc",
+    "object" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/NativeSessionStore.o",
+    "swift-dependencies" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/NativeSessionStore.swiftdeps",
+    "swiftmodule" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/NativeSessionStore~partial.swiftmodule"
+  },
+  "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/Kaisola/Broker/ObserveOnlyBrokerClient.swift" : {
+    "const-values" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/ObserveOnlyBrokerClient.swiftconstvalues",
+    "dependencies" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/ObserveOnlyBrokerClient.d",
+    "diagnostics" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/ObserveOnlyBrokerClient.dia",
+    "index-unit-output-path" : "/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/ObserveOnlyBrokerClient.o",
+    "llvm-bc" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/ObserveOnlyBrokerClient.bc",
+    "object" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/ObserveOnlyBrokerClient.o",
+    "swift-dependencies" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/ObserveOnlyBrokerClient.swiftdeps",
+    "swiftmodule" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/ObserveOnlyBrokerClient~partial.swiftmodule"
+  },
+  "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/Kaisola/Broker/ObserveOnlyBrokerPolicy.swift" : {
+    "const-values" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/ObserveOnlyBrokerPolicy.swiftconstvalues",
+    "dependencies" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/ObserveOnlyBrokerPolicy.d",
+    "diagnostics" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/ObserveOnlyBrokerPolicy.dia",
+    "index-unit-output-path" : "/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/ObserveOnlyBrokerPolicy.o",
+    "llvm-bc" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/ObserveOnlyBrokerPolicy.bc",
+    "object" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/ObserveOnlyBrokerPolicy.o",
+    "swift-dependencies" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/ObserveOnlyBrokerPolicy.swiftdeps",
+    "swiftmodule" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/ObserveOnlyBrokerPolicy~partial.swiftmodule"
+  },
+  "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/Kaisola/Broker/TerminalCursorStore.swift" : {
+    "const-values" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/TerminalCursorStore.swiftconstvalues",
+    "dependencies" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/TerminalCursorStore.d",
+    "diagnostics" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/TerminalCursorStore.dia",
+    "index-unit-output-path" : "/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/TerminalCursorStore.o",
+    "llvm-bc" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/TerminalCursorStore.bc",
+    "object" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/TerminalCursorStore.o",
+    "swift-dependencies" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/TerminalCursorStore.swiftdeps",
+    "swiftmodule" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/TerminalCursorStore~partial.swiftmodule"
+  },
+  "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/Kaisola/Broker/UnixBrokerTransport.swift" : {
+    "const-values" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/UnixBrokerTransport.swiftconstvalues",
+    "dependencies" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/UnixBrokerTransport.d",
+    "diagnostics" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/UnixBrokerTransport.dia",
+    "index-unit-output-path" : "/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/UnixBrokerTransport.o",
+    "llvm-bc" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/UnixBrokerTransport.bc",
+    "object" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/UnixBrokerTransport.o",
+    "swift-dependencies" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/UnixBrokerTransport.swiftdeps",
+    "swiftmodule" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/UnixBrokerTransport~partial.swiftmodule"
+  },
+  "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/Kaisola/Features/Palette/CommandPaletteView.swift" : {
+    "const-values" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/CommandPaletteView.swiftconstvalues",
+    "dependencies" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/CommandPaletteView.d",
+    "diagnostics" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/CommandPaletteView.dia",
+    "index-unit-output-path" : "/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/CommandPaletteView.o",
+    "llvm-bc" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/CommandPaletteView.bc",
+    "object" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/CommandPaletteView.o",
+    "swift-dependencies" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/CommandPaletteView.swiftdeps",
+    "swiftmodule" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/CommandPaletteView~partial.swiftmodule"
+  },
+  "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/Kaisola/Features/Palette/FuzzyMatch.swift" : {
+    "const-values" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/FuzzyMatch.swiftconstvalues",
+    "dependencies" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/FuzzyMatch.d",
+    "diagnostics" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/FuzzyMatch.dia",
+    "index-unit-output-path" : "/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/FuzzyMatch.o",
+    "llvm-bc" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/FuzzyMatch.bc",
+    "object" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/FuzzyMatch.o",
+    "swift-dependencies" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/FuzzyMatch.swiftdeps",
+    "swiftmodule" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/FuzzyMatch~partial.swiftmodule"
+  },
+  "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/Kaisola/Features/Sessions/NativeTerminalSurface.swift" : {
+    "const-values" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/NativeTerminalSurface.swiftconstvalues",
+    "dependencies" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/NativeTerminalSurface.d",
+    "diagnostics" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/NativeTerminalSurface.dia",
+    "index-unit-output-path" : "/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/NativeTerminalSurface.o",
+    "llvm-bc" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/NativeTerminalSurface.bc",
+    "object" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/NativeTerminalSurface.o",
+    "swift-dependencies" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/NativeTerminalSurface.swiftdeps",
+    "swiftmodule" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/NativeTerminalSurface~partial.swiftmodule"
+  },
+  "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/Kaisola/Features/Sessions/RootShellView.swift" : {
+    "const-values" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/RootShellView.swiftconstvalues",
+    "dependencies" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/RootShellView.d",
+    "diagnostics" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/RootShellView.dia",
+    "index-unit-output-path" : "/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/RootShellView.o",
+    "llvm-bc" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/RootShellView.bc",
+    "object" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/RootShellView.o",
+    "swift-dependencies" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/RootShellView.swiftdeps",
+    "swiftmodule" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/RootShellView~partial.swiftmodule"
+  },
+  "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/Kaisola/Features/Sessions/TerminalDocument.swift" : {
+    "const-values" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/TerminalDocument.swiftconstvalues",
+    "dependencies" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/TerminalDocument.d",
+    "diagnostics" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/TerminalDocument.dia",
+    "index-unit-output-path" : "/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/TerminalDocument.o",
+    "llvm-bc" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/TerminalDocument.bc",
+    "object" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/TerminalDocument.o",
+    "swift-dependencies" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/TerminalDocument.swiftdeps",
+    "swiftmodule" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/TerminalDocument~partial.swiftmodule"
+  },
+  "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/Kaisola/Features/Sessions/TerminalTheme.swift" : {
+    "const-values" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/TerminalTheme.swiftconstvalues",
+    "dependencies" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/TerminalTheme.d",
+    "diagnostics" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/TerminalTheme.dia",
+    "index-unit-output-path" : "/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/TerminalTheme.o",
+    "llvm-bc" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/TerminalTheme.bc",
+    "object" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/TerminalTheme.o",
+    "swift-dependencies" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/TerminalTheme.swiftdeps",
+    "swiftmodule" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/TerminalTheme~partial.swiftmodule"
+  },
+  "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/Kaisola/Git/GitPanelView.swift" : {
+    "const-values" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/GitPanelView.swiftconstvalues",
+    "dependencies" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/GitPanelView.d",
+    "diagnostics" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/GitPanelView.dia",
+    "index-unit-output-path" : "/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/GitPanelView.o",
+    "llvm-bc" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/GitPanelView.bc",
+    "object" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/GitPanelView.o",
+    "swift-dependencies" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/GitPanelView.swiftdeps",
+    "swiftmodule" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/GitPanelView~partial.swiftmodule"
+  },
+  "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/Kaisola/Git/GitService.swift" : {
+    "const-values" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/GitService.swiftconstvalues",
+    "dependencies" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/GitService.d",
+    "diagnostics" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/GitService.dia",
+    "index-unit-output-path" : "/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/GitService.o",
+    "llvm-bc" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/GitService.bc",
+    "object" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/GitService.o",
+    "swift-dependencies" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/GitService.swiftdeps",
+    "swiftmodule" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/GitService~partial.swiftmodule"
+  },
+  "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/Kaisola/Updates/NativeUpdateConfiguration.swift" : {
+    "const-values" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/NativeUpdateConfiguration.swiftconstvalues",
+    "dependencies" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/NativeUpdateConfiguration.d",
+    "diagnostics" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/NativeUpdateConfiguration.dia",
+    "index-unit-output-path" : "/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/NativeUpdateConfiguration.o",
+    "llvm-bc" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/NativeUpdateConfiguration.bc",
+    "object" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/NativeUpdateConfiguration.o",
+    "swift-dependencies" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/NativeUpdateConfiguration.swiftdeps",
+    "swiftmodule" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/NativeUpdateConfiguration~partial.swiftmodule"
+  },
+  "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/Kaisola/Updates/NativeUpdateController.swift" : {
+    "const-values" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/NativeUpdateController.swiftconstvalues",
+    "dependencies" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/NativeUpdateController.d",
+    "diagnostics" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/NativeUpdateController.dia",
+    "index-unit-output-path" : "/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/NativeUpdateController.o",
+    "llvm-bc" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/NativeUpdateController.bc",
+    "object" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/NativeUpdateController.o",
+    "swift-dependencies" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/NativeUpdateController.swiftdeps",
+    "swiftmodule" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/NativeUpdateController~partial.swiftmodule"
+  },
+  "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/Shared/BrokerBootstrapXPC.swift" : {
+    "const-values" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/BrokerBootstrapXPC.swiftconstvalues",
+    "dependencies" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/BrokerBootstrapXPC.d",
+    "diagnostics" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/BrokerBootstrapXPC.dia",
+    "index-unit-output-path" : "/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/BrokerBootstrapXPC.o",
+    "llvm-bc" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/BrokerBootstrapXPC.bc",
+    "object" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/BrokerBootstrapXPC.o",
+    "swift-dependencies" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/BrokerBootstrapXPC.swiftdeps",
+    "swiftmodule" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/BrokerBootstrapXPC~partial.swiftmodule"
+  },
+  "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/Shared/BrokerHelperPackage.swift" : {
+    "const-values" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/BrokerHelperPackage.swiftconstvalues",
+    "dependencies" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/BrokerHelperPackage.d",
+    "diagnostics" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/BrokerHelperPackage.dia",
+    "index-unit-output-path" : "/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/BrokerHelperPackage.o",
+    "llvm-bc" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/BrokerHelperPackage.bc",
+    "object" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/BrokerHelperPackage.o",
+    "swift-dependencies" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/BrokerHelperPackage.swiftdeps",
+    "swiftmodule" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/BrokerHelperPackage~partial.swiftmodule"
+  },
+  "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/Shared/BrokerLaunchConfiguration.swift" : {
+    "const-values" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/BrokerLaunchConfiguration.swiftconstvalues",
+    "dependencies" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/BrokerLaunchConfiguration.d",
+    "diagnostics" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/BrokerLaunchConfiguration.dia",
+    "index-unit-output-path" : "/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/BrokerLaunchConfiguration.o",
+    "llvm-bc" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/BrokerLaunchConfiguration.bc",
+    "object" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/BrokerLaunchConfiguration.o",
+    "swift-dependencies" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/BrokerLaunchConfiguration.swiftdeps",
+    "swiftmodule" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaMac.build/Debug/KaisolaMacPreview.build/Objects-normal/arm64/BrokerLaunchConfiguration~partial.swiftmodule"
+  }
+}

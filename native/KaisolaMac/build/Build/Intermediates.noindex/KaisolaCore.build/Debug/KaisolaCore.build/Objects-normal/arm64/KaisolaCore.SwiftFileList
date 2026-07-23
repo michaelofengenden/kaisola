@@ -1,0 +1,10 @@
+/Users/michaelofengenden/Developer/Kaisola/native/KaisolaCore/Sources/KaisolaCore/Domain/CompanionModels.swift
+/Users/michaelofengenden/Developer/Kaisola/native/KaisolaCore/Sources/KaisolaCore/KaisolaCoreVersion.swift
+/Users/michaelofengenden/Developer/Kaisola/native/KaisolaCore/Sources/KaisolaCore/Protocol/CompanionProtocol.swift
+/Users/michaelofengenden/Developer/Kaisola/native/KaisolaCore/Sources/KaisolaCore/Protocol/JSONValue.swift
+/Users/michaelofengenden/Developer/Kaisola/native/KaisolaCore/Sources/KaisolaCore/Security/CompanionCrypto.swift
+/Users/michaelofengenden/Developer/Kaisola/native/KaisolaCore/Sources/KaisolaCore/Security/CompanionIdentity.swift
+/Users/michaelofengenden/Developer/Kaisola/native/KaisolaCore/Sources/KaisolaCore/Security/NoiseXX.swift
+/Users/michaelofengenden/Developer/Kaisola/native/KaisolaCore/Sources/KaisolaCore/Security/PairingModels.swift
+/Users/michaelofengenden/Developer/Kaisola/native/KaisolaCore/Sources/KaisolaCore/Security/SecureFrameChannel.swift
+/Users/michaelofengenden/Developer/Kaisola/native/KaisolaCore/Sources/KaisolaCore/Transport/LengthFraming.swift

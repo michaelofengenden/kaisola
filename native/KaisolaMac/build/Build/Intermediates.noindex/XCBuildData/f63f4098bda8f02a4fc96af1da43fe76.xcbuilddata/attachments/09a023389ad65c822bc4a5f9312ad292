@@ -1,0 +1,19 @@
+{
+  "" : {
+    "diagnostics" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaCore.build/Debug/KaisolaBrokerProtocol.build/Objects-normal/arm64/KaisolaBrokerProtocol-primary.dia",
+    "emit-module-dependencies" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaCore.build/Debug/KaisolaBrokerProtocol.build/Objects-normal/arm64/KaisolaBrokerProtocol-primary-emit-module.d",
+    "emit-module-diagnostics" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaCore.build/Debug/KaisolaBrokerProtocol.build/Objects-normal/arm64/KaisolaBrokerProtocol-primary-emit-module.dia",
+    "pch" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaCore.build/Debug/KaisolaBrokerProtocol.build/Objects-normal/arm64/KaisolaBrokerProtocol-primary-Bridging-header.pch",
+    "swift-dependencies" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaCore.build/Debug/KaisolaBrokerProtocol.build/Objects-normal/arm64/KaisolaBrokerProtocol-primary.swiftdeps"
+  },
+  "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaCore/Sources/KaisolaBrokerProtocol/BrokerWire.swift" : {
+    "const-values" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaCore.build/Debug/KaisolaBrokerProtocol.build/Objects-normal/arm64/BrokerWire.swiftconstvalues",
+    "dependencies" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaCore.build/Debug/KaisolaBrokerProtocol.build/Objects-normal/arm64/BrokerWire.d",
+    "diagnostics" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaCore.build/Debug/KaisolaBrokerProtocol.build/Objects-normal/arm64/BrokerWire.dia",
+    "index-unit-output-path" : "/KaisolaCore.build/Debug/KaisolaBrokerProtocol.build/Objects-normal/arm64/BrokerWire.o",
+    "llvm-bc" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaCore.build/Debug/KaisolaBrokerProtocol.build/Objects-normal/arm64/BrokerWire.bc",
+    "object" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaCore.build/Debug/KaisolaBrokerProtocol.build/Objects-normal/arm64/BrokerWire.o",
+    "swift-dependencies" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaCore.build/Debug/KaisolaBrokerProtocol.build/Objects-normal/arm64/BrokerWire.swiftdeps",
+    "swiftmodule" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/Build/Intermediates.noindex/KaisolaCore.build/Debug/KaisolaBrokerProtocol.build/Objects-normal/arm64/BrokerWire~partial.swiftmodule"
+  }
+}

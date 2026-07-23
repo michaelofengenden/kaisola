@@ -1,0 +1,83 @@
+{
+  "object" : {
+    "artifacts" : [
+      {
+        "kind" : {
+          "xcframework" : {
+
+          }
+        },
+        "packageRef" : {
+          "identity" : "sparkle",
+          "kind" : "remoteSourceControl",
+          "location" : "https://github.com/sparkle-project/Sparkle.git",
+          "name" : "Sparkle"
+        },
+        "path" : "/Users/michaelofengenden/Developer/Kaisola/native/KaisolaMac/build/SourcePackages/artifacts/sparkle/Sparkle/Sparkle.xcframework",
+        "source" : {
+          "checksum" : "b83e37436774556ed055e0244b297ef2c790e0737393bf65bf495fcbba6eed65",
+          "type" : "remote",
+          "url" : "https://github.com/sparkle-project/Sparkle/releases/download/2.9.2/Sparkle-for-Swift-Package-Manager.zip"
+        },
+        "targetName" : "Sparkle"
+      }
+    ],
+    "dependencies" : [
+      {
+        "basedOn" : null,
+        "packageRef" : {
+          "identity" : "sparkle",
+          "kind" : "remoteSourceControl",
+          "location" : "https://github.com/sparkle-project/Sparkle.git",
+          "name" : "Sparkle"
+        },
+        "state" : {
+          "checkoutState" : {
+            "revision" : "6276ba2b404829d139c45ff98427cf90e2efc59b",
+            "version" : "2.9.2"
+          },
+          "name" : "sourceControlCheckout"
+        },
+        "subpath" : "Sparkle"
+      },
+      {
+        "basedOn" : null,
+        "packageRef" : {
+          "identity" : "swift-argument-parser",
+          "kind" : "remoteSourceControl",
+          "location" : "https://github.com/apple/swift-argument-parser",
+          "name" : "swift-argument-parser"
+        },
+        "state" : {
+          "checkoutState" : {
+            "revision" : "6a52f3251125d74daf04fcbd5e6f08a75d074382",
+            "version" : "1.8.2"
+          },
+          "name" : "sourceControlCheckout"
+        },
+        "subpath" : "swift-argument-parser"
+      },
+      {
+        "basedOn" : null,
+        "packageRef" : {
+          "identity" : "swiftterm",
+          "kind" : "remoteSourceControl",
+          "location" : "https://github.com/migueldeicaza/SwiftTerm.git",
+          "name" : "SwiftTerm"
+        },
+        "state" : {
+          "checkoutState" : {
+            "revision" : "dd2fb8ac5b861e7bf617c872895e338f38165648",
+            "version" : "1.15.0"
+          },
+          "name" : "sourceControlCheckout"
+        },
+        "subpath" : "SwiftTerm"
+      }
+    ],
+    "prebuilts" : [
+
+    ]
+  },
+  "version" : 7
+}

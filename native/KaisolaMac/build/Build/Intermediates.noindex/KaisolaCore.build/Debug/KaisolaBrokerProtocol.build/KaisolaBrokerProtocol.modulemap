@@ -1,4 +1,0 @@
-module KaisolaBrokerProtocol {
-header "KaisolaBrokerProtocol-Swift.h"
-export *
-}

@@ -39,6 +39,7 @@ kaisola_icon_concepts/
 **/.build/
 **/.swiftpm/
 **/DerivedData/
+native/KaisolaMac/build/
 **/xcuserdata/
 *.xcuserstate
 native/KaisolaMac/.artifacts/

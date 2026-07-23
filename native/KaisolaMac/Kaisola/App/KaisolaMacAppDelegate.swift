@@ -23,7 +23,7 @@ enum KaisolaMacMain {
 }
 
 @MainActor
-final class KaisolaMacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
+final class KaisolaMacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMenuDelegate {
     private let settings = NativePreviewSettings.shared
     private let updateController = NativeUpdateController()
     // Each window is an independent workspace with its own AppModel and broker
@@ -155,6 +155,99 @@ final class KaisolaMacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDele
     @objc private func decreaseTerminalFont(_ sender: Any?) { settings.adjustTerminalFont(by: -1) }
     @objc private func resetTerminalFont(_ sender: Any?) { settings.resetTerminalFont() }
 
+    // MARK: - Recents & saved windows
+
+    private let savedWindows = SavedWindowsStore()
+
+    @objc private func openRecentFolder(_ sender: Any?) {
+        guard let path = (sender as? NSMenuItem)?.representedObject as? String,
+              let model = keyModel() else { return }
+        model.openProject(directory: URL(fileURLWithPath: path, isDirectory: true))
+    }
+
+    /// Save the key window's frame + active project under a user-chosen name.
+    @objc private func saveWindowLayout(_ sender: Any?) {
+        guard let window = NSApp.keyWindow, let model = windowModels[ObjectIdentifier(window)] else { return }
+        let alert = NSAlert()
+        alert.messageText = "Save Window Layout"
+        alert.informativeText = "Name this window state; opening it later restores the frame and active project."
+        alert.addButton(withTitle: "Save")
+        alert.addButton(withTitle: "Cancel")
+        let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 240, height: 24))
+        field.placeholderString = "Layout name"
+        alert.accessoryView = field
+        alert.window.initialFirstResponder = field
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        let name = field.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !name.isEmpty else { return }
+        savedWindows.save(SavedWindowState(
+            name: name,
+            frame: NSStringFromRect(window.frame),
+            projectName: model.selectedProjectName
+        ))
+    }
+
+    @objc private func openSavedWindow(_ sender: Any?) {
+        guard let name = (sender as? NSMenuItem)?.representedObject as? String,
+              let state = savedWindows.all().first(where: { $0.name == name }) else { return }
+        let window = makeWindow()
+        let frame = NSRectFromString(state.frame)
+        if frame.width > 200, frame.height > 200 { window.setFrame(frame, display: true) }
+        if let projectName = state.projectName,
+           let model = windowModels[ObjectIdentifier(window)] {
+            model.selectedProjectName = projectName
+        }
+    }
+
+    @objc private func deleteSavedWindow(_ sender: Any?) {
+        guard let name = (sender as? NSMenuItem)?.representedObject as? String else { return }
+        savedWindows.remove(name: name)
+    }
+
+    /// Populates the dynamic submenus (Open Recent / Saved Windows) on open.
+    func menuNeedsUpdate(_ menu: NSMenu) {
+        menu.removeAllItems()
+        switch menu.title {
+        case "Open Recent":
+            let recents = NativeSessionStore().recentFolders()
+            if recents.isEmpty {
+                menu.addItem(NSMenuItem(title: "No Recent Folders", action: nil, keyEquivalent: ""))
+            }
+            for path in recents {
+                let item = menu.addItem(
+                    withTitle: (path as NSString).abbreviatingWithTildeInPath,
+                    action: #selector(openRecentFolder(_:)),
+                    keyEquivalent: ""
+                )
+                item.target = self
+                item.representedObject = path
+            }
+        case "Saved Windows":
+            let states = savedWindows.all()
+            if states.isEmpty {
+                menu.addItem(NSMenuItem(title: "No Saved Windows", action: nil, keyEquivalent: ""))
+            }
+            for state in states {
+                let item = menu.addItem(withTitle: state.name, action: #selector(openSavedWindow(_:)), keyEquivalent: "")
+                item.target = self
+                item.representedObject = state.name
+            }
+            if !states.isEmpty {
+                menu.addItem(.separator())
+                let deleteItem = menu.addItem(withTitle: "Delete Saved Window", action: nil, keyEquivalent: "")
+                let deleteMenu = NSMenu(title: "Delete Saved Window")
+                for state in states {
+                    let item = deleteMenu.addItem(withTitle: state.name, action: #selector(deleteSavedWindow(_:)), keyEquivalent: "")
+                    item.target = self
+                    item.representedObject = state.name
+                }
+                deleteItem.submenu = deleteMenu
+            }
+        default:
+            break
+        }
+    }
+
     @objc private func checkForUpdates(_ sender: Any?) {
         updateController.checkForUpdates(sender)
     }
@@ -230,6 +323,9 @@ final class KaisolaMacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDele
             fontIncreaseAction: #selector(increaseTerminalFont(_:)),
             fontDecreaseAction: #selector(decreaseTerminalFont(_:)),
             fontResetAction: #selector(resetTerminalFont(_:)),
+            dynamicMenusDelegate: self,
+            saveWindowTarget: self,
+            saveWindowAction: #selector(saveWindowLayout(_:)),
             currentLayout: settings.navigationLayout.rawValue,
             currentAppearance: settings.appearance.rawValue
         )
@@ -266,6 +362,9 @@ final class KaisolaMacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDele
         fontIncreaseAction: Selector? = nil,
         fontDecreaseAction: Selector? = nil,
         fontResetAction: Selector? = nil,
+        dynamicMenusDelegate: NSMenuDelegate? = nil,
+        saveWindowTarget: AnyObject? = nil,
+        saveWindowAction: Selector? = nil,
         currentLayout: String = NavigationLayout.leftTree.rawValue,
         currentAppearance: String = AppearanceMode.system.rawValue
     ) -> NSMenu {
@@ -313,6 +412,12 @@ final class KaisolaMacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDele
         if let openFolderAction {
             let item = fileMenu.addItem(withTitle: "Open Folder…", action: openFolderAction, keyEquivalent: "o")
             item.target = openFolderTarget
+        }
+        if let dynamicMenusDelegate {
+            let recentItem = fileMenu.addItem(withTitle: "Open Recent", action: nil, keyEquivalent: "")
+            let recentMenu = NSMenu(title: "Open Recent")
+            recentMenu.delegate = dynamicMenusDelegate
+            recentItem.submenu = recentMenu
         }
         if let reopenClosedProjectAction {
             let item = fileMenu.addItem(withTitle: "Reopen Closed Project", action: reopenClosedProjectAction, keyEquivalent: "t")
@@ -418,6 +523,17 @@ final class KaisolaMacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDele
         windowMenu.addItem(withTitle: "Zoom", action: #selector(NSWindow.performZoom(_:)), keyEquivalent: "")
         windowMenu.addItem(.separator())
         windowMenu.addItem(withTitle: "Bring All to Front", action: #selector(NSApplication.arrangeInFront(_:)), keyEquivalent: "")
+        if let saveWindowAction {
+            windowMenu.addItem(.separator())
+            let save = windowMenu.addItem(withTitle: "Save Window Layout…", action: saveWindowAction, keyEquivalent: "")
+            save.target = saveWindowTarget
+            if let dynamicMenusDelegate {
+                let savedItem = windowMenu.addItem(withTitle: "Saved Windows", action: nil, keyEquivalent: "")
+                let savedMenu = NSMenu(title: "Saved Windows")
+                savedMenu.delegate = dynamicMenusDelegate
+                savedItem.submenu = savedMenu
+            }
+        }
         windowItem.submenu = windowMenu
         mainMenu.addItem(windowItem)
 

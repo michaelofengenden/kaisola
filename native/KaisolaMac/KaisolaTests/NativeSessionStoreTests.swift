@@ -121,6 +121,61 @@ final class NativeSessionStoreTests: XCTestCase {
         XCTAssertEqual(store.closedSessions().first?.cwd, "/tmp/s5")   // oldest dropped
     }
 
+    func testProjectColorPersistsAndClears() {
+        let project = store.openProject(directory: "/tmp/tinted")
+        store.setProjectColor(id: project.id, colorHex: "E16A6A")
+        XCTAssertEqual(store.projects().first?.colorHex, "E16A6A")
+        store.setProjectColor(id: project.id, colorHex: nil)
+        XCTAssertNil(store.projects().first?.colorHex)
+    }
+
+    func testMoveProjectReordersWithinBounds() {
+        let a = store.openProject(directory: "/tmp/order-a")
+        let b = store.openProject(directory: "/tmp/order-b")
+        _ = store.openProject(directory: "/tmp/order-c")
+        store.moveProject(id: b.id, delta: -1)
+        XCTAssertEqual(store.projects().map(\.path), ["/tmp/order-b", "/tmp/order-a", "/tmp/order-c"])
+        // Out-of-bounds moves are no-ops.
+        store.moveProject(id: b.id, delta: -1)
+        XCTAssertEqual(store.projects().first?.id, b.id)
+        store.moveProject(id: a.id, delta: 5)
+        XCTAssertEqual(store.projects().map(\.path), ["/tmp/order-b", "/tmp/order-a", "/tmp/order-c"])
+    }
+
+    func testRelocateProjectCarriesNameAndColorToTheNewPath() {
+        let project = store.openProject(directory: "/tmp/old-home")
+        store.renameProject(id: project.id, name: "My Workspace")
+        store.setProjectColor(id: project.id, colorHex: "5AA9E6")
+        let relocated = store.relocateProject(id: project.id, toDirectory: "/tmp/new-home")
+        XCTAssertEqual(relocated?.name, "My Workspace")
+        XCTAssertEqual(relocated?.colorHex, "5AA9E6")
+        XCTAssertEqual(store.projects().count, 1)
+        XCTAssertEqual(store.projects().first?.path, "/tmp/new-home")
+        XCTAssertEqual(store.projects().first?.name, "My Workspace")
+        XCTAssertEqual(store.projects().first?.colorHex, "5AA9E6")
+        // The old id's closed-stack entry must not resurrect the old path.
+        XCTAssertNotEqual(store.projects().first?.id, project.id)
+    }
+
+    func testRecentFoldersAreMostRecentFirstDedupedAndBounded() {
+        for index in 0..<10 {
+            _ = store.openProject(directory: "/tmp/recent-\(index)")
+        }
+        _ = store.openProject(directory: "/tmp/recent-3")   // re-open moves to head
+        let recents = store.recentFolders()
+        XCTAssertEqual(recents.first, "/tmp/recent-3")
+        XCTAssertEqual(recents.count, 8)
+        XCTAssertEqual(recents.filter { $0 == "/tmp/recent-3" }.count, 1)
+    }
+
+    func testSelectedSessionPersistsAcrossInstances() {
+        _ = store.openProject(directory: "/tmp/sel")   // ensures the file exists
+        store.recordSelectedSession("term-abc")
+        XCTAssertEqual(NativeSessionStore(fileURL: fileURL).lastSelectedSessionID(), "term-abc")
+        store.recordSelectedSession(nil)
+        XCTAssertNil(NativeSessionStore(fileURL: fileURL).lastSelectedSessionID())
+    }
+
     func testOpenProjectDoesNotDisturbOwnedSessions() {
         let session = NativeOwnedSession(
             id: "term-1",

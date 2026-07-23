@@ -70,6 +70,68 @@ final class NativePreviewSettingsTests: XCTestCase {
         XCTAssertEqual(reopen.keyEquivalentModifierMask, [.command, .shift])
     }
 
+    func testMenuBarCarriesWindowAndHelpMenus() throws {
+        let menu = KaisolaMacAppDelegate.makeMainMenu(
+            updateTarget: nil, updateAction: nil, updateEnabled: false, updateDetail: nil
+        )
+        let windowMenu = try XCTUnwrap(menu.item(withTitle: "Window")?.submenu)
+        XCTAssertNotNil(windowMenu.items.first { $0.title == "Minimize" && $0.keyEquivalent == "m" })
+        XCTAssertNotNil(windowMenu.items.first { $0.title == "Bring All to Front" })
+        let helpMenu = try XCTUnwrap(menu.item(withTitle: "Help")?.submenu)
+        XCTAssertNotNil(helpMenu.items.first { $0.title.contains("Help") })
+    }
+
+    func testFileMenuCarriesOpenRecentWhenDelegateProvided() throws {
+        final class StubDelegate: NSObject, NSMenuDelegate {}
+        let delegate = StubDelegate()
+        let menu = KaisolaMacAppDelegate.makeMainMenu(
+            updateTarget: nil, updateAction: nil, updateEnabled: false, updateDetail: nil,
+            openFolderTarget: nil, openFolderAction: #selector(NSResponder.doCommand(by:)),
+            dynamicMenusDelegate: delegate,
+            saveWindowTarget: nil, saveWindowAction: #selector(NSResponder.doCommand(by:))
+        )
+        let fileMenu = try XCTUnwrap(menu.item(withTitle: "File")?.submenu)
+        let recent = try XCTUnwrap(fileMenu.items.first { $0.title == "Open Recent" })
+        XCTAssertTrue(recent.submenu?.delegate === delegate)
+        let windowMenu = try XCTUnwrap(menu.item(withTitle: "Window")?.submenu)
+        XCTAssertNotNil(windowMenu.items.first { $0.title == "Save Window Layout…" })
+        let saved = try XCTUnwrap(windowMenu.items.first { $0.title == "Saved Windows" })
+        XCTAssertTrue(saved.submenu?.delegate === delegate)
+    }
+
+    func testViewMenuCarriesTerminalFontItems() throws {
+        let menu = KaisolaMacAppDelegate.makeMainMenu(
+            updateTarget: nil, updateAction: nil, updateEnabled: false, updateDetail: nil,
+            viewTarget: nil,
+            layoutAction: #selector(NSResponder.doCommand(by:)),
+            appearanceAction: #selector(NSResponder.doCommand(by:)),
+            fontTarget: nil,
+            fontIncreaseAction: #selector(NSResponder.doCommand(by:)),
+            fontDecreaseAction: #selector(NSResponder.doCommand(by:)),
+            fontResetAction: #selector(NSResponder.doCommand(by:))
+        )
+        let viewMenu = try XCTUnwrap(menu.item(withTitle: "View")?.submenu)
+        XCTAssertNotNil(viewMenu.items.first { $0.title == "Bigger" && $0.keyEquivalent == "+" })
+        XCTAssertNotNil(viewMenu.items.first { $0.title == "Smaller" && $0.keyEquivalent == "-" })
+        XCTAssertNotNil(viewMenu.items.first { $0.title == "Reset Size" && $0.keyEquivalent == "0" })
+    }
+
+    @MainActor
+    func testTerminalFontAdjustClampsToRange() {
+        let suite = "kaisola-font-tests"
+        let defaults = UserDefaults(suiteName: suite)!
+        defaults.removePersistentDomain(forName: suite)
+        let settings = NativePreviewSettings(defaults: defaults)
+        XCTAssertEqual(settings.terminalFontSize, NativePreviewSettings.terminalFontDefault)
+        settings.adjustTerminalFont(by: 100)
+        XCTAssertEqual(settings.terminalFontSize, NativePreviewSettings.terminalFontRange.upperBound)
+        settings.adjustTerminalFont(by: -100)
+        XCTAssertEqual(settings.terminalFontSize, NativePreviewSettings.terminalFontRange.lowerBound)
+        settings.resetTerminalFont()
+        XCTAssertEqual(settings.terminalFontSize, NativePreviewSettings.terminalFontDefault)
+        defaults.removePersistentDomain(forName: suite)
+    }
+
     func testViewMenuCarriesLayoutAndAppearanceToggles() throws {
         let menu = KaisolaMacAppDelegate.makeMainMenu(
             updateTarget: nil, updateAction: nil, updateEnabled: false, updateDetail: nil,

@@ -97,7 +97,7 @@ struct RootShellView: View {
                     }
                 }
                 ForEach(model.projects) { project in
-                    Section {
+                    Section(isExpanded: expansionBinding(project.id)) {
                         ForEach(project.sessions) { session in
                             sessionRow(session)
                         }
@@ -106,11 +106,21 @@ struct RootShellView: View {
                                 .font(.caption).foregroundStyle(.tertiary)
                         }
                     } header: {
-                        Text(project.name)
-                            .contextMenu {
-                                Button("Rename Project…") { renameProjectTarget = project.id; renameText = project.name }
-                                Button("Close Project", role: .destructive) { model.closeProject(id: project.id) }
+                        HStack(spacing: 6) {
+                            if let tint = ProjectTint.color(project.colorHex) {
+                                Circle().fill(tint).frame(width: 8, height: 8)
                             }
+                            Text(project.name)
+                            if project.workingCount > 0 {
+                                Text("\(project.workingCount)")
+                                    .font(.caption2.weight(.bold))
+                                    .padding(.horizontal, 5).padding(.vertical, 1)
+                                    .background(Color.accentColor.opacity(0.9), in: Capsule())
+                                    .foregroundStyle(.white)
+                                    .accessibilityLabel("\(project.workingCount) agents working")
+                            }
+                        }
+                        .contextMenu { projectContextMenu(project) }
                     }
                 }
             }
@@ -132,8 +142,7 @@ struct RootShellView: View {
                 projects: model.projects,
                 chatCount: model.chats.count,
                 selected: activeProjectBinding,
-                renameProject: { renameProjectTarget = $0; renameText = model.projects.first { $0.id == renameProjectTarget }?.name ?? "" },
-                closeProject: { model.closeProject(id: $0) },
+                menu: { project in AnyView(self.projectContextMenu(project)) },
                 openFolder: { RootShellView.promptForOpenFolder(model: model) }
             )
             Divider()
@@ -154,6 +163,53 @@ struct RootShellView: View {
 
     private var activeProjectBinding: Binding<String?> {
         Binding(get: { activeProjectName }, set: { model.selectedProjectName = $0 })
+    }
+
+    /// Collapsed project sections, persisted per project id.
+    @AppStorage("collapsedProjects") private var collapsedProjectsRaw = ""
+
+    private func expansionBinding(_ projectID: String) -> Binding<Bool> {
+        Binding(
+            get: { !collapsedProjectsRaw.components(separatedBy: ",").contains(projectID) },
+            set: { expanded in
+                var set = Set(collapsedProjectsRaw.components(separatedBy: ",").filter { !$0.isEmpty })
+                if expanded { set.remove(projectID) } else { set.insert(projectID) }
+                collapsedProjectsRaw = set.sorted().joined(separator: ",")
+            }
+        )
+    }
+
+    /// The shared project context menu: rename, tint, reorder, relocate, close.
+    @ViewBuilder
+    func projectContextMenu(_ project: AppModel.ProjectGroup) -> some View {
+        Button("Rename Project…") { renameProjectTarget = project.id; renameText = project.name }
+        Menu("Color") {
+            Button("None") { model.setProjectColor(id: project.id, colorHex: nil) }
+            ForEach(ProjectTint.choices, id: \.hex) { choice in
+                Button(choice.name) { model.setProjectColor(id: project.id, colorHex: choice.hex) }
+            }
+        }
+        Button("Move Left") { model.moveProject(id: project.id, delta: -1) }
+        Button("Move Right") { model.moveProject(id: project.id, delta: 1) }
+        Button("Relocate…") {
+            if let directory = Self.chooseDirectoryForRelocate() {
+                model.relocateProject(id: project.id, to: directory)
+            }
+        }
+        Divider()
+        Button("Close Project", role: .destructive) { model.closeProject(id: project.id) }
+    }
+
+    @MainActor
+    static func chooseDirectoryForRelocate() -> URL? {
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = false
+        panel.canChooseDirectories = true
+        panel.allowsMultipleSelection = false
+        panel.prompt = "Relocate Project"
+        panel.message = "Choose the folder this project moved to."
+        guard panel.runModal() == .OK else { return nil }
+        return panel.urls.first
     }
 
     @ViewBuilder
@@ -353,8 +409,7 @@ private struct ProjectTabStrip: View {
     let projects: [AppModel.ProjectGroup]
     let chatCount: Int
     @Binding var selected: String?
-    let renameProject: (String) -> Void
-    let closeProject: (String) -> Void
+    let menu: (AppModel.ProjectGroup) -> AnyView
     let openFolder: () -> Void
 
     var body: some View {
@@ -371,20 +426,29 @@ private struct ProjectTabStrip: View {
                     Button {
                         selected = project.name
                     } label: {
-                        Text(project.name)
-                            .font(.callout.weight(selected == project.name ? .semibold : .regular))
-                            .padding(.horizontal, 12)
-                            .padding(.vertical, 5)
-                            .background(
-                                selected == project.name ? AnyShapeStyle(Color.accentColor.opacity(0.18)) : AnyShapeStyle(.clear),
-                                in: Capsule()
-                            )
+                        HStack(spacing: 5) {
+                            if let tint = ProjectTint.color(project.colorHex) {
+                                Circle().fill(tint).frame(width: 7, height: 7)
+                            }
+                            Text(project.name)
+                                .font(.callout.weight(selected == project.name ? .semibold : .regular))
+                            if project.workingCount > 0 {
+                                Text("\(project.workingCount)")
+                                    .font(.caption2.weight(.bold))
+                                    .padding(.horizontal, 4)
+                                    .background(Color.accentColor.opacity(0.9), in: Capsule())
+                                    .foregroundStyle(.white)
+                            }
+                        }
+                        .padding(.horizontal, 12)
+                        .padding(.vertical, 5)
+                        .background(
+                            selected == project.name ? AnyShapeStyle(Color.accentColor.opacity(0.18)) : AnyShapeStyle(.clear),
+                            in: Capsule()
+                        )
                     }
                     .buttonStyle(.plain)
-                    .contextMenu {
-                        Button("Rename Project…") { renameProject(project.id) }
-                        Button("Close Project", role: .destructive) { closeProject(project.id) }
-                    }
+                    .contextMenu { menu(project) }
                 }
                 Button(action: openFolder) {
                     Image(systemName: "plus").font(.caption)

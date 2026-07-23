@@ -35,6 +35,7 @@
 		5BDE35CC5251CC2B24071508 /* NativePreviewSettings.swift in Sources */ = {isa = PBXBuildFile; fileRef = 081788CB50A2F8085E0929CE /* NativePreviewSettings.swift */; };
 		5D6DA237FF6F32B1A2A8DB04 /* AcpConversation.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3ACF651DE22A050B1D4AF49C /* AcpConversation.swift */; };
 		640841FC93C7BCB00DFFA219 /* AppModelProjectContextTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 07063F75FCF57994E572B99C /* AppModelProjectContextTests.swift */; };
+		657E81A52421A6E9E9C63814 /* SavedWindowsStoreTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0309F5DD6F095F40A096AA42 /* SavedWindowsStoreTests.swift */; };
 		6A358DDF102C7984D29FD806 /* TerminalCursorStoreTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 96E5D09B49E862C088D584E8 /* TerminalCursorStoreTests.swift */; };
 		6B76FFE3C1F1E11155040E2F /* RootShellView.swift in Sources */ = {isa = PBXBuildFile; fileRef = CBB83EF128840150F6F7103D /* RootShellView.swift */; };
 		6DFF60157687B575AD4176D7 /* UnixBrokerTransport.swift in Sources */ = {isa = PBXBuildFile; fileRef = C1139547AB3E3B3A9C7AAEDA /* UnixBrokerTransport.swift */; };
@@ -50,6 +51,7 @@
 		7F379E964C61CBE180BA4EF9 /* AcpTerminalHost.swift in Sources */ = {isa = PBXBuildFile; fileRef = A85A5A6E3A5EC404CB81A0BD /* AcpTerminalHost.swift */; };
 		81F28501570678EDE2D42B52 /* AcpProcessTransport.swift in Sources */ = {isa = PBXBuildFile; fileRef = 32406CFD933CD31D2751A8AF /* AcpProcessTransport.swift */; };
 		877EEA77C8AE068966E94814 /* AcpTerminalHostTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 07F25711B7E71707CD583039 /* AcpTerminalHostTests.swift */; };
+		8D941A51FE975188FDEFB2BA /* ProjectTint.swift in Sources */ = {isa = PBXBuildFile; fileRef = DD0520C7CA820BC9B9798C98 /* ProjectTint.swift */; };
 		8E3E6D65DEA019947D7C0257 /* BrokerLaunchConfigurationTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8F9EDBEF947F0725DF51BDA4 /* BrokerLaunchConfigurationTests.swift */; };
 		965405BD43BA9C3BBEF15AD7 /* AcpPermissionRulesTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 757C6A4EEAF0C23D949EF4A5 /* AcpPermissionRulesTests.swift */; };
 		970B14F97569D7C4D1267587 /* NativeTerminalInteractionTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5C89B154EE5DAF4AFF41692D /* NativeTerminalInteractionTests.swift */; };
@@ -66,6 +68,7 @@
 		B2E80671AD073A985161ED40 /* ObserveOnlyBrokerPolicyTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7DE33FAC2761474B7B6A46A2 /* ObserveOnlyBrokerPolicyTests.swift */; };
 		B5B4FC5437DED715B8B1883F /* BrokerStartupCoordinator.swift in Sources */ = {isa = PBXBuildFile; fileRef = 03184EF0234187AC455C546D /* BrokerStartupCoordinator.swift */; };
 		B8897143FAAC2BE37F42F6C9 /* Sparkle in Frameworks */ = {isa = PBXBuildFile; productRef = 5C92E4B4A8A305185CE792F5 /* Sparkle */; };
+		C064EB5DC0F7118113696DE9 /* SavedWindowsStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = FCA8B752F1EFCBEFAED78260 /* SavedWindowsStore.swift */; };
 		C490492DC4C65C9BCA0842C0 /* AcpToolArtifactsTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0A75F9D9A2E3D4F6821B1F0A /* AcpToolArtifactsTests.swift */; };
 		C5D7FD2E209D40C0C1CB9724 /* NoBoardBoundaryTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = AF52791E7FB87F94AF30DBD2 /* NoBoardBoundaryTests.swift */; };
 		C8DC030B09CC7E0BDA1FEF96 /* ObserveOnlyBrokerPolicy.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5D434A4435BCB68FD69050A4 /* ObserveOnlyBrokerPolicy.swift */; };
@@ -106,6 +109,7 @@
 /* End PBXContainerItemProxy section */
 
 /* Begin PBXFileReference section */
+		0309F5DD6F095F40A096AA42 /* SavedWindowsStoreTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SavedWindowsStoreTests.swift; sourceTree = "<group>"; };
 		03184EF0234187AC455C546D /* BrokerStartupCoordinator.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BrokerStartupCoordinator.swift; sourceTree = "<group>"; };
 		07063F75FCF57994E572B99C /* AppModelProjectContextTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppModelProjectContextTests.swift; sourceTree = "<group>"; };
 		07F25711B7E71707CD583039 /* AcpTerminalHostTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AcpTerminalHostTests.swift; sourceTree = "<group>"; };
@@ -173,6 +177,7 @@
 		DA6828DB9339AA4CAEDA765D /* AcpPermissionRules.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AcpPermissionRules.swift; sourceTree = "<group>"; };
 		DAF1B7984AA5A644F1BA5BB3 /* CommandPaletteView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CommandPaletteView.swift; sourceTree = "<group>"; };
 		DBB9416285BEDB50CF079DF8 /* BrokerControlClient.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BrokerControlClient.swift; sourceTree = "<group>"; };
+		DD0520C7CA820BC9B9798C98 /* ProjectTint.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ProjectTint.swift; sourceTree = "<group>"; };
 		E66C339455BFF598A81C41DE /* NativeTerminalSurface.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NativeTerminalSurface.swift; sourceTree = "<group>"; };
 		E9BB2E9EA7403C1040B07AB9 /* TerminalTheme.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TerminalTheme.swift; sourceTree = "<group>"; };
 		F45BCF775EB8D43CFD1BFE2E /* FuzzyMatchTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FuzzyMatchTests.swift; sourceTree = "<group>"; };
@@ -180,6 +185,7 @@
 		F9AE494034173A39FE10B346 /* AgentRegistry.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AgentRegistry.swift; sourceTree = "<group>"; };
 		FA616801D125F0ACE1E5A177 /* NativeUpdateConfigurationTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NativeUpdateConfigurationTests.swift; sourceTree = "<group>"; };
 		FBDFA0DF725244691C0496A5 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist; path = Info.plist; sourceTree = "<group>"; };
+		FCA8B752F1EFCBEFAED78260 /* SavedWindowsStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SavedWindowsStore.swift; sourceTree = "<group>"; };
 		FDC5D762925B519587B9EF95 /* AcpChatHandle.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AcpChatHandle.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
@@ -298,6 +304,7 @@
 			isa = PBXGroup;
 			children = (
 				E66C339455BFF598A81C41DE /* NativeTerminalSurface.swift */,
+				DD0520C7CA820BC9B9798C98 /* ProjectTint.swift */,
 				CBB83EF128840150F6F7103D /* RootShellView.swift */,
 				13BFA68C0E2E3E83379B2835 /* TerminalDocument.swift */,
 				E9BB2E9EA7403C1040B07AB9 /* TerminalTheme.swift */,
@@ -332,6 +339,7 @@
 				D624AF2C46BA83B73A21F0B3 /* KaisolaMacAppDelegate.swift */,
 				6E78A73E4BF5DABAB5BF6826 /* NativePreviewPaths.swift */,
 				081788CB50A2F8085E0929CE /* NativePreviewSettings.swift */,
+				FCA8B752F1EFCBEFAED78260 /* SavedWindowsStore.swift */,
 			);
 			path = App;
 			sourceTree = "<group>";
@@ -362,6 +370,7 @@
 				AF52791E7FB87F94AF30DBD2 /* NoBoardBoundaryTests.swift */,
 				96F1989B7416C050648E9CAB /* ObserveOnlyBrokerClientTests.swift */,
 				7DE33FAC2761474B7B6A46A2 /* ObserveOnlyBrokerPolicyTests.swift */,
+				0309F5DD6F095F40A096AA42 /* SavedWindowsStoreTests.swift */,
 				4C1E742D2099046E14888F80 /* SwiftTermStressTests.swift */,
 				96E5D09B49E862C088D584E8 /* TerminalCursorStoreTests.swift */,
 				346DC3875261051CDA13A916 /* TerminalDocumentTests.swift */,
@@ -602,7 +611,9 @@
 				0B95CB6DB59DBD720A65A98E /* ObserveOnlyBrokerClient.swift in Sources */,
 				C8DC030B09CC7E0BDA1FEF96 /* ObserveOnlyBrokerPolicy.swift in Sources */,
 				5BAC96791477731891D5DB47 /* PermissionRuleStore.swift in Sources */,
+				8D941A51FE975188FDEFB2BA /* ProjectTint.swift in Sources */,
 				6B76FFE3C1F1E11155040E2F /* RootShellView.swift in Sources */,
+				C064EB5DC0F7118113696DE9 /* SavedWindowsStore.swift in Sources */,
 				ADF15F7FA4CF4D7D2FA753AE /* TerminalCursorStore.swift in Sources */,
 				D478A5901D0C96CE5D108C4A /* TerminalDocument.swift in Sources */,
 				20AC2166801F213916ED1EB1 /* TerminalTheme.swift in Sources */,
@@ -637,6 +648,7 @@
 				C5D7FD2E209D40C0C1CB9724 /* NoBoardBoundaryTests.swift in Sources */,
 				A06CBCBD9882375F104D2ACA /* ObserveOnlyBrokerClientTests.swift in Sources */,
 				B2E80671AD073A985161ED40 /* ObserveOnlyBrokerPolicyTests.swift in Sources */,
+				657E81A52421A6E9E9C63814 /* SavedWindowsStoreTests.swift in Sources */,
 				D2FF6C769EE7E9EAA8AAC903 /* SwiftTermStressTests.swift in Sources */,
 				6A358DDF102C7984D29FD806 /* TerminalCursorStoreTests.swift in Sources */,
 				EC396A9F5333AD82AA272705 /* TerminalDocumentTests.swift in Sources */,

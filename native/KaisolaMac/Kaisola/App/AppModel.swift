@@ -103,6 +103,10 @@ final class AppModel: ObservableObject {
         let name: String
         let directory: URL?
         let sessions: [BrokerTerminalRecord]
+        /// Tab tint (hex RGB) chosen by the user, nil = default.
+        var colorHex: String?
+        /// Sessions currently in an agent "working" state — the activity badge.
+        var workingCount: Int = 0
     }
 
     var projects: [ProjectGroup] {
@@ -114,19 +118,50 @@ final class AppModel: ObservableObject {
         )
         let sessionsByProject = Dictionary(grouping: sessions, by: \.projectID)
 
-        // Every project id we know about: opened tabs ∪ projects with sessions.
-        let allIDs = Set(opened.map(\.id)).union(sessionsByProject.keys)
-        return allIDs.map { id -> ProjectGroup in
+        func group(for id: String) -> ProjectGroup {
             let sessions = (sessionsByProject[id] ?? []).sorted { $0.title < $1.title }
             let name = openedByID[id]?.name
                 ?? ownedByID[id].map { ($0.cwd as NSString).lastPathComponent }
                 ?? id
             let directory = openedByID[id].map { URL(fileURLWithPath: $0.path) }
                 ?? ownedByID[id].map { URL(fileURLWithPath: $0.cwd) }
-            return ProjectGroup(id: id, name: name, directory: directory, sessions: sessions)
+            let working = sessions.filter { record in
+                if case .working = record.agentActivity, !record.exited { return true }
+                return false
+            }.count
+            return ProjectGroup(
+                id: id, name: name, directory: directory, sessions: sessions,
+                colorHex: openedByID[id]?.colorHex, workingCount: working
+            )
         }
-        .sorted { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
+
+        // Opened tabs keep their persisted (user-reordered) sequence; projects
+        // that only exist through live sessions follow, sorted by name.
+        let openedGroups = opened.map { group(for: $0.id) }
+        let sessionOnly = Set(sessionsByProject.keys).subtracting(opened.map(\.id))
+            .map(group(for:))
+            .sorted { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
+        return openedGroups + sessionOnly
     }
+
+    func setProjectColor(id: String, colorHex: String?) {
+        sessionStore.setProjectColor(id: id, colorHex: colorHex)
+        objectWillChange.send()
+    }
+
+    func moveProject(id: String, delta: Int) {
+        sessionStore.moveProject(id: id, delta: delta)
+        objectWillChange.send()
+    }
+
+    func relocateProject(id: String, to directory: URL) {
+        if let relocated = sessionStore.relocateProject(id: id, toDirectory: directory.path) {
+            selectedProjectName = relocated.name
+        }
+        objectWillChange.send()
+    }
+
+    var recentFolders: [String] { sessionStore.recentFolders() }
 
     func isOwned(_ terminalID: String) -> Bool {
         ownedTerminalIDs.contains(terminalID)
@@ -279,6 +314,7 @@ final class AppModel: ObservableObject {
         let retainedDocument = terminalDocument.sessionID == next.id ? terminalDocument : .empty
         selectedSession = next
         selectedSessionID = next.id
+        sessionStore.recordSelectedSession(next.id)
         guard connectionState.isConnected else {
             terminalDocument = retainedDocument
             return
@@ -614,8 +650,12 @@ final class AppModel: ObservableObject {
             )
             await restoreOwnedSessions(info: info)
             startInventoryRefresh(generation: generation)
+            // Prefer the in-memory selection, then the persisted one from the
+            // last run (whole-app persistence), then the first session.
             let preferredID = selectedSessionID.flatMap { selected in
                 sessions.contains(where: { $0.id == selected }) ? selected : nil
+            } ?? sessionStore.lastSelectedSessionID().flatMap { stored in
+                sessions.contains(where: { $0.id == stored }) ? stored : nil
             } ?? sessions.first?.id
             selectedSession = nil
             if let preferredID {

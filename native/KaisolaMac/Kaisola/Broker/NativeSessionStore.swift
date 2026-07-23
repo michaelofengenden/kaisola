@@ -25,12 +25,23 @@ struct NativeOwnedSession: Codable, Equatable, Identifiable, Sendable {
 }
 
 /// An explicitly-opened project tab: a folder the user opened as a workspace,
-/// which persists even with no live sessions and carries a custom name.
+/// which persists even with no live sessions and carries a custom name and
+/// optional tint color.
 struct OpenProject: Codable, Equatable, Identifiable, Sendable {
     let id: String
     let path: String
     var name: String
     let createdAt: Int64
+    /// Tab tint (hex RGB like "E16A6A"); nil = default chrome.
+    var colorHex: String?
+
+    init(id: String, path: String, name: String, createdAt: Int64, colorHex: String? = nil) {
+        self.id = id
+        self.path = path
+        self.name = name
+        self.createdAt = createdAt
+        self.colorHex = colorHex
+    }
 }
 
 /// What Reopen Closed Session (⌘⌥T) needs to recreate an ended session: the
@@ -56,6 +67,10 @@ struct NativeSessionStore: Sendable {
         /// Recently ended sessions, newest last, bounded — powers
         /// Reopen Closed Session (⌘⌥T).
         var closedSessions: [ClosedSession]?
+        /// Recently opened folders, most recent first — File ▸ Open Recent.
+        var recentFolders: [String]?
+        /// The session selected when the app last ran, restored on relaunch.
+        var lastSelectedSessionID: String?
     }
 
     private let closedStackCap = 10
@@ -97,6 +112,13 @@ struct NativeSessionStore: Sendable {
         var payload = read() ?? Payload(ownerID: ownerID(), sessions: [], projects: [])
         // Re-opening a folder retires any stale closed-stack entry for it.
         payload.closedProjects?.removeAll { $0.id == id }
+        // Every open lands at the head of File ▸ Open Recent.
+        let normalized = (path as NSString).standardizingPath
+        var recents = payload.recentFolders ?? []
+        recents.removeAll { $0 == normalized }
+        recents.insert(normalized, at: 0)
+        if recents.count > 8 { recents.removeLast(recents.count - 8) }
+        payload.recentFolders = recents
         var projects = payload.projects ?? []
         if let existing = projects.first(where: { $0.id == id }) {
             write(payload)
@@ -119,6 +141,69 @@ struct NativeSessionStore: Sendable {
               let index = projects.firstIndex(where: { $0.id == id }) else { return }
         projects[index].name = name
         payload.projects = projects
+        write(payload)
+    }
+
+    /// Set (or clear) a project tab's tint color.
+    func setProjectColor(id: String, colorHex: String?) {
+        guard var payload = read(), var projects = payload.projects,
+              let index = projects.firstIndex(where: { $0.id == id }) else { return }
+        projects[index].colorHex = colorHex
+        payload.projects = projects
+        write(payload)
+    }
+
+    /// Move a project tab one position left/right in the persisted order.
+    func moveProject(id: String, delta: Int) {
+        guard var payload = read(), var projects = payload.projects,
+              let index = projects.firstIndex(where: { $0.id == id }) else { return }
+        let target = index + delta
+        guard target >= 0, target < projects.count else { return }
+        projects.swapAt(index, target)
+        payload.projects = projects
+        write(payload)
+    }
+
+    /// Point a project tab at a folder that moved on disk. Identity follows the
+    /// path, so this closes the old tab and opens the new folder carrying the
+    /// custom name/color across.
+    @discardableResult
+    func relocateProject(id: String, toDirectory newPath: String) -> OpenProject? {
+        guard let existing = projects().first(where: { $0.id == id }) else { return nil }
+        closeProject(id: id)
+        var replacement = openProject(directory: newPath)
+        // Carry look & feel over to the relocated tab.
+        renameProject(id: replacement.id, name: existing.name)
+        setProjectColor(id: replacement.id, colorHex: existing.colorHex)
+        replacement.name = existing.name
+        replacement.colorHex = existing.colorHex
+        return replacement
+    }
+
+    // MARK: - Recents & selection restore
+
+    func recentFolders() -> [String] {
+        read()?.recentFolders ?? []
+    }
+
+    func recordRecentFolder(_ path: String) {
+        var payload = read() ?? Payload(ownerID: ownerID(), sessions: [])
+        var recents = payload.recentFolders ?? []
+        let normalized = (path as NSString).standardizingPath
+        recents.removeAll { $0 == normalized }
+        recents.insert(normalized, at: 0)
+        if recents.count > 8 { recents.removeLast(recents.count - 8) }
+        payload.recentFolders = recents
+        write(payload)
+    }
+
+    func lastSelectedSessionID() -> String? {
+        read()?.lastSelectedSessionID
+    }
+
+    func recordSelectedSession(_ id: String?) {
+        guard var payload = read() else { return }
+        payload.lastSelectedSessionID = id
         write(payload)
     }
 

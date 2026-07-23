@@ -42,6 +42,8 @@ final class AcpConversation: ObservableObject {
     private let environment: [String: String]
     private let cwd: String
     private let mcpServers: [JSONValue]
+    private let ruleStore: PermissionRuleStore
+    private let sensitiveGlobs: [String]
     private var turnCounter = 0
 
     init(
@@ -51,7 +53,9 @@ final class AcpConversation: ObservableObject {
         environment: [String: String] = ProcessInfo.processInfo.environment,
         cwd: String,
         mcpServers: [JSONValue] = [],
-        client: AcpClient = AcpClient()
+        client: AcpClient = AcpClient(),
+        ruleStore: PermissionRuleStore = PermissionRuleStore(),
+        sensitiveGlobs: [String] = AcpPermissionRules.defaultSensitiveGlobs
     ) {
         self.title = title
         self.command = command
@@ -60,6 +64,8 @@ final class AcpConversation: ObservableObject {
         self.cwd = cwd
         self.mcpServers = mcpServers
         self.client = client
+        self.ruleStore = ruleStore
+        self.sensitiveGlobs = sensitiveGlobs
     }
 
     func start() async {
@@ -114,6 +120,56 @@ final class AcpConversation: ObservableObject {
         Task { await client.resolvePermission(id: permission.id, optionID: optionID) }
     }
 
+    /// Grant this ask AND create a standing rule so future matching asks
+    /// auto-allow. Refused for sensitive-file asks — those can never be
+    /// rule-covered (the button is hidden in that case, this is defense in depth).
+    func answerPermissionAlways() {
+        guard let permission = pendingPermission else { return }
+        if !AcpPermissionRules.requestIsSensitive(globs: sensitiveGlobs, title: permission.title, paths: permission.paths) {
+            let derived = AcpPermissionRules.ruleForRequest(kind: permission.kind, title: permission.title)
+            let rule = PermissionRule(
+                id: UUID().uuidString,
+                workspace: cwd,
+                action: derived.action,
+                resource: derived.resource,
+                at: Int64(Date().timeIntervalSince1970 * 1_000)
+            )
+            _ = ruleStore.add(rule)
+        }
+        answerAllowOnce(permission)
+    }
+
+    /// Route an incoming permission ask: sensitive files always surface a card;
+    /// otherwise a matching standing rule auto-allows silently; else surface.
+    private func handlePermission(_ request: AcpPermissionRequest) {
+        if AcpPermissionRules.requestIsSensitive(globs: sensitiveGlobs, title: request.title, paths: request.paths) {
+            pendingPermission = request
+            return
+        }
+        if AcpPermissionRules.requestMatchesRule(ruleStore.rules(), workspace: cwd, kind: request.kind, title: request.title) != nil {
+            answerAllowOnce(request)
+            return
+        }
+        pendingPermission = request
+    }
+
+    /// Answer with the request's allow_once option (falling back to the first
+    /// non-reject option, then the first option), never persisting allow_always.
+    private func answerAllowOnce(_ request: AcpPermissionRequest) {
+        if pendingPermission?.id == request.id { pendingPermission = nil }
+        let option = request.options.first { $0.kind == "allow_once" }
+            ?? request.options.first { !$0.kind.contains("reject") }
+            ?? request.options.first
+        guard let option else { return }
+        Task { await client.resolvePermission(id: request.id, optionID: option.id) }
+    }
+
+    /// Whether the pending ask may be "always allowed" (hidden for sensitive files).
+    var pendingPermissionAllowsRule: Bool {
+        guard let permission = pendingPermission else { return false }
+        return !AcpPermissionRules.requestIsSensitive(globs: sensitiveGlobs, title: permission.title, paths: permission.paths)
+    }
+
     func stop() {
         Task { await client.stop() }
     }
@@ -137,7 +193,7 @@ final class AcpConversation: ObservableObject {
         case let .modelChanged(id):
             currentModelID = id
         case let .permission(request):
-            pendingPermission = request
+            handlePermission(request)
         case .turnEnded:
             isRunning = false
         case let .error(message):

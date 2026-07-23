@@ -301,7 +301,15 @@ actor AcpClient {
         guard let id, let params = params?.objectValue, let sessionID else { return }
         permissionCounter += 1
         let localID = permissionCounter
-        let title = params["toolCall"]?.objectValue?["title"]?.stringValue ?? "Permission requested"
+        let toolCall = params["toolCall"]?.objectValue
+        let title = toolCall?["title"]?.stringValue ?? "Permission requested"
+        let kind = toolCall?["kind"]?.stringValue ?? "other"
+        let locationPaths = (toolCall?["locations"]?.arrayValue ?? []).compactMap {
+            $0.objectValue?["path"]?.stringValue
+        }
+        let diffPaths = Self.parseToolContent(toolCall?["content"]).compactMap { artifact -> String? in
+            if case let .diff(path, _, _) = artifact { return path } else { return nil }
+        }
         let options = (params["options"]?.arrayValue ?? []).compactMap { value -> AcpPermissionRequest.Option? in
             guard let o = value.objectValue, let optionID = o["optionId"]?.stringValue else { return nil }
             return AcpPermissionRequest.Option(
@@ -310,7 +318,10 @@ actor AcpClient {
                 kind: o["kind"]?.stringValue ?? "allow"
             )
         }
-        eventHandler?(.permission(AcpPermissionRequest(id: localID, sessionID: sessionID, title: title, options: options)))
+        eventHandler?(.permission(AcpPermissionRequest(
+            id: localID, sessionID: sessionID, title: title, options: options,
+            kind: kind, paths: locationPaths + diffPaths
+        )))
         Task {
             let chosen = await withCheckedContinuation { (continuation: CheckedContinuation<String, Never>) in
                 permissionWaiters[localID] = continuation

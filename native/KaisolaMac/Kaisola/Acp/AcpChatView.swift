@@ -13,7 +13,12 @@ struct AcpChatView: View {
             Divider()
             transcript
             if let permission = conversation.pendingPermission {
-                PermissionBar(request: permission) { conversation.answerPermission($0) }
+                PermissionBar(
+                    request: permission,
+                    allowsRule: conversation.pendingPermissionAllowsRule,
+                    answer: { conversation.answerPermission($0) },
+                    always: { conversation.answerPermissionAlways() }
+                )
             }
             Divider()
             composer
@@ -279,13 +284,27 @@ private struct PlanCard: View {
 
 private struct PermissionBar: View {
     let request: AcpPermissionRequest
+    let allowsRule: Bool
     let answer: (String) -> Void
+    let always: () -> Void
 
     var body: some View {
         HStack(spacing: 10) {
-            Image(systemName: "hand.raised.fill").foregroundStyle(.orange)
-            Text(request.title).font(.callout).lineLimit(2)
+            Image(systemName: allowsRule ? "hand.raised.fill" : "exclamationmark.shield.fill")
+                .foregroundStyle(allowsRule ? .orange : .red)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(request.title).font(.callout).lineLimit(2)
+                if !allowsRule {
+                    Text("Sensitive file — always asks").font(.caption2).foregroundStyle(.red)
+                }
+            }
             Spacer()
+            if allowsRule {
+                Button("Always allow") { always() }
+                    .buttonStyle(.bordered)
+                    .tint(.green)
+                    .help("Allow this and create a standing rule for matching requests")
+            }
             ForEach(request.options) { option in
                 Button(option.name) { answer(option.id) }
                     .buttonStyle(.bordered)

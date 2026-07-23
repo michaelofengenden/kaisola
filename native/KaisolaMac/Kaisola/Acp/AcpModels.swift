@@ -73,6 +73,12 @@ struct AcpPermissionRequest: Equatable, Sendable, Identifiable {
     let sessionID: String
     let title: String
     let options: [Option]
+    /// The tool-call kind (execute/edit/read/delete/fetch/other), used to derive
+    /// and match standing allow-rules.
+    var kind: String = "other"
+    /// File paths the request touches (ACP tool-call `locations` + diff paths),
+    /// scanned against sensitive globs.
+    var paths: [String] = []
 
     struct Option: Equatable, Sendable, Identifiable {
         let id: String

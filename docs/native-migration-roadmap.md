@@ -85,7 +85,7 @@ optional pending a scope decision.
 | Live plan (todo list) | DONE | P1 | ACP `plan` rendered as a checklist card |
 | Context-window usage | DONE | P1 | `usage_update` shown in the chat header |
 | Model selection (per-session picker) | DONE | P1 | `current_model_update` + session/set_model; effort levels still to add |
-| Permissions / gates (inline allow/reject) | PARTIAL | P0 | inline permission bar done; rules + sensitive globs + always-allow to add |
+| Permissions / gates (inline allow/reject) | DONE | P0 | inline bar + standing allow-rules (workspace-scoped, wildcard, always-allow), sensitive globs that always prompt and can never be rule-covered, auto-answer of matched asks; `AcpPermissionRules`/`PermissionRuleStore` mirror `permissionRules.ts` |
 | MCP servers carried into sessions | DONE | P1 | `native-mcp-registry.cjs` → session/new mcpServers |
 | Adapter/MCP version currency + continuous update | DONE | P1 | `agent-adapter-versions/update.cjs`; npx @latest |
 | Permission mode / autonomy dial (plan/default/acceptEdits/bypass) | NEW | P0 | |
@@ -119,7 +119,7 @@ optional pending a scope decision.
 | Section | Status | Pri | Notes |
 |---|---|---|---|
 | General (theme, updates, onboarding) | NEW | P0 (theme) / P1 | |
-| Guardrails (sensitive globs, permission rules, autonomy) | NEW | P0 | safety-critical |
+| Guardrails (sensitive globs, permission rules, autonomy) | PARTIAL | P0 | sensitive globs + permission rules done (`AcpPermissionRules`); autonomy dial still to add |
 | Terminal (font/size/weight/line-height/tone/cursor) | NEW | P1 | |
 | Agents (add custom terminal/ACP, enable presets, models) | NEW | P1 | |
 | Models & keys (API keys keychain, provider, base URLs) | NEW | P1 | |

@@ -28,7 +28,7 @@ final class AcpClientTests: XCTestCase {
         XCTAssertTrue(events.contains { if case .turnItem(.thought) = $0 { return true } else { return false } })
         XCTAssertTrue(events.contains { if case .turnItem(.plan) = $0 { return true } else { return false } })
         XCTAssertTrue(events.contains { if case let .turnItem(.toolCall(c)) = $0 { return c.id == "t1" } else { return false } })
-        XCTAssertTrue(events.contains { if case let .toolCallUpdate(id, status) = $0 { return id == "t1" && status == .completed } else { return false } })
+        XCTAssertTrue(events.contains { if case let .toolCallUpdate(id, status, _, _) = $0 { return id == "t1" && status == .completed } else { return false } })
         XCTAssertTrue(events.contains { if case let .usage(u) = $0 { return u.used == 5000 } else { return false } })
         XCTAssertTrue(events.contains { if case .turnEnded = $0 { return true } else { return false } })
     }

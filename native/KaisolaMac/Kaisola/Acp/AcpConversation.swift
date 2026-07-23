@@ -124,10 +124,12 @@ final class AcpConversation: ObservableObject {
         switch event {
         case let .turnItem(item):
             accumulate(item)
-        case let .toolCallUpdate(id, status):
+        case let .toolCallUpdate(id, status, content, title):
             if let index = rows.lastIndex(where: { if case let .tool(c) = $0 { return c.id == id } else { return false } }),
                case var .tool(call) = rows[index] {
-                call.status = status
+                if let status { call.status = status }
+                if let content, !content.isEmpty { call.content = content }
+                if let title, !title.isEmpty { call.title = title }
                 rows[index] = .tool(call)
             }
         case let .usage(usage):

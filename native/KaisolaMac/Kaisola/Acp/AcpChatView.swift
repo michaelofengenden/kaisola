@@ -149,14 +149,51 @@ private struct TranscriptRowView: View {
 
 private struct ToolCallCard: View {
     let call: AcpToolCall
+    @State private var expanded = false
+
+    private var hasArtifacts: Bool { !call.content.isEmpty }
 
     var body: some View {
-        HStack(spacing: 9) {
-            Image(systemName: statusSymbol)
-                .foregroundStyle(statusColor)
-            Text(call.title).lineLimit(1)
-            Spacer()
-            Text(call.kind).font(.caption).foregroundStyle(.secondary)
+        VStack(alignment: .leading, spacing: 8) {
+            Button {
+                if hasArtifacts { expanded.toggle() }
+            } label: {
+                HStack(spacing: 9) {
+                    Image(systemName: statusSymbol)
+                        .foregroundStyle(statusColor)
+                    Text(call.title).lineLimit(1)
+                    Spacer()
+                    if hasArtifacts {
+                        Image(systemName: expanded ? "chevron.down" : "chevron.right")
+                            .font(.caption2).foregroundStyle(.secondary)
+                    }
+                    Text(call.kind).font(.caption).foregroundStyle(.secondary)
+                }
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .disabled(!hasArtifacts)
+
+            if !call.locations.isEmpty {
+                Text(call.locations.map { ($0 as NSString).lastPathComponent }.joined(separator: ", "))
+                    .font(.caption).foregroundStyle(.secondary).lineLimit(1)
+            }
+
+            if expanded {
+                ForEach(call.content) { artifact in
+                    switch artifact {
+                    case let .diff(path, oldText, newText):
+                        DiffView(path: path, oldText: oldText, newText: newText)
+                    case let .text(text):
+                        Text(text)
+                            .font(.system(.caption, design: .monospaced))
+                            .textSelection(.enabled)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .padding(8)
+                            .background(.black.opacity(0.18), in: RoundedRectangle(cornerRadius: 6))
+                    }
+                }
+            }
         }
         .padding(9)
         .background(.quaternary.opacity(0.5), in: RoundedRectangle(cornerRadius: 8))
@@ -175,6 +212,46 @@ private struct ToolCallCard: View {
         case .pending, .inProgress: .secondary
         case .completed: .green
         case .failed: .red
+        }
+    }
+}
+
+/// A compact unified diff for a tool-call file edit: removed lines tinted red,
+/// added lines tinted green, mirroring the Electron chat's inline diff card.
+private struct DiffView: View {
+    let path: String
+    let oldText: String?
+    let newText: String
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            Text((path as NSString).lastPathComponent)
+                .font(.caption.weight(.semibold))
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.horizontal, 8).padding(.vertical, 5)
+                .background(.quaternary.opacity(0.6))
+            ScrollView(.horizontal, showsIndicators: false) {
+                VStack(alignment: .leading, spacing: 0) {
+                    ForEach(Array(AcpDiff.lines(old: oldText ?? "", new: newText).enumerated()), id: \.offset) { _, line in
+                        Text(line.kind.prefix + line.text)
+                            .font(.system(.caption, design: .monospaced))
+                            .textSelection(.enabled)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .padding(.horizontal, 8).padding(.vertical, 1)
+                            .background(tint(for: line.kind))
+                    }
+                }
+            }
+        }
+        .clipShape(RoundedRectangle(cornerRadius: 6))
+        .overlay(RoundedRectangle(cornerRadius: 6).strokeBorder(.quaternary))
+    }
+
+    private func tint(for kind: AcpDiff.LineKind) -> Color {
+        switch kind {
+        case .context: .clear
+        case .removed: .red.opacity(0.18)
+        case .added: .green.opacity(0.18)
         }
     }
 }

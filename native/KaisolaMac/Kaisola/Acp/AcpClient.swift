@@ -6,7 +6,9 @@ import KaisolaCore
 /// `session/update` notifications and the agent's callbacks.
 enum AcpEvent: Sendable {
     case turnItem(AcpTurnItem)
-    case toolCallUpdate(id: String, status: AcpToolCall.Status)
+    /// A `tool_call_update`. `status`/`content` are nil when the update didn't
+    /// carry that field, so the merge leaves the existing value untouched.
+    case toolCallUpdate(id: String, status: AcpToolCall.Status?, content: [AcpToolContent]?, title: String?)
     case usage(AcpUsage)
     case modelChanged(id: String)
     case permission(AcpPermissionRequest)
@@ -264,9 +266,12 @@ actor AcpClient {
                 eventHandler?(.turnItem(.toolCall(call)))
             }
         case "tool_call_update":
-            if let id = object["toolCallId"]?.stringValue,
-               let status = object["status"]?.stringValue.flatMap(AcpToolCall.Status.init) {
-                eventHandler?(.toolCallUpdate(id: id, status: status))
+            if let id = object["toolCallId"]?.stringValue {
+                let status = object["status"]?.stringValue.flatMap(AcpToolCall.Status.init)
+                // Only treat content as present when the key exists — an absent
+                // key must not clear artifacts an earlier update already set.
+                let content = object["content"] != nil ? Self.parseToolContent(object["content"]) : nil
+                eventHandler?(.toolCallUpdate(id: id, status: status, content: content, title: object["title"]?.stringValue))
             }
         case "plan":
             let entries = (object["entries"]?.arrayValue ?? []).enumerated().compactMap { index, value -> AcpPlanEntry? in
@@ -339,11 +344,46 @@ actor AcpClient {
 
     private static func parseToolCall(_ object: [String: JSONValue]) -> AcpToolCall? {
         guard let id = object["toolCallId"]?.stringValue else { return nil }
+        let locations = (object["locations"]?.arrayValue ?? []).compactMap {
+            $0.objectValue?["path"]?.stringValue
+        }
         return AcpToolCall(
             id: id,
             title: object["title"]?.stringValue ?? id,
             kind: object["kind"]?.stringValue ?? "other",
-            status: object["status"]?.stringValue.flatMap(AcpToolCall.Status.init) ?? .pending
+            status: object["status"]?.stringValue.flatMap(AcpToolCall.Status.init) ?? .pending,
+            content: parseToolContent(object["content"]),
+            locations: locations
         )
+    }
+
+    /// Parse an ACP `ToolCallContent[]` into our display artifacts. Recognizes
+    /// `{type:"diff", path, oldText, newText}` and `{type:"content", content:{...}}`
+    /// (text / resource blocks); a `{type:"terminal"}` reference degrades to a
+    /// short text placeholder.
+    static func parseToolContent(_ value: JSONValue?) -> [AcpToolContent] {
+        guard let array = value?.arrayValue else { return [] }
+        return array.compactMap { item -> AcpToolContent? in
+            guard let object = item.objectValue else { return nil }
+            switch object["type"]?.stringValue {
+            case "diff":
+                guard let path = object["path"]?.stringValue,
+                      let newText = object["newText"]?.stringValue else { return nil }
+                return .diff(path: path, oldText: object["oldText"]?.stringValue, newText: newText)
+            case "content":
+                let block = object["content"]?.objectValue
+                if let text = block?["text"]?.stringValue { return .text(text) }
+                if let resource = block?["resource"]?.objectValue?["text"]?.stringValue { return .text(resource) }
+                if block?["type"]?.stringValue == "image" { return .text("[image]") }
+                return nil
+            case "terminal":
+                let terminalID = object["terminalId"]?.stringValue ?? ""
+                return .text("[terminal \(terminalID)]")
+            default:
+                // Bare content block (no wrapper type) with inline text.
+                if let text = object["text"]?.stringValue { return .text(text) }
+                return nil
+            }
+        }
     }
 }

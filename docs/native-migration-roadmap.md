@@ -80,7 +80,7 @@ optional pending a scope decision.
 |---|---|---|---|
 | Agent CLI sessions (prepared terminal: Claude/Codex/…) | DONE | P0 | owned terminal booting the CLI + activity status |
 | ACP chat threads (structured, streaming) | DONE | P0 | `Kaisola/Acp/*`; adapter spawned via npx @latest; app-scoped session |
-| Tool-call cards / artifacts | PARTIAL | P0 | tool-call cards done; rich diff/content artifacts still to add |
+| Tool-call cards / artifacts | DONE | P0 | cards + rich artifacts: expandable LCS inline file diffs (red/green), text/output blocks, affected-files line; `AcpToolContent`, `AcpDiff`, `ToolCallCard`/`DiffView` |
 | Thinking / thought blocks | DONE | P0 | streaming thought disclosure |
 | Live plan (todo list) | DONE | P1 | ACP `plan` rendered as a checklist card |
 | Context-window usage | DONE | P1 | `usage_update` shown in the chat header |

@@ -99,6 +99,12 @@ final class KaisolaMacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDele
         RootShellView.promptForNewAgent(agent, model: model)
     }
 
+    @objc private func newChatSession(_ sender: Any?) {
+        guard let item = sender as? NSMenuItem,
+              let agent = AgentRegistry.profile(id: item.representedObject as? String ?? "") else { return }
+        RootShellView.promptForNewChat(agent, model: model)
+    }
+
     private func installMainMenu() {
         NSApp.mainMenu = Self.makeMainMenu(
             updateTarget: self,
@@ -108,7 +114,9 @@ final class KaisolaMacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDele
             newTerminalTarget: self,
             newTerminalAction: #selector(newTerminalSession(_:)),
             newAgentTarget: self,
-            newAgentAction: #selector(newAgentSession(_:))
+            newAgentAction: #selector(newAgentSession(_:)),
+            newChatTarget: self,
+            newChatAction: #selector(newChatSession(_:))
         )
     }
 
@@ -123,7 +131,9 @@ final class KaisolaMacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDele
         newTerminalTarget: AnyObject? = nil,
         newTerminalAction: Selector? = nil,
         newAgentTarget: AnyObject? = nil,
-        newAgentAction: Selector? = nil
+        newAgentAction: Selector? = nil,
+        newChatTarget: AnyObject? = nil,
+        newChatAction: Selector? = nil
     ) -> NSMenu {
         let mainMenu = NSMenu()
         let applicationItem = NSMenuItem()
@@ -159,6 +169,17 @@ final class KaisolaMacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDele
 
         let fileItem = NSMenuItem()
         let fileMenu = NSMenu(title: "File")
+        if let newChatAction {
+            let chatItem = fileMenu.addItem(withTitle: "New Chat", action: nil, keyEquivalent: "n")
+            let chatMenu = NSMenu(title: "New Chat")
+            for agent in AgentRegistry.all where AcpAdapter.forAgent(agent.id) != nil {
+                let item = chatMenu.addItem(withTitle: "Chat with \(agent.name)", action: newChatAction, keyEquivalent: "")
+                item.target = newChatTarget
+                item.representedObject = agent.id
+            }
+            chatItem.submenu = chatMenu
+            fileMenu.addItem(.separator())
+        }
         let newTerminal = fileMenu.addItem(
             withTitle: "New Terminal Session…",
             action: newTerminalAction,

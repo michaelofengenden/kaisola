@@ -1,9 +1,9 @@
 {
   "name": "kaisola",
   "productName": "Kaisola",
-  "version": "0.1.94",
+  "version": "0.1.95",
   "private": true,
-  "description": "Kaisola — a Research IDE. Move research from literature → hypotheses → experiments → results → paper, with a human reviewing every transition.",
+  "description": "Kaisola \u2014 a Research IDE. Move research from literature \u2192 hypotheses \u2192 experiments \u2192 results \u2192 paper, with a human reviewing every transition.",
   "type": "module",
   "main": "electron/main.cjs",
   "scripts": {

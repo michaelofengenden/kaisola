@@ -457,7 +457,16 @@ final class AppModel: ObservableObject {
     /// like Electron's do. An agent session boots its CLI via a login shell so
     /// the user's PATH and CLI config apply.
     private func createOwnedSession(inDirectory directory: URL, agent: AgentProfile?) async {
-        guard controlAvailable else { return }
+        guard controlAvailable else {
+            // Never fail silently: say WHY sessions can't be created here.
+            terminalDocument = .failure(
+                sessionID: "create-unavailable",
+                message: connectionState.isConnected
+                    ? "The connected broker doesn't accept native control (it predates the controller lane), so new sessions can't be created from this app yet. Chats and Mesh still work — they don't need the broker."
+                    : "No broker connection — new sessions need a running session broker. Chats and Mesh still work without one."
+            )
+            return
+        }
         let cwd = directory.path
         let projectID = NativeSessionStore.projectID(forDirectory: cwd)
         let terminalID = NativeSessionStore.terminalID(projectID: projectID)

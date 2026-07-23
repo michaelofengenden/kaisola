@@ -397,7 +397,9 @@ struct RootShellView: View {
         ContentUnavailableView {
             Label("Nothing running yet", systemImage: "sparkles")
         } description: {
-            Text("Start a terminal or an agent here. Existing Electron sessions appear automatically when its broker advertises observation.")
+            Text(model.controlAvailable
+                ? "Start a terminal or an agent here. Existing Electron sessions appear automatically when its broker advertises observation."
+                : "Chats and Mesh are ready. Terminals need a broker that accepts native control — this connection doesn't, so terminal creation is disabled.")
         } actions: {
             HStack(spacing: 10) {
                 Button {
@@ -405,6 +407,8 @@ struct RootShellView: View {
                 } label: {
                     Label("New Terminal", systemImage: "terminal")
                 }
+                .disabled(!model.controlAvailable)
+                .help(model.controlAvailable ? "Open a shell in the active project" : "The connected broker doesn't accept native control")
                 if let chatAgent {
                     Button {
                         RootShellView.promptForNewChat(chatAgent, model: model)

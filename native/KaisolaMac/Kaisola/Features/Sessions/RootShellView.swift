@@ -257,6 +257,40 @@ struct RootShellView: View {
         return panel.urls.first
     }
 
+    /// The fresh/offline empty state: instead of a dead end, offer the first
+    /// actions (start a shell, open a chat, open a folder) right where the user
+    /// is looking.
+    @ViewBuilder
+    private var emptyWorkspaceState: some View {
+        let chatAgent = AgentRegistry.all.first { AcpAdapter.forAgent($0.id) != nil }
+        ContentUnavailableView {
+            Label("Nothing running yet", systemImage: "sparkles")
+        } description: {
+            Text("Start a terminal or an agent here. Existing Electron sessions appear automatically when its broker advertises observation.")
+        } actions: {
+            HStack(spacing: 10) {
+                Button {
+                    RootShellView.promptForNewTerminal(model: model)
+                } label: {
+                    Label("New Terminal", systemImage: "terminal")
+                }
+                if let chatAgent {
+                    Button {
+                        RootShellView.promptForNewChat(chatAgent, model: model)
+                    } label: {
+                        Label("Chat with \(chatAgent.name)", systemImage: "bubble.left.and.bubble.right")
+                    }
+                }
+                Button {
+                    RootShellView.promptForOpenFolder(model: model)
+                } label: {
+                    Label("Open Folder…", systemImage: "folder")
+                }
+            }
+            .buttonStyle(.bordered)
+        }
+    }
+
     @ViewBuilder
     private var terminalContent: some View {
         if let message = model.terminalDocument.errorMessage {
@@ -266,11 +300,15 @@ struct RootShellView: View {
                 description: Text(message)
             )
         } else if model.terminalDocument.sessionID == nil {
-            ContentUnavailableView(
-                model.sessions.isEmpty ? "No observable sessions" : "Choose a terminal",
-                systemImage: "terminal",
-                description: Text("Electron remains the controller. This preview only observes durable output.")
-            )
+            if model.sessions.isEmpty {
+                emptyWorkspaceState
+            } else {
+                ContentUnavailableView(
+                    "Choose a terminal",
+                    systemImage: "terminal",
+                    description: Text("Pick a session from the sidebar to view its durable output.")
+                )
+            }
         } else {
             let sessionID = model.terminalDocument.sessionID
             let owned = sessionID.map(model.isOwned) ?? false

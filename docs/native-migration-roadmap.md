@@ -39,10 +39,10 @@ optional pending a scope decision.
 |---|---|---|---|
 | Multi-window (independent workspaces, ⌘⇧N) | DONE | P0 | each window its own AppModel + broker observer connection (`KaisolaMacAppDelegate.makeWindow`) |
 | Two navigation layouts (Left tree vs Top bar), live-switchable | DONE | P0 | `NativePreviewSettings.navigationLayout`; View menu; persisted |
-| Project tabs (Chrome-style, drag-reorder, rename, color, activity badges) | DONE | P0 | open/rename/close/relocate, tint colors, working-count activity badges, Move Left/Right reorder (persisted); pointer drag-reorder deferred |
+| Project tabs (Chrome-style, drag-reorder, rename, color, activity badges) | DONE | P0 | open/rename/close/relocate, tint colors, working-count activity badges, Move Left/Right reorder (persisted) + pointer drag-reorder (v0.1.99) |
 | Session tabs / dock-grid (draggable columns, split, close, pop) | DONE | P0 | in-window splits (up to 4 panes, each its own live subscription; owned panes fully interactive), tab bar with promote/close, Open in Split context menu, pop-out to window; pointer drag-reorder of panes deferred |
 | Full macOS menu bar (App/File/Edit/View/Window/Help + accelerators) | DONE | P0 | App (Settings ⌘,)/File (Open Recent, reopen ⌘⇧T/⌘⌥T)/Edit/View (layout, appearance, font ⌘±)/Window (saved layouts, NSApp.windowsMenu)/Help |
-| Session groups (named, tinted, collapsible; pinned) | PARTIAL | P1 | projects are the grouping: named (rename), tinted (colorHex), collapsible (persisted); ad-hoc cross-project groups/pinning deferred |
+| Session groups (named, tinted, collapsible; pinned) | PARTIAL | P1 | projects are the grouping: named (rename), tinted (colorHex), collapsible (persisted); session pinning shipped v0.1.99 (Pin/Unpin, pinned-first ordering); ad-hoc cross-project groups deferred |
 | Reopen closed session/project (⌘⇧T / ⌘⌥T, 7-day stack) | DONE | P1 | both stacks bounded in `NativeSessionStore`; ⌘⌥T recreates the shell/agent in the same folder |
 | Saved windows (persist/reopen/delete named states) | DONE | P1 | Window ▸ Save Window Layout… / Saved Windows (open/delete); `SavedWindowsStore` (frame + active project) |
 | Project rename / relocate / recents | DONE | P1 | rename sheet; Relocate… carries name+color to the new path; File ▸ Open Recent (8, deduped) |
@@ -50,7 +50,7 @@ optional pending a scope decision.
 | Command palette (⌘K/⌘P, fuzzy files + actions) | DONE | P1 | ⌘K: fuzzy actions + jump-to + project FILE search (bounded walk, TTL cache) opening the preview |
 | Detach project to new window / adopt | NEW | P2 | renderer-to-renderer transfer; complex |
 | Focus vs Studio layout mode | NEW | P2 | Studio is legacy research surface |
-| OmniBar (⌘L) | NEW | P2 | `OmniBar.tsx` |
+| OmniBar (⌘L) | DONE | P2 | native ⌘L overlay: message the focused agent from anywhere (connect-poll deferred delivery) |
 | Keymap overrides (`keymap.json`) | NEW | P2 | |
 | Onboarding flow | NEW | P2 | |
 
@@ -62,14 +62,14 @@ optional pending a scope decision.
 | Observation (list/subscribe/diagnostics) | DONE | P0 | |
 | PTY continuity across restart / detached broker | DONE | P0 | broker contract + reattach-on-relaunch + selection restore; retained-tail marker in the surface |
 | Theming (dark/light/eco, tones, cursor color) | DONE | P1 | app-wide light/dark/system; terminals follow the appearance (Electron DARK_THEME/LIGHT_THEME both ported, live-switch); eco n/a natively |
-| Fonts (family/size ⌘±/weight/line-height) | PARTIAL | P1 | size ⌘+/⌘−/⌘0 persisted (View menu + Settings slider); family/weight deferred |
+| Fonts (family/size ⌘±/weight/line-height) | PARTIAL | P1 | size ⌘+/⌘−/⌘0 + family/weight pickers persisted (v0.1.99); line-height deferred |
 | Search in scrollback | DONE | P1 | SwiftTerm ⌘F find bar (Edit ▸ Find) |
 | Links: URLs + OSC 8 hyperlinks | DONE | P1 | implicit link detection + OSC 8; http(s) → browser, file:// → reveal in Finder |
-| Rename / auto-name / prompt title | PARTIAL | P1 | manual rename + agent·folder auto-name at creation; live prompt-title tracking deferred |
-| Agent detection / meta (process, cwd, branch, ports, exit) | PARTIAL | P0 | agent id + live activity + exit + git-branch meta on rows (TTL scan); process-name/ports polling deferred |
+| Rename / auto-name / prompt title | PARTIAL | P1 | manual rename + agent·folder auto-name + live OSC title auto-tracking until manually renamed (v0.1.99) |
+| Agent detection / meta (process, cwd, branch, ports, exit) | PARTIAL | P0 | agent id + live activity + exit + git-branch + foreground process + listening ports on rows (TTL scans, v0.1.99) |
 | Scroll pinning / bracketed paste / clipboard | NEW | P1 | |
 | File links in output → open in editor | NEW | P2 | `terminalFileLinks.ts` |
-| Browser-card on localhost dev ports | NEW | P2 | |
+| Browser-card on localhost dev ports | DONE | P2 | confined WKWebView card; localhost links from terminals/chats open it (v0.1.99) |
 | Blocks / OSC 133 prompt marks | NEW | P2 | |
 | CLI draft survival (retype into resumed agent) | NEW | P2 | |
 | Pop-out terminal to window | NEW | P2 | |
@@ -94,8 +94,8 @@ optional pending a scope decision.
 | Turn checkpoints / restore (pre-turn git snapshot) | DONE | P1 | git stash create/store before each turn (clean-tree skip); header clock menu restores with confirm |
 | Slash commands / available commands | DONE | P1 | available_commands_update → '/' fuzzy autocomplete in the composer |
 | ACP terminals (agent-spawned, watch/take over) | DONE | P1 | `AcpTerminalHost`: terminal/create…release answered, bounded live output rendered in tool cards; take-over n/a (app-scoped processes) |
-| Kaisola Mesh (group agents: scout→contract→execute→review→integrate) | PARTIAL | P1 | v1: fan-out to all ACP agents, isolated kaisola-mesh-* worktrees, side-by-side streaming columns, per-column diff-vs-HEAD review; staged scout→contract pipeline + auto-integrate deferred |
-| Transcript archive / paging | NEW | P2 | |
+| Kaisola Mesh (group agents: scout→contract→execute→review→integrate) | PARTIAL | P1 | v1 fan-out + isolated worktrees + diff review; v0.1.99 adds staged scout→execute pipeline, idea (brainstorm) mode, role chips, review summaries, and one-click Integrate (git apply --3way) |
+| Transcript archive / paging | DONE | P2 | windowed transcript (120 rows + Show earlier), per-chat drafts persisted (v0.1.99) |
 | @-mentions (project entities) | NEW | P2 | research-tied |
 | Reasoning providers (domain research agents) | NEW | P2 | legacy |
 
@@ -103,9 +103,9 @@ optional pending a scope decision.
 
 | Feature | Status | Pri | Notes |
 |---|---|---|---|
-| File tree + fuzzy search + index + watch | PARTIAL | P1 | rail tree + palette fuzzy file index (TTL cache, manual refresh); FS watching deferred |
-| Code editor (syntax, save, dirty, cursor restore) | PARTIAL | P1 | plain-text editor: ⌘S save, revert, dirty dot (strangler plan: rich editing arrives via the WKWebView phase; syntax highlighting deferred) |
-| Document preview (Markdown/HTML/CSV/JSON) | PARTIAL | P1 (md) / P2 | markdown styled (inline syntax) + Source toggle; images; HTML/CSV/JSON deferred |
+| File tree + fuzzy search + index + watch | PARTIAL | P1 | rail tree + palette fuzzy index + live FSEvents watching (debounced auto-refresh, v0.1.99) |
+| Code editor (syntax, save, dirty, cursor restore) | PARTIAL | P1 | editor: ⌘S save, revert, dirty dot + native regex syntax highlighting with read/edit toggle (v0.1.99); rich editing still arrives via the WKWebView phase |
+| Document preview (Markdown/HTML/CSV/JSON) | PARTIAL | P1 (md) / P2 | markdown styled + Source toggle; images; CSV/TSV tables, JSON tree, confined JS-off HTML preview (v0.1.99) |
 | Preview tabs (Zed-style transient) | NEW | P2 | |
 | PDF viewer + LaTeX synctex | NEW | P2 | |
 | Research/word diffs | NEW | P2 | |
@@ -118,13 +118,13 @@ optional pending a scope decision.
 
 | Section | Status | Pri | Notes |
 |---|---|---|---|
-| General (theme, updates, onboarding) | DONE | P0 (theme) / P1 | Settings ⌘, General tab: layout, appearance, update check; onboarding deferred (P2) |
+| General (theme, updates, onboarding) | DONE | P0 (theme) / P1 | Settings ⌘, General tab: layout, appearance, notifications, external editor, update check; first-run onboarding sheet (v0.1.99) |
 | Guardrails (sensitive globs, permission rules, autonomy) | DONE | P0 | sensitive globs + permission rules (`AcpPermissionRules`) + ACP session-mode picker (plan/default/acceptEdits/bypass) |
-| Terminal (font/size/weight/line-height/tone/cursor) | PARTIAL | P1 | font-size slider + invariant note; family/weight deferred |
-| Agents (add custom terminal/ACP, enable presets, models) | PARTIAL | P1 | adapter roster + account-isolation fields; custom agent registration deferred |
-| Models & keys (API keys keychain, provider, base URLs) | NEW | P1 | |
-| Usage (Codex/Claude/OpenCode gauges, limits) | PARTIAL | P1 | per-chat context usage in the header; account-level gauges deferred |
-| Interface (cost chips, inbox, diffs, drafts, nav, perf) | PARTIAL | P1 | inbox (bell + dock badge), diffs, nav layouts shipped; cost chips/drafts deferred |
+| Terminal (font/size/weight/line-height/tone/cursor) | PARTIAL | P1 | font-size slider + family/weight pickers (v0.1.99) |
+| Agents (add custom terminal/ACP, enable presets, models) | PARTIAL | P1 | adapter roster + account isolation (app-wide AND per-project) + custom agent registration + device-code sign-in card (v0.1.99) |
+| Models & keys (API keys keychain, provider, base URLs) | PARTIAL | P1 | Anthropic/OpenAI keys in the login keychain, injected into agent env (v0.1.99); provider/base-URL config deferred |
+| Usage (Codex/Claude/OpenCode gauges, limits) | PARTIAL | P1 | per-chat context usage + session-wide usage center (per-chat gauges, turn counts, Settings tab + footer chip, v0.1.99) |
+| Interface (cost chips, inbox, diffs, drafts, nav, perf) | PARTIAL | P1 | inbox (bell + dock badge + native notifications), word-level diffs with unified/split toggle, drafts, toasts, nav layouts (v0.1.99); cost chips deferred |
 | Companion (pairing/devices) | NEW | P2 | |
 | Extensions (languages/grammars/previews/MCP) | NEW | P2 | |
 | Advanced (settings.json/keymap.json editing) | NEW | P2 | |
@@ -134,11 +134,11 @@ optional pending a scope decision.
 
 | Feature | Status | Pri | Notes |
 |---|---|---|---|
-| Claude accounts (isolated CLAUDE_CONFIG_DIR, per-project) | PARTIAL | P1 | app-wide CLAUDE_CONFIG_DIR override applied to terminals+chats; per-project scoping deferred |
-| Codex accounts (isolated CODEX_HOME, per-project) | PARTIAL | P1 | app-wide CODEX_HOME override applied to terminals+chats; per-project scoping deferred |
+| Claude accounts (isolated CLAUDE_CONFIG_DIR, per-project) | PARTIAL | P1 | app-wide override + per-project scoping (project wins per key; plain shells carry the env too, v0.1.99) |
+| Codex accounts (isolated CODEX_HOME, per-project) | PARTIAL | P1 | app-wide override + per-project scoping (project wins per key; plain shells carry the env too, v0.1.99) |
 | Device-code sign-in card | NEW | P1 | |
-| API keys (Anthropic/OpenAI keychain) | NEW | P1 | |
-| MCP servers (per-workspace, add/probe/import, carried into agents) | NEW | P2 | |
+| API keys (Anthropic/OpenAI keychain) | DONE | P1 | data-protection keychain store, Settings tab, env injection (v0.1.99) |
+| MCP servers (per-workspace, add/probe/import, carried into agents) | PARTIAL | P2 | per-workspace registry in Settings, exact Electron wire shapes, carried into chats+Mesh (v0.1.99); probe/import deferred |
 | Extensions | NEW | P2 | |
 | App account (Google/Firebase, for companion rendezvous) | NEW | P2 | |
 
@@ -178,19 +178,19 @@ against the Electron host.
 | Git worktree sessions (isolated checkout per agent; Mesh) | DONE | P1 | Mesh columns each get a kaisola-mesh-* worktree; namespace-guarded cleanup |
 | Whole-app local persistence (layouts, drafts, metadata) | DONE | P0 | layout/appearance/font/rail/globs/accounts (UserDefaults), projects/colors/order/recents/closed-stacks/selection (`NativeSessionStore`), saved windows, window frames |
 | Agent task ledger | NEW | P2 | |
-| Embedded browser cards | NEW | P2 | |
+| Embedded browser cards | DONE | P2 | `BrowserCardView` confined WKWebView (v0.1.99) |
 | LaTeX mode | NEW | P2 | |
 | Workflows / automations | NEW | P2 | research legacy |
 | Cost / usage chips | NEW | P2 | |
 | Sandboxed experiments (mock/docker/e2b) | NEW | P2 | research legacy |
 | Research pipeline (papers/citations/hypotheses/campaigns) | NEW | P2 | large legacy; likely out of scope |
-| Toasts | NEW | P2 | |
+| Toasts | DONE | P2 | `ToastCenter` + overlay: saves, checkpoint restores, PR results, attachment rejections (v0.1.99) |
 
 ---
 
 ## Suggested phase ordering
 
-**Status 2026-07-23: Phases A–D are substantively COMPLETE in the native preview** (every P0 and nearly every P1 row above is DONE or PARTIAL-with-the-core-shipped; per-row notes name what remains). What's left is the P2 long tail plus the named deferrals: in-window dock-grid/split, pointer drag-reorder, staged Mesh pipeline, per-project account scoping, FS watching, syntax highlighting (WKWebView phase), device-code sign-in cards, API-key keychain.
+**Status 2026-07-23 (v0.1.99): Phases A–E are substantively COMPLETE in the native preview.** The v0.1.99 parity campaign (25 subagents across three waves) closed every previously named deferral — pointer drag-reorder, staged Mesh pipeline + idea mode, per-project account scoping, FS watching, syntax highlighting (native interim), device-code sign-in card, API-key keychain, MCP settings, onboarding, OmniBar, browser cards, transcript paging + drafts, session pinning, usage center, native notifications, toasts, font family/weight, live titles, process/ports meta — and added prompt attachments (files + images as real ACP blocks), word-level diffs with a unified/split toggle, one-click Commit→Push→Create-PR, per-project Quick Actions, custom agent registration, Shift+Enter newline, ⇧⌘O open-in-external-editor, and an AGENTS.md scaffold. Remaining: the WKHTML rich-editing phase, provider/base-URL config, MCP probe/import, pane pointer-drag, cost chips, CLI draft retype, and the Phase F research legacy (scope unconfirmed).
 
 - **Phase A — shell & session spine (P0):** multi-window; project tabs; the two navigation layouts; session tabs / dock-grid; full macOS menu bar; theme (dark/light/system live); broaden persistence to whole-app state; PTY-continuity UX + terminal meta poller.
 - **Phase B — agent chat depth (P0):** ACP chat UI with tool-call cards, thinking blocks, plans, streaming; permissions/guardrails + gates; model/effort/permission-mode selection; steering + queued follow-ups; optimistic dispatch/rollback.

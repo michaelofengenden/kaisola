@@ -38,8 +38,13 @@ KAISOLA_NATIVE_BROKER_PROFILE=development npm run native:dev
 products from Launch Services and re-registers only the canonical app.
 `--clean-legacy` additionally moves old installed copies and reproducible raw
 build/test products to Trash, then purges stale Launch Services records left by
-old `/tmp` builds, translocated downloads, and already-trashed copies. It never
-deletes those arbitrary build directories and never touches Electron's
+old `/tmp` builds, translocated downloads, and already-trashed copies. Trashed
+native bundles use a recoverable `.kaisola-trashed` suffix because macOS will
+otherwise re-register a normal `.app` even inside Trash. Launch Services also
+tracks moved directories by file identity, so cleanup renames the bundle's
+`Contents/Info.plist` to `Info.plist.kaisola-trashed`; restore that filename and
+the outer `.app` suffix to recover the untouched bundle. Cleanup never deletes
+arbitrary build directories and never touches Electron's
 `/Applications/Kaisola.app` or broker-owned PTYs.
 
 Finder and Spotlight launches use that same native-only route for Debug builds,

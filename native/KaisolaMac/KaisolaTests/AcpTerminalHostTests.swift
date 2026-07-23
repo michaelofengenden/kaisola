@@ -45,6 +45,26 @@ final class AcpTerminalHostTests: XCTestCase {
         XCTAssertEqual(snapshot?.truncated, false)
     }
 
+    func testRapidExitAlwaysDrainsOutputBeforeWaitResolves() async throws {
+        let host = AcpTerminalHost()
+        for iteration in 0..<20 {
+            let expected = "rapid-drain-\(iteration)-" + String(repeating: "x", count: 1_024)
+            let id = try await host.create(
+                command: "/usr/bin/printf",
+                args: [expected],
+                env: [:],
+                cwd: FileManager.default.temporaryDirectory.path,
+                outputByteLimit: nil
+            )
+            let status = await host.waitForExit(id)
+            let snapshot = await host.output(id)
+            XCTAssertEqual(status?.exitCode, 0)
+            XCTAssertEqual(snapshot?.output, expected,
+                           "iteration \(iteration) resolved before its final output was committed")
+            await host.release(id)
+        }
+    }
+
     func testOutputByteLimitKeepsTailAndMarksTruncated() async throws {
         let host = AcpTerminalHost()
         let id = try await host.create(

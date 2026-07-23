@@ -195,16 +195,94 @@ move_to_trash() {
   local base destination suffix collision
   base="$(basename "$target")"
   suffix="$(date +%Y%m%d-%H%M%S)-$$"
-  destination="$HOME/.Trash/${base%.app}-$suffix.app"
+  # A directory ending in .app remains launchable inside Trash and macOS can
+  # asynchronously add it straight back to Launch Services. Preserve the
+  # bundle under a non-app suffix; the metadata pass below parks Info.plist too,
+  # and reversing both recoverable renames restores the untouched bundle.
+  destination="$HOME/.Trash/${base%.app}-$suffix.kaisola-trashed"
   collision=1
   while [[ -e "$destination" ]]; do
-    destination="$HOME/.Trash/${base%.app}-$suffix-$collision.app"
+    destination="$HOME/.Trash/${base%.app}-$suffix-$collision.kaisola-trashed"
     collision=$((collision + 1))
   done
   /bin/mkdir -p "$HOME/.Trash"
   "$LSREGISTER" -u "$target" 2>/dev/null || true
   /bin/mv "$target" "$destination"
   /bin/echo "Moved legacy copy to Trash: $target"
+}
+
+# Upgrade old cleanup output too. Earlier launcher revisions used a normal
+# `.app` suffix inside Trash, which keeps the copy recoverable but lets macOS
+# rediscover it as a launch candidate. Rename only bundles carrying this exact
+# native-preview id. Deepest-first order safely handles an app nested inside an
+# older wrapper app. No bytes are deleted; this outer rename and the metadata
+# rename below can both be restored manually.
+quarantine_trashed_preview_copies() {
+  local -a trashed_apps=()
+  local -a quarantined_paths=()
+  local candidate identifier destination collision index quarantined_count=0
+  while IFS= read -r -d '' candidate; do
+    trashed_apps+=("$candidate")
+  done < <(/usr/bin/find "$HOME/.Trash" -type d -name '*.app' -print0 2>/dev/null)
+
+  for ((index = ${#trashed_apps[@]} - 1; index >= 0; index -= 1)); do
+    candidate="${trashed_apps[$index]}"
+    [[ -d "$candidate" ]] || continue
+    identifier="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$candidate/Contents/Info.plist" 2>/dev/null || true)"
+    [[ "$identifier" == "com.kaisola.mac.preview" ]] || continue
+
+    "$LSREGISTER" -u "$candidate" 2>/dev/null || true
+    destination="${candidate%.app}.kaisola-trashed"
+    collision=1
+    while [[ -e "$destination" ]]; do
+      destination="${candidate%.app}-$collision.kaisola-trashed"
+      collision=$((collision + 1))
+    done
+    /bin/mv "$candidate" "$destination"
+    quarantined_paths+=("$destination")
+    quarantined_count=$((quarantined_count + 1))
+  done
+
+  if [[ "$quarantined_count" -gt 0 ]]; then
+    # Launch Services follows the moved directory by file identity and updates
+    # its cached path asynchronously. Give that notification one bounded beat,
+    # then unregister the destination identity too. The general stale-record
+    # sweep immediately after this function remains the final backstop.
+    /bin/sleep 1
+    for candidate in "${quarantined_paths[@]}"; do
+      "$LSREGISTER" -u "$candidate" 2>/dev/null || true
+    done
+    /bin/echo "Quarantined $quarantined_count legacy preview bundles already in Trash."
+  fi
+}
+
+# Launch Services can follow a renamed directory by file identity even when its
+# suffix is no longer `.app`. Remove the bundle-recognition trigger as well by
+# recoverably renaming only Info.plist inside exact native-preview bundles in
+# Trash. Restoring the two names (`.app` and `Contents/Info.plist`) restores the
+# original bundle byte-for-byte.
+disable_trashed_preview_metadata() {
+  local info_plist bundle_root identifier metadata_destination collision disabled_count=0
+  while IFS= read -r -d '' info_plist; do
+    identifier="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$info_plist" 2>/dev/null || true)"
+    [[ "$identifier" == "com.kaisola.mac.preview" ]] || continue
+
+    bundle_root="${info_plist%/Contents/Info.plist}"
+    "$LSREGISTER" -u "$bundle_root" 2>/dev/null || true
+    metadata_destination="$info_plist.kaisola-trashed"
+    collision=1
+    while [[ -e "$metadata_destination" ]]; do
+      metadata_destination="$info_plist.$collision.kaisola-trashed"
+      collision=$((collision + 1))
+    done
+    /bin/mv "$info_plist" "$metadata_destination"
+    "$LSREGISTER" -u "$bundle_root" 2>/dev/null || true
+    disabled_count=$((disabled_count + 1))
+  done < <(/usr/bin/find "$HOME/.Trash" -type f -path '*/Contents/Info.plist' -print0 2>/dev/null)
+
+  if [[ "$disabled_count" -gt 0 ]]; then
+    /bin/echo "Disabled launch metadata in $disabled_count trashed preview bundles."
+  fi
 }
 
 clean_legacy_copies() {
@@ -275,6 +353,8 @@ fi
 
 if [[ "$CLEAN_LEGACY" -eq 1 ]]; then
   clean_legacy_copies
+  quarantine_trashed_preview_copies
+  disable_trashed_preview_metadata
   purge_stale_preview_registrations
 fi
 

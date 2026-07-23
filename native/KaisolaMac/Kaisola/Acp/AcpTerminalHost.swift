@@ -79,14 +79,26 @@ actor AcpTerminalHost {
         let entry = Entry(process: process, byteLimit: min(max(1, requestedLimit), Self.maxOutputByteLimit))
         entries[id] = entry
 
-        pipe.fileHandleForReading.readabilityHandler = { [weak self] handle in
+        // FileHandle may call the readability handler once with bytes and then
+        // immediately with EOF. Spawning an independent Task for each callback
+        // lets the EOF task overtake the final append on a busy executor. Feed
+        // one AsyncStream instead: its single consumer commits every chunk in
+        // callback order, then marks EOF only after the buffer is fully drained.
+        let (outputStream, outputContinuation) = AsyncStream<Data>.makeStream()
+        pipe.fileHandleForReading.readabilityHandler = { handle in
             let data = handle.availableData
             if data.isEmpty {
                 handle.readabilityHandler = nil
-                Task { await self?.markEOF(id: id) }
+                outputContinuation.finish()
                 return
             }
-            Task { await self?.append(id: id, data: data) }
+            outputContinuation.yield(data)
+        }
+        Task { [weak self] in
+            for await data in outputStream {
+                await self?.append(id: id, data: data)
+            }
+            await self?.markEOF(id: id)
         }
         process.terminationHandler = { [weak self] finished in
             guard let self else { return }
@@ -104,6 +116,8 @@ actor AcpTerminalHost {
         do {
             try process.run()
         } catch {
+            pipe.fileHandleForReading.readabilityHandler = nil
+            outputContinuation.finish()
             entries[id] = nil
             throw error
         }

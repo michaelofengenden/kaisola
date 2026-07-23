@@ -47,6 +47,11 @@ final class AcpConversation: ObservableObject {
     /// content blocks with the next immediate send and cleared then. Queued
     /// follow-ups never carry attachments (see `send`).
     @Published private(set) var pendingAttachments: [PendingAttachment] = []
+
+    /// Original text + attachment blocks for failed sends, keyed by the failed
+    /// row's Identifiable id, so `retryFailed` can re-send the exact payload
+    /// (attachments included) rather than a text-only prompt.
+    private var failedSends: [String: (text: String, attachments: [AcpAttachment])] = [:]
     /// Pre-turn working-tree snapshots (git stash create), restorable from the
     /// header. Present only when the workspace is a git repo with changes.
     @Published private(set) var checkpoints: [TurnCheckpoint] = []
@@ -198,16 +203,24 @@ final class AcpConversation: ObservableObject {
     }
 
     /// Retry a failed optimistic send: the failed row is replaced by a fresh
-    /// dispatch of the same text.
+    /// dispatch of the SAME text AND attachments. A failed send stashes its
+    /// original (pre-📎-label) text and attachment blocks under the row id, so
+    /// retry re-sends the image/file bytes faithfully instead of a text-only
+    /// prompt. (A retry while another turn runs falls back to a text-only queued
+    /// follow-up — the queue is text-only by design.)
     func retryFailed(_ rowID: String) {
         guard let index = rows.firstIndex(where: { $0.id == rowID }),
               case let .user(_, text, failed) = rows[index], failed else { return }
         rows.remove(at: index)
+        let stashed = failedSends.removeValue(forKey: rowID)
+        let originalText = stashed?.text ?? text
+        let attachments = stashed?.attachments ?? []
         if isRunning {
+            guard !originalText.isEmpty else { return }
             queueCounter += 1
-            queued.append(QueuedMessage(id: "q\(queueCounter)", text: text))
+            queued.append(QueuedMessage(id: "q\(queueCounter)", text: originalText))
         } else {
-            dispatch(text)
+            dispatch(originalText, attachments: attachments)
         }
     }
 
@@ -287,8 +300,11 @@ final class AcpConversation: ObservableObject {
                 statusMessage = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
                 isRunning = false
                 // Roll back optimism: mark the row failed so the user can retry.
+                // Stash the ORIGINAL text + attachment blocks (keyed by the row's
+                // Identifiable id) so Retry re-sends them faithfully.
                 if let index = rows.firstIndex(where: { $0.id == "user-\(rowID)" }) {
                     rows[index] = .user(id: rowID, text: displayText, failed: true)
+                    failedSends["user-\(rowID)"] = (text: trimmed, attachments: attachments)
                 }
             }
         }

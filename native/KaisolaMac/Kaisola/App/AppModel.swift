@@ -544,19 +544,35 @@ final class AppModel: ObservableObject {
             app: NativePreviewSettings.shared.agentEnvironmentOverlay,
             project: ProjectAccountStore().override(forProject: projectID)
         )
+        // The overlay can carry secrets (ANTHROPIC_API_KEY / OPENAI_API_KEY).
+        // The broker's createTerminal has no env channel, so the env must reach
+        // the shell through the `-c` command — but embedding `export KEY=secret`
+        // there leaves the secret in the parent shell's argv, visible to every
+        // `ps`/diagnostic while the agent runs. Instead write the exports to a
+        // per-session 0600 file and `source` + `rm` it, so only the file PATH
+        // (not the secret) is ever in argv. Falls back to inline exports if the
+        // file can't be written, so a write failure never blocks a session.
         let exports = overlay
             .map { "export \($0.key)=\(Self.shellQuote($0.value)); " }
             .sorted()
             .joined()
+        let prelude: String
+        if overlay.isEmpty {
+            prelude = ""
+        } else if let envFile = Self.writeSessionEnvFile(exports: exports, terminalID: terminalID) {
+            prelude = "source \(Self.shellQuote(envFile)); rm -f \(Self.shellQuote(envFile)); "
+        } else {
+            prelude = exports
+        }
         let arguments: [String]
         if let agent, !agent.launchCommand.isEmpty {
             // -ilc runs the agent as the login shell's command so it inherits
             // the interactive environment, then hands control to the user.
-            arguments = ["-ilc", "\(exports)\(agent.launchCommand); exec \(shell) -il"]
-        } else if !exports.isEmpty {
+            arguments = ["-ilc", "\(prelude)\(agent.launchCommand); exec \(shell) -il"]
+        } else if !prelude.isEmpty {
             // Plain shells get the account env too, so a hand-typed `claude`
             // or `codex` (and the Sign-in card's login) uses the right dir.
-            arguments = ["-ilc", "\(exports)exec \(shell) -il"]
+            arguments = ["-ilc", "\(prelude)exec \(shell) -il"]
         } else {
             arguments = ["-il"]
         }
@@ -594,6 +610,36 @@ final class AppModel: ObservableObject {
 
     private static func shellQuote(_ value: String) -> String {
         "'" + value.replacingOccurrences(of: "'", with: "'\\''") + "'"
+    }
+
+    /// Write the export prelude to a per-session mode-0600 file under Application
+    /// Support so account secrets reach the broker-spawned shell without landing
+    /// in its argv. Returns the file path, or nil on any failure (caller then
+    /// falls back to inline exports — availability over secrecy). The shell
+    /// `rm`s it immediately after sourcing; a stale file (shell never ran) is a
+    /// 0600 file only the user can read.
+    private static func writeSessionEnvFile(exports: String, terminalID: String) -> String? {
+        let directory = NativePreviewPaths.applicationSupportDirectory
+            .appendingPathComponent("session-env", isDirectory: true)
+        do {
+            try FileManager.default.createDirectory(
+                at: directory, withIntermediateDirectories: true,
+                attributes: [.posixPermissions: 0o700]
+            )
+            // Sanitize the id into a filename; it is broker-generated but keep
+            // the path from ever escaping the directory.
+            let safeID = terminalID.replacingOccurrences(
+                of: "[^A-Za-z0-9._-]", with: "_", options: .regularExpression
+            )
+            let file = directory.appendingPathComponent("\(safeID).sh", isDirectory: false)
+            try Data(exports.utf8).write(to: file, options: [.atomic])
+            try FileManager.default.setAttributes(
+                [.posixPermissions: 0o600], ofItemAtPath: file.path
+            )
+            return file.path
+        } catch {
+            return nil
+        }
     }
 
     /// The agent profile a session runs, or nil for a plain shell / observed

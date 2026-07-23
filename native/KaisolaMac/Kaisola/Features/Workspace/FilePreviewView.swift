@@ -95,8 +95,15 @@ struct FilePreviewView: View {
             isPresented: Binding(get: { pendingAction != nil }, set: { if !$0 { pendingAction = nil } })
         ) {
             Button("Save") {
-                save()
-                completePendingAction()
+                // Only navigate away once the write actually succeeds — a failed
+                // save (read-only file, disk full, file vanished) must keep the
+                // pane on the current file with the draft and error intact, never
+                // silently discard the edits by navigating/closing anyway.
+                if save() {
+                    completePendingAction()
+                } else {
+                    pendingAction = nil
+                }
             }
             Button("Discard Changes", role: .destructive) {
                 draft = savedText
@@ -275,15 +282,21 @@ struct FilePreviewView: View {
         highlighted = SyntaxHighlighter.highlight(draft, language: language, theme: theme)
     }
 
-    private func save() {
+    /// Write the draft to disk. Returns whether the write succeeded, so callers
+    /// gating navigation on a save (the unsaved-changes dialog) never discard
+    /// edits on failure.
+    @discardableResult
+    private func save() -> Bool {
         do {
             try draft.write(to: displayedURL ?? url, atomically: true, encoding: .utf8)
             savedText = draft
             saveError = nil
             ToastCenter.shared.show("Saved \((displayedURL ?? url).lastPathComponent)", style: .success)
+            return true
         } catch {
             saveError = error.localizedDescription
             ToastCenter.shared.show(error.localizedDescription, style: .error)
+            return false
         }
     }
 

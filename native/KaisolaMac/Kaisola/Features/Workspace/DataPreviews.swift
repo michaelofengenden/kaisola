@@ -605,11 +605,15 @@ private struct ConfinedFileWebView: NSViewRepresentable {
                 decisionHandler(.allow)
                 return
             }
-            // Off-scope (an http link, or a file:// escaping the directory): hand
-            // top-level / new-window navigations to the real browser and drop
-            // off-scope subframes so the pane can never wander.
+            // Off-scope navigation. Hand ONLY an explicit user click on an
+            // http(s) link to the real browser — a meta refresh, a JS-less
+            // redirect, or a custom-scheme navigation (all `.other`) must never
+            // auto-launch an external app just because the file was previewed.
             let isTopLevel = navigationAction.targetFrame?.isMainFrame ?? true
-            if isTopLevel {
+            let scheme = target.scheme?.lowercased()
+            if isTopLevel,
+               navigationAction.navigationType == .linkActivated,
+               scheme == "http" || scheme == "https" {
                 NSWorkspace.shared.open(target)
             }
             decisionHandler(.cancel)

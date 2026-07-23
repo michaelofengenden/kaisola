@@ -33,6 +33,19 @@ final class AcpWordDiffTests: XCTestCase {
         XCTAssertTrue(added.allSatisfy { !$0.changed })
     }
 
+    func testOversizedLineDiffSkipsQuadraticLCS() {
+        // Beyond the line cap the diff must NOT build the O(m×n) table (which
+        // would allocate ~GBs and freeze the UI); it returns every old line
+        // removed then every new line added — bounded and non-freezing.
+        let n = AcpDiff.lineDiffCap + 50
+        let old = (0..<n).map { "old\($0)" }.joined(separator: "\n")
+        let new = (0..<n).map { "new\($0)" }.joined(separator: "\n")
+        let lines = AcpDiff.lines(old: old, new: new)
+        XCTAssertEqual(lines.count, n * 2)
+        XCTAssertEqual(lines.prefix(n).filter { $0.kind == .removed }.count, n)
+        XCTAssertEqual(lines.suffix(n).filter { $0.kind == .added }.count, n)
+    }
+
     func testOversizedLinesFallBackToWholeLineChange() {
         let long = Array(repeating: "word", count: AcpDiff.wordTokenCap + 1).joined(separator: " ")
         let (removed, added) = AcpDiff.wordSegments(removed: long, added: long + " extra")

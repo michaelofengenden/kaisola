@@ -26,6 +26,13 @@ final class DataPreviewsTests: XCTestCase {
         XCTAssertEqual(rows, [["q"], ["He said \"hi\""]])
     }
 
+    func testMidFieldQuoteIsLiteralAndDoesNotSwallowRest() {
+        // A stray quote NOT at field start (3"5) is a literal character; it must
+        // not open a quoted field that eats every later delimiter/newline.
+        let (rows, _) = CsvTable.parse("a,b\n3\"5,tail\nx,y")
+        XCTAssertEqual(rows, [["a", "b"], ["3\"5", "tail"], ["x", "y"]])
+    }
+
     func testCRLFLineEndings() {
         let (rows, _) = CsvTable.parse("a,b\r\n1,2\r\n")
         XCTAssertEqual(rows, [["a", "b"], ["1", "2"]])

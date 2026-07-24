@@ -7,6 +7,71 @@ import XCTest
 /// protocol (initialize → session/new → session/prompt → session/update
 /// stream, plus a permission callback) is verified without spawning a process.
 final class AcpClientTests: XCTestCase {
+    func testRejectsUnsupportedNegotiatedProtocol() async throws {
+        let transport = ScriptedAcpTransport(protocolVersion: 2)
+        let client = AcpClient(transport: transport)
+        do {
+            _ = try await client.start(
+                command: "mock", arguments: [], environment: [:], cwd: "/tmp",
+                mcpServers: []
+            )
+            XCTFail("Expected the ACP protocol mismatch to fail before session/new")
+        } catch let AcpClientError.unsupportedProtocol(version) {
+            XCTAssertEqual(version, 2)
+        } catch {
+            XCTFail("Unexpected error: \(error)")
+        }
+        let terminationCount = await transport.terminationCount()
+        let sessionServers = await transport.receivedSessionMcpServers()
+        XCTAssertEqual(terminationCount, 1)
+        XCTAssertTrue(sessionServers.isEmpty)
+    }
+
+    func testMcpServersAreFilteredAgainstNegotiatedCapabilities() async throws {
+        let transport = ScriptedAcpTransport(mcpHTTP: true, mcpSSE: false)
+        let client = AcpClient(transport: transport)
+        let configured: [JSONValue] = [
+            .object([
+                "name": .string("local"), "command": .string("mcp-local"),
+                "args": .array([]), "env": .array([]),
+            ]),
+            .object([
+                "type": .string("http"), "name": .string("remote"),
+                "url": .string("https://example.com/mcp"), "headers": .array([]),
+            ]),
+            .object([
+                "type": .string("sse"), "name": .string("stream"),
+                "url": .string("https://example.com/sse"), "headers": .array([]),
+            ]),
+        ]
+
+        _ = try await client.start(
+            command: "mock", arguments: [], environment: [:], cwd: "/tmp",
+            mcpServers: configured
+        )
+
+        let sent = await transport.receivedSessionMcpServers()
+        XCTAssertEqual(sent.compactMap { $0.objectValue?["name"]?.stringValue }, ["local", "remote"])
+        XCTAssertNil(sent.first?.objectValue?["type"], "stdio must use the ACP untagged wire shape")
+        XCTAssertEqual(sent.last?.objectValue?["type"], .string("http"))
+    }
+
+    func testInvalidMcpParamsRetrySessionWithoutTools() async throws {
+        let transport = ScriptedAcpTransport(rejectFirstMcpSession: true)
+        let client = AcpClient(transport: transport)
+        _ = try await client.start(
+            command: "mock", arguments: [], environment: [:], cwd: "/tmp",
+            mcpServers: [.object([
+                "name": .string("local"), "command": .string("mcp-local"),
+                "args": .array([]), "env": .array([]),
+            ])]
+        )
+        let attempts = await transport.receivedSessionMcpAttempts()
+        XCTAssertEqual(attempts.count, 2)
+        XCTAssertEqual(attempts.first?.count, 1)
+        XCTAssertTrue(attempts.last?.isEmpty == true)
+    }
+
     func testHandshakeAndStreamedTurn() async throws {
         let transport = ScriptedAcpTransport()
         let client = AcpClient(transport: transport)
@@ -36,7 +101,15 @@ final class AcpClientTests: XCTestCase {
         XCTAssertTrue(events.contains { if case .turnItem(.plan) = $0 { return true } else { return false } })
         XCTAssertTrue(events.contains { if case let .turnItem(.toolCall(c)) = $0 { return c.id == "t1" } else { return false } })
         XCTAssertTrue(events.contains { if case let .toolCallUpdate(id, status, _, _) = $0 { return id == "t1" && status == .completed } else { return false } })
-        XCTAssertTrue(events.contains { if case let .usage(u) = $0 { return u.used == 5000 } else { return false } })
+        XCTAssertTrue(events.contains {
+            if case let .usage(u) = $0 {
+                return u.used == 5000
+                    && u.max == 200000
+                    && u.costAmount == 0.42
+                    && u.costCurrency == "USD"
+            }
+            return false
+        })
         XCTAssertTrue(events.contains { if case .turnEnded = $0 { return true } else { return false } })
         // Slash commands stream in via available_commands_update.
         XCTAssertTrue(events.contains { event in
@@ -178,6 +251,29 @@ private actor ScriptedAcpTransport: AcpByteTransport {
     private var outbound: [Data] = []
     private var waiter: CheckedContinuation<Data?, Never>?
     private var started = false
+    private let protocolVersion: Int64
+    private let mcpHTTP: Bool
+    private let mcpSSE: Bool
+    private let rejectFirstMcpSession: Bool
+    private var sessionMcpServers: [JSONValue] = []
+    private var sessionMcpAttempts: [[JSONValue]] = []
+    private var terminations = 0
+
+    init(
+        protocolVersion: Int64 = 1,
+        mcpHTTP: Bool = true,
+        mcpSSE: Bool = false,
+        rejectFirstMcpSession: Bool = false
+    ) {
+        self.protocolVersion = protocolVersion
+        self.mcpHTTP = mcpHTTP
+        self.mcpSSE = mcpSSE
+        self.rejectFirstMcpSession = rejectFirstMcpSession
+    }
+
+    func receivedSessionMcpServers() -> [JSONValue] { sessionMcpServers }
+    func receivedSessionMcpAttempts() -> [[JSONValue]] { sessionMcpAttempts }
+    func terminationCount() -> Int { terminations }
 
     func start(command: String, arguments: [String], environment: [String: String], cwd: String) async throws {
         started = true
@@ -189,13 +285,22 @@ private actor ScriptedAcpTransport: AcpByteTransport {
         switch object["method"]?.stringValue {
         case "initialize":
             reply(id: id, result: .object([
-                "protocolVersion": .integer(1),
+                "protocolVersion": .integer(protocolVersion),
                 "agentCapabilities": .object([
                     "loadSession": .bool(true),
-                    "mcpCapabilities": .object(["http": .bool(true)]),
+                    "mcpCapabilities": .object([
+                        "http": .bool(mcpHTTP),
+                        "sse": .bool(mcpSSE),
+                    ]),
                 ]),
             ]))
         case "session/new":
+            sessionMcpServers = object["params"]?.objectValue?["mcpServers"]?.arrayValue ?? []
+            sessionMcpAttempts.append(sessionMcpServers)
+            if rejectFirstMcpSession, sessionMcpAttempts.count == 1, !sessionMcpServers.isEmpty {
+                replyError(id: id, message: "Invalid params: unsupported MCP server")
+                return
+            }
             reply(id: id, result: .object([
                 "sessionId": .string("sess-1"),
                 // Flat models shape (exercises the fallback parse path).
@@ -259,12 +364,27 @@ private actor ScriptedAcpTransport: AcpByteTransport {
             .object(["name": .string("compact"), "description": .string("Compact the conversation")]),
             .object(["name": .string("review"), "description": .string("Review changes")]),
         ])]))
-        notify(update: .object(["sessionUpdate": .string("usage_update"), "usedTokens": .integer(5000), "maxTokens": .integer(200000)]))
+        // Current ACP schema: `used` + `size`, with optional cumulative cost.
+        notify(update: .object([
+            "sessionUpdate": .string("usage_update"),
+            "used": .integer(5000),
+            "size": .integer(200000),
+            "cost": .object(["amount": .number(0.42), "currency": .string("USD")]),
+        ]))
     }
 
     private func reply(id: JSONValue?, result: JSONValue) {
         guard let id else { return }
         enqueue(.object(["jsonrpc": .string("2.0"), "id": id, "result": result]))
+    }
+
+    private func replyError(id: JSONValue?, message: String) {
+        guard let id else { return }
+        enqueue(.object([
+            "jsonrpc": .string("2.0"),
+            "id": id,
+            "error": .object(["code": .integer(-32602), "message": .string(message)]),
+        ]))
     }
 
     private func notify(update: JSONValue) {
@@ -292,6 +412,7 @@ private actor ScriptedAcpTransport: AcpByteTransport {
     }
 
     func terminate() async {
+        terminations += 1
         waiter?.resume(returning: nil)
         waiter = nil
     }

@@ -72,6 +72,12 @@ struct UsageSettingsTab: View {
         Section("Session totals") {
             LabeledContent("Total peak tokens", value: Self.tokens(usage.totalPeakTokens))
             LabeledContent("Active chats", value: "\(usage.byChat.count)")
+            ForEach(usage.costTotals) { total in
+                LabeledContent("Session cost (\(total.currency))") {
+                    Text(total.amount, format: .currency(code: total.currency))
+                        .monospacedDigit()
+                }
+            }
             LabeledContent("Context pressure") {
                 let pressure = usage.contextPressure
                 VStack(alignment: .trailing, spacing: 3) {
@@ -202,6 +208,11 @@ private struct ChatUsageRow: View {
                 Text("peak \(UsageSettingsTab.tokens(chat.peakUsed)) · \(chat.turns) turn\(chat.turns == 1 ? "" : "s")")
                     .font(.caption.monospacedDigit())
                     .foregroundStyle(.tertiary)
+            }
+            if let amount = chat.costAmount {
+                Text(amount, format: .currency(code: chat.costCurrency ?? "USD"))
+                    .font(.caption.monospacedDigit())
+                    .foregroundStyle(.secondary)
             }
         }
         .padding(.vertical, 2)

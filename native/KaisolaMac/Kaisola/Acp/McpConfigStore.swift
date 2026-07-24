@@ -30,6 +30,43 @@ struct McpServerConfig: Codable, Equatable, Identifiable {
 
     var id: String { name }
 
+    /// Mirrors `scripts/native-mcp-registry.cjs` validation. Invalid persisted
+    /// records are never forwarded into `session/new`, so a damaged setting
+    /// cannot turn into a surprising process spawn or credential-bearing URL.
+    var validationError: String? {
+        let cleanName = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard Self.safeRequired(cleanName) else { return "Name is required and cannot contain line breaks." }
+        guard envPairs.allSatisfy(Self.safePair), headerPairs.allSatisfy(Self.safePair) else {
+            return "Environment and header names cannot be empty or contain line breaks."
+        }
+        switch kind {
+        case .stdio:
+            guard let command, Self.safeRequired(command.trimmingCharacters(in: .whitespacesAndNewlines)) else {
+                return "A valid command is required."
+            }
+        case .http, .sse:
+            guard let url, let components = URLComponents(string: url),
+                  components.scheme?.lowercased() == "https",
+                  components.host?.isEmpty == false else {
+                return "Remote MCP servers must use a valid HTTPS URL."
+            }
+            guard components.user == nil, components.password == nil else {
+                return "Put credentials in headers, not the URL."
+            }
+        }
+        return nil
+    }
+
+    private static func safeRequired(_ value: String) -> Bool {
+        !value.isEmpty && value.utf8.count <= 4_096
+            && !value.contains("\0") && !value.contains("\r") && !value.contains("\n")
+    }
+
+    private static func safePair(_ pair: Pair) -> Bool {
+        safeRequired(pair.name.trimmingCharacters(in: .whitespacesAndNewlines))
+            && !pair.value.contains("\0")
+    }
+
     init(
         name: String,
         kind: Kind,
@@ -88,7 +125,7 @@ struct McpConfigStore: Sendable {
               let payload = try? JSONDecoder().decode(Payload.self, from: data) else {
             return []
         }
-        return payload.servers
+        return payload.servers.filter { $0.validationError == nil }
     }
 
     func save(_ servers: [McpServerConfig]) {
@@ -98,7 +135,8 @@ struct McpConfigStore: Sendable {
             withIntermediateDirectories: true,
             attributes: [.posixPermissions: 0o700]
         )
-        guard let data = try? JSONEncoder().encode(Payload(servers: servers)) else { return }
+        let validated = servers.filter { $0.validationError == nil }
+        guard let data = try? JSONEncoder().encode(Payload(servers: validated)) else { return }
         let temporary = directory.appendingPathComponent(
             ".\(fileURL.lastPathComponent).\(ProcessInfo.processInfo.processIdentifier)"
         )
@@ -123,7 +161,7 @@ struct McpConfigStore: Sendable {
     /// client-side, keyed off the `type` field this method stamps.
     static func jsonValues(_ servers: [McpServerConfig]) -> [JSONValue] {
         servers.compactMap { server in
-            guard server.enabled else { return nil }
+            guard server.enabled, server.validationError == nil else { return nil }
             switch server.kind {
             case .stdio:
                 return .object([

@@ -28,6 +28,8 @@ final class UsageCenter: ObservableObject {
         var latestMax: Int
         var peakUsed: Int
         var turns: Int
+        var costAmount: Double?
+        var costCurrency: String?
     }
 
     struct PlanWindow: Decodable, Equatable, Identifiable, Sendable {
@@ -53,6 +55,12 @@ final class UsageCenter: ObservableObject {
         var id: String { provider }
     }
 
+    struct CostTotal: Identifiable, Equatable, Sendable {
+        let currency: String
+        let amount: Double
+        var id: String { currency }
+    }
+
     private struct PlanUsageEnvelope: Decodable, Sendable {
         let providers: [ProviderPlanUsage]
         let error: String?
@@ -64,6 +72,8 @@ final class UsageCenter: ObservableObject {
     @Published private(set) var planUsageError: String?
 
     private var planRefreshTask: Task<Void, Never>?
+    private var planRefreshGeneration = 0
+    private var planRefreshWorkspaceKey: String?
 
     init() {}
 
@@ -81,23 +91,42 @@ final class UsageCenter: ObservableObject {
     /// on first sight. Refreshes the latest reading and title/agent (they can
     /// change if the chat is renamed or the model switches) and advances the
     /// peak. `turns` is preserved across records.
-    func record(chatID: String, title: String, agentID: String, usage used: Int, max: Int) {
+    func record(
+        chatID: String,
+        title: String,
+        agentID: String,
+        usage used: Int,
+        max: Int,
+        costAmount: Double? = nil,
+        costCurrency: String? = nil
+    ) {
+        let safeUsed = Swift.max(0, used)
+        let safeMax = Swift.max(0, max)
+        let cleanCost = costAmount.flatMap { $0.isFinite && $0 >= 0 ? $0 : nil }
+        let cleanCurrency = costCurrency?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .uppercased()
+        let currency = cleanCurrency?.isEmpty == false ? cleanCurrency : nil
         if var existing = byChat[chatID] {
             existing.title = title
             existing.agentID = agentID
-            existing.latestUsed = used
-            existing.latestMax = max
-            existing.peakUsed = Swift.max(existing.peakUsed, used)
+            existing.latestUsed = safeUsed
+            existing.latestMax = safeMax
+            existing.peakUsed = Swift.max(existing.peakUsed, safeUsed)
+            if let cleanCost { existing.costAmount = cleanCost }
+            if let currency { existing.costCurrency = currency }
             byChat[chatID] = existing
         } else {
             byChat[chatID] = ChatUsage(
                 id: chatID,
                 title: title,
                 agentID: agentID,
-                latestUsed: used,
-                latestMax: max,
-                peakUsed: used,
-                turns: 0
+                latestUsed: safeUsed,
+                latestMax: safeMax,
+                peakUsed: safeUsed,
+                turns: 0,
+                costAmount: cleanCost,
+                costCurrency: currency
             )
         }
     }
@@ -127,8 +156,16 @@ final class UsageCenter: ObservableObject {
     /// overlay. The signed helper owns the Node/SDK dependency surface; all
     /// package hashing and provider processes stay off the main actor.
     func refreshPlanUsage(workspace: URL?, force: Bool = false) {
-        if isRefreshingPlanUsage, !force { return }
+        let workspaceKey = workspace?.standardizedFileURL.path ?? "<global>"
+        if isRefreshingPlanUsage, !force, planRefreshWorkspaceKey == workspaceKey { return }
         planRefreshTask?.cancel()
+        planRefreshGeneration &+= 1
+        let generation = planRefreshGeneration
+        if planRefreshWorkspaceKey != workspaceKey {
+            // Never show project A's account limits while project B refreshes.
+            planUsage = []
+        }
+        planRefreshWorkspaceKey = workspaceKey
         isRefreshingPlanUsage = true
         planUsageError = nil
 
@@ -154,7 +191,9 @@ final class UsageCenter: ObservableObject {
                     environment: environment
                 )
             }.value
-            guard !Task.isCancelled, let self else { return }
+            guard !Task.isCancelled, let self,
+                  self.planRefreshGeneration == generation,
+                  self.planRefreshWorkspaceKey == workspaceKey else { return }
             switch result {
             case let .success(providers):
                 self.planUsage = providers
@@ -170,6 +209,9 @@ final class UsageCenter: ObservableObject {
     /// Deterministic provider cards for the hosted macOS visual job. No local
     /// account process or credential is touched; production never calls this.
     func loadVisualFixture() {
+        planRefreshTask?.cancel()
+        planRefreshTask = nil
+        planRefreshGeneration &+= 1
         let reset = Date().addingTimeInterval(7_200).timeIntervalSince1970
         planUsage = [
             ProviderPlanUsage(
@@ -271,8 +313,19 @@ final class UsageCenter: ObservableObject {
     var contextPressure: Double {
         byChat.values.reduce(0.0) { current, usage in
             guard usage.latestMax > 0 else { return current }
-            return Swift.max(current, Double(usage.latestUsed) / Double(usage.latestMax))
+            return Swift.max(current, Swift.min(1, Double(usage.latestUsed) / Double(usage.latestMax)))
         }
+    }
+
+    /// Cumulative cost grouped by ISO currency. A session can contain adapters
+    /// that report different currencies, so totals are never silently mixed.
+    var costTotals: [CostTotal] {
+        var totals: [String: Double] = [:]
+        for chat in byChat.values {
+            guard let amount = chat.costAmount, amount.isFinite, amount >= 0 else { continue }
+            totals[chat.costCurrency?.uppercased() ?? "USD", default: 0] += amount
+        }
+        return totals.keys.sorted().map { CostTotal(currency: $0, amount: totals[$0] ?? 0) }
     }
 }
 

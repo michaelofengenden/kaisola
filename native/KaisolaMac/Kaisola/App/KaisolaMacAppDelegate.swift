@@ -132,6 +132,25 @@ final class KaisolaMacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDele
                 if FileManager.default.fileExists(atPath: readme.path) {
                     model.openFilePreview(readme)
                 }
+            } else if visualSurface == "preview-html" {
+                let page = workspace.appendingPathComponent("index.html", isDirectory: false)
+                if FileManager.default.fileExists(atPath: page.path) {
+                    model.openFilePreview(page)
+                }
+            } else if visualSurface == "preview-docx" {
+                let document = FileManager.default.temporaryDirectory
+                    .appendingPathComponent("Kaisola visual document.docx", isDirectory: false)
+                let contents = NSMutableAttributedString(
+                    string: "Native documents\n",
+                    attributes: [.font: NSFont.systemFont(ofSize: 28, weight: .bold)]
+                )
+                contents.append(NSAttributedString(
+                    string: "Edit rich text without leaving the project. Zoom, search, undo, and save stay native and immediate.\n\nA calm, focused page for notes and working documents.",
+                    attributes: [.font: NSFont.systemFont(ofSize: 15)]
+                ))
+                if (try? RichDocumentIO.write(contents, to: document)) != nil {
+                    model.openFilePreview(document)
+                }
             } else if visualSurface == "mesh" {
                 model.loadVisualMeshFixture(workspace: workspace)
             }

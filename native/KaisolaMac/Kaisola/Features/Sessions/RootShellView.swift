@@ -16,6 +16,9 @@ struct RootShellView: View {
     @State private var showSettings = false
     @State private var quickActionsTarget: QuickActionsTarget?
     @State private var workspaceRailDragOrigin: Double?
+    @State private var filePreviewDragOrigin: Double?
+    @State private var workspaceRailDividerHovered = false
+    @State private var filePreviewDividerHovered = false
     @State private var hoveredTerminalPaneID: String?
     /// A Close Mesh request whose worktrees still hold uncommitted changes.
     @State private var meshCloseConfirm: (id: String, dirty: Int)?
@@ -220,7 +223,7 @@ struct RootShellView: View {
                                 }
                                     .buttonStyle(.plain)
                                     .accessibilityAddTraits(model.selectedChatID == chat.id ? .isSelected : [])
-                                    .listRowInsets(.init(top: 1, leading: 20, bottom: 1, trailing: 7))
+                                    .listRowInsets(.init(top: 0, leading: 14, bottom: 0, trailing: 5))
                                     .contextMenu {
                                         Button("Close Chat", role: .destructive) { model.closeChat(chat.id) }
                                     }
@@ -238,7 +241,7 @@ struct RootShellView: View {
                                 }
                                     .buttonStyle(.plain)
                                     .accessibilityAddTraits(model.selectedMeshID == mesh.id ? .isSelected : [])
-                                    .listRowInsets(.init(top: 1, leading: 20, bottom: 1, trailing: 7))
+                                    .listRowInsets(.init(top: 0, leading: 14, bottom: 0, trailing: 5))
                                     .contextMenu {
                                         Button("Close Mesh", role: .destructive) { requestCloseMesh(mesh) }
                                     }
@@ -268,7 +271,7 @@ struct RootShellView: View {
                                             .foregroundStyle(activeProjectID == project.id ? Color.accentColor : .secondary)
                                     }
                                     Text(project.name)
-                                        .font(.system(size: 15, weight: .semibold))
+                                        .font(.system(size: 14, weight: .semibold))
                                         .foregroundStyle(.primary)
                                     if project.workingCount > 0 {
                                         Text("\(project.workingCount)")
@@ -295,8 +298,8 @@ struct RootShellView: View {
                             .fixedSize()
                             .help("New session in \(project.name)")
                         }
-                        .padding(.horizontal, 6)
-                        .frame(minHeight: 44)
+                        .padding(.horizontal, 5)
+                        .frame(minHeight: 38)
                         .background(
                             activeProjectID == project.id
                                 ? AnyShapeStyle(Color.accentColor.opacity(0.13))
@@ -314,7 +317,7 @@ struct RootShellView: View {
                 SidebarBackdropView(appearance: settings.sidebarAppearance)
                     .ignoresSafeArea()
             }
-            .navigationSplitViewColumnWidth(min: 190, ideal: 235, max: 300)
+            .navigationSplitViewColumnWidth(min: 146, ideal: 176, max: 220)
             .safeAreaInset(edge: .top, spacing: 0) {
                 projectSidebarHeader
             }
@@ -383,7 +386,7 @@ struct RootShellView: View {
                 .foregroundStyle(.primary.opacity(0.82))
             Spacer()
         }
-        .padding(.horizontal, 14)
+        .padding(.horizontal, 12)
         .padding(.top, NativeWorkspaceChrome.sidebarTrafficLightClearance)
         .frame(height: 36 + NativeWorkspaceChrome.sidebarTrafficLightClearance, alignment: .bottom)
         .background(.clear)
@@ -512,7 +515,7 @@ struct RootShellView: View {
                 Task { await model.select(session.id) }
             }
         )
-        .listRowInsets(.init(top: 1, leading: 20, bottom: 1, trailing: 7))
+        .listRowInsets(.init(top: 0, leading: 14, bottom: 0, trailing: 5))
         .contextMenu {
             Button("Open in New Window") {
                 KaisolaMacAppDelegate.popOut(sessionID: session.id)
@@ -551,59 +554,128 @@ struct RootShellView: View {
 
     @ViewBuilder
     private var detailPane: some View {
-        HStack(spacing: 0) {
-            HSplitView {
+        GeometryReader { geometry in
+            let widths = NativeDetailPaneSizing.resolve(
+                totalWidth: geometry.size.width,
+                preferredPreview: model.previewedFileURL == nil ? nil : settings.filePreviewWidth,
+                preferredRail: settings.workspaceRailVisible && model.currentProjectDirectory != nil
+                    ? settings.workspaceRailWidth
+                    : nil
+            )
+            HStack(spacing: 0) {
                 detailContent
-                    .frame(minWidth: 240, maxWidth: .infinity, maxHeight: .infinity)
+                    .frame(minWidth: NativeDetailPaneSizing.minimumContentWidth,
+                           maxWidth: .infinity, maxHeight: .infinity)
+                    .layoutPriority(1)
                 if let fileURL = model.previewedFileURL {
-                    FilePreviewView(url: fileURL, workspaceRoot: model.currentProjectDirectory) {
+                    filePreviewDivider
+                    FilePreviewView(
+                        url: fileURL,
+                        workspaceRoot: model.currentProjectDirectory,
+                        restoreSelection: { model.openFilePreview($0) }
+                    ) {
                         model.closeFilePreview()
                     }
-                    .frame(minWidth: 260, idealWidth: 420, maxWidth: .infinity, maxHeight: .infinity)
+                    .frame(width: widths.preview)
+                    .frame(maxHeight: .infinity)
                 }
-            }
-            if settings.workspaceRailVisible, let root = model.currentProjectDirectory {
-                // Files live on the right, matching the editor/reference rail in
-                // the Electron workspace and leaving the project hierarchy as the
-                // sole navigation surface on the left.
-                workspaceRailDivider
-                WorkspaceRailView(root: root, openFile: { model.openFilePreview($0) }) {
-                    settings.workspaceRailVisible = false
+                if settings.workspaceRailVisible, let root = model.currentProjectDirectory {
+                    // Files live on the right, matching the editor/reference rail in
+                    // the Electron workspace and leaving the project hierarchy as the
+                    // sole navigation surface on the left.
+                    workspaceRailDivider
+                    WorkspaceRailView(root: root, openFile: { model.openFilePreview($0) }) {
+                        settings.workspaceRailVisible = false
+                    }
+                    .id(root)
+                    .frame(width: widths.rail)
                 }
-                .id(root)
-                .frame(width: CGFloat(settings.workspaceRailWidth))
             }
         }
     }
 
     private var workspaceRailDivider: some View {
-        ZStack {
-            Rectangle()
-                .fill(Color(nsColor: .separatorColor).opacity(0.8))
-                .frame(width: 1)
-            Rectangle()
-                .fill(.clear)
-                .contentShape(Rectangle())
-        }
-        .frame(width: 7)
+        resizeDivider(hovered: workspaceRailDividerHovered)
         .onHover { hovering in
-            if hovering { NSCursor.resizeLeftRight.push() } else { NSCursor.pop() }
+            workspaceRailDividerHovered = hovering
+            (hovering ? NSCursor.resizeLeftRight : NSCursor.arrow).set()
         }
         .gesture(
             DragGesture(minimumDistance: 0)
                 .onChanged { value in
                     if workspaceRailDragOrigin == nil {
                         workspaceRailDragOrigin = settings.workspaceRailWidth
+                        settings.beginPanelResize()
                     }
                     guard let origin = workspaceRailDragOrigin else { return }
                     settings.workspaceRailWidth = NativePreviewSettings.clampedWorkspaceRailWidth(
                         origin - Double(value.translation.width)
                     )
                 }
-                .onEnded { _ in workspaceRailDragOrigin = nil }
+                .onEnded { _ in
+                    workspaceRailDragOrigin = nil
+                    settings.endPanelResize()
+                }
         )
+        .onTapGesture(count: 2) {
+            settings.workspaceRailWidth = NativePreviewSettings.workspaceRailWidthDefault
+        }
         .help("Drag to resize Files")
-        .accessibilityHidden(true)
+        .accessibilityLabel("Resize Files")
+        .accessibilityAdjustableAction { direction in
+            settings.workspaceRailWidth = NativePreviewSettings.clampedWorkspaceRailWidth(
+                settings.workspaceRailWidth + (direction == .increment ? 16 : -16)
+            )
+        }
+    }
+
+    private var filePreviewDivider: some View {
+        resizeDivider(hovered: filePreviewDividerHovered)
+            .onHover { hovering in
+                filePreviewDividerHovered = hovering
+                (hovering ? NSCursor.resizeLeftRight : NSCursor.arrow).set()
+            }
+            .gesture(
+                DragGesture(minimumDistance: 0)
+                    .onChanged { value in
+                        if filePreviewDragOrigin == nil {
+                            filePreviewDragOrigin = settings.filePreviewWidth
+                            settings.beginPanelResize()
+                        }
+                        guard let origin = filePreviewDragOrigin else { return }
+                        settings.filePreviewWidth = NativePreviewSettings.clampedFilePreviewWidth(
+                            origin - Double(value.translation.width)
+                        )
+                    }
+                    .onEnded { _ in
+                        filePreviewDragOrigin = nil
+                        settings.endPanelResize()
+                    }
+            )
+            .onTapGesture(count: 2) {
+                settings.filePreviewWidth = NativePreviewSettings.filePreviewWidthDefault
+            }
+            .help("Drag to resize the document; double-click to reset")
+            .accessibilityLabel("Resize document preview")
+            .accessibilityAdjustableAction { direction in
+                settings.filePreviewWidth = NativePreviewSettings.clampedFilePreviewWidth(
+                    settings.filePreviewWidth + (direction == .increment ? 24 : -24)
+                )
+            }
+    }
+
+    private func resizeDivider(hovered: Bool) -> some View {
+        ZStack {
+            Rectangle()
+                .fill(Color(nsColor: .separatorColor).opacity(hovered ? 0.95 : 0.58))
+                .frame(width: 1)
+            Capsule()
+                .fill(Color.accentColor.opacity(hovered ? 0.72 : 0.10))
+                .frame(width: 3, height: 32)
+        }
+        .frame(width: 11)
+        .contentShape(Rectangle())
+        .animation(.easeOut(duration: 0.12), value: hovered)
     }
 
     private var splitCandidates: [BrokerTerminalRecord] {
@@ -1162,6 +1234,58 @@ enum NativeWorkspaceChrome {
     static let topBarTrafficLightClearance: CGFloat = 76
 }
 
+/// Turns persisted panel preferences into widths that fit the *current* detail
+/// canvas. Preferences remain untouched, so expanding the window restores the
+/// user's chosen sizes; only the effective presentation compresses. This keeps
+/// terminal + document + Files simultaneously usable at the minimum window.
+enum NativeDetailPaneSizing {
+    struct Widths: Equatable {
+        let preview: CGFloat
+        let rail: CGFloat
+    }
+
+    static let dividerWidth: CGFloat = 11
+    static let minimumContentWidth: CGFloat = 150
+    private static let compactPreviewFloor: CGFloat = 260
+    private static let compactRailFloor: CGFloat = 150
+
+    static func resolve(
+        totalWidth: CGFloat,
+        preferredPreview: Double?,
+        preferredRail: Double?
+    ) -> Widths {
+        var preview: CGFloat = preferredPreview.map { CGFloat($0) } ?? 0
+        var rail: CGFloat = preferredRail.map { CGFloat($0) } ?? 0
+        let panelCount = (preferredPreview == nil ? 0 : 1) + (preferredRail == nil ? 0 : 1)
+        let panelBudget = max(
+            0,
+            totalWidth - CGFloat(panelCount) * dividerWidth - minimumContentWidth
+        )
+        var excess = max(0, preview + rail - panelBudget)
+
+        if preferredPreview != nil {
+            let reduction = min(excess, max(0, preview - compactPreviewFloor))
+            preview -= reduction
+            excess -= reduction
+        }
+        if preferredRail != nil {
+            let reduction = min(excess, max(0, rail - compactRailFloor))
+            rail -= reduction
+            excess -= reduction
+        }
+        // An already-narrow split-view sidebar can leave less than the compact
+        // floors. Continue compressing proportionally rather than clipping or
+        // silently hiding one of the two explicitly-open panels.
+        if excess > 0, preview + rail > 0 {
+            let sum = preview + rail
+            let previewShare = preview / sum
+            preview = max(80, preview - excess * previewShare)
+            rail = max(80, rail - excess * (1 - previewShare))
+        }
+        return Widths(preview: preview, rail: rail)
+    }
+}
+
 enum TerminalPaneMinimizeAction: Equatable {
     case closeSplit(String)
     case promote(String)
@@ -1190,9 +1314,14 @@ private struct SessionStrip: View {
         project.map { model.meshes(in: $0.id) } ?? []
     }
 
+    private var selectedSurfaceID: String? {
+        model.selectedChatID ?? model.selectedMeshID ?? model.selectedSessionID
+    }
+
     var body: some View {
-        ScrollView(.horizontal, showsIndicators: false) {
-            HStack(spacing: 8) {
+        ScrollViewReader { proxy in
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(spacing: 8) {
                 if sessions.isEmpty, chats.isEmpty, meshes.isEmpty {
                     Text("No activity in this project")
                         .font(.caption)
@@ -1222,6 +1351,7 @@ private struct SessionStrip: View {
                     .contextMenu {
                         Button("Close Chat", role: .destructive) { model.closeChat(chat.id) }
                     }
+                    .id(chat.id)
                 }
                 ForEach(meshes) { mesh in
                     Button { model.selectMesh(mesh.id) } label: {
@@ -1249,6 +1379,7 @@ private struct SessionStrip: View {
                     .contextMenu {
                         Button("Close Mesh", role: .destructive) { closeMesh(mesh) }
                     }
+                    .id(mesh.id)
                 }
                 ForEach(sessions) { session in
                     let visible = model.selectedSessionID == session.id
@@ -1293,11 +1424,20 @@ private struct SessionStrip: View {
                             }
                         }
                     }
+                    .id(session.id)
                 }
                 Spacer(minLength: 0)
+                }
+                .padding(.horizontal, 8)
+                .padding(.vertical, 4)
             }
-            .padding(.horizontal, 8)
-            .padding(.vertical, 4)
+            .scrollBounceBehavior(.basedOnSize, axes: .horizontal)
+            .onChange(of: selectedSurfaceID) { _, id in
+                guard let id else { return }
+                withAnimation(.easeInOut(duration: 0.18)) {
+                    proxy.scrollTo(id, anchor: .center)
+                }
+            }
         }
         .frame(height: 36)
     }
@@ -1589,7 +1729,7 @@ private struct ConnectionFooter: View {
         .font(.callout)
         .controlSize(.small)
         .padding(.horizontal, 10)
-        .frame(height: 44)
+        .frame(height: 40)
         .background(.ultraThinMaterial)
         .overlay(alignment: .top) {
             Rectangle().fill(Color(nsColor: .separatorColor).opacity(0.7)).frame(height: 1)

@@ -213,7 +213,11 @@ struct AcpChatView: View {
             }
             HStack(alignment: .bottom, spacing: 8) {
                 Button(action: openAttachmentPanel) {
-                    Image(systemName: "paperclip")
+                    if conversation.preparingAttachmentCount > 0 {
+                        ProgressView().controlSize(.mini)
+                    } else {
+                        Image(systemName: "paperclip")
+                    }
                 }
                 .buttonStyle(.borderless)
                 .disabled(!conversation.isConnected)
@@ -287,6 +291,8 @@ struct AcpChatView: View {
             }
             .padding(.horizontal, 2)
         }
+        .scrollBounceBehavior(.basedOnSize, axes: .horizontal)
+        .scrollClipDisabled()
         .frame(maxWidth: .infinity, alignment: .leading)
     }
 
@@ -294,14 +300,25 @@ struct AcpChatView: View {
         ByteCountFormatter.string(fromByteCount: Int64(bytes), countStyle: .file)
     }
 
-    /// Open a file picker (multiple selection) and stage each chosen file.
+    /// Open Finder without entering a nested modal run loop. The picker starts
+    /// in this chat's workspace, and selected files are materialized/read on a
+    /// detached task so adding an iCloud or large-on-disk item never blocks chat
+    /// rendering or terminal input.
     private func openAttachmentPanel() {
         let panel = NSOpenPanel()
         panel.allowsMultipleSelection = true
         panel.canChooseDirectories = false
         panel.canChooseFiles = true
-        guard panel.runModal() == .OK else { return }
-        for url in panel.urls { conversation.addAttachment(fileURL: url) }
+        panel.directoryURL = conversation.workspaceURL
+        panel.treatsFilePackagesAsDirectories = false
+        panel.prompt = "Attach"
+        panel.begin { response in
+            guard response == .OK else { return }
+            let urls = panel.urls
+            Task { @MainActor in
+                for url in urls { conversation.prepareAttachment(fileURL: url) }
+            }
+        }
     }
 
     /// Stage files dropped onto the composer.
@@ -311,7 +328,7 @@ struct AcpChatView: View {
             handled = true
             _ = provider.loadDataRepresentation(forTypeIdentifier: UTType.fileURL.identifier) { [conversation] data, _ in
                 guard let data, let url = URL(dataRepresentation: data, relativeTo: nil) else { return }
-                Task { @MainActor in conversation.addAttachment(fileURL: url) }
+                Task { @MainActor in conversation.prepareAttachment(fileURL: url) }
             }
         }
         return handled
@@ -597,6 +614,8 @@ struct DiffView: View {
                 }
             }
         }
+        .scrollBounceBehavior(.basedOnSize, axes: .horizontal)
+        .scrollClipDisabled()
     }
 
     private var splitBody: some View {

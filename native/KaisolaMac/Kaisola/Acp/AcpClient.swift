@@ -23,7 +23,8 @@ enum AcpEvent: Sendable {
 /// A file or image the user attached to a prompt, carried into the ACP prompt
 /// as a real content block (never merely a path). `image` becomes an ACP
 /// `image` block (base64 pixels + mime); `textFile` becomes an embedded
-/// `resource` block whose inline text is the file's UTF-8 contents.
+/// `resource` block when the adapter advertises embedded context, otherwise the
+/// ACP-baseline `resource_link` form.
 enum AcpAttachment: Equatable, Sendable {
     case image(data: Data, mimeType: String, name: String)
     case textFile(path: String, contents: String, name: String)
@@ -53,7 +54,11 @@ actor AcpClient {
     private var sessionID: String?
     private var capabilities = AcpAgentCapabilities()
     private var permissionCounter = 0
-    private var permissionWaiters: [Int: CheckedContinuation<String, Never>] = [:]
+    private enum PermissionResolution: Sendable {
+        case selected(String)
+        case cancelled
+    }
+    private var permissionWaiters: [Int: CheckedContinuation<PermissionResolution, Never>] = [:]
     /// Host for agent-requested terminals (`terminal/create` …).
     private let terminalHost = AcpTerminalHost()
     /// The session workspace; fs/terminal callbacks are confined inside it.
@@ -91,10 +96,11 @@ actor AcpClient {
         mcpServers: [JSONValue]
     ) async throws -> AcpSessionInfo {
         workspaceRoot = (cwd as NSString).standardizingPath
-        try await transport.start(command: command, arguments: arguments, environment: environment, cwd: cwd)
-        readerTask = Task { await readLoop() }
+        do {
+            try await transport.start(command: command, arguments: arguments, environment: environment, cwd: cwd)
+            readerTask = Task { await readLoop() }
 
-        let initResult = try await request("initialize", params: .object([
+            let initResult = try await request("initialize", params: .object([
             "protocolVersion": .integer(Int64(AcpWire.protocolVersion)),
             "clientCapabilities": .object([
                 "fs": .object(["readTextFile": .bool(true), "writeTextFile": .bool(true)]),
@@ -103,16 +109,37 @@ actor AcpClient {
                 "_meta": .object(["terminal-auth": .bool(true)]),
             ]),
         ]))
-        capabilities = Self.parseCapabilities(initResult)
+        // ACP requires the client to disconnect when the negotiated protocol is
+        // not one it speaks. Silently continuing here can make a newer adapter
+        // look connected while every later request is subtly malformed.
+            guard initResult.objectValue?["protocolVersion"]?.intValue == Int64(AcpWire.protocolVersion) else {
+                throw AcpClientError.unsupportedProtocol(
+                    initResult.objectValue?["protocolVersion"]?.intValue.map(Int.init) ?? -1
+                )
+            }
+            capabilities = Self.parseCapabilities(initResult)
 
-        let newResult = try await request("session/new", params: .object([
-            "cwd": .string(cwd),
-            "mcpServers": .array(sessionMcpServers(mcpServers)),
-        ]))
-        guard let object = newResult.objectValue, let sessionID = object["sessionId"]?.stringValue else {
-            throw AcpClientError.malformedResponse
-        }
-        self.sessionID = sessionID
+            let sessionServers = sessionMcpServers(mcpServers)
+            let newResult: JSONValue
+            do {
+                newResult = try await request("session/new", params: .object([
+                    "cwd": .string(cwd),
+                    "mcpServers": .array(sessionServers),
+                ]))
+            } catch let AcpClientError.requestFailed(message)
+                where !sessionServers.isEmpty
+                    && message.localizedCaseInsensitiveContains("invalid params") {
+                // Match Electron: one malformed/rejected tool entry must degrade
+                // to a working tool-less chat instead of killing the session.
+                newResult = try await request("session/new", params: .object([
+                    "cwd": .string(cwd),
+                    "mcpServers": .array([]),
+                ]))
+            }
+            guard let object = newResult.objectValue, let sessionID = object["sessionId"]?.stringValue else {
+                throw AcpClientError.malformedResponse
+            }
+            self.sessionID = sessionID
         // Adapters vary: some return a flat `models: [...]` + top-level
         // `currentModelId`; the standard (and our mock) nests them under
         // `models: { availableModels, currentModelId }`. Handle both.
@@ -130,14 +157,21 @@ actor AcpClient {
                   let id = (m["id"] ?? m["modeId"])?.stringValue else { return nil }
             return AcpSessionInfo.Mode(id: id, name: m["name"]?.stringValue ?? id)
         }
-        return AcpSessionInfo(
-            sessionID: sessionID,
-            models: models,
-            currentModelID: modelsNode?["currentModelId"]?.stringValue ?? object["currentModelId"]?.stringValue,
-            modes: modes,
-            currentModeID: modesNode?["currentModeId"]?.stringValue ?? object["currentModeId"]?.stringValue,
-            configOptions: Self.parseConfigOptions(object["configOptions"])
-        )
+            return AcpSessionInfo(
+                sessionID: sessionID,
+                models: models,
+                currentModelID: modelsNode?["currentModelId"]?.stringValue ?? object["currentModelId"]?.stringValue,
+                modes: modes,
+                currentModeID: modesNode?["currentModeId"]?.stringValue ?? object["currentModeId"]?.stringValue,
+                configOptions: Self.parseConfigOptions(object["configOptions"])
+            )
+        } catch {
+            // A failed initialize/session-new must not leave a live adapter or a
+            // reader task behind. This is especially important while users swap
+            // agent profiles rapidly from the project menu.
+            await stop()
+            throw error
+        }
     }
 
     /// Send a user prompt; the turn's updates arrive on the event handler and
@@ -149,7 +183,10 @@ actor AcpClient {
         _ = try await request("session/prompt", params: .object([
             "sessionId": .string(sessionID),
             "prompt": .array(Self.promptBlocks(
-                text: text, attachments: attachments, promptImageOk: capabilities.promptImage
+                text: text,
+                attachments: attachments,
+                promptImageOk: capabilities.promptImage,
+                promptEmbeddedContextOk: capabilities.promptEmbeddedContext
             )),
         ]), timeoutNanoseconds: 0)
         eventHandler?(.turnEnded)
@@ -159,11 +196,14 @@ actor AcpClient {
     /// text block first, then a real `image` block per image attachment (base64
     /// pixels + mime, mirroring electron/ipc/acp.cjs — gated on the agent having
     /// advertised `promptCapabilities.image`, exactly like Electron's
-    /// `promptImageOk`), then an embedded `resource` block per text-file
-    /// attachment carrying its UTF-8 contents inline. Pure and static so the
-    /// wire encoding is unit-testable without a live transport.
+    /// `promptImageOk`), then either an embedded `resource` or baseline
+    /// `resource_link` per text-file attachment according to negotiated prompt
+    /// capabilities. Pure and static so wire encoding stays unit-testable.
     static func promptBlocks(
-        text: String, attachments: [AcpAttachment], promptImageOk: Bool
+        text: String,
+        attachments: [AcpAttachment],
+        promptImageOk: Bool,
+        promptEmbeddedContextOk: Bool = true
     ) -> [JSONValue] {
         var blocks: [JSONValue] = [.object(["type": .string("text"), "text": .string(text)])]
         for attachment in attachments {
@@ -178,15 +218,28 @@ actor AcpClient {
                     "mimeType": .string(mimeType),
                     "data": .string(data.base64EncodedString()),
                 ]))
-            case let .textFile(path, contents, _):
-                blocks.append(.object([
-                    "type": .string("resource"),
-                    "resource": .object([
+            case let .textFile(path, contents, name):
+                if promptEmbeddedContextOk {
+                    blocks.append(.object([
+                        "type": .string("resource"),
+                        "resource": .object([
+                            "uri": .string(fileURI(path)),
+                            "mimeType": .string("text/plain"),
+                            "text": .string(contents),
+                        ]),
+                    ]))
+                } else {
+                    // Resource links are ACP baseline prompt content. Agents that
+                    // did not advertise embeddedContext receive a standards-safe
+                    // link instead of an unsupported inline resource block.
+                    blocks.append(.object([
+                        "type": .string("resource_link"),
+                        "name": .string(name),
                         "uri": .string(fileURI(path)),
                         "mimeType": .string("text/plain"),
-                        "text": .string(contents),
-                    ]),
-                ]))
+                        "size": .integer(Int64(contents.utf8.count)),
+                    ]))
+                }
             }
         }
         return blocks
@@ -203,22 +256,31 @@ actor AcpClient {
     func cancel() async {
         guard let sessionID else { return }
         notify("session/cancel", params: .object(["sessionId": .string(sessionID)]))
+        cancelPermissionRequests()
     }
 
     func setModel(_ modelID: String) async {
         guard let sessionID else { return }
-        notify("session/set_model", params: .object([
-            "sessionId": .string(sessionID),
-            "modelId": .string(modelID),
-        ]))
+        do {
+            _ = try await request("session/set_model", params: .object([
+                "sessionId": .string(sessionID),
+                "modelId": .string(modelID),
+            ]))
+        } catch {
+            eventHandler?(.error(errorText(error)))
+        }
     }
 
     func setMode(_ modeID: String) async {
         guard let sessionID else { return }
-        notify("session/set_mode", params: .object([
-            "sessionId": .string(sessionID),
-            "modeId": .string(modeID),
-        ]))
+        do {
+            _ = try await request("session/set_mode", params: .object([
+                "sessionId": .string(sessionID),
+                "modeId": .string(modeID),
+            ]))
+        } catch {
+            eventHandler?(.error(errorText(error)))
+        }
     }
 
     /// Set an adapter config option (e.g. reasoning effort). The response echoes
@@ -238,7 +300,7 @@ actor AcpClient {
 
     /// Resolve a pending permission request with the user's chosen option.
     func resolvePermission(id: Int, optionID: String) {
-        permissionWaiters.removeValue(forKey: id)?.resume(returning: optionID)
+        permissionWaiters.removeValue(forKey: id)?.resume(returning: .selected(optionID))
     }
 
     func stop() async {
@@ -246,10 +308,14 @@ actor AcpClient {
         readerTask = nil
         await transport.terminate()
         await terminalHost.releaseAll()
-        for waiter in permissionWaiters.values { waiter.resume(returning: "cancel") }
-        permissionWaiters.removeAll()
+        cancelPermissionRequests()
         for continuation in pending.values { continuation.resume(throwing: AcpClientError.notRunning) }
         pending.removeAll()
+    }
+
+    private func cancelPermissionRequests() {
+        for waiter in permissionWaiters.values { waiter.resume(returning: .cancelled) }
+        permissionWaiters.removeAll()
     }
 
     // MARK: - MCP filtering (mirrors acp.cjs sessionMcpServers)
@@ -553,8 +619,21 @@ actor AcpClient {
             }
             eventHandler?(.turnItem(.plan(entries: entries)))
         case "usage_update":
-            if let used = object["usedTokens"]?.intValue, let max = object["maxTokens"]?.intValue {
-                eventHandler?(.usage(AcpUsage(used: Int(used), max: Int(max))))
+            // ACP 1.x standardized these fields as `used` + `size`. Older
+            // adapters (and Kaisola's original mock) emitted
+            // `usedTokens` + `maxTokens`, so accept both without making the
+            // modern wire path depend on a legacy alias. This mismatch was why
+            // real SDK usage stayed blank while the mock looked healthy.
+            let used = (object["used"] ?? object["usedTokens"])?.intValue
+            let size = (object["size"] ?? object["maxTokens"])?.intValue
+            if let used, let size {
+                let cost = object["cost"]?.objectValue
+                eventHandler?(.usage(AcpUsage(
+                    used: Int(used),
+                    max: Int(size),
+                    costAmount: Self.finiteDouble(cost?["amount"]),
+                    costCurrency: cost?["currency"]?.stringValue
+                )))
             }
         case "current_model_update":
             if let id = object["currentModelId"]?.stringValue {
@@ -605,12 +684,17 @@ actor AcpClient {
             kind: kind, paths: locationPaths + diffPaths
         )))
         Task {
-            let chosen = await withCheckedContinuation { (continuation: CheckedContinuation<String, Never>) in
+            let resolution = await withCheckedContinuation { (continuation: CheckedContinuation<PermissionResolution, Never>) in
                 permissionWaiters[localID] = continuation
             }
-            respond(id: id, result: .object([
-                "outcome": .object(["outcome": .string("selected"), "optionId": .string(chosen)]),
-            ]))
+            let outcome: JSONValue
+            switch resolution {
+            case let .selected(optionID):
+                outcome = .object(["outcome": .string("selected"), "optionId": .string(optionID)])
+            case .cancelled:
+                outcome = .object(["outcome": .string("cancelled")])
+            }
+            respond(id: id, result: .object(["outcome": outcome]))
         }
     }
 
@@ -667,8 +751,23 @@ actor AcpClient {
         let mcp = agent["mcpCapabilities"]?.objectValue
         caps.mcpHTTP = mcp?["http"]?.boolValue ?? false
         caps.mcpSSE = mcp?["sse"]?.boolValue ?? false
-        caps.promptImage = agent["promptCapabilities"]?.objectValue?["image"]?.boolValue ?? false
+        let prompt = agent["promptCapabilities"]?.objectValue
+        caps.promptImage = prompt?["image"]?.boolValue ?? false
+        caps.promptEmbeddedContext = prompt?["embeddedContext"]?.boolValue ?? false
         return caps
+    }
+
+    /// JSON numbers decode as either `.integer` or `.number`; ACP cost accepts
+    /// both. Keep non-finite values out of UI/accounting state.
+    private static func finiteDouble(_ value: JSONValue?) -> Double? {
+        let number: Double?
+        switch value {
+        case let .integer(integer): number = Double(integer)
+        case let .number(double): number = double
+        default: number = nil
+        }
+        guard let number, number.isFinite else { return nil }
+        return number
     }
 
     private static func parseToolCall(_ object: [String: JSONValue]) -> AcpToolCall? {

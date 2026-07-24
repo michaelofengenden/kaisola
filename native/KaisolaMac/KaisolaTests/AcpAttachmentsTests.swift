@@ -65,6 +65,25 @@ final class AcpAttachmentsTests: XCTestCase {
         ])
     }
 
+    func testTextFileFallsBackToBaselineResourceLinkWithoutEmbeddedContextCapability() {
+        let blocks = AcpClient.promptBlocks(
+            text: "review",
+            attachments: [.textFile(path: "/tmp/notes.txt", contents: "line one\n", name: "notes.txt")],
+            promptImageOk: true,
+            promptEmbeddedContextOk: false
+        )
+        XCTAssertEqual(blocks, [
+            .object(["type": .string("text"), "text": .string("review")]),
+            .object([
+                "type": .string("resource_link"),
+                "name": .string("notes.txt"),
+                "uri": .string("file:///tmp/notes.txt"),
+                "mimeType": .string("text/plain"),
+                "size": .integer(9),
+            ]),
+        ])
+    }
+
     func testFileURIPercentEncodesSpaces() {
         XCTAssertEqual(AcpClient.fileURI("/tmp/a b.txt"), "file:///tmp/a%20b.txt")
         XCTAssertEqual(AcpClient.fileURI("/tmp/plain.txt"), "file:///tmp/plain.txt")
@@ -178,6 +197,15 @@ final class AcpAttachmentsTests: XCTestCase {
     }
 
     @MainActor
+    func testPendingAttachmentsHaveAnAggregateCountLimit() {
+        let conversation = makeConversation()
+        for index in 0..<(AcpConversation.maxPendingAttachmentCount + 3) {
+            conversation.addImageData(Data([UInt8(index)]), name: "shot-\(index).png")
+        }
+        XCTAssertEqual(conversation.pendingAttachments.count, AcpConversation.maxPendingAttachmentCount)
+    }
+
+    @MainActor
     func testAddFileAttachmentRoundTrip() throws {
         let url = try writeTemp(name: "readme.txt", data: Data("abc".utf8))
         defer { cleanup(url) }
@@ -188,6 +216,24 @@ final class AcpAttachmentsTests: XCTestCase {
         XCTAssertEqual(conversation.pendingAttachments[0].iconName, "doc.text")
         XCTAssertEqual(conversation.pendingAttachments[0].byteSize, 3)
         XCTAssertEqual(conversation.pendingAttachments[0].attachment, .textFile(path: url.path, contents: "abc", name: "readme.txt"))
+    }
+
+    @MainActor
+    func testPrepareAttachmentReturnsImmediatelyThenStagesOffActor() async throws {
+        let url = try writeTemp(name: "async.txt", data: Data("prepared".utf8))
+        defer { cleanup(url) }
+        let conversation = makeConversation()
+
+        conversation.prepareAttachment(fileURL: url)
+        XCTAssertEqual(conversation.preparingAttachmentCount, 1)
+        XCTAssertTrue(conversation.pendingAttachments.isEmpty)
+
+        let deadline = Date().addingTimeInterval(2)
+        while conversation.preparingAttachmentCount > 0, Date() < deadline {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        XCTAssertEqual(conversation.preparingAttachmentCount, 0)
+        XCTAssertEqual(conversation.pendingAttachments.first?.name, "async.txt")
     }
 
     @MainActor

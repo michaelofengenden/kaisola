@@ -171,4 +171,20 @@ final class McpConfigStoreTests: XCTestCase {
         XCTAssertEqual(values.count, 1)
         XCTAssertEqual(values.first?.objectValue?["name"], .string("on"))
     }
+
+    func testInvalidRemoteServersNeverReachSessionWire() {
+        let insecure = McpServerConfig(name: "remote", kind: .http, url: "http://example.com/mcp")
+        let credentialed = McpServerConfig(
+            name: "secret", kind: .sse, url: "https://user:password@example.com/sse"
+        )
+        XCTAssertNotNil(insecure.validationError)
+        XCTAssertNotNil(credentialed.validationError)
+        XCTAssertTrue(McpConfigStore.jsonValues([insecure, credentialed]).isEmpty)
+    }
+
+    func testInvalidStdioCommandNeverReachesSessionWire() {
+        let empty = McpServerConfig(name: "bad", kind: .stdio, command: "  ")
+        let multiline = McpServerConfig(name: "bad2", kind: .stdio, command: "sh\necho")
+        XCTAssertTrue(McpConfigStore.jsonValues([empty, multiline]).isEmpty)
+    }
 }

@@ -25,9 +25,10 @@ struct ProjectTabStripView: View {
     @State private var draggingID: String? = nil
 
     var body: some View {
-        ScrollView(.horizontal, showsIndicators: false) {
-            HStack(spacing: 6) {
-                ForEach(projects) { project in
+        ScrollViewReader { proxy in
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(spacing: 6) {
+                    ForEach(projects) { project in
                     Button {
                         selected = project.id
                     } label: {
@@ -48,8 +49,9 @@ struct ProjectTabStripView: View {
                             reorder: reorder
                         )
                     )
-                }
-                Button(action: openFolder) {
+                    .id(project.id)
+                    }
+                    Button(action: openFolder) {
                     Image(systemName: "plus")
                         .font(.caption.weight(.semibold))
                         .frame(width: 26, height: 26)
@@ -59,12 +61,20 @@ struct ProjectTabStripView: View {
                                 .stroke(Color.primary.opacity(0.08), lineWidth: 0.8)
                         }
                 }
-                .buttonStyle(.plain)
-                .help("Open a folder as a project (⌘O)")
-                Spacer(minLength: 0)
+                    .buttonStyle(.plain)
+                    .help("Open a folder as a project (⌘O)")
+                    Spacer(minLength: 0)
+                }
+                .padding(.horizontal, 8)
+                .padding(.vertical, 4)
             }
-            .padding(.horizontal, 8)
-            .padding(.vertical, 4)
+            .scrollBounceBehavior(.basedOnSize, axes: .horizontal)
+            .onChange(of: selected) { _, id in
+                guard let id else { return }
+                withAnimation(.easeInOut(duration: 0.18)) {
+                    proxy.scrollTo(id, anchor: .center)
+                }
+            }
         }
         .frame(height: 36)
     }

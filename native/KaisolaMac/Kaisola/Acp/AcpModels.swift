@@ -92,6 +92,10 @@ struct AcpPermissionRequest: Equatable, Sendable, Identifiable {
 struct AcpUsage: Equatable, Sendable {
     let used: Int
     let max: Int
+    /// Optional cumulative session cost from ACP's standard `usage_update`.
+    /// Adapters that do not report cost leave both fields nil.
+    var costAmount: Double? = nil
+    var costCurrency: String? = nil
 }
 
 /// The result of `session/new`.
@@ -146,6 +150,7 @@ struct AcpAgentCapabilities: Equatable, Sendable {
     var mcpHTTP = false
     var mcpSSE = false
     var promptImage = false
+    var promptEmbeddedContext = false
 }
 
 enum AcpClientError: Error, Equatable, LocalizedError {
@@ -155,6 +160,7 @@ enum AcpClientError: Error, Equatable, LocalizedError {
     case malformedResponse
     case requestFailed(String)
     case frameTooLarge
+    case unsupportedProtocol(Int)
 
     var errorDescription: String? {
         switch self {
@@ -164,6 +170,8 @@ enum AcpClientError: Error, Equatable, LocalizedError {
         case .malformedResponse: "The agent sent a malformed message."
         case let .requestFailed(message): message
         case .frameTooLarge: "The agent sent an oversized message."
+        case let .unsupportedProtocol(version):
+            "The agent negotiated unsupported ACP protocol version \(version)."
         }
     }
 }

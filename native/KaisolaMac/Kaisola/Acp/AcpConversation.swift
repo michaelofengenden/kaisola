@@ -47,6 +47,10 @@ final class AcpConversation: ObservableObject {
     /// content blocks with the next immediate send and cleared then. Queued
     /// follow-ups never carry attachments (see `send`).
     @Published private(set) var pendingAttachments: [PendingAttachment] = []
+    /// Number of file attachments currently being classified/read off the main
+    /// actor. Exposed so the composer can show a tiny, non-blocking progress
+    /// indicator instead of freezing while Finder/iCloud materializes a file.
+    @Published private(set) var preparingAttachmentCount = 0
 
     /// Original text + attachment blocks for failed sends, keyed by the failed
     /// row's Identifiable id, so `retryFailed` can re-send the exact payload
@@ -91,6 +95,7 @@ final class AcpConversation: ObservableObject {
     }
 
     let title: String
+    var workspaceURL: URL { URL(fileURLWithPath: cwd, isDirectory: true) }
     /// Reports needs-you moments (permission surfaced, turn finished) so the
     /// owner can decide whether they warrant an inbox entry. Set by AppModel.
     var onAttention: ((AttentionCenter.Kind, _ detail: String) -> Void)?
@@ -115,6 +120,8 @@ final class AcpConversation: ObservableObject {
     /// user asks for more. Each "Show earlier" click reveals `expandStep` more.
     static let defaultVisibleLimit = 120
     private static let expandStep = 200
+    static let maxPendingAttachmentCount = 8
+    static let maxPendingAttachmentBytes = 20 * 1_048_576
     /// Set when the user expands earlier history during the current turn, so the
     /// next turn keeps the widened window instead of snapping back to the tail.
     private var didExpandDuringTurn = false
@@ -252,6 +259,28 @@ final class AcpConversation: ObservableObject {
         }
     }
 
+    /// UI attachment path. Filesystem metadata, cloud-file materialization, and
+    /// bounded file reads all happen away from MainActor. The synchronous
+    /// classifier remains available for deterministic unit tests.
+    func prepareAttachment(fileURL: URL) {
+        guard pendingAttachments.count + preparingAttachmentCount < Self.maxPendingAttachmentCount else {
+            ToastCenter.shared.show("Attach up to \(Self.maxPendingAttachmentCount) files per message.", style: .info)
+            return
+        }
+        preparingAttachmentCount += 1
+        Task { [weak self] in
+            let outcome = await Task.detached(priority: .userInitiated) {
+                AcpAttachmentClassifier.classify(fileURL: fileURL)
+            }.value
+            guard let self else { return }
+            self.preparingAttachmentCount = max(0, self.preparingAttachmentCount - 1)
+            switch outcome {
+            case let .accepted(attachment): self.appendPending(attachment)
+            case let .rejected(reason): ToastCenter.shared.show(reason, style: .error)
+            }
+        }
+    }
+
     /// Stage raw image bytes from the pasteboard (already normalized to PNG),
     /// enforcing the same 5 MB image cap as file attachments.
     func addImageData(_ data: Data, name: String) {
@@ -271,13 +300,22 @@ final class AcpConversation: ObservableObject {
     /// payload so the same file added twice shows once.
     private func appendPending(_ attachment: AcpAttachment) {
         guard !pendingAttachments.contains(where: { $0.attachment == attachment }) else { return }
-        attachmentCounter += 1
         let icon: String
         let size: Int
         switch attachment {
         case let .image(data, _, _): icon = "photo"; size = data.count
         case let .textFile(_, contents, _): icon = "doc.text"; size = contents.utf8.count
         }
+        guard pendingAttachments.count < Self.maxPendingAttachmentCount else {
+            ToastCenter.shared.show("Attach up to \(Self.maxPendingAttachmentCount) files per message.", style: .info)
+            return
+        }
+        let stagedBytes = pendingAttachments.reduce(0) { $0 + $1.byteSize }
+        guard stagedBytes + size <= Self.maxPendingAttachmentBytes else {
+            ToastCenter.shared.show("Attachments are limited to 20 MB per message.", style: .error)
+            return
+        }
+        attachmentCounter += 1
         pendingAttachments.append(PendingAttachment(
             id: "att\(attachmentCounter)", name: attachment.name,
             iconName: icon, byteSize: size, attachment: attachment
@@ -328,6 +366,7 @@ final class AcpConversation: ObservableObject {
     }
 
     func cancel() {
+        pendingPermission = nil
         Task { await client.cancel() }
     }
 

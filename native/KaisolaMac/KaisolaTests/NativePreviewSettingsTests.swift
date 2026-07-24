@@ -24,6 +24,7 @@ final class NativePreviewSettingsTests: XCTestCase {
         XCTAssertEqual(settings.terminalPalette, .native)
         XCTAssertTrue(settings.workspaceRailVisible)
         XCTAssertEqual(settings.workspaceRailWidth, NativePreviewSettings.workspaceRailWidthDefault)
+        XCTAssertEqual(settings.filePreviewWidth, NativePreviewSettings.filePreviewWidthDefault)
 
         settings.navigationLayout = .topBar
         settings.appearance = .dark
@@ -31,6 +32,7 @@ final class NativePreviewSettingsTests: XCTestCase {
         settings.workspaceBackdrop = .tinted
         settings.terminalPalette = .kaisola
         settings.workspaceRailWidth = 300
+        settings.filePreviewWidth = 640
 
         let reloaded = NativePreviewSettings(defaults: defaults)
         XCTAssertEqual(reloaded.navigationLayout, .topBar)
@@ -39,12 +41,40 @@ final class NativePreviewSettingsTests: XCTestCase {
         XCTAssertEqual(reloaded.workspaceBackdrop, .tinted)
         XCTAssertEqual(reloaded.terminalPalette, .kaisola)
         XCTAssertEqual(reloaded.workspaceRailWidth, 300)
+        XCTAssertEqual(reloaded.filePreviewWidth, 640)
     }
 
     func testWorkspaceRailWidthStaysThinAndClamped() {
-        XCTAssertEqual(NativePreviewSettings.clampedWorkspaceRailWidth(100), 205)
+        XCTAssertEqual(NativePreviewSettings.clampedWorkspaceRailWidth(100), 188)
         XCTAssertEqual(NativePreviewSettings.clampedWorkspaceRailWidth(248), 248)
-        XCTAssertEqual(NativePreviewSettings.clampedWorkspaceRailWidth(900), 360)
+        XCTAssertEqual(NativePreviewSettings.clampedWorkspaceRailWidth(900), 330)
+        XCTAssertEqual(NativePreviewSettings.clampedFilePreviewWidth(100), 300)
+        XCTAssertEqual(NativePreviewSettings.clampedFilePreviewWidth(600), 600)
+        XCTAssertEqual(NativePreviewSettings.clampedFilePreviewWidth(1_200), 920)
+    }
+
+    func testDetailPaneSizingKeepsAllOpenSurfacesInsideNarrowCanvas() {
+        let widths = NativeDetailPaneSizing.resolve(
+            totalWidth: 602,
+            preferredPreview: 480,
+            preferredRail: 218
+        )
+        let occupied = widths.preview + widths.rail
+            + 2 * NativeDetailPaneSizing.dividerWidth
+            + NativeDetailPaneSizing.minimumContentWidth
+        XCTAssertLessThanOrEqual(occupied, 602.001)
+        XCTAssertGreaterThanOrEqual(widths.preview, 200)
+        XCTAssertGreaterThanOrEqual(widths.rail, 120)
+    }
+
+    func testDetailPaneSizingPreservesPreferencesWhenSpaceAllows() {
+        let widths = NativeDetailPaneSizing.resolve(
+            totalWidth: 1_200,
+            preferredPreview: 480,
+            preferredRail: 218
+        )
+        XCTAssertEqual(widths.preview, 480)
+        XCTAssertEqual(widths.rail, 218)
     }
 
     func testVisualChoiceTitlesRemainUserFacing() {

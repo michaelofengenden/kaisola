@@ -199,6 +199,10 @@ private struct McpServerEditor: View {
                 headerPairs: Self.parsePairs(draft.headerText)
             )
         }
+        if let error = server.validationError {
+            addError = error
+            return
+        }
         servers.append(server)
         store.save(servers)
         draft = Draft()

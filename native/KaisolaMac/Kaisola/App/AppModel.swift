@@ -150,8 +150,9 @@ final class AppModel: ObservableObject {
         persistedPinnedIDs = SessionPinStore().pins()
     }
 
-    /// Keeps the per-chat usage observers alive for this window's lifetime.
-    private var usageObservers = Set<AnyCancellable>()
+    /// Keeps each chat's usage observers alive only while that chat exists.
+    /// Keying by id avoids retaining closed conversations and stale Usage rows.
+    private var usageObservers: [String: Set<AnyCancellable>] = [:]
     /// Child surfaces are observable objects of their own. Relay their live
     /// state changes so project activity badges and tabs update immediately.
     private var surfaceObservers: [String: AnyCancellable] = [:]
@@ -467,20 +468,24 @@ final class AppModel: ObservableObject {
         )
         // Fan this chat's live context usage into the session-wide UsageCenter.
         let usageTitle = conversation.title
+        var chatUsageObservers = Set<AnyCancellable>()
         conversation.$usage
             .compactMap { $0 }
             .sink { usage in
                 UsageCenter.shared.record(
                     chatID: chatID, title: usageTitle, agentID: agent.id,
-                    usage: usage.used, max: usage.max
+                    usage: usage.used, max: usage.max,
+                    costAmount: usage.costAmount,
+                    costCurrency: usage.costCurrency
                 )
             }
-            .store(in: &usageObservers)
+            .store(in: &chatUsageObservers)
         conversation.$isRunning
             .scan((false, false)) { ($0.1, $1) }
             .filter { $0.0 && !$0.1 }
             .sink { _ in UsageCenter.shared.recordTurn(chatID: chatID) }
-            .store(in: &usageObservers)
+            .store(in: &chatUsageObservers)
+        usageObservers[chatID] = chatUsageObservers
         // Needs-you moments land in the inbox only when the chat isn't the
         // focused surface (or the app is in the background).
         let title = conversation.title
@@ -509,6 +514,8 @@ final class AppModel: ObservableObject {
             chat.conversation.stop()
         }
         chats.removeAll { $0.id == chatID }
+        usageObservers.removeValue(forKey: chatID)?.forEach { $0.cancel() }
+        UsageCenter.shared.remove(chatID: chatID)
         surfaceObservers.removeValue(forKey: chatID)?.cancel()
         if selectedChatID == chatID { selectedChatID = nil }
     }
@@ -592,8 +599,11 @@ final class AppModel: ObservableObject {
     func teardown() async {
         for chat in chats {
             chat.conversation.stop()
+            UsageCenter.shared.remove(chatID: chat.id)
         }
         chats.removeAll()
+        for observers in usageObservers.values { observers.forEach { $0.cancel() } }
+        usageObservers.removeAll()
         for mesh in meshes {
             mesh.shutdown()
         }

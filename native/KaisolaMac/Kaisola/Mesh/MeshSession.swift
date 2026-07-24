@@ -87,6 +87,11 @@ final class MeshSession: ObservableObject, Identifiable {
     /// Drives the staged / idea handoff; cancelled on shutdown and restarted on
     /// each new staged/idea send.
     private var stageTask: Task<Void, Never>?
+    /// Closing a Mesh can race the async repository/worktree probes in `start`.
+    /// A generation guard prevents that suspended startup from resurrecting
+    /// hidden columns or processes after shutdown.
+    private var startupGeneration = 0
+    private var isShutDown = false
 
     init(
         id: String = "mesh-\(UUID().uuidString.lowercased().prefix(8))",
@@ -149,6 +154,9 @@ final class MeshSession: ObservableObject, Identifiable {
     /// (and fails closed in a repo when it can't); read-only roles (scout,
     /// ideator) always share the base directory.
     func start(agents: [AgentProfile], environment: [String: String] = ProcessInfo.processInfo.environment) async {
+        guard !isShutDown else { return }
+        startupGeneration &+= 1
+        let generation = startupGeneration
         let service = GitService(repoRoot: baseDirectory)
         // Publish the active project configuration immediately, before the
         // repo/isolation probe, so the Mesh opens with truthful chrome instead
@@ -164,6 +172,7 @@ final class MeshSession: ObservableObject, Identifiable {
         let baseIsRepo = await Task.detached(priority: .userInitiated) {
             (try? service.status()) != nil
         }.value
+        guard !isShutDown, startupGeneration == generation else { return }
         // Filtered adapter order determines role assignment (first = scout).
         for assignment in Self.roles(for: usable, mode: mode, purpose: purpose) {
             let agent = assignment.agent
@@ -181,6 +190,12 @@ final class MeshSession: ObservableObject, Identifiable {
                     try await Task.detached(priority: .userInitiated) {
                         try service.worktreeAdd(path: candidatePath, branch: candidateBranch)
                     }.value
+                    guard !isShutDown, startupGeneration == generation else {
+                        try? await Task.detached(priority: .utility) {
+                            try service.worktreeRemove(path: candidatePath, branch: candidateBranch)
+                        }.value
+                        return
+                    }
                     worktree = candidatePath
                     branch = candidateBranch
                 } catch {
@@ -204,8 +219,32 @@ final class MeshSession: ObservableObject, Identifiable {
             conversation.objectWillChange
                 .sink { [weak self] _ in self?.objectWillChange.send() }
                 .store(in: &columnObservers)
+            let columnID = "\(id)-\(agent.id)"
+            let usageTitle = "\(title) · \(agent.name)"
+            // Mesh columns are first-class ACP sessions. Feed their live
+            // context/cost updates into the same Usage pane as ordinary chats;
+            // previously a multi-agent run was entirely invisible there.
+            conversation.$usage
+                .compactMap { $0 }
+                .sink { usage in
+                    UsageCenter.shared.record(
+                        chatID: columnID,
+                        title: usageTitle,
+                        agentID: agent.id,
+                        usage: usage.used,
+                        max: usage.max,
+                        costAmount: usage.costAmount,
+                        costCurrency: usage.costCurrency
+                    )
+                }
+                .store(in: &columnObservers)
+            conversation.$isRunning
+                .scan((false, false)) { ($0.1, $1) }
+                .filter { $0.0 && !$0.1 }
+                .sink { _ in UsageCenter.shared.recordTurn(chatID: columnID) }
+                .store(in: &columnObservers)
             columns.append(Column(
-                id: "\(id)-\(agent.id)",
+                id: columnID,
                 agent: agent,
                 role: assignment.role,
                 conversation: conversation,
@@ -214,6 +253,7 @@ final class MeshSession: ObservableObject, Identifiable {
             ))
         }
         for column in columns {
+            guard !isShutDown, startupGeneration == generation else { return }
             await column.conversation.start()
         }
     }
@@ -402,15 +442,19 @@ final class MeshSession: ObservableObject, Identifiable {
     /// sequentially — concurrent git processes contend on the repo lock and
     /// would leave stray branches behind.
     func shutdown() {
+        isShutDown = true
+        startupGeneration &+= 1
         stageTask?.cancel()
         stageTask = nil
         stage = "Idle"
         let service = GitService(repoRoot: baseDirectory)
         let cleanups = columns.compactMap { column -> (String, String)? in
             column.conversation.stop()
+            UsageCenter.shared.remove(chatID: column.id)
             guard let path = column.worktreePath, let branch = column.branch else { return nil }
             return (path, branch)
         }
+        columnObservers.removeAll()
         columns.removeAll()
         guard !cleanups.isEmpty else { return }
         Task.detached(priority: .utility) {

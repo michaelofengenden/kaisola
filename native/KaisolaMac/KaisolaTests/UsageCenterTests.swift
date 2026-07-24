@@ -153,6 +153,30 @@ final class UsageCenterTests: XCTestCase {
         XCTAssertEqual(center.contextPressure, 0.30, accuracy: 0.0001)
     }
 
+    func testUsageSanitizesNegativeValuesAndCapsPressure() {
+        let center = makeCenter()
+        center.record(chatID: "negative", title: "N", agentID: "codex", usage: -5, max: -1)
+        XCTAssertEqual(center.byChat["negative"]?.latestUsed, 0)
+        XCTAssertEqual(center.byChat["negative"]?.latestMax, 0)
+
+        center.record(chatID: "over", title: "O", agentID: "codex", usage: 2_000, max: 1_000)
+        XCTAssertEqual(center.contextPressure, 1)
+    }
+
+    func testUsageRejectsNegativeCostAndNormalizesCurrency() {
+        let center = makeCenter()
+        center.record(
+            chatID: "a", title: "Alpha", agentID: "codex",
+            usage: 1, max: 10, costAmount: -1, costCurrency: " usd "
+        )
+        XCTAssertNil(center.byChat["a"]?.costAmount)
+        center.record(
+            chatID: "a", title: "Alpha", agentID: "codex",
+            usage: 2, max: 10, costAmount: 0.25, costCurrency: " usd "
+        )
+        XCTAssertEqual(center.byChat["a"]?.costCurrency, "USD")
+    }
+
     func testProviderPlanUsageDecodesNeutralBridgeShape() throws {
         let data = Data(#"""
         {
@@ -182,5 +206,25 @@ final class UsageCenterTests: XCTestCase {
         XCTAssertThrowsError(try UsageCenter.decodeProviderPlanUsage(data)) { error in
             XCTAssertTrue(error.localizedDescription.contains("helper unavailable"))
         }
+    }
+
+    func testRecordTracksCumulativeCostWithoutMixingCurrencies() {
+        let center = makeCenter()
+        center.record(
+            chatID: "a", title: "Alpha", agentID: "claude-code",
+            usage: 100, max: 1000, costAmount: 0.25, costCurrency: "usd"
+        )
+        center.record(
+            chatID: "a", title: "Alpha", agentID: "claude-code",
+            usage: 200, max: 1000, costAmount: 0.40, costCurrency: "USD"
+        )
+        center.record(
+            chatID: "b", title: "Bravo", agentID: "codex",
+            usage: 150, max: 1000, costAmount: 0.10, costCurrency: "EUR"
+        )
+
+        XCTAssertEqual(center.byChat["a"]?.costAmount, 0.40)
+        XCTAssertEqual(center.costTotals.map(\.currency), ["EUR", "USD"])
+        XCTAssertEqual(center.costTotals.first { $0.currency == "USD" }?.amount, 0.40)
     }
 }

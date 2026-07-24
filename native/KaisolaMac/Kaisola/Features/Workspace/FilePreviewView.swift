@@ -3,12 +3,13 @@ import SwiftUI
 import UniformTypeIdentifiers
 
 /// What a file resolves to for previewing/editing. Pure so tests can drive it.
-enum FilePreviewContent: Equatable {
+enum FilePreviewContent: Equatable, Sendable {
     case text(String)
     case markdown(String)
     case csv(String)
     case json(String)
-    case html
+    case html(String)
+    case docx
     case image
     case tooLarge(Int)
     case binary
@@ -23,15 +24,118 @@ enum FilePreviewContent: Equatable {
               let size = attributes[.size] as? Int else { return .unreadable }
         let ext = url.pathExtension.lowercased()
         if imageExtensions.contains(ext) { return .image }
-        // HTML renders from disk in a WKWebView, so it skips the text cap.
-        if ext == "html" || ext == "htm" { return .html }
+        if ext == "docx" { return size <= maxDocumentBytes ? .docx : .tooLarge(size) }
         guard size <= maxTextBytes else { return .tooLarge(size) }
         guard let data = FileManager.default.contents(atPath: path) else { return .unreadable }
         guard let text = String(data: data, encoding: .utf8) else { return .binary }
+        if ext == "html" || ext == "htm" { return .html(text) }
         if ext == "csv" || ext == "tsv" { return .csv(text) }
         if ext == "json" { return .json(text) }
         return ext == "md" || ext == "markdown" ? .markdown(text) : .text(text)
     }
+
+    static let maxDocumentBytes = 20 * 1_048_576
+}
+
+/// AppKit's Office Open XML reader/writer is synchronous and the attributed
+/// string classes predate Sendable. Keep that work off the main actor and move
+/// the immutable result across the boundary in this explicit wrapper.
+struct RichDocumentPayload: @unchecked Sendable {
+    let value: NSAttributedString
+}
+
+enum RichDocumentIO {
+    static func load(url: URL) -> RichDocumentPayload? {
+        guard let value = try? NSAttributedString(
+            url: url,
+            options: [.documentType: NSAttributedString.DocumentType.officeOpenXML],
+            documentAttributes: nil
+        ) else { return nil }
+        return RichDocumentPayload(value: value)
+    }
+
+    static func write(_ value: NSAttributedString, to url: URL) throws {
+        let data = try value.data(
+            from: NSRange(location: 0, length: value.length),
+            documentAttributes: [.documentType: NSAttributedString.DocumentType.officeOpenXML]
+        )
+        try data.write(to: url, options: .atomic)
+    }
+}
+
+private struct FilePreviewSnapshot: Sendable {
+    let content: FilePreviewContent
+    let modificationDate: Date?
+}
+
+private enum FilePreviewSaveResult: Sendable {
+    case saved(Date?)
+    case changedOnDisk
+    case failed(String)
+}
+
+/// Disk reads/writes used by the preview are deliberately actor-independent so
+/// they can run on a utility executor. The modification-date guard prevents an
+/// agent edit that lands after the preview opened from being silently replaced.
+enum FilePreviewDiskState {
+    nonisolated static func modificationDate(of url: URL) -> Date? {
+        (try? FileManager.default.attributesOfItem(atPath: url.path)[.modificationDate]) as? Date
+    }
+
+    nonisolated static func changed(onDisk url: URL, since expected: Date?) -> Bool {
+        modificationDate(of: url) != expected
+    }
+
+    fileprivate nonisolated static func writeText(
+        _ text: String,
+        to url: URL,
+        expectedModificationDate: Date?,
+        force: Bool
+    ) -> FilePreviewSaveResult {
+        guard force || !changed(onDisk: url, since: expectedModificationDate) else {
+            return .changedOnDisk
+        }
+        do {
+            try text.write(to: url, atomically: true, encoding: .utf8)
+            return .saved(modificationDate(of: url))
+        } catch {
+            return .failed(error.localizedDescription)
+        }
+    }
+}
+
+/// NSAttributedString's DOCX importer/exporter is synchronous. A dedicated
+/// actor serializes rich-document work off the MainActor, so rapid file switches
+/// cannot pile up AppKit parses or freeze terminal rendering.
+private actor RichDocumentWorker {
+    static let shared = RichDocumentWorker()
+
+    func load(url: URL) -> RichDocumentPayload? {
+        RichDocumentIO.load(url: url)
+    }
+
+    func write(
+        _ payload: RichDocumentPayload,
+        to url: URL,
+        expectedModificationDate: Date?,
+        force: Bool
+    ) -> FilePreviewSaveResult {
+        guard force || !FilePreviewDiskState.changed(onDisk: url, since: expectedModificationDate) else {
+            return .changedOnDisk
+        }
+        do {
+            try RichDocumentIO.write(payload.value, to: url)
+            return .saved(FilePreviewDiskState.modificationDate(of: url))
+        } catch {
+            return .failed(error.localizedDescription)
+        }
+    }
+}
+
+private struct RichDocumentCommand: Equatable {
+    enum Kind: Equatable { case bold, italic, underline, heading, bulletList }
+    let id = UUID()
+    let kind: Kind
 }
 
 /// File preview/editor pane: UTF-8 text is editable with ⌘S save + revert,
@@ -42,6 +146,8 @@ struct FilePreviewView: View {
     /// Project root grants HTML previews access to their own relative assets
     /// (styles, scripts, images) without granting the rest of the filesystem.
     let workspaceRoot: URL?
+    /// Restores AppModel's selection when a pending file switch is cancelled.
+    let restoreSelection: (URL) -> Void
     let close: () -> Void
 
     @Environment(\.colorScheme) private var colorScheme
@@ -49,6 +155,8 @@ struct FilePreviewView: View {
     @State private var content: FilePreviewContent = .unreadable
     @State private var draft = ""
     @State private var savedText = ""
+    @State private var richDraft = NSAttributedString(string: "")
+    @State private var savedRichText = NSAttributedString(string: "")
     @State private var showMarkdownSource = false
     /// Text (non-markdown) files default to a read-only, syntax-highlighted
     /// view; this toggle drops into the plain `TextEditor` for editing.
@@ -57,20 +165,34 @@ struct FilePreviewView: View {
     /// language, or appearance changes (never on every keystroke).
     @State private var highlighted = AttributedString("")
     @State private var saveError: String?
-    /// The file actually shown; lags `url` while an unsaved-changes prompt is up.
-    @State private var displayedURL: URL?
+    /// The URL that produced the currently rendered draft. It deliberately
+    /// stays unchanged while another URL loads, so Save can never target the
+    /// incoming file with the outgoing file's contents.
+    @State private var loadedURL: URL?
+    @State private var loadingURL: URL?
+    @State private var loadedModificationDate: Date?
     /// A navigation/close blocked on unsaved changes, awaiting the user.
     @State private var pendingAction: PendingAction?
+    @State private var showUnsavedPrompt = false
+    @State private var showExternalChangePrompt = false
     @State private var isLoading = false
+    @State private var isSaving = false
     @State private var loadTask: Task<Void, Never>?
+    @State private var saveTask: Task<Void, Never>?
     @State private var highlightTask: Task<Void, Never>?
+    @State private var documentZoom: CGFloat = 1
+    @State private var previewRevision = 0
+    @State private var richDocumentCommand: RichDocumentCommand?
 
     private enum PendingAction: Equatable {
         case navigate(URL)
         case close
     }
 
-    private var isDirty: Bool { draft != savedText }
+    private var isDirty: Bool {
+        if case .docx = content { return !richDraft.isEqual(to: savedRichText) }
+        return draft != savedText
+    }
 
     var body: some View {
         VStack(spacing: 0) {
@@ -78,28 +200,38 @@ struct FilePreviewView: View {
             Divider()
             ZStack {
                 body(for: content)
+                    .allowsHitTesting(!isLoading && !isSaving)
                 if isLoading {
-                    VStack(spacing: 10) {
-                        ProgressView().controlSize(.small)
-                        Text("Opening \((displayedURL ?? url).lastPathComponent)…")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
+                    ZStack {
+                        Rectangle().fill(.clear).contentShape(Rectangle())
+                        VStack(spacing: 10) {
+                            ProgressView().controlSize(.small)
+                            Text("Opening \((loadingURL ?? url).lastPathComponent)…")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                        .padding(18)
+                        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 12))
                     }
-                    .padding(18)
-                    .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 12))
                 }
             }
         }
         .background(Color(nsColor: .textBackgroundColor))
-        .onAppear { displayedURL = url; load() }
+        .clipShape(RoundedRectangle(cornerRadius: 13, style: .continuous))
+        .overlay {
+            RoundedRectangle(cornerRadius: 13, style: .continuous)
+                .stroke(Color.primary.opacity(0.10), lineWidth: 0.8)
+        }
+        .onAppear { beginLoad(url) }
         .onChange(of: url) { _, newURL in
+            guard newURL != loadedURL, newURL != loadingURL else { return }
             // Never silently drop unsaved edits: block the switch behind a
             // Save / Discard / Cancel prompt.
-            if isDirty, newURL != displayedURL {
+            if isDirty {
                 pendingAction = .navigate(newURL)
+                showUnsavedPrompt = true
             } else {
-                displayedURL = newURL
-                load()
+                beginLoad(newURL)
             }
         }
         // Re-highlight when appearance flips or when returning to read mode with
@@ -110,38 +242,49 @@ struct FilePreviewView: View {
         .onChange(of: draft) { _, _ in if !isEditingText { refreshHighlight() } }
         .onDisappear {
             loadTask?.cancel()
+            saveTask?.cancel()
             highlightTask?.cancel()
         }
         .confirmationDialog(
             "Unsaved changes",
-            isPresented: Binding(get: { pendingAction != nil }, set: { if !$0 { pendingAction = nil } })
+            isPresented: $showUnsavedPrompt
         ) {
             Button("Save") {
-                // Only navigate away once the write actually succeeds — a failed
-                // save (read-only file, disk full, file vanished) must keep the
-                // pane on the current file with the draft and error intact, never
-                // silently discard the edits by navigating/closing anyway.
-                if save() {
-                    completePendingAction()
-                } else {
-                    pendingAction = nil
-                }
+                save(advancePendingAction: true)
             }
             Button("Discard Changes", role: .destructive) {
                 draft = savedText
+                richDraft = savedRichText
                 completePendingAction()
             }
-            Button("Cancel", role: .cancel) { pendingAction = nil }
+            Button("Cancel", role: .cancel) {
+                pendingAction = nil
+                if let loadedURL { restoreSelection(loadedURL) }
+            }
         } message: {
-            Text("\(displayedURL?.lastPathComponent ?? "This file") has unsaved changes.")
+            Text("\(loadedURL?.lastPathComponent ?? "This file") has unsaved changes.")
+        }
+        .confirmationDialog("File changed on disk", isPresented: $showExternalChangePrompt) {
+            Button("Reload from Disk") {
+                pendingAction = nil
+                if let loadedURL { beginLoad(loadedURL) }
+            }
+            Button("Overwrite", role: .destructive) {
+                save(force: true, advancePendingAction: pendingAction != nil)
+            }
+            Button("Cancel", role: .cancel) {
+                if let loadedURL { restoreSelection(loadedURL) }
+                pendingAction = nil
+            }
+        } message: {
+            Text("An agent or another app edited this file after it was opened. Reload it or explicitly overwrite the newer version.")
         }
     }
 
     private func completePendingAction() {
         switch pendingAction {
         case let .navigate(next):
-            displayedURL = next
-            load()
+            beginLoad(next)
         case .close:
             close()
         case nil:
@@ -153,15 +296,20 @@ struct FilePreviewView: View {
     private func requestClose() {
         if isDirty {
             pendingAction = .close
+            showUnsavedPrompt = true
         } else {
             close()
         }
     }
 
     private var header: some View {
-        HStack(spacing: 10) {
+        HStack(spacing: 7) {
             Image(systemName: "doc.text")
-            Text((displayedURL ?? url).lastPathComponent).font(.subheadline.weight(.medium))
+                .foregroundStyle(.secondary)
+            Text((loadingURL ?? loadedURL ?? url).lastPathComponent)
+                .font(.subheadline.weight(.medium))
+                .lineLimit(1)
+                .truncationMode(.middle)
             if isDirty {
                 Circle().fill(Color.accentColor).frame(width: 7, height: 7)
                     .accessibilityLabel("Unsaved changes")
@@ -170,39 +318,93 @@ struct FilePreviewView: View {
                 Text(saveError).font(.caption).foregroundStyle(.red).lineLimit(1)
             }
             Spacer()
+            if isLoading || isSaving { ProgressView().controlSize(.mini) }
             if case .markdown = content {
-                Toggle("Source", isOn: $showMarkdownSource)
-                    .toggleStyle(.button)
-                    .controlSize(.small)
-            }
-            if case .text = content {
-                Toggle("Edit", isOn: $isEditingText)
-                    .toggleStyle(.button)
-                    .controlSize(.small)
-                    .help("Switch between the read-only highlighted view and editing")
+                Button { showMarkdownSource.toggle() } label: {
+                    Image(systemName: showMarkdownSource ? "doc.richtext.fill" : "doc.plaintext")
+                }
+                .buttonStyle(.borderless)
+                .help(showMarkdownSource ? "Show rendered Markdown" : "Edit Markdown source")
+            } else if case .text = content {
+                editModeButton(help: "Edit text")
+            } else if case .html = content {
+                editModeButton(help: "Edit HTML source")
             }
             if isEditable {
-                Button("Revert") { draft = savedText }
-                    .disabled(!isDirty)
-                Button("Save") { save() }
-                    .keyboardShortcut("s", modifiers: .command)
-                    .disabled(!isDirty)
+                Button { save() } label: {
+                    Image(systemName: "square.and.arrow.down")
+                }
+                .buttonStyle(.borderless)
+                .keyboardShortcut("s", modifiers: .command)
+                .disabled(!isDirty || isLoading || isSaving)
+                .help("Save")
             }
+            previewOptionsMenu
             Button {
                 requestClose()
             } label: {
-                Image(systemName: "xmark.circle.fill")
+                Image(systemName: "minus")
             }
             .buttonStyle(.borderless)
-            .help("Close the file preview")
+            .help("Minimize the document preview")
         }
-        .padding(.horizontal, 14)
-        .frame(height: 42)
+        .padding(.horizontal, 11)
+        .frame(height: 38)
+        .background(.thinMaterial)
+    }
+
+    private func editModeButton(help: String) -> some View {
+        Button { isEditingText.toggle() } label: {
+            Image(systemName: isEditingText ? "eye" : "pencil")
+        }
+        .buttonStyle(.borderless)
+        .help(isEditingText ? "Show preview" : help)
+    }
+
+    private var previewOptionsMenu: some View {
+        Menu {
+            if case .docx = content {
+                Section("Format") {
+                    Button("Bold") { richDocumentCommand = RichDocumentCommand(kind: .bold) }
+                    Button("Italic") { richDocumentCommand = RichDocumentCommand(kind: .italic) }
+                    Button("Underline") { richDocumentCommand = RichDocumentCommand(kind: .underline) }
+                    Button("Heading") { richDocumentCommand = RichDocumentCommand(kind: .heading) }
+                    Button("Bulleted list") { richDocumentCommand = RichDocumentCommand(kind: .bulletList) }
+                }
+            }
+            if supportsZoom {
+                Section("Zoom — \(Int((documentZoom * 100).rounded()))%") {
+                    Button("Zoom In") { adjustZoom(0.1) }.disabled(documentZoom >= 2)
+                    Button("Zoom Out") { adjustZoom(-0.1) }.disabled(documentZoom <= 0.65)
+                    Button("Actual Size") { documentZoom = 1 }.disabled(documentZoom == 1)
+                }
+            }
+            if isEditable {
+                Divider()
+                Button("Revert Changes") {
+                    if case .docx = content { richDraft = savedRichText }
+                    else { draft = savedText }
+                }
+                .disabled(!isDirty)
+            }
+        } label: {
+            Image(systemName: "ellipsis")
+        }
+        .menuStyle(.borderlessButton)
+        .menuIndicator(.hidden)
+        .help("Document options")
+    }
+
+    private var supportsZoom: Bool {
+        switch content {
+        case .text, .markdown, .html, .docx, .image: true
+        default: false
+        }
     }
 
     private var isEditable: Bool {
         switch content {
-        case .text, .markdown: true
+        case .text, .markdown, .html, .docx: true
         default: false
         }
     }
@@ -216,26 +418,28 @@ struct FilePreviewView: View {
             } else {
                 ScrollView {
                     Text(highlighted)
-                        .font(.system(.body, design: .monospaced))
+                        .font(.system(size: 13 * documentZoom, design: .monospaced))
                         .textSelection(.enabled)
                         .lineSpacing(2)
                         .frame(maxWidth: .infinity, alignment: .leading)
                         .padding(16)
                 }
+                .scrollBounceBehavior(.basedOnSize)
             }
         case .markdown:
             if showMarkdownSource {
                 editor
             } else {
-                MarkdownDocumentView(source: draft)
+                MarkdownDocumentView(source: draft, zoom: documentZoom)
             }
         case .image:
-            if let image = NSImage(contentsOf: displayedURL ?? url) {
+            if let image = NSImage(contentsOf: loadedURL ?? url) {
                 ScrollView([.horizontal, .vertical]) {
                     Image(nsImage: image).resizable().aspectRatio(contentMode: .fit)
-                        .frame(maxWidth: 1200)
+                        .frame(maxWidth: 1200 * documentZoom)
                         .padding(16)
                 }
+                .scrollBounceBehavior(.basedOnSize)
             } else {
                 ContentUnavailableView("Could not load image", systemImage: "photo")
             }
@@ -244,12 +448,26 @@ struct FilePreviewView: View {
         case let .json(text):
             JsonPreview(text: text)
         case .html:
-            HtmlFilePreview(fileURL: displayedURL ?? url, readAccessRoot: workspaceRoot)
+            if isEditingText {
+                editor
+            } else {
+                HtmlFilePreview(
+                    fileURL: loadedURL ?? url,
+                    readAccessRoot: workspaceRoot,
+                    zoom: documentZoom,
+                    contentRevision: previewRevision
+                )
+            }
+        case .docx:
+            RichDocumentEditor(text: $richDraft, zoom: documentZoom, command: richDocumentCommand)
+                .background(Color(nsColor: .underPageBackgroundColor))
+                .padding(16)
+                .background(Color(nsColor: .controlBackgroundColor))
         case let .tooLarge(size):
             ContentUnavailableView(
                 "File too large to preview",
                 systemImage: "doc.zipper",
-                description: Text("\(size / 1024) KB — the preview caps at \(FilePreviewContent.maxTextBytes / 1024) KB.")
+                description: Text("\(size / 1024) KB — bounded previews keep the workspace responsive.")
             )
         case .binary:
             ContentUnavailableView("Binary file", systemImage: "doc", description: Text("No text preview available."))
@@ -260,32 +478,58 @@ struct FilePreviewView: View {
 
     private var editor: some View {
         TextEditor(text: $draft)
-            .font(.system(.body, design: .monospaced))
+            .font(.system(size: 13 * documentZoom, design: .monospaced))
             .scrollContentBackground(.hidden)
             .padding(8)
     }
 
-    private func load() {
+    private func beginLoad(_ target: URL) {
         loadTask?.cancel()
         highlightTask?.cancel()
-        let target = displayedURL ?? url
+        loadingURL = target
         isLoading = true
+        saveError = nil
         loadTask = Task {
-            let loaded = await Task.detached(priority: .userInitiated) {
-                FilePreviewContent.load(url: target)
+            let snapshot = await Task.detached(priority: .userInitiated) {
+                FilePreviewSnapshot(
+                    content: FilePreviewContent.load(url: target),
+                    modificationDate: FilePreviewDiskState.modificationDate(of: target)
+                )
             }.value
-            guard !Task.isCancelled, target == (displayedURL ?? url) else { return }
-            content = loaded
-            switch loaded {
-            case let .text(text), let .markdown(text):
+            let rich: RichDocumentPayload?
+            if case .docx = snapshot.content {
+                rich = await RichDocumentWorker.shared.load(url: target)
+            } else {
+                rich = nil
+            }
+            guard !Task.isCancelled, loadingURL == target else { return }
+            if case .docx = snapshot.content, rich == nil {
+                content = .unreadable
+                loadedURL = target
+                loadingURL = nil
+                loadedModificationDate = snapshot.modificationDate
+                isLoading = false
+                return
+            }
+            content = snapshot.content
+            switch snapshot.content {
+            case let .text(text), let .markdown(text), let .html(text):
                 draft = text
                 savedText = text
+            case .docx:
+                richDraft = rich?.value ?? NSAttributedString(string: "")
+                savedRichText = rich?.value.copy() as? NSAttributedString ?? NSAttributedString(string: "")
             default:
                 draft = ""
                 savedText = ""
             }
             // Every newly opened file starts in read mode.
             isEditingText = false
+            showMarkdownSource = false
+            documentZoom = 1
+            loadedURL = target
+            loadingURL = nil
+            loadedModificationDate = snapshot.modificationDate
             saveError = nil
             isLoading = false
             refreshHighlight()
@@ -302,7 +546,7 @@ struct FilePreviewView: View {
             highlighted = AttributedString(draft)
             return
         }
-        let ext = (displayedURL ?? url).pathExtension
+        let ext = (loadedURL ?? url).pathExtension
         guard let language = SyntaxHighlighter.language(forExtension: ext) else {
             highlighted = AttributedString(draft)
             return
@@ -318,22 +562,65 @@ struct FilePreviewView: View {
         }
     }
 
-    /// Write the draft to disk. Returns whether the write succeeded, so callers
-    /// gating navigation on a save (the unsaved-changes dialog) never discard
-    /// edits on failure.
-    @discardableResult
-    private func save() -> Bool {
-        do {
-            try draft.write(to: displayedURL ?? url, atomically: true, encoding: .utf8)
-            savedText = draft
-            saveError = nil
-            ToastCenter.shared.show("Saved \((displayedURL ?? url).lastPathComponent)", style: .success)
-            return true
-        } catch {
-            saveError = error.localizedDescription
-            ToastCenter.shared.show(error.localizedDescription, style: .error)
+    /// Save exactly the snapshot currently displayed. `loadedURL` never moves
+    /// until a load finishes, eliminating the old wrong-file race during fast
+    /// tree navigation. The mtime check makes concurrent agent edits explicit.
+    private func save(force: Bool = false, advancePendingAction: Bool = false) {
+        guard let target = loadedURL, !isSaving else { return }
+        let expectedDate = loadedModificationDate
+        let textSnapshot = draft
+        let richSnapshot = RichDocumentPayload(
+            value: richDraft.copy() as? NSAttributedString ?? richDraft
+        )
+        let savingRichDocument: Bool = {
+            if case .docx = content { return true }
             return false
+        }()
+
+        isSaving = true
+        saveTask?.cancel()
+        saveTask = Task {
+            let result: FilePreviewSaveResult
+            if savingRichDocument {
+                result = await RichDocumentWorker.shared.write(
+                    richSnapshot,
+                    to: target,
+                    expectedModificationDate: expectedDate,
+                    force: force
+                )
+            } else {
+                result = await Task.detached(priority: .userInitiated) {
+                    FilePreviewDiskState.writeText(
+                        textSnapshot,
+                        to: target,
+                        expectedModificationDate: expectedDate,
+                        force: force
+                    )
+                }.value
+            }
+            guard !Task.isCancelled, loadedURL == target else { return }
+            isSaving = false
+            saveTask = nil
+            switch result {
+            case let .saved(modificationDate):
+                loadedModificationDate = modificationDate
+                if savingRichDocument { savedRichText = richSnapshot.value }
+                else { savedText = textSnapshot }
+                if case .html = content { previewRevision &+= 1 }
+                saveError = nil
+                ToastCenter.shared.show("Saved \(target.lastPathComponent)", style: .success)
+                if advancePendingAction { completePendingAction() }
+            case .changedOnDisk:
+                showExternalChangePrompt = true
+            case let .failed(message):
+                saveError = message
+                ToastCenter.shared.show(message, style: .error)
+            }
         }
+    }
+
+    private func adjustZoom(_ delta: CGFloat) {
+        documentZoom = min(2, max(0.65, ((documentZoom + delta) * 10).rounded() / 10))
     }
 
     /// Markdown → AttributedString with a plain-text fallback so a parse
@@ -344,6 +631,158 @@ struct FilePreviewView: View {
             markdown: text,
             options: AttributedString.MarkdownParsingOptions(interpretedSyntax: .full)
         )) ?? AttributedString(text)
+    }
+}
+
+/// Native rich-text editor for Office Open XML documents. NSTextView preserves
+/// formatting and provides undo, find, selection, spell checking, and familiar
+/// macOS editing semantics; the surrounding neutral canvas gives the document
+/// a quiet page-like surface rather than another dense application toolbar.
+private struct RichDocumentEditor: NSViewRepresentable {
+    @Binding var text: NSAttributedString
+    let zoom: CGFloat
+    let command: RichDocumentCommand?
+
+    func makeCoordinator() -> Coordinator {
+        Coordinator(text: $text)
+    }
+
+    func makeNSView(context: Context) -> NSScrollView {
+        let scrollView = NSScrollView()
+        scrollView.hasVerticalScroller = true
+        scrollView.hasHorizontalScroller = false
+        scrollView.autohidesScrollers = true
+        scrollView.drawsBackground = true
+        scrollView.backgroundColor = .textBackgroundColor
+        scrollView.allowsMagnification = true
+        scrollView.minMagnification = 0.65
+        scrollView.maxMagnification = 2
+
+        let textView = NSTextView(frame: .zero)
+        textView.delegate = context.coordinator
+        textView.isEditable = true
+        textView.isSelectable = true
+        textView.isRichText = true
+        textView.importsGraphics = true
+        textView.allowsUndo = true
+        textView.usesFindBar = true
+        textView.isAutomaticSpellingCorrectionEnabled = true
+        textView.isAutomaticQuoteSubstitutionEnabled = true
+        textView.isVerticallyResizable = true
+        textView.isHorizontallyResizable = false
+        textView.autoresizingMask = [.width]
+        textView.textContainerInset = NSSize(width: 34, height: 30)
+        textView.backgroundColor = .textBackgroundColor
+        textView.textStorage?.setAttributedString(text)
+        textView.minSize = NSSize(width: 0, height: 0)
+        textView.maxSize = NSSize(
+            width: CGFloat.greatestFiniteMagnitude,
+            height: CGFloat.greatestFiniteMagnitude
+        )
+        textView.textContainer?.containerSize = NSSize(
+            width: 0,
+            height: CGFloat.greatestFiniteMagnitude
+        )
+        textView.textContainer?.widthTracksTextView = true
+        scrollView.documentView = textView
+        scrollView.magnification = zoom
+        context.coordinator.textView = textView
+        return scrollView
+    }
+
+    func updateNSView(_ scrollView: NSScrollView, context: Context) {
+        guard let textView = context.coordinator.textView else { return }
+        if !textView.attributedString().isEqual(to: text) {
+            let selection = textView.selectedRange()
+            context.coordinator.isApplyingExternalValue = true
+            textView.textStorage?.setAttributedString(text)
+            textView.setSelectedRange(NSIntersectionRange(
+                selection,
+                NSRange(location: 0, length: text.length)
+            ))
+            context.coordinator.isApplyingExternalValue = false
+        }
+        if abs(scrollView.magnification - zoom) > 0.001 {
+            scrollView.setMagnification(zoom, centeredAt: NSPoint(
+                x: scrollView.contentView.bounds.midX,
+                y: scrollView.contentView.bounds.midY
+            ))
+        }
+        if let command, context.coordinator.lastCommandID != command.id {
+            context.coordinator.lastCommandID = command.id
+            context.coordinator.apply(command.kind)
+        }
+    }
+
+    @MainActor
+    final class Coordinator: NSObject, NSTextViewDelegate {
+        @Binding var text: NSAttributedString
+        weak var textView: NSTextView?
+        var isApplyingExternalValue = false
+        var lastCommandID: UUID?
+
+        init(text: Binding<NSAttributedString>) {
+            _text = text
+        }
+
+        func textDidChange(_ notification: Notification) {
+            guard !isApplyingExternalValue,
+                  let textView = notification.object as? NSTextView else { return }
+            publish(textView)
+        }
+
+        func apply(_ command: RichDocumentCommand.Kind) {
+            guard let textView, let storage = textView.textStorage else { return }
+            let selection = textView.selectedRange()
+            switch command {
+            case .bold:
+                applyFontTrait(.boldFontMask, to: textView, storage: storage, selection: selection)
+            case .italic:
+                applyFontTrait(.italicFontMask, to: textView, storage: storage, selection: selection)
+            case .underline:
+                if selection.length > 0 {
+                    storage.addAttribute(.underlineStyle, value: NSUnderlineStyle.single.rawValue, range: selection)
+                } else {
+                    textView.typingAttributes[.underlineStyle] = NSUnderlineStyle.single.rawValue
+                }
+            case .heading:
+                let font = NSFont.systemFont(ofSize: 22, weight: .semibold)
+                if selection.length > 0 { storage.addAttribute(.font, value: font, range: selection) }
+                else { textView.typingAttributes[.font] = font }
+            case .bulletList:
+                let paragraphRange = (textView.string as NSString).paragraphRange(for: selection)
+                let source = (textView.string as NSString).substring(with: paragraphRange)
+                let bulleted = source.split(separator: "\n", omittingEmptySubsequences: false)
+                    .map { $0.isEmpty ? "" : "• \($0)" }
+                    .joined(separator: "\n")
+                textView.insertText(bulleted, replacementRange: paragraphRange)
+            }
+            publish(textView)
+        }
+
+        private func applyFontTrait(
+            _ trait: NSFontTraitMask,
+            to textView: NSTextView,
+            storage: NSTextStorage,
+            selection: NSRange
+        ) {
+            let manager = NSFontManager.shared
+            if selection.length == 0 {
+                let current = textView.typingAttributes[.font] as? NSFont
+                    ?? NSFont.systemFont(ofSize: NSFont.systemFontSize)
+                textView.typingAttributes[.font] = manager.convert(current, toHaveTrait: trait)
+                return
+            }
+            storage.enumerateAttribute(.font, in: selection) { value, range, _ in
+                let current = value as? NSFont ?? NSFont.systemFont(ofSize: NSFont.systemFontSize)
+                storage.addAttribute(.font, value: manager.convert(current, toHaveTrait: trait), range: range)
+            }
+        }
+
+        private func publish(_ textView: NSTextView) {
+            text = textView.attributedString().copy() as? NSAttributedString
+                ?? NSAttributedString(string: textView.string)
+        }
     }
 }
 
@@ -586,20 +1025,21 @@ struct MarkdownDocument: Equatable, Sendable {
 
 private struct MarkdownDocumentView: View {
     let source: String
+    let zoom: CGFloat
 
     private var document: MarkdownDocument { MarkdownDocument.parse(source) }
 
     var body: some View {
         ScrollView {
-            LazyVStack(alignment: .leading, spacing: 14) {
+            LazyVStack(alignment: .leading, spacing: 14 * zoom) {
                 ForEach(Array(document.blocks.enumerated()), id: \.offset) { _, block in
                     blockView(block)
                 }
             }
-            .frame(maxWidth: 880, alignment: .leading)
+            .frame(maxWidth: 880 * zoom, alignment: .leading)
             .frame(maxWidth: .infinity, alignment: .leading)
-            .padding(.horizontal, 28)
-            .padding(.vertical, 24)
+            .padding(.horizontal, 28 * zoom)
+            .padding(.vertical, 24 * zoom)
         }
         .textSelection(.enabled)
     }
@@ -613,23 +1053,24 @@ private struct MarkdownDocumentView: View {
                 .padding(.top, level <= 2 ? 8 : 2)
         case let .paragraph(text):
             Text(inline(text))
-                .font(.body)
-                .lineSpacing(4)
+                .font(.system(size: 14 * zoom))
+                .lineSpacing(4 * zoom)
         case let .listItem(indent, marker, text):
             HStack(alignment: .firstTextBaseline, spacing: 9) {
                 Text(marker)
-                    .font(.body.monospacedDigit())
+                    .font(.system(size: 14 * zoom, design: .monospaced))
                     .foregroundStyle(.secondary)
                     .frame(minWidth: 18, alignment: .trailing)
-                Text(inline(text)).lineSpacing(3)
+                Text(inline(text)).font(.system(size: 14 * zoom)).lineSpacing(3 * zoom)
             }
-            .padding(.leading, CGFloat(indent) * 20)
+            .padding(.leading, CGFloat(indent) * 20 * zoom)
         case let .quote(text):
             HStack(alignment: .top, spacing: 12) {
                 RoundedRectangle(cornerRadius: 2)
                     .fill(Color.accentColor.opacity(0.75))
                     .frame(width: 3)
                 Text(inline(text))
+                    .font(.system(size: 14 * zoom))
                     .italic()
                     .foregroundStyle(.secondary)
                     .lineSpacing(4)
@@ -646,15 +1087,15 @@ private struct MarkdownDocumentView: View {
                 }
                 ScrollView(.horizontal, showsIndicators: false) {
                     Text(verbatim: text)
-                        .font(.system(.callout, design: .monospaced))
-                        .lineSpacing(3)
-                        .padding(12)
+                        .font(.system(size: 13 * zoom, design: .monospaced))
+                        .lineSpacing(3 * zoom)
+                        .padding(12 * zoom)
                 }
             }
             .background(.quaternary.opacity(0.55), in: RoundedRectangle(cornerRadius: 10))
             .overlay(RoundedRectangle(cornerRadius: 10).strokeBorder(.quaternary))
         case let .table(headers, rows):
-            MarkdownTable(headers: headers, rows: rows)
+            MarkdownTable(headers: headers, rows: rows, zoom: zoom)
         case .rule:
             Divider().padding(.vertical, 4)
         }
@@ -669,11 +1110,11 @@ private struct MarkdownDocumentView: View {
 
     private func headingFont(_ level: Int) -> Font {
         switch level {
-        case 1: .largeTitle.bold()
-        case 2: .title.bold()
-        case 3: .title2.weight(.semibold)
-        case 4: .title3.weight(.semibold)
-        default: .headline
+        case 1: .system(size: 30 * zoom, weight: .bold)
+        case 2: .system(size: 24 * zoom, weight: .bold)
+        case 3: .system(size: 20 * zoom, weight: .semibold)
+        case 4: .system(size: 17 * zoom, weight: .semibold)
+        default: .system(size: 15 * zoom, weight: .semibold)
         }
     }
 }
@@ -681,6 +1122,7 @@ private struct MarkdownDocumentView: View {
 private struct MarkdownTable: View {
     let headers: [String]
     let rows: [[String]]
+    let zoom: CGFloat
 
     var body: some View {
         ScrollView(.horizontal, showsIndicators: false) {
@@ -700,10 +1142,10 @@ private struct MarkdownTable: View {
     private func cells(_ values: [String], header: Bool) -> some View {
         ForEach(Array(values.enumerated()), id: \.offset) { _, value in
             Text(value)
-                .font(header ? .callout.weight(.semibold) : .callout)
-                .frame(minWidth: 100, maxWidth: 280, alignment: .leading)
-                .padding(.horizontal, 10)
-                .padding(.vertical, 8)
+                .font(.system(size: 13 * zoom, weight: header ? .semibold : .regular))
+                .frame(minWidth: 100 * zoom, maxWidth: 280 * zoom, alignment: .leading)
+                .padding(.horizontal, 10 * zoom)
+                .padding(.vertical, 8 * zoom)
                 .background(header ? Color.primary.opacity(0.07) : .clear)
                 .overlay(alignment: .trailing) { Divider() }
         }
@@ -756,15 +1198,16 @@ struct WorkspaceRailView: View {
                     .accessibilityLabel("Close file browser")
             }
             .padding(.horizontal, 9)
-            .frame(height: 32)
-            .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 9, style: .continuous))
+            .frame(height: 28)
+            .background(.thinMaterial, in: Capsule(style: .continuous))
             .overlay {
-                RoundedRectangle(cornerRadius: 9, style: .continuous)
-                    .stroke(Color.primary.opacity(0.09), lineWidth: 0.8)
+                Capsule(style: .continuous)
+                    .stroke(Color.primary.opacity(0.11), lineWidth: 0.75)
             }
-            .padding(.horizontal, 7)
-            .padding(.top, 7)
-            .padding(.bottom, 5)
+            .shadow(color: .black.opacity(0.035), radius: 2, y: 1)
+            .padding(.horizontal, 5)
+            .padding(.top, 4)
+            .padding(.bottom, 4)
 
             HStack(spacing: 6) {
                 Image(systemName: "magnifyingglass")
@@ -775,9 +1218,9 @@ struct WorkspaceRailView: View {
             }
             .padding(.horizontal, 8)
             .frame(height: 27)
-            .background(.quaternary.opacity(0.42), in: RoundedRectangle(cornerRadius: 9, style: .continuous))
-            .padding(.horizontal, 8)
-            .padding(.bottom, 7)
+            .background(.quaternary.opacity(0.38), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+            .padding(.horizontal, 6)
+            .padding(.bottom, 5)
 
             if searchText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                 ScrollView {
@@ -786,6 +1229,7 @@ struct WorkspaceRailView: View {
                     }
                     .padding(.vertical, 6)
                 }
+                .scrollBounceBehavior(.basedOnSize)
             } else if tree.isSearching {
                 VStack(spacing: 10) {
                     ProgressView().controlSize(.small)
@@ -820,17 +1264,14 @@ struct WorkspaceRailView: View {
                     }
                     .padding(.vertical, 5)
                 }
+                .scrollBounceBehavior(.basedOnSize)
             }
         }
-        .frame(minWidth: 205, maxWidth: .infinity, maxHeight: .infinity)
+        // The persisted preference stays at least 188 pt, but the responsive
+        // shell may temporarily compress Files to 150 pt at minimum window size.
+        .frame(minWidth: 150, maxWidth: .infinity, maxHeight: .infinity)
         .background {
             SidebarBackdropView(appearance: settings.sidebarAppearance)
-        }
-        .overlay(alignment: .leading) {
-            Rectangle()
-                .fill(Color(nsColor: .separatorColor).opacity(0.8))
-                .frame(width: 1)
-                .shadow(color: .black.opacity(0.12), radius: 2, x: -1)
         }
         .task { tree.load(root) }
         .onChange(of: searchText) { _, query in tree.search(query) }

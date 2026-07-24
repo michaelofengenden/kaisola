@@ -149,7 +149,9 @@ final class WorkspaceTreeModel: ObservableObject {
     func refresh(expandedDirectories: [URL]) {
         for task in directoryTasks.values { task.cancel() }
         directoryTasks.removeAll()
-        childrenByDirectory.removeAll()
+        // Keep the last complete snapshot visible while refreshed directories
+        // load. Clearing it caused an avoidable blank-frame flicker on every
+        // agent filesystem event.
         loadingDirectories.removeAll()
         for directory in [root] + expandedDirectories { load(directory, force: true) }
     }

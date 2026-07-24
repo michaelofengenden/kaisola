@@ -45,6 +45,10 @@ final class WorkspaceFilesTests: XCTestCase {
         XCTAssertEqual(FilePreviewContent.load(url: root.appendingPathComponent("README.md")), .markdown("hello"))
         XCTAssertEqual(FilePreviewContent.load(url: root.appendingPathComponent("src/main.swift")), .text("swift"))
 
+        let html = root.appendingPathComponent("preview.html")
+        try "<h1>Hello</h1>".write(to: html, atomically: true, encoding: .utf8)
+        XCTAssertEqual(FilePreviewContent.load(url: html), .html("<h1>Hello</h1>"))
+
         let binary = root.appendingPathComponent("blob.bin")
         try Data([0xFF, 0xFE, 0x00, 0x81]).write(to: binary)
         XCTAssertEqual(FilePreviewContent.load(url: binary), .binary)
@@ -56,11 +60,37 @@ final class WorkspaceFilesTests: XCTestCase {
         XCTAssertEqual(FilePreviewContent.load(url: root.appendingPathComponent("missing.txt")), .unreadable)
     }
 
+    func testDocxClassificationAndRichTextRoundTrip() throws {
+        let file = root.appendingPathComponent("notes.docx")
+        let source = NSAttributedString(string: "Editable native document")
+        try RichDocumentIO.write(source, to: file)
+
+        XCTAssertEqual(FilePreviewContent.load(url: file), .docx)
+        XCTAssertEqual(
+            RichDocumentIO.load(url: file)?.value.string.trimmingCharacters(in: .newlines),
+            source.string
+        )
+    }
+
     func testOversizedFileReportsTooLarge() throws {
         let big = root.appendingPathComponent("big.txt")
         let bytes = FilePreviewContent.maxTextBytes + 1
         try Data(repeating: 0x61, count: bytes).write(to: big)
         XCTAssertEqual(FilePreviewContent.load(url: big), .tooLarge(bytes))
+    }
+
+    func testPreviewDetectsAnExternalEditBeforeSaving() throws {
+        let file = root.appendingPathComponent("external-edit.txt")
+        try "first".write(to: file, atomically: true, encoding: .utf8)
+        let openedAt = FilePreviewDiskState.modificationDate(of: file)
+        XCTAssertFalse(FilePreviewDiskState.changed(onDisk: file, since: openedAt))
+
+        try "agent edit".write(to: file, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes(
+            [.modificationDate: Date().addingTimeInterval(5)],
+            ofItemAtPath: file.path
+        )
+        XCTAssertTrue(FilePreviewDiskState.changed(onDisk: file, since: openedAt))
     }
 
     func testMarkdownRenderFallsBackToPlainText() {

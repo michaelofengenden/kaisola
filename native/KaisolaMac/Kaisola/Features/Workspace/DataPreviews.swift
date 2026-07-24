@@ -484,62 +484,48 @@ private struct JsonNodeRow: View {
 // MARK: - HTML
 
 /// Renders a local `.html`/`.htm` file in an ephemeral WKWebView. Project-local
-/// assets and scripts work by default, the header exposes an immediate JS kill
-/// switch, and top-level navigation remains confined to the project root.
+/// assets work by default, while project JavaScript requires an explicit opt-in
+/// from the preview menu. Top-level navigation remains confined to the project.
 /// Explicit external links are handed to the system browser. This is embedded
 /// in `FilePreviewView`, which supplies the outer file chrome.
 struct HtmlFilePreview: View {
     let fileURL: URL
     let readAccessRoot: URL?
+    let zoom: CGFloat
+    let contentRevision: Int
 
     @State private var reloadToken = 0
-    @State private var allowsJavaScript = true
+    @State private var allowsJavaScript = false
 
     var body: some View {
-        VStack(spacing: 0) {
-            header
-            Divider()
+        ZStack(alignment: .topTrailing) {
             ConfinedFileWebView(
                 fileURL: fileURL,
                 readAccessRoot: readAccessRoot,
                 allowsJavaScript: allowsJavaScript,
-                reloadToken: reloadToken
+                reloadToken: reloadToken &+ contentRevision,
+                zoom: zoom
             )
             .id("\(fileURL.path)|js:\(allowsJavaScript)")
+
+            Menu {
+                Toggle("Allow project JavaScript", isOn: $allowsJavaScript)
+                Button("Reload") { reloadToken &+= 1 }
+                Divider()
+                Button("Open in Browser") { NSWorkspace.shared.open(fileURL) }
+            } label: {
+                Image(systemName: "ellipsis")
+                    .font(.caption.weight(.semibold))
+                    .frame(width: 27, height: 22)
+                    .background(.regularMaterial, in: Capsule())
+                    .overlay(Capsule().stroke(Color.primary.opacity(0.10), lineWidth: 0.7))
+            }
+            .menuStyle(.borderlessButton)
+            .menuIndicator(.hidden)
+            .help("HTML preview options")
+            .padding(8)
         }
         .background(Color(nsColor: .windowBackgroundColor))
-    }
-
-    private var header: some View {
-        HStack(spacing: 10) {
-            Image(systemName: "chevron.left.forwardslash.chevron.right")
-                .foregroundStyle(.secondary)
-            Text("Interactive HTML · isolated")
-                .font(.subheadline.weight(.medium))
-            Text(fileURL.lastPathComponent)
-                .font(.subheadline)
-                .foregroundStyle(.secondary)
-                .lineLimit(1)
-                .truncationMode(.middle)
-            Spacer(minLength: 12)
-            Toggle("JS", isOn: $allowsJavaScript)
-                .toggleStyle(.switch)
-                .controlSize(.mini)
-                .help("Allow scripts from this local project preview")
-            Button {
-                reloadToken &+= 1
-            } label: {
-                Image(systemName: "arrow.clockwise")
-            }
-            .buttonStyle(.borderless)
-            .help("Reload this page")
-            Button("Open in Browser") {
-                NSWorkspace.shared.open(fileURL)
-            }
-            .help("Open this file in your default browser")
-        }
-        .padding(.horizontal, 14)
-        .frame(height: 42)
     }
 }
 
@@ -552,6 +538,7 @@ private struct ConfinedFileWebView: NSViewRepresentable {
     let readAccessRoot: URL?
     let allowsJavaScript: Bool
     let reloadToken: Int
+    let zoom: CGFloat
 
     func makeCoordinator() -> Coordinator {
         Coordinator()
@@ -561,9 +548,8 @@ private struct ConfinedFileWebView: NSViewRepresentable {
         let configuration = WKWebViewConfiguration()
         // Ephemeral: rendering a local file must not touch on-disk cookies/cache.
         configuration.websiteDataStore = .nonPersistent()
-        // The web view is ephemeral and file-confined. Interactive mode is on
-        // by default so local app previews render like their Electron iframe;
-        // the header exposes a one-click JS kill switch.
+        // The web view is ephemeral and file-confined. Script execution remains
+        // off until the user opts in from the visible preview menu.
         let pagePreferences = WKWebpagePreferences()
         pagePreferences.allowsContentJavaScript = allowsJavaScript
         configuration.defaultWebpagePreferences = pagePreferences
@@ -572,6 +558,7 @@ private struct ConfinedFileWebView: NSViewRepresentable {
         let webView = WKWebView(frame: .zero, configuration: configuration)
         webView.navigationDelegate = context.coordinator
         webView.setValue(false, forKey: "drawsBackground")
+        webView.pageZoom = zoom
 
         let directory = effectiveReadAccessRoot
         let coordinator = context.coordinator
@@ -584,6 +571,9 @@ private struct ConfinedFileWebView: NSViewRepresentable {
 
     func updateNSView(_ webView: WKWebView, context: Context) {
         let coordinator = context.coordinator
+        if abs(webView.pageZoom - zoom) > 0.001 {
+            webView.pageZoom = zoom
+        }
         // Retargeted at a different file (the pane was reused for another doc).
         if coordinator.loadedURL != fileURL {
             let directory = effectiveReadAccessRoot

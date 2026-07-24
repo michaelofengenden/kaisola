@@ -147,12 +147,33 @@ final class NativePreviewSettings: ObservableObject {
                 workspaceRailWidth = clamped
                 return
             }
-            defaults.set(clamped, forKey: Keys.workspaceRailWidth)
+            if !defersPanelPersistence {
+                defaults.set(clamped, forKey: Keys.workspaceRailWidth)
+            }
         }
     }
 
-    static let workspaceRailWidthRange: ClosedRange<Double> = 205...360
-    static let workspaceRailWidthDefault: Double = 248
+    static let workspaceRailWidthRange: ClosedRange<Double> = 188...330
+    static let workspaceRailWidthDefault: Double = 218
+
+    /// Width of the document preview beside the active terminal/chat. App-owned
+    /// sizing avoids HSplitView's stale autosaved dividers and gives us a broad,
+    /// discoverable hit target without drawing a heavy separator.
+    @Published var filePreviewWidth: Double {
+        didSet {
+            let clamped = Self.clampedFilePreviewWidth(filePreviewWidth)
+            if clamped != filePreviewWidth {
+                filePreviewWidth = clamped
+                return
+            }
+            if !defersPanelPersistence {
+                defaults.set(clamped, forKey: Keys.filePreviewWidth)
+            }
+        }
+    }
+
+    static let filePreviewWidthRange: ClosedRange<Double> = 300...920
+    static let filePreviewWidthDefault: Double = 480
 
     /// Sensitive-file globs the guardrails enforce (always prompt, never
     /// rule-coverable, fs bridge refuses them). Editable in Settings.
@@ -202,6 +223,19 @@ final class NativePreviewSettings: ObservableObject {
     }
 
     private let defaults: UserDefaults
+    private var defersPanelPersistence = false
+
+    /// Divider drags update SwiftUI continuously but persist only once at the
+    /// end. This removes synchronous UserDefaults traffic from pointer tracking.
+    func beginPanelResize() {
+        defersPanelPersistence = true
+    }
+
+    func endPanelResize() {
+        defersPanelPersistence = false
+        defaults.set(workspaceRailWidth, forKey: Keys.workspaceRailWidth)
+        defaults.set(filePreviewWidth, forKey: Keys.filePreviewWidth)
+    }
 
     private enum Keys {
         static let layout = "navigationLayout"
@@ -214,6 +248,7 @@ final class NativePreviewSettings: ObservableObject {
         static let terminalPalette = "terminalPalette"
         static let workspaceRail = "workspaceRailVisible"
         static let workspaceRailWidth = "workspaceRailWidth"
+        static let filePreviewWidth = "filePreviewWidth"
         static let sensitiveGlobs = "sensitiveGlobs"
         static let claudeConfigDir = "claudeConfigDir"
         static let codexHome = "codexHome"
@@ -235,6 +270,10 @@ final class NativePreviewSettings: ObservableObject {
         workspaceRailWidth = storedRailWidth > 0
             ? Self.clampedWorkspaceRailWidth(storedRailWidth)
             : Self.workspaceRailWidthDefault
+        let storedPreviewWidth = defaults.double(forKey: Keys.filePreviewWidth)
+        filePreviewWidth = storedPreviewWidth > 0
+            ? Self.clampedFilePreviewWidth(storedPreviewWidth)
+            : Self.filePreviewWidthDefault
         terminalFontFamily = defaults.string(forKey: Keys.terminalFontFamily) ?? TerminalFontOptions.systemMonoSentinel
         terminalFontWeight = defaults.string(forKey: Keys.terminalFontWeight) ?? "regular"
         terminalPalette = defaults.string(forKey: Keys.terminalPalette).flatMap(TerminalPaletteMode.init) ?? .native
@@ -262,6 +301,10 @@ final class NativePreviewSettings: ObservableObject {
 
     static func clampedWorkspaceRailWidth(_ width: Double) -> Double {
         min(max(width, workspaceRailWidthRange.lowerBound), workspaceRailWidthRange.upperBound)
+    }
+
+    static func clampedFilePreviewWidth(_ width: Double) -> Double {
+        min(max(width, filePreviewWidthRange.lowerBound), filePreviewWidthRange.upperBound)
     }
 }
 

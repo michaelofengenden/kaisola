@@ -345,6 +345,16 @@ class ReadOnlyTerminalView: TerminalView {
         if hasUsableRenderGeometry { onUsableLayout?() }
     }
 
+    /// NavigationSplitView may assign a representable's final frame without a
+    /// separate AppKit layout pass. Initial terminal replay cannot depend on
+    /// `layout()` alone or the left-tree surface can remain an empty canvas
+    /// until the user resizes the window. Frame assignment is the earliest
+    /// reliable point at which SwiftTerm has real rows and columns.
+    override func setFrameSize(_ newSize: NSSize) {
+        super.setFrameSize(newSize)
+        if hasUsableRenderGeometry { onUsableLayout?() }
+    }
+
     /// Which palette is installed, so appearance/palette flips reconfigure once.
     private(set) var isLightTheme = false
     private(set) var themeKey = ""

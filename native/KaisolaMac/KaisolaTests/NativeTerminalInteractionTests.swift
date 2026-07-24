@@ -161,6 +161,21 @@ final class NativeTerminalInteractionTests: XCTestCase {
         XCTAssertFalse(coordinator.isAwaitingInitialLayout)
     }
 
+    func testFinalFrameAssignmentFlushesDeferredInitialReplay() {
+        let coordinator = NativeTerminalSurface.Coordinator()
+        let view = ReadOnlyTerminalView(
+            frame: .zero,
+            font: NSFont.monospacedSystemFont(ofSize: 13, weight: .regular)
+        )
+        view.onUsableLayout = { coordinator.flushPendingInitialRender(to: view) }
+        coordinator.apply(output: "ready\r\n", epoch: "epoch-a", endOffset: 7, to: view)
+        XCTAssertTrue(coordinator.isAwaitingInitialLayout)
+
+        view.setFrameSize(NSSize(width: 640, height: 320))
+
+        XCTAssertFalse(coordinator.isAwaitingInitialLayout)
+    }
+
     func testFreshTerminalQueryStillReceivesAReply() {
         let coordinator = NativeTerminalSurface.Coordinator()
         var captured: [String] = []

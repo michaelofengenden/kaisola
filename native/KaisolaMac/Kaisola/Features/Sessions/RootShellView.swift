@@ -321,10 +321,15 @@ struct RootShellView: View {
             .accessibilityLabel("Projects, chats, and terminal sessions")
         } detail: {
             detailPane
-                // The transparent full-size window already provides the native
-                // titlebar hit region. Extending the workspace through its safe
-                // area removes the empty 40pt strip above terminals/previews.
-                .ignoresSafeArea(.container, edges: .top)
+                // Keep representable content (especially SwiftTerm) inside the
+                // hosting view's real layout bounds. Moving the NSView itself
+                // through the titlebar safe area can leave it with a valid frame
+                // that AppKit does not composite after a window transition.
+                // Only the canvas paint extends beneath the transparent titlebar.
+                .background {
+                    WorkspaceBackdropView(mode: settings.workspaceBackdrop)
+                        .ignoresSafeArea(.container, edges: .top)
+                }
         }
         .navigationSplitViewStyle(.balanced)
     }
@@ -1566,16 +1571,9 @@ private struct ConnectionFooter: View {
                         .frame(width: 6, height: 6)
                         .overlay(Circle().stroke(.background, lineWidth: 1.25))
                 }
-                Text("Kaisola")
+                Text("Kaisola · v\(Self.appVersion)")
                     .font(.caption.weight(.semibold))
                     .lineLimit(1)
-                Text("v\(Self.appVersion)")
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
-                Image(systemName: "chevron.up.chevron.down")
-                    .font(.system(size: 8, weight: .semibold))
-                    .foregroundStyle(.tertiary)
             }
             .contentShape(Rectangle())
         }

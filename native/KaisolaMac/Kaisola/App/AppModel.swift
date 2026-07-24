@@ -672,12 +672,12 @@ final class AppModel: ObservableObject {
         selectedSession = sessions[0]
         selectedSessionID = sessions[0].id
 
-        let output = """
-        Last login: Thu Jul 23 17:42:08 on ttys001
-        michael@kaisola Kaisola % git status --short
-         M native/KaisolaMac/Kaisola/Features/Sessions/RootShellView.swift
-        michael@kaisola Kaisola %
-        """
+        let output = [
+            "Last login: Thu Jul 23 17:42:08 on ttys001",
+            "michael@kaisola Kaisola % git status --short",
+            " M native/KaisolaMac/Kaisola/Features/Sessions/RootShellView.swift",
+            "michael@kaisola Kaisola % ",
+        ].joined(separator: "\r\n")
         let byteCount = Int64(output.utf8.count)
         let document = TerminalDocument(
             sessionID: sessions[0].id,

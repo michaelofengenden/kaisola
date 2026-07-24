@@ -1,10 +1,9 @@
 import SwiftUI
 
 /// A slim per-project strip of one-click command buttons (build / test /
-/// dev-server…) plus a gear popover to edit them. Each button runs its action
-/// through `run`; the editor writes straight to `QuickActionStore`. The empty
-/// state is just the gear, so a project with no actions still offers a way to
-/// add its first one.
+/// dev-server…). Each button runs its action through `run`; editing lives in
+/// the project's context menu so an empty project contributes no stray chrome
+/// above the session tabs.
 ///
 /// Actions are read into `@State` on appear and re-read whenever the editor
 /// reports a change (and when the project id changes, since the view is reused
@@ -15,7 +14,6 @@ struct QuickActionsBar: View {
     let run: (QuickAction) -> Void
 
     @State private var actions: [QuickAction] = []
-    @State private var showEditor = false
 
     /// Only actions with a real command earn a button; a half-filled row in the
     /// editor never shows a blank chip in the bar.
@@ -24,41 +22,31 @@ struct QuickActionsBar: View {
     }
 
     var body: some View {
-        ScrollView(.horizontal, showsIndicators: false) {
-            HStack(spacing: 6) {
-                ForEach(runnable) { action in
-                    Button {
-                        run(action)
-                    } label: {
-                        HStack(spacing: 4) {
-                            Image(systemName: "play.fill").font(.system(size: 9))
-                            Text(action.title.isEmpty ? action.command : action.title)
-                                .lineLimit(1)
+        Group {
+            if !runnable.isEmpty {
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(spacing: 6) {
+                        ForEach(runnable) { action in
+                            Button {
+                                run(action)
+                            } label: {
+                                HStack(spacing: 4) {
+                                    Image(systemName: "play.fill").font(.system(size: 9))
+                                    Text(action.title.isEmpty ? action.command : action.title)
+                                        .lineLimit(1)
+                                }
+                                .font(.caption)
+                            }
+                            .buttonStyle(.bordered)
+                            .controlSize(.small)
+                            .help("Run “\(action.command)” in a new terminal in \(projectName)")
                         }
-                        .font(.caption)
+                        Spacer(minLength: 0)
                     }
-                    .buttonStyle(.bordered)
-                    .controlSize(.small)
-                    .help("Run “\(action.command)” in a new terminal in \(projectName)")
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 4)
                 }
-                Button {
-                    showEditor.toggle()
-                } label: {
-                    Image(systemName: "gearshape").font(.caption)
-                }
-                .buttonStyle(.borderless)
-                .controlSize(.small)
-                .help("Edit quick actions for \(projectName)")
-                .accessibilityLabel("Edit quick actions")
-                .popover(isPresented: $showEditor, arrowEdge: .bottom) {
-                    QuickActionsEditor(projectID: projectID, projectName: projectName) {
-                        reload()
-                    }
-                }
-                Spacer(minLength: 0)
             }
-            .padding(.horizontal, 12)
-            .padding(.vertical, 4)
         }
         .onAppear(perform: reload)
         .onChange(of: projectID) { _, _ in reload() }
@@ -73,7 +61,7 @@ struct QuickActionsBar: View {
 /// Add button, capped at eight. Every mutation — field edit, add, delete —
 /// persists immediately to `QuickActionStore` and calls `onSave` so the bar
 /// refreshes its buttons live.
-private struct QuickActionsEditor: View {
+struct QuickActionsEditor: View {
     let projectID: String
     let projectName: String
     let onSave: () -> Void

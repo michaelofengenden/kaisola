@@ -97,6 +97,27 @@ final class WorkspaceFilesTests: XCTestCase {
         XCTAssertTrue(document.blocks.contains(.table(headers: ["Name", "Value"], rows: [["alpha", "1"]])))
     }
 
+    func testMarkdownDocumentTranslatesCommonReadmeHTMLWithoutShowingTags() {
+        let document = MarkdownDocument.parse("""
+        <p align="center">
+          <img src="icon.png" alt="Kaisola icon" />
+        </p>
+
+        <h1 align="center">Kaisola</h1>
+
+        <p align="center">
+          <strong>Your agents. One workspace.</strong><br />
+          <a href="https://kaisola.com">Website</a> · Docs
+        </p>
+        """)
+
+        XCTAssertEqual(document.blocks.first, .heading(level: 1, text: "Kaisola"))
+        XCTAssertTrue(document.blocks.contains(.paragraph(
+            "**Your agents. One workspace.** [Website](https://kaisola.com) · Docs"
+        )))
+        XCTAssertFalse(document.blocks.contains { block in String(describing: block).contains("<") })
+    }
+
     func testDirectorySymlinkIsNotRecursivelyIndexed() throws {
         let loop = root.appendingPathComponent("loop", isDirectory: true)
         try FileManager.default.createSymbolicLink(at: loop, withDestinationURL: root)

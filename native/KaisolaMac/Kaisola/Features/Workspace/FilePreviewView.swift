@@ -388,6 +388,12 @@ struct MarkdownDocument: Equatable, Sendable {
                 index += 1
                 continue
             }
+            if let html = htmlBlock(in: lines, at: index) {
+                flushParagraph()
+                if let block = html.block { blocks.append(block) }
+                index = html.nextIndex
+                continue
+            }
             if trimmed.hasPrefix("```") || trimmed.hasPrefix("~~~") {
                 flushParagraph()
                 let fence = String(trimmed.prefix(3))
@@ -455,6 +461,85 @@ struct MarkdownDocument: Equatable, Sendable {
         }
         flushParagraph()
         return MarkdownDocument(blocks: blocks)
+    }
+
+    /// GitHub READMEs often use a small amount of presentational HTML for
+    /// centered logos, headings, and link rows. Showing those tags verbatim is
+    /// worse than ignoring their alignment, so translate the safe textual
+    /// subset into the same native blocks used for Markdown. Image-only HTML
+    /// is omitted until the native renderer gains workspace-confined embeds.
+    private static func htmlBlock(
+        in lines: [String],
+        at index: Int
+    ) -> (block: Block?, nextIndex: Int)? {
+        let trimmed = lines[index].trimmingCharacters(in: .whitespaces)
+        let lower = trimmed.lowercased()
+
+        for level in 1...6 where lower.hasPrefix("<h\(level)") {
+            let closing = "</h\(level)>"
+            let collected = collectHTML(lines: lines, from: index, closingTag: closing)
+            let text = markdownFromHTML(collected.source)
+            return (
+                text.isEmpty ? nil : .heading(level: level, text: text),
+                collected.nextIndex
+            )
+        }
+
+        if lower.hasPrefix("<p") {
+            let collected = collectHTML(lines: lines, from: index, closingTag: "</p>")
+            let text = markdownFromHTML(collected.source)
+            return (text.isEmpty ? nil : .paragraph(text), collected.nextIndex)
+        }
+
+        if lower.hasPrefix("<img") {
+            return (nil, index + 1)
+        }
+        return nil
+    }
+
+    private static func collectHTML(
+        lines: [String],
+        from start: Int,
+        closingTag: String
+    ) -> (source: String, nextIndex: Int) {
+        var fragments: [String] = []
+        var cursor = start
+        while cursor < lines.count {
+            fragments.append(lines[cursor].trimmingCharacters(in: .whitespaces))
+            cursor += 1
+            if fragments.last?.lowercased().contains(closingTag) == true { break }
+        }
+        return (fragments.joined(separator: " "), cursor)
+    }
+
+    private static func markdownFromHTML(_ html: String) -> String {
+        var value = html
+        value = replacingHTML(value, pattern: #"<a\b[^>]*href=[\"']([^\"']+)[\"'][^>]*>(.*?)</a>"#, with: "[$2]($1)")
+        value = replacingHTML(value, pattern: #"<strong\b[^>]*>(.*?)</strong>"#, with: "**$1**")
+        value = replacingHTML(value, pattern: #"<b\b[^>]*>(.*?)</b>"#, with: "**$1**")
+        value = replacingHTML(value, pattern: #"<em\b[^>]*>(.*?)</em>"#, with: "*$1*")
+        value = replacingHTML(value, pattern: #"<i\b[^>]*>(.*?)</i>"#, with: "*$1*")
+        value = replacingHTML(value, pattern: #"<code\b[^>]*>(.*?)</code>"#, with: "`$1`")
+        value = replacingHTML(value, pattern: #"<img\b[^>]*>"#, with: "")
+        value = replacingHTML(value, pattern: #"<br\s*/?>"#, with: " ")
+        value = replacingHTML(value, pattern: #"<[^>]+>"#, with: "")
+        value = value
+            .replacingOccurrences(of: "&amp;", with: "&")
+            .replacingOccurrences(of: "&lt;", with: "<")
+            .replacingOccurrences(of: "&gt;", with: ">")
+            .replacingOccurrences(of: "&quot;", with: "\"")
+            .replacingOccurrences(of: "&#39;", with: "'")
+        value = replacingHTML(value, pattern: #"\s+"#, with: " ")
+        return value.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private static func replacingHTML(_ value: String, pattern: String, with template: String) -> String {
+        guard let expression = try? NSRegularExpression(
+            pattern: pattern,
+            options: [.caseInsensitive, .dotMatchesLineSeparators]
+        ) else { return value }
+        let range = NSRange(value.startIndex..<value.endIndex, in: value)
+        return expression.stringByReplacingMatches(in: value, range: range, withTemplate: template)
     }
 
     private static func heading(in line: String) -> (level: Int, text: String)? {

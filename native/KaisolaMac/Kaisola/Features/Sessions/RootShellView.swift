@@ -14,6 +14,7 @@ struct RootShellView: View {
     @State private var showOmniBar = false
     @State private var showOnboarding = false
     @State private var showSettings = false
+    @State private var quickActionsTarget: QuickActionsTarget?
     @State private var workspaceRailDragOrigin: Double?
     /// A Close Mesh request whose worktrees still hold uncommitted changes.
     @State private var meshCloseConfirm: (id: String, dirty: Int)?
@@ -123,6 +124,24 @@ struct RootShellView: View {
                 workspace: model.currentProjectDirectory,
                 dismiss: { showSettings = false }
             )
+        }
+        .sheet(item: $quickActionsTarget) { target in
+            VStack(spacing: 0) {
+                HStack {
+                    Text("Quick Actions").font(.headline)
+                    Spacer()
+                    Button("Done") { quickActionsTarget = nil }
+                        .keyboardShortcut(.defaultAction)
+                }
+                .padding(14)
+                Divider()
+                QuickActionsEditor(
+                    projectID: target.id,
+                    projectName: target.name,
+                    onSave: {}
+                )
+                .padding(8)
+            }
         }
     }
 
@@ -327,7 +346,6 @@ struct RootShellView: View {
                 QuickActionsBar(projectID: active.id, projectName: active.name) { action in
                     Task { await model.runQuickAction(action, inProject: activeDir) }
                 }
-                Divider()
             }
             SessionStrip(
                 model: model,
@@ -337,7 +355,10 @@ struct RootShellView: View {
             )
             Divider()
             detailPane
-            footer
+            HStack(spacing: 0) {
+                footer.frame(width: 235)
+                Spacer(minLength: 0)
+            }
         }
     }
 
@@ -401,6 +422,9 @@ struct RootShellView: View {
             if let directory = Self.chooseDirectoryForRelocate() {
                 model.relocateProject(id: project.id, to: directory)
             }
+        }
+        Button("Quick Actions…") {
+            quickActionsTarget = QuickActionsTarget(id: project.id, name: project.name)
         }
         Divider()
         Button("Close Project", role: .destructive) { model.closeProject(id: project.id) }
@@ -1224,6 +1248,11 @@ private struct RenameID: Identifiable { let id: String }
 /// Identifiable wrapper so a repo URL can drive a `.sheet(item:)`.
 private struct GitRepoID: Identifiable { let url: URL; var id: String { url.path } }
 
+private struct QuickActionsTarget: Identifiable {
+    let id: String
+    let name: String
+}
+
 /// Lightweight footer menu item; keeping broker records out of the footer makes
 /// its bottom-left utility shelf purely presentational.
 private struct FooterSplitTarget: Identifiable {
@@ -1376,12 +1405,6 @@ private struct ConnectionFooter: View {
         AgentRegistry.all.filter { AcpAdapter.forAgent($0.id) != nil }
     }
 
-    private static let userName: String = {
-        let fullName = NSFullUserName().trimmingCharacters(in: .whitespacesAndNewlines)
-        if !fullName.isEmpty { return fullName }
-        return ProcessInfo.processInfo.environment["USER"] ?? "Local user"
-    }()
-
     private static let appVersion = Bundle.main.object(
         forInfoDictionaryKey: "CFBundleShortVersionString"
     ) as? String ?? "Dev"
@@ -1446,13 +1469,18 @@ private struct ConnectionFooter: View {
                     } label: {
                         Image(systemName: "circle.hexagongrid.fill")
                             .font(.system(size: 12, weight: .semibold))
-                            .foregroundStyle(.white)
+                            .foregroundStyle(.purple)
                             .frame(width: 27, height: 24)
-                            .background(Color.purple, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
-                            .shadow(color: Color.purple.opacity(0.28), radius: 4, y: 1)
                     }
                     .menuStyle(.borderlessButton)
                     .fixedSize()
+                    .tint(.purple)
+                    .background(Color.purple.opacity(0.18), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+                    .overlay {
+                        RoundedRectangle(cornerRadius: 8, style: .continuous)
+                            .stroke(Color.purple.opacity(0.28), lineWidth: 0.8)
+                    }
+                    .shadow(color: Color.purple.opacity(0.18), radius: 3, y: 1)
                     .help("New Mesh — flat, staged, or idea")
                 }
 
@@ -1538,15 +1566,13 @@ private struct ConnectionFooter: View {
                         .frame(width: 6, height: 6)
                         .overlay(Circle().stroke(.background, lineWidth: 1.25))
                 }
-                VStack(alignment: .leading, spacing: 0) {
-                    Text(Self.userName)
-                        .font(.caption.weight(.semibold))
-                        .lineLimit(1)
-                    Text("Kaisola · v\(Self.appVersion)")
-                        .font(.caption2)
-                        .foregroundStyle(.secondary)
-                        .lineLimit(1)
-                }
+                Text("Kaisola")
+                    .font(.caption.weight(.semibold))
+                    .lineLimit(1)
+                Text("v\(Self.appVersion)")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
                 Image(systemName: "chevron.up.chevron.down")
                     .font(.system(size: 8, weight: .semibold))
                     .foregroundStyle(.tertiary)

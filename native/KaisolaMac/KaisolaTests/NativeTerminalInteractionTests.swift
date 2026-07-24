@@ -15,6 +15,10 @@ final class NativeTerminalInteractionTests: XCTestCase {
         return try XCTUnwrap(editItem.submenu)
     }
 
+    func testTerminalLineSpacingIsComfortableWithoutBecomingLoose() {
+        XCTAssertEqual(NativeTerminalSurface.comfortableLineSpacing, 1.08, accuracy: 0.001)
+    }
+
     func testEditMenuCarriesFindPanelActionsWithSwiftTermTags() throws {
         let menu = KaisolaMacAppDelegate.makeMainMenu(
             updateTarget: nil,

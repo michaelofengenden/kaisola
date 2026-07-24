@@ -53,7 +53,7 @@ final class KaisolaMacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDele
             settings.appearance = .light
             settings.sidebarAppearance = .glass
             settings.workspaceBackdrop = .glass
-            settings.workspaceRailVisible = visualSurface != "topbar"
+            settings.workspaceRailVisible = visualSurface != "topbar" && visualSurface != "terminal-solo"
             settings.workspaceRailWidth = 232
             OnboardingState.markSeen()
         }

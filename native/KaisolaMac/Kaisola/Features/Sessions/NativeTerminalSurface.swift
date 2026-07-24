@@ -11,6 +11,11 @@ extension Notification.Name {
 }
 
 struct NativeTerminalSurface: NSViewRepresentable {
+    /// A restrained increase over SwiftTerm's default metrics keeps dense shell
+    /// output readable while preserving correct cursor, selection, and resize
+    /// geometry inside the terminal renderer itself.
+    static let comfortableLineSpacing: CGFloat = 1.08
+
     let output: String
     let streamEpoch: String?
     let endOffset: Int64?
@@ -39,6 +44,7 @@ struct NativeTerminalSurface: NSViewRepresentable {
         let view: ReadOnlyTerminalView = isOwned
             ? OwnedTerminalView(frame: .zero, font: font)
             : ReadOnlyTerminalView(frame: .zero, font: font)
+        view.lineSpacing = Self.comfortableLineSpacing
         view.terminalDelegate = context.coordinator
         view.configureTerminalTheme(light: lightSurface, mode: paletteMode)
         view.allowMouseReporting = isOwned
@@ -63,6 +69,9 @@ struct NativeTerminalSurface: NSViewRepresentable {
         context.coordinator.onResize = onResize
         context.coordinator.onTitleChange = onTitleChange
         let desired = TerminalFontOptions.resolveFont(family: fontFamily, size: fontSize, weightRaw: fontWeight)
+        if abs(view.lineSpacing - Self.comfortableLineSpacing) > 0.001 {
+            view.lineSpacing = Self.comfortableLineSpacing
+        }
         if view.font.fontName != desired.fontName || abs(view.font.pointSize - desired.pointSize) > 0.1 {
             view.font = desired
         }

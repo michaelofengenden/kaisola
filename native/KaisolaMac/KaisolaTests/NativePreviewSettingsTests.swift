@@ -61,6 +61,13 @@ final class NativePreviewSettingsTests: XCTestCase {
         XCTAssertEqual(TerminalPaneGrid.columns(for: ["a", "b", "c", "d"]), [["a", "b"], ["c", "d"]])
     }
 
+    func testTerminalPaneIdentityHeaderAppearsOnlyForARealSplit() {
+        XCTAssertFalse(TerminalPaneGrid.showsIdentityHeader(paneCount: 0))
+        XCTAssertFalse(TerminalPaneGrid.showsIdentityHeader(paneCount: 1))
+        XCTAssertTrue(TerminalPaneGrid.showsIdentityHeader(paneCount: 2))
+        XCTAssertTrue(TerminalPaneGrid.showsIdentityHeader(paneCount: 4))
+    }
+
     func testTerminalPaneMinimizeKeepsSessionsRunningAndChoosesAVisibleReplacement() {
         XCTAssertEqual(
             TerminalPaneGrid.minimizeAction(targetID: "b", primaryID: "a", splitOrder: ["b", "c"]),

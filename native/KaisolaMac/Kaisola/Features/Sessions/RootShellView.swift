@@ -16,6 +16,7 @@ struct RootShellView: View {
     @State private var showSettings = false
     @State private var quickActionsTarget: QuickActionsTarget?
     @State private var workspaceRailDragOrigin: Double?
+    @State private var hoveredTerminalPaneID: String?
     /// A Close Mesh request whose worktrees still hold uncommitted changes.
     @State private var meshCloseConfirm: (id: String, dirty: Int)?
 
@@ -856,67 +857,140 @@ struct RootShellView: View {
 
     private func terminalPane(_ id: String) -> some View {
         let isPrimary = id == model.terminalDocument.sessionID
-        return VStack(spacing: 0) {
-            HStack(spacing: 7) {
-                Image(systemName: model.agentProfile(for: id)?.symbol ?? "terminal")
-                    .foregroundStyle(Color.accentColor)
-                Text(model.sessionTitle(for: id))
-                    .font(.caption.weight(.semibold))
-                    .lineLimit(1)
-                if model.isOwned(id) {
-                    Text("LIVE")
-                        .font(.system(size: 8, weight: .bold))
-                        .foregroundStyle(.green)
+        let showsIdentityHeader = TerminalPaneGrid.showsIdentityHeader(paneCount: paneIDs.count)
+        let isHovered = hoveredTerminalPaneID == id
+        let cornerRadius: CGFloat = showsIdentityHeader ? 12 : 14
+        return ZStack(alignment: .topTrailing) {
+            VStack(spacing: 0) {
+                if showsIdentityHeader {
+                    terminalPaneHeader(id, isPrimary: isPrimary, isHovered: isHovered)
+                }
+                if isPrimary {
+                    primaryPane
                 } else {
-                    Text("VIEW")
-                        .font(.system(size: 8, weight: .bold))
-                        .foregroundStyle(.secondary)
+                    splitPane(id)
                 }
-                Spacer(minLength: 4)
-                Button {
-                    minimizeTerminalPane(id)
-                } label: {
-                    Image(systemName: "minus")
-                }
-                .buttonStyle(.borderless)
-                .help("Minimize this pane; keep the session running")
-                .accessibilityLabel("Minimize \(model.sessionTitle(for: id)) pane")
-                Button {
-                    KaisolaMacAppDelegate.popOut(sessionID: id)
-                } label: {
-                    Image(systemName: "macwindow.badge.plus")
-                }
-                .buttonStyle(.borderless)
-                .help("Open this session in a new window")
+            }
+
+            if !showsIdentityHeader {
+                soloTerminalControls(id, isHovered: isHovered)
+            }
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .background(Color(nsColor: .textBackgroundColor))
+        .clipShape(RoundedRectangle(cornerRadius: cornerRadius, style: .continuous))
+        .overlay {
+            RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
+                .stroke(Color(nsColor: .separatorColor).opacity(0.48), lineWidth: 0.6)
+        }
+        .padding(showsIdentityHeader ? 5 : 3)
+        .frame(minWidth: 240, idealWidth: 480, maxWidth: .infinity, minHeight: 160, maxHeight: .infinity)
+        .onHover { hovering in
+            if hovering {
+                hoveredTerminalPaneID = id
+            } else if hoveredTerminalPaneID == id {
+                hoveredTerminalPaneID = nil
+            }
+        }
+    }
+
+    /// Session identity is useful only when two or more terminals share the
+    /// canvas. A lone terminal is already named by the selected sidebar row.
+    private func terminalPaneHeader(_ id: String, isPrimary: Bool, isHovered: Bool) -> some View {
+        HStack(spacing: 7) {
+            Image(systemName: model.agentProfile(for: id)?.symbol ?? "terminal")
+                .font(.system(size: 11, weight: .medium))
+                .foregroundStyle(Color.accentColor)
+                .frame(width: 15)
+            Text(model.sessionTitle(for: id))
+                .font(.caption.weight(.semibold))
+                .lineLimit(1)
+            Circle()
+                .fill(model.isOwned(id) ? Color.green : Color.secondary.opacity(0.55))
+                .frame(width: 5, height: 5)
+                .accessibilityLabel(model.isOwned(id) ? "Live" : "View only")
+            Spacer(minLength: 4)
+            terminalPaneButtons(id, isPrimary: isPrimary, revealSecondary: isHovered)
+        }
+        .padding(.horizontal, 9)
+        .frame(height: 27)
+        .background(Color(nsColor: .controlBackgroundColor).opacity(0.58))
+        .overlay(alignment: .bottom) {
+            Rectangle()
+                .fill(Color(nsColor: .separatorColor).opacity(0.42))
+                .frame(height: 0.5)
+        }
+    }
+
+    /// Keep the one essential pane action visible without rebuilding a full
+    /// toolbar. Pop-out appears on hover, matching the Electron session card's
+    /// quiet secondary actions.
+    private func soloTerminalControls(_ id: String, isHovered: Bool) -> some View {
+        HStack(spacing: 1) {
+            minimizeTerminalButton(id)
+            if isHovered {
+                popOutTerminalButton(id)
+                    .transition(.opacity)
+            }
+        }
+        .padding(3)
+        .background(.ultraThinMaterial, in: Capsule())
+        .overlay {
+            Capsule()
+                .stroke(Color(nsColor: .separatorColor).opacity(0.38), lineWidth: 0.5)
+        }
+        .opacity(isHovered ? 1 : 0.58)
+        .padding(8)
+        .animation(.easeOut(duration: 0.12), value: isHovered)
+    }
+
+    private func terminalPaneButtons(_ id: String, isPrimary: Bool, revealSecondary: Bool) -> some View {
+        HStack(spacing: 1) {
+            minimizeTerminalButton(id)
+            if revealSecondary {
+                popOutTerminalButton(id)
                 if !isPrimary {
                     Button {
                         Task { await model.promoteSplit(id) }
                     } label: {
                         Image(systemName: "arrow.up.left")
+                            .frame(width: 22, height: 20)
+                            .contentShape(Rectangle())
                     }
-                    .buttonStyle(.borderless)
+                    .buttonStyle(.plain)
+                    .foregroundStyle(.secondary)
                     .help("Make this the primary session")
                 }
             }
-            .padding(.horizontal, 10)
-            .frame(height: 32)
-            .background(.thinMaterial)
-            Divider().opacity(0.7)
-            if isPrimary {
-                primaryPane
-            } else {
-                splitPane(id)
-            }
         }
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .background(Color(nsColor: .textBackgroundColor))
-        .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
-        .overlay {
-            RoundedRectangle(cornerRadius: 12, style: .continuous)
-                .stroke(Color.primary.opacity(0.10), lineWidth: 0.8)
+        .animation(.easeOut(duration: 0.12), value: revealSecondary)
+    }
+
+    private func minimizeTerminalButton(_ id: String) -> some View {
+        Button {
+            minimizeTerminalPane(id)
+        } label: {
+            Image(systemName: "minus")
+                .frame(width: 22, height: 20)
+                .contentShape(Rectangle())
         }
-        .padding(6)
-        .frame(minWidth: 240, idealWidth: 480, maxWidth: .infinity, minHeight: 160, maxHeight: .infinity)
+        .buttonStyle(.plain)
+        .foregroundStyle(.secondary)
+        .help("Minimize this pane; keep the session running")
+        .accessibilityLabel("Minimize \(model.sessionTitle(for: id)) pane")
+    }
+
+    private func popOutTerminalButton(_ id: String) -> some View {
+        Button {
+            KaisolaMacAppDelegate.popOut(sessionID: id)
+        } label: {
+            Image(systemName: "macwindow.badge.plus")
+                .frame(width: 22, height: 20)
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .foregroundStyle(.secondary)
+        .help("Open this session in a new window")
     }
 
     /// Minimizing is purely a view operation: the broker-backed session keeps
@@ -1048,6 +1122,10 @@ private struct InAppSettingsSheet: View {
 /// Pure layout policy for the terminal card grid. Kept separate from SwiftUI so
 /// pane balancing stays deterministic and directly testable.
 enum TerminalPaneGrid {
+    static func showsIdentityHeader(paneCount: Int) -> Bool {
+        paneCount > 1
+    }
+
     static func columns(for ids: [String]) -> [[String]] {
         guard ids.count > 2 else { return ids.map { [$0] } }
         let midpoint = (ids.count + 1) / 2

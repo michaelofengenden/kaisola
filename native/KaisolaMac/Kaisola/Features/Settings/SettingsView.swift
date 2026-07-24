@@ -22,6 +22,9 @@ struct SettingsView: View {
     /// In-workspace presentation supplies a compact Done action. The standalone
     /// Command-comma window omits it and relies on normal window controls.
     var dismiss: (() -> Void)?
+    /// Hosted visual QA may open one section directly. Normal presentations
+    /// leave this nil and retain the user's interactive selection.
+    var initialSectionID: String?
 
     var body: some View {
         HStack(spacing: 0) {
@@ -53,6 +56,12 @@ struct SettingsView: View {
         }
         .frame(width: 810, height: 540)
         .background(Color(nsColor: .windowBackgroundColor).opacity(0.82))
+        .onAppear {
+            if let initialSectionID,
+               let section = SettingsSection(rawValue: initialSectionID) {
+                selectedSection = section
+            }
+        }
         .task {
             let families = await Task.detached(priority: .utility) {
                 TerminalFontOptions.availableMonospaceFamilies()
@@ -323,7 +332,7 @@ private enum SettingsSection: String, CaseIterable, Identifiable {
         case .mcp: "Workspace tool servers"
         case .agents: "CLI accounts, adapters, and custom agents"
         case .models: "Provider credentials stored in Keychain"
-        case .usage: "Context pressure and session activity"
+        case .usage: "Provider limits and live context"
         }
     }
     var symbol: String {

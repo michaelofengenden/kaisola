@@ -122,12 +122,19 @@ final class KaisolaMacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDele
             }
         }
         let content: AnyView
-        if visualFixture, visualSurface == "settings" {
+        if visualFixture, visualSurface == "settings" || visualSurface == "usage" {
             let workspace = URL(
                 fileURLWithPath: visualWorkspace ?? FileManager.default.currentDirectoryPath,
                 isDirectory: true
             )
-            content = AnyView(SettingsView(settings: settings, workspace: workspace))
+            if visualSurface == "usage" {
+                UsageCenter.shared.loadVisualFixture()
+            }
+            content = AnyView(SettingsView(
+                settings: settings,
+                workspace: workspace,
+                initialSectionID: visualSurface == "usage" ? "usage" : nil
+            ))
         } else {
             content = AnyView(
                 RootShellView()
@@ -136,7 +143,7 @@ final class KaisolaMacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDele
             )
         }
 
-        let visualSettings = visualFixture && visualSurface == "settings"
+        let visualSettings = visualFixture && (visualSurface == "settings" || visualSurface == "usage")
 
         let window = NSWindow(
             contentRect: NSRect(

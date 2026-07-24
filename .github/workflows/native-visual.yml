@@ -41,7 +41,7 @@ jobs:
           CODE_SIGNING_ALLOWED=NO
           build
 
-      - name: Capture terminal, preview, top-tab, Mesh, and Settings states
+      - name: Capture terminal, preview, top-tab, Mesh, Settings, and Usage states
         shell: bash
         run: |
           set -euo pipefail
@@ -50,7 +50,7 @@ jobs:
           output="$RUNNER_TEMP/kaisola-native-screenshots"
           mkdir -p "$output"
 
-          for surface in terminal preview topbar mesh settings; do
+          for surface in terminal preview topbar mesh settings usage; do
             capture="$output/$surface.png"
             env \
               KAISOLA_NATIVE_VISUAL_FIXTURE=1 \

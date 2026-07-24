@@ -167,6 +167,43 @@ final class UsageCenter: ObservableObject {
         }
     }
 
+    /// Deterministic provider cards for the hosted macOS visual job. No local
+    /// account process or credential is touched; production never calls this.
+    func loadVisualFixture() {
+        let reset = Date().addingTimeInterval(7_200).timeIntervalSince1970
+        planUsage = [
+            ProviderPlanUsage(
+                provider: "claude",
+                displayName: "Claude",
+                ok: true,
+                sourceLabel: "Claude Agent SDK 0.3.205",
+                experimental: true,
+                account: nil,
+                plan: "max",
+                windows: [
+                    PlanWindow(label: "5 hour", usedPercent: 38, resetsAt: reset),
+                    PlanWindow(label: "7 day", usedPercent: 16, resetsAt: reset + 338_400),
+                ],
+                message: nil,
+                updatedAt: Date().timeIntervalSince1970 * 1_000
+            ),
+            ProviderPlanUsage(
+                provider: "codex",
+                displayName: "Codex",
+                ok: true,
+                sourceLabel: "Codex CLI app-server",
+                experimental: false,
+                account: nil,
+                plan: "pro",
+                windows: [PlanWindow(label: "5 hour", usedPercent: 24, resetsAt: reset)],
+                message: nil,
+                updatedAt: Date().timeIntervalSince1970 * 1_000
+            ),
+        ]
+        planUsageError = nil
+        isRefreshingPlanUsage = false
+    }
+
     nonisolated static func decodeProviderPlanUsage(_ data: Data) throws -> [ProviderPlanUsage] {
         let envelope = try JSONDecoder().decode(PlanUsageEnvelope.self, from: data)
         if envelope.providers.isEmpty, let error = envelope.error, !error.isEmpty {

@@ -560,12 +560,12 @@ struct RootShellView: View {
         HStack(spacing: 0) {
             HSplitView {
                 detailContent
-                    .frame(minWidth: 420, maxWidth: .infinity, maxHeight: .infinity)
+                    .frame(minWidth: 240, maxWidth: .infinity, maxHeight: .infinity)
                 if let fileURL = model.previewedFileURL {
                     FilePreviewView(url: fileURL, workspaceRoot: model.currentProjectDirectory) {
                         model.closeFilePreview()
                     }
-                    .frame(minWidth: 320, idealWidth: 440, maxWidth: .infinity, maxHeight: .infinity)
+                    .frame(minWidth: 260, idealWidth: 420, maxWidth: .infinity, maxHeight: .infinity)
                 }
             }
             if settings.workspaceRailVisible, let root = model.currentProjectDirectory {
@@ -1433,7 +1433,9 @@ private struct ConnectionFooter: View {
                         .frame(width: 27, height: 24)
                 }
                 .menuStyle(.borderlessButton)
+                .menuIndicator(.hidden)
                 .fixedSize()
+                .tint(.purple)
                 .help("New Mesh — flat, staged, or idea")
             }
         }

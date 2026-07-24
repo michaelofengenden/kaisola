@@ -5,6 +5,7 @@ import SwiftUI
 /// answers, and a worktree diff sheet for judging each agent's edits.
 struct MeshView: View {
     @ObservedObject var mesh: MeshSession
+    @Environment(\.colorScheme) private var colorScheme
     @State private var draft = ""
     @State private var diffColumnID: String?
     @State private var diffText = ""
@@ -43,7 +44,17 @@ struct MeshView: View {
             Divider()
             composer
         }
-        .background(Color(nsColor: .windowBackgroundColor))
+        .background {
+            ZStack {
+                NativeVisualEffectView(material: .underWindowBackground)
+                Color.white.opacity(colorScheme == .light ? 0.68 : 0.025)
+                LinearGradient(
+                    colors: [Color.white.opacity(colorScheme == .light ? 0.20 : 0.02), Color.purple.opacity(0.025), .clear],
+                    startPoint: .topLeading,
+                    endPoint: .bottomTrailing
+                )
+            }
+        }
         .confirmationDialog(
             "Apply this column's diff to the base workspace?",
             isPresented: Binding(
@@ -104,11 +115,51 @@ struct MeshView: View {
                     .font(.caption).foregroundStyle(.orange)
             }
             Spacer()
-            Text("\(mesh.columns.count) agents")
-                .font(.caption).foregroundStyle(.secondary)
+            configurationMenu
         }
-        .padding(.horizontal, 16)
-        .frame(height: 46)
+        .padding(.horizontal, 12)
+        .frame(height: 42)
+        .background(.ultraThinMaterial)
+    }
+
+    private var configurationMenu: some View {
+        Menu {
+            Section("Project") {
+                Label(mesh.baseDirectory.path, systemImage: "folder")
+            }
+            Section("ACP adapters") {
+                if mesh.configuredAgentNames.isEmpty {
+                    Text("No compatible adapters")
+                } else {
+                    ForEach(mesh.configuredAgentNames, id: \.self) { name in
+                        Label(name, systemImage: "checkmark.circle")
+                    }
+                }
+            }
+            Section("MCP servers") {
+                if mesh.configuredMCPServerNames.isEmpty {
+                    Text("No enabled servers")
+                } else {
+                    ForEach(mesh.configuredMCPServerNames, id: \.self) { name in
+                        Label(name, systemImage: "server.rack")
+                    }
+                }
+            }
+        } label: {
+            HStack(spacing: 5) {
+                Image(systemName: "slider.horizontal.3")
+                Text("\(mesh.configuredAgentNames.count) ACP · \(mesh.configuredMCPServerNames.count) MCP")
+            }
+            .font(.caption.weight(.medium))
+            .foregroundStyle(.secondary)
+            .padding(.horizontal, 8)
+            .padding(.vertical, 4)
+            .background(.thinMaterial, in: Capsule())
+            .overlay { Capsule().stroke(Color.primary.opacity(0.08), lineWidth: 0.75) }
+        }
+        .menuStyle(.borderlessButton)
+        .fixedSize()
+        .help("Current project ACP and MCP configuration")
     }
 
     private var composer: some View {
@@ -117,7 +168,7 @@ struct MeshView: View {
                 .textFieldStyle(.plain)
                 .lineLimit(1...6)
                 .padding(8)
-                .background(.quaternary, in: RoundedRectangle(cornerRadius: 8))
+                .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
                 .onSubmit(send)
             Button(action: send) {
                 Image(systemName: "arrow.up.circle.fill")
@@ -126,8 +177,8 @@ struct MeshView: View {
             .disabled(draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
             .help("Fan this prompt out to every column")
         }
-        .padding(12)
-        .background(.bar)
+        .padding(10)
+        .background(.ultraThinMaterial)
     }
 
     private func send() {
@@ -217,7 +268,7 @@ private struct MeshColumnView: View {
             }
             .padding(.horizontal, 10)
             .frame(height: 34)
-            .background(.quaternary.opacity(0.3))
+            .background(.thinMaterial)
             Divider()
             ScrollViewReader { proxy in
                 ScrollView {

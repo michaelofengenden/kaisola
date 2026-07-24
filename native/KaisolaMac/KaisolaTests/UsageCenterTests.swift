@@ -152,4 +152,35 @@ final class UsageCenterTests: XCTestCase {
         center.record(chatID: "b", title: "Bravo", agentID: "codex", usage: 300, max: 1000)
         XCTAssertEqual(center.contextPressure, 0.30, accuracy: 0.0001)
     }
+
+    func testProviderPlanUsageDecodesNeutralBridgeShape() throws {
+        let data = Data(#"""
+        {
+          "providers": [{
+            "provider": "claude",
+            "displayName": "Claude",
+            "ok": true,
+            "sourceLabel": "Claude Agent SDK 0.3.205",
+            "experimental": true,
+            "plan": "max",
+            "windows": [{"label":"5 hour","usedPercent":37.5,"resetsAt":1800000000}],
+            "updatedAt": 1700000000000
+          }]
+        }
+        """#.utf8)
+
+        let providers = try UsageCenter.decodeProviderPlanUsage(data)
+        XCTAssertEqual(providers.count, 1)
+        XCTAssertEqual(providers.first?.provider, "claude")
+        XCTAssertEqual(providers.first?.plan, "max")
+        XCTAssertEqual(providers.first?.windows.first?.usedPercent, 37.5)
+        XCTAssertEqual(providers.first?.windows.first?.resetsAt, 1_800_000_000)
+    }
+
+    func testProviderPlanUsageSurfacesBridgeError() {
+        let data = Data(#"{"providers":[],"error":"helper unavailable"}"#.utf8)
+        XCTAssertThrowsError(try UsageCenter.decodeProviderPlanUsage(data)) { error in
+            XCTAssertTrue(error.localizedDescription.contains("helper unavailable"))
+        }
+    }
 }

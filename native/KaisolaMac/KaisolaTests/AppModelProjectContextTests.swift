@@ -163,5 +163,14 @@ final class AppModelProjectContextTests: XCTestCase {
             ),
             "build"
         )
+        XCTAssertEqual(
+            AppModel.sessionDisplayTitle(
+                for: record,
+                visibleRecords: [record],
+                storedSessions: [],
+                aliases: [record.id: "Deploy console"]
+            ),
+            "Deploy console"
+        )
     }
 }

@@ -67,4 +67,5 @@ test('native broker manifest roles distinguish nested executable code', () => {
   assert.equal(roleFor('bin/kaisola-broker-bootstrap'), 'launch-agent-bootstrap')
   assert.equal(roleFor('lib/node_modules/node-pty/prebuilds/darwin-arm64/pty.node'), 'native-module')
   assert.equal(roleFor('lib/node_modules/node-pty/prebuilds/darwin-arm64/spawn-helper'), 'node-pty-spawn-helper')
+  assert.equal(roleFor('lib/node_modules/@anthropic-ai/claude-agent-sdk/sdk.mjs'), 'broker-javascript')
 })

@@ -16,11 +16,14 @@ const brokerSources = Object.freeze([
   'electron/ipc/brokerWire.cjs',
   'electron/ipc/securityPolicy.cjs',
   'electron/ipc/shellEnv.cjs',
+  'electron/ipc/nativeAgentPaths.cjs',
+  'electron/ipc/usageHandler.cjs',
   'electron/ipc/terminalManager.cjs',
   'electron/ipc/terminalObservers.cjs',
   'electron/ipc/terminalSpool.cjs',
   'electron/companion/protocol.cjs',
   'electron/companion/terminalCursor.cjs',
+  'scripts/native-usage-service.cjs',
 ])
 
 function fail(message) {
@@ -121,7 +124,7 @@ function roleFor(relative) {
   if (relative === 'bin/kaisola-broker-bootstrap') return 'launch-agent-bootstrap'
   if (relative.endsWith('/pty.node')) return 'native-module'
   if (relative.endsWith('/spawn-helper')) return 'node-pty-spawn-helper'
-  if (relative.endsWith('.cjs') || relative.endsWith('.js')) return 'broker-javascript'
+  if (relative.endsWith('.cjs') || relative.endsWith('.js') || relative.endsWith('.mjs')) return 'broker-javascript'
   if (relative.includes('/LICENSE') || relative.startsWith('LICENSES/')) return 'license'
   return 'resource'
 }
@@ -160,6 +163,10 @@ function verifyPackage(root, { requireSignatures = false, policy = readJSON(poli
     fail('helper Node runtime does not match package policy')
   }
   if (manifest.nodePty?.version !== policy.nodePtyVersion) fail('helper node-pty version does not match package policy')
+  if (policy.claudeAgentSDKVersion
+      && manifest.claudeAgentSDK?.version !== policy.claudeAgentSDKVersion) {
+    fail('helper Claude Agent SDK version does not match package policy')
+  }
 
   const actual = new Map(walkFiles(root)
     .filter(({ relative }) => relative !== manifestName)
@@ -276,6 +283,19 @@ function stagePackage({
     copyFile(nodeLicense, path.join(temporary, 'LICENSES', 'Node.js-LICENSE'), 0o644)
     copyFile(path.join(nodePtyRoot, 'LICENSE'), path.join(temporary, 'LICENSES', 'node-pty-LICENSE'), 0o644)
 
+    const claudeSDKRoot = path.join(repoRoot, 'node_modules', '@anthropic-ai', 'claude-agent-sdk')
+    const claudeSDKPackage = readJSON(path.join(claudeSDKRoot, 'package.json'))
+    if (claudeSDKPackage.version !== policy.claudeAgentSDKVersion) {
+      fail('installed Claude Agent SDK does not match helper package policy')
+    }
+    const claudeSDKDestination = path.join(temporary, 'lib', 'node_modules', '@anthropic-ai', 'claude-agent-sdk')
+    copyTree(claudeSDKRoot, claudeSDKDestination)
+    copyFile(
+      path.join(claudeSDKRoot, 'LICENSE.md'),
+      path.join(temporary, 'LICENSES', 'Claude-Agent-SDK-LICENSE.md'),
+      0o644
+    )
+
     if (signIdentity) signNestedCode(temporary, signIdentity, entitlements)
 
     const manifest = createManifest(temporary, {
@@ -285,6 +305,7 @@ function stagePackage({
       brokerProtocol: policy.brokerProtocol,
       node: { version: runtime.version, abi: runtime.abi, architectures: [...runtimeArchitectures].sort() },
       nodePty: { version: nodePtyPackage.version },
+      claudeAgentSDK: { version: claudeSDKPackage.version },
       generatedAt: new Date().toISOString(),
     })
     fs.writeFileSync(path.join(temporary, manifestName), `${JSON.stringify(manifest, null, 2)}\n`, { mode: 0o644 })

@@ -191,6 +191,28 @@ final class NativeSessionStoreTests: XCTestCase {
         XCTAssertEqual(store.projects().count, 1)
     }
 
+    func testObservedSessionAliasPersistsClearsAndIsRemovedWithSession() {
+        store.setSessionAlias("  Build watcher  ", for: "terminal:observed")
+        XCTAssertEqual(
+            NativeSessionStore(fileURL: fileURL).sessionAliases()["terminal:observed"],
+            "Build watcher"
+        )
+        store.setSessionAlias("   ", for: "terminal:observed")
+        XCTAssertNil(store.sessionAliases()["terminal:observed"])
+
+        let session = NativeOwnedSession(
+            id: "term-owned",
+            projectID: "nproj_alias",
+            cwd: "/tmp/alias",
+            title: "Alias",
+            createdAt: 1
+        )
+        store.upsert(session)
+        store.setSessionAlias("Temporary", for: session.id)
+        store.remove(terminalID: session.id)
+        XCTAssertNil(store.sessionAliases()[session.id])
+    }
+
     func testRecoverOwnedSessionsRequiresExactStableOwnerAndKnownProject() throws {
         let project = store.openProject(directory: "/tmp/recover-owned")
         let stableOwnerID = store.ownerID()

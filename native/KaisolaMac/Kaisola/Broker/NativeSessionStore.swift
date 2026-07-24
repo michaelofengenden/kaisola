@@ -71,6 +71,10 @@ struct NativeSessionStore: Sendable {
         var recentFolders: [String]?
         /// The session selected when the app last ran, restored on relaunch.
         var lastSelectedSessionID: String?
+        /// User-facing aliases for sessions that this native install does not
+        /// own (for example an Electron-created terminal).  Ownership still
+        /// gates every broker mutation; aliases are local navigation metadata.
+        var sessionAliases: [String: String]?
     }
 
     private let closedStackCap = 10
@@ -96,6 +100,25 @@ struct NativeSessionStore: Sendable {
 
     func sessions() -> [NativeOwnedSession] {
         read()?.sessions ?? []
+    }
+
+    func sessionAliases() -> [String: String] {
+        read()?.sessionAliases ?? [:]
+    }
+
+    /// Persist or clear a local display alias without touching the PTY or its
+    /// broker-owned title. This makes observed sessions safely renameable.
+    func setSessionAlias(_ title: String?, for terminalID: String) {
+        var payload = read() ?? Payload(ownerID: ownerID(), sessions: [])
+        let trimmed = title?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        var aliases = payload.sessionAliases ?? [:]
+        if trimmed.isEmpty {
+            aliases.removeValue(forKey: terminalID)
+        } else {
+            aliases[terminalID] = trimmed
+        }
+        payload.sessionAliases = aliases.isEmpty ? nil : aliases
+        write(payload)
     }
 
     /// Repair a lost/stale local registry only from the broker's authenticated
@@ -311,6 +334,7 @@ struct NativeSessionStore: Sendable {
     func remove(terminalID: String) {
         guard var payload = read() else { return }
         payload.sessions.removeAll { $0.id == terminalID }
+        payload.sessionAliases?.removeValue(forKey: terminalID)
         write(payload)
     }
 

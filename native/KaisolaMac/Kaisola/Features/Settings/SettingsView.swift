@@ -19,34 +19,39 @@ struct SettingsView: View {
     var updateDetail: String?
     /// The key window's active project (feeds workspace-scoped tabs like MCP).
     var workspace: URL?
+    /// In-workspace presentation supplies a compact Done action. The standalone
+    /// Command-comma window omits it and relies on normal window controls.
+    var dismiss: (() -> Void)?
 
     var body: some View {
         HStack(spacing: 0) {
             settingsNavigation
             Divider()
             VStack(spacing: 0) {
-                HStack(spacing: 12) {
-                    Image(systemName: selectedSection.symbol)
-                        .font(.title2.weight(.medium))
-                        .foregroundStyle(Color.accentColor)
-                        .frame(width: 28)
+                HStack(spacing: 10) {
                     VStack(alignment: .leading, spacing: 2) {
                         Text(selectedSection.title)
-                            .font(.title2.weight(.semibold))
+                            .font(.title3.weight(.semibold))
                         Text(selectedSection.subtitle)
-                            .font(.callout)
+                            .font(.caption)
                             .foregroundStyle(.secondary)
                     }
                     Spacer()
+                    if let dismiss {
+                        Button("Done", action: dismiss)
+                            .buttonStyle(.borderedProminent)
+                            .controlSize(.small)
+                            .keyboardShortcut(.defaultAction)
+                    }
                 }
-                .padding(.horizontal, 28)
-                .frame(height: 82)
+                .padding(.horizontal, 20)
+                .frame(height: 64)
                 Divider().opacity(0.65)
                 settingsContent
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
         }
-        .frame(width: 850, height: 570)
+        .frame(width: 810, height: 540)
         .background(Color(nsColor: .windowBackgroundColor).opacity(0.82))
         .task {
             let families = await Task.detached(priority: .utility) {
@@ -62,14 +67,11 @@ struct SettingsView: View {
                 ZStack {
                     RoundedRectangle(cornerRadius: 9)
                         .fill(Color.accentColor.gradient)
-                    Image(systemName: "k.square.fill")
+                    Image(systemName: "slider.horizontal.3")
                         .foregroundStyle(.white)
                 }
                 .frame(width: 30, height: 30)
-                VStack(alignment: .leading, spacing: 0) {
-                    Text("Kaisola").font(.headline)
-                    Text("Preferences").font(.caption2).foregroundStyle(.secondary)
-                }
+                Text("Settings").font(.headline)
             }
             .padding(.horizontal, 14)
             .padding(.bottom, 16)
@@ -102,9 +104,9 @@ struct SettingsView: View {
                 .foregroundStyle(.tertiary)
                 .padding(.horizontal, 14)
         }
-        .padding(.vertical, 18)
-        .padding(.horizontal, 10)
-        .frame(width: 188)
+        .padding(.vertical, 14)
+        .padding(.horizontal, 8)
+        .frame(width: 176)
         .background {
             ZStack {
                 NativeVisualEffectView(material: .sidebar)
@@ -126,7 +128,7 @@ struct SettingsView: View {
         case .mcp: McpSettingsTab(workspace: workspace).scrollContentBackground(.hidden)
         case .agents: agents.scrollContentBackground(.hidden)
         case .models: ApiKeysSettingsTab().scrollContentBackground(.hidden)
-        case .usage: UsageSettingsTab().scrollContentBackground(.hidden)
+        case .usage: UsageSettingsTab(workspace: workspace).scrollContentBackground(.hidden)
         }
     }
 
@@ -194,7 +196,7 @@ struct SettingsView: View {
                     }
                 }
             }
-            .padding(24)
+            .padding(18)
         }
     }
 
@@ -247,7 +249,7 @@ struct SettingsView: View {
                         .padding(.bottom, 14)
                 }
             }
-            .padding(24)
+            .padding(18)
         }
     }
 

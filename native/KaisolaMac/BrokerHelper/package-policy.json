@@ -1,6 +1,6 @@
 {
   "schemaVersion": 1,
-  "packageVersion": "1.0.0",
+  "packageVersion": "1.1.0",
   "brokerImplementationVersion": 1,
   "brokerProtocol": {
     "minimum": 2,
@@ -21,5 +21,6 @@
       }
     }
   },
-  "nodePtyVersion": "1.1.0"
+  "nodePtyVersion": "1.1.0",
+  "claudeAgentSDKVersion": "0.3.205"
 }

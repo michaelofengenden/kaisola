@@ -68,6 +68,11 @@ final class MeshSession: ObservableObject, Identifiable {
         NativeSessionStore.projectID(forDirectory: baseDirectory.path)
     }
     @Published private(set) var columns: [Column] = []
+    /// Snapshot of the project-scoped ACP adapters and enabled MCP servers
+    /// wired into this run. Exposed in the Mesh header so configuration is
+    /// inspectable instead of being invisible launch state.
+    @Published private(set) var configuredAgentNames: [String] = []
+    @Published private(set) var configuredMCPServerNames: [String] = []
     /// Non-nil when isolation was requested but unavailable (not a repo).
     @Published private(set) var isolationNote: String?
     /// Pipeline phase for the header chip: "Scouting…"/"Executing…" (staged),
@@ -96,6 +101,33 @@ final class MeshSession: ObservableObject, Identifiable {
         self.title = "Mesh · \(baseDirectory.lastPathComponent)"
     }
 
+    /// Broker- and network-free columns for hosted visual QA. This is reachable
+    /// only from the explicit visual-fixture launch path; production Mesh runs
+    /// always go through `start` and current project ACP/MCP configuration.
+    func loadVisualFixture(
+        agents: [AgentProfile] = Array(AgentRegistry.builtIns.prefix(3)),
+        mcpServerNames: [String] = ["filesystem", "github"]
+    ) {
+        configuredAgentNames = agents.map(\.name)
+        configuredMCPServerNames = mcpServerNames
+        columns = agents.map { agent in
+            let conversation = AcpConversation(
+                title: agent.name,
+                command: "/usr/bin/true",
+                arguments: [],
+                cwd: baseDirectory.path
+            )
+            return Column(
+                id: "\(id)-visual-\(agent.id)",
+                agent: agent,
+                role: .peer,
+                conversation: conversation,
+                worktreePath: nil,
+                branch: nil
+            )
+        }
+    }
+
     /// Pure role assignment. `.idea` overrides mode — every column is a read-only
     /// ideator. Otherwise `.flat` → all peers; `.staged` → first agent scouts,
     /// the rest execute. No side effects, no spawning.
@@ -118,17 +150,21 @@ final class MeshSession: ObservableObject, Identifiable {
     /// ideator) always share the base directory.
     func start(agents: [AgentProfile], environment: [String: String] = ProcessInfo.processInfo.environment) async {
         let service = GitService(repoRoot: baseDirectory)
+        // Publish the active project configuration immediately, before the
+        // repo/isolation probe, so the Mesh opens with truthful chrome instead
+        // of briefly reading “0 ACP · 0 MCP”.
+        let serverConfigs = McpConfigStore(workspace: baseDirectory).servers()
+        let mcp = McpConfigStore.jsonValues(serverConfigs)
+        let usable = agents.filter { AcpAdapter.forAgent($0.id, environment: environment) != nil }
+        configuredAgentNames = usable.map(\.name)
+        configuredMCPServerNames = serverConfigs.filter(\.enabled).map(\.name)
         // A git workspace promises isolation; a plain folder never had it.
         // Distinguish the two so a worktree FAILURE in a repo fails closed
         // instead of silently fanning agents into one shared writable tree.
         let baseIsRepo = await Task.detached(priority: .userInitiated) {
             (try? service.status()) != nil
         }.value
-        // MCP servers come from the BASE workspace config, not the worktrees.
-        let mcp = McpConfigStore.jsonValues(McpConfigStore(workspace: baseDirectory).servers())
-        // Filter to adapter-capable agents FIRST so role assignment (first agent
-        // = scout) lines up with the columns that actually get created.
-        let usable = agents.filter { AcpAdapter.forAgent($0.id, environment: environment) != nil }
+        // Filtered adapter order determines role assignment (first = scout).
         for assignment in Self.roles(for: usable, mode: mode, purpose: purpose) {
             let agent = assignment.agent
             // Resolve adapters from the SAME environment the columns run with,

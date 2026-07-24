@@ -5,16 +5,49 @@ import SwiftUI
 /// gauges plus session totals, sourced from `UsageCenter.shared`.
 struct UsageSettingsTab: View {
     @ObservedObject private var usage = UsageCenter.shared
+    let workspace: URL?
 
     var body: some View {
         Form {
+            Section {
+                if usage.isRefreshingPlanUsage, usage.planUsage.isEmpty {
+                    HStack(spacing: 9) {
+                        ProgressView().controlSize(.small)
+                        Text("Reading provider account limits…")
+                            .foregroundStyle(.secondary)
+                    }
+                } else if let error = usage.planUsageError, usage.planUsage.isEmpty {
+                    Label(error, systemImage: "exclamationmark.triangle")
+                        .foregroundStyle(.secondary)
+                } else {
+                    ForEach(usage.planUsage) { provider in
+                        ProviderPlanUsageRow(provider: provider)
+                    }
+                }
+            } header: {
+                HStack {
+                    Text("Account limits")
+                    Spacer()
+                    Button {
+                        usage.refreshPlanUsage(workspace: workspace, force: true)
+                    } label: {
+                        if usage.isRefreshingPlanUsage {
+                            ProgressView().controlSize(.mini)
+                        } else {
+                            Label("Refresh", systemImage: "arrow.clockwise")
+                        }
+                    }
+                    .buttonStyle(.borderless)
+                    .disabled(usage.isRefreshingPlanUsage)
+                }
+            } footer: {
+                Text("Codex uses its read-only app-server. Claude uses the pinned Agent SDK control request; no model prompt is sent.")
+            }
+
             if usage.byChat.isEmpty {
-                Section {
-                    ContentUnavailableView(
-                        "No usage yet",
-                        systemImage: "gauge.with.dots.needle.bottom.50percent",
-                        description: Text("Token usage appears here once an agent chat reports a context window.")
-                    )
+                Section("This app session") {
+                    Label("Context usage appears after an agent chat reports a window.", systemImage: "gauge.with.dots.needle.bottom.50percent")
+                        .foregroundStyle(.secondary)
                 }
             } else {
                 Section("Chats") {
@@ -30,6 +63,9 @@ struct UsageSettingsTab: View {
         }
         .formStyle(.grouped)
         .padding(6)
+        .task(id: workspace?.standardizedFileURL.path) {
+            usage.refreshPlanUsage(workspace: workspace)
+        }
     }
 
     private var totals: some View {
@@ -53,6 +89,81 @@ struct UsageSettingsTab: View {
     /// header's `used/1000)k` formatting).
     static func tokens(_ n: Int) -> String {
         n < 1000 ? "\(n)" : "\(n / 1000)k"
+    }
+}
+
+private struct ProviderPlanUsageRow: View {
+    let provider: UsageCenter.ProviderPlanUsage
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(alignment: .firstTextBaseline) {
+                Text(provider.displayName)
+                    .font(.callout.weight(.semibold))
+                if let plan = provider.plan, !plan.isEmpty {
+                    Text(plan.capitalized)
+                        .font(.caption.weight(.medium))
+                        .foregroundStyle(.secondary)
+                        .padding(.horizontal, 6)
+                        .padding(.vertical, 2)
+                        .background(.quaternary, in: Capsule())
+                }
+                Spacer()
+                Text(provider.sourceLabel)
+                    .font(.caption2)
+                    .foregroundStyle(.tertiary)
+            }
+            if let account = provider.account, !account.isEmpty {
+                Text(account)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+            }
+            if provider.windows.isEmpty {
+                Label(provider.message ?? "No limit windows available.", systemImage: provider.ok ? "info.circle" : "exclamationmark.circle")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            } else {
+                ForEach(provider.windows) { window in
+                    ProviderPlanWindowRow(window: window)
+                }
+            }
+        }
+        .padding(.vertical, 4)
+    }
+}
+
+private struct ProviderPlanWindowRow: View {
+    let window: UsageCenter.PlanWindow
+
+    private var fraction: Double {
+        min(max((window.usedPercent ?? 0) / 100, 0), 1)
+    }
+
+    var body: some View {
+        VStack(spacing: 4) {
+            HStack {
+                Text(window.label)
+                    .font(.caption)
+                Spacer()
+                if let used = window.usedPercent {
+                    Text("\(Int(used.rounded()))% used")
+                        .font(.caption.monospacedDigit())
+                        .foregroundStyle(.secondary)
+                }
+                if let resetsAt = window.resetsAt {
+                    Text("resets")
+                        .font(.caption2)
+                        .foregroundStyle(.tertiary)
+                    Text(Date(timeIntervalSince1970: resetsAt), style: .relative)
+                        .font(.caption2.monospacedDigit())
+                        .foregroundStyle(.tertiary)
+                }
+            }
+            ProgressView(value: fraction)
+                .tint(fraction >= 0.85 ? .orange : .accentColor)
+        }
     }
 }
 

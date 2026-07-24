@@ -65,8 +65,8 @@ final class AppModel: ObservableObject {
     /// editable and can collide, so routing actions by display name made some
     /// project tabs appear unclickable or target the wrong folder.
     @Published private(set) var selectedProjectID: String?
-    /// A file opened from the workspace rail / palette; non-nil replaces the
-    /// detail pane with the preview/editor until closed.
+    /// A file opened from the workspace rail / palette. It composes beside the
+    /// active terminal/chat/Mesh surface instead of replacing that surface.
     @Published var previewedFileURL: URL? {
         didSet {
             if let previewedFileURL {
@@ -114,6 +114,7 @@ final class AppModel: ObservableObject {
     /// and was the largest source of the spinning cursor after opening folders.
     var persistedOpenProjects: [OpenProject] = []
     var persistedOwnedSessions: [NativeOwnedSession] = []
+    var persistedSessionAliases: [String: String] = [:]
     var persistedPinnedIDs: Set<String> = []
 
     init(
@@ -145,6 +146,7 @@ final class AppModel: ObservableObject {
         self.jitter = jitter
         persistedOpenProjects = sessionStore.projects()
         persistedOwnedSessions = sessionStore.sessions()
+        persistedSessionAliases = sessionStore.sessionAliases()
         persistedPinnedIDs = SessionPinStore().pins()
     }
 
@@ -231,6 +233,7 @@ final class AppModel: ObservableObject {
     func refreshPersistedNavigationState(publish: Bool = true) {
         persistedOpenProjects = sessionStore.projects()
         persistedOwnedSessions = sessionStore.sessions()
+        persistedSessionAliases = sessionStore.sessionAliases()
         persistedPinnedIDs = SessionPinStore().pins()
         if publish { objectWillChange.send() }
     }
@@ -692,6 +695,20 @@ final class AppModel: ObservableObject {
         terminalSurfaceOrder = [sessions[0].id]
     }
 
+    func loadVisualMeshFixture(workspace: URL) {
+        let mesh = MeshSession(baseDirectory: workspace.standardizedFileURL)
+        mesh.loadVisualFixture()
+        surfaceObservers[mesh.id] = mesh.objectWillChange.sink { [weak self] _ in
+            self?.objectWillChange.send()
+        }
+        meshes = [mesh]
+        selectedMeshID = mesh.id
+        selectedChatID = nil
+        selectedSessionID = nil
+        selectedProjectID = mesh.projectID
+        selectedProjectName = projects.first(where: { $0.id == mesh.projectID })?.name
+    }
+
     func reload() async {
         hasStarted = true
         shouldReconnect = true
@@ -761,7 +778,6 @@ final class AppModel: ObservableObject {
             selectedChatID = nil
             selectedMeshID = nil
             browserCardURL = nil
-            previewedFileURL = nil
             sessionStore.recordSelectedSession(next.id)
             AttentionCenter.shared.clear(targetID: next.id)
             publishPrimaryDocument(retainedDocument, touch: true)
@@ -771,7 +787,6 @@ final class AppModel: ObservableObject {
             selectedChatID = nil
             selectedMeshID = nil
             browserCardURL = nil
-            previewedFileURL = nil
             terminalDocument = .empty
         }
 
@@ -1006,13 +1021,16 @@ final class AppModel: ObservableObject {
         Self.sessionDisplayTitle(
             for: record,
             visibleRecords: sessions,
-            storedSessions: persistedOwnedSessions
+            storedSessions: persistedOwnedSessions,
+            aliases: persistedSessionAliases
         )
     }
 
     func sessionTitle(for terminalID: String) -> String {
         guard let record = sessions.first(where: { $0.id == terminalID }) else {
-            return persistedOwnedSessions.first(where: { $0.id == terminalID })?.title ?? terminalID
+            return persistedSessionAliases[terminalID]
+                ?? persistedOwnedSessions.first(where: { $0.id == terminalID })?.title
+                ?? terminalID
         }
         return sessionTitle(for: record)
     }
@@ -1020,7 +1038,8 @@ final class AppModel: ObservableObject {
     /// The rename field edits the persisted base title, not a generated
     /// "Terminal 2" navigation label.
     func editableSessionTitle(for terminalID: String) -> String {
-        persistedOwnedSessions.first(where: { $0.id == terminalID })?.title
+        persistedSessionAliases[terminalID]
+            ?? persistedOwnedSessions.first(where: { $0.id == terminalID })?.title
             ?? sessions.first(where: { $0.id == terminalID })?.title
             ?? ""
     }
@@ -1028,8 +1047,10 @@ final class AppModel: ObservableObject {
     static func sessionDisplayTitle(
         for record: BrokerTerminalRecord,
         visibleRecords: [BrokerTerminalRecord],
-        storedSessions: [NativeOwnedSession]
+        storedSessions: [NativeOwnedSession],
+        aliases: [String: String] = [:]
     ) -> String {
+        if let alias = aliases[record.id], !alias.isEmpty { return alias }
         let storedByID = Dictionary(uniqueKeysWithValues: storedSessions.map { ($0.id, $0) })
         guard let stored = storedByID[record.id] else { return record.title }
 
@@ -1055,13 +1076,20 @@ final class AppModel: ObservableObject {
         return "Terminal \(index + 1)"
     }
 
-    /// Rename an owned session's sidebar title.
+    /// Rename any session's navigation title. Owned sessions keep their title
+    /// in the owned registry; observed sessions get a local alias only, so this
+    /// never broadens write authority over an Electron-owned PTY.
     func renameSession(_ terminalID: String, to title: String) {
         let trimmed = title.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard isOwned(terminalID), !trimmed.isEmpty,
-              var stored = persistedOwnedSessions.first(where: { $0.id == terminalID }) else { return }
-        stored.title = trimmed
-        sessionStore.upsert(stored)
+        guard !trimmed.isEmpty, sessions.contains(where: { $0.id == terminalID }) else { return }
+        if isOwned(terminalID),
+           var stored = persistedOwnedSessions.first(where: { $0.id == terminalID }) {
+            stored.title = trimmed
+            sessionStore.upsert(stored)
+            sessionStore.setSessionAlias(nil, for: terminalID)
+        } else {
+            sessionStore.setSessionAlias(trimmed, for: terminalID)
+        }
         refreshPersistedNavigationState()
     }
 

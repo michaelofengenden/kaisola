@@ -117,18 +117,33 @@ final class KaisolaMacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDele
                 if FileManager.default.fileExists(atPath: readme.path) {
                     model.openFilePreview(readme)
                 }
+            } else if visualSurface == "mesh" {
+                model.loadVisualMeshFixture(workspace: workspace)
             }
         }
-        let content = RootShellView()
-            .environmentObject(model)
-            .environmentObject(settings)
+        let content: AnyView
+        if visualFixture, visualSurface == "settings" {
+            let workspace = URL(
+                fileURLWithPath: visualWorkspace ?? FileManager.default.currentDirectoryPath,
+                isDirectory: true
+            )
+            content = AnyView(SettingsView(settings: settings, workspace: workspace))
+        } else {
+            content = AnyView(
+                RootShellView()
+                    .environmentObject(model)
+                    .environmentObject(settings)
+            )
+        }
+
+        let visualSettings = visualFixture && visualSurface == "settings"
 
         let window = NSWindow(
             contentRect: NSRect(
                 x: 0,
                 y: 0,
-                width: visualFixture ? 1_360 : 1_080,
-                height: visualFixture ? 860 : 700
+                width: visualSettings ? 810 : (visualFixture ? 1_360 : 1_080),
+                height: visualSettings ? 540 : (visualFixture ? 860 : 700)
             ),
             styleMask: [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView],
             backing: .buffered,
@@ -415,7 +430,7 @@ final class KaisolaMacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDele
             workspace: keyModel()?.currentProjectDirectory
         )
         let window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 850, height: 570),
+            contentRect: NSRect(x: 0, y: 0, width: 810, height: 540),
             styleMask: [.titled, .closable, .resizable, .fullSizeContentView],
             backing: .buffered,
             defer: false

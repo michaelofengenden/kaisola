@@ -263,11 +263,11 @@ struct RootShellView: View {
                                         Circle().fill(tint).frame(width: 10, height: 10)
                                     } else {
                                         Image(systemName: "folder.fill")
-                                            .font(.system(size: 14, weight: .semibold))
+                                            .font(.system(size: 15, weight: .semibold))
                                             .foregroundStyle(activeProjectID == project.id ? Color.accentColor : .secondary)
                                     }
                                     Text(project.name)
-                                        .font(.system(size: 14, weight: .semibold))
+                                        .font(.system(size: 15, weight: .semibold))
                                         .foregroundStyle(.primary)
                                     if project.workingCount > 0 {
                                         Text("\(project.workingCount)")
@@ -295,7 +295,7 @@ struct RootShellView: View {
                             .help("New session in \(project.name)")
                         }
                         .padding(.horizontal, 6)
-                        .frame(minHeight: 38)
+                        .frame(minHeight: 44)
                         .background(
                             activeProjectID == project.id
                                 ? AnyShapeStyle(Color.accentColor.opacity(0.13))
@@ -503,6 +503,8 @@ struct RootShellView: View {
             agent: model.agentProfile(for: session.id),
             branch: model.branch(for: session.id),
             meta: model.meta(for: session.id),
+            isVisible: session.id == model.selectedSessionID
+                || model.splitDocuments[session.id] != nil,
             canOpenSplit: session.id != model.selectedSessionID
                 && model.splitDocuments[session.id] == nil
                 && model.splitOrder.count < AppModel.maxSplitPanes,
@@ -539,8 +541,8 @@ struct RootShellView: View {
                     Task { await model.closeSplit(session.id) }
                 }
             }
+            Button("Rename…") { renameTarget = session.id }
             if model.isOwned(session.id) {
-                Button("Rename…") { renameTarget = session.id }
                 if let dir = model.directory(for: session.id) {
                     Button("Git Panel…") { gitRepo = dir }
                 }
@@ -556,8 +558,16 @@ struct RootShellView: View {
     @ViewBuilder
     private var detailPane: some View {
         HStack(spacing: 0) {
-            detailContent
-                .frame(minWidth: 420, maxWidth: .infinity, maxHeight: .infinity)
+            HSplitView {
+                detailContent
+                    .frame(minWidth: 420, maxWidth: .infinity, maxHeight: .infinity)
+                if let fileURL = model.previewedFileURL {
+                    FilePreviewView(url: fileURL, workspaceRoot: model.currentProjectDirectory) {
+                        model.closeFilePreview()
+                    }
+                    .frame(minWidth: 320, idealWidth: 440, maxWidth: .infinity, maxHeight: .infinity)
+                }
+            }
             if settings.workspaceRailVisible, let root = model.currentProjectDirectory {
                 // Files live on the right, matching the editor/reference rail in
                 // the Electron workspace and leaving the project hierarchy as the
@@ -611,8 +621,7 @@ struct RootShellView: View {
     }
 
     private var detailContent: some View {
-        let alternateSurfaceVisible = model.previewedFileURL != nil
-            || model.browserCardURL != nil
+        let alternateSurfaceVisible = model.browserCardURL != nil
             || model.selectedMeshID != nil
             || model.selectedChatID != nil
         return ZStack {
@@ -622,11 +631,7 @@ struct RootShellView: View {
                 .allowsHitTesting(!alternateSurfaceVisible)
                 .accessibilityHidden(alternateSurfaceVisible)
 
-            if let fileURL = model.previewedFileURL {
-                FilePreviewView(url: fileURL, workspaceRoot: model.currentProjectDirectory) {
-                    model.closeFilePreview()
-                }
-            } else if let browserURL = model.browserCardURL {
+            if let browserURL = model.browserCardURL {
                 BrowserCardView(url: browserURL) { model.browserCardURL = nil }
             } else if let mesh = model.meshes.first(where: { $0.id == model.selectedMeshID }) {
                 MeshView(mesh: mesh)
@@ -643,11 +648,7 @@ struct RootShellView: View {
     private var footer: some View {
         ConnectionFooter(
             state: model.connectionState,
-            canCreate: model.controlAvailable,
             reload: { Task { await model.reload() } },
-            newTerminal: { RootShellView.promptForNewTerminal(model: model) },
-            newAgent: { agent in RootShellView.promptForNewAgent(agent, model: model) },
-            newChat: { agent in RootShellView.promptForNewChat(agent, model: model) },
             jumpToAttention: { model.jumpToAttentionTarget($0) },
             newMesh: { RootShellView.promptForNewMesh(model: model) },
             newStagedMesh: { RootShellView.promptForNewMesh(model: model, staged: true) },
@@ -709,12 +710,15 @@ struct RootShellView: View {
         model.openChat(agent, inDirectory: directory)
     }
 
-    /// New Mesh in the active project (or a picked folder): every ACP-capable
-    /// agent, each in an isolated worktree when the folder is a git repo.
+    /// New Mesh belongs to the active project. The project-scoped plus menu is
+    /// the place to create one; a global folder picker would make its ACP/MCP
+    /// account and configuration context ambiguous.
     @MainActor
     static func promptForNewMesh(model: AppModel, staged: Bool = false, idea: Bool = false) {
-        guard let directory = model.currentProjectDirectory
-            ?? chooseDirectory(prompt: "Run Mesh Here", startingAt: model.currentProjectDirectory) else { return }
+        guard let directory = model.currentProjectDirectory else {
+            ToastCenter.shared.show("Open or select a project before starting Mesh.", style: .info)
+            return
+        }
         model.openMesh(inDirectory: directory, staged: staged, idea: idea)
     }
 
@@ -850,7 +854,7 @@ struct RootShellView: View {
             if paneIDs.count > 1 {
                 HStack(spacing: 7) {
                     Image(systemName: model.agentProfile(for: id)?.symbol ?? "terminal")
-                        .foregroundStyle(isPrimary ? Color.accentColor : .secondary)
+                        .foregroundStyle(Color.accentColor)
                     Text(model.sessionTitle(for: id))
                         .font(.caption.weight(.semibold))
                         .lineLimit(1)
@@ -997,48 +1001,14 @@ private struct InAppSettingsSheet: View {
     let dismiss: () -> Void
 
     var body: some View {
-        VStack(spacing: 0) {
-            HStack(spacing: 9) {
-                ZStack {
-                    RoundedRectangle(cornerRadius: 9)
-                        .fill(Color.accentColor.gradient)
-                    Image(systemName: "slider.horizontal.3")
-                        .foregroundStyle(.white)
-                }
-                .frame(width: 32, height: 32)
-                VStack(alignment: .leading, spacing: 1) {
-                    Text("Settings")
-                        .font(.title3.weight(.semibold))
-                    Text("Everything applies instantly")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                }
-                Spacer()
-                Button(action: dismiss) {
-                    HStack(spacing: 6) {
-                        Text("Done")
-                        Image(systemName: "checkmark")
-                            .font(.caption.weight(.bold))
-                    }
-                    .padding(.horizontal, 12)
-                    .frame(height: 30)
-                    .background(.quaternary.opacity(0.55), in: Capsule())
-                }
-                    .buttonStyle(.plain)
-                    .keyboardShortcut(.defaultAction)
-            }
-            .padding(.horizontal, 18)
-            .frame(height: 58)
-            .background(.ultraThinMaterial)
-            Divider()
-            SettingsView(
-                settings: settings,
-                checkForUpdates: {
-                    NotificationCenter.default.post(name: .kaisolaCheckForUpdates, object: nil)
-                },
-                workspace: workspace
-            )
-        }
+        SettingsView(
+            settings: settings,
+            checkForUpdates: {
+                NotificationCenter.default.post(name: .kaisolaCheckForUpdates, object: nil)
+            },
+            workspace: workspace,
+            dismiss: dismiss
+        )
         .background {
             WorkspaceBackdropView(mode: settings.workspaceBackdrop)
                 .ignoresSafeArea()
@@ -1131,7 +1101,7 @@ private struct SessionStrip: View {
                         .background {
                             surfaceTabBackground(
                                 selected: model.selectedMeshID == mesh.id,
-                                tint: .purple
+                                tint: .accentColor
                             )
                         }
                     }
@@ -1141,12 +1111,25 @@ private struct SessionStrip: View {
                     }
                 }
                 ForEach(sessions) { session in
+                    let visible = model.selectedSessionID == session.id
+                        || model.splitDocuments[session.id] != nil
+                    let working: Bool = {
+                        if case .working = session.agentActivity, !session.exited { return true }
+                        return false
+                    }()
                     Button {
                         Task { await model.select(session.id) }
                     } label: {
                         HStack(spacing: 6) {
                             Image(systemName: model.agentProfile(for: session.id)?.symbol
                                 ?? (model.isOwned(session.id) ? "terminal.fill" : "terminal"))
+                                .font(.caption.weight(.semibold))
+                                .foregroundStyle(visible || working ? Color.accentColor : Color.secondary)
+                                .frame(width: 20, height: 20)
+                                .background(
+                                    (visible || working) ? Color.accentColor.opacity(0.13) : Color.clear,
+                                    in: RoundedRectangle(cornerRadius: 6, style: .continuous)
+                                )
                             Text(model.sessionTitle(for: session)).lineLimit(1)
                         }
                         .font(.callout)
@@ -1161,8 +1144,8 @@ private struct SessionStrip: View {
                     }
                     .buttonStyle(.plain)
                     .contextMenu {
+                        Button("Rename…") { rename(session.id) }
                         if model.isOwned(session.id) {
-                            Button("Rename…") { rename(session.id) }
                             if !session.exited {
                                 Button("End Session", role: .destructive) {
                                     Task { await model.endSession(session.id) }
@@ -1173,17 +1156,17 @@ private struct SessionStrip: View {
                 }
                 Spacer(minLength: 0)
             }
-            .padding(.horizontal, 12)
-            .padding(.vertical, 6)
+            .padding(.horizontal, 8)
+            .padding(.vertical, 4)
         }
-        .frame(height: 40)
+        .frame(height: 36)
     }
 
     private func surfaceTabBackground(selected: Bool, tint: Color) -> some View {
-        RoundedRectangle(cornerRadius: 9, style: .continuous)
+        Capsule(style: .continuous)
             .fill(selected ? tint.opacity(0.14) : Color.primary.opacity(0.035))
             .overlay {
-                RoundedRectangle(cornerRadius: 9, style: .continuous)
+                Capsule(style: .continuous)
                     .stroke(
                         selected ? tint.opacity(0.30) : Color.primary.opacity(0.075),
                         lineWidth: 0.8
@@ -1304,6 +1287,7 @@ private struct SessionRow: View {
     let agent: AgentProfile?
     var branch: String?
     var meta: TerminalMeta?
+    let isVisible: Bool
     let canOpenSplit: Bool
     let isOpenInSplit: Bool
     let toggleSplit: () -> Void
@@ -1321,7 +1305,11 @@ private struct SessionRow: View {
                             .offset(x: 4, y: 4)
                     }
                 }
-                .frame(width: 18)
+                .frame(width: 22, height: 22)
+                .background(
+                    isVisible ? Color.accentColor.opacity(0.13) : Color.clear,
+                    in: RoundedRectangle(cornerRadius: 6, style: .continuous)
+                )
                 VStack(alignment: .leading, spacing: 2) {
                     Text(title)
                         .lineLimit(1)
@@ -1354,8 +1342,9 @@ private struct SessionRow: View {
 
     private var iconColor: Color {
         if session.exited { return .secondary }
-        if agent != nil { return .accentColor }
-        return owned ? .accentColor : .green
+        if isVisible { return .accentColor }
+        if case .working = session.agentActivity { return .accentColor }
+        return .secondary
     }
 
     private var sessionDetail: String {
@@ -1388,11 +1377,7 @@ private struct SessionRow: View {
 
 private struct ConnectionFooter: View {
     let state: AppModel.ConnectionState
-    let canCreate: Bool
     let reload: () -> Void
-    let newTerminal: () -> Void
-    let newAgent: (AgentProfile) -> Void
-    let newChat: (AgentProfile) -> Void
     var jumpToAttention: ((String) -> Void)?
     var newMesh: (() -> Void)?
     var newStagedMesh: (() -> Void)?
@@ -1412,97 +1397,50 @@ private struct ConnectionFooter: View {
     @ObservedObject private var attention = AttentionCenter.shared
     @State private var showInbox = false
 
-    private var chatAgents: [AgentProfile] {
-        AgentRegistry.all.filter { AcpAdapter.forAgent($0.id) != nil }
-    }
-
     private static let appVersion = Bundle.main.object(
         forInfoDictionaryKey: "CFBundleShortVersionString"
     ) as? String ?? "Dev"
 
     var body: some View {
-        VStack(spacing: 0) {
-            HStack(spacing: 8) {
-                accountMenu
-                Spacer(minLength: 4)
-                attentionButton
-            }
-            .help(state.detail ?? state.title)
+        HStack(spacing: 7) {
+            accountMenu
+                .help(state.detail ?? state.title)
+            Spacer(minLength: 4)
+            attentionButton
+            shelfButton(
+                filesVisible ? "sidebar.trailing" : "sidebar.right",
+                help: filesVisible ? "Hide Files (Command-B)" : "Show Files (Command-B)",
+                active: filesVisible,
+                action: toggleFiles
+            )
 
-            HStack(spacing: 7) {
+            shelfButton(
+                filePreviewVisible ? "doc.text.fill" : "doc.text.magnifyingglass",
+                help: filePreviewVisible ? "Hide file preview" : "Show file preview",
+                active: filePreviewVisible,
+                action: toggleFilePreview
+            )
+
+            if newMesh != nil || newStagedMesh != nil || newIdeaMesh != nil {
                 Menu {
-                    ForEach(chatAgents) { agent in
-                        Button {
-                            newChat(agent)
-                        } label: {
-                            Label("Chat with \(agent.name)", systemImage: "bubble.left.and.text.bubble.right")
-                        }
-                    }
-                    Divider()
-                    Button(action: newTerminal) { Label("New Terminal", systemImage: "terminal") }
-                    ForEach(AgentRegistry.all) { agent in
-                        Button {
-                            newAgent(agent)
-                        } label: {
-                            Label("New \(agent.name) Agent", systemImage: agent.symbol)
-                        }
-                    }
+                    if let newMesh { Button("New Mesh (all agents)", action: newMesh) }
+                    if let newStagedMesh { Button("New Staged Mesh (scout → execute)", action: newStagedMesh) }
+                    if let newIdeaMesh { Button("New Idea Mesh (brainstorm)", action: newIdeaMesh) }
                 } label: {
-                    Image(systemName: "plus")
-                        .frame(width: 25, height: 24)
-                        .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+                    Image(systemName: "circle.hexagongrid.fill")
+                        .font(.system(size: 12, weight: .semibold))
+                        .foregroundStyle(.purple)
+                        .frame(width: 27, height: 24)
                 }
                 .menuStyle(.borderlessButton)
                 .fixedSize()
-                .disabled(!canCreate)
-                .help("New chat or terminal in this project")
-                .accessibilityLabel("New session")
-
-                shelfButton(
-                    filesVisible ? "sidebar.trailing" : "sidebar.right",
-                    help: filesVisible ? "Hide Files (Command-B)" : "Show Files (Command-B)",
-                    active: filesVisible,
-                    action: toggleFiles
-                )
-
-                shelfButton(
-                    filePreviewVisible ? "doc.text.fill" : "doc.text.magnifyingglass",
-                    help: filePreviewVisible ? "Hide file preview" : "Show file preview",
-                    active: filePreviewVisible,
-                    action: toggleFilePreview
-                )
-
-                if newMesh != nil || newStagedMesh != nil || newIdeaMesh != nil {
-                    Menu {
-                        if let newMesh { Button("New Mesh (all agents)", action: newMesh) }
-                        if let newStagedMesh { Button("New Staged Mesh (scout → execute)", action: newStagedMesh) }
-                        if let newIdeaMesh { Button("New Idea Mesh (brainstorm)", action: newIdeaMesh) }
-                    } label: {
-                        Image(systemName: "circle.hexagongrid.fill")
-                            .font(.system(size: 12, weight: .semibold))
-                            .foregroundStyle(.purple)
-                            .frame(width: 27, height: 24)
-                    }
-                    .menuStyle(.borderlessButton)
-                    .fixedSize()
-                    .tint(.purple)
-                    .background(Color.purple.opacity(0.18), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
-                    .overlay {
-                        RoundedRectangle(cornerRadius: 8, style: .continuous)
-                            .stroke(Color.purple.opacity(0.28), lineWidth: 0.8)
-                    }
-                    .shadow(color: Color.purple.opacity(0.18), radius: 3, y: 1)
-                    .help("New Mesh — flat, staged, or idea")
-                }
-
-                Spacer(minLength: 0)
+                .help("New Mesh — flat, staged, or idea")
             }
-            .font(.callout)
-            .controlSize(.small)
         }
+        .font(.callout)
+        .controlSize(.small)
         .padding(.horizontal, 10)
-        .padding(.vertical, 7)
-        .frame(height: 70)
+        .frame(height: 44)
         .background(.ultraThinMaterial)
         .overlay(alignment: .top) {
             Rectangle().fill(Color(nsColor: .separatorColor).opacity(0.7)).frame(height: 1)

@@ -52,10 +52,10 @@ struct ProjectTabStripView: View {
                 Button(action: openFolder) {
                     Image(systemName: "plus")
                         .font(.caption.weight(.semibold))
-                        .frame(width: 27, height: 27)
-                        .background(Color.primary.opacity(0.04), in: RoundedRectangle(cornerRadius: 9, style: .continuous))
+                        .frame(width: 26, height: 26)
+                        .background(Color.primary.opacity(0.04), in: Circle())
                         .overlay {
-                            RoundedRectangle(cornerRadius: 9, style: .continuous)
+                            Circle()
                                 .stroke(Color.primary.opacity(0.08), lineWidth: 0.8)
                         }
                 }
@@ -63,10 +63,10 @@ struct ProjectTabStripView: View {
                 .help("Open a folder as a project (⌘O)")
                 Spacer(minLength: 0)
             }
-            .padding(.horizontal, 12)
-            .padding(.vertical, 6)
+            .padding(.horizontal, 8)
+            .padding(.vertical, 4)
         }
-        .frame(height: 40)
+        .frame(height: 36)
     }
 
     /// Kept separate so the enclosing `Button` can carry drag/drop modifiers.
@@ -86,13 +86,13 @@ struct ProjectTabStripView: View {
                     .foregroundStyle(.white)
             }
         }
-        .padding(.horizontal, 12)
-        .padding(.vertical, 6)
+        .padding(.horizontal, 11)
+        .padding(.vertical, 5)
         .background {
-            RoundedRectangle(cornerRadius: 9, style: .continuous)
+            Capsule(style: .continuous)
                 .fill(selected == project.id ? Color.accentColor.opacity(0.14) : Color.primary.opacity(0.035))
                 .overlay {
-                    RoundedRectangle(cornerRadius: 9, style: .continuous)
+                    Capsule(style: .continuous)
                         .stroke(
                             selected == project.id
                                 ? Color.accentColor.opacity(0.30)

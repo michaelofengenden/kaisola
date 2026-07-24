@@ -30,7 +30,40 @@ final class UsageCenter: ObservableObject {
         var turns: Int
     }
 
+    struct PlanWindow: Decodable, Equatable, Identifiable, Sendable {
+        let label: String
+        let usedPercent: Double?
+        let resetsAt: Double?
+
+        var id: String { label }
+    }
+
+    struct ProviderPlanUsage: Decodable, Equatable, Identifiable, Sendable {
+        let provider: String
+        let displayName: String
+        let ok: Bool
+        let sourceLabel: String
+        let experimental: Bool?
+        let account: String?
+        let plan: String?
+        let windows: [PlanWindow]
+        let message: String?
+        let updatedAt: Double?
+
+        var id: String { provider }
+    }
+
+    private struct PlanUsageEnvelope: Decodable, Sendable {
+        let providers: [ProviderPlanUsage]
+        let error: String?
+    }
+
     @Published private(set) var byChat: [String: ChatUsage] = [:]
+    @Published private(set) var planUsage: [ProviderPlanUsage] = []
+    @Published private(set) var isRefreshingPlanUsage = false
+    @Published private(set) var planUsageError: String?
+
+    private var planRefreshTask: Task<Void, Never>?
 
     init() {}
 
@@ -88,6 +121,106 @@ final class UsageCenter: ObservableObject {
         byChat.removeAll()
     }
 
+    // MARK: - Provider account limits
+
+    /// Refresh exact provider account limits for the active project's account
+    /// overlay. The signed helper owns the Node/SDK dependency surface; all
+    /// package hashing and provider processes stay off the main actor.
+    func refreshPlanUsage(workspace: URL?, force: Bool = false) {
+        if isRefreshingPlanUsage, !force { return }
+        planRefreshTask?.cancel()
+        isRefreshingPlanUsage = true
+        planUsageError = nil
+
+        let projectOverride = workspace.map {
+            ProjectAccountStore().override(
+                forProject: NativeSessionStore.projectID(forDirectory: $0.path)
+            )
+        } ?? nil
+        let overlay = ProjectAccountStore.mergedOverlay(
+            app: NativePreviewSettings.shared.agentEnvironmentOverlay,
+            project: projectOverride
+        )
+        let environment = ProcessInfo.processInfo.environment.merging(overlay) { _, project in project }
+        let helperRoot = Bundle.main.resourceURL?
+            .appendingPathComponent("BrokerHelper", isDirectory: true)
+        let currentDirectory = workspace
+
+        planRefreshTask = Task { [weak self] in
+            let result = await Task.detached(priority: .userInitiated) {
+                Self.readProviderPlanUsage(
+                    helperRoot: helperRoot,
+                    currentDirectory: currentDirectory,
+                    environment: environment
+                )
+            }.value
+            guard !Task.isCancelled, let self else { return }
+            switch result {
+            case let .success(providers):
+                self.planUsage = providers
+                self.planUsageError = nil
+            case let .failure(message):
+                self.planUsageError = message
+            }
+            self.isRefreshingPlanUsage = false
+            self.planRefreshTask = nil
+        }
+    }
+
+    nonisolated static func decodeProviderPlanUsage(_ data: Data) throws -> [ProviderPlanUsage] {
+        let envelope = try JSONDecoder().decode(PlanUsageEnvelope.self, from: data)
+        if envelope.providers.isEmpty, let error = envelope.error, !error.isEmpty {
+            throw ProviderUsageError.message(error)
+        }
+        return envelope.providers
+    }
+
+    private nonisolated static func readProviderPlanUsage(
+        helperRoot: URL?,
+        currentDirectory: URL?,
+        environment: [String: String]
+    ) -> ProviderPlanReadResult {
+        do {
+            guard let helperRoot else {
+                return .failure("The signed usage helper is not packaged in this build.")
+            }
+            let package = try BrokerHelperPackageVerification.verify(
+                root: helperRoot,
+                requireSignatures: environment["KAISOLA_ALLOW_UNSIGNED_NATIVE_HELPER"] != "1"
+            )
+            guard FileManager.default.fileExists(atPath: package.usageScript.path) else {
+                return .failure("The packaged usage reader is missing.")
+            }
+
+            let process = Process()
+            process.executableURL = package.nodeExecutable
+            process.arguments = [package.usageScript.path]
+            process.environment = environment
+            process.currentDirectoryURL = currentDirectory
+            let output = Pipe()
+            let errors = Pipe()
+            process.standardOutput = output
+            process.standardError = errors
+            try process.run()
+            process.waitUntilExit()
+            let data = output.fileHandleForReading.readDataToEndOfFile()
+            let stderr = String(
+                decoding: errors.fileHandleForReading.readDataToEndOfFile().suffix(1_000),
+                as: UTF8.self
+            ).trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !data.isEmpty else {
+                return .failure(stderr.isEmpty ? "Provider usage returned no data." : stderr)
+            }
+            do {
+                return .success(try decodeProviderPlanUsage(data))
+            } catch {
+                return .failure(stderr.isEmpty ? error.localizedDescription : stderr)
+            }
+        } catch {
+            return .failure(error.localizedDescription)
+        }
+    }
+
     // MARK: - Aggregates
 
     /// Sum of every chat's peak used tokens — the session's total token weight.
@@ -102,6 +235,21 @@ final class UsageCenter: ObservableObject {
         byChat.values.reduce(0.0) { current, usage in
             guard usage.latestMax > 0 else { return current }
             return Swift.max(current, Double(usage.latestUsed) / Double(usage.latestMax))
+        }
+    }
+}
+
+private enum ProviderPlanReadResult: Sendable {
+    case success([UsageCenter.ProviderPlanUsage])
+    case failure(String)
+}
+
+private enum ProviderUsageError: LocalizedError, Sendable {
+    case message(String)
+
+    var errorDescription: String? {
+        switch self {
+        case let .message(message): message
         }
     }
 }

@@ -51,6 +51,7 @@ struct VerifiedBrokerHelperPackage: Equatable, Sendable {
     var nodeExecutable: URL { root.appendingPathComponent("bin/node") }
     var bootstrapExecutable: URL { root.appendingPathComponent("bin/kaisola-broker-bootstrap") }
     var brokerScript: URL { root.appendingPathComponent("lib/electron/session-broker.cjs") }
+    var usageScript: URL { root.appendingPathComponent("lib/scripts/native-usage-service.cjs") }
 }
 
 enum BrokerHelperPackageVerification {

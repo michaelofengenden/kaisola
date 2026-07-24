@@ -146,6 +146,21 @@ final class NativeTerminalInteractionTests: XCTestCase {
         XCTAssertTrue(captured.isEmpty)
     }
 
+    func testInitialReplayWaitsUntilTerminalHasRealGeometry() {
+        let coordinator = NativeTerminalSurface.Coordinator()
+        let view = ReadOnlyTerminalView(
+            frame: .zero,
+            font: NSFont.monospacedSystemFont(ofSize: 13, weight: .regular)
+        )
+
+        coordinator.apply(output: "one\ntwo\n", epoch: "epoch-a", endOffset: 8, to: view)
+        XCTAssertTrue(coordinator.isAwaitingInitialLayout)
+
+        view.frame = NSRect(x: 0, y: 0, width: 640, height: 320)
+        coordinator.flushPendingInitialRender(to: view)
+        XCTAssertFalse(coordinator.isAwaitingInitialLayout)
+    }
+
     func testFreshTerminalQueryStillReceivesAReply() {
         let coordinator = NativeTerminalSurface.Coordinator()
         var captured: [String] = []

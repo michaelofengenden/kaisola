@@ -42,6 +42,13 @@ final class AppModel: ObservableObject {
     @Published private(set) var sessions: [BrokerTerminalRecord] = []
     @Published var selectedSessionID: String?
     @Published private(set) var terminalDocument = TerminalDocument.empty
+    /// Recently viewed primary terminal documents stay mounted in the shell.
+    /// Switching back to one is therefore an O(1) visibility change rather than
+    /// a destructive SwiftTerm remount + full ANSI replay. The bounded order is
+    /// least-recently-used first and caps both retained output and view memory.
+    @Published private(set) var terminalSurfaceDocuments: [String: TerminalDocument] = [:]
+    @Published private(set) var terminalSurfaceOrder: [String] = []
+    static let maximumRetainedTerminalSurfaces = 6
     /// Terminals this app created and may mutate. Everything else stays
     /// strictly observed no matter what the UI asks for.
     @Published private(set) var ownedTerminalIDs: Set<String> = []
@@ -85,6 +92,8 @@ final class AppModel: ObservableObject {
     private var terminalResizeGeneration: [String: Int] = [:]
     private var lastTerminalSize: [String: String] = [:]
     private var connectionGeneration = 0
+    /// Discards late subscription results after a faster subsequent tab click.
+    private var terminalSelectionGeneration = 0
     private var shouldReconnect = false
     private var hasStarted = false
     private let observerOwnerID = "native-preview"
@@ -595,11 +604,22 @@ final class AppModel: ObservableObject {
     }
 
     func select(_ id: String?) async {
+        terminalSelectionGeneration &+= 1
+        let selectionGeneration = terminalSelectionGeneration
+        // Snapshot the surface we are leaving once, at the interaction
+        // boundary. Streaming output continues to publish only through
+        // `terminalDocument`; copying every packet into the retained deck
+        // causes needless whole-shell invalidations.
+        if let currentSessionID = terminalDocument.sessionID {
+            terminalSurfaceDocuments[currentSessionID] = terminalDocument
+        }
         guard let id, let next = sessions.first(where: { $0.id == id }) else {
             await persistCurrentCursor()
+            guard selectionGeneration == terminalSelectionGeneration else { return }
             if let current = selectedSession, connectionState.isConnected {
                 try? await client.unsubscribe(from: current, ownerID: observerOwnerID)
             }
+            guard selectionGeneration == terminalSelectionGeneration else { return }
             selectedSession = nil
             selectedSessionID = nil
             terminalDocument = .empty
@@ -608,12 +628,15 @@ final class AppModel: ObservableObject {
 
         if let current = selectedSession, current.id != next.id {
             await persistCurrentCursor()
+            guard selectionGeneration == terminalSelectionGeneration else { return }
             if connectionState.isConnected {
                 try? await client.unsubscribe(from: current, ownerID: observerOwnerID)
             }
+            guard selectionGeneration == terminalSelectionGeneration else { return }
         }
 
-        let retainedDocument = terminalDocument.sessionID == next.id ? terminalDocument : .empty
+        let retainedDocument = terminalSurfaceDocuments[next.id]
+            ?? (terminalDocument.sessionID == next.id ? terminalDocument : .loading(sessionID: next.id))
         selectedSession = next
         selectedSessionID = next.id
         if let project = projects.first(where: { $0.id == next.projectID }) {
@@ -624,8 +647,8 @@ final class AppModel: ObservableObject {
         selectedMeshID = nil
         sessionStore.recordSelectedSession(next.id)
         AttentionCenter.shared.clear(targetID: next.id)
+        publishPrimaryDocument(retainedDocument, touch: true)
         guard connectionState.isConnected else {
-            terminalDocument = retainedDocument
             return
         }
 
@@ -636,6 +659,7 @@ final class AppModel: ObservableObject {
         } else {
             priorPersistedCursor = nil
         }
+        guard selectionGeneration == terminalSelectionGeneration else { return }
 
         do {
             let result = try await client.subscribe(
@@ -643,6 +667,7 @@ final class AppModel: ObservableObject {
                 ownerID: observerOwnerID,
                 cursor: resumeCursor
             )
+            guard selectionGeneration == terminalSelectionGeneration else { return }
             var document = retainedDocument.applying(result, sessionID: next.id)
             // A cold launch asks for the full retained snapshot instead of
             // skipping bytes merely because a disk cursor exists. The cursor
@@ -655,10 +680,28 @@ final class AppModel: ObservableObject {
                    || priorPersistedCursor.offset > snapshot.endOffset) {
                 document.truncated = true
             }
-            terminalDocument = document
+            publishPrimaryDocument(document)
             await persistCurrentCursor()
         } catch {
-            terminalDocument = .failure(sessionID: next.id, message: error.kaisolaSafeDescription)
+            guard selectionGeneration == terminalSelectionGeneration else { return }
+            publishPrimaryDocument(.failure(sessionID: next.id, message: error.kaisolaSafeDescription))
+        }
+    }
+
+    /// Publish the current primary document and synchronize the bounded surface
+    /// deck used by `RootShellView`. LRU order changes only on selection, never
+    /// for every output packet, keeping high-volume terminal streaming cheap.
+    private func publishPrimaryDocument(_ document: TerminalDocument, touch: Bool = false) {
+        terminalDocument = document
+        guard let sessionID = document.sessionID else { return }
+        terminalSurfaceDocuments[sessionID] = document
+        if touch || !terminalSurfaceOrder.contains(sessionID) {
+            terminalSurfaceOrder.removeAll { $0 == sessionID }
+            terminalSurfaceOrder.append(sessionID)
+        }
+        while terminalSurfaceOrder.count > Self.maximumRetainedTerminalSurfaces {
+            let evicted = terminalSurfaceOrder.removeFirst()
+            terminalSurfaceDocuments.removeValue(forKey: evicted)
         }
     }
 
@@ -688,12 +731,12 @@ final class AppModel: ObservableObject {
     private func createOwnedSession(inDirectory directory: URL, agent: AgentProfile?) async -> String? {
         guard controlAvailable else {
             // Never fail silently: say WHY sessions can't be created here.
-            terminalDocument = .failure(
+            publishPrimaryDocument(.failure(
                 sessionID: "create-unavailable",
                 message: connectionState.isConnected
                     ? "The connected broker doesn't accept native control (it predates the controller lane), so new sessions can't be created from this app yet. Chats and Mesh still work — they don't need the broker."
                     : "No broker connection — new sessions need a running session broker. Chats and Mesh still work without one."
-            )
+            ))
             return nil
         }
         let cwd = directory.path
@@ -767,7 +810,7 @@ final class AppModel: ObservableObject {
             await select(terminalID)
             return terminalID
         } catch {
-            terminalDocument = .failure(sessionID: terminalID, message: error.kaisolaSafeDescription)
+            publishPrimaryDocument(.failure(sessionID: terminalID, message: error.kaisolaSafeDescription))
             return nil
         }
     }
@@ -981,6 +1024,8 @@ final class AppModel: ObservableObject {
         terminalResizeGeneration.removeValue(forKey: terminalID)
         lastTerminalSize.removeValue(forKey: terminalID)
         ownedTerminalIDs.remove(terminalID)
+        terminalSurfaceDocuments.removeValue(forKey: terminalID)
+        terminalSurfaceOrder.removeAll { $0 == terminalID }
         if selectedSessionID == terminalID {
             selectedSessionID = nil
             await select(nil)

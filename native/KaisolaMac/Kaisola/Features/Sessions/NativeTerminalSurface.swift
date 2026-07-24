@@ -45,6 +45,11 @@ struct NativeTerminalSurface: NSViewRepresentable {
         view.linkReporting = .implicit
         view.optionAsMetaKey = false
         view.setAccessibilityLabel(isOwned ? "Terminal" : "Read-only terminal output")
+        let coordinator = context.coordinator
+        view.onUsableLayout = { [weak view, weak coordinator] in
+            guard let view, let coordinator else { return }
+            coordinator.flushPendingInitialRender(to: view)
+        }
         context.coordinator.onInput = onInput
         context.coordinator.onResize = onResize
         context.coordinator.onTitleChange = onTitleChange
@@ -53,6 +58,7 @@ struct NativeTerminalSurface: NSViewRepresentable {
     }
 
     func updateNSView(_ view: ReadOnlyTerminalView, context: Context) {
+        let becameInteractive = context.coordinator.onResize == nil && onResize != nil
         context.coordinator.onInput = onInput
         context.coordinator.onResize = onResize
         context.coordinator.onTitleChange = onTitleChange
@@ -64,6 +70,13 @@ struct NativeTerminalSurface: NSViewRepresentable {
             view.configureTerminalTheme(light: lightSurface, mode: paletteMode)
         }
         context.coordinator.apply(output: output, epoch: streamEpoch, endOffset: endOffset, to: view)
+        // A cached terminal can become active after the window changed size.
+        // Synchronize its live PTY once without reconstructing or replaying the
+        // surface, so the first command uses the dimensions already on screen.
+        if becameInteractive, view.hasUsableRenderGeometry {
+            let dimensions = view.getTerminal().getDims()
+            onResize?(dimensions.cols, dimensions.rows)
+        }
     }
 
     private static func themeKey(light: Bool, mode: TerminalPaletteMode) -> String {
@@ -78,6 +91,13 @@ struct NativeTerminalSurface: NSViewRepresentable {
         private var renderedStartOffset: Int64?
         private var renderedEndOffset: Int64?
         private var hasRendered = false
+        /// SwiftUI creates NSViewRepresentables at `.zero` before assigning the
+        /// real pane bounds. Replaying ANSI history at that placeholder width
+        /// makes SwiftTerm wrap at the wrong column count, then reflow on zoom or
+        /// tab return (the visible doubled-line/blank-line artifact). Keep only
+        /// the newest snapshot until the terminal has usable geometry.
+        private var pendingInitialRender: (output: String, epoch: String?, endOffset: Int64?)?
+        var isAwaitingInitialLayout: Bool { pendingInitialRender != nil }
         /// Reconstructing a terminal view means feeding retained PTY history
         /// through SwiftTerm again. That history can contain cursor/color/device
         /// queries. SwiftTerm correctly answers those queries through `send`,
@@ -104,6 +124,11 @@ struct NativeTerminalSurface: NSViewRepresentable {
         @MainActor
         func apply(output: String, epoch: String?, endOffset: Int64?, to view: ReadOnlyTerminalView) {
             defer { view.updateAccessibilityValue(from: output) }
+            if !hasRendered, !view.hasUsableRenderGeometry {
+                pendingInitialRender = (output, epoch, endOffset)
+                return
+            }
+            pendingInitialRender = nil
             let outputBytes = Int64(output.utf8.count)
             let startOffset = endOffset.map { $0 - outputBytes }
 
@@ -151,6 +176,20 @@ struct NativeTerminalSurface: NSViewRepresentable {
             renderedStartOffset = startOffset
             renderedEndOffset = endOffset
             hasRendered = true
+        }
+
+        /// Called by the terminal view's first real layout. It is intentionally
+        /// idempotent because AppKit can lay out a view multiple times per frame.
+        @MainActor
+        func flushPendingInitialRender(to view: ReadOnlyTerminalView) {
+            guard view.hasUsableRenderGeometry, let pendingInitialRender else { return }
+            self.pendingInitialRender = nil
+            apply(
+                output: pendingInitialRender.output,
+                epoch: pendingInitialRender.epoch,
+                endOffset: pendingInitialRender.endOffset,
+                to: view
+            )
         }
 
         /// Feeds `text` into the terminal and, unless the user has deliberately
@@ -274,6 +313,13 @@ class ReadOnlyTerminalView: TerminalView {
     // Copy-on-write reference updated per stream apply in O(1); the bounded
     // tail is materialized only when accessibility actually asks for it.
     private var accessibilitySource: String = ""
+    /// The representable hands initial replay back through this callback after
+    /// AppKit assigns the real terminal size.
+    var onUsableLayout: (() -> Void)?
+
+    var hasUsableRenderGeometry: Bool {
+        bounds.width > 1 && bounds.height > 1
+    }
 
     override func send(source: Terminal, data: ArraySlice<UInt8>) {}
 
@@ -292,6 +338,11 @@ class ReadOnlyTerminalView: TerminalView {
         if Self.shouldClaimFocus(currentFirstResponder: window.firstResponder, window: window) {
             window.makeFirstResponder(self)
         }
+    }
+
+    override func layout() {
+        super.layout()
+        if hasUsableRenderGeometry { onUsableLayout?() }
     }
 
     /// Which palette is installed, so appearance/palette flips reconfigure once.

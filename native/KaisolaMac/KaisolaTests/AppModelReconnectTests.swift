@@ -67,6 +67,25 @@ final class AppModelReconnectTests: XCTestCase {
         await fixture.model.disconnect()
     }
 
+    func testTerminalSurfaceDocumentSurvivesSelectionRoundTrip() async throws {
+        let fixture = try Fixture(failingConnectAttempts: [])
+        defer { fixture.cleanUp() }
+        await fixture.model.reload()
+        let terminalID = try XCTUnwrap(fixture.model.terminalDocument.sessionID)
+
+        XCTAssertEqual(fixture.model.terminalSurfaceDocuments[terminalID]?.output, "hello")
+        XCTAssertEqual(fixture.model.terminalSurfaceOrder, [terminalID])
+
+        await fixture.model.select(nil)
+        XCTAssertNil(fixture.model.terminalDocument.sessionID)
+        XCTAssertEqual(fixture.model.terminalSurfaceDocuments[terminalID]?.output, "hello")
+
+        await fixture.model.select(terminalID)
+        XCTAssertEqual(fixture.model.terminalDocument.output, "hello")
+        XCTAssertEqual(fixture.model.terminalSurfaceOrder, [terminalID])
+        await fixture.model.disconnect()
+    }
+
     private func waitUntil(
         iterations: Int = 500,
         condition: @escaping @MainActor () async -> Bool

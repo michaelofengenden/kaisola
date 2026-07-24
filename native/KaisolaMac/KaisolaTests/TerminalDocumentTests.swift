@@ -2,6 +2,14 @@ import XCTest
 @testable import KaisolaMacPreview
 
 final class TerminalDocumentTests: XCTestCase {
+    func testLoadingDocumentBindsBlankCanvasToSelectedSession() {
+        let document = TerminalDocument.loading(sessionID: "terminal:new")
+        XCTAssertEqual(document.sessionID, "terminal:new")
+        XCTAssertEqual(document.output, "")
+        XCTAssertNil(document.cursor)
+        XCTAssertNil(document.errorMessage)
+    }
+
     func testOrderedUtf8SuffixAdvancesByteCursor() throws {
         let snapshot = try TerminalSnapshot(value: .object([
             "streamEpoch": .string("epoch"),

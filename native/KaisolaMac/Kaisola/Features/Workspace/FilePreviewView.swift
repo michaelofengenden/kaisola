@@ -649,43 +649,37 @@ struct WorkspaceRailView: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            VStack(spacing: 8) {
-                HStack(spacing: 7) {
-                    Image(systemName: "folder.fill")
-                        .foregroundStyle(Color.accentColor)
-                    VStack(alignment: .leading, spacing: 0) {
-                        Text("Files")
-                            .font(.headline)
-                        Text(root.lastPathComponent)
-                            .font(.caption2)
-                            .foregroundStyle(.secondary)
-                            .lineLimit(1)
-                    }
-                    Spacer(minLength: 6)
-                    Button(action: refresh) {
-                        Image(systemName: "arrow.clockwise")
-                    }
+            HStack(spacing: 7) {
+                Image(systemName: "folder.fill")
+                    .foregroundStyle(Color.accentColor)
+                Text(root.lastPathComponent)
+                    .font(.caption.weight(.semibold))
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                Spacer(minLength: 4)
+                Button(action: refresh) { Image(systemName: "arrow.clockwise") }
                     .buttonStyle(.borderless)
                     .help("Refresh files")
-                    Button(action: close) {
-                        Image(systemName: "sidebar.right")
-                    }
+                Button(action: close) { Image(systemName: "sidebar.right") }
                     .buttonStyle(.borderless)
-                    .help("Close file browser (Command-B)")
+                    .help("Close Files (Command-B)")
                     .accessibilityLabel("Close file browser")
-                }
-                HStack(spacing: 6) {
-                    Image(systemName: "magnifyingglass")
-                        .foregroundStyle(.secondary)
-                    TextField("Search files", text: $searchText)
-                        .textFieldStyle(.plain)
-                }
-                .padding(.horizontal, 8)
-                .padding(.vertical, 6)
-                .background(.quaternary.opacity(0.45), in: RoundedRectangle(cornerRadius: 7))
             }
-            .padding(10)
-            Divider()
+            .padding(.horizontal, 10)
+            .frame(height: 32)
+
+            HStack(spacing: 6) {
+                Image(systemName: "magnifyingglass")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                TextField("Search files", text: $searchText)
+                    .textFieldStyle(.plain)
+            }
+            .padding(.horizontal, 8)
+            .frame(height: 27)
+            .background(.quaternary.opacity(0.42), in: RoundedRectangle(cornerRadius: 7))
+            .padding(.horizontal, 8)
+            .padding(.bottom, 7)
 
             if searchText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                 ScrollView {
@@ -730,7 +724,7 @@ struct WorkspaceRailView: View {
                 }
             }
         }
-        .frame(minWidth: 210, idealWidth: 260, maxWidth: 420, maxHeight: .infinity)
+        .frame(minWidth: 205, maxWidth: .infinity, maxHeight: .infinity)
         .background {
             SidebarBackdropView(appearance: settings.sidebarAppearance)
         }

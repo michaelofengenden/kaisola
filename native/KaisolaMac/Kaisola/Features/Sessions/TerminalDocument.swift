@@ -19,6 +19,20 @@ struct TerminalDocument: Equatable, Sendable {
         errorMessage: nil
     )
 
+    /// An empty canvas already bound to a real session. Publishing this before
+    /// an async subscribe prevents the prior terminal from flashing beneath a
+    /// newly-selected sidebar row while the broker returns its retained tail.
+    static func loading(sessionID: String) -> TerminalDocument {
+        TerminalDocument(
+            sessionID: sessionID,
+            output: "",
+            cursor: nil,
+            truncated: false,
+            exited: false,
+            errorMessage: nil
+        )
+    }
+
     static func failure(sessionID: String, message: String) -> TerminalDocument {
         TerminalDocument(
             sessionID: sessionID,

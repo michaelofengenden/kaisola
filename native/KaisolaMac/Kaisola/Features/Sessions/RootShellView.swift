@@ -14,6 +14,7 @@ struct RootShellView: View {
     @State private var showOmniBar = false
     @State private var showOnboarding = false
     @State private var showSettings = false
+    @State private var workspaceRailDragOrigin: Double?
     /// A Close Mesh request whose worktrees still hold uncommitted changes.
     @State private var meshCloseConfirm: (id: String, dirty: Int)?
 
@@ -201,6 +202,7 @@ struct RootShellView: View {
                             ForEach(chats) { chat in
                                 ChatRow(chat: chat)
                                     .tag(Optional(chat.id))
+                                    .listRowInsets(.init(top: 1, leading: 20, bottom: 1, trailing: 7))
                                     .contextMenu {
                                         Button("Close Chat", role: .destructive) { model.closeChat(chat.id) }
                                     }
@@ -211,6 +213,7 @@ struct RootShellView: View {
                             ForEach(meshes) { mesh in
                                 MeshRow(mesh: mesh)
                                     .tag(Optional(mesh.id))
+                                    .listRowInsets(.init(top: 1, leading: 20, bottom: 1, trailing: 7))
                                     .contextMenu {
                                         Button("Close Mesh", role: .destructive) { requestCloseMesh(mesh) }
                                     }
@@ -231,15 +234,17 @@ struct RootShellView: View {
                             Button {
                                 model.activateProject(id: project.id)
                             } label: {
-                                HStack(spacing: 6) {
+                                HStack(spacing: 8) {
                                     if let tint = ProjectTint.color(project.colorHex) {
-                                        Circle().fill(tint).frame(width: 8, height: 8)
+                                        Circle().fill(tint).frame(width: 10, height: 10)
                                     } else {
                                         Image(systemName: "folder.fill")
-                                            .font(.caption)
-                                            .foregroundStyle(.tertiary)
+                                            .font(.system(size: 14, weight: .semibold))
+                                            .foregroundStyle(activeProjectID == project.id ? Color.accentColor : .secondary)
                                     }
                                     Text(project.name)
+                                        .font(.system(size: 14, weight: .semibold))
+                                        .foregroundStyle(.primary)
                                     if project.workingCount > 0 {
                                         Text("\(project.workingCount)")
                                             .font(.caption2.weight(.bold))
@@ -257,21 +262,24 @@ struct RootShellView: View {
                             Menu {
                                 projectLaunchMenu(project)
                             } label: {
-                                Image(systemName: "plus.circle")
-                                    .foregroundStyle(.secondary)
+                                Image(systemName: "plus.circle.fill")
+                                    .font(.system(size: 13, weight: .medium))
+                                    .foregroundStyle(activeProjectID == project.id ? Color.accentColor : .secondary)
                             }
                             .menuStyle(.borderlessButton)
                             .fixedSize()
                             .help("New session in \(project.name)")
                         }
-                        .padding(.vertical, 2)
+                        .padding(.horizontal, 6)
+                        .frame(minHeight: 38)
                         .background(
                             activeProjectID == project.id
-                                ? AnyShapeStyle(Color.accentColor.opacity(0.10))
+                                ? AnyShapeStyle(Color.accentColor.opacity(0.13))
                                 : AnyShapeStyle(.clear),
-                            in: RoundedRectangle(cornerRadius: 7)
+                            in: RoundedRectangle(cornerRadius: 9)
                         )
                         .contextMenu { projectContextMenu(project) }
+                        .textCase(nil)
                     }
                 }
             }
@@ -295,6 +303,10 @@ struct RootShellView: View {
             .accessibilityLabel("Projects, chats, and terminal sessions")
         } detail: {
             detailPane
+                // The transparent full-size window already provides the native
+                // titlebar hit region. Extending the workspace through its safe
+                // area removes the empty 40pt strip above terminals/previews.
+                .ignoresSafeArea(.container, edges: .top)
         }
         .navigationSplitViewStyle(.balanced)
     }
@@ -347,57 +359,15 @@ struct RootShellView: View {
     }
 
     private var projectSidebarHeader: some View {
-        VStack(spacing: 0) {
-            HStack(spacing: 8) {
-                Label("Projects", systemImage: "folder")
-                    .font(.caption.weight(.semibold))
-                    .foregroundStyle(.secondary)
-                Spacer()
-                Button {
-                    RootShellView.promptForOpenFolder(model: model)
-                } label: {
-                    Image(systemName: "folder.badge.plus")
-                }
-                .buttonStyle(.borderless)
-                .help("Open project folder")
-                Menu {
-                    if splitCandidates.isEmpty {
-                        Button("No other live sessions") {}.disabled(true)
-                    } else {
-                        ForEach(splitCandidates) { session in
-                            Button {
-                                Task { await model.openInSplit(session.id) }
-                            } label: {
-                                Label(model.sessionTitle(for: session), systemImage: "terminal")
-                            }
-                        }
-                    }
-                } label: {
-                    Image(systemName: "rectangle.split.2x1")
-                }
-                .menuStyle(.borderlessButton)
-                .fixedSize()
-                .disabled(model.terminalDocument.sessionID == nil || model.splitOrder.count >= AppModel.maxSplitPanes)
-                .help("Open another session beside this one")
-                Button {
-                    settings.workspaceRailVisible.toggle()
-                } label: {
-                    Image(systemName: settings.workspaceRailVisible ? "sidebar.left" : "sidebar.right")
-                }
-                .buttonStyle(.borderless)
-                .help(settings.workspaceRailVisible ? "Hide file browser (Command-B)" : "Show file browser (Command-B)")
-                Button { showSettings = true } label: {
-                    Image(systemName: "gearshape")
-                }
-                .buttonStyle(.borderless)
-                .help("Settings")
-                .accessibilityLabel("Open in-app settings")
-            }
-            .padding(.horizontal, 12)
-            .padding(.vertical, 9)
-            Divider()
+        HStack(spacing: 8) {
+            Label("Projects", systemImage: "folder.fill")
+                .font(.subheadline.weight(.semibold))
+                .foregroundStyle(.secondary)
+            Spacer()
         }
-        .background(.bar)
+        .padding(.horizontal, 14)
+        .frame(height: 36)
+        .background(.clear)
     }
 
     /// Collapsed project sections, persisted per project id.
@@ -512,6 +482,7 @@ struct RootShellView: View {
             }
         )
         .tag(Optional(session.id))
+        .listRowInsets(.init(top: 1, leading: 20, bottom: 1, trailing: 7))
         .contextMenu {
             Button("Open in New Window") {
                 KaisolaMacAppDelegate.popOut(sessionID: session.id)
@@ -550,21 +521,51 @@ struct RootShellView: View {
 
     @ViewBuilder
     private var detailPane: some View {
-        HSplitView {
+        HStack(spacing: 0) {
             detailContent
                 .frame(minWidth: 420, maxWidth: .infinity, maxHeight: .infinity)
             if settings.workspaceRailVisible, let root = model.currentProjectDirectory {
                 // Files live on the right, matching the editor/reference rail in
                 // the Electron workspace and leaving the project hierarchy as the
                 // sole navigation surface on the left.
-                WorkspaceRailView(
-                    root: root,
-                    openFile: { model.previewedFileURL = $0 },
-                    close: { settings.workspaceRailVisible = false }
-                )
+                workspaceRailDivider
+                WorkspaceRailView(root: root, openFile: { model.previewedFileURL = $0 }) {
+                    settings.workspaceRailVisible = false
+                }
                 .id(root)
+                .frame(width: CGFloat(settings.workspaceRailWidth))
             }
         }
+    }
+
+    private var workspaceRailDivider: some View {
+        ZStack {
+            Rectangle()
+                .fill(Color(nsColor: .separatorColor).opacity(0.8))
+                .frame(width: 1)
+            Rectangle()
+                .fill(.clear)
+                .contentShape(Rectangle())
+        }
+        .frame(width: 7)
+        .onHover { hovering in
+            if hovering { NSCursor.resizeLeftRight.push() } else { NSCursor.pop() }
+        }
+        .gesture(
+            DragGesture(minimumDistance: 0)
+                .onChanged { value in
+                    if workspaceRailDragOrigin == nil {
+                        workspaceRailDragOrigin = settings.workspaceRailWidth
+                    }
+                    guard let origin = workspaceRailDragOrigin else { return }
+                    settings.workspaceRailWidth = NativePreviewSettings.clampedWorkspaceRailWidth(
+                        origin - Double(value.translation.width)
+                    )
+                }
+                .onEnded { _ in workspaceRailDragOrigin = nil }
+        )
+        .help("Drag to resize Files")
+        .accessibilityHidden(true)
     }
 
     private var splitCandidates: [BrokerTerminalRecord] {
@@ -575,23 +576,34 @@ struct RootShellView: View {
         }
     }
 
-    @ViewBuilder
     private var detailContent: some View {
-        if let fileURL = model.previewedFileURL {
-            FilePreviewView(url: fileURL, workspaceRoot: model.currentProjectDirectory) {
-                model.previewedFileURL = nil
-            }
-        } else if let mesh = model.meshes.first(where: { $0.id == model.selectedMeshID }) {
-            MeshView(mesh: mesh)
-                .id(mesh.id)
-        } else if let chat = model.chats.first(where: { $0.id == model.selectedChatID }) {
-            AcpChatView(conversation: chat.conversation)
-                .id(chat.id)
-                .background { WorkspaceBackdropView(mode: settings.workspaceBackdrop) }
-        } else {
+        let alternateSurfaceVisible = model.previewedFileURL != nil
+            || model.browserCardURL != nil
+            || model.selectedMeshID != nil
+            || model.selectedChatID != nil
+        return ZStack {
             terminalContent
                 .background { WorkspaceBackdropView(mode: settings.workspaceBackdrop) }
+                .opacity(alternateSurfaceVisible ? 0 : 1)
+                .allowsHitTesting(!alternateSurfaceVisible)
+                .accessibilityHidden(alternateSurfaceVisible)
+
+            if let fileURL = model.previewedFileURL {
+                FilePreviewView(url: fileURL, workspaceRoot: model.currentProjectDirectory) {
+                    model.previewedFileURL = nil
+                }
+            } else if let browserURL = model.browserCardURL {
+                BrowserCardView(url: browserURL) { model.browserCardURL = nil }
+            } else if let mesh = model.meshes.first(where: { $0.id == model.selectedMeshID }) {
+                MeshView(mesh: mesh)
+                    .id(mesh.id)
+            } else if let chat = model.chats.first(where: { $0.id == model.selectedChatID }) {
+                AcpChatView(conversation: chat.conversation)
+                    .id(chat.id)
+                    .background { WorkspaceBackdropView(mode: settings.workspaceBackdrop) }
+            }
         }
+        .transaction { $0.animation = nil }
     }
 
     private var footer: some View {
@@ -605,7 +617,20 @@ struct RootShellView: View {
             jumpToAttention: { model.jumpToAttentionTarget($0) },
             newMesh: { RootShellView.promptForNewMesh(model: model) },
             newStagedMesh: { RootShellView.promptForNewMesh(model: model, staged: true) },
-            newIdeaMesh: { RootShellView.promptForNewMesh(model: model, idea: true) }
+            newIdeaMesh: { RootShellView.promptForNewMesh(model: model, idea: true) },
+            openProject: { RootShellView.promptForOpenFolder(model: model) },
+            splitTargets: splitCandidates.map {
+                FooterSplitTarget(
+                    id: $0.id,
+                    title: model.sessionTitle(for: $0),
+                    systemImage: model.agentProfile(for: $0.id)?.symbol ?? "terminal"
+                )
+            },
+            openSplit: { id in Task { await model.openInSplit(id) } },
+            filesVisible: settings.workspaceRailVisible,
+            toggleFiles: { settings.workspaceRailVisible.toggle() },
+            showSettings: { showSettings = true },
+            showCommandPalette: { showPalette = true }
         )
     }
 
@@ -842,32 +867,19 @@ struct RootShellView: View {
 
     private var primaryPane: some View {
         let sessionID = model.terminalDocument.sessionID
-        let owned = sessionID.map(model.isOwned) ?? false
         return ZStack(alignment: .topTrailing) {
-            NativeTerminalSurface(
-                output: model.terminalDocument.output,
-                streamEpoch: model.terminalDocument.cursor?.streamEpoch,
-                endOffset: model.terminalDocument.cursor?.offset,
-                isOwned: owned,
-                fontSize: settings.terminalFontSize,
-                fontFamily: settings.terminalFontFamily,
-                fontWeight: settings.terminalFontWeight,
-                paletteMode: settings.terminalPalette,
-                lightSurface: colorScheme == .light,
-                onInput: owned ? { data in
-                    guard let sessionID else { return }
-                    model.sendInput(data, to: sessionID)
-                } : nil,
-                onResize: owned ? { columns, rows in
-                    guard let sessionID else { return }
-                    model.resizeTerminal(sessionID, columns: columns, rows: rows)
-                } : nil,
-                onTitleChange: owned ? { title in
-                    guard let sessionID else { return }
-                    model.applyAutoTitle(title, to: sessionID)
-                } : nil
-            )
-            .id("\(sessionID ?? "none")-\(owned)")
+            ForEach(model.terminalSurfaceOrder, id: \.self) { terminalID in
+                if let retainedDocument = model.terminalSurfaceDocuments[terminalID] {
+                    let document = terminalID == sessionID
+                        ? model.terminalDocument
+                        : retainedDocument
+                    primaryTerminalSurface(
+                        terminalID: terminalID,
+                        document: document,
+                        active: terminalID == sessionID
+                    )
+                }
+            }
             if model.terminalDocument.truncated {
                 Label("Retained tail", systemImage: "ellipsis.rectangle")
                     .font(.caption)
@@ -878,6 +890,36 @@ struct RootShellView: View {
                     .accessibilityLabel("Older terminal output was outside the retained history")
             }
         }
+        .transaction { $0.animation = nil }
+    }
+
+    private func primaryTerminalSurface(
+        terminalID: String,
+        document: TerminalDocument,
+        active: Bool
+    ) -> some View {
+        let owned = model.isOwned(terminalID)
+        return NativeTerminalSurface(
+            output: document.output,
+            streamEpoch: document.cursor?.streamEpoch,
+            endOffset: document.cursor?.offset,
+            isOwned: owned,
+            fontSize: settings.terminalFontSize,
+            fontFamily: settings.terminalFontFamily,
+            fontWeight: settings.terminalFontWeight,
+            paletteMode: settings.terminalPalette,
+            lightSurface: colorScheme == .light,
+            onInput: owned && active ? { data in model.sendInput(data, to: terminalID) } : nil,
+            onResize: owned && active ? { columns, rows in
+                model.resizeTerminal(terminalID, columns: columns, rows: rows)
+            } : nil,
+            onTitleChange: owned && active ? { title in model.applyAutoTitle(title, to: terminalID) } : nil
+        )
+        .id("primary-\(terminalID)-\(owned)")
+        .opacity(active ? 1 : 0)
+        .allowsHitTesting(active)
+        .accessibilityHidden(!active)
+        .zIndex(active ? 1 : 0)
     }
 
     @ViewBuilder
@@ -1159,6 +1201,14 @@ private struct RenameID: Identifiable { let id: String }
 /// Identifiable wrapper so a repo URL can drive a `.sheet(item:)`.
 private struct GitRepoID: Identifiable { let url: URL; var id: String { url.path } }
 
+/// Lightweight footer menu item; keeping broker records out of the footer makes
+/// its bottom-left utility shelf purely presentational.
+private struct FooterSplitTarget: Identifiable {
+    let id: String
+    let title: String
+    let systemImage: String
+}
+
 private struct RenameSheet: View {
     @Binding var text: String
     var title: String = "Rename Session"
@@ -1284,6 +1334,13 @@ private struct ConnectionFooter: View {
     var newMesh: (() -> Void)?
     var newStagedMesh: (() -> Void)?
     var newIdeaMesh: (() -> Void)?
+    let openProject: () -> Void
+    let splitTargets: [FooterSplitTarget]
+    let openSplit: (String) -> Void
+    let filesVisible: Bool
+    let toggleFiles: () -> Void
+    let showSettings: () -> Void
+    let showCommandPalette: () -> Void
 
     @ObservedObject private var usage = UsageCenter.shared
 
@@ -1294,85 +1351,45 @@ private struct ConnectionFooter: View {
         AgentRegistry.all.filter { AcpAdapter.forAgent($0.id) != nil }
     }
 
+    private static let userName: String = {
+        let fullName = NSFullUserName().trimmingCharacters(in: .whitespacesAndNewlines)
+        if !fullName.isEmpty { return fullName }
+        return ProcessInfo.processInfo.environment["USER"] ?? "Local user"
+    }()
+
+    private static let appVersion = Bundle.main.object(
+        forInfoDictionaryKey: "CFBundleShortVersionString"
+    ) as? String ?? "Dev"
+
     var body: some View {
-        HStack(spacing: 8) {
-            Circle()
-                .fill(state.isConnected ? Color.green : Color.orange)
-                .frame(width: 7, height: 7)
-            VStack(alignment: .leading, spacing: 2) {
-                Text("Kaisola")
-                    .font(.caption.weight(.semibold))
-                Text(state.detail ?? state.title)
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
-                    .truncationMode(.middle)
-            }
-            Spacer()
-            if usage.totalPeakTokens > 0 {
-                HStack(spacing: 4) {
-                    Image(systemName: "gauge.with.dots.needle.bottom.50percent")
-                    Text("\(usage.totalPeakTokens / 1000)k").monospacedDigit()
-                    Text("· \(Int((usage.contextPressure * 100).rounded()))%")
-                        .foregroundStyle(usage.contextPressure >= 0.85 ? .orange : .secondary)
+        VStack(spacing: 0) {
+            HStack(spacing: 8) {
+                ZStack(alignment: .bottomTrailing) {
+                    Image(systemName: "person.crop.circle.fill")
+                        .font(.system(size: 20))
+                        .foregroundStyle(.secondary)
+                    Circle()
+                        .fill(state.isConnected ? Color.green : Color.orange)
+                        .frame(width: 7, height: 7)
+                        .overlay(Circle().stroke(.background, lineWidth: 1.5))
                 }
-                .font(.caption)
-                .help("Session tokens (peak) · highest context pressure")
-            }
-            if newMesh != nil || newStagedMesh != nil || newIdeaMesh != nil {
-                Menu {
-                    if let newMesh { Button("New Mesh (all agents)", action: newMesh) }
-                    if let newStagedMesh { Button("New Staged Mesh (scout → execute)", action: newStagedMesh) }
-                    if let newIdeaMesh { Button("New Idea Mesh (brainstorm)", action: newIdeaMesh) }
-                } label: {
-                    Image(systemName: "circle.hexagongrid.fill").foregroundStyle(.purple)
-                }
-                .menuStyle(.borderlessButton)
-                .fixedSize()
-                .help("New Mesh — flat, staged, or idea")
-            }
-            if attention.count > 0 {
-                Button {
-                    showInbox.toggle()
-                } label: {
-                    Label("\(attention.count)", systemImage: "bell.badge.fill")
+                VStack(alignment: .leading, spacing: 0) {
+                    Text(Self.userName)
                         .font(.caption.weight(.semibold))
-                        .foregroundStyle(.orange)
+                        .lineLimit(1)
+                    Text("Kaisola · v\(Self.appVersion)")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
                 }
-                .buttonStyle(.borderless)
-                .help("Needs you — permission asks and finished agents")
-                .popover(isPresented: $showInbox, arrowEdge: .top) {
-                    VStack(alignment: .leading, spacing: 0) {
-                        ForEach(attention.entries.reversed()) { entry in
-                            Button {
-                                showInbox = false
-                                jumpToAttention?(entry.targetID)
-                            } label: {
-                                HStack(spacing: 8) {
-                                    Image(systemName: entry.kind == .permission ? "hand.raised.fill" : "checkmark.circle.fill")
-                                        .foregroundStyle(entry.kind == .permission ? Color.orange : .green)
-                                    VStack(alignment: .leading, spacing: 1) {
-                                        Text(entry.title).font(.callout).lineLimit(1)
-                                        Text(entry.detail).font(.caption).foregroundStyle(.secondary).lineLimit(1)
-                                    }
-                                    Spacer()
-                                }
-                                .contentShape(Rectangle())
-                            }
-                            .buttonStyle(.plain)
-                            .padding(.horizontal, 12).padding(.vertical, 6)
-                        }
-                        Divider()
-                        Button("Clear All") { attention.clearAll(); showInbox = false }
-                            .buttonStyle(.borderless)
-                            .font(.caption)
-                            .padding(8)
-                    }
-                    .frame(width: 300)
-                    .padding(.vertical, 6)
-                }
+                Spacer(minLength: 4)
+                attentionButton
             }
-            if canCreate {
+            .help(state.detail ?? state.title)
+
+            HStack(spacing: 6) {
+                footerButton("folder.badge.plus", help: "Open project folder", action: openProject)
+
                 Menu {
                     ForEach(chatAgents) { agent in
                         Button {
@@ -1382,36 +1399,155 @@ private struct ConnectionFooter: View {
                         }
                     }
                     Divider()
-                    Button {
-                        newTerminal()
-                    } label: {
-                        Label("New Terminal", systemImage: "terminal")
-                    }
+                    Button(action: newTerminal) { Label("New Terminal", systemImage: "terminal") }
                     ForEach(AgentRegistry.all) { agent in
                         Button {
                             newAgent(agent)
                         } label: {
-                            Label("New \(agent.name) Agent (Terminal)", systemImage: agent.symbol)
+                            Label("New \(agent.name) Agent", systemImage: agent.symbol)
                         }
                     }
                 } label: {
                     Image(systemName: "plus")
+                        .frame(width: 20, height: 22)
                 }
                 .menuStyle(.borderlessButton)
                 .fixedSize()
-                .help("New chat or session")
+                .disabled(!canCreate)
+                .help("New chat or terminal in this project")
                 .accessibilityLabel("New session")
+
+                Menu {
+                    if splitTargets.isEmpty {
+                        Button("No other live sessions") {}.disabled(true)
+                    } else {
+                        ForEach(splitTargets) { target in
+                            Button {
+                                openSplit(target.id)
+                            } label: {
+                                Label(target.title, systemImage: target.systemImage)
+                            }
+                        }
+                    }
+                } label: {
+                    Image(systemName: "rectangle.split.2x1")
+                        .frame(width: 20, height: 22)
+                }
+                .menuStyle(.borderlessButton)
+                .fixedSize()
+                .disabled(splitTargets.isEmpty)
+                .help("Open another terminal beside this one")
+
+                footerButton(
+                    filesVisible ? "sidebar.trailing" : "sidebar.right",
+                    help: filesVisible ? "Hide Files (Command-B)" : "Show Files (Command-B)",
+                    action: toggleFiles
+                )
+
+                if newMesh != nil || newStagedMesh != nil || newIdeaMesh != nil {
+                    Menu {
+                        if let newMesh { Button("New Mesh (all agents)", action: newMesh) }
+                        if let newStagedMesh { Button("New Staged Mesh (scout → execute)", action: newStagedMesh) }
+                        if let newIdeaMesh { Button("New Idea Mesh (brainstorm)", action: newIdeaMesh) }
+                    } label: {
+                        Image(systemName: "circle.hexagongrid.fill")
+                            .foregroundStyle(.purple)
+                            .frame(width: 24, height: 22)
+                            .background(Color.purple.opacity(0.16), in: RoundedRectangle(cornerRadius: 7))
+                    }
+                    .menuStyle(.borderlessButton)
+                    .fixedSize()
+                    .help("New Mesh — flat, staged, or idea")
+                }
+
+                Spacer(minLength: 0)
+
+                Menu {
+                    Button(action: showCommandPalette) {
+                        Label("Command Palette", systemImage: "command")
+                    }
+                    Button(action: reload) {
+                        Label("Reconnect", systemImage: "arrow.clockwise")
+                    }
+                    Divider()
+                    Text(state.detail ?? state.title)
+                    if usage.totalPeakTokens > 0 {
+                        Text("Usage: \(usage.totalPeakTokens / 1000)k tokens · \(Int((usage.contextPressure * 100).rounded()))% context")
+                    }
+                } label: {
+                    Image(systemName: "ellipsis")
+                        .frame(width: 20, height: 22)
+                }
+                .menuStyle(.borderlessButton)
+                .fixedSize()
+                .help("More workspace actions")
+
+                footerButton("gearshape", help: "Settings", action: showSettings)
+                    .accessibilityLabel("Open in-app settings")
             }
-            Button(action: reload) {
-                Image(systemName: "arrow.clockwise")
+            .font(.callout)
+            .controlSize(.small)
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 7)
+        .frame(height: 70)
+        .background(.ultraThinMaterial)
+        .overlay(alignment: .top) {
+            Rectangle().fill(Color(nsColor: .separatorColor).opacity(0.7)).frame(height: 1)
+        }
+    }
+
+    private func footerButton(_ symbol: String, help: String, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Image(systemName: symbol)
+                .frame(width: 20, height: 22)
+        }
+        .buttonStyle(.borderless)
+        .help(help)
+    }
+
+    @ViewBuilder
+    private var attentionButton: some View {
+        if attention.count > 0 {
+            Button {
+                showInbox.toggle()
+            } label: {
+                Label("\(attention.count)", systemImage: "bell.badge.fill")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.orange)
             }
             .buttonStyle(.borderless)
-            .help("Reconnect without changing terminal ownership")
-            .accessibilityLabel("Reconnect to terminal broker")
+            .help("Needs you — permission asks and finished agents")
+            .popover(isPresented: $showInbox, arrowEdge: .top) {
+                VStack(alignment: .leading, spacing: 0) {
+                    ForEach(attention.entries.reversed()) { entry in
+                        Button {
+                            showInbox = false
+                            jumpToAttention?(entry.targetID)
+                        } label: {
+                            HStack(spacing: 8) {
+                                Image(systemName: entry.kind == .permission ? "hand.raised.fill" : "checkmark.circle.fill")
+                                    .foregroundStyle(entry.kind == .permission ? Color.orange : .green)
+                                VStack(alignment: .leading, spacing: 1) {
+                                    Text(entry.title).font(.callout).lineLimit(1)
+                                    Text(entry.detail).font(.caption).foregroundStyle(.secondary).lineLimit(1)
+                                }
+                                Spacer()
+                            }
+                            .contentShape(Rectangle())
+                        }
+                        .buttonStyle(.plain)
+                        .padding(.horizontal, 12).padding(.vertical, 6)
+                    }
+                    Divider()
+                    Button("Clear All") { attention.clearAll(); showInbox = false }
+                        .buttonStyle(.borderless)
+                        .font(.caption)
+                        .padding(8)
+                }
+                .frame(width: 300)
+                .padding(.vertical, 6)
+            }
         }
-        .padding(.horizontal, 12)
-        .frame(height: 52)
-        .background(.ultraThinMaterial)
-        .overlay(alignment: .top) { Divider() }
     }
 }

@@ -136,6 +136,24 @@ final class NativePreviewSettings: ObservableObject {
         didSet { defaults.set(workspaceRailVisible, forKey: Keys.workspaceRail) }
     }
 
+    /// Width of the right-hand file rail. This is app-owned instead of an
+    /// `HSplitView` autosave so a stale AppKit divider can never reopen Files at
+    /// half the window. The deliberately narrow default keeps the terminal the
+    /// primary canvas while still leaving the rail smoothly resizable.
+    @Published var workspaceRailWidth: Double {
+        didSet {
+            let clamped = Self.clampedWorkspaceRailWidth(workspaceRailWidth)
+            if clamped != workspaceRailWidth {
+                workspaceRailWidth = clamped
+                return
+            }
+            defaults.set(clamped, forKey: Keys.workspaceRailWidth)
+        }
+    }
+
+    static let workspaceRailWidthRange: ClosedRange<Double> = 205...360
+    static let workspaceRailWidthDefault: Double = 248
+
     /// Sensitive-file globs the guardrails enforce (always prompt, never
     /// rule-coverable, fs bridge refuses them). Editable in Settings.
     @Published var sensitiveGlobs: [String] {
@@ -195,6 +213,7 @@ final class NativePreviewSettings: ObservableObject {
         static let terminalFontWeight = "terminalFontWeight"
         static let terminalPalette = "terminalPalette"
         static let workspaceRail = "workspaceRailVisible"
+        static let workspaceRailWidth = "workspaceRailWidth"
         static let sensitiveGlobs = "sensitiveGlobs"
         static let claudeConfigDir = "claudeConfigDir"
         static let codexHome = "codexHome"
@@ -212,6 +231,10 @@ final class NativePreviewSettings: ObservableObject {
             ? min(max(stored, Self.terminalFontRange.lowerBound), Self.terminalFontRange.upperBound)
             : Self.terminalFontDefault
         workspaceRailVisible = defaults.object(forKey: Keys.workspaceRail) as? Bool ?? true
+        let storedRailWidth = defaults.double(forKey: Keys.workspaceRailWidth)
+        workspaceRailWidth = storedRailWidth > 0
+            ? Self.clampedWorkspaceRailWidth(storedRailWidth)
+            : Self.workspaceRailWidthDefault
         terminalFontFamily = defaults.string(forKey: Keys.terminalFontFamily) ?? TerminalFontOptions.systemMonoSentinel
         terminalFontWeight = defaults.string(forKey: Keys.terminalFontWeight) ?? "regular"
         terminalPalette = defaults.string(forKey: Keys.terminalPalette).flatMap(TerminalPaletteMode.init) ?? .native
@@ -235,6 +258,10 @@ final class NativePreviewSettings: ObservableObject {
 
     func resetTerminalFont() {
         terminalFontSize = Self.terminalFontDefault
+    }
+
+    static func clampedWorkspaceRailWidth(_ width: Double) -> Double {
+        min(max(width, workspaceRailWidthRange.lowerBound), workspaceRailWidthRange.upperBound)
     }
 }
 

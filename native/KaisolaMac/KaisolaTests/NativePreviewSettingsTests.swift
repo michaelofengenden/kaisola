@@ -23,12 +23,14 @@ final class NativePreviewSettingsTests: XCTestCase {
         XCTAssertEqual(settings.workspaceBackdrop, .glass)
         XCTAssertEqual(settings.terminalPalette, .native)
         XCTAssertTrue(settings.workspaceRailVisible)
+        XCTAssertEqual(settings.workspaceRailWidth, NativePreviewSettings.workspaceRailWidthDefault)
 
         settings.navigationLayout = .topBar
         settings.appearance = .dark
         settings.sidebarAppearance = .solid
         settings.workspaceBackdrop = .tinted
         settings.terminalPalette = .kaisola
+        settings.workspaceRailWidth = 300
 
         let reloaded = NativePreviewSettings(defaults: defaults)
         XCTAssertEqual(reloaded.navigationLayout, .topBar)
@@ -36,6 +38,13 @@ final class NativePreviewSettingsTests: XCTestCase {
         XCTAssertEqual(reloaded.sidebarAppearance, .solid)
         XCTAssertEqual(reloaded.workspaceBackdrop, .tinted)
         XCTAssertEqual(reloaded.terminalPalette, .kaisola)
+        XCTAssertEqual(reloaded.workspaceRailWidth, 300)
+    }
+
+    func testWorkspaceRailWidthStaysThinAndClamped() {
+        XCTAssertEqual(NativePreviewSettings.clampedWorkspaceRailWidth(100), 205)
+        XCTAssertEqual(NativePreviewSettings.clampedWorkspaceRailWidth(248), 248)
+        XCTAssertEqual(NativePreviewSettings.clampedWorkspaceRailWidth(900), 360)
     }
 
     func testVisualChoiceTitlesRemainUserFacing() {

@@ -319,24 +319,9 @@ struct RootShellView: View {
                 projectSidebarHeader
             }
             .safeAreaInset(edge: .bottom) { footer }
-            .overlay(alignment: .trailing) {
-                Rectangle()
-                    .fill(Color(nsColor: .separatorColor).opacity(0.85))
-                    .frame(width: 1)
-                    .shadow(color: .black.opacity(0.14), radius: 2, x: 1)
-            }
             .accessibilityLabel("Projects, chats, and terminal sessions")
         } detail: {
             detailPane
-                // Keep representable content (especially SwiftTerm) inside the
-                // hosting view's real layout bounds. Moving the NSView itself
-                // through the titlebar safe area can leave it with a valid frame
-                // that AppKit does not composite after a window transition.
-                // Only the canvas paint extends beneath the transparent titlebar.
-                .background {
-                    WorkspaceBackdropView(mode: settings.workspaceBackdrop)
-                        .ignoresSafeArea(.container, edges: .top)
-                }
         }
         .navigationSplitViewStyle(.balanced)
     }
@@ -352,6 +337,7 @@ struct RootShellView: View {
                 openFolder: { RootShellView.promptForOpenFolder(model: model) },
                 reorder: { model.moveProject(id: $0, toIndex: $1) }
             )
+            .padding(.leading, NativeWorkspaceChrome.topBarTrafficLightClearance)
             Divider()
             if let active = model.projects.first(where: { $0.id == activeProjectID }),
                let activeDir = active.directory {
@@ -398,7 +384,8 @@ struct RootShellView: View {
             Spacer()
         }
         .padding(.horizontal, 14)
-        .frame(height: 36)
+        .padding(.top, NativeWorkspaceChrome.sidebarTrafficLightClearance)
+        .frame(height: 36 + NativeWorkspaceChrome.sidebarTrafficLightClearance, alignment: .bottom)
         .background(.clear)
     }
 
@@ -867,8 +854,16 @@ struct RootShellView: View {
                 }
                 if isPrimary {
                     primaryPane
+                        .padding(.leading, TerminalPaneGrid.contentLeadingInset)
+                        .padding(.top, TerminalPaneGrid.contentTopInset)
+                        .padding(.trailing, TerminalPaneGrid.contentTrailingInset)
+                        .padding(.bottom, TerminalPaneGrid.contentBottomInset)
                 } else {
                     splitPane(id)
+                        .padding(.leading, TerminalPaneGrid.contentLeadingInset)
+                        .padding(.top, TerminalPaneGrid.contentTopInset)
+                        .padding(.trailing, TerminalPaneGrid.contentTrailingInset)
+                        .padding(.bottom, TerminalPaneGrid.contentBottomInset)
                 }
             }
 
@@ -1127,6 +1122,14 @@ private struct InAppSettingsSheet: View {
 /// Pure layout policy for the terminal card grid. Kept separate from SwiftUI so
 /// pane balancing stays deterministic and directly testable.
 enum TerminalPaneGrid {
+    /// Insets belong to the renderer frame, not the terminal card. The opaque
+    /// card still reaches every rounded edge while the first glyph and caret
+    /// stay clear of the curved mask.
+    static let contentLeadingInset: CGFloat = 8
+    static let contentTopInset: CGFloat = 7
+    static let contentTrailingInset: CGFloat = 6
+    static let contentBottomInset: CGFloat = 5
+
     static func showsIdentityHeader(paneCount: Int) -> Bool {
         paneCount > 1
     }
@@ -1150,6 +1153,13 @@ enum TerminalPaneGrid {
         if let replacement = splitOrder.first { return .promote(replacement) }
         return .clearPrimary
     }
+}
+
+/// Full-height workspace metrics. The detail canvas has no titlebar inset;
+/// only navigation that sits beneath the traffic lights reserves clearance.
+enum NativeWorkspaceChrome {
+    static let sidebarTrafficLightClearance: CGFloat = 40
+    static let topBarTrafficLightClearance: CGFloat = 76
 }
 
 enum TerminalPaneMinimizeAction: Equatable {

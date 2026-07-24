@@ -1,6 +1,18 @@
 import AppKit
 import SwiftUI
 
+/// The main workspace is a full-size-content window. Giving SwiftUI the
+/// hosting view's real full-height bounds lets every workspace surface meet the
+/// top edge without translating AppKit representables (notably SwiftTerm)
+/// outside their compositor. Sidebar content adds its own traffic-light
+/// clearance; detail panes intentionally use the entire height.
+@MainActor
+final class FullHeightWorkspaceHostingView<Content: View>: NSHostingView<Content> {
+    override var safeAreaInsets: NSEdgeInsets {
+        NSEdgeInsets(top: 0, left: 0, bottom: 0, right: 0)
+    }
+}
+
 @main
 @MainActor
 enum KaisolaMacMain {
@@ -174,7 +186,11 @@ final class KaisolaMacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDele
             window.cascadeTopLeft(from: NSPoint(x: 40 * CGFloat(windowCounter), y: 40 * CGFloat(windowCounter)))
         }
         windowCounter += 1
-        window.contentView = NSHostingView(rootView: content)
+        if visualSettings {
+            window.contentView = NSHostingView(rootView: content)
+        } else {
+            window.contentView = FullHeightWorkspaceHostingView(rootView: content)
+        }
         window.delegate = self
         window.makeKeyAndOrderFront(nil)
         windowModels[ObjectIdentifier(window)] = model

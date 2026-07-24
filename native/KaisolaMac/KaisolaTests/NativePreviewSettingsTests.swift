@@ -68,6 +68,18 @@ final class NativePreviewSettingsTests: XCTestCase {
         XCTAssertTrue(TerminalPaneGrid.showsIdentityHeader(paneCount: 4))
     }
 
+    func testTerminalPaneGridKeepsGlyphsInsideRoundedSurface() {
+        XCTAssertEqual(TerminalPaneGrid.contentLeadingInset, 8)
+        XCTAssertEqual(TerminalPaneGrid.contentTopInset, 7)
+        XCTAssertEqual(TerminalPaneGrid.contentTrailingInset, 6)
+        XCTAssertEqual(TerminalPaneGrid.contentBottomInset, 5)
+    }
+
+    func testFullHeightWorkspaceOnlyReservesTrafficLightClearanceInNavigation() {
+        XCTAssertEqual(NativeWorkspaceChrome.sidebarTrafficLightClearance, 40)
+        XCTAssertEqual(NativeWorkspaceChrome.topBarTrafficLightClearance, 76)
+    }
+
     func testTerminalPaneMinimizeKeepsSessionsRunningAndChoosesAVisibleReplacement() {
         XCTAssertEqual(
             TerminalPaneGrid.minimizeAction(targetID: "b", primaryID: "a", splitOrder: ["b", "c"]),

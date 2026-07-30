@@ -60,22 +60,28 @@ jobs:
             test -n "${!name:-}" || { echo "Missing required candidate credential: $name" >&2; exit 1; }
           done
 
-          # Prefer an App Store Connect API key. Individual API keys work with
-          # key ID + private key only; organizational keys may additionally set
-          # APPLE_API_ISSUER. Apple-ID credentials remain a deliberate fallback.
-          if [[ -n "${APPLE_API_KEY_ID:-}" || -n "${APPLE_API_PRIVATE_KEY:-}" ]]; then
-            test -n "${APPLE_API_KEY_ID:-}" || { echo 'APPLE_API_KEY_ID is required with APPLE_API_PRIVATE_KEY' >&2; exit 1; }
-            test -n "${APPLE_API_PRIVATE_KEY:-}" || { echo 'APPLE_API_PRIVATE_KEY is required with APPLE_API_KEY_ID' >&2; exit 1; }
+          # notarytool only accepts team App Store Connect API keys, which
+          # always require key ID + private key + issuer UUID. Individual API
+          # keys cannot notarize. A complete Apple-ID credential pair is the
+          # deliberate fallback, even when an unusable partial API set exists.
+          if [[ -n "${APPLE_API_KEY_ID:-}" && -n "${APPLE_API_PRIVATE_KEY:-}" && -n "${APPLE_API_ISSUER:-}" ]]; then
             api_key_file="$RUNNER_TEMP/AuthKey_${APPLE_API_KEY_ID}.p8"
             umask 077
             printf '%s' "$APPLE_API_PRIVATE_KEY" | base64 --decode > "$api_key_file"
             test -s "$api_key_file" || { echo 'APPLE_API_PRIVATE_KEY decoded to an empty file' >&2; exit 1; }
             echo "NOTARY_AUTH_MODE=api-key" >> "$GITHUB_ENV"
             echo "APPLE_API_PRIVATE_KEY_FILE=$api_key_file" >> "$GITHUB_ENV"
-          else
-            test -n "${APPLE_ID:-}" || { echo 'APPLE_ID or the preferred API-key credentials are required' >&2; exit 1; }
-            test -n "${APPLE_APP_SPECIFIC_PASSWORD:-}" || { echo 'APPLE_APP_SPECIFIC_PASSWORD is required with APPLE_ID' >&2; exit 1; }
+          elif [[ -n "${APPLE_ID:-}" && -n "${APPLE_APP_SPECIFIC_PASSWORD:-}" ]]; then
             echo "NOTARY_AUTH_MODE=apple-id" >> "$GITHUB_ENV"
+          elif [[ -n "${APPLE_API_KEY_ID:-}" || -n "${APPLE_API_PRIVATE_KEY:-}" || -n "${APPLE_API_ISSUER:-}" ]]; then
+            echo 'Notarization requires a team App Store Connect API key: set APPLE_API_KEY_ID, APPLE_API_PRIVATE_KEY, and APPLE_API_ISSUER. Individual API keys are unsupported by notarytool.' >&2
+            exit 1
+          elif [[ -n "${APPLE_ID:-}" || -n "${APPLE_APP_SPECIFIC_PASSWORD:-}" ]]; then
+            echo 'Apple-ID notarization requires both APPLE_ID and APPLE_APP_SPECIFIC_PASSWORD.' >&2
+            exit 1
+          else
+            echo 'Missing notarization credentials: configure a complete team API-key set or a complete Apple-ID set.' >&2
+            exit 1
           fi
       - name: Download Kaisola helper runtimes
         run: npm run native:helper:download
@@ -182,8 +188,7 @@ jobs:
             local target="$1"
             local -a authentication
             if [[ "$NOTARY_AUTH_MODE" == api-key ]]; then
-              authentication=(--key "$APPLE_API_PRIVATE_KEY_FILE" --key-id "$APPLE_API_KEY_ID")
-              if [[ -n "${APPLE_API_ISSUER:-}" ]]; then authentication+=(--issuer "$APPLE_API_ISSUER"); fi
+              authentication=(--key "$APPLE_API_PRIVATE_KEY_FILE" --key-id "$APPLE_API_KEY_ID" --issuer "$APPLE_API_ISSUER")
             else
               authentication=(--apple-id "$APPLE_ID" --password "$APPLE_APP_SPECIFIC_PASSWORD" --team-id "$APPLE_TEAM_ID")
             fi

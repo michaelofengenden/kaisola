@@ -247,8 +247,13 @@ test('candidate workflow performs expensive signing and supports API-key notariz
   assert.match(candidate, /uses: \.\/\.github\/workflows\/swift-contracts\.yml/)
   assert.match(candidate, /APPLE_API_KEY_ID: \$\{\{ secrets\.APPLE_API_KEY_ID \}\}/)
   assert.match(candidate, /APPLE_API_PRIVATE_KEY: \$\{\{ secrets\.APPLE_API_PRIVATE_KEY \}\}/)
+  assert.match(candidate, /APPLE_API_ISSUER: \$\{\{ secrets\.APPLE_API_ISSUER \}\}/)
   assert.match(candidate, /NOTARY_AUTH_MODE=api-key/)
-  assert.match(candidate, /--key "\$APPLE_API_PRIVATE_KEY_FILE" --key-id "\$APPLE_API_KEY_ID"/)
+  assert.match(
+    candidate,
+    /--key "\$APPLE_API_PRIVATE_KEY_FILE" --key-id "\$APPLE_API_KEY_ID" --issuer "\$APPLE_API_ISSUER"/,
+  )
+  assert.match(candidate, /Individual API keys are unsupported by notarytool/)
   assert.match(candidate, /authentication=\(--apple-id "\$APPLE_ID"/)
   assert.match(candidate, /xcrun notarytool submit/)
   assert.match(candidate, /xcrun stapler staple/)

@@ -84,6 +84,11 @@ in this repository.
   digests after upload, and added safe first-release/interrupted-promotion
   recovery. Expensive candidate validation is reported separately from the
   target one-to-two-minute public promotion.
+- Tightened notarization credential preflight after the first protected-main
+  candidate exposed an invalid assumption: Apple individual API keys are now
+  rejected before building, team API-key authentication always requires its
+  issuer UUID, and a complete Apple-ID/app-specific-password pair can serve as
+  the explicit fallback.
 - Made unattended visual, memory, and cadence fixtures ignore AppKit crash-state
   restore prompts without accepting unrelated output, and aligned their broker
   metadata lookup with the private native fixture layout.

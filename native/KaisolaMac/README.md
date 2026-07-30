@@ -192,6 +192,18 @@ npm run native:helper:probe -- \
 Distribution validation adds `--require-updates --require-developer-id
 --require-notarized`. Those flags intentionally fail an ad-hoc local build.
 
+The protected-main candidate workflow requires the Developer ID certificate,
+team ID, and Sparkle private-key secrets plus one complete notarization method:
+
+- team App Store Connect API key: `APPLE_API_KEY_ID`,
+  `APPLE_API_PRIVATE_KEY` (base64-encoded `.p8`), and
+  `APPLE_API_ISSUER` (issuer UUID); or
+- Apple ID fallback: `APPLE_ID` and `APPLE_APP_SPECIFIC_PASSWORD`.
+
+Individual App Store Connect API keys are intentionally rejected because Apple
+does not permit them to authenticate `notarytool`. Credential preflight runs
+before the distribution build so an incomplete set fails quickly.
+
 Xcode signs an SPM framework container but does not replace Sparkle's vendor
 signatures on its nested Autoupdate/Updater/XPC executables. Normalize one
 already-built candidate before preflight:

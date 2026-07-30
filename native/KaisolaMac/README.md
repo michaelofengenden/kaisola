@@ -20,7 +20,7 @@ npm run native:fast
 
 This is the shortest edit → build → run loop. It performs an
 active-architecture incremental Debug build in the persistent
-`.build/KaisolaNative.noindex` cache and launches that build product directly.
+`.build/Kaisola.noindex` cache and launches that build product directly.
 It disables the command-line index store, uses only `Package.resolved`, reuses
 the selected detached broker, and skips helper packaging, app installation,
 Launch Services cleanup, notarization, and release verification. Useful forms:

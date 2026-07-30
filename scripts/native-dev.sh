@@ -16,7 +16,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
 PROJECT="$ROOT/native/KaisolaMac/KaisolaMac.xcodeproj"
 SCHEME="Kaisola"
 CONFIGURATION="${KAISOLA_NATIVE_CONFIGURATION:-Debug}"
-DERIVED_DATA="${KAISOLA_NATIVE_DERIVED_DATA:-$ROOT/.build/KaisolaNative.noindex}"
+DERIVED_DATA="${KAISOLA_NATIVE_DERIVED_DATA:-$ROOT/.build/Kaisola.noindex}"
 APP="${KAISOLA_NATIVE_APP:-$HOME/Applications/Kaisola Dev.app}"
 SOURCE_APP="$DERIVED_DATA/Build/Products/$CONFIGURATION/Kaisola.app"
 PROFILE_ROUTE="${KAISOLA_NATIVE_BROKER_PROFILE:-native}"
@@ -140,7 +140,7 @@ unregister_noncanonical_products() {
   shopt -s nullglob
   local product
   for product in \
-    "$ROOT"/.build/KaisolaNative*.noindex/Build/Products/*/Kaisola.app \
+    "$ROOT"/.build/Kaisola*.noindex/Build/Products/*/Kaisola.app \
     "$HOME"/Library/Developer/Xcode/DerivedData/KaisolaMac-*/Build/Products/*/Kaisola.app \
     "$HOME"/Library/Developer/Xcode/DerivedData/KaisolaMac-*/Index.noindex/Build/Products/*/Kaisola.app; do
     [[ "$product" == "$APP" ]] && continue
@@ -301,7 +301,7 @@ clean_legacy_copies() {
 
   shopt -s nullglob
   local product
-  for product in "$ROOT"/.build/KaisolaNative*.noindex/Build/Products/*/KaisolaMacPreview.app; do
+  for product in "$ROOT"/.build/Kaisola*.noindex/Build/Products/*/KaisolaMacPreview.app; do
     move_to_trash "$product"
   done
   for product in "$HOME"/Library/Developer/Xcode/DerivedData/KaisolaMac-*/Build/Products/*/KaisolaMacPreview.app; do

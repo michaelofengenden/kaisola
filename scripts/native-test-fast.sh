@@ -5,7 +5,7 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
 PROJECT="$ROOT/native/KaisolaMac/KaisolaMac.xcodeproj"
-DERIVED_DATA="${KAISOLA_NATIVE_DERIVED_DATA:-$ROOT/.build/KaisolaNative.noindex}"
+DERIVED_DATA="${KAISOLA_NATIVE_DERIVED_DATA:-$ROOT/.build/Kaisola.noindex}"
 VERBOSE=0
 RUN_ONLY=0
 declare -a SELECTORS=()

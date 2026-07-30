@@ -22,6 +22,7 @@ const BROKER_PACKAGE_SCHEMA = 1
 const TERMINAL_OBSERVE_FEATURE = 'terminal-observe-v1'
 const TERMINAL_HISTORY_FEATURE = 'terminal-history-v1'
 const OBSERVER_ROLE_FEATURE = 'observer-role-v1'
+const BROKER_UPDATE_FEATURE = 'broker-update-v1'
 const OBSERVER_ACCESS = 'observer'
 const OBSERVER_METHODS = Object.freeze([
   'broker.status',
@@ -72,6 +73,7 @@ module.exports = {
   TERMINAL_OBSERVE_FEATURE,
   TERMINAL_HISTORY_FEATURE,
   OBSERVER_ROLE_FEATURE,
+  BROKER_UPDATE_FEATURE,
   OBSERVER_ACCESS,
   OBSERVER_METHODS,
   MAX_FRAME,

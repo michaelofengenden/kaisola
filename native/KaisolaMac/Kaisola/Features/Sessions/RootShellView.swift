@@ -53,7 +53,11 @@ struct RootShellView: View {
         chromeDecorated
             .onReceive(NotificationCenter.default.publisher(for: .kaisolaOpenFileLink)) { note in
                 guard let url = note.userInfo?["url"] as? URL else { return }
-                model.openFilePreview(url, line: note.userInfo?["line"] as? Int)
+                model.openFilePreview(
+                    url,
+                    line: note.userInfo?["line"] as? Int,
+                    workspaceHint: note.userInfo?["workspaceHint"] as? URL
+                )
             }
             .onReceive(NotificationCenter.default.publisher(for: .kaisolaOpenBrowserCard)) { note in
                 guard let url = note.object as? URL else { return }
@@ -352,13 +356,22 @@ struct RootShellView: View {
                             .help("New session in \(project.name)")
                         }
                         .padding(.horizontal, 9)
-                        .frame(minHeight: 32)
+                        .frame(minHeight: 36)
                         .background(
-                            activeProjectID == project.id
-                                ? AnyShapeStyle(Color.primary.opacity(colorScheme == .dark ? 0.105 : 0.065))
-                                : AnyShapeStyle(.clear),
+                            (ProjectTint.color(project.colorHex) ?? WorkspacePalette.project)
+                                .opacity(activeProjectID == project.id
+                                    ? (colorScheme == .dark ? 0.20 : 0.12)
+                                    : (colorScheme == .dark ? 0.08 : 0.045)),
                             in: RoundedRectangle(cornerRadius: 9)
                         )
+                        .overlay {
+                            RoundedRectangle(cornerRadius: 9)
+                                .strokeBorder(
+                                    (ProjectTint.color(project.colorHex) ?? WorkspacePalette.project)
+                                        .opacity(activeProjectID == project.id ? 0.34 : 0.12),
+                                    lineWidth: 0.7
+                                )
+                        }
                         .contextMenu { projectContextMenu(project) }
                         .textCase(nil)
                         }
@@ -520,6 +533,7 @@ struct RootShellView: View {
                 selected: activeProjectBinding,
                 menu: { project in AnyView(self.projectContextMenu(project)) },
                 openFolder: { RootShellView.promptForOpenFolder(model: model) },
+                useSidebar: { settings.navigationLayout = .leftTree },
                 reorder: { model.moveProject(id: $0, toIndex: $1) }
             )
             .padding(.leading, NativeWorkspaceChrome.topBarTrafficLightClearance)
@@ -579,6 +593,17 @@ struct RootShellView: View {
             .buttonStyle(.plain)
             .help("Open Project")
             .accessibilityLabel("Open Project")
+            Button {
+                settings.navigationLayout = .topBar
+            } label: {
+                Image(systemName: "rectangle.topthird.inset.filled")
+                    .font(.system(size: 11, weight: .semibold))
+                    .frame(width: 24, height: 24)
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .help("Move projects and sessions to top bars")
+            .accessibilityLabel("Use top bar navigation")
         }
         .padding(.leading, 14)
         .padding(.trailing, 9)
@@ -782,7 +807,9 @@ struct RootShellView: View {
         GeometryReader { geometry in
             let widths = NativeDetailPaneSizing.resolve(
                 totalWidth: geometry.size.width,
-                preferredPreview: model.previewedFileURL == nil ? nil : settings.filePreviewWidth,
+                preferredPreview: model.previewedFileURL == nil && model.browserCardURL == nil
+                    ? nil
+                    : settings.filePreviewWidth,
                 preferredRail: settings.workspaceRailVisible && model.currentProjectDirectory != nil
                     ? settings.workspaceRailWidth
                     : nil
@@ -792,7 +819,12 @@ struct RootShellView: View {
                     .frame(minWidth: NativeDetailPaneSizing.minimumContentWidth,
                            maxWidth: .infinity, maxHeight: .infinity)
                     .layoutPriority(1)
-                if let fileURL = model.previewedFileURL {
+                if let browserURL = model.browserCardURL {
+                    filePreviewDivider
+                    BrowserCardView(url: browserURL) { model.browserCardURL = nil }
+                        .frame(width: widths.preview)
+                        .frame(maxHeight: .infinity)
+                } else if let fileURL = model.previewedFileURL {
                     filePreviewDivider
                     FilePreviewView(
                         url: fileURL,
@@ -818,7 +850,7 @@ struct RootShellView: View {
                     // the Electron workspace and leaving the project hierarchy as the
                     // sole navigation surface on the left.
                     workspaceRailDivider
-                    WorkspaceRailView(root: root, openFile: { url, pinned in
+                    WorkspaceRailView(root: root, selectedFile: model.previewedFileURL, openFile: { url, pinned in
                         model.openFilePreview(url, pinned: pinned)
                     }, didMoveItem: { source, destination in
                         model.reconcileWorkspaceFileMove(from: source, to: destination)
@@ -896,19 +928,14 @@ struct RootShellView: View {
     }
 
     private var detailContent: some View {
-        Group {
-            if let browserURL = model.browserCardURL {
-                BrowserCardView(url: browserURL) { model.browserCardURL = nil }
-            } else {
-                unifiedSessionPaneGrid
-            }
-        }
+        unifiedSessionPaneGrid
         .transaction { $0.animation = nil }
     }
 
     private var footer: some View {
         ConnectionFooter(
             state: model.connectionState,
+            brokerUpgradeState: model.brokerUpgradeState,
             reload: { Task { await model.reload() } },
             jumpToAttention: { model.jumpToAttentionTarget($0) },
             newMesh: { RootShellView.promptForNewMesh(model: model) },
@@ -2512,9 +2539,9 @@ enum UnifiedTerminalDocumentResolver {
 enum NativeWorkspaceChrome {
     static let sidebarTrafficLightClearance: CGFloat = 40
     static let topBarTrafficLightClearance: CGFloat = 76
-    static let projectSidebarMinimumWidth: CGFloat = 156
-    static let projectSidebarIdealWidth: CGFloat = 184
-    static let projectSidebarMaximumWidth: CGFloat = 228
+    static let projectSidebarMinimumWidth: CGFloat = 168
+    static let projectSidebarIdealWidth: CGFloat = 200
+    static let projectSidebarMaximumWidth: CGFloat = 260
     static let projectSidebarDividerWidth: CGFloat = 1
     /// Centered across the visible divider, not laid wholly inside either pane.
     static let projectSidebarDividerHitWidth: CGFloat = 17
@@ -3044,6 +3071,7 @@ private struct SurfaceVisibilityControlLabel: View {
 private struct ConnectionFooter: View {
     @EnvironmentObject private var auth: AuthModel
     let state: AppModel.ConnectionState
+    let brokerUpgradeState: BrokerUpgradeState
     let reload: () -> Void
     var jumpToAttention: ((String) -> Void)?
     var newMesh: (() -> Void)?
@@ -3078,6 +3106,8 @@ private struct ConnectionFooter: View {
                         tint: Color(red: 0.44, green: 0.50, blue: 0.20),
                         action: showSettings
                     )
+
+                    brokerUpgradeIndicator
 
                     if newMesh != nil || newStagedMesh != nil || newIdeaMesh != nil {
                         Menu {
@@ -3214,6 +3244,13 @@ private struct ConnectionFooter: View {
             }
             Text("Kaisola v\(Self.appVersion)")
             Text(state.detail ?? state.title)
+            if case .current = brokerUpgradeState {
+                Text("Broker helper is current")
+            } else if case .unknown = brokerUpgradeState {
+                EmptyView()
+            } else {
+                Text(brokerUpgradeState.detail)
+            }
             if usage.totalPeakTokens > 0 {
                 Text("Usage: \(usage.totalPeakTokens / 1000)k tokens · \(Int((usage.contextPressure * 100).rounded()))% context")
             }
@@ -3241,6 +3278,30 @@ private struct ConnectionFooter: View {
         }
         .help("Account and workspace settings")
         .accessibilityLabel("Kaisola account and settings")
+    }
+
+    @ViewBuilder
+    private var brokerUpgradeIndicator: some View {
+        switch brokerUpgradeState {
+        case .unknown, .current:
+            EmptyView()
+        case .checking, .updating:
+            Image(systemName: "arrow.triangle.2.circlepath")
+                .font(.system(size: 11, weight: .semibold))
+                .foregroundStyle(Color.accentColor)
+                .frame(width: 26, height: 26)
+                .background(Color.accentColor.opacity(0.10), in: Capsule())
+                .help(brokerUpgradeState.detail)
+                .accessibilityLabel(brokerUpgradeState.detail)
+        case .pending:
+            Image(systemName: "exclamationmark.triangle.fill")
+                .font(.system(size: 11, weight: .semibold))
+                .foregroundStyle(Color.orange)
+                .frame(width: 26, height: 26)
+                .background(Color.orange.opacity(0.11), in: Capsule())
+                .help(brokerUpgradeState.detail)
+                .accessibilityLabel(brokerUpgradeState.detail)
+        }
     }
 
     @ViewBuilder

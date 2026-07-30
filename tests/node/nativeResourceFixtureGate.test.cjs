@@ -8,6 +8,7 @@ const {
   EXPECTED_PAGES,
   EXPECTED_PAGE_BYTES,
   EXPECTED_SCROLLBACK_LINES,
+  FIXTURE_LAUNCH_ARGUMENTS,
   RECEIPT_PREFIX,
   createBoundedCapture,
   fixtureEnvironment,
@@ -69,17 +70,27 @@ test('resource fixture runner pins the maximum renderer depth independently of u
   assert.equal(environment.KAISOLA_NATIVE_RESOURCE_SCROLLBACK_BYTES, String(EXPECTED_BYTES))
   assert.equal(environment.KAISOLA_NATIVE_RESOURCE_SCROLLBACK_LINES, String(EXPECTED_SCROLLBACK_LINES))
   assert.equal(environment.KAISOLA_NATIVE_RESOURCE_RECEIPT, '1')
+  assert.deepEqual(FIXTURE_LAUNCH_ARGUMENTS, ['-ApplePersistenceIgnoreState', 'YES'])
 })
 
 test('resource fixture runner rejects every byte outside its single readiness receipt', () => {
   const line = `${RECEIPT_PREFIX}${JSON.stringify(exactReceipt())}`
   assert.deepEqual(validateReadinessOutput({ stdout: `${line}\n`, stderr: '', receipt: exactReceipt() }).receipt, exactReceipt())
+  const persistenceNotice = '2026-07-30 02:27:41.409 Kaisola[57115:20001286] ApplePersistenceIgnoreState: Existing state will not be touched. New state will be written to /private/tmp/com.kaisola.mac.savedState\n'
+  assert.deepEqual(
+    validateReadinessOutput({ stdout: `${line}\n`, stderr: persistenceNotice, receipt: exactReceipt() }).receipt,
+    exactReceipt(),
+  )
   assert.throws(
     () => validateReadinessOutput({ stdout: `diagnostic\n${line}\n`, stderr: '', receipt: exactReceipt() }),
     /exactly one receipt line/,
   )
   assert.throws(
     () => validateReadinessOutput({ stdout: `${line}\n`, stderr: '\n', receipt: exactReceipt() }),
+    /stderr before readiness/,
+  )
+  assert.throws(
+    () => validateReadinessOutput({ stdout: `${line}\n`, stderr: `${persistenceNotice}extra\n`, receipt: exactReceipt() }),
     /stderr before readiness/,
   )
 

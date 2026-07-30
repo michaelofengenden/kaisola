@@ -43,6 +43,27 @@ function args(paths, overrides = {}) {
   ]
 }
 
+function preparedArgs(paths, overrides = {}) {
+  const values = {
+    version: '1.2.3',
+    build: '42',
+    url: 'https://github.com/michaelofengenden/kaisola/releases/download/v1.2.3/Kaisola-1.2.3.zip',
+    signature,
+    length: String(fs.statSync(paths.zip).size),
+    ...overrides,
+  }
+  return [
+    '--zip', paths.zip,
+    '--version', values.version,
+    '--build', values.build,
+    '--url', values.url,
+    '--ed-signature', values.signature,
+    '--archive-length', values.length,
+    '--output', paths.output,
+    ...(values.existing ? ['--existing', values.existing] : []),
+  ]
+}
+
 function run(arguments_, environment = {}) {
   return spawnSync(process.execPath, [script, ...arguments_], {
     encoding: 'utf8',
@@ -89,6 +110,49 @@ test('native appcast generates a fresh signed RSS feed and passes through an Ed2
   assert.match(xml, /<sparkle:shortVersionString>1\.2\.3<\/sparkle:shortVersionString>/)
   assert.match(xml, /<sparkle:minimumSystemVersion>14\.0<\/sparkle:minimumSystemVersion>/)
   assert.match(xml, new RegExp(`<enclosure url="https://github\\.com/[^\"]+" length="19" type="application/octet-stream" sparkle:edSignature="${signature}"/>`))
+})
+
+test('native appcast promotes a prepared candidate signature without invoking sign_update', (t) => {
+  const paths = fixture(t)
+  const result = run(preparedArgs(paths))
+  assert.equal(result.status, 0, result.stderr)
+
+  const xml = fs.readFileSync(paths.output, 'utf8')
+  assert.match(xml, new RegExp(`length="${fs.statSync(paths.zip).size}"`))
+  assert.match(xml, new RegExp(`sparkle:edSignature="${signature}"`))
+})
+
+test('native appcast rejects a prepared signature whose sealed length does not match the candidate', (t) => {
+  const paths = fixture(t)
+  const result = run(preparedArgs(paths, { length: '999' }))
+  assert.notEqual(result.status, 0)
+  assert.match(result.stderr, /signed archive length 999 does not match zip size 19/)
+  assert.equal(fs.existsSync(paths.output), false)
+})
+
+test('native appcast requires exactly one complete signing mode', (t) => {
+  const paths = fixture(t)
+  const both = run([
+    ...args(paths).slice(0, -2),
+    '--ed-signature', signature,
+    '--archive-length', '19',
+    '--output', paths.output,
+  ])
+  assert.notEqual(both.status, 0)
+  assert.match(both.stderr, /provide exactly one signing mode/)
+
+  const incomplete = run(preparedArgs(paths).filter((value, index, values) => (
+    value !== '--archive-length' && values[index - 1] !== '--archive-length'
+  )))
+  assert.notEqual(incomplete.status, 0)
+  assert.match(incomplete.stderr, /--ed-signature and --archive-length must be provided together/)
+})
+
+test('native appcast rejects a noncanonical prepared Ed25519 signature', (t) => {
+  const paths = fixture(t)
+  const result = run(preparedArgs(paths, { signature: 'not-a-signature' }))
+  assert.notEqual(result.status, 0)
+  assert.match(result.stderr, /canonical base64/)
 })
 
 test('native appcast merge preserves older items and sorts newest build first', (t) => {
@@ -172,6 +236,19 @@ test('native appcast rejects a duplicate build with a different signature', (t) 
   const result = run(args(paths, { existing }))
   assert.notEqual(result.status, 0)
   assert.match(result.stderr, /refusing to replace build 42 with a different Sparkle signature/)
+  assert.equal(fs.existsSync(paths.output), false)
+})
+
+test('native appcast rejects a build older than the permanent feed head', (t) => {
+  const paths = fixture(t)
+  const existing = path.join(paths.root, 'existing.xml')
+  fs.writeFileSync(existing, existingAppcast([
+    existingItem({ build: '43', itemSignature: otherSignature }),
+  ]))
+
+  const result = run(preparedArgs(paths, { build: '42', existing }))
+  assert.notEqual(result.status, 0)
+  assert.match(result.stderr, /refusing to publish non-monotonic build 42 after build 43/)
   assert.equal(fs.existsSync(paths.output), false)
 })
 

@@ -13,6 +13,9 @@ const workloadAliases = new Map([
   ['streaming', 'one-window-streaming-terminal-fresh-broker'],
   ['restored', 'three-restored-project-windows-fresh-broker'],
 ])
+// Prevent AppKit's crash-state restore prompt from blocking unattended
+// performance fixtures before applicationDidFinishLaunching.
+const FIXTURE_LAUNCH_ARGUMENTS = ['-ApplePersistenceIgnoreState', 'YES']
 
 const wait = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds))
 
@@ -118,11 +121,19 @@ function launchAndWait(command, args, launchOptions, readyParser, timeoutMs = 45
 
 function brokerPIDFromRoot(root) {
   try {
-    const payload = JSON.parse(fs.readFileSync(path.join(root, 'session-broker', 'broker.json'), 'utf8'))
+    const payload = JSON.parse(fs.readFileSync(brokerInfoPath(root), 'utf8'))
     return Number.isSafeInteger(payload.pid) && payload.pid > 1 ? payload.pid : null
   } catch {
     return null
   }
+}
+
+function brokerInfoPath(root) {
+  // NativeResourceWorkloadConfiguration deliberately separates app state from
+  // the broker profile beneath the private fixture root. Keep the Node-side
+  // cadence observer on that same contract instead of accidentally probing the
+  // pre-isolation root layout.
+  return path.join(root, 'broker-profile', 'session-broker', 'broker.json')
 }
 
 async function cleanFailedFixtureLaunch(root, appPid) {
@@ -144,7 +155,7 @@ async function launchNative(options) {
       KAISOLA_NATIVE_RESOURCE_WORKLOAD: options.workload,
       KAISOLA_NATIVE_RESOURCE_ROOT: root,
     })
-    const run = await launchAndWait(executable, [], {
+    const run = await launchAndWait(executable, FIXTURE_LAUNCH_ARGUMENTS, {
       cwd: root,
       env: environment,
     }, (line, child) => {
@@ -201,7 +212,7 @@ function terminalStreamDelta(before, after) {
 }
 
 function brokerInfoForFixture(fixture) {
-  const file = path.join(fixture.root, 'session-broker', 'broker.json')
+  const file = brokerInfoPath(fixture.root)
   try {
     const info = JSON.parse(fs.readFileSync(file, 'utf8'))
     if (Number(info.pid) === fixture.brokerPid
@@ -230,6 +241,8 @@ async function terminalStreamHeads(fixture) {
 }
 
 module.exports = {
+  FIXTURE_LAUNCH_ARGUMENTS,
+  brokerInfoPath,
   isAlive,
   launchNative,
   terminalStreamDelta,

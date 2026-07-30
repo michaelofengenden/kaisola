@@ -37,6 +37,7 @@ struct BrokerHelperManifest: Decodable, Equatable, Sendable {
 
     let schemaVersion: Int
     let packageVersion: String
+    let contentDigest: String
     let brokerImplementationVersion: Int
     let brokerProtocol: ProtocolRange
     let node: NodeRuntime
@@ -112,6 +113,7 @@ enum BrokerHelperPackageVerification {
         guard manifest.schemaVersion == BrokerWire.helperPackageSchema,
               !manifest.packageVersion.isEmpty,
               manifest.packageVersion.count <= 64,
+              isLowercaseSHA256(manifest.contentDigest),
               BrokerWire.compatibleImplementationVersions.contains(manifest.brokerImplementationVersion),
               manifest.brokerProtocol.minimum <= BrokerWire.protocolVersion,
               manifest.brokerProtocol.maximum >= BrokerWire.protocolVersion,
@@ -166,6 +168,10 @@ enum BrokerHelperPackageVerification {
                     try validateSignature(fileURL, requirement: requirement)
                 }
             }
+        }
+
+        guard contentDigest(for: manifest) == manifest.contentDigest else {
+            throw BrokerHelperPackageError.invalidManifest
         }
 
         let verified = VerifiedBrokerHelperPackage(root: root, manifest: manifest)
@@ -238,6 +244,39 @@ enum BrokerHelperPackageVerification {
             if reachedEnd { break }
         }
         return hash.finalize().map { String(format: "%02x", $0) }.joined()
+    }
+
+    /// Must remain byte-for-byte equivalent to
+    /// `scripts/native-broker-package.cjs:contentDigest`. It intentionally
+    /// excludes generated timestamps and JSON formatting while binding the
+    /// compatibility envelope and every sealed behavior-bearing file.
+    static func contentDigest(for manifest: BrokerHelperManifest) -> String {
+        var hash = SHA256()
+        func field(_ value: String) {
+            let bytes = Data(value.utf8)
+            hash.update(data: Data("\(bytes.count):".utf8))
+            hash.update(data: bytes)
+        }
+        field("kaisola-broker-helper-content-v1")
+        field(String(manifest.schemaVersion))
+        field(manifest.packageVersion)
+        field(String(manifest.brokerImplementationVersion))
+        field(String(manifest.brokerProtocol.minimum))
+        field(String(manifest.brokerProtocol.maximum))
+        field(String(manifest.brokerProtocol.securityEpoch))
+        for record in manifest.files.sorted(by: { $0.path < $1.path }) {
+            field(record.path)
+            field(String(record.size))
+            field(record.mode)
+            field(record.sha256.lowercased())
+        }
+        return hash.finalize().map { String(format: "%02x", $0) }.joined()
+    }
+
+    static func isLowercaseSHA256(_ value: String) -> Bool {
+        value.count == 64
+            && value == value.lowercased()
+            && value.allSatisfy(\.isHexDigit)
     }
 
     private static func validateSignature(_ url: URL, requirement: String) throws {

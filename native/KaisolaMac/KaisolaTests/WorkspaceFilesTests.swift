@@ -6,6 +6,55 @@ import XCTest
 /// ProjectFiles (tree listing + bounded enumeration) and FilePreviewContent
 /// (what a file renders as) — the workspace rail's foundations.
 final class WorkspaceFilesTests: XCTestCase {
+    func testMarkdownListContinuationHandlesBulletsTasksAndOrderedLists() {
+        XCTAssertEqual(MarkdownListContinuation.action(for: "- first"), .continueWith("- "))
+        XCTAssertEqual(MarkdownListContinuation.action(for: "  * nested"), .continueWith("  * "))
+        XCTAssertEqual(MarkdownListContinuation.action(for: "- [x] shipped"), .continueWith("- [ ] "))
+        XCTAssertEqual(MarkdownListContinuation.action(for: "9. ninth"), .continueWith("10. "))
+        XCTAssertEqual(MarkdownListContinuation.action(for: "3) third"), .continueWith("4) "))
+        XCTAssertEqual(MarkdownListContinuation.action(for: "- "), .exitList)
+        XCTAssertEqual(MarkdownListContinuation.action(for: "- [ ] "), .exitList)
+        XCTAssertNil(MarkdownListContinuation.action(for: "ordinary paragraph"))
+    }
+
+    func testRenderedMarkdownCommandWheelZoomUsesTheSameClampedPolicyAsSourceEditing() throws {
+        let zoomedIn = try XCTUnwrap(
+            MarkdownWheelZoom.target(current: 1, scrollingDeltaY: 10, scrollingDeltaX: 0)
+        )
+        let zoomedOut = try XCTUnwrap(
+            MarkdownWheelZoom.target(current: 1, scrollingDeltaY: 0, scrollingDeltaX: -10)
+        )
+        XCTAssertEqual(
+            zoomedIn,
+            1.1,
+            accuracy: 0.0001
+        )
+        XCTAssertEqual(
+            zoomedOut,
+            0.9,
+            accuracy: 0.0001
+        )
+        XCTAssertNil(MarkdownWheelZoom.target(current: 2, scrollingDeltaY: 20, scrollingDeltaX: 0))
+        XCTAssertNil(MarkdownWheelZoom.target(current: 1, scrollingDeltaY: 0, scrollingDeltaX: 0))
+    }
+
+    @MainActor
+    func testMarkdownEditorContinuesAndExitsListsWithoutChangingPriorText() {
+        let textView = MarkdownNativeTextView.wholeFileSourceEditor()
+        textView.string = "- first"
+        textView.setSelectedRange(NSRange(location: 7, length: 0))
+        textView.insertNewline(nil)
+        XCTAssertEqual(textView.string, "- first\n- ")
+
+        textView.insertNewline(nil)
+        XCTAssertEqual(textView.string, "- first\n\n")
+
+        textView.string = "7. item"
+        textView.setSelectedRange(NSRange(location: 7, length: 0))
+        textView.insertNewline(nil)
+        XCTAssertEqual(textView.string, "7. item\n8. ")
+    }
+
     @MainActor
     func testMarkdownWholeFileSourceEditorPreservesUnicodeSelectionUndoAndAccessibility() {
         _ = NSApplication.shared
@@ -86,6 +135,41 @@ final class WorkspaceFilesTests: XCTestCase {
         XCTAssertLessThan(elapsed, .seconds(3.5))
         XCTAssertEqual(textView.string.utf8.count, source.utf8.count)
         XCTAssertNotNil(textView.textContentStorage)
+    }
+
+    @MainActor
+    func testMarkdownWholeFileSourceEditorWrapsToZoomableViewportWithoutTextKitDowngrade() {
+        let scrollView = MarkdownMagnifyingScrollView(
+            frame: NSRect(x: 0, y: 0, width: 360, height: 480)
+        )
+        scrollView.hasVerticalScroller = true
+        scrollView.hasHorizontalScroller = false
+        scrollView.allowsMagnification = true
+        scrollView.minMagnification = 0.65
+        scrollView.maxMagnification = 2
+
+        let textView = MarkdownNativeTextView.wholeFileSourceEditor()
+        textView.isVerticallyResizable = true
+        textView.isHorizontallyResizable = false
+        textView.autoresizingMask = [.width]
+        textView.textContainer?.containerSize = NSSize(
+            width: 0,
+            height: CGFloat.greatestFiniteMagnitude
+        )
+        textView.textContainer?.widthTracksTextView = true
+        textView.textContainerInset = NSSize(width: 12, height: 12)
+        textView.string = String(repeating: "A long Markdown sentence must wrap. ", count: 20)
+        scrollView.documentView = textView
+
+        scrollView.reflowDocumentWidth()
+        XCTAssertEqual(textView.frame.width, scrollView.contentView.bounds.width, accuracy: 0.5)
+        XCTAssertEqual(
+            textView.textContainer?.containerSize.width ?? -1,
+            scrollView.contentView.bounds.width - 24,
+            accuracy: 0.5
+        )
+        XCTAssertFalse(scrollView.hasHorizontalScroller)
+        XCTAssertNotNil(textView.textLayoutManager)
     }
 
     func testFileLineNavigationUsesOneBasedLinesAndClampsPastEOF() {
@@ -1673,6 +1757,8 @@ final class WorkspaceFilesTests: XCTestCase {
 
         **bold** and *italic* with `code` and [link](https://example.com).
 
+        - first item
+
         > quoted
 
         ```swift
@@ -1686,12 +1772,15 @@ final class WorkspaceFilesTests: XCTestCase {
         XCTAssertTrue(spans.contains { $0.role == .italic })
         XCTAssertTrue(spans.contains { $0.role == .inlineCode })
         XCTAssertTrue(spans.contains { $0.role == .link })
+        XCTAssertTrue(spans.contains { $0.role == .listMarker })
         XCTAssertTrue(spans.contains { $0.role == .quote })
         XCTAssertTrue(spans.contains { $0.role == .codeBlock })
         XCTAssertEqual(source, """
         # Heading
 
         **bold** and *italic* with `code` and [link](https://example.com).
+
+        - first item
 
         > quoted
 

@@ -1,5 +1,6 @@
 import Foundation
 import KaisolaBrokerProtocol
+import KaisolaCore
 import XCTest
 @testable import Kaisola
 
@@ -42,6 +43,74 @@ final class BrokerControlClientTests: XCTestCase {
             "CODEX_MANAGED_PACKAGE_ROOT": .string(""),
             "CODEX_THREAD_ID": .string(""),
         ])
+    }
+
+    func testUpgradeDecisionPreservesBrokerAuthoritativeBlockersExactly() throws {
+        let decision = try BrokerControlClient.upgradeDecision(.object([
+            "ok": .bool(false),
+            "state": .string("pending"),
+            "liveTerminalCount": .integer(2),
+            "liveTerminalIds": .array([.string("claude"), .string("codex")]),
+            "busyAgentCount": .integer(1),
+            "busyTerminalIds": .array([.string("claude")]),
+            "childTaskCount": .integer(3),
+        ]))
+        XCTAssertEqual(decision, .deferred(BrokerUpgradeBlockers(
+            liveTerminalCount: 2,
+            liveTerminalIDs: ["claude", "codex"],
+            busyAgentCount: 1,
+            busyTerminalIDs: ["claude"],
+            childTaskCount: 3
+        )))
+    }
+
+    func testUpgradeDecisionRejectsCountAndIdentityDrift() {
+        XCTAssertThrowsError(try BrokerControlClient.upgradeDecision(.object([
+            "ok": .bool(false),
+            "state": .string("pending"),
+            "liveTerminalCount": .integer(2),
+            "liveTerminalIds": .array([.string("only-one")]),
+            "busyAgentCount": .integer(0),
+            "busyTerminalIds": .array([]),
+            "childTaskCount": .integer(0),
+        ]))) { error in
+            XCTAssertEqual(error as? BrokerClientError, .malformedResponse)
+        }
+    }
+
+    func testUpgradePreflightRequiresExactStatusIdentityAndAdvertisedCapability() throws {
+        let info = BrokerInfo(
+            protocolVersion: 2,
+            securityEpoch: 1,
+            implementationVersion: 1,
+            packageSchema: 1,
+            packageVersion: "1.0.0",
+            contentDigest: String(repeating: "a", count: 64),
+            pid: 7_777,
+            socketPath: "/tmp/broker.sock",
+            token: String(repeating: "b", count: 64),
+            startedAt: 123_456,
+            version: "test"
+        )
+        let valid: JSONValue = .object([
+            "ok": .bool(true),
+            "pid": .integer(7_777),
+            "startedAt": .integer(123_456),
+            "implementationVersion": .integer(1),
+            "packageSchema": .integer(1),
+            "packageVersion": .string("1.0.0"),
+            "contentDigest": .string(String(repeating: "a", count: 64)),
+            "features": .array([.string(BrokerWire.brokerUpdateFeature)]),
+        ])
+        XCTAssertNoThrow(try BrokerControlClient.validateUpgradeStatus(valid, expected: info))
+
+        guard var unsupported = valid.objectValue else { return XCTFail("expected object") }
+        unsupported["features"] = .array([])
+        XCTAssertThrowsError(
+            try BrokerControlClient.validateUpgradeStatus(.object(unsupported), expected: info)
+        ) { error in
+            XCTAssertEqual(error as? BrokerClientError, .identityChanged)
+        }
     }
 
     func testSessionStorePersistsOwnershipAcrossInstances() throws {

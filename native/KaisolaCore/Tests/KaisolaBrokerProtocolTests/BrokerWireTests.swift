@@ -13,6 +13,7 @@ final class BrokerWireTests: XCTestCase {
         XCTAssertEqual(BrokerWire.terminalObserveFeature, "terminal-observe-v1")
         XCTAssertEqual(BrokerWire.terminalHistoryFeature, "terminal-history-v1")
         XCTAssertEqual(BrokerWire.observerRoleFeature, "observer-role-v1")
+        XCTAssertEqual(BrokerWire.brokerUpdateFeature, "broker-update-v1")
         XCTAssertEqual(BrokerWire.observerMethods, [
             "broker.status",
             "terminal.list",

@@ -11,6 +11,7 @@ const {
   validateLocalAppEntitlements,
   validateNodeEntitlements,
   validateUpdateConfiguration,
+  writeJSONAtomic,
 } = require('../../scripts/native-release-preflight.cjs')
 
 const validKey = Buffer.alloc(32, 0xA5).toString('base64')
@@ -76,6 +77,33 @@ test('notarization implies Developer ID validation', () => {
     requireDeveloperID: true,
     requireNotarized: true,
   })
+})
+
+test('release preflight records exact source provenance in an atomic JSON receipt', (t) => {
+  const fs = require('node:fs')
+  const os = require('node:os')
+  const path = require('node:path')
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kaisola-preflight-receipt-'))
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  const destination = path.join(root, 'nested', 'preflight.json')
+  const commit = 'a'.repeat(40)
+
+  const options = parseArguments([
+    '--app', '/tmp/Kaisola.app',
+    '--source-commit', commit,
+    '--json-output', destination,
+  ])
+  assert.equal(options.sourceCommit, commit)
+  assert.equal(options.jsonOutput, destination)
+  writeJSONAtomic(destination, { pass: true, sourceCommit: commit })
+  assert.deepEqual(JSON.parse(fs.readFileSync(destination, 'utf8')), {
+    pass: true,
+    sourceCommit: commit,
+  })
+
+  assert.throws(() => parseArguments([
+    '--app', '/tmp/Kaisola.app', '--source-commit', 'not-a-commit',
+  ]), /lowercase 40-character Git commit/)
 })
 
 test('release preflight distinguishes local and hardened Developer ID signatures', () => {
@@ -149,20 +177,22 @@ test('the Release build disables Xcode development entitlement injection', () =>
   assert.match(project, /AA529D5536DE8EAB8F9BB0E1 \/\* Release \*\/[\s\S]*?CODE_SIGN_INJECT_BASE_ENTITLEMENTS = NO;/)
 })
 
-test('the release workflow reseals the loose BrokerHelper code before preflight', () => {
+test('the candidate workflow reseals BrokerHelper before notarization and provenance capture', () => {
   const fs = require('node:fs')
   const path = require('node:path')
   const workflow = fs.readFileSync(
-    path.join(__dirname, '..', '..', '.github/workflows/release.yml'),
+    path.join(__dirname, '..', '..', '.github/workflows/release-candidate.yml'),
     'utf8',
   )
 
   assert.match(workflow, /npm run native:sign:distribution --/)
   assert.match(workflow, /--identity "Developer ID Application"/)
   const signingIndex = workflow.indexOf('- name: Re-sign nested components and seal BrokerHelper')
-  const preflightIndex = workflow.indexOf('- name: Verify Kaisola release package')
-  assert.ok(signingIndex >= 0, 'the distribution signer must run in the release workflow')
+  const preflightIndex = workflow.indexOf('- name: Verify Developer ID candidate before notarization')
+  const receiptIndex = workflow.indexOf('native-release-candidate.cjs create')
+  assert.ok(signingIndex >= 0, 'the distribution signer must run in the candidate workflow')
   assert.ok(signingIndex < preflightIndex, 'the resealed package must be verified by release preflight')
+  assert.ok(preflightIndex < receiptIndex, 'only a verified candidate may receive provenance')
 })
 
 test('the shipped update key matches the key that signs the appcast', () => {
@@ -183,7 +213,8 @@ test('the shipped update key matches the key that signs the appcast', () => {
   const KNOWN_BAD_KEY = 'FAk/3R33fKfyvsHiUKiNctprqxw/Y/guajgQXGb8r60='
 
   const sources = {
-    'release workflow': fs.readFileSync(path.join(root, '.github/workflows/release.yml'), 'utf8'),
+    'candidate workflow': fs.readFileSync(path.join(root, '.github/workflows/release-candidate.yml'), 'utf8'),
+    'candidate receipt verifier': fs.readFileSync(path.join(root, 'scripts/native-release-candidate.cjs'), 'utf8'),
     'project.yml': fs.readFileSync(path.join(root, 'native/KaisolaMac/project.yml'), 'utf8'),
   }
 
@@ -199,7 +230,36 @@ test('the shipped update key matches the key that signs the appcast', () => {
   }
 })
 
-test('tag releases publish and verify the signed appcast after immutable assets', () => {
+test('candidate workflow performs expensive signing and supports API-key notarization', () => {
+  const fs = require('node:fs')
+  const path = require('node:path')
+  const candidate = fs.readFileSync(
+    path.join(__dirname, '..', '..', '.github/workflows/release-candidate.yml'),
+    'utf8',
+  )
+  const contracts = fs.readFileSync(
+    path.join(__dirname, '..', '..', '.github/workflows/swift-contracts.yml'),
+    'utf8',
+  )
+
+  assert.match(candidate, /branches: \[main\]/)
+  assert.match(candidate, /test "\$GITHUB_REF" = refs\/heads\/main/)
+  assert.match(candidate, /uses: \.\/\.github\/workflows\/swift-contracts\.yml/)
+  assert.match(candidate, /APPLE_API_KEY_ID: \$\{\{ secrets\.APPLE_API_KEY_ID \}\}/)
+  assert.match(candidate, /APPLE_API_PRIVATE_KEY: \$\{\{ secrets\.APPLE_API_PRIVATE_KEY \}\}/)
+  assert.match(candidate, /NOTARY_AUTH_MODE=api-key/)
+  assert.match(candidate, /--key "\$APPLE_API_PRIVATE_KEY_FILE" --key-id "\$APPLE_API_KEY_ID"/)
+  assert.match(candidate, /authentication=\(--apple-id "\$APPLE_ID"/)
+  assert.match(candidate, /xcrun notarytool submit/)
+  assert.match(candidate, /xcrun stapler staple/)
+  assert.match(candidate, /1000000 \+ GITHUB_RUN_NUMBER \* 1000 \+ GITHUB_RUN_ATTEMPT/)
+  assert.match(candidate, /native_build > 15501/)
+  assert.match(candidate, /native-release-candidate\.cjs create/)
+  assert.match(candidate, /uses: actions\/upload-artifact@[0-9a-f]{40}/)
+  assert.match(contracts, /tests\/node\/nativeReleaseCandidate\.test\.cjs/)
+})
+
+test('tag release is a serialized, fail-closed promotion of exact candidate bytes', () => {
   const fs = require('node:fs')
   const path = require('node:path')
   const workflow = fs.readFileSync(
@@ -209,17 +269,29 @@ test('tag releases publish and verify the signed appcast after immutable assets'
 
   assert.match(workflow, /group: kaisola-release/)
   assert.match(workflow, /cancel-in-progress: false/)
-  assert.match(workflow, /SPARKLE_PRIVATE_ED_KEY: \$\{\{ secrets\.SPARKLE_PRIVATE_ED_KEY \}\}/)
-  assert.match(workflow, /Missing required tag-release credential: SPARKLE_PRIVATE_ED_KEY/)
+  assert.doesNotMatch(workflow, /xcodebuild|notarytool|SPARKLE_PRIVATE_ED_KEY|CSC_LINK|--sign-update/)
+  assert.match(workflow, /actions\/download-artifact@[0-9a-f]{40}/)
+  assert.match(workflow, /run-id: \$\{\{ steps\.candidate\.outputs\.run-id \}\}/)
+  assert.match(workflow, /--commit "\$GITHUB_SHA"/)
+  assert.match(workflow, /--preflight "\$preflight"/)
   assert.match(workflow, /node scripts\/native-appcast\.cjs/)
-  assert.match(workflow, /--ed-key-file "\$private_key"/)
+  assert.match(workflow, /--ed-signature "\$signature"/)
+  assert.match(workflow, /--archive-length "\$archive_length"/)
+  assert.match(workflow, /appcast_arguments=\([\s\S]*?--zip "\$archive"/)
+  assert.doesNotMatch(workflow, /existing_arguments=\(\)/)
   assert.match(workflow, /gh release download kaisola-updates/)
   assert.match(workflow, /gh release upload kaisola-updates "\$generated_appcast" --clobber/)
   assert.match(workflow, /cmp "\$generated_appcast" "\$verified_directory\/appcast\.xml"/)
 
-  const generateIndex = workflow.indexOf('- name: Generate signed Sparkle appcast')
-  const assetsIndex = workflow.indexOf('- name: Publish Kaisola assets')
+  const artifactVerifyIndex = workflow.indexOf('- name: Verify provenance, checksums, and Sparkle signature before unpacking')
+  const unpackIndex = workflow.indexOf('ditto -x -k "$archive"')
+  const generateIndex = workflow.indexOf("- name: Generate appcast from the candidate's prepared signature")
+  const assetsIndex = workflow.indexOf('- name: Publish exact candidate assets')
+  const remoteVerifyIndex = workflow.indexOf('- name: Verify remote release asset digests before feed mutation')
   const appcastIndex = workflow.indexOf('- name: Publish and verify permanent Sparkle appcast')
+  assert.ok(artifactVerifyIndex >= 0 && artifactVerifyIndex < unpackIndex,
+    'checksums and Sparkle signature must verify before unpacking or executing the app')
   assert.ok(generateIndex >= 0 && generateIndex < assetsIndex, 'the appcast must be generated before publication')
-  assert.ok(assetsIndex < appcastIndex, 'the immutable archive must publish before the appcast points at it')
+  assert.ok(assetsIndex < remoteVerifyIndex && remoteVerifyIndex < appcastIndex,
+    'remote assets must match the receipt before the permanent feed changes')
 })

@@ -143,6 +143,7 @@ function validateDistributionCode({ app, appSignature, helperRoot, manifest, nod
     fail('distribution preflight requires a Developer ID Application signature and team identifier')
   }
   if (!appSignature.hardenedRuntime) fail('distribution app must enable the hardened runtime')
+  if (!appSignature.secureTimestamp) fail('distribution app must carry a secure timestamp')
   validateDistributionAppEntitlements(codeEntitlements(app))
 
   const machOEntries = manifest.files.filter((entry) => entry?.machO)
@@ -212,6 +213,16 @@ function parseArguments(argv) {
       const value = argv[++index]
       if (!value) fail('--app requires a path')
       options.app = path.resolve(value)
+    } else if (argument === '--source-commit') {
+      const value = argv[++index]
+      if (!value || !/^[0-9a-f]{40}$/.test(value)) {
+        fail('--source-commit must be a lowercase 40-character Git commit')
+      }
+      options.sourceCommit = value
+    } else if (argument === '--json-output') {
+      const value = argv[++index]
+      if (!value) fail('--json-output requires a path')
+      options.jsonOutput = path.resolve(value)
     } else if (argument === '--require-updates') options.requireUpdates = true
     else if (argument === '--require-developer-id') options.requireDeveloperID = true
     else if (argument === '--require-notarized') options.requireNotarized = true
@@ -225,7 +236,8 @@ function parseArguments(argv) {
 function usage() {
   return `Usage:
   node scripts/native-release-preflight.cjs --app /path/Kaisola.app \\
-    [--require-updates] [--require-developer-id] [--require-notarized]
+    [--require-updates] [--require-developer-id] [--require-notarized] \\
+    [--source-commit <40-hex>] [--json-output <receipt.json>]
 
 The default gate accepts a locally signed universal build. Distribution flags
 add real Sparkle configuration, Developer ID, Gatekeeper, and stapling checks.`
@@ -262,6 +274,9 @@ function preflight(options) {
   requireExactArchitectures(manifest?.node?.architectures || [], 'helper manifest Node runtime')
   if (manifest.schemaVersion !== 1 || manifest.brokerImplementationVersion !== 1) {
     fail('helper manifest version is outside this preflight policy')
+  }
+  if (!/^[0-9a-f]{64}$/.test(String(manifest.contentDigest || ''))) {
+    fail('helper manifest has no canonical content digest')
   }
   validateLaunchAgent(readPlist(launchAgentFile))
   const updates = validateUpdateConfiguration(info, options.requireUpdates)
@@ -300,6 +315,7 @@ function preflight(options) {
   return {
     pass: true,
     app,
+    sourceCommit: options.sourceCommit || null,
     bundleIdentifier: info.CFBundleIdentifier,
     version: info.CFBundleShortVersionString,
     build: info.CFBundleVersion,
@@ -310,15 +326,37 @@ function preflight(options) {
     },
     helper: {
       packageVersion: manifest.packageVersion,
+      contentDigest: manifest.contentDigest,
       schemaVersion: manifest.schemaVersion,
       implementationVersion: manifest.brokerImplementationVersion,
+      protocol: {
+        minimum: manifest.brokerProtocol?.minimum,
+        maximum: manifest.brokerProtocol?.maximum,
+        securityEpoch: manifest.brokerProtocol?.securityEpoch,
+      },
       fileCount: manifest.files?.length,
     },
     updatesConfigured: updates != null,
     developerID: signature.developerID,
     teamIdentifier: signature.teamIdentifier,
+    secureTimestamp: signature.secureTimestamp,
     notarizationRequired: options.requireNotarized,
     launchProbe: true,
+  }
+}
+
+function writeJSONAtomic(destination, value) {
+  fs.mkdirSync(path.dirname(destination), { recursive: true })
+  const temporary = path.join(path.dirname(destination), `.${path.basename(destination)}.${process.pid}.tmp`)
+  try {
+    fs.writeFileSync(temporary, `${JSON.stringify(value, null, 2)}\n`, {
+      encoding: 'utf8',
+      flag: 'wx',
+      mode: 0o644,
+    })
+    fs.renameSync(temporary, destination)
+  } finally {
+    fs.rmSync(temporary, { force: true })
   }
 }
 
@@ -326,7 +364,11 @@ if (require.main === module) {
   try {
     const options = parseArguments(process.argv.slice(2))
     if (options.help) console.log(usage())
-    else console.log(`NATIVE_RELEASE_PREFLIGHT=${JSON.stringify(preflight(options))}`)
+    else {
+      const receipt = preflight(options)
+      if (options.jsonOutput) writeJSONAtomic(options.jsonOutput, receipt)
+      console.log(`NATIVE_RELEASE_PREFLIGHT=${JSON.stringify(receipt)}`)
+    }
   } catch (error) {
     console.error(`NATIVE_RELEASE_PREFLIGHT=FAIL ${error.message}`)
     process.exitCode = 1
@@ -344,4 +386,5 @@ module.exports = {
   validateNodeEntitlements,
   validateLaunchAgent,
   validateUpdateConfiguration,
+  writeJSONAtomic,
 }

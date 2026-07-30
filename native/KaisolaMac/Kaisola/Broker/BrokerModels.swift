@@ -8,11 +8,38 @@ struct BrokerHello: Equatable, Sendable {
     let implementationVersion: Int
     let packageSchema: Int?
     let packageVersion: String?
+    let contentDigest: String?
     let features: Set<String>
     let pid: Int32
     let startedAt: Int64
     let version: String
     let serverEnforcedObserver: Bool
+
+    init(
+        protocolVersion: Int,
+        securityEpoch: Int,
+        implementationVersion: Int,
+        packageSchema: Int?,
+        packageVersion: String?,
+        contentDigest: String? = nil,
+        features: Set<String>,
+        pid: Int32,
+        startedAt: Int64,
+        version: String,
+        serverEnforcedObserver: Bool
+    ) {
+        self.protocolVersion = protocolVersion
+        self.securityEpoch = securityEpoch
+        self.implementationVersion = implementationVersion
+        self.packageSchema = packageSchema
+        self.packageVersion = packageVersion
+        self.contentDigest = contentDigest
+        self.features = features
+        self.pid = pid
+        self.startedAt = startedAt
+        self.version = version
+        self.serverEnforcedObserver = serverEnforcedObserver
+    }
 }
 
 struct BrokerStatus: Equatable, Sendable {
@@ -51,8 +78,12 @@ struct BrokerStatus: Equatable, Sendable {
            packageSchema != expectedHello.packageSchema.map(Int64.init) {
             throw BrokerClientError.identityChanged
         }
-        if let packageVersion = statusObject["packageVersion"]?.stringValue,
-           packageVersion != expectedHello.packageVersion {
+        if statusObject["packageVersion"] != nil || expectedHello.packageVersion != nil,
+           statusObject["packageVersion"]?.stringValue != expectedHello.packageVersion {
+            throw BrokerClientError.identityChanged
+        }
+        if statusObject["contentDigest"] != nil || expectedHello.contentDigest != nil,
+           statusObject["contentDigest"]?.stringValue != expectedHello.contentDigest {
             throw BrokerClientError.identityChanged
         }
         guard let diagnosticValues = diagnostics.arrayValue,

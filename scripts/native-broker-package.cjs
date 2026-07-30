@@ -51,6 +51,34 @@ function sha256(file) {
   return hash.digest('hex')
 }
 
+// Stable identity for the behavior-bearing helper payload. `generatedAt`, code
+// signing metadata, and JSON formatting are deliberately excluded: the digest
+// is a pure function of compatibility metadata plus the exact sealed files.
+// Length-prefixing every field makes the byte stream unambiguous across the
+// JavaScript packager and Swift verifier.
+function contentDigest(manifest) {
+  const hash = crypto.createHash('sha256')
+  const field = (value) => {
+    const bytes = Buffer.from(String(value), 'utf8')
+    hash.update(Buffer.from(`${bytes.length}:`, 'ascii'))
+    hash.update(bytes)
+  }
+  field('kaisola-broker-helper-content-v1')
+  field(manifest.schemaVersion)
+  field(manifest.packageVersion)
+  field(manifest.brokerImplementationVersion)
+  field(manifest.brokerProtocol?.minimum)
+  field(manifest.brokerProtocol?.maximum)
+  field(manifest.brokerProtocol?.securityEpoch)
+  for (const record of [...(manifest.files || [])].sort((a, b) => String(a.path) < String(b.path) ? -1 : String(a.path) > String(b.path) ? 1 : 0)) {
+    field(record.path)
+    field(record.size)
+    field(record.mode)
+    field(String(record.sha256).toLowerCase())
+  }
+  return hash.digest('hex')
+}
+
 function ensureDirectory(directory, mode = 0o755) {
   fs.mkdirSync(directory, { recursive: true, mode })
   fs.chmodSync(directory, mode)
@@ -148,7 +176,8 @@ function createManifest(root, metadata) {
         } : {}),
       }
     })
-  return { ...metadata, files }
+  const manifest = { ...metadata, files }
+  return { ...manifest, contentDigest: contentDigest(manifest) }
 }
 
 function verifyPackage(root, { requireSignatures = false, policy = readJSON(policyFile) } = {}) {
@@ -166,6 +195,10 @@ function verifyPackage(root, { requireSignatures = false, policy = readJSON(poli
   if (policy.claudeAgentSDKVersion
       && manifest.claudeAgentSDK?.version !== policy.claudeAgentSDKVersion) {
     fail('helper Claude Agent SDK version does not match package policy')
+  }
+  if (!/^[0-9a-f]{64}$/.test(String(manifest.contentDigest || ''))
+      || manifest.contentDigest !== contentDigest(manifest)) {
+    fail('helper content digest does not match sealed package inventory')
   }
 
   const actual = new Map(walkFiles(root)
@@ -359,6 +392,7 @@ if (require.main === module) {
 
 module.exports = {
   brokerSources,
+  contentDigest,
   createManifest,
   parseArguments,
   roleFor,

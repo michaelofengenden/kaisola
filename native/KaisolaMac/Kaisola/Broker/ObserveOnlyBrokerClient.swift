@@ -422,11 +422,17 @@ actor ObserveOnlyBrokerClient: ObserveOnlyBrokerServing {
             let implementationVersion = advertisedImplementation ?? BrokerWire.implementationVersion
             let packageSchema = object["packageSchema"]?.intValue.flatMap(Int.init(exactly:))
             let packageVersion = object["packageVersion"]?.stringValue
+            let contentDigest = object["contentDigest"]?.stringValue
+            if let contentDigest,
+               !BrokerHelperPackageVerification.isLowercaseSHA256(contentDigest) {
+                throw BrokerClientError.identityChanged
+            }
             guard object["pid"]?.intValue == Int64(info.pid),
                   object["startedAt"]?.intValue == info.startedAt,
                   info.implementationVersion == nil || info.implementationVersion == implementationVersion,
                   info.packageSchema == nil || info.packageSchema == packageSchema,
-                  info.packageVersion == nil || info.packageVersion == packageVersion else {
+                  info.packageVersion == nil || info.packageVersion == packageVersion,
+                  info.contentDigest == nil || info.contentDigest == contentDigest else {
                 throw BrokerClientError.identityChanged
             }
             let features = Set(object["features"]?.arrayValue?.compactMap(\.stringValue) ?? [])
@@ -443,6 +449,7 @@ actor ObserveOnlyBrokerClient: ObserveOnlyBrokerServing {
                 implementationVersion: implementationVersion,
                 packageSchema: packageSchema,
                 packageVersion: packageVersion,
+                contentDigest: contentDigest,
                 features: features,
                 pid: info.pid,
                 startedAt: object["startedAt"]?.intValue ?? info.startedAt,

@@ -1,277 +1,291 @@
-# Build + publish a macOS release whenever a v* tag is pushed.
-#   git tag v0.2.0 && git push origin v0.2.0
-# workflow_dispatch dry-runs the native build/notarization without publishing.
+# Promote an already signed, notarized, stapled candidate for this exact commit.
+# The expensive candidate is produced by release-candidate.yml on protected
+# main. This tag lane performs no build, signing, or notarization work.
 name: release
+
 on:
   push:
     tags: ['v*']
-  workflow_dispatch:
+
 concurrency:
-  # Updating the permanent Sparkle feed is a read/merge/write operation. Never
-  # let two tag builds race and silently discard one another's appcast entry.
+  # Asset publication and the permanent Sparkle feed are serialized together.
   group: kaisola-release
   cancel-in-progress: false
+
 permissions:
+  actions: read
   contents: write
+
 jobs:
-  swift-contracts:
-    uses: ./.github/workflows/swift-contracts.yml
-    with:
-      # The iPhone build/tests gate pushes and PRs; a release run only ships
-      # desktop artifacts and should not serialize behind the simulator.
-      skip-ios: true
-  mac:
-    needs: swift-contracts
+  promote:
     runs-on: macos-15
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          fetch-depth: 1
+          persist-credentials: false
       - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
         with:
           node-version: 22
-          cache: npm
-      - name: Install exact dependencies
-        run: npm ci --prefer-offline --no-audit --no-fund
+      - name: Resolve the immutable candidate for this tag
+        id: candidate
         env:
-          KAISOLA_SKIP_NATIVE_REBUILD: '1'
-      - name: Require release signing and notarization credentials
-        env:
-          CSC_LINK: ${{ secrets.CSC_LINK }}
-          CSC_KEY_PASSWORD: ${{ secrets.CSC_KEY_PASSWORD }}
-          APPLE_ID: ${{ secrets.APPLE_ID }}
-          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
-          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
-          SPARKLE_PRIVATE_ED_KEY: ${{ secrets.SPARKLE_PRIVATE_ED_KEY }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          for name in CSC_LINK CSC_KEY_PASSWORD APPLE_ID APPLE_APP_SPECIFIC_PASSWORD APPLE_TEAM_ID; do
-            test -n "${!name:-}" || { echo "Missing required release credential: $name" >&2; exit 1; }
-          done
-          if [[ "$GITHUB_REF" == refs/tags/* ]]; then
-            test -n "${SPARKLE_PRIVATE_ED_KEY:-}" || {
-              echo "Missing required tag-release credential: SPARKLE_PRIVATE_ED_KEY" >&2
+          echo "PROMOTION_STARTED_AT=$(date +%s)" >> "$GITHUB_ENV"
+          version="${GITHUB_REF_NAME#v}"
+          [[ "$GITHUB_REF_NAME" == "v$version" && "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || {
+            echo "release tag must be vx.y.z; found $GITHUB_REF_NAME" >&2
+            exit 1
+          }
+          package_version="$(node -p "require('./package.json').version")"
+          test "$package_version" = "$version" || {
+            echo "tag $GITHUB_REF_NAME does not match package version $package_version" >&2
+            exit 1
+          }
+
+          # A rerun must remain bound to the candidate receipt already on the
+          # release. It may never silently select newer bytes for the same tag.
+          prior_directory="$RUNNER_TEMP/prior-release"
+          run_id=''
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            mkdir -p "$prior_directory"
+            if gh release download "$GITHUB_REF_NAME" \
+              --pattern release-candidate.json \
+              --dir "$prior_directory"; then
+              run_id="$(node -e '
+                const fs = require("fs")
+                const receipt = JSON.parse(fs.readFileSync(process.argv[1], "utf8"))
+                const id = String(receipt.workflow?.runID || "")
+                if (!/^[1-9]\d*$/.test(id)) process.exit(2)
+                process.stdout.write(id)
+              ' "$prior_directory/release-candidate.json")"
+            else
+              # A just-created but still-empty release is safely recoverable.
+              # Any unreceipted asset is ambiguous and therefore fails closed.
+              asset_count="$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$GITHUB_REF_NAME" --jq '.assets | length')"
+              test "$asset_count" = 0 || {
+                echo 'existing release has assets but no immutable candidate receipt' >&2
+                exit 1
+              }
+            fi
+          fi
+          if [[ -z "$run_id" ]]; then
+            runs="$RUNNER_TEMP/candidate-runs.json"
+            gh api -X GET \
+              "repos/$GITHUB_REPOSITORY/actions/workflows/release-candidate.yml/runs" \
+              -f head_sha="$GITHUB_SHA" \
+              -f status=success \
+              -f per_page=100 > "$runs"
+            run_id="$(jq -r --arg sha "$GITHUB_SHA" '
+              [.workflow_runs[]
+                | select(.head_sha == $sha)
+                | select(.head_branch == "main")
+                | select(.conclusion == "success")
+                | select(.event == "push" or .event == "workflow_dispatch")]
+              | sort_by(.run_number, .run_attempt)
+              | last
+              | .id // empty
+            ' "$runs")"
+            test -n "$run_id" || {
+              echo "no successful native release candidate exists for $GITHUB_SHA" >&2
               exit 1
             }
           fi
-      - name: Download Kaisola helper runtimes
-        run: npm run native:helper:download
-      - name: Import Developer ID certificate for Kaisola
-        env:
-          CSC_LINK: ${{ secrets.CSC_LINK }}
-          CSC_KEY_PASSWORD: ${{ secrets.CSC_KEY_PASSWORD }}
+
+          run="$RUNNER_TEMP/candidate-run.json"
+          artifacts="$RUNNER_TEMP/candidate-artifacts.json"
+          gh api "repos/$GITHUB_REPOSITORY/actions/runs/$run_id" > "$run"
+          jq -e --arg sha "$GITHUB_SHA" '
+            .head_sha == $sha and .head_branch == "main" and .conclusion == "success"
+          ' "$run" >/dev/null || {
+            echo 'selected candidate run is not a successful exact-commit main run' >&2
+            exit 1
+          }
+          gh api "repos/$GITHUB_REPOSITORY/actions/runs/$run_id/artifacts" > "$artifacts"
+          artifact_digest="$(jq -r '
+            [.artifacts[] | select(.name == "kaisola-native-candidate" and (.expired | not))]
+            | if length == 1 then .[0].digest // empty else empty end
+          ' "$artifacts")"
+          [[ "$artifact_digest" =~ ^sha256:[0-9a-f]{64}$ ]] || {
+            echo 'candidate run must have exactly one unexpired SHA-256-addressed artifact' >&2
+            exit 1
+          }
+          echo "run-id=$run_id" >> "$GITHUB_OUTPUT"
+          echo "artifact-digest=$artifact_digest" >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+      - name: Download exact candidate artifact
+        id: download
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: kaisola-native-candidate
+          path: release/native
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ steps.candidate.outputs.run-id }}
+      - name: Verify provenance, checksums, and Sparkle signature before unpacking
         run: |
           set -euo pipefail
-          keychain_path="$RUNNER_TEMP/kaisola-native-signing.keychain-db"
-          certificate_path="$RUNNER_TEMP/kaisola-native-signing.p12"
-          keychain_password="$(openssl rand -hex 32)"
-          umask 077
-          printf '%s' "$CSC_LINK" | base64 --decode > "$certificate_path"
-          security create-keychain -p "$keychain_password" "$keychain_path"
-          security set-keychain-settings -lut 21600 "$keychain_path"
-          security unlock-keychain -p "$keychain_password" "$keychain_path"
-          security import "$certificate_path" \
-            -k "$keychain_path" \
-            -P "$CSC_KEY_PASSWORD" \
-            -T /usr/bin/codesign \
-            -T /usr/bin/security
-          security set-key-partition-list \
-            -S apple-tool:,apple:,codesign: \
-            -s \
-            -k "$keychain_password" \
-            "$keychain_path"
-          security list-keychains -d user -s "$keychain_path"
-      - name: Build Developer ID Kaisola
-        env:
-          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          node scripts/native-release-candidate.cjs verify \
+            --directory "$GITHUB_WORKSPACE/release/native" \
+            --receipt "$GITHUB_WORKSPACE/release/native/release-candidate.json" \
+            --repository "$GITHUB_REPOSITORY" \
+            --commit "$GITHUB_SHA" \
+            --run-id "${{ steps.candidate.outputs.run-id }}" \
+            --version "${{ steps.candidate.outputs.version }}" \
+            --tag "$GITHUB_REF_NAME"
+      - name: Verify the notarized app and sealed BrokerHelper identity
         run: |
           set -euo pipefail
-          # Run attempts share GITHUB_RUN_NUMBER, so a rerun must still mint a
-          # strictly newer Sparkle bundle version and a distinct artifact name;
-          # otherwise a rerun would re-sign different bytes at the same URL.
-          native_build="$((1000 + GITHUB_RUN_NUMBER * 100 + GITHUB_RUN_ATTEMPT))"
-          echo "NATIVE_BUILD_VERSION=$native_build" >> "$GITHUB_ENV"
-          marketing_version="${GITHUB_REF_NAME#v}"
-          case "$GITHUB_REF" in
-            refs/tags/*) ;;
-            *) marketing_version="0.0.0" ;; # workflow_dispatch dry-run
-          esac
-          echo "NATIVE_MARKETING_VERSION=$marketing_version" >> "$GITHUB_ENV"
-          xcodebuild \
-            -project native/KaisolaMac/KaisolaMac.xcodeproj \
-            -scheme Kaisola \
-            -configuration Release \
-            -destination 'generic/platform=macOS' \
-            -derivedDataPath "$RUNNER_TEMP/kaisola-native" \
-            ARCHS='arm64 x86_64' \
-            ONLY_ACTIVE_ARCH=NO \
-            CODE_SIGN_STYLE=Manual \
-            CODE_SIGN_IDENTITY="Developer ID Application" \
-            DEVELOPMENT_TEAM="${APPLE_TEAM_ID}" \
-            CODE_SIGN_INJECT_BASE_ENTITLEMENTS=NO \
-            OTHER_CODE_SIGN_FLAGS=--timestamp \
-            MARKETING_VERSION="$marketing_version" \
-            CURRENT_PROJECT_VERSION="$native_build" \
-            KAISOLA_SPARKLE_FEED_URL='https://github.com/michaelofengenden/kaisola/releases/download/kaisola-updates/appcast.xml' \
-            KAISOLA_SPARKLE_PUBLIC_ED_KEY='BQgU8WTQzeYBaYnbWrYBgoP7JPYyCXVrNgHCMBvmYrk=' \
-            build
-      - name: Re-sign nested components and seal BrokerHelper
-        run: |
-          set -euo pipefail
-          app="$RUNNER_TEMP/kaisola-native/Build/Products/Release/Kaisola.app"
-          npm run native:sign:distribution -- \
-            --app "$app" \
-            --identity "Developer ID Application"
-      - name: Verify Kaisola release package
-        run: |
-          npm run native:preflight -- \
-            --app "$RUNNER_TEMP/kaisola-native/Build/Products/Release/Kaisola.app" \
-            --require-updates --require-developer-id
-      - name: Notarize, staple, and package Kaisola
-        env:
-          APPLE_ID: ${{ secrets.APPLE_ID }}
-          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
-          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
-        run: |
-          set -euo pipefail
-          app="$RUNNER_TEMP/kaisola-native/Build/Products/Release/Kaisola.app"
-          version="$NATIVE_MARKETING_VERSION"
-          artifact_directory="$GITHUB_WORKSPACE/release/native"
-          # The bundle version in the name keeps every published archive URL
-          # immutable across workflow reruns; the appcast references exactly
-          # one of them.
-          artifact_name="Kaisola-${version}-b${NATIVE_BUILD_VERSION}.zip"
-          artifact="$artifact_directory/$artifact_name"
-          mkdir -p "$artifact_directory"
-          ditto -c -k --keepParent "$app" "$artifact"
-          xcrun notarytool submit "$artifact" \
-            --wait \
-            --apple-id "$APPLE_ID" \
-            --password "$APPLE_APP_SPECIFIC_PASSWORD" \
-            --team-id "$APPLE_TEAM_ID"
-          xcrun stapler staple "$app"
-          rm -f "$artifact"
-          ditto -c -k --keepParent "$app" "$artifact"
-          spctl --assess --type execute --verbose "$app"
-          # Verify the bytes actually being published, not the build tree:
-          # unpack the final archive and hold it to the notarized standard.
-          unpack_directory="$RUNNER_TEMP/kaisola-native-unpack"
-          rm -rf "$unpack_directory"
-          ditto -x -k "$artifact" "$unpack_directory"
-          npm run native:preflight -- \
+          receipt="$GITHUB_WORKSPACE/release/native/release-candidate.json"
+          build="$(node -e '
+            const receipt = require(process.argv[1])
+            const build = String(receipt.application?.build || "")
+            if (!/^[1-9]\d*$/.test(build)) process.exit(2)
+            process.stdout.write(build)
+          ' "$receipt")"
+          archive="$GITHUB_WORKSPACE/release/native/Kaisola-${{ steps.candidate.outputs.version }}-b${build}.zip"
+          unpack_directory="$RUNNER_TEMP/kaisola-promoted-app"
+          preflight="$RUNNER_TEMP/promotion-preflight.json"
+          mkdir -p "$unpack_directory"
+          ditto -x -k "$archive" "$unpack_directory"
+          node scripts/native-release-preflight.cjs \
             --app "$unpack_directory/Kaisola.app" \
-            --require-updates --require-notarized
-          packaged_build="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$unpack_directory/Kaisola.app/Contents/Info.plist")"
-          test "$packaged_build" = "$NATIVE_BUILD_VERSION" || { echo "bundle version $packaged_build != $NATIVE_BUILD_VERSION" >&2; exit 1; }
-
-          # The native app is now the public product. Ship a normal drag-to-
-          # Applications DMG alongside the immutable Sparkle zip, notarize the
-          # container itself, and keep a stable name for the website installer.
-          dmg_staging="$RUNNER_TEMP/kaisola-dmg"
-          dmg_name="Kaisola-${version}-b${NATIVE_BUILD_VERSION}.dmg"
-          dmg="$artifact_directory/$dmg_name"
-          rm -rf "$dmg_staging"
-          mkdir -p "$dmg_staging"
-          ditto "$app" "$dmg_staging/Kaisola.app"
-          ln -s /Applications "$dmg_staging/Applications"
-          hdiutil create -volname Kaisola -srcfolder "$dmg_staging" -ov -format UDZO "$dmg"
-          codesign --force --timestamp --sign "Developer ID Application" "$dmg"
-          xcrun notarytool submit "$dmg" \
-            --wait \
-            --apple-id "$APPLE_ID" \
-            --password "$APPLE_APP_SPECIFIC_PASSWORD" \
-            --team-id "$APPLE_TEAM_ID"
-          xcrun stapler staple "$dmg"
-          xcrun stapler validate "$dmg"
-          ditto "$dmg" "$artifact_directory/Kaisola.dmg"
-
-          (
-            cd "$artifact_directory"
-            for published in *.zip *.dmg; do
-              shasum -a 256 "$published" > "$published.sha256"
-            done
-            for checksum in *.sha256; do
-              shasum -a 256 --check "$checksum"
-            done
-          )
-      - name: Smoke-launch final Kaisola bundle
-        run: |
-          npm run native:launch-smoke -- \
-            --app "$RUNNER_TEMP/kaisola-native-unpack/Kaisola.app" \
-            --seconds 10
-      - name: Clean up native signing keychain
-        if: ${{ always() }}
-        run: |
-          keychain_path="$RUNNER_TEMP/kaisola-native-signing.keychain-db"
-          certificate_path="$RUNNER_TEMP/kaisola-native-signing.p12"
-          security delete-keychain "$keychain_path" || true
-          rm -f "$certificate_path"
-      - name: Generate signed Sparkle appcast
-        if: ${{ startsWith(github.ref, 'refs/tags/') }}
+            --require-updates --require-notarized \
+            --source-commit "$GITHUB_SHA" \
+            --json-output "$preflight"
+          node scripts/native-release-candidate.cjs verify \
+            --directory "$GITHUB_WORKSPACE/release/native" \
+            --receipt "$receipt" \
+            --preflight "$preflight" \
+            --repository "$GITHUB_REPOSITORY" \
+            --commit "$GITHUB_SHA" \
+            --run-id "${{ steps.candidate.outputs.run-id }}" \
+            --version "${{ steps.candidate.outputs.version }}" \
+            --tag "$GITHUB_REF_NAME"
+          echo "NATIVE_BUILD_VERSION=$build" >> "$GITHUB_ENV"
+      - name: Generate appcast from the candidate's prepared signature
         env:
           GH_TOKEN: ${{ github.token }}
-          SPARKLE_PRIVATE_ED_KEY: ${{ secrets.SPARKLE_PRIVATE_ED_KEY }}
         run: |
           set -euo pipefail
+          receipt="$GITHUB_WORKSPACE/release/native/release-candidate.json"
           appcast_directory="$RUNNER_TEMP/kaisola-appcast"
           existing_appcast="$appcast_directory/existing.xml"
           generated_appcast="$appcast_directory/appcast.xml"
-          private_key="$appcast_directory/sparkle-private-ed-key"
-          archive="$GITHUB_WORKSPACE/release/native/Kaisola-${NATIVE_MARKETING_VERSION}-b${NATIVE_BUILD_VERSION}.zip"
-          sign_update="$RUNNER_TEMP/kaisola-native/SourcePackages/artifacts/sparkle/Sparkle/bin/sign_update"
-
-          rm -rf "$appcast_directory"
+          archive_name="Kaisola-${{ steps.candidate.outputs.version }}-b${NATIVE_BUILD_VERSION}.zip"
+          archive="$GITHUB_WORKSPACE/release/native/$archive_name"
+          signature="$(node -e 'process.stdout.write(require(process.argv[1]).sparkle.edSignature)' "$receipt")"
+          archive_length="$(node -e 'process.stdout.write(String(require(process.argv[1]).sparkle.archiveLength))' "$receipt")"
           mkdir -p "$appcast_directory"
-          umask 077
-          printf '%s' "$SPARKLE_PRIVATE_ED_KEY" > "$private_key"
-          test -s "$private_key" || { echo "Sparkle private key is empty" >&2; exit 1; }
-          test -x "$sign_update" || { echo "Sparkle sign_update was not resolved at $sign_update" >&2; exit 1; }
-          test -s "$archive" || { echo "Sparkle archive was not packaged at $archive" >&2; exit 1; }
-
-          # Preserve every previously published update. The release is a
-          # permanent append-only feed, while the versioned zip URL is immutable.
-          gh release download kaisola-updates \
-            --pattern appcast.xml \
-            --dir "$appcast_directory/download"
-          mv "$appcast_directory/download/appcast.xml" "$existing_appcast"
-          enclosure_url="https://github.com/${GITHUB_REPOSITORY}/releases/download/${GITHUB_REF_NAME}/$(basename "$archive")"
+          appcast_arguments=(
+            --zip "$archive"
+            --version "${{ steps.candidate.outputs.version }}"
+            --build "$NATIVE_BUILD_VERSION"
+            --ed-signature "$signature"
+            --archive-length "$archive_length"
+          )
+          if gh release view kaisola-updates >/dev/null 2>&1; then
+            mkdir -p "$appcast_directory/download"
+            if gh release download kaisola-updates \
+              --pattern appcast.xml \
+              --dir "$appcast_directory/download"; then
+              mv "$appcast_directory/download/appcast.xml" "$existing_appcast"
+              appcast_arguments+=(--existing "$existing_appcast")
+            else
+              feed_asset_count="$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/kaisola-updates" --jq '.assets | length')"
+              test "$feed_asset_count" = 0 || {
+                echo 'permanent update release has assets but no appcast.xml' >&2
+                exit 1
+              }
+            fi
+          fi
+          enclosure_url="https://github.com/${GITHUB_REPOSITORY}/releases/download/${GITHUB_REF_NAME}/${archive_name}"
+          appcast_arguments+=(--url "$enclosure_url" --output "$generated_appcast")
           node scripts/native-appcast.cjs \
-            --zip "$archive" \
-            --version "$NATIVE_MARKETING_VERSION" \
-            --build "$NATIVE_BUILD_VERSION" \
-            --url "$enclosure_url" \
-            --sign-update "$sign_update" \
-            --ed-key-file "$private_key" \
-            --existing "$existing_appcast" \
-            --output "$generated_appcast"
+            "${appcast_arguments[@]}"
           test -s "$generated_appcast"
-      - name: Publish Kaisola assets
-        if: ${{ startsWith(github.ref, 'refs/tags/') }}
+      - name: Publish exact candidate assets
         uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3.0.2
         with:
           files: |
-            release/native/*.dmg
-            release/native/*.zip
-            release/native/*.sha256
+            release/native/release-candidate.json
+            release/native/Kaisola-${{ steps.candidate.outputs.version }}-b${{ env.NATIVE_BUILD_VERSION }}.zip
+            release/native/Kaisola-${{ steps.candidate.outputs.version }}-b${{ env.NATIVE_BUILD_VERSION }}.zip.sha256
+            release/native/Kaisola-${{ steps.candidate.outputs.version }}-b${{ env.NATIVE_BUILD_VERSION }}.dmg
+            release/native/Kaisola-${{ steps.candidate.outputs.version }}-b${{ env.NATIVE_BUILD_VERSION }}.dmg.sha256
+            release/native/Kaisola.dmg
+            release/native/Kaisola.dmg.sha256
           generate_release_notes: true
           fail_on_unmatched_files: true
-      - name: Publish and verify permanent Sparkle appcast
-        if: ${{ startsWith(github.ref, 'refs/tags/') }}
+      - name: Verify remote release asset digests before feed mutation
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          appcast_directory="$RUNNER_TEMP/kaisola-appcast"
-          generated_appcast="$appcast_directory/appcast.xml"
-          verified_directory="$appcast_directory/verified"
-
-          # Publish the versioned zip first so Sparkle can never observe an
-          # appcast entry whose immutable enclosure URL does not exist yet.
+          remote="$RUNNER_TEMP/remote-release.json"
+          gh api "repos/$GITHUB_REPOSITORY/releases/tags/$GITHUB_REF_NAME" > "$remote"
+          node - "$GITHUB_WORKSPACE/release/native/release-candidate.json" "$remote" <<'NODE'
+          const crypto = require('node:crypto')
+          const fs = require('node:fs')
+          const path = require('node:path')
+          const receiptPath = process.argv[2]
+          const remotePath = process.argv[3]
+          const receipt = JSON.parse(fs.readFileSync(receiptPath, 'utf8'))
+          const remote = JSON.parse(fs.readFileSync(remotePath, 'utf8'))
+          const receiptBytes = fs.readFileSync(receiptPath)
+          const expected = [...receipt.artifacts, {
+            name: path.basename(receiptPath),
+            size: receiptBytes.length,
+            sha256: crypto.createHash('sha256').update(receiptBytes).digest('hex'),
+          }]
+          const assets = new Map()
+          for (const asset of remote.assets || []) {
+            if (assets.has(asset.name)) throw new Error(`duplicate remote asset: ${asset.name}`)
+            assets.set(asset.name, asset)
+          }
+          if (assets.size !== expected.length) throw new Error('remote release has an unexpected asset set')
+          for (const item of expected) {
+            const asset = assets.get(item.name)
+            if (!asset || asset.state !== 'uploaded' || asset.size !== item.size
+                || asset.digest !== `sha256:${item.sha256}`) {
+              throw new Error(`remote release asset does not match candidate receipt: ${item.name}`)
+            }
+          }
+          console.log(`REMOTE_RELEASE_ASSETS=PASS count=${expected.length}`)
+          NODE
+      - name: Publish and verify permanent Sparkle appcast
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          generated_appcast="$RUNNER_TEMP/kaisola-appcast/appcast.xml"
+          verified_directory="$RUNNER_TEMP/kaisola-appcast/verified"
+          if ! gh release view kaisola-updates >/dev/null 2>&1; then
+            gh release create kaisola-updates \
+              --target "$GITHUB_SHA" \
+              --title 'Kaisola update feed' \
+              --notes 'Permanent signed Sparkle update feed. Managed by the release workflow.' \
+              --prerelease \
+              --latest=false
+          fi
           gh release upload kaisola-updates "$generated_appcast" --clobber
-          rm -rf "$verified_directory"
+          mkdir -p "$verified_directory"
           gh release download kaisola-updates \
             --pattern appcast.xml \
             --dir "$verified_directory"
           cmp "$generated_appcast" "$verified_directory/appcast.xml"
           shasum -a 256 "$generated_appcast" "$verified_directory/appcast.xml"
-      - name: Remove Sparkle private key
-        if: ${{ always() && startsWith(github.ref, 'refs/tags/') }}
-        run: rm -f "$RUNNER_TEMP/kaisola-appcast/sparkle-private-ed-key"
+      - name: Report fast-promotion timing and identity
+        run: |
+          elapsed="$(( $(date +%s) - PROMOTION_STARTED_AT ))"
+          {
+            echo '### Native release promotion'
+            echo
+            echo "- Candidate run: \`${{ steps.candidate.outputs.run-id }}\`"
+            echo "- Candidate artifact digest: \`${{ steps.candidate.outputs.artifact-digest }}\`"
+            echo "- Version/build: \`${{ steps.candidate.outputs.version }} ($NATIVE_BUILD_VERSION)\`"
+            echo "- Promotion duration: \`${elapsed}s\` (candidate build/notarization excluded)"
+          } >> "$GITHUB_STEP_SUMMARY"

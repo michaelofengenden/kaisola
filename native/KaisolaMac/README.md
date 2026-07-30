@@ -31,15 +31,19 @@ npm run native:fast:launch      # relaunch the existing build product
 KAISOLA_NATIVE_BROKER_PROFILE=development npm run native:fast
 npm run native:fast -- --refresh-helper
 npm run native:test:focus -- WorkspaceFilesTests
+npm run native:test:changed -- --changed-file native/KaisolaMac/Kaisola/Features/Workspace/FilePreviewView.swift
 ```
 
 The helper is packaged automatically only when the selected broker is absent
-and the build product has no helper. `--refresh-helper` forces packaging. Use
-the isolated `development` profile for experiments that must not attach to the
-ordinary native broker. On 2026-07-28, the first empty-cache build took 37
-seconds on the development Mac, an immediate warm build took 3 seconds, and
-forcing helper packaging took 7 seconds. These are local signposts, not release
-performance claims.
+and the build product has no helper, or when the sealed helper inputs changed
+since the last successful fast build. `--refresh-helper` forces packaging.
+Packaging a changed helper does not stop or replace the selected detached
+broker; the app's broker parity policy decides when a session-safe replacement
+is allowed. Use the isolated `development` profile for experiments that must
+not attach to the ordinary native broker. On 2026-07-28, the first empty-cache
+build took 37 seconds on the development Mac, an immediate warm build took 3
+seconds, and forcing helper packaging took 7 seconds. These are local signposts,
+not release performance claims.
 
 The focused test command refuses an empty selector so it cannot accidentally
 start the complete native suite. Add `--run-only` after one successful build to
@@ -48,6 +52,45 @@ rerun the existing test product without compiling:
 ```bash
 npm run native:test:focus -- --run-only WorkspaceFilesTests/testExample
 ```
+
+For a reproducible test plan from a diff, use the changed-file lane. It prints
+the normalized file list and every selected test before execution. Direct
+source/test pairs stay focused; shared broker, Swift protocol, build graph, and
+release changes expand to the broader contract lane; an unknown runtime file
+also expands instead of silently skipping coverage.
+
+```bash
+# Current working tree and untracked files
+npm run native:test:changed
+
+# Exact committed diff, optionally including current edits
+npm run native:test:changed -- --base origin/main
+npm run native:test:changed -- --base origin/main --include-working-tree
+
+# Review without running, or reuse an already-built macOS test product
+npm run native:test:changed -- --changed-file scripts/native-mcp-registry.cjs --dry-run
+npm run native:test:changed -- --staged --run-only
+```
+
+`native:test:select` emits the same plan without executing it and accepts
+`--format json` for automation. Explicit inputs can be repeated with
+`--changed-file` or supplied as newline-delimited paths with
+`--changed-files-from`. Documentation files are an explicit no-runtime-tests
+classification; every other unmapped file receives the safe broad fallback.
+
+Record comparable cold and warm active-architecture build timings around a
+structural change with labels:
+
+```bash
+npm run native:timing -- --label before-view-split
+npm run native:timing -- --label after-view-split --warm-runs 2
+```
+
+The timing runner creates a fresh temporary DerivedData directory, builds once
+cold and then immediately warm, and appends a JSONL receipt under
+`.build/metrics/native-build-timings.jsonl`. It never clears or replaces the
+persistent `native:fast` cache and skips helper packaging consistently so the
+comparison measures Swift compilation rather than broker artifacts.
 
 In the same 2026-07-28 local measurement, the first focused test build/run took
 17 seconds and the unchanged `--run-only` rerun took 4 seconds. The selected

@@ -16,6 +16,7 @@ public enum BrokerWire {
     public static let terminalObserveFeature = "terminal-observe-v1"
     public static let terminalHistoryFeature = "terminal-history-v1"
     public static let observerRoleFeature = "observer-role-v1"
+    public static let brokerUpdateFeature = "broker-update-v1"
     public static let observerMethods: Set<String> = [
         "broker.status",
         "terminal.list",

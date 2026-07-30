@@ -7,12 +7,14 @@ const path = require('node:path')
 const {
   BROKER_IMPLEMENTATION_VERSION,
   BROKER_PACKAGE_SCHEMA,
+  BROKER_UPDATE_FEATURE,
   brokerVersionsCompatible,
 } = require('../../runtime/node-broker/ipc/brokerWire.cjs')
 
 test('independent broker implementation and helper package versions are pinned', () => {
   assert.equal(BROKER_IMPLEMENTATION_VERSION, 1)
   assert.equal(BROKER_PACKAGE_SCHEMA, 1)
+  assert.equal(BROKER_UPDATE_FEATURE, 'broker-update-v1')
 })
 
 test('Node and Swift consume the same broker N/N+1 compatibility matrix', () => {

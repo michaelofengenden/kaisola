@@ -491,9 +491,9 @@ final class NativePreviewSettingsTests: XCTestCase {
     }
 
     func testProjectSidebarHasComfortableResizableWidth() {
-        XCTAssertEqual(NativeWorkspaceChrome.projectSidebarMinimumWidth, 156)
-        XCTAssertEqual(NativeWorkspaceChrome.projectSidebarIdealWidth, 184)
-        XCTAssertEqual(NativeWorkspaceChrome.projectSidebarMaximumWidth, 228)
+        XCTAssertEqual(NativeWorkspaceChrome.projectSidebarMinimumWidth, 168)
+        XCTAssertEqual(NativeWorkspaceChrome.projectSidebarIdealWidth, 200)
+        XCTAssertEqual(NativeWorkspaceChrome.projectSidebarMaximumWidth, 260)
         XCTAssertEqual(NativeWorkspaceChrome.projectSidebarDividerWidth, 1)
         XCTAssertEqual(NativeWorkspaceChrome.projectSidebarDividerHitWidth, 17)
         XCTAssertEqual(NativeWorkspaceChrome.projectSidebarDividerReach, 8)

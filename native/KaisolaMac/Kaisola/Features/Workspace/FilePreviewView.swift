@@ -2069,12 +2069,14 @@ struct FilePreviewView: View {
     private var editor: some View {
         LineTargetTextEditor(
             text: $draft,
-            fontSize: 13 * documentZoom,
+            fontSize: editableMarkdownURL == nil ? 13 * documentZoom : 13,
             targetLine: targetLine,
             documentID: (loadedURL ?? url).path,
             markdownURL: editableMarkdownURL,
             workspaceRoot: workspaceRoot,
-            onError: { saveError = $0 }
+            onError: { saveError = $0 },
+            magnification: editableMarkdownURL == nil ? nil : documentZoom,
+            onMagnificationChanged: editableMarkdownURL == nil ? nil : { documentZoom = $0 }
         )
     }
 
@@ -2776,6 +2778,7 @@ struct MarkdownEditingStyle: Sendable {
         case italic
         case inlineCode
         case link
+        case listMarker
         case centered
         case syntax
     }
@@ -2851,7 +2854,12 @@ struct MarkdownEditingStyle: Sendable {
             .heading(min(6, match.range(at: 1).length))
         }, contentGroup: 2, syntaxGroups: [1])
         collect(#"(?m)^([ \t]*>[ \t]?)(.*)$"#, role: { _ in .quote }, contentGroup: 2, syntaxGroups: [1])
-        collect(#"(?m)^([ \t]*(?:[-+*]|[0-9]+\.)[ \t]+)"#, role: { _ in .syntax })
+        // Keep list markers visible while editing. Unlike emphasis and link
+        // delimiters, the marker is meaningful document chrome: showing it
+        // makes Return-driven list continuation feel immediate and keeps the
+        // current nesting level obvious without exposing the rest of the raw
+        // Markdown syntax.
+        collect(#"(?m)^([ \t]*(?:[-+*]|[0-9]+\.)[ \t]+)"#, role: { _ in .listMarker })
         collect(
             #"(?ms)^([ \t]*(?:```|~~~)[^\n]*\n).*?^([ \t]*(?:```|~~~)[ \t]*$)"#,
             role: { _ in .codeBlock }
@@ -2888,13 +2896,26 @@ private struct LineTargetTextEditor: NSViewRepresentable {
     var workspaceRoot: URL? = nil
     var onError: ((String) -> Void)? = nil
     var autoFocus = false
+    var magnification: CGFloat? = nil
+    var onMagnificationChanged: ((CGFloat) -> Void)? = nil
 
     func makeCoordinator() -> Coordinator { Coordinator(text: $text) }
 
     func makeNSView(context: Context) -> NSScrollView {
-        let scrollView = NSScrollView()
+        let scrollView: NSScrollView
+        if markdownURL != nil, let magnification {
+            let markdownScrollView = MarkdownMagnifyingScrollView()
+            markdownScrollView.allowsMagnification = true
+            markdownScrollView.minMagnification = 0.65
+            markdownScrollView.maxMagnification = 2
+            markdownScrollView.magnification = magnification
+            markdownScrollView.onMagnificationChanged = onMagnificationChanged
+            scrollView = markdownScrollView
+        } else {
+            scrollView = NSScrollView()
+        }
         scrollView.hasVerticalScroller = true
-        scrollView.hasHorizontalScroller = true
+        scrollView.hasHorizontalScroller = markdownURL == nil
         scrollView.autohidesScrollers = true
         scrollView.drawsBackground = true
         scrollView.backgroundColor = .textBackgroundColor
@@ -2930,7 +2951,7 @@ private struct LineTargetTextEditor: NSViewRepresentable {
         textView.isAutomaticDashSubstitutionEnabled = false
         textView.isAutomaticTextReplacementEnabled = false
         textView.isVerticallyResizable = true
-        textView.isHorizontallyResizable = true
+        textView.isHorizontallyResizable = markdownURL == nil
         textView.autoresizingMask = [.width]
         textView.minSize = NSSize(width: 0, height: 0)
         textView.maxSize = NSSize(
@@ -2938,16 +2959,17 @@ private struct LineTargetTextEditor: NSViewRepresentable {
             height: CGFloat.greatestFiniteMagnitude
         )
         textView.textContainer?.containerSize = NSSize(
-            width: CGFloat.greatestFiniteMagnitude,
+            width: markdownURL == nil ? CGFloat.greatestFiniteMagnitude : 0,
             height: CGFloat.greatestFiniteMagnitude
         )
-        textView.textContainer?.widthTracksTextView = false
+        textView.textContainer?.widthTracksTextView = markdownURL != nil
         textView.textContainerInset = NSSize(width: 12, height: 12)
         textView.textContainer?.lineFragmentPadding = 0
         textView.backgroundColor = .textBackgroundColor
         textView.font = .monospacedSystemFont(ofSize: fontSize, weight: .regular)
         textView.string = text
         scrollView.documentView = textView
+        (scrollView as? MarkdownMagnifyingScrollView)?.reflowDocumentWidth()
         context.coordinator.textView = textView
         context.coordinator.markdownURL = markdownURL
         context.coordinator.workspaceRoot = workspaceRoot
@@ -2978,6 +3000,17 @@ private struct LineTargetTextEditor: NSViewRepresentable {
             context.coordinator.isApplyingExternalValue = false
         }
         textView.font = .monospacedSystemFont(ofSize: fontSize, weight: .regular)
+        if let markdownScrollView = scrollView as? MarkdownMagnifyingScrollView {
+            markdownScrollView.onMagnificationChanged = onMagnificationChanged
+            if let magnification, abs(markdownScrollView.magnification - magnification) > 0.001 {
+                let center = NSPoint(
+                    x: markdownScrollView.contentView.bounds.midX,
+                    y: markdownScrollView.contentView.bounds.midY
+                )
+                markdownScrollView.setMagnification(magnification, centeredAt: center)
+            }
+            markdownScrollView.reflowDocumentWidth()
+        }
         context.coordinator.scrollIfNeeded(to: targetLine, documentID: documentID)
     }
 
@@ -3338,6 +3371,17 @@ private struct MarkdownRenderedEditor: NSViewRepresentable {
                 case .link:
                     layoutManager.addTemporaryAttribute(.foregroundColor, value: NSColor.linkColor, forCharacterRange: span.range)
                     layoutManager.addTemporaryAttribute(.underlineStyle, value: NSUnderlineStyle.single.rawValue, forCharacterRange: span.range)
+                case .listMarker:
+                    layoutManager.addTemporaryAttribute(
+                        .font,
+                        value: NSFont.systemFont(ofSize: bodySize, weight: .semibold),
+                        forCharacterRange: span.range
+                    )
+                    layoutManager.addTemporaryAttribute(
+                        .foregroundColor,
+                        value: NSColor.controlAccentColor,
+                        forCharacterRange: span.range
+                    )
                 case .centered:
                     let paragraph = NSMutableParagraphStyle()
                     paragraph.alignment = .center
@@ -3394,7 +3438,11 @@ final class MarkdownMagnifyingScrollView: NSScrollView {
             width: containerWidth,
             height: container.containerSize.height
         )
-        if let layoutManager = textView.layoutManager {
+        if let textLayoutManager = textView.textLayoutManager {
+            // Keep the whole-file source editor on TextKit 2. Asking a TextKit
+            // 2 view for its legacy layout manager silently downgrades it.
+            textLayoutManager.textViewportLayoutController.layoutViewport()
+        } else if let layoutManager = textView.layoutManager {
             let range = NSRange(location: 0, length: (textView.string as NSString).length)
             layoutManager.invalidateLayout(forCharacterRange: range, actualCharacterRange: nil)
             layoutManager.ensureLayout(for: container)
@@ -3413,14 +3461,129 @@ final class MarkdownMagnifyingScrollView: NSScrollView {
             super.scrollWheel(with: event)
             return
         }
-        let delta = event.scrollingDeltaY == 0 ? event.scrollingDeltaX : event.scrollingDeltaY
-        let target = min(maxMagnification, max(minMagnification, magnification + delta * 0.01))
-        guard abs(target - magnification) > 0.001 else { return }
+        guard let target = MarkdownWheelZoom.target(
+            current: magnification,
+            scrollingDeltaY: event.scrollingDeltaY,
+            scrollingDeltaX: event.scrollingDeltaX
+        ) else { return }
         let center = documentView?.convert(event.locationInWindow, from: nil)
             ?? NSPoint(x: contentView.bounds.midX, y: contentView.bounds.midY)
         setMagnification(target, centeredAt: center)
         reflowDocumentWidth()
         onMagnificationChanged?(target)
+    }
+}
+
+enum MarkdownWheelZoom {
+    static func target(
+        current: CGFloat,
+        scrollingDeltaY: CGFloat,
+        scrollingDeltaX: CGFloat
+    ) -> CGFloat? {
+        let delta = scrollingDeltaY == 0 ? scrollingDeltaX : scrollingDeltaY
+        guard delta.isFinite, delta != 0 else { return nil }
+        let target = MarkdownPreviewLayout.clampedZoom(current + delta * 0.01)
+        return abs(target - current) > 0.001 ? target : nil
+    }
+}
+
+/// SwiftUI's `MagnificationGesture` handles trackpad pinches but does not see a
+/// Command-mouse-wheel gesture. This transparent AppKit bridge observes only
+/// Command-scroll events whose pointer is inside the rendered Markdown pane;
+/// every ordinary scroll continues through the enclosing SwiftUI ScrollView.
+private struct MarkdownCommandScrollZoomBridge: NSViewRepresentable {
+    @Binding var zoom: CGFloat
+
+    func makeNSView(context: Context) -> MarkdownCommandScrollMonitorView {
+        MarkdownCommandScrollMonitorView()
+    }
+
+    func updateNSView(_ view: MarkdownCommandScrollMonitorView, context: Context) {
+        view.currentZoom = zoom
+        view.onZoom = { zoom = $0 }
+    }
+}
+
+@MainActor
+private final class MarkdownCommandScrollMonitorView: NSView {
+    var currentZoom: CGFloat = 1
+    var onZoom: (CGFloat) -> Void = { _ in }
+    private var monitor: Any?
+
+    override func hitTest(_ point: NSPoint) -> NSView? { nil }
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        removeMonitor()
+        guard window != nil else { return }
+        monitor = NSEvent.addLocalMonitorForEvents(matching: .scrollWheel) { [weak self] event in
+            guard let self,
+                  event.window === self.window,
+                  event.modifierFlags.intersection(.deviceIndependentFlagsMask).contains(.command),
+                  self.bounds.contains(self.convert(event.locationInWindow, from: nil)),
+                  let target = MarkdownWheelZoom.target(
+                      current: self.currentZoom,
+                      scrollingDeltaY: event.scrollingDeltaY,
+                      scrollingDeltaX: event.scrollingDeltaX
+                  ) else { return event }
+            self.currentZoom = target
+            self.onZoom(target)
+            return nil
+        }
+    }
+
+    private func removeMonitor() {
+        guard let monitor else { return }
+        NSEvent.removeMonitor(monitor)
+        self.monitor = nil
+    }
+}
+
+enum MarkdownListContinuation: Equatable, Sendable {
+    case continueWith(String)
+    case exitList
+
+    static func action(for line: String) -> MarkdownListContinuation? {
+        let range = NSRange(location: 0, length: (line as NSString).length)
+        if let expression = try? NSRegularExpression(
+            pattern: #"^([ \t]*)([-+*])([ \t]+)(?:\[([ xX])\]([ \t]+))?(.*)$"#
+        ), let match = expression.firstMatch(in: line, range: range) {
+            let body = substring(match.range(at: 6), in: line)
+            guard !body.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                return .exitList
+            }
+            let indent = substring(match.range(at: 1), in: line)
+            let marker = substring(match.range(at: 2), in: line)
+            let spacing = substring(match.range(at: 3), in: line)
+            if match.range(at: 4).location != NSNotFound {
+                return .continueWith(
+                    indent + marker + spacing + "[ ]" + substring(match.range(at: 5), in: line)
+                )
+            }
+            return .continueWith(indent + marker + spacing)
+        }
+
+        if let expression = try? NSRegularExpression(
+            pattern: #"^([ \t]*)([0-9]+)([.)])([ \t]+)(.*)$"#
+        ), let match = expression.firstMatch(in: line, range: range) {
+            let body = substring(match.range(at: 5), in: line)
+            guard !body.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                return .exitList
+            }
+            let current = Int(substring(match.range(at: 2), in: line)) ?? 0
+            return .continueWith(
+                substring(match.range(at: 1), in: line)
+                    + String(current + 1)
+                    + substring(match.range(at: 3), in: line)
+                    + substring(match.range(at: 4), in: line)
+            )
+        }
+        return nil
+    }
+
+    private static func substring(_ range: NSRange, in value: String) -> String {
+        guard range.location != NSNotFound else { return "" }
+        return (value as NSString).substring(with: range)
     }
 }
 
@@ -3431,6 +3594,46 @@ final class MarkdownNativeTextView: NSTextView {
 
     static func wholeFileSourceEditor() -> MarkdownNativeTextView {
         MarkdownNativeTextView(usingTextLayoutManager: true)
+    }
+
+    override func insertNewline(_ sender: Any?) {
+        let selection = selectedRange()
+        guard selection.length == 0 else {
+            super.insertNewline(sender)
+            return
+        }
+        let source = string as NSString
+        let paragraph = source.paragraphRange(for: selection)
+        let contentEnd = paragraph.location + paragraph.length
+            - lineTerminatorLength(in: source, paragraph: paragraph)
+        guard selection.location <= contentEnd else {
+            super.insertNewline(sender)
+            return
+        }
+        let prefixRange = NSRange(
+            location: paragraph.location,
+            length: selection.location - paragraph.location
+        )
+        let lineBeforeCaret = source.substring(with: prefixRange)
+        switch MarkdownListContinuation.action(for: lineBeforeCaret) {
+        case let .continueWith(prefix):
+            insertText("\n" + prefix, replacementRange: selection)
+        case .exitList where selection.location == contentEnd:
+            insertText("\n", replacementRange: paragraph)
+        case .exitList, .none:
+            super.insertNewline(sender)
+        }
+    }
+
+    private func lineTerminatorLength(in source: NSString, paragraph: NSRange) -> Int {
+        guard paragraph.length > 0 else { return 0 }
+        let last = source.character(at: NSMaxRange(paragraph) - 1)
+        guard last == 0x0A || last == 0x0D else { return 0 }
+        if paragraph.length > 1, last == 0x0A,
+           source.character(at: NSMaxRange(paragraph) - 2) == 0x0D {
+            return 2
+        }
+        return 1
     }
 
     override func paste(_ sender: Any?) {
@@ -4716,6 +4919,9 @@ private struct MarkdownDocumentView: View {
             }
             .scrollBounceBehavior(.basedOnSize)
         }
+        .background {
+            MarkdownCommandScrollZoomBridge(zoom: $zoom)
+        }
         .onAppear { beginAutomaticEditIfReady() }
         .onChange(of: source) { _, _ in beginAutomaticEditIfReady() }
         .simultaneousGesture(
@@ -4846,7 +5052,7 @@ private struct MarkdownDocumentView: View {
             HStack(spacing: 7) {
                 Image(systemName: "pencil.line")
                     .foregroundStyle(.tint)
-                Text("Editing exact Markdown source for this block")
+                Text("Editing this Markdown block directly")
                     .font(.caption.weight(.medium))
                 Spacer()
                 Button("Done") { activeEdit = nil }
@@ -4854,15 +5060,13 @@ private struct MarkdownDocumentView: View {
                     .controlSize(.small)
                     .keyboardShortcut(.return, modifiers: .command)
             }
-            LineTargetTextEditor(
+            MarkdownRenderedEditor(
                 text: activeTextBinding,
-                fontSize: max(12, 13 * zoom),
-                targetLine: nil,
-                documentID: "markdown-block-\(edit.range.location)",
                 markdownURL: documentURL,
                 workspaceRoot: workspaceRoot,
-                onError: onError,
-                autoFocus: true
+                zoom: $zoom,
+                targetLine: nil,
+                onError: onError
             )
             .frame(width: availableWidth)
             .frame(
@@ -5279,7 +5483,9 @@ private struct MarkdownTable: View {
                 )
                 .overlay {
                     ZStack(alignment: .trailing) {
-                        Divider()
+                        Rectangle()
+                            .fill(Color(nsColor: .separatorColor).opacity(0.55))
+                            .frame(width: 1)
                         if activeCell == id {
                             RoundedRectangle(cornerRadius: 5, style: .continuous)
                                 .stroke(Color.accentColor, lineWidth: 1.5)
@@ -5313,522 +5519,5 @@ private struct MarkdownTable: View {
             markdown: MarkdownInlinePresentation.preventingOrphanedSeparators(text),
             options: .init(interpretedSyntax: .inlineOnlyPreservingWhitespace)
         )) ?? AttributedString(text)
-    }
-}
-
-/// The workspace rail: a lazy file tree for the active project (⌘B). Clicking a
-/// file opens it in the preview pane.
-struct WorkspaceRailView: View {
-    private enum CreationKind: String, Sendable {
-        case file = "File"
-        case folder = "Folder"
-    }
-
-    private struct CreationRequest: Identifiable, Sendable {
-        let id = UUID()
-        let kind: CreationKind
-        let parent: URL
-    }
-
-    @EnvironmentObject private var settings: NativePreviewSettings
-    let root: URL
-    let openFile: (URL, Bool) -> Void
-    let didMoveItem: (URL, URL) -> Void
-    let didTrashItem: (WorkspaceFileOperations.TrashMove) -> Void
-    let didCreateItem: (WorkspaceFileOperations.CreatedItem) -> Void
-    let close: () -> Void
-
-    @State private var expanded: Set<String> = []
-    @State private var searchText = ""
-    @State private var renameTarget: FileNode?
-    @State private var renameDraft = ""
-    @State private var creationRequest: CreationRequest?
-    @State private var creationDraft = ""
-    @State private var trashTarget: FileNode?
-    @State private var isMutating = false
-    /// Live FSEvents watcher — agent writes refresh the tree automatically.
-    @StateObject private var watcher: WorkspaceWatcher
-    @StateObject private var tree: WorkspaceTreeModel
-
-    init(
-        root: URL,
-        openFile: @escaping (URL, Bool) -> Void,
-        didMoveItem: @escaping (URL, URL) -> Void,
-        didTrashItem: @escaping (WorkspaceFileOperations.TrashMove) -> Void,
-        didCreateItem: @escaping (WorkspaceFileOperations.CreatedItem) -> Void,
-        close: @escaping () -> Void
-    ) {
-        self.root = root
-        self.openFile = openFile
-        self.didMoveItem = didMoveItem
-        self.didTrashItem = didTrashItem
-        self.didCreateItem = didCreateItem
-        self.close = close
-        _watcher = StateObject(wrappedValue: WorkspaceWatcher(root: root))
-        _tree = StateObject(wrappedValue: WorkspaceTreeModel(root: root))
-    }
-
-    var body: some View {
-        VStack(spacing: 0) {
-            HStack(spacing: 6) {
-                Button(action: close) {
-                    Image(systemName: "folder.fill")
-                        .font(.caption.weight(.semibold))
-                        .foregroundStyle(Color.accentColor)
-                        .frame(width: 20, height: 20)
-                }
-                .buttonStyle(.borderless)
-                .help("Hide \(root.lastPathComponent) files (Command-B)")
-                .accessibilityLabel("Close file browser")
-                Image(systemName: "magnifyingglass")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                TextField("Search files", text: $searchText)
-                    .textFieldStyle(.plain)
-                Menu {
-                    Button("New File…") { beginCreate(.file, in: root) }
-                    Button("New Folder…") { beginCreate(.folder, in: root) }
-                } label: {
-                    Image(systemName: "plus")
-                        .font(.caption.weight(.semibold))
-                }
-                .menuStyle(.borderlessButton)
-                .fixedSize()
-                .help("New file or folder")
-                .accessibilityLabel("New workspace item")
-                Button(action: refresh) {
-                    Image(systemName: "arrow.clockwise")
-                        .font(.caption)
-                }
-                .buttonStyle(.borderless)
-                .help("Refresh files")
-                if isMutating {
-                    ProgressView().controlSize(.mini)
-                        .accessibilityLabel("Updating workspace files")
-                }
-            }
-            .padding(.horizontal, 8)
-            .frame(height: 30)
-            .background(.quaternary.opacity(0.38), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
-            .padding(.horizontal, 6)
-            .padding(.vertical, 6)
-
-            if searchText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                ScrollView {
-                    LazyVStack(alignment: .leading, spacing: 0) {
-                        nodeRows(for: root, depth: 0)
-                    }
-                    .padding(.vertical, 6)
-                }
-                .scrollBounceBehavior(.basedOnSize)
-            } else if tree.isSearching {
-                VStack(spacing: 10) {
-                    ProgressView().controlSize(.small)
-                    Text("Indexing files…").font(.caption).foregroundStyle(.secondary)
-                }
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
-            } else if tree.searchResults.isEmpty {
-                ContentUnavailableView.search(text: searchText)
-            } else {
-                ScrollView {
-                    LazyVStack(alignment: .leading, spacing: 1) {
-                        ForEach(tree.searchResults, id: \.self) { path in
-                            Button {
-                                openFile(root.appendingPathComponent(path), false)
-                            } label: {
-                                HStack(spacing: 7) {
-                                    Image(systemName: "doc.text")
-                                        .font(.caption)
-                                        .foregroundStyle(.secondary)
-                                    Text(path)
-                                        .font(.callout)
-                                        .lineLimit(1)
-                                        .truncationMode(.middle)
-                                    Spacer(minLength: 0)
-                                }
-                                .padding(.horizontal, 10)
-                                .padding(.vertical, 4)
-                                .contentShape(Rectangle())
-                            }
-                            .buttonStyle(.plain)
-                            .contextMenu {
-                                itemActions(FileNode(
-                                    url: root.appendingPathComponent(path).standardizedFileURL,
-                                    isDirectory: false
-                                ))
-                            }
-                        }
-                    }
-                    .padding(.vertical, 5)
-                }
-                .scrollBounceBehavior(.basedOnSize)
-            }
-        }
-        // The persisted preference stays at least 164 pt, but the responsive
-        // shell may temporarily compress Files to 150 pt at minimum window size.
-        .frame(minWidth: 150, maxWidth: .infinity, maxHeight: .infinity)
-        .background {
-            SidebarBackdropView(appearance: settings.sidebarAppearance)
-        }
-        .clipShape(RoundedRectangle(cornerRadius: 13, style: .continuous))
-        .overlay {
-            RoundedRectangle(cornerRadius: 13, style: .continuous)
-                .stroke(Color(nsColor: .separatorColor).opacity(0.52), lineWidth: 0.65)
-        }
-        .padding(4)
-        .task {
-            tree.load(root)
-            // Deterministic broker-free visual QA: present the real rename
-            // sheet over the real lazy tree without mutating any fixture file.
-            if ProcessInfo.processInfo.environment["KAISOLA_NATIVE_VISUAL_FIXTURE"] == "1",
-               let surface = ProcessInfo.processInfo.environment["KAISOLA_NATIVE_VISUAL_SURFACE"],
-               surface == "workspace-rename" || surface == "workspace-new-file" {
-                for _ in 0..<20 {
-                    if let first = tree.children(of: root)?.first {
-                        if surface == "workspace-new-file" {
-                            beginCreate(.file, in: first.isDirectory ? first.url : root)
-                        } else {
-                            beginRename(first)
-                        }
-                        break
-                    }
-                    try? await Task.sleep(for: .milliseconds(50))
-                }
-            }
-        }
-        .onChange(of: searchText) { _, query in tree.search(query) }
-        .onChange(of: watcher.changeToken) { _, _ in
-            tree.refresh(expandedDirectories: expanded.map { URL(fileURLWithPath: $0, isDirectory: true) })
-            tree.search(searchText)
-        }
-        .contextMenu {
-            Button("New File…") { beginCreate(.file, in: root) }
-                .disabled(isMutating)
-            Button("New Folder…") { beginCreate(.folder, in: root) }
-                .disabled(isMutating)
-            Divider()
-            Button("Refresh", action: refresh)
-            Button("New AGENTS.md") {
-                let target = root.appendingPathComponent("AGENTS.md")
-                if !FileManager.default.fileExists(atPath: target.path) {
-                    try? Self.agentsTemplate.write(to: target, atomically: true, encoding: .utf8)
-                    ProjectFileIndex.shared.invalidate()
-                    tree.refresh(expandedDirectories: expanded.map { URL(fileURLWithPath: $0, isDirectory: true) })
-                }
-                openFile(target, true)
-            }
-        }
-        .alert(
-            "Rename \(renameTarget?.isDirectory == true ? "Folder" : "File")",
-            isPresented: renamePresented
-        ) {
-            TextField("Name", text: $renameDraft)
-            Button("Cancel", role: .cancel) { renameTarget = nil }
-            Button("Rename") { performRename() }
-                .disabled(renameDraft.isEmpty || isMutating)
-        } message: {
-            Text("Enter a new name for \(renameTarget?.name ?? "this item").")
-        }
-        .alert(
-            "New \(creationRequest?.kind.rawValue ?? "Item")",
-            isPresented: creationPresented
-        ) {
-            TextField("Name", text: $creationDraft)
-            Button("Cancel", role: .cancel) { creationRequest = nil }
-            Button("Create") { performCreate() }
-                .keyboardShortcut(.defaultAction)
-                .disabled(creationDraft.isEmpty || isMutating)
-        } message: {
-            Text("Create it inside \(creationRequest?.parent.lastPathComponent ?? root.lastPathComponent).")
-        }
-        .confirmationDialog(
-            "Move \(trashTarget?.name ?? "item") to Trash?",
-            isPresented: trashPresented
-        ) {
-            Button("Move to Trash", role: .destructive) { performTrash() }
-                .disabled(isMutating)
-            Button("Cancel", role: .cancel) { trashTarget = nil }
-        } message: {
-            Text("This is recoverable from the macOS Trash.")
-        }
-        .accessibilityLabel("Workspace files")
-    }
-
-    private var renamePresented: Binding<Bool> {
-        Binding(
-            get: { renameTarget != nil },
-            set: { if !$0 { renameTarget = nil } }
-        )
-    }
-
-    private var trashPresented: Binding<Bool> {
-        Binding(
-            get: { trashTarget != nil },
-            set: { if !$0 { trashTarget = nil } }
-        )
-    }
-
-    private var creationPresented: Binding<Bool> {
-        Binding(
-            get: { creationRequest != nil },
-            set: { if !$0 { creationRequest = nil } }
-        )
-    }
-
-    private func refresh() {
-        ProjectFileIndex.shared.invalidate()
-        tree.refresh(expandedDirectories: expanded.map { URL(fileURLWithPath: $0, isDirectory: true) })
-        tree.search(searchText)
-    }
-
-    private func beginRename(_ node: FileNode) {
-        guard !isMutating else { return }
-        renameDraft = node.name
-        renameTarget = node
-    }
-
-    private func beginCreate(_ kind: CreationKind, in parent: URL) {
-        guard !isMutating else { return }
-        creationDraft = ""
-        creationRequest = CreationRequest(kind: kind, parent: parent.standardizedFileURL)
-    }
-
-    private func beginTrash(_ node: FileNode) {
-        guard !isMutating else { return }
-        trashTarget = node
-    }
-
-    @MainActor
-    private func prepareMutation(_ node: FileNode) -> Bool {
-        let request = WorkspaceFileMutationBarrierRequest(item: node.url)
-        NotificationCenter.default.post(name: .kaisolaPrepareWorkspaceFileMutation, object: request)
-        guard request.mayProceed else {
-            ToastCenter.shared.show(
-                "Resolve the unsaved changes in \(node.name) before changing it.",
-                style: .error
-            )
-            return false
-        }
-        return true
-    }
-
-    private func performRename() {
-        guard let target = renameTarget, prepareMutation(target) else { return }
-        let proposedName = renameDraft
-        let root = self.root
-        isMutating = true
-        Task {
-            do {
-                let move = try await Task.detached(priority: .userInitiated) {
-                    try WorkspaceFileOperations.rename(
-                        item: target.url,
-                        to: proposedName,
-                        workspaceRoot: root
-                    )
-                }.value
-                didMoveItem(move.source, move.destination)
-                expanded = Set(expanded.map { path in
-                    WorkspaceFileOperations.replacingPrefix(
-                        of: URL(fileURLWithPath: path),
-                        from: move.source,
-                        to: move.destination
-                    )?.path ?? path
-                })
-                renameTarget = nil
-                refresh()
-                ToastCenter.shared.show("Renamed to \(move.destination.lastPathComponent)", style: .success)
-            } catch {
-                ToastCenter.shared.show(
-                    WorkspaceFileOperations.userFacingDescription(for: error, action: "rename"),
-                    style: .error,
-                    duration: 5
-                )
-            }
-            isMutating = false
-        }
-    }
-
-    private func performCreate() {
-        guard let request = creationRequest else { return }
-        let proposedName = creationDraft
-        let root = self.root
-        isMutating = true
-        Task {
-            do {
-                let created = try await Task.detached(priority: .userInitiated) {
-                    switch request.kind {
-                    case .file:
-                        try WorkspaceFileOperations.createFile(
-                            named: proposedName,
-                            in: request.parent,
-                            workspaceRoot: root
-                        )
-                    case .folder:
-                        try WorkspaceFileOperations.createFolder(
-                            named: proposedName,
-                            in: request.parent,
-                            workspaceRoot: root
-                        )
-                    }
-                }.value
-                didCreateItem(created)
-                expanded.insert(request.parent.path)
-                if created.kind == .folder {
-                    expanded.insert(created.url.path)
-                    tree.load(created.url)
-                } else {
-                    openFile(created.url, true)
-                }
-                creationRequest = nil
-                refresh()
-                ToastCenter.shared.show("Created \(created.url.lastPathComponent)", style: .success)
-            } catch {
-                ToastCenter.shared.show(
-                    WorkspaceFileOperations.userFacingDescription(for: error, action: "create"),
-                    style: .error,
-                    duration: 5
-                )
-            }
-            isMutating = false
-        }
-    }
-
-    private func performTrash() {
-        guard let target = trashTarget, prepareMutation(target) else { return }
-        let root = self.root
-        isMutating = true
-        Task {
-            do {
-                let move = try await Task.detached(priority: .userInitiated) {
-                    try WorkspaceFileOperations.moveToTrash(item: target.url, workspaceRoot: root)
-                }.value
-                didTrashItem(move)
-                expanded = Set(expanded.filter {
-                    !WorkspaceFileOperations.contains(URL(fileURLWithPath: $0), in: target.url)
-                })
-                trashTarget = nil
-                refresh()
-                ToastCenter.shared.show("Moved \(target.name) to Trash", style: .success)
-            } catch {
-                ToastCenter.shared.show(
-                    WorkspaceFileOperations.userFacingDescription(for: error, action: "move to Trash"),
-                    style: .error,
-                    duration: 5
-                )
-            }
-            isMutating = false
-        }
-    }
-
-    /// Starter AGENTS.md dropped at the project root — the emerging convention
-    /// agent CLIs read for repo-specific guidance. Opens the existing file
-    /// instead when one is already there.
-    static let agentsTemplate = """
-    # AGENTS.md
-
-    Guidance for AI agents working in this repository.
-
-    ## Project overview
-
-    Describe what this project is and how it fits together.
-
-    ## Commands
-
-    - Build:
-    - Test:
-    - Lint:
-
-    ## Conventions
-
-    Code style, structure, and review expectations agents should follow.
-    """
-
-
-    @ViewBuilder
-    private func nodeRows(for directory: URL, depth: Int) -> some View {
-        if let nodes = tree.children(of: directory) {
-            ForEach(nodes) { node in
-                nodeRow(node, depth: depth)
-                if node.isDirectory, expanded.contains(node.id) {
-                    AnyView(nodeRows(for: node.url, depth: depth + 1))
-                }
-            }
-        } else {
-            HStack(spacing: 7) {
-                ProgressView().controlSize(.mini)
-                Text("Loading…").font(.caption).foregroundStyle(.tertiary)
-            }
-            .padding(.leading, CGFloat(depth) * 14 + 12)
-            .padding(.vertical, 6)
-            .task { tree.load(directory) }
-        }
-    }
-
-    private func nodeRow(_ node: FileNode, depth: Int) -> some View {
-        Button {
-            if node.isDirectory {
-                if expanded.contains(node.id) {
-                    expanded.remove(node.id)
-                } else {
-                    expanded.insert(node.id)
-                    tree.load(node.url)
-                }
-            } else {
-                openFile(node.url, false)
-            }
-        } label: {
-            HStack(spacing: 5) {
-                if node.isDirectory {
-                    Image(systemName: expanded.contains(node.id) ? "chevron.down" : "chevron.right")
-                        .font(.caption2)
-                        .frame(width: 10)
-                } else {
-                    Spacer().frame(width: 10)
-                }
-                Image(systemName: node.isDirectory ? "folder" : "doc.text")
-                    .font(.caption)
-                    .foregroundStyle(node.isDirectory ? Color.accentColor : .secondary)
-                Text(node.name).font(.callout).lineLimit(1)
-                Spacer(minLength: 0)
-            }
-            .padding(.vertical, 2.5)
-            .padding(.leading, CGFloat(depth) * 14 + 10)
-            .contentShape(Rectangle())
-        }
-        .buttonStyle(.plain)
-        .simultaneousGesture(
-            TapGesture(count: 2).onEnded {
-                guard !node.isDirectory else { return }
-                openFile(node.url, true)
-            }
-        )
-        .contextMenu {
-            itemActions(node)
-        }
-    }
-
-    @ViewBuilder
-    private func itemActions(_ node: FileNode) -> some View {
-        let creationParent = node.isDirectory
-            ? node.url
-            : node.url.deletingLastPathComponent()
-        Button("New File…") { beginCreate(.file, in: creationParent) }
-            .disabled(isMutating)
-        Button("New Folder…") { beginCreate(.folder, in: creationParent) }
-            .disabled(isMutating)
-        Divider()
-        if !node.isDirectory {
-            Button("Open") { openFile(node.url, false) }
-            Button("Keep Open") { openFile(node.url, true) }
-            Divider()
-        }
-        Button("Reveal in Finder") {
-            NSWorkspace.shared.activateFileViewerSelecting([node.url])
-        }
-        Divider()
-        Button("Rename…") { beginRename(node) }
-            .disabled(isMutating)
-        Button("Move to Trash…", role: .destructive) { beginTrash(node) }
-            .disabled(isMutating)
     }
 }

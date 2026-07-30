@@ -1,6 +1,6 @@
 {
   "name": "kaisola-native",
-  "version": "0.1.135",
+  "version": "1.0.0",
   "private": true,
   "description": "Native Swift macOS and iPhone apps for Kaisola",
   "engines": {
@@ -17,6 +17,9 @@
     "native:fast:build": "./scripts/native-fast.sh --build-only",
     "native:fast:launch": "./scripts/native-fast.sh --launch-only",
     "native:test:focus": "./scripts/native-test-fast.sh",
+    "native:test:select": "node scripts/native-test-select.cjs",
+    "native:test:changed": "./scripts/native-test-changed.sh",
+    "native:timing": "node scripts/native-build-timing.cjs",
     "native:launch-smoke": "node scripts/native-launch-smoke.cjs",
     "native:catalog-smoke": "node scripts/native-catalog-smoke.cjs",
     "native:sign:distribution": "node scripts/native-distribution-sign.cjs",

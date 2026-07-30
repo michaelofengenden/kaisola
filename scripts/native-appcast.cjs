@@ -33,6 +33,8 @@ function parseArguments(argv) {
       '--build': 'build',
       '--url': 'url',
       '--sign-update': 'signUpdate',
+      '--ed-signature': 'edSignature',
+      '--archive-length': 'archiveLength',
       '--output': 'output',
       '--existing': 'existing',
       '--min-system': 'minimumSystemVersion',
@@ -49,8 +51,19 @@ function parseArguments(argv) {
       : value
   }
   if (options.help) return options
-  for (const key of ['zip', 'version', 'build', 'url', 'signUpdate', 'output']) {
-    if (!options[key]) fail(`--${key === 'signUpdate' ? 'sign-update' : key} is required`)
+  for (const key of ['zip', 'version', 'build', 'url', 'output']) {
+    if (!options[key]) fail(`--${key} is required`)
+  }
+  const hasSigner = Boolean(options.signUpdate)
+  const hasPreparedSignature = Boolean(options.edSignature || options.archiveLength)
+  if (hasSigner === hasPreparedSignature) {
+    fail('provide exactly one signing mode: --sign-update, or --ed-signature with --archive-length')
+  }
+  if (hasPreparedSignature && (!options.edSignature || !options.archiveLength)) {
+    fail('--ed-signature and --archive-length must be provided together')
+  }
+  if (!hasSigner && options.edKeyFile) {
+    fail('--ed-key-file requires --sign-update')
   }
   if (!/^\d+(?:\.\d+){0,2}$/.test(options.minimumSystemVersion)) {
     fail('--min-system must be a numeric macOS version such as 14.0')
@@ -62,7 +75,9 @@ function usage() {
   return `Usage:
   node scripts/native-appcast.cjs --zip <path> --version <marketingVersion> \\
     --build <bundleVersion> --url <https enclosure url> \\
-    --sign-update <Sparkle sign_update> --output <appcast.xml> \\
+    (--sign-update <Sparkle sign_update> | \\
+      --ed-signature <prepared signature> --archive-length <bytes>) \\
+    --output <appcast.xml> \\
     [--existing <appcast.xml>] [--min-system 14.0] [--ed-key-file <file>]`
 }
 
@@ -89,14 +104,29 @@ function parseSignatureOutput(output) {
   if (!signature || !rawLength) {
     fail('sign_update did not return sparkle:edSignature and length attributes')
   }
+  return validatePreparedSignature(signature, rawLength)
+}
+
+function validatePreparedSignature(signature, archiveLength) {
+  if (typeof signature !== 'string' || !/^[A-Za-z0-9+/]+={0,2}$/.test(signature)) {
+    fail('Sparkle Ed25519 signature must be canonical base64')
+  }
+  const decoded = Buffer.from(signature, 'base64')
+  if (decoded.length !== 64 || decoded.toString('base64') !== signature) {
+    fail('Sparkle Ed25519 signature must canonically encode exactly 64 bytes')
+  }
+  const rawLength = String(archiveLength)
   const length = Number(rawLength)
   if (!/^\d+$/.test(rawLength) || !Number.isSafeInteger(length) || length <= 0) {
-    fail('sign_update returned an invalid archive length')
+    fail('prepared archive length must be a positive safe integer')
   }
   return { signature, length }
 }
 
 function signArchive(options) {
+  if (!options.signUpdate) {
+    return validatePreparedSignature(options.edSignature, options.archiveLength)
+  }
   const args = []
   if (options.edKeyFile) args.push('--ed-key-file', options.edKeyFile)
   args.push(options.zip)
@@ -356,6 +386,9 @@ function mergeItems(existingItems, current) {
     if (item.build === current.build && item.signature !== current.signature) {
       fail(`refusing to replace build ${current.build} with a different Sparkle signature`)
     }
+    if (compareBuildVersions(current.build, item.build) < 0) {
+      fail(`refusing to publish non-monotonic build ${current.build} after build ${item.build}`)
+    }
   }
   return [...existingItems.filter((item) => item.build !== current.build), current]
     .sort((left, right) => compareBuildVersions(right.build, left.build))
@@ -439,6 +472,9 @@ function generateAppcast(options, publicationDate = new Date()) {
     existing = parseExistingAppcast(source)
   }
   const signed = signArchive(options)
+  if (signed.length !== zipStat.size) {
+    fail(`signed archive length ${signed.length} does not match zip size ${zipStat.size}`)
+  }
   const current = {
     build: options.build,
     signature: signed.signature,
@@ -470,5 +506,6 @@ module.exports = {
   parseArguments,
   parseExistingAppcast,
   parseSignatureOutput,
+  validatePreparedSignature,
   validateEnclosureURL,
 }

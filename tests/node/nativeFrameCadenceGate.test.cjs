@@ -7,6 +7,10 @@ const {
   parseArguments,
   validateReport,
 } = require('../../scripts/native-frame-cadence-gate.cjs')
+const {
+  FIXTURE_LAUNCH_ARGUMENTS,
+  brokerInfoPath,
+} = require('../../scripts/native-frame-support.cjs')
 
 function passingReport() {
   return {
@@ -38,6 +42,11 @@ function passingReport() {
 }
 
 test('frame cadence gate accepts only the full fixed-duration fixture contract', () => {
+  assert.deepEqual(FIXTURE_LAUNCH_ARGUMENTS, ['-ApplePersistenceIgnoreState', 'YES'])
+  assert.equal(
+    brokerInfoPath('/tmp/fixture'),
+    '/tmp/fixture/broker-profile/session-broker/broker.json',
+  )
   const options = parseArguments(['--app', '/tmp/Kaisola.app', '--output', '/tmp/frame.json'])
   assert.equal(options.app, '/tmp/Kaisola.app')
   assert.throws(() => parseArguments(['--app', '/tmp/Kaisola.app']), /required/)

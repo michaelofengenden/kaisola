@@ -784,10 +784,15 @@ struct NativeTerminalSurface: NSViewRepresentable {
             let restoresMouseReporting = view.allowMouseReporting
             view.allowMouseReporting = false
             view.feed(text: text)
-            view.observeSemanticPromptCursor()
+            // Feeding and repinning both used to rebuild the semantic overlay.
+            // Record cursor growth first, then paint exactly once after the
+            // viewport reaches its final position for this output batch.
+            view.observeSemanticPromptCursor(refreshDecorations: false)
             view.allowMouseReporting = restoresMouseReporting
             if scrollAfter, !userUnpinned {
                 view.scrollToLiveBottom()
+            } else {
+                view.updateSemanticDecorations()
             }
         }
 
@@ -811,10 +816,12 @@ struct NativeTerminalSurface: NSViewRepresentable {
             let restoresMouseReporting = view.allowMouseReporting
             view.allowMouseReporting = false
             view.feed(byteArray: bytes)
-            view.observeSemanticPromptCursor()
+            view.observeSemanticPromptCursor(refreshDecorations: false)
             view.allowMouseReporting = restoresMouseReporting
             if scrollAfter, !userUnpinned {
                 view.scrollToLiveBottom()
+            } else {
+                view.updateSemanticDecorations()
             }
         }
 
@@ -1071,6 +1078,8 @@ struct NativeTerminalSurface: NSViewRepresentable {
                 // `.kaisolaOpenFileLink` and drives its file preview.
                 var userInfo: [AnyHashable: Any] = ["url": fileURL]
                 if let line { userInfo["line"] = line }
+                userInfo["workspaceHint"] = workingDirectory
+                    ?? fileURL.deletingLastPathComponent()
                 NotificationCenter.default.post(
                     name: .kaisolaOpenFileLink,
                     object: nil,
@@ -1415,12 +1424,16 @@ class ReadOnlyTerminalView: TerminalView {
     /// shell input and secondary prompts can wrap without emitting another OSC
     /// marker, so cursor observation supplies the conservative lower bound used
     /// by vertical Option-click.
-    func observeSemanticPromptCursor() {
+    func observeSemanticPromptCursor(refreshDecorations: Bool = true) {
+        // Plain shells and CLIs that do not emit OSC 133/633 have no active
+        // input region. Avoid a binary search across the SwiftTerm buffer for
+        // every streamed packet in that overwhelmingly common case.
+        guard semanticTracker.activeInputRows != nil else { return }
         reconcileSemanticPromptGrid()
         guard let position = scrollInvariantCursorPosition() else { return }
         semanticTracker.prune(before: getTerminal().buffer.totalLinesTrimmed)
         semanticTracker.observeCursor(at: position)
-        updateSemanticDecorations()
+        if refreshDecorations { updateSemanticDecorations() }
     }
 
     /// Cursor row in SwiftTerm's monotonic scroll-invariant coordinate space.
@@ -1463,6 +1476,9 @@ class ReadOnlyTerminalView: TerminalView {
 
     func updateSemanticDecorations() {
         guard let semanticDecorationView else { return }
+        // Preserve the one transition that hides an old overlay after reset,
+        // while making the steady empty state free during ordinary streaming.
+        guard !semanticTracker.commands.isEmpty || !semanticDecorationView.isHidden else { return }
         let terminal = getTerminal()
         let rowCount = terminal.rows
         let viewportTop = terminal.buffer.totalLinesTrimmed + terminal.getTopVisibleRow()

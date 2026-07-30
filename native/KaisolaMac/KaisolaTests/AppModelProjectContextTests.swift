@@ -459,6 +459,29 @@ final class AppModelProjectContextTests: XCTestCase {
     }
 
     @MainActor
+    func testOpeningTerminalFileFromUnopenedRepositoryAdoptsAndHighlightsItsWorkspace() throws {
+        let (model, _) = makeModel()
+        let repository = storeFile.deletingLastPathComponent()
+            .appendingPathComponent("linked-repository", isDirectory: true)
+        let nested = repository.appendingPathComponent("Sources/Feature", isDirectory: true)
+        try FileManager.default.createDirectory(
+            at: repository.appendingPathComponent(".git", isDirectory: true),
+            withIntermediateDirectories: true
+        )
+        try FileManager.default.createDirectory(at: nested, withIntermediateDirectories: true)
+        let file = nested.appendingPathComponent("Panel.swift")
+        try "let panel = true\n".write(to: file, atomically: true, encoding: .utf8)
+
+        model.openFilePreview(file, line: 18, workspaceHint: nested)
+
+        let projectID = try XCTUnwrap(model.selectedProjectID)
+        XCTAssertEqual(model.currentProjectDirectory, repository.standardizedFileURL)
+        XCTAssertEqual(model.previewedFileURL, file.standardizedFileURL)
+        XCTAssertEqual(model.previewedFileLine, 18)
+        XCTAssertEqual(model.fileTabs(for: projectID).map(\.url), [file.standardizedFileURL])
+    }
+
+    @MainActor
     func testClosingAndReopeningProjectRetainsItsFileDeck() throws {
         let (model, _) = makeModel()
         let root = storeFile.deletingLastPathComponent().appendingPathComponent("reopen-deck")

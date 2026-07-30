@@ -1,0 +1,287 @@
+# Build the expensive, immutable native candidate once on protected main.
+# A v* tag promotes these exact bytes through release.yml; it never rebuilds,
+# re-signs, or re-notarizes the application.
+name: native release candidate
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: kaisola-native-candidate-${{ github.sha }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  swift-contracts:
+    uses: ./.github/workflows/swift-contracts.yml
+    with:
+      skip-ios: true
+
+  candidate:
+    needs: swift-contracts
+    runs-on: macos-15
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: 22
+          cache: npm
+      - name: Install exact dependencies
+        run: npm ci --prefer-offline --no-audit --no-fund
+        env:
+          KAISOLA_SKIP_NATIVE_REBUILD: '1'
+      - name: Test candidate receipt and promotion contracts
+        run: >-
+          node --test
+          tests/node/nativeReleaseCandidate.test.cjs
+          tests/node/nativeAppcast.test.cjs
+          tests/node/nativeReleasePreflight.test.cjs
+      - name: Require release signing and notarization credentials
+        env:
+          CSC_LINK: ${{ secrets.CSC_LINK }}
+          CSC_KEY_PASSWORD: ${{ secrets.CSC_KEY_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          APPLE_API_PRIVATE_KEY: ${{ secrets.APPLE_API_PRIVATE_KEY }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+          SPARKLE_PRIVATE_ED_KEY: ${{ secrets.SPARKLE_PRIVATE_ED_KEY }}
+        run: |
+          set -euo pipefail
+          for name in CSC_LINK CSC_KEY_PASSWORD APPLE_TEAM_ID SPARKLE_PRIVATE_ED_KEY; do
+            test -n "${!name:-}" || { echo "Missing required candidate credential: $name" >&2; exit 1; }
+          done
+
+          # Prefer an App Store Connect API key. Individual API keys work with
+          # key ID + private key only; organizational keys may additionally set
+          # APPLE_API_ISSUER. Apple-ID credentials remain a deliberate fallback.
+          if [[ -n "${APPLE_API_KEY_ID:-}" || -n "${APPLE_API_PRIVATE_KEY:-}" ]]; then
+            test -n "${APPLE_API_KEY_ID:-}" || { echo 'APPLE_API_KEY_ID is required with APPLE_API_PRIVATE_KEY' >&2; exit 1; }
+            test -n "${APPLE_API_PRIVATE_KEY:-}" || { echo 'APPLE_API_PRIVATE_KEY is required with APPLE_API_KEY_ID' >&2; exit 1; }
+            api_key_file="$RUNNER_TEMP/AuthKey_${APPLE_API_KEY_ID}.p8"
+            umask 077
+            printf '%s' "$APPLE_API_PRIVATE_KEY" | base64 --decode > "$api_key_file"
+            test -s "$api_key_file" || { echo 'APPLE_API_PRIVATE_KEY decoded to an empty file' >&2; exit 1; }
+            echo "NOTARY_AUTH_MODE=api-key" >> "$GITHUB_ENV"
+            echo "APPLE_API_PRIVATE_KEY_FILE=$api_key_file" >> "$GITHUB_ENV"
+          else
+            test -n "${APPLE_ID:-}" || { echo 'APPLE_ID or the preferred API-key credentials are required' >&2; exit 1; }
+            test -n "${APPLE_APP_SPECIFIC_PASSWORD:-}" || { echo 'APPLE_APP_SPECIFIC_PASSWORD is required with APPLE_ID' >&2; exit 1; }
+            echo "NOTARY_AUTH_MODE=apple-id" >> "$GITHUB_ENV"
+          fi
+      - name: Download Kaisola helper runtimes
+        run: npm run native:helper:download
+      - name: Import Developer ID certificate for Kaisola
+        env:
+          CSC_LINK: ${{ secrets.CSC_LINK }}
+          CSC_KEY_PASSWORD: ${{ secrets.CSC_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          keychain_path="$RUNNER_TEMP/kaisola-native-signing.keychain-db"
+          certificate_path="$RUNNER_TEMP/kaisola-native-signing.p12"
+          keychain_password="$(openssl rand -hex 32)"
+          umask 077
+          printf '%s' "$CSC_LINK" | base64 --decode > "$certificate_path"
+          security create-keychain -p "$keychain_password" "$keychain_path"
+          security set-keychain-settings -lut 21600 "$keychain_path"
+          security unlock-keychain -p "$keychain_password" "$keychain_path"
+          security import "$certificate_path" \
+            -k "$keychain_path" \
+            -P "$CSC_KEY_PASSWORD" \
+            -T /usr/bin/codesign \
+            -T /usr/bin/security
+          security set-key-partition-list \
+            -S apple-tool:,apple:,codesign: \
+            -s \
+            -k "$keychain_password" \
+            "$keychain_path"
+          security list-keychains -d user -s "$keychain_path"
+      - name: Derive immutable candidate identity
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REF" = refs/heads/main || { echo "candidates must be built from protected main; found $GITHUB_REF" >&2; exit 1; }
+          version="$(node -p "require('./package.json').version")"
+          [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "package version is not release semver: $version" >&2; exit 1; }
+          (( GITHUB_RUN_ATTEMPT < 1000 )) || { echo 'run attempt is outside the build-number policy' >&2; exit 1; }
+          # This repo was recreated, so Actions run numbers restarted while the
+          # installed/public 0.1.135 app was already CFBundleVersion 15501.
+          native_build="$((1000000 + GITHUB_RUN_NUMBER * 1000 + GITHUB_RUN_ATTEMPT))"
+          (( native_build > 15501 )) || { echo 'candidate build must be newer than public build 15501' >&2; exit 1; }
+          source_committed_at="$(git show -s --format=%cI "$GITHUB_SHA")"
+          echo "NATIVE_MARKETING_VERSION=$version" >> "$GITHUB_ENV"
+          echo "NATIVE_BUILD_VERSION=$native_build" >> "$GITHUB_ENV"
+          echo "SOURCE_COMMITTED_AT=$source_committed_at" >> "$GITHUB_ENV"
+      - name: Build Developer ID Kaisola
+        env:
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          set -euo pipefail
+          xcodebuild \
+            -project native/KaisolaMac/KaisolaMac.xcodeproj \
+            -scheme Kaisola \
+            -configuration Release \
+            -destination 'generic/platform=macOS' \
+            -derivedDataPath "$RUNNER_TEMP/kaisola-native" \
+            ARCHS='arm64 x86_64' \
+            ONLY_ACTIVE_ARCH=NO \
+            CODE_SIGN_STYLE=Manual \
+            CODE_SIGN_IDENTITY="Developer ID Application" \
+            DEVELOPMENT_TEAM="${APPLE_TEAM_ID}" \
+            CODE_SIGN_INJECT_BASE_ENTITLEMENTS=NO \
+            OTHER_CODE_SIGN_FLAGS=--timestamp \
+            MARKETING_VERSION="$NATIVE_MARKETING_VERSION" \
+            CURRENT_PROJECT_VERSION="$NATIVE_BUILD_VERSION" \
+            KAISOLA_SPARKLE_FEED_URL='https://github.com/michaelofengenden/kaisola/releases/download/kaisola-updates/appcast.xml' \
+            KAISOLA_SPARKLE_PUBLIC_ED_KEY='BQgU8WTQzeYBaYnbWrYBgoP7JPYyCXVrNgHCMBvmYrk=' \
+            build
+      - name: Re-sign nested components and seal BrokerHelper
+        run: |
+          set -euo pipefail
+          npm run native:sign:distribution -- \
+            --app "$RUNNER_TEMP/kaisola-native/Build/Products/Release/Kaisola.app" \
+            --identity "Developer ID Application"
+      - name: Verify Developer ID candidate before notarization
+        run: |
+          set -euo pipefail
+          npm run native:preflight -- \
+            --app "$RUNNER_TEMP/kaisola-native/Build/Products/Release/Kaisola.app" \
+            --require-updates --require-developer-id \
+            --source-commit "$GITHUB_SHA"
+      - name: Notarize, staple, package, and receipt immutable candidate
+        env:
+          APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          SPARKLE_PRIVATE_ED_KEY: ${{ secrets.SPARKLE_PRIVATE_ED_KEY }}
+        run: |
+          set -euo pipefail
+          app="$RUNNER_TEMP/kaisola-native/Build/Products/Release/Kaisola.app"
+          artifact_directory="$GITHUB_WORKSPACE/release/native"
+          zip_name="Kaisola-${NATIVE_MARKETING_VERSION}-b${NATIVE_BUILD_VERSION}.zip"
+          dmg_name="Kaisola-${NATIVE_MARKETING_VERSION}-b${NATIVE_BUILD_VERSION}.dmg"
+          archive="$artifact_directory/$zip_name"
+          dmg="$artifact_directory/$dmg_name"
+          stable_dmg="$artifact_directory/Kaisola.dmg"
+          unpack_directory="$RUNNER_TEMP/kaisola-native-unpack"
+          preflight_receipt="$RUNNER_TEMP/native-preflight.json"
+          signature_output="$RUNNER_TEMP/sparkle-signature.txt"
+          private_key="$RUNNER_TEMP/sparkle-private-ed-key"
+          sign_update="$RUNNER_TEMP/kaisola-native/SourcePackages/artifacts/sparkle/Sparkle/bin/sign_update"
+
+          notarize() {
+            local target="$1"
+            local -a authentication
+            if [[ "$NOTARY_AUTH_MODE" == api-key ]]; then
+              authentication=(--key "$APPLE_API_PRIVATE_KEY_FILE" --key-id "$APPLE_API_KEY_ID")
+              if [[ -n "${APPLE_API_ISSUER:-}" ]]; then authentication+=(--issuer "$APPLE_API_ISSUER"); fi
+            else
+              authentication=(--apple-id "$APPLE_ID" --password "$APPLE_APP_SPECIFIC_PASSWORD" --team-id "$APPLE_TEAM_ID")
+            fi
+            xcrun notarytool submit "$target" --wait "${authentication[@]}"
+          }
+
+          mkdir -p "$artifact_directory"
+          ditto -c -k --keepParent "$app" "$archive"
+          notarize "$archive"
+          xcrun stapler staple "$app"
+          rm -f "$archive"
+          ditto -c -k --keepParent "$app" "$archive"
+
+          rm -rf "$unpack_directory"
+          ditto -x -k "$archive" "$unpack_directory"
+          npm run native:preflight -- \
+            --app "$unpack_directory/Kaisola.app" \
+            --require-updates --require-notarized \
+            --source-commit "$GITHUB_SHA" \
+            --json-output "$preflight_receipt"
+          packaged_version="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$unpack_directory/Kaisola.app/Contents/Info.plist")"
+          packaged_build="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$unpack_directory/Kaisola.app/Contents/Info.plist")"
+          test "$packaged_version" = "$NATIVE_MARKETING_VERSION"
+          test "$packaged_build" = "$NATIVE_BUILD_VERSION"
+
+          dmg_staging="$RUNNER_TEMP/kaisola-dmg"
+          mkdir -p "$dmg_staging"
+          ditto "$app" "$dmg_staging/Kaisola.app"
+          ln -s /Applications "$dmg_staging/Applications"
+          hdiutil create -volname Kaisola -srcfolder "$dmg_staging" -ov -format UDZO "$dmg"
+          codesign --force --timestamp --sign "Developer ID Application" "$dmg"
+          notarize "$dmg"
+          xcrun stapler staple "$dmg"
+          xcrun stapler validate "$dmg"
+          ditto "$dmg" "$stable_dmg"
+
+          for published in "$archive" "$dmg" "$stable_dmg"; do
+            (cd "$artifact_directory" && shasum -a 256 "$(basename "$published")" > "$(basename "$published").sha256")
+          done
+          (cd "$artifact_directory" && for checksum in *.sha256; do shasum -a 256 --check "$checksum"; done)
+
+          umask 077
+          printf '%s' "$SPARKLE_PRIVATE_ED_KEY" > "$private_key"
+          test -s "$private_key"
+          test -x "$sign_update"
+          "$sign_update" --ed-key-file "$private_key" "$archive" > "$signature_output"
+
+          node scripts/native-release-candidate.cjs create \
+            --directory "$artifact_directory" \
+            --preflight "$preflight_receipt" \
+            --sparkle-signature-output "$signature_output" \
+            --output "$artifact_directory/release-candidate.json" \
+            --repository "$GITHUB_REPOSITORY" \
+            --commit "$GITHUB_SHA" \
+            --source-ref refs/heads/main \
+            --source-committed-at "$SOURCE_COMMITTED_AT" \
+            --run-id "$GITHUB_RUN_ID" \
+            --run-attempt "$GITHUB_RUN_ATTEMPT" \
+            --version "$NATIVE_MARKETING_VERSION" \
+            --build "$NATIVE_BUILD_VERSION"
+          node scripts/native-release-candidate.cjs verify \
+            --directory "$artifact_directory" \
+            --receipt "$artifact_directory/release-candidate.json" \
+            --preflight "$preflight_receipt" \
+            --repository "$GITHUB_REPOSITORY" \
+            --commit "$GITHUB_SHA" \
+            --run-id "$GITHUB_RUN_ID" \
+            --version "$NATIVE_MARKETING_VERSION" \
+            --tag "v$NATIVE_MARKETING_VERSION"
+      - name: Smoke-launch final candidate bundle
+        run: |
+          npm run native:launch-smoke -- \
+            --app "$RUNNER_TEMP/kaisola-native-unpack/Kaisola.app" \
+            --seconds 10
+      - name: Upload immutable native candidate
+        id: upload-candidate
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: kaisola-native-candidate
+          path: release/native/
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 90
+      - name: Record candidate provenance
+        run: |
+          {
+            echo '### Immutable native candidate'
+            echo
+            echo "- Commit: \`$GITHUB_SHA\`"
+            echo "- Version/build: \`$NATIVE_MARKETING_VERSION ($NATIVE_BUILD_VERSION)\`"
+            echo "- Candidate artifact digest: \`${{ steps.upload-candidate.outputs.artifact-digest }}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: Clean up release credentials
+        if: ${{ always() }}
+        run: |
+          security delete-keychain "$RUNNER_TEMP/kaisola-native-signing.keychain-db" || true
+          rm -f \
+            "$RUNNER_TEMP/kaisola-native-signing.p12" \
+            "${APPLE_API_PRIVATE_KEY_FILE:-$RUNNER_TEMP/no-api-key}" \
+            "$RUNNER_TEMP/sparkle-private-ed-key" \
+            "$RUNNER_TEMP/sparkle-signature.txt"

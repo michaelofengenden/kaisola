@@ -8,6 +8,83 @@ protocol BrokerInfoPreparing: Sendable {
     func prepare() async throws -> BrokerInfo
 }
 
+struct BrokerUpgradeBlockers: Equatable, Sendable {
+    let liveTerminalCount: Int
+    let liveTerminalIDs: [String]
+    let busyAgentCount: Int
+    let busyTerminalIDs: [String]
+    let childTaskCount: Int
+}
+
+enum BrokerUpgradePendingReason: Equatable, Sendable {
+    case liveWork(BrokerUpgradeBlockers)
+    case legacyIdentityUnavailable
+    case identityChanged
+    case requestUnavailable
+    case shutdownTimedOut
+    case launchFailed
+}
+
+enum BrokerUpgradeState: Equatable, Sendable {
+    case unknown
+    case current(contentDigest: String)
+    case checking(fromContentDigest: String, targetContentDigest: String)
+    case pending(
+        fromContentDigest: String?,
+        targetContentDigest: String,
+        reason: BrokerUpgradePendingReason
+    )
+    case updating(fromContentDigest: String, targetContentDigest: String)
+
+    var detail: String {
+        switch self {
+        case .unknown:
+            "Broker helper identity has not been checked."
+        case let .current(contentDigest):
+            "Broker helper is current · content \(contentDigest)."
+        case let .checking(fromContentDigest, targetContentDigest):
+            "Checking broker helper update \(Self.transition(fromContentDigest, targetContentDigest)) safely."
+        case let .pending(from, target, .liveWork(blockers)):
+            "Broker update pending \(Self.transition(from, target)): \(blockers.liveTerminalCount) live terminal(s), \(blockers.busyAgentCount) working agent(s), \(blockers.childTaskCount) child task(s)."
+        case let .pending(from, target, .legacyIdentityUnavailable):
+            "Broker update pending \(Self.transition(from, target)): this older broker cannot prove an atomic safe shutdown."
+        case let .pending(from, target, .identityChanged):
+            "Broker update pending \(Self.transition(from, target)): the live broker identity changed during the safety check."
+        case let .pending(from, target, .requestUnavailable):
+            "Broker update pending \(Self.transition(from, target)): the live broker does not support sealed safe promotion."
+        case let .pending(from, target, .shutdownTimedOut):
+            "Broker update pending \(Self.transition(from, target)): the old helper did not finish its safe shutdown."
+        case let .pending(from, target, .launchFailed):
+            "Broker update pending \(Self.transition(from, target)): the replacement helper could not be started yet."
+        case let .updating(fromContentDigest, targetContentDigest):
+            "Broker helper is updating \(Self.transition(fromContentDigest, targetContentDigest)); no terminal processes are being interrupted."
+        }
+    }
+
+    private static func transition(_ from: String?, _ target: String) -> String {
+        "content \(from ?? "legacy-unsealed") → \(target)"
+    }
+}
+
+enum BrokerUpgradeDecision: Equatable, Sendable {
+    case current
+    case accepted
+    case deferred(BrokerUpgradeBlockers)
+    case identityChanged
+}
+
+protocol BrokerUpgradeRequesting: Sendable {
+    func requestUpgrade(
+        from info: BrokerInfo,
+        targetContentDigest: String
+    ) async throws -> BrokerUpgradeDecision
+}
+
+protocol BrokerUpgradeMonitoring: Sendable {
+    func upgradeState() async -> BrokerUpgradeState
+    func attemptUpgradeIfNeeded() async -> BrokerUpgradeState
+}
+
 struct LocatedBrokerInfoPreparer: BrokerInfoPreparing {
     let locator: any BrokerInfoLocating
 
@@ -16,7 +93,7 @@ struct LocatedBrokerInfoPreparer: BrokerInfoPreparing {
     }
 }
 
-actor BrokerStartupCoordinator: BrokerInfoPreparing {
+actor BrokerStartupCoordinator: BrokerInfoPreparing, BrokerUpgradeMonitoring {
     private static let maximumSocketPathBytes = 100
     private static let startupTimeoutNanoseconds: UInt64 = 8_000_000_000
 
@@ -25,18 +102,28 @@ actor BrokerStartupCoordinator: BrokerInfoPreparing {
     private let homeDirectory: URL
     private let appVersion: String
     private let sleep: @Sendable (UInt64) async throws -> Void
+    private let upgradeRequester: any BrokerUpgradeRequesting
+    private var currentUpgradeState: BrokerUpgradeState = .unknown
+    private var pendingUpgrade: PendingUpgrade?
+
+    private struct PendingUpgrade: Sendable {
+        let info: BrokerInfo
+        let package: BrokerHelperManifest
+    }
 
     init(
         locator: BrokerInfoLocator,
         launcher: any BrokerHelperLaunching,
         homeDirectory: URL = FileManager.default.homeDirectoryForCurrentUser,
         appVersion: String = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "kaisola-native",
+        upgradeRequester: any BrokerUpgradeRequesting = BrokerControlClient(),
         sleep: @escaping @Sendable (UInt64) async throws -> Void = { try await Task.sleep(nanoseconds: $0) }
     ) {
         self.locator = locator
         self.launcher = launcher
         self.homeDirectory = homeDirectory
         self.appVersion = appVersion
+        self.upgradeRequester = upgradeRequester
         self.sleep = sleep
     }
 
@@ -61,12 +148,15 @@ actor BrokerStartupCoordinator: BrokerInfoPreparing {
     }
 
     func prepare() async throws -> BrokerInfo {
+        let package = try await launcher.packageManifest()
         do {
             let info = try locator.locate()
             // A socket vnode can survive its detached broker. Treating that
             // stale file as a live endpoint makes every connection fail with
             // ECONNREFUSED and bypasses the safe relaunch path below.
-            guard !info.isProcessAlive else { return info }
+            guard !info.isProcessAlive else {
+                return try await reconcileLiveBroker(info, package: package)
+            }
             try removeStaleRendezvous(info)
         } catch let error as BrokerDiscoveryError {
             switch error {
@@ -82,16 +172,162 @@ actor BrokerStartupCoordinator: BrokerInfoPreparing {
             }
         }
 
-        let package = try await launcher.packageManifest()
+        return try await launchPackagedBroker(package)
+    }
+
+    func upgradeState() -> BrokerUpgradeState {
+        currentUpgradeState
+    }
+
+    /// Called from the app's ordinary inventory heartbeat. A stale broker is
+    /// retried only through its own atomic safety method; UI-observed quietness
+    /// is never used as replacement authority.
+    func attemptUpgradeIfNeeded() async -> BrokerUpgradeState {
+        guard let pendingUpgrade else { return currentUpgradeState }
+        do {
+            _ = try await reconcileLiveBroker(
+                pendingUpgrade.info,
+                package: pendingUpgrade.package
+            )
+        } catch BrokerStartupError.timedOut(_) {
+            currentUpgradeState = .pending(
+                fromContentDigest: pendingUpgrade.info.contentDigest,
+                targetContentDigest: pendingUpgrade.package.contentDigest,
+                reason: .shutdownTimedOut
+            )
+        } catch {
+            currentUpgradeState = .pending(
+                fromContentDigest: pendingUpgrade.info.contentDigest,
+                targetContentDigest: pendingUpgrade.package.contentDigest,
+                reason: .launchFailed
+            )
+        }
+        return currentUpgradeState
+    }
+
+    private func reconcileLiveBroker(
+        _ info: BrokerInfo,
+        package: BrokerHelperManifest
+    ) async throws -> BrokerInfo {
+        let exactPackageIdentity = info.contentDigest == package.contentDigest
+            && info.packageVersion == package.packageVersion
+            && info.packageSchema == package.schemaVersion
+            && info.implementationVersion == package.brokerImplementationVersion
+        if exactPackageIdentity {
+            pendingUpgrade = nil
+            currentUpgradeState = .current(contentDigest: package.contentDigest)
+            return info
+        }
+        guard let runningDigest = info.contentDigest else {
+            pendingUpgrade = nil
+            currentUpgradeState = .pending(
+                fromContentDigest: nil,
+                targetContentDigest: package.contentDigest,
+                reason: .legacyIdentityUnavailable
+            )
+            return info
+        }
+        guard runningDigest != package.contentDigest else {
+            pendingUpgrade = nil
+            currentUpgradeState = .pending(
+                fromContentDigest: runningDigest,
+                targetContentDigest: package.contentDigest,
+                reason: .identityChanged
+            )
+            return info
+        }
+
+        pendingUpgrade = PendingUpgrade(info: info, package: package)
+        currentUpgradeState = .checking(
+            fromContentDigest: runningDigest,
+            targetContentDigest: package.contentDigest
+        )
+        let decision: BrokerUpgradeDecision
+        do {
+            decision = try await upgradeRequester.requestUpgrade(
+                from: info,
+                targetContentDigest: package.contentDigest
+            )
+        } catch {
+            currentUpgradeState = .pending(
+                fromContentDigest: runningDigest,
+                targetContentDigest: package.contentDigest,
+                reason: .requestUnavailable
+            )
+            return info
+        }
+
+        switch decision {
+        case .current:
+            pendingUpgrade = nil
+            currentUpgradeState = .current(contentDigest: package.contentDigest)
+            return info
+        case let .deferred(blockers):
+            currentUpgradeState = .pending(
+                fromContentDigest: runningDigest,
+                targetContentDigest: package.contentDigest,
+                reason: .liveWork(blockers)
+            )
+            return info
+        case .identityChanged:
+            pendingUpgrade = nil
+            currentUpgradeState = .pending(
+                fromContentDigest: runningDigest,
+                targetContentDigest: package.contentDigest,
+                reason: .identityChanged
+            )
+            return info
+        case .accepted:
+            currentUpgradeState = .updating(
+                fromContentDigest: runningDigest,
+                targetContentDigest: package.contentDigest
+            )
+            try await waitForSafeShutdown(of: info)
+            let replacement = try await launchPackagedBroker(package)
+            pendingUpgrade = nil
+            currentUpgradeState = .current(contentDigest: package.contentDigest)
+            return replacement
+        }
+    }
+
+    private func waitForSafeShutdown(of info: BrokerInfo) async throws {
+        let started = DispatchTime.now().uptimeNanoseconds
+        while DispatchTime.now().uptimeNanoseconds - started < Self.startupTimeoutNanoseconds {
+            let metadataStillMatches = (try? locator.locateMetadata(validateSocket: false)) == info
+            if !info.isProcessAlive, !metadataStillMatches { return }
+            try await sleep(60_000_000)
+        }
+        throw BrokerStartupError.timedOut(nil)
+    }
+
+    private func launchPackagedBroker(_ package: BrokerHelperManifest) async throws -> BrokerInfo {
         let launchURL = try writeLaunchConfiguration(package: package)
         defer { try? FileManager.default.removeItem(at: launchURL) }
-        _ = try await launcher.launch(configurationURL: launchURL)
+        do {
+            _ = try await launcher.launch(configurationURL: launchURL)
+        } catch {
+            // Another Kaisola window may win the empty-broker launch race. Its
+            // exact sealed digest is safe to adopt; any other identity is not.
+            if let adopted = try? locator.locate(),
+               adopted.contentDigest == package.contentDigest {
+                pendingUpgrade = nil
+                currentUpgradeState = .current(contentDigest: package.contentDigest)
+                return adopted
+            }
+            throw error
+        }
 
         let started = DispatchTime.now().uptimeNanoseconds
         var lastError: (any Error)?
         while DispatchTime.now().uptimeNanoseconds - started < Self.startupTimeoutNanoseconds {
             do {
-                return try locator.locate()
+                let info = try locator.locate()
+                guard info.contentDigest == package.contentDigest else {
+                    throw BrokerStartupError.rendezvousChanged
+                }
+                pendingUpgrade = nil
+                currentUpgradeState = .current(contentDigest: package.contentDigest)
+                return info
             } catch {
                 lastError = error
                 try await sleep(60_000_000)
@@ -120,6 +356,7 @@ actor BrokerStartupCoordinator: BrokerInfoPreparing {
             implementationVersion: package.brokerImplementationVersion,
             packageSchema: package.schemaVersion,
             packageVersion: package.packageVersion,
+            contentDigest: package.contentDigest,
             token: token,
             socketPath: socket,
             infoFile: brokerDirectory.appendingPathComponent("broker.json").path,

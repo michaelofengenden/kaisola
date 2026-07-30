@@ -14,6 +14,7 @@ struct ProjectTabStripView: View {
     @Binding var selected: String?
     let menu: (AppModel.ProjectGroup) -> AnyView
     let openFolder: () -> Void
+    let useSidebar: () -> Void
     /// Persist a pointer drag-reorder: move project `id` to absolute `toIndex`
     /// in the project order. Wired to `AppModel.moveProject(id:toIndex:)`.
     let reorder: (_ id: String, _ toIndex: Int) -> Void
@@ -63,6 +64,18 @@ struct ProjectTabStripView: View {
                 }
                     .buttonStyle(.plain)
                     .help("Open a folder as a project (⌘O)")
+                    Button(action: useSidebar) {
+                        Image(systemName: "sidebar.left")
+                            .font(.caption.weight(.semibold))
+                            .frame(width: 26, height: 26)
+                            .background(Color.primary.opacity(0.04), in: Circle())
+                            .overlay {
+                                Circle().stroke(Color.primary.opacity(0.08), lineWidth: 0.8)
+                            }
+                    }
+                    .buttonStyle(.plain)
+                    .help("Move projects and sessions to the sidebar")
+                    .accessibilityLabel("Use sidebar navigation")
                     Spacer(minLength: 0)
                 }
                 .padding(.horizontal, 8)

@@ -22,6 +22,7 @@ const {
   TERMINAL_OBSERVE_FEATURE,
   TERMINAL_HISTORY_FEATURE,
   OBSERVER_ROLE_FEATURE,
+  BROKER_UPDATE_FEATURE,
   OBSERVER_ACCESS,
   MAX_FRAME,
   atomicJson,
@@ -32,6 +33,7 @@ const FEATURES = Object.freeze([
   TERMINAL_OBSERVE_FEATURE,
   TERMINAL_HISTORY_FEATURE,
   OBSERVER_ROLE_FEATURE,
+  BROKER_UPDATE_FEATURE,
 ])
 const NO_CLIENT_EXIT_MS = 30_000
 // macOS may reap old entries from its per-user temporary directory even while
@@ -50,7 +52,15 @@ function readLaunch() {
   const config = JSON.parse(raw)
   if (config.protocol !== PROTOCOL) throw new Error('unsupported broker protocol')
   if (config.securityEpoch !== SECURITY_EPOCH) throw new Error('unsupported broker security epoch')
+  if (Number(config.implementationVersion) !== BROKER_IMPLEMENTATION_VERSION) throw new Error('unsupported broker implementation version')
+  if (Number(config.packageSchema) !== BROKER_PACKAGE_SCHEMA) throw new Error('unsupported broker package schema')
+  if (typeof config.packageVersion !== 'string' || !config.packageVersion || config.packageVersion.length > 64) {
+    throw new Error('invalid broker package version')
+  }
   if (!/^[0-9a-f]{64}$/i.test(String(config.token || ''))) throw new Error('invalid broker token')
+  if (config.contentDigest != null && !/^[0-9a-f]{64}$/.test(String(config.contentDigest))) {
+    throw new Error('invalid broker helper content digest')
+  }
   for (const key of ['socketPath', 'infoFile', 'lockFile', 'storageDir', 'logFile']) {
     if (!path.isAbsolute(String(config[key] || ''))) throw new Error(`invalid ${key}`)
   }
@@ -81,6 +91,10 @@ function tokenMatches(candidate) {
 const clients = new Map() // app instance id -> authenticated socket record
 let noClientTimer = null
 let shuttingDown = false
+// Set synchronously in the authenticated update request before its response is
+// emitted. From that instant onward no mutation can create a PTY/child and race
+// the broker-authoritative quiescence snapshot.
+let updateCommitted = false
 let everConnected = false
 
 function send(socket, frame, { maxQueueBytes, force = false } = {}) {
@@ -159,6 +173,9 @@ async function dispatch(client, method, params = {}) {
   if (!brokerMethodAllowedForAccess(client.access, method)) {
     throw new Error('observer access cannot invoke broker mutations')
   }
+  if (updateCommitted && method !== 'broker.status') {
+    throw new Error('broker helper update is already committed')
+  }
   const admin = String(params.ownerId ?? '0') === '0'
   const requestProject = projectScope(params.projectId)
   const owner = ownerKey(client.instanceId, params.ownerId, requestProject)
@@ -190,6 +207,7 @@ async function dispatch(client, method, params = {}) {
         implementationVersion: BROKER_IMPLEMENTATION_VERSION,
         packageSchema: Number(config.packageSchema) || BROKER_PACKAGE_SCHEMA,
         packageVersion: typeof config.packageVersion === 'string' ? config.packageVersion : null,
+        contentDigest: typeof config.contentDigest === 'string' ? config.contentDigest : null,
         features: FEATURES,
         pid: process.pid,
         startedAt: config.startedAt,
@@ -199,6 +217,46 @@ async function dispatch(client, method, params = {}) {
     case 'broker.shutdown':
       setTimeout(() => gracefulExit(true), 20).unref?.()
       return { ok: true }
+    case 'broker.shutdownForUpdate': { // sealed native helper promotion only
+      if (!admin) throw new Error('broker update requires administrative owner scope')
+      const runningDigest = typeof config.contentDigest === 'string' ? config.contentDigest : null
+      const targetDigest = String(params.targetContentDigest || '')
+      const expectedDigest = String(params.expectedContentDigest || '')
+      const identityMatches = Number(params.expectedPid) === process.pid
+        && Number(params.expectedStartedAt) === Number(config.startedAt)
+        && /^[0-9a-f]{64}$/.test(expectedDigest)
+        && expectedDigest === runningDigest
+      if (!identityMatches) {
+        return {
+          ok: false,
+          state: 'identity_changed',
+          pid: process.pid,
+          startedAt: config.startedAt,
+          contentDigest: runningDigest,
+        }
+      }
+      if (!/^[0-9a-f]{64}$/.test(targetDigest)) throw new Error('invalid target helper content digest')
+      if (targetDigest === runningDigest) {
+        return { ok: true, state: 'current', contentDigest: runningDigest }
+      }
+      const readiness = mgr.upgradeReadiness()
+      if (!readiness.safe) {
+        return { ok: false, state: 'pending', ...readiness }
+      }
+
+      // JavaScript executes this check-and-commit without an await, so another
+      // socket cannot interleave a terminal.create/agentTurn/child mutation.
+      updateCommitted = true
+      log(`helper update committed from=${runningDigest} to=${targetDigest}`)
+      const timer = setTimeout(() => gracefulExit(false), 100)
+      timer.unref?.()
+      return {
+        ok: true,
+        state: 'updating',
+        fromContentDigest: runningDigest,
+        targetContentDigest: targetDigest,
+      }
+    }
     case 'terminal.available':
       return { ok: mgr.available() }
     case 'terminal.create': { // user terminal or ACP terminal
@@ -390,6 +448,7 @@ function handleLine(client, line) {
       implementationVersion: BROKER_IMPLEMENTATION_VERSION,
       packageSchema: Number(config.packageSchema) || BROKER_PACKAGE_SCHEMA,
       packageVersion: typeof config.packageVersion === 'string' ? config.packageVersion : null,
+      contentDigest: typeof config.contentDigest === 'string' ? config.contentDigest : null,
       features: FEATURES,
       access,
       pid: process.pid,
@@ -446,6 +505,7 @@ function brokerInfo() {
     implementationVersion: BROKER_IMPLEMENTATION_VERSION,
     packageSchema: Number(config.packageSchema) || BROKER_PACKAGE_SCHEMA,
     packageVersion: typeof config.packageVersion === 'string' ? config.packageVersion : null,
+    contentDigest: typeof config.contentDigest === 'string' ? config.contentDigest : null,
     pid: process.pid,
     socketPath: config.socketPath,
     token: config.token,

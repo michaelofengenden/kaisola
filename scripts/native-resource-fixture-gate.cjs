@@ -14,6 +14,12 @@ const EXPECTED_PAGES = EXPECTED_BYTES / EXPECTED_PAGE_BYTES
 const EXPECTED_MUTABLE_TAIL_BYTES = 16 * 1024
 const EXPECTED_SCROLLBACK_LINES = 100_000
 const MAX_CAPTURE_BYTES = 64 * 1024
+// AppKit can stop before applicationDidFinishLaunching to show its crash-state
+// restore prompt. Fixtures have private state and must be unattended, so opt
+// out explicitly. AppKit writes one deterministic diagnostic for this flag;
+// validate that exact line below while continuing to reject every other byte.
+const FIXTURE_LAUNCH_ARGUMENTS = ['-ApplePersistenceIgnoreState', 'YES']
+const PERSISTENCE_NOTICE = /^(?:\d{4}-\d{2}-\d{2} [^\r\n]+ )?ApplePersistenceIgnoreState: Existing state will not be touched\. New state will be written to [^\r\n]*\/com\.kaisola\.mac\.savedState\r?\n$/
 
 function positiveInteger(value, label) {
   const number = Number(value)
@@ -83,7 +89,8 @@ function validateReadinessOutput(readiness) {
   if (lines.length !== 1 || !lines[0].startsWith(RECEIPT_PREFIX)) {
     throw new Error('fixture stdout before readiness must contain exactly one receipt line')
   }
-  if (String(readiness.stderr).length > 0) {
+  const stderr = String(readiness.stderr)
+  if (stderr.length > 0 && !PERSISTENCE_NOTICE.test(stderr)) {
     throw new Error(`fixture emitted stderr before readiness: ${JSON.stringify(readiness.stderr)}`)
   }
   return readiness
@@ -194,7 +201,7 @@ async function terminateFixture(child) {
 
 async function run(options) {
   const executable = resolveExecutable(options.app)
-  const child = spawn(executable, [], {
+  const child = spawn(executable, FIXTURE_LAUNCH_ARGUMENTS, {
     env: fixtureEnvironment(),
     stdio: ['ignore', 'pipe', 'pipe'],
   })
@@ -257,6 +264,7 @@ module.exports = {
   EXPECTED_PAGES,
   EXPECTED_PAGE_BYTES,
   EXPECTED_SCROLLBACK_LINES,
+  FIXTURE_LAUNCH_ARGUMENTS,
   RECEIPT_PREFIX,
   createBoundedCapture,
   fixtureEnvironment,

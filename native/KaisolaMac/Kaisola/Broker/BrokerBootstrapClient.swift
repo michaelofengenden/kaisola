@@ -37,7 +37,7 @@ actor BrokerBootstrapClient: BrokerHelperLaunching {
         if directOnly || environment["KAISOLA_NATIVE_DIRECT_HELPER"] == "1" {
             return try directLaunch(package: package, configurationURL: configurationURL)
         }
-        try ensureRegistered(packageVersion: package.manifest.packageVersion)
+        try ensureRegistered(packageIdentity: package.manifest.contentDigest)
         return try await xpcLaunch(configurationURL: configurationURL)
     }
 
@@ -48,14 +48,14 @@ actor BrokerBootstrapClient: BrokerHelperLaunching {
         )
     }
 
-    private func ensureRegistered(packageVersion: String) throws {
+    private func ensureRegistered(packageIdentity: String) throws {
         let service = SMAppService.agent(plistName: brokerBootstrapPlistName)
         let priorVersion = try? String(
             data: Data(contentsOf: registrationRecordURL),
             encoding: .utf8
         )?.trimmingCharacters(in: .whitespacesAndNewlines)
 
-        if service.status == .enabled, priorVersion == packageVersion { return }
+        if service.status == .enabled, priorVersion == packageIdentity { return }
         if service.status == .enabled {
             try service.unregister()
         }
@@ -76,7 +76,7 @@ actor BrokerBootstrapClient: BrokerHelperLaunching {
             throw BrokerBootstrapError.registrationFailed
         }
         try NativePreviewPaths.prepareApplicationSupport()
-        try Data("\(packageVersion)\n".utf8).write(to: registrationRecordURL, options: .atomic)
+        try Data("\(packageIdentity)\n".utf8).write(to: registrationRecordURL, options: .atomic)
         _ = chmod(registrationRecordURL.path, 0o600)
     }
 

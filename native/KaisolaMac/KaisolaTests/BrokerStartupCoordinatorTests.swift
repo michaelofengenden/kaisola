@@ -27,6 +27,7 @@ final class BrokerStartupCoordinatorTests: XCTestCase {
         XCTAssertEqual(info.pid, getpid())
         XCTAssertEqual(info.implementationVersion, 1)
         XCTAssertEqual(info.packageVersion, "test-package")
+        XCTAssertEqual(info.contentDigest, String(repeating: "d", count: 64))
         let launchCount = await launcher.launchCount
         XCTAssertEqual(launchCount, 1)
         await launcher.close()
@@ -125,6 +126,73 @@ final class BrokerStartupCoordinatorTests: XCTestCase {
         await launcher.close()
     }
 
+    func testStaleLiveBrokerDefersWithExactAuthoritativeBlockers() async throws {
+        let home = try privateTemporaryDirectory()
+        let blockers = BrokerUpgradeBlockers(
+            liveTerminalCount: 2,
+            liveTerminalIDs: ["claude", "codex"],
+            busyAgentCount: 1,
+            busyTerminalIDs: ["claude"],
+            childTaskCount: 1
+        )
+        let live = try makeLiveBroker(home: home, contentDigest: String(repeating: "e", count: 64))
+        defer { Darwin.close(live.descriptor) }
+        let requester = FakeBrokerUpgradeRequester(decision: .deferred(blockers))
+        let launcher = FakeBrokerHelperLauncher()
+        let coordinator = BrokerStartupCoordinator(
+            locator: BrokerInfoLocator(userDataCandidates: [live.profile]),
+            launcher: launcher,
+            homeDirectory: home,
+            upgradeRequester: requester
+        )
+
+        let adopted = try await coordinator.prepare()
+        let state = await coordinator.upgradeState()
+        let requestCount = await requester.callCount
+        let launchCount = await launcher.launchCount
+
+        XCTAssertEqual(adopted.contentDigest, String(repeating: "e", count: 64))
+        XCTAssertEqual(state, .pending(
+            fromContentDigest: String(repeating: "e", count: 64),
+            targetContentDigest: String(repeating: "d", count: 64),
+            reason: .liveWork(blockers)
+        ))
+        XCTAssertTrue(state.detail.contains(String(repeating: "e", count: 64)))
+        XCTAssertTrue(state.detail.contains(String(repeating: "d", count: 64)))
+        XCTAssertEqual(requestCount, 1)
+        XCTAssertEqual(launchCount, 0)
+    }
+
+    func testLegacyLiveBrokerIsPreservedWithoutARacyClientSideShutdown() async throws {
+        let home = try privateTemporaryDirectory()
+        let live = try makeLiveBroker(home: home, contentDigest: nil)
+        defer { Darwin.close(live.descriptor) }
+        let requester = FakeBrokerUpgradeRequester(decision: .accepted)
+        let launcher = FakeBrokerHelperLauncher()
+        let coordinator = BrokerStartupCoordinator(
+            locator: BrokerInfoLocator(userDataCandidates: [live.profile]),
+            launcher: launcher,
+            homeDirectory: home,
+            upgradeRequester: requester
+        )
+
+        let adopted = try await coordinator.prepare()
+        let state = await coordinator.upgradeState()
+        let requestCount = await requester.callCount
+        let launchCount = await launcher.launchCount
+
+        XCTAssertNil(adopted.contentDigest)
+        XCTAssertEqual(state, .pending(
+            fromContentDigest: nil,
+            targetContentDigest: String(repeating: "d", count: 64),
+            reason: .legacyIdentityUnavailable
+        ))
+        XCTAssertTrue(state.detail.contains("legacy-unsealed"))
+        XCTAssertTrue(state.detail.contains(String(repeating: "d", count: 64)))
+        XCTAssertEqual(requestCount, 0)
+        XCTAssertEqual(launchCount, 0)
+    }
+
     private func privateTemporaryDirectory() throws -> URL {
         let root = URL(fileURLWithPath: "/tmp", isDirectory: true)
             .appendingPathComponent("kaisola-startup-test-\(UUID().uuidString)", isDirectory: true)
@@ -137,6 +205,57 @@ final class BrokerStartupCoordinatorTests: XCTestCase {
         roots.append(root)
         return root
     }
+
+    private func makeLiveBroker(
+        home: URL,
+        contentDigest: String?
+    ) throws -> (profile: URL, descriptor: Int32) {
+        let profile = home.appendingPathComponent("Kaisola", isDirectory: true)
+        let broker = profile.appendingPathComponent("session-broker", isDirectory: true)
+        try FileManager.default.createDirectory(
+            at: broker,
+            withIntermediateDirectories: true,
+            attributes: [.posixPermissions: 0o700]
+        )
+        _ = chmod(profile.path, 0o700)
+        _ = chmod(broker.path, 0o700)
+        let socket = broker.appendingPathComponent("broker.sock")
+        let descriptor = try bindUnixSocket(at: socket)
+        var metadata: [String: Any] = [
+            "protocol": 2,
+            "securityEpoch": 1,
+            "implementationVersion": 1,
+            "packageSchema": 1,
+            "packageVersion": "old-package",
+            "pid": getpid(),
+            "socketPath": socket.path,
+            "token": String(repeating: "b", count: 64),
+            "startedAt": 1,
+            "version": "old-native",
+        ]
+        if let contentDigest { metadata["contentDigest"] = contentDigest }
+        let infoURL = broker.appendingPathComponent("broker.json")
+        try JSONSerialization.data(withJSONObject: metadata, options: [.sortedKeys]).write(to: infoURL)
+        _ = chmod(infoURL.path, 0o600)
+        return (profile, descriptor)
+    }
+}
+
+private actor FakeBrokerUpgradeRequester: BrokerUpgradeRequesting {
+    let decision: BrokerUpgradeDecision
+    private(set) var callCount = 0
+
+    init(decision: BrokerUpgradeDecision) {
+        self.decision = decision
+    }
+
+    func requestUpgrade(
+        from info: BrokerInfo,
+        targetContentDigest: String
+    ) async throws -> BrokerUpgradeDecision {
+        callCount += 1
+        return decision
+    }
 }
 
 private actor FakeBrokerHelperLauncher: BrokerHelperLaunching {
@@ -148,6 +267,7 @@ private actor FakeBrokerHelperLauncher: BrokerHelperLaunching {
         BrokerHelperManifest(
             schemaVersion: 1,
             packageVersion: "test-package",
+            contentDigest: String(repeating: "d", count: 64),
             brokerImplementationVersion: 1,
             brokerProtocol: .init(minimum: 2, maximum: 2, securityEpoch: 1),
             node: .init(version: "22.23.1", abi: "127", architectures: ["arm64"]),
@@ -171,6 +291,7 @@ private actor FakeBrokerHelperLauncher: BrokerHelperLaunching {
             "implementationVersion": configuration.implementationVersion,
             "packageSchema": configuration.packageSchema,
             "packageVersion": configuration.packageVersion,
+            "contentDigest": configuration.contentDigest,
             "pid": getpid(),
             "socketPath": configuration.socketPath,
             "token": configuration.token,

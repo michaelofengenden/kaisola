@@ -666,6 +666,36 @@ function untrackChild(child) {
   runChildren.delete(child)
 }
 
+/**
+ * Broker-authoritative update gate. UI visibility, cached inventory, and a
+ * quiet timer are never treated as permission to replace the process: every
+ * live PTY, every explicit agent turn, and every tracked non-PTY child must be
+ * absent in this single event-loop snapshot.
+ */
+function summarizeUpgradeReadiness(records, childCount) {
+  const liveTerminalIds = []
+  const busyTerminalIds = []
+  for (const record of records) {
+    if (!record.exited) liveTerminalIds.push(String(record.id))
+    if (record.agentBusy) busyTerminalIds.push(String(record.id))
+  }
+  liveTerminalIds.sort()
+  busyTerminalIds.sort()
+  const runningChildCount = Math.max(0, Number(childCount) || 0)
+  return {
+    safe: liveTerminalIds.length === 0 && busyTerminalIds.length === 0 && runningChildCount === 0,
+    liveTerminalCount: liveTerminalIds.length,
+    liveTerminalIds,
+    busyAgentCount: busyTerminalIds.length,
+    busyTerminalIds,
+    childTaskCount: runningChildCount,
+  }
+}
+
+function upgradeReadiness() {
+  return summarizeUpgradeReadiness(terms.values(), runChildren.size)
+}
+
 function killAll() {
   for (const timer of releaseTimers.values()) clearTimeout(timer)
   releaseTimers.clear()
@@ -731,4 +761,4 @@ function diagnostics() {
   }))
 }
 
-module.exports = { available, has, isLive, ownership, spawn, write, agentTurn, resize, setSender, detachRenderer, detachSender, detachSenderPrefix, snapshot, history, subscribe, unsubscribe, unsubscribeSubscriberPrefix, waitForExit, kill, release, scheduleRelease, cancelRelease, trackChild, untrackChild, killAll, list, setAppFocused, configureStorage, setEventSink, diagnostics, __test: { resumeFromSnapshot, splitUtf8, terminalEnv } }
+module.exports = { available, has, isLive, ownership, spawn, write, agentTurn, resize, setSender, detachRenderer, detachSender, detachSenderPrefix, snapshot, history, subscribe, unsubscribe, unsubscribeSubscriberPrefix, waitForExit, kill, release, scheduleRelease, cancelRelease, trackChild, untrackChild, upgradeReadiness, killAll, list, setAppFocused, configureStorage, setEventSink, diagnostics, __test: { resumeFromSnapshot, splitUtf8, terminalEnv, summarizeUpgradeReadiness } }

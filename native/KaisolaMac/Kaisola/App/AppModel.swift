@@ -61,6 +61,9 @@ final class AppModel: ObservableObject {
     }
 
     @Published private(set) var connectionState: ConnectionState = .looking
+    /// Sealed helper parity is separate from socket health. A broker can be
+    /// healthy but intentionally pending an update because it still owns a PTY.
+    @Published private(set) var brokerUpgradeState: BrokerUpgradeState = .unknown
     @Published private(set) var sessions: [BrokerTerminalRecord] = []
     @Published var selectedSessionID: String?
     /// The primary document is intentionally not `@Published`: terminal bytes
@@ -213,6 +216,7 @@ final class AppModel: ObservableObject {
     private var selectedSession: BrokerTerminalRecord?
     private var activeBrokerIdentity: String?
     private var connectedBrokerFeatures: Set<String> = []
+    private var activeBrokerUpgradeMonitor: (any BrokerUpgradeMonitoring)?
     private var reconnectTask: Task<Void, Never>?
     private var cursorSaveTask: Task<Void, Never>?
     private var inventoryRefreshTask: Task<Void, Never>?
@@ -927,9 +931,24 @@ final class AppModel: ObservableObject {
     /// Single-click opens one replaceable preview tab. Kept tabs are never
     /// displaced; pinning (or opening with `pinned`) promotes the document into
     /// the durable ordered deck.
-    func openFilePreview(_ url: URL, line: Int? = nil, pinned: Bool = false) {
+    func openFilePreview(
+        _ url: URL,
+        line: Int? = nil,
+        pinned: Bool = false,
+        workspaceHint: URL? = nil
+    ) {
         let normalized = url.standardizedFileURL
-        guard let context = fileProjectContext(for: normalized) else {
+        var resolvedContext = fileProjectContext(for: normalized)
+        if resolvedContext == nil,
+           let workspaceHint,
+           let inferredRoot = Self.inferredProjectRoot(
+               for: normalized,
+               workspaceHint: workspaceHint
+           ) {
+            openProject(directory: inferredRoot)
+            resolvedContext = fileProjectContext(for: normalized)
+        }
+        guard let context = resolvedContext else {
             // File links from an observed terminal may not have a known local
             // project root. Retain the safe legacy preview behavior for them.
             previewedFileLine = line
@@ -1561,6 +1580,38 @@ final class AppModel: ObservableObject {
         let root = workspace.standardizedFileURL.resolvingSymlinksInPath().path
         let candidate = url.standardizedFileURL.resolvingSymlinksInPath().path
         return candidate == root || candidate.hasPrefix(root + "/")
+    }
+
+    /// A user-clicked terminal citation can point into a repository that has no
+    /// open project tab yet. Prefer its nearest Git root; otherwise use the
+    /// terminal working directory when it contains the file, then the immediate
+    /// parent. This gives the preview and Files rail one coherent workspace
+    /// without granting meaning to an unclicked path printed by terminal output.
+    private static func inferredProjectRoot(for file: URL, workspaceHint: URL) -> URL? {
+        var isDirectory: ObjCBool = false
+        let normalizedFile = file.standardizedFileURL.resolvingSymlinksInPath()
+        guard FileManager.default.fileExists(atPath: normalizedFile.path, isDirectory: &isDirectory),
+              !isDirectory.boolValue else { return nil }
+
+        let parent = normalizedFile.deletingLastPathComponent()
+        var ancestor = parent
+        while true {
+            if FileManager.default.fileExists(atPath: ancestor.appendingPathComponent(".git").path) {
+                return ancestor
+            }
+            let next = ancestor.deletingLastPathComponent()
+            guard next.path != ancestor.path else { break }
+            ancestor = next
+        }
+
+        var hintIsDirectory: ObjCBool = false
+        let normalizedHint = workspaceHint.standardizedFileURL.resolvingSymlinksInPath()
+        if FileManager.default.fileExists(atPath: normalizedHint.path, isDirectory: &hintIsDirectory),
+           hintIsDirectory.boolValue,
+           isWithinWorkspace(normalizedFile, workspace: normalizedHint) {
+            return normalizedHint
+        }
+        return parent
     }
 
     private static func relativePath(for url: URL, workspace: URL) -> String? {
@@ -3950,6 +4001,10 @@ final class AppModel: ObservableObject {
                 sessions = status.terminals
                 reconcileAllPaneLayoutsWithAvailableSurfaces()
             }
+            if let activeBrokerUpgradeMonitor {
+                let next = await activeBrokerUpgradeMonitor.attemptUpgradeIfNeeded()
+                if next != brokerUpgradeState { brokerUpgradeState = next }
+            }
         }
         refreshBranches()
         refreshMeta()
@@ -4122,6 +4177,8 @@ final class AppModel: ObservableObject {
         }
         await client.disconnect()
         connectedBrokerFeatures = []
+        activeBrokerUpgradeMonitor = nil
+        brokerUpgradeState = .unknown
     }
 
     private func connect(generation: Int, reconnectAttempt: Int?) async -> Bool {
@@ -4152,6 +4209,7 @@ final class AppModel: ObservableObject {
             var info: BrokerInfo
             var hello: BrokerHello
             do {
+                activeBrokerUpgradeMonitor = brokerPreparer as? any BrokerUpgradeMonitoring
                 info = try await brokerPreparer.prepare()
                 activeBrokerIdentity = info.persistenceIdentity
                 hello = try await client.connect(to: info)
@@ -4164,6 +4222,7 @@ final class AppModel: ObservableObject {
                 // The failed hello leaves the client attached to the old
                 // socket; reset it before dialing the separate broker.
                 await client.disconnect()
+                activeBrokerUpgradeMonitor = fallbackPreparer as? any BrokerUpgradeMonitoring
                 info = try await fallbackPreparer.prepare()
                 activeBrokerIdentity = info.persistenceIdentity
                 hello = try await client.connect(to: info)
@@ -4178,6 +4237,7 @@ final class AppModel: ObservableObject {
             notifyInventoryCompletions(previous: sessions, next: status.terminals)
             sessions = status.terminals
             connectedBrokerFeatures = hello.features
+            brokerUpgradeState = await activeBrokerUpgradeMonitor?.upgradeState() ?? .unknown
             if restoredWorkspaceState {
                 // A reconnect inventory is authoritative before any old split
                 // subscription is restored. Prune finished ids in the same

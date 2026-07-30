@@ -6,6 +6,7 @@ const fs = require('node:fs')
 const os = require('node:os')
 const path = require('node:path')
 const {
+  contentDigest,
   createManifest,
   roleFor,
   verifyPackage,
@@ -39,10 +40,35 @@ test('native broker package records every file and verifies exact hashes', (t) =
   t.after(() => fs.rmSync(root, { recursive: true, force: true }))
   const manifest = verifyPackage(root, { policy })
   assert.deepEqual(manifest.files.map((entry) => entry.path), ['lib/broker.cjs'])
+  assert.match(manifest.contentDigest, /^[0-9a-f]{64}$/)
+  assert.equal(manifest.contentDigest, contentDigest(manifest))
 
   fs.appendFileSync(path.join(root, 'lib', 'broker.cjs'), 'tampered\n')
   assert.throws(() => verifyPackage(root, { policy }), /integrity mismatch/)
 })
+
+test('helper content identity is deterministic and excludes generation time', (t) => {
+  const root = fixture()
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  const first = readManifest(root)
+  const regenerated = createManifest(root, {
+    schemaVersion: first.schemaVersion,
+    packageVersion: first.packageVersion,
+    brokerImplementationVersion: first.brokerImplementationVersion,
+    brokerProtocol: first.brokerProtocol,
+    node: first.node,
+    nodePty: first.nodePty,
+    generatedAt: '2099-01-01T00:00:00.000Z',
+  })
+  assert.equal(regenerated.contentDigest, first.contentDigest)
+
+  regenerated.files[0].sha256 = '0'.repeat(64)
+  assert.notEqual(contentDigest(regenerated), first.contentDigest)
+})
+
+function readManifest(root) {
+  return JSON.parse(fs.readFileSync(path.join(root, 'manifest.json'), 'utf8'))
+}
 
 test('native broker package rejects unmanifested files, writable code, and symlinks', (t) => {
   const unmanifested = fixture()

@@ -8,6 +8,7 @@ struct BrokerLaunchConfiguration: Codable, Equatable, Sendable {
     let implementationVersion: Int
     let packageSchema: Int
     let packageVersion: String
+    let contentDigest: String
     let token: String
     let socketPath: String
     let infoFile: String
@@ -20,7 +21,7 @@ struct BrokerLaunchConfiguration: Codable, Equatable, Sendable {
 
     enum CodingKeys: String, CodingKey {
         case protocolVersion = "protocol"
-        case securityEpoch, implementationVersion, packageSchema, packageVersion
+        case securityEpoch, implementationVersion, packageSchema, packageVersion, contentDigest
         case token, socketPath, infoFile, lockFile, storageDir, logFile
         case startedAt, version, smoke
     }
@@ -35,6 +36,7 @@ struct BrokerLaunchConfiguration: Codable, Equatable, Sendable {
               packageSchema == BrokerWire.helperPackageSchema,
               !packageVersion.isEmpty,
               packageVersion.count <= 64,
+              BrokerHelperPackageVerification.isLowercaseSHA256(contentDigest),
               token.count == 64,
               token.allSatisfy(\.isHexDigit),
               startedAt > 0,

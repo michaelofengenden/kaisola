@@ -17,6 +17,10 @@ final class BrokerHelperPackageTests: XCTestCase {
         let verified = try BrokerHelperPackageVerification.verify(root: root, requireSignatures: false)
         XCTAssertEqual(verified.manifest.packageVersion, "test-package")
         XCTAssertEqual(verified.manifest.brokerImplementationVersion, 1)
+        XCTAssertEqual(
+            verified.manifest.contentDigest,
+            BrokerHelperPackageVerification.contentDigest(for: verified.manifest)
+        )
 
         try Data("tampered".utf8).append(to: verified.brokerScript)
         XCTAssertThrowsError(try BrokerHelperPackageVerification.verify(root: root, requireSignatures: false)) { error in
@@ -102,9 +106,10 @@ final class BrokerHelperPackageTests: XCTestCase {
                 "sha256": SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined(),
             ])
         }
-        let manifest: [String: Any] = [
+        var manifest: [String: Any] = [
             "schemaVersion": 1,
             "packageVersion": "test-package",
+            "contentDigest": String(repeating: "0", count: 64),
             "brokerImplementationVersion": 1,
             "brokerProtocol": ["minimum": 2, "maximum": 2, "securityEpoch": 1],
             "node": ["version": "22.23.1", "abi": "127", "architectures": ["arm64"]],
@@ -112,6 +117,11 @@ final class BrokerHelperPackageTests: XCTestCase {
             "files": records,
         ]
         let manifestURL = root.appendingPathComponent("manifest.json")
+        let provisional = try JSONDecoder().decode(
+            BrokerHelperManifest.self,
+            from: JSONSerialization.data(withJSONObject: manifest, options: [.sortedKeys])
+        )
+        manifest["contentDigest"] = BrokerHelperPackageVerification.contentDigest(for: provisional)
         try JSONSerialization.data(withJSONObject: manifest, options: [.sortedKeys]).write(to: manifestURL)
         _ = chmod(manifestURL.path, 0o644)
         return root

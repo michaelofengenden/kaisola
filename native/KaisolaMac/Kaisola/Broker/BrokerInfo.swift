@@ -9,6 +9,7 @@ struct BrokerInfo: Decodable, Equatable, Sendable {
     let implementationVersion: Int?
     let packageSchema: Int?
     let packageVersion: String?
+    let contentDigest: String?
     let pid: Int32
     let socketPath: String
     let token: String
@@ -17,7 +18,7 @@ struct BrokerInfo: Decodable, Equatable, Sendable {
 
     enum CodingKeys: String, CodingKey {
         case protocolVersion = "protocol"
-        case securityEpoch, implementationVersion, packageSchema, packageVersion
+        case securityEpoch, implementationVersion, packageSchema, packageVersion, contentDigest
         case pid, socketPath, token, startedAt, version
     }
 
@@ -27,6 +28,7 @@ struct BrokerInfo: Decodable, Equatable, Sendable {
         implementationVersion: Int? = nil,
         packageSchema: Int? = nil,
         packageVersion: String? = nil,
+        contentDigest: String? = nil,
         pid: Int32,
         socketPath: String,
         token: String,
@@ -38,6 +40,7 @@ struct BrokerInfo: Decodable, Equatable, Sendable {
         self.implementationVersion = implementationVersion
         self.packageSchema = packageSchema
         self.packageVersion = packageVersion
+        self.contentDigest = contentDigest
         self.pid = pid
         self.socketPath = socketPath
         self.token = token
@@ -52,6 +55,7 @@ struct BrokerInfo: Decodable, Equatable, Sendable {
         implementationVersion = try values.decodeIfPresent(Int.self, forKey: .implementationVersion)
         packageSchema = try values.decodeIfPresent(Int.self, forKey: .packageSchema)
         packageVersion = try values.decodeIfPresent(String.self, forKey: .packageVersion)
+        contentDigest = try values.decodeIfPresent(String.self, forKey: .contentDigest)
         pid = try values.decode(Int32.self, forKey: .pid)
         socketPath = try values.decode(String.self, forKey: .socketPath)
         token = try values.decode(String.self, forKey: .token)
@@ -78,6 +82,10 @@ struct BrokerInfo: Decodable, Equatable, Sendable {
             throw BrokerDiscoveryError.invalidMetadata
         }
         guard token.count == 64, token.allSatisfy(\.isHexDigit) else {
+            throw BrokerDiscoveryError.invalidMetadata
+        }
+        if let contentDigest,
+           !BrokerHelperPackageVerification.isLowercaseSHA256(contentDigest) {
             throw BrokerDiscoveryError.invalidMetadata
         }
     }

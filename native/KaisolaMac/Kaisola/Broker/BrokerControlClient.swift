@@ -51,7 +51,7 @@ protocol BrokerControlServing: Sendable {
 /// streams from. Reads never travel here; writes never travel there. The
 /// broker's own ownership model (attach-before-write, stale-write rejection)
 /// stays the final authority on every mutation.
-actor BrokerControlClient: BrokerControlServing {
+actor BrokerControlClient: BrokerControlServing, BrokerUpgradeRequesting {
     /// Compatibility values for a durable pre-fix broker. Older brokers merge
     /// their own launcher environment after receiving terminal.create; an
     /// outer Codex process can therefore leak NO_COLOR=1 into every nested CLI.
@@ -72,6 +72,7 @@ actor BrokerControlClient: BrokerControlServing {
     nonisolated let connectionInstanceID: String
     private var decoder = BrokerLineFrameDecoder()
     private var connected = false
+    private var connectedFeatures: Set<String> = []
     private var ownerID = ""
     private var helloWaiter: CheckedContinuation<Void, any Error>?
     private var handshakeTimeoutTask: Task<Void, Never>?
@@ -210,6 +211,44 @@ actor BrokerControlClient: BrokerControlServing {
         _ = try await request(.agentTurn, params: .object(params))
     }
 
+    func requestUpgrade(
+        from info: BrokerInfo,
+        targetContentDigest: String
+    ) async throws -> BrokerUpgradeDecision {
+        guard let runningDigest = info.contentDigest,
+              BrokerHelperPackageVerification.isLowercaseSHA256(runningDigest),
+              BrokerHelperPackageVerification.isLowercaseSHA256(targetContentDigest) else {
+            throw BrokerClientError.requestFailed("broker helper identity")
+        }
+        do {
+            try await connect(to: info, ownerID: "0")
+            guard connectedFeatures.contains(BrokerWire.brokerUpdateFeature) else {
+                throw BrokerClientError.requestFailed("broker sealed update capability")
+            }
+            let status = try await request(
+                "broker.status",
+                params: .object(["ownerId": .string("0")])
+            )
+            try Self.validateUpgradeStatus(status, expected: info)
+            let result = try await request(
+                "broker.shutdownForUpdate",
+                params: .object([
+                    "ownerId": .string("0"),
+                    "expectedPid": .integer(Int64(info.pid)),
+                    "expectedStartedAt": .integer(info.startedAt),
+                    "expectedContentDigest": .string(runningDigest),
+                    "targetContentDigest": .string(targetContentDigest),
+                ])
+            )
+            let decision = try Self.upgradeDecision(result)
+            await disconnect()
+            return decision
+        } catch {
+            await disconnect()
+            throw error
+        }
+    }
+
     func disconnect() async {
         readerTask?.cancel()
         readerTask = nil
@@ -221,6 +260,7 @@ actor BrokerControlClient: BrokerControlServing {
         failConnection(with: BrokerClientError.connectionClosed)
         decoder = BrokerLineFrameDecoder()
         connected = false
+        connectedFeatures = []
     }
 
     private func identity(projectID: String, terminalID: String) -> JSONValue {
@@ -232,12 +272,16 @@ actor BrokerControlClient: BrokerControlServing {
     }
 
     private func request(_ method: ControlBrokerMethod, params: JSONValue) async throws -> JSONValue {
+        try await request(method.rawValue, params: params)
+    }
+
+    private func request(_ method: String, params: JSONValue) async throws -> JSONValue {
         guard connected else { throw BrokerClientError.notConnected }
         let requestID = UUID().uuidString.lowercased()
         let frame: JSONValue = .object([
             "type": .string("request"),
             "id": .string(requestID),
-            "method": .string(method.rawValue),
+            "method": .string(method),
             "params": params,
         ])
         let encoded = try encode(frame)
@@ -256,6 +300,67 @@ actor BrokerControlClient: BrokerControlServing {
                 do { try await transport.send(encoded) }
                 catch { failRequest(requestID, with: error) }
             }
+        }
+    }
+
+    nonisolated static func upgradeDecision(_ value: JSONValue) throws -> BrokerUpgradeDecision {
+        guard let object = value.objectValue,
+              let state = object["state"]?.stringValue else {
+            throw BrokerClientError.malformedResponse
+        }
+        switch state {
+        case "current":
+            guard object["ok"]?.boolValue == true else { throw BrokerClientError.malformedResponse }
+            return .current
+        case "updating":
+            guard object["ok"]?.boolValue == true else { throw BrokerClientError.malformedResponse }
+            return .accepted
+        case "identity_changed":
+            guard object["ok"]?.boolValue == false else { throw BrokerClientError.malformedResponse }
+            return .identityChanged
+        case "pending":
+            guard object["ok"]?.boolValue == false,
+                  let liveCount = object["liveTerminalCount"]?.intValue.flatMap(Int.init(exactly:)),
+                  let busyCount = object["busyAgentCount"]?.intValue.flatMap(Int.init(exactly:)),
+                  let childCount = object["childTaskCount"]?.intValue.flatMap(Int.init(exactly:)),
+                  liveCount >= 0, busyCount >= 0, childCount >= 0 else {
+                throw BrokerClientError.malformedResponse
+            }
+            let liveIDs = object["liveTerminalIds"]?.arrayValue?.compactMap(\.stringValue) ?? []
+            let busyIDs = object["busyTerminalIds"]?.arrayValue?.compactMap(\.stringValue) ?? []
+            guard liveIDs.count == liveCount,
+                  busyIDs.count == busyCount,
+                  Set(liveIDs).count == liveIDs.count,
+                  Set(busyIDs).count == busyIDs.count else {
+                throw BrokerClientError.malformedResponse
+            }
+            return .deferred(BrokerUpgradeBlockers(
+                liveTerminalCount: liveCount,
+                liveTerminalIDs: liveIDs,
+                busyAgentCount: busyCount,
+                busyTerminalIDs: busyIDs,
+                childTaskCount: childCount
+            ))
+        default:
+            throw BrokerClientError.malformedResponse
+        }
+    }
+
+    nonisolated static func validateUpgradeStatus(
+        _ value: JSONValue,
+        expected info: BrokerInfo
+    ) throws {
+        guard let object = value.objectValue,
+              object["ok"]?.boolValue == true,
+              object["pid"]?.intValue == Int64(info.pid),
+              object["startedAt"]?.intValue == info.startedAt,
+              object["contentDigest"]?.stringValue == info.contentDigest,
+              object["implementationVersion"]?.intValue == info.implementationVersion.map(Int64.init),
+              object["packageSchema"]?.intValue == info.packageSchema.map(Int64.init),
+              object["packageVersion"]?.stringValue == info.packageVersion,
+              Set(object["features"]?.arrayValue?.compactMap(\.stringValue) ?? [])
+                .contains(BrokerWire.brokerUpdateFeature) else {
+            throw BrokerClientError.identityChanged
         }
     }
 
@@ -306,6 +411,7 @@ actor BrokerControlClient: BrokerControlServing {
                 throw BrokerClientError.observeFeatureMissing
             }
             connected = true
+            connectedFeatures = features
             handshakeTimeoutTask?.cancel()
             handshakeTimeoutTask = nil
             helloWaiter?.resume(returning: ())
@@ -351,5 +457,6 @@ actor BrokerControlClient: BrokerControlServing {
         for continuation in pending.values { continuation.resume(throwing: error) }
         pending.removeAll()
         connected = false
+        connectedFeatures = []
     }
 }

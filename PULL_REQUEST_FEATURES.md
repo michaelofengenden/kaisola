@@ -1,9 +1,13 @@
-# Native Kaisola: ordered implementation PRs
+# Native Kaisola: large feature and implementation PRs
 
-This is the working order for the next coherent pull requests. Each slice must
-remain independently reviewable, preserve detached broker sessions, and use the
-fast local lane during implementation. Full distribution, visual, resource,
-and interaction gates belong at milestones rather than every edit.
+This is the working order for substantial product and architecture pull
+requests. Each slice must remain independently reviewable, preserve detached
+broker sessions, and use the fast local lane during implementation. Full
+distribution, visual, resource, and interaction gates belong at milestones
+rather than every edit.
+
+Bounded regressions, reliability work, and release-speed improvements live in
+[PULL_REQUEST_FIXES.md](PULL_REQUEST_FIXES.md).
 
 ## PR 1 — Rich editor and workspace spine
 
@@ -64,7 +68,57 @@ Acceptance:
 - Relaunch and migration preserve ordering, drafts, costs, and tool cards.
 - Streaming and history insertion never override deliberate user scrolling.
 
-## PR 4 — Native Companion production hardening
+## PR 4 — Quiescent rolling broker updates
+
+Make the broker shipped by an app update current for all new work immediately,
+without terminating PTYs that are still owned by an older broker process.
+
+The immutable generation digest, parity reporting, authenticated empty-broker
+shutdown, automatic empty-broker replacement, and active-PTY preservation guard
+shipped in v1.0.0 and are recorded in [`CHANGELOG.md`](CHANGELOG.md). The
+remaining feature is multi-generation routing and drain retirement.
+
+Scope:
+
+- Stage verified packages in a private, versioned Application Support location
+  so an installed-app replacement cannot remove files needed by a draining
+  broker.
+- Replace the single broker rendezvous with an atomic private registry that
+  identifies one current generation and zero or more draining generations,
+  each with its own socket and metadata.
+- Add a broker-authoritative quiescence handshake. A cutover is eligible only
+  after every CLI agent reports `busy:false` for a stability window, there are
+  no in-flight create/write/control operations, and the broker rechecks the
+  same activity epoch atomically when committing the cutover.
+- Treat quiet output as a signal, not proof that a session is disposable. An
+  idle Claude, Codex, Gemini, or OpenCode process still owns a live PTY and must
+  never be killed merely because its turn settled.
+- When the old broker owns live PTYs, launch the verified bundled generation
+  alongside it and route every new terminal to the new generation while
+  existing terminals remain connected to the generation that owns them.
+- Abort and retry the cutover if an agent becomes busy, a user sends terminal
+  input, a Companion control lease changes, or broker identity changes during
+  the quiescence window.
+- Stop and garbage-collect a draining generation only after its terminal
+  inventory is empty, its clients have detached, and its identity is rechecked.
+- Surface app, current-broker, and draining-broker versions in diagnostics and
+  make rollback select an already verified generation rather than mutating a
+  running process.
+
+Acceptance:
+
+- Immediately after an update, the current generation matches the installed
+  app's sealed broker manifest and owns every newly created terminal.
+- Terminals created before the update retain their broker and PTY process IDs
+  until the user ends them naturally.
+- Synthetic quiet output, a late activity event, queued terminal input, and a
+  Companion lease race all cancel the attempted cutover without losing data.
+- Empty old generations retire automatically; live generations are never
+  killed merely because a newer app launched.
+- Crash, power-loss, tampered-registry, downgrade, and incompatible-protocol
+  tests fail closed without orphaning or adopting an ambiguous terminal.
+
+## PR 5 — Native Companion production hardening
 
 Close the remaining cutover evidence for the Swift desktop Companion host.
 
@@ -81,7 +135,7 @@ Acceptance:
 - Revocation and account changes invalidate old access immediately.
 - GUI replacement preserves authorized sessions without widening capabilities.
 
-## PR 5 — Extensions and customization
+## PR 6 — Extensions and customization
 
 Add safe registries for language grammars, previews, MCP packages, custom
 agents, and editor themes after the command/editor boundaries are stable.
@@ -93,23 +147,11 @@ Acceptance:
 - Invalid packages degrade to a disabled state with an actionable explanation.
 - Installation and removal are reversible and workspace/account scoped.
 
-## PR 6 — Project and session ergonomics
+## PR 7 — Project and session ergonomics
 
 Add project detach/adopt, ad-hoc cross-project session groups, richer task
 ledger views, and workflow automation only after the daily editor and Companion
 paths are dependable.
-
-## Cross-cutting speed work
-
-Land alongside the feature PRs when the touched boundary makes it natural:
-
-1. Keep `native:fast` and focused `--run-only` tests as the edit loop.
-2. Split the largest Swift files into feature models/coordinators and smaller
-   views, measuring cold and warm build timing before and after.
-3. Add deterministic changed-file-to-focused-test selection.
-4. Build/test/sign/notarize one immutable candidate after a green main commit.
-5. Make public release a provenance-checked promotion of that candidate so the
-   tag, GitHub assets, and Sparkle appcast publish in one to two minutes.
 
 ## Explicitly deferred
 

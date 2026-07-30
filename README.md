@@ -53,6 +53,11 @@ broker-continuity details.
 
 ## Next implementation slices
 
-The ordered PR plan and acceptance criteria live in
-[PULL_REQUEST.md](PULL_REQUEST.md). The authoritative feature-parity inventory
-is [docs/native-migration-roadmap.md](docs/native-migration-roadmap.md).
+The ordered large-feature plan and acceptance criteria live in
+[PULL_REQUEST_FEATURES.md](PULL_REQUEST_FEATURES.md). Bounded bugs, reliability
+work, iteration speed, and release promotion live in
+[PULL_REQUEST_FIXES.md](PULL_REQUEST_FIXES.md). The authoritative feature-parity
+inventory is [docs/native-migration-roadmap.md](docs/native-migration-roadmap.md).
+Drop untriaged ideas into the intentionally empty [BACKLOG.md](BACKLOG.md).
+Completed release work and verification receipts are recorded in
+[CHANGELOG.md](CHANGELOG.md).

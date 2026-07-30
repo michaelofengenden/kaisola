@@ -41,6 +41,7 @@ const launch = {
   implementationVersion: manifest.brokerImplementationVersion,
   packageSchema: manifest.schemaVersion,
   packageVersion: manifest.packageVersion,
+  contentDigest: manifest.contentDigest,
   token,
   socketPath,
   infoFile,
@@ -187,6 +188,18 @@ function observerSlice(subscription, events) {
   return { output, cursor }
 }
 
+function assertSealedBrokerIdentity(frame, label) {
+  if (frame.contentDigest !== manifest.contentDigest
+      || frame.packageVersion !== manifest.packageVersion
+      || frame.packageSchema !== manifest.schemaVersion
+      || frame.implementationVersion !== manifest.brokerImplementationVersion) {
+    throw new Error(`${label} helper identity drifted from the sealed manifest`)
+  }
+  if (!Array.isArray(frame.features) || !frame.features.includes('broker-update-v1')) {
+    throw new Error(`${label} does not advertise broker-update-v1`)
+  }
+}
+
 ;(async () => {
   const bootstrap = path.join(packageRoot, 'bin', 'kaisola-broker-bootstrap')
   if (requireSignedHost) {
@@ -214,6 +227,7 @@ function observerSlice(subscription, events) {
     try { return JSON.parse(fs.readFileSync(infoFile, 'utf8')) } catch { return null }
   })
   if (info.pid !== bootstrapPid) throw new Error('published broker identity differs from bootstrap PID')
+  if (info.contentDigest !== manifest.contentDigest) throw new Error('published broker digest differs from sealed manifest')
 
   const controller = new Client('controller', 'kaisola-native-N')
   await controller.connect()
@@ -238,6 +252,8 @@ function observerSlice(subscription, events) {
   // Inventory is the observer's read-only administrative surface. Streaming
   // still requires the exact project capability below.
   const statusN = await observerN.request('broker.status', { ownerId: '0' })
+  assertSealedBrokerIdentity(helloN, 'N hello')
+  assertSealedBrokerIdentity(statusN, 'N status')
   const diagnostics = await observerN.request('terminal.diagnostics', { ownerId: '0' })
   const before = diagnostics.find((row) => row.id === 'native-helper-probe')
   if (!before || before.pid !== terminalPid) {
@@ -256,6 +272,8 @@ function observerSlice(subscription, events) {
   const observerN1 = new Client('observer', 'kaisola-native-N+1')
   const helloN1 = await observerN1.connect()
   const statusN1 = await observerN1.request('broker.status', { ownerId: '0' })
+  assertSealedBrokerIdentity(helloN1, 'N+1 hello')
+  assertSealedBrokerIdentity(statusN1, 'N+1 status')
   const subscriptionN1 = await observerN1.request('terminal.subscribe', {
     ownerId: 'probe-observer-N1',
     projectId: 'nativehelperprobe',
@@ -271,6 +289,8 @@ function observerSlice(subscription, events) {
   const observerRollback = new Client('observer', 'kaisola-native-rollback-N')
   const helloRollback = await observerRollback.connect()
   const statusRollback = await observerRollback.request('broker.status', { ownerId: '0' })
+  assertSealedBrokerIdentity(helloRollback, 'rollback hello')
+  assertSealedBrokerIdentity(statusRollback, 'rollback status')
   const subscriptionRollback = await observerRollback.request('terminal.subscribe', {
     ownerId: 'probe-observer-rollback',
     projectId: 'nativehelperprobe',
@@ -300,6 +320,7 @@ function observerSlice(subscription, events) {
   console.log('NATIVE_BROKER_HELPER_PROBE=' + JSON.stringify({
     pass: true,
     packageVersion: manifest.packageVersion,
+    contentDigest: manifest.contentDigest,
     nodeVersion: manifest.node.version,
     nodeArchitectures: manifest.node.architectures,
     brokerPid: info.pid,
@@ -307,6 +328,7 @@ function observerSlice(subscription, events) {
     brokerPidStable: [statusN.pid, statusN1.pid, statusRollback.pid].every((pid) => pid === info.pid),
     terminalPidStable: before.pid === terminalPid,
     observerEnforced: [helloN.access, helloN1.access, helloRollback.access].every((access) => access === 'observer'),
+    brokerUpdateCapability: true,
     nodePtyAvailable: true,
     sequenceContinuous: true,
     signedHostVerified: requireSignedHost,

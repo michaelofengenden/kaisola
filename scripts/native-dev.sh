@@ -344,7 +344,7 @@ start_broker_if_needed() {
     const socketDir=path.join(os.homedir(),".kaisola-session");
     fs.mkdirSync(socketDir,{recursive:true,mode:0o700});
     const launchFile=path.join(brokerRoot,"launch-native-"+crypto.randomUUID()+".json");
-    const launch={protocol:2,securityEpoch:1,implementationVersion:manifest.brokerImplementationVersion,packageSchema:manifest.schemaVersion,packageVersion:manifest.packageVersion,token:crypto.randomBytes(32).toString("hex"),socketPath:path.join(socketDir,crypto.randomBytes(9).toString("hex")+".sock"),infoFile:path.join(brokerRoot,"broker.json"),lockFile:path.join(brokerRoot,"broker.lock"),storageDir:path.join(profileRoot,"terminal-cache"),logFile:path.join(brokerRoot,"broker.log"),startedAt:Date.now(),version:"kaisola-native-dev",smoke:false};
+    const launch={protocol:2,securityEpoch:1,implementationVersion:manifest.brokerImplementationVersion,packageSchema:manifest.schemaVersion,packageVersion:manifest.packageVersion,contentDigest:manifest.contentDigest,token:crypto.randomBytes(32).toString("hex"),socketPath:path.join(socketDir,crypto.randomBytes(9).toString("hex")+".sock"),infoFile:path.join(brokerRoot,"broker.json"),lockFile:path.join(brokerRoot,"broker.lock"),storageDir:path.join(profileRoot,"terminal-cache"),logFile:path.join(brokerRoot,"broker.log"),startedAt:Date.now(),version:"kaisola-native-dev",smoke:false};
     fs.writeFileSync(launchFile,JSON.stringify(launch),{mode:0o600});
     const r=spawnSync(path.join(helper,"bin","kaisola-broker-bootstrap"),["--launch",launchFile],{encoding:"utf8",env:{...process.env,KAISOLA_ALLOW_UNSIGNED_NATIVE_HELPER:"1"}});
     if(r.status!==0){console.error(String(r.stderr||r.stdout).trim());process.exit(1);}

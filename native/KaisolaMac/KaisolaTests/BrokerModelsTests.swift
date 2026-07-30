@@ -146,6 +146,37 @@ final class BrokerModelsTests: XCTestCase {
         }
     }
 
+    func testStatusRequiresTheHelloContentIdentityToRemainPresentAndExact() {
+        let sealedHello = BrokerHello(
+            protocolVersion: 2,
+            securityEpoch: 1,
+            implementationVersion: 1,
+            packageSchema: 1,
+            packageVersion: "1.0.0",
+            contentDigest: String(repeating: "a", count: 64),
+            features: [],
+            pid: 1_234,
+            startedAt: 1_784_250_001_000,
+            version: "test",
+            serverEnforcedObserver: true
+        )
+        XCTAssertThrowsError(try BrokerStatus(
+            status: .object([
+                "ok": .bool(true),
+                "protocol": .integer(2),
+                "securityEpoch": .integer(1),
+                "implementationVersion": .integer(1),
+                "packageSchema": .integer(1),
+                "packageVersion": .string("1.0.0"),
+            ]),
+            diagnostics: .array([]),
+            live: .array([]),
+            expectedHello: sealedHello
+        )) { error in
+            XCTAssertEqual(error as? BrokerClientError, .identityChanged)
+        }
+    }
+
     private var validStatus: JSONValue {
         .object([
             "ok": .bool(true),

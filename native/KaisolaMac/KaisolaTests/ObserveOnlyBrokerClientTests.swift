@@ -14,6 +14,7 @@ final class ObserveOnlyBrokerClientTests: XCTestCase {
         XCTAssertEqual(hello.implementationVersion, BrokerWire.implementationVersion)
         XCTAssertEqual(hello.packageSchema, BrokerWire.helperPackageSchema)
         XCTAssertEqual(hello.packageVersion, "1.0.0")
+        XCTAssertEqual(hello.contentDigest, String(repeating: "a", count: 64))
         let frames = await transport.sentFrames()
         let sent = try XCTUnwrap(frames.first?.objectValue)
         XCTAssertEqual(sent["type"]?.stringValue, "hello")
@@ -39,7 +40,8 @@ final class ObserveOnlyBrokerClientTests: XCTestCase {
             advertiseObserverRole: false,
             implementationVersion: nil,
             packageSchema: nil,
-            packageVersion: nil
+            packageVersion: nil,
+            contentDigest: nil
         )
         let client = ObserveOnlyBrokerClient(transport: transport, operationTimeoutNanoseconds: 100_000_000)
 
@@ -110,6 +112,17 @@ final class ObserveOnlyBrokerClientTests: XCTestCase {
             XCTAssertEqual(error as? BrokerClientError, .identityChanged)
         }
         await changedStatus.disconnect()
+
+        let changedDigest = ObserveOnlyBrokerClient(
+            transport: ScriptedBrokerTransport(contentDigest: String(repeating: "b", count: 64)),
+            operationTimeoutNanoseconds: 100_000_000
+        )
+        do {
+            _ = try await changedDigest.connect(to: brokerInfo)
+            XCTFail("A content digest change between metadata and hello must be refused")
+        } catch {
+            XCTAssertEqual(error as? BrokerClientError, .identityChanged)
+        }
     }
 
     func testHandshakeAndReadRequestsAreTimeBounded() async throws {
@@ -256,6 +269,7 @@ final class ObserveOnlyBrokerClientTests: XCTestCase {
             implementationVersion: BrokerWire.implementationVersion,
             packageSchema: BrokerWire.helperPackageSchema,
             packageVersion: "1.0.0",
+            contentDigest: String(repeating: "a", count: 64),
             pid: 12_345,
             socketPath: "/tmp/kaisola-observer-test.sock",
             token: String(repeating: "a", count: 64),
@@ -286,6 +300,7 @@ private actor ScriptedBrokerTransport: BrokerByteTransport {
     private let implementationVersion: Int?
     private let packageSchema: Int?
     private let packageVersion: String?
+    private let contentDigest: String?
     private let statusImplementationVersion: Int?
     private let subscribeOutput: String?
     private var frames: [JSONValue] = []
@@ -301,6 +316,7 @@ private actor ScriptedBrokerTransport: BrokerByteTransport {
         implementationVersion: Int? = BrokerWire.implementationVersion,
         packageSchema: Int? = BrokerWire.helperPackageSchema,
         packageVersion: String? = "1.0.0",
+        contentDigest: String? = String(repeating: "a", count: 64),
         statusImplementationVersion: Int? = nil,
         subscribeOutput: String? = nil
     ) {
@@ -312,6 +328,7 @@ private actor ScriptedBrokerTransport: BrokerByteTransport {
         self.implementationVersion = implementationVersion
         self.packageSchema = packageSchema
         self.packageVersion = packageVersion
+        self.contentDigest = contentDigest
         self.statusImplementationVersion = statusImplementationVersion
         self.subscribeOutput = subscribeOutput
     }
@@ -341,6 +358,7 @@ private actor ScriptedBrokerTransport: BrokerByteTransport {
             }
             if let packageSchema { fields["packageSchema"] = .integer(Int64(packageSchema)) }
             if let packageVersion { fields["packageVersion"] = .string(packageVersion) }
+            if let contentDigest { fields["contentDigest"] = .string(contentDigest) }
             if let helloAccess { fields["access"] = .string(helloAccess) }
             deliver(try encoded(.object(fields)))
             return
@@ -366,6 +384,7 @@ private actor ScriptedBrokerTransport: BrokerByteTransport {
             }
             if let packageSchema { status["packageSchema"] = .integer(Int64(packageSchema)) }
             if let packageVersion { status["packageVersion"] = .string(packageVersion) }
+            if let contentDigest { status["contentDigest"] = .string(contentDigest) }
             result = .object(status)
         case "terminal.diagnostics":
             result = .array([.object([

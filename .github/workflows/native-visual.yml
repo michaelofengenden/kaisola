@@ -1,0 +1,144 @@
+name: native-visual
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/native-visual.yml'
+      - 'native/KaisolaMac/**'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: native-visual-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  capture:
+    runs-on: macos-15
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+
+      - name: Resolve native app version
+        run: >-
+          node -e
+          "require('fs').appendFileSync(process.env.GITHUB_ENV,
+          'KAISOLA_VISUAL_VERSION=' + require('./package.json').version + '\\n')"
+
+      - name: Build native visual fixture
+        run: >-
+          xcodebuild
+          -project native/KaisolaMac/KaisolaMac.xcodeproj
+          -scheme Kaisola
+          -configuration Debug
+          -destination 'platform=macOS'
+          -derivedDataPath "$RUNNER_TEMP/kaisola-native-visual"
+          MARKETING_VERSION="$KAISOLA_VISUAL_VERSION"
+          CURRENT_PROJECT_VERSION="$GITHUB_RUN_NUMBER"
+          CODE_SIGNING_ALLOWED=NO
+          build
+
+      - name: Capture workspace, document, Mesh, Settings, and Usage states
+        shell: bash
+        run: |
+          set -euo pipefail
+          app="$RUNNER_TEMP/kaisola-native-visual/Build/Products/Debug/Kaisola.app"
+          binary="$app/Contents/MacOS/Kaisola"
+          output="$RUNNER_TEMP/kaisola-native-screenshots"
+          mkdir -p "$output"
+
+          verify_capture() {
+            local capture="$1"
+            local surface="$2"
+            test -s "$capture"
+            test "$(stat -f%z "$capture")" -gt 20000
+            local width height
+            width="$(sips -g pixelWidth "$capture" | awk '/pixelWidth/ {print $2}')"
+            height="$(sips -g pixelHeight "$capture" | awk '/pixelHeight/ {print $2}')"
+            echo "KAISOLA_NATIVE_VISUAL_GEOMETRY=$surface ${width}x${height}"
+            # Settings fixtures are intentionally compact. Every other surface
+            # must keep the large workspace footprint. GitHub's headless
+            # WindowServer scales the declared 1360x860 and 810x540 content
+            # frames to about 1024x681 and 810x568 captured pixels respectively.
+            # These bounds still catch AppKit frame-autosave leakage without
+            # rejecting that stable runner scaling.
+            if [[ "$surface" == workspace-rename || "$surface" == workspace-new-file ]]; then
+              test "$width" -ge 500
+              test "$height" -ge 300
+            elif [[ "$surface" == account-picker ]]; then
+              # NSAlert sizes to its informative text and host display scale;
+              # both the hosted 640x460 and Retina 744x392 sheet crops are
+              # valid while still materially larger than an empty alert.
+              test "$width" -ge 600
+              test "$height" -ge 360
+            elif [[ "$surface" == terminal-transcript ]]; then
+              # The transcript is an attached sheet with a declared 620-point
+              # minimum width, not a settings window. Its hosted capture is an
+              # unscaled sheet crop (currently 620x644).
+              test "$width" -ge 600
+              test "$height" -ge 600
+            elif [[ "$surface" == settings || "$surface" == settings-terminal || "$surface" == settings-terminal-history || "$surface" == settings-terminal-interaction || "$surface" == settings-companion || "$surface" == settings-mcp || "$surface" == settings-models || "$surface" == settings-account-recovery || "$surface" == usage ]]; then
+              test "$width" -ge 800
+              test "$height" -ge 540
+            else
+              test "$width" -ge 1000
+              test "$height" -ge 660
+            fi
+          }
+
+          run_fixture() {
+            local surface="$1"
+            local capture="$2"
+            shift 2
+            echo "KAISOLA_NATIVE_VISUAL_SURFACE_BEGIN=$surface"
+            # Each fixture normally captures and exits in under eight seconds.
+            # Keep a broken AppKit sheet or framework callback from hiding the
+            # responsible surface until the job-wide 25-minute timeout. POSIX
+            # preserves alarm(2) across exec, including env -> Kaisola.
+            if /usr/bin/perl -e '
+              $seconds = shift @ARGV;
+              alarm $seconds;
+              exec @ARGV or die "exec failed: $!\n";
+            ' 20 /usr/bin/env \
+              KAISOLA_NATIVE_VISUAL_FIXTURE=1 \
+              KAISOLA_NATIVE_VISUAL_SURFACE="$surface" \
+              KAISOLA_NATIVE_VISUAL_WORKSPACE="$GITHUB_WORKSPACE" \
+              KAISOLA_NATIVE_VISUAL_CAPTURE_PATH="$capture" \
+              "$@"; then
+              echo "KAISOLA_NATIVE_VISUAL_SURFACE_END=$surface"
+            else
+              local status="$?"
+              echo "KAISOLA_NATIVE_VISUAL_SURFACE_FAIL=$surface status=$status" >&2
+              return "$status"
+            fi
+          }
+
+          for surface in terminal terminal-solo terminal-semantic terminal-scroll-output terminal-transcript account-picker attention-completed companion-control mixed preview preview-narrow preview-dirty-tab preview-tab-overflow preview-table-edit preview-html preview-docx workspace-rename workspace-new-file topbar mesh settings settings-terminal settings-terminal-history settings-terminal-interaction settings-companion settings-mcp settings-models settings-account-recovery usage; do
+            capture="$output/$surface.png"
+            run_fixture "$surface" "$capture" \
+              "$binary" -ApplePersistenceIgnoreState YES
+            verify_capture "$capture" "$surface"
+          done
+
+          for surface in terminal terminal-semantic mixed mesh settings-terminal; do
+            capture="$output/dark-$surface.png"
+            run_fixture "$surface" "$capture" \
+              /usr/bin/env KAISOLA_NATIVE_VISUAL_APPEARANCE=dark "$binary"
+            verify_capture "$capture" "$surface"
+          done
+
+          # Dimension and file-size checks cannot distinguish a real capture
+          # from an all-transparent material-backed sheet. Sample visible
+          # alpha and luminance once across the complete inspection set.
+          xcrun swift scripts/native-visual-image-gate.swift "$output"/*.png
+
+      - name: Upload native visual inspection set
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: native-visual-${{ github.sha }}
+          path: ${{ runner.temp }}/kaisola-native-screenshots/*.png
+          if-no-files-found: error
+          retention-days: 14

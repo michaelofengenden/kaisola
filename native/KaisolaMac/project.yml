@@ -1,0 +1,185 @@
+name: KaisolaMac
+
+options:
+  bundleIdPrefix: com.kaisola
+  deploymentTarget:
+    macOS: "14.0"
+  groupSortPosition: top
+
+configs:
+  Debug: debug
+  LocalRelease: release
+  Release: release
+
+settings:
+  base:
+    SWIFT_VERSION: "6.0"
+    CURRENT_PROJECT_VERSION: 1
+    MARKETING_VERSION: 0.1.0
+    MACOSX_DEPLOYMENT_TARGET: "14.0"
+
+packages:
+  KaisolaCore:
+    path: ../KaisolaCore
+  SwiftTerm:
+    url: https://github.com/migueldeicaza/SwiftTerm.git
+    exactVersion: 1.15.0
+  Sparkle:
+    url: https://github.com/sparkle-project/Sparkle.git
+    exactVersion: 2.9.2
+
+targets:
+  KaisolaBrokerBootstrap:
+    type: tool
+    platform: macOS
+    sources:
+      - path: BrokerBootstrap
+      - path: Shared
+    dependencies:
+      - package: KaisolaCore
+        product: KaisolaBrokerProtocol
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.kaisola.mac.broker-bootstrap
+        PRODUCT_MODULE_NAME: KaisolaBrokerBootstrap
+        PRODUCT_NAME: KaisolaBrokerBootstrap
+        GENERATE_INFOPLIST_FILE: YES
+        ENABLE_APP_SANDBOX: NO
+        CODE_SIGN_STYLE: Automatic
+      configs:
+        LocalRelease:
+          ENABLE_HARDENED_RUNTIME: YES
+        Release:
+          # Developer-ID builds must not inherit Xcode's development-only
+          # get-task-allow base entitlement. The distribution preflight also
+          # rejects it, but preventing injection keeps the first artifact clean.
+          CODE_SIGN_INJECT_BASE_ENTITLEMENTS: NO
+          ENABLE_HARDENED_RUNTIME: YES
+
+  Kaisola:
+    type: application
+    platform: macOS
+    sources:
+      - path: Kaisola
+      - path: Shared
+      # The Firebase REST + Keychain account layer is shared with the iPhone
+      # companion. Platform presentation is selected in that source so the two
+      # apps cannot drift on token validation, refresh, or profile parsing.
+      - path: ../../mobile/KaisolaCompanion/KaisolaCompanion/Account/AuthModel.swift
+      - path: ../../mobile/KaisolaCompanion/KaisolaCompanion/Account/FirebaseAuthBackend.swift
+      - path: ../../mobile/KaisolaCompanion/KaisolaCompanion/Account/RememberedSessionCatalog.swift
+      - path: ../../mobile/KaisolaCompanion/KaisolaCompanion/Account/FirebaseAuthConfig.json
+        buildPhase: resources
+      # Production solid Kaisola mark. CFBundleIconFile in the partial
+      # Info.plist points at the copied ICNS resource.
+      - path: ../../assets/kaisola-icon.icns
+        buildPhase: resources
+    dependencies:
+      - target: KaisolaBrokerBootstrap
+        embed: false
+        link: false
+      - package: KaisolaCore
+        product: KaisolaCore
+      - package: KaisolaCore
+        product: KaisolaBrokerProtocol
+      - package: SwiftTerm
+      - package: Sparkle
+        product: Sparkle
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.kaisola.mac
+        PRODUCT_MODULE_NAME: Kaisola
+        PRODUCT_NAME: Kaisola
+        GENERATE_INFOPLIST_FILE: YES
+        # Custom Sparkle keys are merged from this partial plist because Xcode
+        # only honors an allowlist of INFOPLIST_KEY_* names and silently drops
+        # the SU* ones.
+        INFOPLIST_FILE: Kaisola/App/Info.plist
+        INFOPLIST_KEY_CFBundleDisplayName: Kaisola
+        INFOPLIST_KEY_LSApplicationCategoryType: public.app-category.developer-tools
+        INFOPLIST_KEY_NSHighResolutionCapable: YES
+        KAISOLA_SPARKLE_FEED_URL: ""
+        KAISOLA_SPARKLE_PUBLIC_ED_KEY: ""
+        ENABLE_APP_SANDBOX: NO
+        CODE_SIGN_STYLE: Automatic
+      configs:
+        LocalRelease:
+          CODE_SIGN_ENTITLEMENTS: BrokerHelper/LocalPreview.entitlements
+          ENABLE_HARDENED_RUNTIME: YES
+          # A canonical local production replacement must retain the same
+          # signed update channel as a downloaded release. Debug builds stay
+          # deliberately feedless so Kaisola Dev can never replace itself.
+          KAISOLA_SPARKLE_FEED_URL: https://github.com/michaelofengenden/kaisola/releases/download/kaisola-updates/appcast.xml
+          # Must be the public half of the key that actually signs appcast
+          # entries. The previously pinned value (FAk/3R33...) was not, so every
+          # build from 2026-07-22 onward rejected its own update feed and no
+          # release could install — manually or automatically. Verified: the
+          # published 0.1.129 enclosure signature validates against this key and
+          # fails against the old one.
+          KAISOLA_SPARKLE_PUBLIC_ED_KEY: BQgU8WTQzeYBaYnbWrYBgoP7JPYyCXVrNgHCMBvmYrk=
+        Release:
+          ENABLE_HARDENED_RUNTIME: YES
+    postBuildScripts:
+      - name: Package standalone broker helper
+        basedOnDependencyAnalysis: false
+        script: |
+          set -euo pipefail
+          launch_agents="${TARGET_BUILD_DIR}/${CONTENTS_FOLDER_PATH}/Library/LaunchAgents"
+          mkdir -p "${launch_agents}"
+          cp "${SRCROOT}/BrokerHelper/com.kaisola.mac.broker-bootstrap.plist" "${launch_agents}/com.kaisola.mac.broker-bootstrap.plist"
+
+          if [[ "${CONFIGURATION}" != "Release" && "${CONFIGURATION}" != "LocalRelease" && "${KAISOLA_PACKAGE_BROKER_HELPER:-0}" != "1" ]]; then
+            exit 0
+          fi
+
+          runtime_arm64="${KAISOLA_NODE_RUNTIME_ARM64:-${SRCROOT}/.artifacts/node-v22.23.1-darwin-arm64/bin/node}"
+          runtime_x64="${KAISOLA_NODE_RUNTIME_X86_64:-${SRCROOT}/.artifacts/node-v22.23.1-darwin-x64/bin/node}"
+          if [[ ! -x "${runtime_arm64}" ]]; then
+            echo "Missing pinned arm64 Node runtime. Run: node scripts/download-native-node-runtime.cjs arm64" >&2
+            exit 1
+          fi
+
+          args=(
+            --output "${TARGET_BUILD_DIR}/${UNLOCALIZED_RESOURCES_FOLDER_PATH}/BrokerHelper"
+            --runtime-arm64 "${runtime_arm64}"
+            --bootstrap "${BUILT_PRODUCTS_DIR}/KaisolaBrokerBootstrap"
+            --entitlements "${SRCROOT}/BrokerHelper/BrokerHelper.entitlements"
+          )
+          if [[ " ${ARCHS} " == *" x86_64 "* ]]; then
+            if [[ ! -x "${runtime_x64}" ]]; then
+              echo "Missing pinned x86_64 Node runtime. Run: node scripts/download-native-node-runtime.cjs x86_64" >&2
+              exit 1
+            fi
+            args+=(--runtime-x86_64 "${runtime_x64}")
+          fi
+          if [[ -n "${EXPANDED_CODE_SIGN_IDENTITY:-}" ]]; then
+            args+=(--sign-identity "${EXPANDED_CODE_SIGN_IDENTITY}" --require-signatures)
+          fi
+          /usr/bin/env node "${SRCROOT}/../../scripts/native-broker-package.cjs" "${args[@]}"
+
+  KaisolaTests:
+    type: bundle.unit-test
+    platform: macOS
+    sources:
+      - path: KaisolaTests
+    dependencies:
+      - target: Kaisola
+      - package: SwiftTerm
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.kaisola.mac.tests
+        GENERATE_INFOPLIST_FILE: YES
+        CODE_SIGN_STYLE: Automatic
+
+schemes:
+  Kaisola:
+    build:
+      targets:
+        Kaisola: all
+        KaisolaTests: [test]
+    run:
+      config: Debug
+    test:
+      config: Debug
+      targets:
+        - KaisolaTests

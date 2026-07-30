@@ -1,0 +1,23 @@
+{
+  "v": 1,
+  "kind": "receipt",
+  "desktopId": "desktop-michael-mac",
+  "deviceId": "device-michael-iphone",
+  "connectionId": "connection-alpha-1",
+  "epoch": "desktop-epoch-7",
+  "seq": 18,
+  "id": "receipt-terminal-acquire",
+  "sentAt": 1784250001800,
+  "body": {
+    "type": "command.receipt",
+    "commandId": "command-terminal-acquire",
+    "status": "applied",
+    "message": "Terminal control enabled.",
+    "payload": {
+      "leaseId": "lease-terminal-alpha",
+      "expiresAt": 1784250031800,
+      "renewAfterMs": 10000,
+      "resizeEnabled": true
+    }
+  }
+}

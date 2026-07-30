@@ -1,0 +1,39 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>NSBonjourServices</key>
+	<array>
+		<string>_kaisola._tcp</string>
+	</array>
+	<key>NSLocalNetworkUsageDescription</key>
+	<string>Kaisola uses your local network to connect your paired iPhone to sessions running on this Mac.</string>
+	<!-- Merged with the generated Info.plist. Custom Sparkle keys cannot be
+	     injected via INFOPLIST_KEY_* (Xcode only honors an allowlist), so they
+	     live here with build-setting expansion. Empty values keep the updater
+	     fail-closed via NativeUpdateConfiguration. -->
+	<key>CFBundleIconFile</key>
+	<string>kaisola-icon</string>
+	<key>CFBundleURLTypes</key>
+	<array>
+		<dict>
+			<key>CFBundleTypeRole</key>
+			<string>Editor</string>
+			<key>CFBundleURLName</key>
+			<string>com.kaisola.mac.auth</string>
+			<key>CFBundleURLSchemes</key>
+			<array>
+				<string>kaisola</string>
+			</array>
+		</dict>
+	</array>
+	<key>SUFeedURL</key>
+	<string>$(KAISOLA_SPARKLE_FEED_URL)</string>
+	<key>SUPublicEDKey</key>
+	<string>$(KAISOLA_SPARKLE_PUBLIC_ED_KEY)</string>
+	<key>SUEnableAutomaticChecks</key>
+	<true/>
+	<key>SUAutomaticallyUpdate</key>
+	<true/>
+</dict>
+</plist>

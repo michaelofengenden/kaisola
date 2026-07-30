@@ -1,0 +1,938 @@
+import Combine
+import Darwin
+import KaisolaBrokerProtocol
+import KaisolaCore
+import XCTest
+@testable import Kaisola
+
+@MainActor
+final class AppModelReconnectTests: XCTestCase {
+    func testInventoryCompletionRaceRaisesOnlyWorkingToRespondedTransitions() {
+        let working = terminal("terminal-working", activity: .working)
+        let idle = terminal("terminal-idle", activity: .idle)
+        let alreadyResponded = terminal("terminal-old", activity: .responded(at: 10))
+        let transitions = AppModel.inventoryCompletionTransitions(
+            previous: [working, idle, alreadyResponded],
+            next: [
+                terminal("terminal-working", activity: .responded(at: 20)),
+                terminal("terminal-idle", activity: .responded(at: 20)),
+                terminal("terminal-old", activity: .responded(at: 30)),
+            ]
+        )
+
+        XCTAssertEqual(transitions.map(\.id), ["terminal-working"])
+    }
+
+    func testColdConnectRecoversOnlyUnvisitedRespondedSessions() async throws {
+        let firstCompletion: Int64 = 1_785_000_200_000
+        let secondCompletion: Int64 = 1_785_000_300_000
+        let fixture = try Fixture(
+            failingConnectAttempts: [],
+            completedAtByTerminalID: [
+                ReconnectBrokerClient.firstTerminalID: firstCompletion,
+                ReconnectBrokerClient.secondTerminalID: secondCompletion,
+            ]
+        )
+        defer { fixture.cleanUp() }
+
+        await fixture.model.reload()
+
+        // The first terminal is automatically restored and visible. The other
+        // completed terminal must survive the cold-connect inventory as a
+        // durable needs-you entry even though this process never saw it work.
+        XCTAssertEqual(
+            fixture.attentionCenter.entries.map(\.targetID),
+            [ReconnectBrokerClient.secondTerminalID]
+        )
+        XCTAssertTrue(fixture.attentionCenter.hasAcknowledgedSessionResponse(
+            targetID: ReconnectBrokerClient.firstTerminalID,
+            completedAt: firstCompletion
+        ))
+
+        await fixture.model.select(ReconnectBrokerClient.secondTerminalID)
+        XCTAssertTrue(fixture.attentionCenter.entries.isEmpty)
+        XCTAssertTrue(fixture.attentionCenter.hasAcknowledgedSessionResponse(
+            targetID: ReconnectBrokerClient.secondTerminalID,
+            completedAt: secondCompletion
+        ))
+
+        // Reconnecting replays both responded rows. Neither badge may return.
+        await fixture.model.reload()
+        XCTAssertTrue(fixture.attentionCenter.entries.isEmpty)
+        await fixture.model.disconnect()
+    }
+
+    func testDisconnectRetriesAndResubscribesFromTheVisibleCursor() async throws {
+        let fixture = try Fixture(failingConnectAttempts: [2])
+        defer { fixture.cleanUp() }
+        await fixture.model.reload()
+        XCTAssertTrue(fixture.model.connectionState.isConnected)
+        XCTAssertEqual(fixture.model.terminalDocument.output, "hello")
+
+        await fixture.client.simulateDisconnect()
+        await waitUntil {
+            let attempts = await fixture.client.connectionAttempts()
+            let subscriptions = await fixture.client.subscriptionCursors()
+            return attempts >= 3
+                && subscriptions.count >= 2
+                && fixture.model.connectionState.isConnected
+        }
+
+        let attempts = await fixture.client.connectionAttempts()
+        let cursors = await fixture.client.subscriptionCursors()
+        XCTAssertEqual(attempts, 3)
+        XCTAssertEqual(cursors, [nil, TerminalCursor(streamEpoch: "epoch", offset: 5)])
+        XCTAssertEqual(fixture.model.terminalDocument.output, "hello")
+        await fixture.model.disconnect()
+    }
+
+    func testContiguousBrokerBurstPublishesOneTerminalDocumentPerDisplayInterval() async throws {
+        let fixture = try Fixture(failingConnectAttempts: [])
+        defer { fixture.cleanUp() }
+        await fixture.model.reload()
+        let feed = try XCTUnwrap(fixture.model.terminalSurfaceFeed(
+            for: ReconnectBrokerClient.firstTerminalID
+        ))
+        var terminalPublications = 0
+        var shellPublications = 0
+        let terminalWatcher = feed.$document.dropFirst().sink { _ in terminalPublications += 1 }
+        let shellWatcher = fixture.model.objectWillChange.sink { _ in shellPublications += 1 }
+        defer {
+            terminalWatcher.cancel()
+            shellWatcher.cancel()
+        }
+
+        await fixture.client.emitOutput(
+            for: ReconnectBrokerClient.firstTerminalID,
+            epoch: "epoch",
+            startOffset: 5,
+            data: " "
+        )
+        await fixture.client.emitOutput(
+            for: ReconnectBrokerClient.firstTerminalID,
+            epoch: "epoch",
+            startOffset: 6,
+            data: "wo"
+        )
+        await fixture.client.emitOutput(
+            for: ReconnectBrokerClient.firstTerminalID,
+            epoch: "epoch",
+            startOffset: 8,
+            data: "rld"
+        )
+        try await Task.sleep(for: .milliseconds(40))
+
+        XCTAssertEqual(fixture.model.terminalDocument.output, "hello world")
+        XCTAssertEqual(fixture.model.terminalDocument.cursor?.offset, 11)
+        XCTAssertEqual(terminalPublications, 1)
+        XCTAssertEqual(shellPublications, 0, "terminal bytes must not invalidate the full IDE shell")
+        await fixture.model.disconnect()
+    }
+
+    func testSecondaryBrokerBurstPublishesOnlyItsTerminalCard() async throws {
+        let fixture = try Fixture(failingConnectAttempts: [])
+        defer { fixture.cleanUp() }
+        await fixture.model.reload()
+        let terminalID = ReconnectBrokerClient.secondTerminalID
+        await fixture.model.openInSplit(terminalID)
+        _ = try XCTUnwrap(fixture.model.splitDocuments[terminalID])
+        let feed = try XCTUnwrap(fixture.model.terminalSurfaceFeed(for: terminalID))
+        var terminalPublications = 0
+        var shellPublications = 0
+        let terminalWatcher = feed.$document.dropFirst().sink { _ in terminalPublications += 1 }
+        let shellWatcher = fixture.model.objectWillChange.sink { _ in shellPublications += 1 }
+        defer {
+            terminalWatcher.cancel()
+            shellWatcher.cancel()
+        }
+
+        await fixture.client.emitOutput(
+            for: terminalID,
+            epoch: "epoch-2",
+            startOffset: 5,
+            data: "!"
+        )
+        try await Task.sleep(for: .milliseconds(40))
+
+        XCTAssertEqual(fixture.model.splitDocuments[terminalID]?.output, "world!")
+        XCTAssertEqual(feed.document.output, "world!")
+        XCTAssertEqual(terminalPublications, 1)
+        XCTAssertEqual(shellPublications, 0, "split bytes must not invalidate the full IDE shell")
+        await fixture.model.disconnect()
+    }
+
+    func testSettledOfflineStateDoesNotStrobeWhileRetrying() async throws {
+        let fixture = try Fixture(failingConnectAttempts: Set(1...500))
+        defer { fixture.cleanUp() }
+        var transitions: [String] = []
+        let watcher = fixture.model.$connectionState.sink { transitions.append($0.title) }
+        defer { watcher.cancel() }
+
+        await fixture.model.reload()
+        await waitUntil {
+            await fixture.client.connectionAttempts() >= 6
+        }
+
+        // A broker that keeps refusing settles into one visible offline state;
+        // the silent retries behind it must not strobe the UI through
+        // "Reconnecting" or repeated offline flips on every backoff cycle.
+        let attempts = await fixture.client.connectionAttempts()
+        XCTAssertGreaterThanOrEqual(attempts, 6)
+        XCTAssertEqual(transitions.filter { $0 == "Reconnecting" }.count, 0, "state churned: \(transitions)")
+        XCTAssertEqual(transitions.filter { $0 == "Offline" }.count, 1, "state churned: \(transitions)")
+        await fixture.model.disconnect()
+    }
+
+    func testWakeReopensTheSocketWithoutDiscardingVisibleScrollback() async throws {
+        let fixture = try Fixture(failingConnectAttempts: [])
+        defer { fixture.cleanUp() }
+        await fixture.model.reload()
+        await fixture.model.recoverAfterWake()
+
+        let attempts = await fixture.client.connectionAttempts()
+        let cursors = await fixture.client.subscriptionCursors()
+        XCTAssertEqual(attempts, 2)
+        XCTAssertEqual(cursors, [nil, TerminalCursor(streamEpoch: "epoch", offset: 5)])
+        XCTAssertEqual(fixture.model.terminalDocument.output, "hello")
+        await fixture.model.disconnect()
+    }
+
+    func testWakeRestoresEveryVisibleSecondaryAndPreservesPaneGeometry() async throws {
+        let fixture = try Fixture(failingConnectAttempts: [])
+        defer { fixture.cleanUp() }
+        await fixture.model.reload()
+        await fixture.model.openInSplit(ReconnectBrokerClient.secondTerminalID)
+        let before = fixture.model.paneLayout(for: "project.one")
+        XCTAssertEqual(before.sessionIDs, [
+            ReconnectBrokerClient.firstTerminalID,
+            ReconnectBrokerClient.secondTerminalID,
+        ])
+
+        await fixture.model.recoverAfterWake()
+
+        XCTAssertEqual(fixture.model.paneLayout(for: "project.one"), before)
+        XCTAssertEqual(
+            fixture.model.splitDocuments[ReconnectBrokerClient.secondTerminalID]?.output,
+            "world"
+        )
+        let wakeSubscriptions = await fixture.client.subscriptionIDs()
+        XCTAssertEqual(wakeSubscriptions, [
+            ReconnectBrokerClient.firstTerminalID,
+            ReconnectBrokerClient.secondTerminalID,
+            ReconnectBrokerClient.firstTerminalID,
+            ReconnectBrokerClient.secondTerminalID,
+        ])
+        await fixture.model.disconnect()
+    }
+
+    func testColdRestoreSubscribesEveryPersistedVisibleTerminal() async throws {
+        let fixture = try Fixture(failingConnectAttempts: [])
+        defer { fixture.cleanUp() }
+        let layout = SessionPaneLayout(columns: [
+            .init(id: "left", sessionIDs: [ReconnectBrokerClient.firstTerminalID], weight: 1.35),
+            .init(id: "right", sessionIDs: [ReconnectBrokerClient.secondTerminalID], weight: 0.65),
+        ])
+        try await fixture.workspaceStore.saveRestorationState(
+            NativeWorkspaceRestorationState(
+                selectedProjectID: "project.one",
+                projects: [NativeProjectWorkspaceState(
+                    projectID: "project.one",
+                    layout: layout,
+                    arrangement: .columns,
+                    panes: [
+                        Self.terminalPane(ReconnectBrokerClient.firstTerminalID),
+                        Self.terminalPane(ReconnectBrokerClient.secondTerminalID),
+                    ]
+                )]
+            )
+        )
+
+        await fixture.model.reload()
+
+        XCTAssertEqual(fixture.model.paneLayout(for: "project.one"), layout)
+        XCTAssertEqual(fixture.model.selectedProjectID, "project.one")
+        XCTAssertEqual(
+            fixture.model.splitDocuments[ReconnectBrokerClient.secondTerminalID]?.output,
+            "world"
+        )
+        let restoredSubscriptions = await fixture.client.subscriptionIDs()
+        XCTAssertEqual(restoredSubscriptions, [
+            ReconnectBrokerClient.firstTerminalID,
+            ReconnectBrokerClient.secondTerminalID,
+        ])
+        await fixture.model.disconnect()
+    }
+
+    func testMinimizingWhileSecondarySubscribeIsBlockedRejectsLateResult() async throws {
+        let fixture = try Fixture(failingConnectAttempts: [])
+        defer { fixture.cleanUp() }
+        await fixture.model.reload()
+        await fixture.client.setSubscriptionBlocked(
+            ReconnectBrokerClient.secondTerminalID,
+            blocked: true
+        )
+
+        let opening = Task {
+            await fixture.model.openInSplit(ReconnectBrokerClient.secondTerminalID)
+        }
+        await waitUntil {
+            await fixture.client.subscriptionIDs().contains(ReconnectBrokerClient.secondTerminalID)
+        }
+        await fixture.model.minimizeSurface(ReconnectBrokerClient.secondTerminalID)
+        await fixture.client.setSubscriptionBlocked(
+            ReconnectBrokerClient.secondTerminalID,
+            blocked: false
+        )
+        await opening.value
+
+        XCTAssertFalse(
+            fixture.model.paneLayout(for: "project.one")
+                .contains(ReconnectBrokerClient.secondTerminalID)
+        )
+        XCTAssertNil(fixture.model.splitDocuments[ReconnectBrokerClient.secondTerminalID])
+        await fixture.model.disconnect()
+    }
+
+    func testSidebarRevealPublishesPaneBeforeBlockedBrokerSnapshotReturns() async throws {
+        let fixture = try Fixture(failingConnectAttempts: [])
+        defer { fixture.cleanUp() }
+        let terminalID = ReconnectBrokerClient.secondTerminalID
+        await fixture.model.reload()
+        await fixture.client.setSubscriptionBlocked(terminalID, blocked: true)
+
+        fixture.model.revealSurfaceBeside(terminalID)
+
+        XCTAssertTrue(fixture.model.paneLayout(for: "project.one").contains(terminalID))
+        XCTAssertEqual(fixture.model.focusedPaneID, terminalID)
+        XCTAssertNil(fixture.model.splitDocuments[terminalID])
+
+        await fixture.client.setSubscriptionBlocked(terminalID, blocked: false)
+        await waitUntil {
+            fixture.model.splitDocuments[terminalID]?.output == "world"
+        }
+        await fixture.model.disconnect()
+    }
+
+    func testFailedReconnectKeepsLastGoodSecondaryFrame() async throws {
+        let fixture = try Fixture(failingConnectAttempts: [])
+        defer { fixture.cleanUp() }
+        await fixture.model.reload()
+        await fixture.model.openInSplit(ReconnectBrokerClient.secondTerminalID)
+        XCTAssertEqual(
+            fixture.model.splitDocuments[ReconnectBrokerClient.secondTerminalID]?.output,
+            "world"
+        )
+        await fixture.client.setSubscriptionFailure(
+            ReconnectBrokerClient.secondTerminalID,
+            failing: true
+        )
+
+        await fixture.model.recoverAfterWake()
+
+        XCTAssertEqual(
+            fixture.model.splitDocuments[ReconnectBrokerClient.secondTerminalID]?.output,
+            "world"
+        )
+        XCTAssertTrue(
+            fixture.model.paneLayout(for: "project.one")
+                .contains(ReconnectBrokerClient.secondTerminalID)
+        )
+        await fixture.model.disconnect()
+    }
+
+    func testReopeningWhileUnsubscribeIsBlockedRestoresSecondarySubscription() async throws {
+        let fixture = try Fixture(failingConnectAttempts: [])
+        defer { fixture.cleanUp() }
+        await fixture.model.reload()
+        await fixture.model.openInSplit(ReconnectBrokerClient.secondTerminalID)
+        await fixture.client.setUnsubscribeBlocked(true)
+
+        let minimizing = Task {
+            await fixture.model.minimizeSurface(ReconnectBrokerClient.secondTerminalID)
+        }
+        await waitUntil {
+            !fixture.model.paneLayout(for: "project.one")
+                .contains(ReconnectBrokerClient.secondTerminalID)
+        }
+        let reopening = Task {
+            await fixture.model.openInSplit(ReconnectBrokerClient.secondTerminalID)
+        }
+        await fixture.client.setUnsubscribeBlocked(false)
+        await minimizing.value
+        await reopening.value
+        for _ in 0..<20 { await Task.yield() }
+        XCTAssertTrue(
+            fixture.model.paneLayout(for: "project.one")
+                .contains(ReconnectBrokerClient.secondTerminalID)
+        )
+        XCTAssertEqual(
+            fixture.model.splitDocuments[ReconnectBrokerClient.secondTerminalID]?.output,
+            "world"
+        )
+        let subscriptionCount = await fixture.client.subscriptionCount(
+            for: ReconnectBrokerClient.secondTerminalID
+        )
+        // Reopen can invalidate before the old unsubscribe starts (one live
+        // subscription) or while it is suspended (a clean replacement).
+        XCTAssertTrue((1...2).contains(subscriptionCount))
+        await fixture.model.disconnect()
+    }
+
+    func testSnapshotRecoveryCannotResurrectMinimizedSecondary() async throws {
+        let fixture = try Fixture(failingConnectAttempts: [])
+        defer { fixture.cleanUp() }
+        await fixture.model.reload()
+        await fixture.model.openInSplit(ReconnectBrokerClient.secondTerminalID)
+        await fixture.client.setSubscriptionBlocked(
+            ReconnectBrokerClient.secondTerminalID,
+            blocked: true
+        )
+        await fixture.client.emitSnapshotRequired(for: ReconnectBrokerClient.secondTerminalID)
+        await waitUntil {
+            await fixture.client.subscriptionCount(for: ReconnectBrokerClient.secondTerminalID) >= 2
+        }
+
+        await fixture.model.minimizeSurface(ReconnectBrokerClient.secondTerminalID)
+        await fixture.client.setSubscriptionBlocked(
+            ReconnectBrokerClient.secondTerminalID,
+            blocked: false
+        )
+        await waitUntil {
+            fixture.model.splitDocuments[ReconnectBrokerClient.secondTerminalID] == nil
+        }
+
+        XCTAssertFalse(
+            fixture.model.paneLayout(for: "project.one")
+                .contains(ReconnectBrokerClient.secondTerminalID)
+        )
+        XCTAssertNil(fixture.model.splitDocuments[ReconnectBrokerClient.secondTerminalID])
+        await fixture.model.disconnect()
+    }
+
+    func testReopenDuringStaleSubscribeCleanupReestablishesObserver() async throws {
+        let fixture = try Fixture(failingConnectAttempts: [])
+        defer { fixture.cleanUp() }
+        await fixture.model.reload()
+        await fixture.client.setSubscriptionBlocked(
+            ReconnectBrokerClient.secondTerminalID,
+            blocked: true
+        )
+        let firstOpen = Task {
+            await fixture.model.openInSplit(ReconnectBrokerClient.secondTerminalID)
+        }
+        await waitUntil {
+            await fixture.client.subscriptionCount(for: ReconnectBrokerClient.secondTerminalID) == 1
+        }
+        await fixture.model.minimizeSurface(ReconnectBrokerClient.secondTerminalID)
+        await fixture.client.setUnsubscribeBlocked(true)
+        await fixture.client.setSubscriptionBlocked(
+            ReconnectBrokerClient.secondTerminalID,
+            blocked: false
+        )
+        await waitUntil { await fixture.client.unsubscribeCount() >= 1 }
+
+        let reopen = Task {
+            await fixture.model.openInSplit(ReconnectBrokerClient.secondTerminalID)
+        }
+        await waitUntil {
+            await fixture.client.subscriptionCount(for: ReconnectBrokerClient.secondTerminalID) >= 2
+        }
+        await fixture.client.setUnsubscribeBlocked(false)
+        await firstOpen.value
+        await reopen.value
+        await waitUntil {
+            fixture.model.splitDocuments[ReconnectBrokerClient.secondTerminalID]?.output == "world"
+        }
+
+        XCTAssertTrue(
+            fixture.model.paneLayout(for: "project.one")
+                .contains(ReconnectBrokerClient.secondTerminalID)
+        )
+        XCTAssertEqual(
+            fixture.model.splitDocuments[ReconnectBrokerClient.secondTerminalID]?.output,
+            "world"
+        )
+        await fixture.model.disconnect()
+    }
+
+    func testStaleHiddenCleanupReestablishesTerminalPromotedToPrimary() async throws {
+        let fixture = try Fixture(failingConnectAttempts: [])
+        defer { fixture.cleanUp() }
+        let terminalID = ReconnectBrokerClient.secondTerminalID
+        await fixture.model.reload()
+        await fixture.client.setSubscriptionBlocked(terminalID, blocked: true)
+
+        let firstOpen = Task { await fixture.model.openInSplit(terminalID) }
+        await waitUntil {
+            await fixture.client.subscriptionCount(for: terminalID) == 1
+        }
+        await fixture.model.minimizeSurface(terminalID)
+        await fixture.client.setUnsubscribeBlocked(terminalID, blocked: true)
+        await fixture.client.setSubscriptionBlocked(terminalID, blocked: false)
+        await waitUntil {
+            await fixture.client.unsubscribeCount(for: terminalID) == 1
+        }
+
+        // The stale cleanup is blocked after the old secondary subscribe won.
+        // Promote the now-hidden card, allowing the new primary observer to
+        // attach before that destructive cleanup resumes.
+        let promotion = Task { await fixture.model.focusSurface(terminalID) }
+        await waitUntil {
+            let subscriptionCount = await fixture.client.subscriptionCount(for: terminalID)
+            let isSubscribed = await fixture.client.isSubscribed(to: terminalID)
+            return fixture.model.selectedSessionID == terminalID
+                && fixture.model.terminalDocument.output == "world"
+                && subscriptionCount >= 2
+                && isSubscribed
+        }
+
+        await fixture.client.setUnsubscribeBlocked(terminalID, blocked: false)
+        await firstOpen.value
+        await promotion.value
+        await waitUntil {
+            let subscriptionCount = await fixture.client.subscriptionCount(for: terminalID)
+            let isSubscribed = await fixture.client.isSubscribed(to: terminalID)
+            return subscriptionCount >= 3 && isSubscribed
+        }
+
+        XCTAssertEqual(fixture.model.selectedSessionID, terminalID)
+        XCTAssertEqual(fixture.model.terminalDocument.output, "world")
+        let isSubscribed = await fixture.client.isSubscribed(to: terminalID)
+        XCTAssertTrue(isSubscribed)
+        await fixture.model.disconnect()
+    }
+
+    func testTerminalSurfaceDocumentSurvivesSelectionRoundTrip() async throws {
+        let fixture = try Fixture(failingConnectAttempts: [])
+        defer { fixture.cleanUp() }
+        await fixture.model.reload()
+        let terminalID = try XCTUnwrap(fixture.model.terminalDocument.sessionID)
+
+        XCTAssertEqual(fixture.model.terminalSurfaceDocuments[terminalID]?.output, "hello")
+        XCTAssertEqual(fixture.model.terminalSurfaceOrder, [terminalID])
+
+        await fixture.model.select(nil)
+        XCTAssertNil(fixture.model.terminalDocument.sessionID)
+        XCTAssertEqual(fixture.model.terminalSurfaceDocuments[terminalID]?.output, "hello")
+
+        await fixture.model.select(terminalID)
+        XCTAssertEqual(fixture.model.terminalDocument.output, "hello")
+        XCTAssertEqual(fixture.model.terminalSurfaceOrder, [terminalID])
+        await fixture.model.disconnect()
+    }
+
+    func testSelectionPublishesBeforeBlockedBrokerUnsubscribe() async throws {
+        let fixture = try Fixture(failingConnectAttempts: [])
+        defer { fixture.cleanUp() }
+        await fixture.model.reload()
+        await fixture.client.setUnsubscribeBlocked(true)
+
+        let switchTask = Task { await fixture.model.select(ReconnectBrokerClient.secondTerminalID) }
+        await waitUntil {
+            fixture.model.selectedSessionID == ReconnectBrokerClient.secondTerminalID
+                && fixture.model.terminalDocument.sessionID == ReconnectBrokerClient.secondTerminalID
+        }
+
+        // The new retained/loading surface is already visible even though the
+        // old broker subscription is deliberately unable to finish closing.
+        let subscriptionsWhileBlocked = await fixture.client.subscriptionIDs()
+        XCTAssertEqual(subscriptionsWhileBlocked, [ReconnectBrokerClient.firstTerminalID])
+
+        await fixture.client.setUnsubscribeBlocked(false)
+        await switchTask.value
+        XCTAssertEqual(fixture.model.terminalDocument.output, "world")
+        let completedSubscriptions = await fixture.client.subscriptionIDs()
+        XCTAssertEqual(completedSubscriptions, [
+            ReconnectBrokerClient.firstTerminalID,
+            ReconnectBrokerClient.secondTerminalID,
+        ])
+        await fixture.model.disconnect()
+    }
+
+    func testPromotingVisibleSplitRetainsBothDocumentsThroughBrokerHandoff() async throws {
+        let fixture = try Fixture(failingConnectAttempts: [])
+        defer { fixture.cleanUp() }
+        await fixture.model.reload()
+        await fixture.model.openInSplit(ReconnectBrokerClient.secondTerminalID)
+        XCTAssertEqual(
+            fixture.model.splitDocuments[ReconnectBrokerClient.secondTerminalID]?.output,
+            "world"
+        )
+        await fixture.client.setUnsubscribeBlocked(true)
+
+        let promotion = Task {
+            await fixture.model.focusSurface(ReconnectBrokerClient.secondTerminalID)
+        }
+        await waitUntil {
+            fixture.model.terminalSurfaceDocuments[ReconnectBrokerClient.secondTerminalID]?.output == "world"
+        }
+
+        // The unified card can keep rendering the same retained document while
+        // the broker is deliberately blocked closing the secondary subscription.
+        XCTAssertEqual(
+            fixture.model.terminalSurfaceDocuments[ReconnectBrokerClient.secondTerminalID]?.output,
+            "world"
+        )
+        XCTAssertEqual(fixture.model.terminalDocument.output, "hello")
+
+        await fixture.client.setUnsubscribeBlocked(false)
+        await promotion.value
+        XCTAssertEqual(fixture.model.terminalDocument.output, "world")
+        XCTAssertEqual(
+            fixture.model.splitDocuments[ReconnectBrokerClient.firstTerminalID]?.output,
+            "hello"
+        )
+        await fixture.model.disconnect()
+    }
+
+    func testExplicitTranscriptRemovalRejectsLateBufferedSave() async throws {
+        let fixture = try Fixture(failingConnectAttempts: [])
+        defer { fixture.cleanUp() }
+        let chatID = "closing-stream"
+        let firstRows: [AcpTranscriptRow] = [.message(id: "before", text: "before close")]
+        let lateRows: [AcpTranscriptRow] = [.message(id: "late", text: "buffered after close")]
+
+        fixture.model.enqueueTranscriptSave(firstRows, chatID: chatID)
+        fixture.model.enqueueTranscriptRemoval(chatID: chatID)
+        fixture.model.enqueueTranscriptSave(lateRows, chatID: chatID)
+        await fixture.model.flushTranscriptPersistence()
+
+        let entry = await fixture.transcriptStore.entry(for: chatID)
+        XCTAssertNil(entry)
+    }
+
+    private func waitUntil(
+        iterations: Int = 500,
+        condition: @escaping @MainActor () async -> Bool
+    ) async {
+        for _ in 0..<iterations {
+            if await condition() { return }
+            await Task.yield()
+        }
+        XCTFail("The reconnect state machine did not settle")
+    }
+
+    private func terminal(_ id: String, activity: AgentActivity) -> BrokerTerminalRecord {
+        BrokerTerminalRecord(
+            id: id,
+            projectID: "project.one",
+            pid: 123,
+            exited: false,
+            streamEpoch: "epoch",
+            endOffset: 0,
+            agentActivity: activity
+        )
+    }
+
+    private static func terminalPane(_ id: String) -> NativeRestorablePaneState {
+        NativeRestorablePaneState(
+            id: id,
+            surface: NativeRestorableSurfaceState(
+                kind: .terminal,
+                id: id,
+                projectID: "project.one",
+                title: id
+            )
+        )
+    }
+}
+
+@MainActor
+private final class Fixture {
+    let root: URL
+    let client: ReconnectBrokerClient
+    let transcriptStore: AcpTranscriptStore
+    let workspaceStore: NativeWorkspaceStateStore
+    let attentionCenter: AttentionCenter
+    let model: AppModel
+
+    init(
+        failingConnectAttempts: Set<Int>,
+        completedAtByTerminalID: [String: Int64] = [:]
+    ) throws {
+        root = URL(fileURLWithPath: "/tmp/kaisola-app-model-\(UUID().uuidString.prefix(8))", isDirectory: true)
+        try FileManager.default.createDirectory(
+            at: root,
+            withIntermediateDirectories: true,
+            attributes: [.posixPermissions: 0o700]
+        )
+        _ = chmod(root.path, 0o700)
+        client = ReconnectBrokerClient(
+            failingConnectAttempts: failingConnectAttempts,
+            completedAtByTerminalID: completedAtByTerminalID
+        )
+        transcriptStore = AcpTranscriptStore(
+            fileURL: root.appendingPathComponent("agent-chat-transcripts-v1.json")
+        )
+        workspaceStore = NativeWorkspaceStateStore(
+            fileURL: root.appendingPathComponent("workspace-state-v1.json")
+        )
+        let defaultsSuite = "kaisola-app-model-attention-\(UUID().uuidString)"
+        let attentionDefaults = UserDefaults(suiteName: defaultsSuite)!
+        attentionDefaults.removePersistentDomain(forName: defaultsSuite)
+        attentionCenter = AttentionCenter(
+            defaults: attentionDefaults,
+            postsNotifications: false,
+            updatesDockBadge: false
+        )
+        model = AppModel(
+            brokerPreparer: LocatedBrokerInfoPreparer(locator: FixedBrokerLocator(info: Self.brokerInfo)),
+            client: client,
+            sessionStore: NativeSessionStore(fileURL: root.appendingPathComponent("native-sessions.json")),
+            cursorStore: TerminalCursorStore(fileURL: root.appendingPathComponent("cursors.json")),
+            workspaceStateStore: workspaceStore,
+            transcriptStore: transcriptStore,
+            usageCenter: UsageCenter(persistenceStore: transcriptStore),
+            attentionCenter: attentionCenter,
+            reconnectBackoff: BrokerReconnectBackoff(
+                baseNanoseconds: 1,
+                maximumNanoseconds: 2,
+                jitterFraction: 0
+            ),
+            sleep: { nanoseconds in
+                // Keep nanosecond reconnect backoffs deterministic and fast,
+                // but do not turn the 2.5-second inventory poll into a hot
+                // loop. That unrelated refresh publishes structural model
+                // state and can race terminal-card isolation assertions on a
+                // slower CI host.
+                if nanoseconds >= 1_000_000_000 {
+                    try await Task.sleep(nanoseconds: nanoseconds)
+                } else {
+                    await Task.yield()
+                }
+            },
+            jitter: { 0 }
+        )
+    }
+
+    func cleanUp() {
+        try? FileManager.default.removeItem(at: root)
+    }
+
+    private static var brokerInfo: BrokerInfo {
+        BrokerInfo(
+            protocolVersion: BrokerWire.protocolVersion,
+            securityEpoch: BrokerWire.securityEpoch,
+            pid: 12_345,
+            socketPath: "/tmp/kaisola-app-model.sock",
+            token: String(repeating: "a", count: 64),
+            startedAt: 1_784_250_001_000,
+            version: "test"
+        )
+    }
+}
+
+private struct FixedBrokerLocator: BrokerInfoLocating {
+    let info: BrokerInfo
+
+    func locate() throws -> BrokerInfo { info }
+}
+
+private actor ReconnectBrokerClient: ObserveOnlyBrokerServing {
+    static let firstTerminalID = "terminal:codex-1"
+    static let secondTerminalID = "terminal:codex-2"
+
+    private let failingConnectAttempts: Set<Int>
+    private let completedAtByTerminalID: [String: Int64]
+    private var connectCount = 0
+    private var cursors: [TerminalCursor?] = []
+    private var subscribedTerminalIDs: [String] = []
+    private var activeTerminalIDs: Set<String> = []
+    private var ownerIDsByTerminal: [String: String] = [:]
+    private var blockedSubscriptionIDs: Set<String> = []
+    private var failingSubscriptionIDs: Set<String> = []
+    private var unsubscribeBlocked = false
+    private var blockedUnsubscribeIDs: Set<String> = []
+    private var unsubscribeCalls = 0
+    private var unsubscribedTerminalIDs: [String] = []
+    private var eventHandler: (@Sendable (BrokerEvent) -> Void)?
+    private var disconnectHandler: (@Sendable (any Error) -> Void)?
+
+    init(
+        failingConnectAttempts: Set<Int>,
+        completedAtByTerminalID: [String: Int64] = [:]
+    ) {
+        self.failingConnectAttempts = failingConnectAttempts
+        self.completedAtByTerminalID = completedAtByTerminalID
+    }
+
+    func setEventHandler(_ handler: (@Sendable (BrokerEvent) -> Void)?) async {
+        eventHandler = handler
+    }
+
+    func setDisconnectHandler(_ handler: (@Sendable (any Error) -> Void)?) async {
+        disconnectHandler = handler
+    }
+
+    func connect(to info: BrokerInfo) async throws -> BrokerHello {
+        connectCount += 1
+        if failingConnectAttempts.contains(connectCount) {
+            throw BrokerClientError.connectionClosed
+        }
+        return BrokerHello(
+            protocolVersion: BrokerWire.protocolVersion,
+            securityEpoch: BrokerWire.securityEpoch,
+            implementationVersion: BrokerWire.implementationVersion,
+            packageSchema: nil,
+            packageVersion: nil,
+            features: [BrokerWire.terminalObserveFeature, BrokerWire.observerRoleFeature],
+            pid: info.pid,
+            startedAt: info.startedAt,
+            version: info.version,
+            serverEnforcedObserver: true
+        )
+    }
+
+    func inventory() async throws -> BrokerStatus {
+        let expectedHello = BrokerHello(
+            protocolVersion: BrokerWire.protocolVersion,
+            securityEpoch: BrokerWire.securityEpoch,
+            implementationVersion: BrokerWire.implementationVersion,
+            packageSchema: nil,
+            packageVersion: nil,
+            features: [BrokerWire.terminalObserveFeature, BrokerWire.observerRoleFeature],
+            pid: 12_345,
+            startedAt: 1_784_250_001_000,
+            version: "test",
+            serverEnforcedObserver: true
+        )
+        var firstLive: [String: JSONValue] = [
+            "id": .string(Self.firstTerminalID),
+            "pid": .integer(123),
+        ]
+        if let completedAt = completedAtByTerminalID[Self.firstTerminalID] {
+            firstLive["agentCompletedAt"] = .integer(completedAt)
+        }
+        var secondLive: [String: JSONValue] = [
+            "id": .string(Self.secondTerminalID),
+            "pid": .integer(124),
+        ]
+        if let completedAt = completedAtByTerminalID[Self.secondTerminalID] {
+            secondLive["agentCompletedAt"] = .integer(completedAt)
+        }
+        return try BrokerStatus(
+            status: .object([
+                "ok": .bool(true),
+                "protocol": .integer(Int64(BrokerWire.protocolVersion)),
+                "securityEpoch": .integer(Int64(BrokerWire.securityEpoch)),
+            ]),
+            diagnostics: .array([
+                .object([
+                    "id": .string(Self.firstTerminalID),
+                    "owner": .string("instance|42|project.one"),
+                    "pid": .integer(123),
+                    "streamEpoch": .string("epoch"),
+                    "endOffset": .integer(5),
+                ]),
+                .object([
+                    "id": .string(Self.secondTerminalID),
+                    "owner": .string("instance|42|project.one"),
+                    "pid": .integer(124),
+                    "streamEpoch": .string("epoch-2"),
+                    "endOffset": .integer(5),
+                ]),
+            ]),
+            live: .array([
+                .object(firstLive),
+                .object(secondLive),
+            ]),
+            expectedHello: expectedHello
+        )
+    }
+
+    func subscribe(
+        to terminal: BrokerTerminalRecord,
+        ownerID: String,
+        cursor: TerminalCursor?
+    ) async throws -> TerminalSubscriptionResult {
+        cursors.append(cursor)
+        subscribedTerminalIDs.append(terminal.id)
+        ownerIDsByTerminal[terminal.id] = ownerID
+        while blockedSubscriptionIDs.contains(terminal.id) { await Task.yield() }
+        if failingSubscriptionIDs.contains(terminal.id) {
+            throw BrokerClientError.connectionClosed
+        }
+        activeTerminalIDs.insert(terminal.id)
+        if let cursor { return .current(cursor) }
+        let output = terminal.id == Self.secondTerminalID ? "world" : "hello"
+        let epoch = terminal.id == Self.secondTerminalID ? "epoch-2" : "epoch"
+        return .snapshot(
+            try TerminalSnapshot(value: .object([
+                "streamEpoch": .string(epoch),
+                "output": .string(output),
+                "startOffset": .integer(0),
+                "endOffset": .integer(5),
+            ])),
+            resetReason: nil
+        )
+    }
+
+    func unsubscribe(from terminal: BrokerTerminalRecord, ownerID: String) async throws {
+        unsubscribeCalls += 1
+        unsubscribedTerminalIDs.append(terminal.id)
+        while unsubscribeBlocked || blockedUnsubscribeIDs.contains(terminal.id) {
+            await Task.yield()
+        }
+        activeTerminalIDs.remove(terminal.id)
+    }
+    func disconnect() async {}
+
+    func simulateDisconnect() {
+        disconnectHandler?(BrokerClientError.connectionClosed)
+    }
+
+    func emitOutput(for id: String, epoch: String, startOffset: Int64, data: String) {
+        guard let ownerID = ownerIDsByTerminal[id] else { return }
+        eventHandler?(BrokerEvent(
+            ownerID: ownerID,
+            projectID: "project.one",
+            terminalID: id,
+            kind: .output(
+                epoch: epoch,
+                startOffset: startOffset,
+                endOffset: startOffset + Int64(data.utf8.count),
+                data: data
+            )
+        ))
+    }
+
+    func connectionAttempts() -> Int { connectCount }
+    func subscriptionCursors() -> [TerminalCursor?] { cursors }
+    func subscriptionIDs() -> [String] { subscribedTerminalIDs }
+    func subscriptionCount(for id: String) -> Int {
+        subscribedTerminalIDs.filter { $0 == id }.count
+    }
+    func unsubscribeCount() -> Int { unsubscribeCalls }
+    func unsubscribeCount(for id: String) -> Int {
+        unsubscribedTerminalIDs.filter { $0 == id }.count
+    }
+    func isSubscribed(to id: String) -> Bool { activeTerminalIDs.contains(id) }
+    func setUnsubscribeBlocked(_ blocked: Bool) { unsubscribeBlocked = blocked }
+    func setUnsubscribeBlocked(_ id: String, blocked: Bool) {
+        if blocked { blockedUnsubscribeIDs.insert(id) }
+        else { blockedUnsubscribeIDs.remove(id) }
+    }
+    func setSubscriptionFailure(_ id: String, failing: Bool) {
+        if failing { failingSubscriptionIDs.insert(id) }
+        else { failingSubscriptionIDs.remove(id) }
+    }
+    func setSubscriptionBlocked(_ id: String, blocked: Bool) {
+        if blocked {
+            blockedSubscriptionIDs.insert(id)
+        } else {
+            blockedSubscriptionIDs.remove(id)
+        }
+    }
+
+    func emitSnapshotRequired(for id: String) {
+        guard let ownerID = ownerIDsByTerminal[id] else { return }
+        guard let event = BrokerEvent(frame: .object([
+            "type": .string("event"),
+            "ownerId": .string(ownerID),
+            "projectId": .string("project.one"),
+            "channel": .string("terminal:observer-snapshot-required"),
+            "payload": .object(["id": .string(id)]),
+        ])) else { return }
+        eventHandler?(event)
+    }
+}

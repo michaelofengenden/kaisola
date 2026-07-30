@@ -1,0 +1,42 @@
+{
+  "schemaVersion": 1,
+  "metric": {
+    "family": "macOS-footprint",
+    "name": "total footprint",
+    "source": "/usr/bin/footprint JSON",
+    "unit": "byte"
+  },
+  "minimumSamples": 7,
+  "minimumPairedWarmupMs": 60000,
+  "workloads": [
+    {
+      "id": "one-window-idle-terminal-existing-broker",
+      "description": "One restored project window and one idle terminal with an already-running broker."
+    },
+    {
+      "id": "one-window-streaming-terminal-existing-broker",
+      "description": "One project window and one continuously streaming terminal with an already-running broker."
+    },
+    {
+      "id": "three-restored-project-windows-existing-broker",
+      "description": "Three restored project windows with an already-running broker."
+    },
+    {
+      "id": "three-restored-project-windows-fresh-broker",
+      "description": "Three independently restored 1280 x 800 light/solid project windows, each with one real idle terminal, sharing one fresh isolated broker. Require three distinct saved project paths and terminal IDs, pin every renderer to 5,000 rows, warm for at least 60 seconds, then capture at least seven samples at one-second intervals."
+    },
+    {
+      "id": "one-window-idle-terminal-fresh-broker",
+      "description": "One 1280 x 800 light/solid project window and one real idle terminal after the app starts a fresh isolated broker. Pin both live renderers to 5,000 rows, warm for at least 60 seconds, then capture at least seven samples at one-second intervals."
+    },
+    {
+      "id": "one-window-streaming-terminal-fresh-broker",
+      "description": "One 1280 x 800 light/solid project window and one real terminal continuously repainting the same ten-row shell loop after the app starts a fresh isolated broker. Pin both live renderers to 5,000 rows, prove output advances, warm for at least 60 seconds, then capture at least seven samples at one-second intervals."
+    },
+    {
+      "id": "broker-free-terminal-64mib",
+      "description": "One Release-build fixture window reconstructing an exact deterministic 64 MiB terminal transcript directly from 64 bounded 1 MiB sealed TerminalScrollback pages, with no broker or helper process. Incremental output is independently capped to a 16 KiB mutable copy-on-write tail. Pin the explicit maximum 100,000-row renderer independently of the product default, require the post-replay exact-byte/page/tail/cursor/renderer receipt, warm for 15 seconds, then capture at least seven samples. The p95 physical-footprint ceiling is 512 MiB."
+    }
+  ],
+  "countingPolicy": "Measure each app root and its complete descendant process tree, then add the detached broker and control-plane PIDs explicitly. Use the top-level total footprint from one footprint invocation so Electron and native share one metric family and shared regions are handled consistently."
+}

@@ -1,0 +1,37 @@
+{
+  "_comment": "Canonical companion wire vocabulary. protocol.cjs (desktop) and CompanionProtocol.swift (iPhone) each hand-maintain these enums; protocolTables.test.cjs and CompanionProtocolTableTests.swift assert both sides equal THIS file, so any addition/rename on one platform breaks CI until the other is updated too.",
+  "kinds": ["hello", "event", "command", "receipt", "snapshot", "ack", "error"],
+  "capabilities": ["observe", "agent-control", "terminal-control"],
+  "eventTypes": [
+    "desktop.status",
+    "project.updated",
+    "session.updated",
+    "attention.raised",
+    "attention.cleared",
+    "agent.turn.delta",
+    "agent.turn.completed",
+    "agent.permission.requested",
+    "agent.permission.resolved",
+    "terminal.snapshot",
+    "terminal.output",
+    "terminal.exit",
+    "ledger.task.updated"
+  ],
+  "snapshotTypes": ["snapshot.projects", "terminal.snapshot"],
+  "commandCapabilities": {
+    "attention.ack": "observe",
+    "stream.subscribe": "observe",
+    "stream.unsubscribe": "observe",
+    "agent.prompt": "agent-control",
+    "agent.steer": "agent-control",
+    "agent.cancel": "agent-control",
+    "permission.respond": "agent-control",
+    "terminal.acquire-control": "terminal-control",
+    "terminal.renew-control": "terminal-control",
+    "terminal.write": "terminal-control",
+    "terminal.resize": "terminal-control",
+    "terminal.interrupt": "terminal-control",
+    "terminal.release-control": "terminal-control"
+  },
+  "receiptStatuses": ["accepted", "applied", "rejected", "stale", "unavailable", "timed_out"]
+}

@@ -1,0 +1,17 @@
+{
+  "v": 99,
+  "kind": "hello",
+  "desktopId": "desktop-michael-mac",
+  "deviceId": "device-michael-iphone",
+  "connectionId": "connection-alpha-1",
+  "epoch": "desktop-epoch-7",
+  "seq": 0,
+  "id": "hello-unsupported",
+  "sentAt": 1784250000000,
+  "body": {
+    "type": "hello",
+    "role": "device",
+    "protocolMinor": 0,
+    "capabilities": ["observe"]
+  }
+}

@@ -1,0 +1,147 @@
+name: swift-contracts
+
+on:
+  workflow_call:
+    inputs:
+      # Release tags gate on desktop artifacts; the iPhone build/tests stay on
+      # the push/PR path so a release run is not serialized behind them.
+      skip-ios:
+        type: boolean
+        default: false
+        required: false
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/swift-contracts.yml'
+      - 'native/**'
+      - 'mobile/KaisolaCompanion/**'
+      - 'protocol/broker/**'
+      - 'runtime/**'
+      - 'tests/**'
+      - 'scripts/download-native-node-runtime.cjs'
+      - 'scripts/native-*.cjs'
+      - 'package.json'
+      - 'package-lock.json'
+  pull_request:
+    paths:
+      - '.github/workflows/swift-contracts.yml'
+      - 'native/**'
+      - 'mobile/KaisolaCompanion/**'
+      - 'protocol/broker/**'
+      - 'runtime/**'
+      - 'tests/**'
+      - 'scripts/download-native-node-runtime.cjs'
+      - 'scripts/native-*.cjs'
+      - 'package.json'
+      - 'package-lock.json'
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: macos-15
+    timeout-minutes: 50
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: 22
+          cache: npm
+      - name: Record Apple toolchain
+        run: |
+          swift --version
+          xcodebuild -version
+      - name: Install exact Node helper dependencies
+        run: npm ci --prefer-offline --no-audit --no-fund
+        env:
+          KAISOLA_SKIP_NATIVE_REBUILD: '1'
+      - name: Download checksum-pinned universal Node runtimes
+        run: npm run native:helper:download
+      - name: Test native packaging, compatibility, and resource policies
+        run: >-
+          node --test
+          tests/node/brokerCompatibility.test.cjs
+          tests/node/companionProtocolTables.test.cjs
+          tests/node/nativeAppcast.test.cjs
+          tests/node/nativeBrokerPackage.test.cjs
+          tests/node/nativeReleasePreflight.test.cjs
+          tests/node/nativeResourceGate.test.cjs
+          tests/node/nativeResourceFixtureGate.test.cjs
+      - name: Test shared Swift contracts
+        run: swift test --package-path native/KaisolaCore
+      - name: Compile optimized iPhone app against KaisolaCore
+        if: ${{ !inputs.skip-ios }}
+        run: >-
+          xcodebuild
+          -project mobile/KaisolaCompanion/KaisolaCompanion.xcodeproj
+          -scheme KaisolaCompanion
+          -configuration Release
+          -destination 'generic/platform=iOS Simulator'
+          -derivedDataPath "$RUNNER_TEMP/kaisola-ios"
+          CODE_SIGNING_ALLOWED=NO
+          build
+      - name: Compile iPhone test bundle against KaisolaCore
+        if: ${{ !inputs.skip-ios }}
+        run: >-
+          xcodebuild
+          -project mobile/KaisolaCompanion/KaisolaCompanion.xcodeproj
+          -scheme KaisolaCompanion
+          -configuration Debug
+          -destination 'generic/platform=iOS Simulator'
+          -derivedDataPath "$RUNNER_TEMP/kaisola-ios-tests"
+          CODE_SIGNING_ALLOWED=NO
+          build-for-testing
+      - name: Run iPhone contract and app tests
+        if: ${{ !inputs.skip-ios }}
+        run: >-
+          xcodebuild
+          -project mobile/KaisolaCompanion/KaisolaCompanion.xcodeproj
+          -scheme KaisolaCompanion
+          -configuration Debug
+          -destination 'platform=iOS Simulator,name=iPhone 16 Pro,OS=latest'
+          -derivedDataPath "$RUNNER_TEMP/kaisola-ios-tests"
+          CODE_SIGNING_ALLOWED=NO
+          test-without-building
+      - name: Compile optimized Kaisola macOS app
+        run: >-
+          xcodebuild
+          -project native/KaisolaMac/KaisolaMac.xcodeproj
+          -scheme Kaisola
+          -configuration LocalRelease
+          -destination 'generic/platform=macOS'
+          -derivedDataPath "$RUNNER_TEMP/kaisola-mac"
+          ARCHS='arm64 x86_64'
+          ONLY_ACTIVE_ARCH=NO
+          CODE_SIGN_IDENTITY=-
+          build
+      - name: Verify sealed universal Kaisola package
+        run: >-
+          npm run native:preflight --
+          --app "$RUNNER_TEMP/kaisola-mac/Build/Products/LocalRelease/Kaisola.app"
+      - name: Prove packaged broker and PTY continuity
+        run: >-
+          npm run native:helper:probe --
+          "$RUNNER_TEMP/kaisola-mac/Build/Products/LocalRelease/Kaisola.app/Contents/Resources/BrokerHelper"
+          --require-signed-host
+      - name: Compile Kaisola macOS test bundle
+        run: >-
+          xcodebuild
+          -project native/KaisolaMac/KaisolaMac.xcodeproj
+          -scheme Kaisola
+          -configuration Debug
+          -destination 'platform=macOS'
+          -derivedDataPath "$RUNNER_TEMP/kaisola-mac-tests"
+          CODE_SIGNING_ALLOWED=NO
+          build-for-testing
+      - name: Run Kaisola macOS tests
+        run: >-
+          xcodebuild
+          -project native/KaisolaMac/KaisolaMac.xcodeproj
+          -scheme Kaisola
+          -configuration Debug
+          -destination 'platform=macOS'
+          -derivedDataPath "$RUNNER_TEMP/kaisola-mac-tests"
+          CODE_SIGNING_ALLOWED=NO
+          test-without-building

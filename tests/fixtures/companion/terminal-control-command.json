@@ -1,0 +1,19 @@
+{
+  "v": 1,
+  "kind": "command",
+  "desktopId": "desktop-michael-mac",
+  "deviceId": "device-michael-iphone",
+  "connectionId": "connection-alpha-1",
+  "epoch": "desktop-epoch-7",
+  "seq": 17,
+  "id": "command-terminal-acquire",
+  "sentAt": 1784250001700,
+  "body": {
+    "type": "terminal.acquire-control",
+    "commandId": "command-terminal-acquire",
+    "projectId": "project-kaisola",
+    "targetId": "terminal-codex",
+    "capability": "terminal-control",
+    "payload": {}
+  }
+}

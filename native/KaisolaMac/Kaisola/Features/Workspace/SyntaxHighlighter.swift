@@ -212,10 +212,30 @@ enum SyntaxHighlighter {
         storage.beginEditing()
         for span in spans {
             guard let color = palette[span.role] else { continue }
-            storage.addAttribute(.foregroundColor, value: color, range: span.range)
+            applyAppKitSpan(span, color: color, to: storage)
         }
         storage.endEditing()
         return AttributedSource(value: storage)
+    }
+
+    /// Applies `color` for `span` to `storage`'s foreground color attribute,
+    /// clamped to what `storage` actually contains. Never throws: the
+    /// AttributedString path (`apply(_:to:indexMap:length:)` below) already
+    /// clamps span ranges to the text length, and this AppKit path must too —
+    /// a span range that runs past the end (never expected from well-formed
+    /// tokenization, but not guaranteed for pathological input) would
+    /// otherwise trap `NSMutableAttributedString` with an out-of-range
+    /// exception instead of just skipping the tail. Internal so the clamp is
+    /// directly testable without needing a span-producing input that already
+    /// runs past bounds.
+    nonisolated static func applyAppKitSpan(
+        _ span: Span,
+        color: NSColor,
+        to storage: NSMutableAttributedString
+    ) {
+        let bounds = NSRange(location: 0, length: storage.length)
+        guard let range = bounds.intersection(span.range), range.length > 0 else { return }
+        storage.addAttribute(.foregroundColor, value: color, range: range)
     }
 
     // MARK: - Internals

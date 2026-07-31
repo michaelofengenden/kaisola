@@ -2444,7 +2444,14 @@ struct FilePreviewView: View {
     /// never triggers a re-highlight.
     private func refreshHighlight() {
         highlightTask?.cancel()
-        guard case .text = content else { return }
+        guard case .text = content else {
+            // Non-text content never reads `highlightedSource`, but leaving
+            // it populated would keep the previous file's — potentially
+            // very large — attributed string retained in this view's state
+            // for the rest of its lifetime.
+            highlightedSource = AttributedSource(value: NSAttributedString())
+            return
+        }
         let language = SyntaxHighlighter.language(
             forExtension: (loadedURL ?? url).pathExtension
         )
@@ -3282,10 +3289,16 @@ private struct SourceTextReader: NSViewRepresentable {
             // pointer comparison instead of a full re-install.
             if appliedSource !== source {
                 appliedSource = source
+                // Arm the guard before the storage swap: replacing the text
+                // storage moves the clip origin synchronously, which would
+                // otherwise let `recordScrollPosition` observe the resulting
+                // bounds-change notification and poison the remembered
+                // fraction with the collapsed (≈0) position before restore
+                // ever runs.
+                pendingRestore = true
                 storage.setAttributedString(source)
                 // Storage replacement drops the font applied over the old text.
                 appliedFontSize = nil
-                pendingRestore = true
             }
             if appliedFontSize != fontSize {
                 appliedFontSize = fontSize
@@ -3451,12 +3464,22 @@ private struct LineTargetTextEditor: NSViewRepresentable {
         if textView.string != text {
             let selection = textView.selectedRange()
             context.coordinator.isApplyingExternalValue = true
+            // Assigning `.string` resets the clip origin synchronously, the
+            // same way the reader's `storage.setAttributedString` does.
+            // Bracket it so the resulting bounds notification isn't
+            // recorded as a real scroll, and schedule a restore afterward —
+            // `attachScrollRetention`'s idempotent early return only re-arms
+            // one on a document change, so a same-document external reload
+            // would otherwise leave the view pinned at the collapsed
+            // position with recording disabled for good.
+            context.coordinator.beginExternalTextReplacement()
             textView.string = text
             textView.setSelectedRange(NSRange(
                 location: min(selection.location, (text as NSString).length),
                 length: 0
             ))
             context.coordinator.isApplyingExternalValue = false
+            context.coordinator.endExternalTextReplacement(scheduleRestore: targetLine == nil)
         }
         textView.font = .monospacedSystemFont(ofSize: fontSize, weight: .regular)
         if let markdownScrollView = scrollView as? MarkdownMagnifyingScrollView {
@@ -3547,6 +3570,36 @@ private struct LineTargetTextEditor: NSViewRepresentable {
                 return
             }
             DispatchQueue.main.async { [weak self] in self?.restoreScrollPosition() }
+        }
+
+        /// Arm the same guard `attachScrollRetention` uses, ahead of an
+        /// external `textView.string` replacement: the assignment collapses
+        /// the clip origin synchronously, and without suppressing here
+        /// `recordScrollPosition` would capture that collapse as a real
+        /// position for whichever document `scrollDocumentID` currently
+        /// names.
+        func beginExternalTextReplacement() {
+            pendingRestore = true
+            programmaticScrollDepth += 1
+        }
+
+        /// Release the synchronous suppression armed above. `scheduleRestore`
+        /// should be `false` when an explicit line target will place the
+        /// caret itself (mirroring `attachScrollRetention`'s own
+        /// `hasLineTarget` branch); otherwise perform the restore that
+        /// `attachScrollRetention`'s idempotent early return skips whenever
+        /// the document identity did not change, so a same-document external
+        /// reload still gets its scroll position put back.
+        func endExternalTextReplacement(scheduleRestore: Bool) {
+            programmaticScrollDepth -= 1
+            DispatchQueue.main.async { [weak self] in
+                guard let self else { return }
+                if scheduleRestore {
+                    self.restoreScrollPosition()
+                } else {
+                    self.pendingRestore = false
+                }
+            }
         }
 
         @objc private func viewportDidScroll() {

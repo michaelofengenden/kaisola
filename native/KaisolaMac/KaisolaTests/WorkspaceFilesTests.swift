@@ -2078,6 +2078,37 @@ final class WorkspaceFilesTests: XCTestCase {
         XCTAssertFalse(ProjectFiles.children(of: root).contains { $0.name == "loop" })
         XCTAssertEqual(Set(ProjectFiles.enumerate(root: root)), ["README.md", "src/main.swift"])
     }
+
+    func testSyntaxHighlighterAppKitPathClampsOutOfRangeSpanInsteadOfThrowing() {
+        // `spans(in:language:)` can never itself produce a range past the text
+        // it scanned, but the AppKit adapter must still defend against one —
+        // matching the clamp the AttributedString path already applies —
+        // since an unclamped `NSMutableAttributedString.addAttribute` would
+        // trap with an out-of-range `NSRangeException` instead of degrading.
+        let storage = NSMutableAttributedString(string: "let x = 1")
+        let color = SyntaxHighlighter.nsColor(for: .keyword, dark: true)
+
+        // Entirely past the end: a silent no-op, not a crash.
+        SyntaxHighlighter.applyAppKitSpan(
+            SyntaxHighlighter.Span(range: NSRange(location: 20, length: 5), role: .keyword),
+            color: color,
+            to: storage
+        )
+        var effective = NSRange(location: 0, length: 0)
+        XCTAssertNil(storage.attribute(.foregroundColor, at: 0, effectiveRange: &effective))
+
+        // Starts in range but overruns the end: colors only what exists.
+        SyntaxHighlighter.applyAppKitSpan(
+            SyntaxHighlighter.Span(range: NSRange(location: 4, length: 50), role: .keyword),
+            color: color,
+            to: storage
+        )
+        XCTAssertEqual(
+            storage.attribute(.foregroundColor, at: 4, effectiveRange: &effective) as? NSColor,
+            color
+        )
+        XCTAssertEqual(effective, NSRange(location: 4, length: storage.length - 4))
+    }
 }
 
 private final class ProjectFileIndexProbe: @unchecked Sendable {

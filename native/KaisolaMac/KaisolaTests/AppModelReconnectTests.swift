@@ -409,6 +409,37 @@ final class AppModelReconnectTests: XCTestCase {
         await fixture.model.disconnect()
     }
 
+    /// Closing a split card and the terminal vanishing from the broker's
+    /// inventory are independent events, so they can land together. The close
+    /// captures its intent token, suspends on the cursor write, and the
+    /// inventory tick that arrives in that window used to prune the token as
+    /// dead weight — the fence then read "superseded", the early return skipped
+    /// the teardown, and the card's document held a split slot until reconnect.
+    func testInventoryTickDuringSplitTeardownStillReleasesTheSlot() async throws {
+        let fixture = try Fixture(failingConnectAttempts: [])
+        defer { fixture.cleanUp() }
+        let terminalID = ReconnectBrokerClient.secondTerminalID
+        await fixture.model.reload()
+        await fixture.model.openInSplit(terminalID)
+        _ = try XCTUnwrap(fixture.model.splitDocuments[terminalID])
+
+        await fixture.client.setTerminalHidden(terminalID, hidden: true)
+        let close = Task { await fixture.model.minimizeSurface(terminalID) }
+        await fixture.model.refreshInventory()
+        await close.value
+
+        XCTAssertNil(
+            fixture.model.splitDocuments[terminalID],
+            "The closed card must release its document even when the inventory " +
+                "tick that removed the terminal raced the teardown"
+        )
+        XCTAssertFalse(fixture.model.splitOrder.contains(terminalID))
+        XCTAssertFalse(
+            fixture.model.paneLayout(for: "project.one").contains(terminalID)
+        )
+        await fixture.model.disconnect()
+    }
+
     func testReopenDuringStaleSubscribeCleanupReestablishesObserver() async throws {
         let fixture = try Fixture(failingConnectAttempts: [])
         defer { fixture.cleanUp() }
@@ -1015,6 +1046,7 @@ private actor ReconnectBrokerClient: ObserveOnlyBrokerServing {
     private var subscribedTerminalIDs: [String] = []
     private var activeTerminalIDs: Set<String> = []
     private var ownerIDsByTerminal: [String: String] = [:]
+    private var hiddenTerminalIDs: Set<String> = []
     private var blockedSubscriptionIDs: Set<String> = []
     private var failingSubscriptionIDs: Set<String> = []
     private var unsubscribeBlocked = false
@@ -1111,11 +1143,19 @@ private actor ReconnectBrokerClient: ObserveOnlyBrokerServing {
                     "streamEpoch": .string("epoch-2"),
                     "endOffset": .integer(5),
                 ]),
-            ]),
+            ].filter { record in
+                guard case .object(let fields) = record,
+                      case .string(let id)? = fields["id"] else { return true }
+                return !hiddenTerminalIDs.contains(id)
+            }),
             live: .array([
                 .object(firstLive),
                 .object(secondLive),
-            ]),
+            ].filter { record in
+                guard case .object(let fields) = record,
+                      case .string(let id)? = fields["id"] else { return true }
+                return !hiddenTerminalIDs.contains(id)
+            }),
             expectedHello: expectedHello
         )
     }
@@ -1199,6 +1239,12 @@ private actor ReconnectBrokerClient: ObserveOnlyBrokerServing {
         if failing { failingSubscriptionIDs.insert(id) }
         else { failingSubscriptionIDs.remove(id) }
     }
+    /// Drop a terminal from the authoritative inventory, as the broker does
+    /// once its process exits.
+    func setTerminalHidden(_ id: String, hidden: Bool) {
+        if hidden { hiddenTerminalIDs.insert(id) } else { hiddenTerminalIDs.remove(id) }
+    }
+
     func setSubscriptionBlocked(_ id: String, blocked: Bool) {
         if blocked {
             blockedSubscriptionIDs.insert(id)

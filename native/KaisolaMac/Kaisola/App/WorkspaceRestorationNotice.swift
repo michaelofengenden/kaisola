@@ -60,12 +60,34 @@ struct WorkspaceRestorationNotice: Equatable, Sendable {
         }
     }
 
+    /// What became of the bytes this build could not read. Only one of these
+    /// leaves saving blocked, so the notice stores the disposition rather than
+    /// inferring it from a preserved-copy URL that two very different outcomes
+    /// both leave empty.
+    enum ArchiveDisposition: Equatable, Sendable {
+        /// Still exactly where it was — deliberately, for data this build must
+        /// not touch, or because moving it aside failed. Saves cannot land.
+        case protectedInPlace
+        /// This window moved the unreadable bytes here and started fresh.
+        case movedAside(URL)
+        /// The archive was already gone when this window looked: a sibling
+        /// window hit the same damage first and preserved the bytes. The path
+        /// is clear here too, so saving works — this window simply is not the
+        /// one that can name the kept file.
+        case alreadyPreservedByAnotherWindow
+
+        /// A repeat failure that preserved nothing must not forget that an
+        /// earlier attempt already cleared the path.
+        func carryingForward(_ previous: ArchiveDisposition) -> ArchiveDisposition {
+            self == .protectedInPlace ? previous : self
+        }
+    }
+
     let kind: Kind
     /// The archive that failed to load.
     let archiveURL: URL
-    /// Where the app preserved unreadable bytes, or nil when the archive was
-    /// deliberately left untouched.
-    let preservedCopyURL: URL?
+    /// What happened to the bytes that could not be read.
+    let disposition: ArchiveDisposition
     /// Retries the user has already asked for since this problem appeared.
     private(set) var retryCount: Int
     /// A retry is running now.
@@ -77,26 +99,41 @@ struct WorkspaceRestorationNotice: Equatable, Sendable {
     init(
         kind: Kind,
         archiveURL: URL,
-        preservedCopyURL: URL?,
+        disposition: ArchiveDisposition,
         retryCount: Int = 0,
         isRetrying: Bool = false,
         isBannerDismissed: Bool = false
     ) {
         self.kind = kind
         self.archiveURL = archiveURL
-        self.preservedCopyURL = preservedCopyURL
+        self.disposition = disposition
         self.retryCount = retryCount
         self.isRetrying = isRetrying
         self.isBannerDismissed = isBannerDismissed
     }
 
+    /// Where this window preserved the unreadable bytes, when it is the window
+    /// that moved them.
+    var preservedCopyURL: URL? {
+        if case .movedAside(let url) = disposition { return url }
+        return nil
+    }
+
     /// True while the archive is still protected in place, which is exactly
     /// when further layout saves cannot land.
-    var savesBlocked: Bool { preservedCopyURL == nil }
+    var savesBlocked: Bool { disposition == .protectedInPlace }
 
-    /// What Reveal in Finder should select: the preserved bytes when they
-    /// exist, otherwise the protected archive itself.
-    var revealURL: URL { preservedCopyURL ?? archiveURL }
+    /// What Reveal in Finder should select: the preserved bytes when this
+    /// window moved them, otherwise the protected archive itself. Once a
+    /// sibling window has preserved them there is no file here to select, so
+    /// the folder holding the kept copy is the honest target.
+    var revealURL: URL {
+        switch disposition {
+        case .movedAside(let url): url
+        case .protectedInPlace: archiveURL
+        case .alreadyPreservedByAnotherWindow: archiveURL.deletingLastPathComponent()
+        }
+    }
 
     var title: String {
         switch kind {
@@ -112,12 +149,18 @@ struct WorkspaceRestorationNotice: Equatable, Sendable {
     var message: String {
         switch kind {
         case .corruptArchive:
-            if let preservedCopyURL {
+            switch disposition {
+            case .movedAside(let preservedCopyURL):
                 "Kaisola couldn't read your saved layout, so it kept the damaged "
                     + "file as \(preservedCopyURL.lastPathComponent) and started a "
                     + "fresh one. Projects, panes, and drafts from the last session "
                     + "aren't in this window; new changes are being saved normally."
-            } else {
+            case .alreadyPreservedByAnotherWindow:
+                "Kaisola couldn't read your saved layout, so it started a fresh "
+                    + "one. Another Kaisola window had already kept the damaged file "
+                    + "beside it. Projects, panes, and drafts from the last session "
+                    + "aren't in this window; new changes are being saved normally."
+            case .protectedInPlace:
                 "Kaisola couldn't read your saved layout and couldn't move the "
                     + "damaged file aside, so this window's layout changes aren't "
                     + "being saved. The original file is untouched."
@@ -147,7 +190,11 @@ struct WorkspaceRestorationNotice: Equatable, Sendable {
     }
 
     var revealActionTitle: String {
-        preservedCopyURL == nil ? "Reveal Archive in Finder" : "Reveal Kept Copy in Finder"
+        switch disposition {
+        case .protectedInPlace: "Reveal Archive in Finder"
+        case .movedAside: "Reveal Kept Copy in Finder"
+        case .alreadyPreservedByAnotherWindow: "Reveal Kept Copies in Finder"
+        }
     }
 
     /// Carry the user's interaction history into a freshly observed failure so
@@ -157,7 +204,7 @@ struct WorkspaceRestorationNotice: Equatable, Sendable {
         return WorkspaceRestorationNotice(
             kind: kind,
             archiveURL: archiveURL,
-            preservedCopyURL: preservedCopyURL ?? previous.preservedCopyURL,
+            disposition: disposition.carryingForward(previous.disposition),
             retryCount: previous.retryCount + (previous.isRetrying ? 1 : 0),
             isRetrying: false,
             isBannerDismissed: false

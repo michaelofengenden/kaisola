@@ -51,6 +51,13 @@ final class WorkspacePersistenceVisibilityTests: XCTestCase {
         )
     }
 
+    /// `ToastCenter` is a process-wide singleton, so a toast assertion is only
+    /// meaningful from a known-empty queue.
+    @MainActor
+    private func clearToasts() {
+        for toast in ToastCenter.shared.toasts { ToastCenter.shared.dismiss(toast.id) }
+    }
+
     @MainActor
     private func makeModel(_ workspaceStore: NativeWorkspaceStateStore) -> AppModel {
         AppModel(
@@ -118,7 +125,9 @@ final class WorkspacePersistenceVisibilityTests: XCTestCase {
         }
 
         let moved = try await store.preserveUnreadableArchive()
-        let preserved = try XCTUnwrap(moved)
+        guard case .movedAside(let preserved) = moved else {
+            return XCTFail("A corrupt archive on disk must be moved aside, not reported missing")
+        }
         XCTAssertEqual(try String(contentsOf: preserved, encoding: .utf8), corrupt)
         XCTAssertFalse(FileManager.default.fileExists(atPath: archiveURL.path))
 
@@ -134,12 +143,156 @@ final class WorkspacePersistenceVisibilityTests: XCTestCase {
         )
     }
 
+    /// Several windows launching at once all read the same damaged archive and
+    /// all try to rescue it. Exactly one finds anything left to move; the rest
+    /// used to report that the rescue had failed and that their saves were
+    /// blocked, when in fact a sibling had already cleared the path for them.
+    func testASecondWindowFindsNothingToPreserveAndIsNotBlockedBecauseOfIt() async throws {
+        let corrupt = "{\"schemaVersion\":2,\"restoration\":"
+        try writeArchive(corrupt)
+        let windowA = NativeWorkspaceStateStore(fileURL: archiveURL)
+        let windowB = NativeWorkspaceStateStore(fileURL: archiveURL)
+
+        // Both windows read the damaged bytes and fail closed before either
+        // gets as far as moving them.
+        for window in [windowA, windowB] {
+            do {
+                _ = try await window.restorationState()
+                XCTFail("Both windows must fail closed on the same damaged archive")
+            } catch {
+                XCTAssertEqual(
+                    error as? NativeWorkspaceStateStore.StoreError,
+                    .corruptArchive
+                )
+            }
+        }
+
+        guard case .movedAside(let preserved) = try await windowA.preserveUnreadableArchive() else {
+            return XCTFail("The first window to arrive must be the one that moves the bytes")
+        }
+        let secondRescue = try await windowB.preserveUnreadableArchive()
+        XCTAssertEqual(
+            secondRescue,
+            .nothingToPreserve,
+            "A window that arrives second finds the rescue already done, not failed"
+        )
+
+        // The distinguishing consequence: window B can save.
+        try await windowB.saveRestorationState(
+            NativeWorkspaceRestorationState(selectedProjectID: "nproj_second_window")
+        )
+        let reread = try await windowB.restorationState()
+        XCTAssertEqual(reread.selectedProjectID, "nproj_second_window")
+        XCTAssertEqual(try String(contentsOf: preserved, encoding: .utf8), corrupt)
+    }
+
+    func testASecondWindowsNoticeReportsRecoveryRatherThanAFailedRescue() {
+        let notice = WorkspaceRestorationNotice(
+            kind: .corruptArchive,
+            archiveURL: archiveURL,
+            disposition: .alreadyPreservedByAnotherWindow
+        )
+
+        XCTAssertFalse(
+            notice.savesBlocked,
+            "Another window's rescue clears this window's archive path too"
+        )
+        XCTAssertNil(notice.preservedCopyURL, "This window is not the one that moved the bytes")
+        XCTAssertFalse(
+            notice.message.contains("couldn't move"),
+            "Reporting a failed rescue that never failed is the bug: \(notice.message)"
+        )
+        XCTAssertFalse(
+            notice.message.contains("aren't being saved"),
+            "Saving works here: \(notice.message)"
+        )
+        XCTAssertEqual(notice.summary, "Workspace layout not restored")
+        XCTAssertEqual(
+            notice.revealURL,
+            archiveURL.deletingLastPathComponent(),
+            "There is no file at the archive path to select, only the folder holding the kept copy"
+        )
+
+        // A repeat failure that preserves nothing must not forget the recovery.
+        let repeated = WorkspaceRestorationNotice(
+            kind: .corruptArchive,
+            archiveURL: archiveURL,
+            disposition: .protectedInPlace
+        ).continuing(notice)
+        XCTAssertFalse(repeated.savesBlocked)
+    }
+
     func testPreservingWithoutAnArchiveIsANoOp() async throws {
         let store = NativeWorkspaceStateStore(fileURL: archiveURL)
         let moved = try await store.preserveUnreadableArchive()
-        XCTAssertNil(moved)
+        XCTAssertEqual(
+            moved,
+            .nothingToPreserve,
+            "An absent archive is a cleared path, not a failed rescue"
+        )
         try await store.saveRestorationState(NativeWorkspaceRestorationState())
         XCTAssertTrue(FileManager.default.fileExists(atPath: archiveURL.path))
+    }
+
+    /// The reason `unsupportedSchema` is worth a blocked window: every write
+    /// path loads before it persists, so a newer version's archive can never be
+    /// silently downgraded to something this build happens to understand. The
+    /// notice tells the user saves are blocked — this is the test that they
+    /// actually are, byte for byte.
+    func testANewerSchemaRefusesEverySaveAndLeavesItsBytesExactlyAsFound() async throws {
+        let future = "{\"schemaVersion\":999,\"restoration\":{\"projects\":[]},\"future\":true}"
+        try writeArchive(future)
+        let store = NativeWorkspaceStateStore(fileURL: archiveURL)
+
+        func expectRefusal(
+            _ operation: String,
+            _ save: () async throws -> Void
+        ) async {
+            do {
+                try await save()
+                XCTFail("\(operation) must refuse an archive this build cannot read")
+            } catch {
+                XCTAssertEqual(
+                    error as? NativeWorkspaceStateStore.StoreError,
+                    .unsupportedSchema(found: 999),
+                    "\(operation) must fail for the schema, not incidentally"
+                )
+            }
+        }
+
+        await expectRefusal("saveRestorationState") {
+            try await store.saveRestorationState(
+                NativeWorkspaceRestorationState(selectedProjectID: "nproj_downgrade")
+            )
+        }
+        await expectRefusal("saveProjectState") {
+            try await store.saveProjectState(
+                NativeProjectWorkspaceState(projectID: "nproj_downgrade")
+            )
+        }
+        await expectRefusal("setSelectedProjectID") {
+            try await store.setSelectedProjectID("nproj_downgrade")
+        }
+        await expectRefusal("saveDraft") {
+            try await store.saveDraft(
+                "half-typed prompt",
+                stableKey: "nproj_downgrade|chat",
+                projectID: "nproj_downgrade",
+                agentID: "claude",
+                workspacePath: "/tmp"
+            )
+        }
+
+        XCTAssertEqual(
+            try String(contentsOf: archiveURL, encoding: .utf8),
+            future,
+            "A refused save must not rewrite a single byte of the newer archive"
+        )
+        XCTAssertEqual(
+            try FileManager.default.contentsOfDirectory(atPath: directory.path).sorted(),
+            [archiveURL.lastPathComponent],
+            "No preserved copy and no abandoned temp file may be left behind"
+        )
     }
 
     // MARK: - Notice state machine
@@ -150,7 +303,7 @@ final class WorkspacePersistenceVisibilityTests: XCTestCase {
         let corrupt = WorkspaceRestorationNotice(
             kind: .corruptArchive,
             archiveURL: archiveURL,
-            preservedCopyURL: preserved
+            disposition: .movedAside(preserved)
         )
         XCTAssertFalse(corrupt.savesBlocked)
         XCTAssertEqual(corrupt.revealURL, preserved)
@@ -159,7 +312,7 @@ final class WorkspacePersistenceVisibilityTests: XCTestCase {
         let newer = WorkspaceRestorationNotice(
             kind: .newerVersionData(schemaVersion: 999),
             archiveURL: archiveURL,
-            preservedCopyURL: nil
+            disposition: .protectedInPlace
         )
         XCTAssertTrue(newer.savesBlocked)
         XCTAssertEqual(newer.revealURL, archiveURL)
@@ -194,7 +347,7 @@ final class WorkspacePersistenceVisibilityTests: XCTestCase {
         var notice = WorkspaceRestorationNotice(
             kind: .corruptArchive,
             archiveURL: archiveURL,
-            preservedCopyURL: nil
+            disposition: .protectedInPlace
         )
         XCTAssertEqual(notice.retryCount, 0)
         XCTAssertFalse(notice.isRetrying)
@@ -213,7 +366,7 @@ final class WorkspacePersistenceVisibilityTests: XCTestCase {
         let repeated = WorkspaceRestorationNotice(
             kind: .corruptArchive,
             archiveURL: archiveURL,
-            preservedCopyURL: nil
+            disposition: .protectedInPlace
         ).continuing(notice)
         XCTAssertEqual(repeated.retryCount, 1)
         XCTAssertFalse(repeated.isRetrying)
@@ -279,9 +432,44 @@ final class WorkspacePersistenceVisibilityTests: XCTestCase {
         try await store.saveRestorationState(
             NativeWorkspaceRestorationState(selectedProjectID: "nproj_repaired")
         )
+        clearToasts()
         await model.retryWorkspaceRestoration()
 
         XCTAssertNil(model.workspaceRestorationNotice)
+        XCTAssertEqual(
+            ToastCenter.shared.toasts.last?.message,
+            "Restored your saved workspace layout",
+            "This retry really did read the user's repaired archive"
+        )
+    }
+
+    /// The corrupt path's retry always succeeds — it reads the empty archive
+    /// that replaced the damaged one — so a "restored your layout" toast would
+    /// congratulate the user on getting back panes that are gone for good.
+    @MainActor
+    func testRetryOnTheFreshArchiveSaysTheLayoutIsNewRatherThanRestored() async throws {
+        try writeArchive("{\"schemaVersion\":2,\"restoration\":")
+        let store = NativeWorkspaceStateStore(fileURL: archiveURL)
+        let model = makeModel(store)
+
+        await model.restoreWorkspaceStateIfNeeded()
+        let notice = try XCTUnwrap(model.workspaceRestorationNotice)
+        XCTAssertEqual(notice.kind, .corruptArchive)
+        XCTAssertFalse(notice.savesBlocked)
+        clearToasts()
+
+        await model.retryWorkspaceRestoration()
+
+        XCTAssertNil(model.workspaceRestorationNotice)
+        let message = try XCTUnwrap(ToastCenter.shared.toasts.last?.message)
+        XCTAssertEqual(
+            message,
+            "Started a fresh layout — your damaged copy is kept beside it"
+        )
+        XCTAssertFalse(
+            message.lowercased().contains("restored"),
+            "Nothing was restored: the archive this retry read is the empty one"
+        )
     }
 
     @MainActor

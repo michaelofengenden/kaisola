@@ -996,12 +996,22 @@ final class AppModel: ObservableObject {
             reconcilePaneLayoutWithAvailableSurfaces(for: projectID, persist: true)
         }
         // The broker inventory that triggered this reconcile is authoritative
-        // about which terminals still exist. Intent tokens for the others can
-        // never fence anything again: their only readers require a live
-        // record, so retaining them just grows the window forever.
+        // about which terminals still exist, so tokens for the others are
+        // ordinarily dead weight the window would otherwise keep forever.
+        //
+        // "Ordinarily" is doing real work here. A token is also the fence a
+        // *suspended* split operation re-reads when it wakes: `unsubscribeSplit`
+        // captures it, awaits the cursor write, then compares. Pruning purely on
+        // the inventory let a tick during that await nil the token, so the
+        // comparison read "superseded", the early return skipped the teardown,
+        // and the card's document plus its slot in `splitOrder` stayed occupied
+        // until the next reconnect. In-flight subscribes and retained split
+        // documents outlive the inventory, so they keep their token alive.
         splitIntentTokens = SurfaceBookkeeping.pruned(
             splitIntentTokens,
             keeping: Set(sessions.map(\.id))
+                .union(pendingSplitSubscriptions.keys)
+                .union(splitDocuments.keys)
         )
     }
 
@@ -2409,14 +2419,27 @@ final class AppModel: ObservableObject {
     /// — it is that version's state, not damage — and the notice says so.
     private func raiseWorkspaceRestorationNotice(for error: Error) async {
         let kind = WorkspaceRestorationNotice.Kind(storeError: error)
-        var preservedCopyURL: URL?
+        var disposition = WorkspaceRestorationNotice.ArchiveDisposition.protectedInPlace
         if kind.allowsPreservingAside {
-            preservedCopyURL = try? await workspaceStateStore.preserveUnreadableArchive()
+            // Opening several windows at once puts every one of them through
+            // this path against the same damaged archive, and only the first
+            // finds anything left to move. "Nothing to preserve" is that race
+            // resolving in a sibling's favour, not a failed rescue: the bytes
+            // are safe and this window's saves are unblocked exactly as if it
+            // had done the move itself.
+            switch try? await workspaceStateStore.preserveUnreadableArchive() {
+            case .movedAside(let url):
+                disposition = .movedAside(url)
+            case .nothingToPreserve:
+                disposition = .alreadyPreservedByAnotherWindow
+            case nil:
+                disposition = .protectedInPlace
+            }
         }
         let notice = WorkspaceRestorationNotice(
             kind: kind,
             archiveURL: workspaceStateStore.archiveURL,
-            preservedCopyURL: preservedCopyURL
+            disposition: disposition
         ).continuing(workspaceRestorationNotice)
         workspaceRestorationNotice = notice
         ToastCenter.shared.show(notice.summary, style: .error, duration: 6)
@@ -2426,14 +2449,30 @@ final class AppModel: ObservableObject {
     /// success clears the notice and restores normally; a failure updates the
     /// same notice with the new reason and a higher retry count.
     func retryWorkspaceRestoration() async {
-        guard workspaceRestorationNotice != nil else { return }
+        guard let previous = workspaceRestorationNotice else { return }
         workspaceRestorationNotice?.beginRetry()
         await workspaceStateStore.invalidateCache()
         restoredWorkspaceState = false
         await restoreWorkspaceStateIfNeeded()
-        if workspaceRestorationNotice == nil {
-            ToastCenter.shared.show("Restored your saved workspace layout", style: .success)
+        guard workspaceRestorationNotice == nil else { return }
+        // A retry that lands on the empty archive written after the damaged one
+        // was moved aside restored nothing, and this toast is the only place
+        // that would say otherwise. A retry that found real state — the user
+        // repaired or replaced the file — genuinely did restore their layout.
+        let readEmptyArchive: Bool
+        if previous.kind == .corruptArchive,
+           !previous.savesBlocked,
+           let restored = try? await workspaceStateStore.restorationState() {
+            readEmptyArchive = restored.projects.isEmpty && restored.selectedProjectID == nil
+        } else {
+            readEmptyArchive = false
         }
+        ToastCenter.shared.show(
+            readEmptyArchive
+                ? "Started a fresh layout — your damaged copy is kept beside it"
+                : "Restored your saved workspace layout",
+            style: .success
+        )
     }
 
     /// Hide the banner without forgetting the problem: the compact indicator

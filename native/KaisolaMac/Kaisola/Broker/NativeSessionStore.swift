@@ -1122,9 +1122,24 @@ actor NativeWorkspaceStateStore {
         return formatter
     }()
 
+    /// The outcome of moving an unreadable archive aside.
+    ///
+    /// Both cases mean the same thing to the caller's *state*: the archive path
+    /// is clear, so the next save can land. They differ only in what the caller
+    /// can honestly say about it, which is why "nothing was there" is a named
+    /// success rather than a nil that reads like a failure.
+    enum ArchivePreservation: Equatable, Sendable {
+        /// This call moved the unreadable bytes to the given URL.
+        case movedAside(URL)
+        /// There was nothing on disk left to move. When several windows launch
+        /// against the same damaged archive they all reach this code, and every
+        /// window after the first finds the file already gone — preserved by a
+        /// sibling, not lost.
+        case nothingToPreserve
+    }
+
     /// Move an archive this build cannot decode aside so a fresh one can be
-    /// written. Returns where it was preserved, or nil when there was nothing
-    /// on disk to preserve.
+    /// written.
     ///
     /// This is an explicit app-level decision, never a side effect of reading:
     /// `loadArchive` must keep failing closed so an ordinary save can never
@@ -1132,10 +1147,10 @@ actor NativeWorkspaceStateStore {
     /// qualifies — a newer schema is good data this build must leave exactly
     /// where the newer version expects to find it.
     @discardableResult
-    func preserveUnreadableArchive(at date: Date = Date()) throws -> URL? {
+    func preserveUnreadableArchive(at date: Date = Date()) throws -> ArchivePreservation {
         guard fileManager.fileExists(atPath: fileURL.path) else {
             cachedArchive = nil
-            return nil
+            return .nothingToPreserve
         }
         let destination = Self.preservedCopyURL(
             for: fileURL,
@@ -1146,7 +1161,7 @@ actor NativeWorkspaceStateStore {
         // The next read finds no archive and starts an empty one, which is
         // only safe because the original bytes still exist beside it.
         cachedArchive = nil
-        return destination
+        return .movedAside(destination)
     }
 
     func restorationState() throws -> NativeWorkspaceRestorationState {

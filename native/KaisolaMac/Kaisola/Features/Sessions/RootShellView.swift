@@ -258,7 +258,6 @@ struct RootShellView: View {
                 .transition(.opacity)
             }
         }
-        .overlay { WorkspaceRestorationNoticeView(model: model) }
         .overlay { ToastOverlayView() }
         .confirmationDialog(
             "Close Mesh?",
@@ -381,6 +380,12 @@ struct RootShellView: View {
     private var detailArea: some View {
         VStack(spacing: 0) {
             detailChromeBar
+            // A degraded workspace archive usually means an empty detail pane,
+            // so this belongs in the layout rather than over it: covering the
+            // empty state's own actions is exactly the wrong trade.
+            WorkspaceRestorationNoticeView(model: model)
+                .padding(.horizontal, KaisolaVisualSystem.chromeInset + 4)
+                .padding(.bottom, 6)
             detailPane
                 .kaisolaChromePanel(topInset: 0)
         }

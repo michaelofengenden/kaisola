@@ -3,10 +3,13 @@ import SwiftUI
 /// The persistent, recoverable explanation for a workspace archive that could
 /// not be restored.
 ///
-/// Layered over the shell like the toast strip, but deliberately *not* a toast:
-/// the state it describes lasts for the whole session, so it has to still be
-/// findable minutes later. Closing the banner collapses it to a compact
-/// indicator rather than discarding it; only a successful restore removes it.
+/// Deliberately *not* a toast: the state it describes lasts for the whole
+/// session, so it has to still be findable minutes later. It also occupies real
+/// layout above the detail pane rather than floating over it, because the
+/// window it explains is usually empty and covering that empty state's own
+/// actions would be the wrong trade. Closing the banner collapses it to a
+/// compact indicator rather than discarding it; only a successful restore
+/// removes it.
 struct WorkspaceRestorationNoticeView: View {
     @ObservedObject var model: AppModel
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
@@ -14,19 +17,16 @@ struct WorkspaceRestorationNoticeView: View {
     var body: some View {
         Group {
             if let notice = model.workspaceRestorationNotice {
-                VStack(spacing: 0) {
+                Group {
                     if notice.isBannerDismissed {
                         collapsedIndicator(notice)
                             .frame(maxWidth: .infinity, alignment: .trailing)
                     } else {
                         banner(notice)
-                            .frame(maxWidth: 560)
+                            .frame(maxWidth: 620, alignment: .leading)
+                            .frame(maxWidth: .infinity, alignment: .leading)
                     }
-                    Spacer(minLength: 0)
                 }
-                .padding(.horizontal, 16)
-                .padding(.top, 12)
-                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
                 .transition(reduceMotion ? .opacity : .move(edge: .top).combined(with: .opacity))
             }
         }

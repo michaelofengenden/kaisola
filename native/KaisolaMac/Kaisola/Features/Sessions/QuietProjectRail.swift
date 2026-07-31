@@ -220,7 +220,24 @@ private struct QuietProjectGroup: View {
         .onHover { inside in
             withAnimation(.easeOut(duration: KaisolaVisualSystem.hoverDuration)) { hovering = inside }
         }
-        .contextMenu { projectMenu(project) }
+        .contextMenu {
+            projectMenu(project)
+            Divider()
+            // ⌥↑/⌥↓ target the active project only, so a menu opened on a
+            // non-active project's header never reorders the wrong row.
+            Button("Move Up") {
+                guard isActive else { return }
+                model.moveProject(id: project.id, delta: -1)
+            }
+            .keyboardShortcut(.upArrow, modifiers: .option)
+            .disabled(!isActive)
+            Button("Move Down") {
+                guard isActive else { return }
+                model.moveProject(id: project.id, delta: 1)
+            }
+            .keyboardShortcut(.downArrow, modifiers: .option)
+            .disabled(!isActive)
+        }
         .accessibilityElement(children: .contain)
         .accessibilityAction(named: Text(isExpanded ? "Collapse" : "Expand")) { toggle() }
         .onAppear {

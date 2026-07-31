@@ -1,27 +1,10 @@
 import AppKit
 import SwiftUI
-import UserNotifications
 
 extension Notification.Name {
     /// Bridges the in-workspace settings sheet to the delegate-owned Sparkle
     /// controller without coupling the SwiftUI shell to update infrastructure.
     static let kaisolaCheckForUpdates = Notification.Name("kaisolaCheckForUpdates")
-}
-
-enum NotificationAuthorizationState: Equatable, Sendable {
-    case unknown
-    case notDetermined
-    case allowed
-    case denied
-
-    init(_ status: UNAuthorizationStatus) {
-        switch status {
-        case .notDetermined: self = .notDetermined
-        case .denied: self = .denied
-        case .authorized, .provisional, .ephemeral: self = .allowed
-        @unknown default: self = .unknown
-        }
-    }
 }
 
 /// The native Settings window (⌘,): workspace, terminal, Companion, and tools.
@@ -541,18 +524,13 @@ struct SettingsView: View {
         }
     }
 
+    /// Always goes through `NotificationBridge`, never `UNUserNotificationCenter`
+    /// directly: the bridge owns the single guard that keeps unbundled, XCTest,
+    /// and headless visual-fixture processes from touching the notification
+    /// daemon at all. Mounting Settings must stay safe in every one of them.
     private func refreshNotificationAuthorization() {
-        guard Bundle.main.bundleIdentifier != nil,
-              !NotificationBridge.isRunningUnderXCTest else {
-            notificationAuthorization = .unknown
-            return
-        }
         Task {
-            let state = await withCheckedContinuation { continuation in
-                UNUserNotificationCenter.current().getNotificationSettings { settings in
-                    continuation.resume(returning: NotificationAuthorizationState(settings.authorizationStatus))
-                }
-            }
+            let state = await NotificationBridge.shared.authorizationState()
             guard !Task.isCancelled else { return }
             notificationAuthorization = state
         }

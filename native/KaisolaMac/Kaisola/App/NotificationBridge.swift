@@ -9,6 +9,26 @@ extension Notification.Name {
     static let kaisolaAttentionJump = Notification.Name("kaisolaAttentionJump")
 }
 
+/// Whether macOS will actually deliver Kaisola's notifications. Lives beside the
+/// bridge rather than in the Settings view because resolving it requires the
+/// guarded `UNUserNotificationCenter` chokepoint below — no other file may reach
+/// UserNotifications directly (see `NotificationBridgeBoundaryTests`).
+enum NotificationAuthorizationState: Equatable, Sendable {
+    case unknown
+    case notDetermined
+    case allowed
+    case denied
+
+    init(_ status: UNAuthorizationStatus) {
+        switch status {
+        case .notDetermined: self = .notDetermined
+        case .denied: self = .denied
+        case .authorized, .provisional, .ephemeral: self = .allowed
+        @unknown default: self = .unknown
+        }
+    }
+}
+
 /// Bridges the needs-you inbox to macOS UserNotifications. When a background
 /// event lands (permission ask, finished turn, agent response) while Kaisola is
 /// not the frontmost app, it posts a system notification; clicking that
@@ -98,14 +118,43 @@ final class NotificationBridge: NSObject, UNUserNotificationCenterDelegate {
             || ProcessInfo.processInfo.environment["XCTestBundlePath"] != nil
             || NSClassFromString("XCTestCase") != nil
 
-    /// The notification center, resolved lazily and only when the process is
-    /// bundled and not a test host. `UNUserNotificationCenter.current()` traps in
-    /// an unbundled process and is headless-hostile under XCTest, so both are
-    /// gated here — the one chokepoint every notification path funnels through.
+    /// True in the visual-QA fixture process. The fixture is a packaged, signed
+    /// app — so the bundle-id and XCTest gates above both pass — but it runs on a
+    /// headless CI runner with no notification session, where the very first
+    /// `UNUserNotificationCenter.current()` traps the process (EXC_BREAKPOINT,
+    /// exit 133) with no Swift-level message. `applicationDidFinishLaunching`
+    /// already refuses to arm notifications under this flag; resolving it here
+    /// keeps that invariant true for every other caller too.
+    static let isRunningVisualFixture =
+        ProcessInfo.processInfo.environment["KAISOLA_NATIVE_VISUAL_FIXTURE"] == "1"
+
+    /// The notification center, resolved lazily and only in a process that may
+    /// actually talk to the notification daemon. `UNUserNotificationCenter
+    /// .current()` traps in an unbundled process and is headless-hostile under
+    /// both XCTest and the visual fixture, so all three are gated here — the one
+    /// chokepoint every notification path funnels through.
     private lazy var center: UNUserNotificationCenter? = {
-        guard Bundle.main.bundleIdentifier != nil, !Self.isRunningUnderXCTest else { return nil }
+        guard Bundle.main.bundleIdentifier != nil,
+              !Self.isRunningUnderXCTest,
+              !Self.isRunningVisualFixture else { return nil }
         return UNUserNotificationCenter.current()
     }()
+
+    /// Whether macOS will deliver notifications, resolved through the chokepoint.
+    /// Returns `.unknown` — never touching UserNotifications — in any process the
+    /// gate above excludes, so a Settings window can render in the visual fixture
+    /// and the test host without reaching the notification daemon.
+    func authorizationState() async -> NotificationAuthorizationState {
+        guard let center else { return .unknown }
+        return await withCheckedContinuation { continuation in
+            // The completion MUST stay non-isolated: UserNotifications invokes it
+            // on a background queue. It only captures the Sendable continuation,
+            // so nothing main-actor crosses the boundary.
+            center.getNotificationSettings { settings in
+                continuation.resume(returning: NotificationAuthorizationState(settings.authorizationStatus))
+            }
+        }
+    }
 
     // MARK: - Authorization
 

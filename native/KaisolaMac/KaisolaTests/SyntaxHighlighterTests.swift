@@ -1,3 +1,4 @@
+import AppKit
 import SwiftUI
 import XCTest
 @testable import Kaisola
@@ -125,6 +126,87 @@ final class SyntaxHighlighterTests: XCTestCase {
                     XCTAssertEqual(String(attributed.characters), input)
                 }
             }
+        }
+    }
+
+    // MARK: - AppKit adapter (TextKit 2 read mode)
+
+    private func foregroundColor(
+        _ source: NSAttributedString,
+        at index: Int
+    ) throws -> NSColor {
+        try XCTUnwrap(
+            source.attribute(.foregroundColor, at: index, effectiveRange: nil) as? NSColor
+        )
+    }
+
+    func testAttributedSourceColorsTokensAndLeavesPlainTextInLabelColor() throws {
+        let swift = "let x = 42 // note"
+        let source = SyntaxHighlighter.attributedSource(swift, language: .swift, dark: true).value
+
+        XCTAssertEqual(source.string, swift)
+        let keyword = try foregroundColor(source, at: 0)                       // `let`
+        let comment = try foregroundColor(source, at: (swift as NSString).range(of: "//").location)
+        let plain = try foregroundColor(source, at: (swift as NSString).range(of: "x").location)
+
+        XCTAssertEqual(keyword, SyntaxHighlighter.nsColor(for: .keyword, dark: true))
+        XCTAssertEqual(comment, SyntaxHighlighter.nsColor(for: .comment, dark: true))
+        // Uncolored source keeps the system label color, so the reader tracks
+        // the appearance without a second highlight pass.
+        XCTAssertEqual(plain, NSColor.labelColor)
+    }
+
+    func testAttributedSourceUsesTheRequestedAppearancePalette() {
+        let dark = SyntaxHighlighter.attributedSource("let x = 1", language: .swift, dark: true).value
+        let light = SyntaxHighlighter.attributedSource("let x = 1", language: .swift, dark: false).value
+
+        XCTAssertNotEqual(
+            dark.attribute(.foregroundColor, at: 0, effectiveRange: nil) as? NSColor,
+            light.attribute(.foregroundColor, at: 0, effectiveRange: nil) as? NSColor
+        )
+    }
+
+    func testAttributedSourceCarriesNoFontSoZoomNeverRequiresAReHighlight() {
+        let source = SyntaxHighlighter.attributedSource("let x = 1", language: .swift, dark: true).value
+        XCTAssertNil(source.attribute(.font, at: 0, effectiveRange: nil))
+    }
+
+    func testAttributedSourceWithoutALanguageIsUniformlyPlain() throws {
+        let text = "func not really source\n"
+        let source = SyntaxHighlighter.attributedSource(text, language: nil, dark: true).value
+
+        XCTAssertEqual(source.string, text)
+        var effective = NSRange(location: 0, length: 0)
+        XCTAssertEqual(
+            source.attribute(.foregroundColor, at: 0, effectiveRange: &effective) as? NSColor,
+            NSColor.labelColor
+        )
+        XCTAssertEqual(effective, NSRange(location: 0, length: source.length))
+    }
+
+    func testAttributedSourceLeavesOversizedInputPlain() throws {
+        let big = String(repeating: "func x = 1\n", count: 25_000)
+        XCTAssertGreaterThan(big.count, SyntaxHighlighter.maxLength)
+
+        let source = SyntaxHighlighter.attributedSource(big, language: .swift, dark: true).value
+        var effective = NSRange(location: 0, length: 0)
+        _ = source.attribute(.foregroundColor, at: 0, effectiveRange: &effective)
+        XCTAssertEqual(effective, NSRange(location: 0, length: source.length))
+    }
+
+    func testSpansAreSharedByBothRenderingPaths() {
+        let swift = "let x = 42 // note"
+        let spans = SyntaxHighlighter.spans(in: swift, language: .swift)
+
+        XCTAssertTrue(spans.contains { $0.role == .keyword })
+        XCTAssertTrue(spans.contains { $0.role == .comment })
+        XCTAssertTrue(spans.contains { $0.role == .number })
+        // Every span addresses the source by UTF-16 offset, so it can be applied
+        // to an AttributedString or an AppKit text storage unchanged.
+        let length = (swift as NSString).length
+        for span in spans {
+            XCTAssertGreaterThanOrEqual(span.range.location, 0)
+            XCTAssertLessThanOrEqual(NSMaxRange(span.range), length)
         }
     }
 }

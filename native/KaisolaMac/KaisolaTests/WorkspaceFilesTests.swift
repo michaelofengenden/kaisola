@@ -1519,6 +1519,63 @@ final class WorkspaceFilesTests: XCTestCase {
         XCTAssertEqual(cache.parseCount, 2)
     }
 
+    // MARK: - Read/edit scroll retention
+
+    func testTextScrollMemoryRoundTripsTheTopCharacterOffset() {
+        let memory = FilePreviewTextScrollMemory()
+        memory.record(1_280, for: "/tmp/a.swift")
+
+        XCTAssertEqual(memory.characterIndex(for: "/tmp/a.swift", textLength: 4_000), 1_280)
+        // A document that was never scrolled must not fake an offset, so the
+        // reader and the editor both open at the natural top.
+        XCTAssertNil(memory.characterIndex(for: "/tmp/b.swift", textLength: 4_000))
+    }
+
+    func testTextScrollMemoryClampsAnOffsetPastTheCurrentDocumentLength() {
+        let memory = FilePreviewTextScrollMemory()
+        memory.record(9_000, for: "/tmp/a.swift")
+
+        // The file shrank (an agent rewrote it, or the draft was reverted); the
+        // remembered offset clamps instead of scrolling past the end.
+        XCTAssertEqual(memory.characterIndex(for: "/tmp/a.swift", textLength: 120), 120)
+        XCTAssertEqual(memory.characterIndex(for: "/tmp/a.swift", textLength: 0), 0)
+        memory.record(-5, for: "/tmp/a.swift")
+        XCTAssertEqual(memory.characterIndex(for: "/tmp/a.swift", textLength: 120), 0)
+    }
+
+    func testTextScrollMemoryForgetsAndStaysBounded() {
+        let memory = FilePreviewTextScrollMemory()
+        memory.record(10, for: "/tmp/a.swift")
+        memory.forget("/tmp/a.swift")
+        XCTAssertNil(memory.characterIndex(for: "/tmp/a.swift", textLength: 4_000))
+
+        for index in 0..<(FilePreviewTextScrollMemory.capacity + 12) {
+            memory.record(index + 1, for: "/tmp/file\(index).swift")
+        }
+        XCTAssertEqual(memory.trackedDocumentCount, FilePreviewTextScrollMemory.capacity)
+        // Oldest entries are evicted; the newest document survives.
+        XCTAssertNil(memory.characterIndex(for: "/tmp/file0.swift", textLength: 4_000))
+        let newest = FilePreviewTextScrollMemory.capacity + 11
+        XCTAssertEqual(
+            memory.characterIndex(for: "/tmp/file\(newest).swift", textLength: 4_000),
+            newest + 1
+        )
+    }
+
+    func testTextScrollMemoryRefreshesRecencyOnEveryRecord() {
+        let memory = FilePreviewTextScrollMemory()
+        for index in 0..<FilePreviewTextScrollMemory.capacity {
+            memory.record(index + 1, for: "/tmp/file\(index).swift")
+        }
+        // Re-recording the oldest document makes it the newest, so filling the
+        // remaining slot evicts the *second* document instead of it.
+        memory.record(99, for: "/tmp/file0.swift")
+        memory.record(1, for: "/tmp/overflow.swift")
+
+        XCTAssertEqual(memory.characterIndex(for: "/tmp/file0.swift", textLength: 4_000), 99)
+        XCTAssertNil(memory.characterIndex(for: "/tmp/file1.swift", textLength: 4_000))
+    }
+
     func testLargeMarkdownStructuralProjectionStaysWithinInteractionBudget() {
         let sectionCount = 1_600
         let source = (0..<sectionCount).map { index in

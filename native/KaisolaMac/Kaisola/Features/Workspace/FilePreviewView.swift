@@ -1575,8 +1575,12 @@ struct FilePreviewView: View {
     /// view; this toggle drops into the plain `TextEditor` for editing.
     @State private var isEditingText = false
     /// Cached highlighted rendering of `draft`, recomputed only when the source,
-    /// language, or appearance changes (never on every keystroke).
-    @State private var highlighted = AttributedString("")
+    /// language, or appearance changes (never on every keystroke, and never on
+    /// a zoom step — the reader owns the font).
+    @State private var highlightedSource = AttributedSource(value: NSAttributedString())
+    /// Shared by the reader and the editor so the read/edit toggle keeps the
+    /// same line at the top of the viewport.
+    @State private var textScrollMemory = FilePreviewTextScrollMemory()
     @State private var saveError: String?
     /// The URL that produced the currently rendered draft. It deliberately
     /// stays unchanged while another URL loads, so Save can never target the
@@ -2136,15 +2140,12 @@ struct FilePreviewView: View {
             if isEditingText {
                 editor
             } else {
-                ScrollView {
-                    Text(highlighted)
-                        .font(.system(size: 13 * documentZoom, design: .monospaced))
-                        .textSelection(.enabled)
-                        .lineSpacing(2)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .padding(16)
-                }
-                .scrollBounceBehavior(.basedOnSize)
+                SourceTextReader(
+                    source: highlightedSource.value,
+                    fontSize: 13 * documentZoom,
+                    documentID: (loadedURL ?? url).path,
+                    scrollMemory: textScrollMemory
+                )
             }
         case .markdown:
             if showMarkdownSource {
@@ -2253,7 +2254,8 @@ struct FilePreviewView: View {
             workspaceRoot: workspaceRoot,
             onError: { saveError = $0 },
             magnification: editableMarkdownURL == nil ? nil : documentZoom,
-            onMagnificationChanged: editableMarkdownURL == nil ? nil : { documentZoom = $0 }
+            onMagnificationChanged: editableMarkdownURL == nil ? nil : { documentZoom = $0 },
+            scrollMemory: textScrollMemory
         )
     }
 
@@ -2436,29 +2438,31 @@ struct FilePreviewView: View {
         }
     }
 
-    /// Rebuild the syntax-highlighted rendering of `draft` for the current file
-    /// and appearance. Non-highlightable extensions (and non-text content) fall
-    /// back to a plain monospaced rendering. Pure and cheap — the highlighter
-    /// caps and degrades on its own.
+    /// Rebuild the read-mode rendering of `draft` for the current file and
+    /// appearance. Non-highlightable extensions (and non-text content) fall back
+    /// to plain, label-colored text. The result carries no font, so a zoom step
+    /// never triggers a re-highlight.
     private func refreshHighlight() {
         highlightTask?.cancel()
-        guard case .text = content else {
-            highlighted = AttributedString(draft)
-            return
-        }
-        let ext = (loadedURL ?? url).pathExtension
-        guard let language = SyntaxHighlighter.language(forExtension: ext) else {
-            highlighted = AttributedString(draft)
-            return
-        }
-        let theme: SyntaxHighlighter.Theme = colorScheme == .dark ? .dark : .light
+        guard case .text = content else { return }
+        let language = SyntaxHighlighter.language(
+            forExtension: (loadedURL ?? url).pathExtension
+        )
+        let dark = colorScheme == .dark
         let source = draft
+        // Publish the correct *text* immediately; color follows from the
+        // background pass. Without this, returning from an edit would briefly
+        // render the pre-edit snapshot.
+        if highlightedSource.value.string != source {
+            highlightedSource = SyntaxHighlighter.attributedSource(source, language: nil, dark: dark)
+        }
+        guard language != nil else { return }
         highlightTask = Task {
-            let result = await Task.detached(priority: .utility) {
-                SyntaxHighlighter.highlight(source, language: language, theme: theme)
+            let rendered = await Task.detached(priority: .utility) {
+                SyntaxHighlighter.attributedSource(source, language: language, dark: dark)
             }.value
             guard !Task.isCancelled, source == draft else { return }
-            highlighted = result
+            highlightedSource = rendered
         }
     }
 
@@ -3079,6 +3083,259 @@ enum FileLineNavigation {
     }
 }
 
+/// Remembers where each document was last scrolled to, as the character offset
+/// at the top of the viewport.
+///
+/// Read mode and the editor are two different text views laying the same file
+/// out with different machinery, so a raw pixel offset does not survive the
+/// toggle — a character offset does. Without this, every switch between reading
+/// and editing threw the reader back to line 1, which is the whole reason the
+/// toggle felt destructive on a long file.
+///
+/// Bounded so a long session cannot accumulate one entry per file ever opened.
+final class FilePreviewTextScrollMemory {
+    static let capacity = 32
+
+    private var offsets: [String: Int] = [:]
+    /// Least-recently recorded first.
+    private var recency: [String] = []
+
+    var trackedDocumentCount: Int { offsets.count }
+
+    func record(_ characterIndex: Int, for documentID: String) {
+        guard !documentID.isEmpty else { return }
+        offsets[documentID] = max(0, characterIndex)
+        recency.removeAll { $0 == documentID }
+        recency.append(documentID)
+        while recency.count > Self.capacity {
+            offsets[recency.removeFirst()] = nil
+        }
+    }
+
+    /// The remembered offset, clamped into `textLength`. `nil` when the document
+    /// was never scrolled, so the surface opens at its natural top instead of
+    /// pretending to restore something.
+    func characterIndex(for documentID: String, textLength: Int) -> Int? {
+        guard let stored = offsets[documentID] else { return nil }
+        return min(max(0, stored), max(0, textLength))
+    }
+
+    func forget(_ documentID: String) {
+        offsets[documentID] = nil
+        recency.removeAll { $0 == documentID }
+    }
+}
+
+/// Top-of-viewport measurement and restoration, shared by the preview's two
+/// text surfaces so they agree on what "the same place" means.
+@MainActor
+enum FilePreviewTextScroll {
+    /// The character offset nearest the top-left of the viewport.
+    static func topCharacterIndex(in textView: NSTextView, scrollView: NSScrollView) -> Int {
+        let visible = scrollView.contentView.documentVisibleRect
+        guard visible.height > 0 else { return 0 }
+        let origin = textView.textContainerOrigin
+        return textView.characterIndexForInsertion(
+            at: NSPoint(x: origin.x + 1, y: visible.minY + origin.y + 1)
+        )
+    }
+
+    /// Put `characterIndex` at the top of the viewport, clamped to the document
+    /// and to the scrollable range.
+    static func scrollToTop(characterIndex: Int, in textView: NSTextView, scrollView: NSScrollView) {
+        let clamped = min(max(0, characterIndex), (textView.string as NSString).length)
+        guard clamped > 0 else {
+            scrollView.contentView.scroll(to: NSPoint(x: 0, y: 0))
+            scrollView.reflectScrolledClipView(scrollView.contentView)
+            return
+        }
+        // A viewport layout manager has nothing to measure until the range has
+        // been visited, so ask for the range first and read its frame after.
+        textView.scrollRangeToVisible(NSRange(location: clamped, length: 0))
+        guard let rect = lineRect(for: clamped, in: textView) else { return }
+        let maxY = max(0, textView.bounds.height - scrollView.contentView.bounds.height)
+        scrollView.contentView.scroll(to: NSPoint(x: 0, y: min(max(0, rect.minY), maxY)))
+        scrollView.reflectScrolledClipView(scrollView.contentView)
+    }
+
+    /// The laid-out frame of the line containing `characterIndex`, in the text
+    /// view's coordinates. TextKit 2 first, then the TextKit 1 fallback for the
+    /// editor surfaces that still use it; `nil` when layout is not available yet
+    /// (the caller then keeps whatever `scrollRangeToVisible` produced).
+    private static func lineRect(for characterIndex: Int, in textView: NSTextView) -> NSRect? {
+        let origin = textView.textContainerOrigin
+        if let layoutManager = textView.textLayoutManager,
+           let contentManager = layoutManager.textContentManager,
+           let location = contentManager.location(
+               contentManager.documentRange.location,
+               offsetBy: characterIndex
+           ),
+           let fragment = layoutManager.textLayoutFragment(for: location) {
+            return fragment.layoutFragmentFrame.offsetBy(dx: origin.x, dy: origin.y)
+        }
+        guard let layoutManager = textView.layoutManager,
+              let container = textView.textContainer else { return nil }
+        let glyphRange = layoutManager.glyphRange(
+            forCharacterRange: NSRange(location: characterIndex, length: 0),
+            actualCharacterRange: nil
+        )
+        return layoutManager
+            .boundingRect(forGlyphRange: glyphRange, in: container)
+            .offsetBy(dx: origin.x, dy: origin.y)
+    }
+}
+
+/// Read-only source text on TextKit 2.
+///
+/// Read mode used to render the whole file as a single SwiftUI `Text`, which
+/// laid out and drew every line up front and beach-balled as files approached
+/// the 1 MiB preview ceiling. `NSTextLayoutManager` lays out only the visible
+/// viewport, so opening a large file costs what is on screen rather than what is
+/// in the file. The surface keeps native selection and copy, turns on the
+/// standard find bar so Command-F works while reading, and shares its
+/// top-of-viewport offset with the editor so the mode toggle stays put.
+private struct SourceTextReader: NSViewRepresentable {
+    let source: NSAttributedString
+    let fontSize: CGFloat
+    let documentID: String
+    let scrollMemory: FilePreviewTextScrollMemory
+
+    func makeCoordinator() -> Coordinator { Coordinator(scrollMemory: scrollMemory) }
+
+    func makeNSView(context: Context) -> NSScrollView {
+        let scrollView = NSScrollView()
+        scrollView.hasVerticalScroller = true
+        scrollView.hasHorizontalScroller = true
+        scrollView.autohidesScrollers = true
+        scrollView.drawsBackground = true
+        scrollView.backgroundColor = .textBackgroundColor
+
+        // Constructing with `frame:` silently selects TextKit 1; this is the
+        // explicit opt-in that makes layout viewport-sized.
+        let textView = NSTextView(usingTextLayoutManager: true)
+        textView.isEditable = false
+        textView.isSelectable = true
+        textView.usesFindBar = true
+        textView.isIncrementalSearchingEnabled = true
+        textView.isVerticallyResizable = true
+        textView.isHorizontallyResizable = true
+        textView.autoresizingMask = [.width]
+        textView.minSize = NSSize(width: 0, height: 0)
+        textView.maxSize = NSSize(
+            width: CGFloat.greatestFiniteMagnitude,
+            height: CGFloat.greatestFiniteMagnitude
+        )
+        textView.textContainer?.containerSize = NSSize(
+            width: CGFloat.greatestFiniteMagnitude,
+            height: CGFloat.greatestFiniteMagnitude
+        )
+        textView.textContainer?.widthTracksTextView = false
+        textView.textContainer?.lineFragmentPadding = 0
+        textView.textContainerInset = NSSize(width: 12, height: 12)
+        textView.backgroundColor = .textBackgroundColor
+        textView.setAccessibilityLabel("File contents")
+
+        scrollView.documentView = textView
+        context.coordinator.attach(textView: textView, scrollView: scrollView)
+        context.coordinator.apply(source: source, fontSize: fontSize, documentID: documentID)
+        return scrollView
+    }
+
+    func updateNSView(_ scrollView: NSScrollView, context: Context) {
+        context.coordinator.apply(source: source, fontSize: fontSize, documentID: documentID)
+    }
+
+    static func dismantleNSView(_ scrollView: NSScrollView, coordinator: Coordinator) {
+        coordinator.recordScrollPosition()
+    }
+
+    @MainActor
+    final class Coordinator: NSObject {
+        private let scrollMemory: FilePreviewTextScrollMemory
+        private weak var textView: NSTextView?
+        private weak var scrollView: NSScrollView?
+        private var appliedSource: NSAttributedString?
+        private var appliedFontSize: CGFloat?
+        private var documentID = ""
+        /// Suppresses recording until the restore for the current document has
+        /// run; the layout passes before it would otherwise overwrite the
+        /// remembered offset with zero.
+        private var pendingRestore = true
+
+        init(scrollMemory: FilePreviewTextScrollMemory) {
+            self.scrollMemory = scrollMemory
+        }
+
+        func attach(textView: NSTextView, scrollView: NSScrollView) {
+            self.textView = textView
+            self.scrollView = scrollView
+            scrollView.contentView.postsBoundsChangedNotifications = true
+            // Selector-based registration is zeroing-weak, so no explicit
+            // removal is needed when the coordinator goes away.
+            NotificationCenter.default.addObserver(
+                self,
+                selector: #selector(viewportDidScroll),
+                name: NSView.boundsDidChangeNotification,
+                object: scrollView.contentView
+            )
+        }
+
+        @objc private func viewportDidScroll() {
+            recordScrollPosition()
+        }
+
+        func apply(source: NSAttributedString, fontSize: CGFloat, documentID: String) {
+            guard let textView, let storage = textView.textStorage else { return }
+            if self.documentID != documentID {
+                recordScrollPosition()
+                self.documentID = documentID
+                pendingRestore = true
+            }
+            // Identity, not equality: the highlighter publishes a fresh
+            // immutable string only when the source, language, or appearance
+            // actually changed, so a hover-driven body evaluation costs one
+            // pointer comparison instead of a full re-install.
+            if appliedSource !== source {
+                appliedSource = source
+                storage.setAttributedString(source)
+                // Storage replacement drops the font applied over the old text.
+                appliedFontSize = nil
+                pendingRestore = true
+            }
+            if appliedFontSize != fontSize {
+                appliedFontSize = fontSize
+                textView.font = .monospacedSystemFont(ofSize: fontSize, weight: .regular)
+            }
+            guard pendingRestore else { return }
+            // The view has no useful geometry during `makeNSView`; restore once
+            // AppKit has sized it.
+            DispatchQueue.main.async { [weak self] in self?.restoreScrollPosition() }
+        }
+
+        func recordScrollPosition() {
+            guard !pendingRestore, let textView, let scrollView else { return }
+            scrollMemory.record(
+                FilePreviewTextScroll.topCharacterIndex(in: textView, scrollView: scrollView),
+                for: documentID
+            )
+        }
+
+        private func restoreScrollPosition() {
+            guard pendingRestore, let textView, let scrollView else { return }
+            pendingRestore = false
+            guard let index = scrollMemory.characterIndex(
+                for: documentID,
+                textLength: (textView.string as NSString).length
+            ), index > 0 else { return }
+            FilePreviewTextScroll.scrollToTop(
+                characterIndex: index,
+                in: textView,
+                scrollView: scrollView
+            )
+        }
+    }
+}
+
 private struct LineTargetTextEditor: NSViewRepresentable {
     @Binding var text: String
     let fontSize: CGFloat
@@ -3090,6 +3347,9 @@ private struct LineTargetTextEditor: NSViewRepresentable {
     var autoFocus = false
     var magnification: CGFloat? = nil
     var onMagnificationChanged: ((CGFloat) -> Void)? = nil
+    /// Shared with the read-only reader so toggling modes keeps the same line
+    /// at the top. `nil` for surfaces that do not participate.
+    var scrollMemory: FilePreviewTextScrollMemory? = nil
 
     func makeCoordinator() -> Coordinator { Coordinator(text: $text) }
 
@@ -3166,6 +3426,14 @@ private struct LineTargetTextEditor: NSViewRepresentable {
         context.coordinator.markdownURL = markdownURL
         context.coordinator.workspaceRoot = workspaceRoot
         context.coordinator.onError = onError
+        context.coordinator.attachScrollRetention(
+            memory: scrollMemory,
+            scrollView: scrollView,
+            documentID: documentID,
+            // An explicit `path:line` target owns the initial position; the
+            // remembered offset must not fight it.
+            hasLineTarget: targetLine != nil
+        )
         context.coordinator.scrollIfNeeded(to: targetLine, documentID: documentID)
         if autoFocus {
             DispatchQueue.main.async { [weak textView] in
@@ -3203,7 +3471,17 @@ private struct LineTargetTextEditor: NSViewRepresentable {
             }
             markdownScrollView.reflowDocumentWidth()
         }
+        context.coordinator.attachScrollRetention(
+            memory: scrollMemory,
+            scrollView: scrollView,
+            documentID: documentID,
+            hasLineTarget: targetLine != nil
+        )
         context.coordinator.scrollIfNeeded(to: targetLine, documentID: documentID)
+    }
+
+    static func dismantleNSView(_ scrollView: NSScrollView, coordinator: Coordinator) {
+        coordinator.recordScrollPosition()
     }
 
     @MainActor
@@ -3216,6 +3494,10 @@ private struct LineTargetTextEditor: NSViewRepresentable {
         var isApplyingExternalValue = false
         private var lastScrollKey: String?
         private var importTask: Task<Void, Never>?
+        private var scrollMemory: FilePreviewTextScrollMemory?
+        private weak var scrollView: NSScrollView?
+        private var scrollDocumentID = ""
+        private var pendingRestore = false
 
         init(text: Binding<String>) { _text = text }
 
@@ -3225,6 +3507,69 @@ private struct LineTargetTextEditor: NSViewRepresentable {
             guard !isApplyingExternalValue,
                   let textView = notification.object as? NSTextView else { return }
             text = textView.string
+        }
+
+        /// Join the shared top-of-viewport retention. Idempotent: `updateNSView`
+        /// calls this on every body evaluation, and only a document change (or
+        /// the first attach) re-arms a restore.
+        func attachScrollRetention(
+            memory: FilePreviewTextScrollMemory?,
+            scrollView: NSScrollView,
+            documentID: String,
+            hasLineTarget: Bool
+        ) {
+            guard let memory else { return }
+            let isFirstAttach = scrollMemory == nil
+            if !isFirstAttach, scrollDocumentID == documentID { return }
+            if !isFirstAttach { recordScrollPosition() }
+            scrollMemory = memory
+            self.scrollView = scrollView
+            scrollDocumentID = documentID
+            pendingRestore = true
+            if isFirstAttach {
+                scrollView.contentView.postsBoundsChangedNotifications = true
+                // Selector-based registration is zeroing-weak, so no explicit
+                // removal is needed when the coordinator goes away.
+                NotificationCenter.default.addObserver(
+                    self,
+                    selector: #selector(viewportDidScroll),
+                    name: NSView.boundsDidChangeNotification,
+                    object: scrollView.contentView
+                )
+            }
+            guard !hasLineTarget else {
+                // The line target places the caret itself; just stop suppressing
+                // recording so the user's own scrolling is remembered.
+                DispatchQueue.main.async { [weak self] in self?.pendingRestore = false }
+                return
+            }
+            DispatchQueue.main.async { [weak self] in self?.restoreScrollPosition() }
+        }
+
+        @objc private func viewportDidScroll() {
+            recordScrollPosition()
+        }
+
+        func recordScrollPosition() {
+            guard !pendingRestore, let scrollMemory, let textView, let scrollView else { return }
+            scrollMemory.record(
+                FilePreviewTextScroll.topCharacterIndex(in: textView, scrollView: scrollView),
+                for: scrollDocumentID
+            )
+        }
+
+        private func restoreScrollPosition() {
+            guard pendingRestore, let scrollMemory, let textView, let scrollView else { return }
+            pendingRestore = false
+            guard let index = scrollMemory.characterIndex(
+                for: scrollDocumentID,
+                textLength: (textView.string as NSString).length
+            ), index > 0 else { return }
+            FilePreviewTextScroll.scrollToTop(
+                characterIndex: index,
+                in: textView,
+                scrollView: scrollView
+            )
         }
 
         func scrollIfNeeded(to oneBasedLine: Int?, documentID: String) {

@@ -2242,7 +2242,12 @@ final class AppModel: ObservableObject {
         }
     }
 
-    private func restoreWorkspaceStateIfNeeded() async {
+    /// The degraded-state explanation for a workspace archive this build could
+    /// not restore. Durable for the window's lifetime: it clears only when a
+    /// restore actually succeeds, never merely because the banner was closed.
+    @Published private(set) var workspaceRestorationNotice: WorkspaceRestorationNotice?
+
+    func restoreWorkspaceStateIfNeeded() async {
         guard !restoredWorkspaceState else { return }
         restoredWorkspaceState = true
         isRestoringWorkspaceState = true
@@ -2250,7 +2255,14 @@ final class AppModel: ObservableObject {
         workspaceSaveTasks.removeAll()
         defer { isRestoringWorkspaceState = false }
 
-        guard let restoration = try? await workspaceStateStore.restorationState() else { return }
+        let restoration: NativeWorkspaceRestorationState
+        do {
+            restoration = try await workspaceStateStore.restorationState()
+            workspaceRestorationNotice = nil
+        } catch {
+            await raiseWorkspaceRestorationNotice(for: error)
+            return
+        }
         for projectState in restoration.projects {
             for pane in projectState.panes {
                 guard let descriptor = pane.surface.agentChatDescriptor,
@@ -2385,6 +2397,58 @@ final class AppModel: ObservableObject {
             }
             restoreSelectedFilePreview(for: projectID)
         }
+    }
+
+    /// Turn a fail-closed restoration error into something the user can see and
+    /// act on.
+    ///
+    /// Undecodable bytes are moved aside first, because that is what makes the
+    /// rest of the session work: without it every subsequent save throws
+    /// against the same protected file and the window silently stops
+    /// persisting. An archive from a newer Kaisola is left exactly where it is
+    /// — it is that version's state, not damage — and the notice says so.
+    private func raiseWorkspaceRestorationNotice(for error: Error) async {
+        let kind = WorkspaceRestorationNotice.Kind(storeError: error)
+        var preservedCopyURL: URL?
+        if kind.allowsPreservingAside {
+            preservedCopyURL = try? await workspaceStateStore.preserveUnreadableArchive()
+        }
+        let notice = WorkspaceRestorationNotice(
+            kind: kind,
+            archiveURL: workspaceStateStore.archiveURL,
+            preservedCopyURL: preservedCopyURL
+        ).continuing(workspaceRestorationNotice)
+        workspaceRestorationNotice = notice
+        ToastCenter.shared.show(notice.summary, style: .error, duration: 6)
+    }
+
+    /// Read the archive again after the user has repaired or replaced it. A
+    /// success clears the notice and restores normally; a failure updates the
+    /// same notice with the new reason and a higher retry count.
+    func retryWorkspaceRestoration() async {
+        guard workspaceRestorationNotice != nil else { return }
+        workspaceRestorationNotice?.beginRetry()
+        await workspaceStateStore.invalidateCache()
+        restoredWorkspaceState = false
+        await restoreWorkspaceStateIfNeeded()
+        if workspaceRestorationNotice == nil {
+            ToastCenter.shared.show("Restored your saved workspace layout", style: .success)
+        }
+    }
+
+    /// Hide the banner without forgetting the problem: the compact indicator
+    /// stays until a restore succeeds.
+    func dismissWorkspaceRestorationBanner() {
+        workspaceRestorationNotice?.dismissBanner()
+    }
+
+    func presentWorkspaceRestorationBanner() {
+        workspaceRestorationNotice?.presentBanner()
+    }
+
+    func revealWorkspaceRestorationArchive() {
+        guard let url = workspaceRestorationNotice?.revealURL else { return }
+        NSWorkspace.shared.activateFileViewerSelecting([url])
     }
 
     private func restoreFileTabs(from state: NativeProjectWorkspaceState) {

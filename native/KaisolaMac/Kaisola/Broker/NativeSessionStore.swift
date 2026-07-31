@@ -499,7 +499,138 @@ struct NativeSessionStore: Sendable {
             }
         } catch {
             try? FileManager.default.removeItem(at: temporary)
+            // The cache above already accepted this payload, so the live app
+            // stays coherent — but the durable copy is gone. Left unsaid, a
+            // full or read-only volume looks like nothing at all until the next
+            // launch quietly reverts every session the user created.
+            SessionStoreWriteFailureMonitor.shared.record(
+                SessionStoreWriteFailure(path: fileURL.path, error: error)
+            )
         }
+    }
+}
+
+/// A session-store write that reached the in-memory cache but not the disk.
+struct SessionStoreWriteFailure: Equatable, Sendable {
+    let path: String
+    let reason: String
+
+    init(path: String, reason: String) {
+        self.path = path
+        self.reason = reason
+    }
+
+    init(path: String, error: Error) {
+        self.init(path: path, reason: Self.reason(for: error))
+    }
+
+    /// One sentence naming the problem and the thing the user can change.
+    var message: String {
+        "Couldn't save session state to disk. \(reason)"
+    }
+
+    private static func reason(for error: Error) -> String {
+        let cocoa = error as NSError
+        let posix = cocoa.userInfo[NSUnderlyingErrorKey] as? NSError ?? cocoa
+        switch (posix.domain, Int32(posix.code)) {
+        case (NSPOSIXErrorDomain, ENOSPC), (NSCocoaErrorDomain, Int32(NSFileWriteOutOfSpaceError)):
+            return "The disk is full."
+        case (NSPOSIXErrorDomain, EACCES), (NSPOSIXErrorDomain, EPERM),
+             (NSCocoaErrorDomain, Int32(NSFileWriteNoPermissionError)):
+            return "The disk is not writable by Kaisola right now."
+        case (NSPOSIXErrorDomain, EROFS), (NSCocoaErrorDomain, Int32(NSFileWriteVolumeReadOnlyError)):
+            return "The disk is read-only."
+        default:
+            return "The disk write failed: \(cocoa.localizedDescription)"
+        }
+    }
+}
+
+/// Surfaces at most one session-store write failure per window of time.
+///
+/// A failing volume fails every write, and the store writes on ordinary
+/// activity (session create, rename, close, selection). Without a throttle the
+/// first bad write becomes an unbroken wall of identical toasts.
+struct SessionStoreWriteFailureThrottle: Equatable, Sendable {
+    let minimumInterval: TimeInterval
+    private var lastSurfacedAt: Date?
+    /// Failures swallowed since the last surfaced one.
+    private(set) var suppressedCount = 0
+    /// Every failure this throttle has seen, surfaced or not.
+    private(set) var totalCount = 0
+
+    init(minimumInterval: TimeInterval = 300) {
+        self.minimumInterval = max(0, minimumInterval)
+    }
+
+    mutating func shouldSurface(at now: Date) -> Bool {
+        totalCount += 1
+        if let lastSurfacedAt, now.timeIntervalSince(lastSurfacedAt) < minimumInterval {
+            suppressedCount += 1
+            return false
+        }
+        lastSurfacedAt = now
+        suppressedCount = 0
+        return true
+    }
+
+    mutating func reset() {
+        lastSurfacedAt = nil
+        suppressedCount = 0
+        totalCount = 0
+    }
+}
+
+/// Process-wide reporting for session-store write failures. The store is a
+/// value type used from several actors, so the throttle lives here rather than
+/// in any one instance.
+final class SessionStoreWriteFailureMonitor: @unchecked Sendable {
+    static let shared = SessionStoreWriteFailureMonitor()
+
+    private let lock = NSLock()
+    private var throttle: SessionStoreWriteFailureThrottle
+    private var observer: (@Sendable (SessionStoreWriteFailure) -> Void)?
+
+    init(minimumInterval: TimeInterval = 300) {
+        throttle = SessionStoreWriteFailureThrottle(minimumInterval: minimumInterval)
+    }
+
+    /// Replaces the default toast presentation. Tests use it to observe the
+    /// exact failure without a window.
+    func setObserver(_ observer: (@Sendable (SessionStoreWriteFailure) -> Void)?) {
+        lock.lock()
+        defer { lock.unlock() }
+        self.observer = observer
+    }
+
+    func reset() {
+        lock.lock()
+        defer { lock.unlock() }
+        throttle.reset()
+        observer = nil
+    }
+
+    /// Returns whether this failure was surfaced rather than throttled.
+    @discardableResult
+    func record(_ failure: SessionStoreWriteFailure, now: Date = Date()) -> Bool {
+        lock.lock()
+        let surfaced = throttle.shouldSurface(at: now)
+        let observer = self.observer
+        lock.unlock()
+
+        guard surfaced else { return false }
+        FileHandle.standardError.write(Data(
+            "KAISOLA_SESSION_STORE_WRITE_FAILED path=\(failure.path) reason=\(failure.reason)\n".utf8
+        ))
+        if let observer {
+            observer(failure)
+        } else {
+            let message = failure.message
+            Task { @MainActor in
+                ToastCenter.shared.show(message, style: .error, duration: 6)
+            }
+        }
+        return true
     }
 }
 
@@ -946,9 +1077,76 @@ actor NativeWorkspaceStateStore {
         self.decoder = JSONDecoder()
     }
 
+    /// The archive this store protects. Exposed so a degraded-state notice can
+    /// name and reveal it without awaiting the actor.
+    nonisolated var archiveURL: URL { fileURL }
+
     static func agentChatStableKey(agentID: String, workspacePath: String) -> String {
         let standardizedPath = URL(fileURLWithPath: workspacePath).standardizedFileURL.path
         return "\(agentID)|\(standardizedPath)"
+    }
+
+    /// Where an unreadable archive is preserved: beside the original, named for
+    /// the instant it failed, and never a name that is already taken. Recovery
+    /// depends on those bytes, so this deliberately cannot resolve to the
+    /// archive itself or to an earlier preserved copy.
+    static func preservedCopyURL(
+        for archiveURL: URL,
+        at date: Date,
+        isTaken: (URL) -> Bool
+    ) -> URL {
+        let directory = archiveURL.deletingLastPathComponent()
+        let base = archiveURL.deletingPathExtension().lastPathComponent
+        let fileExtension = archiveURL.pathExtension.isEmpty ? "json" : archiveURL.pathExtension
+        let stamp = preservedCopyTimestampFormatter.string(from: date)
+
+        var attempt = 0
+        while true {
+            let suffix = attempt == 0 ? "" : "-\(attempt + 1)"
+            let candidate = directory
+                .appendingPathComponent("\(base).corrupt-\(stamp)\(suffix)")
+                .appendingPathExtension(fileExtension)
+            if candidate.standardizedFileURL != archiveURL.standardizedFileURL,
+               !isTaken(candidate) {
+                return candidate
+            }
+            attempt += 1
+        }
+    }
+
+    private static let preservedCopyTimestampFormatter: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.timeZone = TimeZone(identifier: "UTC")
+        formatter.dateFormat = "yyyyMMdd'T'HHmmss'Z'"
+        return formatter
+    }()
+
+    /// Move an archive this build cannot decode aside so a fresh one can be
+    /// written. Returns where it was preserved, or nil when there was nothing
+    /// on disk to preserve.
+    ///
+    /// This is an explicit app-level decision, never a side effect of reading:
+    /// `loadArchive` must keep failing closed so an ordinary save can never
+    /// overwrite state it did not understand. Only an unreadable archive
+    /// qualifies — a newer schema is good data this build must leave exactly
+    /// where the newer version expects to find it.
+    @discardableResult
+    func preserveUnreadableArchive(at date: Date = Date()) throws -> URL? {
+        guard fileManager.fileExists(atPath: fileURL.path) else {
+            cachedArchive = nil
+            return nil
+        }
+        let destination = Self.preservedCopyURL(
+            for: fileURL,
+            at: date,
+            isTaken: { fileManager.fileExists(atPath: $0.path) }
+        )
+        try fileManager.moveItem(at: fileURL, to: destination)
+        // The next read finds no archive and starts an empty one, which is
+        // only safe because the original bytes still exist beside it.
+        cachedArchive = nil
+        return destination
     }
 
     func restorationState() throws -> NativeWorkspaceRestorationState {

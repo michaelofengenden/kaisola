@@ -258,6 +258,7 @@ struct RootShellView: View {
                 .transition(.opacity)
             }
         }
+        .overlay { WorkspaceRestorationNoticeView(model: model) }
         .overlay { ToastOverlayView() }
         .confirmationDialog(
             "Close Mesh?",

@@ -1783,14 +1783,15 @@ private struct NavigationSidebarResizeAffordance: View {
                 .fill(Color.accentColor.opacity(hovered ? 0.72 : 0.08))
                 .frame(width: 3, height: 32)
         }
-        // Overlay geometry does not consume layout, so the 17-point AppKit
-        // tracker is centered across the real one-point divider. The former
-        // right-aligned 17-point container lived wholly inside the sidebar and
-        // was easy to miss when the pointer approached from the terminal.
+        // Overlay geometry does not consume layout, so the AppKit tracker is
+        // centered across the real one-point divider and spans the whole
+        // visible gap between the two inset chrome cards. Hover is reported by
+        // that one AppKit view: a SwiftUI `.onHover` on the same rectangle is a
+        // second tracking region over the same pixels, and the two disagreed at
+        // the boundary, which is what made the pointer flicker there.
         .overlay {
-            NavigationSidebarResizeHandle()
+            NavigationSidebarResizeHandle(hoverChanged: { hovered = $0 })
                 .frame(width: NativeWorkspaceChrome.projectSidebarDividerHitWidth)
-                .onHover { hovered = $0 }
         }
         .animation(.easeOut(duration: 0.12), value: hovered)
         .help("Drag or use Left/Right arrows to resize; double-click to reset")
@@ -1798,17 +1799,33 @@ private struct NavigationSidebarResizeAffordance: View {
 }
 
 struct NavigationSidebarResizeHandle: NSViewRepresentable {
-    func makeNSView(context: Context) -> TrackingView { TrackingView() }
+    var hoverChanged: (Bool) -> Void = { _ in }
+
+    func makeNSView(context: Context) -> TrackingView {
+        let view = TrackingView()
+        view.hoverChanged = hoverChanged
+        return view
+    }
 
     func updateNSView(_ nsView: TrackingView, context: Context) {
-        nsView.window?.invalidateCursorRects(for: nsView)
+        nsView.hoverChanged = hoverChanged
+        // Deliberately NOT `invalidateCursorRects` here. `updateNSView` runs on
+        // every SwiftUI pass — including every frame of the hover animation this
+        // view's own callback drives — and each invalidation makes AppKit drop
+        // and re-derive the cursor under the pointer, which is seen as the
+        // resize cursor flickering back to the arrow while the pointer is
+        // resting on the divider. The cursor now comes from a `.cursorUpdate`
+        // tracking area, which is stable across re-renders and needs no
+        // push/pop balancing.
         nsView.updateAccessibilityFrame()
     }
 
     final class TrackingView: NSView {
+        var hoverChanged: (Bool) -> Void = { _ in }
         private var lastWindowX: CGFloat?
         private weak var activeSplitView: NSSplitView?
         private var activeDividerIndex: Int?
+        private var trackingArea: NSTrackingArea?
         private lazy var dividerAccessibilityElement = NavigationSidebarAccessibilityElement(
             owner: self
         )
@@ -1816,6 +1833,32 @@ struct NavigationSidebarResizeHandle: NSViewRepresentable {
         override var mouseDownCanMoveWindow: Bool { false }
         override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
         override var acceptsFirstResponder: Bool { true }
+
+        /// One tracking area owns both the cursor and the hover highlight, so
+        /// there is exactly one source of truth for "the pointer is on the
+        /// divider" and no second region to disagree with it.
+        override func updateTrackingAreas() {
+            super.updateTrackingAreas()
+            if let trackingArea { removeTrackingArea(trackingArea) }
+            let area = NSTrackingArea(
+                rect: bounds,
+                options: [.activeInActiveApp, .inVisibleRect, .mouseEnteredAndExited, .cursorUpdate],
+                owner: self
+            )
+            addTrackingArea(area)
+            trackingArea = area
+        }
+
+        override func cursorUpdate(with event: NSEvent) {
+            NSCursor.resizeLeftRight.set()
+        }
+
+        override func mouseEntered(with event: NSEvent) { hoverChanged(true) }
+
+        override func mouseExited(with event: NSEvent) {
+            guard lastWindowX == nil else { return }
+            hoverChanged(false)
+        }
 
         override func isAccessibilityElement() -> Bool { false }
         override func accessibilityChildren() -> [Any]? {
@@ -1855,11 +1898,6 @@ struct NavigationSidebarResizeHandle: NSViewRepresentable {
             enclosingVerticalDivider() != nil
         }
 
-        override func resetCursorRects() {
-            super.resetCursorRects()
-            addCursorRect(bounds, cursor: .resizeLeftRight)
-        }
-
         override func mouseDown(with event: NSEvent) {
             guard let match = enclosingVerticalDivider() else { return }
             window?.makeFirstResponder(self)
@@ -1894,6 +1932,11 @@ struct NavigationSidebarResizeHandle: NSViewRepresentable {
             lastWindowX = nil
             activeSplitView = nil
             activeDividerIndex = nil
+            // A drag that ended outside the handle swallowed its own exit
+            // event while the mouse was down; settle the highlight here.
+            if let window, !bounds.contains(convert(window.mouseLocationOutsideOfEventStream, from: nil)) {
+                hoverChanged(false)
+            }
         }
 
         override func keyDown(with event: NSEvent) {
@@ -2113,7 +2156,11 @@ private struct PaneResizeTrackingView: NSViewRepresentable {
         view.deltaChanged = deltaChanged
         view.dragEnded = dragEnded
         view.doubleClicked = doubleClicked
-        view.window?.invalidateCursorRects(for: view)
+        // No `invalidateCursorRects`: this runs on every SwiftUI pass, and the
+        // hover callback below drives one. Re-deriving the cursor while the
+        // pointer sits on the divider is what made it flicker between the
+        // resize cursor and the arrow. The cursor comes from the tracking
+        // area's `.cursorUpdate` instead.
     }
 
     final class TrackingView: NSView {
@@ -2134,16 +2181,15 @@ private struct PaneResizeTrackingView: NSViewRepresentable {
             if let trackingArea { removeTrackingArea(trackingArea) }
             let area = NSTrackingArea(
                 rect: bounds,
-                options: [.activeInActiveApp, .inVisibleRect, .mouseEnteredAndExited],
+                options: [.activeInActiveApp, .inVisibleRect, .mouseEnteredAndExited, .cursorUpdate],
                 owner: self
             )
             addTrackingArea(area)
             trackingArea = area
         }
 
-        override func resetCursorRects() {
-            super.resetCursorRects()
-            addCursorRect(bounds, cursor: axis == .horizontal ? .resizeLeftRight : .resizeUpDown)
+        override func cursorUpdate(with event: NSEvent) {
+            (axis == .horizontal ? NSCursor.resizeLeftRight : NSCursor.resizeUpDown).set()
         }
 
         override func mouseEntered(with event: NSEvent) {
@@ -2151,6 +2197,10 @@ private struct PaneResizeTrackingView: NSViewRepresentable {
         }
 
         override func mouseExited(with event: NSEvent) {
+            // A drag that leaves the handle keeps the divider live until mouse
+            // up; dropping the highlight mid-drag reads as the handle letting
+            // go of the pointer.
+            guard lastWindowPoint == nil else { return }
             hoverChanged(false)
         }
 
@@ -2181,6 +2231,9 @@ private struct PaneResizeTrackingView: NSViewRepresentable {
             guard lastWindowPoint != nil else { return }
             lastWindowPoint = nil
             dragEnded()
+            if let window, !bounds.contains(convert(window.mouseLocationOutsideOfEventStream, from: nil)) {
+                hoverChanged(false)
+            }
         }
     }
 }
@@ -2305,7 +2358,15 @@ enum NativeWorkspaceChrome {
     static let projectSidebarMaximumWidth: CGFloat = 260
     static let projectSidebarDividerWidth: CGFloat = 1
     /// Centered across the visible divider, not laid wholly inside either pane.
-    static let projectSidebarDividerHitWidth: CGFloat = 17
+    ///
+    /// Sized from what the eye sees rather than from the one-point rule: the
+    /// detail card is inset by `chromeInset`, so the gap the pointer aims at is
+    /// that gutter plus the rule. The hit zone spans the whole gap and reaches
+    /// a few points onto the surface on each side, so the pointer never crosses
+    /// a dead band between "over the content" and "over the divider" — a dead
+    /// band is what made the cursor flicker there.
+    static let projectSidebarDividerHitWidth: CGFloat =
+        KaisolaVisualSystem.chromeInset * 2 + 6
     static let projectSidebarDividerReach: CGFloat =
         (projectSidebarDividerHitWidth - projectSidebarDividerWidth) / 2
     /// The Files control's own height, which the detail chrome band wraps.

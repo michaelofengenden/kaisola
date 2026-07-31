@@ -707,6 +707,13 @@ enum KaisolaVisualSystem {
     static let insetRadius: CGFloat = 10
     static let cardRadius: CGFloat = 12
     static let shellRadius: CGFloat = 16
+    /// Safari's inset floating-card chrome: the radius of the sidebar and
+    /// detail panels that float over the window backdrop. Larger than
+    /// `cardRadius` (which belongs to session cards *inside* a panel) and
+    /// smaller than `shellRadius` (the window itself).
+    static let chromeRadius: CGFloat = 15
+    /// The gutter of window backdrop left visible around each chrome panel.
+    static let chromeInset: CGFloat = 6
     static let hairline: CGFloat = 0.5
     static let focusStroke: CGFloat = 1
     /// Sidebar row leading glyphs (terminal, chat, mesh). Deliberately small:
@@ -721,49 +728,82 @@ enum KaisolaVisualSystem {
     static let layoutDuration = 0.22
 }
 
-/// Low-opacity color recipe laid over AppKit vibrancy for the two large glass
-/// backdrops. White remains the dominant lift so navigation chrome feels clean
-/// rather than gray; accent and mesh are intentionally capped at a quiet wash.
-/// Keeping these values separate from the material makes the light/dark balance
-/// deterministic and gives appearance tests a stable contrast contract.
+/// The neutral veil laid over AppKit vibrancy — or over the sampled desktop
+/// tint — for the two large backdrops.
+///
+/// Methodology: light mode is white-led (white at roughly a third coverage),
+/// dark mode is a near-black neutral (`#0B0C12`). The recipe carries no accent,
+/// mesh, or slate stop, so the only chroma that reaches the eye is whatever the
+/// desktop itself contributes: saturation-forward, with zero warm or lavender
+/// bias. The three opacities describe one vertical gradient of the *same*
+/// color, so the top-light edge reads as light direction rather than as a tint.
+/// Keeping the numbers separate from the material makes the light/dark balance
+/// deterministic and gives appearance tests a stable contract.
 struct GlassBackdropWash: Equatable, Sendable {
-    let baseWhiteOpacity: Double
-    let highlightWhiteOpacity: Double
-    let accentOpacity: Double
-    let secondaryAccentOpacity: Double
+    /// `#0B0C12`: a near-black that still reads neutral at high coverage.
+    static let darkVeil = (red: 11.0 / 255, green: 12.0 / 255, blue: 18.0 / 255)
 
-    static func sidebar(isDark: Bool) -> GlassBackdropWash {
-        if isDark {
-            return GlassBackdropWash(
-                baseWhiteOpacity: 0.016,
-                highlightWhiteOpacity: 0.048,
-                accentOpacity: 0.044,
-                secondaryAccentOpacity: 0.024
-            )
-        }
-        return GlassBackdropWash(
-            baseWhiteOpacity: 0.028,
-            highlightWhiteOpacity: 0.082,
-            accentOpacity: 0.034,
-            secondaryAccentOpacity: 0.018
+    let red: Double
+    let green: Double
+    let blue: Double
+    /// Coverage at the top-leading corner (lit edge).
+    let topOpacity: Double
+    /// Coverage across the body of the backdrop — the headline value.
+    let baseOpacity: Double
+    /// Coverage at the bottom-trailing corner (settled edge).
+    let bottomOpacity: Double
+
+    var color: Color { Color(red: red, green: green, blue: blue) }
+
+    /// One neutral gradient. In light mode the top carries *more* white; in
+    /// dark mode it carries *less* near-black. Both read as light from above.
+    var veil: LinearGradient {
+        LinearGradient(
+            colors: [
+                color.opacity(topOpacity),
+                color.opacity(baseOpacity),
+                color.opacity(bottomOpacity),
+            ],
+            startPoint: .topLeading,
+            endPoint: .bottomTrailing
         )
     }
 
-    static func workspace(isDark: Bool) -> GlassBackdropWash {
-        if isDark {
-            return GlassBackdropWash(
-                baseWhiteOpacity: 0.012,
-                highlightWhiteOpacity: 0.038,
-                accentOpacity: 0.035,
-                secondaryAccentOpacity: 0.020
-            )
-        }
-        return GlassBackdropWash(
-            baseWhiteOpacity: 0.022,
-            highlightWhiteOpacity: 0.064,
-            accentOpacity: 0.030,
-            secondaryAccentOpacity: 0.016
+    private static func dark(top: Double, base: Double, bottom: Double) -> GlassBackdropWash {
+        GlassBackdropWash(
+            red: darkVeil.red,
+            green: darkVeil.green,
+            blue: darkVeil.blue,
+            topOpacity: top,
+            baseOpacity: base,
+            bottomOpacity: bottom
         )
+    }
+
+    private static func light(top: Double, base: Double, bottom: Double) -> GlassBackdropWash {
+        GlassBackdropWash(
+            red: 1,
+            green: 1,
+            blue: 1,
+            topOpacity: top,
+            baseOpacity: base,
+            bottomOpacity: bottom
+        )
+    }
+
+    static func sidebar(isDark: Bool) -> GlassBackdropWash {
+        isDark
+            ? dark(top: 0.38, base: 0.44, bottom: 0.52)
+            : light(top: 0.42, base: 0.32, bottom: 0.26)
+    }
+
+    /// The workspace sits one step deeper than the sidebar so the inset chrome
+    /// panels have something to float above: less white in light mode, more
+    /// near-black in dark mode.
+    static func workspace(isDark: Bool) -> GlassBackdropWash {
+        isDark
+            ? dark(top: 0.44, base: 0.50, bottom: 0.57)
+            : light(top: 0.34, base: 0.26, bottom: 0.21)
     }
 }
 
@@ -821,6 +861,77 @@ extension View {
         interactive: Bool = true
     ) -> some View {
         modifier(KaisolaControlSurfaceModifier(active: active, tint: tint, interactive: interactive))
+    }
+
+    /// Safari's inset floating-card chrome. The window backdrop stays visible
+    /// in a gutter around the panel; the content rides a rounded material with
+    /// a hairline top-light edge. Reduce Transparency yields a clean solid.
+    func kaisolaChromePanel(
+        inset: CGFloat = KaisolaVisualSystem.chromeInset,
+        topInset: CGFloat? = nil
+    ) -> some View {
+        modifier(
+            KaisolaChromePanelModifier(
+                inset: inset,
+                topInset: topInset ?? inset
+            )
+        )
+    }
+}
+
+private struct KaisolaChromePanelModifier: ViewModifier {
+    let inset: CGFloat
+    let topInset: CGFloat
+
+    @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
+    @Environment(\.colorScheme) private var colorScheme
+
+    func body(content: Content) -> some View {
+        let shape = RoundedRectangle(
+            cornerRadius: KaisolaVisualSystem.chromeRadius,
+            style: .continuous
+        )
+        return content
+            .clipShape(shape)
+            .background { panelFill(shape) }
+            .overlay { panelEdge(shape) }
+            .padding(.top, topInset)
+            .padding(.leading, inset)
+            .padding(.trailing, inset)
+            .padding(.bottom, inset)
+    }
+
+    @ViewBuilder
+    private func panelFill(_ shape: RoundedRectangle) -> some View {
+        if reduceTransparency {
+            shape.fill(Color(nsColor: .controlBackgroundColor))
+        } else {
+            shape.fill(.thinMaterial)
+        }
+    }
+
+    /// The lit top edge is what sells a floating card. Reduce Transparency
+    /// swaps it for the flat semantic separator so nothing reads as glass.
+    @ViewBuilder
+    private func panelEdge(_ shape: RoundedRectangle) -> some View {
+        if reduceTransparency {
+            shape.strokeBorder(
+                Color(nsColor: .separatorColor),
+                lineWidth: KaisolaVisualSystem.hairline
+            )
+        } else {
+            shape.strokeBorder(
+                LinearGradient(
+                    colors: [
+                        Color.white.opacity(colorScheme == .dark ? 0.15 : 0.52),
+                        Color.white.opacity(colorScheme == .dark ? 0.03 : 0.10),
+                    ],
+                    startPoint: .top,
+                    endPoint: .bottom
+                ),
+                lineWidth: KaisolaVisualSystem.hairline
+            )
+        }
     }
 }
 
@@ -888,20 +999,9 @@ struct SidebarBackdropView: View {
             if reduceTransparency {
                 Color(nsColor: .controlBackgroundColor)
             } else {
-                let wash = GlassBackdropWash.sidebar(isDark: colorScheme == .dark)
                 ZStack {
                     NativeVisualEffectView(material: .sidebar)
-                    Color.white.opacity(wash.baseWhiteOpacity)
-                    LinearGradient(
-                        colors: [
-                            Color.white.opacity(wash.highlightWhiteOpacity),
-                            Color.accentColor.opacity(wash.accentOpacity),
-                            WorkspacePalette.mesh.opacity(wash.secondaryAccentOpacity),
-                            Color.white.opacity(wash.baseWhiteOpacity * 0.5),
-                        ],
-                        startPoint: .topLeading,
-                        endPoint: .bottomTrailing
-                    )
+                    GlassBackdropWash.sidebar(isDark: colorScheme == .dark).veil
                     if accessibilityContrast == .increased {
                         Color(nsColor: .controlBackgroundColor).opacity(0.18)
                     }
@@ -1041,33 +1141,23 @@ struct WorkspaceBackdropView: View {
             if reduceTransparency {
                 Color(nsColor: .windowBackgroundColor)
             } else {
-                let wash = GlassBackdropWash.workspace(isDark: colorScheme == .dark)
                 ZStack {
                     NativeVisualEffectView(material: .underWindowBackground)
-                    Color.white.opacity(wash.baseWhiteOpacity)
-                    LinearGradient(
-                        colors: [
-                            Color.white.opacity(wash.highlightWhiteOpacity),
-                            Color.accentColor.opacity(wash.accentOpacity),
-                            WorkspacePalette.mesh.opacity(wash.secondaryAccentOpacity),
-                            Color.white.opacity(wash.baseWhiteOpacity * 0.5),
-                        ],
-                        startPoint: .topLeading,
-                        endPoint: .bottomTrailing
-                    )
+                    GlassBackdropWash.workspace(isDark: colorScheme == .dark).veil
                     if accessibilityContrast == .increased {
                         Color(nsColor: .windowBackgroundColor).opacity(0.18)
                     }
                 }
             }
         case .tinted:
+            // Same neutrality contract as the glass veil: the sampled desktop
+            // color is the only chroma in the stack — no mesh (lavender) stop.
             ZStack {
                 Color(nsColor: .windowBackgroundColor)
                 LinearGradient(
                     colors: [
-                        desktopTint.color.opacity(colorScheme == .dark ? 0.15 : 0.10),
-                        desktopTint.color.opacity(colorScheme == .dark ? 0.08 : 0.045),
-                        WorkspacePalette.mesh.opacity(colorScheme == .dark ? 0.025 : 0.014),
+                        desktopTint.color.opacity(colorScheme == .dark ? 0.16 : 0.12),
+                        desktopTint.color.opacity(colorScheme == .dark ? 0.09 : 0.055),
                     ],
                     startPoint: .topLeading,
                     endPoint: .bottomTrailing

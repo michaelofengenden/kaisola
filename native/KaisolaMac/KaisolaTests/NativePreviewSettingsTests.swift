@@ -417,7 +417,37 @@ final class NativePreviewSettingsTests: XCTestCase {
         XCTAssertEqual(TerminalPaletteMode.native.title, "macOS Terminal")
     }
 
-    func testGlassBackdropWashStaysWhiteLedAndRestrained() {
+    func testGlassBackdropWashIsWhiteLedInLightAndNearBlackInDark() {
+        let lightRecipes = [
+            GlassBackdropWash.sidebar(isDark: false),
+            GlassBackdropWash.workspace(isDark: false),
+        ]
+        for recipe in lightRecipes {
+            XCTAssertEqual(recipe.red, 1)
+            XCTAssertEqual(recipe.green, 1)
+            XCTAssertEqual(recipe.blue, 1)
+        }
+
+        let darkRecipes = [
+            GlassBackdropWash.sidebar(isDark: true),
+            GlassBackdropWash.workspace(isDark: true),
+        ]
+        for recipe in darkRecipes {
+            // #0B0C12.
+            XCTAssertEqual(recipe.red, 11.0 / 255, accuracy: 0.0001)
+            XCTAssertEqual(recipe.green, 12.0 / 255, accuracy: 0.0001)
+            XCTAssertEqual(recipe.blue, 18.0 / 255, accuracy: 0.0001)
+        }
+
+        // The headline coverage: white at roughly a third in light, near-black
+        // at roughly 44% in dark.
+        XCTAssertEqual(GlassBackdropWash.sidebar(isDark: false).baseOpacity, 0.32, accuracy: 0.0001)
+        XCTAssertEqual(GlassBackdropWash.sidebar(isDark: true).baseOpacity, 0.44, accuracy: 0.0001)
+    }
+
+    /// Zero warm or lavender bias: the veil is neutral to the eye, so the only
+    /// chroma in the backdrop is whatever the desktop itself contributes.
+    func testGlassBackdropWashCarriesNoWarmOrLavenderBias() {
         let recipes = [
             GlassBackdropWash.sidebar(isDark: false),
             GlassBackdropWash.sidebar(isDark: true),
@@ -426,23 +456,38 @@ final class NativePreviewSettingsTests: XCTestCase {
         ]
 
         for recipe in recipes {
-            XCTAssertGreaterThan(recipe.baseWhiteOpacity, 0)
-            XCTAssertGreaterThan(recipe.highlightWhiteOpacity, recipe.accentOpacity)
-            XCTAssertLessThanOrEqual(recipe.accentOpacity, 0.05)
-            XCTAssertLessThanOrEqual(recipe.secondaryAccentOpacity, 0.025)
+            // Never warm: red must not lead blue.
+            XCTAssertLessThanOrEqual(recipe.red, recipe.blue)
+            // Never lavender: blue may only edge ahead of green by a hair, and
+            // green must sit between the two rather than dipping below both.
+            XCTAssertLessThanOrEqual(recipe.blue - recipe.green, 0.03)
+            XCTAssertGreaterThanOrEqual(recipe.green, recipe.red)
         }
     }
 
-    func testGlassBackdropWashUsesAQuieterDarkModeLift() {
+    func testGlassBackdropWashLightsFromAboveAndSeatsTheWorkspaceDeeper() {
         let lightSidebar = GlassBackdropWash.sidebar(isDark: false)
         let darkSidebar = GlassBackdropWash.sidebar(isDark: true)
         let lightWorkspace = GlassBackdropWash.workspace(isDark: false)
         let darkWorkspace = GlassBackdropWash.workspace(isDark: true)
 
-        XCTAssertGreaterThan(lightSidebar.baseWhiteOpacity, darkSidebar.baseWhiteOpacity)
-        XCTAssertGreaterThan(lightSidebar.highlightWhiteOpacity, darkSidebar.highlightWhiteOpacity)
-        XCTAssertGreaterThan(lightWorkspace.baseWhiteOpacity, darkWorkspace.baseWhiteOpacity)
-        XCTAssertGreaterThan(lightWorkspace.highlightWhiteOpacity, darkWorkspace.highlightWhiteOpacity)
+        // Light from above: more white at the top in light mode, less
+        // near-black at the top in dark mode. Both lift the top edge.
+        XCTAssertGreaterThan(lightSidebar.topOpacity, lightSidebar.baseOpacity)
+        XCTAssertGreaterThan(lightSidebar.baseOpacity, lightSidebar.bottomOpacity)
+        XCTAssertLessThan(darkSidebar.topOpacity, darkSidebar.baseOpacity)
+        XCTAssertLessThan(darkSidebar.baseOpacity, darkSidebar.bottomOpacity)
+
+        // The workspace reads one step deeper than the sidebar so the inset
+        // chrome panels have something to float above.
+        XCTAssertLessThan(lightWorkspace.baseOpacity, lightSidebar.baseOpacity)
+        XCTAssertGreaterThan(darkWorkspace.baseOpacity, darkSidebar.baseOpacity)
+    }
+
+    func testChromePanelTokensSitBetweenCardAndShell() {
+        XCTAssertGreaterThan(KaisolaVisualSystem.chromeRadius, KaisolaVisualSystem.cardRadius)
+        XCTAssertLessThan(KaisolaVisualSystem.chromeRadius, KaisolaVisualSystem.shellRadius)
+        XCTAssertEqual(KaisolaVisualSystem.chromeInset, 6)
     }
 
     func testTerminalPaneGridKeepsSessionsReadable() {

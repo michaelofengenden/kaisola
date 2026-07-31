@@ -513,24 +513,44 @@ final class NativePreviewSettingsTests: XCTestCase {
                 collapsed: []
             )
         )
-        // Collapsing the active project sticks too, and outranks a stale
+        // Collapsing a non-active project sticks too, and outranks a stale
         // expansion entry for the same project.
         XCTAssertFalse(
             ProjectExpansionState.isExpanded(
-                projectID: "active",
-                isActive: true,
-                expanded: ["active"],
-                collapsed: ["active"]
+                projectID: "other",
+                isActive: false,
+                expanded: ["other"],
+                collapsed: ["other"]
             )
         )
     }
 
+    /// The one rule no persisted state may override: the project being worked
+    /// in always shows its sessions.
+    func testTheActiveProjectIsAlwaysExpanded() {
+        for collapsed in [Set<String>(), ["active"], ["active", "other"]] {
+            for expanded in [Set<String>(), ["active"]] {
+                XCTAssertTrue(
+                    ProjectExpansionState.isExpanded(
+                        projectID: "active",
+                        isActive: true,
+                        expanded: expanded,
+                        collapsed: collapsed
+                    ),
+                    "expanded=\(expanded.sorted()) collapsed=\(collapsed.sorted())"
+                )
+            }
+        }
+    }
+
     /// An install made before the default flipped persisted only *collapsed*
-    /// ids. Those must keep their meaning instead of springing open.
+    /// ids. Non-active ones keep their meaning instead of springing open, but
+    /// the active project's entry must never hide the sessions the user is
+    /// working in — an upgrade otherwise opens onto a nearly empty rail.
     func testProjectExpansionMigratesTheLegacyCollapsedKey() {
         let legacy = ProjectExpansionState.decode("alpha,beta")
         XCTAssertEqual(legacy, ["alpha", "beta"])
-        XCTAssertFalse(
+        XCTAssertTrue(
             ProjectExpansionState.isExpanded(
                 projectID: "alpha",
                 isActive: true,
@@ -538,9 +558,88 @@ final class NativePreviewSettingsTests: XCTestCase {
                 collapsed: legacy
             )
         )
+        XCTAssertFalse(
+            ProjectExpansionState.isExpanded(
+                projectID: "beta",
+                isActive: false,
+                expanded: [],
+                collapsed: legacy
+            )
+        )
         XCTAssertEqual(ProjectExpansionState.decode(""), [])
         XCTAssertEqual(ProjectExpansionState.encode(["beta", "alpha"]), "alpha,beta")
         XCTAssertEqual(ProjectExpansionState.encode([]), "")
+    }
+
+    /// Toggling the active project's disclosure cannot collapse it, and heals
+    /// the legacy entry so the id stops lingering in the collapsed set.
+    func testTogglingTheActiveProjectHealsItsLegacyCollapsedEntry() {
+        let healed = ProjectExpansionState.toggled(
+            expanded: false,
+            projectID: "alpha",
+            isActive: true,
+            expanded: [],
+            collapsed: ["alpha", "beta"]
+        )
+        XCTAssertEqual(healed.collapsed, ["beta"])
+        XCTAssertEqual(healed.expanded, [])
+        XCTAssertTrue(
+            ProjectExpansionState.isExpanded(
+                projectID: "alpha",
+                isActive: true,
+                expanded: healed.expanded,
+                collapsed: healed.collapsed
+            )
+        )
+        // Healing is idempotent: a second toggle is a no-op.
+        let again = ProjectExpansionState.toggled(
+            expanded: true,
+            projectID: "alpha",
+            isActive: true,
+            expanded: healed.expanded,
+            collapsed: healed.collapsed
+        )
+        XCTAssertEqual(again.collapsed, ["beta"])
+        XCTAssertEqual(again.expanded, [])
+    }
+
+    func testTogglingANonActiveProjectRecordsBothDirections() {
+        let opened = ProjectExpansionState.toggled(
+            expanded: true,
+            projectID: "other",
+            isActive: false,
+            expanded: [],
+            collapsed: ["other"]
+        )
+        XCTAssertEqual(opened.expanded, ["other"])
+        XCTAssertEqual(opened.collapsed, [])
+
+        let closed = ProjectExpansionState.toggled(
+            expanded: false,
+            projectID: "other",
+            isActive: false,
+            expanded: opened.expanded,
+            collapsed: opened.collapsed
+        )
+        XCTAssertEqual(closed.expanded, [])
+        XCTAssertEqual(closed.collapsed, ["other"])
+    }
+
+    func testTopBarLayoutTightensTheDetailChromeBand() {
+        let split = NativeWorkspaceChrome.detailChromeBandHeight(topBarLayout: false)
+        let topBar = NativeWorkspaceChrome.detailChromeBandHeight(topBarLayout: true)
+        // The split band is unchanged: it still lands the detail card on the
+        // sidebar card's line.
+        XCTAssertEqual(
+            split,
+            NativeWorkspaceChrome.chromePanelTopInset - KaisolaVisualSystem.chromeInset
+        )
+        XCTAssertEqual(split, 40)
+        // Top bar has no toolbar band to clear, so the strip is a tight fit
+        // around the Files control instead of an empty gutter.
+        XCTAssertEqual(topBar, 32)
+        XCTAssertLessThan(topBar, split)
+        XCTAssertGreaterThan(topBar, NativeWorkspaceChrome.detailChromeControlHeight)
     }
 
     func testChromePanelTokensSitBetweenCardAndShell() {

@@ -688,6 +688,9 @@ final class AppModel: ObservableObject {
         focusedPaneID = id
         maximizedPaneID = nil
         focusSurfaceFields(id)
+        // Opening a card beside the current one is a visit, exactly like
+        // selecting it, so the inbox entry it was carrying must not survive.
+        acknowledgeAttention(forSurface: id)
         scheduleWorkspaceStateSave(projectID: projectID)
         // Publish the layout intent before subscribing. `subscribeSplit`
         // deliberately rejects a result for a card that is no longer visible,
@@ -785,6 +788,18 @@ final class AppModel: ObservableObject {
         sessions.first(where: { $0.id == id })?.projectID
             ?? chats.first(where: { $0.id == id })?.projectID
             ?? meshes.first(where: { $0.id == id })?.projectID
+    }
+
+    /// Retire a surface's needs-you state because the user just visited it. A
+    /// terminal that is showing a broker completion is *acknowledged* rather
+    /// than merely cleared, so a relaunch cannot resurrect that same
+    /// completion; every other surface just drops its inbox entries.
+    private func acknowledgeAttention(forSurface id: String) {
+        if case let .responded(completedAt) = sessions.first(where: { $0.id == id })?.agentActivity {
+            attentionCenter.acknowledgeSessionResponse(targetID: id, completedAt: completedAt)
+        } else {
+            attentionCenter.clear(targetID: id)
+        }
     }
 
     private func focusSurfaceFields(_ id: String) {

@@ -155,7 +155,10 @@ enum QuietRailOrder {
         let rest = orderedIDs.filter { $0 != movedID }
         guard landed > 0, landed - 1 < compact.count,
               let predecessorIndex = rest.firstIndex(of: compact[landed - 1]) else {
-            return Move(id: movedID, toIndex: 0)
+            // Dropped at the top of the *compact* list. The pinned project is
+            // not part of that list, so it keeps its stored slot and the row
+            // lands in the first slot the pinned project does not occupy.
+            return Move(id: movedID, toIndex: rest.firstIndex { $0 != activeID } ?? 0)
         }
         return Move(id: movedID, toIndex: predecessorIndex + 1)
     }

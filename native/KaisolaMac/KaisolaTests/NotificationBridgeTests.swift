@@ -93,9 +93,18 @@ final class NotificationBridgeTests: XCTestCase {
     }
 
     func testCategoryCoversEveryAttentionKind() {
-        XCTAssertEqual(NotificationBridge.Category(.permission), .permission)
-        XCTAssertEqual(NotificationBridge.Category(.turnCompleted), .turnCompleted)
-        XCTAssertEqual(NotificationBridge.Category(.sessionResponded), .sessionResponded)
+        // Driven off `allCases`, and the expectation switch is exhaustive, so a
+        // new kind fails to compile here rather than shipping unmapped.
+        XCTAssertFalse(AttentionCenter.Kind.allCases.isEmpty)
+        for kind in AttentionCenter.Kind.allCases {
+            let expected: NotificationBridge.Category = switch kind {
+            case .permission: .permission
+            // A bell posts as a completed-turn-style system notification.
+            case .turnCompleted, .bell: .turnCompleted
+            case .sessionResponded: .sessionResponded
+            }
+            XCTAssertEqual(NotificationBridge.Category(kind), expected, "\(kind.rawValue)")
+        }
     }
 
     func testSettingsAuthorizationPresentationDistinguishesDeniedFromAllowed() {

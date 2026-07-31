@@ -21,7 +21,9 @@ final class AttentionCenter: ObservableObject {
         return AttentionCenter()
     }()
 
-    enum Kind: String, Codable, Equatable {
+    /// `CaseIterable` so mapping tests (notification categories, inbox glyphs)
+    /// can enumerate every kind instead of hand-listing the ones they remember.
+    enum Kind: String, Codable, Equatable, CaseIterable {
         case permission
         case turnCompleted
         case sessionResponded

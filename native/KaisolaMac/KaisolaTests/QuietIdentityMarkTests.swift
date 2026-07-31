@@ -92,11 +92,35 @@ final class QuietIdentityMarkTests: XCTestCase {
 
     // MARK: - Compact-list drag mapping
 
-    func testDragToTopOfTheCompactListLandsAboveThePinnedProject() {
-        // Rail shows: A (pinned) then B, C, D. Dragging D to the top of the
-        // compact list must leave the compact order D, B, C.
+    func testDragToTopOfTheCompactListLandsBelowThePinnedProject() {
+        // Rail shows: A (pinned, store index 0) then B, C, D. Dragging D to the
+        // top of the compact list must leave the compact order D, B, C without
+        // displacing A from the slot it holds in the persisted order.
         let move = QuietRailOrder.moveIndex(activeID: "A", orderedIDs: ["A", "B", "C", "D"], from: 2, to: 0)
+        XCTAssertEqual(move, QuietRailOrder.Move(id: "D", toIndex: 1))
+    }
+
+    func testDragToTopTakesSlotZeroWhenThePinnedProjectIsNotThere() {
+        // Store order B, A, C, D with A active: the first compact slot *is*
+        // store index 0, so a compact-top drop lands there.
+        let move = QuietRailOrder.moveIndex(activeID: "A", orderedIDs: ["B", "A", "C", "D"], from: 2, to: 0)
         XCTAssertEqual(move, QuietRailOrder.Move(id: "D", toIndex: 0))
+    }
+
+    /// The mapping is only correct if the store's remove-then-insert really
+    /// reproduces the dragged compact order *and* leaves the pinned project put.
+    func testDragToTopKeepsThePinnedProjectAtItsStoredIndex() {
+        let ordered = ["A", "B", "C", "D"]
+        guard let move = QuietRailOrder.moveIndex(activeID: "A", orderedIDs: ordered, from: 2, to: 0) else {
+            return XCTFail("expected a move")
+        }
+        var stored = ordered
+        let from = stored.firstIndex(of: move.id)!
+        let clamped = max(0, min(move.toIndex, stored.count - 1))
+        stored.insert(stored.remove(at: from), at: clamped)
+        XCTAssertEqual(stored, ["A", "D", "B", "C"])
+        XCTAssertEqual(stored.firstIndex(of: "A"), 0)
+        XCTAssertEqual(stored.filter { $0 != "A" }, ["D", "B", "C"])
     }
 
     func testDragMapsThroughAnActiveProjectHeldInTheMiddleOfTheStoreOrder() {

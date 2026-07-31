@@ -315,7 +315,10 @@ struct RootShellView: View {
                         model: model,
                         attention: attention,
                         expansion: { expansionBinding($0) },
-                        isActiveProject: { model.selectedProjectID == $0 },
+                        // The same fallback-bearing id the expansion binding
+                        // uses, so the rail always pins exactly the project
+                        // whose sessions are expanded.
+                        isActiveProject: { activeProjectID == $0 },
                         selectSession: { session in
                             if KaisolaMacAppDelegate.focusWindow(displayingSurface: session.id) { return }
                             guard SurfaceSelectionPolicy.shouldRequestFocus(
@@ -389,8 +392,9 @@ struct RootShellView: View {
         }
         .padding(.trailing, KaisolaVisualSystem.chromeInset + 4)
         .frame(
-            height: NativeWorkspaceChrome.chromePanelTopInset
-                - KaisolaVisualSystem.chromeInset
+            height: NativeWorkspaceChrome.detailChromeBandHeight(
+                topBarLayout: settings.navigationLayout == .topBar
+            )
         )
     }
 
@@ -405,7 +409,7 @@ struct RootShellView: View {
             Image(systemName: "sidebar.trailing")
                 .font(.system(size: 12, weight: .medium))
                 .foregroundStyle(visible ? Color.primary : Color.secondary)
-                .frame(width: 26, height: 24)
+                .frame(width: 26, height: NativeWorkspaceChrome.detailChromeControlHeight)
                 .background(
                     visible ? Color.primary.opacity(0.10) : Color.clear,
                     in: RoundedRectangle(
@@ -707,17 +711,15 @@ struct RootShellView: View {
                 )
             },
             set: { expanded in
-                var expandedSet = ProjectExpansionState.decode(expandedProjectsRaw)
-                var collapsedSet = ProjectExpansionState.decode(collapsedProjectsRaw)
-                if expanded {
-                    expandedSet.insert(projectID)
-                    collapsedSet.remove(projectID)
-                } else {
-                    expandedSet.remove(projectID)
-                    collapsedSet.insert(projectID)
-                }
-                expandedProjectsRaw = ProjectExpansionState.encode(expandedSet)
-                collapsedProjectsRaw = ProjectExpansionState.encode(collapsedSet)
+                let next = ProjectExpansionState.toggled(
+                    expanded: expanded,
+                    projectID: projectID,
+                    isActive: activeProjectID == projectID,
+                    expanded: ProjectExpansionState.decode(expandedProjectsRaw),
+                    collapsed: ProjectExpansionState.decode(collapsedProjectsRaw)
+                )
+                expandedProjectsRaw = ProjectExpansionState.encode(next.expanded)
+                collapsedProjectsRaw = ProjectExpansionState.encode(next.collapsed)
             }
         )
     }
@@ -2314,17 +2316,36 @@ enum NativeWorkspaceChrome {
     static let projectSidebarDividerHitWidth: CGFloat = 17
     static let projectSidebarDividerReach: CGFloat =
         (projectSidebarDividerHitWidth - projectSidebarDividerWidth) / 2
+    /// The Files control's own height, which the detail chrome band wraps.
+    static let detailChromeControlHeight: CGFloat = 24
+    /// Breathing room above and below that control when the band carries
+    /// nothing else.
+    static let detailChromeControlPadding: CGFloat = 4
+
+    /// Height of the detail column's chrome band.
+    ///
+    /// In the split layout the band doubles as the clearance for the traffic
+    /// lights and the AppKit toolbar `NavigationSplitView` installs, so it must
+    /// land the detail card on the sidebar card's line. The top-bar layout has
+    /// no such band to match — the tab strip already owns that clearance — so
+    /// the strip shrinks to a tight fit around the Files control instead of
+    /// leaving an empty 40pt gutter.
+    static func detailChromeBandHeight(topBarLayout: Bool) -> CGFloat {
+        topBarLayout
+            ? detailChromeControlHeight + detailChromeControlPadding * 2
+            : chromePanelTopInset - KaisolaVisualSystem.chromeInset
+    }
 }
 
 /// Sidebar disclosure defaults, kept pure so the persistence semantics can be
 /// tested without a `List`.
 ///
-/// The active project shows its own sessions; every other project is a compact
-/// one-line row until the user opens it, so the rail stays short no matter how
-/// many folders are open. Both directions persist: the expanded set records
-/// opt-in peeks, and the original `collapsedProjects` key keeps its meaning as
-/// an explicit collapse, which is also what migrates an install made before
-/// the default flipped.
+/// The active project always shows its own sessions; every other project is a
+/// compact one-line row until the user opens it, so the rail stays short no
+/// matter how many folders are open. Only the non-active state persists: the
+/// expanded set records opt-in peeks and the original `collapsedProjects` key
+/// keeps its meaning as an explicit collapse, which is also what migrates an
+/// install made before the default flipped.
 enum ProjectExpansionState {
     static func decode(_ raw: String) -> Set<String> {
         Set(raw.components(separatedBy: ",").filter { !$0.isEmpty })
@@ -2340,9 +2361,41 @@ enum ProjectExpansionState {
         expanded: Set<String>,
         collapsed: Set<String>
     ) -> Bool {
+        // The active project's surfaces always show, the way Safari always
+        // shows the current tab group's tabs. This also fences the upgrade
+        // hazard: an install that collapsed a project before the default
+        // flipped must not open onto an empty rail when that project is the
+        // one being worked in.
+        if isActive { return true }
         if collapsed.contains(projectID) { return false }
-        if expanded.contains(projectID) { return true }
-        return isActive
+        return expanded.contains(projectID)
+    }
+
+    /// Records a disclosure toggle. Collapsing the active project is refused —
+    /// and the legacy `collapsedProjects` entry an upgrading install may still
+    /// carry for it is dropped on the way through, so the row heals itself the
+    /// first time it is touched.
+    static func toggled(
+        expanded shouldExpand: Bool,
+        projectID: String,
+        isActive: Bool,
+        expanded: Set<String>,
+        collapsed: Set<String>
+    ) -> (expanded: Set<String>, collapsed: Set<String>) {
+        var expandedSet = expanded
+        var collapsedSet = collapsed
+        guard !isActive else {
+            collapsedSet.remove(projectID)
+            return (expandedSet, collapsedSet)
+        }
+        if shouldExpand {
+            expandedSet.insert(projectID)
+            collapsedSet.remove(projectID)
+        } else {
+            expandedSet.remove(projectID)
+            collapsedSet.insert(projectID)
+        }
+        return (expandedSet, collapsedSet)
     }
 }
 
@@ -2836,6 +2889,27 @@ private struct ConnectionFooter: View {
         .accessibilityLabel("Kaisola account and settings")
     }
 
+    /// Inbox row glyphs. Exhaustive on purpose: a new `AttentionCenter.Kind`
+    /// must fail the build here rather than silently inherit a checkmark.
+    static func attentionSymbol(_ kind: AttentionCenter.Kind) -> String {
+        switch kind {
+        case .permission: "hand.raised.fill"
+        // A BEL is the terminal asking for the user, not a completed turn, so
+        // it keeps a bell rather than borrowing the permission hand.
+        case .bell: "bell.fill"
+        case .turnCompleted, .sessionResponded: "checkmark.circle.fill"
+        }
+    }
+
+    /// Amber means needs-you, green means finished — matching the rail's
+    /// status derivation, where a bell is also amber.
+    static func attentionTint(_ kind: AttentionCenter.Kind) -> Color {
+        switch kind {
+        case .permission, .bell: .orange
+        case .turnCompleted, .sessionResponded: .green
+        }
+    }
+
     @ViewBuilder
     private var attentionButton: some View {
         if attention.count > 0 {
@@ -2856,8 +2930,8 @@ private struct ConnectionFooter: View {
                             jumpToAttention?(entry.targetID)
                         } label: {
                             HStack(spacing: 8) {
-                                Image(systemName: entry.kind == .permission ? "hand.raised.fill" : "checkmark.circle.fill")
-                                    .foregroundStyle(entry.kind == .permission ? Color.orange : .green)
+                                Image(systemName: Self.attentionSymbol(entry.kind))
+                                    .foregroundStyle(Self.attentionTint(entry.kind))
                                 VStack(alignment: .leading, spacing: 1) {
                                     Text(entry.title).font(.callout).lineLimit(1)
                                     Text(entry.detail).font(.caption).foregroundStyle(.secondary).lineLimit(1)

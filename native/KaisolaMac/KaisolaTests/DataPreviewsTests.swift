@@ -174,4 +174,121 @@ final class DataPreviewsTests: XCTestCase {
         XCTAssertEqual(root.display, "hello")
         XCTAssertTrue(root.children.isEmpty)
     }
+
+    // MARK: - JSON node identity
+
+    private func identifiers(of node: JsonTree.Node) -> [String] {
+        [node.id] + node.children.flatMap(identifiers(of:))
+    }
+
+    func testNodeIdentityIsTheDeterministicPathToTheValue() throws {
+        let root = JsonTree.build(try object(from: #"{"tags":["a","b"],"meta":{"n":1}}"#))
+        XCTAssertEqual(root.id, "$")
+
+        let byKey = Dictionary(uniqueKeysWithValues: root.children.map { ($0.key ?? "", $0) })
+        XCTAssertEqual(byKey["tags"]?.id, "$.tags")
+        XCTAssertEqual(byKey["tags"]?.children.map(\.id), ["$.tags[0]", "$.tags[1]"])
+        XCTAssertEqual(byKey["meta"]?.children.map(\.id), ["$.meta.n"])
+    }
+
+    func testNodeIdentityIsStableAcrossRebuilds() throws {
+        // Disclosure state is keyed by node identity. A rebuilt tree — a
+        // re-render, a reload, a returning tab — must reuse the same ids or
+        // every expanded object silently snaps shut.
+        let json = #"{"name":"Kai","tags":["a","b"],"meta":{"n":1,"ok":true}}"#
+        XCTAssertEqual(
+            identifiers(of: JsonTree.build(try object(from: json))),
+            identifiers(of: JsonTree.build(try object(from: json)))
+        )
+    }
+
+    func testNodeIdentitiesAreUniqueThroughoutTheTree() throws {
+        let json = #"{"a":{"b":[{"c":1},{"c":2}]},"d":[[1,2],[3,4]],"e":"a.b"}"#
+        let ids = identifiers(of: JsonTree.build(try object(from: json)))
+        XCTAssertEqual(Set(ids).count, ids.count)
+    }
+
+    func testTruncationMarkersCarryDistinctIdentities() throws {
+        let bigArray = "[" + (0..<(JsonTree.maxNodes + 50)).map(String.init).joined(separator: ",") + "]"
+        let ids = identifiers(of: JsonTree.build(try object(from: bigArray)))
+        XCTAssertEqual(Set(ids).count, ids.count)
+        XCTAssertTrue(ids.contains { $0.hasSuffix("|truncated") })
+    }
+
+    // MARK: - Content-identity parse caches
+
+    func testParseCacheReusesTheResultForIdenticalContent() {
+        let cache = PreviewParseCache<Int>()
+        let source = String(repeating: "a,b,c\n", count: 500)
+        var parses = 0
+
+        // Ten body evaluations — a tab-strip hover, a resize, a zoom step —
+        // must cost exactly one parse.
+        for _ in 0..<10 {
+            _ = cache.value(for: source) { text in
+                parses += 1
+                return text.count
+            }
+        }
+        XCTAssertEqual(parses, 1)
+        XCTAssertEqual(cache.parseCount, 1)
+    }
+
+    func testParseCacheReparsesOnlyWhenContentChanges() {
+        let cache = PreviewParseCache<String>()
+        let uppercase = { (text: String) in text.uppercased() }
+
+        XCTAssertEqual(cache.value(for: "one", parse: uppercase), "ONE")
+        XCTAssertEqual(cache.value(for: "one", parse: uppercase), "ONE")
+        XCTAssertEqual(cache.parseCount, 1)
+        XCTAssertEqual(cache.value(for: "two", parse: uppercase), "TWO")
+        XCTAssertEqual(cache.parseCount, 2)
+    }
+
+    func testCsvPreviewModelIsBuiltOncePerContentIdentity() {
+        let text = (0..<300).map { "row\($0),value,\($0)" }.joined(separator: "\n")
+        let cache = PreviewParseCache<CsvPreviewModel>()
+
+        let first = cache.value(for: text, parse: CsvPreviewModel.make)
+        let second = cache.value(for: text, parse: CsvPreviewModel.make)
+        XCTAssertEqual(cache.parseCount, 1)
+        XCTAssertEqual(first, second)
+        XCTAssertEqual(first.rows.count, 300)
+        XCTAssertFalse(first.truncated)
+    }
+
+    func testCsvPreviewModelColumnWidthsFitTheLongestCellWithinBounds() {
+        let model = CsvPreviewModel.make("id,label\n1,\(String(repeating: "x", count: 400))")
+        XCTAssertEqual(model.rows.count, 2)
+        XCTAssertEqual(model.columnWidths.count, 2)
+        // A short column collapses to the floor; a very long one is clamped at
+        // the ceiling instead of realizing an unbounded row.
+        XCTAssertEqual(model.columnWidths[0], CsvPreviewModel.minimumColumnWidth)
+        XCTAssertEqual(model.columnWidths[1], CsvPreviewModel.maximumColumnWidth)
+    }
+
+    func testCsvPreviewModelCarriesTheTruncationFlag() {
+        let text = (0..<(CsvTable.maxRows + 10)).map(String.init).joined(separator: "\n")
+        XCTAssertTrue(CsvPreviewModel.make(text).truncated)
+    }
+
+    func testJsonPreviewOutcomeIsBuiltOncePerContentIdentity() {
+        let text = #"{"a":[1,2,3],"b":{"c":true}}"#
+        let cache = PreviewParseCache<JsonPreviewOutcome>()
+
+        _ = cache.value(for: text, parse: JsonPreviewOutcome.make)
+        let outcome = cache.value(for: text, parse: JsonPreviewOutcome.make)
+        XCTAssertEqual(cache.parseCount, 1)
+        guard case let .tree(root, truncated) = outcome else {
+            return XCTFail("expected a parsed tree")
+        }
+        XCTAssertEqual(root.children.count, 2)
+        XCTAssertFalse(truncated)
+    }
+
+    func testJsonPreviewOutcomeReportsInvalidDocuments() {
+        guard case .invalid = JsonPreviewOutcome.make("{oops") else {
+            return XCTFail("expected an invalid outcome")
+        }
+    }
 }

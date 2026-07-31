@@ -8,6 +8,39 @@ import WebKit
 // file extension. Parsing/tree-building is factored into `CsvTable` / `JsonTree`
 // so it is testable without touching SwiftUI or WebKit.
 
+// MARK: - Parse caching
+
+/// A view-lifetime parse cache keyed by content identity.
+///
+/// SwiftUI re-evaluates `body` for reasons that have nothing to do with the
+/// document — a tab-strip hover, a window resize, a zoom step, a sibling's state
+/// change. Re-parsing a multi-megabyte CSV or JSON payload on each of those
+/// turns a linear parser into visible interaction jank, which is exactly what
+/// hovering the file tabs over a 1 MiB CSV used to cost.
+///
+/// Identity is the source text itself: SwiftUI hands the same String storage
+/// back on a re-render, so the equality check is a pointer comparison in the
+/// common case and a full compare only when the document really changed. One
+/// entry is enough — a preview shows one document at a time, and the view's
+/// `@State` is discarded when it is retargeted at another file.
+final class PreviewParseCache<Value> {
+    private var source: String?
+    private var cached: Value?
+    /// Test-visible proof that repeated body evaluations do not re-parse.
+    private(set) var parseCount = 0
+
+    init() {}
+
+    func value(for source: String, parse: (String) -> Value) -> Value {
+        if let cached, self.source == source { return cached }
+        let parsed = parse(source)
+        self.source = source
+        cached = parsed
+        parseCount += 1
+        return parsed
+    }
+}
+
 // MARK: - CSV
 
 /// RFC-4180-ish CSV/TSV parsing. Pure so tests can drive it directly.
@@ -133,47 +166,56 @@ enum CsvTable {
     }
 }
 
+/// The render-ready projection of a CSV/TSV document: capped rows, the
+/// truncation flag, and the fixed per-column widths that keep cells aligned
+/// across a vertically lazy list. Built once per content identity — this used to
+/// run in `CsvPreview.init`, so every SwiftUI body evaluation re-parsed the
+/// whole file.
+struct CsvPreviewModel: Equatable, Sendable {
+    static let minimumColumnWidth: CGFloat = 46
+    static let maximumColumnWidth: CGFloat = 340
+    /// ~advance of SF Mono 12pt, the cell font.
+    static let characterWidth: CGFloat = 7.3
+    static let cellPadding: CGFloat = 10
+
+    let rows: [[String]]
+    let truncated: Bool
+    let columnWidths: [CGFloat]
+
+    static let empty = CsvPreviewModel(rows: [], truncated: false, columnWidths: [])
+
+    nonisolated static func make(_ text: String) -> CsvPreviewModel {
+        let parsed = CsvTable.parse(text, delimiter: CsvTable.detectDelimiter(text))
+        let columnCount = parsed.rows.map(\.count).max() ?? 0
+        var widths = [CGFloat](repeating: minimumColumnWidth, count: columnCount)
+        for row in parsed.rows {
+            for (column, value) in row.enumerated() where column < columnCount {
+                let fitted = min(
+                    maximumColumnWidth,
+                    max(minimumColumnWidth, CGFloat(value.count) * characterWidth + cellPadding * 2)
+                )
+                if fitted > widths[column] { widths[column] = fitted }
+            }
+        }
+        return CsvPreviewModel(rows: parsed.rows, truncated: parsed.truncated, columnWidths: widths)
+    }
+}
+
 /// A scrollable table for CSV/TSV text. The first row is styled as a header;
 /// cells are monospaced 12pt with fixed per-column widths so columns align
 /// across a vertically lazy list. Delimiter is auto-detected.
 struct CsvPreview: View {
     let text: String
 
-    private let rows: [[String]]
-    private let truncated: Bool
-    private let columnWidths: [CGFloat]
+    @State private var cache = PreviewParseCache<CsvPreviewModel>()
 
     private static let cellFont = Font.system(size: 12, design: .monospaced)
-    private static let charWidth: CGFloat = 7.3   // ~advance of SF Mono 12pt
-    private static let minColumnWidth: CGFloat = 46
-    private static let maxColumnWidth: CGFloat = 340
-    private static let cellPaddingH: CGFloat = 10
-
-    init(text: String) {
-        self.text = text
-        let delimiter = CsvTable.detectDelimiter(text)
-        let parsed = CsvTable.parse(text, delimiter: delimiter)
-        self.rows = parsed.rows
-        self.truncated = parsed.truncated
-
-        let columnCount = parsed.rows.map(\.count).max() ?? 0
-        var widths = [CGFloat](repeating: Self.minColumnWidth, count: columnCount)
-        for row in parsed.rows {
-            for (column, value) in row.enumerated() where column < columnCount {
-                let fitted = min(
-                    Self.maxColumnWidth,
-                    max(Self.minColumnWidth, CGFloat(value.count) * Self.charWidth + Self.cellPaddingH * 2)
-                )
-                if fitted > widths[column] { widths[column] = fitted }
-            }
-        }
-        self.columnWidths = widths
-    }
 
     var body: some View {
+        let model = cache.value(for: text, parse: CsvPreviewModel.make)
         VStack(alignment: .leading, spacing: 0) {
-            if truncated { truncationNotice }
-            if rows.isEmpty {
+            if model.truncated { truncationNotice(rowCount: model.rows.count) }
+            if model.rows.isEmpty {
                 ContentUnavailableView(
                     "Empty file",
                     systemImage: "tablecells",
@@ -183,8 +225,8 @@ struct CsvPreview: View {
             } else {
                 ScrollView([.horizontal, .vertical]) {
                     LazyVStack(alignment: .leading, spacing: 0) {
-                        ForEach(Array(rows.enumerated()), id: \.offset) { index, row in
-                            rowView(row, isHeader: index == 0)
+                        ForEach(Array(model.rows.enumerated()), id: \.offset) { index, row in
+                            rowView(row, columnWidths: model.columnWidths, isHeader: index == 0)
                             Divider()
                         }
                     }
@@ -194,7 +236,7 @@ struct CsvPreview: View {
         }
     }
 
-    private func rowView(_ row: [String], isHeader: Bool) -> some View {
+    private func rowView(_ row: [String], columnWidths: [CGFloat], isHeader: Bool) -> some View {
         HStack(spacing: 0) {
             ForEach(Array(columnWidths.enumerated()), id: \.offset) { column, width in
                 cell(column < row.count ? row[column] : "", width: width, isHeader: isHeader)
@@ -210,7 +252,7 @@ struct CsvPreview: View {
             .lineLimit(1)
             .truncationMode(.tail)
             .textSelection(.enabled)
-            .padding(.horizontal, Self.cellPaddingH)
+            .padding(.horizontal, CsvPreviewModel.cellPadding)
             .padding(.vertical, 5)
             .frame(width: width, alignment: .leading)
             // A trailing hairline as a column separator; an overlay matches the
@@ -221,9 +263,9 @@ struct CsvPreview: View {
             }
     }
 
-    private var truncationNotice: some View {
+    private func truncationNotice(rowCount: Int) -> some View {
         Label(
-            "Showing the first \(rows.count) rows (preview caps at \(CsvTable.maxRows) rows × \(CsvTable.maxCols) columns).",
+            "Showing the first \(rowCount) rows (preview caps at \(CsvTable.maxRows) rows × \(CsvTable.maxCols) columns).",
             systemImage: "exclamationmark.triangle.fill"
         )
         .font(.caption)
@@ -244,12 +286,20 @@ enum JsonTree {
     static let maxDepth = 12
     static let maxNodes = 2_000
 
+    /// The identity of the root value. Child paths extend it with `.key` for
+    /// object members and `[index]` for array elements.
+    static let rootPath = "$"
+
     /// One node in the rendered JSON tree. A reference type so SwiftUI can hold
     /// stable identities across expand/collapse.
     final class Node: Identifiable {
         enum Kind: Equatable { case object, array, string, number, bool, null, truncated }
 
-        let id = UUID()
+        /// The path to this value (`$.meta.items[3]`), not a fresh `UUID`.
+        /// Disclosure state is keyed by node identity, so a rebuilt tree — a
+        /// re-render, a reload, a returning tab — must reuse the same ids or
+        /// every expanded object silently snaps shut.
+        let id: String
         /// Object key or `[index]` label; `nil` for the root value.
         let key: String?
         /// Scalar text, or a `{n}` / `[n]` container summary.
@@ -258,7 +308,15 @@ enum JsonTree {
         let children: [Node]
         let isTruncationMarker: Bool
 
-        init(key: String?, display: String, kind: Kind, children: [Node] = [], isTruncationMarker: Bool = false) {
+        init(
+            id: String,
+            key: String?,
+            display: String,
+            kind: Kind,
+            children: [Node] = [],
+            isTruncationMarker: Bool = false
+        ) {
+            self.id = id
             self.key = key
             self.display = display
             self.kind = kind
@@ -281,13 +339,27 @@ enum JsonTree {
     /// truncation-marker node is inserted so the UI can flag it.
     nonisolated static func build(_ data: Any, key: String? = nil) -> Node {
         var count = 0
-        return build(data, key: key, depth: 0, count: &count)
+        return build(data, key: key, path: rootPath, depth: 0, count: &count)
     }
 
-    nonisolated private static func build(_ data: Any, key: String?, depth: Int, count: inout Int) -> Node {
+    /// The identity of a container's truncation marker. Object children always
+    /// join with `.` and array children with `[`, so a suffix using neither can
+    /// never collide with a real member — including a key literally named
+    /// `truncated`.
+    nonisolated private static func truncationPath(_ path: String) -> String {
+        path + "|truncated"
+    }
+
+    nonisolated private static func build(
+        _ data: Any,
+        key: String?,
+        path: String,
+        depth: Int,
+        count: inout Int
+    ) -> Node {
         count += 1
         if depth > maxDepth {
-            return Node(key: key, display: "…", kind: .truncated, isTruncationMarker: true)
+            return Node(id: path, key: key, display: "…", kind: .truncated, isTruncationMarker: true)
         }
 
         switch data {
@@ -296,40 +368,85 @@ enum JsonTree {
             for childKey in dictionary.keys.sorted() {
                 if count >= maxNodes {
                     let remaining = dictionary.count - children.count
-                    children.append(Node(key: nil, display: "… \(remaining) more", kind: .truncated, isTruncationMarker: true))
+                    children.append(Node(
+                        id: truncationPath(path),
+                        key: nil,
+                        display: "… \(remaining) more",
+                        kind: .truncated,
+                        isTruncationMarker: true
+                    ))
                     break
                 }
-                children.append(build(dictionary[childKey] as Any, key: childKey, depth: depth + 1, count: &count))
+                children.append(build(
+                    dictionary[childKey] as Any,
+                    key: childKey,
+                    path: "\(path).\(childKey)",
+                    depth: depth + 1,
+                    count: &count
+                ))
             }
-            return Node(key: key, display: "{\(dictionary.count)}", kind: .object, children: children)
+            return Node(id: path, key: key, display: "{\(dictionary.count)}", kind: .object, children: children)
 
         case let array as [Any]:
             var children: [Node] = []
             for (index, element) in array.enumerated() {
                 if count >= maxNodes {
-                    children.append(Node(key: nil, display: "… \(array.count - index) more", kind: .truncated, isTruncationMarker: true))
+                    children.append(Node(
+                        id: truncationPath(path),
+                        key: nil,
+                        display: "… \(array.count - index) more",
+                        kind: .truncated,
+                        isTruncationMarker: true
+                    ))
                     break
                 }
-                children.append(build(element, key: "[\(index)]", depth: depth + 1, count: &count))
+                children.append(build(
+                    element,
+                    key: "[\(index)]",
+                    path: "\(path)[\(index)]",
+                    depth: depth + 1,
+                    count: &count
+                ))
             }
-            return Node(key: key, display: "[\(array.count)]", kind: .array, children: children)
+            return Node(id: path, key: key, display: "[\(array.count)]", kind: .array, children: children)
 
         case is NSNull:
-            return Node(key: key, display: "null", kind: .null)
+            return Node(id: path, key: key, display: "null", kind: .null)
 
         case let number as NSNumber:
             // JSON true/false arrive as CFBoolean-backed NSNumbers; distinguish
             // them from numeric NSNumbers by CoreFoundation type id.
             if CFGetTypeID(number) == CFBooleanGetTypeID() {
-                return Node(key: key, display: number.boolValue ? "true" : "false", kind: .bool)
+                return Node(id: path, key: key, display: number.boolValue ? "true" : "false", kind: .bool)
             }
-            return Node(key: key, display: number.stringValue, kind: .number)
+            return Node(id: path, key: key, display: number.stringValue, kind: .number)
 
         case let string as String:
-            return Node(key: key, display: string, kind: .string)
+            return Node(id: path, key: key, display: string, kind: .string)
 
         default:
-            return Node(key: key, display: String(describing: data), kind: .string)
+            return Node(id: path, key: key, display: String(describing: data), kind: .string)
+        }
+    }
+}
+
+/// What a JSON document renders as. Deserialization plus tree building is the
+/// expensive part of the preview, so it is produced once per content identity
+/// rather than on every SwiftUI body evaluation.
+enum JsonPreviewOutcome {
+    case tree(root: JsonTree.Node, truncated: Bool)
+    case invalid(message: String)
+
+    nonisolated static func make(_ text: String) -> JsonPreviewOutcome {
+        guard let data = text.data(using: .utf8) else {
+            return .invalid(message: "File is not valid UTF-8 text.")
+        }
+        do {
+            let object = try JSONSerialization.jsonObject(with: data, options: [.fragmentsAllowed])
+            let root = JsonTree.build(object)
+            return .tree(root: root, truncated: root.containsTruncation)
+        } catch {
+            return .invalid(message: error.localizedDescription)
         }
     }
 }
@@ -340,13 +457,10 @@ enum JsonTree {
 struct JsonPreview: View {
     let text: String
 
-    private enum Outcome {
-        case tree(root: JsonTree.Node, truncated: Bool)
-        case invalid(message: String)
-    }
+    @State private var cache = PreviewParseCache<JsonPreviewOutcome>()
 
     var body: some View {
-        switch Self.parse(text) {
+        switch cache.value(for: text, parse: JsonPreviewOutcome.make) {
         case let .tree(root, truncated):
             VStack(alignment: .leading, spacing: 0) {
                 if truncated { truncationNotice }
@@ -359,19 +473,6 @@ struct JsonPreview: View {
             }
         case let .invalid(message):
             invalidView(message)
-        }
-    }
-
-    private static func parse(_ text: String) -> Outcome {
-        guard let data = text.data(using: .utf8) else {
-            return .invalid(message: "File is not valid UTF-8 text.")
-        }
-        do {
-            let object = try JSONSerialization.jsonObject(with: data, options: [.fragmentsAllowed])
-            let root = JsonTree.build(object)
-            return .tree(root: root, truncated: root.containsTruncation)
-        } catch {
-            return .invalid(message: error.localizedDescription)
         }
     }
 

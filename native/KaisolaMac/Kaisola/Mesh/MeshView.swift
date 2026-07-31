@@ -301,14 +301,37 @@ private struct MeshColumnView: View {
         self.conversation = column.conversation
     }
 
+    /// A dotted ring, a filled disc, and a hollow ring — three shapes, so the
+    /// tint below is reinforcement rather than the only way to read the state.
+    private var statusSymbol: String {
+        if conversation.isRunning { return "circle.dotted" }
+        return conversation.isConnected ? "circle.fill" : "circle"
+    }
+
+    private var statusTint: Color {
+        if conversation.isRunning { return .accentColor }
+        return conversation.isConnected ? .green : .secondary
+    }
+
+    private var statusDescription: String {
+        if conversation.isRunning { return "Working" }
+        return conversation.isConnected ? "Connected" : "Not connected"
+    }
+
     var body: some View {
         VStack(spacing: 0) {
             HStack(spacing: 7) {
                 Image(systemName: column.agent.symbol).foregroundStyle(.purple)
                 Text(column.agent.name).font(.callout.weight(.semibold))
-                Circle()
-                    .fill(conversation.isRunning ? Color.accentColor : (conversation.isConnected ? .green : .secondary))
-                    .frame(width: 6, height: 6)
+                // Three states off one tinted dot meant colour was the whole
+                // signal. Each state now has its own outline as well, and says
+                // its name to VoiceOver and on hover.
+                Image(systemName: statusSymbol)
+                    .font(.system(size: 7, weight: .black))
+                    .foregroundStyle(statusTint)
+                    .accessibilityElement()
+                    .accessibilityLabel("\(column.agent.name): \(statusDescription)")
+                    .help(statusDescription)
                 Spacer()
                 if conversation.isRunning {
                     Button(action: stop) {

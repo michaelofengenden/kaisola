@@ -58,11 +58,17 @@ struct SubscriptionCardView: View {
                     .foregroundStyle(.secondary)
                     .frame(width: 22, height: 22)
                     .background(.quaternary.opacity(0.5), in: RoundedRectangle(cornerRadius: 6, style: .continuous))
-                Circle()
-                    .fill(statusColor)
-                    .frame(width: 7, height: 7)
-                    .overlay(Circle().strokeBorder(.background, lineWidth: 1.5))
-                    .offset(x: -3, y: -3)
+                // Four states shared one tinted dot, and the red one — the
+                // account that needs attention — had no text anywhere to fall
+                // back on. Each state now carries its own glyph and its own
+                // words.
+                Image(systemName: statusSymbol)
+                    .font(.system(size: 9, weight: .bold))
+                    .foregroundStyle(statusColor, Color(nsColor: .windowBackgroundColor))
+                    .offset(x: -4, y: -4)
+                    .accessibilityElement()
+                    .accessibilityLabel("\(profile.label): \(statusDescription)")
+                    .help(statusDescription)
             }
             VStack(alignment: .leading, spacing: 1) {
                 Text(profile.label)
@@ -90,6 +96,18 @@ struct SubscriptionCardView: View {
         guard let usage else { return .secondary }
         if !usage.ok { return .red }
         return usage.account?.isEmpty == false ? .green : .orange
+    }
+
+    private var statusSymbol: String {
+        guard let usage else { return "circle.dotted" }
+        if !usage.ok { return "exclamationmark.circle.fill" }
+        return usage.account?.isEmpty == false ? "checkmark.circle.fill" : "circle"
+    }
+
+    private var statusDescription: String {
+        guard let usage else { return "Checking this account" }
+        if !usage.ok { return "Needs attention" }
+        return usage.account?.isEmpty == false ? "Signed in" : "Not signed in"
     }
 
     // MARK: - Identity

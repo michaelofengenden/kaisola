@@ -66,9 +66,20 @@ struct AcpChatView: View {
 
     private var standardHeader: some View {
         HStack(spacing: 10) {
-            Circle()
-                .fill(conversation.isConnected ? Color.green : Color.secondary.opacity(0.6))
-                .frame(width: 7, height: 7)
+            // Green-versus-grey is invisible to a red/green-blind user and to
+            // VoiceOver alike, so the dot loses its fill when the adapter is
+            // detached and says which state it is in.
+            Group {
+                if conversation.isConnected {
+                    Circle().fill(Color.green)
+                } else {
+                    Circle().strokeBorder(Color.secondary.opacity(0.7), lineWidth: 1.5)
+                }
+            }
+            .frame(width: 7, height: 7)
+            .accessibilityElement()
+            .accessibilityLabel(conversation.isConnected ? "Connected" : "Not connected")
+            .help(conversation.isConnected ? "Connected" : "Not connected")
             Text(conversation.title).font(.subheadline.weight(.medium))
             if conversation.isRunning {
                 ProgressView().controlSize(.small)

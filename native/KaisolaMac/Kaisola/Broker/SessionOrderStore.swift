@@ -32,8 +32,12 @@ struct SessionOrderStore: Sendable {
     /// Reorders `sessions` per the stored `ids`: known ids first in stored
     /// order, then any sessions not present in `ids` appended in their
     /// incoming order. Stale ids (no matching session) are ignored.
+    ///
+    /// Duplicate ids in `sessions` keep the first record rather than trapping:
+    /// this runs on every sidebar render, and a transient duplicate from a
+    /// broker reconnect or an observe-only merge must not crash the app.
     nonisolated static func apply(_ ids: [String], to sessions: [BrokerTerminalRecord]) -> [BrokerTerminalRecord] {
-        let byID = Dictionary(uniqueKeysWithValues: sessions.map { ($0.id, $0) })
+        let byID = Dictionary(sessions.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
         var out: [BrokerTerminalRecord] = ids.compactMap { byID[$0] }
         let placed = Set(out.map(\.id))
         out.append(contentsOf: sessions.filter { !placed.contains($0.id) })

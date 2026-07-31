@@ -13,6 +13,7 @@
 		04F51C3955F0C4BD44AE3B81 /* AcpTerminalHost.swift in Sources */ = {isa = PBXBuildFile; fileRef = A85A5A6E3A5EC404CB81A0BD /* AcpTerminalHost.swift */; };
 		064587EDDCB61E12B2C9EFBA /* NativeTerminalInteractionTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5C89B154EE5DAF4AFF41692D /* NativeTerminalInteractionTests.swift */; };
 		08170963E8934AB8ED6F50AB /* TerminalSurfaceCache.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9653464233B6252DE76DC814 /* TerminalSurfaceCache.swift */; };
+		081A41C0B1FA213B7CD74208 /* QuietStatusDerivationTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = AD8887E4ADA2A72E8F2F8B9B /* QuietStatusDerivationTests.swift */; };
 		08AD90B91DFB148BF2F3B5E8 /* KaisolaMacAppDelegate.swift in Sources */ = {isa = PBXBuildFile; fileRef = D624AF2C46BA83B73A21F0B3 /* KaisolaMacAppDelegate.swift */; };
 		094E4A2FC294A9392EAF649F /* MeshSessionTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 53455843EE4C394EEF0158BC /* MeshSessionTests.swift */; };
 		0C134B5332C1E4A62E0A21E6 /* NativePreviewSettingsTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6AE795C503468AA7CEC0D736 /* NativePreviewSettingsTests.swift */; };
@@ -205,6 +206,7 @@
 		F369C66C4AB127DBFD4B5773 /* DataPreviews.swift in Sources */ = {isa = PBXBuildFile; fileRef = 681E5B3C599B2137041A4E8F /* DataPreviews.swift */; };
 		F377CC5A92CBA50885FEE900 /* GitService.swift in Sources */ = {isa = PBXBuildFile; fileRef = 616586FF6B1EBC62BE203518 /* GitService.swift */; };
 		F3A2F441F5C855CA1BB795E0 /* QuietSessionStatusTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 682112A86BEA2294BA686706 /* QuietSessionStatusTests.swift */; };
+		F4248E5440AD98344F6FAF7F /* QuietStatusDerivation.swift in Sources */ = {isa = PBXBuildFile; fileRef = 46530C246C60DC969457FB84 /* QuietStatusDerivation.swift */; };
 		F4C6C5462997C4F025270D7D /* CustomAgentStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = F4C9DE8414FD78B1EFA06235 /* CustomAgentStore.swift */; };
 		F5139A7FD8A6FD7EEFABB6AB /* BrokerBootstrapXPC.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1CF54122B716B55D67623C3F /* BrokerBootstrapXPC.swift */; };
 		F54657F1A6F671121F2FB2B3 /* ObserveOnlyBrokerClientTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 96F1989B7416C050648E9CAB /* ObserveOnlyBrokerClientTests.swift */; };
@@ -294,6 +296,7 @@
 		44220D13FC4D0265D132F67A /* TerminalCursorStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TerminalCursorStore.swift; sourceTree = "<group>"; };
 		455D0FF2F635A75069247811 /* BrokerBootstrapClient.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BrokerBootstrapClient.swift; sourceTree = "<group>"; };
 		45799AC8A5D80828BB3EB235 /* AppModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppModel.swift; sourceTree = "<group>"; };
+		46530C246C60DC969457FB84 /* QuietStatusDerivation.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = QuietStatusDerivation.swift; sourceTree = "<group>"; };
 		481C565423F2C82B8F330468 /* CompanionDeviceRosterStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CompanionDeviceRosterStore.swift; sourceTree = "<group>"; };
 		496E90C9073FF30527C9C128 /* ApiKeyStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ApiKeyStore.swift; sourceTree = "<group>"; };
 		4A70FC513A508673AD06C7E8 /* AppModelBrokerFallbackTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppModelBrokerFallbackTests.swift; sourceTree = "<group>"; };
@@ -375,6 +378,7 @@
 		A8A8DBF7E5E633D17ADDE128 /* RememberedSessionCatalog.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RememberedSessionCatalog.swift; sourceTree = "<group>"; };
 		A8C8F92A50B6817748440EAE /* DetachedBrokerProcess.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DetachedBrokerProcess.swift; sourceTree = "<group>"; };
 		A962C9CEB31001E24F6C64BE /* TerminalMetaService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TerminalMetaService.swift; sourceTree = "<group>"; };
+		AD8887E4ADA2A72E8F2F8B9B /* QuietStatusDerivationTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = QuietStatusDerivationTests.swift; sourceTree = "<group>"; };
 		AF52791E7FB87F94AF30DBD2 /* NoBoardBoundaryTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NoBoardBoundaryTests.swift; sourceTree = "<group>"; };
 		B29CF4F90D6C4CD2F54D1948 /* ProjectReorderTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ProjectReorderTests.swift; sourceTree = "<group>"; };
 		B2C1094B3B6E5323C1AAE22E /* TerminalTranscriptTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TerminalTranscriptTests.swift; sourceTree = "<group>"; };
@@ -602,6 +606,7 @@
 				E2C62AECA29EC2AB89B8C85A /* QuietRollup.swift */,
 				E871B07C959F4B3AA9233CFE /* QuietSessionStatus.swift */,
 				24F47DB42ECE72E7A870B5E7 /* QuietStatusClock.swift */,
+				46530C246C60DC969457FB84 /* QuietStatusDerivation.swift */,
 				CBB83EF128840150F6F7103D /* RootShellView.swift */,
 				1D546C26BAA99A03D0E76CA7 /* SessionPaneLayout.swift */,
 				2D21E5A80D0B8BA9622A84FE /* SessionTitleTracker.swift */,
@@ -752,6 +757,7 @@
 				D011FEC3CB6A3F15FA1FC5AC /* QuietRollupTests.swift */,
 				682112A86BEA2294BA686706 /* QuietSessionStatusTests.swift */,
 				C04010C4C83AE322453E2F1F /* QuietStatusClockTests.swift */,
+				AD8887E4ADA2A72E8F2F8B9B /* QuietStatusDerivationTests.swift */,
 				CF0112BAE21EFB0355FAB3CA /* RememberedSessionCatalogTests.swift */,
 				0309F5DD6F095F40A096AA42 /* SavedWindowsStoreTests.swift */,
 				732793D0CFBFD121B1D4146D /* SessionOrderStoreTests.swift */,
@@ -1086,6 +1092,7 @@
 				336BCD151BF7DF4E1FBDE151 /* QuietRollup.swift in Sources */,
 				6FF083B2FF23AA15D7648E9F /* QuietSessionStatus.swift in Sources */,
 				7FF3EA80ABF0D3AA00F5FA0B /* QuietStatusClock.swift in Sources */,
+				F4248E5440AD98344F6FAF7F /* QuietStatusDerivation.swift in Sources */,
 				2D87B2E1CE804065E07728CC /* RememberedSessionCatalog.swift in Sources */,
 				048E24B33924C66C0A0F484F /* RootShellView.swift in Sources */,
 				B417F4F52D40B81736E1F7CC /* SavedWindowsStore.swift in Sources */,
@@ -1191,6 +1198,7 @@
 				61AD5F4925746EC3EBB39552 /* QuietRollupTests.swift in Sources */,
 				F3A2F441F5C855CA1BB795E0 /* QuietSessionStatusTests.swift in Sources */,
 				1402D69DCC56FF170B7E18A4 /* QuietStatusClockTests.swift in Sources */,
+				081A41C0B1FA213B7CD74208 /* QuietStatusDerivationTests.swift in Sources */,
 				A0866D44257B82ED4F1484E7 /* RememberedSessionCatalogTests.swift in Sources */,
 				93DFA71C6988B2A423631EA3 /* SavedWindowsStoreTests.swift in Sources */,
 				4E414C9D7F85C2BA40C92E76 /* SessionOrderStoreTests.swift in Sources */,

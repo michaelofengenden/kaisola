@@ -3,10 +3,26 @@ import XCTest
 @testable import Kaisola
 
 final class SessionOrderStoreTests: XCTestCase {
-    private func record(_ id: String) -> BrokerTerminalRecord {
+    private func record(_ id: String, pid: Int32? = nil) -> BrokerTerminalRecord {
         BrokerTerminalRecord(
-            id: id, projectID: "p", pid: nil, exited: false, streamEpoch: nil, endOffset: 0
+            id: id, projectID: "p", pid: pid, exited: false, streamEpoch: nil, endOffset: 0
         )
+    }
+
+    /// `apply` runs on every sidebar render, so a duplicate id (broker
+    /// reconnect, observe-only merge) must not trap the app: the first record
+    /// wins and the duplicate is dropped.
+    func testApplyToleratesDuplicateIDs() {
+        let sessions = [record("a", pid: 1), record("a", pid: 2), record("b")]
+        let out = SessionOrderStore.apply(["a"], to: sessions)
+        XCTAssertEqual(out.map(\.id), ["a", "b"])
+        XCTAssertEqual(out.first?.pid, 1)
+    }
+
+    func testApplyWithoutStoredOrderToleratesDuplicateIDs() {
+        let sessions = [record("a", pid: 1), record("a", pid: 2)]
+        let out = SessionOrderStore.apply([], to: sessions)
+        XCTAssertEqual(out.map(\.id), ["a", "a"])
     }
 
     func testApplyOrdersKnownFirstThenAppendsNew() {

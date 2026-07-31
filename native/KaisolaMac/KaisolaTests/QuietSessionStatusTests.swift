@@ -15,7 +15,12 @@ final class QuietSessionStatusTests: XCTestCase {
     func testChatDerivation() {
         XCTAssertEqual(QuietSessionStatus.chat(isRunning: true, isConnected: true, hasPendingPermission: false, hasAttention: false, statusMessage: nil), .working)
         XCTAssertEqual(QuietSessionStatus.chat(isRunning: true, isConnected: true, hasPendingPermission: true, hasAttention: false, statusMessage: nil), .needsYou)
-        XCTAssertEqual(QuietSessionStatus.chat(isRunning: false, isConnected: false, hasPendingPermission: false, hasAttention: false, statusMessage: "agent exited"), .failed)
+        // Contract change: a disconnected chat is `.ended` regardless of the
+        // status message. AcpConversation publishes a message on clean exits
+        // too, so `statusMessage != nil` used to paint every finished chat red.
+        // `.failed` is deliberately produced by no derivation today.
+        XCTAssertEqual(QuietSessionStatus.chat(isRunning: false, isConnected: false, hasPendingPermission: false, hasAttention: false, statusMessage: "agent exited"), .ended)
+        XCTAssertEqual(QuietSessionStatus.chat(isRunning: false, isConnected: false, hasPendingPermission: false, hasAttention: false, statusMessage: nil), .ended)
         XCTAssertEqual(QuietSessionStatus.chat(isRunning: false, isConnected: true, hasPendingPermission: false, hasAttention: true, statusMessage: nil), .needsYou)
         XCTAssertEqual(QuietSessionStatus.chat(isRunning: false, isConnected: true, hasPendingPermission: false, hasAttention: false, statusMessage: nil), .idle)
     }

@@ -93,8 +93,9 @@ struct QuietProjectRail: View {
 
 // MARK: - Metrics
 
-/// Every size the rail uses. The type scale bottoms out at 10.5pt — nothing in
-/// the sidebar is allowed to be smaller than the time label.
+/// Every size the rail uses. Text bottoms out at 10.5pt — no *label* in the
+/// sidebar is smaller than the time label; symbol glyphs (the hover chevron and
+/// `+`) may be smaller, since they carry no reading load.
 private enum QuietRailMetrics {
     static let headerText: CGFloat = 13
     static let titleText: CGFloat = 12.5
@@ -141,7 +142,9 @@ private struct QuietProjectGroup: View {
     var body: some View {
         let chats = model.chats(in: project.id)
         let meshes = model.meshes(in: project.id)
-        let sessions = SessionOrderStore.apply(manualOrder, to: model.pinnedSort(project.sessions))
+        // `AppModel.projects` already returns each group's sessions in pinned
+        // order, so the manual drag order is the only sort applied here.
+        let sessions = SessionOrderStore.apply(manualOrder, to: project.sessions)
         let statuses = statusMap(sessions: sessions, chats: chats, meshes: meshes)
 
         Group {
@@ -175,21 +178,37 @@ private struct QuietProjectGroup: View {
     private func header(statuses: [String: QuietSessionStatus]) -> some View {
         let tint = ProjectTint.color(project.colorHex) ?? WorkspacePalette.project
         HStack(spacing: 6) {
-            Text(project.name)
-                .font(.system(size: QuietRailMetrics.headerText, weight: isActive ? .semibold : .medium))
-                .foregroundStyle(isActive ? HierarchicalShapeStyle.primary : .secondary)
-                .lineLimit(1)
-                .truncationMode(.middle)
-                .accessibilityAddTraits(.isHeader)
-            Spacer(minLength: 4)
-            if !isExpanded {
-                QuietRollupView(rollup: QuietRollup.of(Array(statuses.values)))
+            // A real Button, not a tap gesture: it is what gives the header a
+            // press action for VoiceOver, Full Keyboard Access and automation.
+            // The `+` stays a SIBLING of the button rather than part of its
+            // label, because a Menu nested inside a button label never receives
+            // the click that opens it.
+            Button(action: toggle) {
+                HStack(spacing: 6) {
+                    Text(project.name)
+                        .font(.system(size: QuietRailMetrics.headerText, weight: isActive ? .semibold : .medium))
+                        .foregroundStyle(isActive ? HierarchicalShapeStyle.primary : .secondary)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                    Spacer(minLength: 4)
+                    if !isExpanded {
+                        QuietRollupView(rollup: QuietRollup.of(Array(statuses.values)))
+                    }
+                    if hovering {
+                        Image(systemName: isExpanded ? "chevron.down" : "chevron.right")
+                            .font(.system(size: QuietRailMetrics.chevronText, weight: .semibold))
+                            .foregroundStyle(.tertiary)
+                            .accessibilityHidden(true)
+                    }
+                }
+                .contentShape(Rectangle())
             }
+            .buttonStyle(.plain)
+            // The row is both the section heading and its expand control, so the
+            // header trait moves onto the button rather than being lost inside
+            // the (now combined) label.
+            .accessibilityAddTraits(.isHeader)
             if hovering {
-                Image(systemName: isExpanded ? "chevron.down" : "chevron.right")
-                    .font(.system(size: QuietRailMetrics.chevronText, weight: .semibold))
-                    .foregroundStyle(.tertiary)
-                    .accessibilityHidden(true)
                 Menu {
                     launchMenu(project)
                 } label: {
@@ -216,13 +235,12 @@ private struct QuietProjectGroup: View {
                     .fill(tint.opacity(0.12))
             }
         }
-        .onTapGesture { toggle() }
         .onHover { inside in
             withAnimation(.easeOut(duration: KaisolaVisualSystem.hoverDuration)) { hovering = inside }
         }
         .contextMenu {
-            projectMenu(project)
-            Divider()
+            // Move Up/Down come first so the destructive tail of the passed-in
+            // project menu (Close Project) stays last in the composed menu.
             // ⌥↑/⌥↓ target the active project only, so a menu opened on a
             // non-active project's header never reorders the wrong row.
             Button("Move Up") {
@@ -237,6 +255,8 @@ private struct QuietProjectGroup: View {
             }
             .keyboardShortcut(.downArrow, modifiers: .option)
             .disabled(!isActive)
+            Divider()
+            projectMenu(project)
         }
         .accessibilityElement(children: .contain)
         .accessibilityAction(named: Text(isExpanded ? "Collapse" : "Expand")) { toggle() }
@@ -339,8 +359,9 @@ private struct QuietProjectGroup: View {
 
     /// A completed turn is not by itself a needs-you: it becomes one only while
     /// it is still unseen, which `QuietSessionStatus` models as `doneUnseen`.
-    private func hasAttention(_ id: String) -> Bool {
-        attention.entries.contains { $0.targetID == id && $0.kind != .turnCompleted }
+    /// The rule itself lives in `QuietStatusDerivation` so it can be tested.
+    private func hasPermissionAttention(_ id: String) -> Bool {
+        QuietStatusDerivation.needsAttention(entries: attention.entries, for: id)
     }
 
     private func terminalStatus(_ record: BrokerTerminalRecord) -> QuietSessionStatus {
@@ -348,26 +369,32 @@ private struct QuietProjectGroup: View {
         if case .responded(let at) = record.agentActivity {
             acknowledged = attention.hasAcknowledgedSessionResponse(targetID: record.id, completedAt: at)
         }
-        return QuietSessionStatus.terminal(
+        return QuietStatusDerivation.terminal(
             activity: record.agentActivity,
             exited: record.exited,
-            hasAttention: hasAttention(record.id),
+            hasPermissionAttention: hasPermissionAttention(record.id),
             respondedAcknowledged: acknowledged
         )
     }
 
     private func chatStatus(_ chat: AcpChatHandle) -> QuietSessionStatus {
-        QuietSessionStatus.chat(
+        QuietStatusDerivation.chat(
             isRunning: chat.conversation.isRunning,
             isConnected: chat.conversation.isConnected,
             hasPendingPermission: chat.conversation.pendingPermission != nil,
-            hasAttention: hasAttention(chat.id),
+            hasPermissionAttention: hasPermissionAttention(chat.id),
             statusMessage: chat.conversation.statusMessage
         )
     }
 
+    /// Derived from the columns' live conversations, not from `mesh.stage`:
+    /// stage is a display string, so matching it against "Idle" left
+    /// "Interrupted" and "Scout timed out…" pulsing green forever.
     private func meshStatus(_ mesh: MeshSession) -> QuietSessionStatus {
-        QuietSessionStatus.mesh(stageIsIdle: mesh.stage == "Idle", hasAttention: hasAttention(mesh.id))
+        QuietStatusDerivation.mesh(
+            anyColumnRunning: mesh.anyRunning,
+            hasPermissionAttention: hasPermissionAttention(mesh.id)
+        )
     }
 
     private func noteAll(_ statuses: [String: QuietSessionStatus]) {
@@ -535,16 +562,19 @@ private struct QuietSessionRowView: View {
     let menu: (BrokerTerminalRecord) -> AnyView
 
     var body: some View {
-        QuietRowBody(
-            glyph: glyph,
-            title: title,
-            timeLabel: timeLabel,
-            status: status,
-            isSelected: isSelected
-        )
-        .onTapGesture(perform: select)
-        // The tap gesture alone is invisible to VoiceOver and keyboard control;
-        // the button trait plus a default action make the row activatable.
+        // A Button, not a tap gesture: a gesture is invisible to VoiceOver,
+        // Full Keyboard Access and automation, so the row would expose no press
+        // action. `.plain` keeps the row's own appearance.
+        Button(action: select) {
+            QuietRowBody(
+                glyph: glyph,
+                title: title,
+                timeLabel: timeLabel,
+                status: status,
+                isSelected: isSelected
+            )
+        }
+        .buttonStyle(.plain)
         .accessibilityAddTraits(.isButton)
         .accessibilityAction { select() }
         .help(tooltip)
@@ -567,14 +597,16 @@ private struct QuietChatRowView: View {
     let menu: (AcpChatHandle) -> AnyView
 
     var body: some View {
-        QuietRowBody(
-            glyph: glyph,
-            title: title,
-            timeLabel: timeLabel,
-            status: status,
-            isSelected: isSelected
-        )
-        .onTapGesture(perform: select)
+        Button(action: select) {
+            QuietRowBody(
+                glyph: glyph,
+                title: title,
+                timeLabel: timeLabel,
+                status: status,
+                isSelected: isSelected
+            )
+        }
+        .buttonStyle(.plain)
         .accessibilityAddTraits(.isButton)
         .accessibilityAction { select() }
         .help(tooltip)
@@ -596,14 +628,16 @@ private struct QuietMeshRowView: View {
     let menu: (MeshSession) -> AnyView
 
     var body: some View {
-        QuietRowBody(
-            glyph: "⌗",
-            title: title,
-            timeLabel: timeLabel,
-            status: status,
-            isSelected: isSelected
-        )
-        .onTapGesture(perform: select)
+        Button(action: select) {
+            QuietRowBody(
+                glyph: "⌗",
+                title: title,
+                timeLabel: timeLabel,
+                status: status,
+                isSelected: isSelected
+            )
+        }
+        .buttonStyle(.plain)
         .accessibilityAddTraits(.isButton)
         .accessibilityAction { select() }
         .help(tooltip)

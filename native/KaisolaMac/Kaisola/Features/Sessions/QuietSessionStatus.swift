@@ -15,9 +15,19 @@ enum QuietSessionStatus: Equatable {
         }
     }
 
+    /// A disconnected chat is always `.ended`, never `.failed`.
+    ///
+    /// `AcpConversation` publishes a `statusMessage` on clean exits as well as
+    /// crashes ("agent exited", "session ended", …), so a non-nil message
+    /// cannot distinguish "the agent finished" from "the agent died" and every
+    /// finished chat painted red. `.failed` therefore stays in the enum but is
+    /// currently produced by no derivation: the published state carries no
+    /// crash signal today. Revisit post-merge when the chat crash-recovery
+    /// rework lands — `statusMessage` stays on this signature as the seam that
+    /// will carry that signal.
     static func chat(isRunning: Bool, isConnected: Bool, hasPendingPermission: Bool, hasAttention: Bool, statusMessage: String?) -> QuietSessionStatus {
         if hasPendingPermission || hasAttention { return .needsYou }
-        if !isConnected { return statusMessage == nil ? .ended : .failed }
+        if !isConnected { return .ended }
         return isRunning ? .working : .idle
     }
 

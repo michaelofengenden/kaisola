@@ -76,14 +76,19 @@ struct GitService: Sendable {
 
     // MARK: - Reads
 
+    /// `--no-optional-locks` keeps a read from taking `index.lock` and rewriting
+    /// the index just to refresh stat data. Without it, the panel's own status
+    /// read is itself a git-directory write — which the live watcher would report
+    /// back as a change, refreshing again. Git ships this flag for exactly this
+    /// class of caller.
     func status() throws -> Status {
-        let output = try run(["status", "--porcelain=v2", "--branch"])
+        let output = try run(["--no-optional-locks", "status", "--porcelain=v2", "--branch"])
         return Self.parseStatus(output)
     }
 
     func diff(path: String, staged: Bool) throws -> String {
         try guardPath(path)
-        var args = ["diff"]
+        var args = ["--no-optional-locks", "diff"]
         if staged { args.append("--staged") }
         args.append(contentsOf: ["--", path])
         let text = try run(args)

@@ -100,6 +100,33 @@ final class GitPRTests: XCTestCase {
         XCTAssertEqual(prep.aheadCount, 1)
     }
 
+    /// The two reads the PR review needs on top of the ahead subjects: the base
+    /// branch it will target and how many files the pull request would touch.
+    func testDefaultBranchAndChangedFilesDescribeThePullRequest() throws {
+        try write("a.txt", "one\n")
+        try git(["add", "a.txt"])
+        try git(["commit", "-q", "-m", "base"])
+
+        let service = GitService(repoRoot: repo)
+        XCTAssertEqual(service.defaultBranchName(), "main")   // no origin/HEAD → main
+        // On the default branch with no upstream there is no ahead range at all.
+        XCTAssertEqual(try service.aheadChangedFiles(), [])
+
+        try git(["checkout", "-q", "-b", "feature/files"])
+        try write("b.txt", "two\n")
+        try write("c.txt", "three\n")
+        try git(["add", "b.txt", "c.txt"])
+        try git(["commit", "-q", "-m", "add two files"])
+        try write("b.txt", "two changed\n")
+        try git(["add", "b.txt"])
+        try git(["commit", "-q", "-m", "touch b again"])
+
+        // Measured against the local default branch: two commits, but b.txt is
+        // counted once — the review shows files changed, not file-touch events.
+        XCTAssertEqual(try service.aheadChangedFiles().sorted(), ["b.txt", "c.txt"])
+        XCTAssertEqual(try service.aheadSubjects(), ["touch b again", "add two files"])
+    }
+
     // MARK: helpers
 
     private func write(_ name: String, _ contents: String) throws {

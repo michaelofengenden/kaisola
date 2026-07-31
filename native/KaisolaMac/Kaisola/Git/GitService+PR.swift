@@ -42,6 +42,20 @@ extension GitService {
         return output.split(separator: "\n", omittingEmptySubsequences: true).map(String.init)
     }
 
+    /// The branch a pull request from here would target — shown in the review
+    /// before anything is pushed.
+    func defaultBranchName() -> String {
+        resolveDefaultBranch()
+    }
+
+    /// The files the ahead commits touch, measured against the same base as
+    /// `aheadSubjects`. Empty when no base resolves.
+    func aheadChangedFiles() throws -> [String] {
+        guard let base = aheadBaseRef() else { return [] }
+        let output = try runGit(["--no-optional-locks", "diff", "--name-only", "\(base)..HEAD"])
+        return output.split(separator: "\n", omittingEmptySubsequences: true).map(String.init)
+    }
+
     /// Push the current branch. Sets an upstream (`push -u origin HEAD`) the first
     /// time; a plain `push` afterwards.
     func pushCurrentBranch(setUpstream: Bool) throws {

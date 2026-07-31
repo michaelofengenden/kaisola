@@ -1,0 +1,412 @@
+import Foundation
+import XCTest
+@testable import Kaisola
+
+/// The Git panel's two testable seams:
+///
+/// 1. `GitRefreshPolicy` — the pure "should a filesystem event turn into a real
+///    `git status` run yet?" decision that replaced the panel's 3s poll, plus a
+///    live round-trip proving an *external* `git add` refreshes the open panel.
+/// 2. `GitPRPlanner` / `PRPlan` — the pure assembly of a reviewable pull-request
+///    plan, so the first click can show exactly what the second click will do.
+final class GitPanelModelTests: XCTestCase {
+    private var repo: URL!
+
+    override func setUpWithError() throws {
+        repo = FileManager.default.temporaryDirectory
+            .appendingPathComponent("kaisola-gitpanel-\(UUID().uuidString.prefix(8))", isDirectory: true)
+        try FileManager.default.createDirectory(at: repo, withIntermediateDirectories: true)
+        try git(["init", "-q", "-b", "main"])
+        try git(["config", "user.email", "test@example.com"])
+        try git(["config", "user.name", "Test"])
+    }
+
+    override func tearDownWithError() throws {
+        try? FileManager.default.removeItem(at: repo)
+    }
+
+    // MARK: - GitRefreshPolicy (pure)
+
+    private let now = Date(timeIntervalSince1970: 1_800_000_000)
+    private let policy = GitRefreshPolicy()
+
+    func testNoPendingEventIsIdle() {
+        XCTAssertEqual(
+            policy.decide(pendingEventAt: nil, lastRefreshAt: now.addingTimeInterval(-60), isBusy: false, now: now),
+            .idle
+        )
+        // Idle regardless of a busy operation: nothing is waiting to be shown.
+        XCTAssertEqual(
+            policy.decide(pendingEventAt: nil, lastRefreshAt: nil, isBusy: true, now: now),
+            .idle
+        )
+    }
+
+    func testBusyDefersInsteadOfDroppingTheEvent() {
+        // A refresh started over a running op would be swallowed by the model's
+        // isBusy guard and the event lost, so a due event must WAIT, not refresh.
+        let decision = policy.decide(
+            pendingEventAt: now.addingTimeInterval(-10),
+            lastRefreshAt: now.addingTimeInterval(-10),
+            isBusy: true,
+            now: now
+        )
+        XCTAssertEqual(waitSeconds(decision), policy.busyRetry, accuracy: 0.001)
+    }
+
+    func testEventInsideDebounceWaitsForTheRemainder() {
+        let decision = policy.decide(
+            pendingEventAt: now.addingTimeInterval(-0.1),
+            lastRefreshAt: nil,
+            isBusy: false,
+            now: now
+        )
+        XCTAssertEqual(waitSeconds(decision), policy.debounce - 0.1, accuracy: 0.001)
+    }
+
+    func testDebouncedEventRefreshesWhenNoRefreshHasRunYet() {
+        XCTAssertEqual(
+            policy.decide(
+                pendingEventAt: now.addingTimeInterval(-policy.debounce),
+                lastRefreshAt: nil,
+                isBusy: false,
+                now: now
+            ),
+            .refresh
+        )
+    }
+
+    func testRateFloorHoldsBackAStormOfEvents() {
+        // Debounce satisfied, but a refresh ran 0.2s ago: agents rewriting a
+        // hundred files must not spawn a `git status` per event.
+        let decision = policy.decide(
+            pendingEventAt: now.addingTimeInterval(-policy.debounce),
+            lastRefreshAt: now.addingTimeInterval(-0.2),
+            isBusy: false,
+            now: now
+        )
+        XCTAssertEqual(waitSeconds(decision), policy.minimumInterval - 0.2, accuracy: 0.001)
+
+        // Once the floor has elapsed the same event refreshes.
+        XCTAssertEqual(
+            policy.decide(
+                pendingEventAt: now.addingTimeInterval(-policy.debounce),
+                lastRefreshAt: now.addingTimeInterval(-policy.minimumInterval),
+                isBusy: false,
+                now: now
+            ),
+            .refresh
+        )
+    }
+
+    func testFutureTimestampsCannotParkThePanelForever() {
+        // A backwards clock jump (or a future-stamped event) must never produce
+        // an unbounded wait: each wait is capped by its own interval.
+        let futureEvent = policy.decide(
+            pendingEventAt: now.addingTimeInterval(3_600),
+            lastRefreshAt: nil,
+            isBusy: false,
+            now: now
+        )
+        XCTAssertEqual(waitSeconds(futureEvent), policy.debounce, accuracy: 0.001)
+
+        let futureRefresh = policy.decide(
+            pendingEventAt: now.addingTimeInterval(-policy.debounce),
+            lastRefreshAt: now.addingTimeInterval(3_600),
+            isBusy: false,
+            now: now
+        )
+        XCTAssertEqual(waitSeconds(futureRefresh), policy.minimumInterval, accuracy: 0.001)
+    }
+
+    func testDebounceStaysInTheAgreedWindow() {
+        // The fix's contract: a 300–500ms trailing debounce, not a 3s poll.
+        XCTAssertGreaterThanOrEqual(policy.debounce, 0.3)
+        XCTAssertLessThanOrEqual(policy.debounce, 0.5)
+    }
+
+    // MARK: - Git directory resolution
+
+    func testResolvesThePlainRepositoryGitDirectory() throws {
+        let resolved = try XCTUnwrap(GitDirectoryWatcher.resolveGitDirectory(repoRoot: repo))
+        XCTAssertEqual(resolved.standardizedFileURL.path, repo.appendingPathComponent(".git").standardizedFileURL.path)
+    }
+
+    func testResolvesALinkedWorktreeGitDirectory() throws {
+        // Kaisola Mesh (and this very branch) run inside linked worktrees, where
+        // `.git` is a FILE pointing at the real per-worktree git directory. A
+        // watcher that assumed a directory would silently never fire there.
+        try write("a.txt", "hello\n")
+        try git(["add", "a.txt"])
+        try git(["commit", "-q", "-m", "init"])
+        let tree = repo.appendingPathComponent("wt", isDirectory: true)
+        try git(["worktree", "add", "-q", "-b", "side", tree.path])
+
+        let resolved = try XCTUnwrap(GitDirectoryWatcher.resolveGitDirectory(repoRoot: tree))
+        XCTAssertTrue(
+            resolved.path.contains("/worktrees/"),
+            "a linked worktree must resolve to its per-worktree git dir, got \(resolved.path)"
+        )
+        XCTAssertTrue(FileManager.default.fileExists(atPath: resolved.appendingPathComponent("HEAD").path))
+    }
+
+    func testGitDirectoryPointerParsingRejectsGarbage() {
+        XCTAssertNil(GitDirectoryWatcher.gitDirectory(fromPointerFile: "not a pointer", repoRoot: repo))
+        XCTAssertNil(GitDirectoryWatcher.gitDirectory(fromPointerFile: "gitdir:   \n", repoRoot: repo))
+        XCTAssertEqual(
+            GitDirectoryWatcher.gitDirectory(fromPointerFile: "gitdir: /abs/path/.git/worktrees/x\n", repoRoot: repo)?.path,
+            "/abs/path/.git/worktrees/x"
+        )
+        // Relative pointers resolve against the worktree root.
+        XCTAssertEqual(
+            GitDirectoryWatcher.gitDirectory(fromPointerFile: "gitdir: ../.git/worktrees/x", repoRoot: repo)?
+                .standardizedFileURL.path,
+            repo.deletingLastPathComponent().appendingPathComponent(".git/worktrees/x").standardizedFileURL.path
+        )
+    }
+
+    // MARK: - PR plan assembly (pure)
+
+    private func prep(branch: String, isDefault: Bool, hasUpstream: Bool, ahead: Int) -> GitService.PRPrep {
+        GitService.PRPrep(branch: branch, isDefaultBranch: isDefault, hasUpstream: hasUpstream, aheadCount: ahead)
+    }
+
+    func testPlanOnAFeatureBranchKeepsTheBranchAndSetsUpstreamOnce() throws {
+        let plan = try GitPRPlanner.assemble(
+            prep: prep(branch: "feature/x", isDefault: false, hasUpstream: false, ahead: 2),
+            defaultBranch: "main",
+            headOID: String(repeating: "a", count: 40),
+            requestedBranchName: "ignored/name",
+            commitSubjects: ["newest subject", "older subject"],
+            changedFileCount: 3
+        )
+        XCTAssertEqual(plan.baseBranch, "main")
+        XCTAssertEqual(plan.headBranch, "feature/x")
+        XCTAssertFalse(plan.createsBranch)
+        XCTAssertTrue(plan.setsUpstream)              // no upstream yet → push -u
+        XCTAssertEqual(plan.commitSubjects.count, 2)
+        XCTAssertEqual(plan.changedFileCount, 3)
+        XCTAssertEqual(plan.title, "newest subject")
+        XCTAssertEqual(plan.body, "- newest subject\n- older subject")
+
+        let tracked = try GitPRPlanner.assemble(
+            prep: prep(branch: "feature/x", isDefault: false, hasUpstream: true, ahead: 1),
+            defaultBranch: "main",
+            headOID: String(repeating: "a", count: 40),
+            requestedBranchName: "",
+            commitSubjects: ["only"],
+            changedFileCount: 1
+        )
+        XCTAssertFalse(tracked.setsUpstream)          // already tracking → plain push
+    }
+
+    func testPlanOnTheDefaultBranchForksTheRequestedBranch() throws {
+        let plan = try GitPRPlanner.assemble(
+            prep: prep(branch: "main", isDefault: true, hasUpstream: true, ahead: 1),
+            defaultBranch: "main",
+            headOID: String(repeating: "b", count: 40),
+            requestedBranchName: "  kaisola/pr-branch  ",
+            commitSubjects: ["work"],
+            changedFileCount: 2
+        )
+        XCTAssertTrue(plan.createsBranch)
+        XCTAssertEqual(plan.headBranch, "kaisola/pr-branch")
+        XCTAssertTrue(plan.setsUpstream)              // a brand-new branch never tracks
+        XCTAssertEqual(plan.baseBranch, "main")
+    }
+
+    func testPlanRejectsAnEmptyOrUnsafeForkName() {
+        XCTAssertThrowsError(try GitPRPlanner.assemble(
+            prep: prep(branch: "main", isDefault: true, hasUpstream: true, ahead: 1),
+            defaultBranch: "main", headOID: String(repeating: "c", count: 40),
+            requestedBranchName: "   ", commitSubjects: ["work"], changedFileCount: 1
+        ))
+        XCTAssertThrowsError(try GitPRPlanner.assemble(
+            prep: prep(branch: "main", isDefault: true, hasUpstream: true, ahead: 1),
+            defaultBranch: "main", headOID: String(repeating: "c", count: 40),
+            requestedBranchName: "bad name; rm -rf /", commitSubjects: ["work"], changedFileCount: 1
+        ))
+    }
+
+    func testPlanRefusesABranchWithNothingToPush() {
+        XCTAssertThrowsError(try GitPRPlanner.assemble(
+            prep: prep(branch: "feature/x", isDefault: false, hasUpstream: true, ahead: 0),
+            defaultBranch: "main", headOID: String(repeating: "d", count: 40),
+            requestedBranchName: "", commitSubjects: [], changedFileCount: 0
+        ))
+    }
+
+    func testTitleAndBodyFallBackWhenSubjectsAreUnavailable() throws {
+        let plan = try GitPRPlanner.assemble(
+            prep: prep(branch: "feature/x", isDefault: false, hasUpstream: true, ahead: 1),
+            defaultBranch: "main", headOID: String(repeating: "e", count: 40),
+            requestedBranchName: "", commitSubjects: [], changedFileCount: 0
+        )
+        XCTAssertEqual(plan.title, GitPRPlanner.fallbackTitle)
+        XCTAssertEqual(plan.body, GitPRPlanner.fallbackBody)
+    }
+
+    func testReviewEditsAreCarriedIntoTheExecutedPlan() throws {
+        let reviewed = try GitPRPlanner.assemble(
+            prep: prep(branch: "main", isDefault: true, hasUpstream: true, ahead: 1),
+            defaultBranch: "main", headOID: String(repeating: "f", count: 40),
+            requestedBranchName: "kaisola/pr-branch", commitSubjects: ["work"], changedFileCount: 1
+        )
+        let edited = try reviewed.applyingEdits(
+            headBranch: " kaisola/reviewed ",
+            title: "  A reviewed title  ",
+            body: "Body the user rewrote.\n"
+        )
+        XCTAssertEqual(edited.headBranch, "kaisola/reviewed")
+        XCTAssertEqual(edited.title, "A reviewed title")
+        XCTAssertEqual(edited.body, "Body the user rewrote.")
+        // Everything the review displayed but did not offer for editing is
+        // carried through untouched — execution runs the reviewed plan.
+        XCTAssertEqual(edited.baseBranch, reviewed.baseBranch)
+        XCTAssertEqual(edited.headOID, reviewed.headOID)
+        XCTAssertTrue(edited.createsBranch)
+    }
+
+    func testReviewEditsRejectAnEmptyTitleOrUnsafeBranch() throws {
+        let reviewed = try GitPRPlanner.assemble(
+            prep: prep(branch: "main", isDefault: true, hasUpstream: true, ahead: 1),
+            defaultBranch: "main", headOID: String(repeating: "f", count: 40),
+            requestedBranchName: "kaisola/pr-branch", commitSubjects: ["work"], changedFileCount: 1
+        )
+        XCTAssertThrowsError(try reviewed.applyingEdits(headBranch: "kaisola/ok", title: "   ", body: "b"))
+        XCTAssertThrowsError(try reviewed.applyingEdits(headBranch: "no good", title: "t", body: "b"))
+
+        // On an existing branch the head is not editable, so a junk field value
+        // cannot rewrite it (nor fail the confirm).
+        let onBranch = try GitPRPlanner.assemble(
+            prep: prep(branch: "feature/x", isDefault: false, hasUpstream: true, ahead: 1),
+            defaultBranch: "main", headOID: String(repeating: "f", count: 40),
+            requestedBranchName: "", commitSubjects: ["work"], changedFileCount: 1
+        )
+        XCTAssertEqual(try onBranch.applyingEdits(headBranch: "junk value", title: "t", body: "b").headBranch, "feature/x")
+    }
+
+    func testAReviewedPlanIsRefusedOnceTheRepositoryMovesPastIt() throws {
+        let plan = try GitPRPlanner.assemble(
+            prep: prep(branch: "feature/x", isDefault: false, hasUpstream: true, ahead: 1),
+            defaultBranch: "main", headOID: String(repeating: "1", count: 40),
+            requestedBranchName: "", commitSubjects: ["work"], changedFileCount: 1
+        )
+        XCTAssertNil(GitPRPlanner.stalenessMessage(
+            plan: plan, currentHeadOID: String(repeating: "1", count: 40), currentBranch: "feature/x"
+        ))
+        XCTAssertNotNil(GitPRPlanner.stalenessMessage(
+            plan: plan, currentHeadOID: String(repeating: "2", count: 40), currentBranch: "feature/x"
+        ), "a new commit after the review must invalidate the plan")
+        XCTAssertNotNil(GitPRPlanner.stalenessMessage(
+            plan: plan, currentHeadOID: String(repeating: "1", count: 40), currentBranch: "other"
+        ), "a branch switch after the review must invalidate the plan")
+    }
+
+    // MARK: - Live model behavior
+
+    /// The first click must assemble a review and execute NOTHING: no fork, no
+    /// push, no `gh`. The repo has no remote at all, so any push attempt would
+    /// surface as an error here.
+    @MainActor
+    func testPreparingAPullRequestOnlyAssemblesAReview() throws {
+        try write("a.txt", "one\n")
+        try git(["add", "a.txt"])
+        try git(["commit", "-q", "-m", "base"])
+        try git(["checkout", "-q", "-b", "feature/live"])
+        try write("b.txt", "two\n")
+        try git(["add", "b.txt"])
+        try git(["commit", "-q", "-m", "feature work"])
+
+        let model = GitPanelModel(repoRoot: repo)
+        model.preparePR()
+        XCTAssertTrue(pump(until: { model.prPlan != nil || model.errorMessage != nil }, timeout: 10))
+
+        let plan = try XCTUnwrap(model.prPlan, "expected a review plan, error: \(model.errorMessage ?? "none")")
+        XCTAssertEqual(plan.headBranch, "feature/live")
+        XCTAssertFalse(plan.createsBranch)
+        XCTAssertEqual(plan.baseBranch, "main")
+        XCTAssertEqual(plan.commitSubjects, ["feature work"])
+        XCTAssertEqual(plan.changedFileCount, 1)
+        XCTAssertEqual(model.prTitleDraft, "feature work")
+
+        // Nothing ran: no PR/compare URL, no error, no new branch, HEAD unmoved.
+        XCTAssertNil(model.prURL)
+        XCTAssertNil(model.prState)
+        XCTAssertNil(model.errorMessage)
+        XCTAssertEqual(try gitOutput(["branch", "--format=%(refname:short)"]).split(separator: "\n").sorted(),
+                       ["feature/live", "main"])
+    }
+
+    /// Event-driven refresh: an external `git add` (an agent, a terminal) must
+    /// reach the open panel on its own — no manual refresh, no 3s poll tick.
+    @MainActor
+    func testExternalStagingRefreshesTheOpenPanel() throws {
+        try write("a.txt", "one\n")
+        try git(["add", "a.txt"])
+        try git(["commit", "-q", "-m", "base"])
+        try write("b.txt", "two\n")
+
+        let model = GitPanelModel(repoRoot: repo)
+        model.startWatching()
+        defer { model.stopWatching() }
+        XCTAssertTrue(pump(until: { model.status != nil }, timeout: 10), "the panel should load its first status")
+        XCTAssertEqual(model.status?.untracked, ["b.txt"])
+
+        // External stage — nothing in the app touches the model.
+        try git(["add", "b.txt"])
+        let sawStage = pump(until: { model.status?.staged.isEmpty == false }, timeout: 12)
+        XCTAssertTrue(sawStage, "an external `git add` must refresh the panel through the watcher")
+        XCTAssertEqual(model.status?.staged.map(\.path), ["b.txt"])
+    }
+
+    // MARK: - helpers
+
+    private func waitSeconds(_ decision: GitRefreshPolicy.Decision) -> TimeInterval {
+        guard case let .wait(seconds) = decision else {
+            XCTFail("expected a wait decision, got \(decision)")
+            return .nan
+        }
+        return seconds
+    }
+
+    /// Pump the main run loop until `condition` holds (see WorkspaceWatcherTests):
+    /// dispatch-source callbacks and MainActor continuations are only serviced
+    /// while the run loop actually runs, so a sleep would starve them.
+    @MainActor
+    private func pump(until condition: () -> Bool, timeout: TimeInterval) -> Bool {
+        let deadline = Date().addingTimeInterval(timeout)
+        while !condition(), Date() < deadline {
+            RunLoop.current.run(mode: .default, before: Date().addingTimeInterval(0.05))
+        }
+        return condition()
+    }
+
+    private func write(_ name: String, _ contents: String) throws {
+        try contents.write(to: repo.appendingPathComponent(name), atomically: true, encoding: .utf8)
+    }
+
+    @discardableResult
+    private func git(_ args: [String]) throws -> Int32 {
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/usr/bin/git")
+        p.arguments = args
+        p.currentDirectoryURL = repo
+        p.standardOutput = Pipe(); p.standardError = Pipe()
+        try p.run(); p.waitUntilExit()
+        return p.terminationStatus
+    }
+
+    private func gitOutput(_ args: [String]) throws -> String {
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/usr/bin/git")
+        p.arguments = args
+        p.currentDirectoryURL = repo
+        let pipe = Pipe()
+        p.standardOutput = pipe; p.standardError = Pipe()
+        try p.run()
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        p.waitUntilExit()
+        return String(data: data, encoding: .utf8) ?? ""
+    }
+}

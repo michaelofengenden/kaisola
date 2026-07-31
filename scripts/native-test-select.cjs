@@ -50,7 +50,7 @@ const NATIVE_DIRECTORY_TESTS = Object.freeze([
     'DataPreviewsTests', 'LocalhostDetectorTests', 'QuickActionStoreTests',
     'SyntaxHighlighterTests', 'WorkspaceFilesTests', 'WorkspaceWatcherTests',
   ]],
-  ['native/KaisolaMac/Kaisola/Git/', ['GitPRTests', 'GitServiceTests']],
+  ['native/KaisolaMac/Kaisola/Git/', ['GitPRTests', 'GitPanelModelTests', 'GitServiceTests']],
   ['native/KaisolaMac/Kaisola/Mesh/', ['MeshSessionTests', 'MeshStagedTests']],
   ['native/KaisolaMac/Kaisola/Updates/', [
     'NativeUpdateConfigurationTests', 'BrokerHelperPackageTests',

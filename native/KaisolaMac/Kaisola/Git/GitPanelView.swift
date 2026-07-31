@@ -1,10 +1,20 @@
 import AppKit
+import Combine
 import SwiftUI
 
 /// A compact Git panel: branch + ahead/behind, staged / unstaged / untracked
 /// files with one-click stage/unstage, and a commit box. Backed by GitService
-/// (git as a child process); refreshes automatically while visible and on
-/// demand. Operations are serialized so an older status cannot win a race.
+/// (git as a child process). Operations are serialized so an older status cannot
+/// win a race.
+///
+/// **Refresh is event-driven.** While the panel is open it follows the workspace
+/// (`WorkspaceWatcher`, working-tree edits) and the git directory
+/// (`GitDirectoryWatcher`, stage/commit/checkout/fetch), filtered through the
+/// pure `GitRefreshPolicy` — replacing the fixed 3s poll that was both late for
+/// an agent's commit and endless on an idle repository.
+///
+/// **Opening a pull request is two steps.** `preparePR` assembles a `PRPlan` and
+/// shows it; `confirmPR` executes that reviewed plan and nothing else.
 @MainActor
 final class GitPanelModel: ObservableObject {
     @Published private(set) var status: GitService.Status?
@@ -18,6 +28,15 @@ final class GitPanelModel: ObservableObject {
     @Published private(set) var prState: String?
     @Published private(set) var prURL: String?
 
+    /// The assembled-but-unexecuted pull request. Non-nil means the panel is in
+    /// its review stage: everything the confirm button will do is on screen and
+    /// nothing has run.
+    @Published private(set) var prPlan: PRPlan?
+    /// Review-stage edits. Seeded from the plan when it is assembled.
+    @Published var prBranchDraft = "kaisola/pr-branch"
+    @Published var prTitleDraft = ""
+    @Published var prBodyDraft = ""
+
     let repoRoot: URL
     /// Whether the GitHub CLI is installed — resolved once (it may spawn a
     /// subprocess) so the view can render the fallback note without re-probing.
@@ -30,10 +49,91 @@ final class GitPanelModel: ObservableObject {
     /// an old diff after external Git activity.
     private var diffRequests: [String: Bool] = [:]
 
+    // MARK: - Live refresh wiring
+
+    /// Working-tree events. `WorkspaceWatcher` ignores `.git` by design, so it
+    /// reports edits but never a stage/commit — hence the second watcher.
+    private var workspaceWatcher: WorkspaceWatcher?
+    private var workspaceObservation: AnyCancellable?
+    /// Git-directory events (`index`, `HEAD`, ref and lock churn).
+    private var gitWatcher: GitDirectoryWatcher?
+
+    private let refreshPolicy = GitRefreshPolicy()
+    /// The first event of the current debounce window, or nil when nothing is
+    /// pending. Later events in the window are absorbed rather than pushing the
+    /// deadline out, so a continuous stream cannot starve the refresh.
+    private var pendingEventAt: Date?
+    /// When git last ran for this panel (any operation) — the rate floor.
+    private var lastActivityAt: Date?
+    /// The running decide/wait/refresh loop; nil while idle.
+    private var refreshPump: Task<Void, Never>?
+
     init(repoRoot: URL) {
         self.repoRoot = repoRoot
         self.service = GitService(repoRoot: repoRoot)
         self.ghAvailable = GitService.ghAvailable()
+    }
+
+    /// Load the current status and start following the repository. Idempotent.
+    func startWatching() {
+        guard workspaceWatcher == nil, gitWatcher == nil else { return }
+        refresh()
+        let watcher = WorkspaceWatcher(root: repoRoot)
+        workspaceObservation = watcher.$changeToken
+            .dropFirst()
+            .sink { [weak self] _ in
+                Task { @MainActor in self?.noteRepositoryEvent() }
+            }
+        workspaceWatcher = watcher
+        gitWatcher = GitDirectoryWatcher(repoRoot: repoRoot) { [weak self] in
+            self?.noteRepositoryEvent()
+        }
+    }
+
+    /// Stop following the repository (the panel closed). Idempotent.
+    func stopWatching() {
+        workspaceObservation?.cancel()
+        workspaceObservation = nil
+        workspaceWatcher?.stop()
+        workspaceWatcher = nil
+        gitWatcher?.stop()
+        gitWatcher = nil
+        refreshPump?.cancel()
+        refreshPump = nil
+        pendingEventAt = nil
+    }
+
+    /// A workspace or git-directory change was observed. The first event of a
+    /// window arms it; the policy decides when it becomes a `git status`.
+    func noteRepositoryEvent(at date: Date = Date()) {
+        if pendingEventAt == nil { pendingEventAt = date }
+        pumpRefreshes()
+    }
+
+    /// Drive the pending event to a refresh. Runs only while something is
+    /// pending: once the policy reports `.idle` the loop exits and the next event
+    /// restarts it, so an untouched repository costs nothing.
+    private func pumpRefreshes() {
+        guard refreshPump == nil else { return }
+        refreshPump = Task { @MainActor [weak self] in
+            while let self, !Task.isCancelled {
+                switch refreshPolicy.decide(
+                    pendingEventAt: pendingEventAt,
+                    lastRefreshAt: lastActivityAt,
+                    isBusy: isBusy,
+                    now: Date()
+                ) {
+                case .idle:
+                    self.refreshPump = nil
+                    return
+                case let .wait(seconds):
+                    try? await Task.sleep(nanoseconds: UInt64(max(0, seconds) * 1_000_000_000))
+                case .refresh:
+                    self.pendingEventAt = nil
+                    self.refresh()
+                }
+            }
+        }
     }
 
     func refresh() {
@@ -130,37 +230,74 @@ final class GitPanelModel: ObservableObject {
         }
     }
 
-    /// One-click "committed work → pushed branch + opened PR". Runs the whole
-    /// sequence off the main actor in a single `perform`: fork a branch when on
-    /// the default branch, capture the PR title/body from the ahead commits
-    /// (before the push sets an upstream that would empty that range), push
-    /// (-u the first time), then either `gh pr create` or — when gh is missing —
-    /// resolve a browser compare URL. The apply step reports the result and
-    /// refreshes branch/ahead state (the branch may have changed).
-    func createPR(branchName rawName: String) {
+    /// Step one of two: assemble the pull request and show it. Reads only — no
+    /// branch is created, nothing is pushed, `gh` is not invoked. Everything the
+    /// confirm step will do is derived here, from one consistent snapshot of the
+    /// branch (its base, upstream, ahead commits, and the files they touch),
+    /// captured *before* a push could set an upstream that empties that range.
+    func preparePR() {
         prState = nil
         prURL = nil
-        let branchName = rawName.trimmingCharacters(in: .whitespaces)
-        perform { service -> PROutcome in
-            let prep = try service.prPrep()
-            if prep.isDefaultBranch {
-                guard !branchName.isEmpty else {
-                    throw GitService.GitError.commandFailed("Enter a branch name for the pull request.")
-                }
-                try service.createBranchFromHead(named: branchName)
-            }
-            let subjects = try service.aheadSubjects()
-            let title = subjects.first ?? "Kaisola changes"
-            let body = subjects.isEmpty
-                ? "Opened from Kaisola."
-                : subjects.map { "- \($0)" }.joined(separator: "\n")
+        let requested = prBranchDraft
+        perform { service -> PRPlan in
+            try GitPRPlanner.assemble(
+                prep: try service.prPrep(),
+                defaultBranch: service.defaultBranchName(),
+                headOID: try service.headOID(),
+                requestedBranchName: requested,
+                commitSubjects: try service.aheadSubjects(),
+                changedFileCount: (try? service.aheadChangedFiles().count) ?? 0
+            )
+        } apply: { plan in
+            self.prPlan = plan
+            self.prBranchDraft = plan.headBranch
+            self.prTitleDraft = plan.title
+            self.prBodyDraft = plan.body
+        }
+    }
 
-            let hasUpstream = (try? service.prPrep().hasUpstream) ?? false
-            try service.pushCurrentBranch(setUpstream: !hasUpstream)
+    /// Leave the review without executing anything.
+    func cancelPR() {
+        guard !isBusy else { return }
+        prPlan = nil
+    }
+
+    /// Step two of two: execute the plan that was reviewed, with the reviewer's
+    /// edits and nothing else — no re-derivation of the title, body, or branch.
+    /// Refuses to run when the repository moved past the reviewed commit, so a
+    /// commit or checkout landing between the two clicks (an agent, a terminal)
+    /// can never silently turn into a pull request nobody looked at.
+    func confirmPR() {
+        guard let reviewed = prPlan else { return }
+        let plan: PRPlan
+        do {
+            plan = try reviewed.applyingEdits(
+                headBranch: prBranchDraft,
+                title: prTitleDraft,
+                body: prBodyDraft
+            )
+        } catch {
+            errorMessage = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+            return
+        }
+        prState = nil
+        prURL = nil
+        perform { service -> PROutcome in
+            if let stale = GitPRPlanner.stalenessMessage(
+                plan: plan,
+                currentHeadOID: try service.headOID(),
+                currentBranch: try service.prPrep().branch
+            ) {
+                throw GitService.GitError.commandFailed(stale)
+            }
+            if plan.createsBranch {
+                try service.createBranchFromHead(named: plan.headBranch)
+            }
+            try service.pushCurrentBranch(setUpstream: plan.setsUpstream)
 
             let result: PRResult
             if GitService.ghAvailable() {
-                result = .created(url: try service.createPullRequest(title: title, body: body))
+                result = .created(url: try service.createPullRequest(title: plan.title, body: plan.body))
             } else if let compare = try service.compareURL() {
                 result = .compare(url: compare)
             } else {
@@ -170,6 +307,7 @@ final class GitPanelModel: ObservableObject {
         } apply: { outcome in
             self.status = outcome.status
             self.prPrepInfo = outcome.prep
+            self.prPlan = nil
             self.diffs.removeAll()
             self.diffRequests.removeAll()
             self.log.removeAll()
@@ -198,6 +336,10 @@ final class GitPanelModel: ObservableObject {
         guard !isBusy else { return }
         isBusy = true
         errorMessage = nil
+        // Every operation re-reads status, so any of them satisfies the refresh
+        // policy's rate floor — a stage and an event-driven refresh must not run
+        // git twice in the same window.
+        lastActivityAt = Date()
         let service = self.service
         Task {
             do {
@@ -241,7 +383,6 @@ private enum PRResult: Sendable {
 struct GitPanelView: View {
     @StateObject private var model: GitPanelModel
     @State private var restoreCandidate: String?
-    @State private var prBranchName = "kaisola/pr-branch"
 
     init(repoRoot: URL) {
         _model = StateObject(wrappedValue: GitPanelModel(repoRoot: repoRoot))
@@ -271,15 +412,21 @@ struct GitPanelView: View {
         }
         .task(id: model.repoRoot) {
             // Git changes frequently arrive outside this panel (agent tools,
-            // terminal commands, hooks). Keep the truth surface current while
-            // the panel is visible; `refresh` skips ticks during an operation.
+            // terminal commands, hooks). Follow the workspace and the git
+            // directory while the panel is visible instead of polling: the
+            // watchers report the change, GitRefreshPolicy decides when it
+            // becomes a `git status`.
+            model.startWatching()
+            defer { model.stopWatching() }
+            // A slow backstop, not the refresh path: it only exists so a
+            // dropped filesystem event cannot leave the panel stale forever.
             while !Task.isCancelled {
-                model.refresh()
                 do {
-                    try await Task.sleep(nanoseconds: 3_000_000_000)
+                    try await Task.sleep(nanoseconds: 30_000_000_000)
                 } catch {
                     break
                 }
+                model.noteRepositoryEvent()
             }
         }
         .confirmationDialog(
@@ -365,47 +512,25 @@ struct GitPanelView: View {
         .padding(.horizontal, model.status?.isClean == true ? 12 : 0)
     }
 
-    /// One-click Create-PR: the current branch + ahead count, a new-branch field
-    /// when sitting on the default branch, and the button that pushes and opens
-    /// the PR (or a browser compare page when gh is absent). The result URL is a
-    /// tappable Link.
+    /// Pull requests in two steps. "Review Pull Request" assembles the plan and
+    /// shows it — base and head branch, the commits, the changed-file count, and
+    /// the editable title/body — without running anything. "Push and Create PR"
+    /// then executes exactly what is on screen (or opens a browser compare page
+    /// when gh is absent). The result URL is a tappable Link.
     @ViewBuilder
     private var prSection: some View {
         VStack(alignment: .leading, spacing: 6) {
-            Text("Create PR")
+            Text("Pull Request")
                 .font(.caption.weight(.semibold))
                 .foregroundStyle(.secondary)
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .padding(.top, 10)
 
-            if let prep = model.prPrepInfo {
-                HStack(spacing: 6) {
-                    Image(systemName: "arrow.triangle.branch").font(.caption2).foregroundStyle(.secondary)
-                    Text(prep.branch).font(.caption.monospaced())
-                    if prep.aheadCount > 0 {
-                        Text("· \(prep.aheadCount) ahead").font(.caption).foregroundStyle(.secondary)
-                    } else {
-                        Text("· nothing to push").font(.caption).foregroundStyle(.tertiary)
-                    }
-                    Spacer()
-                }
-
-                if prep.isDefaultBranch {
-                    Text("On \(prep.branch) — a new branch is created for the PR.")
-                        .font(.caption2).foregroundStyle(.secondary)
-                    TextField("Branch name", text: $prBranchName)
-                        .textFieldStyle(.roundedBorder)
-                        .font(.caption)
-                }
+            if let plan = model.prPlan {
+                reviewStage(plan)
+            } else {
+                prepareStage
             }
-
-            Button {
-                model.createPR(branchName: prBranchName)
-            } label: {
-                Label("Push & Create PR", systemImage: "arrow.up.forward.square")
-                    .font(.caption)
-            }
-            .disabled(createPRDisabled)
 
             if let url = model.prURL, let target = URL(string: url) {
                 Link(destination: target) {
@@ -419,7 +544,7 @@ struct GitPanelView: View {
                 Text(note).font(.caption2).foregroundStyle(.secondary)
             }
             if !model.ghAvailable {
-                Text("GitHub CLI (gh) not found — Create PR opens a browser compare page instead.")
+                Text("GitHub CLI (gh) not found — the confirm step opens a browser compare page instead.")
                     .font(.caption2).foregroundStyle(.tertiary)
             }
         }
@@ -427,10 +552,116 @@ struct GitPanelView: View {
         .padding(.bottom, 10)
     }
 
-    private var createPRDisabled: Bool {
+    /// Before review: what branch we are on and what it would contain.
+    @ViewBuilder
+    private var prepareStage: some View {
+        if let prep = model.prPrepInfo {
+            HStack(spacing: 6) {
+                Image(systemName: "arrow.triangle.branch").font(.caption2).foregroundStyle(.secondary)
+                Text(prep.branch).font(.caption.monospaced())
+                if prep.aheadCount > 0 {
+                    Text("· \(prep.aheadCount) ahead").font(.caption).foregroundStyle(.secondary)
+                } else {
+                    Text("· nothing to push").font(.caption).foregroundStyle(.tertiary)
+                }
+                Spacer()
+            }
+            if prep.isDefaultBranch, prep.aheadCount > 0 {
+                Text("On \(prep.branch) — the review proposes a new branch for the pull request.")
+                    .font(.caption2).foregroundStyle(.secondary)
+            }
+        }
+
+        Button {
+            model.preparePR()
+        } label: {
+            Label("Review Pull Request…", systemImage: "list.bullet.rectangle")
+                .font(.caption)
+        }
+        .disabled(reviewDisabled)
+        .accessibilityIdentifier("git.pr.review")
+        .help("Assemble the pull request and show it before anything is pushed")
+    }
+
+    /// The review itself: nothing here has run yet.
+    @ViewBuilder
+    private func reviewStage(_ plan: PRPlan) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 6) {
+                Image(systemName: "arrow.triangle.pull").font(.caption2).foregroundStyle(.secondary)
+                Text(plan.baseBranch).font(.caption.monospaced())
+                Image(systemName: "arrow.left").font(.caption2).foregroundStyle(.tertiary)
+                Text(plan.headBranch).font(.caption.monospaced())
+                if plan.createsBranch {
+                    Text("new branch")
+                        .font(.caption2)
+                        .padding(.horizontal, 5).padding(.vertical, 1)
+                        .background(.quaternary, in: Capsule())
+                }
+                Spacer()
+            }
+
+            Text("\(plan.commitCount) \(plan.commitCount == 1 ? "commit" : "commits") · "
+                 + "\(plan.changedFileCount) \(plan.changedFileCount == 1 ? "file" : "files") changed")
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+
+            ForEach(Array(plan.commitSubjects.prefix(6).enumerated()), id: \.offset) { _, subject in
+                Text("• \(subject)").font(.caption2).foregroundStyle(.secondary).lineLimit(1)
+            }
+            if plan.commitSubjects.count > 6 {
+                Text("+ \(plan.commitSubjects.count - 6) more")
+                    .font(.caption2).foregroundStyle(.tertiary)
+            }
+
+            if plan.createsBranch {
+                TextField("Branch name", text: $model.prBranchDraft)
+                    .textFieldStyle(.roundedBorder)
+                    .font(.caption)
+                    .accessibilityIdentifier("git.pr.branch")
+                    .accessibilityLabel("Pull request branch name")
+            }
+            TextField("Title", text: $model.prTitleDraft)
+                .textFieldStyle(.roundedBorder)
+                .font(.caption)
+                .accessibilityIdentifier("git.pr.title")
+                .accessibilityLabel("Pull request title")
+            TextEditor(text: $model.prBodyDraft)
+                .font(.caption)
+                .frame(height: 68)
+                .overlay(RoundedRectangle(cornerRadius: 5).strokeBorder(.quaternary))
+                .accessibilityIdentifier("git.pr.body")
+                .accessibilityLabel("Pull request description")
+
+            Text("Nothing has run yet — confirm to push \(plan.headBranch) and open the pull request.")
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+
+            HStack(spacing: 8) {
+                Button {
+                    model.confirmPR()
+                } label: {
+                    Label("Push and Create PR", systemImage: "arrow.up.forward.square")
+                        .font(.caption)
+                }
+                .disabled(model.isBusy)
+                .accessibilityIdentifier("git.pr.confirm")
+                Button("Cancel") { model.cancelPR() }
+                    .font(.caption)
+                    .disabled(model.isBusy)
+                    .accessibilityIdentifier("git.pr.cancel")
+            }
+        }
+        .padding(8)
+        .background(.quaternary.opacity(0.25), in: RoundedRectangle(cornerRadius: 6))
+        .accessibilityElement(children: .contain)
+        .accessibilityIdentifier("git.pr.reviewStage")
+        .accessibilityLabel("Pull request review")
+    }
+
+    private var reviewDisabled: Bool {
         if model.isBusy { return true }
         guard let prep = model.prPrepInfo else { return true }
-        if prep.isDefaultBranch && prBranchName.trimmingCharacters(in: .whitespaces).isEmpty { return true }
         return prep.aheadCount == 0
     }
 

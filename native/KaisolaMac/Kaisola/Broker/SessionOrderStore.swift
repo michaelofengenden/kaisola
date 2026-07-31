@@ -39,8 +39,13 @@ struct SessionOrderStore: Sendable {
     nonisolated static func apply(_ ids: [String], to sessions: [BrokerTerminalRecord]) -> [BrokerTerminalRecord] {
         let byID = Dictionary(sessions.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
         var out: [BrokerTerminalRecord] = ids.compactMap { byID[$0] }
-        let placed = Set(out.map(\.id))
-        out.append(contentsOf: sessions.filter { !placed.contains($0.id) })
+        // SwiftUI's ForEach requires unique ids, so the unmatched tail must be
+        // deduped too, not just the stored-order head: a duplicate incoming id
+        // here would otherwise reach ForEach twice (undefined behavior).
+        var seen = Set(out.map(\.id))
+        for session in sessions where seen.insert(session.id).inserted {
+            out.append(session)
+        }
         return out
     }
 

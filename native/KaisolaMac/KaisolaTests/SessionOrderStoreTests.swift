@@ -22,7 +22,9 @@ final class SessionOrderStoreTests: XCTestCase {
     func testApplyWithoutStoredOrderToleratesDuplicateIDs() {
         let sessions = [record("a", pid: 1), record("a", pid: 2)]
         let out = SessionOrderStore.apply([], to: sessions)
-        XCTAssertEqual(out.map(\.id), ["a", "a"])
+        // Only the first record survives: ForEach requires unique ids, so the
+        // unmatched tail is deduped exactly like the stored-order head.
+        XCTAssertEqual(out.map(\.id), ["a"])
     }
 
     func testApplyOrdersKnownFirstThenAppendsNew() {

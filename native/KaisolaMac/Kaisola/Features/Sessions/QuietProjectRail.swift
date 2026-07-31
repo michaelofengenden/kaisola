@@ -201,6 +201,13 @@ private struct QuietProjectGroup: View {
                             .accessibilityHidden(true)
                     }
                 }
+                // The button's own label owns the full row geometry — height,
+                // horizontal inset and width — so its hit area (and VoiceOver
+                // frame) covers the entire 30pt row, not just the intrinsic
+                // text height. Mirrors QuietRowBody's chain (~line 494).
+                .padding(.horizontal, QuietRailMetrics.horizontalInset)
+                .frame(height: QuietRailMetrics.headerHeight)
+                .frame(maxWidth: .infinity, alignment: .leading)
                 .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
@@ -223,8 +230,6 @@ private struct QuietProjectGroup: View {
                 .accessibilityLabel("New session in \(project.name)")
             }
         }
-        .padding(.horizontal, QuietRailMetrics.horizontalInset)
-        .frame(height: QuietRailMetrics.headerHeight)
         .frame(maxWidth: .infinity, alignment: .leading)
         .contentShape(Rectangle())
         // The active project's tint wash is the only fill in the rail; every

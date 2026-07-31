@@ -150,7 +150,7 @@ final class NotificationBridge: NSObject, UNUserNotificationCenterDelegate {
             // The completion MUST stay non-isolated: UserNotifications invokes it
             // on a background queue. It only captures the Sendable continuation,
             // so nothing main-actor crosses the boundary.
-            center.getNotificationSettings { settings in
+            center.getNotificationSettings { @Sendable settings in
                 continuation.resume(returning: NotificationAuthorizationState(settings.authorizationStatus))
             }
         }

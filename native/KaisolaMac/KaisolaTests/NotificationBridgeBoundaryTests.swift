@@ -84,6 +84,22 @@ final class NotificationBridgeBoundaryTests: XCTestCase {
         XCTAssertEqual(state, .unknown)
     }
 
+    /// UserNotifications invokes this completion on its own callback queue. If
+    /// it inherits NotificationBridge's main-actor isolation, Swift 6 traps at
+    /// runtime before the continuation can resume (EXC_BREAKPOINT/SIGTRAP).
+    func testAuthorizationStateCallbackIsExplicitlySendable() throws {
+        let sourceURL = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .appendingPathComponent("Kaisola/App/NotificationBridge.swift")
+        let source = strippingComments(try String(contentsOf: sourceURL, encoding: .utf8))
+
+        XCTAssertTrue(
+            source.contains("center.getNotificationSettings { @Sendable settings in"),
+            "The notification-settings callback must not inherit @MainActor isolation"
+        )
+    }
+
     // MARK: - Status mapping
 
     /// `.ephemeral` is App Clips only and cannot be constructed on macOS, so the

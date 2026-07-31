@@ -339,10 +339,16 @@ final class AppModel: ObservableObject {
     /// Serializes transcript actor enqueues so an immediate quit cannot overtake
     /// the final streaming row or an explicit chat removal.
     private var transcriptPersistenceTask: Task<Void, Never>?
-    /// A closed chat is a durable tombstone for this window lifetime. Buffered
-    /// ACP events may still drain while the child process stops; they must not
-    /// be allowed to enqueue a transcript write after the explicit deletion.
-    private var explicitlyClosedChatIDs: Set<String> = []
+    /// A closed chat is a tombstone for as long as buffered ACP events can
+    /// still drain while the child process stops; those must not be allowed to
+    /// enqueue a transcript write after the explicit deletion. Bounded by
+    /// recency so a long-lived window cannot accumulate one entry per close.
+    private(set) var explicitlyClosedChatIDs = BoundedIdentifierSet(
+        limit: AppModel.closedChatTombstoneLimit
+    )
+    /// Comfortably more closes than any drain can still be racing, and small
+    /// enough to stay a rounding error in a window's memory.
+    static let closedChatTombstoneLimit = 256
     /// Draft writes are ordered just like transcripts. The final debounced
     /// composer value can therefore be queued and awaited during termination.
     private var draftPersistenceTask: Task<Void, Never>?
@@ -360,8 +366,9 @@ final class AppModel: ObservableObject {
     private var pendingTerminalDraftRestores: [String: TerminalDraftResumeSeed] = [:]
     private var terminalLastOutputAt: [String: Date] = [:]
     /// Explicit chat closes start an async ACP shutdown. Keep those tasks until
-    /// window teardown so application termination cannot strand child adapters.
-    private var chatShutdownTasks: [String: Task<Void, Never>] = [:]
+    /// they finish (or until window teardown awaits them) so application
+    /// termination cannot strand child adapters.
+    private let chatShutdownTasks = ShutdownTaskRegistry()
     private var meshShutdownTasks: [String: Task<Void, Never>] = [:]
     /// A durable Mesh may be restored by only one window model at a time.
     /// Main-actor isolation makes this a process-wide claim without locks.
@@ -988,6 +995,14 @@ final class AppModel: ObservableObject {
         for projectID in Array(paneLayouts.keys) {
             reconcilePaneLayoutWithAvailableSurfaces(for: projectID, persist: true)
         }
+        // The broker inventory that triggered this reconcile is authoritative
+        // about which terminals still exist. Intent tokens for the others can
+        // never fence anything again: their only readers require a live
+        // record, so retaining them just grows the window forever.
+        splitIntentTokens = SurfaceBookkeeping.pruned(
+            splitIntentTokens,
+            keeping: Set(sessions.map(\.id))
+        )
     }
 
     /// Name-based compatibility for saved-window state and older callers.
@@ -2603,8 +2618,7 @@ final class AppModel: ObservableObject {
             explicitlyClosedChatIDs.insert(chatID)
             closingChat.conversation.onTranscriptChanged = nil
             closingChat.conversation.onDraftChanged = nil
-            chatShutdownTasks[chatID]?.cancel()
-            chatShutdownTasks[chatID] = Task {
+            chatShutdownTasks.start(chatID) {
                 _ = await closingChat.conversation.stop()
             }
         }
@@ -2773,8 +2787,7 @@ final class AppModel: ObservableObject {
                 forgetWhenLast: false
             )
         }
-        for task in chatShutdownTasks.values { await task.value }
-        chatShutdownTasks.removeAll()
+        await chatShutdownTasks.drain()
         for observers in usageObservers.values { observers.forEach { $0.cancel() } }
         usageObservers.removeAll()
         await draftPersistenceTask?.value
@@ -2792,6 +2805,7 @@ final class AppModel: ObservableObject {
         for mesh in meshes { Self.claimedRestoredMeshIDs.remove(mesh.id) }
         meshes.removeAll()
         surfaceObservers.removeAll()
+        splitIntentTokens.removeAll()
         await disconnect()
     }
 

@@ -38,7 +38,9 @@ final class NotificationBridge: NSObject, UNUserNotificationCenterDelegate {
         init(_ kind: AttentionCenter.Kind) {
             switch kind {
             case .permission: self = .permission
-            case .turnCompleted: self = .turnCompleted
+            // A bell is displayed as a completed-turn-style system
+            // notification: same category, no dedicated button set.
+            case .turnCompleted, .bell: self = .turnCompleted
             case .sessionResponded: self = .sessionResponded
             }
         }

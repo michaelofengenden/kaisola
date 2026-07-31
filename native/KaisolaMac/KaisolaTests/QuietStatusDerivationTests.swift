@@ -37,6 +37,12 @@ final class QuietStatusDerivationTests: XCTestCase {
         XCTAssertTrue(QuietStatusDerivation.needsAttention(entries: [entry(.permission)], for: "s1"))
     }
 
+    /// A terminal BEL is routed to its own `.bell` kind (not `.turnCompleted`)
+    /// precisely so it reads as needs-you here, unlike a finished chat turn.
+    func testBellIsNeedsYou() {
+        XCTAssertTrue(QuietStatusDerivation.needsAttention(entries: [entry(.bell)], for: "s1"))
+    }
+
     func testAttentionOnlyCountsMatchingTarget() {
         let entries = [entry(.permission, target: "other")]
         XCTAssertFalse(QuietStatusDerivation.needsAttention(entries: entries, for: "s1"))
@@ -81,6 +87,39 @@ final class QuietStatusDerivationTests: XCTestCase {
             respondedAcknowledged: false
         )
         XCTAssertEqual(status, .needsYou)
+    }
+
+    /// A terminal BEL must outrank `.working` the same way a permission ask
+    /// does — the whole point of routing bells through their own kind.
+    func testBellOutranksWorking() {
+        let status = QuietStatusDerivation.terminal(
+            activity: .working,
+            exited: false,
+            hasPermissionAttention: QuietStatusDerivation.needsAttention(
+                entries: [entry(.bell)],
+                for: "s1"
+            ),
+            respondedAcknowledged: false
+        )
+        XCTAssertEqual(status, .needsYou)
+    }
+
+    /// `.turnCompleted` and `.sessionResponded` entries must NOT read as
+    /// needs-you at the terminal level either — only `.permission` and
+    /// `.bell` do.
+    func testTurnCompletedAndSessionRespondedDoNotOutrankWorking() {
+        for kind: AttentionCenter.Kind in [.turnCompleted, .sessionResponded] {
+            let status = QuietStatusDerivation.terminal(
+                activity: .working,
+                exited: false,
+                hasPermissionAttention: QuietStatusDerivation.needsAttention(
+                    entries: [entry(kind)],
+                    for: "s1"
+                ),
+                respondedAcknowledged: false
+            )
+            XCTAssertEqual(status, .working, "\(kind) must not read as needs-you")
+        }
     }
 
     func testExitedTerminalIsEnded() {

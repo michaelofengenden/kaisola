@@ -25,6 +25,11 @@ final class AttentionCenter: ObservableObject {
         case permission
         case turnCompleted
         case sessionResponded
+        /// A terminal BEL (\u{7}): the PTY is asking for attention outside any
+        /// broker-modeled completion. Unlike `.turnCompleted`, this reads as
+        /// needs-you (amber) in the quiet-fleet sidebar — see
+        /// `QuietStatusDerivation.needsAttention`.
+        case bell
     }
 
     struct Entry: Identifiable, Codable, Equatable {

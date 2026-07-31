@@ -1683,13 +1683,14 @@ struct RootShellView: View {
         // avoid replacing it (and posting another system notification) for a
         // repaint burst that contains repeated BEL bytes.
         guard !attention.entries.contains(where: {
-            $0.targetID == id && $0.kind == .turnCompleted
+            $0.targetID == id && $0.kind == .bell
         }) else { return }
         attention.notify(
             // `sessionResponded` advances a durable broker-completion
             // acknowledgement watermark when cleared. BEL has no broker event
-            // timestamp, so keep it in the generic completed/needs-you lane.
-            kind: .turnCompleted,
+            // timestamp, so keep it in the dedicated bell lane, which reads as
+            // needs-you (unlike `.turnCompleted`).
+            kind: .bell,
             targetID: id,
             title: model.sessionTitle(for: terminal),
             detail: "Terminal requested attention"

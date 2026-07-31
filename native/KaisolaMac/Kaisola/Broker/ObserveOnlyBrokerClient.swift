@@ -38,11 +38,45 @@ extension ObserveOnlyBrokerServing {
     }
 }
 
+/// How much retained spool a cold terminal selection pulls into memory.
+///
+/// Selection used to page backwards until it held 64 MiB, which cost up to
+/// sixteen sequential `terminal.history` round trips — each with its own
+/// five-second deadline — before the first frame could be published, and left
+/// that string resident for every terminal the user visited.
+///
+/// Almost none of it was reachable. SwiftTerm keeps
+/// `NativePreviewSettings.terminalScrollbackDefault` lines in a circular
+/// buffer and discards the rest, so bytes past that depth cannot be scrolled
+/// to no matter how many were fetched. Deeper history is the transcript
+/// viewer's job: it pages the same request on demand against a cursor frozen
+/// at open time, which is also the only way to read old bytes without
+/// re-feeding ANSI into a live renderer.
+enum ObserverHistoryTailPolicy {
+    /// The broker answers `terminal.history` with at most 4 MiB per page and
+    /// caps its own subscribe snapshot at the same size, so a tail of exactly
+    /// one page means a cold selection normally issues *zero* extra requests
+    /// and never more than one. 4 MiB also covers 20,000 rows at 200 columns —
+    /// SwiftTerm's whole default scrollback — so a deeper tail could not put a
+    /// single additional row within reach.
+    static let coldSubscribeTailBytes = 4 * 1_024 * 1_024
+    static let maximumPageBytes = 4 * 1_024 * 1_024
+
+    /// Bytes to request immediately before a cold snapshot, or `nil` when the
+    /// snapshot already covers the tail or the stream has no earlier bytes.
+    /// Always satisfiable by a single page.
+    static func coldTailRequestBytes(snapshotBytes: Int, startOffset: Int64) -> Int? {
+        guard snapshotBytes >= 0, startOffset > 0 else { return nil }
+        let deficit = coldSubscribeTailBytes - snapshotBytes
+        guard deficit > 0 else { return nil }
+        return min(deficit, maximumPageBytes, Int(clamping: startOffset))
+    }
+}
+
 actor ObserveOnlyBrokerClient: ObserveOnlyBrokerServing {
     typealias EventHandler = @Sendable (BrokerEvent) -> Void
     typealias DisconnectHandler = @Sendable (any Error) -> Void
-    private static let historyPageBytes = 4 * 1_024 * 1_024
-    private static let historyRetainedBytes = 64 * 1_024 * 1_024
+    private static let historyPageBytes = ObserverHistoryTailPolicy.maximumPageBytes
 
     private let transport: any BrokerByteTransport
     private let operationTimeoutNanoseconds: UInt64
@@ -182,7 +216,7 @@ actor ObserveOnlyBrokerClient: ObserveOnlyBrokerServing {
         switch result {
         case let .snapshot(snapshot, resetReason):
             return .snapshot(
-                await expandEarlierHistory(
+                await prependColdTail(
                     snapshot,
                     terminal: terminal,
                     ownerID: ownerID
@@ -278,57 +312,49 @@ actor ObserveOnlyBrokerClient: ObserveOnlyBrokerServing {
         )
     }
 
-    /// New brokers expose the retained spool as bounded read-only pages. Older
-    /// compatible brokers reject this additive method, in which case the
+    /// Top a cold snapshot up to `ObserverHistoryTailPolicy.coldSubscribeTailBytes`
+    /// with at most one read-only page, then stop. Anything older stays in the
+    /// broker's spool, where the transcript viewer pages it on demand.
+    ///
+    /// Older compatible brokers reject this additive method, in which case the
     /// ordinary reattach snapshot remains a safe fallback until the broker can
     /// be upgraded without interrupting a live PTY.
-    private func expandEarlierHistory(
+    private func prependColdTail(
         _ snapshot: TerminalSnapshot,
         terminal: BrokerTerminalRecord,
         ownerID: String
     ) async -> TerminalSnapshot {
-        guard hello?.features.contains(BrokerWire.terminalHistoryFeature) == true else {
+        guard hello?.features.contains(BrokerWire.terminalHistoryFeature) == true,
+              let requestedBytes = ObserverHistoryTailPolicy.coldTailRequestBytes(
+                  snapshotBytes: snapshot.output.utf8.count,
+                  startOffset: snapshot.startOffset
+              ) else {
             return snapshot
         }
-        var output = snapshot.output
-        var startOffset = snapshot.startOffset
-        var truncated = snapshot.truncated
-        var retainedBytes = output.utf8.count
 
-        while startOffset > 0, retainedBytes < Self.historyRetainedBytes {
-            let requestedBytes = min(
-                Self.historyPageBytes,
-                Self.historyRetainedBytes - retainedBytes
+        let page: TerminalHistoryPage
+        do {
+            page = try await historyPage(
+                for: terminal,
+                ownerID: ownerID,
+                streamEpoch: snapshot.streamEpoch,
+                beforeOffset: snapshot.startOffset,
+                maxBytes: requestedBytes
             )
-            let page: TerminalHistoryPage
-            do {
-                page = try await historyPage(
-                    for: terminal,
-                    ownerID: ownerID,
-                    streamEpoch: snapshot.streamEpoch,
-                    beforeOffset: startOffset,
-                    maxBytes: requestedBytes
-                )
-            } catch {
-                break
-            }
-            guard page.startOffset < page.endOffset else {
-                break
-            }
-            output = page.output + output
-            retainedBytes += page.output.utf8.count
-            startOffset = page.startOffset
-            truncated = page.hasMore || page.truncated
-            if !page.hasMore { break }
+        } catch {
+            return snapshot
         }
+        // `TerminalHistoryPage` already proves the page ends exactly at the
+        // requested offset and that its byte span matches its output, so the
+        // concatenation below preserves the snapshot's cursor arithmetic.
+        guard page.startOffset < page.endOffset else { return snapshot }
 
-        guard startOffset < snapshot.startOffset else { return snapshot }
         return TerminalSnapshot(
             streamEpoch: snapshot.streamEpoch,
-            output: output,
-            startOffset: startOffset,
+            output: page.output + snapshot.output,
+            startOffset: page.startOffset,
             endOffset: snapshot.endOffset,
-            truncated: truncated,
+            truncated: page.hasMore || page.truncated || page.startOffset > 0,
             exited: snapshot.exited
         )
     }

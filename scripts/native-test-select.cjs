@@ -60,7 +60,7 @@ const NATIVE_DIRECTORY_TESTS = Object.freeze([
 const NATIVE_FILE_TESTS = Object.freeze(new Map([
   ['native/KaisolaMac/Kaisola/App/AppModel.swift', [
     'AppModelBrokerFallbackTests', 'AppModelProjectContextTests',
-    'AppModelReconnectTests',
+    'AppModelReconnectTests', 'AppModelTerminalRetentionTests',
   ]],
   ['native/KaisolaMac/Kaisola/Features/Sessions/NativeTerminalSurface.swift', [
     'NativeTerminalInteractionTests', 'SwiftTermStressTests',

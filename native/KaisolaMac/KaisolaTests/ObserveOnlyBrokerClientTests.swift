@@ -373,6 +373,105 @@ final class ObserveOnlyBrokerClientTests: XCTestCase {
         await client.disconnect()
     }
 
+    func testColdSubscribeTopsUpTheTailWithExactlyOneHistoryRequest() async throws {
+        // A deep spool whose subscribe snapshot lands well short of the tail.
+        // The old client kept paging until it held 64 MiB — sixteen sequential
+        // requests at a five-second deadline each — before the first frame.
+        let snapshotOutput = String(repeating: "s", count: 1_024)
+        let spoolDepth: Int64 = 8 * 1_024 * 1_024
+        let transport = ScriptedBrokerTransport(
+            helloAccess: "observer",
+            advertiseObserverRole: true,
+            advertiseHistory: true,
+            replyToRequests: true,
+            subscribeOutput: snapshotOutput,
+            subscribeStartOffset: spoolDepth,
+            historyPageBytes: 64 * 1_024
+        )
+        let client = ObserveOnlyBrokerClient(
+            transport: transport,
+            operationTimeoutNanoseconds: 2_000_000_000
+        )
+        _ = try await client.connect(to: brokerInfo)
+        let terminal = BrokerTerminalRecord(
+            id: "terminal:codex-1",
+            projectID: "project.one",
+            pid: 123,
+            exited: false,
+            streamEpoch: "epoch",
+            endOffset: spoolDepth + Int64(snapshotOutput.utf8.count)
+        )
+
+        let result = try await client.subscribe(
+            to: terminal,
+            ownerID: "native-observer",
+            cursor: nil
+        )
+        guard case let .snapshot(snapshot, _) = result else {
+            return XCTFail("expected a snapshot")
+        }
+
+        let requests = await transport.sentFrames().compactMap {
+            $0.objectValue?["method"]?.stringValue
+        }
+        XCTAssertEqual(
+            requests,
+            ["terminal.subscribe", "terminal.history"],
+            "The page said hasMore; deeper history belongs to the transcript viewer, not to selection latency."
+        )
+
+        let lastFrame = await transport.sentFrames().last
+        let historyRequest = try XCTUnwrap(lastFrame?.objectValue?["params"]?.objectValue)
+        XCTAssertEqual(historyRequest["beforeOffset"]?.intValue, spoolDepth)
+        XCTAssertEqual(
+            historyRequest["maxBytes"]?.intValue,
+            Int64(ObserverHistoryTailPolicy.coldSubscribeTailBytes - snapshotOutput.utf8.count)
+        )
+
+        XCTAssertTrue(snapshot.output.hasSuffix(snapshotOutput), "The live tail must stay last.")
+        XCTAssertEqual(snapshot.startOffset, spoolDepth - 64 * 1_024)
+        XCTAssertEqual(
+            snapshot.endOffset - snapshot.startOffset,
+            Int64(snapshot.output.utf8.count),
+            "Byte-cursor arithmetic must survive the prepend."
+        )
+        XCTAssertTrue(snapshot.truncated, "Older bytes remain; the transcript can still reach them.")
+        await client.disconnect()
+    }
+
+    func testColdSubscribeMakesNoHistoryRequestWhenTheSnapshotAlreadyCoversTheTail() async throws {
+        let output = String(repeating: "t", count: 4_096)
+        let transport = ScriptedBrokerTransport(
+            helloAccess: "observer",
+            advertiseObserverRole: true,
+            advertiseHistory: true,
+            replyToRequests: true,
+            subscribeOutput: output,
+            subscribeStartOffset: 0
+        )
+        let client = ObserveOnlyBrokerClient(
+            transport: transport,
+            operationTimeoutNanoseconds: 2_000_000_000
+        )
+        _ = try await client.connect(to: brokerInfo)
+        let terminal = BrokerTerminalRecord(
+            id: "terminal:codex-1",
+            projectID: "project.one",
+            pid: 123,
+            exited: false,
+            streamEpoch: "epoch",
+            endOffset: Int64(output.utf8.count)
+        )
+
+        _ = try await client.subscribe(to: terminal, ownerID: "native-observer", cursor: nil)
+
+        let methods = await transport.sentFrames().compactMap {
+            $0.objectValue?["method"]?.stringValue
+        }
+        XCTAssertEqual(methods, ["terminal.subscribe"])
+        await client.disconnect()
+    }
+
     private var brokerInfo: BrokerInfo {
         BrokerInfo(
             protocolVersion: BrokerWire.protocolVersion,
@@ -415,6 +514,8 @@ private actor ScriptedBrokerTransport: BrokerByteTransport {
     private let contentDigest: String?
     private let statusImplementationVersion: Int?
     private let subscribeOutput: String?
+    private let subscribeStartOffset: Int64
+    private let historyPageBytes: Int?
     private var connectCallCount = 0
     private var connectReleased: Bool
     private var connectGates: [CheckedContinuation<Void, Never>] = []
@@ -438,7 +539,9 @@ private actor ScriptedBrokerTransport: BrokerByteTransport {
         packageVersion: String? = "1.0.0",
         contentDigest: String? = String(repeating: "a", count: 64),
         statusImplementationVersion: Int? = nil,
-        subscribeOutput: String? = nil
+        subscribeOutput: String? = nil,
+        subscribeStartOffset: Int64 = 0,
+        historyPageBytes: Int? = nil
     ) {
         self.suspendConnect = suspendConnect
         connectReleased = !suspendConnect
@@ -453,6 +556,8 @@ private actor ScriptedBrokerTransport: BrokerByteTransport {
         self.contentDigest = contentDigest
         self.statusImplementationVersion = statusImplementationVersion
         self.subscribeOutput = subscribeOutput
+        self.subscribeStartOffset = subscribeStartOffset
+        self.historyPageBytes = historyPageBytes
     }
 
     func connect(path: String) async throws {
@@ -546,13 +651,29 @@ private actor ScriptedBrokerTransport: BrokerByteTransport {
                 "pid": .integer(123),
             ])])
         case "terminal.history":
+            // A broker may answer with fewer bytes than were requested; the
+            // page is still exactly contiguous with `beforeOffset`.
+            guard let historyPageBytes else {
+                result = .object([
+                    "ok": .bool(true),
+                    "streamEpoch": .string("epoch"),
+                    "output": .string("hello"),
+                    "startOffset": .integer(0),
+                    "endOffset": .integer(5),
+                    "hasMore": .bool(false),
+                    "truncated": .bool(false),
+                ])
+                break
+            }
+            let beforeOffset = object["params"]?.objectValue?["beforeOffset"]?.intValue ?? 0
+            let served = Int64(min(historyPageBytes, Int(clamping: beforeOffset)))
             result = .object([
                 "ok": .bool(true),
                 "streamEpoch": .string("epoch"),
-                "output": .string("hello"),
-                "startOffset": .integer(0),
-                "endOffset": .integer(5),
-                "hasMore": .bool(false),
+                "output": .string(String(repeating: "h", count: Int(served))),
+                "startOffset": .integer(beforeOffset - served),
+                "endOffset": .integer(beforeOffset),
+                "hasMore": .bool(beforeOffset - served > 0),
                 "truncated": .bool(false),
             ])
         case "terminal.subscribe":
@@ -563,9 +684,9 @@ private actor ScriptedBrokerTransport: BrokerByteTransport {
                 "snapshot": .object([
                     "streamEpoch": .string("epoch"),
                     "output": .string(subscribeOutput),
-                    "startOffset": .integer(0),
-                    "endOffset": .integer(Int64(subscribeOutput.utf8.count)),
-                    "truncated": .bool(false),
+                    "startOffset": .integer(subscribeStartOffset),
+                    "endOffset": .integer(subscribeStartOffset + Int64(subscribeOutput.utf8.count)),
+                    "truncated": .bool(subscribeStartOffset > 0),
                     "exited": .bool(false),
                 ]),
             ])

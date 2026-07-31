@@ -82,7 +82,14 @@ final class AppModel: ObservableObject {
     /// be visible at once, but retaining a dozen documents makes ordinary tab
     /// switching immediate without multiplying live SwiftTerm renderers. The
     /// broker's disk spool remains the durable, larger history boundary.
-    static let maximumRetainedTerminalSurfaces = 12
+    nonisolated static let maximumRetainedTerminalSurfaces = 12
+    /// Count alone is the wrong unit for a memory budget: a dozen documents,
+    /// each free to grow to `TerminalDocument.maximumRetainedBytes`, is 768 MiB
+    /// of scrollback strings — reachable simply by touring long-lived
+    /// terminals. Retained bytes are therefore bounded too, evicting
+    /// least-recently-used first. 96 MiB holds a whole saturated terminal plus
+    /// a comfortable deck of ordinary ones.
+    nonisolated static let maximumRetainedTerminalBytes = 96 * 1_024 * 1_024
     /// Terminals this app created and may mutate. Everything else stays
     /// strictly observed no matter what the UI asks for.
     @Published private(set) var ownedTerminalIDs: Set<String> = []
@@ -3517,11 +3524,68 @@ final class AppModel: ObservableObject {
             terminalSurfaceOrder.removeAll { $0 == sessionID }
             terminalSurfaceOrder.append(sessionID)
         }
-        while terminalSurfaceOrder.count > Self.maximumRetainedTerminalSurfaces {
-            let evicted = terminalSurfaceOrder.removeFirst()
-            terminalSurfaceDocuments.removeValue(forKey: evicted)
-            terminalSurfaceFeeds.removeValue(forKey: evicted)
+        let evictions = Self.retainedSurfaceEvictions(
+            order: terminalSurfaceOrder,
+            byteCount: { [terminalSurfaceDocuments] id in
+                terminalSurfaceDocuments[id]?.scrollback.byteCount ?? 0
+            },
+            protected: mountedTerminalSurfaceIDs
+        )
+        guard !evictions.isEmpty else { return }
+        let evicted = Set(evictions)
+        terminalSurfaceOrder.removeAll { evicted.contains($0) }
+        for id in evicted {
+            terminalSurfaceDocuments.removeValue(forKey: id)
+            terminalSurfaceFeeds.removeValue(forKey: id)
         }
+    }
+
+    /// Surfaces that are on screen right now. A terminal card renders only
+    /// while its feed exists, so evicting one of these would replace live
+    /// output with a spinner — a worse outcome than the memory it reclaims.
+    /// In-flight split subscriptions are included because their card is already
+    /// mounted and rendering from the retained document until the snapshot
+    /// lands.
+    private var mountedTerminalSurfaceIDs: Set<String> {
+        var ids = Set(splitDocuments.keys)
+        ids.formUnion(pendingSplitSubscriptions.keys)
+        if let selectedSessionID { ids.insert(selectedSessionID) }
+        if let primaryID = terminalDocument.sessionID { ids.insert(primaryID) }
+        return ids
+    }
+
+    /// Which retained documents to drop, least-recently-used first, so the deck
+    /// obeys both its document count and its byte budget.
+    ///
+    /// Pure so the policy can be exercised without a broker: the caller owns
+    /// the storage, this decides only the order and the stopping point. The
+    /// most recent entry is never evicted — it is the document being published.
+    nonisolated static func retainedSurfaceEvictions(
+        order: [String],
+        byteCount: (String) -> Int,
+        protected: Set<String>,
+        maximumSurfaces: Int = AppModel.maximumRetainedTerminalSurfaces,
+        maximumBytes: Int = AppModel.maximumRetainedTerminalBytes
+    ) -> [String] {
+        var survivors = order
+        var retainedBytes = survivors.reduce(into: 0) { $0 += byteCount($1) }
+        var evictions: [String] = []
+        var index = 0
+
+        while index < survivors.count - 1 {
+            let overCount = survivors.count > maximumSurfaces
+            let overBudget = retainedBytes > maximumBytes
+            guard overCount || overBudget else { break }
+            let candidate = survivors[index]
+            guard !protected.contains(candidate) else {
+                index += 1
+                continue
+            }
+            survivors.remove(at: index)
+            retainedBytes -= byteCount(candidate)
+            evictions.append(candidate)
+        }
+        return evictions
     }
 
     // MARK: - Native terminal ownership (Phase 2)

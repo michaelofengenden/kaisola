@@ -190,7 +190,7 @@ struct TerminalTranscriptView: View {
         }
         if first.hasMore { return "Scroll to the top to load earlier output. The live terminal stays untouched." }
         if first.startOffset == 0, !first.truncated { return "Loaded from the terminal's first byte. The live terminal stays untouched." }
-        return "Loaded all history still retained by this broker; earlier bytes are unavailable."
+        return "Loaded all the retained history; earlier bytes are no longer available."
     }
 
     private var loadedPlainText: String {
@@ -355,7 +355,7 @@ struct TerminalTranscriptView: View {
 
     private func transcriptErrorDescription(_ error: any Error) -> String {
         (error as? any LocalizedError)?.errorDescription
-            ?? "The broker could not load this terminal's retained history."
+            ?? "This terminal's retained history could not be loaded."
     }
 }
 

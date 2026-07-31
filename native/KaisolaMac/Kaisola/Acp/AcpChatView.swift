@@ -1054,7 +1054,7 @@ struct AcpPermissionBar: View {
                 if !allowsRule {
                     Text("Sensitive file — always asks").font(.caption2).foregroundStyle(.red)
                 } else {
-                    Text("Always allow scope: \(derivedRuleLabel)")
+                    Text("Always Allow scope: \(derivedRuleLabel)")
                         .font(.caption2)
                         .foregroundStyle(.secondary)
                 }
@@ -1074,7 +1074,7 @@ struct AcpPermissionBar: View {
             }
             Spacer()
             if allowsRule {
-                Button("Always allow") { always() }
+                Button("Always Allow") { always() }
                     .buttonStyle(.bordered)
                     .tint(.green)
                     .help("Allow this and create the standing rule: \(derivedRuleLabel)")

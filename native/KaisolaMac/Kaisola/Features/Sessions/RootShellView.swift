@@ -1597,7 +1597,7 @@ struct RootShellView: View {
                     }
                     .padding(10)
                     .accessibilityLabel("Reconnecting to \(surfaceTitle(id))")
-                    .accessibilityValue("Attempt \(attempt). Running terminals remain on the broker.")
+                    .accessibilityValue("Attempt \(attempt). Running terminals keep going in the background.")
             }
         }
     }
@@ -2846,7 +2846,7 @@ private struct ConnectionFooter: View {
             Text("Kaisola v\(Self.appVersion)")
             Text(state.detail ?? state.title)
             if case .current = brokerUpgradeState {
-                Text("Broker helper is current")
+                Text("Background service is up to date")
             } else if case .unknown = brokerUpgradeState {
                 EmptyView()
             } else {

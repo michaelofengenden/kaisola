@@ -3396,7 +3396,8 @@ final class KaisolaMacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDele
         windowItem.submenu = windowMenu
         mainMenu.addItem(windowItem)
 
-        // Help menu: Kaisola's roadmap doubles as its manual.
+        // Help menu. This used to open the native-migration roadmap, which is
+        // a document for people building Kaisola, not people using it.
         let helpItem = NSMenuItem()
         helpItem.title = "Help"
         let helpMenu = NSMenu(title: "Help")
@@ -3409,7 +3410,7 @@ final class KaisolaMacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDele
     }
 
     @objc func openHelp(_ sender: Any?) {
-        if let url = URL(string: "https://github.com/michaelofengenden/kaisola/blob/main/docs/native-migration-roadmap.md") {
+        if let url = URL(string: "https://github.com/michaelofengenden/kaisola/blob/main/README.md") {
             NSWorkspace.shared.open(url)
         }
     }

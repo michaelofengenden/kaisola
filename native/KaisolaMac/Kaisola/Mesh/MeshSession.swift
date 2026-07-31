@@ -378,7 +378,7 @@ final class MeshSession: ObservableObject, Identifiable {
                 }
             } else if assignment.role.usesWorktree {
                 if case .plainFolder = repoProbe {
-                    isolationNote = "Not a git repo — columns share the workspace (no isolation)."
+                    isolationNote = "Not a git repo — columns share the project folder (no isolation)."
                 } else {
                     // Any ambiguous Git probe fails closed. Read-only scout /
                     // ideator roles may still run, but writers never share a

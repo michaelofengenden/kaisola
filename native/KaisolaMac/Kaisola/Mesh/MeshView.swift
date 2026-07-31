@@ -68,7 +68,7 @@ struct MeshView: View {
         }
         .background(Color(nsColor: .textBackgroundColor))
         .confirmationDialog(
-            "Apply this column's diff to the base workspace?",
+            "Apply this column's diff to the base project?",
             isPresented: Binding(
                 get: { integrateColumnID != nil },
                 set: { if !$0 { integrateColumnID = nil } }
@@ -349,7 +349,7 @@ private struct MeshColumnView: View {
                     Button("Integrate", action: integrate)
                         .buttonStyle(.borderless)
                         .font(.caption)
-                        .help("Apply this column's diff onto the base workspace")
+                        .help("Apply this column's diff onto the base project")
                 }
             }
             .padding(.horizontal, 10)

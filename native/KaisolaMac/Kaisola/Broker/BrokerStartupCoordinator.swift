@@ -39,25 +39,25 @@ enum BrokerUpgradeState: Equatable, Sendable {
     var detail: String {
         switch self {
         case .unknown:
-            "Broker helper identity has not been checked."
+            "The background service has not been checked yet."
         case let .current(contentDigest):
-            "Broker helper is current · content \(contentDigest)."
+            "Background service is up to date · content \(contentDigest)."
         case let .checking(fromContentDigest, targetContentDigest):
-            "Checking broker helper update \(Self.transition(fromContentDigest, targetContentDigest)) safely."
+            "Checking a background service update \(Self.transition(fromContentDigest, targetContentDigest)) safely."
         case let .pending(from, target, .liveWork(blockers)):
-            "Broker update pending \(Self.transition(from, target)): \(blockers.liveTerminalCount) live terminal(s), \(blockers.busyAgentCount) working agent(s), \(blockers.childTaskCount) child task(s)."
+            "Background service update waiting \(Self.transition(from, target)): \(blockers.liveTerminalCount) live terminal(s), \(blockers.busyAgentCount) working agent(s), \(blockers.childTaskCount) child task(s)."
         case let .pending(from, target, .legacyIdentityUnavailable):
-            "Broker update pending \(Self.transition(from, target)): this older broker cannot prove an atomic safe shutdown."
+            "Background service update waiting \(Self.transition(from, target)): this older version cannot prove an atomic safe shutdown."
         case let .pending(from, target, .identityChanged):
-            "Broker update pending \(Self.transition(from, target)): the live broker identity changed during the safety check."
+            "Background service update waiting \(Self.transition(from, target)): its identity changed during the safety check."
         case let .pending(from, target, .requestUnavailable):
-            "Broker update pending \(Self.transition(from, target)): the live broker does not support sealed safe promotion."
+            "Background service update waiting \(Self.transition(from, target)): the running version does not support sealed safe promotion."
         case let .pending(from, target, .shutdownTimedOut):
-            "Broker update pending \(Self.transition(from, target)): the old helper did not finish its safe shutdown."
+            "Background service update waiting \(Self.transition(from, target)): the old version did not finish its safe shutdown."
         case let .pending(from, target, .launchFailed):
-            "Broker update pending \(Self.transition(from, target)): the replacement helper could not be started yet."
+            "Background service update waiting \(Self.transition(from, target)): the replacement could not be started yet."
         case let .updating(fromContentDigest, targetContentDigest):
-            "Broker helper is updating \(Self.transition(fromContentDigest, targetContentDigest)); no terminal processes are being interrupted."
+            "Background service is updating \(Self.transition(fromContentDigest, targetContentDigest)); no terminal processes are being interrupted."
         }
     }
 

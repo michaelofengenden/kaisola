@@ -35,7 +35,7 @@ final class AppModel: ObservableObject {
 
         var title: String {
             switch self {
-            case .looking: "Looking for broker"
+            case .looking: "Looking for the background service"
             case .connecting: "Connecting"
             case .reconnecting: "Reconnecting"
             case .connected: "Connected"
@@ -46,9 +46,9 @@ final class AppModel: ObservableObject {
         var detail: String? {
             switch self {
             case let .reconnecting(attempt):
-                "Attempt \(attempt) · running terminals remain on the broker"
+                "Attempt \(attempt) · running terminals keep going in the background"
             case let .connected(version, pid, serverEnforced):
-                "Broker \(version) · PID \(pid) · \(serverEnforced ? "server-enforced observer" : "local observer policy")"
+                "Background service \(version) · PID \(pid) · \(serverEnforced ? "server-enforced observer" : "local observer policy")"
             case let .unavailable(message): message
             default: nil
             }
@@ -3569,8 +3569,8 @@ final class AppModel: ObservableObject {
             publishPrimaryDocument(.failure(
                 sessionID: "create-unavailable",
                 message: connectionState.isConnected
-                    ? "The connected broker doesn't accept native control (it predates the controller lane), so new sessions can't be created from this app yet. Chats and Mesh still work — they don't need the broker."
-                    : "No broker connection — new sessions need a running session broker. Chats and Mesh still work without one."
+                    ? "This terminal service is view-only right now, so new terminals are disabled. Chats and Mesh still work — they don't need it."
+                    : "Kaisola isn't connected to its background terminal service, so new terminals are disabled. Chats and Mesh still work without it."
             ))
             return nil
         }
@@ -4589,7 +4589,7 @@ final class AppModel: ObservableObject {
                 reconcileAllPaneLayoutsWithAvailableSurfaces()
             }
             connectionState = .connected(
-                version: hello.version + (usingSeparateBroker ? " · separate native broker" : ""),
+                version: hello.version + (usingSeparateBroker ? " · separate background service" : ""),
                 pid: hello.pid,
                 serverEnforcedObserver: hello.serverEnforcedObserver
             )
@@ -5802,6 +5802,6 @@ private extension Error {
         if let localized = self as? LocalizedError, let description = localized.errorDescription {
             return description
         }
-        return "The terminal observer could not connect. The running broker and its sessions were left untouched."
+        return "The terminal observer could not connect. Everything already running was left untouched."
     }
 }

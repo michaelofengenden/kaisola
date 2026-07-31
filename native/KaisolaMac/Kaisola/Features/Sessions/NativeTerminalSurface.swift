@@ -129,6 +129,7 @@ struct NativeTerminalSurface: NSViewRepresentable {
         view.changeScrollback(NativePreviewSettings.clampedTerminalScrollback(scrollbackLines))
         view.configureAdvertisedGraphicsCapabilities()
         view.configureSemanticPromptMarks()
+        view.configureJumpToLiveBottomAffordance()
         view.terminalDelegate = context.coordinator
         view.configureTerminalTheme(light: lightSurface, mode: paletteMode)
         view.allowMouseReporting = isOwned
@@ -136,6 +137,7 @@ struct NativeTerminalSurface: NSViewRepresentable {
         Self.configureKeyboardInput(on: view)
         view.agentLaunchCommand = agentLaunchCommand
         view.onHistoryBoundary = onHistoryBoundary
+        view.paneSessionID = sessionID
         view.setAccessibilityLabel(isOwned ? "Terminal" : "Read-only terminal output")
         TerminalScrollGestureMonitor.install()
         let coordinator = context.coordinator
@@ -174,8 +176,10 @@ struct NativeTerminalSurface: NSViewRepresentable {
         Self.configureKeyboardInput(on: view)
         view.agentLaunchCommand = agentLaunchCommand
         view.onHistoryBoundary = onHistoryBoundary
+        view.paneSessionID = sessionID
         view.configureAdvertisedGraphicsCapabilities()
         view.configureSemanticPromptMarks()
+        view.configureJumpToLiveBottomAffordance()
         view.onUsableLayout = { [weak view, weak coordinator] in
             guard let view, let coordinator else { return }
             coordinator.flushPendingInitialRender(to: view)
@@ -197,6 +201,7 @@ struct NativeTerminalSurface: NSViewRepresentable {
         context.coordinator.setBaseWorkingDirectory(workingDirectory)
         view.agentLaunchCommand = agentLaunchCommand
         view.onHistoryBoundary = onHistoryBoundary
+        view.paneSessionID = sessionID
         let desired = TerminalFontOptions.resolveFont(family: fontFamily, size: fontSize, weightRaw: fontWeight)
         let desiredLineSpacing = CGFloat(NativePreviewSettings.clampedTerminalLineSpacing(lineSpacing))
         if abs(view.lineSpacing - desiredLineSpacing) > 0.001 {
@@ -933,6 +938,19 @@ struct NativeTerminalSurface: NSViewRepresentable {
             }
         }
 
+        /// Re-enter sticky-scroll follow mode after the user deliberately
+        /// returned to live output (the jump pill) or removed the scrollback
+        /// they had scrolled into (Clear Terminal). Both are explicit intent,
+        /// so unlike `reconcileExpiredGesturePin` this does not second-guess
+        /// the current viewport position.
+        @MainActor
+        func resumeLiveFollow() {
+            userUnpinned = false
+        }
+
+        /// Test seam for the pin state the pill and the clear command depend on.
+        var isFollowingLiveOutput: Bool { !userUnpinned }
+
         /// A microscopic gesture can end before SwiftTerm's precise-delta
         /// accumulator crosses a terminal row. Once gesture attribution expires,
         /// exact live-bottom is authoritative again; clear only that phantom
@@ -1218,6 +1236,92 @@ struct NativeTerminalSurface: NSViewRepresentable {
     }
 }
 
+/// "Clear Terminal" for a surface whose history the broker owns.
+///
+/// A Kaisola terminal is not the authority on its own output: the broker keeps
+/// an append-only spool and every renderer — this window, a popped-out window,
+/// the transcript sheet, the phone companion — is reconstructed from it. There
+/// is therefore nothing a clear could delete here that would stay deleted, and
+/// deleting broker bytes would be the wrong promise to make from a View menu
+/// item. Typing `clear` into the PTY is also wrong: it would land in whatever
+/// the user (or an agent CLI) has half-composed at the prompt.
+///
+/// So this clears the *live renderer* only — erase the visible screen, drop
+/// SwiftTerm's in-memory scrollback, home the cursor, and return to the live
+/// bottom. The PTY is untouched and the coordinator's rendered byte cursor is
+/// unchanged, so streaming output keeps appending incrementally rather than
+/// forcing a full re-feed. A later full reconstruction (a stream-epoch change,
+/// or a pane remounted from a project switch) legitimately repaints the earlier
+/// output, and the retained transcript can always still reach it.
+enum TerminalClearCommand {
+    /// CUP home + ED 2 (erase display) + ED 3 (erase scrollback), fed through
+    /// the parser instead of mutating SwiftTerm's buffers directly so cursor,
+    /// wrap, and image state stay consistent with the renderer's own rules.
+    static let escapeSequence = "\u{1B}[H\u{1B}[2J\u{1B}[3J"
+
+    /// Shown when the command is invoked with no terminal to act on, because a
+    /// silent no-op is exactly the failure this bundle exists to remove.
+    static let noTerminalMessage = "Focus a terminal to clear it."
+}
+
+/// When the "jump to live output" pill is offered, and where it sits.
+///
+/// The pill is strictly a recovery affordance for a viewport the user moved:
+/// it must never appear on a surface that cannot scroll, and never over a
+/// full-screen TUI, where SwiftTerm pins `scrollPosition` to 0 on the
+/// alternate buffer and "the bottom" has no meaning.
+enum TerminalJumpToBottomPolicy {
+    static let trailingInset: CGFloat = 12
+    static let bottomInset: CGFloat = 10
+    /// The legacy scroller keeps a permanently visible track on the right edge;
+    /// clear it so the pill never sits under the user's scroll target.
+    static let scrollerInset: CGFloat = 16
+
+    static func isVisible(
+        canScroll: Bool,
+        isAtLiveBottom: Bool,
+        isAlternateBuffer: Bool
+    ) -> Bool {
+        canScroll && !isAlternateBuffer && !isAtLiveBottom
+    }
+
+    static func frame(in bounds: NSRect, size: NSSize, flipped: Bool) -> NSRect {
+        let x = max(bounds.minX, bounds.maxX - size.width - trailingInset - scrollerInset)
+        let y = flipped
+            ? max(bounds.minY, bounds.maxY - size.height - bottomInset)
+            : bounds.minY + bottomInset
+        return NSRect(origin: NSPoint(x: x, y: y), size: size)
+    }
+}
+
+/// Which terminal a window-level command acts on.
+///
+/// The model's focused pane is the surface the user can *see* highlighted, so
+/// it wins; the AppKit first responder is the fallback for the moments before
+/// the two agree, and a lone terminal is better than refusing the command.
+@MainActor
+enum TerminalFocusResolver {
+    static func focusedTerminal(in window: NSWindow?, paneID: String?) -> ReadOnlyTerminalView? {
+        guard let window, let root = window.contentView else { return nil }
+        if let paneID, let match = terminal(in: root, paneID: paneID) { return match }
+        if let responder = window.firstResponder as? ReadOnlyTerminalView { return responder }
+        return terminal(in: root, paneID: nil)
+    }
+
+    /// Depth-first search for a terminal view. A nil `paneID` matches the first
+    /// terminal found, which is what a single-pane window always wants.
+    static func terminal(in root: NSView, paneID: String?) -> ReadOnlyTerminalView? {
+        if let terminal = root as? ReadOnlyTerminalView,
+           paneID == nil || terminal.paneSessionID == paneID {
+            return terminal
+        }
+        for subview in root.subviews {
+            if let match = terminal(in: subview, paneID: paneID) { return match }
+        }
+        return nil
+    }
+}
+
 enum TerminalSemanticEvent: Equatable, Sendable {
     case promptStart(isSecondary: Bool)
     case commandStart
@@ -1484,6 +1588,12 @@ class ReadOnlyTerminalView: TerminalView {
     /// Host-owned presentation hook for continuing beyond SwiftTerm's bounded
     /// in-memory row model into the broker's disk-backed transcript.
     var onHistoryBoundary: (() -> Void)?
+    /// Stable surface identity of the pane this view renders. Window-level
+    /// commands (Clear Terminal, pane focus moves) resolve a terminal through
+    /// this rather than assuming the AppKit responder chain already agrees with
+    /// the model's focused pane.
+    var paneSessionID: String?
+    private var jumpToLiveBottomButton: NSButton?
     private var lastHistoryBoundaryRequestAt = -TimeInterval.greatestFiniteMagnitude
     var hasUsableRenderGeometry: Bool {
         bounds.width > 1 && bounds.height > 1
@@ -1601,7 +1711,12 @@ class ReadOnlyTerminalView: TerminalView {
         return true
     }
 
+    /// Every path that can move the viewport already calls this — feeds, user
+    /// scrolls, re-pins, layout, and reset — so it is also the single hook the
+    /// jump-to-live-bottom pill reacts to. Keeping one hook is what stops the
+    /// affordance from lagging a scroll by a run-loop turn.
     func updateSemanticDecorations() {
+        updateJumpToLiveBottomVisibility()
         guard let semanticDecorationView else { return }
         // Preserve the one transition that hides an old overlay after reset,
         // while making the steady empty state free during ordinary streaming.
@@ -1809,6 +1924,7 @@ class ReadOnlyTerminalView: TerminalView {
 
     override func layout() {
         super.layout()
+        layoutJumpToLiveBottomAffordance()
         updateSemanticDecorations()
         if hasUsableRenderGeometry {
             onUsableLayout?()
@@ -1878,6 +1994,95 @@ class ReadOnlyTerminalView: TerminalView {
     func scrollToLiveBottom() {
         scroll(toPosition: 1)
         updateSemanticDecorations()
+    }
+
+    /// Erase the live renderer without touching the broker's retained history
+    /// or the PTY. See `TerminalClearCommand` for why that is the only honest
+    /// meaning "Clear Terminal" can have on a broker-backed surface.
+    func clearLiveScrollback() {
+        feed(text: TerminalClearCommand.escapeSequence)
+        // ED 3 resets `buffer.linesTop`, the coordinate space every recorded
+        // OSC 133 mark lives in. Stale marks would decorate unrelated rows, so
+        // drop the index and let later marks rebuild trustworthy bounds.
+        resetSemanticPromptMarks()
+        // The scrollback the user had scrolled into no longer exists, so the
+        // pin state describing it is meaningless: follow live output again.
+        resumeLiveFollow()
+        scrollToLiveBottom()
+    }
+
+    /// Return the surface to sticky-scroll follow mode. Shared by the jump pill
+    /// and by clearing, both of which end with the viewport at the live bottom.
+    func resumeLiveFollow() {
+        (terminalDelegate as? NativeTerminalSurface.Coordinator)?.resumeLiveFollow()
+    }
+
+    /// A small trailing pill offering the way back to live output. It exists
+    /// only while the user is genuinely scrolled up; a permanently visible
+    /// control would just be chrome over the terminal.
+    func configureJumpToLiveBottomAffordance() {
+        guard jumpToLiveBottomButton == nil else { return }
+        let button = NSButton(
+            title: "Latest",
+            image: NSImage(
+                systemSymbolName: "arrow.down.to.line.compact",
+                accessibilityDescription: nil
+            ) ?? NSImage(),
+            target: self,
+            action: #selector(jumpToLiveBottomClicked(_:))
+        )
+        button.bezelStyle = .rounded
+        button.controlSize = .small
+        button.imagePosition = .imageLeading
+        button.font = .systemFont(ofSize: 11, weight: .medium)
+        button.isHidden = true
+        button.toolTip = "Scroll to the newest output"
+        button.setAccessibilityLabel("Scroll to latest output")
+        button.setAccessibilityHelp("Returns this terminal to live output and resumes following it")
+        addSubview(button, positioned: .above, relativeTo: nil)
+        jumpToLiveBottomButton = button
+        layoutJumpToLiveBottomAffordance()
+    }
+
+    @objc private func jumpToLiveBottomClicked(_ sender: Any?) {
+        resumeLiveFollow()
+        scrollToLiveBottom()
+    }
+
+    /// Visible only while the viewport is genuinely parked above live output.
+    func updateJumpToLiveBottomVisibility() {
+        guard let button = jumpToLiveBottomButton else { return }
+        let visible = TerminalJumpToBottomPolicy.isVisible(
+            canScroll: canScroll,
+            isAtLiveBottom: isViewportAtLiveBottom,
+            isAlternateBuffer: getTerminal().isCurrentBufferAlternate
+        )
+        guard button.isHidden == visible else { return }
+        button.isHidden = !visible
+        if visible { layoutJumpToLiveBottomAffordance() }
+    }
+
+    private func layoutJumpToLiveBottomAffordance() {
+        guard let button = jumpToLiveBottomButton else { return }
+        button.sizeToFit()
+        button.frame = TerminalJumpToBottomPolicy.frame(
+            in: bounds,
+            size: button.frame.size,
+            flipped: isFlipped
+        )
+    }
+
+    /// Test seam: the affordance is a private subview, but its state is the
+    /// whole contract ("only while scrolled up").
+    var jumpToLiveBottomIsVisible: Bool {
+        jumpToLiveBottomButton.map { !$0.isHidden } ?? false
+    }
+
+    @discardableResult
+    func performJumpToLiveBottom() -> Bool {
+        guard let button = jumpToLiveBottomButton, !button.isHidden else { return false }
+        jumpToLiveBottomClicked(button)
+        return true
     }
 
     /// Launch command of the CLI running in this pane (`claude`, `codex`, …), so

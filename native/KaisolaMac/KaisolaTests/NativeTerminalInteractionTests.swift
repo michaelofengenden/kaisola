@@ -1284,6 +1284,217 @@ final class NativeTerminalInteractionTests: XCTestCase {
         XCTAssertTrue(view.allowMouseReporting)
     }
 
+    // MARK: - Clear Terminal and jump to live output
+
+    private func scrolledUpFixture(
+        lineCount: Int = 400
+    ) -> (coordinator: NativeTerminalSurface.Coordinator, view: ReadOnlyTerminalView, output: String) {
+        let coordinator = NativeTerminalSurface.Coordinator()
+        let view = OwnedTerminalView(
+            frame: NSRect(x: 0, y: 0, width: 640, height: 320),
+            font: NSFont.monospacedSystemFont(ofSize: 13, weight: .regular)
+        )
+        view.changeScrollback(2_000)
+        view.configureJumpToLiveBottomAffordance()
+        view.terminalDelegate = coordinator
+        let output = (0..<lineCount).map { "clear-fixture-\($0)\r\n" }.joined()
+        coordinator.apply(
+            output: output,
+            epoch: "clear-epoch",
+            endOffset: Int64(output.utf8.count),
+            to: view
+        )
+        return (coordinator, view, output)
+    }
+
+    private func visibleText(_ view: ReadOnlyTerminalView) -> String {
+        let terminal = view.getTerminal()
+        return terminal.getText(
+            start: Position(col: 0, row: 0),
+            end: Position(col: terminal.cols, row: Int.max)
+        )
+    }
+
+    func testClearTerminalDropsTheRendererScrollbackWithoutTouchingThePTY() {
+        let fixture = scrolledUpFixture()
+        XCTAssertTrue(fixture.view.canScroll)
+        XCTAssertTrue(visibleText(fixture.view).contains("clear-fixture-0"))
+
+        fixture.view.clearLiveScrollback()
+
+        XCTAssertFalse(fixture.view.canScroll, "Clearing must leave no scrollback behind.")
+        let remaining = visibleText(fixture.view).trimmingCharacters(in: .whitespacesAndNewlines)
+        XCTAssertTrue(remaining.isEmpty, "Unexpected residue: \(remaining.prefix(120))")
+        XCTAssertTrue(fixture.coordinator.isFollowingLiveOutput)
+    }
+
+    func testClearTerminalKeepsTheIncrementalDeltaPathIntact() throws {
+        let fixture = scrolledUpFixture()
+        let appliedBefore = fixture.coordinator.directDeltaApplyCount
+        fixture.view.clearLiveScrollback()
+
+        // The broker cursor is unchanged by a renderer-local clear, so the very
+        // next frame must still append rather than force a full re-feed (which
+        // would silently repaint everything the user just cleared).
+        let addition = "after-clear\r\n"
+        let combined = fixture.output + addition
+        let delta = try XCTUnwrap(TerminalSurfaceDelta(
+            epoch: "clear-epoch",
+            startOffset: Int64(fixture.output.utf8.count),
+            endOffset: Int64(combined.utf8.count),
+            data: addition
+        ))
+        fixture.coordinator.apply(
+            output: combined,
+            epoch: "clear-epoch",
+            endOffset: Int64(combined.utf8.count),
+            surfaceDelta: delta,
+            to: fixture.view
+        )
+
+        XCTAssertEqual(fixture.coordinator.directDeltaApplyCount, appliedBefore + 1)
+        let visible = visibleText(fixture.view)
+        XCTAssertTrue(visible.contains("after-clear"))
+        XCTAssertFalse(
+            visible.contains("clear-fixture-0"),
+            "A cleared renderer must not resurrect earlier output from an incremental frame."
+        )
+    }
+
+    func testJumpToBottomIsOfferedOnlyWhileGenuinelyScrolledUp() {
+        XCTAssertTrue(TerminalJumpToBottomPolicy.isVisible(
+            canScroll: true,
+            isAtLiveBottom: false,
+            isAlternateBuffer: false
+        ))
+        XCTAssertFalse(TerminalJumpToBottomPolicy.isVisible(
+            canScroll: true,
+            isAtLiveBottom: true,
+            isAlternateBuffer: false
+        ))
+        XCTAssertFalse(TerminalJumpToBottomPolicy.isVisible(
+            canScroll: false,
+            isAtLiveBottom: false,
+            isAlternateBuffer: false
+        ))
+        // A full-screen TUI pins scrollPosition to 0 on the alternate buffer;
+        // "the bottom" is meaningless there and the pill must stay away.
+        XCTAssertFalse(TerminalJumpToBottomPolicy.isVisible(
+            canScroll: true,
+            isAtLiveBottom: false,
+            isAlternateBuffer: true
+        ))
+    }
+
+    func testJumpToBottomPillSitsInsideTheTrailingBottomCornerInBothGeometries() {
+        let bounds = NSRect(x: 0, y: 0, width: 400, height: 300)
+        let size = NSSize(width: 90, height: 20)
+
+        let unflipped = TerminalJumpToBottomPolicy.frame(in: bounds, size: size, flipped: false)
+        XCTAssertEqual(unflipped.minY, TerminalJumpToBottomPolicy.bottomInset, accuracy: 0.001)
+        let flipped = TerminalJumpToBottomPolicy.frame(in: bounds, size: size, flipped: true)
+        XCTAssertEqual(
+            flipped.maxY,
+            bounds.maxY - TerminalJumpToBottomPolicy.bottomInset,
+            accuracy: 0.001
+        )
+        for frame in [unflipped, flipped] {
+            XCTAssertTrue(bounds.contains(frame))
+            XCTAssertLessThan(frame.maxX, bounds.maxX - TerminalJumpToBottomPolicy.scrollerInset)
+        }
+
+        // A pane narrower than the pill must still produce an on-screen frame.
+        let cramped = TerminalJumpToBottomPolicy.frame(
+            in: NSRect(x: 0, y: 0, width: 40, height: 40),
+            size: size,
+            flipped: false
+        )
+        XCTAssertEqual(cramped.minX, 0, accuracy: 0.001)
+    }
+
+    func testJumpToBottomPillAppearsOnScrollUpAndRepinsWhenUsed() {
+        let fixture = scrolledUpFixture()
+        XCTAssertFalse(
+            fixture.view.jumpToLiveBottomIsVisible,
+            "A freshly pinned terminal has nothing to jump back to."
+        )
+
+        fixture.view.scrollUp(lines: 40)
+        fixture.view.updateJumpToLiveBottomVisibility()
+        XCTAssertTrue(fixture.view.jumpToLiveBottomIsVisible)
+
+        XCTAssertTrue(fixture.view.performJumpToLiveBottom())
+        XCTAssertTrue(fixture.view.isViewportAtLiveBottom)
+        XCTAssertTrue(fixture.coordinator.isFollowingLiveOutput)
+        XCTAssertFalse(fixture.view.jumpToLiveBottomIsVisible)
+        // Using the pill must not be a one-shot: following resumes, so the next
+        // output frame stays glued to the bottom.
+        XCTAssertFalse(fixture.view.performJumpToLiveBottom())
+    }
+
+    func testFocusedTerminalPrefersThePaneTheModelRings() throws {
+        let window = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 600, height: 400),
+            styleMask: [.titled],
+            backing: .buffered,
+            defer: false
+        )
+        let root = NSView(frame: window.contentLayoutRect)
+        window.contentView = root
+        let first = OwnedTerminalView(
+            frame: NSRect(x: 0, y: 0, width: 300, height: 400),
+            font: NSFont.monospacedSystemFont(ofSize: 13, weight: .regular)
+        )
+        first.paneSessionID = "terminal:a"
+        let second = OwnedTerminalView(
+            frame: NSRect(x: 300, y: 0, width: 300, height: 400),
+            font: NSFont.monospacedSystemFont(ofSize: 13, weight: .regular)
+        )
+        second.paneSessionID = "terminal:b"
+        root.addSubview(first)
+        root.addSubview(second)
+
+        XCTAssertTrue(
+            TerminalFocusResolver.focusedTerminal(in: window, paneID: "terminal:b") === second
+        )
+        // No pane id (a chat or Mesh is focused): fall back to the responder.
+        window.makeFirstResponder(second)
+        XCTAssertTrue(TerminalFocusResolver.focusedTerminal(in: window, paneID: nil) === second)
+        // An id that is not on screen must not silently retarget another pane's
+        // terminal through the pane lane, but a live responder is still valid.
+        XCTAssertTrue(
+            TerminalFocusResolver.focusedTerminal(in: window, paneID: "terminal:gone") === second
+        )
+        XCTAssertNil(TerminalFocusResolver.focusedTerminal(in: nil, paneID: "terminal:a"))
+    }
+
+    func testViewMenuCarriesClearTerminalAndScrollToLatestWithSafeShortcuts() throws {
+        let action = #selector(NSResponder.doCommand(by:))
+        let menu = KaisolaMacAppDelegate.makeMainMenu(
+            updateTarget: nil, updateAction: nil, updateEnabled: false, updateDetail: nil,
+            viewTarget: nil,
+            layoutAction: action,
+            appearanceAction: action,
+            terminalCommandTarget: nil,
+            clearTerminalAction: action,
+            scrollToLatestOutputAction: action
+        )
+        let viewMenu = try XCTUnwrap(menu.item(withTitle: "View")?.submenu)
+        let clear = try XCTUnwrap(viewMenu.items.first { $0.title == "Clear Terminal" })
+        XCTAssertEqual(clear.keyEquivalent, "k")
+        XCTAssertEqual(clear.keyEquivalentModifierMask, [.command, .option])
+        let latest = try XCTUnwrap(viewMenu.items.first { $0.title == "Scroll to Latest Output" })
+        XCTAssertEqual(latest.keyEquivalent, "\u{F701}")
+        XCTAssertEqual(latest.keyEquivalentModifierMask, [.command, .option])
+
+        // Command-K belongs to the palette; nothing in the bar may claim it.
+        let plainCommandK = menu.items
+            .compactMap(\.submenu)
+            .flatMap(\.items)
+            .filter { $0.keyEquivalent == "k" && $0.keyEquivalentModifierMask == [.command] }
+        XCTAssertTrue(plainCommandK.isEmpty)
+    }
+
     func testReadOnlyViewStillDropsAllPTYBoundBytes() {
         let view = ReadOnlyTerminalView(
             frame: .zero,

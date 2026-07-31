@@ -2697,6 +2697,32 @@ final class KaisolaMacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDele
     @objc private func decreaseTerminalFont(_ sender: Any?) { settings.adjustTerminalFont(by: -1) }
     @objc private func resetTerminalFont(_ sender: Any?) { settings.resetTerminalFont() }
 
+    /// The terminal a View > Terminal command acts on: the model's focused pane
+    /// first, because that is the surface the user can see ringed.
+    private func focusedTerminalView() -> ReadOnlyTerminalView? {
+        TerminalFocusResolver.focusedTerminal(
+            in: NSApp.keyWindow,
+            paneID: keyModel()?.focusedPaneID
+        )
+    }
+
+    @objc private func clearFocusedTerminal(_ sender: Any?) {
+        guard let terminal = focusedTerminalView() else {
+            ToastCenter.shared.show(TerminalClearCommand.noTerminalMessage, style: .info)
+            return
+        }
+        terminal.clearLiveScrollback()
+    }
+
+    @objc private func scrollFocusedTerminalToLatest(_ sender: Any?) {
+        guard let terminal = focusedTerminalView() else {
+            ToastCenter.shared.show(TerminalClearCommand.noTerminalMessage, style: .info)
+            return
+        }
+        terminal.resumeLiveFollow()
+        terminal.scrollToLiveBottom()
+    }
+
     // MARK: - Recents & saved windows
 
     private lazy var savedWindows: SavedWindowsStore = {
@@ -2946,6 +2972,10 @@ final class KaisolaMacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDele
         if menuItem.action == #selector(closeActiveFileTab(_:)) {
             return keyModel()?.previewedFileURL != nil
         }
+        if menuItem.action == #selector(clearFocusedTerminal(_:))
+            || menuItem.action == #selector(scrollFocusedTerminalToLatest(_:)) {
+            return focusedTerminalView() != nil
+        }
         return true
     }
 
@@ -2998,6 +3028,9 @@ final class KaisolaMacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDele
             fontIncreaseAction: #selector(increaseTerminalFont(_:)),
             fontDecreaseAction: #selector(decreaseTerminalFont(_:)),
             fontResetAction: #selector(resetTerminalFont(_:)),
+            terminalCommandTarget: self,
+            clearTerminalAction: #selector(clearFocusedTerminal(_:)),
+            scrollToLatestOutputAction: #selector(scrollFocusedTerminalToLatest(_:)),
             dynamicMenusDelegate: self,
             saveWindowTarget: self,
             saveWindowAction: #selector(saveWindowLayout(_:)),
@@ -3046,6 +3079,9 @@ final class KaisolaMacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDele
         fontIncreaseAction: Selector? = nil,
         fontDecreaseAction: Selector? = nil,
         fontResetAction: Selector? = nil,
+        terminalCommandTarget: AnyObject? = nil,
+        clearTerminalAction: Selector? = nil,
+        scrollToLatestOutputAction: Selector? = nil,
         dynamicMenusDelegate: NSMenuDelegate? = nil,
         saveWindowTarget: AnyObject? = nil,
         saveWindowAction: Selector? = nil,
@@ -3272,6 +3308,29 @@ final class KaisolaMacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDele
                 smaller.target = fontTarget
                 let reset = viewMenu.addItem(withTitle: "Reset Size", action: fontResetAction, keyEquivalent: "0")
                 reset.target = fontTarget
+            }
+            if let clearTerminalAction, let scrollToLatestOutputAction {
+                viewMenu.addItem(.separator())
+                viewMenu.addItem(sectionHeader("Terminal"))
+                // NOT Command-K: that is the command palette. Option-Command-K
+                // is the free neighbour every terminal user already reaches for.
+                let clear = viewMenu.addItem(
+                    withTitle: "Clear Terminal",
+                    action: clearTerminalAction,
+                    keyEquivalent: "k"
+                )
+                clear.keyEquivalentModifierMask = [.command, .option]
+                clear.target = terminalCommandTarget
+                clear.toolTip = "Clears this terminal's visible output and scroll buffer. Retained history stays available in the transcript."
+                // The pill on a scrolled-up terminal is a pointer affordance;
+                // this is the same action for keyboard and VoiceOver users.
+                let latest = viewMenu.addItem(
+                    withTitle: "Scroll to Latest Output",
+                    action: scrollToLatestOutputAction,
+                    keyEquivalent: "\u{F701}"
+                )
+                latest.keyEquivalentModifierMask = [.command, .option]
+                latest.target = terminalCommandTarget
             }
             viewItem.submenu = viewMenu
             mainMenu.addItem(viewItem)

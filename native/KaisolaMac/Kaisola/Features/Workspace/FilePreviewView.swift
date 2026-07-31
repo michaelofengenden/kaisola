@@ -3083,105 +3083,85 @@ enum FileLineNavigation {
     }
 }
 
-/// Remembers where each document was last scrolled to, as the character offset
-/// at the top of the viewport.
+/// Remembers where each document was last scrolled to, as the fraction of its
+/// scrollable range sitting at the top of the viewport.
 ///
-/// Read mode and the editor are two different text views laying the same file
-/// out with different machinery, so a raw pixel offset does not survive the
-/// toggle — a character offset does. Without this, every switch between reading
-/// and editing threw the reader back to line 1, which is the whole reason the
-/// toggle felt destructive on a long file.
+/// Read mode and the editor are two text views laying the same file out with
+/// different machinery, so a raw pixel offset does not survive the toggle.
+/// A character offset sounds more meaningful, but TextKit 2 answers geometry
+/// questions about text it has not laid out with end-of-document values, so an
+/// offset cannot be turned back into a scroll position without first laying out
+/// the whole file — exactly the cost the viewport exists to avoid. Both surfaces
+/// render the same monospaced source without wrapping, so every line is the same
+/// height and the fraction transfers directly.
+///
+/// Without this, every switch between reading and editing threw the view back to
+/// line 1, which is what made the toggle feel destructive on a long file.
 ///
 /// Bounded so a long session cannot accumulate one entry per file ever opened.
 final class FilePreviewTextScrollMemory {
     static let capacity = 32
 
-    private var offsets: [String: Int] = [:]
+    private var fractions: [String: Double] = [:]
     /// Least-recently recorded first.
     private var recency: [String] = []
 
-    var trackedDocumentCount: Int { offsets.count }
+    var trackedDocumentCount: Int { fractions.count }
 
-    func record(_ characterIndex: Int, for documentID: String) {
-        guard !documentID.isEmpty else { return }
-        offsets[documentID] = max(0, characterIndex)
+    func record(_ fraction: Double, for documentID: String) {
+        guard !documentID.isEmpty, fraction.isFinite else { return }
+        fractions[documentID] = min(1, max(0, fraction))
         recency.removeAll { $0 == documentID }
         recency.append(documentID)
         while recency.count > Self.capacity {
-            offsets[recency.removeFirst()] = nil
+            fractions[recency.removeFirst()] = nil
         }
     }
 
-    /// The remembered offset, clamped into `textLength`. `nil` when the document
-    /// was never scrolled, so the surface opens at its natural top instead of
-    /// pretending to restore something.
-    func characterIndex(for documentID: String, textLength: Int) -> Int? {
-        guard let stored = offsets[documentID] else { return nil }
-        return min(max(0, stored), max(0, textLength))
+    /// The remembered fraction, or `nil` when the document was never scrolled —
+    /// the surface then opens at its natural top instead of pretending to
+    /// restore something.
+    func fraction(for documentID: String) -> Double? {
+        fractions[documentID]
     }
 
     func forget(_ documentID: String) {
-        offsets[documentID] = nil
+        fractions[documentID] = nil
         recency.removeAll { $0 == documentID }
     }
 }
 
-/// Top-of-viewport measurement and restoration, shared by the preview's two
-/// text surfaces so they agree on what "the same place" means.
+/// Viewport measurement and restoration shared by the preview's two text
+/// surfaces so they agree on what "the same place" means.
 @MainActor
 enum FilePreviewTextScroll {
-    /// The character offset nearest the top-left of the viewport.
-    static func topCharacterIndex(in textView: NSTextView, scrollView: NSScrollView) -> Int {
-        let visible = scrollView.contentView.documentVisibleRect
-        guard visible.height > 0 else { return 0 }
-        let origin = textView.textContainerOrigin
-        return textView.characterIndexForInsertion(
-            at: NSPoint(x: origin.x + 1, y: visible.minY + origin.y + 1)
-        )
+    /// Whether the pair is currently laid out well enough to trust a
+    /// measurement. A view being torn down still answers geometry questions,
+    /// just not usefully, and recording a garbage position would poison the
+    /// next restore.
+    static func canMeasure(_ textView: NSTextView, in scrollView: NSScrollView) -> Bool {
+        textView.window != nil
+            && scrollView.contentView.bounds.height > 0
+            && !textView.string.isEmpty
     }
 
-    /// Put `characterIndex` at the top of the viewport, clamped to the document
-    /// and to the scrollable range.
-    static func scrollToTop(characterIndex: Int, in textView: NSTextView, scrollView: NSScrollView) {
-        let clamped = min(max(0, characterIndex), (textView.string as NSString).length)
-        guard clamped > 0 else {
-            scrollView.contentView.scroll(to: NSPoint(x: 0, y: 0))
-            scrollView.reflectScrolledClipView(scrollView.contentView)
-            return
-        }
-        // A viewport layout manager has nothing to measure until the range has
-        // been visited, so ask for the range first and read its frame after.
-        textView.scrollRangeToVisible(NSRange(location: clamped, length: 0))
-        guard let rect = lineRect(for: clamped, in: textView) else { return }
-        let maxY = max(0, textView.bounds.height - scrollView.contentView.bounds.height)
-        scrollView.contentView.scroll(to: NSPoint(x: 0, y: min(max(0, rect.minY), maxY)))
-        scrollView.reflectScrolledClipView(scrollView.contentView)
+    /// How far down its scrollable range the view currently sits, 0...1.
+    static func scrollFraction(in textView: NSTextView, scrollView: NSScrollView) -> Double {
+        let scrollable = scrollableHeight(textView, scrollView)
+        guard scrollable > 0 else { return 0 }
+        return min(1, max(0, Double(scrollView.contentView.bounds.origin.y / scrollable)))
     }
 
-    /// The laid-out frame of the line containing `characterIndex`, in the text
-    /// view's coordinates. TextKit 2 first, then the TextKit 1 fallback for the
-    /// editor surfaces that still use it; `nil` when layout is not available yet
-    /// (the caller then keeps whatever `scrollRangeToVisible` produced).
-    private static func lineRect(for characterIndex: Int, in textView: NSTextView) -> NSRect? {
-        let origin = textView.textContainerOrigin
-        if let layoutManager = textView.textLayoutManager,
-           let contentManager = layoutManager.textContentManager,
-           let location = contentManager.location(
-               contentManager.documentRange.location,
-               offsetBy: characterIndex
-           ),
-           let fragment = layoutManager.textLayoutFragment(for: location) {
-            return fragment.layoutFragmentFrame.offsetBy(dx: origin.x, dy: origin.y)
-        }
-        guard let layoutManager = textView.layoutManager,
-              let container = textView.textContainer else { return nil }
-        let glyphRange = layoutManager.glyphRange(
-            forCharacterRange: NSRange(location: characterIndex, length: 0),
-            actualCharacterRange: nil
-        )
-        return layoutManager
-            .boundingRect(forGlyphRange: glyphRange, in: container)
-            .offsetBy(dx: origin.x, dy: origin.y)
+    /// Put `fraction` of the scrollable range above the viewport.
+    static func scroll(to fraction: Double, in textView: NSTextView, scrollView: NSScrollView) {
+        let clip = scrollView.contentView
+        let scrollable = scrollableHeight(textView, scrollView)
+        clip.scroll(to: NSPoint(x: 0, y: CGFloat(min(1, max(0, fraction))) * scrollable))
+        scrollView.reflectScrolledClipView(clip)
+    }
+
+    private static func scrollableHeight(_ textView: NSTextView, _ scrollView: NSScrollView) -> CGFloat {
+        max(0, textView.bounds.height - scrollView.contentView.bounds.height)
     }
 }
 
@@ -3261,6 +3241,11 @@ private struct SourceTextReader: NSViewRepresentable {
         /// run; the layout passes before it would otherwise overwrite the
         /// remembered offset with zero.
         private var pendingRestore = true
+        /// Non-zero while this coordinator is scrolling the view itself. The
+        /// clip view posts its bounds notification synchronously, so without
+        /// this every position a restore passes through is recorded as if the
+        /// user had scrolled there — and the last one wins.
+        private var programmaticScrollDepth = 0
 
         init(scrollMemory: FilePreviewTextScrollMemory) {
             self.scrollMemory = scrollMemory
@@ -3313,9 +3298,11 @@ private struct SourceTextReader: NSViewRepresentable {
         }
 
         func recordScrollPosition() {
-            guard !pendingRestore, let textView, let scrollView else { return }
+            guard !pendingRestore, programmaticScrollDepth == 0,
+                  let textView, let scrollView,
+                  FilePreviewTextScroll.canMeasure(textView, in: scrollView) else { return }
             scrollMemory.record(
-                FilePreviewTextScroll.topCharacterIndex(in: textView, scrollView: scrollView),
+                FilePreviewTextScroll.scrollFraction(in: textView, scrollView: scrollView),
                 for: documentID
             )
         }
@@ -3323,15 +3310,27 @@ private struct SourceTextReader: NSViewRepresentable {
         private func restoreScrollPosition() {
             guard pendingRestore, let textView, let scrollView else { return }
             pendingRestore = false
-            guard let index = scrollMemory.characterIndex(
-                for: documentID,
-                textLength: (textView.string as NSString).length
-            ), index > 0 else { return }
-            FilePreviewTextScroll.scrollToTop(
-                characterIndex: index,
-                in: textView,
-                scrollView: scrollView
-            )
+            guard let fraction = scrollMemory.fraction(for: documentID), fraction > 0 else { return }
+            programmaticScrollDepth += 1
+            FilePreviewTextScroll.scroll(to: fraction, in: textView, scrollView: scrollView)
+            DispatchQueue.main.async { [weak self] in
+                guard let self else { return }
+                // The first pass makes TextKit 2 lay out the region it landed
+                // on, which sharpens its estimate of the whole document's
+                // height; re-applying the same fraction against the corrected
+                // height removes most of the residual drift. Releasing the
+                // suppression only here also covers any bounds notification
+                // AppKit defers past the synchronous scroll.
+                if let textView = self.textView, let scrollView = self.scrollView,
+                   FilePreviewTextScroll.canMeasure(textView, in: scrollView) {
+                    FilePreviewTextScroll.scroll(
+                        to: fraction,
+                        in: textView,
+                        scrollView: scrollView
+                    )
+                }
+                self.programmaticScrollDepth -= 1
+            }
         }
     }
 }
@@ -3498,6 +3497,10 @@ private struct LineTargetTextEditor: NSViewRepresentable {
         private weak var scrollView: NSScrollView?
         private var scrollDocumentID = ""
         private var pendingRestore = false
+        /// See the reader's coordinator: the clip view's bounds notification is
+        /// synchronous, so a restore would otherwise record every position it
+        /// scrolls through.
+        private var programmaticScrollDepth = 0
 
         init(text: Binding<String>) { _text = text }
 
@@ -3551,9 +3554,11 @@ private struct LineTargetTextEditor: NSViewRepresentable {
         }
 
         func recordScrollPosition() {
-            guard !pendingRestore, let scrollMemory, let textView, let scrollView else { return }
+            guard !pendingRestore, programmaticScrollDepth == 0,
+                  let scrollMemory, let textView, let scrollView,
+                  FilePreviewTextScroll.canMeasure(textView, in: scrollView) else { return }
             scrollMemory.record(
-                FilePreviewTextScroll.topCharacterIndex(in: textView, scrollView: scrollView),
+                FilePreviewTextScroll.scrollFraction(in: textView, scrollView: scrollView),
                 for: scrollDocumentID
             )
         }
@@ -3561,15 +3566,12 @@ private struct LineTargetTextEditor: NSViewRepresentable {
         private func restoreScrollPosition() {
             guard pendingRestore, let scrollMemory, let textView, let scrollView else { return }
             pendingRestore = false
-            guard let index = scrollMemory.characterIndex(
-                for: scrollDocumentID,
-                textLength: (textView.string as NSString).length
-            ), index > 0 else { return }
-            FilePreviewTextScroll.scrollToTop(
-                characterIndex: index,
-                in: textView,
-                scrollView: scrollView
-            )
+            guard let fraction = scrollMemory.fraction(for: scrollDocumentID), fraction > 0 else { return }
+            programmaticScrollDepth += 1
+            FilePreviewTextScroll.scroll(to: fraction, in: textView, scrollView: scrollView)
+            DispatchQueue.main.async { [weak self] in
+                self?.programmaticScrollDepth -= 1
+            }
         }
 
         func scrollIfNeeded(to oneBasedLine: Int?, documentID: String) {

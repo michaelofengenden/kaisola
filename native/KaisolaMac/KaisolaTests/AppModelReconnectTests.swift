@@ -731,9 +731,17 @@ final class AppModelReconnectTests: XCTestCase {
         XCTAssertEqual(initialControlConnections, 1)
 
         await fixture.control.simulateDisconnect()
+        // The control lane reattaches *after* the observer lane comes back, so
+        // waiting only on the observer made this assert against a half-finished
+        // reconnect roughly one run in five.
         await waitUntil {
             let attempts = await fixture.client.connectionAttempts()
-            return attempts >= 2 && fixture.model.connectionState.isConnected
+            let controlConnections = await fixture.control.connectionCount()
+            let attachCalls = await fixture.control.attachCalls()
+            return attempts >= 2
+                && fixture.model.connectionState.isConnected
+                && controlConnections >= 2
+                && attachCalls.count >= 2
         }
 
         let controlConnections = await fixture.control.connectionCount()

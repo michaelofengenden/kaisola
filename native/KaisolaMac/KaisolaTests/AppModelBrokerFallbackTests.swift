@@ -27,7 +27,7 @@ final class AppModelBrokerFallbackTests: XCTestCase {
         XCTAssertTrue(model.connectionState.isConnected, "should be connected via the fallback broker")
         XCTAssertTrue(model.usingSeparateBroker)
         if case let .connected(version, _, _) = model.connectionState {
-            XCTAssertTrue(version.contains("separate native broker"))
+            XCTAssertTrue(version.contains("separate background service"))
             XCTAssertTrue(version.contains("0.1.95-native"))
         } else {
             XCTFail("expected connected state")

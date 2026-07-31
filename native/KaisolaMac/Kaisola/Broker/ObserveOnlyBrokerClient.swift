@@ -49,7 +49,10 @@ actor ObserveOnlyBrokerClient: ObserveOnlyBrokerServing {
     private var decoder = BrokerLineFrameDecoder()
     private var info: BrokerInfo?
     private var hello: BrokerHello?
-    private var helloWaiter: CheckedContinuation<BrokerHello, any Error>?
+    private var connectTarget: BrokerInfo?
+    private var connectWaiters: [CheckedContinuation<BrokerHello, any Error>] = []
+    private var connectAttemptTask: Task<Void, Never>?
+    private var connectionGeneration: UInt64 = 0
     private var handshakeTimeoutTask: Task<Void, Never>?
     private var pending: [String: CheckedContinuation<JSONValue, any Error>] = [:]
     private var requestTimeoutTasks: [String: Task<Void, Never>] = [:]
@@ -74,40 +77,81 @@ actor ObserveOnlyBrokerClient: ObserveOnlyBrokerServing {
         disconnectHandler = handler
     }
 
-    func connect(to info: BrokerInfo) async throws -> BrokerHello {
-        if let hello { return hello }
-        try info.validate()
-        self.info = info
-        try await transport.connect(path: info.socketPath)
-        readerTask = Task { await readLoop() }
+    func connect(to requestedInfo: BrokerInfo) async throws -> BrokerHello {
+        try requestedInfo.validate()
 
-        let frame: JSONValue = .object([
-            "type": .string("hello"),
-            "protocol": .integer(Int64(BrokerWire.protocolVersion)),
-            "token": .string(info.token),
-            "instanceId": .string(UUID().uuidString.lowercased()),
-            "appVersion": .string(Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "kaisola-native"),
-            "access": .string("observer"),
-        ])
-        let encoded = try encode(frame)
+        if let hello {
+            guard info == requestedInfo else { throw BrokerClientError.identityChanged }
+            return hello
+        }
+        if let connectTarget {
+            guard connectTarget == requestedInfo else {
+                throw BrokerClientError.identityChanged
+            }
+            return try await waitForConnectResult()
+        }
 
+        connectionGeneration &+= 1
+        let generation = connectionGeneration
+        info = requestedInfo
+        connectTarget = requestedInfo
         return try await withCheckedThrowingContinuation { continuation in
-            helloWaiter = continuation
+            connectWaiters.append(continuation)
+            connectAttemptTask = Task { [weak self] in
+                await self?.performConnect(to: requestedInfo, generation: generation)
+            }
+        }
+    }
+
+    private func waitForConnectResult() async throws -> BrokerHello {
+        try await withCheckedThrowingContinuation { continuation in
+            connectWaiters.append(continuation)
+        }
+    }
+
+    private func performConnect(to info: BrokerInfo, generation: UInt64) async {
+        do {
+            try await transport.connect(path: info.socketPath)
+            guard generation == connectionGeneration, connectTarget == info else { return }
+
+            readerTask = Task { [weak self] in
+                await self?.readLoop(generation: generation)
+            }
+            let frame: JSONValue = .object([
+                "type": .string("hello"),
+                "protocol": .integer(Int64(BrokerWire.protocolVersion)),
+                "token": .string(info.token),
+                "instanceId": .string(UUID().uuidString.lowercased()),
+                "appVersion": .string(Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "kaisola-native"),
+                "access": .string("observer"),
+            ])
+            let encoded = try encode(frame)
+
             handshakeTimeoutTask?.cancel()
-            handshakeTimeoutTask = Task {
+            let timeoutNanoseconds = operationTimeoutNanoseconds
+            handshakeTimeoutTask = Task { [weak self] in
                 do {
-                    try await Task.sleep(nanoseconds: operationTimeoutNanoseconds)
+                    try await Task.sleep(nanoseconds: timeoutNanoseconds)
                 } catch {
                     return
                 }
                 guard !Task.isCancelled else { return }
-                await abortConnection(with: BrokerClientError.connectionTimedOut)
+                await self?.handshakeTimedOut(generation: generation)
             }
-            Task {
-                do { try await transport.send(encoded) }
-                catch { await abortConnection(with: error) }
-            }
+            try await transport.send(encoded)
+        } catch {
+            await abortConnection(with: error, generation: generation)
         }
+    }
+
+    private func handshakeTimedOut(generation: UInt64) async {
+        guard generation == connectionGeneration,
+              connectTarget != nil,
+              hello == nil else { return }
+        await abortConnection(
+            with: BrokerClientError.connectionTimedOut,
+            generation: generation
+        )
     }
 
     func inventory() async throws -> BrokerStatus {
@@ -328,17 +372,21 @@ actor ObserveOnlyBrokerClient: ObserveOnlyBrokerServing {
     }
 
     func disconnect() async {
+        connectionGeneration &+= 1
+        connectAttemptTask?.cancel()
+        connectAttemptTask = nil
+        connectTarget = nil
         readerTask?.cancel()
         readerTask = nil
         handshakeTimeoutTask?.cancel()
         handshakeTimeoutTask = nil
         for task in requestTimeoutTasks.values { task.cancel() }
         requestTimeoutTasks.removeAll()
-        await transport.close()
         failConnection(with: BrokerClientError.connectionClosed)
         decoder = BrokerLineFrameDecoder()
         info = nil
         hello = nil
+        await transport.close()
     }
 
     private func request(_ method: ObserveOnlyBrokerMethod, params: JSONValue) async throws -> JSONValue {
@@ -370,12 +418,13 @@ actor ObserveOnlyBrokerClient: ObserveOnlyBrokerServing {
         }
     }
 
-    private func readLoop() async {
+    private func readLoop(generation: UInt64) async {
         do {
             while !Task.isCancelled {
                 guard let data = try await transport.receive(maximumBytes: 64 * 1_024) else {
                     throw BrokerClientError.connectionClosed
                 }
+                guard generation == connectionGeneration else { return }
                 if data.isEmpty { continue }
                 var activeDecoder = decoder
                 try activeDecoder.consume(data) { data in
@@ -385,15 +434,24 @@ actor ObserveOnlyBrokerClient: ObserveOnlyBrokerServing {
                 decoder = activeDecoder
             }
         } catch {
-            if !Task.isCancelled { await abortConnection(with: error) }
+            if !Task.isCancelled {
+                await abortConnection(with: error, generation: generation)
+            }
         }
     }
 
-    private func abortConnection(with error: any Error) async {
-        await transport.close()
+    private func abortConnection(with error: any Error, generation: UInt64) async {
+        guard generation == connectionGeneration else { return }
+        connectionGeneration &+= 1
+        connectAttemptTask?.cancel()
+        connectAttemptTask = nil
+        connectTarget = nil
+        readerTask?.cancel()
         readerTask = nil
         decoder = BrokerLineFrameDecoder()
         failConnection(with: error)
+        info = nil
+        await transport.close()
         disconnectHandler?(error)
     }
 
@@ -462,8 +520,11 @@ actor ObserveOnlyBrokerClient: ObserveOnlyBrokerServing {
             self.hello = hello
             handshakeTimeoutTask?.cancel()
             handshakeTimeoutTask = nil
-            helloWaiter?.resume(returning: hello)
-            helloWaiter = nil
+            connectAttemptTask = nil
+            connectTarget = nil
+            let waiters = connectWaiters
+            connectWaiters.removeAll()
+            for waiter in waiters { waiter.resume(returning: hello) }
         case "response":
             guard let id = object["id"]?.stringValue, let continuation = pending.removeValue(forKey: id) else {
                 return
@@ -496,8 +557,9 @@ actor ObserveOnlyBrokerClient: ObserveOnlyBrokerServing {
     private func failConnection(with error: any Error) {
         handshakeTimeoutTask?.cancel()
         handshakeTimeoutTask = nil
-        helloWaiter?.resume(throwing: error)
-        helloWaiter = nil
+        let waiters = connectWaiters
+        connectWaiters.removeAll()
+        for waiter in waiters { waiter.resume(throwing: error) }
         for task in requestTimeoutTasks.values { task.cancel() }
         requestTimeoutTasks.removeAll()
         for continuation in pending.values { continuation.resume(throwing: error) }

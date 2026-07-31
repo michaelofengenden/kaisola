@@ -36,6 +36,18 @@ enum TerminalMetaService: Sendable {
     private static let psPath = "/bin/ps"
     private static let lsofPath = "/usr/sbin/lsof"
 
+    /// A bounded branch probe shared by the inventory metadata refresh. Git can
+    /// otherwise wait forever on a disconnected network/FileProvider mount.
+    static func gitBranch(at directory: URL) -> String? {
+        guard let output = run(
+            "/usr/bin/git",
+            ["rev-parse", "--abbrev-ref", "HEAD"],
+            currentDirectoryURL: directory
+        ) else { return nil }
+        let branch = output.trimmingCharacters(in: .whitespacesAndNewlines)
+        return branch.isEmpty ? nil : branch
+    }
+
     /// Foreground process name + listening ports for a shell PID.
     ///
     /// Walks the descendant chain (`pgrep -P`, taking the most-recently-spawned
@@ -151,10 +163,15 @@ enum TerminalMetaService: Sendable {
 
     /// Run a tool, returning its stdout (bounded) or `nil` on any failure.
     /// stderr/stdin are discarded and a watchdog terminates a stuck child.
-    private static func run(_ path: String, _ arguments: [String]) -> String? {
+    private static func run(
+        _ path: String,
+        _ arguments: [String],
+        currentDirectoryURL: URL? = nil
+    ) -> String? {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: path)
         process.arguments = arguments
+        process.currentDirectoryURL = currentDirectoryURL
         let pipe = Pipe()
         process.standardOutput = pipe
         process.standardError = FileHandle.nullDevice

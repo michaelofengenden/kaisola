@@ -220,6 +220,35 @@ final class UsageCenterTests: XCTestCase {
         }
     }
 
+    func testSubscriptionStalenessAcceptsMillisecondAndSecondEpochs() {
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        let twoHoursAgo = now.addingTimeInterval(-7_200).timeIntervalSince1970
+
+        XCTAssertEqual(
+            SubscriptionCardView.stalenessCaption(updatedAt: twoHoursAgo, now: now),
+            "2h ago"
+        )
+        XCTAssertEqual(
+            SubscriptionCardView.stalenessCaption(updatedAt: twoHoursAgo * 1_000, now: now),
+            "2h ago"
+        )
+        XCTAssertNil(SubscriptionCardView.stalenessCaption(
+            updatedAt: now.addingTimeInterval(-60).timeIntervalSince1970 * 1_000,
+            now: now
+        ))
+        XCTAssertNil(SubscriptionCardView.stalenessCaption(updatedAt: .nan, now: now))
+    }
+
+    func testUsageTokenFormattingChangesUnitsAtOneMillion() {
+        XCTAssertEqual(UsageSettingsTab.tokens(999), "999")
+        XCTAssertEqual(UsageSettingsTab.tokens(1_000), "1k")
+        XCTAssertEqual(UsageSettingsTab.tokens(999_999), "999k")
+        XCTAssertEqual(UsageSettingsTab.tokens(1_000_000), "1m")
+        XCTAssertEqual(UsageSettingsTab.tokens(1_999_999), "2m")
+        XCTAssertEqual(UsageSettingsTab.tokens(1_250_000), "1.3m")
+        XCTAssertEqual(UsageSettingsTab.tokens(-1), "0")
+    }
+
     func testRecordTracksCumulativeCostWithoutMixingCurrencies() {
         let center = makeCenter()
         center.record(

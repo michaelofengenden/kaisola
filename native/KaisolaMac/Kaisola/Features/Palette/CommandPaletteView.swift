@@ -18,6 +18,8 @@ struct CommandPaletteView: View {
     @ObservedObject var settings: NativePreviewSettings
     @Binding var isPresented: Bool
 
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
     @State private var query = ""
     @State private var selection = 0
     @State private var projectFiles: [String] = []
@@ -40,10 +42,17 @@ struct CommandPaletteView: View {
                 ScrollView {
                     LazyVStack(alignment: .leading, spacing: 0) {
                         ForEach(Array(filtered.enumerated()), id: \.element.id) { index, item in
-                            row(item, selected: index == selection)
-                                .id(index)
-                                .contentShape(Rectangle())
-                                .onTapGesture { selection = index; runSelection() }
+                            Button {
+                                selection = index
+                                run(item)
+                            } label: {
+                                row(item, selected: index == selection)
+                                    .contentShape(Rectangle())
+                            }
+                            .buttonStyle(.plain)
+                            .accessibilityValue(item.subtitle)
+                            .accessibilityAddTraits(index == selection ? .isSelected : [])
+                            .id(index)
                         }
                         if filtered.isEmpty {
                             Text("No matching commands")
@@ -54,7 +63,13 @@ struct CommandPaletteView: View {
                 }
                 .frame(maxHeight: 360)
                 .onChange(of: selection) { _, new in
-                    withAnimation(.easeOut(duration: 0.1)) { proxy.scrollTo(new, anchor: .center) }
+                    if reduceMotion {
+                        proxy.scrollTo(new, anchor: .center)
+                    } else {
+                        withAnimation(.easeOut(duration: KaisolaVisualSystem.hoverDuration)) {
+                            proxy.scrollTo(new, anchor: .center)
+                        }
+                    }
                 }
             }
         }
@@ -77,19 +92,21 @@ struct CommandPaletteView: View {
     }
 
     private func row(_ item: PaletteItem, selected: Bool) -> some View {
-        HStack(spacing: 10) {
+        let selectedText = Color(nsColor: .alternateSelectedControlTextColor)
+        return HStack(spacing: 10) {
             Image(systemName: item.systemImage)
                 .frame(width: 18)
-                .foregroundStyle(selected ? Color.white : .secondary)
+                .foregroundStyle(selected ? selectedText : .secondary)
             Text(item.title)
-                .foregroundStyle(selected ? Color.white : .primary)
+                .foregroundStyle(selected ? selectedText : .primary)
             Spacer()
             Text(item.subtitle)
                 .font(.caption)
-                .foregroundStyle(selected ? Color.white.opacity(0.8) : .secondary)
+                .foregroundStyle(selected ? selectedText.opacity(0.8) : .secondary)
         }
         .padding(.horizontal, 16).padding(.vertical, 9)
-        .background(selected ? Color.accentColor : Color.clear)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(selected ? Color(nsColor: .selectedContentBackgroundColor) : Color.clear)
     }
 
     private var filtered: [PaletteItem] {
@@ -125,7 +142,10 @@ struct CommandPaletteView: View {
     private func runSelection() {
         let items = filtered
         guard selection >= 0, selection < items.count else { return }
-        let item = items[selection]
+        run(items[selection])
+    }
+
+    private func run(_ item: PaletteItem) {
         isPresented = false
         // Defer so the sheet is fully dismissed before an action opens a panel.
         DispatchQueue.main.async { item.run() }
@@ -151,7 +171,7 @@ struct CommandPaletteView: View {
             RootShellView.promptForOpenFolder(model: model)
         })
         if model.hasClosedProjects {
-            items.append(PaletteItem(id: "action.reopenClosedProject", title: "Reopen Closed Project", subtitle: "Action · ⇧⌘T", systemImage: "arrow.uturn.backward") {
+            items.append(PaletteItem(id: "action.reopenClosedProject", title: "Reopen Closed Project", subtitle: "Action · ⌥⇧⌘T", systemImage: "arrow.uturn.backward") {
                 model.reopenLastClosedProject()
             })
         }
@@ -205,7 +225,7 @@ struct CommandPaletteView: View {
             })
         }
         for session in model.sessions {
-            items.append(PaletteItem(id: "session.\(session.id)", title: session.title, subtitle: "Session", systemImage: "terminal.fill") {
+            items.append(PaletteItem(id: "session.\(session.id)", title: model.sessionTitle(for: session), subtitle: "Session", systemImage: "terminal.fill") {
                 model.selectedChatID = nil
                 Task { await model.select(session.id) }
             })
@@ -213,6 +233,17 @@ struct CommandPaletteView: View {
         for chat in model.chats {
             items.append(PaletteItem(id: "chat.\(chat.id)", title: chat.conversation.title, subtitle: "Chat", systemImage: "bubble.left.fill") {
                 model.selectChat(chat.id)
+            })
+        }
+        for mesh in model.meshes {
+            let projectName = model.projects.first(where: { $0.id == mesh.projectID })?.name
+            items.append(PaletteItem(
+                id: "mesh.\(mesh.id)",
+                title: mesh.title,
+                subtitle: projectName.map { "Mesh · \($0)" } ?? "Mesh",
+                systemImage: "circle.hexagongrid.fill"
+            ) {
+                model.selectMesh(mesh.id)
             })
         }
         return items

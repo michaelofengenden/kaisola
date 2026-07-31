@@ -23,6 +23,7 @@ struct AcpChatView: View {
     @State private var transcriptIsReady = false
     @State private var loadingEarlierRows = false
     @State private var transcriptIsAtBottom = true
+    @State private var hasUnseenTranscriptUpdates = false
     @State private var transcriptConversationID: ObjectIdentifier?
 
     init(conversation: AcpConversation, presentation: Presentation = .standard) {
@@ -40,9 +41,10 @@ struct AcpChatView: View {
             Divider()
             transcript
             if let permission = conversation.pendingPermission {
-                PermissionBar(
+                AcpPermissionBar(
                     request: permission,
                     allowsRule: conversation.pendingPermissionAllowsRule,
+                    pendingCount: conversation.pendingPermissionCount,
                     answer: { conversation.answerPermission($0) },
                     always: { conversation.answerPermissionAlways() }
                 )
@@ -182,86 +184,116 @@ struct AcpChatView: View {
 
     private var transcript: some View {
         ScrollViewReader { proxy in
-            ScrollView {
-                LazyVStack(alignment: .leading, spacing: 12) {
-                    if conversation.hiddenEarlierCount > 0 {
-                        HStack(spacing: 8) {
-                            ProgressView().controlSize(.small)
-                            Text(loadingEarlierRows ? "Loading earlier messages…" : "Earlier messages")
+            ZStack(alignment: .bottomTrailing) {
+                ScrollView {
+                    LazyVStack(alignment: .leading, spacing: 12) {
+                        if conversation.hiddenEarlierCount > 0 {
+                            HStack(spacing: 8) {
+                                ProgressView().controlSize(.small)
+                                Text(loadingEarlierRows ? "Loading earlier messages…" : "Earlier messages")
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            }
+                            .frame(maxWidth: .infinity)
+                            .padding(.vertical, 6)
+                            .onAppear {
+                                guard transcriptIsReady,
+                                      transcriptConversationID == ObjectIdentifier(conversation),
+                                      !loadingEarlierRows,
+                                      let anchor = conversation.visibleRows.first?.id else { return }
+                                loadingEarlierRows = true
+                                conversation.expandEarlier()
+                                // Expanding prepends rows. Restore the formerly
+                                // first visible row so the viewport does not jump,
+                                // while retaining active trackpad velocity on
+                                // macOS 15 and newer.
+                                DispatchQueue.main.async {
+                                    TerminalTranscriptScrollPolicy.preserveUserVelocity {
+                                        proxy.scrollTo(anchor, anchor: .top)
+                                    }
+                                    loadingEarlierRows = false
+                                }
+                            }
+                        } else if transcriptIsReady, !conversation.rows.isEmpty {
+                            Label("Beginning of session", systemImage: "checkmark.circle")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                                .frame(maxWidth: .infinity)
+                                .padding(.vertical, 6)
+                                .accessibilityLabel("Beginning of session history")
+                        }
+                        if let status = conversation.statusMessage {
+                            Label(status, systemImage: "exclamationmark.triangle")
                                 .font(.caption)
                                 .foregroundStyle(.secondary)
                         }
-                        .frame(maxWidth: .infinity)
-                        .padding(.vertical, 6)
-                        .onAppear {
-                            guard transcriptIsReady,
-                                  transcriptConversationID == ObjectIdentifier(conversation),
-                                  !loadingEarlierRows,
-                                  let anchor = conversation.visibleRows.first?.id else { return }
-                            loadingEarlierRows = true
-                            conversation.expandEarlier()
-                            // Expanding prepends rows. Restore the formerly
-                            // first visible row so the viewport does not jump,
-                            // while retaining active trackpad velocity on
-                            // macOS 15 and newer.
-                            DispatchQueue.main.async {
-                                TerminalTranscriptScrollPolicy.preserveUserVelocity {
-                                    proxy.scrollTo(anchor, anchor: .top)
-                                }
-                                loadingEarlierRows = false
-                            }
+                        ForEach(conversation.visibleRows) { row in
+                            TranscriptRowView(
+                                row: row,
+                                retry: { conversation.retryFailed($0) },
+                                terminalSnapshot: { [weak conversation] id in await conversation?.terminalSnapshot(id) }
+                            )
+                            .id(row.id)
                         }
-                    } else if transcriptIsReady, !conversation.rows.isEmpty {
-                        Label("Beginning of session", systemImage: "checkmark.circle")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                            .frame(maxWidth: .infinity)
-                            .padding(.vertical, 6)
-                            .accessibilityLabel("Beginning of session history")
+                        Color.clear
+                            .frame(height: 1)
+                            .id("acp-transcript-bottom")
+                            .onAppear {
+                                transcriptIsAtBottom = true
+                                hasUnseenTranscriptUpdates = false
+                            }
+                            .onDisappear { transcriptIsAtBottom = false }
                     }
-                    if let status = conversation.statusMessage {
-                        Label(status, systemImage: "exclamationmark.triangle")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                    }
-                    ForEach(conversation.visibleRows) { row in
-                        TranscriptRowView(
-                            row: row,
-                            retry: { conversation.retryFailed($0) },
-                            terminalSnapshot: { [weak conversation] id in await conversation?.terminalSnapshot(id) }
-                        )
-                        .id(row.id)
-                    }
-                    Color.clear
-                        .frame(height: 1)
-                        .id("acp-transcript-bottom")
-                        .onAppear { transcriptIsAtBottom = true }
-                        .onDisappear { transcriptIsAtBottom = false }
+                    .padding(16)
+                    .frame(maxWidth: .infinity, alignment: .leading)
                 }
-                .padding(16)
-                .frame(maxWidth: .infinity, alignment: .leading)
+
+                if transcriptIsReady, !transcriptIsAtBottom, !conversation.rows.isEmpty {
+                    Button {
+                        hasUnseenTranscriptUpdates = false
+                        withAnimation(.easeOut(duration: 0.15)) {
+                            proxy.scrollTo("acp-transcript-bottom", anchor: .bottom)
+                        }
+                    } label: {
+                        Label(
+                            hasUnseenTranscriptUpdates ? "New output" : "Jump to latest",
+                            systemImage: "arrow.down"
+                        )
+                        .font(.caption.weight(.medium))
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .controlSize(.small)
+                    .padding(12)
+                    .help("Return to the latest agent output")
+                    .accessibilityHint("Scrolls the transcript to the newest output")
+                }
             }
             .onAppear {
                 transcriptConversationID = ObjectIdentifier(conversation)
                 transcriptIsReady = false
+                transcriptIsAtBottom = true
+                hasUnseenTranscriptUpdates = false
                 DispatchQueue.main.async {
-                    if let last = conversation.visibleRows.last {
-                        proxy.scrollTo(last.id, anchor: .bottom)
-                    }
+                    proxy.scrollTo("acp-transcript-bottom", anchor: .bottom)
                     transcriptIsReady = true
                 }
             }
-            .onChange(of: conversation.rows.count) { _, _ in
-                if transcriptIsAtBottom, let last = conversation.rows.last {
-                    if presentation == .standard {
-                        withAnimation(.easeOut(duration: 0.15)) {
-                            proxy.scrollTo(last.id, anchor: .bottom)
+            .onChange(of: conversation.contentVersion) { _, _ in
+                guard transcriptIsReady else { return }
+                if transcriptIsAtBottom {
+                    DispatchQueue.main.async {
+                        if presentation == .standard {
+                            withAnimation(.easeOut(duration: 0.15)) {
+                                proxy.scrollTo("acp-transcript-bottom", anchor: .bottom)
+                            }
+                        } else {
+                            // A unified card can swap sessions in place. Do not
+                            // animate from the preceding session's scroll offset.
+                            proxy.scrollTo("acp-transcript-bottom", anchor: .bottom)
                         }
-                    } else {
-                        // A unified card can swap sessions in place. Do not
-                        // animate from the preceding session's scroll offset.
-                        proxy.scrollTo(last.id, anchor: .bottom)
                     }
+                } else {
+                    hasUnseenTranscriptUpdates = true
                 }
             }
         }
@@ -283,6 +315,28 @@ struct AcpChatView: View {
 
     private var composer: some View {
         VStack(spacing: 6) {
+            if !conversation.isConnected, conversation.statusMessage != nil {
+                HStack(spacing: 8) {
+                    Label("Agent disconnected — your draft and queued follow-ups are preserved.", systemImage: "bolt.slash")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    Spacer()
+                    if conversation.canRestart {
+                        Button("Restart") {
+                            Task { await conversation.restart() }
+                        }
+                        .buttonStyle(.bordered)
+                        .controlSize(.small)
+                        .keyboardShortcut("r", modifiers: [.command, .shift])
+                        .help("Start a fresh adapter and resume this ACP session when supported")
+                    } else if conversation.isReconnecting {
+                        ProgressView().controlSize(.mini)
+                    }
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .accessibilityElement(children: .contain)
+                .accessibilityLabel("Agent disconnected. Your draft and queued follow-ups are preserved.")
+            }
             if !matchingCommands.isEmpty {
                 VStack(alignment: .leading, spacing: 2) {
                     ForEach(matchingCommands.prefix(6)) { command in
@@ -475,8 +529,83 @@ struct AcpChatView: View {
 
     private func sendDraft() {
         let text = draft
-        draft = ""
-        conversation.send(text)
+        if conversation.send(text) {
+            draft = ""
+        }
+    }
+}
+
+/// Rendering budgets keep hostile or accidental multi-megabyte agent output
+/// from monopolizing SwiftUI layout/Markdown parsing. The full transcript stays
+/// in the conversation/store; only the visible representation is bounded.
+struct AcpBoundedText: Equatable, Sendable {
+    let text: String
+    let isTruncated: Bool
+}
+
+enum AcpChatRendering {
+    static let assistantCharacterLimit = 120_000
+    static let assistantLineLimit = 2_500
+    static let toolCharacterLimit = 64_000
+    static let toolLineLimit = 1_500
+    static let diffCharacterLimit = 100_000
+    static let diffLineLimit = 2_000
+
+    static func bounded(
+        _ text: String,
+        characterLimit: Int,
+        lineLimit: Int
+    ) -> AcpBoundedText {
+        guard characterLimit > 0, lineLimit > 0 else {
+            return AcpBoundedText(text: "", isTruncated: !text.isEmpty)
+        }
+
+        let prefix = text.prefix(characterLimit)
+        var result = String(prefix)
+        var truncated = prefix.endIndex != text.endIndex
+        var currentLine = 1
+        var lineCutoff: String.Index?
+        for index in result.indices where result[index] == "\n" {
+            if currentLine >= lineLimit {
+                lineCutoff = index
+                break
+            }
+            currentLine += 1
+        }
+        if let lineCutoff {
+            result = String(result[..<lineCutoff])
+            truncated = true
+        }
+        return AcpBoundedText(text: result, isTruncated: truncated)
+    }
+
+    static func markdown(_ text: String) -> AttributedString {
+        (try? AttributedString(markdown: text)) ?? AttributedString(text)
+    }
+}
+
+private struct AssistantMarkdownText: View {
+    let text: String
+
+    private var rendered: AcpBoundedText {
+        AcpChatRendering.bounded(
+            text,
+            characterLimit: AcpChatRendering.assistantCharacterLimit,
+            lineLimit: AcpChatRendering.assistantLineLimit
+        )
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 5) {
+            Text(AcpChatRendering.markdown(rendered.text))
+                .textSelection(.enabled)
+                .frame(maxWidth: .infinity, alignment: .leading)
+            if rendered.isTruncated {
+                Label("Long response truncated in the transcript view", systemImage: "ellipsis.rectangle")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+            }
+        }
     }
 }
 
@@ -515,15 +644,23 @@ struct TranscriptRowView: View {
                     .textSelection(.enabled)
             }
         case let .message(_, text):
-            Text(text)
-                .textSelection(.enabled)
-                .frame(maxWidth: .infinity, alignment: .leading)
+            AssistantMarkdownText(text: text)
         case let .thought(_, text):
             DisclosureGroup {
-                Text(text)
+                let bounded = AcpChatRendering.bounded(
+                    text,
+                    characterLimit: AcpChatRendering.assistantCharacterLimit,
+                    lineLimit: AcpChatRendering.assistantLineLimit
+                )
+                Text(bounded.text)
                     .font(.callout)
                     .foregroundStyle(.secondary)
                     .textSelection(.enabled)
+                if bounded.isTruncated {
+                    Text("Thinking output truncated in this view")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                }
             } label: {
                 Label("Thinking", systemImage: "brain")
                     .font(.caption.weight(.medium))
@@ -576,12 +713,7 @@ struct ToolCallCard: View {
                     case let .diff(path, oldText, newText):
                         DiffView(path: path, oldText: oldText, newText: newText)
                     case let .text(text):
-                        Text(text)
-                            .font(.system(.caption, design: .monospaced))
-                            .textSelection(.enabled)
-                            .frame(maxWidth: .infinity, alignment: .leading)
-                            .padding(8)
-                            .background(.black.opacity(0.18), in: RoundedRectangle(cornerRadius: 6))
+                        ToolTextArtifact(text: text)
                     case let .terminal(id):
                         TerminalContentView(terminalID: id, snapshot: terminalSnapshot)
                     }
@@ -609,12 +741,47 @@ struct ToolCallCard: View {
     }
 }
 
+private struct ToolTextArtifact: View {
+    let text: String
+
+    private var rendered: AcpBoundedText {
+        AcpChatRendering.bounded(
+            text,
+            characterLimit: AcpChatRendering.toolCharacterLimit,
+            lineLimit: AcpChatRendering.toolLineLimit
+        )
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            ScrollView([.horizontal, .vertical]) {
+                Text(rendered.text.isEmpty ? " " : rendered.text)
+                    .font(.system(.caption, design: .monospaced))
+                    .foregroundStyle(.primary)
+                    .textSelection(.enabled)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(8)
+            }
+            .frame(maxHeight: 220)
+            if rendered.isTruncated {
+                Label("Tool output truncated in this view", systemImage: "ellipsis.rectangle")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .padding(.horizontal, 8)
+                    .padding(.bottom, 6)
+            }
+        }
+        .background(.black.opacity(0.12), in: RoundedRectangle(cornerRadius: 6))
+    }
+}
+
 /// Live output of an agent-spawned terminal inside a tool card: polls the
 /// AcpTerminalHost snapshot until the process exits.
 struct TerminalContentView: View {
     let terminalID: String
     var snapshot: (@Sendable (String) async -> AcpTerminalHost.Snapshot?)?
     @State private var output = ""
+    @State private var outputIsTruncated = false
     @State private var exitText: String?
 
     var body: some View {
@@ -636,13 +803,26 @@ struct TerminalContentView: View {
             }
             .frame(maxHeight: 180)
             .background(.black.opacity(0.18))
+            if outputIsTruncated {
+                Text("Earlier terminal output truncated in this view")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 4)
+            }
         }
         .clipShape(RoundedRectangle(cornerRadius: 6))
         .overlay(RoundedRectangle(cornerRadius: 6).strokeBorder(.quaternary))
         .task(id: terminalID) {
             while !Task.isCancelled {
                 guard let snap = await snapshot?(terminalID) else { break }
-                output = snap.output
+                let bounded = AcpChatRendering.bounded(
+                    snap.output,
+                    characterLimit: AcpChatRendering.toolCharacterLimit,
+                    lineLimit: AcpChatRendering.toolLineLimit
+                )
+                output = bounded.text
+                outputIsTruncated = bounded.isTruncated
                 if let status = snap.exitStatus {
                     exitText = status.exitCode.map { "Exited (\($0))" }
                         ?? status.signal.map { "Killed (\($0))" }
@@ -665,8 +845,24 @@ struct DiffView: View {
 
     @State private var sideBySide = false
 
+    private var boundedOld: AcpBoundedText {
+        AcpChatRendering.bounded(
+            oldText ?? "",
+            characterLimit: AcpChatRendering.diffCharacterLimit,
+            lineLimit: AcpChatRendering.diffLineLimit
+        )
+    }
+
+    private var boundedNew: AcpBoundedText {
+        AcpChatRendering.bounded(
+            newText,
+            characterLimit: AcpChatRendering.diffCharacterLimit,
+            lineLimit: AcpChatRendering.diffLineLimit
+        )
+    }
+
     private var rows: [AcpDiff.Row] {
-        AcpDiff.rows(old: oldText ?? "", new: newText)
+        AcpDiff.rows(old: boundedOld.text, new: boundedNew.text)
     }
 
     var body: some View {
@@ -691,6 +887,12 @@ struct DiffView: View {
                 splitBody
             } else {
                 unifiedBody
+            }
+            if boundedOld.isTruncated || boundedNew.isTruncated {
+                Label("Large diff truncated in this view", systemImage: "ellipsis.rectangle")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .padding(6)
             }
         }
         .clipShape(RoundedRectangle(cornerRadius: 6))
@@ -811,11 +1013,26 @@ struct PlanCard: View {
     }
 }
 
-private struct PermissionBar: View {
+struct AcpPermissionBar: View {
     let request: AcpPermissionRequest
     let allowsRule: Bool
+    let pendingCount: Int
     let answer: (String) -> Void
     let always: () -> Void
+    var enablesKeyboardShortcuts = true
+
+    private var defaultOptionID: String? {
+        request.options.first { !$0.kind.contains("reject") }?.id
+    }
+
+    private var cancelOptionID: String? {
+        request.options.first { $0.kind.contains("reject") }?.id
+    }
+
+    private var derivedRuleLabel: String {
+        let rule = AcpPermissionRules.ruleForRequest(kind: request.kind, title: request.title)
+        return "\(rule.action) · \(AcpPermissionRules.ruleLabel(action: rule.action, resource: rule.resource))"
+    }
 
     var body: some View {
         HStack(spacing: 10) {
@@ -825,6 +1042,23 @@ private struct PermissionBar: View {
                 Text(request.title).font(.callout).lineLimit(2)
                 if !allowsRule {
                     Text("Sensitive file — always asks").font(.caption2).foregroundStyle(.red)
+                } else {
+                    Text("Always allow scope: \(derivedRuleLabel)")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                }
+                if !request.paths.isEmpty {
+                    Text(request.paths.joined(separator: ", "))
+                        .font(.caption2.monospaced())
+                        .foregroundStyle(.secondary)
+                        .lineLimit(2)
+                        .textSelection(.enabled)
+                        .help(request.paths.joined(separator: "\n"))
+                }
+                if pendingCount > 1 {
+                    Text("\(pendingCount - 1) more permission request\(pendingCount == 2 ? "" : "s") queued")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
                 }
             }
             Spacer()
@@ -832,16 +1066,39 @@ private struct PermissionBar: View {
                 Button("Always allow") { always() }
                     .buttonStyle(.bordered)
                     .tint(.green)
-                    .help("Allow this and create a standing rule for matching requests")
+                    .help("Allow this and create the standing rule: \(derivedRuleLabel)")
             }
             ForEach(request.options) { option in
-                Button(option.name) { answer(option.id) }
-                    .buttonStyle(.bordered)
-                    .tint(option.kind.contains("reject") ? .red : .accentColor)
+                optionButton(option)
             }
         }
         .padding(12)
         .background(.regularMaterial)
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel("Permission request: \(request.title)")
+        .accessibilityHint("Use Return for the suggested allow action or Escape to reject")
+    }
+
+    @ViewBuilder
+    private func optionButton(_ option: AcpPermissionRequest.Option) -> some View {
+        if enablesKeyboardShortcuts, option.id == defaultOptionID {
+            baseOptionButton(option)
+                .keyboardShortcut(.defaultAction)
+        } else if enablesKeyboardShortcuts, option.id == cancelOptionID {
+            baseOptionButton(option)
+                .keyboardShortcut(.cancelAction)
+        } else {
+            baseOptionButton(option)
+        }
+    }
+
+    private func baseOptionButton(_ option: AcpPermissionRequest.Option) -> some View {
+        Button(option.name) { answer(option.id) }
+            .buttonStyle(.bordered)
+            .tint(option.kind.contains("reject") ? .red : .accentColor)
+            .accessibilityHint(option.kind.contains("reject")
+                ? "Reject this agent request"
+                : "Allow this agent request once")
     }
 }
 

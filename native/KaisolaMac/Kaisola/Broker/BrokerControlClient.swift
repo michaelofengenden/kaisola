@@ -27,6 +27,7 @@ struct TerminalCreation: Equatable, Sendable {
 }
 
 protocol BrokerControlServing: Sendable {
+    func setDisconnectHandler(_ handler: (@Sendable (any Error) -> Void)?) async
     func connect(to info: BrokerInfo, ownerID: String) async throws
     func createTerminal(
         projectID: String,
@@ -47,11 +48,19 @@ protocol BrokerControlServing: Sendable {
     func disconnect() async
 }
 
+extension BrokerControlServing {
+    /// Keeps focused test doubles and additive alternative implementations
+    /// source-compatible. The production controller below reports a lane-only
+    /// disconnect so AppModel can stop accepting writes and reattach ownership.
+    func setDisconnectHandler(_ handler: (@Sendable (any Error) -> Void)?) async {}
+}
+
 /// A second, write-capable connection to the same broker the observer client
 /// streams from. Reads never travel here; writes never travel there. The
 /// broker's own ownership model (attach-before-write, stale-write rejection)
 /// stays the final authority on every mutation.
 actor BrokerControlClient: BrokerControlServing, BrokerUpgradeRequesting {
+    typealias DisconnectHandler = @Sendable (any Error) -> Void
     /// Compatibility values for a durable pre-fix broker. Older brokers merge
     /// their own launcher environment after receiving terminal.create; an
     /// outer Codex process can therefore leak NO_COLOR=1 into every nested CLI.
@@ -79,6 +88,7 @@ actor BrokerControlClient: BrokerControlServing, BrokerUpgradeRequesting {
     private var pending: [String: CheckedContinuation<JSONValue, any Error>] = [:]
     private var requestTimeoutTasks: [String: Task<Void, Never>] = [:]
     private var readerTask: Task<Void, Never>?
+    private var disconnectHandler: DisconnectHandler?
 
     init(
         transport: any BrokerByteTransport = UnixBrokerTransport(),
@@ -90,6 +100,10 @@ actor BrokerControlClient: BrokerControlServing, BrokerUpgradeRequesting {
         self.transport = transport
         self.operationTimeoutNanoseconds = operationTimeoutNanoseconds
         self.connectionInstanceID = connectionInstanceID.lowercased()
+    }
+
+    func setDisconnectHandler(_ handler: DisconnectHandler?) async {
+        disconnectHandler = handler
     }
 
     func connect(to info: BrokerInfo, ownerID: String) async throws {
@@ -185,7 +199,10 @@ actor BrokerControlClient: BrokerControlServing, BrokerUpgradeRequesting {
         }
         params["cols"] = .integer(Int64(columns))
         params["rows"] = .integer(Int64(rows))
-        _ = try await request(.resize, params: .object(params))
+        let result = try await request(.resize, params: .object(params))
+        guard result.objectValue?["ok"]?.boolValue == true else {
+            throw BrokerClientError.requestFailed("terminal.resize")
+        }
     }
 
     func kill(projectID: String, terminalID: String) async throws {
@@ -388,6 +405,7 @@ actor BrokerControlClient: BrokerControlServing, BrokerUpgradeRequesting {
         readerTask = nil
         decoder = BrokerLineFrameDecoder()
         failConnection(with: error)
+        disconnectHandler?(error)
     }
 
     private func handle(_ frame: JSONValue) throws {

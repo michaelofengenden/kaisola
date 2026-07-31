@@ -171,6 +171,87 @@ final class MeshStagedTests: XCTestCase {
         XCTAssertTrue(prompt.range(of: "no contract", options: .caseInsensitive) != nil)
     }
 
+    @MainActor
+    func testDisconnectedScoutKeepsStagedPromptsInFIFOOrder() async {
+        let mesh = MeshSession(
+            baseDirectory: FileManager.default.temporaryDirectory,
+            mode: .staged,
+            purpose: .build
+        )
+        mesh.loadVisualFixture(agents: Self.agents)
+        XCTAssertEqual(mesh.columns.map(\.role), [.scout, .executor, .executor])
+        _ = await mesh.columns[0].conversation.stop()
+
+        XCTAssertTrue(mesh.sendStaged("first request"))
+        XCTAssertTrue(mesh.sendStaged("second request"))
+        XCTAssertEqual(mesh.stagedQueuedPromptCount, 2)
+        XCTAssertEqual(mesh.stagedPromptsForTesting, ["first request", "second request"])
+
+        // Let the drain observe the disconnected scout. The active prompt is
+        // put back at the head rather than dropped or replayed to executors.
+        for _ in 0..<5 { await Task.yield() }
+        XCTAssertEqual(mesh.stagedQueuedPromptCount, 2)
+        XCTAssertEqual(mesh.stagedPromptsForTesting, ["first request", "second request"])
+        XCTAssertTrue(mesh.stage.localizedCaseInsensitiveContains("prompt kept"))
+    }
+
+    @MainActor
+    func testDisconnectedFlatAndIdeaSendsReportDraftWasNotAccepted() async {
+        let flat = MeshSession(baseDirectory: FileManager.default.temporaryDirectory)
+        flat.loadVisualFixture(agents: Self.agents)
+        for column in flat.columns { _ = await column.conversation.stop() }
+        XCTAssertFalse(flat.send("preserve flat draft"))
+
+        let idea = MeshSession(
+            baseDirectory: FileManager.default.temporaryDirectory,
+            purpose: .idea
+        )
+        idea.loadVisualFixture(agents: Self.agents)
+        for column in idea.columns { _ = await column.conversation.stop() }
+        XCTAssertFalse(idea.sendIdea("preserve idea draft"))
+        XCTAssertTrue(idea.stage.localizedCaseInsensitiveContains("draft preserved"))
+    }
+
+    @MainActor
+    func testPerColumnAndGlobalStopPreserveMeshRowsAndDrafts() async throws {
+        let mesh = MeshSession(baseDirectory: FileManager.default.temporaryDirectory)
+        mesh.loadVisualFixture(agents: Self.agents)
+        let first = try XCTUnwrap(mesh.columns.first)
+        let originalRows = first.conversation.rows
+        mesh.draft = "keep this draft"
+
+        await mesh.stopTurn(columnID: first.id)
+
+        XCTAssertFalse(first.conversation.isConnected)
+        XCTAssertTrue(mesh.columns.dropFirst().allSatisfy { $0.conversation.isConnected })
+        XCTAssertEqual(first.conversation.rows, originalRows)
+        XCTAssertEqual(mesh.draft, "keep this draft")
+        XCTAssertEqual(mesh.columns.count, Self.agents.count)
+
+        let global = MeshSession(baseDirectory: FileManager.default.temporaryDirectory)
+        global.loadVisualFixture(agents: Self.agents)
+        XCTAssertTrue(global.send("start every column"))
+        XCTAssertTrue(global.anyRunning)
+
+        await global.stopAllTurns()
+        XCTAssertFalse(global.anyRunning)
+        XCTAssertEqual(global.columns.count, Self.agents.count)
+        XCTAssertEqual(global.stage, "Stopped")
+        XCTAssertEqual(global.draft, "")
+    }
+
+    func testLastUserTurnFailureUsesNewestAuthoredTurn() {
+        let rows: [AcpTranscriptRow] = [
+            .user(id: "1", text: "old", failed: true),
+            .message(id: "1", text: "recovered"),
+            .user(id: "2", text: "new", failed: false),
+        ]
+        XCTAssertFalse(MeshSession.lastUserTurnFailed(in: rows))
+        XCTAssertTrue(MeshSession.lastUserTurnFailed(in: rows + [
+            .user(id: "3", text: "failed", failed: true),
+        ]))
+    }
+
     // MARK: - Fixtures / helpers
 
     private static let agents: [AgentProfile] = [

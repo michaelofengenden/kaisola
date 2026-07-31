@@ -8,6 +8,61 @@ import XCTest
 /// stream, plus a permission callback) is verified without spawning a process.
 final class AcpClientTests: XCTestCase {
     @MainActor
+    func testOwnedConversationCanRestartAfterAdapterExit() async {
+        let conversation = AcpConversation(
+            title: "Restart", command: "/usr/bin/true", arguments: [], cwd: "/tmp"
+        )
+
+        // `true` exits before the ACP initialize handshake. A restart must
+        // replace the dead Process transport and complete another bounded
+        // attempt instead of reusing its closed handles or hanging.
+        await conversation.start()
+        XCTAssertFalse(conversation.isConnected)
+        XCTAssertTrue(conversation.canRestart)
+
+        await conversation.restart()
+        XCTAssertFalse(conversation.isConnected)
+        XCTAssertFalse(conversation.isReconnecting)
+        XCTAssertTrue(conversation.canRestart)
+        XCTAssertNotNil(conversation.statusMessage)
+    }
+
+    @MainActor
+    func testSteeringQueuedTurnClearsPresentedAndQueuedPermissions() async throws {
+        let transport = ScriptedAcpTransport()
+        let client = AcpClient(transport: transport)
+        let ruleDirectory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("kaisola-steer-permissions-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: ruleDirectory) }
+        let conversation = AcpConversation(
+            title: "Steer", command: "mock", arguments: [], environment: [:],
+            cwd: "/tmp", client: client,
+            ruleStore: PermissionRuleStore(fileURL: ruleDirectory.appendingPathComponent("rules.json"))
+        )
+        await conversation.start()
+        conversation.send("current")
+        conversation.send("steer me")
+        let options = [
+            AcpPermissionRequest.Option(id: "allow", name: "Allow", kind: "allow_once"),
+            AcpPermissionRequest.Option(id: "reject", name: "Reject", kind: "reject_once"),
+        ]
+        conversation.receivePermissionForTesting(AcpPermissionRequest(
+            id: 101, sessionID: "session", title: "First", options: options
+        ))
+        conversation.receivePermissionForTesting(AcpPermissionRequest(
+            id: 102, sessionID: "session", title: "Second", options: options
+        ))
+        XCTAssertEqual(conversation.pendingPermissionCount, 2)
+
+        let queuedID = try XCTUnwrap(conversation.queued.first?.id)
+        conversation.steerQueued(queuedID)
+
+        XCTAssertNil(conversation.pendingPermission)
+        XCTAssertEqual(conversation.pendingPermissionCount, 0)
+        XCTAssertEqual(conversation.queued.first?.text, "steer me")
+    }
+
+    @MainActor
     func testConversationStopReturnsFinalDebouncedDraft() async {
         let key = "stop-draft-\(UUID().uuidString)"
         defer { UserDefaults.standard.removeObject(forKey: "chatDraft.\(key)") }

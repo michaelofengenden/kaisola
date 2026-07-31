@@ -13,6 +13,8 @@ struct OnboardingView: View {
     /// Close the welcome. The caller marks onboarding seen and drops the sheet.
     let dismiss: () -> Void
 
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
     @State private var index = 0
     /// Slide direction for the page transition (forward on Continue, back on
     /// Back) so the motion reads as paging rather than a crossfade.
@@ -119,7 +121,8 @@ struct OnboardingView: View {
     }
 
     private var pageTransition: AnyTransition {
-        .asymmetric(
+        if reduceMotion { return .opacity }
+        return .asymmetric(
             insertion: .move(edge: forward ? .trailing : .leading).combined(with: .opacity),
             removal: .move(edge: forward ? .leading : .trailing).combined(with: .opacity)
         )
@@ -152,7 +155,10 @@ struct OnboardingView: View {
                 Circle()
                     .fill(page == index ? Color.accentColor : Color.secondary.opacity(0.28))
                     .frame(width: page == index ? 8 : 7, height: page == index ? 8 : 7)
-                    .animation(.easeInOut(duration: 0.2), value: index)
+                    .animation(
+                        reduceMotion ? nil : .easeInOut(duration: KaisolaVisualSystem.stateDuration),
+                        value: index
+                    )
             }
         }
         .accessibilityElement(children: .ignore)
@@ -163,7 +169,7 @@ struct OnboardingView: View {
         let target = min(max(index + delta, 0), pages.count - 1)
         guard target != index else { return }
         forward = target > index
-        withAnimation(.easeInOut(duration: 0.28)) {
+        withAnimation(.easeInOut(duration: KaisolaVisualSystem.layoutDuration)) {
             index = target
         }
     }
@@ -185,7 +191,7 @@ private struct OnboardingPage: Identifiable {
             id: 0,
             symbol: "terminal.fill",
             title: "Your agents, native",
-            subtitle: "Terminals and agent CLIs run on a durable broker — they survive app quits and updates.",
+            subtitle: "Kaisola keeps terminals and agent CLIs running in the background — even while the app quits or updates.",
             features: [
                 OnboardingFeature(
                     symbol: "terminal.fill",

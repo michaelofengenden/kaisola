@@ -86,6 +86,25 @@ final class AcpPermissionRulesTests: XCTestCase {
         XCTAssertTrue(AcpPermissionRules.requestIsSensitive(globs: globs, title: "cat 'secrets.yml'", paths: []))
         XCTAssertFalse(AcpPermissionRules.requestIsSensitive(globs: globs, title: "ls -la", paths: ["src/main.swift"]))
     }
+
+    func testSensitiveGlobSettingsRejectUnsupportedOrDangerouslyBroadPatterns() {
+        XCTAssertNil(SensitiveGlobPolicy.validationMessage(
+            " **/*.p12 ",
+            existing: AcpPermissionRules.defaultSensitiveGlobs
+        ))
+        XCTAssertEqual(
+            SensitiveGlobPolicy.validationMessage("**/[Ss]ecret", existing: []),
+            "Only * and ** wildcards are supported; ?, brackets, and braces are not."
+        )
+        XCTAssertEqual(
+            SensitiveGlobPolicy.validationMessage("**/*", existing: []),
+            "Name at least part of a sensitive file; a wildcard-only pattern is too broad."
+        )
+        XCTAssertEqual(
+            SensitiveGlobPolicy.validationMessage("**/.ENV*", existing: ["**/.env*"]),
+            "That sensitive-file pattern already exists."
+        )
+    }
 }
 
 /// PermissionRuleStore file persistence.

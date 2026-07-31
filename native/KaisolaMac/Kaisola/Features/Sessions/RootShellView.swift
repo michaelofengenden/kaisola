@@ -31,21 +31,64 @@ struct RootShellView: View {
     @State private var terminalTranscriptTarget: AppModel.TerminalTranscriptContext?
     @State private var terminalTranscriptOpenedFromLiveBoundary = false
     @State private var hoveredTerminalPaneID: String?
-    /// A Close Mesh request whose worktrees still hold uncommitted changes.
-    @State private var meshCloseConfirm: (id: String, dirty: Int)?
+    /// A Close Mesh request whose active turns or worktrees require a deliberate
+    /// destructive choice.
+    private struct MeshCloseConfirmation {
+        let id: String
+        let dirty: Int
+        let running: Bool
+    }
+    @State private var meshCloseConfirm: MeshCloseConfirmation?
 
     /// Close immediately only when every column has neither working-tree
     /// changes nor unique commits; all uncertainty blocks deletion.
     private func requestCloseMesh(_ mesh: MeshSession) {
         Task {
+            if mesh.anyRunning {
+                switch await mesh.discardAssessment() {
+                case .safe:
+                    meshCloseConfirm = .init(id: mesh.id, dirty: 0, running: true)
+                case let .recoverableWork(columns):
+                    meshCloseConfirm = .init(id: mesh.id, dirty: columns, running: true)
+                case let .blocked(message):
+                    ToastCenter.shared.show(message, style: .error, duration: 5)
+                }
+                return
+            }
             switch await model.requestCloseMesh(mesh.id, allowRecoverableWork: false) {
             case .closed, .unavailable:
                 break
             case let .needsConfirmation(columns):
-                meshCloseConfirm = (mesh.id, columns)
+                meshCloseConfirm = .init(id: mesh.id, dirty: columns, running: false)
             case let .blocked(message):
                 ToastCenter.shared.show(message, style: .error, duration: 5)
             }
+        }
+    }
+
+    private var meshCloseDestructiveTitle: String {
+        guard let confirmation = meshCloseConfirm else { return "Close Mesh" }
+        if confirmation.running, confirmation.dirty > 0 { return "Stop, Discard, and Close" }
+        if confirmation.running { return "Stop and Close" }
+        return "Discard and Close"
+    }
+
+    /// Chat deletion really removes its persisted transcript and draft. Keep a
+    /// separate non-destructive Stop action and require an explicit decision
+    /// before entering the deletion path.
+    private func requestDeleteChat(_ chat: AcpChatHandle) {
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = "Delete “\(chat.conversation.title)”?"
+        alert.informativeText = "This permanently removes the chat transcript and saved draft. Use Stop Chat if you only want to end the current agent process."
+        alert.addButton(withTitle: "Delete Chat")
+        alert.addButton(withTitle: "Cancel")
+        if let window = NSApp.keyWindow {
+            alert.beginSheetModal(for: window) { response in
+                if response == .alertFirstButtonReturn { model.closeChat(chat.id) }
+            }
+        } else if alert.runModal() == .alertFirstButtonReturn {
+            model.closeChat(chat.id)
         }
     }
 
@@ -62,11 +105,6 @@ struct RootShellView: View {
             .onReceive(NotificationCenter.default.publisher(for: .kaisolaOpenBrowserCard)) { note in
                 guard let url = note.object as? URL else { return }
                 model.openBrowserCard(url)
-            }
-            .onReceive(NotificationCenter.default.publisher(for: .kaisolaAttentionJump)) { note in
-                if let targetID = note.userInfo?[NotificationBridge.targetIDKey] as? String {
-                    model.jumpToAttentionTarget(targetID)
-                }
             }
             .onAppear {
                 let environment = ProcessInfo.processInfo.environment
@@ -182,13 +220,13 @@ struct RootShellView: View {
         sheeted
         .background(
             Group {
-                Button(action: { showPalette.toggle() }) { EmptyView() }
+                Button(action: toggleCommandPalette) { EmptyView() }
                     .keyboardShortcut("k", modifiers: .command)
                     .accessibilityLabel("Command Palette")
                 Button(action: { settings.workspaceRailVisible.toggle() }) { EmptyView() }
                     .keyboardShortcut("b", modifiers: .command)
                     .accessibilityLabel("Toggle Workspace Rail")
-                Button(action: { showOmniBar.toggle() }) { EmptyView() }
+                Button(action: toggleOmniBar) { EmptyView() }
                     .keyboardShortcut("l", modifiers: .command)
                     .accessibilityLabel("Message Current Agent")
                 Button(action: {
@@ -210,8 +248,7 @@ struct RootShellView: View {
                         .padding(.top, 72)
                 }
                 .transition(.opacity)
-            }
-            if showOmniBar {
+            } else if showOmniBar {
                 ZStack(alignment: .top) {
                     Color.black.opacity(0.18)
                         .ignoresSafeArea()
@@ -227,7 +264,7 @@ struct RootShellView: View {
             "Close Mesh?",
             isPresented: Binding(get: { meshCloseConfirm != nil }, set: { if !$0 { meshCloseConfirm = nil } })
         ) {
-            Button("Discard and Close", role: .destructive) {
+            Button(meshCloseDestructiveTitle, role: .destructive) {
                 if let confirm = meshCloseConfirm {
                     Task {
                         if case let .blocked(message) = await model.requestCloseMesh(
@@ -242,8 +279,26 @@ struct RootShellView: View {
             }
             Button("Cancel", role: .cancel) { meshCloseConfirm = nil }
         } message: {
-            Text("\(meshCloseConfirm?.dirty ?? 0) column(s) contain unintegrated files or commits. Closing discards that recoverable work permanently — integrate what you want to keep first.")
+            if let confirmation = meshCloseConfirm, confirmation.running, confirmation.dirty > 0 {
+                Text("Agents are still working and \(confirmation.dirty) column(s) contain unintegrated files or commits. Closing stops the run and permanently discards that recoverable work.")
+            } else if meshCloseConfirm?.running == true {
+                Text("One or more agents are still working. Closing stops every turn and deletes the Mesh transcript and draft.")
+            } else {
+                Text("\(meshCloseConfirm?.dirty ?? 0) column(s) contain unintegrated files or commits. Closing discards that recoverable work permanently — integrate what you want to keep first.")
+            }
         }
+    }
+
+    private func toggleCommandPalette() {
+        let shouldPresent = !showPalette
+        showOmniBar = false
+        showPalette = shouldPresent
+    }
+
+    private func toggleOmniBar() {
+        let shouldPresent = !showOmniBar
+        showPalette = false
+        showOmniBar = shouldPresent
     }
 
     // MARK: - Layouts
@@ -278,7 +333,10 @@ struct RootShellView: View {
                             .contextMenu {
                                 Button("Open Beside") { model.revealSurfaceBeside(chat.id) }
                                 Button("Rename…") { renameTarget = chat.id }
-                                Button("Close Chat", role: .destructive) { model.closeChat(chat.id) }
+                                if chat.conversation.isRunning {
+                                    Button("Stop Chat") { model.stopChat(chat.id) }
+                                }
+                                Button("Delete Chat…", role: .destructive) { requestDeleteChat(chat) }
                             }
                         }
                         ForEach(meshes) { mesh in
@@ -298,6 +356,9 @@ struct RootShellView: View {
                             .contextMenu {
                                 Button("Open Beside") { model.revealSurfaceBeside(mesh.id) }
                                 Button("Rename…") { renameTarget = mesh.id }
+                                if mesh.anyRunning {
+                                    Button("Stop All Columns") { Task { await mesh.stopAllTurns() } }
+                                }
                                 Button("Close Mesh", role: .destructive) { requestCloseMesh(mesh) }
                             }
                         }
@@ -548,6 +609,7 @@ struct RootShellView: View {
                 model: model,
                 projectID: activeProjectID,
                 rename: { renameTarget = $0 },
+                deleteChat: requestDeleteChat,
                 closeMesh: requestCloseMesh
             )
             Divider()
@@ -842,6 +904,10 @@ struct RootShellView: View {
                     ) {
                         model.closeFilePreview()
                     }
+                    // Keep document/tab state while navigating inside a
+                    // project, but remount the FSEvents watcher when the file
+                    // workbench moves to a different project root.
+                    .id("file-preview-\(model.currentProjectDirectory?.standardizedFileURL.path ?? fileURL.deletingLastPathComponent().path)")
                     .frame(width: widths.preview)
                     .frame(maxHeight: .infinity)
                 }
@@ -1168,7 +1234,7 @@ struct RootShellView: View {
         } description: {
             Text(model.controlAvailable
                 ? "Start a terminal, agent, chat, or Mesh run for this project."
-                : "Chats and Mesh are ready. Terminals need a broker that accepts native control — this connection doesn't, so terminal creation is disabled.")
+                : "Chats and Mesh are ready. The background terminal service is view-only right now, so new terminals are temporarily unavailable.")
         } actions: {
             HStack(spacing: 10) {
                 Button {
@@ -1177,7 +1243,7 @@ struct RootShellView: View {
                     Label("New Terminal", systemImage: "terminal")
                 }
                 .disabled(!model.controlAvailable)
-                .help(model.controlAvailable ? "Open a shell in the active project" : "The connected broker doesn't accept native control")
+                .help(model.controlAvailable ? "Open a shell in the active project" : "New terminals are unavailable while the background terminal service is view-only")
                 if let chatAgent {
                     Button {
                         RootShellView.promptForNewChat(chatAgent, model: model)
@@ -1367,11 +1433,16 @@ struct RootShellView: View {
                         .font(.system(size: 12, weight: .semibold))
                         .lineLimit(1)
                     if surfaceWorking(id) {
-                        ProgressView().controlSize(.mini).scaleEffect(0.55)
+                        ProgressView()
+                            .controlSize(.mini)
+                            .scaleEffect(0.55)
+                            .accessibilityLabel(surfaceStatusLabel(id))
                     } else {
                         Circle()
                             .fill(surfaceLive(id) ? Color.green : Color.secondary.opacity(0.45))
                             .frame(width: 5, height: 5)
+                            .accessibilityElement(children: .ignore)
+                            .accessibilityLabel(surfaceStatusLabel(id))
                     }
                     if let deviceName = companionControllerName(for: id) {
                         Label(deviceName, systemImage: "iphone")
@@ -1496,35 +1567,84 @@ struct RootShellView: View {
         if unifiedTerminalDocument(id) != nil,
            let feed = model.terminalSurfaceFeed(for: id) {
             let owned = model.isOwned(id)
-            TerminalSurfaceFeedView(feed: feed) { liveDocument in
-                NativeTerminalSurface(
-                    output: "",
-                    streamEpoch: liveDocument.cursor?.streamEpoch,
-                    endOffset: liveDocument.cursor?.offset,
-                    scrollback: liveDocument.scrollback,
-                    surfaceDelta: liveDocument.surfaceDelta,
-                    workingDirectory: model.directory(for: id),
-                    isOwned: owned,
-                    fontSize: settings.terminalFontSize,
-                    fontFamily: settings.terminalFontFamily,
-                    fontWeight: settings.terminalFontWeight,
-                    lineSpacing: settings.terminalLineSpacing,
-                    scrollbackLines: settings.terminalScrollbackLines,
-                    paletteMode: settings.terminalPalette,
-                    lightSurface: colorScheme == .light,
-                    sessionID: id,
-                    agentLaunchCommand: model.agentProfile(for: id)?.launchCommand,
-                    onInput: owned ? { data in model.sendInput(data, to: id) } : nil,
-                    onResize: owned ? { columns, rows in model.resizeTerminal(id, columns: columns, rows: rows) } : nil,
-                    onTitleChange: owned ? { title in model.applyAutoTitle(title, to: id) } : nil,
-                    onHistoryBoundary: { openTerminalTranscript(id, fromLiveBoundary: true) }
-                )
+            ZStack(alignment: .top) {
+                TerminalSurfaceFeedView(feed: feed) { liveDocument in
+                    NativeTerminalSurface(
+                        output: "",
+                        streamEpoch: liveDocument.cursor?.streamEpoch,
+                        endOffset: liveDocument.cursor?.offset,
+                        scrollback: liveDocument.scrollback,
+                        surfaceDelta: liveDocument.surfaceDelta,
+                        workingDirectory: model.directory(for: id),
+                        isOwned: owned,
+                        fontSize: settings.terminalFontSize,
+                        fontFamily: settings.terminalFontFamily,
+                        fontWeight: settings.terminalFontWeight,
+                        lineSpacing: settings.terminalLineSpacing,
+                        scrollbackLines: settings.terminalScrollbackLines,
+                        paletteMode: settings.terminalPalette,
+                        lightSurface: colorScheme == .light,
+                        sessionID: id,
+                        agentLaunchCommand: model.agentProfile(for: id)?.launchCommand,
+                        onInput: owned ? { data in model.sendInput(data, to: id) } : nil,
+                        onResize: owned ? { columns, rows in model.resizeTerminal(id, columns: columns, rows: rows) } : nil,
+                        onTitleChange: owned ? { title in model.applyAutoTitle(title, to: id) } : nil,
+                        onBell: { handleTerminalBell(id) },
+                        onHistoryBoundary: { openTerminalTranscript(id, fromLiveBoundary: true) }
+                    )
+                }
+                // A reconnect can promote an observed surface to an owned one
+                // after inventory is already visible. The concrete AppKit class is
+                // part of the input-safety boundary: remount so a formerly
+                // ReadOnlyTerminalView can never keep swallowing owned keystrokes.
+                .id("unified-\(id)-\(owned)")
+
+                terminalLifecycleOverlay(id)
             }
         } else {
             ProgressView()
                 .controlSize(.small)
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
                 .accessibilityLabel("Loading terminal")
+        }
+    }
+
+    @ViewBuilder
+    private func terminalLifecycleOverlay(_ id: String) -> some View {
+        if let terminal = model.sessions.first(where: { $0.id == id }) {
+            if terminal.exited {
+                HStack(spacing: 8) {
+                    Label("Session ended", systemImage: "stop.circle.fill")
+                    Button("Open Transcript") { openTerminalTranscript(id) }
+                        .buttonStyle(.borderless)
+                        .disabled(model.terminalTranscriptContext(for: id) == nil)
+                }
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(.secondary)
+                .padding(.horizontal, 10)
+                .padding(.vertical, 6)
+                .background(.regularMaterial, in: Capsule())
+                .overlay {
+                    Capsule().stroke(Color(nsColor: .separatorColor).opacity(0.7), lineWidth: 0.5)
+                }
+                .padding(10)
+                .accessibilityElement(children: .contain)
+                .accessibilityLabel("Session ended")
+                .accessibilityHint("Open the retained terminal transcript to review its output")
+            } else if case let .reconnecting(attempt) = model.connectionState {
+                Label("Reconnecting…", systemImage: "arrow.triangle.2.circlepath")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.secondary)
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 6)
+                    .background(.regularMaterial, in: Capsule())
+                    .overlay {
+                        Capsule().stroke(Color(nsColor: .separatorColor).opacity(0.7), lineWidth: 0.5)
+                    }
+                    .padding(10)
+                    .accessibilityLabel("Reconnecting to \(surfaceTitle(id))")
+                    .accessibilityValue("Attempt \(attempt). Running terminals remain on the broker.")
+            }
         }
     }
 
@@ -1568,9 +1688,48 @@ struct RootShellView: View {
     }
 
     private func surfaceLive(_ id: String) -> Bool {
-        if let terminal = model.sessions.first(where: { $0.id == id }) { return !terminal.exited }
+        if let terminal = model.sessions.first(where: { $0.id == id }) {
+            return !terminal.exited && model.connectionState.isConnected
+        }
         if let chat = model.chats.first(where: { $0.id == id }) { return chat.conversation.isConnected }
         return model.meshes.contains(where: { $0.id == id })
+    }
+
+    private func surfaceStatusLabel(_ id: String) -> String {
+        if let terminal = model.sessions.first(where: { $0.id == id }) {
+            if terminal.exited { return "Session ended" }
+            switch model.connectionState {
+            case .reconnecting: return "Terminal reconnecting"
+            case .connected: return "Terminal live"
+            case .looking, .connecting: return "Terminal connecting"
+            case .unavailable: return "Terminal offline"
+            }
+        }
+        if let chat = model.chats.first(where: { $0.id == id }) {
+            return chat.conversation.isConnected ? "Chat connected" : "Chat disconnected"
+        }
+        return "Mesh session"
+    }
+
+    private func handleTerminalBell(_ id: String) {
+        guard let terminal = model.sessions.first(where: { $0.id == id }), !terminal.exited else {
+            return
+        }
+        // AttentionCenter already models one live entry per target and kind;
+        // avoid replacing it (and posting another system notification) for a
+        // repaint burst that contains repeated BEL bytes.
+        guard !attention.entries.contains(where: {
+            $0.targetID == id && $0.kind == .turnCompleted
+        }) else { return }
+        attention.notify(
+            // `sessionResponded` advances a durable broker-completion
+            // acknowledgement watermark when cleared. BEL has no broker event
+            // timestamp, so keep it in the generic completed/needs-you lane.
+            kind: .turnCompleted,
+            targetID: id,
+            title: model.sessionTitle(for: terminal),
+            detail: "Terminal requested attention"
+        )
     }
 
     @ViewBuilder
@@ -1882,6 +2041,7 @@ struct RootShellView: View {
                         model.resizeTerminal(terminalID, columns: columns, rows: rows)
                     } : nil,
                     onTitleChange: owned && active ? { title in model.applyAutoTitle(title, to: terminalID) } : nil,
+                    onBell: { handleTerminalBell(terminalID) },
                     onHistoryBoundary: active
                         ? { openTerminalTranscript(terminalID, fromLiveBoundary: true) }
                         : nil
@@ -1921,6 +2081,7 @@ struct RootShellView: View {
                     onInput: owned ? { data in model.sendInput(data, to: splitID) } : nil,
                     onResize: owned ? { columns, rows in model.resizeTerminal(splitID, columns: columns, rows: rows) } : nil,
                     onTitleChange: owned ? { title in model.applyAutoTitle(title, to: splitID) } : nil,
+                    onBell: { handleTerminalBell(splitID) },
                     onHistoryBoundary: { openTerminalTranscript(splitID, fromLiveBoundary: true) }
                 )
             }
@@ -2649,6 +2810,7 @@ private struct SessionStrip: View {
     @ObservedObject var model: AppModel
     let projectID: String?
     let rename: (String) -> Void
+    let deleteChat: (AcpChatHandle) -> Void
     let closeMesh: (MeshSession) -> Void
 
     private var project: AppModel.ProjectGroup? {
@@ -2708,7 +2870,10 @@ private struct SessionStrip: View {
                     }
                     .buttonStyle(.plain)
                     .contextMenu {
-                        Button("Close Chat", role: .destructive) { model.closeChat(chat.id) }
+                        if chat.conversation.isRunning {
+                            Button("Stop Chat") { model.stopChat(chat.id) }
+                        }
+                        Button("Delete Chat…", role: .destructive) { deleteChat(chat) }
                     }
                     .id(chat.id)
                 }
@@ -2736,6 +2901,9 @@ private struct SessionStrip: View {
                     }
                     .buttonStyle(.plain)
                     .contextMenu {
+                        if mesh.anyRunning {
+                            Button("Stop All Columns") { Task { await mesh.stopAllTurns() } }
+                        }
                         Button("Close Mesh", role: .destructive) { closeMesh(mesh) }
                     }
                     .id(mesh.id)

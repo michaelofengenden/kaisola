@@ -133,6 +133,42 @@ final class TerminalReplayFidelityTests: XCTestCase {
         )
     }
 
+    func testCacheRejectsReadOnlyViewWhenSessionBecomesOwned() {
+        let cache = TerminalSurfaceCache.shared
+        cache.removeAll()
+        defer { cache.removeAll() }
+
+        cache.store(
+            sessionID: "t1",
+            view: ReadOnlyTerminalView(
+                frame: .zero,
+                font: .monospacedSystemFont(ofSize: 12, weight: .regular)
+            ),
+            coordinator: NativeTerminalSurface.Coordinator()
+        )
+
+        XCTAssertNil(cache.claim(sessionID: "t1", isOwned: true))
+        XCTAssertFalse(cache.retainedSessionIDs.contains("t1"), "A type-mismatched pair must be evicted, not offered again.")
+    }
+
+    func testCacheRejectsOwnedViewWhenSessionBecomesObserved() {
+        let cache = TerminalSurfaceCache.shared
+        cache.removeAll()
+        defer { cache.removeAll() }
+
+        cache.store(
+            sessionID: "t1",
+            view: OwnedTerminalView(
+                frame: .zero,
+                font: .monospacedSystemFont(ofSize: 12, weight: .regular)
+            ),
+            coordinator: NativeTerminalSurface.Coordinator()
+        )
+
+        XCTAssertNil(cache.claim(sessionID: "t1", isOwned: false))
+        XCTAssertFalse(cache.retainedSessionIDs.contains("t1"), "An owned view must never cross into an observer surface.")
+    }
+
     func testRetentionIsBounded() {
         let cache = TerminalSurfaceCache.shared
         cache.removeAll()

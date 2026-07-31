@@ -101,4 +101,31 @@ final class ApiKeyStoreTests: XCTestCase {
         XCTAssertEqual(ApiKeyStore.Key.openai.rawValue, "OPENAI_API_KEY")
         XCTAssertEqual(ApiKeyStore.Key.allCases.count, 2)
     }
+
+    func testSettingsKeyFormatWarningsAreSoftAndProviderSpecific() {
+        XCTAssertNil(ApiKeyFormatPolicy.warning(
+            for: .anthropic,
+            value: "sk-ant-api03-abcdefghijklmnopqrstuvwxyz"
+        ))
+        XCTAssertNil(ApiKeyFormatPolicy.warning(
+            for: .openai,
+            value: "sk-proj-abcdefghijklmnopqrstuvwxyz"
+        ))
+        XCTAssertEqual(
+            ApiKeyFormatPolicy.warning(for: .anthropic, value: "sk-wrong-abcdefghijklmnopqrstuvwxyz"),
+            "Anthropic API keys usually begin with sk-ant-."
+        )
+        XCTAssertEqual(
+            ApiKeyFormatPolicy.warning(for: .openai, value: "not-an-openai-key"),
+            "OpenAI API keys usually begin with sk-."
+        )
+        XCTAssertEqual(
+            ApiKeyFormatPolicy.warning(for: .openai, value: "sk-short"),
+            "This API key looks unusually short."
+        )
+        XCTAssertEqual(
+            ApiKeyFormatPolicy.warning(for: .anthropic, value: "sk-ant-api03-has a-space"),
+            "API keys normally do not contain spaces or line breaks."
+        )
+    }
 }

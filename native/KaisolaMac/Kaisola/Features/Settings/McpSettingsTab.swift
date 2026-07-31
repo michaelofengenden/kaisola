@@ -1,7 +1,7 @@
 import SwiftUI
 
-/// Settings tab for per-workspace MCP servers. Whatever is configured here rides
-/// into every ACP chat's `session/new` for that workspace (see
+/// Settings tab for per-project MCP servers. Whatever is configured here rides
+/// into every ACP chat's `session/new` for that project (see
 /// `McpConfigStore.jsonValues`). MCP servers are workspace-scoped, so a nil
 /// workspace (no active project) has nowhere to store them — the tab shows a hint
 /// instead of an editor.
@@ -16,8 +16,8 @@ struct McpSettingsTab: View {
                 .id(workspace)
         } else {
             Form {
-                Section("MCP servers") {
-                    Text("Open a project to configure its MCP servers. Servers are scoped per workspace and ride into every agent chat you start there.")
+                Section("MCP Servers") {
+                    Text("Open a project to configure its MCP servers. Servers are scoped to that project and are available to every agent chat you start there.")
                         .font(.callout)
                         .foregroundStyle(.secondary)
                 }
@@ -25,6 +25,21 @@ struct McpSettingsTab: View {
             .formStyle(.grouped)
             .padding(6)
         }
+    }
+}
+
+/// Pure add-form policy shared by the view and focused tests. Keeping the
+/// catalog cap here prevents UI state from ever getting ahead of what the
+/// bounded store can persist.
+enum McpSettingsPolicy {
+    static func remainingCapacity(serverCount: Int) -> Int {
+        max(0, McpConfigStore.maximumServerCount - max(0, serverCount))
+    }
+
+    static func duplicateName(_ rawName: String, servers: [McpServerConfig]) -> String? {
+        let name = rawName.trimmingCharacters(in: .whitespaces)
+        guard !name.isEmpty, servers.contains(where: { $0.id == name }) else { return nil }
+        return name
     }
 }
 
@@ -43,6 +58,13 @@ private struct McpServerEditor: View {
     @State private var isDiscovering = false
     @State private var isImporting = false
     @State private var discoveryMessage: String?
+    @State private var recentlyDeleted: DeletedServer?
+
+    private struct DeletedServer: Identifiable {
+        let id = UUID()
+        let server: McpServerConfig
+        let index: Int
+    }
 
     /// The in-progress new-server form.
     private struct Draft {
@@ -64,6 +86,12 @@ private struct McpServerEditor: View {
         .formStyle(.grouped)
         .padding(6)
         .onAppear { loadInitialState() }
+        .task(id: recentlyDeleted?.id) {
+            guard recentlyDeleted != nil else { return }
+            try? await Task.sleep(nanoseconds: 8_000_000_000)
+            guard !Task.isCancelled else { return }
+            recentlyDeleted = nil
+        }
     }
 
     private func loadInitialState() {
@@ -105,7 +133,7 @@ private struct McpServerEditor: View {
     // MARK: - Configured servers
 
     private var configuredSection: some View {
-        Section("Configured servers") {
+        Section("Configured Servers") {
             if servers.isEmpty {
                 Text("No MCP servers yet — add one below.")
                     .font(.caption)
@@ -146,9 +174,7 @@ private struct McpServerEditor: View {
                         .help("Check MCP server")
                         .accessibilityLabel("Check MCP server \(server.name)")
                         Button(role: .destructive) {
-                            servers.removeAll { $0.id == server.id }
-                            probeResults[server.name] = nil
-                            store.save(servers)
+                            delete(server)
                         } label: {
                             Image(systemName: "trash")
                         }
@@ -172,7 +198,35 @@ private struct McpServerEditor: View {
                     }
                 }
             }
+            if let deleted = recentlyDeleted {
+                HStack(spacing: 8) {
+                    Label("\(deleted.server.name) removed", systemImage: "trash")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    Spacer()
+                    Button("Undo") { restore(deleted) }
+                        .buttonStyle(.borderless)
+                }
+            }
         }
+    }
+
+    private func delete(_ server: McpServerConfig) {
+        guard let index = servers.firstIndex(where: { $0.id == server.id }) else { return }
+        recentlyDeleted = DeletedServer(server: servers.remove(at: index), index: index)
+        probeResults[server.name] = nil
+        store.save(servers)
+    }
+
+    private func restore(_ deleted: DeletedServer) {
+        guard servers.count < McpConfigStore.maximumServerCount,
+              !servers.contains(where: { $0.id == deleted.server.id }) else {
+            recentlyDeleted = nil
+            return
+        }
+        servers.insert(deleted.server, at: min(deleted.index, servers.count))
+        store.save(servers)
+        recentlyDeleted = nil
     }
 
     private func probe(_ server: McpServerConfig) {
@@ -222,7 +276,7 @@ private struct McpServerEditor: View {
     // MARK: - Discovery and disabled import
 
     private var discoverySection: some View {
-        Section("Import existing configuration") {
+        Section("Import Existing Configuration") {
             Text("Find MCP servers already configured in Cursor, Claude, Codex, Gemini, VS Code, or Windsurf. Kaisola reads only their standard local config files, never expands secrets, and imports selected servers disabled.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
@@ -234,7 +288,7 @@ private struct McpServerEditor: View {
                     if isDiscovering {
                         Label("Searching…", systemImage: "magnifyingglass")
                     } else {
-                        Label("Find configured servers", systemImage: "magnifyingglass")
+                        Label("Find Configured Servers", systemImage: "magnifyingglass")
                     }
                 }
                 .disabled(isDiscovering)
@@ -253,15 +307,20 @@ private struct McpServerEditor: View {
                     .accessibilityLabel("Import \(discovery.config.name) from \(discovery.origin)")
                 }
                 HStack {
-                    Button("Import selected disabled") { importSelected() }
-                        .disabled(selectedDiscoveryIDs.isEmpty || isImporting)
-                    Button("Search again") { discover() }
+                    Button("Import as Disabled") { importSelected() }
+                        .disabled(selectedDiscoveryIDs.isEmpty || isImporting || remainingCapacity == 0)
+                    Button("Search Again") { discover() }
                         .disabled(isDiscovering || isImporting)
                     if isImporting { ProgressView().controlSize(.small) }
                 }
             }
             if let discoveryMessage {
                 Text(discoveryMessage)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            if remainingCapacity == 0 {
+                Text("MCP server limit reached (\(McpConfigStore.maximumServerCount)). Remove a server before importing another.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
@@ -306,10 +365,14 @@ private struct McpServerEditor: View {
                 store.importDiscovered(selected)
             }.value
             servers = store.servers()
-            let importedNames = Set(selected.map { $0.config.name })
-            discoveries.removeAll { importedNames.contains($0.config.name) }
+            let savedNames = Set(servers.map(\.name))
+            discoveries.removeAll { savedNames.contains($0.config.name) }
             selectedDiscoveryIDs = Set(discoveries.map(\.id))
-            discoveryMessage = "Imported \(imported) server\(imported == 1 ? "" : "s") disabled. Enable one only after reviewing its command or URL."
+            if imported < selected.count {
+                discoveryMessage = "Imported \(imported) of \(selected.count) selected servers as disabled; the \(McpConfigStore.maximumServerCount)-server limit was reached."
+            } else {
+                discoveryMessage = "Imported \(imported) server\(imported == 1 ? "" : "s") as disabled. Enable one only after reviewing its command or URL."
+            }
             isImporting = false
         }
     }
@@ -317,8 +380,9 @@ private struct McpServerEditor: View {
     // MARK: - Add form
 
     private var addSection: some View {
-        Section("Add a server") {
-            TextField("Name", text: $draft.name, prompt: Text("unique per workspace"))
+        Section("Add a Server") {
+            TextField("Name", text: $draft.name, prompt: Text("unique per project"))
+                .onChange(of: draft.name) { _, _ in addError = nil }
             Picker("Transport", selection: $draft.kind) {
                 Text("stdio").tag(McpServerConfig.Kind.stdio)
                 Text("http").tag(McpServerConfig.Kind.http)
@@ -340,8 +404,18 @@ private struct McpServerEditor: View {
                     .font(.caption)
                     .foregroundStyle(.red)
             }
-            Button("Add server", action: add)
-                .disabled(!canAdd)
+            if let duplicate = duplicateName {
+                Text("A server named \"\(duplicate)\" already exists in this project.")
+                    .font(.caption)
+                    .foregroundStyle(.red)
+            }
+            if remainingCapacity == 0 {
+                Text("MCP server limit reached (\(McpConfigStore.maximumServerCount)). Remove a server before adding another.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            Button("Add Server", action: add)
+                .disabled(!hasRequiredFields || remainingCapacity == 0)
         }
     }
 
@@ -358,9 +432,8 @@ private struct McpServerEditor: View {
         }
     }
 
-    private var canAdd: Bool {
-        let name = draft.name.trimmingCharacters(in: .whitespaces)
-        guard !name.isEmpty, !servers.contains(where: { $0.id == name }) else { return false }
+    private var hasRequiredFields: Bool {
+        guard !draft.name.trimmingCharacters(in: .whitespaces).isEmpty else { return false }
         switch draft.kind {
         case .stdio:
             return !draft.command.trimmingCharacters(in: .whitespaces).isEmpty
@@ -369,13 +442,22 @@ private struct McpServerEditor: View {
         }
     }
 
+    private var remainingCapacity: Int {
+        McpSettingsPolicy.remainingCapacity(serverCount: servers.count)
+    }
+
+    private var duplicateName: String? {
+        McpSettingsPolicy.duplicateName(draft.name, servers: servers)
+    }
+
     private func add() {
         let name = draft.name.trimmingCharacters(in: .whitespaces)
-        guard canAdd else { return }
-        if servers.contains(where: { $0.id == name }) {
-            addError = "A server named \"\(name)\" already exists."
+        guard remainingCapacity > 0 else {
+            addError = "MCP server limit reached (\(McpConfigStore.maximumServerCount))."
             return
         }
+        guard hasRequiredFields else { return }
+        guard duplicateName == nil else { return }
         let server: McpServerConfig
         switch draft.kind {
         case .stdio:

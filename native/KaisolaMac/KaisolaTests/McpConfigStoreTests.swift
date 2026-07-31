@@ -106,6 +106,25 @@ final class McpConfigStoreTests: XCTestCase {
         XCTAssertTrue(store(workspace).servers().isEmpty)
     }
 
+    func testSettingsAddPolicyMatchesBoundedStoreAndSurfacesDuplicates() {
+        let servers = [
+            McpServerConfig(name: "files", kind: .stdio, command: "server"),
+        ]
+        XCTAssertEqual(
+            McpSettingsPolicy.remainingCapacity(serverCount: servers.count),
+            McpConfigStore.maximumServerCount - 1
+        )
+        XCTAssertEqual(
+            McpSettingsPolicy.remainingCapacity(serverCount: McpConfigStore.maximumServerCount),
+            0
+        )
+        XCTAssertEqual(
+            McpSettingsPolicy.duplicateName("  files  ", servers: servers),
+            "files"
+        )
+        XCTAssertNil(McpSettingsPolicy.duplicateName("other", servers: servers))
+    }
+
     // MARK: - Session wire shapes
 
     func testStdioJsonValueMatchesNodeShape() {

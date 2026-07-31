@@ -220,9 +220,29 @@ final class AppModel: ObservableObject {
     private var reconnectTask: Task<Void, Never>?
     private var cursorSaveTask: Task<Void, Never>?
     private var inventoryRefreshTask: Task<Void, Never>?
+    private var consecutiveInventoryFailures = 0
+    private struct DesktopTerminalGeometry: Equatable, Sendable {
+        let columns: Int
+        let rows: Int
+        var key: String { "\(columns)x\(rows)" }
+    }
     private var terminalResizeTasks: [String: Task<Void, Never>] = [:]
     private var terminalResizeGeneration: [String: Int] = [:]
+    /// Latest AppKit geometry is desired state, not a disposable edge. It is
+    /// retained while ownership/control is unavailable and replayed after a
+    /// reconnect or Companion lease, preventing a transient 20-column PTY from
+    /// surviving underneath a visually wide terminal.
+    private var desiredTerminalGeometry: [String: DesktopTerminalGeometry] = [:]
     private var lastTerminalSize: [String: String] = [:]
+    static let terminalResizeDebounceNanoseconds: UInt64 = 40_000_000
+    private struct PendingTerminalInput: Sendable {
+        let projectID: String
+        let data: String
+        let opensAgentTurn: Bool
+    }
+    private var terminalInputQueues: [String: [PendingTerminalInput]] = [:]
+    private var terminalInputDrainTasks: [String: Task<Void, Never>] = [:]
+    private var terminalInputFailureNoticeAt: [String: Date] = [:]
     /// Broker PTYs can emit hundreds of small packets in one display interval.
     /// Merge contiguous packets for 16 ms so a 64 MiB retained document is
     /// copied and published at most once per frame, while offsets and ordering
@@ -614,6 +634,17 @@ final class AppModel: ObservableObject {
     func isSurfaceVisible(_ id: String) -> Bool {
         guard let projectID = projectID(forSurface: id) else { return false }
         return paneLayouts[projectID]?.contains(id) == true
+    }
+
+    /// Window-aware notification routing asks each model before mutating it.
+    /// Terminal inventories can be shared across windows, while chats and Mesh
+    /// are window-local, so the delegate prefers a visible owner first.
+    func containsAttentionTarget(_ id: String) -> Bool {
+        sessions.contains(where: { $0.id == id })
+            || chats.contains(where: { $0.id == id })
+            || meshes.contains(where: { mesh in
+                mesh.id == id || mesh.columns.contains(where: { $0.id == id })
+            })
     }
 
     /// Normal navigation focuses a card already in the dock; a hidden card
@@ -2533,6 +2564,7 @@ final class AppModel: ObservableObject {
             forgetWhenLast: true
         )
         surfaceObservers.removeValue(forKey: chatID)?.cancel()
+        attentionCenter.clear(targetID: chatID)
         if selectedChatID == chatID { selectedChatID = nil }
         if let projectID = closingChat?.projectID {
             var layout = paneLayouts[projectID] ?? SessionPaneLayout()
@@ -2542,6 +2574,14 @@ final class AppModel: ObservableObject {
         }
         if forgetDurableChat { enqueueTranscriptRemoval(chatID: chatID) }
         enqueueDraftRemoval(chatID: chatID)
+    }
+
+    /// Stop the adapter without deleting the surface, transcript, or draft.
+    /// The conversation can be restarted in place, so ordinary run control no
+    /// longer has to go through the destructive close path.
+    func stopChat(_ chatID: String) {
+        guard let chat = chats.first(where: { $0.id == chatID }) else { return }
+        Task { _ = await chat.conversation.stop() }
     }
 
     func selectChat(_ chatID: String?) {
@@ -2705,11 +2745,20 @@ final class AppModel: ObservableObject {
 
     /// Jump from an inbox entry to its surface (chat or terminal session).
     func jumpToAttentionTarget(_ targetID: String) {
-        attentionCenter.clear(targetID: targetID)
         if chats.contains(where: { $0.id == targetID }) {
+            attentionCenter.clear(targetID: targetID)
             selectChat(targetID)
-        } else {
+        } else if sessions.contains(where: { $0.id == targetID }) {
+            attentionCenter.clear(targetID: targetID)
             Task { await select(targetID) }
+        } else if let mesh = meshes.first(where: { mesh in
+            mesh.id == targetID || mesh.columns.contains(where: { $0.id == targetID })
+        }) {
+            attentionCenter.clear(targetID: targetID)
+            selectMesh(mesh.id)
+        } else {
+            attentionCenter.clear(targetID: targetID)
+            ToastCenter.shared.show("That session is no longer open", style: .info)
         }
     }
 
@@ -3717,7 +3766,7 @@ final class AppModel: ObservableObject {
     /// an agent session, a submitted line (carriage return) opens an agent
     /// turn; the broker's quiet timer settles it back to idle.
     func sendInput(_ data: String, to terminalID: String) {
-        guard controlAvailable, isOwned(terminalID),
+        guard isOwned(terminalID),
               let record = sessions.first(where: { $0.id == terminalID }) else { return }
         let projectID = record.projectID
         trackTerminalDraftInput(data, terminalID: terminalID)
@@ -3725,12 +3774,71 @@ final class AppModel: ObservableObject {
             agentProfile(for: terminalID) != nil
                 || detectedAgentNamesByTerminalID[terminalID] != nil
         ) && data.contains("\r")
-        Task {
-            try? await controlClient.write(projectID: projectID, terminalID: terminalID, data: data)
-            if opensAgentTurn {
-                try? await controlClient.setAgentTurn(projectID: projectID, terminalID: terminalID, busy: true)
+        guard controlAvailable else {
+            reportTerminalInputFailure(terminalID)
+            return
+        }
+        terminalInputQueues[terminalID, default: []].append(PendingTerminalInput(
+            projectID: projectID,
+            data: data,
+            opensAgentTurn: opensAgentTurn
+        ))
+        guard terminalInputDrainTasks[terminalID] == nil else { return }
+        terminalInputDrainTasks[terminalID] = Task { [weak self] in
+            await self?.drainTerminalInputQueue(terminalID)
+        }
+    }
+
+    /// One consumer per PTY makes keyboard bytes FIFO by construction. The
+    /// previous fire-and-forget Task per key depended on actor scheduling order
+    /// and swallowed every mutation error.
+    private func drainTerminalInputQueue(_ terminalID: String) async {
+        defer { terminalInputDrainTasks[terminalID] = nil }
+        while !Task.isCancelled,
+              controlAvailable,
+              isOwned(terminalID),
+              var queue = terminalInputQueues[terminalID],
+              !queue.isEmpty {
+            let packet = queue.removeFirst()
+            terminalInputQueues[terminalID] = queue
+            do {
+                try await controlClient.write(
+                    projectID: packet.projectID,
+                    terminalID: terminalID,
+                    data: packet.data
+                )
+                if packet.opensAgentTurn {
+                    try? await controlClient.setAgentTurn(
+                        projectID: packet.projectID,
+                        terminalID: terminalID,
+                        busy: true
+                    )
+                }
+            } catch {
+                terminalInputQueues.removeValue(forKey: terminalID)
+                reportTerminalInputFailure(terminalID)
+                guard controlAvailable else { return }
+                controlAvailable = false
+                ownedTerminalIDs = []
+                connectionLost(error, generation: connectionGeneration)
+                return
             }
         }
+        if terminalInputQueues[terminalID]?.isEmpty == true {
+            terminalInputQueues.removeValue(forKey: terminalID)
+        }
+    }
+
+    private func reportTerminalInputFailure(_ terminalID: String) {
+        let now = Date()
+        if let last = terminalInputFailureNoticeAt[terminalID],
+           now.timeIntervalSince(last) < 2 { return }
+        terminalInputFailureNoticeAt[terminalID] = now
+        ToastCenter.shared.show(
+            "Terminal connection is recovering; input was not sent",
+            style: .error,
+            duration: 4
+        )
     }
 
     private func trackTerminalDraftInput(_ data: String, terminalID: String) {
@@ -3759,12 +3867,27 @@ final class AppModel: ObservableObject {
     }
 
     func resizeTerminal(_ terminalID: String, columns: Int, rows: Int) {
+        guard columns > 0, rows > 0 else { return }
+        desiredTerminalGeometry[terminalID] = DesktopTerminalGeometry(
+            columns: columns,
+            rows: rows
+        )
+        scheduleDesiredTerminalResize(terminalID)
+    }
+
+    private func scheduleDesiredTerminalResize(
+        _ terminalID: String,
+        force: Bool = false
+    ) {
         guard controlAvailable, isOwned(terminalID),
               !companionControlledTerminalIDs.contains(terminalID),
-              let record = sessions.first(where: { $0.id == terminalID }) else { return }
+              let record = sessions.first(where: { $0.id == terminalID }),
+              let geometry = desiredTerminalGeometry[terminalID] else { return }
         let projectID = record.projectID
-        let sizeKey = "\(columns)x\(rows)"
-        guard lastTerminalSize[terminalID] != sizeKey || terminalResizeTasks[terminalID] != nil else { return }
+        let sizeKey = geometry.key
+        guard force
+            || lastTerminalSize[terminalID] != sizeKey
+            || terminalResizeTasks[terminalID] != nil else { return }
         let generation = (terminalResizeGeneration[terminalID] ?? 0) + 1
         terminalResizeGeneration[terminalID] = generation
         terminalResizeTasks[terminalID]?.cancel()
@@ -3773,15 +3896,21 @@ final class AppModel: ObservableObject {
             // minimize, zoom, and equal-grid relayout. Send only the settled
             // latest size so stale async requests cannot arrive out of order and
             // make SwiftTerm reflow against yesterday's width.
-            try? await Task.sleep(nanoseconds: 40_000_000)
+            if !force {
+                try? await Task.sleep(nanoseconds: Self.terminalResizeDebounceNanoseconds)
+            }
             guard !Task.isCancelled, let self,
-                  self.terminalResizeGeneration[terminalID] == generation else { return }
+                  self.terminalResizeGeneration[terminalID] == generation,
+                  self.desiredTerminalGeometry[terminalID] == geometry,
+                  self.controlAvailable,
+                  self.isOwned(terminalID),
+                  !self.companionControlledTerminalIDs.contains(terminalID) else { return }
             do {
                 try await self.controlClient.resize(
                     projectID: projectID,
                     terminalID: terminalID,
-                    columns: columns,
-                    rows: rows
+                    columns: geometry.columns,
+                    rows: geometry.rows
                 )
                 guard self.terminalResizeGeneration[terminalID] == generation else { return }
                 self.lastTerminalSize[terminalID] = sizeKey
@@ -3806,8 +3935,14 @@ final class AppModel: ObservableObject {
     }
 
     func setCompanionControlActive(_ active: Bool, for terminal: BrokerTerminalRecord) {
-        if active { companionControlledTerminalIDs.insert(terminal.id) }
-        else { companionControlledTerminalIDs.remove(terminal.id) }
+        if active {
+            companionControlledTerminalIDs.insert(terminal.id)
+            terminalResizeTasks.removeValue(forKey: terminal.id)?.cancel()
+            terminalResizeGeneration[terminal.id, default: 0] += 1
+        } else {
+            companionControlledTerminalIDs.remove(terminal.id)
+            scheduleDesiredTerminalResize(terminal.id, force: true)
+        }
     }
 
     func companionWrite(_ data: String, to terminal: BrokerTerminalRecord) async throws {
@@ -3927,7 +4062,11 @@ final class AppModel: ObservableObject {
         refreshPersistedNavigationState(publish: false)
         terminalResizeTasks.removeValue(forKey: terminalID)?.cancel()
         terminalResizeGeneration.removeValue(forKey: terminalID)
+        desiredTerminalGeometry.removeValue(forKey: terminalID)
         lastTerminalSize.removeValue(forKey: terminalID)
+        terminalInputDrainTasks.removeValue(forKey: terminalID)?.cancel()
+        terminalInputQueues.removeValue(forKey: terminalID)
+        terminalInputFailureNoticeAt.removeValue(forKey: terminalID)
         ownedTerminalIDs.remove(terminalID)
         companionControlledTerminalIDs.remove(terminalID)
         terminalSurfaceDocuments.removeValue(forKey: terminalID)
@@ -3991,7 +4130,9 @@ final class AppModel: ObservableObject {
     func refreshInventory() async {
         refreshPersistedNavigationState(publish: false)
         guard connectionState.isConnected else { return }
-        if let status = try? await client.inventory() {
+        do {
+            let status = try await client.inventory()
+            consecutiveInventoryFailures = 0
             // `@Published` fires on every assignment regardless of equality, and
             // this runs on a 2.5s timer for the life of the app — assigning
             // unconditionally rebuilt the entire shell every tick even when the
@@ -4004,6 +4145,13 @@ final class AppModel: ObservableObject {
             if let activeBrokerUpgradeMonitor {
                 let next = await activeBrokerUpgradeMonitor.attemptUpgradeIfNeeded()
                 if next != brokerUpgradeState { brokerUpgradeState = next }
+            }
+        } catch {
+            consecutiveInventoryFailures += 1
+            if consecutiveInventoryFailures >= 3 {
+                consecutiveInventoryFailures = 0
+                connectionLost(error, generation: connectionGeneration)
+                return
             }
         }
         refreshBranches()
@@ -4049,6 +4197,7 @@ final class AppModel: ObservableObject {
     /// TTL so the inventory tick doesn't spawn a git process per 2.5s.
     @Published private(set) var branchesByCwd: [String: String] = [:]
     private var lastBranchScan = Date.distantPast
+    private var branchScanTask: Task<Void, Never>?
 
     func branch(for terminalID: String) -> String? {
         guard let cwd = persistedOwnedSessions.first(where: { $0.id == terminalID })?.cwd else { return nil }
@@ -4056,29 +4205,26 @@ final class AppModel: ObservableObject {
     }
 
     private func refreshBranches() {
-        guard Date().timeIntervalSince(lastBranchScan) > 10 else { return }
+        guard branchScanTask == nil,
+              Date().timeIntervalSince(lastBranchScan) > 10 else { return }
         lastBranchScan = Date()
         let cwds = Set(persistedOwnedSessions.map(\.cwd))
         guard !cwds.isEmpty else { return }
-        Task.detached(priority: .utility) { [weak self] in
+        branchScanTask = Task.detached(priority: .utility) { [weak self] in
             var result: [String: String] = [:]
             for cwd in cwds {
-                let process = Process()
-                process.executableURL = URL(fileURLWithPath: "/usr/bin/git")
-                process.arguments = ["rev-parse", "--abbrev-ref", "HEAD"]
-                process.currentDirectoryURL = URL(fileURLWithPath: cwd, isDirectory: true)
-                let pipe = Pipe()
-                process.standardOutput = pipe
-                process.standardError = FileHandle.nullDevice
-                guard (try? process.run()) != nil else { continue }
-                process.waitUntilExit()
-                guard process.terminationStatus == 0 else { continue }
-                let data = pipe.fileHandleForReading.readDataToEndOfFile()
-                let branch = String(decoding: data, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
-                if !branch.isEmpty { result[cwd] = branch }
+                guard !Task.isCancelled else { break }
+                if let branch = TerminalMetaService.gitBranch(
+                    at: URL(fileURLWithPath: cwd, isDirectory: true)
+                ) {
+                    result[cwd] = branch
+                }
             }
             let branches = result
-            await MainActor.run { [weak self] in self?.branchesByCwd = branches }
+            await MainActor.run { [weak self] in
+                self?.branchesByCwd = branches
+                self?.branchScanTask = nil
+            }
         }
     }
 
@@ -4101,9 +4247,23 @@ final class AppModel: ObservableObject {
     /// the terminals this app created in earlier runs. Registry entries from a
     /// different still-draining broker are retained; an authenticated broker
     /// owner capability can repair records lost during a profile switch.
-    private func restoreOwnedSessions(info: BrokerInfo) async {
+    private func restoreOwnedSessions(info: BrokerInfo, generation: Int) async {
         controlAvailable = false
         ownedTerminalIDs = []
+        await controlClient.setDisconnectHandler { [weak self] error in
+            Task { @MainActor in
+                guard let self, self.controlAvailable else { return }
+                self.controlAvailable = false
+                self.ownedTerminalIDs = []
+                for task in self.terminalResizeTasks.values { task.cancel() }
+                self.terminalResizeTasks.removeAll()
+                // The observer socket may still be streaming, but a full
+                // generation reconnect is the safest ownership reattach: it
+                // re-probes identity, restores both lanes, and never touches
+                // the detached broker's PTYs.
+                self.connectionLost(error, generation: generation)
+            }
+        }
         do {
             try await controlClient.connect(to: info, ownerID: sessionStore.ownerID())
         } catch {
@@ -4132,6 +4292,12 @@ final class AppModel: ObservableObject {
             }
         }
         ownedTerminalIDs = owned
+        // Layout may have reported its real size while inventory was visible
+        // but before ownership finished restoring. Those callbacks are retained
+        // above; ownership publication is the level-triggered flush point.
+        for terminalID in owned {
+            scheduleDesiredTerminalResize(terminalID, force: true)
+        }
     }
 
     /// App-quit path: detach so owned shells keep running on the broker, then
@@ -4141,6 +4307,7 @@ final class AppModel: ObservableObject {
         for stored in persistedOwnedSessions where ownedTerminalIDs.contains(stored.id) {
             try? await controlClient.detachOwner(projectID: stored.projectID, terminalID: stored.id)
         }
+        await controlClient.setDisconnectHandler(nil)
         await controlClient.disconnect()
         controlAvailable = false
     }
@@ -4157,12 +4324,20 @@ final class AppModel: ObservableObject {
         reconnectTask = nil
         inventoryRefreshTask?.cancel()
         inventoryRefreshTask = nil
+        consecutiveInventoryFailures = 0
+        branchScanTask?.cancel()
+        branchScanTask = nil
         for task in terminalResizeTasks.values { task.cancel() }
         terminalResizeTasks.removeAll()
         terminalResizeGeneration.removeAll()
         lastTerminalSize.removeAll()
+        for task in terminalInputDrainTasks.values { task.cancel() }
+        terminalInputDrainTasks.removeAll()
+        terminalInputQueues.removeAll()
+        terminalInputFailureNoticeAt.removeAll()
         cursorSaveTask?.cancel()
         cursorSaveTask = nil
+        await controlClient.setDisconnectHandler(nil)
         await persistCurrentCursor()
         await clearSplits()
         if usesVisualFixtureTransport {
@@ -4249,7 +4424,7 @@ final class AppModel: ObservableObject {
                 pid: hello.pid,
                 serverEnforcedObserver: hello.serverEnforcedObserver
             )
-            await restoreOwnedSessions(info: info)
+            await restoreOwnedSessions(info: info, generation: generation)
             startInventoryRefresh(generation: generation)
             // Prefer the in-memory selection, then the persisted one from the
             // last run (whole-app persistence), then the first session.

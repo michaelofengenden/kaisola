@@ -501,6 +501,34 @@ final class WorkspaceFilesTests: XCTestCase {
         XCTAssertEqual(FilePreviewContent.load(url: root.appendingPathComponent("missing.txt")), .unreadable)
     }
 
+    func testPreviewContentDecodesUnicodeAndCommonExportEncodingsWithoutTreatingBinaryAsText() throws {
+        let utf16 = root.appendingPathComponent("utf16.md")
+        try "# Héllo".data(using: .utf16)!.write(to: utf16)
+        XCTAssertEqual(FilePreviewContent.load(url: utf16), .markdown("# Héllo"))
+
+        let latin1 = root.appendingPathComponent("latin1.txt")
+        try Data([0x63, 0x61, 0x66, 0xE9]).write(to: latin1)
+        XCTAssertEqual(FilePreviewContent.load(url: latin1), .text("café"))
+
+        let nulBinary = root.appendingPathComponent("nul.bin")
+        try Data([0x61, 0x00, 0x62, 0x03, 0x7F]).write(to: nulBinary)
+        XCTAssertEqual(FilePreviewContent.load(url: nulBinary), .binary)
+
+        let notebook = root.appendingPathComponent("analysis.ipynb")
+        try #"{"cells":[]}"#.write(to: notebook, atomically: true, encoding: .utf8)
+        XCTAssertEqual(FilePreviewContent.load(url: notebook), .json(#"{"cells":[]}"#))
+    }
+
+    func testWorkspaceFileClipboardCopiesMarkdownSourceAndRejectsBinary() throws {
+        let markdown = root.appendingPathComponent("copy.md")
+        try "# Copy me\n\n`exact`".write(to: markdown, atomically: true, encoding: .utf8)
+        XCTAssertEqual(WorkspaceFileClipboard.contents(of: markdown), "# Copy me\n\n`exact`")
+
+        let binary = root.appendingPathComponent("copy.bin")
+        try Data([0x00, 0x01, 0x02]).write(to: binary)
+        XCTAssertNil(WorkspaceFileClipboard.contents(of: binary))
+    }
+
     func testDocxClassificationAndRichTextRoundTrip() throws {
         let file = root.appendingPathComponent("notes.docx")
         let source = NSAttributedString(string: "Editable native document")
@@ -1800,6 +1828,18 @@ final class WorkspaceFilesTests: XCTestCase {
         XCTAssertTrue(spans.contains { $0.role == .centered })
         XCTAssertGreaterThanOrEqual(spans.filter { $0.role == .syntax }.count, 6)
         XCTAssertEqual(source, #"<h1 align="center">Kaisola</h1> <strong>One workspace.</strong> <a href="https://kaisola.com">Website</a>"#)
+    }
+
+    func testMarkdownEditingStyleDoesNotHideOrdinaryLessThanProseAcrossLines() {
+        let source = "a < b and\nc > d"
+        let spans = MarkdownEditingStyle.spans(in: source)
+        XCTAssertFalse(spans.contains { $0.role == .syntax })
+
+        let html = "before <em>visible</em> after"
+        XCTAssertEqual(
+            MarkdownEditingStyle.spans(in: html).filter { $0.role == .syntax }.count,
+            2
+        )
     }
 
     @MainActor

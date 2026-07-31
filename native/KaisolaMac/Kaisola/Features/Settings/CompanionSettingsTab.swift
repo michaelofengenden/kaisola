@@ -7,11 +7,12 @@ struct CompanionSettingsTab: View {
     @ObservedObject private var host = CompanionHost.shared
     @State private var allowsTerminalControl = false
     @State private var operationError: String?
+    @State private var pendingRevocation: CompanionPairedDeviceRecord?
 
     var body: some View {
         ScrollView {
             VStack(spacing: 16) {
-                SettingsCard(title: "Nearby access", symbol: "iphone.and.arrow.forward") {
+                SettingsCard(title: "Nearby Access", symbol: "iphone.and.arrow.forward") {
                     SettingsRow(
                         title: "Kaisola Companion",
                         detail: "Available only while Kaisola is open",
@@ -62,7 +63,7 @@ struct CompanionSettingsTab: View {
                 }
 
                 if case .ready = host.state {
-                    SettingsCard(title: "Pair a device", symbol: "qrcode") {
+                    SettingsCard(title: "Pair a Device", symbol: "qrcode") {
                         SettingsRow(
                             title: "Allow terminal control",
                             detail: "Off gives this phone view-only access",
@@ -141,7 +142,7 @@ struct CompanionSettingsTab: View {
                     }
                 }
 
-                SettingsCard(title: "Paired devices", symbol: "checkmark.shield") {
+                SettingsCard(title: "Paired Devices", symbol: "checkmark.shield") {
                     if host.pairedDevices.isEmpty {
                         Text("No devices are paired with this Mac.")
                             .font(.callout)
@@ -156,7 +157,9 @@ struct CompanionSettingsTab: View {
                                 detail: capabilityDetail(device.capabilities),
                                 symbol: "laptopcomputer.and.iphone"
                             ) {
-                                Button("Revoke", role: .destructive) { revoke(device.id) }
+                                Button("Revoke", role: .destructive) {
+                                    pendingRevocation = device
+                                }
                                     .buttonStyle(.bordered)
                                     .controlSize(.small)
                             }
@@ -173,6 +176,23 @@ struct CompanionSettingsTab: View {
                 }
             }
             .padding(18)
+        }
+        .confirmationDialog(
+            "Revoke \(pendingRevocation?.displayName ?? "Device")?",
+            isPresented: Binding(
+                get: { pendingRevocation != nil },
+                set: { if !$0 { pendingRevocation = nil } }
+            ),
+            titleVisibility: .visible
+        ) {
+            Button("Revoke Device", role: .destructive) {
+                guard let device = pendingRevocation else { return }
+                pendingRevocation = nil
+                revoke(device.id)
+            }
+            Button("Cancel", role: .cancel) { pendingRevocation = nil }
+        } message: {
+            Text("This device will immediately lose access. Pairing it again requires a new single-use code and confirmation on both devices.")
         }
     }
 

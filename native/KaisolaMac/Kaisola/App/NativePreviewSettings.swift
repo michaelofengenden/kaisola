@@ -721,6 +721,52 @@ enum KaisolaVisualSystem {
     static let layoutDuration = 0.22
 }
 
+/// Low-opacity color recipe laid over AppKit vibrancy for the two large glass
+/// backdrops. White remains the dominant lift so navigation chrome feels clean
+/// rather than gray; accent and mesh are intentionally capped at a quiet wash.
+/// Keeping these values separate from the material makes the light/dark balance
+/// deterministic and gives appearance tests a stable contrast contract.
+struct GlassBackdropWash: Equatable, Sendable {
+    let baseWhiteOpacity: Double
+    let highlightWhiteOpacity: Double
+    let accentOpacity: Double
+    let secondaryAccentOpacity: Double
+
+    static func sidebar(isDark: Bool) -> GlassBackdropWash {
+        if isDark {
+            return GlassBackdropWash(
+                baseWhiteOpacity: 0.016,
+                highlightWhiteOpacity: 0.048,
+                accentOpacity: 0.044,
+                secondaryAccentOpacity: 0.024
+            )
+        }
+        return GlassBackdropWash(
+            baseWhiteOpacity: 0.028,
+            highlightWhiteOpacity: 0.082,
+            accentOpacity: 0.034,
+            secondaryAccentOpacity: 0.018
+        )
+    }
+
+    static func workspace(isDark: Bool) -> GlassBackdropWash {
+        if isDark {
+            return GlassBackdropWash(
+                baseWhiteOpacity: 0.012,
+                highlightWhiteOpacity: 0.038,
+                accentOpacity: 0.035,
+                secondaryAccentOpacity: 0.020
+            )
+        }
+        return GlassBackdropWash(
+            baseWhiteOpacity: 0.022,
+            highlightWhiteOpacity: 0.064,
+            accentOpacity: 0.030,
+            secondaryAccentOpacity: 0.016
+        )
+    }
+}
+
 private struct KaisolaControlSurfaceModifier: ViewModifier {
     let active: Bool
     let tint: Color?
@@ -842,13 +888,16 @@ struct SidebarBackdropView: View {
             if reduceTransparency {
                 Color(nsColor: .controlBackgroundColor)
             } else {
+                let wash = GlassBackdropWash.sidebar(isDark: colorScheme == .dark)
                 ZStack {
                     NativeVisualEffectView(material: .sidebar)
+                    Color.white.opacity(wash.baseWhiteOpacity)
                     LinearGradient(
                         colors: [
-                            Color.white.opacity(colorScheme == .dark ? 0.035 : 0.065),
-                            Color.accentColor.opacity(colorScheme == .dark ? 0.05 : 0.02),
-                            Color.clear,
+                            Color.white.opacity(wash.highlightWhiteOpacity),
+                            Color.accentColor.opacity(wash.accentOpacity),
+                            WorkspacePalette.mesh.opacity(wash.secondaryAccentOpacity),
+                            Color.white.opacity(wash.baseWhiteOpacity * 0.5),
                         ],
                         startPoint: .topLeading,
                         endPoint: .bottomTrailing
@@ -971,6 +1020,7 @@ final class DesktopTintProvider: ObservableObject {
 struct WorkspaceBackdropView: View {
     @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
     @Environment(\.colorScheme) private var colorScheme
+    @Environment(\.colorSchemeContrast) private var accessibilityContrast
     @StateObject private var desktopTint = DesktopTintProvider()
     let mode: WorkspaceBackdropMode
 
@@ -991,17 +1041,23 @@ struct WorkspaceBackdropView: View {
             if reduceTransparency {
                 Color(nsColor: .windowBackgroundColor)
             } else {
+                let wash = GlassBackdropWash.workspace(isDark: colorScheme == .dark)
                 ZStack {
                     NativeVisualEffectView(material: .underWindowBackground)
+                    Color.white.opacity(wash.baseWhiteOpacity)
                     LinearGradient(
                         colors: [
-                            Color.accentColor.opacity(0.028),
-                            Color.clear,
-                            Color.purple.opacity(0.018),
+                            Color.white.opacity(wash.highlightWhiteOpacity),
+                            Color.accentColor.opacity(wash.accentOpacity),
+                            WorkspacePalette.mesh.opacity(wash.secondaryAccentOpacity),
+                            Color.white.opacity(wash.baseWhiteOpacity * 0.5),
                         ],
                         startPoint: .topLeading,
                         endPoint: .bottomTrailing
                     )
+                    if accessibilityContrast == .increased {
+                        Color(nsColor: .windowBackgroundColor).opacity(0.18)
+                    }
                 }
             }
         case .tinted:

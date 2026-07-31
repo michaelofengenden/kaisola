@@ -14,6 +14,64 @@ final class NativeTerminalInteractionTests: XCTestCase {
         "\u{1B}]133;\(value)\u{7}"
     }
 
+    func testSurfaceLeavesOptionAvailableToInternationalKeyboardLayouts() {
+        let view = OwnedTerminalView(
+            frame: .zero,
+            font: NSFont.monospacedSystemFont(ofSize: 13, weight: .regular)
+        )
+        view.optionAsMetaKey = true
+        NativeTerminalSurface.configureKeyboardInput(on: view)
+        XCTAssertFalse(view.optionAsMetaKey)
+    }
+
+    func testTerminalGeometryIgnoresZeroDeduplicatesLayoutAndFinishesWide() {
+        let coordinator = NativeTerminalSurface.Coordinator()
+        let view = OwnedTerminalView(
+            frame: .zero,
+            font: NSFont.monospacedSystemFont(ofSize: 13, weight: .regular)
+        )
+        view.terminalDelegate = coordinator
+        var delivered: [(columns: Int, rows: Int)] = []
+        coordinator.setResizeHandler({ delivered.append(($0, $1)) }, synchronizing: view)
+
+        XCTAssertTrue(delivered.isEmpty, "The representable's zero placeholder is not PTY geometry.")
+        view.setFrameSize(NSSize(width: 150, height: 110))
+        let narrow = view.getTerminal().getDims()
+        coordinator.synchronizeCurrentGeometry(from: view)
+        coordinator.synchronizeCurrentGeometry(from: view)
+        XCTAssertEqual(delivered.count, 1, "Repeated usable-layout callbacks must be deduplicated.")
+        XCTAssertEqual(delivered.last?.columns, narrow.cols)
+        XCTAssertEqual(delivered.last?.rows, narrow.rows)
+
+        view.setFrameSize(NSSize(width: 760, height: 360))
+        let wide = view.getTerminal().getDims()
+        coordinator.synchronizeCurrentGeometry(from: view)
+        XCTAssertEqual(delivered.count, 2)
+        XCTAssertEqual(delivered.last?.columns, wide.cols)
+        XCTAssertEqual(delivered.last?.rows, wide.rows)
+        XCTAssertGreaterThan(wide.cols, narrow.cols)
+    }
+
+    func testResizeCapabilityActivationForceSynchronizesUnchangedCachedGeometry() {
+        let coordinator = NativeTerminalSurface.Coordinator()
+        let view = OwnedTerminalView(
+            frame: NSRect(x: 0, y: 0, width: 640, height: 300),
+            font: NSFont.monospacedSystemFont(ofSize: 13, weight: .regular)
+        )
+        view.terminalDelegate = coordinator
+        var first: [(Int, Int)] = []
+        coordinator.setResizeHandler({ first.append(($0, $1)) }, synchronizing: view)
+        XCTAssertEqual(first.count, 1)
+
+        coordinator.prepareForRetention()
+        var reattached: [(Int, Int)] = []
+        coordinator.setResizeHandler({ reattached.append(($0, $1)) }, synchronizing: view)
+        let dimensions = view.getTerminal().getDims()
+        XCTAssertEqual(reattached.count, 1, "Reattachment must reconcile even when AppKit keeps identical bounds.")
+        XCTAssertEqual(reattached.first?.0, dimensions.cols)
+        XCTAssertEqual(reattached.first?.1, dimensions.rows)
+    }
+
     func testRepaintHeavyOSCTitlesDebounceAfterTheTerminalFeedTurn() async {
         let coordinator = NativeTerminalSurface.Coordinator()
         let view = ReadOnlyTerminalView(
@@ -931,6 +989,64 @@ final class NativeTerminalInteractionTests: XCTestCase {
         // them into an onInput string bound to the broker controller write.
         view.send(source: view.getTerminal(), data: ArraySlice(Array("ls -la\r".utf8)))
         XCTAssertEqual(captured, ["ls -la\r"])
+    }
+
+    func testShiftEnterRequiresExactlyShift() {
+        XCTAssertTrue(OwnedTerminalView.shouldHandleShiftEnter(
+            keyCode: 36,
+            modifierFlags: .shift
+        ))
+        XCTAssertFalse(OwnedTerminalView.shouldHandleShiftEnter(
+            keyCode: 36,
+            modifierFlags: [.shift, .command]
+        ))
+        XCTAssertFalse(OwnedTerminalView.shouldHandleShiftEnter(
+            keyCode: 36,
+            modifierFlags: [.shift, .control]
+        ))
+        XCTAssertFalse(OwnedTerminalView.shouldHandleShiftEnter(
+            keyCode: 36,
+            modifierFlags: [.shift, .option]
+        ))
+        XCTAssertFalse(OwnedTerminalView.shouldHandleShiftEnter(
+            keyCode: 76,
+            modifierFlags: .shift
+        ), "The keypad Enter key keeps its native terminal behavior.")
+    }
+
+    func testBellCooldownCollapsesOneTUIPromptBurst() {
+        let cooldown = NativeTerminalSurface.Coordinator.bellNotificationCooldown
+        XCTAssertTrue(NativeTerminalSurface.Coordinator.shouldDeliverBell(
+            lastDeliveredAt: nil,
+            now: 10
+        ))
+        XCTAssertFalse(NativeTerminalSurface.Coordinator.shouldDeliverBell(
+            lastDeliveredAt: 10,
+            now: 10 + cooldown / 2
+        ))
+        XCTAssertTrue(NativeTerminalSurface.Coordinator.shouldDeliverBell(
+            lastDeliveredAt: 10,
+            now: 10 + cooldown
+        ))
+    }
+
+    func testHistoricalBellReplayIsSilentAndLiveBellIsDeliveredOnce() {
+        let coordinator = NativeTerminalSurface.Coordinator()
+        var bellCount = 0
+        coordinator.onBell = { bellCount += 1 }
+        let view = ReadOnlyTerminalView(
+            frame: NSRect(x: 0, y: 0, width: 640, height: 320),
+            font: NSFont.monospacedSystemFont(ofSize: 13, weight: .regular)
+        )
+        view.terminalDelegate = coordinator
+
+        coordinator.apply(output: "\u{7}", epoch: "bell", endOffset: 1, to: view)
+        XCTAssertEqual(bellCount, 0, "Retained BEL bytes must never create a fresh alert.")
+
+        coordinator.apply(output: "\u{7}\u{7}", epoch: "bell", endOffset: 2, to: view)
+        XCTAssertEqual(bellCount, 1)
+        coordinator.apply(output: "\u{7}\u{7}\u{7}", epoch: "bell", endOffset: 3, to: view)
+        XCTAssertEqual(bellCount, 1, "A rapid BEL repaint burst should remain one attention signal.")
     }
 
     /// A pane with no agent — a plain shell — keeps receiving shell-quoted

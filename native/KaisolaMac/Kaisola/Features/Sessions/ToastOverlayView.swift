@@ -1,3 +1,4 @@
+import AppKit
 import SwiftUI
 
 /// The in-window toast strip: a bottom-center stack of auto-dismissing capsules
@@ -9,24 +10,79 @@ import SwiftUI
 /// capsule to dismiss it early.
 struct ToastOverlayView: View {
     @ObservedObject private var center = ToastCenter.shared
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     var body: some View {
         VStack(spacing: 8) {
             ForEach(center.toasts) { toast in
-                ToastCapsule(toast: toast)
-                    .contentShape(Capsule())
-                    .onTapGesture { center.dismiss(toast.id) }
-                    .allowsHitTesting(true)
+                Button {
+                    center.dismiss(toast.id)
+                } label: {
+                    ToastCapsule(toast: toast)
+                        .contentShape(Capsule())
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel(toast.message)
+                .accessibilityHint("Dismiss notification")
+                .transition(reduceMotion
+                    ? .opacity
+                    : .move(edge: .bottom).combined(with: .opacity))
+                .allowsHitTesting(true)
             }
         }
         .padding(.bottom, 28)
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottom)
-        .animation(.spring(response: 0.34, dampingFraction: 0.85), value: center.toasts)
+        .animation(
+            reduceMotion
+                ? .easeOut(duration: KaisolaVisualSystem.stateDuration)
+                : .spring(response: 0.34, dampingFraction: 0.85),
+            value: center.toasts
+        )
+        .onAppear { announceNewToasts(center.toasts) }
+        .onChange(of: center.toasts) { _, toasts in announceNewToasts(toasts) }
+    }
+
+    private func announceNewToasts(_ toasts: [ToastCenter.Toast]) {
+        toasts.forEach(ToastAccessibilityAnnouncements.postIfNeeded)
+    }
+}
+
+/// `ToastCenter` is app-wide while every window renders its own overlay. Keep
+/// announcement de-duplication app-wide too, or VoiceOver would speak the same
+/// transient result once per open window.
+@MainActor
+private enum ToastAccessibilityAnnouncements {
+    private static let retentionLimit = 64
+    private static var announcedIDs: Set<UUID> = []
+    private static var announcementOrder: [UUID] = []
+
+    static func postIfNeeded(_ toast: ToastCenter.Toast) {
+        guard announcedIDs.insert(toast.id).inserted else { return }
+        announcementOrder.append(toast.id)
+        if announcementOrder.count > retentionLimit {
+            let expiredCount = announcementOrder.count - retentionLimit
+            let expired = Array(announcementOrder.prefix(expiredCount))
+            announcementOrder.removeFirst(expiredCount)
+            announcedIDs.subtract(expired)
+        }
+
+        let priority: NSAccessibilityPriorityLevel = switch toast.style {
+        case .error: .high
+        case .info, .success: .medium
+        }
+        NSAccessibility.post(
+            element: NSApplication.shared,
+            notification: .announcementRequested,
+            userInfo: [
+                .announcement: toast.message,
+                .priority: priority.rawValue,
+            ]
+        )
     }
 }
 
 /// One capsule. Icon and tint carry the meaning: neutral info, green success,
-/// orange failure. The move+fade transition rides the container's animation.
+/// orange failure. The parent chooses a motion-safe transition.
 private struct ToastCapsule: View {
     let toast: ToastCenter.Toast
 
@@ -44,7 +100,6 @@ private struct ToastCapsule: View {
         .background(.regularMaterial, in: Capsule())
         .overlay(Capsule().strokeBorder(.primary.opacity(0.06)))
         .shadow(color: .black.opacity(0.22), radius: 12, y: 4)
-        .transition(.move(edge: .bottom).combined(with: .opacity))
     }
 
     private var symbol: String {

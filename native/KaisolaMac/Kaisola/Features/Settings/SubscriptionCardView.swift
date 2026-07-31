@@ -172,8 +172,17 @@ struct SubscriptionCardView: View {
 
     /// Says how old the numbers are rather than hiding that they are cached.
     private var stalenessCaption: String? {
-        guard let updatedAt = usage?.updatedAt, updatedAt > 0 else { return nil }
-        let elapsed = now.timeIntervalSince(Date(timeIntervalSince1970: updatedAt))
+        Self.stalenessCaption(updatedAt: usage?.updatedAt, now: now)
+    }
+
+    /// Provider helpers report `updatedAt` in epoch milliseconds, while older
+    /// cached fixtures used epoch seconds. Accept both so a restored card never
+    /// loses its only indication that the numbers are stale. `resetsAt` remains
+    /// epoch seconds and is handled separately by `SubscriptionUsageMeter`.
+    static func stalenessCaption(updatedAt: Double?, now: Date) -> String? {
+        guard let updatedAt, updatedAt > 0, updatedAt.isFinite else { return nil }
+        let epochSeconds = updatedAt > 10_000_000_000 ? updatedAt / 1_000 : updatedAt
+        let elapsed = now.timeIntervalSince(Date(timeIntervalSince1970: epochSeconds))
         guard elapsed > 90 else { return nil }
         if elapsed < 3_600 { return "\(Int(elapsed / 60))m ago" }
         if elapsed < 86_400 { return "\(Int(elapsed / 3_600))h ago" }

@@ -28,7 +28,7 @@ struct SignInCardView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
-            Label("Sign in to your CLIs", systemImage: "person.badge.key")
+            Label("Sign In to Your CLIs", systemImage: "person.badge.key")
                 .font(.headline)
             Text("Kaisola drives your installed Claude and Codex CLIs — sign in once per account directory. Sign-in runs in a real terminal here: a device-code flow prints in the terminal, and your browser may pop to finish it.")
                 .font(.callout)
@@ -38,13 +38,13 @@ struct SignInCardView: View {
                 Button {
                     runInTerminal("claude setup-token")
                 } label: {
-                    Label("Sign in to Claude", systemImage: "sparkle")
+                    Label("Sign In to Claude", systemImage: "sparkle")
                 }
                 .buttonStyle(.borderedProminent)
                 Button {
                     runInTerminal("codex login")
                 } label: {
-                    Label("Sign in to Codex", systemImage: "chevron.left.forwardslash.chevron.right")
+                    Label("Sign In to Codex", systemImage: "chevron.left.forwardslash.chevron.right")
                 }
                 .buttonStyle(.borderedProminent)
             }

@@ -26,7 +26,7 @@ struct CustomAgentsSection: View {
     @State private var newCommand = ""
 
     var body: some View {
-        Section("Custom agents") {
+        Section("Custom Agents") {
             if specs.isEmpty {
                 Text("Add any terminal CLI — it appears in the New menu and launches into an owned terminal.")
                     .font(.caption).foregroundStyle(.secondary)

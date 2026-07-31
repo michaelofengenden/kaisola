@@ -110,6 +110,48 @@ final class TerminalImageDropTests: XCTestCase {
         XCTAssertTrue(text.hasPrefix("'"), "got \(text)")
     }
 
+    func testFailedClaudeAttachmentCarriesVisibleFallbackWarning() {
+        let plan = TerminalImageDrop.insertionPlan(
+            for: [screenshot()],
+            syntax: .claudeMention,
+            stage: { _ in nil }
+        )
+
+        XCTAssertEqual(plan.unattachedClaudeImageCount, 1)
+        XCTAssertEqual(
+            plan.warningMessage,
+            "Image wasn’t attached to Claude — the file path was pasted instead."
+        )
+        XCTAssertTrue(plan.text.hasPrefix("'"))
+    }
+
+    func testIntentionalPathInsertionNeverClaimsAttachmentFailure() {
+        let plan = TerminalImageDrop.insertionPlan(
+            for: [screenshot()],
+            syntax: .pathOnly,
+            stage: { _ in XCTFail("Path-only syntax must not stage"); return nil }
+        )
+
+        XCTAssertEqual(plan.unattachedClaudeImageCount, 0)
+        XCTAssertNil(plan.warningMessage)
+    }
+
+    func testMixedClaudeDropCountsOnlyImagesThatFailedToStage() {
+        let staged = URL(fileURLWithPath: "/staged/attached.png")
+        let failed = screenshot("failed.png")
+        let attached = screenshot("attached.png")
+        let plan = TerminalImageDrop.insertionPlan(
+            for: [failed, attached, URL(fileURLWithPath: "/tmp/notes.txt")],
+            syntax: .claudeMention,
+            stage: { $0 == failed ? nil : staged }
+        )
+
+        XCTAssertEqual(plan.unattachedClaudeImageCount, 1)
+        XCTAssertNotNil(plan.warningMessage)
+        XCTAssertTrue(plan.text.contains("@/staged/attached.png"))
+        XCTAssertTrue(plan.text.contains("'/Users/m/Desktop/failed.png'"))
+    }
+
     func testMixedDropMentionsOnlyTheImage() {
         let staged = URL(fileURLWithPath: "/staged/shot-1.png")
         let text = TerminalImageDrop.insertionText(

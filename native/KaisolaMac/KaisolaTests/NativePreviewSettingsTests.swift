@@ -417,6 +417,34 @@ final class NativePreviewSettingsTests: XCTestCase {
         XCTAssertEqual(TerminalPaletteMode.native.title, "macOS Terminal")
     }
 
+    func testGlassBackdropWashStaysWhiteLedAndRestrained() {
+        let recipes = [
+            GlassBackdropWash.sidebar(isDark: false),
+            GlassBackdropWash.sidebar(isDark: true),
+            GlassBackdropWash.workspace(isDark: false),
+            GlassBackdropWash.workspace(isDark: true),
+        ]
+
+        for recipe in recipes {
+            XCTAssertGreaterThan(recipe.baseWhiteOpacity, 0)
+            XCTAssertGreaterThan(recipe.highlightWhiteOpacity, recipe.accentOpacity)
+            XCTAssertLessThanOrEqual(recipe.accentOpacity, 0.05)
+            XCTAssertLessThanOrEqual(recipe.secondaryAccentOpacity, 0.025)
+        }
+    }
+
+    func testGlassBackdropWashUsesAQuieterDarkModeLift() {
+        let lightSidebar = GlassBackdropWash.sidebar(isDark: false)
+        let darkSidebar = GlassBackdropWash.sidebar(isDark: true)
+        let lightWorkspace = GlassBackdropWash.workspace(isDark: false)
+        let darkWorkspace = GlassBackdropWash.workspace(isDark: true)
+
+        XCTAssertGreaterThan(lightSidebar.baseWhiteOpacity, darkSidebar.baseWhiteOpacity)
+        XCTAssertGreaterThan(lightSidebar.highlightWhiteOpacity, darkSidebar.highlightWhiteOpacity)
+        XCTAssertGreaterThan(lightWorkspace.baseWhiteOpacity, darkWorkspace.baseWhiteOpacity)
+        XCTAssertGreaterThan(lightWorkspace.highlightWhiteOpacity, darkWorkspace.highlightWhiteOpacity)
+    }
+
     func testTerminalPaneGridKeepsSessionsReadable() {
         XCTAssertEqual(TerminalPaneGrid.columns(for: []), [])
         XCTAssertEqual(TerminalPaneGrid.columns(for: ["a"]), [["a"]])

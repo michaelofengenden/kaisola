@@ -51,6 +51,10 @@ actor AcpClient {
     private var pending: [Int: CheckedContinuation<JSONValue, any Error>] = [:]
     private var nextRequestID = 0
     private var readerTask: Task<Void, Never>?
+    /// Invalidates callbacks that were awaiting a user decision when an adapter
+    /// exits or a client is stopped/restarted. Without this guard, a resumed
+    /// permission task could write its JSON-RPC response into the next adapter.
+    private var connectionGeneration: UInt64 = 0
     private var sessionID: String?
     private var capabilities = AcpAgentCapabilities()
     private var permissionCounter = 0
@@ -59,6 +63,11 @@ actor AcpClient {
         case cancelled
     }
     private var permissionWaiters: [Int: CheckedContinuation<PermissionResolution, Never>] = [:]
+    /// A permission event is delivered synchronously, so a fast policy/UI can
+    /// answer before the continuation task gets its first actor turn. Track the
+    /// request first and retain that early resolution instead of dropping it.
+    private var activePermissionIDs: Set<Int> = []
+    private var earlyPermissionResolutions: [Int: PermissionResolution] = [:]
     /// Host for agent-requested terminals (`terminal/create` …).
     private let terminalHost = AcpTerminalHost()
     /// The session workspace; fs/terminal callbacks are confined inside it.
@@ -96,6 +105,10 @@ actor AcpClient {
         mcpServers: [JSONValue],
         resumeSessionID: String? = nil
     ) async throws -> AcpSessionInfo {
+        connectionGeneration &+= 1
+        decoder = BrokerLineFrameDecoder(maximumFrameBytes: 64 * 1_024 * 1_024)
+        sessionID = nil
+        cancelPermissionRequests()
         workspaceRoot = (cwd as NSString).standardizingPath
         do {
             try await transport.start(command: command, arguments: arguments, environment: environment, cwd: cwd)
@@ -324,24 +337,40 @@ actor AcpClient {
 
     /// Resolve a pending permission request with the user's chosen option.
     func resolvePermission(id: Int, optionID: String) {
-        permissionWaiters.removeValue(forKey: id)?.resume(returning: .selected(optionID))
+        guard activePermissionIDs.contains(id) else { return }
+        let resolution = PermissionResolution.selected(optionID)
+        if let waiter = permissionWaiters.removeValue(forKey: id) {
+            waiter.resume(returning: resolution)
+        } else {
+            earlyPermissionResolutions[id] = resolution
+        }
     }
 
     func stop() async {
+        connectionGeneration &+= 1
         let reader = readerTask
         readerTask = nil
         reader?.cancel()
+        cancelPermissionRequests()
         await transport.terminate()
         await reader?.value
         await terminalHost.releaseAll()
-        cancelPermissionRequests()
         for continuation in pending.values { continuation.resume(throwing: AcpClientError.notRunning) }
         pending.removeAll()
+        sessionID = nil
+        workspaceRoot = nil
+        capabilities = AcpAgentCapabilities()
     }
 
     private func cancelPermissionRequests() {
-        for waiter in permissionWaiters.values { waiter.resume(returning: .cancelled) }
-        permissionWaiters.removeAll()
+        let ids = activePermissionIDs
+        activePermissionIDs.removeAll()
+        for id in ids {
+            earlyPermissionResolutions.removeValue(forKey: id)
+            if let waiter = permissionWaiters.removeValue(forKey: id) {
+                waiter.resume(returning: .cancelled)
+            }
+        }
     }
 
     // MARK: - MCP filtering (mirrors acp.cjs sessionMcpServers)
@@ -430,6 +459,10 @@ actor AcpClient {
             while !Task.isCancelled {
                 guard let data = try await transport.receive(maximumBytes: 256 * 1_024) else {
                     let code = await transport.exitCode() ?? 0
+                    connectionGeneration &+= 1
+                    cancelPermissionRequests()
+                    sessionID = nil
+                    workspaceRoot = nil
                     eventHandler?(.exited(code: code))
                     for continuation in pending.values { continuation.resume(throwing: AcpClientError.adapterExited(code: code)) }
                     pending.removeAll()
@@ -445,7 +478,14 @@ actor AcpClient {
                 decoder = active
             }
         } catch {
-            if !Task.isCancelled { eventHandler?(.error(error.localizedDescription)) }
+            guard !Task.isCancelled else { return }
+            connectionGeneration &+= 1
+            cancelPermissionRequests()
+            sessionID = nil
+            workspaceRoot = nil
+            for continuation in pending.values { continuation.resume(throwing: error) }
+            pending.removeAll()
+            eventHandler?(.error(error.localizedDescription))
         }
     }
 
@@ -705,14 +745,25 @@ actor AcpClient {
                 kind: o["kind"]?.stringValue ?? "allow"
             )
         }
+        activePermissionIDs.insert(localID)
+        let generation = connectionGeneration
         eventHandler?(.permission(AcpPermissionRequest(
             id: localID, sessionID: sessionID, title: title, options: options,
             kind: kind, paths: locationPaths + diffPaths
         )))
         Task {
             let resolution = await withCheckedContinuation { (continuation: CheckedContinuation<PermissionResolution, Never>) in
-                permissionWaiters[localID] = continuation
+                if let early = earlyPermissionResolutions.removeValue(forKey: localID) {
+                    continuation.resume(returning: early)
+                } else if activePermissionIDs.contains(localID) {
+                    permissionWaiters[localID] = continuation
+                } else {
+                    continuation.resume(returning: .cancelled)
+                }
             }
+            activePermissionIDs.remove(localID)
+            earlyPermissionResolutions.removeValue(forKey: localID)
+            guard connectionGeneration == generation else { return }
             let outcome: JSONValue
             switch resolution {
             case let .selected(optionID):

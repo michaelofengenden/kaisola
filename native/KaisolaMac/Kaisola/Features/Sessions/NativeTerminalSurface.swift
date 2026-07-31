@@ -69,6 +69,9 @@ struct NativeTerminalSurface: NSViewRepresentable {
     var onResize: ((_ columns: Int, _ rows: Int) -> Void)? = nil
     /// Live OSC title changes (auto-naming owned sessions).
     var onTitleChange: ((String) -> Void)? = nil
+    /// Live BEL from the PTY. Historical replay is intentionally suppressed by
+    /// the coordinator so an old bell never resurrects an attention alert.
+    var onBell: (() -> Void)? = nil
     /// Invoked when the user reaches the oldest row SwiftTerm can render and
     /// deliberately scrolls upward again. The host opens the immutable broker
     /// transcript from there; historical ANSI is never prepended into the live
@@ -79,7 +82,8 @@ struct NativeTerminalSurface: NSViewRepresentable {
         // Claim the retained pair here, before `makeNSView`, so the view and the
         // render state that describes it can never be mismatched. See
         // `TerminalSurfaceCache` for why they must move together.
-        if let sessionID, let claimed = TerminalSurfaceCache.shared.claim(sessionID: sessionID) {
+        if let sessionID,
+           let claimed = TerminalSurfaceCache.shared.claim(sessionID: sessionID, isOwned: isOwned) {
             claimed.coordinator.reusedView = claimed.view
             return claimed.coordinator
         }
@@ -91,6 +95,8 @@ struct NativeTerminalSurface: NSViewRepresentable {
         // the view and its render state so returning to this project re-attaches
         // the already-parsed terminal instead of replaying the transcript.
         guard let sessionID = coordinator.retainedSessionID else { return }
+        coordinator.prepareForRetention()
+        view.onHistoryBoundary = nil
         TerminalSurfaceCache.shared.store(
             sessionID: sessionID,
             view: view,
@@ -109,6 +115,11 @@ struct NativeTerminalSurface: NSViewRepresentable {
         let view: ReadOnlyTerminalView = isOwned
             ? OwnedTerminalView(frame: .zero, font: font)
             : ReadOnlyTerminalView(frame: .zero, font: font)
+        // SwiftTerm's overlay scroller follows the system auto-hide policy and
+        // can therefore make a scrollable terminal look as though it has no
+        // scrollbar. Its legacy style is still a native NSScroller, but keeps
+        // the track visible like the standalone Terminal app.
+        view.scrollerStyle = .legacy
         view.lineSpacing = CGFloat(NativePreviewSettings.clampedTerminalLineSpacing(lineSpacing))
         // SwiftTerm's default is 500 lines — about a dozen screens — which is
         // why scrolling up appeared to just stop. The Electron terminal this
@@ -122,10 +133,7 @@ struct NativeTerminalSurface: NSViewRepresentable {
         view.configureTerminalTheme(light: lightSurface, mode: paletteMode)
         view.allowMouseReporting = isOwned
         view.configureLinkInteraction()
-        // Match the active macOS Terminal "Basic" profile: Option sends Meta
-        // for shell/agent word navigation instead of silently diverging from
-        // the user's standalone terminal behavior.
-        view.optionAsMetaKey = true
+        Self.configureKeyboardInput(on: view)
         view.agentLaunchCommand = agentLaunchCommand
         view.onHistoryBoundary = onHistoryBoundary
         view.setAccessibilityLabel(isOwned ? "Terminal" : "Read-only terminal output")
@@ -135,10 +143,12 @@ struct NativeTerminalSurface: NSViewRepresentable {
             guard let view, let coordinator else { return }
             coordinator.flushPendingInitialRender(to: view)
             coordinator.repinAfterLayout(view)
+            coordinator.synchronizeCurrentGeometry(from: view)
         }
         context.coordinator.onInput = onInput
-        context.coordinator.onResize = onResize
+        context.coordinator.setResizeHandler(onResize, synchronizing: view)
         context.coordinator.onTitleChange = onTitleChange
+        context.coordinator.onBell = onBell
         context.coordinator.setBaseWorkingDirectory(workingDirectory)
         context.coordinator.apply(
             scrollback: scrollback ?? TerminalScrollback(output),
@@ -157,10 +167,11 @@ struct NativeTerminalSurface: NSViewRepresentable {
     /// applies any delta that arrived in the meantime.
     private func configureReusedView(_ view: ReadOnlyTerminalView, context: Context) {
         let coordinator = context.coordinator
+        view.scrollerStyle = .legacy
         view.terminalDelegate = coordinator
         view.configureTerminalTheme(light: lightSurface, mode: paletteMode)
         view.allowMouseReporting = isOwned
-        view.optionAsMetaKey = true
+        Self.configureKeyboardInput(on: view)
         view.agentLaunchCommand = agentLaunchCommand
         view.onHistoryBoundary = onHistoryBoundary
         view.configureAdvertisedGraphicsCapabilities()
@@ -169,18 +180,20 @@ struct NativeTerminalSurface: NSViewRepresentable {
             guard let view, let coordinator else { return }
             coordinator.flushPendingInitialRender(to: view)
             coordinator.repinAfterLayout(view)
+            coordinator.synchronizeCurrentGeometry(from: view)
         }
         coordinator.onInput = onInput
-        coordinator.onResize = onResize
+        coordinator.setResizeHandler(onResize, synchronizing: view)
         coordinator.onTitleChange = onTitleChange
+        coordinator.onBell = onBell
         coordinator.setBaseWorkingDirectory(workingDirectory)
     }
 
     func updateNSView(_ view: ReadOnlyTerminalView, context: Context) {
-        let becameInteractive = context.coordinator.onResize == nil && onResize != nil
         context.coordinator.onInput = onInput
-        context.coordinator.onResize = onResize
+        context.coordinator.setResizeHandler(onResize, synchronizing: view)
         context.coordinator.onTitleChange = onTitleChange
+        context.coordinator.onBell = onBell
         context.coordinator.setBaseWorkingDirectory(workingDirectory)
         view.agentLaunchCommand = agentLaunchCommand
         view.onHistoryBoundary = onHistoryBoundary
@@ -206,17 +219,19 @@ struct NativeTerminalSurface: NSViewRepresentable {
             surfaceDelta: surfaceDelta,
             to: view
         )
-        // A cached terminal can become active after the window changed size.
-        // Synchronize its live PTY once without reconstructing or replaying the
-        // surface, so the first command uses the dimensions already on screen.
-        if becameInteractive, view.hasUsableRenderGeometry {
-            let dimensions = view.getTerminal().getDims()
-            onResize?(dimensions.cols, dimensions.rows)
-        }
     }
 
     private static func themeKey(light: Bool, mode: TerminalPaletteMode) -> String {
         "\(mode.rawValue):\(light ? "light" : "dark")"
+    }
+
+    /// Keep Option available to the active keyboard layout. Hard-wiring it to
+    /// Meta turns international-layout characters such as @, brackets, braces,
+    /// pipes, tildes, and dead-key accents into escape sequences. A future user
+    /// preference may opt into Meta explicitly; the safe native default is off.
+    @MainActor
+    static func configureKeyboardInput(on view: ReadOnlyTerminalView) {
+        view.optionAsMetaKey = false
     }
 
     @MainActor
@@ -224,6 +239,9 @@ struct NativeTerminalSurface: NSViewRepresentable {
         var onInput: ((String) -> Void)?
         var onResize: ((_ columns: Int, _ rows: Int) -> Void)?
         var onTitleChange: ((String) -> Void)?
+        var onBell: (() -> Void)?
+        static let bellNotificationCooldown: TimeInterval = 2
+        private var lastDeliveredBellAt: TimeInterval?
         /// SwiftTerm reports OSC 0/2 titles synchronously while `updateNSView`
         /// feeds a render delta. Agent TUIs can emit these on every repaint;
         /// forwarding them immediately lets AppModel publish while SwiftUI is
@@ -323,9 +341,74 @@ struct NativeTerminalSurface: NSViewRepresentable {
         /// and corrupt the next command. Suppress only reconstruction replies;
         /// fresh incremental output still receives normal terminal responses.
         private var suppressReplayReplies = false
+        /// Last geometry delivered by either SwiftTerm's delegate or an
+        /// explicit usable-layout reconciliation. Layout can fire repeatedly
+        /// without a grid change; the host should see one level transition,
+        /// not a stream of duplicate resize requests.
+        private var lastReportedColumns: Int?
+        private var lastReportedRows: Int?
 
         deinit {
             progressiveReplayTask?.cancel()
+        }
+
+        /// Parked surfaces must not retain an AppModel through their closures.
+        /// Clearing the resize handler also makes the next owned reattachment
+        /// an explicit activation, which force-synchronizes current geometry.
+        func prepareForRetention() {
+            onInput = nil
+            onResize = nil
+            onTitleChange = nil
+            onBell = nil
+        }
+
+        /// BEL-heavy TUIs may emit several bytes for one logical prompt. Keep
+        /// the first signal immediate and collapse the repaint burst; the
+        /// AttentionCenter additionally keeps one live entry per session.
+        static func shouldDeliverBell(
+            lastDeliveredAt: TimeInterval?,
+            now: TimeInterval
+        ) -> Bool {
+            guard now.isFinite else { return false }
+            guard let lastDeliveredAt, lastDeliveredAt.isFinite else { return true }
+            return now < lastDeliveredAt
+                || now - lastDeliveredAt >= bellNotificationCooldown
+        }
+
+        /// Bind the current controller capability. A nil-to-live transition is
+        /// a state-reconciliation boundary, not merely another SwiftUI update:
+        /// the PTY may have changed while this renderer was observed or parked.
+        func setResizeHandler(
+            _ handler: ((_ columns: Int, _ rows: Int) -> Void)?,
+            synchronizing view: ReadOnlyTerminalView
+        ) {
+            let activated = onResize == nil && handler != nil
+            onResize = handler
+            if activated {
+                synchronizeCurrentGeometry(from: view, force: true)
+            }
+        }
+
+        /// Reconcile the renderer's level-triggered geometry after AppKit has
+        /// assigned usable bounds. SwiftTerm normally emits `sizeChanged`, but
+        /// it intentionally emits nothing when a cached view returns at the same
+        /// pixel size; that is exactly when a remotely-resized PTY still needs a
+        /// fresh authoritative desktop size.
+        func synchronizeCurrentGeometry(
+            from view: ReadOnlyTerminalView,
+            force: Bool = false
+        ) {
+            guard view.hasUsableRenderGeometry else { return }
+            let dimensions = view.getTerminal().getDims()
+            reportGeometry(columns: dimensions.cols, rows: dimensions.rows, force: force)
+        }
+
+        private func reportGeometry(columns: Int, rows: Int, force: Bool = false) {
+            guard columns > 0, rows > 0, let onResize else { return }
+            guard force || lastReportedColumns != columns || lastReportedRows != rows else { return }
+            lastReportedColumns = columns
+            lastReportedRows = rows
+            onResize(columns, rows)
         }
 
         /// Keep a shell-reported OSC 7 directory across ordinary SwiftUI
@@ -360,9 +443,11 @@ struct NativeTerminalSurface: NSViewRepresentable {
 
         private var userUnpinned = false
         private var isFeeding = false
-        /// `scrollPosition` is 1.0 exactly at the live bottom; treat anything at
-        /// or above this as "still pinned" to tolerate rounding.
-        private static let pinnedThreshold = 0.999
+        /// SwiftTerm returns exactly 1.0 at the live bottom and a ratio below it
+        /// for every other row. Do not add an epsilon: with 20,000 retained rows,
+        /// 0.999 still covers roughly the newest 20 rows and misclassifies a real
+        /// light scroll as pinned.
+        private static let pinnedThreshold = 1.0
 
         @MainActor
         func apply(
@@ -831,8 +916,34 @@ struct NativeTerminalSurface: NSViewRepresentable {
         /// bottom for one frame — the visible "spazz" while scrolling upward.
         @MainActor
         private func captureUserScrollBeforeOutput(to view: ReadOnlyTerminalView) {
-            guard view.isUserScrollGesture, view.canScroll else { return }
-            userUnpinned = view.scrollPosition < Self.pinnedThreshold
+            guard view.canScroll else { return }
+            guard view.isUserScrollGesture else {
+                reconcileExpiredGesturePin(to: view)
+                return
+            }
+            // A precise upward trackpad gesture exists before SwiftTerm's
+            // private sub-cell accumulator changes `scrollPosition`. Latch the
+            // direction itself; otherwise a repaint in that gap records 1.0 and
+            // leaves follow mode enabled. A downward gesture still re-pins only
+            // once it has actually reached the live bottom.
+            if TerminalScrollGestureMonitor.isScrollingUpward(for: view) {
+                userUnpinned = true
+            } else {
+                userUnpinned = view.scrollPosition < Self.pinnedThreshold
+            }
+        }
+
+        /// A microscopic gesture can end before SwiftTerm's precise-delta
+        /// accumulator crosses a terminal row. Once gesture attribution expires,
+        /// exact live-bottom is authoritative again; clear only that phantom
+        /// unpin, never a viewport that actually moved into scrollback.
+        @MainActor
+        private func reconcileExpiredGesturePin(to view: ReadOnlyTerminalView) {
+            guard userUnpinned,
+                  !view.isUserScrollGesture,
+                  view.canScroll,
+                  view.scrollPosition >= Self.pinnedThreshold else { return }
+            userUnpinned = false
         }
 
         /// The already-rendered prefix, dropped by byte count.
@@ -868,8 +979,7 @@ struct NativeTerminalSurface: NSViewRepresentable {
         }
 
         func sizeChanged(source: TerminalView, newCols: Int, newRows: Int) {
-            guard newCols > 0, newRows > 0 else { return }
-            onResize?(newCols, newRows)
+            reportGeometry(columns: newCols, rows: newRows)
         }
         func setTerminalTitle(source: TerminalView, title: String) {
             pendingTitleChange = title
@@ -936,6 +1046,7 @@ struct NativeTerminalSurface: NSViewRepresentable {
             // `position` is the relative viewport position (1.0 at the live
             // bottom): leaving the bottom unpins, returning to it re-pins.
             userUnpinned = position < Self.pinnedThreshold
+            TerminalScrollGestureMonitor.acknowledgeScrollPosition(for: view)
         }
 
         /// Re-snap to the newest output after a geometry change.
@@ -948,6 +1059,7 @@ struct NativeTerminalSurface: NSViewRepresentable {
         /// resulting scroll cannot be mistaken for user intent.
         @MainActor
         func repinAfterLayout(_ view: ReadOnlyTerminalView) {
+            reconcileExpiredGesturePin(to: view)
             guard !userUnpinned, !isProgressivelyReplaying else { return }
             DispatchQueue.main.async { [weak self, weak view] in
                 guard let self, let view, !self.userUnpinned else { return }
@@ -1087,7 +1199,18 @@ struct NativeTerminalSurface: NSViewRepresentable {
                 )
             }
         }
-        func bell(source: TerminalView) {}
+        func bell(source: TerminalView) {
+            // Initial/progressive reconstruction can contain old BEL bytes.
+            // Treat them like replayed terminal replies: render history, but do
+            // not manufacture a new user-facing side effect.
+            guard !suppressReplayReplies, let onBell else { return }
+            let now = ProcessInfo.processInfo.systemUptime
+            guard Self.shouldDeliverBell(lastDeliveredAt: lastDeliveredBellAt, now: now) else {
+                return
+            }
+            lastDeliveredBellAt = now
+            onBell()
+        }
         func clipboardCopy(source: TerminalView, content: Data) {}
         func clipboardRead(source: TerminalView) -> Data? { nil }
         func iTermContent(source: TerminalView, content: ArraySlice<UInt8>) {}
@@ -1464,11 +1587,15 @@ class ReadOnlyTerminalView: TerminalView {
     /// the shell. If no mark exists in that direction SwiftTerm retains its
     /// ordinary key behavior.
     @discardableResult
-    func navigateSemanticPrompt(backward: Bool) -> Bool {
+    func navigateSemanticPrompt(
+        backward: Bool,
+        beforeScroll: (() -> Void)? = nil
+    ) -> Bool {
         let terminal = getTerminal()
         let first = terminal.buffer.totalLinesTrimmed
         semanticTracker.prune(before: first)
         guard let destination = semanticPromptDestination(backward: backward) else { return false }
+        beforeScroll?()
         scrollTo(row: max(0, destination.row - first), notifyAccessibility: true)
         updateSemanticDecorations()
         return true
@@ -1558,7 +1685,7 @@ class ReadOnlyTerminalView: TerminalView {
     /// row the cursor reports. On the alternate screen SwiftTerm reports
     /// `canScroll == false`, which is exactly the full-screen-TUI case.
     var isViewportAtLiveBottom: Bool {
-        !canScroll || scrollPosition >= 0.999
+        !canScroll || scrollPosition >= 1.0
     }
 
     private func updateLinkCursor(for event: NSEvent) {
@@ -1766,6 +1893,20 @@ class ReadOnlyTerminalView: TerminalView {
     /// gestures without subclassing.
     var isUserScrollGesture: Bool { TerminalScrollGestureMonitor.isActive(for: self) }
 
+    /// Mirrors SwiftTerm's wheel-routing decision without touching its private
+    /// accumulator: normal-buffer events use native scrollback unless the
+    /// application requested mouse reports and Shift did not bypass them.
+    func wheelUsesNativeScrollback(_ event: NSEvent) -> Bool {
+        let terminal = getTerminal()
+        let shiftBypassesMouseReporting = event.modifierFlags.contains(.shift)
+            && !terminal.mouseShiftCapture
+        return !terminal.isCurrentBufferAlternate
+            && canScroll
+            && (!allowMouseReporting
+                || terminal.mouseMode == .off
+                || shiftBypassesMouseReporting)
+    }
+
     /// A second upward gesture at row zero is the explicit seam between the
     /// interactive renderer and immutable history. Returning `true` means the
     /// request was accepted; the wheel event itself still reaches SwiftTerm and
@@ -1899,26 +2040,81 @@ enum TerminalScrollGestureMonitor {
     private static var monitor: Any?
     private static var lastGestureTimestamp: TimeInterval = -.greatestFiniteMagnitude
     private static weak var lastGestureView: ReadOnlyTerminalView?
+    private static var lastGestureWasUpward = false
+    private static weak var activeScrollerGestureView: ReadOnlyTerminalView?
 
     /// Page keys SwiftTerm treats as scrollback navigation.
-    private static let scrollKeyCodes: Set<UInt16> = [115, 116, 119, 121] // home, pgup, end, pgdn
+    private static let scrollKeyCodes: Set<UInt16> = [116, 121] // page up, page down
 
     static func install() {
         guard monitor == nil else { return }
         monitor = NSEvent.addLocalMonitorForEvents(
-            matching: [.scrollWheel, .magnify, .swipe, .keyDown]
+            matching: [
+                .scrollWheel, .magnify, .swipe, .keyDown,
+                .leftMouseDown, .leftMouseDragged, .leftMouseUp,
+            ]
         ) { event in
+            if event.type == .leftMouseDown
+                || event.type == .leftMouseDragged
+                || event.type == .leftMouseUp {
+                let view: ReadOnlyTerminalView?
+                if event.type == .leftMouseDown {
+                    view = terminalViewForScroller(at: event)
+                    activeScrollerGestureView = view
+                } else {
+                    view = activeScrollerGestureView
+                }
+                if let view, event.window === view.window {
+                    recordGesture(view: view, at: event.timestamp, scrollingUpward: false)
+                }
+                if event.type == .leftMouseUp {
+                    activeScrollerGestureView = nil
+                }
+                return event
+            }
             if event.type == .keyDown,
                let view = terminalView(for: event),
                event.modifierFlags.intersection(.deviceIndependentFlagsMask) == .command,
-               event.keyCode == 126 || event.keyCode == 125,
-               view.navigateSemanticPrompt(backward: event.keyCode == 126) {
-                return nil
+               event.keyCode == 126 || event.keyCode == 125 {
+                let backward = event.keyCode == 126
+                // Attribute the gesture before `scrollTo(row:)` invokes the
+                // delegate synchronously; otherwise output can immediately
+                // undo this explicit command jump.
+                if view.navigateSemanticPrompt(
+                    backward: backward,
+                    beforeScroll: {
+                        recordGesture(
+                            view: view,
+                            at: event.timestamp,
+                            scrollingUpward: backward
+                        )
+                    }
+                ) {
+                    return nil
+                }
             }
             if let view = terminalView(for: event),
                (event.type != .keyDown || scrollKeyCodes.contains(event.keyCode)) {
-                lastGestureTimestamp = event.timestamp
-                lastGestureView = view
+                if event.type == .scrollWheel {
+                    recordGesture(
+                        view: view,
+                        at: event.timestamp,
+                        scrollingUpward: event.scrollingDeltaY > 0
+                            && view.wheelUsesNativeScrollback(event)
+                    )
+                } else if event.type == .keyDown {
+                    recordGesture(
+                        view: view,
+                        at: event.timestamp,
+                        scrollingUpward: view.canScroll && event.keyCode == 116
+                    )
+                } else {
+                    recordGesture(
+                        view: view,
+                        at: event.timestamp,
+                        scrollingUpward: false
+                    )
+                }
                 if event.type == .scrollWheel {
                     // SwiftTerm uses positive `scrollingDeltaY` for upward
                     // movement. The monitor runs before its non-open
@@ -1929,11 +2125,11 @@ enum TerminalScrollGestureMonitor {
                         scrollingDeltaY: event.scrollingDeltaY,
                         now: event.timestamp
                     )
-                } else if event.type == .keyDown,
-                          event.keyCode == 115 || event.keyCode == 116 {
-                    // Home and Page Up are SwiftTerm's keyboard scroll-up
-                    // routes. Repeating either at row zero should cross the
-                    // same history seam as a continued trackpad gesture.
+                } else if event.type == .keyDown, event.keyCode == 116 {
+                    // Page Up is SwiftTerm's keyboard scrollback route.
+                    // Repeating it at row zero should cross the same history
+                    // seam as a continued trackpad gesture. Home/End are sent
+                    // to the application and are intentionally not attributed.
                     _ = view.requestHistoryBeyondTop(
                         scrollingDeltaY: 1,
                         now: event.timestamp
@@ -1950,18 +2146,63 @@ enum TerminalScrollGestureMonitor {
             && ProcessInfo.processInfo.systemUptime - lastGestureTimestamp < recencyWindow
     }
 
+    static func isScrollingUpward(for view: ReadOnlyTerminalView) -> Bool {
+        isActive(for: view) && lastGestureWasUpward
+    }
+
+    /// A real SwiftTerm scroll callback supersedes the pending direction hint;
+    /// from this point the exact public position is the pinning authority.
+    static func acknowledgeScrollPosition(for view: ReadOnlyTerminalView) {
+        guard lastGestureView === view else { return }
+        lastGestureWasUpward = false
+    }
+
     /// Test seam — lets the pin policy be exercised without synthesising events.
     static func noteGestureForTesting(
         view: ReadOnlyTerminalView,
-        at timestamp: TimeInterval? = nil
+        at timestamp: TimeInterval? = nil,
+        scrollingUpward: Bool = true
     ) {
         lastGestureTimestamp = timestamp ?? ProcessInfo.processInfo.systemUptime
         lastGestureView = view
+        lastGestureWasUpward = scrollingUpward
     }
 
     static func resetForTesting() {
         lastGestureTimestamp = -.greatestFiniteMagnitude
         lastGestureView = nil
+        lastGestureWasUpward = false
+        activeScrollerGestureView = nil
+    }
+
+    private static func recordGesture(
+        view: ReadOnlyTerminalView,
+        at timestamp: TimeInterval,
+        scrollingUpward: Bool
+    ) {
+        lastGestureTimestamp = timestamp
+        lastGestureView = view
+        lastGestureWasUpward = scrollingUpward
+    }
+
+    /// Attribute mouse tracking only when it began on SwiftTerm's actual native
+    /// NSScroller. Text selection and link clicks inside the terminal must not
+    /// acquire permission to mutate sticky-scroll state.
+    private static func terminalViewForScroller(at event: NSEvent) -> ReadOnlyTerminalView? {
+        guard let window = event.window,
+              let contentView = window.contentView else { return nil }
+        let point = contentView.convert(event.locationInWindow, from: nil)
+        guard let hit = contentView.hitTest(point) else { return nil }
+        var candidate: NSView? = hit
+        var foundScroller = false
+        while let view = candidate {
+            if view is NSScroller { foundScroller = true }
+            if let terminal = view as? ReadOnlyTerminalView {
+                return foundScroller ? terminal : nil
+            }
+            candidate = view.superview
+        }
+        return nil
     }
 
     private static func terminalView(for event: NSEvent) -> ReadOnlyTerminalView? {
@@ -2088,7 +2329,14 @@ final class OwnedTerminalView: ReadOnlyTerminalView {
     /// than pasted as a plain path — in short, a quoted path attaches nothing,
     /// and macOS screenshot filenames contain spaces that break `@` mentions.
     static func droppedFileText(_ urls: [URL], agentLaunchCommand: String?) -> String {
-        TerminalImageDrop.insertionText(
+        droppedFilePlan(urls, agentLaunchCommand: agentLaunchCommand).text
+    }
+
+    static func droppedFilePlan(
+        _ urls: [URL],
+        agentLaunchCommand: String?
+    ) -> TerminalImageDrop.InsertionPlan {
+        TerminalImageDrop.insertionPlan(
             for: urls,
             syntax: TerminalImageDrop.syntax(forLaunchCommand: agentLaunchCommand)
         )
@@ -2133,16 +2381,19 @@ final class OwnedTerminalView: ReadOnlyTerminalView {
     override func performDragOperation(_ sender: any NSDraggingInfo) -> Bool {
         defer { setFileDropActive(false) }
         let urls = droppedFileURLs(from: sender.draggingPasteboard)
-        let text = Self.droppedFileText(urls, agentLaunchCommand: agentLaunchCommand)
-        guard !text.isEmpty else { return false }
+        let plan = Self.droppedFilePlan(urls, agentLaunchCommand: agentLaunchCommand)
+        guard !plan.text.isEmpty else { return false }
         window?.makeFirstResponder(self)
         let terminal = getTerminal()
         if terminal.bracketedPasteMode {
             send(source: terminal, data: ArraySlice(Array("\u{1B}[200~".utf8)))
         }
-        send(source: terminal, data: ArraySlice(Array(text.utf8)))
+        send(source: terminal, data: ArraySlice(Array(plan.text.utf8)))
         if terminal.bracketedPasteMode {
             send(source: terminal, data: ArraySlice(Array("\u{1B}[201~".utf8)))
+        }
+        if let warning = plan.warningMessage {
+            ToastCenter.shared.show(warning, style: .error, duration: 5)
         }
         return true
     }
@@ -2154,6 +2405,14 @@ final class OwnedTerminalView: ReadOnlyTerminalView {
     /// it uninstalls when the view leaves its window (weak self keeps a
     /// stragglling monitor harmless).
     private var shiftEnterMonitor: Any?
+
+    static func shouldHandleShiftEnter(
+        keyCode: UInt16,
+        modifierFlags: NSEvent.ModifierFlags
+    ) -> Bool {
+        keyCode == 36
+            && modifierFlags.intersection(.deviceIndependentFlagsMask) == .shift
+    }
 
     override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
@@ -2167,7 +2426,10 @@ final class OwnedTerminalView: ReadOnlyTerminalView {
         } else if shiftEnterMonitor == nil {
             registerForDraggedTypes([.fileURL])
             shiftEnterMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
-                guard event.keyCode == 36, event.modifierFlags.contains(.shift) else { return event }
+                guard Self.shouldHandleShiftEnter(
+                    keyCode: event.keyCode,
+                    modifierFlags: event.modifierFlags
+                ) else { return event }
                 // Local monitors fire on the main thread; NSEvent itself must
                 // stay outside the isolation hop (it isn't Sendable).
                 let handled = MainActor.assumeIsolated { () -> Bool in

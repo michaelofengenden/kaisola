@@ -1,10 +1,27 @@
 import AppKit
 import SwiftUI
+import UserNotifications
 
 extension Notification.Name {
     /// Bridges the in-workspace settings sheet to the delegate-owned Sparkle
     /// controller without coupling the SwiftUI shell to update infrastructure.
     static let kaisolaCheckForUpdates = Notification.Name("kaisolaCheckForUpdates")
+}
+
+enum NotificationAuthorizationState: Equatable, Sendable {
+    case unknown
+    case notDetermined
+    case allowed
+    case denied
+
+    init(_ status: UNAuthorizationStatus) {
+        switch status {
+        case .notDetermined: self = .notDetermined
+        case .denied: self = .denied
+        case .authorized, .provisional, .ephemeral: self = .allowed
+        @unknown default: self = .unknown
+        }
+    }
 }
 
 /// The native Settings window (⌘,): workspace, terminal, Companion, and tools.
@@ -22,6 +39,8 @@ struct SettingsView: View {
     var interruptibleTurnCount: (() -> Int)?
     @ObservedObject private var updates = UpdateCenter.shared
     @State private var restartRequest: RestartRequest?
+    @State private var notificationsEnabled = true
+    @State private var notificationAuthorization = NotificationAuthorizationState.unknown
 
     /// Identifiable wrapper so the confirmation presents via `.alert(item:)`.
     private struct RestartRequest: Identifiable { let id = UUID() }
@@ -55,6 +74,9 @@ struct SettingsView: View {
     /// Visual QA can reveal a control below a section's first viewport without
     /// changing where the production Settings window normally opens.
     var initialContentAnchorID: String?
+    /// The delegate uses this to preserve the selected tab when a live project
+    /// switch rebuilds workspace-scoped Settings content.
+    var sectionChanged: ((String) -> Void)? = nil
 
     var body: some View {
         HStack(spacing: 0) {
@@ -84,7 +106,14 @@ struct SettingsView: View {
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
         }
-        .frame(width: 810, height: 540)
+        .frame(
+            minWidth: 760,
+            idealWidth: 810,
+            maxWidth: .infinity,
+            minHeight: 500,
+            idealHeight: 540,
+            maxHeight: .infinity
+        )
         .background(Color(nsColor: .windowBackgroundColor).opacity(0.82))
         .alert(item: $restartRequest) { _ in
             // A warning, never a block: the user is allowed to restart over a
@@ -99,6 +128,8 @@ struct SettingsView: View {
             )
         }
         .onAppear {
+            notificationsEnabled = NotificationBridge.shared.enabled
+            refreshNotificationAuthorization()
             if let initialSectionID,
                let section = SettingsSection(rawValue: initialSectionID) {
                 selectedSection = section
@@ -109,6 +140,12 @@ struct SettingsView: View {
                 TerminalFontOptions.availableMonospaceFamilies()
             }.value
             fontFamilies = families
+        }
+        .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
+            refreshNotificationAuthorization()
+        }
+        .onChange(of: selectedSection) { _, section in
+            sectionChanged?(section.rawValue)
         }
     }
 
@@ -155,7 +192,7 @@ struct SettingsView: View {
             }
 
             Spacer()
-            Text("Changes apply instantly")
+            Text("Most changes apply instantly")
                 .font(.caption2)
                 .foregroundStyle(.tertiary)
                 .padding(.horizontal, 14)
@@ -196,7 +233,7 @@ struct SettingsView: View {
                     AppAccountSettingsView(auth: auth)
                 }
 
-                SettingsCard(title: "Workspace", symbol: "rectangle.3.group") {
+                SettingsCard(title: "Projects", symbol: "rectangle.3.group") {
                     SettingsRow(title: "Navigation", detail: "Project tree or horizontal tabs", symbol: "sidebar.left") {
                         Menu {
                             ForEach(NavigationLayout.allCases) { layout in
@@ -204,7 +241,7 @@ struct SettingsView: View {
                             }
                         } label: { SettingsChoiceLabel(settings.navigationLayout.title) }
                         .menuIndicator(.hidden)
-                        .accessibilityLabel("Workspace navigation")
+                        .accessibilityLabel("Project navigation")
                     }
                     SettingsDivider()
                     SettingsRow(title: "Appearance", detail: "Follow macOS or pin a theme", symbol: "circle.lefthalf.filled") {
@@ -239,14 +276,21 @@ struct SettingsView: View {
                 }
 
                 SettingsCard(title: "System", symbol: "macwindow") {
-                    SettingsRow(title: "Native notifications", detail: "Alert when an agent needs you", symbol: "bell.badge") {
-                        Toggle("", isOn: Binding(
-                            get: { NotificationBridge.shared.enabled },
-                            set: { NotificationBridge.shared.enabled = $0 }
-                        ))
-                        .labelsHidden()
-                        .toggleStyle(.switch)
-                        .accessibilityLabel("Native notifications")
+                    SettingsRow(title: "Native notifications", detail: nativeNotificationDetail, symbol: "bell.badge") {
+                        VStack(alignment: .trailing, spacing: 4) {
+                            Toggle("", isOn: Binding(
+                                get: { notificationsEnabled },
+                                set: { setNotificationsEnabled($0) }
+                            ))
+                            .labelsHidden()
+                            .toggleStyle(.switch)
+                            .accessibilityLabel("Native notifications")
+                            if notificationAuthorization == .denied {
+                                Button("Open Settings", action: openNotificationSettings)
+                                    .buttonStyle(.borderless)
+                                    .font(.caption)
+                            }
+                        }
                     }
                     SettingsDivider()
                     SettingsRow(title: "External editor", detail: "Used by Shift-Command-O", symbol: "arrow.up.forward.app") {
@@ -411,7 +455,7 @@ struct SettingsView: View {
                         .padding(.bottom, 14)
                 }
 
-                SettingsCard(title: "History storage", symbol: "externaldrive") {
+                SettingsCard(title: "History Storage", symbol: "externaldrive") {
                     SettingsRow(
                         title: "Disk warning",
                         detail: "Per terminal · never deletes output automatically",
@@ -478,9 +522,52 @@ struct SettingsView: View {
         GuardrailsSettings(settings: settings)
     }
 
+    private var nativeNotificationDetail: String {
+        switch notificationAuthorization {
+        case .denied: "Blocked by macOS; enable notifications in System Settings"
+        case .notDetermined: "macOS permission has not been granted yet"
+        case .allowed: "Alert when an agent needs you"
+        case .unknown: "Alert when an agent needs you"
+        }
+    }
+
+    private func setNotificationsEnabled(_ enabled: Bool) {
+        notificationsEnabled = enabled
+        NotificationBridge.shared.enabled = enabled
+        guard enabled else { return }
+        NotificationBridge.shared.requestAuthorizationIfNeeded()
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.75) {
+            refreshNotificationAuthorization()
+        }
+    }
+
+    private func refreshNotificationAuthorization() {
+        guard Bundle.main.bundleIdentifier != nil,
+              !NotificationBridge.isRunningUnderXCTest else {
+            notificationAuthorization = .unknown
+            return
+        }
+        Task {
+            let state = await withCheckedContinuation { continuation in
+                UNUserNotificationCenter.current().getNotificationSettings { settings in
+                    continuation.resume(returning: NotificationAuthorizationState(settings.authorizationStatus))
+                }
+            }
+            guard !Task.isCancelled else { return }
+            notificationAuthorization = state
+        }
+    }
+
+    private func openNotificationSettings() {
+        guard let url = URL(
+            string: "x-apple.systempreferences:com.apple.Notifications-Settings.extension"
+        ) else { return }
+        NSWorkspace.shared.open(url)
+    }
+
     private var agents: some View {
         Form {
-            Section("Account isolation") {
+            Section("Account Isolation") {
                 TextField("CLAUDE_CONFIG_DIR", text: $settings.claudeConfigDir, prompt: Text("CLI default"))
                 TextField("CODEX_HOME", text: $settings.codexHome, prompt: Text("CLI default"))
                 Text("Applied to new agent terminals and chats; leave blank to use each CLI's own login.")
@@ -501,7 +588,7 @@ struct SettingsView: View {
                 .listRowInsets(EdgeInsets())
             }
             CustomAgentsSection()
-            Section("ACP adapters") {
+            Section("ACP Adapters") {
                 ForEach(AgentRegistry.all) { agent in
                     if let adapter = AcpAdapter.forAgent(agent.id) {
                         LabeledContent(agent.name) {
@@ -539,11 +626,11 @@ private enum SettingsSection: String, CaseIterable, Identifiable {
     }
     var subtitle: String {
         switch self {
-        case .general: "Workspace behavior and appearance"
+        case .general: "Project behavior and appearance"
         case .terminal: "Typography, palette, and interaction"
         case .companion: "Pair nearby devices and stay connected anywhere"
         case .guardrails: "Standing rules and sensitive files"
-        case .mcp: "Workspace tool servers"
+        case .mcp: "Project tool servers"
         case .agents: "CLI accounts, adapters, and custom agents"
         case .models: "Provider credentials, models, and routing"
         case .usage: "Provider limits and live context"
@@ -651,18 +738,42 @@ private struct TerminalPalettePreview: View {
     }
 }
 
+enum SensitiveGlobPolicy {
+    static func validationMessage(_ rawValue: String, existing: [String]) -> String? {
+        let value = rawValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !value.isEmpty else { return nil }
+        if value.count > 512 {
+            return "Patterns must be 512 characters or fewer."
+        }
+        if value.unicodeScalars.contains(where: CharacterSet.controlCharacters.contains) {
+            return "Patterns cannot contain control characters."
+        }
+        if value.rangeOfCharacter(from: CharacterSet(charactersIn: "?[]{}")) != nil {
+            return "Only * and ** wildcards are supported; ?, brackets, and braces are not."
+        }
+        if value.allSatisfy({ $0 == "*" || $0 == "/" }) {
+            return "Name at least part of a sensitive file; a wildcard-only pattern is too broad."
+        }
+        if existing.contains(where: { $0.caseInsensitiveCompare(value) == .orderedSame }) {
+            return "That sensitive-file pattern already exists."
+        }
+        return nil
+    }
+}
+
 /// Guardrails tab: standing permission rules (delete) + sensitive globs (edit).
 private struct GuardrailsSettings: View {
     @ObservedObject var settings: NativePreviewSettings
     @State private var rules: [PermissionRule] = []
     @State private var newGlob = ""
+    @State private var showsRestoreDefaultsConfirmation = false
     private let store = PermissionRuleStore()
 
     var body: some View {
         Form {
-            Section("Standing allow-rules") {
+            Section("Standing Allow Rules") {
                 if rules.isEmpty {
-                    Text("No rules yet — \"Always allow\" on a permission ask creates one.")
+                    Text("No rules yet — \"Always Allow\" on a permission ask creates one.")
                         .font(.caption).foregroundStyle(.secondary)
                 }
                 ForEach(rules) { rule in
@@ -686,7 +797,7 @@ private struct GuardrailsSettings: View {
                     }
                 }
             }
-            Section("Sensitive files (always ask, never rule-covered)") {
+            Section("Sensitive Files (Always Ask, Never Rule-Covered)") {
                 ForEach(settings.sensitiveGlobs, id: \.self) { glob in
                     HStack {
                         Text(glob).font(.callout.monospaced())
@@ -704,22 +815,48 @@ private struct GuardrailsSettings: View {
                     TextField("Add glob (e.g. **/*.p12)", text: $newGlob)
                         .onSubmit(addGlob)
                     Button("Add", action: addGlob)
-                        .disabled(newGlob.trimmingCharacters(in: .whitespaces).isEmpty)
+                        .disabled(!canAddGlob)
                 }
-                Button("Restore defaults") {
-                    settings.sensitiveGlobs = AcpPermissionRules.defaultSensitiveGlobs
+                if let issue = newGlobIssue {
+                    Text(issue)
+                        .font(.caption)
+                        .foregroundStyle(.red)
                 }
+                Button("Restore Defaults") { showsRestoreDefaultsConfirmation = true }
                 .font(.caption)
             }
         }
         .formStyle(.grouped)
         .padding(6)
         .onAppear { rules = store.rules() }
+        .confirmationDialog(
+            "Restore Default Sensitive-File Patterns?",
+            isPresented: $showsRestoreDefaultsConfirmation,
+            titleVisibility: .visible
+        ) {
+            Button("Restore Defaults", role: .destructive) {
+                settings.sensitiveGlobs = AcpPermissionRules.defaultSensitiveGlobs
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("This replaces every custom sensitive-file pattern with Kaisola's defaults.")
+        }
+    }
+
+    private var newGlobIssue: String? {
+        SensitiveGlobPolicy.validationMessage(newGlob, existing: settings.sensitiveGlobs)
+    }
+
+    private var canAddGlob: Bool {
+        !newGlob.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && newGlobIssue == nil
     }
 
     private func addGlob() {
-        let trimmed = newGlob.trimmingCharacters(in: .whitespaces)
-        guard !trimmed.isEmpty, !settings.sensitiveGlobs.contains(trimmed) else { return }
+        let trimmed = newGlob.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty,
+              SensitiveGlobPolicy.validationMessage(trimmed, existing: settings.sensitiveGlobs) == nil else {
+            return
+        }
         settings.sensitiveGlobs.append(trimmed)
         newGlob = ""
     }

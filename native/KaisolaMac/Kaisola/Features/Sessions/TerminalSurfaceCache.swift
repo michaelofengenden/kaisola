@@ -58,11 +58,19 @@ final class TerminalSurfaceCache {
     /// another pane or another window — an `NSView` has exactly one superview,
     /// so it cannot be shared. In that case this returns nil and the caller
     /// builds a fresh pair, which is the pre-existing behaviour.
-    func claim(sessionID: String) -> Entry? {
+    func claim(sessionID: String, isOwned: Bool? = nil) -> Entry? {
         guard let entry = entries[sessionID] else { return nil }
         guard entry.view.superview == nil else { return nil }
-        entries.removeValue(forKey: sessionID)
-        order.removeAll { $0 == sessionID }
+        // Ownership is a type-level security boundary: ReadOnlyTerminalView
+        // compiles away every outbound byte, while OwnedTerminalView forwards
+        // input to the controller lane. A parked observer must never come back
+        // as an apparently writable terminal (or vice versa). Drop the stale
+        // pair and let NSViewRepresentable build the correct concrete class.
+        if let isOwned, (entry.view is OwnedTerminalView) != isOwned {
+            remove(sessionID: sessionID)
+            return nil
+        }
+        remove(sessionID: sessionID)
         return entry
     }
 
@@ -80,8 +88,7 @@ final class TerminalSurfaceCache {
     /// Drop a session's surface — used when a session ends, so its buffer is not
     /// retained for a terminal that can never come back.
     func evict(sessionID: String) {
-        entries.removeValue(forKey: sessionID)
-        order.removeAll { $0 == sessionID }
+        remove(sessionID: sessionID)
     }
 
     func removeAll() {
@@ -90,4 +97,9 @@ final class TerminalSurfaceCache {
     }
 
     var retainedSessionIDs: [String] { order }
+
+    private func remove(sessionID: String) {
+        entries.removeValue(forKey: sessionID)
+        order.removeAll { $0 == sessionID }
+    }
 }

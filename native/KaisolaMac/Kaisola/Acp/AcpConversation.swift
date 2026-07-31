@@ -29,10 +29,18 @@ enum AcpTranscriptRow: Codable, Identifiable, Equatable {
 @MainActor
 final class AcpConversation: ObservableObject {
     @Published private(set) var rows: [AcpTranscriptRow] = [] {
-        didSet { onTranscriptChanged?(rows) }
+        didSet {
+            contentVersion &+= 1
+            onTranscriptChanged?(rows)
+        }
     }
+    /// Advances for both appended rows and in-place streaming updates. Views
+    /// must follow this rather than `rows.count`: an agent can stream thousands
+    /// of chunks into one existing Markdown row without changing the count.
+    @Published private(set) var contentVersion: UInt64 = 0
     @Published private(set) var isRunning = false
     @Published private(set) var isConnected = false
+    @Published private(set) var isReconnecting = false
     @Published private(set) var usage: AcpUsage?
     @Published private(set) var models: [AcpSessionInfo.Model] = []
     @Published private(set) var currentModelID: String?
@@ -115,7 +123,11 @@ final class AcpConversation: ObservableObject {
     /// parameter. Nil disables persistence: `loadDraft` returns "" and
     /// `saveDraft` is a no-op.
     var draftStorageKey: String?
-    private let client: AcpClient
+    private var client: AcpClient
+    /// Production conversations own their client and can replace it after the
+    /// child process exits. Injected clients remain fixed so tests/custom
+    /// transports never get silently swapped for a real process transport.
+    private let ownsClient: Bool
     private let command: String
     private let arguments: [String]
     private let environment: [String: String]
@@ -127,10 +139,18 @@ final class AcpConversation: ObservableObject {
     private var restoredDraft: String?
     private var hasStarted = false
     private var turnCounter = 0
+    /// Monotonic transcript segment identity. A single turn may emit
+    /// message -> tool -> message (or thought -> tool -> thought); using only
+    /// `turnCounter` gave those non-contiguous rows duplicate SwiftUI ids.
+    private var segmentCounter = 0
     private var queueCounter = 0
     private var attachmentCounter = 0
     private var draftPersistenceTask: Task<Void, Never>?
     private var pendingDraftPersistence: String?
+    /// ACP adapters may issue several permission requests before the user has
+    /// answered the first. Keep one visible request and preserve the remainder
+    /// in arrival order instead of replacing the on-screen card.
+    @Published private var permissionQueue: [AcpPermissionRequest] = []
 
     /// Default transcript render window: only the last 120 rows paint until the
     /// the user reaches the top. Each top crossing reveals `expandStep` more.
@@ -148,7 +168,7 @@ final class AcpConversation: ObservableObject {
         environment: [String: String] = ProcessInfo.processInfo.environment,
         cwd: String,
         mcpServers: [JSONValue] = [],
-        client: AcpClient = AcpClient(),
+        client: AcpClient? = nil,
         ruleStore: PermissionRuleStore = PermissionRuleStore(),
         sensitiveGlobs: [String] = AcpPermissionRules.defaultSensitiveGlobs,
         draftKey: String? = nil,
@@ -163,7 +183,8 @@ final class AcpConversation: ObservableObject {
         self.environment = environment
         self.cwd = cwd
         self.mcpServers = mcpServers
-        self.client = client
+        self.client = client ?? AcpClient()
+        self.ownsClient = client == nil
         self.ruleStore = ruleStore
         self.sensitiveGlobs = sensitiveGlobs
         self.draftStorageKey = draftKey
@@ -174,6 +195,7 @@ final class AcpConversation: ObservableObject {
         self.turnCounter = initialRows.reduce(into: 0) { count, row in
             if case .user = row { count += 1 }
         }
+        self.segmentCounter = initialRows.count
     }
 
     func start() async {
@@ -199,7 +221,7 @@ final class AcpConversation: ObservableObject {
                 environment: environment,
                 cwd: cwd,
                 mcpServers: mcpServers,
-                resumeSessionID: resumeSessionID
+                resumeSessionID: providerSessionID ?? resumeSessionID
             )
             providerSessionID = info.sessionID
             onProviderSessionID?(info.sessionID)
@@ -212,31 +234,59 @@ final class AcpConversation: ObservableObject {
             statusMessage = nil
         } catch {
             hasStarted = false
+            eventContinuation?.finish()
+            eventContinuation = nil
+            eventConsumerTask?.cancel()
+            eventConsumerTask = nil
             statusMessage = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
             isConnected = false
         }
+    }
+
+    var canRestart: Bool {
+        ownsClient && !isConnected && !isRunning && !isReconnecting
+    }
+
+    /// Restart an app-owned adapter with a fresh transport. Reusing the dead
+    /// `Process` object is intentionally avoided; the provider session id is
+    /// offered back through ACP load/resume negotiation when supported.
+    func restart() async {
+        guard canRestart else { return }
+        isReconnecting = true
+        statusMessage = "Restarting agent…"
+        eventContinuation?.finish()
+        eventContinuation = nil
+        eventConsumerTask?.cancel()
+        eventConsumerTask = nil
+        await client.stop()
+        client = AcpClient()
+        hasStarted = false
+        await start()
+        isReconnecting = false
     }
 
     /// Send a message, or — if a turn is already running — queue it as a
     /// follow-up that dispatches automatically when the current turn ends.
     /// Any staged attachments ride the immediate send and are cleared; a send
     /// with attachments alone (no text) is allowed when idle.
-    func send(_ text: String) {
+    @discardableResult
+    func send(_ text: String) -> Bool {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         let attachments = pendingAttachments.map(\.attachment)
-        guard isConnected, !trimmed.isEmpty || !attachments.isEmpty else { return }
+        guard isConnected, !trimmed.isEmpty || !attachments.isEmpty else { return false }
         if isRunning {
             // A running turn queues this as a TEXT-ONLY follow-up. Queued
             // follow-ups deliberately never carry attachments (the flush path
             // dispatches with none), so the staged chips stay put and ride the
             // next immediate send. An attachments-only send can't be queued.
-            guard !trimmed.isEmpty else { return }
+            guard !trimmed.isEmpty else { return false }
             queueCounter += 1
             queued.append(QueuedMessage(id: "q\(queueCounter)", text: trimmed))
-            return
+            return true
         }
         pendingAttachments.removeAll()
         dispatch(trimmed, attachments: attachments)
+        return true
     }
 
     /// Drop a still-pending queued follow-up before it dispatches.
@@ -252,6 +302,8 @@ final class AcpConversation: ObservableObject {
         let message = queued.remove(at: index)
         if isRunning {
             queued.insert(message, at: 0)
+            pendingPermission = nil
+            permissionQueue.removeAll()
             Task { await client.cancel() }
         } else {
             dispatch(message.text)
@@ -368,6 +420,7 @@ final class AcpConversation: ObservableObject {
 
     private func dispatch(_ trimmed: String, attachments: [AcpAttachment] = []) {
         turnCounter += 1
+        statusMessage = nil
         // Keep any history the user has already revealed. The view independently
         // follows live output only while its bottom sentinel remains visible.
         let rowID = "\(turnCounter)"
@@ -396,6 +449,7 @@ final class AcpConversation: ObservableObject {
 
     func cancel() {
         pendingPermission = nil
+        permissionQueue.removeAll()
         Task { await client.cancel() }
     }
 
@@ -422,6 +476,7 @@ final class AcpConversation: ObservableObject {
         guard let permission = pendingPermission else { return }
         pendingPermission = nil
         Task { await client.resolvePermission(id: permission.id, optionID: optionID) }
+        presentNextPermission()
     }
 
     /// Grant this ask AND create a standing rule so future matching asks
@@ -447,33 +502,56 @@ final class AcpConversation: ObservableObject {
     /// otherwise a matching standing rule auto-allows silently; else surface.
     private func handlePermission(_ request: AcpPermissionRequest) {
         if AcpPermissionRules.requestIsSensitive(globs: sensitiveGlobs, title: request.title, paths: request.paths) {
-            pendingPermission = request
-            onAttention?(.permission, request.title)
+            enqueuePresentedPermission(request)
             return
         }
         if AcpPermissionRules.requestMatchesRule(ruleStore.rules(), workspace: cwd, kind: request.kind, title: request.title) != nil {
             answerAllowOnce(request)
             return
         }
+        enqueuePresentedPermission(request)
+    }
+
+    private func enqueuePresentedPermission(_ request: AcpPermissionRequest) {
+        guard pendingPermission?.id != request.id,
+              !permissionQueue.contains(where: { $0.id == request.id }) else { return }
+        guard pendingPermission == nil else {
+            permissionQueue.append(request)
+            return
+        }
         pendingPermission = request
         onAttention?(.permission, request.title)
+    }
+
+    private func presentNextPermission() {
+        guard pendingPermission == nil, !permissionQueue.isEmpty else { return }
+        let next = permissionQueue.removeFirst()
+        pendingPermission = next
+        onAttention?(.permission, next.title)
     }
 
     /// Answer with the request's allow_once option (falling back to the first
     /// non-reject option, then the first option), never persisting allow_always.
     private func answerAllowOnce(_ request: AcpPermissionRequest) {
-        if pendingPermission?.id == request.id { pendingPermission = nil }
+        let wasPresented = pendingPermission?.id == request.id
+        if wasPresented { pendingPermission = nil }
         let option = request.options.first { $0.kind == "allow_once" }
             ?? request.options.first { !$0.kind.contains("reject") }
             ?? request.options.first
-        guard let option else { return }
-        Task { await client.resolvePermission(id: request.id, optionID: option.id) }
+        if let option {
+            Task { await client.resolvePermission(id: request.id, optionID: option.id) }
+        }
+        if wasPresented { presentNextPermission() }
     }
 
     /// Whether the pending ask may be "always allowed" (hidden for sensitive files).
     var pendingPermissionAllowsRule: Bool {
         guard let permission = pendingPermission else { return false }
         return !AcpPermissionRules.requestIsSensitive(globs: sensitiveGlobs, title: permission.title, paths: permission.paths)
+    }
+
+    var pendingPermissionCount: Int {
+        (pendingPermission == nil ? 0 : 1) + permissionQueue.count
     }
 
     /// Stop the adapter and every terminal host it owns. Returning the final
@@ -485,6 +563,10 @@ final class AcpConversation: ObservableObject {
         let finalDraft = pendingDraftPersistence
         pendingDraftPersistence = nil
         await client.stop()
+        isConnected = false
+        isRunning = false
+        pendingPermission = nil
+        permissionQueue.removeAll()
         eventContinuation?.finish()
         eventContinuation = nil
         let consumer = eventConsumerTask
@@ -615,6 +697,21 @@ final class AcpConversation: ObservableObject {
         rows = newRows
     }
 
+    /// Test seam for the FIFO presentation policy. Wire parsing remains covered
+    /// separately by `AcpClientTests`; this exercises the UI-facing queue without
+    /// spawning an adapter.
+    func receivePermissionForTesting(_ request: AcpPermissionRequest) {
+        handlePermission(request)
+    }
+
+    /// Test seam for transcript segmentation. The JSON-RPC decoder and event
+    /// stream ordering have their own coverage; this lets a focused unit test
+    /// prove that message -> tool -> message produces three distinct row ids
+    /// and that in-place chunks advance `contentVersion`.
+    func receiveTurnItemForTesting(_ item: AcpTurnItem) {
+        accumulate(item)
+    }
+
     /// Deterministic, process-free state for hosted/local visual inspection.
     /// Marking startup complete prevents the embedded view from launching a
     /// real provider while the fixture is being captured.
@@ -688,7 +785,11 @@ final class AcpConversation: ObservableObject {
         case let .exited(code):
             isConnected = false
             isRunning = false
-            queued.removeAll()   // the agent is gone; nothing can dispatch
+            pendingPermission = nil
+            permissionQueue.removeAll()
+            // Preserve queued user text for inspection/copying. The adapter is
+            // gone so it cannot auto-dispatch, but silently deleting authored
+            // follow-ups is worse than leaving them visible.
             statusMessage = code == 0 ? "The agent ended." : "The agent exited (code \(code))."
         }
     }
@@ -711,26 +812,31 @@ final class AcpConversation: ObservableObject {
         case let .toolCall(call):
             rows.append(.tool(call))
         case let .plan(entries):
-            if let index = rows.lastIndex(where: { if case .plan = $0 { return true } else { return false } }) {
-                rows[index] = .plan(id: "\(turnCounter)", entries: entries)
+            let planID = "\(turnCounter)"
+            if let index = rows.lastIndex(where: {
+                if case let .plan(id, _) = $0 { return id == planID }
+                return false
+            }) {
+                rows[index] = .plan(id: planID, entries: entries)
             } else {
-                rows.append(.plan(id: "\(turnCounter)", entries: entries))
+                rows.append(.plan(id: planID, entries: entries))
             }
         }
     }
 
     private func appendChunk(_ text: String, isThought: Bool) {
-        let rowID = "\(turnCounter)"
         if let last = rows.last {
-            if !isThought, case let .message(id, existing) = last, id == rowID {
+            if !isThought, case let .message(id, existing) = last {
                 rows[rows.count - 1] = .message(id: id, text: existing + text)
                 return
             }
-            if isThought, case let .thought(id, existing) = last, id == rowID {
+            if isThought, case let .thought(id, existing) = last {
                 rows[rows.count - 1] = .thought(id: id, text: existing + text)
                 return
             }
         }
+        segmentCounter += 1
+        let rowID = "\(turnCounter)-segment-\(segmentCounter)"
         rows.append(isThought ? .thought(id: rowID, text: text) : .message(id: rowID, text: text))
     }
 }

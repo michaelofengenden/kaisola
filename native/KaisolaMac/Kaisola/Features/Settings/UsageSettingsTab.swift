@@ -8,6 +8,8 @@ struct UsageSettingsTab: View {
     let workspace: URL?
 
     @State private var accountProfiles: [UsageAccountProfile] = []
+    @State private var pendingAccountRemoval: UsageAccountProfile?
+    @State private var showsResetConfirmation = false
     private let accountStore = UsageAccountStore()
 
     /// Reading for a configured account. `ProviderPlanUsage.profileID` carries
@@ -18,10 +20,12 @@ struct UsageSettingsTab: View {
     }
 
     private var unmatchedReadings: [UsageCenter.ProviderPlanUsage] {
-        let known = Set(accountProfiles.map(\.id))
         return usage.planUsage.filter { reading in
             guard let id = reading.profileID else { return true }
-            return !known.contains(id)
+            // A removed named account can remain in the previous in-memory
+            // reading until the forced refresh finishes. Do not resurrect it
+            // as an anonymous provider row during that short handoff.
+            return id == "active"
         }
     }
 
@@ -85,7 +89,8 @@ struct UsageSettingsTab: View {
                             isRefreshing: usage.isRefreshingPlanUsage,
                             now: Date(),
                             onSignIn: { signIn(to: profile) },
-                            onReveal: { reveal(profile) }
+                            onReveal: { reveal(profile) },
+                            onRemove: { pendingAccountRemoval = profile }
                         )
                     }
                     // A reading with no matching configured profile — the CLI's
@@ -96,7 +101,7 @@ struct UsageSettingsTab: View {
                 }
             } header: {
                 HStack {
-                    Text("Account limits")
+                    Text("Account Limits")
                     Spacer()
                     Button {
                         usage.refreshPlanUsage(workspace: workspace, force: true)
@@ -112,22 +117,24 @@ struct UsageSettingsTab: View {
                     .accessibilityLabel("Refresh account limits")
                 }
             } footer: {
-                Text("Every named account is read independently. Codex uses its read-only app-server. Claude uses the pinned Agent SDK's experimental control-only usage request; no model prompt is sent and no credential is copied into Kaisola.")
+                Text("Kaisola reads each named account separately without sending a model prompt or copying its credentials. Provider usage support may be experimental, and refreshes use the CLI already signed in to that account.")
             }
 
             if usage.byChat.isEmpty {
-                Section("Agent chats") {
+                Section("Agent Chats") {
                     Label("Context usage appears after an agent chat reports a window.", systemImage: "gauge.with.dots.needle.bottom.50percent")
                         .foregroundStyle(.secondary)
                 }
             } else {
-                Section("Agent chats") {
+                Section("Agent Chats") {
                     ForEach(usage.all) { chat in
                         ChatUsageRow(chat: chat)
                     }
                 }
                 Section {
-                    Button("Reset usage", role: .destructive) { usage.reset() }
+                    Button("Reset Usage", role: .destructive) {
+                        showsResetConfirmation = true
+                    }
                 }
             }
         }
@@ -148,10 +155,38 @@ struct UsageSettingsTab: View {
             guard ProcessInfo.processInfo.environment["KAISOLA_NATIVE_VISUAL_FIXTURE"] != "1" else { return }
             usage.refreshPlanUsage(workspace: workspace, force: true)
         }
+        .confirmationDialog(
+            "Remove \(pendingAccountRemoval?.label ?? "Account")?",
+            isPresented: Binding(
+                get: { pendingAccountRemoval != nil },
+                set: { if !$0 { pendingAccountRemoval = nil } }
+            ),
+            titleVisibility: .visible
+        ) {
+            Button("Remove Account", role: .destructive) {
+                guard let profile = pendingAccountRemoval else { return }
+                pendingAccountRemoval = nil
+                guard accountStore.remove(id: profile.id) else { return }
+                accountProfiles.removeAll { $0.id == profile.id }
+                NotificationCenter.default.post(name: .kaisolaUsageAccountsChanged, object: nil)
+            }
+            Button("Cancel", role: .cancel) { pendingAccountRemoval = nil }
+        } message: {
+            Text("Kaisola will forget this named account. Its provider files and sign-in stay on disk.")
+        }
+        .alert(
+            "Reset Usage History?",
+            isPresented: $showsResetConfirmation
+        ) {
+            Button("Reset Usage", role: .destructive) { usage.reset() }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("This clears restored token, turn, and cost history for every agent chat. Provider account limits are not affected.")
+        }
     }
 
     private var totals: some View {
-        Section("Restored totals") {
+        Section("Restored Totals") {
             LabeledContent("Total peak tokens", value: Self.tokens(usage.totalPeakTokens))
             LabeledContent("Active chats", value: "\(usage.byChat.count)")
             ForEach(usage.costTotals) { total in
@@ -175,10 +210,15 @@ struct UsageSettingsTab: View {
         }
     }
 
-    /// Compact token count: raw below 1k, otherwise "Nk" (parity with the chat
-    /// header's `used/1000)k` formatting).
+    /// Compact token count that changes units at a million instead of emitting
+    /// misleading values such as "1999k".
     static func tokens(_ n: Int) -> String {
-        n < 1000 ? "\(n)" : "\(n / 1000)k"
+        let value = max(0, n)
+        if value < 1_000 { return "\(value)" }
+        if value < 1_000_000 { return "\(value / 1_000)k" }
+        let millions = (Double(value) / 1_000_000 * 10).rounded() / 10
+        if millions.rounded() == millions { return "\(Int(millions))m" }
+        return String(format: "%.1fm", millions)
     }
 }
 
@@ -204,7 +244,7 @@ private struct ProviderPlanUsageRow: View {
                         .background(.quaternary, in: Capsule())
                 }
                 Spacer()
-                Text(provider.sourceLabel)
+                Text(provider.ok ? "Available" : "Needs Attention")
                     .font(.caption2)
                     .foregroundStyle(.tertiary)
             }
@@ -216,7 +256,7 @@ private struct ProviderPlanUsageRow: View {
                     .truncationMode(.middle)
             }
             if provider.experimental == true {
-                Text("Experimental provider API · \(provider.sourceLabel)")
+                Text("Experimental usage support")
                     .font(.caption2)
                     .foregroundStyle(.tertiary)
             }

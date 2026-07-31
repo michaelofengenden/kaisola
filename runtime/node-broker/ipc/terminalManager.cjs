@@ -400,19 +400,24 @@ function agentTurn(id, busy) {
   return rec?.setAgentTurn?.(!!busy) ?? false
 }
 
-function resize(id, cols, rows) {
-  const r = terms.get(id)
-  if (r && cols > 0 && rows > 0) {
-    try {
-      r.pty.resize(cols, rows)
-      r.cols = cols
-      r.rows = rows
-    } catch {
-      /* ignore transient races */
-    }
-    return true
+function resizeRecord(record, cols, rows) {
+  if (!record || !Number.isInteger(cols) || !Number.isInteger(rows) || cols <= 0 || rows <= 0) {
+    return false
   }
-  return false
+  try {
+    record.pty.resize(cols, rows)
+  } catch {
+    // The controller must not cache a geometry the PTY never accepted. A later
+    // level-triggered desktop synchronization can safely retry the same size.
+    return false
+  }
+  record.cols = cols
+  record.rows = rows
+  return true
+}
+
+function resize(id, cols, rows) {
+  return resizeRecord(terms.get(id), cols, rows)
 }
 
 /** Re-bind a record's output stream to a (possibly new) renderer webContents. */
@@ -761,4 +766,4 @@ function diagnostics() {
   }))
 }
 
-module.exports = { available, has, isLive, ownership, spawn, write, agentTurn, resize, setSender, detachRenderer, detachSender, detachSenderPrefix, snapshot, history, subscribe, unsubscribe, unsubscribeSubscriberPrefix, waitForExit, kill, release, scheduleRelease, cancelRelease, trackChild, untrackChild, upgradeReadiness, killAll, list, setAppFocused, configureStorage, setEventSink, diagnostics, __test: { resumeFromSnapshot, splitUtf8, terminalEnv, summarizeUpgradeReadiness } }
+module.exports = { available, has, isLive, ownership, spawn, write, agentTurn, resize, setSender, detachRenderer, detachSender, detachSenderPrefix, snapshot, history, subscribe, unsubscribe, unsubscribeSubscriberPrefix, waitForExit, kill, release, scheduleRelease, cancelRelease, trackChild, untrackChild, upgradeReadiness, killAll, list, setAppFocused, configureStorage, setEventSink, diagnostics, __test: { resizeRecord, resumeFromSnapshot, splitUtf8, terminalEnv, summarizeUpgradeReadiness } }

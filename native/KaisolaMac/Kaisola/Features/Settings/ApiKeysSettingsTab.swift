@@ -22,15 +22,17 @@ struct ApiKeysSettingsTab: View {
 
     var body: some View {
         Form {
-            Section("Direct-API keys") {
+            Section("Direct API Keys") {
                 ForEach(ApiKeyStore.Key.allCases, id: \.self) { key in
                     ApiKeyRow(store: store, key: key)
                 }
                 Text("Stored in this Mac's Keychain and injected only into new direct-API agent terminals and chats. CLI sign-ins do not use these keys; stored values are never displayed.")
                     .font(.caption).foregroundStyle(.secondary)
+                Text("Kaisola checks the key's shape locally. The provider verifies it when a new direct-API session starts.")
+                    .font(.caption).foregroundStyle(.secondary)
             }
 
-            Section("Provider routing") {
+            Section("Provider Routing") {
                 LabeledContent("Provider") {
                     Picker("Provider", selection: $selectedProvider) {
                         ForEach(DirectAPIProvider.allCases) { provider in
@@ -80,7 +82,7 @@ struct ApiKeysSettingsTab: View {
                 }
 
                 LabeledContent {
-                    Button("Use provider defaults", action: resetSelectedProvider)
+                    Button("Use Provider Defaults", action: resetSelectedProvider)
                         .disabled(
                             baseURLBinding.wrappedValue.isEmpty
                                 && modelBinding.wrappedValue.isEmpty
@@ -153,6 +155,31 @@ struct ApiKeysSettingsTab: View {
     }
 }
 
+/// A deliberately soft, local-only check. Prefixes catch common paste mistakes
+/// without pretending the provider accepted the credential; saving remains
+/// available because providers may add legitimate formats over time.
+enum ApiKeyFormatPolicy {
+    static func warning(for key: ApiKeyStore.Key, value: String) -> String? {
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+        if trimmed.unicodeScalars.contains(where: CharacterSet.whitespacesAndNewlines.contains) {
+            return "API keys normally do not contain spaces or line breaks."
+        }
+        switch key {
+        case .anthropic where !trimmed.hasPrefix("sk-ant-"):
+            return "Anthropic API keys usually begin with sk-ant-."
+        case .openai where !trimmed.hasPrefix("sk-"):
+            return "OpenAI API keys usually begin with sk-."
+        default:
+            break
+        }
+        if trimmed.count < 20 {
+            return "This API key looks unusually short."
+        }
+        return nil
+    }
+}
+
 /// One provider row: a masked field that starts empty (the stored value is never
 /// loaded into it), a set/not-set caption, Save, and Clear.
 private struct ApiKeyRow: View {
@@ -162,6 +189,8 @@ private struct ApiKeyRow: View {
     @State private var draft = ""
     @State private var isSet = false
     @State private var errorText: String?
+    @State private var savedFormatWarning: String?
+    @State private var showsClearConfirmation = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 4) {
@@ -177,7 +206,7 @@ private struct ApiKeyRow: View {
                     .disabled(trimmedDraft.isEmpty)
                     .accessibilityLabel("Save \(key.title) API key")
                 if isSet {
-                    Button("Clear", role: .destructive, action: clear)
+                    Button("Clear", role: .destructive) { showsClearConfirmation = true }
                         .accessibilityLabel("Clear \(key.title) API key")
                 }
             }
@@ -193,14 +222,38 @@ private struct ApiKeyRow: View {
                     .font(.caption)
                     .foregroundStyle(.red)
             }
+            if let warning = visibleFormatWarning {
+                Label(warning, systemImage: "exclamationmark.triangle")
+                    .font(.caption)
+                    .foregroundStyle(.orange)
+            }
         }
         // The row label; the field/status stack sits in the value column.
         .modifier(RowLabel(title: key.title))
         .onAppear(perform: refresh)
+        .confirmationDialog(
+            "Clear \(key.title) API Key?",
+            isPresented: $showsClearConfirmation,
+            titleVisibility: .visible
+        ) {
+            Button("Clear API Key", role: .destructive, action: clear)
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("New direct-API sessions will stop receiving this key. Existing provider sign-ins are not affected.")
+        }
     }
 
     private var trimmedDraft: String {
         draft.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private var draftFormatWarning: String? {
+        guard !trimmedDraft.isEmpty else { return nil }
+        return ApiKeyFormatPolicy.warning(for: key, value: draft)
+    }
+
+    private var visibleFormatWarning: String? {
+        trimmedDraft.isEmpty ? savedFormatWarning : draftFormatWarning
     }
 
     private func refresh() {
@@ -208,9 +261,12 @@ private struct ApiKeyRow: View {
         // touch or reveal the developer's real Keychain state.
         guard ProcessInfo.processInfo.environment["KAISOLA_NATIVE_VISUAL_FIXTURE"] != "1" else {
             isSet = false
+            savedFormatWarning = nil
             return
         }
-        isSet = store.read(key) != nil
+        let stored = store.read(key)
+        isSet = stored != nil
+        savedFormatWarning = stored.flatMap { ApiKeyFormatPolicy.warning(for: key, value: $0) }
     }
 
     private func save() {

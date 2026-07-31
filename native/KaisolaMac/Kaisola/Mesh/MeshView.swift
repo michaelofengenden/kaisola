@@ -55,6 +55,8 @@ struct MeshView: View {
                         if index > 0 { Divider() }
                         MeshColumnView(
                             column: column,
+                            enablesPermissionShortcuts: column.id == firstPermissionColumnID,
+                            stop: { Task { await mesh.stopTurn(columnID: column.id) } },
                             showDiff: { diffColumnID = column.id },
                             integrate: { integrateColumnID = column.id }
                         )
@@ -125,6 +127,15 @@ struct MeshView: View {
                     .font(.caption).foregroundStyle(.orange)
             }
             Spacer()
+            if mesh.anyRunning {
+                Button {
+                    Task { await mesh.stopAllTurns() }
+                } label: {
+                    Label("Stop All", systemImage: "stop.circle")
+                }
+                .buttonStyle(.borderless)
+                .help("Stop every running Mesh column without deleting the run")
+            }
             configurationMenu
         }
         .padding(.horizontal, 12)
@@ -157,23 +168,33 @@ struct MeshView: View {
 
     private func send() {
         let text = mesh.draft
-        mesh.draft = ""
+        let accepted: Bool
         switch (mesh.purpose, mesh.mode) {
-        case (.idea, _): mesh.sendIdea(text)
-        case (.build, .staged): mesh.sendStaged(text)
-        case (.build, .flat): mesh.send(text)
+        case (.idea, _): accepted = mesh.sendIdea(text)
+        case (.build, .staged): accepted = mesh.sendStaged(text)
+        case (.build, .flat): accepted = mesh.send(text)
+        }
+        if accepted {
+            mesh.draft = ""
         }
     }
 
     /// The header status chip: the run's purpose plus, when a staged/idea
     /// pipeline is active, its current phase. Nil for a plain flat build run.
     private var headerChip: String? {
+        let queued = mesh.stagedQueuedPromptCount > 0
+            ? " · \(mesh.stagedQueuedPromptCount) queued"
+            : ""
         switch mesh.purpose {
         case .idea:
             return mesh.stage == "Idle" ? "Idea" : "Idea · \(mesh.stage)"
         case .build:
-            return mesh.mode == .staged ? "Staged · \(mesh.stage)" : nil
+            return mesh.mode == .staged ? "Staged · \(mesh.stage)\(queued)" : nil
         }
+    }
+
+    private var firstPermissionColumnID: String? {
+        mesh.columns.first { $0.conversation.pendingPermission != nil }?.id
     }
 
     /// Fetch the column's worktree diff and graft it onto the base workspace.
@@ -255,12 +276,26 @@ struct MeshConfigurationMenu: View {
 /// and the worktree diff affordance.
 private struct MeshColumnView: View {
     let column: MeshSession.Column
+    let enablesPermissionShortcuts: Bool
+    let stop: () -> Void
     let showDiff: () -> Void
     let integrate: () -> Void
     @ObservedObject private var conversation: AcpConversation
+    @State private var transcriptIsReady = false
+    @State private var loadingEarlierRows = false
+    @State private var transcriptIsAtBottom = true
+    @State private var hasUnseenTranscriptUpdates = false
 
-    init(column: MeshSession.Column, showDiff: @escaping () -> Void, integrate: @escaping () -> Void) {
+    init(
+        column: MeshSession.Column,
+        enablesPermissionShortcuts: Bool,
+        stop: @escaping () -> Void,
+        showDiff: @escaping () -> Void,
+        integrate: @escaping () -> Void
+    ) {
         self.column = column
+        self.enablesPermissionShortcuts = enablesPermissionShortcuts
+        self.stop = stop
         self.showDiff = showDiff
         self.integrate = integrate
         self.conversation = column.conversation
@@ -275,6 +310,14 @@ private struct MeshColumnView: View {
                     .fill(conversation.isRunning ? Color.accentColor : (conversation.isConnected ? .green : .secondary))
                     .frame(width: 6, height: 6)
                 Spacer()
+                if conversation.isRunning {
+                    Button(action: stop) {
+                        Image(systemName: "stop.circle")
+                    }
+                    .buttonStyle(.borderless)
+                    .help("Stop \(column.agent.name) without deleting its transcript")
+                    .accessibilityLabel("Stop \(column.agent.name) turn")
+                }
                 if column.worktreePath != nil {
                     Button("Diff", action: showDiff)
                         .buttonStyle(.borderless)
@@ -291,46 +334,110 @@ private struct MeshColumnView: View {
             .background(.thinMaterial)
             Divider()
             ScrollViewReader { proxy in
-                ScrollView {
-                    LazyVStack(alignment: .leading, spacing: 10) {
-                        if let status = conversation.statusMessage {
-                            Label(status, systemImage: "exclamationmark.triangle")
-                                .font(.caption).foregroundStyle(.secondary)
+                ZStack(alignment: .bottomTrailing) {
+                    ScrollView {
+                        LazyVStack(alignment: .leading, spacing: 10) {
+                            if conversation.hiddenEarlierCount > 0 {
+                                HStack(spacing: 6) {
+                                    if loadingEarlierRows { ProgressView().controlSize(.mini) }
+                                    Text(loadingEarlierRows ? "Loading earlier messages…" : "Earlier messages")
+                                        .font(.caption2)
+                                        .foregroundStyle(.secondary)
+                                }
+                                .frame(maxWidth: .infinity)
+                                .padding(.vertical, 5)
+                                .onAppear {
+                                    guard transcriptIsReady,
+                                          !loadingEarlierRows,
+                                          let anchor = conversation.visibleRows.first?.id else { return }
+                                    loadingEarlierRows = true
+                                    conversation.expandEarlier()
+                                    DispatchQueue.main.async {
+                                        TerminalTranscriptScrollPolicy.preserveUserVelocity {
+                                            proxy.scrollTo(anchor, anchor: .top)
+                                        }
+                                        loadingEarlierRows = false
+                                    }
+                                }
+                            } else if transcriptIsReady, !conversation.rows.isEmpty {
+                                Text("Beginning of session")
+                                    .font(.caption2)
+                                    .foregroundStyle(.secondary)
+                                    .frame(maxWidth: .infinity)
+                                    .padding(.vertical, 5)
+                            }
+                            if let status = conversation.statusMessage {
+                                Label(status, systemImage: "exclamationmark.triangle")
+                                    .font(.caption).foregroundStyle(.secondary)
+                            }
+                            ForEach(conversation.visibleRows) { row in
+                                TranscriptRowView(
+                                    row: row,
+                                    retry: { conversation.retryFailed($0) },
+                                    terminalSnapshot: { [weak conversation] id in await conversation?.terminalSnapshot(id) }
+                                )
+                                .id(row.id)
+                            }
+                            Color.clear
+                                .frame(height: 1)
+                                .id("mesh-transcript-bottom-\(column.id)")
+                                .onAppear {
+                                    transcriptIsAtBottom = true
+                                    hasUnseenTranscriptUpdates = false
+                                }
+                                .onDisappear { transcriptIsAtBottom = false }
                         }
-                        ForEach(conversation.rows) { row in
-                            TranscriptRowView(
-                                row: row,
-                                retry: { conversation.retryFailed($0) },
-                                terminalSnapshot: { [weak conversation] id in await conversation?.terminalSnapshot(id) }
-                            )
-                            .id(row.id)
-                        }
+                        .padding(10)
+                        .frame(maxWidth: .infinity, alignment: .leading)
                     }
-                    .padding(10)
-                    .frame(maxWidth: .infinity, alignment: .leading)
+
+                    if transcriptIsReady, !transcriptIsAtBottom, !conversation.rows.isEmpty {
+                        Button {
+                            hasUnseenTranscriptUpdates = false
+                            withAnimation(.easeOut(duration: 0.15)) {
+                                proxy.scrollTo("mesh-transcript-bottom-\(column.id)", anchor: .bottom)
+                            }
+                        } label: {
+                            Image(systemName: hasUnseenTranscriptUpdates ? "arrow.down.circle.fill" : "arrow.down.circle")
+                        }
+                        .buttonStyle(.borderedProminent)
+                        .controlSize(.small)
+                        .padding(8)
+                        .help(hasUnseenTranscriptUpdates ? "Jump to new output" : "Jump to latest")
+                        .accessibilityLabel(hasUnseenTranscriptUpdates ? "Jump to new agent output" : "Jump to latest agent output")
+                    }
                 }
-                .onChange(of: conversation.rows.count) { _, _ in
-                    if let last = conversation.rows.last {
-                        proxy.scrollTo(last.id, anchor: .bottom)
+                .onAppear {
+                    transcriptIsReady = false
+                    transcriptIsAtBottom = true
+                    hasUnseenTranscriptUpdates = false
+                    DispatchQueue.main.async {
+                        proxy.scrollTo("mesh-transcript-bottom-\(column.id)", anchor: .bottom)
+                        transcriptIsReady = true
+                    }
+                }
+                .onChange(of: conversation.contentVersion) { _, _ in
+                    guard transcriptIsReady else { return }
+                    if transcriptIsAtBottom {
+                        DispatchQueue.main.async {
+                            proxy.scrollTo("mesh-transcript-bottom-\(column.id)", anchor: .bottom)
+                        }
+                    } else {
+                        hasUnseenTranscriptUpdates = true
                     }
                 }
             }
             if let permission = conversation.pendingPermission {
                 Divider()
-                VStack(alignment: .leading, spacing: 6) {
-                    Label(permission.title, systemImage: "hand.raised.fill")
-                        .font(.caption).lineLimit(2)
-                        .foregroundStyle(.orange)
-                    HStack(spacing: 6) {
-                        ForEach(permission.options) { option in
-                            Button(option.name) { conversation.answerPermission(option.id) }
-                                .buttonStyle(.bordered)
-                                .controlSize(.small)
-                                .tint(option.kind.contains("reject") ? .red : .accentColor)
-                        }
-                    }
-                }
-                .padding(8)
+                AcpPermissionBar(
+                    request: permission,
+                    allowsRule: conversation.pendingPermissionAllowsRule,
+                    pendingCount: conversation.pendingPermissionCount,
+                    answer: { conversation.answerPermission($0) },
+                    always: { conversation.answerPermissionAlways() },
+                    enablesKeyboardShortcuts: enablesPermissionShortcuts
+                )
+                .controlSize(.small)
             }
         }
         .frame(maxWidth: .infinity)
@@ -343,22 +450,32 @@ private struct MeshColumnView: View {
 struct UnifiedPatchView: View {
     let patch: String
 
+    private var rendered: GitBoundedPatch { GitPatchRendering.bounded(patch) }
+
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
-            ForEach(Array(patch.split(separator: "\n", omittingEmptySubsequences: false).enumerated()), id: \.offset) { _, line in
-                Text(String(line))
+            ForEach(Array(rendered.lines.enumerated()), id: \.offset) { _, line in
+                Text(line)
                     .font(.system(size: 11, design: .monospaced))
-                    .foregroundStyle(tint(for: line))
+                    .foregroundStyle(.primary)
                     .textSelection(.enabled)
                     .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.horizontal, 3)
+                    .background(tint(for: line))
+            }
+            if rendered.isTruncated {
+                Label("Large diff truncated in this view", systemImage: "ellipsis.rectangle")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .padding(.top, 6)
             }
         }
     }
 
-    private func tint(for line: Substring) -> Color {
-        if line.hasPrefix("+"), !line.hasPrefix("+++") { return .green }
-        if line.hasPrefix("-"), !line.hasPrefix("---") { return .red }
-        if line.hasPrefix("@@") { return .blue }
-        return .primary
+    private func tint(for line: String) -> Color {
+        if line.hasPrefix("+"), !line.hasPrefix("+++") { return .green.opacity(0.13) }
+        if line.hasPrefix("-"), !line.hasPrefix("---") { return .red.opacity(0.13) }
+        if line.hasPrefix("@@") { return .accentColor.opacity(0.13) }
+        return .clear
     }
 }

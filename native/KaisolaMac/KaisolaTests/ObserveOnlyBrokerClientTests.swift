@@ -5,6 +5,117 @@ import XCTest
 @testable import Kaisola
 
 final class ObserveOnlyBrokerClientTests: XCTestCase {
+    func testConcurrentConnectsToSameBrokerShareOneTransportAndHandshake() async throws {
+        let transport = ScriptedBrokerTransport(
+            suspendConnect: true,
+            helloAccess: "observer",
+            advertiseObserverRole: true
+        )
+        let client = ObserveOnlyBrokerClient(
+            transport: transport,
+            operationTimeoutNanoseconds: 500_000_000
+        )
+        let info = brokerInfo
+
+        let first = Task { try await client.connect(to: info) }
+        await transport.waitUntilConnectCallCount(1)
+        let second = Task { try await client.connect(to: info) }
+        for _ in 0..<100 { await Task.yield() }
+
+        let callsDuringHandshake = await transport.connectCalls()
+        XCTAssertEqual(callsDuringHandshake, 1)
+        await transport.releaseConnect()
+        let firstHello = try await first.value
+        let secondHello = try await second.value
+
+        XCTAssertEqual(firstHello, secondHello)
+        let helloFrames = await transport.sentFrames().filter {
+            $0.objectValue?["type"]?.stringValue == "hello"
+        }
+        XCTAssertEqual(helloFrames.count, 1)
+        let completedCalls = await transport.connectCalls()
+        XCTAssertEqual(completedCalls, 1)
+        await client.disconnect()
+    }
+
+    func testConcurrentConnectToDifferentBrokerFailsWithoutDisturbingActiveAttempt() async throws {
+        let transport = ScriptedBrokerTransport(
+            suspendConnect: true,
+            helloAccess: "observer",
+            advertiseObserverRole: true
+        )
+        let client = ObserveOnlyBrokerClient(
+            transport: transport,
+            operationTimeoutNanoseconds: 500_000_000
+        )
+        let info = brokerInfo
+        let active = Task { try await client.connect(to: info) }
+        await transport.waitUntilConnectCallCount(1)
+        let other = BrokerInfo(
+            protocolVersion: info.protocolVersion,
+            securityEpoch: info.securityEpoch,
+            implementationVersion: info.implementationVersion,
+            packageSchema: info.packageSchema,
+            packageVersion: info.packageVersion,
+            contentDigest: info.contentDigest,
+            pid: info.pid,
+            socketPath: "/tmp/kaisola-other-observer-test.sock",
+            token: String(repeating: "b", count: 64),
+            startedAt: info.startedAt + 1,
+            version: info.version
+        )
+
+        do {
+            _ = try await client.connect(to: other)
+            XCTFail("A different broker must not replace an in-flight handshake")
+        } catch {
+            XCTAssertEqual(error as? BrokerClientError, .identityChanged)
+        }
+        let callsAfterRefusal = await transport.connectCalls()
+        XCTAssertEqual(callsAfterRefusal, 1)
+
+        await transport.releaseConnect()
+        _ = try await active.value
+        let completedCalls = await transport.connectCalls()
+        XCTAssertEqual(completedCalls, 1)
+        await client.disconnect()
+    }
+
+    func testDisconnectFailsEveryConnectWaiterAndAllowsCleanRetry() async throws {
+        let transport = ScriptedBrokerTransport(
+            suspendConnect: true,
+            helloAccess: "observer",
+            advertiseObserverRole: true
+        )
+        let client = ObserveOnlyBrokerClient(
+            transport: transport,
+            operationTimeoutNanoseconds: 500_000_000
+        )
+        let info = brokerInfo
+        let first = Task { try await client.connect(to: info) }
+        await transport.waitUntilConnectCallCount(1)
+        let second = Task { try await client.connect(to: info) }
+        for _ in 0..<100 { await Task.yield() }
+
+        await client.disconnect()
+        for task in [first, second] {
+            do {
+                _ = try await task.value
+                XCTFail("Disconnect must fail every caller sharing the connect attempt")
+            } catch {
+                XCTAssertEqual(error as? BrokerClientError, .connectionClosed)
+            }
+        }
+        let callsAfterDisconnect = await transport.connectCalls()
+        XCTAssertEqual(callsAfterDisconnect, 1)
+
+        let hello = try await client.connect(to: info)
+        XCTAssertTrue(hello.serverEnforcedObserver)
+        let callsAfterRetry = await transport.connectCalls()
+        XCTAssertEqual(callsAfterRetry, 2)
+        await client.disconnect()
+    }
+
     func testObserverHandshakeIsExplicitAndNewBrokerMustEchoTheRole() async throws {
         let transport = ScriptedBrokerTransport(helloAccess: "observer", advertiseObserverRole: true)
         let client = ObserveOnlyBrokerClient(transport: transport, operationTimeoutNanoseconds: 100_000_000)
@@ -292,6 +403,7 @@ final class ObserveOnlyBrokerClientTests: XCTestCase {
 }
 
 private actor ScriptedBrokerTransport: BrokerByteTransport {
+    private let suspendConnect: Bool
     private let replyToHello: Bool
     private let helloAccess: String?
     private let advertiseObserverRole: Bool
@@ -303,11 +415,19 @@ private actor ScriptedBrokerTransport: BrokerByteTransport {
     private let contentDigest: String?
     private let statusImplementationVersion: Int?
     private let subscribeOutput: String?
+    private var connectCallCount = 0
+    private var connectReleased: Bool
+    private var connectGates: [CheckedContinuation<Void, Never>] = []
+    private var connectCallWaiters: [(
+        count: Int,
+        continuation: CheckedContinuation<Void, Never>
+    )] = []
     private var frames: [JSONValue] = []
     private var incoming: [Data?] = []
     private var waiter: CheckedContinuation<Data?, Never>?
 
     init(
+        suspendConnect: Bool = false,
         replyToHello: Bool = true,
         helloAccess: String? = nil,
         advertiseObserverRole: Bool = false,
@@ -320,6 +440,8 @@ private actor ScriptedBrokerTransport: BrokerByteTransport {
         statusImplementationVersion: Int? = nil,
         subscribeOutput: String? = nil
     ) {
+        self.suspendConnect = suspendConnect
+        connectReleased = !suspendConnect
         self.replyToHello = replyToHello
         self.helloAccess = helloAccess
         self.advertiseObserverRole = advertiseObserverRole
@@ -333,7 +455,31 @@ private actor ScriptedBrokerTransport: BrokerByteTransport {
         self.subscribeOutput = subscribeOutput
     }
 
-    func connect(path: String) async throws {}
+    func connect(path: String) async throws {
+        connectCallCount += 1
+        let ready = connectCallWaiters.filter { connectCallCount >= $0.count }
+        connectCallWaiters.removeAll { connectCallCount >= $0.count }
+        for observer in ready { observer.continuation.resume() }
+
+        guard suspendConnect, !connectReleased else { return }
+        await withCheckedContinuation { connectGates.append($0) }
+    }
+
+    func waitUntilConnectCallCount(_ count: Int) async {
+        guard connectCallCount < count else { return }
+        await withCheckedContinuation { continuation in
+            connectCallWaiters.append((count, continuation))
+        }
+    }
+
+    func releaseConnect() {
+        connectReleased = true
+        let gates = connectGates
+        connectGates.removeAll()
+        for gate in gates { gate.resume() }
+    }
+
+    func connectCalls() -> Int { connectCallCount }
 
     func send(_ data: Data) async throws {
         guard let newline = data.firstIndex(of: 0x0A) else { throw BrokerClientError.malformedResponse }
@@ -440,6 +586,7 @@ private actor ScriptedBrokerTransport: BrokerByteTransport {
     }
 
     func close() async {
+        releaseConnect()
         waiter?.resume(returning: nil)
         waiter = nil
     }

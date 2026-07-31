@@ -583,6 +583,9 @@ final class KaisolaMacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDele
     // observer connection — the broker's coexistence contract makes concurrent
     // observers safe. Keyed by the NSWindow so menu actions target the key one.
     private var windowModels: [ObjectIdentifier: AppModel] = [:]
+    /// The last actual project window remains the Settings target while the
+    /// standalone Settings window itself is key.
+    private weak var lastWorkspaceWindow: NSWindow?
     private var companionProjectionObservers: [ObjectIdentifier: AnyCancellable] = [:]
     private var companionAttentionObserver: AnyCancellable?
     private var teardownTasks: [ObjectIdentifier: Task<Void, Never>] = [:]
@@ -596,7 +599,11 @@ final class KaisolaMacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDele
     private var agentsObserver: NSObjectProtocol?
     private var runInTerminalObserver: NSObjectProtocol?
     private var checkForUpdatesObserver: NSObjectProtocol?
+    private var attentionJumpObserver: NSObjectProtocol?
     private var authPhaseObserver: AnyCancellable?
+    private var settingsWorkspaceObserver: AnyCancellable?
+    private var settingsWorkspaceModelID: ObjectIdentifier?
+    private var settingsSelectedSectionID: String?
     private var rememberedSessionRefreshObserver: NSObjectProtocol?
     private var rememberedSessionSyncTask: Task<Void, Never>?
     private var rememberedSessionAccountID: String?
@@ -841,6 +848,18 @@ final class KaisolaMacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDele
             forName: .kaisolaCheckForUpdates, object: nil, queue: .main
         ) { [weak self] _ in
             Task { @MainActor in self?.updateController.checkForUpdates(nil) }
+        }
+        // A system-notification click is process-global. Route it once through
+        // the window registry; per-RootShell observers made every window act on
+        // the same target and could clear an unrelated window's selection.
+        attentionJumpObserver = NotificationCenter.default.addObserver(
+            forName: .kaisolaAttentionJump, object: nil, queue: .main
+        ) { [weak self] note in
+            let targetID = note.userInfo?[NotificationBridge.targetIDKey] as? String
+            Task { @MainActor in
+                guard let self, let targetID else { return }
+                self.revealAttentionTarget(targetID)
+            }
         }
         if let resourceWorkload,
            resourceWorkload.workloadID == NativeResourceWorkloadConfiguration.restoredWindowsID {
@@ -1853,7 +1872,34 @@ final class KaisolaMacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDele
     private func keyModel() -> AppModel? {
         guard !terminationPreparationInProgress, !terminationPrepared else { return nil }
         if let key = NSApp.keyWindow, let model = windowModels[ObjectIdentifier(key)] { return model }
-        return windowModels.values.first
+        if let lastWorkspaceWindow,
+           let model = windowModels[ObjectIdentifier(lastWorkspaceWindow)] {
+            return model
+        }
+        return NSApp.orderedWindows.compactMap { windowModels[ObjectIdentifier($0)] }.first
+    }
+
+    private func revealAttentionTarget(_ targetID: String) {
+        let ordered = NSApp.orderedWindows.compactMap { window -> (NSWindow, AppModel)? in
+            windowModels[ObjectIdentifier(window)].map { (window, $0) }
+        }
+        let visibleOwner = ordered.first { $0.1.isSurfaceVisible(targetID) }
+        let keyOwner = NSApp.keyWindow.flatMap { window -> (NSWindow, AppModel)? in
+            guard let model = windowModels[ObjectIdentifier(window)],
+                  model.containsAttentionTarget(targetID) else { return nil }
+            return (window, model)
+        }
+        guard let (window, model) = visibleOwner
+            ?? keyOwner
+            ?? ordered.first(where: { $0.1.containsAttentionTarget(targetID) }) else {
+            AttentionCenter.shared.clear(targetID: targetID)
+            ToastCenter.shared.show("That session is no longer open", style: .info)
+            return
+        }
+        if window.isMiniaturized { window.deminiaturize(nil) }
+        window.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+        model.jumpToAttentionTarget(targetID)
     }
 
     func applicationDidBecomeActive(_ notification: Notification) {
@@ -2516,12 +2562,45 @@ final class KaisolaMacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDele
 
     func windowWillClose(_ notification: Notification) {
         guard let window = notification.object as? NSWindow else { return }
+        if window === settingsWindow {
+            settingsWorkspaceObserver?.cancel()
+            settingsWorkspaceObserver = nil
+            settingsWorkspaceModelID = nil
+            settingsWindow = nil
+            return
+        }
         let id = ObjectIdentifier(window)
-        guard let model = windowModels.removeValue(forKey: id) else { return }
+        let model = windowModels.removeValue(forKey: id)
+        if window === lastWorkspaceWindow { lastWorkspaceWindow = nil }
+        if settingsWorkspaceModelID == id {
+            settingsWorkspaceObserver?.cancel()
+            settingsWorkspaceObserver = nil
+            settingsWorkspaceModelID = nil
+            if let settingsWindow, settingsWindow.isVisible {
+                bindSettingsWindow(settingsWindow, to: activeSettingsModel())
+            }
+        }
+        guard let model else { return }
         companionProjectionObservers.removeValue(forKey: id)
         publishCompanionProjection()
         if teardownTasks[id] == nil {
-            teardownTasks[id] = Task { await model.teardown() }
+            teardownTasks[id] = Task { @MainActor [weak self] in
+                await model.teardown()
+                // Ordinary window closes must not retain a completed Task for
+                // the rest of the process lifetime. The termination drain has
+                // its own snapshot-and-remove loop for models still open when
+                // Quit begins.
+                self?.teardownTasks.removeValue(forKey: id)
+            }
+        }
+    }
+
+    func windowDidBecomeKey(_ notification: Notification) {
+        guard let window = notification.object as? NSWindow,
+              windowModels[ObjectIdentifier(window)] != nil else { return }
+        lastWorkspaceWindow = window
+        if let settingsWindow, settingsWindow.isVisible {
+            bindSettingsWindow(settingsWindow, to: windowModels[ObjectIdentifier(window)])
         }
     }
 
@@ -2736,17 +2815,12 @@ final class KaisolaMacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDele
     private var settingsWindow: NSWindow?
 
     @objc func openSettings(_ sender: Any?) {
+        let model = activeSettingsModel()
         if let settingsWindow, settingsWindow.isVisible {
+            bindSettingsWindow(settingsWindow, to: model)
             settingsWindow.makeKeyAndOrderFront(nil)
             return
         }
-        let view = SettingsView(
-            settings: settings,
-            checkForUpdates: { [weak self] in self?.updateController.checkForUpdates(nil) },
-            updateDetail: updateController.availability.detail,
-            interruptibleTurnCount: { [weak self] in self?.keyModel()?.interruptibleTurnCount ?? 0 },
-            workspace: keyModel()?.currentProjectDirectory
-        )
         let window = NSWindow(
             contentRect: NSRect(x: 0, y: 0, width: 810, height: 540),
             styleMask: [.titled, .closable, .resizable, .fullSizeContentView],
@@ -2760,10 +2834,65 @@ final class KaisolaMacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDele
         window.backgroundColor = .clear
         window.minSize = NSSize(width: 760, height: 500)
         window.isReleasedWhenClosed = false
-        window.contentView = NSHostingView(rootView: view.environmentObject(auth))
+        window.delegate = self
+        bindSettingsWindow(window, to: model)
         window.center()
         window.makeKeyAndOrderFront(nil)
         settingsWindow = window
+    }
+
+    /// Resolve Settings against the frontmost project window, never against
+    /// the Settings window or dictionary iteration order.
+    private func activeSettingsModel() -> AppModel? {
+        if let key = NSApp.keyWindow,
+           let model = windowModels[ObjectIdentifier(key)] {
+            lastWorkspaceWindow = key
+            return model
+        }
+        if let lastWorkspaceWindow,
+           let model = windowModels[ObjectIdentifier(lastWorkspaceWindow)] {
+            return model
+        }
+        return NSApp.orderedWindows.compactMap { windowModels[ObjectIdentifier($0)] }.first
+            ?? windowModels.values.first
+    }
+
+    /// Re-render workspace-scoped tabs whenever their owning AppModel switches
+    /// projects while Settings is open. This prevents MCP/account changes from
+    /// silently landing in the project that happened to be active at creation.
+    private func bindSettingsWindow(_ window: NSWindow, to model: AppModel?) {
+        settingsWorkspaceObserver?.cancel()
+        let capturedModel = model
+        installSettingsContent(in: window, model: capturedModel)
+        guard let capturedModel else {
+            settingsWorkspaceModelID = nil
+            settingsWorkspaceObserver = nil
+            return
+        }
+        settingsWorkspaceModelID = windowModels.first(where: { $0.value === capturedModel })?.key
+        settingsWorkspaceObserver = capturedModel.$selectedProjectID
+            .dropFirst()
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self, weak window, weak capturedModel] _ in
+                guard let self, let window, window.isVisible else { return }
+                self.installSettingsContent(in: window, model: capturedModel)
+            }
+    }
+
+    private func installSettingsContent(in window: NSWindow, model: AppModel?) {
+        let capturedModel = model
+        let view = SettingsView(
+            settings: settings,
+            checkForUpdates: { [weak self] in self?.updateController.checkForUpdates(nil) },
+            updateDetail: updateController.availability.detail,
+            interruptibleTurnCount: { [weak capturedModel] in capturedModel?.interruptibleTurnCount ?? 0 },
+            workspace: capturedModel?.currentProjectDirectory,
+            initialSectionID: settingsSelectedSectionID,
+            sectionChanged: { [weak self] sectionID in
+                self?.settingsSelectedSectionID = sectionID
+            }
+        )
+        window.contentView = NSHostingView(rootView: view.environmentObject(auth))
     }
 
     @objc private func newTerminalSession(_ sender: Any?) {

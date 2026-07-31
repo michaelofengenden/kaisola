@@ -52,6 +52,9 @@ enum FilePreviewContent: Equatable, Sendable {
     static let maxTextBytes = 1_048_576
     static let maxImageBytes = 25 * 1_048_576
     static let imageExtensions: Set<String> = ["png", "jpg", "jpeg", "gif", "heic", "webp", "bmp", "tiff", "svg", "icns"]
+    static let binaryExtensions: Set<String> = [
+        "a", "bin", "class", "dmg", "dylib", "exe", "framework", "o", "pdf", "pkg", "so", "wasm", "zip",
+    ]
 
     static func load(url: URL) -> FilePreviewContent {
         let path = url.path
@@ -62,13 +65,49 @@ enum FilePreviewContent: Equatable, Sendable {
             return size <= maxImageBytes ? .image : .tooLarge(size)
         }
         if ext == "docx" { return size <= maxDocumentBytes ? .docx : .tooLarge(size) }
+        if binaryExtensions.contains(ext) { return .binary }
         guard size <= maxTextBytes else { return .tooLarge(size) }
         guard let data = FileManager.default.contents(atPath: path) else { return .unreadable }
-        guard let text = String(data: data, encoding: .utf8) else { return .binary }
+        // Recheck the actual payload: an agent may append between stat(2) and
+        // the read, and the preview's memory bound must apply to what we loaded.
+        guard data.count <= maxTextBytes else { return .tooLarge(data.count) }
+        guard let text = decodeText(data) else { return .binary }
         if ext == "html" || ext == "htm" { return .html(text) }
         if ext == "csv" || ext == "tsv" { return .csv(text) }
-        if ext == "json" { return .json(text) }
+        if ext == "json" || ext == "ipynb" { return .json(text) }
         return ext == "md" || ext == "markdown" ? .markdown(text) : .text(text)
+    }
+
+    /// Prefer explicit Unicode BOMs, then UTF-8 and common repository-export
+    /// encodings. Latin-1 is intentionally last and only after a binary-control
+    /// sniff, because it can otherwise "decode" arbitrary executable bytes.
+    static func decodeText(_ data: Data) -> String? {
+        if data.starts(with: [0x00, 0x00, 0xFE, 0xFF]) {
+            return String(data: data, encoding: .utf32BigEndian)
+        }
+        if data.starts(with: [0xFF, 0xFE, 0x00, 0x00]) {
+            return String(data: data, encoding: .utf32LittleEndian)
+        }
+        if data.starts(with: [0xFE, 0xFF]) || data.starts(with: [0xFF, 0xFE]) {
+            return String(data: data, encoding: .utf16)
+        }
+        guard !looksBinary(data) else { return nil }
+        if let utf8 = String(data: data, encoding: .utf8) { return utf8 }
+        if let shiftJIS = String(data: data, encoding: .shiftJIS) { return shiftJIS }
+        return String(data: data, encoding: .isoLatin1)
+    }
+
+    static func looksBinary(_ data: Data) -> Bool {
+        let sample = data.prefix(8_192)
+        guard !sample.isEmpty else { return false }
+        var suspicious = 0
+        for byte in sample {
+            if byte == 0 { return true }
+            if byte < 0x09 || (byte > 0x0D && byte < 0x20) {
+                suspicious += 1
+            }
+        }
+        return suspicious * 100 > sample.count * 2
     }
 
     static let maxDocumentBytes = 20 * 1_048_576
@@ -1482,6 +1521,10 @@ struct FilePreviewView: View {
     let restoreSelection: (URL) -> Void
     let close: () -> Void
     private let recoveryStore: FilePreviewRecoveryStore
+    /// The file tree already watches the project for agent edits. The mounted
+    /// document needs its own subscriber because the rail may be hidden while
+    /// an agent rewrites the file currently under review.
+    @StateObject private var workspaceWatcher: WorkspaceWatcher
 
     init(
         url: URL,
@@ -1513,6 +1556,11 @@ struct FilePreviewView: View {
         self.restoreSelection = restoreSelection
         self.close = close
         self.recoveryStore = recoveryStore
+        _workspaceWatcher = StateObject(
+            wrappedValue: WorkspaceWatcher(
+                root: workspaceRoot ?? url.deletingLastPathComponent()
+            )
+        )
     }
 
     @Environment(\.colorScheme) private var colorScheme
@@ -1540,6 +1588,7 @@ struct FilePreviewView: View {
     @State private var pendingAction: PendingAction?
     @State private var showUnsavedPrompt = false
     @State private var showExternalChangePrompt = false
+    @State private var externalChangeDetected = false
     @State private var isLoading = false
     @State private var isSaving = false
     @State private var loadTask: Task<Void, Never>?
@@ -1581,6 +1630,10 @@ struct FilePreviewView: View {
         VStack(spacing: 0) {
             header
             Divider()
+            if externalChangeDetected {
+                externalChangeBanner
+                Divider()
+            }
             ZStack {
                 body(for: content)
                     .allowsHitTesting(!isLoading && !isSaving)
@@ -1655,6 +1708,9 @@ struct FilePreviewView: View {
             promoteEditedPreviewIfNeeded()
         }
         .onChange(of: recoveredDraftPending) { _, _ in promoteEditedPreviewIfNeeded() }
+        .onChange(of: workspaceWatcher.changeToken) { _, _ in
+            reconcileExternalFileChange()
+        }
         .onReceive(NotificationCenter.default.publisher(for: .kaisolaFlushFilePreviews)) { _ in
             flushPendingPreviewSave()
         }
@@ -1742,6 +1798,58 @@ struct FilePreviewView: View {
         } else {
             close()
         }
+    }
+
+    private var externalChangeBanner: some View {
+        HStack(spacing: 8) {
+            Image(systemName: "arrow.triangle.2.circlepath")
+                .foregroundStyle(.orange)
+                .accessibilityHidden(true)
+            Text("Changed on disk while you were editing")
+                .font(.caption.weight(.medium))
+            Spacer(minLength: 8)
+            Button("Reload") {
+                reloadExternalVersion()
+            }
+            .buttonStyle(.bordered)
+            .controlSize(.small)
+            Button {
+                externalChangeDetected = false
+            } label: {
+                Image(systemName: "xmark")
+            }
+            .buttonStyle(.borderless)
+            .help("Dismiss change notice")
+            .accessibilityLabel("Dismiss changed-on-disk notice")
+        }
+        .padding(.horizontal, 11)
+        .frame(minHeight: 32)
+        .background(Color.orange.opacity(colorScheme == .dark ? 0.12 : 0.08))
+        .accessibilityElement(children: .contain)
+    }
+
+    /// FSEvents is project-wide, so re-check the exact mounted file before
+    /// acting. Clean previews follow agent writes automatically; dirty editors
+    /// retain the user's draft and show a reversible reload choice.
+    private func reconcileExternalFileChange() {
+        guard !isLoading, !isSaving, let loadedURL,
+              FilePreviewDiskState.changed(onDisk: loadedURL, since: loadedModificationDate) else {
+            return
+        }
+        if isDirty {
+            externalChangeDetected = true
+        } else {
+            externalChangeDetected = false
+            beginLoad(loadedURL)
+        }
+    }
+
+    private func reloadExternalVersion() {
+        guard let loadedURL else { return }
+        guard clearRecoveryTokens(for: loadedURL) else { return }
+        externalChangeDetected = false
+        recoveredDraftPending = false
+        beginLoad(loadedURL)
     }
 
     private var header: some View {
@@ -1932,6 +2040,18 @@ struct FilePreviewView: View {
 
     private var previewOptionsMenu: some View {
         Menu {
+            Section("File") {
+                Button("Reveal in Finder") {
+                    revealCurrentFileInFinder()
+                }
+                Button("Copy Contents") {
+                    copyCurrentFileContents()
+                }
+                .disabled(copyableContents == nil)
+                Button("Open Externally") {
+                    NSWorkspace.shared.open(loadedURL ?? url)
+                }
+            }
             if case .docx = content {
                 Section("Format") {
                     Button("Bold") { richDocumentCommand = RichDocumentCommand(kind: .bold) }
@@ -1964,6 +2084,35 @@ struct FilePreviewView: View {
         .menuStyle(.borderlessButton)
         .menuIndicator(.hidden)
         .help("Document options")
+        .accessibilityLabel("Document options")
+    }
+
+    private var copyableContents: String? {
+        switch content {
+        case .text, .markdown, .html:
+            draft
+        case let .csv(text), let .json(text):
+            text
+        case .docx:
+            richDraft.string
+        case .image, .tooLarge, .binary, .unreadable:
+            nil
+        }
+    }
+
+    private func copyCurrentFileContents() {
+        guard let copyableContents else { return }
+        let pasteboard = NSPasteboard.general
+        pasteboard.clearContents()
+        guard pasteboard.setString(copyableContents, forType: .string) else {
+            ToastCenter.shared.show("Could not copy file contents", style: .error)
+            return
+        }
+        ToastCenter.shared.show("Copied \((loadedURL ?? url).lastPathComponent)", style: .success)
+    }
+
+    private func revealCurrentFileInFinder() {
+        NSWorkspace.shared.activateFileViewerSelecting([loadedURL ?? url])
     }
 
     private var supportsZoom: Bool {
@@ -2012,6 +2161,7 @@ struct FilePreviewView: View {
                     source: $draft,
                     documentURL: loadedURL ?? url,
                     workspaceRoot: workspaceRoot,
+                    imageRevision: workspaceWatcher.changeToken,
                     zoom: $documentZoom,
                     onError: { saveError = $0 },
                     automaticallyEditFirstBlock: ProcessInfo.processInfo.environment["KAISOLA_NATIVE_VISUAL_FIXTURE"] == "1"
@@ -2054,15 +2204,42 @@ struct FilePreviewView: View {
                 .padding(16)
                 .background(Color(nsColor: .controlBackgroundColor))
         case let .tooLarge(size):
-            ContentUnavailableView(
-                "File too large to preview",
+            unavailablePreview(
+                title: "File too large to preview",
                 systemImage: "doc.zipper",
-                description: Text("\(size / 1024) KB — bounded previews keep the workspace responsive.")
+                description: "\(ByteCountFormatter.string(fromByteCount: Int64(size), countStyle: .file)) — bounded previews keep the project responsive."
             )
         case .binary:
-            ContentUnavailableView("Binary file", systemImage: "doc", description: Text("No text preview available."))
+            unavailablePreview(
+                title: "Binary file",
+                systemImage: "doc",
+                description: "No text preview is available in Kaisola."
+            )
         case .unreadable:
-            ContentUnavailableView("Could not read file", systemImage: "exclamationmark.triangle")
+            unavailablePreview(
+                title: "Could not read file",
+                systemImage: "exclamationmark.triangle",
+                description: "The file may have moved or its permissions may have changed."
+            )
+        }
+    }
+
+    private func unavailablePreview(
+        title: String,
+        systemImage: String,
+        description: String
+    ) -> some View {
+        ContentUnavailableView {
+            Label(title, systemImage: systemImage)
+        } description: {
+            Text(description)
+        } actions: {
+            HStack {
+                Button("Reveal in Finder", action: revealCurrentFileInFinder)
+                Button("Open Externally") {
+                    NSWorkspace.shared.open(loadedURL ?? url)
+                }
+            }
         }
     }
 
@@ -2095,6 +2272,7 @@ struct FilePreviewView: View {
         loadingURL = target
         isLoading = true
         saveError = nil
+        externalChangeDetected = false
         recoveredDraftPending = false
         ownedRecoveryToken = nil
         claimedRecoverySourceTokens = []
@@ -2770,7 +2948,7 @@ struct FilePreviewView: View {
 /// computed off the main actor and applied as TextKit temporary attributes, so
 /// the file remains exact Markdown source even though it reads like a document.
 struct MarkdownEditingStyle: Sendable {
-    enum Role: Equatable, Sendable {
+    enum Role: Hashable, Sendable {
         case heading(Int)
         case quote
         case codeBlock
@@ -2783,7 +2961,7 @@ struct MarkdownEditingStyle: Sendable {
         case syntax
     }
 
-    struct Span: Equatable, Sendable {
+    struct Span: Hashable, Sendable {
         let range: NSRange
         let role: Role
     }
@@ -2849,7 +3027,10 @@ struct MarkdownEditingStyle: Sendable {
             role: { _ in .centered },
             contentGroup: 2
         )
-        collect(#"(?is)<[^>]+>"#, role: { _ in .syntax })
+        // Hide only plausible single-line HTML tags. The former dot-all
+        // `<[^>]+>` rule could span paragraphs and make ordinary comparisons
+        // such as `a < b and c > d` disappear from the rendered editor.
+        collect(#"(?i)</?[A-Za-z][^>\n]*>"#, role: { _ in .syntax })
         collect(#"(?m)^(#{1,6})(?:[ \t]+)(.+)$"#, role: { match in
             .heading(min(6, match.range(at: 1).length))
         }, contentGroup: 2, syntaxGroups: [1])
@@ -2864,7 +3045,18 @@ struct MarkdownEditingStyle: Sendable {
             #"(?ms)^([ \t]*(?:```|~~~)[^\n]*\n).*?^([ \t]*(?:```|~~~)[ \t]*$)"#,
             role: { _ in .codeBlock }
         )
-        return Array(result.prefix(20_000))
+        // Several semantic recognizers intentionally overlap (for example an
+        // `<em>` pair is found both by the emphasis rule and by the generic
+        // tag rule). Apply each identical style/range once so TextKit does not
+        // redo temporary-attribute work while scrolling a Markdown document.
+        var seen: Set<Span> = []
+        var unique: [Span] = []
+        unique.reserveCapacity(min(result.count, 20_000))
+        for span in result where seen.insert(span).inserted {
+            unique.append(span)
+            if unique.count == 20_000 { break }
+        }
+        return unique
     }
 }
 
@@ -4860,10 +5052,160 @@ private struct MarkdownTableCellID: Hashable {
     let column: Int
 }
 
+/// Own hover state at block granularity. Keeping it on the parent document
+/// invalidated every rendered block whenever scrolling moved a new block under
+/// a stationary pointer; image decoding and Markdown layout then fought native
+/// scroll momentum. Local state redraws only the affected block chrome.
+private struct MarkdownBlockHoverChrome<Content: View>: View {
+    let onEdit: () -> Void
+    let content: Content
+    @State private var isHovered = false
+
+    init(onEdit: @escaping () -> Void, @ViewBuilder content: () -> Content) {
+        self.onEdit = onEdit
+        self.content = content()
+    }
+
+    var body: some View {
+        ZStack(alignment: .topTrailing) {
+            content
+            if isHovered {
+                Button(action: onEdit) {
+                    Image(systemName: "pencil")
+                        .font(.system(size: 11, weight: .semibold))
+                        .frame(width: 25, height: 23)
+                        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 7))
+                }
+                .buttonStyle(.plain)
+                .help("Edit this block in place")
+                .accessibilityLabel("Edit this Markdown block")
+            }
+        }
+        .onHover { isHovered = $0 }
+    }
+}
+
+private struct MarkdownImagePayload: @unchecked Sendable {
+    let image: NSImage
+}
+
+/// Thread-safe decoded-image cache for rendered Markdown. LazyVStack may
+/// remount offscreen blocks during momentum; decoding from disk in blockView on
+/// each remount made image-heavy documents hitch. The workspace watcher token
+/// is part of the key, so agent-written replacements still refresh.
+private final class MarkdownLocalImageCache: @unchecked Sendable {
+    static let shared = MarkdownLocalImageCache()
+    private let images = NSCache<NSString, NSImage>()
+
+    private init() {
+        images.countLimit = 64
+        images.totalCostLimit = 128 * 1_048_576
+    }
+
+    func load(
+        source: String,
+        documentURL: URL,
+        workspaceRoot: URL?,
+        revision: Int
+    ) -> MarkdownImagePayload? {
+        guard !source.contains("://"), !source.hasPrefix("data:") else { return nil }
+        let decoded = source.removingPercentEncoding ?? source
+        let base = documentURL.deletingLastPathComponent().standardizedFileURL
+        let candidate = URL(fileURLWithPath: decoded, relativeTo: base)
+            .standardizedFileURL
+            .resolvingSymlinksInPath()
+        let boundary = (workspaceRoot ?? base).standardizedFileURL.resolvingSymlinksInPath()
+        let boundaryPath = boundary.path.hasSuffix("/") ? boundary.path : boundary.path + "/"
+        guard candidate.path == boundary.path || candidate.path.hasPrefix(boundaryPath),
+              let attributes = try? FileManager.default.attributesOfItem(atPath: candidate.path),
+              let bytes = attributes[.size] as? Int,
+              bytes <= FilePreviewContent.maxImageBytes else { return nil }
+        let key = "\(candidate.path)#\(revision)" as NSString
+        if let cached = images.object(forKey: key) { return MarkdownImagePayload(image: cached) }
+        guard let image = NSImage(contentsOf: candidate) else { return nil }
+        images.setObject(image, forKey: key, cost: max(1, bytes))
+        return MarkdownImagePayload(image: image)
+    }
+}
+
+private struct MarkdownLocalImageView: View {
+    let source: String
+    let alt: String?
+    let declaredWidth: Double?
+    let declaredHeight: Double?
+    let alignment: MarkdownDocument.ContentAlignment?
+    let availableWidth: CGFloat
+    let zoom: CGFloat
+    let documentURL: URL
+    let workspaceRoot: URL?
+    let revision: Int
+    @State private var image: NSImage?
+    @State private var didFinishLoading = false
+
+    private var loadIdentity: String {
+        "\(documentURL.path)|\(source)|\(revision)"
+    }
+
+    var body: some View {
+        Group {
+            if let image {
+                let renderedSize = MarkdownPreviewLayout.imageSize(
+                    intrinsicSize: image.size,
+                    declaredWidth: declaredWidth,
+                    declaredHeight: declaredHeight,
+                    availableWidth: availableWidth,
+                    zoom: zoom
+                )
+                Image(nsImage: image)
+                    .resizable()
+                    .aspectRatio(contentMode: .fit)
+                    .frame(width: renderedSize.width, height: renderedSize.height)
+                    .clipShape(RoundedRectangle(cornerRadius: 12 * zoom, style: .continuous))
+                    .frame(maxWidth: .infinity, alignment: frameAlignment)
+                    .accessibilityLabel(alt ?? "Markdown image")
+            } else if !didFinishLoading {
+                ProgressView()
+                    .controlSize(.small)
+                    .frame(maxWidth: .infinity, minHeight: 64, alignment: frameAlignment)
+                    .accessibilityLabel("Loading Markdown image")
+            } else {
+                Label(alt ?? "Image unavailable", systemImage: "photo")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity, alignment: frameAlignment)
+            }
+        }
+        .task(id: loadIdentity) {
+            image = nil
+            didFinishLoading = false
+            let payload = await Task.detached(priority: .utility) {
+                MarkdownLocalImageCache.shared.load(
+                    source: source,
+                    documentURL: documentURL,
+                    workspaceRoot: workspaceRoot,
+                    revision: revision
+                )
+            }.value
+            guard !Task.isCancelled else { return }
+            image = payload?.image
+            didFinishLoading = true
+        }
+    }
+
+    private var frameAlignment: Alignment {
+        switch alignment {
+        case .center: .center
+        case .trailing: .trailing
+        default: .leading
+        }
+    }
+}
+
 private struct MarkdownDocumentView: View {
     @Binding var source: String
     let documentURL: URL
     let workspaceRoot: URL?
+    let imageRevision: Int
     @Binding var zoom: CGFloat
     let onError: (String) -> Void
     let automaticallyEditFirstBlock: Bool
@@ -4871,7 +5213,6 @@ private struct MarkdownDocumentView: View {
     @State private var pinchStartZoom: CGFloat?
     @State private var activeEdit: ActiveEdit?
     @State private var activeTableCell: (id: MarkdownTableCellID, text: String)?
-    @State private var hoveredBlockID: Int?
     @State private var appliedAutomaticEdit = false
     @State private var blockCache = MarkdownSourceBlockCache()
 
@@ -4951,21 +5292,11 @@ private struct MarkdownDocumentView: View {
     ) -> some View {
         let renderedBlocks = blocks.map(\.block)
         ForEach(Array(blocks.enumerated()), id: \.element.id) { index, sourceBlock in
-            let renderedBlock = ZStack(alignment: .topTrailing) {
+            let renderedBlock = MarkdownBlockHoverChrome(
+                onEdit: { beginEditing(sourceBlock) }
+            ) {
                 blockView(sourceBlock, availableWidth: availableWidth)
                     .frame(maxWidth: .infinity, alignment: .leading)
-                if hoveredBlockID == sourceBlock.id {
-                    Button {
-                        beginEditing(sourceBlock)
-                    } label: {
-                        Image(systemName: "pencil")
-                            .font(.system(size: 11, weight: .semibold))
-                            .frame(width: 25, height: 23)
-                            .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 7))
-                    }
-                    .buttonStyle(.plain)
-                    .help("Edit this block in place")
-                }
             }
 
             if case .table = sourceBlock.block {
@@ -4996,10 +5327,6 @@ private struct MarkdownDocumentView: View {
     ) -> some View {
         content
             .contentShape(Rectangle())
-            .onHover { inside in
-                if inside { hoveredBlockID = sourceBlock.id }
-                else if hoveredBlockID == sourceBlock.id { hoveredBlockID = nil }
-            }
             .simultaneousGesture(
                 TapGesture(count: 2).onEnded {
                     // Tables own double-click at cell granularity. The hover
@@ -5029,10 +5356,6 @@ private struct MarkdownDocumentView: View {
     ) -> some View {
         content
             .contentShape(Rectangle())
-            .onHover { inside in
-                if inside { hoveredBlockID = sourceBlock.id }
-                else if hoveredBlockID == sourceBlock.id { hoveredBlockID = nil }
-            }
             // Individual table cells own Return and arrow-key handling. A
             // focusable whole-table Return handler receives the bubbled key
             // first on macOS and incorrectly opens raw block source instead.
@@ -5113,7 +5436,6 @@ private struct MarkdownDocumentView: View {
             before: blocks.filter { NSMaxRange($0.range) <= exact.range.location },
             after: blocks.filter { $0.range.location >= NSMaxRange(exact.range) }
         )
-        hoveredBlockID = nil
     }
 
     private func beginEditingEmptyDocument() {
@@ -5247,27 +5569,18 @@ private struct MarkdownDocumentView: View {
                 .multilineTextAlignment(textAlignment(alignment))
                 .frame(maxWidth: .infinity, alignment: frameAlignment(alignment))
         case let .image(source, alt, declaredWidth, declaredHeight, alignment):
-            if let image = localImage(source: source) {
-                let renderedSize = MarkdownPreviewLayout.imageSize(
-                    intrinsicSize: image.size,
-                    declaredWidth: declaredWidth,
-                    declaredHeight: declaredHeight,
-                    availableWidth: availableWidth,
-                    zoom: zoom
-                )
-                Image(nsImage: image)
-                    .resizable()
-                    .aspectRatio(contentMode: .fit)
-                    .frame(width: renderedSize.width, height: renderedSize.height)
-                    .clipShape(RoundedRectangle(cornerRadius: 12 * zoom, style: .continuous))
-                    .frame(maxWidth: .infinity, alignment: frameAlignment(alignment))
-                    .accessibilityLabel(alt ?? "Markdown image")
-            } else if let alt {
-                Label(alt, systemImage: "photo")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .frame(maxWidth: .infinity, alignment: frameAlignment(alignment))
-            }
+            MarkdownLocalImageView(
+                source: source,
+                alt: alt,
+                declaredWidth: declaredWidth,
+                declaredHeight: declaredHeight,
+                alignment: alignment,
+                availableWidth: availableWidth,
+                zoom: zoom,
+                documentURL: documentURL,
+                workspaceRoot: workspaceRoot,
+                revision: imageRevision
+            )
         case let .listItem(indent, marker, text):
             HStack(alignment: .firstTextBaseline, spacing: 9) {
                 Text(marker)
@@ -5374,20 +5687,6 @@ private struct MarkdownDocumentView: View {
         }
     }
 
-    /// Resolve only local descendants of the open workspace/document folder.
-    /// Remote HTML image sources remain inert in the native Markdown reader.
-    private func localImage(source: String) -> NSImage? {
-        guard !source.contains("://"), !source.hasPrefix("data:") else { return nil }
-        let decoded = source.removingPercentEncoding ?? source
-        let base = documentURL.deletingLastPathComponent().standardizedFileURL
-        let candidate = URL(fileURLWithPath: decoded, relativeTo: base)
-            .standardizedFileURL
-            .resolvingSymlinksInPath()
-        let boundary = (workspaceRoot ?? base).standardizedFileURL.resolvingSymlinksInPath()
-        let boundaryPath = boundary.path.hasSuffix("/") ? boundary.path : boundary.path + "/"
-        guard candidate.path == boundary.path || candidate.path.hasPrefix(boundaryPath) else { return nil }
-        return NSImage(contentsOf: candidate)
-    }
 }
 
 private struct MarkdownTable: View {

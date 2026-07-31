@@ -277,6 +277,21 @@ final class GitServiceTests: XCTestCase {
         XCTAssertFalse(status.isClean)
     }
 
+    func testGitPatchRenderingIsBoundedButPreservesSmallDiffs() {
+        let small = "@@ -1 +1 @@\n-old\n+new"
+        XCTAssertEqual(
+            GitPatchRendering.bounded(small),
+            GitBoundedPatch(lines: ["@@ -1 +1 @@", "-old", "+new"], isTruncated: false)
+        )
+
+        let oversized = (0 ... GitPatchRendering.lineLimit)
+            .map { "+line \($0)" }
+            .joined(separator: "\n")
+        let rendered = GitPatchRendering.bounded(oversized)
+        XCTAssertEqual(rendered.lines.count, GitPatchRendering.lineLimit)
+        XCTAssertTrue(rendered.isTruncated)
+    }
+
     func testStageThenCommitClearsTree() throws {
         try write("a.txt", "hello\n")
         let service = GitService(repoRoot: repo)

@@ -3,7 +3,8 @@ import SwiftUI
 
 /// A compact Git panel: branch + ahead/behind, staged / unstaged / untracked
 /// files with one-click stage/unstage, and a commit box. Backed by GitService
-/// (git as a child process); refreshes on demand.
+/// (git as a child process); refreshes automatically while visible and on
+/// demand. Operations are serialized so an older status cannot win a race.
 @MainActor
 final class GitPanelModel: ObservableObject {
     @Published private(set) var status: GitService.Status?
@@ -23,6 +24,12 @@ final class GitPanelModel: ObservableObject {
     let ghAvailable: Bool
     private let service: GitService
 
+    /// Which inline patches are open and whether each represents the index.
+    /// Every authoritative refresh recomputes these patches with the status in
+    /// one detached snapshot, preventing a staged/unstaged label from showing
+    /// an old diff after external Git activity.
+    private var diffRequests: [String: Bool] = [:]
+
     init(repoRoot: URL) {
         self.repoRoot = repoRoot
         self.service = GitService(repoRoot: repoRoot)
@@ -30,20 +37,52 @@ final class GitPanelModel: ObservableObject {
     }
 
     func refresh() {
-        perform { svc -> (GitService.Status, GitService.PRPrep?) in
-            (try svc.status(), try? svc.prPrep())
-        } apply: {
-            self.status = $0.0
-            self.prPrepInfo = $0.1
+        let requests = diffRequests
+        perform { svc -> GitRefreshSnapshot in
+            let status = try svc.status()
+            let livePaths = Set(
+                status.staged.map(\.path)
+                    + status.unstaged.map(\.path)
+                    + status.untracked
+            )
+            var patches: [String: String] = [:]
+            for (path, staged) in requests where livePaths.contains(path) {
+                guard let patch = try? svc.diff(path: path, staged: staged) else { continue }
+                patches[path] = patch.isEmpty ? "No changes." : patch
+            }
+            return GitRefreshSnapshot(
+                status: status,
+                prep: try? svc.prPrep(),
+                diffs: patches
+            )
+        } apply: { snapshot in
+            self.status = snapshot.status
+            self.prPrepInfo = snapshot.prep
+            self.diffs = snapshot.diffs
+            self.diffRequests = self.diffRequests.filter { snapshot.diffs[$0.key] != nil }
+        } onError: { _ in
+            // A failed refresh cannot certify that the old branch/file state is
+            // still true. Clear it instead of presenting stale Git controls.
+            self.status = nil
+            self.prPrepInfo = nil
+            self.diffs.removeAll()
+            self.diffRequests.removeAll()
+            self.log.removeAll()
         }
     }
 
     func stage(_ path: String) {
-        perform { try $0.stage(path: path); return try $0.status() } apply: { self.status = $0 }
+        perform { try $0.stage(path: path); return try $0.status() } apply: {
+            self.status = $0
+            self.closeDiff(path)
+        }
     }
 
     func unstage(_ path: String) {
-        perform { try $0.unstage(path: path); return try $0.status() } apply: { self.status = $0 }
+        perform { try $0.unstage(path: path); return try $0.status() } apply: {
+            self.status = $0
+            self.closeDiff(path)
+        }
     }
 
     func commit() {
@@ -52,6 +91,9 @@ final class GitPanelModel: ObservableObject {
             self.status = $0.1
             self.prPrepInfo = $0.2
             self.commitMessage = ""
+            self.diffs.removeAll()
+            self.diffRequests.removeAll()
+            self.log.removeAll()
             ToastCenter.shared.show("Committed \($0.0.prefix(7))", style: .success)
         }
     }
@@ -62,12 +104,17 @@ final class GitPanelModel: ObservableObject {
     @Published private(set) var log: [GitService.Commit] = []
 
     func toggleDiff(_ path: String, staged: Bool) {
-        if diffs[path] != nil {
-            diffs[path] = nil
+        guard !isBusy else { return }
+        if diffRequests[path] != nil {
+            closeDiff(path)
             return
         }
+        diffRequests[path] = staged
         perform { try $0.diff(path: path, staged: staged) } apply: { patch in
+            guard self.diffRequests[path] == staged else { return }
             self.diffs[path] = patch.isEmpty ? "No changes." : patch
+        } onError: { _ in
+            self.closeDiff(path)
         }
     }
 
@@ -79,7 +126,7 @@ final class GitPanelModel: ObservableObject {
     func restore(_ path: String) {
         perform { try $0.restoreFile(path: path); return try $0.status() } apply: {
             self.status = $0
-            self.diffs[path] = nil
+            self.closeDiff(path)
         }
     }
 
@@ -123,6 +170,9 @@ final class GitPanelModel: ObservableObject {
         } apply: { outcome in
             self.status = outcome.status
             self.prPrepInfo = outcome.prep
+            self.diffs.removeAll()
+            self.diffRequests.removeAll()
+            self.log.removeAll()
             switch outcome.result {
             case let .created(url):
                 self.prURL = url
@@ -142,8 +192,10 @@ final class GitPanelModel: ObservableObject {
     /// Sendable, so nothing unsafe crosses the boundary.
     private func perform<T: Sendable>(
         _ work: @escaping @Sendable (GitService) throws -> T,
-        apply: @escaping @MainActor (T) -> Void
+        apply: @escaping @MainActor (T) -> Void,
+        onError: (@MainActor (any Error) -> Void)? = nil
     ) {
+        guard !isBusy else { return }
         isBusy = true
         errorMessage = nil
         let service = self.service
@@ -153,11 +205,23 @@ final class GitPanelModel: ObservableObject {
                 apply(value)
                 isBusy = false
             } catch {
+                onError?(error)
                 errorMessage = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
                 isBusy = false
             }
         }
     }
+
+    private func closeDiff(_ path: String) {
+        diffRequests[path] = nil
+        diffs[path] = nil
+    }
+}
+
+private struct GitRefreshSnapshot: Sendable {
+    let status: GitService.Status
+    let prep: GitService.PRPrep?
+    let diffs: [String: String]
 }
 
 /// The terminal outcome of a one-click Create-PR run, carried back across the
@@ -205,7 +269,19 @@ struct GitPanelView: View {
                 ProgressView().frame(maxWidth: .infinity, maxHeight: .infinity)
             }
         }
-        .task { model.refresh() }
+        .task(id: model.repoRoot) {
+            // Git changes frequently arrive outside this panel (agent tools,
+            // terminal commands, hooks). Keep the truth surface current while
+            // the panel is visible; `refresh` skips ticks during an operation.
+            while !Task.isCancelled {
+                model.refresh()
+                do {
+                    try await Task.sleep(nanoseconds: 3_000_000_000)
+                } catch {
+                    break
+                }
+            }
+        }
         .confirmationDialog(
             "Discard changes?",
             isPresented: Binding(get: { restoreCandidate != nil }, set: { if !$0 { restoreCandidate = nil } })
@@ -387,6 +463,7 @@ struct GitPanelView: View {
                             .contentShape(Rectangle())
                         }
                         .buttonStyle(.plain)
+                        .disabled(model.isBusy)
                         .help("Show the diff")
                         Spacer()
                         if restorable {
@@ -425,31 +502,67 @@ struct GitPanelView: View {
     }
 }
 
-/// A raw unified diff, tinted per line (+ green, − red, @@ blue), horizontally
-/// scrollable so long lines never wrap into noise.
+struct GitBoundedPatch: Equatable, Sendable {
+    let lines: [String]
+    let isTruncated: Bool
+}
+
+enum GitPatchRendering {
+    static let characterLimit = 160_000
+    static let lineLimit = 2_500
+
+    static func bounded(_ patch: String) -> GitBoundedPatch {
+        let prefix = patch.prefix(characterLimit)
+        let characterTruncated = prefix.endIndex != patch.endIndex
+        let allLines = prefix.split(separator: "\n", omittingEmptySubsequences: false)
+        let lineTruncated = allLines.count > lineLimit
+        return GitBoundedPatch(
+            lines: allLines.prefix(lineLimit).map(String.init),
+            isTruncated: characterTruncated || lineTruncated
+        )
+    }
+}
+
+/// A raw unified diff whose prefixes remain readable in every appearance mode.
+/// Semantic color lives in a restrained background tint rather than low-
+/// contrast red/green/blue foreground text.
 private struct PatchText: View {
     let patch: String
 
+    private var rendered: GitBoundedPatch { GitPatchRendering.bounded(patch) }
+
     var body: some View {
-        ScrollView(.horizontal, showsIndicators: false) {
-            VStack(alignment: .leading, spacing: 0) {
-                ForEach(Array(patch.split(separator: "\n", omittingEmptySubsequences: false).enumerated()), id: \.offset) { _, line in
-                    Text(String(line))
+        VStack(alignment: .leading, spacing: 0) {
+            ScrollView(.horizontal, showsIndicators: false) {
+                VStack(alignment: .leading, spacing: 0) {
+                    ForEach(Array(rendered.lines.enumerated()), id: \.offset) { _, line in
+                        Text(line)
                         .font(.system(size: 11, design: .monospaced))
-                        .foregroundStyle(tint(for: line))
+                        .foregroundStyle(.primary)
                         .textSelection(.enabled)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(.horizontal, 3)
+                        .background(tint(for: line))
+                    }
                 }
+                .padding(6)
             }
-            .padding(6)
+            if rendered.isTruncated {
+                Label("Large diff truncated in this view", systemImage: "ellipsis.rectangle")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .padding(.horizontal, 8)
+                    .padding(.bottom, 5)
+            }
         }
         .frame(maxHeight: 200)
         .background(.quaternary.opacity(0.35), in: RoundedRectangle(cornerRadius: 6))
     }
 
-    private func tint(for line: Substring) -> Color {
-        if line.hasPrefix("+"), !line.hasPrefix("+++") { return .green }
-        if line.hasPrefix("-"), !line.hasPrefix("---") { return .red }
-        if line.hasPrefix("@@") { return .blue }
-        return .primary
+    private func tint(for line: String) -> Color {
+        if line.hasPrefix("+"), !line.hasPrefix("+++") { return .green.opacity(0.13) }
+        if line.hasPrefix("-"), !line.hasPrefix("---") { return .red.opacity(0.13) }
+        if line.hasPrefix("@@") { return .accentColor.opacity(0.13) }
+        return .clear
     }
 }

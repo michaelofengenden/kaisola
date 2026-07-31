@@ -1,4 +1,5 @@
 import Foundation
+import UserNotifications
 import XCTest
 @testable import Kaisola
 
@@ -95,6 +96,13 @@ final class NotificationBridgeTests: XCTestCase {
         XCTAssertEqual(NotificationBridge.Category(.permission), .permission)
         XCTAssertEqual(NotificationBridge.Category(.turnCompleted), .turnCompleted)
         XCTAssertEqual(NotificationBridge.Category(.sessionResponded), .sessionResponded)
+    }
+
+    func testSettingsAuthorizationPresentationDistinguishesDeniedFromAllowed() {
+        XCTAssertEqual(NotificationAuthorizationState(.notDetermined), .notDetermined)
+        XCTAssertEqual(NotificationAuthorizationState(.denied), .denied)
+        XCTAssertEqual(NotificationAuthorizationState(.authorized), .allowed)
+        XCTAssertEqual(NotificationAuthorizationState(.provisional), .allowed)
     }
 
     // MARK: - durable attention inbox

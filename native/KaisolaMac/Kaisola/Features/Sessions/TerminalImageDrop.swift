@@ -36,6 +36,23 @@ enum TerminalImageDrop {
         case pathOnly
     }
 
+    /// The exact PTY insertion plus any attachment degradation the terminal
+    /// must disclose. Keeping this structured prevents the AppKit drop path
+    /// from guessing whether a quoted image path was intentional (Codex/plain
+    /// shell) or an attachment failure (Claude).
+    struct InsertionPlan: Equatable {
+        let text: String
+        let unattachedClaudeImageCount: Int
+
+        var warningMessage: String? {
+            guard unattachedClaudeImageCount > 0 else { return nil }
+            if unattachedClaudeImageCount == 1 {
+                return "Image wasn’t attached to Claude — the file path was pasted instead."
+            }
+            return "\(unattachedClaudeImageCount) images weren’t attached to Claude — their file paths were pasted instead."
+        }
+    }
+
     /// Extensions Claude accepts as image attachments.
     static let imageExtensions: Set<String> = ["png", "jpg", "jpeg", "gif", "webp"]
 
@@ -85,19 +102,37 @@ enum TerminalImageDrop {
         syntax: AgentSyntax,
         stage: (URL) -> URL? = { stageImage($0) }
     ) -> String {
-        let files = urls.filter(\.isFileURL)
-        guard !files.isEmpty else { return "" }
+        insertionPlan(for: urls, syntax: syntax, stage: stage).text
+    }
 
+    /// Builds the insertion and records every Claude image that had to fall
+    /// back to inert path text. Callers should surface `warningMessage` after
+    /// pasting so the user never assumes Claude received pixels it did not.
+    static func insertionPlan(
+        for urls: [URL],
+        syntax: AgentSyntax,
+        stage: (URL) -> URL? = { stageImage($0) }
+    ) -> InsertionPlan {
+        let files = urls.filter(\.isFileURL)
+        guard !files.isEmpty else {
+            return InsertionPlan(text: "", unattachedClaudeImageCount: 0)
+        }
+
+        var unattachedClaudeImageCount = 0
         let tokens: [String] = files.map { url in
             guard syntax == .claudeMention, isImage(url) else {
                 return shellQuote(url.standardizedFileURL.path)
             }
             guard let staged = stage(url) else {
+                unattachedClaudeImageCount += 1
                 return shellQuote(url.standardizedFileURL.path)
             }
             return "@" + staged.standardizedFileURL.path
         }
-        return tokens.joined(separator: " ") + " "
+        return InsertionPlan(
+            text: tokens.joined(separator: " ") + " ",
+            unattachedClaudeImageCount: unattachedClaudeImageCount
+        )
     }
 
     /// Copy an image to a space-free, collision-free staged path.

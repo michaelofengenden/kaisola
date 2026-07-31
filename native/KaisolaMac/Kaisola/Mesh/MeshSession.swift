@@ -87,6 +87,10 @@ final class MeshSession: ObservableObject, Identifiable {
     /// "Ideating…"/"Reacting…" (idea), "Idle", or a timeout message. Meaningless
     /// for a flat build run.
     @Published private(set) var stage: String = "Idle"
+    /// Prompts waiting behind the currently active scout -> executor pipeline.
+    /// A second send must never cancel the first pipeline and strand its scout
+    /// result; staged runs are therefore drained in strict FIFO order.
+    @Published private(set) var stagedQueuedPromptCount = 0
     @Published private(set) var lifecycle: NativeMeshLifecycle
     @Published var draft: String {
         didSet { onDraftChanged?(draft) }
@@ -106,9 +110,10 @@ final class MeshSession: ObservableObject, Identifiable {
     /// Relay each column's live conversation state through this Mesh object so
     /// parent project navigation can show accurate working activity.
     private var columnObservers = Set<AnyCancellable>()
-    /// Drives the staged / idea handoff; cancelled on shutdown and restarted on
-    /// each new staged/idea send.
+    /// Drives the staged / idea handoff. Staged sends share one FIFO drain task;
+    /// idea sends retain their bounded cancel-and-restart behavior.
     private var stageTask: Task<Void, Never>?
+    private var stagedPromptQueue: [String] = []
     /// Closing a Mesh can race the async repository/worktree probes in `start`.
     /// A generation guard prevents that suspended startup from resurrecting
     /// hidden columns or processes after shutdown.
@@ -179,7 +184,8 @@ final class MeshSession: ObservableObject, Identifiable {
     ) {
         configuredAgentNames = agents.map(\.name)
         configuredMCPServerNames = mcpServerNames
-        columns = agents.map { agent in
+        columns = Self.roles(for: agents, mode: mode, purpose: purpose).map { assignment in
+            let agent = assignment.agent
             let conversation = AcpConversation(
                 title: agent.name,
                 command: "/usr/bin/true",
@@ -194,7 +200,7 @@ final class MeshSession: ObservableObject, Identifiable {
             return Column(
                 id: "\(id)-visual-\(agent.id)",
                 agent: agent,
-                role: .peer,
+                role: assignment.role,
                 conversation: conversation,
                 accountBinding: SessionAccountBinding.resolve(
                     agentID: agent.id,
@@ -600,6 +606,34 @@ final class MeshSession: ObservableObject, Identifiable {
         await persistBestEffort()
     }
 
+    /// End every active turn without closing the Mesh or deleting transcripts,
+    /// drafts, queued prompts, branches, or worktrees.
+    func stopAllTurns() async {
+        startupGeneration &+= 1
+        stageTask?.cancel()
+        stageTask = nil
+        for column in columns where column.conversation.isRunning {
+            _ = await column.conversation.stop()
+        }
+        stage = "Stopped"
+        onDescriptorChanged?()
+        await persistBestEffort()
+    }
+
+    /// Stop one column while keeping the rest visible. A staged orchestration
+    /// cannot safely advance after a human interrupts one participant, so its
+    /// coordinator is cancelled while other already-running columns continue.
+    func stopTurn(columnID: String) async {
+        guard let column = columns.first(where: { $0.id == columnID }) else { return }
+        startupGeneration &+= 1
+        stageTask?.cancel()
+        stageTask = nil
+        _ = await column.conversation.stop()
+        stage = "\(column.agent.name) stopped"
+        onDescriptorChanged?()
+        await persistBestEffort()
+    }
+
     /// Inventory uncommitted files AND unique commits. Any probe failure blocks
     /// deletion; uncertainty must never be treated as a clean worktree.
     func discardAssessment() async -> DiscardAssessment {
@@ -809,67 +843,143 @@ final class MeshSession: ObservableObject, Identifiable {
 
     /// Fan the prompt out to every connected column (each queues if busy).
     /// Flat build mode and manual sends use this directly.
-    func send(_ text: String) {
+    @discardableResult
+    func send(_ text: String) -> Bool {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return }
+        guard !trimmed.isEmpty else { return false }
+        var accepted = false
         for column in columns {
-            column.conversation.send(trimmed)
+            accepted = column.conversation.send(trimmed) || accepted
         }
+        return accepted
     }
+
+    /// Focused, process-free verification seam for FIFO/no-loss behavior.
+    var stagedPromptsForTesting: [String] { stagedPromptQueue }
 
     // MARK: - Staged build pipeline
 
     /// Staged send: prompt the SCOUT only; when its turn ends, auto-fan the
     /// original prompt + the scout's contract to the executors. Falls back to a
     /// flat fan-out when the session isn't staged or has no scout column.
-    func sendStaged(_ text: String) {
+    @discardableResult
+    func sendStaged(_ text: String) -> Bool {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return }
+        guard !trimmed.isEmpty else { return false }
         guard mode == .staged, purpose == .build,
               let scout = columns.first(where: { $0.role == .scout }) else {
-            send(trimmed)
-            return
+            return send(trimmed)
         }
-        stageTask?.cancel()
-        stage = "Scouting…"
+        stagedPromptQueue.append(trimmed)
+        stagedQueuedPromptCount = stagedPromptQueue.count
+        // The active pipeline owns stageTask until it drains or reaches a safe
+        // stop. Never cancel it just because another prompt arrived.
+        guard stageTask == nil else { return true }
         let scoutID = scout.id
-        scout.conversation.send(Self.scoutPrompt(for: trimmed))
         stageTask = Task { [weak self] in
-            await self?.runStagedPipeline(originalPrompt: trimmed, scoutID: scoutID)
+            await self?.drainStagedQueue(scoutID: scoutID)
         }
+        return true
+    }
+
+    private enum StagedPipelineResult {
+        case completed
+        /// The scout never accepted the prompt, so it is safe to put it back at
+        /// the head of the FIFO and wait for a later user retry/send.
+        case retryable
+        /// Work may have reached one or more agents; automatic replay could
+        /// duplicate edits, so stop without re-enqueueing the active prompt.
+        case stopped
+        case cancelled
+    }
+
+    private func drainStagedQueue(scoutID: String) async {
+        defer { stageTask = nil }
+        while !Task.isCancelled, !stagedPromptQueue.isEmpty {
+            let prompt = stagedPromptQueue.removeFirst()
+            stagedQueuedPromptCount = stagedPromptQueue.count
+            switch await runStagedPipeline(originalPrompt: prompt, scoutID: scoutID) {
+            case .completed:
+                continue
+            case .retryable:
+                stagedPromptQueue.insert(prompt, at: 0)
+                stagedQueuedPromptCount = stagedPromptQueue.count
+                return
+            case .stopped, .cancelled:
+                return
+            }
+        }
+        if !Task.isCancelled { stage = "Idle" }
     }
 
     /// Wait (bounded) for the scout's turn to finish, then fan the original
     /// prompt + the scout's contract to the executors, tracking them to Idle.
     /// A >10-minute scout surfaces a timeout stage and stops waiting; never
     /// crashes.
-    private func runStagedPipeline(originalPrompt: String, scoutID: String) async {
-        let deadline = Date().addingTimeInterval(10 * 60)
-        var sawScoutRun = false
-        while true {
-            if Task.isCancelled { return }
-            if Date() >= deadline {
-                stage = "Scout timed out — send again or use flat mode"
-                return
-            }
-            let running = columns.first(where: { $0.id == scoutID })?.conversation.isRunning ?? false
-            if running { sawScoutRun = true }
-            if sawScoutRun && !running { break }
-            try? await Task.sleep(nanoseconds: 200_000_000)
+    private func runStagedPipeline(originalPrompt: String, scoutID: String) async -> StagedPipelineResult {
+        guard let scout = columns.first(where: { $0.id == scoutID }) else {
+            stage = "Scout unavailable — prompt kept in queue"
+            return .retryable
         }
-        if Task.isCancelled { return }
+        stage = "Scouting…"
+        let priorScoutMessageCount = scout.conversation.rows.reduce(into: 0) { count, row in
+            if case .message = row { count += 1 }
+        }
+        guard scout.conversation.send(Self.scoutPrompt(for: originalPrompt)) else {
+            stage = "Scout disconnected — prompt kept in queue"
+            return .retryable
+        }
+        let scoutSettle = await waitForSettle(
+            columnIDs: [scoutID],
+            timeoutStage: "Scout timed out — queued prompts paused"
+        )
+        guard !Task.isCancelled else { return .cancelled }
+        guard scoutSettle == .settled else { return .stopped }
+        let scoutMessageCount = scout.conversation.rows.reduce(into: 0) { count, row in
+            if case .message = row { count += 1 }
+        }
+        guard scoutMessageCount > priorScoutMessageCount,
+              !Self.lastUserTurnFailed(in: scout.conversation.rows) else {
+            stage = "Scout failed before producing a contract — pipeline paused"
+            return .stopped
+        }
         let rows = columns.first(where: { $0.id == scoutID })?.conversation.rows ?? []
         let contract = Self.lastMessageText(in: rows)
         let executors = columns.filter { $0.role == .executor }
-        let executorIDs = executors.map(\.id)
         let prompt = Self.executorPrompt(original: originalPrompt, contract: contract)
-        stage = executorIDs.isEmpty ? "Idle" : "Executing…"
+        var executorIDs: [String] = []
         for column in executors {
-            column.conversation.send(prompt)
+            if column.conversation.send(prompt) { executorIDs.append(column.id) }
         }
-        await waitForSettle(columnIDs: executorIDs)
-        if Task.isCancelled { return }
+        if executors.isEmpty {
+            stage = "Idle"
+            return .completed
+        }
+        guard !executorIDs.isEmpty else {
+            stage = "Executors disconnected — pipeline paused"
+            return .stopped
+        }
+        stage = executorIDs.count == executors.count
+            ? "Executing…"
+            : "Executing with \(executorIDs.count) of \(executors.count) agents…"
+        let executorSettle = await waitForSettle(
+            columnIDs: executorIDs,
+            timeoutStage: "Executors timed out — queued prompts paused"
+        )
+        guard !Task.isCancelled else { return .cancelled }
+        guard executorSettle == .settled else { return .stopped }
+        if executors.contains(where: { column in
+            executorIDs.contains(column.id) && Self.lastUserTurnFailed(in: column.conversation.rows)
+        }) {
+            stage = "An executor failed — queued prompts paused"
+            return .stopped
+        }
+        if executorIDs.count != executors.count {
+            stage = "Some executors were unavailable — pipeline paused"
+            return .stopped
+        }
         stage = "Idle"
+        return .completed
     }
 
     // MARK: - Idea brainstorm cycle
@@ -878,31 +988,42 @@ final class MeshSession: ObservableObject, Identifiable {
     /// no edits), then — after all initial turns end — exactly ONE reaction pass
     /// runs where each column reacts to its peers' answers. Bounded to two turns
     /// per send. Falls back to a flat fan-out when the session isn't idea mode.
-    func sendIdea(_ text: String) {
+    @discardableResult
+    func sendIdea(_ text: String) -> Bool {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return }
+        guard !trimmed.isEmpty else { return false }
         guard purpose == .idea, !columns.isEmpty else {
-            send(trimmed)
-            return
+            return send(trimmed)
         }
         stageTask?.cancel()
         stage = "Ideating…"
         let initial = Self.ideaInitialPrompt(for: trimmed)
-        let columnIDs = columns.map(\.id)
+        var columnIDs: [String] = []
         for column in columns {
-            column.conversation.send(initial)
+            if column.conversation.send(initial) { columnIDs.append(column.id) }
+        }
+        guard !columnIDs.isEmpty else {
+            stage = "Ideators disconnected — draft preserved"
+            return false
+        }
+        if columnIDs.count != columns.count {
+            stage = "Ideating with \(columnIDs.count) of \(columns.count) agents…"
         }
         stageTask = Task { [weak self] in
             await self?.runIdeaCycle(originalPrompt: trimmed, columnIDs: columnIDs)
         }
+        return true
     }
 
     /// Wait for every column's initial turn to finish, snapshot each answer, then
     /// fan a single reaction pass (each column reacts to the OTHERS' answers) and
     /// track it to Idle. Bounded; never crashes.
     private func runIdeaCycle(originalPrompt: String, columnIDs: [String]) async {
-        await waitForSettle(columnIDs: columnIDs, timeoutStage: "Idea timed out — send again")
-        if Task.isCancelled { return }
+        let initialSettle = await waitForSettle(
+            columnIDs: columnIDs,
+            timeoutStage: "Idea timed out — send again"
+        )
+        guard !Task.isCancelled, initialSettle == .settled else { return }
         // Snapshot each column's final initial answer.
         let answers: [(id: String, agent: String, answer: String)] = columns
             .filter { columnIDs.contains($0.id) }
@@ -915,30 +1036,54 @@ final class MeshSession: ObservableObject, Identifiable {
             let prompt = Self.ideaReactionPrompt(agent: column.agent.name, original: originalPrompt, peerAnswers: peers)
             column.conversation.send(prompt)
         }
-        await waitForSettle(columnIDs: columnIDs)
-        if Task.isCancelled { return }
+        let reactionSettle = await waitForSettle(
+            columnIDs: columnIDs,
+            timeoutStage: "Reaction timed out — send again"
+        )
+        guard !Task.isCancelled, reactionSettle == .settled else { return }
         stage = "Idle"
     }
 
     /// Poll until the given columns have all been running and then all stopped —
     /// i.e. their current turns have settled. Bounded: a 30s grace covers the
     /// "never started" case, and `timeoutStage`, when given, sets the stage on a
-    /// 10-minute hard cap. Cancellation returns early.
-    private func waitForSettle(columnIDs: [String], timeoutStage: String? = nil) async {
-        guard !columnIDs.isEmpty else { return }
+    /// 10-minute hard cap. Cancellation and disconnects are explicit outcomes,
+    /// so callers never continue into a later phase after a failed handoff.
+    private enum SettleResult: Equatable {
+        case settled
+        case didNotStart
+        case timedOut
+        case disconnected
+        case cancelled
+    }
+
+    private func waitForSettle(columnIDs: [String], timeoutStage: String? = nil) async -> SettleResult {
+        guard !columnIDs.isEmpty else { return .settled }
         var sawRunning = false
-        let startGrace = Date().addingTimeInterval(30)
+        // `AcpConversation.send` marks a dispatched or queued turn running
+        // synchronously. Five seconds is ample scheduling grace without hiding
+        // a rejected handoff for half a minute.
+        let startGrace = Date().addingTimeInterval(5)
         let hardDeadline = Date().addingTimeInterval(10 * 60)
         while true {
-            if Task.isCancelled { return }
-            if let timeoutStage, Date() >= hardDeadline {
-                stage = timeoutStage
-                return
+            if Task.isCancelled { return .cancelled }
+            if Date() >= hardDeadline {
+                stage = timeoutStage ?? "Agents timed out — queued prompts paused"
+                return .timedOut
             }
-            let running = columns.contains { columnIDs.contains($0.id) && $0.conversation.isRunning }
+            let targets = columns.filter { columnIDs.contains($0.id) }
+            let running = targets.contains { $0.conversation.isRunning }
             if running { sawRunning = true }
-            if sawRunning && !running { return }
-            if !sawRunning && Date() >= startGrace { return }
+            if sawRunning && !running { return .settled }
+            if !sawRunning,
+               (targets.count != columnIDs.count || targets.allSatisfy({ !$0.conversation.isConnected })) {
+                stage = "Agent disconnected before the handoff started"
+                return .disconnected
+            }
+            if !sawRunning && Date() >= startGrace {
+                stage = "Agent did not start — queued prompts paused"
+                return .didNotStart
+            }
             try? await Task.sleep(nanoseconds: 250_000_000)
         }
     }
@@ -986,6 +1131,13 @@ final class MeshSession: ObservableObject, Identifiable {
             if case let .message(_, text) = row { return text }
         }
         return ""
+    }
+
+    nonisolated static func lastUserTurnFailed(in rows: [AcpTranscriptRow]) -> Bool {
+        for row in rows.reversed() {
+            if case let .user(_, _, failed) = row { return failed }
+        }
+        return false
     }
 
     /// Staged phase 1: the scout analyzes the repo + request read-only and emits

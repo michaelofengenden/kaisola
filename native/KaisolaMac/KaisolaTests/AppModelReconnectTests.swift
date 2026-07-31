@@ -601,6 +601,117 @@ final class AppModelReconnectTests: XCTestCase {
         XCTAssertNil(entry)
     }
 
+    func testTerminalResizeSendsOnlyLatestSettledGeometryAndDeduplicatesRepeats() async throws {
+        let fixture = try VisualControlFixture()
+        defer { fixture.cleanUp() }
+        fixture.model.loadVisualFixture(workspace: fixture.root)
+
+        fixture.model.resizeTerminal("visual-terminal", columns: 20, rows: 5)
+        fixture.model.resizeTerminal("visual-terminal", columns: 120, rows: 40)
+        try await Task.sleep(for: .milliseconds(100))
+
+        let settledResizes = await fixture.control.resizeCalls()
+        XCTAssertEqual(
+            settledResizes,
+            [.init(terminalID: "visual-terminal", columns: 120, rows: 40)]
+        )
+
+        fixture.model.resizeTerminal("visual-terminal", columns: 120, rows: 40)
+        try await Task.sleep(for: .milliseconds(100))
+        let repeatedResizes = await fixture.control.resizeCalls()
+        XCTAssertEqual(repeatedResizes.count, 1)
+        await fixture.model.disconnect()
+    }
+
+    func testCompanionLeaseReleaseForceRestoresLatestDesktopGeometry() async throws {
+        let fixture = try VisualControlFixture()
+        defer { fixture.cleanUp() }
+        fixture.model.loadVisualFixture(workspace: fixture.root)
+        let terminal = try XCTUnwrap(fixture.model.sessions.first { $0.id == "visual-terminal" })
+
+        fixture.model.resizeTerminal(terminal.id, columns: 128, rows: 42)
+        try await Task.sleep(for: .milliseconds(100))
+        fixture.model.setCompanionControlActive(true, for: terminal)
+        // AppKit can continue reporting desktop layout while Companion owns
+        // the PTY. It must update desired state without sending it yet.
+        fixture.model.resizeTerminal(terminal.id, columns: 140, rows: 46)
+        fixture.model.setCompanionControlActive(false, for: terminal)
+        try await Task.sleep(for: .milliseconds(30))
+
+        let leaseResizes = await fixture.control.resizeCalls()
+        XCTAssertEqual(
+            Array(leaseResizes.suffix(2)),
+            [
+                .init(terminalID: terminal.id, columns: 128, rows: 42),
+                .init(terminalID: terminal.id, columns: 140, rows: 46),
+            ]
+        )
+        await fixture.model.disconnect()
+    }
+
+    func testTerminalInputQueuePreservesExactFIFOBytes() async throws {
+        let fixture = try VisualControlFixture()
+        defer { fixture.cleanUp() }
+        fixture.model.loadVisualFixture(workspace: fixture.root)
+
+        fixture.model.sendInput("a", to: "visual-terminal")
+        fixture.model.sendInput("β", to: "visual-terminal")
+        fixture.model.sendInput("\r", to: "visual-terminal")
+        await waitUntil { await fixture.control.writes().count == 3 }
+
+        let writes = await fixture.control.writes()
+        XCTAssertEqual(writes, ["a", "β", "\r"])
+        await fixture.model.disconnect()
+    }
+
+    func testStaleAttentionJumpLeavesCurrentSurfaceSelected() async throws {
+        let fixture = try VisualControlFixture()
+        defer { fixture.cleanUp() }
+        fixture.model.loadVisualFixture(workspace: fixture.root)
+        let selected = fixture.model.selectedSessionID
+
+        fixture.model.jumpToAttentionTarget("closed-or-stale-surface")
+
+        XCTAssertEqual(fixture.model.selectedSessionID, selected)
+        await fixture.model.disconnect()
+    }
+
+    func testThreeInventoryTimeoutsForceAReconnectInsteadOfStayingFalselyConnected() async throws {
+        let fixture = try Fixture(failingConnectAttempts: Set(2...20))
+        defer { fixture.cleanUp() }
+        await fixture.model.reload()
+        await fixture.client.failNextInventoryRequests(3)
+
+        await fixture.model.refreshInventory()
+        await fixture.model.refreshInventory()
+        XCTAssertTrue(fixture.model.connectionState.isConnected)
+        await fixture.model.refreshInventory()
+
+        await waitUntil { await fixture.client.connectionAttempts() >= 2 }
+        XCTAssertFalse(fixture.model.connectionState.isConnected)
+        await fixture.model.disconnect()
+    }
+
+    func testControllerLaneDisconnectReconnectsAndReattachesOwnership() async throws {
+        let fixture = try ControllerReconnectFixture()
+        defer { fixture.cleanUp() }
+        await fixture.model.reload()
+        let initialControlConnections = await fixture.control.connectionCount()
+        XCTAssertEqual(initialControlConnections, 1)
+
+        await fixture.control.simulateDisconnect()
+        await waitUntil {
+            let attempts = await fixture.client.connectionAttempts()
+            return attempts >= 2 && fixture.model.connectionState.isConnected
+        }
+
+        let controlConnections = await fixture.control.connectionCount()
+        let attachCalls = await fixture.control.attachCalls()
+        XCTAssertGreaterThanOrEqual(controlConnections, 2)
+        XCTAssertGreaterThanOrEqual(attachCalls.count, 2)
+        await fixture.model.disconnect()
+    }
+
     private func waitUntil(
         iterations: Int = 500,
         condition: @escaping @MainActor () async -> Bool
@@ -633,6 +744,170 @@ final class AppModelReconnectTests: XCTestCase {
                 projectID: "project.one",
                 title: id
             )
+        )
+    }
+}
+
+private struct RecordedTerminalResize: Equatable, Sendable {
+    let terminalID: String
+    let columns: Int
+    let rows: Int
+}
+
+private actor RecordingBrokerControlClient: BrokerControlServing {
+    private var recordedResizes: [RecordedTerminalResize] = []
+    private var recordedWrites: [String] = []
+    private var disconnectHandler: (@Sendable (any Error) -> Void)?
+    private var connectCount = 0
+    private var recordedAttaches: [String] = []
+
+    func setDisconnectHandler(_ handler: (@Sendable (any Error) -> Void)?) async {
+        disconnectHandler = handler
+    }
+
+    func connect(to info: BrokerInfo, ownerID: String) async throws {
+        connectCount += 1
+    }
+
+    func createTerminal(
+        projectID: String,
+        terminalID: String,
+        command: String,
+        arguments: [String],
+        cwd: String,
+        columns: Int,
+        rows: Int
+    ) async throws -> TerminalCreation {
+        TerminalCreation(
+            terminalID: terminalID,
+            projectID: projectID,
+            pid: 1,
+            streamEpoch: "recording"
+        )
+    }
+
+    func attach(projectID: String, terminalID: String) async throws {
+        recordedAttaches.append(terminalID)
+    }
+
+    func write(projectID: String, terminalID: String, data: String) async throws {
+        // Yield here so the test exercises AppModel's serializer rather than
+        // accidentally relying on immediately completing actor calls.
+        await Task.yield()
+        recordedWrites.append(data)
+    }
+
+    func resize(projectID: String, terminalID: String, columns: Int, rows: Int) async throws {
+        recordedResizes.append(.init(terminalID: terminalID, columns: columns, rows: rows))
+    }
+
+    func kill(projectID: String, terminalID: String) async throws {}
+    func release(projectID: String, terminalID: String) async throws {}
+    func detachOwner(projectID: String, terminalID: String) async throws {}
+    func setAgentTurn(projectID: String, terminalID: String, busy: Bool) async throws {}
+    func disconnect() async {}
+
+    func resizeCalls() -> [RecordedTerminalResize] { recordedResizes }
+    func writes() -> [String] { recordedWrites }
+    func connectionCount() -> Int { connectCount }
+    func attachCalls() -> [String] { recordedAttaches }
+    func simulateDisconnect() { disconnectHandler?(BrokerClientError.connectionClosed) }
+}
+
+@MainActor
+private final class VisualControlFixture {
+    let root: URL
+    let control = RecordingBrokerControlClient()
+    let model: AppModel
+
+    init() throws {
+        root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("kaisola-control-\(UUID().uuidString.prefix(8))", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        let transcriptStore = AcpTranscriptStore(fileURL: root.appendingPathComponent("transcripts.json"))
+        model = AppModel(
+            controlClient: control,
+            sessionStore: NativeSessionStore(fileURL: root.appendingPathComponent("sessions.json")),
+            cursorStore: TerminalCursorStore(fileURL: root.appendingPathComponent("cursors.json")),
+            workspaceStateStore: NativeWorkspaceStateStore(fileURL: root.appendingPathComponent("workspace.json")),
+            transcriptStore: transcriptStore,
+            usageCenter: UsageCenter(persistenceStore: transcriptStore),
+            attentionCenter: AttentionCenter(
+                defaults: UserDefaults(suiteName: "kaisola-control-\(UUID().uuidString)")!,
+                postsNotifications: false,
+                updatesDockBadge: false
+            )
+        )
+    }
+
+    func cleanUp() {
+        try? FileManager.default.removeItem(at: root)
+    }
+}
+
+@MainActor
+private final class ControllerReconnectFixture {
+    let root: URL
+    let client = ReconnectBrokerClient(failingConnectAttempts: [])
+    let control = RecordingBrokerControlClient()
+    let model: AppModel
+
+    init() throws {
+        root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("kaisola-controller-reconnect-\(UUID().uuidString.prefix(8))", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        let sessionStore = NativeSessionStore(fileURL: root.appendingPathComponent("sessions.json"))
+        sessionStore.upsert(NativeOwnedSession(
+            id: ReconnectBrokerClient.firstTerminalID,
+            projectID: "project.one",
+            cwd: root.path,
+            title: "Controller reconnect",
+            createdAt: 1
+        ))
+        let transcriptStore = AcpTranscriptStore(fileURL: root.appendingPathComponent("transcripts.json"))
+        model = AppModel(
+            brokerPreparer: LocatedBrokerInfoPreparer(locator: FixedBrokerLocator(info: Self.brokerInfo)),
+            client: client,
+            controlClient: control,
+            sessionStore: sessionStore,
+            cursorStore: TerminalCursorStore(fileURL: root.appendingPathComponent("cursors.json")),
+            workspaceStateStore: NativeWorkspaceStateStore(fileURL: root.appendingPathComponent("workspace.json")),
+            transcriptStore: transcriptStore,
+            usageCenter: UsageCenter(persistenceStore: transcriptStore),
+            attentionCenter: AttentionCenter(
+                defaults: UserDefaults(suiteName: "kaisola-controller-reconnect-\(UUID().uuidString)")!,
+                postsNotifications: false,
+                updatesDockBadge: false
+            ),
+            reconnectBackoff: BrokerReconnectBackoff(
+                baseNanoseconds: 1,
+                maximumNanoseconds: 2,
+                jitterFraction: 0
+            ),
+            sleep: { nanoseconds in
+                if nanoseconds >= 1_000_000_000 {
+                    try await Task.sleep(nanoseconds: nanoseconds)
+                } else {
+                    await Task.yield()
+                }
+            },
+            jitter: { 0 }
+        )
+    }
+
+    func cleanUp() {
+        try? FileManager.default.removeItem(at: root)
+    }
+
+    private static var brokerInfo: BrokerInfo {
+        BrokerInfo(
+            protocolVersion: BrokerWire.protocolVersion,
+            securityEpoch: BrokerWire.securityEpoch,
+            pid: 12_345,
+            socketPath: "/tmp/kaisola-controller-reconnect.sock",
+            token: String(repeating: "b", count: 64),
+            startedAt: 1_784_250_001_000,
+            version: "test"
         )
     }
 }
@@ -735,6 +1010,7 @@ private actor ReconnectBrokerClient: ObserveOnlyBrokerServing {
     private let failingConnectAttempts: Set<Int>
     private let completedAtByTerminalID: [String: Int64]
     private var connectCount = 0
+    private var inventoryFailuresRemaining = 0
     private var cursors: [TerminalCursor?] = []
     private var subscribedTerminalIDs: [String] = []
     private var activeTerminalIDs: Set<String> = []
@@ -784,6 +1060,10 @@ private actor ReconnectBrokerClient: ObserveOnlyBrokerServing {
     }
 
     func inventory() async throws -> BrokerStatus {
+        if inventoryFailuresRemaining > 0 {
+            inventoryFailuresRemaining -= 1
+            throw BrokerClientError.requestTimedOut
+        }
         let expectedHello = BrokerHello(
             protocolVersion: BrokerWire.protocolVersion,
             securityEpoch: BrokerWire.securityEpoch,
@@ -897,6 +1177,9 @@ private actor ReconnectBrokerClient: ObserveOnlyBrokerServing {
     }
 
     func connectionAttempts() -> Int { connectCount }
+    func failNextInventoryRequests(_ count: Int) {
+        inventoryFailuresRemaining = max(0, count)
+    }
     func subscriptionCursors() -> [TerminalCursor?] { cursors }
     func subscriptionIDs() -> [String] { subscribedTerminalIDs }
     func subscriptionCount(for id: String) -> Int {

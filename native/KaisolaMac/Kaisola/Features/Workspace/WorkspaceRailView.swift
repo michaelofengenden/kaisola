@@ -60,14 +60,14 @@ struct WorkspaceRailView: View {
         VStack(spacing: 0) {
             HStack(spacing: 6) {
                 Button(action: close) {
-                    Image(systemName: "folder.fill")
+                    Image(systemName: "sidebar.trailing")
                         .font(.caption.weight(.semibold))
                         .foregroundStyle(Color.accentColor)
                         .frame(width: 20, height: 20)
                 }
                 .buttonStyle(.borderless)
                 .help("Hide \(root.lastPathComponent) files (Command-B)")
-                .accessibilityLabel("Close file browser")
+                .accessibilityLabel("Hide Files")
                 Image(systemName: "magnifyingglass")
                     .font(.caption)
                     .foregroundStyle(.secondary)
@@ -146,6 +146,14 @@ struct WorkspaceRailView: View {
                                 .contentShape(Rectangle())
                             }
                             .buttonStyle(.plain)
+                            .accessibilityLabel(path)
+                            .overlay(alignment: .trailing) {
+                                itemMenu(FileNode(
+                                    url: root.appendingPathComponent(path).standardizedFileURL,
+                                    isDirectory: false
+                                ))
+                                .padding(.trailing, 6)
+                            }
                             .contextMenu {
                                 itemActions(FileNode(
                                     url: root.appendingPathComponent(path).standardizedFileURL,
@@ -520,6 +528,7 @@ struct WorkspaceRailView: View {
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
+        .accessibilityLabel(node.name)
         .id(node.id)
         .simultaneousGesture(
             TapGesture(count: 2).onEnded {
@@ -530,6 +539,26 @@ struct WorkspaceRailView: View {
         .contextMenu {
             itemActions(node)
         }
+        .overlay(alignment: .trailing) {
+            itemMenu(node)
+                .padding(.trailing, 6)
+        }
+    }
+
+    private func itemMenu(_ node: FileNode) -> some View {
+        Menu {
+            itemActions(node)
+        } label: {
+            Image(systemName: "ellipsis")
+                .font(.caption.weight(.semibold))
+                .frame(width: 18, height: 18)
+                .contentShape(Rectangle())
+        }
+        .menuStyle(.borderlessButton)
+        .menuIndicator(.hidden)
+        .fixedSize()
+        .help("File options")
+        .accessibilityLabel("Options for \(node.name)")
     }
 
     @ViewBuilder
@@ -545,6 +574,7 @@ struct WorkspaceRailView: View {
         if !node.isDirectory {
             Button("Open") { openFile(node.url, false) }
             Button("Keep Open") { openFile(node.url, true) }
+            Button("Copy Contents") { copyContents(of: node.url) }
             Divider()
         }
         Button("Reveal in Finder") {
@@ -555,5 +585,38 @@ struct WorkspaceRailView: View {
             .disabled(isMutating)
         Button("Move to Trash…", role: .destructive) { beginTrash(node) }
             .disabled(isMutating)
+    }
+
+    private func copyContents(of url: URL) {
+        Task {
+            let text = await Task.detached(priority: .userInitiated) {
+                WorkspaceFileClipboard.contents(of: url)
+            }.value
+            guard let text else {
+                ToastCenter.shared.show("This file has no copyable text preview", style: .error)
+                return
+            }
+            let pasteboard = NSPasteboard.general
+            pasteboard.clearContents()
+            guard pasteboard.setString(text, forType: .string) else {
+                ToastCenter.shared.show("Could not copy file contents", style: .error)
+                return
+            }
+            ToastCenter.shared.show("Copied \(url.lastPathComponent)", style: .success)
+        }
+    }
+}
+
+enum WorkspaceFileClipboard {
+    static func contents(of url: URL) -> String? {
+        switch FilePreviewContent.load(url: url) {
+        case let .text(text), let .markdown(text), let .csv(text),
+             let .json(text), let .html(text):
+            text
+        case .docx:
+            RichDocumentIO.load(url: url)?.value.string
+        case .image, .tooLarge, .binary, .unreadable:
+            nil
+        }
     }
 }

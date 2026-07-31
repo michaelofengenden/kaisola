@@ -7,6 +7,58 @@ the Swift macOS app, iPhone Companion, shared Swift protocols, and the sealed
 transitional terminal broker; no Electron renderer or React application ships
 in this repository.
 
+### Local iteration build 1002003 — 2026-07-30T17:25:07-0700 (PDT)
+
+- Repaired the terminal input and geometry path identified by the native audit:
+  ownership changes now remount the correct live/read-only surface, controller
+  loss reconnects instead of silently dropping typing, input is serialized, and
+  failed resize acknowledgements cannot overwrite the last valid PTY geometry.
+- Hardened terminal presentation during agent output with exact-bottom pinning,
+  upward-gesture retention, replay-safe attention bells, exact Shift-Return
+  modifiers, accessible reconnect/exit state, and a visible warning when a
+  Claude image attachment cannot be delivered. Unix-domain socket I/O now uses
+  dedicated queues and close wakes blocked reads.
+- Made open file previews follow external edits without overwriting a dirty
+  buffer. Markdown images decode asynchronously through a bounded cache, hover
+  state is local to each block, and the Files rail now exposes Reveal in Finder
+  and Copy Contents from each row's ellipsis menu. Added safer encoding/binary
+  detection, notebook JSON rendering, and recovery actions for unsupported files.
+- Fixed the audit's principal Chat, Git, Mesh, Settings, window-routing, broker-
+  recovery, toast, and accessibility failure seams, including draft-safe sends,
+  unique transcript IDs, FIFO permission and Mesh staging, active-run stop and
+  close confirmation, live Git refresh, stale-target protection, settings
+  rebinding, bounded branch probes, and Reduce Motion/VoiceOver feedback.
+- Moved the work that still needs architectural or physical-device proof into
+  `PULL_REQUEST_FIXES.md` and PRs 8–14 of `PULL_REQUEST_FEATURES.md`. In
+  particular, true sub-row Terminal.app parity still requires a continuous
+  SwiftTerm viewport, and large read-only Markdown still needs the TextKit 2
+  path before either is considered complete.
+- Verification: Node contracts 130/130; shared KaisolaCore contracts 25/25;
+  native macOS tests 644 passed, 7 intentionally skipped, 0 failed; universal
+  arm64/x86_64 Developer ID signing, deep code-sign verification, sealed-helper
+  preflight, and app launch all passed.
+- Installed this uncommitted iteration over source commit `02566d83dbf2` as
+  `/Applications/Kaisola.app`. Broker PID 40496 and PTYs 45199, 48110, 69807,
+  and 83946 survived the GUI replacement with their terminal sizes unchanged.
+  Build 1002002 remains recoverable in Trash.
+
+### Local iteration build 1002002 — 2026-07-30T15:34:51-0700 (PDT)
+
+- Fixed light trackpad scrolling snapping back to live output under rapid agent
+  repaint traffic. Only SwiftTerm's exact `1.0` position is now treated as the
+  live bottom; pending upward intent survives sub-row gesture accumulation and
+  repeated Claude Code packets, while an expired gesture that never moves a row
+  safely resumes live following.
+- Added an always-visible native terminal scrollbar and attributed scrollbar,
+  Page Up/Down, and semantic prompt navigation to the same sticky-scroll policy.
+- Made Glass navigation and workspace backdrops slightly brighter and less gray
+  with a white-led highlight plus restrained system-accent and mesh color washes.
+  Dark Mode stays quieter, and Solid/Reduce Transparency behavior is unchanged.
+- Installed this uncommitted local iteration over source commit `02566d83dbf2`.
+  The optimized universal Developer ID build passed 121 focused tests (one
+  intentional skip), the 240-packet retained-scroll fixture, strict packaged-app
+  preflight, and the 120 Hz streaming cadence gate.
+
 ### Terminal and app experience
 
 - Made Claude Code, Codex, and ordinary shell streaming stable while scrolling:

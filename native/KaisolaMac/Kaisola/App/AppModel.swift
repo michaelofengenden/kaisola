@@ -823,6 +823,39 @@ final class AppModel: ObservableObject {
         } else if meshes.contains(where: { $0.id == id }) {
             selectMesh(id)
         }
+        // The ring and the keyboard must agree in both directions. Moving the
+        // ring from a header click, the rail, or a menu command previously left
+        // AppKit's first responder wherever it was, so the app showed one pane
+        // as focused while typing — and VoiceOver — went to another.
+        TerminalKeyboardFocus.moveFirstResponder(toSessionID: id)
+    }
+
+    /// AppKit moved keyboard focus into a surface (a click into its terminal).
+    /// Route it through the same promotion the pane header performs so the two
+    /// entry points cannot drift apart; the guard makes repeat clicks free.
+    func focusSurfaceFromKeyboard(_ id: String) {
+        guard focusedPaneID != id, isSurfaceVisible(id) else { return }
+        Task { await focusSurface(id) }
+    }
+
+    /// Move pane focus to the next or previous visible surface in the active
+    /// project (View > Focus, Control-Command-Left/Right).
+    func cyclePaneFocus(forward: Bool) {
+        guard let projectID = selectedProjectID,
+              let layout = paneLayouts[projectID],
+              let target = PaneFocusCycle.target(
+                  after: focusedPaneID,
+                  in: layout.sessionIDs,
+                  forward: forward
+              ) else { return }
+        Task { await focusSurface(target) }
+    }
+
+    /// Whether a keyboard focus move has anywhere to go, so the menu items can
+    /// disable themselves instead of looking broken.
+    var canCyclePaneFocus: Bool {
+        guard let projectID = selectedProjectID else { return false }
+        return (paneLayouts[projectID]?.sessionIDs.count ?? 0) > 1
     }
 
     /// Promote a visible secondary terminal without dropping the old primary

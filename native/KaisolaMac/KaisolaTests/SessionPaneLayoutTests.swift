@@ -189,4 +189,34 @@ final class SessionPaneLayoutTests: XCTestCase {
         let decoded = try JSONDecoder().decode(SessionPaneLayout.self, from: JSONEncoder().encode(layout))
         XCTAssertEqual(decoded, layout)
     }
+
+    func testPaneFocusCycleWrapsInBothDirectionsAndAlwaysMovesSomewhere() {
+        let ids = ["terminal:a", "chat:b", "mesh:c"]
+
+        XCTAssertEqual(PaneFocusCycle.target(after: "terminal:a", in: ids, forward: true), "chat:b")
+        XCTAssertEqual(PaneFocusCycle.target(after: "mesh:c", in: ids, forward: true), "terminal:a")
+        XCTAssertEqual(PaneFocusCycle.target(after: "terminal:a", in: ids, forward: false), "mesh:c")
+        XCTAssertEqual(PaneFocusCycle.target(after: "chat:b", in: ids, forward: false), "terminal:a")
+
+        // Nothing focused, or a pane that has since closed: start from the end
+        // the direction implies rather than making the command a silent no-op.
+        XCTAssertEqual(PaneFocusCycle.target(after: nil, in: ids, forward: true), "terminal:a")
+        XCTAssertEqual(PaneFocusCycle.target(after: nil, in: ids, forward: false), "mesh:c")
+        XCTAssertEqual(PaneFocusCycle.target(after: "terminal:gone", in: ids, forward: true), "terminal:a")
+
+        XCTAssertNil(PaneFocusCycle.target(after: "terminal:a", in: [], forward: true))
+        XCTAssertEqual(
+            PaneFocusCycle.target(after: "terminal:a", in: ["terminal:a"], forward: true),
+            "terminal:a"
+        )
+    }
+
+    func testPaneFocusCycleFollowsTheLayoutsReadingOrder() {
+        let layout = SessionPaneLayout(columns: [
+            SessionPaneLayout.Column(id: "left", sessionIDs: ["a", "b"], weight: 1, rowWeights: [1, 1]),
+            SessionPaneLayout.Column(id: "right", sessionIDs: ["c"], weight: 1, rowWeights: [1]),
+        ])
+        XCTAssertEqual(layout.sessionIDs, ["a", "b", "c"])
+        XCTAssertEqual(PaneFocusCycle.target(after: "b", in: layout.sessionIDs, forward: true), "c")
+    }
 }

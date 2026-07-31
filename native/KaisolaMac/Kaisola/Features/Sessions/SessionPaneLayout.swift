@@ -226,3 +226,20 @@ struct SessionPaneLayout: Codable, Equatable, Sendable {
         columns = normalized
     }
 }
+
+/// Keyboard traversal of the visible panes.
+///
+/// `SessionPaneLayout.sessionIDs` is already in reading order (columns left to
+/// right, rows top to bottom), which is the order a user expects an arrow to
+/// follow. Both directions wrap, and an unknown or absent current pane starts
+/// from the appropriate end rather than making the command silently do nothing.
+enum PaneFocusCycle {
+    static func target(after current: String?, in ids: [String], forward: Bool) -> String? {
+        guard !ids.isEmpty else { return nil }
+        guard let current, let index = ids.firstIndex(of: current) else {
+            return forward ? ids.first : ids.last
+        }
+        let count = ids.count
+        return ids[forward ? (index + 1) % count : (index - 1 + count) % count]
+    }
+}

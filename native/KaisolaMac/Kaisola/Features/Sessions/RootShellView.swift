@@ -1537,7 +1537,8 @@ struct RootShellView: View {
                         onResize: owned ? { columns, rows in model.resizeTerminal(id, columns: columns, rows: rows) } : nil,
                         onTitleChange: owned ? { title in model.applyAutoTitle(title, to: id) } : nil,
                         onBell: { handleTerminalBell(id) },
-                        onHistoryBoundary: { openTerminalTranscript(id, fromLiveBoundary: true) }
+                        onHistoryBoundary: { openTerminalTranscript(id, fromLiveBoundary: true) },
+                        onKeyboardFocus: { model.focusSurfaceFromKeyboard(id) }
                     )
                 }
                 // A reconnect can promote an observed surface to an owned one

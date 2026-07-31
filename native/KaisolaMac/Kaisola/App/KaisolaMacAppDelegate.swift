@@ -2714,6 +2714,14 @@ final class KaisolaMacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDele
         terminal.clearLiveScrollback()
     }
 
+    @objc private func focusNextPane(_ sender: Any?) {
+        keyModel()?.cyclePaneFocus(forward: true)
+    }
+
+    @objc private func focusPreviousPane(_ sender: Any?) {
+        keyModel()?.cyclePaneFocus(forward: false)
+    }
+
     @objc private func scrollFocusedTerminalToLatest(_ sender: Any?) {
         guard let terminal = focusedTerminalView() else {
             ToastCenter.shared.show(TerminalClearCommand.noTerminalMessage, style: .info)
@@ -2976,6 +2984,10 @@ final class KaisolaMacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDele
             || menuItem.action == #selector(scrollFocusedTerminalToLatest(_:)) {
             return focusedTerminalView() != nil
         }
+        if menuItem.action == #selector(focusNextPane(_:))
+            || menuItem.action == #selector(focusPreviousPane(_:)) {
+            return keyModel()?.canCyclePaneFocus == true
+        }
         return true
     }
 
@@ -3031,6 +3043,9 @@ final class KaisolaMacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDele
             terminalCommandTarget: self,
             clearTerminalAction: #selector(clearFocusedTerminal(_:)),
             scrollToLatestOutputAction: #selector(scrollFocusedTerminalToLatest(_:)),
+            paneFocusTarget: self,
+            focusNextPaneAction: #selector(focusNextPane(_:)),
+            focusPreviousPaneAction: #selector(focusPreviousPane(_:)),
             dynamicMenusDelegate: self,
             saveWindowTarget: self,
             saveWindowAction: #selector(saveWindowLayout(_:)),
@@ -3082,6 +3097,9 @@ final class KaisolaMacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDele
         terminalCommandTarget: AnyObject? = nil,
         clearTerminalAction: Selector? = nil,
         scrollToLatestOutputAction: Selector? = nil,
+        paneFocusTarget: AnyObject? = nil,
+        focusNextPaneAction: Selector? = nil,
+        focusPreviousPaneAction: Selector? = nil,
         dynamicMenusDelegate: NSMenuDelegate? = nil,
         saveWindowTarget: AnyObject? = nil,
         saveWindowAction: Selector? = nil,
@@ -3331,6 +3349,26 @@ final class KaisolaMacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDele
                 )
                 latest.keyEquivalentModifierMask = [.command, .option]
                 latest.target = terminalCommandTarget
+            }
+            if let focusNextPaneAction, let focusPreviousPaneAction {
+                viewMenu.addItem(.separator())
+                viewMenu.addItem(sectionHeader("Focus"))
+                // Option-Command-arrows already move editor tabs, so pane focus
+                // takes the free Control-Command pair rather than shadowing it.
+                let previous = viewMenu.addItem(
+                    withTitle: "Focus Previous Pane",
+                    action: focusPreviousPaneAction,
+                    keyEquivalent: "\u{F702}"
+                )
+                previous.keyEquivalentModifierMask = [.command, .control]
+                previous.target = paneFocusTarget
+                let next = viewMenu.addItem(
+                    withTitle: "Focus Next Pane",
+                    action: focusNextPaneAction,
+                    keyEquivalent: "\u{F703}"
+                )
+                next.keyEquivalentModifierMask = [.command, .control]
+                next.target = paneFocusTarget
             }
             viewItem.submenu = viewMenu
             mainMenu.addItem(viewItem)

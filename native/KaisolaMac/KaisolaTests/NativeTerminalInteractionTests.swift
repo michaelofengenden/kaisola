@@ -1631,6 +1631,132 @@ final class NativeTerminalInteractionTests: XCTestCase {
         XCTAssertTrue(NativePreviewSettings(defaults: defaults).terminalClipboardWriteAllowed)
     }
 
+    // MARK: - Focus synchronization
+
+    private func twoPaneWindow() -> (window: NSWindow, a: OwnedTerminalView, b: OwnedTerminalView) {
+        let window = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 600, height: 400),
+            styleMask: [.titled],
+            backing: .buffered,
+            defer: false
+        )
+        let root = NSView(frame: NSRect(x: 0, y: 0, width: 600, height: 400))
+        window.contentView = root
+        let font = NSFont.monospacedSystemFont(ofSize: 13, weight: .regular)
+        let a = OwnedTerminalView(frame: NSRect(x: 0, y: 0, width: 300, height: 400), font: font)
+        a.paneSessionID = "terminal:a"
+        let b = OwnedTerminalView(frame: NSRect(x: 300, y: 0, width: 300, height: 400), font: font)
+        b.paneSessionID = "terminal:b"
+        root.addSubview(a)
+        root.addSubview(b)
+        return (window, a, b)
+    }
+
+    func testClickingIntoATerminalReportsKeyboardFocusForItsPane() throws {
+        let panes = twoPaneWindow()
+        var reported: [String] = []
+        panes.a.onKeyboardFocus = { reported.append("terminal:a") }
+        panes.b.onKeyboardFocus = { reported.append("terminal:b") }
+        panes.window.makeFirstResponder(panes.a)
+
+        let click = try XCTUnwrap(NSEvent.mouseEvent(
+            with: .leftMouseDown,
+            location: NSPoint(x: 400, y: 200),
+            modifierFlags: [],
+            timestamp: ProcessInfo.processInfo.systemUptime,
+            windowNumber: panes.window.windowNumber,
+            context: nil,
+            eventNumber: 1,
+            clickCount: 1,
+            pressure: 1
+        ))
+        panes.b.mouseDown(with: click)
+
+        XCTAssertEqual(reported, ["terminal:b"])
+    }
+
+    func testFocusingASurfaceMovesTheAppKitFirstResponderToItsTerminal() {
+        let panes = twoPaneWindow()
+        panes.window.makeFirstResponder(panes.a)
+        XCTAssertTrue(panes.window.firstResponder === panes.a)
+
+        XCTAssertTrue(TerminalKeyboardFocus.moveFirstResponder(
+            toSessionID: "terminal:b",
+            in: panes.window
+        ))
+        XCTAssertTrue(panes.window.firstResponder === panes.b)
+
+        // Already there: nothing to do, and no redundant AppKit churn.
+        XCTAssertFalse(TerminalKeyboardFocus.moveFirstResponder(
+            toSessionID: "terminal:b",
+            in: panes.window
+        ))
+        // A surface with no terminal on screen (a chat, a closed pane) leaves
+        // keyboard focus exactly where it was.
+        XCTAssertFalse(TerminalKeyboardFocus.moveFirstResponder(
+            toSessionID: "chat:z",
+            in: panes.window
+        ))
+        XCTAssertTrue(panes.window.firstResponder === panes.b)
+    }
+
+    func testFocusMoveNeverStealsTheKeyboardFromSomewhereTheUserIsTyping() {
+        XCTAssertTrue(TerminalKeyboardFocus.canClaimFocus(from: nil))
+        let button = NSButton(title: "Focus", target: nil, action: nil)
+        XCTAssertTrue(TerminalKeyboardFocus.canClaimFocus(from: button))
+        // Every editable NSTextField hands its window an NSTextView field
+        // editor as the first responder while the user types in it.
+        XCTAssertFalse(TerminalKeyboardFocus.canClaimFocus(from: NSTextView()))
+
+        let panes = twoPaneWindow()
+        let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 120, height: 22))
+        panes.window.contentView?.addSubview(field)
+        panes.window.makeFirstResponder(field)
+        let editing = panes.window.firstResponder
+        XCTAssertFalse(TerminalKeyboardFocus.moveFirstResponder(
+            toSessionID: "terminal:a",
+            in: panes.window
+        ))
+        XCTAssertTrue(panes.window.firstResponder === editing)
+    }
+
+    func testViewMenuCarriesPaneFocusCyclingClearOfTheFileTabShortcuts() throws {
+        let action = #selector(NSResponder.doCommand(by:))
+        let menu = KaisolaMacAppDelegate.makeMainMenu(
+            updateTarget: nil, updateAction: nil, updateEnabled: false, updateDetail: nil,
+            viewTarget: nil,
+            layoutAction: action,
+            appearanceAction: action,
+            fileTabTarget: nil,
+            previousFileTabAction: action,
+            nextFileTabAction: action,
+            paneFocusTarget: nil,
+            focusNextPaneAction: action,
+            focusPreviousPaneAction: action
+        )
+        let viewMenu = try XCTUnwrap(menu.item(withTitle: "View")?.submenu)
+        let next = try XCTUnwrap(viewMenu.items.first { $0.title == "Focus Next Pane" })
+        XCTAssertEqual(next.keyEquivalent, "\u{F703}")
+        XCTAssertEqual(next.keyEquivalentModifierMask, [.command, .control])
+        let previous = try XCTUnwrap(viewMenu.items.first { $0.title == "Focus Previous Pane" })
+        XCTAssertEqual(previous.keyEquivalent, "\u{F702}")
+        XCTAssertEqual(previous.keyEquivalentModifierMask, [.command, .control])
+
+        // Option-Command-arrows still belong to the editor tabs; the two pairs
+        // must stay distinct or one of the commands becomes unreachable.
+        for item in [
+            try XCTUnwrap(viewMenu.items.first { $0.title == "Next File Tab" }),
+            try XCTUnwrap(viewMenu.items.first { $0.title == "Previous File Tab" }),
+        ] {
+            XCTAssertEqual(item.keyEquivalentModifierMask, [.command, .option])
+        }
+        let duplicates = Dictionary(
+            grouping: viewMenu.items.filter { !$0.keyEquivalent.isEmpty },
+            by: { "\($0.keyEquivalent)|\($0.keyEquivalentModifierMask.rawValue)" }
+        ).filter { $0.value.count > 1 }
+        XCTAssertTrue(duplicates.isEmpty, "Conflicting View shortcuts: \(duplicates.keys)")
+    }
+
     func testReadOnlyViewStillDropsAllPTYBoundBytes() {
         let view = ReadOnlyTerminalView(
             frame: .zero,

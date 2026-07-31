@@ -80,6 +80,10 @@ struct NativeTerminalSurface: NSViewRepresentable {
     /// transcript from there; historical ANSI is never prepended into the live
     /// parser or allowed to mutate the PTY screen.
     var onHistoryBoundary: (() -> Void)? = nil
+    /// AppKit gave this surface keyboard focus (a click into the grid, or a
+    /// programmatic first-responder move). The shell uses it to keep the pane
+    /// focus ring truthful about where typing will land.
+    var onKeyboardFocus: (() -> Void)? = nil
 
     func makeCoordinator() -> Coordinator {
         // Claim the retained pair here, before `makeNSView`, so the view and the
@@ -100,6 +104,9 @@ struct NativeTerminalSurface: NSViewRepresentable {
         guard let sessionID = coordinator.retainedSessionID else { return }
         coordinator.prepareForRetention()
         view.onHistoryBoundary = nil
+        // Parked surfaces must not retain the shell (and its AppModel) through
+        // a focus callback that can no longer describe anything on screen.
+        view.onKeyboardFocus = nil
         TerminalSurfaceCache.shared.store(
             sessionID: sessionID,
             view: view,
@@ -141,6 +148,7 @@ struct NativeTerminalSurface: NSViewRepresentable {
         view.agentLaunchCommand = agentLaunchCommand
         view.onHistoryBoundary = onHistoryBoundary
         view.paneSessionID = sessionID
+        view.onKeyboardFocus = onKeyboardFocus
         view.setAccessibilityLabel(isOwned ? "Terminal" : "Read-only terminal output")
         TerminalScrollGestureMonitor.install()
         let coordinator = context.coordinator
@@ -181,6 +189,7 @@ struct NativeTerminalSurface: NSViewRepresentable {
         view.agentLaunchCommand = agentLaunchCommand
         view.onHistoryBoundary = onHistoryBoundary
         view.paneSessionID = sessionID
+        view.onKeyboardFocus = onKeyboardFocus
         view.configureAdvertisedGraphicsCapabilities()
         view.configureSemanticPromptMarks()
         view.configureJumpToLiveBottomAffordance()
@@ -208,6 +217,7 @@ struct NativeTerminalSurface: NSViewRepresentable {
         view.agentLaunchCommand = agentLaunchCommand
         view.onHistoryBoundary = onHistoryBoundary
         view.paneSessionID = sessionID
+        view.onKeyboardFocus = onKeyboardFocus
         let desired = TerminalFontOptions.resolveFont(family: fontFamily, size: fontSize, weightRaw: fontWeight)
         let desiredLineSpacing = CGFloat(NativePreviewSettings.clampedTerminalLineSpacing(lineSpacing))
         if abs(view.lineSpacing - desiredLineSpacing) > 0.001 {
@@ -1414,6 +1424,33 @@ enum TerminalClipboardWriteRequest {
     }
 }
 
+/// The other half of focus synchronization: after the model moves its pane
+/// focus, AppKit's first responder must follow, or the ring says one thing
+/// while typing (and VoiceOver) go somewhere else.
+@MainActor
+enum TerminalKeyboardFocus {
+    /// Never take the keyboard away from somewhere the user is typing. The
+    /// field editor behind every `NSTextField` — the omnibar, a rename sheet,
+    /// a chat composer — is an `NSText`, so this one check covers them all.
+    static func canClaimFocus(from responder: NSResponder?) -> Bool {
+        guard let responder else { return true }
+        return !(responder is NSText)
+    }
+
+    @discardableResult
+    static func moveFirstResponder(
+        toSessionID id: String,
+        in window: NSWindow? = NSApplication.shared.keyWindow
+    ) -> Bool {
+        guard let window,
+              let root = window.contentView,
+              let terminal = TerminalFocusResolver.terminal(in: root, paneID: id),
+              window.firstResponder !== terminal,
+              canClaimFocus(from: window.firstResponder) else { return false }
+        return window.makeFirstResponder(terminal)
+    }
+}
+
 /// Which terminal a window-level command acts on.
 ///
 /// The model's focused pane is the surface the user can *see* highlighted, so
@@ -1713,6 +1750,10 @@ class ReadOnlyTerminalView: TerminalView {
     /// this rather than assuming the AppKit responder chain already agrees with
     /// the model's focused pane.
     var paneSessionID: String?
+    /// Published to the shell when AppKit hands this view keyboard focus, so
+    /// the pane focus ring follows a click into the terminal instead of staying
+    /// on whichever pane was focused last.
+    var onKeyboardFocus: (() -> Void)?
     private var jumpToLiveBottomButton: NSButton?
     private var lastHistoryBoundaryRequestAt = -TimeInterval.greatestFiniteMagnitude
     var hasUsableRenderGeometry: Bool {
@@ -2039,7 +2080,24 @@ class ReadOnlyTerminalView: TerminalView {
         guard let window else { return }
         if Self.shouldClaimFocus(currentFirstResponder: window.firstResponder, window: window) {
             window.makeFirstResponder(self)
+            publishKeyboardFocus()
         }
+    }
+
+    /// SwiftTerm declares `becomeFirstResponder()` `public`, not `open`, so a
+    /// subclass in this module cannot observe focus acquisition directly. A
+    /// mouse-down in the grid is exactly when AppKit hands this view the first
+    /// responder, and it is precisely the desync the pane ring had: keyboard
+    /// focus moved into this pane while the ring stayed on the previous one.
+    override func mouseDown(with event: NSEvent) {
+        publishKeyboardFocus()
+        super.mouseDown(with: event)
+    }
+
+    /// Tell the shell that typing now lands here. The shell ignores a report
+    /// for the pane it already rings, so repeat clicks cost nothing.
+    func publishKeyboardFocus() {
+        onKeyboardFocus?()
     }
 
     override func layout() {

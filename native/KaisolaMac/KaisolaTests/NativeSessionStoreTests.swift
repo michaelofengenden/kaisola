@@ -407,6 +407,47 @@ final class NativeSessionStoreTests: XCTestCase {
         )
     }
 
+    /// A corrupt-archive drill run under `KAISOLA_NATIVE_BROKER_PROFILE=development`
+    /// once moved the *production* workspace archive aside, because both
+    /// profiles resolved to the same file. The dev profile must land on its
+    /// own filename beside — never instead of — the production archive.
+    func testDevelopmentProfileArchiveURLIsDistinctFromProduction() {
+        let directory = fileURL.deletingLastPathComponent()
+        let production = NativeWorkspaceStateStore.archiveURL(in: directory, forDevelopmentProfile: false)
+        let development = NativeWorkspaceStateStore.archiveURL(in: directory, forDevelopmentProfile: true)
+
+        XCTAssertNotEqual(production, development)
+        XCTAssertEqual(production.deletingLastPathComponent(), directory)
+        XCTAssertEqual(development.deletingLastPathComponent(), directory)
+        XCTAssertEqual(production.lastPathComponent, "workspace-state-v1.json")
+        XCTAssertEqual(development.lastPathComponent, "workspace-state-v1.dev.json")
+    }
+
+    /// The behavioral guarantee behind the path split: writing through the
+    /// dev-profile store must never appear in — or overwrite — the production
+    /// archive, and vice versa.
+    func testStoreCreatedUnderTheDevelopmentProfileWritesToADistinctPathFromProduction() async throws {
+        let directory = fileURL.deletingLastPathComponent()
+        let productionURL = NativeWorkspaceStateStore.archiveURL(in: directory, forDevelopmentProfile: false)
+        let developmentURL = NativeWorkspaceStateStore.archiveURL(in: directory, forDevelopmentProfile: true)
+
+        let developmentStore = NativeWorkspaceStateStore(fileURL: developmentURL)
+        try await developmentStore.setSelectedProjectID("dev-only-project")
+
+        XCTAssertTrue(FileManager.default.fileExists(atPath: developmentURL.path))
+        XCTAssertFalse(
+            FileManager.default.fileExists(atPath: productionURL.path),
+            "Writing the dev-profile archive must not create or touch the production archive."
+        )
+
+        let productionStore = NativeWorkspaceStateStore(fileURL: productionURL)
+        let productionState = try await productionStore.restorationState()
+        XCTAssertNil(
+            productionState.selectedProjectID,
+            "The production archive must stay untouched by dev-profile writes."
+        )
+    }
+
     func testLegacyAgentChatDescriptorDecodesWithoutAccountBinding() throws {
         let json = #"{"id":"chat-legacy","projectID":"nproj_legacy","agentID":"codex","workspacePath":"/tmp/legacy","acpSessionID":"provider-legacy","title":"Legacy"}"#
         let decoded = try JSONDecoder().decode(

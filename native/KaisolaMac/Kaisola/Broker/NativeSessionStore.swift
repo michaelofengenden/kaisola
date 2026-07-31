@@ -1062,8 +1062,7 @@ actor NativeWorkspaceStateStore {
     private var cachedArchive: Archive?
 
     init(
-        fileURL: URL = NativePreviewPaths.applicationSupportDirectory
-            .appendingPathComponent("workspace-state-v1.json"),
+        fileURL: URL = NativeWorkspaceStateStore.defaultArchiveURL,
         fileManager: FileManager = .default,
         meshWorktreeRoot: URL = NativePreviewPaths.meshWorktreesDirectory
     ) {
@@ -1080,6 +1079,31 @@ actor NativeWorkspaceStateStore {
     /// The archive this store protects. Exposed so a degraded-state notice can
     /// name and reveal it without awaiting the actor.
     nonisolated var archiveURL: URL { fileURL }
+
+    /// The production archive location, scoped by broker profile.
+    ///
+    /// A `KAISOLA_NATIVE_BROKER_PROFILE=development` launch already routes to
+    /// the clean-room "Kaisola Dev" broker (`BrokerInfoLocator`) so it never
+    /// touches the ordinary native broker's sessions; the workspace archive
+    /// used to ignore that same override and share one file with production
+    /// regardless. A corrupt-archive drill run under the development profile
+    /// once moved the *production* archive aside as a result. Dev launches now
+    /// get their own filename in the same directory.
+    static var defaultArchiveURL: URL {
+        archiveURL(forDevelopmentProfile: BrokerInfoLocator.defaultPreviewProfile == .development)
+    }
+
+    /// The directory is a parameter (defaulting to the real application
+    /// support directory) so the naming rule is directly testable against a
+    /// throwaway directory without touching the environment or disk state
+    /// this app actually reads.
+    static func archiveURL(
+        in directory: URL = NativePreviewPaths.applicationSupportDirectory,
+        forDevelopmentProfile isDevelopment: Bool
+    ) -> URL {
+        let name = isDevelopment ? "workspace-state-v1.dev.json" : "workspace-state-v1.json"
+        return directory.appendingPathComponent(name)
+    }
 
     static func agentChatStableKey(agentID: String, workspacePath: String) -> String {
         let standardizedPath = URL(fileURLWithPath: workspacePath).standardizedFileURL.path

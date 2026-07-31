@@ -1495,6 +1495,142 @@ final class NativeTerminalInteractionTests: XCTestCase {
         XCTAssertTrue(plainCommandK.isEmpty)
     }
 
+    // MARK: - Consented OSC 52 clipboard writes
+
+    private func clipboardPayload(_ text: String) -> Data {
+        Data(text.utf8)
+    }
+
+    func testClipboardWriteIsRefusedUntilTheUserGrantsIt() {
+        let payload = clipboardPayload("git push --force-with-lease")
+
+        XCTAssertEqual(
+            TerminalClipboardWriteRequest.decide(
+                content: payload,
+                consentGranted: false,
+                hasShownGuidance: false
+            ),
+            .refused(showsGuidance: true)
+        )
+        // Only the first blocked attempt earns a toast; a chatty program must
+        // not be able to turn a refusal into a wall of notifications.
+        XCTAssertEqual(
+            TerminalClipboardWriteRequest.decide(
+                content: payload,
+                consentGranted: false,
+                hasShownGuidance: true
+            ),
+            .refused(showsGuidance: false)
+        )
+        XCTAssertEqual(
+            TerminalClipboardWriteRequest.decide(
+                content: payload,
+                consentGranted: true,
+                hasShownGuidance: true
+            ),
+            .copy("git push --force-with-lease")
+        )
+    }
+
+    func testClipboardWriteDropsTheTrailingNewlineThatWouldAutoExecute() {
+        XCTAssertEqual(
+            TerminalClipboardWriteRequest.decide(
+                content: clipboardPayload("rm -rf ~/work\n"),
+                consentGranted: true,
+                hasShownGuidance: true
+            ),
+            .copy("rm -rf ~/work")
+        )
+        // Interior newlines are ordinary multi-line text and must survive.
+        XCTAssertEqual(
+            TerminalClipboardWriteRequest.decide(
+                content: clipboardPayload("first\nsecond\r\n"),
+                consentGranted: true,
+                hasShownGuidance: true
+            ),
+            .copy("first\nsecond")
+        )
+    }
+
+    func testClipboardWriteIgnoresPayloadsNobodyCouldHaveMeantToPaste() {
+        for content in [
+            Data(),
+            clipboardPayload("\n\n"),
+            // Escape and NUL hide part of a payload from whatever renders it.
+            clipboardPayload("safe\u{1B}[2Kmalicious"),
+            clipboardPayload("nul\u{0}byte"),
+            Data([0xFF, 0xFE, 0xFD]),
+            clipboardPayload(String(repeating: "x", count: TerminalClipboardWriteRequest.maximumPayloadBytes + 1)),
+        ] {
+            XCTAssertEqual(
+                TerminalClipboardWriteRequest.decide(
+                    content: content,
+                    consentGranted: true,
+                    hasShownGuidance: true
+                ),
+                .ignored
+            )
+            // An unusable payload must not spend the one guidance toast either.
+            XCTAssertEqual(
+                TerminalClipboardWriteRequest.decide(
+                    content: content,
+                    consentGranted: false,
+                    hasShownGuidance: false
+                ),
+                .ignored
+            )
+        }
+        // Tabs are ordinary pasteboard text.
+        XCTAssertEqual(
+            TerminalClipboardWriteRequest.decide(
+                content: clipboardPayload("a\tb"),
+                consentGranted: true,
+                hasShownGuidance: true
+            ),
+            .copy("a\tb")
+        )
+    }
+
+    func testTerminalStreamCannotWriteTheClipboardWithoutConsent() throws {
+        let pasteboard = NSPasteboard(name: NSPasteboard.Name("kaisola-osc52-tests"))
+        pasteboard.clearContents()
+        pasteboard.setString("kaisola-untouched", forType: .string)
+        defer { pasteboard.releaseGlobally() }
+
+        let coordinator = NativeTerminalSurface.Coordinator()
+        coordinator.clipboard = pasteboard
+        let view = OwnedTerminalView(
+            frame: NSRect(x: 0, y: 0, width: 640, height: 320),
+            font: NSFont.monospacedSystemFont(ofSize: 13, weight: .regular)
+        )
+        view.terminalDelegate = coordinator
+
+        // OSC 52 as a hostile program would actually emit it.
+        let encoded = Data("stolen".utf8).base64EncodedString()
+        view.feed(text: "\u{1B}]52;c;\(encoded)\u{7}")
+        XCTAssertEqual(pasteboard.string(forType: .string), "kaisola-untouched")
+
+        coordinator.allowsClipboardWrite = true
+        view.feed(text: "\u{1B}]52;c;\(encoded)\u{7}")
+        XCTAssertEqual(pasteboard.string(forType: .string), "stolen")
+
+        // Reading is refused regardless of the write setting: a reply here
+        // would hand the user's clipboard to whatever is running in the pane.
+        XCTAssertNil(coordinator.clipboardRead(source: view))
+    }
+
+    func testClipboardWriteConsentDefaultsOffAndPersists() throws {
+        let suite = "kaisola-clipboard-consent-tests"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defaults.removePersistentDomain(forName: suite)
+        defer { defaults.removePersistentDomain(forName: suite) }
+
+        let settings = NativePreviewSettings(defaults: defaults)
+        XCTAssertFalse(settings.terminalClipboardWriteAllowed)
+        settings.terminalClipboardWriteAllowed = true
+        XCTAssertTrue(NativePreviewSettings(defaults: defaults).terminalClipboardWriteAllowed)
+    }
+
     func testReadOnlyViewStillDropsAllPTYBoundBytes() {
         let view = ReadOnlyTerminalView(
             frame: .zero,

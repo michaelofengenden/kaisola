@@ -487,6 +487,22 @@ struct SettingsView: View {
                                 .toggleStyle(.switch)
                                 .accessibilityLabel("Semantic shell commands")
                         }
+                        SettingsRow(
+                            title: "Allow terminal applications to write the clipboard",
+                            detail: "Off by default · anything running in a terminal, local or remote, can replace what you paste next",
+                            symbol: "doc.on.clipboard"
+                        ) {
+                            Toggle("", isOn: $settings.terminalClipboardWriteAllowed)
+                                .labelsHidden()
+                                .toggleStyle(.switch)
+                                .accessibilityLabel("Allow terminal applications to write the clipboard")
+                        }
+                        Text("Terminal applications can never read your clipboard; Kaisola refuses those requests whether or not this is on.")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .padding(.horizontal, 16)
+                            .padding(.bottom, 14)
                     }
                     .id("terminal-interaction")
                 }

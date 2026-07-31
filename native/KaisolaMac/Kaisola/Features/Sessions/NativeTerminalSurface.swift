@@ -55,6 +55,9 @@ struct NativeTerminalSurface: NSViewRepresentable {
     var lineSpacing: Double = NativePreviewSettings.terminalLineSpacingDefault
     /// Scrollback depth in lines. See `NativePreviewSettings.terminalScrollbackLines`.
     var scrollbackLines: Int = NativePreviewSettings.terminalScrollbackDefault
+    /// Whether OSC 52 may write the system clipboard from this surface
+    /// (Settings > Terminal, off by default).
+    var allowsClipboardWrite: Bool = false
     /// Native macOS Terminal by default; Kaisola keeps Electron palette parity.
     var paletteMode: TerminalPaletteMode = .native
     /// Paper palette on light appearances, ink on dark.
@@ -151,6 +154,7 @@ struct NativeTerminalSurface: NSViewRepresentable {
         context.coordinator.setResizeHandler(onResize, synchronizing: view)
         context.coordinator.onTitleChange = onTitleChange
         context.coordinator.onBell = onBell
+        context.coordinator.allowsClipboardWrite = allowsClipboardWrite
         context.coordinator.setBaseWorkingDirectory(workingDirectory)
         context.coordinator.apply(
             scrollback: scrollback ?? TerminalScrollback(output),
@@ -190,6 +194,7 @@ struct NativeTerminalSurface: NSViewRepresentable {
         coordinator.setResizeHandler(onResize, synchronizing: view)
         coordinator.onTitleChange = onTitleChange
         coordinator.onBell = onBell
+        coordinator.allowsClipboardWrite = allowsClipboardWrite
         coordinator.setBaseWorkingDirectory(workingDirectory)
     }
 
@@ -198,6 +203,7 @@ struct NativeTerminalSurface: NSViewRepresentable {
         context.coordinator.setResizeHandler(onResize, synchronizing: view)
         context.coordinator.onTitleChange = onTitleChange
         context.coordinator.onBell = onBell
+        context.coordinator.allowsClipboardWrite = allowsClipboardWrite
         context.coordinator.setBaseWorkingDirectory(workingDirectory)
         view.agentLaunchCommand = agentLaunchCommand
         view.onHistoryBoundary = onHistoryBoundary
@@ -245,6 +251,11 @@ struct NativeTerminalSurface: NSViewRepresentable {
         var onResize: ((_ columns: Int, _ rows: Int) -> Void)?
         var onTitleChange: ((String) -> Void)?
         var onBell: (() -> Void)?
+        /// Mirrors Settings > Terminal. See `TerminalClipboardWriteRequest`.
+        var allowsClipboardWrite = false
+        /// Injected so a test can prove the OSC 52 gate without writing to the
+        /// developer's real pasteboard.
+        var clipboard: NSPasteboard = .general
         static let bellNotificationCooldown: TimeInterval = 2
         private var lastDeliveredBellAt: TimeInterval?
         /// SwiftTerm reports OSC 0/2 titles synchronously while `updateNSView`
@@ -1229,7 +1240,36 @@ struct NativeTerminalSurface: NSViewRepresentable {
             lastDeliveredBellAt = now
             onBell()
         }
-        func clipboardCopy(source: TerminalView, content: Data) {}
+        /// One guidance toast per app run, not per pane: every terminal shares
+        /// the same setting, so nagging once per surface would be noise.
+        static var hasShownClipboardGuidance = false
+
+        func clipboardCopy(source: TerminalView, content: Data) {
+            switch TerminalClipboardWriteRequest.decide(
+                content: content,
+                consentGranted: allowsClipboardWrite,
+                hasShownGuidance: Self.hasShownClipboardGuidance
+            ) {
+            case .copy(let text):
+                clipboard.clearContents()
+                clipboard.setString(text, forType: .string)
+            case .refused(let showsGuidance):
+                guard showsGuidance else { return }
+                Self.hasShownClipboardGuidance = true
+                ToastCenter.shared.show(
+                    TerminalClipboardWriteRequest.guidanceMessage,
+                    style: .info,
+                    duration: 6
+                )
+            case .ignored:
+                break
+            }
+        }
+
+        /// Never granted. Answering would hand whatever the user last copied —
+        /// a password, a token, a private path — to a program that may be on
+        /// the far end of an SSH session. Returning nil makes SwiftTerm send no
+        /// OSC 52 reply at all.
         func clipboardRead(source: TerminalView) -> Data? { nil }
         func iTermContent(source: TerminalView, content: ArraySlice<UInt8>) {}
         func rangeChanged(source: TerminalView, startY: Int, endY: Int) {}
@@ -1291,6 +1331,86 @@ enum TerminalJumpToBottomPolicy {
             ? max(bounds.minY, bounds.maxY - size.height - bottomInset)
             : bounds.minY + bottomInset
         return NSRect(origin: NSPoint(x: x, y: y), size: size)
+    }
+}
+
+/// OSC 52 — "put this on the user's clipboard" — from a program running in the
+/// terminal.
+///
+/// This is a genuinely useful capability (an agent CLI offering to copy a
+/// command, `tmux`/`nvim` yanking over SSH) and a genuinely dangerous one: the
+/// emitter can be any script, on either end of a remote session, and silently
+/// replacing what a user is about to paste into their shell is a known attack
+/// rather than a hypothetical. Kaisola therefore refuses the write unless the
+/// user has explicitly granted it in Settings > Terminal, and tells them once
+/// where the switch is instead of failing invisibly.
+///
+/// The *read* half is never granted: SwiftTerm asks through `clipboardRead`,
+/// and returning nil there makes it send no reply at all, so no clipboard
+/// contents can be exfiltrated to whatever is running in the pane.
+enum TerminalClipboardWriteRequest {
+    enum Decision: Equatable {
+        /// Consent is granted and the payload is usable clipboard text.
+        case copy(String)
+        /// Consent is withheld. `showsGuidance` is true only for the first
+        /// blocked attempt, so a chatty program cannot turn the refusal into a
+        /// wall of toasts.
+        case refused(showsGuidance: Bool)
+        /// Nothing a person could have meant to paste.
+        case ignored
+    }
+
+    /// A clipboard write is a short piece of text a human is about to paste.
+    /// SwiftTerm has already base64-decoded the payload; this caps what is
+    /// accepted so a runaway program cannot push megabytes onto the pasteboard.
+    static let maximumPayloadBytes = 256 * 1_024
+
+    static let guidanceMessage =
+        "A terminal program tried to change your clipboard. Allow it in Settings > Terminal."
+
+    static func decide(
+        content: Data,
+        consentGranted: Bool,
+        hasShownGuidance: Bool
+    ) -> Decision {
+        // Validity is decided before consent on purpose: a malformed or absurd
+        // payload was never a clipboard write, so it must not spend the single
+        // guidance toast the user gets.
+        guard !content.isEmpty,
+              content.count <= maximumPayloadBytes,
+              let text = String(data: content, encoding: .utf8),
+              !containsRejectedControls(text) else { return .ignored }
+        let payload = trimmingExecutionNewlines(text)
+        guard !payload.isEmpty else { return .ignored }
+        guard consentGranted else { return .refused(showsGuidance: !hasShownGuidance) }
+        return .copy(payload)
+    }
+
+    /// Tab, newline, and carriage return are ordinary text; every other C0
+    /// control (and DEL) is either a terminal command that escaped its parser
+    /// or an attempt to hide part of the payload from whatever renders the
+    /// paste. Neither belongs on a text pasteboard.
+    private static func containsRejectedControls(_ text: String) -> Bool {
+        text.unicodeScalars.contains { scalar in
+            let value = scalar.value
+            guard value < 0x20 || value == 0x7F else { return false }
+            return value != 0x09 && value != 0x0A && value != 0x0D
+        }
+    }
+
+    /// Drop trailing newlines. Copying "text" and "text\n" is indistinguishable
+    /// to the user, but pasting the second into a shell *runs* it — the classic
+    /// OSC 52 auto-execute vector. Interior newlines are preserved.
+    ///
+    /// Scalars, not `Character`s: `\r\n` is a single Swift grapheme cluster, so
+    /// a `Character`-based trim silently leaves a CRLF terminator in place —
+    /// exactly the payload this is meant to defuse.
+    private static func trimmingExecutionNewlines(_ text: String) -> String {
+        var scalars = text.unicodeScalars
+        while let last = scalars.last, last == "\n" || last == "\r" {
+            scalars.removeLast()
+        }
+        return String(scalars)
     }
 }
 

@@ -1528,6 +1528,7 @@ struct RootShellView: View {
                         fontWeight: settings.terminalFontWeight,
                         lineSpacing: settings.terminalLineSpacing,
                         scrollbackLines: settings.terminalScrollbackLines,
+                        allowsClipboardWrite: settings.terminalClipboardWriteAllowed,
                         paletteMode: settings.terminalPalette,
                         lightSurface: colorScheme == .light,
                         sessionID: id,

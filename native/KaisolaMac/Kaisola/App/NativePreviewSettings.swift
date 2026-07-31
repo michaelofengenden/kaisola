@@ -427,6 +427,17 @@ final class NativePreviewSettings: ObservableObject {
         didSet { persist(semanticShellIntegration, forKey: Keys.semanticShellIntegration) }
     }
 
+    /// Whether OSC 52 may put text on the user's system clipboard.
+    ///
+    /// Off by default: anything running in a terminal — an agent CLI, a build
+    /// script, something on the far end of an SSH session — can emit OSC 52,
+    /// and silently replacing what the user is about to paste into a shell is
+    /// a real attack, not a hypothetical one. Reading the clipboard is never
+    /// granted by this setting. See `TerminalClipboardWriteRequest`.
+    @Published var terminalClipboardWriteAllowed: Bool {
+        didSet { persist(terminalClipboardWriteAllowed, forKey: Keys.terminalClipboardWriteAllowed) }
+    }
+
     /// Whether the workspace rail (file tree, ⌘B) is shown.
     @Published var workspaceRailVisible: Bool {
         didSet { persist(workspaceRailVisible, forKey: Keys.workspaceRail) }
@@ -575,6 +586,7 @@ final class NativePreviewSettings: ObservableObject {
         static let terminalPalette = "terminalPalette"
         static let restoreCLIDrafts = "restoreCLIDrafts"
         static let semanticShellIntegration = "semanticShellIntegration"
+        static let terminalClipboardWriteAllowed = "terminalClipboardWriteAllowed"
         static let workspaceRail = "workspaceRailVisible"
         static let workspaceRailWidth = "workspaceRailWidth"
         static let filePreviewWidth = "filePreviewWidth"
@@ -644,6 +656,7 @@ final class NativePreviewSettings: ObservableObject {
         terminalPalette = defaults.string(forKey: Keys.terminalPalette).flatMap(TerminalPaletteMode.init) ?? .native
         restoreCLIDrafts = defaults.object(forKey: Keys.restoreCLIDrafts) as? Bool ?? true
         semanticShellIntegration = defaults.object(forKey: Keys.semanticShellIntegration) as? Bool ?? false
+        terminalClipboardWriteAllowed = defaults.object(forKey: Keys.terminalClipboardWriteAllowed) as? Bool ?? false
         sensitiveGlobs = defaults.stringArray(forKey: Keys.sensitiveGlobs) ?? AcpPermissionRules.defaultSensitiveGlobs
         claudeConfigDir = defaults.string(forKey: Keys.claudeConfigDir) ?? ""
         codexHome = defaults.string(forKey: Keys.codexHome) ?? ""

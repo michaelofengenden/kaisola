@@ -257,125 +257,16 @@ struct RootShellView: View {
                 // Navigation is explicit here so visible surfaces are communicated
                 // by their blue icons instead of a heavy row treatment.
                 List {
-                    ForEach(model.projects) { project in
-                        let chats = model.chats(in: project.id)
-                        let meshes = model.meshes(in: project.id)
-                        Section(isExpanded: expansionBinding(project.id)) {
-                        ForEach(chats) { chat in
-                            HStack(spacing: 3) {
-                                Button {
-                                    model.selectChat(chat.id)
-                                } label: {
-                                    ChatRow(chat: chat, isVisible: model.isSurfaceVisible(chat.id))
-                                        .frame(maxWidth: .infinity, alignment: .leading)
-                                        .contentShape(Rectangle())
-                                }
-                                .buttonStyle(.plain)
-                                surfaceVisibilityButton(chat.id)
-                            }
-                            .accessibilityAddTraits(model.focusedPaneID == chat.id ? .isSelected : [])
-                            .listRowInsets(.init(top: 0, leading: 16, bottom: 0, trailing: 10))
-                            .contextMenu {
-                                Button("Open Beside") { model.revealSurfaceBeside(chat.id) }
-                                Button("Rename…") { renameTarget = chat.id }
-                                Button("Close Chat", role: .destructive) { model.closeChat(chat.id) }
-                            }
-                        }
-                        ForEach(meshes) { mesh in
-                            HStack(spacing: 3) {
-                                Button {
-                                    model.selectMesh(mesh.id)
-                                } label: {
-                                    MeshRow(mesh: mesh, isVisible: model.isSurfaceVisible(mesh.id))
-                                        .frame(maxWidth: .infinity, alignment: .leading)
-                                        .contentShape(Rectangle())
-                                }
-                                .buttonStyle(.plain)
-                                surfaceVisibilityButton(mesh.id)
-                            }
-                            .accessibilityAddTraits(model.focusedPaneID == mesh.id ? .isSelected : [])
-                            .listRowInsets(.init(top: 0, leading: 16, bottom: 0, trailing: 10))
-                            .contextMenu {
-                                Button("Open Beside") { model.revealSurfaceBeside(mesh.id) }
-                                Button("Rename…") { renameTarget = mesh.id }
-                                Button("Close Mesh", role: .destructive) { requestCloseMesh(mesh) }
-                            }
-                        }
-                        ForEach(project.sessions) { session in
-                            sessionRow(session)
-                        }
-                        if project.sessions.isEmpty, chats.isEmpty, meshes.isEmpty {
-                            Text("No activity yet")
-                                .font(.caption).foregroundStyle(.tertiary)
-                        }
-                        } header: {
-                        HStack(spacing: 5) {
-                            Button {
-                                model.activateProject(id: project.id)
-                            } label: {
-                                HStack(spacing: 7) {
-                                    Image(systemName: "folder.fill")
-                                        .font(.system(size: 11, weight: .semibold))
-                                        .foregroundStyle(
-                                            ProjectTint.color(project.colorHex)
-                                                ?? WorkspacePalette.project
-                                        )
-                                    Text(project.name)
-                                        .font(.system(size: 12.5, weight: .semibold))
-                                        .foregroundStyle(.primary)
-                                    if project.attentionCount > 0 {
-                                        Text("\(project.attentionCount)")
-                                            .font(.caption2.weight(.bold))
-                                            .padding(.horizontal, 5).padding(.vertical, 1)
-                                            .background(Color.orange.opacity(0.92), in: Capsule())
-                                            .foregroundStyle(.white)
-                                            .accessibilityLabel("\(project.attentionCount) agents finished")
-                                    } else if project.workingCount > 0 {
-                                        Text("\(project.workingCount)")
-                                            .font(.caption2.weight(.bold))
-                                            .padding(.horizontal, 5).padding(.vertical, 1)
-                                            .background(WorkspacePalette.active.opacity(0.92), in: Capsule())
-                                            .foregroundStyle(.white)
-                                            .accessibilityLabel("\(project.workingCount) agents working")
-                                    }
-                                    Spacer(minLength: 4)
-                                }
-                                .contentShape(Rectangle())
-                            }
-                            .buttonStyle(.plain)
-                            .accessibilityLabel("Open \(project.name) project")
-                            Menu {
-                                projectLaunchMenu(project)
-                            } label: {
-                                Image(systemName: "plus.circle.fill")
-                                    .font(.system(size: 13, weight: .medium))
-                                    .foregroundStyle(activeProjectID == project.id ? WorkspacePalette.project : .secondary)
-                            }
-                            .menuStyle(.borderlessButton)
-                            .fixedSize()
-                            .help("New session in \(project.name)")
-                        }
-                        .padding(.horizontal, 9)
-                        .frame(minHeight: 36)
-                        .background(
-                            (ProjectTint.color(project.colorHex) ?? WorkspacePalette.project)
-                                .opacity(activeProjectID == project.id
-                                    ? (colorScheme == .dark ? 0.20 : 0.12)
-                                    : (colorScheme == .dark ? 0.08 : 0.045)),
-                            in: RoundedRectangle(cornerRadius: 9)
-                        )
-                        .overlay {
-                            RoundedRectangle(cornerRadius: 9)
-                                .strokeBorder(
-                                    (ProjectTint.color(project.colorHex) ?? WorkspacePalette.project)
-                                        .opacity(activeProjectID == project.id ? 0.34 : 0.12),
-                                    lineWidth: 0.7
-                                )
-                        }
-                        .contextMenu { projectContextMenu(project) }
-                        .textCase(nil)
-                        }
-                    }
+                    QuietProjectRail(
+                        model: model,
+                        attention: attention,
+                        expansion: { expansionBinding($0) },
+                        isActiveProject: { model.selectedProjectID == $0 },
+                        contextMenu: { AnyView(projectContextMenu($0)) },
+                        sessionContextMenu: { AnyView(sessionContextMenuContent($0)) },
+                        chatContextMenu: { AnyView(chatContextMenuContent($0)) },
+                        meshContextMenu: { AnyView(meshContextMenuContent($0)) }
+                    )
                     if auth.isSignedIn {
                         rememberedSessionSidebarSection
                     }
@@ -406,6 +297,67 @@ struct RootShellView: View {
             detailPane
         }
         .navigationSplitViewStyle(.balanced)
+    }
+
+    // MARK: Left-tree context menus
+    //
+    // The quiet rail is pure presentation, so the sidebar's menus live here and
+    // are handed to it as closures. Each one is the menu the pre-rail row built
+    // inline, plus the visibility action that row's trailing button used to own.
+
+    @ViewBuilder
+    private func sessionContextMenuContent(_ session: BrokerTerminalRecord) -> some View {
+        let visible = model.isSurfaceVisible(session.id)
+        Button("Open in New Window") {
+            KaisolaMacAppDelegate.popOut(sessionID: session.id)
+        }
+        Button {
+            model.togglePin(session.id)
+        } label: {
+            Label(model.isPinned(session.id) ? "Unpin" : "Pin",
+                  systemImage: model.isPinned(session.id) ? "pin.slash" : "pin")
+        }
+        if !visible {
+            Button("Open in Split") {
+                model.revealSurfaceBeside(session.id)
+            }
+        }
+        if visible {
+            Button("Minimize Pane") {
+                Task { await model.minimizeSurface(session.id) }
+            }
+        }
+        Button("Rename…") { renameTarget = session.id }
+        if model.isOwned(session.id) {
+            if let dir = model.directory(for: session.id) {
+                Button("Git Panel…") { gitRepo = dir }
+            }
+            if !session.exited {
+                Button("End Session", role: .destructive) {
+                    Task { await model.endSession(session.id) }
+                }
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func chatContextMenuContent(_ chat: AcpChatHandle) -> some View {
+        Button("Open Beside") { model.revealSurfaceBeside(chat.id) }
+        if model.isSurfaceVisible(chat.id) {
+            Button("Minimize Pane") { Task { await model.minimizeSurface(chat.id) } }
+        }
+        Button("Rename…") { renameTarget = chat.id }
+        Button("Close Chat", role: .destructive) { model.closeChat(chat.id) }
+    }
+
+    @ViewBuilder
+    private func meshContextMenuContent(_ mesh: MeshSession) -> some View {
+        Button("Open Beside") { model.revealSurfaceBeside(mesh.id) }
+        if model.isSurfaceVisible(mesh.id) {
+            Button("Minimize Pane") { Task { await model.minimizeSurface(mesh.id) } }
+        }
+        Button("Rename…") { renameTarget = mesh.id }
+        Button("Close Mesh", role: .destructive) { requestCloseMesh(mesh) }
     }
 
     @ViewBuilder

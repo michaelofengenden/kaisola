@@ -25,6 +25,11 @@ struct TerminalTranscriptView: View {
     private let bottomID = "terminal-transcript-bottom"
 
     var body: some View {
+        // Resolved once per body pass rather than once per page: `ForEach`
+        // previously re-ran `TerminalFontOptions.resolveFont` for every
+        // retained page on every render, which is wasted work identical on
+        // every iteration.
+        let transcriptFont = self.transcriptFont
         VStack(spacing: 0) {
             header
             Divider()

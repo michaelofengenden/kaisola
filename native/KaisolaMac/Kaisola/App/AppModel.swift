@@ -843,10 +843,14 @@ final class AppModel: ObservableObject {
     func cyclePaneFocus(forward: Bool) {
         guard let projectID = selectedProjectID,
               let layout = paneLayouts[projectID],
-              let target = PaneFocusCycle.target(
+              let target = PaneFocusCycle.terminalTarget(
                   after: focusedPaneID,
                   in: layout.sessionIDs,
-                  forward: forward
+                  forward: forward,
+                  // Chat and Mesh panes have no FocusState hook yet, so the
+                  // ring must skip straight past them (out of scope: giving
+                  // them one).
+                  isTerminalSurface: { id in sessions.contains(where: { $0.id == id }) }
               ) else { return }
         Task { await focusSurface(target) }
     }

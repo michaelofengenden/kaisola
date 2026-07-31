@@ -242,4 +242,18 @@ enum PaneFocusCycle {
         let count = ids.count
         return ids[forward ? (index + 1) % count : (index - 1 + count) % count]
     }
+
+    /// Only terminal surfaces can currently receive keyboard focus
+    /// programmatically — a chat or Mesh pane has no `FocusState` hook yet, so
+    /// ringing one leaves the keyboard unable to follow. Cycling therefore
+    /// skips non-terminal ids entirely rather than landing the ring somewhere
+    /// typing (and VoiceOver) cannot reach.
+    static func terminalTarget(
+        after current: String?,
+        in ids: [String],
+        forward: Bool,
+        isTerminalSurface: (String) -> Bool
+    ) -> String? {
+        target(after: current, in: ids.filter(isTerminalSurface), forward: forward)
+    }
 }

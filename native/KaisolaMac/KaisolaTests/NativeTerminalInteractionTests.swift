@@ -1361,6 +1361,41 @@ final class NativeTerminalInteractionTests: XCTestCase {
         )
     }
 
+    /// Clearing while a retained transcript is still being fed in
+    /// progressively must refuse rather than half-apply: the next replay
+    /// chunk would otherwise repaint straight over an "erased" screen.
+    func testClearDuringProgressiveReplayIsRefusedNotHalfUndone() async {
+        let coordinator = NativeTerminalSurface.Coordinator()
+        let view = OwnedTerminalView(
+            frame: NSRect(x: 0, y: 0, width: 640, height: 320),
+            font: NSFont.monospacedSystemFont(ofSize: 13, weight: .regular)
+        )
+        view.terminalDelegate = coordinator
+        let output = String(
+            repeating: "0123456789abcdef\r\n",
+            count: NativeTerminalSurface.Coordinator.progressiveReplayThresholdBytes / 16
+        )
+        coordinator.apply(
+            output: output,
+            epoch: "large-epoch",
+            endOffset: Int64(output.utf8.count),
+            to: view
+        )
+        XCTAssertTrue(coordinator.isProgressivelyReplaying)
+
+        for toast in ToastCenter.shared.toasts { ToastCenter.shared.dismiss(toast.id) }
+        XCTAssertFalse(
+            view.clearLiveScrollback(),
+            "clearing mid-replay must be refused, not applied and then half-undone by the next chunk"
+        )
+        XCTAssertEqual(ToastCenter.shared.toasts.last?.message, TerminalClearCommand.noTerminalMessage)
+
+        for _ in 0..<500 where coordinator.isProgressivelyReplaying {
+            await Task.yield()
+        }
+        XCTAssertFalse(coordinator.isProgressivelyReplaying)
+    }
+
     func testJumpToBottomIsOfferedOnlyWhileGenuinelyScrolledUp() {
         XCTAssertTrue(TerminalJumpToBottomPolicy.isVisible(
             canScroll: true,
@@ -1466,6 +1501,36 @@ final class NativeTerminalInteractionTests: XCTestCase {
             TerminalFocusResolver.focusedTerminal(in: window, paneID: "terminal:gone") === second
         )
         XCTAssertNil(TerminalFocusResolver.focusedTerminal(in: nil, paneID: "terminal:a"))
+    }
+
+    /// The bug this guards: a chat or Mesh pane focused while an unrelated
+    /// terminal exists elsewhere in the window must never silently become
+    /// ⌥⌘K's (or Scroll to Latest's) target. Refuse instead of reaching for
+    /// "any terminal in the tree".
+    func testFocusedTerminalRefusesRatherThanGrabbingAnUnrelatedTerminal() {
+        let window = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 600, height: 400),
+            styleMask: [.titled],
+            backing: .buffered,
+            defer: false
+        )
+        let root = NSView(frame: window.contentLayoutRect)
+        window.contentView = root
+        let terminal = OwnedTerminalView(
+            frame: NSRect(x: 0, y: 0, width: 300, height: 400),
+            font: NSFont.monospacedSystemFont(ofSize: 13, weight: .regular)
+        )
+        terminal.paneSessionID = "terminal:a"
+        root.addSubview(terminal)
+
+        let chatField = NSTextView(frame: NSRect(x: 300, y: 0, width: 300, height: 400))
+        root.addSubview(chatField)
+        window.makeFirstResponder(chatField)
+
+        // The model rings a chat pane and the keyboard genuinely sits in its
+        // text view. A terminal exists elsewhere in the window, but the user
+        // cannot see it being targeted.
+        XCTAssertNil(TerminalFocusResolver.focusedTerminal(in: window, paneID: "chat:z"))
     }
 
     func testViewMenuCarriesClearTerminalAndScrollToLatestWithSafeShortcuts() throws {
@@ -1591,6 +1656,36 @@ final class NativeTerminalInteractionTests: XCTestCase {
         )
     }
 
+    /// A retained transcript can contain an old OSC 52 write. Replaying it
+    /// (initial or progressive reconstruction) must render the bytes without
+    /// ever reaching the live pasteboard — the same non-negotiable rule
+    /// `bell` and terminal-query replies already follow for reconstructed
+    /// history.
+    func testHistoricalOSC52ClipboardWritesAreNeverReplayed() {
+        let pasteboard = NSPasteboard(name: NSPasteboard.Name("kaisola-osc52-replay-tests"))
+        pasteboard.clearContents()
+        pasteboard.setString("kaisola-untouched", forType: .string)
+        defer { pasteboard.releaseGlobally() }
+
+        let coordinator = NativeTerminalSurface.Coordinator()
+        coordinator.clipboard = pasteboard
+        coordinator.allowsClipboardWrite = true
+        let view = OwnedTerminalView(
+            frame: NSRect(x: 0, y: 0, width: 640, height: 320),
+            font: NSFont.monospacedSystemFont(ofSize: 13, weight: .regular)
+        )
+        view.terminalDelegate = coordinator
+
+        let encoded = Data("stolen-from-history".utf8).base64EncodedString()
+        coordinator.apply(
+            output: "prompt % \u{1B}]52;c;\(encoded)\u{7}",
+            epoch: "epoch-a",
+            endOffset: 40,
+            to: view
+        )
+        XCTAssertEqual(pasteboard.string(forType: .string), "kaisola-untouched")
+    }
+
     func testTerminalStreamCannotWriteTheClipboardWithoutConsent() throws {
         let pasteboard = NSPasteboard(name: NSPasteboard.Name("kaisola-osc52-tests"))
         pasteboard.clearContents()
@@ -1673,6 +1768,50 @@ final class NativeTerminalInteractionTests: XCTestCase {
         panes.b.mouseDown(with: click)
 
         XCTAssertEqual(reported, ["terminal:b"])
+    }
+
+    /// Mounting into a window (a restored window, a project switch
+    /// reattaching a retained view) still needs an AppKit first responder,
+    /// but mounting is not a user action: it must not publish keyboard focus
+    /// to the model, or a mounting pane could steal the ring — and the
+    /// broker observer role that follows it — from whatever pane the model
+    /// had already restored. Only a genuine user gesture (a click) publishes.
+    func testMountingIntoAWindowClaimsFirstResponderWithoutPublishingKeyboardFocus() throws {
+        let window = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 400, height: 300),
+            styleMask: [.titled],
+            backing: .buffered,
+            defer: false
+        )
+        let root = NSView(frame: NSRect(x: 0, y: 0, width: 400, height: 300))
+        window.contentView = root
+
+        let view = OwnedTerminalView(
+            frame: NSRect(x: 0, y: 0, width: 400, height: 300),
+            font: NSFont.monospacedSystemFont(ofSize: 13, weight: .regular)
+        )
+        view.paneSessionID = "terminal:mounting"
+        var published: [String] = []
+        view.onKeyboardFocus = { published.append("terminal:mounting") }
+
+        root.addSubview(view)
+
+        XCTAssertTrue(window.firstResponder === view, "mounting must still claim the AppKit first responder")
+        XCTAssertTrue(published.isEmpty, "mounting must not publish keyboard focus to the model")
+
+        let click = try XCTUnwrap(NSEvent.mouseEvent(
+            with: .leftMouseDown,
+            location: NSPoint(x: 200, y: 150),
+            modifierFlags: [],
+            timestamp: ProcessInfo.processInfo.systemUptime,
+            windowNumber: window.windowNumber,
+            context: nil,
+            eventNumber: 1,
+            clickCount: 1,
+            pressure: 1
+        ))
+        view.mouseDown(with: click)
+        XCTAssertEqual(published, ["terminal:mounting"], "a genuine user click must still publish")
     }
 
     func testFocusingASurfaceMovesTheAppKitFirstResponderToItsTerminal() {

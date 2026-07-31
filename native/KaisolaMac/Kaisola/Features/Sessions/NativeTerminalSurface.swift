@@ -1255,6 +1255,11 @@ struct NativeTerminalSurface: NSViewRepresentable {
         static var hasShownClipboardGuidance = false
 
         func clipboardCopy(source: TerminalView, content: Data) {
+            // Initial/progressive reconstruction can contain an old OSC 52
+            // write. Replaying it must render the bytes without reaching out
+            // to the live pasteboard, the same rule `bell` already follows
+            // for reconstructed history.
+            guard !suppressReplayReplies else { return }
             switch TerminalClipboardWriteRequest.decide(
                 content: content,
                 consentGranted: allowsClipboardWrite,
@@ -1455,14 +1460,19 @@ enum TerminalKeyboardFocus {
 ///
 /// The model's focused pane is the surface the user can *see* highlighted, so
 /// it wins; the AppKit first responder is the fallback for the moments before
-/// the two agree, and a lone terminal is better than refusing the command.
+/// the two agree. Refusing the command is deliberately preferred over
+/// grabbing some other terminal in the window: when the focused pane is a
+/// chat or Mesh surface (or the id is simply stale), acting on an unrelated
+/// terminal elsewhere in the layout would be a surprise, not a convenience.
 @MainActor
 enum TerminalFocusResolver {
     static func focusedTerminal(in window: NSWindow?, paneID: String?) -> ReadOnlyTerminalView? {
         guard let window, let root = window.contentView else { return nil }
         if let paneID, let match = terminal(in: root, paneID: paneID) { return match }
-        if let responder = window.firstResponder as? ReadOnlyTerminalView { return responder }
-        return terminal(in: root, paneID: nil)
+        // A live first responder is still trustworthy evidence of where the
+        // keyboard actually is right now. An arbitrary DFS match through the
+        // rest of the view tree is not, so there is no further fallback.
+        return window.firstResponder as? ReadOnlyTerminalView
     }
 
     /// Depth-first search for a terminal view. A nil `paneID` matches the first
@@ -2079,8 +2089,15 @@ class ReadOnlyTerminalView: TerminalView {
         }
         guard let window else { return }
         if Self.shouldClaimFocus(currentFirstResponder: window.firstResponder, window: window) {
+            // AppKit-only: a mounting pane (a restored window, a project
+            // switch reattaching a retained view) legitimately needs *some*
+            // first responder, but mounting is not a user action. Publishing
+            // here would let whichever pane happens to mount last steal the
+            // pane focus ring — and the broker observer role that follows it
+            // — from the pane the model actually restored. Only a genuine
+            // user gesture (`mouseDown` below) reports keyboard focus to the
+            // model.
             window.makeFirstResponder(self)
-            publishKeyboardFocus()
         }
     }
 
@@ -2177,7 +2194,16 @@ class ReadOnlyTerminalView: TerminalView {
     /// Erase the live renderer without touching the broker's retained history
     /// or the PTY. See `TerminalClearCommand` for why that is the only honest
     /// meaning "Clear Terminal" can have on a broker-backed surface.
-    func clearLiveScrollback() {
+    ///
+    /// Refuses (returning `false`) while a retained transcript is still being
+    /// fed in progressively: clearing now would only be half-undone a moment
+    /// later when the next replay chunk repaints over it.
+    @discardableResult
+    func clearLiveScrollback() -> Bool {
+        guard (terminalDelegate as? NativeTerminalSurface.Coordinator)?.isProgressivelyReplaying != true else {
+            ToastCenter.shared.show(TerminalClearCommand.noTerminalMessage, style: .info)
+            return false
+        }
         feed(text: TerminalClearCommand.escapeSequence)
         // ED 3 resets `buffer.linesTop`, the coordinate space every recorded
         // OSC 133 mark lives in. Stale marks would decorate unrelated rows, so
@@ -2187,6 +2213,7 @@ class ReadOnlyTerminalView: TerminalView {
         // pin state describing it is meaningless: follow live output again.
         resumeLiveFollow()
         scrollToLiveBottom()
+        return true
     }
 
     /// Return the surface to sticky-scroll follow mode. Shared by the jump pill

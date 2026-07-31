@@ -219,4 +219,37 @@ final class SessionPaneLayoutTests: XCTestCase {
         XCTAssertEqual(layout.sessionIDs, ["a", "b", "c"])
         XCTAssertEqual(PaneFocusCycle.target(after: "b", in: layout.sessionIDs, forward: true), "c")
     }
+
+    /// Chat and Mesh panes have no `FocusState` hook yet, so the ring must
+    /// skip straight past them in either direction rather than landing
+    /// somewhere the keyboard cannot follow.
+    func testPaneFocusCycleSkipsNonTerminalSurfaces() {
+        let ids = ["terminal:a", "chat:b", "mesh:c", "terminal:d"]
+        let isTerminal: (String) -> Bool = { $0.hasPrefix("terminal:") }
+
+        XCTAssertEqual(
+            PaneFocusCycle.terminalTarget(after: "terminal:a", in: ids, forward: true, isTerminalSurface: isTerminal),
+            "terminal:d"
+        )
+        XCTAssertEqual(
+            PaneFocusCycle.terminalTarget(after: "terminal:d", in: ids, forward: true, isTerminalSurface: isTerminal),
+            "terminal:a"
+        )
+        XCTAssertEqual(
+            PaneFocusCycle.terminalTarget(after: "terminal:a", in: ids, forward: false, isTerminalSurface: isTerminal),
+            "terminal:d"
+        )
+        // Nothing focused yet: start from the end the direction implies,
+        // among terminal surfaces only.
+        XCTAssertEqual(
+            PaneFocusCycle.terminalTarget(after: nil, in: ids, forward: true, isTerminalSurface: isTerminal),
+            "terminal:a"
+        )
+        // A layout with no terminal at all has nowhere to cycle to.
+        XCTAssertNil(
+            PaneFocusCycle.terminalTarget(
+                after: nil, in: ["chat:b", "mesh:c"], forward: true, isTerminalSurface: isTerminal
+            )
+        )
+    }
 }

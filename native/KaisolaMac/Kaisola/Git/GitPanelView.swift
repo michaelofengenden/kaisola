@@ -41,6 +41,12 @@ final class GitPanelModel: ObservableObject {
     @Published var prBranchDraft = "kaisola/pr-branch"
     @Published var prTitleDraft = ""
     @Published var prBodyDraft = ""
+    /// The title/body this model itself last wrote into the drafts above, so
+    /// a later re-prepare ("Review Again", once the reviewed plan goes stale)
+    /// can tell a user's edit apart from its own previous default and never
+    /// silently overwrite it. Nil until the first `preparePR()` completes.
+    private var seededPRTitle: String?
+    private var seededPRBody: String?
 
     let repoRoot: URL
     /// Whether the GitHub CLI is installed — resolved once (it may spawn a
@@ -272,9 +278,28 @@ final class GitPanelModel: ObservableObject {
             self.prPlan = plan
             self.prPlanStale = false
             self.prBranchDraft = plan.headBranch
-            self.prTitleDraft = plan.title
-            self.prBodyDraft = plan.body
+            // "Review Again" re-runs this exact path once the reviewed plan
+            // goes stale. Only reseed a field the user left exactly as this
+            // model last set it — anything else is a real edit and must
+            // survive rather than being clobbered by the fresh default.
+            if Self.shouldReseedDraft(current: self.prTitleDraft, previousDefault: self.seededPRTitle) {
+                self.prTitleDraft = plan.title
+            }
+            if Self.shouldReseedDraft(current: self.prBodyDraft, previousDefault: self.seededPRBody) {
+                self.prBodyDraft = plan.body
+            }
+            self.seededPRTitle = plan.title
+            self.seededPRBody = plan.body
         }
+    }
+
+    /// Whether a review-stage draft should be overwritten with a freshly
+    /// assembled default. True on the very first prepare (nothing to compare
+    /// against yet) or when the draft still holds exactly the value this
+    /// model seeded last time — i.e. the user never touched it since. Pulled
+    /// out as a pure decision so it is directly unit-testable.
+    nonisolated static func shouldReseedDraft(current: String, previousDefault: String?) -> Bool {
+        previousDefault == nil || current == previousDefault
     }
 
     /// Leave the review without executing anything.

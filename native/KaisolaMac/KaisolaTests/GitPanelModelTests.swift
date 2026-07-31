@@ -246,6 +246,19 @@ final class GitPanelModelTests: XCTestCase {
         XCTAssertEqual(plan.body, GitPRPlanner.fallbackBody)
     }
 
+    // MARK: - PR draft reseed decision (pure)
+
+    /// Whether a re-prepare ("Review Again") may overwrite a review-stage
+    /// draft: only when there is nothing to compare against yet (the first
+    /// prepare) or the draft still matches exactly what this model seeded
+    /// last time. Anything else is a real user edit and must survive.
+    func testShouldReseedDraftOnlyOverwritesUntouchedDefaults() {
+        XCTAssertTrue(GitPanelModel.shouldReseedDraft(current: "", previousDefault: nil))
+        XCTAssertTrue(GitPanelModel.shouldReseedDraft(current: "anything at all", previousDefault: nil))
+        XCTAssertTrue(GitPanelModel.shouldReseedDraft(current: "feature work", previousDefault: "feature work"))
+        XCTAssertFalse(GitPanelModel.shouldReseedDraft(current: "My custom PR title", previousDefault: "feature work"))
+    }
+
     func testReviewEditsAreCarriedIntoTheExecutedPlan() throws {
         let reviewed = try GitPRPlanner.assemble(
             prep: prep(branch: "main", isDefault: true, hasUpstream: true, ahead: 1),
@@ -455,6 +468,52 @@ final class GitPanelModelTests: XCTestCase {
             "a background refresh must mark the open plan stale once the repository moves past it"
         )
         XCTAssertNotNil(model.prPlan, "the card stays on screen — only its confirm affordance is disabled")
+    }
+
+    /// "Review Again" re-runs `preparePR()` on a stale plan. It must not
+    /// clobber a title the user already edited, but an untouched body should
+    /// still pick up the regenerated default (a new commit landed).
+    @MainActor
+    func testReviewAgainPreservesEditedDraftsAndReseedsUntouchedOnes() throws {
+        try write("a.txt", "one\n")
+        try git(["add", "a.txt"])
+        try git(["commit", "-q", "-m", "base"])
+        try git(["checkout", "-q", "-b", "feature/live"])
+        try write("b.txt", "two\n")
+        try git(["add", "b.txt"])
+        try git(["commit", "-q", "-m", "feature work"])
+
+        let model = GitPanelModel(repoRoot: repo)
+        model.preparePR()
+        XCTAssertTrue(pump(until: { model.prPlan != nil }, timeout: 10))
+        XCTAssertEqual(model.prTitleDraft, "feature work")
+        XCTAssertEqual(model.prBodyDraft, "- feature work")
+
+        // The user edits the title but leaves the body exactly as generated.
+        model.prTitleDraft = "My custom PR title"
+
+        // An external commit lands, making the reviewed plan stale and
+        // changing what a fresh assembly would generate as defaults.
+        try write("c.txt", "three\n")
+        try git(["add", "c.txt"])
+        try git(["commit", "-q", "-m", "more feature work"])
+        model.refresh()
+        XCTAssertTrue(pump(until: { model.prPlanStale }, timeout: 10))
+
+        // Review Again.
+        model.preparePR()
+        XCTAssertTrue(
+            pump(until: { !model.prPlanStale && model.prPlan?.commitSubjects.count == 2 }, timeout: 10)
+        )
+
+        XCTAssertEqual(
+            model.prTitleDraft, "My custom PR title",
+            "an edited draft must survive Review Again"
+        )
+        XCTAssertEqual(
+            model.prBodyDraft, "- more feature work\n- feature work",
+            "an untouched draft should pick up the regenerated default"
+        )
     }
 
     /// GitPanelModel level (not just `GitRefreshPolicy`): an event noted while

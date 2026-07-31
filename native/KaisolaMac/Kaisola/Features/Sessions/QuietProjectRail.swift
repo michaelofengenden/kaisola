@@ -356,6 +356,7 @@ private struct QuietProjectGroup: View {
             // header trait moves onto the button rather than being lost inside
             // the (now combined) label.
             .accessibilityAddTraits(.isHeader)
+            .accessibilityIdentifier(project.id)
             if hovering {
                 Menu {
                     launchMenu(project)
@@ -402,6 +403,7 @@ private struct QuietProjectGroup: View {
             }
             .buttonStyle(.plain)
             .accessibilityAddTraits(.isHeader)
+            .accessibilityIdentifier(project.id)
             // Peeking into a project must not steal the workspace: the chevron
             // is a SIBLING control so its click never reaches the row's
             // activate action. It keeps its slot when hidden so the row's
@@ -515,6 +517,7 @@ private struct QuietProjectGroup: View {
     ) -> some View {
         let processName = model.meta(for: record.id)?.processName
         return QuietSurfaceRowView(
+            id: record.id,
             identity: QuietIdentity.identity(
                 agentName: model.agentProfile(for: record.id)?.name,
                 processName: processName
@@ -537,6 +540,7 @@ private struct QuietProjectGroup: View {
 
     private func chatRow(_ chat: AcpChatHandle, status: QuietSessionStatus) -> some View {
         QuietSurfaceRowView(
+            id: chat.id,
             identity: QuietIdentity.identity(agentName: chat.agentID, processName: nil),
             title: chat.conversation.title,
             status: status,
@@ -551,6 +555,7 @@ private struct QuietProjectGroup: View {
 
     private func meshRow(_ mesh: MeshSession, status: QuietSessionStatus) -> some View {
         QuietSurfaceRowView(
+            id: mesh.id,
             identity: .mesh,
             title: mesh.title,
             status: status,
@@ -796,17 +801,12 @@ private struct QuietRowBody: View {
                 QuietSelectionWash()
             }
         }
-        .accessibilityElement(children: .combine)
-        .accessibilityLabel(accessibilityLabel)
-        .accessibilityAddTraits(isSelected ? .isSelected : [])
-    }
-
-    /// A row with no time-in-state yet must not read as "…, idle, " — the
-    /// components are joined only when they carry something.
-    private var accessibilityLabel: String {
-        [title, status.accessibilityWord ?? "idle", timeLabel]
-            .filter { !$0.isEmpty }
-            .joined(separator: ", ")
+        // Deliberately NOT `.accessibilityElement(children: .combine)` here:
+        // that would make this the row's own isolated accessibility node,
+        // nested *inside* the enclosing Button in `QuietSurfaceRowView`
+        // rather than merged into it — System Events then sees a button with
+        // AXPress but no AXTitle, since the label lives on a child it never
+        // descends into. The combine + label live on the Button itself.
     }
 }
 
@@ -849,6 +849,10 @@ private struct QuietStatusDot: View {
 /// they do when pressed and which context menu they carry, so they share one
 /// row: the identity mark already says which kind it is.
 private struct QuietSurfaceRowView: View {
+    /// The surface's stable id (session/chat/mesh id). Carried onto the row's
+    /// `accessibilityIdentifier` so scripted automation (System Events, XCUITest)
+    /// can address a specific row without depending on its visible title.
+    let id: String
     let identity: QuietIdentity
     let title: String
     let status: QuietSessionStatus
@@ -877,7 +881,14 @@ private struct QuietSurfaceRowView: View {
             )
         }
         .buttonStyle(.plain)
-        .accessibilityAddTraits(.isButton)
+        // The label lives on the Button itself, not on the nested `QuietRowBody`:
+        // a label declared on a child that is its own `.accessibilityElement`
+        // never surfaces as the Button's AXTitle/description, which left
+        // System Events seeing a row with AXPress but no readable title.
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel(accessibilityLabel)
+        .accessibilityAddTraits(isSelected ? [.isButton, .isSelected] : .isButton)
+        .accessibilityIdentifier(id)
         .accessibilityAction { select() }
         .accessibilityAction(named: Text("Open beside")) { reveal() }
         .onHover { inside in
@@ -888,6 +899,14 @@ private struct QuietSurfaceRowView: View {
         .listRowInsets(EdgeInsets())
         .listRowSeparator(.hidden)
         .listRowBackground(Color.clear)
+    }
+
+    /// A row with no time-in-state yet must not read as "…, idle, " — the
+    /// components are joined only when they carry something.
+    private var accessibilityLabel: String {
+        [title, status.accessibilityWord ?? "idle", timeLabel]
+            .filter { !$0.isEmpty }
+            .joined(separator: ", ")
     }
 
     /// ⌘-click opens the surface beside the current one instead of replacing

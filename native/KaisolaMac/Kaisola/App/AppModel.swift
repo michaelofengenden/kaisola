@@ -3545,12 +3545,36 @@ final class AppModel: ObservableObject {
     /// output with a spinner — a worse outcome than the memory it reclaims.
     /// In-flight split subscriptions are included because their card is already
     /// mounted and rendering from the retained document until the snapshot
-    /// lands.
+    /// lands. The active project's whole pane layout is unioned in too:
+    /// `focusTerminalSurface` unsubscribes the outgoing primary before
+    /// re-subscribing it as a split, and during that window it lives in none
+    /// of the sets above even though its card is still mounted in the layout.
     private var mountedTerminalSurfaceIDs: Set<String> {
-        var ids = Set(splitDocuments.keys)
-        ids.formUnion(pendingSplitSubscriptions.keys)
+        Self.protectedSurfaceIDs(
+            splitDocumentIDs: splitDocuments.keys,
+            pendingSplitSubscriptionIDs: pendingSplitSubscriptions.keys,
+            selectedSessionID: selectedSessionID,
+            primarySessionID: terminalDocument.sessionID,
+            activePaneLayoutSessionIDs: selectedProjectID.flatMap { paneLayouts[$0]?.sessionIDs } ?? []
+        )
+    }
+
+    /// Pure form of `mountedTerminalSurfaceIDs`, so the eviction-protection
+    /// policy can be exercised without an `AppModel` instance. Kept in sync by
+    /// construction: the property above is a thin call site, not a second copy
+    /// of this union.
+    nonisolated static func protectedSurfaceIDs(
+        splitDocumentIDs: some Sequence<String>,
+        pendingSplitSubscriptionIDs: some Sequence<String>,
+        selectedSessionID: String?,
+        primarySessionID: String?,
+        activePaneLayoutSessionIDs: some Sequence<String>
+    ) -> Set<String> {
+        var ids = Set(splitDocumentIDs)
+        ids.formUnion(pendingSplitSubscriptionIDs)
         if let selectedSessionID { ids.insert(selectedSessionID) }
-        if let primaryID = terminalDocument.sessionID { ids.insert(primaryID) }
+        if let primarySessionID { ids.insert(primarySessionID) }
+        ids.formUnion(activePaneLayoutSessionIDs)
         return ids
     }
 

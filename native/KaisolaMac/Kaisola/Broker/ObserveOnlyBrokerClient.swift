@@ -312,9 +312,12 @@ actor ObserveOnlyBrokerClient: ObserveOnlyBrokerServing {
         )
     }
 
-    /// Top a cold snapshot up to `ObserverHistoryTailPolicy.coldSubscribeTailBytes`
+    /// Top a snapshot up to `ObserverHistoryTailPolicy.coldSubscribeTailBytes`
     /// with at most one read-only page, then stop. Anything older stays in the
-    /// broker's spool, where the transcript viewer pages it on demand.
+    /// broker's spool, where the transcript viewer pages it on demand. This
+    /// runs on every `.snapshot` result from `subscribeWire`, not only a cold
+    /// subscribe: a warm resubscribe that the broker resets also comes back as
+    /// `.snapshot`, and it gets the same tail top-up.
     ///
     /// Older compatible brokers reject this additive method, in which case the
     /// ordinary reattach snapshot remains a safe fallback until the broker can

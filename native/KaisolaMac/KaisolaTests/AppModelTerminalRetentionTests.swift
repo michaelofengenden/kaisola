@@ -98,4 +98,42 @@ final class AppModelTerminalRetentionTests: XCTestCase {
         order.append(contentsOf: (0..<AppModel.maximumRetainedTerminalSurfaces).map { "t\($0)" })
         XCTAssertEqual(evictions(order, protected: ["pinned"]), ["t0"])
     }
+
+    // MARK: - protectedSurfaceIDs
+
+    /// `focusTerminalSurface` unsubscribes the outgoing primary before
+    /// re-subscribing it as a split, so mid-transition it is none of
+    /// `selectedSessionID`, the primary document, a split document, or a
+    /// pending split subscription — yet its card is still mounted in the
+    /// active project's pane layout. It must be protected anyway.
+    func testAnIDPresentOnlyInTheActivePaneLayoutIsProtected() {
+        let protectedIDs = AppModel.protectedSurfaceIDs(
+            splitDocumentIDs: [],
+            pendingSplitSubscriptionIDs: [],
+            selectedSessionID: "new-primary",
+            primarySessionID: "new-primary",
+            activePaneLayoutSessionIDs: ["new-primary", "mid-transition"]
+        )
+        XCTAssertTrue(protectedIDs.contains("mid-transition"))
+
+        // And it survives an eviction pass that would otherwise take it as
+        // the least-recently-used entry.
+        let order = ["mid-transition", "b", "c", "d"]
+        let bytes = Dictionary(uniqueKeysWithValues: order.map { ($0, 40 * Self.megabyte) })
+        XCTAssertEqual(evictions(order, bytes: bytes, protected: protectedIDs), ["b", "c"])
+    }
+
+    /// An id that belongs to no active surface and sits outside the pane
+    /// layout — e.g. a different project's terminal, or one the user closed
+    /// — is not protected by the layout union.
+    func testAnIDOutsideEveryMountedSetIsNotProtected() {
+        let protectedIDs = AppModel.protectedSurfaceIDs(
+            splitDocumentIDs: [],
+            pendingSplitSubscriptionIDs: [],
+            selectedSessionID: "new-primary",
+            primarySessionID: "new-primary",
+            activePaneLayoutSessionIDs: ["new-primary"]
+        )
+        XCTAssertFalse(protectedIDs.contains("elsewhere"))
+    }
 }

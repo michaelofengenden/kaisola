@@ -32,7 +32,8 @@ const NATIVE_DIRECTORY_TESTS = Object.freeze([
   ['native/KaisolaMac/Kaisola/Broker/', [
     'BrokerControlClientTests', 'BrokerDiscoveryTests', 'BrokerModelsTests',
     'BrokerReconnectBackoffTests', 'BrokerStartupCoordinatorTests',
-    'ObserveOnlyBrokerClientTests', 'TerminalCursorStoreTests',
+    'ObserveOnlyBrokerClientTests', 'ObserveOnlyBrokerHistoryPagingTests',
+    'TerminalCursorStoreTests',
   ]],
   ['native/KaisolaMac/Kaisola/Companion/', [
     'CompanionCommandRouterTests', 'CompanionConnectionSessionTests',

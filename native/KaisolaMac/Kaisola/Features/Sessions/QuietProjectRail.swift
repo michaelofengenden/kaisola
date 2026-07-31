@@ -16,6 +16,12 @@ struct QuietProjectRail: View {
 
     private let expansion: (String) -> Binding<Bool>
     private let isActiveProject: (String) -> Bool
+    /// Terminal selection carries a focus policy the rail must not own (window
+    /// hand-off, focused-pane and cross-project guards), so the host supplies it.
+    private let selectSession: (BrokerTerminalRecord) -> Void
+    /// The hover `+` offers creation only; destructive project actions stay in
+    /// the row's context menu.
+    private let launchMenu: (AppModel.ProjectGroup) -> AnyView
     private let projectMenu: (AppModel.ProjectGroup) -> AnyView
     private let sessionMenu: (BrokerTerminalRecord) -> AnyView
     private let chatMenu: (AcpChatHandle) -> AnyView
@@ -36,6 +42,8 @@ struct QuietProjectRail: View {
         attention: AttentionCenter,
         expansion: @escaping (String) -> Binding<Bool>,
         isActiveProject: @escaping (String) -> Bool,
+        selectSession: @escaping (BrokerTerminalRecord) -> Void,
+        launchMenu: @escaping (AppModel.ProjectGroup) -> AnyView,
         contextMenu: @escaping (AppModel.ProjectGroup) -> AnyView,
         sessionContextMenu: @escaping (BrokerTerminalRecord) -> AnyView,
         chatContextMenu: @escaping (AcpChatHandle) -> AnyView,
@@ -45,6 +53,8 @@ struct QuietProjectRail: View {
         self.attention = attention
         self.expansion = expansion
         self.isActiveProject = isActiveProject
+        self.selectSession = selectSession
+        self.launchMenu = launchMenu
         self.projectMenu = contextMenu
         self.sessionMenu = sessionContextMenu
         self.chatMenu = chatContextMenu
@@ -63,6 +73,8 @@ struct QuietProjectRail: View {
                 orderStore: orderStore,
                 since: { clock.since(id: $0) },
                 note: { id, status in clock.note(id: id, status: status, at: Date()) },
+                selectSession: selectSession,
+                launchMenu: launchMenu,
                 projectMenu: projectMenu,
                 sessionMenu: sessionMenu,
                 chatMenu: chatMenu,
@@ -113,6 +125,8 @@ private struct QuietProjectGroup: View {
     let orderStore: SessionOrderStore
     let since: (String) -> Date?
     let note: (String, QuietSessionStatus) -> Void
+    let selectSession: (BrokerTerminalRecord) -> Void
+    let launchMenu: (AppModel.ProjectGroup) -> AnyView
     let projectMenu: (AppModel.ProjectGroup) -> AnyView
     let sessionMenu: (BrokerTerminalRecord) -> AnyView
     let chatMenu: (AcpChatHandle) -> AnyView
@@ -177,7 +191,7 @@ private struct QuietProjectGroup: View {
                     .foregroundStyle(.tertiary)
                     .accessibilityHidden(true)
                 Menu {
-                    projectMenu(project)
+                    launchMenu(project)
                 } label: {
                     Image(systemName: "plus")
                         .font(.system(size: QuietRailMetrics.plusText, weight: .semibold))
@@ -253,7 +267,7 @@ private struct QuietProjectGroup: View {
             timeLabel: timeLabel(record.id),
             isSelected: model.isSurfaceVisible(record.id),
             tooltip: tooltip(for: record),
-            select: { Task { await model.select(record.id) } },
+            select: { selectSession(record) },
             menu: sessionMenu
         )
     }
@@ -387,6 +401,9 @@ private struct QuietRollupView: View {
         }
         .accessibilityElement(children: .ignore)
         .accessibilityLabel(label)
+        // An empty rollup draws nothing; without this VoiceOver still stops on
+        // an unlabeled element between the project name and its chrome.
+        .accessibilityHidden(rollup.total == 0)
     }
 
     private var label: String {
@@ -441,8 +458,16 @@ private struct QuietRowBody: View {
             }
         }
         .accessibilityElement(children: .combine)
-        .accessibilityLabel("\(title), \(status.accessibilityWord ?? "idle"), \(timeLabel)")
+        .accessibilityLabel(accessibilityLabel)
         .accessibilityAddTraits(isSelected ? .isSelected : [])
+    }
+
+    /// A row with no time-in-state yet must not read as "…, idle, " — the
+    /// components are joined only when they carry something.
+    private var accessibilityLabel: String {
+        [title, status.accessibilityWord ?? "idle", timeLabel]
+            .filter { !$0.isEmpty }
+            .joined(separator: ", ")
     }
 }
 
@@ -501,6 +526,10 @@ private struct QuietSessionRowView: View {
             isSelected: isSelected
         )
         .onTapGesture(perform: select)
+        // The tap gesture alone is invisible to VoiceOver and keyboard control;
+        // the button trait plus a default action make the row activatable.
+        .accessibilityAddTraits(.isButton)
+        .accessibilityAction { select() }
         .help(tooltip)
         .contextMenu { menu(record) }
         .listRowInsets(EdgeInsets())
@@ -529,6 +558,8 @@ private struct QuietChatRowView: View {
             isSelected: isSelected
         )
         .onTapGesture(perform: select)
+        .accessibilityAddTraits(.isButton)
+        .accessibilityAction { select() }
         .help(tooltip)
         .contextMenu { menu(chat) }
         .listRowInsets(EdgeInsets())
@@ -556,6 +587,8 @@ private struct QuietMeshRowView: View {
             isSelected: isSelected
         )
         .onTapGesture(perform: select)
+        .accessibilityAddTraits(.isButton)
+        .accessibilityAction { select() }
         .help(tooltip)
         .contextMenu { menu(mesh) }
         .listRowInsets(EdgeInsets())

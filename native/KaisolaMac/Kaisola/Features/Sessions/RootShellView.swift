@@ -262,6 +262,18 @@ struct RootShellView: View {
                         attention: attention,
                         expansion: { expansionBinding($0) },
                         isActiveProject: { model.selectedProjectID == $0 },
+                        selectSession: { session in
+                            if KaisolaMacAppDelegate.focusWindow(displayingSurface: session.id) { return }
+                            guard SurfaceSelectionPolicy.shouldRequestFocus(
+                                focusedPaneID: model.focusedPaneID,
+                                targetID: session.id,
+                                browserOpen: model.browserCardURL != nil,
+                                activeProjectID: model.selectedProjectID,
+                                targetProjectID: session.projectID
+                            ) else { return }
+                            Task { await model.focusSurface(session.id) }
+                        },
+                        launchMenu: { AnyView(projectLaunchMenu($0)) },
                         contextMenu: { AnyView(projectContextMenu($0)) },
                         sessionContextMenu: { AnyView(sessionContextMenuContent($0)) },
                         chatContextMenu: { AnyView(chatContextMenuContent($0)) },

@@ -1,3 +1,4 @@
+import AppKit
 import XCTest
 @testable import Kaisola
 
@@ -108,6 +109,86 @@ final class TerminalTranscriptTests: XCTestCase {
             4
         )
         XCTAssertTrue(TerminalTranscriptSearch.ranges(in: text, query: "   ").isEmpty)
+    }
+
+    func testTranscriptUsesTheConfiguredTerminalTypefaceAndWeight() {
+        let menlo = TerminalTranscriptTypography.font(
+            family: "Menlo",
+            size: 17,
+            weightRaw: "bold"
+        )
+        XCTAssertEqual(menlo.familyName, "Menlo")
+        XCTAssertEqual(menlo.pointSize, 17, accuracy: 0.001)
+        XCTAssertTrue(menlo.isFixedPitch)
+
+        let sentinel = TerminalTranscriptTypography.font(
+            family: TerminalFontOptions.systemMonoSentinel,
+            size: 13,
+            weightRaw: "regular"
+        )
+        XCTAssertTrue(sentinel.isFixedPitch)
+        XCTAssertEqual(sentinel.pointSize, 13, accuracy: 0.001)
+    }
+
+    func testTranscriptFontSizeStaysInsideTheSettingsRange() {
+        XCTAssertEqual(
+            TerminalTranscriptTypography.clampedSize(200),
+            NativePreviewSettings.terminalFontRange.upperBound,
+            accuracy: 0.001
+        )
+        XCTAssertEqual(
+            TerminalTranscriptTypography.clampedSize(0),
+            NativePreviewSettings.terminalFontRange.lowerBound,
+            accuracy: 0.001
+        )
+        XCTAssertEqual(
+            TerminalTranscriptTypography.clampedSize(.nan),
+            NativePreviewSettings.terminalFontDefault,
+            accuracy: 0.001
+        )
+        XCTAssertEqual(TerminalTranscriptTypography.clampedSize(13), 13, accuracy: 0.001)
+    }
+
+    func testFindHighlightAdaptsToAppearanceAndStaysBehindTheText() {
+        let light = TerminalTranscriptSearch.matchHighlight(dark: false)
+        let dark = TerminalTranscriptSearch.matchHighlight(dark: true)
+
+        XCTAssertNotEqual(light, dark)
+        // A find highlight is a wash behind selectable text, never an opaque
+        // block: fully opaque yellow made dark-appearance matches unreadable.
+        for color in [light, dark] {
+            XCTAssertLessThan(color.alphaComponent, 1)
+            XCTAssertGreaterThan(color.alphaComponent, 0.15)
+        }
+
+        // The dynamic color the view actually applies must resolve to exactly
+        // those two values, so the sheet follows a mid-session appearance flip.
+        let dynamic = TerminalTranscriptSearch.matchHighlightColor
+        assertResolves(dynamic, under: .darkAqua, to: dark)
+        assertResolves(dynamic, under: .aqua, to: light)
+    }
+
+    private func assertResolves(
+        _ dynamic: NSColor,
+        under appearanceName: NSAppearance.Name,
+        to expected: NSColor,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) {
+        guard let appearance = NSAppearance(named: appearanceName) else {
+            return XCTFail("Missing appearance \(appearanceName.rawValue)", file: file, line: line)
+        }
+        var resolved: NSColor?
+        appearance.performAsCurrentDrawingAppearance {
+            resolved = dynamic.usingColorSpace(.sRGB)
+        }
+        guard let resolved, let expected = expected.usingColorSpace(.sRGB) else {
+            return XCTFail("Highlight did not resolve to an sRGB color", file: file, line: line)
+        }
+        XCTAssertEqual(resolved.redComponent, expected.redComponent, accuracy: 0.002, file: file, line: line)
+        XCTAssertEqual(resolved.greenComponent, expected.greenComponent, accuracy: 0.002, file: file, line: line)
+        XCTAssertEqual(resolved.blueComponent, expected.blueComponent, accuracy: 0.002, file: file, line: line)
+        XCTAssertEqual(resolved.alphaComponent, expected.alphaComponent, accuracy: 0.002, file: file, line: line)
     }
 
     func testHistoryStorageWarningIsSoftAndUsesExactBrokerBytes() {

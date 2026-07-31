@@ -39,7 +39,7 @@ struct TerminalTranscriptView: View {
                                 renderedPages[page.id] ?? "",
                                 query: searchText
                             ))
-                                .font(.system(size: 12, design: .monospaced))
+                                .font(Font(transcriptFont))
                                 .textSelection(.enabled)
                                 .frame(maxWidth: .infinity, alignment: .leading)
                                 .padding(.horizontal, 18)
@@ -54,6 +54,19 @@ struct TerminalTranscriptView: View {
             }
         }
         .frame(minWidth: 620, idealWidth: 820, minHeight: 440, idealHeight: 660)
+    }
+
+    /// The transcript is the same output the live surface renders, so it must
+    /// obey the user's Settings → Terminal typeface, size, and weight rather
+    /// than a hardcoded system-mono face. Column alignment in retained TUI
+    /// frames only survives in a fixed-pitch font, which `TerminalFontOptions`
+    /// guarantees for every resolution path.
+    private var transcriptFont: NSFont {
+        TerminalTranscriptTypography.font(
+            family: settings.terminalFontFamily,
+            size: settings.terminalFontSize,
+            weightRaw: settings.terminalFontWeight
+        )
     }
 
     private var header: some View {
@@ -389,7 +402,51 @@ enum TerminalTranscriptScrollPolicy {
     }
 }
 
+/// Typography for the read-only history sheet, resolved from the same settings
+/// the live terminal uses. Kept separate from the view so the resolution and
+/// clamping rules are directly testable.
+@MainActor
+enum TerminalTranscriptTypography {
+    static func font(family: String, size: Double, weightRaw: String) -> NSFont {
+        TerminalFontOptions.resolveFont(
+            family: family,
+            size: clampedSize(size),
+            weightRaw: weightRaw
+        )
+    }
+
+    /// The transcript is selectable text rather than a terminal grid, so an
+    /// out-of-range persisted size cannot break geometry — but it can still
+    /// make retained history unreadable. Clamp to the range Settings offers,
+    /// and treat a non-finite stored value as "never configured".
+    static func clampedSize(_ size: Double) -> Double {
+        guard size.isFinite else { return NativePreviewSettings.terminalFontDefault }
+        return min(
+            max(size, NativePreviewSettings.terminalFontRange.lowerBound),
+            NativePreviewSettings.terminalFontRange.upperBound
+        )
+    }
+}
+
 enum TerminalTranscriptSearch {
+    /// Find-match wash. A fixed 50%-opacity yellow was legible on the light
+    /// transcript background and close to unreadable on the dark one, where
+    /// the text drawn over it is nearly white. Both variants stay translucent
+    /// so the match reads as a highlight behind selectable text.
+    nonisolated static func matchHighlight(dark: Bool) -> NSColor {
+        dark
+            ? NSColor(srgbRed: 0.98, green: 0.80, blue: 0.24, alpha: 0.30)
+            : NSColor(srgbRed: 1.0, green: 0.87, blue: 0.19, alpha: 0.55)
+    }
+
+    /// Resolved lazily by AppKit against the *current* appearance, so the sheet
+    /// follows a mid-session Light/Dark flip without rebuilding its pages.
+    nonisolated static let matchHighlightColor = NSColor(
+        name: NSColor.Name("kaisolaTranscriptFindMatch")
+    ) { appearance in
+        matchHighlight(dark: appearance.bestMatch(from: [.aqua, .darkAqua]) == .darkAqua)
+    }
+
     static func ranges(in text: String, query: String) -> [NSRange] {
         let needle = query.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !needle.isEmpty else { return [] }
@@ -427,7 +484,7 @@ enum TerminalTranscriptSearch {
                 ))))
             }
             var match = AttributedString(source.substring(with: range))
-            match.backgroundColor = .yellow.opacity(0.5)
+            match.backgroundColor = Color(nsColor: matchHighlightColor)
             result.append(match)
             cursor = NSMaxRange(range)
         }

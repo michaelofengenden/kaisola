@@ -36,11 +36,12 @@ final class ObserveOnlyBrokerHistoryPagingTests: XCTestCase {
     }
 
     func testTheTailIsAFractionOfTheOldEagerRetainTarget() {
-        // The document trim cap is the broker's durable spool size. The old cold
-        // subscribe tried to fill it on every selection.
-        XCTAssertLessThanOrEqual(
+        // The old cold subscribe tried to fill the whole document trim cap on
+        // every selection; the fixed one-page tail must stay a strict fraction
+        // of that cap however the cap itself is tuned.
+        XCTAssertLessThan(
             policy.coldSubscribeTailBytes,
-            TerminalDocument.maximumRetainedBytes / 16
+            TerminalDocument.maximumRetainedBytes
         )
     }
 

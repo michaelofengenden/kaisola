@@ -210,10 +210,13 @@ struct TerminalScrollback: Equatable, Sendable {
 }
 
 struct TerminalDocument: Equatable, Sendable {
-    /// Match the detached broker's default durable spool so a reattached app
-    /// can retain every page it just fetched instead of immediately discarding
-    /// the earliest terminal messages again.
-    static let maximumRetainedBytes = 64 * 1_024 * 1_024
+    /// Cold select now tops up to a single ~4 MiB tail instead of paging the
+    /// whole spool ("fetch a tail on cold select, not the whole spool"), so
+    /// the tail policy makes a large resident buffer pointless: nothing fills
+    /// it past the first frame. Deep history beyond this cap is the
+    /// transcript viewer's job — it pages further `terminal.history` straight
+    /// from the broker's durable spool instead of holding it all in memory.
+    static let maximumRetainedBytes = 16 * 1_024 * 1_024
 
     /// How far *below* the cap a trim drops the buffer.
     ///

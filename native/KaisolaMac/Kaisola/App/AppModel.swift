@@ -84,11 +84,11 @@ final class AppModel: ObservableObject {
     /// broker's disk spool remains the durable, larger history boundary.
     nonisolated static let maximumRetainedTerminalSurfaces = 12
     /// Count alone is the wrong unit for a memory budget: a dozen documents,
-    /// each free to grow to `TerminalDocument.maximumRetainedBytes`, is 768 MiB
+    /// each free to grow to `TerminalDocument.maximumRetainedBytes`, is 192 MiB
     /// of scrollback strings — reachable simply by touring long-lived
     /// terminals. Retained bytes are therefore bounded too, evicting
-    /// least-recently-used first. 96 MiB holds a whole saturated terminal plus
-    /// a comfortable deck of ordinary ones.
+    /// least-recently-used first. 96 MiB comfortably holds six saturated
+    /// terminals, or one saturated terminal plus a deep deck of ordinary ones.
     nonisolated static let maximumRetainedTerminalBytes = 96 * 1_024 * 1_024
     /// Terminals this app created and may mutate. Everything else stays
     /// strictly observed no matter what the UI asks for.

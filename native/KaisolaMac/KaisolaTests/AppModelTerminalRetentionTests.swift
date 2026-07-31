@@ -4,9 +4,9 @@ import XCTest
 /// The retained terminal deck was bounded by document *count* only.
 ///
 /// Twelve documents, each free to grow to `TerminalDocument.maximumRetainedBytes`,
-/// is three quarters of a gigabyte of scrollback strings — reachable simply by
-/// touring long-lived terminals. Count is the wrong unit for a memory budget:
-/// eleven idle shells and one week-old agent log are not the same object.
+/// is 192 MiB of scrollback strings — reachable simply by touring long-lived
+/// terminals. Count is the wrong unit for a memory budget: eleven idle shells
+/// and one week-old agent log are not the same object.
 ///
 /// The deck is therefore bounded in bytes as well, evicting least-recently-used
 /// first. Mounted cards are exempt: a terminal card renders only while its feed
@@ -36,7 +36,7 @@ final class AppModelTerminalRetentionTests: XCTestCase {
         XCTAssertEqual(AppModel.maximumRetainedTerminalBytes, 96 * Self.megabyte)
         let countOnlyWorstCase = AppModel.maximumRetainedTerminalSurfaces
             * TerminalDocument.maximumRetainedBytes
-        XCTAssertEqual(countOnlyWorstCase, 768 * Self.megabyte, "This is what a count-only bound permitted.")
+        XCTAssertEqual(countOnlyWorstCase, 192 * Self.megabyte, "This is what a count-only bound permitted.")
         XCTAssertLessThan(AppModel.maximumRetainedTerminalBytes, countOnlyWorstCase)
     }
 

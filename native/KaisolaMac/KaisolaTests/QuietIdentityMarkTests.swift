@@ -90,6 +90,45 @@ final class QuietIdentityMarkTests: XCTestCase {
         )
     }
 
+    // MARK: - Row width budget
+
+    /// The regression this covers: at the default sidebar width a session title
+    /// must read as a title, not as an abbreviation. v1.1.4 left it 56pt —
+    /// "Audit K…" — because the row's fixed tokens were charged against it and
+    /// its trailing lane could still be compressed below its own first glyph.
+    func testSessionTitleGetsMostOfTheRowAtTheDefaultSidebarWidth() {
+        let titleFont = NSFont.systemFont(ofSize: 13)
+        let timeFont = NSFont.monospacedDigitSystemFont(ofSize: 10.5, weight: .regular)
+        let timeWidth = ("now" as NSString).size(withAttributes: [.font: timeFont]).width
+
+        let available = QuietRowBudget.titleWidth(
+            sidebarWidth: NativeWorkspaceChrome.projectSidebarIdealWidth,
+            timeLabelWidth: timeWidth,
+            showsReveal: false
+        )
+        XCTAssertGreaterThan(available, 100, "the title lane lost its share of the row again")
+
+        // Stated the way the complaint was: how much of a real title is legible.
+        let sample = "Audit Kaisola Sidebar parity"
+        var visible = 0
+        for count in 1...sample.count {
+            let candidate = String(sample.prefix(count)) + "…"
+            let width = (candidate as NSString).size(withAttributes: [.font: titleFont]).width
+            if width <= available { visible = count } else { break }
+        }
+        XCTAssertGreaterThanOrEqual(visible, 15, "only \(visible) characters survive at 200pt")
+
+        // The hover-only reveal control may cost the title, but never this much.
+        XCTAssertGreaterThan(
+            QuietRowBudget.titleWidth(
+                sidebarWidth: NativeWorkspaceChrome.projectSidebarIdealWidth,
+                timeLabelWidth: timeWidth,
+                showsReveal: true
+            ),
+            80
+        )
+    }
+
     // MARK: - Compact-list drag mapping
 
     func testDragToTopOfTheCompactListLandsBelowThePinnedProject() {

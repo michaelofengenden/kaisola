@@ -176,21 +176,80 @@ private enum QuietRailMetrics {
     static let secondaryText: CGFloat = 10.5
     static let chevronText: CGFloat = 9
     static let plusText: CGFloat = 10
-    static let folderText: CGFloat = 11
+    /// The stacked-tile project mark. Drawn a shade larger than the old folder
+    /// glyph because an outline mark carries less ink at the same point size.
+    static let projectMarkText: CGFloat = 11.5
     static let revealText: CGFloat = 10
+    /// Slot the hover-only "open beside" control occupies in the trailing lane.
+    static let revealSlot: CGFloat = 16
     /// Identity slot and the gap between it and the label.
     static let mark: CGFloat = QuietIdentityMarkView.slot
     static let markGap: CGFloat = 8
     static let dot: CGFloat = 6
-    static let sessionIndent: CGFloat = 30
+    /// A session sits one mark-width in from its project, no further: the row's
+    /// scarce resource is title width, and every point spent on the indent is a
+    /// point the title loses.
+    static let sessionIndent: CGFloat = 18
     /// One cadence for every row in the rail: sessions, compact projects and
     /// the pinned project header all measure 32pt.
     static let rowHeight: CGFloat = 32
     static let horizontalInset: CGFloat = 8
     static let trailingInset: CGFloat = 10
+    /// macOS's `List` reserves a fixed row inset (8pt leading, 9pt trailing)
+    /// that `listRowInsets(EdgeInsets())` does *not* clear, and neither does
+    /// `contentMargins`. At the 200pt default sidebar those 17pt were most of
+    /// the difference between a title showing 7 characters and 16, so each row
+    /// cancels the platform inset and divides the full column width itself —
+    /// the rail already insets its own wash from the column edge.
+    ///
+    /// Degrades safely: were a future macOS to stop reserving the inset, the
+    /// row would overhang its cell by these amounts and be clipped there, which
+    /// costs only the row's own leading indent and trailing padding — the mark,
+    /// title, time and dot all sit inside that margin.
+    static let listRowBleed = EdgeInsets(top: 0, leading: -8, bottom: 0, trailing: -9)
+    /// Gap inside the trailing lane (reveal · time · dot, or rollup · chevron).
+    /// Tighter than `markGap` so the lane costs the title as little as possible.
+    static let laneGap: CGFloat = 5
+    /// How long a group keeps its hover state while the pointer crosses from
+    /// one of its rows into the next. Without the grace period the row the
+    /// pointer is travelling *to* can be removed before it arrives.
+    static let hoverGrace: Double = 0.12
     static let pulseDuration: Double = 1.4
     /// The rail's only fill: a neutral wash, never a tint.
     static let washOpacity: Double = 0.055
+}
+
+/// What a surface row's title is actually given, derived from the same metrics
+/// the row lays out with.
+///
+/// The rail's scarcest resource is title width, and it regressed silently: the
+/// v1.1.4 row spent 30pt on its indent, four uniform 8pt gaps and a trailing
+/// lane that could not be compressed, leaving a 200pt sidebar's title 56pt —
+/// seven characters. Stating the budget as arithmetic gives that a test.
+enum QuietRowBudget {
+    /// - Parameters:
+    ///   - sidebarWidth: the navigation column's width. Rows span it entirely;
+    ///     see `QuietRailMetrics.listRowBleed`.
+    ///   - timeLabelWidth: rendered width of the time-in-state label.
+    ///   - showsReveal: whether the hover-only "open beside" control is drawn.
+    /// - Returns: points left for the title once every fixed token is paid for.
+    static func titleWidth(
+        sidebarWidth: CGFloat,
+        timeLabelWidth: CGFloat,
+        showsReveal: Bool
+    ) -> CGFloat {
+        var lane = timeLabelWidth + QuietRailMetrics.laneGap + QuietRailMetrics.dot
+        if showsReveal { lane += QuietRailMetrics.revealSlot + QuietRailMetrics.laneGap }
+        return sidebarWidth
+            - QuietRailMetrics.sessionIndent
+            - QuietRailMetrics.trailingInset
+            - QuietRailMetrics.mark
+            - QuietRailMetrics.markGap
+            // The spacer between the title and the lane, at its minimum — which
+            // is where it sits whenever the title is long enough to truncate.
+            - QuietRailMetrics.laneGap
+            - lane
+    }
 }
 
 private enum QuietProjectPlacement {
@@ -213,9 +272,30 @@ private struct QuietSectionLabel: View {
             .padding(.bottom, 5)
             .frame(maxWidth: .infinity, alignment: .leading)
             .accessibilityAddTraits(.isHeader)
-            .listRowInsets(EdgeInsets())
+            .listRowInsets(QuietRailMetrics.listRowBleed)
             .listRowSeparator(.hidden)
             .listRowBackground(Color.clear)
+    }
+}
+
+/// A project's leading mark: the stacked-tile glyph the v4 mock uses, in the
+/// same 16pt slot a surface row's identity mark occupies, so project names and
+/// session titles start on two consistent columns.
+///
+/// Deliberately not `folder`/`folder.fill`: a folder reads as a *file system*
+/// row, and the rail's projects are workspaces. Only the pinned project's mark
+/// carries the project tint — every other row's mark stays neutral so the tint
+/// means "this is the project you are in" rather than "this is a project".
+private struct QuietProjectMarkView: View {
+    /// `nil` for a compact (non-pinned) row.
+    let tint: Color?
+
+    var body: some View {
+        Image(systemName: "square.on.square")
+            .font(.system(size: QuietRailMetrics.projectMarkText, weight: .regular))
+            .foregroundStyle(tint ?? Color.secondary)
+            .frame(width: QuietRailMetrics.mark, height: QuietRailMetrics.mark)
+            .accessibilityHidden(true)
     }
 }
 
@@ -245,12 +325,40 @@ private struct QuietProjectGroup: View {
 
     @State private var hovering = false
     @State private var hoveringLaunchRow = false
+    /// Bumped on every hover transition anywhere in the group so a pending
+    /// "leave" can tell whether the pointer actually left or merely crossed
+    /// into the next row of the same group.
+    @State private var hoverGeneration = 0
     /// Manual drag order, read from disk once per project so streamed output
     /// never turns a re-render into file I/O.
     @State private var manualOrder: [String] = []
     @State private var loadedOrder = false
 
     private var isActive: Bool { placement == .pinned }
+
+    /// The mock has no resting "New session" ghost row, so the row is not in
+    /// the layout at all until the group is hovered — the same rule the header
+    /// chevron and `+` follow.
+    private var showsNewSessionRow: Bool { hovering || hoveringLaunchRow }
+
+    /// Hover is a property of the whole *group*, not of one row: the reveal row
+    /// sits under the group's last surface, so the pointer has to travel across
+    /// sibling rows to reach it. Every row reports into this, and a leave is
+    /// deferred by one grace period so crossing a row boundary never removes
+    /// the row the pointer is heading for.
+    private func setHover(_ inside: Bool) {
+        hoverGeneration &+= 1
+        if inside {
+            guard !hovering else { return }
+            withAnimation(.easeOut(duration: KaisolaVisualSystem.hoverDuration)) { hovering = true }
+            return
+        }
+        let generation = hoverGeneration
+        DispatchQueue.main.asyncAfter(deadline: .now() + QuietRailMetrics.hoverGrace) {
+            guard generation == hoverGeneration, hovering else { return }
+            withAnimation(.easeOut(duration: KaisolaVisualSystem.hoverDuration)) { hovering = false }
+        }
+    }
 
     var body: some View {
         let chats = model.chats(in: project.id)
@@ -281,7 +389,7 @@ private struct QuietProjectGroup: View {
                 if sessions.isEmpty, chats.isEmpty, meshes.isEmpty {
                     emptyRow
                 }
-                if isActive {
+                if isActive, showsNewSessionRow {
                     newSessionRow
                 }
             }
@@ -320,27 +428,28 @@ private struct QuietProjectGroup: View {
             Button {
                 withAnimation(.easeInOut(duration: KaisolaVisualSystem.stateDuration)) { isExpanded.toggle() }
             } label: {
-                HStack(spacing: QuietRailMetrics.markGap) {
-                    Image(systemName: "folder")
-                        .font(.system(size: QuietRailMetrics.folderText, weight: .medium))
-                        .foregroundStyle(tint)
-                        .frame(width: QuietRailMetrics.mark, height: QuietRailMetrics.mark)
-                        .accessibilityHidden(true)
+                HStack(spacing: 0) {
+                    QuietProjectMarkView(tint: tint)
+                        .padding(.trailing, QuietRailMetrics.markGap)
                     Text(project.name)
                         .font(.system(size: QuietRailMetrics.headerText, weight: .semibold))
                         .foregroundStyle(tint)
                         .lineLimit(1)
                         .truncationMode(.middle)
-                    Spacer(minLength: 4)
-                    if !isExpanded {
-                        QuietRollupView(rollup: QuietRollup.of(Array(statuses.values)))
+                        .layoutPriority(1)
+                    Spacer(minLength: QuietRailMetrics.laneGap)
+                    HStack(spacing: QuietRailMetrics.laneGap) {
+                        if !isExpanded {
+                            QuietRollupView(rollup: QuietRollup.of(Array(statuses.values)))
+                        }
+                        if hovering {
+                            Image(systemName: isExpanded ? "chevron.down" : "chevron.right")
+                                .font(.system(size: QuietRailMetrics.chevronText, weight: .semibold))
+                                .foregroundStyle(.tertiary)
+                                .accessibilityHidden(true)
+                        }
                     }
-                    if hovering {
-                        Image(systemName: isExpanded ? "chevron.down" : "chevron.right")
-                            .font(.system(size: QuietRailMetrics.chevronText, weight: .semibold))
-                            .foregroundStyle(.tertiary)
-                            .accessibilityHidden(true)
-                    }
+                    .fixedSize()
                 }
                 // The button's own label owns the full row geometry — height,
                 // horizontal inset and width — so its hit area (and VoiceOver
@@ -382,19 +491,18 @@ private struct QuietProjectGroup: View {
     private func compactRow(statuses: [String: QuietSessionStatus]) -> some View {
         HStack(spacing: 6) {
             Button(action: activate) {
-                HStack(spacing: QuietRailMetrics.markGap) {
-                    Image(systemName: "folder")
-                        .font(.system(size: QuietRailMetrics.folderText, weight: .regular))
-                        .foregroundStyle(.tertiary)
-                        .frame(width: QuietRailMetrics.mark, height: QuietRailMetrics.mark)
-                        .accessibilityHidden(true)
+                HStack(spacing: 0) {
+                    QuietProjectMarkView(tint: nil)
+                        .padding(.trailing, QuietRailMetrics.markGap)
                     Text(project.name)
                         .font(.system(size: QuietRailMetrics.headerText))
                         .foregroundStyle(HierarchicalShapeStyle.primary)
                         .lineLimit(1)
                         .truncationMode(.middle)
-                    Spacer(minLength: 4)
+                        .layoutPriority(1)
+                    Spacer(minLength: QuietRailMetrics.laneGap)
                     QuietRollupView(rollup: QuietRollup.of(Array(statuses.values)))
+                        .fixedSize()
                 }
                 .padding(.leading, QuietRailMetrics.horizontalInset)
                 .frame(height: QuietRailMetrics.rowHeight)
@@ -433,7 +541,7 @@ private struct QuietProjectGroup: View {
     /// both header shapes.
     private var projectRowChrome: QuietProjectRowChrome {
         QuietProjectRowChrome(
-            hovering: $hovering,
+            setHover: setHover,
             isActive: isActive,
             expandLabel: isExpanded ? "Collapse" : "Expand",
             toggle: { withAnimation(.easeInOut(duration: KaisolaVisualSystem.stateDuration)) { isExpanded.toggle() } },
@@ -467,25 +575,29 @@ private struct QuietProjectGroup: View {
             .padding(.leading, QuietRailMetrics.sessionIndent)
             .frame(height: QuietRailMetrics.rowHeight)
             .frame(maxWidth: .infinity, alignment: .leading)
-            .listRowInsets(EdgeInsets())
+            .contentShape(Rectangle())
+            .onHover { inside in setHover(inside) }
+            .listRowInsets(QuietRailMetrics.listRowBleed)
             .listRowSeparator(.hidden)
             .listRowBackground(Color.clear)
     }
 
-    /// The pinned project's creation affordance, under its surfaces. The row
-    /// always holds its slot so the pointer can reach it (an `opacity(0)` view
-    /// still hit-tests); only its contents are hover-revealed, which keeps the
-    /// rail's resting state free of chrome without making the target jump.
+    /// The pinned project's creation affordance, under its surfaces. It is only
+    /// in the layout while the group is hovered — at rest the rail shows no
+    /// chrome at all, and creation is still one hover away on the pinned
+    /// header's `+` (plus ⌘T, the project's context menu and File ▸ Open).
     private var newSessionRow: some View {
         Menu {
             launchMenu(project)
         } label: {
-            HStack(spacing: QuietRailMetrics.markGap) {
+            HStack(spacing: 0) {
                 Image(systemName: "plus")
                     .font(.system(size: QuietRailMetrics.plusText, weight: .semibold))
                     .frame(width: QuietRailMetrics.mark, height: QuietRailMetrics.mark)
+                    .padding(.trailing, QuietRailMetrics.markGap)
                 Text("New session")
                     .font(.system(size: QuietRailMetrics.titleText))
+                    .lineLimit(1)
                 Spacer(minLength: 0)
             }
             .foregroundStyle(.tertiary)
@@ -494,16 +606,21 @@ private struct QuietProjectGroup: View {
             .frame(height: QuietRailMetrics.rowHeight)
             .frame(maxWidth: .infinity, alignment: .leading)
             .contentShape(Rectangle())
-            .opacity(hovering || hoveringLaunchRow ? 1 : 0)
         }
         .menuStyle(.borderlessButton)
         .menuIndicator(.hidden)
+        // The label's own height does not reach the row: a borderless Menu
+        // sizes to its control, so the row is pinned to the rail's cadence here
+        // rather than inside the label.
+        .frame(height: QuietRailMetrics.rowHeight)
+        .transition(.opacity)
         .onHover { inside in
+            setHover(inside)
             withAnimation(.easeOut(duration: KaisolaVisualSystem.hoverDuration)) { hoveringLaunchRow = inside }
         }
         .help("New session in \(project.name)")
         .accessibilityLabel("New session in \(project.name)")
-        .listRowInsets(EdgeInsets())
+        .listRowInsets(QuietRailMetrics.listRowBleed)
         .listRowSeparator(.hidden)
         .listRowBackground(Color.clear)
     }
@@ -532,6 +649,7 @@ private struct QuietProjectGroup: View {
             timeLabel: timeLabel(record.id),
             isSelected: model.isSurfaceVisible(record.id),
             tooltip: tooltip(for: record),
+            groupHover: setHover,
             select: { selectSession(record) },
             reveal: { model.revealSurfaceBeside(record.id) },
             menu: { sessionMenu(record) }
@@ -547,6 +665,7 @@ private struct QuietProjectGroup: View {
             timeLabel: timeLabel(chat.id),
             isSelected: model.isSurfaceVisible(chat.id),
             tooltip: chatTooltip(chat),
+            groupHover: setHover,
             select: { model.selectChat(chat.id) },
             reveal: { model.revealSurfaceBeside(chat.id) },
             menu: { chatMenu(chat) }
@@ -562,6 +681,7 @@ private struct QuietProjectGroup: View {
             timeLabel: timeLabel(mesh.id),
             isSelected: model.isSurfaceVisible(mesh.id),
             tooltip: mesh.stage == "Idle" ? "Mesh · Ready" : "Mesh · \(mesh.stage)",
+            groupHover: setHover,
             select: { model.selectMesh(mesh.id) },
             reveal: { model.revealSurfaceBeside(mesh.id) },
             menu: { meshMenu(mesh) }
@@ -652,7 +772,9 @@ private struct QuietProjectGroup: View {
 /// helper function so the hover binding, the context menu (Move Up/Down ahead
 /// of the host's destructive tail) and the list chrome stay defined once.
 private struct QuietProjectRowChrome: ViewModifier {
-    @Binding var hovering: Bool
+    /// The group owns the hover state (and its leave grace period), so the row
+    /// reports into it rather than writing a binding directly.
+    let setHover: (Bool) -> Void
     let isActive: Bool
     let expandLabel: String
     let toggle: () -> Void
@@ -663,9 +785,7 @@ private struct QuietProjectRowChrome: ViewModifier {
 
     func body(content: Content) -> some View {
         content
-            .onHover { inside in
-                withAnimation(.easeOut(duration: KaisolaVisualSystem.hoverDuration)) { hovering = inside }
-            }
+            .onHover { inside in setHover(inside) }
             .contextMenu {
                 // Move Up/Down come first so the destructive tail of the
                 // passed-in project menu (Close Project) stays last in the
@@ -690,7 +810,7 @@ private struct QuietProjectRowChrome: ViewModifier {
             .accessibilityElement(children: .contain)
             .accessibilityAction(named: Text(expandLabel)) { toggle() }
             .onAppear { onAppear() }
-            .listRowInsets(EdgeInsets())
+            .listRowInsets(QuietRailMetrics.listRowBleed)
             .listRowSeparator(.hidden)
             .listRowBackground(Color.clear)
     }
@@ -759,8 +879,12 @@ private struct QuietRowBody: View {
     let reveal: () -> Void
 
     var body: some View {
-        HStack(spacing: QuietRailMetrics.markGap) {
+        // Spacing is 0 and every gap is explicit: a uniform `HStack` spacing
+        // charged the title for four gaps, three of which sat inside the
+        // trailing lane where they bought nothing.
+        HStack(spacing: 0) {
             QuietIdentityMarkView(identity: identity)
+                .padding(.trailing, QuietRailMetrics.markGap)
             Text(title)
                 .font(.system(size: QuietRailMetrics.titleText))
                 .foregroundStyle(status.isDimmed ? HierarchicalShapeStyle.tertiary : .primary)
@@ -769,27 +893,8 @@ private struct QuietRowBody: View {
                 // The only compressible token in the row; without this it loses
                 // to its fixed-size siblings and truncates first.
                 .layoutPriority(1)
-            Spacer(minLength: 4)
-            if showsReveal {
-                // A `highPriorityGesture` rather than a nested Button: SwiftUI
-                // gives a descendant's high-priority gesture precedence over the
-                // enclosing Button's own gesture, while a Button (or Menu)
-                // nested inside a button label is swallowed by it. The row keeps
-                // an "Open beside" accessibility action for the paths this
-                // pointer-only affordance cannot serve.
-                Image(systemName: "square.split.2x1")
-                    .font(.system(size: QuietRailMetrics.revealText, weight: .medium))
-                    .foregroundStyle(.secondary)
-                    .frame(width: 16, height: 16)
-                    .contentShape(Rectangle())
-                    .highPriorityGesture(TapGesture().onEnded { reveal() })
-                    .help("Open beside (⌘-click the row)")
-                    .accessibilityHidden(true)
-            }
-            Text(timeLabel)
-                .font(.system(size: QuietRailMetrics.secondaryText).monospacedDigit())
-                .foregroundStyle(.tertiary)
-            QuietStatusDot(status: status)
+            Spacer(minLength: QuietRailMetrics.laneGap)
+            trailingLane
         }
         .padding(.leading, QuietRailMetrics.sessionIndent)
         .padding(.trailing, QuietRailMetrics.trailingInset)
@@ -807,6 +912,46 @@ private struct QuietRowBody: View {
         // rather than merged into it — System Events then sees a button with
         // AXPress but no AXTitle, since the label lives on a child it never
         // descends into. The combine + label live on the Button itself.
+    }
+
+    /// Reveal, time-in-state and dot travel as ONE `fixedSize` lane.
+    ///
+    /// They used to be free-floating `HStack` children at the default layout
+    /// priority, which let the row's leftover width land on the `Spacer` while
+    /// the time label was compressed *below the width of its own first glyph*:
+    /// the label then rendered as a ~2pt vertical sliver of a digit at the
+    /// row's trailing edge, which read as a stray "{". Sizing the lane first
+    /// and never compressing it means the label either fits whole or the title
+    /// (the only flexible token left) gives up the space.
+    private var trailingLane: some View {
+        HStack(spacing: QuietRailMetrics.laneGap) {
+            if showsReveal {
+                // A `highPriorityGesture` rather than a nested Button: SwiftUI
+                // gives a descendant's high-priority gesture precedence over the
+                // enclosing Button's own gesture, while a Button (or Menu)
+                // nested inside a button label is swallowed by it. The row keeps
+                // an "Open beside" accessibility action for the paths this
+                // pointer-only affordance cannot serve.
+                Image(systemName: "square.split.2x1")
+                    .font(.system(size: QuietRailMetrics.revealText, weight: .medium))
+                    .foregroundStyle(.secondary)
+                    .frame(width: QuietRailMetrics.revealSlot, height: QuietRailMetrics.revealSlot)
+                    .contentShape(Rectangle())
+                    .highPriorityGesture(TapGesture().onEnded { reveal() })
+                    .help("Open beside (⌘-click the row)")
+                    .accessibilityHidden(true)
+            }
+            // An empty label must not reserve a lane slot; `Text("")` still
+            // costs the lane a gap.
+            if !timeLabel.isEmpty {
+                Text(timeLabel)
+                    .font(.system(size: QuietRailMetrics.secondaryText).monospacedDigit())
+                    .foregroundStyle(.tertiary)
+                    .lineLimit(1)
+            }
+            QuietStatusDot(status: status)
+        }
+        .fixedSize()
     }
 }
 
@@ -859,6 +1004,10 @@ private struct QuietSurfaceRowView: View {
     let timeLabel: String
     let isSelected: Bool
     let tooltip: String
+    /// Reports this row's hover into its project group, which is what keeps the
+    /// group's hover-only "New session" row alive while the pointer travels
+    /// down to it.
+    let groupHover: (Bool) -> Void
     let select: () -> Void
     let reveal: () -> Void
     let menu: () -> AnyView
@@ -892,11 +1041,12 @@ private struct QuietSurfaceRowView: View {
         .accessibilityAction { select() }
         .accessibilityAction(named: Text("Open beside")) { reveal() }
         .onHover { inside in
+            groupHover(inside)
             withAnimation(.easeOut(duration: KaisolaVisualSystem.hoverDuration)) { hovering = inside }
         }
         .help(tooltip)
         .contextMenu { menu() }
-        .listRowInsets(EdgeInsets())
+        .listRowInsets(QuietRailMetrics.listRowBleed)
         .listRowSeparator(.hidden)
         .listRowBackground(Color.clear)
     }

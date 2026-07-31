@@ -303,6 +303,70 @@ final class GitPanelModelTests: XCTestCase {
         ), "a branch switch after the review must invalidate the plan")
     }
 
+    /// The discriminating case `testAReviewedPlanIsRefusedOnceTheRepositoryMovesPastIt`
+    /// does not cover: when the plan forks a new branch, only re-checking the
+    /// HEAD OID is not enough — the branch that was checked out at review time
+    /// (the default/base branch) must still be checked out at confirm time too,
+    /// even if some other branch now happens to point at the same commit.
+    func testAPlanThatForksABranchIsRefusedIfTheCheckedOutBranchChangedEvenWithTheSameHeadOID() throws {
+        let plan = try GitPRPlanner.assemble(
+            prep: prep(branch: "main", isDefault: true, hasUpstream: true, ahead: 1),
+            defaultBranch: "main", headOID: String(repeating: "3", count: 40),
+            requestedBranchName: "kaisola/pr-branch", commitSubjects: ["work"], changedFileCount: 1
+        )
+        XCTAssertTrue(plan.createsBranch)
+
+        // Still on "main" (the branch it was reviewed on), HEAD unmoved: fine.
+        XCTAssertNil(GitPRPlanner.stalenessMessage(
+            plan: plan, currentHeadOID: String(repeating: "3", count: 40), currentBranch: "main"
+        ))
+
+        // A different branch is checked out that happens to point at the exact
+        // same commit (a synced branch, a detached checkout) — the HEAD-OID
+        // check alone would pass, but forking "off HEAD" now forks off a
+        // branch context nobody reviewed, so this must still be refused.
+        XCTAssertNotNil(GitPRPlanner.stalenessMessage(
+            plan: plan, currentHeadOID: String(repeating: "3", count: 40), currentBranch: "other"
+        ), "checking out a different branch, even at the same commit, must invalidate a plan that forks off it")
+    }
+
+    /// `GitPRPlanner.isStale` is the pure seam the panel's background refresh
+    /// uses to self-invalidate an open review card — same discrimination as
+    /// `stalenessMessage`, but boolean and safe against a refresh snapshot
+    /// missing one of its two current identities.
+    func testIsStaleMirrorsStalenessMessageAndIgnoresMissingSnapshotData() throws {
+        let onBranch = try GitPRPlanner.assemble(
+            prep: prep(branch: "feature/x", isDefault: false, hasUpstream: true, ahead: 1),
+            defaultBranch: "main", headOID: String(repeating: "4", count: 40),
+            requestedBranchName: "", commitSubjects: ["work"], changedFileCount: 1
+        )
+        XCTAssertFalse(GitPRPlanner.isStale(
+            plan: onBranch, currentHeadOID: String(repeating: "4", count: 40), currentBranch: "feature/x"
+        ))
+        XCTAssertTrue(GitPRPlanner.isStale(
+            plan: onBranch, currentHeadOID: String(repeating: "5", count: 40), currentBranch: "feature/x"
+        ), "a new commit after the review must read as stale")
+        XCTAssertTrue(GitPRPlanner.isStale(
+            plan: onBranch, currentHeadOID: String(repeating: "4", count: 40), currentBranch: "other"
+        ), "a branch switch after the review must read as stale")
+
+        let forking = try GitPRPlanner.assemble(
+            prep: prep(branch: "main", isDefault: true, hasUpstream: true, ahead: 1),
+            defaultBranch: "main", headOID: String(repeating: "6", count: 40),
+            requestedBranchName: "kaisola/pr-branch", commitSubjects: ["work"], changedFileCount: 1
+        )
+        XCTAssertTrue(GitPRPlanner.isStale(
+            plan: forking, currentHeadOID: String(repeating: "6", count: 40), currentBranch: "other"
+        ), "isStale must apply the same createsBranch discrimination as stalenessMessage")
+
+        // A refresh that could not resolve the current HEAD OID or branch (a
+        // transient git failure) must not flip staleness either way.
+        XCTAssertFalse(GitPRPlanner.isStale(plan: onBranch, currentHeadOID: nil, currentBranch: "feature/x"))
+        XCTAssertFalse(GitPRPlanner.isStale(
+            plan: onBranch, currentHeadOID: String(repeating: "4", count: 40), currentBranch: nil
+        ))
+    }
+
     // MARK: - Live model behavior
 
     /// The first click must assemble a review and execute NOTHING: no fork, no
@@ -358,6 +422,71 @@ final class GitPanelModelTests: XCTestCase {
         let sawStage = pump(until: { model.status?.staged.isEmpty == false }, timeout: 12)
         XCTAssertTrue(sawStage, "an external `git add` must refresh the panel through the watcher")
         XCTAssertEqual(model.status?.staged.map(\.path), ["b.txt"])
+    }
+
+    /// The review card must self-invalidate: a background refresh (an external
+    /// commit landing between the review and confirm clicks) marks the open
+    /// plan stale so Confirm gets disabled instead of waiting for the user's
+    /// own click to discover it as an error.
+    @MainActor
+    func testBackgroundRefreshMarksAnOpenPlanStale() throws {
+        try write("a.txt", "one\n")
+        try git(["add", "a.txt"])
+        try git(["commit", "-q", "-m", "base"])
+        try git(["checkout", "-q", "-b", "feature/live"])
+        try write("b.txt", "two\n")
+        try git(["add", "b.txt"])
+        try git(["commit", "-q", "-m", "feature work"])
+
+        let model = GitPanelModel(repoRoot: repo)
+        model.preparePR()
+        XCTAssertTrue(pump(until: { model.prPlan != nil }, timeout: 10))
+        XCTAssertFalse(model.prPlanStale)
+
+        // An external commit lands on the reviewed branch — the plan's
+        // recorded HEAD OID no longer matches.
+        try write("c.txt", "three\n")
+        try git(["add", "c.txt"])
+        try git(["commit", "-q", "-m", "external commit"])
+
+        model.refresh()
+        XCTAssertTrue(
+            pump(until: { model.prPlanStale }, timeout: 10),
+            "a background refresh must mark the open plan stale once the repository moves past it"
+        )
+        XCTAssertNotNil(model.prPlan, "the card stays on screen — only its confirm affordance is disabled")
+    }
+
+    /// GitPanelModel level (not just `GitRefreshPolicy`): an event noted while
+    /// an unrelated operation holds the model busy must not be dropped — once
+    /// the busy operation clears, the deferred refresh must still run.
+    @MainActor
+    func testEventDuringBusyProducesADeferredRefreshOnceBusyClears() throws {
+        try write("a.txt", "one\n")
+        try git(["add", "a.txt"])
+        try git(["commit", "-q", "-m", "base"])
+
+        let model = GitPanelModel(repoRoot: repo)
+        model.refresh()
+        XCTAssertTrue(
+            pump(until: { model.status != nil && !model.isBusy }, timeout: 10),
+            "initial status should load"
+        )
+        XCTAssertEqual(model.status?.untracked, [])
+
+        // An unrelated operation (loading history) holds the model busy...
+        model.loadLog()
+        XCTAssertTrue(model.isBusy, "loadLog should mark the model busy synchronously, before its Task runs")
+
+        // ...while an external change lands and is noted.
+        try write("b.txt", "two\n")
+        model.noteRepositoryEvent()
+
+        XCTAssertTrue(pump(until: { !model.isBusy }, timeout: 10), "the busy operation should complete")
+        XCTAssertTrue(
+            pump(until: { model.status?.untracked == ["b.txt"] }, timeout: 10),
+            "an event noted while busy must still produce a refresh once isBusy clears"
+        )
     }
 
     // MARK: - helpers

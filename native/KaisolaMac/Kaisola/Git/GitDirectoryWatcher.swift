@@ -33,8 +33,12 @@ final class GitDirectoryWatcher {
     /// is itself safe to call from anywhere.
     nonisolated(unsafe) private var sources: [DispatchSourceFileSystemObject] = []
 
-    /// Pending re-open after a rename/delete burst.
-    private var rearm: Task<Void, Never>?
+    /// Pending re-open after a rename/delete burst. `nonisolated(unsafe)` so the
+    /// nonisolated `deinit` can cancel it alongside `sources`; every access is
+    /// otherwise single-threaded (created and cleared only from `scheduleRearm`
+    /// and `stop`, both on the main actor), and `Task.cancel()` is itself safe
+    /// to call from anywhere.
+    nonisolated(unsafe) private var rearm: Task<Void, Never>?
 
     /// Delay before re-opening the watched entries after a burst. Git renames a
     /// fresh file over `index`/`HEAD`, so the descriptor we hold stops receiving
@@ -53,9 +57,12 @@ final class GitDirectoryWatcher {
     }
 
     deinit {
-        // Nonisolated: only touches the sources through the unsafe handle, and
-        // cancelling releases each source's handlers (breaking the retain that
-        // the event handler would otherwise hold).
+        // Nonisolated: only touches sources/rearm through their unsafe handles.
+        // Cancelling the sources releases each one's handlers (breaking the
+        // retain that the event handler would otherwise hold); cancelling
+        // `rearm` stops a pending re-arm from firing `arm()` on a watcher that
+        // is already gone, mirroring `stop()`.
+        rearm?.cancel()
         cancelSources()
     }
 

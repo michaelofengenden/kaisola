@@ -135,9 +135,32 @@ enum GitPRPlanner {
         if plan.headOID.lowercased() != currentHeadOID.lowercased() {
             return "The branch moved since this plan was reviewed. Review it again."
         }
-        if !plan.createsBranch, plan.headBranch != currentBranch {
+        if plan.createsBranch {
+            // A plan that forks a branch does so off whatever is checked out
+            // *right now* — reviewed while `currentBranch` was `plan.baseBranch`
+            // (the default branch). Matching HEAD OID alone is not enough: an
+            // agent or terminal could check out a different branch that
+            // happens to point at the same commit (a synced branch, a
+            // detached checkout) between review and confirm, and forking would
+            // then run against a branch context nobody reviewed.
+            if currentBranch != plan.baseBranch {
+                return "The checked-out branch changed since this plan was reviewed. Review it again."
+            }
+        } else if plan.headBranch != currentBranch {
             return "The checked-out branch changed since this plan was reviewed. Review it again."
         }
         return nil
+    }
+
+    /// Same discriminating check as `stalenessMessage`, boolean and resilient to
+    /// a background refresh snapshot that could not resolve one of the two
+    /// current identities (a transient git failure must not flip the open
+    /// review card's staleness either way — missing data simply reports "not
+    /// stale" rather than guessing). Used by the panel's live refresh to
+    /// self-invalidate an open plan without waiting for the user to click
+    /// Confirm and hit the same check as an error.
+    static func isStale(plan: PRPlan, currentHeadOID: String?, currentBranch: String?) -> Bool {
+        guard let currentHeadOID, let currentBranch else { return false }
+        return stalenessMessage(plan: plan, currentHeadOID: currentHeadOID, currentBranch: currentBranch) != nil
     }
 }

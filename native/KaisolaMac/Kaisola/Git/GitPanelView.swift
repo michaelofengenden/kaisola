@@ -32,6 +32,11 @@ final class GitPanelModel: ObservableObject {
     /// its review stage: everything the confirm button will do is on screen and
     /// nothing has run.
     @Published private(set) var prPlan: PRPlan?
+    /// True once a background refresh observes that the repository moved past
+    /// the open plan (HEAD OID or checked-out branch differs from what it was
+    /// reviewed against). The card stays on screen so the user's edits aren't
+    /// lost, but Confirm is disabled until they review again.
+    @Published private(set) var prPlanStale = false
     /// Review-stage edits. Seeded from the plan when it is assembled.
     @Published var prBranchDraft = "kaisola/pr-branch"
     @Published var prTitleDraft = ""
@@ -153,6 +158,7 @@ final class GitPanelModel: ObservableObject {
             return GitRefreshSnapshot(
                 status: status,
                 prep: try? svc.prPrep(),
+                headOID: try? svc.headOID(),
                 diffs: patches
             )
         } apply: { snapshot in
@@ -160,6 +166,20 @@ final class GitPanelModel: ObservableObject {
             self.prPrepInfo = snapshot.prep
             self.diffs = snapshot.diffs
             self.diffRequests = self.diffRequests.filter { snapshot.diffs[$0.key] != nil }
+            // An open review card must not silently outlive the repository it
+            // was assembled against: once a background refresh sees the HEAD
+            // OID or checked-out branch differ from the plan's recorded
+            // identities, mark it stale so the UI disables Confirm instead of
+            // waiting for the user's own click to discover it as an error.
+            if let plan = self.prPlan {
+                self.prPlanStale = GitPRPlanner.isStale(
+                    plan: plan,
+                    currentHeadOID: snapshot.headOID,
+                    currentBranch: snapshot.prep?.branch
+                )
+            } else {
+                self.prPlanStale = false
+            }
         } onError: { _ in
             // A failed refresh cannot certify that the old branch/file state is
             // still true. Clear it instead of presenting stale Git controls.
@@ -250,6 +270,7 @@ final class GitPanelModel: ObservableObject {
             )
         } apply: { plan in
             self.prPlan = plan
+            self.prPlanStale = false
             self.prBranchDraft = plan.headBranch
             self.prTitleDraft = plan.title
             self.prBodyDraft = plan.body
@@ -260,6 +281,7 @@ final class GitPanelModel: ObservableObject {
     func cancelPR() {
         guard !isBusy else { return }
         prPlan = nil
+        prPlanStale = false
     }
 
     /// Step two of two: execute the plan that was reviewed, with the reviewer's
@@ -308,6 +330,7 @@ final class GitPanelModel: ObservableObject {
             self.status = outcome.status
             self.prPrepInfo = outcome.prep
             self.prPlan = nil
+            self.prPlanStale = false
             self.diffs.removeAll()
             self.diffRequests.removeAll()
             self.log.removeAll()
@@ -363,6 +386,7 @@ final class GitPanelModel: ObservableObject {
 private struct GitRefreshSnapshot: Sendable {
     let status: GitService.Status
     let prep: GitService.PRPrep?
+    let headOID: String?
     let diffs: [String: String]
 }
 
@@ -587,6 +611,13 @@ struct GitPanelView: View {
     @ViewBuilder
     private func reviewStage(_ plan: PRPlan) -> some View {
         VStack(alignment: .leading, spacing: 6) {
+            if model.prPlanStale {
+                Label("Repository changed — Review again", systemImage: "exclamationmark.arrow.triangle.2.circlepath")
+                    .font(.caption)
+                    .foregroundStyle(.orange)
+                    .accessibilityIdentifier("git.pr.stale")
+            }
+
             HStack(spacing: 6) {
                 Image(systemName: "arrow.triangle.pull").font(.caption2).foregroundStyle(.secondary)
                 Text(plan.baseBranch).font(.caption.monospaced())
@@ -633,9 +664,11 @@ struct GitPanelView: View {
                 .accessibilityIdentifier("git.pr.body")
                 .accessibilityLabel("Pull request description")
 
-            Text("Nothing has run yet — confirm to push \(plan.headBranch) and open the pull request.")
-                .font(.caption2)
-                .foregroundStyle(.secondary)
+            if !model.prPlanStale {
+                Text("Nothing has run yet — confirm to push \(plan.headBranch) and open the pull request.")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+            }
 
             HStack(spacing: 8) {
                 Button {
@@ -644,8 +677,18 @@ struct GitPanelView: View {
                     Label("Push and Create PR", systemImage: "arrow.up.forward.square")
                         .font(.caption)
                 }
-                .disabled(model.isBusy)
+                .disabled(model.isBusy || model.prPlanStale)
                 .accessibilityIdentifier("git.pr.confirm")
+                if model.prPlanStale {
+                    Button {
+                        model.preparePR()
+                    } label: {
+                        Label("Review Again", systemImage: "arrow.clockwise")
+                            .font(.caption)
+                    }
+                    .disabled(model.isBusy)
+                    .accessibilityIdentifier("git.pr.reprepare")
+                }
                 Button("Cancel") { model.cancelPR() }
                     .font(.caption)
                     .disabled(model.isBusy)
@@ -656,7 +699,7 @@ struct GitPanelView: View {
         .background(.quaternary.opacity(0.25), in: RoundedRectangle(cornerRadius: 6))
         .accessibilityElement(children: .contain)
         .accessibilityIdentifier("git.pr.reviewStage")
-        .accessibilityLabel("Pull request review")
+        .accessibilityLabel(model.prPlanStale ? "Pull request review, repository changed, review again" : "Pull request review")
     }
 
     private var reviewDisabled: Bool {

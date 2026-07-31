@@ -306,7 +306,13 @@ struct RootShellView: View {
     private var leftTreeLayout: some View {
         NavigationSplitView {
             VStack(spacing: 0) {
-                projectSidebarHeader
+                // No "Projects" title row: the chrome panel already starts below
+                // the traffic lights, the rail's own pinned project names the
+                // workspace, and the two buttons that lived here survive in the
+                // menu bar (File ▸ Open Folder…, View ▸ Navigation) and the
+                // command palette. The rail begins directly under the traffic
+                // light clearance, as the v4 mock has it.
+                //
                 // A selection-bound macOS sidebar paints a full-width blue block.
                 // Navigation is explicit here so visible surfaces are communicated
                 // by their blue icons instead of a heavy row treatment.
@@ -336,11 +342,16 @@ struct RootShellView: View {
                         chatContextMenu: { AnyView(chatContextMenuContent($0)) },
                         meshContextMenu: { AnyView(meshContextMenuContent($0)) }
                     )
-                    if auth.isSignedIn {
+                    if auth.isSignedIn, showsRememberedSessionSection {
                         rememberedSessionSidebarSection
                     }
                 }
-                .listStyle(.sidebar)
+                // `.sidebar` reserves ~16pt of leading and trailing row inset
+                // for a source-list look this rail does not use: every row
+                // already zeroes its `listRowInsets` and paints its own wash.
+                // At the 200pt default width those 31pt were the difference
+                // between a title showing 7 characters and 15.
+                .listStyle(.plain)
                 .scrollContentBackground(.hidden)
                 .accessibilityLabel("Projects, chats, and terminal sessions")
                 footer
@@ -349,7 +360,18 @@ struct RootShellView: View {
             // edge behind the column and the navigation content floats on a
             // rounded material panel inside it. The top inset clears the
             // traffic lights, which the header used to pad around itself.
-            .kaisolaChromePanel(topInset: NativeWorkspaceChrome.chromePanelTopInset)
+            // No chrome panel here — the sidebar is ONE layer.
+            //
+            // It used to be four stacked over the desktop: behind-window
+            // vibrancy, a white veil, a `.thinMaterial` card, and that card's
+            // lit edge. The material is opaque enough on its own that the
+            // column rendered as a flat gray box inside the window no matter
+            // what was behind it, so every layer under it was paying rendering
+            // cost to be invisible. A panel isolates content from its backdrop;
+            // the sidebar's backdrop is the thing it is meant to show. All that
+            // survives is the traffic-light clearance the panel used to carry
+            // as its top inset.
+            .padding(.top, NativeWorkspaceChrome.chromePanelTopInset)
             .background {
                 SidebarBackdropView(appearance: settings.sidebarAppearance)
                     .ignoresSafeArea()
@@ -497,41 +519,42 @@ struct RootShellView: View {
         Button("Close Mesh", role: .destructive) { requestCloseMesh(mesh) }
     }
 
+    /// "Other Macs" is a *report on other machines*. With none paired it was a
+    /// permanent empty state plus a "Updated N seconds ago" line — two rows of
+    /// chrome saying nothing, which is exactly what the v4 rail is meant not to
+    /// carry. It appears when there is something to report: a remote device, or
+    /// an error explaining why there is not.
+    private var showsRememberedSessionSection: Bool {
+        RememberedSessionsSectionVisibility.shouldShow(
+            remoteDeviceCount: rememberedSessions.remoteDevices.count,
+            errorMessage: rememberedSessions.errorMessage
+        )
+    }
+
     @ViewBuilder
     private var rememberedSessionSidebarSection: some View {
         Section {
-            if rememberedSessions.remoteDevices.isEmpty {
-                HStack(spacing: 8) {
-                    Image(systemName: "desktopcomputer")
-                        .foregroundStyle(.secondary)
-                    Text(rememberedSessions.isRefreshing ? "Checking your Macs…" : "No other Macs yet")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                }
-                .listRowInsets(.init(top: 5, leading: 16, bottom: 5, trailing: 10))
-            } else {
-                ForEach(rememberedSessions.remoteDevices) { device in
-                    DisclosureGroup {
-                        ForEach(device.sessions) { session in
-                            rememberedSessionRow(session, device: device)
-                        }
-                    } label: {
-                        HStack(spacing: 7) {
-                            Circle()
-                                .fill(device.presence == .online ? Color.green : Color.secondary.opacity(0.45))
-                                .frame(width: 6, height: 6)
-                            VStack(alignment: .leading, spacing: 1) {
-                                Text(device.deviceName)
-                                    .font(.system(size: 12, weight: .semibold))
-                                    .lineLimit(1)
-                                Text("\(device.sessions.count) remembered \(device.sessions.count == 1 ? "session" : "sessions")")
-                                    .font(.system(size: 10))
-                                    .foregroundStyle(.secondary)
-                            }
+            ForEach(rememberedSessions.remoteDevices) { device in
+                DisclosureGroup {
+                    ForEach(device.sessions) { session in
+                        rememberedSessionRow(session, device: device)
+                    }
+                } label: {
+                    HStack(spacing: 7) {
+                        Circle()
+                            .fill(device.presence == .online ? Color.green : Color.secondary.opacity(0.45))
+                            .frame(width: 6, height: 6)
+                        VStack(alignment: .leading, spacing: 1) {
+                            Text(device.deviceName)
+                                .font(.system(size: 12, weight: .semibold))
+                                .lineLimit(1)
+                            Text("\(device.sessions.count) remembered \(device.sessions.count == 1 ? "session" : "sessions")")
+                                .font(.system(size: 10))
+                                .foregroundStyle(.secondary)
                         }
                     }
-                    .help("Metadata only; live control remains on this Mac until Companion is connected")
                 }
+                .help("Metadata only; live control remains on this Mac until Companion is connected")
             }
             if let error = rememberedSessions.errorMessage {
                 Text(error)
@@ -657,45 +680,6 @@ struct RootShellView: View {
 
     private var activeProjectBinding: Binding<String?> {
         Binding(get: { activeProjectID }, set: { model.activateProject(id: $0) })
-    }
-
-    private var projectSidebarHeader: some View {
-        HStack(spacing: 8) {
-            Text("Projects")
-                .font(.system(size: 13, weight: .semibold))
-                .foregroundStyle(.primary.opacity(0.82))
-                .padding(.leading, 12)
-            Spacer()
-            Button {
-                RootShellView.promptForOpenFolder(model: model)
-            } label: {
-                Image(systemName: "folder.badge.plus")
-                    .font(.system(size: 11, weight: .semibold))
-                    .frame(width: 24, height: 24)
-                    .contentShape(Rectangle())
-            }
-            .buttonStyle(.plain)
-            .help("Open Project")
-            .accessibilityLabel("Open Project")
-            Button {
-                settings.navigationLayout = .topBar
-            } label: {
-                Image(systemName: "rectangle.topthird.inset.filled")
-                    .font(.system(size: 11, weight: .semibold))
-                    .frame(width: 24, height: 24)
-                    .contentShape(Rectangle())
-            }
-            .buttonStyle(.plain)
-            .help("Move projects and sessions to top bars")
-            .accessibilityLabel("Use top bar navigation")
-        }
-        .padding(.leading, 14)
-        .padding(.trailing, 9)
-        // The chrome panel already starts below the traffic lights, so the
-        // header only owns its own 36pt row.
-        .frame(height: 36, alignment: .bottom)
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .background(.clear)
     }
 
     /// Projects the user explicitly expanded. Absent from this set, a
@@ -2342,6 +2326,20 @@ enum NativeWorkspaceChrome {
         topBarLayout
             ? detailChromeControlHeight + detailChromeControlPadding * 2
             : chromePanelTopInset - KaisolaVisualSystem.chromeInset
+    }
+}
+
+/// When the sidebar carries an "Other Macs" section at all. Pure so the rule
+/// can be tested without a signed-in account or a catalog fetch.
+enum RememberedSessionsSectionVisibility {
+    /// - Returns: `true` only when the section has something to say — at least
+    ///   one remembered remote device, or an error that explains why there is
+    ///   none. An empty, healthy catalog draws nothing: no header, no
+    ///   placeholder row, and no freshness line.
+    static func shouldShow(remoteDeviceCount: Int, errorMessage: String?) -> Bool {
+        if remoteDeviceCount > 0 { return true }
+        guard let errorMessage else { return false }
+        return !errorMessage.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
 }
 

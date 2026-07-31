@@ -804,19 +804,33 @@ struct GlassBackdropWash: Equatable, Sendable {
         )
     }
 
+    /// The sidebar's veil is the *thinnest* surface in the app on purpose: it
+    /// is the one large area whose whole job is to read as the desktop seen
+    /// through glass. The retuned v1.1 values (light 0.42/0.32/0.26, dark
+    /// 0.38/0.44/0.52) covered the vibrancy layer so completely that a
+    /// saturated desktop reached the eye with no measurable chroma at all —
+    /// the column rendered as flat #EDEDED over a blue desktop. These halve
+    /// that coverage; the sidebar chrome panel above them no longer adds a
+    /// second opaque material, so the two changes compound.
     static func sidebar(isDark: Bool) -> GlassBackdropWash {
         isDark
-            ? dark(top: 0.38, base: 0.44, bottom: 0.52)
-            : light(top: 0.42, base: 0.32, bottom: 0.26)
+            ? dark(top: 0.20, base: 0.26, bottom: 0.34)
+            : light(top: 0.24, base: 0.16, bottom: 0.12)
     }
+
+    /// How much of the composited backdrop is still the desktop's own colour
+    /// rather than the veil — `1 - baseOpacity`, named so the appearance
+    /// contract can be stated as "the desktop must survive", which is the
+    /// property that actually regressed.
+    var desktopTransmission: Double { 1 - baseOpacity }
 
     /// The workspace sits one step deeper than the sidebar so the inset chrome
     /// panels have something to float above: less white in light mode, more
     /// near-black in dark mode.
     static func workspace(isDark: Bool) -> GlassBackdropWash {
         isDark
-            ? dark(top: 0.44, base: 0.50, bottom: 0.57)
-            : light(top: 0.34, base: 0.26, bottom: 0.21)
+            ? dark(top: 0.26, base: 0.32, bottom: 0.40)
+            : light(top: 0.18, base: 0.11, bottom: 0.08)
     }
 }
 
@@ -879,6 +893,12 @@ extension View {
     /// Safari's inset floating-card chrome. The window backdrop stays visible
     /// in a gutter around the panel; the content rides a rounded material with
     /// a hairline top-light edge. Reduce Transparency yields a clean solid.
+    /// A floating inset card for content that must be isolated from whatever is
+    /// behind the window — the detail canvas and its panels.
+    ///
+    /// Deliberately *not* used by the project sidebar: navigation chrome has
+    /// nothing to isolate, and stacking this material over the sidebar backdrop
+    /// hid the desktop that backdrop exists to show.
     func kaisolaChromePanel(
         inset: CGFloat = KaisolaVisualSystem.chromeInset,
         topInset: CGFloat? = nil
@@ -1003,6 +1023,7 @@ struct SidebarBackdropView: View {
     @Environment(\.colorScheme) private var colorScheme
     @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
     @Environment(\.colorSchemeContrast) private var accessibilityContrast
+    @StateObject private var desktopTint = DesktopTintProvider()
     let appearance: SidebarAppearance
 
     @ViewBuilder
@@ -1014,10 +1035,30 @@ struct SidebarBackdropView: View {
             } else {
                 ZStack {
                     NativeVisualEffectView(material: .sidebar)
+                    // AppKit's behind-window vibrancy is the only *live* sample
+                    // of the desktop, but in light appearance `.sidebar` is
+                    // already a near-white material: whatever colour the
+                    // wallpaper has, almost none of it survives. The sampled
+                    // wallpaper average is laid over it so the column reliably
+                    // carries the desktop's hue in both appearances instead of
+                    // depending on what the system material decides to pass
+                    // through.
+                    LinearGradient(
+                        colors: [
+                            desktopTint.color.opacity(colorScheme == .dark ? 0.30 : 0.26),
+                            desktopTint.color.opacity(colorScheme == .dark ? 0.18 : 0.14),
+                        ],
+                        startPoint: .top,
+                        endPoint: .bottom
+                    )
                     GlassBackdropWash.sidebar(isDark: colorScheme == .dark).veil
                     if accessibilityContrast == .increased {
                         Color(nsColor: .controlBackgroundColor).opacity(0.18)
                     }
+                }
+                .onAppear { desktopTint.refresh() }
+                .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
+                    desktopTint.refresh()
                 }
             }
         case .solid:

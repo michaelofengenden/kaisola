@@ -439,11 +439,32 @@ final class NativePreviewSettingsTests: XCTestCase {
             XCTAssertEqual(recipe.blue, 18.0 / 255, accuracy: 0.0001)
         }
 
-        // The headline coverage: white at roughly a third in light, near-black
-        // at roughly 44% in dark.
-        XCTAssertEqual(GlassBackdropWash.sidebar(isDark: false).baseOpacity, 0.32, accuracy: 0.0001)
-        XCTAssertEqual(GlassBackdropWash.sidebar(isDark: true).baseOpacity, 0.44, accuracy: 0.0001)
+        // The headline coverage. Halved from v1.1's 0.32/0.44: at those values
+        // the veil covered the vibrancy layer so completely that the sidebar
+        // rendered as a flat neutral over a saturated desktop.
+        XCTAssertEqual(GlassBackdropWash.sidebar(isDark: false).baseOpacity, 0.16, accuracy: 0.0001)
+        XCTAssertEqual(GlassBackdropWash.sidebar(isDark: true).baseOpacity, 0.26, accuracy: 0.0001)
     }
+
+    /// The property that actually regressed: a veil that covers most of the
+    /// backdrop leaves no desktop colour to see. Both appearances must pass the
+    /// majority of the backdrop through, and the sidebar — the surface whose
+    /// whole job is to read as glass — must pass more than the workspace does.
+    func testSidebarVeilLeavesTheDesktopVisible() {
+        for isDark in [false, true] {
+            let sidebar = GlassBackdropWash.sidebar(isDark: isDark)
+            XCTAssertGreaterThan(
+                sidebar.desktopTransmission,
+                0.7,
+                "sidebar veil (isDark: \(isDark)) hides the desktop it exists to show"
+            )
+            XCTAssertGreaterThan(
+                GlassBackdropWash.workspace(isDark: isDark).desktopTransmission,
+                0.6
+            )
+        }
+    }
+
 
     /// Zero warm or lavender bias: the veil is neutral to the eye, so the only
     /// chroma in the backdrop is whatever the desktop itself contributes.
@@ -482,6 +503,30 @@ final class NativePreviewSettingsTests: XCTestCase {
         // chrome panels have something to float above.
         XCTAssertLessThan(lightWorkspace.baseOpacity, lightSidebar.baseOpacity)
         XCTAssertGreaterThan(darkWorkspace.baseOpacity, darkSidebar.baseOpacity)
+    }
+
+    /// With no paired Mac the section was a permanent "No other Macs yet" plus
+    /// a "Updated N seconds ago" line: two rows of chrome reporting nothing.
+    func testOtherMacsSectionStaysHiddenUntilThereIsSomethingToReport() {
+        XCTAssertFalse(
+            RememberedSessionsSectionVisibility.shouldShow(remoteDeviceCount: 0, errorMessage: nil)
+        )
+        XCTAssertFalse(
+            RememberedSessionsSectionVisibility.shouldShow(remoteDeviceCount: 0, errorMessage: "")
+        )
+        XCTAssertFalse(
+            RememberedSessionsSectionVisibility.shouldShow(remoteDeviceCount: 0, errorMessage: "  \n ")
+        )
+        XCTAssertTrue(
+            RememberedSessionsSectionVisibility.shouldShow(remoteDeviceCount: 1, errorMessage: nil)
+        )
+        // A failure must never be silent just because it left the catalog empty.
+        XCTAssertTrue(
+            RememberedSessionsSectionVisibility.shouldShow(
+                remoteDeviceCount: 0,
+                errorMessage: "Companion is offline"
+            )
+        )
     }
 
     func testNonActiveProjectsDefaultToCollapsed() {
@@ -726,8 +771,24 @@ final class NativePreviewSettingsTests: XCTestCase {
         XCTAssertEqual(NativeWorkspaceChrome.projectSidebarIdealWidth, 200)
         XCTAssertEqual(NativeWorkspaceChrome.projectSidebarMaximumWidth, 260)
         XCTAssertEqual(NativeWorkspaceChrome.projectSidebarDividerWidth, 1)
-        XCTAssertEqual(NativeWorkspaceChrome.projectSidebarDividerHitWidth, 17)
-        XCTAssertEqual(NativeWorkspaceChrome.projectSidebarDividerReach, 8)
+    }
+
+    /// The pointer target is sized from the gap the eye aims at, not from the
+    /// one-point rule: the inset chrome cards leave `chromeInset` of backdrop on
+    /// each side, and the hit zone has to span that whole gap *plus* overlap
+    /// onto both cards. A zone narrower than the gap leaves a dead band the
+    /// pointer crosses on its way in, which is seen as the cursor flickering.
+    func testSidebarDividerHitZoneSpansTheWholeVisibleGap() {
+        let gap = KaisolaVisualSystem.chromeInset + NativeWorkspaceChrome.projectSidebarDividerWidth
+        XCTAssertEqual(NativeWorkspaceChrome.projectSidebarDividerHitWidth, 18)
+        XCTAssertGreaterThan(NativeWorkspaceChrome.projectSidebarDividerHitWidth, gap)
+        // Reach past the visible gutter, onto the content on each side, so the
+        // pointer is never over a point that is neither content nor divider.
+        XCTAssertGreaterThan(
+            NativeWorkspaceChrome.projectSidebarDividerReach,
+            KaisolaVisualSystem.chromeInset
+        )
+        XCTAssertEqual(NativeWorkspaceChrome.projectSidebarDividerReach, 8.5)
     }
 
     func testClickingFocusedSurfaceStillSwitchesItsProject() {

@@ -1,10 +1,16 @@
 import Combine
 import SwiftUI
 
-/// "Quiet fleet" v2.3 sidebar rail. Spec: single-line rows
-/// (glyph · title · time · dot-at-right-edge), idle rows draw no dot,
-/// plain-text headers with hover-only chrome, 30pt session indent,
-/// collapsed headers show a count + dot rollup (amber outermost).
+/// "Quiet fleet" v4.4 sidebar rail, restyled on Safari's tab-group
+/// methodology: the *active* project is pinned at the top of the rail with its
+/// surfaces beneath it, and every other project sits under a quiet "Projects"
+/// section label as a compact one-line row that can be expanded in place
+/// without stealing focus.
+///
+/// Row grammar is unchanged: identity mark · title · time-in-state · dot at the
+/// right edge, idle rows draw no dot, and the only background fill in the whole
+/// rail is the neutral selection wash on surfaces that are actually on screen
+/// (plus the pinned project's header).
 ///
 /// The rail is pure presentation: every mutating action it offers is a closure
 /// or an `AppModel` call that already existed, so the sidebar's context menus
@@ -62,32 +68,96 @@ struct QuietProjectRail: View {
     }
 
     var body: some View {
-        ForEach(model.projects) { project in
-            QuietProjectGroup(
-                model: model,
-                attention: attention,
-                project: project,
-                isExpanded: expansion(project.id),
-                isActive: isActiveProject(project.id),
-                now: now,
-                orderStore: orderStore,
-                since: { clock.since(id: $0) },
-                note: { id, status in clock.note(id: id, status: status, at: Date()) },
-                selectSession: selectSession,
-                launchMenu: launchMenu,
-                projectMenu: projectMenu,
-                sessionMenu: sessionMenu,
-                chatMenu: chatMenu,
-                meshMenu: meshMenu
-            )
-        }
-        .onMove { indices, target in
-            guard let first = indices.first else { return }
-            let id = model.projects[first].id
-            let to = target > first ? target - 1 : target
-            model.moveProject(id: id, toIndex: to)
+        let projects = model.projects
+        let active = projects.first { isActiveProject($0.id) }
+        let others = projects.filter { $0.id != active?.id }
+        Group {
+            if let active {
+                group(active, placement: .pinned)
+            }
+            if !others.isEmpty {
+                QuietSectionLabel(title: "Projects")
+                ForEach(others) { project in
+                    group(project, placement: .compact)
+                }
+                // Drag reorder still writes the persisted project order, but the
+                // list being dragged no longer contains the active project, so
+                // the indices are mapped back through `QuietRailOrder`.
+                .onMove { indices, target in
+                    guard let from = indices.first,
+                          let move = QuietRailOrder.moveIndex(
+                              activeID: active?.id,
+                              orderedIDs: projects.map(\.id),
+                              from: from,
+                              to: target
+                          ) else { return }
+                    model.moveProject(id: move.id, toIndex: move.toIndex)
+                }
+            }
         }
         .onReceive(tick) { now = $0 }
+    }
+
+    private func group(_ project: AppModel.ProjectGroup, placement: QuietProjectPlacement) -> some View {
+        QuietProjectGroup(
+            model: model,
+            attention: attention,
+            project: project,
+            isExpanded: expansion(project.id),
+            placement: placement,
+            now: now,
+            orderStore: orderStore,
+            since: { clock.since(id: $0) },
+            note: { id, status in clock.note(id: id, status: status, at: Date()) },
+            selectSession: selectSession,
+            launchMenu: launchMenu,
+            projectMenu: projectMenu,
+            sessionMenu: sessionMenu,
+            chatMenu: chatMenu,
+            meshMenu: meshMenu
+        )
+    }
+}
+
+// MARK: - Compact-list drag mapping
+
+/// Maps a drag in the compact project list (which excludes the pinned active
+/// project) onto the index `AppModel.moveProject(id:toIndex:)` expects in the
+/// *persisted* order. Pure so the arithmetic can be tested without a list.
+enum QuietRailOrder {
+    struct Move: Equatable {
+        let id: String
+        let toIndex: Int
+    }
+
+    /// - Parameters:
+    ///   - activeID: the pinned project, absent from the dragged list.
+    ///   - orderedIDs: the full persisted project order.
+    ///   - from: source index in the compact list (SwiftUI `onMove` offsets).
+    ///   - to: destination index in the compact list, before the move.
+    /// - Returns: the project to move and its destination in the full order, or
+    ///   `nil` when the drag is a no-op or out of range.
+    static func moveIndex(activeID: String?, orderedIDs: [String], from: Int, to: Int) -> Move? {
+        var compact = orderedIDs.filter { $0 != activeID }
+        guard from >= 0, from < compact.count else { return nil }
+        let destination = max(0, min(to, compact.count))
+        // SwiftUI's `toOffset` is measured before the removal; a drop onto the
+        // row's own slot (or immediately after it) changes nothing.
+        let landed = destination > from ? destination - 1 : destination
+        guard landed != from else { return nil }
+        let movedID = compact[from]
+        compact.move(fromOffsets: IndexSet(integer: from), toOffset: destination)
+
+        // The persisted store moves a project by remove-then-insert, so the
+        // destination index is measured against the order with the dragged
+        // project taken out. Anchoring on the row it landed behind keeps the
+        // pinned project wherever it already sat.
+        let rest = orderedIDs.filter { $0 != movedID }
+        guard landed > 0, landed - 1 < compact.count,
+              let predecessorIndex = rest.firstIndex(of: compact[landed - 1]) else {
+            return Move(id: movedID, toIndex: 0)
+        }
+        return Move(id: movedID, toIndex: predecessorIndex + 1)
     }
 }
 
@@ -98,30 +168,67 @@ struct QuietProjectRail: View {
 /// `+`) may be smaller, since they carry no reading load.
 private enum QuietRailMetrics {
     static let headerText: CGFloat = 13
-    static let titleText: CGFloat = 12.5
+    static let titleText: CGFloat = 13
+    static let sectionText: CGFloat = 11
     static let secondaryText: CGFloat = 10.5
     static let chevronText: CGFloat = 9
     static let plusText: CGFloat = 10
-    static let glyphColumn: CGFloat = 13
+    static let folderText: CGFloat = 11
+    static let revealText: CGFloat = 10
+    /// Identity slot and the gap between it and the label.
+    static let mark: CGFloat = QuietIdentityMarkView.slot
+    static let markGap: CGFloat = 8
     static let dot: CGFloat = 6
     static let sessionIndent: CGFloat = 30
-    static let rowHeight: CGFloat = 26
-    static let headerHeight: CGFloat = 30
+    /// One cadence for every row in the rail: sessions, compact projects and
+    /// the pinned project header all measure 32pt.
+    static let rowHeight: CGFloat = 32
     static let horizontalInset: CGFloat = 8
     static let trailingInset: CGFloat = 10
     static let pulseDuration: Double = 1.4
+    /// The rail's only fill: a neutral wash, never a tint.
+    static let washOpacity: Double = 0.055
+}
+
+private enum QuietProjectPlacement {
+    /// The active project, pinned to the top of the rail with its surfaces.
+    case pinned
+    /// Any other project, one compact line under the "Projects" label.
+    case compact
+}
+
+/// Sentence-case section divider between the pinned project and the rest.
+private struct QuietSectionLabel: View {
+    let title: String
+
+    var body: some View {
+        Text(title)
+            .font(.system(size: QuietRailMetrics.sectionText, weight: .semibold))
+            .foregroundStyle(.tertiary)
+            .padding(.top, 14)
+            .padding(.leading, 10)
+            .padding(.bottom, 5)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .accessibilityAddTraits(.isHeader)
+            .listRowInsets(EdgeInsets())
+            .listRowSeparator(.hidden)
+            .listRowBackground(Color.clear)
+    }
 }
 
 // MARK: - Project group
 
-/// One project: a plain-text header (hover reveals its chevron and `+`) plus,
-/// when expanded, that project's chats, meshes, and terminal sessions.
+/// One project. Pinned: a 32pt header carrying the project's tinted name, its
+/// chats/meshes/sessions beneath, and a hover-revealed "New session" row.
+/// Compact: a single 32pt row with a folder glyph, the project's name, its
+/// rollup, and a hover chevron that expands the project in place *without*
+/// activating it — activation is the row body's job.
 private struct QuietProjectGroup: View {
     @ObservedObject var model: AppModel
     @ObservedObject var attention: AttentionCenter
     let project: AppModel.ProjectGroup
     @Binding var isExpanded: Bool
-    let isActive: Bool
+    let placement: QuietProjectPlacement
     let now: Date
     let orderStore: SessionOrderStore
     let since: (String) -> Date?
@@ -134,10 +241,13 @@ private struct QuietProjectGroup: View {
     let meshMenu: (MeshSession) -> AnyView
 
     @State private var hovering = false
+    @State private var hoveringLaunchRow = false
     /// Manual drag order, read from disk once per project so streamed output
     /// never turns a re-render into file I/O.
     @State private var manualOrder: [String] = []
     @State private var loadedOrder = false
+
+    private var isActive: Bool { placement == .pinned }
 
     var body: some View {
         let chats = model.chats(in: project.id)
@@ -156,8 +266,8 @@ private struct QuietProjectGroup: View {
                 ForEach(meshes) { mesh in
                     meshRow(mesh, status: statuses[mesh.id] ?? .idle)
                 }
-                ForEach(sessions) { session in
-                    sessionRow(session, status: statuses[session.id] ?? .idle)
+                ForEach(Array(sessions.enumerated()), id: \.element.id) { index, session in
+                    sessionRow(session, ordinal: index + 1, status: statuses[session.id] ?? .idle)
                 }
                 .onMove { indices, target in
                     var ids = sessions.map(\.id)
@@ -168,26 +278,54 @@ private struct QuietProjectGroup: View {
                 if sessions.isEmpty, chats.isEmpty, meshes.isEmpty {
                     emptyRow
                 }
+                if isActive {
+                    newSessionRow
+                }
             }
         }
     }
 
     // MARK: Header
 
-    @ViewBuilder
     private func header(statuses: [String: QuietSessionStatus]) -> some View {
-        let tint = ProjectTint.color(project.colorHex) ?? WorkspacePalette.project
+        Group {
+            switch placement {
+            case .pinned: pinnedHeader(statuses: statuses)
+            case .compact: compactRow(statuses: statuses)
+            }
+        }
+        // The status clock is stamped from the project's own row so a project
+        // whose surfaces are collapsed keeps accumulating time-in-state.
+        .onAppear { noteAll(statuses) }
+        .onChange(of: statuses) { _, updated in noteAll(updated) }
+    }
+
+    private func noteAll(_ statuses: [String: QuietSessionStatus]) {
+        for (id, status) in statuses { note(id, status) }
+    }
+
+    /// The pinned (active) project. Only the project's *name* carries its tint;
+    /// the background is the same neutral wash focused surfaces use, so no tint
+    /// fill appears anywhere in the rail.
+    private func pinnedHeader(statuses: [String: QuietSessionStatus]) -> some View {
         HStack(spacing: 6) {
             // A real Button, not a tap gesture: it is what gives the header a
             // press action for VoiceOver, Full Keyboard Access and automation.
             // The `+` stays a SIBLING of the button rather than part of its
             // label, because a Menu nested inside a button label never receives
             // the click that opens it.
-            Button(action: toggle) {
-                HStack(spacing: 6) {
+            Button {
+                withAnimation(.easeInOut(duration: KaisolaVisualSystem.stateDuration)) { isExpanded.toggle() }
+            } label: {
+                HStack(spacing: QuietRailMetrics.markGap) {
+                    Image(systemName: "folder")
+                        .font(.system(size: QuietRailMetrics.folderText, weight: .medium))
+                        .foregroundStyle(tint)
+                        .frame(width: QuietRailMetrics.mark, height: QuietRailMetrics.mark)
+                        .accessibilityHidden(true)
                     Text(project.name)
-                        .font(.system(size: QuietRailMetrics.headerText, weight: isActive ? .semibold : .medium))
-                        .foregroundStyle(isActive ? HierarchicalShapeStyle.primary : .secondary)
+                        .font(.system(size: QuietRailMetrics.headerText, weight: .semibold))
+                        .foregroundStyle(tint)
                         .lineLimit(1)
                         .truncationMode(.middle)
                     Spacer(minLength: 4)
@@ -203,10 +341,10 @@ private struct QuietProjectGroup: View {
                 }
                 // The button's own label owns the full row geometry — height,
                 // horizontal inset and width — so its hit area (and VoiceOver
-                // frame) covers the entire 30pt row, not just the intrinsic
-                // text height. Mirrors QuietRowBody's chain (~line 494).
+                // frame) covers the entire 32pt row, not just the intrinsic
+                // text height. Mirrors QuietRowBody's chain.
                 .padding(.horizontal, QuietRailMetrics.horizontalInset)
-                .frame(height: QuietRailMetrics.headerHeight)
+                .frame(height: QuietRailMetrics.rowHeight)
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .contentShape(Rectangle())
             }
@@ -232,50 +370,89 @@ private struct QuietProjectGroup: View {
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         .contentShape(Rectangle())
-        // The active project's tint wash is the only fill in the rail; every
-        // other row earns its emphasis from the dot instead.
-        .background {
-            if isActive {
-                RoundedRectangle(cornerRadius: KaisolaVisualSystem.insetRadius, style: .continuous)
-                    .fill(tint.opacity(0.12))
+        .background { QuietSelectionWash() }
+        .modifier(projectRowChrome)
+    }
+
+    /// Every other project: one line, no wash, expandable in place.
+    private func compactRow(statuses: [String: QuietSessionStatus]) -> some View {
+        HStack(spacing: 6) {
+            Button(action: activate) {
+                HStack(spacing: QuietRailMetrics.markGap) {
+                    Image(systemName: "folder")
+                        .font(.system(size: QuietRailMetrics.folderText, weight: .regular))
+                        .foregroundStyle(.tertiary)
+                        .frame(width: QuietRailMetrics.mark, height: QuietRailMetrics.mark)
+                        .accessibilityHidden(true)
+                    Text(project.name)
+                        .font(.system(size: QuietRailMetrics.headerText))
+                        .foregroundStyle(HierarchicalShapeStyle.primary)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                    Spacer(minLength: 4)
+                    QuietRollupView(rollup: QuietRollup.of(Array(statuses.values)))
+                }
+                .padding(.leading, QuietRailMetrics.horizontalInset)
+                .frame(height: QuietRailMetrics.rowHeight)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .contentShape(Rectangle())
             }
-        }
-        .onHover { inside in
-            withAnimation(.easeOut(duration: KaisolaVisualSystem.hoverDuration)) { hovering = inside }
-        }
-        .contextMenu {
-            // Move Up/Down come first so the destructive tail of the passed-in
-            // project menu (Close Project) stays last in the composed menu.
-            // ⌥↑/⌥↓ target the active project only, so a menu opened on a
-            // non-active project's header never reorders the wrong row.
-            Button("Move Up") {
-                guard isActive else { return }
-                model.moveProject(id: project.id, delta: -1)
+            .buttonStyle(.plain)
+            .accessibilityAddTraits(.isHeader)
+            // Peeking into a project must not steal the workspace: the chevron
+            // is a SIBLING control so its click never reaches the row's
+            // activate action. It keeps its slot when hidden so the row's
+            // contents do not shift under the pointer on hover.
+            Button {
+                withAnimation(.easeInOut(duration: KaisolaVisualSystem.stateDuration)) { isExpanded.toggle() }
+            } label: {
+                Image(systemName: isExpanded ? "chevron.down" : "chevron.right")
+                    .font(.system(size: QuietRailMetrics.chevronText, weight: .semibold))
+                    .foregroundStyle(.tertiary)
+                    .frame(width: 14, height: QuietRailMetrics.rowHeight)
+                    .contentShape(Rectangle())
             }
-            .keyboardShortcut(.upArrow, modifiers: .option)
-            .disabled(!isActive)
-            Button("Move Down") {
-                guard isActive else { return }
-                model.moveProject(id: project.id, delta: 1)
-            }
-            .keyboardShortcut(.downArrow, modifiers: .option)
-            .disabled(!isActive)
-            Divider()
-            projectMenu(project)
+            .buttonStyle(.plain)
+            .opacity(hovering ? 1 : 0)
+            .allowsHitTesting(hovering)
+            .padding(.trailing, QuietRailMetrics.horizontalInset)
+            .help(isExpanded ? "Collapse \(project.name)" : "Expand \(project.name)")
+            .accessibilityLabel(isExpanded ? "Collapse \(project.name)" : "Expand \(project.name)")
         }
-        .accessibilityElement(children: .contain)
-        .accessibilityAction(named: Text(isExpanded ? "Collapse" : "Expand")) { toggle() }
-        .onAppear {
-            if !loadedOrder {
-                loadedOrder = true
-                manualOrder = orderStore.order(projectID: project.id)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .contentShape(Rectangle())
+        .modifier(projectRowChrome)
+    }
+
+    /// Hover, context menu, status bookkeeping and list chrome — identical for
+    /// both header shapes.
+    private var projectRowChrome: QuietProjectRowChrome {
+        QuietProjectRowChrome(
+            hovering: $hovering,
+            isActive: isActive,
+            expandLabel: isExpanded ? "Collapse" : "Expand",
+            toggle: { withAnimation(.easeInOut(duration: KaisolaVisualSystem.stateDuration)) { isExpanded.toggle() } },
+            moveUp: { model.moveProject(id: project.id, delta: -1) },
+            moveDown: { model.moveProject(id: project.id, delta: 1) },
+            menu: { projectMenu(project) },
+            onAppear: {
+                if !loadedOrder {
+                    loadedOrder = true
+                    manualOrder = orderStore.order(projectID: project.id)
+                }
             }
-            noteAll(statuses)
+        )
+    }
+
+    private var tint: Color { ProjectTint.color(project.colorHex) ?? WorkspacePalette.project }
+
+    /// Activating re-pins the project at the top of the rail; opening it there
+    /// collapsed would hide the surfaces the click was asking for.
+    private func activate() {
+        if !isActive { model.activateProject(id: project.id) }
+        if !isExpanded {
+            withAnimation(.easeInOut(duration: KaisolaVisualSystem.stateDuration)) { isExpanded = true }
         }
-        .onChange(of: statuses) { _, updated in noteAll(updated) }
-        .listRowInsets(EdgeInsets())
-        .listRowSeparator(.hidden)
-        .listRowBackground(Color.clear)
     }
 
     private var emptyRow: some View {
@@ -290,54 +467,96 @@ private struct QuietProjectGroup: View {
             .listRowBackground(Color.clear)
     }
 
-    private func toggle() {
-        if !isActive { model.activateProject(id: project.id) }
-        withAnimation(.easeInOut(duration: KaisolaVisualSystem.stateDuration)) { isExpanded.toggle() }
+    /// The pinned project's creation affordance, under its surfaces. The row
+    /// always holds its slot so the pointer can reach it (an `opacity(0)` view
+    /// still hit-tests); only its contents are hover-revealed, which keeps the
+    /// rail's resting state free of chrome without making the target jump.
+    private var newSessionRow: some View {
+        Menu {
+            launchMenu(project)
+        } label: {
+            HStack(spacing: QuietRailMetrics.markGap) {
+                Image(systemName: "plus")
+                    .font(.system(size: QuietRailMetrics.plusText, weight: .semibold))
+                    .frame(width: QuietRailMetrics.mark, height: QuietRailMetrics.mark)
+                Text("New session")
+                    .font(.system(size: QuietRailMetrics.titleText))
+                Spacer(minLength: 0)
+            }
+            .foregroundStyle(.tertiary)
+            .padding(.leading, QuietRailMetrics.sessionIndent)
+            .padding(.trailing, QuietRailMetrics.trailingInset)
+            .frame(height: QuietRailMetrics.rowHeight)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .contentShape(Rectangle())
+            .opacity(hovering || hoveringLaunchRow ? 1 : 0)
+        }
+        .menuStyle(.borderlessButton)
+        .menuIndicator(.hidden)
+        .onHover { inside in
+            withAnimation(.easeOut(duration: KaisolaVisualSystem.hoverDuration)) { hoveringLaunchRow = inside }
+        }
+        .help("New session in \(project.name)")
+        .accessibilityLabel("New session in \(project.name)")
+        .listRowInsets(EdgeInsets())
+        .listRowSeparator(.hidden)
+        .listRowBackground(Color.clear)
     }
 
     // MARK: Rows
 
-    private func sessionRow(_ record: BrokerTerminalRecord, status: QuietSessionStatus) -> some View {
-        QuietSessionRowView(
-            record: record,
-            glyph: QuietKindGlyph.glyph(
+    private func sessionRow(
+        _ record: BrokerTerminalRecord,
+        ordinal: Int,
+        status: QuietSessionStatus
+    ) -> some View {
+        let processName = model.meta(for: record.id)?.processName
+        return QuietSurfaceRowView(
+            identity: QuietIdentity.identity(
                 agentName: model.agentProfile(for: record.id)?.name,
-                processName: model.meta(for: record.id)?.processName
+                processName: processName
             ),
-            title: model.sessionTitle(for: record),
+            title: QuietRailTitle.displayTitle(
+                rawTitle: model.sessionTitle(for: record),
+                projectName: project.name,
+                processName: processName,
+                ordinal: ordinal
+            ),
             status: status,
             timeLabel: timeLabel(record.id),
             isSelected: model.isSurfaceVisible(record.id),
             tooltip: tooltip(for: record),
             select: { selectSession(record) },
-            menu: sessionMenu
+            reveal: { model.revealSurfaceBeside(record.id) },
+            menu: { sessionMenu(record) }
         )
     }
 
     private func chatRow(_ chat: AcpChatHandle, status: QuietSessionStatus) -> some View {
-        QuietChatRowView(
-            chat: chat,
-            glyph: QuietKindGlyph.glyph(agentName: chat.agentID, processName: nil),
+        QuietSurfaceRowView(
+            identity: QuietIdentity.identity(agentName: chat.agentID, processName: nil),
             title: chat.conversation.title,
             status: status,
             timeLabel: timeLabel(chat.id),
             isSelected: model.isSurfaceVisible(chat.id),
             tooltip: chatTooltip(chat),
             select: { model.selectChat(chat.id) },
-            menu: chatMenu
+            reveal: { model.revealSurfaceBeside(chat.id) },
+            menu: { chatMenu(chat) }
         )
     }
 
     private func meshRow(_ mesh: MeshSession, status: QuietSessionStatus) -> some View {
-        QuietMeshRowView(
-            mesh: mesh,
+        QuietSurfaceRowView(
+            identity: .mesh,
             title: mesh.title,
             status: status,
             timeLabel: timeLabel(mesh.id),
             isSelected: model.isSurfaceVisible(mesh.id),
             tooltip: mesh.stage == "Idle" ? "Mesh · Ready" : "Mesh · \(mesh.stage)",
             select: { model.selectMesh(mesh.id) },
-            menu: meshMenu
+            reveal: { model.revealSurfaceBeside(mesh.id) },
+            menu: { meshMenu(mesh) }
         )
     }
 
@@ -348,8 +567,8 @@ private struct QuietProjectGroup: View {
         return QuietTimeLabel.label(since: start, now: now)
     }
 
-    /// Everything the collapsed rollup and the expanded rows both need, derived
-    /// once per body pass.
+    /// Everything the rollup and the expanded rows both need, derived once per
+    /// body pass.
     private func statusMap(
         sessions: [BrokerTerminalRecord],
         chats: [AcpChatHandle],
@@ -402,10 +621,6 @@ private struct QuietProjectGroup: View {
         )
     }
 
-    private func noteAll(_ statuses: [String: QuietSessionStatus]) {
-        for (id, status) in statuses { note(id, status) }
-    }
-
     /// What the old two-line row's subtitle carried, moved into the tooltip so
     /// the row itself stays one line.
     private func tooltip(for record: BrokerTerminalRecord) -> String {
@@ -425,11 +640,59 @@ private struct QuietProjectGroup: View {
     }
 }
 
+/// The chrome both project-row shapes share. A `ViewModifier` rather than a
+/// helper function so the hover binding, the context menu (Move Up/Down ahead
+/// of the host's destructive tail) and the list chrome stay defined once.
+private struct QuietProjectRowChrome: ViewModifier {
+    @Binding var hovering: Bool
+    let isActive: Bool
+    let expandLabel: String
+    let toggle: () -> Void
+    let moveUp: () -> Void
+    let moveDown: () -> Void
+    let menu: () -> AnyView
+    let onAppear: () -> Void
+
+    func body(content: Content) -> some View {
+        content
+            .onHover { inside in
+                withAnimation(.easeOut(duration: KaisolaVisualSystem.hoverDuration)) { hovering = inside }
+            }
+            .contextMenu {
+                // Move Up/Down come first so the destructive tail of the
+                // passed-in project menu (Close Project) stays last in the
+                // composed menu. ⌥↑/⌥↓ target the active project only, so a
+                // menu opened on a non-active project never reorders the wrong
+                // row.
+                Button("Move Up") {
+                    guard isActive else { return }
+                    moveUp()
+                }
+                .keyboardShortcut(.upArrow, modifiers: .option)
+                .disabled(!isActive)
+                Button("Move Down") {
+                    guard isActive else { return }
+                    moveDown()
+                }
+                .keyboardShortcut(.downArrow, modifiers: .option)
+                .disabled(!isActive)
+                Divider()
+                menu()
+            }
+            .accessibilityElement(children: .contain)
+            .accessibilityAction(named: Text(expandLabel)) { toggle() }
+            .onAppear { onAppear() }
+            .listRowInsets(EdgeInsets())
+            .listRowSeparator(.hidden)
+            .listRowBackground(Color.clear)
+    }
+}
+
 // MARK: - Collapsed rollup
 
-/// A collapsed project's whole story: how many surfaces are active, and which
-/// states they are in. Amber (needs-you) sorts to the outer edge so the eye
-/// finds it at the right margin without expanding anything.
+/// A project's whole story in one glance: how many surfaces are active, and
+/// which states they are in. Amber (needs-you) sorts to the outer edge so the
+/// eye finds it at the right margin without expanding anything.
 private struct QuietRollupView: View {
     let rollup: QuietRollup
 
@@ -464,22 +727,32 @@ private struct QuietRollupView: View {
 
 // MARK: - Row anatomy
 
-/// The four tokens every row shares: kind glyph, title, time-in-state, dot.
-/// The dot always occupies its 6pt slot even when it draws nothing, so the
-/// times stay in one column down the whole rail.
+/// The rail's only background fill: a neutral wash, inset from the rail edges.
+/// Never tinted — colour in the sidebar means status, not identity.
+private struct QuietSelectionWash: View {
+    var body: some View {
+        RoundedRectangle(cornerRadius: KaisolaVisualSystem.insetRadius, style: .continuous)
+            .fill(Color.primary.opacity(QuietRailMetrics.washOpacity))
+            .padding(.horizontal, 6)
+    }
+}
+
+/// The tokens every surface row shares: identity mark, title, the hover-only
+/// "open beside" control, time-in-state, dot. The dot always occupies its 6pt
+/// slot even when it draws nothing, so the times stay in one column down the
+/// whole rail.
 private struct QuietRowBody: View {
-    let glyph: String
+    let identity: QuietIdentity
     let title: String
     let timeLabel: String
     let status: QuietSessionStatus
     let isSelected: Bool
+    let showsReveal: Bool
+    let reveal: () -> Void
 
     var body: some View {
-        HStack(spacing: 7) {
-            Text(glyph)
-                .font(.system(size: QuietRailMetrics.secondaryText))
-                .foregroundStyle(.tertiary)
-                .frame(width: QuietRailMetrics.glyphColumn, alignment: .center)
+        HStack(spacing: QuietRailMetrics.markGap) {
+            QuietIdentityMarkView(identity: identity)
             Text(title)
                 .font(.system(size: QuietRailMetrics.titleText))
                 .foregroundStyle(status.isDimmed ? HierarchicalShapeStyle.tertiary : .primary)
@@ -489,6 +762,22 @@ private struct QuietRowBody: View {
                 // to its fixed-size siblings and truncates first.
                 .layoutPriority(1)
             Spacer(minLength: 4)
+            if showsReveal {
+                // A `highPriorityGesture` rather than a nested Button: SwiftUI
+                // gives a descendant's high-priority gesture precedence over the
+                // enclosing Button's own gesture, while a Button (or Menu)
+                // nested inside a button label is swallowed by it. The row keeps
+                // an "Open beside" accessibility action for the paths this
+                // pointer-only affordance cannot serve.
+                Image(systemName: "square.split.2x1")
+                    .font(.system(size: QuietRailMetrics.revealText, weight: .medium))
+                    .foregroundStyle(.secondary)
+                    .frame(width: 16, height: 16)
+                    .contentShape(Rectangle())
+                    .highPriorityGesture(TapGesture().onEnded { reveal() })
+                    .help("Open beside (⌘-click the row)")
+                    .accessibilityHidden(true)
+            }
             Text(timeLabel)
                 .font(.system(size: QuietRailMetrics.secondaryText).monospacedDigit())
                 .foregroundStyle(.tertiary)
@@ -501,9 +790,7 @@ private struct QuietRowBody: View {
         .contentShape(Rectangle())
         .background {
             if isSelected {
-                RoundedRectangle(cornerRadius: KaisolaVisualSystem.insetRadius, style: .continuous)
-                    .fill(Color.primary.opacity(0.06))
-                    .padding(.horizontal, 6)
+                QuietSelectionWash()
             }
         }
         .accessibilityElement(children: .combine)
@@ -553,102 +840,63 @@ private struct QuietStatusDot: View {
     }
 }
 
-// MARK: - Concrete rows
+// MARK: - Surface row
 
-private struct QuietSessionRowView: View {
-    let record: BrokerTerminalRecord
-    let glyph: String
+/// One terminal, chat or mesh. Sessions, chats and meshes differ only in what
+/// they do when pressed and which context menu they carry, so they share one
+/// row: the identity mark already says which kind it is.
+private struct QuietSurfaceRowView: View {
+    let identity: QuietIdentity
     let title: String
     let status: QuietSessionStatus
     let timeLabel: String
     let isSelected: Bool
     let tooltip: String
     let select: () -> Void
-    let menu: (BrokerTerminalRecord) -> AnyView
+    let reveal: () -> Void
+    let menu: () -> AnyView
+
+    @State private var hovering = false
 
     var body: some View {
         // A Button, not a tap gesture: a gesture is invisible to VoiceOver,
         // Full Keyboard Access and automation, so the row would expose no press
         // action. `.plain` keeps the row's own appearance.
-        Button(action: select) {
+        Button(action: press) {
             QuietRowBody(
-                glyph: glyph,
+                identity: identity,
                 title: title,
                 timeLabel: timeLabel,
                 status: status,
-                isSelected: isSelected
+                isSelected: isSelected,
+                showsReveal: hovering,
+                reveal: reveal
             )
         }
         .buttonStyle(.plain)
         .accessibilityAddTraits(.isButton)
         .accessibilityAction { select() }
+        .accessibilityAction(named: Text("Open beside")) { reveal() }
+        .onHover { inside in
+            withAnimation(.easeOut(duration: KaisolaVisualSystem.hoverDuration)) { hovering = inside }
+        }
         .help(tooltip)
-        .contextMenu { menu(record) }
+        .contextMenu { menu() }
         .listRowInsets(EdgeInsets())
         .listRowSeparator(.hidden)
         .listRowBackground(Color.clear)
     }
-}
 
-private struct QuietChatRowView: View {
-    let chat: AcpChatHandle
-    let glyph: String
-    let title: String
-    let status: QuietSessionStatus
-    let timeLabel: String
-    let isSelected: Bool
-    let tooltip: String
-    let select: () -> Void
-    let menu: (AcpChatHandle) -> AnyView
-
-    var body: some View {
-        Button(action: select) {
-            QuietRowBody(
-                glyph: glyph,
-                title: title,
-                timeLabel: timeLabel,
-                status: status,
-                isSelected: isSelected
-            )
+    /// ⌘-click opens the surface beside the current one instead of replacing
+    /// it. SwiftUI's Button action carries no event, so the modifier is read
+    /// from `NSEvent.modifierFlags`, which is valid for the click being
+    /// dispatched; VoiceOver's press path calls `select()` directly and is
+    /// unaffected.
+    private func press() {
+        if NSEvent.modifierFlags.contains(.command) {
+            reveal()
+        } else {
+            select()
         }
-        .buttonStyle(.plain)
-        .accessibilityAddTraits(.isButton)
-        .accessibilityAction { select() }
-        .help(tooltip)
-        .contextMenu { menu(chat) }
-        .listRowInsets(EdgeInsets())
-        .listRowSeparator(.hidden)
-        .listRowBackground(Color.clear)
-    }
-}
-
-private struct QuietMeshRowView: View {
-    let mesh: MeshSession
-    let title: String
-    let status: QuietSessionStatus
-    let timeLabel: String
-    let isSelected: Bool
-    let tooltip: String
-    let select: () -> Void
-    let menu: (MeshSession) -> AnyView
-
-    var body: some View {
-        Button(action: select) {
-            QuietRowBody(
-                glyph: "⌗",
-                title: title,
-                timeLabel: timeLabel,
-                status: status,
-                isSelected: isSelected
-            )
-        }
-        .buttonStyle(.plain)
-        .accessibilityAddTraits(.isButton)
-        .accessibilityAction { select() }
-        .help(tooltip)
-        .contextMenu { menu(mesh) }
-        .listRowInsets(EdgeInsets())
-        .listRowSeparator(.hidden)
-        .listRowBackground(Color.clear)
     }
 }

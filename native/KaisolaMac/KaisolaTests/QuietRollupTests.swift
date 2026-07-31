@@ -21,13 +21,6 @@ final class QuietRollupTests: XCTestCase {
         XCTAssertEqual(r.total, 0)
         XCTAssertTrue(r.dots.isEmpty)
     }
-
-    func testGlyphs() {
-        XCTAssertEqual(QuietKindGlyph.glyph(agentName: "Claude Code", processName: nil), "✦")
-        XCTAssertEqual(QuietKindGlyph.glyph(agentName: "codex", processName: nil), "⌁")
-        XCTAssertEqual(QuietKindGlyph.glyph(agentName: nil, processName: "ssh"), "⇅")
-        XCTAssertEqual(QuietKindGlyph.glyph(agentName: "mesh", processName: nil), "⌗")
-        XCTAssertEqual(QuietKindGlyph.glyph(agentName: nil, processName: "zsh"), "❯")
-        XCTAssertEqual(QuietKindGlyph.glyph(agentName: nil, processName: nil), "❯")
-    }
 }
+// Kind-glyph coverage moved to QuietIdentityMarkTests when the text glyphs
+// became drawn identity marks (v4.4 "quiet fleet / Safari").

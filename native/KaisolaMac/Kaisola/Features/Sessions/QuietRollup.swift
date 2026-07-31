@@ -14,14 +14,3 @@ struct QuietRollup: Equatable {
         return QuietRollup(total: active.count, dots: Array(distinct.suffix(3)))
     }
 }
-
-enum QuietKindGlyph {
-    static func glyph(agentName: String?, processName: String?) -> String {
-        let agent = (agentName ?? "").lowercased()
-        if agent.contains("claude") { return "✦" }
-        if agent.contains("codex") { return "⌁" }
-        if agent.contains("mesh") { return "⌗" }
-        if (processName ?? "").lowercased() == "ssh" { return "⇅" }
-        return "❯"
-    }
-}

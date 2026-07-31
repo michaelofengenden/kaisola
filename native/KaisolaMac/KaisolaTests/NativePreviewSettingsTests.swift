@@ -484,6 +484,65 @@ final class NativePreviewSettingsTests: XCTestCase {
         XCTAssertGreaterThan(darkWorkspace.baseOpacity, darkSidebar.baseOpacity)
     }
 
+    func testNonActiveProjectsDefaultToCollapsed() {
+        XCTAssertTrue(
+            ProjectExpansionState.isExpanded(
+                projectID: "active",
+                isActive: true,
+                expanded: [],
+                collapsed: []
+            )
+        )
+        XCTAssertFalse(
+            ProjectExpansionState.isExpanded(
+                projectID: "other",
+                isActive: false,
+                expanded: [],
+                collapsed: []
+            )
+        )
+    }
+
+    func testProjectExpansionHonoursExplicitUserToggles() {
+        // Peeking into a non-active project is opt-in and sticks.
+        XCTAssertTrue(
+            ProjectExpansionState.isExpanded(
+                projectID: "other",
+                isActive: false,
+                expanded: ["other"],
+                collapsed: []
+            )
+        )
+        // Collapsing the active project sticks too, and outranks a stale
+        // expansion entry for the same project.
+        XCTAssertFalse(
+            ProjectExpansionState.isExpanded(
+                projectID: "active",
+                isActive: true,
+                expanded: ["active"],
+                collapsed: ["active"]
+            )
+        )
+    }
+
+    /// An install made before the default flipped persisted only *collapsed*
+    /// ids. Those must keep their meaning instead of springing open.
+    func testProjectExpansionMigratesTheLegacyCollapsedKey() {
+        let legacy = ProjectExpansionState.decode("alpha,beta")
+        XCTAssertEqual(legacy, ["alpha", "beta"])
+        XCTAssertFalse(
+            ProjectExpansionState.isExpanded(
+                projectID: "alpha",
+                isActive: true,
+                expanded: [],
+                collapsed: legacy
+            )
+        )
+        XCTAssertEqual(ProjectExpansionState.decode(""), [])
+        XCTAssertEqual(ProjectExpansionState.encode(["beta", "alpha"]), "alpha,beta")
+        XCTAssertEqual(ProjectExpansionState.encode([]), "")
+    }
+
     func testChromePanelTokensSitBetweenCardAndShell() {
         XCTAssertGreaterThan(KaisolaVisualSystem.chromeRadius, KaisolaVisualSystem.cardRadius)
         XCTAssertLessThan(KaisolaVisualSystem.chromeRadius, KaisolaVisualSystem.shellRadius)

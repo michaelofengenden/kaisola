@@ -342,6 +342,11 @@ struct RootShellView: View {
                 .accessibilityLabel("Projects, chats, and terminal sessions")
                 footer
             }
+            // Safari's inset sidebar card: the tinted backdrop runs edge to
+            // edge behind the column and the navigation content floats on a
+            // rounded material panel inside it. The top inset clears the
+            // traffic lights, which the header used to pad around itself.
+            .kaisolaChromePanel(topInset: NativeWorkspaceChrome.chromePanelTopInset)
             .background {
                 SidebarBackdropView(appearance: settings.sidebarAppearance)
                     .ignoresSafeArea()
@@ -360,9 +365,59 @@ struct RootShellView: View {
                     .frame(width: NativeWorkspaceChrome.projectSidebarDividerWidth)
             }
         } detail: {
-            detailPane
+            detailArea
         }
         .navigationSplitViewStyle(.balanced)
+    }
+
+    /// The detail column: a titlebar-height chrome band carrying the trailing
+    /// Files control, then the content on its own inset floating card. The
+    /// band's height plus the panel's inset equals the sidebar card's top
+    /// inset, so the two cards start on the same line.
+    private var detailArea: some View {
+        VStack(spacing: 0) {
+            detailChromeBar
+            detailPane
+                .kaisolaChromePanel(topInset: 0)
+        }
+    }
+
+    private var detailChromeBar: some View {
+        HStack(spacing: 4) {
+            Spacer(minLength: 0)
+            filesToolbarControl
+        }
+        .padding(.trailing, KaisolaVisualSystem.chromeInset + 4)
+        .frame(
+            height: NativeWorkspaceChrome.chromePanelTopInset
+                - KaisolaVisualSystem.chromeInset
+        )
+    }
+
+    /// The workspace rail toggle lives at the top-right of the content area,
+    /// where a document app puts its sidebar controls. ⌘B and the command
+    /// palette drive the same setting.
+    private var filesToolbarControl: some View {
+        let visible = settings.workspaceRailVisible
+        return Button {
+            settings.workspaceRailVisible.toggle()
+        } label: {
+            Image(systemName: "sidebar.trailing")
+                .font(.system(size: 12, weight: .medium))
+                .foregroundStyle(visible ? Color.primary : Color.secondary)
+                .frame(width: 26, height: 24)
+                .background(
+                    visible ? Color.primary.opacity(0.10) : Color.clear,
+                    in: RoundedRectangle(
+                        cornerRadius: KaisolaVisualSystem.controlRadius,
+                        style: .continuous
+                    )
+                )
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .help(visible ? "Hide Files (⌘B)" : "Show Files (⌘B)")
+        .accessibilityLabel(visible ? "Hide Files" : "Show Files")
     }
 
     // MARK: Left-tree context menus
@@ -576,7 +631,7 @@ struct RootShellView: View {
                 closeMesh: requestCloseMesh
             )
             Divider()
-            detailPane
+            detailArea
             HStack(spacing: 0) {
                 footer.frame(width: 235)
                 Spacer(minLength: 0)
@@ -626,22 +681,43 @@ struct RootShellView: View {
         }
         .padding(.leading, 14)
         .padding(.trailing, 9)
-        .padding(.top, NativeWorkspaceChrome.sidebarTrafficLightClearance)
-        .frame(height: 36 + NativeWorkspaceChrome.sidebarTrafficLightClearance, alignment: .bottom)
+        // The chrome panel already starts below the traffic lights, so the
+        // header only owns its own 36pt row.
+        .frame(height: 36, alignment: .bottom)
         .frame(maxWidth: .infinity, alignment: .leading)
         .background(.clear)
     }
 
-    /// Collapsed project sections, persisted per project id.
+    /// Projects the user explicitly expanded. Absent from this set, a
+    /// non-active project stays collapsed — peeking is opt-in.
+    @AppStorage("expandedProjects") private var expandedProjectsRaw = ""
+    /// Projects the user explicitly collapsed. Retained under its original key
+    /// so an install that had collapsed projects before the default flipped
+    /// keeps them collapsed rather than springing open.
     @AppStorage("collapsedProjects") private var collapsedProjectsRaw = ""
 
     private func expansionBinding(_ projectID: String) -> Binding<Bool> {
         Binding(
-            get: { !collapsedProjectsRaw.components(separatedBy: ",").contains(projectID) },
+            get: {
+                ProjectExpansionState.isExpanded(
+                    projectID: projectID,
+                    isActive: activeProjectID == projectID,
+                    expanded: ProjectExpansionState.decode(expandedProjectsRaw),
+                    collapsed: ProjectExpansionState.decode(collapsedProjectsRaw)
+                )
+            },
             set: { expanded in
-                var set = Set(collapsedProjectsRaw.components(separatedBy: ",").filter { !$0.isEmpty })
-                if expanded { set.remove(projectID) } else { set.insert(projectID) }
-                collapsedProjectsRaw = set.sorted().joined(separator: ",")
+                var expandedSet = ProjectExpansionState.decode(expandedProjectsRaw)
+                var collapsedSet = ProjectExpansionState.decode(collapsedProjectsRaw)
+                if expanded {
+                    expandedSet.insert(projectID)
+                    collapsedSet.remove(projectID)
+                } else {
+                    expandedSet.remove(projectID)
+                    collapsedSet.insert(projectID)
+                }
+                expandedProjectsRaw = ProjectExpansionState.encode(expandedSet)
+                collapsedProjectsRaw = ProjectExpansionState.encode(collapsedSet)
             }
         )
     }
@@ -877,8 +953,6 @@ struct RootShellView: View {
             newMesh: { RootShellView.promptForNewMesh(model: model) },
             newStagedMesh: { RootShellView.promptForNewMesh(model: model, staged: true) },
             newIdeaMesh: { RootShellView.promptForNewMesh(model: model, idea: true) },
-            filesVisible: settings.workspaceRailVisible,
-            toggleFiles: { settings.workspaceRailVisible.toggle() },
             filePreviewVisible: model.previewedFileURL != nil,
             toggleFilePreview: {
                 if !model.toggleFilePreview() {
@@ -2226,6 +2300,11 @@ enum UnifiedTerminalDocumentResolver {
 /// only navigation that sits beneath the traffic lights reserves clearance.
 enum NativeWorkspaceChrome {
     static let sidebarTrafficLightClearance: CGFloat = 40
+    /// Where the inset chrome panels start. Clears the traffic lights *and*
+    /// the 52pt AppKit toolbar band that `NavigationSplitView` installs for its
+    /// own Hide Sidebar toggle, which otherwise clips the sidebar card's
+    /// top-right corner.
+    static let chromePanelTopInset: CGFloat = 46
     static let topBarTrafficLightClearance: CGFloat = 76
     static let projectSidebarMinimumWidth: CGFloat = 168
     static let projectSidebarIdealWidth: CGFloat = 200
@@ -2235,6 +2314,36 @@ enum NativeWorkspaceChrome {
     static let projectSidebarDividerHitWidth: CGFloat = 17
     static let projectSidebarDividerReach: CGFloat =
         (projectSidebarDividerHitWidth - projectSidebarDividerWidth) / 2
+}
+
+/// Sidebar disclosure defaults, kept pure so the persistence semantics can be
+/// tested without a `List`.
+///
+/// The active project shows its own sessions; every other project is a compact
+/// one-line row until the user opens it, so the rail stays short no matter how
+/// many folders are open. Both directions persist: the expanded set records
+/// opt-in peeks, and the original `collapsedProjects` key keeps its meaning as
+/// an explicit collapse, which is also what migrates an install made before
+/// the default flipped.
+enum ProjectExpansionState {
+    static func decode(_ raw: String) -> Set<String> {
+        Set(raw.components(separatedBy: ",").filter { !$0.isEmpty })
+    }
+
+    static func encode(_ ids: Set<String>) -> String {
+        ids.sorted().joined(separator: ",")
+    }
+
+    static func isExpanded(
+        projectID: String,
+        isActive: Bool,
+        expanded: Set<String>,
+        collapsed: Set<String>
+    ) -> Bool {
+        if collapsed.contains(projectID) { return false }
+        if expanded.contains(projectID) { return true }
+        return isActive
+    }
 }
 
 /// A row that is still the focused pane can belong to a project that is no
@@ -2557,8 +2666,6 @@ private struct ConnectionFooter: View {
     var newMesh: (() -> Void)?
     var newStagedMesh: (() -> Void)?
     var newIdeaMesh: (() -> Void)?
-    let filesVisible: Bool
-    let toggleFiles: () -> Void
     let filePreviewVisible: Bool
     let toggleFilePreview: () -> Void
     let showSettings: () -> Void
@@ -2573,66 +2680,22 @@ private struct ConnectionFooter: View {
         forInfoDictionaryKey: "CFBundleShortVersionString"
     ) as? String ?? "Dev"
 
+    /// Identity, then everything else behind one overflow. The footer used to
+    /// be a six-glyph multicolor shelf; the only things that earn a permanent
+    /// pixel here are who you are signed in as and — when there is something to
+    /// answer — the needs-you count.
     var body: some View {
-        HStack(spacing: 4) {
+        HStack(spacing: 6) {
             accountMenu
-                .padding(.leading, 12)
                 .help(state.detail ?? state.title)
-            KaisolaGlassEffectGroup(spacing: 4) {
-                HStack(spacing: 4) {
-                    shelfButton(
-                        "gearshape.fill",
-                        help: "Settings",
-                        tint: Color(red: 0.44, green: 0.50, blue: 0.20),
-                        action: showSettings
-                    )
-
-                    brokerUpgradeIndicator
-
-                    if newMesh != nil || newStagedMesh != nil || newIdeaMesh != nil {
-                        Menu {
-                            if let newMesh { Button("New Mesh (all agents)", action: newMesh) }
-                            if let newStagedMesh { Button("New Staged Mesh (scout → execute)", action: newStagedMesh) }
-                            if let newIdeaMesh { Button("New Idea Mesh (brainstorm)", action: newIdeaMesh) }
-                        } label: {
-                            Image(systemName: "circle.hexagongrid.fill")
-                                .font(.system(size: 12, weight: .semibold))
-                                .foregroundStyle(.purple)
-                                .frame(width: 22, height: 24)
-                        }
-                        .menuStyle(.borderlessButton)
-                        .menuIndicator(.hidden)
-                        .fixedSize()
-                        .tint(.purple)
-                        .help("New Mesh — flat, staged, or idea")
-                    }
-
-                    shelfButton(
-                        filePreviewVisible ? "doc.text.fill" : "doc.text.magnifyingglass",
-                        help: filePreviewVisible ? "Hide file preview" : "Show file preview",
-                        active: filePreviewVisible,
-                        action: toggleFilePreview
-                    )
-
-                    shelfButton(
-                        filesVisible ? "sidebar.trailing" : "sidebar.right",
-                        help: filesVisible ? "Hide Files (Command-B)" : "Show Files (Command-B)",
-                        active: filesVisible,
-                        action: toggleFiles
-                    )
-
-                    if UsageCenter.footerCostChipLabel(usage.costTotals) != nil {
-                        footerCostButton
-                    }
-
-                    attentionButton
-                }
-            }
-            Spacer(minLength: 2)
+            Spacer(minLength: 4)
+            attentionButton
+            overflowMenu
         }
         .font(.callout)
         .controlSize(.small)
-        .padding(.horizontal, 7)
+        .padding(.leading, 10)
+        .padding(.trailing, 6)
         .frame(height: 40)
     }
 
@@ -2641,56 +2704,53 @@ private struct ConnectionFooter: View {
         return false
     }
 
-    private func shelfButton(
-        _ symbol: String,
-        help: String,
-        active: Bool = false,
-        tint: Color? = nil,
-        action: @escaping () -> Void
-    ) -> some View {
-        let color = tint ?? (active ? Color.primary : Color.secondary)
-        return Button(action: action) {
-            Image(systemName: symbol)
-                .font(.system(size: 12, weight: .medium))
-                .foregroundStyle(color)
-                .frame(width: 26, height: 26)
-                .background(
-                    active ? color.opacity(0.12) : Color.clear,
-                    in: RoundedRectangle(cornerRadius: KaisolaVisualSystem.controlRadius, style: .continuous)
-                )
-                .contentShape(Rectangle())
-        }
-        .buttonStyle(.plain)
-        .help(help)
-        .accessibilityLabel(help)
+    /// Avatar plus as much of the account name as the narrowest sidebar can
+    /// show without crowding the overflow button.
+    private static let accountChipWidth: CGFloat = 118
+
+    private var accountName: String {
+        guard let account = auth.account else { return "Kaisola" }
+        return account.displayName ?? account.email
     }
 
-    private var footerCostButton: some View {
-        let totals = usage.costTotals
-        let label = UsageCenter.footerCostChipLabel(totals) ?? "Cost"
-        let accessibility = UsageCenter.costAccessibilityLabel(totals) ?? "Session cost"
-        return Button(action: showUsage) {
-            HStack(spacing: 3) {
-                Image(systemName: "dollarsign.circle")
-                Text(label)
-                    .monospacedDigit()
-                    .lineLimit(1)
-                    .fixedSize(horizontal: true, vertical: false)
+    /// Everything the old shelf buttons did, minus the Files toggle (now a
+    /// content-area control) and minus any persistent color.
+    private var overflowMenu: some View {
+        Menu {
+            Button(action: toggleFilePreview) {
+                Label(
+                    filePreviewVisible ? "Hide File Preview" : "Show File Preview",
+                    systemImage: "doc.text.magnifyingglass"
+                )
             }
-            .font(.system(size: 10, weight: .semibold))
-            .foregroundStyle(Color.secondary)
-            .padding(.horizontal, 6)
-            .frame(height: 24)
-            .background(Color.secondary.opacity(0.08), in: Capsule())
-            .overlay {
-                Capsule().strokeBorder(Color.secondary.opacity(0.14), lineWidth: 0.5)
+            if newMesh != nil || newStagedMesh != nil || newIdeaMesh != nil {
+                Divider()
+                if let newMesh { Button("New Mesh (all agents)", action: newMesh) }
+                if let newStagedMesh { Button("New Staged Mesh (scout → execute)", action: newStagedMesh) }
+                if let newIdeaMesh { Button("New Idea Mesh (brainstorm)", action: newIdeaMesh) }
             }
+            Divider()
+            if let cost = UsageCenter.costAccessibilityLabel(usage.costTotals) {
+                Text(cost)
+            }
+            Button(action: showUsage) {
+                Label("Usage…", systemImage: "gauge.with.dots.needle.bottom.50percent")
+            }
+            Button(action: showSettings) {
+                Label("Settings…", systemImage: "gearshape")
+            }
+        } label: {
+            Image(systemName: "ellipsis")
+                .font(.system(size: 12, weight: .semibold))
+                .foregroundStyle(.secondary)
+                .frame(width: 24, height: 24)
+                .contentShape(Rectangle())
         }
-        .buttonStyle(.plain)
-        .fixedSize(horizontal: true, vertical: false)
-        .help(accessibility)
-        .accessibilityLabel(accessibility)
-        .accessibilityHint("Opens Usage settings")
+        .menuStyle(.borderlessButton)
+        .menuIndicator(.hidden)
+        .fixedSize()
+        .help("More workspace actions")
+        .accessibilityLabel("More workspace actions")
     }
 
     private var accountMenu: some View {
@@ -2735,53 +2795,45 @@ private struct ConnectionFooter: View {
                 Text("Usage: \(usage.totalPeakTokens / 1000)k tokens · \(Int((usage.contextPressure * 100).rounded()))% context")
             }
         } label: {
-            Color.clear
-                .frame(width: 24, height: 24)
-                .contentShape(Rectangle())
+            HStack(spacing: 7) {
+                // Placeholder for the avatar, which is drawn in the overlay
+                // below; see the note there.
+                Color.clear
+                    .frame(width: 22, height: 22)
+                Text(accountName)
+                    .font(.system(size: 12, weight: .medium))
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+            }
+            .frame(width: Self.accountChipWidth, height: 24, alignment: .leading)
+            .contentShape(Rectangle())
         }
-        .menuStyle(.borderlessButton)
+        // `.button` rather than `.borderlessButton`: the borderless bridge
+        // collapses an explicitly framed label down to the menu arrow's own
+        // metrics, which shrank the whole chip to a few points of hit area.
+        .menuStyle(.button)
+        .buttonStyle(.plain)
         .menuIndicator(.hidden)
-        .frame(width: 24, height: 24)
-        .clipped()
+        .fixedSize()
         // Keep the asynchronously loaded photo outside AppKit's Menu label
         // bridge. The bridge otherwise promotes the source bitmap's intrinsic
         // dimensions and drops its SwiftUI mask when the image finishes loading.
-        .overlay {
+        .overlay(alignment: .leading) {
             AccountAvatarView(account: auth.account, size: 22)
                 .overlay(alignment: .bottomTrailing) {
-                    Circle()
-                        .fill(state.isConnected ? Color.green : Color.orange)
-                        .frame(width: 6, height: 6)
-                        .overlay(Circle().stroke(Color(nsColor: .windowBackgroundColor), lineWidth: 1))
+                    // Connected is the silent default; only a broken connection
+                    // earns a colored mark.
+                    if !state.isConnected {
+                        Circle()
+                            .fill(Color.orange)
+                            .frame(width: 6, height: 6)
+                            .overlay(Circle().stroke(Color(nsColor: .windowBackgroundColor), lineWidth: 1))
+                    }
                 }
                 .allowsHitTesting(false)
         }
         .help("Account and workspace settings")
         .accessibilityLabel("Kaisola account and settings")
-    }
-
-    @ViewBuilder
-    private var brokerUpgradeIndicator: some View {
-        switch brokerUpgradeState {
-        case .unknown, .current:
-            EmptyView()
-        case .checking, .updating:
-            Image(systemName: "arrow.triangle.2.circlepath")
-                .font(.system(size: 11, weight: .semibold))
-                .foregroundStyle(Color.accentColor)
-                .frame(width: 26, height: 26)
-                .background(Color.accentColor.opacity(0.10), in: Capsule())
-                .help(brokerUpgradeState.detail)
-                .accessibilityLabel(brokerUpgradeState.detail)
-        case .pending:
-            Image(systemName: "exclamationmark.triangle.fill")
-                .font(.system(size: 11, weight: .semibold))
-                .foregroundStyle(Color.orange)
-                .frame(width: 26, height: 26)
-                .background(Color.orange.opacity(0.11), in: Capsule())
-                .help(brokerUpgradeState.detail)
-                .accessibilityLabel(brokerUpgradeState.detail)
-        }
     }
 
     @ViewBuilder

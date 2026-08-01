@@ -28,13 +28,14 @@ Large product and architecture work remains ordered in
   pass removed several implementation terms (`50e00aa`, `949c4ef`).
 - Bounded PDF files now open in a native PDFKit surface with selection,
   scrolling, magnification, and accessibility; parsing stays off the main actor.
+- Truncated Markdown tables now state the exact number of rows not shown instead
+  of silently stopping after the bounded 100-row preview.
 
 ## Open audit fixes
 
 ### Preview correctness and interaction performance
 
-- Add a visible “more rows” marker for truncated Markdown tables and finish the
-  typed informational recovery banner.
+- Finish the typed informational recovery banner.
 - Split the preview monolith into bounded content units and keep installed-build
   performance gates for 1 MiB text, large structured data, PDFs, and image-heavy
   Markdown.

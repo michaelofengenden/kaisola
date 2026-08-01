@@ -1406,7 +1406,11 @@ final class WorkspaceFilesTests: XCTestCase {
         XCTAssertTrue(document.blocks.contains(.listItem(indent: 0, marker: "1.", text: "second")))
         XCTAssertTrue(document.blocks.contains(.quote("quoted")))
         XCTAssertTrue(document.blocks.contains(.code(language: "swift", text: "let answer = 42")))
-        XCTAssertTrue(document.blocks.contains(.table(headers: ["Name", "Value"], rows: [["alpha", "1"]])))
+        XCTAssertTrue(document.blocks.contains(.table(
+            headers: ["Name", "Value"],
+            rows: [["alpha", "1"]],
+            omittedRows: 0
+        )))
         XCTAssertTrue(document.blocks.contains(.heading(
             level: 2,
             text: "Setext heading",
@@ -1498,8 +1502,34 @@ final class WorkspaceFilesTests: XCTestCase {
             "| Name | Value |\n| --- | --- |\n| a\\|b | left\\|right\\\\tail next |\n"
         )
         XCTAssertTrue(MarkdownDocument.parse(replaced).blocks.contains(
-            .table(headers: ["Name", "Value"], rows: [["a|b", "left|right\\tail next"]])
+            .table(
+                headers: ["Name", "Value"],
+                rows: [["a|b", "left|right\\tail next"]],
+                omittedRows: 0
+            )
         ))
+    }
+
+    func testMarkdownTableTruncationReportsRowsThatAreNotRendered() throws {
+        let rows = (1...102).map { "| row \($0) | value \($0) |" }
+        let source = ([
+            "| Name | Value |",
+            "| --- | --- |",
+        ] + rows).joined(separator: "\n")
+
+        let document = MarkdownDocument.parse(source)
+        guard case let .table(headers, visibleRows, omittedRows) = try XCTUnwrap(document.blocks.first) else {
+            return XCTFail("Expected a Markdown table")
+        }
+        XCTAssertEqual(headers, ["Name", "Value"])
+        XCTAssertEqual(visibleRows.count, 100)
+        XCTAssertEqual(visibleRows.last, ["row 100", "value 100"])
+        XCTAssertEqual(omittedRows, 2)
+        XCTAssertEqual(
+            MarkdownTableTruncation.message(omittedRows: omittedRows),
+            "2 more rows not shown"
+        )
+        XCTAssertEqual(MarkdownTableTruncation.message(omittedRows: 1), "1 more row not shown")
     }
 
     func testWrappedListItemRendersAndEditsAsOneExactBlock() throws {

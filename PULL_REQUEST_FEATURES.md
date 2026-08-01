@@ -240,7 +240,8 @@ The audit pass adds live-file reconciliation, dirty conflict banners, encoding
 detection, binary sniffing, safe dead-end actions, notebook JSON rendering, and
 off-main cached Markdown images. A bounded native PDFKit preview now covers PDF
 selection, scrolling, magnification, and accessibility while parsing off the
-main actor. Finish the remaining large-document architecture.
+main actor, and bounded Markdown tables visibly disclose omitted rows. Finish
+the remaining large-document architecture.
 
 Scope:
 
@@ -248,8 +249,7 @@ Scope:
   viewport position and providing native Find without entering edit mode.
 - Parse CSV, JSON, and HTML readiness once per content/mtime and cache those
   results off the main thread.
-- Add visible Markdown table truncation disclosure, safe link-scheme routing,
-  and autosave flush before navigation.
+- Add safe link-scheme routing and autosave flush before navigation.
 - Split the preview monolith into recovery, tabs, editors, Markdown, assets, and
   content-preview units with typed notice/error channels.
 

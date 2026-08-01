@@ -4646,7 +4646,7 @@ struct MarkdownDocument: Equatable, Sendable {
         case listItem(indent: Int, marker: String, text: String)
         case quote(String)
         case code(language: String?, text: String)
-        case table(headers: [String], rows: [[String]])
+        case table(headers: [String], rows: [[String]], omittedRows: Int)
         case rule
     }
 
@@ -4776,7 +4776,12 @@ struct MarkdownDocument: Equatable, Sendable {
                     rows.append(tableCells(lines[index]))
                     index += 1
                 }
-                blocks.append(.table(headers: headers, rows: Array(rows.prefix(100))))
+                let visibleRows = Array(rows.prefix(100))
+                blocks.append(.table(
+                    headers: headers,
+                    rows: visibleRows,
+                    omittedRows: rows.count - visibleRows.count
+                ))
                 continue
             }
             paragraph.append(trimmed)
@@ -6099,25 +6104,38 @@ private struct MarkdownDocumentView: View {
             }
             .background(.quaternary.opacity(0.55), in: RoundedRectangle(cornerRadius: 10))
             .overlay(RoundedRectangle(cornerRadius: 10).strokeBorder(.quaternary))
-        case let .table(headers, rows):
-            MarkdownTable(
-                headers: headers,
-                rows: rows,
-                zoom: zoom,
-                blockLocation: sourceBlock.range.location,
-                activeCell: activeTableCell?.id,
-                activeText: activeTableTextBinding,
-                onBeginEdit: { row, column, text in
-                    beginEditingTableCell(
-                        blockLocation: sourceBlock.range.location,
-                        row: row,
-                        column: column,
-                        text: text
+        case let .table(headers, rows, omittedRows):
+            VStack(alignment: .leading, spacing: 7 * zoom) {
+                MarkdownTable(
+                    headers: headers,
+                    rows: rows,
+                    zoom: zoom,
+                    blockLocation: sourceBlock.range.location,
+                    activeCell: activeTableCell?.id,
+                    activeText: activeTableTextBinding,
+                    onBeginEdit: { row, column, text in
+                        beginEditingTableCell(
+                            blockLocation: sourceBlock.range.location,
+                            row: row,
+                            column: column,
+                            text: text
+                        )
+                    },
+                    onCommit: commitTableCellEdit,
+                    onCancel: { activeTableCell = nil }
+                )
+                if omittedRows > 0 {
+                    Label(
+                        MarkdownTableTruncation.message(omittedRows: omittedRows),
+                        systemImage: "ellipsis.rectangle"
                     )
-                },
-                onCommit: commitTableCellEdit,
-                onCancel: { activeTableCell = nil }
-            )
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .accessibilityLabel(
+                        MarkdownTableTruncation.message(omittedRows: omittedRows)
+                    )
+                }
+            }
         case .rule:
             Divider().padding(.vertical, 4)
         }
@@ -6166,6 +6184,13 @@ private struct MarkdownDocumentView: View {
         }
     }
 
+}
+
+enum MarkdownTableTruncation {
+    static func message(omittedRows: Int) -> String {
+        let noun = omittedRows == 1 ? "row" : "rows"
+        return "\(omittedRows) more \(noun) not shown"
+    }
 }
 
 private struct MarkdownTable: View {

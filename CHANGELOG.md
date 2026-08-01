@@ -22,7 +22,7 @@
 - An opt-in Files control follows files declared by the selected Chat or Mesh without treating transcript prose as a path.
 - Files and folders can move between project directories with collision checks, open-tab reconciliation, and exact Undo/Redo.
 - Long Chat and Mesh histories now open from a bounded SQLite tail; scrolling upward loads exact earlier pages without moving your reading position, while drafts, attachments, usage, costs, and continuation identity survive relaunch and the one-time JSON migration.
-- Broker-update groundwork now preserves verified helper generations outside the replaceable app bundle and routes old terminals by generation; live cutover stays disabled until an installed two-generation handoff passes.
+- Rolling broker updates now stage verified helper generations outside the replaceable app bundle, send all new terminals to the installed generation, keep existing PTYs on authenticated draining brokers, abort on activity or Companion-lease races, offer verified rollback, and retire only empty detached generations. The installed two-generation handoff passed with the original broker and PTY process IDs intact.
 
 ## 1.1.7 — 2026-07-31
 

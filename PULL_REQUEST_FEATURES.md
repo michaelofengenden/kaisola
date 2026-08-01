@@ -109,7 +109,8 @@ without terminating PTYs that are still owned by an older broker process.
 The immutable generation digest, parity reporting, authenticated empty-broker
 shutdown, automatic empty-broker replacement, and active-PTY preservation guard
 shipped in v1.0.0 and are recorded in [`CHANGELOG.md`](CHANGELOG.md). The
-remaining feature is multi-generation routing and drain retirement.
+generation-aware routing and drain-retirement slice below completes that
+continuity contract.
 
 Scope:
 
@@ -138,11 +139,16 @@ Scope:
   make rollback select an already verified generation rather than mutating a
   running process.
 
-Implementation status: foundation landed; live cutover remains safety-gated.
-Verified package staging, the registry/CAS contract, generation-specific
-sockets, broker-authoritative quiescence, multi-generation routing, and drain
-retirement contracts are present. Enablement waits on an installed
-two-generation live-PTY acceptance run.
+Implementation status: complete. Verified package staging, the private
+registry/CAS contract, generation-specific sockets, broker-authoritative
+quiescence, multi-generation routing, rollback selection, and empty-drain
+retirement are enabled.
+
+The 2026-08-01 installed same-path replacement gate kept predecessor broker PID
+57356 and PTY PID 57395 alive while the replacement generation became current
+and owned a newly created terminal. Releasing that old terminal advanced the
+registry from its two-generation cutover to a one-generation topology and
+retired only the now-empty predecessor.
 
 Acceptance:
 

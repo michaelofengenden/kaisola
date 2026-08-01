@@ -53,6 +53,9 @@ Large product and architecture work remains ordered in
   optimized and visual Xcode lanes compile the same confined editor contract.
 - The focused native test runner now handles verbose mode under macOS Bash 3
   without tripping strict nounset checks on an intentionally empty flag list.
+- A just-created terminal keeps its acknowledged broker generation when an
+  older in-flight inventory response arrives afterward; explicit release hands
+  lifecycle authority back without leaving a stale route.
 - Workspace FSEvents now publish bounded exact paths and detect dropped/root
   events. Loaded folders and cached search indexes patch only affected subtrees
   unless correctness requires a full bounded replacement walk.

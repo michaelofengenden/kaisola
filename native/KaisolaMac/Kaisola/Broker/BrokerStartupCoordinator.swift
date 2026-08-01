@@ -153,11 +153,11 @@ protocol BrokerGenerationRollbackServing: Sendable {
     func rollback(toGenerationID generationID: String) async throws -> BrokerInfo
 }
 
-/// Generation-aware routing is installed, but live cutover remains gated until
-/// an installed two-generation handoff proves PTY, Companion-lease, and drain
-/// retirement continuity end to end.
+/// The installed two-generation acceptance lane proves that a replaced app can
+/// keep an old PTY on its draining broker, route new work to the sealed current
+/// package, and retire the old process only after its last terminal is released.
 enum BrokerRollingUpdatePolicy {
-    static let clientRoutingEnabled = false
+    static let clientRoutingEnabled = true
 }
 
 struct LocatedBrokerInfoPreparer: BrokerInfoPreparing {

@@ -751,15 +751,31 @@ final class NativePreviewSettings: ObservableObject {
 /// Shared native visual grammar. Glass belongs to navigation and controls;
 /// terminals, transcripts, and documents intentionally remain opaque.
 enum KaisolaVisualSystem {
-    static let controlRadius: CGFloat = 7
-    static let insetRadius: CGFloat = 10
-    static let cardRadius: CGFloat = 12
-    static let shellRadius: CGFloat = 16
+    /// The corner ladder, from the smallest control to the window itself.
+    ///
+    /// v1.1.8 bumps every rung one step (shell 16 → 20, chrome 15 → 18, and
+    /// each nested radius proportionally). The numbers are only half the
+    /// contract: what keeps the chrome coherent is that they stay *strictly
+    /// increasing* outward, so a shape nested inside another is always the
+    /// rounder one's junior. `testCornerLadderIsStrictlyIncreasingOutward`
+    /// holds that, and it is the check a future "make it rounder" pass has to
+    /// keep green rather than a list of literals to edit past.
+    static let controlRadius: CGFloat = 8
+    /// A session pane card, which sits *inside* the detail chrome panel. Was a
+    /// bare `8` written inline in `RootShellView.unifiedSessionCard`; naming it
+    /// is what puts it on the ladder at all.
+    static let paneRadius: CGFloat = 10
+    static let insetRadius: CGFloat = 12
+    static let cardRadius: CGFloat = 14
+    /// The document-preview and Files panels, which are nested one level inside
+    /// the detail chrome panel and so stay a step under `chromeRadius`.
+    static let panelRadius: CGFloat = 16
+    static let shellRadius: CGFloat = 20
     /// Safari's inset floating-card chrome: the radius of the sidebar and
     /// detail panels that float over the window backdrop. Larger than
     /// `cardRadius` (which belongs to session cards *inside* a panel) and
     /// smaller than `shellRadius` (the window itself).
-    static let chromeRadius: CGFloat = 15
+    static let chromeRadius: CGFloat = 18
     /// The gutter of window backdrop left visible around each chrome panel.
     static let chromeInset: CGFloat = 6
     static let hairline: CGFloat = 0.5
@@ -1365,16 +1381,25 @@ enum DesktopBackdropRenderer {
     /// story and no locatable shape. The cost is unchanged in practice: this is
     /// 176px once per wallpaper, not the backing store per frame.
     static let blurRadius: Double = 28
-    /// No saturation boost.
+    /// A slight saturation *cut*.
     ///
     /// This was 1.3, from the era when a heavy veil ate most of the desktop's
     /// chroma and the bake had to shout to be heard through it. Under a 0.60
     /// veil it inverted: the sidebar measured a 0.53 peak channel spread
     /// against the raw desktop's 0.33 — Kaisola's "glass" was more saturated
     /// than the wallpaper it was imitating, which is precisely what made it
-    /// read as a photograph. 1.0 is the wallpaper's own colour, and the veil
-    /// alone decides how much of it arrives.
-    static let saturation: Double = 1.0
+    /// read as a photograph. 1.0 was the correction, and it landed the
+    /// composite at the wallpaper's own chroma.
+    ///
+    /// v1.1.8 takes one more step down, to 0.85. The remaining complaint was
+    /// not that the surface was *bright* but that it was **colourful** —
+    /// whatever hue the desktop happened to carry arrived at full strength and
+    /// the chrome changed personality with the wallpaper. Damping the still's
+    /// chroma by 15% keeps the desktop legibly present while moving the surface
+    /// toward a material of its own, and the warmth it loses is put back
+    /// deliberately and in one known hue by `GlassWarmth` rather than being
+    /// borrowed from whatever picture is on the desktop.
+    static let saturation: Double = 0.85
 
     /// Mean luminance the baked still is moved to, per appearance.
     ///
@@ -1799,6 +1824,42 @@ final class DesktopBackdropProvider: ObservableObject {
     }
 }
 
+/// The one **deliberately non-neutral** layer in the glass stack.
+///
+/// Everything else the app declares as a backdrop constant is achromatic, and
+/// `testDeclaredNeutralConstantsAreAchromatic` enforces that per-channel — that
+/// invariant is what caught the `#0B0C12` blue-purple cast, and it must not be
+/// weakened. So the v1.1.8 warmth is *not* a warmer "neutral": it is a separate,
+/// named, exempt constant with its own test (`testGlassWarmthIsADeclaredAmber`)
+/// pinning its hue and its coverage. Anything that wants to be warm has to say
+/// so here; anything that claims to be neutral still has to prove it there.
+///
+/// One flat amber laid over the baked still, before the veil. It is not a
+/// gradient and not appearance-dependent: the veil above already carries the
+/// light direction and the light/dark balance, and a second gradient under it
+/// only muddies both. At 4% over a luminance-normalized still it moves the
+/// composite by roughly one step of chroma — the surface reads *slightly
+/// warmer*, the way a warm-white room does, rather than orange.
+enum GlassWarmth {
+    /// `#FFB070`. A high-value amber rather than a saturated orange: the layer
+    /// is applied at a few percent, so what matters is the direction it pulls
+    /// the composite, and a dark or heavily saturated tint at this coverage
+    /// pulls toward *grey-brown* instead of toward warm.
+    static let red = 1.0
+    static let green = 176.0 / 255
+    static let blue = 112.0 / 255
+
+    /// Coverage, in both appearances.
+    ///
+    /// Deliberately one number. A per-appearance split reads as a tuning knob
+    /// and invites drift; the still underneath is already luminance-normalized
+    /// (see `DesktopBackdropRenderer.targetLuminance`), so the same coverage
+    /// lands on comparable ground in light and dark.
+    static let opacity = 0.04
+
+    static var color: Color { Color(red: red, green: green, blue: blue) }
+}
+
 /// The desktop layer beneath a glass veil.
 ///
 /// This is the layer the wallpaper-only request is about: in `.wallpaper` mode
@@ -1870,6 +1931,11 @@ struct DesktopGlassLayer: View {
                 .resizable()
                 .interpolation(.high)
                 .antialiased(true)
+                // The declared warm layer (v1.1.8), over the still and under
+                // the veil. Over, so the desaturated wallpaper is what it warms
+                // rather than the other way round; under, because the veil is
+                // what decides how much of this whole composite arrives.
+                .overlay(GlassWarmth.color.opacity(GlassWarmth.opacity))
                 .allowsHitTesting(false)
         case let .flat(tint):
             let color = Color(red: tint.red, green: tint.green, blue: tint.blue)
@@ -1882,6 +1948,9 @@ struct DesktopGlassLayer: View {
                 endPoint: .bottom
             )
             .background(Color(nsColor: .windowBackgroundColor))
+            // The no-wallpaper rung gets the same warmth, so the two paths do
+            // not read as two different materials.
+            .overlay(GlassWarmth.color.opacity(GlassWarmth.opacity))
         }
     }
 }

@@ -173,9 +173,9 @@ struct WorkspaceRailView: View {
         .background {
             SidebarBackdropView(appearance: settings.sidebarAppearance)
         }
-        .clipShape(RoundedRectangle(cornerRadius: 13, style: .continuous))
+        .clipShape(RoundedRectangle(cornerRadius: KaisolaVisualSystem.panelRadius, style: .continuous))
         .overlay {
-            RoundedRectangle(cornerRadius: 13, style: .continuous)
+            RoundedRectangle(cornerRadius: KaisolaVisualSystem.panelRadius, style: .continuous)
                 .stroke(Color(nsColor: .separatorColor).opacity(0.52), lineWidth: 0.65)
         }
         .padding(4)

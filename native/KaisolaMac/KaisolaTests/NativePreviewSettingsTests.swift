@@ -993,7 +993,51 @@ final class NativePreviewSettingsTests: XCTestCase {
     /// the "glass" was more colourful than the wallpaper it imitated. The veil
     /// decides how much desktop arrives; the bake must not put a thumb on it.
     func testWallpaperBakeCarriesNoSaturationBoost() {
-        XCTAssertEqual(DesktopBackdropRenderer.saturation, 1.0, accuracy: 0.0001)
+        // v1.1.8 goes one step further and CUTS chroma to 0.85: the surface
+        // should not change personality with the desktop picture. The ceiling is
+        // what this test is really for — the bake must never boost again — and
+        // the floor keeps the cut from sliding toward a greyscale still, which
+        // would make the whole painted-wallpaper layer pointless.
+        XCTAssertEqual(DesktopBackdropRenderer.saturation, 0.85, accuracy: 0.0001)
+        XCTAssertLessThanOrEqual(DesktopBackdropRenderer.saturation, 1.0)
+        XCTAssertGreaterThan(DesktopBackdropRenderer.saturation, 0.6)
+    }
+
+    /// The warmth is a SEPARATE, DECLARED constant, and that is the point.
+    ///
+    /// `testDeclaredNeutralConstantsAreAchromatic` is what caught the
+    /// `#0B0C12` blue-purple cast, and the only safe way to add warmth without
+    /// weakening it is to keep every "neutral" honest and put the chroma
+    /// somewhere that says out loud that it is chroma. `GlassWarmth` is that
+    /// place, it is deliberately absent from the neutrals list over there, and
+    /// this is the test that stops it from becoming a licence to drift: it has
+    /// to stay an amber, and it has to stay barely there.
+    func testGlassWarmthIsADeclaredAmber() {
+        // Warm means red leads and blue trails. Anything else is a different
+        // decision wearing this constant's name.
+        XCTAssertGreaterThan(GlassWarmth.red, GlassWarmth.green)
+        XCTAssertGreaterThan(GlassWarmth.green, GlassWarmth.blue)
+
+        // …in the amber/orange band, not red and not yellow. Hue in degrees,
+        // computed the standard way from the max/min channels.
+        let maximum = max(GlassWarmth.red, GlassWarmth.green, GlassWarmth.blue)
+        let minimum = min(GlassWarmth.red, GlassWarmth.green, GlassWarmth.blue)
+        let delta = maximum - minimum
+        XCTAssertGreaterThan(delta, 0, "a warm layer with no chroma is not a warm layer")
+        let hue = 60 * ((GlassWarmth.green - GlassWarmth.blue) / delta)
+        XCTAssertGreaterThan(hue, 15, "that is red, not warmth")
+        XCTAssertLessThan(hue, 45, "that is yellow, not warmth")
+
+        // A high-value amber: at a few percent coverage a dark tint pulls the
+        // composite toward grey-brown instead of toward warm.
+        XCTAssertGreaterThan(GlassWarmth.red, 0.9)
+
+        // And it stays a hint. The ceiling is the whole safety argument — at 8%
+        // this stops being warmth and starts being a tint, which is the thing
+        // the neutrality invariant exists to prevent.
+        XCTAssertEqual(GlassWarmth.opacity, 0.04, accuracy: 0.0001)
+        XCTAssertLessThan(GlassWarmth.opacity, 0.08)
+        XCTAssertGreaterThan(GlassWarmth.opacity, 0.02, "deleted in all but name")
     }
 
     /// Gaussians compose by variance, so raising the radius from 12 to 28 adds
@@ -1448,6 +1492,40 @@ final class NativePreviewSettingsTests: XCTestCase {
         XCTAssertGreaterThan(KaisolaVisualSystem.chromeRadius, KaisolaVisualSystem.cardRadius)
         XCTAssertLessThan(KaisolaVisualSystem.chromeRadius, KaisolaVisualSystem.shellRadius)
         XCTAssertEqual(KaisolaVisualSystem.chromeInset, 6)
+    }
+
+    /// v1.1.8 made everything a step rounder. The literals matter less than the
+    /// shape of the ladder: a corner nested inside another must be the tighter
+    /// one, or the inner shape's arc crosses its container's and the chrome
+    /// reads as two unrelated rounding systems.
+    ///
+    /// Stated as the whole ordering rather than as one `chromeRadius <
+    /// shellRadius` pair, because the pass that broke it would be exactly the
+    /// pass that bumps one rung and forgets its neighbour.
+    func testCornerLadderIsStrictlyIncreasingOutward() {
+        let ladder: [(String, CGFloat)] = [
+            ("control", KaisolaVisualSystem.controlRadius),
+            ("pane", KaisolaVisualSystem.paneRadius),
+            ("inset", KaisolaVisualSystem.insetRadius),
+            ("card", KaisolaVisualSystem.cardRadius),
+            ("panel", KaisolaVisualSystem.panelRadius),
+            ("chrome", KaisolaVisualSystem.chromeRadius),
+            ("shell", KaisolaVisualSystem.shellRadius),
+        ]
+        for (inner, outer) in zip(ladder, ladder.dropFirst()) {
+            XCTAssertLessThan(
+                inner.1,
+                outer.1,
+                "\(inner.0)Radius must stay tighter than \(outer.0)Radius"
+            )
+        }
+        XCTAssertEqual(KaisolaVisualSystem.shellRadius, 20)
+        XCTAssertEqual(KaisolaVisualSystem.chromeRadius, 18)
+
+        // The rail's active-project capsule uses `insetRadius` inside a 32pt
+        // row, so it has to stay under half the row height or the capsule turns
+        // into a stadium and stops reading as a rectangle at all.
+        XCTAssertLessThan(KaisolaVisualSystem.insetRadius, 16)
     }
 
     func testTerminalPaneGridKeepsSessionsReadable() {

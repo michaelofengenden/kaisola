@@ -1504,7 +1504,9 @@ struct RootShellView: View {
 
     private func unifiedSessionCard(_ id: String) -> some View {
         GeometryReader { geometry in
-            let cardRadius: CGFloat = 8
+            // On the shared corner ladder since v1.1.8; it was a bare literal 8
+            // and so sat outside every relation the rest of the chrome holds.
+            let cardRadius = KaisolaVisualSystem.paneRadius
             VStack(spacing: 0) {
                 unifiedSessionHeader(id)
                 unifiedSessionContent(id)

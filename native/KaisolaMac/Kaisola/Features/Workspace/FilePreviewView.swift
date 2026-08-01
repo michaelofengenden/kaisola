@@ -1657,9 +1657,9 @@ struct FilePreviewView: View {
             }
         }
         .background(Color(nsColor: .textBackgroundColor))
-        .clipShape(RoundedRectangle(cornerRadius: 13, style: .continuous))
+        .clipShape(RoundedRectangle(cornerRadius: KaisolaVisualSystem.panelRadius, style: .continuous))
         .overlay {
-            RoundedRectangle(cornerRadius: 13, style: .continuous)
+            RoundedRectangle(cornerRadius: KaisolaVisualSystem.panelRadius, style: .continuous)
                 .stroke(Color.primary.opacity(0.10), lineWidth: 0.8)
         }
         .onAppear {

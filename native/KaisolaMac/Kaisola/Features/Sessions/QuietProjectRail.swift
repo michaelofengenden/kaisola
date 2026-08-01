@@ -186,10 +186,15 @@ private enum QuietRailMetrics {
     static let mark: CGFloat = QuietIdentityMarkView.slot
     static let markGap: CGFloat = 8
     static let dot: CGFloat = 6
-    /// A session sits one mark-width in from its project, no further: the row's
-    /// scarce resource is title width, and every point spent on the indent is a
-    /// point the title loses.
-    static let sessionIndent: CGFloat = 18
+    /// A session sits a clear step in from its project row's leading edge.
+    ///
+    /// The v1.1.5 width-budget work cut this to 18pt — one mark-width past the
+    /// project row's own 8pt inset, a 10pt step the eye read as "slightly
+    /// ragged" rather than "nested". v1.1.6 pays for a 22pt step out of the
+    /// wider default sidebar (`projectSidebarIdealWidth`, 200 → 248) instead of
+    /// out of the title, so the hierarchy is unmistakable and the title lane is
+    /// still wider than it was before. `QuietRowBudget` holds the arithmetic.
+    static let sessionIndent: CGFloat = 30
     /// One cadence for every row in the rail: sessions, compact projects and
     /// the pinned project header all measure 32pt.
     static let rowHeight: CGFloat = 32
@@ -227,6 +232,17 @@ private enum QuietRailMetrics {
 /// lane that could not be compressed, leaving a 200pt sidebar's title 56pt —
 /// seven characters. Stating the budget as arithmetic gives that a test.
 enum QuietRowBudget {
+    /// Leading inset of a project row (pinned header or compact row).
+    static let projectIndent: CGFloat = QuietRailMetrics.horizontalInset
+    /// Leading inset of a surface row (session, chat, mesh) and of the rail's
+    /// "New session" / "No activity yet" rows, which share the same column.
+    static let sessionIndent: CGFloat = QuietRailMetrics.sessionIndent
+    /// The hierarchy step: how much deeper a session's mark starts than its
+    /// project's. Stated as arithmetic so "sessions must sit clearly deeper
+    /// than project rows" is a test rather than a pair of literals that can
+    /// drift back together the next time the title lane needs points.
+    static var indentStep: CGFloat { sessionIndent - projectIndent }
+
     /// - Parameters:
     ///   - sidebarWidth: the navigation column's width. Rows span it entirely;
     ///     see `QuietRailMetrics.listRowBleed`.
@@ -415,9 +431,15 @@ private struct QuietProjectGroup: View {
         for (id, status) in statuses { note(id, status) }
     }
 
-    /// The pinned (active) project. Only the project's *name* carries its tint;
-    /// the background is the same neutral wash focused surfaces use, so no tint
-    /// fill appears anywhere in the rail.
+    /// The pinned (active) project, drawn on its own tinted glass capsule.
+    ///
+    /// This is the one place in the rail where colour is *identity* rather than
+    /// status, and it is deliberate: the capsule is what says "this is the
+    /// project you are in". Its language is the approved v1.1.6 mock's —
+    /// a shallow tint gradient, a lit top edge and a hairline tint stroke (see
+    /// `QuietActiveGlass`) — restrained enough that the status dots two columns
+    /// over still read first. Name and mark keep the same tint, so the row is
+    /// one object rather than a coloured box with grey contents.
     private func pinnedHeader(statuses: [String: QuietSessionStatus]) -> some View {
         HStack(spacing: 6) {
             // A real Button, not a tap gesture: it is what gives the header a
@@ -483,7 +505,7 @@ private struct QuietProjectGroup: View {
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         .contentShape(Rectangle())
-        .background { QuietSelectionWash() }
+        .background { QuietActiveProjectGlass(tint: tint) }
         .modifier(projectRowChrome)
     }
 
@@ -855,13 +877,94 @@ private struct QuietRollupView: View {
 
 // MARK: - Row anatomy
 
-/// The rail's only background fill: a neutral wash, inset from the rail edges.
-/// Never tinted — colour in the sidebar means status, not identity.
+/// A focused surface's background: a neutral wash, inset from the rail edges.
+/// Never tinted — on a *surface* row colour means status, not identity. The
+/// active project's own capsule is the single deliberate exception; see
+/// `QuietActiveProjectGlass`.
 private struct QuietSelectionWash: View {
     var body: some View {
         RoundedRectangle(cornerRadius: KaisolaVisualSystem.insetRadius, style: .continuous)
             .fill(Color.primary.opacity(QuietRailMetrics.washOpacity))
             .padding(.horizontal, 6)
+    }
+}
+
+/// Every number the active project's tinted glass capsule is made of.
+///
+/// Stated as one table rather than inline literals because the whole risk of
+/// this treatment is drift toward candy: each value is the *ceiling* the mock
+/// approved, and the relationships between them (top heavier than bottom, the
+/// lit edge brighter in light mode than in dark, every value well under half)
+/// are what keep it reading as glass rather than as a coloured chip. Tested.
+enum QuietActiveGlass {
+    /// Tint alpha at the capsule's top edge…
+    static let topFillOpacity: Double = 0.18
+    /// …and at its bottom, so the fill falls away rather than sitting flat.
+    static let bottomFillOpacity: Double = 0.08
+    /// Hairline tint stroke: enough to draw the capsule's edge against a busy
+    /// wallpaper, not enough to outline it.
+    static let strokeOpacity: Double = 0.26
+    /// The 1pt lit top edge that makes the capsule read as a reflective
+    /// surface. Light mode can carry a bright specular; dark mode cannot —
+    /// white at that strength on a dark rail reads as a seam, not a highlight.
+    static func highlightOpacity(dark: Bool) -> Double { dark ? 0.12 : 0.35 }
+    /// Where the highlight has faded to nothing, as a fraction of row height.
+    /// It is a *top* highlight: past this point the capsule is only its tint.
+    static let highlightFalloff: Double = 0.5
+}
+
+/// The active project's tint as a reflective glass capsule.
+///
+/// Three layers, cheapest first: a vertical tint gradient, a hairline tint
+/// stroke on the border, and a 1pt white inner edge along the top that fades
+/// out by mid-row. No material and no blur — the sidebar's backdrop is already
+/// one live layer (v1.1.5) and stacking a second one here is exactly the cost
+/// that got the old four-layer sidebar card deleted.
+private struct QuietActiveProjectGlass: View {
+    let tint: Color
+
+    @Environment(\.colorScheme) private var colorScheme
+
+    private var shape: RoundedRectangle {
+        RoundedRectangle(cornerRadius: KaisolaVisualSystem.insetRadius, style: .continuous)
+    }
+
+    private var highlight: Color {
+        .white.opacity(QuietActiveGlass.highlightOpacity(dark: colorScheme == .dark))
+    }
+
+    var body: some View {
+        shape
+            .fill(
+                LinearGradient(
+                    colors: [
+                        tint.opacity(QuietActiveGlass.topFillOpacity),
+                        tint.opacity(QuietActiveGlass.bottomFillOpacity),
+                    ],
+                    startPoint: .top,
+                    endPoint: .bottom
+                )
+            )
+            // `strokeBorder`, not `stroke`: the hairline has to sit inside the
+            // capsule, or half of it lands on the neighbouring row's pixels.
+            .overlay { shape.strokeBorder(tint.opacity(QuietActiveGlass.strokeOpacity), lineWidth: 1) }
+            .overlay {
+                shape
+                    .inset(by: 0.5)
+                    .stroke(
+                        LinearGradient(
+                            stops: [
+                                .init(color: highlight, location: 0),
+                                .init(color: highlight.opacity(0), location: QuietActiveGlass.highlightFalloff),
+                            ],
+                            startPoint: .top,
+                            endPoint: .bottom
+                        ),
+                        lineWidth: 1
+                    )
+            }
+            .padding(.horizontal, 6)
+            .accessibilityHidden(true)
     }
 }
 

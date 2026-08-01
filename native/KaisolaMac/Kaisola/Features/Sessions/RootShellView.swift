@@ -2354,8 +2354,15 @@ enum NativeWorkspaceChrome {
     static let chromePanelTopInset: CGFloat = 46
     static let topBarTrafficLightClearance: CGFloat = 76
     static let projectSidebarMinimumWidth: CGFloat = 168
-    static let projectSidebarIdealWidth: CGFloat = 200
-    static let projectSidebarMaximumWidth: CGFloat = 260
+    /// The rail's resting width. Raised from 200 in v1.1.6: the row grammar
+    /// (indent · mark · title · time · dot) needs more than 200pt before a
+    /// session title reads as a title *and* the hierarchy step between a
+    /// project row and its sessions is visible. The extra points are spent on
+    /// both — see `QuietRowBudget`.
+    static let projectSidebarIdealWidth: CGFloat = 248
+    /// Raised alongside the ideal so a user who wants long titles can have
+    /// them; the minimum is unchanged, so nothing about the narrow rail moves.
+    static let projectSidebarMaximumWidth: CGFloat = 340
     static let projectSidebarDividerWidth: CGFloat = 1
     /// Centered across the visible divider, not laid wholly inside either pane.
     ///

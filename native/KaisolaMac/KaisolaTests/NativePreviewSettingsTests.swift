@@ -1165,10 +1165,14 @@ final class NativePreviewSettingsTests: XCTestCase {
         XCTAssertEqual(NativeWorkspaceChrome.topBarTrafficLightClearance, 76)
     }
 
+    /// v1.1.6 widened the resting rail (200 → 248) and its ceiling (260 → 340)
+    /// to pay for a visible hierarchy step between a project row and its
+    /// sessions, and for a footer that can show a whole account name. The
+    /// *minimum* is deliberately unchanged: nothing about the narrow rail moves.
     func testProjectSidebarHasComfortableResizableWidth() {
         XCTAssertEqual(NativeWorkspaceChrome.projectSidebarMinimumWidth, 168)
-        XCTAssertEqual(NativeWorkspaceChrome.projectSidebarIdealWidth, 200)
-        XCTAssertEqual(NativeWorkspaceChrome.projectSidebarMaximumWidth, 260)
+        XCTAssertEqual(NativeWorkspaceChrome.projectSidebarIdealWidth, 248)
+        XCTAssertEqual(NativeWorkspaceChrome.projectSidebarMaximumWidth, 340)
         XCTAssertEqual(NativeWorkspaceChrome.projectSidebarDividerWidth, 1)
     }
 

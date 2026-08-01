@@ -1,3 +1,4 @@
+import SwiftUI
 import XCTest
 @testable import Kaisola
 
@@ -127,6 +128,78 @@ final class QuietIdentityMarkTests: XCTestCase {
             ),
             80
         )
+    }
+
+    // MARK: - Hierarchy step
+
+    /// The complaint this covers: after the v1.1.5 width-budget work a session
+    /// sat 10pt in from its project row, which the eye read as a ragged edge
+    /// rather than as nesting. The step is now paid for out of the wider
+    /// default sidebar, so it does not come back out of the title.
+    func testSessionsSitClearlyDeeperThanTheirProjectRow() {
+        XCTAssertGreaterThan(
+            QuietRowBudget.sessionIndent,
+            QuietRowBudget.projectIndent,
+            "sessions must not start on the same column as their project"
+        )
+        XCTAssertGreaterThanOrEqual(
+            QuietRowBudget.indentStep,
+            QuietIdentityMarkView.slot,
+            "the hierarchy step is narrower than one identity mark — it reads as ragged, not nested"
+        )
+    }
+
+    /// Item 3 and item 2 are one trade: the indent grew, so the sidebar had to.
+    /// Assert the *outcome* — that the wider default really did buy both — so a
+    /// future width tweak cannot quietly re-flatten the rail.
+    func testTheWiderDefaultSidebarPaysForTheDeeperIndent() {
+        XCTAssertGreaterThan(NativeWorkspaceChrome.projectSidebarIdealWidth, 200)
+        XCTAssertGreaterThan(
+            NativeWorkspaceChrome.projectSidebarMaximumWidth,
+            NativeWorkspaceChrome.projectSidebarIdealWidth
+        )
+        XCTAssertEqual(NativeWorkspaceChrome.projectSidebarMinimumWidth, 168, "the narrow rail must not move")
+
+        let timeFont = NSFont.monospacedDigitSystemFont(ofSize: 10.5, weight: .regular)
+        let timeWidth = ("now" as NSString).size(withAttributes: [.font: timeFont]).width
+
+        // The title lane at the new default is wider than it was at the old
+        // one, *after* paying for the deeper indent.
+        let now = QuietRowBudget.titleWidth(
+            sidebarWidth: NativeWorkspaceChrome.projectSidebarIdealWidth,
+            timeLabelWidth: timeWidth,
+            showsReveal: false
+        )
+        let before = 200 - 18 - 10 - QuietIdentityMarkView.slot - 8 - 5 - (timeWidth + 5 + 6)
+        XCTAssertGreaterThan(now, before, "the wider sidebar was spent entirely on the indent")
+    }
+
+    // MARK: - Active project glass
+
+    /// The whole risk of a tinted row is drift toward candy. These are the
+    /// ceilings the mock approved; the relationships between them are what keep
+    /// it reading as glass.
+    func testActiveProjectGlassStaysRestrained() {
+        XCTAssertGreaterThan(QuietActiveGlass.topFillOpacity, QuietActiveGlass.bottomFillOpacity,
+                             "a flat fill is a coloured chip, not glass")
+        XCTAssertLessThan(QuietActiveGlass.topFillOpacity, 0.25, "the tint is a wash, not a fill")
+        XCTAssertGreaterThan(QuietActiveGlass.strokeOpacity, QuietActiveGlass.topFillOpacity,
+                             "the edge must read against the fill")
+        XCTAssertLessThan(QuietActiveGlass.strokeOpacity, 0.4, "that is an outline, not a hairline")
+
+        // The lit top edge: bright in light mode, barely there in dark, where
+        // white at light-mode strength reads as a seam.
+        XCTAssertGreaterThan(
+            QuietActiveGlass.highlightOpacity(dark: false),
+            QuietActiveGlass.highlightOpacity(dark: true)
+        )
+        XCTAssertLessThan(QuietActiveGlass.highlightOpacity(dark: true), 0.2)
+        XCTAssertLessThan(QuietActiveGlass.highlightOpacity(dark: false), 0.5)
+
+        // It is a *top* highlight: it has to be gone before the row's bottom
+        // edge, or it is a second fill.
+        XCTAssertLessThanOrEqual(QuietActiveGlass.highlightFalloff, 0.6)
+        XCTAssertGreaterThan(QuietActiveGlass.highlightFalloff, 0)
     }
 
     // MARK: - Compact-list drag mapping

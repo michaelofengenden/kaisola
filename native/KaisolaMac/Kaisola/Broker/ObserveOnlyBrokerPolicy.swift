@@ -24,6 +24,7 @@ enum ObserveOnlyBrokerPolicy {
         "terminal.detachRenderer",
         "terminal.detachOwner",
         "terminal.agentTurn",
+        "terminal.controlLease",
         "terminal.setFocused",
         "terminal.snapshot",
         "terminal.output",

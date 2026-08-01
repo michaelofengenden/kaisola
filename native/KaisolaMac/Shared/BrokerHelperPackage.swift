@@ -356,6 +356,153 @@ enum BrokerHelperPackageVerification {
     }
 }
 
+/// Copies one already verified helper package out of the replaceable `.app`
+/// bundle into a private, digest-addressed generation directory. The final
+/// path is immutable by convention: an existing directory is reused only when
+/// every byte still verifies against the sealed source manifest. A mismatch
+/// fails closed instead of repairing over evidence of tampering.
+enum BrokerHelperPackageStaging {
+    static func stage(
+        _ source: VerifiedBrokerHelperPackage,
+        at requestedDestination: URL,
+        currentUserID: uid_t = getuid()
+    ) throws -> VerifiedBrokerHelperPackage {
+        let destination = requestedDestination.standardizedFileURL
+        let generations = destination.deletingLastPathComponent()
+        guard generations.lastPathComponent == "broker-generations",
+              destination.lastPathComponent == source.manifest.contentDigest else {
+            throw BrokerHelperPackageError.unsafeStagingPath
+        }
+        try preparePrivateDirectory(generations, currentUserID: currentUserID)
+
+        if FileManager.default.fileExists(atPath: destination.path) {
+            return try verifiedExisting(
+                destination,
+                expected: source.manifest,
+                currentUserID: currentUserID
+            )
+        }
+
+        let temporary = generations.appendingPathComponent(
+            ".stage-\(source.manifest.contentDigest)-\(getpid())-\(UUID().uuidString.lowercased())",
+            isDirectory: true
+        )
+        var temporaryExists = false
+        defer {
+            if temporaryExists { try? FileManager.default.removeItem(at: temporary) }
+        }
+        do {
+            try FileManager.default.copyItem(at: source.root, to: temporary)
+            temporaryExists = true
+            guard chmod(temporary.path, 0o700) == 0 else {
+                throw BrokerHelperPackageError.unsafePermissions
+            }
+            let copied = try BrokerHelperPackageVerification.verify(
+                root: temporary,
+                requireSignatures: false,
+                currentUserID: currentUserID
+            )
+            guard copied.manifest == source.manifest else {
+                throw BrokerHelperPackageError.stagedPackageMismatch
+            }
+            try synchronize(copied)
+            do {
+                try FileManager.default.moveItem(at: temporary, to: destination)
+                temporaryExists = false
+            } catch {
+                // A second window may have won the same digest-addressed stage
+                // race. Adopt only its independently verified exact bytes.
+                if FileManager.default.fileExists(atPath: destination.path) {
+                    return try verifiedExisting(
+                        destination,
+                        expected: source.manifest,
+                        currentUserID: currentUserID
+                    )
+                }
+                throw error
+            }
+            try synchronizeDirectory(generations)
+            return try verifiedExisting(
+                destination,
+                expected: source.manifest,
+                currentUserID: currentUserID
+            )
+        } catch let error as BrokerHelperPackageError {
+            throw error
+        } catch {
+            throw BrokerHelperPackageError.couldNotStage
+        }
+    }
+
+    private static func verifiedExisting(
+        _ destination: URL,
+        expected: BrokerHelperManifest,
+        currentUserID: uid_t
+    ) throws -> VerifiedBrokerHelperPackage {
+        let verified: VerifiedBrokerHelperPackage
+        do {
+            verified = try BrokerHelperPackageVerification.verify(
+                root: destination,
+                requireSignatures: false,
+                currentUserID: currentUserID
+            )
+        } catch {
+            throw BrokerHelperPackageError.stagedPackageMismatch
+        }
+        guard verified.manifest == expected else {
+            throw BrokerHelperPackageError.stagedPackageMismatch
+        }
+        return verified
+    }
+
+    private static func preparePrivateDirectory(_ url: URL, currentUserID: uid_t) throws {
+        var value = stat()
+        if lstat(url.path, &value) == 0 {
+            guard value.st_uid == currentUserID,
+                  value.st_mode & S_IFMT == S_IFDIR,
+                  value.st_mode & 0o077 == 0 else {
+                throw BrokerHelperPackageError.unsafePermissions
+            }
+            return
+        }
+        guard errno == ENOENT else { throw BrokerHelperPackageError.unsafePermissions }
+        try FileManager.default.createDirectory(
+            at: url,
+            withIntermediateDirectories: true,
+            attributes: [.posixPermissions: 0o700]
+        )
+        guard chmod(url.path, 0o700) == 0,
+              lstat(url.path, &value) == 0,
+              value.st_uid == currentUserID,
+              value.st_mode & S_IFMT == S_IFDIR,
+              value.st_mode & 0o077 == 0 else {
+            throw BrokerHelperPackageError.unsafePermissions
+        }
+    }
+
+    private static func synchronize(_ package: VerifiedBrokerHelperPackage) throws {
+        for record in package.manifest.files {
+            try synchronizeFile(package.root.appendingPathComponent(record.path))
+        }
+        try synchronizeFile(package.root.appendingPathComponent("manifest.json"))
+        try synchronizeDirectory(package.root)
+    }
+
+    private static func synchronizeFile(_ url: URL) throws {
+        let descriptor = open(url.path, O_RDONLY | O_NOFOLLOW)
+        guard descriptor >= 0 else { throw BrokerHelperPackageError.couldNotStage }
+        defer { Darwin.close(descriptor) }
+        guard fsync(descriptor) == 0 else { throw BrokerHelperPackageError.couldNotStage }
+    }
+
+    private static func synchronizeDirectory(_ url: URL) throws {
+        let descriptor = open(url.path, O_RDONLY | O_DIRECTORY | O_NOFOLLOW)
+        guard descriptor >= 0 else { throw BrokerHelperPackageError.couldNotStage }
+        defer { Darwin.close(descriptor) }
+        guard fsync(descriptor) == 0 else { throw BrokerHelperPackageError.couldNotStage }
+    }
+}
+
 enum BrokerHelperPackageError: Error, Equatable, LocalizedError {
     case notPackaged
     case invalidManifest
@@ -366,6 +513,9 @@ enum BrokerHelperPackageError: Error, Equatable, LocalizedError {
     case unsealedHostApplication
     case unsignedNestedCode(String)
     case signatureMismatch(String)
+    case unsafeStagingPath
+    case stagedPackageMismatch
+    case couldNotStage
 
     var errorDescription: String? {
         switch self {
@@ -387,6 +537,12 @@ enum BrokerHelperPackageError: Error, Equatable, LocalizedError {
             "The bundled terminal helper contains unsigned code at \(path)."
         case let .signatureMismatch(path):
             "The bundled terminal helper signature is invalid at \(path)."
+        case .unsafeStagingPath:
+            "The terminal helper generation path is invalid."
+        case .stagedPackageMismatch:
+            "The staged terminal helper no longer matches its sealed generation."
+        case .couldNotStage:
+            "The terminal helper generation could not be staged durably."
         }
     }
 }

@@ -272,7 +272,7 @@ function preflight(options) {
   const bootstrapArchitectures = requireExactArchitectures(architectures(bootstrap), 'broker bootstrap')
   const manifest = JSON.parse(fs.readFileSync(manifestFile, 'utf8'))
   requireExactArchitectures(manifest?.node?.architectures || [], 'helper manifest Node runtime')
-  if (manifest.schemaVersion !== 1 || manifest.brokerImplementationVersion !== 1) {
+  if (manifest.schemaVersion !== 1 || manifest.brokerImplementationVersion !== 2) {
     fail('helper manifest version is outside this preflight policy')
   }
   if (!/^[0-9a-f]{64}$/.test(String(manifest.contentDigest || ''))) {

@@ -23,6 +23,7 @@ const {
   TERMINAL_HISTORY_FEATURE,
   OBSERVER_ROLE_FEATURE,
   BROKER_UPDATE_FEATURE,
+  BROKER_ROLLING_UPDATE_FEATURE,
   OBSERVER_ACCESS,
   MAX_FRAME,
   atomicJson,
@@ -34,8 +35,11 @@ const FEATURES = Object.freeze([
   TERMINAL_HISTORY_FEATURE,
   OBSERVER_ROLE_FEATURE,
   BROKER_UPDATE_FEATURE,
+  BROKER_ROLLING_UPDATE_FEATURE,
 ])
-const NO_CLIENT_EXIT_MS = 30_000
+const NO_CLIENT_EXIT_MS = process.env.NODE_ENV === 'test' && process.env.KAISOLA_TEST_BROKER_NO_CLIENT_EXIT_MS
+  ? Math.max(50, Math.min(30_000, Number(process.env.KAISOLA_TEST_BROKER_NO_CLIENT_EXIT_MS) || 30_000))
+  : 30_000
 // macOS may reap old entries from its per-user temporary directory even while
 // a process still has the AF_UNIX listener open. The broker and every PTY stay
 // alive, but a replacement app cannot reach that now-unlinked listener. Check
@@ -95,7 +99,50 @@ let shuttingDown = false
 // emitted. From that instant onward no mutation can create a PTY/child and race
 // the broker-authoritative quiescence snapshot.
 let updateCommitted = false
+let drainingTarget = null
+let activityEpoch = 1
+let companionLeaseEpoch = 1
+const companionLeases = new Set()
+let inFlightMutations = 0
 let everConnected = false
+
+const MUTATING_METHODS = new Set([
+  'terminal.create',
+  'terminal.attach',
+  'terminal.detachRenderer',
+  'terminal.detachOwner',
+  'terminal.write',
+  'terminal.agentTurn',
+  'terminal.resize',
+  'terminal.signal',
+  'terminal.kill',
+  'terminal.release',
+  'terminal.scheduleRelease',
+  'terminal.cancelRelease',
+  'terminal.setFocused',
+  'terminal.controlLease',
+])
+
+function noteActivity() {
+  activityEpoch = activityEpoch >= Number.MAX_SAFE_INTEGER ? 1 : activityEpoch + 1
+}
+
+function beginMutation() {
+  inFlightMutations++
+  noteActivity()
+}
+
+function endMutation() {
+  inFlightMutations = Math.max(0, inFlightMutations - 1)
+  noteActivity()
+}
+
+function waitMilliseconds(milliseconds) {
+  return new Promise((resolve) => {
+    const timer = setTimeout(resolve, milliseconds)
+    timer.unref?.()
+  })
+}
 
 function send(socket, frame, { maxQueueBytes, force = false } = {}) {
   if (!socket || socket.destroyed) return false
@@ -149,6 +196,12 @@ function scheduleNoClientExit() {
   // Connected Electron main must not pin an otherwise empty ~60 MB helper.
   // A later terminal request transparently starts/adopts a broker again.
   // Dead-but-unreleased records still carry a snapshot, so wait for release.
+  // Draining generations are different: only the registry owner may retire
+  // them after every app lane detaches and identity is rechecked. Keeping an
+  // empty drain alive closes the crash window between UI detachment and that
+  // explicit retirement transaction (and preserves a selected rollback
+  // fallback across app relaunches).
+  if (drainingTarget) return
   if (mgr.diagnostics().length) return
   noClientTimer = setTimeout(() => gracefulExit(false), NO_CLIENT_EXIT_MS)
   noClientTimer.unref?.()
@@ -168,6 +221,7 @@ mgr.setEventSink((owner, channel, payload, options) => {
   if (!client) return false
   return send(client.socket, { type: 'event', ownerId: parts.ownerId, projectId: parts.projectId, channel, payload }, options)
 })
+mgr.setActivitySink(() => noteActivity())
 
 async function dispatch(client, method, params = {}) {
   if (!brokerMethodAllowedForAccess(client.access, method)) {
@@ -180,6 +234,9 @@ async function dispatch(client, method, params = {}) {
   const requestProject = projectScope(params.projectId)
   const owner = ownerKey(client.instanceId, params.ownerId, requestProject)
   const terminalId = () => String(params.id || '').slice(0, 240)
+  if (drainingTarget && method === 'terminal.create' && !mgr.has(terminalId())) {
+    throw new Error('broker generation is draining; create on the current generation')
+  }
   const allowed = (id, adopt = false) => {
     const record = mgr.ownership(id)
     // Renderer cleanup is intentionally idempotent: a released terminal has
@@ -212,6 +269,13 @@ async function dispatch(client, method, params = {}) {
         pid: process.pid,
         startedAt: config.startedAt,
         version: config.version,
+        activityEpoch,
+        companionLeaseEpoch,
+        companionLeaseCount: companionLeases.size,
+        inFlightMutations,
+        generationState: drainingTarget ? 'draining' : 'current',
+        drainingTargetContentDigest: drainingTarget?.targetContentDigest ?? null,
+        authenticatedClientCount: clients.size,
         terminals: mgr.diagnostics(),
       }
     case 'broker.shutdown':
@@ -256,6 +320,98 @@ async function dispatch(client, method, params = {}) {
         fromContentDigest: runningDigest,
         targetContentDigest: targetDigest,
       }
+    }
+    case 'broker.prepareRollingUpdate': {
+      if (!admin) throw new Error('broker rolling update requires administrative owner scope')
+      const runningDigest = typeof config.contentDigest === 'string' ? config.contentDigest : null
+      const targetDigest = String(params.targetContentDigest || '')
+      const expectedDigest = String(params.expectedContentDigest || '')
+      const identityMatches = Number(params.expectedPid) === process.pid
+        && Number(params.expectedStartedAt) === Number(config.startedAt)
+        && /^[0-9a-f]{64}$/.test(expectedDigest)
+        && expectedDigest === runningDigest
+      if (!identityMatches) {
+        return {
+          ok: false,
+          state: 'identity_changed',
+          pid: process.pid,
+          startedAt: config.startedAt,
+          contentDigest: runningDigest,
+        }
+      }
+      if (!/^[0-9a-f]{64}$/.test(targetDigest)) throw new Error('invalid target helper content digest')
+      if (targetDigest === runningDigest) {
+        return { ok: true, state: 'current', contentDigest: runningDigest }
+      }
+      if (drainingTarget) {
+        return drainingTarget.targetContentDigest === targetDigest
+          ? { ok: true, state: 'rolling', ...drainingTarget }
+          : { ok: false, state: 'identity_changed', contentDigest: runningDigest }
+      }
+
+      const stabilityWindowMs = Math.max(50, Math.min(2_000, Math.floor(Number(params.stabilityWindowMs) || 300)))
+      const initial = mgr.rollingUpdateReadiness()
+      if (!initial.safe || inFlightMutations !== 0) {
+        return { ok: false, state: 'pending', reason: 'busy', ...initial, inFlightMutations }
+      }
+      const expectedActivityEpoch = activityEpoch
+      const expectedLeaseEpoch = companionLeaseEpoch
+      await waitMilliseconds(stabilityWindowMs)
+      const final = mgr.rollingUpdateReadiness()
+      if (companionLeaseEpoch !== expectedLeaseEpoch) {
+        return { ok: false, state: 'pending', reason: 'lease_changed', ...final, inFlightMutations }
+      }
+      if (activityEpoch !== expectedActivityEpoch || inFlightMutations !== 0 || !final.safe) {
+        return { ok: false, state: 'pending', reason: 'activity_changed', ...final, inFlightMutations }
+      }
+
+      drainingTarget = {
+        fromContentDigest: runningDigest,
+        targetContentDigest: targetDigest,
+        committedActivityEpoch: activityEpoch,
+        committedLeaseEpoch: companionLeaseEpoch,
+        committedAt: Date.now(),
+      }
+      noteActivity()
+      log(`rolling update committed from=${runningDigest} to=${targetDigest} live=${final.liveTerminalCount}`)
+      return { ok: true, state: 'rolling', ...drainingTarget }
+    }
+    case 'broker.cancelRollingUpdate': {
+      if (!admin) throw new Error('broker rolling update requires administrative owner scope')
+      const targetDigest = String(params.targetContentDigest || '')
+      const identityMatches = Number(params.expectedPid) === process.pid
+        && Number(params.expectedStartedAt) === Number(config.startedAt)
+        && String(params.expectedContentDigest || '') === String(config.contentDigest || '')
+      if (!identityMatches || !drainingTarget || drainingTarget.targetContentDigest !== targetDigest) {
+        return { ok: false, state: 'identity_changed' }
+      }
+      drainingTarget = null
+      noteActivity()
+      log(`rolling update cancelled target=${targetDigest}`)
+      return { ok: true, state: 'current', contentDigest: config.contentDigest }
+    }
+    case 'broker.retireDraining': {
+      if (!admin) throw new Error('broker retirement requires administrative owner scope')
+      const identityMatches = Number(params.expectedPid) === process.pid
+        && Number(params.expectedStartedAt) === Number(config.startedAt)
+        && String(params.expectedContentDigest || '') === String(config.contentDigest || '')
+        && drainingTarget?.targetContentDigest === String(params.targetContentDigest || '')
+      if (!identityMatches) return { ok: false, state: 'identity_changed' }
+      const readiness = mgr.upgradeReadiness()
+      const otherClientCount = Math.max(0, clients.size - 1)
+      if (mgr.diagnostics().length !== 0 || otherClientCount !== 0 || inFlightMutations !== 0) {
+        return {
+          ok: false,
+          state: 'pending',
+          ...readiness,
+          clientCount: otherClientCount,
+          inFlightMutations,
+        }
+      }
+      updateCommitted = true
+      const timer = setTimeout(() => gracefulExit(false), 100)
+      timer.unref?.()
+      return { ok: true, state: 'retiring', contentDigest: config.contentDigest }
     }
     case 'terminal.available':
       return { ok: mgr.available() }
@@ -341,6 +497,18 @@ async function dispatch(client, method, params = {}) {
       const id = terminalId()
       requireAllowed(id)
       return { ok: mgr.agentTurn(id, !!params.busy) }
+    }
+    case 'terminal.controlLease': {
+      const id = terminalId()
+      requireAllowed(id)
+      companionLeaseEpoch = companionLeaseEpoch >= Number.MAX_SAFE_INTEGER ? 1 : companionLeaseEpoch + 1
+      if (params.active === true) companionLeases.add(id)
+      else companionLeases.delete(id)
+      return {
+        ok: true,
+        active: companionLeases.has(id),
+        companionLeaseEpoch,
+      }
     }
     case 'terminal.resize': {
       const id = terminalId()
@@ -458,7 +626,11 @@ function handleLine(client, line) {
     return
   }
   if (frame?.type !== 'request' || typeof frame.id !== 'string' || typeof frame.method !== 'string') return
-  void dispatch(client, frame.method, frame.params).then(
+  const mutating = MUTATING_METHODS.has(frame.method)
+  if (mutating) beginMutation()
+  void dispatch(client, frame.method, frame.params).finally(() => {
+    if (mutating) endMutation()
+  }).then(
     (result) => {
       send(client.socket, { type: 'response', id: frame.id, ok: true, result })
       scheduleNoClientExit()

@@ -17,6 +17,7 @@ enum ControlBrokerMethod: String, CaseIterable, Sendable {
     case release = "terminal.release"
     case detachOwner = "terminal.detachOwner"
     case agentTurn = "terminal.agentTurn"
+    case controlLease = "terminal.controlLease"
 }
 
 struct TerminalCreation: Equatable, Sendable {
@@ -27,8 +28,10 @@ struct TerminalCreation: Equatable, Sendable {
 }
 
 protocol BrokerControlServing: Sendable {
+    var connectionInstanceID: String { get }
     func setDisconnectHandler(_ handler: (@Sendable (any Error) -> Void)?) async
     func connect(to info: BrokerInfo, ownerID: String) async throws
+    func connect(to topology: BrokerGenerationTopology, ownerID: String) async throws
     func createTerminal(
         projectID: String,
         terminalID: String,
@@ -45,21 +48,32 @@ protocol BrokerControlServing: Sendable {
     func release(projectID: String, terminalID: String) async throws
     func detachOwner(projectID: String, terminalID: String) async throws
     func setAgentTurn(projectID: String, terminalID: String, busy: Bool) async throws
+    func setControlLease(projectID: String, terminalID: String, active: Bool) async throws
+    func detachGenerations(_ generationIDs: Set<String>) async
     func disconnect() async
 }
 
 extension BrokerControlServing {
+    var connectionInstanceID: String { "" }
+
+    func connect(
+        to topology: BrokerGenerationTopology,
+        ownerID: String
+    ) async throws {
+        try await connect(to: topology.current.info, ownerID: ownerID)
+    }
     /// Keeps focused test doubles and additive alternative implementations
     /// source-compatible. The production controller below reports a lane-only
     /// disconnect so AppModel can stop accepting writes and reattach ownership.
     func setDisconnectHandler(_ handler: (@Sendable (any Error) -> Void)?) async {}
+    func detachGenerations(_ generationIDs: Set<String>) async {}
 }
 
 /// A second, write-capable connection to the same broker the observer client
 /// streams from. Reads never travel here; writes never travel there. The
 /// broker's own ownership model (attach-before-write, stale-write rejection)
 /// stays the final authority on every mutation.
-actor BrokerControlClient: BrokerControlServing, BrokerUpgradeRequesting {
+actor BrokerControlClient: BrokerControlServing, BrokerRollingUpdateRequesting {
     typealias DisconnectHandler = @Sendable (any Error) -> Void
     /// Compatibility values for a durable pre-fix broker. Older brokers merge
     /// their own launcher environment after receiving terminal.create; an
@@ -228,6 +242,18 @@ actor BrokerControlClient: BrokerControlServing, BrokerUpgradeRequesting {
         _ = try await request(.agentTurn, params: .object(params))
     }
 
+    func setControlLease(projectID: String, terminalID: String, active: Bool) async throws {
+        guard var params = identity(projectID: projectID, terminalID: terminalID).objectValue else {
+            throw BrokerClientError.malformedResponse
+        }
+        params["active"] = .bool(active)
+        let result = try await request(.controlLease, params: .object(params))
+        guard result.objectValue?["ok"]?.boolValue == true,
+              result.objectValue?["active"]?.boolValue == active else {
+            throw BrokerClientError.requestFailed("terminal.controlLease")
+        }
+    }
+
     func requestUpgrade(
         from info: BrokerInfo,
         targetContentDigest: String
@@ -247,8 +273,43 @@ actor BrokerControlClient: BrokerControlServing, BrokerUpgradeRequesting {
                 params: .object(["ownerId": .string("0")])
             )
             try Self.validateUpgradeStatus(status, expected: info)
+            let rolling = BrokerRollingUpdatePolicy.clientRoutingEnabled
+                && (info.implementationVersion ?? 1) >= 2
+            if rolling,
+               !connectedFeatures.contains(BrokerWire.brokerRollingUpdateFeature) {
+                throw BrokerClientError.requestFailed("broker rolling update capability")
+            }
             let result = try await request(
-                "broker.shutdownForUpdate",
+                rolling ? "broker.prepareRollingUpdate" : "broker.shutdownForUpdate",
+                params: .object([
+                    "ownerId": .string("0"),
+                    "expectedPid": .integer(Int64(info.pid)),
+                    "expectedStartedAt": .integer(info.startedAt),
+                    "expectedContentDigest": .string(runningDigest),
+                    "targetContentDigest": .string(targetContentDigest),
+                    "stabilityWindowMs": .integer(300),
+                ])
+            )
+            let decision = try Self.upgradeDecision(result)
+            await disconnect()
+            return decision
+        } catch {
+            await disconnect()
+            throw error
+        }
+    }
+
+    func cancelRollingUpdate(
+        from info: BrokerInfo,
+        targetContentDigest: String
+    ) async throws {
+        guard let runningDigest = info.contentDigest else {
+            throw BrokerClientError.requestFailed("broker helper identity")
+        }
+        do {
+            try await connect(to: info, ownerID: "0")
+            let result = try await request(
+                "broker.cancelRollingUpdate",
                 params: .object([
                     "ownerId": .string("0"),
                     "expectedPid": .integer(Int64(info.pid)),
@@ -257,7 +318,42 @@ actor BrokerControlClient: BrokerControlServing, BrokerUpgradeRequesting {
                     "targetContentDigest": .string(targetContentDigest),
                 ])
             )
-            let decision = try Self.upgradeDecision(result)
+            guard result.objectValue?["ok"]?.boolValue == true,
+                  result.objectValue?["state"]?.stringValue == "current" else {
+                throw BrokerClientError.identityChanged
+            }
+            await disconnect()
+        } catch {
+            await disconnect()
+            throw error
+        }
+    }
+
+    func requestRetirement(
+        of info: BrokerInfo,
+        targetContentDigest: String
+    ) async throws -> BrokerRetirementDecision {
+        guard let runningDigest = info.contentDigest else {
+            throw BrokerClientError.requestFailed("broker helper identity")
+        }
+        do {
+            try await connect(to: info, ownerID: "0")
+            let status = try await request(
+                "broker.status",
+                params: .object(["ownerId": .string("0")])
+            )
+            try Self.validateUpgradeStatus(status, expected: info)
+            let result = try await request(
+                "broker.retireDraining",
+                params: .object([
+                    "ownerId": .string("0"),
+                    "expectedPid": .integer(Int64(info.pid)),
+                    "expectedStartedAt": .integer(info.startedAt),
+                    "expectedContentDigest": .string(runningDigest),
+                    "targetContentDigest": .string(targetContentDigest),
+                ])
+            )
+            let decision = try Self.retirementDecision(result)
             await disconnect()
             return decision
         } catch {
@@ -329,7 +425,7 @@ actor BrokerControlClient: BrokerControlServing, BrokerUpgradeRequesting {
         case "current":
             guard object["ok"]?.boolValue == true else { throw BrokerClientError.malformedResponse }
             return .current
-        case "updating":
+        case "updating", "rolling":
             guard object["ok"]?.boolValue == true else { throw BrokerClientError.malformedResponse }
             return .accepted
         case "identity_changed":
@@ -351,13 +447,46 @@ actor BrokerControlClient: BrokerControlServing, BrokerUpgradeRequesting {
                   Set(busyIDs).count == busyIDs.count else {
                 throw BrokerClientError.malformedResponse
             }
-            return .deferred(BrokerUpgradeBlockers(
+            let blockers = BrokerUpgradeBlockers(
                 liveTerminalCount: liveCount,
                 liveTerminalIDs: liveIDs,
                 busyAgentCount: busyCount,
                 busyTerminalIDs: busyIDs,
                 childTaskCount: childCount
-            ))
+            )
+            switch object["reason"]?.stringValue {
+            case "activity_changed": return .activityChanged(blockers)
+            case "lease_changed": return .companionLeaseChanged(blockers)
+            default: return .deferred(blockers)
+            }
+        default:
+            throw BrokerClientError.malformedResponse
+        }
+    }
+
+    nonisolated static func retirementDecision(_ value: JSONValue) throws -> BrokerRetirementDecision {
+        guard let object = value.objectValue,
+              let state = object["state"]?.stringValue else {
+            throw BrokerClientError.malformedResponse
+        }
+        switch state {
+        case "retiring":
+            guard object["ok"]?.boolValue == true else { throw BrokerClientError.malformedResponse }
+            return .accepted
+        case "identity_changed":
+            guard object["ok"]?.boolValue == false else { throw BrokerClientError.malformedResponse }
+            return .identityChanged
+        case "pending":
+            guard object["ok"]?.boolValue == false,
+                  let clientCount = object["clientCount"]?.intValue.flatMap(Int.init(exactly:)),
+                  clientCount >= 0 else {
+                throw BrokerClientError.malformedResponse
+            }
+            let decision = try upgradeDecision(value)
+            guard case let .deferred(blockers) = decision else {
+                throw BrokerClientError.malformedResponse
+            }
+            return .deferred(blockers, clientCount: clientCount)
         default:
             throw BrokerClientError.malformedResponse
         }

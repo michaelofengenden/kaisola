@@ -16,6 +16,7 @@ protocol CompanionTerminalBrokerServing: Sendable {
 }
 
 extension ObserveOnlyBrokerClient: CompanionTerminalBrokerServing {}
+extension BrokerGenerationObserverRouter: CompanionTerminalBrokerServing {}
 
 struct CompanionTerminalStreamDelivery: Sendable {
     let connectionIDs: Set<String>
@@ -57,7 +58,9 @@ actor CompanionTerminalStreamHub {
     private var streams: [Key: Stream] = [:]
 
     init(
-        broker: any CompanionTerminalBrokerServing = ObserveOnlyBrokerClient(),
+        broker: any CompanionTerminalBrokerServing = BrokerGenerationObserverRouter(
+            routes: BrokerGenerationRouteTable()
+        ),
         locator: any BrokerInfoLocating = BrokerInfoLocator.preview(),
         ownerID: String = NativeSessionStore().ownerID(),
         eventSink: @escaping @Sendable (CompanionTerminalStreamDelivery) -> Void
@@ -212,7 +215,14 @@ actor CompanionTerminalStreamHub {
             }
         }
         guard !connected else { return }
-        _ = try await broker.connect(to: locator.locate())
+        if let topologyLocator = locator as? any BrokerTopologyLocating,
+           let routedBroker = broker as? any ObserveOnlyBrokerServing {
+            _ = try await routedBroker.connect(
+                to: topologyLocator.locateTopology(validateSockets: true)
+            )
+        } else {
+            _ = try await broker.connect(to: locator.locate())
+        }
         connected = true
     }
 

@@ -49,6 +49,10 @@ Large product and architecture work remains ordered in
   two-resource private scheme. Swift validates incremental edits and owns
   undo/redo, exact CRLF/LF source, save/revert, recovery, paths, and permissions;
   the ephemeral page has no file or network capability.
+- Code editor undo registration now makes its main-actor hop explicit, so the
+  optimized and visual Xcode lanes compile the same confined editor contract.
+- The focused native test runner now handles verbose mode under macOS Bash 3
+  without tripping strict nounset checks on an intentionally empty flag list.
 - Workspace FSEvents now publish bounded exact paths and detect dropped/root
   events. Loaded folders and cached search indexes patch only affected subtrees
   unless correctness requires a full bounded replacement walk.

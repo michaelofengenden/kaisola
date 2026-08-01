@@ -3,7 +3,7 @@ import CryptoKit
 import Foundation
 import KaisolaBrokerProtocol
 
-struct BrokerInfo: Decodable, Equatable, Sendable {
+struct BrokerInfo: Codable, Equatable, Sendable {
     let protocolVersion: Int
     let securityEpoch: Int
     let implementationVersion: Int?
@@ -118,6 +118,10 @@ protocol BrokerInfoLocating: Sendable {
     func locate() throws -> BrokerInfo
 }
 
+protocol BrokerTopologyLocating: BrokerInfoLocating {
+    func locateTopology(validateSockets: Bool) throws -> BrokerGenerationTopology
+}
+
 /// A deliberately narrow launch contract for paired native/Electron resource
 /// measurements. The normal app never consults this root: only an explicitly
 /// named workload may route its broker and fixture state beneath the caller's
@@ -170,7 +174,7 @@ struct NativeResourceWorkloadConfiguration: Equatable, Sendable {
     }
 }
 
-struct BrokerInfoLocator: BrokerInfoLocating, Sendable {
+struct BrokerInfoLocator: BrokerTopologyLocating, Sendable {
     enum PreviewProfile: String, Sendable {
         case native
         case development
@@ -253,7 +257,7 @@ struct BrokerInfoLocator: BrokerInfoLocating, Sendable {
     }
 
     func locate() throws -> BrokerInfo {
-        try locateMetadata(validateSocket: true)
+        try locateTopology(validateSockets: true).current.info
     }
 
     var preferredUserDataRoot: URL {
@@ -263,6 +267,14 @@ struct BrokerInfoLocator: BrokerInfoLocating, Sendable {
     }
 
     func locateMetadata(validateSocket: Bool) throws -> BrokerInfo {
+        try locateTopology(validateSockets: validateSocket).current.info
+    }
+
+    /// Resolves the atomic generation registry when present and otherwise
+    /// preserves the pre-registry single-broker discovery contract. Registry
+    /// metadata is cross-checked against each generation's independently
+    /// published identity before any socket is adopted.
+    func locateTopology(validateSockets: Bool = true) throws -> BrokerGenerationTopology {
         guard let root = userDataCandidates.first(where: {
             FileManager.default.fileExists(atPath: $0.path)
         }) else { throw BrokerDiscoveryError.notRunning }
@@ -272,30 +284,136 @@ struct BrokerInfoLocator: BrokerInfoLocating, Sendable {
         // profile merely because it happens to contain old metadata.
         try validatePrivatePath(root, expectedKind: S_IFDIR)
         let brokerDirectory = root.appendingPathComponent("session-broker", isDirectory: true)
+        var brokerDirectoryStat = stat()
+        guard lstat(brokerDirectory.path, &brokerDirectoryStat) == 0 else {
+            if errno == ENOENT { throw BrokerDiscoveryError.notRunning }
+            throw BrokerDiscoveryError.privateEndpointUnavailable
+        }
+        try validatePrivatePath(brokerDirectory, expectedKind: S_IFDIR)
+
+        let store = BrokerGenerationRegistryStore(
+            profileRoot: root,
+            currentUserID: currentUserID
+        )
+        var registryStat = stat()
+        if lstat(store.registryURL.path, &registryStat) == 0 {
+            let registry: BrokerGenerationRegistry
+            do { registry = try store.load() }
+            catch { throw BrokerDiscoveryError.invalidRegistry }
+            guard let topology = registry.topology else {
+                throw BrokerDiscoveryError.invalidRegistry
+            }
+            var socketPaths = Set<String>()
+            for generation in topology.all {
+                let published: BrokerInfo
+                do {
+                    published = try readMetadata(at: store.metadataURL(for: generation))
+                } catch {
+                    // The registry is published only after generation metadata.
+                    // A missing, swapped, or unreadable identity therefore
+                    // represents an incomplete/tampered topology, not a
+                    // discoverable broker that callers may safely adopt.
+                    throw BrokerDiscoveryError.invalidRegistry
+                }
+                guard published == generation.info,
+                      socketPaths.insert(published.socketPath).inserted else {
+                    throw BrokerDiscoveryError.invalidRegistry
+                }
+                if validateSockets {
+                    try validatePrivatePath(
+                        URL(fileURLWithPath: published.socketPath),
+                        expectedKind: S_IFSOCK
+                    )
+                }
+            }
+            return topology
+        }
+        guard errno == ENOENT else { throw BrokerDiscoveryError.invalidRegistry }
+
         let infoURL = brokerDirectory.appendingPathComponent("broker.json", isDirectory: false)
-        guard FileManager.default.fileExists(atPath: infoURL.path) else {
+        var legacyStat = stat()
+        guard lstat(infoURL.path, &legacyStat) == 0 else {
+            if errno != ENOENT { throw BrokerDiscoveryError.privateEndpointUnavailable }
             throw BrokerDiscoveryError.notRunning
         }
+        let info = try readMetadata(at: infoURL)
+        if validateSockets {
+            try validatePrivatePath(URL(fileURLWithPath: info.socketPath), expectedKind: S_IFSOCK)
+        }
+        return .single(info)
+    }
 
+    func locateGenerationMetadata(
+        contentDigest: String,
+        validateSocket: Bool = true
+    ) throws -> BrokerInfo {
+        guard BrokerHelperPackageVerification.isLowercaseSHA256(contentDigest),
+              let root = userDataCandidates.first(where: {
+                  FileManager.default.fileExists(atPath: $0.path)
+              }) else {
+            throw BrokerDiscoveryError.notRunning
+        }
+        try validatePrivatePath(root, expectedKind: S_IFDIR)
+        let brokerDirectory = root.appendingPathComponent("session-broker", isDirectory: true)
         try validatePrivatePath(brokerDirectory, expectedKind: S_IFDIR)
-        let metadataStat = try validatePrivatePath(infoURL, expectedKind: S_IFREG)
-        guard metadataStat.st_size > 0, metadataStat.st_size <= Self.maximumMetadataBytes else {
+        let metadataDirectory = brokerDirectory.appendingPathComponent(
+            BrokerLaunchConfiguration.generationMetadataDirectoryName,
+            isDirectory: true
+        )
+        try validatePrivatePath(metadataDirectory, expectedKind: S_IFDIR)
+        let info = try readMetadata(
+            at: metadataDirectory.appendingPathComponent("\(contentDigest).json")
+        )
+        guard info.contentDigest == contentDigest else {
             throw BrokerDiscoveryError.invalidMetadata
         }
-        let data = try Data(contentsOf: infoURL)
-        let info: BrokerInfo
+        if validateSocket {
+            try validatePrivatePath(
+                URL(fileURLWithPath: info.socketPath),
+                expectedKind: S_IFSOCK
+            )
+        }
+        return info
+    }
+
+    private func readMetadata(at url: URL) throws -> BrokerInfo {
+        let metadata = try validatePrivatePath(url, expectedKind: S_IFREG)
+        guard metadata.st_size > 0, metadata.st_size <= Self.maximumMetadataBytes else {
+            throw BrokerDiscoveryError.invalidMetadata
+        }
+        let descriptor = open(url.path, O_RDONLY | O_NOFOLLOW)
+        guard descriptor >= 0 else { throw BrokerDiscoveryError.privateEndpointUnavailable }
+        defer { Darwin.close(descriptor) }
+        var opened = stat()
+        guard fstat(descriptor, &opened) == 0,
+              opened.st_uid == currentUserID,
+              opened.st_mode & S_IFMT == S_IFREG,
+              opened.st_mode & 0o077 == 0,
+              opened.st_size > 0,
+              opened.st_size <= Self.maximumMetadataBytes else {
+            throw BrokerDiscoveryError.unsafePermissions
+        }
+        var data = Data()
+        data.reserveCapacity(Int(opened.st_size))
+        var buffer = [UInt8](repeating: 0, count: 16 * 1_024)
+        while true {
+            let count = Darwin.read(descriptor, &buffer, buffer.count)
+            guard count >= 0 else { throw BrokerDiscoveryError.invalidMetadata }
+            if count == 0 { break }
+            guard data.count <= Int(Self.maximumMetadataBytes) - count else {
+                throw BrokerDiscoveryError.invalidMetadata
+            }
+            data.append(contentsOf: buffer.prefix(count))
+        }
         do {
-            info = try JSONDecoder().decode(BrokerInfo.self, from: data)
+            let info = try JSONDecoder().decode(BrokerInfo.self, from: data)
             try info.validate()
+            return info
         } catch let error as BrokerDiscoveryError {
             throw error
         } catch {
             throw BrokerDiscoveryError.invalidMetadata
         }
-        if validateSocket {
-            try validatePrivatePath(URL(fileURLWithPath: info.socketPath), expectedKind: S_IFSOCK)
-        }
-        return info
     }
 
     @discardableResult
@@ -318,6 +436,7 @@ enum BrokerDiscoveryError: Error, Equatable, LocalizedError {
     case privateEndpointUnavailable
     case unsafePermissions
     case invalidMetadata
+    case invalidRegistry
     case unsupportedProtocol(Int)
     case unsupportedSecurityEpoch
     case unsupportedImplementation(Int)
@@ -338,6 +457,8 @@ enum BrokerDiscoveryError: Error, Equatable, LocalizedError {
             "The running session service version \(version) is incompatible with this version of Kaisola and was left untouched."
         case .invalidMetadata:
             "Saved terminal connection information is invalid. No terminal process was changed."
+        case .invalidRegistry:
+            "The saved terminal-generation registry is invalid. No terminal process was changed."
         }
     }
 }

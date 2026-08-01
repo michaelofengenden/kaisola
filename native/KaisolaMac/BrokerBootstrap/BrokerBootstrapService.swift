@@ -15,7 +15,6 @@ final class BrokerBootstrapService: NSObject, BrokerBootstrapXPCProtocol {
     }
 
     func launchBroker(configurationPath: String) throws -> pid_t {
-        let package = try verifiedPackage()
         let configurationURL = URL(fileURLWithPath: configurationPath).standardizedFileURL
         try validatePrivateConfiguration(configurationURL)
         let configuration: BrokerLaunchConfiguration
@@ -28,9 +27,31 @@ final class BrokerBootstrapService: NSObject, BrokerBootstrapXPCProtocol {
             throw BrokerLaunchConfigurationError.invalidConfiguration
         }
         try configuration.validate(configurationURL: configurationURL)
+        let package: VerifiedBrokerHelperPackage
+        if let packageRoot = configuration.packageRoot {
+            let requestedRoot = URL(fileURLWithPath: packageRoot, isDirectory: true)
+                .standardizedFileURL
+            if ProcessInfo.processInfo.environment["KAISOLA_STAGED_BROKER_HELPER"] == "1" {
+                let executable = URL(fileURLWithPath: CommandLine.arguments[0]).standardizedFileURL
+                let executableRoot = executable
+                    .deletingLastPathComponent()
+                    .deletingLastPathComponent()
+                guard executableRoot == requestedRoot else {
+                    throw BrokerHelperPackageError.stagedPackageMismatch
+                }
+            }
+            package = try BrokerHelperPackageVerification.verify(
+                root: requestedRoot,
+                requireSignatures: false
+            )
+        } else {
+            // Compatibility for a launch request written by an older app.
+            package = try verifiedPackage()
+        }
         guard configuration.implementationVersion == package.manifest.brokerImplementationVersion,
               configuration.packageSchema == package.manifest.schemaVersion,
-              configuration.packageVersion == package.manifest.packageVersion else {
+              configuration.packageVersion == package.manifest.packageVersion,
+              configuration.contentDigest == package.manifest.contentDigest else {
             throw BrokerHelperPackageError.incompatibleManifest
         }
 

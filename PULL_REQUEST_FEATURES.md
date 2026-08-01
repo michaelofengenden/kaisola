@@ -138,6 +138,12 @@ Scope:
   make rollback select an already verified generation rather than mutating a
   running process.
 
+Implementation status: foundation landed; live cutover remains safety-gated.
+Verified package staging, the registry/CAS contract, generation-specific
+sockets, broker-authoritative quiescence, multi-generation routing, and drain
+retirement contracts are present. Enablement waits on an installed
+two-generation live-PTY acceptance run.
+
 Acceptance:
 
 - Immediately after an update, the current generation matches the installed

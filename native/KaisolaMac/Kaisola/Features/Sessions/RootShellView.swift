@@ -1320,6 +1320,11 @@ struct RootShellView: View {
         ConnectionFooter(
             state: model.connectionState,
             brokerUpgradeState: model.brokerUpgradeState,
+            brokerGenerationDetail: model.brokerGenerationDetail,
+            brokerRollbackCandidates: model.brokerRollbackCandidates,
+            rollbackBrokerGeneration: { generationID in
+                Task { await model.rollbackBrokerGeneration(generationID) }
+            },
             reload: { Task { await model.reload() } },
             jumpToAttention: { model.jumpToAttentionTarget($0) },
             newMesh: { runCommand(.newMesh) },
@@ -4007,6 +4012,9 @@ private struct ConnectionFooter: View {
     @EnvironmentObject private var auth: AuthModel
     let state: AppModel.ConnectionState
     let brokerUpgradeState: BrokerUpgradeState
+    let brokerGenerationDetail: String
+    let brokerRollbackCandidates: [BrokerRollbackCandidate]
+    let rollbackBrokerGeneration: (String) -> Void
     let reload: () -> Void
     var jumpToAttention: ((String) -> Void)?
     var newMesh: (() -> Void)?
@@ -4217,6 +4225,20 @@ private struct ConnectionFooter: View {
             }
             Text("Kaisola v\(Self.appVersion)")
             Text(state.detail ?? state.title)
+            Text(brokerGenerationDetail)
+            if !brokerRollbackCandidates.isEmpty {
+                Menu("Use Retained Terminal Version") {
+                    ForEach(brokerRollbackCandidates) { candidate in
+                        Button {
+                            rollbackBrokerGeneration(candidate.id)
+                        } label: {
+                            Text(
+                                "\(candidate.brokerVersion) · package \(candidate.packageVersion) · PID \(candidate.pid)"
+                            )
+                        }
+                    }
+                }
+            }
             if case .current = brokerUpgradeState {
                 Text("Terminal continuity is up to date")
             } else if case .unknown = brokerUpgradeState {

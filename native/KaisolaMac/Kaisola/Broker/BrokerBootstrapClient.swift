@@ -5,6 +5,30 @@ import ServiceManagement
 protocol BrokerHelperLaunching: Sendable {
     func packageManifest() async throws -> BrokerHelperManifest
     func launch(configurationURL: URL) async throws -> Int32
+    func verifiedStagedPackage(at root: URL) async throws -> VerifiedBrokerHelperPackage
+    func validateStagedPackage(
+        at root: URL,
+        expected manifest: BrokerHelperManifest
+    ) async throws
+}
+
+extension BrokerHelperLaunching {
+    func verifiedStagedPackage(at root: URL) async throws -> VerifiedBrokerHelperPackage {
+        try BrokerHelperPackageVerification.verify(root: root, requireSignatures: false)
+    }
+
+    func validateStagedPackage(
+        at root: URL,
+        expected manifest: BrokerHelperManifest
+    ) async throws {
+        let verified = try BrokerHelperPackageVerification.verify(
+            root: root,
+            requireSignatures: false
+        )
+        guard verified.manifest == manifest else {
+            throw BrokerHelperPackageError.stagedPackageMismatch
+        }
+    }
 }
 
 struct BrokerBootstrapProcessOutput: Equatable, Sendable {
@@ -108,7 +132,7 @@ actor BrokerBootstrapClient: BrokerHelperLaunching {
     }
 
     func launch(configurationURL: URL) async throws -> Int32 {
-        let package = try verifiedPackage()
+        let package = try stagedPackage(for: configurationURL)
         if directOnly || environment["KAISOLA_NATIVE_DIRECT_HELPER"] == "1" {
             return try directLaunch(package: package, configurationURL: configurationURL)
         }
@@ -120,6 +144,31 @@ actor BrokerBootstrapClient: BrokerHelperLaunching {
         try BrokerHelperPackageVerification.verifyBundled(
             bundle: bundle,
             requireSignatures: environment["KAISOLA_ALLOW_UNSIGNED_NATIVE_HELPER"] != "1"
+        )
+    }
+
+    private func stagedPackage(for configurationURL: URL) throws -> VerifiedBrokerHelperPackage {
+        let bundled = try verifiedPackage()
+        let configuration: BrokerLaunchConfiguration
+        do {
+            configuration = try JSONDecoder().decode(
+                BrokerLaunchConfiguration.self,
+                from: Data(contentsOf: configurationURL, options: [.mappedIfSafe])
+            )
+        } catch {
+            throw BrokerLaunchConfigurationError.invalidConfiguration
+        }
+        try configuration.validate(configurationURL: configurationURL)
+        guard configuration.contentDigest == bundled.manifest.contentDigest,
+              configuration.packageSchema == bundled.manifest.schemaVersion,
+              configuration.packageVersion == bundled.manifest.packageVersion,
+              configuration.implementationVersion == bundled.manifest.brokerImplementationVersion,
+              let packageRoot = configuration.packageRoot else {
+            throw BrokerHelperPackageError.incompatibleManifest
+        }
+        return try BrokerHelperPackageStaging.stage(
+            bundled,
+            at: URL(fileURLWithPath: packageRoot, isDirectory: true)
         )
     }
 
@@ -191,7 +240,9 @@ actor BrokerBootstrapClient: BrokerHelperLaunching {
         let process = Process()
         process.executableURL = package.bootstrapExecutable
         process.arguments = ["--launch", configurationURL.path]
-        process.environment = environment
+        var launchEnvironment = environment
+        launchEnvironment["KAISOLA_STAGED_BROKER_HELPER"] = "1"
+        process.environment = launchEnvironment
         let output = Pipe()
         let errors = Pipe()
         process.standardOutput = output

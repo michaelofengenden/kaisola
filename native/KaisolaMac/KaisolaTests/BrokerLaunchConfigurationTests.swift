@@ -18,6 +18,7 @@ final class BrokerLaunchConfigurationTests: XCTestCase {
             packageSchema: valid.packageSchema,
             packageVersion: valid.packageVersion,
             contentDigest: valid.contentDigest,
+            packageRoot: valid.packageRoot,
             token: valid.token,
             socketPath: valid.socketPath,
             infoFile: "/tmp/attacker/broker.json",
@@ -45,6 +46,7 @@ final class BrokerLaunchConfigurationTests: XCTestCase {
             packageSchema: valid.packageSchema,
             packageVersion: valid.packageVersion,
             contentDigest: valid.contentDigest,
+            packageRoot: valid.packageRoot,
             token: valid.token,
             socketPath: valid.socketPath,
             infoFile: valid.infoFile,
@@ -63,20 +65,64 @@ final class BrokerLaunchConfigurationTests: XCTestCase {
         ) { XCTAssertEqual($0 as? BrokerLaunchConfigurationError, .invalidConfiguration) }
     }
 
-    private func configuration(userData: URL, broker: URL) -> BrokerLaunchConfiguration {
-        BrokerLaunchConfiguration(
-            protocolVersion: 2,
-            securityEpoch: 1,
-            implementationVersion: 1,
-            packageSchema: 1,
-            packageVersion: "1.0.0",
-            contentDigest: String(repeating: "a", count: 64),
-            token: String(repeating: "a", count: 64),
+    func testLegacyLaunchWithoutStagedPackageKeepsExactSingleBrokerLayout() throws {
+        let home = URL(fileURLWithPath: "/tmp/kaisola-launch-home")
+        let userData = home.appendingPathComponent("Kaisola", isDirectory: true)
+        let broker = userData.appendingPathComponent("session-broker", isDirectory: true)
+        let current = configuration(userData: userData, broker: broker)
+        let legacy = BrokerLaunchConfiguration(
+            protocolVersion: current.protocolVersion,
+            securityEpoch: current.securityEpoch,
+            implementationVersion: current.implementationVersion,
+            packageSchema: current.packageSchema,
+            packageVersion: current.packageVersion,
+            contentDigest: current.contentDigest,
+            packageRoot: nil,
+            token: current.token,
             socketPath: broker.appendingPathComponent("broker.sock").path,
             infoFile: broker.appendingPathComponent("broker.json").path,
             lockFile: broker.appendingPathComponent("broker.lock").path,
             storageDir: userData.appendingPathComponent("terminal-cache").path,
             logFile: broker.appendingPathComponent("broker.log").path,
+            startedAt: current.startedAt,
+            version: current.version,
+            smoke: false
+        )
+
+        XCTAssertNoThrow(try legacy.validate(
+            configurationURL: broker.appendingPathComponent("launch-native-legacy.json"),
+            homeDirectory: home
+        ))
+    }
+
+    private func configuration(userData: URL, broker: URL) -> BrokerLaunchConfiguration {
+        let digest = String(repeating: "a", count: 64)
+        let metadata = broker.appendingPathComponent(
+            BrokerLaunchConfiguration.generationMetadataDirectoryName,
+            isDirectory: true
+        )
+        return BrokerLaunchConfiguration(
+            protocolVersion: 2,
+            securityEpoch: 1,
+            implementationVersion: 1,
+            packageSchema: 1,
+            packageVersion: "1.0.0",
+            contentDigest: digest,
+            packageRoot: userData
+                .appendingPathComponent("broker-generations", isDirectory: true)
+                .appendingPathComponent(digest, isDirectory: true)
+                .path,
+            token: String(repeating: "a", count: 64),
+            socketPath: broker.appendingPathComponent(
+                BrokerLaunchConfiguration.generationSocketLeaf(
+                    userData: userData,
+                    contentDigest: digest
+                )
+            ).path,
+            infoFile: metadata.appendingPathComponent("\(digest).json").path,
+            lockFile: metadata.appendingPathComponent("\(digest).lock").path,
+            storageDir: userData.appendingPathComponent("terminal-cache").path,
+            logFile: metadata.appendingPathComponent("\(digest).log").path,
             startedAt: 1,
             version: "native-test",
             smoke: false

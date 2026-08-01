@@ -178,7 +178,9 @@ private final class CodeEditorUndoTarget: NSObject {
 
     func register(_ record: CodeEditorUndoRecord, with manager: UndoManager) {
         manager.registerUndo(withTarget: self) { target in
-            target.perform(record, direction: .undo)
+            MainActor.assumeIsolated {
+                target.perform(record, direction: .undo)
+            }
         }
         manager.setActionName("Edit Source")
     }
@@ -188,7 +190,9 @@ private final class CodeEditorUndoTarget: NSObject {
               coordinator.applyUndoRecord(record, direction: direction) else { return }
         let manager = coordinator.activeUndoManager
         manager.registerUndo(withTarget: self) { target in
-            target.perform(record, direction: direction == .undo ? .redo : .undo)
+            MainActor.assumeIsolated {
+                target.perform(record, direction: direction == .undo ? .redo : .undo)
+            }
         }
         manager.setActionName("Edit Source")
     }

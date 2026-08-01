@@ -1,4 +1,3 @@
-import CryptoKit
 import Darwin
 import Foundation
 import KaisolaBrokerProtocol
@@ -6,6 +5,10 @@ import Security
 
 protocol BrokerInfoPreparing: Sendable {
     func prepare() async throws -> BrokerInfo
+}
+
+protocol BrokerGenerationTopologyProviding: BrokerInfoPreparing {
+    func generationTopology() async -> BrokerGenerationTopology?
 }
 
 struct BrokerUpgradeBlockers: Equatable, Sendable {
@@ -18,6 +21,8 @@ struct BrokerUpgradeBlockers: Equatable, Sendable {
 
 enum BrokerUpgradePendingReason: Equatable, Sendable {
     case liveWork(BrokerUpgradeBlockers)
+    case activityChanged(BrokerUpgradeBlockers)
+    case companionLeaseChanged(BrokerUpgradeBlockers)
     case legacyIdentityUnavailable
     case identityChanged
     case requestUnavailable
@@ -46,6 +51,10 @@ enum BrokerUpgradeState: Equatable, Sendable {
             "Checking a terminal-continuity update \(Self.transition(fromContentDigest, targetContentDigest)) safely."
         case let .pending(from, target, .liveWork(blockers)):
             "Terminal-continuity update waiting \(Self.transition(from, target)): \(blockers.liveTerminalCount) live terminal(s), \(blockers.busyAgentCount) working agent(s), \(blockers.childTaskCount) child task(s)."
+        case let .pending(from, target, .activityChanged(blockers)):
+            "Terminal-continuity update retrying \(Self.transition(from, target)): terminal activity changed during the stability window (\(blockers.liveTerminalCount) retained terminal(s))."
+        case let .pending(from, target, .companionLeaseChanged(blockers)):
+            "Terminal-continuity update retrying \(Self.transition(from, target)): Companion control changed during the stability window (\(blockers.liveTerminalCount) retained terminal(s))."
         case let .pending(from, target, .legacyIdentityUnavailable):
             "Terminal-continuity update waiting \(Self.transition(from, target)): this older version cannot prove a safe handoff."
         case let .pending(from, target, .identityChanged):
@@ -70,6 +79,8 @@ enum BrokerUpgradeDecision: Equatable, Sendable {
     case current
     case accepted
     case deferred(BrokerUpgradeBlockers)
+    case activityChanged(BrokerUpgradeBlockers)
+    case companionLeaseChanged(BrokerUpgradeBlockers)
     case identityChanged
 }
 
@@ -80,9 +91,73 @@ protocol BrokerUpgradeRequesting: Sendable {
     ) async throws -> BrokerUpgradeDecision
 }
 
+enum BrokerRetirementDecision: Equatable, Sendable {
+    case accepted
+    case deferred(BrokerUpgradeBlockers, clientCount: Int)
+    case identityChanged
+}
+
+protocol BrokerRollingUpdateRequesting: BrokerUpgradeRequesting {
+    func cancelRollingUpdate(from info: BrokerInfo, targetContentDigest: String) async throws
+    func requestRetirement(
+        of info: BrokerInfo,
+        targetContentDigest: String
+    ) async throws -> BrokerRetirementDecision
+}
+
 protocol BrokerUpgradeMonitoring: Sendable {
     func upgradeState() async -> BrokerUpgradeState
     func attemptUpgradeIfNeeded() async -> BrokerUpgradeState
+}
+
+struct BrokerRollbackCandidate: Identifiable, Equatable, Sendable {
+    let id: String
+    let brokerVersion: String
+    let packageVersion: String
+    let implementationVersion: Int
+    let pid: Int32
+    let retainedForExplicitSelection: Bool
+}
+
+enum BrokerRollbackError: Error, Equatable, LocalizedError {
+    case unavailable
+    case targetUnavailable
+    case targetNotVerified
+    case incompatibleTarget
+    case quiescenceDeferred
+    case identityChanged
+    case activationFailed
+
+    var errorDescription: String? {
+        switch self {
+        case .unavailable:
+            "Broker rollback is unavailable for this terminal-continuity version."
+        case .targetUnavailable:
+            "That retained broker generation is no longer available."
+        case .targetNotVerified:
+            "The retained broker package no longer matches its sealed generation."
+        case .incompatibleTarget:
+            "That retained broker generation is not compatible with this app."
+        case .quiescenceDeferred:
+            "Terminal activity changed before rollback could commit. Try again when agents are idle."
+        case .identityChanged:
+            "Broker identity changed before rollback could commit."
+        case .activationFailed:
+            "The selected generation could not be activated; terminal creation remains safely paused."
+        }
+    }
+}
+
+protocol BrokerGenerationRollbackServing: Sendable {
+    func rollbackCandidates() async -> [BrokerRollbackCandidate]
+    func rollback(toGenerationID generationID: String) async throws -> BrokerInfo
+}
+
+/// Generation-aware routing is installed, but live cutover remains gated until
+/// an installed two-generation handoff proves PTY, Companion-lease, and drain
+/// retirement continuity end to end.
+enum BrokerRollingUpdatePolicy {
+    static let clientRoutingEnabled = false
 }
 
 struct LocatedBrokerInfoPreparer: BrokerInfoPreparing {
@@ -93,7 +168,11 @@ struct LocatedBrokerInfoPreparer: BrokerInfoPreparing {
     }
 }
 
-actor BrokerStartupCoordinator: BrokerInfoPreparing, BrokerUpgradeMonitoring {
+actor BrokerStartupCoordinator:
+    BrokerGenerationTopologyProviding,
+    BrokerUpgradeMonitoring,
+    BrokerGenerationRollbackServing
+{
     private static let maximumSocketPathBytes = 100
     private static let startupTimeoutNanoseconds: UInt64 = 8_000_000_000
 
@@ -103,8 +182,10 @@ actor BrokerStartupCoordinator: BrokerInfoPreparing, BrokerUpgradeMonitoring {
     private let appVersion: String
     private let sleep: @Sendable (UInt64) async throws -> Void
     private let upgradeRequester: any BrokerUpgradeRequesting
+    private let rollingUpdatesEnabled: Bool
     private var currentUpgradeState: BrokerUpgradeState = .unknown
     private var pendingUpgrade: PendingUpgrade?
+    private var currentTopology: BrokerGenerationTopology?
 
     private struct PendingUpgrade: Sendable {
         let info: BrokerInfo
@@ -117,6 +198,7 @@ actor BrokerStartupCoordinator: BrokerInfoPreparing, BrokerUpgradeMonitoring {
         homeDirectory: URL = FileManager.default.homeDirectoryForCurrentUser,
         appVersion: String = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "kaisola-native",
         upgradeRequester: any BrokerUpgradeRequesting = BrokerControlClient(),
+        rollingUpdatesEnabled: Bool = BrokerRollingUpdatePolicy.clientRoutingEnabled,
         sleep: @escaping @Sendable (UInt64) async throws -> Void = { try await Task.sleep(nanoseconds: $0) }
     ) {
         self.locator = locator
@@ -124,6 +206,7 @@ actor BrokerStartupCoordinator: BrokerInfoPreparing, BrokerUpgradeMonitoring {
         self.homeDirectory = homeDirectory
         self.appVersion = appVersion
         self.upgradeRequester = upgradeRequester
+        self.rollingUpdatesEnabled = rollingUpdatesEnabled
         self.sleep = sleep
     }
 
@@ -150,45 +233,231 @@ actor BrokerStartupCoordinator: BrokerInfoPreparing, BrokerUpgradeMonitoring {
     func prepare() async throws -> BrokerInfo {
         let package = try await launcher.packageManifest()
         do {
-            let info = try locator.locate()
+            let topology = try locator.locateTopology()
+            let info = topology.current.info
             // A socket vnode can survive its detached broker. Treating that
             // stale file as a live endpoint makes every connection fail with
             // ECONNREFUSED and bypasses the safe relaunch path below.
             guard !info.isProcessAlive else {
-                return try await reconcileLiveBroker(info, package: package)
+                return try await reconcileLiveBroker(topology, package: package)
             }
-            try removeStaleRendezvous(info)
+            try removeStaleRendezvous(topology.current)
         } catch let error as BrokerDiscoveryError {
             switch error {
             case .notRunning:
                 break
             case .privateEndpointUnavailable:
-                let metadata = try locator.locateMetadata(validateSocket: false)
-                guard !metadata.isProcessAlive else { throw error }
-                try removeStaleRendezvous(metadata)
+                let topology = try locator.locateTopology(validateSockets: false)
+                guard !topology.current.info.isProcessAlive else { throw error }
+                try removeStaleRendezvous(topology.current)
             default:
                 // A live or ambiguous incompatible broker is never replaced.
                 throw error
             }
         }
 
-        return try await launchPackagedBroker(package)
+        let launched = try await launchPackagedBroker(package)
+        currentTopology = try locator.locateTopology()
+        return launched
     }
 
     func upgradeState() -> BrokerUpgradeState {
         currentUpgradeState
     }
 
+    func generationTopology() async -> BrokerGenerationTopology? {
+        currentTopology
+    }
+
+    func rollbackCandidates() async -> [BrokerRollbackCandidate] {
+        guard rollingUpdatesEnabled else { return [] }
+        guard let topology = try? locator.locateTopology(),
+              let registry = try? BrokerGenerationRegistryStore(
+                  profileRoot: locator.preferredUserDataRoot
+              ).load(),
+              registry.topology == topology else { return [] }
+        currentTopology = topology
+        var candidates: [BrokerRollbackCandidate] = []
+        for generation in topology.draining {
+            guard generation.info.isProcessAlive,
+                  (generation.info.implementationVersion ?? 1) >= 2,
+                  let packageRoot = generation.packageRoot,
+                  let verified = try? await launcher.verifiedStagedPackage(
+                      at: URL(fileURLWithPath: packageRoot, isDirectory: true)
+                  ),
+                  Self.packageManifest(verified.manifest, exactlyMatches: generation) else {
+                continue
+            }
+            candidates.append(BrokerRollbackCandidate(
+                id: generation.id,
+                brokerVersion: generation.info.version,
+                packageVersion: verified.manifest.packageVersion,
+                implementationVersion: verified.manifest.brokerImplementationVersion,
+                pid: generation.info.pid,
+                retainedForExplicitSelection:
+                    registry.selection?.selectingAppContentDigest == generation.id
+            ))
+        }
+        return candidates
+    }
+
+    /// Selects one already-running, independently re-verified draining
+    /// generation. No process is mutated in place: the registry current pointer
+    /// changes atomically, then the selected broker leaves drain mode. Any
+    /// failure before both steps complete either restores the prior registry or
+    /// leaves terminal creation rejected, never ambiguously split between two
+    /// active generations.
+    func rollback(toGenerationID generationID: String) async throws -> BrokerInfo {
+        guard rollingUpdatesEnabled else { throw BrokerRollbackError.unavailable }
+        guard let rolling = upgradeRequester as? any BrokerRollingUpdateRequesting else {
+            throw BrokerRollbackError.unavailable
+        }
+        let topology: BrokerGenerationTopology
+        do { topology = try locator.locateTopology() }
+        catch { throw BrokerRollbackError.identityChanged }
+        guard let target = topology.draining.first(where: { $0.id == generationID }),
+              target.info.isProcessAlive,
+              topology.current.info.isProcessAlive,
+              let packageRoot = target.packageRoot else {
+            throw BrokerRollbackError.targetUnavailable
+        }
+        guard (topology.current.info.implementationVersion ?? 1) >= 2,
+              (target.info.implementationVersion ?? 1) >= 2 else {
+            throw BrokerRollbackError.incompatibleTarget
+        }
+
+        let verified: VerifiedBrokerHelperPackage
+        do {
+            verified = try await launcher.verifiedStagedPackage(
+                at: URL(fileURLWithPath: packageRoot, isDirectory: true)
+            )
+        } catch {
+            throw BrokerRollbackError.targetNotVerified
+        }
+        guard Self.packageManifest(verified.manifest, exactlyMatches: target) else {
+            throw BrokerRollbackError.targetNotVerified
+        }
+        let selectingAppPackage: BrokerHelperManifest
+        do { selectingAppPackage = try await launcher.packageManifest() }
+        catch { throw BrokerRollbackError.unavailable }
+
+        let decision: BrokerUpgradeDecision
+        do {
+            decision = try await rolling.requestUpgrade(
+                from: topology.current.info,
+                targetContentDigest: target.id
+            )
+        } catch {
+            throw BrokerRollbackError.unavailable
+        }
+        guard decision == .accepted else {
+            switch decision {
+            case .identityChanged:
+                throw BrokerRollbackError.identityChanged
+            default:
+                throw BrokerRollbackError.quiescenceDeferred
+            }
+        }
+
+        let store = BrokerGenerationRegistryStore(profileRoot: locator.preferredUserDataRoot)
+        var published: BrokerGenerationRegistry?
+        var priorRegistry: BrokerGenerationRegistry?
+        do {
+            let registry = try store.load()
+            guard registry.topology == topology else {
+                throw BrokerRollbackError.identityChanged
+            }
+            priorRegistry = registry
+            let selectedCurrent = BrokerGenerationRecord(
+                id: target.id,
+                role: .current,
+                info: target.info,
+                packageRoot: target.packageRoot,
+                registeredAt: target.registeredAt
+            )
+            var drains = topology.draining.filter { $0.id != target.id }
+            drains.append(BrokerGenerationRecord(
+                id: topology.current.id,
+                role: .draining,
+                info: topology.current.info,
+                packageRoot: topology.current.packageRoot,
+                registeredAt: topology.current.registeredAt
+            ))
+            let selection = BrokerGenerationSelection(
+                generationID: target.id,
+                selectingAppContentDigest: selectingAppPackage.contentDigest,
+                selectedAt: max(1, Int64(Date().timeIntervalSince1970 * 1_000))
+            )
+            published = try store.save(
+                currentGenerationID: target.id,
+                generations: [selectedCurrent] + drains,
+                expectedRevision: registry.revision,
+                selection: selection
+            )
+            do {
+                try await rolling.cancelRollingUpdate(
+                    from: target.info,
+                    targetContentDigest: topology.current.id
+                )
+            } catch {
+                throw BrokerRollbackError.activationFailed
+            }
+
+            let selectedTopology = try locator.locateTopology()
+            guard selectedTopology.current.id == target.id else {
+                throw BrokerRollbackError.identityChanged
+            }
+            currentTopology = selectedTopology
+            pendingUpgrade = nil
+            currentUpgradeState = .current(contentDigest: target.id)
+            return selectedTopology.current.info
+        } catch {
+            let registryRestored: Bool
+            if let published, let priorRegistry {
+                registryRestored = (try? store.save(
+                    currentGenerationID: topology.current.id,
+                    generations: topology.all,
+                    expectedRevision: published.revision,
+                    selection: priorRegistry.selection
+                )) != nil
+            } else {
+                registryRestored = true
+            }
+            if registryRestored {
+                try? await rolling.cancelRollingUpdate(
+                    from: topology.current.info,
+                    targetContentDigest: target.id
+                )
+                currentTopology = topology
+            }
+            if let rollbackError = error as? BrokerRollbackError { throw rollbackError }
+            if error is BrokerGenerationRegistryError {
+                throw BrokerRollbackError.identityChanged
+            }
+            throw BrokerRollbackError.activationFailed
+        }
+    }
+
     /// Called from the app's ordinary inventory heartbeat. A stale broker is
     /// retried only through its own atomic safety method; UI-observed quietness
     /// is never used as replacement authority.
     func attemptUpgradeIfNeeded() async -> BrokerUpgradeState {
-        guard let pendingUpgrade else { return currentUpgradeState }
+        guard let pendingUpgrade else {
+            await retireEmptyDrainingGenerationIfPossible()
+            return currentUpgradeState
+        }
         do {
-            _ = try await reconcileLiveBroker(
-                pendingUpgrade.info,
-                package: pendingUpgrade.package
-            )
+            let topology = try locator.locateTopology()
+            guard topology.current.info == pendingUpgrade.info else {
+                self.pendingUpgrade = nil
+                currentUpgradeState = .pending(
+                    fromContentDigest: pendingUpgrade.info.contentDigest,
+                    targetContentDigest: pendingUpgrade.package.contentDigest,
+                    reason: .identityChanged
+                )
+                return currentUpgradeState
+            }
+            _ = try await reconcileLiveBroker(topology, package: pendingUpgrade.package)
         } catch BrokerStartupError.timedOut(_) {
             currentUpgradeState = .pending(
                 fromContentDigest: pendingUpgrade.info.contentDigest,
@@ -205,10 +474,98 @@ actor BrokerStartupCoordinator: BrokerInfoPreparing, BrokerUpgradeMonitoring {
         return currentUpgradeState
     }
 
+    private func retireEmptyDrainingGenerationIfPossible() async {
+        guard rollingUpdatesEnabled,
+              let rolling = upgradeRequester as? any BrokerRollingUpdateRequesting,
+              let topology = currentTopology ?? (try? locator.locateTopology()) else { return }
+        let store = BrokerGenerationRegistryStore(profileRoot: locator.preferredUserDataRoot)
+        guard let registry = try? store.load(), registry.topology == topology else { return }
+        let retainedRollbackID = registry.selection?.selectingAppContentDigest
+        guard let draining = topology.draining.first(where: {
+            $0.id != retainedRollbackID
+        }) else { return }
+        let decision: BrokerRetirementDecision
+        do {
+            decision = try await rolling.requestRetirement(
+                of: draining.info,
+                targetContentDigest: topology.current.id
+            )
+        } catch {
+            return
+        }
+        guard decision == .accepted else { return }
+        do {
+            try await waitForRetirement(of: draining, profileRoot: locator.preferredUserDataRoot)
+            let registry = try store.load()
+            guard registry.topology == topology,
+                  registry.currentGenerationID == topology.current.id else {
+                throw BrokerGenerationRegistryError.revisionChanged
+            }
+            let retained = registry.generations.filter { $0.id != draining.id }
+            let next = try store.save(
+                currentGenerationID: topology.current.id,
+                generations: retained,
+                expectedRevision: registry.revision,
+                selection: registry.selection
+            )
+            currentTopology = next.topology
+            try garbageCollectRetiredMetadata(draining, store: store)
+        } catch {
+            // The registry intentionally retains the generation if retirement
+            // or its identity recheck is ambiguous. A later heartbeat retries.
+        }
+    }
+
+    private func waitForRetirement(
+        of generation: BrokerGenerationRecord,
+        profileRoot: URL
+    ) async throws {
+        let metadataURL = BrokerGenerationRegistryStore(profileRoot: profileRoot)
+            .metadataURL(for: generation)
+        let started = DispatchTime.now().uptimeNanoseconds
+        while DispatchTime.now().uptimeNanoseconds - started < Self.startupTimeoutNanoseconds {
+            var metadata = stat()
+            let metadataExists = lstat(metadataURL.path, &metadata) == 0
+            if !generation.info.isProcessAlive, !metadataExists { return }
+            try await sleep(60_000_000)
+        }
+        throw BrokerStartupError.timedOut(nil)
+    }
+
+    private func garbageCollectRetiredMetadata(
+        _ generation: BrokerGenerationRecord,
+        store: BrokerGenerationRegistryStore
+    ) throws {
+        let brokerDirectory = store.brokerDirectory.standardizedFileURL
+        let metadataDirectory = brokerDirectory.appendingPathComponent(
+            BrokerLaunchConfiguration.generationMetadataDirectoryName,
+            isDirectory: true
+        )
+        let logURL = generation.packageRoot == nil
+            ? brokerDirectory.appendingPathComponent("broker.log")
+            : metadataDirectory.appendingPathComponent("\(generation.id).log")
+        for candidate in [logURL, logURL.appendingPathExtension("previous")] {
+            var metadata = stat()
+            guard lstat(candidate.path, &metadata) == 0 else {
+                if errno == ENOENT { continue }
+                throw BrokerStartupError.unsafeStaleRendezvous
+            }
+            guard candidate.standardizedFileURL.deletingLastPathComponent()
+                    == logURL.standardizedFileURL.deletingLastPathComponent(),
+                  metadata.st_uid == getuid(),
+                  metadata.st_mode & S_IFMT == S_IFREG,
+                  metadata.st_mode & 0o077 == 0 else {
+                throw BrokerStartupError.unsafeStaleRendezvous
+            }
+            try FileManager.default.removeItem(at: candidate)
+        }
+    }
+
     private func reconcileLiveBroker(
-        _ info: BrokerInfo,
+        _ topology: BrokerGenerationTopology,
         package: BrokerHelperManifest
     ) async throws -> BrokerInfo {
+        let info = topology.current.info
         let exactPackageIdentity = info.contentDigest == package.contentDigest
             && info.packageVersion == package.packageVersion
             && info.packageSchema == package.schemaVersion
@@ -216,6 +573,13 @@ actor BrokerStartupCoordinator: BrokerInfoPreparing, BrokerUpgradeMonitoring {
         if exactPackageIdentity {
             pendingUpgrade = nil
             currentUpgradeState = .current(contentDigest: package.contentDigest)
+            currentTopology = topology
+            return info
+        }
+        if try await honorsExplicitSelection(topology, selectingAppPackage: package) {
+            pendingUpgrade = nil
+            currentUpgradeState = .current(contentDigest: topology.current.id)
+            currentTopology = topology
             return info
         }
         guard let runningDigest = info.contentDigest else {
@@ -242,6 +606,23 @@ actor BrokerStartupCoordinator: BrokerInfoPreparing, BrokerUpgradeMonitoring {
             fromContentDigest: runningDigest,
             targetContentDigest: package.contentDigest
         )
+        let supportsRolling = rollingUpdatesEnabled
+            && (info.implementationVersion ?? 1) >= 2
+        let preparedReplacement: BrokerInfo?
+        if supportsRolling {
+            do { preparedReplacement = try await launchGeneration(package) }
+            catch {
+                currentUpgradeState = .pending(
+                    fromContentDigest: runningDigest,
+                    targetContentDigest: package.contentDigest,
+                    reason: .launchFailed
+                )
+                return info
+            }
+        } else {
+            preparedReplacement = nil
+        }
+
         let decision: BrokerUpgradeDecision
         do {
             decision = try await upgradeRequester.requestUpgrade(
@@ -269,6 +650,20 @@ actor BrokerStartupCoordinator: BrokerInfoPreparing, BrokerUpgradeMonitoring {
                 reason: .liveWork(blockers)
             )
             return info
+        case let .activityChanged(blockers):
+            currentUpgradeState = .pending(
+                fromContentDigest: runningDigest,
+                targetContentDigest: package.contentDigest,
+                reason: .activityChanged(blockers)
+            )
+            return info
+        case let .companionLeaseChanged(blockers):
+            currentUpgradeState = .pending(
+                fromContentDigest: runningDigest,
+                targetContentDigest: package.contentDigest,
+                reason: .companionLeaseChanged(blockers)
+            )
+            return info
         case .identityChanged:
             pendingUpgrade = nil
             currentUpgradeState = .pending(
@@ -282,11 +677,46 @@ actor BrokerStartupCoordinator: BrokerInfoPreparing, BrokerUpgradeMonitoring {
                 fromContentDigest: runningDigest,
                 targetContentDigest: package.contentDigest
             )
-            try await waitForSafeShutdown(of: info)
-            let replacement = try await launchPackagedBroker(package)
-            pendingUpgrade = nil
-            currentUpgradeState = .current(contentDigest: package.contentDigest)
-            return replacement
+            if supportsRolling, let preparedReplacement {
+                do {
+                    let replacement = try await publishCutover(
+                        replacement: preparedReplacement,
+                        package: package,
+                        prior: topology,
+                        retainPriorCurrent: true
+                    )
+                    pendingUpgrade = nil
+                    currentUpgradeState = .current(contentDigest: package.contentDigest)
+                    currentTopology = try locator.locateTopology()
+                    return replacement
+                } catch {
+                    if let rolling = upgradeRequester as? any BrokerRollingUpdateRequesting {
+                        try? await rolling.cancelRollingUpdate(
+                            from: info,
+                            targetContentDigest: package.contentDigest
+                        )
+                    }
+                    currentUpgradeState = .pending(
+                        fromContentDigest: runningDigest,
+                        targetContentDigest: package.contentDigest,
+                        reason: .launchFailed
+                    )
+                    return info
+                }
+            } else {
+                try await waitForSafeShutdown(of: info)
+                let prepared = try await launchGeneration(package)
+                let replacement = try await publishCutover(
+                    replacement: prepared,
+                    package: package,
+                    prior: topology,
+                    retainPriorCurrent: false
+                )
+                pendingUpgrade = nil
+                currentUpgradeState = .current(contentDigest: package.contentDigest)
+                currentTopology = try locator.locateTopology()
+                return replacement
+            }
         }
     }
 
@@ -301,6 +731,21 @@ actor BrokerStartupCoordinator: BrokerInfoPreparing, BrokerUpgradeMonitoring {
     }
 
     private func launchPackagedBroker(_ package: BrokerHelperManifest) async throws -> BrokerInfo {
+        let generation = try await launchGeneration(package)
+        return try publishFreshGeneration(generation, package: package)
+    }
+
+    /// Starts or adopts one exact staged generation without changing which
+    /// generation is current. Rolling cutover publishes the registry only
+    /// after the old broker commits its activity epoch.
+    private func launchGeneration(_ package: BrokerHelperManifest) async throws -> BrokerInfo {
+        if let existing = try? locator.locateGenerationMetadata(
+            contentDigest: package.contentDigest
+        ), existing.isProcessAlive {
+            try await verifyStagedPackage(package)
+            return existing
+        }
+
         let launchURL = try writeLaunchConfiguration(package: package)
         defer { try? FileManager.default.removeItem(at: launchURL) }
         do {
@@ -310,8 +755,15 @@ actor BrokerStartupCoordinator: BrokerInfoPreparing, BrokerUpgradeMonitoring {
             // exact sealed digest is safe to adopt; any other identity is not.
             if let adopted = try? locator.locate(),
                adopted.contentDigest == package.contentDigest {
-                pendingUpgrade = nil
-                currentUpgradeState = .current(contentDigest: package.contentDigest)
+                return adopted
+            }
+            // The competing generation can publish its own metadata before it
+            // wins the registry compare-and-swap. Complete that same exact
+            // publication instead of launching a duplicate process.
+            if let adopted = try? locator.locateGenerationMetadata(
+                contentDigest: package.contentDigest
+            ), adopted.isProcessAlive {
+                try await verifyStagedPackage(package)
                 return adopted
             }
             throw error
@@ -321,12 +773,14 @@ actor BrokerStartupCoordinator: BrokerInfoPreparing, BrokerUpgradeMonitoring {
         var lastError: (any Error)?
         while DispatchTime.now().uptimeNanoseconds - started < Self.startupTimeoutNanoseconds {
             do {
-                let info = try locator.locate()
-                guard info.contentDigest == package.contentDigest else {
+                let info = try locator.locateGenerationMetadata(
+                    contentDigest: package.contentDigest
+                )
+                guard info.contentDigest == package.contentDigest,
+                      info.isProcessAlive else {
                     throw BrokerStartupError.rendezvousChanged
                 }
-                pendingUpgrade = nil
-                currentUpgradeState = .current(contentDigest: package.contentDigest)
+                try await verifyStagedPackage(package)
                 return info
             } catch {
                 lastError = error
@@ -336,12 +790,64 @@ actor BrokerStartupCoordinator: BrokerInfoPreparing, BrokerUpgradeMonitoring {
         throw BrokerStartupError.timedOut(lastError?.localizedDescription)
     }
 
+    private func verifyStagedPackage(_ package: BrokerHelperManifest) async throws {
+        let root = locator.preferredUserDataRoot
+            .appendingPathComponent("broker-generations", isDirectory: true)
+            .appendingPathComponent(package.contentDigest, isDirectory: true)
+        try await launcher.validateStagedPackage(
+            at: root,
+            expected: package
+        )
+    }
+
+    private func honorsExplicitSelection(
+        _ topology: BrokerGenerationTopology,
+        selectingAppPackage: BrokerHelperManifest
+    ) async throws -> Bool {
+        guard topology.current.packageRoot != nil else { return false }
+        let registry = try BrokerGenerationRegistryStore(
+            profileRoot: locator.preferredUserDataRoot
+        ).load()
+        guard registry.topology == topology,
+              let selection = registry.selection,
+              selection.generationID == topology.current.id,
+              selection.selectingAppContentDigest == selectingAppPackage.contentDigest,
+              let packageRoot = topology.current.packageRoot else {
+            return false
+        }
+        let verified = try await launcher.verifiedStagedPackage(
+            at: URL(fileURLWithPath: packageRoot, isDirectory: true)
+        )
+        guard Self.packageManifest(verified.manifest, exactlyMatches: topology.current) else {
+            throw BrokerRollbackError.targetNotVerified
+        }
+        return true
+    }
+
+    private static func packageManifest(
+        _ manifest: BrokerHelperManifest,
+        exactlyMatches generation: BrokerGenerationRecord
+    ) -> Bool {
+        manifest.contentDigest == generation.id
+            && manifest.packageVersion == generation.info.packageVersion
+            && manifest.schemaVersion == generation.info.packageSchema
+            && manifest.brokerImplementationVersion == generation.info.implementationVersion
+            && manifest.brokerProtocol.minimum <= BrokerWire.protocolVersion
+            && manifest.brokerProtocol.maximum >= BrokerWire.protocolVersion
+            && manifest.brokerProtocol.securityEpoch == BrokerWire.securityEpoch
+    }
+
     private func writeLaunchConfiguration(package: BrokerHelperManifest) throws -> URL {
         let userData = locator.preferredUserDataRoot.standardizedFileURL
         try preparePrivateDirectory(userData)
         let brokerDirectory = userData.appendingPathComponent("session-broker", isDirectory: true)
         try preparePrivateDirectory(brokerDirectory)
-        let socket = try socketPath(userData: userData)
+        let metadataDirectory = brokerDirectory.appendingPathComponent(
+            BrokerLaunchConfiguration.generationMetadataDirectoryName,
+            isDirectory: true
+        )
+        try preparePrivateDirectory(metadataDirectory)
+        let socket = try socketPath(userData: userData, contentDigest: package.contentDigest)
         try preparePrivateDirectory(URL(fileURLWithPath: socket).deletingLastPathComponent())
 
         var tokenBytes = [UInt8](repeating: 0, count: 32)
@@ -357,12 +863,16 @@ actor BrokerStartupCoordinator: BrokerInfoPreparing, BrokerUpgradeMonitoring {
             packageSchema: package.schemaVersion,
             packageVersion: package.packageVersion,
             contentDigest: package.contentDigest,
+            packageRoot: userData
+                .appendingPathComponent("broker-generations", isDirectory: true)
+                .appendingPathComponent(package.contentDigest, isDirectory: true)
+                .path,
             token: token,
             socketPath: socket,
-            infoFile: brokerDirectory.appendingPathComponent("broker.json").path,
-            lockFile: brokerDirectory.appendingPathComponent("broker.lock").path,
+            infoFile: metadataDirectory.appendingPathComponent("\(package.contentDigest).json").path,
+            lockFile: metadataDirectory.appendingPathComponent("\(package.contentDigest).lock").path,
             storageDir: userData.appendingPathComponent("terminal-cache", isDirectory: true).path,
-            logFile: brokerDirectory.appendingPathComponent("broker.log").path,
+            logFile: metadataDirectory.appendingPathComponent("\(package.contentDigest).log").path,
             startedAt: timestamp,
             version: appVersion,
             smoke: false
@@ -375,25 +885,215 @@ actor BrokerStartupCoordinator: BrokerInfoPreparing, BrokerUpgradeMonitoring {
         return launchURL
     }
 
-    private func socketPath(userData: URL) throws -> String {
+    private func socketPath(userData: URL, contentDigest: String) throws -> String {
+        let socketLeaf = BrokerLaunchConfiguration.generationSocketLeaf(
+            userData: userData,
+            contentDigest: contentDigest
+        )
         let durable = userData
             .appendingPathComponent("session-broker", isDirectory: true)
-            .appendingPathComponent("broker.sock").path
+            .appendingPathComponent(socketLeaf).path
         if durable.utf8.count <= Self.maximumSocketPathBytes { return durable }
-        let digest = SHA256.hash(data: Data(userData.path.utf8))
-            .prefix(9)
-            .map { String(format: "%02x", $0) }
-            .joined()
         let compact = homeDirectory
             .appendingPathComponent(".kaisola-session", isDirectory: true)
-            .appendingPathComponent("\(digest).sock").path
+            .appendingPathComponent(socketLeaf).path
         guard compact.utf8.count <= Self.maximumSocketPathBytes else {
             throw BrokerClientError.socketPathTooLong
         }
         return compact
     }
 
-    private func removeStaleRendezvous(_ stale: BrokerInfo) throws {
+    private func publishFreshGeneration(
+        _ info: BrokerInfo,
+        package: BrokerHelperManifest
+    ) throws -> BrokerInfo {
+        guard info.contentDigest == package.contentDigest,
+              info.packageVersion == package.packageVersion,
+              info.packageSchema == package.schemaVersion,
+              info.implementationVersion == package.brokerImplementationVersion,
+              info.isProcessAlive else {
+            throw BrokerStartupError.rendezvousChanged
+        }
+        let userData = locator.preferredUserDataRoot.standardizedFileURL
+        let record = BrokerGenerationRecord(
+            id: package.contentDigest,
+            role: .current,
+            info: info,
+            packageRoot: userData
+                .appendingPathComponent("broker-generations", isDirectory: true)
+                .appendingPathComponent(package.contentDigest, isDirectory: true)
+                .path,
+            registeredAt: max(1, info.startedAt)
+        )
+        let store = BrokerGenerationRegistryStore(profileRoot: userData)
+        do {
+            _ = try store.save(
+                currentGenerationID: record.id,
+                generations: [record],
+                expectedRevision: nil
+            )
+        } catch BrokerGenerationRegistryError.revisionChanged {
+            let existing = try store.load()
+            if existing.topology?.current == record {
+                // A second app window published the same launched generation.
+            } else if let topology = existing.topology,
+                      topology.draining.isEmpty,
+                      !topology.current.info.isProcessAlive {
+                _ = try store.save(
+                    currentGenerationID: record.id,
+                    generations: [record],
+                    expectedRevision: existing.revision
+                )
+            } else {
+                throw BrokerStartupError.rendezvousChanged
+            }
+        }
+        let adopted = try locator.locate()
+        guard adopted == info else { throw BrokerStartupError.rendezvousChanged }
+        pendingUpgrade = nil
+        currentUpgradeState = .current(contentDigest: package.contentDigest)
+        return adopted
+    }
+
+    private func publishCutover(
+        replacement: BrokerInfo,
+        package: BrokerHelperManifest,
+        prior: BrokerGenerationTopology,
+        retainPriorCurrent: Bool
+    ) async throws -> BrokerInfo {
+        guard replacement.contentDigest == package.contentDigest,
+              replacement.packageVersion == package.packageVersion,
+              replacement.packageSchema == package.schemaVersion,
+              replacement.implementationVersion == package.brokerImplementationVersion,
+              replacement.isProcessAlive else {
+            throw BrokerStartupError.rendezvousChanged
+        }
+        try await verifyStagedPackage(package)
+
+        let userData = locator.preferredUserDataRoot.standardizedFileURL
+        let store = BrokerGenerationRegistryStore(profileRoot: userData)
+        let existingRegistry: BrokerGenerationRegistry?
+        if prior.current.packageRoot == nil {
+            existingRegistry = nil
+        } else {
+            let loaded = try store.load()
+            guard loaded.topology == prior else {
+                throw BrokerGenerationRegistryError.revisionChanged
+            }
+            existingRegistry = loaded
+        }
+
+        let priorTarget = prior.all.first(where: { $0.id == package.contentDigest })
+        let current = BrokerGenerationRecord(
+            id: package.contentDigest,
+            role: .current,
+            info: replacement,
+            packageRoot: userData
+                .appendingPathComponent("broker-generations", isDirectory: true)
+                .appendingPathComponent(package.contentDigest, isDirectory: true)
+                .path,
+            registeredAt: priorTarget?.registeredAt ?? max(1, replacement.startedAt)
+        )
+        var retained = prior.draining.filter { $0.id != package.contentDigest }
+        if retainPriorCurrent, prior.current.id != package.contentDigest {
+            retained.append(BrokerGenerationRecord(
+                id: prior.current.id,
+                role: .draining,
+                info: prior.current.info,
+                packageRoot: prior.current.packageRoot,
+                registeredAt: prior.current.registeredAt
+            ))
+        }
+        _ = try store.save(
+            currentGenerationID: current.id,
+            generations: [current] + retained,
+            expectedRevision: existingRegistry?.revision
+        )
+        let adopted = try locator.locate()
+        guard adopted == replacement else {
+            throw BrokerStartupError.rendezvousChanged
+        }
+        return adopted
+    }
+
+    private func removeStaleRendezvous(_ stale: BrokerGenerationRecord) throws {
+        if stale.packageRoot != nil {
+            try removeStaleGenerationRendezvous(stale)
+        } else {
+            try removeStaleLegacyRendezvous(stale.info)
+        }
+    }
+
+    private func removeStaleGenerationRendezvous(_ stale: BrokerGenerationRecord) throws {
+        guard !stale.info.isProcessAlive else { throw BrokerStartupError.liveBrokerRefused }
+        let root = locator.preferredUserDataRoot.standardizedFileURL
+        let store = BrokerGenerationRegistryStore(profileRoot: root)
+        let registry = try store.load()
+        guard registry.topology?.current == stale,
+              !stale.info.isProcessAlive,
+              try locator.locateGenerationMetadata(
+                  contentDigest: stale.id,
+                  validateSocket: false
+              ) == stale.info else {
+            throw BrokerStartupError.rendezvousChanged
+        }
+
+        let lockURL = store.brokerDirectory
+            .appendingPathComponent(
+                BrokerLaunchConfiguration.generationMetadataDirectoryName,
+                isDirectory: true
+            )
+            .appendingPathComponent("\(stale.id).lock", isDirectory: false)
+        let lockDescriptor = open(lockURL.path, O_RDWR | O_CREAT | O_NOFOLLOW, 0o600)
+        guard lockDescriptor >= 0 else { throw BrokerStartupError.unsafeStaleRendezvous }
+        defer { Darwin.close(lockDescriptor) }
+        var lockMetadata = stat()
+        guard fstat(lockDescriptor, &lockMetadata) == 0,
+              lockMetadata.st_uid == getuid(),
+              lockMetadata.st_mode & S_IFMT == S_IFREG,
+              lockMetadata.st_mode & 0o077 == 0,
+              flock(lockDescriptor, LOCK_EX | LOCK_NB) == 0 else {
+            throw BrokerStartupError.unsafeStaleRendezvous
+        }
+        defer { _ = flock(lockDescriptor, LOCK_UN) }
+
+        // Recheck identity after acquiring the generation lock. Another app
+        // may have relaunched it between the registry read and the lock.
+        guard registry == (try store.load()),
+              !stale.info.isProcessAlive,
+              try locator.locateGenerationMetadata(
+                  contentDigest: stale.id,
+                  validateSocket: false
+              ) == stale.info else {
+            throw BrokerStartupError.rendezvousChanged
+        }
+        let metadataURL = store.metadataURL(for: stale)
+        let socketURL = URL(fileURLWithPath: stale.info.socketPath)
+        let expectedSocketLeaf = BrokerLaunchConfiguration.generationSocketLeaf(
+            userData: root,
+            contentDigest: stale.id
+        )
+        guard socketURL.lastPathComponent == expectedSocketLeaf else {
+            throw BrokerStartupError.unsafeStaleRendezvous
+        }
+        try removePrivateRendezvousFile(
+            socketURL,
+            expectedParents: [
+                store.brokerDirectory,
+                homeDirectory.appendingPathComponent(".kaisola-session", isDirectory: true),
+            ],
+            allowedKinds: [S_IFSOCK]
+        )
+        // Remove metadata last. If an earlier unlink fails, the independently
+        // published identity remains available for a safe retry.
+        try removePrivateRendezvousFile(
+            metadataURL,
+            expectedParent: metadataURL.deletingLastPathComponent(),
+            allowedKinds: [S_IFREG]
+        )
+    }
+
+    private func removeStaleLegacyRendezvous(_ stale: BrokerInfo) throws {
         guard !stale.isProcessAlive else { throw BrokerStartupError.liveBrokerRefused }
         let current = try locator.locateMetadata(validateSocket: false)
         guard current == stale, !current.isProcessAlive else {
@@ -407,22 +1107,46 @@ actor BrokerStartupCoordinator: BrokerInfoPreparing, BrokerUpgradeMonitoring {
             URL(fileURLWithPath: stale.socketPath),
         ]
         for url in removable {
-            var value = stat()
-            guard lstat(url.path, &value) == 0 else {
-                if errno == ENOENT { continue }
-                throw BrokerStartupError.unsafeStaleRendezvous
-            }
-            let allowedPath = url.deletingLastPathComponent() == brokerDirectory
-                || url.deletingLastPathComponent() == homeDirectory.appendingPathComponent(".kaisola-session", isDirectory: true)
-            let kind = value.st_mode & S_IFMT
-            guard allowedPath,
-                  value.st_uid == getuid(),
-                  value.st_mode & 0o077 == 0,
-                  (kind == S_IFREG || kind == S_IFSOCK) else {
-                throw BrokerStartupError.unsafeStaleRendezvous
-            }
-            try FileManager.default.removeItem(at: url)
+            try removePrivateRendezvousFile(
+                url,
+                expectedParents: [
+                    brokerDirectory,
+                    homeDirectory.appendingPathComponent(".kaisola-session", isDirectory: true),
+                ],
+                allowedKinds: [S_IFREG, S_IFSOCK]
+            )
         }
+    }
+
+    private func removePrivateRendezvousFile(
+        _ url: URL,
+        expectedParent: URL,
+        allowedKinds: Set<mode_t>
+    ) throws {
+        try removePrivateRendezvousFile(
+            url,
+            expectedParents: [expectedParent],
+            allowedKinds: allowedKinds
+        )
+    }
+
+    private func removePrivateRendezvousFile(
+        _ url: URL,
+        expectedParents: Set<URL>,
+        allowedKinds: Set<mode_t>
+    ) throws {
+        var value = stat()
+        guard lstat(url.path, &value) == 0 else {
+            if errno == ENOENT { return }
+            throw BrokerStartupError.unsafeStaleRendezvous
+        }
+        guard expectedParents.contains(url.deletingLastPathComponent()),
+              value.st_uid == getuid(),
+              value.st_mode & 0o077 == 0,
+              allowedKinds.contains(value.st_mode & S_IFMT) else {
+            throw BrokerStartupError.unsafeStaleRendezvous
+        }
+        try FileManager.default.removeItem(at: url)
     }
 
     private func preparePrivateDirectory(_ url: URL) throws {

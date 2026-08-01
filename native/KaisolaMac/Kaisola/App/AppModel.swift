@@ -69,6 +69,8 @@ final class AppModel: ObservableObject {
     /// Sealed helper parity is separate from socket health. A broker can be
     /// healthy but intentionally pending an update because it still owns a PTY.
     @Published private(set) var brokerUpgradeState: BrokerUpgradeState = .unknown
+    @Published private(set) var brokerGenerationDetail: String = "Broker generations have not been inspected yet."
+    @Published private(set) var brokerRollbackCandidates: [BrokerRollbackCandidate] = []
     @Published private(set) var sessions: [BrokerTerminalRecord] = []
     @Published var selectedSessionID: String?
     /// A new-window pop-out target that could not be resolved. Kept separate
@@ -258,8 +260,11 @@ final class AppModel: ObservableObject {
     private let jitter: @Sendable () -> Double
     private var selectedSession: BrokerTerminalRecord?
     private var activeBrokerIdentity: String?
+    private var activeBrokerTopology: BrokerGenerationTopology?
+    private var activeBrokerTopologyProvider: (any BrokerGenerationTopologyProviding)?
     private var connectedBrokerFeatures: Set<String> = []
     private var activeBrokerUpgradeMonitor: (any BrokerUpgradeMonitoring)?
+    private var activeBrokerRollbackController: (any BrokerGenerationRollbackServing)?
     private var reconnectTask: Task<Void, Never>?
     private var cursorSaveTask: Task<Void, Never>?
     private var inventoryRefreshTask: Task<Void, Never>?
@@ -325,8 +330,8 @@ final class AppModel: ObservableObject {
     init(
         brokerPreparer: any BrokerInfoPreparing = BrokerStartupCoordinator.live(),
         fallbackPreparer: (any BrokerInfoPreparing)? = nil,
-        client: any ObserveOnlyBrokerServing = ObserveOnlyBrokerClient(),
-        controlClient: any BrokerControlServing = BrokerControlClient(),
+        client: (any ObserveOnlyBrokerServing)? = nil,
+        controlClient: (any BrokerControlServing)? = nil,
         sessionStore: NativeSessionStore = NativeSessionStore(),
         cursorStore: TerminalCursorStore = TerminalCursorStore(fileURL: NativePreviewPaths.terminalCursorStore),
         workspaceStateStore: NativeWorkspaceStateStore = .live,
@@ -343,8 +348,9 @@ final class AppModel: ObservableObject {
     ) {
         self.brokerPreparer = brokerPreparer
         self.fallbackPreparer = fallbackPreparer
-        self.client = client
-        self.controlClient = controlClient
+        let generationRoutes = BrokerGenerationRouteTable()
+        self.client = client ?? BrokerGenerationObserverRouter(routes: generationRoutes)
+        self.controlClient = controlClient ?? BrokerGenerationControlRouter(routes: generationRoutes)
         self.sessionStore = sessionStore
         self.cursorStore = cursorStore
         self.workspaceStateStore = workspaceStateStore
@@ -4918,7 +4924,29 @@ final class AppModel: ObservableObject {
         )
     }
 
-    func setCompanionControlActive(_ active: Bool, for terminal: BrokerTerminalRecord) {
+    func setCompanionControlActive(
+        _ active: Bool,
+        for terminal: BrokerTerminalRecord
+    ) async throws {
+        try await controlClient.setControlLease(
+            projectID: terminal.projectID,
+            terminalID: terminal.id,
+            active: active
+        )
+        applyCompanionControlState(active, for: terminal)
+    }
+
+    func setCompanionControlFixtureActive(
+        _ active: Bool,
+        for terminal: BrokerTerminalRecord
+    ) {
+        applyCompanionControlState(active, for: terminal)
+    }
+
+    private func applyCompanionControlState(
+        _ active: Bool,
+        for terminal: BrokerTerminalRecord
+    ) {
         if active {
             companionControlledTerminalIDs.insert(terminal.id)
             terminalResizeTasks.removeValue(forKey: terminal.id)?.cancel()
@@ -4993,13 +5021,13 @@ final class AppModel: ObservableObject {
     ) -> BrokerTerminalRecord? {
         guard controlAvailable,
               isOwned(terminal.id),
-              let controller = controlClient as? BrokerControlClient,
+              !controlClient.connectionInstanceID.isEmpty,
               let current = sessions.first(where: {
                   $0.id == terminal.id
                       && $0.projectID == terminal.projectID
                       && !$0.exited
               }),
-              current.currentOwnerInstanceID == controller.connectionInstanceID else {
+              current.currentOwnerInstanceID == controlClient.connectionInstanceID else {
             return nil
         }
         return current
@@ -5172,9 +5200,28 @@ final class AppModel: ObservableObject {
                 sessions = status.terminals
                 reconcileAllPaneLayoutsWithAvailableSurfaces()
             }
+            let emptyDrains = await client.detachEmptyDrainingGenerations()
+            if !emptyDrains.isEmpty {
+                await controlClient.detachGenerations(emptyDrains)
+                brokerRollbackCandidates.removeAll { emptyDrains.contains($0.id) }
+            }
             if let activeBrokerUpgradeMonitor {
                 let next = await activeBrokerUpgradeMonitor.attemptUpgradeIfNeeded()
                 if next != brokerUpgradeState { brokerUpgradeState = next }
+                if case let .current(contentDigest) = next,
+                   activeBrokerTopology?.current.id != contentDigest {
+                    // The coordinator atomically changed the registry. Reopen
+                    // both lanes against the new topology before allowing a
+                    // create; retained terminal IDs will then route to drains.
+                    connectionLost(BrokerClientError.identityChanged, generation: connectionGeneration)
+                    return
+                }
+            }
+            if let provider = activeBrokerTopologyProvider,
+               let latest = await provider.generationTopology(),
+               latest != activeBrokerTopology {
+                connectionLost(BrokerClientError.identityChanged, generation: connectionGeneration)
+                return
             }
         } catch {
             consecutiveInventoryFailures += 1
@@ -5186,6 +5233,36 @@ final class AppModel: ObservableObject {
         }
         refreshBranches()
         refreshMeta()
+    }
+
+    func rollbackBrokerGeneration(_ generationID: String) async {
+        guard brokerRollbackCandidates.contains(where: { $0.id == generationID }),
+              let controller = activeBrokerRollbackController else {
+            ToastCenter.shared.show(
+                BrokerRollbackError.targetUnavailable.localizedDescription,
+                style: .error
+            )
+            return
+        }
+        do {
+            let selected = try await controller.rollback(toGenerationID: generationID)
+            ToastCenter.shared.show(
+                "Using terminal continuity \(selected.version). Running terminals were preserved.",
+                style: .success
+            )
+            brokerRollbackCandidates = []
+            connectionLost(
+                BrokerClientError.identityChanged,
+                generation: connectionGeneration
+            )
+        } catch {
+            ToastCenter.shared.show(
+                (error as? BrokerRollbackError)?.localizedDescription
+                    ?? "Terminal-continuity rollback could not be completed safely.",
+                style: .error,
+                duration: 6
+            )
+        }
     }
 
     /// Process-name + listening-port meta per owned native session, refreshed
@@ -5281,7 +5358,10 @@ final class AppModel: ObservableObject {
     /// the terminals this app created in earlier runs. Registry entries from a
     /// different still-draining broker are retained; an authenticated broker
     /// owner capability can repair records lost during a profile switch.
-    private func restoreOwnedSessions(info: BrokerInfo, generation: Int) async {
+    private func restoreOwnedSessions(
+        topology: BrokerGenerationTopology,
+        generation: Int
+    ) async {
         controlAvailable = false
         ownedTerminalIDs = []
         await controlClient.setDisconnectHandler { [weak self] error in
@@ -5299,7 +5379,7 @@ final class AppModel: ObservableObject {
             }
         }
         do {
-            try await controlClient.connect(to: info, ownerID: sessionStore.ownerID())
+            try await controlClient.connect(to: topology, ownerID: sessionStore.ownerID())
         } catch {
             // Observation continues against brokers that refuse control.
             return
@@ -5386,8 +5466,13 @@ final class AppModel: ObservableObject {
         }
         await client.disconnect()
         connectedBrokerFeatures = []
+        activeBrokerTopology = nil
+        activeBrokerTopologyProvider = nil
         activeBrokerUpgradeMonitor = nil
+        activeBrokerRollbackController = nil
         brokerUpgradeState = .unknown
+        brokerGenerationDetail = "Broker generations have not been inspected yet."
+        brokerRollbackCandidates = []
     }
 
     private func connect(generation: Int, reconnectAttempt: Int?) async -> Bool {
@@ -5416,12 +5501,18 @@ final class AppModel: ObservableObject {
                 Task { @MainActor in self?.consume(event) }
             }
             var info: BrokerInfo
+            var topology: BrokerGenerationTopology
             var hello: BrokerHello
             do {
                 activeBrokerUpgradeMonitor = brokerPreparer as? any BrokerUpgradeMonitoring
+                activeBrokerTopologyProvider = brokerPreparer as? any BrokerGenerationTopologyProviding
+                activeBrokerRollbackController = brokerPreparer as? any BrokerGenerationRollbackServing
                 info = try await brokerPreparer.prepare()
+                topology = await activeBrokerTopologyProvider?
+                    .generationTopology() ?? .single(info)
                 activeBrokerIdentity = info.persistenceIdentity
-                hello = try await client.connect(to: info)
+                activeBrokerTopology = topology
+                hello = try await client.connect(to: topology)
                 usingSeparateBroker = false
             } catch BrokerClientError.observeFeatureMissing where fallbackPreparer != nil {
                 // Electron's broker is alive but predates the features this app
@@ -5432,9 +5523,14 @@ final class AppModel: ObservableObject {
                 // socket; reset it before dialing the separate broker.
                 await client.disconnect()
                 activeBrokerUpgradeMonitor = fallbackPreparer as? any BrokerUpgradeMonitoring
+                activeBrokerTopologyProvider = fallbackPreparer as? any BrokerGenerationTopologyProviding
+                activeBrokerRollbackController = fallbackPreparer as? any BrokerGenerationRollbackServing
                 info = try await fallbackPreparer.prepare()
+                topology = await activeBrokerTopologyProvider?
+                    .generationTopology() ?? .single(info)
                 activeBrokerIdentity = info.persistenceIdentity
-                hello = try await client.connect(to: info)
+                activeBrokerTopology = topology
+                hello = try await client.connect(to: topology)
                 usingSeparateBroker = true
             }
             let status = try await client.inventory()
@@ -5447,6 +5543,19 @@ final class AppModel: ObservableObject {
             sessions = status.terminals
             connectedBrokerFeatures = hello.features
             brokerUpgradeState = await activeBrokerUpgradeMonitor?.upgradeState() ?? .unknown
+            brokerGenerationDetail = BrokerGenerationDiagnostics.detail(
+                appVersion: Bundle.main.object(
+                    forInfoDictionaryKey: "CFBundleShortVersionString"
+                ) as? String ?? "Dev",
+                topology: topology
+            )
+            brokerRollbackCandidates = await activeBrokerRollbackController?
+                .rollbackCandidates() ?? []
+            await client.preserveDrainingGenerations(Set(
+                brokerRollbackCandidates.lazy
+                    .filter(\.retainedForExplicitSelection)
+                    .map(\.id)
+            ))
             if restoredWorkspaceState {
                 // A reconnect inventory is authoritative before any old split
                 // subscription is restored. Prune finished ids in the same
@@ -5458,7 +5567,12 @@ final class AppModel: ObservableObject {
                 pid: hello.pid,
                 serverEnforcedObserver: hello.serverEnforcedObserver
             )
-            await restoreOwnedSessions(info: info, generation: generation)
+            await restoreOwnedSessions(topology: topology, generation: generation)
+            let emptyDrains = await client.detachEmptyDrainingGenerations()
+            if !emptyDrains.isEmpty {
+                await controlClient.detachGenerations(emptyDrains)
+                brokerRollbackCandidates.removeAll { emptyDrains.contains($0.id) }
+            }
             startInventoryRefresh(generation: generation)
             // Prefer the in-memory selection, then the persisted one from the
             // last run (whole-app persistence), then the first session.
@@ -5491,6 +5605,10 @@ final class AppModel: ObservableObject {
         } catch {
             guard generation == connectionGeneration, shouldReconnect else { return false }
             connectedBrokerFeatures = []
+            activeBrokerTopology = nil
+            activeBrokerTopologyProvider = nil
+            activeBrokerRollbackController = nil
+            brokerRollbackCandidates = []
             let description = error.kaisolaSafeDescription
             if case let .unavailable(existing) = connectionState, existing == description {
                 // identical settled state — no churn for observers
@@ -6054,6 +6172,8 @@ final class AppModel: ObservableObject {
         guard generation == connectionGeneration, shouldReconnect else { return }
         flushPendingTerminalOutputs()
         connectedBrokerFeatures = []
+        brokerRollbackCandidates = []
+        activeBrokerRollbackController = nil
         connectionState = .unavailable(error.kaisolaSafeDescription)
         Task { [weak self] in
             guard let self else { return }
@@ -6067,9 +6187,11 @@ final class AppModel: ObservableObject {
     }
 
     private func cursorScope(for session: BrokerTerminalRecord) -> TerminalCursorScope? {
-        guard let activeBrokerIdentity else { return nil }
+        guard let brokerIdentity = session.brokerPersistenceIdentity ?? activeBrokerIdentity else {
+            return nil
+        }
         return TerminalCursorScope(
-            brokerIdentity: activeBrokerIdentity,
+            brokerIdentity: brokerIdentity,
             projectID: session.projectID,
             terminalID: session.id
         )

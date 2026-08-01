@@ -7,13 +7,14 @@ final class BrokerWireTests: XCTestCase {
     func testConstantsMatchTheShippingNodeBroker() {
         XCTAssertEqual(BrokerWire.protocolVersion, 2)
         XCTAssertEqual(BrokerWire.securityEpoch, 1)
-        XCTAssertEqual(BrokerWire.implementationVersion, 1)
+        XCTAssertEqual(BrokerWire.implementationVersion, 2)
         XCTAssertEqual(BrokerWire.helperPackageSchema, 1)
         XCTAssertEqual(BrokerWire.compatibleImplementationVersions, 1...2)
         XCTAssertEqual(BrokerWire.terminalObserveFeature, "terminal-observe-v1")
         XCTAssertEqual(BrokerWire.terminalHistoryFeature, "terminal-history-v1")
         XCTAssertEqual(BrokerWire.observerRoleFeature, "observer-role-v1")
         XCTAssertEqual(BrokerWire.brokerUpdateFeature, "broker-update-v1")
+        XCTAssertEqual(BrokerWire.brokerRollingUpdateFeature, "broker-rolling-update-v1")
         XCTAssertEqual(BrokerWire.observerMethods, [
             "broker.status",
             "terminal.list",

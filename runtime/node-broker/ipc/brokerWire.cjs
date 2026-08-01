@@ -17,12 +17,13 @@ const SECURITY_EPOCH = 1
 // layout used by the native preview. Neither value is permission to replace a
 // live broker; clients must adopt a compatible live process and defer helper
 // upgrades until its terminal inventory is empty.
-const BROKER_IMPLEMENTATION_VERSION = 1
+const BROKER_IMPLEMENTATION_VERSION = 2
 const BROKER_PACKAGE_SCHEMA = 1
 const TERMINAL_OBSERVE_FEATURE = 'terminal-observe-v1'
 const TERMINAL_HISTORY_FEATURE = 'terminal-history-v1'
 const OBSERVER_ROLE_FEATURE = 'observer-role-v1'
 const BROKER_UPDATE_FEATURE = 'broker-update-v1'
+const BROKER_ROLLING_UPDATE_FEATURE = 'broker-rolling-update-v1'
 const OBSERVER_ACCESS = 'observer'
 const OBSERVER_METHODS = Object.freeze([
   'broker.status',
@@ -59,10 +60,10 @@ function brokerMethodAllowedForAccess(access, method) {
 function brokerVersionsCompatible({ protocol, securityEpoch, implementationVersion }) {
   if (Number(protocol) !== PROTOCOL || Number(securityEpoch) !== SECURITY_EPOCH) return false
   // Protocol-2 brokers predating this additive field are implementation N.
-  const implementation = implementationVersion == null ? BROKER_IMPLEMENTATION_VERSION : Number(implementationVersion)
+  const implementation = implementationVersion == null ? 1 : Number(implementationVersion)
   return Number.isInteger(implementation)
-    && implementation >= BROKER_IMPLEMENTATION_VERSION
-    && implementation <= BROKER_IMPLEMENTATION_VERSION + 1
+    && implementation >= 1
+    && implementation <= BROKER_IMPLEMENTATION_VERSION
 }
 
 module.exports = {
@@ -74,6 +75,7 @@ module.exports = {
   TERMINAL_HISTORY_FEATURE,
   OBSERVER_ROLE_FEATURE,
   BROKER_UPDATE_FEATURE,
+  BROKER_ROLLING_UPDATE_FEATURE,
   OBSERVER_ACCESS,
   OBSERVER_METHODS,
   MAX_FRAME,

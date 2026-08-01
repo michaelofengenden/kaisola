@@ -126,6 +126,86 @@ final class BrokerStartupCoordinatorTests: XCTestCase {
         await launcher.close()
     }
 
+    func testDeadRegisteredGenerationIsReplacedWithOneCASRevision() async throws {
+        let home = try privateTemporaryDirectory()
+        let profile = home.appendingPathComponent("Kaisola", isDirectory: true)
+        let broker = profile.appendingPathComponent("session-broker", isDirectory: true)
+        let metadataDirectory = broker.appendingPathComponent(
+            BrokerLaunchConfiguration.generationMetadataDirectoryName,
+            isDirectory: true
+        )
+        for directory in [profile, broker, metadataDirectory] {
+            try FileManager.default.createDirectory(
+                at: directory,
+                withIntermediateDirectories: false,
+                attributes: [.posixPermissions: 0o700]
+            )
+            _ = chmod(directory.path, 0o700)
+        }
+
+        let digest = String(repeating: "d", count: 64)
+        let socket = broker.appendingPathComponent(
+            BrokerLaunchConfiguration.generationSocketLeaf(
+                userData: profile,
+                contentDigest: digest
+            )
+        )
+        let staleDescriptor = try bindUnixSocket(at: socket)
+        Darwin.close(staleDescriptor)
+        let stale = BrokerInfo(
+            protocolVersion: 2,
+            securityEpoch: 1,
+            implementationVersion: 1,
+            packageSchema: 1,
+            packageVersion: "test-package",
+            contentDigest: digest,
+            pid: Int32.max,
+            socketPath: socket.path,
+            token: String(repeating: "c", count: 64),
+            startedAt: 1,
+            version: "stale-native"
+        )
+        let metadataURL = metadataDirectory.appendingPathComponent("\(digest).json")
+        try JSONEncoder().encode(stale).write(to: metadataURL)
+        _ = chmod(metadataURL.path, 0o600)
+        let record = BrokerGenerationRecord(
+            id: digest,
+            role: .current,
+            info: stale,
+            packageRoot: profile
+                .appendingPathComponent("broker-generations", isDirectory: true)
+                .appendingPathComponent(digest, isDirectory: true)
+                .path,
+            registeredAt: 1
+        )
+        let store = BrokerGenerationRegistryStore(profileRoot: profile)
+        _ = try store.save(
+            currentGenerationID: digest,
+            generations: [record],
+            expectedRevision: nil,
+            now: 1
+        )
+
+        let launcher = FakeBrokerHelperLauncher()
+        let coordinator = BrokerStartupCoordinator(
+            locator: BrokerInfoLocator(userDataCandidates: [profile]),
+            launcher: launcher,
+            homeDirectory: home,
+            appVersion: "native-test"
+        )
+        let replacement = try await coordinator.prepare()
+        let registry = try store.load()
+        let launchCount = await launcher.launchCount
+
+        XCTAssertEqual(replacement.pid, getpid())
+        XCTAssertEqual(replacement.contentDigest, digest)
+        XCTAssertEqual(registry.revision, 2)
+        XCTAssertEqual(registry.topology?.current.info, replacement)
+        XCTAssertTrue(registry.topology?.draining.isEmpty == true)
+        XCTAssertEqual(launchCount, 1)
+        await launcher.close()
+    }
+
     func testStaleLiveBrokerDefersWithExactAuthoritativeBlockers() async throws {
         let home = try privateTemporaryDirectory()
         let blockers = BrokerUpgradeBlockers(
@@ -193,6 +273,334 @@ final class BrokerStartupCoordinatorTests: XCTestCase {
         XCTAssertEqual(launchCount, 0)
     }
 
+    func testRollingCutoverPublishesNewCurrentAndRetainsLivePriorGeneration() async throws {
+        let home = try privateTemporaryDirectory()
+        let oldDigest = String(repeating: "e", count: 64)
+        let live = try makeRegisteredLiveBroker(home: home, contentDigest: oldDigest)
+        defer { Darwin.close(live.descriptor) }
+        let requester = FakeRollingBrokerUpgradeRequester(upgradeDecision: .accepted)
+        let launcher = FakeBrokerHelperLauncher(implementationVersion: 2)
+        let coordinator = BrokerStartupCoordinator(
+            locator: BrokerInfoLocator(userDataCandidates: [live.profile]),
+            launcher: launcher,
+            homeDirectory: home,
+            appVersion: "native-test",
+            upgradeRequester: requester,
+            rollingUpdatesEnabled: true
+        )
+
+        let replacement = try await coordinator.prepare()
+        let registry = try BrokerGenerationRegistryStore(profileRoot: live.profile).load()
+        let topology = try XCTUnwrap(registry.topology)
+        let upgradeCalls = await requester.upgradeCallCount()
+        let cancelCalls = await requester.cancelCallCount()
+        let launchCalls = await launcher.launchCount
+
+        XCTAssertEqual(replacement.contentDigest, String(repeating: "d", count: 64))
+        XCTAssertEqual(replacement.implementationVersion, 2)
+        XCTAssertEqual(registry.revision, 2)
+        XCTAssertEqual(topology.current.info, replacement)
+        XCTAssertEqual(topology.draining.map(\.id), [oldDigest])
+        XCTAssertEqual(topology.draining[0].info, live.info)
+        XCTAssertTrue(live.info.isProcessAlive)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: live.info.socketPath))
+        XCTAssertEqual(upgradeCalls, 1)
+        XCTAssertEqual(cancelCalls, 0)
+        XCTAssertEqual(launchCalls, 1)
+        await launcher.close()
+    }
+
+    func testRollbackSelectsVerifiedDrainAndSurvivesSameAppRelaunch() async throws {
+        let home = try privateTemporaryDirectory()
+        let oldDigest = String(repeating: "e", count: 64)
+        let bundledDigest = String(repeating: "d", count: 64)
+        let live = try makeRegisteredLiveBroker(home: home, contentDigest: oldDigest)
+        defer { Darwin.close(live.descriptor) }
+        let requester = FakeRollingBrokerUpgradeRequester(upgradeDecision: .accepted)
+        let launcher = FakeBrokerHelperLauncher(implementationVersion: 2)
+        let coordinator = BrokerStartupCoordinator(
+            locator: BrokerInfoLocator(userDataCandidates: [live.profile]),
+            launcher: launcher,
+            homeDirectory: home,
+            appVersion: "native-test",
+            upgradeRequester: requester,
+            rollingUpdatesEnabled: true
+        )
+
+        _ = try await coordinator.prepare()
+        let candidates = await coordinator.rollbackCandidates()
+        XCTAssertEqual(candidates.map(\.id), [oldDigest])
+        XCTAssertEqual(candidates.first?.packageVersion, "old-package")
+
+        let selected = try await coordinator.rollback(toGenerationID: oldDigest)
+        let store = BrokerGenerationRegistryStore(profileRoot: live.profile)
+        let rolledBack = try store.load()
+        XCTAssertEqual(selected, live.info)
+        XCTAssertEqual(rolledBack.currentGenerationID, oldDigest)
+        XCTAssertEqual(rolledBack.topology?.draining.map(\.id), [bundledDigest])
+        XCTAssertEqual(rolledBack.selection?.generationID, oldDigest)
+        XCTAssertEqual(rolledBack.selection?.selectingAppContentDigest, bundledDigest)
+        _ = await coordinator.attemptUpgradeIfNeeded()
+        let retirementCalls = await requester.retirementCallCount()
+        XCTAssertEqual(retirementCalls, 0)
+        XCTAssertEqual(try store.load(), rolledBack)
+
+        // The same sealed app honors its explicit selection rather than
+        // immediately rolling forward on the next heartbeat/relaunch probe.
+        let adoptedAgain = try await coordinator.prepare()
+        let upgradeCalls = await requester.upgradeCallCount()
+        let cancelCalls = await requester.cancelCallCount()
+        XCTAssertEqual(adoptedAgain, live.info)
+        XCTAssertEqual(upgradeCalls, 2)
+        XCTAssertEqual(cancelCalls, 1)
+        XCTAssertEqual(try store.load(), rolledBack)
+        await launcher.close()
+    }
+
+    func testRollbackRejectsTamperedStagedDrainWithoutChangingRegistry() async throws {
+        let home = try privateTemporaryDirectory()
+        let oldDigest = String(repeating: "e", count: 64)
+        let live = try makeRegisteredLiveBroker(home: home, contentDigest: oldDigest)
+        defer { Darwin.close(live.descriptor) }
+        let requester = FakeRollingBrokerUpgradeRequester(upgradeDecision: .accepted)
+        let launcher = FakeBrokerHelperLauncher(
+            implementationVersion: 2,
+            rejectedStagedDigests: [oldDigest]
+        )
+        let coordinator = BrokerStartupCoordinator(
+            locator: BrokerInfoLocator(userDataCandidates: [live.profile]),
+            launcher: launcher,
+            homeDirectory: home,
+            appVersion: "native-test",
+            upgradeRequester: requester,
+            rollingUpdatesEnabled: true
+        )
+
+        _ = try await coordinator.prepare()
+        let store = BrokerGenerationRegistryStore(profileRoot: live.profile)
+        let before = try store.load()
+        let candidates = await coordinator.rollbackCandidates()
+        XCTAssertEqual(candidates, [])
+        do {
+            _ = try await coordinator.rollback(toGenerationID: oldDigest)
+            XCTFail("expected staged-package tampering to block rollback")
+        } catch {
+            XCTAssertEqual(error as? BrokerRollbackError, .targetNotVerified)
+        }
+        let upgradeCalls = await requester.upgradeCallCount()
+        XCTAssertEqual(try store.load(), before)
+        XCTAssertEqual(upgradeCalls, 1)
+        await launcher.close()
+    }
+
+    func testEmptyDrainingGenerationRetiresAfterIdentityRecheckAndDetachment() async throws {
+        let home = try privateTemporaryDirectory()
+        let oldDigest = String(repeating: "e", count: 64)
+        let live = try makeRegisteredLiveBroker(home: home, contentDigest: oldDigest)
+        defer { Darwin.close(live.descriptor) }
+        let cutoverRequester = FakeRollingBrokerUpgradeRequester(upgradeDecision: .accepted)
+        let launcher = FakeBrokerHelperLauncher(implementationVersion: 2)
+        let locator = BrokerInfoLocator(userDataCandidates: [live.profile])
+        let cutoverCoordinator = BrokerStartupCoordinator(
+            locator: locator,
+            launcher: launcher,
+            homeDirectory: home,
+            appVersion: "native-test",
+            upgradeRequester: cutoverRequester,
+            rollingUpdatesEnabled: true
+        )
+        _ = try await cutoverCoordinator.prepare()
+
+        let store = BrokerGenerationRegistryStore(profileRoot: live.profile)
+        let cutoverRegistry = try store.load()
+        let cutoverTopology = try XCTUnwrap(cutoverRegistry.topology)
+        let old = try XCTUnwrap(cutoverTopology.draining.first)
+        let childPID = try spawnPausedChild()
+        defer {
+            _ = Darwin.kill(childPID, SIGKILL)
+            var status: Int32 = 0
+            _ = waitpid(childPID, &status, WNOHANG)
+        }
+        let childInfo = BrokerInfo(
+            protocolVersion: old.info.protocolVersion,
+            securityEpoch: old.info.securityEpoch,
+            implementationVersion: old.info.implementationVersion,
+            packageSchema: old.info.packageSchema,
+            packageVersion: old.info.packageVersion,
+            contentDigest: old.info.contentDigest,
+            pid: childPID,
+            socketPath: old.info.socketPath,
+            token: old.info.token,
+            startedAt: old.info.startedAt,
+            version: old.info.version
+        )
+        let childGeneration = BrokerGenerationRecord(
+            id: old.id,
+            role: .draining,
+            info: childInfo,
+            packageRoot: old.packageRoot,
+            registeredAt: old.registeredAt
+        )
+        let metadataURL = store.metadataURL(for: childGeneration)
+        try JSONEncoder().encode(childInfo).write(to: metadataURL)
+        _ = chmod(metadataURL.path, 0o600)
+        let rewritten = try store.save(
+            currentGenerationID: cutoverTopology.current.id,
+            generations: [cutoverTopology.current, childGeneration],
+            expectedRevision: cutoverRegistry.revision
+        )
+
+        let metadataPath = metadataURL.path
+        let socketPath = childInfo.socketPath
+        let retirementRequester = FakeRollingBrokerUpgradeRequester(
+            upgradeDecision: .accepted,
+            retirementDecision: .accepted,
+            onRetirement: {
+                _ = Darwin.kill(childPID, SIGKILL)
+                var status: Int32 = 0
+                _ = waitpid(childPID, &status, 0)
+                _ = metadataPath.withCString(Darwin.unlink)
+                _ = socketPath.withCString(Darwin.unlink)
+            }
+        )
+        let retirementCoordinator = BrokerStartupCoordinator(
+            locator: locator,
+            launcher: launcher,
+            homeDirectory: home,
+            appVersion: "native-test",
+            upgradeRequester: retirementRequester,
+            rollingUpdatesEnabled: true
+        )
+        _ = try await retirementCoordinator.prepare()
+        _ = await retirementCoordinator.attemptUpgradeIfNeeded()
+
+        let retired = try store.load()
+        let retirementCalls = await retirementRequester.retirementCallCount()
+        XCTAssertEqual(rewritten.revision, 3)
+        XCTAssertEqual(retired.revision, 4)
+        XCTAssertEqual(retired.currentGenerationID, cutoverTopology.current.id)
+        XCTAssertTrue(retired.topology?.draining.isEmpty == true)
+        XCTAssertEqual(retirementCalls, 1)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: metadataPath))
+        await launcher.close()
+    }
+
+    func testRollbackRefusesOlderImplementationEvenWhenItsProcessIsLive() async throws {
+        let home = try privateTemporaryDirectory()
+        let oldDigest = String(repeating: "e", count: 64)
+        let live = try makeRegisteredLiveBroker(home: home, contentDigest: oldDigest)
+        defer { Darwin.close(live.descriptor) }
+        let requester = FakeRollingBrokerUpgradeRequester(upgradeDecision: .accepted)
+        let launcher = FakeBrokerHelperLauncher(implementationVersion: 2)
+        let locator = BrokerInfoLocator(userDataCandidates: [live.profile])
+        let coordinator = BrokerStartupCoordinator(
+            locator: locator,
+            launcher: launcher,
+            homeDirectory: home,
+            appVersion: "native-test",
+            upgradeRequester: requester,
+            rollingUpdatesEnabled: true
+        )
+        _ = try await coordinator.prepare()
+
+        let store = BrokerGenerationRegistryStore(profileRoot: live.profile)
+        let registry = try store.load()
+        let topology = try XCTUnwrap(registry.topology)
+        let old = try XCTUnwrap(topology.draining.first)
+        let downgradedInfo = BrokerInfo(
+            protocolVersion: old.info.protocolVersion,
+            securityEpoch: old.info.securityEpoch,
+            implementationVersion: 1,
+            packageSchema: old.info.packageSchema,
+            packageVersion: old.info.packageVersion,
+            contentDigest: old.info.contentDigest,
+            pid: old.info.pid,
+            socketPath: old.info.socketPath,
+            token: old.info.token,
+            startedAt: old.info.startedAt,
+            version: "older-implementation"
+        )
+        let downgraded = BrokerGenerationRecord(
+            id: old.id,
+            role: .draining,
+            info: downgradedInfo,
+            packageRoot: old.packageRoot,
+            registeredAt: old.registeredAt
+        )
+        try JSONEncoder().encode(downgradedInfo).write(to: store.metadataURL(for: downgraded))
+        _ = chmod(store.metadataURL(for: downgraded).path, 0o600)
+        let before = try store.save(
+            currentGenerationID: topology.current.id,
+            generations: [topology.current, downgraded],
+            expectedRevision: registry.revision
+        )
+
+        let candidates = await coordinator.rollbackCandidates()
+        XCTAssertEqual(candidates, [])
+        do {
+            _ = try await coordinator.rollback(toGenerationID: oldDigest)
+            XCTFail("expected older implementation to be refused")
+        } catch {
+            XCTAssertEqual(error as? BrokerRollbackError, .incompatibleTarget)
+        }
+        let upgradeCalls = await requester.upgradeCallCount()
+        XCTAssertEqual(try store.load(), before)
+        XCTAssertEqual(upgradeCalls, 1)
+        await launcher.close()
+    }
+
+    func testRollingActivityAndLeaseRacesLeaveOldGenerationCurrent() async throws {
+        let blockers = BrokerUpgradeBlockers(
+            liveTerminalCount: 1,
+            liveTerminalIDs: ["retained"],
+            busyAgentCount: 0,
+            busyTerminalIDs: [],
+            childTaskCount: 0
+        )
+        let decisions: [(BrokerUpgradeDecision, BrokerUpgradePendingReason)] = [
+            (.activityChanged(blockers), .activityChanged(blockers)),
+            (.companionLeaseChanged(blockers), .companionLeaseChanged(blockers)),
+        ]
+
+        for (index, entry) in decisions.enumerated() {
+            let home = try privateTemporaryDirectory()
+            let oldDigest = String(repeating: index == 0 ? "e" : "f", count: 64)
+            let live = try makeRegisteredLiveBroker(home: home, contentDigest: oldDigest)
+            let requester = FakeRollingBrokerUpgradeRequester(upgradeDecision: entry.0)
+            let launcher = FakeBrokerHelperLauncher(implementationVersion: 2)
+            let coordinator = BrokerStartupCoordinator(
+                locator: BrokerInfoLocator(userDataCandidates: [live.profile]),
+                launcher: launcher,
+                homeDirectory: home,
+                appVersion: "native-test",
+                upgradeRequester: requester,
+                rollingUpdatesEnabled: true
+            )
+
+            let adopted = try await coordinator.prepare()
+            let registry = try BrokerGenerationRegistryStore(profileRoot: live.profile).load()
+            let state = await coordinator.upgradeState()
+            let upgradeCalls = await requester.upgradeCallCount()
+            let cancelCalls = await requester.cancelCallCount()
+            let launchCalls = await launcher.launchCount
+
+            XCTAssertEqual(adopted, live.info)
+            XCTAssertEqual(registry.revision, 1)
+            XCTAssertEqual(registry.currentGenerationID, oldDigest)
+            XCTAssertTrue(registry.topology?.draining.isEmpty == true)
+            XCTAssertEqual(state, .pending(
+                fromContentDigest: oldDigest,
+                targetContentDigest: String(repeating: "d", count: 64),
+                reason: entry.1
+            ))
+            XCTAssertEqual(upgradeCalls, 1)
+            XCTAssertEqual(cancelCalls, 0)
+            XCTAssertEqual(launchCalls, 1)
+            await launcher.close()
+            Darwin.close(live.descriptor)
+        }
+    }
+
     private func privateTemporaryDirectory() throws -> URL {
         let root = URL(fileURLWithPath: "/tmp", isDirectory: true)
             .appendingPathComponent("kaisola-startup-test-\(UUID().uuidString)", isDirectory: true)
@@ -239,6 +647,66 @@ final class BrokerStartupCoordinatorTests: XCTestCase {
         _ = chmod(infoURL.path, 0o600)
         return (profile, descriptor)
     }
+
+    private func makeRegisteredLiveBroker(
+        home: URL,
+        contentDigest: String
+    ) throws -> (profile: URL, descriptor: Int32, info: BrokerInfo) {
+        let profile = home.appendingPathComponent("Kaisola", isDirectory: true)
+        let broker = profile.appendingPathComponent("session-broker", isDirectory: true)
+        let metadataDirectory = broker.appendingPathComponent(
+            BrokerLaunchConfiguration.generationMetadataDirectoryName,
+            isDirectory: true
+        )
+        let packageRoot = profile
+            .appendingPathComponent("broker-generations", isDirectory: true)
+            .appendingPathComponent(contentDigest, isDirectory: true)
+        for directory in [profile, broker, metadataDirectory, packageRoot] {
+            try FileManager.default.createDirectory(
+                at: directory,
+                withIntermediateDirectories: true,
+                attributes: [.posixPermissions: 0o700]
+            )
+            _ = chmod(directory.path, 0o700)
+        }
+        let socket = broker.appendingPathComponent(
+            BrokerLaunchConfiguration.generationSocketLeaf(
+                userData: profile,
+                contentDigest: contentDigest
+            )
+        )
+        let descriptor = try bindUnixSocket(at: socket)
+        let info = BrokerInfo(
+            protocolVersion: 2,
+            securityEpoch: 1,
+            implementationVersion: 2,
+            packageSchema: 1,
+            packageVersion: "old-package",
+            contentDigest: contentDigest,
+            pid: getpid(),
+            socketPath: socket.path,
+            token: String(repeating: "b", count: 64),
+            startedAt: 1,
+            version: "old-native"
+        )
+        let metadataURL = metadataDirectory.appendingPathComponent("\(contentDigest).json")
+        try JSONEncoder().encode(info).write(to: metadataURL)
+        _ = chmod(metadataURL.path, 0o600)
+        let record = BrokerGenerationRecord(
+            id: contentDigest,
+            role: .current,
+            info: info,
+            packageRoot: packageRoot.path,
+            registeredAt: 1
+        )
+        _ = try BrokerGenerationRegistryStore(profileRoot: profile).save(
+            currentGenerationID: contentDigest,
+            generations: [record],
+            expectedRevision: nil,
+            now: 1
+        )
+        return (profile, descriptor, info)
+    }
 }
 
 private actor FakeBrokerUpgradeRequester: BrokerUpgradeRequesting {
@@ -258,22 +726,111 @@ private actor FakeBrokerUpgradeRequester: BrokerUpgradeRequesting {
     }
 }
 
+private actor FakeRollingBrokerUpgradeRequester: BrokerRollingUpdateRequesting {
+    private let upgradeDecision: BrokerUpgradeDecision
+    private let retirementDecision: BrokerRetirementDecision
+    private let onRetirement: @Sendable () -> Void
+    private var upgrades = 0
+    private var cancels = 0
+    private var retirements = 0
+
+    init(
+        upgradeDecision: BrokerUpgradeDecision,
+        retirementDecision: BrokerRetirementDecision = .deferred(
+            BrokerUpgradeBlockers(
+                liveTerminalCount: 1,
+                liveTerminalIDs: ["retained"],
+                busyAgentCount: 0,
+                busyTerminalIDs: [],
+                childTaskCount: 0
+            ),
+            clientCount: 1
+        ),
+        onRetirement: @escaping @Sendable () -> Void = {}
+    ) {
+        self.upgradeDecision = upgradeDecision
+        self.retirementDecision = retirementDecision
+        self.onRetirement = onRetirement
+    }
+
+    func requestUpgrade(
+        from info: BrokerInfo,
+        targetContentDigest: String
+    ) async throws -> BrokerUpgradeDecision {
+        upgrades += 1
+        return upgradeDecision
+    }
+
+    func cancelRollingUpdate(from info: BrokerInfo, targetContentDigest: String) async throws {
+        cancels += 1
+    }
+
+    func requestRetirement(
+        of info: BrokerInfo,
+        targetContentDigest: String
+    ) async throws -> BrokerRetirementDecision {
+        retirements += 1
+        onRetirement()
+        return retirementDecision
+    }
+
+    func upgradeCallCount() -> Int { upgrades }
+    func cancelCallCount() -> Int { cancels }
+    func retirementCallCount() -> Int { retirements }
+}
+
 private actor FakeBrokerHelperLauncher: BrokerHelperLaunching {
+    private let implementationVersion: Int
+    private let rejectedStagedDigests: Set<String>
     private(set) var launchCount = 0
     private var descriptor: Int32 = -1
     private var socketURL: URL?
+
+    init(
+        implementationVersion: Int = 1,
+        rejectedStagedDigests: Set<String> = []
+    ) {
+        self.implementationVersion = implementationVersion
+        self.rejectedStagedDigests = rejectedStagedDigests
+    }
 
     func packageManifest() async throws -> BrokerHelperManifest {
         BrokerHelperManifest(
             schemaVersion: 1,
             packageVersion: "test-package",
             contentDigest: String(repeating: "d", count: 64),
-            brokerImplementationVersion: 1,
+            brokerImplementationVersion: implementationVersion,
             brokerProtocol: .init(minimum: 2, maximum: 2, securityEpoch: 1),
             node: .init(version: "22.23.1", abi: "127", architectures: ["arm64"]),
             nodePty: .init(version: "1.1.0"),
             files: []
         )
+    }
+
+    func validateStagedPackage(
+        at root: URL,
+        expected manifest: BrokerHelperManifest
+    ) async throws {}
+
+    func verifiedStagedPackage(at root: URL) async throws -> VerifiedBrokerHelperPackage {
+        let digest = root.lastPathComponent
+        guard !rejectedStagedDigests.contains(digest) else {
+            throw BrokerHelperPackageError.stagedPackageMismatch
+        }
+        let packageVersion = digest == String(repeating: "d", count: 64)
+            ? "test-package"
+            : "old-package"
+        let manifest = BrokerHelperManifest(
+            schemaVersion: 1,
+            packageVersion: packageVersion,
+            contentDigest: digest,
+            brokerImplementationVersion: implementationVersion,
+            brokerProtocol: .init(minimum: 2, maximum: 2, securityEpoch: 1),
+            node: .init(version: "22.23.1", abi: "127", architectures: ["arm64"]),
+            nodePty: .init(version: "1.1.0"),
+            files: []
+        )
+        return VerifiedBrokerHelperPackage(root: root, manifest: manifest)
     }
 
     func launch(configurationURL: URL) async throws -> Int32 {
@@ -341,4 +898,25 @@ private func bindUnixSocket(at url: URL) throws -> Int32 {
     }
     _ = chmod(url.path, 0o600)
     return descriptor
+}
+
+private func spawnPausedChild() throws -> pid_t {
+    let argv = [strdup("/bin/sleep"), strdup("60"), nil]
+    let environment = [UnsafeMutablePointer<CChar>?](arrayLiteral: nil)
+    defer { argv.dropLast().forEach { free($0) } }
+    var pid: pid_t = 0
+    let result = argv.withUnsafeBufferPointer { arguments in
+        environment.withUnsafeBufferPointer { variables in
+            posix_spawn(
+                &pid,
+                "/bin/sleep",
+                nil,
+                nil,
+                UnsafeMutablePointer(mutating: arguments.baseAddress),
+                UnsafeMutablePointer(mutating: variables.baseAddress)
+            )
+        }
+    }
+    guard result == 0, pid > 1 else { throw POSIXError(.EAGAIN) }
+    return pid
 }

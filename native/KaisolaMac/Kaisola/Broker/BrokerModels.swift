@@ -45,6 +45,10 @@ struct BrokerHello: Equatable, Sendable {
 struct BrokerStatus: Equatable, Sendable {
     let terminals: [BrokerTerminalRecord]
 
+    init(terminals: [BrokerTerminalRecord]) {
+        self.terminals = terminals
+    }
+
     init(
         status: JSONValue,
         diagnostics: JSONValue,
@@ -135,6 +139,10 @@ struct BrokerTerminalRecord: Identifiable, Equatable, Hashable, Sendable {
     /// PTY when several Kaisola windows observe the same broker.
     let currentOwnerInstanceID: String?
     let lastOwnerInstanceID: String?
+    /// Native-only generation identity. This is attached after a validated
+    /// broker inventory and never accepted from the wire payload itself.
+    let brokerGenerationID: String?
+    let brokerPersistenceIdentity: String?
     var agentActivity: AgentActivity
 
     var title: String {
@@ -169,6 +177,8 @@ struct BrokerTerminalRecord: Identifiable, Equatable, Hashable, Sendable {
         self.lastOwnerID = Self.stableOwnerID(from: lastOwner)
         self.currentOwnerInstanceID = Self.instanceID(from: owner)
         self.lastOwnerInstanceID = Self.instanceID(from: lastOwner)
+        self.brokerGenerationID = nil
+        self.brokerPersistenceIdentity = nil
         let busy = (live?["agentBusy"] ?? object["agentBusy"])?.boolValue ?? false
         if busy {
             self.agentActivity = .working
@@ -193,6 +203,8 @@ struct BrokerTerminalRecord: Identifiable, Equatable, Hashable, Sendable {
         lastOwnerID: String? = nil,
         currentOwnerInstanceID: String? = nil,
         lastOwnerInstanceID: String? = nil,
+        brokerGenerationID: String? = nil,
+        brokerPersistenceIdentity: String? = nil,
         agentActivity: AgentActivity = .idle
     ) {
         self.id = id
@@ -208,7 +220,30 @@ struct BrokerTerminalRecord: Identifiable, Equatable, Hashable, Sendable {
         self.lastOwnerID = lastOwnerID
         self.currentOwnerInstanceID = currentOwnerInstanceID
         self.lastOwnerInstanceID = lastOwnerInstanceID
+        self.brokerGenerationID = brokerGenerationID
+        self.brokerPersistenceIdentity = brokerPersistenceIdentity
         self.agentActivity = agentActivity
+    }
+
+    func routed(to generation: BrokerGenerationRecord) -> BrokerTerminalRecord {
+        BrokerTerminalRecord(
+            id: id,
+            projectID: projectID,
+            pid: pid,
+            exited: exited,
+            streamEpoch: streamEpoch,
+            endOffset: endOffset,
+            diskBytes: diskBytes,
+            columns: columns,
+            rows: rows,
+            currentOwnerID: currentOwnerID,
+            lastOwnerID: lastOwnerID,
+            currentOwnerInstanceID: currentOwnerInstanceID,
+            lastOwnerInstanceID: lastOwnerInstanceID,
+            brokerGenerationID: generation.id,
+            brokerPersistenceIdentity: generation.info.persistenceIdentity,
+            agentActivity: agentActivity
+        )
     }
 
     func wasOwned(by stableOwnerID: String) -> Bool {

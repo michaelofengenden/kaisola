@@ -6,6 +6,7 @@ protocol ObserveOnlyBrokerServing: Sendable {
     func setEventHandler(_ handler: (@Sendable (BrokerEvent) -> Void)?) async
     func setDisconnectHandler(_ handler: (@Sendable (any Error) -> Void)?) async
     func connect(to info: BrokerInfo) async throws -> BrokerHello
+    func connect(to topology: BrokerGenerationTopology) async throws -> BrokerHello
     func inventory() async throws -> BrokerStatus
     func subscribe(
         to terminal: BrokerTerminalRecord,
@@ -20,10 +21,32 @@ protocol ObserveOnlyBrokerServing: Sendable {
         maxBytes: Int
     ) async throws -> TerminalHistoryPage
     func unsubscribe(from terminal: BrokerTerminalRecord, ownerID: String) async throws
+    func preserveDrainingGenerations(_ generationIDs: Set<String>) async
+    func detachEmptyDrainingGenerations() async -> Set<String>
+    func subscribeBounded(
+        to terminal: BrokerTerminalRecord,
+        ownerID: String,
+        cursor: TerminalCursor?,
+        maximumSnapshotBytes: Int
+    ) async throws -> TerminalSubscriptionResult
     func disconnect() async
 }
 
 extension ObserveOnlyBrokerServing {
+    func preserveDrainingGenerations(_ generationIDs: Set<String>) async {}
+    func detachEmptyDrainingGenerations() async -> Set<String> { [] }
+    func connect(to topology: BrokerGenerationTopology) async throws -> BrokerHello {
+        try await connect(to: topology.current.info)
+    }
+
+    func subscribeBounded(
+        to terminal: BrokerTerminalRecord,
+        ownerID: String,
+        cursor: TerminalCursor?,
+        maximumSnapshotBytes: Int
+    ) async throws -> TerminalSubscriptionResult {
+        throw BrokerClientError.requestFailed("bounded terminal subscribe unavailable")
+    }
     /// Test doubles and older alternative clients remain source-compatible;
     /// the production client below is the only implementation that advertises
     /// and performs the additive read-only history request.
@@ -506,7 +529,9 @@ actor ObserveOnlyBrokerClient: ObserveOnlyBrokerServing {
             ) else {
                 throw BrokerClientError.implementationMismatch
             }
-            let implementationVersion = advertisedImplementation ?? BrokerWire.implementationVersion
+            // Protocol-2 brokers shipped before this additive field are
+            // implementation 1, irrespective of the current packaged helper.
+            let implementationVersion = advertisedImplementation ?? 1
             let packageSchema = object["packageSchema"]?.intValue.flatMap(Int.init(exactly:))
             let packageVersion = object["packageVersion"]?.stringValue
             let contentDigest = object["contentDigest"]?.stringValue

@@ -44,8 +44,6 @@ for selector in "${SELECTORS[@]}"; do
   fi
 done
 
-declare -a LOG_ARGS=()
-[[ "$VERBOSE" -eq 1 ]] || LOG_ARGS+=("-quiet")
 ACTION="test"
 [[ "$RUN_ONLY" -eq 1 ]] && ACTION="test-without-building"
 
@@ -53,22 +51,33 @@ ACTION="test"
 /usr/bin/touch "$DERIVED_DATA/.metadata_never_index"
 /bin/echo "Running focused native tests: ${SELECTORS[*]}"
 SECONDS=0
-/usr/bin/xcodebuild \
-  -project "$PROJECT" \
-  -scheme Kaisola \
-  -configuration Debug \
-  -derivedDataPath "$DERIVED_DATA" \
-  -destination "platform=macOS,arch=$(uname -m)" \
-  -disableAutomaticPackageResolution \
-  -onlyUsePackageVersionsFromResolvedFile \
-  -skipPackageUpdates \
-  "${LOG_ARGS[@]}" \
-  "${TEST_ARGS[@]}" \
-  ONLY_ACTIVE_ARCH=YES \
-  ARCHS="$(uname -m)" \
-  SWIFT_COMPILATION_MODE=incremental \
-  COMPILER_INDEX_STORE_ENABLE=NO \
-  BUILD_ACTIVE_RESOURCES_ONLY=YES \
-  KAISOLA_PACKAGE_BROKER_HELPER=0 \
-  "$ACTION"
+run_xcodebuild() {
+  /usr/bin/xcodebuild \
+    -project "$PROJECT" \
+    -scheme Kaisola \
+    -configuration Debug \
+    -derivedDataPath "$DERIVED_DATA" \
+    -destination "platform=macOS,arch=$(uname -m)" \
+    -disableAutomaticPackageResolution \
+    -onlyUsePackageVersionsFromResolvedFile \
+    -skipPackageUpdates \
+    "$@" \
+    "${TEST_ARGS[@]}" \
+    ONLY_ACTIVE_ARCH=YES \
+    ARCHS="$(uname -m)" \
+    SWIFT_COMPILATION_MODE=incremental \
+    COMPILER_INDEX_STORE_ENABLE=NO \
+    BUILD_ACTIVE_RESOURCES_ONLY=YES \
+    KAISOLA_PACKAGE_BROKER_HELPER=0 \
+    "$ACTION"
+}
+
+# Bash 3 treats expansion of an empty declared array as an unbound variable
+# under `set -u`. Branching here keeps --verbose genuinely argument-free while
+# preserving strict nounset checking for the rest of the runner.
+if [[ "$VERBOSE" -eq 1 ]]; then
+  run_xcodebuild
+else
+  run_xcodebuild -quiet
+fi
 /bin/echo "Focused tests finished in ${SECONDS}s."

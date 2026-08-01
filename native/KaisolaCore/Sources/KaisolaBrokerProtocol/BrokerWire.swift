@@ -7,7 +7,7 @@ import Foundation
 public enum BrokerWire {
     public static let protocolVersion = 2
     public static let securityEpoch = 1
-    public static let implementationVersion = 1
+    public static let implementationVersion = 2
     public static let helperPackageSchema = 1
     /// Protocol-2 implementation N and N+1 are additive-compatible. A future
     /// implementation that needs a wire break must increment `protocolVersion`
@@ -17,6 +17,7 @@ public enum BrokerWire {
     public static let terminalHistoryFeature = "terminal-history-v1"
     public static let observerRoleFeature = "observer-role-v1"
     public static let brokerUpdateFeature = "broker-update-v1"
+    public static let brokerRollingUpdateFeature = "broker-rolling-update-v1"
     public static let observerMethods: Set<String> = [
         "broker.status",
         "terminal.list",

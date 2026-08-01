@@ -140,6 +140,7 @@ final class BrokerControlClientTests: XCTestCase {
                 "terminal.release",
                 "terminal.detachOwner",
                 "terminal.agentTurn",
+                "terminal.controlLease",
             ]
         )
     }

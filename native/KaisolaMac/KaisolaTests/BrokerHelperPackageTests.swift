@@ -100,6 +100,66 @@ final class BrokerHelperPackageTests: XCTestCase {
         )
     }
 
+    func testStagerPublishesOnePrivateDigestAddressedCopyIndependentOfTheApp() throws {
+        let sourceRoot = try makePackage()
+        let source = try BrokerHelperPackageVerification.verify(
+            root: sourceRoot,
+            requireSignatures: false
+        )
+        let profile = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "kaisola-helper-stage-\(UUID().uuidString)",
+            isDirectory: true
+        )
+        roots.append(profile)
+        let destination = profile
+            .appendingPathComponent("broker-generations", isDirectory: true)
+            .appendingPathComponent(source.manifest.contentDigest, isDirectory: true)
+
+        let staged = try BrokerHelperPackageStaging.stage(source, at: destination)
+
+        XCTAssertEqual(staged.root, destination.standardizedFileURL)
+        XCTAssertEqual(staged.manifest, source.manifest)
+        let generationPermissions = try FileManager.default.attributesOfItem(
+            atPath: destination.deletingLastPathComponent().path
+        )[.posixPermissions] as? NSNumber
+        XCTAssertEqual((generationPermissions?.intValue ?? 0) & 0o777, 0o700)
+
+        // The running generation no longer depends on its replaceable source.
+        try FileManager.default.removeItem(at: sourceRoot)
+        let reopened = try BrokerHelperPackageVerification.verify(
+            root: destination,
+            requireSignatures: false
+        )
+        XCTAssertEqual(reopened.manifest.contentDigest, source.manifest.contentDigest)
+        XCTAssertTrue(FileManager.default.isExecutableFile(atPath: reopened.nodeExecutable.path))
+    }
+
+    func testStagerReusesExactBytesAndFailsClosedOnAChangedGeneration() throws {
+        let sourceRoot = try makePackage()
+        let source = try BrokerHelperPackageVerification.verify(
+            root: sourceRoot,
+            requireSignatures: false
+        )
+        let profile = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "kaisola-helper-stage-tamper-\(UUID().uuidString)",
+            isDirectory: true
+        )
+        roots.append(profile)
+        let destination = profile
+            .appendingPathComponent("broker-generations", isDirectory: true)
+            .appendingPathComponent(source.manifest.contentDigest, isDirectory: true)
+
+        let first = try BrokerHelperPackageStaging.stage(source, at: destination)
+        let second = try BrokerHelperPackageStaging.stage(source, at: destination)
+        XCTAssertEqual(first, second)
+
+        try Data("changed".utf8).append(to: second.brokerScript)
+        XCTAssertThrowsError(try BrokerHelperPackageStaging.stage(source, at: destination)) {
+            XCTAssertEqual($0 as? BrokerHelperPackageError, .stagedPackageMismatch)
+        }
+        XCTAssertEqual(try Data(contentsOf: source.brokerScript), Data("broker".utf8))
+    }
+
     private func makePackage(brokerData: Data = Data("broker".utf8)) throws -> URL {
         let root = FileManager.default.temporaryDirectory
             .appendingPathComponent("kaisola-helper-test-\(UUID().uuidString)", isDirectory: true)

@@ -26,7 +26,7 @@
       "name": "current clients with current packaged broker",
       "protocol": 2,
       "securityEpoch": 1,
-      "implementationVersion": 1,
+      "implementationVersion": 2,
       "supported": true
     },
     {

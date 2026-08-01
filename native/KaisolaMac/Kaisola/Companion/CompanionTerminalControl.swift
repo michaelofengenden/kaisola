@@ -44,14 +44,14 @@ struct CompanionTerminalControlAdapter {
     let write: (BrokerTerminalRecord, String) async throws -> Void
     let resize: (BrokerTerminalRecord, CompanionTerminalGeometry) async throws -> Void
     let interrupt: (BrokerTerminalRecord) async throws -> Void
-    let controlStateChanged: (BrokerTerminalRecord, Bool) -> Void
+    let controlStateChanged: (BrokerTerminalRecord, Bool) async throws -> Void
 
     init(
         availability: @escaping (BrokerTerminalRecord) -> CompanionTerminalControlAvailability?,
         write: @escaping (BrokerTerminalRecord, String) async throws -> Void,
         resize: @escaping (BrokerTerminalRecord, CompanionTerminalGeometry) async throws -> Void,
         interrupt: @escaping (BrokerTerminalRecord) async throws -> Void,
-        controlStateChanged: @escaping (BrokerTerminalRecord, Bool) -> Void = { _, _ in }
+        controlStateChanged: @escaping (BrokerTerminalRecord, Bool) async throws -> Void = { _, _ in }
     ) {
         self.availability = availability
         self.write = write
@@ -214,8 +214,13 @@ final class CompanionTerminalControl {
             originalGeometry: available.geometry,
             expiresAt: 0
         )
+        if isNewLease {
+            do { try await adapter.controlStateChanged(terminal, true) }
+            catch {
+                return receipt(command, .unavailable, "Terminal control could not be fenced safely.")
+            }
+        }
         arm(&lease)
-        if isNewLease { adapter.controlStateChanged(terminal, true) }
         return receipt(
             command,
             .applied,
@@ -234,6 +239,8 @@ final class CompanionTerminalControl {
             deviceID: deviceID,
             connectionID: connectionID
         ) else { return stale(command) }
+        do { try await adapter.controlStateChanged(lease.terminal, true) }
+        catch { return receipt(command, .unavailable, "Terminal control could not be renewed safely.") }
         arm(&lease)
         return receipt(command, .applied, "Terminal control renewed.", payload: leasePayload(lease))
     }
@@ -388,7 +395,7 @@ final class CompanionTerminalControl {
         publishLeaseState()
         expiryTasks.removeValue(forKey: key)?.cancel()
         guard let geometry = lease.originalGeometry else {
-            adapter.controlStateChanged(lease.terminal, false)
+            try? await adapter.controlStateChanged(lease.terminal, false)
             return
         }
         let token = UUID()
@@ -399,7 +406,7 @@ final class CompanionTerminalControl {
         restorations[key] = Restoration(token: token, task: task)
         await task.value
         if restorations[key]?.token == token { restorations.removeValue(forKey: key) }
-        adapter.controlStateChanged(lease.terminal, false)
+        try? await adapter.controlStateChanged(lease.terminal, false)
     }
 
     private func waitForRestoration(_ key: Key) async {

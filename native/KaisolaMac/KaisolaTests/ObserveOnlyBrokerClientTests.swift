@@ -211,7 +211,7 @@ final class ObserveOnlyBrokerClientTests: XCTestCase {
         let changedStatus = ObserveOnlyBrokerClient(
             transport: ScriptedBrokerTransport(
                 replyToRequests: true,
-                statusImplementationVersion: 2
+                statusImplementationVersion: 1
             ),
             operationTimeoutNanoseconds: 100_000_000
         )

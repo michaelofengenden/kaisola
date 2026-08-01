@@ -36,7 +36,7 @@ function startBroker() {
   const config = {
     protocol: 2,
     securityEpoch: 1,
-    implementationVersion: 1,
+    implementationVersion: 2,
     packageSchema: 1,
     packageVersion: 'integration-old',
     contentDigest: oldDigest,
@@ -54,6 +54,11 @@ function startBroker() {
   fs.writeFileSync(launchFile, JSON.stringify(config), { mode: 0o600 })
   const child = spawn(process.execPath, [brokerScript, '--launch', launchFile], {
     stdio: ['ignore', 'ignore', 'pipe'],
+    env: {
+      ...process.env,
+      NODE_ENV: 'test',
+      KAISOLA_TEST_BROKER_NO_CLIENT_EXIT_MS: '100',
+    },
   })
   let stderr = ''
   child.stderr.on('data', (chunk) => { stderr += chunk })
@@ -169,4 +174,136 @@ test('sealed broker identity is published and safe update commit rejects racing 
   assert.equal(fs.existsSync(fixture.config.infoFile), false)
   assert.equal(fs.existsSync(fixture.config.socketPath), false)
   assert.equal(fixture.stderr(), '')
+})
+
+test('rolling cutover preserves an idle PTY and rejects late activity, input, and lease races', async (t) => {
+  const fixture = startBroker()
+  t.after(() => {
+    try { fixture.child.kill('SIGKILL') } catch {}
+    fs.rmSync(fixture.root, { recursive: true, force: true })
+  })
+  await waitFor(() => fs.existsSync(fixture.config.infoFile), 'broker metadata')
+  const controller = await connectClient(fixture.config)
+  const created = await controller.request('terminal.create', {
+    ownerId: '0',
+    projectId: 'rolling-test',
+    id: 'preserved-terminal',
+    command: '/bin/cat',
+    args: [],
+    cwd: fixture.root,
+  })
+  assert.equal(created.ok, true)
+  assert.equal(created.result.ok, true)
+  const terminalPid = created.result.pid
+
+  const prepare = (stabilityWindowMs = 150) => controller.request('broker.prepareRollingUpdate', {
+    ownerId: '0',
+    expectedPid: fixture.child.pid,
+    expectedStartedAt: fixture.config.startedAt,
+    expectedContentDigest: oldDigest,
+    targetContentDigest: newDigest,
+    stabilityWindowMs,
+  })
+
+  const outputTrigger = path.join(fixture.root, 'emit-synthetic-output')
+  const synthetic = await controller.request('terminal.create', {
+    ownerId: '0',
+    projectId: 'rolling-test',
+    id: 'synthetic-output-terminal',
+    command: '/bin/sh',
+    args: [
+      '-c',
+      'while [ ! -f "$1" ]; do sleep 0.01; done; printf synthetic-output; sleep 5',
+      'kaisola-output-race',
+      outputTrigger,
+    ],
+    cwd: fixture.root,
+  })
+  assert.equal(synthetic.result.ok, true)
+  const pendingOutputRace = prepare(300)
+  await delay(30)
+  fs.writeFileSync(outputTrigger, 'emit', { mode: 0o600 })
+  const outputRace = await pendingOutputRace
+  assert.equal(outputRace.result.state, 'pending')
+  assert.equal(outputRace.result.reason, 'activity_changed')
+  await controller.request('terminal.release', {
+    ownerId: '0', projectId: 'rolling-test', id: 'synthetic-output-terminal',
+  })
+
+  const inputRace = prepare()
+  await delay(30)
+  const input = await controller.request('terminal.write', {
+    ownerId: '0', projectId: 'rolling-test', id: 'preserved-terminal', data: 'late input\n',
+  })
+  assert.equal(input.result.ok, true)
+  const inputResult = await inputRace
+  assert.equal(inputResult.result.state, 'pending')
+  assert.equal(inputResult.result.reason, 'activity_changed')
+
+  const agentRace = prepare()
+  await delay(30)
+  const busy = await controller.request('terminal.agentTurn', {
+    ownerId: '0', projectId: 'rolling-test', id: 'preserved-terminal', busy: true,
+  })
+  assert.equal(busy.result.ok, true)
+  const agentResult = await agentRace
+  assert.equal(agentResult.result.state, 'pending')
+  assert.equal(agentResult.result.reason, 'activity_changed')
+  await controller.request('terminal.agentTurn', {
+    ownerId: '0', projectId: 'rolling-test', id: 'preserved-terminal', busy: false,
+  })
+
+  const leaseRace = prepare()
+  await delay(30)
+  const lease = await controller.request('terminal.controlLease', {
+    ownerId: '0', projectId: 'rolling-test', id: 'preserved-terminal', active: true,
+  })
+  assert.equal(lease.result.ok, true)
+  const leaseResult = await leaseRace
+  assert.equal(leaseResult.result.state, 'pending')
+  assert.equal(leaseResult.result.reason, 'lease_changed')
+
+  const rolling = await prepare(75)
+  assert.equal(rolling.result.state, 'rolling')
+  assert.equal(rolling.result.fromContentDigest, oldDigest)
+  assert.equal(rolling.result.targetContentDigest, newDigest)
+
+  const rejectedCreate = await controller.request('terminal.create', {
+    ownerId: '0', projectId: 'rolling-test', id: 'must-route-to-new-generation',
+  })
+  assert.equal(rejectedCreate.ok, false)
+  assert.match(rejectedCreate.message, /generation is draining/)
+
+  const status = await controller.request('broker.status', { ownerId: '0' })
+  const preserved = status.result.terminals.find((terminal) => terminal.id === 'preserved-terminal')
+  assert.equal(preserved.pid, terminalPid)
+  assert.equal(status.result.generationState, 'draining')
+  assert.equal(status.result.drainingTargetContentDigest, newDigest)
+
+  await controller.request('terminal.controlLease', {
+    ownerId: '0', projectId: 'rolling-test', id: 'preserved-terminal', active: false,
+  })
+  await controller.request('terminal.release', {
+    ownerId: '0', projectId: 'rolling-test', id: 'preserved-terminal',
+  })
+  controller.socket.destroy()
+  await delay(250)
+  assert.equal(fixture.child.exitCode, null, 'an empty drain waits for explicit retirement')
+  assert.equal(fs.existsSync(fixture.config.infoFile), true)
+
+  const retirementController = await connectClient(fixture.config)
+  const retired = await retirementController.request('broker.retireDraining', {
+    ownerId: '0',
+    expectedPid: fixture.child.pid,
+    expectedStartedAt: fixture.config.startedAt,
+    expectedContentDigest: oldDigest,
+    targetContentDigest: newDigest,
+  })
+  assert.equal(retired.result.state, 'retiring')
+  retirementController.socket.destroy()
+  const exit = await waitFor(
+    () => fixture.child.exitCode != null ? { code: fixture.child.exitCode } : null,
+    'draining broker retirement',
+  )
+  assert.equal(exit.code, 0)
 })

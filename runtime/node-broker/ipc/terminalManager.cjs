@@ -87,6 +87,7 @@ const terms = new Map()
 const releaseTimers = new Map()
 let spoolDir = path.join(os.tmpdir(), `kaisola-terminal-cache-${process.pid}`)
 let eventSink = null
+let activitySink = null
 
 function configureStorage(dir) {
   if (dir) {
@@ -99,6 +100,18 @@ function configureStorage(dir) {
  * WebContents. Keeping this injectable preserves the direct in-main probes. */
 function setEventSink(sink) {
   eventSink = typeof sink === 'function' ? sink : null
+}
+
+/** The detached broker owns the rolling-update activity epoch. Terminal output
+ * and broker-internal state changes can occur without a new socket request, so
+ * the manager reports them explicitly instead of letting UI quietness stand in
+ * for process truth. */
+function setActivitySink(sink) {
+  activitySink = typeof sink === 'function' ? sink : null
+}
+
+function reportActivity(kind, id = null) {
+  try { activitySink?.(String(kind || 'terminal'), id == null ? null : String(id)) } catch { /* safety telemetry only */ }
 }
 
 /** terminal:run children (plain child_process, not node-pty) — tracked here so
@@ -307,6 +320,7 @@ function spawn({ id, command, args, cwd, env, outputByteLimit, cols, rows, sende
     if (!rec.agentBusy) return
     rec.agentBusy = false
     rec.agentCompletedAt = Date.now()
+    reportActivity('agent-settled', id)
     broadcastAgentActivity()
   }
   const armAgentQuiet = () => {
@@ -320,6 +334,7 @@ function spawn({ id, command, args, cwd, env, outputByteLimit, cols, rows, sende
       if (rec.agentQuietTimer) clearTimeout(rec.agentQuietTimer)
       rec.agentBusy = true
       rec.agentCompletedAt = null
+      reportActivity('agent-busy', id)
       broadcastAgentActivity()
       armAgentQuiet()
     } else settleAgentTurn()
@@ -337,6 +352,7 @@ function spawn({ id, command, args, cwd, env, outputByteLimit, cols, rows, sende
   }
   rec.flushPending = flushPending
   p.onData((data) => {
+    reportActivity('terminal-output', id)
     rec.spool.push(data)
     if (rec.agentBusy) {
       const responseAt = Date.now()
@@ -360,6 +376,7 @@ function spawn({ id, command, args, cwd, env, outputByteLimit, cols, rows, sende
     armAgentQuiet()
   })
   p.onExit(({ exitCode, signal }) => {
+    reportActivity('terminal-exit', id)
     flushPending() // the tail of the stream must land before the exit signal
     rec.exited = true
     rec.exitedWhileDetached = !rec.rendererVisible
@@ -642,6 +659,7 @@ function scheduleRelease(id, delayMs = 60_000) {
   if (!terms.has(id)) return false
   const timer = setTimeout(() => {
     releaseTimers.delete(id)
+    reportActivity('scheduled-release', id)
     release(id)
   }, Math.max(1_000, Math.min(Number(delayMs) || 60_000, 5 * 60_000)))
   timer.unref?.()
@@ -661,14 +679,17 @@ function cancelRelease(id) {
  *  itself when the child exits, so the set never accumulates corpses. */
 function trackChild(child) {
   runChildren.add(child)
-  const drop = () => runChildren.delete(child)
+  reportActivity('child-started')
+  const drop = () => {
+    if (runChildren.delete(child)) reportActivity('child-ended')
+  }
   child.once('exit', drop)
   child.once('error', drop)
   return child
 }
 
 function untrackChild(child) {
-  runChildren.delete(child)
+  if (runChildren.delete(child)) reportActivity('child-ended')
 }
 
 /**
@@ -699,6 +720,14 @@ function summarizeUpgradeReadiness(records, childCount) {
 
 function upgradeReadiness() {
   return summarizeUpgradeReadiness(terms.values(), runChildren.size)
+}
+
+/** Rolling cutover preserves live PTYs and tracked child processes in this
+ * process. Only an explicitly working CLI agent blocks the stability window;
+ * socket-request and lease races are fenced by the broker's activity epoch. */
+function rollingUpdateReadiness() {
+  const summary = summarizeUpgradeReadiness(terms.values(), runChildren.size)
+  return { ...summary, safe: summary.busyAgentCount === 0 }
 }
 
 function killAll() {
@@ -766,4 +795,4 @@ function diagnostics() {
   }))
 }
 
-module.exports = { available, has, isLive, ownership, spawn, write, agentTurn, resize, setSender, detachRenderer, detachSender, detachSenderPrefix, snapshot, history, subscribe, unsubscribe, unsubscribeSubscriberPrefix, waitForExit, kill, release, scheduleRelease, cancelRelease, trackChild, untrackChild, upgradeReadiness, killAll, list, setAppFocused, configureStorage, setEventSink, diagnostics, __test: { resizeRecord, resumeFromSnapshot, splitUtf8, terminalEnv, summarizeUpgradeReadiness } }
+module.exports = { available, has, isLive, ownership, spawn, write, agentTurn, resize, setSender, detachRenderer, detachSender, detachSenderPrefix, snapshot, history, subscribe, unsubscribe, unsubscribeSubscriberPrefix, waitForExit, kill, release, scheduleRelease, cancelRelease, trackChild, untrackChild, upgradeReadiness, rollingUpdateReadiness, killAll, list, setAppFocused, configureStorage, setEventSink, setActivitySink, diagnostics, __test: { resizeRecord, resumeFromSnapshot, splitUtf8, terminalEnv, summarizeUpgradeReadiness } }

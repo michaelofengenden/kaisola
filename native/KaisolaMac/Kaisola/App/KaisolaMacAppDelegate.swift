@@ -635,13 +635,20 @@ final class KaisolaMacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDele
             try await model.companionInterrupt(terminal)
         },
         controlStateChanged: { [weak self] terminal, active in
-            guard let self else { return }
+            guard let self else { throw CompanionTerminalControlAdapterError.unavailable }
             if active {
-                self.companionController(for: terminal)?
-                    .setCompanionControlActive(true, for: terminal)
+                guard let model = await MainActor.run(body: {
+                    self.companionController(for: terminal)
+                }) else {
+                    throw CompanionTerminalControlAdapterError.unavailable
+                }
+                try await model.setCompanionControlActive(true, for: terminal)
             } else {
-                for model in self.windowModels.values {
-                    model.setCompanionControlActive(false, for: terminal)
+                let models = await MainActor.run(body: {
+                    Array(self.windowModels.values)
+                })
+                for model in models {
+                    try? await model.setCompanionControlActive(false, for: terminal)
                 }
             }
         }
@@ -930,7 +937,7 @@ final class KaisolaMacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDele
             )
             if visualSurface == "companion-control",
                let terminal = model.sessions.first {
-                model.setCompanionControlActive(true, for: terminal)
+                model.setCompanionControlFixtureActive(true, for: terminal)
             } else if ["attention-completed", "topbar-attention"].contains(visualSurface) {
                 model.loadVisualCompletedAttentionFixture()
             } else if visualSurface == "mixed" || visualSurface == "permission" {

@@ -667,11 +667,11 @@ final class AppModelReconnectTests: XCTestCase {
 
         fixture.model.resizeTerminal(terminal.id, columns: 128, rows: 42)
         try await Task.sleep(for: .milliseconds(100))
-        fixture.model.setCompanionControlActive(true, for: terminal)
+        try await fixture.model.setCompanionControlActive(true, for: terminal)
         // AppKit can continue reporting desktop layout while Companion owns
         // the PTY. It must update desired state without sending it yet.
         fixture.model.resizeTerminal(terminal.id, columns: 140, rows: 46)
-        fixture.model.setCompanionControlActive(false, for: terminal)
+        try await fixture.model.setCompanionControlActive(false, for: terminal)
         try await Task.sleep(for: .milliseconds(30))
 
         let leaseResizes = await fixture.control.resizeCalls()
@@ -849,6 +849,7 @@ private actor RecordingBrokerControlClient: BrokerControlServing {
     func release(projectID: String, terminalID: String) async throws {}
     func detachOwner(projectID: String, terminalID: String) async throws {}
     func setAgentTurn(projectID: String, terminalID: String, busy: Bool) async throws {}
+    func setControlLease(projectID: String, terminalID: String, active: Bool) async throws {}
     func disconnect() async {}
 
     func resizeCalls() -> [RecordedTerminalResize] { recordedResizes }

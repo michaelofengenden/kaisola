@@ -1180,7 +1180,7 @@ final class NativePreviewSettingsTests: XCTestCase {
     /// The width the override applies is the one the rest of the chrome is
     /// designed around, not a second literal that can drift away from it.
     func testSidebarOverrideTargetsTheIdealWidthTheChromeIsSizedFor() {
-        XCTAssertEqual(NativeWorkspaceChrome.projectSidebarIdealWidth, 248)
+        XCTAssertEqual(NativeWorkspaceChrome.projectSidebarIdealWidth, 228)
         XCTAssertGreaterThan(
             NativeWorkspaceChrome.projectSidebarIdealWidth,
             InitialSidebarWidth.systemDefault + InitialSidebarWidth.tolerance,
@@ -1458,12 +1458,14 @@ final class NativePreviewSettingsTests: XCTestCase {
     }
 
     /// v1.1.6 widened the resting rail (200 → 248) and its ceiling (260 → 340)
-    /// to pay for a visible hierarchy step between a project row and its
-    /// sessions, and for a footer that can show a whole account name. The
-    /// *minimum* is deliberately unchanged: nothing about the narrow rail moves.
+    /// to pay for a visible hierarchy step and a whole account name. v1.1.7
+    /// gives 20 of those points back (248 → 228) now that the rail spends none
+    /// of its width on chrome — no ghost row, no row washes, no mark tiles. The
+    /// *minimum* and the *maximum* are both unchanged: nothing about the narrow
+    /// rail moves, and anyone who wants the v1.1.6 rail drags it back.
     func testProjectSidebarHasComfortableResizableWidth() {
         XCTAssertEqual(NativeWorkspaceChrome.projectSidebarMinimumWidth, 168)
-        XCTAssertEqual(NativeWorkspaceChrome.projectSidebarIdealWidth, 248)
+        XCTAssertEqual(NativeWorkspaceChrome.projectSidebarIdealWidth, 228)
         XCTAssertEqual(NativeWorkspaceChrome.projectSidebarMaximumWidth, 340)
         XCTAssertEqual(NativeWorkspaceChrome.projectSidebarDividerWidth, 1)
     }

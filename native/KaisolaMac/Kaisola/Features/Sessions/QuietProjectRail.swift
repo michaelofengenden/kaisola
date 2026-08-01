@@ -8,9 +8,14 @@ import SwiftUI
 /// without stealing focus.
 ///
 /// Row grammar is unchanged: identity mark · title · time-in-state · dot at the
-/// right edge, idle rows draw no dot, and the only background fill in the whole
-/// rail is the neutral selection wash on surfaces that are actually on screen
-/// (plus the pinned project's header).
+/// right edge, and idle rows draw no dot.
+///
+/// v1.1.7 removed the last of the rail's boxes. There is now **exactly one**
+/// background fill in the whole sidebar — the active project's tinted glass
+/// capsule. Surface rows have none at all: a visible session is signalled by
+/// its title alone (primary, semibold) against `.secondary` regular for the
+/// rest, and by the `.isSelected` accessibility trait, which is the only part
+/// of "selected" assistive technology ever read out of the wash.
 ///
 /// The rail is pure presentation: every mutating action it offers is a closure
 /// or an `AppModel` call that already existed, so the sidebar's context menus
@@ -190,11 +195,13 @@ private enum QuietRailMetrics {
     ///
     /// The v1.1.5 width-budget work cut this to 18pt — one mark-width past the
     /// project row's own 8pt inset, a 10pt step the eye read as "slightly
-    /// ragged" rather than "nested". v1.1.6 pays for a 22pt step out of the
-    /// wider default sidebar (`projectSidebarIdealWidth`, 200 → 248) instead of
-    /// out of the title, so the hierarchy is unmistakable and the title lane is
-    /// still wider than it was before. `QuietRowBudget` holds the arithmetic.
-    static let sessionIndent: CGFloat = 30
+    /// ragged" rather than "nested". v1.1.6 bought a 22pt step; v1.1.7 pushes
+    /// it to 32pt (two identity slots) *while* the rail narrows to 228, which
+    /// is the trade worth stating: at 228 a session title still gets 117.5pt —
+    /// 17 characters of a real title — so the nesting is paid for out of the
+    /// row's slack, not out of legibility. `QuietRowBudget` holds the
+    /// arithmetic and a test holds the character count.
+    static let sessionIndent: CGFloat = 40
     /// One cadence for every row in the rail: sessions, compact projects and
     /// the pinned project header all measure 32pt.
     static let rowHeight: CGFloat = 32
@@ -220,8 +227,18 @@ private enum QuietRailMetrics {
     /// pointer is travelling *to* can be removed before it arrives.
     static let hoverGrace: Double = 0.12
     static let pulseDuration: Double = 1.4
-    /// The rail's only fill: a neutral wash, never a tint.
-    static let washOpacity: Double = 0.055
+    /// The trailing slot the pinned header's `+` menu occupies.
+    ///
+    /// Reserved whether or not the menu is drawn. It used to be a plain sibling
+    /// of a `maxWidth: .infinity` button, so the button claimed the whole row
+    /// and the menu was laid out *past* the row's trailing edge — it rendered
+    /// half outside the project row. A reserved slot is also what keeps the
+    /// header's rollup from shifting sideways when the pointer arrives.
+    static let plusSlot: CGFloat = 18
+    /// Distance from the row's trailing edge to the `+` slot. Lands the slot
+    /// just inside the active project's capsule, which is itself inset by
+    /// `KaisolaVisualSystem.chromeInset`.
+    static let plusTrailingInset: CGFloat = 10
 }
 
 /// What a surface row's title is actually given, derived from the same metrics
@@ -242,6 +259,18 @@ enum QuietRowBudget {
     /// than project rows" is a test rather than a pair of literals that can
     /// drift back together the next time the title lane needs points.
     static var indentStep: CGFloat { sessionIndent - projectIndent }
+
+    /// The slot the pinned project header reserves at its trailing edge for the
+    /// `+` menu, and how far that slot sits in from the row's own edge.
+    ///
+    /// Exposed because the bug was geometric, not visual: the `+` used to be a
+    /// bare sibling of a `maxWidth: .infinity` button, so it was laid out
+    /// *past* the row and rendered cut in half. Reserving the slot is what
+    /// makes containment structural, and `headerPlusReserved` is the number an
+    /// accessibility frame check can be read against.
+    static let headerPlusSlot: CGFloat = QuietRailMetrics.plusSlot
+    static let headerPlusTrailingInset: CGFloat = QuietRailMetrics.plusTrailingInset
+    static var headerPlusReserved: CGFloat { headerPlusSlot + headerPlusTrailingInset }
 
     /// - Parameters:
     ///   - sidebarWidth: the navigation column's width. Rows span it entirely;
@@ -340,7 +369,6 @@ private struct QuietProjectGroup: View {
     let meshMenu: (MeshSession) -> AnyView
 
     @State private var hovering = false
-    @State private var hoveringLaunchRow = false
     /// Bumped on every hover transition anywhere in the group so a pending
     /// "leave" can tell whether the pointer actually left or merely crossed
     /// into the next row of the same group.
@@ -352,16 +380,10 @@ private struct QuietProjectGroup: View {
 
     private var isActive: Bool { placement == .pinned }
 
-    /// The mock has no resting "New session" ghost row, so the row is not in
-    /// the layout at all until the group is hovered — the same rule the header
-    /// chevron and `+` follow.
-    private var showsNewSessionRow: Bool { hovering || hoveringLaunchRow }
-
-    /// Hover is a property of the whole *group*, not of one row: the reveal row
-    /// sits under the group's last surface, so the pointer has to travel across
-    /// sibling rows to reach it. Every row reports into this, and a leave is
-    /// deferred by one grace period so crossing a row boundary never removes
-    /// the row the pointer is heading for.
+    /// Hover is a property of the whole *group*, not of one row: the pointer
+    /// travels across sibling rows on its way to the header's chrome, and a
+    /// leave is deferred by one grace period so crossing a row boundary never
+    /// removes the control the pointer is heading for.
     private func setHover(_ inside: Bool) {
         hoverGeneration &+= 1
         if inside {
@@ -405,9 +427,6 @@ private struct QuietProjectGroup: View {
                 if sessions.isEmpty, chats.isEmpty, meshes.isEmpty {
                     emptyRow
                 }
-                if isActive, showsNewSessionRow {
-                    newSessionRow
-                }
             }
         }
     }
@@ -441,7 +460,9 @@ private struct QuietProjectGroup: View {
     /// over still read first. Name and mark keep the same tint, so the row is
     /// one object rather than a coloured box with grey contents.
     private func pinnedHeader(statuses: [String: QuietSessionStatus]) -> some View {
-        HStack(spacing: 6) {
+        // Spacing 0: the `+` slot below carries its own trailing inset, and a
+        // stack gap on top of it would push the menu back out of the row.
+        HStack(spacing: 0) {
             // A real Button, not a tap gesture: it is what gives the header a
             // press action for VoiceOver, Full Keyboard Access and automation.
             // The `+` stays a SIBLING of the button rather than part of its
@@ -476,8 +497,10 @@ private struct QuietProjectGroup: View {
                 // The button's own label owns the full row geometry — height,
                 // horizontal inset and width — so its hit area (and VoiceOver
                 // frame) covers the entire 32pt row, not just the intrinsic
-                // text height. Mirrors QuietRowBody's chain.
-                .padding(.horizontal, QuietRailMetrics.horizontalInset)
+                // text height. Mirrors QuietRowBody's chain. Only the LEADING
+                // inset is the label's: the trailing edge belongs to the `+`
+                // slot below, which the button must stop short of.
+                .padding(.leading, QuietRailMetrics.horizontalInset)
                 .frame(height: QuietRailMetrics.rowHeight)
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .contentShape(Rectangle())
@@ -488,20 +511,28 @@ private struct QuietProjectGroup: View {
             // the (now combined) label.
             .accessibilityAddTraits(.isHeader)
             .accessibilityIdentifier(project.id)
-            if hovering {
-                Menu {
-                    launchMenu(project)
-                } label: {
-                    Image(systemName: "plus")
-                        .font(.system(size: QuietRailMetrics.plusText, weight: .semibold))
-                        .foregroundStyle(.secondary)
+            // The `+` sits in a slot the header always reserves, so it can only
+            // ever be laid out INSIDE the row. As a bare sibling of a
+            // `maxWidth: .infinity` button it was pushed past the row's trailing
+            // edge and rendered clipped in half.
+            ZStack {
+                if hovering {
+                    Menu {
+                        launchMenu(project)
+                    } label: {
+                        Image(systemName: "plus")
+                            .font(.system(size: QuietRailMetrics.plusText, weight: .semibold))
+                            .foregroundStyle(.secondary)
+                    }
+                    .menuStyle(.borderlessButton)
+                    .menuIndicator(.hidden)
+                    .fixedSize()
+                    .help("New session in \(project.name)")
+                    .accessibilityLabel("New session in \(project.name)")
                 }
-                .menuStyle(.borderlessButton)
-                .menuIndicator(.hidden)
-                .fixedSize()
-                .help("New session in \(project.name)")
-                .accessibilityLabel("New session in \(project.name)")
             }
+            .frame(width: QuietRailMetrics.plusSlot, height: QuietRailMetrics.rowHeight)
+            .padding(.trailing, QuietRailMetrics.plusTrailingInset)
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         .contentShape(Rectangle())
@@ -604,48 +635,12 @@ private struct QuietProjectGroup: View {
             .listRowBackground(Color.clear)
     }
 
-    /// The pinned project's creation affordance, under its surfaces. It is only
-    /// in the layout while the group is hovered — at rest the rail shows no
-    /// chrome at all, and creation is still one hover away on the pinned
-    /// header's `+` (plus ⌘T, the project's context menu and File ▸ Open).
-    private var newSessionRow: some View {
-        Menu {
-            launchMenu(project)
-        } label: {
-            HStack(spacing: 0) {
-                Image(systemName: "plus")
-                    .font(.system(size: QuietRailMetrics.plusText, weight: .semibold))
-                    .frame(width: QuietRailMetrics.mark, height: QuietRailMetrics.mark)
-                    .padding(.trailing, QuietRailMetrics.markGap)
-                Text("New session")
-                    .font(.system(size: QuietRailMetrics.titleText))
-                    .lineLimit(1)
-                Spacer(minLength: 0)
-            }
-            .foregroundStyle(.tertiary)
-            .padding(.leading, QuietRailMetrics.sessionIndent)
-            .padding(.trailing, QuietRailMetrics.trailingInset)
-            .frame(height: QuietRailMetrics.rowHeight)
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .contentShape(Rectangle())
-        }
-        .menuStyle(.borderlessButton)
-        .menuIndicator(.hidden)
-        // The label's own height does not reach the row: a borderless Menu
-        // sizes to its control, so the row is pinned to the rail's cadence here
-        // rather than inside the label.
-        .frame(height: QuietRailMetrics.rowHeight)
-        .transition(.opacity)
-        .onHover { inside in
-            setHover(inside)
-            withAnimation(.easeOut(duration: KaisolaVisualSystem.hoverDuration)) { hoveringLaunchRow = inside }
-        }
-        .help("New session in \(project.name)")
-        .accessibilityLabel("New session in \(project.name)")
-        .listRowInsets(QuietRailMetrics.listRowBleed)
-        .listRowSeparator(.hidden)
-        .listRowBackground(Color.clear)
-    }
+    // The hover-revealed "New session" ghost row is gone (v1.1.7). A row that
+    // appears under the pointer whenever it crosses the group is a row that
+    // pops at the user, and it was the rail's last piece of resting chrome.
+    // Creation keeps four doors that do not move: the pinned header's `+` menu,
+    // the project and session context menus, the File menu (⌘T), and the
+    // command palette.
 
     // MARK: Rows
 
@@ -877,15 +872,24 @@ private struct QuietRollupView: View {
 
 // MARK: - Row anatomy
 
-/// A focused surface's background: a neutral wash, inset from the rail edges.
-/// Never tinted — on a *surface* row colour means status, not identity. The
-/// active project's own capsule is the single deliberate exception; see
-/// `QuietActiveProjectGlass`.
-private struct QuietSelectionWash: View {
-    var body: some View {
-        RoundedRectangle(cornerRadius: KaisolaVisualSystem.insetRadius, style: .continuous)
-            .fill(Color.primary.opacity(QuietRailMetrics.washOpacity))
-            .padding(.horizontal, 6)
+/// How a surface row says it is the one on screen — with no box at all.
+///
+/// v1.1.7 deleted `QuietSelectionWash`, the rounded grey rectangle that used to
+/// sit under a visible row. A wash is a second selection language competing
+/// with the active project's capsule, and stacked down a column of five rows it
+/// turned the rail back into a list of chips. What is left is the least a row
+/// can say and still be found: the title's own weight and colour.
+///
+/// Stated as a table rather than inline ternaries so "the ONLY difference is
+/// type" is a testable claim.
+enum QuietRowEmphasis {
+    /// The visible surface: full ink, semibold.
+    static let selectedWeight: Font.Weight = .semibold
+    /// Everything else in the rail: regular, one step back.
+    static let restingWeight: Font.Weight = .regular
+
+    static func weight(isSelected: Bool) -> Font.Weight {
+        isSelected ? selectedWeight : restingWeight
     }
 }
 
@@ -989,8 +993,11 @@ private struct QuietRowBody: View {
             QuietIdentityMarkView(identity: identity)
                 .padding(.trailing, QuietRailMetrics.markGap)
             Text(title)
-                .font(.system(size: QuietRailMetrics.titleText))
-                .foregroundStyle(status.isDimmed ? HierarchicalShapeStyle.tertiary : .primary)
+                .font(.system(size: QuietRailMetrics.titleText, weight: QuietRowEmphasis.weight(isSelected: isSelected)))
+                // Three steps, and type carries all of them: an ended row is
+                // tertiary, the row you are looking at is primary semibold,
+                // everything else is secondary regular. No fill anywhere.
+                .foregroundStyle(titleStyle)
                 .lineLimit(1)
                 .truncationMode(.tail)
                 // The only compressible token in the row; without this it loses
@@ -1004,17 +1011,21 @@ private struct QuietRowBody: View {
         .frame(height: QuietRailMetrics.rowHeight)
         .frame(maxWidth: .infinity, alignment: .leading)
         .contentShape(Rectangle())
-        .background {
-            if isSelected {
-                QuietSelectionWash()
-            }
-        }
+        // No `.background` at all. The row draws nothing behind itself in any
+        // state; `.isSelected` on the enclosing Button is what assistive
+        // technology reads, and it is unaffected by the wash's removal.
+        //
         // Deliberately NOT `.accessibilityElement(children: .combine)` here:
         // that would make this the row's own isolated accessibility node,
         // nested *inside* the enclosing Button in `QuietSurfaceRowView`
         // rather than merged into it — System Events then sees a button with
         // AXPress but no AXTitle, since the label lives on a child it never
         // descends into. The combine + label live on the Button itself.
+    }
+
+    private var titleStyle: HierarchicalShapeStyle {
+        if status.isDimmed { return .tertiary }
+        return isSelected ? .primary : .secondary
     }
 
     /// Reveal, time-in-state and dot travel as ONE `fixedSize` lane.

@@ -1809,19 +1809,19 @@ private struct NavigationSidebarResizeAffordance: View {
 /// A fallback for the SwiftUI versions that ignore
 /// `navigationSplitViewColumnWidth`'s `ideal:` when *opening* a column, honour
 /// only its `min:` and `max:`, and leave `ideal:` governing nothing but the
-/// double-click reset. Where that happens, Kaisola's 248pt rail — sized in
+/// double-click reset. Where that happens, Kaisola's rail — sized in
 /// `NativeWorkspaceChrome` for a row grammar that needs the room — opens at
 /// AppKit's own ~195pt and truncates its titles until the user drags it.
 ///
 /// Measured status, so nobody has to guess whether this is load-bearing: on
 /// macOS 26 with the current SDK it is **inert**. A cold launch against cleared
-/// defaults opens the column at exactly 248.0 before this code gets a look, so
+/// defaults opens the column at exactly the ideal before this code gets a look, so
 /// `shouldForceInitialWidth` returns false and nothing is written or moved. It
 /// is kept because the guards make an inert fallback free — it can only act on
 /// a column sitting at AppKit's untouched default, only once per window, and
 /// only if the hierarchy walk finds a real `NSSplitView` — and because the
 /// widths it protects are the ones the row grammar is designed around. If a
-/// future SDK stops honouring `ideal:`, this is what keeps the rail at 248
+/// future SDK stops honouring `ideal:`, this is what keeps the rail at its ideal
 /// instead of shipping truncated titles.
 ///
 /// The rules that decide whether to override, kept pure and free of AppKit so
@@ -2570,12 +2570,13 @@ enum NativeWorkspaceChrome {
     static let chromePanelTopInset: CGFloat = 46
     static let topBarTrafficLightClearance: CGFloat = 76
     static let projectSidebarMinimumWidth: CGFloat = 168
-    /// The rail's resting width. Raised from 200 in v1.1.6: the row grammar
-    /// (indent · mark · title · time · dot) needs more than 200pt before a
-    /// session title reads as a title *and* the hierarchy step between a
-    /// project row and its sessions is visible. The extra points are spent on
-    /// both — see `QuietRowBudget`.
-    static let projectSidebarIdealWidth: CGFloat = 248
+    /// The rail's resting width. 200 → 248 in v1.1.6 to buy a legible title and
+    /// a visible hierarchy step; 248 → 228 in v1.1.7, once the rail stopped
+    /// spending width on chrome. Nothing in the row grammar shrank to pay for
+    /// it: at 228, with the deeper 40pt session indent, a title still gets
+    /// 117.5pt — 17 characters — which `QuietRowBudget` states and a test pins.
+    /// The maximum is unchanged, so anyone who wants the old rail drags it back.
+    static let projectSidebarIdealWidth: CGFloat = 228
     /// Raised alongside the ideal so a user who wants long titles can have
     /// them; the minimum is unchanged, so nothing about the narrow rail moves.
     static let projectSidebarMaximumWidth: CGFloat = 340

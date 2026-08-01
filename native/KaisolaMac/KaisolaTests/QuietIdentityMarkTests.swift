@@ -305,7 +305,12 @@ final class QuietIdentityMarkTests: XCTestCase {
             let width = (candidate as NSString).size(withAttributes: [.font: titleFont]).width
             if width <= available { visible = count } else { break }
         }
-        XCTAssertGreaterThanOrEqual(visible, 15, "only \(visible) characters survive at 200pt")
+        XCTAssertGreaterThanOrEqual(
+            visible,
+            15,
+            "only \(visible) characters survive at "
+                + "\(NativeWorkspaceChrome.projectSidebarIdealWidth)pt"
+        )
 
         // The hover-only reveal control may cost the title, but never this much.
         XCTAssertGreaterThan(
@@ -335,12 +340,23 @@ final class QuietIdentityMarkTests: XCTestCase {
             QuietIdentityMarkView.slot,
             "the hierarchy step is narrower than one identity mark — it reads as ragged, not nested"
         )
+        // v1.1.7 pushed it to two full identity slots. 22pt still read as a
+        // nudge next to a 16pt mark; a session's mark now starts past where
+        // its project's mark ENDS, which is what "nested" actually looks like.
+        XCTAssertGreaterThanOrEqual(
+            QuietRowBudget.indentStep,
+            QuietIdentityMarkView.slot * 2,
+            "the session indent went shallow again"
+        )
+        XCTAssertEqual(QuietRowBudget.sessionIndent, 40)
     }
 
-    /// Item 3 and item 2 are one trade: the indent grew, so the sidebar had to.
-    /// Assert the *outcome* — that the wider default really did buy both — so a
-    /// future width tweak cannot quietly re-flatten the rail.
-    func testTheWiderDefaultSidebarPaysForTheDeeperIndent() {
+    /// v1.1.7 does the opposite trade to v1.1.6's and has to survive it: the
+    /// rail NARROWS by 20 and the indent DEEPENS by 10 in the same pass. Assert
+    /// the outcome — that a title at the new resting width still beats the one
+    /// the v1.1.4 rail shipped — so neither number can be pushed further
+    /// without this failing.
+    func testTheNarrowerRailStillOutTitlesTheOldOne() {
         XCTAssertGreaterThan(NativeWorkspaceChrome.projectSidebarIdealWidth, 200)
         XCTAssertGreaterThan(
             NativeWorkspaceChrome.projectSidebarMaximumWidth,
@@ -351,15 +367,55 @@ final class QuietIdentityMarkTests: XCTestCase {
         let timeFont = NSFont.monospacedDigitSystemFont(ofSize: 10.5, weight: .regular)
         let timeWidth = ("now" as NSString).size(withAttributes: [.font: timeFont]).width
 
-        // The title lane at the new default is wider than it was at the old
-        // one, *after* paying for the deeper indent.
         let now = QuietRowBudget.titleWidth(
             sidebarWidth: NativeWorkspaceChrome.projectSidebarIdealWidth,
             timeLabelWidth: timeWidth,
             showsReveal: false
         )
+        // The v1.1.4 row: 200pt sidebar, 18pt indent, same tokens.
         let before = 200 - 18 - 10 - QuietIdentityMarkView.slot - 8 - 5 - (timeWidth + 5 + 6)
-        XCTAssertGreaterThan(now, before, "the wider sidebar was spent entirely on the indent")
+        XCTAssertGreaterThan(now, before, "the narrower rail gave the title back to the indent")
+    }
+
+    // MARK: - Header "+" containment
+
+    /// The clipping bug: the pinned header's `+` rendered half outside the
+    /// project row, because it was a bare sibling of a `maxWidth: .infinity`
+    /// button and got laid out past the row's trailing edge. The fix is a
+    /// reserved slot, so containment is arithmetic rather than luck.
+    func testThePinnedHeaderPlusHasAReservedSlotInsideTheRow() {
+        XCTAssertGreaterThan(QuietRowBudget.headerPlusSlot, 0)
+        // The slot has to be wider than the glyph it holds, or the menu spills
+        // out of it the same way it used to spill out of the row.
+        XCTAssertGreaterThanOrEqual(QuietRowBudget.headerPlusSlot, 16)
+
+        // …and it sits far enough in that it lands inside the active project's
+        // tinted capsule, which is itself inset by `chromeInset`.
+        XCTAssertGreaterThan(
+            QuietRowBudget.headerPlusTrailingInset,
+            KaisolaVisualSystem.chromeInset,
+            "the + sits on the capsule's edge instead of inside it"
+        )
+
+        // The whole reservation still has to leave the project name most of the
+        // row: a slot that fixes clipping by eating the header is not a fix.
+        XCTAssertLessThan(
+            QuietRowBudget.headerPlusReserved,
+            NativeWorkspaceChrome.projectSidebarIdealWidth * 0.2
+        )
+    }
+
+    // MARK: - Row emphasis (no wash)
+
+    /// v1.1.7 deleted the rounded grey wash from surface rows entirely. The
+    /// only thing left that says "this is the session on screen" is the title's
+    /// own weight, so the two weights have to actually differ — a table where
+    /// selected and resting collapsed to the same value would render the rail
+    /// with no selection signal at all.
+    func testTheVisibleSessionIsSignalledByWeightAlone() {
+        XCTAssertNotEqual(QuietRowEmphasis.selectedWeight, QuietRowEmphasis.restingWeight)
+        XCTAssertEqual(QuietRowEmphasis.weight(isSelected: true), .semibold)
+        XCTAssertEqual(QuietRowEmphasis.weight(isSelected: false), .regular)
     }
 
     // MARK: - Footer budget
@@ -383,12 +439,22 @@ final class QuietIdentityMarkTests: XCTestCase {
         // The old chip framed avatar + name into 118pt total.
         XCTAssertGreaterThan(width, 118 - FooterAccountBudget.avatarSlot)
 
-        // The name from the bug report has to fit *whole* at the default width,
-        // with the gear and the usage chip both present. It is 117.3pt at this
-        // font, so the footer's own budget is tight on purpose: the control
-        // slots, the gaps and the chip's padding were each trimmed to buy it.
+        // The name from the bug report is 117.3pt at this font. It fit whole at
+        // v1.1.6's 248pt rail; v1.1.7's 228pt rail is 20pt narrower and the
+        // footer is where those 20 points come out, so at the *resting* width a
+        // long name now takes an ellipsis again. That is a real cost of item 1
+        // and it is written down rather than asserted away: what the footer
+        // still guarantees is that widening the rail *at all* recovers it, and
+        // that the name never falls back to the fixed 118pt chip it was pinned
+        // to before v1.1.6.
         let rendered = ("michael ofengenden" as NSString).size(withAttributes: [.font: font]).width
-        XCTAssertGreaterThan(width, rendered, "the footer still cannot show the whole name")
+        let whole = FooterAccountBudget.nameWidth(footerWidth: 248, usageChipWidth: chip, attentionWidth: 0)
+        XCTAssertGreaterThan(whole, rendered, "the whole name no longer fits at any reachable width")
+        XCTAssertLessThanOrEqual(
+            248,
+            NativeWorkspaceChrome.projectSidebarMaximumWidth,
+            "the width that shows the whole name is no longer reachable by dragging"
+        )
 
         // The margin at the default width is thin by construction, so widening
         // the sidebar has to open it up properly rather than merely a little.
@@ -402,16 +468,18 @@ final class QuietIdentityMarkTests: XCTestCase {
         func width(_ sidebar: CGFloat) -> CGFloat {
             FooterAccountBudget.nameWidth(footerWidth: sidebar, usageChipWidth: 34, attentionWidth: 0)
         }
-        XCTAssertGreaterThan(width(NativeWorkspaceChrome.projectSidebarMaximumWidth), width(248))
-        XCTAssertGreaterThan(width(248), width(NativeWorkspaceChrome.projectSidebarMinimumWidth))
+        let ideal = NativeWorkspaceChrome.projectSidebarIdealWidth
+        XCTAssertGreaterThan(width(NativeWorkspaceChrome.projectSidebarMaximumWidth), width(ideal))
+        XCTAssertGreaterThan(width(ideal), width(NativeWorkspaceChrome.projectSidebarMinimumWidth))
     }
 
     /// Every optional control is charged for, so the arithmetic degrades the
     /// way the layout does rather than only describing the quiet case.
     func testOptionalFooterControlsAreChargedAgainstTheName() {
-        let quiet = FooterAccountBudget.nameWidth(footerWidth: 248, usageChipWidth: 0, attentionWidth: 0)
-        let withChip = FooterAccountBudget.nameWidth(footerWidth: 248, usageChipWidth: 34, attentionWidth: 0)
-        let withBoth = FooterAccountBudget.nameWidth(footerWidth: 248, usageChipWidth: 34, attentionWidth: 30)
+        let ideal = NativeWorkspaceChrome.projectSidebarIdealWidth
+        let quiet = FooterAccountBudget.nameWidth(footerWidth: ideal, usageChipWidth: 0, attentionWidth: 0)
+        let withChip = FooterAccountBudget.nameWidth(footerWidth: ideal, usageChipWidth: 34, attentionWidth: 0)
+        let withBoth = FooterAccountBudget.nameWidth(footerWidth: ideal, usageChipWidth: 34, attentionWidth: 30)
         XCTAssertEqual(quiet - withChip, 34 + FooterAccountBudget.gap, accuracy: 0.001)
         XCTAssertEqual(withChip - withBoth, 30 + FooterAccountBudget.gap, accuracy: 0.001)
     }

@@ -41,4 +41,67 @@ final class QuietSessionStatusTests: XCTestCase {
         XCTAssertTrue(QuietSessionStatus.ended.isDimmed)
         XCTAssertFalse(QuietSessionStatus.idle.isDimmed)
     }
+
+    // MARK: - Dot palette
+
+    private func channels(_ hex: UInt32) -> (r: Int, g: Int, b: Int) {
+        (Int((hex >> 16) & 0xFF), Int((hex >> 8) & 0xFF), Int(hex & 0xFF))
+    }
+
+    /// The v1.1.6 complaint: at 6pt, "still working" and "finished" were the
+    /// same dot. Working was an olive one hue-step from done's green. It is now
+    /// blue, and the two are asserted apart on the one axis that matters at
+    /// that size — which channel dominates.
+    func testWorkingIsBlueAndDoneIsGreen() {
+        for hex in [QuietStatusPalette.working.light, QuietStatusPalette.working.dark] {
+            let c = channels(hex)
+            XCTAssertGreaterThan(c.b, c.r, "working is not blue-dominant")
+            XCTAssertGreaterThan(c.b, c.g, "working is not blue-dominant")
+            XCTAssertGreaterThan(c.b - max(c.r, c.g), 60, "working's blue is not decisive at 6pt")
+        }
+        for hex in [QuietStatusPalette.doneUnseen.light, QuietStatusPalette.doneUnseen.dark] {
+            let c = channels(hex)
+            XCTAssertGreaterThan(c.g, c.r, "done is not green-dominant")
+            XCTAssertGreaterThan(c.g, c.b, "done is not green-dominant")
+        }
+    }
+
+    /// The rest of the grammar is unchanged, and every state that draws a dot
+    /// has to be distinguishable from every other one.
+    func testTheFourSpeakingStatesKeepDistinctHues() {
+        let needsYou = channels(QuietStatusPalette.needsYou.light)
+        XCTAssertGreaterThan(needsYou.r, needsYou.b, "needs-you is not amber")
+        XCTAssertGreaterThan(needsYou.g, needsYou.b, "needs-you is not amber")
+
+        let failed = channels(QuietStatusPalette.failed.light)
+        XCTAssertGreaterThan(failed.r, failed.g, "failed is not red")
+        XCTAssertGreaterThan(failed.r, failed.b, "failed is not red")
+
+        let speaking: [QuietSessionStatus] = [.working, .needsYou, .doneUnseen, .failed]
+        let lights = speaking.compactMap { QuietStatusPalette.hexes(for: $0)?.light }
+        XCTAssertEqual(Set(lights).count, speaking.count, "two states share a colour")
+        for status in speaking {
+            XCTAssertNotNil(status.dotColor, "\(status) must draw a dot")
+        }
+    }
+
+    func testSilentStatesDrawNoDot() {
+        XCTAssertNil(QuietStatusPalette.hexes(for: .idle))
+        XCTAssertNil(QuietStatusPalette.hexes(for: .ended))
+        XCTAssertNil(QuietSessionStatus.idle.dotColor)
+        XCTAssertNil(QuietSessionStatus.ended.dotColor)
+    }
+
+    /// Dark-mode values are *lifted*, not merely the light ones: a dot tuned
+    /// for a white sidebar loses its chroma on a dark one.
+    func testDarkVariantsAreLighterThanTheirLightCounterparts() {
+        for status in [QuietSessionStatus.working, .needsYou, .doneUnseen, .failed] {
+            guard let hexes = QuietStatusPalette.hexes(for: status) else { return XCTFail("no palette") }
+            let light = channels(hexes.light)
+            let dark = channels(hexes.dark)
+            let lightSum = light.r + light.g + light.b
+            let darkSum = dark.r + dark.g + dark.b
+            XCTAssertGreaterThan(darkSum, lightSum, "\(status)'s dark dot is not lifted")
+        }
+    }
 }

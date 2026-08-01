@@ -38,13 +38,8 @@ enum QuietSessionStatus: Equatable {
 
     /// nil for idle/ended — no dot is drawn.
     var dotColor: Color? {
-        switch self {
-        case .working:   return Color(light: 0x8A9A46, dark: 0xA6B85E)
-        case .needsYou:  return Color(light: 0xC7862A, dark: 0xE0A046)
-        case .doneUnseen: return Color(light: 0x2E9E5B, dark: 0x4FB878)
-        case .failed:    return Color(light: 0xC64B40, dark: 0xE0716A)
-        case .idle, .ended: return nil
-        }
+        guard let hexes = QuietStatusPalette.hexes(for: self) else { return nil }
+        return Color(light: hexes.light, dark: hexes.dark)
     }
 
     var accessibilityWord: String? {
@@ -58,6 +53,44 @@ enum QuietSessionStatus: Equatable {
     }
 
     var isDimmed: Bool { self == .ended }
+}
+
+/// The status dot palette, as packed sRGB hexes.
+///
+/// Kept as numbers rather than as `Color`s so the exact values are one
+/// greppable table and can be asserted in tests — a `Color` built from a
+/// dynamic `NSColor` does not compare, so a palette expressed only as `Color`
+/// is a palette no test can defend.
+///
+/// The v1.1.6 change is `working`: it was an olive (`0x8A9A46`) that sat one
+/// hue-step from `doneUnseen`'s green, so at 6pt "still running" and "finished"
+/// were the same dot. Working is now unmistakably blue and, unlike every other
+/// state, it *pulses* (`QuietStatusDot`), which is the second, colour-blind-safe
+/// channel that separates it from done. The rest of the grammar is unchanged:
+/// green means done, amber means needs-you, red means failed, idle and ended
+/// draw nothing.
+///
+/// Blue is free here: the rail's identity marks are Claude's coral, a near
+/// mono OpenAI knot, and neutral grey tiles — including the ssh tile, which
+/// carries no blue — so nothing else in a row can be mistaken for this dot.
+enum QuietStatusPalette {
+    /// Blue on light, lifted (not merely brightened) on dark so the dot keeps
+    /// its chroma against the rail's dark backdrop.
+    static let working: (light: UInt32, dark: UInt32) = (0x3478F6, 0x6FA8FF)
+    static let needsYou: (light: UInt32, dark: UInt32) = (0xC7862A, 0xE0A046)
+    static let doneUnseen: (light: UInt32, dark: UInt32) = (0x2E9E5B, 0x4FB878)
+    static let failed: (light: UInt32, dark: UInt32) = (0xC64B40, 0xE0716A)
+
+    /// `nil` for the two silent states.
+    static func hexes(for status: QuietSessionStatus) -> (light: UInt32, dark: UInt32)? {
+        switch status {
+        case .working: return working
+        case .needsYou: return needsYou
+        case .doneUnseen: return doneUnseen
+        case .failed: return failed
+        case .idle, .ended: return nil
+        }
+    }
 }
 
 private extension Color {

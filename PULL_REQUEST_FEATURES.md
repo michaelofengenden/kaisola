@@ -21,7 +21,11 @@ store, navigation escape, credential, or permitted network path. Swift remains t
 authority for exact source, line endings, dirty state, save/revert, recovery,
 path confinement, permissions, and undo/redo. The same fixture edits a CRLF
 Swift file through the bridge, undoes it, redoes it, and verifies syntax in
-light and dark mode.
+light and dark mode. Bounded multi-language outlines navigate exact source
+lines; exact FSEvents batches patch only affected tree/index subtrees. An
+explicit Files-rail control follows structured ACP locations from only the
+selected Chat or Mesh, and the in-project move sheet performs collision-safe,
+symlink-confined cross-directory moves with exact undo/redo.
 
 Completed scope:
 
@@ -30,11 +34,15 @@ Completed scope:
   ownership, and permissions in Swift.
 - Add transient preview tabs, persistent edited tabs, and safe same-directory
   rename, Trash/restore, and reveal actions.
+- Add bounded outline navigation with repeatable exact-line selection.
+- Add explicit follow-the-agent navigation from structured ACP locations and
+  diff artifacts without inferring paths from transcript prose.
+- Add safe cross-directory moves with bounded in-project destination search,
+  tab/path reconciliation, and exact undo/redo.
+- Patch repository indexes and loaded tree directories from bounded exact
+  watcher batches, with full-refresh fallback for dropped/root events.
 
-Remaining scope:
-
-- Add outline navigation, follow-the-agent, and safe cross-directory move.
-- Improve repository indexing and watcher invalidation for large workspaces.
+Implementation status: complete.
 
 Acceptance:
 

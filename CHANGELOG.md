@@ -17,6 +17,10 @@
 - Agent permission prompts now show the raw request, every declared path, and the exact standing-rule scope, with separate Deny, Allow Once, and Create Rule actions.
 - Chat and Mesh now render agent Markdown as native headings, tables, highlighted code with copy controls, and clickable project file citations; large responses, tool output, and diffs have explicit Show More and Collapse controls.
 - Text and HTML files now edit in a fast, syntax-aware CodeMirror surface while Swift keeps source bytes, line endings, undo, save/revert, recovery, permissions, and file access under native control.
+- Source outlines jump to exact Markdown and code structure, including repeated navigation to the same symbol.
+- Files and search now update only the changed repository areas during ordinary agent edits, with a safe full refresh when macOS reports dropped or root-level events.
+- An opt-in Files control follows files declared by the selected Chat or Mesh without treating transcript prose as a path.
+- Files and folders can move between project directories with collision checks, open-tab reconciliation, and exact Undo/Redo.
 
 ## 1.1.7 — 2026-07-31
 

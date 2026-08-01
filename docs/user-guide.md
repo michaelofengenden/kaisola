@@ -25,6 +25,13 @@ explicitly choose **End Session**.
 
 - **Files** opens the active project's file tree. A single click opens a
   temporary preview; editing or choosing **Keep Open** makes the tab persistent.
+  A file's action menu can rename it, move it to another project folder, reveal
+  it in Finder, or move it to the recoverable macOS Trash. The outline menu in
+  supported source files jumps to exact headings, declarations, and keys.
+- The scope button in **Files** explicitly follows files declared by the
+  currently selected Chat or Mesh. It starts off, follows only structured agent
+  file activity, and opens replaceable previews so background work cannot pin
+  documents or infer paths from ordinary response text.
 - **Chat** runs supported agents through their chat adapters. Drafts and queued
   follow-ups are saved. If an adapter restarts, only prompts that were never
   dispatched can resume automatically.

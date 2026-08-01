@@ -45,6 +45,20 @@ Large product and architecture work remains ordered in
   two-resource private scheme. Swift validates incremental edits and owns
   undo/redo, exact CRLF/LF source, save/revert, recovery, paths, and permissions;
   the ephemeral page has no file or network capability.
+- Workspace FSEvents now publish bounded exact paths and detect dropped/root
+  events. Loaded folders and cached search indexes patch only affected subtrees
+  unless correctness requires a full bounded replacement walk.
+- Source files now expose a bounded native outline for Markdown, Swift, Python,
+  JavaScript/TypeScript, HTML, CSS, shell, JSON, and YAML. Repeated selection of
+  the same symbol still navigates to its exact one-based line.
+- Files can explicitly follow structured locations and diff artifacts from only
+  the selected Chat or Mesh. The mode is off by default, opens transient tabs,
+  retries files declared before creation, and rejects prose, missing files,
+  traversal, directories, and symlink escapes.
+- Files now move across project folders through a bounded in-app destination
+  picker. Collisions, workspace escapes, link traversal, and recursive folder
+  moves fail closed; open tabs, expanded paths, indexes, and exact undo/redo stay
+  synchronized.
 - Status indicators expose shape and accessible names, and the user-facing copy
   pass removed several implementation terms (`50e00aa`, `949c4ef`).
 - Bounded PDF files now open in a native PDFKit surface with selection,

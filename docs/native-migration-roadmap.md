@@ -105,16 +105,16 @@ optional pending a scope decision.
 
 | Feature | Status | Pri | Notes |
 |---|---|---|---|
-| File tree + fuzzy search + index + watch | PARTIAL | P1 | rail tree + palette fuzzy index + live FSEvents watching (debounced auto-refresh, v0.1.99) |
+| File tree + fuzzy search + index + watch | DONE | P1 | lazy rail tree + bounded fuzzy index + bounded exact FSEvents batches; ordinary changes patch affected loaded/index subtrees and dropped/root events request a full bounded refresh |
 | Code editor (syntax, save, dirty, cursor restore) | DONE | P1 | offline CodeMirror 6 island for text/HTML with syntax, search, completion, folds, exact LF/CRLF transactions and Swift-owned undo/save/revert/recovery; Markdown keeps its native rendered/source editor |
 | Document preview (Markdown/HTML/CSV/JSON) | DONE | P1 (md) / P2 | Markdown is editable in its native rendered TextKit view with a Source toggle; images, CSV/TSV tables, JSON tree, and confined JS-off HTML preview are included |
 | Preview tabs (Zed-style transient) | DONE | P2 | single-click previews remain replaceable; edits and double-click promote persistent tabs; overflow and recently closed state are bounded |
 | PDF viewer + LaTeX synctex | PARTIAL | P2 | native bounded PDFKit viewer is complete; LaTeX SyncTeX remains open |
 | Research/word diffs | NEW | P2 | |
-| Outline / cursor follow | NEW | P2 | |
+| Outline / cursor follow | DONE | P2 | bounded native outlines for Markdown, Swift, Python, JS/TS, HTML, CSS, shell, JSON, and YAML; selecting an entry drives repeatable exact-line editor navigation |
 | Quote annotations | NEW | P2 | research |
-| Follow-the-agent (auto-open touched files) | NEW | P2 | |
-| Asset import/rename/trash/reveal | PARTIAL | P2 | Markdown image import, safe same-directory rename, reversible Trash, and reveal are complete; cross-directory move remains open |
+| Follow-the-agent (auto-open touched files) | DONE | P2 | explicit default-off Files toggle; only structured ACP locations/diffs from the selected Chat or Mesh can open a symlink-confined existing file as a transient preview |
+| Asset import/rename/trash/reveal | DONE | P2 | Markdown image import, safe rename and bounded in-project cross-directory move, exact undo/redo, reversible Trash, and reveal |
 
 ## 5. Settings & configuration
 

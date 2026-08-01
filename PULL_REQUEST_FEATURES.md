@@ -328,7 +328,9 @@ Acceptance:
 The audit pass moves Unix socket work to dedicated queues, makes close wake
 blocked I/O, bounds Git branch probes, reconnects after repeated inventory
 failures, orders menu-window targeting, and cleans completed teardown tasks.
-Finish the remaining failure and scaling seams.
+Failed pop-out targets now retain a standard missing-session recovery card with
+Try Again and Back to Workspace instead of becoming blank windows. Finish the
+remaining failure and scaling seams.
 
 Scope:
 
@@ -338,8 +340,6 @@ Scope:
   explicit memory budgets for retained terminal surfaces.
 - Batch idle process metadata probes, harden bootstrap process output draining,
   and ensure all long-lived tasks remove their completion bookkeeping.
-- Make failed pop-out targets show the standard missing-session recovery card
-  instead of an empty window.
 
 Acceptance:
 

@@ -105,4 +105,24 @@ final class AppModelBookkeepingTests: XCTestCase {
         ))
         XCTAssertFalse(model.explicitlyClosedChatIDs.contains("chat-0"))
     }
+
+    @MainActor
+    func testFailedPopOutTargetRetainsExplicitRecoveryUntilDismissed() async {
+        let model = AppModel(
+            sessionStore: NativeSessionStore(
+                fileURL: directory.appendingPathComponent("popout-sessions.json")
+            ),
+            workspaceStateStore: NativeWorkspaceStateStore(
+                fileURL: directory.appendingPathComponent("popout-workspace.json")
+            )
+        )
+
+        await model.openPopOutTarget("terminal:missing")
+
+        XCTAssertEqual(model.missingSessionRecovery?.sessionID, "terminal:missing")
+        XCTAssertTrue(model.missingSessionRecovery?.message.contains("could not connect") == true)
+        XCTAssertNil(model.selectedSessionID)
+        model.dismissMissingSessionRecovery()
+        XCTAssertNil(model.missingSessionRecovery)
+    }
 }

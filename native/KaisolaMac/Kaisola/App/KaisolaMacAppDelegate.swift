@@ -2687,16 +2687,25 @@ final class KaisolaMacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDele
     /// Open a session in its own fresh window (the native "pop out"): the new
     /// window's independent AppModel selects the same broker session.
     static func popOut(sessionID: String) {
-        guard let delegate = NSApp.delegate as? KaisolaMacAppDelegate else { return }
-        guard let window = delegate.makeWindow() else { return }
-        guard let model = delegate.windowModels[ObjectIdentifier(window)] else { return }
+        guard let delegate = NSApp.delegate as? KaisolaMacAppDelegate else {
+            ToastCenter.shared.show("Kaisola could not open a new window.", style: .error)
+            return
+        }
+        guard let window = delegate.makeWindow() else {
+            ToastCenter.shared.show("Kaisola could not open a new window right now.", style: .error)
+            return
+        }
+        guard let model = delegate.windowModels[ObjectIdentifier(window)] else {
+            window.close()
+            ToastCenter.shared.show("The new window could not load its workspace.", style: .error)
+            return
+        }
         Task {
             // Wait for the fresh model's broker connection before selecting.
             for _ in 0..<50 where !model.connectionState.isConnected {
                 try? await Task.sleep(nanoseconds: 100_000_000)
             }
-            model.selectedSessionID = sessionID
-            await model.select(sessionID)
+            await model.openPopOutTarget(sessionID)
         }
     }
 

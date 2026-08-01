@@ -5,6 +5,11 @@ import KaisolaBrokerProtocol
 
 @MainActor
 final class AppModel: ObservableObject {
+    struct MissingSessionRecovery: Equatable, Sendable {
+        let sessionID: String
+        let message: String
+    }
+
     struct TerminalTranscriptContext: Identifiable, Equatable, Sendable {
         let id: String
         let title: String
@@ -66,6 +71,10 @@ final class AppModel: ObservableObject {
     @Published private(set) var brokerUpgradeState: BrokerUpgradeState = .unknown
     @Published private(set) var sessions: [BrokerTerminalRecord] = []
     @Published var selectedSessionID: String?
+    /// A new-window pop-out target that could not be resolved. Kept separate
+    /// from ordinary selection so a failed target cannot collapse into the
+    /// generic empty workspace and look like a successful blank window.
+    @Published private(set) var missingSessionRecovery: MissingSessionRecovery?
     /// The primary document is intentionally not `@Published`: terminal bytes
     /// are a card-local concern, not an IDE-structure mutation. Mounted cards
     /// observe `TerminalSurfaceFeed` instances instead, while selection and
@@ -2767,6 +2776,7 @@ final class AppModel: ObservableObject {
     func selectChat(_ chatID: String?) {
         selectedChatID = chatID
         if let chatID {
+            missingSessionRecovery = nil
             if let projectID = chats.first(where: { $0.id == chatID })?.projectID,
                let project = projects.first(where: { $0.id == projectID }) {
                 selectedProjectID = project.id
@@ -2863,6 +2873,7 @@ final class AppModel: ObservableObject {
     func selectMesh(_ meshID: String?) {
         selectedMeshID = meshID
         if let meshID {
+            missingSessionRecovery = nil
             if let projectID = meshes.first(where: { $0.id == meshID })?.projectID,
                let project = projects.first(where: { $0.id == projectID }) {
                 selectedProjectID = project.id
@@ -3239,6 +3250,55 @@ final class AppModel: ObservableObject {
         await reload()
     }
 
+    /// Resolve an explicit new-window target only after the destination model
+    /// has its own current inventory. Absence and connection failure become a
+    /// durable recovery card instead of being flattened into `select(nil)`.
+    func openPopOutTarget(_ sessionID: String) async {
+        let target = sessionID.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !target.isEmpty else {
+            missingSessionRecovery = MissingSessionRecovery(
+                sessionID: sessionID,
+                message: "Kaisola could not identify the terminal to open."
+            )
+            return
+        }
+        guard connectionState.isConnected else {
+            missingSessionRecovery = MissingSessionRecovery(
+                sessionID: target,
+                message: "Kaisola could not connect to that terminal. It may still be running; try again after the connection recovers."
+            )
+            return
+        }
+
+        await refreshInventory()
+        guard sessions.contains(where: { $0.id == target }) else {
+            missingSessionRecovery = MissingSessionRecovery(
+                sessionID: target,
+                message: "That terminal is no longer available. It may have ended or been closed in another window."
+            )
+            return
+        }
+
+        missingSessionRecovery = nil
+        await select(target)
+        if selectedSessionID != target {
+            missingSessionRecovery = MissingSessionRecovery(
+                sessionID: target,
+                message: "Kaisola found the terminal but could not open it in this window."
+            )
+        }
+    }
+
+    func retryMissingSession() async {
+        guard let missingSessionRecovery else { return }
+        if !connectionState.isConnected { await reload() }
+        await openPopOutTarget(missingSessionRecovery.sessionID)
+    }
+
+    func dismissMissingSessionRecovery() {
+        missingSessionRecovery = nil
+    }
+
     func select(_ id: String?) async {
         // Preserve every byte that arrived before this interaction boundary;
         // the document below is the snapshot persisted and retained on leave.
@@ -3267,6 +3327,7 @@ final class AppModel: ObservableObject {
         // milliseconds; waiting for them here made the old terminal briefly
         // reappear whenever a chat/Mesh/CLI tab was selected.
         if let next {
+            missingSessionRecovery = nil
             let retainedDocument = terminalSurfaceDocuments[next.id]
                 ?? (previousDocument.sessionID == next.id
                     ? previousDocument

@@ -54,6 +54,9 @@ Large product and architecture work remains ordered in
 - An ended owned pane can recreate that exact agent/account/title/draft recipe
   in place with a fresh PTY, while oversized valid ACP images downscale off-main
   through a 2048 px/128 MB-bounded ImageIO path instead of being rejected.
+- Failed pop-out targets now retain a standard missing-session recovery card
+  with Try Again and Back to Workspace; window/model construction failures also
+  surface an explicit error toast.
 
 ## Open audit fixes
 
@@ -70,8 +73,6 @@ Large product and architecture work remains ordered in
 
 ### Shell, Git, and session recovery
 
-- Make pop-out failure explicit; the current-window preference for an already
-  visible local surface is implemented.
 - Finish reversible Recently Closed/Restore/Delete behavior and persisted,
   inspectable Mesh staged prompts.
 

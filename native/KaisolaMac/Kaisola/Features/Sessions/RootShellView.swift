@@ -1431,12 +1431,35 @@ struct RootShellView: View {
         }
     }
 
+    private func missingSessionRecoveryState(
+        _ recovery: AppModel.MissingSessionRecovery
+    ) -> some View {
+        ContentUnavailableView {
+            Label("Session unavailable", systemImage: "rectangle.slash")
+        } description: {
+            Text(recovery.message)
+        } actions: {
+            HStack(spacing: 10) {
+                Button("Try Again") {
+                    Task { await model.retryMissingSession() }
+                }
+                Button("Back to Workspace") {
+                    model.dismissMissingSessionRecovery()
+                }
+            }
+            .buttonStyle(.bordered)
+        }
+        .accessibilityIdentifier("kaisola.missing-session-recovery")
+    }
+
     // MARK: - Unified movable session dock
 
     private var unifiedSessionPaneGrid: some View {
         let layout = model.paneLayout(for: activeProjectID)
         return Group {
-            if let maximized = model.maximizedPaneID, layout.contains(maximized) {
+            if let recovery = model.missingSessionRecovery {
+                missingSessionRecoveryState(recovery)
+            } else if let maximized = model.maximizedPaneID, layout.contains(maximized) {
                 unifiedSessionCard(maximized)
             } else if layout.isEmpty {
                 emptyWorkspaceState

@@ -2784,6 +2784,119 @@ private struct RenameSheet: View {
     }
 }
 
+/// The footer's plan-usage chip, derived from the same `UsageCenter` readings
+/// Settings ▸ Usage renders as cards.
+///
+/// Pure, and deliberately not a method on `UsageCenter`: the chip is a *view*
+/// decision (which one number earns four characters of a 40pt-tall footer),
+/// not a fact about usage, and keeping it here means the rule can be changed
+/// without touching the probe.
+enum FooterUsageChip {
+    enum Level: Equatable {
+        case normal, warning, critical
+    }
+
+    struct Reading: Equatable {
+        /// Rounded, clamped to 0…100.
+        let percent: Int
+        let level: Level
+        /// The account the number belongs to, for the tooltip. The chip itself
+        /// never spends width on it.
+        let providerName: String
+        /// Which limit window the number came from.
+        let windowLabel: String
+
+        var label: String { "\(percent)%" }
+
+        var accessibilityLabel: String {
+            "\(providerName) plan usage, \(percent) percent of \(windowLabel) used"
+        }
+
+        var help: String {
+            "\(providerName) · \(windowLabel) \(percent)% used — open Usage settings"
+        }
+    }
+
+    /// Amber from three-quarters, red from ninety percent. Both are *late*: a
+    /// footer that is orange most of the day has stopped meaning anything.
+    static let warningThreshold = 75
+    static let criticalThreshold = 90
+
+    static func level(forPercent percent: Int) -> Level {
+        if percent >= criticalThreshold { return .critical }
+        if percent >= warningThreshold { return .warning }
+        return .normal
+    }
+
+    /// The one number the chip shows.
+    ///
+    /// The *primary* account is the first reading that can answer at all —
+    /// `UsageCenter.planUsage` is built in the order the accounts are
+    /// configured, so "first" is the user's own ordering — and a healthy
+    /// (`ok`) account is preferred over one that is reporting a problem.
+    /// Within that account the chip shows its *tightest* window rather than an
+    /// average: what matters is the limit you are about to hit, and a 5-hour
+    /// window at 95% is not softened by a monthly window at 10%.
+    static func reading(_ providers: [UsageCenter.ProviderPlanUsage]) -> Reading? {
+        let candidates = providers.filter { !windows($0).isEmpty }
+        guard let provider = candidates.first(where: \.ok) ?? candidates.first else { return nil }
+        guard let tightest = windows(provider).max(by: { ($0.usedPercent ?? 0) < ($1.usedPercent ?? 0) }),
+              let used = tightest.usedPercent else { return nil }
+        let percent = Int(min(max(used, 0), 100).rounded())
+        return Reading(
+            percent: percent,
+            level: level(forPercent: percent),
+            providerName: provider.displayName,
+            windowLabel: tightest.label
+        )
+    }
+
+    private static func windows(_ provider: UsageCenter.ProviderPlanUsage) -> [UsageCenter.PlanWindow] {
+        provider.windows.filter { window in
+            guard let used = window.usedPercent else { return false }
+            return used.isFinite
+        }
+    }
+}
+
+/// What the footer's account name is actually given, stated as arithmetic for
+/// the same reason `QuietRowBudget` is: the name silently regressed to a fixed
+/// 118pt chip, so widening the sidebar did nothing and "michael ofen…" stayed
+/// truncated at every width. The chip is now bounded by the *footer*, not by a
+/// constant, and this is the number that says so.
+enum FooterAccountBudget {
+    /// Leading and trailing padding the footer row itself pays.
+    static let leadingPadding: CGFloat = 8
+    static let trailingPadding: CGFloat = 5
+    static var horizontalPadding: CGFloat { leadingPadding + trailingPadding }
+    /// Gap between footer controls. 5, matching the rail's own trailing lane —
+    /// the footer is the bottom of that column and should keep its rhythm.
+    static let gap: CGFloat = 5
+    /// The avatar that leads the account chip, plus its gap to the name.
+    static let avatarGap: CGFloat = 6
+    static let avatarSlot: CGFloat = 22 + avatarGap
+    /// A square footer control (gear, overflow). 22 rather than 24: the glyphs
+    /// inside are 12pt, the target is pointer-only, and the two points bought
+    /// back here are two points the account name keeps. Every one of them
+    /// mattered — see `FooterAccountBudget` callers and the test that pins the
+    /// name's width at the default sidebar.
+    static let controlSlot: CGFloat = 22
+
+    /// - Returns: points the account *name* can use before it must truncate.
+    static func nameWidth(
+        footerWidth: CGFloat,
+        usageChipWidth: CGFloat,
+        attentionWidth: CGFloat
+    ) -> CGFloat {
+        // gear + overflow are always present; the usage chip and the attention
+        // button are present only when they have something to say.
+        var trailing = controlSlot * 2 + gap * 2
+        if usageChipWidth > 0 { trailing += usageChipWidth + gap }
+        if attentionWidth > 0 { trailing += attentionWidth + gap }
+        return footerWidth - horizontalPadding - avatarSlot - trailing
+    }
+}
+
 private struct ConnectionFooter: View {
     @EnvironmentObject private var auth: AuthModel
     let state: AppModel.ConnectionState
@@ -2807,23 +2920,90 @@ private struct ConnectionFooter: View {
         forInfoDictionaryKey: "CFBundleShortVersionString"
     ) as? String ?? "Dev"
 
-    /// Identity, then everything else behind one overflow. The footer used to
-    /// be a six-glyph multicolor shelf; the only things that earn a permanent
-    /// pixel here are who you are signed in as and — when there is something to
-    /// answer — the needs-you count.
+    /// Identity, the two things worth one click, then everything else behind
+    /// one overflow.
+    ///
+    /// The footer used to be a six-glyph multicolor shelf, and the correction
+    /// for that over-corrected: Settings and Usage both went behind a menu, so
+    /// the two destinations the user visits daily cost two clicks and a read.
+    /// v1.1.6 promotes exactly those two, and pays for the width by no longer
+    /// spending a fixed 118pt on the account chip. Both promotions are quiet —
+    /// a monochrome gear and a secondary-text percentage, no color unless the
+    /// usage number has earned it.
+    ///
+    /// The account chip is the only flexible child: everything else is
+    /// `fixedSize`, so the name gets the whole remainder and truncates only
+    /// when the sidebar is genuinely at its minimum.
     var body: some View {
-        HStack(spacing: 6) {
+        HStack(spacing: FooterAccountBudget.gap) {
             accountMenu
                 .help(state.detail ?? state.title)
-            Spacer(minLength: 4)
+            usageChip
+            settingsButton
             attentionButton
             overflowMenu
         }
         .font(.callout)
         .controlSize(.small)
-        .padding(.leading, 10)
-        .padding(.trailing, 6)
+        .padding(.leading, FooterAccountBudget.leadingPadding)
+        .padding(.trailing, FooterAccountBudget.trailingPadding)
         .frame(height: 40)
+    }
+
+    /// One click to Settings — the ⌘, destination, which until now existed
+    /// only inside two menus. Monochrome on purpose: it is a door, not a state.
+    private var settingsButton: some View {
+        Button(action: showSettings) {
+            Image(systemName: "gearshape")
+                .font(.system(size: 12, weight: .medium))
+                .foregroundStyle(.secondary)
+                .frame(width: FooterAccountBudget.controlSlot, height: FooterAccountBudget.controlSlot)
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .fixedSize()
+        .help("Settings (⌘,)")
+        .accessibilityLabel("Settings")
+        .accessibilityIdentifier("footer.settings")
+    }
+
+    /// The primary account's tightest plan window, as one percentage that opens
+    /// Settings ▸ Usage. Absent entirely until a reading exists — an empty
+    /// chip, a spinner or a "—" would all be noise in a 40pt footer.
+    ///
+    /// Text only, with no capsule behind it. A filled chip was the first draft
+    /// and it cost ~10pt of padding, which is width the account name needs at
+    /// the default sidebar; it also read louder than the gear beside it, which
+    /// is the opposite of what this footer is for. The tooltip and the
+    /// accessibility label carry what the four characters cannot.
+    @ViewBuilder
+    private var usageChip: some View {
+        if let reading = FooterUsageChip.reading(usage.planUsage) {
+            Button(action: showUsage) {
+                Text(reading.label)
+                    .font(.system(size: 11, weight: .medium).monospacedDigit())
+                    .foregroundStyle(Self.usageTint(reading.level))
+                    .padding(.horizontal, 2)
+                    .frame(height: FooterAccountBudget.controlSlot)
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .fixedSize()
+            .help(reading.help)
+            .accessibilityLabel(reading.accessibilityLabel)
+            .accessibilityIdentifier("footer.usage")
+        }
+    }
+
+    /// Secondary until the number matters. `.orange`/`.red` here are the same
+    /// two colors the inbox and the rail's dots already use for "attend to
+    /// this" and "this failed", so the footer adds no new vocabulary.
+    static func usageTint(_ level: FooterUsageChip.Level) -> Color {
+        switch level {
+        case .normal: .secondary
+        case .warning: .orange
+        case .critical: .red
+        }
     }
 
     private var accountSignInIsRunning: Bool {
@@ -2831,9 +3011,15 @@ private struct ConnectionFooter: View {
         return false
     }
 
-    /// Avatar plus as much of the account name as the narrowest sidebar can
-    /// show without crowding the overflow button.
-    private static let accountChipWidth: CGFloat = 118
+    /// The account chip never gets narrower than its avatar plus a couple of
+    /// characters; below that the name is not worth the width and the row's
+    /// remaining controls matter more.
+    ///
+    /// This replaced a fixed `accountChipWidth` of 118pt. That constant — not
+    /// the font, not the priority — is why "michael ofen…" stayed truncated no
+    /// matter how wide the sidebar was dragged: the chip was framed to 118pt
+    /// and then `fixedSize`d, so the extra points went to the spacer beside it.
+    private static let accountChipMinimumWidth: CGFloat = 52
 
     private var accountName: String {
         guard let account = auth.account else { return "Kaisola" }
@@ -2870,7 +3056,7 @@ private struct ConnectionFooter: View {
             Image(systemName: "ellipsis")
                 .font(.system(size: 12, weight: .semibold))
                 .foregroundStyle(.secondary)
-                .frame(width: 24, height: 24)
+                .frame(width: FooterAccountBudget.controlSlot, height: FooterAccountBudget.controlSlot)
                 .contentShape(Rectangle())
         }
         .menuStyle(.borderlessButton)
@@ -2922,7 +3108,7 @@ private struct ConnectionFooter: View {
                 Text("Usage: \(usage.totalPeakTokens / 1000)k tokens · \(Int((usage.contextPressure * 100).rounded()))% context")
             }
         } label: {
-            HStack(spacing: 7) {
+            HStack(spacing: FooterAccountBudget.avatarGap) {
                 // Placeholder for the avatar, which is drawn in the overlay
                 // below; see the note there.
                 Color.clear
@@ -2932,8 +3118,15 @@ private struct ConnectionFooter: View {
                     .lineLimit(1)
                     .truncationMode(.tail)
             }
-            .frame(width: Self.accountChipWidth, height: 24, alignment: .leading)
+            // Sized by its contents, floored so a short name still leaves a
+            // usable target, then laid leading inside whatever the footer has
+            // left over. `contentShape` is applied BEFORE the stretch, so the
+            // blank remainder of the footer is not a click target for the
+            // account menu.
+            .frame(minWidth: Self.accountChipMinimumWidth, alignment: .leading)
+            .frame(height: 24)
             .contentShape(Rectangle())
+            .frame(maxWidth: .infinity, alignment: .leading)
         }
         // `.button` rather than `.borderlessButton`: the borderless bridge
         // collapses an explicitly framed label down to the menu arrow's own
@@ -2941,7 +3134,6 @@ private struct ConnectionFooter: View {
         .menuStyle(.button)
         .buttonStyle(.plain)
         .menuIndicator(.hidden)
-        .fixedSize()
         // Keep the asynchronously loaded photo outside AppKit's Menu label
         // bridge. The bridge otherwise promotes the source bitmap's intrinsic
         // dimensions and drops its SwiftUI mask when the image finishes loading.

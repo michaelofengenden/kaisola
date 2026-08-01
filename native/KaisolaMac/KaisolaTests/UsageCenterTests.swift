@@ -649,6 +649,92 @@ final class UsageCenterTests: XCTestCase {
         XCTAssertFalse(firstFingerprint.contains("account-one"))
         XCTAssertEqual(firstFingerprint.count, 64)
     }
+
+    // MARK: - Footer usage chip
+
+    private func provider(
+        _ name: String,
+        ok: Bool = true,
+        windows: [(String, Double?)]
+    ) -> UsageCenter.ProviderPlanUsage {
+        UsageCenter.ProviderPlanUsage(
+            provider: name.lowercased(),
+            displayName: name,
+            ok: ok,
+            sourceLabel: "test",
+            windows: windows.map { UsageCenter.PlanWindow(label: $0.0, usedPercent: $0.1, resetsAt: nil) }
+        )
+    }
+
+    /// The chip shows the account's *tightest* window, not an average: what
+    /// matters is the limit about to be hit, and a 5-hour window at 95% is not
+    /// softened by a monthly window at 10%.
+    func testChipShowsTheTightestWindowOfThePrimaryAccount() {
+        let reading = FooterUsageChip.reading([
+            provider("Claude", windows: [("5-hour", 62), ("Weekly", 18)]),
+            provider("Codex", windows: [("Weekly", 99)]),
+        ])
+        XCTAssertEqual(reading?.percent, 62)
+        XCTAssertEqual(reading?.label, "62%")
+        XCTAssertEqual(reading?.providerName, "Claude")
+        XCTAssertEqual(reading?.windowLabel, "5-hour")
+        XCTAssertEqual(reading?.level, .normal)
+    }
+
+    /// `planUsage` is built in the order the accounts are configured, so
+    /// "primary" is the user's own ordering — but an account that is reporting
+    /// a problem yields to one that can actually answer.
+    func testAHealthyAccountIsPreferredOverAFailingOne() {
+        let reading = FooterUsageChip.reading([
+            provider("Codex", ok: false, windows: [("Weekly", 12)]),
+            provider("Claude", windows: [("5-hour", 40)]),
+        ])
+        XCTAssertEqual(reading?.providerName, "Claude")
+
+        // …but a failing account is still better than no number at all.
+        let onlyFailing = FooterUsageChip.reading([provider("Codex", ok: false, windows: [("Weekly", 12)])])
+        XCTAssertEqual(onlyFailing?.providerName, "Codex")
+        XCTAssertEqual(onlyFailing?.percent, 12)
+    }
+
+    /// No reading, no chip. An empty capsule, a spinner or a "—" would all be
+    /// noise in a 40pt footer.
+    func testChipIsAbsentWhenNothingCanAnswer() {
+        XCTAssertNil(FooterUsageChip.reading([]))
+        XCTAssertNil(FooterUsageChip.reading([provider("Claude", windows: [])]))
+        XCTAssertNil(FooterUsageChip.reading([provider("Claude", windows: [("5-hour", nil)])]))
+        XCTAssertNil(FooterUsageChip.reading([provider("Claude", windows: [("5-hour", .nan)])]))
+    }
+
+    /// Both thresholds are late on purpose: a footer that is orange most of the
+    /// day has stopped meaning anything.
+    func testThresholdTintIsLateAndMonotonic() {
+        XCTAssertEqual(FooterUsageChip.level(forPercent: 0), .normal)
+        XCTAssertEqual(FooterUsageChip.level(forPercent: 74), .normal)
+        XCTAssertEqual(FooterUsageChip.level(forPercent: 75), .warning)
+        XCTAssertEqual(FooterUsageChip.level(forPercent: 89), .warning)
+        XCTAssertEqual(FooterUsageChip.level(forPercent: 90), .critical)
+        XCTAssertEqual(FooterUsageChip.level(forPercent: 100), .critical)
+        XCTAssertGreaterThan(FooterUsageChip.warningThreshold, 50)
+        XCTAssertGreaterThan(FooterUsageChip.criticalThreshold, FooterUsageChip.warningThreshold)
+    }
+
+    /// A provider that reports 104% (or a negative) must not render "104%" in
+    /// four characters of chrome.
+    func testPercentIsRoundedAndClamped() {
+        XCTAssertEqual(FooterUsageChip.reading([provider("Claude", windows: [("5-hour", 61.6)])])?.percent, 62)
+        XCTAssertEqual(FooterUsageChip.reading([provider("Claude", windows: [("5-hour", 104)])])?.percent, 100)
+        XCTAssertEqual(FooterUsageChip.reading([provider("Claude", windows: [("5-hour", -3)])])?.percent, 0)
+    }
+
+    /// Four characters cannot say whose limit this is, so the tooltip and the
+    /// spoken label have to.
+    func testChipCarriesItsContextInTextItDoesNotDraw() {
+        let reading = FooterUsageChip.reading([provider("Claude", windows: [("5-hour", 91)])])
+        XCTAssertEqual(reading?.level, .critical)
+        XCTAssertEqual(reading?.accessibilityLabel, "Claude plan usage, 91 percent of 5-hour used")
+        XCTAssertEqual(reading?.help, "Claude · 5-hour 91% used — open Usage settings")
+    }
 }
 
 private final class UsageContextResolverProbe: @unchecked Sendable {

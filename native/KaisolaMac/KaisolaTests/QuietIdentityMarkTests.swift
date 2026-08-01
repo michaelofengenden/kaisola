@@ -306,6 +306,60 @@ final class QuietIdentityMarkTests: XCTestCase {
         XCTAssertGreaterThan(now, before, "the wider sidebar was spent entirely on the indent")
     }
 
+    // MARK: - Footer budget
+
+    /// The footer regression: the account chip was framed to a fixed 118pt and
+    /// then `fixedSize`d, so "michael ofen…" stayed truncated no matter how far
+    /// the sidebar was dragged. The name's width is now a function of the
+    /// footer's, and at the default sidebar it must beat that old constant even
+    /// with both new controls present.
+    func testAccountNameGetsMoreThanTheOldFixedChipAtTheDefaultWidth() {
+        let font = NSFont.systemFont(ofSize: 12, weight: .medium)
+        // The chip is text only, so its width is the percentage's own.
+        let chipFont = NSFont.monospacedDigitSystemFont(ofSize: 11, weight: .medium)
+        let chip = ("62%" as NSString).size(withAttributes: [.font: chipFont]).width + 4
+
+        let width = FooterAccountBudget.nameWidth(
+            footerWidth: NativeWorkspaceChrome.projectSidebarIdealWidth,
+            usageChipWidth: chip,
+            attentionWidth: 0
+        )
+        // The old chip framed avatar + name into 118pt total.
+        XCTAssertGreaterThan(width, 118 - FooterAccountBudget.avatarSlot)
+
+        // The name from the bug report has to fit *whole* at the default width,
+        // with the gear and the usage chip both present. It is 117.3pt at this
+        // font, so the footer's own budget is tight on purpose: the control
+        // slots, the gaps and the chip's padding were each trimmed to buy it.
+        let rendered = ("michael ofengenden" as NSString).size(withAttributes: [.font: font]).width
+        XCTAssertGreaterThan(width, rendered, "the footer still cannot show the whole name")
+
+        // The margin at the default width is thin by construction, so widening
+        // the sidebar has to open it up properly rather than merely a little.
+        let roomy = FooterAccountBudget.nameWidth(footerWidth: 300, usageChipWidth: chip, attentionWidth: 0)
+        XCTAssertGreaterThan(roomy - rendered, 40, "widening the sidebar barely helps the name")
+    }
+
+    /// …and it really is a function of the footer: widening the sidebar has to
+    /// move the number, which is precisely what the fixed frame prevented.
+    func testAccountNameWidthGrowsWithTheSidebar() {
+        func width(_ sidebar: CGFloat) -> CGFloat {
+            FooterAccountBudget.nameWidth(footerWidth: sidebar, usageChipWidth: 34, attentionWidth: 0)
+        }
+        XCTAssertGreaterThan(width(NativeWorkspaceChrome.projectSidebarMaximumWidth), width(248))
+        XCTAssertGreaterThan(width(248), width(NativeWorkspaceChrome.projectSidebarMinimumWidth))
+    }
+
+    /// Every optional control is charged for, so the arithmetic degrades the
+    /// way the layout does rather than only describing the quiet case.
+    func testOptionalFooterControlsAreChargedAgainstTheName() {
+        let quiet = FooterAccountBudget.nameWidth(footerWidth: 248, usageChipWidth: 0, attentionWidth: 0)
+        let withChip = FooterAccountBudget.nameWidth(footerWidth: 248, usageChipWidth: 34, attentionWidth: 0)
+        let withBoth = FooterAccountBudget.nameWidth(footerWidth: 248, usageChipWidth: 34, attentionWidth: 30)
+        XCTAssertEqual(quiet - withChip, 34 + FooterAccountBudget.gap, accuracy: 0.001)
+        XCTAssertEqual(withChip - withBoth, 30 + FooterAccountBudget.gap, accuracy: 0.001)
+    }
+
     // MARK: - Active project glass
 
     /// The whole risk of a tinted row is drift toward candy. These are the

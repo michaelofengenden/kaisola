@@ -780,16 +780,26 @@ enum KaisolaVisualSystem {
 /// tint — for the two large backdrops.
 ///
 /// Methodology: light mode is white-led (white at roughly a third coverage),
-/// dark mode is a near-black neutral (`#0B0C12`). The recipe carries no accent,
-/// mesh, or slate stop, so the only chroma that reaches the eye is whatever the
-/// desktop itself contributes: saturation-forward, with zero warm or lavender
-/// bias. The three opacities describe one vertical gradient of the *same*
-/// color, so the top-light edge reads as light direction rather than as a tint.
-/// Keeping the numbers separate from the material makes the light/dark balance
-/// deterministic and gives appearance tests a stable contract.
+/// dark mode is a truly achromatic near-black (`#0D0D0D`). The recipe carries
+/// no accent, mesh, or slate stop, so the only chroma that reaches the eye is
+/// whatever the desktop itself contributes. The three opacities describe one
+/// vertical gradient of the *same* color, so the top-light edge reads as light
+/// direction rather than as a tint. Keeping the numbers separate from the
+/// material makes the light/dark balance deterministic and gives appearance
+/// tests a stable contract.
 struct GlassBackdropWash: Equatable, Sendable {
-    /// `#0B0C12`: a near-black that still reads neutral at high coverage.
-    static let darkVeil = (red: 11.0 / 255, green: 12.0 / 255, blue: 18.0 / 255)
+    /// `#0D0D0D`: R = G = B, so the veil contributes no hue of its own at any
+    /// coverage.
+    ///
+    /// It was `#0B0C12` — 11/12/18 — and that is where Michael's "blue-purple
+    /// tone" came from. At 0.60 coverage a veil is most of the surface, and
+    /// 18/255 against 11/255 is a **64% blue lead over red**; the eye reads
+    /// that as a cool cast long before it reads it as black. The old guard
+    /// missed it because it was stated in absolute terms (`blue - green ≤
+    /// 0.03`), and 0.024 of absolute difference is nothing at mid-grey and
+    /// everything at near-black. The invariant is relative now — see
+    /// `testDeclaredNeutralConstantsAreAchromatic`.
+    static let darkVeil = (red: 13.0 / 255, green: 13.0 / 255, blue: 13.0 / 255)
 
     let red: Double
     let green: Double
@@ -1121,7 +1131,7 @@ enum DesktopWallpaperResolution: Equatable, Sendable {
     case picture(URL)
     /// A still standing in for a dynamic aerial, which has no picture file.
     case aerialStill(URL)
-    /// Nothing readable: the veil sits on the cooled average colour instead.
+    /// Nothing readable: the veil sits on the wallpaper's average colour instead.
     case unavailable
 
     var url: URL? {
@@ -1422,7 +1432,7 @@ enum DesktopBackdropRenderer {
         // Gaussian with `clampedToExtent` edges preserves the image mean, so
         // blurring first would only move the measurement later.
         let pixels = DesktopTintSampler.pixels(image: still)
-        let tint = pixels.flatMap { DesktopTintSampler.cooledAverage(rgba: $0) }
+        let tint = pixels.flatMap { DesktopTintSampler.wallpaperAverage(rgba: $0) }
             ?? DesktopTintSampler.fallback
         let mean = pixels.flatMap { DesktopTintSampler.meanLuminance(rgba: $0) }
             ?? targetLuminance(isDark: key.isDark)
@@ -1463,7 +1473,13 @@ struct DesktopTintComponents: Equatable, Sendable {
 }
 
 enum DesktopTintSampler {
-    static let fallback = DesktopTintComponents(red: 0.38, green: 0.43, blue: 0.49)
+    /// The tint when there is no desktop to read: a plain grey at the same
+    /// Rec. 709 luma the old slate fallback had (0.4237), but achromatic.
+    ///
+    /// It was 0.38/0.43/0.49 — a blue-grey — so the one case where Kaisola
+    /// knows *nothing* about the wallpaper was also the case where it invented
+    /// the most blue.
+    static let fallback = DesktopTintComponents(red: 0.42, green: 0.42, blue: 0.42)
 
     /// How much of the wallpaper's own chroma reaches the tint.
     ///
@@ -1475,19 +1491,18 @@ enum DesktopTintSampler {
     /// magenta desktop resolved to a 0.18-wide channel spread, which is grey
     /// once a veil goes over it.
     static let chromaRetention = 0.70
-    /// A small pull toward a cool slate keeps a *near*-neutral desktop from
-    /// picking up a random cast, without flattening a colourful one.
-    static let slateMix = 0.10
-    private static let slate = (red: 0.35, green: 0.42, blue: 0.50)
-    /// Floors low enough that a dark wallpaper stays dark. The veil above is
-    /// what guarantees legibility; clamping here only prevents a fully black or
-    /// blown-out desktop from producing a degenerate tint.
-    private static let floors = (red: 0.07, green: 0.07, blue: 0.09)
-    private static let ceilings = (red: 0.90, green: 0.91, blue: 0.92)
+    /// Floors low enough that a dark wallpaper stays dark, and achromatic, so
+    /// clamping a very dark or very bright desktop cannot introduce a hue the
+    /// wallpaper does not have. The blue floor used to sit 0.02 above the other
+    /// two, which meant every near-black desktop resolved to a *blue*
+    /// near-black. The veil above is what guarantees legibility; clamping here
+    /// only prevents a degenerate tint.
+    static let floors = (red: 0.07, green: 0.07, blue: 0.07)
+    static let ceilings = (red: 0.91, green: 0.91, blue: 0.91)
 
     static func sample(image: CGImage) -> DesktopTintComponents {
         guard let pixels = pixels(image: image) else { return fallback }
-        return cooledAverage(rgba: pixels) ?? fallback
+        return wallpaperAverage(rgba: pixels) ?? fallback
     }
 
     /// The 16×16 box reduction both the tint and the bake's luminance
@@ -1513,7 +1528,8 @@ enum DesktopTintSampler {
         return drew ? pixels : nil
     }
 
-    /// Rec. 709 luma of the wallpaper's plain average — no cooling, no floors.
+    /// Rec. 709 luma of the wallpaper's plain average — no chroma softening,
+    /// no floors.
     /// This is what the bake normalizes against, so it has to describe the
     /// picture rather than the tint derived from it.
     static func meanLuminance(rgba: [UInt8]) -> Double? {
@@ -1543,10 +1559,18 @@ enum DesktopTintSampler {
     }
 
     /// The wallpaper's average, with its chroma pulled toward luminance and
-    /// then nudged toward a cool slate — enough to stay recognisably the
-    /// desktop's colour, not enough to turn a blue desktop into blue-on-blue
-    /// application chrome.
-    static func cooledAverage(rgba: [UInt8]) -> DesktopTintComponents? {
+    /// clamped — and **nothing else mixed in**.
+    ///
+    /// This was `cooledAverage`, and it earned the name: it blended 10% of a
+    /// cool slate (0.35/0.42/0.50) into every sampled tint. The intent was to
+    /// keep a near-neutral desktop from picking up a random cast, but a
+    /// constant blue-grey stop does not prevent a cast — it *is* one, applied
+    /// unconditionally, and it is the second half of the blue-purple tone. A
+    /// grey desktop now comes back grey because the wallpaper is grey, not
+    /// because a slate was averaged into it, and the only hue in the result is
+    /// the desktop's own. Renamed to match: it is the wallpaper's average, not
+    /// a cooled one.
+    static func wallpaperAverage(rgba: [UInt8]) -> DesktopTintComponents? {
         guard let wallpaper = plainAverage(rgba: rgba) else { return nil }
         let luminance = wallpaper.0 * 0.2126 + wallpaper.1 * 0.7152 + wallpaper.2 * 0.0722
         let softened = (
@@ -1555,9 +1579,9 @@ enum DesktopTintSampler {
             luminance + (wallpaper.2 - luminance) * chromaRetention
         )
         return DesktopTintComponents(
-            red: min(ceilings.red, max(floors.red, softened.0 * (1 - slateMix) + slate.red * slateMix)),
-            green: min(ceilings.green, max(floors.green, softened.1 * (1 - slateMix) + slate.green * slateMix)),
-            blue: min(ceilings.blue, max(floors.blue, softened.2 * (1 - slateMix) + slate.blue * slateMix))
+            red: min(ceilings.red, max(floors.red, softened.0)),
+            green: min(ceilings.green, max(floors.green, softened.1)),
+            blue: min(ceilings.blue, max(floors.blue, softened.2))
         )
     }
 }

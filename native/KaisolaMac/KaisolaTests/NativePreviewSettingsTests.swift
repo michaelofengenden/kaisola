@@ -434,10 +434,11 @@ final class NativePreviewSettingsTests: XCTestCase {
             GlassBackdropWash.workspace(isDark: true),
         ]
         for recipe in darkRecipes {
-            // #0B0C12.
-            XCTAssertEqual(recipe.red, 11.0 / 255, accuracy: 0.0001)
-            XCTAssertEqual(recipe.green, 12.0 / 255, accuracy: 0.0001)
-            XCTAssertEqual(recipe.blue, 18.0 / 255, accuracy: 0.0001)
+            // #0D0D0D. Was #0B0C12, which is where the blue-purple cast came
+            // from; see `testDeclaredNeutralConstantsAreAchromatic`.
+            XCTAssertEqual(recipe.red, 13.0 / 255, accuracy: 0.0001)
+            XCTAssertEqual(recipe.green, 13.0 / 255, accuracy: 0.0001)
+            XCTAssertEqual(recipe.blue, 13.0 / 255, accuracy: 0.0001)
         }
 
         // The headline coverage. 0.60 in both appearances: frost, not a pane.
@@ -479,23 +480,65 @@ final class NativePreviewSettingsTests: XCTestCase {
     }
 
 
-    /// Zero warm or lavender bias: the veil is neutral to the eye, so the only
-    /// chroma in the backdrop is whatever the desktop itself contributes.
-    func testGlassBackdropWashCarriesNoWarmOrLavenderBias() {
-        let recipes = [
-            GlassBackdropWash.sidebar(isDark: false),
-            GlassBackdropWash.sidebar(isDark: true),
-            GlassBackdropWash.workspace(isDark: false),
-            GlassBackdropWash.workspace(isDark: true),
-        ]
+    /// The cool-cast regression, and why the old invariant could not catch it.
+    ///
+    /// The guard used to be ABSOLUTE — `blue - green <= 0.03` — and the dark
+    /// veil was `#0B0C12`: 11/12/18 out of 255. That is a 0.024 absolute gap
+    /// between blue and red, which sails through a 0.03 tolerance, and a **64%
+    /// relative** blue lead, which at 0.60 coverage is most of what the eye
+    /// sees. Michael reported it as "the glass has a blue-purple tone".
+    ///
+    /// An absolute tolerance is meaningless at near-black, so the invariant is
+    /// relative: anything this app *declares* neutral has to hold every channel
+    /// within 5% of its own mean. A near-black cannot fake that.
+    func testDeclaredNeutralConstantsAreAchromatic() {
+        /// Largest per-channel departure from the mean, as a fraction of it.
+        func chromaticity(_ channels: [Double]) -> Double {
+            let mean = channels.reduce(0, +) / Double(channels.count)
+            guard mean > 0 else { return 0 }
+            return channels.map { abs($0 - mean) / mean }.max() ?? 0
+        }
 
-        for recipe in recipes {
-            // Never warm: red must not lead blue.
-            XCTAssertLessThanOrEqual(recipe.red, recipe.blue)
-            // Never lavender: blue may only edge ahead of green by a hair, and
-            // green must sit between the two rather than dipping below both.
-            XCTAssertLessThanOrEqual(recipe.blue - recipe.green, 0.03)
-            XCTAssertGreaterThanOrEqual(recipe.green, recipe.red)
+        // Sanity: the measure sees what the old one missed. #0B0C12 reads as
+        // 30% off-neutral; #0D0D0D reads as 0.
+        XCTAssertGreaterThan(chromaticity([11.0 / 255, 12.0 / 255, 18.0 / 255]), 0.25)
+
+        let neutrals: [(String, [Double])] = [
+            ("dark veil", [
+                GlassBackdropWash.darkVeil.red,
+                GlassBackdropWash.darkVeil.green,
+                GlassBackdropWash.darkVeil.blue,
+            ]),
+            ("tint fallback", [
+                DesktopTintSampler.fallback.red,
+                DesktopTintSampler.fallback.green,
+                DesktopTintSampler.fallback.blue,
+            ]),
+            ("tint floors", [
+                DesktopTintSampler.floors.red,
+                DesktopTintSampler.floors.green,
+                DesktopTintSampler.floors.blue,
+            ]),
+            ("tint ceilings", [
+                DesktopTintSampler.ceilings.red,
+                DesktopTintSampler.ceilings.green,
+                DesktopTintSampler.ceilings.blue,
+            ]),
+        ] + [
+            (false, "sidebar"), (true, "sidebar"), (false, "workspace"), (true, "workspace"),
+        ].map { isDark, name -> (String, [Double]) in
+            let wash = name == "sidebar"
+                ? GlassBackdropWash.sidebar(isDark: isDark)
+                : GlassBackdropWash.workspace(isDark: isDark)
+            return ("\(name) wash (isDark: \(isDark))", [wash.red, wash.green, wash.blue])
+        }
+
+        for (name, channels) in neutrals {
+            XCTAssertLessThanOrEqual(
+                chromaticity(channels),
+                0.05,
+                "\(name) is not achromatic: \(channels) — it will tint the glass on its own"
+            )
         }
     }
 
@@ -887,13 +930,20 @@ final class NativePreviewSettingsTests: XCTestCase {
     /// slate mix compressed a saturated desktop into grey. Michael's ask is a
     /// tint you can actually see.
     func testDesktopTintKeepsEnoughWallpaperHueToBeSeen() throws {
-        let tint = try XCTUnwrap(DesktopTintSampler.cooledAverage(rgba: [
+        let tint = try XCTUnwrap(DesktopTintSampler.wallpaperAverage(rgba: [
             255, 0, 0, 255,
             0, 0, 255, 255,
         ]))
-        XCTAssertEqual(tint.red, 0.3884, accuracy: 0.0001)
-        XCTAssertEqual(tint.green, 0.0804, accuracy: 0.0001)
-        XCTAssertEqual(tint.blue, 0.4034, accuracy: 0.0001)
+        XCTAssertEqual(tint.red, 0.3927, accuracy: 0.0001)
+        XCTAssertEqual(tint.green, 0.0700, accuracy: 0.0001)
+        XCTAssertEqual(tint.blue, 0.3927, accuracy: 0.0001)
+
+        // The slate mix is gone, and this is what it was doing: an equal-parts
+        // red/blue desktop used to come back with blue 0.015 ahead of red,
+        // because 10% of a 0.35/0.42/0.50 slate was averaged into every tint
+        // whatever the wallpaper was. A symmetric desktop now returns a
+        // symmetric tint.
+        XCTAssertEqual(tint.red, tint.blue, accuracy: 0.0001)
 
         // The property the numbers exist for. The pre-retune recipe returned
         // 0.3117/0.16/0.3387 for this same magenta desktop: a 0.179 spread,
@@ -901,21 +951,34 @@ final class NativePreviewSettingsTests: XCTestCase {
         let spread = max(tint.red, tint.green, tint.blue) - min(tint.red, tint.green, tint.blue)
         XCTAssertGreaterThan(spread, 0.30)
         XCTAssertGreaterThan(DesktopTintSampler.chromaRetention, 0.45)
-        XCTAssertLessThan(DesktopTintSampler.slateMix, 0.18)
 
-        XCTAssertNil(DesktopTintSampler.cooledAverage(rgba: [0, 0, 0, 0]))
+        XCTAssertNil(DesktopTintSampler.wallpaperAverage(rgba: [0, 0, 0, 0]))
     }
 
-    /// Retaining chroma must not invent it: a neutral desktop still has to come
-    /// back neutral, or every grey wallpaper picks up the slate stop as a cast.
+    /// Retaining chroma must not invent it: a neutral desktop has to come back
+    /// EXACTLY neutral. It used to come back 0.4868/0.4868/0.4868 — accidentally
+    /// balanced, because a grey happened to be near the slate's own luminance —
+    /// while a grey at any other brightness picked the slate's hue up as a cast.
+    /// With the mix gone the identity is structural, not lucky.
     func testDesktopTintLeavesANeutralWallpaperNeutral() throws {
-        let tint = try XCTUnwrap(DesktopTintSampler.cooledAverage(rgba: [
-            128, 128, 128, 255,
-            128, 128, 128, 255,
-        ]))
-        let spread = max(tint.red, tint.green, tint.blue) - min(tint.red, tint.green, tint.blue)
-        XCTAssertLessThan(spread, 0.02)
-        XCTAssertEqual(tint.red, 0.4868, accuracy: 0.0001)
+        for level: UInt8 in [40, 128, 220] {
+            let tint = try XCTUnwrap(DesktopTintSampler.wallpaperAverage(rgba: [
+                level, level, level, 255,
+                level, level, level, 255,
+            ]))
+            XCTAssertEqual(tint.red, tint.green, accuracy: 0.0000001)
+            XCTAssertEqual(tint.green, tint.blue, accuracy: 0.0000001)
+            XCTAssertEqual(tint.red, Double(level) / 255, accuracy: 0.0001)
+        }
+    }
+
+    /// The floors were 0.07/0.07/0.09, so a black desktop resolved to a *blue*
+    /// near-black — the clamp invented the exact cast the veil was blamed for.
+    func testClampingABlackWallpaperCannotInventAHue() throws {
+        let tint = try XCTUnwrap(DesktopTintSampler.wallpaperAverage(rgba: [0, 0, 0, 255]))
+        XCTAssertEqual(tint.red, tint.blue, accuracy: 0.0000001)
+        XCTAssertEqual(tint.green, tint.blue, accuracy: 0.0000001)
+        XCTAssertGreaterThan(tint.red, 0)
     }
 
     // MARK: - Frost
@@ -984,7 +1047,7 @@ final class NativePreviewSettingsTests: XCTestCase {
         XCTAssertEqual(green, 0.7152, accuracy: 0.0001)
         // A black wallpaper's tint is floored at 0.07-ish so it never degenerates;
         // its *luminance* must still read as black, or the bake would under-lift it.
-        let tint = try XCTUnwrap(DesktopTintSampler.cooledAverage(rgba: [0, 0, 0, 255]))
+        let tint = try XCTUnwrap(DesktopTintSampler.wallpaperAverage(rgba: [0, 0, 0, 255]))
         XCTAssertGreaterThan(tint.red, 0.0)
         XCTAssertNil(DesktopTintSampler.meanLuminance(rgba: [0, 0, 0, 0]))
     }

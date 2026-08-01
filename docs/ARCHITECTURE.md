@@ -22,9 +22,13 @@ Kaisola uses a native shell with explicit process and trust boundaries.
 
 - Prefer SwiftUI for composition and state-driven UI.
 - Use AppKit-backed views for terminal, text-system, window, and menu behavior.
-- A confined `WKWebView` is acceptable for the rich code-editor surface and
-  localhost browser cards. Swift retains file I/O, permissions, dirty state,
-  persistence, and command authority.
+- The rich code editor is a checked-in CodeMirror bundle served through a
+  two-resource private `WKURLSchemeHandler` in an ephemeral `WKWebView`. Its
+  content-security policy denies network, frames, workers, forms, and arbitrary
+  assets; the message bridge carries only an opaque token and validated text,
+  scroll, and undo requests. Swift retains file I/O, paths, line endings,
+  permissions, dirty state, persistence, undo, and command authority.
+- Localhost browser cards use a separate ephemeral, origin-confined web view.
 - Do not introduce a general-purpose web application shell.
 
 ## State policy

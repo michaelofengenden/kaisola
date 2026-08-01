@@ -909,7 +909,7 @@ final class KaisolaMacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDele
         let model = makeAppModel()
         if visualFixture {
             let workspace: URL
-            if ["preview-dirty-tab", "preview-tab-overflow"].contains(visualSurface),
+            if ["preview-code-editor", "preview-dirty-tab", "preview-tab-overflow"].contains(visualSurface),
                let visualFixtureStorageRoot {
                 workspace = visualFixtureStorageRoot.appendingPathComponent("project", isDirectory: true)
                 try? FileManager.default.createDirectory(
@@ -997,6 +997,34 @@ final class KaisolaMacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDele
                 }
                 if let firstDocument {
                     model.openFilePreview(firstDocument, pinned: true)
+                }
+            } else if visualSurface == "preview-code-editor" {
+                let sources = workspace.appendingPathComponent("Sources", isDirectory: true)
+                let document = sources.appendingPathComponent("ReleaseGate.swift", isDirectory: false)
+                let fixture = """
+                import Foundation
+
+                struct ReleaseGate {
+                    let surface: String
+
+                    func summary(isReady: Bool) -> String {
+                        let state = isReady ? "Ready" : "Needs review"
+                        return "\\(surface): \\(state)"
+                    }
+                }
+
+                let gate = ReleaseGate(surface: "Confined CodeMirror")
+                print(gate.summary(isReady: true))
+                """.replacingOccurrences(of: "\n", with: "\r\n")
+                try? FileManager.default.createDirectory(
+                    at: sources,
+                    withIntermediateDirectories: true,
+                    attributes: [.posixPermissions: 0o700]
+                )
+                if (try? fixture.write(to: document, atomically: true, encoding: .utf8)) != nil {
+                    // A file citation is the production route into editable
+                    // source and gives the fixture a deterministic active line.
+                    model.openFilePreview(document, line: 6)
                 }
             } else if visualSurface == "preview"
                         || visualSurface == "preview-edit"
@@ -1583,7 +1611,7 @@ final class KaisolaMacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDele
             // pay this fixture-only delay.
             let delay: UInt64
             switch visualSurface {
-            case "preview-html": delay = 4_000_000_000
+            case "preview-code-editor", "preview-html": delay = 4_000_000_000
             case "terminal-scroll-output": delay = 1_800_000_000
             default: delay = 1_800_000_000
             }
@@ -1718,6 +1746,64 @@ final class KaisolaMacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDele
                 )
                 requestVisualFixtureTermination()
                 return
+            }
+
+            if visualSurface == "preview-code-editor" {
+                guard let webView = firstWebView(in: view) else {
+                    print("KAISOLA_NATIVE_CODE_EDITOR_VISUAL=FAIL no-web-view")
+                    requestVisualFixtureTermination()
+                    return
+                }
+                do {
+                    let inserted = try await webView.evaluateJavaScript(
+                        "window.KaisolaEditor.fixtureInsert('    // Bridge edit verified\\n')"
+                    ) as? Bool
+                    try? await Task.sleep(nanoseconds: 220_000_000)
+                    let containsEdit = try await webView.evaluateJavaScript(
+                        "window.KaisolaEditor.fixtureContains('Bridge edit verified')"
+                    ) as? Bool
+                    let requestedUndo = try await webView.evaluateJavaScript(
+                        "window.KaisolaEditor.fixtureUndo()"
+                    ) as? Bool
+                    try? await Task.sleep(nanoseconds: 220_000_000)
+                    let undoRemovedEdit = try await webView.evaluateJavaScript(
+                        "!window.KaisolaEditor.fixtureContains('Bridge edit verified')"
+                    ) as? Bool
+                    let requestedRedo = try await webView.evaluateJavaScript(
+                        "window.KaisolaEditor.fixtureRedo()"
+                    ) as? Bool
+                    try? await Task.sleep(nanoseconds: 220_000_000)
+                    let redoRestoredEdit = try await webView.evaluateJavaScript(
+                        "window.KaisolaEditor.fixtureContains('Bridge edit verified')"
+                    ) as? Bool
+                    let ready = try await webView.evaluateJavaScript("""
+                    Boolean(
+                      window.KaisolaEditor
+                      && document.querySelector('.cm-editor')
+                      && document.querySelectorAll('.cm-line').length >= 10
+                      && document.querySelectorAll('.cm-line span').length >= 5
+                    )
+                    """) as? Bool
+                    guard inserted == true,
+                          containsEdit == true,
+                          requestedUndo == true,
+                          undoRemovedEdit == true,
+                          requestedRedo == true,
+                          redoRestoredEdit == true,
+                          ready == true else {
+                        print("KAISOLA_NATIVE_CODE_EDITOR_VISUAL=FAIL interaction-or-render")
+                        requestVisualFixtureTermination()
+                        return
+                    }
+                    print(
+                        "KAISOLA_NATIVE_CODE_EDITOR_VISUAL=PASS "
+                            + "syntax=true lines=14 edit=true undo=true redo=true"
+                    )
+                } catch {
+                    print("KAISOLA_NATIVE_CODE_EDITOR_VISUAL=FAIL \(error.localizedDescription)")
+                    requestVisualFixtureTermination()
+                    return
+                }
             }
 
             // ScreenCaptureKit captures Kaisola's WindowServer surface, but a

@@ -14,13 +14,26 @@ Bounded regressions, reliability work, and release-speed improvements live in
 Build the strongest remaining daily-use surface without recreating an Electron
 application inside the native app.
 
-Scope:
+The v1.1.8 editor slice adds a pinned, offline CodeMirror 6 bundle behind a
+private `kaisola-editor` scheme. The page receives an opaque document token and
+validated text transactions only; it has no workspace path, file URL, cookie
+store, navigation escape, credential, or permitted network path. Swift remains the
+authority for exact source, line endings, dirty state, save/revert, recovery,
+path confinement, permissions, and undo/redo. The same fixture edits a CRLF
+Swift file through the bridge, undoes it, redoes it, and verifies syntax in
+light and dark mode.
+
+Completed scope:
 
 - Add a confined CodeMirror 6 `WKWebView` editor surface.
 - Keep file reads/writes, path confinement, dirty state, save/revert, undo
   ownership, and permissions in Swift.
-- Add transient preview tabs, persistent edited tabs, outline navigation,
-  follow-the-agent, and safe rename/move/trash/reveal actions.
+- Add transient preview tabs, persistent edited tabs, and safe same-directory
+  rename, Trash/restore, and reveal actions.
+
+Remaining scope:
+
+- Add outline navigation, follow-the-agent, and safe cross-directory move.
 - Improve repository indexing and watcher invalidation for large workspaces.
 
 Acceptance:

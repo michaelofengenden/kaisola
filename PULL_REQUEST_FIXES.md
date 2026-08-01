@@ -41,6 +41,10 @@ Large product and architecture work remains ordered in
   tables natively, highlights supported languages, links project file-and-line
   citations, and makes every response, tool-output, and diff bound explicit and
   expandable.
+- Text and HTML source editing now use a checked-in CodeMirror 6 bundle over a
+  two-resource private scheme. Swift validates incremental edits and owns
+  undo/redo, exact CRLF/LF source, save/revert, recovery, paths, and permissions;
+  the ephemeral page has no file or network capability.
 - Status indicators expose shape and accessible names, and the user-facing copy
   pass removed several implementation terms (`50e00aa`, `949c4ef`).
 - Bounded PDF files now open in a native PDFKit surface with selection,

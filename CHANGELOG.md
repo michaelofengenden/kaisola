@@ -16,6 +16,7 @@
 - Pull request review now shows every changed file plus the credential-safe remote, repository, and base branch, and refuses to run if that destination changes.
 - Agent permission prompts now show the raw request, every declared path, and the exact standing-rule scope, with separate Deny, Allow Once, and Create Rule actions.
 - Chat and Mesh now render agent Markdown as native headings, tables, highlighted code with copy controls, and clickable project file citations; large responses, tool output, and diffs have explicit Show More and Collapse controls.
+- Text and HTML files now edit in a fast, syntax-aware CodeMirror surface while Swift keeps source bytes, line endings, undo, save/revert, recovery, permissions, and file access under native control.
 
 ## 1.1.7 — 2026-07-31
 

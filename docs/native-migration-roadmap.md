@@ -106,15 +106,15 @@ optional pending a scope decision.
 | Feature | Status | Pri | Notes |
 |---|---|---|---|
 | File tree + fuzzy search + index + watch | PARTIAL | P1 | rail tree + palette fuzzy index + live FSEvents watching (debounced auto-refresh, v0.1.99) |
-| Code editor (syntax, save, dirty, cursor restore) | PARTIAL | P1 | editor: ⌘S save, revert, dirty dot + native regex syntax highlighting with read/edit toggle (v0.1.99); rich editing still arrives via the WKWebView phase |
+| Code editor (syntax, save, dirty, cursor restore) | DONE | P1 | offline CodeMirror 6 island for text/HTML with syntax, search, completion, folds, exact LF/CRLF transactions and Swift-owned undo/save/revert/recovery; Markdown keeps its native rendered/source editor |
 | Document preview (Markdown/HTML/CSV/JSON) | DONE | P1 (md) / P2 | Markdown is editable in its native rendered TextKit view with a Source toggle; images, CSV/TSV tables, JSON tree, and confined JS-off HTML preview are included |
-| Preview tabs (Zed-style transient) | NEW | P2 | |
-| PDF viewer + LaTeX synctex | NEW | P2 | |
+| Preview tabs (Zed-style transient) | DONE | P2 | single-click previews remain replaceable; edits and double-click promote persistent tabs; overflow and recently closed state are bounded |
+| PDF viewer + LaTeX synctex | PARTIAL | P2 | native bounded PDFKit viewer is complete; LaTeX SyncTeX remains open |
 | Research/word diffs | NEW | P2 | |
 | Outline / cursor follow | NEW | P2 | |
 | Quote annotations | NEW | P2 | research |
 | Follow-the-agent (auto-open touched files) | NEW | P2 | |
-| Asset import/rename/trash/reveal | NEW | P2 | |
+| Asset import/rename/trash/reveal | PARTIAL | P2 | Markdown image import, safe same-directory rename, reversible Trash, and reveal are complete; cross-directory move remains open |
 
 ## 5. Settings & configuration
 

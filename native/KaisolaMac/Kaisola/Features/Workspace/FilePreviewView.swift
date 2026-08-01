@@ -67,6 +67,7 @@ struct FilePreviewView: View {
     }
 
     @Environment(\.colorScheme) private var colorScheme
+    @Environment(\.undoManager) private var undoManager
 
     @State private var content: FilePreviewContent = .unreadable
     @State private var draft = ""
@@ -76,7 +77,7 @@ struct FilePreviewView: View {
     @State private var pdfDocument: PDFDocument?
     @State private var showMarkdownSource = false
     /// Text (non-markdown) files default to a read-only, syntax-highlighted
-    /// view; this toggle drops into the plain `TextEditor` for editing.
+    /// view; this toggle enters the confined CodeMirror source editor.
     @State private var isEditingText = false
     /// Cached highlighted rendering of `draft`, recomputed only when the source,
     /// language, or appearance changes (never on every keystroke, and never on
@@ -833,18 +834,37 @@ struct FilePreviewView: View {
     }
 
     private var editor: some View {
-        LineTargetTextEditor(
-            text: $draft,
-            fontSize: editableMarkdownURL == nil ? 13 * documentZoom : 13,
-            targetLine: targetLine,
-            documentID: (loadedURL ?? url).path,
-            markdownURL: editableMarkdownURL,
-            workspaceRoot: workspaceRoot,
-            onError: { previewNotice = .error($0) },
-            magnification: editableMarkdownURL == nil ? nil : documentZoom,
-            onMagnificationChanged: editableMarkdownURL == nil ? nil : { documentZoom = $0 },
-            scrollMemory: textScrollMemory
-        )
+        Group {
+            if let editableMarkdownURL {
+                // Markdown retains the native whole-source editor because its
+                // image import and magnification bridge is intentionally tied
+                // to a project-confined NSView. Ordinary source files use the
+                // networkless CodeMirror island below.
+                LineTargetTextEditor(
+                    text: $draft,
+                    fontSize: 13,
+                    targetLine: targetLine,
+                    documentID: editableMarkdownURL.path,
+                    markdownURL: editableMarkdownURL,
+                    workspaceRoot: workspaceRoot,
+                    onError: { previewNotice = .error($0) },
+                    magnification: documentZoom,
+                    onMagnificationChanged: { documentZoom = $0 },
+                    scrollMemory: textScrollMemory
+                )
+            } else {
+                CodeEditorView(
+                    text: $draft,
+                    fileURL: loadedURL ?? url,
+                    targetLine: targetLine,
+                    fontSize: 13 * documentZoom,
+                    colorScheme: colorScheme,
+                    undoManager: undoManager,
+                    scrollMemory: textScrollMemory,
+                    onError: { previewNotice = .error($0) }
+                )
+            }
+        }
     }
 
     private var editableMarkdownURL: URL? {

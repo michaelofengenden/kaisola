@@ -71,6 +71,10 @@ const FILE_PREVIEW_TESTS = Object.freeze([
   'DataPreviewsTests', 'SyntaxHighlighterTests', 'WorkspaceFilesTests',
 ])
 
+const CODE_EDITOR_TESTS = Object.freeze([
+  'CodeEditorViewTests', 'WorkspaceFilesTests',
+])
+
 const NATIVE_FILE_TESTS = Object.freeze(new Map([
   ['native/KaisolaMac/Kaisola/Features/Onboarding/OnboardingView.swift', [
     'CommandRegistryTests', 'OnboardingStateTests', 'UsageCenterTests',
@@ -104,7 +108,10 @@ const NATIVE_FILE_TESTS = Object.freeze(new Map([
   ['native/KaisolaMac/Kaisola/Features/Workspace/FilePreviewEditors.swift', FILE_PREVIEW_TESTS],
   ['native/KaisolaMac/Kaisola/Features/Workspace/FilePreviewRecovery.swift', FILE_PREVIEW_TESTS],
   ['native/KaisolaMac/Kaisola/Features/Workspace/FilePreviewTabs.swift', FILE_PREVIEW_TESTS],
-  ['native/KaisolaMac/Kaisola/Features/Workspace/FilePreviewView.swift', FILE_PREVIEW_TESTS],
+  ['native/KaisolaMac/Kaisola/Features/Workspace/CodeEditorView.swift', CODE_EDITOR_TESTS],
+  ['native/KaisolaMac/Kaisola/Features/Workspace/FilePreviewView.swift', [
+    ...FILE_PREVIEW_TESTS, 'CodeEditorViewTests',
+  ]],
   ['native/KaisolaMac/Kaisola/Features/Workspace/MarkdownAssets.swift', FILE_PREVIEW_TESTS],
   ['native/KaisolaMac/Kaisola/Features/Workspace/MarkdownPreview.swift', FILE_PREVIEW_TESTS],
   ['native/KaisolaMac/Kaisola/Features/Workspace/FileTreeModel.swift', [
@@ -241,6 +248,18 @@ function planForChanges(changedFiles, inventory = discoverInventory()) {
   const runtimeFiles = normalizedFiles.filter((file) => !isKnownNonRuntimeFile(file))
 
   for (const file of runtimeFiles) {
+    if (file.startsWith('scripts/code-editor/')
+        || file.startsWith('native/KaisolaMac/Kaisola/Resources/CodeEditor/')) {
+      addExistingNodeTests(
+        plan,
+        ['tests/node/codeEditorBundle.test.cjs'],
+        inventory,
+        'confined code editor runtime changed',
+      )
+      addExistingNativeTests(plan, CODE_EDITOR_TESTS, inventory, 'confined code editor runtime changed')
+      continue
+    }
+
     if (file === 'scripts/native-test-select.cjs'
         || file === 'scripts/native-test-changed.sh'
         || file === 'scripts/native-build-timing.cjs'

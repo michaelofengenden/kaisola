@@ -10,20 +10,31 @@ import WebKit
 
 // MARK: - Parse caching
 
-/// A view-lifetime parse cache keyed by content identity.
+/// Cheap task identity supplied by the mounted file preview. The path and mtime
+/// distinguish disk snapshots without hashing a 1 MiB source string on every
+/// SwiftUI body evaluation; revision covers every committed load and explicit
+/// in-place HTML reload.
+struct PreviewParseIdentity: Hashable, Sendable {
+    let path: String
+    let modificationDate: Date?
+    let revision: Int
+}
+
+/// A view-lifetime actor cache keyed by content identity.
 ///
 /// SwiftUI re-evaluates `body` for reasons that have nothing to do with the
 /// document — a tab-strip hover, a window resize, a zoom step, a sibling's state
 /// change. Re-parsing a multi-megabyte CSV or JSON payload on each of those
 /// turns a linear parser into visible interaction jank, which is exactly what
-/// hovering the file tabs over a 1 MiB CSV used to cost.
+/// hovering the file tabs over a 1 MiB CSV used to cost. Actor isolation also
+/// keeps the first parse/tree/readiness pass off the main actor.
 ///
 /// Identity is the source text itself: SwiftUI hands the same String storage
 /// back on a re-render, so the equality check is a pointer comparison in the
 /// common case and a full compare only when the document really changed. One
 /// entry is enough — a preview shows one document at a time, and the view's
 /// `@State` is discarded when it is retargeted at another file.
-final class PreviewParseCache<Value> {
+actor PreviewParseCache<Value: Sendable> {
     private var source: String?
     private var cached: Value?
     /// Test-visible proof that repeated body evaluations do not re-parse.
@@ -31,7 +42,10 @@ final class PreviewParseCache<Value> {
 
     init() {}
 
-    func value(for source: String, parse: (String) -> Value) -> Value {
+    func value(
+        for source: String,
+        parse: @Sendable (String) -> Value
+    ) -> Value {
         if let cached, self.source == source { return cached }
         let parsed = parse(source)
         self.source = source
@@ -206,13 +220,34 @@ struct CsvPreviewModel: Equatable, Sendable {
 /// across a vertically lazy list. Delimiter is auto-detected.
 struct CsvPreview: View {
     let text: String
+    let identity: PreviewParseIdentity
 
     @State private var cache = PreviewParseCache<CsvPreviewModel>()
+    @State private var model: CsvPreviewModel?
+    @State private var preparedIdentity: PreviewParseIdentity?
 
     private static let cellFont = Font.system(size: 12, design: .monospaced)
 
     var body: some View {
-        let model = cache.value(for: text, parse: CsvPreviewModel.make)
+        Group {
+            if preparedIdentity == identity, let model {
+                table(model)
+            } else {
+                ProgressView("Preparing table…")
+                    .controlSize(.small)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+            }
+        }
+        .task(id: identity) {
+            let source = text
+            let parsed = await cache.value(for: source, parse: CsvPreviewModel.make)
+            guard !Task.isCancelled else { return }
+            model = parsed
+            preparedIdentity = identity
+        }
+    }
+
+    private func table(_ model: CsvPreviewModel) -> some View {
         VStack(alignment: .leading, spacing: 0) {
             if model.truncated { truncationNotice(rowCount: model.rows.count) }
             if model.rows.isEmpty {
@@ -292,8 +327,8 @@ enum JsonTree {
 
     /// One node in the rendered JSON tree. A reference type so SwiftUI can hold
     /// stable identities across expand/collapse.
-    final class Node: Identifiable {
-        enum Kind: Equatable { case object, array, string, number, bool, null, truncated }
+    final class Node: Identifiable, @unchecked Sendable {
+        enum Kind: Equatable, Sendable { case object, array, string, number, bool, null, truncated }
 
         /// The path to this value (`$.meta.items[3]`), not a fresh `UUID`.
         /// Disclosure state is keyed by node identity, so a rebuilt tree — a
@@ -433,7 +468,7 @@ enum JsonTree {
 /// What a JSON document renders as. Deserialization plus tree building is the
 /// expensive part of the preview, so it is produced once per content identity
 /// rather than on every SwiftUI body evaluation.
-enum JsonPreviewOutcome {
+enum JsonPreviewOutcome: Sendable {
     case tree(root: JsonTree.Node, truncated: Bool)
     case invalid(message: String)
 
@@ -456,11 +491,34 @@ enum JsonPreviewOutcome {
 /// above the raw text so the preview is never blank.
 struct JsonPreview: View {
     let text: String
+    let identity: PreviewParseIdentity
 
     @State private var cache = PreviewParseCache<JsonPreviewOutcome>()
+    @State private var outcome: JsonPreviewOutcome?
+    @State private var preparedIdentity: PreviewParseIdentity?
 
     var body: some View {
-        switch cache.value(for: text, parse: JsonPreviewOutcome.make) {
+        Group {
+            if preparedIdentity == identity, let outcome {
+                parsedView(outcome)
+            } else {
+                ProgressView("Preparing JSON…")
+                    .controlSize(.small)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+            }
+        }
+        .task(id: identity) {
+            let source = text
+            let parsed = await cache.value(for: source, parse: JsonPreviewOutcome.make)
+            guard !Task.isCancelled else { return }
+            outcome = parsed
+            preparedIdentity = identity
+        }
+    }
+
+    @ViewBuilder
+    private func parsedView(_ outcome: JsonPreviewOutcome) -> some View {
+        switch outcome {
         case let .tree(root, truncated):
             VStack(alignment: .leading, spacing: 0) {
                 if truncated { truncationNotice }
@@ -662,9 +720,13 @@ struct HtmlFilePreview: View {
     let fileURL: URL
     let readAccessRoot: URL?
     let source: String
+    let identity: PreviewParseIdentity
     let zoom: CGFloat
     let contentRevision: Int
 
+    @State private var readinessCache = PreviewParseCache<Bool>()
+    @State private var requiresJavaScriptPrompt = false
+    @State private var preparedIdentity: PreviewParseIdentity?
     @State private var reloadToken = 0
     @State private var allowsJavaScript = false
     @State private var loadState: HTMLPreviewLoadState = .loading
@@ -681,7 +743,7 @@ struct HtmlFilePreview: View {
             )
             .id("\(fileURL.path)|js:\(allowsJavaScript)")
 
-            if !HTMLPreviewReadiness.requiresJavaScriptPrompt(source) {
+            if !requiresJavaScriptPrompt {
                 switch loadState {
                 case .loading:
                     ProgressView("Rendering HTML…")
@@ -707,8 +769,7 @@ struct HtmlFilePreview: View {
                 }
             }
 
-            if !allowsJavaScript,
-               HTMLPreviewReadiness.requiresJavaScriptPrompt(source) {
+            if !allowsJavaScript, requiresJavaScriptPrompt {
                 VStack(spacing: 10) {
                     Image(systemName: "curlybraces.square")
                         .font(.system(size: 23, weight: .medium))
@@ -754,6 +815,25 @@ struct HtmlFilePreview: View {
         // Approval is deliberately one-file-at-a-time. Navigating from a
         // trusted document must never silently grant scripts to the next file.
         .onChange(of: fileURL) { _, _ in allowsJavaScript = false }
+        .overlay {
+            if preparedIdentity != identity {
+                ZStack {
+                    Color(nsColor: .textBackgroundColor)
+                    ProgressView("Preparing HTML…")
+                        .controlSize(.small)
+                }
+            }
+        }
+        .task(id: identity) {
+            let html = source
+            let readiness = await readinessCache.value(
+                for: html,
+                parse: HTMLPreviewReadiness.requiresJavaScriptPrompt
+            )
+            guard !Task.isCancelled else { return }
+            requiresJavaScriptPrompt = readiness
+            preparedIdentity = identity
+        }
     }
 }
 

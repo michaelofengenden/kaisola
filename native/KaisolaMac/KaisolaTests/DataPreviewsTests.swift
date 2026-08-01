@@ -217,41 +217,43 @@ final class DataPreviewsTests: XCTestCase {
 
     // MARK: - Content-identity parse caches
 
-    func testParseCacheReusesTheResultForIdenticalContent() {
+    func testParseCacheReusesTheResultForIdenticalContent() async {
         let cache = PreviewParseCache<Int>()
         let source = String(repeating: "a,b,c\n", count: 500)
-        var parses = 0
 
         // Ten body evaluations — a tab-strip hover, a resize, a zoom step —
         // must cost exactly one parse.
         for _ in 0..<10 {
-            _ = cache.value(for: source) { text in
-                parses += 1
-                return text.count
-            }
+            _ = await cache.value(for: source) { $0.count }
         }
-        XCTAssertEqual(parses, 1)
-        XCTAssertEqual(cache.parseCount, 1)
+        let parseCount = await cache.parseCount
+        XCTAssertEqual(parseCount, 1)
     }
 
-    func testParseCacheReparsesOnlyWhenContentChanges() {
+    func testParseCacheReparsesOnlyWhenContentChanges() async {
         let cache = PreviewParseCache<String>()
-        let uppercase = { (text: String) in text.uppercased() }
+        let uppercase: @Sendable (String) -> String = { $0.uppercased() }
 
-        XCTAssertEqual(cache.value(for: "one", parse: uppercase), "ONE")
-        XCTAssertEqual(cache.value(for: "one", parse: uppercase), "ONE")
-        XCTAssertEqual(cache.parseCount, 1)
-        XCTAssertEqual(cache.value(for: "two", parse: uppercase), "TWO")
-        XCTAssertEqual(cache.parseCount, 2)
+        let first = await cache.value(for: "one", parse: uppercase)
+        let repeated = await cache.value(for: "one", parse: uppercase)
+        let firstCount = await cache.parseCount
+        let changed = await cache.value(for: "two", parse: uppercase)
+        let changedCount = await cache.parseCount
+        XCTAssertEqual(first, "ONE")
+        XCTAssertEqual(repeated, "ONE")
+        XCTAssertEqual(firstCount, 1)
+        XCTAssertEqual(changed, "TWO")
+        XCTAssertEqual(changedCount, 2)
     }
 
-    func testCsvPreviewModelIsBuiltOncePerContentIdentity() {
+    func testCsvPreviewModelIsBuiltOncePerContentIdentity() async {
         let text = (0..<300).map { "row\($0),value,\($0)" }.joined(separator: "\n")
         let cache = PreviewParseCache<CsvPreviewModel>()
 
-        let first = cache.value(for: text, parse: CsvPreviewModel.make)
-        let second = cache.value(for: text, parse: CsvPreviewModel.make)
-        XCTAssertEqual(cache.parseCount, 1)
+        let first = await cache.value(for: text, parse: CsvPreviewModel.make)
+        let second = await cache.value(for: text, parse: CsvPreviewModel.make)
+        let parseCount = await cache.parseCount
+        XCTAssertEqual(parseCount, 1)
         XCTAssertEqual(first, second)
         XCTAssertEqual(first.rows.count, 300)
         XCTAssertFalse(first.truncated)
@@ -272,13 +274,14 @@ final class DataPreviewsTests: XCTestCase {
         XCTAssertTrue(CsvPreviewModel.make(text).truncated)
     }
 
-    func testJsonPreviewOutcomeIsBuiltOncePerContentIdentity() {
+    func testJsonPreviewOutcomeIsBuiltOncePerContentIdentity() async {
         let text = #"{"a":[1,2,3],"b":{"c":true}}"#
         let cache = PreviewParseCache<JsonPreviewOutcome>()
 
-        _ = cache.value(for: text, parse: JsonPreviewOutcome.make)
-        let outcome = cache.value(for: text, parse: JsonPreviewOutcome.make)
-        XCTAssertEqual(cache.parseCount, 1)
+        _ = await cache.value(for: text, parse: JsonPreviewOutcome.make)
+        let outcome = await cache.value(for: text, parse: JsonPreviewOutcome.make)
+        let parseCount = await cache.parseCount
+        XCTAssertEqual(parseCount, 1)
         guard case let .tree(root, truncated) = outcome else {
             return XCTFail("expected a parsed tree")
         }
@@ -290,5 +293,73 @@ final class DataPreviewsTests: XCTestCase {
         guard case .invalid = JsonPreviewOutcome.make("{oops") else {
             return XCTFail("expected an invalid outcome")
         }
+    }
+
+    func testPreviewParseIdentityTracksDiskSnapshotAndExplicitReload() {
+        let first = PreviewParseIdentity(
+            path: "/project/report.json",
+            modificationDate: Date(timeIntervalSince1970: 10),
+            revision: 0
+        )
+        XCTAssertEqual(first, first)
+        XCTAssertNotEqual(
+            first,
+            PreviewParseIdentity(
+                path: first.path,
+                modificationDate: Date(timeIntervalSince1970: 11),
+                revision: first.revision
+            )
+        )
+        XCTAssertNotEqual(
+            first,
+            PreviewParseIdentity(
+                path: first.path,
+                modificationDate: first.modificationDate,
+                revision: 1
+            )
+        )
+    }
+
+    func testNearLimitStructuredPreparationIsBoundedAndCached() async {
+        let csvRow = "00000000,alpha,beta,gamma\n"
+        let csv = String(
+            repeating: csvRow,
+            count: 900_000 / csvRow.utf8.count
+        )
+        XCTAssertGreaterThan(csv.utf8.count, 850_000)
+        XCTAssertLessThan(csv.utf8.count, FilePreviewContent.maxTextBytes)
+
+        let csvCache = PreviewParseCache<CsvPreviewModel>()
+        let csvStart = ContinuousClock.now
+        let csvModel = await csvCache.value(for: csv, parse: CsvPreviewModel.make)
+        let csvElapsed = csvStart.duration(to: .now)
+        _ = await csvCache.value(for: csv, parse: CsvPreviewModel.make)
+        let csvParseCount = await csvCache.parseCount
+        XCTAssertTrue(csvModel.truncated)
+        XCTAssertEqual(csvParseCount, 1)
+        XCTAssertLessThan(csvElapsed, .seconds(3.5))
+
+        let jsonElement = #""0123456789abcdef","#
+        let jsonBody = String(
+            repeating: jsonElement,
+            count: 900_000 / jsonElement.utf8.count
+        )
+        let json = "[" + String(jsonBody.dropLast()) + "]"
+        XCTAssertGreaterThan(json.utf8.count, 850_000)
+        XCTAssertLessThan(json.utf8.count, FilePreviewContent.maxTextBytes)
+
+        let jsonCache = PreviewParseCache<JsonPreviewOutcome>()
+        let jsonStart = ContinuousClock.now
+        let outcome = await jsonCache.value(for: json, parse: JsonPreviewOutcome.make)
+        let jsonElapsed = jsonStart.duration(to: .now)
+        _ = await jsonCache.value(for: json, parse: JsonPreviewOutcome.make)
+        let jsonParseCount = await jsonCache.parseCount
+        guard case let .tree(root, truncated) = outcome else {
+            return XCTFail("expected a parsed near-limit JSON tree")
+        }
+        XCTAssertFalse(root.children.isEmpty)
+        XCTAssertTrue(truncated)
+        XCTAssertEqual(jsonParseCount, 1)
+        XCTAssertLessThan(jsonElapsed, .seconds(3.5))
     }
 }

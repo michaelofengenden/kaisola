@@ -240,16 +240,17 @@ The audit pass adds live-file reconciliation, dirty conflict banners, encoding
 detection, binary sniffing, safe dead-end actions, notebook JSON rendering, and
 off-main cached Markdown images. A bounded native PDFKit preview now covers PDF
 selection, scrolling, magnification, and accessibility while parsing off the
-main actor, and bounded Markdown tables visibly disclose omitted rows. Finish
-the remaining large-document architecture. Rendered Markdown links now fail
-closed to explicit http(s) destinations or symlink-confined project files, and
+main actor, and bounded Markdown tables visibly disclose omitted rows. Rendered
+Markdown links now fail closed to explicit http(s) destinations or
+symlink-confined project files, and
 navigation flushes the latest Markdown draft before switching documents.
 Recovery, conflict, and failure feedback now retain typed severity in a
 dismissible accessible notice row instead of sharing a red header label. The
 former 6,600-line preview monolith is now partitioned into content policy,
-recovery, tabs, editors, Markdown rendering, and asset-loading units.
+recovery, tabs, editors, Markdown rendering, and asset-loading units. CSV, JSON,
+and HTML readiness now prepare once per path/mtime/revision on a dedicated actor.
 
-Scope:
+Completed scope:
 
 - Use TextKit 2 for read-only text and Markdown-source views, preserving
   viewport position and providing native Find without entering edit mode.

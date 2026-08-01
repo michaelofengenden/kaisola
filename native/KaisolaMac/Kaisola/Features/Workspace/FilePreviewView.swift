@@ -702,6 +702,14 @@ struct FilePreviewView: View {
         return false
     }
 
+    private var previewParseIdentity: PreviewParseIdentity {
+        PreviewParseIdentity(
+            path: (loadedURL ?? url).standardizedFileURL.path,
+            modificationDate: loadedModificationDate,
+            revision: previewRevision
+        )
+    }
+
     @ViewBuilder
     private func body(for content: FilePreviewContent) -> some View {
         switch content {
@@ -753,17 +761,18 @@ struct FilePreviewView: View {
                 ContentUnavailableView("Could not load image", systemImage: "photo")
             }
         case let .csv(text):
-            CsvPreview(text: text)
+            CsvPreview(text: text, identity: previewParseIdentity)
         case let .json(text):
-            JsonPreview(text: text)
-        case let .html(source):
+            JsonPreview(text: text, identity: previewParseIdentity)
+        case .html:
             if isEditingText {
                 editor
             } else {
                 HtmlFilePreview(
                     fileURL: loadedURL ?? url,
                     readAccessRoot: workspaceRoot,
-                    source: source,
+                    source: draft,
+                    identity: previewParseIdentity,
                     zoom: documentZoom,
                     contentRevision: previewRevision
                 )
@@ -1000,6 +1009,7 @@ struct FilePreviewView: View {
             } else {
                 previewNotice = nil
             }
+            previewRevision &+= 1
             isLoading = false
             refreshHighlight()
             navigationCommitted(target)

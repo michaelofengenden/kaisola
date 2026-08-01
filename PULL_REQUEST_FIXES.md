@@ -42,6 +42,9 @@ Large product and architecture work remains ordered in
 - Preview ownership is split into bounded content-policy, recovery, tab,
   editor, Markdown-rendering, and asset-loading units; the changed-file runner
   maps every extracted source back to the complete preview contract lane.
+- CSV, JSON, and HTML readiness now prepare through a view-lifetime actor cache
+  keyed by path, modification date, and explicit reload revision; a near-limit
+  structured-data contract pins bounded first preparation and single parsing.
 
 ## Open audit fixes
 

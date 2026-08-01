@@ -42,6 +42,42 @@ struct RootShellView: View {
     /// have to be separate views on separate sides of an `NSSplitView` clip but
     /// are one affordance to the user.
     @State private var sidebarDividerHovered = false
+    /// Bumped on every hover transition reported by EITHER half's tracker.
+    ///
+    /// The two halves are separate `NSTrackingArea`s on separate `NSView`s, so
+    /// as the pointer crosses the split boundary there is no ordering guarantee
+    /// between "the old side's exit" and "the new side's enter" — they are
+    /// independent event streams, not one gesture. Measured, the sidebar side's
+    /// clipped `visibleRect` reaches only ~0.5pt past the divider's centre
+    /// before `NSSplitView` clips it away, so the margin an exit can race an
+    /// enter within is thin rather than absent. Debouncing the exit (below)
+    /// removes the dependency on that margin instead of trusting it.
+    @State private var sidebarDividerHoverGeneration = 0
+
+    /// Both halves write through this instead of the raw `@State` so a leaving
+    /// tracker's "false" cannot land after the other half's tracker has already
+    /// reported "true" for the same crossing — see
+    /// `sidebarDividerHoverGeneration`. A "true" from either side is immediate;
+    /// a "false" is applied only if 50ms pass with no intervening "true" from
+    /// either tracker, which comfortably covers ordinary pointer speeds while
+    /// staying well under anything a user would perceive as a stuck highlight.
+    private var sidebarDividerHoveredBinding: Binding<Bool> {
+        Binding(
+            get: { sidebarDividerHovered },
+            set: { inside in
+                sidebarDividerHoverGeneration &+= 1
+                guard inside else {
+                    let generation = sidebarDividerHoverGeneration
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
+                        guard generation == sidebarDividerHoverGeneration else { return }
+                        sidebarDividerHovered = false
+                    }
+                    return
+                }
+                sidebarDividerHovered = true
+            }
+        )
+    }
 
     /// Close immediately only when every column has neither working-tree
     /// changes nor unique commits; all uncertainty blocks deletion.
@@ -358,6 +394,27 @@ struct RootShellView: View {
                 .listStyle(.plain)
                 .scrollContentBackground(.hidden)
                 .accessibilityLabel("Projects, chats, and terminal sessions")
+                // NavigationSplitView exposes only the one-pixel AppKit divider.
+                // Add a quiet in-sidebar acquisition target that drives the same
+                // NSSplitView in window coordinates, matching every other Kaisola
+                // panel handle without replacing native sidebar behavior.
+                //
+                // Anchored to the List rather than the column as a whole: the
+                // corridor's tracker fills whatever height it is given, and
+                // attached any higher it ran the full column height, straight
+                // through the footer row below. Centred 22pt on the trailing
+                // edge, that reached ~5.5pt into the footer's own trailing
+                // controls (settings/overflow) before a click or hover ever got
+                // to them. The List already ends exactly where the footer
+                // begins, so anchoring here excludes the footer's row height
+                // for free — no footer-height constant to duplicate or keep in
+                // sync. (The pinned header's "+" menu, at the List's own top
+                // edge, still overlaps the corridor by ~1.5pt; fixing that
+                // needs a change inside `QuietProjectRail`, out of scope here.)
+                .overlay(alignment: .trailing) {
+                    NavigationSidebarResizeAffordance(hovered: sidebarDividerHoveredBinding)
+                        .frame(width: NativeWorkspaceChrome.projectSidebarDividerWidth)
+                }
                 footer
             }
             // Safari's inset sidebar card: the tinted backdrop runs edge to
@@ -393,14 +450,6 @@ struct RootShellView: View {
                 ideal: NativeWorkspaceChrome.projectSidebarIdealWidth,
                 max: NativeWorkspaceChrome.projectSidebarMaximumWidth
             )
-            // NavigationSplitView exposes only the one-pixel AppKit divider.
-            // Add a quiet in-sidebar acquisition target that drives the same
-            // NSSplitView in window coordinates, matching every other Kaisola
-            // panel handle without replacing native sidebar behavior.
-            .overlay(alignment: .trailing) {
-                NavigationSidebarResizeAffordance(hovered: $sidebarDividerHovered)
-                    .frame(width: NativeWorkspaceChrome.projectSidebarDividerWidth)
-            }
         } detail: {
             detailArea
         }
@@ -426,8 +475,22 @@ struct RootShellView: View {
         // The other half of the sidebar divider's corridor. It has to live in
         // this column: a tracking area is clipped to its own split-view
         // subview, so the sidebar's tracker stops dead at the boundary.
+        //
+        // `detailArea` is also the top-bar layout's content column (see
+        // `topBarLayout`), which has no `NSSplitView` at all — there is no
+        // sidebar divider there to grab. Gated on `.leftTree` so the strip
+        // only exists where a real divider does; without this a `.topBar`
+        // window still showed a resize cursor over a phantom corridor and
+        // could eat the click meant for whatever sat under it, because
+        // `TrackingView.mouseDown` only discovered there was nothing to drive
+        // *after* accepting the event. `TrackingView` is now defensive on top
+        // of this gate too (its `hitTest` and `cursorUpdate` both bail when
+        // `enclosingVerticalDivider()` finds nothing), so a future layout that
+        // forgets this `if` still cannot reintroduce the phantom.
         .overlay(alignment: .leading) {
-            DetailEdgeResizeAffordance(hovered: $sidebarDividerHovered)
+            if settings.navigationLayout == .leftTree {
+                DetailEdgeResizeAffordance(hovered: sidebarDividerHoveredBinding)
+            }
         }
     }
 
@@ -1853,11 +1916,19 @@ private struct NavigationSidebarResizeAffordance: View {
 /// clip, so "10pt of reach on each side of the line" needs a view on each side.
 /// It reports its hover into the same state, so the rule still lights up when
 /// the pointer approaches from the content side.
+///
+/// `.accessibilityHidden(true)` below prunes the SwiftUI accessibility tree,
+/// but `TrackingView` also vends its own AX child directly through
+/// `NSAccessibilityElement`/`accessibilityChildren()` — an AppKit-owned node
+/// outside SwiftUI's tree, not covered by that modifier. Left unguarded, this
+/// second instance of the handle exposed a second "Resize project sidebar"
+/// slider sharing the sidebar's fixed identifier; `exposesAccessibility:
+/// false` is what actually silences it.
 private struct DetailEdgeResizeAffordance: View {
     @Binding var hovered: Bool
 
     var body: some View {
-        NavigationSidebarResizeHandle(hoverChanged: { hovered = $0 })
+        NavigationSidebarResizeHandle(hoverChanged: { hovered = $0 }, exposesAccessibility: false)
             .frame(width: NativeWorkspaceChrome.dividerCorridorReach)
             .accessibilityHidden(true)
     }
@@ -2073,15 +2144,27 @@ struct InitialSidebarWidthApplier: NSViewRepresentable {
 
 struct NavigationSidebarResizeHandle: NSViewRepresentable {
     var hoverChanged: (Bool) -> Void = { _ in }
+    /// Whether this instance vends the shared AX slider.
+    ///
+    /// The handle is planted twice — once in the sidebar column, once in the
+    /// detail column, because a tracking area cannot cross the `NSSplitView`'s
+    /// clip (see `DetailEdgeResizeAffordance`) — but VoiceOver should find
+    /// exactly one "Resize project sidebar" slider, not two elements sharing
+    /// one fixed identifier. Only the sidebar-side instance exposes it; the
+    /// detail-side one still tracks hover/cursor/drag identically, it just
+    /// stays silent to accessibility.
+    var exposesAccessibility = true
 
     func makeNSView(context: Context) -> TrackingView {
         let view = TrackingView()
         view.hoverChanged = hoverChanged
+        view.exposesAccessibility = exposesAccessibility
         return view
     }
 
     func updateNSView(_ nsView: TrackingView, context: Context) {
         nsView.hoverChanged = hoverChanged
+        nsView.exposesAccessibility = exposesAccessibility
         // Deliberately NOT `invalidateCursorRects` here. `updateNSView` runs on
         // every SwiftUI pass — including every frame of the hover animation this
         // view's own callback drives — and each invalidation makes AppKit drop
@@ -2095,6 +2178,7 @@ struct NavigationSidebarResizeHandle: NSViewRepresentable {
 
     final class TrackingView: NSView {
         var hoverChanged: (Bool) -> Void = { _ in }
+        var exposesAccessibility = true
         private var lastWindowX: CGFloat?
         private weak var activeSplitView: NSSplitView?
         private var activeDividerIndex: Int?
@@ -2122,8 +2206,27 @@ struct NavigationSidebarResizeHandle: NSViewRepresentable {
             trackingArea = area
         }
 
+        /// Defensive independently of whichever layout SwiftUI plants this view
+        /// in: `enclosingVerticalDivider()` is the same guard `mouseDown` and
+        /// the accessibility value/actions already trust, so a handle with
+        /// nothing to drive shows no resize cursor either, rather than only
+        /// discovering that after the pointer has already landed on it.
         override func cursorUpdate(with event: NSEvent) {
+            guard enclosingVerticalDivider() != nil else {
+                super.cursorUpdate(with: event)
+                return
+            }
             NSCursor.resizeLeftRight.set()
+        }
+
+        /// Same defense on the hit-testing side: a handle with no divider to
+        /// drive takes no hits at all, so it can never sit in front of a click
+        /// meant for whatever is actually under it. `mouseDown` already bails
+        /// via the same guard, but only after accepting the event — this stops
+        /// it from being routed here in the first place.
+        override func hitTest(_ point: NSPoint) -> NSView? {
+            guard enclosingVerticalDivider() != nil else { return nil }
+            return super.hitTest(point)
         }
 
         override func mouseEntered(with event: NSEvent) { hoverChanged(true) }
@@ -2135,11 +2238,13 @@ struct NavigationSidebarResizeHandle: NSViewRepresentable {
 
         override func isAccessibilityElement() -> Bool { false }
         override func accessibilityChildren() -> [Any]? {
+            guard exposesAccessibility else { return [] }
             updateAccessibilityFrame()
             return [dividerAccessibilityElement]
         }
 
         fileprivate func updateAccessibilityFrame() {
+            guard exposesAccessibility else { return }
             dividerAccessibilityElement.setAccessibilityFrameInParentSpace(bounds)
         }
 

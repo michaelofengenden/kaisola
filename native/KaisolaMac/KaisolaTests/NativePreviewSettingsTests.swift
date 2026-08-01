@@ -1585,12 +1585,19 @@ final class NativePreviewSettingsTests: XCTestCase {
         // NSSplitView subview it lives in. Measured on the running app, a
         // 40pt-wide tracker centred on the divider had a visibleRect that
         // stopped 0.5pt past the divider's centre. So the detail side needs its
-        // own strip, and it has to be at least the shared floor wide.
-        XCTAssertGreaterThanOrEqual(
-            NativeWorkspaceChrome.dividerCorridorReach,
-            10,
-            "the detail-side strip no longer reaches far enough to grab"
-        )
+        // own strip, and `dividerCorridorReach` — already pinned to the floor
+        // above — is exactly what backs it (`DetailEdgeResizeAffordance`'s
+        // frame width).
+        //
+        // What none of the checks above pin is the PANE corridor's own reach
+        // as a literal number, the way the sidebar's is pinned in
+        // `testSidebarDividerHitZoneSpansTheWholeVisibleGap`. The relative
+        // checks already leave it fully determined (>= the floor, and its
+        // `hitExtent` == the sidebar's), but only by hopping to another test's
+        // constants — stating the number here means a future change to
+        // `layoutExtent` or `hitExtent` that keeps both relative checks green
+        // still cannot silently move it.
+        XCTAssertEqual(SessionPaneDividerSizing.reach, 10.5)
     }
 
     func testClickingFocusedSurfaceStillSwitchesItsProject() {

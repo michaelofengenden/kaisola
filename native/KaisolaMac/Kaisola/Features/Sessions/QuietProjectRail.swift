@@ -193,14 +193,16 @@ private enum QuietRailMetrics {
     static let dot: CGFloat = 6
     /// A session sits a clear step in from its project row's leading edge.
     ///
-    /// The v1.1.5 width-budget work cut this to 18pt — one mark-width past the
-    /// project row's own 8pt inset, a 10pt step the eye read as "slightly
-    /// ragged" rather than "nested". v1.1.6 bought a 22pt step; v1.1.7 pushes
-    /// it to 32pt (two identity slots) *while* the rail narrows to 228, which
-    /// is the trade worth stating: at 228 a session title still gets 117.5pt —
-    /// 17 characters of a real title — so the nesting is paid for out of the
-    /// row's slack, not out of legibility. `QuietRowBudget` holds the
-    /// arithmetic and a test holds the character count.
+    /// The v1.1.5 width-budget work cut the STEP (this minus the project row's
+    /// own 8pt inset) to 18pt — one mark-width, a 10pt step the eye read as
+    /// "slightly ragged" rather than "nested". v1.1.6 bought a 22pt step;
+    /// v1.1.7 pushes the step to 32pt (two identity slots), which lands the
+    /// indent itself — the constant below — at 40 (8pt inset + 32pt step)
+    /// *while* the rail narrows to 228, which is the trade worth stating: at
+    /// 228 a session title still gets 117.5pt — 17 characters of a real title
+    /// — so the nesting is paid for out of the row's slack, not out of
+    /// legibility. `QuietRowBudget` holds the arithmetic and a test holds the
+    /// character count.
     static let sessionIndent: CGFloat = 40
     /// One cadence for every row in the rail: sessions, compact projects and
     /// the pinned project header all measure 32pt.
@@ -1118,9 +1120,11 @@ private struct QuietSurfaceRowView: View {
     let timeLabel: String
     let isSelected: Bool
     let tooltip: String
-    /// Reports this row's hover into its project group, which is what keeps the
-    /// group's hover-only "New session" row alive while the pointer travels
-    /// down to it.
+    /// Reports this row's hover into its project group's shared `hovering`
+    /// flag (see `setHover`), which is what keeps the header's hover-only
+    /// chevron and "+" menu (`pinnedHeader`/`compactRow`) visible while the
+    /// pointer is anywhere among the group's rows, not just resting on the
+    /// header itself.
     let groupHover: (Bool) -> Void
     let select: () -> Void
     let reveal: () -> Void

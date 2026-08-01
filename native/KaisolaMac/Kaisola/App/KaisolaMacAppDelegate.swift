@@ -1761,9 +1761,36 @@ final class KaisolaMacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDele
                     requestVisualFixtureTermination()
                     return
                 }
+                // A cold WebContent process can finish after the fixture's
+                // initial settling delay. Probe the editor's actual DOM state
+                // instead of racing its JavaScript export on slower runners.
+                var editorReady = false
+                for attempt in 0..<50 {
+                    if let ready = try? await webView.evaluateJavaScript("""
+                    Boolean(
+                      window.KaisolaEditor
+                      && document.querySelector('.cm-editor')
+                    )
+                    """) as? Bool,
+                       ready == true {
+                        editorReady = true
+                        break
+                    }
+                    if attempt < 49 {
+                        try? await Task.sleep(nanoseconds: 100_000_000)
+                    }
+                }
+                guard editorReady else {
+                    print("KAISOLA_NATIVE_CODE_EDITOR_VISUAL=FAIL editor-not-ready")
+                    requestVisualFixtureTermination()
+                    return
+                }
                 do {
-                    let inserted = try await webView.evaluateJavaScript(
-                        "window.KaisolaEditor.fixtureInsert('    // Bridge edit verified\\n')"
+                    let inserted = try await webView.callAsyncJavaScript(
+                        "return window.KaisolaEditor.fixtureInsert(text)",
+                        arguments: ["text": "    // Bridge edit verified\n"],
+                        in: nil,
+                        contentWorld: .page
                     ) as? Bool
                     try? await Task.sleep(nanoseconds: 220_000_000)
                     let containsEdit = try await webView.evaluateJavaScript(
@@ -1807,7 +1834,13 @@ final class KaisolaMacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDele
                             + "syntax=true lines=14 edit=true undo=true redo=true"
                     )
                 } catch {
-                    print("KAISOLA_NATIVE_CODE_EDITOR_VISUAL=FAIL \(error.localizedDescription)")
+                    let exception = (error as NSError).userInfo[
+                        "WKJavaScriptExceptionMessage"
+                    ] as? String
+                    print(
+                        "KAISOLA_NATIVE_CODE_EDITOR_VISUAL=FAIL "
+                            + (exception ?? error.localizedDescription)
+                    )
                     requestVisualFixtureTermination()
                     return
                 }

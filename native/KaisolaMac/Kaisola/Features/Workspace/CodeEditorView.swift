@@ -207,12 +207,13 @@ private final class CodeEditorAssetSchemeHandler: NSObject, WKURLSchemeHandler {
     }
 
     func webView(_ webView: WKWebView, start urlSchemeTask: WKURLSchemeTask) {
+        // Xcode's resources phase flattens this PBX group into the app bundle
+        // root; the private URL path remains independently gated.
         guard let requestURL = urlSchemeTask.request.url,
               let resource = CodeEditorAssetPolicy.resource(for: requestURL),
               let resourceURL = bundle.url(
                 forResource: resource.name,
-                withExtension: resource.extension,
-                subdirectory: "CodeEditor"
+                withExtension: resource.extension
               ),
               let data = try? Data(contentsOf: resourceURL, options: [.mappedIfSafe]) else {
             urlSchemeTask.didFailWithError(NSError(

@@ -1,60 +1,65 @@
 # Native Kaisola: bugs, reliability, and iteration fixes
 
 The 2026-07-30 native audit's P0 input-path and principal P1 data-loss fixes are
-implemented in the current local iteration. The following bounded issues remain
-open; they are not silently treated as completed merely because the broader
-architecture is tracked in the feature plan.
+implemented. This list was reconciled against v1.1.8 on 2026-08-01 so work that
+has shipped is no longer presented as open merely because the broader
+architecture remains in the feature plan.
 
 Large product and architecture work remains ordered in
 [`PULL_REQUEST_FEATURES.md`](PULL_REQUEST_FEATURES.md).
 
+## Landed since the audit
+
+- Persistence failures are visible and recoverable: corrupt or newer workspace
+  archives are preserved, retryable, and never silently overwritten; session
+  store write failures retain the cached payload (`2f9a9b9`, `3b10449`).
+- AppModel now prunes completed shutdown, split, and closed-surface bookkeeping
+  instead of growing it for the life of the app (`0dda009`, `3b10449`).
+- Large read-only text uses TextKit 2 with native Find and retained viewport;
+  CSV/JSON parsing is cached by content identity (`1ff191d`, `cf697a5`,
+  `e33150b`, `770acb9`).
+- Observer terminals subscribe tail-first, the legacy grid is gone, focus tracks
+  AppKit's first responder, and transcript font, Clear, Jump to Bottom, and
+  consented OSC 52 copy are implemented (`dd8097e`, `3365d32`, `bf733ad`,
+  `fa44da2`, `facc171`, `d5d12d1`).
+- The Git panel refreshes from filesystem events and PR creation is split into
+  an inspectable review followed by explicit execution (`81a59cb`).
+- Status indicators expose shape and accessible names, and the user-facing copy
+  pass removed several implementation terms (`50e00aa`, `949c4ef`).
+- Bounded PDF files now open in a native PDFKit surface with selection,
+  scrolling, magnification, and accessibility; parsing stays off the main actor.
+
 ## Open audit fixes
-
-### Persistence and restoration visibility
-
-- Reproduce a corrupt/unsupported workspace archive and a disk-full session
-  store write; show a persistent, recoverable degraded-state notice rather than
-  restoring an unexplained empty workspace or reverting silently on relaunch.
-- Add rename-aside/export and retry actions without overwriting the protected
-  archive.
-- Verify that AppModel's chat-shutdown, split-intent, and explicitly-closed ID
-  bookkeeping is pruned after completion.
 
 ### Preview correctness and interaction performance
 
-- Move large read-only text to TextKit 2 and cache CSV/JSON/HTML preparation by
-  content identity so hover, zoom, and navigation never repeat full parsing.
-- Add native Find to read mode, autosave-flush Markdown before navigation, a
-  visible “more rows” marker for truncated Markdown tables, and an explicit
-  http/https/workspace-file link policy.
-- Add PDFKit and a typed informational recovery banner; keep performance gates
-  for 1 MiB text and image-heavy Markdown on an installed optimized build.
+- Add a visible “more rows” marker for truncated Markdown tables and finish the
+  typed informational recovery banner.
+- Split the preview monolith into bounded content units and keep installed-build
+  performance gates for 1 MiB text, large structured data, PDFs, and image-heavy
+  Markdown.
 
 ### Terminal parity and failure feedback
 
-- Page older observer history instead of eagerly retaining 64 MiB per cold
-  selection; make transcript sanitization incremental and search cached/off-main.
-- Add focus/VoiceOver synchronization, configured transcript font, terminal-
-  themed chrome, clear/jump commands, consented OSC 52 copy, and remove the
-  obsolete terminal-grid implementation.
+- Make transcript sanitization incremental and move cached history search off
+  the main actor.
+- Add throttled VoiceOver output announcements and terminal-themed pane chrome.
 - Keep the PR 8 physical-trackpad gate open until sub-row movement is genuinely
   continuous in the installed app; row-quantized SwiftTerm scrolling is not
   considered fixed by the repaint/geometry work alone.
 
 ### Shell, Git, and session recovery
 
-- Make pop-out failure explicit and prefer the current window when a surface is
-  already visible locally.
-- Drive the Git panel from workspace/Git filesystem events rather than only its
-  bounded timer, and split PR creation into review then execution.
+- Make pop-out failure explicit; the current-window preference for an already
+  visible local surface is implemented.
 - Finish reversible Recently Closed/Restore/Delete behavior and persisted,
   inspectable Mesh staged prompts.
 
 ### Accessibility, copy, and readiness
 
-- Replace remaining color-only status dots and low-contrast attention badges;
-  honor Reduce Motion outside the now-covered toast/onboarding paths; and expose
-  truthful keyboard focus and button traits throughout the AX tree.
+- Replace remaining low-contrast attention badges; honor Reduce Motion outside
+  the covered toast, onboarding, restoration, palette, and rail paths; and
+  expose truthful keyboard focus and button traits throughout the AX tree.
 - Finish Title Case and project terminology, remove background-service jargon
   from user surfaces, align menu/palette shortcuts, and replace developer Help
   and feature-marketing onboarding with operational guidance.

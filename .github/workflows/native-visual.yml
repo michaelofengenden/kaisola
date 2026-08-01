@@ -116,7 +116,7 @@ jobs:
             fi
           }
 
-          for surface in terminal terminal-solo terminal-semantic terminal-scroll-output terminal-transcript account-picker attention-completed companion-control mixed preview preview-narrow preview-dirty-tab preview-tab-overflow preview-table-edit preview-html preview-docx workspace-rename workspace-new-file topbar mesh settings settings-terminal settings-terminal-history settings-terminal-interaction settings-companion settings-mcp settings-models settings-account-recovery usage; do
+          for surface in terminal terminal-solo terminal-semantic terminal-scroll-output terminal-transcript account-picker attention-completed companion-control mixed preview preview-narrow preview-dirty-tab preview-tab-overflow preview-table-edit preview-html preview-docx preview-pdf workspace-rename workspace-new-file topbar mesh settings settings-terminal settings-terminal-history settings-terminal-interaction settings-companion settings-mcp settings-models settings-account-recovery usage; do
             capture="$output/$surface.png"
             run_fixture "$surface" "$capture" \
               "$binary" -ApplePersistenceIgnoreState YES

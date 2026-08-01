@@ -1,6 +1,7 @@
 import AppKit
 import CryptoKit
 import Darwin
+import PDFKit
 import SwiftUI
 import UniformTypeIdentifiers
 
@@ -44,6 +45,7 @@ enum FilePreviewContent: Equatable, Sendable {
     case json(String)
     case html(String)
     case docx
+    case pdf
     case image
     case tooLarge(Int)
     case binary
@@ -53,7 +55,7 @@ enum FilePreviewContent: Equatable, Sendable {
     static let maxImageBytes = 25 * 1_048_576
     static let imageExtensions: Set<String> = ["png", "jpg", "jpeg", "gif", "heic", "webp", "bmp", "tiff", "svg", "icns"]
     static let binaryExtensions: Set<String> = [
-        "a", "bin", "class", "dmg", "dylib", "exe", "framework", "o", "pdf", "pkg", "so", "wasm", "zip",
+        "a", "bin", "class", "dmg", "dylib", "exe", "framework", "o", "pkg", "so", "wasm", "zip",
     ]
 
     static func load(url: URL) -> FilePreviewContent {
@@ -65,6 +67,7 @@ enum FilePreviewContent: Equatable, Sendable {
             return size <= maxImageBytes ? .image : .tooLarge(size)
         }
         if ext == "docx" { return size <= maxDocumentBytes ? .docx : .tooLarge(size) }
+        if ext == "pdf" { return size <= maxDocumentBytes ? .pdf : .tooLarge(size) }
         if binaryExtensions.contains(ext) { return .binary }
         guard size <= maxTextBytes else { return .tooLarge(size) }
         guard let data = FileManager.default.contents(atPath: path) else { return .unreadable }
@@ -118,6 +121,20 @@ enum FilePreviewContent: Equatable, Sendable {
 /// the immutable result across the boundary in this explicit wrapper.
 struct RichDocumentPayload: @unchecked Sendable {
     let value: NSAttributedString
+}
+
+/// PDFKit documents are immutable for this read-only surface after loading.
+/// The wrapper makes that ownership boundary explicit when the dedicated PDF
+/// worker moves the parsed document back to the MainActor.
+struct PDFDocumentPayload: @unchecked Sendable {
+    let value: PDFDocument
+}
+
+enum PDFDocumentIO {
+    static func load(url: URL) -> PDFDocumentPayload? {
+        guard let document = PDFDocument(url: url), document.pageCount > 0 else { return nil }
+        return PDFDocumentPayload(value: document)
+    }
 }
 
 enum RichDocumentIO {
@@ -1437,6 +1454,16 @@ private actor RichDocumentWorker {
     }
 }
 
+/// PDF parsing is synchronous. Serialize it away from the MainActor so opening
+/// a bounded but image-heavy document cannot stall terminals or pointer input.
+private actor PDFDocumentWorker {
+    static let shared = PDFDocumentWorker()
+
+    func load(url: URL) -> PDFDocumentPayload? {
+        PDFDocumentIO.load(url: url)
+    }
+}
+
 private struct RichDocumentCommand: Equatable {
     enum Kind: Equatable { case bold, italic, underline, heading, bulletList }
     let id = UUID()
@@ -1570,6 +1597,7 @@ struct FilePreviewView: View {
     @State private var savedText = ""
     @State private var richDraft = NSAttributedString(string: "")
     @State private var savedRichText = NSAttributedString(string: "")
+    @State private var pdfDocument: PDFDocument?
     @State private var showMarkdownSource = false
     /// Text (non-markdown) files default to a read-only, syntax-highlighted
     /// view; this toggle drops into the plain `TextEditor` for editing.
@@ -2099,7 +2127,7 @@ struct FilePreviewView: View {
             text
         case .docx:
             richDraft.string
-        case .image, .tooLarge, .binary, .unreadable:
+        case .pdf, .image, .tooLarge, .binary, .unreadable:
             nil
         }
     }
@@ -2204,6 +2232,16 @@ struct FilePreviewView: View {
                 .background(Color(nsColor: .underPageBackgroundColor))
                 .padding(16)
                 .background(Color(nsColor: .controlBackgroundColor))
+        case .pdf:
+            if let pdfDocument {
+                PDFFilePreview(document: pdfDocument)
+            } else {
+                unavailablePreview(
+                    title: "Could not load PDF",
+                    systemImage: "doc.richtext",
+                    description: "The document may be damaged, encrypted, or incomplete."
+                )
+            }
         case let .tooLarge(size):
             unavailablePreview(
                 title: "File too large to preview",
@@ -2305,6 +2343,12 @@ struct FilePreviewView: View {
             } else {
                 rich = nil
             }
+            let pdf: PDFDocumentPayload?
+            if case .pdf = snapshot.content {
+                pdf = await PDFDocumentWorker.shared.load(url: target)
+            } else {
+                pdf = nil
+            }
             let recoveredRich: RichDocumentPayload?
             if recovery?.kind == .richDocument,
                let data = recovery?.richDocumentData {
@@ -2318,6 +2362,7 @@ struct FilePreviewView: View {
             }
             var restoredRecovery = false
             var recoveryMatchesDisk = false
+            pdfDocument = nil
             switch snapshot.content {
             case let .text(text), let .markdown(text), let .html(text):
                 content = snapshot.content
@@ -2352,6 +2397,11 @@ struct FilePreviewView: View {
                     content = .unreadable
                     richDraft = NSAttributedString(string: "")
                 }
+            case .pdf:
+                content = pdf == nil ? .unreadable : .pdf
+                pdfDocument = pdf?.value
+                savedText = ""
+                savedRichText = NSAttributedString(string: "")
             default:
                 savedText = ""
                 savedRichText = NSAttributedString(string: "")
@@ -2952,6 +3002,35 @@ struct FilePreviewView: View {
             markdown: text,
             options: AttributedString.MarkdownParsingOptions(interpretedSyntax: .full)
         )) ?? AttributedString(text)
+    }
+}
+
+/// Native, selectable PDF rendering with PDFKit's own scrolling, page layout,
+/// accessibility, and trackpad magnification behavior. The parsed
+/// document arrives from `PDFDocumentWorker`; this representable only mounts it.
+private struct PDFFilePreview: NSViewRepresentable {
+    let document: PDFDocument
+
+    func makeNSView(context: Context) -> PDFView {
+        let view = PDFView()
+        view.autoScales = true
+        view.displayMode = .singlePageContinuous
+        view.displayDirection = .vertical
+        view.displaysPageBreaks = true
+        view.pageShadowsEnabled = true
+        view.backgroundColor = .underPageBackgroundColor
+        view.document = document
+        return view
+    }
+
+    func updateNSView(_ view: PDFView, context: Context) {
+        guard view.document !== document else { return }
+        view.document = document
+        view.autoScales = true
+    }
+
+    static func dismantleNSView(_ view: PDFView, coordinator: ()) {
+        view.document = nil
     }
 }
 

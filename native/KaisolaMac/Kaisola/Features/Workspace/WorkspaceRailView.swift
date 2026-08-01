@@ -615,7 +615,7 @@ enum WorkspaceFileClipboard {
             text
         case .docx:
             RichDocumentIO.load(url: url)?.value.string
-        case .image, .tooLarge, .binary, .unreadable:
+        case .pdf, .image, .tooLarge, .binary, .unreadable:
             nil
         }
     }

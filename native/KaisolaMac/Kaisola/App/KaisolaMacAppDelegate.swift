@@ -1065,6 +1065,32 @@ final class KaisolaMacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDele
                 if (try? RichDocumentIO.write(contents, to: document)) != nil {
                     model.openFilePreview(document)
                 }
+            } else if visualSurface == "preview-pdf" {
+                let document = FileManager.default.temporaryDirectory
+                    .appendingPathComponent("Kaisola visual document.pdf", isDirectory: false)
+                let page = NSTextView(frame: NSRect(x: 0, y: 0, width: 540, height: 720))
+                page.drawsBackground = true
+                page.backgroundColor = .white
+                page.textColor = .black
+                page.textContainerInset = NSSize(width: 44, height: 48)
+                page.textStorage?.setAttributedString(NSMutableAttributedString(
+                    string: "Native PDF review\n\n",
+                    attributes: [
+                        .font: NSFont.systemFont(ofSize: 30, weight: .bold),
+                        .foregroundColor: NSColor.black,
+                    ]
+                ))
+                page.textStorage?.append(NSAttributedString(
+                    string: "Read selectable project documents beside live terminals. PDFKit keeps page scrolling, trackpad magnification, and accessibility native.\n\nRelease evidence\n• Parsing runs away from the main actor\n• Oversized files fail closed\n• Finder and external-app recovery stay available",
+                    attributes: [
+                        .font: NSFont.systemFont(ofSize: 16),
+                        .foregroundColor: NSColor.darkGray,
+                    ]
+                ))
+                let data = page.dataWithPDF(inside: page.bounds)
+                if !data.isEmpty, (try? data.write(to: document, options: .atomic)) != nil {
+                    model.openFilePreview(document)
+                }
             } else if visualSurface == "mesh" {
                 model.loadVisualMeshFixture(workspace: workspace)
             }

@@ -482,6 +482,7 @@ final class WorkspaceFilesTests: XCTestCase {
         XCTAssertEqual(probe.startedCount, 2)
     }
 
+    @MainActor
     func testPreviewContentClassifiesFiles() throws {
         XCTAssertEqual(FilePreviewContent.load(url: root.appendingPathComponent("README.md")), .markdown("hello"))
         XCTAssertEqual(FilePreviewContent.load(url: root.appendingPathComponent("src/main.swift")), .text("swift"))
@@ -497,6 +498,13 @@ final class WorkspaceFilesTests: XCTestCase {
         let image = root.appendingPathComponent("pic.png")
         try Data([0x89, 0x50]).write(to: image)
         XCTAssertEqual(FilePreviewContent.load(url: image), .image)
+
+        let pdf = root.appendingPathComponent("review.pdf")
+        let pdfSource = NSTextField(labelWithString: "Native PDF preview")
+        pdfSource.frame = NSRect(x: 0, y: 0, width: 300, height: 80)
+        try pdfSource.dataWithPDF(inside: pdfSource.bounds).write(to: pdf)
+        XCTAssertEqual(FilePreviewContent.load(url: pdf), .pdf)
+        XCTAssertEqual(PDFDocumentIO.load(url: pdf)?.value.pageCount, 1)
 
         XCTAssertEqual(FilePreviewContent.load(url: root.appendingPathComponent("missing.txt")), .unreadable)
     }
@@ -1331,6 +1339,16 @@ final class WorkspaceFilesTests: XCTestCase {
         XCTAssertEqual(
             FilePreviewContent.load(url: image),
             .tooLarge(FilePreviewContent.maxImageBytes + 1)
+        )
+
+        let pdf = root.appendingPathComponent("oversized.pdf")
+        XCTAssertTrue(FileManager.default.createFile(atPath: pdf.path, contents: nil))
+        let pdfHandle = try FileHandle(forWritingTo: pdf)
+        try pdfHandle.truncate(atOffset: UInt64(FilePreviewContent.maxDocumentBytes + 1))
+        try pdfHandle.close()
+        XCTAssertEqual(
+            FilePreviewContent.load(url: pdf),
+            .tooLarge(FilePreviewContent.maxDocumentBytes + 1)
         )
     }
 

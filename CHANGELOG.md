@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.1.8 — 2026-08-01
+
+- Projects stay in their saved order instead of moving when selected.
+- A slimmer sidebar keeps the hierarchy clear and shows only your first name in the footer.
+- Document and Files controls now sit together, and Document closes either a file preview or browser card correctly.
+- Both right-side dividers keep their resize cursor and drag behavior along their full height, even beside rendered documents.
+- Glass is calmer, subtly warmer, and consistently rounded.
+
 ## 1.1.7 — 2026-07-31
 
 - Cleaner sidebar: slimmer default width, deeper session indentation, and no row highlight boxes.

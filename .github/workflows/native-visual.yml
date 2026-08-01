@@ -72,9 +72,16 @@ jobs:
             # frames to about 1024x681 and 810x568 captured pixels respectively.
             # These bounds still catch AppKit frame-autosave leakage without
             # rejecting that stable runner scaling.
-            if [[ "$surface" == workspace-rename || "$surface" == workspace-new-file || "$surface" == workspace-move ]]; then
-              test "$width" -ge 500
-              test "$height" -ge 300
+            if [[ "$surface" == workspace-rename || "$surface" == workspace-new-file ]]; then
+              # NSAlert sheet crops are 260x241 on the headless runner and
+              # 520x324 on a local Retina display.
+              test "$width" -ge 250
+              test "$height" -ge 230
+            elif [[ "$surface" == workspace-move ]]; then
+              # The declared 460x440 SwiftUI move sheet may be captured at
+              # either point or Retina pixel dimensions.
+              test "$width" -ge 450
+              test "$height" -ge 400
             elif [[ "$surface" == account-picker ]]; then
               # NSAlert sizes to its informative text and host display scale.
               # ScreenCaptureKit may return either the compact 372x274 sheet

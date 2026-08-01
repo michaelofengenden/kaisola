@@ -861,7 +861,20 @@ final class AcpConversation: ObservableObject {
         currentModeID = "default"
         rows = [
             .user(id: "1", text: "Make the native project feel calm and fast.", failed: false),
-            .message(id: "1", text: "I’ve unified terminal and agent sessions into movable cards, then tightened the project rail and persisted the layout."),
+            .message(id: "1", text: """
+            ## Review ready
+
+            | Check | Result |
+            | --- | --- |
+            | Focused tests | Passed |
+            | Native build | Passed |
+
+            ```swift
+            let renderer = TranscriptRenderer(cache: .incremental)
+            ```
+
+            Inspect `PULL_REQUEST_FEATURES.md:211` for the exact acceptance contract.
+            """),
             .tool(AcpToolCall(
                 id: "visual-tool",
                 title: "Inspect native project",

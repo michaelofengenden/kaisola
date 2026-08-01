@@ -520,6 +520,7 @@ private struct MeshColumnView: View {
                             ForEach(conversation.visibleRows) { row in
                                 TranscriptRowView(
                                     row: row,
+                                    workspaceURL: conversation.workspaceURL,
                                     retry: { conversation.retryFailed($0) },
                                     terminalSnapshot: { [weak conversation] id in await conversation?.terminalSnapshot(id) }
                                 )

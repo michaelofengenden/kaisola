@@ -190,7 +190,9 @@ credential-redacted remote, repository, and base branch; execution rechecks and
 uses that exact destination. Chat and Mesh permission asks now disclose the
 adapter's raw input, every declared path, and the literal local-rule scope before
 offering separate Deny, Allow Once, and Create Rule actions. Cached block
-rendering remains.
+rendering is shared by Chat and Mesh, keeps streaming parse work off the main
+actor, and presents Markdown, code, tables, file citations, and bounded
+artifacts as reviewable native controls.
 
 Completed scope:
 
@@ -205,13 +207,12 @@ Completed scope:
   tuple Kaisola will persist. Keep adapter-owned opaque persistence out of the
   safe controls, and preserve Deny, Allow Once, and Create Rule as distinct
   decisions in both Chat and Mesh.
-
-Remaining scope:
-
 - Build one cached block-transcript renderer for Chat and Mesh with fenced,
   syntax-highlighted code, copy controls, tables, clickable file-and-line
   references, and expandable tool artifacts. Keep streaming updates bounded so
-  a growing answer does not reparse the whole transcript on every token.
+  a growing answer does not reparse the whole transcript on every token. Long
+  responses, tool output, and diffs disclose their bounded prefix and provide
+  explicit Show More, Collapse, and copy paths.
 
 Acceptance:
 

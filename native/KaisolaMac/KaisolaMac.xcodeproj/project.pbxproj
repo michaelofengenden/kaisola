@@ -115,6 +115,7 @@
 		C0D2A0000000000000000004 /* CommandRegistryTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = C0D2A0000000000000000003 /* CommandRegistryTests.swift */; };
 		7DAB0AD69D2C07C5526C14B9 /* ProjectAccountsSection.swift in Sources */ = {isa = PBXBuildFile; fileRef = 154C63628A43E6BD8410F578 /* ProjectAccountsSection.swift */; };
 		7DF2FB061FD5D062D6A085DF /* AcpChatView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4AEB389DB67AC63D7147C0BA /* AcpChatView.swift */; };
+		A9C900000000000000000002 /* AcpTranscriptRendering.swift in Sources */ = {isa = PBXBuildFile; fileRef = A9C900000000000000000001 /* AcpTranscriptRendering.swift */; };
 		7E79252544D2552F7335E60C /* SyntaxHighlighter.swift in Sources */ = {isa = PBXBuildFile; fileRef = BA44B5608FF424D5A4173716 /* SyntaxHighlighter.swift */; };
 		7F366A320AFDDE5C0B008686 /* GitPanelView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9586CAAF5EE496B213F01998 /* GitPanelView.swift */; };
 		7F9A5DAA9548D99E55198D7E /* WorkspaceWatcherTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2709C3EF1FBBB647E9258793 /* WorkspaceWatcherTests.swift */; };
@@ -328,6 +329,7 @@
 		4A75B9CDDB712B8E40FD295E /* AppModelBookkeepingTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppModelBookkeepingTests.swift; sourceTree = "<group>"; };
 		4A9119A3AFA982A1A42C4356 /* McpSettingsTab.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = McpSettingsTab.swift; sourceTree = "<group>"; };
 		4AEB389DB67AC63D7147C0BA /* AcpChatView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AcpChatView.swift; sourceTree = "<group>"; };
+		A9C900000000000000000001 /* AcpTranscriptRendering.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AcpTranscriptRendering.swift; sourceTree = "<group>"; };
 		4C1E742D2099046E14888F80 /* SwiftTermStressTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SwiftTermStressTests.swift; sourceTree = "<group>"; };
 		4E6225F81B83882F5395725D /* WorkspaceRestorationNoticeView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WorkspaceRestorationNoticeView.swift; sourceTree = "<group>"; };
 		502B709E629F1098130633B7 /* FilePreviewView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FilePreviewView.swift; sourceTree = "<group>"; };
@@ -897,6 +899,7 @@
 				BC20168C86DDDBA7D70222F3 /* AcpAdapterResolver.swift */,
 				FDC5D762925B519587B9EF95 /* AcpChatHandle.swift */,
 				4AEB389DB67AC63D7147C0BA /* AcpChatView.swift */,
+				A9C900000000000000000001 /* AcpTranscriptRendering.swift */,
 				9B1563BF7D126A8B5C295EA7 /* AcpClient.swift */,
 				3ACF651DE22A050B1D4AF49C /* AcpConversation.swift */,
 				CA7E0A7AF7C58D8926909FDB /* AcpDiff.swift */,
@@ -1076,6 +1079,7 @@
 				4AEED15A504F6575273F165A /* AcpAdapterResolver.swift in Sources */,
 				C3C6A0FA37B46A4E2561429A /* AcpChatHandle.swift in Sources */,
 				7DF2FB061FD5D062D6A085DF /* AcpChatView.swift in Sources */,
+				A9C900000000000000000002 /* AcpTranscriptRendering.swift in Sources */,
 				907211E885D959CE7539719F /* AcpClient.swift in Sources */,
 				A82D652E2C835E8ACC2DAFA0 /* AcpConversation.swift in Sources */,
 				BFDE2C98C977243CF4E89074 /* AcpDiff.swift in Sources */,

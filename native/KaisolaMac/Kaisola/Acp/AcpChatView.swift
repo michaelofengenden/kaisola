@@ -256,6 +256,7 @@ struct AcpChatView: View {
                         ForEach(conversation.visibleRows) { row in
                             TranscriptRowView(
                                 row: row,
+                                workspaceURL: conversation.workspaceURL,
                                 retry: { conversation.retryFailed($0) },
                                 terminalSnapshot: { [weak conversation] id in await conversation?.terminalSnapshot(id) }
                             )
@@ -634,38 +635,14 @@ enum AcpChatRendering {
         return AcpBoundedText(text: result, isTruncated: truncated)
     }
 
-    static func markdown(_ text: String) -> AttributedString {
-        (try? AttributedString(markdown: text)) ?? AttributedString(text)
-    }
-}
-
-private struct AssistantMarkdownText: View {
-    let text: String
-
-    private var rendered: AcpBoundedText {
-        AcpChatRendering.bounded(
-            text,
-            characterLimit: AcpChatRendering.assistantCharacterLimit,
-            lineLimit: AcpChatRendering.assistantLineLimit
-        )
-    }
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 5) {
-            Text(AcpChatRendering.markdown(rendered.text))
-                .textSelection(.enabled)
-                .frame(maxWidth: .infinity, alignment: .leading)
-            if rendered.isTruncated {
-                Label("Long response truncated in the transcript view", systemImage: "ellipsis.rectangle")
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
-            }
-        }
+    static func expandedLimit(_ current: Int) -> Int {
+        current > Int.max / 2 ? Int.max : current * 2
     }
 }
 
 struct TranscriptRowView: View {
     let row: AcpTranscriptRow
+    var workspaceURL: URL?
     var retry: ((String) -> Void)?
     var terminalSnapshot: (@Sendable (String) async -> AcpTerminalHost.Snapshot?)?
 
@@ -699,7 +676,7 @@ struct TranscriptRowView: View {
                     .textSelection(.enabled)
             }
         case let .message(_, text):
-            AssistantMarkdownText(text: text)
+            AssistantMarkdownText(text: text, workspaceURL: workspaceURL)
         case let .thought(_, text):
             DisclosureGroup {
                 let bounded = AcpChatRendering.bounded(
@@ -722,7 +699,11 @@ struct TranscriptRowView: View {
                     .foregroundStyle(.secondary)
             }
         case let .tool(call):
-            ToolCallCard(call: call, terminalSnapshot: terminalSnapshot)
+            ToolCallCard(
+                call: call,
+                workspaceURL: workspaceURL,
+                terminalSnapshot: terminalSnapshot
+            )
         case let .plan(_, entries):
             PlanCard(entries: entries)
         }
@@ -731,6 +712,7 @@ struct TranscriptRowView: View {
 
 struct ToolCallCard: View {
     let call: AcpToolCall
+    var workspaceURL: URL?
     var terminalSnapshot: (@Sendable (String) async -> AcpTerminalHost.Snapshot?)?
     @State private var expanded = false
 
@@ -758,7 +740,10 @@ struct ToolCallCard: View {
             .disabled(!hasArtifacts)
 
             if !call.locations.isEmpty {
-                Text(call.locations.map { ($0 as NSString).lastPathComponent }.joined(separator: ", "))
+                Text(AcpTranscriptInlineRendering.attributed(
+                    call.locations.joined(separator: ", "),
+                    workspaceURL: workspaceURL
+                ))
                     .font(.caption).foregroundStyle(.secondary).lineLimit(1)
             }
 
@@ -777,6 +762,9 @@ struct ToolCallCard: View {
         }
         .padding(9)
         .background(.quaternary.opacity(0.5), in: RoundedRectangle(cornerRadius: 8))
+        .environment(\.openURL, OpenURLAction { link in
+            AcpTranscriptLinkRouting.open(link, workspaceURL: workspaceURL)
+        })
     }
 
     private var statusSymbol: String {
@@ -798,12 +786,14 @@ struct ToolCallCard: View {
 
 private struct ToolTextArtifact: View {
     let text: String
+    @State private var characterLimit = AcpChatRendering.toolCharacterLimit
+    @State private var lineLimit = AcpChatRendering.toolLineLimit
 
     private var rendered: AcpBoundedText {
         AcpChatRendering.bounded(
             text,
-            characterLimit: AcpChatRendering.toolCharacterLimit,
-            lineLimit: AcpChatRendering.toolLineLimit
+            characterLimit: characterLimit,
+            lineLimit: lineLimit
         )
     }
 
@@ -818,8 +808,36 @@ private struct ToolTextArtifact: View {
                     .padding(8)
             }
             .frame(maxHeight: 220)
+            HStack(spacing: 9) {
+                if rendered.isTruncated {
+                    Button("Show more") {
+                        characterLimit = AcpChatRendering.expandedLimit(characterLimit)
+                        lineLimit = AcpChatRendering.expandedLimit(lineLimit)
+                    }
+                    .font(.caption2.weight(.semibold))
+                    .help("Render the next bounded portion of this tool output")
+                }
+                if characterLimit > AcpChatRendering.toolCharacterLimit {
+                    Button("Collapse") {
+                        characterLimit = AcpChatRendering.toolCharacterLimit
+                        lineLimit = AcpChatRendering.toolLineLimit
+                    }
+                    .font(.caption2)
+                }
+                Button {
+                    NSPasteboard.general.clearContents()
+                    NSPasteboard.general.setString(text, forType: .string)
+                } label: {
+                    Label("Copy output", systemImage: "doc.on.doc")
+                }
+                .font(.caption2)
+                Spacer()
+            }
+            .buttonStyle(.borderless)
+            .padding(.horizontal, 8)
+            .padding(.vertical, 6)
             if rendered.isTruncated {
-                Label("Tool output truncated in this view", systemImage: "ellipsis.rectangle")
+                Text("A bounded prefix is shown; the complete tool output remains available.")
                     .font(.caption2)
                     .foregroundStyle(.secondary)
                     .padding(.horizontal, 8)
@@ -903,20 +921,22 @@ struct DiffView: View {
     let newText: String
 
     @State private var sideBySide = false
+    @State private var characterLimit = AcpChatRendering.diffCharacterLimit
+    @State private var lineLimit = AcpChatRendering.diffLineLimit
 
     private var boundedOld: AcpBoundedText {
         AcpChatRendering.bounded(
             oldText ?? "",
-            characterLimit: AcpChatRendering.diffCharacterLimit,
-            lineLimit: AcpChatRendering.diffLineLimit
+            characterLimit: characterLimit,
+            lineLimit: lineLimit
         )
     }
 
     private var boundedNew: AcpBoundedText {
         AcpChatRendering.bounded(
             newText,
-            characterLimit: AcpChatRendering.diffCharacterLimit,
-            lineLimit: AcpChatRendering.diffLineLimit
+            characterLimit: characterLimit,
+            lineLimit: lineLimit
         )
     }
 
@@ -947,11 +967,36 @@ struct DiffView: View {
             } else {
                 unifiedBody
             }
-            if boundedOld.isTruncated || boundedNew.isTruncated {
-                Label("Large diff truncated in this view", systemImage: "ellipsis.rectangle")
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
-                    .padding(6)
+            if boundedOld.isTruncated || boundedNew.isTruncated
+                || characterLimit > AcpChatRendering.diffCharacterLimit {
+                VStack(alignment: .leading, spacing: 5) {
+                    if boundedOld.isTruncated || boundedNew.isTruncated {
+                        Label(
+                            "A bounded diff prefix is shown; the complete artifact remains available.",
+                            systemImage: "ellipsis.rectangle"
+                        )
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                    }
+                    HStack(spacing: 10) {
+                        if boundedOld.isTruncated || boundedNew.isTruncated {
+                            Button("Show more") {
+                                characterLimit = AcpChatRendering.expandedLimit(characterLimit)
+                                lineLimit = AcpChatRendering.expandedLimit(lineLimit)
+                            }
+                            .font(.caption2.weight(.semibold))
+                        }
+                        if characterLimit > AcpChatRendering.diffCharacterLimit {
+                            Button("Collapse") {
+                                characterLimit = AcpChatRendering.diffCharacterLimit
+                                lineLimit = AcpChatRendering.diffLineLimit
+                            }
+                            .font(.caption2)
+                        }
+                    }
+                    .buttonStyle(.borderless)
+                }
+                .padding(6)
             }
         }
         .clipShape(RoundedRectangle(cornerRadius: 6))

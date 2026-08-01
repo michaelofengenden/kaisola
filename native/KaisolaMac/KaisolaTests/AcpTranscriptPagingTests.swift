@@ -162,6 +162,12 @@ final class AcpTranscriptPagingTests: XCTestCase {
         let ordinary = makeConversation()
         ordinary.loadVisualFixture()
         XCTAssertNil(ordinary.pendingPermission)
+        let renderedBlocks = ordinary.rows.compactMap { row -> [MarkdownSourceBlock]? in
+            guard case let .message(_, text) = row else { return nil }
+            return AcpTranscriptBlockCache().blocks(for: text)
+        }.flatMap { $0 }
+        XCTAssertTrue(renderedBlocks.contains { if case .table = $0.block { return true }; return false })
+        XCTAssertTrue(renderedBlocks.contains { if case .code = $0.block { return true }; return false })
 
         let permission = makeConversation()
         permission.loadVisualFixture(includePermission: true)
@@ -204,6 +210,115 @@ final class AcpTranscriptPagingTests: XCTestCase {
             lineLimit: 10
         )
         XCTAssertEqual(untouched, AcpBoundedText(text: "short", isTruncated: false))
+    }
+
+    func testTranscriptBlockCacheReparsesOnlyTheGrowingTail() {
+        let cache = AcpTranscriptBlockCache()
+        let initial = "# Result\n\nStable paragraph.\n\nGrowing"
+        let originalBlocks = cache.blocks(for: initial)
+        XCTAssertEqual(originalBlocks.count, 3)
+        XCTAssertEqual(cache.lastParsedUTF16Count, (initial as NSString).length)
+
+        let appended = initial + " answer with `inline code`."
+        let updatedBlocks = cache.blocks(for: appended)
+
+        XCTAssertEqual(updatedBlocks.count, 3)
+        XCTAssertEqual(Array(updatedBlocks.prefix(2)), Array(originalBlocks.prefix(2)))
+        XCTAssertLessThan(cache.lastParsedUTF16Count, (appended as NSString).length)
+        XCTAssertEqual(cache.parseCount, 2)
+    }
+
+    func testTranscriptBlockCacheWorkStaysBoundedAcrossManyStreamingChunks() {
+        let cache = AcpTranscriptBlockCache()
+        let stable = (0..<120).map { "Stable paragraph \($0)." }.joined(separator: "\n\n")
+        var stream = stable + "\n\nGrowing"
+        _ = cache.blocks(for: stream)
+        var naiveWholeSourceUnits = (stream as NSString).length
+        for index in 0..<100 {
+            stream += " token\(index)"
+            _ = cache.blocks(for: stream)
+            naiveWholeSourceUnits += (stream as NSString).length
+        }
+
+        // Reusing stable blocks keeps aggregate parser input far below the
+        // exact whole-source-on-every-chunk baseline.
+        XCTAssertLessThan(
+            cache.totalParsedUTF16Count,
+            naiveWholeSourceUnits / 5
+        )
+    }
+
+    func testTranscriptBlockCacheReparsesAChangedSourceAndCanPromoteTailToTable() {
+        let cache = AcpTranscriptBlockCache()
+        _ = cache.blocks(for: "Intro\n\nName | Result")
+        let tableSource = "Intro\n\nName | Result\n--- | ---\nBuild | Passed"
+        let blocks = cache.blocks(for: tableSource)
+
+        guard case let .table(headers, rows, _) = blocks.last?.block else {
+            return XCTFail("Expected the growing final paragraph to become a table")
+        }
+        XCTAssertEqual(headers, ["Name", "Result"])
+        XCTAssertEqual(rows, [["Build", "Passed"]])
+
+        let replacement = "Entirely different response"
+        _ = cache.blocks(for: replacement)
+        XCTAssertEqual(cache.lastParsedUTF16Count, (replacement as NSString).length)
+    }
+
+    func testTranscriptMarkdownPreservesFencedCodeAndTablesAsBlocks() {
+        let source = """
+        ```swift
+        let answer = 42
+        ```
+
+        File | Line
+        --- | ---
+        App.swift | 42
+        """
+        let blocks = AcpTranscriptBlockCache().blocks(for: source)
+        XCTAssertEqual(blocks.count, 2)
+        guard case let .code(language, code) = blocks[0].block else {
+            return XCTFail("Expected fenced code block")
+        }
+        XCTAssertEqual(language, "swift")
+        XCTAssertEqual(code, "let answer = 42")
+        guard case .table = blocks[1].block else {
+            return XCTFail("Expected native table block")
+        }
+        XCTAssertEqual(AcpTranscriptCodeLanguage.language(for: "typescript"), .javascript)
+        XCTAssertEqual(AcpTranscriptCodeLanguage.language(for: "py"), .python)
+        XCTAssertFalse(SyntaxHighlighter.spans(in: code, language: .swift).isEmpty)
+    }
+
+    func testTranscriptFileReferencesResolveInsideWorkspaceWithLineAndColumn() throws {
+        let workspace = FileManager.default.temporaryDirectory
+            .appendingPathComponent("kaisola-transcript-links-\(UUID().uuidString)", isDirectory: true)
+        let sources = workspace.appendingPathComponent("Sources", isDirectory: true)
+        try FileManager.default.createDirectory(at: sources, withIntermediateDirectories: true)
+        let file = sources.appendingPathComponent("App.swift")
+        try "let answer = 42\n".write(to: file, atomically: true, encoding: .utf8)
+        defer { try? FileManager.default.removeItem(at: workspace) }
+
+        let references = AcpTranscriptInlineRendering.fileReferences(
+            in: "See Sources/App.swift:42:7 and missing.swift:9.",
+            workspaceURL: workspace
+        )
+
+        XCTAssertEqual(references.count, 1)
+        XCTAssertEqual(references[0].fileURL, file.standardizedFileURL)
+        XCTAssertEqual(references[0].line, 42)
+        XCTAssertEqual(references[0].linkURL.fragment, "L42")
+
+        let attributed = AcpTranscriptInlineRendering.attributed(
+            "Open `Sources/App.swift:42:7`.",
+            workspaceURL: workspace
+        )
+        XCTAssertEqual(attributed.runs.compactMap { $0.link }.first?.fragment, "L42")
+    }
+
+    func testTranscriptExpansionBudgetDoublesAndSaturates() {
+        XCTAssertEqual(AcpChatRendering.expandedLimit(120_000), 240_000)
+        XCTAssertEqual(AcpChatRendering.expandedLimit(Int.max), Int.max)
     }
 
     // MARK: - Persistent drafts

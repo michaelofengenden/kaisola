@@ -36,6 +36,11 @@ Large product and architecture work remains ordered in
   path, and preview the exact workspace/action/resource tuple before creating a
   local rule. Deny and Allow Once remain non-persistent, while adapter-owned
   always choices with undisclosed scope are never silently substituted.
+- Chat and Mesh now share one off-main, cadence-coalesced transcript renderer.
+  It incrementally reparses only the growing tail, renders fenced code and
+  tables natively, highlights supported languages, links project file-and-line
+  citations, and makes every response, tool-output, and diff bound explicit and
+  expandable.
 - Status indicators expose shape and accessible names, and the user-facing copy
   pass removed several implementation terms (`50e00aa`, `949c4ef`).
 - Bounded PDF files now open in a native PDFKit surface with selection,

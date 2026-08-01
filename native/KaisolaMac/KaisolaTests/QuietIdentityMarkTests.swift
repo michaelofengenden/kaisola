@@ -41,6 +41,138 @@ final class QuietIdentityMarkTests: XCTestCase {
         XCTAssertEqual(QuietIdentity.identity(agentName: "", processName: nil), .shell)
     }
 
+    // MARK: - Dynamic terminal identity (foreground process)
+
+    /// The v1.1.6 addition: a terminal that was opened as a plain shell and
+    /// then had `claude` typed into it must swap its mark. Nothing declares an
+    /// agent for such a row, so the foreground process is the only signal.
+    func testForegroundAgentProcessSwapsAPlainTerminalsMark() {
+        XCTAssertEqual(QuietIdentity.identity(agentName: nil, processName: "claude"), .claude)
+        XCTAssertEqual(QuietIdentity.identity(agentName: nil, processName: "codex"), .openai)
+    }
+
+    /// `TerminalMetaService.processName(fromCommand:)` is what feeds this, and
+    /// it normalizes a runtime-wrapped CLI down to the bare marker name. These
+    /// are the values it actually produces for the two agents.
+    func testProcessNamesTerminalMetaServiceReallyReportsMapToTheirMarks() {
+        let claudeCommands = [
+            "/Users/m/.local/bin/claude",
+            "node /Users/m/.nvm/versions/node/v22.3.0/lib/node_modules/@anthropic-ai/claude-code/cli.js",
+        ]
+        for command in claudeCommands {
+            let reported = TerminalMetaService.processName(fromCommand: command)
+            XCTAssertEqual(reported, "claude", "meta reported \(reported ?? "nil") for \(command)")
+            XCTAssertEqual(QuietIdentity.identity(agentName: nil, processName: reported), .claude)
+        }
+
+        let codexCommands = [
+            "/opt/homebrew/bin/codex",
+            "node /Users/m/.npm/_npx/abc/node_modules/@openai/codex/bin/codex.js",
+        ]
+        for command in codexCommands {
+            let reported = TerminalMetaService.processName(fromCommand: command)
+            XCTAssertEqual(reported, "codex", "meta reported \(reported ?? "nil") for \(command)")
+            XCTAssertEqual(QuietIdentity.identity(agentName: nil, processName: reported), .openai)
+        }
+    }
+
+    func testProcessMatchingIsCaseInsensitiveAndSubstringTolerant() {
+        XCTAssertEqual(QuietIdentity.identity(agentName: nil, processName: "CLAUDE"), .claude)
+        XCTAssertEqual(QuietIdentity.identity(agentName: nil, processName: "claude-code"), .claude)
+        XCTAssertEqual(QuietIdentity.identity(agentName: nil, processName: "Codex"), .openai)
+        XCTAssertEqual(QuietIdentity.identity(agentName: nil, processName: "openai"), .openai)
+    }
+
+    /// Precedence: the running process outranks the transport, so an agent on
+    /// the far end of an ssh hop is that agent's row, not an ssh row. It stays
+    /// below a *declared* agent, which is a stronger statement than a probe.
+    func testForegroundProcessOutranksTheTransportButNotADeclaredAgent() {
+        XCTAssertEqual(QuietIdentity.identity(agentName: nil, processName: "ssh"), .ssh)
+        XCTAssertEqual(QuietIdentity.identity(agentName: "Claude Code", processName: "zsh"), .claude)
+        XCTAssertEqual(QuietIdentity.identity(agentName: "mesh", processName: "claude"), .mesh)
+    }
+
+    /// A shell whose foreground process is an ordinary command keeps its tile:
+    /// the process check must not become a catch-all.
+    func testOrdinaryForegroundProcessesStillReadAsShells() {
+        for process in ["zsh", "node", "npm", "vim", "git", "python3"] {
+            XCTAssertEqual(
+                QuietIdentity.identity(agentName: nil, processName: process),
+                .shell,
+                "\(process) should not claim an agent mark"
+            )
+        }
+    }
+
+    // MARK: - OpenAI knot geometry
+
+    /// The mark is six copies of ONE strand at 60°, which is the logo's actual
+    /// construction. If that ever stops being true the mark stops being the
+    /// logo, so the symmetry is asserted rather than eyeballed.
+    func testKnotIsSixStrandsEvenlySpacedOnOneOrbit() {
+        let rect = CGRect(x: 0, y: 0, width: 16, height: 16)
+        let centers = QuietOpenAIKnot.strandCenters(in: rect)
+        XCTAssertEqual(centers.count, 6)
+
+        let middle = CGPoint(x: rect.midX, y: rect.midY)
+        let radii = centers.map { hypot($0.x - middle.x, $0.y - middle.y) }
+        let expected = QuietOpenAIKnot.orbit * QuietOpenAIKnot.unit(in: rect)
+        for radius in radii {
+            XCTAssertEqual(radius, expected, accuracy: 0.001, "a strand left the orbit")
+        }
+
+        // Consecutive strands are exactly 60° apart.
+        let angles = centers.map { atan2($0.y - middle.y, $0.x - middle.x) }
+        for index in 1 ..< angles.count {
+            var delta = angles[index] - angles[index - 1]
+            if delta < 0 { delta += 2 * .pi }
+            XCTAssertEqual(delta, .pi / 3, accuracy: 0.001)
+        }
+    }
+
+    /// The two numbers that carry the likeness. `lengthRatio` above ~1.16 is
+    /// what makes consecutive strands *cross* instead of merely meeting — that
+    /// overlap is the knot; without it the mark is a plain hexagonal ring. The
+    /// skew is what gives it chirality, and past roughly 20° the interior fills
+    /// in and the mark turns to mud at 16pt.
+    func testKnotStrandsOverlapAndLeanOffTangential() {
+        let neighbourGapRatio = 2 * tan(Double.pi / 6) // 1.1547
+        XCTAssertGreaterThan(
+            Double(QuietOpenAIKnot.lengthRatio),
+            neighbourGapRatio,
+            "strands no longer overlap — the mark is a hexagon, not a knot"
+        )
+        XCTAssertGreaterThan(QuietOpenAIKnot.skew.degrees, 0, "a skew of 0 draws a symmetric ring")
+        XCTAssertLessThan(QuietOpenAIKnot.skew.degrees, 20, "past ~20° the knot fills in at 16pt")
+
+        // Elongated, not round: a stadium at aspect 1 is a circle.
+        XCTAssertGreaterThan(QuietOpenAIKnot.aspect, 2)
+        // Michael's spec: outline weight ≈ strand width × 0.35, give or take.
+        XCTAssertEqual(Double(QuietOpenAIKnot.strokeRatio), 0.45, accuracy: 0.15)
+    }
+
+    /// Six-fold symmetry means the union's bounding box is centred on the slot,
+    /// and the whole mark has to stay inside its 16pt slot once the outline
+    /// weight is added — a mark that overflows its slot collides with the row's
+    /// title column.
+    func testKnotFitsItsSlotAndStaysCentred() {
+        let slot = QuietIdentityMarkView.slot
+        let rect = CGRect(x: 0, y: 0, width: slot, height: slot)
+        let unit = QuietOpenAIKnot.unit(in: rect)
+        let bounds = QuietOpenAIKnot.path(in: rect).boundingRect
+            .insetBy(dx: -QuietOpenAIKnot.strokeWidth(unit: unit) / 2,
+                     dy: -QuietOpenAIKnot.strokeWidth(unit: unit) / 2)
+
+        XCTAssertEqual(bounds.midX, rect.midX, accuracy: 0.01, "the knot is off-centre horizontally")
+        XCTAssertEqual(bounds.midY, rect.midY, accuracy: 0.01, "the knot is off-centre vertically")
+        XCTAssertTrue(rect.contains(bounds), "the knot overflows its \(slot)pt slot: \(bounds)")
+
+        // …but it still fills the slot: a mark that shrank to nothing would
+        // also pass the containment check above.
+        XCTAssertGreaterThan(bounds.width / slot, 0.75)
+        XCTAssertGreaterThan(bounds.height / slot, 0.75)
+    }
+
     func testUnrecognizedAgentsFallBackToTheirInitial() {
         XCTAssertEqual(QuietIdentity.identity(agentName: "Gemini", processName: "node"), .letter("G"))
         XCTAssertEqual(QuietIdentity.identity(agentName: "aider", processName: nil), .letter("A"))

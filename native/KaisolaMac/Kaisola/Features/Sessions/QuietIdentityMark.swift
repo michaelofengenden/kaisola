@@ -15,15 +15,30 @@ enum QuietIdentity: Equatable {
 
     /// Pure mapping from what the model knows about a surface to its mark.
     ///
-    /// Precedence is agent first, then transport, then the initial fallback:
-    /// `ssh` describes how a session is reached, so it only labels a row whose
-    /// agent Kaisola does not recognize, and a plain shell is the default.
+    /// Precedence: declared agent, then the *running* process, then the
+    /// transport, then the initial fallback.
+    ///
+    /// The process check is what makes a plain terminal's mark dynamic. Type
+    /// `claude` into a shell that was opened as a shell and the row's mark
+    /// becomes Claude's; the row was never launched as an agent session, so
+    /// nothing but the foreground process can say so. `ssh` describes how a
+    /// session is *reached*, so it stays below both — a `claude` running on the
+    /// far end of an ssh hop is a Claude row.
+    ///
+    /// Matching is `contains`, not equality, because
+    /// `TerminalMetaService.processName(fromCommand:)` already normalizes a
+    /// runtime-wrapped CLI (`node …/@openai/codex…`) down to the bare marker
+    /// name, but a directly-installed binary can still arrive as `claude-code`
+    /// or similar.
     static func identity(agentName: String?, processName: String?) -> QuietIdentity {
         let agent = (agentName ?? "").lowercased()
         if agent.contains("claude") { return .claude }
         if agent.contains("codex") || agent.contains("openai") { return .openai }
         if agent.contains("mesh") { return .mesh }
-        if (processName ?? "").lowercased() == "ssh" { return .ssh }
+        let process = (processName ?? "").lowercased()
+        if process.contains("claude") { return .claude }
+        if process.contains("codex") || process.contains("openai") { return .openai }
+        if process == "ssh" { return .ssh }
         if let first = agentName?.trimmingCharacters(in: .whitespacesAndNewlines).first,
            let uppercased = first.uppercased().first {
             return .letter(uppercased)
@@ -66,10 +81,10 @@ struct QuietIdentityMarkView: View {
                         style: StrokeStyle(lineWidth: unit * 2.3, lineCap: .round)
                     )
             case .openai:
-                QuietRosetteMark(arcs: 6, radius: 8.2, sweep: 85)
+                QuietOpenAIKnotMark()
                     .stroke(
                         Color(light: 0x202123, dark: 0xF2F2F2),
-                        style: StrokeStyle(lineWidth: unit * 2.2, lineCap: .round)
+                        style: StrokeStyle(lineWidth: QuietOpenAIKnot.strokeWidth(unit: unit))
                     )
             case .shell:
                 tile(">_", size: 7.5, monospaced: true)
@@ -120,32 +135,87 @@ private struct QuietStarburstMark: Shape {
     }
 }
 
-/// The OpenAI/Codex mark: identical arc segments on one radius, rotated evenly
-/// around the centre.
-private struct QuietRosetteMark: Shape {
-    let arcs: Int
-    let radius: CGFloat
-    /// Sweep of each arc in degrees.
-    let sweep: CGFloat
+/// The OpenAI/Codex knot, as geometry rather than as a picture.
+///
+/// The logo is six identical elongated loops arranged with six-fold rotational
+/// symmetry, overlapping into a hexagonal knot. This reproduces that
+/// construction: one stadium (a rounded rect whose corner radius is half its
+/// width), placed with its centre on an orbit around the mark's centre and its
+/// long axis nearly tangential, then repeated every 60°.
+///
+/// Two numbers carry the whole likeness, and both were picked by rendering the
+/// mark at its shipping size rather than by eye at poster size:
+///
+/// * `lengthRatio` — each strand is longer than the arc it spans, so
+///   consecutive strands cross rather than meet. Purely tangential strands of
+///   exactly the right length draw a plain hexagonal ring with beads at the
+///   vertices; it is the *overlap* that reads as a knot.
+/// * `skew` — the strands lean off tangential, which is what gives the mark its
+///   chirality. At 0° it is a symmetric ring and reads as a generic hexagon; far
+///   past 14° the strands cross so much the interior fills in and at 16pt the
+///   mark turns to mud. 14° is the point where the six lobes and the hexagonal
+///   void in the middle both survive a 16pt rasterization.
+///
+/// Everything is expressed in the shared 24-unit viewbox, so the same geometry
+/// serves any slot size.
+enum QuietOpenAIKnot {
+    static let strandCount = 6
+    /// Distance from the mark's centre to each strand's centre.
+    static let orbit: CGFloat = 5.7
+    /// Strand length as a multiple of `orbit`. Above ~1.16 the strands overlap.
+    static let lengthRatio: CGFloat = 1.70
+    /// Strand length ÷ strand width.
+    static let aspect: CGFloat = 2.6
+    /// Outline weight as a fraction of strand width.
+    static let strokeRatio: CGFloat = 0.48
+    /// How far each strand's long axis is turned off tangential.
+    static let skew = Angle(degrees: 14)
 
-    func path(in rect: CGRect) -> Path {
-        let unit = min(rect.width, rect.height) / 24
-        let center = CGPoint(x: rect.midX, y: rect.midY)
-        let r = radius * unit
-        let step = 360 / CGFloat(max(arcs, 1))
+    static func unit(in rect: CGRect) -> CGFloat { min(rect.width, rect.height) / 24 }
+    static func strandLength(unit: CGFloat) -> CGFloat { lengthRatio * orbit * unit }
+    static func strandWidth(unit: CGFloat) -> CGFloat { strandLength(unit: unit) / aspect }
+    static func strokeWidth(unit: CGFloat) -> CGFloat { strandWidth(unit: unit) * strokeRatio }
+
+    /// Where each strand sits. Pure, so the mark's symmetry is testable without
+    /// rasterizing anything.
+    static func strandCenters(in rect: CGRect) -> [CGPoint] {
+        let radius = orbit * unit(in: rect)
+        return (0..<strandCount).map { index in
+            let angle = (2 * .pi / CGFloat(strandCount)) * CGFloat(index)
+            return CGPoint(x: rect.midX + cos(angle) * radius, y: rect.midY + sin(angle) * radius)
+        }
+    }
+
+    /// The whole mark's outline. Lives on the geometry rather than inside the
+    /// `Shape` so the knot's bounds and symmetry can be asserted directly.
+    static func path(in rect: CGRect) -> Path {
+        let unit = unit(in: rect)
+        let length = strandLength(unit: unit)
+        let width = strandWidth(unit: unit)
+        // Built at the origin once and transformed into place: six copies of
+        // ONE shape is the logo's actual construction, and building it that way
+        // makes the six-fold symmetry structural rather than arithmetic that
+        // could drift.
+        let strand = Path(
+            roundedRect: CGRect(x: -length / 2, y: -width / 2, width: length, height: width),
+            cornerRadius: width / 2,
+            style: .circular
+        )
         var path = Path()
-        for index in 0..<max(arcs, 1) {
-            let middle = step * CGFloat(index)
-            let start = Angle(degrees: Double(middle - sweep / 2))
-            let end = Angle(degrees: Double(middle + sweep / 2))
-            path.move(to: CGPoint(
-                x: center.x + cos(CGFloat(start.radians)) * r,
-                y: center.y + sin(CGFloat(start.radians)) * r
-            ))
-            path.addArc(center: center, radius: r, startAngle: start, endAngle: end, clockwise: false)
+        for (index, center) in strandCenters(in: rect).enumerated() {
+            let orbitAngle = (2 * .pi / CGFloat(strandCount)) * CGFloat(index)
+            let axis = orbitAngle + .pi / 2 - CGFloat(skew.radians)
+            path.addPath(
+                strand,
+                transform: CGAffineTransform(translationX: center.x, y: center.y).rotated(by: axis)
+            )
         }
         return path
     }
+}
+
+private struct QuietOpenAIKnotMark: Shape {
+    func path(in rect: CGRect) -> Path { QuietOpenAIKnot.path(in: rect) }
 }
 
 /// A row's title when the raw title carries nothing the project name has not

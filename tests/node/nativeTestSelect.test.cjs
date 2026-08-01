@@ -54,6 +54,24 @@ test('extracted workspace rail stays on the narrow workspace contract', () => {
   assert.equal(plan.node.mode, 'none')
 })
 
+test('extracted preview units retain the complete preview contract lane', () => {
+  const plan = selector.planForChanges([
+    'native/KaisolaMac/Kaisola/Features/Workspace/FilePreviewContent.swift',
+    'native/KaisolaMac/Kaisola/Features/Workspace/FilePreviewEditors.swift',
+    'native/KaisolaMac/Kaisola/Features/Workspace/FilePreviewRecovery.swift',
+    'native/KaisolaMac/Kaisola/Features/Workspace/FilePreviewTabs.swift',
+    'native/KaisolaMac/Kaisola/Features/Workspace/MarkdownAssets.swift',
+    'native/KaisolaMac/Kaisola/Features/Workspace/MarkdownPreview.swift',
+  ], inventory)
+
+  assert.equal(plan.native.mode, 'focused')
+  assert.deepEqual(plan.native.selectors, [
+    'DataPreviewsTests', 'SyntaxHighlighterTests', 'WorkspaceFilesTests',
+  ])
+  assert.equal(plan.node.mode, 'none')
+  assert.equal(plan.fallback, false)
+})
+
 test('broker and shared wire changes expand to the reproducible contract lane', () => {
   const plan = selector.planForChanges([
     'runtime/node-broker/ipc/brokerWire.cjs',

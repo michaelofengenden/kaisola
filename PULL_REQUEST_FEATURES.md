@@ -245,7 +245,9 @@ the remaining large-document architecture. Rendered Markdown links now fail
 closed to explicit http(s) destinations or symlink-confined project files, and
 navigation flushes the latest Markdown draft before switching documents.
 Recovery, conflict, and failure feedback now retain typed severity in a
-dismissible accessible notice row instead of sharing a red header label.
+dismissible accessible notice row instead of sharing a red header label. The
+former 6,600-line preview monolith is now partitioned into content policy,
+recovery, tabs, editors, Markdown rendering, and asset-loading units.
 
 Scope:
 
@@ -253,8 +255,6 @@ Scope:
   viewport position and providing native Find without entering edit mode.
 - Parse CSV, JSON, and HTML readiness once per content/mtime and cache those
   results off the main thread.
-- Split the preview monolith into recovery, tabs, editors, Markdown, assets, and
-  content-preview units with typed notice/error channels.
 
 Acceptance:
 

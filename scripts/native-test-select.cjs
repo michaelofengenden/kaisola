@@ -58,6 +58,10 @@ const NATIVE_DIRECTORY_TESTS = Object.freeze([
   ]],
 ])
 
+const FILE_PREVIEW_TESTS = Object.freeze([
+  'DataPreviewsTests', 'SyntaxHighlighterTests', 'WorkspaceFilesTests',
+])
+
 const NATIVE_FILE_TESTS = Object.freeze(new Map([
   ['native/KaisolaMac/Kaisola/App/AppModel.swift', [
     'AppModelBrokerFallbackTests', 'AppModelProjectContextTests',
@@ -75,9 +79,13 @@ const NATIVE_FILE_TESTS = Object.freeze(new Map([
   ['native/KaisolaMac/Kaisola/Features/Workspace/BrowserCardView.swift', [
     'AppModelProjectContextTests', 'LocalhostDetectorTests',
   ]],
-  ['native/KaisolaMac/Kaisola/Features/Workspace/FilePreviewView.swift', [
-    'DataPreviewsTests', 'SyntaxHighlighterTests', 'WorkspaceFilesTests',
-  ]],
+  ['native/KaisolaMac/Kaisola/Features/Workspace/FilePreviewContent.swift', FILE_PREVIEW_TESTS],
+  ['native/KaisolaMac/Kaisola/Features/Workspace/FilePreviewEditors.swift', FILE_PREVIEW_TESTS],
+  ['native/KaisolaMac/Kaisola/Features/Workspace/FilePreviewRecovery.swift', FILE_PREVIEW_TESTS],
+  ['native/KaisolaMac/Kaisola/Features/Workspace/FilePreviewTabs.swift', FILE_PREVIEW_TESTS],
+  ['native/KaisolaMac/Kaisola/Features/Workspace/FilePreviewView.swift', FILE_PREVIEW_TESTS],
+  ['native/KaisolaMac/Kaisola/Features/Workspace/MarkdownAssets.swift', FILE_PREVIEW_TESTS],
+  ['native/KaisolaMac/Kaisola/Features/Workspace/MarkdownPreview.swift', FILE_PREVIEW_TESTS],
   ['native/KaisolaMac/Kaisola/Features/Workspace/FileTreeModel.swift', [
     'WorkspaceFilesTests', 'WorkspaceWatcherTests',
   ]],

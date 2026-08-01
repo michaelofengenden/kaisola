@@ -39,14 +39,16 @@ Large product and architecture work remains ordered in
 - Preview recovery now uses a dismissible typed notice row: an ordinary restored
   draft is informational, a restored draft with a disk change is a warning, and
   editor, recovery, or save failures remain errors with accessible labels.
+- Preview ownership is split into bounded content-policy, recovery, tab,
+  editor, Markdown-rendering, and asset-loading units; the changed-file runner
+  maps every extracted source back to the complete preview contract lane.
 
 ## Open audit fixes
 
 ### Preview correctness and interaction performance
 
-- Split the preview monolith into bounded content units and keep installed-build
-  performance gates for 1 MiB text, large structured data, PDFs, and image-heavy
-  Markdown.
+- Keep installed-build performance gates for 1 MiB text, large structured data,
+  PDFs, and image-heavy Markdown.
 
 ### Terminal parity and failure feedback
 

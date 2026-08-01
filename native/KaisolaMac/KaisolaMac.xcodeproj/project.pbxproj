@@ -22,6 +22,12 @@
 		104445F9A7ECA376AB39CC53 /* SwiftTermStressTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4C1E742D2099046E14888F80 /* SwiftTermStressTests.swift */; };
 		111953CC1CF47CB697278109 /* TerminalTranscriptView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 172FA557F42248FF6A752716 /* TerminalTranscriptView.swift */; };
 		1155D48BA0F2FA048D963A3E /* FilePreviewView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 502B709E629F1098130633B7 /* FilePreviewView.swift */; };
+		A10000000000000000000002 /* FilePreviewContent.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000001 /* FilePreviewContent.swift */; };
+		A10000000000000000000004 /* FilePreviewRecovery.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000003 /* FilePreviewRecovery.swift */; };
+		A10000000000000000000006 /* FilePreviewTabs.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000005 /* FilePreviewTabs.swift */; };
+		A10000000000000000000008 /* MarkdownAssets.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000007 /* MarkdownAssets.swift */; };
+		A1000000000000000000000A /* FilePreviewEditors.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000009 /* FilePreviewEditors.swift */; };
+		A1000000000000000000000C /* MarkdownPreview.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1000000000000000000000B /* MarkdownPreview.swift */; };
 		120DB3BB674B60C5B51F0F44 /* AppAccountView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5F2770649BEF99AA932FFBDF /* AppAccountView.swift */; };
 		12EAB0BC4C613FF5DF4FF4FF /* McpConfigStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = FDE152F4457B8AF7E5A92225 /* McpConfigStore.swift */; };
 		137B0B37E2B58DE72AC839A2 /* QuietIdentityMarkTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = DCA7D7BB9E3FF610CA333A17 /* QuietIdentityMarkTests.swift */; };
@@ -323,6 +329,12 @@
 		4C1E742D2099046E14888F80 /* SwiftTermStressTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SwiftTermStressTests.swift; sourceTree = "<group>"; };
 		4E6225F81B83882F5395725D /* WorkspaceRestorationNoticeView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WorkspaceRestorationNoticeView.swift; sourceTree = "<group>"; };
 		502B709E629F1098130633B7 /* FilePreviewView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FilePreviewView.swift; sourceTree = "<group>"; };
+		A10000000000000000000001 /* FilePreviewContent.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FilePreviewContent.swift; sourceTree = "<group>"; };
+		A10000000000000000000003 /* FilePreviewRecovery.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FilePreviewRecovery.swift; sourceTree = "<group>"; };
+		A10000000000000000000005 /* FilePreviewTabs.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FilePreviewTabs.swift; sourceTree = "<group>"; };
+		A10000000000000000000007 /* MarkdownAssets.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MarkdownAssets.swift; sourceTree = "<group>"; };
+		A10000000000000000000009 /* FilePreviewEditors.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FilePreviewEditors.swift; sourceTree = "<group>"; };
+		A1000000000000000000000B /* MarkdownPreview.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MarkdownPreview.swift; sourceTree = "<group>"; };
 		5245B06FDE5E37D212A59E72 /* NativeUpdateController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NativeUpdateController.swift; sourceTree = "<group>"; };
 		53455843EE4C394EEF0158BC /* MeshSessionTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MeshSessionTests.swift; sourceTree = "<group>"; };
 		53F710A393B9F0B30F9D2F91 /* CompanionProjectionBuilderTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CompanionProjectionBuilderTests.swift; sourceTree = "<group>"; };
@@ -546,11 +558,17 @@
 			children = (
 				3D651B2D78C5F94B243E1DC2 /* BrowserCardView.swift */,
 				681E5B3C599B2137041A4E8F /* DataPreviews.swift */,
+				A10000000000000000000001 /* FilePreviewContent.swift */,
+				A10000000000000000000009 /* FilePreviewEditors.swift */,
+				A10000000000000000000003 /* FilePreviewRecovery.swift */,
+				A10000000000000000000005 /* FilePreviewTabs.swift */,
 				502B709E629F1098130633B7 /* FilePreviewView.swift */,
 				CEA4E3B7B25D187C019B2CC9 /* FileTreeModel.swift */,
 				995477C896372B075A7640B8 /* QuickActionsBar.swift */,
 				6D76F5FBB1B68291847A102F /* QuickActionStore.swift */,
 				BA44B5608FF424D5A4173716 /* SyntaxHighlighter.swift */,
+				A10000000000000000000007 /* MarkdownAssets.swift */,
+				A1000000000000000000000B /* MarkdownPreview.swift */,
 				2709FF5202ACBC7BD9696C64 /* WorkspaceRailView.swift */,
 				7FB737D5C0A6E0BA42FFC65E /* WorkspaceWatcher.swift */,
 			);
@@ -1097,8 +1115,14 @@
 				F4C6C5462997C4F025270D7D /* CustomAgentStore.swift in Sources */,
 				5760827CF9F4168466291A60 /* CustomAgentsSection.swift in Sources */,
 				F369C66C4AB127DBFD4B5773 /* DataPreviews.swift in Sources */,
+				A10000000000000000000002 /* FilePreviewContent.swift in Sources */,
+				A1000000000000000000000A /* FilePreviewEditors.swift in Sources */,
+				A10000000000000000000004 /* FilePreviewRecovery.swift in Sources */,
+				A10000000000000000000006 /* FilePreviewTabs.swift in Sources */,
 				1155D48BA0F2FA048D963A3E /* FilePreviewView.swift in Sources */,
 				C19C7088849EC2E91A9EB2B2 /* FileTreeModel.swift in Sources */,
+				A10000000000000000000008 /* MarkdownAssets.swift in Sources */,
+				A1000000000000000000000C /* MarkdownPreview.swift in Sources */,
 				445F0B98BA9637A2980CFB1A /* FirebaseAuthBackend.swift in Sources */,
 				DC00CE55888A4B1629DF4C86 /* FuzzyMatch.swift in Sources */,
 				B2D635093462209867718C25 /* GitDirectoryWatcher.swift in Sources */,

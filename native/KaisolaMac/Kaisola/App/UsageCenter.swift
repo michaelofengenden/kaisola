@@ -138,7 +138,7 @@ struct SessionAccountBinding: Codable, Equatable, Hashable, Sendable {
     }
 }
 
-/// Small private registry used by both Agents settings and the Usage reader.
+/// Small private registry used by both Accounts settings and the Usage reader.
 /// It deliberately stores no OAuth/API material; provider CLIs continue to own
 /// authentication in their isolated config directories.
 struct UsageAccountStore: Sendable {

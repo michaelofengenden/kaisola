@@ -54,6 +54,24 @@ test('extracted workspace rail stays on the narrow workspace contract', () => {
   assert.equal(plan.node.mode, 'none')
 })
 
+test('settings surfaces stay on their bounded account and configuration contracts', () => {
+  const plan = selector.planForChanges([
+    'native/KaisolaMac/Kaisola/Features/Settings/ApiKeysSettingsTab.swift',
+    'native/KaisolaMac/Kaisola/Features/Settings/ProjectAccountsSection.swift',
+    'native/KaisolaMac/Kaisola/Features/Settings/SettingsView.swift',
+  ], inventory)
+
+  assert.equal(plan.native.mode, 'focused')
+  assert.deepEqual(plan.native.selectors, [
+    'ApiKeyStoreTests', 'AppModelProjectContextTests',
+    'CompanionConnectionSessionTests', 'McpConfigStoreTests',
+    'NativePreviewSettingsTests', 'NativeUpdateConfigurationTests',
+    'NotificationBridgeTests', 'UsageCenterTests',
+  ])
+  assert.equal(plan.node.mode, 'none')
+  assert.equal(plan.fallback, false)
+})
+
 test('extracted preview units retain the complete preview contract lane', () => {
   const plan = selector.planForChanges([
     'native/KaisolaMac/Kaisola/Features/Workspace/FilePreviewContent.swift',

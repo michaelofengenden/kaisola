@@ -128,4 +128,138 @@ final class ApiKeyStoreTests: XCTestCase {
             "API keys normally do not contain spaces or line breaks."
         )
     }
+
+    func testOpenAIProbeUsesNoPromptModelsEndpointAndBearerAuthentication() async throws {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [ApiKeyProbeURLProtocol.self]
+        ApiKeyProbeURLProtocol.handler = { request in
+            XCTAssertEqual(request.httpMethod, "GET")
+            XCTAssertEqual(request.url?.absoluteString, "https://api.openai.com/v1/models")
+            XCTAssertEqual(request.value(forHTTPHeaderField: "Authorization"), "Bearer sk-test-openai")
+            XCTAssertNil(request.value(forHTTPHeaderField: "x-api-key"))
+            XCTAssertNil(request.httpBody, "a credential check must never send a prompt body")
+            return (
+                HTTPURLResponse(
+                    url: try XCTUnwrap(request.url),
+                    statusCode: 200,
+                    httpVersion: "HTTP/1.1",
+                    headerFields: ["Content-Type": "application/json"]
+                )!,
+                Data(#"{"object":"list","data":[{"id":"fixture"}]}"#.utf8)
+            )
+        }
+        defer { ApiKeyProbeURLProtocol.handler = nil }
+        let service = ApiKeyProbeService(session: URLSession(configuration: configuration))
+
+        let result = await service.probe(
+            key: .openai,
+            value: "sk-test-openai",
+            configuredBaseURL: ""
+        )
+
+        XCTAssertEqual(result, .init(status: .ready, message: "Verified with OpenAI."))
+    }
+
+    func testAnthropicProbeUsesVersionedBoundedModelsRequest() async throws {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [ApiKeyProbeURLProtocol.self]
+        ApiKeyProbeURLProtocol.handler = { request in
+            XCTAssertEqual(
+                request.url?.absoluteString,
+                "https://gateway.example.test/v1/models?limit=1"
+            )
+            XCTAssertEqual(request.value(forHTTPHeaderField: "x-api-key"), "sk-ant-test")
+            XCTAssertEqual(request.value(forHTTPHeaderField: "anthropic-version"), "2023-06-01")
+            XCTAssertNil(request.value(forHTTPHeaderField: "Authorization"))
+            return (
+                HTTPURLResponse(
+                    url: try XCTUnwrap(request.url),
+                    statusCode: 200,
+                    httpVersion: "HTTP/1.1",
+                    headerFields: ["Content-Type": "application/json"]
+                )!,
+                Data(#"{"data":[{"id":"claude-fixture","type":"model"}],"has_more":false}"#.utf8)
+            )
+        }
+        defer { ApiKeyProbeURLProtocol.handler = nil }
+        let service = ApiKeyProbeService(session: URLSession(configuration: configuration))
+
+        let result = await service.probe(
+            key: .anthropic,
+            value: "sk-ant-test",
+            configuredBaseURL: "https://gateway.example.test/v1/"
+        )
+
+        XCTAssertEqual(result, .init(status: .ready, message: "Verified with Anthropic."))
+    }
+
+    func testRejectedKeyDoesNotEchoProviderBodyOrCredential() async throws {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [ApiKeyProbeURLProtocol.self]
+        ApiKeyProbeURLProtocol.handler = { request in
+            (
+                HTTPURLResponse(
+                    url: try XCTUnwrap(request.url),
+                    statusCode: 401,
+                    httpVersion: "HTTP/1.1",
+                    headerFields: ["Content-Type": "application/json"]
+                )!,
+                Data(#"{"error":{"message":"secret-bearing upstream diagnostic"}}"#.utf8)
+            )
+        }
+        defer { ApiKeyProbeURLProtocol.handler = nil }
+        let service = ApiKeyProbeService(session: URLSession(configuration: configuration))
+
+        let result = await service.probe(
+            key: .openai,
+            value: "sk-never-echo-this",
+            configuredBaseURL: ""
+        )
+
+        XCTAssertEqual(result.status, .rejected)
+        XCTAssertEqual(result.message, "OpenAI rejected this API key.")
+        XCTAssertFalse(result.message.contains("secret-bearing"))
+        XCTAssertFalse(result.message.contains("sk-never"))
+    }
+
+    func testInvalidCustomBaseURLFailsBeforeNetwork() async {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [ApiKeyProbeURLProtocol.self]
+        ApiKeyProbeURLProtocol.handler = { _ in
+            XCTFail("an invalid route must fail before opening a connection")
+            throw URLError(.badURL)
+        }
+        defer { ApiKeyProbeURLProtocol.handler = nil }
+        let service = ApiKeyProbeService(session: URLSession(configuration: configuration))
+
+        let result = await service.probe(
+            key: .anthropic,
+            value: "sk-ant-test",
+            configuredBaseURL: "http://remote.example.test"
+        )
+
+        XCTAssertEqual(result.status, .failed)
+        XCTAssertEqual(result.message, "Fix the provider Base URL before testing.")
+    }
+}
+
+private final class ApiKeyProbeURLProtocol: URLProtocol, @unchecked Sendable {
+    nonisolated(unsafe) static var handler: ((URLRequest) throws -> (HTTPURLResponse, Data))?
+
+    override class func canInit(with request: URLRequest) -> Bool { true }
+    override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
+
+    override func startLoading() {
+        do {
+            guard let handler = Self.handler else { throw URLError(.resourceUnavailable) }
+            let (response, data) = try handler(request)
+            client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+            client?.urlProtocol(self, didLoad: data)
+            client?.urlProtocolDidFinishLoading(self)
+        } catch {
+            client?.urlProtocol(self, didFailWithError: error)
+        }
+    }
+
+    override func stopLoading() {}
 }

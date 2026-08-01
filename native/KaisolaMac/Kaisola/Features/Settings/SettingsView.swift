@@ -203,6 +203,7 @@ struct SettingsView: View {
         case .companion: CompanionSettingsTab()
         case .guardrails: guardrails.scrollContentBackground(.hidden)
         case .mcp: McpSettingsTab(workspace: workspace).scrollContentBackground(.hidden)
+        case .accounts: accounts.scrollContentBackground(.hidden)
         case .agents: agents.scrollContentBackground(.hidden)
         case .models: ApiKeysSettingsTab(settings: settings).scrollContentBackground(.hidden)
         case .usage: UsageSettingsTab(workspace: workspace).scrollContentBackground(.hidden)
@@ -573,12 +574,12 @@ struct SettingsView: View {
         NSWorkspace.shared.open(url)
     }
 
-    private var agents: some View {
+    private var accounts: some View {
         Form {
-            Section("Account Isolation") {
+            Section("App Account Defaults") {
                 TextField("CLAUDE_CONFIG_DIR", text: $settings.claudeConfigDir, prompt: Text("CLI default"))
                 TextField("CODEX_HOME", text: $settings.codexHome, prompt: Text("CLI default"))
-                Text("Applied to new agent terminals and chats; leave blank to use each CLI's own login.")
+                Text("Applied to new Claude and Codex sessions; leave blank to use each CLI's own sign-in.")
                     .font(.caption).foregroundStyle(.secondary)
             }
             ProjectAccountsSection(
@@ -595,6 +596,13 @@ struct SettingsView: View {
                 }
                 .listRowInsets(EdgeInsets())
             }
+        }
+        .formStyle(.grouped)
+        .padding(6)
+    }
+
+    private var agents: some View {
+        Form {
             CustomAgentsSection()
             Section("ACP Adapters") {
                 ForEach(AgentRegistry.all) { agent in
@@ -618,7 +626,7 @@ struct SettingsView: View {
 }
 
 private enum SettingsSection: String, CaseIterable, Identifiable {
-    case general, terminal, companion, guardrails, mcp, agents, models, usage
+    case general, terminal, companion, guardrails, mcp, accounts, agents, models, usage
     var id: String { rawValue }
     var title: String {
         switch self {
@@ -627,6 +635,7 @@ private enum SettingsSection: String, CaseIterable, Identifiable {
         case .companion: "Companion"
         case .guardrails: "Guardrails"
         case .mcp: "MCP"
+        case .accounts: "Accounts"
         case .agents: "Agents"
         case .models: "Models & Keys"
         case .usage: "Usage"
@@ -639,7 +648,8 @@ private enum SettingsSection: String, CaseIterable, Identifiable {
         case .companion: "Pair nearby devices and stay connected anywhere"
         case .guardrails: "Standing rules and sensitive files"
         case .mcp: "Project tool servers"
-        case .agents: "CLI accounts, adapters, and custom agents"
+        case .accounts: "Sign-ins, named accounts, and project overrides"
+        case .agents: "Custom agents and ACP adapters"
         case .models: "Provider credentials, models, and routing"
         case .usage: "Provider limits and live context"
         }
@@ -651,6 +661,7 @@ private enum SettingsSection: String, CaseIterable, Identifiable {
         case .companion: "iphone.and.arrow.forward"
         case .guardrails: "shield.lefthalf.filled"
         case .mcp: "puzzlepiece.extension"
+        case .accounts: "person.crop.circle"
         case .agents: "sparkles"
         case .models: "key"
         case .usage: "gauge.with.dots.needle.bottom.50percent"

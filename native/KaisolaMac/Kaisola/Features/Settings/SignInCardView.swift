@@ -9,7 +9,7 @@ extension Notification.Name {
     static let kaisolaRunInTerminal = Notification.Name("kaisolaRunInTerminal")
 }
 
-/// Settings ▸ Agents card explaining first-run CLI sign-in. Kaisola drives the
+/// Settings ▸ Accounts card explaining first-run CLI sign-in. Kaisola drives the
 /// user's installed Claude / Codex CLIs, which authenticate themselves (device
 /// code + browser), so the app can't sign in on their behalf — it can only open
 /// a terminal and run the CLI's own login command. This card is pure UI: each

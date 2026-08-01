@@ -15,7 +15,7 @@ import Security
 struct ApiKeyStore {
     /// A named secret. The raw value is the environment variable the agent
     /// process expects, and also the Keychain account under the shared service.
-    enum Key: String, CaseIterable {
+    enum Key: String, CaseIterable, Sendable {
         case anthropic = "ANTHROPIC_API_KEY"
         case openai = "OPENAI_API_KEY"
 

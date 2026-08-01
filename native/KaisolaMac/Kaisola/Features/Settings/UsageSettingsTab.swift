@@ -75,7 +75,7 @@ struct UsageSettingsTab: View {
                             .foregroundStyle(.secondary)
                     } else {
                         Label(
-                            "Add a Claude or Codex account in Agents settings to see its plan and limits here.",
+                            "Add a Claude or Codex account in Accounts settings to see its plan and limits here.",
                             systemImage: "person.2"
                         )
                         .font(.caption)

@@ -1,6 +1,6 @@
 import SwiftUI
 
-/// Settings ▸ Agents section that pins a per-project Claude/Codex account on top
+/// Settings ▸ Accounts section that pins a per-project Claude/Codex account on top
 /// of the app-wide one. Overrides are project-scoped, so a nil `projectID` (no
 /// active project) has nowhere to store them — the section shows a hint instead
 /// of the editor, mirroring `McpSettingsTab`. Electron parity: per-project

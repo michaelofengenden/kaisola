@@ -1108,7 +1108,7 @@ final class KaisolaMacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDele
             model.selectedProjectName = legacyInitialProjectName
         }
         let content: AnyView
-        if visualFixture, ["settings", "settings-terminal", "settings-terminal-history", "settings-terminal-interaction", "settings-companion", "settings-mcp", "settings-models", "settings-account-recovery", "usage"].contains(visualSurface) {
+        if visualFixture, ["settings", "settings-terminal", "settings-terminal-history", "settings-terminal-interaction", "settings-companion", "settings-mcp", "settings-accounts", "settings-models", "settings-account-recovery", "usage"].contains(visualSurface) {
             let workspace = URL(
                 fileURLWithPath: visualWorkspace ?? FileManager.default.currentDirectoryPath,
                 isDirectory: true
@@ -1124,6 +1124,7 @@ final class KaisolaMacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDele
             case "settings-terminal", "settings-terminal-history", "settings-terminal-interaction": initialSectionID = "terminal"
             case "settings-companion": initialSectionID = "companion"
             case "settings-mcp": initialSectionID = "mcp"
+            case "settings-accounts": initialSectionID = "accounts"
             case "settings-models": initialSectionID = "models"
             default: initialSectionID = nil
             }
@@ -1150,7 +1151,7 @@ final class KaisolaMacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDele
         }
 
         let visualSettings = visualFixture
-            && ["settings", "settings-terminal", "settings-terminal-history", "settings-terminal-interaction", "settings-companion", "settings-mcp", "settings-models", "settings-account-recovery", "usage"].contains(visualSurface)
+            && ["settings", "settings-terminal", "settings-terminal-history", "settings-terminal-interaction", "settings-companion", "settings-mcp", "settings-accounts", "settings-models", "settings-account-recovery", "usage"].contains(visualSurface)
 
         let window = NSWindow(
             contentRect: NSRect(

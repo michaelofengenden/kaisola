@@ -67,6 +67,10 @@ Large product and architecture work remains ordered in
 - ACP follow-up queues now persist in exact FIFO order. A fresh adapter resumes
   only never-dispatched entries after Restart; the interrupted prompt remains a
   visible explicit Retry so ambiguous delivery cannot duplicate side effects.
+- Settings now gives sign-ins, named accounts, app defaults, and per-project
+  overrides one Accounts tab. Saved or newly pasted direct-API keys can be
+  verified through a bounded, no-prompt provider request that refuses redirects
+  and never displays the credential or an upstream response body.
 
 ## Open audit fixes
 
@@ -89,9 +93,6 @@ Large product and architecture work remains ordered in
 - Finish Title Case and project terminology, remove background-service jargon
   from user surfaces, align menu/palette shortcuts, and replace developer Help
   and feature-marketing onboarding with operational guidance.
-- Add a real provider API-key connectivity probe and complete the Accounts
-  information architecture.
-
 ## Adding a fix
 
 Each confirmed fix should include:

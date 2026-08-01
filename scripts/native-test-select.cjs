@@ -43,6 +43,12 @@ const NATIVE_DIRECTORY_TESTS = Object.freeze([
   ['native/KaisolaMac/Kaisola/Features/Palette/', [
     'FuzzyMatchTests', 'OmniBarDispatchTests',
   ]],
+  ['native/KaisolaMac/Kaisola/Features/Settings/', [
+    'ApiKeyStoreTests', 'AppModelProjectContextTests',
+    'CompanionConnectionSessionTests', 'McpConfigStoreTests',
+    'NativePreviewSettingsTests', 'NativeUpdateConfigurationTests',
+    'NotificationBridgeTests', 'UsageCenterTests',
+  ]],
   ['native/KaisolaMac/Kaisola/Features/Sessions/', [
     'NativeTerminalInteractionTests', 'SessionPaneLayoutTests',
     'TerminalDocumentTests', 'TerminalLinkRoutingTests', 'TerminalScrollPinTests',

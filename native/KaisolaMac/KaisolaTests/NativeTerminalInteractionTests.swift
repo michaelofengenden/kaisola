@@ -966,6 +966,87 @@ final class NativeTerminalInteractionTests: XCTestCase {
         XCTAssertTrue(value?.hasSuffix("tail-marker") ?? false)
     }
 
+    func testTerminalAccessibilityAnnouncementPolicyHandlesAppendScrollAndRepaint() {
+        XCTAssertEqual(TerminalAccessibilityAnnouncementPolicy.throttleInterval, 0.8)
+        XCTAssertEqual(
+            TerminalAccessibilityAnnouncementPolicy.announcement(
+                previous: "prompt\nfirst",
+                current: "prompt\nfirst\nsecond"
+            ),
+            "second"
+        )
+        XCTAssertEqual(
+            TerminalAccessibilityAnnouncementPolicy.announcement(
+                previous: "one\ntwo\nthree",
+                current: "two\nthree\nfour"
+            ),
+            "four"
+        )
+        XCTAssertEqual(
+            TerminalAccessibilityAnnouncementPolicy.announcement(
+                previous: "Working 10%",
+                current: "Working 20%"
+            ),
+            "Working 20%"
+        )
+        let bounded = TerminalAccessibilityAnnouncementPolicy.announcement(
+            previous: "",
+            current: String(repeating: "x", count: 900)
+        )
+        XCTAssertEqual(bounded?.count, TerminalAccessibilityAnnouncementPolicy.maximumCharacters)
+    }
+
+    func testTerminalOutputAnnouncementsThrottleAndNeverSpeakBackgroundBacklog() throws {
+        let window = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 400, height: 300),
+            styleMask: [.titled],
+            backing: .buffered,
+            defer: false
+        )
+        window.isReleasedWhenClosed = false
+        defer { window.close() }
+        let root = NSView(frame: window.contentView?.bounds ?? .zero)
+        window.contentView = root
+        let view = ReadOnlyTerminalView(
+            frame: root.bounds,
+            font: NSFont.monospacedSystemFont(ofSize: 13, weight: .regular)
+        )
+        root.addSubview(view)
+        XCTAssertTrue(window.makeFirstResponder(view))
+
+        var announcements: [String] = []
+        view.accessibilityAnnouncementVoiceOverEnabled = { true }
+        view.accessibilityAnnouncementPoster = { announcements.append($0) }
+        view.updateAccessibilityValue(from: "ready")
+        view.seedAccessibilityAnnouncementBaseline()
+
+        view.updateAccessibilityValue(from: "ready\none")
+        view.noteLiveOutputForAccessibility()
+        view.updateAccessibilityValue(from: "ready\none\ntwo")
+        view.noteLiveOutputForAccessibility()
+
+        XCTAssertTrue(view.accessibilityAnnouncementIsScheduled)
+        XCTAssertEqual(view.accessibilityAnnouncementScheduleCount, 1)
+        view.deliverAccessibilityAnnouncementNow()
+        XCTAssertEqual(announcements, ["one\ntwo"])
+
+        let backgroundControl = NSButton(title: "Background", target: nil, action: nil)
+        root.addSubview(backgroundControl)
+        XCTAssertTrue(window.makeFirstResponder(backgroundControl))
+        view.updateAccessibilityValue(from: "ready\none\ntwo\nbackground backlog")
+        view.noteLiveOutputForAccessibility()
+        XCTAssertFalse(view.accessibilityAnnouncementIsScheduled)
+
+        XCTAssertTrue(window.makeFirstResponder(view))
+        view.updateAccessibilityValue(from: "ready\none\ntwo\nbackground backlog\nresume baseline")
+        view.noteLiveOutputForAccessibility()
+        XCTAssertFalse(view.accessibilityAnnouncementIsScheduled)
+        view.updateAccessibilityValue(from: "ready\none\ntwo\nbackground backlog\nresume baseline\nlive")
+        view.noteLiveOutputForAccessibility()
+        view.deliverAccessibilityAnnouncementNow()
+        XCTAssertEqual(announcements, ["one\ntwo", "live"])
+    }
+
     // First-responder claims cannot be asserted end to end on a headless CI
     // runner (windows never become key), so the decision is a pure function:
     // claim focus only from the window or its bare content view, and never

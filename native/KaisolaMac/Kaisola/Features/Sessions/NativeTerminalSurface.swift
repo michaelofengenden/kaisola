@@ -483,7 +483,7 @@ struct NativeTerminalSurface: NSViewRepresentable {
             surfaceDelta: TerminalSurfaceDelta? = nil,
             to view: ReadOnlyTerminalView
         ) {
-            defer { view.updateAccessibilityValue(from: scrollback) }
+            view.updateAccessibilityValue(from: scrollback)
             if isProgressivelyReplaying {
                 queuedPagedDuringProgressiveReplay = (
                     scrollback,
@@ -588,7 +588,7 @@ struct NativeTerminalSurface: NSViewRepresentable {
             surfaceDelta: TerminalSurfaceDelta? = nil,
             to view: ReadOnlyTerminalView
         ) {
-            defer { view.updateAccessibilityValue(from: output) }
+            view.updateAccessibilityValue(from: output)
             if isProgressivelyReplaying {
                 // Preserve only the newest immutable broker frame. Once the
                 // historical replay finishes, ordinary offset reconciliation
@@ -905,6 +905,11 @@ struct NativeTerminalSurface: NSViewRepresentable {
             } else {
                 view.updateSemanticDecorations()
             }
+            if suppressReplies {
+                if scrollAfter { view.seedAccessibilityAnnouncementBaseline() }
+            } else {
+                view.noteLiveOutputForAccessibility()
+            }
         }
 
         /// Byte-exact variant of `feed`, used by incremental reconciliation so a
@@ -933,6 +938,11 @@ struct NativeTerminalSurface: NSViewRepresentable {
                 view.scrollToLiveBottom()
             } else {
                 view.updateSemanticDecorations()
+            }
+            if suppressReplies {
+                if scrollAfter { view.seedAccessibilityAnnouncementBaseline() }
+            } else {
+                view.noteLiveOutputForAccessibility()
             }
         }
 
@@ -1730,6 +1740,72 @@ struct TerminalSemanticTracker: Equatable, Sendable {
     }
 }
 
+/// Converts two already-rendered terminal viewport snapshots into one bounded
+/// VoiceOver utterance. The renderer has already interpreted ANSI/OSC/DCS, so
+/// this policy never exposes the raw PTY stream. Line overlap handles the
+/// ordinary scrolling case; a cursor-addressed repaint speaks only its newest
+/// readable line instead of the whole viewport.
+enum TerminalAccessibilityAnnouncementPolicy {
+    static let throttleInterval: TimeInterval = 0.8
+    static let maximumCharacters = 600
+
+    static func announcement(previous: String, current: String) -> String? {
+        let previous = normalizedSnapshot(previous)
+        let current = normalizedSnapshot(current)
+        guard !current.isEmpty, current != previous else { return nil }
+
+        let candidate: String
+        if current.hasPrefix(previous) {
+            candidate = String(current.dropFirst(previous.count))
+        } else {
+            let oldLines = previous.split(separator: "\n", omittingEmptySubsequences: false)
+            let newLines = current.split(separator: "\n", omittingEmptySubsequences: false)
+            var overlap = min(oldLines.count, newLines.count)
+            while overlap > 0,
+                  !oldLines.suffix(overlap).elementsEqual(newLines.prefix(overlap)) {
+                overlap -= 1
+            }
+            if overlap > 0, overlap < newLines.count {
+                candidate = newLines.dropFirst(overlap).joined(separator: "\n")
+            } else {
+                candidate = newLines.last(where: {
+                    !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                }).map(String.init) ?? current
+            }
+        }
+
+        let readable = readableText(candidate)
+        guard !readable.isEmpty else { return nil }
+        return String(readable.suffix(maximumCharacters))
+    }
+
+    private static func normalizedSnapshot(_ input: String) -> String {
+        var lines = input
+            .replacingOccurrences(of: "\r\n", with: "\n")
+            .replacingOccurrences(of: "\r", with: "\n")
+            .split(separator: "\n", omittingEmptySubsequences: false)
+            .map { String($0).trimmingCharacters(in: .whitespaces) }
+        while lines.first?.isEmpty == true { lines.removeFirst() }
+        while lines.last?.isEmpty == true { lines.removeLast() }
+        return lines.joined(separator: "\n")
+    }
+
+    private static func readableText(_ input: String) -> String {
+        var scalars = String.UnicodeScalarView()
+        for scalar in input.unicodeScalars {
+            switch scalar.value {
+            case 0x09, 0x0A:
+                scalars.append(scalar)
+            case 0x20...0x7E, 0xA0...0x10FFFF:
+                scalars.append(scalar)
+            default:
+                continue
+            }
+        }
+        return String(scalars).trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+}
+
 /// Drops both physical-key input and terminal-generated query replies. SwiftTerm
 /// still provides native selection, copy, and Command-F search, but no byte can
 /// flow from this view back to a PTY. The view claims keyboard focus when it
@@ -1744,6 +1820,14 @@ class ReadOnlyTerminalView: TerminalView {
     // Copy-on-write reference updated per stream apply in O(1); the bounded
     // tail is materialized only when accessibility actually asks for it.
     private var accessibilitySource: String = ""
+    private var accessibilityAnnouncementBaseline = ""
+    private var accessibilityAnnouncementNeedsBaseline = true
+    private(set) var accessibilityAnnouncementIsScheduled = false
+    private(set) var accessibilityAnnouncementScheduleCount = 0
+    var accessibilityAnnouncementVoiceOverEnabled: () -> Bool = {
+        NSWorkspace.shared.isVoiceOverEnabled
+    }
+    var accessibilityAnnouncementPoster: ((String) -> Void)?
     private(set) var semanticTracker = TerminalSemanticTracker()
     private var semanticHandlerInstalled = false
     private var semanticGridColumns: Int?
@@ -2225,6 +2309,94 @@ class ReadOnlyTerminalView: TerminalView {
         )
     }
 
+    /// Historical reconstruction is deliberately silent. Capture its final
+    /// rendered viewport as the comparison baseline so the first live packet
+    /// cannot make VoiceOver recite retained output from before the pane opened.
+    func seedAccessibilityAnnouncementBaseline() {
+        cancelAccessibilityAnnouncement()
+        accessibilityAnnouncementBaseline = accessibilityTextSnapshot()
+        accessibilityAnnouncementNeedsBaseline = false
+    }
+
+    /// A live feed only marks work pending. Snapshotting and diffing wait for
+    /// the throttle boundary, so token-by-token output never scans the viewport
+    /// token by token. Only the AppKit-focused pane may speak; background panes
+    /// mark their baseline stale and resume without announcing a backlog.
+    func noteLiveOutputForAccessibility() {
+        guard accessibilityAnnouncementVoiceOverEnabled(),
+              window?.firstResponder === self else {
+            cancelAccessibilityAnnouncement()
+            accessibilityAnnouncementNeedsBaseline = true
+            return
+        }
+        if accessibilityAnnouncementNeedsBaseline {
+            accessibilityAnnouncementBaseline = accessibilityTextSnapshot()
+            accessibilityAnnouncementNeedsBaseline = false
+            return
+        }
+        guard !accessibilityAnnouncementIsScheduled else { return }
+        accessibilityAnnouncementIsScheduled = true
+        accessibilityAnnouncementScheduleCount += 1
+        perform(
+            #selector(deliverAccessibilityAnnouncement),
+            with: nil,
+            afterDelay: TerminalAccessibilityAnnouncementPolicy.throttleInterval
+        )
+    }
+
+    /// Deterministic test seam; production reaches the same delivery through
+    /// the main-run-loop selector scheduled above.
+    func deliverAccessibilityAnnouncementNow() {
+        NSObject.cancelPreviousPerformRequests(
+            withTarget: self,
+            selector: #selector(deliverAccessibilityAnnouncement),
+            object: nil
+        )
+        accessibilityAnnouncementIsScheduled = false
+        deliverAccessibilityAnnouncement()
+    }
+
+    private func cancelAccessibilityAnnouncement() {
+        guard accessibilityAnnouncementIsScheduled else { return }
+        NSObject.cancelPreviousPerformRequests(
+            withTarget: self,
+            selector: #selector(deliverAccessibilityAnnouncement),
+            object: nil
+        )
+        accessibilityAnnouncementIsScheduled = false
+    }
+
+    @objc private func deliverAccessibilityAnnouncement() {
+        accessibilityAnnouncementIsScheduled = false
+        guard accessibilityAnnouncementVoiceOverEnabled(),
+              window?.firstResponder === self else {
+            accessibilityAnnouncementNeedsBaseline = true
+            return
+        }
+
+        let current = accessibilityTextSnapshot()
+        let previous = accessibilityAnnouncementBaseline
+        accessibilityAnnouncementBaseline = current
+        accessibilityAnnouncementNeedsBaseline = false
+        guard let announcement = TerminalAccessibilityAnnouncementPolicy.announcement(
+            previous: previous,
+            current: current
+        ) else { return }
+
+        if let accessibilityAnnouncementPoster {
+            accessibilityAnnouncementPoster(announcement)
+        } else {
+            NSAccessibility.post(
+                element: self,
+                notification: .announcementRequested,
+                userInfo: [
+                    .announcement: announcement,
+                    .priority: NSAccessibilityPriorityLevel.medium.rawValue,
+                ]
+            )
+        }
+    }
+
     /// Snap the viewport to the newest output (Electron sticky-scroll parity).
     /// `scroll(toPosition:)` is SwiftTerm's public relative-scroll API — 1.0 is
     /// the live bottom — and is a harmless no-op when there is nothing to
@@ -2384,7 +2556,9 @@ class ReadOnlyTerminalView: TerminalView {
 
     override func isAccessibilityElement() -> Bool { true }
     override func accessibilityRole() -> NSAccessibility.Role? { .textArea }
-    override func accessibilityValue() -> Any? {
+    override func accessibilityValue() -> Any? { accessibilityTextSnapshot() }
+
+    private func accessibilityTextSnapshot() -> String {
         let terminal = getTerminal()
         let dimensions = terminal.getDims()
         if dimensions.cols > 0, dimensions.rows > 0 {

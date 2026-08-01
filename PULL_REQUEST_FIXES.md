@@ -48,6 +48,9 @@ Large product and architecture work remains ordered in
 - Retained terminal pages now filter control strings chunk by chunk before
   replay, while debounced transcript matching and attributed highlights prepare
   in a cancellable actor cache keyed by page generation and appearance.
+- The focused terminal now coalesces rendered, bounded VoiceOver output at an
+  800 ms cadence without replaying background backlog; terminal pane chrome
+  derives from the same opaque native/Kaisola palette as its SwiftTerm canvas.
 
 ## Open audit fixes
 
@@ -58,7 +61,6 @@ Large product and architecture work remains ordered in
 
 ### Terminal parity and failure feedback
 
-- Add throttled VoiceOver output announcements and terminal-themed pane chrome.
 - Keep the PR 8 physical-trackpad gate open until sub-row movement is genuinely
   continuous in the installed app; row-quantized SwiftTerm scrolling is not
   considered fixed by the repaint/geometry work alone.

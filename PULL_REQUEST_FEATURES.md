@@ -283,13 +283,13 @@ Completed scope:
 - Add OSC 52 copy with consent and Clear/Jump-to-Bottom commands.
 - Remove the dead legacy terminal grid and make the transcript viewer inherit
   the configured terminal font.
+- Provide throttled, focused-pane VoiceOver output announcements and use the
+  active terminal palette for opaque card chrome.
 
 Remaining scope:
 
-- Provide throttled VoiceOver output announcements.
 - Add target-specific Reopen from an ended pane and safe oversized-image
   downscaling.
-- Use the active terminal theme for card chrome.
 
 Acceptance:
 

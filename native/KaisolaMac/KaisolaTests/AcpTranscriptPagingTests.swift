@@ -2,6 +2,28 @@ import Foundation
 import XCTest
 @testable import Kaisola
 
+private actor TranscriptPageFixture {
+    let rows: [AcpTranscriptRow]
+    private(set) var requests: [(before: Int64, limit: Int)] = []
+
+    init(rows: [AcpTranscriptRow]) { self.rows = rows }
+
+    func page(before: Int64, limit: Int) -> AcpTranscriptStore.Page {
+        requests.append((before, limit))
+        let end = max(0, min(rows.count, Int(before)))
+        let start = max(0, end - limit)
+        return AcpTranscriptStore.Page(
+            rows: Array(rows[start..<end]),
+            startOrdinal: Int64(start),
+            endOrdinalExclusive: Int64(end),
+            earlierRowCount: start,
+            totalRowCount: rows.count
+        )
+    }
+
+    func requestCount() -> Int { requests.count }
+}
+
 /// Unit tests for two Electron-parity behaviors on `AcpConversation` that need
 /// no live agent: transcript render-window paging (`visibleRows`/`expandEarlier`)
 /// and per-chat persistent composer drafts (`loadDraft`/`saveDraft` round-trip).
@@ -37,15 +59,15 @@ final class AcpTranscriptPagingTests: XCTestCase {
         XCTAssertEqual(conversation.visibleRows.last?.id, conversation.rows.last?.id)
     }
 
-    func testExpandEarlierGrowsWindowByStep() {
+    func testExpandEarlierGrowsWindowByStep() async {
         let conversation = makeConversation()
         conversation.seedRowsForTesting(Self.messageRows(count: 500))
 
-        conversation.expandEarlier()   // +200
+        await conversation.expandEarlier()   // +200
         XCTAssertEqual(conversation.visibleRows.count, 320)
         XCTAssertEqual(conversation.hiddenEarlierCount, 180)
 
-        conversation.expandEarlier()   // +200 more, clamps to all rows
+        await conversation.expandEarlier()   // +200 more, clamps to all rows
         XCTAssertEqual(conversation.visibleRows.count, 500)
         XCTAssertEqual(conversation.hiddenEarlierCount, 0, "no hidden rows ⇒ the button disappears")
     }
@@ -67,14 +89,14 @@ final class AcpTranscriptPagingTests: XCTestCase {
         XCTAssertEqual(conversation.hiddenEarlierCount, 300)
     }
 
-    func testRepeatedTopPagingReachesTheLiteralFirstMessage() {
+    func testRepeatedTopPagingReachesTheLiteralFirstMessage() async {
         let conversation = makeConversation()
         conversation.seedRowsForTesting(Self.messageRows(count: 10_003))
 
         var pageCount = 0
         while conversation.hiddenEarlierCount > 0 {
             let previousHidden = conversation.hiddenEarlierCount
-            conversation.expandEarlier()
+            await conversation.expandEarlier()
             XCTAssertLessThan(conversation.hiddenEarlierCount, previousHidden)
             pageCount += 1
             XCTAssertLessThan(pageCount, 100, "Paging must make bounded forward progress")
@@ -83,6 +105,47 @@ final class AcpTranscriptPagingTests: XCTestCase {
         XCTAssertEqual(conversation.visibleRows.count, 10_003)
         XCTAssertEqual(conversation.visibleRows.first?.id, "msg-m0")
         XCTAssertEqual(conversation.visibleRows.last?.id, "msg-m10002")
+    }
+
+    func testPageBackedExpansionLoadsToTheFirstRowWithoutRepersistingHistory() async throws {
+        let allRows = Self.messageRows(count: 1_003)
+        let fixture = TranscriptPageFixture(rows: allRows)
+        let tailStart = allRows.count - AcpConversation.defaultVisibleLimit
+        let conversation = AcpConversation(
+            title: "Paged",
+            command: "mock",
+            arguments: [],
+            cwd: "/tmp",
+            initialRows: Array(allRows[tailStart...]),
+            initialRowStartOrdinal: Int64(tailStart),
+            initialEarlierRowCount: tailStart,
+            initialTotalRowCount: allRows.count
+        )
+        var persistenceEvents = 0
+        conversation.onTranscriptChanged = { _, _ in persistenceEvents += 1 }
+        conversation.loadEarlierRows = { before, limit in
+            await fixture.page(before: before, limit: limit)
+        }
+
+        while conversation.hiddenEarlierCount > 0 {
+            let anchor = try XCTUnwrap(conversation.visibleRows.first?.id)
+            let previousCount = conversation.rows.count
+            await conversation.expandEarlier()
+            XCTAssertGreaterThan(conversation.rows.count, previousCount)
+            XCTAssertTrue(conversation.visibleRows.contains(where: { $0.id == anchor }))
+            XCTAssertEqual(
+                conversation.lastHistoryInsertionContentVersion,
+                conversation.contentVersion,
+                "A durable prepend must bypass live-output bottom following"
+            )
+        }
+
+        XCTAssertEqual(conversation.rows, allRows)
+        XCTAssertEqual(conversation.loadedRowStartOrdinal, 0)
+        XCTAssertEqual(conversation.unloadedEarlierRowCount, 0)
+        XCTAssertEqual(persistenceEvents, 0, "Reading durable pages must not schedule redundant writes")
+        let requestCount = await fixture.requestCount()
+        XCTAssertEqual(requestCount, 5)
     }
 
     func testStreamingContentVersionAdvancesWithoutGrowingRowCount() {

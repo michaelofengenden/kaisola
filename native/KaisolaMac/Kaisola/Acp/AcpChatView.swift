@@ -228,12 +228,16 @@ struct AcpChatView: View {
                                       !loadingEarlierRows,
                                       let anchor = conversation.visibleRows.first?.id else { return }
                                 loadingEarlierRows = true
-                                conversation.expandEarlier()
-                                // Expanding prepends rows. Restore the formerly
-                                // first visible row so the viewport does not jump,
-                                // while retaining active trackpad velocity on
-                                // macOS 15 and newer.
-                                DispatchQueue.main.async {
+                                Task { @MainActor in
+                                    await conversation.expandEarlier()
+                                    guard transcriptConversationID == ObjectIdentifier(conversation) else {
+                                        loadingEarlierRows = false
+                                        return
+                                    }
+                                    // Expanding prepends rows. Restore the formerly
+                                    // first visible row so the viewport does not jump,
+                                    // while retaining active trackpad velocity on
+                                    // macOS 15 and newer.
                                     TerminalTranscriptScrollPolicy.preserveUserVelocity {
                                         proxy.scrollTo(anchor, anchor: .top)
                                     }
@@ -305,8 +309,9 @@ struct AcpChatView: View {
                     transcriptIsReady = true
                 }
             }
-            .onChange(of: conversation.contentVersion) { _, _ in
-                guard transcriptIsReady else { return }
+            .onChange(of: conversation.contentVersion) { _, newVersion in
+                guard transcriptIsReady,
+                      conversation.lastHistoryInsertionContentVersion != newVersion else { return }
                 if transcriptIsAtBottom {
                     DispatchQueue.main.async {
                         if presentation == .standard {

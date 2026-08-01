@@ -31,7 +31,7 @@ enum AcpEvent: Sendable {
 /// `image` block (base64 pixels + mime); `textFile` becomes an embedded
 /// `resource` block when the adapter advertises embedded context, otherwise the
 /// ACP-baseline `resource_link` form.
-enum AcpAttachment: Equatable, Sendable {
+enum AcpAttachment: Codable, Equatable, Sendable {
     case image(data: Data, mimeType: String, name: String)
     case textFile(path: String, contents: String, name: String)
 

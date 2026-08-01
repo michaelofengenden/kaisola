@@ -695,7 +695,7 @@ final class AppModelProjectContextTests: XCTestCase {
             "oldest pending follow-up",
             "newest pending follow-up",
         ])
-        chat.conversation.onTranscriptChanged?(rows)
+        chat.conversation.onTranscriptChanged?(rows, 0)
         chat.conversation.saveDraft("keep this draft")
 
         XCTAssertTrue(model.closeChat(chat.id))
@@ -1077,6 +1077,74 @@ final class AppModelProjectContextTests: XCTestCase {
             ),
             "Deploy console"
         )
+    }
+
+    @MainActor
+    func testChatRestorationLoadsOnlyTailThenFetchesEarlierSQLitePage() async throws {
+        let root = storeFile.deletingLastPathComponent()
+        let projectDirectory = root.appendingPathComponent("paged-chat-project", isDirectory: true)
+        try FileManager.default.createDirectory(at: projectDirectory, withIntermediateDirectories: true)
+        let projectID = NativeSessionStore.projectID(forDirectory: projectDirectory.path)
+        let chatID = "paged-chat"
+        let agent = try XCTUnwrap(AgentRegistry.all.first { AcpAdapter.forAgent($0.id) != nil })
+        let workspaceStore = NativeWorkspaceStateStore(
+            fileURL: root.appendingPathComponent("workspace-paged-restore.json")
+        )
+        let descriptor = NativeRestorableAgentChatDescriptor(
+            id: chatID,
+            projectID: projectID,
+            agentID: agent.id,
+            workspacePath: projectDirectory.path,
+            acpSessionID: nil,
+            accountBinding: nil,
+            title: "Paged chat"
+        )
+        try await workspaceStore.saveProjectState(NativeProjectWorkspaceState(
+            projectID: projectID,
+            layout: SessionPaneLayout(sessionID: chatID),
+            panes: [NativeRestorablePaneState(
+                id: chatID,
+                surface: NativeRestorableSurfaceState(agentChat: descriptor)
+            )],
+            focusedPaneID: chatID
+        ))
+
+        let transcriptStore = AcpTranscriptStore(
+            fileURL: root.appendingPathComponent("transcripts-paged-restore.json")
+        )
+        let rows = (0..<1_000).map {
+            AcpTranscriptRow.message(id: "\($0)", text: "row \($0)")
+        }
+        let attachments: [AcpAttachment] = [
+            .textFile(path: "/tmp/context.txt", contents: "context", name: "context.txt"),
+        ]
+        await transcriptStore.scheduleSave(rows, for: chatID, now: 1)
+        await transcriptStore.scheduleDraft("restored composer", for: chatID, now: 2)
+        await transcriptStore.scheduleAttachments(attachments, for: chatID, now: 3)
+        await transcriptStore.flush()
+
+        let model = makeRestoringModel(
+            workspaceStore: workspaceStore,
+            root: root,
+            identity: "paged-restore",
+            projectDirectory: projectDirectory
+        )
+        await model.restoreWorkspaceStateIfNeeded()
+        let conversation = try XCTUnwrap(model.chats.first { $0.id == chatID }?.conversation)
+
+        XCTAssertEqual(conversation.rows.count, AcpConversation.defaultVisibleLimit)
+        XCTAssertEqual(conversation.rows.first?.id, "msg-880")
+        XCTAssertEqual(conversation.loadedRowStartOrdinal, 880)
+        XCTAssertEqual(conversation.hiddenEarlierCount, 880)
+        XCTAssertEqual(conversation.loadDraft(), "restored composer")
+        XCTAssertEqual(conversation.pendingAttachments.map(\.attachment), attachments)
+
+        await conversation.expandEarlier()
+        XCTAssertEqual(conversation.rows.count, 320)
+        XCTAssertEqual(conversation.rows.first?.id, "msg-680")
+        XCTAssertEqual(conversation.loadedRowStartOrdinal, 680)
+        XCTAssertEqual(conversation.hiddenEarlierCount, 680)
+        await model.teardown()
     }
 
     @MainActor

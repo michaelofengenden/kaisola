@@ -2233,13 +2233,54 @@ final class AppModel: ObservableObject {
         await usageCenter.flushPersistence()
     }
 
-    func enqueueTranscriptSave(_ rows: [AcpTranscriptRow], chatID: String) {
+    func enqueueTranscriptSave(
+        _ rows: [AcpTranscriptRow],
+        startOrdinal: Int64 = 0,
+        chatID: String
+    ) {
         guard !explicitlyClosedChatIDs.contains(chatID) else { return }
         let previous = transcriptPersistenceTask
         let transcriptStore = transcriptStore
         transcriptPersistenceTask = Task {
             await previous?.value
-            await transcriptStore.scheduleSave(rows, for: chatID)
+            await transcriptStore.scheduleSave(
+                rows,
+                for: chatID,
+                startOrdinal: startOrdinal
+            )
+        }
+    }
+
+    private func enqueueTranscriptDraft(_ draft: String, chatID: String) {
+        guard !explicitlyClosedChatIDs.contains(chatID) else { return }
+        let previous = transcriptPersistenceTask
+        let transcriptStore = transcriptStore
+        transcriptPersistenceTask = Task {
+            await previous?.value
+            await transcriptStore.scheduleDraft(draft, for: chatID)
+        }
+    }
+
+    private func enqueueTranscriptAttachments(
+        _ attachments: [AcpAttachment],
+        chatID: String
+    ) {
+        guard !explicitlyClosedChatIDs.contains(chatID) else { return }
+        let previous = transcriptPersistenceTask
+        let transcriptStore = transcriptStore
+        transcriptPersistenceTask = Task {
+            await previous?.value
+            await transcriptStore.scheduleAttachments(attachments, for: chatID)
+        }
+    }
+
+    private func enqueueTranscriptSessionID(_ sessionID: String, chatID: String) {
+        guard !explicitlyClosedChatIDs.contains(chatID) else { return }
+        let previous = transcriptPersistenceTask
+        let transcriptStore = transcriptStore
+        transcriptPersistenceTask = Task {
+            await previous?.value
+            await transcriptStore.scheduleSessionID(sessionID, for: chatID)
         }
     }
 
@@ -2290,8 +2331,29 @@ final class AppModel: ObservableObject {
                 throw NativeWorkspaceStateStore.StoreError.criticalDescriptorNotPersisted
             }
         }
-        mesh.onTranscriptChanged = { [weak self] columnID, rows in
-            self?.enqueueTranscriptSave(rows, chatID: columnID)
+        mesh.onTranscriptChanged = { [weak self] columnID, rows, startOrdinal in
+            self?.enqueueTranscriptSave(
+                rows,
+                startOrdinal: startOrdinal,
+                chatID: columnID
+            )
+        }
+        let pageStore = transcriptStore
+        mesh.loadEarlierTranscript = { columnID, beforeOrdinal, limit in
+            await pageStore.page(
+                for: columnID,
+                beforeOrdinal: beforeOrdinal,
+                limit: limit
+            )
+        }
+        mesh.onColumnDraftChanged = { [weak self] columnID, draft in
+            self?.enqueueTranscriptDraft(draft, chatID: columnID)
+        }
+        mesh.onColumnAttachmentsChanged = { [weak self] columnID, attachments in
+            self?.enqueueTranscriptAttachments(attachments, chatID: columnID)
+        }
+        mesh.onColumnSessionIDChanged = { [weak self] columnID, sessionID in
+            self?.enqueueTranscriptSessionID(sessionID, chatID: columnID)
         }
         mesh.onFileActivity = { [weak self, weak mesh] _, activity in
             guard let self, let mesh else { return false }
@@ -2321,6 +2383,7 @@ final class AppModel: ObservableObject {
         agentID: String,
         workspacePath: String
     ) {
+        enqueueTranscriptDraft(text, chatID: chatID)
         enqueueDraftSave(
             text,
             stableKey: "chat|\(chatID)",
@@ -2509,19 +2572,25 @@ final class AppModel: ObservableObject {
                 var isDirectory: ObjCBool = false
                 guard FileManager.default.fileExists(atPath: directory.path, isDirectory: &isDirectory),
                       isDirectory.boolValue else { continue }
-                let transcript = await transcriptStore.entry(for: descriptor.id)
-                let draft = try? await workspaceStateStore.draft(for: "chat|\(descriptor.id)")
+                let transcript = await transcriptStore.restoration(
+                    for: descriptor.id,
+                    tailLimit: AcpConversation.defaultVisibleLimit
+                )
+                let legacyDraft = try? await workspaceStateStore.draft(for: "chat|\(descriptor.id)")
+                let draft = transcript?.draft ?? legacyDraft
+                if transcript?.draft == nil, let legacyDraft, !legacyDraft.isEmpty {
+                    await transcriptStore.scheduleDraft(legacyDraft, for: descriptor.id)
+                }
                 _ = appendChat(
                     id: descriptor.id,
                     agent: agent,
                     directory: directory,
                     title: descriptor.title
                         ?? "\(agent.name) · \(directory.lastPathComponent)",
-                    resumeSessionID: descriptor.acpSessionID,
+                    resumeSessionID: descriptor.acpSessionID ?? transcript?.sessionID,
                     accountBinding: descriptor.accountBinding,
-                    initialRows: transcript?.rows ?? [],
+                    initialTranscript: transcript,
                     initialDraft: draft,
-                    initialUsage: transcript?.usage,
                     initialQueuedPrompts: descriptor.queuedPrompts
                 )
             }
@@ -2568,11 +2637,19 @@ final class AppModel: ObservableObject {
 
                 var states: [MeshSession.RestoredColumnState] = []
                 for column in descriptor.columns {
-                    let transcript = await transcriptStore.entry(for: column.id)
+                    let transcript = await transcriptStore.restoration(
+                        for: column.id,
+                        tailLimit: AcpConversation.defaultVisibleLimit
+                    )
                     states.append(MeshSession.RestoredColumnState(
                         descriptor: column,
-                        rows: transcript?.rows ?? [],
-                        initialDraft: nil,
+                        rows: transcript?.page.rows ?? [],
+                        rowStartOrdinal: transcript?.page.startOrdinal ?? 0,
+                        earlierRowCount: transcript?.page.earlierRowCount ?? 0,
+                        totalRowCount: transcript?.page.totalRowCount ?? 0,
+                        initialDraft: transcript?.draft,
+                        initialAttachments: transcript?.attachments ?? [],
+                        persistedSessionID: transcript?.sessionID,
                         usage: transcript?.usage
                     ))
                 }
@@ -2813,9 +2890,8 @@ final class AppModel: ObservableObject {
             title: "\(agent.name) · \((directory.path as NSString).lastPathComponent)",
             resumeSessionID: nil,
             accountBinding: accountBinding,
-            initialRows: [],
+            initialTranscript: nil,
             initialDraft: nil,
-            initialUsage: nil,
             initialQueuedPrompts: []
         ) != nil else { return }
         focusPane(chatID, projectID: project.id)
@@ -2831,9 +2907,8 @@ final class AppModel: ObservableObject {
         title: String,
         resumeSessionID: String?,
         accountBinding: SessionAccountBinding?,
-        initialRows: [AcpTranscriptRow],
+        initialTranscript: AcpTranscriptStore.Restoration?,
         initialDraft: String?,
-        initialUsage: AcpPersistedUsage?,
         initialQueuedPrompts: [String]
     ) -> AcpChatHandle? {
         guard chats.contains(where: { $0.id == chatID }) == false else { return nil }
@@ -2862,9 +2937,13 @@ final class AppModel: ObservableObject {
             sensitiveGlobs: NativePreviewSettings.shared.sensitiveGlobs,
             draftKey: chatID,
             resumeSessionID: safeResumeSessionID,
-            initialRows: initialRows,
+            initialRows: initialTranscript?.page.rows ?? [],
+            initialRowStartOrdinal: initialTranscript?.page.startOrdinal ?? 0,
+            initialEarlierRowCount: initialTranscript?.page.earlierRowCount ?? 0,
+            initialTotalRowCount: initialTranscript?.page.totalRowCount ?? 0,
             initialDraft: initialDraft,
-            initialUsage: initialUsage.map {
+            initialAttachments: initialTranscript?.attachments ?? [],
+            initialUsage: initialTranscript?.usage.map {
                 AcpUsage(
                     used: $0.latestUsed,
                     max: $0.latestMax,
@@ -2875,7 +2954,7 @@ final class AppModel: ObservableObject {
             initialQueuedPrompts: initialQueuedPrompts
         )
         usageCenter.register(chatID: chatID, sourceID: usageSourceID)
-        if let initialUsage {
+        if let initialUsage = initialTranscript?.usage {
             usageCenter.restore(chatID: chatID, snapshot: initialUsage)
         }
         // Fan this chat's live context usage into the session-wide UsageCenter.
@@ -2916,8 +2995,20 @@ final class AppModel: ObservableObject {
                 detail: detail
             )
         }
-        conversation.onTranscriptChanged = { [weak self] rows in
-            self?.enqueueTranscriptSave(rows, chatID: chatID)
+        conversation.onTranscriptChanged = { [weak self] rows, startOrdinal in
+            self?.enqueueTranscriptSave(
+                rows,
+                startOrdinal: startOrdinal,
+                chatID: chatID
+            )
+        }
+        let pageStore = transcriptStore
+        conversation.loadEarlierRows = { beforeOrdinal, limit in
+            await pageStore.page(
+                for: chatID,
+                beforeOrdinal: beforeOrdinal,
+                limit: limit
+            )
         }
         conversation.onFileActivity = { [weak self] activity in
             self?.recordAgentFileActivity(
@@ -2936,7 +3027,11 @@ final class AppModel: ObservableObject {
                 workspacePath: directory.path
             )
         }
-        conversation.onProviderSessionID = { [weak self] _ in
+        conversation.onAttachmentsChanged = { [weak self] attachments in
+            self?.enqueueTranscriptAttachments(attachments, chatID: chatID)
+        }
+        conversation.onProviderSessionID = { [weak self] sessionID in
+            self?.enqueueTranscriptSessionID(sessionID, chatID: chatID)
             self?.scheduleWorkspaceStateSave(projectID: projectID)
         }
         conversation.onQueueChanged = { [weak self] _ in
@@ -3263,18 +3358,24 @@ final class AppModel: ObservableObject {
                   isDirectory.boolValue else {
                 return .blocked("The chat's project folder is unavailable. Nothing was removed.")
             }
-            let transcript = await transcriptStore.entry(for: descriptor.id)
-            let draft = try? await workspaceStateStore.draft(for: "chat|\(descriptor.id)")
+            let transcript = await transcriptStore.restoration(
+                for: descriptor.id,
+                tailLimit: AcpConversation.defaultVisibleLimit
+            )
+            let legacyDraft = try? await workspaceStateStore.draft(for: "chat|\(descriptor.id)")
+            let draft = transcript?.draft ?? legacyDraft
+            if transcript?.draft == nil, let legacyDraft, !legacyDraft.isEmpty {
+                await transcriptStore.scheduleDraft(legacyDraft, for: descriptor.id)
+            }
             guard appendChat(
                 id: descriptor.id,
                 agent: agent,
                 directory: directory,
                 title: descriptor.title ?? "\(agent.name) · \(directory.lastPathComponent)",
-                resumeSessionID: descriptor.acpSessionID,
+                resumeSessionID: descriptor.acpSessionID ?? transcript?.sessionID,
                 accountBinding: descriptor.accountBinding,
-                initialRows: transcript?.rows ?? [],
+                initialTranscript: transcript,
                 initialDraft: draft,
-                initialUsage: transcript?.usage,
                 initialQueuedPrompts: descriptor.queuedPrompts
             ) != nil else {
                 return .blocked("The chat adapter is unavailable. The Recently Closed entry was preserved.")
@@ -3426,11 +3527,19 @@ final class AppModel: ObservableObject {
         wireMeshPersistence(mesh, recentlyClosed: true)
         var states: [MeshSession.RestoredColumnState] = []
         for column in descriptor.columns {
-            let transcript = await transcriptStore.entry(for: column.id)
+            let transcript = await transcriptStore.restoration(
+                for: column.id,
+                tailLimit: AcpConversation.defaultVisibleLimit
+            )
             states.append(MeshSession.RestoredColumnState(
                 descriptor: column,
-                rows: transcript?.rows ?? [],
-                initialDraft: nil,
+                rows: transcript?.page.rows ?? [],
+                rowStartOrdinal: transcript?.page.startOrdinal ?? 0,
+                earlierRowCount: transcript?.page.earlierRowCount ?? 0,
+                totalRowCount: transcript?.page.totalRowCount ?? 0,
+                initialDraft: transcript?.draft,
+                initialAttachments: transcript?.attachments ?? [],
+                persistedSessionID: transcript?.sessionID,
                 usage: transcript?.usage
             ))
         }
@@ -3746,9 +3855,8 @@ final class AppModel: ObservableObject {
                     profile: nil,
                     fallbackEnvironment: ProcessInfo.processInfo.environment
                 ),
-                initialRows: [],
+                initialTranscript: nil,
                 initialDraft: "",
-                initialUsage: nil,
                 initialQueuedPrompts: []
               ) else { return }
         chat.conversation.loadVisualFixture(includePermission: includePermission)

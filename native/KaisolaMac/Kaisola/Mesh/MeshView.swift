@@ -498,8 +498,8 @@ private struct MeshColumnView: View {
                                           !loadingEarlierRows,
                                           let anchor = conversation.visibleRows.first?.id else { return }
                                     loadingEarlierRows = true
-                                    conversation.expandEarlier()
-                                    DispatchQueue.main.async {
+                                    Task { @MainActor in
+                                        await conversation.expandEarlier()
                                         TerminalTranscriptScrollPolicy.preserveUserVelocity {
                                             proxy.scrollTo(anchor, anchor: .top)
                                         }
@@ -564,8 +564,9 @@ private struct MeshColumnView: View {
                         transcriptIsReady = true
                     }
                 }
-                .onChange(of: conversation.contentVersion) { _, _ in
-                    guard transcriptIsReady else { return }
+                .onChange(of: conversation.contentVersion) { _, newVersion in
+                    guard transcriptIsReady,
+                          conversation.lastHistoryInsertionContentVersion != newVersion else { return }
                     if transcriptIsAtBottom {
                         DispatchQueue.main.async {
                             proxy.scrollTo("mesh-transcript-bottom-\(column.id)", anchor: .bottom)

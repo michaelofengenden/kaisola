@@ -76,6 +76,22 @@ const CODE_EDITOR_TESTS = Object.freeze([
 ])
 
 const NATIVE_FILE_TESTS = Object.freeze(new Map([
+  ['native/KaisolaMac/Kaisola/Acp/AcpTranscriptStore.swift', [
+    'AcpTranscriptStoreTests', 'AppModelProjectContextTests', 'UsageCenterTests',
+  ]],
+  ['native/KaisolaMac/Kaisola/Acp/AcpConversation.swift', [
+    'AcpAttachmentsTests', 'AcpClientTests', 'AcpToolArtifactsTests',
+    'AcpTranscriptPagingTests',
+  ]],
+  ['native/KaisolaMac/Kaisola/Acp/AcpChatView.swift', [
+    'AcpTranscriptPagingTests',
+  ]],
+  ['native/KaisolaMac/Kaisola/Acp/AcpClient.swift', [
+    'AcpAttachmentsTests', 'AcpClientTests',
+  ]],
+  ['native/KaisolaMac/Kaisola/App/NativePreviewPaths.swift', [
+    'AcpTranscriptStoreTests', 'NativePreviewSettingsTests',
+  ]],
   ['native/KaisolaMac/Kaisola/Features/Onboarding/OnboardingView.swift', [
     'CommandRegistryTests', 'OnboardingStateTests', 'UsageCenterTests',
   ]],

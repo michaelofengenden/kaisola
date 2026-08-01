@@ -102,7 +102,22 @@ final class MeshSession: ObservableObject, Identifiable {
     /// Awaited at worktree transaction boundaries. AppModel writes the Mesh
     /// manifest before Git registration and immediately after adoption.
     var persistDescriptor: (() async throws -> Void)?
-    var onTranscriptChanged: ((_ columnID: String, _ rows: [AcpTranscriptRow]) -> Void)?
+    var onTranscriptChanged: ((
+        _ columnID: String,
+        _ rows: [AcpTranscriptRow],
+        _ startOrdinal: Int64
+    ) -> Void)?
+    var loadEarlierTranscript: ((
+        _ columnID: String,
+        _ beforeOrdinal: Int64,
+        _ limit: Int
+    ) async -> AcpTranscriptStore.Page?)?
+    var onColumnDraftChanged: ((_ columnID: String, _ draft: String) -> Void)?
+    var onColumnAttachmentsChanged: ((
+        _ columnID: String,
+        _ attachments: [AcpAttachment]
+    ) -> Void)?
+    var onColumnSessionIDChanged: ((_ columnID: String, _ sessionID: String) -> Void)?
     var onFileActivity: ((_ columnID: String, _ activity: AcpFileActivity) -> Bool)?
     var onDraftChanged: ((String) -> Void)?
 
@@ -431,8 +446,35 @@ final class MeshSession: ObservableObject, Identifiable {
     struct RestoredColumnState: Sendable {
         let descriptor: NativeRestorableMeshColumnDescriptor
         let rows: [AcpTranscriptRow]
+        let rowStartOrdinal: Int64
+        let earlierRowCount: Int
+        let totalRowCount: Int
         let initialDraft: String?
+        let initialAttachments: [AcpAttachment]
+        let persistedSessionID: String?
         let usage: AcpPersistedUsage?
+
+        init(
+            descriptor: NativeRestorableMeshColumnDescriptor,
+            rows: [AcpTranscriptRow],
+            rowStartOrdinal: Int64 = 0,
+            earlierRowCount: Int = 0,
+            totalRowCount: Int? = nil,
+            initialDraft: String?,
+            initialAttachments: [AcpAttachment] = [],
+            persistedSessionID: String? = nil,
+            usage: AcpPersistedUsage?
+        ) {
+            self.descriptor = descriptor
+            self.rows = rows
+            self.rowStartOrdinal = rowStartOrdinal
+            self.earlierRowCount = earlierRowCount
+            self.totalRowCount = totalRowCount ?? rows.count
+            self.initialDraft = initialDraft
+            self.initialAttachments = initialAttachments
+            self.persistedSessionID = persistedSessionID
+            self.usage = usage
+        }
     }
 
     enum DiscardAssessment: Equatable, Sendable {
@@ -568,9 +610,15 @@ final class MeshSession: ObservableObject, Identifiable {
                 mcp: mcp,
                 // A pre-binding manifest has no proof of which credentials
                 // own its provider id. Restore the transcript but start fresh.
-                resumeSessionID: hadPersistedBinding ? descriptor.acpSessionID : nil,
+                resumeSessionID: hadPersistedBinding
+                    ? (descriptor.acpSessionID ?? state.persistedSessionID)
+                    : nil,
                 initialRows: state.rows,
+                initialRowStartOrdinal: state.rowStartOrdinal,
+                initialEarlierRowCount: state.earlierRowCount,
+                initialTotalRowCount: state.totalRowCount,
                 initialDraft: state.initialDraft,
+                initialAttachments: state.initialAttachments,
                 initialUsage: state.usage
             )
             columns.append(Column(
@@ -752,7 +800,11 @@ final class MeshSession: ObservableObject, Identifiable {
         mcp: [JSONValue],
         resumeSessionID: String? = nil,
         initialRows: [AcpTranscriptRow] = [],
+        initialRowStartOrdinal: Int64 = 0,
+        initialEarlierRowCount: Int = 0,
+        initialTotalRowCount: Int? = nil,
         initialDraft: String? = nil,
+        initialAttachments: [AcpAttachment] = [],
         initialUsage: AcpPersistedUsage? = nil
     ) -> AcpConversation {
         let conversation = AcpConversation(
@@ -766,7 +818,11 @@ final class MeshSession: ObservableObject, Identifiable {
             draftKey: columnID,
             resumeSessionID: resumeSessionID,
             initialRows: initialRows,
+            initialRowStartOrdinal: initialRowStartOrdinal,
+            initialEarlierRowCount: initialEarlierRowCount,
+            initialTotalRowCount: initialTotalRowCount,
             initialDraft: initialDraft,
+            initialAttachments: initialAttachments,
             initialUsage: initialUsage.map {
                 AcpUsage(
                     used: $0.latestUsed,
@@ -776,14 +832,25 @@ final class MeshSession: ObservableObject, Identifiable {
                 )
             }
         )
-        conversation.onTranscriptChanged = { [weak self] rows in
-            self?.onTranscriptChanged?(columnID, rows)
+        conversation.onTranscriptChanged = { [weak self] rows, startOrdinal in
+            self?.onTranscriptChanged?(columnID, rows, startOrdinal)
+        }
+        conversation.loadEarlierRows = { [weak self] beforeOrdinal, limit in
+            guard let self else { return nil }
+            return await self.loadEarlierTranscript?(columnID, beforeOrdinal, limit)
         }
         conversation.onFileActivity = { [weak self] activity in
             self?.onFileActivity?(columnID, activity) ?? false
         }
-        conversation.onProviderSessionID = { [weak self] _ in
+        conversation.onDraftChanged = { [weak self] draft in
+            self?.onColumnDraftChanged?(columnID, draft)
+        }
+        conversation.onAttachmentsChanged = { [weak self] attachments in
+            self?.onColumnAttachmentsChanged?(columnID, attachments)
+        }
+        conversation.onProviderSessionID = { [weak self] sessionID in
             guard let self else { return }
+            self.onColumnSessionIDChanged?(columnID, sessionID)
             if self.lifecycle == .suspended { self.lifecycle = .active }
             self.onDescriptorChanged?()
         }

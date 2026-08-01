@@ -5,7 +5,7 @@ import SwiftUI
 import UniformTypeIdentifiers
 
 /// One rendered row in the chat transcript.
-enum AcpTranscriptRow: Codable, Identifiable, Equatable {
+enum AcpTranscriptRow: Codable, Identifiable, Equatable, Sendable {
     /// `failed` marks an optimistic send whose prompt request errored — the row
     /// stays visible with a retry affordance instead of vanishing.
     case user(id: String, text: String, failed: Bool)
@@ -33,13 +33,22 @@ final class AcpConversation: ObservableObject {
     @Published private(set) var rows: [AcpTranscriptRow] = [] {
         didSet {
             contentVersion &+= 1
-            onTranscriptChanged?(rows)
+            if isApplyingPersistedPage {
+                lastHistoryInsertionContentVersion = contentVersion
+            } else {
+                lastHistoryInsertionContentVersion = nil
+                onTranscriptChanged?(rows, loadedRowStartOrdinal)
+            }
         }
     }
     /// Advances for both appended rows and in-place streaming updates. Views
     /// must follow this rather than `rows.count`: an agent can stream thousands
     /// of chunks into one existing Markdown row without changing the count.
     @Published private(set) var contentVersion: UInt64 = 0
+    /// Lets transcript views distinguish a prepended durable page from new live
+    /// output. Page insertion has its own explicit anchor restoration and must
+    /// never trigger the bottom-follow or "New output" path.
+    private(set) var lastHistoryInsertionContentVersion: UInt64?
     @Published private(set) var isRunning = false
     @Published private(set) var isConnected = false
     @Published private(set) var isReconnecting = false
@@ -60,7 +69,9 @@ final class AcpConversation: ObservableObject {
     /// Files/images staged in the composer, shown as chips, sent as real ACP
     /// content blocks with the next immediate send and cleared then. Queued
     /// follow-ups never carry attachments (see `send`).
-    @Published private(set) var pendingAttachments: [PendingAttachment] = []
+    @Published private(set) var pendingAttachments: [PendingAttachment] = [] {
+        didSet { onAttachmentsChanged?(pendingAttachments.map(\.attachment)) }
+    }
     /// Number of file attachments currently being classified/read off the main
     /// actor. Exposed so the composer can show a tiny, non-blocking progress
     /// indicator instead of freezing while Finder/iCloud materializes a file.
@@ -85,11 +96,11 @@ final class AcpConversation: ObservableObject {
     /// Pre-turn working-tree snapshots (git stash create), restorable from the
     /// header. Present only when the workspace is a git repo with changes.
     @Published private(set) var checkpoints: [TurnCheckpoint] = []
-    /// The chat view renders only the last `visibleLimit` rows for performance;
-    /// full history stays in `rows`. Grown by `expandEarlier()` ("Show earlier
-    /// messages"); reset to the default when a new turn starts unless the user
-    /// expanded during that turn. Settable so tests and the view can drive it.
+    /// The chat view renders only the last `visibleLimit` loaded rows. Earlier
+    /// SQLite pages are fetched only when the top boundary appears; already
+    /// loaded rows remain in memory so expanding never discards an anchor.
     @Published var visibleLimit: Int = AcpConversation.defaultVisibleLimit
+    @Published private(set) var unloadedEarlierRowCount = 0
 
     struct QueuedMessage: Identifiable, Equatable, Sendable {
         let id: String
@@ -119,7 +130,10 @@ final class AcpConversation: ObservableObject {
     var onAttention: ((AttentionCenter.Kind, _ detail: String) -> Void)?
     /// Persistence hooks are injected by AppModel so this reusable conversation
     /// stays independent of the concrete disk stores used by the native shell.
-    var onTranscriptChanged: (([AcpTranscriptRow]) -> Void)?
+    var onTranscriptChanged: ((_ rows: [AcpTranscriptRow], _ startOrdinal: Int64) -> Void)?
+    /// Bounded page loader injected by AppModel (or MeshSession) so this
+    /// presentation model remains independent of the concrete SQLite store.
+    var loadEarlierRows: ((_ beforeOrdinal: Int64, _ limit: Int) async -> AcpTranscriptStore.Page?)?
     /// Live ACP-declared locations/diff paths for explicit follow mode. This is
     /// never derived from transcript prose. Return true only after the owner
     /// resolves and accepts the target; a not-yet-created file can then retry
@@ -127,6 +141,7 @@ final class AcpConversation: ObservableObject {
     var onFileActivity: ((AcpFileActivity) -> Bool)?
     var onProviderSessionID: ((String) -> Void)?
     var onDraftChanged: ((String) -> Void)?
+    var onAttachmentsChanged: (([AcpAttachment]) -> Void)?
     /// Pending follow-ups are part of the workspace recovery contract, not
     /// ephemeral view state. AppModel uses this hook to archive their exact
     /// FIFO order whenever the queue changes.
@@ -157,6 +172,9 @@ final class AcpConversation: ObservableObject {
     private let sensitiveGlobs: [String]
     private let resumeSessionID: String?
     private var restoredDraft: String?
+    private(set) var loadedRowStartOrdinal: Int64 = 0
+    private var isApplyingPersistedPage = false
+    private var earlierPageLoadInFlight = false
     private var hasStarted = false
     private var turnCounter = 0
     /// Monotonic transcript segment identity. A single turn may emit
@@ -183,8 +201,6 @@ final class AcpConversation: ObservableObject {
     private static let expandStep = 200
     static let maxPendingAttachmentCount = 8
     static let maxPendingAttachmentBytes = 20 * 1_048_576
-    /// Set when the user expands earlier history during the current turn, so the
-    /// next turn keeps the widened window instead of snapping back to the tail.
 
     init(
         title: String,
@@ -200,7 +216,11 @@ final class AcpConversation: ObservableObject {
         draftKey: String? = nil,
         resumeSessionID: String? = nil,
         initialRows: [AcpTranscriptRow] = [],
+        initialRowStartOrdinal: Int64 = 0,
+        initialEarlierRowCount: Int = 0,
+        initialTotalRowCount: Int? = nil,
         initialDraft: String? = nil,
+        initialAttachments: [AcpAttachment] = [],
         initialUsage: AcpUsage? = nil,
         initialQueuedPrompts: [String] = []
     ) {
@@ -219,16 +239,25 @@ final class AcpConversation: ObservableObject {
         self.draftStorageKey = draftKey
         self.resumeSessionID = resumeSessionID
         self.rows = initialRows
+        self.loadedRowStartOrdinal = max(0, initialRowStartOrdinal)
+        self.unloadedEarlierRowCount = max(0, initialEarlierRowCount)
         self.restoredDraft = initialDraft
+        self.pendingAttachments = Self.restoredPendingAttachments(initialAttachments)
+        self.attachmentCounter = self.pendingAttachments.count
         self.usage = initialUsage
         self.queued = initialQueuedPrompts.enumerated().map { index, text in
             QueuedMessage(id: "q\(index + 1)", text: text)
         }
         self.queueCounter = initialQueuedPrompts.count
-        self.turnCounter = initialRows.reduce(into: 0) { count, row in
+        let loadedTurnCount = initialRows.reduce(into: 0) { count, row in
             if case .user = row { count += 1 }
         }
-        self.segmentCounter = initialRows.count
+        let durableRowCount = max(initialRows.count, initialTotalRowCount ?? initialRows.count)
+        // A tail-only restore cannot count every historic user turn. Starting
+        // both monotonic identifiers at or above the durable row count may skip
+        // integers, but it can never collide with a retained row identifier.
+        self.turnCounter = max(loadedTurnCount, durableRowCount)
+        self.segmentCounter = durableRowCount
     }
 
     func start(resumeQueuedPrompts: Bool = false) async {
@@ -463,12 +492,7 @@ final class AcpConversation: ObservableObject {
     /// payload so the same file added twice shows once.
     private func appendPending(_ attachment: AcpAttachment) {
         guard !pendingAttachments.contains(where: { $0.attachment == attachment }) else { return }
-        let icon: String
-        let size: Int
-        switch attachment {
-        case let .image(data, _, _): icon = "photo"; size = data.count
-        case let .textFile(_, contents, _): icon = "doc.text"; size = contents.utf8.count
-        }
+        let (icon, size) = Self.attachmentPresentation(attachment)
         guard pendingAttachments.count < Self.maxPendingAttachmentCount else {
             ToastCenter.shared.show("Attach up to \(Self.maxPendingAttachmentCount) files per message.", style: .info)
             return
@@ -483,6 +507,38 @@ final class AcpConversation: ObservableObject {
             id: "att\(attachmentCounter)", name: attachment.name,
             iconName: icon, byteSize: size, attachment: attachment
         ))
+    }
+
+    /// Rebuild composer chips from the durable bounded attachment list. A
+    /// malformed future payload is filtered again at the UI boundary so it can
+    /// never bypass the same count/aggregate limits as a fresh Finder drop.
+    private static func restoredPendingAttachments(
+        _ attachments: [AcpAttachment]
+    ) -> [PendingAttachment] {
+        var result: [PendingAttachment] = []
+        var totalBytes = 0
+        for attachment in attachments {
+            guard result.count < maxPendingAttachmentCount,
+                  !result.contains(where: { $0.attachment == attachment }) else { continue }
+            let (icon, size) = attachmentPresentation(attachment)
+            guard size <= maxPendingAttachmentBytes - totalBytes else { continue }
+            totalBytes += size
+            result.append(PendingAttachment(
+                id: "att\(result.count + 1)",
+                name: attachment.name,
+                iconName: icon,
+                byteSize: size,
+                attachment: attachment
+            ))
+        }
+        return result
+    }
+
+    private static func attachmentPresentation(_ attachment: AcpAttachment) -> (String, Int) {
+        switch attachment {
+        case let .image(data, _, _): ("photo", data.count)
+        case let .textFile(_, contents, _): ("doc.text", contents.utf8.count)
+        }
     }
 
     /// Compose the user-visible (and prompt) text: the typed text plus a
@@ -765,21 +821,49 @@ final class AcpConversation: ObservableObject {
 
     // MARK: - Transcript paging
 
-    /// The tail of `rows` the chat view actually renders — the last
-    /// `visibleLimit` rows. Full history is always kept in `rows`; only the
-    /// rendered window is bounded so long chats stay smooth.
+    /// The tail of the currently loaded pages that the chat view renders.
+    /// SQLite rows before `loadedRowStartOrdinal` are not allocated until the
+    /// user reaches the top boundary.
     var visibleRows: [AcpTranscriptRow] {
         rows.count > visibleLimit ? Array(rows.suffix(visibleLimit)) : rows
     }
 
-    /// How many earlier rows sit above the rendered window.
+    /// Exact earlier-row count across both loaded-but-hidden and unloaded pages.
     var hiddenEarlierCount: Int {
-        max(0, rows.count - visibleLimit)
+        max(0, rows.count - visibleLimit) + unloadedEarlierRowCount
     }
 
-    /// Reveal `expandStep` (200) more earlier rows when the view reaches the top.
-    func expandEarlier() {
-        visibleLimit = min(rows.count, visibleLimit + Self.expandStep)
+    /// Reveal an already loaded window or fetch one bounded page immediately
+    /// before it. Page insertion deliberately suppresses the persistence hook:
+    /// those rows already came from the durable store and only the UI window
+    /// changed. `contentVersion` still advances so the view restores its anchor.
+    func expandEarlier() async {
+        if rows.count > visibleLimit {
+            visibleLimit = min(rows.count, visibleLimit + Self.expandStep)
+            return
+        }
+        guard unloadedEarlierRowCount > 0,
+              !earlierPageLoadInFlight,
+              let loadEarlierRows else { return }
+
+        let boundary = loadedRowStartOrdinal
+        earlierPageLoadInFlight = true
+        defer { earlierPageLoadInFlight = false }
+        guard let page = await loadEarlierRows(boundary, Self.expandStep),
+              loadedRowStartOrdinal == boundary else { return }
+        guard !page.rows.isEmpty else {
+            unloadedEarlierRowCount = 0
+            return
+        }
+        guard page.startOrdinal >= 0,
+              page.endOrdinalExclusive == boundary else { return }
+
+        isApplyingPersistedPage = true
+        loadedRowStartOrdinal = page.startOrdinal
+        unloadedEarlierRowCount = max(0, page.earlierRowCount)
+        rows.insert(contentsOf: page.rows, at: 0)
+        isApplyingPersistedPage = false
+        visibleLimit = min(rows.count, visibleLimit + page.rows.count)
     }
 
     // MARK: - Persistent draft
@@ -824,6 +908,8 @@ final class AcpConversation: ObservableObject {
     /// Test-only: replace the transcript wholesale so paging math can be
     /// exercised without driving a live turn. Not called by production code.
     func seedRowsForTesting(_ newRows: [AcpTranscriptRow]) {
+        loadedRowStartOrdinal = 0
+        unloadedEarlierRowCount = 0
         rows = newRows
     }
 

@@ -33,8 +33,10 @@ explicitly choose **End Session**.
   file activity, and opens replaceable previews so background work cannot pin
   documents or infer paths from ordinary response text.
 - **Chat** runs supported agents through their chat adapters. Drafts and queued
-  follow-ups are saved. If an adapter restarts, only prompts that were never
-  dispatched can resume automatically.
+  follow-ups are saved. Long histories open at the latest messages; continue
+  scrolling upward to load earlier pages without losing your reading position.
+  Unsent attachments stay with the draft across relaunches. If an adapter
+  restarts, only prompts that were never dispatched can resume automatically.
 - **Mesh** gives several agents one task. Editing columns use isolated Git
   copies when the project supports them, and the review controls show changes
   before integration.

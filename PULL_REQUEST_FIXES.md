@@ -41,6 +41,10 @@ Large product and architecture work remains ordered in
   tables natively, highlights supported languages, links project file-and-line
   citations, and makes every response, tool-output, and diff bound explicit and
   expandable.
+- Chat and Mesh now restore only a bounded SQLite transcript tail instead of
+  decoding every historic row from one JSON file. Exact ordinal pages preserve
+  tool cards, usage and costs, drafts, staged attachments, provider identity,
+  top-edge anchors, and deliberate scrolling through atomic v1 migration.
 - Text and HTML source editing now use a checked-in CodeMirror 6 bundle over a
   two-resource private scheme. Swift validates incremental edits and owns
   undo/redo, exact CRLF/LF source, save/revert, recovery, paths, and permissions;

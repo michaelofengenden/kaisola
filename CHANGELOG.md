@@ -21,6 +21,7 @@
 - Files and search now update only the changed repository areas during ordinary agent edits, with a safe full refresh when macOS reports dropped or root-level events.
 - An opt-in Files control follows files declared by the selected Chat or Mesh without treating transcript prose as a path.
 - Files and folders can move between project directories with collision checks, open-tab reconciliation, and exact Undo/Redo.
+- Long Chat and Mesh histories now open from a bounded SQLite tail; scrolling upward loads exact earlier pages without moving your reading position, while drafts, attachments, usage, costs, and continuation identity survive relaunch and the one-time JSON migration.
 
 ## 1.1.7 — 2026-07-31
 

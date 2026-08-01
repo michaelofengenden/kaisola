@@ -97,7 +97,7 @@ optional pending a scope decision.
 | Slash commands / available commands | DONE | P1 | available_commands_update → '/' fuzzy autocomplete in the composer |
 | ACP terminals (agent-spawned, watch/take over) | DONE | P1 | `AcpTerminalHost`: terminal/create…release answered, bounded live output rendered in tool cards; take-over n/a (app-scoped processes) |
 | Kaisola Mesh (group agents: scout→contract→execute→review→integrate) | DONE | P1 | project-scoped fan-out, isolated worktrees, flat/staged/idea modes, role chips, diff review, summaries, and one-click Integrate (`git apply --3way`) |
-| Transcript archive / paging | DONE | P2 | windowed transcript (120 rows + Show earlier), per-chat drafts persisted (v0.1.99) |
+| Transcript archive / paging | DONE | P2 | mode-0600 SQLite store with atomic v1 JSON migration; Chat and Mesh restore a 120-row tail, load exact 200-row ordinal pages to the first retained row, preserve anchors and deliberate scrolling, and keep drafts, staged attachments, usage/cost rollups, and provider identity together |
 | @-mentions (project entities) | NEW | P2 | research-tied |
 | Reasoning providers (domain research agents) | NEW | P2 | legacy |
 

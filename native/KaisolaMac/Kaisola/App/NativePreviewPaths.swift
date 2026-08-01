@@ -11,6 +11,11 @@ enum NativePreviewPaths {
     static let agentChatTranscriptStore = applicationSupportDirectory
         .appendingPathComponent("agent-chat-transcripts-v1.json", isDirectory: false)
 
+    /// Page-oriented v2 transcript storage. The adjacent v1 JSON remains the
+    /// immutable migration source and rollback copy after first successful use.
+    static let agentChatTranscriptDatabase = applicationSupportDirectory
+        .appendingPathComponent("agent-chat-transcripts-v2.sqlite3", isDirectory: false)
+
     static let helperRegistrationRecord = applicationSupportDirectory
         .appendingPathComponent("broker-helper-registration-v1", isDirectory: false)
 

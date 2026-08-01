@@ -79,12 +79,21 @@ Acceptance:
 Keep the current anchored auto-pagination behavior while replacing monolithic
 JSON transcript persistence with a store designed for long-lived sessions.
 
-Scope:
+The v1.1.8 implementation migrates the untouched v1 JSON archive into a
+mode-0600 SQLite database in one immediate transaction. Chat and Mesh restore
+only the newest 120 rows, read earlier history in bounded 200-row pages, and
+write the loaded ordinal range without deleting older pages that remain on
+disk. Compact per-chat metadata keeps usage and cost rollups, drafts, staged
+attachments, and provider continuation identity together.
+
+Completed scope:
 
 - Add an actor-backed SQLite/page API with bounded reads and atomic migration.
 - Persist stable row order, usage rollups, drafts, attachments, and session
   identity without loading every row at launch.
 - Preserve viewport anchors when earlier pages are inserted.
+
+Implementation status: complete.
 
 Acceptance:
 

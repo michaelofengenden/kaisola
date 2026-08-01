@@ -67,6 +67,24 @@ test('agent file follow selects protocol, project, and workspace safety contract
   assert.equal(plan.fallback, false)
 })
 
+test('page-oriented transcript sources select persistence, paging, metadata, and restore contracts', () => {
+  const plan = selector.planForChanges([
+    'native/KaisolaMac/Kaisola/Acp/AcpTranscriptStore.swift',
+    'native/KaisolaMac/Kaisola/Acp/AcpConversation.swift',
+    'native/KaisolaMac/Kaisola/Acp/AcpChatView.swift',
+    'native/KaisolaMac/Kaisola/App/NativePreviewPaths.swift',
+  ], inventory)
+
+  assert.equal(plan.native.mode, 'focused')
+  assert.deepEqual(plan.native.selectors, [
+    'AcpAttachmentsTests', 'AcpClientTests', 'AcpToolArtifactsTests',
+    'AcpTranscriptPagingTests', 'AcpTranscriptStoreTests',
+    'AppModelProjectContextTests', 'NativePreviewSettingsTests', 'UsageCenterTests',
+  ])
+  assert.equal(plan.node.mode, 'none')
+  assert.equal(plan.fallback, false)
+})
+
 test('settings surfaces stay on their bounded account and configuration contracts', () => {
   const plan = selector.planForChanges([
     'native/KaisolaMac/Kaisola/Features/Settings/ApiKeysSettingsTab.swift',

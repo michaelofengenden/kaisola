@@ -13,6 +13,17 @@ enum TerminalTheme {
         let ansi: [SwiftTerm.Color]
     }
 
+    /// Opaque terminal-card chrome derived from the same palette installed in
+    /// SwiftTerm. Header and rule opacities tint the palette background with
+    /// its own foreground, preserving the active native/Kaisola character
+    /// without letting window glass reduce terminal contrast.
+    struct PaneChrome {
+        let background: NSColor
+        let foreground: NSColor
+        let headerTintOpacity: Double
+        let ruleOpacity: Double
+    }
+
     /// A clean Terminal-like light canvas. Every text-bearing ANSI slot clears
     /// a 4.5:1 contrast target against white; cyan is deliberately a readable
     /// light blue because agent CLIs commonly use it for links and file paths.
@@ -76,6 +87,16 @@ enum TerminalTheme {
         case .native: light ? nativeLight : nativeDark
         case .kaisola: light ? Self.light : Self.dark
         }
+    }
+
+    static func paneChrome(light: Bool, mode: TerminalPaletteMode) -> PaneChrome {
+        let palette = palette(light: light, mode: mode)
+        return PaneChrome(
+            background: palette.background,
+            foreground: palette.foreground,
+            headerTintOpacity: light ? 0.055 : 0.075,
+            ruleOpacity: light ? 0.16 : 0.20
+        )
     }
 
     private static func nativeANSI(dark: Bool) -> [SwiftTerm.Color] {

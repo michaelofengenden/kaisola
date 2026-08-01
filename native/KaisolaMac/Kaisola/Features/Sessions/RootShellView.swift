@@ -1557,19 +1557,23 @@ struct RootShellView: View {
             // On the shared corner ladder since v1.1.8; it was a bare literal 8
             // and so sat outside every relation the rest of the chrome holds.
             let cardRadius = KaisolaVisualSystem.paneRadius
+            let terminalChrome = terminalPaneChrome(for: id)
             VStack(spacing: 0) {
                 unifiedSessionHeader(id)
                 unifiedSessionContent(id)
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
-            .background(Color(nsColor: .textBackgroundColor))
+            .background(terminalChrome.map { Color(nsColor: $0.background) }
+                ?? Color(nsColor: .textBackgroundColor))
             .clipShape(RoundedRectangle(cornerRadius: cardRadius, style: .continuous))
             .overlay {
                 RoundedRectangle(cornerRadius: cardRadius, style: .continuous)
                     .stroke(
                         model.focusedPaneID == id
                             ? Color.accentColor.opacity(0.38)
-                            : Color(nsColor: .separatorColor).opacity(0.55),
+                            : terminalChrome.map {
+                                Color(nsColor: $0.foreground).opacity($0.ruleOpacity)
+                            } ?? Color(nsColor: .separatorColor).opacity(0.55),
                         lineWidth: model.focusedPaneID == id
                             ? KaisolaVisualSystem.focusStroke
                             : KaisolaVisualSystem.hairline
@@ -1592,7 +1596,8 @@ struct RootShellView: View {
     }
 
     private func unifiedSessionHeader(_ id: String) -> some View {
-        HStack(spacing: 7) {
+        let terminalChrome = terminalPaneChrome(for: id)
+        return HStack(spacing: 7) {
             Button {
                 Task { await model.focusSurface(id) }
             } label: {
@@ -1669,9 +1674,23 @@ struct RootShellView: View {
         .padding(.leading, 10)
         .padding(.trailing, 9)
         .frame(height: 32)
-        .background(Color(nsColor: .controlBackgroundColor).opacity(0.62))
+        .background {
+            if let terminalChrome {
+                ZStack {
+                    Color(nsColor: terminalChrome.background)
+                    Color(nsColor: terminalChrome.foreground)
+                        .opacity(terminalChrome.headerTintOpacity)
+                }
+            } else {
+                Color(nsColor: .controlBackgroundColor).opacity(0.62)
+            }
+        }
         .overlay(alignment: .bottom) {
-            Rectangle().fill(Color(nsColor: .separatorColor).opacity(0.38)).frame(height: 0.5)
+            Rectangle()
+                .fill(terminalChrome.map {
+                    Color(nsColor: $0.foreground).opacity($0.ruleOpacity)
+                } ?? Color(nsColor: .separatorColor).opacity(0.38))
+                .frame(height: 0.5)
         }
         .contentShape(Rectangle())
         .onDrag {
@@ -1687,6 +1706,14 @@ struct RootShellView: View {
             }
             Button("Minimize") { Task { await model.minimizeSurface(id) } }
         }
+    }
+
+    private func terminalPaneChrome(for id: String) -> TerminalTheme.PaneChrome? {
+        guard model.sessions.contains(where: { $0.id == id }) else { return nil }
+        return TerminalTheme.paneChrome(
+            light: colorScheme == .light,
+            mode: settings.terminalPalette
+        )
     }
 
     private func companionControllerName(for terminalID: String) -> String? {

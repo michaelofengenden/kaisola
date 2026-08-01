@@ -674,6 +674,23 @@ final class NativeTerminalInteractionTests: XCTestCase {
         }
     }
 
+    func testTerminalPaneChromeUsesTheActiveOpaqueTerminalPalette() {
+        for mode in TerminalPaletteMode.allCases {
+            for light in [false, true] {
+                let palette = TerminalTheme.palette(light: light, mode: mode)
+                let chrome = TerminalTheme.paneChrome(light: light, mode: mode)
+
+                XCTAssertTrue(chrome.background.isEqual(palette.background))
+                XCTAssertTrue(chrome.foreground.isEqual(palette.foreground))
+                XCTAssertGreaterThan(chrome.headerTintOpacity, 0)
+                XCTAssertLessThan(chrome.headerTintOpacity, 0.1)
+                XCTAssertGreaterThan(chrome.ruleOpacity, chrome.headerTintOpacity)
+                XCTAssertLessThan(chrome.ruleOpacity, 0.25)
+                XCTAssertEqual(chrome.background.alphaComponent, 1, accuracy: 0.001)
+            }
+        }
+    }
+
     func testEditMenuCarriesFindPanelActionsWithSwiftTermTags() throws {
         let menu = KaisolaMacAppDelegate.makeMainMenu(
             updateTarget: nil,

@@ -333,13 +333,15 @@ struct AcpChatView: View {
                         .foregroundStyle(.secondary)
                     Spacer()
                     if conversation.canRestart {
-                        Button("Restart") {
+                        Button(conversation.queued.isEmpty ? "Restart" : "Restart & Resume") {
                             Task { await conversation.restart() }
                         }
                         .buttonStyle(.bordered)
                         .controlSize(.small)
                         .keyboardShortcut("r", modifiers: [.command, .shift])
-                        .help("Start a fresh adapter and resume this ACP session when supported")
+                        .help(conversation.queued.isEmpty
+                            ? "Start a fresh adapter and resume this ACP session when supported"
+                            : "Start a fresh adapter, resume this ACP session when supported, and send the preserved follow-ups in order")
                     } else if conversation.isReconnecting {
                         ProgressView().controlSize(.mini)
                     }
@@ -509,6 +511,22 @@ struct AcpChatView: View {
 
     private var queuedStrip: some View {
         VStack(alignment: .leading, spacing: 4) {
+            if conversation.isConnected, !conversation.isRunning {
+                HStack(spacing: 8) {
+                    Text("\(conversation.queued.count) preserved follow-up\(conversation.queued.count == 1 ? "" : "s")")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    Spacer()
+                    Button("Resume All") {
+                        conversation.resumeQueuedFollowUps()
+                    }
+                    .buttonStyle(.borderless)
+                    .font(.caption.weight(.semibold))
+                    .help("Send the preserved follow-ups one at a time in their original order")
+                    .accessibilityLabel("Resume all queued follow-ups")
+                }
+                .padding(.horizontal, 8)
+            }
             ForEach(conversation.queued) { message in
                 HStack(spacing: 6) {
                     Image(systemName: "clock").font(.caption2).foregroundStyle(.secondary)

@@ -345,7 +345,8 @@ final class NativeSessionStoreTests: XCTestCase {
                 label: "Work",
                 configDirectory: "/tmp/claude-work"
             ),
-            title: "Claude · workspace"
+            title: "Claude · workspace",
+            queuedPrompts: ["oldest follow-up", "newest follow-up"]
         )
         let panes = [
             NativeRestorablePaneState(
@@ -457,6 +458,7 @@ final class NativeSessionStoreTests: XCTestCase {
 
         XCTAssertNil(decoded.accountBinding)
         XCTAssertEqual(decoded.acpSessionID, "provider-legacy")
+        XCTAssertEqual(decoded.queuedPrompts, [])
     }
 
     func testWorkspaceSanitizerDropsCrossProviderBindingAndContinuation() async throws {
@@ -629,7 +631,8 @@ final class NativeSessionStoreTests: XCTestCase {
             agentID: "codex",
             workspacePath: basePath,
             acpSessionID: "provider-recent",
-            title: "Closed chat"
+            title: "Closed chat",
+            queuedPrompts: ["preserve first", "preserve second"]
         )
         let recentPane = NativeRestorablePaneState(
             id: chat.id,
@@ -659,6 +662,10 @@ final class NativeSessionStoreTests: XCTestCase {
         XCTAssertTrue(closed.isRecentlyClosed)
         XCTAssertTrue(closed.isMinimized)
         XCTAssertEqual(closed.closedAt, 123_456)
+        XCTAssertEqual(
+            closed.surface.agentChatDescriptor?.queuedPrompts,
+            ["preserve first", "preserve second"]
+        )
         XCTAssertEqual(restored.layout.sessionIDs, [terminalPane.id])
         XCTAssertFalse(restored.layout.contains(chat.id))
         XCTAssertEqual(restored.focusedPaneID, terminalPane.id)

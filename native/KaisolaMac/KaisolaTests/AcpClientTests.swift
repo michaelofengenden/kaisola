@@ -28,6 +28,76 @@ final class AcpClientTests: XCTestCase {
     }
 
     @MainActor
+    func testRestartResumesOnlyNeverDispatchedFollowUpsInExactFIFOOrder() async throws {
+        let crashedTransport = ScriptedAcpTransport(crashOnFirstPrompt: true)
+        let recoveredTransport = ScriptedAcpTransport()
+        let clients = [
+            AcpClient(transport: crashedTransport),
+            AcpClient(transport: recoveredTransport),
+        ]
+        var clientIndex = 0
+        let conversation = AcpConversation(
+            title: "Queue recovery",
+            command: "mock",
+            arguments: [],
+            environment: [:],
+            cwd: "/tmp",
+            clientFactory: {
+                let client = clients[clientIndex]
+                clientIndex += 1
+                return client
+            }
+        )
+        await conversation.start()
+
+        XCTAssertTrue(conversation.send("ambiguous in-flight prompt"))
+        XCTAssertTrue(conversation.send("oldest never-dispatched follow-up"))
+        XCTAssertTrue(conversation.send("newest never-dispatched follow-up"))
+
+        var deadline = Date().addingTimeInterval(5)
+        while conversation.isConnected || conversation.isRunning {
+            if Date() > deadline { XCTFail("scripted adapter did not crash"); break }
+            try await Task.sleep(nanoseconds: 20_000_000)
+        }
+        XCTAssertEqual(
+            conversation.queued.map(\.text),
+            ["oldest never-dispatched follow-up", "newest never-dispatched follow-up"]
+        )
+        XCTAssertTrue(conversation.rows.contains { row in
+            if case let .user(_, text, failed) = row {
+                return text == "ambiguous in-flight prompt" && failed
+            }
+            return false
+        })
+
+        await conversation.restart()
+
+        deadline = Date().addingTimeInterval(5)
+        while conversation.isRunning || !conversation.queued.isEmpty {
+            if Date() > deadline { XCTFail("preserved queue did not drain after restart"); break }
+            try await Task.sleep(nanoseconds: 20_000_000)
+        }
+        let crashedPrompts = await crashedTransport.receivedPromptTexts()
+        let recoveredPrompts = await recoveredTransport.receivedPromptTexts()
+        let recoveredSessionMethods = await recoveredTransport.receivedSessionMethods()
+        XCTAssertTrue(conversation.isConnected)
+        XCTAssertEqual(crashedPrompts, ["ambiguous in-flight prompt"])
+        XCTAssertEqual(
+            recoveredPrompts,
+            ["oldest never-dispatched follow-up", "newest never-dispatched follow-up"]
+        )
+        XCTAssertFalse(
+            recoveredPrompts.contains("ambiguous in-flight prompt"),
+            "an interrupted prompt has ambiguous delivery and must require explicit Retry"
+        )
+        XCTAssertTrue(
+            recoveredSessionMethods.contains("session/load"),
+            "restart should offer the prior provider session before draining its queue"
+        )
+        _ = await conversation.stop()
+    }
+
+    @MainActor
     func testSteeringQueuedTurnClearsPresentedAndQueuedPermissions() async throws {
         let transport = ScriptedAcpTransport()
         let client = AcpClient(transport: transport)
@@ -360,9 +430,13 @@ private actor ScriptedAcpTransport: AcpByteTransport {
     private let rejectFirstMcpSession: Bool
     private let resumeCapability: Bool
     private let rejectRestoration: Bool
+    private let crashOnFirstPrompt: Bool
     private var sessionMcpServers: [JSONValue] = []
     private var sessionMcpAttempts: [[JSONValue]] = []
     private var sessionMethods: [String] = []
+    private var promptTexts: [String] = []
+    private var didCrashPrompt = false
+    private var recordedExitCode: Int32 = 0
     private var terminations = 0
 
     init(
@@ -371,7 +445,8 @@ private actor ScriptedAcpTransport: AcpByteTransport {
         mcpSSE: Bool = false,
         rejectFirstMcpSession: Bool = false,
         resumeCapability: Bool = false,
-        rejectRestoration: Bool = false
+        rejectRestoration: Bool = false,
+        crashOnFirstPrompt: Bool = false
     ) {
         self.protocolVersion = protocolVersion
         self.mcpHTTP = mcpHTTP
@@ -379,11 +454,13 @@ private actor ScriptedAcpTransport: AcpByteTransport {
         self.rejectFirstMcpSession = rejectFirstMcpSession
         self.resumeCapability = resumeCapability
         self.rejectRestoration = rejectRestoration
+        self.crashOnFirstPrompt = crashOnFirstPrompt
     }
 
     func receivedSessionMcpServers() -> [JSONValue] { sessionMcpServers }
     func receivedSessionMcpAttempts() -> [[JSONValue]] { sessionMcpAttempts }
     func receivedSessionMethods() -> [String] { sessionMethods }
+    func receivedPromptTexts() -> [String] { promptTexts }
     func terminationCount() -> Int { terminations }
 
     func start(command: String, arguments: [String], environment: [String: String], cwd: String) async throws {
@@ -469,6 +546,18 @@ private actor ScriptedAcpTransport: AcpByteTransport {
                 ]),
             ]))
         case "session/prompt":
+            if let text = object["params"]?.objectValue?["prompt"]?.arrayValue?
+                .first?.objectValue?["text"]?.stringValue {
+                promptTexts.append(text)
+            }
+            if crashOnFirstPrompt, !didCrashPrompt {
+                didCrashPrompt = true
+                recordedExitCode = 17
+                started = false
+                waiter?.resume(returning: nil)
+                waiter = nil
+                return
+            }
             streamTurn()
             reply(id: id, result: .object(["stopReason": .string("end_turn")]))
         default:
@@ -542,7 +631,7 @@ private actor ScriptedAcpTransport: AcpByteTransport {
         waiter = nil
     }
 
-    func exitCode() async -> Int32? { 0 }
+    func exitCode() async -> Int32? { recordedExitCode }
 
     private func trimmed(_ data: Data) -> Data {
         data.last == 0x0A ? data.dropLast() : data

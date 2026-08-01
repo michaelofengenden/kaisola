@@ -636,6 +636,10 @@ final class AppModelProjectContextTests: XCTestCase {
             .message(id: "agent-1", text: "keep this answer"),
         ]
         chat.conversation.seedRowsForTesting(rows)
+        chat.conversation.seedQueuedPromptsForTesting([
+            "oldest pending follow-up",
+            "newest pending follow-up",
+        ])
         chat.conversation.onTranscriptChanged?(rows)
         chat.conversation.saveDraft("keep this draft")
 
@@ -653,6 +657,10 @@ final class AppModelProjectContextTests: XCTestCase {
         let restored = try XCTUnwrap(model.chats.first { $0.id == chat.id })
         XCTAssertEqual(restored.conversation.rows, rows)
         XCTAssertEqual(restored.conversation.loadDraft(), "keep this draft")
+        XCTAssertEqual(
+            restored.conversation.queued.map(\.text),
+            ["oldest pending follow-up", "newest pending follow-up"]
+        )
         XCTAssertTrue(model.recentlyClosedSurfaces(in: chat.projectID).isEmpty)
 
         XCTAssertTrue(model.closeChat(chat.id))

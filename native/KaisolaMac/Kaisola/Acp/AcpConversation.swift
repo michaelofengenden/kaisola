@@ -54,7 +54,9 @@ final class AcpConversation: ObservableObject {
     @Published private(set) var statusMessage: String?
     /// Follow-up messages typed while a turn was running; each dispatches when
     /// the preceding turn ends.
-    @Published private(set) var queued: [QueuedMessage] = []
+    @Published private(set) var queued: [QueuedMessage] = [] {
+        didSet { onQueueChanged?(queued.map(\.text)) }
+    }
     /// Files/images staged in the composer, shown as chips, sent as real ACP
     /// content blocks with the next immediate send and cleared then. Queued
     /// follow-ups never carry attachments (see `send`).
@@ -120,6 +122,10 @@ final class AcpConversation: ObservableObject {
     var onTranscriptChanged: (([AcpTranscriptRow]) -> Void)?
     var onProviderSessionID: ((String) -> Void)?
     var onDraftChanged: ((String) -> Void)?
+    /// Pending follow-ups are part of the workspace recovery contract, not
+    /// ephemeral view state. AppModel uses this hook to archive their exact
+    /// FIFO order whenever the queue changes.
+    var onQueueChanged: (([String]) -> Void)?
     /// Stable per-chat key for persisting the composer draft across relaunches.
     /// Set by the owner (AppModel passes the chat id) or the `draftKey` init
     /// parameter. Nil disables persistence: `loadDraft` returns "" and
@@ -130,6 +136,10 @@ final class AcpConversation: ObservableObject {
     /// child process exits. Injected clients remain fixed so tests/custom
     /// transports never get silently swapped for a real process transport.
     private let ownsClient: Bool
+    /// Produces a genuinely fresh client/transport for an app-owned restart.
+    /// The injectable factory keeps crash recovery process-free in tests while
+    /// preserving the rule that caller-owned clients are never replaced.
+    private let clientFactory: @MainActor () -> AcpClient
     private let command: String
     private let arguments: [String]
     private let environment: [String: String]
@@ -146,6 +156,11 @@ final class AcpConversation: ObservableObject {
     /// `turnCounter` gave those non-contiguous rows duplicate SwiftUI ids.
     private var segmentCounter = 0
     private var queueCounter = 0
+    /// The prompt task is retained so restart can quiesce the old client before
+    /// a queued follow-up is dispatched on its replacement. This closes the
+    /// crash race where an old failure could otherwise mark a new turn idle.
+    private var activePromptTask: Task<Void, Never>?
+    private var activePromptTurn: Int?
     private var attachmentCounter = 0
     private var draftPersistenceTask: Task<Void, Never>?
     private var pendingDraftPersistence: String?
@@ -171,13 +186,15 @@ final class AcpConversation: ObservableObject {
         cwd: String,
         mcpServers: [JSONValue] = [],
         client: AcpClient? = nil,
+        clientFactory: (@MainActor () -> AcpClient)? = nil,
         ruleStore: PermissionRuleStore = PermissionRuleStore(),
         sensitiveGlobs: [String] = AcpPermissionRules.defaultSensitiveGlobs,
         draftKey: String? = nil,
         resumeSessionID: String? = nil,
         initialRows: [AcpTranscriptRow] = [],
         initialDraft: String? = nil,
-        initialUsage: AcpUsage? = nil
+        initialUsage: AcpUsage? = nil,
+        initialQueuedPrompts: [String] = []
     ) {
         self.title = title
         self.command = command
@@ -185,7 +202,9 @@ final class AcpConversation: ObservableObject {
         self.environment = environment
         self.cwd = cwd
         self.mcpServers = mcpServers
-        self.client = client ?? AcpClient()
+        let factory = clientFactory ?? { AcpClient() }
+        self.clientFactory = factory
+        self.client = client ?? factory()
         self.ownsClient = client == nil
         self.ruleStore = ruleStore
         self.sensitiveGlobs = sensitiveGlobs
@@ -194,13 +213,17 @@ final class AcpConversation: ObservableObject {
         self.rows = initialRows
         self.restoredDraft = initialDraft
         self.usage = initialUsage
+        self.queued = initialQueuedPrompts.enumerated().map { index, text in
+            QueuedMessage(id: "q\(index + 1)", text: text)
+        }
+        self.queueCounter = initialQueuedPrompts.count
         self.turnCounter = initialRows.reduce(into: 0) { count, row in
             if case .user = row { count += 1 }
         }
         self.segmentCounter = initialRows.count
     }
 
-    func start() async {
+    func start(resumeQueuedPrompts: Bool = false) async {
         guard !hasStarted else { return }
         hasStarted = true
         // One ordered pipe from the client's (off-main) event handler to the
@@ -234,6 +257,11 @@ final class AcpConversation: ObservableObject {
             configOptions = info.configOptions
             isConnected = true
             statusMessage = nil
+            // Only entries still in `queued` are known never to have been
+            // dispatched. An explicit adapter restart resumes them; ordinary
+            // app restoration leaves them paused until the user chooses Resume
+            // All, avoiding surprise work immediately after launch.
+            if resumeQueuedPrompts { flushQueue() }
         } catch {
             hasStarted = false
             eventContinuation?.finish()
@@ -260,10 +288,13 @@ final class AcpConversation: ObservableObject {
         eventContinuation = nil
         eventConsumerTask?.cancel()
         eventConsumerTask = nil
-        await client.stop()
-        client = AcpClient()
+        let oldClient = client
+        let oldPromptTask = activePromptTask
+        await oldClient.stop()
+        await oldPromptTask?.value
+        client = clientFactory()
         hasStarted = false
-        await start()
+        await start(resumeQueuedPrompts: true)
         isReconnecting = false
     }
 
@@ -294,6 +325,12 @@ final class AcpConversation: ObservableObject {
     /// Drop a still-pending queued follow-up before it dispatches.
     func removeQueued(_ id: String) {
         queued.removeAll { $0.id == id }
+    }
+
+    /// Resume a restored/paused FIFO. Dispatch removes exactly one item; the
+    /// normal turn-end path advances the remainder one at a time.
+    func resumeQueuedFollowUps() {
+        flushQueue()
     }
 
     /// Steer: promote a queued follow-up to the front and interrupt the current
@@ -462,11 +499,20 @@ final class AcpConversation: ObservableObject {
         let displayText = Self.userText(trimmed, attachments: attachments)
         rows.append(.user(id: rowID, text: displayText, failed: false))
         isRunning = true
-        Task {
+        let dispatchClient = client
+        activePromptTurn = turn
+        activePromptTask = Task { [weak self] in
+            guard let self else { return }
+            defer {
+                if self.activePromptTurn == turn {
+                    self.activePromptTurn = nil
+                    self.activePromptTask = nil
+                }
+            }
             // The snapshot must complete BEFORE the agent starts, or it could
             // capture partial agent edits instead of the pre-turn tree.
             await recordCheckpoint(turn: turn)
-            do { try await client.prompt(displayText, attachments: attachments) }
+            do { try await dispatchClient.prompt(displayText, attachments: attachments) }
             catch {
                 statusMessage = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
                 isRunning = false
@@ -599,6 +645,9 @@ final class AcpConversation: ObservableObject {
         await client.stop()
         isConnected = false
         isRunning = false
+        statusMessage = queued.isEmpty
+            ? "The agent is stopped."
+            : "The agent is stopped. \(queued.count) queued follow-up\(queued.count == 1 ? " is" : "s are") ready to resume."
         pendingPermission = nil
         permissionQueue.removeAll()
         eventContinuation?.finish()
@@ -731,6 +780,15 @@ final class AcpConversation: ObservableObject {
         rows = newRows
     }
 
+    /// Test-only: seed the never-dispatched recovery FIFO without spawning an
+    /// adapter or manufacturing an artificial running turn.
+    func seedQueuedPromptsForTesting(_ prompts: [String]) {
+        queued = prompts.enumerated().map { index, text in
+            QueuedMessage(id: "q\(index + 1)", text: text)
+        }
+        queueCounter = prompts.count
+    }
+
     /// Test seam for the FIFO presentation policy. Wire parsing remains covered
     /// separately by `AcpClientTests`; this exercises the UI-facing queue without
     /// spawning an adapter.
@@ -824,7 +882,10 @@ final class AcpConversation: ObservableObject {
             // Preserve queued user text for inspection/copying. The adapter is
             // gone so it cannot auto-dispatch, but silently deleting authored
             // follow-ups is worse than leaving them visible.
-            statusMessage = code == 0 ? "The agent ended." : "The agent exited (code \(code))."
+            let ending = code == 0 ? "The agent ended." : "The agent exited (code \(code))."
+            statusMessage = queued.isEmpty
+                ? ending
+                : "\(ending) \(queued.count) queued follow-up\(queued.count == 1 ? " is" : "s are") ready to resume."
         }
     }
 

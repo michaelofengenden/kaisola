@@ -64,6 +64,9 @@ Large product and architecture work remains ordered in
   and confirmed permanent Delete. Relaunch keeps closed transcripts, drafts,
   queued prompts, and Mesh worktree manifests; Undo Last Close and per-entry
   Restore/Delete controls are available from each project rail.
+- ACP follow-up queues now persist in exact FIFO order. A fresh adapter resumes
+  only never-dispatched entries after Restart; the interrupted prompt remains a
+  visible explicit Retry so ambiguous delivery cannot duplicate side effects.
 
 ## Open audit fixes
 
@@ -77,11 +80,6 @@ Large product and architecture work remains ordered in
 - Keep the PR 8 physical-trackpad gate open until sub-row movement is genuinely
   continuous in the installed app; row-quantized SwiftTerm scrolling is not
   considered fixed by the repaint/geometry work alone.
-
-### Shell, Git, and session recovery
-
-- Add ACP adapter restart queue recovery so pending work survives an adapter
-  crash without manual reconstruction.
 
 ### Accessibility, copy, and readiness
 

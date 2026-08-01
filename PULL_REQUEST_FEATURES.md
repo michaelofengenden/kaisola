@@ -227,11 +227,11 @@ Completed scope:
   Restore, and permanently Delete for Chat and Mesh.
 - Preserve transcripts, drafts, queued prompts, and recoverable worktrees for
   every non-delete action, with Undo for recently closed surfaces.
+- Persist ordinary ACP follow-up queues in exact FIFO order. Restart reconnects
+  with a fresh transport and resumes only entries that were never dispatched;
+  interrupted prompts stay failed for an explicit, non-duplicating Retry.
 
-Remaining scope:
-
-- Add ACP restart queue recovery so a crashed adapter can resume without users
-  manually reconstructing pending work.
+Implementation status: complete.
 
 Acceptance:
 

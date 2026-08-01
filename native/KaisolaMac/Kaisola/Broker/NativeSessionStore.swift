@@ -795,6 +795,10 @@ struct NativeRestorableSurfaceState: Codable, Equatable, Hashable, Sendable {
     let acpSessionID: String?
     let accountBinding: SessionAccountBinding?
     let title: String?
+    /// Never-dispatched ACP follow-ups in exact FIFO order. Optional at the
+    /// generic surface layer so schema-one archives decode without migration;
+    /// `agentChatDescriptor` normalizes absence to an empty queue.
+    let queuedPrompts: [String]?
     let mesh: NativeRestorableMeshDescriptor?
 
     init(
@@ -806,6 +810,7 @@ struct NativeRestorableSurfaceState: Codable, Equatable, Hashable, Sendable {
         acpSessionID: String? = nil,
         accountBinding: SessionAccountBinding? = nil,
         title: String? = nil,
+        queuedPrompts: [String]? = nil,
         mesh: NativeRestorableMeshDescriptor? = nil
     ) {
         self.kind = kind
@@ -816,6 +821,7 @@ struct NativeRestorableSurfaceState: Codable, Equatable, Hashable, Sendable {
         self.acpSessionID = acpSessionID
         self.accountBinding = accountBinding?.normalized
         self.title = title
+        self.queuedPrompts = queuedPrompts
         self.mesh = mesh
     }
 }
@@ -828,6 +834,7 @@ struct NativeRestorableAgentChatDescriptor: Codable, Equatable, Hashable, Identi
     let acpSessionID: String?
     let accountBinding: SessionAccountBinding?
     let title: String?
+    let queuedPrompts: [String]
 
     init(
         id: String,
@@ -836,7 +843,8 @@ struct NativeRestorableAgentChatDescriptor: Codable, Equatable, Hashable, Identi
         workspacePath: String,
         acpSessionID: String?,
         accountBinding: SessionAccountBinding? = nil,
-        title: String?
+        title: String?,
+        queuedPrompts: [String] = []
     ) {
         self.id = id
         self.projectID = projectID
@@ -845,6 +853,45 @@ struct NativeRestorableAgentChatDescriptor: Codable, Equatable, Hashable, Identi
         self.acpSessionID = acpSessionID
         self.accountBinding = accountBinding?.normalized
         self.title = title
+        self.queuedPrompts = queuedPrompts
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case id
+        case projectID
+        case agentID
+        case workspacePath
+        case acpSessionID
+        case accountBinding
+        case title
+        case queuedPrompts
+    }
+
+    init(from decoder: any Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = try container.decode(String.self, forKey: .id)
+        projectID = try container.decode(String.self, forKey: .projectID)
+        agentID = try container.decode(String.self, forKey: .agentID)
+        workspacePath = try container.decode(String.self, forKey: .workspacePath)
+        acpSessionID = try container.decodeIfPresent(String.self, forKey: .acpSessionID)
+        accountBinding = try container.decodeIfPresent(
+            SessionAccountBinding.self,
+            forKey: .accountBinding
+        )?.normalized
+        title = try container.decodeIfPresent(String.self, forKey: .title)
+        queuedPrompts = try container.decodeIfPresent([String].self, forKey: .queuedPrompts) ?? []
+    }
+
+    func encode(to encoder: any Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(id, forKey: .id)
+        try container.encode(projectID, forKey: .projectID)
+        try container.encode(agentID, forKey: .agentID)
+        try container.encode(workspacePath, forKey: .workspacePath)
+        try container.encodeIfPresent(acpSessionID, forKey: .acpSessionID)
+        try container.encodeIfPresent(accountBinding, forKey: .accountBinding)
+        try container.encodeIfPresent(title, forKey: .title)
+        try container.encode(queuedPrompts, forKey: .queuedPrompts)
     }
 }
 
@@ -858,7 +905,8 @@ extension NativeRestorableSurfaceState {
             workspacePath: descriptor.workspacePath,
             acpSessionID: descriptor.acpSessionID,
             accountBinding: descriptor.accountBinding,
-            title: descriptor.title
+            title: descriptor.title,
+            queuedPrompts: descriptor.queuedPrompts
         )
     }
 
@@ -875,7 +923,8 @@ extension NativeRestorableSurfaceState {
             workspacePath: workspacePath,
             acpSessionID: acpSessionID,
             accountBinding: accountBinding,
-            title: title
+            title: title,
+            queuedPrompts: queuedPrompts ?? []
         )
     }
 
@@ -1133,6 +1182,13 @@ actor NativeWorkspaceStateStore {
     static let maximumDrafts = 128
     static let maximumDraftBytes = 256 * 1_024
     static let maximumTotalDraftBytes = 2 * 1_024 * 1_024
+    /// Recovery queues are user-authored text and therefore receive the same
+    /// per-entry ceiling as drafts plus a tighter per-chat aggregate bound.
+    /// This keeps a hostile archive from turning restoration into an unbounded
+    /// allocation while preserving ordinary FIFO queues byte-for-byte.
+    static let maximumQueuedPromptsPerChat = 64
+    static let maximumQueuedPromptBytes = maximumDraftBytes
+    static let maximumQueuedPromptTotalBytes = 512 * 1_024
     static let maximumArchiveBytes = 3 * 1_024 * 1_024
     /// Process-wide production instance. Using one actor avoids lost updates
     /// between independently rendered chat/pane views.
@@ -1857,6 +1913,7 @@ actor NativeWorkspaceStateStore {
             // continuation id as well. The transcript can still be restored,
             // but the adapter must begin a fresh thread under current context.
             let canResume = surface.accountBinding == nil || accountBinding != nil
+            let queuedPrompts = boundedQueuedPrompts(surface.queuedPrompts ?? [])
             return NativeRestorableSurfaceState(
                 kind: .agentChat,
                 id: surface.id,
@@ -1867,7 +1924,8 @@ actor NativeWorkspaceStateStore {
                     isValidIdentifier($0) ? $0 : nil
                 } : nil,
                 accountBinding: accountBinding,
-                title: title
+                title: title,
+                queuedPrompts: queuedPrompts
             )
         case .mesh:
             guard let descriptor = surface.meshDescriptor,
@@ -2014,6 +2072,19 @@ actor NativeWorkspaceStateStore {
 
             guard totalBytes + bytes <= maximumTotalDraftBytes else { continue }
             result.append(draft)
+            totalBytes += bytes
+        }
+        return result
+    }
+
+    private static func boundedQueuedPrompts(_ prompts: [String]) -> [String] {
+        var totalBytes = 0
+        var result: [String] = []
+        for prompt in prompts.prefix(maximumQueuedPromptsPerChat) {
+            let bytes = prompt.utf8.count
+            guard bytes <= maximumQueuedPromptBytes,
+                  totalBytes + bytes <= maximumQueuedPromptTotalBytes else { continue }
+            result.append(prompt)
             totalBytes += bytes
         }
         return result

@@ -2027,7 +2027,8 @@ final class AppModel: ObservableObject {
                 workspacePath: chat.workspaceDirectory.path,
                 acpSessionID: chat.conversation.providerSessionID,
                 accountBinding: chat.accountBinding,
-                title: chat.conversation.title
+                title: chat.conversation.title,
+                queuedPrompts: chat.conversation.queued.map(\.text)
             )
             panes.append(NativeRestorablePaneState(
                 id: chat.id,
@@ -2461,7 +2462,8 @@ final class AppModel: ObservableObject {
                     accountBinding: descriptor.accountBinding,
                     initialRows: transcript?.rows ?? [],
                     initialDraft: draft,
-                    initialUsage: transcript?.usage
+                    initialUsage: transcript?.usage,
+                    initialQueuedPrompts: descriptor.queuedPrompts
                 )
             }
 
@@ -2754,7 +2756,8 @@ final class AppModel: ObservableObject {
             accountBinding: accountBinding,
             initialRows: [],
             initialDraft: nil,
-            initialUsage: nil
+            initialUsage: nil,
+            initialQueuedPrompts: []
         ) != nil else { return }
         focusPane(chatID, projectID: project.id)
         focusSurfaceFields(chatID)
@@ -2771,7 +2774,8 @@ final class AppModel: ObservableObject {
         accountBinding: SessionAccountBinding?,
         initialRows: [AcpTranscriptRow],
         initialDraft: String?,
-        initialUsage: AcpPersistedUsage?
+        initialUsage: AcpPersistedUsage?,
+        initialQueuedPrompts: [String]
     ) -> AcpChatHandle? {
         guard chats.contains(where: { $0.id == chatID }) == false else { return nil }
         explicitlyClosedChatIDs.remove(chatID)
@@ -2808,7 +2812,8 @@ final class AppModel: ObservableObject {
                     costAmount: $0.costAmount,
                     costCurrency: $0.costCurrency
                 )
-            }
+            },
+            initialQueuedPrompts: initialQueuedPrompts
         )
         usageCenter.register(chatID: chatID, sourceID: usageSourceID)
         if let initialUsage {
@@ -2867,6 +2872,9 @@ final class AppModel: ObservableObject {
         conversation.onProviderSessionID = { [weak self] _ in
             self?.scheduleWorkspaceStateSave(projectID: projectID)
         }
+        conversation.onQueueChanged = { [weak self] _ in
+            self?.scheduleWorkspaceStateSave(projectID: projectID)
+        }
         let handle = AcpChatHandle(
             id: chatID,
             agentID: agent.id,
@@ -2912,7 +2920,8 @@ final class AppModel: ObservableObject {
             workspacePath: closingChat.workspaceDirectory.path,
             acpSessionID: closingChat.conversation.providerSessionID,
             accountBinding: closingChat.accountBinding,
-            title: closingChat.conversation.title
+            title: closingChat.conversation.title,
+            queuedPrompts: closingChat.conversation.queued.map(\.text)
         )
         storeRecentlyClosedPane(NativeRestorablePaneState(
             id: chatID,
@@ -2961,6 +2970,7 @@ final class AppModel: ObservableObject {
             explicitlyClosedChatIDs.insert(chatID)
             closingChat.conversation.onTranscriptChanged = nil
             closingChat.conversation.onDraftChanged = nil
+            closingChat.conversation.onQueueChanged = nil
             chatShutdownTasks.start(chatID) {
                 _ = await closingChat.conversation.stop()
             }
@@ -3192,7 +3202,8 @@ final class AppModel: ObservableObject {
                 accountBinding: descriptor.accountBinding,
                 initialRows: transcript?.rows ?? [],
                 initialDraft: draft,
-                initialUsage: transcript?.usage
+                initialUsage: transcript?.usage,
+                initialQueuedPrompts: descriptor.queuedPrompts
             ) != nil else {
                 return .blocked("The chat adapter is unavailable. The Recently Closed entry was preserved.")
             }
@@ -3669,7 +3680,8 @@ final class AppModel: ObservableObject {
                 ),
                 initialRows: [],
                 initialDraft: "",
-                initialUsage: nil
+                initialUsage: nil,
+                initialQueuedPrompts: []
               ) else { return }
         chat.conversation.loadVisualFixture()
         var layout = paneLayouts[project.id] ?? SessionPaneLayout()

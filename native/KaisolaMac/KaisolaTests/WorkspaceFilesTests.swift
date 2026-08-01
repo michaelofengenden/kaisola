@@ -292,6 +292,35 @@ final class WorkspaceFilesTests: XCTestCase {
             hasPendingAction: true
         ))
     }
+
+    func testPreviewNoticesDistinguishRecoveryWarningsFromFailures() {
+        let recovered = FilePreviewNotice.recoveredDraft(diskChanged: false)
+        XCTAssertEqual(recovered.severity, .information)
+        XCTAssertEqual(recovered.message, "Recovered an unsaved draft.")
+        XCTAssertEqual(recovered.severity.systemImageName, "info.circle.fill")
+        XCTAssertEqual(
+            recovered.accessibilityLabel,
+            "Information: Recovered an unsaved draft."
+        )
+
+        let conflicted = FilePreviewNotice.recoveredDraft(diskChanged: true)
+        XCTAssertEqual(conflicted.severity, .warning)
+        XCTAssertEqual(
+            conflicted.message,
+            "Recovered an unsaved draft; the file also changed on disk."
+        )
+        XCTAssertEqual(conflicted.severity.systemImageName, "exclamationmark.triangle.fill")
+        XCTAssertEqual(conflicted.severity.accessibilityName, "Warning")
+
+        let failure = FilePreviewNotice.error("Could not save the draft.")
+        XCTAssertEqual(failure.severity, .error)
+        XCTAssertEqual(failure.severity.systemImageName, "xmark.octagon.fill")
+        XCTAssertEqual(failure.accessibilityLabel, "Error: Could not save the draft.")
+
+        let warning = FilePreviewNotice.warning("The file changed on disk.")
+        XCTAssertEqual(warning.severity, .warning)
+        XCTAssertEqual(warning.message, "The file changed on disk.")
+    }
     private var root: URL!
 
     override func setUpWithError() throws {

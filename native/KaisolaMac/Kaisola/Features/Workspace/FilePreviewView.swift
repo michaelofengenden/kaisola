@@ -256,6 +256,57 @@ enum FilePreviewNavigationPolicy {
     }
 }
 
+/// User-facing preview feedback is deliberately typed so ordinary recovery is
+/// never presented as a save failure. The view supplies semantic color while
+/// this value owns stable icon and accessibility metadata for every channel.
+struct FilePreviewNotice: Equatable {
+    enum Severity: Equatable {
+        case information
+        case warning
+        case error
+
+        var systemImageName: String {
+            switch self {
+            case .information: "info.circle.fill"
+            case .warning: "exclamationmark.triangle.fill"
+            case .error: "xmark.octagon.fill"
+            }
+        }
+
+        var accessibilityName: String {
+            switch self {
+            case .information: "Information"
+            case .warning: "Warning"
+            case .error: "Error"
+            }
+        }
+    }
+
+    let severity: Severity
+    let message: String
+
+    var accessibilityLabel: String {
+        "\(severity.accessibilityName): \(message)"
+    }
+
+    static func recoveredDraft(diskChanged: Bool) -> Self {
+        Self(
+            severity: diskChanged ? .warning : .information,
+            message: diskChanged
+                ? "Recovered an unsaved draft; the file also changed on disk."
+                : "Recovered an unsaved draft."
+        )
+    }
+
+    static func warning(_ message: String) -> Self {
+        Self(severity: .warning, message: message)
+    }
+
+    static func error(_ message: String) -> Self {
+        Self(severity: .error, message: message)
+    }
+}
+
 /// AppKit's Office Open XML reader/writer is synchronous and the attributed
 /// string classes predate Sendable. Keep that work off the main actor and move
 /// the immutable result across the boundary in this explicit wrapper.
@@ -1749,7 +1800,7 @@ struct FilePreviewView: View {
     /// Shared by the reader and the editor so the read/edit toggle keeps the
     /// same line at the top of the viewport.
     @State private var textScrollMemory = FilePreviewTextScrollMemory()
-    @State private var saveError: String?
+    @State private var previewNotice: FilePreviewNotice?
     /// The URL that produced the currently rendered draft. It deliberately
     /// stays unchanged while another URL loads, so Save can never target the
     /// incoming file with the outgoing file's contents.
@@ -1806,6 +1857,10 @@ struct FilePreviewView: View {
         VStack(spacing: 0) {
             header
             Divider()
+            if let previewNotice {
+                noticeBanner(previewNotice)
+                Divider()
+            }
             if externalChangeDetected {
                 externalChangeBanner
                 Divider()
@@ -2026,6 +2081,39 @@ struct FilePreviewView: View {
         .accessibilityElement(children: .contain)
     }
 
+    private func noticeBanner(_ notice: FilePreviewNotice) -> some View {
+        let tint: Color = switch notice.severity {
+        case .information: .accentColor
+        case .warning: .orange
+        case .error: .red
+        }
+        return HStack(alignment: .firstTextBaseline, spacing: 8) {
+            Image(systemName: notice.severity.systemImageName)
+                .foregroundStyle(tint)
+                .accessibilityHidden(true)
+            Text(notice.message)
+                .font(.caption)
+                .foregroundStyle(.primary)
+                .fixedSize(horizontal: false, vertical: true)
+                .textSelection(.enabled)
+                .accessibilityLabel(notice.accessibilityLabel)
+            Spacer(minLength: 8)
+            Button {
+                previewNotice = nil
+            } label: {
+                Image(systemName: "xmark")
+            }
+            .buttonStyle(.borderless)
+            .help("Dismiss notice")
+            .accessibilityLabel("Dismiss preview notice")
+        }
+        .padding(.horizontal, 11)
+        .padding(.vertical, 7)
+        .frame(minHeight: 32)
+        .background(tint.opacity(colorScheme == .dark ? 0.13 : 0.08))
+        .accessibilityElement(children: .contain)
+    }
+
     /// FSEvents is project-wide, so re-check the exact mounted file before
     /// acting. Clean previews follow agent writes automatically; dirty editors
     /// retain the user's draft and show a reversible reload choice.
@@ -2056,9 +2144,6 @@ struct FilePreviewView: View {
             if tabs.isEmpty, isDirty {
                 Circle().fill(Color.accentColor).frame(width: 7, height: 7)
                     .accessibilityLabel("Unsaved changes")
-            }
-            if let saveError {
-                Text(saveError).font(.caption).foregroundStyle(.red).lineLimit(1)
             }
             if isLoading || isSaving { ProgressView().controlSize(.mini) }
             if case .markdown = content {
@@ -2363,7 +2448,7 @@ struct FilePreviewView: View {
                     workspaceRoot: workspaceRoot,
                     imageRevision: workspaceWatcher.changeToken,
                     zoom: $documentZoom,
-                    onError: { saveError = $0 },
+                    onError: { previewNotice = .error($0) },
                     automaticallyEditFirstBlock: ProcessInfo.processInfo.environment["KAISOLA_NATIVE_VISUAL_FIXTURE"] == "1"
                         && (ProcessInfo.processInfo.environment["KAISOLA_NATIVE_VISUAL_SURFACE"] == "preview-edit"
                             || ProcessInfo.processInfo.environment["KAISOLA_NATIVE_VISUAL_SURFACE"] == "preview-dirty-tab"),
@@ -2461,7 +2546,7 @@ struct FilePreviewView: View {
             documentID: (loadedURL ?? url).path,
             markdownURL: editableMarkdownURL,
             workspaceRoot: workspaceRoot,
-            onError: { saveError = $0 },
+            onError: { previewNotice = .error($0) },
             magnification: editableMarkdownURL == nil ? nil : documentZoom,
             onMagnificationChanged: editableMarkdownURL == nil ? nil : { documentZoom = $0 },
             scrollMemory: textScrollMemory
@@ -2482,7 +2567,7 @@ struct FilePreviewView: View {
         releaseRecoveryClaims()
         loadingURL = target
         isLoading = true
-        saveError = nil
+        previewNotice = nil
         externalChangeDetected = false
         recoveredDraftPending = false
         ownedRecoveryToken = nil
@@ -2626,11 +2711,9 @@ struct FilePreviewView: View {
                 : snapshot.modificationDate
             if restoredRecovery {
                 let diskChanged = snapshot.modificationDate != recovery?.expectedModificationDate
-                saveError = diskChanged
-                    ? "Recovered an unsaved draft; the file also changed on disk."
-                    : "Recovered an unsaved draft."
+                previewNotice = .recoveredDraft(diskChanged: diskChanged)
             } else {
-                saveError = nil
+                previewNotice = nil
             }
             isLoading = false
             refreshHighlight()
@@ -2822,7 +2905,7 @@ struct FilePreviewView: View {
                     return
                 }
                 if case .html = content { previewRevision &+= 1 }
-                saveError = nil
+                previewNotice = nil
                 if !silently {
                     ToastCenter.shared.show("Saved \(target.lastPathComponent)", style: .success)
                 }
@@ -2850,7 +2933,7 @@ struct FilePreviewView: View {
                 autosavePendingAction = false
                 showExternalChangePrompt = true
             case let .failed(message):
-                saveError = message
+                previewNotice = .error(message)
                 ToastCenter.shared.show(message, style: .error)
                 resumePendingActionPrompt()
             }
@@ -3120,7 +3203,7 @@ struct FilePreviewView: View {
         payloadTooLarge: Bool,
         richDocument: Bool
     ) {
-        saveError = message
+        previewNotice = .error(message)
         if richDocument, payloadTooLarge {
             richDraft = lastRecoverableRichDraft
             recoveredDraftPending = !richDraft.isEqual(to: savedRichText)
@@ -3130,7 +3213,7 @@ struct FilePreviewView: View {
 
     private func reportOversizedDraft() {
         let message = "This edit is too large for safe preview recovery."
-        saveError = message
+        previewNotice = .error(message)
         ToastCenter.shared.show(message, style: .error)
     }
 
@@ -3176,7 +3259,7 @@ struct FilePreviewView: View {
         let result: FilePreviewSaveResult
         if savingRichDocument {
             guard !FilePreviewDiskState.changed(onDisk: target, since: loadedModificationDate) else {
-                saveError = "The file changed on disk. Your open draft was not overwritten."
+                previewNotice = .warning("The file changed on disk. Your open draft was not overwritten.")
                 return
             }
             do {
@@ -3201,11 +3284,11 @@ struct FilePreviewView: View {
             else { savedText = textSnapshot }
             loadedModificationDate = modificationDate
             guard clearRecoveryTokens(for: target) else { return }
-            saveError = nil
+            previewNotice = nil
         case .changedOnDisk:
-            saveError = "The file changed on disk. Your open draft was not overwritten."
+            previewNotice = .warning("The file changed on disk. Your open draft was not overwritten.")
         case let .failed(message):
-            saveError = message
+            previewNotice = .error(message)
         }
     }
 

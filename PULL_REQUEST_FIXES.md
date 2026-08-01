@@ -36,12 +36,14 @@ Large product and architecture work remains ordered in
 - Markdown navigation now flushes immediately, waits for an in-flight snapshot,
   and saves a newer draft again before committing the file switch; conflicts
   and failures return to an explicit user decision.
+- Preview recovery now uses a dismissible typed notice row: an ordinary restored
+  draft is informational, a restored draft with a disk change is a warning, and
+  editor, recovery, or save failures remain errors with accessible labels.
 
 ## Open audit fixes
 
 ### Preview correctness and interaction performance
 
-- Finish the typed informational recovery banner.
 - Split the preview monolith into bounded content units and keep installed-build
   performance gates for 1 MiB text, large structured data, PDFs, and image-heavy
   Markdown.

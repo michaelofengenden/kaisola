@@ -244,6 +244,8 @@ main actor, and bounded Markdown tables visibly disclose omitted rows. Finish
 the remaining large-document architecture. Rendered Markdown links now fail
 closed to explicit http(s) destinations or symlink-confined project files, and
 navigation flushes the latest Markdown draft before switching documents.
+Recovery, conflict, and failure feedback now retain typed severity in a
+dismissible accessible notice row instead of sharing a red header label.
 
 Scope:
 

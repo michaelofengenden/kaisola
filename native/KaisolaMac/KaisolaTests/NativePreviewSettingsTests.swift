@@ -1094,6 +1094,107 @@ final class NativePreviewSettingsTests: XCTestCase {
         )
     }
 
+    // MARK: - Opening sidebar width
+
+    /// macOS honours `navigationSplitViewColumnWidth`'s `min:`/`max:` but not
+    /// its `ideal:` for the *opening* width, so Kaisola's 248pt rail opened at
+    /// roughly 195 and truncated its titles. The override has to be narrow: it
+    /// fires once, only on a column still sitting at AppKit's untouched
+    /// default, and never against a width the user chose.
+    func testSidebarIsWidenedOnlyOnceAndOnlyFromTheSystemDefault() {
+        // The case the feature exists for.
+        XCTAssertTrue(
+            InitialSidebarWidth.shouldForceInitialWidth(currentWidth: 195, didForce: false)
+        )
+        // AppKit's default is undocumented, so it is matched with tolerance.
+        XCTAssertTrue(
+            InitialSidebarWidth.shouldForceInitialWidth(currentWidth: 186, didForce: false)
+        )
+        XCTAssertTrue(
+            InitialSidebarWidth.shouldForceInitialWidth(currentWidth: 204, didForce: false)
+        )
+
+        // Never twice: a user who drags the rail back toward the default keeps
+        // their width across relaunches.
+        XCTAssertFalse(
+            InitialSidebarWidth.shouldForceInitialWidth(currentWidth: 195, didForce: true)
+        )
+
+        // Never against a restored or user-chosen width — including the ideal
+        // itself, so a second window does not re-run the override.
+        for width in [168.0, 240.0, 248.0, 300.0, 340.0] {
+            XCTAssertFalse(
+                InitialSidebarWidth.shouldForceInitialWidth(
+                    currentWidth: width,
+                    didForce: false
+                ),
+                "\(width) is not AppKit's default and must be left alone"
+            )
+        }
+    }
+
+    /// The "we did this" flag is per window restoration id, and the id falls
+    /// back through identifier → autosave name → a fixed key so a window that
+    /// reports neither still gets a stable, non-empty bucket.
+    func testInitialSidebarWidthLedgerIsScopedPerWindow() throws {
+        let suite = "kaisola-sidebar-width-\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+
+        XCTAssertFalse(InitialSidebarWidth.hasApplied(restorationID: "main", defaults: defaults))
+        InitialSidebarWidth.markApplied(restorationID: "main", defaults: defaults)
+        XCTAssertTrue(InitialSidebarWidth.hasApplied(restorationID: "main", defaults: defaults))
+        // A different window has its own answer.
+        XCTAssertFalse(InitialSidebarWidth.hasApplied(restorationID: "second", defaults: defaults))
+
+        XCTAssertEqual(
+            InitialSidebarWidth.restorationID(identifier: "window-1", frameAutosaveName: "autosave"),
+            "window-1"
+        )
+        XCTAssertEqual(
+            InitialSidebarWidth.restorationID(identifier: nil, frameAutosaveName: "autosave"),
+            "autosave"
+        )
+        XCTAssertEqual(
+            InitialSidebarWidth.restorationID(identifier: "", frameAutosaveName: ""),
+            "kaisola.window"
+        )
+    }
+
+    /// A visual fixture runs the production hierarchy in a short-lived process.
+    /// It must not leave a "we widened this window" flag in the real user's
+    /// defaults, or QA taking a screenshot would silently opt that user out of
+    /// the fix.
+    func testInitialSidebarWidthFlagStaysOutOfRealDefaultsInFixtures() {
+        XCTAssertEqual(
+            InitialSidebarWidth.store(environment: [:], processIdentifier: 42),
+            .standard
+        )
+        let fixture = InitialSidebarWidth.store(
+            environment: ["KAISOLA_NATIVE_VISUAL_FIXTURE": "1"],
+            processIdentifier: 42
+        )
+        XCTAssertNotEqual(fixture, .standard)
+    }
+
+    /// The width the override applies is the one the rest of the chrome is
+    /// designed around, not a second literal that can drift away from it.
+    func testSidebarOverrideTargetsTheIdealWidthTheChromeIsSizedFor() {
+        XCTAssertEqual(NativeWorkspaceChrome.projectSidebarIdealWidth, 248)
+        XCTAssertGreaterThan(
+            NativeWorkspaceChrome.projectSidebarIdealWidth,
+            InitialSidebarWidth.systemDefault + InitialSidebarWidth.tolerance,
+            "the ideal is inside the default's tolerance, so the override would never fire"
+        )
+        XCTAssertGreaterThanOrEqual(
+            NativeWorkspaceChrome.projectSidebarIdealWidth,
+            NativeWorkspaceChrome.projectSidebarMinimumWidth
+        )
+        XCTAssertLessThanOrEqual(
+            NativeWorkspaceChrome.projectSidebarIdealWidth,
+            NativeWorkspaceChrome.projectSidebarMaximumWidth
+        )
+    }
 
     /// With no paired Mac the section was a permanent "No other Macs yet" plus
     /// a "Updated N seconds ago" line: two rows of chrome reporting nothing.

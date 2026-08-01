@@ -376,6 +376,14 @@ struct RootShellView: View {
                 SidebarBackdropView(appearance: settings.sidebarAppearance)
                     .ignoresSafeArea()
             }
+            // `ideal:` below is honoured for the double-click reset but not for
+            // the opening width; this plants the one AppKit view that can fix
+            // that, once per window. It draws nothing and takes no hits.
+            .background {
+                InitialSidebarWidthApplier()
+                    .frame(width: 0, height: 0)
+                    .accessibilityHidden(true)
+            }
             .navigationSplitViewColumnWidth(
                 min: NativeWorkspaceChrome.projectSidebarMinimumWidth,
                 ideal: NativeWorkspaceChrome.projectSidebarIdealWidth,
@@ -1795,6 +1803,214 @@ private struct NavigationSidebarResizeAffordance: View {
         }
         .animation(.easeOut(duration: 0.12), value: hovered)
         .help("Drag or use Left/Right arrows to resize; double-click to reset")
+    }
+}
+
+/// A fallback for the SwiftUI versions that ignore
+/// `navigationSplitViewColumnWidth`'s `ideal:` when *opening* a column, honour
+/// only its `min:` and `max:`, and leave `ideal:` governing nothing but the
+/// double-click reset. Where that happens, Kaisola's 248pt rail — sized in
+/// `NativeWorkspaceChrome` for a row grammar that needs the room — opens at
+/// AppKit's own ~195pt and truncates its titles until the user drags it.
+///
+/// Measured status, so nobody has to guess whether this is load-bearing: on
+/// macOS 26 with the current SDK it is **inert**. A cold launch against cleared
+/// defaults opens the column at exactly 248.0 before this code gets a look, so
+/// `shouldForceInitialWidth` returns false and nothing is written or moved. It
+/// is kept because the guards make an inert fallback free — it can only act on
+/// a column sitting at AppKit's untouched default, only once per window, and
+/// only if the hierarchy walk finds a real `NSSplitView` — and because the
+/// widths it protects are the ones the row grammar is designed around. If a
+/// future SDK stops honouring `ideal:`, this is what keeps the rail at 248
+/// instead of shipping truncated titles.
+///
+/// The rules that decide whether to override, kept pure and free of AppKit so
+/// they can be tested without a window:
+enum InitialSidebarWidth {
+    /// The width AppKit opens a SwiftUI sidebar at when it ignores `ideal:`.
+    /// Not a documented constant, so it is matched with a tolerance rather than
+    /// for equality, and the whole feature is a no-op if the match fails.
+    static let systemDefault: CGFloat = 195
+    static let tolerance: CGFloat = 10
+
+    /// True only for a column still sitting at AppKit's untouched default.
+    ///
+    /// This is the guard that makes the override safe: a restored width the
+    /// user dragged, or any width a future macOS opens at, falls outside the
+    /// window and is left exactly as found.
+    static func isSystemDefault(_ width: CGFloat) -> Bool {
+        abs(width - systemDefault) <= tolerance
+    }
+
+    /// - Parameters:
+    ///   - currentWidth: the sidebar column's width right now.
+    ///   - didForce: whether this window's restoration id has already been
+    ///     widened once. Persisted, so a user who drags the rail narrower and
+    ///     relaunches keeps their width even though it may land back inside the
+    ///     default's tolerance.
+    static func shouldForceInitialWidth(currentWidth: CGFloat, didForce: Bool) -> Bool {
+        guard !didForce else { return false }
+        return isSystemDefault(currentWidth)
+    }
+
+    static func defaultsKey(restorationID: String) -> String {
+        "kaisola.sidebar.openedAtIdealWidth.\(restorationID)"
+    }
+
+    static func hasApplied(restorationID: String, defaults: UserDefaults) -> Bool {
+        defaults.bool(forKey: defaultsKey(restorationID: restorationID))
+    }
+
+    static func markApplied(restorationID: String, defaults: UserDefaults) {
+        defaults.set(true, forKey: defaultsKey(restorationID: restorationID))
+    }
+
+    /// Where the flag lives. A visual fixture runs the production hierarchy in
+    /// a short-lived process and must not rewrite the real user's layout just
+    /// because QA needed a screenshot — the same rule, and the same per-process
+    /// suite, that the rest of the preview settings follow.
+    static func store(
+        environment: [String: String] = ProcessInfo.processInfo.environment,
+        processIdentifier: Int32 = ProcessInfo.processInfo.processIdentifier
+    ) -> UserDefaults {
+        guard let suite = NativePreviewSettings.isolatedFixtureSuiteName(
+            environment: environment,
+            processIdentifier: processIdentifier
+        ), let defaults = UserDefaults(suiteName: suite) else { return .standard }
+        return defaults
+    }
+
+    /// Windows restored by SwiftUI carry an identifier; the autosave name is the
+    /// fallback for anything that does not.
+    static func restorationID(identifier: String?, frameAutosaveName: String) -> String {
+        if let identifier, !identifier.isEmpty { return identifier }
+        if !frameAutosaveName.isEmpty { return frameAutosaveName }
+        return "kaisola.window"
+    }
+}
+
+/// Applies `InitialSidebarWidth` once per window, by reaching the `NSSplitView`
+/// that `NavigationSplitView` is built on.
+///
+/// Introspection, so it is written to fail quietly: if a future SwiftUI stops
+/// backing the split with an `NSSplitView`, or reparents it, the hierarchy walk
+/// finds nothing and the sidebar simply opens at whatever macOS chose — the
+/// pre-existing behaviour, not a broken one.
+struct InitialSidebarWidthApplier: NSViewRepresentable {
+    var idealWidth: CGFloat = NativeWorkspaceChrome.projectSidebarIdealWidth
+    var defaults: UserDefaults = InitialSidebarWidth.store()
+
+    func makeNSView(context: Context) -> ApplierView {
+        let view = ApplierView()
+        view.idealWidth = idealWidth
+        view.defaults = defaults
+        return view
+    }
+
+    func updateNSView(_ nsView: ApplierView, context: Context) {}
+
+    final class ApplierView: NSView {
+        var idealWidth: CGFloat = NativeWorkspaceChrome.projectSidebarIdealWidth
+        var defaults: UserDefaults = InitialSidebarWidth.store()
+        private var settled = false
+        private var attempts = 0
+        /// The split view joins the hierarchy before it has laid its subviews
+        /// out, so the first look can find no ancestor at all or a zero-width
+        /// column. Retries are spaced in *time* rather than chained through
+        /// `async`: five immediate runloop hops all land inside the same
+        /// millisecond and answer the same unlaid-out question five times,
+        /// which is indistinguishable from not retrying. Bounded hard, so this
+        /// is a short settling window and never a poll.
+        private static let maximumAttempts = 12
+        private static let retryInterval: TimeInterval = 0.05
+
+        override var isFlipped: Bool { true }
+        override func hitTest(_ point: NSPoint) -> NSView? { nil }
+
+        override func viewDidMoveToWindow() {
+            super.viewDidMoveToWindow()
+            guard window != nil, !settled else { return }
+            scheduleApply()
+        }
+
+        private func scheduleApply(afterSettling: Bool = false) {
+            guard afterSettling else {
+                DispatchQueue.main.async { [weak self] in self?.applyIfNeeded() }
+                return
+            }
+            DispatchQueue.main.asyncAfter(deadline: .now() + Self.retryInterval) { [weak self] in
+                self?.applyIfNeeded()
+            }
+        }
+
+        private func applyIfNeeded() {
+            guard !settled, let window else { return }
+            attempts += 1
+            guard let splitView = enclosingVerticalSplitView() else {
+                // Nothing to drive. Retry through the settling window in case
+                // the view simply has not been parented yet, then give up for
+                // good — a SwiftUI that no longer uses NSSplitView must leave
+                // the sidebar exactly as it found it.
+                if attempts < Self.maximumAttempts {
+                    scheduleApply(afterSettling: true)
+                } else {
+                    settled = true
+                }
+                return
+            }
+            let currentWidth = splitView.subviews[0].frame.width
+            guard currentWidth > 1 else {
+                if attempts < Self.maximumAttempts {
+                    scheduleApply(afterSettling: true)
+                } else {
+                    settled = true
+                }
+                return
+            }
+
+            let restorationID = InitialSidebarWidth.restorationID(
+                identifier: window.identifier?.rawValue,
+                frameAutosaveName: window.frameAutosaveName
+            )
+            settled = true
+            guard InitialSidebarWidth.shouldForceInitialWidth(
+                currentWidth: currentWidth,
+                didForce: InitialSidebarWidth.hasApplied(restorationID: restorationID, defaults: defaults)
+            ) else { return }
+
+            splitView.setPosition(idealWidth, ofDividerAt: 0)
+            InitialSidebarWidth.markApplied(restorationID: restorationID, defaults: defaults)
+            reportVisualFixtureWidth(splitView)
+        }
+
+        /// The sidebar column is the leading pane of the *nearest* enclosing
+        /// vertical split. Nothing nested lies above this view: it is planted
+        /// inside the sidebar, so any detail-side split is a sibling's
+        /// descendant rather than an ancestor.
+        private func enclosingVerticalSplitView() -> NSSplitView? {
+            var candidate: NSView? = superview
+            while let view = candidate {
+                if let splitView = view as? NSSplitView,
+                   splitView.isVertical,
+                   splitView.subviews.count >= 2 {
+                    return splitView
+                }
+                candidate = view.superview
+            }
+            return nil
+        }
+
+        private func reportVisualFixtureWidth(_ splitView: NSSplitView) {
+            guard ProcessInfo.processInfo.environment["KAISOLA_NATIVE_VISUAL_FIXTURE"] == "1" else {
+                return
+            }
+            DispatchQueue.main.async {
+                print(
+                    "KAISOLA_NATIVE_VISUAL_SIDEBAR_WIDTH="
+                        + "\(splitView.subviews[0].frame.width)"
+                )
+            }
+        }
     }
 }
 

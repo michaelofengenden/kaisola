@@ -38,6 +38,10 @@ struct RootShellView: View {
         let running: Bool
     }
     @State private var meshCloseConfirm: MeshCloseConfirmation?
+    /// Shared by the two halves of the sidebar divider's grab corridor, which
+    /// have to be separate views on separate sides of an `NSSplitView` clip but
+    /// are one affordance to the user.
+    @State private var sidebarDividerHovered = false
 
     /// Close immediately only when every column has neither working-tree
     /// changes nor unique commits; all uncertainty blocks deletion.
@@ -394,7 +398,7 @@ struct RootShellView: View {
             // NSSplitView in window coordinates, matching every other Kaisola
             // panel handle without replacing native sidebar behavior.
             .overlay(alignment: .trailing) {
-                NavigationSidebarResizeAffordance()
+                NavigationSidebarResizeAffordance(hovered: $sidebarDividerHovered)
                     .frame(width: NativeWorkspaceChrome.projectSidebarDividerWidth)
             }
         } detail: {
@@ -418,6 +422,12 @@ struct RootShellView: View {
                 .padding(.bottom, 6)
             detailPane
                 .kaisolaChromePanel(topInset: 0)
+        }
+        // The other half of the sidebar divider's corridor. It has to live in
+        // this column: a tracking area is clipped to its own split-view
+        // subview, so the sidebar's tracker stops dead at the boundary.
+        .overlay(alignment: .leading) {
+            DetailEdgeResizeAffordance(hovered: $sidebarDividerHovered)
         }
     }
 
@@ -1796,8 +1806,16 @@ enum SessionPaneDividerSizing {
 /// AppKit in charge of its min/max constraints, collapse behavior, restoration,
 /// and accessibility. The tracker lives just inside the sidebar so it does not
 /// shift layout or add another visible divider.
+///
+/// Only the SIDEBAR half of the corridor lives here. `NSTrackingArea` is created
+/// `.inVisibleRect`, and the sidebar is an `NSSplitView` subview, so everything
+/// past the split boundary is clipped away: measured off the running app, a
+/// 40pt-wide tracker centred on the divider had a `visibleRect` that stopped
+/// 0.5pt past the divider's centre. Widening this view can therefore never buy
+/// reach on the detail side — that half is `DetailEdgeResizeAffordance`, which
+/// lives inside the detail column and drives the same `NSSplitView`.
 private struct NavigationSidebarResizeAffordance: View {
-    @State private var hovered = false
+    @Binding var hovered: Bool
 
     var body: some View {
         ZStack {
@@ -1824,6 +1842,24 @@ private struct NavigationSidebarResizeAffordance: View {
         }
         .animation(.easeOut(duration: 0.12), value: hovered)
         .help("Drag or use Left/Right arrows to resize; double-click to reset")
+    }
+}
+
+/// The detail-column half of the sidebar divider's grab corridor.
+///
+/// Draws nothing: the visible rule and the hover highlight belong to
+/// `NavigationSidebarResizeAffordance` on the other side of the boundary. This
+/// exists only because a tracking area cannot cross an `NSSplitView` subview's
+/// clip, so "10pt of reach on each side of the line" needs a view on each side.
+/// It reports its hover into the same state, so the rule still lights up when
+/// the pointer approaches from the content side.
+private struct DetailEdgeResizeAffordance: View {
+    @Binding var hovered: Bool
+
+    var body: some View {
+        NavigationSidebarResizeHandle(hoverChanged: { hovered = $0 })
+            .frame(width: NativeWorkspaceChrome.dividerCorridorReach)
+            .accessibilityHidden(true)
     }
 }
 

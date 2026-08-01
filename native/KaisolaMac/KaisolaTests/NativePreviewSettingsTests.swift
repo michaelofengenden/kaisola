@@ -1579,6 +1579,18 @@ final class NativePreviewSettingsTests: XCTestCase {
         // gutter between the panes.
         XCTAssertEqual(SessionPaneDividerSizing.layoutExtent, 1)
         XCTAssertEqual(NativeWorkspaceChrome.projectSidebarDividerWidth, 1)
+
+        // The sidebar's own tracker can only ever supply the reach on ITS side
+        // of the split: `NSTrackingArea(.inVisibleRect)` is clipped to the
+        // NSSplitView subview it lives in. Measured on the running app, a
+        // 40pt-wide tracker centred on the divider had a visibleRect that
+        // stopped 0.5pt past the divider's centre. So the detail side needs its
+        // own strip, and it has to be at least the shared floor wide.
+        XCTAssertGreaterThanOrEqual(
+            NativeWorkspaceChrome.dividerCorridorReach,
+            10,
+            "the detail-side strip no longer reaches far enough to grab"
+        )
     }
 
     func testClickingFocusedSurfaceStillSwitchesItsProject() {

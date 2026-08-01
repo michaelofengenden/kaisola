@@ -14,8 +14,12 @@ struct TerminalTranscriptView: View {
     var openedFromLiveBoundary = false
 
     @Environment(\.dismiss) private var dismiss
+    @Environment(\.colorScheme) private var colorScheme
     @State private var pages: [TerminalHistoryPage] = []
     @State private var renderedPages: [Int64: String] = [:]
+    @State private var renderedGeneration = 0
+    @State private var searchWorker = TerminalTranscriptSearchWorker()
+    @State private var preparedSearch: TerminalTranscriptSearchWorker.Prepared?
     @State private var isLoading = false
     @State private var didPositionAtBottom = false
     @State private var errorMessage: String?
@@ -30,6 +34,7 @@ struct TerminalTranscriptView: View {
         // retained page on every render, which is wasted work identical on
         // every iteration.
         let transcriptFont = self.transcriptFont
+        let searchRequest = self.searchRequest
         VStack(spacing: 0) {
             header
             Divider()
@@ -40,10 +45,7 @@ struct TerminalTranscriptView: View {
                     LazyVStack(alignment: .leading, spacing: 0) {
                         historyBoundary(proxy: proxy)
                         ForEach(pages) { page in
-                            Text(TerminalTranscriptSearch.highlighted(
-                                renderedPages[page.id] ?? "",
-                                query: searchText
-                            ))
+                            transcriptText(for: page, request: searchRequest)
                                 .font(Font(transcriptFont))
                                 .textSelection(.enabled)
                                 .frame(maxWidth: .infinity, alignment: .leading)
@@ -57,6 +59,9 @@ struct TerminalTranscriptView: View {
                 .background(Color(nsColor: .textBackgroundColor))
                 .task { await loadInitial(using: proxy) }
             }
+        }
+        .task(id: searchRequest) {
+            await prepareSearch(for: searchRequest)
         }
         .frame(minWidth: 620, idealWidth: 820, minHeight: 440, idealHeight: 660)
     }
@@ -142,8 +147,8 @@ struct TerminalTranscriptView: View {
                 ProgressView().controlSize(.small)
             }
             if !pages.isEmpty {
-                if !searchText.isEmpty {
-                    Text("\(TerminalTranscriptSearch.matchCount(in: renderedPages.values, query: searchText)) matches")
+                if searchRequest.hasQuery {
+                    Text(searchStatus(for: searchRequest))
                         .monospacedDigit()
                         .foregroundStyle(.secondary)
                 }
@@ -195,6 +200,32 @@ struct TerminalTranscriptView: View {
 
     private var loadedPlainText: String {
         pages.compactMap { renderedPages[$0.id] }.joined()
+    }
+
+    private var searchRequest: TerminalTranscriptSearchWorker.Request {
+        TerminalTranscriptSearchWorker.Request(
+            query: searchText,
+            generation: renderedGeneration,
+            dark: colorScheme == .dark
+        )
+    }
+
+    private func transcriptText(
+        for page: TerminalHistoryPage,
+        request: TerminalTranscriptSearchWorker.Request
+    ) -> Text {
+        if preparedSearch?.request == request,
+           let highlighted = preparedSearch?.pages[page.id] {
+            return Text(highlighted)
+        }
+        return Text(renderedPages[page.id] ?? "")
+    }
+
+    private func searchStatus(for request: TerminalTranscriptSearchWorker.Request) -> String {
+        guard preparedSearch?.request == request, let count = preparedSearch?.matchCount else {
+            return "Searching…"
+        }
+        return "\(count) matches"
     }
 
     @ViewBuilder
@@ -351,6 +382,32 @@ struct TerminalTranscriptView: View {
         }.value
         guard pageIDs == pages.map(\.id) else { return }
         renderedPages = Dictionary(uniqueKeysWithValues: zip(pageIDs, plain))
+        renderedGeneration &+= 1
+    }
+
+    @MainActor
+    private func prepareSearch(for request: TerminalTranscriptSearchWorker.Request) async {
+        do {
+            if request.hasQuery {
+                // Avoid queueing a full retained-history scan for every
+                // intermediate keystroke. SwiftUI cancels this task whenever
+                // the query, appearance, or rendered page generation changes.
+                try await Task.sleep(for: .milliseconds(120))
+            }
+            let snapshot = pages.compactMap { page -> TerminalTranscriptSearchWorker.Page? in
+                guard let text = renderedPages[page.id] else { return nil }
+                return TerminalTranscriptSearchWorker.Page(id: page.id, text: text)
+            }
+            let prepared = try await searchWorker.prepare(snapshot, request: request)
+            try Task.checkCancellation()
+            guard request == searchRequest else { return }
+            preparedSearch = prepared
+        } catch is CancellationError {
+            // A new query/generation supersedes this preparation normally.
+        } catch {
+            // Search is an enhancement over the selectable plain transcript.
+            // Keep that transcript available if preparation ever fails.
+        }
     }
 
     private func transcriptErrorDescription(_ error: any Error) -> String {
@@ -434,25 +491,34 @@ enum TerminalTranscriptTypography {
 }
 
 enum TerminalTranscriptSearch {
+    private struct HighlightStyle: Sendable {
+        let red: Double
+        let green: Double
+        let blue: Double
+        let alpha: Double
+    }
+
     /// Find-match wash. A fixed 50%-opacity yellow was legible on the light
     /// transcript background and close to unreadable on the dark one, where
     /// the text drawn over it is nearly white. Both variants stay translucent
     /// so the match reads as a highlight behind selectable text.
     nonisolated static func matchHighlight(dark: Bool) -> NSColor {
+        let style = highlightStyle(dark: dark)
+        return NSColor(
+            srgbRed: style.red,
+            green: style.green,
+            blue: style.blue,
+            alpha: style.alpha
+        )
+    }
+
+    private nonisolated static func highlightStyle(dark: Bool) -> HighlightStyle {
         dark
-            ? NSColor(srgbRed: 0.98, green: 0.80, blue: 0.24, alpha: 0.30)
-            : NSColor(srgbRed: 1.0, green: 0.87, blue: 0.19, alpha: 0.55)
+            ? HighlightStyle(red: 0.98, green: 0.80, blue: 0.24, alpha: 0.30)
+            : HighlightStyle(red: 1.0, green: 0.87, blue: 0.19, alpha: 0.55)
     }
 
-    /// Resolved lazily by AppKit against the *current* appearance, so the sheet
-    /// follows a mid-session Light/Dark flip without rebuilding its pages.
-    nonisolated static let matchHighlightColor = NSColor(
-        name: NSColor.Name("kaisolaTranscriptFindMatch")
-    ) { appearance in
-        matchHighlight(dark: appearance.bestMatch(from: [.aqua, .darkAqua]) == .darkAqua)
-    }
-
-    static func ranges(in text: String, query: String) -> [NSRange] {
+    nonisolated static func ranges(in text: String, query: String) -> [NSRange] {
         let needle = query.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !needle.isEmpty else { return [] }
         let source = text as NSString
@@ -471,14 +537,26 @@ enum TerminalTranscriptSearch {
         return result
     }
 
-    static func matchCount<S: Sequence>(in pages: S, query: String) -> Int where S.Element == String {
+    nonisolated static func matchCount<S: Sequence>(in pages: S, query: String) -> Int where S.Element == String {
         pages.reduce(0) { $0 + ranges(in: $1, query: query).count }
     }
 
-    static func highlighted(_ text: String, query: String) -> AttributedString {
+    nonisolated static func highlighted(
+        _ text: String,
+        query: String,
+        dark: Bool
+    ) -> (text: AttributedString, matchCount: Int) {
         let ranges = ranges(in: text, query: query)
-        guard !ranges.isEmpty else { return AttributedString(text) }
+        guard !ranges.isEmpty else { return (AttributedString(text), 0) }
         let source = text as NSString
+        let style = highlightStyle(dark: dark)
+        let highlight = Color(
+            .sRGB,
+            red: style.red,
+            green: style.green,
+            blue: style.blue,
+            opacity: style.alpha
+        )
         var result = AttributedString()
         var cursor = 0
         for range in ranges {
@@ -489,14 +567,72 @@ enum TerminalTranscriptSearch {
                 ))))
             }
             var match = AttributedString(source.substring(with: range))
-            match.backgroundColor = Color(nsColor: matchHighlightColor)
+            match.backgroundColor = highlight
             result.append(match)
             cursor = NSMaxRange(range)
         }
         if cursor < source.length {
             result.append(AttributedString(source.substring(from: cursor)))
         }
-        return result
+        return (result, ranges.count)
+    }
+}
+
+/// View-lifetime cache for selectable transcript text and its find highlights.
+/// Actor isolation keeps Unicode matching and attributed-string construction
+/// off the main actor; the request generation prevents a cached result from a
+/// prior sanitizer pass from being reused after older pages are prepended.
+actor TerminalTranscriptSearchWorker {
+    struct Page: Sendable {
+        let id: Int64
+        let text: String
+    }
+
+    struct Request: Hashable, Sendable {
+        let query: String
+        let generation: Int
+        let dark: Bool
+
+        init(query: String, generation: Int, dark: Bool) {
+            self.query = query.trimmingCharacters(in: .whitespacesAndNewlines)
+            self.generation = generation
+            self.dark = dark
+        }
+
+        var hasQuery: Bool { !query.isEmpty }
+    }
+
+    struct Prepared: Sendable {
+        let request: Request
+        let pages: [Int64: AttributedString]
+        let matchCount: Int
+    }
+
+    private var cached: Prepared?
+    private(set) var preparationCount = 0
+
+    func prepare(_ sourcePages: [Page], request: Request) async throws -> Prepared {
+        if let cached, cached.request == request { return cached }
+
+        var pages: [Int64: AttributedString] = [:]
+        pages.reserveCapacity(sourcePages.count)
+        var matchCount = 0
+        for page in sourcePages {
+            try Task.checkCancellation()
+            let highlighted = TerminalTranscriptSearch.highlighted(
+                page.text,
+                query: request.query,
+                dark: request.dark
+            )
+            pages[page.id] = highlighted.text
+            matchCount += highlighted.matchCount
+        }
+        try Task.checkCancellation()
+
+        let prepared = Prepared(request: request, pages: pages, matchCount: matchCount)
+        cached = prepared
+        preparationCount += 1
+        return prepared
     }
 }
 

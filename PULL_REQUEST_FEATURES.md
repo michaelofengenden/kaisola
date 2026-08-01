@@ -274,16 +274,22 @@ geometry reconciliation. The same pass now forwards replay-safe BEL attention,
 matches Shift-Enter modifiers exactly, warns when Claude did not receive a
 dropped image, and shows accessible ended/reconnecting state in the pane.
 
-Scope:
+Completed scope:
 
 - Incrementally sanitize transcript pages and move cached search off the main
   thread; subscribe tail-first and page older observer history on demand.
-- Synchronize pane focus rings with AppKit first responder, add keyboard pane
-  cycling, and provide throttled VoiceOver output announcements.
-- Add target-specific Reopen from an ended pane, safe oversized-image
-  downscaling, OSC 52 copy with consent, and Clear/Jump-to-Bottom commands.
-- Remove the dead legacy terminal grid, use the active terminal theme for card
-  chrome, and make the transcript viewer inherit the configured terminal font.
+- Synchronize pane focus rings with AppKit first responder and add keyboard pane
+  cycling.
+- Add OSC 52 copy with consent and Clear/Jump-to-Bottom commands.
+- Remove the dead legacy terminal grid and make the transcript viewer inherit
+  the configured terminal font.
+
+Remaining scope:
+
+- Provide throttled VoiceOver output announcements.
+- Add target-specific Reopen from an ended pane and safe oversized-image
+  downscaling.
+- Use the active terminal theme for card chrome.
 
 Acceptance:
 

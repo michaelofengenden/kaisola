@@ -111,6 +111,36 @@ final class TerminalTranscriptTests: XCTestCase {
         XCTAssertTrue(TerminalTranscriptSearch.ranges(in: text, query: "   ").isEmpty)
     }
 
+    func testSearchWorkerCachesLargeTranscriptPreparationByGenerationAndAppearance() async throws {
+        let worker = TerminalTranscriptSearchWorker()
+        let padding = String(repeating: "0123456789abcdef", count: 30_000)
+        let pages = [
+            TerminalTranscriptSearchWorker.Page(id: 1, text: "Needle \(padding)"),
+            TerminalTranscriptSearchWorker.Page(id: 2, text: "\(padding) résumé"),
+        ]
+        let request = TerminalTranscriptSearchWorker.Request(
+            query: "  resume  ",
+            generation: 7,
+            dark: false
+        )
+
+        let first = try await worker.prepare(pages, request: request)
+        let cached = try await worker.prepare(pages, request: request)
+
+        XCTAssertEqual(first.matchCount, 1)
+        XCTAssertEqual(first.pages.count, 2)
+        XCTAssertEqual(cached.matchCount, first.matchCount)
+        let cachedPreparationCount = await worker.preparationCount
+        XCTAssertEqual(cachedPreparationCount, 1)
+
+        _ = try await worker.prepare(
+            pages,
+            request: .init(query: "resume", generation: 7, dark: true)
+        )
+        let appearancePreparationCount = await worker.preparationCount
+        XCTAssertEqual(appearancePreparationCount, 2)
+    }
+
     func testTranscriptUsesTheConfiguredTerminalTypefaceAndWeight() {
         let menlo = TerminalTranscriptTypography.font(
             family: "Menlo",
@@ -160,35 +190,6 @@ final class TerminalTranscriptTests: XCTestCase {
             XCTAssertLessThan(color.alphaComponent, 1)
             XCTAssertGreaterThan(color.alphaComponent, 0.15)
         }
-
-        // The dynamic color the view actually applies must resolve to exactly
-        // those two values, so the sheet follows a mid-session appearance flip.
-        let dynamic = TerminalTranscriptSearch.matchHighlightColor
-        assertResolves(dynamic, under: .darkAqua, to: dark)
-        assertResolves(dynamic, under: .aqua, to: light)
-    }
-
-    private func assertResolves(
-        _ dynamic: NSColor,
-        under appearanceName: NSAppearance.Name,
-        to expected: NSColor,
-        file: StaticString = #filePath,
-        line: UInt = #line
-    ) {
-        guard let appearance = NSAppearance(named: appearanceName) else {
-            return XCTFail("Missing appearance \(appearanceName.rawValue)", file: file, line: line)
-        }
-        var resolved: NSColor?
-        appearance.performAsCurrentDrawingAppearance {
-            resolved = dynamic.usingColorSpace(.sRGB)
-        }
-        guard let resolved, let expected = expected.usingColorSpace(.sRGB) else {
-            return XCTFail("Highlight did not resolve to an sRGB color", file: file, line: line)
-        }
-        XCTAssertEqual(resolved.redComponent, expected.redComponent, accuracy: 0.002, file: file, line: line)
-        XCTAssertEqual(resolved.greenComponent, expected.greenComponent, accuracy: 0.002, file: file, line: line)
-        XCTAssertEqual(resolved.blueComponent, expected.blueComponent, accuracy: 0.002, file: file, line: line)
-        XCTAssertEqual(resolved.alphaComponent, expected.alphaComponent, accuracy: 0.002, file: file, line: line)
     }
 
     func testHistoryStorageWarningIsSoftAndUsesExactBrokerBytes() {

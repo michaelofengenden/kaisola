@@ -45,6 +45,9 @@ Large product and architecture work remains ordered in
 - CSV, JSON, and HTML readiness now prepare through a view-lifetime actor cache
   keyed by path, modification date, and explicit reload revision; a near-limit
   structured-data contract pins bounded first preparation and single parsing.
+- Retained terminal pages now filter control strings chunk by chunk before
+  replay, while debounced transcript matching and attributed highlights prepare
+  in a cancellable actor cache keyed by page generation and appearance.
 
 ## Open audit fixes
 
@@ -55,8 +58,6 @@ Large product and architecture work remains ordered in
 
 ### Terminal parity and failure feedback
 
-- Make transcript sanitization incremental and move cached history search off
-  the main actor.
 - Add throttled VoiceOver output announcements and terminal-themed pane chrome.
 - Keep the PR 8 physical-trackpad gate open until sub-row movement is genuinely
   continuous in the installed app; row-quantized SwiftTerm scrolling is not

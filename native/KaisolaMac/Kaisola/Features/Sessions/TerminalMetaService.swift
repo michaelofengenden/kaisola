@@ -15,24 +15,39 @@ struct TerminalMeta: Equatable, Sendable {
     static let empty = TerminalMeta(processName: nil, ports: [])
 }
 
+struct TerminalProcessRecord: Equatable, Sendable {
+    let pid: Int32
+    let parentPID: Int32
+    let command: String
+}
+
 /// Collects `TerminalMeta` by shelling out to system tools. The parsing is
 /// factored into pure static helpers so it is unit-testable without spawning
 /// any processes.
 enum TerminalMetaService: Sendable {
-    /// How many `pgrep -P` levels to descend before giving up. A real shell →
-    /// launcher → agent chain is only a few deep; the bound guards against a
-    /// pathological (or cyclic) process tree.
+    /// How many process-tree levels to descend before giving up. A real shell
+    /// to launcher to agent chain is only a few deep; the bound guards against
+    /// a pathological (or cyclic) process tree.
     private static let maxDescentDepth = 12
 
     /// Per-invocation wall-clock budget. `lsof` can block on a wedged network
     /// mount; the watchdog terminates a stuck child so the collector stays fast.
     private static let processTimeout: DispatchTimeInterval = .milliseconds(1500)
 
-    /// Cap the bytes we decode from any one helper. The targeted tools emit
-    /// only a few lines, so this only ever trips on a runaway.
+    /// Cap the bytes retained from a targeted helper. The pipe is still fully
+    /// drained so a noisy child cannot deadlock while exiting.
     private static let maxOutputBytes = 64 * 1024
 
-    private static let pgrepPath = "/usr/bin/pgrep"
+    /// A process-table snapshot can legitimately be larger than one targeted
+    /// helper response. It is still bounded to keep an idle refresh from
+    /// becoming an unbounded allocation.
+    private static let maxProcessSnapshotBytes = 1024 * 1024
+
+    /// Keep one `lsof` argv and response bounded while still replacing the old
+    /// per-terminal subprocess fan-out with a small number of batch probes.
+    private static let portProbeBatchSize = 128
+    private static let maxPortProbeOutputBytes = 512 * 1024
+
     private static let psPath = "/bin/ps"
     private static let lsofPath = "/usr/sbin/lsof"
 
@@ -48,42 +63,113 @@ enum TerminalMetaService: Sendable {
         return branch.isEmpty ? nil : branch
     }
 
-    /// Foreground process name + listening ports for a shell PID.
-    ///
-    /// Walks the descendant chain (`pgrep -P`, taking the most-recently-spawned
-    /// child at each level as the foreground) and reads the deepest child's
-    /// name (`ps -o comm=`). Listening ports come from a single `lsof` over the
-    /// whole chain. Never throws — any failure yields empty (or partial) meta.
+    /// Foreground process name + listening ports for one shell PID.
+    /// Retained for callers that need a one-off probe; inventory refreshes use
+    /// the batched overload below.
     static func collect(pid: Int32) -> TerminalMeta {
         guard pid > 0 else { return .empty }
+        return collect(pids: [pid])[pid] ?? .empty
+    }
 
-        var chain: [Int32] = [pid]
-        var current = pid
-        for _ in 0 ..< maxDescentDepth {
-            let output = run(pgrepPath, ["-P", String(current)]) ?? ""
-            guard let child = mostRecentChild(fromPgrepOutput: output),
-                  child != current,
-                  !chain.contains(child) else { break }
-            chain.append(child)
-            current = child
+    /// Collect metadata for all owned terminal roots with one process-table
+    /// snapshot and batched `lsof` calls. Duplicate roots are probed once.
+    /// Every valid requested PID receives a value, even when a helper fails.
+    static func collect(pids: [Int32]) -> [Int32: TerminalMeta] {
+        let roots = Array(Set(pids.filter { $0 > 0 })).sorted()
+        guard !roots.isEmpty else { return [:] }
+
+        let snapshot = parseProcessSnapshot(
+            run(
+                psPath,
+                ["-axo", "pid=,ppid=,command="],
+                retainedOutputLimit: maxProcessSnapshotBytes
+            ) ?? ""
+        )
+        let chains = processChains(rootPIDs: roots, recordsByPID: snapshot)
+        let probedPIDs = Array(Set(chains.values.flatMap { $0 })).sorted()
+
+        var portsByPID: [Int32: Set<Int>] = [:]
+        for start in stride(from: 0, to: probedPIDs.count, by: portProbeBatchSize) {
+            let end = min(start + portProbeBatchSize, probedPIDs.count)
+            let joined = probedPIDs[start ..< end].map(String.init).joined(separator: ",")
+            let output = run(
+                lsofPath,
+                ["-n", "-P", "-a", "-p", joined, "-iTCP", "-sTCP:LISTEN", "-Fn"],
+                retainedOutputLimit: maxPortProbeOutputBytes
+            ) ?? ""
+            for (pid, ports) in parsePortsByPID(fromLsof: output) {
+                portsByPID[pid, default: []].formUnion(ports)
+            }
         }
 
-        let foreground = chain.last ?? pid
-        let name = run(psPath, ["-o", "command=", "-p", String(foreground)])
-            .flatMap { Self.processName(fromCommand: $0) }
-
-        // One lsof for every PID in the chain — any of them may hold the socket.
-        let joined = chain.map(String.init).joined(separator: ",")
-        let lsofOutput = run(
-            lsofPath,
-            ["-n", "-P", "-a", "-p", joined, "-iTCP", "-sTCP:LISTEN", "-Fn"]
-        ) ?? ""
-        let ports = parsePorts(fromLsof: lsofOutput)
-
-        return TerminalMeta(processName: name, ports: ports)
+        var result: [Int32: TerminalMeta] = [:]
+        for root in roots {
+            let chain = chains[root] ?? [root]
+            let foreground = chain.last ?? root
+            let name = snapshot[foreground].flatMap { processName(fromCommand: $0.command) }
+            let ports = chain
+                .reduce(into: Set<Int>()) { collected, pid in
+                    collected.formUnion(portsByPID[pid] ?? [])
+                }
+                .sorted()
+                .prefix(5)
+            result[root] = TerminalMeta(processName: name, ports: Array(ports))
+        }
+        return result
     }
 
     // MARK: - Pure parsers (unit-testable without processes)
+
+    /// Parse a single `ps -axo pid=,ppid=,command=` snapshot. The command may
+    /// contain arbitrary spaces; only the first two whitespace-delimited
+    /// columns are structural.
+    static func parseProcessSnapshot(_ output: String) -> [Int32: TerminalProcessRecord] {
+        var records: [Int32: TerminalProcessRecord] = [:]
+        for line in output.split(whereSeparator: \.isNewline) {
+            let columns = line.split(
+                maxSplits: 2,
+                omittingEmptySubsequences: true,
+                whereSeparator: \.isWhitespace
+            )
+            guard columns.count >= 2,
+                  let pid = Int32(columns[0]), pid > 0,
+                  let parentPID = Int32(columns[1]), parentPID >= 0 else { continue }
+            let command = columns.count == 3 ? String(columns[2]) : ""
+            records[pid] = TerminalProcessRecord(
+                pid: pid,
+                parentPID: parentPID,
+                command: command
+            )
+        }
+        return records
+    }
+
+    /// Reconstruct each root's foreground chain from one process snapshot.
+    /// Choosing the greatest direct-child PID preserves the prior collector's
+    /// most-recently-spawned heuristic without launching `pgrep` per level.
+    static func processChains(
+        rootPIDs: [Int32],
+        recordsByPID: [Int32: TerminalProcessRecord]
+    ) -> [Int32: [Int32]] {
+        var childrenByParent: [Int32: [Int32]] = [:]
+        for record in recordsByPID.values where record.pid != record.parentPID {
+            childrenByParent[record.parentPID, default: []].append(record.pid)
+        }
+
+        var result: [Int32: [Int32]] = [:]
+        for root in Set(rootPIDs.filter { $0 > 0 }) {
+            var chain = [root]
+            var current = root
+            for _ in 0 ..< maxDescentDepth {
+                guard let child = childrenByParent[current]?.max(),
+                      !chain.contains(child) else { break }
+                chain.append(child)
+                current = child
+            }
+            result[root] = chain
+        }
+        return result
+    }
 
     /// Unique, sorted, capped-at-5 TCP ports from `lsof -Fn` output.
     ///
@@ -94,35 +180,35 @@ enum TerminalMetaService: Sendable {
     static func parsePorts(fromLsof output: String) -> [Int] {
         var ports: Set<Int> = []
         for line in output.split(whereSeparator: \.isNewline) {
-            guard line.first == "n" else { continue }
-            let address = line.dropFirst()
-            guard !address.contains("->"),
-                  let colon = address.lastIndex(of: ":") else { continue }
-            let portText = address[address.index(after: colon)...]
-            guard let port = Int(portText), port > 0, port <= 65535 else { continue }
-            ports.insert(port)
+            if let port = port(fromLsofNameLine: line) { ports.insert(port) }
         }
         return Array(ports.sorted().prefix(5))
     }
 
-    /// The child PID to descend into from one `pgrep -P` block: the
-    /// numerically-greatest PID (PIDs are handed out monotonically, so the
-    /// largest is the most-recently spawned). `nil` ends the walk.
-    static func mostRecentChild(fromPgrepOutput output: String) -> Int32? {
-        output.split(whereSeparator: \.isNewline)
-            .compactMap { Int32(String($0).trimmingCharacters(in: .whitespaces)) }
-            .filter { $0 > 0 }
-            .max()
+    /// Associate `lsof -Fn` name fields with the most recent `p<PID>` header.
+    static func parsePortsByPID(fromLsof output: String) -> [Int32: [Int]] {
+        var currentPID: Int32?
+        var portsByPID: [Int32: Set<Int>] = [:]
+        for line in output.split(whereSeparator: \.isNewline) {
+            if line.first == "p" {
+                currentPID = Int32(line.dropFirst()).flatMap { $0 > 0 ? $0 : nil }
+                continue
+            }
+            guard let currentPID,
+                  let port = port(fromLsofNameLine: line) else { continue }
+            portsByPID[currentPID, default: []].insert(port)
+        }
+        return portsByPID.mapValues { Array($0.sorted().prefix(5)) }
     }
 
-    /// The deepest descendant across pre-collected `pgrep -P` outputs (one per
-    /// descent level, in order). The last level that names any child is the
-    /// foreground process. Pure form of `collect`'s live walk, for testing.
-    static func deepestChild(fromPgrepOutputs outputs: [String]) -> Int32? {
-        for output in outputs.reversed() {
-            if let child = mostRecentChild(fromPgrepOutput: output) { return child }
-        }
-        return nil
+    private static func port(fromLsofNameLine line: Substring) -> Int? {
+        guard line.first == "n" else { return nil }
+        let address = line.dropFirst()
+        guard !address.contains("->"),
+              let colon = address.lastIndex(of: ":") else { return nil }
+        let portText = address[address.index(after: colon)...]
+        guard let port = Int(portText), port > 0, port <= 65535 else { return nil }
+        return port
     }
 
     /// Normalize a `ps -o comm=` value to a bare process name: trim, take the
@@ -166,7 +252,8 @@ enum TerminalMetaService: Sendable {
     private static func run(
         _ path: String,
         _ arguments: [String],
-        currentDirectoryURL: URL? = nil
+        currentDirectoryURL: URL? = nil,
+        retainedOutputLimit: Int = maxOutputBytes
     ) -> String? {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: path)
@@ -183,11 +270,34 @@ enum TerminalMetaService: Sendable {
         }
         DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + processTimeout, execute: watchdog)
 
-        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        let data = drain(
+            pipe.fileHandleForReading,
+            retainingAtMost: retainedOutputLimit
+        )
         process.waitUntilExit()
         watchdog.cancel()
 
-        let bounded = data.prefix(maxOutputBytes)
-        return String(decoding: bounded, as: UTF8.self)
+        return String(decoding: data, as: UTF8.self)
+    }
+
+    /// Continue reading after the retention cap so a helper can always exit;
+    /// discard excess chunks instead of materializing unbounded output.
+    private static func drain(_ handle: FileHandle, retainingAtMost limit: Int) -> Data {
+        var retained = Data()
+        while true {
+            let chunk: Data
+            do {
+                guard let next = try handle.read(upToCount: 16 * 1024),
+                      !next.isEmpty else { break }
+                chunk = next
+            } catch {
+                break
+            }
+            let remaining = max(0, limit - retained.count)
+            if remaining > 0 {
+                retained.append(contentsOf: chunk.prefix(remaining))
+            }
+        }
+        return retained
     }
 }

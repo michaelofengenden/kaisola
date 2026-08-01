@@ -2,7 +2,7 @@ import Foundation
 import XCTest
 @testable import Kaisola
 
-/// Unit coverage for the pure `lsof`/`pgrep`/`ps` parsers, plus one live
+/// Unit coverage for the pure `lsof`/`ps` parsers, plus one live
 /// smoke test that only asserts `collect` does not crash.
 final class TerminalMetaServiceTests: XCTestCase {
 
@@ -67,30 +67,65 @@ final class TerminalMetaServiceTests: XCTestCase {
         XCTAssertEqual(TerminalMetaService.parsePorts(fromLsof: ""), [])
     }
 
-    // MARK: - mostRecentChild / deepestChild
+    // MARK: - process snapshot and chains
 
-    func testMostRecentChildPicksGreatestPid() {
-        XCTAssertEqual(TerminalMetaService.mostRecentChild(fromPgrepOutput: "2345\n2346\n2340"), 2346)
+    func testProcessSnapshotPreservesCommandsWithSpacesAndSkipsGarbage() {
+        let records = TerminalMetaService.parseProcessSnapshot(
+            """
+              100     1 /bin/zsh -il
+              205   100 /opt/homebrew/bin/node /opt/tools/codex.js
+            not a process
+              300   205
+            """
+        )
+        XCTAssertEqual(records[100], TerminalProcessRecord(pid: 100, parentPID: 1, command: "/bin/zsh -il"))
+        XCTAssertEqual(
+            records[205],
+            TerminalProcessRecord(
+                pid: 205,
+                parentPID: 100,
+                command: "/opt/homebrew/bin/node /opt/tools/codex.js"
+            )
+        )
+        XCTAssertEqual(records[300], TerminalProcessRecord(pid: 300, parentPID: 205, command: ""))
+        XCTAssertEqual(records.count, 3)
     }
 
-    func testMostRecentChildIgnoresBlankAndGarbageLines() {
-        XCTAssertEqual(TerminalMetaService.mostRecentChild(fromPgrepOutput: "\n  4100  \nnope\n4099\n"), 4100)
+    func testProcessChainsUseNewestDirectChildAndDeduplicateRoots() {
+        let records = TerminalMetaService.parseProcessSnapshot(
+            """
+            100 1 /bin/zsh
+            200 100 older-child
+            205 100 newest-child
+            300 205 codex
+            400 1 /bin/fish
+            """
+        )
+        let chains = TerminalMetaService.processChains(
+            rootPIDs: [100, 400, 100, -1],
+            recordsByPID: records
+        )
+        XCTAssertEqual(chains, [100: [100, 205, 300], 400: [400]])
     }
 
-    func testMostRecentChildEmptyOutputIsNil() {
-        XCTAssertNil(TerminalMetaService.mostRecentChild(fromPgrepOutput: ""))
-        XCTAssertNil(TerminalMetaService.mostRecentChild(fromPgrepOutput: "\n\n"))
-    }
+    // MARK: - batched lsof
 
-    func testDeepestChildReturnsLastLevelThatNamesAChild() {
-        let outputs = ["2000\n2001", "3005\n3004", ""]
-        // Level 1 is deepest non-empty; its greatest pid is the foreground.
-        XCTAssertEqual(TerminalMetaService.deepestChild(fromPgrepOutputs: outputs), 3005)
-    }
-
-    func testDeepestChildAllEmptyIsNil() {
-        XCTAssertNil(TerminalMetaService.deepestChild(fromPgrepOutputs: []))
-        XCTAssertNil(TerminalMetaService.deepestChild(fromPgrepOutputs: ["", "  ", "\n"]))
+    func testParsePortsByPIDKeepsProcessOwnership() {
+        let output = """
+        p100
+        f4
+        n*:3000
+        p205
+        f8
+        n127.0.0.1:8080
+        n127.0.0.1:8080
+        p999
+        n1.2.3.4:4321->5.6.7.8:80
+        """
+        XCTAssertEqual(
+            TerminalMetaService.parsePortsByPID(fromLsof: output),
+            [100: [3000], 205: [8080]]
+        )
     }
 
     // MARK: - processName
@@ -122,6 +157,13 @@ final class TerminalMetaServiceTests: XCTestCase {
         if let name = meta.processName {
             XCTAssertFalse(name.isEmpty)
         }
+    }
+
+    func testBatchCollectDeduplicatesAndRejectsInvalidPids() {
+        let pid = ProcessInfo.processInfo.processIdentifier
+        let collected = TerminalMetaService.collect(pids: [pid, pid, 0, -1])
+        XCTAssertEqual(Set(collected.keys), [pid])
+        XCTAssertLessThanOrEqual(collected[pid]?.ports.count ?? 0, 5)
     }
 
     func testCollectRejectsNonPositivePid() {

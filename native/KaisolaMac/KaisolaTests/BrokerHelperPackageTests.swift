@@ -4,6 +4,35 @@ import Foundation
 import XCTest
 @testable import Kaisola
 
+final class BrokerBootstrapProcessDrainerTests: XCTestCase {
+    func testDrainsNoisyStdoutAndStderrWithoutPipeDeadlockAndBoundsRetention() throws {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/bin/sh")
+        process.arguments = [
+            "-c",
+            "/usr/bin/yes O | /usr/bin/head -c 262144; "
+                + "/usr/bin/yes E | /usr/bin/head -c 262144 >&2",
+        ]
+        let stdout = Pipe()
+        let stderr = Pipe()
+        process.standardOutput = stdout
+        process.standardError = stderr
+
+        try process.run()
+        let collected = BrokerBootstrapProcessDrainer.waitForExit(
+            process,
+            stdout: stdout,
+            stderr: stderr
+        )
+
+        XCTAssertEqual(collected.terminationStatus, 0)
+        XCTAssertEqual(collected.stdout.utf8.count, BrokerBootstrapProcessDrainer.retainedBytesPerStream)
+        XCTAssertEqual(collected.stderr.utf8.count, BrokerBootstrapProcessDrainer.retainedBytesPerStream)
+        XCTAssertTrue(collected.stdout.hasPrefix("O\nO\n"))
+        XCTAssertTrue(collected.stderr.hasPrefix("E\nE\n"))
+    }
+}
+
 final class BrokerHelperPackageTests: XCTestCase {
     private var roots: [URL] = []
 

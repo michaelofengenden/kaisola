@@ -15,6 +15,10 @@ Large product and architecture work remains ordered in
   store write failures retain the cached payload (`2f9a9b9`, `3b10449`).
 - AppModel now prunes completed shutdown, split, and closed-surface bookkeeping
   instead of growing it for the life of the app (`0dda009`, `3b10449`).
+- Idle session metadata now shares one bounded process-table snapshot and
+  batched port probes, repeated refreshes cannot overlap, and direct helper
+  startup drains bounded stdout and stderr concurrently instead of waiting on
+  full kernel pipes.
 - Large read-only text uses TextKit 2 with native Find and retained viewport;
   CSV/JSON parsing is cached by content identity (`1ff191d`, `cf697a5`,
   `e33150b`, `770acb9`).

@@ -5024,22 +5024,26 @@ final class AppModel: ObservableObject {
     @Published private(set) var metaByTerminalID: [String: TerminalMeta] = [:]
     private var detectedAgentNamesByTerminalID: [String: String] = [:]
     private var lastMetaScan = Date.distantPast
+    private var metaScanTask: Task<Void, Never>?
 
     func meta(for terminalID: String) -> TerminalMeta? { metaByTerminalID[terminalID] }
 
     private func refreshMeta() {
-        guard Date().timeIntervalSince(lastMetaScan) > 5 else { return }
+        guard metaScanTask == nil,
+              Date().timeIntervalSince(lastMetaScan) > 5 else { return }
         lastMetaScan = Date()
         let owned: [(String, Int32)] = sessions.compactMap {
             guard ownedTerminalIDs.contains($0.id), !$0.exited, let pid = $0.pid else { return nil }
             return ($0.id, pid)
         }
-        Task.detached(priority: .utility) { [weak self] in
+        metaScanTask = Task.detached(priority: .utility) { [weak self] in
+            let byPID = TerminalMetaService.collect(pids: owned.map { $0.1 })
             var out: [String: TerminalMeta] = [:]
-            for (id, pid) in owned { out[id] = TerminalMetaService.collect(pid: pid) }
+            for (id, pid) in owned { out[id] = byPID[pid] ?? .empty }
             let collected = out
             await MainActor.run { [weak self] in
                 guard let self else { return }
+                defer { self.metaScanTask = nil }
                 self.metaByTerminalID = collected
                 self.detectedAgentNamesByTerminalID = self.detectedAgentNamesByTerminalID.filter {
                     collected[$0.key] != nil

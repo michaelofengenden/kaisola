@@ -338,14 +338,16 @@ Acceptance:
 
 ## PR 14 — Durable failure visibility and core scaling
 
-The audit pass moves Unix socket work to dedicated queues, makes close wake
-blocked I/O, bounds Git branch probes, reconnects after repeated inventory
+The reliability pass moves Unix socket work to dedicated queues, makes close
+wake blocked I/O, bounds Git branch probes, reconnects after repeated inventory
 failures, orders menu-window targeting, and cleans completed teardown tasks.
-Failed pop-out targets now retain a standard missing-session recovery card with
-Try Again and Back to Main Window instead of becoming blank windows. Finish the
-remaining failure and scaling seams.
+Failed pop-out targets retain a standard missing-session recovery card with Try
+Again and Back to Main Window instead of becoming blank windows. Persistence
+failures now have explicit recovery, observer history loads tail-first, retained
+terminal memory is bounded, process metadata refreshes in batches, and direct
+bootstrap output drains concurrently without unbounded retention.
 
-Scope:
+Completed scope:
 
 - Surface workspace-archive corruption and session-store disk-write failures in
   a recoverable degraded-state UI, including rename-aside recovery and retry.
@@ -353,6 +355,8 @@ Scope:
   explicit memory budgets for retained terminal surfaces.
 - Batch idle process metadata probes, harden bootstrap process output draining,
   and ensure all long-lived tasks remove their completion bookkeeping.
+
+Implementation status: complete.
 
 Acceptance:
 

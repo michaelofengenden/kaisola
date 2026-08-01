@@ -1,9 +1,84 @@
+import Dispatch
 import Foundation
 import ServiceManagement
 
 protocol BrokerHelperLaunching: Sendable {
     func packageManifest() async throws -> BrokerHelperManifest
     func launch(configurationURL: URL) async throws -> Int32
+}
+
+struct BrokerBootstrapProcessOutput: Equatable, Sendable {
+    let stdout: String
+    let stderr: String
+    let terminationStatus: Int32
+}
+
+/// Drain both bootstrap pipes while the process is running. Waiting first can
+/// deadlock as soon as either pipe reaches its kernel buffer capacity.
+enum BrokerBootstrapProcessDrainer {
+    static let retainedBytesPerStream = 64 * 1024
+
+    static func waitForExit(
+        _ process: Process,
+        stdout: Pipe,
+        stderr: Pipe
+    ) -> BrokerBootstrapProcessOutput {
+        let outputDrain = BoundedBootstrapPipeDrain(limit: retainedBytesPerStream)
+        let errorDrain = BoundedBootstrapPipeDrain(limit: retainedBytesPerStream)
+        let group = DispatchGroup()
+
+        group.enter()
+        DispatchQueue.global(qos: .utility).async {
+            outputDrain.consume(stdout.fileHandleForReading)
+            group.leave()
+        }
+        group.enter()
+        DispatchQueue.global(qos: .utility).async {
+            errorDrain.consume(stderr.fileHandleForReading)
+            group.leave()
+        }
+
+        process.waitUntilExit()
+        group.wait()
+        return BrokerBootstrapProcessOutput(
+            stdout: outputDrain.string,
+            stderr: errorDrain.string,
+            terminationStatus: process.terminationStatus
+        )
+    }
+}
+
+private final class BoundedBootstrapPipeDrain: @unchecked Sendable {
+    private let limit: Int
+    private let lock = NSLock()
+    private var retained = Data()
+
+    init(limit: Int) {
+        self.limit = max(0, limit)
+    }
+
+    var string: String {
+        lock.withLock { String(decoding: retained, as: UTF8.self) }
+    }
+
+    func consume(_ handle: FileHandle) {
+        while true {
+            let chunk: Data
+            do {
+                guard let next = try handle.read(upToCount: 16 * 1024),
+                      !next.isEmpty else { return }
+                chunk = next
+            } catch {
+                return
+            }
+            lock.withLock {
+                let remaining = max(0, limit - retained.count)
+                if remaining > 0 {
+                    retained.append(contentsOf: chunk.prefix(remaining))
+                }
+            }
+        }
+    }
 }
 
 actor BrokerBootstrapClient: BrokerHelperLaunching {
@@ -122,14 +197,19 @@ actor BrokerBootstrapClient: BrokerHelperLaunching {
         process.standardOutput = output
         process.standardError = errors
         try process.run()
-        process.waitUntilExit()
-        let stdout = String(decoding: output.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
-        let stderr = String(decoding: errors.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
-        guard process.terminationStatus == 0,
-              let match = stdout.range(of: #"BROKER_BOOTSTRAP_PID=([0-9]+)"#, options: .regularExpression),
-              let pid = Int32(stdout[match].split(separator: "=").last ?? ""),
+        let collected = BrokerBootstrapProcessDrainer.waitForExit(
+            process,
+            stdout: output,
+            stderr: errors
+        )
+        guard collected.terminationStatus == 0,
+              let match = collected.stdout.range(
+                  of: #"BROKER_BOOTSTRAP_PID=([0-9]+)"#,
+                  options: .regularExpression
+              ),
+              let pid = Int32(collected.stdout[match].split(separator: "=").last ?? ""),
               pid > 1 else {
-            let message = stderr
+            let message = collected.stderr
                 .replacingOccurrences(of: #"^BROKER_BOOTSTRAP_ERROR="#, with: "", options: .regularExpression)
                 .trimmingCharacters(in: .whitespacesAndNewlines)
             throw BrokerBootstrapError.launchRejected(message.isEmpty ? nil : message)

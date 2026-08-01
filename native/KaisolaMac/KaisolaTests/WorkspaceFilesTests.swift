@@ -1710,6 +1710,85 @@ final class WorkspaceFilesTests: XCTestCase {
         XCTAssertEqual(source, "[Website](https://example.test) · [Docs](docs/README.md)")
     }
 
+    func testMarkdownLinkPolicyRoutesHTTPAndHTTPSPlusWorkspaceFiles() throws {
+        let document = root.appendingPathComponent("docs/guide.md")
+        try FileManager.default.createDirectory(
+            at: document.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        let expectedFile = root.appendingPathComponent("Sources/App.swift").standardizedFileURL
+
+        XCTAssertEqual(
+            WorkspacePreviewLinkPolicy.decision(
+                for: try XCTUnwrap(URL(string: "https://example.test/docs")),
+                documentURL: document,
+                workspaceRoot: root
+            ),
+            .external(try XCTUnwrap(URL(string: "https://example.test/docs")))
+        )
+        XCTAssertEqual(
+            WorkspacePreviewLinkPolicy.decision(
+                for: try XCTUnwrap(URL(string: "http://localhost:8080/status")),
+                documentURL: document,
+                workspaceRoot: root
+            ),
+            .external(try XCTUnwrap(URL(string: "http://localhost:8080/status")))
+        )
+        XCTAssertEqual(
+            WorkspacePreviewLinkPolicy.decision(
+                for: try XCTUnwrap(URL(string: "../Sources/App.swift#L42")),
+                documentURL: document,
+                workspaceRoot: root
+            ),
+            .workspaceFile(expectedFile, line: 42)
+        )
+        XCTAssertEqual(
+            WorkspacePreviewLinkPolicy.decision(
+                for: expectedFile,
+                documentURL: document,
+                workspaceRoot: root
+            ),
+            .workspaceFile(expectedFile, line: nil)
+        )
+    }
+
+    func testMarkdownLinkPolicyBlocksSchemesCredentialsAndWorkspaceEscapes() throws {
+        let document = root.appendingPathComponent("docs/guide.md")
+        let outside = root.deletingLastPathComponent().appendingPathComponent("outside.md")
+        let blocked = [
+            "mailto:agent@example.test",
+            "kaisola-do-something://payload",
+            "https://user:secret@example.test/private",
+            "//example.test/scheme-relative",
+            "#local-anchor",
+            outside.absoluteString,
+            "../../outside.md",
+        ]
+
+        for rawLink in blocked {
+            XCTAssertEqual(
+                WorkspacePreviewLinkPolicy.decision(
+                    for: try XCTUnwrap(URL(string: rawLink)),
+                    documentURL: document,
+                    workspaceRoot: root
+                ),
+                .blocked,
+                rawLink
+            )
+        }
+
+        let outsideDirectory = root.deletingLastPathComponent()
+            .appendingPathComponent("kaisola-link-outside-\(UUID().uuidString.prefix(8))", isDirectory: true)
+        try FileManager.default.createDirectory(at: outsideDirectory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: outsideDirectory) }
+        let escape = root.appendingPathComponent("linked-outside", isDirectory: true)
+        try FileManager.default.createSymbolicLink(at: escape, withDestinationURL: outsideDirectory)
+        XCTAssertFalse(WorkspacePreviewLinkPolicy.isContained(
+            escape.appendingPathComponent("secret.md"),
+            in: root
+        ))
+    }
+
     func testMarkdownPinchZoomScalesFromGestureStartAndStaysBounded() {
         XCTAssertEqual(MarkdownPreviewLayout.magnifiedZoom(start: 1, gestureScale: 1.25), 1.25)
         XCTAssertEqual(MarkdownPreviewLayout.magnifiedZoom(start: 1.5, gestureScale: 2), 2)

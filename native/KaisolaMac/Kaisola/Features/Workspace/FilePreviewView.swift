@@ -116,6 +116,91 @@ enum FilePreviewContent: Equatable, Sendable {
     static let maxDocumentBytes = 20 * 1_048_576
 }
 
+/// One fail-closed policy for links originating in local previews. Rendered
+/// Markdown may hand an arbitrary URL to SwiftUI's `OpenURLAction`; never let a
+/// README launch a custom scheme or reveal an arbitrary `file:` URL through
+/// Launch Services. Web links are explicit http(s) destinations, while local
+/// links are resolved against the document and routed back through Kaisola's
+/// workspace preview.
+enum WorkspacePreviewLinkPolicy {
+    enum Decision: Equatable {
+        case external(URL)
+        case workspaceFile(URL, line: Int?)
+        case blocked
+    }
+
+    static func decision(
+        for link: URL,
+        documentURL: URL,
+        workspaceRoot: URL?
+    ) -> Decision {
+        if let scheme = link.scheme?.lowercased() {
+            if scheme == "http" || scheme == "https" {
+                guard link.host?.isEmpty == false,
+                      link.user == nil,
+                      link.password == nil else { return .blocked }
+                return .external(link)
+            }
+            guard scheme == "file",
+                  link.host?.isEmpty != false else { return .blocked }
+        } else {
+            // `//host/path` is a scheme-relative network URL, not a project
+            // path. A fragment-only link needs in-document anchor support and
+            // must not accidentally become a filesystem navigation.
+            guard link.host == nil,
+                  !link.absoluteString.hasPrefix("//"),
+                  !link.absoluteString.hasPrefix("#") else { return .blocked }
+        }
+
+        let decodedPath = link.path.removingPercentEncoding ?? link.path
+        guard !decodedPath.isEmpty else { return .blocked }
+        let base = documentURL.deletingLastPathComponent().standardizedFileURL
+        let candidate: URL
+        if link.isFileURL || decodedPath.hasPrefix("/") {
+            candidate = URL(fileURLWithPath: decodedPath).standardizedFileURL
+        } else {
+            candidate = URL(fileURLWithPath: decodedPath, relativeTo: base).standardizedFileURL
+        }
+        let boundary = (workspaceRoot ?? base).standardizedFileURL
+        guard isContained(candidate, in: boundary) else { return .blocked }
+        return .workspaceFile(candidate, line: lineNumber(from: link.fragment))
+    }
+
+    /// Resolve both sides before comparing so `..` walks and symlinked files
+    /// cannot escape the project boundary.
+    static func isContained(_ url: URL, in directory: URL) -> Bool {
+        let base = canonicalPath(directory)
+        let candidate = canonicalPath(url)
+        return candidate == base || candidate.hasPrefix(base + "/")
+    }
+
+    /// `resolvingSymlinksInPath()` can leave a symlinked parent unresolved when
+    /// the leaf does not exist. Resolve the nearest existing ancestor first,
+    /// then append the missing suffix without giving it another interpretation.
+    private static func canonicalPath(_ url: URL) -> String {
+        var ancestor = url.standardizedFileURL
+        var missingComponents: [String] = []
+        while ancestor.path != "/",
+              !FileManager.default.fileExists(atPath: ancestor.path) {
+            missingComponents.insert(ancestor.lastPathComponent, at: 0)
+            ancestor.deleteLastPathComponent()
+        }
+        var resolved = ancestor.resolvingSymlinksInPath()
+        for component in missingComponents {
+            resolved.appendPathComponent(component)
+        }
+        return resolved.standardizedFileURL.path
+    }
+
+    private static func lineNumber(from fragment: String?) -> Int? {
+        guard let fragment,
+              fragment.first?.lowercased() == "l",
+              let line = Int(fragment.dropFirst()),
+              line > 0 else { return nil }
+        return line
+    }
+}
+
 /// AppKit's Office Open XML reader/writer is synchronous and the attributed
 /// string classes predate Sendable. Keep that work off the main actor and move
 /// the immutable result across the boundary in this explicit wrapper.
@@ -5747,6 +5832,35 @@ private struct MarkdownDocumentView: View {
         .background {
             MarkdownCommandScrollZoomBridge(zoom: $zoom)
         }
+        .environment(\.openURL, OpenURLAction { link in
+            switch WorkspacePreviewLinkPolicy.decision(
+                for: link,
+                documentURL: documentURL,
+                workspaceRoot: workspaceRoot
+            ) {
+            case let .external(url):
+                NSWorkspace.shared.open(url)
+                return .handled
+            case let .workspaceFile(url, line):
+                var userInfo: [AnyHashable: Any] = [
+                    "url": url,
+                    "workspaceHint": workspaceRoot
+                        ?? documentURL.deletingLastPathComponent(),
+                ]
+                if let line { userInfo["line"] = line }
+                NotificationCenter.default.post(
+                    name: .kaisolaOpenFileLink,
+                    object: nil,
+                    userInfo: userInfo
+                )
+                return .handled
+            case .blocked:
+                onError(
+                    "Kaisola blocked a Markdown link outside this project or using an unsupported scheme."
+                )
+                return .discarded
+            }
+        })
         .onAppear { beginAutomaticEditIfReady() }
         .onChange(of: source) { _, _ in beginAutomaticEditIfReady() }
         .simultaneousGesture(

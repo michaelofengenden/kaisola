@@ -823,7 +823,7 @@ private struct ConfinedFileWebView: NSViewRepresentable {
     private var effectiveReadAccessRoot: URL {
         let fallback = fileURL.deletingLastPathComponent()
         guard let candidate = readAccessRoot?.standardizedFileURL,
-              Coordinator.isContained(fileURL, in: candidate) else { return fallback }
+              WorkspacePreviewLinkPolicy.isContained(fileURL, in: candidate) else { return fallback }
         return candidate
     }
 
@@ -889,7 +889,9 @@ private struct ConfinedFileWebView: NSViewRepresentable {
             }
             // Confine to file:// URLs inside the chosen project read root (this
             // also admits the initial load of the file itself).
-            if target.isFileURL, let directory, Self.isContained(target, in: directory) {
+            if target.isFileURL,
+               let directory,
+               WorkspacePreviewLinkPolicy.isContained(target, in: directory) {
                 decisionHandler(.allow)
                 return
             }
@@ -907,13 +909,5 @@ private struct ConfinedFileWebView: NSViewRepresentable {
             decisionHandler(.cancel)
         }
 
-        /// True when `url` resolves to a path inside `directory`. Symlinks are
-        /// resolved on both sides before the prefix check so a `../` walk or a
-        /// symlinked entry cannot escape the folder.
-        static func isContained(_ url: URL, in directory: URL) -> Bool {
-            let base = directory.standardizedFileURL.resolvingSymlinksInPath().path
-            let candidate = url.standardizedFileURL.resolvingSymlinksInPath().path
-            return candidate == base || candidate.hasPrefix(base + "/")
-        }
     }
 }

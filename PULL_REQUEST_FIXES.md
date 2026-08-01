@@ -30,6 +30,9 @@ Large product and architecture work remains ordered in
   scrolling, magnification, and accessibility; parsing stays off the main actor.
 - Truncated Markdown tables now state the exact number of rows not shown instead
   of silently stopping after the bounded 100-row preview.
+- Rendered Markdown now blocks custom schemes, credential-bearing web links,
+  scheme-relative URLs, and filesystem escapes; project files route back into
+  Kaisola through one symlink-safe policy shared with HTML previews.
 
 ## Open audit fixes
 

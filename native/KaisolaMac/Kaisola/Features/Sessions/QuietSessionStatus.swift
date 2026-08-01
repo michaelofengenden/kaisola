@@ -52,6 +52,20 @@ enum QuietSessionStatus: Equatable {
         }
     }
 
+    /// A second, non-colour channel for every speaking state. Six-point rail
+    /// marks cannot carry readable letters, but a circle, triangle, square,
+    /// and cross remain distinct in peripheral vision and under common colour
+    /// deficiencies. Silent states intentionally have no marker.
+    var markerShape: QuietStatusMarkerShape? {
+        switch self {
+        case .working: .circle
+        case .needsYou: .triangle
+        case .doneUnseen: .square
+        case .failed: .cross
+        case .idle, .ended: nil
+        }
+    }
+
     var isDimmed: Bool { self == .ended }
 }
 
@@ -90,6 +104,162 @@ enum QuietStatusPalette {
         case .failed: return failed
         case .idle, .ended: return nil
         }
+    }
+}
+
+enum QuietStatusMarkerShape: String, CaseIterable, Equatable {
+    case circle, triangle, square, cross
+}
+
+/// Packed sRGB values for a filled semantic badge. The foreground/background
+/// pair is deliberate: status text and glyphs never sit directly on unknown
+/// glass, and every pair clears WCAG AA for small text in both appearances.
+struct KaisolaStatusColorPair: Equatable {
+    let light: UInt32
+    let dark: UInt32
+}
+
+struct KaisolaStatusBadgePalette: Equatable {
+    let foreground: KaisolaStatusColorPair
+    let background: KaisolaStatusColorPair
+}
+
+enum KaisolaStatusTone: CaseIterable, Equatable {
+    case needsYou, working, done, failed
+
+    var palette: KaisolaStatusBadgePalette {
+        switch self {
+        case .needsYou:
+            KaisolaStatusBadgePalette(
+                foreground: .init(light: 0x6D3B00, dark: 0xFFD589),
+                background: .init(light: 0xFFE4B5, dark: 0x4A2B00)
+            )
+        case .working:
+            KaisolaStatusBadgePalette(
+                foreground: .init(light: 0x164A9C, dark: 0xB9D2FF),
+                background: .init(light: 0xDCEAFF, dark: 0x173461)
+            )
+        case .done:
+            KaisolaStatusBadgePalette(
+                foreground: .init(light: 0x145C2F, dark: 0xA8E6BC),
+                background: .init(light: 0xD9F4E2, dark: 0x174229)
+            )
+        case .failed:
+            KaisolaStatusBadgePalette(
+                foreground: .init(light: 0x8A261F, dark: 0xFFC0BA),
+                background: .init(light: 0xFDE1DE, dark: 0x5B211D)
+            )
+        }
+    }
+
+    var foregroundColor: Color {
+        Color(light: palette.foreground.light, dark: palette.foreground.dark)
+    }
+
+    var backgroundColor: Color {
+        Color(light: palette.background.light, dark: palette.background.dark)
+    }
+}
+
+/// A compact, labelled status pill used by project and footer chrome. The icon
+/// makes the state independent of colour; the text/count keeps it explicit.
+struct KaisolaStatusBadge: View {
+    let text: String
+    let systemImage: String
+    let tone: KaisolaStatusTone
+
+    var body: some View {
+        Label(text, systemImage: systemImage)
+            .font(.caption2.weight(.bold))
+            .foregroundStyle(tone.foregroundColor)
+            .padding(.horizontal, 5)
+            .padding(.vertical, 2)
+            .background(tone.backgroundColor, in: Capsule())
+            .overlay {
+                Capsule()
+                    .strokeBorder(tone.foregroundColor.opacity(0.24), lineWidth: KaisolaVisualSystem.hairline)
+            }
+            .fixedSize()
+            .accessibilityElement(children: .combine)
+    }
+}
+
+/// The icon-only companion for rows whose adjacent title/detail already names
+/// the item. It retains the same high-contrast fill and an unambiguous symbol.
+struct KaisolaStatusGlyph: View {
+    let systemImage: String
+    let tone: KaisolaStatusTone
+    var size: CGFloat = 18
+
+    var body: some View {
+        Image(systemName: systemImage)
+            .font(.system(size: max(7, size * 0.52), weight: .bold))
+            .foregroundStyle(tone.foregroundColor)
+            .frame(width: size, height: size)
+            .background(tone.backgroundColor, in: Circle())
+            .overlay {
+                Circle()
+                    .strokeBorder(tone.foregroundColor.opacity(0.24), lineWidth: KaisolaVisualSystem.hairline)
+            }
+            .accessibilityHidden(true)
+    }
+}
+
+/// The shared colour-blind-safe marker for the compact rail and its collapsed
+/// project rollups. Accessibility text lives on the enclosing row/rollup.
+struct QuietStatusMark: View {
+    let status: QuietSessionStatus
+    let size: CGFloat
+
+    @ViewBuilder
+    var body: some View {
+        if let color = status.dotColor, let shape = status.markerShape {
+            switch shape {
+            case .circle:
+                Circle().fill(color)
+                    .frame(width: size, height: size)
+            case .triangle:
+                QuietTriangle().fill(color)
+                    .frame(width: size, height: size)
+            case .square:
+                RoundedRectangle(cornerRadius: max(1, size * 0.18), style: .continuous)
+                    .fill(color)
+                    .frame(width: size, height: size)
+            case .cross:
+                QuietCross()
+                    .stroke(
+                        color,
+                        style: StrokeStyle(
+                            lineWidth: max(1.2, size * 0.25),
+                            lineCap: .round,
+                            lineJoin: .round
+                        )
+                    )
+                    .frame(width: size, height: size)
+            }
+        }
+    }
+}
+
+private struct QuietTriangle: Shape {
+    func path(in rect: CGRect) -> Path {
+        var path = Path()
+        path.move(to: CGPoint(x: rect.midX, y: rect.minY))
+        path.addLine(to: CGPoint(x: rect.maxX, y: rect.maxY))
+        path.addLine(to: CGPoint(x: rect.minX, y: rect.maxY))
+        path.closeSubpath()
+        return path
+    }
+}
+
+private struct QuietCross: Shape {
+    func path(in rect: CGRect) -> Path {
+        var path = Path()
+        path.move(to: CGPoint(x: rect.minX, y: rect.minY))
+        path.addLine(to: CGPoint(x: rect.maxX, y: rect.maxY))
+        path.move(to: CGPoint(x: rect.maxX, y: rect.minY))
+        path.addLine(to: CGPoint(x: rect.minX, y: rect.maxY))
+        return path
     }
 }
 

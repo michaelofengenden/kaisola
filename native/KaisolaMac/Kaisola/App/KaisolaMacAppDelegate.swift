@@ -781,7 +781,9 @@ final class KaisolaMacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDele
             try? NativePreviewPaths.prepareApplicationSupport()
         }
         if visualFixture {
-            settings.navigationLayout = visualSurface == "topbar" ? .topBar : .leftTree
+            settings.navigationLayout = ["topbar", "topbar-attention"].contains(visualSurface)
+                ? .topBar
+                : .leftTree
             settings.appearance = visualAppearance == "dark" ? .dark : .light
             settings.sidebarAppearance = .glass
             settings.workspaceBackdrop = .glass
@@ -929,7 +931,7 @@ final class KaisolaMacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDele
             if visualSurface == "companion-control",
                let terminal = model.sessions.first {
                 model.setCompanionControlActive(true, for: terminal)
-            } else if visualSurface == "attention-completed" {
+            } else if ["attention-completed", "topbar-attention"].contains(visualSurface) {
                 model.loadVisualCompletedAttentionFixture()
             } else if visualSurface == "mixed" {
                 model.loadVisualMixedSessionFixture(workspace: workspace)
@@ -1605,6 +1607,28 @@ final class KaisolaMacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDele
                 print("KAISOLA_NATIVE_VISUAL_CAPTURE=FAIL no-content-view")
                 requestVisualFixtureTermination()
                 return
+            }
+
+            // Mixed and Mesh both select a non-terminal pane before the view is
+            // hosted. Their generation-based request must survive that mount
+            // and land on the real composer field editor, or the visible focus
+            // ring and keyboard target have drifted again.
+            if ["mixed", "mesh"].contains(visualSurface) {
+                guard captureWindow.firstResponder is NSText else {
+                    let responder = captureWindow.firstResponder
+                        .map { String(describing: type(of: $0)) }
+                        ?? "nil"
+                    print(
+                        "KAISOLA_NATIVE_VISUAL_COMPOSER_FOCUS=FAIL "
+                            + "surface=\(visualSurface) responder=\(responder)"
+                    )
+                    requestVisualFixtureTermination()
+                    return
+                }
+                print(
+                    "KAISOLA_NATIVE_VISUAL_COMPOSER_FOCUS=PASS "
+                        + "surface=\(visualSurface)"
+                )
             }
 
             let terminalAccessibilityMarkers = NativeVisualTerminalAccessibilityGate.expectedMarkers(

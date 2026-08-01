@@ -1,5 +1,6 @@
 import AppKit
 import ImageIO
+import SwiftUI
 import XCTest
 @testable import Kaisola
 
@@ -1545,6 +1546,18 @@ final class NativePreviewSettingsTests: XCTestCase {
         XCTAssertGreaterThan(KaisolaVisualSystem.chromeRadius, KaisolaVisualSystem.cardRadius)
         XCTAssertLessThan(KaisolaVisualSystem.chromeRadius, KaisolaVisualSystem.shellRadius)
         XCTAssertEqual(KaisolaVisualSystem.chromeInset, 6)
+    }
+
+    func testReduceMotionFallbackStripsEveryDescendantAnimationTransaction() {
+        var ordinary = Transaction(animation: .linear(duration: 1))
+        KaisolaMotionPolicy.apply(reduceMotion: false, to: &ordinary)
+        XCTAssertNotNil(ordinary.animation)
+        XCTAssertFalse(ordinary.disablesAnimations)
+
+        var reduced = Transaction(animation: .linear(duration: 1))
+        KaisolaMotionPolicy.apply(reduceMotion: true, to: &reduced)
+        XCTAssertNil(reduced.animation)
+        XCTAssertTrue(reduced.disablesAnimations)
     }
 
     /// v1.1.8 made everything a step rounder. The literals matter less than the

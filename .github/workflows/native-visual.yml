@@ -119,14 +119,14 @@ jobs:
             fi
           }
 
-          for surface in terminal terminal-solo terminal-semantic terminal-scroll-output terminal-transcript account-picker attention-completed companion-control mixed palette preview preview-narrow preview-dirty-tab preview-tab-overflow preview-table-edit preview-html preview-docx preview-pdf workspace-rename workspace-new-file topbar mesh onboarding settings settings-terminal settings-terminal-history settings-terminal-interaction settings-companion settings-mcp settings-models settings-shortcuts settings-account-recovery usage; do
+          for surface in terminal terminal-solo terminal-semantic terminal-scroll-output terminal-transcript account-picker attention-completed companion-control mixed palette preview preview-narrow preview-dirty-tab preview-tab-overflow preview-table-edit preview-html preview-docx preview-pdf workspace-rename workspace-new-file topbar topbar-attention mesh onboarding settings settings-terminal settings-terminal-history settings-terminal-interaction settings-companion settings-mcp settings-models settings-shortcuts settings-account-recovery usage; do
             capture="$output/$surface.png"
             run_fixture "$surface" "$capture" \
               "$binary" -ApplePersistenceIgnoreState YES
             verify_capture "$capture" "$surface"
           done
 
-          for surface in terminal terminal-semantic mixed palette mesh onboarding settings-terminal settings-shortcuts; do
+          for surface in terminal terminal-semantic mixed palette topbar-attention mesh onboarding settings-terminal settings-shortcuts; do
             capture="$output/dark-$surface.png"
             run_fixture "$surface" "$capture" \
               /usr/bin/env KAISOLA_NATIVE_VISUAL_APPEARANCE=dark "$binary"

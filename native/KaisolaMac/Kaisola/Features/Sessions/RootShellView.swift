@@ -26,6 +26,7 @@ struct RootShellView: View {
     @ObservedObject private var companionHost = CompanionHost.shared
     @ObservedObject private var keymap = AppCommandKeymapCenter.shared
     @Environment(\.colorScheme) private var colorScheme
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @Environment(\.undoManager) private var undoManager
     @State private var renameTarget: String?
     @State private var renameProjectTarget: String?
@@ -205,6 +206,7 @@ struct RootShellView: View {
 
     var body: some View {
         chromeDecorated
+            .kaisolaReduceMotionFallback()
             .onReceive(NotificationCenter.default.publisher(for: .kaisolaOpenFileLink)) { note in
                 guard let url = note.userInfo?["url"] as? URL else { return }
                 model.openFilePreview(
@@ -852,7 +854,7 @@ struct RootShellView: View {
             if let error = rememberedSessions.errorMessage {
                 Text(error)
                     .font(.caption2)
-                    .foregroundStyle(.orange)
+                    .foregroundStyle(KaisolaStatusTone.failed.foregroundColor)
                     .lineLimit(2)
             }
             if let freshness = rememberedSessions.freshnessTitle {
@@ -1754,14 +1756,25 @@ struct RootShellView: View {
                         .font(.system(size: 12, weight: .semibold))
                         .lineLimit(1)
                     if surfaceWorking(id) {
-                        ProgressView()
-                            .controlSize(.mini)
-                            .scaleEffect(0.55)
-                            .accessibilityLabel(surfaceStatusLabel(id))
+                        if reduceMotion {
+                            Image(systemName: "hourglass")
+                                .font(.system(size: 8, weight: .bold))
+                                .foregroundStyle(KaisolaStatusTone.working.foregroundColor)
+                                .accessibilityLabel(surfaceStatusLabel(id))
+                        } else {
+                            ProgressView()
+                                .controlSize(.mini)
+                                .scaleEffect(0.55)
+                                .accessibilityLabel(surfaceStatusLabel(id))
+                        }
                     } else {
-                        Circle()
-                            .fill(surfaceLive(id) ? Color.green : Color.secondary.opacity(0.45))
-                            .frame(width: 5, height: 5)
+                        Image(systemName: surfaceLive(id) ? "checkmark.circle.fill" : "circle.slash")
+                            .font(.system(size: 8, weight: .bold))
+                            .foregroundStyle(
+                                surfaceLive(id)
+                                    ? KaisolaStatusTone.done.foregroundColor
+                                    : Color.secondary
+                            )
                             .accessibilityElement(children: .ignore)
                             .accessibilityLabel(surfaceStatusLabel(id))
                     }
@@ -1892,10 +1905,20 @@ struct RootShellView: View {
             .padding(.trailing, TerminalPaneGrid.contentTrailingInset)
             .padding(.bottom, TerminalPaneGrid.contentBottomInset)
         } else if let chat = model.chats.first(where: { $0.id == id }) {
-            AcpChatView(conversation: chat.conversation, presentation: .embedded)
+            AcpChatView(
+                conversation: chat.conversation,
+                presentation: .embedded,
+                focusRequestGeneration: keyboardFocusGeneration(for: id),
+                onKeyboardFocus: { model.focusSurfaceFromKeyboard(id) }
+            )
                 .id(chat.id)
         } else if let mesh = model.meshes.first(where: { $0.id == id }) {
-            MeshView(mesh: mesh, presentation: .embedded)
+            MeshView(
+                mesh: mesh,
+                presentation: .embedded,
+                focusRequestGeneration: keyboardFocusGeneration(for: id),
+                onKeyboardFocus: { model.focusSurfaceFromKeyboard(id) }
+            )
                 .id(mesh.id)
         } else {
             ContentUnavailableView("Session unavailable", systemImage: "rectangle.slash")
@@ -1944,6 +1967,10 @@ struct RootShellView: View {
                 // part of the input-safety boundary: remount so a formerly
                 // ReadOnlyTerminalView can never keep swallowing owned keystrokes.
                 .id("unified-\(id)-\(owned)")
+                .onAppear { fulfillTerminalKeyboardFocusRequest(for: id) }
+                .onChange(of: model.keyboardFocusRequest) { _, _ in
+                    fulfillTerminalKeyboardFocusRequest(for: id)
+                }
 
                 terminalLifecycleOverlay(id)
             }
@@ -2018,6 +2045,21 @@ struct RootShellView: View {
             splits: model.splitDocuments,
             retained: model.terminalSurfaceDocuments
         )
+    }
+
+    private func keyboardFocusGeneration(for id: String) -> UInt64? {
+        guard let request = model.keyboardFocusRequest,
+              request.targetID == id else { return nil }
+        return request.generation
+    }
+
+    private func fulfillTerminalKeyboardFocusRequest(for id: String) {
+        guard let request = model.keyboardFocusRequest,
+              request.targetID == id else { return }
+        DispatchQueue.main.async {
+            guard model.keyboardFocusRequest == request else { return }
+            TerminalKeyboardFocus.moveFirstResponder(toSessionID: id)
+        }
     }
 
     private func surfaceTitle(_ id: String) -> String {
@@ -4040,14 +4082,14 @@ private struct ConnectionFooter: View {
         }
     }
 
-    /// Secondary until the number matters. `.orange`/`.red` here are the same
-    /// two colors the inbox and the rail's dots already use for "attend to
-    /// this" and "this failed", so the footer adds no new vocabulary.
+    /// Secondary until the number matters. Warning and critical readings use
+    /// the filled-status foreground tokens so small text clears contrast in
+    /// either appearance instead of relying on raw system orange/red.
     static func usageTint(_ level: FooterUsageChip.Level) -> Color {
         switch level {
         case .normal: .secondary
-        case .warning: .orange
-        case .critical: .red
+        case .warning: KaisolaStatusTone.needsYou.foregroundColor
+        case .critical: KaisolaStatusTone.failed.foregroundColor
         }
     }
 
@@ -4079,7 +4121,9 @@ private struct ConnectionFooter: View {
     /// The tooltip leads with the whole name whenever the chip is showing less
     /// than all of it, so the first-name label is never the only copy on screen.
     private var accountHelp: String {
-        let base = "Account and project settings"
+        let base = state.isConnected
+            ? "Account and project settings"
+            : "Connection needs attention — account and project settings"
         return displayedAccountName == accountName ? base : "\(accountName) — \(base)"
     }
 
@@ -4198,18 +4242,24 @@ private struct ConnectionFooter: View {
             AccountAvatarView(account: auth.account, size: FooterAccountBudget.avatarSize)
                 .overlay(alignment: .bottomTrailing) {
                     // Connected is the silent default; only a broken connection
-                    // earns a colored mark.
+                    // earns a labelled-shape mark. The old orange dot was both
+                    // low contrast and colour-only.
                     if !state.isConnected {
-                        Circle()
-                            .fill(Color.orange)
-                            .frame(width: 6, height: 6)
-                            .overlay(Circle().stroke(Color(nsColor: .windowBackgroundColor), lineWidth: 1))
+                        KaisolaStatusGlyph(
+                            systemImage: "exclamationmark",
+                            tone: .needsYou,
+                            size: 11
+                        )
                     }
                 }
                 .allowsHitTesting(false)
         }
         .help(accountHelp)
-        .accessibilityLabel("Kaisola account and settings")
+        .accessibilityLabel(
+            state.isConnected
+                ? "Kaisola account and settings"
+                : "Kaisola account and settings, connection needs attention"
+        )
     }
 
     /// Inbox row glyphs. Exhaustive on purpose: a new `AttentionCenter.Kind`
@@ -4224,12 +4274,12 @@ private struct ConnectionFooter: View {
         }
     }
 
-    /// Amber means needs-you, green means finished — matching the rail's
-    /// status derivation, where a bell is also amber.
-    static func attentionTint(_ kind: AttentionCenter.Kind) -> Color {
+    /// Needs-you and finished use the same filled semantic vocabulary as the
+    /// project badges, instead of raw system orange/green on unknown material.
+    static func attentionTone(_ kind: AttentionCenter.Kind) -> KaisolaStatusTone {
         switch kind {
-        case .permission, .bell: .orange
-        case .turnCompleted, .sessionResponded: .green
+        case .permission, .bell: .needsYou
+        case .turnCompleted, .sessionResponded: .done
         }
     }
 
@@ -4239,12 +4289,16 @@ private struct ConnectionFooter: View {
             Button {
                 showInbox.toggle()
             } label: {
-                Label("\(attention.count)", systemImage: "bell.badge.fill")
-                    .font(.caption.weight(.semibold))
-                    .foregroundStyle(.orange)
+                KaisolaStatusBadge(
+                    text: "\(attention.count)",
+                    systemImage: "bell.fill",
+                    tone: .needsYou
+                )
             }
             .buttonStyle(.borderless)
             .help("Needs you — permission asks and finished agents")
+            .accessibilityLabel("Attention inbox, \(attention.count) items")
+            .accessibilityIdentifier("footer.attention")
             .popover(isPresented: $showInbox, arrowEdge: .top) {
                 VStack(alignment: .leading, spacing: 0) {
                     ForEach(attention.entries.reversed()) { entry in
@@ -4253,8 +4307,10 @@ private struct ConnectionFooter: View {
                             jumpToAttention?(entry.targetID)
                         } label: {
                             HStack(spacing: 8) {
-                                Image(systemName: Self.attentionSymbol(entry.kind))
-                                    .foregroundStyle(Self.attentionTint(entry.kind))
+                                KaisolaStatusGlyph(
+                                    systemImage: Self.attentionSymbol(entry.kind),
+                                    tone: Self.attentionTone(entry.kind)
+                                )
                                 VStack(alignment: .leading, spacing: 1) {
                                     Text(entry.title).font(.callout).lineLimit(1)
                                     Text(entry.detail).font(.caption).foregroundStyle(.secondary).lineLimit(1)

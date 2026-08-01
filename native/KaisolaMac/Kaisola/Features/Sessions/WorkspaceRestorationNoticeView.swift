@@ -41,7 +41,7 @@ struct WorkspaceRestorationNoticeView: View {
     private func banner(_ notice: WorkspaceRestorationNotice) -> some View {
         HStack(alignment: .top, spacing: 10) {
             Image(systemName: "exclamationmark.triangle.fill")
-                .foregroundStyle(.orange)
+                .foregroundStyle(KaisolaStatusTone.needsYou.foregroundColor)
                 .accessibilityHidden(true)
             VStack(alignment: .leading, spacing: 6) {
                 Text(notice.title)
@@ -106,7 +106,7 @@ struct WorkspaceRestorationNoticeView: View {
         } label: {
             HStack(spacing: 6) {
                 Image(systemName: "exclamationmark.triangle.fill")
-                    .foregroundStyle(.orange)
+                    .foregroundStyle(KaisolaStatusTone.needsYou.foregroundColor)
                 Text(notice.summary)
                     .font(.caption.weight(.medium))
             }

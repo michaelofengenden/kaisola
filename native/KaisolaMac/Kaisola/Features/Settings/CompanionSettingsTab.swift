@@ -170,7 +170,7 @@ struct CompanionSettingsTab: View {
                 if let error = operationError {
                     Label(error, systemImage: "exclamationmark.triangle.fill")
                         .font(.caption)
-                        .foregroundStyle(.red)
+                        .foregroundStyle(KaisolaStatusTone.failed.foregroundColor)
                         .frame(maxWidth: .infinity, alignment: .leading)
                         .padding(.horizontal, 4)
                 }

@@ -36,6 +36,8 @@ struct ProjectTabStripView: View {
                         chipLabel(project)
                     }
                     .buttonStyle(.plain)
+                    .accessibilityLabel(projectAccessibilityLabel(project))
+                    .accessibilityAddTraits(selected == project.id ? .isSelected : [])
                     .contextMenu { menu(project) }
                     .onDrag {
                         draggingID = project.id
@@ -102,17 +104,17 @@ struct ProjectTabStripView: View {
             Text(project.name)
                 .font(.callout.weight(selected == project.id ? .semibold : .regular))
             if project.attentionCount > 0 {
-                Text("\(project.attentionCount)")
-                    .font(.caption2.weight(.bold))
-                    .padding(.horizontal, 4)
-                    .background(Color.orange.opacity(0.92), in: Capsule())
-                    .foregroundStyle(.white)
+                KaisolaStatusBadge(
+                    text: "\(project.attentionCount)",
+                    systemImage: "exclamationmark",
+                    tone: .needsYou
+                )
             } else if project.workingCount > 0 {
-                Text("\(project.workingCount)")
-                    .font(.caption2.weight(.bold))
-                    .padding(.horizontal, 4)
-                    .background(WorkspacePalette.active.opacity(0.92), in: Capsule())
-                    .foregroundStyle(.white)
+                KaisolaStatusBadge(
+                    text: "\(project.workingCount)",
+                    systemImage: "hourglass",
+                    tone: .working
+                )
             }
         }
         .padding(.horizontal, 11)
@@ -130,6 +132,18 @@ struct ProjectTabStripView: View {
                         )
                 }
         }
+    }
+
+    private func projectAccessibilityLabel(_ project: AppModel.ProjectGroup) -> String {
+        if project.attentionCount > 0 {
+            let noun = project.attentionCount == 1 ? "item" : "items"
+            return "\(project.name), \(project.attentionCount) \(noun) needing attention"
+        }
+        if project.workingCount > 0 {
+            let noun = project.workingCount == 1 ? "session" : "sessions"
+            return "\(project.name), \(project.workingCount) \(noun) working"
+        }
+        return project.name
     }
 }
 

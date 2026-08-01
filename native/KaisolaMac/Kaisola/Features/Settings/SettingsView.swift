@@ -98,6 +98,7 @@ struct SettingsView: View {
             maxHeight: .infinity
         )
         .background(Color(nsColor: .windowBackgroundColor).opacity(0.82))
+        .kaisolaReduceMotionFallback()
         .alert(item: $restartRequest) { _ in
             // A warning, never a block: the user is allowed to restart over a
             // running turn if they want to.
@@ -852,7 +853,7 @@ private struct GuardrailsSettings: View {
                 if let issue = newGlobIssue {
                     Text(issue)
                         .font(.caption)
-                        .foregroundStyle(.red)
+                        .foregroundStyle(KaisolaStatusTone.failed.foregroundColor)
                 }
                 Button("Restore Defaults") { showsRestoreDefaultsConfirmation = true }
                 .font(.caption)

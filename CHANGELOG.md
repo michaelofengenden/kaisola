@@ -9,6 +9,8 @@
 - Glass is calmer, subtly warmer, and consistently rounded.
 - Menus, the command palette, project actions, and workspace controls now run through one command system with clear unavailable-state explanations.
 - Keyboard Settings can create, validate, reload, or reset a private `keymap.json`; conflicting shortcuts safely keep every default.
+- Attention badges stay readable in light and dark mode, and status shapes no longer rely on color alone.
+- Reduce Motion now applies throughout the workspace and Settings; keyboard pane cycling also reaches Chat and Mesh composers.
 
 ## 1.1.7 — 2026-07-31
 

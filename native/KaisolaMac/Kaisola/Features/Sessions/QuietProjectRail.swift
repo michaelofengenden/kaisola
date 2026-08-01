@@ -902,11 +902,7 @@ private struct QuietRollupView: View {
                     .foregroundStyle(.secondary)
             }
             ForEach(Array(rollup.dots.enumerated()), id: \.offset) { _, state in
-                if let color = state.dotColor {
-                    Circle()
-                        .fill(color)
-                        .frame(width: QuietRailMetrics.dot, height: QuietRailMetrics.dot)
-                }
+                QuietStatusMark(status: state, size: QuietRailMetrics.dot)
             }
         }
         .accessibilityElement(children: .ignore)
@@ -1135,12 +1131,8 @@ private struct QuietStatusDot: View {
         ZStack {
             Color.clear
                 .frame(width: QuietRailMetrics.dot, height: QuietRailMetrics.dot)
-            if let color = status.dotColor {
-                Circle()
-                    .fill(color)
-                    .frame(width: QuietRailMetrics.dot, height: QuietRailMetrics.dot)
-                    .opacity(pulsing ? 0.3 : 1)
-            }
+            QuietStatusMark(status: status, size: QuietRailMetrics.dot)
+                .opacity(pulsing ? 0.3 : 1)
         }
         .frame(width: QuietRailMetrics.dot, height: QuietRailMetrics.dot)
         .animation(

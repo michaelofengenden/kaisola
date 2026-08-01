@@ -42,10 +42,51 @@ final class QuietSessionStatusTests: XCTestCase {
         XCTAssertFalse(QuietSessionStatus.idle.isDimmed)
     }
 
+    func testSpeakingStatesHaveDistinctNonColourMarkers() {
+        let speaking: [QuietSessionStatus] = [.working, .needsYou, .doneUnseen, .failed]
+        let markers = speaking.compactMap(\.markerShape)
+        XCTAssertEqual(markers.count, speaking.count)
+        XCTAssertEqual(Set(markers.map(\.rawValue)).count, speaking.count)
+        XCTAssertNil(QuietSessionStatus.idle.markerShape)
+        XCTAssertNil(QuietSessionStatus.ended.markerShape)
+    }
+
     // MARK: - Dot palette
 
     private func channels(_ hex: UInt32) -> (r: Int, g: Int, b: Int) {
         (Int((hex >> 16) & 0xFF), Int((hex >> 8) & 0xFF), Int(hex & 0xFF))
+    }
+
+    private func relativeLuminance(_ hex: UInt32) -> Double {
+        let channels = [16, 8, 0].map { shift -> Double in
+            let channel = Double((hex >> UInt32(shift)) & 0xFF) / 255
+            return channel <= 0.04045
+                ? channel / 12.92
+                : pow((channel + 0.055) / 1.055, 2.4)
+        }
+        return 0.2126 * channels[0] + 0.7152 * channels[1] + 0.0722 * channels[2]
+    }
+
+    private func contrastRatio(_ foreground: UInt32, _ background: UInt32) -> Double {
+        let first = relativeLuminance(foreground)
+        let second = relativeLuminance(background)
+        return (max(first, second) + 0.05) / (min(first, second) + 0.05)
+    }
+
+    func testFilledStatusBadgesClearSmallTextContrastInBothAppearances() {
+        for tone in KaisolaStatusTone.allCases {
+            let palette = tone.palette
+            XCTAssertGreaterThanOrEqual(
+                contrastRatio(palette.foreground.light, palette.background.light),
+                4.5,
+                "\(tone) light badge is below WCAG AA"
+            )
+            XCTAssertGreaterThanOrEqual(
+                contrastRatio(palette.foreground.dark, palette.background.dark),
+                4.5,
+                "\(tone) dark badge is below WCAG AA"
+            )
+        }
     }
 
     /// The v1.1.6 complaint: at 6pt, "still working" and "finished" were the

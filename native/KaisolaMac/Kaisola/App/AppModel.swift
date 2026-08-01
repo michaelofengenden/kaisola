@@ -137,7 +137,9 @@ final class AppModel: ObservableObject {
     /// A column is horizontal; ids inside a column stack vertically.
     @Published private(set) var paneLayouts: [String: SessionPaneLayout] = [:]
     @Published private(set) var focusedPaneID: String?
+    @Published private(set) var keyboardFocusRequest: SurfaceKeyboardFocusRequest?
     @Published private(set) var maximizedPaneID: String?
+    private var keyboardFocusGeneration: UInt64 = 0
     /// The project tab shown in the top-bar layout. Nil means the first project.
     @Published var selectedProjectName: String?
     /// Stable project identity used by interactive tabs/headers. Names are user
@@ -779,6 +781,7 @@ final class AppModel: ObservableObject {
         focusedPaneID = id
         maximizedPaneID = nil
         focusSurfaceFields(id)
+        requestSurfaceKeyboardFocus(id)
         // Opening a card beside the current one is a visit, exactly like
         // selecting it, so the inbox entry it was carrying must not survive.
         acknowledgeAttention(forSurface: id)
@@ -906,19 +909,29 @@ final class AppModel: ObservableObject {
         }
     }
 
+    /// Publish a fresh request even when the same pane is selected twice. Chat
+    /// and Mesh consume the generation through SwiftUI `FocusState`; terminals
+    /// keep their AppKit first-responder bridge.
+    private func requestSurfaceKeyboardFocus(_ id: String) {
+        keyboardFocusGeneration &+= 1
+        keyboardFocusRequest = SurfaceKeyboardFocusRequest(
+            targetID: id,
+            generation: keyboardFocusGeneration
+        )
+        if sessions.contains(where: { $0.id == id }) {
+            TerminalKeyboardFocus.moveFirstResponder(toSessionID: id)
+        }
+    }
+
     func focusSurface(_ id: String) async {
         if sessions.contains(where: { $0.id == id }) {
             await focusTerminalSurface(id)
+            requestSurfaceKeyboardFocus(id)
         } else if chats.contains(where: { $0.id == id }) {
             selectChat(id)
         } else if meshes.contains(where: { $0.id == id }) {
             selectMesh(id)
         }
-        // The ring and the keyboard must agree in both directions. Moving the
-        // ring from a header click, the rail, or a menu command previously left
-        // AppKit's first responder wherever it was, so the app showed one pane
-        // as focused while typing — and VoiceOver — went to another.
-        TerminalKeyboardFocus.moveFirstResponder(toSessionID: id)
     }
 
     /// AppKit moved keyboard focus into a surface (a click into its terminal).
@@ -934,14 +947,10 @@ final class AppModel: ObservableObject {
     func cyclePaneFocus(forward: Bool) {
         guard let projectID = selectedProjectID,
               let layout = paneLayouts[projectID],
-              let target = PaneFocusCycle.terminalTarget(
+              let target = PaneFocusCycle.target(
                   after: focusedPaneID,
                   in: layout.sessionIDs,
-                  forward: forward,
-                  // Chat and Mesh panes have no FocusState hook yet, so the
-                  // ring must skip straight past them (out of scope: giving
-                  // them one).
-                  isTerminalSurface: { id in sessions.contains(where: { $0.id == id }) }
+                  forward: forward
               ) else { return }
         Task { await focusSurface(target) }
     }
@@ -3016,6 +3025,7 @@ final class AppModel: ObservableObject {
             selectedMeshID = nil
             focusedPaneID = chatID
             attentionCenter.clear(targetID: chatID)
+            requestSurfaceKeyboardFocus(chatID)
         }
     }
 
@@ -3155,6 +3165,7 @@ final class AppModel: ObservableObject {
             }
             selectedChatID = nil
             focusedPaneID = meshID
+            requestSurfaceKeyboardFocus(meshID)
         }
     }
 
@@ -3654,13 +3665,9 @@ final class AppModel: ObservableObject {
             self?.objectWillChange.send()
         }
         meshes = [mesh]
-        selectedMeshID = mesh.id
-        selectedChatID = nil
         selectedSessionID = nil
-        selectedProjectID = mesh.projectID
-        selectedProjectName = projects.first(where: { $0.id == mesh.projectID })?.name
         paneLayouts[mesh.projectID] = SessionPaneLayout(sessionID: mesh.id)
-        focusedPaneID = mesh.id
+        selectMesh(mesh.id)
     }
 
     func loadVisualMixedSessionFixture(workspace: URL) {
@@ -3687,9 +3694,7 @@ final class AppModel: ObservableObject {
         var layout = paneLayouts[project.id] ?? SessionPaneLayout()
         layout.add(chat.id)
         paneLayouts[project.id] = layout
-        selectedChatID = chat.id
-        selectedMeshID = nil
-        focusedPaneID = chat.id
+        selectChat(chat.id)
     }
 
     func reload() async {

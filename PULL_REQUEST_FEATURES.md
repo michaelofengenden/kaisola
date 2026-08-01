@@ -309,24 +309,24 @@ Acceptance:
 
 ## PR 13 — Native accessibility, design-system adoption, and readiness
 
-The immediate audit pass makes transient toasts VoiceOver-actionable and
-announced, adds Reduce Motion behavior to those toasts and onboarding, and
-improves terminal and permission labels. First run is now an operational
-readiness checklist backed by live project, terminal-control, provider-account,
-and update state; Help opens a user guide with shortcuts and troubleshooting.
-User-facing buttons and project/session copy have also completed the Title Case,
-project-terminology, and implementation-jargon pass. Complete the same
-accessibility floor app-wide. The command floor is now complete: palette rows
-carry truthful button/selection traits and disabled reasons, Mesh and Settings
-are discoverable, Command-W closes the active file tab or project window, and
-menu shortcuts and palette hints share the validated PR 2 keymap snapshot.
+The v1.1.8 accessibility pass makes transient toasts VoiceOver-actionable and
+announced, turns first run into a live operational-readiness checklist, and
+adds a user guide with shortcuts and troubleshooting. The final app-wide slice
+adds one contrast-tested status vocabulary, shape-distinct rail markers,
+workspace/Settings Reduce Motion boundaries, and real composer focus for Chat
+and Mesh. Deterministic mixed and Mesh fixtures fail unless the requested
+composer becomes AppKit's first responder.
 
-Scope:
+Completed scope:
 
 - Introduce shared labeled, colorblind-safe status indicators; semantic diff
   colors; app-wide Reduce Motion fallbacks; and truthful focus state.
 - Adopt the existing radius, motion, palette, hairline, and compact-type tokens
   across Chat, Git, Mesh, files, Settings, badges, and terminal chrome.
+- Give palette and project controls truthful button/selection semantics,
+  disabled reasons, and labels sourced from the same command/status models.
+
+Implementation status: complete.
 
 Acceptance:
 

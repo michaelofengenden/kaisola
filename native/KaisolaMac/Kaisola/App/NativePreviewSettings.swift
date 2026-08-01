@@ -792,6 +792,32 @@ enum KaisolaVisualSystem {
     static let layoutDuration = 0.22
 }
 
+/// One last-resort motion boundary for the two native view roots.
+///
+/// Individual surfaces can still choose a calmer replacement transition (the
+/// toast, onboarding, restoration notice, palette, and rail already do), but
+/// a new `withAnimation` must never become mandatory motion merely because its
+/// author forgot to repeat that check. Applying this policy at `RootShellView`
+/// and `SettingsView` strips animation from every descendant transaction while
+/// the system Reduce Motion preference is enabled.
+enum KaisolaMotionPolicy {
+    static func apply(reduceMotion: Bool, to transaction: inout Transaction) {
+        guard reduceMotion else { return }
+        transaction.animation = nil
+        transaction.disablesAnimations = true
+    }
+}
+
+private struct KaisolaReduceMotionFallbackModifier: ViewModifier {
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
+    func body(content: Content) -> some View {
+        content.transaction { transaction in
+            KaisolaMotionPolicy.apply(reduceMotion: reduceMotion, to: &transaction)
+        }
+    }
+}
+
 /// The neutral veil laid over AppKit vibrancy — or over the sampled desktop
 /// tint — for the two large backdrops.
 ///
@@ -1002,6 +1028,13 @@ private struct KaisolaControlSurfaceModifier: ViewModifier {
 }
 
 extension View {
+    /// Enforces Reduce Motion for a complete native presentation tree. Keep it
+    /// on every independently hosted root rather than relying on each child to
+    /// remember the preference.
+    func kaisolaReduceMotionFallback() -> some View {
+        modifier(KaisolaReduceMotionFallbackModifier())
+    }
+
     /// Adaptive Liquid Glass on macOS 26, with a semantic material fallback on
     /// macOS 14/15 and a solid surface when Reduce Transparency is enabled.
     func kaisolaControlSurface(

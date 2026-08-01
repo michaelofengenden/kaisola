@@ -341,7 +341,7 @@ struct FilePreviewView: View {
     private var externalChangeBanner: some View {
         HStack(spacing: 8) {
             Image(systemName: "arrow.triangle.2.circlepath")
-                .foregroundStyle(.orange)
+                .foregroundStyle(KaisolaStatusTone.needsYou.foregroundColor)
                 .accessibilityHidden(true)
             Text("Changed on disk while you were editing")
                 .font(.caption.weight(.medium))

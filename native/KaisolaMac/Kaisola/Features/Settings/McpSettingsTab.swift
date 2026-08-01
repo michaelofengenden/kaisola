@@ -193,7 +193,11 @@ private struct McpServerEditor: View {
                             }
                         }
                         .font(.caption)
-                        .foregroundStyle(result.status == .failed ? .red : .secondary)
+                        .foregroundStyle(
+                            result.status == .failed
+                                ? KaisolaStatusTone.failed.foregroundColor
+                                : Color.secondary
+                        )
                         .accessibilityElement(children: .combine)
                     }
                 }
@@ -402,12 +406,12 @@ private struct McpServerEditor: View {
             if let addError {
                 Text(addError)
                     .font(.caption)
-                    .foregroundStyle(.red)
+                    .foregroundStyle(KaisolaStatusTone.failed.foregroundColor)
             }
             if let duplicate = duplicateName {
                 Text("A server named \"\(duplicate)\" already exists in this project.")
                     .font(.caption)
-                    .foregroundStyle(.red)
+                    .foregroundStyle(KaisolaStatusTone.failed.foregroundColor)
             }
             if remainingCapacity == 0 {
                 Text("MCP server limit reached (\(McpConfigStore.maximumServerCount)). Remove a server before adding another.")

@@ -447,7 +447,8 @@ struct GitPanelView: View {
             // until a manual refresh).
             if let error = model.errorMessage {
                 Label(error, systemImage: "exclamationmark.triangle")
-                    .font(.caption).foregroundStyle(.red)
+                    .font(.caption)
+                    .foregroundStyle(KaisolaStatusTone.failed.foregroundColor)
                     .padding(.horizontal, 12).padding(.vertical, 8)
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .background(.red.opacity(0.08))
@@ -639,7 +640,7 @@ struct GitPanelView: View {
             if model.prPlanStale {
                 Label("Repository changed — Review again", systemImage: "exclamationmark.arrow.triangle.2.circlepath")
                     .font(.caption)
-                    .foregroundStyle(.orange)
+                    .foregroundStyle(KaisolaStatusTone.needsYou.foregroundColor)
                     .accessibilityIdentifier("git.pr.stale")
             }
 
@@ -769,7 +770,7 @@ struct GitPanelView: View {
                             Button("Discard") { restoreCandidate = path }
                                 .buttonStyle(.borderless)
                                 .font(.caption)
-                                .foregroundStyle(.red)
+                                .foregroundStyle(KaisolaStatusTone.failed.foregroundColor)
                                 .disabled(model.isBusy)
                         }
                         Button(action) { perform(path) }

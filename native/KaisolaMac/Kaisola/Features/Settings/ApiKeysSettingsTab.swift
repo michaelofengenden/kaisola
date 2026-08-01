@@ -64,7 +64,7 @@ struct ApiKeysSettingsTab: View {
                         if let issue = ProviderRouting.baseURLIssue(baseURLBinding.wrappedValue) {
                             Label(issue, systemImage: "exclamationmark.triangle.fill")
                                 .font(.caption)
-                                .foregroundStyle(.red)
+                                .foregroundStyle(KaisolaStatusTone.failed.foregroundColor)
                         }
                     }
                 }
@@ -82,7 +82,7 @@ struct ApiKeysSettingsTab: View {
                         if let issue = ProviderRouting.modelIssue(modelBinding.wrappedValue) {
                             Label(issue, systemImage: "exclamationmark.triangle.fill")
                                 .font(.caption)
-                                .foregroundStyle(.red)
+                                .foregroundStyle(KaisolaStatusTone.failed.foregroundColor)
                         }
                     }
                 }
@@ -373,7 +373,11 @@ private struct ApiKeyRow: View {
             }
             HStack(spacing: 4) {
                 Image(systemName: isSet ? "checkmark.circle.fill" : "circle.dashed")
-                    .foregroundStyle(isSet ? Color.green : Color.secondary)
+                    .foregroundStyle(
+                        isSet
+                            ? KaisolaStatusTone.done.foregroundColor
+                            : Color.secondary
+                    )
                 Text(isSet ? "\(key.rawValue) is set" : "\(key.rawValue) is not set")
                     .foregroundStyle(.secondary)
             }
@@ -381,12 +385,12 @@ private struct ApiKeyRow: View {
             if let errorText {
                 Text(errorText)
                     .font(.caption)
-                    .foregroundStyle(.red)
+                    .foregroundStyle(KaisolaStatusTone.failed.foregroundColor)
             }
             if let warning = visibleFormatWarning {
                 Label(warning, systemImage: "exclamationmark.triangle")
                     .font(.caption)
-                    .foregroundStyle(.orange)
+                    .foregroundStyle(KaisolaStatusTone.needsYou.foregroundColor)
             }
             if let probeResult {
                 Label(probeResult.message, systemImage: probeSymbol(probeResult.status))

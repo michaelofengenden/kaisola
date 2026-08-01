@@ -80,6 +80,11 @@ Large product and architecture work remains ordered in
   now share one typed command registry. Palette hints and AppKit shortcuts use
   the same validated keymap snapshot; conflicts preserve every default and stay
   actionable from the Keyboard Settings tab.
+- Attention, working, completion, and failure indicators now use distinct
+  shapes plus contrast-tested filled colors instead of raw orange/green text or
+  color-only dots. The workspace and Settings roots enforce Reduce Motion for
+  every descendant animation, while Chat and Mesh participate in keyboard pane
+  cycling through real composer focus targets.
 
 ## Open audit fixes
 
@@ -94,11 +99,6 @@ Large product and architecture work remains ordered in
   continuous in the installed app; row-quantized SwiftTerm scrolling is not
   considered fixed by the repaint/geometry work alone.
 
-### Accessibility, copy, and readiness
-
-- Replace remaining low-contrast attention badges; honor Reduce Motion outside
-  the covered toast, onboarding, restoration, palette, and rail paths; and
-  expose truthful keyboard focus and button traits throughout the AX tree.
 ## Adding a fix
 
 Each confirmed fix should include:

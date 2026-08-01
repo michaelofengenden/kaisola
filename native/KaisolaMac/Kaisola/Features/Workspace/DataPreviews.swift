@@ -551,7 +551,7 @@ struct JsonPreview: View {
         VStack(alignment: .leading, spacing: 0) {
             Label("Invalid JSON — \(message)", systemImage: "exclamationmark.triangle.fill")
                 .font(.caption)
-                .foregroundStyle(.orange)
+                .foregroundStyle(KaisolaStatusTone.needsYou.foregroundColor)
                 .padding(.horizontal, 12)
                 .padding(.vertical, 8)
                 .frame(maxWidth: .infinity, alignment: .leading)

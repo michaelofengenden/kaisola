@@ -333,7 +333,7 @@ struct OnboardingView: View {
         switch kind {
         case .ready:
             Image(systemName: "checkmark.circle.fill")
-                .foregroundStyle(.green)
+                .foregroundStyle(KaisolaStatusTone.done.foregroundColor)
                 .accessibilityLabel("Ready")
         case .checking:
             ProgressView()
@@ -342,7 +342,7 @@ struct OnboardingView: View {
                 .accessibilityLabel("Checking")
         case .needsAction:
             Image(systemName: "exclamationmark.triangle.fill")
-                .foregroundStyle(.orange)
+                .foregroundStyle(KaisolaStatusTone.needsYou.foregroundColor)
                 .accessibilityLabel("Needs action")
         case .information:
             Image(systemName: "info.circle.fill")

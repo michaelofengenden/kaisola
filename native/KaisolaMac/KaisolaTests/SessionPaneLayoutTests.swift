@@ -234,36 +234,37 @@ final class SessionPaneLayoutTests: XCTestCase {
         XCTAssertEqual(PaneFocusCycle.target(after: "b", in: layout.sessionIDs, forward: true), "c")
     }
 
-    /// Chat and Mesh panes have no `FocusState` hook yet, so the ring must
-    /// skip straight past them in either direction rather than landing
-    /// somewhere the keyboard cannot follow.
-    func testPaneFocusCycleSkipsNonTerminalSurfaces() {
+    /// Every unified pane now has a concrete keyboard target: terminals use
+    /// AppKit first responder and Chat/Mesh use their composer FocusState.
+    func testPaneFocusCycleIncludesChatAndMeshSurfaces() {
         let ids = ["terminal:a", "chat:b", "mesh:c", "terminal:d"]
-        let isTerminal: (String) -> Bool = { $0.hasPrefix("terminal:") }
 
         XCTAssertEqual(
-            PaneFocusCycle.terminalTarget(after: "terminal:a", in: ids, forward: true, isTerminalSurface: isTerminal),
+            PaneFocusCycle.target(after: "terminal:a", in: ids, forward: true),
+            "chat:b"
+        )
+        XCTAssertEqual(
+            PaneFocusCycle.target(after: "chat:b", in: ids, forward: true),
+            "mesh:c"
+        )
+        XCTAssertEqual(
+            PaneFocusCycle.target(after: "terminal:a", in: ids, forward: false),
             "terminal:d"
         )
         XCTAssertEqual(
-            PaneFocusCycle.terminalTarget(after: "terminal:d", in: ids, forward: true, isTerminalSurface: isTerminal),
+            PaneFocusCycle.target(after: nil, in: ids, forward: true),
             "terminal:a"
         )
         XCTAssertEqual(
-            PaneFocusCycle.terminalTarget(after: "terminal:a", in: ids, forward: false, isTerminalSurface: isTerminal),
-            "terminal:d"
+            PaneFocusCycle.target(after: nil, in: ["chat:b", "mesh:c"], forward: true),
+            "chat:b"
         )
-        // Nothing focused yet: start from the end the direction implies,
-        // among terminal surfaces only.
-        XCTAssertEqual(
-            PaneFocusCycle.terminalTarget(after: nil, in: ids, forward: true, isTerminalSurface: isTerminal),
-            "terminal:a"
-        )
-        // A layout with no terminal at all has nowhere to cycle to.
-        XCTAssertNil(
-            PaneFocusCycle.terminalTarget(
-                after: nil, in: ["chat:b", "mesh:c"], forward: true, isTerminalSurface: isTerminal
-            )
-        )
+    }
+
+    func testRepeatedKeyboardFocusRequestsRemainObservable() {
+        let first = SurfaceKeyboardFocusRequest(targetID: "chat:b", generation: 1)
+        let repeated = SurfaceKeyboardFocusRequest(targetID: "chat:b", generation: 2)
+        XCTAssertNotEqual(first, repeated)
+        XCTAssertEqual(repeated.targetID, first.targetID)
     }
 }

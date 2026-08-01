@@ -164,7 +164,11 @@ struct TerminalTranscriptView: View {
                     TerminalHistoryStoragePolicy.usageLabel(diskBytes: context.diskBytes),
                     systemImage: historyStorageExceeded ? "externaldrive.badge.exclamationmark" : "externaldrive"
                 )
-                .foregroundStyle(historyStorageExceeded ? Color.orange : Color.secondary)
+                .foregroundStyle(
+                    historyStorageExceeded
+                        ? KaisolaStatusTone.needsYou.foregroundColor
+                        : Color.secondary
+                )
                 .help(TerminalHistoryStoragePolicy.help(
                     diskBytes: context.diskBytes,
                     warningMiB: settings.terminalHistoryWarningMiB

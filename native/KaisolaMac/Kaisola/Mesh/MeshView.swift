@@ -15,10 +15,20 @@ struct MeshView: View {
     @State private var diffText = ""
     @State private var integrateColumnID: String?
     @State private var integrationStatus: String?
+    @FocusState private var composerFocused: Bool
+    private let focusRequestGeneration: UInt64?
+    private let onKeyboardFocus: (() -> Void)?
 
-    init(mesh: MeshSession, presentation: Presentation = .standard) {
+    init(
+        mesh: MeshSession,
+        presentation: Presentation = .standard,
+        focusRequestGeneration: UInt64? = nil,
+        onKeyboardFocus: (() -> Void)? = nil
+    ) {
         _mesh = ObservedObject(wrappedValue: mesh)
         self.presentation = presentation
+        self.focusRequestGeneration = focusRequestGeneration
+        self.onKeyboardFocus = onKeyboardFocus
     }
 
     var body: some View {
@@ -30,7 +40,11 @@ struct MeshView: View {
             if let status = integrationStatus {
                 Text(status)
                     .font(.caption)
-                    .foregroundStyle(isConflictStatus(status) ? .orange : .secondary)
+                    .foregroundStyle(
+                        isConflictStatus(status)
+                            ? KaisolaStatusTone.needsYou.foregroundColor
+                            : Color.secondary
+                    )
                     .textSelection(.enabled)
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .padding(.horizontal, 16)
@@ -101,6 +115,10 @@ struct MeshView: View {
             .frame(width: 640, height: 480)
             .task { diffText = await mesh.diff(for: sheet.id) }
         }
+        .onAppear { applyFocusRequest(focusRequestGeneration) }
+        .onChange(of: focusRequestGeneration) { _, request in
+            applyFocusRequest(request)
+        }
     }
 
     private struct DiffSheetID: Identifiable {
@@ -124,7 +142,8 @@ struct MeshView: View {
             }
             if let note = mesh.isolationNote {
                 Label(note, systemImage: "exclamationmark.triangle")
-                    .font(.caption).foregroundStyle(.orange)
+                    .font(.caption)
+                    .foregroundStyle(KaisolaStatusTone.needsYou.foregroundColor)
             }
             Spacer()
             MeshStagedPromptQueueButton(mesh: mesh)
@@ -155,6 +174,10 @@ struct MeshView: View {
                 .lineLimit(1...6)
                 .padding(8)
                 .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+                .focused($composerFocused)
+                .onChange(of: composerFocused) { _, focused in
+                    if focused { onKeyboardFocus?() }
+                }
                 .onSubmit(send)
             Button(action: send) {
                 Image(systemName: "arrow.up.circle.fill")
@@ -165,6 +188,13 @@ struct MeshView: View {
         }
         .padding(10)
         .background(.ultraThinMaterial)
+    }
+
+    private func applyFocusRequest(_ generation: UInt64?) {
+        guard generation != nil else { return }
+        DispatchQueue.main.async {
+            composerFocused = true
+        }
     }
 
     private func send() {

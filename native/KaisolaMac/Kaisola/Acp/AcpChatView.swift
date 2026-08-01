@@ -25,10 +25,20 @@ struct AcpChatView: View {
     @State private var transcriptIsAtBottom = true
     @State private var hasUnseenTranscriptUpdates = false
     @State private var transcriptConversationID: ObjectIdentifier?
+    @FocusState private var composerFocused: Bool
+    private let focusRequestGeneration: UInt64?
+    private let onKeyboardFocus: (() -> Void)?
 
-    init(conversation: AcpConversation, presentation: Presentation = .standard) {
+    init(
+        conversation: AcpConversation,
+        presentation: Presentation = .standard,
+        focusRequestGeneration: UInt64? = nil,
+        onKeyboardFocus: (() -> Void)? = nil
+    ) {
         _conversation = ObservedObject(wrappedValue: conversation)
         self.presentation = presentation
+        self.focusRequestGeneration = focusRequestGeneration
+        self.onKeyboardFocus = onKeyboardFocus
     }
 
     var body: some View {
@@ -61,6 +71,10 @@ struct AcpChatView: View {
         }
         .onChange(of: draft) { _, newValue in
             conversation.saveDraft(newValue)
+        }
+        .onAppear { applyFocusRequest(focusRequestGeneration) }
+        .onChange(of: focusRequestGeneration) { _, request in
+            applyFocusRequest(request)
         }
     }
 
@@ -392,6 +406,10 @@ struct AcpChatView: View {
                     .lineLimit(1...6)
                     .padding(8)
                     .background(.quaternary, in: RoundedRectangle(cornerRadius: 8))
+                    .focused($composerFocused)
+                    .onChange(of: composerFocused) { _, focused in
+                        if focused { onKeyboardFocus?() }
+                    }
                     .onSubmit(sendDraft)
                 if conversation.isRunning {
                     Button(action: conversation.cancel) {
@@ -422,6 +440,13 @@ struct AcpChatView: View {
         }
         .onDrop(of: [.fileURL], isTargeted: $isDropTargeted, perform: handleDrop)
         .onPasteCommand(of: [.png, .tiff], perform: handlePaste)
+    }
+
+    private func applyFocusRequest(_ generation: UInt64?) {
+        guard generation != nil else { return }
+        DispatchQueue.main.async {
+            composerFocused = true
+        }
     }
 
     /// Send is enabled when there's something to deliver. While a turn runs the
@@ -538,7 +563,7 @@ struct AcpChatView: View {
                         Image(systemName: "bolt.fill").font(.caption2)
                     }
                     .buttonStyle(.borderless)
-                    .foregroundStyle(.orange)
+                    .foregroundStyle(KaisolaStatusTone.needsYou.foregroundColor)
                     .help("Steer: interrupt the current turn and send this now")
                     Button {
                         conversation.removeQueued(message.id)
@@ -820,7 +845,11 @@ struct TerminalContentView: View {
                 Text(exitText ?? "Running…").font(.caption2)
                 Spacer()
             }
-            .foregroundStyle(exitText == nil ? Color.orange : .secondary)
+            .foregroundStyle(
+                exitText == nil
+                    ? KaisolaStatusTone.working.foregroundColor
+                    : Color.secondary
+            )
             .padding(.horizontal, 8).padding(.vertical, 5)
             .background(.quaternary.opacity(0.6))
             ScrollView {
@@ -1030,7 +1059,11 @@ struct PlanCard: View {
             ForEach(entries) { entry in
                 HStack(spacing: 7) {
                     Image(systemName: entry.status == "completed" ? "checkmark.square" : "square")
-                        .foregroundStyle(entry.status == "completed" ? .green : .secondary)
+                        .foregroundStyle(
+                            entry.status == "completed"
+                                ? KaisolaStatusTone.done.foregroundColor
+                                : Color.secondary
+                        )
                     Text(entry.content).strikethrough(entry.status == "completed")
                     Spacer()
                 }
@@ -1066,11 +1099,17 @@ struct AcpPermissionBar: View {
     var body: some View {
         HStack(spacing: 10) {
             Image(systemName: allowsRule ? "hand.raised.fill" : "exclamationmark.shield.fill")
-                .foregroundStyle(allowsRule ? .orange : .red)
+                .foregroundStyle(
+                    allowsRule
+                        ? KaisolaStatusTone.needsYou.foregroundColor
+                        : KaisolaStatusTone.failed.foregroundColor
+                )
             VStack(alignment: .leading, spacing: 2) {
                 Text(request.title).font(.callout).lineLimit(2)
                 if !allowsRule {
-                    Text("Sensitive file — always asks").font(.caption2).foregroundStyle(.red)
+                    Text("Sensitive file — always asks")
+                        .font(.caption2)
+                        .foregroundStyle(KaisolaStatusTone.failed.foregroundColor)
                 } else {
                     Text("Always Allow scope: \(derivedRuleLabel)")
                         .font(.caption2)

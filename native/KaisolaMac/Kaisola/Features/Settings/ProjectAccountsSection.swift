@@ -103,7 +103,7 @@ struct ProjectAccountsSection: View {
             if let accountError {
                 Text(accountError)
                     .font(.caption)
-                    .foregroundStyle(.red)
+                    .foregroundStyle(KaisolaStatusTone.failed.foregroundColor)
             }
             HStack {
                 Text("Only the label and directory are stored. Tokens remain in the provider's own credential files.")

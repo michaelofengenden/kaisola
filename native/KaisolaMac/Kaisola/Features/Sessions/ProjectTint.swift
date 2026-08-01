@@ -27,8 +27,10 @@ enum ProjectTint {
     }
 }
 
-/// Restrained semantic accents for workspace activity. Blue remains available
-/// as a project tint, but it no longer represents every selected/running state.
+/// Restrained semantic accents for workspace activity: a surface's kind is
+/// carried by its own hue rather than by one accent colour standing in for
+/// every selected-or-running state. Blue is spoken for elsewhere — it is the
+/// working dot in the rail — so nothing here reaches for it.
 enum WorkspacePalette {
     static let project = Color(red: 0.50, green: 0.42, blue: 0.60)
     static let terminal = Color(red: 0.25, green: 0.52, blue: 0.48)

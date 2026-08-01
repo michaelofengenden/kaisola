@@ -839,18 +839,32 @@ struct GlassBackdropWash: Equatable, Sendable {
         )
     }
 
-    /// The sidebar's veil is the *thinnest* surface in the app on purpose: it
-    /// is the one large area whose whole job is to read as the desktop seen
-    /// through glass. The retuned v1.1 values (light 0.42/0.32/0.26, dark
-    /// 0.38/0.44/0.52) covered the vibrancy layer so completely that a
-    /// saturated desktop reached the eye with no measurable chroma at all —
-    /// the column rendered as flat #EDEDED over a blue desktop. These halve
-    /// that coverage; the sidebar chrome panel above them no longer adds a
-    /// second opaque material, so the two changes compound.
+    /// The sidebar is frost, not a window.
+    ///
+    /// Three eras, and both of the first two overshot. The v1.1 values (light
+    /// 0.42/0.32/0.26) sat over *vibrancy*, which is itself near-opaque, so the
+    /// column rendered flat #EDEDED and no desktop colour survived. Halving
+    /// them to 0.16 fixed that against vibrancy — but by then the layer
+    /// underneath had become the painted wallpaper still, which passes 100% of
+    /// the desktop instead of vibrancy's sliver. A 0.16 veil over a raw
+    /// wallpaper is not glass; it is a blurred photograph with a haze on it,
+    /// and that is exactly how it read: measured off the shipped build, the
+    /// sidebar's average channel spread was 0.32 and its peak 0.53 — *more*
+    /// saturated than the desktop beside the window, because the bake was also
+    /// boosting saturation 1.3×.
+    ///
+    /// The reference is the Safari sidebar: a heavy near-white (light) or
+    /// near-black (dark) surface that the wallpaper *tints* rather than fills.
+    /// At 0.60 coverage the still contributes 40% — enough that the desktop's
+    /// hue is unmistakably present (modelled composite spread 0.11, against
+    /// 0.32 before) and its luminance structure is not (modelled top-to-bottom
+    /// luminance range 0.019, against 0.218 before). The wallpaper bake now
+    /// luminance-normalizes too, so that 40% arrives at a predictable
+    /// brightness whatever the desktop is — see `DesktopBackdropRenderer`.
     static func sidebar(isDark: Bool) -> GlassBackdropWash {
         isDark
-            ? dark(top: 0.20, base: 0.26, bottom: 0.34)
-            : light(top: 0.24, base: 0.16, bottom: 0.12)
+            ? dark(top: 0.55, base: 0.60, bottom: 0.66)
+            : light(top: 0.66, base: 0.60, bottom: 0.56)
     }
 
     /// How much of the composited backdrop is still the desktop's own colour
@@ -864,60 +878,55 @@ struct GlassBackdropWash: Equatable, Sendable {
     /// near-black in dark mode.
     static func workspace(isDark: Bool) -> GlassBackdropWash {
         isDark
-            ? dark(top: 0.26, base: 0.32, bottom: 0.40)
-            : light(top: 0.18, base: 0.11, bottom: 0.08)
+            ? dark(top: 0.60, base: 0.65, bottom: 0.71)
+            : light(top: 0.61, base: 0.55, bottom: 0.51)
     }
 
-    /// Increased Contrast lays a flat neutral overlay on top of the veil so
-    /// low-vision users get a more opaque, more legible backdrop. Before the
-    /// halving above, that overlay was a single constant (0.18) sized for the
-    /// *pre-halving* base coverage — sidebar light 0.32 / dark 0.44,
-    /// workspace light 0.26 / dark 0.50. Halving the veil's own coverage
-    /// without re-deriving this compensation left Increased Contrast mode
-    /// proportionally *less* opaque than it was before the retune: exactly
-    /// backwards for an accessibility setting.
+    /// How much of a glass surface Increased Contrast must cover, counting the
+    /// veil and the overlay together.
     ///
-    /// Two translucent layers stacked with standard "over" compositing
-    /// combine to a total coverage of `base + overlay * (1 - base)` — the
-    /// overlay only paints the sliver of the surface the base veil left
-    /// uncovered. Solving that for `overlay` so today's thinner `newBase`
-    /// still reaches the coverage the old `oldBase` used to reach once the
-    /// old flat overlay was stacked on top of it:
+    /// This used to be expressed as a *restoration*: reproduce whatever
+    /// coverage the pre-halving veil reached once a flat 0.18 overlay was
+    /// stacked on it. That reference is now moot. The frost retune raised every
+    /// base past the composite those old numbers produced (the highest was
+    /// workspace dark at 0.59, below today's 0.65 base alone), so the
+    /// restoration formula solved to a negative overlay on all four surfaces
+    /// and collapsed onto its own 0.18 floor — an accessibility setting whose
+    /// arithmetic had quietly stopped doing anything.
     ///
-    ///     oldComposite = oldBase + priorOverlay * (1 - oldBase)
-    ///     overlay      = (oldComposite - newBase) / (1 - newBase)
+    /// Stating it as an absolute floor is both simpler and the thing that
+    /// actually matters to a low-vision user: with Increased Contrast on, at
+    /// most 20% of what reaches the eye is wallpaper. That is a property of the
+    /// rendered surface, not of any previous release, so it cannot rot the next
+    /// time the veil moves.
+    static let increasedContrastCoverage = 0.80
+
+    /// Two translucent layers stacked with standard "over" compositing cover
+    /// `base + overlay * (1 - base)` in total — the overlay only paints the
+    /// sliver the veil left uncovered. Solving for the overlay that lifts a
+    /// given base to `increasedContrastCoverage`:
     ///
-    /// gives the exact per-surface replacement for the flat constant.
-    /// `newBase` is read live from `sidebar(isDark:)` / `workspace(isDark:)`
-    /// rather than duplicated as a literal, so a future veil retune that
-    /// thins the base further automatically raises this compensation instead
-    /// of silently falling behind again. Clamped to `[priorOverlay, 0.6]` so
-    /// the result can only be *more* protective than the historical flat
-    /// value, never less, and never runs away toward an opaque panel.
-    private static func increasedContrastOverlay(
-        oldBase: Double,
-        newBase: Double,
-        priorOverlay: Double = 0.18
-    ) -> Double {
-        let oldComposite = oldBase + priorOverlay * (1 - oldBase)
-        let required = (oldComposite - newBase) / (1 - newBase)
-        return min(0.6, max(priorOverlay, required))
+    ///     overlay = (coverage - base) / (1 - base)
+    ///
+    /// `base` is read live from `sidebar(isDark:)` / `workspace(isDark:)` so a
+    /// future veil retune re-derives this instead of falling behind. Clamped to
+    /// `[0, 0.6]`: a base that already meets the floor needs no overlay, and no
+    /// surface is ever painted into an opaque panel. The ceiling binds only if
+    /// some future base drops below 0.5; at today's 0.55–0.65 the exact
+    /// solution is 0.43–0.56 and the floor is met precisely.
+    private static func increasedContrastOverlay(base: Double) -> Double {
+        guard base < 1 else { return 0 }
+        return min(0.6, max(0, (increasedContrastCoverage - base) / (1 - base)))
     }
 
-    /// Increased Contrast overlay opacity for the sidebar veil, scaled to
-    /// restore the pre-halving (0.32 light / 0.44 dark) composite coverage
-    /// over whatever the current base opacity is.
+    /// Increased Contrast overlay opacity for the sidebar veil.
     static func sidebarIncreasedContrastOverlay(isDark: Bool) -> Double {
-        let oldBase = isDark ? 0.44 : 0.32
-        return increasedContrastOverlay(oldBase: oldBase, newBase: sidebar(isDark: isDark).baseOpacity)
+        increasedContrastOverlay(base: sidebar(isDark: isDark).baseOpacity)
     }
 
-    /// Increased Contrast overlay opacity for the workspace veil, scaled to
-    /// restore the pre-halving (0.26 light / 0.50 dark) composite coverage
-    /// over whatever the current base opacity is.
+    /// Increased Contrast overlay opacity for the workspace veil.
     static func workspaceIncreasedContrastOverlay(isDark: Bool) -> Double {
-        let oldBase = isDark ? 0.50 : 0.26
-        return increasedContrastOverlay(oldBase: oldBase, newBase: workspace(isDark: isDark).baseOpacity)
+        increasedContrastOverlay(base: workspace(isDark: isDark).baseOpacity)
     }
 }
 
@@ -1214,8 +1223,12 @@ enum DesktopWallpaperLocator {
             ) as? [String: Any] else { return nil }
             return inner["assetID"] as? String
         case let dictionary as [String: Any]:
-            for value in dictionary.values {
-                if let found = nestedAssetID(value) { return found }
+            // Sorted, not `.values`: dictionary iteration order is seeded per
+            // process, so a plist holding two asset IDs would pick a different
+            // one on some launches — and the asset ID is part of the backdrop
+            // cache key, so that is a wallpaper that changes when you restart.
+            for key in dictionary.keys.sorted() {
+                if let value = dictionary[key], let found = nestedAssetID(value) { return found }
             }
             return nil
         case let array as [Any]:
@@ -1332,10 +1345,55 @@ enum DesktopBackdropRenderer {
     static let stillWidth = 176
     /// Radius in `stillWidth` pixels. Enough that no wallpaper detail survives
     /// as a recognisable shape — this has to read as light, not as a picture.
-    static let blurRadius: Double = 12
-    /// A Gaussian average of a whole wallpaper is always less colourful than
-    /// the wallpaper. Lift it back so the desktop's hue survives the veil.
-    static let saturation: Double = 1.3
+    ///
+    /// Raised from 12 with the frost retune. At 12 the still is soft but not
+    /// shapeless: on a 176×110 thumbnail the wallpaper's large features still
+    /// resolve as a bloom the eye reads as *a place in a photograph*. Composing
+    /// two Gaussians adds their variances, so going to 28 lays another
+    /// `sqrt(28² − 12²) ≈ 25` still-pixels of blur over the old result — a
+    /// quarter of the thumbnail's height, which leaves a left-to-right colour
+    /// story and no locatable shape. The cost is unchanged in practice: this is
+    /// 176px once per wallpaper, not the backing store per frame.
+    static let blurRadius: Double = 28
+    /// No saturation boost.
+    ///
+    /// This was 1.3, from the era when a heavy veil ate most of the desktop's
+    /// chroma and the bake had to shout to be heard through it. Under a 0.60
+    /// veil it inverted: the sidebar measured a 0.53 peak channel spread
+    /// against the raw desktop's 0.33 — Kaisola's "glass" was more saturated
+    /// than the wallpaper it was imitating, which is precisely what made it
+    /// read as a photograph. 1.0 is the wallpaper's own colour, and the veil
+    /// alone decides how much of it arrives.
+    static let saturation: Double = 1.0
+
+    /// Mean luminance the baked still is moved to, per appearance.
+    ///
+    /// `NSVisualEffectView` normalized luminance for us; a raw wallpaper does
+    /// not, so before this the legibility of every label in the app was a
+    /// function of the user's desktop picture — a white wallpaper in dark mode
+    /// put tertiary text on a pale surface. Normalizing here makes the veil's
+    /// coverage arithmetic land on known ground for *any* desktop: the still
+    /// always arrives at these luminances, so the composite always lands near
+    /// 0.60·1.0 + 0.40·0.72 ≈ 0.89 in light and 0.60·0.05 + 0.40·0.16 ≈ 0.09 in
+    /// dark. The wallpaper still supplies hue and its large-scale gradient; it
+    /// no longer supplies brightness.
+    static func targetLuminance(isDark: Bool) -> Double { isDark ? 0.16 : 0.72 }
+
+    /// The additive shift that moves a still of mean luminance `mean` onto
+    /// `targetLuminance`.
+    ///
+    /// Additive rather than multiplicative on purpose. `CIColorControls`'
+    /// brightness is a straight per-channel offset, so it moves mean luminance
+    /// by exactly this amount while leaving every channel *difference* — the
+    /// hue and the chroma spread the frost exists to show — untouched. An
+    /// exposure/gain step would scale chroma along with brightness and make a
+    /// dark wallpaper's tint vanish in light mode. Clamped only to keep a
+    /// degenerate decode (a fully black or blown-out still) from inverting into
+    /// a shift larger than the range it is correcting; inside the clamp the
+    /// normalization is exact.
+    static func luminanceShift(mean: Double, isDark: Bool) -> Double {
+        min(0.9, max(-0.9, targetLuminance(isDark: isDark) - mean))
+    }
 
     /// Dynamic desktops pack every hour of the day into one HEIC with nothing
     /// in the container labelling the frames; the day frames lead and the night
@@ -1359,15 +1417,24 @@ enum DesktopBackdropRenderer {
             options as CFDictionary
         ) else { return nil }
 
-        let tint = DesktopTintSampler.sample(image: still)
-        guard let blurred = blur(still) else { return .flat(tint) }
+        // One 16×16 box draw serves both products. The mean is taken from the
+        // *unblurred* thumbnail, which costs nothing and is the same number: a
+        // Gaussian with `clampedToExtent` edges preserves the image mean, so
+        // blurring first would only move the measurement later.
+        let pixels = DesktopTintSampler.pixels(image: still)
+        let tint = pixels.flatMap { DesktopTintSampler.cooledAverage(rgba: $0) }
+            ?? DesktopTintSampler.fallback
+        let mean = pixels.flatMap { DesktopTintSampler.meanLuminance(rgba: $0) }
+            ?? targetLuminance(isDark: key.isDark)
+        let brightness = luminanceShift(mean: mean, isDark: key.isDark)
+        guard let blurred = blur(still, brightness: brightness) else { return .flat(tint) }
         return .wallpaper(blurred, tint: tint)
     }
 
     /// `clampedToExtent` before the blur, cropped back after: without it the
     /// Gaussian averages in transparent black at every edge and the backdrop
     /// arrives with a dark vignette exactly where the window's corners are.
-    private static func blur(_ image: CGImage) -> CGImage? {
+    private static func blur(_ image: CGImage, brightness: Double) -> CGImage? {
         let input = CIImage(cgImage: image)
         let extent = input.extent
 
@@ -1376,9 +1443,12 @@ enum DesktopBackdropRenderer {
         gaussian.radius = Float(blurRadius)
         guard let softened = gaussian.outputImage else { return nil }
 
+        // Both corrections ride the one `CIColorControls` pass already in the
+        // chain, so luminance normalization costs no extra filter.
         let controls = CIFilter.colorControls()
         controls.inputImage = softened
         controls.saturation = Float(saturation)
+        controls.brightness = Float(brightness)
         guard let output = controls.outputImage else { return nil }
 
         return CIContext(options: [.useSoftwareRenderer: false])
@@ -1415,16 +1485,15 @@ enum DesktopTintSampler {
     private static let floors = (red: 0.07, green: 0.07, blue: 0.09)
     private static let ceilings = (red: 0.90, green: 0.91, blue: 0.92)
 
-    static func sample(url: URL?) -> DesktopTintComponents {
-        guard let url,
-              let source = CGImageSourceCreateWithURL(url as CFURL, nil),
-              let image = CGImageSourceCreateImageAtIndex(source, 0, nil) else {
-            return fallback
-        }
-        return sample(image: image)
+    static func sample(image: CGImage) -> DesktopTintComponents {
+        guard let pixels = pixels(image: image) else { return fallback }
+        return cooledAverage(rgba: pixels) ?? fallback
     }
 
-    static func sample(image: CGImage) -> DesktopTintComponents {
+    /// The 16×16 box reduction both the tint and the bake's luminance
+    /// normalization read, exposed so one decode produces both instead of
+    /// drawing the same image twice.
+    static func pixels(image: CGImage) -> [UInt8]? {
         let side = 16
         var pixels = [UInt8](repeating: 0, count: side * side * 4)
         let drew = pixels.withUnsafeMutableBytes { bytes -> Bool in
@@ -1441,15 +1510,18 @@ enum DesktopTintSampler {
             context.draw(image, in: CGRect(x: 0, y: 0, width: side, height: side))
             return true
         }
-        guard drew else { return fallback }
-        return cooledAverage(rgba: pixels) ?? fallback
+        return drew ? pixels : nil
     }
 
-    /// The wallpaper's average, with its chroma pulled toward luminance and
-    /// then nudged toward a cool slate — enough to stay recognisably the
-    /// desktop's colour, not enough to turn a blue desktop into blue-on-blue
-    /// application chrome.
-    static func cooledAverage(rgba: [UInt8]) -> DesktopTintComponents? {
+    /// Rec. 709 luma of the wallpaper's plain average — no cooling, no floors.
+    /// This is what the bake normalizes against, so it has to describe the
+    /// picture rather than the tint derived from it.
+    static func meanLuminance(rgba: [UInt8]) -> Double? {
+        guard let average = plainAverage(rgba: rgba) else { return nil }
+        return average.0 * 0.2126 + average.1 * 0.7152 + average.2 * 0.0722
+    }
+
+    private static func plainAverage(rgba: [UInt8]) -> (Double, Double, Double)? {
         guard rgba.count >= 4 else { return nil }
         var red = 0.0
         var green = 0.0
@@ -1467,7 +1539,15 @@ enum DesktopTintSampler {
             index += 4
         }
         guard count > 0 else { return nil }
-        let wallpaper = (red / count, green / count, blue / count)
+        return (red / count, green / count, blue / count)
+    }
+
+    /// The wallpaper's average, with its chroma pulled toward luminance and
+    /// then nudged toward a cool slate — enough to stay recognisably the
+    /// desktop's colour, not enough to turn a blue desktop into blue-on-blue
+    /// application chrome.
+    static func cooledAverage(rgba: [UInt8]) -> DesktopTintComponents? {
+        guard let wallpaper = plainAverage(rgba: rgba) else { return nil }
         let luminance = wallpaper.0 * 0.2126 + wallpaper.1 * 0.7152 + wallpaper.2 * 0.0722
         let softened = (
             luminance + (wallpaper.0 - luminance) * chromaRetention,
@@ -1480,6 +1560,18 @@ enum DesktopTintSampler {
             blue: min(ceilings.blue, max(floors.blue, softened.2 * (1 - slateMix) + slate.blue * slateMix))
         )
     }
+}
+
+/// What a "the desktop may have changed" hint should do about it.
+enum DesktopResolveDecision: Equatable {
+    /// The rate-limit floor has expired; read the desktop now.
+    case resolveNow
+    /// Inside the floor with nothing armed yet: arm one resolve for when the
+    /// floor expires, in `after` seconds.
+    case deferBy(TimeInterval)
+    /// Inside the floor and a deferred resolve is already armed. Doing nothing
+    /// is correct — the armed resolve will pick up whatever this hint saw.
+    case alreadyScheduled
 }
 
 /// Owns the one rendered desktop backdrop the whole app shares.
@@ -1504,6 +1596,14 @@ final class DesktopBackdropProvider: ObservableObject {
     private var cache: [DesktopBackdropKey: DesktopPainting] = [:]
     private var cacheOrder: [DesktopBackdropKey] = []
     private var work: Task<Void, Never>?
+    private var deferredResolve: Task<Void, Never>?
+    /// Bumped on every resolve so a detached stage that finishes after a newer
+    /// resolve started cannot publish its stale painting. `Task.cancel()` is not
+    /// enough on its own: `Task.detached` deliberately does not inherit
+    /// cancellation, so the decode and the bake always run to completion once
+    /// started and the only safe thing to do with a superseded result is to
+    /// drop it here.
+    private var generation = 0
     private var lastResolved = Date.distantPast
     private var lastAppearanceIsDark: Bool?
     private var observers: [any NSObjectProtocol] = []
@@ -1543,28 +1643,87 @@ final class DesktopBackdropProvider: ObservableObject {
         ]
     }
 
+    /// Whether a hint should resolve now, arm a deferred resolve, or defer to
+    /// one that is already armed.
+    ///
+    /// Pure so the coalescing rule is testable without a clock, a desktop, or a
+    /// run loop — the previous rule looked correct in the source and was inert
+    /// in fact, which is the failure mode a unit test catches and a reading
+    /// does not.
+    static func hintDecision(
+        now: Date,
+        lastResolved: Date,
+        deferredResolveArmed: Bool,
+        floor: TimeInterval = minimumResolveInterval
+    ) -> DesktopResolveDecision {
+        let elapsed = now.timeIntervalSince(lastResolved)
+        if elapsed >= floor { return .resolveNow }
+        if deferredResolveArmed { return .alreadyScheduled }
+        return .deferBy(floor - elapsed)
+    }
+
     /// Ask for the backdrop that matches `isDark`. Cheap and idempotent: an
     /// appearance flip always re-resolves, anything else waits out the
     /// rate limit.
     func refresh(isDark: Bool) {
         let appearanceChanged = isDark != lastAppearanceIsDark
-        let due = Date().timeIntervalSince(lastResolved) >= Self.minimumResolveInterval
-        guard appearanceChanged || due else { return }
         lastAppearanceIsDark = isDark
+        guard appearanceChanged
+            || Date().timeIntervalSince(lastResolved) >= Self.minimumResolveInterval else { return }
+        // An appearance flip supersedes any armed hint: it is about to do the
+        // read that hint was waiting for, and for the newer appearance.
+        deferredResolve?.cancel()
+        deferredResolve = nil
         lastResolved = Date()
         resolve(isDark: isDark)
     }
 
-    /// A hint arrived that the desktop may have changed. Re-resolution is
-    /// re-armed rather than performed, so a burst of notifications costs one
-    /// disk read at most.
+    /// A hint arrived that the desktop may have changed.
+    ///
+    /// The floor exists because these hints are cheap to emit and expensive to
+    /// honour: each resolve is an `Index.plist` read, an `entries.json` parse,
+    /// and a main-thread `desktopImageURL(for:)` call. It used to be inert —
+    /// this method reset `lastResolved` to `.distantPast` and then asked
+    /// `refresh` whether enough time had passed since `lastResolved`, which it
+    /// always had. Every Space switch, activation, screen change, and key-window
+    /// change therefore paid for a full re-resolution.
+    ///
+    /// Coalescing properly means a hint inside the floor is neither dropped nor
+    /// duplicated: it arms exactly one resolve for the moment the floor expires,
+    /// and every further hint before then rides on that one.
     private func invalidate() {
-        lastResolved = .distantPast
-        guard let isDark = lastAppearanceIsDark else { return }
-        refresh(isDark: isDark)
+        guard lastAppearanceIsDark != nil else { return }
+        switch Self.hintDecision(
+            now: Date(),
+            lastResolved: lastResolved,
+            deferredResolveArmed: deferredResolve != nil
+        ) {
+        case .alreadyScheduled:
+            return
+        case .resolveNow:
+            guard let isDark = lastAppearanceIsDark else { return }
+            lastResolved = Date()
+            resolve(isDark: isDark)
+        case let .deferBy(delay):
+            deferredResolve = Task { [weak self] in
+                try? await Task.sleep(for: .seconds(delay))
+                guard !Task.isCancelled, let self else { return }
+                self.deferredResolve = nil
+                guard let isDark = self.lastAppearanceIsDark else { return }
+                self.lastResolved = Date()
+                self.resolve(isDark: isDark)
+            }
+        }
     }
 
+    /// Reading the wallpaper URL stays on the main actor — `NSScreen` is not
+    /// `Sendable`, so the alternative is smuggling one into a detached task —
+    /// but it now runs only on a resolve, and `invalidate` guarantees at most
+    /// one of those per `minimumResolveInterval`. The hot path a burst of hints
+    /// travels no longer touches it at all.
     private func resolve(isDark: Bool) {
+        generation &+= 1
+        let generation = generation
         let desktopImageURL = Self.currentScreen()
             .flatMap { NSWorkspace.shared.desktopImageURL(for: $0) }
         work?.cancel()
@@ -1572,7 +1731,7 @@ final class DesktopBackdropProvider: ObservableObject {
             let key = await Task.detached(priority: .utility) {
                 Self.key(desktopImageURL: desktopImageURL, isDark: isDark)
             }.value
-            guard !Task.isCancelled, let self else { return }
+            guard let self, generation == self.generation else { return }
             guard let key else {
                 painting = .flat(DesktopTintSampler.fallback)
                 return
@@ -1584,7 +1743,7 @@ final class DesktopBackdropProvider: ObservableObject {
             let rendered = await Task.detached(priority: .utility) {
                 DesktopBackdropRenderer.render(key: key)
             }.value
-            guard !Task.isCancelled else { return }
+            guard generation == self.generation else { return }
             let resolved = rendered ?? .flat(DesktopTintSampler.fallback)
             self.store(resolved, for: key)
             self.painting = resolved

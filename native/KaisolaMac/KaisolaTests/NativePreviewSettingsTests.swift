@@ -440,29 +440,41 @@ final class NativePreviewSettingsTests: XCTestCase {
             XCTAssertEqual(recipe.blue, 18.0 / 255, accuracy: 0.0001)
         }
 
-        // The headline coverage. Halved from v1.1's 0.32/0.44: at those values
-        // the veil covered the vibrancy layer so completely that the sidebar
-        // rendered as a flat neutral over a saturated desktop.
-        XCTAssertEqual(GlassBackdropWash.sidebar(isDark: false).baseOpacity, 0.16, accuracy: 0.0001)
-        XCTAssertEqual(GlassBackdropWash.sidebar(isDark: true).baseOpacity, 0.26, accuracy: 0.0001)
+        // The headline coverage. 0.60 in both appearances: frost, not a pane.
+        // Two earlier eras both missed, in opposite directions — 0.32/0.44 over
+        // near-opaque vibrancy passed no desktop colour at all, and the 0.16
+        // that replaced it was calibrated against vibrancy but ended up over a
+        // *painted wallpaper*, which passes everything.
+        XCTAssertEqual(GlassBackdropWash.sidebar(isDark: false).baseOpacity, 0.60, accuracy: 0.0001)
+        XCTAssertEqual(GlassBackdropWash.sidebar(isDark: true).baseOpacity, 0.60, accuracy: 0.0001)
     }
 
-    /// The property that actually regressed: a veil that covers most of the
-    /// backdrop leaves no desktop colour to see. Both appearances must pass the
-    /// majority of the backdrop through, and the sidebar — the surface whose
-    /// whole job is to read as glass — must pass more than the workspace does.
-    func testSidebarVeilLeavesTheDesktopVisible() {
+    /// The contract the frost retune exists to hold, and it is two-sided.
+    ///
+    /// Too much transmission and the surface is a blurred photograph: that was
+    /// the bug, a sidebar whose measured channel spread (0.32 average, 0.53
+    /// peak) ran *higher* than the desktop beside the window. Too little and it
+    /// is the flat #EDEDED panel of the release before that. Frost lives in
+    /// between — the desktop's hue arrives, its brightness and its shapes do
+    /// not — and only a band expresses that. A one-sided floor is what let the
+    /// veil drift to 0.16 without a single test objecting.
+    func testGlassVeilsFrostTheDesktopWithoutErasingIt() {
         for isDark in [false, true] {
-            let sidebar = GlassBackdropWash.sidebar(isDark: isDark)
-            XCTAssertGreaterThan(
-                sidebar.desktopTransmission,
-                0.7,
-                "sidebar veil (isDark: \(isDark)) hides the desktop it exists to show"
-            )
-            XCTAssertGreaterThan(
-                GlassBackdropWash.workspace(isDark: isDark).desktopTransmission,
-                0.6
-            )
+            for (name, wash) in [
+                ("sidebar", GlassBackdropWash.sidebar(isDark: isDark)),
+                ("workspace", GlassBackdropWash.workspace(isDark: isDark)),
+            ] {
+                XCTAssertGreaterThanOrEqual(
+                    wash.desktopTransmission,
+                    0.30,
+                    "\(name) veil (isDark: \(isDark)) hides the desktop it exists to tint"
+                )
+                XCTAssertLessThanOrEqual(
+                    wash.desktopTransmission,
+                    0.50,
+                    "\(name) veil (isDark: \(isDark)) reads as a photograph, not as glass"
+                )
+            }
         }
     }
 
@@ -506,68 +518,51 @@ final class NativePreviewSettingsTests: XCTestCase {
         XCTAssertGreaterThan(darkWorkspace.baseOpacity, darkSidebar.baseOpacity)
     }
 
-    /// Increased Contrast used to add a flat neutral overlay (0.18) on top of
-    /// the veil, sized for the *pre-halving* base coverage. Once the veil
-    /// itself was halved (above), that flat overlay left Increased Contrast
-    /// *less* opaque than it was pre-retune — backwards for an accessibility
-    /// setting. The overlay must scale with how much coverage the thinner
-    /// veil gave up, so the composite (veil + overlay) still clears a floor
-    /// equal to the coverage the pre-halving veil delivered stacked with the
-    /// old flat 0.18 overlay. This is the regression test: it fails against a
-    /// flat 0.18 overlay and passes only once the overlay is scaled.
-    func testIncreasedContrastOverlayRestoresThePreHalvingCompositeCoverage() {
+    /// Increased Contrast must leave at most 20% of any glass surface showing
+    /// wallpaper, on every surface and in both appearances.
+    ///
+    /// Stated absolutely, because the previous statement — "reproduce the
+    /// coverage the pre-halving veil reached with a flat 0.18 overlay on it" —
+    /// stopped constraining anything the moment the frost retune raised each
+    /// base past that historical composite. All four surfaces then solved to a
+    /// negative overlay and collapsed onto the formula's own 0.18 floor, and
+    /// the old test still passed, because a base of 0.60 clears a 0.44 floor
+    /// with no overlay at all. A floor tied to a past release cannot notice
+    /// that; a floor tied to the rendered surface can.
+    func testIncreasedContrastCoversAtLeastFourFifthsOfEverySurface() {
         // Two translucent layers stacked with standard "over" compositing
         // combine to `base + overlay * (1 - base)`.
         func composite(base: Double, overlay: Double) -> Double {
             base + overlay * (1 - base)
         }
-        let priorOverlay = 0.18
-        // Named floors: the pre-halving base opacities (sidebar 0.32/0.44,
-        // workspace 0.26/0.50) composited with the old flat overlay.
-        let sidebarLightFloor = composite(base: 0.32, overlay: priorOverlay)
-        let sidebarDarkFloor = composite(base: 0.44, overlay: priorOverlay)
-        let workspaceLightFloor = composite(base: 0.26, overlay: priorOverlay)
-        let workspaceDarkFloor = composite(base: 0.50, overlay: priorOverlay)
         let epsilon = 0.0001
 
-        XCTAssertGreaterThanOrEqual(
-            composite(
-                base: GlassBackdropWash.sidebar(isDark: false).baseOpacity,
-                overlay: GlassBackdropWash.sidebarIncreasedContrastOverlay(isDark: false)
-            ),
-            sidebarLightFloor - epsilon,
-            "sidebar (light) composite under Increased Contrast fell below the pre-halving floor"
-        )
-        XCTAssertGreaterThanOrEqual(
-            composite(
-                base: GlassBackdropWash.sidebar(isDark: true).baseOpacity,
-                overlay: GlassBackdropWash.sidebarIncreasedContrastOverlay(isDark: true)
-            ),
-            sidebarDarkFloor - epsilon,
-            "sidebar (dark) composite under Increased Contrast fell below the pre-halving floor"
-        )
-        XCTAssertGreaterThanOrEqual(
-            composite(
-                base: GlassBackdropWash.workspace(isDark: false).baseOpacity,
-                overlay: GlassBackdropWash.workspaceIncreasedContrastOverlay(isDark: false)
-            ),
-            workspaceLightFloor - epsilon,
-            "workspace (light) composite under Increased Contrast fell below the pre-halving floor"
-        )
-        XCTAssertGreaterThanOrEqual(
-            composite(
-                base: GlassBackdropWash.workspace(isDark: true).baseOpacity,
-                overlay: GlassBackdropWash.workspaceIncreasedContrastOverlay(isDark: true)
-            ),
-            workspaceDarkFloor - epsilon,
-            "workspace (dark) composite under Increased Contrast fell below the pre-halving floor"
-        )
+        for isDark in [false, true] {
+            let appearance = isDark ? "dark" : "light"
+            XCTAssertGreaterThanOrEqual(
+                composite(
+                    base: GlassBackdropWash.sidebar(isDark: isDark).baseOpacity,
+                    overlay: GlassBackdropWash.sidebarIncreasedContrastOverlay(isDark: isDark)
+                ),
+                GlassBackdropWash.increasedContrastCoverage - epsilon,
+                "sidebar (\(appearance)) leaves too much wallpaper under Increased Contrast"
+            )
+            XCTAssertGreaterThanOrEqual(
+                composite(
+                    base: GlassBackdropWash.workspace(isDark: isDark).baseOpacity,
+                    overlay: GlassBackdropWash.workspaceIncreasedContrastOverlay(isDark: isDark)
+                ),
+                GlassBackdropWash.increasedContrastCoverage - epsilon,
+                "workspace (\(appearance)) leaves too much wallpaper under Increased Contrast"
+            )
+        }
     }
 
-    /// The replacement overlay must actually be bigger than the old flat 0.18
-    /// it replaces — otherwise this is a no-op rename, not a fix — and must
-    /// stay well short of an opaque panel.
-    func testIncreasedContrastOverlayIsLargerThanTheOldFlatConstantButBounded() {
+    /// Increased Contrast has to be a *visible* step up from the ordinary veil
+    /// and still stop short of an opaque panel — and the exact solution has to
+    /// land strictly inside the clamp, or the guarantee above is being met by
+    /// the clamp rather than by the arithmetic.
+    func testIncreasedContrastOverlayIsASubstantialStepThatNeverClamps() {
         let overlays = [
             GlassBackdropWash.sidebarIncreasedContrastOverlay(isDark: false),
             GlassBackdropWash.sidebarIncreasedContrastOverlay(isDark: true),
@@ -575,9 +570,28 @@ final class NativePreviewSettingsTests: XCTestCase {
             GlassBackdropWash.workspaceIncreasedContrastOverlay(isDark: true),
         ]
         for overlay in overlays {
-            XCTAssertGreaterThan(overlay, 0.18)
-            XCTAssertLessThanOrEqual(overlay, 0.6)
+            XCTAssertGreaterThan(overlay, 0.18, "no longer a step up from the old flat constant")
+            XCTAssertLessThan(overlay, 0.6, "the 0.6 ceiling is binding, so the floor is not being met")
         }
+    }
+
+    /// The floor is a property of the surface, not of these particular
+    /// constants: a future veil retune has to re-derive the overlay rather than
+    /// inherit a stale one. Exercised at bases either side of today's.
+    func testIncreasedContrastOverlayTracksWhateverTheVeilDoes() {
+        // A thinner veil must be compensated by a heavier overlay, and the
+        // composite must land on the floor either way.
+        func requiredOverlay(base: Double) -> Double {
+            (GlassBackdropWash.increasedContrastCoverage - base) / (1 - base)
+        }
+        XCTAssertGreaterThan(requiredOverlay(base: 0.40), requiredOverlay(base: 0.60))
+        XCTAssertEqual(
+            0.40 + requiredOverlay(base: 0.40) * (1 - 0.40),
+            GlassBackdropWash.increasedContrastCoverage,
+            accuracy: 0.0001
+        )
+        // A veil already past the floor needs nothing added.
+        XCTAssertLessThanOrEqual(requiredOverlay(base: 0.85), 0)
     }
 
     // MARK: - Wallpaper-only glass
@@ -883,7 +897,7 @@ final class NativePreviewSettingsTests: XCTestCase {
 
         // The property the numbers exist for. The pre-retune recipe returned
         // 0.3117/0.16/0.3387 for this same magenta desktop: a 0.179 spread,
-        // which reads as grey once a 0.16-coverage veil is laid over it.
+        // which is already grey before any veil goes over it.
         let spread = max(tint.red, tint.green, tint.blue) - min(tint.red, tint.green, tint.blue)
         XCTAssertGreaterThan(spread, 0.30)
         XCTAssertGreaterThan(DesktopTintSampler.chromaRetention, 0.45)
@@ -903,6 +917,183 @@ final class NativePreviewSettingsTests: XCTestCase {
         XCTAssertLessThan(spread, 0.02)
         XCTAssertEqual(tint.red, 0.4868, accuracy: 0.0001)
     }
+
+    // MARK: - Frost
+
+    /// The bake used to boost saturation 1.3×, from the era when a heavy veil
+    /// ate the desktop's chroma and the still had to shout through it. Under
+    /// the frost veil that inverted: measured off the shipped build, the
+    /// sidebar's peak channel spread was 0.53 against the raw desktop's 0.33 —
+    /// the "glass" was more colourful than the wallpaper it imitated. The veil
+    /// decides how much desktop arrives; the bake must not put a thumb on it.
+    func testWallpaperBakeCarriesNoSaturationBoost() {
+        XCTAssertEqual(DesktopBackdropRenderer.saturation, 1.0, accuracy: 0.0001)
+    }
+
+    /// Gaussians compose by variance, so raising the radius from 12 to 28 adds
+    /// `sqrt(28² − 12²) ≈ 25` still-pixels over the previous result — about a
+    /// quarter of the 176×110 thumbnail's height. Enough that the wallpaper
+    /// keeps a left-to-right colour story and loses every locatable shape.
+    func testWallpaperBakeBlursPastAnyRecognisableShape() {
+        XCTAssertGreaterThanOrEqual(DesktopBackdropRenderer.blurRadius, 24)
+        let added = (DesktopBackdropRenderer.blurRadius * DesktopBackdropRenderer.blurRadius - 144)
+            .squareRoot()
+        XCTAssertGreaterThan(
+            added,
+            0.2 * Double(DesktopBackdropRenderer.stillWidth) * 10 / 16,
+            "the extra blur is small against the thumbnail, so shapes still resolve"
+        )
+    }
+
+    /// `NSVisualEffectView` normalized luminance; a raw wallpaper does not, so
+    /// before this every label's legibility was a function of the user's
+    /// desktop picture — a white wallpaper in dark mode put tertiary text on a
+    /// pale surface. The normalization has to be *exact* across the entire
+    /// range of possible wallpapers, not merely clamped somewhere sensible:
+    /// the clamp exists for a degenerate decode, and if it ever binds for a
+    /// real desktop the guarantee is only approximate.
+    func testWallpaperBakeNormalizesLuminanceExactlyForEveryPossibleWallpaper() {
+        for isDark in [false, true] {
+            let target = DesktopBackdropRenderer.targetLuminance(isDark: isDark)
+            for step in 0...20 {
+                let mean = Double(step) / 20
+                let shifted = mean + DesktopBackdropRenderer.luminanceShift(mean: mean, isDark: isDark)
+                XCTAssertEqual(
+                    shifted,
+                    target,
+                    accuracy: 0.0001,
+                    "a wallpaper of mean luminance \(mean) missed the \(isDark ? "dark" : "light") target"
+                )
+            }
+        }
+        // Light lifts toward bright, dark crushes toward dark.
+        XCTAssertGreaterThan(DesktopBackdropRenderer.targetLuminance(isDark: false), 0.6)
+        XCTAssertLessThan(DesktopBackdropRenderer.targetLuminance(isDark: true), 0.25)
+    }
+
+    /// The mean the bake normalizes against is the picture's own average, with
+    /// none of the tint's cooling, floors, or slate mix applied — those exist to
+    /// make a *tint* legible and would misreport the wallpaper's brightness.
+    func testMeanLuminanceReadsThePictureRatherThanTheTint() throws {
+        let white = try XCTUnwrap(DesktopTintSampler.meanLuminance(rgba: [255, 255, 255, 255]))
+        XCTAssertEqual(white, 1.0, accuracy: 0.0001)
+        let black = try XCTUnwrap(DesktopTintSampler.meanLuminance(rgba: [0, 0, 0, 255]))
+        XCTAssertEqual(black, 0.0, accuracy: 0.0001)
+        // Rec. 709: green dominates, blue barely registers.
+        let green = try XCTUnwrap(DesktopTintSampler.meanLuminance(rgba: [0, 255, 0, 255]))
+        XCTAssertEqual(green, 0.7152, accuracy: 0.0001)
+        // A black wallpaper's tint is floored at 0.07-ish so it never degenerates;
+        // its *luminance* must still read as black, or the bake would under-lift it.
+        let tint = try XCTUnwrap(DesktopTintSampler.cooledAverage(rgba: [0, 0, 0, 255]))
+        XCTAssertGreaterThan(tint.red, 0.0)
+        XCTAssertNil(DesktopTintSampler.meanLuminance(rgba: [0, 0, 0, 0]))
+    }
+
+    /// The whole point of normalizing: the composite the eye actually sees is
+    /// the same brightness on every desktop, so "0.60 coverage" means one thing
+    /// rather than one thing per wallpaper. Modelled end to end — normalize the
+    /// still, then lay the veil over it — across the full range of wallpapers.
+    func testFrostCompositeLandsOnTheSameGroundForEveryWallpaper() throws {
+        func veilLuminance(isDark: Bool) -> Double {
+            guard isDark else { return 1.0 }
+            let veil = GlassBackdropWash.darkVeil
+            return veil.red * 0.2126 + veil.green * 0.7152 + veil.blue * 0.0722
+        }
+
+        for isDark in [false, true] {
+            let base = GlassBackdropWash.sidebar(isDark: isDark).baseOpacity
+            var composites: [Double] = []
+            for step in 0...20 {
+                let mean = Double(step) / 20
+                let still = mean + DesktopBackdropRenderer.luminanceShift(mean: mean, isDark: isDark)
+                composites.append(base * veilLuminance(isDark: isDark) + (1 - base) * still)
+            }
+            let spread = (composites.max() ?? 0) - (composites.min() ?? 0)
+            XCTAssertLessThan(
+                spread,
+                0.001,
+                "sidebar brightness still depends on the wallpaper (isDark: \(isDark))"
+            )
+            let composite = try XCTUnwrap(composites.first)
+            if isDark {
+                // Near-black: white text has room, whatever the desktop is.
+                XCTAssertLessThan(composite, 0.16)
+            } else {
+                // Near-white frost, the Safari sidebar reference.
+                XCTAssertGreaterThan(composite, 0.85)
+            }
+        }
+    }
+
+    // MARK: - Desktop resolve coalescing
+
+    /// The rate limit was inert. `invalidate` set `lastResolved = .distantPast`
+    /// and then asked `refresh` whether enough time had passed *since
+    /// lastResolved*, which it now always had — so every Space switch,
+    /// activation, screen change, and key-window change paid for a full
+    /// re-resolution: an `Index.plist` read, an `entries.json` parse, and a
+    /// main-thread `desktopImageURL(for:)` call. Coalescing means a hint inside
+    /// the floor is neither dropped nor duplicated.
+    func testDesktopHintsCoalesceIntoOneDeferredResolve() {
+        let floor = DesktopBackdropProvider.minimumResolveInterval
+        let now = Date()
+
+        // Past the floor: read it now.
+        XCTAssertEqual(
+            DesktopBackdropProvider.hintDecision(
+                now: now,
+                lastResolved: now.addingTimeInterval(-floor - 0.1),
+                deferredResolveArmed: false
+            ),
+            .resolveNow
+        )
+
+        // Inside the floor with nothing armed: arm exactly one resolve, for the
+        // moment the floor expires — never dropped.
+        XCTAssertEqual(
+            DesktopBackdropProvider.hintDecision(
+                now: now,
+                lastResolved: now.addingTimeInterval(-0.5),
+                deferredResolveArmed: false
+            ),
+            .deferBy(floor - 0.5)
+        )
+
+        // The burst: every further hint rides the armed one — never duplicated.
+        for elapsed in [0.0, 0.25, 1.0, 1.99] {
+            XCTAssertEqual(
+                DesktopBackdropProvider.hintDecision(
+                    now: now,
+                    lastResolved: now.addingTimeInterval(-elapsed),
+                    deferredResolveArmed: true
+                ),
+                .alreadyScheduled,
+                "a hint \(elapsed)s into the floor scheduled a second resolve"
+            )
+        }
+
+        // An armed resolve does not suppress a hint that arrives after the floor
+        // has already expired; that one is due on its own account.
+        XCTAssertEqual(
+            DesktopBackdropProvider.hintDecision(
+                now: now,
+                lastResolved: now.addingTimeInterval(-floor),
+                deferredResolveArmed: true
+            ),
+            .resolveNow
+        )
+
+        // A cold start has never resolved, so the first hint is immediate.
+        XCTAssertEqual(
+            DesktopBackdropProvider.hintDecision(
+                now: now,
+                lastResolved: .distantPast,
+                deferredResolveArmed: false
+            ),
+            .resolveNow
+        )
+    }
+
 
     /// With no paired Mac the section was a permanent "No other Macs yet" plus
     /// a "Updated N seconds ago" line: two rows of chrome reporting nothing.

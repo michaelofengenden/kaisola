@@ -549,7 +549,8 @@ final class NativeSessionStoreTests: XCTestCase {
                     provisioning: .attached,
                     workspaceKind: .base
                 ),
-            ]
+            ],
+            stagedPrompts: ["oldest queued request", "newest queued request"]
         )
         let state = NativeWorkspaceRestorationState(
             selectedProjectID: projectID,
@@ -587,7 +588,33 @@ final class NativeSessionStoreTests: XCTestCase {
         XCTAssertTrue(restoredPane.isMinimized)
         XCTAssertEqual(restoredPane.sizeWeight, 0.8, accuracy: 0.0001)
         XCTAssertEqual(restoredPane.surface.meshDescriptor, descriptor)
+        XCTAssertEqual(
+            restoredPane.surface.meshDescriptor?.stagedPrompts,
+            ["oldest queued request", "newest queued request"]
+        )
         XCTAssertTrue(try XCTUnwrap(restored.projects.first).layout.isEmpty)
+    }
+
+    func testRestorableMeshDescriptorDefaultsLegacyMissingStagedPromptsToEmpty() throws {
+        let legacyJSON = """
+        {
+          "id": "mesh-before-queued-prompts",
+          "projectID": "nproj_legacy_mesh",
+          "basePath": "/tmp/legacy-mesh",
+          "title": "Legacy Mesh",
+          "mode": "staged",
+          "purpose": "build",
+          "lifecycle": "suspended",
+          "columns": []
+        }
+        """
+
+        let descriptor = try JSONDecoder().decode(
+            NativeRestorableMeshDescriptor.self,
+            from: try XCTUnwrap(legacyJSON.data(using: .utf8))
+        )
+
+        XCTAssertEqual(descriptor.stagedPrompts, [])
     }
 
     func testWorkspaceStoreMigratesSchemaOneArchiveToSchemaTwoWithoutLosingLegacyPanes() async throws {

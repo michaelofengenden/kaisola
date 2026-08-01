@@ -716,6 +716,58 @@ final class AppModelProjectContextTests: XCTestCase {
     }
 
     @MainActor
+    func testMeshRestorationKeepsQueuedPromptOrderPaused() async throws {
+        let root = storeFile.deletingLastPathComponent()
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        let projectDirectory = root.appendingPathComponent("queued-mesh-project", isDirectory: true)
+        try FileManager.default.createDirectory(
+            at: projectDirectory,
+            withIntermediateDirectories: true
+        )
+        let workspaceStore = NativeWorkspaceStateStore(
+            fileURL: root.appendingPathComponent("workspace-state-v1.json"),
+            meshWorktreeRoot: root.appendingPathComponent("mesh-worktrees", isDirectory: true)
+        )
+        let meshPane = Self.meshPane(
+            id: "mesh-queued-restoration",
+            basePath: projectDirectory.path,
+            mode: .staged,
+            purpose: .build,
+            stagedPrompts: ["inspect first", "dispatch second"]
+        )
+        let projectID = meshPane.surface.projectID
+        try await workspaceStore.saveRestorationState(
+            NativeWorkspaceRestorationState(
+                selectedProjectID: projectID,
+                projects: [
+                    NativeProjectWorkspaceState(
+                        projectID: projectID,
+                        layout: SessionPaneLayout(sessionID: meshPane.id),
+                        panes: [meshPane],
+                        focusedPaneID: meshPane.id
+                    ),
+                ]
+            )
+        )
+
+        let model = makeRestoringModel(
+            workspaceStore: workspaceStore,
+            root: root,
+            identity: "queued-prompts",
+            projectDirectory: projectDirectory
+        )
+        await model.reload()
+        let mesh = try XCTUnwrap(model.meshes.first { $0.id == meshPane.id })
+
+        XCTAssertEqual(mesh.stagedPrompts, ["inspect first", "dispatch second"])
+        XCTAssertEqual(mesh.stagedQueuedPromptCount, 2)
+        XCTAssertFalse(mesh.stagedQueueIsRunning)
+        XCTAssertEqual(mesh.stage, "Idle")
+
+        await model.teardown()
+    }
+
+    @MainActor
     func testUnavailableMeshBaseFolderSurvivesRestoreSaveAndTeardown() async throws {
         let root = storeFile.deletingLastPathComponent()
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
@@ -871,16 +923,23 @@ final class AppModelProjectContextTests: XCTestCase {
         )
     }
 
-    private static func meshPane(id: String, basePath: String) -> NativeRestorablePaneState {
+    private static func meshPane(
+        id: String,
+        basePath: String,
+        mode: MeshMode = .flat,
+        purpose: MeshPurpose = .idea,
+        stagedPrompts: [String] = []
+    ) -> NativeRestorablePaneState {
         let descriptor = NativeRestorableMeshDescriptor(
             id: id,
             projectID: NativeSessionStore.projectID(forDirectory: basePath),
             basePath: basePath,
             title: "Mesh · \(id)",
-            mode: .flat,
-            purpose: .idea,
+            mode: mode,
+            purpose: purpose,
             lifecycle: .suspended,
-            columns: []
+            columns: [],
+            stagedPrompts: stagedPrompts
         )
         return NativeRestorablePaneState(
             id: id,

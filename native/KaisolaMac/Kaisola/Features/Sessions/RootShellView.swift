@@ -1662,6 +1662,7 @@ struct RootShellView: View {
             .buttonStyle(.plain)
             .help("Focus \(surfaceTitle(id))")
             if let mesh = model.meshes.first(where: { $0.id == id }) {
+                MeshStagedPromptQueueButton(mesh: mesh)
                 MeshConfigurationMenu(mesh: mesh)
             }
             Button { model.toggleMaximizeSurface(id) } label: {

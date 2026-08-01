@@ -2349,6 +2349,7 @@ final class AppModel: ObservableObject {
                     title: descriptor.title,
                     lifecycle: descriptor.lifecycle,
                     initialDraft: draft,
+                    initialStagedPrompts: descriptor.stagedPrompts,
                     usageCenter: usageCenter
                 )
                 wireMeshPersistence(mesh)

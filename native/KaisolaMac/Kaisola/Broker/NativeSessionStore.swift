@@ -718,6 +718,70 @@ struct NativeRestorableMeshDescriptor: Codable, Equatable, Hashable, Identifiabl
     let purpose: MeshPurpose
     let lifecycle: NativeMeshLifecycle
     let columns: [NativeRestorableMeshColumnDescriptor]
+    /// Waiting staged-build prompts in dispatch order. The currently active
+    /// scout/executor handoff is deliberately not replayed after a crash: only
+    /// work that has not yet been dispatched is safe to resume automatically.
+    let stagedPrompts: [String]
+
+    init(
+        id: String,
+        projectID: String,
+        basePath: String,
+        title: String,
+        mode: MeshMode,
+        purpose: MeshPurpose,
+        lifecycle: NativeMeshLifecycle,
+        columns: [NativeRestorableMeshColumnDescriptor],
+        stagedPrompts: [String] = []
+    ) {
+        self.id = id
+        self.projectID = projectID
+        self.basePath = basePath
+        self.title = title
+        self.mode = mode
+        self.purpose = purpose
+        self.lifecycle = lifecycle
+        self.columns = columns
+        self.stagedPrompts = stagedPrompts
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case id
+        case projectID
+        case basePath
+        case title
+        case mode
+        case purpose
+        case lifecycle
+        case columns
+        case stagedPrompts
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = try container.decode(String.self, forKey: .id)
+        projectID = try container.decode(String.self, forKey: .projectID)
+        basePath = try container.decode(String.self, forKey: .basePath)
+        title = try container.decode(String.self, forKey: .title)
+        mode = try container.decode(MeshMode.self, forKey: .mode)
+        purpose = try container.decode(MeshPurpose.self, forKey: .purpose)
+        lifecycle = try container.decode(NativeMeshLifecycle.self, forKey: .lifecycle)
+        columns = try container.decode([NativeRestorableMeshColumnDescriptor].self, forKey: .columns)
+        stagedPrompts = try container.decodeIfPresent([String].self, forKey: .stagedPrompts) ?? []
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(id, forKey: .id)
+        try container.encode(projectID, forKey: .projectID)
+        try container.encode(basePath, forKey: .basePath)
+        try container.encode(title, forKey: .title)
+        try container.encode(mode, forKey: .mode)
+        try container.encode(purpose, forKey: .purpose)
+        try container.encode(lifecycle, forKey: .lifecycle)
+        try container.encode(columns, forKey: .columns)
+        try container.encode(stagedPrompts, forKey: .stagedPrompts)
+    }
 }
 
 struct NativeRestorableSurfaceState: Codable, Equatable, Hashable, Sendable {
@@ -1806,7 +1870,8 @@ actor NativeWorkspaceStateStore {
                 mode: descriptor.mode,
                 purpose: descriptor.purpose,
                 lifecycle: descriptor.lifecycle,
-                columns: columns
+                columns: columns,
+                stagedPrompts: descriptor.stagedPrompts
             )
             return NativeRestorableSurfaceState(mesh: normalizedDescriptor)
         }

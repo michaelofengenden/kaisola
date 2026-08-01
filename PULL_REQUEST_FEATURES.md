@@ -213,14 +213,20 @@ Acceptance:
 
 The immediate audit pass adds non-destructive Chat stop controls, per-column
 and global Mesh stop, active-run close confirmation, and draft-safe sending.
-Complete the lifecycle model without overloading “close” to mean deletion.
+Waiting staged prompts now persist in exact FIFO order, restore paused, and can
+be inspected, removed individually, or explicitly resumed from either Mesh
+presentation. Complete the remaining lifecycle model without overloading
+“close” to mean deletion.
 
-Scope:
+Completed scope:
+
+- Persist staged Mesh prompts across window close and app restart; expose their
+  order and allow individual removal before dispatch.
+
+Remaining scope:
 
 - Distinguish Hide, Stop Current Turn, Stop All, Close to Recently Closed,
   Restore, and permanently Delete for Chat and Mesh.
-- Persist staged Mesh prompts across window close and app restart; expose their
-  order and allow individual removal before dispatch.
 - Preserve transcripts, drafts, queued prompts, and recoverable worktrees for
   every non-delete action, with Undo for recently closed surfaces.
 - Add ACP restart queue recovery so a crashed adapter can resume without users

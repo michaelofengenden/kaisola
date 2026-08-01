@@ -185,14 +185,49 @@ final class MeshStagedTests: XCTestCase {
         XCTAssertTrue(mesh.sendStaged("first request"))
         XCTAssertTrue(mesh.sendStaged("second request"))
         XCTAssertEqual(mesh.stagedQueuedPromptCount, 2)
-        XCTAssertEqual(mesh.stagedPromptsForTesting, ["first request", "second request"])
+        XCTAssertEqual(mesh.stagedPrompts, ["first request", "second request"])
 
         // Let the drain observe the disconnected scout. The active prompt is
         // put back at the head rather than dropped or replayed to executors.
         for _ in 0..<5 { await Task.yield() }
         XCTAssertEqual(mesh.stagedQueuedPromptCount, 2)
-        XCTAssertEqual(mesh.stagedPromptsForTesting, ["first request", "second request"])
+        XCTAssertEqual(mesh.stagedPrompts, ["first request", "second request"])
         XCTAssertTrue(mesh.stage.localizedCaseInsensitiveContains("prompt kept"))
+    }
+
+    @MainActor
+    func testRestoredStagedQueueStaysPausedAndSupportsDurableRemoval() async {
+        let mesh = MeshSession(
+            baseDirectory: FileManager.default.temporaryDirectory,
+            mode: .staged,
+            purpose: .build,
+            initialStagedPrompts: ["oldest request", "newest request"]
+        )
+        mesh.loadVisualFixture(agents: Self.agents)
+
+        XCTAssertEqual(mesh.stagedPrompts, ["oldest request", "newest request"])
+        XCTAssertEqual(mesh.stagedQueuedPromptCount, 2)
+        XCTAssertFalse(mesh.stagedQueueIsRunning)
+        XCTAssertEqual(mesh.stage, "Idle", "restoration must not dispatch merely because columns loaded")
+        XCTAssertEqual(mesh.restorationDescriptor.stagedPrompts, mesh.stagedPrompts)
+
+        var persistenceRequests = 0
+        mesh.onDescriptorChanged = { persistenceRequests += 1 }
+        XCTAssertFalse(mesh.removeStagedPrompt(at: -1))
+        XCTAssertFalse(mesh.removeStagedPrompt("stale row", at: 1))
+        XCTAssertTrue(mesh.removeStagedPrompt(at: 1))
+        XCTAssertEqual(mesh.stagedPrompts, ["oldest request"])
+        XCTAssertEqual(mesh.stagedQueuedPromptCount, 1)
+        XCTAssertEqual(mesh.restorationDescriptor.stagedPrompts, ["oldest request"])
+        XCTAssertEqual(persistenceRequests, 1)
+
+        _ = await mesh.columns[0].conversation.stop()
+        XCTAssertTrue(mesh.resumeStagedQueue())
+        for _ in 0..<5 { await Task.yield() }
+        XCTAssertEqual(mesh.stagedPrompts, ["oldest request"])
+        XCTAssertFalse(mesh.stagedQueueIsRunning)
+        XCTAssertTrue(mesh.stage.localizedCaseInsensitiveContains("prompt kept"))
+        XCTAssertGreaterThan(persistenceRequests, 1)
     }
 
     @MainActor

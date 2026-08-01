@@ -127,6 +127,7 @@ struct MeshView: View {
                     .font(.caption).foregroundStyle(.orange)
             }
             Spacer()
+            MeshStagedPromptQueueButton(mesh: mesh)
             if mesh.anyRunning {
                 Button {
                     Task { await mesh.stopAllTurns() }
@@ -223,6 +224,99 @@ struct MeshView: View {
     private func isConflictStatus(_ status: String) -> Bool {
         status.range(of: "conflict", options: .caseInsensitive) != nil
             || status.range(of: "marker", options: .caseInsensitive) != nil
+    }
+}
+
+/// Shared by standalone and embedded Mesh headers so a restored queue is never
+/// hidden behind a particular presentation mode.
+struct MeshStagedPromptQueueButton: View {
+    @ObservedObject var mesh: MeshSession
+    @State private var isPresented = false
+
+    var body: some View {
+        if !mesh.stagedPrompts.isEmpty {
+            Button {
+                isPresented.toggle()
+            } label: {
+                Label("\(mesh.stagedPrompts.count)", systemImage: "tray.full")
+                    .font(.caption.weight(.medium))
+            }
+            .buttonStyle(.borderless)
+            .help("Review queued Mesh prompts")
+            .accessibilityLabel(queueAccessibilityLabel)
+            .popover(isPresented: $isPresented, arrowEdge: .bottom) {
+                queueInspector
+            }
+        }
+    }
+
+    private var queueAccessibilityLabel: String {
+        let count = mesh.stagedPrompts.count
+        return "Review \(count) queued \(count == 1 ? "prompt" : "prompts")"
+    }
+
+    private var queueInspector: some View {
+        VStack(spacing: 0) {
+            HStack(spacing: 10) {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Queued Prompts")
+                        .font(.headline)
+                    Text("Waiting in dispatch order")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                Spacer()
+                Button {
+                    _ = mesh.resumeStagedQueue()
+                } label: {
+                    Label("Resume Queue", systemImage: "play.fill")
+                }
+                .disabled(!mesh.canResumeStagedQueue)
+                .help("Dispatch the oldest waiting prompt")
+                Button("Done") { isPresented = false }
+                    .keyboardShortcut(.cancelAction)
+            }
+            .padding(12)
+            Divider()
+            ScrollView {
+                LazyVStack(alignment: .leading, spacing: 10) {
+                    ForEach(Array(mesh.stagedPrompts.enumerated()), id: \.offset) { index, prompt in
+                        VStack(alignment: .leading, spacing: 7) {
+                            HStack {
+                                Text("Prompt \(index + 1)")
+                                    .font(.caption.weight(.semibold))
+                                    .foregroundStyle(.secondary)
+                                Spacer()
+                                Button(role: .destructive) {
+                                    if mesh.removeStagedPrompt(prompt, at: index), mesh.stagedPrompts.isEmpty {
+                                        isPresented = false
+                                    }
+                                } label: {
+                                    Label("Remove", systemImage: "trash")
+                                        .labelStyle(.titleAndIcon)
+                                }
+                                .buttonStyle(.borderless)
+                                .accessibilityLabel("Remove queued prompt \(index + 1)")
+                            }
+                            Text(prompt)
+                                .font(.callout)
+                                .textSelection(.enabled)
+                                .fixedSize(horizontal: false, vertical: true)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                        }
+                        .padding(10)
+                        .background(
+                            Color(nsColor: .controlBackgroundColor),
+                            in: RoundedRectangle(cornerRadius: 8, style: .continuous)
+                        )
+                        .accessibilityElement(children: .contain)
+                        .accessibilityLabel("Queued prompt \(index + 1)")
+                    }
+                }
+                .padding(12)
+            }
+        }
+        .frame(width: 390, height: 360)
     }
 }
 

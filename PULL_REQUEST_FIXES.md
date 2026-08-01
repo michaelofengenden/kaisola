@@ -57,6 +57,9 @@ Large product and architecture work remains ordered in
 - Failed pop-out targets now retain a standard missing-session recovery card
   with Try Again and Back to Workspace; window/model construction failures also
   surface an explicit error toast.
+- Waiting staged Mesh prompts now persist in exact FIFO order, restore paused,
+  and remain inspectable, removable one at a time, and explicitly resumable
+  from both standalone and embedded Mesh headers.
 
 ## Open audit fixes
 
@@ -73,8 +76,7 @@ Large product and architecture work remains ordered in
 
 ### Shell, Git, and session recovery
 
-- Finish reversible Recently Closed/Restore/Delete behavior and persisted,
-  inspectable Mesh staged prompts.
+- Finish reversible Recently Closed/Restore/Delete behavior.
 
 ### Accessibility, copy, and readiness
 

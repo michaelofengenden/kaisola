@@ -91,6 +91,7 @@ final class MeshSession: ObservableObject, Identifiable {
     /// A second send must never cancel the first pipeline and strand its scout
     /// result; staged runs are therefore drained in strict FIFO order.
     @Published private(set) var stagedQueuedPromptCount = 0
+    @Published private(set) var stagedQueueIsRunning = false
     @Published private(set) var lifecycle: NativeMeshLifecycle
     @Published var draft: String {
         didSet { onDraftChanged?(draft) }
@@ -114,6 +115,9 @@ final class MeshSession: ObservableObject, Identifiable {
     /// idea sends retain their bounded cancel-and-restart behavior.
     private var stageTask: Task<Void, Never>?
     private var stagedPromptQueue: [String] = []
+    /// Prevents a cancelled drain's deferred cleanup from clearing a newer
+    /// coordinator task that started while an awaited stop was yielding.
+    private var stagedDrainGeneration = 0
     /// Closing a Mesh can race the async repository/worktree probes in `start`.
     /// A generation guard prevents that suspended startup from resurrecting
     /// hidden columns or processes after shutdown.
@@ -159,6 +163,7 @@ final class MeshSession: ObservableObject, Identifiable {
         title: String? = nil,
         lifecycle: NativeMeshLifecycle = .provisioning,
         initialDraft: String = "",
+        initialStagedPrompts: [String] = [],
         worktreeRoot: URL = NativePreviewPaths.meshWorktreesDirectory,
         fileManager: FileManager = .default,
         usageCenter: UsageCenter = .shared
@@ -173,6 +178,8 @@ final class MeshSession: ObservableObject, Identifiable {
         self.worktreeRoot = worktreeRoot.standardizedFileURL
         self.fileManager = fileManager
         self.usageCenter = usageCenter
+        self.stagedPromptQueue = initialStagedPrompts
+        self.stagedQueuedPromptCount = initialStagedPrompts.count
     }
 
     /// Broker- and network-free columns for hosted visual QA. This is reachable
@@ -456,7 +463,8 @@ final class MeshSession: ObservableObject, Identifiable {
             mode: mode,
             purpose: purpose,
             lifecycle: lifecycle,
-            columns: live + provisioningColumns
+            columns: live + provisioningColumns,
+            stagedPrompts: stagedPromptQueue
         )
     }
 
@@ -595,8 +603,7 @@ final class MeshSession: ObservableObject, Identifiable {
         guard !isDestroyed, !isSuspended else { return }
         isSuspended = true
         startupGeneration &+= 1
-        stageTask?.cancel()
-        stageTask = nil
+        cancelStageCoordinator()
         stage = "Interrupted"
         for column in columns {
             _ = await column.conversation.stop()
@@ -610,8 +617,7 @@ final class MeshSession: ObservableObject, Identifiable {
     /// drafts, queued prompts, branches, or worktrees.
     func stopAllTurns() async {
         startupGeneration &+= 1
-        stageTask?.cancel()
-        stageTask = nil
+        cancelStageCoordinator()
         for column in columns where column.conversation.isRunning {
             _ = await column.conversation.stop()
         }
@@ -626,8 +632,7 @@ final class MeshSession: ObservableObject, Identifiable {
     func stopTurn(columnID: String) async {
         guard let column = columns.first(where: { $0.id == columnID }) else { return }
         startupGeneration &+= 1
-        stageTask?.cancel()
-        stageTask = nil
+        cancelStageCoordinator()
         _ = await column.conversation.stop()
         stage = "\(column.agent.name) stopped"
         onDescriptorChanged?()
@@ -728,6 +733,8 @@ final class MeshSession: ObservableObject, Identifiable {
         columns.removeAll()
         provisioningColumns.removeAll()
         retiredColumnIDs.removeAll()
+        stagedPromptQueue.removeAll()
+        stagedQueuedPromptCount = 0
         onDescriptorChanged?()
         guard await persistBoundary("Mesh cleanup completed, but its final tombstone could not be saved.") else {
             return .blocked(isolationNote ?? "Mesh cleanup completed, but its final tombstone could not be saved.")
@@ -854,8 +861,74 @@ final class MeshSession: ObservableObject, Identifiable {
         return accepted
     }
 
-    /// Focused, process-free verification seam for FIFO/no-loss behavior.
-    var stagedPromptsForTesting: [String] { stagedPromptQueue }
+    /// Waiting prompts in exact dispatch order. This snapshot powers both the
+    /// inspector and restoration; it never includes a possibly-dispatched
+    /// prompt currently owned by the active scout/executor pipeline.
+    var stagedPrompts: [String] { stagedPromptQueue }
+
+    /// Remove one waiting prompt without disturbing the active pipeline.
+    @discardableResult
+    func removeStagedPrompt(at index: Int) -> Bool {
+        guard stagedPromptQueue.indices.contains(index) else { return false }
+        return removeStagedPrompt(stagedPromptQueue[index], at: index)
+    }
+
+    /// UI-safe variant: a live drain can shift the FIFO between a render and a
+    /// click, so refuse a stale row action rather than remove a different item.
+    @discardableResult
+    func removeStagedPrompt(_ expectedPrompt: String, at index: Int) -> Bool {
+        guard stagedPromptQueue.indices.contains(index) else { return false }
+        guard stagedPromptQueue[index] == expectedPrompt else { return false }
+        stagedPromptQueue.remove(at: index)
+        stagedQueueDidChange()
+        return true
+    }
+
+    /// Explicitly continue a restored or retry-paused FIFO. Restoration never
+    /// auto-dispatches work merely because the app relaunched.
+    @discardableResult
+    func resumeStagedQueue() -> Bool {
+        guard mode == .staged, purpose == .build, !stagedPromptQueue.isEmpty else {
+            return false
+        }
+        guard let scout = columns.first(where: { $0.role == .scout }) else {
+            stage = "Scout unavailable — queued prompts paused"
+            return false
+        }
+        return beginStagedDrain(scoutID: scout.id)
+    }
+
+    var canResumeStagedQueue: Bool {
+        mode == .staged
+            && purpose == .build
+            && !stagedPromptQueue.isEmpty
+            && !stagedQueueIsRunning
+            && stageTask == nil
+            && columns.contains(where: { $0.role == .scout })
+    }
+
+    private func stagedQueueDidChange() {
+        stagedQueuedPromptCount = stagedPromptQueue.count
+        onDescriptorChanged?()
+    }
+
+    private func beginStagedDrain(scoutID: String) -> Bool {
+        guard stageTask == nil, !stagedPromptQueue.isEmpty else { return false }
+        stagedDrainGeneration &+= 1
+        let generation = stagedDrainGeneration
+        stagedQueueIsRunning = true
+        stageTask = Task { [weak self] in
+            await self?.drainStagedQueue(scoutID: scoutID, generation: generation)
+        }
+        return true
+    }
+
+    private func cancelStageCoordinator() {
+        stagedDrainGeneration &+= 1
+        stageTask?.cancel()
+        stageTask = nil
+        stagedQueueIsRunning = false
+    }
 
     // MARK: - Staged build pipeline
 
@@ -871,14 +944,10 @@ final class MeshSession: ObservableObject, Identifiable {
             return send(trimmed)
         }
         stagedPromptQueue.append(trimmed)
-        stagedQueuedPromptCount = stagedPromptQueue.count
+        stagedQueueDidChange()
         // The active pipeline owns stageTask until it drains or reaches a safe
         // stop. Never cancel it just because another prompt arrived.
-        guard stageTask == nil else { return true }
-        let scoutID = scout.id
-        stageTask = Task { [weak self] in
-            await self?.drainStagedQueue(scoutID: scoutID)
-        }
+        _ = beginStagedDrain(scoutID: scout.id)
         return true
     }
 
@@ -893,17 +962,22 @@ final class MeshSession: ObservableObject, Identifiable {
         case cancelled
     }
 
-    private func drainStagedQueue(scoutID: String) async {
-        defer { stageTask = nil }
+    private func drainStagedQueue(scoutID: String, generation: Int) async {
+        defer {
+            if stagedDrainGeneration == generation {
+                stageTask = nil
+                stagedQueueIsRunning = false
+            }
+        }
         while !Task.isCancelled, !stagedPromptQueue.isEmpty {
             let prompt = stagedPromptQueue.removeFirst()
-            stagedQueuedPromptCount = stagedPromptQueue.count
+            stagedQueueDidChange()
             switch await runStagedPipeline(originalPrompt: prompt, scoutID: scoutID) {
             case .completed:
                 continue
             case .retryable:
                 stagedPromptQueue.insert(prompt, at: 0)
-                stagedQueuedPromptCount = stagedPromptQueue.count
+                stagedQueueDidChange()
                 return
             case .stopped, .cancelled:
                 return
@@ -995,7 +1069,7 @@ final class MeshSession: ObservableObject, Identifiable {
         guard purpose == .idea, !columns.isEmpty else {
             return send(trimmed)
         }
-        stageTask?.cancel()
+        cancelStageCoordinator()
         stage = "Ideating…"
         let initial = Self.ideaInitialPrompt(for: trimmed)
         var columnIDs: [String] = []

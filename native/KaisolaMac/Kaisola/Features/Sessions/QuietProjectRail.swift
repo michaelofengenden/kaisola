@@ -1,11 +1,20 @@
 import Combine
 import SwiftUI
 
-/// "Quiet fleet" v4.4 sidebar rail, restyled on Safari's tab-group
-/// methodology: the *active* project is pinned at the top of the rail with its
-/// surfaces beneath it, and every other project sits under a quiet "Projects"
-/// section label as a compact one-line row that can be expanded in place
+/// "Quiet fleet" v4.4 sidebar rail: **one** list of projects in the order the
+/// user stored them, with the active project expanded in place — wherever it
+/// sits — and every other project a compact one-line row that can be expanded
 /// without stealing focus.
+///
+/// v1.1.8 removed the pinned-on-top information architecture. Pinning the
+/// active project meant activating a project *moved* it, so the rail rearranged
+/// itself under the pointer on the single most common action in the app and the
+/// spatial memory the stored order exists to give you was destroyed by using
+/// it. Activation now changes exactly two things: which row wears the tinted
+/// capsule, and which row is expanded. Nothing moves. There is no second
+/// section and therefore no "Projects" label above one — a single unbroken list
+/// needs no heading, and the column already announces itself to assistive
+/// technology through the List's own accessibility label.
 ///
 /// Row grammar is unchanged: identity mark · title · time-in-state · dot at the
 /// right edge, and idle rows draw no dot.
@@ -74,30 +83,25 @@ struct QuietProjectRail: View {
 
     var body: some View {
         let projects = model.projects
-        let active = projects.first { isActiveProject($0.id) }
-        let others = projects.filter { $0.id != active?.id }
         Group {
-            if let active {
-                group(active, placement: .pinned)
+            ForEach(projects) { project in
+                group(
+                    project,
+                    placement: isActiveProject(project.id) ? .active : .compact
+                )
             }
-            if !others.isEmpty {
-                QuietSectionLabel(title: "Projects")
-                ForEach(others) { project in
-                    group(project, placement: .compact)
-                }
-                // Drag reorder still writes the persisted project order, but the
-                // list being dragged no longer contains the active project, so
-                // the indices are mapped back through `QuietRailOrder`.
-                .onMove { indices, target in
-                    guard let from = indices.first,
-                          let move = QuietRailOrder.moveIndex(
-                              activeID: active?.id,
-                              orderedIDs: projects.map(\.id),
-                              from: from,
-                              to: target
-                          ) else { return }
-                    model.moveProject(id: move.id, toIndex: move.toIndex)
-                }
+            // The dragged list IS the persisted list now, so the drag offsets
+            // need no remapping around a pinned row — `QuietRailOrder` is down
+            // to translating SwiftUI's before-the-move `toOffset` into the
+            // after-the-removal index the store inserts at.
+            .onMove { indices, target in
+                guard let from = indices.first,
+                      let move = QuietRailOrder.moveIndex(
+                          orderedIDs: projects.map(\.id),
+                          from: from,
+                          to: target
+                      ) else { return }
+                model.moveProject(id: move.id, toIndex: move.toIndex)
             }
         }
         .onReceive(tick) { now = $0 }
@@ -124,11 +128,18 @@ struct QuietProjectRail: View {
     }
 }
 
-// MARK: - Compact-list drag mapping
+// MARK: - Project drag mapping
 
-/// Maps a drag in the compact project list (which excludes the pinned active
-/// project) onto the index `AppModel.moveProject(id:toIndex:)` expects in the
-/// *persisted* order. Pure so the arithmetic can be tested without a list.
+/// Maps a drag in the project list onto the index
+/// `AppModel.moveProject(id:toIndex:)` expects. Pure so the arithmetic can be
+/// tested without a list.
+///
+/// This used to carry a *pinned offset*: the rail rendered the active project
+/// on its own above a compact list that excluded it, so every drag index had to
+/// be projected out of that shortened list and back into the persisted order,
+/// with a special case for "dropped at the top of a list whose top is not the
+/// top of the store". v1.1.8 renders one list in stored order, so the mapping is
+/// direct and that entire class of off-by-one is gone rather than tested for.
 enum QuietRailOrder {
     struct Move: Equatable {
         let id: String
@@ -136,36 +147,21 @@ enum QuietRailOrder {
     }
 
     /// - Parameters:
-    ///   - activeID: the pinned project, absent from the dragged list.
-    ///   - orderedIDs: the full persisted project order.
-    ///   - from: source index in the compact list (SwiftUI `onMove` offsets).
-    ///   - to: destination index in the compact list, before the move.
-    /// - Returns: the project to move and its destination in the full order, or
-    ///   `nil` when the drag is a no-op or out of range.
-    static func moveIndex(activeID: String?, orderedIDs: [String], from: Int, to: Int) -> Move? {
-        var compact = orderedIDs.filter { $0 != activeID }
-        guard from >= 0, from < compact.count else { return nil }
-        let destination = max(0, min(to, compact.count))
-        // SwiftUI's `toOffset` is measured before the removal; a drop onto the
-        // row's own slot (or immediately after it) changes nothing.
+    ///   - orderedIDs: the persisted project order, which is also what is drawn.
+    ///   - from: source index (SwiftUI `onMove` offsets).
+    ///   - to: destination index, measured *before* the row is removed.
+    /// - Returns: the project to move and its destination index in the order
+    ///   with that project taken out — which is what the store's
+    ///   remove-then-insert wants — or `nil` for a no-op or out-of-range drag.
+    static func moveIndex(orderedIDs: [String], from: Int, to: Int) -> Move? {
+        guard from >= 0, from < orderedIDs.count else { return nil }
+        let destination = max(0, min(to, orderedIDs.count))
+        // SwiftUI's `toOffset` is measured before the removal, so a drop past
+        // the row's own slot lands one index lower once it is taken out; a drop
+        // onto its own slot (or immediately after it) changes nothing.
         let landed = destination > from ? destination - 1 : destination
         guard landed != from else { return nil }
-        let movedID = compact[from]
-        compact.move(fromOffsets: IndexSet(integer: from), toOffset: destination)
-
-        // The persisted store moves a project by remove-then-insert, so the
-        // destination index is measured against the order with the dragged
-        // project taken out. Anchoring on the row it landed behind keeps the
-        // pinned project wherever it already sat.
-        let rest = orderedIDs.filter { $0 != movedID }
-        guard landed > 0, landed - 1 < compact.count,
-              let predecessorIndex = rest.firstIndex(of: compact[landed - 1]) else {
-            // Dropped at the top of the *compact* list. The pinned project is
-            // not part of that list, so it keeps its stored slot and the row
-            // lands in the first slot the pinned project does not occupy.
-            return Move(id: movedID, toIndex: rest.firstIndex { $0 != activeID } ?? 0)
-        }
-        return Move(id: movedID, toIndex: predecessorIndex + 1)
+        return Move(id: orderedIDs[from], toIndex: landed)
     }
 }
 
@@ -177,7 +173,6 @@ enum QuietRailOrder {
 private enum QuietRailMetrics {
     static let headerText: CGFloat = 13
     static let titleText: CGFloat = 13
-    static let sectionText: CGFloat = 11
     static let secondaryText: CGFloat = 10.5
     static let chevronText: CGFloat = 9
     static let plusText: CGFloat = 10
@@ -229,7 +224,7 @@ private enum QuietRailMetrics {
     /// pointer is travelling *to* can be removed before it arrives.
     static let hoverGrace: Double = 0.12
     static let pulseDuration: Double = 1.4
-    /// The trailing slot the pinned header's `+` menu occupies.
+    /// The trailing slot the active header's `+` menu occupies.
     ///
     /// Reserved whether or not the menu is drawn. It used to be a plain sibling
     /// of a `maxWidth: .infinity` button, so the button claimed the whole row
@@ -251,7 +246,7 @@ private enum QuietRailMetrics {
 /// lane that could not be compressed, leaving a 200pt sidebar's title 56pt —
 /// seven characters. Stating the budget as arithmetic gives that a test.
 enum QuietRowBudget {
-    /// Leading inset of a project row (pinned header or compact row).
+    /// Leading inset of a project row (active header or compact row).
     static let projectIndent: CGFloat = QuietRailMetrics.horizontalInset
     /// Leading inset of a surface row (session, chat, mesh) and of the rail's
     /// "New session" / "No activity yet" rows, which share the same column.
@@ -262,7 +257,7 @@ enum QuietRowBudget {
     /// drift back together the next time the title lane needs points.
     static var indentStep: CGFloat { sessionIndent - projectIndent }
 
-    /// The slot the pinned project header reserves at its trailing edge for the
+    /// The slot the active project header reserves at its trailing edge for the
     /// `+` menu, and how far that slot sits in from the row's own edge.
     ///
     /// Exposed because the bug was geometric, not visual: the `+` used to be a
@@ -299,30 +294,13 @@ enum QuietRowBudget {
     }
 }
 
+/// How a project row is drawn. NOT where it sits — v1.1.8 decoupled those: the
+/// active project is drawn `.active` in whatever slot the stored order gives it.
 private enum QuietProjectPlacement {
-    /// The active project, pinned to the top of the rail with its surfaces.
-    case pinned
-    /// Any other project, one compact line under the "Projects" label.
+    /// The project you are in: expanded, with its surfaces, on a tinted capsule.
+    case active
+    /// Any other project: one compact line, expandable in place.
     case compact
-}
-
-/// Sentence-case section divider between the pinned project and the rest.
-private struct QuietSectionLabel: View {
-    let title: String
-
-    var body: some View {
-        Text(title)
-            .font(.system(size: QuietRailMetrics.sectionText, weight: .semibold))
-            .foregroundStyle(.tertiary)
-            .padding(.top, 14)
-            .padding(.leading, 10)
-            .padding(.bottom, 5)
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .accessibilityAddTraits(.isHeader)
-            .listRowInsets(QuietRailMetrics.listRowBleed)
-            .listRowSeparator(.hidden)
-            .listRowBackground(Color.clear)
-    }
 }
 
 /// A project's leading mark: the stacked-tile glyph the v4 mock uses, in the
@@ -330,11 +308,11 @@ private struct QuietSectionLabel: View {
 /// session titles start on two consistent columns.
 ///
 /// Deliberately not `folder`/`folder.fill`: a folder reads as a *file system*
-/// row, and the rail's projects are workspaces. Only the pinned project's mark
+/// row, and the rail's projects are workspaces. Only the active project's mark
 /// carries the project tint — every other row's mark stays neutral so the tint
 /// means "this is the project you are in" rather than "this is a project".
 private struct QuietProjectMarkView: View {
-    /// `nil` for a compact (non-pinned) row.
+    /// `nil` for a compact (non-active) row.
     let tint: Color?
 
     var body: some View {
@@ -380,7 +358,7 @@ private struct QuietProjectGroup: View {
     @State private var manualOrder: [String] = []
     @State private var loadedOrder = false
 
-    private var isActive: Bool { placement == .pinned }
+    private var isActive: Bool { placement == .active }
 
     /// Hover is a property of the whole *group*, not of one row: the pointer
     /// travels across sibling rows on its way to the header's chrome, and a
@@ -438,7 +416,7 @@ private struct QuietProjectGroup: View {
     private func header(statuses: [String: QuietSessionStatus]) -> some View {
         Group {
             switch placement {
-            case .pinned: pinnedHeader(statuses: statuses)
+            case .active: activeHeader(statuses: statuses)
             case .compact: compactRow(statuses: statuses)
             }
         }
@@ -452,7 +430,7 @@ private struct QuietProjectGroup: View {
         for (id, status) in statuses { note(id, status) }
     }
 
-    /// The pinned (active) project, drawn on its own tinted glass capsule.
+    /// The active project, drawn on its own tinted glass capsule *in place*.
     ///
     /// This is the one place in the rail where colour is *identity* rather than
     /// status, and it is deliberate: the capsule is what says "this is the
@@ -461,7 +439,7 @@ private struct QuietProjectGroup: View {
     /// `QuietActiveGlass`) — restrained enough that the status dots two columns
     /// over still read first. Name and mark keep the same tint, so the row is
     /// one object rather than a coloured box with grey contents.
-    private func pinnedHeader(statuses: [String: QuietSessionStatus]) -> some View {
+    private func activeHeader(statuses: [String: QuietSessionStatus]) -> some View {
         // Spacing 0: the `+` slot below carries its own trailing inset, and a
         // stack gap on top of it would push the menu back out of the row.
         HStack(spacing: 0) {
@@ -614,8 +592,10 @@ private struct QuietProjectGroup: View {
 
     private var tint: Color { ProjectTint.color(project.colorHex) ?? WorkspacePalette.project }
 
-    /// Activating re-pins the project at the top of the rail; opening it there
-    /// collapsed would hide the surfaces the click was asking for.
+    /// Activation moves nothing. The row keeps its slot in the stored order and
+    /// simply becomes the one wearing the tinted capsule — v1.1.8's whole point.
+    /// It does expand: a project opened collapsed would hide the surfaces the
+    /// click was asking for.
     private func activate() {
         if !isActive { model.activateProject(id: project.id) }
         if !isExpanded {
@@ -640,7 +620,7 @@ private struct QuietProjectGroup: View {
     // The hover-revealed "New session" ghost row is gone (v1.1.7). A row that
     // appears under the pointer whenever it crosses the group is a row that
     // pops at the user, and it was the rail's last piece of resting chrome.
-    // Creation keeps four doors that do not move: the pinned header's `+` menu,
+    // Creation keeps four doors that do not move: the active header's `+` menu,
     // the project and session context menus, the File menu (⌘T), and the
     // command palette.
 
@@ -1122,7 +1102,7 @@ private struct QuietSurfaceRowView: View {
     let tooltip: String
     /// Reports this row's hover into its project group's shared `hovering`
     /// flag (see `setHover`), which is what keeps the header's hover-only
-    /// chevron and "+" menu (`pinnedHeader`/`compactRow`) visible while the
+    /// chevron and "+" menu (`activeHeader`/`compactRow`) visible while the
     /// pointer is anywhere among the group's rows, not just resting on the
     /// header itself.
     let groupHover: (Bool) -> Void

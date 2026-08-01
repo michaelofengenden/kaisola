@@ -547,78 +547,96 @@ final class QuietIdentityMarkTests: XCTestCase {
         XCTAssertGreaterThan(QuietActiveGlass.highlightFalloff, 0)
     }
 
-    // MARK: - Compact-list drag mapping
+    // MARK: - Project drag mapping
 
-    func testDragToTopOfTheCompactListLandsBelowThePinnedProject() {
-        // Rail shows: A (pinned, store index 0) then B, C, D. Dragging D to the
-        // top of the compact list must leave the compact order D, B, C without
-        // displacing A from the slot it holds in the persisted order.
-        let move = QuietRailOrder.moveIndex(activeID: "A", orderedIDs: ["A", "B", "C", "D"], from: 2, to: 0)
-        XCTAssertEqual(move, QuietRailOrder.Move(id: "D", toIndex: 1))
+    /// v1.1.8 deleted the pinned-on-top rail, and with it the pinned OFFSET the
+    /// old mapping carried: the dragged list is now the persisted list, so the
+    /// only translation left is SwiftUI's own before-the-move `toOffset` into
+    /// the after-the-removal index `NativeSessionStore.moveProject` inserts at.
+    ///
+    /// The whole point of the simplification is that the active project no
+    /// longer participates in the arithmetic at all, so these cases no longer
+    /// mention it — which is exactly why the reorder can no longer depend on
+    /// which project happens to be active.
+    func testDragToTopLandsAtIndexZero() {
+        XCTAssertEqual(
+            QuietRailOrder.moveIndex(orderedIDs: ["A", "B", "C", "D"], from: 3, to: 0),
+            QuietRailOrder.Move(id: "D", toIndex: 0)
+        )
     }
 
-    func testDragToTopTakesSlotZeroWhenThePinnedProjectIsNotThere() {
-        // Store order B, A, C, D with A active: the first compact slot *is*
-        // store index 0, so a compact-top drop lands there.
-        let move = QuietRailOrder.moveIndex(activeID: "A", orderedIDs: ["B", "A", "C", "D"], from: 2, to: 0)
-        XCTAssertEqual(move, QuietRailOrder.Move(id: "D", toIndex: 0))
+    /// SwiftUI measures `toOffset` before the row leaves, so a downward drag
+    /// lands one index lower once it does. Getting this backwards is the classic
+    /// off-by-one, and it shows up as a row that refuses to move past its
+    /// neighbour.
+    func testDraggingDownAccountsForTheRowLeavingItsOwnSlot() {
+        XCTAssertEqual(
+            QuietRailOrder.moveIndex(orderedIDs: ["A", "B", "C", "D"], from: 0, to: 2),
+            QuietRailOrder.Move(id: "A", toIndex: 1)
+        )
+        XCTAssertEqual(
+            QuietRailOrder.moveIndex(orderedIDs: ["A", "B", "C", "D"], from: 0, to: 4),
+            QuietRailOrder.Move(id: "A", toIndex: 3)
+        )
     }
 
-    /// The mapping is only correct if the store's remove-then-insert really
-    /// reproduces the dragged compact order *and* leaves the pinned project put.
-    func testDragToTopKeepsThePinnedProjectAtItsStoredIndex() {
-        let ordered = ["A", "B", "C", "D"]
-        guard let move = QuietRailOrder.moveIndex(activeID: "A", orderedIDs: ordered, from: 2, to: 0) else {
-            return XCTFail("expected a move")
-        }
-        var stored = ordered
-        let from = stored.firstIndex(of: move.id)!
-        let clamped = max(0, min(move.toIndex, stored.count - 1))
-        stored.insert(stored.remove(at: from), at: clamped)
-        XCTAssertEqual(stored, ["A", "D", "B", "C"])
-        XCTAssertEqual(stored.firstIndex(of: "A"), 0)
-        XCTAssertEqual(stored.filter { $0 != "A" }, ["D", "B", "C"])
-    }
-
-    func testDragMapsThroughAnActiveProjectHeldInTheMiddleOfTheStoreOrder() {
-        // Store order B, A, C, D with A active: the compact list is B, C, D.
-        // Dragging B to the end must land B last in the store order too.
-        let move = QuietRailOrder.moveIndex(activeID: "A", orderedIDs: ["B", "A", "C", "D"], from: 0, to: 3)
-        XCTAssertEqual(move, QuietRailOrder.Move(id: "B", toIndex: 3))
-    }
-
-    func testDragOneStepDownSkipsThePinnedProject() {
-        // Compact list B, C, D; move B below C.
-        let move = QuietRailOrder.moveIndex(activeID: "A", orderedIDs: ["A", "B", "C", "D"], from: 0, to: 2)
-        XCTAssertEqual(move, QuietRailOrder.Move(id: "B", toIndex: 2))
+    func testDraggingUpUsesTheOffsetAsGiven() {
+        XCTAssertEqual(
+            QuietRailOrder.moveIndex(orderedIDs: ["A", "B", "C", "D"], from: 3, to: 1),
+            QuietRailOrder.Move(id: "D", toIndex: 1)
+        )
     }
 
     func testNoOpDragsAreIgnored() {
-        XCTAssertNil(QuietRailOrder.moveIndex(activeID: "A", orderedIDs: ["A", "B", "C"], from: 0, to: 0))
-        XCTAssertNil(QuietRailOrder.moveIndex(activeID: "A", orderedIDs: ["A", "B", "C"], from: 0, to: 1))
+        XCTAssertNil(QuietRailOrder.moveIndex(orderedIDs: ["A", "B", "C"], from: 0, to: 0))
+        XCTAssertNil(QuietRailOrder.moveIndex(orderedIDs: ["A", "B", "C"], from: 0, to: 1))
+        XCTAssertNil(QuietRailOrder.moveIndex(orderedIDs: ["A", "B", "C"], from: 2, to: 3))
     }
 
     func testOutOfRangeDragsAreIgnored() {
-        XCTAssertNil(QuietRailOrder.moveIndex(activeID: "A", orderedIDs: ["A", "B"], from: 4, to: 0))
-        XCTAssertNil(QuietRailOrder.moveIndex(activeID: "A", orderedIDs: [], from: 0, to: 0))
+        XCTAssertNil(QuietRailOrder.moveIndex(orderedIDs: ["A", "B"], from: 4, to: 0))
+        XCTAssertNil(QuietRailOrder.moveIndex(orderedIDs: ["A", "B"], from: -1, to: 0))
+        XCTAssertNil(QuietRailOrder.moveIndex(orderedIDs: [], from: 0, to: 0))
     }
 
-    func testWithoutAnActiveProjectTheCompactListIsTheStoreOrder() {
-        let move = QuietRailOrder.moveIndex(activeID: nil, orderedIDs: ["A", "B", "C"], from: 2, to: 0)
-        XCTAssertEqual(move, QuietRailOrder.Move(id: "C", toIndex: 0))
-    }
+    /// The mapping is only correct if the store's remove-then-insert reproduces
+    /// the order the user dragged. Run every drag in a four-project rail through
+    /// both, and require them to agree — which is the property, rather than a
+    /// handful of cases that happen to be right.
+    func testMappedIndexReproducesTheDraggedOrderForEveryDrag() {
+        let ordered = ["A", "B", "C", "D"]
+        for from in ordered.indices {
+            for to in 0...ordered.count {
+                // What SwiftUI's own list would show after the drop.
+                var dragged = ordered
+                dragged.move(fromOffsets: IndexSet(integer: from), toOffset: to)
 
-    /// The rail's mapping must agree with `NativeSessionStore.moveProject`'s
-    /// remove-then-insert, so the resulting compact list is what was dragged.
-    func testMappedIndexReproducesTheDraggedCompactOrder() {
-        let ordered = ["B", "A", "C", "D"]
-        guard let move = QuietRailOrder.moveIndex(activeID: "A", orderedIDs: ordered, from: 0, to: 3) else {
-            return XCTFail("expected a move")
+                guard let move = QuietRailOrder.moveIndex(orderedIDs: ordered, from: from, to: to) else {
+                    XCTAssertEqual(dragged, ordered, "a no-op mapping for a drag that moved something")
+                    continue
+                }
+                // What the store does with the mapped index.
+                var stored = ordered
+                let index = stored.firstIndex(of: move.id)!
+                let clamped = max(0, min(move.toIndex, stored.count - 1))
+                stored.insert(stored.remove(at: index), at: clamped)
+
+                XCTAssertEqual(stored, dragged, "drag \(from) → \(to) disagreed with the store")
+            }
         }
-        var stored = ordered
-        let from = stored.firstIndex(of: move.id)!
-        let clamped = max(0, min(move.toIndex, stored.count - 1))
-        stored.insert(stored.remove(at: from), at: clamped)
-        XCTAssertEqual(stored.filter { $0 != "A" }, ["C", "D", "B"])
+    }
+
+    /// The regression this release is FOR: activating a project must not move
+    /// it. The rail renders `model.projects` in order and decides the tinted
+    /// capsule per row, so the order the user sees cannot be a function of which
+    /// project is active — there is no longer any code path by which it could
+    /// be. `QuietRailOrder` no longer takes an `activeID` at all, and that
+    /// signature is the guarantee.
+    func testReorderingIsIndependentOfWhichProjectIsActive() {
+        let ordered = ["A", "B", "C", "D"]
+        // The same drag, and there is exactly one answer for it — not one per
+        // possible active project, which is what the pinned rail had.
+        let move = QuietRailOrder.moveIndex(orderedIDs: ordered, from: 3, to: 1)
+        XCTAssertEqual(move, QuietRailOrder.Move(id: "D", toIndex: 1))
     }
 }

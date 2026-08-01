@@ -211,6 +211,61 @@ final class GitPanelModel: ObservableObject {
         }
     }
 
+    func stageAll() {
+        perform { try $0.stageAll(); return try $0.status() } apply: {
+            self.status = $0
+            self.diffs.removeAll()
+            self.diffRequests.removeAll()
+        }
+    }
+
+    func unstageAll() {
+        perform { try $0.unstageAll(); return try $0.status() } apply: {
+            self.status = $0
+            self.diffs.removeAll()
+            self.diffRequests.removeAll()
+        }
+    }
+
+    var canPull: Bool {
+        !isBusy
+            && prPlan == nil
+            && status?.isClean == true
+            && prPrepInfo?.hasUpstream == true
+    }
+
+    var pullHelp: String {
+        if isBusy { return "Wait for the current Git operation to finish" }
+        if prPlan != nil { return "Finish or cancel the pull request review before pulling" }
+        if status?.isClean != true { return "Commit or discard local changes before pulling" }
+        if prPrepInfo?.hasUpstream != true { return "Set an upstream branch before pulling" }
+        return "Fetch and fast-forward the current branch without creating a merge commit"
+    }
+
+    func pull() {
+        guard canPull else { return }
+        perform { service in
+            let changed = try service.pullFastForward()
+            return GitPullOutcome(
+                changed: changed,
+                status: try service.status(),
+                prep: try? service.prPrep()
+            )
+        } apply: { outcome in
+            self.status = outcome.status
+            self.prPrepInfo = outcome.prep
+            if outcome.changed {
+                self.diffs.removeAll()
+                self.diffRequests.removeAll()
+                self.log.removeAll()
+            }
+            ToastCenter.shared.show(
+                outcome.changed ? "Pulled latest changes" : "Already up to date",
+                style: outcome.changed ? .success : .info
+            )
+        }
+    }
+
     func commit() {
         let message = commitMessage
         perform { (try $0.commit(message: message), try $0.status(), try? $0.prPrep()) } apply: {
@@ -415,6 +470,12 @@ private struct GitRefreshSnapshot: Sendable {
     let diffs: [String: String]
 }
 
+private struct GitPullOutcome: Sendable {
+    let changed: Bool
+    let status: GitService.Status
+    let prep: GitService.PRPrep?
+}
+
 /// The terminal outcome of a one-click Create-PR run, carried back across the
 /// actor boundary with a fresh status/prep snapshot so the panel updates in one
 /// step.
@@ -500,9 +561,19 @@ struct GitPanelView: View {
             if let s = model.status, s.ahead > 0 { Text("↑\(s.ahead)").font(.caption).foregroundStyle(.secondary) }
             if let s = model.status, s.behind > 0 { Text("↓\(s.behind)").font(.caption).foregroundStyle(.secondary) }
             Spacer()
+            Button(action: model.pull) {
+                Label("Pull", systemImage: "arrow.down.circle")
+                    .font(.caption)
+            }
+            .buttonStyle(.borderless)
+            .disabled(!model.canPull)
+            .help(model.pullHelp)
+            .accessibilityIdentifier("git.pull")
             Button(action: model.refresh) { Image(systemName: "arrow.clockwise") }
                 .buttonStyle(.borderless)
                 .disabled(model.isBusy)
+                .help("Refresh Git status")
+                .accessibilityLabel("Refresh Git status")
         }
         .padding(.horizontal, 14)
         .frame(height: 42)
@@ -519,6 +590,7 @@ struct GitPanelView: View {
         } else {
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: 4) {
+                    bulkActions(status)
                     fileSection("Staged", status.staged.map { ($0.path, $0.code) }, action: "Unstage", staged: true) { model.unstage($0) }
                     fileSection("Changes", status.unstaged.map { ($0.path, $0.code) }, action: "Stage", staged: false, restorable: true) { model.stage($0) }
                     fileSection("Untracked", status.untracked.map { ($0, "?") }, action: "Stage", staged: false) { model.stage($0) }
@@ -537,6 +609,33 @@ struct GitPanelView: View {
             }
             .padding(12)
         }
+    }
+
+    @ViewBuilder
+    private func bulkActions(_ status: GitService.Status) -> some View {
+        HStack(spacing: 12) {
+            if !status.staged.isEmpty {
+                Button {
+                    model.unstageAll()
+                } label: {
+                    Label("Unstage All", systemImage: "minus.circle")
+                }
+                .accessibilityIdentifier("git.unstageAll")
+            }
+            if !status.unstaged.isEmpty || !status.untracked.isEmpty {
+                Button {
+                    model.stageAll()
+                } label: {
+                    Label("Stage All", systemImage: "plus.circle")
+                }
+                .accessibilityIdentifier("git.stageAll")
+            }
+            Spacer()
+        }
+        .font(.caption)
+        .buttonStyle(.borderless)
+        .disabled(model.isBusy)
+        .padding(.bottom, 2)
     }
 
     @ViewBuilder

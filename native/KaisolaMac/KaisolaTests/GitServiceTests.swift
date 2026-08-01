@@ -304,6 +304,104 @@ final class GitServiceTests: XCTestCase {
         XCTAssertEqual(try service.log(limit: 5).first?.subject, "add a")
     }
 
+    func testStageAllAndUnstageAllRoundTripEveryChangeKind() throws {
+        try write("modified.txt", "before\n")
+        try write("deleted.txt", "delete me\n")
+        try git(["add", "."])
+        try git(["commit", "-q", "-m", "base"])
+
+        try write("modified.txt", "after\n")
+        try FileManager.default.removeItem(at: repo.appendingPathComponent("deleted.txt"))
+        try write("untracked.txt", "new\n")
+
+        let service = GitService(repoRoot: repo)
+        try service.stageAll()
+        let staged = try service.status()
+        XCTAssertEqual(Set(staged.staged.map(\.path)), ["modified.txt", "deleted.txt", "untracked.txt"])
+        XCTAssertTrue(staged.unstaged.isEmpty)
+        XCTAssertTrue(staged.untracked.isEmpty)
+
+        try service.unstageAll()
+        let unstaged = try service.status()
+        XCTAssertTrue(unstaged.staged.isEmpty)
+        XCTAssertEqual(Set(unstaged.unstaged.map(\.path)), ["modified.txt", "deleted.txt"])
+        XCTAssertEqual(unstaged.untracked, ["untracked.txt"])
+    }
+
+    func testUnstageAllSupportsAnUnbornRepositoryWithoutDeletingFiles() throws {
+        try write("first.txt", "still here\n")
+        let service = GitService(repoRoot: repo)
+        try service.stageAll()
+        XCTAssertEqual(try service.status().staged.map(\.path), ["first.txt"])
+
+        try service.unstageAll()
+        let status = try service.status()
+        XCTAssertTrue(status.staged.isEmpty)
+        XCTAssertEqual(status.untracked, ["first.txt"])
+        XCTAssertEqual(
+            try String(contentsOf: repo.appendingPathComponent("first.txt"), encoding: .utf8),
+            "still here\n"
+        )
+    }
+
+    func testPullFastForwardUpdatesFromConfiguredUpstreamWithoutMergeCommit() throws {
+        try write("base.txt", "base\n")
+        try git(["add", "base.txt"])
+        try git(["commit", "-q", "-m", "base"])
+
+        let remote = FileManager.default.temporaryDirectory
+            .appendingPathComponent("kaisola-remote-\(UUID().uuidString.prefix(8)).git", isDirectory: true)
+        let publisher = FileManager.default.temporaryDirectory
+            .appendingPathComponent("kaisola-publisher-\(UUID().uuidString.prefix(8))", isDirectory: true)
+        defer {
+            try? FileManager.default.removeItem(at: publisher)
+            try? FileManager.default.removeItem(at: remote)
+        }
+        try git(["clone", "-q", "--bare", repo.path, remote.path])
+        try git(["remote", "add", "origin", remote.path])
+        try git(["fetch", "-q", "origin"])
+        try git(["branch", "--set-upstream-to=origin/main", "main"])
+        try git(["clone", "-q", remote.path, publisher.path])
+        try git(["config", "user.email", "publisher@example.com"], at: publisher)
+        try git(["config", "user.name", "Publisher"], at: publisher)
+        try "remote change\n".write(
+            to: publisher.appendingPathComponent("remote.txt"),
+            atomically: true,
+            encoding: .utf8
+        )
+        try git(["add", "remote.txt"], at: publisher)
+        try git(["commit", "-q", "-m", "remote change"], at: publisher)
+        try git(["push", "-q", "origin", "main"], at: publisher)
+
+        let service = GitService(repoRoot: repo)
+        let before = try service.headOID()
+        XCTAssertTrue(try service.pullFastForward())
+        XCTAssertNotEqual(try service.headOID(), before)
+        XCTAssertEqual(
+            try String(contentsOf: repo.appendingPathComponent("remote.txt"), encoding: .utf8),
+            "remote change\n"
+        )
+        XCTAssertFalse(try service.pullFastForward())
+
+        // Once local and remote both advance, --ff-only must fail without
+        // synthesizing a merge commit or moving the local branch.
+        try write("local.txt", "local change\n")
+        try git(["add", "local.txt"])
+        try git(["commit", "-q", "-m", "local change"])
+        let divergentLocalHead = try service.headOID()
+        try "second remote change\n".write(
+            to: publisher.appendingPathComponent("remote-two.txt"),
+            atomically: true,
+            encoding: .utf8
+        )
+        try git(["add", "remote-two.txt"], at: publisher)
+        try git(["commit", "-q", "-m", "second remote change"], at: publisher)
+        try git(["push", "-q", "origin", "main"], at: publisher)
+
+        XCTAssertThrowsError(try service.pullFastForward())
+        XCTAssertEqual(try service.headOID(), divergentLocalHead)
+    }
+
     func testCommitWithNothingStagedFails() throws {
         try write("committed.txt", "x\n")
         try git(["add", "."]); try git(["commit", "-q", "-m", "init"])

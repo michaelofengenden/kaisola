@@ -12,6 +12,7 @@
 - Attention badges stay readable in light and dark mode, and status shapes no longer rely on color alone.
 - Reduce Motion now applies throughout the workspace and Settings; keyboard pane cycling also reaches Chat and Mesh composers.
 - Session status refreshes now share bounded process probes, and a noisy session helper can no longer stall app startup on a full output pipe.
+- Git can stage or unstage all changes at once and safely fast-forward a clean branch from its upstream.
 
 ## 1.1.7 — 2026-07-31
 

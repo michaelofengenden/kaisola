@@ -127,6 +127,35 @@ struct GitService: Sendable {
         _ = try run(["restore", "--staged", "--", path])
     }
 
+    /// Stage every tracked change, deletion, and untracked file under the
+    /// repository root. This changes only the index and is fully reversible by
+    /// `unstageAll()`.
+    func stageAll() throws {
+        _ = try run(["add", "--all", "--", "."])
+    }
+
+    /// Return the whole index to HEAD without touching working-tree bytes. An
+    /// unborn repository has no HEAD for `git restore --staged`; removing the
+    /// cached entries is the equivalent index-only operation there.
+    func unstageAll() throws {
+        do {
+            _ = try run(["restore", "--staged", "--", "."])
+        } catch let GitError.commandFailed(message) where message.contains("could not resolve HEAD") {
+            _ = try run(["rm", "--cached", "-r", "--", "."])
+        }
+    }
+
+    /// Fetch and update the checked-out branch only when Git can fast-forward.
+    /// The panel additionally requires a clean tree and configured upstream;
+    /// this service guard ensures no implicit merge commit is created even if
+    /// another caller invokes it directly. Returns whether HEAD moved.
+    @discardableResult
+    func pullFastForward() throws -> Bool {
+        let before = try headOID()
+        _ = try run(["pull", "--ff-only"])
+        return try headOID() != before
+    }
+
     @discardableResult
     func commit(message: String) throws -> String {
         let trimmed = message.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -368,6 +397,16 @@ struct GitService: Sendable {
         process.executableURL = URL(fileURLWithPath: "/usr/bin/git")
         process.arguments = arguments
         process.currentDirectoryURL = repoRoot
+        var environment = ProcessInfo.processInfo.environment
+        // A GUI operation must fail with an actionable error instead of
+        // waiting forever on an invisible credential or host-key prompt.
+        environment["GIT_TERMINAL_PROMPT"] = "0"
+        environment["GCM_INTERACTIVE"] = "Never"
+        environment["GIT_ASKPASS"] = "/usr/bin/false"
+        environment["SSH_ASKPASS"] = "/usr/bin/false"
+        environment["SSH_ASKPASS_REQUIRE"] = "never"
+        process.environment = environment
+        process.standardInput = FileHandle.nullDevice
         let capture: (out: Data, err: Data)
         do { capture = try GitProcessCapture.run(process) }
         catch { throw GitError.commandFailed(error.localizedDescription) }

@@ -183,21 +183,26 @@ Acceptance:
 
 ## PR 9 — Review and control workbench
 
-Turn the human review loop into a first-class project surface shared by Chat,
-Mesh, files, Git, and permissions.
+The project-level Git inspector now follows workspace and `.git` changes,
+supports per-file and all-file stage/unstage, and permits only clean-tree,
+upstream-backed fast-forward pulls. Pull-request creation is already split into
+review and execution, but its remote/destination disclosure still needs to join
+the remaining Chat/Mesh and permission review work.
 
-Scope:
+Completed scope:
+
+- Promote Git from a terminal-attached sheet into a project-level live
+  inspector driven by workspace and `.git` changes, with stage/unstage-all and
+  clean-tree, non-interactive fast-forward pull controls.
+
+Remaining scope:
 
 - Build one cached block-transcript renderer for Chat and Mesh with fenced,
   syntax-highlighted code, copy controls, tables, clickable file-and-line
   references, and expandable tool artifacts. Keep streaming updates bounded so
   a growing answer does not reparse the whole transcript on every token.
-- Promote Git from a terminal-attached sheet into a project-level live
-  inspector driven by workspace and `.git` changes. Add stage/unstage-all and
-  pull controls.
-- Replace the opaque “Push & Create PR” action with an explicit composer that
-  previews base, branch, commits, files, title, body, remote, and destination
-  before any push or PR creation.
+- Finish the two-step pull-request composer by adding the remote and destination
+  to its existing base, branch, commit, file-count, title, and body review.
 - Expand permission cards into a decision-grade inspector showing the raw
   command or resource, every affected path, and the exact scope of a proposed
   persistent rule. Preserve Deny, Allow Once, and Create Rule as distinct

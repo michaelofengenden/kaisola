@@ -26,8 +26,10 @@ Large product and architecture work remains ordered in
   AppKit's first responder, and transcript font, Clear, Jump to Bottom, and
   consented OSC 52 copy are implemented (`dd8097e`, `3365d32`, `bf733ad`,
   `fa44da2`, `facc171`, `d5d12d1`).
-- The Git panel refreshes from filesystem events and PR creation is split into
-  an inspectable review followed by explicit execution (`81a59cb`).
+- The Git panel refreshes from filesystem events, stages or unstages every
+  change in one reversible action, and fast-forwards only a clean branch with a
+  configured upstream. PR creation is split into an inspectable review followed
+  by explicit execution (`81a59cb`).
 - Status indicators expose shape and accessible names, and the user-facing copy
   pass removed several implementation terms (`50e00aa`, `949c4ef`).
 - Bounded PDF files now open in a native PDFKit surface with selection,

@@ -58,7 +58,7 @@ struct WorkspaceRestorationNoticeView: View {
                     .controlSize(.small)
                     .disabled(notice.isRetrying)
                     .accessibilityLabel("Retry Restore")
-                    .accessibilityHint("Read the saved workspace layout again")
+                    .accessibilityHint("Read the saved window layout again")
 
                     Button(notice.revealActionTitle) {
                         model.revealWorkspaceRestorationArchive()
@@ -87,7 +87,7 @@ struct WorkspaceRestorationNoticeView: View {
             }
             .buttonStyle(.borderless)
             .help("Collapse this notice")
-            .accessibilityLabel("Collapse Workspace Layout Notice")
+            .accessibilityLabel("Collapse Window Layout Notice")
         }
         .padding(12)
         .background(.regularMaterial, in: RoundedRectangle(cornerRadius: KaisolaVisualSystem.cardRadius))
@@ -118,6 +118,6 @@ struct WorkspaceRestorationNoticeView: View {
         }
         .buttonStyle(.plain)
         .accessibilityLabel(notice.summary)
-        .accessibilityHint("Show what happened to your saved workspace layout")
+        .accessibilityHint("Show what happened to your saved window layout")
     }
 }

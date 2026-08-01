@@ -10,6 +10,14 @@ struct RootShellView: View {
         !NativePreviewSettings.isIsolatedFixture(environment: environment)
     }
 
+    nonisolated static func shouldPresentOnboarding(
+        environment: [String: String],
+        defaults: UserDefaults = .standard
+    ) -> Bool {
+        !NativePreviewSettings.isIsolatedFixture(environment: environment)
+            && OnboardingState.shouldShow(defaults: defaults)
+    }
+
     @EnvironmentObject private var model: AppModel
     @EnvironmentObject private var settings: NativePreviewSettings
     @EnvironmentObject private var auth: AuthModel
@@ -27,6 +35,10 @@ struct RootShellView: View {
     @State private var showOnboarding = false
     @State private var showSettings = false
     @State private var settingsSectionID: String?
+    /// A Settings destination requested from the readiness sheet. Present it
+    /// only after that sheet has actually dismissed so SwiftUI never has to
+    /// arbitrate two simultaneous sheet presentations.
+    @State private var onboardingSettingsSectionID: String?
     @State private var quickActionsTarget: QuickActionsTarget?
     @State private var terminalTranscriptTarget: AppModel.TerminalTranscriptContext?
     @State private var terminalTranscriptOpenedFromLiveBoundary = false
@@ -212,7 +224,7 @@ struct RootShellView: View {
                     DispatchQueue.main.async {
                         terminalTranscriptTarget = model.terminalTranscriptContext(for: terminalID)
                     }
-                } else if OnboardingState.shouldShow() {
+                } else if Self.shouldPresentOnboarding(environment: environment) {
                     showOnboarding = true
                 }
             }
@@ -222,12 +234,13 @@ struct RootShellView: View {
                 ) else { return }
                 UsageCenter.shared.refreshPlanUsage(workspace: model.currentProjectDirectory)
             }
-            .sheet(isPresented: $showOnboarding) {
-                OnboardingView {
-                    OnboardingState.markSeen()
-                    showOnboarding = false
-                }
-                .frame(width: 640, height: 460)
+            .sheet(isPresented: $showOnboarding, onDismiss: presentOnboardingSettingsIfNeeded) {
+                OnboardingView(
+                    model: model,
+                    dismiss: { finishOnboarding() },
+                    openAccounts: { finishOnboarding(openingSettings: "accounts") },
+                    openUpdateSettings: { finishOnboarding(openingSettings: "general") }
+                )
             }
     }
 
@@ -323,7 +336,7 @@ struct RootShellView: View {
                     .accessibilityLabel("Command Palette")
                 Button(action: { settings.workspaceRailVisible.toggle() }) { EmptyView() }
                     .keyboardShortcut("b", modifiers: .command)
-                    .accessibilityLabel("Toggle Workspace Rail")
+                    .accessibilityLabel("Toggle Files")
                 // ⇧⌘B for the document column, beside ⌘B for the Files column —
                 // the two panels the detail chrome bar now toggles. Checked
                 // against every other binding in the app (the AppKit main menu
@@ -406,6 +419,19 @@ struct RootShellView: View {
         let shouldPresent = !showOmniBar
         showPalette = false
         showOmniBar = shouldPresent
+    }
+
+    private func finishOnboarding(openingSettings sectionID: String? = nil) {
+        OnboardingState.markSeen()
+        onboardingSettingsSectionID = sectionID
+        showOnboarding = false
+    }
+
+    private func presentOnboardingSettingsIfNeeded() {
+        guard let sectionID = onboardingSettingsSectionID else { return }
+        onboardingSettingsSectionID = nil
+        settingsSectionID = sectionID
+        showSettings = true
     }
 
     // MARK: - Layouts
@@ -1015,7 +1041,7 @@ struct RootShellView: View {
                 Label("New Mesh", systemImage: "circle.hexagongrid.fill")
             }
         } else {
-            Button("Folder unavailable") {}.disabled(true)
+            Button("Folder Unavailable") {}.disabled(true)
         }
     }
 
@@ -1467,7 +1493,7 @@ struct RootShellView: View {
         } description: {
             Text(model.controlAvailable
                 ? "Start a terminal, agent, chat, or Mesh run for this project."
-                : "Chats and Mesh are ready. The background terminal service is view-only right now, so new terminals are temporarily unavailable.")
+                : "Chats and Mesh are ready. Saved terminals are view-only right now, so new terminals are temporarily unavailable.")
         } actions: {
             HStack(spacing: 10) {
                 Button {
@@ -1476,7 +1502,7 @@ struct RootShellView: View {
                     Label("New Terminal", systemImage: "terminal")
                 }
                 .disabled(!model.controlAvailable)
-                .help(model.controlAvailable ? "Open a shell in the active project" : "New terminals are unavailable while the background terminal service is view-only")
+                .help(model.controlAvailable ? "Open a shell in the active project" : "New terminals are unavailable while saved sessions are view-only")
                 if let chatAgent {
                     Button {
                         RootShellView.promptForNewChat(chatAgent, model: model)
@@ -1506,7 +1532,7 @@ struct RootShellView: View {
                 Button("Try Again") {
                     Task { await model.retryMissingSession() }
                 }
-                Button("Back to Workspace") {
+                Button("Back to Main Window") {
                     model.dismissMissingSessionRecovery()
                 }
             }
@@ -4021,7 +4047,7 @@ private struct ConnectionFooter: View {
     /// The tooltip leads with the whole name whenever the chip is showing less
     /// than all of it, so the first-name label is never the only copy on screen.
     private var accountHelp: String {
-        let base = "Account and workspace settings"
+        let base = "Account and project settings"
         return displayedAccountName == accountName ? base : "\(accountName) — \(base)"
     }
 
@@ -4037,9 +4063,9 @@ private struct ConnectionFooter: View {
             }
             if newMesh != nil || newStagedMesh != nil || newIdeaMesh != nil {
                 Divider()
-                if let newMesh { Button("New Mesh (all agents)", action: newMesh) }
-                if let newStagedMesh { Button("New Staged Mesh (scout → execute)", action: newStagedMesh) }
-                if let newIdeaMesh { Button("New Idea Mesh (brainstorm)", action: newIdeaMesh) }
+                if let newMesh { Button("New Mesh (All Agents)", action: newMesh) }
+                if let newStagedMesh { Button("New Staged Mesh (Scout → Execute)", action: newStagedMesh) }
+                if let newIdeaMesh { Button("New Idea Mesh (Brainstorm)", action: newIdeaMesh) }
             }
             Divider()
             if let cost = UsageCenter.costAccessibilityLabel(usage.costTotals) {
@@ -4061,8 +4087,8 @@ private struct ConnectionFooter: View {
         .menuStyle(.borderlessButton)
         .menuIndicator(.hidden)
         .fixedSize()
-        .help("More workspace actions")
-        .accessibilityLabel("More workspace actions")
+        .help("More project actions")
+        .accessibilityLabel("More project actions")
     }
 
     private var accountMenu: some View {
@@ -4079,7 +4105,7 @@ private struct ConnectionFooter: View {
                 Button {
                     Task { await auth.signInWithGoogle() }
                 } label: {
-                    Label("Sign in with Google", systemImage: "person.crop.circle.badge.plus")
+                    Label("Sign In with Google", systemImage: "person.crop.circle.badge.plus")
                 }
                 .disabled(accountSignInIsRunning)
             }
@@ -4097,7 +4123,7 @@ private struct ConnectionFooter: View {
             Text("Kaisola v\(Self.appVersion)")
             Text(state.detail ?? state.title)
             if case .current = brokerUpgradeState {
-                Text("Background service is up to date")
+                Text("Terminal continuity is up to date")
             } else if case .unknown = brokerUpgradeState {
                 EmptyView()
             } else {

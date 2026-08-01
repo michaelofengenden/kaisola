@@ -40,20 +40,20 @@ final class AppModel: ObservableObject {
 
         var title: String {
             switch self {
-            case .looking: "Looking for the background service"
+            case .looking: "Finding saved sessions"
             case .connecting: "Connecting"
             case .reconnecting: "Reconnecting"
-            case .connected: "Connected"
-            case .unavailable: "Offline"
+            case .connected: "Sessions Ready"
+            case .unavailable: "Session Connection Unavailable"
             }
         }
 
         var detail: String? {
             switch self {
             case let .reconnecting(attempt):
-                "Attempt \(attempt) · running terminals keep going in the background"
-            case let .connected(version, pid, serverEnforced):
-                "Background service \(version) · PID \(pid) · \(serverEnforced ? "server-enforced observer" : "local observer policy")"
+                "Attempt \(attempt) · running terminals continue safely"
+            case let .connected(version, _, serverEnforced):
+                "Terminal continuity \(version) · \(serverEnforced ? "project isolation verified" : "read-only compatibility mode")"
             case let .unavailable(message): message
             default: nil
             }
@@ -2640,7 +2640,7 @@ final class AppModel: ObservableObject {
         ToastCenter.shared.show(
             readEmptyArchive
                 ? "Started a fresh layout — your damaged copy is kept beside it"
-                : "Restored your saved workspace layout",
+                : "Restored your saved window layout",
             style: .success
         )
     }
@@ -4211,7 +4211,7 @@ final class AppModel: ObservableObject {
                 sessionID: "create-unavailable",
                 message: connectionState.isConnected
                     ? "This terminal service is view-only right now, so new terminals are disabled. Chats and Mesh still work — they don't need it."
-                    : "Kaisola isn't connected to its background terminal service, so new terminals are disabled. Chats and Mesh still work without it."
+                    : "Kaisola isn't connected to saved terminal sessions, so new terminals are disabled. Chats and Mesh still work without that connection."
             ))
             return nil
         }
@@ -5276,7 +5276,7 @@ final class AppModel: ObservableObject {
                 reconcileAllPaneLayoutsWithAvailableSurfaces()
             }
             connectionState = .connected(
-                version: hello.version + (usingSeparateBroker ? " · separate background service" : ""),
+                version: hello.version + (usingSeparateBroker ? " · Kaisola-only continuity" : ""),
                 pid: hello.pid,
                 serverEnforcedObserver: hello.serverEnforcedObserver
             )

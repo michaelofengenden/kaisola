@@ -308,7 +308,12 @@ Acceptance:
 
 The immediate audit pass makes transient toasts VoiceOver-actionable and
 announced, adds Reduce Motion behavior to those toasts and onboarding, and
-improves terminal and permission labels. Complete the same floor app-wide.
+improves terminal and permission labels. First run is now an operational
+readiness checklist backed by live project, terminal-control, provider-account,
+and update state; Help opens a user guide with shortcuts and troubleshooting.
+User-facing buttons and project/session copy have also completed the Title Case,
+project-terminology, and implementation-jargon pass. Complete the same
+accessibility and command floor app-wide.
 
 Scope:
 
@@ -319,8 +324,6 @@ Scope:
 - Complete the menu/command registry work from PR 2, including palette button
   traits, shortcut parity, Mesh and Settings coverage, and standard macOS
   close/window behavior.
-- Replace feature-marketing onboarding and the migration-roadmap Help link with
-  an operational readiness checklist and real user troubleshooting.
 
 Acceptance:
 
@@ -336,7 +339,7 @@ The audit pass moves Unix socket work to dedicated queues, makes close wake
 blocked I/O, bounds Git branch probes, reconnects after repeated inventory
 failures, orders menu-window targeting, and cleans completed teardown tasks.
 Failed pop-out targets now retain a standard missing-session recovery card with
-Try Again and Back to Workspace instead of becoming blank windows. Finish the
+Try Again and Back to Main Window instead of becoming blank windows. Finish the
 remaining failure and scaling seams.
 
 Scope:

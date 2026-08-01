@@ -50,17 +50,17 @@ enum WorkspaceFileOperations {
         var errorDescription: String? {
             switch self {
             case .workspaceUnavailable:
-                return "The workspace folder is unavailable."
+                return "The project folder is unavailable."
             case .workspaceRoot:
-                return "The workspace folder itself can't be changed here."
+                return "The project folder itself can't be changed here."
             case .outsideWorkspace:
-                return "That item is outside the current workspace."
+                return "That item is outside the current project."
             case .symbolicLink:
-                return "Kaisola won't change a symbolic link from the workspace rail."
+                return "Kaisola won't change a symbolic link from Files."
             case .missingItem:
                 return "That item no longer exists."
             case .notDirectory:
-                return "Choose a folder inside the current workspace."
+                return "Choose a folder inside the current project."
             case .invalidName:
                 return "Enter a valid file or folder name."
             case .nameTooLong:

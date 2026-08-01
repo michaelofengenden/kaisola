@@ -607,14 +607,14 @@ actor AcpClient {
             : ((root as NSString).appendingPathComponent(raw) as NSString).standardizingPath
         let realRoot = URL(fileURLWithPath: root).resolvingSymlinksInPath().path
         guard Self.isContained(resolved, in: root) || Self.isContained(resolved, in: realRoot) else {
-            throw AcpClientError.requestFailed("Path escapes the session workspace")
+            throw AcpClientError.requestFailed("Path escapes the session project")
         }
         // Resolve symlinks through the NEAREST EXISTING ancestor, so neither an
         // existing symlinked file nor a not-yet-created file under a symlinked
         // parent (write path) can escape the workspace.
         let real = Self.realPathViaNearestExistingAncestor(resolved)
         guard Self.isContained(real, in: realRoot) else {
-            throw AcpClientError.requestFailed("Path escapes the session workspace")
+            throw AcpClientError.requestFailed("Path escapes the session project")
         }
         if mustExist, !FileManager.default.fileExists(atPath: real) {
             throw AcpClientError.requestFailed("No such path: \(resolved)")

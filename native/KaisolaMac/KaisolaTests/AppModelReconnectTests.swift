@@ -173,13 +173,18 @@ final class AppModelReconnectTests: XCTestCase {
             await fixture.client.connectionAttempts() >= 6
         }
 
-        // A broker that keeps refusing settles into one visible offline state;
+        // A session service that keeps refusing settles into one visible
+        // unavailable state;
         // the silent retries behind it must not strobe the UI through
-        // "Reconnecting" or repeated offline flips on every backoff cycle.
+        // "Reconnecting" or repeated unavailable flips on every backoff cycle.
         let attempts = await fixture.client.connectionAttempts()
         XCTAssertGreaterThanOrEqual(attempts, 6)
         XCTAssertEqual(transitions.filter { $0 == "Reconnecting" }.count, 0, "state churned: \(transitions)")
-        XCTAssertEqual(transitions.filter { $0 == "Offline" }.count, 1, "state churned: \(transitions)")
+        XCTAssertEqual(
+            transitions.filter { $0 == "Session Connection Unavailable" }.count,
+            1,
+            "state churned: \(transitions)"
+        )
         await fixture.model.disconnect()
     }
 

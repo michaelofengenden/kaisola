@@ -206,7 +206,7 @@ final class WorkspacePersistenceVisibilityTests: XCTestCase {
             notice.message.contains("aren't being saved"),
             "Saving works here: \(notice.message)"
         )
-        XCTAssertEqual(notice.summary, "Workspace layout not restored")
+        XCTAssertEqual(notice.summary, "Window layout not restored")
         XCTAssertEqual(
             notice.revealURL,
             archiveURL.deletingLastPathComponent(),
@@ -438,7 +438,7 @@ final class WorkspacePersistenceVisibilityTests: XCTestCase {
         XCTAssertNil(model.workspaceRestorationNotice)
         XCTAssertEqual(
             ToastCenter.shared.toasts.last?.message,
-            "Restored your saved workspace layout",
+            "Restored your saved window layout",
             "This retry really did read the user's repaired archive"
         )
     }

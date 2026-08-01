@@ -1,45 +1,233 @@
 import SwiftUI
 
-/// First-run welcome. A one-time, three-page pager that frames the product
-/// model — durable agents, chats/Mesh/guardrails, and native workspaces —
-/// before the user lands in an empty workspace. Shown once, gated by
-/// ``OnboardingState`` so it never re-appears after it's been seen.
-///
-/// The caller owns presentation and persistence: it presents this in a sheet
-/// and, on `dismiss`, records ``OnboardingState/markSeen(defaults:)`` and drops
-/// the sheet. Every exit path here — Continue past the last page, or Escape —
-/// funnels through `dismiss`, so "seen" is recorded however the user leaves.
-struct OnboardingView: View {
-    /// Close the welcome. The caller marks onboarding seen and drops the sheet.
-    let dismiss: () -> Void
-
-    @Environment(\.accessibilityReduceMotion) private var reduceMotion
-
-    @State private var index = 0
-    /// Slide direction for the page transition (forward on Continue, back on
-    /// Back) so the motion reads as paging rather than a crossfade.
-    @State private var forward = true
-
-    /// `@State private` would make the synthesized memberwise initializer
-    /// private, so an explicit initializer keeps `OnboardingView(dismiss:)`
-    /// callable from the shell that presents it.
-    init(dismiss: @escaping () -> Void) {
-        self.dismiss = dismiss
+/// A small value used by the first-run checklist and its focused tests. The
+/// symbol and text always accompany color so every state remains legible under
+/// VoiceOver, Increased Contrast, and color-vision differences.
+struct OnboardingReadinessStatus: Equatable, Sendable {
+    enum Kind: Equatable, Sendable {
+        case ready
+        case checking
+        case needsAction
+        case information
     }
 
-    private var pages: [OnboardingPage] { OnboardingPage.all }
-    private var isLastPage: Bool { index == pages.count - 1 }
+    let kind: Kind
+    let detail: String
+}
+
+/// Pure readiness decisions kept outside the view. The UI observes live app
+/// state, while tests can pin the important distinctions without launching a
+/// window or touching a real provider account.
+enum OnboardingReadiness {
+    static func project(directory: URL?) -> OnboardingReadinessStatus {
+        guard let directory else {
+            return .init(
+                kind: .needsAction,
+                detail: "Choose the project folder where your sessions should work."
+            )
+        }
+        return .init(
+            kind: .ready,
+            detail: "\(directory.lastPathComponent) is the active project."
+        )
+    }
+
+    static func terminalService(
+        connectionState: AppModel.ConnectionState,
+        controlAvailable: Bool
+    ) -> OnboardingReadinessStatus {
+        switch connectionState {
+        case .looking, .connecting:
+            return .init(kind: .checking, detail: "Connecting to saved terminal sessions…")
+        case let .reconnecting(attempt):
+            return .init(
+                kind: .checking,
+                detail: "Reconnect attempt \(attempt). Running terminals continue safely."
+            )
+        case .connected where controlAvailable:
+            return .init(
+                kind: .ready,
+                detail: "New terminals are enabled and running terminals can reconnect after Kaisola closes."
+            )
+        case .connected:
+            return .init(
+                kind: .needsAction,
+                detail: "Saved terminals are visible, but new terminal control is temporarily unavailable."
+            )
+        case let .unavailable(message):
+            return .init(kind: .needsAction, detail: message)
+        }
+    }
+
+    static func agentAccount(
+        agentID: String,
+        readings: [UsageCenter.ProviderPlanUsage],
+        isRefreshing: Bool
+    ) -> OnboardingReadinessStatus {
+        guard let provider = SessionAccountBinding.provider(forAgentID: agentID) else {
+            return .init(
+                kind: .ready,
+                detail: "A plain terminal does not require an agent account."
+            )
+        }
+        guard AcpAdapter.forAgent(agentID) != nil else {
+            return .init(
+                kind: .needsAction,
+                detail: "The \(provider.displayName) chat adapter is not configured."
+            )
+        }
+        if let reading = readings.first(where: { $0.provider == provider.rawValue }), reading.ok {
+            let account = reading.account?.trimmingCharacters(in: .whitespacesAndNewlines)
+            let detail: String
+            if let account, !account.isEmpty {
+                detail = "\(provider.displayName) is signed in as \(account)."
+            } else {
+                detail = "The \(provider.displayName) adapter and account are verified."
+            }
+            return .init(
+                kind: .ready,
+                detail: detail
+            )
+        }
+        if isRefreshing {
+            return .init(
+                kind: .checking,
+                detail: "Checking the active \(provider.displayName) account…"
+            )
+        }
+        return .init(
+            kind: .needsAction,
+            detail: "The adapter is ready, but the active \(provider.displayName) sign-in is not verified."
+        )
+    }
+
+    static func updates(
+        canConfigure: Bool,
+        checksAutomatically: Bool,
+        pendingVersion: String?
+    ) -> OnboardingReadinessStatus {
+        if let pendingVersion {
+            return .init(
+                kind: .needsAction,
+                detail: "Kaisola \(pendingVersion) is ready to install from Settings."
+            )
+        }
+        guard canConfigure else {
+            return .init(
+                kind: .information,
+                detail: "Update controls become available in a signed Kaisola build."
+            )
+        }
+        return checksAutomatically
+            ? .init(kind: .ready, detail: "Kaisola will check for signed updates automatically.")
+            : .init(kind: .needsAction, detail: "Automatic update checks are off.")
+    }
+}
+
+/// First-run setup is an operational checklist rather than a feature tour. It
+/// reflects the active project's real session-control and provider-account
+/// state, keeps failed checks actionable, and can launch the first session only
+/// when the project and terminal service are ready.
+struct OnboardingView: View {
+    @ObservedObject var model: AppModel
+    @ObservedObject private var usage = UsageCenter.shared
+    @ObservedObject private var updates = UpdateCenter.shared
+
+    let dismiss: () -> Void
+    let openAccounts: () -> Void
+    let openUpdateSettings: () -> Void
+
+    @State private var selectedAgentID = "codex"
+
+    private var launchChoices: [AgentProfile] {
+        [.shell] + AgentRegistry.builtIns.filter {
+            SessionAccountBinding.provider(forAgentID: $0.id) != nil
+        }
+    }
+
+    private var selectedAgent: AgentProfile {
+        launchChoices.first(where: { $0.id == selectedAgentID }) ?? .shell
+    }
+
+    private var projectStatus: OnboardingReadinessStatus {
+        OnboardingReadiness.project(directory: model.currentProjectDirectory)
+    }
+
+    private var terminalStatus: OnboardingReadinessStatus {
+        OnboardingReadiness.terminalService(
+            connectionState: model.connectionState,
+            controlAvailable: model.controlAvailable
+        )
+    }
+
+    private var accountStatus: OnboardingReadinessStatus {
+        OnboardingReadiness.agentAccount(
+            agentID: selectedAgentID,
+            readings: usage.planUsage,
+            isRefreshing: usage.isRefreshingPlanUsage
+        )
+    }
+
+    private var updateStatus: OnboardingReadinessStatus {
+        OnboardingReadiness.updates(
+            canConfigure: updates.canConfigureUpdates,
+            checksAutomatically: updates.automaticallyChecksForUpdates,
+            pendingVersion: updates.pendingUpdate?.version
+        )
+    }
+
+    private var canStart: Bool {
+        model.currentProjectDirectory != nil && model.controlAvailable
+    }
 
     var body: some View {
         VStack(spacing: 0) {
-            pager
+            ScrollView {
+                VStack(alignment: .leading, spacing: 20) {
+                    header
+
+                    VStack(spacing: 10) {
+                        readinessRow(
+                            title: "Project",
+                            symbol: "folder.fill",
+                            status: projectStatus,
+                            actionTitle: model.currentProjectDirectory == nil ? "Choose Project…" : nil,
+                            action: { RootShellView.promptForOpenFolder(model: model) }
+                        )
+                        readinessRow(
+                            title: "Terminal Continuity",
+                            symbol: "terminal.fill",
+                            status: terminalStatus,
+                            actionTitle: terminalStatus.kind == .needsAction ? "Try Again" : nil,
+                            action: { Task { await model.reload() } }
+                        )
+                        agentRow
+                        readinessRow(
+                            title: "Updates",
+                            symbol: "arrow.triangle.2.circlepath",
+                            status: updateStatus,
+                            actionTitle: updateStatus.kind == .ready ? nil : "Update Settings",
+                            action: openUpdateSettings
+                        )
+                    }
+
+                    if !canStart {
+                        Label(
+                            "Choose a project and restore terminal control before starting the first session.",
+                            systemImage: "info.circle"
+                        )
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    }
+                }
+                .padding(28)
+            }
+
             Divider()
             controls
         }
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .frame(minWidth: 660, idealWidth: 700, minHeight: 500, idealHeight: 540)
         .background(Color(nsColor: .windowBackgroundColor))
-        // Escape leaves onboarding (recorded as seen) from any page. Mirrors
-        // the shell's hidden-shortcut pattern so it never steals focus.
         .background(
             Button(action: dismiss) { EmptyView() }
                 .keyboardShortcut(.cancelAction)
@@ -47,242 +235,166 @@ struct OnboardingView: View {
                 .accessibilityHidden(true)
         )
         .accessibilityElement(children: .contain)
-        .accessibilityLabel("Welcome to Kaisola")
+        .accessibilityLabel("Kaisola readiness checklist")
     }
 
-    // MARK: - Pages
-
-    private var pager: some View {
-        ZStack {
-            pageView(pages[index])
-                .id(index)
-                .transition(pageTransition)
-        }
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .clipped()
-    }
-
-    private func pageView(_ page: OnboardingPage) -> some View {
-        VStack(spacing: 18) {
-            ZStack {
-                Circle()
-                    .fill(Color.accentColor.opacity(0.12))
-                    .frame(width: 84, height: 84)
-                Image(systemName: page.symbol)
-                    .font(.system(size: 40, weight: .regular))
-                    .foregroundStyle(Color.accentColor)
-                    .symbolRenderingMode(.hierarchical)
-            }
-            .accessibilityHidden(true)
-
-            VStack(spacing: 7) {
-                Text(page.title)
+    private var header: some View {
+        HStack(alignment: .top, spacing: 16) {
+            Image(systemName: "checklist.checked")
+                .font(.system(size: 30, weight: .medium))
+                .foregroundStyle(Color.accentColor)
+                .frame(width: 46, height: 46)
+                .background(Color.accentColor.opacity(0.12), in: RoundedRectangle(cornerRadius: 12))
+                .accessibilityHidden(true)
+            VStack(alignment: .leading, spacing: 5) {
+                Text("Get Ready to Work")
                     .font(.largeTitle.weight(.bold))
-                    .multilineTextAlignment(.center)
-                Text(page.subtitle)
+                Text("Confirm the essentials, then start a terminal or agent in your first project.")
                     .font(.title3)
                     .foregroundStyle(.secondary)
-                    .multilineTextAlignment(.center)
-                    .fixedSize(horizontal: false, vertical: true)
             }
-            .frame(maxWidth: 460)
-
-            VStack(alignment: .leading, spacing: 12) {
-                ForEach(page.features) { feature in
-                    featureRow(feature)
-                }
-            }
-            .frame(maxWidth: 430, alignment: .leading)
-            .padding(.top, 4)
         }
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .padding(.horizontal, 40)
-        .padding(.vertical, 28)
     }
 
-    private func featureRow(_ feature: OnboardingFeature) -> some View {
-        HStack(alignment: .top, spacing: 12) {
-            Image(systemName: feature.symbol)
-                .font(.system(size: 15, weight: .semibold))
-                .foregroundStyle(Color.accentColor)
-                .symbolRenderingMode(.hierarchical)
-                .frame(width: 22, height: 20)
+    private var agentRow: some View {
+        readinessRow(
+            title: "Agent and Account",
+            symbol: selectedAgent.symbol,
+            status: accountStatus,
+            actionTitle: accountStatus.kind == .needsAction ? "Open Accounts" : nil,
+            action: openAccounts
+        ) {
+            Picker("First session", selection: $selectedAgentID) {
+                ForEach(launchChoices) { agent in
+                    Text(agent.name).tag(agent.id)
+                }
+            }
+            .labelsHidden()
+            .frame(width: 130)
+            .accessibilityLabel("First session type")
+        }
+    }
+
+    @ViewBuilder
+    private func readinessRow<Trailing: View>(
+        title: String,
+        symbol: String,
+        status: OnboardingReadinessStatus,
+        actionTitle: String?,
+        action: @escaping () -> Void,
+        @ViewBuilder trailing: () -> Trailing
+    ) -> some View {
+        HStack(alignment: .center, spacing: 12) {
+            statusSymbol(status.kind)
+            Image(systemName: symbol)
+                .foregroundStyle(.secondary)
+                .frame(width: 19)
                 .accessibilityHidden(true)
-            VStack(alignment: .leading, spacing: 2) {
-                Text(feature.title)
-                    .font(.headline)
-                Text(feature.detail)
+            VStack(alignment: .leading, spacing: 3) {
+                Text(title).font(.headline)
+                Text(status.detail)
                     .font(.subheadline)
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
             }
+            Spacer(minLength: 12)
+            trailing()
+            if let actionTitle {
+                Button(actionTitle, action: action)
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+            }
         }
-        .accessibilityElement(children: .combine)
+        .padding(14)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(.quaternary.opacity(0.28), in: RoundedRectangle(cornerRadius: 12))
+        .accessibilityElement(children: .contain)
     }
 
-    private var pageTransition: AnyTransition {
-        if reduceMotion { return .opacity }
-        return .asymmetric(
-            insertion: .move(edge: forward ? .trailing : .leading).combined(with: .opacity),
-            removal: .move(edge: forward ? .leading : .trailing).combined(with: .opacity)
-        )
+    private func readinessRow(
+        title: String,
+        symbol: String,
+        status: OnboardingReadinessStatus,
+        actionTitle: String?,
+        action: @escaping () -> Void
+    ) -> some View {
+        readinessRow(
+            title: title,
+            symbol: symbol,
+            status: status,
+            actionTitle: actionTitle,
+            action: action
+        ) { EmptyView() }
     }
 
-    // MARK: - Controls
+    @ViewBuilder
+    private func statusSymbol(_ kind: OnboardingReadinessStatus.Kind) -> some View {
+        switch kind {
+        case .ready:
+            Image(systemName: "checkmark.circle.fill")
+                .foregroundStyle(.green)
+                .accessibilityLabel("Ready")
+        case .checking:
+            ProgressView()
+                .controlSize(.small)
+                .frame(width: 16, height: 16)
+                .accessibilityLabel("Checking")
+        case .needsAction:
+            Image(systemName: "exclamationmark.triangle.fill")
+                .foregroundStyle(.orange)
+                .accessibilityLabel("Needs action")
+        case .information:
+            Image(systemName: "info.circle.fill")
+                .foregroundStyle(.secondary)
+                .accessibilityLabel("Information")
+        }
+    }
 
     private var controls: some View {
         HStack(spacing: 12) {
-            pageDots
-            Spacer(minLength: 12)
-            if index > 0 {
-                Button("Back") { advance(-1) }
-                    .controlSize(.large)
-            }
-            Button(isLastPage ? "Start using Kaisola" : "Continue") {
-                if isLastPage { dismiss() } else { advance(1) }
-            }
-            .keyboardShortcut(.defaultAction)
-            .buttonStyle(.borderedProminent)
-            .controlSize(.large)
+            Button("Do This Later", action: dismiss)
+                .fixedSize()
+            Spacer()
+            Button(startButtonTitle, action: startFirstSession)
+                .keyboardShortcut(.defaultAction)
+                .buttonStyle(.borderedProminent)
+                .disabled(!canStart)
+                .help(canStart ? "Start the selected session in the active project" : "Choose a project and reconnect first")
+                .fixedSize()
         }
         .padding(.horizontal, 24)
         .padding(.vertical, 16)
     }
 
-    private var pageDots: some View {
-        HStack(spacing: 7) {
-            ForEach(pages.indices, id: \.self) { page in
-                Circle()
-                    .fill(page == index ? Color.accentColor : Color.secondary.opacity(0.28))
-                    .frame(width: page == index ? 8 : 7, height: page == index ? 8 : 7)
-                    .animation(
-                        reduceMotion ? nil : .easeInOut(duration: KaisolaVisualSystem.stateDuration),
-                        value: index
-                    )
-            }
-        }
-        .accessibilityElement(children: .ignore)
-        .accessibilityLabel("Page \(index + 1) of \(pages.count)")
+    private var startButtonTitle: String {
+        selectedAgent.id == AgentProfile.shell.id
+            ? "Start Terminal"
+            : "Start \(selectedAgent.name) Session"
     }
 
-    private func advance(_ delta: Int) {
-        let target = min(max(index + delta, 0), pages.count - 1)
-        guard target != index else { return }
-        forward = target > index
-        withAnimation(.easeInOut(duration: KaisolaVisualSystem.layoutDuration)) {
-            index = target
+    private func startFirstSession() {
+        guard canStart else { return }
+        if selectedAgent.id == AgentProfile.shell.id {
+            RootShellView.promptForNewTerminal(model: model)
+        } else {
+            RootShellView.promptForNewAgent(selectedAgent, model: model)
         }
+        dismiss()
     }
-}
-
-// MARK: - Page model
-
-/// One welcome page: a hero symbol + headline + a short list of supporting
-/// features. Kept file-private so nothing outside onboarding depends on it.
-private struct OnboardingPage: Identifiable {
-    let id: Int
-    let symbol: String
-    let title: String
-    let subtitle: String
-    let features: [OnboardingFeature]
-
-    static let all: [OnboardingPage] = [
-        OnboardingPage(
-            id: 0,
-            symbol: "terminal.fill",
-            title: "Your agents, native",
-            subtitle: "Kaisola keeps terminals and agent CLIs running in the background — even while the app quits or updates.",
-            features: [
-                OnboardingFeature(
-                    symbol: "terminal.fill",
-                    title: "Owned terminals",
-                    detail: "Claude, Codex, and other CLIs launch as real shells you drive."
-                ),
-                OnboardingFeature(
-                    symbol: "arrow.triangle.2.circlepath",
-                    title: "Survives updates",
-                    detail: "Quit or update Kaisola and any in-flight run keeps going."
-                ),
-                OnboardingFeature(
-                    symbol: "clock.arrow.circlepath",
-                    title: "Reattaches cleanly",
-                    detail: "Relaunch reconnects with continuous scrollback."
-                ),
-            ]
-        ),
-        OnboardingPage(
-            id: 1,
-            symbol: "circle.hexagongrid.fill",
-            title: "Chats, Mesh, and guardrails",
-            subtitle: "Chat with inline diffs and permissions, fan out with Mesh, and keep sensitive files guarded.",
-            features: [
-                OnboardingFeature(
-                    symbol: "bubble.left.and.text.bubble.right",
-                    title: "Chats with diffs",
-                    detail: "Inline red/green diffs with a permission prompt for each action."
-                ),
-                OnboardingFeature(
-                    symbol: "circle.hexagongrid.fill",
-                    title: "Mesh fan-out",
-                    detail: "Send one prompt to every agent, each in its own isolated worktree."
-                ),
-                OnboardingFeature(
-                    symbol: "shield.lefthalf.filled",
-                    title: "Sensitive files always ask",
-                    detail: "Secrets and keys prompt every time — never auto-approved."
-                ),
-            ]
-        ),
-        OnboardingPage(
-            id: 2,
-            symbol: "sparkles.rectangle.stack",
-            title: "Native from end to end",
-            subtitle: "Projects, durable terminals, and restored work now stay entirely inside Kaisola.",
-            features: [
-                OnboardingFeature(
-                    symbol: "checkmark.shield",
-                    title: "One workspace",
-                    detail: "No background scan or migration from unrelated applications."
-                ),
-                OnboardingFeature(
-                    symbol: "externaldrive.badge.checkmark",
-                    title: "Durable sessions",
-                    detail: "Native terminals survive relaunches and Kaisola updates."
-                ),
-                OnboardingFeature(
-                    symbol: "server.rack",
-                    title: "Native service",
-                    detail: "Kaisola starts and reconnects its own terminal service automatically."
-                ),
-            ]
-        ),
-    ]
-}
-
-private struct OnboardingFeature: Identifiable {
-    let id = UUID()
-    let symbol: String
-    let title: String
-    let detail: String
 }
 
 // MARK: - Persisted first-run flag
 
-/// The one-time gate for ``OnboardingView``. Versioned so a future redesign can
-/// re-introduce the welcome under a new key (`onboardingSeen.v2`, …) without
-/// clearing or colliding with the v1 record. Stored in the preview's own
-/// UserDefaults suite, so it never touches any Electron profile.
+/// The one-time gate for ``OnboardingView``. Version 2 replaces the old feature
+/// tour with a readiness checklist, so existing installs receive the useful
+/// setup flow once without disturbing the v1 record.
 enum OnboardingState {
-    /// Bump this key (v2, v3, …) to re-show a revised onboarding to everyone.
-    private static let seenKey = "onboardingSeen.v1"
+    private static let seenKey = "onboardingSeen.v2"
 
-    /// True until the current onboarding version has been marked seen. Unset
-    /// defaults read as `false`, so a fresh install always shows it once.
     static func shouldShow(defaults: UserDefaults = .standard) -> Bool {
         !defaults.bool(forKey: seenKey)
     }
 
-    /// Record that this onboarding version has been seen. Idempotent.
     static func markSeen(defaults: UserDefaults = .standard) {
         defaults.set(true, forKey: seenKey)
     }

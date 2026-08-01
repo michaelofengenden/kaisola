@@ -54,7 +54,7 @@ struct AppAccountSettingsView: View {
         } label: {
             HStack(spacing: 7) {
                 GoogleAccountGlyph().frame(width: 14, height: 14)
-                Text("Sign in with Google")
+                Text("Sign In with Google")
             }
         }
         .buttonStyle(.borderedProminent)

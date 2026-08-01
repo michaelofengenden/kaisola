@@ -176,16 +176,16 @@ struct CommandPaletteView: View {
             })
         }
 
-        items.append(PaletteItem(id: "action.newMesh", title: "New Mesh (all agents)", subtitle: "Action", systemImage: "circle.hexagongrid.fill") {
+        items.append(PaletteItem(id: "action.newMesh", title: "New Mesh (All Agents)", subtitle: "Action", systemImage: "circle.hexagongrid.fill") {
             RootShellView.promptForNewMesh(model: model)
         })
-        items.append(PaletteItem(id: "action.newStagedMesh", title: "New Staged Mesh (scout → execute)", subtitle: "Action", systemImage: "arrow.triangle.branch") {
+        items.append(PaletteItem(id: "action.newStagedMesh", title: "New Staged Mesh (Scout → Execute)", subtitle: "Action", systemImage: "arrow.triangle.branch") {
             RootShellView.promptForNewMesh(model: model, staged: true)
         })
-        items.append(PaletteItem(id: "action.newIdeaMesh", title: "New Idea Mesh (brainstorm)", subtitle: "Action", systemImage: "lightbulb") {
+        items.append(PaletteItem(id: "action.newIdeaMesh", title: "New Idea Mesh (Brainstorm)", subtitle: "Action", systemImage: "lightbulb") {
             RootShellView.promptForNewMesh(model: model, idea: true)
         })
-        items.append(PaletteItem(id: "action.toggleRail", title: "Toggle Workspace Rail", subtitle: "View · ⌘B", systemImage: "sidebar.left") {
+        items.append(PaletteItem(id: "action.toggleRail", title: "Show or Hide Files", subtitle: "View · ⌘B", systemImage: "sidebar.left") {
             settings.workspaceRailVisible.toggle()
         })
         if let editorTarget = model.previewedFileURL ?? model.currentProjectDirectory {

@@ -42,7 +42,7 @@ enum FilePreviewTabPolicy {
         if let root = workspaceRoot?.standardizedFileURL {
             if parent == root {
                 let rootName = root.lastPathComponent
-                return "\(filename) — \(rootName.isEmpty ? "workspace" : rootName)"
+                return "\(filename) — \(rootName.isEmpty ? "project" : rootName)"
             }
             let rootPath = root.path
             let parentPath = parent.path

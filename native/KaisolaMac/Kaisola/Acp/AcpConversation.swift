@@ -821,11 +821,11 @@ final class AcpConversation: ObservableObject {
         ]
         currentModeID = "default"
         rows = [
-            .user(id: "1", text: "Make the native workspace feel calm and fast.", failed: false),
+            .user(id: "1", text: "Make the native project feel calm and fast.", failed: false),
             .message(id: "1", text: "I’ve unified terminal and agent sessions into movable cards, then tightened the project rail and persisted the layout."),
             .tool(AcpToolCall(
                 id: "visual-tool",
-                title: "Inspect native workspace",
+                title: "Inspect native project",
                 kind: "read",
                 status: .completed,
                 content: [.text("Build and focused tests passed.")]

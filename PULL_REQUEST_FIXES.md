@@ -55,7 +55,7 @@ Large product and architecture work remains ordered in
   in place with a fresh PTY, while oversized valid ACP images downscale off-main
   through a 2048 px/128 MB-bounded ImageIO path instead of being rejected.
 - Failed pop-out targets now retain a standard missing-session recovery card
-  with Try Again and Back to Workspace; window/model construction failures also
+  with Try Again and Back to Main Window; window/model construction failures also
   surface an explicit error toast.
 - Waiting staged Mesh prompts now persist in exact FIFO order, restore paused,
   and remain inspectable, removable one at a time, and explicitly resumable
@@ -71,6 +71,11 @@ Large product and architecture work remains ordered in
   overrides one Accounts tab. Saved or newly pasted direct-API keys can be
   verified through a bounded, no-prompt provider request that refuses redirects
   and never displays the credential or an upstream response body.
+- First run is now a live readiness checklist for the project, terminal
+  continuity, selected agent account, update policy, and runnable first session.
+  Help opens a user guide with shortcuts and recovery steps; buttons use Title
+  Case, project surfaces use project terminology, and session failures no longer
+  expose broker or app-server implementation vocabulary.
 
 ## Open audit fixes
 
@@ -90,9 +95,8 @@ Large product and architecture work remains ordered in
 - Replace remaining low-contrast attention badges; honor Reduce Motion outside
   the covered toast, onboarding, restoration, palette, and rail paths; and
   expose truthful keyboard focus and button traits throughout the AX tree.
-- Finish Title Case and project terminology, remove background-service jargon
-  from user surfaces, align menu/palette shortcuts, and replace developer Help
-  and feature-marketing onboarding with operational guidance.
+- Align menu and command-palette shortcuts through the typed command registry
+  from PR 2.
 ## Adding a fix
 
 Each confirmed fix should include:

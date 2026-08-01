@@ -327,17 +327,17 @@ enum BrokerDiscoveryError: Error, Equatable, LocalizedError {
         case .notRunning:
             "Kaisola's native terminal service is not running. Reconnect to start it again."
         case .privateEndpointUnavailable:
-            "The broker is republishing its private socket. Try reconnecting in a moment."
+            "Saved sessions are reopening their private connection. Try reconnecting in a moment."
         case .unsafePermissions:
-            "The broker endpoint was refused because it is not private to this macOS user."
+            "The terminal connection was refused because it is not private to this macOS user."
         case let .unsupportedProtocol(version):
-            "The running broker uses protocol \(version), which this preview will not replace or terminate."
+            "The running session service uses an incompatible version (\(version)) and was left untouched."
         case .unsupportedSecurityEpoch:
-            "The running broker does not provide project-scoped terminal isolation."
+            "The running session service does not provide project-scoped terminal isolation."
         case let .unsupportedImplementation(version):
-            "The running broker implementation \(version) is outside this preview's compatibility window and was left untouched."
+            "The running session service version \(version) is incompatible with this version of Kaisola and was left untouched."
         case .invalidMetadata:
-            "The broker rendezvous metadata is invalid. No terminal process was changed."
+            "Saved terminal connection information is invalid. No terminal process was changed."
         }
     }
 }

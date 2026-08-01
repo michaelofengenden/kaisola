@@ -44,6 +44,6 @@ enum ObserveOnlyBrokerPolicyError: Error, Equatable, LocalizedError {
     case methodRejected(String)
 
     var errorDescription: String? {
-        "Kaisola blocked a broker method outside its read-only contract."
+        "Kaisola blocked a session-service operation outside its read-only contract."
     }
 }

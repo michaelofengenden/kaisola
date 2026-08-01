@@ -72,6 +72,19 @@ test('settings surfaces stay on their bounded account and configuration contract
   assert.equal(plan.fallback, false)
 })
 
+test('operational onboarding stays on readiness and account contracts', () => {
+  const plan = selector.planForChanges([
+    'native/KaisolaMac/Kaisola/Features/Onboarding/OnboardingView.swift',
+  ], inventory)
+
+  assert.equal(plan.native.mode, 'focused')
+  assert.deepEqual(plan.native.selectors, [
+    'OnboardingStateTests', 'UsageCenterTests',
+  ])
+  assert.equal(plan.node.mode, 'none')
+  assert.equal(plan.fallback, false)
+})
+
 test('extracted preview units retain the complete preview contract lane', () => {
   const plan = selector.planForChanges([
     'native/KaisolaMac/Kaisola/Features/Workspace/FilePreviewContent.swift',

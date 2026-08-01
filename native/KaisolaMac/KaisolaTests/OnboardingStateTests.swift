@@ -1,9 +1,9 @@
 import XCTest
 @testable import Kaisola
 
-/// The first-run onboarding gate: shown once, then never again — and keyed by a
-/// versioned flag so a future onboarding revision (v2, v3, …) can re-show
-/// without disturbing the v1 record. Each test runs in its own throwaway
+/// The first-run readiness gate: shown once, then never again — and keyed by a
+/// versioned flag so a future onboarding revision can re-show without
+/// disturbing an earlier record. Each test runs in its own throwaway
 /// UserDefaults suite so nothing leaks into `.standard` or across tests.
 final class OnboardingStateTests: XCTestCase {
     /// A fresh, empty defaults domain unique to each call.
@@ -30,16 +30,18 @@ final class OnboardingStateTests: XCTestCase {
         XCTAssertFalse(OnboardingState.shouldShow(defaults: defaults))
     }
 
-    /// Marking v1 seen must not set a hypothetical future version key, so a
-    /// later onboarding revision keyed on v2 would still show.
+    /// Marking the current checklist seen must not disturb the historical tour
+    /// or a hypothetical future version.
     func testVersionKeyIsolation() {
         let defaults = makeDefaults()
         OnboardingState.markSeen(defaults: defaults)
 
-        XCTAssertNotNil(defaults.object(forKey: "onboardingSeen.v1"),
-                        "markSeen writes the v1 flag it owns.")
-        XCTAssertFalse(defaults.bool(forKey: "onboardingSeen.v2"),
-                       "markSeen must not touch a future v2 key.")
+        XCTAssertNotNil(defaults.object(forKey: "onboardingSeen.v2"),
+                        "markSeen writes the v2 readiness flag it owns.")
+        XCTAssertFalse(defaults.bool(forKey: "onboardingSeen.v1"),
+                       "markSeen must not rewrite the historical v1 tour flag.")
+        XCTAssertFalse(defaults.bool(forKey: "onboardingSeen.v3"),
+                       "markSeen must not touch a future v3 key.")
     }
 
     /// The default is `.standard`, but every real call site passes the preview's
@@ -51,5 +53,101 @@ final class OnboardingStateTests: XCTestCase {
         XCTAssertFalse(OnboardingState.shouldShow(defaults: seen))
         XCTAssertTrue(OnboardingState.shouldShow(defaults: fresh),
                       "A different suite has its own, still-unseen record.")
+    }
+
+    func testHostedFixturesNeverCoverTheirDeclaredSurfaceWithOnboarding() {
+        let defaults = makeDefaults()
+        XCTAssertTrue(OnboardingState.shouldShow(defaults: defaults))
+        XCTAssertFalse(RootShellView.shouldPresentOnboarding(
+            environment: ["KAISOLA_NATIVE_VISUAL_FIXTURE": "1"],
+            defaults: defaults
+        ))
+        XCTAssertFalse(RootShellView.shouldPresentOnboarding(
+            environment: ["KAISOLA_NATIVE_RESOURCE_WORKLOAD": "terminal-idle"],
+            defaults: defaults
+        ))
+        XCTAssertTrue(RootShellView.shouldPresentOnboarding(
+            environment: [:],
+            defaults: defaults
+        ))
+    }
+
+    func testTerminalReadinessRequiresWriteControlNotOnlyObservation() {
+        XCTAssertEqual(
+            OnboardingReadiness.terminalService(
+                connectionState: .connected(
+                    version: "fixture",
+                    pid: 42,
+                    serverEnforcedObserver: true
+                ),
+                controlAvailable: false
+            ).kind,
+            .needsAction
+        )
+        XCTAssertEqual(
+            OnboardingReadiness.terminalService(
+                connectionState: .connected(
+                    version: "fixture",
+                    pid: 42,
+                    serverEnforcedObserver: true
+                ),
+                controlAvailable: true
+            ).kind,
+            .ready
+        )
+    }
+
+    func testAgentReadinessSeparatesCheckingSignedInAndUnverifiedStates() {
+        XCTAssertEqual(
+            OnboardingReadiness.agentAccount(
+                agentID: "codex",
+                readings: [],
+                isRefreshing: true
+            ).kind,
+            .checking
+        )
+
+        let verified = UsageCenter.ProviderPlanUsage(
+            provider: "codex",
+            displayName: "Codex",
+            ok: true,
+            sourceLabel: "fixture",
+            account: "ready@example.test",
+            windows: []
+        )
+        let status = OnboardingReadiness.agentAccount(
+            agentID: "codex",
+            readings: [verified],
+            isRefreshing: false
+        )
+        XCTAssertEqual(status.kind, .ready)
+        XCTAssertEqual(status.detail, "Codex is signed in as ready@example.test.")
+
+        XCTAssertEqual(
+            OnboardingReadiness.agentAccount(
+                agentID: "claude-code",
+                readings: [],
+                isRefreshing: false
+            ).kind,
+            .needsAction
+        )
+    }
+
+    func testPlainTerminalDoesNotClaimAnAgentAccountIsRequired() {
+        XCTAssertEqual(
+            OnboardingReadiness.agentAccount(
+                agentID: AgentProfile.shell.id,
+                readings: [],
+                isRefreshing: false
+            ),
+            .init(kind: .ready, detail: "A plain terminal does not require an agent account.")
+        )
+    }
+
+    func testHelpTargetsTheUserGuideInsteadOfDeveloperSetup() {
+        XCTAssertEqual(
+            KaisolaMacAppDelegate.userHelpURL?.path,
+            "/michaelofengenden/kaisola/blob/main/docs/user-guide.md"
+        )
     }
 }

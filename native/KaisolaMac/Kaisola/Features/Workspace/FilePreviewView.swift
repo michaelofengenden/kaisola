@@ -626,7 +626,7 @@ struct FilePreviewView: View {
                     Button("Italic") { richDocumentCommand = RichDocumentCommand(kind: .italic) }
                     Button("Underline") { richDocumentCommand = RichDocumentCommand(kind: .underline) }
                     Button("Heading") { richDocumentCommand = RichDocumentCommand(kind: .heading) }
-                    Button("Bulleted list") { richDocumentCommand = RichDocumentCommand(kind: .bulletList) }
+                    Button("Bulleted List") { richDocumentCommand = RichDocumentCommand(kind: .bulletList) }
                 }
             }
             if supportsZoom {

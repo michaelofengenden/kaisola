@@ -83,7 +83,7 @@ struct WorkspaceRailView: View {
                 .menuStyle(.borderlessButton)
                 .fixedSize()
                 .help("New file or folder")
-                .accessibilityLabel("New workspace item")
+                .accessibilityLabel("New project item")
                 Button(action: refresh) {
                     Image(systemName: "arrow.clockwise")
                         .font(.caption)
@@ -92,7 +92,7 @@ struct WorkspaceRailView: View {
                 .help("Refresh files")
                 if isMutating {
                     ProgressView().controlSize(.mini)
-                        .accessibilityLabel("Updating workspace files")
+                        .accessibilityLabel("Updating project files")
                 }
             }
             .padding(.horizontal, 8)
@@ -258,7 +258,7 @@ struct WorkspaceRailView: View {
         } message: {
             Text("This is recoverable from the macOS Trash.")
         }
-        .accessibilityLabel("Workspace files")
+        .accessibilityLabel("Project files")
     }
 
     private var renamePresented: Binding<Bool> {

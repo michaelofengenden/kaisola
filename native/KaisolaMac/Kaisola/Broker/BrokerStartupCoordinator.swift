@@ -39,25 +39,25 @@ enum BrokerUpgradeState: Equatable, Sendable {
     var detail: String {
         switch self {
         case .unknown:
-            "The background service has not been checked yet."
+            "Terminal continuity has not been checked yet."
         case let .current(contentDigest):
-            "Background service is up to date · content \(contentDigest)."
+            "Terminal continuity is up to date · content \(contentDigest)."
         case let .checking(fromContentDigest, targetContentDigest):
-            "Checking a background service update \(Self.transition(fromContentDigest, targetContentDigest)) safely."
+            "Checking a terminal-continuity update \(Self.transition(fromContentDigest, targetContentDigest)) safely."
         case let .pending(from, target, .liveWork(blockers)):
-            "Background service update waiting \(Self.transition(from, target)): \(blockers.liveTerminalCount) live terminal(s), \(blockers.busyAgentCount) working agent(s), \(blockers.childTaskCount) child task(s)."
+            "Terminal-continuity update waiting \(Self.transition(from, target)): \(blockers.liveTerminalCount) live terminal(s), \(blockers.busyAgentCount) working agent(s), \(blockers.childTaskCount) child task(s)."
         case let .pending(from, target, .legacyIdentityUnavailable):
-            "Background service update waiting \(Self.transition(from, target)): this older version cannot prove an atomic safe shutdown."
+            "Terminal-continuity update waiting \(Self.transition(from, target)): this older version cannot prove a safe handoff."
         case let .pending(from, target, .identityChanged):
-            "Background service update waiting \(Self.transition(from, target)): its identity changed during the safety check."
+            "Terminal-continuity update waiting \(Self.transition(from, target)): the running service changed during the safety check."
         case let .pending(from, target, .requestUnavailable):
-            "Background service update waiting \(Self.transition(from, target)): the running version does not support sealed safe promotion."
+            "Terminal-continuity update waiting \(Self.transition(from, target)): the running version cannot complete a verified handoff."
         case let .pending(from, target, .shutdownTimedOut):
-            "Background service update waiting \(Self.transition(from, target)): the old version did not finish its safe shutdown."
+            "Terminal-continuity update waiting \(Self.transition(from, target)): the old version did not finish its safe handoff."
         case let .pending(from, target, .launchFailed):
-            "Background service update waiting \(Self.transition(from, target)): the replacement could not be started yet."
+            "Terminal-continuity update waiting \(Self.transition(from, target)): the replacement could not be started yet."
         case let .updating(fromContentDigest, targetContentDigest):
-            "Background service is updating \(Self.transition(fromContentDigest, targetContentDigest)); no terminal processes are being interrupted."
+            "Terminal continuity is updating \(Self.transition(fromContentDigest, targetContentDigest)); no terminal processes are being interrupted."
         }
     }
 
@@ -490,19 +490,19 @@ enum BrokerStartupError: Error, Equatable, LocalizedError {
     var errorDescription: String? {
         switch self {
         case .liveBrokerRefused:
-            "A live terminal broker was left untouched."
+            "A live terminal service was left untouched."
         case .rendezvousChanged:
-            "Another Kaisola process changed the broker rendezvous; reconnect to adopt it safely."
+            "Another Kaisola process changed the saved-session connection; reconnect to adopt it safely."
         case .unsafeStaleRendezvous:
-            "Stale broker metadata was not removed because its path or permissions were unsafe."
+            "Stale session-connection data was preserved because its path or permissions were unsafe."
         case .unsafeDirectory:
-            "The broker support directory is not private to this macOS user."
+            "The session support directory is not private to this macOS user."
         case .randomnessUnavailable:
-            "A secure broker authentication token could not be generated."
+            "A secure session-connection token could not be generated."
         case .couldNotWriteLaunchRequest:
-            "The private broker launch request could not be written safely."
+            "The private session launch request could not be written safely."
         case .timedOut:
-            "The standalone broker helper launched, but its private socket did not become ready."
+            "The session helper launched, but its private connection did not become ready."
         }
     }
 }

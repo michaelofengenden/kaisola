@@ -1037,9 +1037,9 @@ final class KaisolaMacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDele
                 </head>
                 <body>
                   <main>
-                    <div class="eyebrow">Kaisola workspace</div>
+                    <div class="eyebrow">Kaisola project</div>
                     <h1>Native HTML preview</h1>
-                    <p>Inspect project pages beside live terminals, then edit the source without leaving your workspace.</p>
+                    <p>Inspect project pages beside live terminals, then edit the source without leaving the project.</p>
                     <section class="cards">
                       <div class="card"><strong>Confined</strong><span>Assets stay inside this project.</span></div>
                       <div class="card"><strong>Fast</strong><span>Rendered in an ephemeral view.</span></div>
@@ -1108,7 +1108,15 @@ final class KaisolaMacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDele
             model.selectedProjectName = legacyInitialProjectName
         }
         let content: AnyView
-        if visualFixture, ["settings", "settings-terminal", "settings-terminal-history", "settings-terminal-interaction", "settings-companion", "settings-mcp", "settings-accounts", "settings-models", "settings-account-recovery", "usage"].contains(visualSurface) {
+        if visualFixture, visualSurface == "onboarding" {
+            UsageCenter.shared.loadVisualFixture()
+            content = AnyView(OnboardingView(
+                model: model,
+                dismiss: {},
+                openAccounts: {},
+                openUpdateSettings: {}
+            ))
+        } else if visualFixture, ["settings", "settings-terminal", "settings-terminal-history", "settings-terminal-interaction", "settings-companion", "settings-mcp", "settings-accounts", "settings-models", "settings-account-recovery", "usage"].contains(visualSurface) {
             let workspace = URL(
                 fileURLWithPath: visualWorkspace ?? FileManager.default.currentDirectoryPath,
                 isDirectory: true
@@ -1152,13 +1160,14 @@ final class KaisolaMacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDele
 
         let visualSettings = visualFixture
             && ["settings", "settings-terminal", "settings-terminal-history", "settings-terminal-interaction", "settings-companion", "settings-mcp", "settings-accounts", "settings-models", "settings-account-recovery", "usage"].contains(visualSurface)
+        let visualOnboarding = visualFixture && visualSurface == "onboarding"
 
         let window = NSWindow(
             contentRect: NSRect(
                 x: 0,
                 y: 0,
-                width: visualSettings ? 810 : (resourceWorkload != nil ? 1_280 : (visualFixture ? 1_360 : 1_080)),
-                height: visualSettings ? 540 : (resourceWorkload != nil ? 800 : (visualFixture ? 860 : 700))
+                width: visualSettings ? 810 : (visualOnboarding ? 760 : (resourceWorkload != nil ? 1_280 : (visualFixture ? 1_360 : 1_080))),
+                height: visualSettings ? 540 : (visualOnboarding ? 560 : (resourceWorkload != nil ? 800 : (visualFixture ? 860 : 700)))
             ),
             styleMask: [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView],
             backing: .buffered,
@@ -1195,7 +1204,7 @@ final class KaisolaMacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDele
             )
         }
         windowCounter += 1
-        if visualSettings {
+        if visualSettings || visualOnboarding {
             window.contentView = NSHostingView(rootView: content)
         } else {
             window.contentView = FullHeightWorkspaceHostingView(rootView: content)
@@ -2698,7 +2707,7 @@ final class KaisolaMacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDele
         }
         guard let model = delegate.windowModels[ObjectIdentifier(window)] else {
             window.close()
-            ToastCenter.shared.show("The new window could not load its workspace.", style: .error)
+            ToastCenter.shared.show("The new window could not load its project.", style: .error)
             return
         }
         Task {
@@ -3445,8 +3454,12 @@ final class KaisolaMacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDele
         return mainMenu
     }
 
+    nonisolated static let userHelpURL = URL(
+        string: "https://github.com/michaelofengenden/kaisola/blob/main/docs/user-guide.md"
+    )
+
     @objc func openHelp(_ sender: Any?) {
-        if let url = URL(string: "https://github.com/michaelofengenden/kaisola/blob/main/README.md") {
+        if let url = Self.userHelpURL {
             NSWorkspace.shared.open(url)
         }
     }

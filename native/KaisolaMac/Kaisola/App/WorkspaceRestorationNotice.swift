@@ -138,11 +138,11 @@ struct WorkspaceRestorationNotice: Equatable, Sendable {
     var title: String {
         switch kind {
         case .corruptArchive:
-            "Workspace Layout Couldn't Be Restored"
+            "Window Layout Couldn't Be Restored"
         case .newerVersionData:
             "Saved by a Newer Version of Kaisola"
         case .unreadable:
-            "Workspace Layout Couldn't Be Read"
+            "Window Layout Couldn't Be Read"
         }
     }
 
@@ -181,11 +181,11 @@ struct WorkspaceRestorationNotice: Equatable, Sendable {
     var summary: String {
         switch kind {
         case .corruptArchive:
-            savesBlocked ? "Workspace layout not saving" : "Workspace layout not restored"
+            savesBlocked ? "Window layout not saving" : "Window layout not restored"
         case .newerVersionData:
             "Layout saved by a newer version"
         case .unreadable:
-            "Workspace layout unreadable"
+            "Window layout unreadable"
         }
     }
 

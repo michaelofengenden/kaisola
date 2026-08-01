@@ -43,6 +43,9 @@ const NATIVE_DIRECTORY_TESTS = Object.freeze([
   ['native/KaisolaMac/Kaisola/Features/Palette/', [
     'FuzzyMatchTests', 'OmniBarDispatchTests',
   ]],
+  ['native/KaisolaMac/Kaisola/Features/Onboarding/', [
+    'OnboardingStateTests', 'UsageCenterTests',
+  ]],
   ['native/KaisolaMac/Kaisola/Features/Settings/', [
     'ApiKeyStoreTests', 'AppModelProjectContextTests',
     'CompanionConnectionSessionTests', 'McpConfigStoreTests',
@@ -69,6 +72,9 @@ const FILE_PREVIEW_TESTS = Object.freeze([
 ])
 
 const NATIVE_FILE_TESTS = Object.freeze(new Map([
+  ['native/KaisolaMac/Kaisola/Features/Onboarding/OnboardingView.swift', [
+    'OnboardingStateTests', 'UsageCenterTests',
+  ]],
   ['native/KaisolaMac/Kaisola/App/AppModel.swift', [
     'AppModelBrokerFallbackTests', 'AppModelProjectContextTests',
     'AppModelReconnectTests', 'AppModelTerminalRetentionTests',

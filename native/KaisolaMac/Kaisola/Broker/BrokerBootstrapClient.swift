@@ -148,15 +148,15 @@ enum BrokerBootstrapError: Error, Equatable, LocalizedError {
     var errorDescription: String? {
         switch self {
         case .requiresApproval:
-            "Allow the Kaisola broker helper in System Settings → General → Login Items, then reconnect."
+            "Allow Kaisola in System Settings → General → Login Items, then reconnect."
         case .serviceNotFound:
-            "The packaged per-user broker helper could not be found."
+            "Kaisola's packaged session helper could not be found."
         case .registrationFailed:
-            "The packaged per-user broker helper could not be registered."
+            "Kaisola's session helper could not be registered."
         case .xpcFailed:
-            "The per-user broker helper did not answer the authenticated launch request."
+            "Kaisola's session helper did not answer the secure launch request."
         case let .launchRejected(message):
-            message?.isEmpty == false ? message : "The per-user broker helper refused to start the broker."
+            message?.isEmpty == false ? message : "Kaisola's session helper could not start saved-session continuity."
         }
     }
 }

@@ -505,6 +505,80 @@ final class NativePreviewSettingsTests: XCTestCase {
         XCTAssertGreaterThan(darkWorkspace.baseOpacity, darkSidebar.baseOpacity)
     }
 
+    /// Increased Contrast used to add a flat neutral overlay (0.18) on top of
+    /// the veil, sized for the *pre-halving* base coverage. Once the veil
+    /// itself was halved (above), that flat overlay left Increased Contrast
+    /// *less* opaque than it was pre-retune — backwards for an accessibility
+    /// setting. The overlay must scale with how much coverage the thinner
+    /// veil gave up, so the composite (veil + overlay) still clears a floor
+    /// equal to the coverage the pre-halving veil delivered stacked with the
+    /// old flat 0.18 overlay. This is the regression test: it fails against a
+    /// flat 0.18 overlay and passes only once the overlay is scaled.
+    func testIncreasedContrastOverlayRestoresThePreHalvingCompositeCoverage() {
+        // Two translucent layers stacked with standard "over" compositing
+        // combine to `base + overlay * (1 - base)`.
+        func composite(base: Double, overlay: Double) -> Double {
+            base + overlay * (1 - base)
+        }
+        let priorOverlay = 0.18
+        // Named floors: the pre-halving base opacities (sidebar 0.32/0.44,
+        // workspace 0.26/0.50) composited with the old flat overlay.
+        let sidebarLightFloor = composite(base: 0.32, overlay: priorOverlay)
+        let sidebarDarkFloor = composite(base: 0.44, overlay: priorOverlay)
+        let workspaceLightFloor = composite(base: 0.26, overlay: priorOverlay)
+        let workspaceDarkFloor = composite(base: 0.50, overlay: priorOverlay)
+        let epsilon = 0.0001
+
+        XCTAssertGreaterThanOrEqual(
+            composite(
+                base: GlassBackdropWash.sidebar(isDark: false).baseOpacity,
+                overlay: GlassBackdropWash.sidebarIncreasedContrastOverlay(isDark: false)
+            ),
+            sidebarLightFloor - epsilon,
+            "sidebar (light) composite under Increased Contrast fell below the pre-halving floor"
+        )
+        XCTAssertGreaterThanOrEqual(
+            composite(
+                base: GlassBackdropWash.sidebar(isDark: true).baseOpacity,
+                overlay: GlassBackdropWash.sidebarIncreasedContrastOverlay(isDark: true)
+            ),
+            sidebarDarkFloor - epsilon,
+            "sidebar (dark) composite under Increased Contrast fell below the pre-halving floor"
+        )
+        XCTAssertGreaterThanOrEqual(
+            composite(
+                base: GlassBackdropWash.workspace(isDark: false).baseOpacity,
+                overlay: GlassBackdropWash.workspaceIncreasedContrastOverlay(isDark: false)
+            ),
+            workspaceLightFloor - epsilon,
+            "workspace (light) composite under Increased Contrast fell below the pre-halving floor"
+        )
+        XCTAssertGreaterThanOrEqual(
+            composite(
+                base: GlassBackdropWash.workspace(isDark: true).baseOpacity,
+                overlay: GlassBackdropWash.workspaceIncreasedContrastOverlay(isDark: true)
+            ),
+            workspaceDarkFloor - epsilon,
+            "workspace (dark) composite under Increased Contrast fell below the pre-halving floor"
+        )
+    }
+
+    /// The replacement overlay must actually be bigger than the old flat 0.18
+    /// it replaces — otherwise this is a no-op rename, not a fix — and must
+    /// stay well short of an opaque panel.
+    func testIncreasedContrastOverlayIsLargerThanTheOldFlatConstantButBounded() {
+        let overlays = [
+            GlassBackdropWash.sidebarIncreasedContrastOverlay(isDark: false),
+            GlassBackdropWash.sidebarIncreasedContrastOverlay(isDark: true),
+            GlassBackdropWash.workspaceIncreasedContrastOverlay(isDark: false),
+            GlassBackdropWash.workspaceIncreasedContrastOverlay(isDark: true),
+        ]
+        for overlay in overlays {
+            XCTAssertGreaterThan(overlay, 0.18)
+            XCTAssertLessThanOrEqual(overlay, 0.6)
+        }
+    }
+
     /// With no paired Mac the section was a permanent "No other Macs yet" plus
     /// a "Updated N seconds ago" line: two rows of chrome reporting nothing.
     func testOtherMacsSectionStaysHiddenUntilThereIsSomethingToReport() {

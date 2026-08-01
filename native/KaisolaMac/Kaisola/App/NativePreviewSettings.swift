@@ -832,6 +832,58 @@ struct GlassBackdropWash: Equatable, Sendable {
             ? dark(top: 0.26, base: 0.32, bottom: 0.40)
             : light(top: 0.18, base: 0.11, bottom: 0.08)
     }
+
+    /// Increased Contrast lays a flat neutral overlay on top of the veil so
+    /// low-vision users get a more opaque, more legible backdrop. Before the
+    /// halving above, that overlay was a single constant (0.18) sized for the
+    /// *pre-halving* base coverage — sidebar light 0.32 / dark 0.44,
+    /// workspace light 0.26 / dark 0.50. Halving the veil's own coverage
+    /// without re-deriving this compensation left Increased Contrast mode
+    /// proportionally *less* opaque than it was before the retune: exactly
+    /// backwards for an accessibility setting.
+    ///
+    /// Two translucent layers stacked with standard "over" compositing
+    /// combine to a total coverage of `base + overlay * (1 - base)` — the
+    /// overlay only paints the sliver of the surface the base veil left
+    /// uncovered. Solving that for `overlay` so today's thinner `newBase`
+    /// still reaches the coverage the old `oldBase` used to reach once the
+    /// old flat overlay was stacked on top of it:
+    ///
+    ///     oldComposite = oldBase + priorOverlay * (1 - oldBase)
+    ///     overlay      = (oldComposite - newBase) / (1 - newBase)
+    ///
+    /// gives the exact per-surface replacement for the flat constant.
+    /// `newBase` is read live from `sidebar(isDark:)` / `workspace(isDark:)`
+    /// rather than duplicated as a literal, so a future veil retune that
+    /// thins the base further automatically raises this compensation instead
+    /// of silently falling behind again. Clamped to `[priorOverlay, 0.6]` so
+    /// the result can only be *more* protective than the historical flat
+    /// value, never less, and never runs away toward an opaque panel.
+    private static func increasedContrastOverlay(
+        oldBase: Double,
+        newBase: Double,
+        priorOverlay: Double = 0.18
+    ) -> Double {
+        let oldComposite = oldBase + priorOverlay * (1 - oldBase)
+        let required = (oldComposite - newBase) / (1 - newBase)
+        return min(0.6, max(priorOverlay, required))
+    }
+
+    /// Increased Contrast overlay opacity for the sidebar veil, scaled to
+    /// restore the pre-halving (0.32 light / 0.44 dark) composite coverage
+    /// over whatever the current base opacity is.
+    static func sidebarIncreasedContrastOverlay(isDark: Bool) -> Double {
+        let oldBase = isDark ? 0.44 : 0.32
+        return increasedContrastOverlay(oldBase: oldBase, newBase: sidebar(isDark: isDark).baseOpacity)
+    }
+
+    /// Increased Contrast overlay opacity for the workspace veil, scaled to
+    /// restore the pre-halving (0.26 light / 0.50 dark) composite coverage
+    /// over whatever the current base opacity is.
+    static func workspaceIncreasedContrastOverlay(isDark: Bool) -> Double {
+        let oldBase = isDark ? 0.50 : 0.26
+        return increasedContrastOverlay(oldBase: oldBase, newBase: workspace(isDark: isDark).baseOpacity)
+    }
 }
 
 private struct KaisolaControlSurfaceModifier: ViewModifier {
@@ -1053,7 +1105,8 @@ struct SidebarBackdropView: View {
                     )
                     GlassBackdropWash.sidebar(isDark: colorScheme == .dark).veil
                     if accessibilityContrast == .increased {
-                        Color(nsColor: .controlBackgroundColor).opacity(0.18)
+                        Color(nsColor: .controlBackgroundColor)
+                            .opacity(GlassBackdropWash.sidebarIncreasedContrastOverlay(isDark: colorScheme == .dark))
                     }
                 }
                 .onAppear { desktopTint.refresh() }
@@ -1199,7 +1252,8 @@ struct WorkspaceBackdropView: View {
                     NativeVisualEffectView(material: .underWindowBackground)
                     GlassBackdropWash.workspace(isDark: colorScheme == .dark).veil
                     if accessibilityContrast == .increased {
-                        Color(nsColor: .windowBackgroundColor).opacity(0.18)
+                        Color(nsColor: .windowBackgroundColor)
+                            .opacity(GlassBackdropWash.workspaceIncreasedContrastOverlay(isDark: colorScheme == .dark))
                     }
                 }
             }

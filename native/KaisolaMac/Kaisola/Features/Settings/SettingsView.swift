@@ -247,6 +247,20 @@ struct SettingsView: View {
                         .accessibilityLabel("Project glass")
                     }
                     SettingsDivider()
+                    SettingsRow(
+                        title: "Glass shows",
+                        detail: "Your desktop picture, or whatever is behind the window",
+                        symbol: "photo.on.rectangle.angled"
+                    ) {
+                        Menu {
+                            ForEach(GlassBackdropSource.allCases) { source in
+                                Button(source.title) { settings.glassBackdropSource = source }
+                            }
+                        } label: { SettingsChoiceLabel(settings.glassBackdropSource.title) }
+                        .menuIndicator(.hidden)
+                        .accessibilityLabel("Glass source")
+                    }
+                    SettingsDivider()
                     SettingsRow(title: "Canvas", detail: "Backdrop behind chats and tools", symbol: "square.on.square") {
                         Menu {
                             ForEach(WorkspaceBackdropMode.allCases) { mode in

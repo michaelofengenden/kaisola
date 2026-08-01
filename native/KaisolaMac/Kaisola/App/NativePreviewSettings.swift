@@ -1,5 +1,7 @@
 import AppKit
 import Combine
+import CoreImage
+import CoreImage.CIFilterBuiltins
 import ImageIO
 import SwiftUI
 
@@ -55,6 +57,32 @@ enum SidebarAppearance: String, CaseIterable, Identifiable, Sendable {
 
     var id: String { rawValue }
     var title: String { self == .glass ? "Glass" : "Solid" }
+}
+
+/// Where the glass surfaces get the desktop they show through themselves.
+///
+/// The two settings map onto the same live/painted/eco split the Electron shell
+/// used, now that the native app has a painted mode worth defaulting to:
+///
+/// - **`wallpaper` (painted, the default)** — a heavily blurred copy of the
+///   desktop picture, pre-rendered once per desktop and reused. This is the
+///   only mode that answers the actual request: glass that shows the *desktop*
+///   and never the app windows stacked behind Kaisola. It is also the cheapest,
+///   because nothing samples or re-composites while the app is idle.
+/// - **`behindWindow` (live)** — AppKit's `NSVisualEffectView` behind-window
+///   vibrancy, which is a genuine live sample and therefore genuinely shows
+///   Safari, Xcode, and everything else that happens to be underneath. Kept as
+///   an explicit choice for people who *want* that classic macOS depth.
+/// - *eco* has no separate setting here: `SidebarAppearance.solid` and
+///   `WorkspaceBackdropMode.system` already are the flat, still, zero-sampling
+///   surfaces that mode described, and Reduce Transparency selects them
+///   automatically.
+enum GlassBackdropSource: String, CaseIterable, Identifiable, Sendable {
+    case wallpaper
+    case behindWindow
+
+    var id: String { rawValue }
+    var title: String { self == .wallpaper ? "Wallpaper" : "Live" }
 }
 
 /// The canvas behind workspace surfaces. Terminals keep an opaque, legible
@@ -308,6 +336,10 @@ final class NativePreviewSettings: ObservableObject {
 
     @Published var workspaceBackdrop: WorkspaceBackdropMode {
         didSet { persist(workspaceBackdrop.rawValue, forKey: Keys.workspaceBackdrop) }
+    }
+
+    @Published var glassBackdropSource: GlassBackdropSource {
+        didSet { persist(glassBackdropSource.rawValue, forKey: Keys.glassBackdropSource) }
     }
 
     /// Terminal font size (⌘+/⌘−/⌘0), clamped to a readable range.
@@ -576,6 +608,7 @@ final class NativePreviewSettings: ObservableObject {
         static let appearance = "appearanceMode"
         static let sidebarAppearance = "sidebarAppearance"
         static let workspaceBackdrop = "workspaceBackdrop"
+        static let glassBackdropSource = "glassBackdropSource"
         static let terminalFontSize = "terminalFontSize"
         static let terminalFontFamily = "terminalFontFamily"
         static let terminalFontWeight = "terminalFontWeight"
@@ -607,6 +640,8 @@ final class NativePreviewSettings: ObservableObject {
         appearance = defaults.string(forKey: Keys.appearance).flatMap(AppearanceMode.init) ?? .system
         sidebarAppearance = defaults.string(forKey: Keys.sidebarAppearance).flatMap(SidebarAppearance.init) ?? .glass
         workspaceBackdrop = defaults.string(forKey: Keys.workspaceBackdrop).flatMap(WorkspaceBackdropMode.init) ?? .glass
+        glassBackdropSource = defaults.string(forKey: Keys.glassBackdropSource)
+            .flatMap(GlassBackdropSource.init) ?? .wallpaper
         let stored = defaults.double(forKey: Keys.terminalFontSize)
         terminalFontSize = stored > 0
             ? min(max(stored, Self.terminalFontRange.lowerBound), Self.terminalFontRange.upperBound)
@@ -1069,54 +1104,285 @@ struct NativeVisualEffectView: NSViewRepresentable {
     }
 }
 
-/// Reusable material used by both the project sidebar and the workspace file
-/// rail, keeping the two left-hand navigation surfaces visually coherent.
-struct SidebarBackdropView: View {
-    @Environment(\.colorScheme) private var colorScheme
-    @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
-    @Environment(\.colorSchemeContrast) private var accessibilityContrast
-    @StateObject private var desktopTint = DesktopTintProvider()
-    let appearance: SidebarAppearance
+// MARK: - Wallpaper-only glass
 
-    @ViewBuilder
-    var body: some View {
-        switch appearance {
-        case .glass:
-            if reduceTransparency {
-                Color(nsColor: .controlBackgroundColor)
-            } else {
-                ZStack {
-                    NativeVisualEffectView(material: .sidebar)
-                    // AppKit's behind-window vibrancy is the only *live* sample
-                    // of the desktop, but in light appearance `.sidebar` is
-                    // already a near-white material: whatever colour the
-                    // wallpaper has, almost none of it survives. The sampled
-                    // wallpaper average is laid over it so the column reliably
-                    // carries the desktop's hue in both appearances instead of
-                    // depending on what the system material decides to pass
-                    // through.
-                    LinearGradient(
-                        colors: [
-                            desktopTint.color.opacity(colorScheme == .dark ? 0.30 : 0.26),
-                            desktopTint.color.opacity(colorScheme == .dark ? 0.18 : 0.14),
-                        ],
-                        startPoint: .top,
-                        endPoint: .bottom
-                    )
-                    GlassBackdropWash.sidebar(isDark: colorScheme == .dark).veil
-                    if accessibilityContrast == .increased {
-                        Color(nsColor: .controlBackgroundColor)
-                            .opacity(GlassBackdropWash.sidebarIncreasedContrastOverlay(isDark: colorScheme == .dark))
-                    }
-                }
-                .onAppear { desktopTint.refresh() }
-                .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
-                    desktopTint.refresh()
-                }
-            }
-        case .solid:
-            Color(nsColor: .controlBackgroundColor)
+/// Which file, if any, is currently painting the desktop.
+enum DesktopWallpaperResolution: Equatable, Sendable {
+    /// A picture file the user actually chose — the common case.
+    case picture(URL)
+    /// A still standing in for a dynamic aerial, which has no picture file.
+    case aerialStill(URL)
+    /// Nothing readable: the veil sits on the cooled average colour instead.
+    case unavailable
+
+    var url: URL? {
+        switch self {
+        case let .picture(url), let .aerialStill(url): url
+        case .unavailable: nil
         }
+    }
+}
+
+/// Finds the image that the desktop is actually showing.
+///
+/// `NSWorkspace.desktopImageURL(for:)` is only half an answer. For a picture
+/// desktop it returns the file, but for a dynamic aerial — including the
+/// *rotating categories* that macOS 26 ships as its headline desktops — it
+/// returns one fixed stand-in path for every screen rather than failing. Taking
+/// that at face value paints the stock Big Sur picture behind a user whose
+/// desktop is a moving Tahoe drone shot, which looks like a bug, so the
+/// sentinel is recognised and the wallpaper store is consulted instead.
+enum DesktopWallpaperLocator {
+    /// macOS hands this back for every screen whenever the desktop cannot be
+    /// expressed as a picture file.
+    static let dynamicDesktopSentinelPath = "/System/Library/CoreServices/DefaultDesktop.heic"
+
+    static var defaultSupportDirectory: URL {
+        URL(fileURLWithPath: NSHomeDirectory(), isDirectory: true)
+            .appending(path: "Library/Application Support/com.apple.wallpaper", directoryHint: .isDirectory)
+    }
+
+    static func isDynamicDesktopSentinel(_ url: URL) -> Bool {
+        let candidate = url.standardized
+        let sentinel = URL(fileURLWithPath: dynamicDesktopSentinelPath)
+        if candidate.path == sentinel.path { return true }
+        // The stand-in is itself a symlink — on macOS 26 it lands on
+        // `/System/Library/Wallpapers/.default/DefaultAerial.heic` — and the
+        // name it points at has moved between releases. Compare after
+        // resolving both sides rather than hardcoding this release's target.
+        return candidate.resolvingSymlinksInPath().path
+            == sentinel.resolvingSymlinksInPath().path
+    }
+
+    /// The ladder, with its two disk-touching rungs injected so the ordering
+    /// itself is testable. `aerialStill` reads two files, so it is deliberately
+    /// a closure that a picture desktop never calls.
+    static func resolve(
+        desktopImageURL: URL?,
+        readableStill: (URL) -> Bool,
+        aerialStill: () -> URL?
+    ) -> DesktopWallpaperResolution {
+        if let desktopImageURL,
+           !isDynamicDesktopSentinel(desktopImageURL),
+           readableStill(desktopImageURL) {
+            return .picture(desktopImageURL)
+        }
+        if let still = aerialStill() { return .aerialStill(still) }
+        return .unavailable
+    }
+
+    /// Live wiring for `resolve(desktopImageURL:readableStill:aerialStill:)`.
+    static func resolveOnDisk(
+        desktopImageURL: URL?,
+        supportDirectory: URL? = nil
+    ) -> DesktopWallpaperResolution {
+        let support = supportDirectory ?? defaultSupportDirectory
+        return resolve(
+            desktopImageURL: desktopImageURL,
+            readableStill: { CGImageSourceCreateWithURL($0 as CFURL, nil) != nil },
+            aerialStill: { currentAerialStill(supportDirectory: support) }
+        )
+    }
+
+    /// The store's `Index.plist` nests a *second*, binary plist inside each
+    /// choice's `Configuration` value; the identifier only exists in there.
+    /// `AllSpacesAndDisplays` is the live selection and outranks the
+    /// `SystemDefault` copy that sits beside it.
+    static func aerialAssetID(indexPlist data: Data) -> String? {
+        guard let root = try? PropertyListSerialization.propertyList(
+            from: data,
+            options: [],
+            format: nil
+        ) else { return nil }
+        for scope in ["AllSpacesAndDisplays", "Displays", "Spaces", "SystemDefault"] {
+            if let dictionary = root as? [String: Any],
+               let branch = dictionary[scope],
+               let found = nestedAssetID(branch) {
+                return found
+            }
+        }
+        return nestedAssetID(root)
+    }
+
+    private static func nestedAssetID(_ node: Any) -> String? {
+        switch node {
+        case let data as Data:
+            guard let inner = try? PropertyListSerialization.propertyList(
+                from: data,
+                options: [],
+                format: nil
+            ) as? [String: Any] else { return nil }
+            return inner["assetID"] as? String
+        case let dictionary as [String: Any]:
+            for value in dictionary.values {
+                if let found = nestedAssetID(value) { return found }
+            }
+            return nil
+        case let array as [Any]:
+            for value in array {
+                if let found = nestedAssetID(value) { return found }
+            }
+            return nil
+        default:
+            return nil
+        }
+    }
+
+    /// An aerial desktop is normally a rotating *category*, so no single file is
+    /// "the" wallpaper and there is no published pointer at whichever clip is
+    /// on screen right now. Pick the category's lowest-ordered member whose
+    /// still macOS has already downloaded: deterministic — the backdrop cache
+    /// key depends on it — never a network fetch, and colour-coherent, because
+    /// Apple groups a category by look in the first place.
+    static func representativeAerialStill(
+        assetID: String,
+        manifest data: Data,
+        cachedStillIDs: Set<String>
+    ) -> String? {
+        // A single pinned aerial names its own still; no category to read.
+        if cachedStillIDs.contains(assetID) { return assetID }
+        guard let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let assets = root["assets"] as? [[String: Any]] else { return nil }
+        let members = assets.compactMap { asset -> (order: Int, id: String)? in
+            guard let id = asset["id"] as? String, cachedStillIDs.contains(id) else { return nil }
+            let categories = (asset["categories"] as? [String] ?? [])
+                + (asset["subcategories"] as? [String] ?? [])
+            guard categories.contains(assetID) else { return nil }
+            return (asset["preferredOrder"] as? Int ?? .max, id)
+        }
+        return members.min { lhs, rhs in
+            lhs.order == rhs.order ? lhs.id < rhs.id : lhs.order < rhs.order
+        }?.id
+    }
+
+    private static func currentAerialStill(supportDirectory: URL) -> URL? {
+        let thumbnails = supportDirectory
+            .appending(path: "aerials/thumbnails", directoryHint: .isDirectory)
+        guard let index = try? Data(
+            contentsOf: supportDirectory.appending(path: "Store/Index.plist")
+        ), let assetID = aerialAssetID(indexPlist: index) else { return nil }
+
+        let pinned = thumbnails.appending(path: "\(assetID).png")
+        if FileManager.default.fileExists(atPath: pinned.path) { return pinned }
+
+        guard let manifest = try? Data(
+            contentsOf: supportDirectory.appending(path: "aerials/manifest/entries.json")
+        ), let cached = try? FileManager.default.contentsOfDirectory(atPath: thumbnails.path)
+        else { return nil }
+        let ids = Set(cached.lazy.filter { $0.hasSuffix(".png") }.map { String($0.dropLast(4)) })
+        guard let pick = representativeAerialStill(
+            assetID: assetID,
+            manifest: manifest,
+            cachedStillIDs: ids
+        ) else { return nil }
+        return thumbnails.appending(path: "\(pick).png")
+    }
+}
+
+/// Everything a rendered backdrop depends on, and nothing else.
+///
+/// The screen is not a component: two displays showing the same desktop render
+/// the same picture, and keying on the file dedupes them instead of blurring it
+/// twice. `modified` catches "set as desktop picture" over a path that never
+/// changed, and `isDark` selects the frame of a dynamic desktop.
+struct DesktopBackdropKey: Hashable, Sendable {
+    let path: String
+    let modified: Date?
+    let isDark: Bool
+
+    var url: URL { URL(fileURLWithPath: path) }
+}
+
+/// What a glass surface paints under its veil.
+enum DesktopPainting: @unchecked Sendable {
+    /// The pre-blurred desktop still, plus the tint sampled from that same
+    /// decode so a single pass produces both products.
+    case wallpaper(CGImage, tint: DesktopTintComponents)
+    /// No readable still anywhere on the ladder.
+    case flat(DesktopTintComponents)
+
+    var tint: DesktopTintComponents {
+        switch self {
+        case let .wallpaper(_, tint): tint
+        case let .flat(tint): tint
+        }
+    }
+}
+
+extension DesktopPainting: Equatable {
+    static func == (lhs: DesktopPainting, rhs: DesktopPainting) -> Bool {
+        switch (lhs, rhs) {
+        case let (.wallpaper(lhsImage, lhsTint), .wallpaper(rhsImage, rhsTint)):
+            lhsImage === rhsImage && lhsTint == rhsTint
+        case let (.flat(lhsTint), .flat(rhsTint)):
+            lhsTint == rhsTint
+        default:
+            false
+        }
+    }
+}
+
+/// Turns a desktop still into the small blurred image the glass surfaces draw.
+///
+/// The blur is baked once, at thumbnail scale, and then stretched over a
+/// surface many times wider — not applied live to the window. Blurring 176 px
+/// is roughly two orders of magnitude less work than blurring the backing
+/// store, and the upscale is a second, free smoothing pass.
+enum DesktopBackdropRenderer {
+    static let stillWidth = 176
+    /// Radius in `stillWidth` pixels. Enough that no wallpaper detail survives
+    /// as a recognisable shape — this has to read as light, not as a picture.
+    static let blurRadius: Double = 12
+    /// A Gaussian average of a whole wallpaper is always less colourful than
+    /// the wallpaper. Lift it back so the desktop's hue survives the veil.
+    static let saturation: Double = 1.3
+
+    /// Dynamic desktops pack every hour of the day into one HEIC with nothing
+    /// in the container labelling the frames; the day frames lead and the night
+    /// frames trail, so each appearance takes the end nearest to it.
+    static func frameIndex(imageCount: Int, isDark: Bool) -> Int {
+        guard imageCount > 1 else { return 0 }
+        return isDark ? imageCount - 1 : 0
+    }
+
+    static func render(key: DesktopBackdropKey) -> DesktopPainting? {
+        guard let source = CGImageSourceCreateWithURL(key.url as CFURL, nil) else { return nil }
+        let index = frameIndex(imageCount: CGImageSourceGetCount(source), isDark: key.isDark)
+        let options: [CFString: Any] = [
+            kCGImageSourceCreateThumbnailFromImageAlways: true,
+            kCGImageSourceCreateThumbnailWithTransform: true,
+            kCGImageSourceThumbnailMaxPixelSize: stillWidth,
+        ]
+        guard let still = CGImageSourceCreateThumbnailAtIndex(
+            source,
+            index,
+            options as CFDictionary
+        ) else { return nil }
+
+        let tint = DesktopTintSampler.sample(image: still)
+        guard let blurred = blur(still) else { return .flat(tint) }
+        return .wallpaper(blurred, tint: tint)
+    }
+
+    /// `clampedToExtent` before the blur, cropped back after: without it the
+    /// Gaussian averages in transparent black at every edge and the backdrop
+    /// arrives with a dark vignette exactly where the window's corners are.
+    private static func blur(_ image: CGImage) -> CGImage? {
+        let input = CIImage(cgImage: image)
+        let extent = input.extent
+
+        let gaussian = CIFilter.gaussianBlur()
+        gaussian.inputImage = input.clampedToExtent()
+        gaussian.radius = Float(blurRadius)
+        guard let softened = gaussian.outputImage else { return nil }
+
+        let controls = CIFilter.colorControls()
+        controls.inputImage = softened
+        controls.saturation = Float(saturation)
+        guard let output = controls.outputImage else { return nil }
+
+        return CIContext(options: [.useSoftwareRenderer: false])
+            .createCGImage(output, from: extent)
     }
 }
 
@@ -1127,7 +1393,27 @@ struct DesktopTintComponents: Equatable, Sendable {
 }
 
 enum DesktopTintSampler {
-    private static let fallback = DesktopTintComponents(red: 0.38, green: 0.43, blue: 0.49)
+    static let fallback = DesktopTintComponents(red: 0.38, green: 0.43, blue: 0.49)
+
+    /// How much of the wallpaper's own chroma reaches the tint.
+    ///
+    /// This was 0.45 with a 0.18 slate mix, tuned back when the tint *was* the
+    /// backdrop and a saturated desktop could shout through the whole sidebar.
+    /// It no longer is: the painted wallpaper carries the desktop now, and the
+    /// tint's remaining jobs — the last fallback rung and the Tinted canvas —
+    /// both want the hue to be legible rather than damped. At the old values a
+    /// magenta desktop resolved to a 0.18-wide channel spread, which is grey
+    /// once a veil goes over it.
+    static let chromaRetention = 0.70
+    /// A small pull toward a cool slate keeps a *near*-neutral desktop from
+    /// picking up a random cast, without flattening a colourful one.
+    static let slateMix = 0.10
+    private static let slate = (red: 0.35, green: 0.42, blue: 0.50)
+    /// Floors low enough that a dark wallpaper stays dark. The veil above is
+    /// what guarantees legibility; clamping here only prevents a fully black or
+    /// blown-out desktop from producing a degenerate tint.
+    private static let floors = (red: 0.07, green: 0.07, blue: 0.09)
+    private static let ceilings = (red: 0.90, green: 0.91, blue: 0.92)
 
     static func sample(url: URL?) -> DesktopTintComponents {
         guard let url,
@@ -1135,7 +1421,10 @@ enum DesktopTintSampler {
               let image = CGImageSourceCreateImageAtIndex(source, 0, nil) else {
             return fallback
         }
+        return sample(image: image)
+    }
 
+    static func sample(image: CGImage) -> DesktopTintComponents {
         let side = 16
         var pixels = [UInt8](repeating: 0, count: side * side * 4)
         let drew = pixels.withUnsafeMutableBytes { bytes -> Bool in
@@ -1156,9 +1445,10 @@ enum DesktopTintSampler {
         return cooledAverage(rgba: pixels) ?? fallback
     }
 
-    /// Wallpaper color remains recognizable, with chroma compressed and mixed
-    /// toward a cool slate. This keeps tinted mode adaptive without turning a
-    /// blue desktop into a blue-on-blue application chrome.
+    /// The wallpaper's average, with its chroma pulled toward luminance and
+    /// then nudged toward a cool slate — enough to stay recognisably the
+    /// desktop's colour, not enough to turn a blue desktop into blue-on-blue
+    /// application chrome.
     static func cooledAverage(rgba: [UInt8]) -> DesktopTintComponents? {
         guard rgba.count >= 4 else { return nil }
         var red = 0.0
@@ -1179,47 +1469,266 @@ enum DesktopTintSampler {
         guard count > 0 else { return nil }
         let wallpaper = (red / count, green / count, blue / count)
         let luminance = wallpaper.0 * 0.2126 + wallpaper.1 * 0.7152 + wallpaper.2 * 0.0722
-        let chroma = 0.45
         let softened = (
-            luminance + (wallpaper.0 - luminance) * chroma,
-            luminance + (wallpaper.1 - luminance) * chroma,
-            luminance + (wallpaper.2 - luminance) * chroma
+            luminance + (wallpaper.0 - luminance) * chromaRetention,
+            luminance + (wallpaper.1 - luminance) * chromaRetention,
+            luminance + (wallpaper.2 - luminance) * chromaRetention
         )
-        let slate = (0.35, 0.42, 0.50)
-        let mix = 0.18
         return DesktopTintComponents(
-            red: min(0.82, max(0.14, softened.0 * (1 - mix) + slate.0 * mix)),
-            green: min(0.84, max(0.16, softened.1 * (1 - mix) + slate.1 * mix)),
-            blue: min(0.86, max(0.20, softened.2 * (1 - mix) + slate.2 * mix))
+            red: min(ceilings.red, max(floors.red, softened.0 * (1 - slateMix) + slate.red * slateMix)),
+            green: min(ceilings.green, max(floors.green, softened.1 * (1 - slateMix) + slate.green * slateMix)),
+            blue: min(ceilings.blue, max(floors.blue, softened.2 * (1 - slateMix) + slate.blue * slateMix))
         )
     }
 }
 
+/// Owns the one rendered desktop backdrop the whole app shares.
+///
+/// Every glass surface reads the same published painting, so a window with a
+/// sidebar and a canvas decodes and blurs the wallpaper once, not twice. There
+/// is no per-frame and no idle work: rendering happens only when the resolved
+/// key changes, and re-*resolution* is rate-limited because a focus change or a
+/// Space switch is a hint that the desktop may have changed, not proof.
 @MainActor
-final class DesktopTintProvider: ObservableObject {
-    @Published private(set) var components = DesktopTintComponents(
-        red: 0.38,
-        green: 0.43,
-        blue: 0.49
-    )
-    private var refreshTask: Task<Void, Never>?
-    private var lastURL: URL?
+final class DesktopBackdropProvider: ObservableObject {
+    static let shared = DesktopBackdropProvider()
 
-    var color: Color {
-        Color(red: components.red, green: components.green, blue: components.blue)
+    @Published private(set) var painting: DesktopPainting = .flat(DesktopTintSampler.fallback)
+
+    /// Wallpaper changes are not observable; they are polled off the hints
+    /// below. This is the floor between two disk reads.
+    static let minimumResolveInterval: TimeInterval = 2
+    /// Enough for a light/dark pair on each of two recently seen desktops.
+    private static let cacheLimit = 4
+
+    private var cache: [DesktopBackdropKey: DesktopPainting] = [:]
+    private var cacheOrder: [DesktopBackdropKey] = []
+    private var work: Task<Void, Never>?
+    private var lastResolved = Date.distantPast
+    private var lastAppearanceIsDark: Bool?
+    private var observers: [any NSObjectProtocol] = []
+
+    var tintColor: Color {
+        let tint = painting.tint
+        return Color(red: tint.red, green: tint.green, blue: tint.blue)
     }
 
-    func refresh() {
-        let url = NSScreen.main.flatMap { NSWorkspace.shared.desktopImageURL(for: $0) }
-        guard url != lastURL else { return }
-        lastURL = url
-        refreshTask?.cancel()
-        refreshTask = Task {
-            let sampled = await Task.detached(priority: .utility) {
-                DesktopTintSampler.sample(url: url)
+    private init() {
+        let workspace = NSWorkspace.shared.notificationCenter
+        let center = NotificationCenter.default
+        // Space switches and screen reconfiguration can both change which
+        // desktop picture applies; becoming key is when a wallpaper the user
+        // changed in System Settings first matters to us.
+        observers = [
+            workspace.addObserver(
+                forName: NSWorkspace.activeSpaceDidChangeNotification,
+                object: nil,
+                queue: .main
+            ) { [weak self] _ in MainActor.assumeIsolated { self?.invalidate() } },
+            center.addObserver(
+                forName: NSApplication.didBecomeActiveNotification,
+                object: nil,
+                queue: .main
+            ) { [weak self] _ in MainActor.assumeIsolated { self?.invalidate() } },
+            center.addObserver(
+                forName: NSApplication.didChangeScreenParametersNotification,
+                object: nil,
+                queue: .main
+            ) { [weak self] _ in MainActor.assumeIsolated { self?.invalidate() } },
+            center.addObserver(
+                forName: NSWindow.didBecomeKeyNotification,
+                object: nil,
+                queue: .main
+            ) { [weak self] _ in MainActor.assumeIsolated { self?.invalidate() } },
+        ]
+    }
+
+    /// Ask for the backdrop that matches `isDark`. Cheap and idempotent: an
+    /// appearance flip always re-resolves, anything else waits out the
+    /// rate limit.
+    func refresh(isDark: Bool) {
+        let appearanceChanged = isDark != lastAppearanceIsDark
+        let due = Date().timeIntervalSince(lastResolved) >= Self.minimumResolveInterval
+        guard appearanceChanged || due else { return }
+        lastAppearanceIsDark = isDark
+        lastResolved = Date()
+        resolve(isDark: isDark)
+    }
+
+    /// A hint arrived that the desktop may have changed. Re-resolution is
+    /// re-armed rather than performed, so a burst of notifications costs one
+    /// disk read at most.
+    private func invalidate() {
+        lastResolved = .distantPast
+        guard let isDark = lastAppearanceIsDark else { return }
+        refresh(isDark: isDark)
+    }
+
+    private func resolve(isDark: Bool) {
+        let desktopImageURL = Self.currentScreen()
+            .flatMap { NSWorkspace.shared.desktopImageURL(for: $0) }
+        work?.cancel()
+        work = Task { [weak self] in
+            let key = await Task.detached(priority: .utility) {
+                Self.key(desktopImageURL: desktopImageURL, isDark: isDark)
+            }.value
+            guard !Task.isCancelled, let self else { return }
+            guard let key else {
+                painting = .flat(DesktopTintSampler.fallback)
+                return
+            }
+            if let cached = cache[key] {
+                painting = cached
+                return
+            }
+            let rendered = await Task.detached(priority: .utility) {
+                DesktopBackdropRenderer.render(key: key)
             }.value
             guard !Task.isCancelled else { return }
-            components = sampled
+            let resolved = rendered ?? .flat(DesktopTintSampler.fallback)
+            self.store(resolved, for: key)
+            self.painting = resolved
+        }
+    }
+
+    private func store(_ painting: DesktopPainting, for key: DesktopBackdropKey) {
+        if cache[key] == nil { cacheOrder.append(key) }
+        cache[key] = painting
+        while cacheOrder.count > Self.cacheLimit {
+            cache.removeValue(forKey: cacheOrder.removeFirst())
+        }
+    }
+
+    private nonisolated static func key(
+        desktopImageURL: URL?,
+        isDark: Bool
+    ) -> DesktopBackdropKey? {
+        guard let url = DesktopWallpaperLocator
+            .resolveOnDisk(desktopImageURL: desktopImageURL).url else { return nil }
+        let modified = try? url.resourceValues(forKeys: [.contentModificationDateKey])
+            .contentModificationDate
+        return DesktopBackdropKey(path: url.path, modified: modified, isDark: isDark)
+    }
+
+    /// The desktop under *this* window, falling back to the primary display.
+    private static func currentScreen() -> NSScreen? {
+        NSApp?.keyWindow?.screen ?? NSApp?.mainWindow?.screen ?? NSScreen.main
+    }
+}
+
+/// The desktop layer beneath a glass veil.
+///
+/// This is the layer the wallpaper-only request is about: in `.wallpaper` mode
+/// nothing behind the window is sampled at all, so another app's window can
+/// never appear inside Kaisola's glass.
+struct DesktopGlassLayer: View {
+    let liveMaterial: NSVisualEffectView.Material
+    /// Tint coverage (dark, light) laid over *live* vibrancy only. In light
+    /// appearance AppKit's materials are near-white and pass almost no desktop
+    /// colour through, so live mode needs the sampled average to carry the hue.
+    /// The painted wallpaper already is the hue and must not be tinted twice.
+    var liveTint: (dark: Double, light: Double)?
+
+    @Environment(\.colorScheme) private var colorScheme
+    @ObservedObject private var settings: NativePreviewSettings
+    @ObservedObject private var desktop = DesktopBackdropProvider.shared
+
+    init(
+        liveMaterial: NSVisualEffectView.Material,
+        liveTint: (dark: Double, light: Double)? = nil,
+        settings: NativePreviewSettings = .shared
+    ) {
+        self.liveMaterial = liveMaterial
+        self.liveTint = liveTint
+        self.settings = settings
+    }
+
+    var body: some View {
+        layer
+            .onAppear { desktop.refresh(isDark: colorScheme == .dark) }
+            .onChange(of: colorScheme) { desktop.refresh(isDark: colorScheme == .dark) }
+    }
+
+    @ViewBuilder
+    private var layer: some View {
+        switch settings.glassBackdropSource {
+        case .wallpaper:
+            paintedDesktop
+        case .behindWindow:
+            ZStack {
+                NativeVisualEffectView(material: liveMaterial)
+                if let liveTint {
+                    LinearGradient(
+                        colors: [
+                            desktop.tintColor.opacity(colorScheme == .dark ? liveTint.dark : liveTint.light),
+                            desktop.tintColor.opacity(
+                                (colorScheme == .dark ? liveTint.dark : liveTint.light) * 0.55
+                            ),
+                        ],
+                        startPoint: .top,
+                        endPoint: .bottom
+                    )
+                }
+            }
+        }
+    }
+
+    /// The still is stretched, not aspect-filled. Every glass surface is a
+    /// different shape — a tall narrow sidebar beside a wide canvas — and
+    /// filling each one to its own aspect shows each a *different* crop of the
+    /// wallpaper, which reads as a seam between them. Stretching gives them all
+    /// the same left-to-right colour story, and at this blur radius the
+    /// distortion has nothing recognisable left to distort.
+    @ViewBuilder
+    private var paintedDesktop: some View {
+        switch desktop.painting {
+        case let .wallpaper(image, _):
+            Image(decorative: image, scale: 1, orientation: .up)
+                .resizable()
+                .interpolation(.high)
+                .antialiased(true)
+                .allowsHitTesting(false)
+        case let .flat(tint):
+            let color = Color(red: tint.red, green: tint.green, blue: tint.blue)
+            LinearGradient(
+                colors: [
+                    color.opacity(colorScheme == .dark ? 0.42 : 0.34),
+                    color.opacity(colorScheme == .dark ? 0.26 : 0.20),
+                ],
+                startPoint: .top,
+                endPoint: .bottom
+            )
+            .background(Color(nsColor: .windowBackgroundColor))
+        }
+    }
+}
+
+/// Reusable material used by both the project sidebar and the workspace file
+/// rail, keeping the two left-hand navigation surfaces visually coherent.
+struct SidebarBackdropView: View {
+    @Environment(\.colorScheme) private var colorScheme
+    @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
+    @Environment(\.colorSchemeContrast) private var accessibilityContrast
+    let appearance: SidebarAppearance
+
+    @ViewBuilder
+    var body: some View {
+        switch appearance {
+        case .glass:
+            if reduceTransparency {
+                Color(nsColor: .controlBackgroundColor)
+            } else {
+                ZStack {
+                    DesktopGlassLayer(liveMaterial: .sidebar, liveTint: (dark: 0.30, light: 0.26))
+                    GlassBackdropWash.sidebar(isDark: colorScheme == .dark).veil
+                    if accessibilityContrast == .increased {
+                        Color(nsColor: .controlBackgroundColor)
+                            .opacity(GlassBackdropWash.sidebarIncreasedContrastOverlay(isDark: colorScheme == .dark))
+                    }
+                }
+            }
+        case .solid:
+            Color(nsColor: .controlBackgroundColor)
         }
     }
 }
@@ -1228,14 +1737,14 @@ struct WorkspaceBackdropView: View {
     @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
     @Environment(\.colorScheme) private var colorScheme
     @Environment(\.colorSchemeContrast) private var accessibilityContrast
-    @StateObject private var desktopTint = DesktopTintProvider()
+    @ObservedObject private var desktop = DesktopBackdropProvider.shared
     let mode: WorkspaceBackdropMode
 
     var body: some View {
         backdrop
-            .onAppear { if mode == .tinted { desktopTint.refresh() } }
-            .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
-                if mode == .tinted { desktopTint.refresh() }
+            .onAppear { if mode == .tinted { desktop.refresh(isDark: colorScheme == .dark) } }
+            .onChange(of: colorScheme) {
+                if mode == .tinted { desktop.refresh(isDark: colorScheme == .dark) }
             }
     }
 
@@ -1249,7 +1758,7 @@ struct WorkspaceBackdropView: View {
                 Color(nsColor: .windowBackgroundColor)
             } else {
                 ZStack {
-                    NativeVisualEffectView(material: .underWindowBackground)
+                    DesktopGlassLayer(liveMaterial: .underWindowBackground)
                     GlassBackdropWash.workspace(isDark: colorScheme == .dark).veil
                     if accessibilityContrast == .increased {
                         Color(nsColor: .windowBackgroundColor)
@@ -1264,8 +1773,8 @@ struct WorkspaceBackdropView: View {
                 Color(nsColor: .windowBackgroundColor)
                 LinearGradient(
                     colors: [
-                        desktopTint.color.opacity(colorScheme == .dark ? 0.16 : 0.12),
-                        desktopTint.color.opacity(colorScheme == .dark ? 0.09 : 0.055),
+                        desktop.tintColor.opacity(colorScheme == .dark ? 0.16 : 0.12),
+                        desktop.tintColor.opacity(colorScheme == .dark ? 0.09 : 0.055),
                     ],
                     startPoint: .topLeading,
                     endPoint: .bottomTrailing

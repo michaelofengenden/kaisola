@@ -1,4 +1,5 @@
 import AppKit
+import ImageIO
 import XCTest
 @testable import Kaisola
 
@@ -579,6 +580,330 @@ final class NativePreviewSettingsTests: XCTestCase {
         }
     }
 
+    // MARK: - Wallpaper-only glass
+
+    /// Glass must read as the *desktop* seen through the window, never as the
+    /// other apps stacked behind it, so the painted wallpaper is the default
+    /// and live behind-window vibrancy survives only as an explicit choice.
+    func testGlassBackdropDefaultsToThePaintedWallpaperSource() {
+        let suite = "kaisola-backdrop-\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suite)!
+        defer { defaults.removePersistentDomain(forName: suite) }
+
+        let fresh = NativePreviewSettings(defaults: defaults)
+        XCTAssertEqual(fresh.glassBackdropSource, .wallpaper)
+
+        fresh.glassBackdropSource = .behindWindow
+        XCTAssertEqual(
+            NativePreviewSettings(defaults: defaults).glassBackdropSource,
+            .behindWindow
+        )
+        XCTAssertEqual(GlassBackdropSource.wallpaper.title, "Wallpaper")
+        XCTAssertEqual(GlassBackdropSource.behindWindow.title, "Live")
+    }
+
+    /// `desktopImageURL(for:)` does not fail for a dynamic desktop — it hands
+    /// back one fixed stand-in path for every screen. Painting *that* would
+    /// show the stock Big Sur picture to a user whose desktop is an aerial, so
+    /// the sentinel has to be recognised before it is treated as a wallpaper.
+    func testDynamicDesktopsAreRecognisedByTheirStandInPath() {
+        XCTAssertTrue(DesktopWallpaperLocator.isDynamicDesktopSentinel(
+            URL(fileURLWithPath: DesktopWallpaperLocator.dynamicDesktopSentinelPath)
+        ))
+        XCTAssertTrue(DesktopWallpaperLocator.isDynamicDesktopSentinel(
+            URL(fileURLWithPath: "/System/Library/CoreServices/../CoreServices/DefaultDesktop.heic")
+        ))
+        XCTAssertFalse(DesktopWallpaperLocator.isDynamicDesktopSentinel(
+            URL(fileURLWithPath: "/Users/test/Pictures/ridge.heic")
+        ))
+    }
+
+    /// The ladder is ordered, and each rung is only paid for when the one above
+    /// it came up empty — resolving an aerial reads two files off disk, so a
+    /// plain picture desktop must never trigger it.
+    func testWallpaperResolutionFallsBackOneRungAtATime() {
+        var aerialLookups = 0
+        let aerial = URL(fileURLWithPath: "/cache/aerial.png")
+        func resolve(_ url: URL?, aerialAvailable: Bool) -> DesktopWallpaperResolution {
+            DesktopWallpaperLocator.resolve(
+                desktopImageURL: url,
+                readableStill: { $0.pathExtension != "mov" },
+                aerialStill: {
+                    aerialLookups += 1
+                    return aerialAvailable ? aerial : nil
+                }
+            )
+        }
+
+        let picture = URL(fileURLWithPath: "/Users/test/Pictures/ridge.heic")
+        XCTAssertEqual(resolve(picture, aerialAvailable: true), .picture(picture))
+        XCTAssertEqual(aerialLookups, 0, "a readable picture must not touch the wallpaper store")
+
+        let sentinel = URL(fileURLWithPath: DesktopWallpaperLocator.dynamicDesktopSentinelPath)
+        XCTAssertEqual(resolve(sentinel, aerialAvailable: true), .aerialStill(aerial))
+        XCTAssertEqual(resolve(nil, aerialAvailable: true), .aerialStill(aerial))
+        XCTAssertEqual(
+            resolve(URL(fileURLWithPath: "/cache/aerial.mov"), aerialAvailable: true),
+            .aerialStill(aerial)
+        )
+
+        // Last rung: no still anywhere, so the veil sits on the cooled average
+        // rather than on whatever windows happen to be behind us.
+        XCTAssertEqual(resolve(sentinel, aerialAvailable: false), .unavailable)
+        XCTAssertEqual(resolve(nil, aerialAvailable: false), .unavailable)
+    }
+
+    /// The store nests a *second*, binary plist inside `Configuration`; the id
+    /// only exists in there. `AllSpacesAndDisplays` is the live choice and must
+    /// win over the `SystemDefault` copy that sits beside it.
+    func testAerialAssetIdentifierIsReadFromTheNestedConfigurationPlist() throws {
+        func configuration(_ assetID: String) throws -> Data {
+            try PropertyListSerialization.data(
+                fromPropertyList: ["assetID": assetID],
+                format: .binary,
+                options: 0
+            )
+        }
+        func choice(_ assetID: String) throws -> [String: Any] {
+            [
+                "Linked": [
+                    "Content": [
+                        "Choices": [
+                            [
+                                "Provider": "com.apple.wallpaper.choice.aerials",
+                                "Configuration": try configuration(assetID),
+                            ],
+                        ],
+                    ],
+                ],
+            ]
+        }
+        let index = try PropertyListSerialization.data(
+            fromPropertyList: [
+                "SystemDefault": try choice("STALE"),
+                "AllSpacesAndDisplays": try choice("LIVE"),
+            ] as [String: Any],
+            format: .binary,
+            options: 0
+        )
+        XCTAssertEqual(DesktopWallpaperLocator.aerialAssetID(indexPlist: index), "LIVE")
+
+        let pictureIndex = try PropertyListSerialization.data(
+            fromPropertyList: ["AllSpacesAndDisplays": ["Type": "individual"]] as [String: Any],
+            format: .binary,
+            options: 0
+        )
+        XCTAssertNil(DesktopWallpaperLocator.aerialAssetID(indexPlist: pictureIndex))
+        XCTAssertNil(DesktopWallpaperLocator.aerialAssetID(indexPlist: Data("not a plist".utf8)))
+    }
+
+    /// An aerial desktop is usually a *rotating category*, so no one file is
+    /// "the" wallpaper. Pick deterministically — the cache key depends on it —
+    /// and only ever from stills macOS has already downloaded, so resolving the
+    /// backdrop never reaches the network.
+    func testRotatingAerialCategoryResolvesToACachedRepresentativeStill() throws {
+        let manifest = try JSONSerialization.data(withJSONObject: [
+            "assets": [
+                ["id": "first", "categories": ["landscapes"], "preferredOrder": 1],
+                ["id": "second", "subcategories": ["landscapes"], "preferredOrder": 2],
+                ["id": "third", "categories": ["landscapes"], "preferredOrder": 3],
+                ["id": "elsewhere", "categories": ["cityscapes"], "preferredOrder": 0],
+            ],
+        ])
+
+        XCTAssertEqual(
+            DesktopWallpaperLocator.representativeAerialStill(
+                assetID: "landscapes",
+                manifest: manifest,
+                cachedStillIDs: ["first", "second", "third"]
+            ),
+            "first"
+        )
+        // The lowest-ordered member is not always downloaded.
+        XCTAssertEqual(
+            DesktopWallpaperLocator.representativeAerialStill(
+                assetID: "landscapes",
+                manifest: manifest,
+                cachedStillIDs: ["third", "second"]
+            ),
+            "second"
+        )
+        // A single pinned aerial resolves to itself without reading a category.
+        XCTAssertEqual(
+            DesktopWallpaperLocator.representativeAerialStill(
+                assetID: "third",
+                manifest: manifest,
+                cachedStillIDs: ["third"]
+            ),
+            "third"
+        )
+        XCTAssertNil(
+            DesktopWallpaperLocator.representativeAerialStill(
+                assetID: "landscapes",
+                manifest: manifest,
+                cachedStillIDs: ["elsewhere"]
+            )
+        )
+        XCTAssertNil(
+            DesktopWallpaperLocator.representativeAerialStill(
+                assetID: "landscapes",
+                manifest: Data("{}".utf8),
+                cachedStillIDs: ["first"]
+            )
+        )
+    }
+
+    /// Dynamic desktops pack every hour of the day into one HEIC with nothing
+    /// labelling the frames; the day frames lead and the night frames trail.
+    func testDynamicDesktopFramePicksTheEndMatchingTheAppearance() {
+        XCTAssertEqual(DesktopBackdropRenderer.frameIndex(imageCount: 16, isDark: false), 0)
+        XCTAssertEqual(DesktopBackdropRenderer.frameIndex(imageCount: 16, isDark: true), 15)
+        // A plain picture has exactly one frame in both appearances.
+        XCTAssertEqual(DesktopBackdropRenderer.frameIndex(imageCount: 1, isDark: true), 0)
+        XCTAssertEqual(DesktopBackdropRenderer.frameIndex(imageCount: 0, isDark: true), 0)
+        XCTAssertEqual(DesktopBackdropRenderer.frameIndex(imageCount: -3, isDark: false), 0)
+    }
+
+    /// The whole point of pre-rendering is that nothing re-blurs while the app
+    /// is idle, so the key has to change on exactly the three things that alter
+    /// the picture and on nothing else.
+    func testBackdropCacheKeyChangesOnlyWithTheDesktopItDraws() {
+        let stamp = Date(timeIntervalSince1970: 1_000)
+        let key = DesktopBackdropKey(path: "/w.heic", modified: stamp, isDark: false)
+
+        XCTAssertEqual(key, DesktopBackdropKey(path: "/w.heic", modified: stamp, isDark: false))
+        XCTAssertNotEqual(key, DesktopBackdropKey(path: "/other.heic", modified: stamp, isDark: false))
+        // Same path, replaced contents — "set as wallpaper" over the same file.
+        XCTAssertNotEqual(
+            key,
+            DesktopBackdropKey(path: "/w.heic", modified: stamp.addingTimeInterval(1), isDark: false)
+        )
+        // Appearance selects a different frame of a dynamic desktop.
+        XCTAssertNotEqual(key, DesktopBackdropKey(path: "/w.heic", modified: stamp, isDark: true))
+        XCTAssertEqual(key.url.path, "/w.heic")
+    }
+
+    /// Every rung above the last produces a real still, so the renderer has to
+    /// turn a file into a small blurred image plus the tint sampled from it.
+    func testWallpaperStillRendersToASmallBlurredImageAndItsTint() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appending(path: "kaisola-wallpaper-\(UUID().uuidString)", directoryHint: .isDirectory)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        // A saturated orange field, large enough that downscaling is real work.
+        let side = 512
+        let bitmap = try XCTUnwrap(NSBitmapImageRep(
+            bitmapDataPlanes: nil,
+            pixelsWide: side,
+            pixelsHigh: side,
+            bitsPerSample: 8,
+            samplesPerPixel: 4,
+            hasAlpha: true,
+            isPlanar: false,
+            colorSpaceName: .deviceRGB,
+            bytesPerRow: side * 4,
+            bitsPerPixel: 32
+        ))
+        for x in 0..<side {
+            for y in 0..<side {
+                bitmap.setColor(
+                    NSColor(deviceRed: 0.92, green: 0.44, blue: 0.10, alpha: 1),
+                    atX: x,
+                    y: y
+                )
+            }
+        }
+        let url = directory.appending(path: "wallpaper.png")
+        try XCTUnwrap(bitmap.representation(using: .png, properties: [:])).write(to: url)
+
+        let painting = try XCTUnwrap(DesktopBackdropRenderer.render(
+            key: DesktopBackdropKey(path: url.path, modified: nil, isDark: false)
+        ))
+        guard case let .wallpaper(image, tint) = painting else {
+            return XCTFail("a readable still must render as a painted wallpaper, got \(painting)")
+        }
+        // Pre-rendered small: the surface it fills is many times wider.
+        XCTAssertLessThanOrEqual(image.width, DesktopBackdropRenderer.stillWidth)
+        XCTAssertGreaterThan(image.width, 0)
+        // The tint keeps the wallpaper's identity: warm, and orange-ordered.
+        XCTAssertGreaterThan(tint.red, tint.green)
+        XCTAssertGreaterThan(tint.green, tint.blue)
+
+        XCTAssertNil(DesktopBackdropRenderer.render(
+            key: DesktopBackdropKey(
+                path: directory.appending(path: "missing.png").path,
+                modified: nil,
+                isDark: false
+            )
+        ))
+    }
+
+    /// End to end against whatever desktop this Mac is actually showing. The
+    /// one thing that must never happen is painting the stand-in picture: on a
+    /// machine running an aerial that would put the stock Big Sur photo behind
+    /// the glass. Vacuous — and passing — on a Mac with no readable desktop at
+    /// all, which is the state a headless CI runner is in.
+    func testLiveDesktopNeverResolvesToTheStandInPicture() throws {
+        let desktopImageURL = NSScreen.main.flatMap { NSWorkspace.shared.desktopImageURL(for: $0) }
+        let resolution = DesktopWallpaperLocator.resolveOnDisk(desktopImageURL: desktopImageURL)
+        guard let url = resolution.url else { return }
+
+        XCTAssertFalse(
+            DesktopWallpaperLocator.isDynamicDesktopSentinel(url),
+            "the ladder handed back the dynamic-desktop stand-in: \(url.path)"
+        )
+        XCTAssertNotNil(
+            CGImageSourceCreateWithURL(url as CFURL, nil),
+            "resolved \(url.path), which is not a decodable still"
+        )
+        let painting = DesktopBackdropRenderer.render(
+            key: DesktopBackdropKey(path: url.path, modified: nil, isDark: false)
+        )
+        guard case let .wallpaper(image, _) = painting else {
+            return XCTFail("live desktop \(url.path) did not render a painted backdrop")
+        }
+        XCTAssertLessThanOrEqual(image.width, DesktopBackdropRenderer.stillWidth)
+        print("[wallpaper-glass] resolved \(resolution) -> \(image.width)x\(image.height)")
+    }
+
+    /// With a real wallpaper *image* under the veil the tint no longer has to
+    /// carry the desktop on its own, but it is still what the last fallback
+    /// rung and the Tinted canvas paint — and the old 0.45 chroma with a 0.18
+    /// slate mix compressed a saturated desktop into grey. Michael's ask is a
+    /// tint you can actually see.
+    func testDesktopTintKeepsEnoughWallpaperHueToBeSeen() throws {
+        let tint = try XCTUnwrap(DesktopTintSampler.cooledAverage(rgba: [
+            255, 0, 0, 255,
+            0, 0, 255, 255,
+        ]))
+        XCTAssertEqual(tint.red, 0.3884, accuracy: 0.0001)
+        XCTAssertEqual(tint.green, 0.0804, accuracy: 0.0001)
+        XCTAssertEqual(tint.blue, 0.4034, accuracy: 0.0001)
+
+        // The property the numbers exist for. The pre-retune recipe returned
+        // 0.3117/0.16/0.3387 for this same magenta desktop: a 0.179 spread,
+        // which reads as grey once a 0.16-coverage veil is laid over it.
+        let spread = max(tint.red, tint.green, tint.blue) - min(tint.red, tint.green, tint.blue)
+        XCTAssertGreaterThan(spread, 0.30)
+        XCTAssertGreaterThan(DesktopTintSampler.chromaRetention, 0.45)
+        XCTAssertLessThan(DesktopTintSampler.slateMix, 0.18)
+
+        XCTAssertNil(DesktopTintSampler.cooledAverage(rgba: [0, 0, 0, 0]))
+    }
+
+    /// Retaining chroma must not invent it: a neutral desktop still has to come
+    /// back neutral, or every grey wallpaper picks up the slate stop as a cast.
+    func testDesktopTintLeavesANeutralWallpaperNeutral() throws {
+        let tint = try XCTUnwrap(DesktopTintSampler.cooledAverage(rgba: [
+            128, 128, 128, 255,
+            128, 128, 128, 255,
+        ]))
+        let spread = max(tint.red, tint.green, tint.blue) - min(tint.red, tint.green, tint.blue)
+        XCTAssertLessThan(spread, 0.02)
+        XCTAssertEqual(tint.red, 0.4868, accuracy: 0.0001)
+    }
+
     /// With no paired Mac the section was a permanent "No other Macs yet" plus
     /// a "Updated N seconds ago" line: two rows of chrome reporting nothing.
     func testOtherMacsSectionStaysHiddenUntilThereIsSomethingToReport() {
@@ -889,17 +1214,6 @@ final class NativePreviewSettingsTests: XCTestCase {
             "/Users/test/Developer"
         )
         XCTAssertNil(NativeFolderPickerStartingPoint.preferred(currentProject: nil))
-    }
-
-    func testDesktopTintSamplerKeepsWallpaperIdentityButCoolsIt() throws {
-        let tint = try XCTUnwrap(DesktopTintSampler.cooledAverage(rgba: [
-            255, 0, 0, 255,
-            0, 0, 255, 255,
-        ]))
-        XCTAssertEqual(tint.red, 0.3117, accuracy: 0.0001)
-        XCTAssertEqual(tint.green, 0.16, accuracy: 0.0001)
-        XCTAssertEqual(tint.blue, 0.3387, accuracy: 0.0001)
-        XCTAssertNil(DesktopTintSampler.cooledAverage(rgba: [0, 0, 0, 0]))
     }
 
     func testNativeGoogleAuthConfigurationParsesSecureURLs() throws {

@@ -28,8 +28,10 @@ Large product and architecture work remains ordered in
   `fa44da2`, `facc171`, `d5d12d1`).
 - The Git panel refreshes from filesystem events, stages or unstages every
   change in one reversible action, and fast-forwards only a clean branch with a
-  configured upstream. PR creation is split into an inspectable review followed
-  by explicit execution (`81a59cb`).
+  configured upstream. PR creation is split into review and execution; the
+  review discloses every changed path plus a credential-safe
+  remote/repository/base destination, and invalidates itself if that target
+  changes (`81a59cb`).
 - Status indicators expose shape and accessible names, and the user-facing copy
   pass removed several implementation terms (`50e00aa`, `949c4ef`).
 - Bounded PDF files now open in a native PDFKit surface with selection,

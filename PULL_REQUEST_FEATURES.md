@@ -185,15 +185,18 @@ Acceptance:
 
 The project-level Git inspector now follows workspace and `.git` changes,
 supports per-file and all-file stage/unstage, and permits only clean-tree,
-upstream-backed fast-forward pulls. Pull-request creation is already split into
-review and execution, but its remote/destination disclosure still needs to join
-the remaining Chat/Mesh and permission review work.
+upstream-backed fast-forward pulls. Pull-request review now captures a
+credential-redacted remote, repository, and base branch; execution rechecks and
+uses that exact destination. Chat/Mesh rendering and permission review remain.
 
 Completed scope:
 
 - Promote Git from a terminal-attached sheet into a project-level live
   inspector driven by workspace and `.git` changes, with stage/unstage-all and
   clean-tree, non-interactive fast-forward pull controls.
+- Replace the opaque “Push & Create PR” action with a two-step composer that
+  previews base, head, commits, files, title, body, remote, repository, and
+  destination before any push or pull-request creation.
 
 Remaining scope:
 
@@ -201,8 +204,6 @@ Remaining scope:
   syntax-highlighted code, copy controls, tables, clickable file-and-line
   references, and expandable tool artifacts. Keep streaming updates bounded so
   a growing answer does not reparse the whole transcript on every token.
-- Finish the two-step pull-request composer by adding the remote and destination
-  to its existing base, branch, commit, file-count, title, and body review.
 - Expand permission cards into a decision-grade inspector showing the raw
   command or resource, every affected path, and the exact scope of a proposed
   persistent rule. Preserve Deny, Allow Once, and Create Rule as distinct

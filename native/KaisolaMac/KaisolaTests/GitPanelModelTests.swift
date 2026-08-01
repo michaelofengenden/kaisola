@@ -178,7 +178,8 @@ final class GitPanelModelTests: XCTestCase {
             headOID: String(repeating: "a", count: 40),
             requestedBranchName: "ignored/name",
             commitSubjects: ["newest subject", "older subject"],
-            changedFileCount: 3
+            changedFileCount: 3,
+            changedFiles: ["Sources/App.swift", "Tests/AppTests.swift", "README.md"]
         )
         XCTAssertEqual(plan.baseBranch, "main")
         XCTAssertEqual(plan.headBranch, "feature/x")
@@ -186,6 +187,7 @@ final class GitPanelModelTests: XCTestCase {
         XCTAssertTrue(plan.setsUpstream)              // no upstream yet → push -u
         XCTAssertEqual(plan.commitSubjects.count, 2)
         XCTAssertEqual(plan.changedFileCount, 3)
+        XCTAssertEqual(plan.changedFiles, ["Sources/App.swift", "Tests/AppTests.swift", "README.md"])
         XCTAssertEqual(plan.title, "newest subject")
         XCTAssertEqual(plan.body, "- newest subject\n- older subject")
 
@@ -277,6 +279,7 @@ final class GitPanelModelTests: XCTestCase {
         // carried through untouched — execution runs the reviewed plan.
         XCTAssertEqual(edited.baseBranch, reviewed.baseBranch)
         XCTAssertEqual(edited.headOID, reviewed.headOID)
+        XCTAssertEqual(edited.changedFiles, reviewed.changedFiles)
         XCTAssertTrue(edited.createsBranch)
     }
 
@@ -314,6 +317,54 @@ final class GitPanelModelTests: XCTestCase {
         XCTAssertNotNil(GitPRPlanner.stalenessMessage(
             plan: plan, currentHeadOID: String(repeating: "1", count: 40), currentBranch: "other"
         ), "a branch switch after the review must invalidate the plan")
+    }
+
+    func testReviewedRemoteAndDestinationArePreservedAndInvalidateWhenChanged() throws {
+        let reviewedDestination = GitService.PRDestination(
+            remoteName: "origin",
+            remoteDisplayURL: "https://github.com/acme/widget",
+            webURL: "https://github.com/acme/widget",
+            remoteIdentity: "reviewed-identity",
+            baseBranch: "main",
+            isConfigured: true
+        )
+        let plan = try GitPRPlanner.assemble(
+            prep: prep(branch: "feature/x", isDefault: false, hasUpstream: true, ahead: 1),
+            defaultBranch: "main",
+            destination: reviewedDestination,
+            headOID: String(repeating: "7", count: 40),
+            requestedBranchName: "",
+            commitSubjects: ["work"],
+            changedFileCount: 1
+        )
+        XCTAssertEqual(plan.destination, reviewedDestination)
+        XCTAssertNil(GitPRPlanner.stalenessMessage(
+            plan: plan,
+            currentHeadOID: plan.headOID,
+            currentBranch: plan.headBranch,
+            currentDestination: reviewedDestination
+        ))
+
+        let changedRemote = GitService.PRDestination(
+            remoteName: "origin",
+            remoteDisplayURL: "https://github.com/acme/other",
+            webURL: "https://github.com/acme/other",
+            remoteIdentity: "changed-identity",
+            baseBranch: "main",
+            isConfigured: true
+        )
+        XCTAssertNotNil(GitPRPlanner.stalenessMessage(
+            plan: plan,
+            currentHeadOID: plan.headOID,
+            currentBranch: plan.headBranch,
+            currentDestination: changedRemote
+        ))
+        XCTAssertTrue(GitPRPlanner.isStale(
+            plan: plan,
+            currentHeadOID: plan.headOID,
+            currentBranch: plan.headBranch,
+            currentDestination: changedRemote
+        ))
     }
 
     /// The discriminating case `testAReviewedPlanIsRefusedOnceTheRepositoryMovesPastIt`
@@ -383,8 +434,7 @@ final class GitPanelModelTests: XCTestCase {
     // MARK: - Live model behavior
 
     /// The first click must assemble a review and execute NOTHING: no fork, no
-    /// push, no `gh`. The repo has no remote at all, so any push attempt would
-    /// surface as an error here.
+    /// push, no `gh`, even with a real web destination configured.
     @MainActor
     func testPreparingAPullRequestOnlyAssemblesAReview() throws {
         try write("a.txt", "one\n")
@@ -394,6 +444,7 @@ final class GitPanelModelTests: XCTestCase {
         try write("b.txt", "two\n")
         try git(["add", "b.txt"])
         try git(["commit", "-q", "-m", "feature work"])
+        try git(["remote", "add", "origin", "git@github.com:acme/widget.git"])
 
         let model = GitPanelModel(repoRoot: repo)
         model.preparePR()
@@ -405,6 +456,11 @@ final class GitPanelModelTests: XCTestCase {
         XCTAssertEqual(plan.baseBranch, "main")
         XCTAssertEqual(plan.commitSubjects, ["feature work"])
         XCTAssertEqual(plan.changedFileCount, 1)
+        XCTAssertEqual(plan.changedFiles, ["b.txt"])
+        XCTAssertEqual(plan.destination.remoteName, "origin")
+        XCTAssertEqual(plan.destination.remoteDisplayURL, "ssh://github.com/acme/widget")
+        XCTAssertEqual(plan.destination.webURL, "https://github.com/acme/widget")
+        XCTAssertTrue(plan.destination.isReadyForPullRequest)
         XCTAssertEqual(model.prTitleDraft, "feature work")
 
         // Nothing ran: no PR/compare URL, no error, no new branch, HEAD unmoved.

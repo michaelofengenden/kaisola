@@ -33,9 +33,9 @@ final class GitPanelModel: ObservableObject {
     /// nothing has run.
     @Published private(set) var prPlan: PRPlan?
     /// True once a background refresh observes that the repository moved past
-    /// the open plan (HEAD OID or checked-out branch differs from what it was
-    /// reviewed against). The card stays on screen so the user's edits aren't
-    /// lost, but Confirm is disabled until they review again.
+    /// the open plan (HEAD OID, checked-out branch, remote, or base destination
+    /// differs from what it was reviewed against). The card stays on screen so
+    /// the user's edits aren't lost, but Confirm is disabled until review.
     @Published private(set) var prPlanStale = false
     /// Review-stage edits. Seeded from the plan when it is assembled.
     @Published var prBranchDraft = "kaisola/pr-branch"
@@ -165,6 +165,7 @@ final class GitPanelModel: ObservableObject {
                 status: status,
                 prep: try? svc.prPrep(),
                 headOID: try? svc.headOID(),
+                destination: svc.prDestination(),
                 diffs: patches
             )
         } apply: { snapshot in
@@ -181,7 +182,8 @@ final class GitPanelModel: ObservableObject {
                 self.prPlanStale = GitPRPlanner.isStale(
                     plan: plan,
                     currentHeadOID: snapshot.headOID,
-                    currentBranch: snapshot.prep?.branch
+                    currentBranch: snapshot.prep?.branch,
+                    currentDestination: snapshot.destination
                 )
             } else {
                 self.prPlanStale = false
@@ -321,13 +323,17 @@ final class GitPanelModel: ObservableObject {
         prURL = nil
         let requested = prBranchDraft
         perform { service -> PRPlan in
-            try GitPRPlanner.assemble(
+            let destination = service.prDestination()
+            let changedFiles = try service.aheadChangedFiles()
+            return try GitPRPlanner.assemble(
                 prep: try service.prPrep(),
-                defaultBranch: service.defaultBranchName(),
+                defaultBranch: destination.baseBranch,
+                destination: destination,
                 headOID: try service.headOID(),
                 requestedBranchName: requested,
                 commitSubjects: try service.aheadSubjects(),
-                changedFileCount: (try? service.aheadChangedFiles().count) ?? 0
+                changedFileCount: changedFiles.count,
+                changedFiles: changedFiles
             )
         } apply: { plan in
             self.prPlan = plan
@@ -388,19 +394,38 @@ final class GitPanelModel: ObservableObject {
             if let stale = GitPRPlanner.stalenessMessage(
                 plan: plan,
                 currentHeadOID: try service.headOID(),
-                currentBranch: try service.prPrep().branch
+                currentBranch: try service.prPrep().branch,
+                currentDestination: service.prDestination()
             ) {
                 throw GitService.GitError.commandFailed(stale)
+            }
+            guard plan.destination.isReadyForPullRequest,
+                  let repositoryURL = plan.destination.webURL else {
+                throw GitService.GitError.commandFailed(
+                    "Add a web origin remote, then review the pull request again."
+                )
             }
             if plan.createsBranch {
                 try service.createBranchFromHead(named: plan.headBranch)
             }
-            try service.pushCurrentBranch(setUpstream: plan.setsUpstream)
+            try service.pushCurrentBranch(
+                setUpstream: plan.setsUpstream,
+                remoteName: plan.destination.remoteName
+            )
 
             let result: PRResult
             if GitService.ghAvailable() {
-                result = .created(url: try service.createPullRequest(title: plan.title, body: plan.body))
-            } else if let compare = try service.compareURL() {
+                result = .created(url: try service.createPullRequest(
+                    title: plan.title,
+                    body: plan.body,
+                    baseBranch: plan.baseBranch,
+                    headBranch: plan.headBranch,
+                    repositoryURL: repositoryURL
+                ))
+            } else if let compare = service.compareURL(
+                destination: plan.destination,
+                headBranch: plan.headBranch
+            ) {
                 result = .compare(url: compare)
             } else {
                 throw GitService.GitError.commandFailed("Install the GitHub CLI (gh) or add a GitHub origin remote to open a pull request.")
@@ -467,6 +492,7 @@ private struct GitRefreshSnapshot: Sendable {
     let status: GitService.Status
     let prep: GitService.PRPrep?
     let headOID: String?
+    let destination: GitService.PRDestination
     let diffs: [String: String]
 }
 
@@ -662,10 +688,10 @@ struct GitPanelView: View {
     }
 
     /// Pull requests in two steps. "Review Pull Request" assembles the plan and
-    /// shows it — base and head branch, the commits, the changed-file count, and
-    /// the editable title/body — without running anything. "Push and Create PR"
-    /// then executes exactly what is on screen (or opens a browser compare page
-    /// when gh is absent). The result URL is a tappable Link.
+    /// shows it — remote, destination, base and head branch, commits, exact
+    /// changed files, and editable title/body — without running anything. "Push
+    /// and Create PR" then executes exactly what is on screen (or opens a
+    /// browser compare page when gh is absent). The result URL is tappable.
     @ViewBuilder
     private var prSection: some View {
         VStack(alignment: .leading, spacing: 6) {
@@ -709,9 +735,13 @@ struct GitPanelView: View {
                 Image(systemName: "arrow.triangle.branch").font(.caption2).foregroundStyle(.secondary)
                 Text(prep.branch).font(.caption.monospaced())
                 if prep.aheadCount > 0 {
-                    Text("· \(prep.aheadCount) ahead").font(.caption).foregroundStyle(.secondary)
+                    Text("· \(prep.aheadCount) PR \(prep.aheadCount == 1 ? "commit" : "commits")")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
                 } else {
-                    Text("· nothing to push").font(.caption).foregroundStyle(.tertiary)
+                    Text("· no pull request commits")
+                        .font(.caption)
+                        .foregroundStyle(.tertiary)
                 }
                 Spacer()
             }
@@ -757,6 +787,50 @@ struct GitPanelView: View {
                 Spacer()
             }
 
+            HStack(alignment: .firstTextBaseline, spacing: 6) {
+                Text("Remote")
+                    .font(.caption2.weight(.semibold))
+                    .foregroundStyle(.secondary)
+                Text(plan.destination.remoteName)
+                    .font(.caption2.monospaced())
+                Text("·")
+                    .font(.caption2)
+                    .foregroundStyle(.tertiary)
+                Text(plan.destination.remoteDisplayURL)
+                    .font(.caption2.monospaced())
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                    .textSelection(.enabled)
+                Spacer()
+            }
+            .accessibilityElement(children: .combine)
+            .accessibilityLabel(
+                "Push remote \(plan.destination.remoteName), \(plan.destination.remoteDisplayURL)"
+            )
+
+            HStack(alignment: .firstTextBaseline, spacing: 6) {
+                Text("Destination")
+                    .font(.caption2.weight(.semibold))
+                    .foregroundStyle(.secondary)
+                Text("\(plan.destination.webURL ?? plan.destination.remoteDisplayURL) · \(plan.baseBranch)")
+                    .font(.caption2.monospaced())
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                    .textSelection(.enabled)
+                Spacer()
+            }
+            .accessibilityElement(children: .combine)
+            .accessibilityLabel(
+                "Pull request destination \(plan.destination.webURL ?? plan.destination.remoteDisplayURL), base branch \(plan.baseBranch)"
+            )
+
+            if !plan.destination.isReadyForPullRequest {
+                Label("Add a web origin remote, then review again", systemImage: "exclamationmark.triangle")
+                    .font(.caption2)
+                    .foregroundStyle(KaisolaStatusTone.needsYou.foregroundColor)
+                    .accessibilityIdentifier("git.pr.destinationUnavailable")
+            }
+
             Text("\(plan.commitCount) \(plan.commitCount == 1 ? "commit" : "commits") · "
                  + "\(plan.changedFileCount) \(plan.changedFileCount == 1 ? "file" : "files") changed")
                 .font(.caption2)
@@ -768,6 +842,30 @@ struct GitPanelView: View {
             if plan.commitSubjects.count > 6 {
                 Text("+ \(plan.commitSubjects.count - 6) more")
                     .font(.caption2).foregroundStyle(.tertiary)
+            }
+
+            if !plan.changedFiles.isEmpty {
+                DisclosureGroup {
+                    ScrollView {
+                        LazyVStack(alignment: .leading, spacing: 2) {
+                            ForEach(plan.changedFiles, id: \.self) { path in
+                                Text(path)
+                                    .font(.caption2.monospaced())
+                                    .textSelection(.enabled)
+                                    .frame(maxWidth: .infinity, alignment: .leading)
+                            }
+                        }
+                    }
+                    .frame(maxHeight: 150)
+                } label: {
+                    Label(
+                        "Review \(plan.changedFiles.count) changed "
+                            + "\(plan.changedFiles.count == 1 ? "file" : "files")",
+                        systemImage: "doc.on.doc"
+                    )
+                    .font(.caption2.weight(.medium))
+                }
+                .accessibilityIdentifier("git.pr.changedFiles")
             }
 
             if plan.createsBranch {
@@ -790,7 +888,10 @@ struct GitPanelView: View {
                 .accessibilityLabel("Pull request description")
 
             if !model.prPlanStale {
-                Text("Nothing has run yet — confirm to push \(plan.headBranch) and open the pull request.")
+                Text(
+                    "Nothing has run yet — confirm to push \(plan.headBranch) to "
+                        + "\(plan.destination.remoteName) and open the pull request against \(plan.baseBranch)."
+                )
                     .font(.caption2)
                     .foregroundStyle(.secondary)
             }
@@ -802,7 +903,11 @@ struct GitPanelView: View {
                     Label("Push and Create PR", systemImage: "arrow.up.forward.square")
                         .font(.caption)
                 }
-                .disabled(model.isBusy || model.prPlanStale)
+                .disabled(
+                    model.isBusy
+                        || model.prPlanStale
+                        || !plan.destination.isReadyForPullRequest
+                )
                 .accessibilityIdentifier("git.pr.confirm")
                 if model.prPlanStale {
                     Button {

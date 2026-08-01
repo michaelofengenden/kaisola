@@ -10,8 +10,12 @@ import Foundation
 /// data: assembled by `GitPRPlanner` for review, edited by the user, then handed
 /// back for execution unchanged.
 struct PRPlan: Equatable, Sendable {
+    /// The reviewed remote repository and base branch. Execution rechecks this
+    /// identity and uses it verbatim instead of asking Git or `gh` to infer a
+    /// destination after the user confirms.
+    var destination: GitService.PRDestination
     /// The branch the pull request will target.
-    var baseBranch: String
+    var baseBranch: String { destination.baseBranch }
     /// The branch that will be pushed (existing, or created when `createsBranch`).
     var headBranch: String
     /// True when the head branch does not exist yet and will be forked off HEAD.
@@ -25,6 +29,9 @@ struct PRPlan: Equatable, Sendable {
     var commitSubjects: [String]
     /// How many files those commits touch.
     var changedFileCount: Int
+    /// Exact paths those commits touch. Production plans always populate this;
+    /// the separate count keeps narrow planner fixtures representable.
+    var changedFiles: [String]
     var title: String
     var body: String
 
@@ -61,14 +68,24 @@ enum GitPRPlanner {
     static func assemble(
         prep: GitService.PRPrep,
         defaultBranch: String,
+        destination: GitService.PRDestination? = nil,
         headOID: String,
         requestedBranchName: String,
         commitSubjects: [String],
-        changedFileCount: Int
+        changedFileCount: Int,
+        changedFiles: [String] = []
     ) throws -> PRPlan {
         guard prep.aheadCount > 0 || !commitSubjects.isEmpty else {
             throw GitService.GitError.commandFailed(
                 "This branch has no commits to open a pull request with."
+            )
+        }
+        guard changedFileCount >= 0,
+              (changedFiles.isEmpty || changedFiles.count == changedFileCount),
+              Set(changedFiles).count == changedFiles.count,
+              changedFiles.allSatisfy({ !$0.isEmpty }) else {
+            throw GitService.GitError.commandFailed(
+                "The pull request file inventory is incomplete. Review it again."
             )
         }
 
@@ -88,14 +105,22 @@ enum GitPRPlanner {
             setsUpstream = !prep.hasUpstream
         }
 
+        let reviewedDestination = destination ?? .unavailable(baseBranch: defaultBranch)
+        guard reviewedDestination.baseBranch == defaultBranch else {
+            throw GitService.GitError.commandFailed(
+                "The reviewed pull request destination does not match its base branch."
+            )
+        }
+
         return PRPlan(
-            baseBranch: defaultBranch,
+            destination: reviewedDestination,
             headBranch: headBranch,
             createsBranch: createsBranch,
             setsUpstream: setsUpstream,
             headOID: headOID,
             commitSubjects: commitSubjects,
             changedFileCount: changedFileCount,
+            changedFiles: changedFiles,
             title: title(for: commitSubjects),
             body: body(for: commitSubjects)
         )
@@ -131,7 +156,12 @@ enum GitPRPlanner {
     /// and an agent can commit or switch branches in between — executing "the
     /// plan the user approved" against a different HEAD would push work nobody
     /// reviewed.
-    static func stalenessMessage(plan: PRPlan, currentHeadOID: String, currentBranch: String) -> String? {
+    static func stalenessMessage(
+        plan: PRPlan,
+        currentHeadOID: String,
+        currentBranch: String,
+        currentDestination: GitService.PRDestination? = nil
+    ) -> String? {
         if plan.headOID.lowercased() != currentHeadOID.lowercased() {
             return "The branch moved since this plan was reviewed. Review it again."
         }
@@ -149,6 +179,10 @@ enum GitPRPlanner {
         } else if plan.headBranch != currentBranch {
             return "The checked-out branch changed since this plan was reviewed. Review it again."
         }
+        if let currentDestination,
+           plan.destination != currentDestination {
+            return "The pull request remote or destination changed since this plan was reviewed. Review it again."
+        }
         return nil
     }
 
@@ -159,8 +193,18 @@ enum GitPRPlanner {
     /// stale" rather than guessing). Used by the panel's live refresh to
     /// self-invalidate an open plan without waiting for the user to click
     /// Confirm and hit the same check as an error.
-    static func isStale(plan: PRPlan, currentHeadOID: String?, currentBranch: String?) -> Bool {
+    static func isStale(
+        plan: PRPlan,
+        currentHeadOID: String?,
+        currentBranch: String?,
+        currentDestination: GitService.PRDestination? = nil
+    ) -> Bool {
         guard let currentHeadOID, let currentBranch else { return false }
-        return stalenessMessage(plan: plan, currentHeadOID: currentHeadOID, currentBranch: currentBranch) != nil
+        return stalenessMessage(
+            plan: plan,
+            currentHeadOID: currentHeadOID,
+            currentBranch: currentBranch,
+            currentDestination: currentDestination
+        ) != nil
     }
 }

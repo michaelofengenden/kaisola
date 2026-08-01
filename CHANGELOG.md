@@ -13,6 +13,7 @@
 - Reduce Motion now applies throughout the workspace and Settings; keyboard pane cycling also reaches Chat and Mesh composers.
 - Session status refreshes now share bounded process probes, and a noisy session helper can no longer stall app startup on a full output pipe.
 - Git can stage or unstage all changes at once and safely fast-forward a clean branch from its upstream.
+- Pull request review now shows every changed file plus the credential-safe remote, repository, and base branch, and refuses to run if that destination changes.
 
 ## 1.1.7 — 2026-07-31
 

@@ -36,6 +36,22 @@ enum GitProcessCapture {
     }
 }
 
+enum GitProcessEnvironment {
+    /// Configure a GUI-launched Git or GitHub CLI process to fail instead of
+    /// waiting on an invisible terminal, credential, or host-key prompt.
+    static func configureNonInteractive(_ process: Process) {
+        var environment = ProcessInfo.processInfo.environment
+        environment["GIT_TERMINAL_PROMPT"] = "0"
+        environment["GCM_INTERACTIVE"] = "Never"
+        environment["GIT_ASKPASS"] = "/usr/bin/false"
+        environment["SSH_ASKPASS"] = "/usr/bin/false"
+        environment["SSH_ASKPASS_REQUIRE"] = "never"
+        environment["GH_PROMPT_DISABLED"] = "1"
+        process.environment = environment
+        process.standardInput = FileHandle.nullDevice
+    }
+}
+
 /// A read-safe git status/stage/commit service over `git` as a child process.
 /// Mirrors the porcelain-v2 parsing validated by scripts/native-git-service.cjs
 /// (Codex). Never runs destructive commands (no reset --hard, clean, checkout,
@@ -397,16 +413,7 @@ struct GitService: Sendable {
         process.executableURL = URL(fileURLWithPath: "/usr/bin/git")
         process.arguments = arguments
         process.currentDirectoryURL = repoRoot
-        var environment = ProcessInfo.processInfo.environment
-        // A GUI operation must fail with an actionable error instead of
-        // waiting forever on an invisible credential or host-key prompt.
-        environment["GIT_TERMINAL_PROMPT"] = "0"
-        environment["GCM_INTERACTIVE"] = "Never"
-        environment["GIT_ASKPASS"] = "/usr/bin/false"
-        environment["SSH_ASKPASS"] = "/usr/bin/false"
-        environment["SSH_ASKPASS_REQUIRE"] = "never"
-        process.environment = environment
-        process.standardInput = FileHandle.nullDevice
+        GitProcessEnvironment.configureNonInteractive(process)
         let capture: (out: Data, err: Data)
         do { capture = try GitProcessCapture.run(process) }
         catch { throw GitError.commandFailed(error.localizedDescription) }

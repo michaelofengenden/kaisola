@@ -74,6 +74,10 @@ struct AcpPermissionRequest: Equatable, Sendable, Identifiable {
     let sessionID: String
     let title: String
     let options: [Option]
+    /// ACP's untyped `toolCall.rawInput`. Keeping the decoded JSON intact lets
+    /// the review card disclose the command/resource payload without guessing
+    /// at adapter-specific keys or flattening away structure.
+    var rawInput: JSONValue? = nil
     /// The tool-call kind (execute/edit/read/delete/fetch/other), used to derive
     /// and match standing allow-rules.
     var kind: String = "other"
@@ -85,6 +89,31 @@ struct AcpPermissionRequest: Equatable, Sendable, Identifiable {
         let id: String
         let name: String
         let kind: String
+    }
+}
+
+/// Review-relevant fields retained from the latest updates for one tool call.
+/// A permission request carries a `ToolCallUpdate`, so it may omit values the
+/// agent already declared in an earlier `session/update` event.
+struct AcpToolCallReviewContext: Equatable, Sendable {
+    var title: String?
+    var kind: String?
+    var rawInput: JSONValue?
+    var locationPaths: [String]
+    var diffPaths: [String]
+
+    init(
+        title: String? = nil,
+        kind: String? = nil,
+        rawInput: JSONValue? = nil,
+        locationPaths: [String] = [],
+        diffPaths: [String] = []
+    ) {
+        self.title = title
+        self.kind = kind
+        self.rawInput = rawInput
+        self.locationPaths = locationPaths
+        self.diffPaths = diffPaths
     }
 }
 

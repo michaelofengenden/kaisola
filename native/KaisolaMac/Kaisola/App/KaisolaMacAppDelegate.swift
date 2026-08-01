@@ -933,8 +933,11 @@ final class KaisolaMacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDele
                 model.setCompanionControlActive(true, for: terminal)
             } else if ["attention-completed", "topbar-attention"].contains(visualSurface) {
                 model.loadVisualCompletedAttentionFixture()
-            } else if visualSurface == "mixed" {
-                model.loadVisualMixedSessionFixture(workspace: workspace)
+            } else if visualSurface == "mixed" || visualSurface == "permission" {
+                model.loadVisualMixedSessionFixture(
+                    workspace: workspace,
+                    includePermission: visualSurface == "permission"
+                )
             } else if visualSurface == "preview-dirty-tab" {
                 let document = workspace.appendingPathComponent("README.md", isDirectory: false)
                 let docsDirectory = workspace.appendingPathComponent("docs", isDirectory: true)

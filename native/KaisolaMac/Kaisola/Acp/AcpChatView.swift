@@ -50,13 +50,14 @@ struct AcpChatView: View {
             }
             Divider()
             transcript
-            if let permission = conversation.pendingPermission {
+            if let review = conversation.pendingPermissionReview {
                 AcpPermissionBar(
-                    request: permission,
+                    review: review,
                     allowsRule: conversation.pendingPermissionAllowsRule,
                     pendingCount: conversation.pendingPermissionCount,
-                    answer: { conversation.answerPermission($0) },
-                    always: { conversation.answerPermissionAlways() }
+                    deny: { conversation.denyPermission() },
+                    allowOnce: { conversation.allowPermissionOnce() },
+                    createRule: { conversation.answerPermissionAlways() }
                 )
             }
             Divider()
@@ -1076,97 +1077,203 @@ struct PlanCard: View {
 }
 
 struct AcpPermissionBar: View {
-    let request: AcpPermissionRequest
+    let review: AcpPermissionReview
     let allowsRule: Bool
     let pendingCount: Int
-    let answer: (String) -> Void
-    let always: () -> Void
+    let deny: () -> Void
+    let allowOnce: () -> Void
+    let createRule: () -> Void
     var enablesKeyboardShortcuts = true
 
-    private var defaultOptionID: String? {
-        request.options.first { !$0.kind.contains("reject") }?.id
-    }
-
-    private var cancelOptionID: String? {
-        request.options.first { $0.kind.contains("reject") }?.id
-    }
-
-    private var derivedRuleLabel: String {
-        let rule = AcpPermissionRules.ruleForRequest(kind: request.kind, title: request.title)
-        return "\(rule.action) · \(AcpPermissionRules.ruleLabel(action: rule.action, resource: rule.resource))"
+    private var ruleUnavailableReason: String {
+        review.allowOnceOptionID == nil
+            ? "The adapter did not offer an exact one-time allow, so Kaisola cannot create a safe local rule."
+            : "This request touches a protected path. Kaisola will always ask."
     }
 
     var body: some View {
-        HStack(spacing: 10) {
-            Image(systemName: allowsRule ? "hand.raised.fill" : "exclamationmark.shield.fill")
-                .foregroundStyle(
-                    allowsRule
-                        ? KaisolaStatusTone.needsYou.foregroundColor
-                        : KaisolaStatusTone.failed.foregroundColor
-                )
-            VStack(alignment: .leading, spacing: 2) {
-                Text(request.title).font(.callout).lineLimit(2)
-                if !allowsRule {
-                    Text("Sensitive file — always asks")
-                        .font(.caption2)
-                        .foregroundStyle(KaisolaStatusTone.failed.foregroundColor)
-                } else {
-                    Text("Always Allow scope: \(derivedRuleLabel)")
-                        .font(.caption2)
-                        .foregroundStyle(.secondary)
-                }
-                if !request.paths.isEmpty {
-                    Text(request.paths.joined(separator: ", "))
-                        .font(.caption2.monospaced())
-                        .foregroundStyle(.secondary)
-                        .lineLimit(2)
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(alignment: .top, spacing: 9) {
+                Image(systemName: allowsRule ? "hand.raised.fill" : "exclamationmark.shield.fill")
+                    .foregroundStyle(
+                        allowsRule
+                            ? KaisolaStatusTone.needsYou.foregroundColor
+                            : KaisolaStatusTone.failed.foregroundColor
+                    )
+                    .accessibilityHidden(true)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Permission required")
+                        .font(.headline)
+                    Text(review.title)
+                        .font(.callout)
                         .textSelection(.enabled)
-                        .help(request.paths.joined(separator: "\n"))
                 }
+                Spacer(minLength: 8)
                 if pendingCount > 1 {
                     Text("\(pendingCount - 1) more permission request\(pendingCount == 2 ? "" : "s") queued")
                         .font(.caption2)
                         .foregroundStyle(.secondary)
+                        .multilineTextAlignment(.trailing)
                 }
             }
-            Spacer()
-            if allowsRule {
-                Button("Always Allow") { always() }
+
+            inspectorSection(review.rawInputIsTitleFallback ? "Agent-provided request" : "Raw input") {
+                ScrollView([.horizontal, .vertical]) {
+                    Text(review.rawInput)
+                        .font(.caption.monospaced())
+                        .textSelection(.enabled)
+                        .fixedSize(horizontal: true, vertical: true)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
+                .frame(minHeight: 34, maxHeight: 96, alignment: .topLeading)
+                .inspectorSurface()
+                if review.rawInputIsTitleFallback {
+                    Text("This adapter did not provide ACP rawInput; the exact title above is the only request payload available.")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                }
+            }
+
+            inspectorSection("Affected paths (\(review.paths.count))") {
+                if review.paths.isEmpty {
+                    Text("None declared by the adapter.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                } else {
+                    ScrollView([.horizontal, .vertical]) {
+                        VStack(alignment: .leading, spacing: 3) {
+                            ForEach(Array(review.paths.enumerated()), id: \.offset) { _, path in
+                                Text(path)
+                                    .font(.caption.monospaced())
+                                    .textSelection(.enabled)
+                                    .fixedSize(horizontal: true, vertical: true)
+                            }
+                        }
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                    }
+                    .frame(minHeight: 24, maxHeight: 88, alignment: .topLeading)
+                    .inspectorSurface()
+                }
+            }
+
+            inspectorSection(allowsRule ? "Proposed standing rule" : "Standing rule unavailable") {
+                if allowsRule {
+                    ruleScopeRow("Workspace", review.ruleScope.workspace)
+                    ruleScopeRow("Action", review.ruleScope.action)
+                    ruleScopeRow("Resource", review.ruleScope.resource)
+                    Text("Future requests must match all three fields.")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                } else {
+                    Text(ruleUnavailableReason)
+                        .font(.caption)
+                        .foregroundStyle(KaisolaStatusTone.failed.foregroundColor)
+                }
+            }
+
+            if !review.omittedOptions.isEmpty {
+                let labels = review.omittedOptions.map { "\($0.name) [\($0.kind)]" }.joined(separator: ", ")
+                Text("Additional adapter choices not exposed: \(labels). Kaisola offers only scoped local persistence and one-time wire decisions.")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .textSelection(.enabled)
+            }
+
+            HStack(spacing: 8) {
+                Spacer(minLength: 0)
+                denyButton
+                allowOnceButton
+                Button("Create Rule") { createRule() }
                     .buttonStyle(.bordered)
                     .tint(.green)
-                    .help("Allow this and create the standing rule: \(derivedRuleLabel)")
-            }
-            ForEach(request.options) { option in
-                optionButton(option)
+                    .disabled(!allowsRule)
+                    .help(allowsRule
+                        ? "Allow once and save exactly the workspace, action, and resource shown above"
+                        : ruleUnavailableReason)
             }
         }
         .padding(12)
         .background(.regularMaterial)
+        .overlay(alignment: .top) {
+            Rectangle()
+                .fill(KaisolaStatusTone.needsYou.foregroundColor.opacity(0.35))
+                .frame(height: 1)
+        }
         .accessibilityElement(children: .contain)
-        .accessibilityLabel("Permission request: \(request.title)")
-        .accessibilityHint("Use Return for the suggested allow action or Escape to reject")
+        .accessibilityLabel("Permission request: \(review.title)")
+        .accessibilityHint(review.allowOnceOptionID == nil
+            ? "Use Escape to deny this request"
+            : "Use Return to allow once or Escape to deny")
     }
 
     @ViewBuilder
-    private func optionButton(_ option: AcpPermissionRequest.Option) -> some View {
-        if enablesKeyboardShortcuts, option.id == defaultOptionID {
-            baseOptionButton(option)
-                .keyboardShortcut(.defaultAction)
-        } else if enablesKeyboardShortcuts, option.id == cancelOptionID {
-            baseOptionButton(option)
+    private var denyButton: some View {
+        if enablesKeyboardShortcuts {
+            baseDenyButton
                 .keyboardShortcut(.cancelAction)
         } else {
-            baseOptionButton(option)
+            baseDenyButton
         }
     }
 
-    private func baseOptionButton(_ option: AcpPermissionRequest.Option) -> some View {
-        Button(option.name) { answer(option.id) }
+    private var baseDenyButton: some View {
+        Button("Deny") { deny() }
             .buttonStyle(.bordered)
-            .tint(option.kind.contains("reject") ? .red : .accentColor)
-            .accessibilityHint(option.kind.contains("reject")
-                ? "Reject this agent request"
-                : "Allow this agent request once")
+            .tint(.red)
+            .accessibilityHint("Deny this request without creating a persistent rule")
+    }
+
+    @ViewBuilder
+    private var allowOnceButton: some View {
+        if enablesKeyboardShortcuts {
+            baseAllowOnceButton
+                .keyboardShortcut(.defaultAction)
+        } else {
+            baseAllowOnceButton
+        }
+    }
+
+    private var baseAllowOnceButton: some View {
+        Button("Allow Once") { allowOnce() }
+            .buttonStyle(.bordered)
+            .disabled(review.allowOnceOptionID == nil)
+            .help(review.allowOnceOptionID == nil
+                ? "The adapter did not offer a one-time allow option"
+                : "Allow only this request without saving a rule")
+            .accessibilityHint("Allow this request once without saving a rule")
+    }
+
+    @ViewBuilder
+    private func inspectorSection<Content: View>(
+        _ title: String,
+        @ViewBuilder content: () -> Content
+    ) -> some View {
+        VStack(alignment: .leading, spacing: 5) {
+            Text(title)
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(.secondary)
+            content()
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    private func ruleScopeRow(_ label: String, _ value: String) -> some View {
+        VStack(alignment: .leading, spacing: 1) {
+            Text(label)
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+            Text(value)
+                .font(.caption.monospaced())
+                .textSelection(.enabled)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+}
+
+private extension View {
+    func inspectorSurface() -> some View {
+        padding(7)
+            .background(.quaternary.opacity(0.45), in: RoundedRectangle(cornerRadius: 6))
     }
 }
 

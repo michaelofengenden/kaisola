@@ -187,7 +187,10 @@ The project-level Git inspector now follows workspace and `.git` changes,
 supports per-file and all-file stage/unstage, and permits only clean-tree,
 upstream-backed fast-forward pulls. Pull-request review now captures a
 credential-redacted remote, repository, and base branch; execution rechecks and
-uses that exact destination. Chat/Mesh rendering and permission review remain.
+uses that exact destination. Chat and Mesh permission asks now disclose the
+adapter's raw input, every declared path, and the literal local-rule scope before
+offering separate Deny, Allow Once, and Create Rule actions. Cached block
+rendering remains.
 
 Completed scope:
 
@@ -197,6 +200,11 @@ Completed scope:
 - Replace the opaque “Push & Create PR” action with a two-step composer that
   previews base, head, commits, files, title, body, remote, repository, and
   destination before any push or pull-request creation.
+- Expand permission cards into a bounded, selectable inspector for raw ACP
+  input, every declared affected path, and the exact workspace/action/resource
+  tuple Kaisola will persist. Keep adapter-owned opaque persistence out of the
+  safe controls, and preserve Deny, Allow Once, and Create Rule as distinct
+  decisions in both Chat and Mesh.
 
 Remaining scope:
 
@@ -204,10 +212,6 @@ Remaining scope:
   syntax-highlighted code, copy controls, tables, clickable file-and-line
   references, and expandable tool artifacts. Keep streaming updates bounded so
   a growing answer does not reparse the whole transcript on every token.
-- Expand permission cards into a decision-grade inspector showing the raw
-  command or resource, every affected path, and the exact scope of a proposed
-  persistent rule. Preserve Deny, Allow Once, and Create Rule as distinct
-  choices.
 
 Acceptance:
 

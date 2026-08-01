@@ -574,14 +574,15 @@ private struct MeshColumnView: View {
                     }
                 }
             }
-            if let permission = conversation.pendingPermission {
+            if let review = conversation.pendingPermissionReview {
                 Divider()
                 AcpPermissionBar(
-                    request: permission,
+                    review: review,
                     allowsRule: conversation.pendingPermissionAllowsRule,
                     pendingCount: conversation.pendingPermissionCount,
-                    answer: { conversation.answerPermission($0) },
-                    always: { conversation.answerPermissionAlways() },
+                    deny: { conversation.denyPermission() },
+                    allowOnce: { conversation.allowPermissionOnce() },
+                    createRule: { conversation.answerPermissionAlways() },
                     enablesKeyboardShortcuts: enablesPermissionShortcuts
                 )
                 .controlSize(.small)

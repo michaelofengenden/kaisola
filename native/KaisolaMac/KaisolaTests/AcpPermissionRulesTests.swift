@@ -1,4 +1,5 @@
 import Foundation
+import KaisolaCore
 import XCTest
 @testable import Kaisola
 
@@ -24,19 +25,19 @@ final class AcpPermissionRulesTests: XCTestCase {
     // MARK: - Rule derivation
 
     func testRuleForExecuteUsesFirstWord() {
-        let rule = AcpPermissionRules.ruleForRequest(kind: "execute", title: "git commit -m 'x'")
+        let rule = AcpPermissionRules.ruleForRequest(kind: "execute", resource: "git commit -m 'x'")
         XCTAssertEqual(rule.action, "execute")
         XCTAssertEqual(rule.resource, "git *")
     }
 
     func testRuleForNonExecuteAllowsWholeKind() {
-        let rule = AcpPermissionRules.ruleForRequest(kind: "edit", title: "Edit src/app.ts")
+        let rule = AcpPermissionRules.ruleForRequest(kind: "edit", resource: "Edit src/app.ts")
         XCTAssertEqual(rule.action, "edit")
         XCTAssertEqual(rule.resource, "*")
     }
 
     func testEmptyKindBecomesOther() {
-        let rule = AcpPermissionRules.ruleForRequest(kind: "", title: "do a thing")
+        let rule = AcpPermissionRules.ruleForRequest(kind: "", resource: "do a thing")
         XCTAssertEqual(rule.action, "other")
     }
 
@@ -46,22 +47,149 @@ final class AcpPermissionRulesTests: XCTestCase {
         XCTAssertEqual(AcpPermissionRules.ruleLabel(action: "execute", resource: "exact"), "exact")
     }
 
+    func testPermissionReviewDisclosesRawInputEveryUniquePathAndExactRuleScope() throws {
+        let rawInput = JSONValue.object([
+            "command": .string("git status --short"),
+            "target": .string("Sources/App.swift"),
+        ])
+        let options = [
+            AcpPermissionRequest.Option(id: "allow", name: "Proceed once", kind: "allow_once"),
+            AcpPermissionRequest.Option(id: "deny", name: "Reject once", kind: "reject_once"),
+            AcpPermissionRequest.Option(id: "always", name: "Always proceed", kind: "allow_always"),
+        ]
+        let request = AcpPermissionRequest(
+            id: 7,
+            sessionID: "s",
+            title: "Inspect repository status",
+            options: options,
+            rawInput: rawInput,
+            kind: "execute",
+            paths: ["Sources/App.swift", "Sources/App.swift", "Tests/Odd\nName.swift"]
+        )
+
+        let review = AcpPermissionReview(request: request, workspace: "/work/project")
+
+        XCTAssertFalse(review.rawInputIsTitleFallback)
+        XCTAssertEqual(
+            try JSONDecoder().decode(JSONValue.self, from: Data(review.rawInput.utf8)),
+            rawInput
+        )
+        XCTAssertEqual(review.paths, ["Sources/App.swift", "Tests/Odd\nName.swift"])
+        XCTAssertEqual(review.ruleScope, AcpPermissionRuleScope(
+            workspace: "/work/project",
+            action: "execute",
+            resource: "git *"
+        ))
+        XCTAssertEqual(review.allowOnceOptionID, "allow")
+        XCTAssertEqual(review.denyOnceOptionID, "deny")
+        XCTAssertEqual(review.omittedOptions.map(\.id), ["always"])
+    }
+
+    func testPermissionReviewLabelsTitleFallbackInsteadOfInventingRawInput() {
+        let request = AcpPermissionRequest(
+            id: 1,
+            sessionID: "s",
+            title: "Human-readable adapter title",
+            options: []
+        )
+
+        let review = AcpPermissionReview(request: request, workspace: "/work")
+
+        XCTAssertTrue(review.rawInputIsTitleFallback)
+        XCTAssertEqual(review.rawInput, "Human-readable adapter title")
+        XCTAssertNil(review.allowOnceOptionID)
+        XCTAssertNil(review.denyOnceOptionID)
+    }
+
     // MARK: - Rule matching
 
     func testRequestMatchesRuleByWorkspaceActionAndResource() {
         let rules = [
             PermissionRule(id: "1", workspace: "/w", action: "execute", resource: "git *", at: 0),
         ]
-        XCTAssertNotNil(AcpPermissionRules.requestMatchesRule(rules, workspace: "/w", kind: "execute", title: "git push"))
+        XCTAssertNotNil(AcpPermissionRules.requestMatchesRule(rules, workspace: "/w", kind: "execute", resource: "git push"))
         // Wrong workspace, wrong action, and non-matching resource all miss.
-        XCTAssertNil(AcpPermissionRules.requestMatchesRule(rules, workspace: "/other", kind: "execute", title: "git push"))
-        XCTAssertNil(AcpPermissionRules.requestMatchesRule(rules, workspace: "/w", kind: "edit", title: "git push"))
-        XCTAssertNil(AcpPermissionRules.requestMatchesRule(rules, workspace: "/w", kind: "execute", title: "npm test"))
+        XCTAssertNil(AcpPermissionRules.requestMatchesRule(rules, workspace: "/other", kind: "execute", resource: "git push"))
+        XCTAssertNil(AcpPermissionRules.requestMatchesRule(rules, workspace: "/w", kind: "edit", resource: "git push"))
+        XCTAssertNil(AcpPermissionRules.requestMatchesRule(rules, workspace: "/w", kind: "execute", resource: "npm test"))
     }
 
     func testNilWorkspaceNeverMatches() {
         let rules = [PermissionRule(id: "1", workspace: "/w", action: "execute", resource: "*", at: 0)]
-        XCTAssertNil(AcpPermissionRules.requestMatchesRule(rules, workspace: nil, kind: "execute", title: "anything"))
+        XCTAssertNil(AcpPermissionRules.requestMatchesRule(rules, workspace: nil, kind: "execute", resource: "anything"))
+    }
+
+    @MainActor
+    func testCreateRulePersistsTheScopeShownInReview() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("kaisola-reviewed-rule-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let store = PermissionRuleStore(fileURL: directory.appendingPathComponent("rules.json"))
+        let conversation = AcpConversation(
+            title: "Permission",
+            command: "unused",
+            arguments: [],
+            cwd: "/work/project",
+            ruleStore: store,
+            sensitiveGlobs: []
+        )
+        conversation.receivePermissionForTesting(AcpPermissionRequest(
+            id: 1,
+            sessionID: "s",
+            title: "Inspect repository status",
+            options: [
+                .init(id: "allow", name: "Allow once", kind: "allow_once"),
+                .init(id: "deny", name: "Reject once", kind: "reject_once"),
+            ],
+            rawInput: .string("git status --short"),
+            kind: "execute"
+        ))
+        let displayedScope = try XCTUnwrap(conversation.pendingPermissionReview?.ruleScope)
+        XCTAssertEqual(displayedScope.resource, "git *")
+
+        conversation.answerPermissionAlways()
+
+        let stored = try XCTUnwrap(store.rules().first)
+        XCTAssertEqual(stored.workspace, displayedScope.workspace)
+        XCTAssertEqual(stored.action, displayedScope.action)
+        XCTAssertEqual(stored.resource, displayedScope.resource)
+        XCTAssertNil(conversation.pendingPermission)
+    }
+
+    @MainActor
+    func testMatchingRuleCannotEscalateToAdapterOwnedAlwaysAllow() {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("kaisola-no-always-escalation-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let store = PermissionRuleStore(fileURL: directory.appendingPathComponent("rules.json"))
+        _ = store.add(PermissionRule(
+            id: "existing",
+            workspace: "/work/project",
+            action: "execute",
+            resource: "git *",
+            at: 0
+        ))
+        let conversation = AcpConversation(
+            title: "Permission",
+            command: "unused",
+            arguments: [],
+            cwd: "/work/project",
+            ruleStore: store,
+            sensitiveGlobs: []
+        )
+        conversation.receivePermissionForTesting(AcpPermissionRequest(
+            id: 2,
+            sessionID: "s",
+            title: "git push",
+            options: [
+                .init(id: "always", name: "Always allow", kind: "allow_always"),
+                .init(id: "deny", name: "Reject once", kind: "reject_once"),
+            ],
+            kind: "execute"
+        ))
+
+        XCTAssertEqual(conversation.pendingPermission?.id, 2)
+        XCTAssertFalse(conversation.pendingPermissionAllowsRule)
     }
 
     // MARK: - Sensitive files
@@ -84,6 +212,12 @@ final class AcpPermissionRulesTests: XCTestCase {
         let globs = AcpPermissionRules.defaultSensitiveGlobs
         XCTAssertTrue(AcpPermissionRules.requestIsSensitive(globs: globs, title: "Edit file", paths: ["app/.env"]))
         XCTAssertTrue(AcpPermissionRules.requestIsSensitive(globs: globs, title: "cat 'secrets.yml'", paths: []))
+        XCTAssertTrue(AcpPermissionRules.requestIsSensitive(
+            globs: globs,
+            title: "Read configuration",
+            paths: [],
+            rawInput: .object(["command": .string("cat .env")])
+        ))
         XCTAssertFalse(AcpPermissionRules.requestIsSensitive(globs: globs, title: "ls -la", paths: ["src/main.swift"]))
     }
 

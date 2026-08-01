@@ -559,34 +559,64 @@ final class AcpConversation: ObservableObject {
         presentNextPermission()
     }
 
-    /// Grant this ask AND create a standing rule so future matching asks
-    /// auto-allow. Refused for sensitive-file asks — those can never be
-    /// rule-covered (the button is hidden in that case, this is defense in depth).
-    func answerPermissionAlways() {
+    /// Deny once when the adapter exposes that exact option. If it does not,
+    /// return ACP's non-persistent cancelled outcome rather than accidentally
+    /// selecting an opaque `reject_always` choice.
+    func denyPermission() {
         guard let permission = pendingPermission else { return }
-        if !AcpPermissionRules.requestIsSensitive(globs: sensitiveGlobs, title: permission.title, paths: permission.paths) {
-            let derived = AcpPermissionRules.ruleForRequest(kind: permission.kind, title: permission.title)
-            let rule = PermissionRule(
-                id: UUID().uuidString,
-                workspace: cwd,
-                action: derived.action,
-                resource: derived.resource,
-                at: Int64(Date().timeIntervalSince1970 * 1_000)
-            )
-            _ = ruleStore.add(rule)
+        if let option = permission.denyOnceOption {
+            answerPermission(option.id)
+            return
         }
-        answerAllowOnce(permission)
+        pendingPermission = nil
+        Task { await client.cancelPermission(id: permission.id) }
+        presentNextPermission()
+    }
+
+    /// Select only an exact one-time allow. Adapter-owned `allow_always`
+    /// choices are deliberately excluded because their scope is not inspectable.
+    func allowPermissionOnce() {
+        guard let option = pendingPermission?.allowOnceOption else { return }
+        answerPermission(option.id)
+    }
+
+    /// Grant this ask AND create a standing rule so future matching asks
+    /// auto-allow. Refused for sensitive-file asks and adapters without an exact
+    /// one-time allow; the disabled UI is backed by this defense in depth.
+    func answerPermissionAlways() {
+        guard let review = pendingPermissionReview,
+              let allowOnceOptionID = review.allowOnceOptionID,
+              pendingPermissionAllowsRule else { return }
+        let rule = PermissionRule(
+            id: UUID().uuidString,
+            workspace: review.ruleScope.workspace,
+            action: review.ruleScope.action,
+            resource: review.ruleScope.resource,
+            at: Int64(Date().timeIntervalSince1970 * 1_000)
+        )
+        _ = ruleStore.add(rule)
+        answerPermission(allowOnceOptionID)
     }
 
     /// Route an incoming permission ask: sensitive files always surface a card;
     /// otherwise a matching standing rule auto-allows silently; else surface.
     private func handlePermission(_ request: AcpPermissionRequest) {
-        if AcpPermissionRules.requestIsSensitive(globs: sensitiveGlobs, title: request.title, paths: request.paths) {
+        if AcpPermissionRules.requestIsSensitive(
+            globs: sensitiveGlobs,
+            title: request.title,
+            paths: request.paths,
+            rawInput: request.rawInput
+        ) {
             enqueuePresentedPermission(request)
             return
         }
-        if AcpPermissionRules.requestMatchesRule(ruleStore.rules(), workspace: cwd, kind: request.kind, title: request.title) != nil {
-            answerAllowOnce(request)
+        if AcpPermissionRules.requestMatchesRule(
+            ruleStore.rules(),
+            workspace: cwd,
+            kind: request.kind,
+            resource: request.ruleMatchValue
+        ) != nil,
+           answerAllowOnce(request) {
             return
         }
         enqueuePresentedPermission(request)
@@ -610,24 +640,33 @@ final class AcpConversation: ObservableObject {
         onAttention?(.permission, next.title)
     }
 
-    /// Answer with the request's allow_once option (falling back to the first
-    /// non-reject option, then the first option), never persisting allow_always.
-    private func answerAllowOnce(_ request: AcpPermissionRequest) {
+    /// Answer only with the request's exact `allow_once` option. A matching
+    /// local rule must never silently escalate into adapter-owned persistence.
+    @discardableResult
+    private func answerAllowOnce(_ request: AcpPermissionRequest) -> Bool {
+        guard let option = request.allowOnceOption else { return false }
         let wasPresented = pendingPermission?.id == request.id
         if wasPresented { pendingPermission = nil }
-        let option = request.options.first { $0.kind == "allow_once" }
-            ?? request.options.first { !$0.kind.contains("reject") }
-            ?? request.options.first
-        if let option {
-            Task { await client.resolvePermission(id: request.id, optionID: option.id) }
-        }
+        Task { await client.resolvePermission(id: request.id, optionID: option.id) }
         if wasPresented { presentNextPermission() }
+        return true
     }
 
-    /// Whether the pending ask may be "always allowed" (hidden for sensitive files).
+    var pendingPermissionReview: AcpPermissionReview? {
+        pendingPermission.map { AcpPermissionReview(request: $0, workspace: cwd) }
+    }
+
+    /// Whether the pending ask may create a reviewed standing rule. Sensitive
+    /// requests and adapters without an exact one-time allow remain prompt-only.
     var pendingPermissionAllowsRule: Bool {
         guard let permission = pendingPermission else { return false }
-        return !AcpPermissionRules.requestIsSensitive(globs: sensitiveGlobs, title: permission.title, paths: permission.paths)
+        guard permission.allowOnceOption != nil else { return false }
+        return !AcpPermissionRules.requestIsSensitive(
+            globs: sensitiveGlobs,
+            title: permission.title,
+            paths: permission.paths,
+            rawInput: permission.rawInput
+        )
     }
 
     var pendingPermissionCount: Int {
@@ -807,7 +846,7 @@ final class AcpConversation: ObservableObject {
     /// Deterministic, process-free state for hosted/local visual inspection.
     /// Marking startup complete prevents the embedded view from launching a
     /// real provider while the fixture is being captured.
-    func loadVisualFixture() {
+    func loadVisualFixture(includePermission: Bool = false) {
         hasStarted = true
         isConnected = true
         models = [
@@ -837,6 +876,28 @@ final class AcpConversation: ObservableObject {
             costAmount: 0.42,
             costCurrency: "USD"
         )
+        if includePermission {
+            receivePermissionForTesting(AcpPermissionRequest(
+                id: 1,
+                sessionID: "visual-session",
+                title: "Run the release verification commands",
+                options: [
+                    .init(id: "allow-once", name: "Allow once", kind: "allow_once"),
+                    .init(id: "reject-once", name: "Reject once", kind: "reject_once"),
+                    .init(id: "allow-always", name: "Always allow", kind: "allow_always"),
+                ],
+                rawInput: .object([
+                    "command": .string("npm run native:test:changed && npm run native:fast -- --build-only"),
+                    "cwd": .string(cwd),
+                ]),
+                kind: "execute",
+                paths: [
+                    "native/KaisolaMac/Kaisola/Acp/AcpChatView.swift",
+                    "native/KaisolaMac/Kaisola/Acp/AcpConversation.swift",
+                    "native/KaisolaMac/KaisolaTests/AcpPermissionRulesTests.swift",
+                ]
+            ))
+        }
     }
 
     // MARK: - Stream accumulation

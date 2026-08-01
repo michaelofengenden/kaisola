@@ -158,6 +158,22 @@ final class AcpTranscriptPagingTests: XCTestCase {
         XCTAssertEqual(conversation.pendingPermissionCount, 0)
     }
 
+    func testPermissionVisualFixtureIsOptInAndDecisionGrade() throws {
+        let ordinary = makeConversation()
+        ordinary.loadVisualFixture()
+        XCTAssertNil(ordinary.pendingPermission)
+
+        let permission = makeConversation()
+        permission.loadVisualFixture(includePermission: true)
+        let review = try XCTUnwrap(permission.pendingPermissionReview)
+        XCTAssertFalse(review.rawInputIsTitleFallback)
+        XCTAssertEqual(review.paths.count, 3)
+        XCTAssertEqual(review.ruleScope.workspace, permission.workspaceURL.path)
+        XCTAssertEqual(review.allowOnceOptionID, "allow-once")
+        XCTAssertEqual(review.denyOnceOptionID, "reject-once")
+        XCTAssertEqual(review.omittedOptions.map(\.kind), ["allow_always"])
+    }
+
     func testDisconnectedSendDoesNotConsumeAuthoredText() {
         let conversation = makeConversation()
 

@@ -68,6 +68,12 @@ actor AcpClient {
     /// request first and retain that early resolution instead of dropping it.
     private var activePermissionIDs: Set<Int> = []
     private var earlyPermissionResolutions: [Int: PermissionResolution] = [:]
+    /// Permission requests are partial ToolCallUpdates. Retain a bounded set of
+    /// prior review fields so a later ask can disclose paths/raw input already
+    /// streamed for the same tool-call id.
+    private var toolCallReviewContexts: [String: AcpToolCallReviewContext] = [:]
+    private var toolCallReviewOrder: [String] = []
+    private static let maxToolCallReviewContexts = 512
     /// Host for agent-requested terminals (`terminal/create` …).
     private let terminalHost = AcpTerminalHost()
     /// The session workspace; fs/terminal callbacks are confined inside it.
@@ -109,6 +115,8 @@ actor AcpClient {
         decoder = BrokerLineFrameDecoder(maximumFrameBytes: 64 * 1_024 * 1_024)
         sessionID = nil
         cancelPermissionRequests()
+        toolCallReviewContexts.removeAll(keepingCapacity: true)
+        toolCallReviewOrder.removeAll(keepingCapacity: true)
         workspaceRoot = (cwd as NSString).standardizingPath
         do {
             try await transport.start(command: command, arguments: arguments, environment: environment, cwd: cwd)
@@ -346,6 +354,19 @@ actor AcpClient {
         }
     }
 
+    /// Decline an ask without selecting an adapter-owned `reject_always`
+    /// option. ACP's cancelled outcome denies the pending operation without
+    /// granting the adapter an undisclosed persistent decision.
+    func cancelPermission(id: Int) {
+        guard activePermissionIDs.contains(id) else { return }
+        let resolution = PermissionResolution.cancelled
+        if let waiter = permissionWaiters.removeValue(forKey: id) {
+            waiter.resume(returning: resolution)
+        } else {
+            earlyPermissionResolutions[id] = resolution
+        }
+    }
+
     func stop() async {
         connectionGeneration &+= 1
         let reader = readerTask
@@ -360,6 +381,8 @@ actor AcpClient {
         sessionID = nil
         workspaceRoot = nil
         capabilities = AcpAgentCapabilities()
+        toolCallReviewContexts.removeAll(keepingCapacity: true)
+        toolCallReviewOrder.removeAll(keepingCapacity: true)
     }
 
     private func cancelPermissionRequests() {
@@ -662,10 +685,12 @@ actor AcpClient {
                 eventHandler?(.turnItem(.thought(id: "live", text: text)))
             }
         case "tool_call":
+            recordToolCallReviewContext(object)
             if let call = Self.parseToolCall(object) {
                 eventHandler?(.turnItem(.toolCall(call)))
             }
         case "tool_call_update":
+            recordToolCallReviewContext(object)
             if let id = object["toolCallId"]?.stringValue {
                 let status = object["status"]?.stringValue.flatMap(AcpToolCall.Status.init)
                 // Only treat content as present when the key exists — an absent
@@ -725,32 +750,20 @@ actor AcpClient {
     }
 
     private func handlePermissionRequest(id: JSONValue?, params: JSONValue?) {
-        guard let id, let params = params?.objectValue, let sessionID else { return }
+        guard let id, let sessionID else { return }
         permissionCounter += 1
         let localID = permissionCounter
-        let toolCall = params["toolCall"]?.objectValue
-        let title = toolCall?["title"]?.stringValue ?? "Permission requested"
-        let kind = toolCall?["kind"]?.stringValue ?? "other"
-        let locationPaths = (toolCall?["locations"]?.arrayValue ?? []).compactMap {
-            $0.objectValue?["path"]?.stringValue
-        }
-        let diffPaths = Self.parseToolContent(toolCall?["content"]).compactMap { artifact -> String? in
-            if case let .diff(path, _, _) = artifact { return path } else { return nil }
-        }
-        let options = (params["options"]?.arrayValue ?? []).compactMap { value -> AcpPermissionRequest.Option? in
-            guard let o = value.objectValue, let optionID = o["optionId"]?.stringValue else { return nil }
-            return AcpPermissionRequest.Option(
-                id: optionID,
-                name: o["name"]?.stringValue ?? optionID,
-                kind: o["kind"]?.stringValue ?? "allow"
-            )
-        }
+        let toolCallID = params?.objectValue?["toolCall"]?.objectValue?["toolCallId"]?.stringValue
+        let priorContext = toolCallID.flatMap { toolCallReviewContexts[$0] }
+        guard let request = Self.parsePermissionRequest(
+            localID: localID,
+            sessionID: sessionID,
+            params: params,
+            priorContext: priorContext
+        ) else { return }
         activePermissionIDs.insert(localID)
         let generation = connectionGeneration
-        eventHandler?(.permission(AcpPermissionRequest(
-            id: localID, sessionID: sessionID, title: title, options: options,
-            kind: kind, paths: locationPaths + diffPaths
-        )))
+        eventHandler?(.permission(request))
         Task {
             let resolution = await withCheckedContinuation { (continuation: CheckedContinuation<PermissionResolution, Never>) in
                 if let early = earlyPermissionResolutions.removeValue(forKey: localID) {
@@ -772,6 +785,111 @@ actor AcpClient {
                 outcome = .object(["outcome": .string("cancelled")])
             }
             respond(id: id, result: .object(["outcome": outcome]))
+        }
+    }
+
+    /// Decode the complete permission review payload, including ACP v1's
+    /// arbitrary `rawInput`. Kept pure for wire-contract tests.
+    static func parsePermissionRequest(
+        localID: Int,
+        sessionID: String,
+        params value: JSONValue?,
+        priorContext: AcpToolCallReviewContext? = nil
+    ) -> AcpPermissionRequest? {
+        guard let params = value?.objectValue else { return nil }
+        let toolCall = params["toolCall"]?.objectValue
+        let title = toolCall?["title"] != nil
+            ? (toolCall?["title"]?.stringValue ?? "Permission requested")
+            : (priorContext?.title ?? "Permission requested")
+        let kind = toolCall?["kind"] != nil
+            ? (toolCall?["kind"]?.stringValue ?? "other")
+            : (priorContext?.kind ?? "other")
+        let rawInput: JSONValue?
+        if toolCall?["rawInput"] != nil {
+            if let value = toolCall?["rawInput"], value != .null {
+                rawInput = value
+            } else {
+                rawInput = nil
+            }
+        } else {
+            rawInput = priorContext?.rawInput
+        }
+        let locationPaths = toolCall?["locations"] != nil
+            ? Self.locationPaths(toolCall?["locations"])
+            : (priorContext?.locationPaths ?? [])
+        let diffPaths = toolCall?["content"] != nil
+            ? Self.diffPaths(toolCall?["content"])
+            : (priorContext?.diffPaths ?? [])
+        let options = (params["options"]?.arrayValue ?? []).compactMap { value -> AcpPermissionRequest.Option? in
+            guard let o = value.objectValue, let optionID = o["optionId"]?.stringValue else { return nil }
+            return AcpPermissionRequest.Option(
+                id: optionID,
+                name: o["name"]?.stringValue ?? optionID,
+                kind: o["kind"]?.stringValue ?? "other"
+            )
+        }
+        var seenPaths = Set<String>()
+        let paths = (locationPaths + diffPaths).filter {
+            !$0.isEmpty && seenPaths.insert($0).inserted
+        }
+        return AcpPermissionRequest(
+            id: localID, sessionID: sessionID, title: title, options: options,
+            rawInput: rawInput, kind: kind, paths: paths
+        )
+    }
+
+    private func recordToolCallReviewContext(_ update: [String: JSONValue]) {
+        guard let id = update["toolCallId"]?.stringValue else { return }
+        let isNew = toolCallReviewContexts[id] == nil
+        toolCallReviewContexts[id] = Self.mergeToolCallReviewContext(
+            toolCallReviewContexts[id],
+            update: update
+        )
+        if isNew {
+            toolCallReviewOrder.append(id)
+            if toolCallReviewOrder.count > Self.maxToolCallReviewContexts {
+                let overflow = toolCallReviewOrder.count - Self.maxToolCallReviewContexts
+                let expired = toolCallReviewOrder.prefix(overflow)
+                for expiredID in expired { toolCallReviewContexts.removeValue(forKey: expiredID) }
+                toolCallReviewOrder.removeFirst(overflow)
+            }
+        }
+    }
+
+    /// Merge ACP's replace-when-present ToolCallUpdate semantics. Pure so the
+    /// partial-request correlation contract can be tested without a process.
+    static func mergeToolCallReviewContext(
+        _ prior: AcpToolCallReviewContext?,
+        update: [String: JSONValue]
+    ) -> AcpToolCallReviewContext {
+        var context = prior ?? AcpToolCallReviewContext()
+        if update["title"] != nil { context.title = update["title"]?.stringValue }
+        if update["kind"] != nil { context.kind = update["kind"]?.stringValue }
+        if update["rawInput"] != nil {
+            if let value = update["rawInput"], value != .null {
+                context.rawInput = value
+            } else {
+                context.rawInput = nil
+            }
+        }
+        if update["locations"] != nil {
+            context.locationPaths = locationPaths(update["locations"])
+        }
+        if update["content"] != nil {
+            context.diffPaths = diffPaths(update["content"])
+        }
+        return context
+    }
+
+    private static func locationPaths(_ value: JSONValue?) -> [String] {
+        (value?.arrayValue ?? []).compactMap { $0.objectValue?["path"]?.stringValue }
+    }
+
+    private static func diffPaths(_ value: JSONValue?) -> [String] {
+        (value?.arrayValue ?? []).compactMap { item in
+            guard let object = item.objectValue,
+                  object["type"]?.stringValue == "diff" else { return nil }
+            return object["path"]?.stringValue
         }
     }
 

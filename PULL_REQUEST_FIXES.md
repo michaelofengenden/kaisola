@@ -32,6 +32,10 @@ Large product and architecture work remains ordered in
   review discloses every changed path plus a credential-safe
   remote/repository/base destination, and invalidates itself if that target
   changes (`81a59cb`).
+- Chat and Mesh permission cards preserve ACP raw input, show every declared
+  path, and preview the exact workspace/action/resource tuple before creating a
+  local rule. Deny and Allow Once remain non-persistent, while adapter-owned
+  always choices with undisclosed scope are never silently substituted.
 - Status indicators expose shape and accessible names, and the user-facing copy
   pass removed several implementation terms (`50e00aa`, `949c4ef`).
 - Bounded PDF files now open in a native PDFKit surface with selection,

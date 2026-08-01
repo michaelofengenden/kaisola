@@ -3670,7 +3670,7 @@ final class AppModel: ObservableObject {
         selectMesh(mesh.id)
     }
 
-    func loadVisualMixedSessionFixture(workspace: URL) {
+    func loadVisualMixedSessionFixture(workspace: URL, includePermission: Bool = false) {
         let root = workspace.standardizedFileURL
         guard let project = projects.first(where: { $0.directory?.standardizedFileURL == root }),
               let agent = AgentRegistry.profile(id: "codex"),
@@ -3690,7 +3690,7 @@ final class AppModel: ObservableObject {
                 initialUsage: nil,
                 initialQueuedPrompts: []
               ) else { return }
-        chat.conversation.loadVisualFixture()
+        chat.conversation.loadVisualFixture(includePermission: includePermission)
         var layout = paneLayouts[project.id] ?? SessionPaneLayout()
         layout.add(chat.id)
         paneLayouts[project.id] = layout

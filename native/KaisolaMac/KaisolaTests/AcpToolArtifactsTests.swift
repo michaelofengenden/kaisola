@@ -91,6 +91,151 @@ final class AcpToolArtifactsTests: XCTestCase {
         XCTAssertTrue(AcpClient.parseToolContent(.array([])).isEmpty)
     }
 
+    func testPermissionWireParserKeepsRawInputAndEveryDeclaredPath() throws {
+        let rawInput = JSONValue.object([
+            "command": .string("swift test"),
+            "cwd": .string("/work/project"),
+        ])
+        let params = JSONValue.object([
+            "toolCall": .object([
+                "toolCallId": .string("tool-1"),
+                "title": .string("Run tests"),
+                "kind": .string("execute"),
+                "rawInput": rawInput,
+                "locations": .array([
+                    .object(["path": .string("/work/project/Package.swift")]),
+                    .object(["path": .string("/work/project/Package.swift")]),
+                    .object(["path": .string("/work/project/Tests/Odd\nName.swift")]),
+                ]),
+                "content": .array([
+                    .object([
+                        "type": .string("diff"),
+                        "path": .string("/work/project/Sources/App.swift"),
+                        "oldText": .string("old"),
+                        "newText": .string("new"),
+                    ]),
+                ]),
+            ]),
+            "options": .array([
+                .object([
+                    "optionId": .string("allow"),
+                    "name": .string("Proceed once"),
+                    "kind": .string("allow_once"),
+                ]),
+                .object([
+                    "optionId": .string("extension"),
+                    "name": .string("Adapter extension"),
+                ]),
+            ]),
+        ])
+
+        let request = try XCTUnwrap(AcpClient.parsePermissionRequest(
+            localID: 42,
+            sessionID: "session-1",
+            params: params
+        ))
+
+        XCTAssertEqual(request.id, 42)
+        XCTAssertEqual(request.sessionID, "session-1")
+        XCTAssertEqual(request.rawInput, rawInput)
+        XCTAssertEqual(request.kind, "execute")
+        XCTAssertEqual(request.paths, [
+            "/work/project/Package.swift",
+            "/work/project/Tests/Odd\nName.swift",
+            "/work/project/Sources/App.swift",
+        ])
+        XCTAssertEqual(request.options.map(\.kind), ["allow_once", "other"])
+    }
+
+    func testPartialPermissionRequestMergesPriorToolCallDisclosure() throws {
+        let rawInput = JSONValue.object(["operation": .string("replace")])
+        let initial = AcpClient.mergeToolCallReviewContext(nil, update: [
+            "toolCallId": .string("file-change-1"),
+            "title": .string("Editing files"),
+            "kind": .string("edit"),
+            "rawInput": rawInput,
+            "locations": .array([
+                .object(["path": .string("/work/Sources/App.swift")]),
+            ]),
+            "content": .array([
+                .object([
+                    "type": .string("diff"),
+                    "path": .string("/work/Sources/App.swift"),
+                    "oldText": .string("old"),
+                    "newText": .string("new"),
+                ]),
+                .object([
+                    "type": .string("diff"),
+                    "path": .string("/work/Tests/AppTests.swift"),
+                    // Path disclosure must survive even if artifact rendering
+                    // cannot parse an incomplete diff body.
+                ]),
+            ]),
+        ])
+        let updated = AcpClient.mergeToolCallReviewContext(initial, update: [
+            "toolCallId": .string("file-change-1"),
+            "status": .string("pending"),
+        ])
+        let params = JSONValue.object([
+            "toolCall": .object([
+                "toolCallId": .string("file-change-1"),
+                "status": .string("pending"),
+            ]),
+            "options": .array([
+                .object([
+                    "optionId": .string("allow"),
+                    "name": .string("Allow once"),
+                    "kind": .string("allow_once"),
+                ]),
+                .object([
+                    "optionId": .string("deny"),
+                    "name": .string("Reject"),
+                    "kind": .string("reject_once"),
+                ]),
+            ]),
+        ])
+
+        let request = try XCTUnwrap(AcpClient.parsePermissionRequest(
+            localID: 9,
+            sessionID: "session",
+            params: params,
+            priorContext: updated
+        ))
+
+        XCTAssertEqual(request.title, "Editing files")
+        XCTAssertEqual(request.kind, "edit")
+        XCTAssertEqual(request.rawInput, rawInput)
+        XCTAssertEqual(request.paths, [
+            "/work/Sources/App.swift",
+            "/work/Tests/AppTests.swift",
+        ])
+    }
+
+    func testPresentToolCallFieldsReplaceCachedDisclosureCollections() {
+        let prior = AcpToolCallReviewContext(
+            title: "Old title",
+            kind: "edit",
+            rawInput: .string("old"),
+            locationPaths: ["/old/location"],
+            diffPaths: ["/old/diff"]
+        )
+
+        let replaced = AcpClient.mergeToolCallReviewContext(prior, update: [
+            "toolCallId": .string("tool"),
+            "rawInput": .null,
+            "locations": .array([]),
+            "content": .array([
+                .object(["type": .string("diff"), "path": .string("/new/diff")]),
+            ]),
+        ])
+
+        XCTAssertEqual(replaced.title, "Old title")
+        XCTAssertEqual(replaced.kind, "edit")
+        XCTAssertNil(replaced.rawInput)
+        XCTAssertTrue(replaced.locationPaths.isEmpty)
+        XCTAssertEqual(replaced.diffPaths, ["/new/diff"])
+    }
+
     // MARK: - Workspace confinement (symlink resolution)
 
     func testNearestExistingAncestorResolvesSymlinksForUncreatedPaths() throws {

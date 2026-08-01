@@ -13,7 +13,7 @@ struct FileNode: Identifiable, Equatable, Sendable {
 /// The filesystem mutation boundary used by the workspace rail. File actions
 /// are intentionally narrower than a general-purpose file manager: they may
 /// only target the mounted workspace, existing-item actions never target its
-/// root, creation is leaf-only, and a rename stays in the current directory.
+/// root, creation is leaf-only, and moves never overwrite or traverse links.
 enum WorkspaceFileOperations {
     struct Move: Equatable, Sendable {
         let source: URL
@@ -45,7 +45,9 @@ enum WorkspaceFileOperations {
         case invalidName
         case nameTooLong
         case unchangedName
+        case unchangedLocation
         case destinationExists
+        case destinationInsideItem
 
         var errorDescription: String? {
             switch self {
@@ -67,8 +69,12 @@ enum WorkspaceFileOperations {
                 return "That name is longer than macOS allows."
             case .unchangedName:
                 return "The name hasn't changed."
+            case .unchangedLocation:
+                return "That item is already in this folder."
             case .destinationExists:
                 return "An item with that name already exists."
+            case .destinationInsideItem:
+                return "A folder can't be moved inside itself."
             }
         }
     }
@@ -84,22 +90,42 @@ enum WorkspaceFileOperations {
         let destination = source.deletingLastPathComponent()
             .appendingPathComponent(proposedName, isDirectory: source.hasDirectoryPath)
             .standardizedFileURL
-        let resolvedRoot = workspaceRoot.standardizedFileURL.resolvingSymlinksInPath()
-        let resolvedParent = destination.deletingLastPathComponent().resolvingSymlinksInPath()
-        guard isDescendantOrSame(resolvedParent, of: resolvedRoot) else {
-            throw OperationError.outsideWorkspace
-        }
-        if FileManager.default.fileExists(atPath: destination.path),
-           !sameFilesystemItem(source, destination) {
-            throw OperationError.destinationExists
-        }
-        return Move(source: source, destination: destination)
+        return try validatedMove(
+            source: source,
+            destination: destination,
+            workspaceRoot: workspaceRoot
+        )
     }
 
     /// Performs the already-validated same-directory rename. `moveItem` keeps
     /// Finder/APFS collision behavior authoritative and never overwrites.
     static func rename(item: URL, to proposedName: String, workspaceRoot: URL) throws -> Move {
         let move = try renameMove(item: item, to: proposedName, workspaceRoot: workspaceRoot)
+        try FileManager.default.moveItem(at: move.source, to: move.destination)
+        return move
+    }
+
+    /// Validate an exact cross-directory destination without touching disk.
+    /// The destination is a leaf path rather than just a folder so undo/redo
+    /// can replay the same transaction even when the two parents differ.
+    static func movePlan(item: URL, to destination: URL, workspaceRoot: URL) throws -> Move {
+        let source = try validatedItem(item, workspaceRoot: workspaceRoot)
+        let destination = destination.standardizedFileURL
+        try validateLeafName(destination.lastPathComponent)
+        guard destination.path != source.path else {
+            throw OperationError.unchangedLocation
+        }
+        return try validatedMove(
+            source: source,
+            destination: destination,
+            workspaceRoot: workspaceRoot
+        )
+    }
+
+    /// Move one item to an exact validated destination. FileManager remains the
+    /// final collision authority if the filesystem changes after planning.
+    static func move(item: URL, to destination: URL, workspaceRoot: URL) throws -> Move {
+        let move = try movePlan(item: item, to: destination, workspaceRoot: workspaceRoot)
         try FileManager.default.moveItem(at: move.source, to: move.destination)
         return move
     }
@@ -260,6 +286,39 @@ enum WorkspaceFileOperations {
         return source
     }
 
+    private static func validatedMove(
+        source: URL,
+        destination: URL,
+        workspaceRoot: URL
+    ) throws -> Move {
+        let destinationParent = try validatedDirectory(
+            destination.deletingLastPathComponent(),
+            workspaceRoot: workspaceRoot
+        )
+        var sourceIsDirectory: ObjCBool = false
+        guard FileManager.default.fileExists(
+            atPath: source.path,
+            isDirectory: &sourceIsDirectory
+        ) else {
+            throw OperationError.missingItem
+        }
+        if sourceIsDirectory.boolValue,
+           contains(destinationParent, in: source) {
+            throw OperationError.destinationInsideItem
+        }
+        if FileManager.default.fileExists(atPath: destination.path) {
+            let sameParent = source.deletingLastPathComponent().standardizedFileURL
+                == destinationParent.standardizedFileURL
+            let destinationValues = try? destination.resourceValues(forKeys: [.isSymbolicLinkKey])
+            guard sameParent,
+                  destinationValues?.isSymbolicLink != true,
+                  sameFilesystemItem(source, destination) else {
+                throw OperationError.destinationExists
+            }
+        }
+        return Move(source: source, destination: destination)
+    }
+
     private static func createDestination(
         named proposedName: String,
         in parent: URL,
@@ -349,6 +408,7 @@ enum WorkspaceFileOperations {
 /// command palette's file search. Pure filesystem logic, testable directly.
 enum ProjectFiles {
     static let defaultFileLimit = 3_000
+    static let defaultMoveDirectoryLimit = 2_000
     /// Fuzzy search needs useful coverage, not an unbounded repository crawl.
     /// These limits are deliberately much larger than the result limit so a
     /// project with many folders still has a representative index while a
@@ -369,12 +429,24 @@ enum ProjectFiles {
         limit: Int = .max,
         isCancelled: () -> Bool = { Task.isCancelled }
     ) -> [FileNode] {
-        guard limit > 0, !isCancelled() else { return [] }
+        scanChildren(
+            of: directory,
+            limit: limit,
+            isCancelled: isCancelled
+        ).nodes
+    }
+
+    private static func scanChildren(
+        of directory: URL,
+        limit: Int,
+        isCancelled: () -> Bool
+    ) -> (nodes: [FileNode], visited: Int) {
+        guard limit > 0, !isCancelled() else { return ([], 0) }
         guard let contents = FileManager.default.enumerator(
             at: directory,
             includingPropertiesForKeys: [.isDirectoryKey, .isSymbolicLinkKey],
             options: [.skipsHiddenFiles, .skipsSubdirectoryDescendants]
-        ) else { return [] }
+        ) else { return ([], 0) }
         var nodes: [FileNode] = []
         if limit != .max { nodes.reserveCapacity(min(limit, 256)) }
         var visited = 0
@@ -389,10 +461,11 @@ enum ProjectFiles {
             if isDirectory, ignoredNames.contains(url.lastPathComponent) { continue }
             nodes.append(FileNode(url: url.standardizedFileURL, isDirectory: isDirectory))
         }
-        return nodes.sorted {
+        let sorted = nodes.sorted {
             if $0.isDirectory != $1.isDirectory { return $0.isDirectory }
             return $0.name.localizedStandardCompare($1.name) == .orderedAscending
         }
+        return (sorted, visited)
     }
 
     /// Recursively enumerate project files for fuzzy search, bounded so a huge
@@ -444,6 +517,58 @@ enum ProjectFiles {
             }
         }
         return results
+    }
+
+    /// Bounded, symlink-free project folders suitable for an in-app move
+    /// chooser. The current parent and a directory's own subtree are omitted,
+    /// so every displayed destination is meaningful before final validation.
+    static func moveDestinationDirectories(
+        root: URL,
+        movingItem: URL,
+        limit: Int = defaultMoveDirectoryLimit,
+        visitLimit: Int = defaultVisitLimit,
+        isCancelled: () -> Bool = { Task.isCancelled }
+    ) -> [URL] {
+        guard limit > 0, visitLimit > 0, !isCancelled() else { return [] }
+        let root = root.standardizedFileURL
+        let movingItem = movingItem.standardizedFileURL
+        guard WorkspaceFileOperations.contains(movingItem, in: root) else { return [] }
+        let currentParent = movingItem.deletingLastPathComponent()
+        var queue: [URL] = [root]
+        var queueIndex = 0
+        var visitedEntries = 0
+        var destinations: [URL] = []
+        while queueIndex < queue.count,
+              queueIndex < limit,
+              visitedEntries < visitLimit,
+              !isCancelled() {
+            let directory = queue[queueIndex]
+            queueIndex += 1
+            if directory.path != currentParent.path,
+               !WorkspaceFileOperations.contains(directory, in: movingItem) {
+                destinations.append(directory)
+            }
+            let scan = scanChildren(
+                of: directory,
+                limit: visitLimit - visitedEntries,
+                isCancelled: isCancelled
+            )
+            visitedEntries += scan.visited
+            for node in scan.nodes
+                where node.isDirectory && !WorkspaceFileOperations.contains(node.url, in: movingItem) {
+                guard queue.count < limit else { break }
+                queue.append(node.url)
+            }
+        }
+        guard !isCancelled() else { return [] }
+        return destinations.sorted { first, second in
+            if first.path == root.path || second.path == root.path {
+                return first.path == root.path && second.path != root.path
+            }
+            let firstRelative = String(first.path.dropFirst(root.path.count))
+            let secondRelative = String(second.path.dropFirst(root.path.count))
+            return firstRelative.localizedStandardCompare(secondRelative) == .orderedAscending
+        }
     }
 
     /// Reconcile a cached project-relative file list against a bounded set of

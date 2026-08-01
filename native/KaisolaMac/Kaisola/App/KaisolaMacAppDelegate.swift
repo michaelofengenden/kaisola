@@ -3607,6 +3607,7 @@ enum NativeVisualCaptureTarget {
     static func window(rootedAt root: NSWindow, surface: String) -> NSWindow? {
         surface == "terminal-transcript" || surface == "account-picker"
             || surface == "workspace-rename" || surface == "workspace-new-file"
+            || surface == "workspace-move"
             ? root.attachedSheet
             : root
     }

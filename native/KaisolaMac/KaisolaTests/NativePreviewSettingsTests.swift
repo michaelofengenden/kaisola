@@ -46,6 +46,7 @@ final class NativePreviewSettingsTests: XCTestCase {
 
         XCTAssertTrue(NativeVisualCaptureTarget.window(rootedAt: root, surface: "terminal") === root)
         XCTAssertTrue(NativeVisualCaptureTarget.window(rootedAt: root, surface: "terminal-transcript") === sheet)
+        XCTAssertTrue(NativeVisualCaptureTarget.window(rootedAt: root, surface: "workspace-move") === sheet)
     }
 
     func testVisualCaptureRoundsPointGeometryUpToRetinaPixels() {

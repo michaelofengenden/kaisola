@@ -30,6 +30,7 @@ struct WorkspaceRailView: View {
     @State private var searchText = ""
     @State private var renameTarget: FileNode?
     @State private var renameDraft = ""
+    @State private var moveTarget: FileNode?
     @State private var creationRequest: CreationRequest?
     @State private var creationDraft = ""
     @State private var trashTarget: FileNode?
@@ -63,7 +64,7 @@ struct WorkspaceRailView: View {
     }
 
     var body: some View {
-        VStack(spacing: 0) {
+        AnyView(VStack(spacing: 0) {
             HStack(spacing: 6) {
                 Button(action: close) {
                     Image(systemName: "sidebar.trailing")
@@ -104,7 +105,7 @@ struct WorkspaceRailView: View {
                     : "Select a Chat or Mesh to follow its files")
                 .accessibilityLabel("Follow selected agent files")
                 .accessibilityValue(followsAgentFiles ? "On" : "Off")
-                Button(action: refresh) {
+                Button(action: { refresh() }) {
                     Image(systemName: "arrow.clockwise")
                         .font(.caption)
                 }
@@ -202,15 +203,18 @@ struct WorkspaceRailView: View {
         .task {
             tree.load(root)
             revealSelection()
-            // Deterministic broker-free visual QA: present the real rename
+            // Deterministic broker-free visual QA: present a real file-action
             // sheet over the real lazy tree without mutating any fixture file.
             if ProcessInfo.processInfo.environment["KAISOLA_NATIVE_VISUAL_FIXTURE"] == "1",
                let surface = ProcessInfo.processInfo.environment["KAISOLA_NATIVE_VISUAL_SURFACE"],
-               surface == "workspace-rename" || surface == "workspace-new-file" {
+               surface == "workspace-rename" || surface == "workspace-new-file"
+                || surface == "workspace-move" {
                 for _ in 0..<20 {
                     if let first = tree.children(of: root)?.first {
                         if surface == "workspace-new-file" {
                             beginCreate(.file, in: first.isDirectory ? first.url : root)
+                        } else if surface == "workspace-move" {
+                            beginMove(first)
                         } else {
                             beginRename(first)
                         }
@@ -237,7 +241,7 @@ struct WorkspaceRailView: View {
             Button("New Folder…") { beginCreate(.folder, in: root) }
                 .disabled(isMutating)
             Divider()
-            Button("Refresh", action: refresh)
+            Button("Refresh") { refresh() }
             Button("New AGENTS.md") {
                 let target = root.appendingPathComponent("AGENTS.md")
                 if !FileManager.default.fileExists(atPath: target.path) {
@@ -258,6 +262,11 @@ struct WorkspaceRailView: View {
                 .disabled(renameDraft.isEmpty || isMutating)
         } message: {
             Text("Enter a new name for \(renameTarget?.name ?? "this item").")
+        })
+        .sheet(item: $moveTarget) { target in
+            WorkspaceMoveSheet(root: root, item: target) { destinationDirectory in
+                performMove(target, to: destinationDirectory)
+            }
         }
         .alert(
             "New \(creationRequest?.kind.rawValue ?? "Item")",
@@ -305,9 +314,26 @@ struct WorkspaceRailView: View {
         )
     }
 
-    private func refresh() {
-        ProjectFileIndex.shared.invalidate(root: root)
-        tree.refresh(expandedDirectories: expanded.map { URL(fileURLWithPath: $0, isDirectory: true) })
+    private func refresh(changedPaths: [URL]? = nil) {
+        let expandedDirectories = expanded.map { URL(fileURLWithPath: $0, isDirectory: true) }
+        if let changedPaths {
+            ProjectFileIndex.shared.invalidate(
+                root: root,
+                changedPaths: changedPaths,
+                requiresFullRefresh: false
+            )
+            tree.refresh(
+                changeBatch: WorkspaceChangeBatch(
+                    token: 0,
+                    paths: changedPaths,
+                    requiresFullRefresh: false
+                ),
+                expandedDirectories: expandedDirectories
+            )
+        } else {
+            ProjectFileIndex.shared.invalidate(root: root)
+            tree.refresh(expandedDirectories: expandedDirectories)
+        }
         tree.search(searchText)
     }
 
@@ -340,6 +366,11 @@ struct WorkspaceRailView: View {
         guard !isMutating else { return }
         creationDraft = ""
         creationRequest = CreationRequest(kind: kind, parent: parent.standardizedFileURL)
+    }
+
+    private func beginMove(_ node: FileNode) {
+        guard !isMutating else { return }
+        moveTarget = node
     }
 
     private func beginTrash(_ node: FileNode) {
@@ -384,7 +415,7 @@ struct WorkspaceRailView: View {
                     )?.path ?? path
                 })
                 renameTarget = nil
-                refresh()
+                refresh(changedPaths: [move.source, move.destination])
                 ToastCenter.shared.show("Renamed to \(move.destination.lastPathComponent)", style: .success)
             } catch {
                 ToastCenter.shared.show(
@@ -395,6 +426,49 @@ struct WorkspaceRailView: View {
             }
             isMutating = false
         }
+    }
+
+    @discardableResult
+    private func performMove(_ target: FileNode, to destinationDirectory: URL) -> Bool {
+        guard prepareMutation(target) else { return false }
+        let destination = destinationDirectory.appendingPathComponent(
+            target.name,
+            isDirectory: target.isDirectory
+        )
+        let root = self.root
+        isMutating = true
+        Task {
+            do {
+                let move = try await Task.detached(priority: .userInitiated) {
+                    try WorkspaceFileOperations.move(
+                        item: target.url,
+                        to: destination,
+                        workspaceRoot: root
+                    )
+                }.value
+                didMoveItem(move.source, move.destination)
+                expanded = Set(expanded.map { path in
+                    WorkspaceFileOperations.replacingPrefix(
+                        of: URL(fileURLWithPath: path),
+                        from: move.source,
+                        to: move.destination
+                    )?.path ?? path
+                })
+                refresh(changedPaths: [move.source, move.destination])
+                ToastCenter.shared.show(
+                    "Moved \(target.name) to \(destinationDirectory.lastPathComponent)",
+                    style: .success
+                )
+            } catch {
+                ToastCenter.shared.show(
+                    WorkspaceFileOperations.userFacingDescription(for: error, action: "move"),
+                    style: .error,
+                    duration: 5
+                )
+            }
+            isMutating = false
+        }
+        return true
     }
 
     private func performCreate() {
@@ -606,6 +680,8 @@ struct WorkspaceRailView: View {
         Divider()
         Button("Rename…") { beginRename(node) }
             .disabled(isMutating)
+        Button("Move…") { beginMove(node) }
+            .disabled(isMutating)
         Button("Move to Trash…", role: .destructive) { beginTrash(node) }
             .disabled(isMutating)
     }
@@ -627,6 +703,165 @@ struct WorkspaceRailView: View {
             }
             ToastCenter.shared.show("Copied \(url.lastPathComponent)", style: .success)
         }
+    }
+}
+
+private struct WorkspaceMoveSheet: View {
+    @Environment(\.dismiss) private var dismiss
+
+    let root: URL
+    let item: FileNode
+    let commit: (URL) -> Bool
+
+    @State private var directories: [URL] = []
+    @State private var selectedPath: String?
+    @State private var searchText = ""
+    @State private var isLoading = true
+
+    private var visibleDirectories: [URL] {
+        let query = searchText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !query.isEmpty else { return directories }
+        return directories.filter {
+            destinationLabel($0).localizedCaseInsensitiveContains(query)
+        }
+    }
+
+    private var selectedDirectory: URL? {
+        guard let selectedPath else { return nil }
+        return visibleDirectories.first { $0.path == selectedPath }
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            VStack(alignment: .leading, spacing: 4) {
+                Text("Move \(item.name)")
+                    .font(.title3.weight(.semibold))
+                Text("Choose a folder inside \(root.lastPathComponent). The item will keep its name.")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+            }
+
+            TextField("Search folders", text: $searchText)
+                .textFieldStyle(.roundedBorder)
+
+            Group {
+                if isLoading {
+                    VStack(spacing: 10) {
+                        ProgressView().controlSize(.small)
+                        Text("Finding project folders…")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                } else if visibleDirectories.isEmpty {
+                    ContentUnavailableView(
+                        searchText.isEmpty ? "No Other Folders" : "No Matching Folders",
+                        systemImage: "folder.badge.minus",
+                        description: Text(
+                            searchText.isEmpty
+                                ? "This item has no safe cross-directory destination."
+                                : "Try a different folder search."
+                        )
+                    )
+                } else {
+                    ScrollView {
+                        LazyVStack(spacing: 2) {
+                            ForEach(visibleDirectories, id: \.path) { directory in
+                                let isSelected = selectedPath == directory.path
+                                Button {
+                                    selectedPath = directory.path
+                                } label: {
+                                    HStack(spacing: 9) {
+                                        Image(systemName: directory.path == root.standardizedFileURL.path
+                                            ? "shippingbox"
+                                            : "folder")
+                                            .foregroundStyle(isSelected ? Color.accentColor : .secondary)
+                                            .frame(width: 18)
+                                        Text(destinationLabel(directory))
+                                            .font(.callout)
+                                            .lineLimit(1)
+                                            .truncationMode(.middle)
+                                        Spacer(minLength: 0)
+                                        if isSelected {
+                                            Image(systemName: "checkmark")
+                                                .font(.caption.weight(.semibold))
+                                                .foregroundStyle(Color.accentColor)
+                                        }
+                                    }
+                                    .padding(.horizontal, 10)
+                                    .padding(.vertical, 7)
+                                    .background(
+                                        isSelected ? Color.accentColor.opacity(0.14) : .clear,
+                                        in: RoundedRectangle(cornerRadius: 7, style: .continuous)
+                                    )
+                                    .contentShape(Rectangle())
+                                }
+                                .buttonStyle(.plain)
+                                .accessibilityLabel("Move destination \(destinationLabel(directory))")
+                                .accessibilityValue(isSelected ? "Selected" : "Not selected")
+                            }
+                        }
+                        .padding(4)
+                    }
+                    .background(
+                        Color(nsColor: .controlBackgroundColor).opacity(0.72),
+                        in: RoundedRectangle(cornerRadius: 9, style: .continuous)
+                    )
+                    .overlay {
+                        RoundedRectangle(cornerRadius: 9, style: .continuous)
+                            .stroke(Color(nsColor: .separatorColor).opacity(0.55), lineWidth: 0.65)
+                    }
+                }
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+
+            Divider()
+            HStack {
+                Spacer()
+                Button("Cancel", role: .cancel) { dismiss() }
+                    .keyboardShortcut(.cancelAction)
+                Button("Move") {
+                    guard let selectedDirectory, commit(selectedDirectory) else { return }
+                    dismiss()
+                }
+                .keyboardShortcut(.defaultAction)
+                .disabled(selectedDirectory == nil || isLoading)
+            }
+        }
+        .padding(20)
+        .frame(width: 460, height: 440)
+        .task(id: item.id) {
+            isLoading = true
+            let root = root
+            let movingItem = item.url
+            let scan = Task.detached(priority: .utility) {
+                ProjectFiles.moveDestinationDirectories(
+                    root: root,
+                    movingItem: movingItem
+                )
+            }
+            let loaded = await scan.value
+            guard !Task.isCancelled else { return }
+            directories = loaded
+            selectedPath = loaded.first?.path
+            isLoading = false
+        }
+        .onChange(of: searchText) { _, _ in
+            if selectedDirectory == nil {
+                selectedPath = visibleDirectories.first?.path
+            }
+        }
+    }
+
+    private func destinationLabel(_ directory: URL) -> String {
+        let root = root.standardizedFileURL
+        let directory = directory.standardizedFileURL
+        guard directory.path != root.path else {
+            return "\(root.lastPathComponent) — Project Root"
+        }
+        let prefix = root.path.hasSuffix("/") ? root.path : root.path + "/"
+        guard directory.path.hasPrefix(prefix) else { return directory.lastPathComponent }
+        return String(directory.path.dropFirst(prefix.count))
     }
 }
 

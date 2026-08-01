@@ -1549,16 +1549,21 @@ final class AppModel: ObservableObject {
         scheduleWorkspaceStateSave(projectID: snapshot.projectID)
     }
 
-    func registerWorkspaceRenameUndo(
+    func registerWorkspaceMoveUndo(
         _ move: WorkspaceFileOperations.Move,
         workspaceRoot: URL,
         undoManager: UndoManager?
     ) {
-        registerWorkspaceRenameAction(
+        let actionName = move.source.deletingLastPathComponent().standardizedFileURL
+            == move.destination.deletingLastPathComponent().standardizedFileURL
+            ? "Rename"
+            : "Move"
+        registerWorkspaceMoveAction(
             from: move.destination,
             to: move.source,
             workspaceRoot: workspaceRoot,
-            undoManager: undoManager
+            undoManager: undoManager,
+            actionName: actionName
         )
     }
 
@@ -1592,54 +1597,65 @@ final class AppModel: ObservableObject {
         registerWorkspaceTrashAction(transaction, undoManager: undoManager)
     }
 
-    private func registerWorkspaceRenameAction(
+    private func registerWorkspaceMoveAction(
         from source: URL,
         to destination: URL,
         workspaceRoot: URL,
-        undoManager: UndoManager?
+        undoManager: UndoManager?,
+        actionName: String
     ) {
         guard let undoManager else { return }
         undoManager.registerUndo(withTarget: self) { [weak undoManager] model in
             guard let undoManager else { return }
             MainActor.assumeIsolated {
-                model.performWorkspaceRenameAction(
+                model.performWorkspaceMoveAction(
                     from: source,
                     to: destination,
                     workspaceRoot: workspaceRoot,
-                    undoManager: undoManager
+                    undoManager: undoManager,
+                    actionName: actionName
                 )
             }
         }
-        undoManager.setActionName("Rename")
+        undoManager.setActionName(actionName)
     }
 
-    private func performWorkspaceRenameAction(
+    private func performWorkspaceMoveAction(
         from source: URL,
         to destination: URL,
         workspaceRoot: URL,
-        undoManager: UndoManager
+        undoManager: UndoManager,
+        actionName: String
     ) {
-        registerWorkspaceRenameAction(
+        registerWorkspaceMoveAction(
             from: destination,
             to: source,
             workspaceRoot: workspaceRoot,
-            undoManager: undoManager
+            undoManager: undoManager,
+            actionName: actionName
         )
         guard prepareWorkspaceFileMutation(source) else { return }
         Task {
             do {
                 let move = try await Task.detached(priority: .userInitiated) {
-                    try WorkspaceFileOperations.rename(
+                    try WorkspaceFileOperations.move(
                         item: source,
-                        to: destination.lastPathComponent,
+                        to: destination,
                         workspaceRoot: workspaceRoot
                     )
                 }.value
                 reconcileWorkspaceFileMove(from: move.source, to: move.destination)
-                ProjectFileIndex.shared.invalidate(root: workspaceRoot)
-                ToastCenter.shared.show("Renamed to \(destination.lastPathComponent)", style: .success)
+                ProjectFileIndex.shared.invalidate(
+                    root: workspaceRoot,
+                    changedPaths: [move.source, move.destination],
+                    requiresFullRefresh: false
+                )
+                let message = actionName == "Rename"
+                    ? "Renamed to \(destination.lastPathComponent)"
+                    : "Moved \(destination.lastPathComponent)"
+                ToastCenter.shared.show(message, style: .success)
             } catch {
-                showWorkspaceMutationError(error, action: "rename")
+                showWorkspaceMutationError(error, action: actionName.lowercased())
             }
         }
     }

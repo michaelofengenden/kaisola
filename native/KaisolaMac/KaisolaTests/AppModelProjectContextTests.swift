@@ -380,7 +380,7 @@ final class AppModelProjectContextTests: XCTestCase {
         let undoManager = UndoManager()
         undoManager.groupsByEvent = false
         undoManager.beginUndoGrouping()
-        model.registerWorkspaceRenameUndo(
+        model.registerWorkspaceMoveUndo(
             move,
             workspaceRoot: root,
             undoManager: undoManager
@@ -388,6 +388,7 @@ final class AppModelProjectContextTests: XCTestCase {
         undoManager.endUndoGrouping()
 
         XCTAssertTrue(undoManager.canUndo)
+        XCTAssertEqual(undoManager.undoActionName, "Rename")
         undoManager.undo()
         let undoDeadline = Date().addingTimeInterval(2)
         while !FileManager.default.fileExists(atPath: original.path), Date() < undoDeadline {
@@ -404,6 +405,60 @@ final class AppModelProjectContextTests: XCTestCase {
         }
         XCTAssertTrue(FileManager.default.fileExists(atPath: move.destination.path))
         XCTAssertEqual(model.fileTabs(for: projectID).map(\.url), [move.destination])
+    }
+
+    @MainActor
+    func testWorkspaceCrossDirectoryMoveUndoAndRedoUseExactPaths() throws {
+        let (model, _) = makeModel()
+        let root = storeFile.deletingLastPathComponent().appendingPathComponent("undo-move")
+        let destinationDirectory = root.appendingPathComponent("docs", isDirectory: true)
+        try FileManager.default.createDirectory(
+            at: destinationDirectory,
+            withIntermediateDirectories: true
+        )
+        let original = root.appendingPathComponent("draft.md")
+        let destination = destinationDirectory.appendingPathComponent("draft.md")
+        try "draft".write(to: original, atomically: true, encoding: .utf8)
+        model.openProject(directory: root)
+        let projectID = try XCTUnwrap(model.selectedProjectID)
+        model.openFilePreview(original, pinned: true)
+        model.commitFileNavigation(original)
+
+        let move = try WorkspaceFileOperations.move(
+            item: original,
+            to: destination,
+            workspaceRoot: root
+        )
+        model.reconcileWorkspaceFileMove(from: move.source, to: move.destination)
+        let undoManager = UndoManager()
+        undoManager.groupsByEvent = false
+        undoManager.beginUndoGrouping()
+        model.registerWorkspaceMoveUndo(
+            move,
+            workspaceRoot: root,
+            undoManager: undoManager
+        )
+        undoManager.endUndoGrouping()
+
+        XCTAssertEqual(undoManager.undoActionName, "Move")
+        undoManager.undo()
+        let undoDeadline = Date().addingTimeInterval(2)
+        while !FileManager.default.fileExists(atPath: original.path), Date() < undoDeadline {
+            RunLoop.current.run(until: Date().addingTimeInterval(0.01))
+        }
+        XCTAssertTrue(FileManager.default.fileExists(atPath: original.path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: destination.path))
+        XCTAssertEqual(model.fileTabs(for: projectID).map(\.url), [original.standardizedFileURL])
+
+        XCTAssertEqual(undoManager.redoActionName, "Move")
+        undoManager.redo()
+        let redoDeadline = Date().addingTimeInterval(2)
+        while !FileManager.default.fileExists(atPath: destination.path), Date() < redoDeadline {
+            RunLoop.current.run(until: Date().addingTimeInterval(0.01))
+        }
+        XCTAssertFalse(FileManager.default.fileExists(atPath: original.path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: destination.path))
+        XCTAssertEqual(model.fileTabs(for: projectID).map(\.url), [destination.standardizedFileURL])
     }
 
     @MainActor

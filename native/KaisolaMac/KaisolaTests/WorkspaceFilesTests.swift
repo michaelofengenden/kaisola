@@ -449,6 +449,105 @@ final class WorkspaceFilesTests: XCTestCase {
         }
     }
 
+    func testWorkspaceMoveCrossesDirectoriesWithoutOverwriting() throws {
+        let source = root.appendingPathComponent("README.md")
+        let destination = root.appendingPathComponent("src/README.md")
+        let plan = try WorkspaceFileOperations.movePlan(
+            item: source,
+            to: destination,
+            workspaceRoot: root
+        )
+        XCTAssertEqual(plan.source, source.standardizedFileURL)
+        XCTAssertEqual(plan.destination, destination.standardizedFileURL)
+
+        let move = try WorkspaceFileOperations.move(
+            item: source,
+            to: destination,
+            workspaceRoot: root
+        )
+        XCTAssertFalse(FileManager.default.fileExists(atPath: source.path))
+        XCTAssertEqual(try String(contentsOf: move.destination, encoding: .utf8), "hello")
+
+        let collidingSource = root.appendingPathComponent("main.swift")
+        try "collision".write(to: collidingSource, atomically: true, encoding: .utf8)
+        XCTAssertThrowsError(try WorkspaceFileOperations.move(
+            item: collidingSource,
+            to: root.appendingPathComponent("src/main.swift"),
+            workspaceRoot: root
+        )) { error in
+            XCTAssertEqual(error as? WorkspaceFileOperations.OperationError, .destinationExists)
+        }
+        XCTAssertTrue(FileManager.default.fileExists(atPath: collidingSource.path))
+    }
+
+    func testWorkspaceMoveRejectsSameLocationDescendantsAndSymlinkParents() throws {
+        let source = root.appendingPathComponent("src", isDirectory: true)
+        let nested = source.appendingPathComponent("nested", isDirectory: true)
+        try FileManager.default.createDirectory(at: nested, withIntermediateDirectories: true)
+
+        XCTAssertThrowsError(try WorkspaceFileOperations.movePlan(
+            item: source,
+            to: source,
+            workspaceRoot: root
+        )) { error in
+            XCTAssertEqual(error as? WorkspaceFileOperations.OperationError, .unchangedLocation)
+        }
+        XCTAssertThrowsError(try WorkspaceFileOperations.movePlan(
+            item: source,
+            to: nested.appendingPathComponent("src", isDirectory: true),
+            workspaceRoot: root
+        )) { error in
+            XCTAssertEqual(error as? WorkspaceFileOperations.OperationError, .destinationInsideItem)
+        }
+
+        let linkedParent = root.appendingPathComponent("linked-parent", isDirectory: true)
+        try FileManager.default.createSymbolicLink(
+            at: linkedParent,
+            withDestinationURL: root.appendingPathComponent("node_modules", isDirectory: true)
+        )
+        XCTAssertThrowsError(try WorkspaceFileOperations.movePlan(
+            item: root.appendingPathComponent("README.md"),
+            to: linkedParent.appendingPathComponent("README.md"),
+            workspaceRoot: root
+        )) { error in
+            XCTAssertEqual(error as? WorkspaceFileOperations.OperationError, .symbolicLink)
+        }
+    }
+
+    func testMoveDestinationListIsBoundedAndOmitsCurrentParentAndSourceSubtree() throws {
+        let docs = root.appendingPathComponent("docs", isDirectory: true)
+        let nested = docs.appendingPathComponent("nested", isDirectory: true)
+        try FileManager.default.createDirectory(at: nested, withIntermediateDirectories: true)
+
+        let fileDestinations = ProjectFiles.moveDestinationDirectories(
+            root: root,
+            movingItem: root.appendingPathComponent("README.md")
+        )
+        XCTAssertEqual(fileDestinations.map(\.path), [
+            docs.path,
+            nested.path,
+            root.appendingPathComponent("src", isDirectory: true).path,
+        ])
+
+        let directoryDestinations = ProjectFiles.moveDestinationDirectories(
+            root: root,
+            movingItem: docs
+        )
+        XCTAssertEqual(directoryDestinations.map(\.path), [
+            root.appendingPathComponent("src", isDirectory: true).path,
+        ])
+        XCTAssertTrue(ProjectFiles.moveDestinationDirectories(
+            root: root,
+            movingItem: root.appendingPathComponent("README.md"),
+            limit: 1
+        ).isEmpty)
+        XCTAssertTrue(ProjectFiles.moveDestinationDirectories(
+            root: root,
+            movingItem: root.appendingPathComponent("README.md"),
+            visitLimit: 1
+        ).isEmpty)
+    }
+
     func testWorkspaceCreateFileAndFolderAreExclusiveAndWorkspaceBounded() throws {
         let folder = try WorkspaceFileOperations.createFolder(
             named: "Notes",

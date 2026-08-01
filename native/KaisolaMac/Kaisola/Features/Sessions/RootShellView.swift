@@ -1178,7 +1178,7 @@ struct RootShellView: View {
                     }, followsAgentFiles: $followsSelectedAgentFiles, canFollowAgentFiles: canFollowAgentFiles,
                     didMoveItem: { source, destination in
                         model.reconcileWorkspaceFileMove(from: source, to: destination)
-                        model.registerWorkspaceRenameUndo(
+                        model.registerWorkspaceMoveUndo(
                             .init(source: source, destination: destination),
                             workspaceRoot: root,
                             undoManager: undoManager

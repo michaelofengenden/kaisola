@@ -2093,7 +2093,6 @@ class ReadOnlyTerminalView: TerminalView {
                     guard let self,
                           let window = self.window,
                           event.window === window else { return }
-                    let point = self.convert(event.locationInWindow, from: nil)
                     switch event.type {
                     case .mouseMoved:
                         // Only when the pointer is actually ours; see
@@ -2102,7 +2101,11 @@ class ReadOnlyTerminalView: TerminalView {
                         guard self.ownsPointer(for: event) else { break }
                         self.updateLinkCursor(for: event)
                     case .leftMouseDown:
-                        self.linkPointerDownInView = self.bounds.contains(point)
+                        // Match the cursor path's hit-test ownership guard. A
+                        // divider corridor can deliberately overhang this
+                        // terminal's bounds; a press there belongs to the
+                        // divider, not to terminal link-selection state.
+                        self.linkPointerDownInView = self.ownsPointer(for: event)
                         self.linkPointerDragged = false
                     case .leftMouseDragged where self.linkPointerDownInView:
                         self.linkPointerDragged = true

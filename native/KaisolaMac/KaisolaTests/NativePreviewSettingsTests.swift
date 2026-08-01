@@ -415,6 +415,59 @@ final class NativePreviewSettingsTests: XCTestCase {
         XCTAssertEqual(NativeDetailPaneSizing.dividerHitWidth, 22)
     }
 
+    /// Both detail dividers' trackers were hoisted into ONE overlay on the
+    /// detail stack, because a tracker nested inside its handle sits under the
+    /// panel beside it in the backing NSView hierarchy — and the document panel
+    /// hosts a WKWebView/NSTextView, which then answers for the corridor's
+    /// cursor no matter what `zIndex` SwiftUI is given. Placing the corridors is
+    /// now this function's job rather than the HStack's, so the arithmetic that
+    /// used to be implicit in the layout is pinned here.
+    func testDetailDividerCorridorsSitOnTheRulesTheyResize() {
+        let widths = NativeDetailPaneSizing.Widths(preview: 480, rail: 218)
+        let both = NativeDetailPaneSizing.corridors(
+            widths: widths,
+            previewVisible: true,
+            railVisible: true
+        )
+        XCTAssertEqual(both.map(\.divider), [.rail, .preview])
+        // Right to left: [ rail 218 | rule 1 | preview 480 | rule 1 | content ].
+        XCTAssertEqual(both[0].centerFromTrailing, 218.5, accuracy: 0.001)
+        // The preview's rule sits past the rail AND the rail's own rule;
+        // forgetting that one point walks the corridor off its divider.
+        XCTAssertEqual(both[1].centerFromTrailing, 699.5, accuracy: 0.001)
+        XCTAssertGreaterThan(
+            both[1].centerFromTrailing - both[0].centerFromTrailing,
+            NativeDetailPaneSizing.dividerHitWidth,
+            "the two hit corridors must not overlap"
+        )
+
+        // Files closed: the document divider moves in by exactly the rail and
+        // the rail's rule, so the corridor tracks the panel it resizes.
+        let previewOnly = NativeDetailPaneSizing.corridors(
+            widths: NativeDetailPaneSizing.Widths(preview: 480, rail: 0),
+            previewVisible: true,
+            railVisible: false
+        )
+        XCTAssertEqual(previewOnly.map(\.divider), [.preview])
+        XCTAssertEqual(previewOnly[0].centerFromTrailing, 480.5, accuracy: 0.001)
+
+        let railOnly = NativeDetailPaneSizing.corridors(
+            widths: NativeDetailPaneSizing.Widths(preview: 0, rail: 218),
+            previewVisible: false,
+            railVisible: true
+        )
+        XCTAssertEqual(railOnly.map(\.divider), [.rail])
+        XCTAssertEqual(railOnly[0].centerFromTrailing, 218.5, accuracy: 0.001)
+
+        // No panels, no corridors: an overlay that always placed a tracker
+        // would leave a resize cursor floating over a bare terminal canvas.
+        XCTAssertTrue(NativeDetailPaneSizing.corridors(
+            widths: NativeDetailPaneSizing.Widths(preview: 0, rail: 0),
+            previewVisible: false,
+            railVisible: false
+        ).isEmpty)
+    }
+
     func testVisualChoiceTitlesRemainUserFacing() {
         XCTAssertEqual(SidebarAppearance.glass.title, "Glass")
         XCTAssertEqual(WorkspaceBackdropMode.tinted.title, "Tinted")
@@ -1609,9 +1662,9 @@ final class NativePreviewSettingsTests: XCTestCase {
     /// The *minimum* and the *maximum* are unchanged through all of it: nothing
     /// about the narrow rail moves, and anyone who wants the wide one drags it
     /// back. What v1.1.8 does change is that the narrowing is no longer free —
-    /// the session indent and the footer's account name each give something up
-    /// for it, and those two trades are pinned in `QuietIdentityMarkTests`
-    /// rather than left as a comment here.
+    /// the session indent gives something up for it, while the footer adopts a
+    /// stable first-name label; both decisions are pinned in
+    /// `QuietIdentityMarkTests` rather than left as comments here.
     func testProjectSidebarHasComfortableResizableWidth() {
         XCTAssertEqual(NativeWorkspaceChrome.projectSidebarMinimumWidth, 168)
         XCTAssertEqual(NativeWorkspaceChrome.projectSidebarIdealWidth, 210)

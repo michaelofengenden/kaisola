@@ -53,6 +53,10 @@ struct RootShellView: View {
     /// enter within is thin rather than absent. Debouncing the exit (below)
     /// removes the dependency on that margin instead of trusting it.
     @State private var sidebarDividerHoverGeneration = 0
+    /// Which detail divider the pointer is in the corridor of, if any. Their
+    /// trackers were hoisted out of the handles into one overlay on the detail
+    /// stack, so the highlight has to travel back down from here.
+    @State private var hoveredDetailDivider: NativeDetailPaneSizing.Divider?
 
     /// Both halves write through this instead of the raw `@State` so a leaving
     /// tracker's "false" cannot land after the other half's tracker has already
@@ -583,6 +587,10 @@ struct RootShellView: View {
     }
 
     private func toggleFilePreviewColumn() {
+        if model.browserCardURL != nil {
+            model.browserCardURL = nil
+            return
+        }
         if !model.toggleFilePreview() { settings.workspaceRailVisible = true }
     }
 
@@ -969,17 +977,24 @@ struct RootShellView: View {
         }
     }
 
+    /// The document preview (or the browser card, which shares its width and
+    /// its divider) is open.
+    private var detailPreviewPanelVisible: Bool {
+        model.previewedFileURL != nil || model.browserCardURL != nil
+    }
+
+    /// The Files rail is open.
+    private var detailRailPanelVisible: Bool {
+        settings.workspaceRailVisible && model.currentProjectDirectory != nil
+    }
+
     @ViewBuilder
     private var detailPane: some View {
         GeometryReader { geometry in
             let widths = NativeDetailPaneSizing.resolve(
                 totalWidth: geometry.size.width,
-                preferredPreview: model.previewedFileURL == nil && model.browserCardURL == nil
-                    ? nil
-                    : settings.filePreviewWidth,
-                preferredRail: settings.workspaceRailVisible && model.currentProjectDirectory != nil
-                    ? settings.workspaceRailWidth
-                    : nil
+                preferredPreview: detailPreviewPanelVisible ? settings.filePreviewWidth : nil,
+                preferredRail: detailRailPanelVisible ? settings.workspaceRailWidth : nil
             )
             HStack(spacing: 0) {
                 detailContent
@@ -1051,6 +1066,74 @@ struct RootShellView: View {
                     .frame(width: widths.rail)
                 }
             }
+            // Both detail dividers' pointer trackers live HERE, in one overlay
+            // on the stack, instead of inside the handles they belong to.
+            //
+            // `FilePreviewView` hosts real AppKit views — a `WKWebView` for
+            // rendered Markdown, an `NSTextView` for source — and a hosted
+            // AppKit view outranks a SwiftUI sibling for cursor dispatch.
+            // `zIndex` reorders SwiftUI's drawing but NOT the backing NSViews,
+            // measured: with the tracker inside the handle the document
+            // divider's corridor read `arrow` across its whole width at every
+            // zIndex, while the identical Files handle (whose neighbour hosts
+            // no web view) read `resizeLeftRight`. An overlay attached to the
+            // HStack is added to the same backing hierarchy AFTER the panels,
+            // so these tracking views are true top-level siblings above the
+            // hosted content and finally receive `.cursorUpdate` first.
+            .overlay(alignment: .trailing) {
+                detailDividerTrackers(widths: widths)
+            }
+        }
+    }
+
+    /// The hoisted corridors, owned by one AppKit overlay.
+    ///
+    /// The overlay fills the detail stack but returns `nil` from hit testing
+    /// outside the two `dividerHitWidth` corridors. That keeps the hosted
+    /// document views below it in backing-view order without placing an
+    /// invisible pointer surface over the terminal, preview, or Files panel.
+    private func detailDividerTrackers(widths: NativeDetailPaneSizing.Widths) -> some View {
+        let corridors = NativeDetailPaneSizing.corridors(
+            widths: widths,
+            previewVisible: detailPreviewPanelVisible,
+            railVisible: detailRailPanelVisible
+        )
+        return DetailDividerTrackingView(
+            corridors: corridors,
+            corridorWidth: NativeDetailPaneSizing.dividerHitWidth,
+            hoverChanged: { hoveredDetailDivider = $0 },
+            dragBegan: settings.beginPanelResize,
+            deltaChanged: { resizeDetailPanel($0, by: $1) },
+            dragEnded: settings.endPanelResize,
+            doubleClicked: { resetDetailPanel($0) }
+        )
+        // The corridor is a pointer surface only. Each divider's single AX
+        // slider stays on its handle, where the label, the hint, and the
+        // adjustable action already are.
+        .accessibilityHidden(true)
+    }
+
+    /// The one width-write path per detail panel, shared by the hoisted tracker
+    /// (drag) and the handle itself (arrow keys, VoiceOver adjustment).
+    private func resizeDetailPanel(_ divider: NativeDetailPaneSizing.Divider, by delta: CGFloat) {
+        switch divider {
+        case .preview:
+            settings.filePreviewWidth = NativePreviewSettings.clampedFilePreviewWidth(
+                settings.filePreviewWidth - Double(delta)
+            )
+        case .rail:
+            settings.workspaceRailWidth = NativePreviewSettings.clampedWorkspaceRailWidth(
+                settings.workspaceRailWidth - Double(delta)
+            )
+        }
+    }
+
+    private func resetDetailPanel(_ divider: NativeDetailPaneSizing.Divider) {
+        switch divider {
+        case .preview:
+            settings.filePreviewWidth = NativePreviewSettings.filePreviewWidthDefault
+        case .rail:
+            settings.workspaceRailWidth = NativePreviewSettings.workspaceRailWidthDefault
         }
     }
 
@@ -1058,16 +1141,10 @@ struct RootShellView: View {
         StablePanelResizeHandle(
             label: "Resize Files",
             help: "Drag to resize Files; double-click to reset",
+            hovered: hoveredDetailDivider == .rail,
             onBegan: settings.beginPanelResize,
-            onDelta: { delta in
-                settings.workspaceRailWidth = NativePreviewSettings.clampedWorkspaceRailWidth(
-                    settings.workspaceRailWidth - Double(delta)
-                )
-            },
-            onEnded: settings.endPanelResize,
-            onDoubleClick: {
-                settings.workspaceRailWidth = NativePreviewSettings.workspaceRailWidthDefault
-            }
+            onDelta: { resizeDetailPanel(.rail, by: $0) },
+            onEnded: settings.endPanelResize
         )
         .accessibilityAdjustableAction { direction in
             settings.workspaceRailWidth = NativePreviewSettings.clampedWorkspaceRailWidth(
@@ -1080,16 +1157,10 @@ struct RootShellView: View {
         StablePanelResizeHandle(
             label: "Resize document preview",
             help: "Drag to resize the document; double-click to reset",
+            hovered: hoveredDetailDivider == .preview,
             onBegan: settings.beginPanelResize,
-            onDelta: { delta in
-                settings.filePreviewWidth = NativePreviewSettings.clampedFilePreviewWidth(
-                    settings.filePreviewWidth - Double(delta)
-                )
-            },
-            onEnded: settings.endPanelResize,
-            onDoubleClick: {
-                settings.filePreviewWidth = NativePreviewSettings.filePreviewWidthDefault
-            }
+            onDelta: { resizeDetailPanel(.preview, by: $0) },
+            onEnded: settings.endPanelResize
         )
             .accessibilityAdjustableAction { direction in
                 settings.filePreviewWidth = NativePreviewSettings.clampedFilePreviewWidth(
@@ -1112,12 +1183,8 @@ struct RootShellView: View {
             newMesh: { RootShellView.promptForNewMesh(model: model) },
             newStagedMesh: { RootShellView.promptForNewMesh(model: model, staged: true) },
             newIdeaMesh: { RootShellView.promptForNewMesh(model: model, idea: true) },
-            filePreviewVisible: model.previewedFileURL != nil,
-            toggleFilePreview: {
-                if !model.toggleFilePreview() {
-                    settings.workspaceRailVisible = true
-                }
-            },
+            filePreviewVisible: detailPreviewPanelVisible,
+            toggleFilePreview: toggleFilePreviewColumn,
             showSettings: {
                 settingsSectionID = nil
                 showSettings = true
@@ -1911,14 +1978,13 @@ private struct PaneResizeHandle: View {
         .accessibilityLabel(axis == .horizontal ? "Resize session columns" : "Resize stacked sessions")
         .accessibilityHint("Drag or use arrow keys to resize; double-click to balance panes")
         .help("Drag or use arrow keys to resize; double-click to balance panes")
-        // The tracker goes LAST, under nothing, and that ordering is the fix.
-        //
-        // `.help` installs a real (hit-transparent) AppKit view for the tooltip.
-        // Layered over the tracker, as it was, that view answered for the
-        // corridor's cursor while the drag still fell straight through to the
-        // tracker underneath — so every pane divider was perfectly draggable
-        // and showed a plain arrow the whole time. See `StablePanelResizeHandle`,
-        // which had the same bug from the call site's `.help`.
+        // The tracker is the explicit pointer surface and stays the final
+        // overlay on a session divider. The verified cursor bug here was the
+        // terminal's window-wide mouse monitor overwriting `resizeLeftRight`
+        // after entry; detail-panel dividers have a different issue — hosted
+        // AppKit siblings outrank nested SwiftUI trackers — and are hoisted at
+        // `detailDividerTrackers`. Do not attribute either failure to `.help`:
+        // its view is sized to the one-point rule, not the whole corridor.
         //
         // The cross-axis dimension is left `nil` on purpose: the tracker
         // stretches to the handle's full length, so the resize cursor and the
@@ -2557,16 +2623,24 @@ final class NavigationSidebarAccessibilityElement: NSAccessibilityElement, NSAcc
 /// session cards. Their previous SwiftUI DragGesture measured translation in a
 /// coordinate space that moved as the panel width changed, feeding alternating
 /// deltas back into the layout and making rich previews visibly oscillate.
+///
+/// The tracker itself is no longer here: it is hoisted into one overlay on the
+/// detail `HStack` (see `detailDividerTrackers`), because a tracker nested in
+/// this handle sits in the backing hierarchy UNDER the panel beside it, and the
+/// document panel hosts AppKit views that then answer for the corridor's
+/// cursor. What stays is the visible rule, the keyboard path, and the AX
+/// slider — one per divider.
 private struct StablePanelResizeHandle: View {
     let label: String
-    /// Taken as a parameter rather than applied by the caller, so `.help` lands
-    /// UNDER the pointer tracker. See the note on the overlay below.
+    /// Kept with the semantic handle so its tooltip, label, and keyboard path
+    /// describe the same divider. Pointer tracking is hoisted separately.
     let help: String
+    /// Driven by the hoisted tracker's hover callback rather than local state:
+    /// the pointer now enters a view that is no longer this one's descendant.
+    let hovered: Bool
     let onBegan: () -> Void
     let onDelta: (CGFloat) -> Void
     let onEnded: () -> Void
-    let onDoubleClick: () -> Void
-    @State private var hovered = false
 
     var body: some View {
         ZStack {
@@ -2579,13 +2653,6 @@ private struct StablePanelResizeHandle: View {
         }
         .frame(width: NativeDetailPaneSizing.dividerWidth)
         .contentShape(Rectangle())
-        // Same fix `PaneResizeHandle` got in v1.1.7, and for the same reason:
-        // the corridor overhangs both neighbours, and in an `HStack` a later
-        // sibling is drawn — and hit-tested — above an earlier one. Left at the
-        // default, the trailing half of this corridor was swallowed by the panel
-        // that follows it, which for the document divider is a text view that
-        // sets its own I-beam. That is why the resize cursor appeared on the
-        // approach and vanished as the pointer arrived.
         .animation(.easeOut(duration: 0.12), value: hovered)
         .focusable()
         .accessibilityElement(children: .ignore)
@@ -2604,29 +2671,152 @@ private struct StablePanelResizeHandle: View {
         .accessibilityHint("Drag or use arrow keys to resize; double-click to reset")
         .accessibilityLabel(label)
         .help(help)
-        // The tracker goes LAST, under nothing, and that ordering is the fix.
-        //
-        // `.help` installs a real (hit-transparent) AppKit view for the tooltip,
-        // and the call sites applied it AFTER this handle — so it sat in front
-        // of the tracker. The drag still fell through to the tracker underneath,
-        // but the cursor did not: the tooltip view answered for the corridor and
-        // the pointer showed a plain arrow. The document and Files dividers were
-        // fully draggable and never once said so, in every build that has
-        // shipped. Nothing may be layered over the tracker.
-        .overlay {
-            PaneResizeTrackingView(
-                axis: .horizontal,
-                hoverChanged: { hovered = $0 },
-                dragBegan: onBegan,
-                deltaChanged: onDelta,
-                dragEnded: onEnded,
-                doubleClicked: onDoubleClick
-            )
-            .frame(width: NativeDetailPaneSizing.dividerHitWidth)
-        }
-        // The corridor overhangs both neighbours, and in an `HStack` a later
-        // sibling is drawn — and hit-tested — above an earlier one.
+        // The visible rule is one layout point but its hover capsule is three,
+        // so it still has to draw over the panel beside it.
         .zIndex(1)
+    }
+}
+
+/// One AppKit overlay owns every detail-divider corridor. A SwiftUI `HStack` of
+/// separate representables puts each tracking view inside another hosting
+/// container; the document panel's hosted WKWebView/NSTextView can still outrank
+/// that nested container for cursor dispatch. This representable is attached
+/// directly to the detail stack, so it is one front-most AppKit sibling. Its
+/// `hitTest` returns `nil` outside the narrow corridor rectangles, leaving the
+/// document, terminal, and Files surfaces completely interactive.
+private struct DetailDividerTrackingView: NSViewRepresentable {
+    let corridors: [NativeDetailPaneSizing.Corridor]
+    let corridorWidth: CGFloat
+    let hoverChanged: (NativeDetailPaneSizing.Divider?) -> Void
+    let dragBegan: () -> Void
+    let deltaChanged: (NativeDetailPaneSizing.Divider, CGFloat) -> Void
+    let dragEnded: () -> Void
+    let doubleClicked: (NativeDetailPaneSizing.Divider) -> Void
+
+    func makeNSView(context: Context) -> TrackingView {
+        let view = TrackingView()
+        update(view)
+        return view
+    }
+
+    func updateNSView(_ nsView: TrackingView, context: Context) {
+        update(nsView)
+    }
+
+    private func update(_ view: TrackingView) {
+        let geometryChanged = view.corridors != corridors || view.corridorWidth != corridorWidth
+        view.corridors = corridors
+        view.corridorWidth = corridorWidth
+        view.hoverChanged = hoverChanged
+        view.dragBegan = dragBegan
+        view.deltaChanged = deltaChanged
+        view.dragEnded = dragEnded
+        view.doubleClicked = doubleClicked
+        if geometryChanged { view.updateTrackingAreas() }
+    }
+
+    final class TrackingView: NSView {
+        var corridors: [NativeDetailPaneSizing.Corridor] = []
+        var corridorWidth: CGFloat = 0
+        var hoverChanged: (NativeDetailPaneSizing.Divider?) -> Void = { _ in }
+        var dragBegan: () -> Void = {}
+        var deltaChanged: (NativeDetailPaneSizing.Divider, CGFloat) -> Void = { _, _ in }
+        var dragEnded: () -> Void = {}
+        var doubleClicked: (NativeDetailPaneSizing.Divider) -> Void = { _ in }
+
+        private static let dividerKey = "divider"
+        private var corridorTrackingAreas: [NSTrackingArea] = []
+        private var draggingDivider: NativeDetailPaneSizing.Divider?
+        private var lastWindowPoint: NSPoint?
+
+        override var mouseDownCanMoveWindow: Bool { false }
+        override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+        override func isAccessibilityElement() -> Bool { false }
+
+        override func hitTest(_ point: NSPoint) -> NSView? {
+            guard let superview else { return nil }
+            let localPoint = convert(point, from: superview)
+            return divider(at: localPoint) == nil ? nil : self
+        }
+
+        override func updateTrackingAreas() {
+            super.updateTrackingAreas()
+            for area in corridorTrackingAreas { removeTrackingArea(area) }
+            corridorTrackingAreas = corridors.compactMap { corridor in
+                let centerX = bounds.maxX - corridor.centerFromTrailing
+                let rect = NSRect(
+                    x: centerX - corridorWidth / 2,
+                    y: bounds.minY,
+                    width: corridorWidth,
+                    height: bounds.height
+                ).intersection(bounds)
+                guard !rect.isEmpty else { return nil }
+                let area = NSTrackingArea(
+                    rect: rect,
+                    options: [.activeInActiveApp, .mouseEnteredAndExited, .cursorUpdate],
+                    owner: self,
+                    userInfo: [Self.dividerKey: corridor.divider.rawValue]
+                )
+                addTrackingArea(area)
+                return area
+            }
+        }
+
+        override func cursorUpdate(with event: NSEvent) {
+            guard divider(for: event.trackingArea) != nil else { return }
+            NSCursor.resizeLeftRight.set()
+        }
+
+        override func mouseEntered(with event: NSEvent) {
+            hoverChanged(divider(for: event.trackingArea))
+        }
+
+        override func mouseExited(with event: NSEvent) {
+            guard draggingDivider == nil else { return }
+            hoverChanged(nil)
+        }
+
+        override func mouseDown(with event: NSEvent) {
+            let point = convert(event.locationInWindow, from: nil)
+            guard let divider = divider(at: point) else { return }
+            if event.clickCount == 2 {
+                draggingDivider = nil
+                lastWindowPoint = nil
+                doubleClicked(divider)
+                return
+            }
+            draggingDivider = divider
+            lastWindowPoint = event.locationInWindow
+            dragBegan()
+        }
+
+        override func mouseDragged(with event: NSEvent) {
+            let point = event.locationInWindow
+            guard let divider = draggingDivider, let previous = lastWindowPoint else { return }
+            lastWindowPoint = point
+            let delta = point.x - previous.x
+            guard abs(delta) >= 0.25 else { return }
+            deltaChanged(divider, delta)
+        }
+
+        override func mouseUp(with event: NSEvent) {
+            guard draggingDivider != nil else { return }
+            draggingDivider = nil
+            lastWindowPoint = nil
+            dragEnded()
+            hoverChanged(divider(at: convert(event.locationInWindow, from: nil)))
+        }
+
+        private func divider(at point: NSPoint) -> NativeDetailPaneSizing.Divider? {
+            corridors.first { corridor in
+                abs((bounds.maxX - point.x) - corridor.centerFromTrailing) <= corridorWidth / 2
+            }?.divider
+        }
+
+        private func divider(for area: NSTrackingArea?) -> NativeDetailPaneSizing.Divider? {
+            guard let rawValue = area?.userInfo?[Self.dividerKey] as? String else { return nil }
+            return NativeDetailPaneSizing.Divider(rawValue: rawValue)
+        }
     }
 }
 
@@ -2664,9 +2854,9 @@ private struct PaneResizeTrackingView: NSViewRepresentable {
         // hover callback below drives one. Re-deriving the cursor while the
         // pointer sits on the divider is what made it flicker between the
         // resize cursor and the arrow. The cursor comes from the tracking
-        // area's `.cursorUpdate` instead — which is delivered correctly as long
-        // as nothing is layered over the tracker; see the overlay ordering in
-        // `PaneResizeHandle` and `StablePanelResizeHandle`.
+        // area's `.cursorUpdate` instead. Session dividers keep this view as
+        // their final overlay; detail dividers use
+        // `DetailDividerTrackingView` above hosted AppKit content.
     }
 
     final class TrackingView: NSView {
@@ -2681,6 +2871,11 @@ private struct PaneResizeTrackingView: NSViewRepresentable {
 
         override var mouseDownCanMoveWindow: Bool { false }
         override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+
+        /// The divider's one AX slider is vended by the SwiftUI handle. Hoisted
+        /// out of that handle's accessibility element, this view would otherwise
+        /// be free to appear in the tree beside it as a second, silent element.
+        override func isAccessibilityElement() -> Bool { false }
 
         override func updateTrackingAreas() {
             super.updateTrackingAreas()
@@ -2864,18 +3059,11 @@ enum NativeWorkspaceChrome {
     /// a visible hierarchy step; 248 → 228 in v1.1.7 once the rail stopped
     /// spending width on chrome; 228 → 210 in v1.1.8.
     ///
-    /// This step is the first one the row grammar actually pays for, and the two
-    /// bills are stated rather than absorbed. The session indent gives back 4pt
-    /// (40 → 36) so a title still renders 15 characters — see
-    /// `QuietRailMetrics.sessionIndent`. The footer's account name cannot be made
-    /// to fit: after spending every point the budget had (leading padding 8 → 6,
-    /// avatar 22 → 18, the usage chip's internal padding 2 → 1) the lane is
-    /// 110.0pt against the 117.3pt "michael ofengenden" needs, so below
-    /// `FooterAccountName.abbreviationThreshold` the chip shows a first name plus
-    /// a last initial and carries the whole name in its tooltip.
-    ///
-    /// The maximum is unchanged, so anyone who wants the wide rail — and the
-    /// unabbreviated name with it — drags it back and it stays.
+    /// This step is the first one the row grammar actually pays for. The session
+    /// indent gives back 4pt (40 → 36) so a title still renders 15 characters —
+    /// see `QuietRailMetrics.sessionIndent`. The footer deliberately shows only
+    /// the account's first name at every width; the whole name stays in its help
+    /// text and at the top of the account menu.
     static let projectSidebarIdealWidth: CGFloat = 210
     /// Raised alongside the ideal so a user who wants long titles can have
     /// them; the minimum is unchanged, so nothing about the narrow rail moves.
@@ -3044,6 +3232,56 @@ enum NativeDetailPaneSizing {
     struct Widths: Equatable {
         let preview: CGFloat
         let rail: CGFloat
+    }
+
+    /// Which panel a detail divider resizes. The two dividers now share one
+    /// tracker overlay, so each corridor has to name the panel it drives.
+    enum Divider: String, Hashable, CaseIterable, Identifiable {
+        case preview
+        case rail
+
+        var id: String { rawValue }
+    }
+
+    /// One divider's pointer corridor, measured from the detail pane's TRAILING
+    /// edge because that is the edge the panels are anchored to: the content
+    /// column is the flexible one, so a corridor's distance from the right of
+    /// the pane depends only on the panel widths `resolve` already returned.
+    struct Corridor: Equatable, Identifiable {
+        let divider: Divider
+        /// Trailing edge → the CENTRE of the divider's one-point rule.
+        let centerFromTrailing: CGFloat
+
+        var id: String { divider.rawValue }
+    }
+
+    /// Where each visible detail divider sits, right to left. The overlay that
+    /// hosts the trackers is attached to the whole detail `HStack`, so it has
+    /// to place them itself rather than inherit the stack's own layout.
+    static func corridors(
+        widths: Widths,
+        previewVisible: Bool,
+        railVisible: Bool
+    ) -> [Corridor] {
+        var corridors: [Corridor] = []
+        // Walk in from the trailing edge in the same order the HStack lays the
+        // panels out: [ content | preview divider | preview | rail divider | rail ].
+        var consumed: CGFloat = 0
+        if railVisible {
+            corridors.append(
+                Corridor(divider: .rail, centerFromTrailing: widths.rail + dividerWidth / 2)
+            )
+            consumed = widths.rail + dividerWidth
+        }
+        if previewVisible {
+            corridors.append(
+                Corridor(
+                    divider: .preview,
+                    centerFromTrailing: consumed + widths.preview + dividerWidth / 2
+                )
+            )
+        }
+        return corridors
     }
 
     /// One visible/layout point with a forgiving overlaid acquisition target.
@@ -3458,52 +3696,17 @@ enum FooterAccountBudget {
     }
 }
 
-/// What the account chip actually renders, once the budget has run out.
-///
-/// v1.1.8's 210pt rail is the first width where "michael ofengenden" genuinely
-/// does not fit: the ladder in `FooterAccountBudget` (leading padding 8 → 6,
-/// avatar 22 → 18, chip padding 2 → 1) recovers 8 of the 18 points the narrowing
-/// cost, leaving the name lane at ~110pt against the 117.3pt the name renders at.
-/// The remaining choice is which failure to ship, and an ellipsis is the worse
-/// one: "michael ofen…" is a truncation *artifact*, it tells you nothing you did
-/// not already know, and it is exactly the complaint that started this thread.
-///
-/// A deliberate abbreviation is the better failure. "michael o." is a form
-/// people write themselves, it fits with room to spare, and the whole name stays
-/// one hover away in the tooltip and one click away at the top of the account
-/// menu. It applies at narrow widths only — drag the rail past the threshold and
-/// the full name comes back — so nothing is lost, it is deferred.
+/// What the account chip renders. The footer is a compact identity control, so
+/// it consistently shows the first name rather than changing labels as the rail
+/// is resized. The whole account name remains in help text and the account menu.
 enum FooterAccountName {
-    /// Below this footer width the chip abbreviates.
-    ///
-    /// 225, not the 217.3 the arithmetic bottoms out at: a threshold sitting on
-    /// the exact point where the name stops fitting would flip back and forth
-    /// under a slow drag, and the last few points before it would render a name
-    /// that technically fits and visually touches the gear beside it.
-    static let abbreviationThreshold: CGFloat = 225
-
-    static func shouldAbbreviate(footerWidth: CGFloat) -> Bool {
-        footerWidth < abbreviationThreshold
-    }
-
-    /// First name plus last initial. Case is the account's own — the display
-    /// name is whatever the provider stored, and title-casing someone's name for
-    /// them is not this function's business.
-    ///
-    /// Anything without a space (a single name, or the email address the chip
-    /// falls back to) is returned untouched: there is no initial to take, and an
-    /// email abbreviated at its first dot would be unrecognisable.
-    static func abbreviated(_ name: String) -> String {
-        let parts = name.split(whereSeparator: \.isWhitespace)
-        guard parts.count > 1, let first = parts.first, let last = parts.last,
-              let initial = last.first else { return name }
-        return "\(first) \(initial)."
-    }
-
-    /// - Returns: what to draw, and the full name whenever it differs so the
-    ///   caller can put it in the tooltip.
-    static func displayed(_ name: String, footerWidth: CGFloat) -> String {
-        shouldAbbreviate(footerWidth: footerWidth) ? abbreviated(name) : name
+    /// Case is the account's own. A single-token name and the email fallback
+    /// remain intact; multi-part display names reduce to their first token.
+    static func displayed(_ name: String) -> String {
+        guard !name.contains("@"), let first = name.split(whereSeparator: \.isWhitespace).first else {
+            return name
+        }
+        return String(first)
     }
 }
 
@@ -3525,11 +3728,6 @@ private struct ConnectionFooter: View {
 
     @ObservedObject private var attention = AttentionCenter.shared
     @State private var showInbox = false
-    /// The footer's own rendered width, which decides whether the account name
-    /// abbreviates. Read from a background `GeometryReader` rather than passed
-    /// in: the footer is the thing the budget is measured against, and it is the
-    /// only view that knows how wide the user has dragged the rail.
-    @State private var measuredWidth: CGFloat = NativeWorkspaceChrome.projectSidebarIdealWidth
 
     private static let appVersion = Bundle.main.object(
         forInfoDictionaryKey: "CFBundleShortVersionString"
@@ -3563,17 +3761,6 @@ private struct ConnectionFooter: View {
         .padding(.leading, FooterAccountBudget.leadingPadding)
         .padding(.trailing, FooterAccountBudget.trailingPadding)
         .frame(height: 40)
-        // A background reader, so measuring cannot participate in the layout it
-        // measures. The only thing the width decides is which *string* the chip
-        // draws, and the chip is the row's flexible child either way, so there
-        // is no path back from the decision to the measurement.
-        .background {
-            GeometryReader { proxy in
-                Color.clear
-                    .onAppear { measuredWidth = proxy.size.width }
-                    .onChange(of: proxy.size.width) { _, width in measuredWidth = width }
-            }
-        }
     }
 
     /// One click to Settings — the ⌘, destination, which until now existed
@@ -3652,13 +3839,13 @@ private struct ConnectionFooter: View {
         return account.displayName ?? account.email
     }
 
-    /// What the chip draws at the current width; see `FooterAccountName`.
+    /// What the compact chip draws; see `FooterAccountName`.
     private var displayedAccountName: String {
-        FooterAccountName.displayed(accountName, footerWidth: measuredWidth)
+        FooterAccountName.displayed(accountName)
     }
 
     /// The tooltip leads with the whole name whenever the chip is showing less
-    /// than all of it, so the abbreviation is never the only copy on screen.
+    /// than all of it, so the first-name label is never the only copy on screen.
     private var accountHelp: String {
         let base = "Account and workspace settings"
         return displayedAccountName == accountName ? base : "\(accountName) — \(base)"

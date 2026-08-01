@@ -401,7 +401,7 @@ final class QuietIdentityMarkTests: XCTestCase {
         // …and the narrowing really is a narrowing: the rail is now under every
         // resting width it has had since v1.1.5, which is what makes the two
         // trades this release pays for (the 4pt of indent above, and the
-        // footer's abbreviated name below) real rather than decorative.
+        // footer's compact first-name label below) real rather than decorative.
         XCTAssertLessThan(NativeWorkspaceChrome.projectSidebarIdealWidth, 228)
     }
 
@@ -475,31 +475,17 @@ final class QuietIdentityMarkTests: XCTestCase {
         // The old chip framed avatar + name into 118pt total.
         XCTAssertGreaterThan(width, 118 - FooterAccountBudget.avatarSlot)
 
-        // What v1.1.8 actually ships, stated as arithmetic because it is a
-        // trade and not a win. The 210pt rail leaves the name lane ~110pt
-        // against the 117.3pt "michael ofengenden" renders at, AFTER spending
-        // every rung of the recovery ladder (leading padding 8→6, avatar
-        // 22→18, chip padding 2→1). So the full name does NOT fit here, and
-        // the honest thing is to assert that rather than to pretend otherwise:
-        // what has to fit is what the chip DRAWS.
+        // v1.1.8 intentionally uses the first name at every width. The 210pt
+        // rail must give that stable label ample room even with usage visible;
+        // the whole display name remains in help text and the account menu.
         let full = "michael ofengenden"
-        XCTAssertLessThan(
-            width,
-            footerNameRenders(full),
-            "the full name fits again — the abbreviation fallback is now dead code, remove it"
-        )
-        let displayed = FooterAccountName.displayed(
-            full,
-            footerWidth: NativeWorkspaceChrome.projectSidebarIdealWidth
-        )
-        XCTAssertEqual(displayed, "michael o.")
+        let displayed = FooterAccountName.displayed(full)
+        XCTAssertEqual(displayed, "michael")
         XCTAssertGreaterThanOrEqual(
             width, footerNameRenders(displayed),
-            "even the abbreviated name takes an ellipsis at the default width"
+            "the first-name label takes an ellipsis at the default width"
         )
-        // With real room to spare, not by a hair: an abbreviation that only just
-        // fits is one control away from truncating too.
-        XCTAssertGreaterThan(width - footerNameRenders(displayed), 30)
+        XCTAssertGreaterThan(width - footerNameRenders(displayed), 50)
 
         // The ladder still has to have been climbed. These are the three rungs;
         // pinned so a later pass cannot restore the points it took and leave the
@@ -509,64 +495,20 @@ final class QuietIdentityMarkTests: XCTestCase {
         XCTAssertEqual(FooterAccountBudget.usageChipHorizontalPadding, 1)
     }
 
-    /// The abbreviation is a NARROW-WIDTH behaviour, not the new normal. Drag the
-    /// rail out and the whole name comes back — that is what makes deferring it
-    /// acceptable rather than a loss.
-    func testTheWholeNameComesBackWhenTheRailIsDraggedWider() {
-        let full = "michael ofengenden"
-        let rendered = footerNameRenders(full)
-
-        // At and above the threshold the chip shows everything…
-        XCTAssertFalse(FooterAccountName.shouldAbbreviate(
-            footerWidth: FooterAccountName.abbreviationThreshold
-        ))
+    /// The label is stable across sidebar widths: first token, account casing
+    /// preserved. Single-token names and the email fallback stay intact.
+    func testFooterAccountNameUsesOnlyTheFirstToken() {
+        XCTAssertEqual(FooterAccountName.displayed("michael ofengenden"), "michael")
+        XCTAssertEqual(FooterAccountName.displayed("Michael Ofengenden"), "Michael")
+        XCTAssertEqual(FooterAccountName.displayed("Michael Ofengenden Jr."), "Michael")
+        XCTAssertEqual(FooterAccountName.displayed("Ada Byron Lovelace"), "Ada")
+        XCTAssertEqual(FooterAccountName.displayed("Kaisola"), "Kaisola")
         XCTAssertEqual(
-            FooterAccountName.displayed(full, footerWidth: FooterAccountName.abbreviationThreshold),
-            full
-        )
-        // …and the threshold is set where the name genuinely fits, with margin.
-        // A threshold below this point would show a full name that overlaps the
-        // gear beside it, which is worse than abbreviating.
-        let atThreshold = FooterAccountBudget.nameWidth(
-            footerWidth: FooterAccountName.abbreviationThreshold,
-            usageChipWidth: usageChipWidth,
-            attentionWidth: 0
-        )
-        XCTAssertGreaterThanOrEqual(atThreshold, rendered)
-        XCTAssertGreaterThan(
-            atThreshold - rendered, 5,
-            "the threshold sits on the exact point the name stops fitting; it will flicker under a drag"
-        )
-
-        // …and at the rail's maximum there is real room, so widening keeps
-        // paying rather than saturating.
-        let roomy = FooterAccountBudget.nameWidth(
-            footerWidth: NativeWorkspaceChrome.projectSidebarMaximumWidth,
-            usageChipWidth: usageChipWidth,
-            attentionWidth: 0
-        )
-        XCTAssertGreaterThan(roomy - rendered, 40, "widening the sidebar barely helps the name")
-    }
-
-    /// The rule itself: first name plus last initial, the account's own casing,
-    /// and hands back anything it cannot abbreviate meaningfully.
-    func testAbbreviationTakesAFirstNameAndALastInitial() {
-        XCTAssertEqual(FooterAccountName.abbreviated("michael ofengenden"), "michael o.")
-        XCTAssertEqual(FooterAccountName.abbreviated("Michael Ofengenden"), "Michael O.")
-        // Three or more parts: still first + last initial, not a middle-name
-        // chain, because the last name is the one that disambiguates.
-        XCTAssertEqual(FooterAccountName.abbreviated("Ada Byron Lovelace"), "Ada L.")
-        // Nothing to take an initial from — returned untouched rather than
-        // mangled. An email is the chip's fallback when there is no display
-        // name, and "mofengenden@…" abbreviated at a dot is unrecognisable.
-        XCTAssertEqual(FooterAccountName.abbreviated("Kaisola"), "Kaisola")
-        XCTAssertEqual(
-            FooterAccountName.abbreviated("mofengenden@berkeley.edu"),
+            FooterAccountName.displayed("mofengenden@berkeley.edu"),
             "mofengenden@berkeley.edu"
         )
-        XCTAssertEqual(FooterAccountName.abbreviated(""), "")
-        // Extra whitespace must not produce "michael ." from an empty tail.
-        XCTAssertEqual(FooterAccountName.abbreviated("michael   ofengenden  "), "michael o.")
+        XCTAssertEqual(FooterAccountName.displayed(""), "")
+        XCTAssertEqual(FooterAccountName.displayed("michael   ofengenden  "), "michael")
     }
 
     /// The fix is in the slots and gaps shared by every control, not a

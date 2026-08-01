@@ -110,4 +110,10 @@ final class ShutdownTaskRegistry {
         }
         entries.removeAll()
     }
+
+    /// Restoration can follow a close immediately. Wait for that one adapter
+    /// to finish stopping so the replacement never overlaps its predecessor.
+    func wait(for id: String) async {
+        await entries[id]?.task.value
+    }
 }

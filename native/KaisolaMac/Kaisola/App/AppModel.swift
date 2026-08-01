@@ -117,6 +117,22 @@ final class AppModel: ObservableObject {
     /// independently of the broker (the adapter is a child of this app).
     @Published private(set) var chats: [AcpChatHandle] = []
     @Published var selectedChatID: String?
+    /// Durable, stopped Chat and Mesh entries that have left the active layout
+    /// but have not crossed the explicit permanent-delete boundary.
+    @Published private var recentlyClosedPanes: [NativeRestorablePaneState] = []
+
+    struct RecentlyClosedSurface: Identifiable, Equatable, Sendable {
+        enum Kind: String, Equatable, Sendable {
+            case chat
+            case mesh
+        }
+
+        let id: String
+        let projectID: String
+        let title: String
+        let kind: Kind
+        let closedAt: Int64
+    }
     /// Project-scoped card geometry shared by terminals, ACP chats, and Mesh.
     /// A column is horizontal; ids inside a column stack vertically.
     @Published private(set) var paneLayouts: [String: SessionPaneLayout] = [:]
@@ -393,6 +409,9 @@ final class AppModel: ObservableObject {
     /// A durable Mesh may be restored by only one window model at a time.
     /// Main-actor isolation makes this a process-wide claim without locks.
     private static var claimedRestoredMeshIDs: Set<String> = []
+    /// Restore and permanent Delete are mutually exclusive transitions. A
+    /// stale menu in another window must not run either transition twice.
+    private static var claimedRecentlyClosedSurfaceIDs: Set<String> = []
     /// Mesh panes this window intentionally did not adopt (owned by another
     /// window or temporarily unavailable on disk). The shared store preserves
     /// their latest descriptor when this window saves a partial snapshot.
@@ -451,21 +470,36 @@ final class AppModel: ObservableObject {
         let sessionsByProject = Dictionary(grouping: sessions, by: \.projectID)
         let chatsByProject = Dictionary(grouping: chats, by: \.projectID)
         let meshesByProject = Dictionary(grouping: meshes, by: \.projectID)
+        let recentlyClosedByProject = Dictionary(
+            grouping: recentlyClosedPanes,
+            by: { $0.surface.projectID }
+        )
         let pins = persistedPinnedIDs
 
         func group(for id: String) -> ProjectGroup {
             let sessions = AppModel.pinnedOrder(sessionsByProject[id] ?? [], pinned: pins)
             let projectChats = chatsByProject[id] ?? []
             let projectMeshes = meshesByProject[id] ?? []
+            let recentDirectory: URL? = recentlyClosedByProject[id]?.lazy.compactMap { pane in
+                if let descriptor = pane.surface.agentChatDescriptor {
+                    return URL(fileURLWithPath: descriptor.workspacePath, isDirectory: true)
+                }
+                if let descriptor = pane.surface.meshDescriptor {
+                    return URL(fileURLWithPath: descriptor.basePath, isDirectory: true)
+                }
+                return nil
+            }.first
             let name = openedByID[id]?.name
                 ?? ownedByID[id].map { ($0.cwd as NSString).lastPathComponent }
                 ?? projectChats.first?.workspaceDirectory.lastPathComponent
                 ?? projectMeshes.first?.baseDirectory.lastPathComponent
+                ?? recentDirectory?.lastPathComponent
                 ?? id
             let directory = openedByID[id].map { URL(fileURLWithPath: $0.path) }
                 ?? ownedByID[id].map { URL(fileURLWithPath: $0.cwd) }
                 ?? projectChats.first?.workspaceDirectory
                 ?? projectMeshes.first?.baseDirectory
+                ?? recentDirectory
             let terminalWorking = sessions.filter { record in
                 if case .working = record.agentActivity, !record.exited { return true }
                 return false
@@ -491,12 +525,14 @@ final class AppModel: ObservableObject {
         }
 
         // Opened tabs keep their persisted (user-reordered) sequence; projects
-        // that only exist through live sessions/chats/Mesh follow, sorted by
-        // name. Closing a tab therefore never orphans an active surface.
+        // that only exist through live sessions/chats/Mesh or Recently Closed
+        // follow, sorted by name. Closing a tab therefore never strands a
+        // restorable or permanently deletable surface.
         let openedGroups = opened.map { group(for: $0.id) }
         let liveProjectIDs = Set(sessionsByProject.keys)
             .union(chatsByProject.keys)
             .union(meshesByProject.keys)
+            .union(recentlyClosedByProject.keys)
         let sessionOnly = liveProjectIDs.subtracting(opened.map(\.id))
             .map(group(for:))
             .sorted { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
@@ -649,6 +685,34 @@ final class AppModel: ObservableObject {
 
     func meshes(in projectID: String) -> [MeshSession] {
         meshes.filter { $0.projectID == projectID }
+    }
+
+    func recentlyClosedSurfaces(in projectID: String) -> [RecentlyClosedSurface] {
+        recentlyClosedPanes.compactMap { pane in
+            guard pane.isRecentlyClosed, pane.surface.projectID == projectID else { return nil }
+            if let descriptor = pane.surface.agentChatDescriptor {
+                return RecentlyClosedSurface(
+                    id: descriptor.id,
+                    projectID: descriptor.projectID,
+                    title: descriptor.title ?? "Agent Chat",
+                    kind: .chat,
+                    closedAt: pane.closedAt ?? 0
+                )
+            }
+            if let descriptor = pane.surface.meshDescriptor {
+                return RecentlyClosedSurface(
+                    id: descriptor.id,
+                    projectID: descriptor.projectID,
+                    title: descriptor.title,
+                    kind: .mesh,
+                    closedAt: pane.closedAt ?? 0
+                )
+            }
+            return nil
+        }.sorted { lhs, rhs in
+            if lhs.closedAt == rhs.closedAt { return lhs.id < rhs.id }
+            return lhs.closedAt > rhs.closedAt
+        }
     }
 
     // MARK: - Unified session cards
@@ -1845,6 +1909,12 @@ final class AppModel: ObservableObject {
         workspaceSaveTasks[id] = nil
         sessionStore.closeProject(id: id)
         refreshPersistedNavigationState(publish: false)
+        if recentlyClosedPanes.contains(where: { $0.surface.projectID == id }) {
+            // Closing the project tab must not cancel the only pending write
+            // for a just-closed Chat or Mesh. The project can leave the opened
+            // tab list while its Recently Closed recovery state stays durable.
+            scheduleWorkspaceStateSave(projectID: id)
+        }
         if selectedProjectID == id {
             let fallback = projects.first { $0.id != id }
             selectedProjectID = fallback?.id
@@ -1977,6 +2047,21 @@ final class AppModel: ObservableObject {
             ))
         }
 
+        // Recently Closed entries share this archive with live panes but never
+        // participate in its layout. Keeping them here lets the existing Mesh
+        // manifest merge protect recoverable work across multiple windows.
+        for pane in recentlyClosedPanes
+        where pane.surface.projectID == projectID && seen.insert(pane.id).inserted {
+            panes.append(NativeRestorablePaneState(
+                id: pane.id,
+                surface: pane.surface,
+                sizeWeight: pane.sizeWeight,
+                isMinimized: true,
+                isRecentlyClosed: true,
+                closedAt: pane.closedAt
+            ))
+        }
+
         let restorableFileTabs: [NativeRestorableFileTabState] = {
             guard let root = projects.first(where: { $0.id == projectID })?.directory else { return [] }
             return (fileTabsByProject[projectID] ?? []).compactMap { tab in
@@ -2007,6 +2092,53 @@ final class AppModel: ObservableObject {
         )
     }
 
+    private func recentlyClosedPane(id: String) -> NativeRestorablePaneState? {
+        recentlyClosedPanes.first { $0.id == id && $0.isRecentlyClosed }
+    }
+
+    private func storeRecentlyClosedPane(_ pane: NativeRestorablePaneState) {
+        guard pane.isRecentlyClosed else { return }
+        recentlyClosedPanes.removeAll { $0.id == pane.id }
+        recentlyClosedPanes.append(pane)
+    }
+
+    private func nextRecentlyClosedTimestamp() -> Int64 {
+        let wallClock = Int64(Date().timeIntervalSince1970 * 1_000)
+        let newest = recentlyClosedPanes.compactMap(\.closedAt).max() ?? -1
+        return max(wallClock, newest + 1)
+    }
+
+    @discardableResult
+    private func removeRecentlyClosedPane(id: String) -> NativeRestorablePaneState? {
+        guard let index = recentlyClosedPanes.firstIndex(where: { $0.id == id }) else { return nil }
+        return recentlyClosedPanes.remove(at: index)
+    }
+
+    private func updateRecentlyClosedMeshDescriptor(_ descriptor: NativeRestorableMeshDescriptor) {
+        guard let index = recentlyClosedPanes.firstIndex(where: {
+            $0.id == descriptor.id && $0.isRecentlyClosed
+        }) else { return }
+        let existing = recentlyClosedPanes[index]
+        recentlyClosedPanes[index] = NativeRestorablePaneState(
+            id: descriptor.id,
+            surface: NativeRestorableSurfaceState(mesh: descriptor),
+            sizeWeight: existing.sizeWeight,
+            isMinimized: true,
+            isRecentlyClosed: true,
+            closedAt: existing.closedAt
+        )
+    }
+
+    private func durableRecentlyClosedPaneExists(_ pane: NativeRestorablePaneState) async throws -> Bool {
+        await workspaceSaveTasks[pane.surface.projectID]?.value
+        let state = try await workspaceStateStore.projectState(for: pane.surface.projectID)
+        return state?.panes.contains(where: {
+            $0.id == pane.id
+                && $0.isRecentlyClosed
+                && $0.surface.kind == pane.surface.kind
+        }) == true
+    }
+
     private func persistWorkspaceStateNow() async {
         for task in workspaceSaveTasks.values { task.cancel() }
         workspaceSaveTasks.removeAll()
@@ -2014,6 +2146,7 @@ final class AppModel: ObservableObject {
         var projectIDs = Set(paneLayouts.keys)
         projectIDs.formUnion(chats.map(\.projectID))
         projectIDs.formUnion(meshes.map(\.projectID))
+        projectIDs.formUnion(recentlyClosedPanes.map { $0.surface.projectID })
         projectIDs.formUnion(fileTabsByProject.keys)
         projectIDs.formUnion(explicitlyOpenProjectIDs)
         var statesByProject = deferredFileWorkspaceStates
@@ -2079,20 +2212,29 @@ final class AppModel: ObservableObject {
         await transcriptStore.flush()
     }
 
-    private func wireMeshPersistence(_ mesh: MeshSession) {
+    private func wireMeshPersistence(_ mesh: MeshSession, recentlyClosed: Bool = false) {
         let projectID = mesh.projectID
-        mesh.onDescriptorChanged = { [weak self] in
+        mesh.onDescriptorChanged = { [weak self, weak mesh] in
+            if recentlyClosed, let mesh {
+                self?.updateRecentlyClosedMeshDescriptor(mesh.restorationDescriptor)
+            }
             self?.scheduleWorkspaceStateSave(projectID: projectID)
         }
         mesh.persistDescriptor = { [weak self, weak mesh] in
-            guard let self, let mesh,
-                  let snapshot = self.workspaceSnapshot(projectID: projectID) else {
+            guard let self, let mesh else {
+                throw CancellationError()
+            }
+            if recentlyClosed {
+                self.updateRecentlyClosedMeshDescriptor(mesh.restorationDescriptor)
+            }
+            guard let snapshot = self.workspaceSnapshot(projectID: projectID) else {
                 throw CancellationError()
             }
             try await self.workspaceStateStore.saveProjectState(snapshot, makeSelected: false)
             let persisted = try await self.workspaceStateStore.projectState(for: projectID)
             guard persisted?.panes.contains(where: {
                 $0.surface.meshDescriptor?.id == mesh.id
+                    && (!recentlyClosed || $0.isRecentlyClosed)
             }) == true else {
                 throw NativeWorkspaceStateStore.StoreError.criticalDescriptorNotPersisted
             }
@@ -2293,9 +2435,13 @@ final class AppModel: ObservableObject {
             await raiseWorkspaceRestorationNotice(for: error)
             return
         }
+        recentlyClosedPanes = restoration.projects.flatMap { project in
+            project.panes.filter(\.isRecentlyClosed)
+        }
         for projectState in restoration.projects {
             for pane in projectState.panes {
-                guard let descriptor = pane.surface.agentChatDescriptor,
+                guard !pane.isRecentlyClosed,
+                      let descriptor = pane.surface.agentChatDescriptor,
                       chats.contains(where: { $0.id == descriptor.id }) == false,
                       let agent = AgentRegistry.profile(id: descriptor.agentID) else { continue }
                 let directory = URL(fileURLWithPath: descriptor.workspacePath, isDirectory: true)
@@ -2320,7 +2466,8 @@ final class AppModel: ObservableObject {
             }
 
             for pane in projectState.panes {
-                guard let descriptor = pane.surface.meshDescriptor,
+                guard !pane.isRecentlyClosed,
+                      let descriptor = pane.surface.meshDescriptor,
                       meshes.contains(where: { $0.id == descriptor.id }) == false,
                       NativeSessionStore.projectID(forDirectory: descriptor.basePath) == descriptor.projectID else {
                     continue
@@ -2734,7 +2881,79 @@ final class AppModel: ObservableObject {
         return handle
     }
 
-    func closeChat(_ chatID: String) {
+    /// Ordinary close moves a chat into the durable Recently Closed archive.
+    /// Its adapter stops, but transcript, draft, usage, and continuation
+    /// identity remain available to Restore and Undo Last Close.
+    @discardableResult
+    func closeChat(_ chatID: String) -> Bool {
+        let closingChat = chats.first(where: { $0.id == chatID })
+        guard let closingChat else { return false }
+        let projectID = closingChat.projectID
+        let closedChatCount = recentlyClosedPanes.lazy.filter {
+            $0.surface.projectID == projectID
+                && $0.isRecentlyClosed
+                && $0.surface.kind == .agentChat
+        }.count
+        guard closedChatCount < NativeWorkspaceStateStore.maximumRecentlyClosedChatsPerProject else {
+            ToastCenter.shared.show(
+                "Recently Closed is full. Permanently delete an older chat before closing another.",
+                style: .error,
+                duration: 5
+            )
+            return false
+        }
+
+        let sizeWeight = workspaceSnapshot(projectID: projectID)?.panes
+            .first(where: { $0.id == chatID })?.sizeWeight ?? 1
+        let descriptor = NativeRestorableAgentChatDescriptor(
+            id: closingChat.id,
+            projectID: projectID,
+            agentID: closingChat.agentID,
+            workspacePath: closingChat.workspaceDirectory.path,
+            acpSessionID: closingChat.conversation.providerSessionID,
+            accountBinding: closingChat.accountBinding,
+            title: closingChat.conversation.title
+        )
+        storeRecentlyClosedPane(NativeRestorablePaneState(
+            id: chatID,
+            surface: NativeRestorableSurfaceState(agentChat: descriptor),
+            sizeWeight: sizeWeight,
+            isMinimized: true,
+            isRecentlyClosed: true,
+            closedAt: nextRecentlyClosedTimestamp()
+        ))
+
+        chatShutdownTasks.start(chatID) { [weak self] in
+            if let finalDraft = await closingChat.conversation.stop() {
+                self?.enqueueDraftSave(
+                    finalDraft,
+                    chatID: chatID,
+                    projectID: projectID,
+                    agentID: closingChat.agentID,
+                    workspacePath: closingChat.workspaceDirectory.path
+                )
+            }
+        }
+        chats.removeAll { $0.id == chatID }
+        usageObservers.removeValue(forKey: chatID)?.forEach { $0.cancel() }
+        usageCenter.unregister(
+            chatID: chatID,
+            sourceID: usageSourceID,
+            forgetWhenLast: false
+        )
+        surfaceObservers.removeValue(forKey: chatID)?.cancel()
+        attentionCenter.clear(targetID: chatID)
+        if selectedChatID == chatID { selectedChatID = nil }
+        var layout = paneLayouts[projectID] ?? SessionPaneLayout()
+        layout.remove(chatID)
+        paneLayouts[projectID] = layout
+        scheduleWorkspaceStateSave(projectID: projectID)
+        ToastCenter.shared.show("Moved chat to Recently Closed", style: .success)
+        return true
+    }
+
+    /// The explicit permanent-delete boundary for a live chat.
+    func deleteChat(_ chatID: String) {
         let closingChat = chats.first(where: { $0.id == chatID })
         if let closingChat {
             // Quiesce persistence synchronously on MainActor before stop()
@@ -2792,8 +3011,15 @@ final class AppModel: ObservableObject {
 
     // MARK: - Kaisola Mesh
 
-    enum MeshCloseResult: Equatable {
+    enum MeshDeleteResult: Equatable {
         case closed
+        case needsConfirmation(columns: Int)
+        case blocked(String)
+        case unavailable
+    }
+
+    enum RecentlyClosedActionResult: Equatable {
+        case completed
         case needsConfirmation(columns: Int)
         case blocked(String)
         case unavailable
@@ -2838,10 +3064,46 @@ final class AppModel: ObservableObject {
         Task { await mesh.start(agents: agents, environment: environment) }
     }
 
-    /// Central destructive-close policy. UI callers first request without
+    /// Close a Mesh without deleting any durable state. Running adapters stop,
+    /// while transcripts, drafts, staged prompts, and worktrees move together
+    /// into Recently Closed.
+    func closeMesh(
+        _ meshID: String,
+        allowStoppingRunning: Bool = false
+    ) async -> RecentlyClosedActionResult {
+        guard let mesh = meshes.first(where: { $0.id == meshID }) else { return .unavailable }
+        guard allowStoppingRunning || !mesh.anyRunning else {
+            return .needsConfirmation(columns: 0)
+        }
+        let projectID = mesh.projectID
+        let sizeWeight = workspaceSnapshot(projectID: projectID)?.panes
+            .first(where: { $0.id == meshID })?.sizeWeight ?? 1
+
+        await mesh.suspend()
+        storeRecentlyClosedPane(NativeRestorablePaneState(
+            id: mesh.id,
+            surface: NativeRestorableSurfaceState(mesh: mesh.restorationDescriptor),
+            sizeWeight: sizeWeight,
+            isMinimized: true,
+            isRecentlyClosed: true,
+            closedAt: nextRecentlyClosedTimestamp()
+        ))
+        meshes.removeAll { $0.id == meshID }
+        Self.claimedRestoredMeshIDs.remove(meshID)
+        surfaceObservers.removeValue(forKey: meshID)?.cancel()
+        if selectedMeshID == meshID { selectedMeshID = nil }
+        var layout = paneLayouts[projectID] ?? SessionPaneLayout()
+        layout.remove(meshID)
+        paneLayouts[projectID] = layout
+        await persistWorkspaceStateImmediately(projectID: projectID)
+        ToastCenter.shared.show("Moved Mesh to Recently Closed", style: .success)
+        return .completed
+    }
+
+    /// Central permanent-delete policy. UI callers first request without
     /// authorization; only the destructive confirmation retries with
     /// `allowRecoverableWork`. Window/app/update teardown never enters here.
-    func requestCloseMesh(_ meshID: String, allowRecoverableWork: Bool) async -> MeshCloseResult {
+    func requestDeleteMesh(_ meshID: String, allowRecoverableWork: Bool) async -> MeshDeleteResult {
         guard let mesh = meshes.first(where: { $0.id == meshID }) else { return .unavailable }
         let columnIDs = mesh.durableColumnIDs
         let result = await mesh.destroy(allowRecoverableWork: allowRecoverableWork)
@@ -2886,9 +3148,222 @@ final class AppModel: ObservableObject {
         }
     }
 
+    /// Restore a specific archived surface. Closed adapters never overlap a
+    /// replacement: Chat waits for its stop task, while Mesh reconstructs its
+    /// exact manifest without creating new worktrees or dispatching prompts.
+    func restoreRecentlyClosedSurface(_ surfaceID: String) async -> RecentlyClosedActionResult {
+        guard let pane = recentlyClosedPane(id: surfaceID) else { return .unavailable }
+        guard Self.claimedRecentlyClosedSurfaceIDs.insert(surfaceID).inserted else {
+            return .blocked("Another window is already restoring or deleting this entry.")
+        }
+        defer { Self.claimedRecentlyClosedSurfaceIDs.remove(surfaceID) }
+        do {
+            guard try await durableRecentlyClosedPaneExists(pane) else {
+                _ = removeRecentlyClosedPane(id: surfaceID)
+                return .unavailable
+            }
+        } catch {
+            return .blocked("Recently Closed could not be verified: \(error.localizedDescription)")
+        }
+
+        if let descriptor = pane.surface.agentChatDescriptor {
+            await chatShutdownTasks.wait(for: surfaceID)
+            await draftPersistenceTask?.value
+            await flushTranscriptPersistence()
+            guard recentlyClosedPane(id: surfaceID) != nil,
+                  let agent = AgentRegistry.profile(id: descriptor.agentID) else {
+                return .unavailable
+            }
+            let directory = URL(fileURLWithPath: descriptor.workspacePath, isDirectory: true)
+                .standardizedFileURL
+            var isDirectory: ObjCBool = false
+            guard FileManager.default.fileExists(atPath: directory.path, isDirectory: &isDirectory),
+                  isDirectory.boolValue else {
+                return .blocked("The chat's project folder is unavailable. Nothing was removed.")
+            }
+            let transcript = await transcriptStore.entry(for: descriptor.id)
+            let draft = try? await workspaceStateStore.draft(for: "chat|\(descriptor.id)")
+            guard appendChat(
+                id: descriptor.id,
+                agent: agent,
+                directory: directory,
+                title: descriptor.title ?? "\(agent.name) · \(directory.lastPathComponent)",
+                resumeSessionID: descriptor.acpSessionID,
+                accountBinding: descriptor.accountBinding,
+                initialRows: transcript?.rows ?? [],
+                initialDraft: draft,
+                initialUsage: transcript?.usage
+            ) != nil else {
+                return .blocked("The chat adapter is unavailable. The Recently Closed entry was preserved.")
+            }
+            _ = removeRecentlyClosedPane(id: surfaceID)
+            selectChat(surfaceID)
+            await persistWorkspaceStateImmediately(projectID: descriptor.projectID)
+            ToastCenter.shared.show("Restored chat", style: .success)
+            return .completed
+        }
+
+        guard let descriptor = pane.surface.meshDescriptor else { return .unavailable }
+        guard descriptor.lifecycle != .pendingDeletion else {
+            return .blocked("This Mesh is completing a permanent deletion and cannot be restored.")
+        }
+        guard !Self.claimedRestoredMeshIDs.contains(surfaceID) else {
+            return .blocked("This Mesh is already open in another window.")
+        }
+        Self.claimedRestoredMeshIDs.insert(surfaceID)
+        var keepsClaim = false
+        defer {
+            if !keepsClaim { Self.claimedRestoredMeshIDs.remove(surfaceID) }
+        }
+        guard let mesh = await materializeRecentlyClosedMesh(descriptor) else {
+            return .blocked("The Mesh project folder or adapter configuration is unavailable. Nothing was removed.")
+        }
+        _ = removeRecentlyClosedPane(id: surfaceID)
+        wireMeshPersistence(mesh)
+        surfaceObservers[mesh.id] = mesh.objectWillChange.sink { [weak self] _ in
+            self?.objectWillChange.send()
+        }
+        meshes.append(mesh)
+        keepsClaim = true
+        selectMesh(mesh.id)
+        await persistWorkspaceStateImmediately(projectID: descriptor.projectID)
+        ToastCenter.shared.show("Restored Mesh", style: .success)
+        return .completed
+    }
+
+    func restoreMostRecentlyClosed(in projectID: String) async -> RecentlyClosedActionResult {
+        guard let newest = recentlyClosedSurfaces(in: projectID).first else { return .unavailable }
+        return await restoreRecentlyClosedSurface(newest.id)
+    }
+
+    /// Permanent deletion of an archived surface. Chat data is tombstoned only
+    /// after the archive entry is removed. Mesh uses its transactional destroy
+    /// path so partial Git cleanup remains represented by a retryable manifest.
+    func deleteRecentlyClosedSurface(
+        _ surfaceID: String,
+        allowRecoverableWork: Bool
+    ) async -> RecentlyClosedActionResult {
+        guard let pane = recentlyClosedPane(id: surfaceID) else { return .unavailable }
+        guard Self.claimedRecentlyClosedSurfaceIDs.insert(surfaceID).inserted else {
+            return .blocked("Another window is already restoring or deleting this entry.")
+        }
+        defer { Self.claimedRecentlyClosedSurfaceIDs.remove(surfaceID) }
+        do {
+            guard try await durableRecentlyClosedPaneExists(pane) else {
+                _ = removeRecentlyClosedPane(id: surfaceID)
+                return .unavailable
+            }
+        } catch {
+            return .blocked("Recently Closed could not be verified: \(error.localizedDescription)")
+        }
+        if let descriptor = pane.surface.agentChatDescriptor {
+            await chatShutdownTasks.wait(for: surfaceID)
+            do {
+                let removed = try await workspaceStateStore.removeRecentlyClosedSurfaceState(
+                    projectID: descriptor.projectID,
+                    surfaceID: surfaceID
+                )
+                guard removed else {
+                    _ = removeRecentlyClosedPane(id: surfaceID)
+                    return .unavailable
+                }
+            } catch {
+                return .blocked("The permanent-delete tombstone could not be saved: \(error.localizedDescription)")
+            }
+            _ = removeRecentlyClosedPane(id: surfaceID)
+            explicitlyClosedChatIDs.insert(surfaceID)
+            usageCenter.remove(chatID: surfaceID)
+            enqueueTranscriptRemoval(chatID: surfaceID)
+            enqueueDraftRemoval(chatID: surfaceID)
+            await persistWorkspaceStateImmediately(projectID: descriptor.projectID)
+            ToastCenter.shared.show("Permanently deleted chat", style: .success)
+            return .completed
+        }
+
+        guard let descriptor = pane.surface.meshDescriptor else { return .unavailable }
+        guard !Self.claimedRestoredMeshIDs.contains(surfaceID) else {
+            return .blocked("This Mesh is open in another window and cannot be deleted here.")
+        }
+        Self.claimedRestoredMeshIDs.insert(surfaceID)
+        defer { Self.claimedRestoredMeshIDs.remove(surfaceID) }
+        guard let mesh = await materializeRecentlyClosedMesh(descriptor) else {
+            return .blocked("The Mesh project folder is unavailable. Its worktrees were preserved.")
+        }
+        let columnIDs = mesh.durableColumnIDs
+        switch await mesh.destroy(allowRecoverableWork: allowRecoverableWork) {
+        case .safe:
+            // The user crossed the permanent-delete boundary. Remove column
+            // data even if writing the final archive tombstone needs a retry.
+            for columnID in columnIDs { enqueueTranscriptRemoval(chatID: columnID) }
+            enqueueDraftRemoval(stableKey: "mesh|\(surfaceID)")
+            do {
+                try await workspaceStateStore.removeMeshState(
+                    projectID: descriptor.projectID,
+                    meshID: surfaceID
+                )
+            } catch {
+                return .blocked("Mesh work was cleaned up, but the delete tombstone could not be saved: \(error.localizedDescription)")
+            }
+            _ = removeRecentlyClosedPane(id: surfaceID)
+            await persistWorkspaceStateImmediately(projectID: descriptor.projectID)
+            ToastCenter.shared.show("Permanently deleted Mesh", style: .success)
+            return .completed
+        case let .recoverableWork(columns):
+            return .needsConfirmation(columns: columns)
+        case let .blocked(message):
+            return .blocked(message)
+        }
+    }
+
+    private func materializeRecentlyClosedMesh(
+        _ descriptor: NativeRestorableMeshDescriptor
+    ) async -> MeshSession? {
+        guard NativeSessionStore.projectID(forDirectory: descriptor.basePath) == descriptor.projectID else {
+            return nil
+        }
+        let directory = URL(fileURLWithPath: descriptor.basePath, isDirectory: true)
+            .standardizedFileURL
+        var isDirectory: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: directory.path, isDirectory: &isDirectory),
+              isDirectory.boolValue else { return nil }
+        await draftPersistenceTask?.value
+        await flushTranscriptPersistence()
+        let draft = (try? await workspaceStateStore.draft(for: "mesh|\(descriptor.id)")) ?? ""
+        let mesh = MeshSession(
+            id: descriptor.id,
+            baseDirectory: directory,
+            mode: descriptor.mode,
+            purpose: descriptor.purpose,
+            title: descriptor.title,
+            lifecycle: descriptor.lifecycle,
+            initialDraft: draft,
+            initialStagedPrompts: descriptor.stagedPrompts,
+            usageCenter: usageCenter
+        )
+        wireMeshPersistence(mesh, recentlyClosed: true)
+        var states: [MeshSession.RestoredColumnState] = []
+        for column in descriptor.columns {
+            let transcript = await transcriptStore.entry(for: column.id)
+            states.append(MeshSession.RestoredColumnState(
+                descriptor: column,
+                rows: transcript?.rows ?? [],
+                initialDraft: nil,
+                usage: transcript?.usage
+            ))
+        }
+        let environment = ProcessInfo.processInfo.environment.merging(
+            ProjectAccountStore.mergedOverlay(
+                app: NativePreviewSettings.shared.agentEnvironmentOverlay,
+                project: ProjectAccountStore().override(forProject: descriptor.projectID)
+            )
+        ) { _, custom in custom }
+        await mesh.restore(states: states, agents: AgentRegistry.all, environment: environment)
+        return mesh
+    }
+
     /// Full window teardown: stop every app-scoped process, persist its state,
     /// and drop broker connections. Mesh Git worktrees deliberately remain
-    /// registered; only an explicit, safety-checked Close Mesh may destroy them.
+    /// registered; only an explicit, safety-checked permanent Delete may destroy them.
     func teardown() async {
         // Save the user's restorable truth before asking any adapter or mesh to
         // stop. A provider shutdown can stall, but a bounded application quit

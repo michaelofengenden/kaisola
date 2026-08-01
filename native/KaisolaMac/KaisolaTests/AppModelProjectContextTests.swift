@@ -619,7 +619,57 @@ final class AppModelProjectContextTests: XCTestCase {
         XCTAssertEqual(model.selectedProjectID, project.id)
         XCTAssertEqual(model.selectedProjectName, project.name)
 
-        if let chatID = model.chats.first?.id { model.closeChat(chatID) }
+        if let chatID = model.chats.first?.id { model.deleteChat(chatID) }
+    }
+
+    @MainActor
+    func testChatCloseRestoreAndPermanentDeleteKeepClearDurabilityBoundaries() async throws {
+        let (model, _) = makeModel()
+        let agent = try XCTUnwrap(AgentRegistry.all.first { AcpAdapter.forAgent($0.id) != nil })
+        let directory = storeFile.deletingLastPathComponent()
+            .appendingPathComponent("recent-chat-project", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        model.openChat(agent, inDirectory: directory)
+        let chat = try XCTUnwrap(model.chats.first)
+        let rows: [AcpTranscriptRow] = [
+            .user(id: "user-1", text: "keep this question", failed: false),
+            .message(id: "agent-1", text: "keep this answer"),
+        ]
+        chat.conversation.seedRowsForTesting(rows)
+        chat.conversation.onTranscriptChanged?(rows)
+        chat.conversation.saveDraft("keep this draft")
+
+        XCTAssertTrue(model.closeChat(chat.id))
+        XCTAssertTrue(model.chats.isEmpty)
+        XCTAssertEqual(model.recentlyClosedSurfaces(in: chat.projectID).map(\.id), [chat.id])
+        model.closeProject(id: chat.projectID)
+        XCTAssertTrue(
+            model.projects.contains(where: { $0.id == chat.projectID }),
+            "a project with Recently Closed work must keep its recovery controls reachable"
+        )
+
+        let restoreResult = await model.restoreRecentlyClosedSurface(chat.id)
+        XCTAssertEqual(restoreResult, .completed)
+        let restored = try XCTUnwrap(model.chats.first { $0.id == chat.id })
+        XCTAssertEqual(restored.conversation.rows, rows)
+        XCTAssertEqual(restored.conversation.loadDraft(), "keep this draft")
+        XCTAssertTrue(model.recentlyClosedSurfaces(in: chat.projectID).isEmpty)
+
+        XCTAssertTrue(model.closeChat(chat.id))
+        let deleteResult = await model.deleteRecentlyClosedSurface(
+            chat.id,
+            allowRecoverableWork: true
+        )
+        XCTAssertEqual(deleteResult, .completed)
+        XCTAssertTrue(model.recentlyClosedSurfaces(in: chat.projectID).isEmpty)
+        let missingResult = await model.restoreRecentlyClosedSurface(chat.id)
+        XCTAssertEqual(missingResult, .unavailable)
+        let workspaceStore = NativeWorkspaceStateStore(
+            fileURL: storeFile.deletingLastPathComponent()
+                .appendingPathComponent("workspace-state-v1.json")
+        )
+        let persisted = try await workspaceStore.projectState(for: chat.projectID)
+        XCTAssertFalse(persisted?.panes.contains(where: { $0.id == chat.id }) == true)
     }
 
     @MainActor
@@ -641,7 +691,7 @@ final class AppModelProjectContextTests: XCTestCase {
         XCTAssertEqual(model.selectedChatID, secondChat.id)
         XCTAssertNotEqual(model.selectedChatID, firstChat.id)
 
-        for chat in model.chats { model.closeChat(chat.id) }
+        for chat in model.chats { model.deleteChat(chat.id) }
     }
 
     @MainActor
@@ -765,6 +815,84 @@ final class AppModelProjectContextTests: XCTestCase {
         XCTAssertEqual(mesh.stage, "Idle")
 
         await model.teardown()
+    }
+
+    @MainActor
+    func testMeshCloseRestoreAndPermanentDeletePreserveThenTombstoneQueue() async throws {
+        let root = storeFile.deletingLastPathComponent()
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        let projectDirectory = root.appendingPathComponent("recent-mesh-project", isDirectory: true)
+        try FileManager.default.createDirectory(
+            at: projectDirectory,
+            withIntermediateDirectories: true
+        )
+        let workspaceStore = NativeWorkspaceStateStore(
+            fileURL: root.appendingPathComponent("workspace-state-v1.json"),
+            meshWorktreeRoot: root.appendingPathComponent("mesh-worktrees", isDirectory: true)
+        )
+        let pane = Self.meshPane(
+            id: "mesh-recent-lifecycle",
+            basePath: projectDirectory.path,
+            mode: .staged,
+            purpose: .build,
+            stagedPrompts: ["first queued", "second queued"]
+        )
+        let projectID = pane.surface.projectID
+        try await workspaceStore.saveProjectState(NativeProjectWorkspaceState(
+            projectID: projectID,
+            layout: SessionPaneLayout(sessionID: pane.id),
+            panes: [pane],
+            focusedPaneID: pane.id
+        ))
+        let model = makeRestoringModel(
+            workspaceStore: workspaceStore,
+            root: root,
+            identity: "recent-mesh",
+            projectDirectory: projectDirectory
+        )
+        await model.reload()
+
+        let firstClose = await model.closeMesh(pane.id)
+        XCTAssertEqual(firstClose, .completed)
+        XCTAssertTrue(model.meshes.isEmpty)
+        XCTAssertEqual(model.recentlyClosedSurfaces(in: projectID).map(\.id), [pane.id])
+        let closedState = try await workspaceStore.projectState(for: projectID)
+        let closedPane = try XCTUnwrap(closedState?.panes.first { $0.id == pane.id })
+        XCTAssertTrue(closedPane.isRecentlyClosed)
+        XCTAssertEqual(
+            closedPane.surface.meshDescriptor?.stagedPrompts,
+            ["first queued", "second queued"]
+        )
+
+        await model.teardown()
+        let reopened = makeRestoringModel(
+            workspaceStore: workspaceStore,
+            root: root,
+            identity: "recent-mesh-reopened",
+            projectDirectory: projectDirectory
+        )
+        await reopened.reload()
+        XCTAssertTrue(reopened.meshes.isEmpty)
+        XCTAssertEqual(reopened.recentlyClosedSurfaces(in: projectID).map(\.id), [pane.id])
+
+        let restore = await reopened.restoreRecentlyClosedSurface(pane.id)
+        XCTAssertEqual(restore, .completed)
+        let restored = try XCTUnwrap(reopened.meshes.first { $0.id == pane.id })
+        XCTAssertEqual(restored.stagedPrompts, ["first queued", "second queued"])
+        XCTAssertFalse(restored.stagedQueueIsRunning)
+
+        let secondClose = await reopened.closeMesh(pane.id)
+        XCTAssertEqual(secondClose, .completed)
+        let delete = await reopened.deleteRecentlyClosedSurface(
+            pane.id,
+            allowRecoverableWork: true
+        )
+        XCTAssertEqual(delete, .completed)
+        XCTAssertTrue(reopened.recentlyClosedSurfaces(in: projectID).isEmpty)
+        let deletedState = try await workspaceStore.projectState(for: projectID)
+        XCTAssertFalse(deletedState?.panes.contains(where: { $0.id == pane.id }) == true)
+
+        await reopened.teardown()
     }
 
     @MainActor

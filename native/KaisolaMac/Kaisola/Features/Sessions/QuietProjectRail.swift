@@ -46,6 +46,7 @@ struct QuietProjectRail: View {
     private let sessionMenu: (BrokerTerminalRecord) -> AnyView
     private let chatMenu: (AcpChatHandle) -> AnyView
     private let meshMenu: (MeshSession) -> AnyView
+    private let deleteRecentlyClosed: (AppModel.RecentlyClosedSurface) -> Void
 
     /// Time-in-state, not time-since-creation: rows report how long the surface
     /// has been in the state it is showing.
@@ -67,7 +68,8 @@ struct QuietProjectRail: View {
         contextMenu: @escaping (AppModel.ProjectGroup) -> AnyView,
         sessionContextMenu: @escaping (BrokerTerminalRecord) -> AnyView,
         chatContextMenu: @escaping (AcpChatHandle) -> AnyView,
-        meshContextMenu: @escaping (MeshSession) -> AnyView
+        meshContextMenu: @escaping (MeshSession) -> AnyView,
+        deleteRecentlyClosed: @escaping (AppModel.RecentlyClosedSurface) -> Void
     ) {
         self.model = model
         self.attention = attention
@@ -79,6 +81,7 @@ struct QuietProjectRail: View {
         self.sessionMenu = sessionContextMenu
         self.chatMenu = chatContextMenu
         self.meshMenu = meshContextMenu
+        self.deleteRecentlyClosed = deleteRecentlyClosed
     }
 
     var body: some View {
@@ -123,7 +126,8 @@ struct QuietProjectRail: View {
             projectMenu: projectMenu,
             sessionMenu: sessionMenu,
             chatMenu: chatMenu,
-            meshMenu: meshMenu
+            meshMenu: meshMenu,
+            deleteRecentlyClosed: deleteRecentlyClosed
         )
     }
 }
@@ -353,6 +357,7 @@ private struct QuietProjectGroup: View {
     let sessionMenu: (BrokerTerminalRecord) -> AnyView
     let chatMenu: (AcpChatHandle) -> AnyView
     let meshMenu: (MeshSession) -> AnyView
+    let deleteRecentlyClosed: (AppModel.RecentlyClosedSurface) -> Void
 
     @State private var hovering = false
     /// Bumped on every hover transition anywhere in the group so a pending
@@ -387,6 +392,7 @@ private struct QuietProjectGroup: View {
     var body: some View {
         let chats = model.chats(in: project.id)
         let meshes = model.meshes(in: project.id)
+        let recentlyClosed = model.recentlyClosedSurfaces(in: project.id)
         // `AppModel.projects` already returns each group's sessions in pinned
         // order, so the manual drag order is the only sort applied here.
         let sessions = SessionOrderStore.apply(manualOrder, to: project.sessions)
@@ -410,7 +416,10 @@ private struct QuietProjectGroup: View {
                     manualOrder = ids
                     orderStore.setOrder(projectID: project.id, ids: ids)
                 }
-                if sessions.isEmpty, chats.isEmpty, meshes.isEmpty {
+                if !recentlyClosed.isEmpty {
+                    recentlyClosedRow(recentlyClosed)
+                }
+                if sessions.isEmpty, chats.isEmpty, meshes.isEmpty, recentlyClosed.isEmpty {
                     emptyRow
                 }
             }
@@ -621,6 +630,62 @@ private struct QuietProjectGroup: View {
             .listRowInsets(QuietRailMetrics.listRowBleed)
             .listRowSeparator(.hidden)
             .listRowBackground(Color.clear)
+    }
+
+    private func recentlyClosedRow(_ surfaces: [AppModel.RecentlyClosedSurface]) -> some View {
+        Menu {
+            if let newest = surfaces.first {
+                Button("Undo Last Close") { restoreRecentlyClosed(newest.id) }
+                Divider()
+            }
+            ForEach(surfaces) { surface in
+                Menu(surface.title) {
+                    Button("Restore") { restoreRecentlyClosed(surface.id) }
+                    Button("Delete Permanently…", role: .destructive) {
+                        deleteRecentlyClosed(surface)
+                    }
+                }
+            }
+        } label: {
+            HStack(spacing: QuietRailMetrics.markGap) {
+                Image(systemName: "clock.arrow.circlepath")
+                    .font(.system(size: QuietRailMetrics.projectMarkText))
+                    .foregroundStyle(.secondary)
+                    .frame(width: QuietRailMetrics.mark)
+                Text("Recently Closed")
+                    .lineLimit(1)
+                Spacer(minLength: QuietRailMetrics.laneGap)
+                Text("\(surfaces.count)")
+                    .font(.system(size: QuietRailMetrics.secondaryText).monospacedDigit())
+                    .foregroundStyle(.secondary)
+            }
+            .font(.system(size: QuietRailMetrics.secondaryText, weight: .medium))
+            .padding(.leading, QuietRailMetrics.sessionIndent)
+            .padding(.trailing, QuietRailMetrics.trailingInset)
+            .frame(height: QuietRailMetrics.rowHeight)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .contentShape(Rectangle())
+        }
+        .menuStyle(.borderlessButton)
+        .help("Restore or permanently delete closed chats and Mesh runs")
+        .accessibilityLabel("Recently Closed, \(surfaces.count) items")
+        .onHover { inside in setHover(inside) }
+        .listRowInsets(QuietRailMetrics.listRowBleed)
+        .listRowSeparator(.hidden)
+        .listRowBackground(Color.clear)
+    }
+
+    private func restoreRecentlyClosed(_ id: String) {
+        Task {
+            switch await model.restoreRecentlyClosedSurface(id) {
+            case .completed, .unavailable:
+                break
+            case .needsConfirmation:
+                break
+            case let .blocked(message):
+                ToastCenter.shared.show(message, style: .error, duration: 5)
+            }
+        }
     }
 
     // The hover-revealed "New session" ghost row is gone (v1.1.7). A row that

@@ -30,14 +30,14 @@ struct RootShellView: View {
     @State private var quickActionsTarget: QuickActionsTarget?
     @State private var terminalTranscriptTarget: AppModel.TerminalTranscriptContext?
     @State private var terminalTranscriptOpenedFromLiveBoundary = false
-    /// A Close Mesh request whose active turns or worktrees require a deliberate
+    /// A permanent Mesh deletion whose active turns or worktrees require a deliberate
     /// destructive choice.
-    private struct MeshCloseConfirmation {
+    private struct MeshDeleteConfirmation {
         let id: String
         let dirty: Int
         let running: Bool
     }
-    @State private var meshCloseConfirm: MeshCloseConfirmation?
+    @State private var meshDeleteConfirm: MeshDeleteConfirmation?
     /// Shared by the two halves of the sidebar divider's grab corridor, which
     /// have to be separate views on separate sides of an `NSSplitView` clip but
     /// are one affordance to the user.
@@ -83,37 +83,56 @@ struct RootShellView: View {
         )
     }
 
-    /// Close immediately only when every column has neither working-tree
-    /// changes nor unique commits; all uncertainty blocks deletion.
-    private func requestCloseMesh(_ mesh: MeshSession) {
+    /// Assess before presenting the permanent-delete confirmation. Clean work
+    /// still requires that explicit decision; uncertainty blocks deletion.
+    private func requestDeleteMesh(_ mesh: MeshSession) {
         Task {
-            if mesh.anyRunning {
-                switch await mesh.discardAssessment() {
-                case .safe:
-                    meshCloseConfirm = .init(id: mesh.id, dirty: 0, running: true)
-                case let .recoverableWork(columns):
-                    meshCloseConfirm = .init(id: mesh.id, dirty: columns, running: true)
-                case let .blocked(message):
-                    ToastCenter.shared.show(message, style: .error, duration: 5)
-                }
-                return
-            }
-            switch await model.requestCloseMesh(mesh.id, allowRecoverableWork: false) {
-            case .closed, .unavailable:
-                break
-            case let .needsConfirmation(columns):
-                meshCloseConfirm = .init(id: mesh.id, dirty: columns, running: false)
+            switch await mesh.discardAssessment() {
+            case .safe:
+                meshDeleteConfirm = .init(id: mesh.id, dirty: 0, running: mesh.anyRunning)
+            case let .recoverableWork(columns):
+                meshDeleteConfirm = .init(id: mesh.id, dirty: columns, running: mesh.anyRunning)
             case let .blocked(message):
                 ToastCenter.shared.show(message, style: .error, duration: 5)
             }
         }
     }
 
-    private var meshCloseDestructiveTitle: String {
-        guard let confirmation = meshCloseConfirm else { return "Close Mesh" }
-        if confirmation.running, confirmation.dirty > 0 { return "Stop, Discard, and Close" }
-        if confirmation.running { return "Stop and Close" }
-        return "Discard and Close"
+    private var meshDeleteDestructiveTitle: String {
+        guard let confirmation = meshDeleteConfirm else { return "Delete Mesh" }
+        if confirmation.running, confirmation.dirty > 0 { return "Stop, Discard, and Delete" }
+        if confirmation.running { return "Stop and Delete" }
+        return "Discard and Delete"
+    }
+
+    /// Non-destructive Mesh close still stops active adapters, so make that
+    /// consequence explicit while promising the durable state that remains.
+    private func requestMoveMeshToRecentlyClosed(_ mesh: MeshSession) {
+        let close: () -> Void = {
+            _ = Task {
+                if case let .blocked(message) = await model.closeMesh(
+                    mesh.id,
+                    allowStoppingRunning: true
+                ) {
+                    ToastCenter.shared.show(message, style: .error, duration: 5)
+                }
+            }
+        }
+        let alert = NSAlert()
+        alert.alertStyle = .informational
+        alert.messageText = "Close “\(mesh.title)” to Recently Closed?"
+        alert.informativeText = mesh.anyRunning
+            ? "This stops every active agent. Transcripts, drafts, queued prompts, and recoverable worktrees stay available to restore."
+            : "Transcripts, drafts, queued prompts, and recoverable worktrees stay available to restore."
+        alert.addButton(withTitle: mesh.anyRunning ? "Close and Stop" : "Close Mesh")
+        alert.addButton(withTitle: "Cancel")
+        if let window = NSApp.keyWindow {
+            alert.beginSheetModal(for: window) { response in
+                if response == .alertFirstButtonReturn { close() }
+            }
+        } else if alert.runModal() == .alertFirstButtonReturn {
+            close()
+        }
     }
 
     /// Chat deletion really removes its persisted transcript and draft. Keep a
@@ -128,10 +147,46 @@ struct RootShellView: View {
         alert.addButton(withTitle: "Cancel")
         if let window = NSApp.keyWindow {
             alert.beginSheetModal(for: window) { response in
-                if response == .alertFirstButtonReturn { model.closeChat(chat.id) }
+                if response == .alertFirstButtonReturn { model.deleteChat(chat.id) }
             }
         } else if alert.runModal() == .alertFirstButtonReturn {
-            model.closeChat(chat.id)
+            model.deleteChat(chat.id)
+        }
+    }
+
+    private func requestDeleteRecentlyClosed(_ surface: AppModel.RecentlyClosedSurface) {
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = "Permanently delete “\(surface.title)”?"
+        switch surface.kind {
+        case .chat:
+            alert.informativeText = "This permanently removes the saved transcript, draft, and usage. This cannot be undone."
+        case .mesh:
+            alert.informativeText = "This permanently removes transcripts, draft, queued prompts, and every recoverable Mesh worktree, including unintegrated files or commits. This cannot be undone."
+        }
+        alert.addButton(withTitle: "Delete Permanently")
+        alert.addButton(withTitle: "Cancel")
+        let performDelete: () -> Void = {
+            _ = Task {
+                switch await model.deleteRecentlyClosedSurface(
+                    surface.id,
+                    allowRecoverableWork: true
+                ) {
+                case .completed, .unavailable:
+                    break
+                case .needsConfirmation:
+                    ToastCenter.shared.show("Deletion still needs confirmation.", style: .error)
+                case let .blocked(message):
+                    ToastCenter.shared.show(message, style: .error, duration: 5)
+                }
+            }
+        }
+        if let window = NSApp.keyWindow {
+            alert.beginSheetModal(for: window) { response in
+                if response == .alertFirstButtonReturn { performDelete() }
+            }
+        } else if alert.runModal() == .alertFirstButtonReturn {
+            performDelete()
         }
     }
 
@@ -311,13 +366,13 @@ struct RootShellView: View {
         }
         .overlay { ToastOverlayView() }
         .confirmationDialog(
-            "Close Mesh?",
-            isPresented: Binding(get: { meshCloseConfirm != nil }, set: { if !$0 { meshCloseConfirm = nil } })
+            "Permanently Delete Mesh?",
+            isPresented: Binding(get: { meshDeleteConfirm != nil }, set: { if !$0 { meshDeleteConfirm = nil } })
         ) {
-            Button(meshCloseDestructiveTitle, role: .destructive) {
-                if let confirm = meshCloseConfirm {
+            Button(meshDeleteDestructiveTitle, role: .destructive) {
+                if let confirm = meshDeleteConfirm {
                     Task {
-                        if case let .blocked(message) = await model.requestCloseMesh(
+                        if case let .blocked(message) = await model.requestDeleteMesh(
                             confirm.id,
                             allowRecoverableWork: true
                         ) {
@@ -325,16 +380,18 @@ struct RootShellView: View {
                         }
                     }
                 }
-                meshCloseConfirm = nil
+                meshDeleteConfirm = nil
             }
-            Button("Cancel", role: .cancel) { meshCloseConfirm = nil }
+            Button("Cancel", role: .cancel) { meshDeleteConfirm = nil }
         } message: {
-            if let confirmation = meshCloseConfirm, confirmation.running, confirmation.dirty > 0 {
-                Text("Agents are still working and \(confirmation.dirty) column(s) contain unintegrated files or commits. Closing stops the run and permanently discards that recoverable work.")
-            } else if meshCloseConfirm?.running == true {
-                Text("One or more agents are still working. Closing stops every turn and deletes the Mesh transcript and draft.")
+            if let confirmation = meshDeleteConfirm, confirmation.running, confirmation.dirty > 0 {
+                Text("Agents are still working and \(confirmation.dirty) column(s) contain unintegrated files or commits. Deleting stops the run and permanently discards that recoverable work.")
+            } else if meshDeleteConfirm?.running == true {
+                Text("One or more agents are still working. Deleting stops every turn and permanently removes the Mesh transcripts and draft.")
+            } else if (meshDeleteConfirm?.dirty ?? 0) > 0 {
+                Text("\(meshDeleteConfirm?.dirty ?? 0) column(s) contain unintegrated files or commits. Deleting discards that recoverable work permanently — integrate what you want to keep first.")
             } else {
-                Text("\(meshCloseConfirm?.dirty ?? 0) column(s) contain unintegrated files or commits. Closing discards that recoverable work permanently — integrate what you want to keep first.")
+                Text("This permanently removes the Mesh transcripts, draft, queued prompts, and worktree manifest. This cannot be undone.")
             }
         }
     }
@@ -391,7 +448,8 @@ struct RootShellView: View {
                         contextMenu: { AnyView(projectContextMenu($0)) },
                         sessionContextMenu: { AnyView(sessionContextMenuContent($0)) },
                         chatContextMenu: { AnyView(chatContextMenuContent($0)) },
-                        meshContextMenu: { AnyView(meshContextMenuContent($0)) }
+                        meshContextMenu: { AnyView(meshContextMenuContent($0)) },
+                        deleteRecentlyClosed: requestDeleteRecentlyClosed
                     )
                     if auth.isSignedIn, showsRememberedSessionSection {
                         rememberedSessionSidebarSection
@@ -651,7 +709,7 @@ struct RootShellView: View {
             }
         }
         if visible {
-            Button("Minimize Pane") {
+            Button("Hide Terminal") {
                 Task { await model.minimizeSurface(session.id) }
             }
         }
@@ -672,12 +730,13 @@ struct RootShellView: View {
     private func chatContextMenuContent(_ chat: AcpChatHandle) -> some View {
         Button("Open Beside") { model.revealSurfaceBeside(chat.id) }
         if model.isSurfaceVisible(chat.id) {
-            Button("Minimize Pane") { Task { await model.minimizeSurface(chat.id) } }
+            Button("Hide Chat") { Task { await model.minimizeSurface(chat.id) } }
         }
         Button("Rename…") { renameTarget = chat.id }
         if chat.conversation.isRunning {
             Button("Stop Chat") { model.stopChat(chat.id) }
         }
+        Button("Close to Recently Closed") { model.closeChat(chat.id) }
         Button("Delete Chat…", role: .destructive) { requestDeleteChat(chat) }
     }
 
@@ -685,13 +744,14 @@ struct RootShellView: View {
     private func meshContextMenuContent(_ mesh: MeshSession) -> some View {
         Button("Open Beside") { model.revealSurfaceBeside(mesh.id) }
         if model.isSurfaceVisible(mesh.id) {
-            Button("Minimize Pane") { Task { await model.minimizeSurface(mesh.id) } }
+            Button("Hide Mesh") { Task { await model.minimizeSurface(mesh.id) } }
         }
         Button("Rename…") { renameTarget = mesh.id }
         if mesh.anyRunning {
             Button("Stop All Columns") { Task { await mesh.stopAllTurns() } }
         }
-        Button("Close Mesh", role: .destructive) { requestCloseMesh(mesh) }
+        Button("Close to Recently Closed") { requestMoveMeshToRecentlyClosed(mesh) }
+        Button("Delete Mesh…", role: .destructive) { requestDeleteMesh(mesh) }
     }
 
     /// "Other Macs" is a *report on other machines*. With none paired it was a
@@ -835,8 +895,11 @@ struct RootShellView: View {
                 model: model,
                 projectID: activeProjectID,
                 rename: { renameTarget = $0 },
+                closeChat: { model.closeChat($0.id) },
                 deleteChat: requestDeleteChat,
-                closeMesh: requestCloseMesh
+                closeMesh: requestMoveMeshToRecentlyClosed,
+                deleteMesh: requestDeleteMesh,
+                deleteRecentlyClosed: requestDeleteRecentlyClosed
             )
             Divider()
             detailArea
@@ -1693,7 +1756,7 @@ struct RootShellView: View {
             }
             .buttonStyle(.plain)
             .foregroundStyle(.secondary)
-            .help("Minimize this session; keep it running")
+            .help("Hide this session; keep it running")
         }
         .padding(.leading, 10)
         .padding(.trailing, 9)
@@ -1728,7 +1791,7 @@ struct RootShellView: View {
                 }
                 .disabled(model.terminalTranscriptContext(for: id) == nil)
             }
-            Button("Minimize") { Task { await model.minimizeSurface(id) } }
+            Button("Hide Pane") { Task { await model.minimizeSurface(id) } }
         }
     }
 
@@ -3420,8 +3483,11 @@ private struct SessionStrip: View {
     @ObservedObject var model: AppModel
     let projectID: String?
     let rename: (String) -> Void
+    let closeChat: (AcpChatHandle) -> Void
     let deleteChat: (AcpChatHandle) -> Void
     let closeMesh: (MeshSession) -> Void
+    let deleteMesh: (MeshSession) -> Void
+    let deleteRecentlyClosed: (AppModel.RecentlyClosedSurface) -> Void
 
     private var project: AppModel.ProjectGroup? {
         model.projects.first { $0.id == projectID }
@@ -3434,6 +3500,9 @@ private struct SessionStrip: View {
     private var meshes: [MeshSession] {
         project.map { model.meshes(in: $0.id) } ?? []
     }
+    private var recentlyClosed: [AppModel.RecentlyClosedSurface] {
+        project.map { model.recentlyClosedSurfaces(in: $0.id) } ?? []
+    }
 
     private var selectedSurfaceID: String? {
         model.selectedChatID ?? model.selectedMeshID ?? model.selectedSessionID
@@ -3443,7 +3512,7 @@ private struct SessionStrip: View {
         ScrollViewReader { proxy in
             ScrollView(.horizontal, showsIndicators: false) {
                 HStack(spacing: 8) {
-                if sessions.isEmpty, chats.isEmpty, meshes.isEmpty {
+                if sessions.isEmpty, chats.isEmpty, meshes.isEmpty, recentlyClosed.isEmpty {
                     Text("No activity in this project")
                         .font(.caption)
                         .foregroundStyle(.secondary)
@@ -3483,6 +3552,7 @@ private struct SessionStrip: View {
                         if chat.conversation.isRunning {
                             Button("Stop Chat") { model.stopChat(chat.id) }
                         }
+                        Button("Close to Recently Closed") { closeChat(chat) }
                         Button("Delete Chat…", role: .destructive) { deleteChat(chat) }
                     }
                     .id(chat.id)
@@ -3514,9 +3584,34 @@ private struct SessionStrip: View {
                         if mesh.anyRunning {
                             Button("Stop All Columns") { Task { await mesh.stopAllTurns() } }
                         }
-                        Button("Close Mesh", role: .destructive) { closeMesh(mesh) }
+                        Button("Close to Recently Closed") { closeMesh(mesh) }
+                        Button("Delete Mesh…", role: .destructive) { deleteMesh(mesh) }
                     }
                     .id(mesh.id)
+                }
+                if !recentlyClosed.isEmpty {
+                    Menu {
+                        if let newest = recentlyClosed.first {
+                            Button("Undo Last Close") { restoreRecentlyClosed(newest.id) }
+                            Divider()
+                        }
+                        ForEach(recentlyClosed) { surface in
+                            Menu(surface.title) {
+                                Button("Restore") { restoreRecentlyClosed(surface.id) }
+                                Button("Delete Permanently…", role: .destructive) {
+                                    deleteRecentlyClosed(surface)
+                                }
+                            }
+                        }
+                    } label: {
+                        Label("Recently Closed \(recentlyClosed.count)", systemImage: "clock.arrow.circlepath")
+                            .font(.callout)
+                            .padding(.horizontal, 10)
+                            .padding(.vertical, 5)
+                    }
+                    .menuStyle(.borderlessButton)
+                    .help("Restore or permanently delete closed chats and Mesh runs")
+                    .accessibilityLabel("Recently Closed, \(recentlyClosed.count) items")
                 }
                 ForEach(sessions) { session in
                     let visible = model.selectedSessionID == session.id
@@ -3580,6 +3675,17 @@ private struct SessionStrip: View {
             }
         }
         .frame(height: 36)
+    }
+
+    private func restoreRecentlyClosed(_ id: String) {
+        Task {
+            switch await model.restoreRecentlyClosedSurface(id) {
+            case .completed, .unavailable, .needsConfirmation:
+                break
+            case let .blocked(message):
+                ToastCenter.shared.show(message, style: .error, duration: 5)
+            }
+        }
     }
 
     private func surfaceTabBackground(selected: Bool, tint: Color) -> some View {
@@ -4113,4 +4219,5 @@ private struct ConnectionFooter: View {
             }
         }
     }
+
 }

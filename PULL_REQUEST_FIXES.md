@@ -60,6 +60,10 @@ Large product and architecture work remains ordered in
 - Waiting staged Mesh prompts now persist in exact FIFO order, restore paused,
   and remain inspectable, removable one at a time, and explicitly resumable
   from both standalone and embedded Mesh headers.
+- Chat and Mesh now distinguish Hide, Stop, Close to Recently Closed, Restore,
+  and confirmed permanent Delete. Relaunch keeps closed transcripts, drafts,
+  queued prompts, and Mesh worktree manifests; Undo Last Close and per-entry
+  Restore/Delete controls are available from each project rail.
 
 ## Open audit fixes
 
@@ -76,7 +80,8 @@ Large product and architecture work remains ordered in
 
 ### Shell, Git, and session recovery
 
-- Finish reversible Recently Closed/Restore/Delete behavior.
+- Add ACP adapter restart queue recovery so pending work survives an adapter
+  crash without manual reconstruction.
 
 ### Accessibility, copy, and readiness
 

@@ -617,6 +617,141 @@ final class NativeSessionStoreTests: XCTestCase {
         XCTAssertEqual(descriptor.stagedPrompts, [])
     }
 
+    func testWorkspaceRestorationRoundTripsRecentlyClosedWithoutAddingItToLayout() async throws {
+        let stateURL = fileURL.deletingLastPathComponent()
+            .appendingPathComponent("workspace-state-v1.json")
+        let workspaceStore = NativeWorkspaceStateStore(fileURL: stateURL)
+        let basePath = "/tmp/recently-closed-project"
+        let projectID = NativeSessionStore.projectID(forDirectory: basePath)
+        let chat = NativeRestorableAgentChatDescriptor(
+            id: "chat-recent",
+            projectID: projectID,
+            agentID: "codex",
+            workspacePath: basePath,
+            acpSessionID: "provider-recent",
+            title: "Closed chat"
+        )
+        let recentPane = NativeRestorablePaneState(
+            id: chat.id,
+            surface: NativeRestorableSurfaceState(agentChat: chat),
+            isRecentlyClosed: true,
+            closedAt: 123_456
+        )
+        let terminalPane = NativeRestorablePaneState(
+            id: "term-live",
+            surface: NativeRestorableSurfaceState(
+                kind: .terminal,
+                id: "term-live",
+                projectID: projectID
+            )
+        )
+
+        try await workspaceStore.saveProjectState(NativeProjectWorkspaceState(
+            projectID: projectID,
+            layout: SessionPaneLayout(sessionID: terminalPane.id),
+            panes: [terminalPane, recentPane],
+            focusedPaneID: terminalPane.id
+        ))
+
+        let restoredValue = try await workspaceStore.projectState(for: projectID)
+        let restored = try XCTUnwrap(restoredValue)
+        let closed = try XCTUnwrap(restored.panes.first { $0.id == chat.id })
+        XCTAssertTrue(closed.isRecentlyClosed)
+        XCTAssertTrue(closed.isMinimized)
+        XCTAssertEqual(closed.closedAt, 123_456)
+        XCTAssertEqual(restored.layout.sessionIDs, [terminalPane.id])
+        XCTAssertFalse(restored.layout.contains(chat.id))
+        XCTAssertEqual(restored.focusedPaneID, terminalPane.id)
+    }
+
+    func testPartialWindowSavePreservesRecentlyClosedChatUntilExplicitTombstone() async throws {
+        let workspaceStore = NativeWorkspaceStateStore(
+            fileURL: fileURL.deletingLastPathComponent()
+                .appendingPathComponent("workspace-state-v1.json")
+        )
+        let basePath = "/tmp/recently-closed-merge"
+        let projectID = NativeSessionStore.projectID(forDirectory: basePath)
+        let chat = NativeRestorableAgentChatDescriptor(
+            id: "chat-preserved",
+            projectID: projectID,
+            agentID: "codex",
+            workspacePath: basePath,
+            acpSessionID: nil,
+            title: "Preserve me"
+        )
+        try await workspaceStore.saveProjectState(NativeProjectWorkspaceState(
+            projectID: projectID,
+            panes: [NativeRestorablePaneState(
+                id: chat.id,
+                surface: NativeRestorableSurfaceState(agentChat: chat),
+                isRecentlyClosed: true,
+                closedAt: 9
+            )]
+        ))
+
+        // A second window has no local copy of this closed chat. Its partial
+        // snapshot must not erase the durable entry.
+        try await workspaceStore.saveProjectState(NativeProjectWorkspaceState(projectID: projectID))
+        let preserved = try await workspaceStore.projectState(for: projectID)
+        XCTAssertEqual(preserved?.panes.map(\.id), [chat.id])
+
+        try await workspaceStore.removeRecentlyClosedSurfaceState(
+            projectID: projectID,
+            surfaceID: chat.id
+        )
+        try await workspaceStore.saveProjectState(NativeProjectWorkspaceState(projectID: projectID))
+        let tombstoned = try await workspaceStore.projectState(for: projectID)
+        XCTAssertTrue(tombstoned?.panes.isEmpty == true)
+    }
+
+    func testStaleRecentlyClosedDeleteCannotRemoveEntryRestoredByAnotherWindow() async throws {
+        let workspaceStore = NativeWorkspaceStateStore(
+            fileURL: fileURL.deletingLastPathComponent()
+                .appendingPathComponent("workspace-state-v1.json")
+        )
+        let basePath = "/tmp/recently-closed-stale-delete"
+        let projectID = NativeSessionStore.projectID(forDirectory: basePath)
+        let chat = NativeRestorableAgentChatDescriptor(
+            id: "chat-restored-elsewhere",
+            projectID: projectID,
+            agentID: "codex",
+            workspacePath: basePath,
+            acpSessionID: nil,
+            title: "Restored elsewhere"
+        )
+        let closed = NativeRestorablePaneState(
+            id: chat.id,
+            surface: NativeRestorableSurfaceState(agentChat: chat),
+            isRecentlyClosed: true,
+            closedAt: 1
+        )
+        try await workspaceStore.saveProjectState(NativeProjectWorkspaceState(
+            projectID: projectID,
+            panes: [closed]
+        ))
+
+        // Another window restores the same identity to its active pane list.
+        let active = NativeRestorablePaneState(
+            id: chat.id,
+            surface: NativeRestorableSurfaceState(agentChat: chat)
+        )
+        try await workspaceStore.saveProjectState(NativeProjectWorkspaceState(
+            projectID: projectID,
+            layout: SessionPaneLayout(sessionID: chat.id),
+            panes: [active],
+            focusedPaneID: chat.id
+        ))
+
+        let removed = try await workspaceStore.removeRecentlyClosedSurfaceState(
+            projectID: projectID,
+            surfaceID: chat.id
+        )
+        let state = try await workspaceStore.projectState(for: projectID)
+        XCTAssertFalse(removed)
+        XCTAssertFalse(state?.panes.first?.isRecentlyClosed == true)
+        XCTAssertEqual(state?.panes.first?.id, chat.id)
+    }
+
     func testWorkspaceStoreMigratesSchemaOneArchiveToSchemaTwoWithoutLosingLegacyPanes() async throws {
         let stateURL = fileURL.deletingLastPathComponent()
             .appendingPathComponent("workspace-state-v1.json")
@@ -665,6 +800,8 @@ final class NativeSessionStoreTests: XCTestCase {
         let migrated = try await workspaceStore.restorationState()
         XCTAssertEqual(migrated.selectedProjectID, projectID)
         XCTAssertEqual(migrated.projects.first?.panes.map(\.id), ["term-legacy"])
+        XCTAssertFalse(migrated.projects.first?.panes.first?.isRecentlyClosed == true)
+        XCTAssertNil(migrated.projects.first?.panes.first?.closedAt)
         XCTAssertEqual(
             migrated.projects.first?.layout.columns.first?.sessionIDs,
             ["term-legacy"]

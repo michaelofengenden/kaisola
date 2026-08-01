@@ -908,17 +908,59 @@ struct NativeRestorablePaneState: Codable, Equatable, Identifiable, Sendable {
     let surface: NativeRestorableSurfaceState
     var sizeWeight: Double
     var isMinimized: Bool
+    /// Closed surfaces remain durable but are excluded from the live pane
+    /// layout until the user explicitly restores them.
+    var isRecentlyClosed: Bool
+    /// Milliseconds since the Unix epoch, used only to present newest closes
+    /// first. Nil on legacy and active panes.
+    var closedAt: Int64?
 
     init(
         id: String,
         surface: NativeRestorableSurfaceState,
         sizeWeight: Double = 1,
-        isMinimized: Bool = false
+        isMinimized: Bool = false,
+        isRecentlyClosed: Bool = false,
+        closedAt: Int64? = nil
     ) {
         self.id = id
         self.surface = surface
         self.sizeWeight = sizeWeight
-        self.isMinimized = isMinimized
+        self.isMinimized = isRecentlyClosed || isMinimized
+        self.isRecentlyClosed = isRecentlyClosed
+        self.closedAt = isRecentlyClosed ? max(0, closedAt ?? 0) : nil
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case id
+        case surface
+        case sizeWeight
+        case isMinimized
+        case isRecentlyClosed
+        case closedAt
+    }
+
+    init(from decoder: any Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = try container.decode(String.self, forKey: .id)
+        surface = try container.decode(NativeRestorableSurfaceState.self, forKey: .surface)
+        sizeWeight = try container.decodeIfPresent(Double.self, forKey: .sizeWeight) ?? 1
+        isRecentlyClosed = try container.decodeIfPresent(Bool.self, forKey: .isRecentlyClosed) ?? false
+        let decodedMinimized = try container.decodeIfPresent(Bool.self, forKey: .isMinimized) ?? false
+        isMinimized = isRecentlyClosed || decodedMinimized
+        closedAt = isRecentlyClosed
+            ? max(0, try container.decodeIfPresent(Int64.self, forKey: .closedAt) ?? 0)
+            : nil
+    }
+
+    func encode(to encoder: any Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(id, forKey: .id)
+        try container.encode(surface, forKey: .surface)
+        try container.encode(sizeWeight, forKey: .sizeWeight)
+        try container.encode(isMinimized, forKey: .isMinimized)
+        try container.encode(isRecentlyClosed, forKey: .isRecentlyClosed)
+        try container.encodeIfPresent(closedAt, forKey: .closedAt)
     }
 }
 
@@ -1023,7 +1065,7 @@ struct NativeProjectWorkspaceState: Codable, Equatable, Identifiable, Sendable {
         for panes: [NativeRestorablePaneState],
         arrangement: NativePaneArrangement
     ) -> SessionPaneLayout {
-        let visibleIDs = panes.filter { !$0.isMinimized }.map(\.id)
+        let visibleIDs = panes.filter { !$0.isMinimized && !$0.isRecentlyClosed }.map(\.id)
         guard !visibleIDs.isEmpty else { return SessionPaneLayout() }
         switch arrangement {
         case .rows:
@@ -1086,6 +1128,7 @@ actor NativeWorkspaceStateStore {
     static let minimumReadableSchemaVersion = 1
     static let maximumProjects = 64
     static let maximumPanesPerProject = 8
+    static let maximumRecentlyClosedChatsPerProject = 256
     static let maximumFileTabsPerProject = 24
     static let maximumDrafts = 128
     static let maximumDraftBytes = 256 * 1_024
@@ -1299,12 +1342,14 @@ actor NativeWorkspaceStateStore {
     func removeProjectState(projectID: String) throws {
         var archive = try loadArchive()
         if let existing = archive.restoration.projects.first(where: { $0.projectID == projectID }) {
-            let meshes = existing.panes.filter { $0.surface.kind == .mesh }
+            let durablePanes = existing.panes.filter {
+                $0.surface.kind == .mesh || $0.isRecentlyClosed
+            }
             archive.restoration.projects.removeAll { $0.projectID == projectID }
-            if !meshes.isEmpty {
+            if !durablePanes.isEmpty {
                 archive.restoration.projects.append(NativeProjectWorkspaceState(
                     projectID: projectID,
-                    panes: meshes.map { pane in
+                    panes: durablePanes.map { pane in
                         var pane = pane
                         pane.isMinimized = true
                         return pane
@@ -1318,7 +1363,7 @@ actor NativeWorkspaceStateStore {
         try persist(archive)
     }
 
-    /// Explicit Mesh close is the sole operation allowed to tombstone a Mesh
+    /// Explicit permanent Mesh deletion is the sole operation allowed to tombstone a Mesh
     /// descriptor. Ordinary window/project snapshots always preserve Meshes
     /// they do not own, preventing last-writer data loss across windows.
     func removeMeshState(projectID: String, meshID: String) throws {
@@ -1336,6 +1381,30 @@ actor NativeWorkspaceStateStore {
         project.updatedAt = Int64(Date().timeIntervalSince1970 * 1_000)
         archive.restoration.projects[index] = project
         try persist(archive)
+    }
+
+    /// Explicit permanent deletion is the only path allowed to tombstone a
+    /// recently closed descriptor. Ordinary partial-window snapshots preserve
+    /// these entries so another window cannot silently resurrect or erase one.
+    @discardableResult
+    func removeRecentlyClosedSurfaceState(projectID: String, surfaceID: String) throws -> Bool {
+        guard Self.isValidIdentifier(projectID), Self.isValidIdentifier(surfaceID) else {
+            throw StoreError.invalidIdentifier
+        }
+        var archive = try loadArchive()
+        guard let index = archive.restoration.projects.firstIndex(where: { $0.projectID == projectID }) else {
+            return false
+        }
+        var project = archive.restoration.projects[index]
+        let previousCount = project.panes.count
+        project.panes.removeAll { $0.id == surfaceID && $0.isRecentlyClosed }
+        guard project.panes.count < previousCount else { return false }
+        project.layout.remove(surfaceID)
+        if project.focusedPaneID == surfaceID { project.focusedPaneID = nil }
+        project.updatedAt = Int64(Date().timeIntervalSince1970 * 1_000)
+        archive.restoration.projects[index] = project
+        try persist(archive)
+        return true
     }
 
     func draft(for stableKey: String) throws -> String? {
@@ -1573,17 +1642,19 @@ actor NativeWorkspaceStateStore {
         )
     }
 
-    /// Merge panes by Mesh identity, preferring the incoming descriptor when
-    /// its owning window supplied one and retaining the archive's descriptor
-    /// otherwise. Preserved panes are hidden from the incoming window layout.
+    /// Merge crash-safe panes by identity, preferring the incoming descriptor
+    /// when its owning window supplied one. Mesh manifests and Recently Closed
+    /// entries survive partial snapshots from other windows.
     private static func preservingExistingMeshes(
         from existing: NativeProjectWorkspaceState?,
         in incoming: NativeProjectWorkspaceState
     ) -> NativeProjectWorkspaceState {
         guard let existing else { return incoming }
         var merged = incoming
-        var known = Set(merged.panes.filter { $0.surface.kind == .mesh }.map(\.id))
-        for oldPane in existing.panes where oldPane.surface.kind == .mesh && known.insert(oldPane.id).inserted {
+        var known = Set(merged.panes.map(\.id))
+        for oldPane in existing.panes
+        where (oldPane.surface.kind == .mesh || oldPane.isRecentlyClosed)
+            && known.insert(oldPane.id).inserted {
             var preserved = oldPane
             preserved.isMinimized = true
             merged.panes.append(preserved)
@@ -1596,14 +1667,13 @@ actor NativeWorkspaceStateStore {
         in incoming: NativeWorkspaceRestorationState
     ) -> NativeWorkspaceRestorationState {
         var merged = incoming
-        var incomingMeshIDs = Set(
-            merged.projects.flatMap { project in
-                project.panes.filter { $0.surface.kind == .mesh }.map(\.id)
-            }
+        var incomingDurableIDs = Set(
+            merged.projects.flatMap { project in project.panes.map(\.id) }
         )
         for oldProject in existing.projects {
             let missing = oldProject.panes.filter {
-                $0.surface.kind == .mesh && incomingMeshIDs.insert($0.id).inserted
+                ($0.surface.kind == .mesh || $0.isRecentlyClosed)
+                    && incomingDurableIDs.insert($0.id).inserted
             }
             guard !missing.isEmpty else { continue }
             if let index = merged.projects.firstIndex(where: { $0.projectID == oldProject.projectID }) {
@@ -1636,15 +1706,25 @@ actor NativeWorkspaceStateStore {
         var panes: [NativeRestorablePaneState] = []
 
         var ordinaryPaneCount = 0
+        var recentlyClosedChatCount = 0
         // Mesh first: an ordinary window snapshot at its visual pane cap must
         // never push a preserved recovery manifest out of the archive.
-        let orderedPanes = state.panes.filter { $0.surface.kind == .mesh }
-            + state.panes.filter { $0.surface.kind != .mesh }
+        // Active ordinary panes precede closed chats so the closed archive has
+        // its own independent bound and cannot crowd live work out.
+        let orderedPanes = state.panes.filter { $0.surface.kind == .mesh && !$0.isRecentlyClosed }
+            + state.panes.filter { $0.surface.kind != .mesh && !$0.isRecentlyClosed }
+            + state.panes.filter { $0.surface.kind == .mesh && $0.isRecentlyClosed }
+            + state.panes.filter { $0.surface.kind != .mesh && $0.isRecentlyClosed }
         for pane in orderedPanes {
             let isMesh = pane.surface.kind == .mesh
-            guard (isMesh || ordinaryPaneCount < maximumPanesPerProject),
+            let hasCapacity = isMesh
+                || (pane.isRecentlyClosed
+                    ? recentlyClosedChatCount < maximumRecentlyClosedChatsPerProject
+                    : ordinaryPaneCount < maximumPanesPerProject)
+            guard hasCapacity,
                   isValidIdentifier(pane.id),
                   pane.surface.projectID == state.projectID,
+                  (!pane.isRecentlyClosed || pane.surface.kind == .agentChat || isMesh),
                   let surface = normalizedSurface(
                     pane.surface,
                     meshWorktreeRoot: meshWorktreeRoot,
@@ -1668,16 +1748,28 @@ actor NativeWorkspaceStateStore {
                     id: pane.id,
                     surface: surface,
                     sizeWeight: weight,
-                    isMinimized: pane.isMinimized
+                    isMinimized: pane.isMinimized,
+                    isRecentlyClosed: pane.isRecentlyClosed,
+                    closedAt: pane.closedAt
                 )
             )
-            if !isMesh { ordinaryPaneCount += 1 }
+            if !isMesh {
+                if pane.isRecentlyClosed {
+                    recentlyClosedChatCount += 1
+                } else {
+                    ordinaryPaneCount += 1
+                }
+            }
         }
 
         let focusedPaneID = state.focusedPaneID.flatMap { focused in
-            panes.contains { $0.id == focused && !$0.isMinimized } ? focused : nil
+            panes.contains {
+                $0.id == focused && !$0.isMinimized && !$0.isRecentlyClosed
+            } ? focused : nil
         }
-        let visiblePaneIDs = Set(panes.lazy.filter { !$0.isMinimized }.map(\.id))
+        let visiblePaneIDs = Set(
+            panes.lazy.filter { !$0.isMinimized && !$0.isRecentlyClosed }.map(\.id)
+        )
         var layout = state.layout
         layout.normalize(availableSessionIDs: visiblePaneIDs)
         for id in panes.lazy.filter({ !$0.isMinimized }).map(\.id) where !layout.contains(id) {

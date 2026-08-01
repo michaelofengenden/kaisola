@@ -1978,6 +1978,42 @@ class ReadOnlyTerminalView: TerminalView {
         let point = convert(event.locationInWindow, from: nil)
         (terminalLink(at: point) == nil ? NSCursor.iBeam : NSCursor.pointingHand).set()
     }
+
+    /// Whether this terminal is the thing under the pointer, and therefore
+    /// entitled to set the cursor for this event.
+    ///
+    /// The link affordance is driven by a *local NSEvent monitor* rather than by
+    /// SwiftTerm's own (non-open) mouse callbacks, and a local monitor sees every
+    /// `.mouseMoved` in the window — not only the ones over this view. Its sole
+    /// guard used to be `event.window === window`, so every mounted terminal
+    /// stamped `NSCursor.iBeam` on every pointer motion anywhere in its window,
+    /// including motion over the sidebar splitter and the pane and panel
+    /// dividers. Those dividers set `resizeLeftRight` from a `.cursorUpdate`
+    /// tracking area, which fires once on entry; the very next mouse-moved event
+    /// put the I-beam straight back. That is the whole "the resize cursor does
+    /// not appear reliably" report: the cursor was being set correctly and then
+    /// immediately overwritten, a frame later, by a view the pointer was nowhere
+    /// near.
+    ///
+    /// Containment alone is not enough, because a divider corridor deliberately
+    /// *overhangs* the cards on either side of it — inside this view's bounds is
+    /// exactly where the contested pixels are. So this asks AppKit the same
+    /// question a click does: hit-test the window and require the answer to be
+    /// this view or something inside it. A tracker sitting above the terminal
+    /// then wins the cursor, and a terminal with nothing over it is unaffected.
+    private func ownsPointer(for event: NSEvent) -> Bool {
+        guard let window, event.window === window else { return false }
+        // `visibleRect`, not `bounds`: a pane scrolled or clipped out from under
+        // the pointer must not claim it.
+        guard visibleRect.contains(convert(event.locationInWindow, from: nil)) else { return false }
+        guard let hit = window.contentView?.hitTest(event.locationInWindow) else { return false }
+        var candidate: NSView? = hit
+        while let view = candidate {
+            if view === self { return true }
+            candidate = view.superview
+        }
+        return false
+    }
     private var linkInteractionMonitor: Any?
     private var linkPointerDownInView = false
     fileprivate var linkPointerDragged = false
@@ -2060,6 +2096,10 @@ class ReadOnlyTerminalView: TerminalView {
                     let point = self.convert(event.locationInWindow, from: nil)
                     switch event.type {
                     case .mouseMoved:
+                        // Only when the pointer is actually ours; see
+                        // `ownsPointer(for:)`. Without this the terminal
+                        // overwrote every divider's resize cursor.
+                        guard self.ownsPointer(for: event) else { break }
                         self.updateLinkCursor(for: event)
                     case .leftMouseDown:
                         self.linkPointerDownInView = self.bounds.contains(point)

@@ -409,7 +409,10 @@ final class NativePreviewSettingsTests: XCTestCase {
         XCTAssertEqual(widths.preview, 480)
         XCTAssertEqual(widths.rail, 218)
         XCTAssertEqual(NativeDetailPaneSizing.dividerWidth, 1)
-        XCTAssertEqual(NativeDetailPaneSizing.dividerHitWidth, 17)
+        // 17 → 22 in v1.1.8: these two were the last dividers in the app below
+        // the shared grab floor. See
+        // `testEveryDividerCorridorClearsTheGrabReachOnBothSides`.
+        XCTAssertEqual(NativeDetailPaneSizing.dividerHitWidth, 22)
     }
 
     func testVisualChoiceTitlesRemainUserFacing() {
@@ -1566,6 +1569,20 @@ final class NativePreviewSettingsTests: XCTestCase {
             SessionPaneDividerSizing.reach,
             NativeWorkspaceChrome.dividerCorridorReach,
             "the pane splitters are back to a line you have to hit"
+        )
+        // v1.1.8: the document-preview and Files dividers were never in this
+        // check and had quietly stayed at 17 (8pt of reach) while everything
+        // else moved to 22. "Every draggable divider" now means every one.
+        XCTAssertGreaterThanOrEqual(
+            (NativeDetailPaneSizing.dividerHitWidth - NativeDetailPaneSizing.dividerWidth) / 2,
+            NativeWorkspaceChrome.dividerCorridorReach,
+            "the document/Files splitters are back to a line you have to hit"
+        )
+        XCTAssertEqual(
+            NativeDetailPaneSizing.dividerHitWidth,
+            NativeWorkspaceChrome.projectSidebarDividerHitWidth,
+            accuracy: 0.001,
+            "all three corridors must be the same width or the grab feel forks"
         )
         // The two corridors are the same width, so the sidebar and the panes
         // cannot drift into two different grab feels.

@@ -408,14 +408,41 @@ struct RootShellView: View {
                 // to them. The List already ends exactly where the footer
                 // begins, so anchoring here excludes the footer's row height
                 // for free — no footer-height constant to duplicate or keep in
-                // sync. (The pinned header's "+" menu, at the List's own top
+                // sync. (The active header's "+" menu, at the List's own top
                 // edge, still overlaps the corridor by ~1.5pt; fixing that
                 // needs a change inside `QuietProjectRail`, out of scope here.)
+                //
+                // This is the ONE instance that vends the AX slider; the two
+                // segments below cover the rest of the boundary silently.
                 .overlay(alignment: .trailing) {
                     NavigationSidebarResizeAffordance(hovered: sidebarDividerHoveredBinding)
                         .frame(width: NativeWorkspaceChrome.projectSidebarDividerWidth)
                 }
                 footer
+                    // …and the footer's own 40pt of the boundary, which the
+                    // List's overlay by construction cannot reach. Left alone,
+                    // the sidebar half of the corridor simply stopped existing
+                    // beside the footer: the pointer showed an arrow on the left
+                    // of the line and a resize cursor on the right of it, which
+                    // is precisely the "not appearing reliably" complaint at the
+                    // bottom of the column.
+                    //
+                    // A BACKGROUND, not an overlay. That is the whole trick, and
+                    // it is what makes this safe where the earlier full-column
+                    // overlay was not: the footer's gear and overflow buttons are
+                    // drawn in front, so they keep every click in the ~20pt band
+                    // they occupy — but a plain SwiftUI button installs no cursor
+                    // rect of its own, so the tracker behind it is still the only
+                    // `.cursorUpdate` region under the pointer and the resize
+                    // cursor runs the full corridor. Dragging works everywhere the
+                    // footer has no control, which is most of its height.
+                    .background(alignment: .trailing) {
+                        NavigationSidebarResizeAffordance(
+                            hovered: sidebarDividerHoveredBinding,
+                            exposesAccessibility: false
+                        )
+                        .frame(width: NativeWorkspaceChrome.projectSidebarDividerWidth)
+                    }
             }
             // Safari's inset sidebar card: the tinted backdrop runs edge to
             // edge behind the column and the navigation content floats on a
@@ -433,6 +460,21 @@ struct RootShellView: View {
             // survives is the traffic-light clearance the panel used to carry
             // as its top inset.
             .padding(.top, NativeWorkspaceChrome.chromePanelTopInset)
+            // The traffic-light clearance band the padding above just created is
+            // the third and last piece of the boundary. It carries nothing at
+            // all, so this segment can be a plain overlay — and it has to be
+            // attached AFTER the padding, or it lands on the List's top rows
+            // instead of on the empty band.
+            .overlay(alignment: .topTrailing) {
+                NavigationSidebarResizeAffordance(
+                    hovered: sidebarDividerHoveredBinding,
+                    exposesAccessibility: false
+                )
+                .frame(
+                    width: NativeWorkspaceChrome.projectSidebarDividerWidth,
+                    height: NativeWorkspaceChrome.chromePanelTopInset
+                )
+            }
             .background {
                 SidebarBackdropView(appearance: settings.sidebarAppearance)
                     .ignoresSafeArea()
@@ -1879,6 +1921,10 @@ enum SessionPaneDividerSizing {
 /// lives inside the detail column and drives the same `NSSplitView`.
 private struct NavigationSidebarResizeAffordance: View {
     @Binding var hovered: Bool
+    /// Only ONE instance in the column may vend the shared AX slider; the
+    /// segments that cover the header band and the footer are silent. See
+    /// `NavigationSidebarResizeHandle.exposesAccessibility`.
+    var exposesAccessibility = true
 
     var body: some View {
         ZStack {
@@ -1900,8 +1946,11 @@ private struct NavigationSidebarResizeAffordance: View {
         // from the traffic-light clearance down past the footer. There is no
         // centred grip to find.
         .overlay {
-            NavigationSidebarResizeHandle(hoverChanged: { hovered = $0 })
-                .frame(width: NativeWorkspaceChrome.projectSidebarDividerHitWidth)
+            NavigationSidebarResizeHandle(
+                hoverChanged: { hovered = $0 },
+                exposesAccessibility: exposesAccessibility
+            )
+            .frame(width: NativeWorkspaceChrome.projectSidebarDividerHitWidth)
         }
         .animation(.easeOut(duration: 0.12), value: hovered)
         .help("Drag or use Left/Right arrows to resize; double-click to reset")
@@ -2484,6 +2533,14 @@ private struct StablePanelResizeHandle: View {
             )
             .frame(width: NativeDetailPaneSizing.dividerHitWidth)
         }
+        // Same fix `PaneResizeHandle` got in v1.1.7, and for the same reason:
+        // the corridor overhangs both neighbours, and in an `HStack` a later
+        // sibling is drawn — and hit-tested — above an earlier one. Left at the
+        // default, the trailing half of this corridor was swallowed by the panel
+        // that follows it, which for the document divider is a text view that
+        // sets its own I-beam. That is why the resize cursor appeared on the
+        // approach and vanished as the pointer arrived.
+        .zIndex(1)
         .animation(.easeOut(duration: 0.12), value: hovered)
         .focusable()
         .accessibilityElement(children: .ignore)
@@ -2902,7 +2959,14 @@ enum NativeDetailPaneSizing {
 
     /// One visible/layout point with a forgiving overlaid acquisition target.
     static let dividerWidth: CGFloat = 1
-    static let dividerHitWidth: CGFloat = 17
+    /// 17 → 22 in v1.1.8. These two dividers (the document preview's and the
+    /// Files rail's) were the last in the app still below
+    /// `NativeWorkspaceChrome.dividerCorridorReach`: 17 buys 8pt of reach on
+    /// each side where every other divider buys 10.5. Matching
+    /// `SessionPaneDividerSizing.hitExtent` exactly is the point — "every
+    /// divider is grabbable, and grabbable by the same amount" is one claim, not
+    /// three, and a test now reads all three constants against the one floor.
+    static let dividerHitWidth: CGFloat = 22
     static let minimumContentWidth: CGFloat = 220
     private static let compactPreviewFloor: CGFloat = 210
     private static let compactRailFloor: CGFloat = 150

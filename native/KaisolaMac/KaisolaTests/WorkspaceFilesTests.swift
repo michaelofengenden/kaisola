@@ -180,6 +180,118 @@ final class WorkspaceFilesTests: XCTestCase {
         XCTAssertEqual(FileLineNavigation.range(forOneBasedLine: 99, in: text), NSRange(location: 17, length: 0))
         XCTAssertEqual(FileLineNavigation.range(forOneBasedLine: 1, in: ""), NSRange(location: 0, length: 0))
     }
+
+    func testMarkdownNavigationFlushesOrWaitsForAutosaveBeforeSwitchingFiles() {
+        XCTAssertEqual(
+            FilePreviewNavigationPolicy.requestDecision(
+                isDirty: false,
+                isMarkdown: true,
+                isSaving: false,
+                hasExternalConflict: false
+            ),
+            .navigate
+        )
+        XCTAssertEqual(
+            FilePreviewNavigationPolicy.requestDecision(
+                isDirty: true,
+                isMarkdown: true,
+                isSaving: false,
+                hasExternalConflict: false
+            ),
+            .autosave
+        )
+        XCTAssertEqual(
+            FilePreviewNavigationPolicy.requestDecision(
+                isDirty: true,
+                isMarkdown: true,
+                isSaving: true,
+                hasExternalConflict: false
+            ),
+            .awaitCurrentSave
+        )
+        XCTAssertEqual(
+            FilePreviewNavigationPolicy.requestDecision(
+                isDirty: true,
+                isMarkdown: true,
+                isSaving: false,
+                hasExternalConflict: true
+            ),
+            .prompt
+        )
+        XCTAssertEqual(
+            FilePreviewNavigationPolicy.requestDecision(
+                isDirty: true,
+                isMarkdown: false,
+                isSaving: false,
+                hasExternalConflict: false
+            ),
+            .prompt
+        )
+    }
+
+    func testPendingNavigationSavesTheLatestDraftBeforeItCommits() {
+        XCTAssertEqual(
+            FilePreviewNavigationPolicy.saveCompletion(
+                hasPendingAction: false,
+                isDirty: true,
+                isMarkdown: true
+            ),
+            .stay
+        )
+        XCTAssertEqual(
+            FilePreviewNavigationPolicy.saveCompletion(
+                hasPendingAction: true,
+                isDirty: false,
+                isMarkdown: true
+            ),
+            .completePendingAction
+        )
+        XCTAssertEqual(
+            FilePreviewNavigationPolicy.saveCompletion(
+                hasPendingAction: true,
+                isDirty: true,
+                isMarkdown: true
+            ),
+            .saveLatestDraft
+        )
+        XCTAssertEqual(
+            FilePreviewNavigationPolicy.saveCompletion(
+                hasPendingAction: true,
+                isDirty: true,
+                isMarkdown: false
+            ),
+            .prompt
+        )
+
+        XCTAssertTrue(FilePreviewNavigationPolicy.shouldRetrySupersededSave(
+            taskCancelled: false,
+            remainsOnLoadedFile: true,
+            recoveryGenerationChanged: true,
+            autosavePendingAction: true,
+            hasPendingAction: true
+        ))
+        XCTAssertFalse(FilePreviewNavigationPolicy.shouldRetrySupersededSave(
+            taskCancelled: true,
+            remainsOnLoadedFile: true,
+            recoveryGenerationChanged: true,
+            autosavePendingAction: true,
+            hasPendingAction: true
+        ))
+        XCTAssertFalse(FilePreviewNavigationPolicy.shouldRetrySupersededSave(
+            taskCancelled: false,
+            remainsOnLoadedFile: false,
+            recoveryGenerationChanged: true,
+            autosavePendingAction: true,
+            hasPendingAction: true
+        ))
+        XCTAssertFalse(FilePreviewNavigationPolicy.shouldRetrySupersededSave(
+            taskCancelled: false,
+            remainsOnLoadedFile: true,
+            recoveryGenerationChanged: true,
+            autosavePendingAction: false,
+            hasPendingAction: true
+        ))
+    }
     private var root: URL!
 
     override func setUpWithError() throws {

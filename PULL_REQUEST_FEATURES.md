@@ -242,7 +242,8 @@ off-main cached Markdown images. A bounded native PDFKit preview now covers PDF
 selection, scrolling, magnification, and accessibility while parsing off the
 main actor, and bounded Markdown tables visibly disclose omitted rows. Finish
 the remaining large-document architecture. Rendered Markdown links now fail
-closed to explicit http(s) destinations or symlink-confined project files.
+closed to explicit http(s) destinations or symlink-confined project files, and
+navigation flushes the latest Markdown draft before switching documents.
 
 Scope:
 
@@ -250,7 +251,6 @@ Scope:
   viewport position and providing native Find without entering edit mode.
 - Parse CSV, JSON, and HTML readiness once per content/mtime and cache those
   results off the main thread.
-- Flush Markdown autosave before navigation.
 - Split the preview monolith into recovery, tabs, editors, Markdown, assets, and
   content-preview units with typed notice/error channels.
 

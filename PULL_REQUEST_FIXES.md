@@ -33,6 +33,9 @@ Large product and architecture work remains ordered in
 - Rendered Markdown now blocks custom schemes, credential-bearing web links,
   scheme-relative URLs, and filesystem escapes; project files route back into
   Kaisola through one symlink-safe policy shared with HTML previews.
+- Markdown navigation now flushes immediately, waits for an in-flight snapshot,
+  and saves a newer draft again before committing the file switch; conflicts
+  and failures return to an explicit user decision.
 
 ## Open audit fixes
 

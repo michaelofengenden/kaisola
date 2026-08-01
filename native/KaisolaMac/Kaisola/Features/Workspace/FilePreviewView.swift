@@ -201,6 +201,61 @@ enum WorkspacePreviewLinkPolicy {
     }
 }
 
+/// Pure navigation/save state machine for a mounted preview. Rendered Markdown
+/// owns a short autosave debounce, but a file switch must flush immediately.
+/// If a previous snapshot is already saving, its completion decides whether the
+/// latest draft needs one more save before navigation can commit.
+enum FilePreviewNavigationPolicy {
+    enum RequestDecision: Equatable {
+        case navigate
+        case autosave
+        case awaitCurrentSave
+        case prompt
+    }
+
+    enum SaveCompletion: Equatable {
+        case stay
+        case completePendingAction
+        case saveLatestDraft
+        case prompt
+    }
+
+    static func requestDecision(
+        isDirty: Bool,
+        isMarkdown: Bool,
+        isSaving: Bool,
+        hasExternalConflict: Bool
+    ) -> RequestDecision {
+        guard isDirty else { return .navigate }
+        guard isMarkdown, !hasExternalConflict else { return .prompt }
+        return isSaving ? .awaitCurrentSave : .autosave
+    }
+
+    static func saveCompletion(
+        hasPendingAction: Bool,
+        isDirty: Bool,
+        isMarkdown: Bool
+    ) -> SaveCompletion {
+        guard hasPendingAction else { return .stay }
+        guard isDirty else { return .completePendingAction }
+        return isMarkdown ? .saveLatestDraft : .prompt
+    }
+
+    static func shouldRetrySupersededSave(
+        taskCancelled: Bool,
+        remainsOnLoadedFile: Bool,
+        recoveryGenerationChanged: Bool,
+        autosavePendingAction: Bool,
+        hasPendingAction: Bool
+    ) -> Bool {
+        !taskCancelled
+            && remainsOnLoadedFile
+            && recoveryGenerationChanged
+            && autosavePendingAction
+            && hasPendingAction
+    }
+}
+
 /// AppKit's Office Open XML reader/writer is synchronous and the attributed
 /// string classes predate Sendable. Keep that work off the main actor and move
 /// the immutable result across the boundary in this explicit wrapper.
@@ -1703,6 +1758,10 @@ struct FilePreviewView: View {
     @State private var loadedModificationDate: Date?
     /// A navigation/close blocked on unsaved changes, awaiting the user.
     @State private var pendingAction: PendingAction?
+    /// True when Markdown navigation is waiting for the latest autosave rather
+    /// than a user decision. A save already in flight may have captured an
+    /// older draft, so its completion can chain one final save before loading.
+    @State private var autosavePendingAction = false
     @State private var showUnsavedPrompt = false
     @State private var showExternalChangePrompt = false
     @State private var externalChangeDetected = false
@@ -1781,13 +1840,27 @@ struct FilePreviewView: View {
         }
         .onChange(of: url) { _, newURL in
             guard newURL != loadedURL, newURL != loadingURL else { return }
-            // Never silently drop unsaved edits: block the switch behind a
-            // Save / Discard / Cancel prompt.
-            if isDirty {
-                pendingAction = .navigate(newURL)
-                showUnsavedPrompt = true
-            } else {
+            switch FilePreviewNavigationPolicy.requestDecision(
+                isDirty: isDirty,
+                isMarkdown: isMarkdownContent,
+                isSaving: isSaving,
+                hasExternalConflict: externalChangeDetected || showExternalChangePrompt
+            ) {
+            case .navigate:
                 beginLoad(newURL)
+            case .autosave:
+                pendingAction = .navigate(newURL)
+                autosavePendingAction = true
+                markdownAutosaveTask?.cancel()
+                save(advancePendingAction: true, silently: true)
+            case .awaitCurrentSave:
+                pendingAction = .navigate(newURL)
+                autosavePendingAction = true
+                markdownAutosaveTask?.cancel()
+            case .prompt:
+                pendingAction = .navigate(newURL)
+                autosavePendingAction = false
+                showUnsavedPrompt = true
             }
         }
         .onChange(of: targetLine) { _, newLine in
@@ -1860,6 +1933,7 @@ struct FilePreviewView: View {
             isPresented: $showUnsavedPrompt
         ) {
             Button("Save") {
+                autosavePendingAction = false
                 save(advancePendingAction: true)
             }
             Button("Discard Changes", role: .destructive) {
@@ -1870,6 +1944,7 @@ struct FilePreviewView: View {
                 completePendingAction()
             }
             Button("Cancel", role: .cancel) {
+                autosavePendingAction = false
                 pendingAction = nil
                 if let loadedURL { restoreSelection(loadedURL) }
             }
@@ -1878,6 +1953,7 @@ struct FilePreviewView: View {
         }
         .confirmationDialog("File changed on disk", isPresented: $showExternalChangePrompt) {
             Button("Reload from Disk") {
+                autosavePendingAction = false
                 pendingAction = nil
                 if let loadedURL {
                     guard clearRecoveryTokens(for: loadedURL) else { return }
@@ -1885,9 +1961,11 @@ struct FilePreviewView: View {
                 }
             }
             Button("Overwrite", role: .destructive) {
+                autosavePendingAction = false
                 save(force: true, advancePendingAction: pendingAction != nil)
             }
             Button("Cancel", role: .cancel) {
+                autosavePendingAction = false
                 if let loadedURL { restoreSelection(loadedURL) }
                 pendingAction = nil
             }
@@ -1897,7 +1975,10 @@ struct FilePreviewView: View {
     }
 
     private func completePendingAction() {
-        switch pendingAction {
+        let action = pendingAction
+        pendingAction = nil
+        autosavePendingAction = false
+        switch action {
         case let .navigate(next):
             beginLoad(next)
         case .close:
@@ -1905,12 +1986,12 @@ struct FilePreviewView: View {
         case nil:
             break
         }
-        pendingAction = nil
     }
 
     private func requestClose() {
         if isDirty {
             pendingAction = .close
+            autosavePendingAction = false
             showUnsavedPrompt = true
         } else {
             close()
@@ -2244,6 +2325,11 @@ struct FilePreviewView: View {
         case .text, .markdown, .html, .docx: true
         default: false
         }
+    }
+
+    private var isMarkdownContent: Bool {
+        if case .markdown = content { return true }
+        return false
     }
 
     @ViewBuilder
@@ -2645,6 +2731,7 @@ struct FilePreviewView: View {
             )
         } catch {
             handleRecoveryFailure(error, richDocument: savingRichDocument)
+            resumePendingActionPrompt()
             return
         }
         isSaving = true
@@ -2664,6 +2751,13 @@ struct FilePreviewView: View {
                     richPayload: savingRichDocument ? richSnapshot : nil
                 )
             }.value
+            let shouldRetryPendingAutosave = FilePreviewNavigationPolicy.shouldRetrySupersededSave(
+                taskCancelled: Task.isCancelled,
+                remainsOnLoadedFile: loadedURL == target,
+                recoveryGenerationChanged: recoveryGeneration != generation,
+                autosavePendingAction: autosavePendingAction,
+                hasPendingAction: pendingAction != nil
+            )
             guard !Task.isCancelled,
                   loadedURL == target,
                   recoveryGeneration == generation else {
@@ -2672,7 +2766,13 @@ struct FilePreviewView: View {
                         store.remove(token, for: target, workspaceRoot: root)
                     }
                 }
-                if loadedURL == target { isSaving = false }
+                if loadedURL == target {
+                    isSaving = false
+                    saveTask = nil
+                }
+                if shouldRetryPendingAutosave {
+                    save(advancePendingAction: true, silently: true)
+                }
                 return
             }
             switch recoveryResult {
@@ -2686,6 +2786,7 @@ struct FilePreviewView: View {
                     payloadTooLarge: payloadTooLarge,
                     richDocument: savingRichDocument
                 )
+                resumePendingActionPrompt()
                 return
             }
 
@@ -2716,22 +2817,55 @@ struct FilePreviewView: View {
                 recoveredDraftPending = false
                 if savingRichDocument { savedRichText = richSnapshot.value }
                 else { savedText = textSnapshot }
-                guard clearRecoveryTokens(for: target) else { return }
+                guard clearRecoveryTokens(for: target) else {
+                    resumePendingActionPrompt()
+                    return
+                }
                 if case .html = content { previewRevision &+= 1 }
                 saveError = nil
                 if !silently {
                     ToastCenter.shared.show("Saved \(target.lastPathComponent)", style: .success)
                 }
-                if advancePendingAction { completePendingAction() }
-                if case .markdown = content, draft != savedText {
+                let completion = FilePreviewNavigationPolicy.saveCompletion(
+                    hasPendingAction: pendingAction != nil
+                        && (advancePendingAction || autosavePendingAction),
+                    isDirty: isDirty,
+                    isMarkdown: isMarkdownContent
+                )
+                switch completion {
+                case .stay:
+                    break
+                case .completePendingAction:
+                    completePendingAction()
+                case .saveLatestDraft:
+                    autosavePendingAction = true
+                    save(advancePendingAction: true, silently: true)
+                case .prompt:
+                    resumePendingActionPrompt()
+                }
+                if completion == .stay, isMarkdownContent, isDirty {
                     scheduleMarkdownAutosave()
                 }
             case .changedOnDisk:
+                autosavePendingAction = false
                 showExternalChangePrompt = true
             case let .failed(message):
                 saveError = message
                 ToastCenter.shared.show(message, style: .error)
+                resumePendingActionPrompt()
             }
+        }
+    }
+
+    /// A failed automatic or user-requested save must not strand AppModel on a
+    /// new selection while the old dirty document remains mounted. Return to
+    /// the explicit Save / Discard / Cancel decision on the next main turn.
+    private func resumePendingActionPrompt() {
+        guard pendingAction != nil else { return }
+        autosavePendingAction = false
+        Task { @MainActor in
+            await Task.yield()
+            if pendingAction != nil { showUnsavedPrompt = true }
         }
     }
 

@@ -26,11 +26,19 @@ enum BrokerGenerationDiagnostics {
 actor BrokerGenerationRouteTable {
     private var topology: BrokerGenerationTopology?
     private var terminalOwners: [String: String] = [:]
+    /// A create reply is authoritative even if an inventory request that began
+    /// just before it finishes afterward. Keep that acknowledged owner until a
+    /// later inventory observes it (or release explicitly removes it), so the
+    /// stale snapshot cannot make the terminal temporarily unroutable.
+    private var createdAwaitingInventory: [String: String] = [:]
 
     func configure(_ topology: BrokerGenerationTopology) {
         self.topology = topology
         let liveGenerations = Set(topology.all.map(\.id))
         terminalOwners = terminalOwners.filter { liveGenerations.contains($0.value) }
+        createdAwaitingInventory = createdAwaitingInventory.filter {
+            liveGenerations.contains($0.value)
+        }
     }
 
     func replaceTerminalOwners(_ owners: [String: String]) throws {
@@ -39,12 +47,33 @@ actor BrokerGenerationRouteTable {
         guard owners.values.allSatisfy(valid.contains) else {
             throw BrokerClientError.identityChanged
         }
-        terminalOwners = owners
+        var reconciled = owners
+        var observedCreates: [String] = []
+        for (terminalID, generationID) in createdAwaitingInventory {
+            if let observed = owners[terminalID] {
+                guard observed == generationID else {
+                    throw BrokerClientError.identityChanged
+                }
+                observedCreates.append(terminalID)
+            } else {
+                reconciled[terminalID] = generationID
+            }
+        }
+        for terminalID in observedCreates {
+            createdAwaitingInventory.removeValue(forKey: terminalID)
+        }
+        terminalOwners = reconciled
     }
 
     func noteCreated(terminalID: String) throws {
         guard let topology else { throw BrokerClientError.notConnected }
         terminalOwners[terminalID] = topology.current.id
+        createdAwaitingInventory[terminalID] = topology.current.id
+    }
+
+    func noteReleased(terminalID: String) {
+        terminalOwners.removeValue(forKey: terminalID)
+        createdAwaitingInventory.removeValue(forKey: terminalID)
     }
 
     func generationID(for terminalID: String, hint: String? = nil) throws -> String {
@@ -367,6 +396,7 @@ actor BrokerGenerationControlRouter: BrokerControlServing {
 
     func release(projectID: String, terminalID: String) async throws {
         try await client(for: terminalID).release(projectID: projectID, terminalID: terminalID)
+        await routes.noteReleased(terminalID: terminalID)
     }
 
     func detachOwner(projectID: String, terminalID: String) async throws {

@@ -137,6 +137,37 @@ final class BrokerGenerationRoutingTests: XCTestCase {
         }
     }
 
+    func testAcknowledgedCreateSurvivesAnOlderInventorySnapshot() async throws {
+        let topology = makeTopology()
+        let routes = BrokerGenerationRouteTable()
+        await routes.configure(topology)
+        try await routes.replaceTerminalOwners(["existing": topology.current.id])
+
+        try await routes.noteCreated(terminalID: "new-terminal")
+        // This response may have been captured before terminal.create was
+        // processed on the other authenticated socket.
+        try await routes.replaceTerminalOwners(["existing": topology.current.id])
+        let routedGenerationID = try await routes.generationID(for: "new-terminal")
+        XCTAssertEqual(routedGenerationID, topology.current.id)
+
+        // Once an inventory observes the terminal, ordinary snapshots own its
+        // lifecycle again; explicit release removes the provisional route.
+        try await routes.replaceTerminalOwners([
+            "existing": topology.current.id,
+            "new-terminal": topology.current.id,
+        ])
+        await routes.noteReleased(terminalID: "new-terminal")
+        do {
+            _ = try await routes.generationID(for: "new-terminal")
+            XCTFail("expected a released terminal route to be removed")
+        } catch {
+            XCTAssertEqual(
+                error as? BrokerClientError,
+                .requestFailed("terminal generation unavailable")
+            )
+        }
+    }
+
     func testEmptyDrainDetachesBothAuthenticatedLanesBeforeRetirement() async throws {
         let topology = makeTopology()
         let currentObserver = RoutingObserverClient(

@@ -425,31 +425,14 @@ struct RootShellView: View {
                     NavigationSidebarResizeAffordance(hovered: sidebarDividerHoveredBinding)
                         .frame(width: NativeWorkspaceChrome.projectSidebarDividerWidth)
                 }
+                // The footer's own 40pt of the boundary is deliberately NOT
+                // covered. A background segment there was measured and does not
+                // work — behind the footer's controls the tracker never receives
+                // `.cursorUpdate` — and an overlay would put an 11pt corridor
+                // straight through the gear and overflow buttons, whose tap
+                // targets start 3pt in from the trailing edge. The corridor runs
+                // the List and the header band; the footer keeps its controls.
                 footer
-                    // …and the footer's own 40pt of the boundary, which the
-                    // List's overlay by construction cannot reach. Left alone,
-                    // the sidebar half of the corridor simply stopped existing
-                    // beside the footer: the pointer showed an arrow on the left
-                    // of the line and a resize cursor on the right of it, which
-                    // is precisely the "not appearing reliably" complaint at the
-                    // bottom of the column.
-                    //
-                    // A BACKGROUND, not an overlay. That is the whole trick, and
-                    // it is what makes this safe where the earlier full-column
-                    // overlay was not: the footer's gear and overflow buttons are
-                    // drawn in front, so they keep every click in the ~20pt band
-                    // they occupy — but a plain SwiftUI button installs no cursor
-                    // rect of its own, so the tracker behind it is still the only
-                    // `.cursorUpdate` region under the pointer and the resize
-                    // cursor runs the full corridor. Dragging works everywhere the
-                    // footer has no control, which is most of its height.
-                    .background(alignment: .trailing) {
-                        NavigationSidebarResizeAffordance(
-                            hovered: sidebarDividerHoveredBinding,
-                            exposesAccessibility: false
-                        )
-                        .frame(width: NativeWorkspaceChrome.projectSidebarDividerWidth)
-                    }
             }
             // Safari's inset sidebar card: the tinted backdrop runs edge to
             // edge behind the column and the navigation content floats on a
@@ -1074,6 +1057,7 @@ struct RootShellView: View {
     private var workspaceRailDivider: some View {
         StablePanelResizeHandle(
             label: "Resize Files",
+            help: "Drag to resize Files; double-click to reset",
             onBegan: settings.beginPanelResize,
             onDelta: { delta in
                 settings.workspaceRailWidth = NativePreviewSettings.clampedWorkspaceRailWidth(
@@ -1085,7 +1069,6 @@ struct RootShellView: View {
                 settings.workspaceRailWidth = NativePreviewSettings.workspaceRailWidthDefault
             }
         )
-        .help("Drag to resize Files; double-click to reset")
         .accessibilityAdjustableAction { direction in
             settings.workspaceRailWidth = NativePreviewSettings.clampedWorkspaceRailWidth(
                 settings.workspaceRailWidth + (direction == .increment ? 16 : -16)
@@ -1096,6 +1079,7 @@ struct RootShellView: View {
     private var filePreviewDivider: some View {
         StablePanelResizeHandle(
             label: "Resize document preview",
+            help: "Drag to resize the document; double-click to reset",
             onBegan: settings.beginPanelResize,
             onDelta: { delta in
                 settings.filePreviewWidth = NativePreviewSettings.clampedFilePreviewWidth(
@@ -1107,7 +1091,6 @@ struct RootShellView: View {
                 settings.filePreviewWidth = NativePreviewSettings.filePreviewWidthDefault
             }
         )
-            .help("Drag to resize the document; double-click to reset")
             .accessibilityAdjustableAction { direction in
                 settings.filePreviewWidth = NativePreviewSettings.clampedFilePreviewWidth(
                     settings.filePreviewWidth + (direction == .increment ? 24 : -24)
@@ -1894,31 +1877,6 @@ private struct PaneResizeHandle: View {
             height: axis == .vertical ? SessionPaneDividerSizing.layoutExtent : nil
         )
         .contentShape(Rectangle())
-        // The cross-axis dimension is left `nil` on purpose: the tracker
-        // stretches to the handle's full length, so the resize cursor and the
-        // drag are live along the ENTIRE divider rather than over a centred
-        // grip. The other axis is the corridor, which overhangs the one-point
-        // rule by `SessionPaneDividerSizing.reach` on each side.
-        .overlay {
-            PaneResizeTrackingView(
-                axis: axis,
-                hoverChanged: { hovered = $0 },
-                dragBegan: {},
-                deltaChanged: onDelta,
-                dragEnded: onEnded,
-                doubleClicked: onDoubleClick
-            )
-            .frame(
-                width: axis == .horizontal ? SessionPaneDividerSizing.hitExtent : nil,
-                height: axis == .vertical ? SessionPaneDividerSizing.hitExtent : nil
-            )
-        }
-        // The corridor overhangs both neighbouring cards, and in a stack a
-        // later sibling is drawn — and hit-tested — above an earlier one. Left
-        // at the default the divider only reached backwards, so half the
-        // corridor was swallowed by the card after it (and by that card's own
-        // I-beam cursor). This lifts the whole handle above both.
-        .zIndex(1)
         .animation(.easeOut(duration: 0.1), value: hovered)
         .focusable()
         .accessibilityElement(children: .ignore)
@@ -1953,6 +1911,39 @@ private struct PaneResizeHandle: View {
         .accessibilityLabel(axis == .horizontal ? "Resize session columns" : "Resize stacked sessions")
         .accessibilityHint("Drag or use arrow keys to resize; double-click to balance panes")
         .help("Drag or use arrow keys to resize; double-click to balance panes")
+        // The tracker goes LAST, under nothing, and that ordering is the fix.
+        //
+        // `.help` installs a real (hit-transparent) AppKit view for the tooltip.
+        // Layered over the tracker, as it was, that view answered for the
+        // corridor's cursor while the drag still fell straight through to the
+        // tracker underneath — so every pane divider was perfectly draggable
+        // and showed a plain arrow the whole time. See `StablePanelResizeHandle`,
+        // which had the same bug from the call site's `.help`.
+        //
+        // The cross-axis dimension is left `nil` on purpose: the tracker
+        // stretches to the handle's full length, so the resize cursor and the
+        // drag are live along the ENTIRE divider rather than over a centred
+        // grip. The other axis is the corridor, which overhangs the one-point
+        // rule by `SessionPaneDividerSizing.reach` on each side.
+        .overlay {
+            PaneResizeTrackingView(
+                axis: axis,
+                hoverChanged: { hovered = $0 },
+                dragBegan: {},
+                deltaChanged: onDelta,
+                dragEnded: onEnded,
+                doubleClicked: onDoubleClick
+            )
+            .frame(
+                width: axis == .horizontal ? SessionPaneDividerSizing.hitExtent : nil,
+                height: axis == .vertical ? SessionPaneDividerSizing.hitExtent : nil
+            )
+        }
+        // The corridor overhangs both neighbouring cards, and in a stack a
+        // later sibling is drawn — and hit-tested — above an earlier one. Left
+        // at the default the divider only reached backwards, so half the
+        // corridor was swallowed by the card after it.
+        .zIndex(1)
     }
 }
 
@@ -2568,6 +2559,9 @@ final class NavigationSidebarAccessibilityElement: NSAccessibilityElement, NSAcc
 /// deltas back into the layout and making rich previews visibly oscillate.
 private struct StablePanelResizeHandle: View {
     let label: String
+    /// Taken as a parameter rather than applied by the caller, so `.help` lands
+    /// UNDER the pointer tracker. See the note on the overlay below.
+    let help: String
     let onBegan: () -> Void
     let onDelta: (CGFloat) -> Void
     let onEnded: () -> Void
@@ -2585,17 +2579,6 @@ private struct StablePanelResizeHandle: View {
         }
         .frame(width: NativeDetailPaneSizing.dividerWidth)
         .contentShape(Rectangle())
-        .overlay {
-            PaneResizeTrackingView(
-                axis: .horizontal,
-                hoverChanged: { hovered = $0 },
-                dragBegan: onBegan,
-                deltaChanged: onDelta,
-                dragEnded: onEnded,
-                doubleClicked: onDoubleClick
-            )
-            .frame(width: NativeDetailPaneSizing.dividerHitWidth)
-        }
         // Same fix `PaneResizeHandle` got in v1.1.7, and for the same reason:
         // the corridor overhangs both neighbours, and in an `HStack` a later
         // sibling is drawn — and hit-tested — above an earlier one. Left at the
@@ -2603,7 +2586,6 @@ private struct StablePanelResizeHandle: View {
         // that follows it, which for the document divider is a text view that
         // sets its own I-beam. That is why the resize cursor appeared on the
         // approach and vanished as the pointer arrived.
-        .zIndex(1)
         .animation(.easeOut(duration: 0.12), value: hovered)
         .focusable()
         .accessibilityElement(children: .ignore)
@@ -2621,6 +2603,30 @@ private struct StablePanelResizeHandle: View {
         }
         .accessibilityHint("Drag or use arrow keys to resize; double-click to reset")
         .accessibilityLabel(label)
+        .help(help)
+        // The tracker goes LAST, under nothing, and that ordering is the fix.
+        //
+        // `.help` installs a real (hit-transparent) AppKit view for the tooltip,
+        // and the call sites applied it AFTER this handle — so it sat in front
+        // of the tracker. The drag still fell through to the tracker underneath,
+        // but the cursor did not: the tooltip view answered for the corridor and
+        // the pointer showed a plain arrow. The document and Files dividers were
+        // fully draggable and never once said so, in every build that has
+        // shipped. Nothing may be layered over the tracker.
+        .overlay {
+            PaneResizeTrackingView(
+                axis: .horizontal,
+                hoverChanged: { hovered = $0 },
+                dragBegan: onBegan,
+                deltaChanged: onDelta,
+                dragEnded: onEnded,
+                doubleClicked: onDoubleClick
+            )
+            .frame(width: NativeDetailPaneSizing.dividerHitWidth)
+        }
+        // The corridor overhangs both neighbours, and in an `HStack` a later
+        // sibling is drawn — and hit-tested — above an earlier one.
+        .zIndex(1)
     }
 }
 
@@ -2658,7 +2664,9 @@ private struct PaneResizeTrackingView: NSViewRepresentable {
         // hover callback below drives one. Re-deriving the cursor while the
         // pointer sits on the divider is what made it flicker between the
         // resize cursor and the arrow. The cursor comes from the tracking
-        // area's `.cursorUpdate` instead.
+        // area's `.cursorUpdate` instead — which is delivered correctly as long
+        // as nothing is layered over the tracker; see the overlay ordering in
+        // `PaneResizeHandle` and `StablePanelResizeHandle`.
     }
 
     final class TrackingView: NSView {

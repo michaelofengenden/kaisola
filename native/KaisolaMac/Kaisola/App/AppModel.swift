@@ -1611,7 +1611,7 @@ final class AppModel: ObservableObject {
                     )
                 }.value
                 reconcileWorkspaceFileMove(from: move.source, to: move.destination)
-                ProjectFileIndex.shared.invalidate()
+                ProjectFileIndex.shared.invalidate(root: workspaceRoot)
                 ToastCenter.shared.show("Renamed to \(destination.lastPathComponent)", style: .success)
             } catch {
                 showWorkspaceMutationError(error, action: "rename")
@@ -1653,7 +1653,7 @@ final class AppModel: ObservableObject {
                 }.value
                 transaction.move = move
                 transaction.removalSnapshot = reconcileWorkspaceFileRemoval(transaction.original)
-                ProjectFileIndex.shared.invalidate()
+                ProjectFileIndex.shared.invalidate(root: root)
                 ToastCenter.shared.show("Moved \(transaction.original.lastPathComponent) to Trash", style: .success)
             } catch {
                 showWorkspaceMutationError(error, action: "move to Trash")
@@ -1690,7 +1690,7 @@ final class AppModel: ObservableObject {
                     try WorkspaceFileOperations.restoreFromTrash(move, workspaceRoot: root)
                 }.value
                 restoreWorkspaceFileRemoval(transaction.removalSnapshot)
-                ProjectFileIndex.shared.invalidate()
+                ProjectFileIndex.shared.invalidate(root: root)
                 ToastCenter.shared.show("Restored \(transaction.original.lastPathComponent)", style: .success)
             } catch {
                 showWorkspaceMutationError(error, action: "restore")

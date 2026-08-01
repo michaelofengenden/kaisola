@@ -348,6 +348,7 @@ enum WorkspaceFileOperations {
 /// Directory listing + project file enumeration for the workspace rail and the
 /// command palette's file search. Pure filesystem logic, testable directly.
 enum ProjectFiles {
+    static let defaultFileLimit = 3_000
     /// Fuzzy search needs useful coverage, not an unbounded repository crawl.
     /// These limits are deliberately much larger than the result limit so a
     /// project with many folders still has a representative index while a
@@ -398,7 +399,7 @@ enum ProjectFiles {
     /// tree cannot stall the palette. Returns project-relative paths.
     static func enumerate(
         root: URL,
-        limit: Int = 3_000,
+        limit: Int = defaultFileLimit,
         directoryLimit: Int = defaultDirectoryLimit,
         visitLimit: Int = defaultVisitLimit,
         isCancelled: () -> Bool = { Task.isCancelled }
@@ -444,6 +445,96 @@ enum ProjectFiles {
         }
         return results
     }
+
+    /// Reconcile a cached project-relative file list against a bounded set of
+    /// exact FSEvents paths. Only changed files/directories are inspected; an
+    /// event for the root itself returns `nil` so the caller can fall back to a
+    /// complete bounded walk. Removed paths prune their whole cached subtree,
+    /// while a new/changed directory contributes only its own bounded subtree.
+    static func updatingIndex(
+        _ existing: [String],
+        root: URL,
+        changedPaths: [URL],
+        limit: Int = defaultFileLimit,
+        directoryLimit: Int = defaultDirectoryLimit,
+        visitLimit: Int = defaultVisitLimit,
+        isCancelled: () -> Bool = { Task.isCancelled }
+    ) -> [String]? {
+        guard limit > 0, !isCancelled() else { return [] }
+        let normalizedRoot = root.standardizedFileURL
+        let rootPath = normalizedRoot.path
+        var relativeChanges: Set<String> = []
+        for changedPath in changedPaths {
+            guard !isCancelled() else { return [] }
+            let path = changedPath.standardizedFileURL.path
+            if path == rootPath { return nil }
+            guard path.hasPrefix(rootPath + "/") else { continue }
+            let relative = String(path.dropFirst(rootPath.count + 1))
+            guard isIndexableRelativePath(relative) else { continue }
+            relativeChanges.insert(relative)
+        }
+        guard !relativeChanges.isEmpty else { return existing }
+
+        var files = Set(existing)
+        let orderedChanges = relativeChanges.sorted {
+            $0.localizedStandardCompare($1) == .orderedAscending
+        }
+        for relative in orderedChanges {
+            let prefix = relative + "/"
+            files = Set(files.filter { $0 != relative && !$0.hasPrefix(prefix) })
+        }
+
+        var additions: [String] = []
+        additions.reserveCapacity(min(limit, 256))
+        for relative in orderedChanges where additions.count < limit {
+            guard !isCancelled() else { return [] }
+            let candidate = normalizedRoot.appendingPathComponent(relative).standardizedFileURL
+            var isDirectory: ObjCBool = false
+            guard FileManager.default.fileExists(atPath: candidate.path, isDirectory: &isDirectory),
+                  isSafeIndexCandidate(candidate, root: normalizedRoot) else { continue }
+            if isDirectory.boolValue {
+                let remaining = limit - additions.count
+                additions.append(contentsOf: enumerate(
+                    root: candidate,
+                    limit: remaining,
+                    directoryLimit: directoryLimit,
+                    visitLimit: visitLimit,
+                    isCancelled: isCancelled
+                ).map { relative + "/" + $0 })
+            } else {
+                additions.append(relative)
+            }
+        }
+        files.formUnion(additions)
+        return Array(files).sorted {
+            $0.localizedStandardCompare($1) == .orderedAscending
+        }.prefix(limit).map { $0 }
+    }
+
+    private static func isIndexableRelativePath(_ path: String) -> Bool {
+        let components = path.split(separator: "/", omittingEmptySubsequences: false)
+        guard !components.isEmpty else { return false }
+        return components.allSatisfy { component in
+            !component.isEmpty
+                && component != "."
+                && component != ".."
+                && !component.hasPrefix(".")
+                && !ignoredNames.contains(String(component))
+        }
+    }
+
+    private static func isSafeIndexCandidate(_ candidate: URL, root: URL) -> Bool {
+        let rootPath = root.standardizedFileURL.path
+        let candidatePath = candidate.standardizedFileURL.path
+        guard candidatePath.hasPrefix(rootPath + "/") else { return false }
+        var cursor = root
+        for component in candidatePath.dropFirst(rootPath.count + 1).split(separator: "/") {
+            cursor.appendPathComponent(String(component))
+            let values = try? cursor.resourceValues(forKeys: [.isSymbolicLinkKey])
+            if values?.isSymbolicLink == true { return false }
+        }
+        return true
+    }
 }
 
 /// A small TTL cache of project file lists so the palette doesn't re-walk the
@@ -457,13 +548,19 @@ final class ProjectFileIndex {
         let task: Task<[String], Never>
     }
 
+    private struct PendingInvalidation {
+        var paths: Set<String> = []
+        var requiresFullRefresh = false
+    }
+
     private var cache: [String: (at: Date, files: [String])] = [:]
     private var inFlight: [String: InFlightWalk] = [:]
     /// A replacement walk waits for its canceled predecessor to finish. The
     /// production enumerator cooperates promptly, and the ordering guarantee
     /// ensures invalidation can never create overlapping crawls of one root.
     private var retiring: [String: Task<[String], Never>] = [:]
-    private var generation = 0
+    private var generationByRoot: [String: Int] = [:]
+    private var pendingInvalidations: [String: PendingInvalidation] = [:]
     private let enumerateFiles: @Sendable (URL) -> [String]
 
     init(
@@ -476,20 +573,23 @@ final class ProjectFileIndex {
 
     func files(for root: URL, now: Date = Date()) async -> [String] {
         let key = root.standardizedFileURL.path
-        if let cached = cache[key], now.timeIntervalSince(cached.at) < 30 {
+        if pendingInvalidations[key] == nil,
+           let cached = cache[key], now.timeIntervalSince(cached.at) < 30 {
             return cached.files
         }
         if let existing = inFlight[key] {
-            let joinedGeneration = generation
+            let joinedGeneration = generationByRoot[key, default: 0]
             let files = await existing.task.value
-            if joinedGeneration == generation, !existing.task.isCancelled {
+            if joinedGeneration == generationByRoot[key, default: 0], !existing.task.isCancelled {
                 return files
             }
             guard !Task.isCancelled else { return [] }
             return await self.files(for: root)
         }
-        let currentGeneration = generation
+        let currentGeneration = generationByRoot[key, default: 0]
         let predecessor = retiring.removeValue(forKey: key)
+        let invalidation = pendingInvalidations.removeValue(forKey: key)
+        let cachedFiles = cache[key]?.files
         let walkID = UUID()
         let enumerateFiles = self.enumerateFiles
         let task: Task<[String], Never> = Task.detached(priority: .utility) {
@@ -497,6 +597,18 @@ final class ProjectFileIndex {
                 _ = await predecessor.value
             }
             guard !Task.isCancelled else { return [] }
+            if let invalidation,
+               !invalidation.requiresFullRefresh,
+               let cachedFiles {
+                let paths = invalidation.paths.map { URL(fileURLWithPath: $0) }
+                if let files = ProjectFiles.updatingIndex(
+                    cachedFiles,
+                    root: root,
+                    changedPaths: paths
+                ) {
+                    return files
+                }
+            }
             return enumerateFiles(root)
         }
         inFlight[key] = InFlightWalk(id: walkID, task: task)
@@ -507,7 +619,9 @@ final class ProjectFileIndex {
         if stillOwnsSlot {
             inFlight[key] = nil
         }
-        if stillOwnsSlot, generation == currentGeneration, !task.isCancelled {
+        if stillOwnsSlot,
+           generationByRoot[key, default: 0] == currentGeneration,
+           !task.isCancelled {
             cache[key] = (now, files)
             return files
         }
@@ -518,13 +632,51 @@ final class ProjectFileIndex {
     }
 
     func invalidate() {
-        generation &+= 1
-        for (key, walk) in inFlight {
+        let keys = Set(cache.keys)
+            .union(inFlight.keys)
+            .union(pendingInvalidations.keys)
+        for key in keys {
+            invalidateKey(key, changedPaths: [], requiresFullRefresh: true)
+        }
+    }
+
+    /// Invalidate one project only. Detailed watcher paths preserve a valid
+    /// cached index and patch just those subtrees on its next read; overflow or
+    /// root-level events deliberately request a complete bounded replacement.
+    func invalidate(
+        root: URL,
+        changedPaths: [URL] = [],
+        requiresFullRefresh: Bool = true
+    ) {
+        invalidateKey(
+            root.standardizedFileURL.path,
+            changedPaths: changedPaths.map { $0.standardizedFileURL.path },
+            requiresFullRefresh: requiresFullRefresh
+        )
+    }
+
+    private func invalidateKey(
+        _ key: String,
+        changedPaths: [String],
+        requiresFullRefresh: Bool
+    ) {
+        generationByRoot[key, default: 0] &+= 1
+        let replacedInFlightWork = inFlight[key] != nil
+        if let walk = inFlight.removeValue(forKey: key) {
             walk.task.cancel()
             retiring[key] = walk.task
         }
-        inFlight.removeAll()
-        cache.removeAll()
+        // The paths owned by a canceled patch have already been removed from
+        // `pendingInvalidations`; a full replacement is the only safe way to
+        // avoid losing them when another event arrives mid-patch.
+        if requiresFullRefresh || replacedInFlightWork || cache[key] == nil {
+            cache[key] = nil
+            pendingInvalidations[key] = PendingInvalidation(requiresFullRefresh: true)
+            return
+        }
+        var pending = pendingInvalidations[key] ?? PendingInvalidation()
+        pending.paths.formUnion(changedPaths)
+        pendingInvalidations[key] = pending
     }
 }
 
@@ -584,6 +736,53 @@ final class WorkspaceTreeModel: ObservableObject {
         // agent filesystem event.
         loadingDirectories.removeAll()
         for directory in [root] + expandedDirectories { load(directory, force: true) }
+    }
+
+    /// Re-list only directories whose immediate contents may have changed.
+    /// Unrelated expanded folders keep both their snapshot and any in-flight
+    /// work, which prevents one source-file write from scaling with the number
+    /// of open folders in a large repository.
+    func refresh(
+        changeBatch: WorkspaceChangeBatch,
+        expandedDirectories: [URL]
+    ) {
+        guard !changeBatch.requiresFullRefresh, !changeBatch.paths.isEmpty else {
+            refresh(expandedDirectories: expandedDirectories)
+            return
+        }
+        let rootPath = root.path
+        let loaded = Set(childrenByDirectory.keys)
+        var affected: Set<String> = []
+        var removedSubtrees: Set<String> = []
+        for changedURL in changeBatch.paths {
+            let changed = changedURL.standardizedFileURL
+            let path = changed.path
+            guard path.hasPrefix(rootPath + "/") else { continue }
+            let parent = changed.deletingLastPathComponent().path
+            if loaded.contains(parent) { affected.insert(parent) }
+            if loaded.contains(path) { affected.insert(path) }
+            if !FileManager.default.fileExists(atPath: path) {
+                removedSubtrees.insert(path)
+            }
+        }
+
+        for removed in removedSubtrees {
+            let prefix = removed + "/"
+            let staleKeys = childrenByDirectory.keys.filter {
+                $0 == removed || $0.hasPrefix(prefix)
+            }
+            for key in staleKeys {
+                childrenByDirectory[key] = nil
+                directoryTasks[key]?.cancel()
+                directoryTasks[key] = nil
+                loadingDirectories.remove(key)
+                affected.remove(key)
+            }
+        }
+        for key in affected {
+            directoryTasks[key]?.cancel()
+            load(URL(fileURLWithPath: key, isDirectory: true), force: true)
+        }
     }
 
     func search(_ rawQuery: String) {

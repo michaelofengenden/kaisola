@@ -577,6 +577,54 @@ final class WorkspaceFilesTests: XCTestCase {
         XCTAssertLessThan(files.count, 21)
     }
 
+    func testDetailedChangesPatchOnlyAffectedIndexSubtrees() throws {
+        let original = ProjectFiles.enumerate(root: root)
+        let added = root.appendingPathComponent("src/new.swift")
+        try "new".write(to: added, atomically: true, encoding: .utf8)
+        let hidden = root.appendingPathComponent("src/.generated.swift")
+        try "hidden".write(to: hidden, atomically: true, encoding: .utf8)
+
+        let updated = try XCTUnwrap(ProjectFiles.updatingIndex(
+            original,
+            root: root,
+            changedPaths: [root.appendingPathComponent("src", isDirectory: true)]
+        ))
+        XCTAssertEqual(Set(updated), ["README.md", "src/main.swift", "src/new.swift"])
+
+        try FileManager.default.removeItem(at: root.appendingPathComponent("README.md"))
+        let afterRemoval = try XCTUnwrap(ProjectFiles.updatingIndex(
+            updated,
+            root: root,
+            changedPaths: [root.appendingPathComponent("README.md")]
+        ))
+        XCTAssertEqual(Set(afterRemoval), ["src/main.swift", "src/new.swift"])
+        XCTAssertNil(ProjectFiles.updatingIndex(
+            afterRemoval,
+            root: root,
+            changedPaths: [root]
+        ), "a root event must request a complete bounded walk")
+    }
+
+    @MainActor
+    func testDetailedIndexInvalidationAvoidsASecondRepositoryWalk() async throws {
+        let probe = ProjectFileIndexStaticProbe(files: ProjectFiles.enumerate(root: root))
+        let index = ProjectFileIndex(enumerateFiles: probe.enumerate)
+        _ = await index.files(for: root)
+        XCTAssertEqual(probe.startedCount, 1)
+
+        let added = root.appendingPathComponent("src/targeted.swift")
+        try "targeted".write(to: added, atomically: true, encoding: .utf8)
+        index.invalidate(
+            root: root,
+            changedPaths: [added],
+            requiresFullRefresh: false
+        )
+
+        let updated = await index.files(for: root)
+        XCTAssertTrue(updated.contains("src/targeted.swift"))
+        XCTAssertEqual(probe.startedCount, 1, "an exact file event should patch the cached index")
+    }
+
     @MainActor
     func testInvalidationSerializesReplacementWalkAndCachesOnlyReplacement() async {
         let probe = ProjectFileIndexProbe()
@@ -2409,6 +2457,25 @@ private final class ProjectFileIndexProbe: @unchecked Sendable {
             activeWalks -= 1
         }
         return ["walk-\(sequence)"]
+    }
+}
+
+private final class ProjectFileIndexStaticProbe: @unchecked Sendable {
+    private let lock = NSLock()
+    private let files: [String]
+    private var starts = 0
+
+    init(files: [String]) {
+        self.files = files
+    }
+
+    var startedCount: Int {
+        lock.withLock { starts }
+    }
+
+    func enumerate(_ root: URL) -> [String] {
+        lock.withLock { starts += 1 }
+        return files
     }
 }
 

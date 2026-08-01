@@ -2,6 +2,21 @@ import Combine
 import CoreServices
 import Foundation
 
+/// One debounced, bounded set of exact workspace paths. Consumers may refresh
+/// only affected directories; `requiresFullRefresh` is the correctness fallback
+/// for dropped/coalesced events, a root event, or a path-count overflow.
+struct WorkspaceChangeBatch: Equatable, Sendable {
+    let token: Int
+    let paths: [URL]
+    let requiresFullRefresh: Bool
+
+    static let empty = WorkspaceChangeBatch(
+        token: 0,
+        paths: [],
+        requiresFullRefresh: false
+    )
+}
+
 /// Live filesystem watching for the workspace rail (`WorkspaceRailView`).
 ///
 /// Agents write files constantly, but the tree previously only refreshed on a
@@ -36,6 +51,7 @@ final class WorkspaceWatcher: ObservableObject {
     /// Advanced (never reset) whenever a relevant change settles. Observers key
     /// their refresh off the change in value; the exact number is meaningless.
     @Published private(set) var changeToken: Int = 0
+    @Published private(set) var changeBatch: WorkspaceChangeBatch = .empty
 
     private let root: URL
 
@@ -49,6 +65,8 @@ final class WorkspaceWatcher: ObservableObject {
     /// The pending trailing-edge debounce. Non-nil means a bump is already
     /// scheduled for the current window, so further events are absorbed.
     private var pendingBump: Task<Void, Never>?
+    private var pendingPaths: Set<String> = []
+    private var pendingRequiresFullRefresh = false
 
     /// FSEvents coalescing latency: the OS batches raw notifications over this
     /// window before delivering a callback.
@@ -57,6 +75,7 @@ final class WorkspaceWatcher: ObservableObject {
     /// Trailing debounce applied on top of the FSEvents latency, capping the
     /// bump rate at ≤1 per this interval.
     private static let debounceNanoseconds: UInt64 = 700_000_000
+    static let maximumDetailedPaths = 256
 
     init(root: URL) {
         self.root = root.standardizedFileURL
@@ -78,6 +97,8 @@ final class WorkspaceWatcher: ObservableObject {
     func stop() {
         pendingBump?.cancel()
         pendingBump = nil
+        pendingPaths.removeAll()
+        pendingRequiresFullRefresh = false
         teardownStream()
     }
 
@@ -94,6 +115,21 @@ final class WorkspaceWatcher: ObservableObject {
             return false
         }
         return true
+    }
+
+    /// FSEvents explicitly tells clients when its detail stream is incomplete.
+    /// Those batches must never drive targeted invalidation.
+    nonisolated static func requiresFullRefresh(
+        flags: [FSEventStreamEventFlags]
+    ) -> Bool {
+        let unsafeFlags = FSEventStreamEventFlags(
+            kFSEventStreamEventFlagMustScanSubDirs
+                | kFSEventStreamEventFlagUserDropped
+                | kFSEventStreamEventFlagKernelDropped
+                | kFSEventStreamEventFlagEventIdsWrapped
+                | kFSEventStreamEventFlagRootChanged
+        )
+        return flags.contains { $0 & unsafeFlags != 0 }
     }
 
     // MARK: - FSEvents lifecycle
@@ -146,21 +182,46 @@ final class WorkspaceWatcher: ObservableObject {
     /// MainActor. Capturing `watcher` across the hop is safe: a `@MainActor`
     /// class is implicitly `Sendable`, and the strong capture keeps it alive for
     /// the (brief) duration of the hop.
-    private static let eventCallback: FSEventStreamCallback = { _, info, _, eventPaths, _, _ in
+    private static let eventCallback: FSEventStreamCallback = {
+        _, info, eventCount, eventPaths, eventFlags, _ in
         guard let info else { return }
         let watcher = Unmanaged<WorkspaceWatcher>.fromOpaque(info).takeUnretainedValue()
         // With kFSEventStreamCreateFlagUseCFTypes the payload is a CFArray of
         // CFString, toll-free bridged to [String].
         let paths = (unsafeBitCast(eventPaths, to: NSArray.self) as? [String]) ?? []
+        let flags = Array(UnsafeBufferPointer(
+            start: eventFlags,
+            count: Int(eventCount)
+        ))
         Task { @MainActor in
-            watcher.ingest(paths)
+            watcher.ingest(paths, flags: flags)
         }
     }
 
     /// Called on the MainActor for each delivered batch. Drops batches whose
     /// paths are all ignored, otherwise arms the debounce.
-    private func ingest(_ paths: [String]) {
-        guard paths.contains(where: { Self.isRelevant(path: $0) }) else { return }
+    private func ingest(
+        _ paths: [String],
+        flags: [FSEventStreamEventFlags]
+    ) {
+        if Self.requiresFullRefresh(flags: flags) {
+            pendingRequiresFullRefresh = true
+            pendingPaths.removeAll(keepingCapacity: true)
+            scheduleBump()
+            return
+        }
+        let rootPath = root.path
+        for rawPath in paths where Self.isRelevant(path: rawPath) {
+            let path = URL(fileURLWithPath: rawPath).standardizedFileURL.path
+            guard path == rootPath || path.hasPrefix(rootPath + "/") else { continue }
+            if path == rootPath || pendingPaths.count >= Self.maximumDetailedPaths {
+                pendingRequiresFullRefresh = true
+                pendingPaths.removeAll(keepingCapacity: true)
+                break
+            }
+            pendingPaths.insert(path)
+        }
+        guard pendingRequiresFullRefresh || !pendingPaths.isEmpty else { return }
         scheduleBump()
     }
 
@@ -179,9 +240,25 @@ final class WorkspaceWatcher: ObservableObject {
     }
 
     private func bump() {
-        // Keep the command palette's fuzzy file index in step with the tree so
-        // palette file search stays fresh alongside the rail.
-        ProjectFileIndex.shared.invalidate()
         changeToken &+= 1
+        let paths = pendingPaths.sorted {
+            $0.localizedStandardCompare($1) == .orderedAscending
+        }.map { URL(fileURLWithPath: $0).standardizedFileURL }
+        let requiresFullRefresh = pendingRequiresFullRefresh
+        pendingPaths.removeAll(keepingCapacity: true)
+        pendingRequiresFullRefresh = false
+
+        // Keep the palette index in step without throwing away cached indexes
+        // for other projects or crawling this entire project after one edit.
+        ProjectFileIndex.shared.invalidate(
+            root: root,
+            changedPaths: paths,
+            requiresFullRefresh: requiresFullRefresh
+        )
+        changeBatch = WorkspaceChangeBatch(
+            token: changeToken,
+            paths: paths,
+            requiresFullRefresh: requiresFullRefresh
+        )
     }
 }

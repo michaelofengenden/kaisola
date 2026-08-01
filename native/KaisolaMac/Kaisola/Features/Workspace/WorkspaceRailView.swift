@@ -204,8 +204,11 @@ struct WorkspaceRailView: View {
             revealSelection()
         }
         .onChange(of: searchText) { _, query in tree.search(query) }
-        .onChange(of: watcher.changeToken) { _, _ in
-            tree.refresh(expandedDirectories: expanded.map { URL(fileURLWithPath: $0, isDirectory: true) })
+        .onChange(of: watcher.changeBatch) { _, batch in
+            tree.refresh(
+                changeBatch: batch,
+                expandedDirectories: expanded.map { URL(fileURLWithPath: $0, isDirectory: true) }
+            )
             tree.search(searchText)
         }
         .contextMenu {
@@ -219,7 +222,7 @@ struct WorkspaceRailView: View {
                 let target = root.appendingPathComponent("AGENTS.md")
                 if !FileManager.default.fileExists(atPath: target.path) {
                     try? Self.agentsTemplate.write(to: target, atomically: true, encoding: .utf8)
-                    ProjectFileIndex.shared.invalidate()
+                    ProjectFileIndex.shared.invalidate(root: root)
                     tree.refresh(expandedDirectories: expanded.map { URL(fileURLWithPath: $0, isDirectory: true) })
                 }
                 openFile(target, true)
@@ -283,7 +286,7 @@ struct WorkspaceRailView: View {
     }
 
     private func refresh() {
-        ProjectFileIndex.shared.invalidate()
+        ProjectFileIndex.shared.invalidate(root: root)
         tree.refresh(expandedDirectories: expanded.map { URL(fileURLWithPath: $0, isDirectory: true) })
         tree.search(searchText)
     }

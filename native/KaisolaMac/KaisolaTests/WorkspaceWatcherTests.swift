@@ -1,3 +1,4 @@
+import CoreServices
 import Foundation
 import XCTest
 @testable import Kaisola
@@ -47,6 +48,18 @@ final class WorkspaceWatcherTests: XCTestCase {
         XCTAssertTrue(WorkspaceWatcher.isRelevant(path: "/proj/rebuild/tool.swift"))
     }
 
+    func testDroppedOrRootChangedEventsRequireFullRefresh() {
+        XCTAssertFalse(WorkspaceWatcher.requiresFullRefresh(flags: [
+            FSEventStreamEventFlags(kFSEventStreamEventFlagItemModified),
+        ]))
+        XCTAssertTrue(WorkspaceWatcher.requiresFullRefresh(flags: [
+            FSEventStreamEventFlags(kFSEventStreamEventFlagKernelDropped),
+        ]))
+        XCTAssertTrue(WorkspaceWatcher.requiresFullRefresh(flags: [
+            FSEventStreamEventFlags(kFSEventStreamEventFlagRootChanged),
+        ]))
+    }
+
     // MARK: - Live: FSEvents round-trip
 
     @MainActor
@@ -64,6 +77,13 @@ final class WorkspaceWatcherTests: XCTestCase {
         )
         let bumped = pump(until: { watcher.changeToken > 0 }, timeout: 3.0)
         XCTAssertTrue(bumped, "a relevant write should bump changeToken within 3s")
+        if bumped {
+            XCTAssertEqual(watcher.changeBatch.token, watcher.changeToken)
+            XCTAssertFalse(watcher.changeBatch.requiresFullRefresh)
+            XCTAssertTrue(watcher.changeBatch.paths.contains {
+                $0.lastPathComponent == "live.swift"
+            })
+        }
 
         // Negative path (deliberately lenient): a write under node_modules must
         // not bump. This is only meaningful if the positive machinery actually

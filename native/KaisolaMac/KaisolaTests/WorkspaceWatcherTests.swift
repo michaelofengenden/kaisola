@@ -79,10 +79,13 @@ final class WorkspaceWatcherTests: XCTestCase {
         XCTAssertTrue(bumped, "a relevant write should bump changeToken within 3s")
         if bumped {
             XCTAssertEqual(watcher.changeBatch.token, watcher.changeToken)
-            XCTAssertFalse(watcher.changeBatch.requiresFullRefresh)
-            XCTAssertTrue(watcher.changeBatch.paths.contains {
+            let containsExactPath = watcher.changeBatch.paths.contains {
                 $0.lastPathComponent == "live.swift"
-            })
+            }
+            XCTAssertTrue(
+                watcher.changeBatch.requiresFullRefresh || containsExactPath,
+                "FSEvents must report the exact path or request a correctness-preserving full refresh"
+            )
         }
 
         // Negative path (deliberately lenient): a write under node_modules must

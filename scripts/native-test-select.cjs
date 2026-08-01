@@ -109,6 +109,7 @@ const NATIVE_FILE_TESTS = Object.freeze(new Map([
   ['native/KaisolaMac/Kaisola/Features/Workspace/FilePreviewRecovery.swift', FILE_PREVIEW_TESTS],
   ['native/KaisolaMac/Kaisola/Features/Workspace/FilePreviewTabs.swift', FILE_PREVIEW_TESTS],
   ['native/KaisolaMac/Kaisola/Features/Workspace/CodeEditorView.swift', CODE_EDITOR_TESTS],
+  ['native/KaisolaMac/Kaisola/Features/Workspace/SourceOutline.swift', CODE_EDITOR_TESTS],
   ['native/KaisolaMac/Kaisola/Features/Workspace/FilePreviewView.swift', [
     ...FILE_PREVIEW_TESTS, 'CodeEditorViewTests',
   ]],

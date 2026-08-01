@@ -60,6 +60,12 @@ enum CodeEditorLineSeparator: String, Equatable, Sendable {
     }
 }
 
+enum FileEditorLineTarget {
+    static func key(documentID: String, line: Int, navigationRevision: UInt64) -> String {
+        "\(documentID)|\(line)|\(navigationRevision)"
+    }
+}
+
 /// The editor page is not a file URL and never receives workspace read access.
 /// Its private scheme serves exactly the two immutable runtime assets below.
 enum CodeEditorAssetPolicy {
@@ -237,6 +243,7 @@ struct CodeEditorView: NSViewRepresentable {
     @Binding var text: String
     let fileURL: URL
     let targetLine: Int?
+    var navigationRevision: UInt64 = 0
     let fontSize: CGFloat
     let colorScheme: ColorScheme
     let undoManager: UndoManager?
@@ -270,6 +277,7 @@ struct CodeEditorView: NSViewRepresentable {
             binding: $text,
             fileURL: fileURL,
             targetLine: targetLine,
+            navigationRevision: navigationRevision,
             fontSize: fontSize,
             colorScheme: colorScheme,
             undoManager: undoManager,
@@ -285,6 +293,7 @@ struct CodeEditorView: NSViewRepresentable {
             binding: $text,
             fileURL: fileURL,
             targetLine: targetLine,
+            navigationRevision: navigationRevision,
             fontSize: fontSize,
             colorScheme: colorScheme,
             undoManager: undoManager,
@@ -325,6 +334,7 @@ struct CodeEditorView: NSViewRepresentable {
         private var documentID = ""
         private var documentToken = UUID().uuidString.lowercased()
         private var targetLine: Int?
+        private var navigationRevision: UInt64 = 0
         private var fontSize: CGFloat = 13
         private var colorScheme: ColorScheme = .light
         private var suppliedUndoManager: UndoManager?
@@ -355,6 +365,7 @@ struct CodeEditorView: NSViewRepresentable {
             binding: Binding<String>,
             fileURL: URL,
             targetLine: Int?,
+            navigationRevision: UInt64,
             fontSize: CGFloat,
             colorScheme: ColorScheme,
             undoManager: UndoManager?,
@@ -367,6 +378,7 @@ struct CodeEditorView: NSViewRepresentable {
                 binding: binding,
                 fileURL: fileURL,
                 targetLine: targetLine,
+                navigationRevision: navigationRevision,
                 fontSize: fontSize,
                 colorScheme: colorScheme,
                 undoManager: undoManager,
@@ -379,6 +391,7 @@ struct CodeEditorView: NSViewRepresentable {
             binding: Binding<String>,
             fileURL: URL,
             targetLine: Int?,
+            navigationRevision: UInt64,
             fontSize: CGFloat,
             colorScheme: ColorScheme,
             undoManager: UndoManager?,
@@ -387,6 +400,7 @@ struct CodeEditorView: NSViewRepresentable {
         ) {
             textBinding = binding
             self.targetLine = targetLine
+            self.navigationRevision = navigationRevision
             self.fontSize = fontSize
             self.colorScheme = colorScheme
             suppliedUndoManager = undoManager
@@ -538,7 +552,11 @@ struct CodeEditorView: NSViewRepresentable {
             guard let targetLine, targetLine > 0 else { return nil }
             // A citation owns the initial route only. Including document length
             // here would snap the caret back to that line after every edit.
-            let key = "\(documentID)|\(targetLine)"
+            let key = FileEditorLineTarget.key(
+                documentID: documentID,
+                line: targetLine,
+                navigationRevision: navigationRevision
+            )
             guard key != lastLineTargetKey else { return nil }
             lastLineTargetKey = key
             return targetLine

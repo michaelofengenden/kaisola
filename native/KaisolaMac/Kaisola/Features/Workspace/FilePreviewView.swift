@@ -108,6 +108,10 @@ struct FilePreviewView: View {
     @State private var saveTask: Task<Void, Never>?
     @State private var markdownAutosaveTask: Task<Void, Never>?
     @State private var highlightTask: Task<Void, Never>?
+    @State private var outlineTask: Task<Void, Never>?
+    @State private var outlineItems: [SourceOutlineItem] = []
+    @State private var outlineTargetLine: Int?
+    @State private var outlineNavigationRevision: UInt64 = 0
     @State private var recoveryJournalTask: Task<Void, Never>?
     @State private var documentZoom: CGFloat = 1
     @State private var previewRevision = 0
@@ -206,6 +210,8 @@ struct FilePreviewView: View {
         }
         .onChange(of: targetLine) { _, newLine in
             guard newLine != nil else { return }
+            outlineTargetLine = nil
+            outlineNavigationRevision &+= 1
             if case .text = content { isEditingText = true }
             if case .html = content { isEditingText = true }
             if case .markdown = content { showMarkdownSource = false }
@@ -222,6 +228,7 @@ struct FilePreviewView: View {
                 return
             }
             if !isEditingText { refreshHighlight() }
+            scheduleOutlineRefresh()
             if draft == savedText, !recoveredDraftPending, let loadedURL {
                 clearRecoveryTokens(for: loadedURL)
             }
@@ -265,6 +272,7 @@ struct FilePreviewView: View {
             loadTask?.cancel()
             markdownAutosaveTask?.cancel()
             highlightTask?.cancel()
+            outlineTask?.cancel()
             recoveryJournalTask?.cancel()
             releaseRecoveryClaims()
             FilePreviewRecoveryOwnerRegistry.shared.unregister(recoveryOwnerID)
@@ -432,6 +440,9 @@ struct FilePreviewView: View {
                     .accessibilityLabel("Unsaved changes")
             }
             if isLoading || isSaving { ProgressView().controlSize(.mini) }
+            if !outlineItems.isEmpty {
+                outlineMenu
+            }
             if case .markdown = content {
                 Button { showMarkdownSource.toggle() } label: {
                     Image(systemName: showMarkdownSource ? "doc.richtext.fill" : "pencil")
@@ -605,6 +616,46 @@ struct FilePreviewView: View {
         }
         .buttonStyle(.borderless)
         .help(isEditingText ? "Show preview" : help)
+    }
+
+    private var outlineMenu: some View {
+        Menu {
+            ForEach(outlineItems) { item in
+                Button {
+                    navigate(to: item)
+                } label: {
+                    Label(
+                        outlineTitle(for: item),
+                        systemImage: item.kind.systemImage
+                    )
+                }
+            }
+        } label: {
+            Image(systemName: "list.bullet.indent")
+        }
+        .menuStyle(.borderlessButton)
+        .menuIndicator(.hidden)
+        .fixedSize()
+        .help("Jump to a symbol or heading")
+        .accessibilityLabel("Document outline")
+    }
+
+    private func outlineTitle(for item: SourceOutlineItem) -> String {
+        let indentation = String(repeating: "\u{2003}", count: max(0, min(5, item.depth - 1)))
+        return "\(indentation)\(item.title) — line \(item.line)"
+    }
+
+    private func navigate(to item: SourceOutlineItem) {
+        outlineTargetLine = item.line
+        outlineNavigationRevision &+= 1
+        switch content {
+        case .markdown:
+            showMarkdownSource = true
+        case .text, .html:
+            isEditingText = true
+        default:
+            break
+        }
     }
 
     private var previewOptionsMenu: some View {
@@ -843,7 +894,8 @@ struct FilePreviewView: View {
                 LineTargetTextEditor(
                     text: $draft,
                     fontSize: 13,
-                    targetLine: targetLine,
+                    targetLine: editorTargetLine,
+                    navigationRevision: outlineNavigationRevision,
                     documentID: editableMarkdownURL.path,
                     markdownURL: editableMarkdownURL,
                     workspaceRoot: workspaceRoot,
@@ -856,7 +908,8 @@ struct FilePreviewView: View {
                 CodeEditorView(
                     text: $draft,
                     fileURL: loadedURL ?? url,
-                    targetLine: targetLine,
+                    targetLine: editorTargetLine,
+                    navigationRevision: outlineNavigationRevision,
                     fontSize: 13 * documentZoom,
                     colorScheme: colorScheme,
                     undoManager: undoManager,
@@ -872,16 +925,24 @@ struct FilePreviewView: View {
         return loadedURL ?? url
     }
 
+    private var editorTargetLine: Int? {
+        outlineTargetLine ?? targetLine
+    }
+
     private func beginLoad(_ target: URL) {
         loadTask?.cancel()
         markdownAutosaveTask?.cancel()
         highlightTask?.cancel()
+        outlineTask?.cancel()
         recoveryJournalTask?.cancel()
         recoveryGeneration &+= 1
         releaseRecoveryClaims()
         loadingURL = target
         isLoading = true
         previewNotice = nil
+        outlineItems = []
+        outlineTargetLine = nil
+        outlineNavigationRevision &+= 1
         externalChangeDetected = false
         recoveredDraftPending = false
         ownedRecoveryToken = nil
@@ -1032,6 +1093,7 @@ struct FilePreviewView: View {
             previewRevision &+= 1
             isLoading = false
             refreshHighlight()
+            scheduleOutlineRefresh()
             navigationCommitted(target)
         }
     }
@@ -1089,6 +1151,32 @@ struct FilePreviewView: View {
             }.value
             guard !Task.isCancelled, source == draft else { return }
             highlightedSource = rendered
+        }
+    }
+
+    /// Rebuild the native outline after a short typing debounce. Parsing stays
+    /// off the MainActor and is bounded by both line and item count.
+    private func scheduleOutlineRefresh() {
+        outlineTask?.cancel()
+        switch content {
+        case .text, .markdown, .html:
+            break
+        default:
+            outlineItems = []
+            return
+        }
+        let source = draft
+        let fileURL = (loadedURL ?? url).standardizedFileURL
+        outlineTask = Task {
+            try? await Task.sleep(for: .milliseconds(180))
+            guard !Task.isCancelled else { return }
+            let items = await Task.detached(priority: .utility) {
+                SourceOutline.items(in: source, fileURL: fileURL)
+            }.value
+            guard !Task.isCancelled,
+                  source == draft,
+                  fileURL == (loadedURL ?? url).standardizedFileURL else { return }
+            outlineItems = items
         }
     }
 

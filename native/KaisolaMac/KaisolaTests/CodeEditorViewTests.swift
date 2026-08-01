@@ -18,6 +18,61 @@ final class CodeEditorViewTests: XCTestCase {
         XCTAssertEqual(CodeEditorLineSeparator.detect(in: "one"), .lf)
     }
 
+    func testLineTargetRevisionMakesRepeatedOutlineSelectionDistinct() {
+        let first = FileEditorLineTarget.key(documentID: "/project/App.swift", line: 12, navigationRevision: 1)
+        let repeated = FileEditorLineTarget.key(documentID: "/project/App.swift", line: 12, navigationRevision: 2)
+        XCTAssertNotEqual(first, repeated)
+        XCTAssertEqual(
+            first,
+            FileEditorLineTarget.key(documentID: "/project/App.swift", line: 12, navigationRevision: 1)
+        )
+    }
+
+    func testOutlinePreservesCRLFHeadingLinesAndHierarchy() {
+        let source = "# Overview\r\nbody\r\n\r\nDetails\r\n-------\r\n### Deep ###\r\n"
+        let items = SourceOutline.items(
+            in: source,
+            fileURL: URL(fileURLWithPath: "/project/README.md")
+        )
+        XCTAssertEqual(items.map(\.title), ["Overview", "Details", "Deep"])
+        XCTAssertEqual(items.map(\.line), [1, 4, 6])
+        XCTAssertEqual(items.map(\.depth), [1, 2, 3])
+        XCTAssertTrue(items.allSatisfy { $0.kind == .section })
+    }
+
+    func testOutlineRecognizesCommonSourceDeclarationsWithoutScalarNoise() {
+        let swiftItems = SourceOutline.items(
+            in: "private struct Worker {\n    func run() {}\n    let count = 1\n}\n",
+            fileURL: URL(fileURLWithPath: "/project/Worker.swift")
+        )
+        XCTAssertEqual(swiftItems.map(\.title), ["struct Worker", "func run"])
+        XCTAssertEqual(swiftItems.map(\.line), [1, 2])
+        XCTAssertEqual(swiftItems.map(\.kind), [.type, .function])
+
+        let javascriptItems = SourceOutline.items(
+            in: "export class Card {}\nconst render = (value) => value\nconst scalar = 3\n",
+            fileURL: URL(fileURLWithPath: "/project/card.ts")
+        )
+        XCTAssertEqual(javascriptItems.map(\.title), ["class Card", "render"])
+
+        let jsonItems = SourceOutline.items(
+            in: "{\n  \"scripts\": {\n    \"test\": \"npm test\"\n  },\n  \"files\": [\n  ]\n}\n",
+            fileURL: URL(fileURLWithPath: "/project/package.json")
+        )
+        XCTAssertEqual(jsonItems.map(\.title), ["scripts", "files"])
+    }
+
+    func testOutlineIsBoundedForGeneratedSources() {
+        let source = (0..<500).map { "func generated\($0)() {}" }.joined(separator: "\n")
+        let items = SourceOutline.items(
+            in: source,
+            fileURL: URL(fileURLWithPath: "/project/Generated.swift")
+        )
+        XCTAssertEqual(items.count, SourceOutline.maximumItems)
+        XCTAssertEqual(items.first?.line, 1)
+        XCTAssertEqual(items.last?.line, SourceOutline.maximumItems)
+    }
+
     func testAssetPolicyAllowsOnlyTheTwoOpaqueBundledResources() throws {
         XCTAssertNotNil(CodeEditorAssetPolicy.resource(
             for: try XCTUnwrap(URL(string: "kaisola-editor://app/index.html"))

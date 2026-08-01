@@ -477,6 +477,7 @@ struct LineTargetTextEditor: NSViewRepresentable {
     @Binding var text: String
     let fontSize: CGFloat
     let targetLine: Int?
+    var navigationRevision: UInt64 = 0
     let documentID: String
     var markdownURL: URL? = nil
     var workspaceRoot: URL? = nil
@@ -571,7 +572,11 @@ struct LineTargetTextEditor: NSViewRepresentable {
             // remembered offset must not fight it.
             hasLineTarget: targetLine != nil
         )
-        context.coordinator.scrollIfNeeded(to: targetLine, documentID: documentID)
+        context.coordinator.scrollIfNeeded(
+            to: targetLine,
+            documentID: documentID,
+            navigationRevision: navigationRevision
+        )
         if autoFocus {
             DispatchQueue.main.async { [weak textView] in
                 guard let textView else { return }
@@ -624,7 +629,11 @@ struct LineTargetTextEditor: NSViewRepresentable {
             documentID: documentID,
             hasLineTarget: targetLine != nil
         )
-        context.coordinator.scrollIfNeeded(to: targetLine, documentID: documentID)
+        context.coordinator.scrollIfNeeded(
+            to: targetLine,
+            documentID: documentID,
+            navigationRevision: navigationRevision
+        )
     }
 
     static func dismantleNSView(_ scrollView: NSScrollView, coordinator: Coordinator) {
@@ -752,9 +761,17 @@ struct LineTargetTextEditor: NSViewRepresentable {
             }
         }
 
-        func scrollIfNeeded(to oneBasedLine: Int?, documentID: String) {
+        func scrollIfNeeded(
+            to oneBasedLine: Int?,
+            documentID: String,
+            navigationRevision: UInt64 = 0
+        ) {
             guard let oneBasedLine, oneBasedLine > 0, let textView else { return }
-            let key = "\(documentID)|\(oneBasedLine)|\(textView.string.utf8.count)"
+            let key = FileEditorLineTarget.key(
+                documentID: documentID,
+                line: oneBasedLine,
+                navigationRevision: navigationRevision
+            )
             guard key != lastScrollKey else { return }
             lastScrollKey = key
             let range = FileLineNavigation.range(forOneBasedLine: oneBasedLine, in: textView.string)

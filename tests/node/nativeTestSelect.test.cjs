@@ -118,6 +118,7 @@ test('extracted preview units retain the complete preview contract lane', () => 
 test('confined editor sources select bridge, bundle, and workspace contracts', () => {
   const plan = selector.planForChanges([
     'native/KaisolaMac/Kaisola/Features/Workspace/CodeEditorView.swift',
+    'native/KaisolaMac/Kaisola/Features/Workspace/SourceOutline.swift',
     'native/KaisolaMac/Kaisola/Resources/CodeEditor/index.html',
     'scripts/code-editor/editor.mjs',
   ], inventory)

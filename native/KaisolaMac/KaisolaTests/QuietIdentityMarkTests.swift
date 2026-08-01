@@ -23,12 +23,12 @@ final class QuietIdentityMarkTests: XCTestCase {
         XCTAssertEqual(QuietIdentity.identity(agentName: "OpenAI", processName: nil), .openai)
     }
 
-    func testMeshMapsToTheMeshTile() {
+    func testMeshMapsToTheMeshMark() {
         XCTAssertEqual(QuietIdentity.identity(agentName: "mesh", processName: nil), .mesh)
         XCTAssertEqual(QuietIdentity.identity(agentName: "Mesh", processName: "node"), .mesh)
     }
 
-    func testSSHProcessMapsToTheTransferTile() {
+    func testSSHProcessMapsToTheTransferMark() {
         XCTAssertEqual(QuietIdentity.identity(agentName: nil, processName: "ssh"), .ssh)
         XCTAssertEqual(QuietIdentity.identity(agentName: nil, processName: "SSH"), .ssh)
     }
@@ -92,8 +92,8 @@ final class QuietIdentityMarkTests: XCTestCase {
         XCTAssertEqual(QuietIdentity.identity(agentName: "mesh", processName: "claude"), .mesh)
     }
 
-    /// A shell whose foreground process is an ordinary command keeps its tile:
-    /// the process check must not become a catch-all.
+    /// A shell whose foreground process is an ordinary command keeps the shell
+    /// mark: the process check must not become a catch-all.
     func testOrdinaryForegroundProcessesStillReadAsShells() {
         for process in ["zsh", "node", "npm", "vim", "git", "python3"] {
             XCTAssertEqual(
@@ -102,6 +102,62 @@ final class QuietIdentityMarkTests: XCTestCase {
                 "\(process) should not claim an agent mark"
             )
         }
+    }
+
+    // MARK: - Naked-mark grammar (v1.1.7)
+
+    /// The tiles are gone. Every mark is now drawn naked at ONE optical size,
+    /// the way Codex's agent list draws its row glyphs — a grey rounded tile is
+    /// what let a 7.5pt `>_` and a 12.8pt starburst sit in the same rail and
+    /// still look deliberate. Without the tile, the sizes themselves have to
+    /// agree, so they are constants and this is their test.
+    func testEveryMarkIsDrawnNakedAtOneOpticalSize() {
+        let slot = QuietIdentityMarkView.slot
+
+        // Symbol marks sit inside the slot but fill most of it: a glyph that
+        // shrank to nothing would also "not overflow".
+        XCTAssertLessThan(QuietIdentityMarkView.symbolSize, slot)
+        XCTAssertGreaterThan(QuietIdentityMarkView.symbolSize, slot * 0.7)
+
+        // The letter fallback is a shade smaller — cap-height ink out-weighs a
+        // monoline glyph at the same point size — but only a shade.
+        XCTAssertLessThan(QuietIdentityMarkView.letterSize, QuietIdentityMarkView.symbolSize)
+        XCTAssertEqual(
+            QuietIdentityMarkView.letterSize,
+            QuietIdentityMarkView.symbolSize,
+            accuracy: 2,
+            "the letter mark drifted out of the row's optical size"
+        )
+
+        // …and the DRAWN marks land on the same optical circle. The starburst
+        // spans 2 × outerRadius in the 24-unit viewbox.
+        let starburstDiameter = 2 * 9.6 * (slot / 24)
+        XCTAssertEqual(
+            starburstDiameter,
+            QuietIdentityMarkView.symbolSize,
+            accuracy: 2,
+            "the coral mark no longer matches the glyph marks beside it"
+        )
+    }
+
+    /// "Monoline weight matched across marks": the coral rays, the knot's
+    /// outline and an SF Symbol at `.regular` all have to land within a few
+    /// tenths of a point of each other, or the rail reads as one bold mark and
+    /// four thin ones.
+    func testDrawnMarksShareOneMonolineStrokeWeight() {
+        let unit = QuietIdentityMarkView.slot / 24
+        let starburst = unit * QuietIdentityMarkView.starburstStroke
+        let knot = QuietOpenAIKnot.strokeWidth(unit: unit)
+
+        // Monoline: a hairline, not a rule.
+        XCTAssertGreaterThan(starburst, 0.9)
+        XCTAssertLessThan(starburst, 1.8)
+        XCTAssertEqual(
+            starburst,
+            knot,
+            accuracy: 0.35,
+            "the starburst and the knot no longer read as the same pen"
+        )
     }
 
     // MARK: - OpenAI knot geometry

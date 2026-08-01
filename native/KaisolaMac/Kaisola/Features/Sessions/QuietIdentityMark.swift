@@ -1,9 +1,14 @@
 import SwiftUI
 
 /// Who is on the other end of a rail row, as a *mark* rather than a word
-/// (spec: quiet fleet v4.4 "Safari"). The two first-class agents get their own
-/// drawn marks; everything else gets a neutral tile, so the rail's only colour
-/// besides the status dot is Claude's coral.
+/// (spec: quiet fleet v4.4 "Safari").
+///
+/// v1.1.7 grammar, taken from Codex's agent list: every mark is a **naked
+/// monoline glyph** at one optical size — no tile, no chip, no fill behind
+/// anything. The two first-class agents carry full ink (Claude's coral, the
+/// knot in the label colour); every generic surface recedes to `.secondary`.
+/// So the rail's only colour besides the status dot is still Claude's coral,
+/// but nothing is boxed to say so.
 enum QuietIdentity: Equatable {
     case claude
     case openai
@@ -60,9 +65,10 @@ enum QuietIdentity: Equatable {
     }
 }
 
-/// The 16×16 identity slot every row's leading edge reserves. Marks are drawn
-/// in a 24-unit viewbox and scaled into the slot, so the same geometry serves
-/// any future size without new constants.
+/// The 16×16 identity slot every row's leading edge reserves. Drawn marks live
+/// in a 24-unit viewbox and scale into the slot, so the same geometry serves
+/// any future size without new constants; symbol marks are pinned to one point
+/// size so a glyph and a drawn mark read as the same object at the same weight.
 struct QuietIdentityMarkView: View {
     let identity: QuietIdentity
     var size: CGFloat = QuietIdentityMarkView.slot
@@ -71,6 +77,16 @@ struct QuietIdentityMarkView: View {
     /// slot size instead of repeating the literal.
     nonisolated static let slot: CGFloat = 16
 
+    /// One optical size for every symbol mark, chosen to match the *drawn*
+    /// marks rather than the slot: the starburst spans `2 × 9.6/24 × slot`
+    /// = 12.8pt, so a 12.5pt glyph sits on the same optical circle. Making
+    /// this a constant is what keeps a future SF Symbol from arriving a size
+    /// larger than its neighbours, which is exactly what a tile used to hide.
+    nonisolated static let symbolSize: CGFloat = 12.5
+    /// The letter fallback, a shade smaller: a cap-height letter at the symbol
+    /// size out-inks a monoline glyph.
+    nonisolated static let letterSize: CGFloat = 11.5
+
     var body: some View {
         Group {
             switch identity {
@@ -78,7 +94,7 @@ struct QuietIdentityMarkView: View {
                 QuietStarburstMark(rays: 12, innerRadius: 3.6, outerRadius: 9.6)
                     .stroke(
                         Color(light: 0xD97757, dark: 0xE58A6D),
-                        style: StrokeStyle(lineWidth: unit * 2.3, lineCap: .round)
+                        style: StrokeStyle(lineWidth: unit * QuietIdentityMarkView.starburstStroke, lineCap: .round)
                     )
             case .openai:
                 QuietOpenAIKnotMark()
@@ -87,13 +103,16 @@ struct QuietIdentityMarkView: View {
                         style: StrokeStyle(lineWidth: QuietOpenAIKnot.strokeWidth(unit: unit))
                     )
             case .shell:
-                tile(">_", size: 7.5, monospaced: true)
+                // The reference's Terminal mark: a rounded window outline with
+                // a prompt inside it, no fill. SF's own `terminal` is that
+                // drawing, so the rail does not maintain a second copy of it.
+                symbol("terminal")
             case .ssh:
-                tile("⇅", size: 9.5)
+                symbol("arrow.up.arrow.down")
             case .mesh:
-                tile("⌗", size: 9.5)
+                glyph("⌗", size: QuietIdentityMarkView.symbolSize)
             case .letter(let character):
-                tile(String(character), size: 9)
+                glyph(String(character), size: QuietIdentityMarkView.letterSize)
             }
         }
         .frame(width: size, height: size)
@@ -101,16 +120,27 @@ struct QuietIdentityMarkView: View {
         .accessibilityHidden(true)
     }
 
+    /// Stroke weight of the Claude starburst in viewbox units. Sits where it
+    /// does so the coral rays, the knot's outline and an SF Symbol at
+    /// `.regular` all land within a few tenths of a point of each other — the
+    /// "monoline weight matched across marks" rule the reference sets.
+    nonisolated static let starburstStroke: CGFloat = 2.0
+
     private var unit: CGFloat { size / 24 }
 
-    private func tile(_ glyph: String, size glyphSize: CGFloat, monospaced: Bool = false) -> some View {
-        RoundedRectangle(cornerRadius: 4, style: .continuous)
-            .fill(Color(light: 0x8E8E93, dark: 0x6C6C72))
-            .overlay {
-                Text(glyph)
-                    .font(.system(size: glyphSize, weight: .semibold, design: monospaced ? .monospaced : .default))
-                    .foregroundStyle(.white)
-            }
+    /// A naked SF Symbol at the shared optical size. `.regular` is the monoline
+    /// weight; anything heavier reads as a filled badge next to the knot.
+    private func symbol(_ name: String) -> some View {
+        Image(systemName: name)
+            .font(.system(size: QuietIdentityMarkView.symbolSize * (size / QuietIdentityMarkView.slot), weight: .regular))
+            .foregroundStyle(.secondary)
+    }
+
+    /// A naked text glyph, for the marks SF has no monoline drawing of.
+    private func glyph(_ text: String, size glyphSize: CGFloat) -> some View {
+        Text(text)
+            .font(.system(size: glyphSize * (size / QuietIdentityMarkView.slot), weight: .regular))
+            .foregroundStyle(.secondary)
     }
 }
 

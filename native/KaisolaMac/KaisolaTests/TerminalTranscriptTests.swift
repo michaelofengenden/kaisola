@@ -236,6 +236,20 @@ final class TerminalTranscriptTests: XCTestCase {
         XCTAssertFalse(pages.joined().contains("example.com"))
     }
 
+    func testControlStringFilterReturnsPageBoundedOutputAcrossSplitOSC() {
+        var filter = TerminalControlStringFilter()
+
+        XCTAssertEqual(
+            filter.consume("before\u{1B}]8;;https://example."),
+            "before"
+        )
+        XCTAssertEqual(
+            filter.consume("com\u{1B}\\linked"),
+            "linked"
+        )
+        XCTAssertEqual(filter.finish(), "")
+    }
+
     func testSanitizerDropsDCSAndC1ControlStrings() {
         let pages = TerminalTranscriptSanitizer.plainPages([
             "a\u{1B}Pprivate\u{1B}\\b\u{009D}secret\u{009C}c"

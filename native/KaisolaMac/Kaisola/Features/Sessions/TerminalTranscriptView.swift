@@ -513,6 +513,66 @@ enum TerminalTranscriptExport {
     }
 }
 
+/// Stateful OSC/DCS/APC/PM/SOS filtering for retained transcript chunks. A
+/// broker page may end halfway through ESC ] ... ST, so each chunk resumes the
+/// previous parser mode while still returning a page-bounded String for replay.
+struct TerminalControlStringFilter {
+    private enum Mode {
+        case text
+        case escape
+        case osc
+        case oscEscape
+        case controlString
+        case controlStringEscape
+    }
+
+    private var mode = Mode.text
+
+    mutating func consume(_ input: String) -> String {
+        var result = String.UnicodeScalarView()
+        for scalar in input.unicodeScalars {
+            let value = scalar.value
+            switch mode {
+            case .text:
+                switch value {
+                case 0x1B: mode = .escape
+                case 0x9D: mode = .osc
+                case 0x90, 0x98, 0x9E, 0x9F: mode = .controlString
+                default: result.append(scalar)
+                }
+            case .escape:
+                switch value {
+                case 0x5D: mode = .osc
+                case 0x50, 0x58, 0x5E, 0x5F: mode = .controlString
+                default:
+                    result.append(UnicodeScalar(0x1B)!)
+                    result.append(scalar)
+                    mode = .text
+                }
+            case .osc:
+                if value == 0x07 || value == 0x9C { mode = .text }
+                else if value == 0x1B { mode = .oscEscape }
+            case .oscEscape:
+                mode = value == 0x5C ? .text : .osc
+            case .controlString:
+                if value == 0x1B { mode = .controlStringEscape }
+                else if value == 0x9C { mode = .text }
+            case .controlStringEscape:
+                mode = value == 0x5C ? .text : .controlString
+            }
+        }
+        return String(result)
+    }
+
+    /// Preserve a lone trailing ESC because it may be ordinary terminal input;
+    /// unterminated control strings remain deliberately non-rendering.
+    mutating func finish() -> String {
+        defer { mode = .text }
+        if case .escape = mode { return "\u{1B}" }
+        return ""
+    }
+}
+
 /// Replays immutable output through Kaisola's production terminal parser, then
 /// exposes the normal scrollback as selectable plain text. A strip-only parser
 /// made cursor-addressed progress/TUI frames read as `W-Wo-Wor-Working`; replay
@@ -540,8 +600,17 @@ enum TerminalTranscriptSanitizer {
             scrollback: 100_000
         )
         let terminal = Terminal(delegate: delegate, options: options)
-        let replayInput = removingControlStrings(from: pages.joined())
-        terminal.feed(buffer: Array(replayInput.utf8)[...])
+        var filter = TerminalControlStringFilter()
+        for page in pages {
+            let replayInput = filter.consume(page)
+            if !replayInput.isEmpty {
+                terminal.feed(buffer: Array(replayInput.utf8)[...])
+            }
+        }
+        let trailingInput = filter.finish()
+        if !trailingInput.isEmpty {
+            terminal.feed(buffer: Array(trailingInput.utf8)[...])
+        }
         let replayed = terminal.getText(
             start: Position(col: 0, row: 0),
             end: Position(col: terminal.cols, row: Int.max)
@@ -578,54 +647,4 @@ enum TerminalTranscriptSanitizer {
         return result
     }
 
-    /// SwiftTerm interprets CSI state, but C1 OSC/DCS scalars arrive here as
-    /// decoded Unicode rather than raw single-byte controls. Remove only those
-    /// non-rendering payloads (including sequences split across broker pages)
-    /// before replay; CSI bytes remain intact for cursor/erase semantics.
-    private static func removingControlStrings(from input: String) -> String {
-        enum Mode {
-            case text
-            case escape
-            case osc
-            case oscEscape
-            case controlString
-            case controlStringEscape
-        }
-
-        var mode = Mode.text
-        var result = String.UnicodeScalarView()
-        for scalar in input.unicodeScalars {
-            let value = scalar.value
-            switch mode {
-            case .text:
-                switch value {
-                case 0x1B: mode = .escape
-                case 0x9D: mode = .osc
-                case 0x90, 0x98, 0x9E, 0x9F: mode = .controlString
-                default: result.append(scalar)
-                }
-            case .escape:
-                switch value {
-                case 0x5D: mode = .osc
-                case 0x50, 0x58, 0x5E, 0x5F: mode = .controlString
-                default:
-                    result.append(UnicodeScalar(0x1B)!)
-                    result.append(scalar)
-                    mode = .text
-                }
-            case .osc:
-                if value == 0x07 || value == 0x9C { mode = .text }
-                else if value == 0x1B { mode = .oscEscape }
-            case .oscEscape:
-                mode = value == 0x5C ? .text : .osc
-            case .controlString:
-                if value == 0x1B { mode = .controlStringEscape }
-                else if value == 0x9C { mode = .text }
-            case .controlStringEscape:
-                mode = value == 0x5C ? .text : .controlString
-            }
-        }
-        if case .escape = mode { result.append(UnicodeScalar(0x1B)!) }
-        return String(result)
-    }
 }

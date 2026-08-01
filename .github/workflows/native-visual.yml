@@ -54,11 +54,18 @@ jobs:
             local capture="$1"
             local surface="$2"
             test -s "$capture"
-            test "$(stat -f%z "$capture")" -gt 20000
-            local width height
+            local bytes width height minimum_bytes
+            bytes="$(stat -f%z "$capture")"
+            minimum_bytes=20000
+            if [[ "$surface" == workspace-rename || "$surface" == workspace-new-file || "$surface" == workspace-move ]]; then
+              # These compact AppKit sheets are mostly flat material and text,
+              # so a valid crop can compress below the workspace-wide floor.
+              minimum_bytes=10000
+            fi
+            test "$bytes" -gt "$minimum_bytes"
             width="$(sips -g pixelWidth "$capture" | awk '/pixelWidth/ {print $2}')"
             height="$(sips -g pixelHeight "$capture" | awk '/pixelHeight/ {print $2}')"
-            echo "KAISOLA_NATIVE_VISUAL_GEOMETRY=$surface ${width}x${height}"
+            echo "KAISOLA_NATIVE_VISUAL_GEOMETRY=$surface ${width}x${height} bytes=$bytes"
             # Settings fixtures are intentionally compact. Every other surface
             # must keep the large workspace footprint. GitHub's headless
             # WindowServer scales the declared 1360x860 and 810x540 content

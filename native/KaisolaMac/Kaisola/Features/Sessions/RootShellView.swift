@@ -37,6 +37,9 @@ struct RootShellView: View {
     @State private var showOnboarding = false
     @State private var showSettings = false
     @State private var settingsSectionID: String?
+    /// Opt-in, window-local follow mode. It is deliberately off at launch so a
+    /// background tool call can never steal the user's document unexpectedly.
+    @State private var followsSelectedAgentFiles = false
     /// A Settings destination requested from the readiness sheet. Present it
     /// only after that sheet has actually dismissed so SwiftUI never has to
     /// arbitrate two simultaneous sheet presentations.
@@ -226,6 +229,17 @@ struct RootShellView: View {
                     return
                 }
                 performLocalCommand(AppCommandID(rawValue: rawID))
+            }
+            .onChange(of: model.latestAgentFileActivity) { _, activity in
+                guard let activity,
+                      WorkspaceAgentFileFollowPolicy.shouldOpen(
+                        activity,
+                        enabled: followsSelectedAgentFiles,
+                        selectedProjectID: model.selectedProjectID,
+                        selectedChatID: model.selectedChatID,
+                        selectedMeshID: model.selectedMeshID
+                      ) else { return }
+                model.openFilePreview(activity.fileURL, pinned: false)
             }
             .onAppear {
                 let environment = ProcessInfo.processInfo.environment
@@ -1161,7 +1175,8 @@ struct RootShellView: View {
                     workspaceRailDivider
                     WorkspaceRailView(root: root, selectedFile: model.previewedFileURL, openFile: { url, pinned in
                         model.openFilePreview(url, pinned: pinned)
-                    }, didMoveItem: { source, destination in
+                    }, followsAgentFiles: $followsSelectedAgentFiles, canFollowAgentFiles: canFollowAgentFiles,
+                    didMoveItem: { source, destination in
                         model.reconcileWorkspaceFileMove(from: source, to: destination)
                         model.registerWorkspaceRenameUndo(
                             .init(source: source, destination: destination),
@@ -1207,6 +1222,10 @@ struct RootShellView: View {
                 detailDividerTrackers(widths: widths)
             }
         }
+    }
+
+    private var canFollowAgentFiles: Bool {
+        model.selectedChatID != nil || model.selectedMeshID != nil
     }
 
     /// The hoisted corridors, owned by one AppKit overlay.

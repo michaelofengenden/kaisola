@@ -19,6 +19,8 @@ struct WorkspaceRailView: View {
     let root: URL
     let selectedFile: URL?
     let openFile: (URL, Bool) -> Void
+    @Binding private var followsAgentFiles: Bool
+    let canFollowAgentFiles: Bool
     let didMoveItem: (URL, URL) -> Void
     let didTrashItem: (WorkspaceFileOperations.TrashMove) -> Void
     let didCreateItem: (WorkspaceFileOperations.CreatedItem) -> Void
@@ -40,6 +42,8 @@ struct WorkspaceRailView: View {
         root: URL,
         selectedFile: URL? = nil,
         openFile: @escaping (URL, Bool) -> Void,
+        followsAgentFiles: Binding<Bool> = .constant(false),
+        canFollowAgentFiles: Bool = false,
         didMoveItem: @escaping (URL, URL) -> Void,
         didTrashItem: @escaping (WorkspaceFileOperations.TrashMove) -> Void,
         didCreateItem: @escaping (WorkspaceFileOperations.CreatedItem) -> Void,
@@ -48,6 +52,8 @@ struct WorkspaceRailView: View {
         self.root = root
         self.selectedFile = selectedFile?.standardizedFileURL
         self.openFile = openFile
+        _followsAgentFiles = followsAgentFiles
+        self.canFollowAgentFiles = canFollowAgentFiles
         self.didMoveItem = didMoveItem
         self.didTrashItem = didTrashItem
         self.didCreateItem = didCreateItem
@@ -84,6 +90,20 @@ struct WorkspaceRailView: View {
                 .fixedSize()
                 .help("New file or folder")
                 .accessibilityLabel("New project item")
+                Button {
+                    followsAgentFiles.toggle()
+                } label: {
+                    Image(systemName: "scope")
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(followsAgentFiles ? Color.accentColor : Color.secondary)
+                }
+                .buttonStyle(.borderless)
+                .disabled(!canFollowAgentFiles)
+                .help(canFollowAgentFiles
+                    ? (followsAgentFiles ? "Stop following the selected agent's files" : "Follow the selected agent's files")
+                    : "Select a Chat or Mesh to follow its files")
+                .accessibilityLabel("Follow selected agent files")
+                .accessibilityValue(followsAgentFiles ? "On" : "Off")
                 Button(action: refresh) {
                     Image(systemName: "arrow.clockwise")
                         .font(.caption)

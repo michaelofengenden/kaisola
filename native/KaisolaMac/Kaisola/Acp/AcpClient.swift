@@ -6,9 +6,15 @@ import KaisolaCore
 /// `session/update` notifications and the agent's callbacks.
 enum AcpEvent: Sendable {
     case turnItem(AcpTurnItem)
-    /// A `tool_call_update`. `status`/`content` are nil when the update didn't
-    /// carry that field, so the merge leaves the existing value untouched.
-    case toolCallUpdate(id: String, status: AcpToolCall.Status?, content: [AcpToolContent]?, title: String?)
+    /// A `tool_call_update`. Optional collections are nil when the update
+    /// didn't carry that field, so the merge leaves existing disclosure intact.
+    case toolCallUpdate(
+        id: String,
+        status: AcpToolCall.Status?,
+        content: [AcpToolContent]?,
+        locations: [String]?,
+        title: String?
+    )
     case usage(AcpUsage)
     case modelChanged(id: String)
     case modeChanged(id: String)
@@ -696,7 +702,16 @@ actor AcpClient {
                 // Only treat content as present when the key exists — an absent
                 // key must not clear artifacts an earlier update already set.
                 let content = object["content"] != nil ? Self.parseToolContent(object["content"]) : nil
-                eventHandler?(.toolCallUpdate(id: id, status: status, content: content, title: object["title"]?.stringValue))
+                let locations = object["locations"] != nil
+                    ? Self.locationPaths(object["locations"])
+                    : nil
+                eventHandler?(.toolCallUpdate(
+                    id: id,
+                    status: status,
+                    content: content,
+                    locations: locations,
+                    title: object["title"]?.stringValue
+                ))
             }
         case "plan":
             let entries = (object["entries"]?.arrayValue ?? []).enumerated().compactMap { index, value -> AcpPlanEntry? in

@@ -104,6 +104,9 @@ const NATIVE_FILE_TESTS = Object.freeze(new Map([
   ['native/KaisolaMac/Kaisola/Features/Workspace/BrowserCardView.swift', [
     'AppModelProjectContextTests', 'LocalhostDetectorTests',
   ]],
+  ['native/KaisolaMac/Kaisola/Features/Workspace/AgentFileFollow.swift', [
+    'AcpToolArtifactsTests', 'AppModelProjectContextTests', 'WorkspaceFilesTests',
+  ]],
   ['native/KaisolaMac/Kaisola/Features/Workspace/FilePreviewContent.swift', FILE_PREVIEW_TESTS],
   ['native/KaisolaMac/Kaisola/Features/Workspace/FilePreviewEditors.swift', FILE_PREVIEW_TESTS],
   ['native/KaisolaMac/Kaisola/Features/Workspace/FilePreviewRecovery.swift', FILE_PREVIEW_TESTS],

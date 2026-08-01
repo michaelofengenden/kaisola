@@ -91,6 +91,87 @@ final class AcpToolArtifactsTests: XCTestCase {
         XCTAssertTrue(AcpClient.parseToolContent(.array([])).isEmpty)
     }
 
+    func testDeclaredFilePathsPreserveStructuredOrderAndIgnoreProse() {
+        let call = AcpToolCall(
+            id: "tool-1",
+            title: "Editing README.md and prose/decoy.swift",
+            kind: "edit",
+            status: .inProgress,
+            content: [
+                .text("Pretend output mentions prose/another-decoy.swift"),
+                .diff(path: "Sources/App.swift", oldText: "old", newText: "new"),
+                .diff(path: "README.md", oldText: nil, newText: "docs"),
+            ],
+            locations: ["README.md", "", "Tests/AppTests.swift", "README.md"]
+        )
+
+        XCTAssertEqual(call.declaredFilePaths, [
+            "README.md",
+            "Tests/AppTests.swift",
+            "Sources/App.swift",
+        ])
+    }
+
+    @MainActor
+    func testConversationRetriesRejectedPathsAndPublishesAcceptedPathsOnlyOnce() {
+        let conversation = AcpConversation(
+            title: "Test",
+            command: "/usr/bin/true",
+            arguments: [],
+            cwd: "/tmp"
+        )
+        var activities: [AcpFileActivity] = []
+        var attemptedPaths: [String] = []
+        var rejectsFirstSourceAttempt = true
+        conversation.onFileActivity = { activity in
+            attemptedPaths.append(activity.path)
+            if activity.path == "Sources/App.swift", rejectsFirstSourceAttempt {
+                rejectsFirstSourceAttempt = false
+                return false
+            }
+            activities.append(activity)
+            return true
+        }
+
+        conversation.receiveTurnItemForTesting(.toolCall(AcpToolCall(
+            id: "tool-1",
+            title: "Read",
+            kind: "read",
+            status: .inProgress,
+            locations: ["Sources/App.swift"]
+        )))
+        conversation.receiveTurnItemForTesting(.toolCall(AcpToolCall(
+            id: "tool-1",
+            title: "Edit",
+            kind: "edit",
+            status: .completed,
+            content: [
+                .diff(path: "Sources/App.swift", oldText: "old", newText: "new"),
+                .diff(path: "Tests/AppTests.swift", oldText: nil, newText: "test"),
+            ]
+        )))
+        conversation.receiveTurnItemForTesting(.toolCall(AcpToolCall(
+            id: "tool-1",
+            title: "Completed",
+            kind: "edit",
+            status: .completed,
+            content: [
+                .diff(path: "Sources/App.swift", oldText: "old", newText: "new"),
+                .diff(path: "Tests/AppTests.swift", oldText: nil, newText: "test"),
+            ]
+        )))
+
+        XCTAssertEqual(attemptedPaths, [
+            "Sources/App.swift",
+            "Sources/App.swift",
+            "Tests/AppTests.swift",
+        ])
+        XCTAssertEqual(activities, [
+            AcpFileActivity(toolCallID: "tool-1", kind: "edit", path: "Sources/App.swift"),
+            AcpFileActivity(toolCallID: "tool-1", kind: "edit", path: "Tests/AppTests.swift"),
+        ])
+    }
+
     func testPermissionWireParserKeepsRawInputAndEveryDeclaredPath() throws {
         let rawInput = JSONValue.object([
             "command": .string("swift test"),

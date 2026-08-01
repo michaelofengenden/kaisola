@@ -273,7 +273,14 @@ final class AcpClientTests: XCTestCase {
         XCTAssertTrue(events.contains { if case .turnItem(.thought) = $0 { return true } else { return false } })
         XCTAssertTrue(events.contains { if case .turnItem(.plan) = $0 { return true } else { return false } })
         XCTAssertTrue(events.contains { if case let .turnItem(.toolCall(c)) = $0 { return c.id == "t1" } else { return false } })
-        XCTAssertTrue(events.contains { if case let .toolCallUpdate(id, status, _, _) = $0 { return id == "t1" && status == .completed } else { return false } })
+        XCTAssertTrue(events.contains {
+            if case let .toolCallUpdate(id, status, _, locations, _) = $0 {
+                return id == "t1"
+                    && status == .completed
+                    && locations == ["Sources/App.swift"]
+            }
+            return false
+        })
         XCTAssertTrue(events.contains {
             if case let .usage(u) = $0 {
                 return u.used == 5000
@@ -573,7 +580,14 @@ private actor ScriptedAcpTransport: AcpByteTransport {
         notify(update: .object(["sessionUpdate": .string("agent_message_chunk"), "content": .object(["type": .string("text"), "text": .string("Hello")])]))
         notify(update: .object(["sessionUpdate": .string("agent_message_chunk"), "content": .object(["type": .string("text"), "text": .string(" world")])]))
         notify(update: .object(["sessionUpdate": .string("tool_call"), "toolCallId": .string("t1"), "title": .string("run echo"), "kind": .string("execute"), "status": .string("pending")]))
-        notify(update: .object(["sessionUpdate": .string("tool_call_update"), "toolCallId": .string("t1"), "status": .string("completed")]))
+        notify(update: .object([
+            "sessionUpdate": .string("tool_call_update"),
+            "toolCallId": .string("t1"),
+            "status": .string("completed"),
+            "locations": .array([
+                .object(["path": .string("Sources/App.swift")]),
+            ]),
+        ]))
         notify(update: .object(["sessionUpdate": .string("available_commands_update"), "availableCommands": .array([
             .object(["name": .string("compact"), "description": .string("Compact the conversation")]),
             .object(["name": .string("review"), "description": .string("Review changes")]),

@@ -339,6 +339,89 @@ final class WorkspaceFilesTests: XCTestCase {
         try? FileManager.default.removeItem(at: root)
     }
 
+    func testAgentFileFollowResolvesOnlyExistingWorkspaceFiles() throws {
+        let readme = root.appendingPathComponent("README.md").standardizedFileURL
+        let source = root.appendingPathComponent("src/main.swift").standardizedFileURL
+        XCTAssertEqual(
+            WorkspaceAgentFileFollowPolicy.resolve(path: "README.md", workspaceRoot: root),
+            readme
+        )
+        XCTAssertEqual(
+            WorkspaceAgentFileFollowPolicy.resolve(path: source.path, workspaceRoot: root),
+            source
+        )
+        XCTAssertNil(WorkspaceAgentFileFollowPolicy.resolve(path: "src", workspaceRoot: root))
+        XCTAssertNil(WorkspaceAgentFileFollowPolicy.resolve(path: "missing.swift", workspaceRoot: root))
+        XCTAssertNil(WorkspaceAgentFileFollowPolicy.resolve(path: "", workspaceRoot: root))
+    }
+
+    func testAgentFileFollowRejectsTraversalAndSymlinkEscapes() throws {
+        let outside = root.deletingLastPathComponent()
+            .appendingPathComponent("kaisola-follow-outside-\(UUID().uuidString).swift")
+        try "outside".write(to: outside, atomically: true, encoding: .utf8)
+        defer { try? FileManager.default.removeItem(at: outside) }
+
+        XCTAssertNil(WorkspaceAgentFileFollowPolicy.resolve(
+            path: "../\(outside.lastPathComponent)",
+            workspaceRoot: root
+        ))
+        XCTAssertNil(WorkspaceAgentFileFollowPolicy.resolve(
+            path: outside.path,
+            workspaceRoot: root
+        ))
+
+        let link = root.appendingPathComponent("outside-link.swift")
+        try FileManager.default.createSymbolicLink(at: link, withDestinationURL: outside)
+        XCTAssertNil(WorkspaceAgentFileFollowPolicy.resolve(
+            path: link.lastPathComponent,
+            workspaceRoot: root
+        ))
+    }
+
+    func testAgentFileFollowRequiresExplicitModeAndSelectedSurface() {
+        let activity = WorkspaceAgentFileActivity(
+            sequence: 1,
+            projectID: "project-a",
+            surfaceID: "chat-a",
+            fileURL: root.appendingPathComponent("README.md")
+        )
+        XCTAssertTrue(WorkspaceAgentFileFollowPolicy.shouldOpen(
+            activity,
+            enabled: true,
+            selectedProjectID: "project-a",
+            selectedChatID: "chat-a",
+            selectedMeshID: nil
+        ))
+        XCTAssertTrue(WorkspaceAgentFileFollowPolicy.shouldOpen(
+            activity,
+            enabled: true,
+            selectedProjectID: "project-a",
+            selectedChatID: nil,
+            selectedMeshID: "chat-a"
+        ))
+        XCTAssertFalse(WorkspaceAgentFileFollowPolicy.shouldOpen(
+            activity,
+            enabled: false,
+            selectedProjectID: "project-a",
+            selectedChatID: "chat-a",
+            selectedMeshID: nil
+        ))
+        XCTAssertFalse(WorkspaceAgentFileFollowPolicy.shouldOpen(
+            activity,
+            enabled: true,
+            selectedProjectID: "project-b",
+            selectedChatID: "chat-a",
+            selectedMeshID: nil
+        ))
+        XCTAssertFalse(WorkspaceAgentFileFollowPolicy.shouldOpen(
+            activity,
+            enabled: true,
+            selectedProjectID: "project-a",
+            selectedChatID: "chat-b",
+            selectedMeshID: nil
+        ))
+    }
+
     func testChildrenSkipsIgnoredAndHiddenAndSortsDirsFirst() {
         let children = ProjectFiles.children(of: root)
         XCTAssertEqual(children.map(\.name), ["src", "README.md"])

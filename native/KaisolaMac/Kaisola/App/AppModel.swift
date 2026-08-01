@@ -235,6 +235,11 @@ final class AppModel: ObservableObject {
     /// Line target for the previewed file (from a terminal :LINE citation);
     /// retained for a future editor scroll.
     @Published var previewedFileLine: Int?
+    /// Latest symlink-safe, existing project file declared by a live ACP tool
+    /// call. The shell follows it only while the user explicitly enables follow
+    /// mode for the currently selected Chat or Mesh.
+    @Published private(set) var latestAgentFileActivity: WorkspaceAgentFileActivity?
+    private var agentFileActivitySequence: UInt64 = 0
     /// A local dev-server URL opened as an in-app browser card (Electron
     /// parity); non-nil raises a BrowserCardView in the detail pane.
     @Published var browserCardURL: URL?
@@ -1199,6 +1204,26 @@ final class AppModel: ObservableObject {
         previewedFileLine = line
         previewedFileURL = normalized
         browserCardURL = nil
+    }
+
+    private func recordAgentFileActivity(
+        _ activity: AcpFileActivity,
+        surfaceID: String,
+        projectID: String,
+        workspaceRoot: URL
+    ) -> Bool {
+        guard let fileURL = WorkspaceAgentFileFollowPolicy.resolve(
+            path: activity.path,
+            workspaceRoot: workspaceRoot
+        ) else { return false }
+        agentFileActivitySequence &+= 1
+        latestAgentFileActivity = WorkspaceAgentFileActivity(
+            sequence: agentFileActivitySequence,
+            projectID: projectID,
+            surfaceID: surfaceID,
+            fileURL: fileURL
+        )
+        return true
     }
 
     func selectFileTab(_ url: URL) {
@@ -2252,6 +2277,15 @@ final class AppModel: ObservableObject {
         mesh.onTranscriptChanged = { [weak self] columnID, rows in
             self?.enqueueTranscriptSave(rows, chatID: columnID)
         }
+        mesh.onFileActivity = { [weak self, weak mesh] _, activity in
+            guard let self, let mesh else { return false }
+            return self.recordAgentFileActivity(
+                activity,
+                surfaceID: mesh.id,
+                projectID: projectID,
+                workspaceRoot: mesh.baseDirectory
+            )
+        }
         mesh.onDraftChanged = { [weak self, weak mesh] text in
             guard let self, let mesh else { return }
             self.enqueueDraftSave(
@@ -2869,6 +2903,14 @@ final class AppModel: ObservableObject {
         conversation.onTranscriptChanged = { [weak self] rows in
             self?.enqueueTranscriptSave(rows, chatID: chatID)
         }
+        conversation.onFileActivity = { [weak self] activity in
+            self?.recordAgentFileActivity(
+                activity,
+                surfaceID: chatID,
+                projectID: projectID,
+                workspaceRoot: directory
+            ) ?? false
+        }
         conversation.onDraftChanged = { [weak self] text in
             self?.enqueueDraftSave(
                 text,
@@ -2952,6 +2994,7 @@ final class AppModel: ObservableObject {
                 )
             }
         }
+        closingChat.conversation.onFileActivity = nil
         chats.removeAll { $0.id == chatID }
         usageObservers.removeValue(forKey: chatID)?.forEach { $0.cancel() }
         usageCenter.unregister(
@@ -2978,6 +3021,7 @@ final class AppModel: ObservableObject {
             // yields and lets already-buffered ACP events drain.
             explicitlyClosedChatIDs.insert(chatID)
             closingChat.conversation.onTranscriptChanged = nil
+            closingChat.conversation.onFileActivity = nil
             closingChat.conversation.onDraftChanged = nil
             closingChat.conversation.onQueueChanged = nil
             chatShutdownTasks.start(chatID) {
@@ -3099,6 +3143,7 @@ final class AppModel: ObservableObject {
         let sizeWeight = workspaceSnapshot(projectID: projectID)?.panes
             .first(where: { $0.id == meshID })?.sizeWeight ?? 1
 
+        mesh.onFileActivity = nil
         await mesh.suspend()
         storeRecentlyClosedPane(NativeRestorablePaneState(
             id: mesh.id,

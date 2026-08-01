@@ -120,6 +120,11 @@ final class AcpConversation: ObservableObject {
     /// Persistence hooks are injected by AppModel so this reusable conversation
     /// stays independent of the concrete disk stores used by the native shell.
     var onTranscriptChanged: (([AcpTranscriptRow]) -> Void)?
+    /// Live ACP-declared locations/diff paths for explicit follow mode. This is
+    /// never derived from transcript prose. Return true only after the owner
+    /// resolves and accepts the target; a not-yet-created file can then retry
+    /// on a later tool update.
+    var onFileActivity: ((AcpFileActivity) -> Bool)?
     var onProviderSessionID: ((String) -> Void)?
     var onDraftChanged: ((String) -> Void)?
     /// Pending follow-ups are part of the workspace recovery contract, not
@@ -132,6 +137,9 @@ final class AcpConversation: ObservableObject {
     /// `saveDraft` is a no-op.
     var draftStorageKey: String?
     private var client: AcpClient
+    private var reportedFileActivityKeys: Set<String> = []
+    private var reportedFileActivityOrder: [String] = []
+    private static let maximumReportedFileActivityKeys = 2_048
     /// Production conversations own their client and can replace it after the
     /// child process exits. Injected clients remain fixed so tests/custom
     /// transports never get silently swapped for a real process transport.
@@ -919,13 +927,15 @@ final class AcpConversation: ObservableObject {
         switch event {
         case let .turnItem(item):
             accumulate(item)
-        case let .toolCallUpdate(id, status, content, title):
+        case let .toolCallUpdate(id, status, content, locations, title):
             if let index = rows.lastIndex(where: { if case let .tool(c) = $0 { return c.id == id } else { return false } }),
                case var .tool(call) = rows[index] {
                 if let status { call.status = status }
                 if let content, !content.isEmpty { call.content = content }
+                if let locations { call.locations = locations }
                 if let title, !title.isEmpty { call.title = title }
                 rows[index] = .tool(call)
+                publishFileActivity(for: call)
             }
         case let .usage(usage):
             self.usage = usage
@@ -980,6 +990,7 @@ final class AcpConversation: ObservableObject {
             appendChunk(text, isThought: true)
         case let .toolCall(call):
             rows.append(.tool(call))
+            publishFileActivity(for: call)
         case let .plan(entries):
             let planID = "\(turnCounter)"
             if let index = rows.lastIndex(where: {
@@ -991,6 +1002,27 @@ final class AcpConversation: ObservableObject {
                 rows.append(.plan(id: planID, entries: entries))
             }
         }
+    }
+
+    private func publishFileActivity(for call: AcpToolCall) {
+        for path in call.declaredFilePaths {
+            let key = "\(call.id)\u{0}\(path)"
+            guard !reportedFileActivityKeys.contains(key) else { continue }
+            let accepted = onFileActivity?(AcpFileActivity(
+                toolCallID: call.id,
+                kind: call.kind,
+                path: path
+            )) ?? false
+            guard accepted else { continue }
+            reportedFileActivityKeys.insert(key)
+            reportedFileActivityOrder.append(key)
+        }
+        let overflow = reportedFileActivityOrder.count - Self.maximumReportedFileActivityKeys
+        guard overflow > 0 else { return }
+        for key in reportedFileActivityOrder.prefix(overflow) {
+            reportedFileActivityKeys.remove(key)
+        }
+        reportedFileActivityOrder.removeFirst(overflow)
     }
 
     private func appendChunk(_ text: String, isThought: Bool) {

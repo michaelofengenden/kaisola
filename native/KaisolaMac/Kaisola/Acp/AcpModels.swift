@@ -44,6 +44,30 @@ struct AcpToolCall: Codable, Equatable, Sendable, Identifiable {
     }
 }
 
+struct AcpFileActivity: Equatable, Sendable {
+    let toolCallID: String
+    let kind: String
+    let path: String
+}
+
+extension AcpToolCall {
+    /// Ordered, deduplicated ACP-declared paths only. Display text and tool
+    /// titles are intentionally excluded: follow mode must never infer a local
+    /// file from prose that merely looks path-like.
+    var declaredFilePaths: [String] {
+        var seen: Set<String> = []
+        var paths: [String] = []
+        for path in locations + content.compactMap({ artifact in
+            guard case let .diff(path, _, _) = artifact else { return nil }
+            return path
+        }) where !path.isEmpty && seen.insert(path).inserted {
+            paths.append(path)
+            if paths.count == 64 { break }
+        }
+        return paths
+    }
+}
+
 /// A single artifact inside a tool call. Mirrors ACP `ToolCallContent`:
 /// a file diff, a generic text/output content block, or a reference to an
 /// agent-spawned terminal (rendered live from `AcpTerminalHost`).

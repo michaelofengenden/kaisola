@@ -55,7 +55,7 @@ final class AcpProcessIntegrationTests: XCTestCase {
         // The mock attaches a diff artifact to its tool_call_update; assert it
         // streams through as parsed content (end-to-end proof of the inline-diff path).
         let diffArrived = events.contains { event in
-            guard case let .toolCallUpdate(_, _, content, _) = event, let content else { return false }
+            guard case let .toolCallUpdate(_, _, content, _, _) = event, let content else { return false }
             return content.contains { artifact in
                 if case let .diff(path, _, _) = artifact { return path == "fixture/notes.txt" }
                 return false
@@ -107,7 +107,7 @@ final class AcpProcessIntegrationTests: XCTestCase {
         // The mock's final update for term-tool-1 carries the exit report our
         // host produced: /bin/echo exits 0.
         let sawExitReport = events.contains { event in
-            guard case let .toolCallUpdate(id, _, content, _) = event, id == "term-tool-1", let content else { return false }
+            guard case let .toolCallUpdate(id, _, content, _, _) = event, id == "term-tool-1", let content else { return false }
             return content.contains { artifact in
                 if case let .text(text) = artifact { return text.contains("terminal-exit:") && text.contains("\"exitCode\":0") }
                 return false
@@ -116,7 +116,7 @@ final class AcpProcessIntegrationTests: XCTestCase {
         XCTAssertTrue(sawExitReport, "expected the mock to report our terminal host's exit status")
         // And the terminal reference itself streamed as live terminal content.
         let sawTerminalRef = events.contains { event in
-            guard case let .toolCallUpdate(_, _, content, _) = event, let content else { return false }
+            guard case let .toolCallUpdate(_, _, content, _, _) = event, let content else { return false }
             return content.contains { if case .terminal = $0 { return true } else { return false } }
         }
         XCTAssertTrue(sawTerminalRef, "expected a terminal content reference in the tool card")

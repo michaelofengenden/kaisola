@@ -32,6 +32,7 @@
 		C0DE10000000000000000004 /* CodeEditor in Resources */ = {isa = PBXBuildFile; fileRef = C0DE10000000000000000003 /* CodeEditor */; };
 		C0DE10000000000000000006 /* CodeEditorViewTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = C0DE10000000000000000005 /* CodeEditorViewTests.swift */; };
 		50A0CE000000000000000002 /* SourceOutline.swift in Sources */ = {isa = PBXBuildFile; fileRef = 50A0CE000000000000000001 /* SourceOutline.swift */; };
+		A6E17F000000000000000002 /* AgentFileFollow.swift in Sources */ = {isa = PBXBuildFile; fileRef = A6E17F000000000000000001 /* AgentFileFollow.swift */; };
 		120DB3BB674B60C5B51F0F44 /* AppAccountView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5F2770649BEF99AA932FFBDF /* AppAccountView.swift */; };
 		12EAB0BC4C613FF5DF4FF4FF /* McpConfigStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = FDE152F4457B8AF7E5A92225 /* McpConfigStore.swift */; };
 		137B0B37E2B58DE72AC839A2 /* QuietIdentityMarkTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = DCA7D7BB9E3FF610CA333A17 /* QuietIdentityMarkTests.swift */; };
@@ -346,6 +347,7 @@
 		C0DE10000000000000000003 /* CodeEditor */ = {isa = PBXFileReference; lastKnownFileType = folder; path = Resources/CodeEditor; sourceTree = "<group>"; };
 		C0DE10000000000000000005 /* CodeEditorViewTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CodeEditorViewTests.swift; sourceTree = "<group>"; };
 		50A0CE000000000000000001 /* SourceOutline.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SourceOutline.swift; sourceTree = "<group>"; };
+		A6E17F000000000000000001 /* AgentFileFollow.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AgentFileFollow.swift; sourceTree = "<group>"; };
 		A1000000000000000000000B /* MarkdownPreview.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MarkdownPreview.swift; sourceTree = "<group>"; };
 		5245B06FDE5E37D212A59E72 /* NativeUpdateController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NativeUpdateController.swift; sourceTree = "<group>"; };
 		53455843EE4C394EEF0158BC /* MeshSessionTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MeshSessionTests.swift; sourceTree = "<group>"; };
@@ -571,6 +573,7 @@
 		3AABBB474A3D9EBF5F5E9E72 /* Workspace */ = {
 			isa = PBXGroup;
 			children = (
+				A6E17F000000000000000001 /* AgentFileFollow.swift */,
 				3D651B2D78C5F94B243E1DC2 /* BrowserCardView.swift */,
 				C0DE10000000000000000001 /* CodeEditorView.swift */,
 				681E5B3C599B2137041A4E8F /* DataPreviews.swift */,
@@ -1089,6 +1092,7 @@
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				A6E17F000000000000000002 /* AgentFileFollow.swift in Sources */,
 				C0DE10000000000000000002 /* CodeEditorView.swift in Sources */,
 				50A0CE000000000000000002 /* SourceOutline.swift in Sources */,
 				4AEED15A504F6575273F165A /* AcpAdapterResolver.swift in Sources */,

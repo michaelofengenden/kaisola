@@ -103,6 +103,7 @@ final class MeshSession: ObservableObject, Identifiable {
     /// manifest before Git registration and immediately after adoption.
     var persistDescriptor: (() async throws -> Void)?
     var onTranscriptChanged: ((_ columnID: String, _ rows: [AcpTranscriptRow]) -> Void)?
+    var onFileActivity: ((_ columnID: String, _ activity: AcpFileActivity) -> Bool)?
     var onDraftChanged: ((String) -> Void)?
 
     private let fileManager: FileManager
@@ -777,6 +778,9 @@ final class MeshSession: ObservableObject, Identifiable {
         )
         conversation.onTranscriptChanged = { [weak self] rows in
             self?.onTranscriptChanged?(columnID, rows)
+        }
+        conversation.onFileActivity = { [weak self] activity in
+            self?.onFileActivity?(columnID, activity) ?? false
         }
         conversation.onProviderSessionID = { [weak self] _ in
             guard let self else { return }

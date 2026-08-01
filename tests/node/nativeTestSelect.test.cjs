@@ -54,6 +54,19 @@ test('extracted workspace rail stays on the narrow workspace contract', () => {
   assert.equal(plan.node.mode, 'none')
 })
 
+test('agent file follow selects protocol, project, and workspace safety contracts', () => {
+  const plan = selector.planForChanges([
+    'native/KaisolaMac/Kaisola/Features/Workspace/AgentFileFollow.swift',
+  ], inventory)
+
+  assert.equal(plan.native.mode, 'focused')
+  assert.deepEqual(plan.native.selectors, [
+    'AcpToolArtifactsTests', 'AppModelProjectContextTests', 'WorkspaceFilesTests',
+  ])
+  assert.equal(plan.node.mode, 'none')
+  assert.equal(plan.fallback, false)
+})
+
 test('settings surfaces stay on their bounded account and configuration contracts', () => {
   const plan = selector.planForChanges([
     'native/KaisolaMac/Kaisola/Features/Settings/ApiKeysSettingsTab.swift',

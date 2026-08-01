@@ -597,6 +597,8 @@ final class KaisolaMacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDele
     private var windowCounter = 0
     private var wakeObserver: NSObjectProtocol?
     private var agentsObserver: NSObjectProtocol?
+    private var keymapObserver: NSObjectProtocol?
+    private var commandPresentationObserver: NSObjectProtocol?
     private var runInTerminalObserver: NSObjectProtocol?
     private var checkForUpdatesObserver: NSObjectProtocol?
     private var attentionJumpObserver: NSObjectProtocol?
@@ -825,12 +827,24 @@ final class KaisolaMacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDele
             Task { await auth.restore() }
         }
         installMainMenu()
-        // Custom agents added/removed in Settings rebuild the static AppKit
-        // menus (SwiftUI surfaces re-read the registry on their own).
-        agentsObserver = NotificationCenter.default.addObserver(
-            forName: .kaisolaAgentsChanged, object: nil, queue: .main
+        keymapObserver = NotificationCenter.default.addObserver(
+            forName: .kaisolaKeymapChanged, object: nil, queue: .main
         ) { [weak self] _ in
             Task { @MainActor in self?.installMainMenu() }
+        }
+        commandPresentationObserver = NotificationCenter.default.addObserver(
+            forName: .kaisolaCommandPresentationChanged, object: nil, queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor in self?.refreshMenuStates() }
+        }
+        // Custom agents added/removed in Settings reload both the typed
+        // registry and its validated keymap before rebuilding AppKit menus.
+        agentsObserver = NotificationCenter.default.addObserver(
+            forName: .kaisolaAgentsChanged, object: nil, queue: .main
+        ) { _ in
+            Task { @MainActor in
+                AppCommandKeymapCenter.shared.reload()
+            }
         }
         // The Settings sign-in card asks for a terminal via notification (it
         // has no AppModel). Handled here — not per-window — so exactly one
@@ -1112,11 +1126,12 @@ final class KaisolaMacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDele
             UsageCenter.shared.loadVisualFixture()
             content = AnyView(OnboardingView(
                 model: model,
+                settings: settings,
                 dismiss: {},
                 openAccounts: {},
                 openUpdateSettings: {}
             ))
-        } else if visualFixture, ["settings", "settings-terminal", "settings-terminal-history", "settings-terminal-interaction", "settings-companion", "settings-mcp", "settings-accounts", "settings-models", "settings-account-recovery", "usage"].contains(visualSurface) {
+        } else if visualFixture, ["settings", "settings-terminal", "settings-terminal-history", "settings-terminal-interaction", "settings-companion", "settings-mcp", "settings-accounts", "settings-models", "settings-shortcuts", "settings-account-recovery", "usage"].contains(visualSurface) {
             let workspace = URL(
                 fileURLWithPath: visualWorkspace ?? FileManager.default.currentDirectoryPath,
                 isDirectory: true
@@ -1134,6 +1149,7 @@ final class KaisolaMacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDele
             case "settings-mcp": initialSectionID = "mcp"
             case "settings-accounts": initialSectionID = "accounts"
             case "settings-models": initialSectionID = "models"
+            case "settings-shortcuts": initialSectionID = "shortcuts"
             default: initialSectionID = nil
             }
             let initialContentAnchorID: String?
@@ -1159,7 +1175,7 @@ final class KaisolaMacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDele
         }
 
         let visualSettings = visualFixture
-            && ["settings", "settings-terminal", "settings-terminal-history", "settings-terminal-interaction", "settings-companion", "settings-mcp", "settings-accounts", "settings-models", "settings-account-recovery", "usage"].contains(visualSurface)
+            && ["settings", "settings-terminal", "settings-terminal-history", "settings-terminal-interaction", "settings-companion", "settings-mcp", "settings-accounts", "settings-models", "settings-shortcuts", "settings-account-recovery", "usage"].contains(visualSurface)
         let visualOnboarding = visualFixture && visualSurface == "onboarding"
 
         let window = NSWindow(
@@ -1915,6 +1931,51 @@ final class KaisolaMacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDele
         return NSApp.orderedWindows.compactMap { windowModels[ObjectIdentifier($0)] }.first
     }
 
+    /// Typed command plumbing. The registry owns command meaning; the delegate
+    /// contributes only process/window capabilities that a value-type SwiftUI
+    /// view cannot own.
+    func commandWindow(for model: AppModel?) -> NSWindow? {
+        if let model,
+           let entry = windowModels.first(where: { $0.value === model }) {
+            return NSApp.windows.first { ObjectIdentifier($0) == entry.key }
+        }
+        if let key = NSApp.keyWindow, windowModels[ObjectIdentifier(key)] != nil { return key }
+        if let lastWorkspaceWindow,
+           windowModels[ObjectIdentifier(lastWorkspaceWindow)] != nil {
+            return lastWorkspaceWindow
+        }
+        return NSApp.orderedWindows.first { windowModels[ObjectIdentifier($0)] != nil }
+    }
+
+    func commandFocusedTerminal(for model: AppModel?) -> ReadOnlyTerminalView? {
+        let model = model ?? keyModel()
+        return TerminalFocusResolver.focusedTerminal(
+            in: commandWindow(for: model),
+            paneID: model?.focusedPaneID
+        )
+    }
+
+    var commandCanCheckForUpdates: Bool { updateController.availability.canCheck }
+    var commandUpdateDetail: String? { updateController.availability.detail }
+
+    func performNewWindowCommand() { _ = makeWindow() }
+    func performOpenProjectInNewWindowCommand() { openFolderInNewWindow(nil) }
+    func performOpenSettingsCommand() { openSettings(nil) }
+    func performCheckForUpdatesCommand() { updateController.checkForUpdates(nil) }
+    func performOpenHelpCommand() { openHelp(nil) }
+
+    func performCloseWindowCommand(for model: AppModel?) {
+        commandWindow(for: model)?.performClose(nil)
+    }
+
+    @objc private func runRegisteredCommand(_ sender: Any?) {
+        guard let rawID = (sender as? NSMenuItem)?.representedObject as? String else { return }
+        _ = AppCommandRegistry.execute(
+            AppCommandID(rawValue: rawID),
+            in: AppCommandContext(model: keyModel(), settings: settings)
+        )
+    }
+
     private func revealAttentionTarget(_ targetID: String) {
         let ordered = NSApp.orderedWindows.compactMap { window -> (NSWindow, AppModel)? in
             windowModels[ObjectIdentifier(window)].map { (window, $0) }
@@ -2509,10 +2570,16 @@ final class KaisolaMacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDele
             NSWorkspace.shared.notificationCenter.removeObserver(wakeObserver)
         }
         if let agentsObserver { NotificationCenter.default.removeObserver(agentsObserver) }
+        if let keymapObserver { NotificationCenter.default.removeObserver(keymapObserver) }
+        if let commandPresentationObserver {
+            NotificationCenter.default.removeObserver(commandPresentationObserver)
+        }
         if let runInTerminalObserver { NotificationCenter.default.removeObserver(runInTerminalObserver) }
         if let checkForUpdatesObserver { NotificationCenter.default.removeObserver(checkForUpdatesObserver) }
         wakeObserver = nil
         agentsObserver = nil
+        keymapObserver = nil
+        commandPresentationObserver = nil
         runInTerminalObserver = nil
         checkForUpdatesObserver = nil
         if let suite = Self.isolatedSettingsSuite {
@@ -2640,15 +2707,6 @@ final class KaisolaMacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDele
         }
     }
 
-    @objc private func newWindow(_ sender: Any?) {
-        _ = makeWindow()
-    }
-
-    @objc private func openFolder(_ sender: Any?) {
-        guard let model = keyModel() else { return }
-        RootShellView.promptForOpenFolder(model: model)
-    }
-
     /// Choose a folder first, then create an independent workspace window for
     /// it. This keeps the existing key window untouched and makes the semantic
     /// difference between "switch project" and "open another project" explicit.
@@ -2674,24 +2732,6 @@ final class KaisolaMacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDele
     /// without reaching into the delegate's private window registry.
     static func promptForProjectInNewWindow() {
         (NSApp.delegate as? KaisolaMacAppDelegate)?.openFolderInNewWindow(nil)
-    }
-
-    @objc private func reopenClosedProject(_ sender: Any?) {
-        keyModel()?.reopenLastClosedProject()
-    }
-
-    @objc private func reopenClosedSession(_ sender: Any?) {
-        guard let model = keyModel() else { return }
-        Task { await model.reopenLastClosedSession() }
-    }
-
-    @objc private func reopenClosedFileTab(_ sender: Any?) {
-        keyModel()?.reopenClosedFileTab()
-    }
-
-    @objc private func closeActiveFileTab(_ sender: Any?) {
-        guard let model = keyModel(), model.previewedFileURL != nil else { return }
-        NotificationCenter.default.post(name: .kaisolaCloseActiveFileTab, object: model)
     }
 
     /// Open a session in its own fresh window (the native "pop out"): the new
@@ -2736,44 +2776,6 @@ final class KaisolaMacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDele
             return true
         }
         return false
-    }
-
-    @objc private func increaseTerminalFont(_ sender: Any?) { settings.adjustTerminalFont(by: 1) }
-    @objc private func decreaseTerminalFont(_ sender: Any?) { settings.adjustTerminalFont(by: -1) }
-    @objc private func resetTerminalFont(_ sender: Any?) { settings.resetTerminalFont() }
-
-    /// The terminal a View > Terminal command acts on: the model's focused pane
-    /// first, because that is the surface the user can see ringed.
-    private func focusedTerminalView() -> ReadOnlyTerminalView? {
-        TerminalFocusResolver.focusedTerminal(
-            in: NSApp.keyWindow,
-            paneID: keyModel()?.focusedPaneID
-        )
-    }
-
-    @objc private func clearFocusedTerminal(_ sender: Any?) {
-        guard let terminal = focusedTerminalView() else {
-            ToastCenter.shared.show(TerminalClearCommand.noTerminalMessage, style: .info)
-            return
-        }
-        terminal.clearLiveScrollback()
-    }
-
-    @objc private func focusNextPane(_ sender: Any?) {
-        keyModel()?.cyclePaneFocus(forward: true)
-    }
-
-    @objc private func focusPreviousPane(_ sender: Any?) {
-        keyModel()?.cyclePaneFocus(forward: false)
-    }
-
-    @objc private func scrollFocusedTerminalToLatest(_ sender: Any?) {
-        guard let terminal = focusedTerminalView() else {
-            ToastCenter.shared.show(TerminalClearCommand.noTerminalMessage, style: .info)
-            return
-        }
-        terminal.resumeLiveFollow()
-        terminal.scrollToLiveBottom()
     }
 
     // MARK: - Recents & saved windows
@@ -2887,10 +2889,6 @@ final class KaisolaMacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDele
         }
     }
 
-    @objc private func checkForUpdates(_ sender: Any?) {
-        updateController.checkForUpdates(sender)
-    }
-
     private var settingsWindow: NSWindow?
 
     @objc func openSettings(_ sender: Any?) {
@@ -2974,76 +2972,32 @@ final class KaisolaMacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDele
         window.contentView = NSHostingView(rootView: view.environmentObject(auth))
     }
 
-    @objc private func newTerminalSession(_ sender: Any?) {
-        guard let model = keyModel() else { return }
-        RootShellView.promptForNewTerminal(model: model)
-    }
-
-    @objc private func newAgentSession(_ sender: Any?) {
-        guard let item = sender as? NSMenuItem, let model = keyModel(),
-              let agent = AgentRegistry.profile(id: item.representedObject as? String ?? "") else { return }
-        RootShellView.promptForNewAgent(agent, model: model)
-    }
-
-    @objc private func newChatSession(_ sender: Any?) {
-        guard let item = sender as? NSMenuItem, let model = keyModel(),
-              let agent = AgentRegistry.profile(id: item.representedObject as? String ?? "") else { return }
-        RootShellView.promptForNewChat(agent, model: model)
-    }
-
-    @objc private func setNavigationLayout(_ sender: Any?) {
-        guard let item = sender as? NSMenuItem,
-              let layout = (item.representedObject as? String).flatMap(NavigationLayout.init) else { return }
-        settings.navigationLayout = layout
-        refreshMenuStates()
-    }
-
-    @objc private func setAppearanceMode(_ sender: Any?) {
-        guard let item = sender as? NSMenuItem,
-              let mode = (item.representedObject as? String).flatMap(AppearanceMode.init) else { return }
-        settings.appearance = mode
-        refreshMenuStates()
-    }
-
-    @objc private func selectPreviousFileTab(_ sender: Any?) {
-        keyModel()?.selectAdjacentFileTab(direction: -1)
-    }
-
-    @objc private func selectNextFileTab(_ sender: Any?) {
-        keyModel()?.selectAdjacentFileTab(direction: 1)
-    }
-
     func validateMenuItem(_ menuItem: NSMenuItem) -> Bool {
-        if menuItem.action == #selector(selectPreviousFileTab(_:))
-            || menuItem.action == #selector(selectNextFileTab(_:)) {
-            guard let model = keyModel() else { return false }
-            return model.fileTabs(for: model.selectedProjectID).count > 1
+        guard let rawID = menuItem.representedObject as? String,
+              AppCommandRegistry.definition(for: AppCommandID(rawValue: rawID)) != nil else {
+            return true
         }
-        if menuItem.action == #selector(reopenClosedFileTab(_:)) {
-            return keyModel()?.canReopenClosedFileTab == true
+        let id = AppCommandID(rawValue: rawID)
+        if id == .closeContext {
+            menuItem.title = keyModel()?.previewedFileURL == nil ? "Close Window" : "Close File Tab"
         }
-        if menuItem.action == #selector(closeActiveFileTab(_:)) {
-            return keyModel()?.previewedFileURL != nil
-        }
-        if menuItem.action == #selector(clearFocusedTerminal(_:))
-            || menuItem.action == #selector(scrollFocusedTerminalToLatest(_:)) {
-            return focusedTerminalView() != nil
-        }
-        if menuItem.action == #selector(focusNextPane(_:))
-            || menuItem.action == #selector(focusPreviousPane(_:)) {
-            return keyModel()?.canCyclePaneFocus == true
-        }
-        return true
+        let availability = AppCommandRegistry.availability(
+            of: id,
+            in: AppCommandContext(model: keyModel(), settings: settings)
+        )
+        if let reason = availability.reason { menuItem.toolTip = reason }
+        return availability.isEnabled
     }
 
     /// Reflect the current layout/appearance selection as menu checkmarks.
     private func refreshMenuStates() {
         for item in NSApp.mainMenu?.item(withTitle: "View")?.submenu?.items ?? [] {
             if let raw = item.representedObject as? String {
-                if NavigationLayout(rawValue: raw) != nil {
-                    item.state = raw == settings.navigationLayout.rawValue ? .on : .off
-                } else if AppearanceMode(rawValue: raw) != nil {
-                    item.state = raw == settings.appearance.rawValue ? .on : .off
+                let id = AppCommandID(rawValue: raw)
+                if let layout = id.navigationLayout {
+                    item.state = layout == settings.navigationLayout ? .on : .off
+                } else if let appearance = id.appearance {
+                    item.state = appearance == settings.appearance ? .on : .off
                 }
             }
         }
@@ -3051,46 +3005,13 @@ final class KaisolaMacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDele
 
     private func installMainMenu() {
         NSApp.mainMenu = Self.makeMainMenu(
-            updateTarget: self,
-            updateAction: #selector(checkForUpdates(_:)),
+            updateTarget: nil,
+            updateAction: nil,
             updateEnabled: updateController.availability.canCheck,
             updateDetail: updateController.availability.detail,
-            newWindowTarget: self,
-            newWindowAction: #selector(newWindow(_:)),
-            openFolderTarget: self,
-            openFolderAction: #selector(openFolder(_:)),
-            openFolderInNewWindowTarget: self,
-            openFolderInNewWindowAction: #selector(openFolderInNewWindow(_:)),
-            reopenClosedProjectTarget: self,
-            reopenClosedProjectAction: #selector(reopenClosedProject(_:)),
-            reopenClosedSessionTarget: self,
-            reopenClosedSessionAction: #selector(reopenClosedSession(_:)),
-            reopenClosedFileTabTarget: self,
-            reopenClosedFileTabAction: #selector(reopenClosedFileTab(_:)),
-            closeFileTabTarget: self,
-            closeFileTabAction: #selector(closeActiveFileTab(_:)),
-            newTerminalTarget: self,
-            newTerminalAction: #selector(newTerminalSession(_:)),
-            newAgentTarget: self,
-            newAgentAction: #selector(newAgentSession(_:)),
-            newChatTarget: self,
-            newChatAction: #selector(newChatSession(_:)),
-            viewTarget: self,
-            layoutAction: #selector(setNavigationLayout(_:)),
-            appearanceAction: #selector(setAppearanceMode(_:)),
-            fileTabTarget: self,
-            previousFileTabAction: #selector(selectPreviousFileTab(_:)),
-            nextFileTabAction: #selector(selectNextFileTab(_:)),
-            fontTarget: self,
-            fontIncreaseAction: #selector(increaseTerminalFont(_:)),
-            fontDecreaseAction: #selector(decreaseTerminalFont(_:)),
-            fontResetAction: #selector(resetTerminalFont(_:)),
-            terminalCommandTarget: self,
-            clearTerminalAction: #selector(clearFocusedTerminal(_:)),
-            scrollToLatestOutputAction: #selector(scrollFocusedTerminalToLatest(_:)),
-            paneFocusTarget: self,
-            focusNextPaneAction: #selector(focusNextPane(_:)),
-            focusPreviousPaneAction: #selector(focusPreviousPane(_:)),
+            commandTarget: self,
+            commandAction: #selector(runRegisteredCommand(_:)),
+            keymap: AppCommandKeymapCenter.shared.snapshot,
             dynamicMenusDelegate: self,
             saveWindowTarget: self,
             saveWindowAction: #selector(saveWindowLayout(_:)),
@@ -3109,6 +3030,9 @@ final class KaisolaMacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDele
         updateAction: Selector?,
         updateEnabled: Bool,
         updateDetail: String?,
+        commandTarget: AnyObject? = nil,
+        commandAction: Selector? = nil,
+        keymap: AppCommandKeymapSnapshot? = nil,
         newWindowTarget: AnyObject? = nil,
         newWindowAction: Selector? = nil,
         openFolderTarget: AnyObject? = nil,
@@ -3151,6 +3075,35 @@ final class KaisolaMacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDele
         currentLayout: String = NavigationLayout.leftTree.rawValue,
         currentAppearance: String = AppearanceMode.system.rawValue
     ) -> NSMenu {
+        let effectiveKeymap = keymap ?? AppCommandKeymapSnapshot(
+            effectiveShortcuts: AppCommandKeymapStore.defaultShortcuts(
+                definitions: AppCommandRegistry.keymapDefinitions
+            ),
+            status: .defaults,
+            fileExists: false
+        )
+
+        @discardableResult
+        func addRegisteredItem(
+            to menu: NSMenu,
+            id: AppCommandID,
+            title: String? = nil,
+            fallbackTarget: AnyObject?,
+            fallbackAction: Selector?
+        ) -> NSMenuItem {
+            let definition = AppCommandRegistry.definition(for: id)
+            let shortcut = effectiveKeymap.shortcut(for: id)
+            let item = menu.addItem(
+                withTitle: title ?? definition?.title ?? id.rawValue,
+                action: commandAction ?? fallbackAction,
+                keyEquivalent: shortcut?.appKitKeyEquivalent ?? ""
+            )
+            if let shortcut { item.keyEquivalentModifierMask = shortcut.appKitModifiers }
+            item.target = commandAction == nil ? fallbackTarget : commandTarget
+            item.representedObject = id.rawValue
+            return item
+        }
+
         let mainMenu = NSMenu()
         let applicationItem = NSMenuItem()
         applicationItem.title = "Kaisola"
@@ -3162,21 +3115,21 @@ final class KaisolaMacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDele
             action: #selector(NSApplication.orderFrontStandardAboutPanel(_:)),
             keyEquivalent: ""
         )
-        let updateItem = applicationMenu.addItem(
-            withTitle: "Check for Updates…",
-            action: updateAction,
-            keyEquivalent: ""
+        let updateItem = addRegisteredItem(
+            to: applicationMenu,
+            id: .checkForUpdates,
+            fallbackTarget: updateTarget,
+            fallbackAction: updateAction
         )
-        updateItem.target = updateTarget
         updateItem.isEnabled = updateEnabled
         updateItem.toolTip = updateDetail
         applicationMenu.addItem(.separator())
-        let settingsItem = applicationMenu.addItem(
-            withTitle: "Settings…",
-            action: #selector(KaisolaMacAppDelegate.openSettings(_:)),
-            keyEquivalent: ","
+        _ = addRegisteredItem(
+            to: applicationMenu,
+            id: .openSettings,
+            fallbackTarget: nil,
+            fallbackAction: #selector(KaisolaMacAppDelegate.openSettings(_:))
         )
-        settingsItem.target = nil   // first responder → the app delegate
         applicationMenu.addItem(.separator())
         applicationMenu.addItem(
             withTitle: "Hide Kaisola",
@@ -3194,24 +3147,30 @@ final class KaisolaMacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDele
         let fileItem = NSMenuItem()
         fileItem.title = "File"
         let fileMenu = NSMenu(title: "File")
-        if let newWindowAction {
-            let item = fileMenu.addItem(withTitle: "New Window", action: newWindowAction, keyEquivalent: "n")
-            item.keyEquivalentModifierMask = [.command, .shift]
-            item.target = newWindowTarget
+        if commandAction != nil || newWindowAction != nil {
+            addRegisteredItem(
+                to: fileMenu,
+                id: .newWindow,
+                fallbackTarget: newWindowTarget,
+                fallbackAction: newWindowAction
+            )
             fileMenu.addItem(.separator())
         }
-        if let openFolderAction {
-            let item = fileMenu.addItem(withTitle: "Open Folder…", action: openFolderAction, keyEquivalent: "o")
-            item.target = openFolderTarget
-        }
-        if let openFolderInNewWindowAction {
-            let item = fileMenu.addItem(
-                withTitle: "Open Project in New Window…",
-                action: openFolderInNewWindowAction,
-                keyEquivalent: "o"
+        if commandAction != nil || openFolderAction != nil {
+            addRegisteredItem(
+                to: fileMenu,
+                id: .openProject,
+                fallbackTarget: openFolderTarget,
+                fallbackAction: openFolderAction
             )
-            item.keyEquivalentModifierMask = [.command, .option]
-            item.target = openFolderInNewWindowTarget
+        }
+        if commandAction != nil || openFolderInNewWindowAction != nil {
+            addRegisteredItem(
+                to: fileMenu,
+                id: .openProjectInNewWindow,
+                fallbackTarget: openFolderInNewWindowTarget,
+                fallbackAction: openFolderInNewWindowAction
+            )
         }
         if let dynamicMenusDelegate {
             let recentItem = fileMenu.addItem(withTitle: "Open Recent", action: nil, keyEquivalent: "")
@@ -3219,71 +3178,97 @@ final class KaisolaMacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDele
             recentMenu.delegate = dynamicMenusDelegate
             recentItem.submenu = recentMenu
         }
-        if let reopenClosedFileTabAction {
-            let item = fileMenu.addItem(
-                withTitle: "Reopen Closed File Tab",
-                action: reopenClosedFileTabAction,
-                keyEquivalent: "t"
+        if commandAction != nil || reopenClosedFileTabAction != nil {
+            addRegisteredItem(
+                to: fileMenu,
+                id: .reopenClosedFileTab,
+                fallbackTarget: reopenClosedFileTabTarget,
+                fallbackAction: reopenClosedFileTabAction
             )
-            item.keyEquivalentModifierMask = [.command, .shift]
-            item.target = reopenClosedFileTabTarget
         }
-        if let reopenClosedProjectAction {
-            let item = fileMenu.addItem(withTitle: "Reopen Closed Project", action: reopenClosedProjectAction, keyEquivalent: "t")
-            item.keyEquivalentModifierMask = [.command, .option, .shift]
-            item.target = reopenClosedProjectTarget
+        if commandAction != nil || reopenClosedProjectAction != nil {
+            addRegisteredItem(
+                to: fileMenu,
+                id: .reopenClosedProject,
+                fallbackTarget: reopenClosedProjectTarget,
+                fallbackAction: reopenClosedProjectAction
+            )
         }
-        if let reopenClosedSessionAction {
-            let item = fileMenu.addItem(withTitle: "Reopen Closed Session", action: reopenClosedSessionAction, keyEquivalent: "t")
-            item.keyEquivalentModifierMask = [.command, .option]
-            item.target = reopenClosedSessionTarget
+        if commandAction != nil || reopenClosedSessionAction != nil {
+            addRegisteredItem(
+                to: fileMenu,
+                id: .reopenClosedSession,
+                fallbackTarget: reopenClosedSessionTarget,
+                fallbackAction: reopenClosedSessionAction
+            )
         }
-        if let closeFileTabAction {
+        if commandAction != nil || closeFileTabAction != nil {
             fileMenu.addItem(.separator())
-            let closeFile = fileMenu.addItem(
-                withTitle: "Close File Tab",
-                action: closeFileTabAction,
-                keyEquivalent: "w"
+            addRegisteredItem(
+                to: fileMenu,
+                id: .closeContext,
+                title: "Close File Tab",
+                fallbackTarget: closeFileTabTarget,
+                fallbackAction: closeFileTabAction
             )
-            closeFile.target = closeFileTabTarget
-            let closeWindow = fileMenu.addItem(
-                withTitle: "Close Window",
-                action: #selector(NSWindow.performClose(_:)),
-                keyEquivalent: "w"
+            addRegisteredItem(
+                to: fileMenu,
+                id: .closeWindow,
+                fallbackTarget: nil,
+                fallbackAction: #selector(NSWindow.performClose(_:))
             )
-            closeWindow.keyEquivalentModifierMask = [.command, .shift]
         }
-        if openFolderAction != nil || openFolderInNewWindowAction != nil
+        if commandAction != nil || openFolderAction != nil || openFolderInNewWindowAction != nil
             || reopenClosedFileTabAction != nil || reopenClosedProjectAction != nil
             || reopenClosedSessionAction != nil {
             fileMenu.addItem(.separator())
         }
-        if let newChatAction {
+        if commandAction != nil || newChatAction != nil {
             let chatItem = fileMenu.addItem(withTitle: "New Chat", action: nil, keyEquivalent: "")
             let chatMenu = NSMenu(title: "New Chat")
             for agent in AgentRegistry.all where AcpAdapter.forAgent(agent.id) != nil {
-                let item = chatMenu.addItem(withTitle: "Chat with \(agent.name)", action: newChatAction, keyEquivalent: "")
-                item.target = newChatTarget
-                item.representedObject = agent.id
+                addRegisteredItem(
+                    to: chatMenu,
+                    id: .newChat(agent.id),
+                    fallbackTarget: newChatTarget,
+                    fallbackAction: newChatAction
+                )
             }
             chatItem.submenu = chatMenu
             fileMenu.addItem(.separator())
         }
-        let newTerminal = fileMenu.addItem(
-            withTitle: "New Terminal Session…",
-            action: newTerminalAction,
-            keyEquivalent: "t"
+        addRegisteredItem(
+            to: fileMenu,
+            id: .newTerminal,
+            fallbackTarget: newTerminalTarget,
+            fallbackAction: newTerminalAction
         )
-        newTerminal.target = newTerminalTarget
-        if let newAgentAction {
+        if commandAction != nil || newAgentAction != nil {
             let agentItem = fileMenu.addItem(withTitle: "New Agent Session", action: nil, keyEquivalent: "")
             let agentMenu = NSMenu(title: "New Agent Session")
             for agent in AgentRegistry.all {
-                let item = agentMenu.addItem(withTitle: agent.name, action: newAgentAction, keyEquivalent: "")
-                item.target = newAgentTarget
-                item.representedObject = agent.id
+                addRegisteredItem(
+                    to: agentMenu,
+                    id: .newAgent(agent.id),
+                    title: agent.name,
+                    fallbackTarget: newAgentTarget,
+                    fallbackAction: newAgentAction
+                )
             }
             agentItem.submenu = agentMenu
+        }
+        if commandAction != nil {
+            let meshItem = fileMenu.addItem(withTitle: "New Mesh", action: nil, keyEquivalent: "")
+            let meshMenu = NSMenu(title: "New Mesh")
+            for id in [AppCommandID.newMesh, .newStagedMesh, .newIdeaMesh] {
+                addRegisteredItem(
+                    to: meshMenu,
+                    id: id,
+                    fallbackTarget: nil,
+                    fallbackAction: nil
+                )
+            }
+            meshItem.submenu = meshMenu
         }
         fileItem.submenu = fileMenu
         mainMenu.addItem(fileItem)
@@ -3325,95 +3310,124 @@ final class KaisolaMacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDele
         editItem.submenu = editMenu
         mainMenu.addItem(editItem)
 
-        if let layoutAction, let appearanceAction {
+        if commandAction != nil || (layoutAction != nil && appearanceAction != nil) {
             let viewItem = NSMenuItem()
             viewItem.title = "View"
             let viewMenu = NSMenu(title: "View")
             viewMenu.addItem(sectionHeader("Navigation Layout"))
             for layout in NavigationLayout.allCases {
-                let item = viewMenu.addItem(withTitle: layout.title, action: layoutAction, keyEquivalent: "")
-                item.target = viewTarget
-                item.representedObject = layout.rawValue
+                let item = addRegisteredItem(
+                    to: viewMenu,
+                    id: .navigationLayout(layout),
+                    title: layout.title,
+                    fallbackTarget: viewTarget,
+                    fallbackAction: layoutAction
+                )
                 item.state = layout.rawValue == currentLayout ? .on : .off
             }
             viewMenu.addItem(.separator())
             viewMenu.addItem(sectionHeader("Appearance"))
             for mode in AppearanceMode.allCases {
-                let item = viewMenu.addItem(withTitle: mode.title, action: appearanceAction, keyEquivalent: "")
-                item.target = viewTarget
-                item.representedObject = mode.rawValue
+                let item = addRegisteredItem(
+                    to: viewMenu,
+                    id: .appearance(mode),
+                    title: mode.title,
+                    fallbackTarget: viewTarget,
+                    fallbackAction: appearanceAction
+                )
                 item.state = mode.rawValue == currentAppearance ? .on : .off
             }
-            if let previousFileTabAction, let nextFileTabAction {
+            if commandAction != nil {
+                viewMenu.addItem(.separator())
+                viewMenu.addItem(sectionHeader("Workspace"))
+                for id in [
+                    AppCommandID.commandPalette,
+                    .messageCurrentAgent,
+                    .toggleFiles,
+                    .toggleDocumentPreview,
+                    .openExternalEditor,
+                ] {
+                    addRegisteredItem(
+                        to: viewMenu,
+                        id: id,
+                        fallbackTarget: nil,
+                        fallbackAction: nil
+                    )
+                }
+            }
+            if commandAction != nil || (previousFileTabAction != nil && nextFileTabAction != nil) {
                 viewMenu.addItem(.separator())
                 viewMenu.addItem(sectionHeader("Editor Tabs"))
-                let previous = viewMenu.addItem(
-                    withTitle: "Previous File Tab",
-                    action: previousFileTabAction,
-                    keyEquivalent: "\u{F702}"
+                addRegisteredItem(
+                    to: viewMenu,
+                    id: .previousFileTab,
+                    fallbackTarget: fileTabTarget,
+                    fallbackAction: previousFileTabAction
                 )
-                previous.target = fileTabTarget
-                previous.keyEquivalentModifierMask = [.command, .option]
-                let next = viewMenu.addItem(
-                    withTitle: "Next File Tab",
-                    action: nextFileTabAction,
-                    keyEquivalent: "\u{F703}"
+                addRegisteredItem(
+                    to: viewMenu,
+                    id: .nextFileTab,
+                    fallbackTarget: fileTabTarget,
+                    fallbackAction: nextFileTabAction
                 )
-                next.target = fileTabTarget
-                next.keyEquivalentModifierMask = [.command, .option]
             }
-            if let fontIncreaseAction, let fontDecreaseAction, let fontResetAction {
+            if commandAction != nil
+                || (fontIncreaseAction != nil && fontDecreaseAction != nil && fontResetAction != nil) {
                 viewMenu.addItem(.separator())
                 viewMenu.addItem(sectionHeader("Terminal Font"))
-                let bigger = viewMenu.addItem(withTitle: "Bigger", action: fontIncreaseAction, keyEquivalent: "+")
-                bigger.target = fontTarget
-                let smaller = viewMenu.addItem(withTitle: "Smaller", action: fontDecreaseAction, keyEquivalent: "-")
-                smaller.target = fontTarget
-                let reset = viewMenu.addItem(withTitle: "Reset Size", action: fontResetAction, keyEquivalent: "0")
-                reset.target = fontTarget
+                addRegisteredItem(
+                    to: viewMenu,
+                    id: .increaseTerminalFont,
+                    fallbackTarget: fontTarget,
+                    fallbackAction: fontIncreaseAction
+                )
+                addRegisteredItem(
+                    to: viewMenu,
+                    id: .decreaseTerminalFont,
+                    fallbackTarget: fontTarget,
+                    fallbackAction: fontDecreaseAction
+                )
+                addRegisteredItem(
+                    to: viewMenu,
+                    id: .resetTerminalFont,
+                    fallbackTarget: fontTarget,
+                    fallbackAction: fontResetAction
+                )
             }
-            if let clearTerminalAction, let scrollToLatestOutputAction {
+            if commandAction != nil
+                || (clearTerminalAction != nil && scrollToLatestOutputAction != nil) {
                 viewMenu.addItem(.separator())
                 viewMenu.addItem(sectionHeader("Terminal"))
-                // NOT Command-K: that is the command palette. Option-Command-K
-                // is the free neighbour every terminal user already reaches for.
-                let clear = viewMenu.addItem(
-                    withTitle: "Clear Terminal",
-                    action: clearTerminalAction,
-                    keyEquivalent: "k"
+                let clear = addRegisteredItem(
+                    to: viewMenu,
+                    id: .clearTerminal,
+                    fallbackTarget: terminalCommandTarget,
+                    fallbackAction: clearTerminalAction
                 )
-                clear.keyEquivalentModifierMask = [.command, .option]
-                clear.target = terminalCommandTarget
                 clear.toolTip = "Clears this terminal's visible output and scroll buffer. Retained history stays available in the transcript."
-                // The pill on a scrolled-up terminal is a pointer affordance;
-                // this is the same action for keyboard and VoiceOver users.
-                let latest = viewMenu.addItem(
-                    withTitle: "Scroll to Latest Output",
-                    action: scrollToLatestOutputAction,
-                    keyEquivalent: "\u{F701}"
+                addRegisteredItem(
+                    to: viewMenu,
+                    id: .scrollTerminalToLatest,
+                    fallbackTarget: terminalCommandTarget,
+                    fallbackAction: scrollToLatestOutputAction
                 )
-                latest.keyEquivalentModifierMask = [.command, .option]
-                latest.target = terminalCommandTarget
             }
-            if let focusNextPaneAction, let focusPreviousPaneAction {
+            if commandAction != nil
+                || (focusNextPaneAction != nil && focusPreviousPaneAction != nil) {
                 viewMenu.addItem(.separator())
                 viewMenu.addItem(sectionHeader("Focus"))
-                // Option-Command-arrows already move editor tabs, so pane focus
-                // takes the free Control-Command pair rather than shadowing it.
-                let previous = viewMenu.addItem(
-                    withTitle: "Focus Previous Pane",
-                    action: focusPreviousPaneAction,
-                    keyEquivalent: "\u{F702}"
+                addRegisteredItem(
+                    to: viewMenu,
+                    id: .focusPreviousPane,
+                    fallbackTarget: paneFocusTarget,
+                    fallbackAction: focusPreviousPaneAction
                 )
-                previous.keyEquivalentModifierMask = [.command, .control]
-                previous.target = paneFocusTarget
-                let next = viewMenu.addItem(
-                    withTitle: "Focus Next Pane",
-                    action: focusNextPaneAction,
-                    keyEquivalent: "\u{F703}"
+                addRegisteredItem(
+                    to: viewMenu,
+                    id: .focusNextPane,
+                    fallbackTarget: paneFocusTarget,
+                    fallbackAction: focusNextPaneAction
                 )
-                next.keyEquivalentModifierMask = [.command, .control]
-                next.target = paneFocusTarget
             }
             viewItem.submenu = viewMenu
             mainMenu.addItem(viewItem)
@@ -3446,8 +3460,12 @@ final class KaisolaMacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDele
         let helpItem = NSMenuItem()
         helpItem.title = "Help"
         let helpMenu = NSMenu(title: "Help")
-        let help = helpMenu.addItem(withTitle: "Kaisola Help", action: #selector(KaisolaMacAppDelegate.openHelp(_:)), keyEquivalent: "?")
-        help.target = nil   // first responder → the app delegate
+        addRegisteredItem(
+            to: helpMenu,
+            id: .openHelp,
+            fallbackTarget: nil,
+            fallbackAction: #selector(KaisolaMacAppDelegate.openHelp(_:))
+        )
         helpItem.submenu = helpMenu
         mainMenu.addItem(helpItem)
 

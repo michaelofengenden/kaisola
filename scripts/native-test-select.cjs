@@ -41,14 +41,14 @@ const NATIVE_DIRECTORY_TESTS = Object.freeze([
     'CompanionTerminalStreamHubTests',
   ]],
   ['native/KaisolaMac/Kaisola/Features/Palette/', [
-    'FuzzyMatchTests', 'OmniBarDispatchTests',
+    'CommandRegistryTests', 'FuzzyMatchTests', 'OmniBarDispatchTests',
   ]],
   ['native/KaisolaMac/Kaisola/Features/Onboarding/', [
     'OnboardingStateTests', 'UsageCenterTests',
   ]],
   ['native/KaisolaMac/Kaisola/Features/Settings/', [
     'ApiKeyStoreTests', 'AppModelProjectContextTests',
-    'CompanionConnectionSessionTests', 'McpConfigStoreTests',
+    'CommandRegistryTests', 'CompanionConnectionSessionTests', 'McpConfigStoreTests',
     'NativePreviewSettingsTests', 'NativeUpdateConfigurationTests',
     'NotificationBridgeTests', 'UsageCenterTests',
   ]],
@@ -73,7 +73,16 @@ const FILE_PREVIEW_TESTS = Object.freeze([
 
 const NATIVE_FILE_TESTS = Object.freeze(new Map([
   ['native/KaisolaMac/Kaisola/Features/Onboarding/OnboardingView.swift', [
-    'OnboardingStateTests', 'UsageCenterTests',
+    'CommandRegistryTests', 'OnboardingStateTests', 'UsageCenterTests',
+  ]],
+  ['native/KaisolaMac/Kaisola/App/KaisolaMacAppDelegate.swift', [
+    'CommandRegistryTests', 'NativePreviewSettingsTests', 'NativeTerminalInteractionTests',
+  ]],
+  ['native/KaisolaMac/Kaisola/Features/Palette/CommandPaletteView.swift', [
+    'CommandRegistryTests', 'FuzzyMatchTests',
+  ]],
+  ['native/KaisolaMac/Kaisola/Features/Palette/CommandRegistry.swift', [
+    'CommandRegistryTests',
   ]],
   ['native/KaisolaMac/Kaisola/App/AppModel.swift', [
     'AppModelBrokerFallbackTests', 'AppModelProjectContextTests',
@@ -85,7 +94,7 @@ const NATIVE_FILE_TESTS = Object.freeze(new Map([
     'TerminalScrollbackDepthTests',
   ]],
   ['native/KaisolaMac/Kaisola/Features/Sessions/RootShellView.swift', [
-    'AppModelProjectContextTests', 'NativePreviewSettingsTests',
+    'AppModelProjectContextTests', 'CommandRegistryTests', 'NativePreviewSettingsTests',
     'SessionPaneLayoutTests',
   ]],
   ['native/KaisolaMac/Kaisola/Features/Workspace/BrowserCardView.swift', [

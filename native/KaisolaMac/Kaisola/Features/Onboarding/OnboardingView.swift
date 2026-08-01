@@ -130,6 +130,7 @@ enum OnboardingReadiness {
 /// when the project and terminal service are ready.
 struct OnboardingView: View {
     @ObservedObject var model: AppModel
+    @ObservedObject var settings: NativePreviewSettings
     @ObservedObject private var usage = UsageCenter.shared
     @ObservedObject private var updates = UpdateCenter.shared
 
@@ -192,7 +193,7 @@ struct OnboardingView: View {
                             symbol: "folder.fill",
                             status: projectStatus,
                             actionTitle: model.currentProjectDirectory == nil ? "Choose Project…" : nil,
-                            action: { RootShellView.promptForOpenFolder(model: model) }
+                            action: { runCommand(.openProject) }
                         )
                         readinessRow(
                             title: "Terminal Continuity",
@@ -375,11 +376,18 @@ struct OnboardingView: View {
     private func startFirstSession() {
         guard canStart else { return }
         if selectedAgent.id == AgentProfile.shell.id {
-            RootShellView.promptForNewTerminal(model: model)
+            runCommand(.newTerminal)
         } else {
-            RootShellView.promptForNewAgent(selectedAgent, model: model)
+            runCommand(.newAgent(selectedAgent.id))
         }
         dismiss()
+    }
+
+    private func runCommand(_ id: AppCommandID) {
+        _ = AppCommandRegistry.execute(
+            id,
+            in: AppCommandContext(model: model, settings: settings)
+        )
     }
 }
 

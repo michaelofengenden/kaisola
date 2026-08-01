@@ -24,6 +24,7 @@ struct RootShellView: View {
     @EnvironmentObject private var rememberedSessions: RememberedSessionCatalogCenter
     @ObservedObject private var attention = AttentionCenter.shared
     @ObservedObject private var companionHost = CompanionHost.shared
+    @ObservedObject private var keymap = AppCommandKeymapCenter.shared
     @Environment(\.colorScheme) private var colorScheme
     @Environment(\.undoManager) private var undoManager
     @State private var renameTarget: String?
@@ -216,9 +217,20 @@ struct RootShellView: View {
                 guard let url = note.object as? URL else { return }
                 model.openBrowserCard(url)
             }
+            .onReceive(NotificationCenter.default.publisher(for: .kaisolaLocalCommand)) { note in
+                guard let target = note.object as? AppModel,
+                      target === model,
+                      let rawID = note.userInfo?[AppCommandNotificationKey.commandID] as? String else {
+                    return
+                }
+                performLocalCommand(AppCommandID(rawValue: rawID))
+            }
             .onAppear {
                 let environment = ProcessInfo.processInfo.environment
                 if environment["KAISOLA_NATIVE_VISUAL_FIXTURE"] == "1",
+                   environment["KAISOLA_NATIVE_VISUAL_SURFACE"] == "palette" {
+                    showPalette = true
+                } else if environment["KAISOLA_NATIVE_VISUAL_FIXTURE"] == "1",
                    environment["KAISOLA_NATIVE_VISUAL_SURFACE"] == "terminal-transcript",
                    let terminalID = model.sessions.first?.id {
                     DispatchQueue.main.async {
@@ -237,6 +249,7 @@ struct RootShellView: View {
             .sheet(isPresented: $showOnboarding, onDismiss: presentOnboardingSettingsIfNeeded) {
                 OnboardingView(
                     model: model,
+                    settings: settings,
                     dismiss: { finishOnboarding() },
                     openAccounts: { finishOnboarding(openingSettings: "accounts") },
                     openUpdateSettings: { finishOnboarding(openingSettings: "general") }
@@ -331,29 +344,11 @@ struct RootShellView: View {
         sheeted
         .background(
             Group {
-                Button(action: toggleCommandPalette) { EmptyView() }
-                    .keyboardShortcut("k", modifiers: .command)
-                    .accessibilityLabel("Command Palette")
-                Button(action: { settings.workspaceRailVisible.toggle() }) { EmptyView() }
-                    .keyboardShortcut("b", modifiers: .command)
-                    .accessibilityLabel("Toggle Files")
-                // ⇧⌘B for the document column, beside ⌘B for the Files column —
-                // the two panels the detail chrome bar now toggles. Checked
-                // against every other binding in the app (the AppKit main menu
-                // and this Group): ⇧⌘B was unclaimed.
-                Button(action: toggleFilePreviewColumn) { EmptyView() }
-                    .keyboardShortcut("b", modifiers: [.command, .shift])
-                    .accessibilityLabel("Toggle Document Preview")
-                Button(action: toggleOmniBar) { EmptyView() }
-                    .keyboardShortcut("l", modifiers: .command)
-                    .accessibilityLabel("Message Current Agent")
-                Button(action: {
-                    if let target = model.previewedFileURL ?? model.currentProjectDirectory {
-                        settings.openInExternalEditor(target)
-                    }
-                }) { EmptyView() }
-                    .keyboardShortcut("o", modifiers: [.command, .shift])
-                    .accessibilityLabel("Open in External Editor")
+                registeredShortcut(.commandPalette)
+                registeredShortcut(.toggleFiles)
+                registeredShortcut(.toggleDocumentPreview)
+                registeredShortcut(.messageCurrentAgent)
+                registeredShortcut(.openExternalEditor)
             }
         )
         .overlay {
@@ -419,6 +414,39 @@ struct RootShellView: View {
         let shouldPresent = !showOmniBar
         showPalette = false
         showOmniBar = shouldPresent
+    }
+
+    private var commandContext: AppCommandContext {
+        AppCommandContext(model: model, settings: settings)
+    }
+
+    private func runCommand(_ id: AppCommandID) {
+        _ = AppCommandRegistry.execute(id, in: commandContext)
+    }
+
+    private func performLocalCommand(_ id: AppCommandID) {
+        switch id {
+        case .commandPalette: toggleCommandPalette()
+        case .messageCurrentAgent: toggleOmniBar()
+        case .toggleDocumentPreview: toggleFilePreviewColumn()
+        default: break
+        }
+    }
+
+    @ViewBuilder
+    private func registeredShortcut(_ id: AppCommandID) -> some View {
+        if let definition = AppCommandRegistry.definition(for: id),
+           let shortcut = keymap.shortcut(for: id) {
+            let availability = AppCommandRegistry.availability(of: id, in: commandContext)
+            Button(action: { runCommand(id) }) { EmptyView() }
+                .keyboardShortcut(
+                    shortcut.swiftUIKeyEquivalent,
+                    modifiers: shortcut.swiftUIModifiers
+                )
+                .disabled(!availability.isEnabled)
+                .accessibilityLabel(definition.title)
+                .accessibilityHint(availability.reason ?? "")
+        }
     }
 
     private func finishOnboarding(openingSettings sectionID: String? = nil) {
@@ -641,13 +669,15 @@ struct RootShellView: View {
     /// palette drive the same setting.
     private var filesToolbarControl: some View {
         let visible = settings.workspaceRailVisible
+        let shortcut = keymap.shortcut(for: .toggleFiles)?.display
+        let action = visible ? "Hide Files" : "Show Files"
         return detailChromeToggle(
             symbol: "sidebar.trailing",
             isOn: visible,
-            help: visible ? "Hide Files (⌘B)" : "Show Files (⌘B)",
-            label: visible ? "Hide Files" : "Show Files",
+            help: shortcut.map { "\(action) (\($0))" } ?? action,
+            label: action,
             identifier: "detail.toggle-files",
-            action: { settings.workspaceRailVisible.toggle() }
+            action: { runCommand(.toggleFiles) }
         )
     }
 
@@ -660,13 +690,15 @@ struct RootShellView: View {
     /// footer's menu item has always done.
     private var filePreviewToolbarControl: some View {
         let visible = model.previewedFileURL != nil || model.browserCardURL != nil
+        let shortcut = keymap.shortcut(for: .toggleDocumentPreview)?.display
+        let action = visible ? "Hide Document" : "Show Document"
         return detailChromeToggle(
             symbol: "doc.text",
             isOn: visible,
-            help: visible ? "Hide the document (⇧⌘B)" : "Show the document (⇧⌘B)",
-            label: visible ? "Hide Document" : "Show Document",
+            help: shortcut.map { "\(action) (\($0))" } ?? action,
+            label: action,
             identifier: "detail.toggle-document",
-            action: toggleFilePreviewColumn
+            action: { runCommand(.toggleDocumentPreview) }
         )
     }
 
@@ -905,8 +937,8 @@ struct RootShellView: View {
                 projects: model.projects,
                 selected: activeProjectBinding,
                 menu: { project in AnyView(self.projectContextMenu(project)) },
-                openFolder: { RootShellView.promptForOpenFolder(model: model) },
-                useSidebar: { settings.navigationLayout = .leftTree },
+                openFolder: { runCommand(.openProject) },
+                useSidebar: { runCommand(.navigationLayout(.leftTree)) },
                 reorder: { model.moveProject(id: $0, toIndex: $1) }
             )
             .padding(.leading, NativeWorkspaceChrome.topBarTrafficLightClearance)
@@ -1010,17 +1042,17 @@ struct RootShellView: View {
     /// different folders without reopening a folder picker each time.
     @ViewBuilder
     private func projectLaunchMenu(_ project: AppModel.ProjectGroup) -> some View {
-        if let directory = project.directory {
+        if project.directory != nil {
             Button {
                 model.activateProject(id: project.id)
-                Task { await model.createTerminal(inDirectory: directory) }
+                runCommand(.newTerminal)
             } label: {
                 Label("New Terminal", systemImage: "terminal")
             }
             ForEach(AgentRegistry.all) { agent in
                 Button {
                     model.activateProject(id: project.id)
-                    Self.startAgentSession(agent, in: directory, model: model)
+                    runCommand(.newAgent(agent.id))
                 } label: {
                     Label("New \(agent.name) Terminal", systemImage: agent.symbol)
                 }
@@ -1029,14 +1061,14 @@ struct RootShellView: View {
             ForEach(AgentRegistry.all.filter { AcpAdapter.forAgent($0.id) != nil }) { agent in
                 Button {
                     model.activateProject(id: project.id)
-                    Self.startChat(agent, in: directory, model: model)
+                    runCommand(.newChat(agent.id))
                 } label: {
                     Label("Chat with \(agent.name)", systemImage: "bubble.left.and.bubble.right")
                 }
             }
             Button {
                 model.activateProject(id: project.id)
-                model.openMesh(inDirectory: directory)
+                runCommand(.newMesh)
             } label: {
                 Label("New Mesh", systemImage: "circle.hexagongrid.fill")
             }
@@ -1269,11 +1301,11 @@ struct RootShellView: View {
             brokerUpgradeState: model.brokerUpgradeState,
             reload: { Task { await model.reload() } },
             jumpToAttention: { model.jumpToAttentionTarget($0) },
-            newMesh: { RootShellView.promptForNewMesh(model: model) },
-            newStagedMesh: { RootShellView.promptForNewMesh(model: model, staged: true) },
-            newIdeaMesh: { RootShellView.promptForNewMesh(model: model, idea: true) },
+            newMesh: { runCommand(.newMesh) },
+            newStagedMesh: { runCommand(.newStagedMesh) },
+            newIdeaMesh: { runCommand(.newIdeaMesh) },
             filePreviewVisible: detailPreviewPanelVisible,
-            toggleFilePreview: toggleFilePreviewColumn,
+            toggleFilePreview: { runCommand(.toggleDocumentPreview) },
             showSettings: {
                 settingsSectionID = nil
                 showSettings = true
@@ -1497,7 +1529,7 @@ struct RootShellView: View {
         } actions: {
             HStack(spacing: 10) {
                 Button {
-                    RootShellView.promptForNewTerminal(model: model)
+                    runCommand(.newTerminal)
                 } label: {
                     Label("New Terminal", systemImage: "terminal")
                 }
@@ -1505,13 +1537,13 @@ struct RootShellView: View {
                 .help(model.controlAvailable ? "Open a shell in the active project" : "New terminals are unavailable while saved sessions are view-only")
                 if let chatAgent {
                     Button {
-                        RootShellView.promptForNewChat(chatAgent, model: model)
+                        runCommand(.newChat(chatAgent.id))
                     } label: {
                         Label("Chat with \(chatAgent.name)", systemImage: "bubble.left.and.bubble.right")
                     }
                 }
                 Button {
-                    RootShellView.promptForOpenFolder(model: model)
+                    runCommand(.openProject)
                 } label: {
                     Label("Open Folder…", systemImage: "folder")
                 }

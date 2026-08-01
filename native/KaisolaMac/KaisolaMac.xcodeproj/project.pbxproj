@@ -111,6 +111,8 @@
 		798DE8FD51B9FFE7D6F9706F /* BrokerLaunchConfiguration.swift in Sources */ = {isa = PBXBuildFile; fileRef = 58663742F2D4497A3D234BF7 /* BrokerLaunchConfiguration.swift */; };
 		7B168B0E70A7503AD02FF74D /* DetachedBrokerProcess.swift in Sources */ = {isa = PBXBuildFile; fileRef = A8C8F92A50B6817748440EAE /* DetachedBrokerProcess.swift */; };
 		7D7BE0BDADEA2A4373D66096 /* CommandPaletteView.swift in Sources */ = {isa = PBXBuildFile; fileRef = DAF1B7984AA5A644F1BA5BB3 /* CommandPaletteView.swift */; };
+		C0D2A0000000000000000002 /* CommandRegistry.swift in Sources */ = {isa = PBXBuildFile; fileRef = C0D2A0000000000000000001 /* CommandRegistry.swift */; };
+		C0D2A0000000000000000004 /* CommandRegistryTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = C0D2A0000000000000000003 /* CommandRegistryTests.swift */; };
 		7DAB0AD69D2C07C5526C14B9 /* ProjectAccountsSection.swift in Sources */ = {isa = PBXBuildFile; fileRef = 154C63628A43E6BD8410F578 /* ProjectAccountsSection.swift */; };
 		7DF2FB061FD5D062D6A085DF /* AcpChatView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4AEB389DB67AC63D7147C0BA /* AcpChatView.swift */; };
 		7E79252544D2552F7335E60C /* SyntaxHighlighter.swift in Sources */ = {isa = PBXBuildFile; fileRef = BA44B5608FF424D5A4173716 /* SyntaxHighlighter.swift */; };
@@ -429,6 +431,8 @@
 		BF1963B69A68F8B8B3326F9E /* QuietProjectRail.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = QuietProjectRail.swift; sourceTree = "<group>"; };
 		C04010C4C83AE322453E2F1F /* QuietStatusClockTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = QuietStatusClockTests.swift; sourceTree = "<group>"; };
 		C0E9DAFAB20BAC2549AC31EE /* SyntaxHighlighterTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SyntaxHighlighterTests.swift; sourceTree = "<group>"; };
+		C0D2A0000000000000000001 /* CommandRegistry.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CommandRegistry.swift; sourceTree = "<group>"; };
+		C0D2A0000000000000000003 /* CommandRegistryTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CommandRegistryTests.swift; sourceTree = "<group>"; };
 		C1139547AB3E3B3A9C7AAEDA /* UnixBrokerTransport.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = UnixBrokerTransport.swift; sourceTree = "<group>"; };
 		C2C127B15864D9B20EE61750 /* SessionPinStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SessionPinStore.swift; sourceTree = "<group>"; };
 		C49D972FACEF9F904974B8EB /* SessionTitleTrackerTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SessionTitleTrackerTests.swift; sourceTree = "<group>"; };
@@ -638,6 +642,7 @@
 		8E525454CAEE2F374B1F48C9 /* Palette */ = {
 			isa = PBXGroup;
 			children = (
+				C0D2A0000000000000000001 /* CommandRegistry.swift */,
 				DAF1B7984AA5A644F1BA5BB3 /* CommandPaletteView.swift */,
 				8FCBB2E107C280C3B125DF67 /* FuzzyMatch.swift */,
 				83D17767E2F2F48BE60D3518 /* OmniBarView.swift */,
@@ -777,6 +782,7 @@
 				A451FC25E152BC8B61FB5702 /* BrokerReconnectBackoffTests.swift */,
 				A7E57351BA3A72C99024DAEC /* BrokerStartupCoordinatorTests.swift */,
 				88248FB2EEAA9902A80D000D /* CompanionCommandRouterTests.swift */,
+				C0D2A0000000000000000003 /* CommandRegistryTests.swift */,
 				D7B13A899955A8094A15E262 /* CompanionConnectionSessionTests.swift */,
 				1E90B4D2D24769D0CEB3DD2B /* CompanionEventLogTests.swift */,
 				54C430C9213147C88D3B98F9 /* CompanionHostFoundationTests.swift */,
@@ -1098,6 +1104,7 @@
 				C0AB4855272A0368E1F55C08 /* BrokerReconnectBackoff.swift in Sources */,
 				8B8F9D7E715AC5693879B9FC /* BrokerStartupCoordinator.swift in Sources */,
 				EF5C4926C6A1A69767C3ECB2 /* BrowserCardView.swift in Sources */,
+				C0D2A0000000000000000002 /* CommandRegistry.swift in Sources */,
 				7D7BE0BDADEA2A4373D66096 /* CommandPaletteView.swift in Sources */,
 				EC2DA4A5EEE7309740A3F8FF /* CompanionCommandRouter.swift in Sources */,
 				7220383F52A27FECE4EA9D08 /* CompanionConnection.swift in Sources */,
@@ -1238,6 +1245,7 @@
 				6654B3A1CE2F11C7026F61B2 /* BrokerReconnectBackoffTests.swift in Sources */,
 				5EA24E714C9FF79494C0DDFA /* BrokerStartupCoordinatorTests.swift in Sources */,
 				1C675F4AF5327A3E83E5D7F8 /* CompanionCommandRouterTests.swift in Sources */,
+				C0D2A0000000000000000004 /* CommandRegistryTests.swift in Sources */,
 				D26B8D9E26E6AEE0BA0B50A6 /* CompanionConnectionSessionTests.swift in Sources */,
 				9C0F1C05560CAA34F45C43B8 /* CompanionEventLogTests.swift in Sources */,
 				3D5D2BB9AF69D483F5E7B602 /* CompanionHostFoundationTests.swift in Sources */,

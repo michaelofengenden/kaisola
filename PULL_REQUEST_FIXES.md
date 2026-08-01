@@ -76,6 +76,10 @@ Large product and architecture work remains ordered in
   Help opens a user guide with shortcuts and recovery steps; buttons use Title
   Case, project surfaces use project terminology, and session failures no longer
   expose broker or app-server implementation vocabulary.
+- Menu items, the command palette, project launch menus, and workspace controls
+  now share one typed command registry. Palette hints and AppKit shortcuts use
+  the same validated keymap snapshot; conflicts preserve every default and stay
+  actionable from the Keyboard Settings tab.
 
 ## Open audit fixes
 
@@ -95,8 +99,6 @@ Large product and architecture work remains ordered in
 - Replace remaining low-contrast attention badges; honor Reduce Motion outside
   the covered toast, onboarding, restoration, palette, and rail paths; and
   expose truthful keyboard focus and button traits throughout the AX tree.
-- Align menu and command-palette shortcuts through the typed command registry
-  from PR 2.
 ## Adding a fix
 
 Each confirmed fix should include:

@@ -175,7 +175,7 @@ struct SettingsView: View {
             }
 
             Spacer()
-            Text("Most changes apply instantly")
+            Text("Changes apply instantly")
                 .font(.caption2)
                 .foregroundStyle(.tertiary)
                 .padding(.horizontal, 14)
@@ -206,6 +206,7 @@ struct SettingsView: View {
         case .accounts: accounts.scrollContentBackground(.hidden)
         case .agents: agents.scrollContentBackground(.hidden)
         case .models: ApiKeysSettingsTab(settings: settings).scrollContentBackground(.hidden)
+        case .shortcuts: CommandKeymapSettingsView()
         case .usage: UsageSettingsTab(workspace: workspace).scrollContentBackground(.hidden)
         }
     }
@@ -221,7 +222,9 @@ struct SettingsView: View {
                     SettingsRow(title: "Navigation", detail: "Project tree or horizontal tabs", symbol: "sidebar.left") {
                         Menu {
                             ForEach(NavigationLayout.allCases) { layout in
-                                Button(layout.title) { settings.navigationLayout = layout }
+                                Button(layout.title) {
+                                    runCommand(.navigationLayout(layout))
+                                }
                             }
                         } label: { SettingsChoiceLabel(settings.navigationLayout.title) }
                         .menuIndicator(.hidden)
@@ -231,7 +234,7 @@ struct SettingsView: View {
                     SettingsRow(title: "Appearance", detail: "Follow macOS or pin a theme", symbol: "circle.lefthalf.filled") {
                         Menu {
                             ForEach(AppearanceMode.allCases) { mode in
-                                Button(mode.title) { settings.appearance = mode }
+                                Button(mode.title) { runCommand(.appearance(mode)) }
                             }
                         } label: { SettingsChoiceLabel(settings.appearance.title) }
                         .menuIndicator(.hidden)
@@ -623,10 +626,17 @@ struct SettingsView: View {
         .formStyle(.grouped)
         .padding(6)
     }
+
+    private func runCommand(_ id: AppCommandID) {
+        _ = AppCommandRegistry.execute(
+            id,
+            in: AppCommandContext(model: nil, settings: settings)
+        )
+    }
 }
 
 private enum SettingsSection: String, CaseIterable, Identifiable {
-    case general, terminal, companion, guardrails, mcp, accounts, agents, models, usage
+    case general, terminal, companion, guardrails, mcp, accounts, agents, models, shortcuts, usage
     var id: String { rawValue }
     var title: String {
         switch self {
@@ -638,6 +648,7 @@ private enum SettingsSection: String, CaseIterable, Identifiable {
         case .accounts: "Accounts"
         case .agents: "Agents"
         case .models: "Models & Keys"
+        case .shortcuts: "Keyboard"
         case .usage: "Usage"
         }
     }
@@ -651,6 +662,7 @@ private enum SettingsSection: String, CaseIterable, Identifiable {
         case .accounts: "Sign-ins, named accounts, and project overrides"
         case .agents: "Custom agents and ACP adapters"
         case .models: "Provider credentials, models, and routing"
+        case .shortcuts: "Shortcuts and keymap.json overrides"
         case .usage: "Provider limits and live context"
         }
     }
@@ -664,6 +676,7 @@ private enum SettingsSection: String, CaseIterable, Identifiable {
         case .accounts: "person.crop.circle"
         case .agents: "sparkles"
         case .models: "key"
+        case .shortcuts: "keyboard"
         case .usage: "gauge.with.dots.needle.bottom.50percent"
         }
     }

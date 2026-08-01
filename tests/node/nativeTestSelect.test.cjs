@@ -64,7 +64,7 @@ test('settings surfaces stay on their bounded account and configuration contract
   assert.equal(plan.native.mode, 'focused')
   assert.deepEqual(plan.native.selectors, [
     'ApiKeyStoreTests', 'AppModelProjectContextTests',
-    'CompanionConnectionSessionTests', 'McpConfigStoreTests',
+    'CommandRegistryTests', 'CompanionConnectionSessionTests', 'McpConfigStoreTests',
     'NativePreviewSettingsTests', 'NativeUpdateConfigurationTests',
     'NotificationBridgeTests', 'UsageCenterTests',
   ])
@@ -79,8 +79,20 @@ test('operational onboarding stays on readiness and account contracts', () => {
 
   assert.equal(plan.native.mode, 'focused')
   assert.deepEqual(plan.native.selectors, [
-    'OnboardingStateTests', 'UsageCenterTests',
+    'CommandRegistryTests', 'OnboardingStateTests', 'UsageCenterTests',
   ])
+  assert.equal(plan.node.mode, 'none')
+  assert.equal(plan.fallback, false)
+})
+
+test('typed command surfaces select the command registry contract', () => {
+  const plan = selector.planForChanges([
+    'native/KaisolaMac/Kaisola/Features/Palette/CommandPaletteView.swift',
+    'native/KaisolaMac/Kaisola/Features/Palette/CommandRegistry.swift',
+  ], inventory)
+
+  assert.equal(plan.native.mode, 'focused')
+  assert.deepEqual(plan.native.selectors, ['CommandRegistryTests', 'FuzzyMatchTests'])
   assert.equal(plan.node.mode, 'none')
   assert.equal(plan.fallback, false)
 })

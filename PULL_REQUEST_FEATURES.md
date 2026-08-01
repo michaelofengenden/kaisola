@@ -33,10 +33,13 @@ Acceptance:
 
 ## PR 2 — Unified command and keymap architecture
 
-Create one typed command registry shared by the menu bar, command palette,
-context menus, toolbar actions, and future user keymaps.
+The v1.1.8 implementation provides one typed command registry for the menu bar,
+command palette, project launch menus, toolbar actions, Settings controls, and
+validated user keymaps. Menu shortcuts, palette hints, availability reasons,
+and execution now come from that registry; the old per-command app-delegate
+selectors and duplicated palette actions are gone.
 
-Scope:
+Completed scope:
 
 - Define command identifiers, availability, discoverability, default shortcuts,
   and typed execution context.
@@ -313,7 +316,10 @@ readiness checklist backed by live project, terminal-control, provider-account,
 and update state; Help opens a user guide with shortcuts and troubleshooting.
 User-facing buttons and project/session copy have also completed the Title Case,
 project-terminology, and implementation-jargon pass. Complete the same
-accessibility and command floor app-wide.
+accessibility floor app-wide. The command floor is now complete: palette rows
+carry truthful button/selection traits and disabled reasons, Mesh and Settings
+are discoverable, Command-W closes the active file tab or project window, and
+menu shortcuts and palette hints share the validated PR 2 keymap snapshot.
 
 Scope:
 
@@ -321,9 +327,6 @@ Scope:
   colors; app-wide Reduce Motion fallbacks; and truthful focus state.
 - Adopt the existing radius, motion, palette, hairline, and compact-type tokens
   across Chat, Git, Mesh, files, Settings, badges, and terminal chrome.
-- Complete the menu/command registry work from PR 2, including palette button
-  traits, shortcut parity, Mesh and Settings coverage, and standard macOS
-  close/window behavior.
 
 Acceptance:
 

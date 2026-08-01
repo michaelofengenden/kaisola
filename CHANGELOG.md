@@ -7,6 +7,8 @@
 - Document and Files controls now sit together, and Document closes either a file preview or browser card correctly.
 - Both right-side dividers keep their resize cursor and drag behavior along their full height, even beside rendered documents.
 - Glass is calmer, subtly warmer, and consistently rounded.
+- Menus, the command palette, project actions, and workspace controls now run through one command system with clear unavailable-state explanations.
+- Keyboard Settings can create, validate, reload, or reset a private `keymap.json`; conflicting shortcuts safely keep every default.
 
 ## 1.1.7 — 2026-07-31
 

@@ -5,8 +5,31 @@ struct PaletteItem: Identifiable {
     let id: String
     let title: String
     let subtitle: String
+    let shortcutHint: String?
     let systemImage: String
+    let isEnabled: Bool
+    let disabledReason: String?
     let run: () -> Void
+
+    init(
+        id: String,
+        title: String,
+        subtitle: String,
+        shortcutHint: String? = nil,
+        systemImage: String,
+        isEnabled: Bool = true,
+        disabledReason: String? = nil,
+        run: @escaping () -> Void
+    ) {
+        self.id = id
+        self.title = title
+        self.subtitle = subtitle
+        self.shortcutHint = shortcutHint
+        self.systemImage = systemImage
+        self.isEnabled = isEnabled
+        self.disabledReason = disabledReason
+        self.run = run
+    }
 }
 
 /// A ⌘K fuzzy command palette: app actions (new terminal/agent/chat, open
@@ -16,6 +39,7 @@ struct PaletteItem: Identifiable {
 struct CommandPaletteView: View {
     @ObservedObject var model: AppModel
     @ObservedObject var settings: NativePreviewSettings
+    @ObservedObject private var keymap = AppCommandKeymapCenter.shared
     @Binding var isPresented: Bool
 
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
@@ -48,9 +72,16 @@ struct CommandPaletteView: View {
                             } label: {
                                 row(item, selected: index == selection)
                                     .contentShape(Rectangle())
+                                    // Keep the explanation readable while the
+                                    // outer Button remains semantically disabled.
+                                    .environment(\.isEnabled, true)
                             }
                             .buttonStyle(.plain)
+                            .disabled(!item.isEnabled)
+                            .accessibilityLabel(item.title)
                             .accessibilityValue(item.subtitle)
+                            .accessibilityHint(item.disabledReason ?? shortcutAccessibilityHint(item))
+                            .accessibilityAddTraits(.isButton)
                             .accessibilityAddTraits(index == selection ? .isSelected : [])
                             .id(index)
                         }
@@ -97,16 +128,26 @@ struct CommandPaletteView: View {
             Image(systemName: item.systemImage)
                 .frame(width: 18)
                 .foregroundStyle(selected ? selectedText : .secondary)
-            Text(item.title)
-                .foregroundStyle(selected ? selectedText : .primary)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(item.title)
+                    .foregroundStyle(selected ? selectedText : .primary)
+                Text(item.disabledReason ?? item.subtitle)
+                    .font(.caption)
+                    .foregroundStyle(selected ? selectedText.opacity(0.78) : .secondary)
+                    .lineLimit(2)
+            }
             Spacer()
-            Text(item.subtitle)
-                .font(.caption)
-                .foregroundStyle(selected ? selectedText.opacity(0.8) : .secondary)
+            if let shortcutHint = item.shortcutHint {
+                Text(shortcutHint)
+                    .font(.caption.monospaced())
+                    .foregroundStyle(selected ? selectedText.opacity(0.8) : .secondary)
+                    .accessibilityHidden(true)
+            }
         }
         .padding(.horizontal, 16).padding(.vertical, 9)
         .frame(maxWidth: .infinity, alignment: .leading)
         .background(selected ? Color(nsColor: .selectedContentBackgroundColor) : Color.clear)
+        .opacity(item.isEnabled ? 1 : 0.72)
     }
 
     private var filtered: [PaletteItem] {
@@ -142,67 +183,24 @@ struct CommandPaletteView: View {
     private func runSelection() {
         let items = filtered
         guard selection >= 0, selection < items.count else { return }
+        guard items[selection].isEnabled else {
+            if let reason = items[selection].disabledReason {
+                ToastCenter.shared.show(reason, style: .info)
+            }
+            return
+        }
         run(items[selection])
     }
 
     private func run(_ item: PaletteItem) {
+        guard item.isEnabled else { return }
         isPresented = false
         // Defer so the sheet is fully dismissed before an action opens a panel.
         DispatchQueue.main.async { item.run() }
     }
 
     private func allItems() -> [PaletteItem] {
-        var items: [PaletteItem] = []
-
-        items.append(PaletteItem(id: "action.newTerminal", title: "New Terminal Session", subtitle: "Action · ⌘T", systemImage: "terminal") {
-            RootShellView.promptForNewTerminal(model: model)
-        })
-        for agent in AgentRegistry.all {
-            items.append(PaletteItem(id: "action.newAgent.\(agent.id)", title: "New \(agent.name) Session", subtitle: "New Agent", systemImage: "sparkles") {
-                RootShellView.promptForNewAgent(agent, model: model)
-            })
-        }
-        for agent in AgentRegistry.all where AcpAdapter.forAgent(agent.id) != nil {
-            items.append(PaletteItem(id: "action.newChat.\(agent.id)", title: "Chat with \(agent.name)", subtitle: "New Chat", systemImage: "bubble.left.and.bubble.right") {
-                RootShellView.promptForNewChat(agent, model: model)
-            })
-        }
-        items.append(PaletteItem(id: "action.openFolder", title: "Open Folder…", subtitle: "Action · ⌘O", systemImage: "folder") {
-            RootShellView.promptForOpenFolder(model: model)
-        })
-        if model.hasClosedProjects {
-            items.append(PaletteItem(id: "action.reopenClosedProject", title: "Reopen Closed Project", subtitle: "Action · ⌥⇧⌘T", systemImage: "arrow.uturn.backward") {
-                model.reopenLastClosedProject()
-            })
-        }
-
-        items.append(PaletteItem(id: "action.newMesh", title: "New Mesh (All Agents)", subtitle: "Action", systemImage: "circle.hexagongrid.fill") {
-            RootShellView.promptForNewMesh(model: model)
-        })
-        items.append(PaletteItem(id: "action.newStagedMesh", title: "New Staged Mesh (Scout → Execute)", subtitle: "Action", systemImage: "arrow.triangle.branch") {
-            RootShellView.promptForNewMesh(model: model, staged: true)
-        })
-        items.append(PaletteItem(id: "action.newIdeaMesh", title: "New Idea Mesh (Brainstorm)", subtitle: "Action", systemImage: "lightbulb") {
-            RootShellView.promptForNewMesh(model: model, idea: true)
-        })
-        items.append(PaletteItem(id: "action.toggleRail", title: "Show or Hide Files", subtitle: "View · ⌘B", systemImage: "sidebar.left") {
-            settings.workspaceRailVisible.toggle()
-        })
-        if let editorTarget = model.previewedFileURL ?? model.currentProjectDirectory {
-            items.append(PaletteItem(id: "action.openExternalEditor", title: "Open in External Editor", subtitle: "Action · ⇧⌘O", systemImage: "arrow.up.forward.app") {
-                settings.openInExternalEditor(editorTarget)
-            })
-        }
-        for layout in NavigationLayout.allCases {
-            items.append(PaletteItem(id: "layout.\(layout.rawValue)", title: "Layout: \(layout.title)", subtitle: "View", systemImage: "sidebar.squares.left") {
-                settings.navigationLayout = layout
-            })
-        }
-        for mode in AppearanceMode.allCases {
-            items.append(PaletteItem(id: "appearance.\(mode.rawValue)", title: "Appearance: \(mode.title)", subtitle: "View", systemImage: "circle.lefthalf.filled") {
-                settings.appearance = mode
-            })
-        }
+        var items = registeredCommandItems()
 
         // Quick Actions for the active project run straight from the palette.
         if let active = model.projects.first(where: { $0.id == (model.selectedProjectID ?? model.projects.first?.id) }),
@@ -247,5 +245,28 @@ struct CommandPaletteView: View {
             })
         }
         return items
+    }
+
+    private func registeredCommandItems() -> [PaletteItem] {
+        let context = AppCommandContext(model: model, settings: settings)
+        return AppCommandRegistry.paletteDefinitions.map { definition in
+            let availability = AppCommandRegistry.availability(of: definition.id, in: context)
+            return PaletteItem(
+                id: "command.\(definition.id.rawValue)",
+                title: AppCommandRegistry.presentationTitle(for: definition.id, in: context),
+                subtitle: definition.category.rawValue,
+                shortcutHint: keymap.shortcut(for: definition.id)?.display,
+                systemImage: definition.systemImage,
+                isEnabled: availability.isEnabled,
+                disabledReason: availability.reason
+            ) {
+                _ = AppCommandRegistry.execute(definition.id, in: context)
+            }
+        }
+    }
+
+    private func shortcutAccessibilityHint(_ item: PaletteItem) -> String {
+        guard let shortcutHint = item.shortcutHint else { return "" }
+        return "Keyboard shortcut \(shortcutHint)"
     }
 }

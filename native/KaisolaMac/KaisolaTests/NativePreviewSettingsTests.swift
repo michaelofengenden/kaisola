@@ -1892,7 +1892,7 @@ final class NativePreviewSettingsTests: XCTestCase {
         let closeFile = try XCTUnwrap(fileMenu.items.first { $0.title == "Close File Tab" })
         XCTAssertEqual(closeFile.keyEquivalent, "w")
         XCTAssertEqual(closeFile.keyEquivalentModifierMask, [.command])
-        let closeWindow = try XCTUnwrap(fileMenu.items.first { $0.title == "Close Window" })
+        let closeWindow = try XCTUnwrap(fileMenu.items.first { $0.title == "Close Project Window" })
         XCTAssertEqual(closeWindow.keyEquivalent, "w")
         XCTAssertEqual(closeWindow.keyEquivalentModifierMask, [.command, .shift])
         let reopenFile = try XCTUnwrap(fileMenu.items.first { $0.title == "Reopen Closed File Tab" })
@@ -1997,15 +1997,19 @@ final class NativePreviewSettingsTests: XCTestCase {
         )
         let viewMenu = try XCTUnwrap(menu.item(withTitle: "View")?.submenu)
         let items = viewMenu.items.compactMap { $0.representedObject as? String }
-        XCTAssertTrue(items.contains(NavigationLayout.leftTree.rawValue))
-        XCTAssertTrue(items.contains(NavigationLayout.topBar.rawValue))
-        XCTAssertTrue(items.contains(AppearanceMode.light.rawValue))
-        XCTAssertTrue(items.contains(AppearanceMode.dark.rawValue))
+        XCTAssertTrue(items.contains(AppCommandID.navigationLayout(.leftTree).rawValue))
+        XCTAssertTrue(items.contains(AppCommandID.navigationLayout(.topBar).rawValue))
+        XCTAssertTrue(items.contains(AppCommandID.appearance(.light).rawValue))
+        XCTAssertTrue(items.contains(AppCommandID.appearance(.dark).rawValue))
 
         // The current selections are checked.
-        let topBarItem = try XCTUnwrap(viewMenu.items.first { ($0.representedObject as? String) == NavigationLayout.topBar.rawValue })
+        let topBarItem = try XCTUnwrap(viewMenu.items.first {
+            ($0.representedObject as? String) == AppCommandID.navigationLayout(.topBar).rawValue
+        })
         XCTAssertEqual(topBarItem.state, .on)
-        let darkItem = try XCTUnwrap(viewMenu.items.first { ($0.representedObject as? String) == AppearanceMode.dark.rawValue })
+        let darkItem = try XCTUnwrap(viewMenu.items.first {
+            ($0.representedObject as? String) == AppCommandID.appearance(.dark).rawValue
+        })
         XCTAssertEqual(darkItem.state, .on)
     }
 }

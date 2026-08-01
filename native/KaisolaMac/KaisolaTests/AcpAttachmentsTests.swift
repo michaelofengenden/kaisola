@@ -1,4 +1,5 @@
 import Foundation
+import ImageIO
 import KaisolaCore
 import XCTest
 @testable import Kaisola
@@ -150,14 +151,45 @@ final class AcpAttachmentsTests: XCTestCase {
         XCTAssertTrue(reason.localizedCaseInsensitiveContains("large"), "reason: \(reason)")
     }
 
-    func testClassifyRejectsOversizeImage() throws {
+    func testClassifyRejectsUndecodableOversizeImage() throws {
         let big = Data(repeating: 0, count: AcpAttachmentClassifier.maxImageBytes + 1)
         let url = try writeTemp(name: "huge.png", data: big)
         defer { cleanup(url) }
         guard case let .rejected(reason) = AcpAttachmentClassifier.classify(fileURL: url) else {
             return XCTFail("expected a rejection")
         }
-        XCTAssertTrue(reason.localizedCaseInsensitiveContains("large"), "reason: \(reason)")
+        XCTAssertTrue(reason.localizedCaseInsensitiveContains("downscaled"), "reason: \(reason)")
+    }
+
+    @MainActor
+    func testOversizeValidImageDownscalesForFileAndPaste() async throws {
+        let source = makeUncompressedBMP(width: 1_600, height: 1_200)
+        XCTAssertGreaterThan(source.count, AcpAttachmentClassifier.maxImageBytes)
+        let url = try writeTemp(name: "large.bmp", data: source)
+        defer { cleanup(url) }
+
+        guard case let .accepted(.image(fileData, fileMime, fileName)) =
+            AcpAttachmentClassifier.classify(fileURL: url) else {
+            return XCTFail("expected the valid oversized BMP to be downscaled")
+        }
+        XCTAssertEqual(fileName, "large.bmp")
+        XCTAssertEqual(fileMime, "image/jpeg")
+        XCTAssertLessThanOrEqual(fileData.count, AcpAttachmentClassifier.maxImageBytes)
+        XCTAssertNotNil(CGImageSourceCreateWithData(fileData as CFData, nil))
+
+        let conversation = makeConversation()
+        conversation.addImageData(source, name: "Pasted image.png")
+        let deadline = Date().addingTimeInterval(4)
+        while conversation.preparingAttachmentCount > 0, Date() < deadline {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        let pending = try XCTUnwrap(conversation.pendingAttachments.first)
+        guard case let .image(pasteData, pasteMime, pasteName) = pending.attachment else {
+            return XCTFail("expected a staged image")
+        }
+        XCTAssertEqual(pasteName, "Pasted image.png")
+        XCTAssertEqual(pasteMime, "image/jpeg")
+        XCTAssertLessThanOrEqual(pasteData.count, AcpAttachmentClassifier.maxImageBytes)
     }
 
     func testClassifyRejectsNonUTF8NonImageFile() throws {
@@ -245,9 +277,13 @@ final class AcpAttachmentsTests: XCTestCase {
     }
 
     @MainActor
-    func testOversizeImageDataIsRejectedNoPending() {
+    func testUndecodableOversizeImageDataIsRejectedNoPending() async throws {
         let conversation = makeConversation()
         conversation.addImageData(Data(repeating: 0, count: AcpAttachmentClassifier.maxImageBytes + 1), name: "big.png")
+        let deadline = Date().addingTimeInterval(2)
+        while conversation.preparingAttachmentCount > 0, Date() < deadline {
+            try await Task.sleep(for: .milliseconds(10))
+        }
         XCTAssertTrue(conversation.pendingAttachments.isEmpty)
     }
 
@@ -269,5 +305,40 @@ final class AcpAttachmentsTests: XCTestCase {
 
     private func cleanup(_ url: URL) {
         try? FileManager.default.removeItem(at: url.deletingLastPathComponent())
+    }
+
+    /// A deterministic, valid, uncompressed 24-bit BMP. Black pixels keep the
+    /// fixture cheap to construct while the file itself stays above ACP's 5 MB
+    /// encoded limit, exercising real ImageIO downscaling rather than a mocked
+    /// byte-count decision.
+    private func makeUncompressedBMP(width: Int, height: Int) -> Data {
+        let rowBytes = ((width * 3 + 3) / 4) * 4
+        let imageBytes = rowBytes * height
+        let fileBytes = 54 + imageBytes
+        var data = Data()
+
+        func appendLittleEndian<T: FixedWidthInteger>(_ value: T) {
+            var littleEndian = value.littleEndian
+            withUnsafeBytes(of: &littleEndian) { data.append(contentsOf: $0) }
+        }
+
+        data.append(contentsOf: [0x42, 0x4D])
+        appendLittleEndian(UInt32(fileBytes))
+        appendLittleEndian(UInt16(0))
+        appendLittleEndian(UInt16(0))
+        appendLittleEndian(UInt32(54))
+        appendLittleEndian(UInt32(40))
+        appendLittleEndian(Int32(width))
+        appendLittleEndian(Int32(height))
+        appendLittleEndian(UInt16(1))
+        appendLittleEndian(UInt16(24))
+        appendLittleEndian(UInt32(0))
+        appendLittleEndian(UInt32(imageBytes))
+        appendLittleEndian(Int32(2_835))
+        appendLittleEndian(Int32(2_835))
+        appendLittleEndian(UInt32(0))
+        appendLittleEndian(UInt32(0))
+        data.append(Data(repeating: 0, count: imageBytes))
+        return data
     }
 }

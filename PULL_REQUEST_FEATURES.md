@@ -285,11 +285,8 @@ Completed scope:
   the configured terminal font.
 - Provide throttled, focused-pane VoiceOver output announcements and use the
   active terminal palette for opaque card chrome.
-
-Remaining scope:
-
-- Add target-specific Reopen from an ended pane and safe oversized-image
-  downscaling.
+- Add target-specific Reopen from an ended pane and safe, bounded oversized-
+  image downscaling.
 
 Acceptance:
 

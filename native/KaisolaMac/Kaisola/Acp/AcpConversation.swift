@@ -1,6 +1,8 @@
 import Foundation
+import ImageIO
 import KaisolaCore
 import SwiftUI
+import UniformTypeIdentifiers
 
 /// One rendered row in the chat transcript.
 enum AcpTranscriptRow: Codable, Identifiable, Equatable {
@@ -365,14 +367,46 @@ final class AcpConversation: ObservableObject {
         }
     }
 
-    /// Stage raw image bytes from the pasteboard (already normalized to PNG),
-    /// enforcing the same 5 MB image cap as file attachments.
+    /// Stage raw image bytes from the pasteboard (already normalized to PNG).
+    /// Oversized but bounded sources downscale away from MainActor using the
+    /// same ImageIO path as file attachments.
     func addImageData(_ data: Data, name: String) {
-        guard data.count <= AcpAttachmentClassifier.maxImageBytes else {
-            ToastCenter.shared.show("\(name) is too large — images must be ≤ 5 MB.", style: .error)
+        if data.count <= AcpAttachmentClassifier.maxImageBytes {
+            appendPending(.image(data: data, mimeType: "image/png", name: name))
             return
         }
-        appendPending(.image(data: data, mimeType: "image/png", name: name))
+        guard data.count <= AcpImageDownscaler.maximumSourceBytes else {
+            ToastCenter.shared.show("\(name) is too large to downscale safely.", style: .error)
+            return
+        }
+        guard pendingAttachments.count + preparingAttachmentCount < Self.maxPendingAttachmentCount else {
+            ToastCenter.shared.show("Attach up to \(Self.maxPendingAttachmentCount) files per message.", style: .info)
+            return
+        }
+
+        preparingAttachmentCount += 1
+        Task { [weak self] in
+            let scaled = await Task.detached(priority: .userInitiated) {
+                AcpImageDownscaler.downscale(
+                    data: data,
+                    maximumBytes: AcpAttachmentClassifier.maxImageBytes
+                )
+            }.value
+            guard let self else { return }
+            self.preparingAttachmentCount = max(0, self.preparingAttachmentCount - 1)
+            guard let scaled else {
+                ToastCenter.shared.show(
+                    "\(name) could not be downscaled safely below 5 MB.",
+                    style: .error
+                )
+                return
+            }
+            self.appendPending(.image(
+                data: scaled.data,
+                mimeType: scaled.mimeType,
+                name: name
+            ))
+        }
     }
 
     /// Drop a staged attachment chip before it is sent.
@@ -841,11 +875,125 @@ final class AcpConversation: ObservableObject {
     }
 }
 
+/// Bounded ImageIO thumbnailing for image attachments whose encoded source is
+/// too large for ACP's 5 MB image block. ImageIO subsamples while decoding, so
+/// a high-resolution source never needs a full-size bitmap; the output is an
+/// opaque sRGB JPEG whose dimensions and encoded bytes both stay bounded.
+enum AcpImageDownscaler {
+    struct Output: Equatable, Sendable {
+        let data: Data
+        let mimeType: String
+        let pixelWidth: Int
+        let pixelHeight: Int
+    }
+
+    static let maximumSourceBytes = 128 * 1_024 * 1_024
+    /// 2K is ample prompt context while keeping each decode and flatten buffer
+    /// near 16 MiB instead of materializing a camera-sized bitmap.
+    static let maximumDimension = 2_048
+    static let minimumDimension = 512
+    private static let jpegQualities: [Double] = [0.84, 0.70, 0.56, 0.42]
+
+    static func downscale(data: Data, maximumBytes: Int) -> Output? {
+        guard data.count <= maximumSourceBytes,
+              let source = CGImageSourceCreateWithData(data as CFData, [
+                kCGImageSourceShouldCache: false,
+              ] as CFDictionary) else { return nil }
+        return downscale(source: source, maximumBytes: maximumBytes)
+    }
+
+    static func downscale(fileURL: URL, maximumBytes: Int) -> Output? {
+        guard let source = CGImageSourceCreateWithURL(fileURL as CFURL, [
+            kCGImageSourceShouldCache: false,
+        ] as CFDictionary) else { return nil }
+        return downscale(source: source, maximumBytes: maximumBytes)
+    }
+
+    private static func downscale(
+        source: CGImageSource,
+        maximumBytes: Int
+    ) -> Output? {
+        guard maximumBytes > 0, CGImageSourceGetCount(source) > 0 else { return nil }
+        let properties = CGImageSourceCopyPropertiesAtIndex(source, 0, nil)
+            as? [CFString: Any]
+        guard let width = (properties?[kCGImagePropertyPixelWidth] as? NSNumber)?.intValue,
+              let height = (properties?[kCGImagePropertyPixelHeight] as? NSNumber)?.intValue,
+              width > 0,
+              height > 0 else { return nil }
+
+        var target = max(minimumDimension, min(max(width, height), maximumDimension))
+        while target >= minimumDimension {
+            let options: [CFString: Any] = [
+                kCGImageSourceCreateThumbnailFromImageAlways: true,
+                kCGImageSourceCreateThumbnailWithTransform: true,
+                kCGImageSourceShouldCacheImmediately: true,
+                kCGImageSourceThumbnailMaxPixelSize: target,
+            ]
+            guard let thumbnail = CGImageSourceCreateThumbnailAtIndex(
+                source,
+                0,
+                options as CFDictionary
+            ), let flattened = flattenedJPEGSource(thumbnail) else { return nil }
+
+            for quality in jpegQualities {
+                guard let encoded = encodeJPEG(flattened, quality: quality) else { continue }
+                if encoded.count <= maximumBytes {
+                    return Output(
+                        data: encoded,
+                        mimeType: "image/jpeg",
+                        pixelWidth: flattened.width,
+                        pixelHeight: flattened.height
+                    )
+                }
+            }
+
+            guard target > minimumDimension else { break }
+            target = max(minimumDimension, target * 3 / 4)
+        }
+        return nil
+    }
+
+    /// JPEG has no alpha channel. Composite transparent sources over white so
+    /// screenshots and diagrams remain readable instead of acquiring black
+    /// boxes where their transparent canvas used to be.
+    private static func flattenedJPEGSource(_ image: CGImage) -> CGImage? {
+        guard let context = CGContext(
+            data: nil,
+            width: image.width,
+            height: image.height,
+            bitsPerComponent: 8,
+            bytesPerRow: 0,
+            space: CGColorSpace(name: CGColorSpace.sRGB) ?? CGColorSpaceCreateDeviceRGB(),
+            bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue
+        ) else { return nil }
+        context.setFillColor(CGColor(gray: 1, alpha: 1))
+        context.fill(CGRect(x: 0, y: 0, width: image.width, height: image.height))
+        context.draw(image, in: CGRect(x: 0, y: 0, width: image.width, height: image.height))
+        return context.makeImage()
+    }
+
+    private static func encodeJPEG(_ image: CGImage, quality: Double) -> Data? {
+        let output = NSMutableData()
+        guard let destination = CGImageDestinationCreateWithData(
+            output,
+            UTType.jpeg.identifier as CFString,
+            1,
+            nil
+        ) else { return nil }
+        CGImageDestinationAddImage(destination, image, [
+            kCGImageDestinationLossyCompressionQuality: quality,
+        ] as CFDictionary)
+        guard CGImageDestinationFinalize(destination) else { return nil }
+        return output as Data
+    }
+}
+
 /// Pure classification of a dropped/opened file into an `AcpAttachment`,
-/// applying the image (≤ 5 MB) and UTF-8 text (≤ 256 KB) size limits. No actor
-/// isolation, so it can run off the main thread and be unit-tested directly.
+/// applying the image (≤ 5 MB after bounded downscaling) and UTF-8 text
+/// (≤ 256 KB) size limits. No actor isolation, so it can run off the main
+/// thread and be unit-tested directly.
 enum AcpAttachmentClassifier {
-    /// Images ride as base64 pixels; cap the payload at 5 MB (no downscaling).
+    /// Images ride as base64 pixels; cap the encoded payload at 5 MB.
     static let maxImageBytes = 5 * 1024 * 1024
     /// Text files ride inline as an embedded resource block; cap at 256 KB.
     static let maxTextFileBytes = 256 * 1024
@@ -872,14 +1020,40 @@ enum AcpAttachmentClassifier {
         let declaredSize = (try? fm.attributesOfItem(atPath: fileURL.path))?[.size] as? Int
 
         if imageExtensions.contains(ext) {
-            if let declaredSize, declaredSize > maxImageBytes {
+            if let declaredSize, declaredSize > AcpImageDownscaler.maximumSourceBytes {
                 return .rejected(reason: oversize(name, kind: "images", limit: maxImageBytes))
             }
-            guard let data = try? Data(contentsOf: fileURL) else {
+            if let declaredSize, declaredSize > maxImageBytes {
+                guard let scaled = AcpImageDownscaler.downscale(
+                    fileURL: fileURL,
+                    maximumBytes: maxImageBytes
+                ) else {
+                    return .rejected(reason: "\(name): could not be downscaled safely below 5 MB.")
+                }
+                return .accepted(.image(
+                    data: scaled.data,
+                    mimeType: scaled.mimeType,
+                    name: name
+                ))
+            }
+            guard let data = try? Data(contentsOf: fileURL, options: .mappedIfSafe) else {
                 return .rejected(reason: "\(name): could not be read.")
             }
-            guard data.count <= maxImageBytes else {
+            if data.count > AcpImageDownscaler.maximumSourceBytes {
                 return .rejected(reason: oversize(name, kind: "images", limit: maxImageBytes))
+            }
+            if data.count > maxImageBytes {
+                guard let scaled = AcpImageDownscaler.downscale(
+                    data: data,
+                    maximumBytes: maxImageBytes
+                ) else {
+                    return .rejected(reason: "\(name): could not be downscaled safely below 5 MB.")
+                }
+                return .accepted(.image(
+                    data: scaled.data,
+                    mimeType: scaled.mimeType,
+                    name: name
+                ))
             }
             return .accepted(.image(data: data, mimeType: mimeType(forExtension: ext), name: name))
         }

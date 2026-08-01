@@ -51,6 +51,9 @@ Large product and architecture work remains ordered in
 - The focused terminal now coalesces rendered, bounded VoiceOver output at an
   800 ms cadence without replaying background backlog; terminal pane chrome
   derives from the same opaque native/Kaisola palette as its SwiftTerm canvas.
+- An ended owned pane can recreate that exact agent/account/title/draft recipe
+  in place with a fresh PTY, while oversized valid ACP images downscale off-main
+  through a 2048 px/128 MB-bounded ImageIO path instead of being rejected.
 
 ## Open audit fixes
 

@@ -1246,7 +1246,7 @@ final class NativePreviewSettingsTests: XCTestCase {
     /// The width the override applies is the one the rest of the chrome is
     /// designed around, not a second literal that can drift away from it.
     func testSidebarOverrideTargetsTheIdealWidthTheChromeIsSizedFor() {
-        XCTAssertEqual(NativeWorkspaceChrome.projectSidebarIdealWidth, 228)
+        XCTAssertEqual(NativeWorkspaceChrome.projectSidebarIdealWidth, 210)
         XCTAssertGreaterThan(
             NativeWorkspaceChrome.projectSidebarIdealWidth,
             InitialSidebarWidth.systemDefault + InitialSidebarWidth.tolerance,
@@ -1524,16 +1524,26 @@ final class NativePreviewSettingsTests: XCTestCase {
     }
 
     /// v1.1.6 widened the resting rail (200 → 248) and its ceiling (260 → 340)
-    /// to pay for a visible hierarchy step and a whole account name. v1.1.7
-    /// gives 20 of those points back (248 → 228) now that the rail spends none
-    /// of its width on chrome — no ghost row, no row washes, no mark tiles. The
-    /// *minimum* and the *maximum* are both unchanged: nothing about the narrow
-    /// rail moves, and anyone who wants the v1.1.6 rail drags it back.
+    /// to pay for a visible hierarchy step and a whole account name. v1.1.7 gave
+    /// 20 of those points back (248 → 228) once the rail spent none of its width
+    /// on chrome, and v1.1.8 takes 18 more (228 → 210).
+    ///
+    /// The *minimum* and the *maximum* are unchanged through all of it: nothing
+    /// about the narrow rail moves, and anyone who wants the wide one drags it
+    /// back. What v1.1.8 does change is that the narrowing is no longer free —
+    /// the session indent and the footer's account name each give something up
+    /// for it, and those two trades are pinned in `QuietIdentityMarkTests`
+    /// rather than left as a comment here.
     func testProjectSidebarHasComfortableResizableWidth() {
         XCTAssertEqual(NativeWorkspaceChrome.projectSidebarMinimumWidth, 168)
-        XCTAssertEqual(NativeWorkspaceChrome.projectSidebarIdealWidth, 228)
+        XCTAssertEqual(NativeWorkspaceChrome.projectSidebarIdealWidth, 210)
         XCTAssertEqual(NativeWorkspaceChrome.projectSidebarMaximumWidth, 340)
         XCTAssertEqual(NativeWorkspaceChrome.projectSidebarDividerWidth, 1)
+        // Still comfortably inside its own bounds after two narrowings.
+        XCTAssertGreaterThan(
+            NativeWorkspaceChrome.projectSidebarIdealWidth,
+            NativeWorkspaceChrome.projectSidebarMinimumWidth
+        )
     }
 
     /// The pointer target is sized from the gap the eye aims at, not from the

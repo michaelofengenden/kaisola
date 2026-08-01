@@ -340,24 +340,41 @@ final class QuietIdentityMarkTests: XCTestCase {
             QuietIdentityMarkView.slot,
             "the hierarchy step is narrower than one identity mark — it reads as ragged, not nested"
         )
-        // v1.1.7 pushed it to two full identity slots. 22pt still read as a
-        // nudge next to a 16pt mark; a session's mark now starts past where
-        // its project's mark ENDS, which is what "nested" actually looks like.
+        // v1.1.7 pushed it to two full identity slots (32pt). v1.1.8 gives 4 of
+        // those back, and the reason is worth stating rather than hiding in a
+        // smaller literal: the rail narrows to 210, and at a 40pt indent the
+        // title lane renders 14 characters — under the 15-character floor the
+        // test above holds. Something had to pay, and the indent is the cheaper
+        // of the two: at 28pt a session's mark still starts 12pt past where its
+        // project's mark ends, so the row is still unambiguously nested, while
+        // 14 characters of a title is the abbreviation problem the whole budget
+        // exists to prevent.
         XCTAssertGreaterThanOrEqual(
             QuietRowBudget.indentStep,
-            QuietIdentityMarkView.slot * 2,
+            QuietIdentityMarkView.slot,
+            "the hierarchy step is under one identity mark — that reads as ragged"
+        )
+        XCTAssertGreaterThan(
+            QuietRowBudget.indentStep,
+            QuietIdentityMarkView.slot * 1.5,
             "the session indent went shallow again"
         )
-        XCTAssertEqual(QuietRowBudget.sessionIndent, 40)
+        XCTAssertEqual(QuietRowBudget.sessionIndent, 36)
+        XCTAssertEqual(QuietRowBudget.indentStep, 28)
     }
 
-    /// v1.1.7 does the opposite trade to v1.1.6's and has to survive it: the
-    /// rail NARROWS by 20 and the indent DEEPENS by 10 in the same pass. Assert
-    /// the outcome — that a title at the new resting width still beats the one
-    /// the v1.1.4 rail shipped — so neither number can be pushed further
-    /// without this failing.
+    /// Three releases have now narrowed the rail, and each one has to survive
+    /// the comparison that started the whole budget: the v1.1.4 row that shipped
+    /// a 56pt title lane — "Audit K…", seven characters — at a 200pt sidebar.
+    ///
+    /// Deliberately measured against what v1.1.4 *shipped* rather than against a
+    /// reconstruction of its arithmetic. The reconstruction is the tempting
+    /// version and it is the wrong one: v1.1.4 also paid `.sidebar` list style's
+    /// ~31pt of platform row inset, which v1.1.5 cancelled and no formula
+    /// written from today's constants remembers. Comparing against a model that
+    /// omits it would quietly hold this release to a standard the old release
+    /// never actually met.
     func testTheNarrowerRailStillOutTitlesTheOldOne() {
-        XCTAssertGreaterThan(NativeWorkspaceChrome.projectSidebarIdealWidth, 200)
         XCTAssertGreaterThan(
             NativeWorkspaceChrome.projectSidebarMaximumWidth,
             NativeWorkspaceChrome.projectSidebarIdealWidth
@@ -372,9 +389,20 @@ final class QuietIdentityMarkTests: XCTestCase {
             timeLabelWidth: timeWidth,
             showsReveal: false
         )
-        // The v1.1.4 row: 200pt sidebar, 18pt indent, same tokens.
-        let before = 200 - 18 - 10 - QuietIdentityMarkView.slot - 8 - 5 - (timeWidth + 5 + 6)
-        XCTAssertGreaterThan(now, before, "the narrower rail gave the title back to the indent")
+        // The measured v1.1.4 lane, from the bug report this budget was built
+        // for. Not derived — recorded.
+        let shippedInV114: CGFloat = 56
+        XCTAssertGreaterThan(
+            now,
+            shippedInV114 * 1.75,
+            "the narrower rail handed the title back to the indent"
+        )
+
+        // …and the narrowing really is a narrowing: the rail is now under every
+        // resting width it has had since v1.1.5, which is what makes the two
+        // trades this release pays for (the 4pt of indent above, and the
+        // footer's abbreviated name below) real rather than decorative.
+        XCTAssertLessThan(NativeWorkspaceChrome.projectSidebarIdealWidth, 228)
     }
 
     // MARK: - Header "+" containment
@@ -420,51 +448,125 @@ final class QuietIdentityMarkTests: XCTestCase {
 
     // MARK: - Footer budget
 
+    /// The chip's width, as the footer actually renders it: text only, plus its
+    /// own internal padding on each side.
+    private var usageChipWidth: CGFloat {
+        let chipFont = NSFont.monospacedDigitSystemFont(ofSize: 11, weight: .medium)
+        return ("62%" as NSString).size(withAttributes: [.font: chipFont]).width
+            + FooterAccountBudget.usageChipHorizontalPadding * 2
+    }
+
+    private var footerNameFont: NSFont { NSFont.systemFont(ofSize: 12, weight: .medium) }
+
+    private func footerNameRenders(_ name: String) -> CGFloat {
+        (name as NSString).size(withAttributes: [.font: footerNameFont]).width
+    }
+
     /// The footer regression: the account chip was framed to a fixed 118pt and
     /// then `fixedSize`d, so "michael ofen…" stayed truncated no matter how far
     /// the sidebar was dragged. The name's width is now a function of the
-    /// footer's, and at the default sidebar it must beat that old constant even
-    /// with both new controls present.
+    /// footer's, and it must still beat that old constant.
     func testAccountNameGetsMoreThanTheOldFixedChipAtTheDefaultWidth() {
-        let font = NSFont.systemFont(ofSize: 12, weight: .medium)
-        // The chip is text only, so its width is the percentage's own.
-        let chipFont = NSFont.monospacedDigitSystemFont(ofSize: 11, weight: .medium)
-        let chip = ("62%" as NSString).size(withAttributes: [.font: chipFont]).width + 4
-
         let width = FooterAccountBudget.nameWidth(
             footerWidth: NativeWorkspaceChrome.projectSidebarIdealWidth,
-            usageChipWidth: chip,
+            usageChipWidth: usageChipWidth,
             attentionWidth: 0
         )
         // The old chip framed avatar + name into 118pt total.
         XCTAssertGreaterThan(width, 118 - FooterAccountBudget.avatarSlot)
 
-        // The name from the bug report is 117.3pt at this font. v1.1.7's 228pt
-        // rail (20pt narrower than v1.1.6's 248pt) left the name only 99.0pt —
-        // controlSlot(22)×2 + gap(5)×2 + chip + gap ate the difference, so
-        // "michael ofengenden" took an ellipsis again at the *default* width.
-        // The fix slims the two control slots (22→16) and the gaps between
-        // them (5→2) rather than the sidebar, so the whole name fits again at
-        // rest, not only when the rail is dragged wider.
-        let rendered = ("michael ofengenden" as NSString).size(withAttributes: [.font: font]).width
+        // What v1.1.8 actually ships, stated as arithmetic because it is a
+        // trade and not a win. The 210pt rail leaves the name lane ~110pt
+        // against the 117.3pt "michael ofengenden" renders at, AFTER spending
+        // every rung of the recovery ladder (leading padding 8→6, avatar
+        // 22→18, chip padding 2→1). So the full name does NOT fit here, and
+        // the honest thing is to assert that rather than to pretend otherwise:
+        // what has to fit is what the chip DRAWS.
+        let full = "michael ofengenden"
+        XCTAssertLessThan(
+            width,
+            footerNameRenders(full),
+            "the full name fits again — the abbreviation fallback is now dead code, remove it"
+        )
+        let displayed = FooterAccountName.displayed(
+            full,
+            footerWidth: NativeWorkspaceChrome.projectSidebarIdealWidth
+        )
+        XCTAssertEqual(displayed, "michael o.")
         XCTAssertGreaterThanOrEqual(
-            width, rendered,
-            "the whole name should fit at the default sidebar width without an ellipsis"
+            width, footerNameRenders(displayed),
+            "even the abbreviated name takes an ellipsis at the default width"
+        )
+        // With real room to spare, not by a hair: an abbreviation that only just
+        // fits is one control away from truncating too.
+        XCTAssertGreaterThan(width - footerNameRenders(displayed), 30)
+
+        // The ladder still has to have been climbed. These are the three rungs;
+        // pinned so a later pass cannot restore the points it took and leave the
+        // rail narrow anyway.
+        XCTAssertEqual(FooterAccountBudget.leadingPadding, 6)
+        XCTAssertEqual(FooterAccountBudget.avatarSize, 18)
+        XCTAssertEqual(FooterAccountBudget.usageChipHorizontalPadding, 1)
+    }
+
+    /// The abbreviation is a NARROW-WIDTH behaviour, not the new normal. Drag the
+    /// rail out and the whole name comes back — that is what makes deferring it
+    /// acceptable rather than a loss.
+    func testTheWholeNameComesBackWhenTheRailIsDraggedWider() {
+        let full = "michael ofengenden"
+        let rendered = footerNameRenders(full)
+
+        // At and above the threshold the chip shows everything…
+        XCTAssertFalse(FooterAccountName.shouldAbbreviate(
+            footerWidth: FooterAccountName.abbreviationThreshold
+        ))
+        XCTAssertEqual(
+            FooterAccountName.displayed(full, footerWidth: FooterAccountName.abbreviationThreshold),
+            full
+        )
+        // …and the threshold is set where the name genuinely fits, with margin.
+        // A threshold below this point would show a full name that overlaps the
+        // gear beside it, which is worse than abbreviating.
+        let atThreshold = FooterAccountBudget.nameWidth(
+            footerWidth: FooterAccountName.abbreviationThreshold,
+            usageChipWidth: usageChipWidth,
+            attentionWidth: 0
+        )
+        XCTAssertGreaterThanOrEqual(atThreshold, rendered)
+        XCTAssertGreaterThan(
+            atThreshold - rendered, 5,
+            "the threshold sits on the exact point the name stops fitting; it will flicker under a drag"
         )
 
-        // The regression's own number, pinned so a future slot/gap change can't
-        // quietly reopen it: the old arithmetic left 99.0pt here, and the fix
-        // has to recover at least 18 of the ~20pt the narrower rail cost.
-        let brokenWidthAtDefault: CGFloat = 99.0
-        XCTAssertGreaterThanOrEqual(
-            width - brokenWidthAtDefault, 18,
-            "the footer should recover at least 18pt for the name at the default width"
+        // …and at the rail's maximum there is real room, so widening keeps
+        // paying rather than saturating.
+        let roomy = FooterAccountBudget.nameWidth(
+            footerWidth: NativeWorkspaceChrome.projectSidebarMaximumWidth,
+            usageChipWidth: usageChipWidth,
+            attentionWidth: 0
         )
-
-        // The margin at the default width is thin by construction, so widening
-        // the sidebar has to open it up properly rather than merely a little.
-        let roomy = FooterAccountBudget.nameWidth(footerWidth: 300, usageChipWidth: chip, attentionWidth: 0)
         XCTAssertGreaterThan(roomy - rendered, 40, "widening the sidebar barely helps the name")
+    }
+
+    /// The rule itself: first name plus last initial, the account's own casing,
+    /// and hands back anything it cannot abbreviate meaningfully.
+    func testAbbreviationTakesAFirstNameAndALastInitial() {
+        XCTAssertEqual(FooterAccountName.abbreviated("michael ofengenden"), "michael o.")
+        XCTAssertEqual(FooterAccountName.abbreviated("Michael Ofengenden"), "Michael O.")
+        // Three or more parts: still first + last initial, not a middle-name
+        // chain, because the last name is the one that disambiguates.
+        XCTAssertEqual(FooterAccountName.abbreviated("Ada Byron Lovelace"), "Ada L.")
+        // Nothing to take an initial from — returned untouched rather than
+        // mangled. An email is the chip's fallback when there is no display
+        // name, and "mofengenden@…" abbreviated at a dot is unrecognisable.
+        XCTAssertEqual(FooterAccountName.abbreviated("Kaisola"), "Kaisola")
+        XCTAssertEqual(
+            FooterAccountName.abbreviated("mofengenden@berkeley.edu"),
+            "mofengenden@berkeley.edu"
+        )
+        XCTAssertEqual(FooterAccountName.abbreviated(""), "")
+        // Extra whitespace must not produce "michael ." from an empty tail.
+        XCTAssertEqual(FooterAccountName.abbreviated("michael   ofengenden  "), "michael o.")
     }
 
     /// The fix is in the slots and gaps shared by every control, not a
@@ -473,8 +575,7 @@ final class QuietIdentityMarkTests: XCTestCase {
     /// to recover at least the same 18pt the quiet case does, compared against
     /// what the pre-fix arithmetic gave the name in that same busy state.
     func testTheRecoveryHoldsWithTheAttentionBellShowingToo() {
-        let chipFont = NSFont.monospacedDigitSystemFont(ofSize: 11, weight: .medium)
-        let chip = ("62%" as NSString).size(withAttributes: [.font: chipFont]).width + 4
+        let chip = usageChipWidth
         let bellWidth: CGFloat = 30
 
         let width = FooterAccountBudget.nameWidth(

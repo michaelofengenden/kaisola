@@ -191,16 +191,22 @@ private enum QuietRailMetrics {
     /// The v1.1.5 width-budget work cut the STEP (this minus the project row's
     /// own 8pt inset) to 18pt — one mark-width, a 10pt step the eye read as
     /// "slightly ragged" rather than "nested". v1.1.6 bought a 22pt step;
-    /// v1.1.7 pushes the step to 32pt (two identity slots), which lands the
-    /// indent itself — the constant below — at 40 (8pt inset + 32pt step)
-    /// *while* the rail narrows to 228, which is the trade worth stating: at
-    /// 228 a session title still gets 117.5pt — 17 characters of a real title
-    /// — so the nesting is paid for out of the row's slack, not out of
-    /// legibility. `QuietRowBudget` holds the arithmetic and a test holds the
+    /// v1.1.7 pushed the step to 32pt (two identity slots), landing this
+    /// constant at 40 while the rail narrowed to 228.
+    ///
+    /// v1.1.8 narrows the rail again, 228 → 210, and that is where the trade
+    /// finally bites: at 210 with a 40pt indent a session title gets 99.5pt,
+    /// which renders **14** characters of a real title — under the 15-character
+    /// floor `QuietIdentityMarkTests` holds. The indent gives the 4pt back
+    /// rather than the title doing so: at 36 (8pt inset + a 28pt step) the title
+    /// gets 103.5pt and 15 characters survive. 28pt is still comfortably past
+    /// one identity slot, so a session's mark still starts well beyond where its
+    /// project's mark ends — the nesting reads, it is simply no longer two full
+    /// slots. `QuietRowBudget` holds the arithmetic and a test holds the
     /// character count.
-    static let sessionIndent: CGFloat = 40
+    static let sessionIndent: CGFloat = 36
     /// One cadence for every row in the rail: sessions, compact projects and
-    /// the pinned project header all measure 32pt.
+    /// the active project header all measure 32pt.
     static let rowHeight: CGFloat = 32
     static let horizontalInset: CGFloat = 8
     static let trailingInset: CGFloat = 10

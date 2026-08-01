@@ -265,6 +265,13 @@ struct RootShellView: View {
                 Button(action: { settings.workspaceRailVisible.toggle() }) { EmptyView() }
                     .keyboardShortcut("b", modifiers: .command)
                     .accessibilityLabel("Toggle Workspace Rail")
+                // ⇧⌘B for the document column, beside ⌘B for the Files column —
+                // the two panels the detail chrome bar now toggles. Checked
+                // against every other binding in the app (the AppKit main menu
+                // and this Group): ⇧⌘B was unclaimed.
+                Button(action: toggleFilePreviewColumn) { EmptyView() }
+                    .keyboardShortcut("b", modifiers: [.command, .shift])
+                    .accessibilityLabel("Toggle Document Preview")
                 Button(action: toggleOmniBar) { EmptyView() }
                     .keyboardShortcut("l", modifiers: .command)
                     .accessibilityLabel("Message Current Agent")
@@ -536,9 +543,18 @@ struct RootShellView: View {
         }
     }
 
+    /// The detail column's two panel toggles, top-right.
+    ///
+    /// They are a PAIR, in the order the panels themselves sit: the document
+    /// preview opens to the left of the Files rail, so its control is to the
+    /// left of the Files control. Files shipped here alone in v1.1.6 while the
+    /// preview's only door stayed buried in the footer's overflow menu — one of
+    /// two adjacent columns had a visible toggle and the other did not, which
+    /// read as an oversight because it was one.
     private var detailChromeBar: some View {
-        HStack(spacing: 4) {
+        HStack(spacing: NativeWorkspaceChrome.detailChromeControlGap) {
             Spacer(minLength: 0)
+            filePreviewToolbarControl
             filesToolbarControl
         }
         .padding(.trailing, KaisolaVisualSystem.chromeInset + 4)
@@ -554,15 +570,59 @@ struct RootShellView: View {
     /// palette drive the same setting.
     private var filesToolbarControl: some View {
         let visible = settings.workspaceRailVisible
-        return Button {
-            settings.workspaceRailVisible.toggle()
-        } label: {
-            Image(systemName: "sidebar.trailing")
-                .font(.system(size: 12, weight: .medium))
-                .foregroundStyle(visible ? Color.primary : Color.secondary)
-                .frame(width: 26, height: NativeWorkspaceChrome.detailChromeControlHeight)
+        return detailChromeToggle(
+            symbol: "sidebar.trailing",
+            isOn: visible,
+            help: visible ? "Hide Files (⌘B)" : "Show Files (⌘B)",
+            label: visible ? "Hide Files" : "Show Files",
+            identifier: "detail.toggle-files",
+            action: { settings.workspaceRailVisible.toggle() }
+        )
+    }
+
+    /// Its twin for the document-preview column. There is no `showFilePreview`
+    /// flag to bind: the preview column is present exactly when the model has a
+    /// file (or browser card) to show, so `AppModel.toggleFilePreview()` is the
+    /// state — it hides the column, or restores the last file and reports
+    /// whether it found one. When it finds none there is nothing to preview, so
+    /// the control opens Files instead of doing nothing, which is what the
+    /// footer's menu item has always done.
+    private var filePreviewToolbarControl: some View {
+        let visible = model.previewedFileURL != nil || model.browserCardURL != nil
+        return detailChromeToggle(
+            symbol: "doc.text",
+            isOn: visible,
+            help: visible ? "Hide the document (⇧⌘B)" : "Show the document (⇧⌘B)",
+            label: visible ? "Hide Document" : "Show Document",
+            identifier: "detail.toggle-document",
+            action: toggleFilePreviewColumn
+        )
+    }
+
+    private func toggleFilePreviewColumn() {
+        if !model.toggleFilePreview() { settings.workspaceRailVisible = true }
+    }
+
+    /// One shape for both, so "consistent spacing" is structural rather than two
+    /// call sites that happen to agree today.
+    private func detailChromeToggle(
+        symbol: String,
+        isOn: Bool,
+        help: String,
+        label: String,
+        identifier: String,
+        action: @escaping () -> Void
+    ) -> some View {
+        Button(action: action) {
+            Image(systemName: symbol)
+                .font(.system(size: NativeWorkspaceChrome.detailChromeGlyphSize, weight: .regular))
+                .foregroundStyle(isOn ? Color.primary : Color.secondary)
+                .frame(
+                    width: NativeWorkspaceChrome.detailChromeControlWidth,
+                    height: NativeWorkspaceChrome.detailChromeControlHeight
+                )
                 .background(
-                    visible ? Color.primary.opacity(0.10) : Color.clear,
+                    isOn ? Color.primary.opacity(0.10) : Color.clear,
                     in: RoundedRectangle(
                         cornerRadius: KaisolaVisualSystem.controlRadius,
                         style: .continuous
@@ -571,8 +631,9 @@ struct RootShellView: View {
                 .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
-        .help(visible ? "Hide Files (⌘B)" : "Show Files (⌘B)")
-        .accessibilityLabel(visible ? "Hide Files" : "Show Files")
+        .help(help)
+        .accessibilityLabel(label)
+        .accessibilityIdentifier(identifier)
     }
 
     // MARK: Left-tree context menus
@@ -2790,12 +2851,22 @@ enum NativeWorkspaceChrome {
     static let topBarTrafficLightClearance: CGFloat = 76
     static let projectSidebarMinimumWidth: CGFloat = 168
     /// The rail's resting width. 200 → 248 in v1.1.6 to buy a legible title and
-    /// a visible hierarchy step; 248 → 228 in v1.1.7, once the rail stopped
-    /// spending width on chrome. Nothing in the row grammar shrank to pay for
-    /// it: at 228, with the deeper 40pt session indent, a title still gets
-    /// 117.5pt — 17 characters — which `QuietRowBudget` states and a test pins.
-    /// The maximum is unchanged, so anyone who wants the old rail drags it back.
-    static let projectSidebarIdealWidth: CGFloat = 228
+    /// a visible hierarchy step; 248 → 228 in v1.1.7 once the rail stopped
+    /// spending width on chrome; 228 → 210 in v1.1.8.
+    ///
+    /// This step is the first one the row grammar actually pays for, and the two
+    /// bills are stated rather than absorbed. The session indent gives back 4pt
+    /// (40 → 36) so a title still renders 15 characters — see
+    /// `QuietRailMetrics.sessionIndent`. The footer's account name cannot be made
+    /// to fit: after spending every point the budget had (leading padding 8 → 6,
+    /// avatar 22 → 18, the usage chip's internal padding 2 → 1) the lane is
+    /// 110.0pt against the 117.3pt "michael ofengenden" needs, so below
+    /// `FooterAccountName.abbreviationThreshold` the chip shows a first name plus
+    /// a last initial and carries the whole name in its tooltip.
+    ///
+    /// The maximum is unchanged, so anyone who wants the wide rail — and the
+    /// unabbreviated name with it — drags it back and it stays.
+    static let projectSidebarIdealWidth: CGFloat = 210
     /// Raised alongside the ideal so a user who wants long titles can have
     /// them; the minimum is unchanged, so nothing about the narrow rail moves.
     static let projectSidebarMaximumWidth: CGFloat = 340
@@ -2821,8 +2892,16 @@ enum NativeWorkspaceChrome {
     /// visible line. One number so the sidebar splitter and the pane handles
     /// cannot drift apart; see `SessionPaneDividerSizing`.
     static let dividerCorridorReach: CGFloat = 10
-    /// The Files control's own height, which the detail chrome band wraps.
+    /// A detail-chrome toggle's own height, which the chrome band wraps.
     static let detailChromeControlHeight: CGFloat = 24
+    static let detailChromeControlWidth: CGFloat = 26
+    /// Monoline SF Symbols at toolbar weight. 12 → 16 in v1.1.8: at 12 the lone
+    /// Files glyph read as a hairline sitting in an empty 40pt band, and a pair
+    /// of controls at that size reads as debris rather than as a control group.
+    static let detailChromeGlyphSize: CGFloat = 16
+    /// Between the two toggles. Tight enough that they read as one group and not
+    /// as two unrelated buttons that happen to share a corner.
+    static let detailChromeControlGap: CGFloat = 2
     /// Breathing room above and below that control when the band carries
     /// nothing else.
     static let detailChromeControlPadding: CGFloat = 4
@@ -3317,8 +3396,9 @@ enum FooterUsageChip {
 /// truncated at every width. The chip is now bounded by the *footer*, not by a
 /// constant, and this is the number that says so.
 enum FooterAccountBudget {
-    /// Leading and trailing padding the footer row itself pays.
-    static let leadingPadding: CGFloat = 8
+    /// Leading and trailing padding the footer row itself pays. The leading side
+    /// went 8 → 6 in v1.1.8, the first rung of the 210pt rail's recovery ladder.
+    static let leadingPadding: CGFloat = 6
     static let trailingPadding: CGFloat = 5
     static var horizontalPadding: CGFloat { leadingPadding + trailingPadding }
     /// Gap between footer controls. The 228pt resting rail (down from 248pt)
@@ -3327,8 +3407,13 @@ enum FooterAccountBudget {
     /// gets the difference.
     static let gap: CGFloat = 2
     /// The avatar that leads the account chip, plus its gap to the name.
+    ///
+    /// 22 → 18 in v1.1.8, the second rung. An avatar is an identity cue, not a
+    /// portrait; at 18 it is still comfortably above the ~16pt where a circular
+    /// photo stops resolving as a face, and the 4pt goes straight to the name.
     static let avatarGap: CGFloat = 6
-    static let avatarSlot: CGFloat = 22 + avatarGap
+    static let avatarSize: CGFloat = 18
+    static var avatarSlot: CGFloat { avatarSize + avatarGap }
     /// A square footer control (gear, overflow). Shrank from 22 to 16 for the
     /// same reason `gap` did: the glyphs inside are 12pt and were never what
     /// needed a 22pt frame, so the slot now sits closer to the glyph and the
@@ -3343,6 +3428,10 @@ enum FooterAccountBudget {
     /// the tap target stays ≥20pt (16 + 2×2) without costing the name a
     /// single point.
     static let tapTargetExpansion: CGFloat = 2
+    /// Padding inside the usage chip, on each side. 2 → 1 in v1.1.8, the third
+    /// and last rung: the chip is text with no capsule behind it, so its padding
+    /// only separates four characters from the `gap` already on either side.
+    static let usageChipHorizontalPadding: CGFloat = 1
 
     /// - Returns: points the account *name* can use before it must truncate.
     static func nameWidth(
@@ -3356,6 +3445,55 @@ enum FooterAccountBudget {
         if usageChipWidth > 0 { trailing += usageChipWidth + gap }
         if attentionWidth > 0 { trailing += attentionWidth + gap }
         return footerWidth - horizontalPadding - avatarSlot - trailing
+    }
+}
+
+/// What the account chip actually renders, once the budget has run out.
+///
+/// v1.1.8's 210pt rail is the first width where "michael ofengenden" genuinely
+/// does not fit: the ladder in `FooterAccountBudget` (leading padding 8 → 6,
+/// avatar 22 → 18, chip padding 2 → 1) recovers 8 of the 18 points the narrowing
+/// cost, leaving the name lane at ~110pt against the 117.3pt the name renders at.
+/// The remaining choice is which failure to ship, and an ellipsis is the worse
+/// one: "michael ofen…" is a truncation *artifact*, it tells you nothing you did
+/// not already know, and it is exactly the complaint that started this thread.
+///
+/// A deliberate abbreviation is the better failure. "michael o." is a form
+/// people write themselves, it fits with room to spare, and the whole name stays
+/// one hover away in the tooltip and one click away at the top of the account
+/// menu. It applies at narrow widths only — drag the rail past the threshold and
+/// the full name comes back — so nothing is lost, it is deferred.
+enum FooterAccountName {
+    /// Below this footer width the chip abbreviates.
+    ///
+    /// 225, not the 217.3 the arithmetic bottoms out at: a threshold sitting on
+    /// the exact point where the name stops fitting would flip back and forth
+    /// under a slow drag, and the last few points before it would render a name
+    /// that technically fits and visually touches the gear beside it.
+    static let abbreviationThreshold: CGFloat = 225
+
+    static func shouldAbbreviate(footerWidth: CGFloat) -> Bool {
+        footerWidth < abbreviationThreshold
+    }
+
+    /// First name plus last initial. Case is the account's own — the display
+    /// name is whatever the provider stored, and title-casing someone's name for
+    /// them is not this function's business.
+    ///
+    /// Anything without a space (a single name, or the email address the chip
+    /// falls back to) is returned untouched: there is no initial to take, and an
+    /// email abbreviated at its first dot would be unrecognisable.
+    static func abbreviated(_ name: String) -> String {
+        let parts = name.split(whereSeparator: \.isWhitespace)
+        guard parts.count > 1, let first = parts.first, let last = parts.last,
+              let initial = last.first else { return name }
+        return "\(first) \(initial)."
+    }
+
+    /// - Returns: what to draw, and the full name whenever it differs so the
+    ///   caller can put it in the tooltip.
+    static func displayed(_ name: String, footerWidth: CGFloat) -> String {
+        shouldAbbreviate(footerWidth: footerWidth) ? abbreviated(name) : name
     }
 }
 
@@ -3377,6 +3515,11 @@ private struct ConnectionFooter: View {
 
     @ObservedObject private var attention = AttentionCenter.shared
     @State private var showInbox = false
+    /// The footer's own rendered width, which decides whether the account name
+    /// abbreviates. Read from a background `GeometryReader` rather than passed
+    /// in: the footer is the thing the budget is measured against, and it is the
+    /// only view that knows how wide the user has dragged the rail.
+    @State private var measuredWidth: CGFloat = NativeWorkspaceChrome.projectSidebarIdealWidth
 
     private static let appVersion = Bundle.main.object(
         forInfoDictionaryKey: "CFBundleShortVersionString"
@@ -3410,6 +3553,17 @@ private struct ConnectionFooter: View {
         .padding(.leading, FooterAccountBudget.leadingPadding)
         .padding(.trailing, FooterAccountBudget.trailingPadding)
         .frame(height: 40)
+        // A background reader, so measuring cannot participate in the layout it
+        // measures. The only thing the width decides is which *string* the chip
+        // draws, and the chip is the row's flexible child either way, so there
+        // is no path back from the decision to the measurement.
+        .background {
+            GeometryReader { proxy in
+                Color.clear
+                    .onAppear { measuredWidth = proxy.size.width }
+                    .onChange(of: proxy.size.width) { _, width in measuredWidth = width }
+            }
+        }
     }
 
     /// One click to Settings — the ⌘, destination, which until now existed
@@ -3445,7 +3599,7 @@ private struct ConnectionFooter: View {
                 Text(reading.label)
                     .font(.system(size: 11, weight: .medium).monospacedDigit())
                     .foregroundStyle(Self.usageTint(reading.level))
-                    .padding(.horizontal, 2)
+                    .padding(.horizontal, FooterAccountBudget.usageChipHorizontalPadding)
                     .frame(height: FooterAccountBudget.controlSlot)
                     .contentShape(Rectangle().inset(by: -FooterAccountBudget.tapTargetExpansion))
             }
@@ -3486,6 +3640,18 @@ private struct ConnectionFooter: View {
     private var accountName: String {
         guard let account = auth.account else { return "Kaisola" }
         return account.displayName ?? account.email
+    }
+
+    /// What the chip draws at the current width; see `FooterAccountName`.
+    private var displayedAccountName: String {
+        FooterAccountName.displayed(accountName, footerWidth: measuredWidth)
+    }
+
+    /// The tooltip leads with the whole name whenever the chip is showing less
+    /// than all of it, so the abbreviation is never the only copy on screen.
+    private var accountHelp: String {
+        let base = "Account and workspace settings"
+        return displayedAccountName == accountName ? base : "\(accountName) — \(base)"
     }
 
     /// Everything the old shelf buttons did, minus the Files toggle (now a
@@ -3574,8 +3740,8 @@ private struct ConnectionFooter: View {
                 // Placeholder for the avatar, which is drawn in the overlay
                 // below; see the note there.
                 Color.clear
-                    .frame(width: 22, height: 22)
-                Text(accountName)
+                    .frame(width: FooterAccountBudget.avatarSize, height: FooterAccountBudget.avatarSize)
+                Text(displayedAccountName)
                     .font(.system(size: 12, weight: .medium))
                     .lineLimit(1)
                     .truncationMode(.tail)
@@ -3600,7 +3766,7 @@ private struct ConnectionFooter: View {
         // bridge. The bridge otherwise promotes the source bitmap's intrinsic
         // dimensions and drops its SwiftUI mask when the image finishes loading.
         .overlay(alignment: .leading) {
-            AccountAvatarView(account: auth.account, size: 22)
+            AccountAvatarView(account: auth.account, size: FooterAccountBudget.avatarSize)
                 .overlay(alignment: .bottomTrailing) {
                     // Connected is the silent default; only a broken connection
                     // earns a colored mark.
@@ -3613,7 +3779,7 @@ private struct ConnectionFooter: View {
                 }
                 .allowsHitTesting(false)
         }
-        .help("Account and workspace settings")
+        .help(accountHelp)
         .accessibilityLabel("Kaisola account and settings")
     }
 

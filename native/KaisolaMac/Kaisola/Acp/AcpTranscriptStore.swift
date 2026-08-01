@@ -120,17 +120,17 @@ actor AcpTranscriptStore {
         var entries: [String: LegacyEntry]
     }
 
-    private struct RowWrite {
+    private struct RowWrite: Sendable {
         var rows: [AcpTranscriptRow]
         var startOrdinal: Int64
     }
 
-    private enum FieldChange<Value> {
+    private enum FieldChange<Value: Sendable>: Sendable {
         case unchanged
         case set(Value?)
     }
 
-    private struct PendingWrite {
+    private struct PendingWrite: Sendable {
         var rows: RowWrite?
         var usage: FieldChange<AcpPersistedUsage> = .unchanged
         var draft: FieldChange<String> = .unchanged
@@ -143,7 +143,7 @@ actor AcpTranscriptStore {
         }
     }
 
-    private struct StoredMetadata {
+    private struct StoredMetadata: Sendable {
         var updatedAt: Int64
         var usage: AcpPersistedUsage?
         var draft: String?
@@ -151,10 +151,12 @@ actor AcpTranscriptStore {
         var sessionID: String?
     }
 
-    /// `OpaquePointer` has no Sendable annotation, while an actor deinitializer
-    /// is nonisolated under Swift 6. Give the connection one explicitly owned,
-    /// unchecked-sendable box; every operation still occurs on this actor and
-    /// the box merely closes the pointer when actor storage is released.
+    /// SQLite exposes its connection as an `OpaquePointer`, which older Swift 6
+    /// region-based isolation checking cannot safely follow through our nested,
+    /// synchronous transaction closures. Keep the pointer in one explicitly
+    /// owned, unchecked-sendable box. The box never leaves this actor and every
+    /// database operation remains actor-serialized; the annotation only makes
+    /// that lifetime and synchronization boundary visible to the compiler.
     private final class SQLiteHandle: @unchecked Sendable {
         let pointer: OpaquePointer
 
@@ -401,8 +403,8 @@ actor AcpTranscriptStore {
 
     // MARK: - SQLite lifecycle and migration
 
-    private func openDatabase() throws -> OpaquePointer {
-        if let databaseHandle { return databaseHandle.pointer }
+    private func openDatabase() throws -> SQLiteHandle {
+        if let databaseHandle { return databaseHandle }
         let directory = databaseURL.deletingLastPathComponent()
         try FileManager.default.createDirectory(
             at: directory,
@@ -421,30 +423,30 @@ actor AcpTranscriptStore {
             throw StoreError.database(message)
         }
 
+        let database = SQLiteHandle(handle)
         do {
             // Close the brief create-to-chmod window before schema or legacy
             // bytes enter the file. SQLite's rollback journal inherits this
             // private database ownership contract.
             try secureDatabaseFile()
-            try execute("PRAGMA foreign_keys = ON", database: handle)
-            try execute("PRAGMA trusted_schema = OFF", database: handle)
-            try execute("PRAGMA journal_mode = DELETE", database: handle)
-            try execute("PRAGMA synchronous = FULL", database: handle)
-            _ = sqlite3_busy_timeout(handle, 3_000)
-            try transaction(handle) {
-                try createSchema(handle)
-                try migrateLegacyArchiveIfNeeded(handle)
+            try execute("PRAGMA foreign_keys = ON", database: database)
+            try execute("PRAGMA trusted_schema = OFF", database: database)
+            try execute("PRAGMA journal_mode = DELETE", database: database)
+            try execute("PRAGMA synchronous = FULL", database: database)
+            _ = sqlite3_busy_timeout(database.pointer, 3_000)
+            try transaction(database) {
+                try createSchema(database)
+                try migrateLegacyArchiveIfNeeded(database)
             }
-            databaseHandle = SQLiteHandle(handle)
             try secureDatabaseFile()
-            return handle
+            databaseHandle = database
+            return database
         } catch {
-            sqlite3_close_v2(handle)
             throw error
         }
     }
 
-    private func createSchema(_ database: OpaquePointer) throws {
+    private func createSchema(_ database: SQLiteHandle) throws {
         try execute(
             """
             CREATE TABLE IF NOT EXISTS store_meta (
@@ -489,7 +491,7 @@ actor AcpTranscriptStore {
     /// creates the schema. The source file is never renamed or deleted. A
     /// decode/insert failure rolls every destination row back and leaves the
     /// marker absent, so the next launch can retry the exact source bytes.
-    private func migrateLegacyArchiveIfNeeded(_ database: OpaquePointer) throws {
+    private func migrateLegacyArchiveIfNeeded(_ database: SQLiteHandle) throws {
         let previousFingerprint = try metadataValue(for: "legacy_v1_import", database: database)
         guard let legacyJSONURL,
               FileManager.default.fileExists(atPath: legacyJSONURL.path) else {
@@ -554,7 +556,7 @@ actor AcpTranscriptStore {
 
     // MARK: - Writes
 
-    private func apply(_ write: PendingWrite, chatID: String, database: OpaquePointer) throws {
+    private func apply(_ write: PendingWrite, chatID: String, database: SQLiteHandle) throws {
         try ensureChat(chatID, updatedAt: write.updatedAt, database: database)
         if let rowWrite = write.rows {
             let prefixCount = try rowCount(
@@ -614,7 +616,7 @@ actor AcpTranscriptStore {
         }
     }
 
-    private func ensureChat(_ chatID: String, updatedAt: Int64, database: OpaquePointer) throws {
+    private func ensureChat(_ chatID: String, updatedAt: Int64, database: SQLiteHandle) throws {
         try withStatement(
             """
             INSERT INTO chats(chat_id, updated_at) VALUES (?, ?)
@@ -632,7 +634,7 @@ actor AcpTranscriptStore {
         _ row: AcpTranscriptRow,
         chatID: String,
         ordinal: Int64,
-        database: OpaquePointer
+        database: SQLiteHandle
     ) throws {
         let data = try encoder.encode(row)
         try withStatement(
@@ -650,7 +652,7 @@ actor AcpTranscriptStore {
         column: String,
         data: Data?,
         chatID: String,
-        database: OpaquePointer
+        database: SQLiteHandle
     ) throws {
         try withStatement("UPDATE chats SET \(column) = ? WHERE chat_id = ?", database: database) {
             if let data { try bind(data, at: 1, statement: $0, database: database) }
@@ -664,7 +666,7 @@ actor AcpTranscriptStore {
         column: String,
         value: String?,
         chatID: String,
-        database: OpaquePointer
+        database: SQLiteHandle
     ) throws {
         try withStatement("UPDATE chats SET \(column) = ? WHERE chat_id = ?", database: database) {
             if let value { try bind(value, at: 1, statement: $0, database: database) }
@@ -674,7 +676,7 @@ actor AcpTranscriptStore {
         }
     }
 
-    private func pruneEmptyChats(_ database: OpaquePointer) throws {
+    private func pruneEmptyChats(_ database: SQLiteHandle) throws {
         try execute(
             """
             DELETE FROM chats
@@ -687,7 +689,7 @@ actor AcpTranscriptStore {
         )
     }
 
-    private func pruneOldChats(_ database: OpaquePointer) throws {
+    private func pruneOldChats(_ database: SQLiteHandle) throws {
         try execute(
             """
             DELETE FROM chats WHERE chat_id IN (
@@ -702,7 +704,7 @@ actor AcpTranscriptStore {
 
     // MARK: - Reads
 
-    private func readMetadata(chatID: String, database: OpaquePointer) throws -> StoredMetadata? {
+    private func readMetadata(chatID: String, database: SQLiteHandle) throws -> StoredMetadata? {
         try withStatement(
             """
             SELECT updated_at, usage_json, draft, attachments_json, session_id
@@ -743,7 +745,7 @@ actor AcpTranscriptStore {
         }
     }
 
-    private func readAllRows(chatID: String, database: OpaquePointer) throws -> [AcpTranscriptRow] {
+    private func readAllRows(chatID: String, database: SQLiteHandle) throws -> [AcpTranscriptRow] {
         try withStatement(
             "SELECT row_json FROM transcript_rows WHERE chat_id = ? ORDER BY ordinal ASC",
             database: database
@@ -763,7 +765,7 @@ actor AcpTranscriptStore {
         }
     }
 
-    private func readTailPage(chatID: String, limit: Int, database: OpaquePointer) throws -> Page {
+    private func readTailPage(chatID: String, limit: Int, database: SQLiteHandle) throws -> Page {
         let total = try rowCount(chatID: chatID, beforeOrdinal: nil, database: database)
         guard total > 0 else { return .empty }
         return try readDescendingPage(
@@ -780,7 +782,7 @@ actor AcpTranscriptStore {
         chatID: String,
         beforeOrdinal: Int64,
         limit: Int,
-        database: OpaquePointer
+        database: SQLiteHandle
     ) throws -> Page {
         let total = try rowCount(chatID: chatID, beforeOrdinal: nil, database: database)
         let available = try rowCount(
@@ -813,7 +815,7 @@ actor AcpTranscriptStore {
         boundary: Int64?,
         limit: Int,
         total: Int,
-        database: OpaquePointer
+        database: SQLiteHandle
     ) throws -> Page {
         try withStatement(
             """
@@ -861,7 +863,7 @@ actor AcpTranscriptStore {
     private func rowCount(
         chatID: String,
         beforeOrdinal: Int64?,
-        database: OpaquePointer
+        database: SQLiteHandle
     ) throws -> Int {
         let predicate = beforeOrdinal == nil ? "" : " AND ordinal < ?"
         return try withStatement(
@@ -875,7 +877,7 @@ actor AcpTranscriptStore {
         }
     }
 
-    private func chatCount(_ database: OpaquePointer) throws -> Int {
+    private func chatCount(_ database: SQLiteHandle) throws -> Int {
         try withStatement("SELECT COUNT(*) FROM chats", database: database) { statement in
             guard sqlite3_step(statement) == SQLITE_ROW else { throw databaseError(database) }
             return Int(sqlite3_column_int64(statement, 0))
@@ -884,7 +886,7 @@ actor AcpTranscriptStore {
 
     // MARK: - SQLite helpers
 
-    private func transaction(_ database: OpaquePointer, body: () throws -> Void) throws {
+    private func transaction(_ database: SQLiteHandle, body: () throws -> Void) throws {
         try execute("BEGIN IMMEDIATE", database: database)
         do {
             try body()
@@ -895,10 +897,10 @@ actor AcpTranscriptStore {
         }
     }
 
-    private func execute(_ sql: String, database: OpaquePointer) throws {
+    private func execute(_ sql: String, database: SQLiteHandle) throws {
         var message: UnsafeMutablePointer<CChar>?
-        guard sqlite3_exec(database, sql, nil, nil, &message) == SQLITE_OK else {
-            let detail = message.map { String(cString: $0) } ?? Self.errorMessage(database)
+        guard sqlite3_exec(database.pointer, sql, nil, nil, &message) == SQLITE_OK else {
+            let detail = message.map { String(cString: $0) } ?? Self.errorMessage(database.pointer)
             sqlite3_free(message)
             throw StoreError.database(detail)
         }
@@ -906,17 +908,17 @@ actor AcpTranscriptStore {
 
     private func withStatement<Result>(
         _ sql: String,
-        database: OpaquePointer,
+        database: SQLiteHandle,
         body: (OpaquePointer) throws -> Result
     ) throws -> Result {
         var statement: OpaquePointer?
-        guard sqlite3_prepare_v2(database, sql, -1, &statement, nil) == SQLITE_OK,
+        guard sqlite3_prepare_v2(database.pointer, sql, -1, &statement, nil) == SQLITE_OK,
               let statement else { throw databaseError(database) }
         defer { sqlite3_finalize(statement) }
         return try body(statement)
     }
 
-    private func stepDone(_ statement: OpaquePointer, database: OpaquePointer) throws {
+    private func stepDone(_ statement: OpaquePointer, database: SQLiteHandle) throws {
         guard sqlite3_step(statement) == SQLITE_DONE else { throw databaseError(database) }
     }
 
@@ -924,7 +926,7 @@ actor AcpTranscriptStore {
         _ value: String,
         at index: Int32,
         statement: OpaquePointer,
-        database: OpaquePointer
+        database: SQLiteHandle
     ) throws {
         guard sqlite3_bind_text(statement, index, value, -1, Self.sqliteTransient) == SQLITE_OK else {
             throw databaseError(database)
@@ -935,7 +937,7 @@ actor AcpTranscriptStore {
         _ data: Data,
         at index: Int32,
         statement: OpaquePointer,
-        database: OpaquePointer
+        database: SQLiteHandle
     ) throws {
         let result = data.withUnsafeBytes { bytes in
             sqlite3_bind_blob(statement, index, bytes.baseAddress, Int32(bytes.count), Self.sqliteTransient)
@@ -956,7 +958,7 @@ actor AcpTranscriptStore {
         catch { throw StoreError.database("stored metadata blob could not be decoded") }
     }
 
-    private func metadataValue(for key: String, database: OpaquePointer) throws -> String? {
+    private func metadataValue(for key: String, database: SQLiteHandle) throws -> String? {
         try withStatement("SELECT value FROM store_meta WHERE key = ?", database: database) { statement in
             try bind(key, at: 1, statement: statement, database: database)
             let result = sqlite3_step(statement)
@@ -966,7 +968,7 @@ actor AcpTranscriptStore {
         }
     }
 
-    private func setMetadataValue(_ value: String, for key: String, database: OpaquePointer) throws {
+    private func setMetadataValue(_ value: String, for key: String, database: SQLiteHandle) throws {
         try withStatement(
             "INSERT OR REPLACE INTO store_meta(key, value) VALUES (?, ?)",
             database: database
@@ -977,8 +979,8 @@ actor AcpTranscriptStore {
         }
     }
 
-    private func databaseError(_ database: OpaquePointer) -> StoreError {
-        .database(Self.errorMessage(database))
+    private func databaseError(_ database: SQLiteHandle) -> StoreError {
+        .database(Self.errorMessage(database.pointer))
     }
 
     private static func errorMessage(_ database: OpaquePointer) -> String {

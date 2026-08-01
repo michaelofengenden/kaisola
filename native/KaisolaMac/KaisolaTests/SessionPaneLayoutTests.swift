@@ -76,6 +76,20 @@ final class SessionPaneLayoutTests: XCTestCase {
         XCTAssertEqual(layout.columns[1].sessionIDs, ["two"])
     }
 
+    func testTargetedReplacementPreservesExactPaneGeometry() {
+        var layout = SessionPaneLayout(columns: [
+            .init(id: "left", sessionIDs: ["one"], weight: 1.4, rowWeights: [1]),
+            .init(id: "right", sessionIDs: ["ended", "three"], weight: 0.6, rowWeights: [0.7, 1.3]),
+        ])
+
+        XCTAssertTrue(layout.replace("ended", with: "reopened"))
+        XCTAssertEqual(layout.columns.map(\.sessionIDs), [["one"], ["reopened", "three"]])
+        XCTAssertEqual(layout.columns.map(\.weight), [1.4, 0.6])
+        XCTAssertEqual(layout.columns[1].rowWeights, [0.7, 1.3])
+        XCTAssertFalse(layout.replace("missing", with: "another"))
+        XCTAssertFalse(layout.replace("reopened", with: "three"))
+    }
+
     func testEdgePlacementMakesColumnsAndRows() {
         var layout = SessionPaneLayout(columns: [
             .init(sessionIDs: ["one", "two"]),

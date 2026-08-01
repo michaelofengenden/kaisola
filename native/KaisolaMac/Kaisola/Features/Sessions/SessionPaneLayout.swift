@@ -140,6 +140,25 @@ struct SessionPaneLayout: Codable, Equatable, Sendable {
         normalize()
     }
 
+    /// Replace one visible surface in place without disturbing the user's
+    /// split geometry. Reopening an exited terminal creates a new broker/PTY
+    /// identity, but it should still occupy the exact row and column the ended
+    /// card occupied rather than replacing an unrelated primary pane.
+    @discardableResult
+    mutating func replace(_ sessionID: String, with replacementID: String) -> Bool {
+        guard !sessionID.isEmpty,
+              !replacementID.isEmpty,
+              sessionID != replacementID,
+              !contains(replacementID),
+              let columnIndex = columns.firstIndex(where: { $0.sessionIDs.contains(sessionID) }),
+              let rowIndex = columns[columnIndex].sessionIDs.firstIndex(of: sessionID) else {
+            return false
+        }
+        columns[columnIndex].sessionIDs[rowIndex] = replacementID
+        normalize()
+        return true
+    }
+
     /// Reposition a card at the nearest edge of another card. Horizontal edges
     /// make columns; vertical edges make stacks. The moved card keeps running.
     mutating func place(_ sessionID: String, relativeTo targetID: String, edge: Edge) {

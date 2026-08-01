@@ -96,6 +96,10 @@ final class AppModel: ObservableObject {
     /// Whether the connected broker accepted a controller connection; older
     /// brokers stay observe-only and hide every mutation affordance.
     @Published private(set) var controlAvailable = false
+    /// Exact ended panes currently being recreated. Kept in the model so every
+    /// window disables the same target and a double click cannot create two
+    /// replacement PTYs from one ended card.
+    @Published private(set) var reopeningTerminalIDs: Set<String> = []
     /// A phone holds the short Companion lease. Keep AppKit geometry callbacks
     /// from fighting its explicit PTY size until release restores the desktop
     /// geometry; surfaced by the session UI as a live remote-control state.
@@ -4348,6 +4352,57 @@ final class AppModel: ObservableObject {
     /// PTY is gone, so the broker always creates a new terminal identity.
     func reopenLastClosedSession() async {
         guard let closed = sessionStore.popClosedSession() else { return }
+        if await recreateSession(from: closed) == nil {
+            // A transient broker/account failure must not consume the user's
+            // only reopen affordance or strand its private draft.
+            sessionStore.pushClosedSession(closed)
+        }
+    }
+
+    /// Whether an exact ended card can be recreated right now. Observed panes
+    /// remain read-only, and a disconnected/legacy broker keeps the action
+    /// visible but disabled instead of pretending a new PTY was started.
+    func canReopenEndedSession(_ terminalID: String) -> Bool {
+        controlAvailable
+            && !reopeningTerminalIDs.contains(terminalID)
+            && sessions.contains(where: { $0.id == terminalID && $0.exited })
+            && isOwned(terminalID)
+            && persistedOwnedSessions.contains(where: { $0.id == terminalID })
+    }
+
+    /// Recreate the terminal represented by one ended pane, then put the new
+    /// broker identity back into that pane's exact split position. The ended
+    /// record remains available in the sidebar for transcript inspection.
+    func reopenEndedSession(_ terminalID: String) async {
+        guard canReopenEndedSession(terminalID),
+              let record = sessions.first(where: { $0.id == terminalID && $0.exited }),
+              let stored = persistedOwnedSessions.first(where: { $0.id == terminalID }) else {
+            return
+        }
+        let originalLayout = paneLayouts[record.projectID]
+        let wasMaximized = maximizedPaneID == terminalID
+        reopeningTerminalIDs.insert(terminalID)
+        defer { reopeningTerminalIDs.remove(terminalID) }
+
+        let closed = ClosedSession(
+            cwd: stored.cwd,
+            agentID: stored.agentID,
+            title: stored.title,
+            accountBinding: stored.accountBinding,
+            sourceTerminalID: terminalID
+        )
+        guard let createdID = await recreateSession(from: closed) else { return }
+
+        if var layout = originalLayout,
+           layout.replace(terminalID, with: createdID) {
+            paneLayouts[record.projectID] = layout
+            focusedPaneID = createdID
+            if wasMaximized { maximizedPaneID = createdID }
+            scheduleWorkspaceStateSave(projectID: record.projectID)
+        }
+    }
+
+    private func recreateSession(from closed: ClosedSession) async -> String? {
         let directory = URL(fileURLWithPath: closed.cwd)
         let agent = closed.agentID.flatMap { AgentRegistry.profile(id: $0) }
         await draftPersistenceTask?.value
@@ -4364,7 +4419,7 @@ final class AppModel: ObservableObject {
                 )
             }
         }
-        let created = await createOwnedSession(
+        return await createOwnedSession(
             inDirectory: directory,
             agent: agent,
             lockedAccountBinding: closed.accountBinding,
@@ -4372,11 +4427,6 @@ final class AppModel: ObservableObject {
             titleOverride: closed.title,
             draftRestoreSeed: draftSeed
         )
-        if created == nil {
-            // A transient broker/account failure must not consume the user's
-            // only reopen affordance or strand its private draft.
-            sessionStore.pushClosedSession(closed)
-        }
     }
 
     var hasClosedSessions: Bool { !sessionStore.closedSessions().isEmpty }

@@ -1816,6 +1816,23 @@ struct RootShellView: View {
             if terminal.exited {
                 HStack(spacing: 8) {
                     Label("Session ended", systemImage: "stop.circle.fill")
+                    if model.isOwned(id) {
+                        Button {
+                            Task { await model.reopenEndedSession(id) }
+                        } label: {
+                            if model.reopeningTerminalIDs.contains(id) {
+                                HStack(spacing: 4) {
+                                    ProgressView().controlSize(.mini)
+                                    Text("Reopening…")
+                                }
+                            } else {
+                                Text("Reopen")
+                            }
+                        }
+                        .buttonStyle(.borderless)
+                        .disabled(!model.canReopenEndedSession(id))
+                        .accessibilityHint("Starts a new terminal in this pane with the same agent and folder")
+                    }
                     Button("Open Transcript") { openTerminalTranscript(id) }
                         .buttonStyle(.borderless)
                         .disabled(model.terminalTranscriptContext(for: id) == nil)

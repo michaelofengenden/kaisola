@@ -3152,18 +3152,28 @@ enum FooterAccountBudget {
     static let leadingPadding: CGFloat = 8
     static let trailingPadding: CGFloat = 5
     static var horizontalPadding: CGFloat { leadingPadding + trailingPadding }
-    /// Gap between footer controls. 5, matching the rail's own trailing lane —
-    /// the footer is the bottom of that column and should keep its rhythm.
-    static let gap: CGFloat = 5
+    /// Gap between footer controls. The 228pt resting rail (down from 248pt)
+    /// left only 99.0pt for a name that needs 117.3pt, so this shrank from 5
+    /// to 2 to help buy that back — the controls sit closer, the name lane
+    /// gets the difference.
+    static let gap: CGFloat = 2
     /// The avatar that leads the account chip, plus its gap to the name.
     static let avatarGap: CGFloat = 6
     static let avatarSlot: CGFloat = 22 + avatarGap
-    /// A square footer control (gear, overflow). 22 rather than 24: the glyphs
-    /// inside are 12pt, the target is pointer-only, and the two points bought
-    /// back here are two points the account name keeps. Every one of them
-    /// mattered — see `FooterAccountBudget` callers and the test that pins the
-    /// name's width at the default sidebar.
-    static let controlSlot: CGFloat = 22
+    /// A square footer control (gear, overflow). Shrank from 22 to 16 for the
+    /// same reason `gap` did: the glyphs inside are 12pt and were never what
+    /// needed a 22pt frame, so the slot now sits closer to the glyph and the
+    /// tap target is restored separately, via `tapTargetExpansion`, instead of
+    /// being reserved as layout width. Every point bought back here is a
+    /// point the account name keeps — see `FooterAccountBudget` callers and
+    /// the test that pins the name's width at the default sidebar.
+    static let controlSlot: CGFloat = 16
+    /// How far a control's *hit* region extends past its visual
+    /// `controlSlot` frame, on every side. `contentShape` grows into the
+    /// row's own gaps rather than the frame growing into the name's width, so
+    /// the tap target stays ≥20pt (16 + 2×2) without costing the name a
+    /// single point.
+    static let tapTargetExpansion: CGFloat = 2
 
     /// - Returns: points the account *name* can use before it must truncate.
     static func nameWidth(
@@ -3241,7 +3251,7 @@ private struct ConnectionFooter: View {
                 .font(.system(size: 12, weight: .medium))
                 .foregroundStyle(.secondary)
                 .frame(width: FooterAccountBudget.controlSlot, height: FooterAccountBudget.controlSlot)
-                .contentShape(Rectangle())
+                .contentShape(Rectangle().inset(by: -FooterAccountBudget.tapTargetExpansion))
         }
         .buttonStyle(.plain)
         .fixedSize()
@@ -3268,7 +3278,7 @@ private struct ConnectionFooter: View {
                     .foregroundStyle(Self.usageTint(reading.level))
                     .padding(.horizontal, 2)
                     .frame(height: FooterAccountBudget.controlSlot)
-                    .contentShape(Rectangle())
+                    .contentShape(Rectangle().inset(by: -FooterAccountBudget.tapTargetExpansion))
             }
             .buttonStyle(.plain)
             .fixedSize()
@@ -3340,7 +3350,7 @@ private struct ConnectionFooter: View {
                 .font(.system(size: 12, weight: .semibold))
                 .foregroundStyle(.secondary)
                 .frame(width: FooterAccountBudget.controlSlot, height: FooterAccountBudget.controlSlot)
-                .contentShape(Rectangle())
+                .contentShape(Rectangle().inset(by: -FooterAccountBudget.tapTargetExpansion))
         }
         .menuStyle(.borderlessButton)
         .menuIndicator(.hidden)

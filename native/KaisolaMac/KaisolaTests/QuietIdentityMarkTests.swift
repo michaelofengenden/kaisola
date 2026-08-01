@@ -439,27 +439,62 @@ final class QuietIdentityMarkTests: XCTestCase {
         // The old chip framed avatar + name into 118pt total.
         XCTAssertGreaterThan(width, 118 - FooterAccountBudget.avatarSlot)
 
-        // The name from the bug report is 117.3pt at this font. It fit whole at
-        // v1.1.6's 248pt rail; v1.1.7's 228pt rail is 20pt narrower and the
-        // footer is where those 20 points come out, so at the *resting* width a
-        // long name now takes an ellipsis again. That is a real cost of item 1
-        // and it is written down rather than asserted away: what the footer
-        // still guarantees is that widening the rail *at all* recovers it, and
-        // that the name never falls back to the fixed 118pt chip it was pinned
-        // to before v1.1.6.
+        // The name from the bug report is 117.3pt at this font. v1.1.7's 228pt
+        // rail (20pt narrower than v1.1.6's 248pt) left the name only 99.0pt —
+        // controlSlot(22)×2 + gap(5)×2 + chip + gap ate the difference, so
+        // "michael ofengenden" took an ellipsis again at the *default* width.
+        // The fix slims the two control slots (22→16) and the gaps between
+        // them (5→2) rather than the sidebar, so the whole name fits again at
+        // rest, not only when the rail is dragged wider.
         let rendered = ("michael ofengenden" as NSString).size(withAttributes: [.font: font]).width
-        let whole = FooterAccountBudget.nameWidth(footerWidth: 248, usageChipWidth: chip, attentionWidth: 0)
-        XCTAssertGreaterThan(whole, rendered, "the whole name no longer fits at any reachable width")
-        XCTAssertLessThanOrEqual(
-            248,
-            NativeWorkspaceChrome.projectSidebarMaximumWidth,
-            "the width that shows the whole name is no longer reachable by dragging"
+        XCTAssertGreaterThanOrEqual(
+            width, rendered,
+            "the whole name should fit at the default sidebar width without an ellipsis"
+        )
+
+        // The regression's own number, pinned so a future slot/gap change can't
+        // quietly reopen it: the old arithmetic left 99.0pt here, and the fix
+        // has to recover at least 18 of the ~20pt the narrower rail cost.
+        let brokenWidthAtDefault: CGFloat = 99.0
+        XCTAssertGreaterThanOrEqual(
+            width - brokenWidthAtDefault, 18,
+            "the footer should recover at least 18pt for the name at the default width"
         )
 
         // The margin at the default width is thin by construction, so widening
         // the sidebar has to open it up properly rather than merely a little.
         let roomy = FooterAccountBudget.nameWidth(footerWidth: 300, usageChipWidth: chip, attentionWidth: 0)
         XCTAssertGreaterThan(roomy - rendered, 40, "widening the sidebar barely helps the name")
+    }
+
+    /// The fix is in the slots and gaps shared by every control, not a
+    /// special case for the quiet footer: charging for the attention bell too
+    /// (its `attentionWidth` stands for the badge's own footprint) still has
+    /// to recover at least the same 18pt the quiet case does, compared against
+    /// what the pre-fix arithmetic gave the name in that same busy state.
+    func testTheRecoveryHoldsWithTheAttentionBellShowingToo() {
+        let chipFont = NSFont.monospacedDigitSystemFont(ofSize: 11, weight: .medium)
+        let chip = ("62%" as NSString).size(withAttributes: [.font: chipFont]).width + 4
+        let bellWidth: CGFloat = 30
+
+        let width = FooterAccountBudget.nameWidth(
+            footerWidth: NativeWorkspaceChrome.projectSidebarIdealWidth,
+            usageChipWidth: chip,
+            attentionWidth: bellWidth
+        )
+
+        // Pre-fix arithmetic (controlSlot 22, gap 5) for this same busy state,
+        // written out rather than re-derived so the comparison can't drift
+        // with the constants under test.
+        let brokenWidthWithBell: CGFloat = NativeWorkspaceChrome.projectSidebarIdealWidth
+            - FooterAccountBudget.horizontalPadding
+            - FooterAccountBudget.avatarSlot
+            - (22 * 2 + 5 * 2 + (chip + 5) + (bellWidth + 5))
+
+        XCTAssertGreaterThanOrEqual(
+            width - brokenWidthWithBell, 18,
+            "the recovery must hold even when the attention bell is also charged for"
+        )
     }
 
     /// …and it really is a function of the footer: widening the sidebar has to

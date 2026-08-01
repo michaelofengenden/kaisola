@@ -1716,6 +1716,11 @@ private struct PaneResizeHandle: View {
             height: axis == .vertical ? SessionPaneDividerSizing.layoutExtent : nil
         )
         .contentShape(Rectangle())
+        // The cross-axis dimension is left `nil` on purpose: the tracker
+        // stretches to the handle's full length, so the resize cursor and the
+        // drag are live along the ENTIRE divider rather than over a centred
+        // grip. The other axis is the corridor, which overhangs the one-point
+        // rule by `SessionPaneDividerSizing.reach` on each side.
         .overlay {
             PaneResizeTrackingView(
                 axis: axis,
@@ -1730,6 +1735,12 @@ private struct PaneResizeHandle: View {
                 height: axis == .vertical ? SessionPaneDividerSizing.hitExtent : nil
             )
         }
+        // The corridor overhangs both neighbouring cards, and in a stack a
+        // later sibling is drawn — and hit-tested — above an earlier one. Left
+        // at the default the divider only reached backwards, so half the
+        // corridor was swallowed by the card after it (and by that card's own
+        // I-beam cursor). This lifts the whole handle above both.
+        .zIndex(1)
         .animation(.easeOut(duration: 0.1), value: hovered)
         .focusable()
         .accessibilityElement(children: .ignore)
@@ -1767,12 +1778,18 @@ private struct PaneResizeHandle: View {
     }
 }
 
-private enum SessionPaneDividerSizing {
+enum SessionPaneDividerSizing {
     /// The visible rule consumes only one layout point. Its overlaid pointer
     /// target reaches into both adjacent cards, so acquisition stays generous
     /// without turning a splitter into a blank gutter.
     static let layoutExtent: CGFloat = 1
-    static let hitExtent: CGFloat = 17
+    /// 17 → 22 in v1.1.7, so the corridor clears
+    /// `NativeWorkspaceChrome.dividerCorridorReach` on each side and matches
+    /// the sidebar splitter exactly. Internal, not private, because "every
+    /// divider is grabbable" is a claim worth a test.
+    static let hitExtent: CGFloat = 22
+    /// How far the corridor reaches past the visible rule on each side.
+    static var reach: CGFloat { (hitExtent - layoutExtent) / 2 }
 }
 
 /// Makes the system NavigationSplitView divider easy to acquire while leaving
@@ -1797,6 +1814,10 @@ private struct NavigationSidebarResizeAffordance: View {
         // that one AppKit view: a SwiftUI `.onHover` on the same rectangle is a
         // second tracking region over the same pixels, and the two disagreed at
         // the boundary, which is what made the pointer flicker there.
+        // Width only: the tracker takes the affordance's full height, so the
+        // corridor and the resize cursor run the ENTIRE length of the divider,
+        // from the traffic-light clearance down past the footer. There is no
+        // centred grip to find.
         .overlay {
             NavigationSidebarResizeHandle(hoverChanged: { hovered = $0 })
                 .frame(width: NativeWorkspaceChrome.projectSidebarDividerHitWidth)
@@ -2586,13 +2607,22 @@ enum NativeWorkspaceChrome {
     /// Sized from what the eye sees rather than from the one-point rule: the
     /// detail card is inset by `chromeInset`, so the gap the pointer aims at is
     /// that gutter plus the rule. The hit zone spans the whole gap and reaches
-    /// a few points onto the surface on each side, so the pointer never crosses
+    /// well past it onto the surface on each side, so the pointer never crosses
     /// a dead band between "over the content" and "over the divider" — a dead
     /// band is what made the cursor flicker there.
+    ///
+    /// v1.1.7 widened it from 18 to 22 so the reach clears
+    /// `dividerCorridorReach` on both sides: "grab it anywhere" has to mean the
+    /// pointer finds the divider before the user aims at it, and 8.5pt of reach
+    /// was still a line you had to hit.
     static let projectSidebarDividerHitWidth: CGFloat =
-        KaisolaVisualSystem.chromeInset * 2 + 6
+        KaisolaVisualSystem.chromeInset * 2 + 10
     static let projectSidebarDividerReach: CGFloat =
         (projectSidebarDividerHitWidth - projectSidebarDividerWidth) / 2
+    /// The floor every draggable divider in the app clears on each side of its
+    /// visible line. One number so the sidebar splitter and the pane handles
+    /// cannot drift apart; see `SessionPaneDividerSizing`.
+    static let dividerCorridorReach: CGFloat = 10
     /// The Files control's own height, which the detail chrome band wraps.
     static let detailChromeControlHeight: CGFloat = 24
     /// Breathing room above and below that control when the band carries

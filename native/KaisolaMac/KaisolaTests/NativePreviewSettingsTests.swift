@@ -1477,7 +1477,7 @@ final class NativePreviewSettingsTests: XCTestCase {
     /// pointer crosses on its way in, which is seen as the cursor flickering.
     func testSidebarDividerHitZoneSpansTheWholeVisibleGap() {
         let gap = KaisolaVisualSystem.chromeInset + NativeWorkspaceChrome.projectSidebarDividerWidth
-        XCTAssertEqual(NativeWorkspaceChrome.projectSidebarDividerHitWidth, 18)
+        XCTAssertEqual(NativeWorkspaceChrome.projectSidebarDividerHitWidth, 22)
         XCTAssertGreaterThan(NativeWorkspaceChrome.projectSidebarDividerHitWidth, gap)
         // Reach past the visible gutter, onto the content on each side, so the
         // pointer is never over a point that is neither content nor divider.
@@ -1485,7 +1485,37 @@ final class NativePreviewSettingsTests: XCTestCase {
             NativeWorkspaceChrome.projectSidebarDividerReach,
             KaisolaVisualSystem.chromeInset
         )
-        XCTAssertEqual(NativeWorkspaceChrome.projectSidebarDividerReach, 8.5)
+        XCTAssertEqual(NativeWorkspaceChrome.projectSidebarDividerReach, 10.5)
+    }
+
+    /// v1.1.7: "grab it anywhere, easily" is one rule, so it is one number.
+    /// Every draggable divider in the workspace — the sidebar splitter and both
+    /// pane handles — has to clear `dividerCorridorReach` on each side of its
+    /// visible line, or the user is aiming at a hairline again.
+    func testEveryDividerCorridorClearsTheGrabReachOnBothSides() {
+        XCTAssertGreaterThanOrEqual(NativeWorkspaceChrome.dividerCorridorReach, 10)
+        XCTAssertGreaterThanOrEqual(
+            NativeWorkspaceChrome.projectSidebarDividerReach,
+            NativeWorkspaceChrome.dividerCorridorReach,
+            "the sidebar splitter is back to a line you have to hit"
+        )
+        XCTAssertGreaterThanOrEqual(
+            SessionPaneDividerSizing.reach,
+            NativeWorkspaceChrome.dividerCorridorReach,
+            "the pane splitters are back to a line you have to hit"
+        )
+        // The two corridors are the same width, so the sidebar and the panes
+        // cannot drift into two different grab feels.
+        XCTAssertEqual(
+            SessionPaneDividerSizing.hitExtent,
+            NativeWorkspaceChrome.projectSidebarDividerHitWidth,
+            accuracy: 0.001
+        )
+        // …and the corridor is an overlay, not layout: the visible rule still
+        // costs exactly one point, so widening the grab zone never opened a
+        // gutter between the panes.
+        XCTAssertEqual(SessionPaneDividerSizing.layoutExtent, 1)
+        XCTAssertEqual(NativeWorkspaceChrome.projectSidebarDividerWidth, 1)
     }
 
     func testClickingFocusedSurfaceStillSwitchesItsProject() {

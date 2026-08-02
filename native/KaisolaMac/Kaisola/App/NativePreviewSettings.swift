@@ -930,20 +930,46 @@ struct GlassBackdropWash: Equatable, Sendable {
     /// 0.0283. Thinner veil, wider gradient: spread 0.072, gradient 0.0165, and
     /// primary/secondary label contrast still 12.8:1 / 6.0:1.
     ///
-    /// v1.1.10 takes dark one more step down, 0.55 → 0.52. On its own that is a
-    /// small change and it is deliberately small: the flatness Michael reported
-    /// after the v1.1.9 pass was not the veil's doing at all but
-    /// `DesktopBackdropRenderer.bakeColorSpace`, which was rendering the dark
-    /// still as near-solid black no matter what the veil above it did. With the
-    /// still actually arriving, 45% transmission already delivers a measured
-    /// composite spread of 0.078 against light's 0.063 — dark is no longer the
-    /// flattest surface in the app. The extra three points buy margin (spread
-    /// 0.083, gradient 0.037) without leaving the frost band
-    /// `testGlassVeilsFrostTheDesktopWithoutErasingIt` holds: at 0.48
-    /// transmission the surface is still glass and not a photograph.
+    /// v1.1.10 took dark one step down, 0.55 → 0.52, and said so was
+    /// deliberately small because the flatness was a colour-space bug rather
+    /// than a veil. With that fixed and the surface finally showing what its
+    /// constants describe, Michael's next note is about the veil and only the
+    /// veil: "dark glass mode could look more glassy/translucent if possible!
+    /// especially on live and wallpaper (dark mode should be very translucent)".
+    ///
+    /// **0.52 → 0.34.** Transmission 0.48 → 0.66 — the veil now covers a third
+    /// of the surface rather than half, the largest single move this constant
+    /// has made. Measured through the real pipeline against Michael's own
+    /// desktop (the Lake Tahoe aerial macOS resolves for his rotating category),
+    /// dark sidebar at 210×900:
+    ///
+    ///     composite rgb   0.089/0.107/0.115  →  0.103/0.129/0.139
+    ///     mean luminance              0.104  →  0.124
+    ///     luminance spread p5..p95    0.086  →  0.095
+    ///     off-neutral                 0.143  →  0.165
+    ///     primary label contrast     12.7:1  →  12.1:1  (worst patch 10.9:1)
+    ///     secondary label contrast    6.0:1  →   5.8:1  (worst patch  5.5:1)
+    ///
+    /// This is only available because `DesktopBackdropRenderer`
+    /// `darkStillSpreadCeiling` bounds the still's dynamic range first. Thinning
+    /// the veil this far *without* that cap put the worst patch of the widest
+    /// wallpaper measured at **3.9:1** secondary — below the 4.5 floor. With it,
+    /// the worst patch over the five extremes of this Mac's aerial library
+    /// **improves** to 4.9:1 (from 4.6:1 at the thicker veil), because the cap
+    /// removes more of the worst case than the veil it replaces did.
+    ///
+    /// The floor is what stopped this at 0.34 rather than lower, and the binding
+    /// case is not a photograph: a wallpaper that *is* a linear gradient (macOS
+    /// ships several) passes the Gaussian untouched, so its whole range reaches
+    /// the veil. Against that fixture the worst patch measures 4.6:1 here, 4.4:1
+    /// at a 0.26 base — so roughly 0.30 is the real limit and the margin between
+    /// there and here is deliberate. Past that point extra transmission also
+    /// stops buying *structure*: the cap has to tighten in step, and
+    /// `(1 - base) × ceiling` is conserved. It keeps buying chroma, which is
+    /// most of what reads as translucency at this luminance.
     static func sidebar(isDark: Bool) -> GlassBackdropWash {
         isDark
-            ? dark(top: 0.45, base: 0.52, bottom: 0.61)
+            ? dark(top: 0.27, base: 0.34, bottom: 0.43)
             : light(top: 0.66, base: 0.60, bottom: 0.56)
     }
 
@@ -955,11 +981,36 @@ struct GlassBackdropWash: Equatable, Sendable {
 
     /// The workspace sits one step deeper than the sidebar so the inset chrome
     /// panels have something to float above: less white in light mode, more
-    /// near-black in dark mode.
+    /// near-black in dark mode. Dark moves with the sidebar and keeps its three
+    /// points of separation (0.55 → 0.37); measured composite 0.102/0.126/0.135,
+    /// spread 0.094, primary 12.2:1 (worst 11.0:1), secondary 5.9:1 (worst 5.5:1).
     static func workspace(isDark: Bool) -> GlassBackdropWash {
         isDark
-            ? dark(top: 0.48, base: 0.55, bottom: 0.64)
+            ? dark(top: 0.30, base: 0.37, bottom: 0.46)
             : light(top: 0.61, base: 0.55, bottom: 0.51)
+    }
+
+    /// The band a glass veil's transmission has to live in, per appearance.
+    ///
+    /// The contract is unchanged and still two-sided: too little transmission
+    /// and the surface is the flat #EDEDED panel of v1.1; too much and it is a
+    /// blurred photograph with a haze on it. What changed is *where the upper
+    /// bound comes from in dark*.
+    ///
+    /// It used to be 0.50 for both appearances because the veil was the only
+    /// thing keeping the desktop's brightness and dynamic range out of the
+    /// surface. In dark it no longer is: the bake normalizes the still's mean to
+    /// 0.16 **and** caps its p5..p95 range at
+    /// `DesktopBackdropRenderer.darkStillSpreadCeiling`, so "not a photograph"
+    /// is now a property of the layer underneath rather than of the layer over
+    /// it. A dark still cannot be brighter, and cannot have more range, than
+    /// those two constants allow, whatever the desktop is — which is exactly the
+    /// guarantee the 0.50 ceiling was standing in for.
+    ///
+    /// Light keeps 0.50: it has no range cap (it does not need one at a 0.72
+    /// surface), so there the veil is still the only bound.
+    static func desktopTransmissionBand(isDark: Bool) -> (floor: Double, ceiling: Double) {
+        isDark ? (floor: 0.30, ceiling: 0.70) : (floor: 0.30, ceiling: 0.50)
     }
 
     /// How much of a glass surface Increased Contrast must cover, counting the
@@ -988,15 +1039,31 @@ struct GlassBackdropWash: Equatable, Sendable {
     ///
     ///     overlay = (coverage - base) / (1 - base)
     ///
+    /// The overlay may not paint a glass surface into an opaque panel — that is
+    /// what `SidebarAppearance.solid` and Reduce Transparency are for, and an
+    /// overlay that reached 1 would make Increased Contrast silently a third
+    /// opacity setting.
+    ///
+    /// It was 0.6, and 0.6 is exactly the overlay a 0.50 base needs to reach the
+    /// 0.80 floor — so the moment the dark veil went below 0.50 the clamp would
+    /// have started binding and the accessibility guarantee would have been met
+    /// by a `min` rather than by arithmetic (0.34 + 0.6·0.66 = 0.74, not 0.80).
+    /// Raised to 0.80, which leaves the exact solutions for today's four bases
+    /// (0.60/0.55 light, 0.34/0.37 dark → 0.500/0.556/0.697/0.683) strictly
+    /// inside it, and still keeps a fifth of the surface translucent at the
+    /// extreme.
+    static let increasedContrastOverlayCeiling = 0.80
+
     /// `base` is read live from `sidebar(isDark:)` / `workspace(isDark:)` so a
     /// future veil retune re-derives this instead of falling behind. Clamped to
-    /// `[0, 0.6]`: a base that already meets the floor needs no overlay, and no
-    /// surface is ever painted into an opaque panel. The ceiling binds only if
-    /// some future base drops below 0.5; at today's 0.55–0.65 the exact
-    /// solution is 0.43–0.56 and the floor is met precisely.
+    /// `[0, increasedContrastOverlayCeiling]`: a base that already meets the
+    /// floor needs no overlay.
     private static func increasedContrastOverlay(base: Double) -> Double {
         guard base < 1 else { return 0 }
-        return min(0.6, max(0, (increasedContrastCoverage - base) / (1 - base)))
+        return min(
+            increasedContrastOverlayCeiling,
+            max(0, (increasedContrastCoverage - base) / (1 - base))
+        )
     }
 
     /// Increased Contrast overlay opacity for the sidebar veil.
@@ -1533,9 +1600,73 @@ enum DesktopBackdropRenderer {
     /// 0.078/0.106/0.119 — 0.229 off-neutral, cool but no longer coloured, and
     /// with red back at 65% of blue instead of 38%. Light is unchanged for
     /// every wallpaper dimmer than the 0.72 target, which is nearly all of them.
-    static func saturation(mean: Double, isDark: Bool) -> Double {
+    /// `gain` is divided back out because `CIColorControls`' contrast scales
+    /// channel *differences* along with the luminance range — see
+    /// `rangeGain(spread:isDark:)`. Without this the range cap would damp the
+    /// wallpaper's colour as a side effect of damping its dynamic range, which
+    /// is the one thing the whole layer exists to show.
+    static func saturation(mean: Double, isDark: Bool, gain: Double = 1) -> Double {
         let target = targetLuminance(isDark: isDark)
-        return saturationCeiling(isDark: isDark) * min(1, target / max(mean, 0.02))
+        return saturationCeiling(isDark: isDark)
+            * min(1, target / max(mean, 0.02))
+            / max(gain, 0.05)
+    }
+
+    /// The widest luminance range a **dark** baked still may carry, p5..p95 of
+    /// the 16×16 box reduction — and the constant that lets the dark veil get
+    /// out of the way.
+    ///
+    /// Michael's ask was "dark glass could look more glassy/translucent…
+    /// especially on live and wallpaper". The veil is the obvious lever and it
+    /// was already the binding one: at the shipped 0.52 base, the *worst patch*
+    /// of the most extreme wallpaper in this Mac's aerial library (`AB7FC3C3`,
+    /// luma 0.435 — a bright sky over dark ground, box spread **0.615**, 1.7×
+    /// the next widest) measured **4.6:1** secondary contrast against a 4.5
+    /// floor. There was no room to thin anything.
+    ///
+    /// The reason is that the bake normalized the still's *mean* and left its
+    /// *range* alone, so how bright the brightest patch of the sidebar got was
+    /// still a function of the user's desktop — the exact dependency
+    /// `targetLuminance` exists to remove, surviving in the second moment.
+    /// `CIColorControls`' contrast is a gain about 0.5, so solving it together
+    /// with the brightness offset removes it: the still's range is capped, its
+    /// mean still lands on target, and the surface's worst case stops depending
+    /// on the picture.
+    ///
+    /// Dark sidebar, worst-patch (brightest 2% band) secondary contrast against
+    /// a 4.5 floor, measured by rendering:
+    ///
+    ///     veil 0.52, no cap    4.6 : 1   ← shipped; already at the floor
+    ///     veil 0.34, no cap    3.9 : 1   ← thinning the veil alone fails
+    ///     veil 0.34, cap 0.30  4.9 : 1   ← shipped here
+    ///
+    /// The cap does more for the worst case than the veil it buys out, which is
+    /// why the surface can be a third more transparent *and* better on its worst
+    /// wallpaper at the same time.
+    ///
+    /// The gain is computed from the *unblurred* box, which over-states what
+    /// actually reaches the veil — radius 28 on a 176px still smooths most of a
+    /// photograph's range away, so the cap is deliberately conservative. What it
+    /// does in practice, over the five extremes of this Mac's 156-still aerial
+    /// library and with the thinner veil above: the composite's luminance spread
+    /// **rises** on four of them (0.086 → 0.095 on Michael's own desktop, 0.064 →
+    /// 0.081 on the brightest, 0.022 → 0.034 on the darkest) and **falls** on the
+    /// one whose range was the problem (0.197 → 0.158). That asymmetry is the
+    /// whole design: more wallpaper everywhere, less of the one thing that was
+    /// making the worst case a function of the desktop.
+    ///
+    /// Light has no cap — a 0.72 surface has the headroom, light was never the
+    /// complaint, and this leaves the light half of every glass measurement in
+    /// this file exactly where it was.
+    static let darkStillSpreadCeiling: Double = 0.30
+
+    /// The gain `CIColorControls.contrast` is set to, from the still's measured
+    /// p5..p95 spread. Never above 1: a wallpaper with less range than the
+    /// ceiling is passed through exactly as it was, so this only ever *removes*
+    /// an excess and can never manufacture contrast the desktop does not have.
+    static func rangeGain(spread: Double, isDark: Bool) -> Double {
+        guard isDark else { return 1 }
+        return min(1, darkStillSpreadCeiling / max(spread, 0.01))
     }
 
     /// Mean luminance the baked still is moved to, per appearance.
@@ -1558,13 +1689,23 @@ enum DesktopBackdropRenderer {
     /// brightness is a straight per-channel offset, so it moves mean luminance
     /// by exactly this amount while leaving every channel *difference* — the
     /// hue and the chroma spread the frost exists to show — untouched. An
-    /// exposure/gain step would scale chroma along with brightness and make a
-    /// dark wallpaper's tint vanish in light mode. Clamped only to keep a
-    /// degenerate decode (a fully black or blown-out still) from inverting into
-    /// a shift larger than the range it is correcting; inside the clamp the
+    /// exposure step would scale chroma along with brightness and make a dark
+    /// wallpaper's tint vanish in light mode. Clamped only to keep a degenerate
+    /// decode (a fully black or blown-out still) from inverting into a shift
+    /// larger than the range it is correcting; inside the clamp the
     /// normalization is exact.
-    static func luminanceShift(mean: Double, isDark: Bool) -> Double {
-        min(0.9, max(-0.9, targetLuminance(isDark: isDark) - mean))
+    ///
+    /// `gain` is the range cap's contrast, and it has to be solved *with* the
+    /// offset rather than before it. Measured on the real filter (see
+    /// `rangeGain(spread:isDark:)`), `CIColorControls` evaluates saturation,
+    /// then contrast about **0.5**, then brightness — so a gain below 1 has
+    /// already moved the mean to `(mean - 0.5) · gain + 0.5` by the time this
+    /// offset lands, and normalizing against the raw mean would miss by
+    /// `(0.5 - mean) · (1 - gain)`. At gain 1 this is the identical expression
+    /// it always was.
+    static func luminanceShift(mean: Double, isDark: Bool, gain: Double = 1) -> Double {
+        let pivoted = (mean - 0.5) * gain + 0.5
+        return min(0.9, max(-0.9, targetLuminance(isDark: isDark) - pivoted))
     }
 
     /// Dynamic desktops pack every hour of the day into one HEIC with nothing
@@ -1598,12 +1739,18 @@ enum DesktopBackdropRenderer {
             ?? DesktopTintSampler.fallback
         let mean = pixels.flatMap { DesktopTintSampler.meanLuminance(rgba: $0) }
             ?? targetLuminance(isDark: key.isDark)
-        let brightness = luminanceShift(mean: mean, isDark: key.isDark)
-        let saturation = saturation(mean: mean, isDark: key.isDark)
+        // The range cap reads the same 16×16 reduction the mean does, so
+        // bounding the still's dynamic range costs no extra decode and no extra
+        // draw — one box, three products.
+        let spread = pixels.flatMap { DesktopTintSampler.luminanceSpread(rgba: $0) } ?? 0
+        let gain = rangeGain(spread: spread, isDark: key.isDark)
+        let brightness = luminanceShift(mean: mean, isDark: key.isDark, gain: gain)
+        let saturation = saturation(mean: mean, isDark: key.isDark, gain: gain)
         guard let blurred = blur(
             still,
             brightness: brightness,
-            saturation: saturation
+            saturation: saturation,
+            gain: gain
         ) else { return .flat(tint) }
         return .wallpaper(blurred, tint: tint)
     }
@@ -1657,7 +1804,8 @@ enum DesktopBackdropRenderer {
     private static func blur(
         _ image: CGImage,
         brightness: Double,
-        saturation: Double
+        saturation: Double,
+        gain: Double
     ) -> CGImage? {
         let input = CIImage(cgImage: image)
         let extent = input.extent
@@ -1667,14 +1815,17 @@ enum DesktopBackdropRenderer {
         gaussian.radius = Float(blurRadius)
         guard let softened = gaussian.outputImage else { return nil }
 
-        // Both normalizations ride the one `CIColorControls` pass already in
-        // the chain, so neither costs an extra filter. Saturation is applied
-        // about the pixel's own luminance and brightness is the offset after
-        // it, which is why the two have to be solved together rather than
-        // treating the chroma as a fixed constant — see `saturation(mean:isDark:)`.
+        // All three normalizations ride the one `CIColorControls` pass already
+        // in the chain, so none costs an extra filter. The filter evaluates
+        // saturation, then contrast about 0.5, then brightness — measured, not
+        // assumed — which is why chroma, range and mean have to be solved
+        // together rather than treated as three independent constants. See
+        // `saturation(mean:isDark:gain:)`, `rangeGain(spread:isDark:)` and
+        // `luminanceShift(mean:isDark:gain:)`.
         let controls = CIFilter.colorControls()
         controls.inputImage = softened
         controls.saturation = Float(saturation)
+        controls.contrast = Float(gain)
         controls.brightness = Float(brightness)
         guard let output = controls.outputImage else { return nil }
 
@@ -1756,6 +1907,33 @@ enum DesktopTintSampler {
     static func meanLuminance(rgba: [UInt8]) -> Double? {
         guard let average = plainAverage(rgba: rgba) else { return nil }
         return average.0 * 0.2126 + average.1 * 0.7152 + average.2 * 0.0722
+    }
+
+    /// The wallpaper's p5..p95 luminance range, read from the same box the mean
+    /// is — the *second* moment the bake normalizes, and the one that decides
+    /// how bright the brightest patch of a glass surface gets.
+    ///
+    /// Percentiles rather than min..max because a 16×16 box has 256 samples and
+    /// one blown highlight in a corner should not set the gain for the whole
+    /// picture. Two samples either end are trimmed, so a wallpaper needs a real
+    /// bright *region* to be treated as high-range.
+    static func luminanceSpread(rgba: [UInt8]) -> Double? {
+        var lumas: [Double] = []
+        var index = 0
+        while index + 3 < rgba.count {
+            if Double(rgba[index + 3]) / 255 > 0.05 {
+                lumas.append(
+                    Double(rgba[index]) / 255 * 0.2126
+                        + Double(rgba[index + 1]) / 255 * 0.7152
+                        + Double(rgba[index + 2]) / 255 * 0.0722
+                )
+            }
+            index += 4
+        }
+        guard lumas.count >= 20 else { return nil }
+        lumas.sort()
+        let count = Double(lumas.count)
+        return lumas[Int(count * 0.95)] - lumas[Int(count * 0.05)]
     }
 
     private static func plainAverage(rgba: [UInt8]) -> (Double, Double, Double)? {
@@ -1847,6 +2025,59 @@ enum DesktopTintSampler {
     }
 }
 
+/// How much of the desktop one watch tick is allowed to read.
+///
+/// The two rungs are two orders of magnitude apart, measured on this machine:
+/// three `stat`s cost **0.045 ms**, and `NSWorkspace.desktopImageURL(for:)`
+/// costs **4.1 ms** — and the latter has to run on the main actor, because
+/// `NSScreen` is not `Sendable`. A 4 ms main-thread stall is a dropped frame,
+/// so it cannot be what a five-second timer does.
+enum DesktopProbeDepth: Equatable, Sendable {
+    /// `stat` only: the painted file, the wallpaper store's index, and the
+    /// aerial thumbnail cache. Catches every desktop change that goes through
+    /// the wallpaper store, which on macOS 26 is every change made from System
+    /// Settings, Finder's "Set Desktop Picture", or the Wallpaper API.
+    case shallow
+    /// The above plus `desktopImageURL(for:)`. The only thing this adds is a
+    /// desktop whose *path* moved without the store being rewritten — a
+    /// rotating picture folder advancing — so it is taken on a slow cadence
+    /// rather than every tick.
+    case deep
+}
+
+/// The cheap fingerprint of "which picture the desktop is showing".
+///
+/// Nothing in AppKit publishes a wallpaper-changed event that can be relied on
+/// (see `DesktopBackdropProvider.desktopChangedNotification` for what is
+/// observed and what that is worth), so the backstop is this: a handful of
+/// modification dates that a change cannot avoid moving, compared on a timer.
+/// It is deliberately *not* the backdrop cache key — building that key reads
+/// and parses two files, and this has to be affordable every few seconds.
+struct DesktopWallpaperSignature: Equatable, Sendable {
+    /// What `NSWorkspace` reports, on a `deep` probe only; `nil` on a shallow
+    /// one, and a `nil` on either side is not evidence of a change.
+    let desktopImagePath: String?
+    /// The file the current backdrop was baked from — "set as desktop picture"
+    /// over a path that never changed lands here.
+    let paintedModified: Date?
+    /// `Store/Index.plist`, which the wallpaper agent rewrites for every
+    /// desktop choice, including picking a different aerial *category*.
+    let storeModified: Date?
+    /// The aerial thumbnail cache directory. A rotating category has no
+    /// published pointer at the clip playing right now, so the backdrop picks a
+    /// deterministic representative from the stills macOS has downloaded — and
+    /// this directory's mtime is what moves when that set grows.
+    let thumbnailsModified: Date?
+}
+
+/// What a watch tick found, against the previous one.
+enum DesktopSignalDecision: Equatable {
+    /// Nothing moved, or there is no baseline yet — either way, no hint.
+    case unchanged
+    /// Something the desktop is made of moved. Hint the provider.
+    case changed
+}
+
 /// What a "the desktop may have changed" hint should do about it.
 enum DesktopResolveDecision: Equatable {
     /// The rate-limit floor has expired; read the desktop now.
@@ -1872,16 +2103,40 @@ final class DesktopBackdropProvider: ObservableObject {
 
     @Published private(set) var painting: DesktopPainting = .flat(DesktopTintSampler.fallback)
 
-    /// Wallpaper changes are not observable; they are polled off the hints
-    /// below. This is the floor between two disk reads.
+    /// The floor between two disk reads. Every hint — notification, watch tick,
+    /// or activation — is funnelled through it.
     static let minimumResolveInterval: TimeInterval = 2
     /// Enough for a light/dark pair on each of two recently seen desktops.
     private static let cacheLimit = 4
+
+    /// The distributed notification the wallpaper agent posts when the desktop
+    /// changes, and an honest account of what observing it is worth.
+    ///
+    /// `WallpaperAgent` links `NSDistributedNotificationCenter` and carries the
+    /// string `com.apple.desktop`, so the long-standing notification is very
+    /// likely still posted on macOS 26 — but that is inference from `nm` and
+    /// `strings`, not a measurement: confirming it needs an actual desktop
+    /// change, and changing the developer's desktop to find out is not a thing
+    /// this code is allowed to do. So it is observed as a *fast path* and
+    /// nothing depends on it. `desktopWatchInterval` below is the guarantee.
+    static let desktopChangedNotification = Notification.Name("com.apple.desktop")
+
+    /// How often the shallow watch tick runs while Kaisola is the active app.
+    ///
+    /// Three `stat`s, 0.045 ms — 0.001% duty at this cadence, and the timer
+    /// carries a wide tolerance so the wakeups coalesce with whatever else the
+    /// process is doing. It is suspended entirely when the app is not active,
+    /// because `didBecomeActive` already forces a resolve on the way back in,
+    /// which makes an unattended app cost exactly nothing.
+    static let desktopWatchInterval: TimeInterval = 5
+    /// How often a tick is allowed to be `deep` — see `DesktopProbeDepth`.
+    static let desktopDeepProbeInterval: TimeInterval = 30
 
     private var cache: [DesktopBackdropKey: DesktopPainting] = [:]
     private var cacheOrder: [DesktopBackdropKey] = []
     private var work: Task<Void, Never>?
     private var deferredResolve: Task<Void, Never>?
+    private var watch: Task<Void, Never>?
     /// Bumped on every resolve so a detached stage that finishes after a newer
     /// resolve started cannot publish its stale painting. `Task.cancel()` is not
     /// enough on its own: `Task.detached` deliberately does not inherit
@@ -1892,6 +2147,18 @@ final class DesktopBackdropProvider: ObservableObject {
     private var lastResolved = Date.distantPast
     private var lastAppearanceIsDark: Bool?
     private var observers: [any NSObjectProtocol] = []
+    private var lastKey: DesktopBackdropKey?
+    private var lastDeepProbe = Date.distantPast
+
+    /// The last fingerprint a watch tick read, and the number of times anything
+    /// has said "the desktop may have changed".
+    ///
+    /// Deliberately not `@Published`: a hint is not a repaint, and publishing
+    /// one would invalidate every glass surface in the app on a timer. They are
+    /// observable so the watch can be *proved* to fire rather than asserted to —
+    /// see `testTheWallpaperWatchFiresOnADistributedDesktopNotification`.
+    private(set) var wallpaperSignature: DesktopWallpaperSignature?
+    private(set) var wallpaperSignals = 0
 
     var tintColor: Color {
         let tint = painting.tint
@@ -1901,30 +2168,55 @@ final class DesktopBackdropProvider: ObservableObject {
     private init() {
         let workspace = NSWorkspace.shared.notificationCenter
         let center = NotificationCenter.default
+        let distributed = DistributedNotificationCenter.default()
         // Space switches and screen reconfiguration can both change which
         // desktop picture applies; becoming key is when a wallpaper the user
-        // changed in System Settings first matters to us.
+        // changed in System Settings first matters to us; waking is when a
+        // desktop set to rotate "on wake" has already rotated.
         observers = [
             workspace.addObserver(
                 forName: NSWorkspace.activeSpaceDidChangeNotification,
                 object: nil,
                 queue: .main
-            ) { [weak self] _ in MainActor.assumeIsolated { self?.invalidate() } },
+            ) { [weak self] _ in MainActor.assumeIsolated { self?.noteDesktopSignal() } },
+            workspace.addObserver(
+                forName: NSWorkspace.didWakeNotification,
+                object: nil,
+                queue: .main
+            ) { [weak self] _ in MainActor.assumeIsolated { self?.noteDesktopSignal() } },
             center.addObserver(
                 forName: NSApplication.didBecomeActiveNotification,
                 object: nil,
                 queue: .main
-            ) { [weak self] _ in MainActor.assumeIsolated { self?.invalidate() } },
+            ) { [weak self] _ in
+                MainActor.assumeIsolated {
+                    self?.noteDesktopSignal()
+                    self?.startWatching()
+                }
+            },
+            center.addObserver(
+                forName: NSApplication.didResignActiveNotification,
+                object: nil,
+                queue: .main
+            ) { [weak self] _ in MainActor.assumeIsolated { self?.stopWatching() } },
             center.addObserver(
                 forName: NSApplication.didChangeScreenParametersNotification,
                 object: nil,
                 queue: .main
-            ) { [weak self] _ in MainActor.assumeIsolated { self?.invalidate() } },
+            ) { [weak self] _ in MainActor.assumeIsolated { self?.noteDesktopSignal() } },
             center.addObserver(
                 forName: NSWindow.didBecomeKeyNotification,
                 object: nil,
                 queue: .main
-            ) { [weak self] _ in MainActor.assumeIsolated { self?.invalidate() } },
+            ) { [weak self] _ in MainActor.assumeIsolated { self?.noteDesktopSignal() } },
+            // The fast path. `object: nil` because the agent's object string is
+            // not documented and has changed across releases; the name alone is
+            // specific enough, and a spurious hint costs one coalesced resolve.
+            distributed.addObserver(
+                forName: Self.desktopChangedNotification,
+                object: nil,
+                queue: .main
+            ) { [weak self] _ in MainActor.assumeIsolated { self?.noteDesktopSignal() } },
         ]
     }
 
@@ -1947,12 +2239,154 @@ final class DesktopBackdropProvider: ObservableObject {
         return .deferBy(floor - elapsed)
     }
 
+    /// How much a watch tick at `now` is allowed to read.
+    ///
+    /// Pure, so the "4 ms call is not on the 5-second path" rule is a test
+    /// rather than a comment that a later edit can quietly break.
+    static func probeDepth(
+        now: Date,
+        lastDeepProbe: Date,
+        interval: TimeInterval = desktopDeepProbeInterval
+    ) -> DesktopProbeDepth {
+        now.timeIntervalSince(lastDeepProbe) >= interval ? .deep : .shallow
+    }
+
+    /// Whether a fingerprint that just came back means the desktop moved.
+    ///
+    /// Two rules that are easy to get wrong and impossible to see in a reading:
+    ///
+    /// * **No baseline is not a change.** The first tick after a resolve exists
+    ///   to record what "unchanged" looks like. Treating it as a change would
+    ///   make the watch re-resolve every time it started.
+    /// * **A field only one side has proves nothing.** A shallow tick does not
+    ///   pay for `desktopImageURL`, so its `desktopImagePath` is `nil`; if a
+    ///   missing value counted as different, every shallow tick after a deep one
+    ///   would fire, and the whole point of the two rungs would be lost.
+    static func signalDecision(
+        previous: DesktopWallpaperSignature?,
+        current: DesktopWallpaperSignature
+    ) -> DesktopSignalDecision {
+        guard let previous else { return .unchanged }
+        if previous.paintedModified != current.paintedModified { return .changed }
+        if previous.storeModified != current.storeModified { return .changed }
+        if previous.thumbnailsModified != current.thumbnailsModified { return .changed }
+        if let old = previous.desktopImagePath,
+           let new = current.desktopImagePath,
+           old != new { return .changed }
+        return .unchanged
+    }
+
+    /// The fingerprint itself. `modificationDate` is injected so the whole rule
+    /// — which files are read, and which of them a `deep` probe adds — is
+    /// testable against a fixture directory rather than against the developer's
+    /// own desktop.
+    nonisolated static func signature(
+        depth: DesktopProbeDepth,
+        desktopImagePath: String?,
+        paintedPath: String?,
+        supportDirectory: URL,
+        modificationDate: (URL) -> Date?
+    ) -> DesktopWallpaperSignature {
+        DesktopWallpaperSignature(
+            desktopImagePath: depth == .deep ? desktopImagePath : nil,
+            paintedModified: paintedPath.flatMap { modificationDate(URL(fileURLWithPath: $0)) },
+            storeModified: modificationDate(supportDirectory.appending(path: "Store/Index.plist")),
+            thumbnailsModified: modificationDate(
+                supportDirectory.appending(path: "aerials/thumbnails", directoryHint: .isDirectory)
+            )
+        )
+    }
+
+    nonisolated static func modificationDateOnDisk(_ url: URL) -> Date? {
+        try? url.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate
+    }
+
+    /// Whether the watch is currently armed. Observable so "an app with no
+    /// glass surface never starts a timer" is a test rather than a claim.
+    var isWatchingDesktop: Bool { watch != nil }
+
+    /// Start the watch. Idempotent, and a no-op until a glass surface has
+    /// actually asked for a backdrop — an app whose windows are all solid
+    /// never starts a timer.
+    private func startWatching() {
+        guard watch == nil, lastAppearanceIsDark != nil else { return }
+        watch = Task { [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(
+                    for: .seconds(Self.desktopWatchInterval),
+                    tolerance: .seconds(Self.desktopWatchInterval / 2)
+                )
+                guard !Task.isCancelled, let self else { return }
+                await self.probeDesktop()
+            }
+        }
+    }
+
+    private func stopWatching() {
+        watch?.cancel()
+        watch = nil
+    }
+
+    /// One watch tick.
+    ///
+    /// The main actor pays only for `desktopImageURL`, and only on a deep tick;
+    /// the `stat`s run detached. A tick that finds nothing does not touch the
+    /// backdrop at all, so the steady state is three `stat`s every five seconds
+    /// and no allocation, no decode, and no repaint.
+    ///
+    /// `supportDirectory` is a parameter only so the whole chain — filesystem
+    /// change, fingerprint, decision, coalescing door — can be driven end to end
+    /// against a fixture. There is no way to test it against the real store: it
+    /// would mean changing the developer's desktop.
+    func probeDesktop(
+        supportDirectory: URL = DesktopWallpaperLocator.defaultSupportDirectory
+    ) async {
+        guard lastAppearanceIsDark != nil else { return }
+        let depth = Self.probeDepth(now: Date(), lastDeepProbe: lastDeepProbe)
+        var desktopImagePath: String?
+        if depth == .deep {
+            lastDeepProbe = Date()
+            desktopImagePath = Self.currentScreen()
+                .flatMap { NSWorkspace.shared.desktopImageURL(for: $0) }?.path
+        }
+        let paintedPath = lastKey?.path
+        let support = supportDirectory
+        let current = await Task.detached(priority: .utility) {
+            Self.signature(
+                depth: depth,
+                desktopImagePath: desktopImagePath,
+                paintedPath: paintedPath,
+                supportDirectory: support,
+                modificationDate: Self.modificationDateOnDisk
+            )
+        }.value
+        let decision = Self.signalDecision(previous: wallpaperSignature, current: current)
+        wallpaperSignature = current
+        guard decision == .changed else { return }
+        noteDesktopSignal()
+    }
+
+    /// The one door every "the desktop may have changed" signal goes through —
+    /// the distributed notification, a watch tick that found something, a Space
+    /// switch, a wake, an activation, a screen change, a new key window.
+    ///
+    /// It records the signal and then defers entirely to `invalidate`, so the
+    /// coalescing contract is unchanged: a burst still arms exactly one
+    /// deferred resolve, and the generation counter still drops stale bakes.
+    private func noteDesktopSignal() {
+        wallpaperSignals += 1
+        invalidate()
+    }
+
     /// Ask for the backdrop that matches `isDark`. Cheap and idempotent: an
     /// appearance flip always re-resolves, anything else waits out the
     /// rate limit.
     func refresh(isDark: Bool) {
         let appearanceChanged = isDark != lastAppearanceIsDark
         lastAppearanceIsDark = isDark
+        // The first surface to ask for a backdrop is what arms the watch; an
+        // app with nothing but solid chrome never starts a timer at all.
+        startWatching()
         guard appearanceChanged
             || Date().timeIntervalSince(lastResolved) >= Self.minimumResolveInterval else { return }
         // An appearance flip supersedes any armed hint: it is about to do the
@@ -2017,6 +2451,12 @@ final class DesktopBackdropProvider: ObservableObject {
                 Self.key(desktopImageURL: desktopImageURL, isDark: isDark)
             }.value
             guard let self, generation == self.generation else { return }
+            // Whatever this resolve concluded is the new baseline: the file it
+            // painted has just been read, so the next watch tick must compare
+            // against *that* rather than fire a second time on the change this
+            // resolve already honoured.
+            self.lastKey = key
+            self.wallpaperSignature = nil
             guard let key else {
                 painting = .flat(DesktopTintSampler.fallback)
                 return
@@ -2123,6 +2563,9 @@ struct DesktopGlassLayer: View {
     /// appearance AppKit's materials are near-white and pass almost no desktop
     /// colour through, so live mode needs the sampled average to carry the hue.
     /// The painted wallpaper already is the hue and must not be tinted twice.
+    ///
+    /// See `SidebarBackdropView` for why the dark half of the pair is so much
+    /// smaller than the light one.
     var liveTint: (dark: Double, light: Double)?
 
     @Environment(\.colorScheme) private var colorScheme
@@ -2210,6 +2653,29 @@ struct DesktopGlassLayer: View {
 /// Reusable material used by both the project sidebar and the workspace file
 /// rail, keeping the two left-hand navigation surfaces visually coherent.
 struct SidebarBackdropView: View {
+    /// Coverage of the sampled desktop average laid over *live* vibrancy.
+    ///
+    /// Michael's translucency note names both glass sources — "especially on
+    /// live and wallpaper" — and in Live the veil is not the only thing between
+    /// the user and the desktop: this tint sits under it, so the two coverages
+    /// multiply. At the shipped pair the dark Live sidebar passed
+    /// `(1 - 0.30) · (1 - 0.52) = 0.336` of the material; the thinner veil alone
+    /// takes that to 0.462, and halving the dark tint takes it to **0.561** —
+    /// the material behind the window contributes 67% more than it did.
+    ///
+    /// Halving *dark* specifically, and leaving light at 0.26, is the same
+    /// argument this layer was introduced with rather than a new one: the tint
+    /// exists because AppKit's light materials are near-white and eat the
+    /// desktop's hue, which is a light-appearance problem. A dark `.sidebar`
+    /// material is already dark and already carries the desktop's colour, so
+    /// most of what a 0.30 tint did there was dim it — the very complaint.
+    ///
+    /// (Unlike the wallpaper source, this cannot be measured offline: it lands
+    /// on live vibrancy, whose input is whatever is behind the window. The
+    /// numbers above are compositing algebra over the two declared coverages,
+    /// which is exactly as much as is knowable without a screenshot.)
+    static let liveTint = (dark: 0.15, light: 0.26)
+
     @Environment(\.colorScheme) private var colorScheme
     @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
     @Environment(\.colorSchemeContrast) private var accessibilityContrast
@@ -2223,7 +2689,7 @@ struct SidebarBackdropView: View {
                 Color(nsColor: .controlBackgroundColor)
             } else {
                 ZStack {
-                    DesktopGlassLayer(liveMaterial: .sidebar, liveTint: (dark: 0.30, light: 0.26))
+                    DesktopGlassLayer(liveMaterial: .sidebar, liveTint: Self.liveTint)
                     GlassBackdropWash.sidebar(isDark: colorScheme == .dark).veil
                     if accessibilityContrast == .increased {
                         Color(nsColor: .controlBackgroundColor)

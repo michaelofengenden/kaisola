@@ -50,8 +50,10 @@ struct QuietProjectRail: View {
     /// Terminal selection carries a focus policy the rail must not own (window
     /// hand-off, focused-pane and cross-project guards), so the host supplies it.
     private let selectSession: (BrokerTerminalRecord) -> Void
-    /// The hover `+` offers creation only; destructive project actions stay in
-    /// the row's context menu.
+    /// The active header's `+` offers creation only; destructive project actions
+    /// stay in the row's context menu. Its contents (New Terminal, the agent
+    /// terminals, Chat, Mesh) are the host's — the rail only decides where the
+    /// control sits and when it is drawn.
     private let launchMenu: (AppModel.ProjectGroup) -> AnyView
     private let projectMenu: (AppModel.ProjectGroup) -> AnyView
     private let sessionMenu: (BrokerTerminalRecord) -> AnyView
@@ -256,7 +258,55 @@ private enum QuietRailMetrics {
     /// Distance from the row's trailing edge to the `+` slot. Lands the slot
     /// just inside the active project's capsule, which is itself inset by
     /// `KaisolaVisualSystem.chromeInset`.
-    static let plusTrailingInset: CGFloat = 10
+    ///
+    /// 10 → 12 in v1.1.10, when the active header's `+` stopped being
+    /// hover-only. The sidebar's resize corridor is an *overlay* on the trailing
+    /// edge of the List and reaches `NativeWorkspaceChrome.projectSidebarDividerReach`
+    /// (10.5pt) inward, so at 10 the corridor sat over the last half-point of
+    /// the `+` slot — already noted in `RootShellView` as a known ~1.5pt overlap
+    /// and left alone while the control only existed under the pointer. A
+    /// permanent control that is now *the* way to make a session cannot share
+    /// its edge with a drag handle, so the slot moves inside the reach instead.
+    static let plusTrailingInset: CGFloat = 12
+}
+
+/// Which of the project header's trailing controls are drawn, given the row's
+/// placement and whether the pointer is inside the group.
+///
+/// Pure so "creating a session is always one click away" is a test rather than
+/// a `if hovering` that the next layout pass can quietly re-add.
+enum QuietProjectHeaderControls {
+    /// The `+` launch menu.
+    ///
+    /// Permanent on the **active** project, hover-only on every other row.
+    ///
+    /// v1.1.7 removed the rail's last resting chrome and left creation four
+    /// doors, all of them either hidden or remembered: this `+` (revealed on
+    /// hover), the project and session context menus, ⌘T, and the command
+    /// palette. Michael's round-2 note is that this is the wrong trade — "make
+    /// it easier to open new sessions" — and it is the wrong trade specifically
+    /// on the row you are already working in. Exactly one project is active at a
+    /// time, so making its `+` permanent adds exactly one 18pt glyph to the
+    /// whole rail: the app's most common action becomes visible without the
+    /// column acquiring a control per row.
+    ///
+    /// Inactive projects keep the hover rule, and today they draw no `+` at all
+    /// — creating a session in a project you are not in goes through that row's
+    /// context menu. The rule is stated for both placements anyway so that a
+    /// future compact `+` cannot arrive as a *resting* one: one permanent glyph
+    /// in the whole rail is a control, one per row is a toolbar.
+    static func showsLaunchControl(isActive: Bool, hovering: Bool) -> Bool {
+        isActive || hovering
+    }
+
+    /// Accessibility identifier for the active project's launch menu, so its
+    /// presence-without-hover can be asserted from outside the process.
+    static let launchIdentifier = "rail.new-session"
+
+    /// The expand/collapse chevron stays hover-only in both placements: the
+    /// whole row is already the disclosure control, so the glyph is a hint
+    /// rather than the only way in.
+    static func showsDisclosureChevron(hovering: Bool) -> Bool { hovering }
 }
 
 /// What a surface row's title is actually given, derived from the same metrics
@@ -365,8 +415,9 @@ private struct QuietProjectMarkView: View {
 
 // MARK: - Project group
 
-/// One project. Pinned: a 32pt header carrying the project's tinted name, its
-/// chats/meshes/sessions beneath, and a hover-revealed "New session" row.
+/// One project. Pinned: a 32pt header carrying the project's tinted name, a
+/// resting `+` that opens the launch menu, and its chats/meshes/sessions
+/// beneath.
 /// Compact: a single 32pt row with a folder glyph, the project's name, its
 /// rollup, and a hover chevron that expands the project in place *without*
 /// activating it — activation is the row body's job.
@@ -522,7 +573,7 @@ private struct QuietProjectGroup: View {
                         if !isExpanded {
                             QuietRollupView(rollup: QuietRollup.of(Array(statuses.values)))
                         }
-                        if hovering {
+                        if QuietProjectHeaderControls.showsDisclosureChevron(hovering: hovering) {
                             Image(systemName: isExpanded ? "chevron.down" : "chevron.right")
                                 .font(.system(size: QuietRailMetrics.chevronText, weight: .semibold))
                                 .foregroundStyle(.tertiary)
@@ -552,13 +603,25 @@ private struct QuietProjectGroup: View {
             // ever be laid out INSIDE the row. As a bare sibling of a
             // `maxWidth: .infinity` button it was pushed past the row's trailing
             // edge and rendered clipped in half.
+            //
+            // On the active project it is drawn at rest — see
+            // `QuietProjectHeaderControls.showsLaunchControl`. It is the rail's
+            // only piece of resting chrome and it buys the app's most common
+            // action; everything else in the column still appears only under the
+            // pointer.
             ZStack {
-                if hovering {
+                if QuietProjectHeaderControls.showsLaunchControl(
+                    isActive: isActive,
+                    hovering: hovering
+                ) {
                     Menu {
                         launchMenu(project)
                     } label: {
                         Image(systemName: "plus")
                             .font(.system(size: QuietRailMetrics.plusText, weight: .semibold))
+                            // `.secondary` at rest, not `.primary`: present
+                            // enough to find without competing with the project
+                            // name beside it, which is the row's actual subject.
                             .foregroundStyle(.secondary)
                     }
                     .menuStyle(.borderlessButton)
@@ -566,6 +629,7 @@ private struct QuietProjectGroup: View {
                     .fixedSize()
                     .help("New session in \(project.name)")
                     .accessibilityLabel("New session in \(project.name)")
+                    .accessibilityIdentifier(QuietProjectHeaderControls.launchIdentifier)
                 }
             }
             .frame(width: QuietRailMetrics.plusSlot, height: QuietRailMetrics.rowHeight)
@@ -732,12 +796,18 @@ private struct QuietProjectGroup: View {
         }
     }
 
-    // The hover-revealed "New session" ghost row is gone (v1.1.7). A row that
-    // appears under the pointer whenever it crosses the group is a row that
-    // pops at the user, and it was the rail's last piece of resting chrome.
-    // Creation keeps four doors that do not move: the active header's `+` menu,
-    // the project and session context menus, the File menu (⌘T), and the
-    // command palette.
+    // The hover-revealed "New session" ghost row is gone (v1.1.7) and is not
+    // coming back. A row that appears under the pointer whenever it crosses the
+    // group is a row that pops at the user, and it moves the rows below it while
+    // the pointer is travelling.
+    //
+    // v1.1.10 answers "make it easier to open new sessions" the other way: the
+    // active header's `+` is simply drawn at rest (see
+    // `QuietProjectHeaderControls.showsLaunchControl`) rather than a second
+    // affordance being added beside it. One glyph, in the row the user is
+    // already in, that does not move and does not appear or disappear. The other
+    // doors are unchanged: the project and session context menus, the File menu
+    // (⌘T), and the command palette.
 
     // MARK: Rows
 

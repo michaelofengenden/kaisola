@@ -491,6 +491,56 @@ final class QuietIdentityMarkTests: XCTestCase {
         )
     }
 
+    /// "Make it easier to open new sessions" (Michael, round 2).
+    ///
+    /// Before this, every door to creation was either hidden or remembered: the
+    /// `+` appeared only under the pointer, the context menus need a
+    /// right-click on the right row, and ⌘T / the palette have to be known.
+    /// The active project's `+` is now simply *there*.
+    func testTheActiveProjectsNewSessionControlIsThereWithoutHovering() {
+        XCTAssertTrue(
+            QuietProjectHeaderControls.showsLaunchControl(isActive: true, hovering: false),
+            "the active project's + is hidden until the pointer finds it"
+        )
+        XCTAssertTrue(
+            QuietProjectHeaderControls.showsLaunchControl(isActive: true, hovering: true)
+        )
+    }
+
+    /// …and the rail does not become a toolbar to do it. Exactly one project is
+    /// active, so exactly one `+` rests in the column; every other project's
+    /// stays behind the pointer.
+    func testOnlyTheActiveProjectRestsAControlInTheColumn() {
+        XCTAssertFalse(
+            QuietProjectHeaderControls.showsLaunchControl(isActive: false, hovering: false),
+            "an inactive project would draw a resting + too — one per row is a toolbar"
+        )
+        XCTAssertTrue(
+            QuietProjectHeaderControls.showsLaunchControl(isActive: false, hovering: true)
+        )
+        // The disclosure chevron is a hint on top of a row that is already the
+        // disclosure control, so it stays hover-only in both placements.
+        XCTAssertFalse(QuietProjectHeaderControls.showsDisclosureChevron(hovering: false))
+        XCTAssertTrue(QuietProjectHeaderControls.showsDisclosureChevron(hovering: true))
+    }
+
+    /// A control that is only there under the pointer can share its edge with a
+    /// drag handle; a permanent one cannot.
+    ///
+    /// The sidebar's resize corridor is an overlay on the trailing edge of the
+    /// List and reaches `projectSidebarDividerReach` inward. At the old 10pt
+    /// inset the corridor covered the last half-point of the `+` slot —
+    /// documented in `RootShellView` as a known overlap and tolerated while the
+    /// `+` was hover-only. Now that it is the app's main creation door, the slot
+    /// has to start clear of the corridor by construction.
+    func testTheRestingPlusDoesNotShareItsEdgeWithTheResizeCorridor() {
+        XCTAssertGreaterThan(
+            QuietRowBudget.headerPlusTrailingInset,
+            NativeWorkspaceChrome.projectSidebarDividerReach,
+            "the resize corridor overlaps the + the user is aiming at"
+        )
+    }
+
     // MARK: - Row emphasis and selection
 
     /// v1.1.9 gives the selected surface row a colour and a pill back, but the

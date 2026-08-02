@@ -239,15 +239,28 @@ struct AcpModelFavoritesStore: Sendable {
 // MARK: - Effort · context chip
 
 enum AcpComposerMetrics {
-    /// The adapter option worth a chip. Reasoning effort is the one people
-    /// change mid-task; anything else is a preset they set once, so it stays in
-    /// the chip's menu rather than on its face.
-    static func primaryOption(_ options: [AcpConfigOption]) -> AcpConfigOption? {
+    /// The reasoning-effort option, by the adapter's own classification when it
+    /// declares one and by its wording when it does not.
+    ///
+    /// ACP's `category` is the only non-guessing answer: two adapters name this
+    /// setting differently but both file it under `thought_level`. The word
+    /// search stays as the fallback for adapters that omit the field.
+    static func effortOption(_ options: [AcpConfigOption]) -> AcpConfigOption? {
+        if let declared = options.first(where: { $0.category?.lowercased() == "thought_level" }) {
+            return declared
+        }
         let effortWords = ["effort", "reasoning", "thinking", "think"]
         return options.first { option in
             let haystack = (option.id + " " + option.name).lowercased()
             return effortWords.contains { haystack.contains($0) }
-        } ?? options.first
+        }
+    }
+
+    /// The adapter option worth a chip. Reasoning effort is the one people
+    /// change mid-task; anything else is a preset they set once, so it stays in
+    /// the chip's menu rather than on its face.
+    static func primaryOption(_ options: [AcpConfigOption]) -> AcpConfigOption? {
+        effortOption(options) ?? options.first
     }
 
     /// The chosen value in the adapter's own display wording, falling back to
@@ -279,6 +292,219 @@ enum AcpComposerMetrics {
         if value >= 1_000_000 { return trim(Double(value) / 1_000_000, "M") }
         if value >= 1_000 { return trim(Double(value) / 1_000, "k") }
         return "\(value)"
+    }
+}
+
+// MARK: - Adapter surface
+
+/// One adapter's declared settings, reduced so each setting is stated once.
+///
+/// Codex declares reasoning effort three times over: as a `reasoning_effort`
+/// config option, as a suffix on every model id (`gpt-5.6-sol[max]`), and again
+/// inside every model's display name ("GPT-5.6-Sol (max)"). It declares the
+/// model twice — the 33-entry model × effort cross product in `models`, and the
+/// seven base models in a `model` config option — and the permission mode twice,
+/// once in `modes` and once in a `mode` config option the permission chip is
+/// already rendering. Rendered raw, the settings menu reads
+///
+///     Agent  Codex · Model  GPT-5.6-Sol (max) · Mode  Agent
+///     Collaboration mode  Default · Model  GPT-5.6-Sol · Effort  Max
+///
+/// and the pill reads "GPT-5.6-Sol (max)  Max".
+///
+/// The repetition is only half of it. The copies also drift: setting
+/// `reasoning_effort` to Low leaves `models.currentModelId` at
+/// `gpt-5.6-sol[max]` — the adapter sends no model update — so two rows of the
+/// same menu end up disagreeing about the effort in force. There is no ordering
+/// of rows that makes that read as anything but a bug.
+///
+/// So the payload is reconciled exactly once, here, into the one model list and
+/// the one option list the menu renders. Measured against
+/// `@agentclientprotocol/codex-acp` 1.1.8 and `claude-agent-acp`, whose payload
+/// has none of this and passes through untouched.
+struct AcpComposerSurface: Equatable, Sendable {
+    /// How choosing a model row has to reach the adapter. Which one applies is
+    /// decided by where the surviving model list came from, so a caller can
+    /// never pair an id with the wrong request.
+    enum ModelTarget: Equatable, Sendable {
+        /// ACP `session/set_model`, with the row's id as `modelId`.
+        case setModel
+        /// ACP `session/set_config_option` on this option id, with the row's id
+        /// as the value.
+        case configOption(String)
+    }
+
+    var models: [AcpSessionInfo.Model] = []
+    var currentModelID: String?
+    var modelTarget: ModelTarget = .setModel
+    /// The options that still have something of their own to say.
+    var options: [AcpConfigOption] = []
+
+    /// Reduce one `session/new` payload to the settings the menu shows.
+    static func reconciled(
+        models: [AcpSessionInfo.Model],
+        currentModelID: String?,
+        modes: [AcpSessionInfo.Mode],
+        configOptions: [AcpConfigOption]
+    ) -> AcpComposerSurface {
+        // An option with nothing to choose is not a setting; it is a label the
+        // menu would open onto a blank panel.
+        var options = configOptions.filter { !$0.choices.isEmpty }
+
+        // The permission chip already renders `modes`. An option offering those
+        // very ids is that chip written out a second time.
+        let modeIDs = Set(modes.map { folded($0.id) })
+        if !modeIDs.isEmpty {
+            options.removeAll { option in
+                classified(option, as: "mode", fallbackWords: ["mode", "approval"])
+                    && option.choices.allSatisfy { modeIDs.contains(folded($0.value)) }
+            }
+        }
+
+        // A base-model option supersedes an `availableModels` list it covers:
+        // the option names each model once, the list names it once per effort.
+        // Choosing through the option also leaves the effort alone, which is
+        // the behaviour the separate Effort row promises.
+        if let modelOption = options.first(where: {
+            classified($0, as: "model", fallbackWords: ["model"]) && covers($0, models: models)
+        }) {
+            options.removeAll { $0.id == modelOption.id }
+            return AcpComposerSurface(
+                models: modelOption.choices.map { AcpSessionInfo.Model(id: $0.value, name: $0.name) },
+                currentModelID: modelOption.currentValue ?? modelOption.choices.first?.value,
+                modelTarget: .configOption(modelOption.id),
+                options: options
+            )
+        }
+
+        let collapsed = collapsingEffortVariants(
+            models: models,
+            currentModelID: currentModelID,
+            effort: AcpComposerMetrics.effortOption(options)
+        )
+        return AcpComposerSurface(
+            models: collapsed.models,
+            currentModelID: collapsed.currentModelID,
+            modelTarget: .setModel,
+            options: options
+        )
+    }
+
+    // MARK: Effort variants
+
+    /// Fold `<model>` × `<effort>` rows back into one row per model.
+    ///
+    /// Only when a separate effort option exists. When effort lives *only* in
+    /// the model names there is no second row for them to contradict, so the
+    /// names keep it and the model row carries the setting alone.
+    ///
+    /// The row that survives each group is the variant at the effort currently
+    /// in force, so the id handed to `session/set_model` preserves the effort
+    /// the Effort row is showing, and `Advanced` quotes an id that is true.
+    private static func collapsingEffortVariants(
+        models: [AcpSessionInfo.Model],
+        currentModelID: String?,
+        effort: AcpConfigOption?
+    ) -> (models: [AcpSessionInfo.Model], currentModelID: String?) {
+        guard let effort, !effort.choices.isEmpty else { return (models, currentModelID) }
+        // Longest first, so `[xhigh]` is never read as a stray `high`.
+        let values = effort.choices.map(\.value).sorted { $0.count > $1.count }
+        let inForce = folded(effort.currentValue ?? effort.choices[0].value)
+
+        var order: [String] = []
+        var variants: [String: [(model: AcpSessionInfo.Model, effort: String?)]] = [:]
+        var names: [String: String] = [:]
+
+        for model in models {
+            let fromID = effortSuffix(model.id, values: values)
+            let fromName = effortSuffix(model.name, values: values)
+            let key = folded(fromID?.base ?? model.id)
+            if variants[key] == nil {
+                order.append(key)
+                names[key] = fromName?.base ?? model.name
+            }
+            variants[key, default: []].append((model, fromID?.effort ?? fromName?.effort))
+        }
+
+        func survivor(_ group: [(model: AcpSessionInfo.Model, effort: String?)]) -> AcpSessionInfo.Model {
+            if let atEffort = group.first(where: { $0.effort.map { folded($0) == inForce } ?? false }) {
+                return atEffort.model
+            }
+            // No variant at this effort (Codex's Luna stops short of `ultra`).
+            // The selected one, else the adapter's first, keeps the row
+            // truthful; the adapter reports whatever effort it lands on and the
+            // Effort row follows it.
+            return group.first { $0.model.id == currentModelID }?.model ?? group[0].model
+        }
+
+        let collapsed = order.map { key in
+            AcpSessionInfo.Model(id: survivor(variants[key] ?? []).id, name: names[key] ?? key)
+        }
+        let currentKey = currentModelID.flatMap { id in
+            order.first { key in (variants[key] ?? []).contains { $0.model.id == id } }
+        }
+        return (collapsed, currentKey.flatMap { key in survivor(variants[key] ?? []).id })
+    }
+
+    /// Split a trailing effort qualifier off an id or a display name:
+    /// `gpt-5.6-sol[max]` → (`gpt-5.6-sol`, `max`), `GPT-5.6-Sol (max)` →
+    /// (`GPT-5.6-Sol`, `max`), `sonnet-high` → (`sonnet`, `high`).
+    ///
+    /// The values come from the effort option's own choices rather than a word
+    /// list of ours, which is what stops this from amputating a model whose
+    /// name merely rhymes with an effort level.
+    static func effortSuffix(_ text: String, values: [String]) -> (base: String, effort: String)? {
+        let trimmed = text.trimmingCharacters(in: .whitespaces)
+        let lowered = trimmed.lowercased()
+        for value in values where !value.isEmpty {
+            for wrapper in ["[\(value)]", "(\(value))"] where lowered.hasSuffix(wrapper.lowercased()) {
+                let base = String(trimmed.dropLast(wrapper.count))
+                    .trimmingCharacters(in: CharacterSet(charactersIn: " -_"))
+                if !base.isEmpty { return (base, value) }
+            }
+            for separator in ["-", "_", " "] where lowered.hasSuffix((separator + value).lowercased()) {
+                let base = String(trimmed.dropLast(value.count + 1))
+                if !base.isEmpty { return (base, value) }
+            }
+        }
+        return nil
+    }
+
+    // MARK: Classification
+
+    /// Does this option describe the given ACP category?
+    ///
+    /// A declared `category` decides alone — that is the whole point of the
+    /// field, and it is why Codex's `collaboration_mode` is not mistaken for
+    /// its `mode` despite the word. Only an adapter that declares nothing falls
+    /// back to reading the id and name.
+    private static func classified(
+        _ option: AcpConfigOption,
+        as category: String,
+        fallbackWords: [String]
+    ) -> Bool {
+        if let declared = option.category?.lowercased(), !declared.isEmpty {
+            return declared == category
+        }
+        let haystack = folded(option.id) + " " + folded(option.name)
+        return fallbackWords.contains { haystack.contains($0) }
+    }
+
+    /// Is every declared model a variant of one of this option's choices? Only
+    /// then is the option the same list said more briefly, rather than a
+    /// different list that happens to be about models.
+    private static func covers(_ option: AcpConfigOption, models: [AcpSessionInfo.Model]) -> Bool {
+        guard !models.isEmpty else { return true }
+        let bases = option.choices.map { folded($0.value) }.filter { !$0.isEmpty }
+        guard !bases.isEmpty else { return false }
+        return models.allSatisfy { model in
+            let id = folded(model.id)
+            return bases.contains { id.hasPrefix($0) }
+        }
+    }
+
+    private static func folded(_ value: String) -> String {
+        value.lowercased().filter { $0.isLetter || $0.isNumber }
     }
 }
 
@@ -345,17 +571,15 @@ enum AcpComposerMenu {
     /// again.
     private static let qualifiers: Set<String> = ["reasoning", "agent", "model", "session"]
 
-    static func rows(
-        agentName: String,
-        models: [AcpSessionInfo.Model],
-        currentModelID: String?,
-        configOptions: [AcpConfigOption]
-    ) -> [AcpComposerMenuRow] {
+    /// The menu, from a reconciled surface rather than a raw payload — the one
+    /// place effort could still be said twice is if a caller fed this
+    /// `session/new` directly, so the type system does not let it.
+    static func rows(agentName: String, surface: AcpComposerSurface) -> [AcpComposerMenuRow] {
         var rows = [AcpComposerMenuRow(target: .agent, label: "Agent", value: agentName)]
-        if let model = currentModel(models: models, currentModelID: currentModelID) {
+        if let model = currentModel(surface) {
             rows.append(AcpComposerMenuRow(target: .model, label: "Model", value: model.name))
         }
-        for option in configOptions where !option.choices.isEmpty {
+        for option in surface.options where !option.choices.isEmpty {
             let value = AcpComposerMetrics.optionLabel(option) ?? option.choices[0].name
             rows.append(AcpComposerMenuRow(
                 target: .option(option.id),
@@ -364,6 +588,10 @@ enum AcpComposerMenu {
             ))
         }
         return rows
+    }
+
+    static func currentModel(_ surface: AcpComposerSurface) -> AcpSessionInfo.Model? {
+        currentModel(models: surface.models, currentModelID: surface.currentModelID)
     }
 
     /// Adapters may report models before naming a current one; the first
@@ -389,14 +617,13 @@ enum AcpComposerMenu {
     // MARK: Submenus
 
     static func modelSubmenu(
-        models: [AcpSessionInfo.Model],
-        currentModelID: String?,
+        surface: AcpComposerSurface,
         favorites: Set<String>,
         query: String
     ) -> AcpComposerSubmenu {
-        let selectedID = currentModel(models: models, currentModelID: currentModelID)?.id
+        let selectedID = currentModel(surface)?.id
         let options = AcpModelPicker.choices(
-            models: models,
+            models: surface.models,
             currentID: selectedID,
             favorites: favorites,
             query: query
@@ -458,11 +685,7 @@ enum AcpComposerMenu {
     /// What the pill cannot hold and no row can change: statements, not
     /// controls. An empty result hides the disclosure entirely rather than
     /// opening onto a blank panel.
-    static func advancedLines(
-        usage: AcpUsage?,
-        currentModelID: String?,
-        models: [AcpSessionInfo.Model]
-    ) -> [String] {
+    static func advancedLines(usage: AcpUsage?, surface: AcpComposerSurface) -> [String] {
         var lines: [String] = []
         if let usage, usage.max > 0 {
             lines.append(
@@ -470,8 +693,7 @@ enum AcpComposerMenu {
                     + " of \(AcpComposerMetrics.compactTokens(usage.max))"
             )
         }
-        if let model = currentModel(models: models, currentModelID: currentModelID),
-           folded(model.id) != folded(model.name) {
+        if let model = currentModel(surface), folded(model.id) != folded(model.name) {
             lines.append("Model id: \(model.id)")
         }
         return lines

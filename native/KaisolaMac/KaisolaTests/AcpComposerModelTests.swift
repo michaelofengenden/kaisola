@@ -189,13 +189,19 @@ final class AcpComposerModelTests: XCTestCase {
         ])
     }
 
-    func testMenuLeadsWithAgentThenModelThenTheDeclaredOptions() {
-        let rows = AcpComposerMenu.rows(
-            agentName: "Claude",
+    /// The Claude shape, and the control for everything below: one flat model
+    /// list, no effort anywhere near it, nothing to reconcile.
+    private func claudeSurface(currentModelID: String? = "claude-sonnet-4-5") -> AcpComposerSurface {
+        AcpComposerSurface.reconciled(
             models: models,
-            currentModelID: "claude-sonnet-4-5",
+            currentModelID: currentModelID,
+            modes: [],
             configOptions: [effortOption]
         )
+    }
+
+    func testMenuLeadsWithAgentThenModelThenTheDeclaredOptions() {
+        let rows = AcpComposerMenu.rows(agentName: "Claude", surface: claudeSurface())
         XCTAssertEqual(rows.map(\.label), ["Agent", "Model", "Effort"])
         XCTAssertEqual(rows.map(\.value), ["Claude", "Sonnet 4.5", "Light"])
         XCTAssertEqual(rows.map(\.target), [.agent, .model, .option("effort")])
@@ -206,9 +212,12 @@ final class AcpComposerModelTests: XCTestCase {
     func testMenuOmitsRowsTheAdapterCannotFill() {
         let rows = AcpComposerMenu.rows(
             agentName: "Claude",
-            models: [],
-            currentModelID: nil,
-            configOptions: [AcpConfigOption(id: "preset", name: "Preset", currentValue: nil, choices: [])]
+            surface: AcpComposerSurface.reconciled(
+                models: [],
+                currentModelID: nil,
+                modes: [],
+                configOptions: [AcpConfigOption(id: "preset", name: "Preset", currentValue: nil, choices: [])]
+            )
         )
         XCTAssertEqual(rows.map(\.label), ["Agent"])
     }
@@ -217,7 +226,10 @@ final class AcpComposerModelTests: XCTestCase {
     /// in force, exactly as with permission modes.
     func testModelRowFallsBackToTheFirstDeclaredModel() {
         let rows = AcpComposerMenu.rows(
-            agentName: "Claude", models: models, currentModelID: nil, configOptions: []
+            agentName: "Claude",
+            surface: AcpComposerSurface.reconciled(
+                models: models, currentModelID: nil, modes: [], configOptions: []
+            )
         )
         XCTAssertEqual(rows.first(where: { $0.target == .model })?.value, "Opus 4.5")
     }
@@ -232,15 +244,273 @@ final class AcpComposerModelTests: XCTestCase {
         XCTAssertEqual(AcpComposerMenu.shortLabel(name: "   ", id: "preset"), "Preset")
     }
 
+    // MARK: - Adapter surface: saying each setting exactly once
+
+    /// The Codex shape, transcribed from a live `session/new` against
+    /// `@agentclientprotocol/codex-acp` 1.1.8 (2026-08-02): effort appears in
+    /// every model id, again in every model name, and again as its own option;
+    /// the model appears both as the cross product and as a base-model option;
+    /// the permission mode appears both in `modes` and as a `mode` option.
+    /// Trimmed to three base models — the real payload lists 33 model rows.
+    private enum CodexFixture {
+        static let models = [
+            AcpSessionInfo.Model(id: "gpt-5.6-sol[low]", name: "GPT-5.6-Sol (low)"),
+            AcpSessionInfo.Model(id: "gpt-5.6-sol[high]", name: "GPT-5.6-Sol (high)"),
+            AcpSessionInfo.Model(id: "gpt-5.6-sol[xhigh]", name: "GPT-5.6-Sol (xhigh)"),
+            AcpSessionInfo.Model(id: "gpt-5.6-sol[max]", name: "GPT-5.6-Sol (max)"),
+            AcpSessionInfo.Model(id: "gpt-5.6-terra[low]", name: "GPT-5.6-Terra (low)"),
+            AcpSessionInfo.Model(id: "gpt-5.6-terra[high]", name: "GPT-5.6-Terra (high)"),
+            AcpSessionInfo.Model(id: "gpt-5.6-terra[xhigh]", name: "GPT-5.6-Terra (xhigh)"),
+            AcpSessionInfo.Model(id: "gpt-5.6-terra[max]", name: "GPT-5.6-Terra (max)"),
+            AcpSessionInfo.Model(id: "gpt-5.6-luna[low]", name: "GPT-5.6-Luna (low)"),
+            AcpSessionInfo.Model(id: "gpt-5.6-luna[high]", name: "GPT-5.6-Luna (high)"),
+        ]
+        static let currentModelID = "gpt-5.6-sol[max]"
+        static let modes = [
+            AcpSessionInfo.Mode(id: "read-only", name: "Read-only"),
+            AcpSessionInfo.Mode(id: "agent", name: "Agent"),
+            AcpSessionInfo.Mode(id: "agent-full-access", name: "Agent (full access)"),
+        ]
+
+        static func configOptions(effort: String = "max") -> [AcpConfigOption] {
+            [
+                AcpConfigOption(id: "mode", name: "Mode", category: "mode", currentValue: "agent", choices: [
+                    .init(value: "read-only", name: "Read-only"),
+                    .init(value: "agent", name: "Agent"),
+                    .init(value: "agent-full-access", name: "Agent (full access)"),
+                ]),
+                AcpConfigOption(
+                    id: "collaboration_mode",
+                    name: "Collaboration mode",
+                    category: "collaboration_mode",
+                    currentValue: "default",
+                    choices: [.init(value: "default", name: "Default"), .init(value: "plan", name: "Plan")]
+                ),
+                AcpConfigOption(id: "model", name: "Model", category: "model", currentValue: "gpt-5.6-sol", choices: [
+                    .init(value: "gpt-5.6-sol", name: "GPT-5.6-Sol"),
+                    .init(value: "gpt-5.6-terra", name: "GPT-5.6-Terra"),
+                    .init(value: "gpt-5.6-luna", name: "GPT-5.6-Luna"),
+                ]),
+                AcpConfigOption(
+                    id: "reasoning_effort",
+                    name: "Reasoning effort",
+                    category: "thought_level",
+                    currentValue: effort,
+                    choices: [
+                        .init(value: "low", name: "Low"),
+                        .init(value: "medium", name: "Medium"),
+                        .init(value: "high", name: "High"),
+                        .init(value: "xhigh", name: "Xhigh"),
+                        .init(value: "max", name: "Max"),
+                        .init(value: "ultra", name: "Ultra"),
+                    ]
+                ),
+                AcpConfigOption(id: "fast-mode", name: "Fast mode", category: "model_config", currentValue: "off", choices: [
+                    .init(value: "off", name: "Off"), .init(value: "on", name: "On"),
+                ]),
+            ]
+        }
+
+        static func surface(effort: String = "max") -> AcpComposerSurface {
+            AcpComposerSurface.reconciled(
+                models: models,
+                currentModelID: currentModelID,
+                modes: modes,
+                configOptions: configOptions(effort: effort)
+            )
+        }
+    }
+
+    /// The bug, stated as an assertion: the word "max" may appear in exactly one
+    /// row of the menu. Before the surface existed it appeared in two — the
+    /// Model row read "GPT-5.6-Sol (max)" and the Effort row read "Max" — and
+    /// the pill read "GPT-5.6-Sol (max)  Max".
+    func testCodexStatesTheEffortExactlyOnce() {
+        let rows = AcpComposerMenu.rows(agentName: "Codex", surface: CodexFixture.surface())
+        XCTAssertEqual(rows.map(\.label), ["Agent", "Model", "Collaboration mode", "Effort", "Fast mode"])
+        XCTAssertEqual(rows.map(\.value), ["Codex", "GPT-5.6-Sol", "Default", "Max", "Off"])
+        XCTAssertEqual(
+            rows.filter { $0.value.lowercased().contains("max") }.count,
+            1,
+            "the effort in force must be stated by one row, not two"
+        )
+    }
+
+    /// The pill's face, which is where Michael saw it: model, then effort, each
+    /// once.
+    func testCodexPillNamesTheModelAndTheEffortOnceEach() {
+        let surface = CodexFixture.surface()
+        let values = AcpComposerMenu.chipValues(
+            agentName: "Codex",
+            modelName: AcpComposerMenu.currentModel(surface)?.name,
+            option: AcpComposerMetrics.primaryOption(surface.options)
+        )
+        XCTAssertEqual(values.primary, "GPT-5.6-Sol")
+        XCTAssertEqual(values.secondary, "Max")
+    }
+
+    /// 33 rows of `<model> × <effort>` collapse to one row per model, because
+    /// the effort is chosen one row above.
+    func testCodexModelSubmenuNamesEachModelOnceWithoutItsEffort() {
+        let submenu = AcpComposerMenu.modelSubmenu(
+            surface: CodexFixture.surface(), favorites: [], query: ""
+        )
+        XCTAssertEqual(submenu.options.map(\.name), ["GPT-5.6-Sol", "GPT-5.6-Terra", "GPT-5.6-Luna"])
+        XCTAssertEqual(submenu.options.map(\.isSelected), [true, false, false])
+        XCTAssertTrue(
+            submenu.options.allSatisfy { !$0.name.contains("(") },
+            "no model row may restate the effort the Effort row owns"
+        )
+    }
+
+    /// Codex declares a base-model option, so choosing a model goes through
+    /// `session/set_config_option` — which leaves the effort alone — rather than
+    /// the legacy `session/set_model`, which would carry an effort with it.
+    func testCodexModelChoiceIsDeliveredAsAConfigOption() {
+        XCTAssertEqual(CodexFixture.surface().modelTarget, .configOption("model"))
+        XCTAssertEqual(CodexFixture.surface().models.map(\.id), ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"])
+    }
+
+    /// The drift that makes this a correctness bug and not only a tidiness one.
+    /// Setting the effort to Low leaves `models.currentModelId` at
+    /// `gpt-5.6-sol[max]` — the adapter sends no model update — so a menu built
+    /// from the raw payload would show Model "GPT-5.6-Sol (max)" beside Effort
+    /// "Low" and be wrong about which one is running.
+    func testChangingTheEffortNeverLeavesTheModelRowQuotingTheOldOne() {
+        let rows = AcpComposerMenu.rows(agentName: "Codex", surface: CodexFixture.surface(effort: "low"))
+        XCTAssertEqual(rows.map(\.value), ["Codex", "GPT-5.6-Sol", "Default", "Low", "Off"])
+        XCTAssertFalse(rows.contains { $0.value.lowercased().contains("max") })
+    }
+
+    /// The permission chip already renders `modes`. An option offering those
+    /// same ids is that chip a second time, so it earns no row.
+    func testAnOptionThatRestatesThePermissionModesIsDropped() {
+        XCTAssertFalse(CodexFixture.surface().options.contains { $0.id == "mode" })
+        // …but only because the ids match. An adapter whose `mode`-ish option
+        // offers something else keeps its row.
+        let kept = AcpComposerSurface.reconciled(
+            models: [],
+            currentModelID: nil,
+            modes: CodexFixture.modes,
+            configOptions: [AcpConfigOption(
+                id: "approval", name: "Approval", currentValue: "always", choices: [
+                    .init(value: "always", name: "Always"), .init(value: "never", name: "Never"),
+                ]
+            )]
+        )
+        XCTAssertEqual(kept.options.map(\.id), ["approval"])
+    }
+
+    /// An adapter that bakes the effort into its model names *and* declares a
+    /// separate Effort option, but offers no base-model option: the names are
+    /// stripped and the variants folded, and the id kept for `session/set_model`
+    /// is the one at the effort in force, so choosing a model preserves it.
+    func testEffortBakedIntoModelNamesIsStrippedWhenAnEffortRowOwnsIt() {
+        let surface = AcpComposerSurface.reconciled(
+            models: CodexFixture.models,
+            currentModelID: "gpt-5.6-sol[max]",
+            modes: [],
+            configOptions: CodexFixture.configOptions(effort: "high")
+                .filter { $0.id == "reasoning_effort" }
+        )
+        XCTAssertEqual(surface.modelTarget, .setModel)
+        XCTAssertEqual(surface.models.map(\.name), ["GPT-5.6-Sol", "GPT-5.6-Terra", "GPT-5.6-Luna"])
+        XCTAssertEqual(
+            surface.models.map(\.id),
+            ["gpt-5.6-sol[high]", "gpt-5.6-terra[high]", "gpt-5.6-luna[high]"]
+        )
+        XCTAssertEqual(surface.currentModelID, "gpt-5.6-sol[high]")
+    }
+
+    /// No variant at the effort in force — the fixture's Luna stops at `high`,
+    /// exactly as the real one stops short of `ultra`. The row still resolves to
+    /// a real id rather than vanishing; the adapter reports whatever effort it
+    /// lands on and the Effort row follows it.
+    func testAModelWithNoVariantAtThisEffortStillResolves() {
+        let surface = AcpComposerSurface.reconciled(
+            models: CodexFixture.models,
+            currentModelID: "gpt-5.6-sol[max]",
+            modes: [],
+            configOptions: CodexFixture.configOptions(effort: "xhigh")
+                .filter { $0.id == "reasoning_effort" }
+        )
+        XCTAssertEqual(
+            surface.models.map(\.id),
+            ["gpt-5.6-sol[xhigh]", "gpt-5.6-terra[xhigh]", "gpt-5.6-luna[low]"]
+        )
+    }
+
+    /// The other shape the spec allows: effort lives *only* in the model names,
+    /// with no option of its own. Then the model row is the only thing that can
+    /// carry it, so nothing is stripped and no Effort row is invented.
+    func testEffortLivingOnlyInModelNamesStaysOnTheModelRow() {
+        let surface = AcpComposerSurface.reconciled(
+            models: CodexFixture.models,
+            currentModelID: "gpt-5.6-sol[max]",
+            modes: [],
+            configOptions: [AcpConfigOption(
+                id: "fast-mode", name: "Fast mode", category: "model_config", currentValue: "off",
+                choices: [.init(value: "off", name: "Off"), .init(value: "on", name: "On")]
+            )]
+        )
+        let rows = AcpComposerMenu.rows(agentName: "Codex", surface: surface)
+        XCTAssertEqual(rows.map(\.label), ["Agent", "Model", "Fast mode"])
+        XCTAssertEqual(rows.first { $0.target == .model }?.value, "GPT-5.6-Sol (max)")
+        XCTAssertFalse(rows.contains { $0.label == "Effort" })
+        XCTAssertEqual(surface.models.count, CodexFixture.models.count)
+    }
+
+    /// The control: Claude declares a flat model list, no effort anywhere near
+    /// it, and one option. Reconciling must be a no-op.
+    func testTheClaudeShapePassesThroughUntouched() {
+        let surface = claudeSurface()
+        XCTAssertEqual(surface.models, models)
+        XCTAssertEqual(surface.currentModelID, "claude-sonnet-4-5")
+        XCTAssertEqual(surface.modelTarget, .setModel)
+        XCTAssertEqual(surface.options.map(\.id), ["effort"])
+    }
+
+    /// `[xhigh]` is not a stray `high`, and a model that merely rhymes with an
+    /// effort level keeps its whole name.
+    func testTheEffortSuffixIsReadWholeOrNotAtAll() {
+        let values = ["low", "high", "xhigh", "max"]
+        XCTAssertEqual(AcpComposerSurface.effortSuffix("gpt-5.6-sol[xhigh]", values: values)?.effort, "xhigh")
+        XCTAssertEqual(AcpComposerSurface.effortSuffix("gpt-5.6-sol[xhigh]", values: values)?.base, "gpt-5.6-sol")
+        XCTAssertEqual(AcpComposerSurface.effortSuffix("GPT-5.6-Sol (max)", values: values)?.base, "GPT-5.6-Sol")
+        XCTAssertEqual(AcpComposerSurface.effortSuffix("sonnet-high", values: values)?.base, "sonnet")
+        XCTAssertNil(AcpComposerSurface.effortSuffix("gpt-highlander", values: values))
+        XCTAssertNil(AcpComposerSurface.effortSuffix("low", values: values), "nothing left of the name")
+    }
+
+    /// The adapter's own `category` decides, so Codex's `collaboration_mode` is
+    /// never mistaken for its `mode` despite the word they share.
+    func testTheDeclaredCategoryDecidesWhichOptionIsTheEffort() {
+        XCTAssertEqual(
+            AcpComposerMetrics.effortOption(CodexFixture.configOptions())?.id,
+            "reasoning_effort"
+        )
+        // No category declared: the wording is the fallback, as before.
+        XCTAssertEqual(
+            AcpComposerMetrics.effortOption([
+                AcpConfigOption(id: "preset", name: "Approval preset", currentValue: "a", choices: []),
+                effortOption,
+            ])?.id,
+            "effort"
+        )
+        XCTAssertNil(AcpComposerMetrics.effortOption([]))
+    }
+
     // MARK: - Submenus
 
     func testModelSubmenuChecksTheCurrentRowAndCaptionsAUsefulIdentifier() {
         let submenu = AcpComposerMenu.modelSubmenu(
-            models: [
-                AcpSessionInfo.Model(id: "gpt-5.6-sol", name: "GPT-5.6-Sol"),
-                AcpSessionInfo.Model(id: "claude-sonnet-4-5-20250929", name: "Sonnet 4.5"),
-            ],
-            currentModelID: "claude-sonnet-4-5-20250929",
+            surface: AcpComposerSurface(
+                models: [
+                    AcpSessionInfo.Model(id: "gpt-5.6-sol", name: "GPT-5.6-Sol"),
+                    AcpSessionInfo.Model(id: "claude-sonnet-4-5-20250929", name: "Sonnet 4.5"),
+                ],
+                currentModelID: "claude-sonnet-4-5-20250929"
+            ),
             favorites: [],
             query: ""
         )
@@ -255,8 +525,7 @@ final class AcpComposerModelTests: XCTestCase {
     /// There is no star column, so nothing about the row says "favourite".
     func testModelSubmenuFloatsFavouritesWithoutMarkingThem() {
         let submenu = AcpComposerMenu.modelSubmenu(
-            models: models,
-            currentModelID: "claude-opus-4-5",
+            surface: AcpComposerSurface(models: models, currentModelID: "claude-opus-4-5"),
             favorites: ["claude-haiku-4-5"],
             query: ""
         )
@@ -266,7 +535,7 @@ final class AcpComposerModelTests: XCTestCase {
 
     func testModelSubmenuStillFiltersOnAQuery() {
         let submenu = AcpComposerMenu.modelSubmenu(
-            models: models, currentModelID: nil, favorites: [], query: "haiku"
+            surface: AcpComposerSurface(models: models), favorites: [], query: "haiku"
         )
         XCTAssertEqual(submenu.options.map(\.name), ["Haiku 4.5"])
     }
@@ -276,8 +545,9 @@ final class AcpComposerModelTests: XCTestCase {
     func testSearchAppearsOnlyBeyondEightOptions() {
         func submenu(count: Int) -> AcpComposerSubmenu {
             AcpComposerMenu.modelSubmenu(
-                models: (1...count).map { AcpSessionInfo.Model(id: "m\($0)", name: "Model \($0)") },
-                currentModelID: nil,
+                surface: AcpComposerSurface(
+                    models: (1...count).map { AcpSessionInfo.Model(id: "m\($0)", name: "Model \($0)") }
+                ),
                 favorites: [],
                 query: ""
             )
@@ -370,8 +640,10 @@ final class AcpComposerModelTests: XCTestCase {
     func testAdvancedStatesWhatTheChipCannotHold() {
         let lines = AcpComposerMenu.advancedLines(
             usage: AcpUsage(used: 12_000, max: 1_000_000),
-            currentModelID: "claude-sonnet-4-5-20250929",
-            models: [AcpSessionInfo.Model(id: "claude-sonnet-4-5-20250929", name: "Sonnet 4.5")]
+            surface: AcpComposerSurface(
+                models: [AcpSessionInfo.Model(id: "claude-sonnet-4-5-20250929", name: "Sonnet 4.5")],
+                currentModelID: "claude-sonnet-4-5-20250929"
+            )
         )
         XCTAssertEqual(lines, ["Context used: 12k of 1M", "Model id: claude-sonnet-4-5-20250929"])
     }
@@ -379,11 +651,13 @@ final class AcpComposerModelTests: XCTestCase {
     /// Nothing to disclose, no disclosure: the row is hidden rather than
     /// opening onto an empty panel.
     func testAdvancedDisappearsWhenThereIsNothingToSay() {
-        XCTAssertTrue(AcpComposerMenu.advancedLines(usage: nil, currentModelID: nil, models: []).isEmpty)
+        XCTAssertTrue(AcpComposerMenu.advancedLines(usage: nil, surface: AcpComposerSurface()).isEmpty)
         XCTAssertTrue(AcpComposerMenu.advancedLines(
             usage: AcpUsage(used: 0, max: 0),
-            currentModelID: "sonnet",
-            models: [AcpSessionInfo.Model(id: "sonnet", name: "Sonnet")]
+            surface: AcpComposerSurface(
+                models: [AcpSessionInfo.Model(id: "sonnet", name: "Sonnet")],
+                currentModelID: "sonnet"
+            )
         ).isEmpty)
     }
 

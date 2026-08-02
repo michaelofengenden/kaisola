@@ -153,6 +153,7 @@
 		962C060B2EF48F35A66AAEDD /* AppModel+Pinning.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6EB61D36CC5BEB88B707C9D7 /* AppModel+Pinning.swift */; };
 		9871B1188DC281FDBF7088AD /* BrokerControlClient.swift in Sources */ = {isa = PBXBuildFile; fileRef = DBB9416285BEDB50CF079DF8 /* BrokerControlClient.swift */; };
 		98882138088B682565342107 /* AcpPermissionRules.swift in Sources */ = {isa = PBXBuildFile; fileRef = DA6828DB9339AA4CAEDA765D /* AcpPermissionRules.swift */; };
+		194ADF6E6ED10853CAE35B89 /* AcpSteering.swift in Sources */ = {isa = PBXBuildFile; fileRef = C4BB834D5E4217C2B66D5CDF /* AcpSteering.swift */; };
 		999ED8CCA027C3B3C2691A18 /* TerminalOptionClickTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3C39FF0D2776D41DC0294227 /* TerminalOptionClickTests.swift */; };
 		99E6D86EF216D99AA0A13755 /* CompanionTerminalControlTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = E438E95AD251C6069A846859 /* CompanionTerminalControlTests.swift */; };
 		9A94CB3A0C12A31A71AB1C92 /* CompanionSettingsTab.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8B3E3C357D3C2EC2452B447B /* CompanionSettingsTab.swift */; };
@@ -487,6 +488,7 @@
 		D917DA578BC63AF251ADA075 /* BrokerGenerationRoutingTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BrokerGenerationRoutingTests.swift; sourceTree = "<group>"; };
 		DA63C78CB95AECCF06926DB8 /* MeshSession.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MeshSession.swift; sourceTree = "<group>"; };
 		DA6828DB9339AA4CAEDA765D /* AcpPermissionRules.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AcpPermissionRules.swift; sourceTree = "<group>"; };
+		C4BB834D5E4217C2B66D5CDF /* AcpSteering.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AcpSteering.swift; sourceTree = "<group>"; };
 		DAF1B7984AA5A644F1BA5BB3 /* CommandPaletteView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CommandPaletteView.swift; sourceTree = "<group>"; };
 		DBB9416285BEDB50CF079DF8 /* BrokerControlClient.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BrokerControlClient.swift; sourceTree = "<group>"; };
 		DCA7D7BB9E3FF610CA333A17 /* QuietIdentityMarkTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = QuietIdentityMarkTests.swift; sourceTree = "<group>"; };
@@ -974,6 +976,7 @@
 				CA7E0A7AF7C58D8926909FDB /* AcpDiff.swift */,
 				F979524745D6648E34835DF3 /* AcpModels.swift */,
 				DA6828DB9339AA4CAEDA765D /* AcpPermissionRules.swift */,
+				C4BB834D5E4217C2B66D5CDF /* AcpSteering.swift */,
 				32406CFD933CD31D2751A8AF /* AcpProcessTransport.swift */,
 				A85A5A6E3A5EC404CB81A0BD /* AcpTerminalHost.swift */,
 				40AFF780B226613EC2DA25AA /* AcpTranscriptRendering.swift */,
@@ -1160,6 +1163,7 @@
 				BFDE2C98C977243CF4E89074 /* AcpDiff.swift in Sources */,
 				BCEE7C4B2655BD5F02B14ABA /* AcpModels.swift in Sources */,
 				98882138088B682565342107 /* AcpPermissionRules.swift in Sources */,
+				194ADF6E6ED10853CAE35B89 /* AcpSteering.swift in Sources */,
 				4552F75BAE695B4A4E2327A3 /* AcpProcessTransport.swift in Sources */,
 				04F51C3955F0C4BD44AE3B81 /* AcpTerminalHost.swift in Sources */,
 				9229A2F4720268663EE8AC09 /* AcpTranscriptRendering.swift in Sources */,

@@ -145,6 +145,14 @@ final class AcpConversation: ObservableObject {
     @Published private(set) var currentModeID: String?
     @Published private(set) var configOptions: [AcpConfigOption] = []
     @Published private(set) var commands: [AcpCommand] = []
+    /// Whether this adapter advertised `_session/steering` at `initialize`.
+    /// Reset on every connect so a swapped agent can never inherit the previous
+    /// one's answer.
+    @Published private(set) var supportsSteering = false
+    /// Queued messages whose `_session/steering` request is still in flight.
+    /// The row stays queued (and un-removable) until the adapter answers, so a
+    /// rejected injection cannot lose it and a double tap cannot send it twice.
+    @Published private(set) var injectingQueuedIDs: Set<String> = []
     @Published var pendingPermission: AcpPermissionRequest?
     @Published private(set) var statusMessage: String?
     /// Follow-up messages typed while a turn was running; each dispatches when
@@ -385,6 +393,7 @@ final class AcpConversation: ObservableObject {
             modes = info.modes
             currentModeID = info.currentModeID
             configOptions = info.configOptions
+            supportsSteering = info.supportsSteering
             isConnected = true
             statusMessage = nil
             // Only entries still in `queued` are known never to have been
@@ -400,6 +409,7 @@ final class AcpConversation: ObservableObject {
             eventConsumerTask = nil
             statusMessage = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
             isConnected = false
+            supportsSteering = false
         }
     }
 
@@ -452,8 +462,12 @@ final class AcpConversation: ObservableObject {
         return true
     }
 
-    /// Drop a still-pending queued follow-up before it dispatches.
+    /// Drop a still-pending queued follow-up before it dispatches. A message
+    /// whose injection is in flight is left alone: the adapter may already have
+    /// taken it, and removing it here would hide a message that is about to
+    /// speak.
     func removeQueued(_ id: String) {
+        guard !injectingQueuedIDs.contains(id) else { return }
         queued.removeAll { $0.id == id }
     }
 
@@ -463,20 +477,66 @@ final class AcpConversation: ObservableObject {
         flushQueue()
     }
 
-    /// Steer: promote a queued follow-up to the front and interrupt the current
-    /// turn so it dispatches now (the cancel ends the turn, and the normal
-    /// turn-end flush sends the promoted message). Idle → dispatches directly.
-    func steerQueued(_ id: String) {
-        guard let index = queued.firstIndex(where: { $0.id == id }) else { return }
-        let message = queued.remove(at: index)
-        if isRunning {
-            queued.insert(message, at: 0)
-            pendingPermission = nil
-            permissionQueue.removeAll()
-            Task { await client.cancel() }
-        } else {
-            dispatch(message.text)
+    /// Whether a queued row may offer the inject action right now. Sending
+    /// mid-turn still queues — this is the per-message escape hatch, and it is
+    /// offered only when it can actually work.
+    var canInjectQueued: Bool {
+        AcpSteering.canInject(
+            supportsSteering: supportsSteering,
+            isConnected: isConnected,
+            isRunning: isRunning
+        )
+    }
+
+    /// Steer: inject ONE queued follow-up into the turn that is running, via
+    /// `_session/steering`. The message stays queued for the whole round trip
+    /// and leaves the queue only once the adapter says it took it, so a refusal
+    /// or a turn that ended first can never lose it.
+    func injectQueued(_ id: String) {
+        guard canInjectQueued,
+              !injectingQueuedIDs.contains(id),
+              let message = queued.first(where: { $0.id == id }) else { return }
+        injectingQueuedIDs.insert(id)
+        let steerClient = client
+        Task { [weak self] in
+            let outcome = await steerClient.steer(message.text)
+            self?.applySteerOutcome(outcome, for: message)
         }
+    }
+
+    private func applySteerOutcome(_ outcome: AcpSteerOutcome, for message: QueuedMessage) {
+        injectingQueuedIDs.remove(message.id)
+        switch AcpSteering.decide(outcome) {
+        case .delivered:
+            queued.removeAll { $0.id == message.id }
+            appendInjectedUserRow(message.text)
+        case let .deliveredAsNewTurn(notice):
+            queued.removeAll { $0.id == message.id }
+            appendInjectedUserRow(message.text)
+            statusMessage = notice
+            ToastCenter.shared.show(notice, style: .info)
+        case let .keptQueued(notice):
+            // Left exactly where it was. `turnEnded` still flushes the queue in
+            // the ordinary way, so a message the adapter would not inject is
+            // sent as its own turn rather than dropped.
+            statusMessage = notice
+            ToastCenter.shared.show(notice, style: .error)
+        }
+        // The turn may have ended while the request was in flight, with the
+        // ordinary flush held back for exactly this message.
+        flushQueue()
+    }
+
+    /// Show an injected message in the transcript at the point in the turn where
+    /// it landed. Neither adapter echoes an injected message back — Claude's
+    /// consumer drops the echo as an unrelated replay, and Codex never surfaces
+    /// live user items — so the row has to be written here. The ledger records
+    /// it so a LATER `session/load` replay of the same message is recognized
+    /// rather than shown a second time.
+    private func appendInjectedUserRow(_ text: String) {
+        turnCounter += 1
+        rows.append(.user(id: "\(turnCounter)", text: text, failed: false))
+        userMessageLedger.recordLocal(text: text)
     }
 
     /// Retry a failed optimistic send: the failed row is replaced by a fresh
@@ -846,6 +906,8 @@ final class AcpConversation: ObservableObject {
         await client.stop()
         isConnected = false
         isRunning = false
+        supportsSteering = false
+        injectingQueuedIDs.removeAll()
         statusMessage = queued.isEmpty
             ? "The agent is stopped."
             : "The agent is stopped. \(queued.count) queued follow-up\(queued.count == 1 ? " is" : "s are") ready to resume."
@@ -1145,6 +1207,8 @@ final class AcpConversation: ObservableObject {
         case let .exited(code):
             isConnected = false
             isRunning = false
+            supportsSteering = false
+            injectingQueuedIDs.removeAll()
             pendingPermission = nil
             permissionQueue.removeAll()
             // Preserve queued user text for inspection/copying. The adapter is
@@ -1158,8 +1222,14 @@ final class AcpConversation: ObservableObject {
     }
 
     /// Dispatch the next queued follow-up after a turn ends.
+    ///
+    /// Held while any injection is still in flight. Otherwise a turn that ends
+    /// inside a `_session/steering` round trip would dispatch the very message
+    /// the adapter is about to inject, and the user would say it twice.
+    /// `applySteerOutcome` flushes again once the answer is in, so a refused
+    /// injection is sent as its own turn immediately afterwards.
     private func flushQueue() {
-        guard !isRunning, isConnected, !queued.isEmpty else { return }
+        guard !isRunning, isConnected, injectingQueuedIDs.isEmpty, !queued.isEmpty else { return }
         let next = queued.removeFirst()
         dispatch(next.text)
     }

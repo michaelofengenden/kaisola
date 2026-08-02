@@ -512,14 +512,22 @@ struct AcpChatView: View {
                     Image(systemName: "clock").font(.caption2).foregroundStyle(.secondary)
                     Text(message.text).font(.caption).lineLimit(1)
                     Spacer()
-                    Button {
-                        conversation.steerQueued(message.id)
-                    } label: {
-                        Image(systemName: "bolt.fill").font(.caption2)
+                    // Offered only while a steering-capable adapter has a turn
+                    // running — the one window in which the request can do what
+                    // the button says. Otherwise this stays a plain queued row.
+                    if conversation.canInjectQueued
+                        || conversation.injectingQueuedIDs.contains(message.id) {
+                        Button {
+                            conversation.injectQueued(message.id)
+                        } label: {
+                            Image(systemName: "bolt.fill").font(.caption2)
+                        }
+                        .buttonStyle(.borderless)
+                        .foregroundStyle(KaisolaStatusTone.needsYou.foregroundColor)
+                        .disabled(conversation.injectingQueuedIDs.contains(message.id))
+                        .help("Steer: send this into the running turn now")
+                        .accessibilityLabel("Steer this queued follow-up into the running turn")
                     }
-                    .buttonStyle(.borderless)
-                    .foregroundStyle(KaisolaStatusTone.needsYou.foregroundColor)
-                    .help("Steer: interrupt the current turn and send this now")
                     Button {
                         conversation.removeQueued(message.id)
                     } label: {
@@ -527,6 +535,7 @@ struct AcpChatView: View {
                     }
                     .buttonStyle(.borderless)
                     .foregroundStyle(.secondary)
+                    .disabled(conversation.injectingQueuedIDs.contains(message.id))
                     .help("Remove this queued follow-up")
                 }
                 .padding(.horizontal, 8).padding(.vertical, 4)

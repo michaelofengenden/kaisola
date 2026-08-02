@@ -169,6 +169,9 @@ struct AcpSessionInfo: Equatable, Sendable {
     var currentModeID: String?
     /// Adapter configuration options (effort levels etc.).
     var configOptions: [AcpConfigOption] = []
+    /// Whether the adapter advertised the `_session/steering` extension, so a
+    /// queued follow-up may be injected into a turn that is already running.
+    var supportsSteering = false
 
     struct Model: Equatable, Sendable, Identifiable {
         let id: String
@@ -216,6 +219,10 @@ struct AcpAgentCapabilities: Equatable, Sendable {
     var resumeSession = false
     var closeSession = false
     var promptQueueing = false
+    /// `InitializeResponse._meta.steering.supported`. Deliberately read from the
+    /// TOP-LEVEL `_meta` (a sibling of `agentCapabilities`, not a member of it),
+    /// which is where both shipping adapters put it.
+    var steering = false
     var mcpHTTP = false
     var mcpSSE = false
     var promptImage = false

@@ -214,7 +214,8 @@ actor AcpClient {
                 currentModelID: modelsNode?["currentModelId"]?.stringValue ?? object["currentModelId"]?.stringValue,
                 modes: modes,
                 currentModeID: modesNode?["currentModeId"]?.stringValue ?? object["currentModeId"]?.stringValue,
-                configOptions: Self.parseConfigOptions(object["configOptions"])
+                configOptions: Self.parseConfigOptions(object["configOptions"]),
+                supportsSteering: capabilities.steering
             )
         } catch {
             // A failed initialize/session-new must not leave a live adapter or a
@@ -308,6 +309,29 @@ actor AcpClient {
         guard let sessionID else { return }
         notify("session/cancel", params: .object(["sessionId": .string(sessionID)]))
         cancelPermissionRequests()
+    }
+
+    /// Inject one message into the turn that is already running, via the
+    /// `_session/steering` extension both adapters advertise. Unlike `prompt`,
+    /// this returns as soon as the adapter has decided what it did with the
+    /// message — the injected message's own output streams through the RUNNING
+    /// turn's `session/update` notifications, not through this response.
+    ///
+    /// Never throws: every failure — no session, a JSON-RPC error, an outcome
+    /// this client does not recognize — comes back as `.rejected`, because the
+    /// caller's only safe response to "we do not know what happened" is to keep
+    /// the message queued.
+    func steer(_ text: String) async -> AcpSteerOutcome {
+        guard let sessionID else { return .rejected(AcpClientError.notRunning.localizedDescription) }
+        do {
+            let result = try await request(
+                AcpSteering.method,
+                params: AcpSteering.requestParams(sessionID: sessionID, text: text)
+            )
+            return AcpSteering.parseOutcome(result)
+        } catch {
+            return .rejected(errorText(error))
+        }
     }
 
     func setModel(_ modelID: String) async {
@@ -966,8 +990,14 @@ actor AcpClient {
 
     // MARK: - Parsing helpers
 
-    private static func parseCapabilities(_ result: JSONValue) -> AcpAgentCapabilities {
+    static func parseCapabilities(_ result: JSONValue) -> AcpAgentCapabilities {
         var caps = AcpAgentCapabilities()
+        // The steering extension is advertised on the response's OWN `_meta`,
+        // beside `agentCapabilities` rather than inside it, so it is read before
+        // (and independently of) the capability block — an adapter that offers
+        // steering without an `agentCapabilities` object still counts.
+        caps.steering = result.objectValue?["_meta"]?.objectValue?["steering"]?
+            .objectValue?["supported"]?.boolValue ?? false
         guard let agent = result.objectValue?["agentCapabilities"]?.objectValue else { return caps }
         caps.loadSession = agent["loadSession"]?.boolValue ?? false
         let session = agent["sessionCapabilities"]?.objectValue

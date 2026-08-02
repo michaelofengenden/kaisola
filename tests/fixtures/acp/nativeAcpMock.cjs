@@ -167,6 +167,49 @@ function replaySessionHistory(session) {
   }
 }
 
+/// The `_session/steering` extension. Outcomes match the two shipping adapters:
+/// `injected` when a turn is running, `promptRequired` when none is and the
+/// client opted into the host-owned idle fallback, `startedNewTurn` otherwise.
+/// Nothing is echoed back for an injected message — neither real adapter does —
+/// so the client is responsible for showing it.
+function handleSteering(id, params) {
+  const session = sessions.get(params && params.sessionId)
+  if (!session) {
+    respondError(id, -32603, 'Session not found')
+    return
+  }
+  const blocks = Array.isArray(params.prompt) ? params.prompt : []
+  if (blocks.length === 0) {
+    respondError(id, -32602, 'steer params require a non-empty prompt array')
+    return
+  }
+  if (process.env.KAISOLA_MOCK_STEERING === 'reject') {
+    respondError(id, -32603, 'Steering refused by the fixture')
+    return
+  }
+  const turns = activeTurns.get(session.sessionId)
+  const running = turns && [...turns].some((turn) => turnIsActive(turn))
+  if (!running) {
+    const idleBehavior = params._meta
+      && params._meta.steering
+      && params._meta.steering.idleBehavior
+    if (idleBehavior === 'promptRequired') {
+      respond(id, { outcome: 'promptRequired', reason: 'noRunningTurn' })
+      return
+    }
+    respond(id, { outcome: 'startedNewTurn' })
+    return
+  }
+  const text = promptText(blocks)
+  session.history.push({ messageId: `mock-msg-${session.nextMessageNumber++}`, text })
+  const turn = [...turns].find((candidate) => turnIsActive(candidate))
+  sessionUpdate(turn, {
+    sessionUpdate: 'agent_message_chunk',
+    content: { type: 'text', text: ` Steered: ${text}.` },
+  })
+  respond(id, { outcome: 'injected' })
+}
+
 function addTurn(turn) {
   let turns = activeTurns.get(turn.sessionId)
   if (!turns) {
@@ -495,6 +538,9 @@ function handleInitialize(id) {
       mcpCapabilities: { http: true },
       _meta: { claudeCode: { promptQueueing: true } },
     },
+    // Top-level `_meta`, a sibling of `agentCapabilities` — where both shipping
+    // adapters advertise the steering extension.
+    _meta: { steering: { supported: process.env.KAISOLA_MOCK_STEERING !== 'off' } },
   })
 }
 
@@ -563,6 +609,8 @@ function dispatch(message) {
     // matching both shipping adapters.
     if (method === 'session/load') replaySessionHistory(session)
     respond(id, sessionResult(session))
+  } else if (method === '_session/steering') {
+    handleSteering(id, params)
   } else if (method === 'session/close') {
     cancelSession(params.sessionId)
     sessions.delete(params.sessionId)

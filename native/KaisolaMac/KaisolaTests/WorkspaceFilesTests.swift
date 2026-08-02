@@ -2613,6 +2613,435 @@ final class WorkspaceFilesTests: XCTestCase {
         )
     }
 
+    /// Replacing the string strips every attribute, so the height available at
+    /// that instant is the *unstyled* height. Restoring a proportion of it
+    /// threw a 90 KB document 15 000 points off its reading position when the
+    /// file changed on disk. The character anchor is what has to survive.
+    func testLiveMarkdownReplacementKeepsAnAnchorThatSurvivesTheIncomingText() {
+        let text = "0123456789"
+        XCTAssertTrue(
+            MarkdownEditorScrollRetention.anchorSurvives(characterIndex: 9, in: text)
+        )
+        XCTAssertFalse(
+            MarkdownEditorScrollRetention.anchorSurvives(characterIndex: 10, in: text)
+        )
+        XCTAssertFalse(
+            MarkdownEditorScrollRetention.anchorSurvives(characterIndex: -1, in: text)
+        )
+        XCTAssertFalse(MarkdownEditorScrollRetention.anchorSurvives(characterIndex: 0, in: ""))
+    }
+
+    // MARK: - Tables rendered in place
+
+    /// A table is only a table when GitHub says so. Re-aligning prose that
+    /// merely contains a pipe, or a `---` that is really a Setext underline,
+    /// would silently change what the document appears to say.
+    func testMarkdownTableRegionsAcceptRealTablesAndRejectLookalikes() {
+        let source = """
+        | Surface | State |
+        | :------ | ----: |
+        | Markdown | Editable |
+        | Terminal | Live |
+
+        Prose with a | pipe in it, and a following line.
+        --- not a delimiter
+
+        ```
+        | Fenced | Table |
+        | ------ | ----- |
+        ```
+
+        | Ragged | Header | Row |
+        | ------ | ------ |
+        """
+        let regions = MarkdownTableRegions.scan(source)
+
+        XCTAssertEqual(regions.count, 1, "only the first block is a GitHub table")
+        let table = try? XCTUnwrap(regions.first)
+        XCTAssertEqual(table?.alignments, [.leading, .trailing])
+        XCTAssertEqual(table?.rows.count, 4)
+        XCTAssertEqual(table?.rows.map(\.kind), [.header, .delimiter, .body, .body])
+        XCTAssertEqual(table?.rows.first?.cells.count, 2)
+        XCTAssertTrue(table?.rows.allSatisfy { $0.hasLeadingPipe && $0.hasTrailingPipe } == true)
+
+        let nsSource = source as NSString
+        XCTAssertEqual(
+            nsSource.substring(with: try! XCTUnwrap(table?.rows[2].cells[1])),
+            "Editable"
+        )
+        XCTAssertEqual(
+            MarkdownTableRegions.delimiterAlignments(in: "| :--- | :--: | ---: | --- |"),
+            [.leading, .center, .trailing, .leading]
+        )
+        XCTAssertNil(MarkdownTableRegions.delimiterAlignments(in: "| a | b |"))
+    }
+
+    /// The heart of the grid: every row's pipes must land on the same x, and
+    /// each column's text must start at the column origin. Proved by replaying
+    /// the planner's own kern deltas across the row, character by character —
+    /// the same advance arithmetic TextKit performs.
+    func testMarkdownTableGeometryLandsEveryRowOnTheSameColumns() throws {
+        let source = """
+        | a | bb |
+        | - | -- |
+        | ccc | d |
+        |x|yy|
+        """
+        let region = try XCTUnwrap(MarkdownTableRegions.scan(source).first)
+        let characterWidth: CGFloat = 7
+        let plan = MarkdownTableGeometry.plan(
+            rows: measuredRows(in: region, characterWidth: characterWidth),
+            alignments: region.alignments,
+            pipeWidth: characterWidth,
+            padding: 10
+        )
+
+        // 1 pipe + 10 pad + max("ccc") 21 + 10 pad + 1 pipe + 10 pad ...
+        XCTAssertEqual(plan.columnWidths, [21, 14])
+        XCTAssertEqual(plan.columnOrigins, [17, 65])
+        XCTAssertEqual(plan.totalWidth, 96)
+
+        var separatorsPerRow: [[CGFloat]] = []
+        for (index, row) in region.rows.enumerated() where row.kind != .delimiter {
+            let replay = replayTableRow(
+                row,
+                plan: plan.rows[index],
+                characterWidth: characterWidth
+            )
+            XCTAssertEqual(
+                replay.contentStarts,
+                plan.columnOrigins,
+                "row \(index) text must begin at the column origin"
+            )
+            XCTAssertEqual(
+                replay.separators,
+                plan.rows[index].separatorPositions,
+                "row \(index) replay must match the planned separators"
+            )
+            separatorsPerRow.append(replay.separators)
+        }
+        XCTAssertEqual(separatorsPerRow.count, 3)
+        XCTAssertEqual(separatorsPerRow[0], [0, 48, 89])
+        for separators in separatorsPerRow {
+            XCTAssertEqual(separators, separatorsPerRow[0], "every row draws the same grid")
+        }
+    }
+
+    func testMarkdownTableGeometryPlacesSlackAheadOfRightAndCentreColumns() throws {
+        let source = """
+        | left | right | mid |
+        | :--- | ----: | :-: |
+        | a | b | c |
+        """
+        let region = try XCTUnwrap(MarkdownTableRegions.scan(source).first)
+        XCTAssertEqual(region.alignments, [.leading, .trailing, .center])
+        let characterWidth: CGFloat = 7
+        let plan = MarkdownTableGeometry.plan(
+            rows: measuredRows(in: region, characterWidth: characterWidth),
+            alignments: region.alignments,
+            pipeWidth: characterWidth,
+            padding: 10
+        )
+        XCTAssertEqual(plan.columnWidths, [28, 35, 21])
+
+        let body = region.rows[2]
+        let replay = replayTableRow(body, plan: plan.rows[2], characterWidth: characterWidth)
+        // "a" is left aligned, "b" is pushed to the right edge of a 35 pt
+        // column, "c" is centred in a 21 pt one.
+        XCTAssertEqual(replay.contentStarts[0], plan.columnOrigins[0])
+        XCTAssertEqual(replay.contentStarts[1], plan.columnOrigins[1] + 28)
+        XCTAssertEqual(replay.contentStarts[2], plan.columnOrigins[2] + 7)
+        XCTAssertEqual(replay.separators, plan.rows[0].separatorPositions)
+    }
+
+    /// The whole reason this is styling rather than a widget: the grid must be
+    /// producible without moving a single byte, including the delimiter row
+    /// that is drawn as a rule.
+    func testMarkdownTableStylingRendersAGridWithoutAlteringDocumentBytes() throws {
+        let source = """
+        # Notes
+
+        | Surface | **State** |
+        | :------ | --------: |
+        | Markdown | Editable |
+
+        ---
+
+        ![shot](assets/backlog/shot.png)
+
+        Trailing CRLF line.\r
+        """
+        let storage = NSTextStorage(string: source)
+        let decorations = styleMarkdown(storage, source: source, availableWidth: 900)
+
+        XCTAssertEqual(storage.string, source, "rendering a table must not touch a byte")
+        XCTAssertTrue(storage.string.contains("| :------ | --------: |"))
+        XCTAssertTrue(storage.string.contains("\r"))
+        XCTAssertTrue(storage.string.contains("![shot](assets/backlog/shot.png)"))
+
+        let nsSource = source as NSString
+        // The pipes stay in the text and become the vertical rules.
+        let pipe = nsSource.range(of: "| Markdown").location
+        XCTAssertEqual(
+            storage.attribute(.foregroundColor, at: pipe, effectiveRange: nil) as? NSColor,
+            MarkdownTableStyle.pipeColor
+        )
+        // Columns were actually aligned: padding carries a kern correction.
+        var kerned = false
+        storage.enumerateAttribute(
+            .kern,
+            in: nsSource.range(of: "| Markdown | Editable |")
+        ) { value, _, _ in
+            if let value = value as? CGFloat, value != 0 { kerned = true }
+        }
+        XCTAssertTrue(kerned, "column alignment is applied as kern on the padding")
+
+        // The delimiter row collapses to a blank strip with a hairline behind
+        // it — but its dashes are still in the document.
+        let delimiter = nsSource.range(of: "| :------ | --------: |").location
+        let delimiterFont = storage.attribute(.font, at: delimiter, effectiveRange: nil) as? NSFont
+        XCTAssertEqual(delimiterFont?.pointSize, MarkdownTableStyle.rulePointSize)
+        XCTAssertEqual(
+            storage.attribute(.foregroundColor, at: delimiter, effectiveRange: nil) as? NSColor,
+            NSColor.clear
+        )
+        XCTAssertTrue(
+            decorations.contains { $0.kind == .rule && $0.characterIndex == delimiter }
+        )
+        XCTAssertTrue(
+            decorations.contains {
+                $0.kind == .fill && $0.characterIndex == nsSource.range(of: "| Surface").location
+            }
+        )
+        // ...and so does the thematic break.
+        let rule = nsSource.range(of: "\n---\n").location + 1
+        XCTAssertTrue(decorations.contains { $0.kind == .rule && $0.characterIndex == rule })
+        XCTAssertTrue(storage.string.contains("\n---\n"))
+    }
+
+    /// A header cell carrying its own emphasis still lands on the column,
+    /// because the grid is measured after the inline pass rather than from the
+    /// raw characters.
+    func testMarkdownTableStylingMeasuresCellsAfterInlineMarkupCollapses() throws {
+        let source = """
+        | Plain | **Bold** |
+        | ----- | -------- |
+        | a | b |
+        """
+        let storage = NSTextStorage(string: source)
+        _ = styleMarkdown(storage, source: source, availableWidth: 900)
+        let nsSource = source as NSString
+
+        // The delimiters really are collapsed inside the cell...
+        let asterisks = nsSource.range(of: "**Bold").location
+        let collapsed = storage.attribute(.font, at: asterisks, effectiveRange: nil) as? NSFont
+        XCTAssertEqual(collapsed?.pointSize, 0.1)
+        // ...and the visible word is still semibold-ish rather than reset.
+        let word = nsSource.range(of: "Bold**").location
+        let bold = storage.attribute(.font, at: word, effectiveRange: nil) as? NSFont
+        XCTAssertGreaterThan(try XCTUnwrap(bold?.pointSize), 1)
+        XCTAssertEqual(storage.string, source)
+    }
+
+    /// A table wider than the pane is left as plain source rather than clipped
+    /// into unreachable columns. It still must not rewrite anything.
+    func testMarkdownTableWiderThanThePaneFallsBackWithoutClippingOrRewriting() throws {
+        let wide = String(repeating: "x", count: 400)
+        let source = """
+        | One | Two |
+        | --- | --- |
+        | \(wide) | \(wide) |
+        """
+        let storage = NSTextStorage(string: source)
+        _ = styleMarkdown(storage, source: source, availableWidth: 320)
+
+        XCTAssertEqual(storage.string, source)
+        var kerned = false
+        storage.enumerateAttribute(
+            .kern,
+            in: NSRange(location: 0, length: storage.length)
+        ) { value, _, _ in
+            if let value = value as? CGFloat, value != 0 { kerned = true }
+        }
+        XCTAssertFalse(kerned, "an unfittable table is not forced onto a grid")
+    }
+
+    func testMarkdownThematicBreaksSkipSetextUnderlinesAndFrontMatter() {
+        let source = """
+        ---
+        title: Front matter
+        ---
+
+        Heading underlined by dashes
+        ---
+
+        ***
+
+        Real break below.
+
+        ---
+        """
+        let nsSource = source as NSString
+        let breaks = MarkdownThematicBreaks.scan(source)
+
+        XCTAssertEqual(breaks.count, 2, "front matter and a Setext underline are not rules")
+        XCTAssertEqual(nsSource.substring(with: breaks[0]), "***")
+        XCTAssertEqual(breaks[1].location, nsSource.range(of: "---", options: .backwards).location)
+    }
+
+    /// Table scanning joins the same 70 ms debounce as everything else, so it
+    /// has to stay far inside the budget on a table-heavy document.
+    func testMarkdownTableScanAndStylingStayWithinInteractionBudget() throws {
+        let block = """
+        ## Section
+
+        | Mechanism | Location | Notes |
+        | :-------- | -------: | :---: |
+        | One | file.swift:12 | kept |
+        | Two | other.swift:44 | replaced |
+
+        """
+        var source = ""
+        while source.utf8.count < 60_000 { source += block }
+
+        let scanStart = CFAbsoluteTimeGetCurrent()
+        let regions = MarkdownTableRegions.scan(source)
+        let breaks = MarkdownThematicBreaks.scan(source)
+        let scanElapsed = CFAbsoluteTimeGetCurrent() - scanStart
+        XCTAssertGreaterThan(regions.count, 20)
+
+        let storage = NSTextStorage(string: source)
+        let applyStart = CFAbsoluteTimeGetCurrent()
+        storage.beginEditing()
+        storage.setAttributes(
+            MarkdownEditingStyle.baseAttributes,
+            range: NSRange(location: 0, length: storage.length)
+        )
+        MarkdownTableStyler.applyTypography(
+            regions: regions,
+            thematicBreaks: breaks,
+            to: storage
+        )
+        _ = MarkdownTableStyler.applyGeometry(
+            regions: regions,
+            thematicBreaks: breaks,
+            to: storage,
+            availableWidth: 900
+        )
+        storage.endEditing()
+        let applyElapsed = CFAbsoluteTimeGetCurrent() - applyStart
+
+        XCTAssertEqual(storage.string, source)
+        XCTAssertLessThan(scanElapsed, 0.35, "table scan took \(scanElapsed)s")
+        XCTAssertLessThan(applyElapsed, 0.30, "table styling took \(applyElapsed)s")
+    }
+
+    // MARK: Table rendering helpers
+
+    /// The production styling pass, minus the text view.
+    private func styleMarkdown(
+        _ storage: NSTextStorage,
+        source: String,
+        availableWidth: CGFloat
+    ) -> [MarkdownInlineImageLayoutManager.Decoration] {
+        let scan = MarkdownLiveStyleScan(source: source)
+        let fullRange = NSRange(location: 0, length: storage.length)
+        storage.beginEditing()
+        storage.setAttributes(MarkdownEditingStyle.baseAttributes, range: fullRange)
+        MarkdownTableStyler.applyTypography(
+            regions: scan.tables,
+            thematicBreaks: scan.thematicBreaks,
+            to: storage
+        )
+        for span in scan.spans where NSMaxRange(span.range) <= fullRange.length {
+            storage.addAttributes(MarkdownEditingStyle.attributes(for: span.role), range: span.range)
+        }
+        let decorations = MarkdownTableStyler.applyGeometry(
+            regions: scan.tables,
+            thematicBreaks: scan.thematicBreaks,
+            to: storage,
+            availableWidth: availableWidth
+        )
+        storage.endEditing()
+        return decorations
+    }
+
+    /// Measured rows built from a synthetic monospaced metric, so the geometry
+    /// can be asserted arithmetically instead of against a rendered font.
+    private func measuredRows(
+        in region: MarkdownTableRegion,
+        characterWidth: CGFloat
+    ) -> [MarkdownTableGeometry.MeasuredRow] {
+        region.rows.map { row in
+            guard row.kind != .delimiter else {
+                return MarkdownTableGeometry.MeasuredRow(
+                    isDelimiter: true,
+                    hasLeadingPipe: row.hasLeadingPipe,
+                    cells: [],
+                    trailingPipe: nil
+                )
+            }
+            let cells = row.cells.enumerated().map { index, content -> MarkdownTableGeometry.MeasuredCell in
+                let preceding = row.precedingPipe(ofCell: index)
+                let gapStart = preceding.map { $0 + 1 } ?? row.lineRange.location
+                let leadingGap = NSRange(
+                    location: gapStart,
+                    length: max(0, content.location - gapStart)
+                )
+                let gapEnd = row.followingPipe(ofCell: index) ?? NSMaxRange(row.lineRange)
+                let trailingGap = NSRange(
+                    location: NSMaxRange(content),
+                    length: max(0, gapEnd - NSMaxRange(content))
+                )
+                return MarkdownTableGeometry.MeasuredCell(
+                    content: content,
+                    contentWidth: CGFloat(content.length) * characterWidth,
+                    leadingGap: leadingGap,
+                    leadingGapWidth: CGFloat(leadingGap.length) * characterWidth,
+                    trailingGap: trailingGap,
+                    trailingGapWidth: CGFloat(trailingGap.length) * characterWidth,
+                    precedingPipe: preceding
+                )
+            }
+            return MarkdownTableGeometry.MeasuredRow(
+                isDelimiter: false,
+                hasLeadingPipe: row.hasLeadingPipe,
+                cells: cells,
+                trailingPipe: row.trailingPipe
+            )
+        }
+    }
+
+    /// Walk the row exactly as TextKit does — natural advance plus this
+    /// character's kern — and report where the pipes and the cell text land.
+    private func replayTableRow(
+        _ row: MarkdownTableRow,
+        plan: MarkdownTableGeometry.RowPlan,
+        characterWidth: CGFloat
+    ) -> (separators: [CGFloat], contentStarts: [CGFloat]) {
+        var kern: [Int: CGFloat] = [:]
+        for adjustment in plan.adjustments {
+            for index in adjustment.range.location..<NSMaxRange(adjustment.range) {
+                kern[index, default: 0] += adjustment.kern
+            }
+        }
+        var starts: [Int: Int] = [:]
+        for (column, cell) in row.cells.enumerated() where starts[cell.location] == nil {
+            starts[cell.location] = column
+        }
+        let pipes = Set(row.pipes)
+
+        var x = plan.headIndent
+        var separators: [CGFloat] = []
+        var contentStarts: [CGFloat] = []
+        for index in row.lineRange.location..<NSMaxRange(row.lineRange) {
+            if pipes.contains(index) { separators.append(x) }
+            if starts[index] != nil { contentStarts.append(x) }
+            x += characterWidth + (kern[index] ?? 0)
+        }
+        return (separators, contentStarts)
+    }
+
     func testMarkdownEditingStyleFindsDocumentSemanticsWithoutRewritingSource() {
         let source = """
         # Heading

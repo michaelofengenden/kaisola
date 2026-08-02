@@ -403,6 +403,82 @@ struct MarkdownTableSourceCell: Equatable, Sendable {
 /// cosmetic padding are not part of the editable range, so changing one cell
 /// cannot reformat the table or normalize the document's line endings.
 enum MarkdownTableSource {
+    /// Where a single table line's pipes and cells actually are.
+    ///
+    /// The continuous editor styles a table by kerning the padding that already
+    /// sits between these pipes, so it needs the separators as well as the cell
+    /// content — the same scan the block editor used for exact-range writes.
+    struct LineLayout: Equatable, Sendable {
+        /// Whitespace-trimmed content range of each cell, local to the line.
+        let cells: [NSRange]
+        /// Every unescaped `|` in the line, local to the line.
+        let pipes: [Int]
+        let hasLeadingPipe: Bool
+        let hasTrailingPipe: Bool
+    }
+
+    static func layout(of line: String) -> LineLayout {
+        let value = line as NSString
+        guard value.length > 0 else {
+            return LineLayout(cells: [], pipes: [], hasLeadingPipe: false, hasTrailingPipe: false)
+        }
+        var delimiters: [Int] = []
+        var backslashes = 0
+        for index in 0..<value.length {
+            let character = value.character(at: index)
+            if character == 0x5C {
+                backslashes += 1
+                continue
+            }
+            if character == 0x7C, backslashes.isMultiple(of: 2) {
+                delimiters.append(index)
+            }
+            backslashes = 0
+        }
+
+        func isWhitespace(_ character: unichar) -> Bool {
+            character == 0x20 || character == 0x09
+        }
+        var firstContent = 0
+        while firstContent < value.length, isWhitespace(value.character(at: firstContent)) {
+            firstContent += 1
+        }
+        var lastContent = value.length
+        while lastContent > firstContent, isWhitespace(value.character(at: lastContent - 1)) {
+            lastContent -= 1
+        }
+        let hasLeadingPipe = delimiters.first == firstContent
+        // One lone `|` is both the first and the last delimiter; it can only be
+        // one of the two, or the caller would kern the same character twice.
+        let hasTrailingPipe = delimiters.last == lastContent - 1
+            && !(hasLeadingPipe && delimiters.count == 1)
+        var separators = delimiters
+        var cellStart = 0
+        if hasLeadingPipe, let leading = separators.first {
+            cellStart = leading + 1
+            separators.removeFirst()
+        }
+        let cellEnd = hasTrailingPipe ? (separators.last ?? value.length) : value.length
+        if hasTrailingPipe, !separators.isEmpty { separators.removeLast() }
+
+        var cells: [NSRange] = []
+        for separator in separators + [cellEnd] {
+            guard separator >= cellStart else { continue }
+            var start = cellStart
+            var end = separator
+            while start < end, isWhitespace(value.character(at: start)) { start += 1 }
+            while end > start, isWhitespace(value.character(at: end - 1)) { end -= 1 }
+            cells.append(NSRange(location: start, length: end - start))
+            cellStart = separator + 1
+        }
+        return LineLayout(
+            cells: cells,
+            pipes: delimiters,
+            hasLeadingPipe: hasLeadingPipe,
+            hasTrailingPipe: hasTrailingPipe
+        )
+    }
+
     static func values(in line: String) -> [String] {
         localCellRanges(in: line).map { range in
             decodeCell((line as NSString).substring(with: range))
@@ -470,55 +546,7 @@ enum MarkdownTableSource {
     }
 
     private static func localCellRanges(in line: String) -> [NSRange] {
-        let value = line as NSString
-        guard value.length > 0 else { return [] }
-        var delimiters: [Int] = []
-        var backslashes = 0
-        for index in 0..<value.length {
-            let character = value.character(at: index)
-            if character == 0x5C {
-                backslashes += 1
-                continue
-            }
-            if character == 0x7C, backslashes.isMultiple(of: 2) {
-                delimiters.append(index)
-            }
-            backslashes = 0
-        }
-
-        func isWhitespace(_ character: unichar) -> Bool {
-            character == 0x20 || character == 0x09
-        }
-        var firstContent = 0
-        while firstContent < value.length, isWhitespace(value.character(at: firstContent)) {
-            firstContent += 1
-        }
-        var lastContent = value.length
-        while lastContent > firstContent, isWhitespace(value.character(at: lastContent - 1)) {
-            lastContent -= 1
-        }
-        let hasLeadingPipe = delimiters.first == firstContent
-        let hasTrailingPipe = delimiters.last == lastContent - 1
-        var separators = delimiters
-        var cellStart = 0
-        if hasLeadingPipe, let leading = separators.first {
-            cellStart = leading + 1
-            separators.removeFirst()
-        }
-        let cellEnd = hasTrailingPipe ? (separators.last ?? value.length) : value.length
-        if hasTrailingPipe, !separators.isEmpty { separators.removeLast() }
-
-        var ranges: [NSRange] = []
-        for separator in separators + [cellEnd] {
-            guard separator >= cellStart else { continue }
-            var start = cellStart
-            var end = separator
-            while start < end, isWhitespace(value.character(at: start)) { start += 1 }
-            while end > start, isWhitespace(value.character(at: end - 1)) { end -= 1 }
-            ranges.append(NSRange(location: start, length: end - start))
-            cellStart = separator + 1
-        }
-        return ranges
+        layout(of: line).cells
     }
 
     private static func decodeCell(_ source: String) -> String {

@@ -24,6 +24,7 @@
 		111953CC1CF47CB697278109 /* TerminalTranscriptView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 172FA557F42248FF6A752716 /* TerminalTranscriptView.swift */; };
 		1155D48BA0F2FA048D963A3E /* FilePreviewView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 502B709E629F1098130633B7 /* FilePreviewView.swift */; };
 		120DB3BB674B60C5B51F0F44 /* AppAccountView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5F2770649BEF99AA932FFBDF /* AppAccountView.swift */; };
+		127BE781A9EC6DD430FEA31F /* MarkdownTableRendering.swift in Sources */ = {isa = PBXBuildFile; fileRef = F0BA033A578D32686122F7B3 /* MarkdownTableRendering.swift */; };
 		12EAB0BC4C613FF5DF4FF4FF /* McpConfigStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = FDE152F4457B8AF7E5A92225 /* McpConfigStore.swift */; };
 		137B0B37E2B58DE72AC839A2 /* QuietIdentityMarkTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = DCA7D7BB9E3FF610CA333A17 /* QuietIdentityMarkTests.swift */; };
 		1402D69DCC56FF170B7E18A4 /* QuietStatusClockTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = C04010C4C83AE322453E2F1F /* QuietStatusClockTests.swift */; };
@@ -499,6 +500,7 @@
 		EDCF271FCBDC7AAEACD59129 /* KaisolaProductMigrationTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KaisolaProductMigrationTests.swift; sourceTree = "<group>"; };
 		EEC8E541404472EF4F2F17A4 /* CommandRegistryTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CommandRegistryTests.swift; sourceTree = "<group>"; };
 		F07359E5FCD9B5DF4E23DE50 /* PlanUsageSnapshotStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PlanUsageSnapshotStore.swift; sourceTree = "<group>"; };
+		F0BA033A578D32686122F7B3 /* MarkdownTableRendering.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MarkdownTableRendering.swift; sourceTree = "<group>"; };
 		F415566C0592DEBE80C0A642 /* CommandRegistry.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CommandRegistry.swift; sourceTree = "<group>"; };
 		F45BCF775EB8D43CFD1BFE2E /* FuzzyMatchTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FuzzyMatchTests.swift; sourceTree = "<group>"; };
 		F4C9DE8414FD78B1EFA06235 /* CustomAgentStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CustomAgentStore.swift; sourceTree = "<group>"; };
@@ -610,6 +612,7 @@
 				D2D6020A7FBF1683EB7484D0 /* MarkdownAssets.swift */,
 				C5828E934026DD96C9C6A1A9 /* MarkdownLiveEditor.swift */,
 				9286E9EFA45E3FEE67AEB1E3 /* MarkdownPreview.swift */,
+				F0BA033A578D32686122F7B3 /* MarkdownTableRendering.swift */,
 				995477C896372B075A7640B8 /* QuickActionsBar.swift */,
 				6D76F5FBB1B68291847A102F /* QuickActionStore.swift */,
 				3F83577979FF0B2A400B8F40 /* SourceOutline.swift */,
@@ -1208,6 +1211,7 @@
 				5E7F7A75F43B6ED23B0A0C71 /* MarkdownAssets.swift in Sources */,
 				94907F0CD6A85638D2CB1420 /* MarkdownLiveEditor.swift in Sources */,
 				BDE65F12928C19D4C1D19381 /* MarkdownPreview.swift in Sources */,
+				127BE781A9EC6DD430FEA31F /* MarkdownTableRendering.swift in Sources */,
 				12EAB0BC4C613FF5DF4FF4FF /* McpConfigStore.swift in Sources */,
 				D5863CCBBD41F0FD1FA9C2C5 /* McpSettingsTab.swift in Sources */,
 				89C7CC13ADA6A74DA94F405B /* MeshSession.swift in Sources */,

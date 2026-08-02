@@ -219,6 +219,19 @@ enum MarkdownEditorScrollRetention {
         let fraction = min(1, max(0, previousOrigin / previousScrollable))
         return min(newScrollable, fraction * newScrollable)
     }
+
+    /// Whether the character that was at the top of the viewport still exists
+    /// in the incoming text.
+    ///
+    /// A pixel or proportional restore is measured against the *unstyled*
+    /// height of a freshly replaced string — headings at body size, table rows
+    /// uncollapsed — so it lands thousands of points away on a long document.
+    /// Restoring the same character instead is only meaningful while that
+    /// character is still there, which is exactly the case that matters:
+    /// reconciling an external edit of the file already open.
+    static func anchorSurvives(characterIndex: Int, in text: String) -> Bool {
+        characterIndex >= 0 && characterIndex < (text as NSString).length
+    }
 }
 
 // MARK: - Inline image layout
@@ -242,10 +255,29 @@ final class MarkdownInlineImageLayoutManager: NSLayoutManager {
         let alt: String
     }
 
+    /// Chrome drawn behind a whole line: the header band of a table, or the
+    /// hairline that a `|---|` delimiter row and a `---` break render as.
+    ///
+    /// Anchored to a character index rather than a rectangle, so it follows the
+    /// line it belongs to through reflow, zoom, and every edit above it — and
+    /// so the delimiter row can *look* like a rule while its dashes stay in the
+    /// document exactly as typed.
+    struct Decoration: Equatable {
+        enum Kind: Equatable {
+            case rule
+            case fill
+        }
+
+        let characterIndex: Int
+        let width: CGFloat
+        let kind: Kind
+    }
+
     /// Vertical breathing room drawn around an image line.
     static let verticalPadding: CGFloat = 10
 
     private(set) var placements: [Placement] = []
+    private(set) var decorations: [Decoration] = []
     private var placementsByLocation: [Int: Placement] = [:]
 
     func setPlacements(_ placements: [Placement]) {
@@ -254,6 +286,10 @@ final class MarkdownInlineImageLayoutManager: NSLayoutManager {
             placements.map { ($0.range.location, $0) },
             uniquingKeysWith: { first, _ in first }
         )
+    }
+
+    func setDecorations(_ decorations: [Decoration]) {
+        self.decorations = decorations
     }
 
     /// The tallest image whose reference starts inside `characterRange`.
@@ -266,7 +302,12 @@ final class MarkdownInlineImageLayoutManager: NSLayoutManager {
     }
 
     override func drawBackground(forGlyphRange glyphsToShow: NSRange, at origin: NSPoint) {
+        // Fills go under everything, including the selection highlight and any
+        // `.backgroundColor` run `super` paints, so a selected table header
+        // still reads as selected.
+        drawDecorations(.fill, forGlyphRange: glyphsToShow, at: origin)
         super.drawBackground(forGlyphRange: glyphsToShow, at: origin)
+        drawDecorations(.rule, forGlyphRange: glyphsToShow, at: origin)
         guard !placements.isEmpty else { return }
         let characterRange = self.characterRange(forGlyphRange: glyphsToShow, actualGlyphRange: nil)
 
@@ -296,6 +337,45 @@ final class MarkdownInlineImageLayoutManager: NSLayoutManager {
                 )
                 draw(candidate, in: rect)
                 x += candidate.size.width + 8
+            }
+        }
+    }
+
+    private func drawDecorations(
+        _ kind: Decoration.Kind,
+        forGlyphRange glyphsToShow: NSRange,
+        at origin: NSPoint
+    ) {
+        guard decorations.contains(where: { $0.kind == kind }) else { return }
+        let characterRange = self.characterRange(forGlyphRange: glyphsToShow, actualGlyphRange: nil)
+        for decoration in decorations
+        where decoration.kind == kind
+            && NSLocationInRange(decoration.characterIndex, characterRange) {
+            let glyphIndex = self.glyphIndexForCharacter(at: decoration.characterIndex)
+            guard glyphIndex < numberOfGlyphs else { continue }
+            let fragment = lineFragmentRect(
+                forGlyphAt: glyphIndex,
+                effectiveRange: nil,
+                withoutAdditionalLayout: true
+            )
+            let x = fragment.minX + origin.x
+            switch kind {
+            case .fill:
+                MarkdownTableStyle.headerFill.setFill()
+                NSRect(
+                    x: x,
+                    y: fragment.minY + origin.y,
+                    width: decoration.width,
+                    height: fragment.height
+                ).fill()
+            case .rule:
+                MarkdownTableStyle.ruleColor.setFill()
+                NSRect(
+                    x: x,
+                    y: (fragment.midY + origin.y - MarkdownTableStyle.ruleThickness / 2).rounded(),
+                    width: decoration.width,
+                    height: MarkdownTableStyle.ruleThickness
+                ).fill()
             }
         }
     }

@@ -913,9 +913,20 @@ struct GlassBackdropWash: Equatable, Sendable {
     /// luminance range 0.019, against 0.218 before). The wallpaper bake now
     /// luminance-normalizes too, so that 40% arrives at a predictable
     /// brightness whatever the desktop is — see `DesktopBackdropRenderer`.
+    /// v1.1.10 thins the **dark** veil and widens its gradient; light is
+    /// untouched, because light was never the complaint.
+    ///
+    /// Dark was the least translucent surface in the app — 0.35–0.40
+    /// transmission against light's 0.40–0.45 — and it read exactly as that:
+    /// "the background in dark mode looks bad… needs to be really glass dark…
+    /// glassy/smooth/translucent to the wallpaper". Modelled against the actual
+    /// desktop (an Aerial still), the surface's luminance spread p5..p95 was
+    /// 0.060 and the veil's own top-to-bottom range 0.0144 — half of light's
+    /// 0.0283. Thinner veil, wider gradient: spread 0.072, gradient 0.0165, and
+    /// primary/secondary label contrast still 12.8:1 / 6.0:1.
     static func sidebar(isDark: Bool) -> GlassBackdropWash {
         isDark
-            ? dark(top: 0.55, base: 0.60, bottom: 0.66)
+            ? dark(top: 0.48, base: 0.55, bottom: 0.63)
             : light(top: 0.66, base: 0.60, bottom: 0.56)
     }
 
@@ -930,7 +941,7 @@ struct GlassBackdropWash: Equatable, Sendable {
     /// near-black in dark mode.
     static func workspace(isDark: Bool) -> GlassBackdropWash {
         isDark
-            ? dark(top: 0.60, base: 0.65, bottom: 0.71)
+            ? dark(top: 0.51, base: 0.58, bottom: 0.66)
             : light(top: 0.61, base: 0.55, bottom: 0.51)
     }
 
@@ -1432,7 +1443,51 @@ enum DesktopBackdropRenderer {
     /// toward a material of its own, and the warmth it loses is put back
     /// deliberately and in one known hue by `GlassWarmth` rather than being
     /// borrowed from whatever picture is on the desktop.
-    static let saturation: Double = 0.85
+    ///
+    /// This is now the *ceiling* rather than the value: see
+    /// `saturation(mean:isDark:)`, which is where the dark cast was.
+    static let saturationCeiling: Double = 0.85
+
+    /// The chroma that actually reaches a baked still — and the fix for
+    /// "the background in dark mode looks… purple/blue".
+    ///
+    /// The bake normalized luminance and left chroma alone, and those two
+    /// cannot be separated at near-black. `CIColorControls.brightness` is a
+    /// straight per-channel offset (that is exactly why `luminanceShift` uses
+    /// it), so it preserves the still's **absolute** channel differences while
+    /// moving its mean. In light that is harmless: the still is lifted to 0.72
+    /// and the same absolute spread is a small fraction of it. In dark the
+    /// still is crushed to 0.16 and the identical spread becomes most of the
+    /// surface.
+    ///
+    /// Measured end to end against the real desktop (an Aerial still, average
+    /// rgb 0.263/0.476/0.576, so a genuinely blue picture), using the *same*
+    /// relative measure `testDeclaredNeutralConstantsAreAchromatic` applies to
+    /// anything this app calls neutral — the largest per-channel departure from
+    /// the mean, over the mean:
+    ///
+    ///     light sidebar composite  0.834/0.898/0.927 → 0.059 off-neutral
+    ///     dark  sidebar composite  0.055/0.114/0.143 → 0.473 off-neutral
+    ///
+    /// The dark surface was 8× further from neutral than the light one, and —
+    /// the part that makes it a bug rather than a taste — **further from
+    /// neutral than the desktop it was sampling** (0.400). That is the same
+    /// failure the v1.1.8 note describes for the sidebar, surviving in dark
+    /// only: glass more colourful than the wallpaper it imitates.
+    ///
+    /// So chroma is normalized the way luminance already is. Scaling the
+    /// still's saturation by `target / mean` keeps its chroma the same
+    /// *fraction* of its luminance that the desktop's chroma was of the
+    /// desktop's, which makes the composite's off-neutrality a roughly fixed
+    /// multiple of the desktop's own whatever the desktop is: **1.0–1.3×
+    /// before, 0.5–0.7× after**. The measured dark composite becomes
+    /// 0.078/0.106/0.119 — 0.229 off-neutral, cool but no longer coloured, and
+    /// with red back at 65% of blue instead of 38%. Light is unchanged for
+    /// every wallpaper dimmer than the 0.72 target, which is nearly all of them.
+    static func saturation(mean: Double, isDark: Bool) -> Double {
+        let target = targetLuminance(isDark: isDark)
+        return saturationCeiling * min(1, target / max(mean, 0.02))
+    }
 
     /// Mean luminance the baked still is moved to, per appearance.
     ///
@@ -1495,14 +1550,23 @@ enum DesktopBackdropRenderer {
         let mean = pixels.flatMap { DesktopTintSampler.meanLuminance(rgba: $0) }
             ?? targetLuminance(isDark: key.isDark)
         let brightness = luminanceShift(mean: mean, isDark: key.isDark)
-        guard let blurred = blur(still, brightness: brightness) else { return .flat(tint) }
+        let saturation = saturation(mean: mean, isDark: key.isDark)
+        guard let blurred = blur(
+            still,
+            brightness: brightness,
+            saturation: saturation
+        ) else { return .flat(tint) }
         return .wallpaper(blurred, tint: tint)
     }
 
     /// `clampedToExtent` before the blur, cropped back after: without it the
     /// Gaussian averages in transparent black at every edge and the backdrop
     /// arrives with a dark vignette exactly where the window's corners are.
-    private static func blur(_ image: CGImage, brightness: Double) -> CGImage? {
+    private static func blur(
+        _ image: CGImage,
+        brightness: Double,
+        saturation: Double
+    ) -> CGImage? {
         let input = CIImage(cgImage: image)
         let extent = input.extent
 
@@ -1511,8 +1575,11 @@ enum DesktopBackdropRenderer {
         gaussian.radius = Float(blurRadius)
         guard let softened = gaussian.outputImage else { return nil }
 
-        // Both corrections ride the one `CIColorControls` pass already in the
-        // chain, so luminance normalization costs no extra filter.
+        // Both normalizations ride the one `CIColorControls` pass already in
+        // the chain, so neither costs an extra filter. Saturation is applied
+        // about the pixel's own luminance and brightness is the offset after
+        // it, which is why the two have to be solved together rather than
+        // treating the chroma as a fixed constant — see `saturation(mean:isDark:)`.
         let controls = CIFilter.colorControls()
         controls.inputImage = softened
         controls.saturation = Float(saturation)
@@ -1882,13 +1949,29 @@ enum GlassWarmth {
     static let green = 176.0 / 255
     static let blue = 112.0 / 255
 
-    /// Coverage, in both appearances.
-    ///
-    /// Deliberately one number. A per-appearance split reads as a tuning knob
-    /// and invites drift; the still underneath is already luminance-normalized
-    /// (see `DesktopBackdropRenderer.targetLuminance`), so the same coverage
-    /// lands on comparable ground in light and dark.
+    /// Coverage in light, and the number the dark one is derived from.
     static let opacity = 0.04
+
+    /// Coverage per appearance.
+    ///
+    /// This used to be one number, on the argument that the still underneath is
+    /// luminance-normalized so the same coverage lands on comparable ground in
+    /// both appearances. That argument is wrong, and in the same way the
+    /// saturation constant was wrong: the still is normalized to 0.72 in light
+    /// and 0.16 in dark, a 4.5× difference, and this amber's own luminance is
+    /// 0.738. At 4% it lifts a light still by ~0.001 of its luminance and a
+    /// dark still by ~0.019 — nineteen times the relative perturbation, in a
+    /// hue directly opposite the cool cast the dark surface already had, which
+    /// is what turned "blue" into "purple". Coverage therefore scales with the
+    /// luminance of the surface it lands on: 4% at 0.72, 0.89% at 0.16.
+    ///
+    /// It is still a declared amber and still not zero — a warm hint that
+    /// survives its own neutrality audit rather than a layer quietly deleted.
+    static func opacity(isDark: Bool) -> Double {
+        let light = DesktopBackdropRenderer.targetLuminance(isDark: false)
+        let target = DesktopBackdropRenderer.targetLuminance(isDark: isDark)
+        return opacity * (target / light)
+    }
 
     static var color: Color { Color(red: red, green: green, blue: blue) }
 }
@@ -1968,7 +2051,7 @@ struct DesktopGlassLayer: View {
                 // the veil. Over, so the desaturated wallpaper is what it warms
                 // rather than the other way round; under, because the veil is
                 // what decides how much of this whole composite arrives.
-                .overlay(GlassWarmth.color.opacity(GlassWarmth.opacity))
+                .overlay(GlassWarmth.color.opacity(GlassWarmth.opacity(isDark: colorScheme == .dark)))
                 .allowsHitTesting(false)
         case let .flat(tint):
             let color = Color(red: tint.red, green: tint.green, blue: tint.blue)
@@ -1983,7 +2066,7 @@ struct DesktopGlassLayer: View {
             .background(Color(nsColor: .windowBackgroundColor))
             // The no-wallpaper rung gets the same warmth, so the two paths do
             // not read as two different materials.
-            .overlay(GlassWarmth.color.opacity(GlassWarmth.opacity))
+            .overlay(GlassWarmth.color.opacity(GlassWarmth.opacity(isDark: colorScheme == .dark)))
         }
     }
 }

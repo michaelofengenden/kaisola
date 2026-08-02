@@ -499,13 +499,44 @@ final class NativePreviewSettingsTests: XCTestCase {
             XCTAssertEqual(recipe.blue, 13.0 / 255, accuracy: 0.0001)
         }
 
-        // The headline coverage. 0.60 in both appearances: frost, not a pane.
-        // Two earlier eras both missed, in opposite directions — 0.32/0.44 over
-        // near-opaque vibrancy passed no desktop colour at all, and the 0.16
-        // that replaced it was calibrated against vibrancy but ended up over a
-        // *painted wallpaper*, which passes everything.
+        // The headline coverage: frost, not a pane. Two earlier eras both
+        // missed, in opposite directions — 0.32/0.44 over near-opaque vibrancy
+        // passed no desktop colour at all, and the 0.16 that replaced it was
+        // calibrated against vibrancy but ended up over a *painted wallpaper*,
+        // which passes everything.
         XCTAssertEqual(GlassBackdropWash.sidebar(isDark: false).baseOpacity, 0.60, accuracy: 0.0001)
-        XCTAssertEqual(GlassBackdropWash.sidebar(isDark: true).baseOpacity, 0.60, accuracy: 0.0001)
+        // Dark is thinner than light now, and deliberately so: it used to be
+        // the least translucent surface in the app (0.40 transmission against
+        // light's 0.40 on the sidebar and 0.45 on the workspace), which is what
+        // "the background in dark mode looks bad… needs to be glassy/smooth/
+        // translucent to the wallpaper" was describing.
+        XCTAssertEqual(GlassBackdropWash.sidebar(isDark: true).baseOpacity, 0.55, accuracy: 0.0001)
+        XCTAssertGreaterThan(
+            GlassBackdropWash.sidebar(isDark: true).desktopTransmission,
+            GlassBackdropWash.sidebar(isDark: false).desktopTransmission
+        )
+    }
+
+    /// Dark's gradient carried half the light direction light's did — 0.0144 of
+    /// modelled top-to-bottom luminance against 0.0283 — which is the other
+    /// half of "flat". The veil's span is what expresses that, so it is the
+    /// thing asserted.
+    func testDarkVeilCarriesAsMuchLightDirectionAsLight() {
+        for name in ["sidebar", "workspace"] {
+            let light = name == "sidebar"
+                ? GlassBackdropWash.sidebar(isDark: false)
+                : GlassBackdropWash.workspace(isDark: false)
+            let dark = name == "sidebar"
+                ? GlassBackdropWash.sidebar(isDark: true)
+                : GlassBackdropWash.workspace(isDark: true)
+            let lightSpan = abs(light.topOpacity - light.bottomOpacity)
+            let darkSpan = abs(dark.topOpacity - dark.bottomOpacity)
+            XCTAssertGreaterThanOrEqual(
+                darkSpan,
+                lightSpan,
+                "\(name): the dark veil has less light direction in it than the light one"
+            )
+        }
     }
 
     /// The contract the frost retune exists to hold, and it is two-sided.
@@ -1053,46 +1084,124 @@ final class NativePreviewSettingsTests: XCTestCase {
         // what this test is really for — the bake must never boost again — and
         // the floor keeps the cut from sliding toward a greyscale still, which
         // would make the whole painted-wallpaper layer pointless.
-        XCTAssertEqual(DesktopBackdropRenderer.saturation, 0.85, accuracy: 0.0001)
-        XCTAssertLessThanOrEqual(DesktopBackdropRenderer.saturation, 1.0)
-        XCTAssertGreaterThan(DesktopBackdropRenderer.saturation, 0.6)
+        XCTAssertEqual(DesktopBackdropRenderer.saturationCeiling, 0.85, accuracy: 0.0001)
+        XCTAssertLessThanOrEqual(DesktopBackdropRenderer.saturationCeiling, 1.0)
+        XCTAssertGreaterThan(DesktopBackdropRenderer.saturationCeiling, 0.6)
+
+        // In light the ceiling is what ships for any wallpaper dimmer than the
+        // 0.72 target, which is nearly all of them.
+        for mean in [0.20, 0.35, 0.50, 0.70] {
+            XCTAssertEqual(
+                DesktopBackdropRenderer.saturation(mean: mean, isDark: false),
+                DesktopBackdropRenderer.saturationCeiling,
+                accuracy: 0.0001
+            )
+        }
     }
 
-    /// The warmth is a SEPARATE, DECLARED constant, and that is the point.
+    /// The dark cast, stated as the invariant that was missing.
     ///
-    /// `testDeclaredNeutralConstantsAreAchromatic` is what caught the
-    /// `#0B0C12` blue-purple cast, and the only safe way to add warmth without
-    /// weakening it is to keep every "neutral" honest and put the chroma
-    /// somewhere that says out loud that it is chroma. `GlassWarmth` is that
-    /// place, it is deliberately absent from the neutrals list over there, and
-    /// this is the test that stops it from becoming a licence to drift: it has
-    /// to stay an amber, and it has to stay barely there.
-    func testGlassWarmthIsADeclaredAmber() {
-        // Warm means red leads and blue trails. Anything else is a different
-        // decision wearing this constant's name.
-        XCTAssertGreaterThan(GlassWarmth.red, GlassWarmth.green)
-        XCTAssertGreaterThan(GlassWarmth.green, GlassWarmth.blue)
+    /// `luminanceShift` is additive — deliberately, so it moves the mean
+    /// without touching channel *differences* — which means the bake normalized
+    /// brightness and left chroma exactly where the wallpaper had it. In light
+    /// the still is lifted to 0.72 and that absolute chroma is a small fraction
+    /// of it; in dark it is crushed to 0.16 and the identical chroma is most of
+    /// the surface. Measured on the real desktop, the dark composite came out
+    /// 0.473 off-neutral against light's 0.059 — and against the desktop's own
+    /// 0.400, i.e. glass more colourful than the wallpaper it imitates.
+    ///
+    /// The fix scales chroma by the same ratio the luminance moves by, so the
+    /// composite's off-neutrality is a fixed multiple of the desktop's own
+    /// whatever the desktop is. That multiple is what this pins.
+    func testDarkBakeNormalizesChromaTheWayItNormalizesLuminance() {
+        /// Largest per-channel departure from the mean over the mean — the same
+        /// measure `testDeclaredNeutralConstantsAreAchromatic` uses.
+        func offNeutral(_ channels: [Double]) -> Double {
+            let mean = channels.reduce(0, +) / Double(channels.count)
+            guard mean > 0 else { return 0 }
+            return channels.map { abs($0 - mean) / mean }.max() ?? 0
+        }
 
-        // …in the amber/orange band, not red and not yellow. Hue in degrees,
-        // computed the standard way from the max/min channels.
-        let maximum = max(GlassWarmth.red, GlassWarmth.green, GlassWarmth.blue)
-        let minimum = min(GlassWarmth.red, GlassWarmth.green, GlassWarmth.blue)
-        let delta = maximum - minimum
-        XCTAssertGreaterThan(delta, 0, "a warm layer with no chroma is not a warm layer")
-        let hue = 60 * ((GlassWarmth.green - GlassWarmth.blue) / delta)
-        XCTAssertGreaterThan(hue, 15, "that is red, not warmth")
-        XCTAssertLessThan(hue, 45, "that is yellow, not warmth")
+        /// One wallpaper, all the way to the eye: normalize, warm, veil.
+        /// `saturation`/`warmth`/`base` are parameters so the release this
+        /// replaces can be reproduced with the same arithmetic rather than
+        /// described in a comment.
+        func composite(
+            wallpaper: [Double],
+            saturation: Double,
+            warmth: Double,
+            base: Double,
+            veil: [Double]
+        ) -> [Double] {
+            let mean = wallpaper[0] * 0.2126 + wallpaper[1] * 0.7152 + wallpaper[2] * 0.0722
+            let shift = DesktopBackdropRenderer.luminanceShift(mean: mean, isDark: true)
+            let still = wallpaper.map { mean + ($0 - mean) * saturation + shift }
+            let amber = [GlassWarmth.red, GlassWarmth.green, GlassWarmth.blue]
+            let warmed = zip(still, amber).map { $0 * (1 - warmth) + $1 * warmth }
+            return zip(warmed, veil).map { $0 * (1 - base) + $1 * base }
+        }
 
-        // A high-value amber: at a few percent coverage a dark tint pulls the
-        // composite toward grey-brown instead of toward warm.
-        XCTAssertGreaterThan(GlassWarmth.red, 0.9)
+        let wash = GlassBackdropWash.sidebar(isDark: true)
+        let darkVeil = [wash.red, wash.green, wash.blue]
 
-        // And it stays a hint. The ceiling is the whole safety argument — at 8%
-        // this stops being warmth and starts being a tint, which is the thing
-        // the neutrality invariant exists to prevent.
-        XCTAssertEqual(GlassWarmth.opacity, 0.04, accuracy: 0.0001)
-        XCTAssertLessThan(GlassWarmth.opacity, 0.08)
-        XCTAssertGreaterThan(GlassWarmth.opacity, 0.02, "deleted in all but name")
+        // Michael's actual desktop: an Aerial still averaging a decidedly blue
+        // 0.263/0.476/0.576. Plus a magenta and a green, so the guarantee is not
+        // a property of one picture.
+        for wallpaper in [[0.263, 0.476, 0.576], [0.62, 0.21, 0.58], [0.18, 0.44, 0.21]] {
+            let mean = wallpaper[0] * 0.2126 + wallpaper[1] * 0.7152 + wallpaper[2] * 0.0722
+            let desktop = offNeutral(wallpaper)
+
+            let shipped = offNeutral(composite(
+                wallpaper: wallpaper,
+                saturation: DesktopBackdropRenderer.saturation(mean: mean, isDark: true),
+                warmth: GlassWarmth.opacity(isDark: true),
+                base: wash.baseOpacity,
+                veil: darkVeil
+            ))
+            // v1.1.9: chroma unscaled, warmth at the light coverage, veil 0.60.
+            let before = offNeutral(composite(
+                wallpaper: wallpaper,
+                saturation: DesktopBackdropRenderer.saturationCeiling,
+                warmth: GlassWarmth.opacity,
+                base: 0.60,
+                veil: darkVeil
+            ))
+
+            XCTAssertGreaterThan(
+                before,
+                desktop,
+                "the regression this fixes is that the dark glass out-saturated the desktop"
+            )
+            XCTAssertLessThan(
+                shipped,
+                desktop,
+                "the dark glass is still more off-neutral than the desktop it samples: \(wallpaper)"
+            )
+            // Roughly wallpaper-independent, which is the point of normalizing
+            // at all: before, the multiple sat at 1.0–1.3 and the surface's
+            // colour was whatever the desktop happened to be.
+            XCTAssertEqual(shipped / desktop, 0.60, accuracy: 0.10, "for \(wallpaper)")
+        }
+    }
+
+    /// The warmth is derived per appearance now, and the derivation is the
+    /// point: a fixed 4% of a 0.738-luminance amber is a nineteen-times larger
+    /// relative perturbation on a still normalized to 0.16 than on one
+    /// normalized to 0.72, in a hue opposite the cool cast — which is how
+    /// "blue" became "purple".
+    func testGlassWarmthCoverageTracksTheSurfaceItLandsOn() {
+        XCTAssertEqual(GlassWarmth.opacity(isDark: false), GlassWarmth.opacity, accuracy: 0.0001)
+        let ratio = DesktopBackdropRenderer.targetLuminance(isDark: true)
+            / DesktopBackdropRenderer.targetLuminance(isDark: false)
+        XCTAssertEqual(
+            GlassWarmth.opacity(isDark: true),
+            GlassWarmth.opacity * ratio,
+            accuracy: 0.0001
+        )
+        // Still there. A layer scaled to zero is a layer deleted, and the whole
+        // argument for a declared amber is that it says out loud that it exists.
+        XCTAssertGreaterThan(GlassWarmth.opacity(isDark: true), 0.005)
+        XCTAssertLessThan(GlassWarmth.opacity(isDark: true), GlassWarmth.opacity(isDark: false))
     }
 
     /// Gaussians compose by variance, so raising the radius from 12 to 28 adds

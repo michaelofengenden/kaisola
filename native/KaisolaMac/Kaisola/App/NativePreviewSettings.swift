@@ -1556,19 +1556,80 @@ extension DesktopPainting: Equatable {
 /// is roughly two orders of magnitude less work than blurring the backing
 /// store, and the upscale is a second, free smoothing pass.
 enum DesktopBackdropRenderer {
-    static let stillWidth = 176
-    /// Radius in `stillWidth` pixels. Enough that no wallpaper detail survives
-    /// as a recognisable shape — this has to read as light, not as a picture.
+    /// Working resolution of the bake, and the fix for "glass picks up the
+    /// colour of the wallpaper but not the **vibe**".
     ///
-    /// Raised from 12 with the frost retune. At 12 the still is soft but not
-    /// shapeless: on a 176×110 thumbnail the wallpaper's large features still
-    /// resolve as a bloom the eye reads as *a place in a photograph*. Composing
-    /// two Gaussians adds their variances, so going to 28 lays another
-    /// `sqrt(28² − 12²) ≈ 25` still-pixels of blur over the old result — a
-    /// quarter of the thumbnail's height, which leaves a left-to-right colour
-    /// story and no locatable shape. The cost is unchanged in practice: this is
-    /// 176px once per wallpaper, not the backing store per frame.
-    static let blurRadius: Double = 28
+    /// It was 176. That was ample while the blur was destroying every
+    /// mid-frequency in the picture anyway — the still was a colour field, so
+    /// how faithfully it sampled the wallpaper's *shapes* did not matter. Once
+    /// `blurFraction` lets those shapes through it matters a great deal, and the
+    /// measurement is unambiguous. Baking each of this Mac's aerial extremes at
+    /// several widths and correlating the result against a 1024px reference,
+    /// both reduced to a common 128×128 grid:
+    ///
+    ///     176 px → 0.841      384 px → 0.910      640 px → 0.975
+    ///     256 px → 0.861      448 px → 0.932
+    ///
+    /// At 176 px **16% of the structure the surface shows is not the
+    /// wallpaper's** — it is the thumbnail decode's own aliasing, promoted to
+    /// visible texture the moment the blur stopped hiding it. 448 takes that to
+    /// 7% for about +2 ms of decode, and the still it caches is 451 KB.
+    ///
+    /// Resolution is deliberately *not* the lever that produces detail — the
+    /// detail metric is flat in it, because what the eye sees is set by the blur
+    /// as a **fraction of the frame**, not by the pixel count. Raising it only
+    /// buys fidelity of the structure `blurFraction` chose to keep.
+    static let stillWidth = 448
+
+    /// The blur, as a fraction of `stillWidth` — the constant that actually
+    /// decides whether the surface is a colour field or frosted glass.
+    ///
+    /// It was 28 px on a 176 px still: **15.9%** of the frame. That is a blur
+    /// wide enough to reduce any wallpaper to about six distinguishable masses
+    /// across its whole width, which is why the shipped surface measured
+    /// `spread ≈ gradient` on every fixture — *all* of its luminance range was
+    /// the veil's own top-to-bottom gradient and none of it was the picture.
+    /// Michael's note is exactly that distinction: "glass wallpaper should pick
+    /// up the **vibe** of the wallpaper as well, like **washed details**".
+    ///
+    /// 5% leaves roughly twenty masses across the frame: a horizon, a shoreline,
+    /// the shape of a cloud bank read as soft washes, with nothing identifiable.
+    /// The old note's requirement — "no locatable shape" — is kept; what changes
+    /// is that "no locatable shape" and "no shape at all" turn out to be two
+    /// different radii, and the bake had been sitting on the second one.
+    ///
+    /// Lowering this alone would be the regression the previous three rounds
+    /// each fixed a version of: more range reaching the veil is exactly what the
+    /// contrast floors cannot afford. It is affordable here only because the cap
+    /// underneath it moved from a *proxy* to the real quantity — see
+    /// `tailHeadroom(isDark:)`.
+    static let blurFraction: Double = 0.05
+
+    /// Radius in `stillWidth` pixels.
+    static var blurRadius: Double { Double(stillWidth) * blurFraction }
+
+    /// A local-contrast add-back, applied to the blurred still before the tone
+    /// map — the "compress the global range, keep the local one" half of the
+    /// change stated as one filter.
+    ///
+    /// An unsharp mask adds `intensity × (image − blur(image))`: a **zero-mean**
+    /// mid-frequency residual. It therefore raises the contrast *within* a
+    /// neighbourhood without moving the still's mean, and what it does move —
+    /// the extremes — is measured immediately afterwards and paid for by the
+    /// gain. So this cannot smuggle range past the legibility cap; it can only
+    /// change how that range is spent, which is the whole point.
+    ///
+    /// The radius is set relative to the blur so the band restored is the one
+    /// just above what the blur removed rather than a fixed pixel size that
+    /// would mean something different at every `stillWidth`.
+    ///
+    /// 0.6 rather than more: at 1.0 the worst-patch secondary in dark falls back
+    /// to the shipped 4.51 and stops improving, and past ~1.8 the upscale to the
+    /// surface starts ringing — measured, the dark worst patch drops to 4.32,
+    /// *below* the 4.5 floor, which the still-side cap cannot see because the
+    /// overshoot is created by the interpolation and not by the bake.
+    static let localContrastRadiusFactor: Double = 1.4
+    static let localContrastIntensity: Double = 0.6
     /// A slight saturation *cut*.
     ///
     /// This was 1.3, from the era when a heavy veil ate most of the desktop's
@@ -1766,16 +1827,66 @@ enum DesktopBackdropRenderer {
     static let lightStillSpreadCeiling: Double = 0.26
 
     /// The widest luminance range a baked still may carry, per appearance.
+    ///
+    /// Retained as the *declared* bound the two veil ceilings are priced
+    /// against; the gain is no longer solved from it. See
+    /// `tailHeadroom(isDark:)` for what replaced it and why.
     static func stillSpreadCeiling(isDark: Bool) -> Double {
         isDark ? darkStillSpreadCeiling : lightStillSpreadCeiling
     }
 
-    /// The gain `CIColorControls.contrast` is set to, from the still's measured
-    /// p5..p95 spread. Never above 1: a wallpaper with less range than the
-    /// ceiling is passed through exactly as it was, so this only ever *removes*
-    /// an excess and can never manufacture contrast the desktop does not have.
-    static func rangeGain(spread: Double, isDark: Bool) -> Double {
-        min(1, stillSpreadCeiling(isDark: isDark) / max(spread, 0.01))
+    /// How far above (dark) or below (light) `targetLuminance` the baked still's
+    /// **worst patch** may sit — and the constant that makes room for the
+    /// texture without spending a point of legibility.
+    ///
+    /// The p5..p95 cap this replaces was a *proxy*. Every contrast floor in this
+    /// file is measured on the worst patch — the mean of the brightest 2% of the
+    /// surface in dark, the darkest 2% in light — and a percentile band by
+    /// construction says nothing about the tail outside it. Rendering the
+    /// shipped pipeline over this Mac's aerial extremes and the ramp fixtures
+    /// shows how loose the proxy was: the still's tail excursion ranged from
+    /// 0.027 to **0.151** while every one of those stills sat inside the 0.30
+    /// p5..p95 ceiling. The worst wallpaper on the machine (`A92E4A3F`, box
+    /// spread 0.856) landed at 4.52:1 secondary against the 4.5 floor — the
+    /// margin was **0.02**, and nothing in the bake knew.
+    ///
+    /// Capping the tail instead is both exact and one division. The tone map is
+    /// affine — `out = (in − mean)·gain + target` — so
+    ///
+    ///     out(tail) − target = (tail − mean) · gain
+    ///
+    /// and bounding the left side is solving for the gain directly:
+    /// `gain = min(1, headroom / |tail − mean|)`. The quantity the floor is
+    /// stated in is now the quantity the bake controls, for every wallpaper
+    /// rather than for the p5..p95 of one.
+    ///
+    /// **0.145 dark / 0.124 light** are the shipped pipeline's own worst
+    /// excursions (0.151 and 0.131), taken a step under. So the surface's worst
+    /// case cannot be worse than the worst case that already shipped — and for
+    /// every *other* wallpaper it is now bounded by the same number instead of
+    /// being left wherever the picture happened to put it. Measured across the
+    /// six real aerial extremes and the six ramp fixtures, on both surfaces, the
+    /// worst patch improves in both appearances: dark 4.52 → **4.55**, light
+    /// 3.43 → **3.44**, primary 8.29 → **8.38** and 9.05 → **9.16**.
+    ///
+    /// That is what pays for `blurFraction`. Three rounds in a row found that
+    /// letting more of the wallpaper through costs contrast the floors do not
+    /// have; this one tightens the cap onto the exact quantity at issue first,
+    /// and spends the slack on structure.
+    static let darkTailHeadroom: Double = 0.145
+    static let lightTailHeadroom: Double = 0.124
+
+    static func tailHeadroom(isDark: Bool) -> Double {
+        isDark ? darkTailHeadroom : lightTailHeadroom
+    }
+
+    /// The gain `CIColorControls.contrast` is set to, from the distance between
+    /// the baked structure's mean and its worst patch. Never above 1: a
+    /// wallpaper whose worst patch is already inside the headroom is passed
+    /// through exactly as it was, so this only ever *removes* an excess and can
+    /// never manufacture contrast the desktop does not have.
+    static func tailGain(excursion: Double, isDark: Bool) -> Double {
+        min(1, tailHeadroom(isDark: isDark) / max(excursion, 0.001))
     }
 
     /// Mean luminance the baked still is moved to, per appearance.
@@ -1839,28 +1950,12 @@ enum DesktopBackdropRenderer {
             options as CFDictionary
         ) else { return nil }
 
-        // One 16×16 box draw serves both products. The mean is taken from the
-        // *unblurred* thumbnail, which costs nothing and is the same number: a
-        // Gaussian with `clampedToExtent` edges preserves the image mean, so
-        // blurring first would only move the measurement later.
-        let pixels = DesktopTintSampler.pixels(image: still)
-        let tint = pixels.flatMap { DesktopTintSampler.wallpaperAverage(rgba: $0) }
+        // The tint is the wallpaper's own average and so is read from the raw
+        // thumbnail, unchanged.
+        let tint = DesktopTintSampler.pixels(image: still)
+            .flatMap { DesktopTintSampler.wallpaperAverage(rgba: $0) }
             ?? DesktopTintSampler.fallback
-        let mean = pixels.flatMap { DesktopTintSampler.meanLuminance(rgba: $0) }
-            ?? targetLuminance(isDark: key.isDark)
-        // The range cap reads the same 16×16 reduction the mean does, so
-        // bounding the still's dynamic range costs no extra decode and no extra
-        // draw — one box, three products.
-        let spread = pixels.flatMap { DesktopTintSampler.luminanceSpread(rgba: $0) } ?? 0
-        let gain = rangeGain(spread: spread, isDark: key.isDark)
-        let brightness = luminanceShift(mean: mean, isDark: key.isDark, gain: gain)
-        let saturation = saturation(mean: mean, isDark: key.isDark, gain: gain)
-        guard let blurred = blur(
-            still,
-            brightness: brightness,
-            saturation: saturation,
-            gain: gain
-        ) else { return .flat(tint) }
+        guard let blurred = blur(still, isDark: key.isDark) else { return .flat(tint) }
         return .wallpaper(blurred, tint: tint)
     }
 
@@ -1907,44 +2002,81 @@ enum DesktopBackdropRenderer {
     /// default.
     static let bakeColorSpace = CGColorSpace(name: CGColorSpace.sRGB)
 
+    /// Structure first, then measure, then tone-map.
+    ///
+    /// The order is the change. The bake used to solve its gain and offset from
+    /// a 16×16 box of the *source* thumbnail and then apply them blind, which
+    /// meant every constant was stated about a picture the veil never actually
+    /// saw — a proxy two blurs removed from the surface. It now builds the
+    /// structure it intends to show, renders that once, measures the two
+    /// quantities the guarantees are written in (its mean, and its worst patch),
+    /// and solves the tone map against those. The normalization stops being an
+    /// estimate and becomes arithmetic.
+    ///
     /// `clampedToExtent` before the blur, cropped back after: without it the
     /// Gaussian averages in transparent black at every edge and the backdrop
     /// arrives with a dark vignette exactly where the window's corners are.
-    private static func blur(
-        _ image: CGImage,
-        brightness: Double,
-        saturation: Double,
-        gain: Double
-    ) -> CGImage? {
+    private static func blur(_ image: CGImage, isDark: Bool) -> CGImage? {
         let input = CIImage(cgImage: image)
         let extent = input.extent
-
-        let gaussian = CIFilter.gaussianBlur()
-        gaussian.inputImage = input.clampedToExtent()
-        gaussian.radius = Float(blurRadius)
-        guard let softened = gaussian.outputImage else { return nil }
-
-        // All three normalizations ride the one `CIColorControls` pass already
-        // in the chain, so none costs an extra filter. The filter evaluates
-        // saturation, then contrast about 0.5, then brightness — measured, not
-        // assumed — which is why chroma, range and mean have to be solved
-        // together rather than treated as three independent constants. See
-        // `saturation(mean:isDark:gain:)`, `rangeGain(spread:isDark:)` and
-        // `luminanceShift(mean:isDark:gain:)`.
-        let controls = CIFilter.colorControls()
-        controls.inputImage = softened
-        controls.saturation = Float(saturation)
-        controls.contrast = Float(gain)
-        controls.brightness = Float(brightness)
-        guard let output = controls.outputImage else { return nil }
 
         var options: [CIContextOption: Any] = [.useSoftwareRenderer: false]
         // See `bakeColorSpace`. Falls through to the default working space only
         // if the system cannot vend sRGB, which is the pre-v1.1.10 behaviour —
         // degraded, not broken.
         if let bakeColorSpace { options[.workingColorSpace] = bakeColorSpace }
-        return CIContext(options: options).createCGImage(output, from: extent)
+        let context = CIContext(options: options)
+
+        let gaussian = CIFilter.gaussianBlur()
+        gaussian.inputImage = input.clampedToExtent()
+        gaussian.radius = Float(blurRadius)
+        guard let softened = gaussian.outputImage else { return nil }
+
+        // The local-contrast add-back. Zero-mean by construction, so it changes
+        // how the still's range is distributed and not how much of it there is —
+        // and whatever it does to the extremes is measured on the very next
+        // line and paid for by the gain.
+        let unsharp = CIFilter.unsharpMask()
+        unsharp.inputImage = softened
+        unsharp.radius = Float(blurRadius * localContrastRadiusFactor)
+        unsharp.intensity = Float(localContrastIntensity)
+        guard let structured = unsharp.outputImage,
+              let probe = context.createCGImage(structured, from: extent),
+              let sampled = DesktopTintSampler.pixels(image: probe, side: probeSide)
+        else { return nil }
+
+        let mean = DesktopTintSampler.meanLuminance(rgba: sampled)
+            ?? targetLuminance(isDark: isDark)
+        let tail = DesktopTintSampler.worstPatchLuminance(rgba: sampled, isDark: isDark) ?? mean
+        let gain = tailGain(excursion: abs(tail - mean), isDark: isDark)
+        let brightness = luminanceShift(mean: mean, isDark: isDark, gain: gain)
+        let saturation = saturation(mean: mean, isDark: isDark, gain: gain)
+
+        // All three normalizations ride the one `CIColorControls` pass already
+        // in the chain, so none costs an extra filter. The filter evaluates
+        // saturation, then contrast about 0.5, then brightness — measured, not
+        // assumed — which is why chroma, range and mean have to be solved
+        // together rather than treated as three independent constants. See
+        // `saturation(mean:isDark:gain:)`, `tailGain(excursion:isDark:)` and
+        // `luminanceShift(mean:isDark:gain:)`.
+        let controls = CIFilter.colorControls()
+        controls.inputImage = structured
+        controls.saturation = Float(saturation)
+        controls.contrast = Float(gain)
+        controls.brightness = Float(brightness)
+        guard let output = controls.outputImage else { return nil }
+        return context.createCGImage(output, from: extent)
     }
+
+    /// Side of the square reduction the bake measures its own structure on.
+    ///
+    /// 96 rather than the tint's 16: the worst patch is a 2% tail, and 256
+    /// samples put only five pixels in it — enough for a mean but not for a
+    /// stable one. 9216 samples put 184 there. It is also fine enough to still
+    /// contain the mid-frequency band `blurFraction` keeps, which a 16×16
+    /// reduction averages away completely — measuring the tail on that box would
+    /// reintroduce exactly the proxy this replaced.
+    static let probeSide = 96
 }
 
 struct DesktopTintComponents: Equatable, Sendable {
@@ -1989,8 +2121,7 @@ enum DesktopTintSampler {
     /// The 16×16 box reduction both the tint and the bake's luminance
     /// normalization read, exposed so one decode produces both instead of
     /// drawing the same image twice.
-    static func pixels(image: CGImage) -> [UInt8]? {
-        let side = 16
+    static func pixels(image: CGImage, side: Int = 16) -> [UInt8]? {
         var pixels = [UInt8](repeating: 0, count: side * side * 4)
         let drew = pixels.withUnsafeMutableBytes { bytes -> Bool in
             guard let context = CGContext(
@@ -2016,6 +2147,36 @@ enum DesktopTintSampler {
     static func meanLuminance(rgba: [UInt8]) -> Double? {
         guard let average = plainAverage(rgba: rgba) else { return nil }
         return average.0 * 0.2126 + average.1 * 0.7152 + average.2 * 0.0722
+    }
+
+    /// Mean luminance of the extreme 2% band — the brightest in dark, the
+    /// darkest in light.
+    ///
+    /// This is the still-side twin of the worst patch every contrast floor in
+    /// this app is measured on, and it is what the bake's cap is solved against.
+    /// A percentile *band* (p5..p95) deliberately excludes the tail; the tail is
+    /// precisely where white text on dark glass is hardest to read, so the
+    /// quantity the guarantee is written in has to be the quantity the bake
+    /// bounds. See `DesktopBackdropRenderer.tailHeadroom(isDark:)`.
+    static func worstPatchLuminance(rgba: [UInt8], isDark: Bool) -> Double? {
+        var lumas: [Double] = []
+        lumas.reserveCapacity(rgba.count / 4)
+        var index = 0
+        while index + 3 < rgba.count {
+            if Double(rgba[index + 3]) / 255 > 0.05 {
+                lumas.append(
+                    Double(rgba[index]) / 255 * 0.2126
+                        + Double(rgba[index + 1]) / 255 * 0.7152
+                        + Double(rgba[index + 2]) / 255 * 0.0722
+                )
+            }
+            index += 4
+        }
+        guard lumas.count >= 50 else { return nil }
+        lumas.sort()
+        let count = max(1, lumas.count / 50)
+        let band = isDark ? lumas.suffix(count) : lumas.prefix(count)
+        return band.reduce(0, +) / Double(count)
     }
 
     /// The wallpaper's p5..p95 luminance range, read from the same box the mean

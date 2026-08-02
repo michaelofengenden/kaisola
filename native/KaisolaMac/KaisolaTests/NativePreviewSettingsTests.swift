@@ -1551,6 +1551,78 @@ final class NativePreviewSettingsTests: XCTestCase {
         )
     }
 
+    /// Separable box blur, three passes ≈ a Gaussian. Radius in surface pixels.
+    private func boxBlurred(_ plane: [Double], width: Int, height: Int, radius: Int) -> [Double] {
+        var buffer = plane
+        var scratch = [Double](repeating: 0, count: plane.count)
+        let denominator = Double(2 * radius + 1)
+        for _ in 0..<3 {
+            for y in 0..<height {
+                let row = y * width
+                var accumulator = 0.0
+                for x in -radius...radius {
+                    accumulator += buffer[row + min(max(x, 0), width - 1)]
+                }
+                for x in 0..<width {
+                    scratch[row + x] = accumulator / denominator
+                    accumulator += buffer[row + min(max(x + radius + 1, 0), width - 1)]
+                        - buffer[row + min(max(x - radius, 0), width - 1)]
+                }
+            }
+            for x in 0..<width {
+                var accumulator = 0.0
+                for y in -radius...radius {
+                    accumulator += scratch[min(max(y, 0), height - 1) * width + x]
+                }
+                for y in 0..<height {
+                    buffer[y * width + x] = accumulator / denominator
+                    accumulator += scratch[min(max(y + radius + 1, 0), height - 1) * width + x]
+                        - scratch[min(max(y - radius, 0), height - 1) * width + x]
+                }
+            }
+        }
+        return buffer
+    }
+
+    /// **The detail metric**: RMS of the high-pass residual of a rendered
+    /// surface's luminance — "how much of the wallpaper's *texture* is in the
+    /// glass", as distinct from how much of its colour or its overall gradient.
+    ///
+    /// This is the measurement the round-7 ask needed and no previous round had.
+    /// Every existing metric here — transmission, composite rgb, luminance
+    /// spread, chroma — is satisfied by a surface that is a single smooth
+    /// gradient, and that is exactly what the bake was producing: measured on
+    /// the shipped pipeline, `spread` and `gradient` agreed to three decimals on
+    /// every fixture, meaning **all** of the surface's luminance range was the
+    /// veil's own top-to-bottom ramp and none of it was the picture. "It picks
+    /// up the colour but not the vibe" is that identity, in words.
+    ///
+    /// Subtracting a heavily blurred copy leaves only what varies *within* a
+    /// neighbourhood, so the veil's full-surface gradient contributes nothing
+    /// and a wallpaper's shapes, horizon and cloud masses contribute everything.
+    /// A radius of 32 on a 900px surface rejects anything slower than about a
+    /// ninth of the surface, which is well clear of the veil.
+    private func localDetail(_ pixels: [UInt8], width: Int, height: Int) -> Double {
+        var plane = [Double](repeating: 0, count: width * height)
+        for index in 0..<(width * height) {
+            let pixel = index * 4
+            plane[index] = Double(pixels[pixel]) / 255 * 0.2126
+                + Double(pixels[pixel + 1]) / 255 * 0.7152
+                + Double(pixels[pixel + 2]) / 255 * 0.0722
+        }
+        let low = boxBlurred(plane, width: width, height: height, radius: 32)
+        var sum = 0.0
+        var sumSquares = 0.0
+        for index in 0..<plane.count {
+            let residual = plane[index] - low[index]
+            sum += residual
+            sumSquares += residual * residual
+        }
+        let count = Double(plane.count)
+        let mean = sum / count
+        return max(0, sumSquares / count - mean * mean).squareRoot()
+    }
+
     /// p5..p95 luminance spread of a rendered surface — "how much of the
     /// wallpaper's light and shade is in the glass", which is what "translucent"
     /// means once brightness has been normalized away.
@@ -1758,6 +1830,225 @@ final class NativePreviewSettingsTests: XCTestCase {
         XCTAssertGreaterThanOrEqual(
             inked(0.60), 4.5,
             "a custom α0.60 ink no longer buys the floor; the follow-up needs re-deriving"
+        )
+    }
+
+    /// A wallpaper with the mid-frequency structure a photograph has — a
+    /// horizon, soft masses, two octaves of large-scale texture — around the
+    /// same base and range as the matching ramp fixture.
+    ///
+    /// The ramps cannot serve here and that is the point: a linear ramp passes a
+    /// Gaussian untouched, which makes it the right adversarial fixture for a
+    /// *range* cap and a useless one for a *detail* metric, because it has no
+    /// detail to carry. Every fixture in this file until now was blur-invariant,
+    /// which is precisely why nothing noticed the glass had no texture in it.
+    private func writeStructuredWallpaper(
+        base: (Double, Double, Double),
+        range: Double,
+        into directory: URL,
+        named name: String
+    ) throws -> URL {
+        let side = 768
+        var pixels = [UInt8](repeating: 255, count: side * side * 4)
+        func value(_ nx: Double, _ ny: Double) -> Double {
+            var value = (1 - range / 2) + range * ny
+            // A horizon: a soft step across the frame.
+            value += range * 0.22 * (1 / (1 + exp(-(ny - 0.58) * 46)) - 0.5)
+            // Three soft masses — headland, cloud bank, haze.
+            func mass(_ cx: Double, _ cy: Double, _ rx: Double, _ ry: Double, _ amplitude: Double)
+                -> Double {
+                let dx = (nx - cx) / rx
+                let dy = (ny - cy) / ry
+                return amplitude * exp(-(dx * dx + dy * dy) * 2.2)
+            }
+            value += range * mass(0.26, 0.72, 0.30, 0.20, 0.30)
+            value += range * mass(0.74, 0.44, 0.34, 0.16, -0.26)
+            value += range * mass(0.52, 0.18, 0.22, 0.13, 0.20)
+            value += range * 0.075 * sin(nx * 7.3 + ny * 3.1) * cos(ny * 5.9 - nx * 2.2)
+            value += range * 0.035 * sin(nx * 15.7 - ny * 11.3) * cos(ny * 13.1 + nx * 6.5)
+            return max(0, value)
+        }
+        for y in 0..<side {
+            let ny = Double(y) / Double(side - 1)
+            for x in 0..<side {
+                let nx = Double(x) / Double(side - 1)
+                let scale = value(nx, ny)
+                let index = (y * side + x) * 4
+                pixels[index] = UInt8(min(255, max(0, base.0 * scale * 255)))
+                pixels[index + 1] = UInt8(min(255, max(0, base.1 * scale * 255)))
+                pixels[index + 2] = UInt8(min(255, max(0, base.2 * scale * 255)))
+            }
+        }
+        var image: CGImage?
+        pixels.withUnsafeMutableBytes { bytes in
+            image = CGContext(
+                data: bytes.baseAddress, width: side, height: side, bitsPerComponent: 8,
+                bytesPerRow: side * 4, space: CGColorSpaceCreateDeviceRGB(),
+                bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+            )?.makeImage()
+        }
+        let url = directory.appending(path: "\(name).png")
+        let destination = try XCTUnwrap(CGImageDestinationCreateWithURL(
+            url as CFURL, "public.png" as CFString, 1, nil
+        ))
+        CGImageDestinationAddImage(destination, try XCTUnwrap(image), nil)
+        XCTAssertTrue(CGImageDestinationFinalize(destination))
+        return url
+    }
+
+    /// The bake exactly as it shipped before round 7 — 176px still, radius 28,
+    /// gain solved from a 16×16 box's p5..p95 against the declared spread
+    /// ceiling. Frozen here as the reference the detail metric is measured
+    /// against, the same way the veil tests keep the previous veil's opacities.
+    private func bakeAsShippedBeforeRound7(_ url: URL, isDark: Bool) -> CGImage? {
+        guard let source = CGImageSourceCreateWithURL(url as CFURL, nil),
+              let still = CGImageSourceCreateThumbnailAtIndex(source, 0, [
+                  kCGImageSourceCreateThumbnailFromImageAlways: true,
+                  kCGImageSourceCreateThumbnailWithTransform: true,
+                  kCGImageSourceThumbnailMaxPixelSize: 176,
+              ] as CFDictionary),
+              let box = DesktopTintSampler.pixels(image: still),
+              let mean = DesktopTintSampler.meanLuminance(rgba: box)
+        else { return nil }
+        let spread = DesktopTintSampler.luminanceSpread(rgba: box) ?? 0
+        let gain = min(
+            1, DesktopBackdropRenderer.stillSpreadCeiling(isDark: isDark) / max(spread, 0.01)
+        )
+        let input = CIImage(cgImage: still)
+        let gaussian = CIFilter.gaussianBlur()
+        gaussian.inputImage = input.clampedToExtent()
+        gaussian.radius = 28
+        guard let softened = gaussian.outputImage else { return nil }
+        let controls = CIFilter.colorControls()
+        controls.inputImage = softened
+        controls.saturation = Float(
+            DesktopBackdropRenderer.saturation(mean: mean, isDark: isDark, gain: gain)
+        )
+        controls.contrast = Float(gain)
+        controls.brightness = Float(
+            DesktopBackdropRenderer.luminanceShift(mean: mean, isDark: isDark, gain: gain)
+        )
+        guard let output = controls.outputImage else { return nil }
+        var options: [CIContextOption: Any] = [.useSoftwareRenderer: false]
+        if let space = DesktopBackdropRenderer.bakeColorSpace {
+            options[.workingColorSpace] = space
+        }
+        return CIContext(options: options).createCGImage(output, from: input.extent)
+    }
+
+    /// **The round-7 contract**: the glass carries the wallpaper's *texture*,
+    /// not only its colour — and a future retune cannot quietly take that away.
+    ///
+    /// Michael: "it seems glass wallpaper picks up the color of the wallpaper.
+    /// glass wallpaper should pick up the **vibe** of the wallpaper as well like
+    /// **washed details** or whatnot if possible."
+    ///
+    /// The distinction is tint versus texture, and no metric in this file could
+    /// see it. `luminanceSpread` is satisfied by one smooth ramp; so is
+    /// `chroma`; so is every composite-rgb figure the previous three rounds
+    /// quoted. Measured on the shipped bake, `spread` and `gradient` were the
+    /// same number on every fixture — the surface's entire luminance range was
+    /// the veil's own gradient. It was, exactly and measurably, a colour field.
+    ///
+    /// This holds both halves at once on the same renders, because separately
+    /// they are each trivially satisfiable: more texture is free if the floors
+    /// may move, and the floors are free if the surface may go flat. That has
+    /// now been the shape of the bug twice — a gamma/linear mix crushed dark to
+    /// 79.7% black, and its light mirror blew 19% to white — and both times the
+    /// constants looked right.
+    func testGlassCarriesTheWallpapersTextureAndNotOnlyItsColour() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appending(path: "kaisola-detail-\(UUID().uuidString)", directoryHint: .isDirectory)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        // The same five extremes the contrast floors use, given the structure a
+        // photograph has.
+        let wallpapers: [(name: String, base: (Double, Double, Double), range: Double)] = [
+            ("aerial", (0.263, 0.476, 0.575), 0.9),
+            ("dim", (0.06, 0.07, 0.09), 0.9),
+            ("bright", (0.82, 0.80, 0.76), 0.7),
+            ("saturated", (0.42, 0.20, 0.08), 0.8),
+            ("neutral-wide", (0.435, 0.435, 0.435), 1.6),
+        ]
+
+        var beforeTotal = 0.0
+        var afterTotal = 0.0
+        for (name, base, range) in wallpapers {
+            let url = try writeStructuredWallpaper(
+                base: base, range: range, into: directory, named: name
+            )
+            for isDark in [true, false] {
+                let key = DesktopBackdropKey(path: url.path, modified: nil, isDark: isDark)
+                guard case let .wallpaper(still, _)? = DesktopBackdropRenderer.render(key: key),
+                      let legacy = bakeAsShippedBeforeRound7(url, isDark: isDark)
+                else { return XCTFail("\(name) produced no painting") }
+
+                // The sidebar is where the metric is read: it is 210pt wide, so
+                // the still is *downscaled* into it and its mid-frequency band
+                // lands inside the high-pass. The workspace upscales the same
+                // still 2x, which moves that band below the measurement — the
+                // texture is there, an order of magnitude softer, which is what
+                // a wide canvas showing a stretched still physically is.
+                let wash = GlassBackdropWash.sidebar(isDark: isDark)
+                let before = try renderGlassSurface(
+                    still: legacy, wash: wash, isDark: isDark, width: 210, height: 900
+                )
+                let after = try renderGlassSurface(
+                    still: still, wash: wash, isDark: isDark, width: 210, height: 900
+                )
+                let beforeDetail = localDetail(before, width: 210, height: 900)
+                let afterDetail = localDetail(after, width: 210, height: 900)
+                beforeTotal += beforeDetail
+                afterTotal += afterDetail
+
+                let worst = worstPatchContrast(after, isDark: isDark)
+                print(String(
+                    format: "[glass-detail] %@ %@ detail %.5f -> %.5f (%.2fx)  spread %.4f  P %.2f:1  S %.2f:1",
+                    name, isDark ? "dark" : "light", beforeDetail, afterDetail,
+                    afterDetail / max(beforeDetail, 1e-9), luminanceSpread(after),
+                    worst.primary, worst.secondary
+                ))
+
+                // Never a regression on any single wallpaper…
+                XCTAssertGreaterThanOrEqual(
+                    afterDetail, beforeDetail,
+                    "\(name) (isDark: \(isDark)) lost local contrast against the pre-round-7 bake"
+                )
+                // …and the floors hold on the very same render, so texture can
+                // never be bought with legibility.
+                XCTAssertGreaterThanOrEqual(
+                    worst.primary, 7,
+                    "\(name) (isDark: \(isDark)): primary on the worst patch is \(worst.primary):1"
+                )
+                XCTAssertGreaterThanOrEqual(
+                    worst.secondary, isDark ? 4.5 : 3.4,
+                    "\(name) (isDark: \(isDark)): secondary on the worst patch is \(worst.secondary):1"
+                )
+                // A surface that is one smooth gradient is the regression this
+                // whole test exists for: its detail would be a rounding error
+                // against its own range.
+                XCTAssertGreaterThan(
+                    afterDetail / max(luminanceSpread(after), 0.001), 0.02,
+                    """
+                    \(name) (isDark: \(isDark)): local detail is only \
+                    \(afterDetail / max(luminanceSpread(after), 0.001)) of the surface's \
+                    range — the glass is a colour field again
+                    """
+                )
+            }
+        }
+
+        print(String(
+            format: "[glass-detail] TOTAL %.5f -> %.5f (%.2fx)",
+            beforeTotal, afterTotal, afterTotal / beforeTotal
+        ))
+        XCTAssertGreaterThan(
+            afterTotal, beforeTotal * 1.5,
+            """
+            the bake carries \(afterTotal / beforeTotal)x the local contrast the \
+            pre-round-7 one did, which is not the substantial gain this round shipped
+            """
         )
     }
 
@@ -2062,25 +2353,46 @@ final class NativePreviewSettingsTests: XCTestCase {
     /// The gain is a *cap*, never a boost, and it is solved together with the
     /// offset. Both are pure, and both are the kind of arithmetic that looks
     /// right and is off by `(0.5 - mean)(1 - gain)`.
+    ///
+    /// The cap is now solved from the still's **worst-patch excursion** rather
+    /// than from a p5..p95 spread. That is not a refactor: a percentile band by
+    /// construction excludes the tail, and the tail is the only thing every
+    /// contrast floor in this file is measured on. The properties below are the
+    /// same ones the spread cap had to hold, restated on the quantity that
+    /// actually binds.
     func testTheRangeCapOnlyEverRemovesRangeAndTheOffsetIsSolvedAfterIt() {
         for isDark in [false, true] {
-            let ceiling = DesktopBackdropRenderer.stillSpreadCeiling(isDark: isDark)
-            // Never manufactures contrast a desktop does not have.
-            for spread in [0.0, 0.05, 0.2, ceiling] {
+            let headroom = DesktopBackdropRenderer.tailHeadroom(isDark: isDark)
+            // Never manufactures contrast a desktop does not have: a wallpaper
+            // whose worst patch is already inside the headroom is passed
+            // through untouched.
+            for excursion in [0.0, 0.02, 0.08, headroom] {
                 XCTAssertEqual(
-                    DesktopBackdropRenderer.rangeGain(spread: spread, isDark: isDark),
+                    DesktopBackdropRenderer.tailGain(excursion: excursion, isDark: isDark),
                     1, accuracy: 0.0001,
-                    "a \(spread)-range wallpaper was given a gain other than 1"
+                    "a \(excursion)-excursion wallpaper was given a gain other than 1"
                 )
             }
-            XCTAssertLessThan(DesktopBackdropRenderer.rangeGain(spread: 0.7, isDark: isDark), 1)
-            // Monotone: the wider the picture, the harder the cap bites.
             XCTAssertLessThan(
-                DesktopBackdropRenderer.rangeGain(spread: 0.9, isDark: isDark),
-                DesktopBackdropRenderer.rangeGain(spread: 0.6, isDark: isDark)
+                DesktopBackdropRenderer.tailGain(excursion: 0.3, isDark: isDark), 1
+            )
+            // Monotone: the further the worst patch, the harder the cap bites.
+            XCTAssertLessThan(
+                DesktopBackdropRenderer.tailGain(excursion: 0.5, isDark: isDark),
+                DesktopBackdropRenderer.tailGain(excursion: 0.3, isDark: isDark)
             )
             // A degenerate decode cannot divide by zero into an infinite gain.
-            XCTAssertEqual(DesktopBackdropRenderer.rangeGain(spread: 0, isDark: isDark), 1)
+            XCTAssertEqual(DesktopBackdropRenderer.tailGain(excursion: 0, isDark: isDark), 1)
+            // And the cap lands the worst patch exactly on the headroom, which
+            // is the whole reason for solving it there: the tone map is affine,
+            // so `out(tail) - target = (tail - mean) * gain`.
+            for excursion in [0.2, 0.35, 0.6] {
+                let gain = DesktopBackdropRenderer.tailGain(excursion: excursion, isDark: isDark)
+                XCTAssertEqual(
+                    excursion * gain, headroom, accuracy: 0.0001,
+                    "an excursion of \(excursion) did not land on the headroom"
+                )
+            }
 
             // The offset lands the mean on target *after* the gain has moved it.
             // `CIColorControls` applies contrast about 0.5 and then adds
@@ -2290,18 +2602,43 @@ final class NativePreviewSettingsTests: XCTestCase {
         XCTAssertGreaterThan(GlassWarmth.opacity, 0.02, "deleted in all but name")
     }
 
-    /// Gaussians compose by variance, so raising the radius from 12 to 28 adds
-    /// `sqrt(28² − 12²) ≈ 25` still-pixels over the previous result — about a
-    /// quarter of the 176×110 thumbnail's height. Enough that the wallpaper
-    /// keeps a left-to-right colour story and loses every locatable shape.
-    func testWallpaperBakeBlursPastAnyRecognisableShape() {
-        XCTAssertGreaterThanOrEqual(DesktopBackdropRenderer.blurRadius, 24)
-        let added = (DesktopBackdropRenderer.blurRadius * DesktopBackdropRenderer.blurRadius - 144)
-            .squareRoot()
-        XCTAssertGreaterThan(
-            added,
-            0.2 * Double(DesktopBackdropRenderer.stillWidth) * 10 / 16,
-            "the extra blur is small against the thumbnail, so shapes still resolve"
+    /// The blur is a fraction of the frame, not a pixel count — and the band it
+    /// has to stay inside is two-sided.
+    ///
+    /// This used to assert `blurRadius >= 24` on a 176px still: 14% of the
+    /// frame, one-sided, and it passed for exactly the wrong reason. The bake
+    /// had been tuned until *no* structure survived, which is what produced the
+    /// flat colour field Michael described as missing the wallpaper's "vibe".
+    /// A one-sided floor cannot see that, in the same way the veil's one-sided
+    /// floor could not see the surface going opaque.
+    ///
+    /// Both ends now. Too small and the desktop is a recognisable picture behind
+    /// the labels, which is the thing the original note was right about; too
+    /// large and the surface is a colour field again. Stated relative to the
+    /// still's width so it keeps meaning the same thing if `stillWidth` moves.
+    func testWallpaperBakeBlursPastAnyRecognisableShapeButNotPastEveryShape() {
+        let fraction = DesktopBackdropRenderer.blurRadius
+            / Double(DesktopBackdropRenderer.stillWidth)
+        XCTAssertEqual(fraction, DesktopBackdropRenderer.blurFraction, accuracy: 0.0001)
+        XCTAssertGreaterThanOrEqual(
+            fraction, 0.03,
+            "the wallpaper resolves as a picture rather than as a wash"
+        )
+        XCTAssertLessThanOrEqual(
+            fraction, 0.09,
+            """
+            the blur spans \(Int(fraction * 100))% of the frame, which leaves \
+            about \(Int(1 / fraction)) masses across the whole wallpaper — a \
+            colour field, not frosted glass
+            """
+        )
+        // The working resolution has to be fine enough that the structure the
+        // blur keeps is the wallpaper's and not the decode's. Measured: at
+        // 176px the baked still correlates 0.841 with a 1024px reference, at
+        // 448px 0.932 — so 176 was showing ~16% aliasing as texture.
+        XCTAssertGreaterThanOrEqual(
+            Double(DesktopBackdropRenderer.stillWidth), 1 / fraction * 20,
+            "too few pixels per retained feature; the texture is decode aliasing"
         )
     }
 

@@ -473,6 +473,11 @@ final class NativePreviewSettingsTests: XCTestCase {
     func testVisualChoiceTitlesRemainUserFacing() {
         XCTAssertEqual(SidebarAppearance.glass.title, "Glass")
         XCTAssertEqual(WorkspaceBackdropMode.tinted.title, "Tinted")
+        // "System" said where the colour came from; "Solid" says what you get,
+        // which is what makes the choice next to "Tinted" mean anything. The
+        // stored value is unchanged, so nobody's preference moves.
+        XCTAssertEqual(WorkspaceBackdropMode.system.title, "Solid")
+        XCTAssertEqual(WorkspaceBackdropMode.system.rawValue, "system")
         XCTAssertEqual(TerminalPaletteMode.native.title, "macOS Terminal")
     }
 
@@ -1202,6 +1207,139 @@ final class NativePreviewSettingsTests: XCTestCase {
         // argument for a declared amber is that it says out loud that it exists.
         XCTAssertGreaterThan(GlassWarmth.opacity(isDark: true), 0.005)
         XCTAssertLessThan(GlassWarmth.opacity(isDark: true), GlassWarmth.opacity(isDark: false))
+    }
+
+    // MARK: - The three workspace canvases
+
+    /// "The tinted canvas settings should actually be tinted or a white solid."
+    ///
+    /// They were neither, because they were the same surface twice: measured
+    /// against the real desktop the old Tinted canvas landed 0.016 off-neutral
+    /// in light, against Solid's 0.000 — one and a half percent of channel
+    /// spread, which nobody can see. This is the arithmetic that says the two
+    /// modes are now different objects.
+    func testSolidAndTintedCanvasesAreUnmistakablyDifferentSurfaces() {
+        func offNeutral(_ channels: [Double]) -> Double {
+            let mean = channels.reduce(0, +) / Double(channels.count)
+            guard mean > 0 else { return 0 }
+            return channels.map { abs($0 - mean) / mean }.max() ?? 0
+        }
+        func luminance(_ channels: [Double]) -> Double {
+            channels[0] * 0.2126 + channels[1] * 0.7152 + channels[2] * 0.0722
+        }
+
+        // The sampled tint of Michael's desktop, through the shipping sampler.
+        let sampled = DesktopTintComponents(red: 0.3152, green: 0.4646, blue: 0.5343)
+        // `windowBackgroundColor`, read off the two appearances.
+        let solids = [false: [1.0, 1.0, 1.0], true: [0.1176, 0.1176, 0.1176]]
+
+        for isDark in [false, true] {
+            let solid = solids[isDark]!
+            let tint = DesktopTintSampler.revalued(
+                sampled,
+                peak: DesktopTintSampler.canvasTintPeak(isDark: isDark)
+            )
+            let coverage = DesktopTintSampler.canvasTintCoverage(isDark: isDark)
+            let channels = [tint.red, tint.green, tint.blue]
+            let tinted = zip(solid, channels).map { $0 * (1 - coverage.top) + $1 * coverage.top }
+
+            // Solid contributes no wallpaper at all: perfectly achromatic.
+            XCTAssertEqual(offNeutral(solid), 0, accuracy: 0.0001)
+
+            // Tinted is unmistakably hued — an order of magnitude past the old
+            // 0.016, and past the 0.05 bar this app sets for anything that
+            // claims to be neutral.
+            XCTAssertGreaterThan(
+                offNeutral(tinted),
+                0.10,
+                "the Tinted canvas (isDark: \(isDark)) is not visibly tinted"
+            )
+
+            // …without becoming a different brightness of canvas. Re-valuing
+            // the tint first is what buys this: light keeps 90%+ of the solid's
+            // luminance instead of dimming toward grey.
+            if isDark {
+                XCTAssertGreaterThan(luminance(tinted), luminance(solid))
+                XCTAssertLessThan(luminance(tinted), 0.30, "a dark canvas that glows is not a canvas")
+            } else {
+                XCTAssertGreaterThan(
+                    luminance(tinted) / luminance(solid),
+                    0.88,
+                    "Tinted is dimming the canvas instead of tinting it"
+                )
+            }
+
+            // The gradient still reads as light from above.
+            XCTAssertGreaterThan(coverage.top, coverage.bottom)
+        }
+    }
+
+    /// Re-valuing keeps the hue and moves only the value — that is the whole
+    /// trick, so it is asserted rather than assumed.
+    func testRevaluedTintKeepsItsHueAndOnlyMovesItsValue() {
+        let tint = DesktopTintComponents(red: 0.3152, green: 0.4646, blue: 0.5343)
+        let full = DesktopTintSampler.revalued(tint, peak: 1.0)
+        XCTAssertEqual(max(full.red, max(full.green, full.blue)), 1.0, accuracy: 0.0001)
+        // Channel ratios — the hue — survive exactly.
+        XCTAssertEqual(full.red / full.blue, tint.red / tint.blue, accuracy: 0.0001)
+        XCTAssertEqual(full.green / full.blue, tint.green / tint.blue, accuracy: 0.0001)
+
+        let low = DesktopTintSampler.revalued(tint, peak: 0.34)
+        XCTAssertEqual(max(low.red, max(low.green, low.blue)), 0.34, accuracy: 0.0001)
+        XCTAssertEqual(low.red / low.blue, tint.red / tint.blue, accuracy: 0.0001)
+
+        // A grey desktop re-values to a grey, not to a hue.
+        let grey = DesktopTintSampler.revalued(
+            DesktopTintComponents(red: 0.4, green: 0.4, blue: 0.4),
+            peak: 1.0
+        )
+        XCTAssertEqual(grey.red, grey.blue, accuracy: 0.0001)
+        // A degenerate (black) sample cannot divide by nothing.
+        let black = DesktopTintSampler.revalued(
+            DesktopTintComponents(red: 0, green: 0, blue: 0),
+            peak: 0.34
+        )
+        XCTAssertEqual(black.red, 0.34, accuracy: 0.0001)
+        XCTAssertEqual(black.blue, 0.34, accuracy: 0.0001)
+    }
+
+    /// The warmth is a SEPARATE, DECLARED constant, and that is the point.
+    ///
+    /// `testDeclaredNeutralConstantsAreAchromatic` is what caught the
+    /// `#0B0C12` blue-purple cast, and the only safe way to add warmth without
+    /// weakening it is to keep every "neutral" honest and put the chroma
+    /// somewhere that says out loud that it is chroma. `GlassWarmth` is that
+    /// place, it is deliberately absent from the neutrals list over there, and
+    /// this is the test that stops it from becoming a licence to drift: it has
+    /// to stay an amber, and it has to stay barely there.
+    func testGlassWarmthIsADeclaredAmber() {
+        // Warm means red leads and blue trails. Anything else is a different
+        // decision wearing this constant's name.
+        XCTAssertGreaterThan(GlassWarmth.red, GlassWarmth.green)
+        XCTAssertGreaterThan(GlassWarmth.green, GlassWarmth.blue)
+
+        // …in the amber/orange band, not red and not yellow. Hue in degrees,
+        // computed the standard way from the max/min channels.
+        let maximum = max(GlassWarmth.red, GlassWarmth.green, GlassWarmth.blue)
+        let minimum = min(GlassWarmth.red, GlassWarmth.green, GlassWarmth.blue)
+        let delta = maximum - minimum
+        XCTAssertGreaterThan(delta, 0, "a warm layer with no chroma is not a warm layer")
+        let hue = 60 * ((GlassWarmth.green - GlassWarmth.blue) / delta)
+        XCTAssertGreaterThan(hue, 15, "that is red, not warmth")
+        XCTAssertLessThan(hue, 45, "that is yellow, not warmth")
+
+        // A high-value amber: at a few percent coverage a dark tint pulls the
+        // composite toward grey-brown instead of toward warm.
+        XCTAssertGreaterThan(GlassWarmth.red, 0.9)
+
+        // And it stays a hint. The ceiling is the whole safety argument — at 8%
+        // this stops being warmth and starts being a tint, which is the thing
+        // the neutrality invariant exists to prevent. Stated on the light
+        // coverage, which is the number the dark one is derived from; see
+        // `testGlassWarmthCoverageTracksTheSurfaceItLandsOn`.
+        XCTAssertEqual(GlassWarmth.opacity, 0.04, accuracy: 0.0001)
+        XCTAssertLessThan(GlassWarmth.opacity, 0.08)
+        XCTAssertGreaterThan(GlassWarmth.opacity, 0.02, "deleted in all but name")
     }
 
     /// Gaussians compose by variance, so raising the radius from 12 to 28 adds

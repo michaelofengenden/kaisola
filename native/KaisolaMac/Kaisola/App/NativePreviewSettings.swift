@@ -96,7 +96,12 @@ enum WorkspaceBackdropMode: String, CaseIterable, Identifiable, Sendable {
     var id: String { rawValue }
     var title: String {
         switch self {
-        case .system: "System"
+        // "System" described where the colour came from, not what you get, and
+        // what you get is the point: a flat opaque surface with no wallpaper in
+        // it at all. Michael asked for the canvas to "actually be tinted or a
+        // white solid"; this is the white solid, and it now says so. The raw
+        // value stays `system` so nobody's stored preference moves.
+        case .system: "Solid"
         case .glass: "Glass"
         case .tinted: "Tinted"
         }
@@ -1695,6 +1700,46 @@ enum DesktopTintSampler {
     /// because a slate was averaged into it, and the only hue in the result is
     /// the desktop's own. Renamed to match: it is the wallpaper's average, not
     /// a cooled one.
+    /// The desktop's hue at a chosen value: the sampled tint scaled so its
+    /// brightest channel lands on `peak`, hue and channel ratios untouched.
+    ///
+    /// This is what makes the Tinted canvas *tinted* rather than merely dimmer.
+    /// Compositing the raw sample over the canvas moves brightness and hue
+    /// together, and brightness dominates: at the coverage a canvas can afford,
+    /// the surface reads as "slightly grey white" and not as "tinted". Michael's
+    /// note is exactly that — "the tinted canvas settings should actually be
+    /// tinted or a white solid" — and measured against the real desktop the old
+    /// Tinted canvas sat **0.016** off-neutral in light, against Solid's 0.000.
+    /// Nothing to see.
+    ///
+    /// Re-valuing first separates the two. In light the tint goes to full value
+    /// (peak 1) so the composite keeps the canvas's brightness and takes only
+    /// its hue; in dark it goes to a low value so it takes the hue without
+    /// turning the canvas into a lamp.
+    static func revalued(_ tint: DesktopTintComponents, peak: Double) -> DesktopTintComponents {
+        let brightest = max(tint.red, max(tint.green, tint.blue))
+        guard brightest > 0.001 else {
+            return DesktopTintComponents(red: peak, green: peak, blue: peak)
+        }
+        let scale = peak / brightest
+        return DesktopTintComponents(
+            red: min(1, tint.red * scale),
+            green: min(1, tint.green * scale),
+            blue: min(1, tint.blue * scale)
+        )
+    }
+
+    /// Value the Tinted canvas re-values the desktop's hue to, per appearance.
+    /// Light takes it at full value (over white, that is pure hue and almost no
+    /// dimming); dark takes it just above the canvas it sits on.
+    static func canvasTintPeak(isDark: Bool) -> Double { isDark ? 0.34 : 1.0 }
+
+    /// Coverage of the re-valued tint at the two ends of the canvas gradient.
+    /// Same light-from-above language as the glass veil.
+    static func canvasTintCoverage(isDark: Bool) -> (top: Double, bottom: Double) {
+        isDark ? (top: 0.55, bottom: 0.38) : (top: 0.45, bottom: 0.30)
+    }
+
     static func wallpaperAverage(rgba: [UInt8]) -> DesktopTintComponents? {
         guard let wallpaper = plainAverage(rgba: rgba) else { return nil }
         let luminance = wallpaper.0 * 0.2126 + wallpaper.1 * 0.7152 + wallpaper.2 * 0.0722
@@ -2120,6 +2165,12 @@ struct WorkspaceBackdropView: View {
     private var backdrop: some View {
         switch mode {
         case .system:
+            // The white solid. One flat opaque colour, no sampling, no
+            // gradient: whatever is on the desktop contributes exactly nothing.
+            // `windowBackgroundColor` resolves to #FFFFFF in light and #1E1E1E
+            // in dark, so this already *is* the "white solid" — what it lacked
+            // was a name that said so and a Tinted option distinct enough for
+            // the difference to be visible.
             Color(nsColor: .windowBackgroundColor)
         case .glass:
             if reduceTransparency {
@@ -2135,15 +2186,28 @@ struct WorkspaceBackdropView: View {
                 }
             }
         case .tinted:
-            // Same neutrality contract as the glass veil: the sampled desktop
-            // color is the only chroma in the stack — no mesh (lavender) stop.
+            // The desktop's *hue*, laid into the solid canvas — see
+            // `DesktopTintSampler.revalued(_:peak:)` for why the sample is
+            // re-valued before it is composited. Same neutrality contract as
+            // the glass veil: the sampled desktop colour is the only chroma in
+            // the stack, no mesh (lavender) stop.
+            //
+            // Measured against the real desktop, light: Solid 1.000/1.000/1.000
+            // (0.000 off-neutral) against Tinted 0.816/0.941/1.000 at the top
+            // (0.113 off-neutral, luminance 0.919). Dark: Solid 0.118 flat
+            // against Tinted 0.163/0.216/0.240 (0.209 off-neutral). Nobody has
+            // to squint to tell which one is on.
+            let isDark = colorScheme == .dark
+            let tint = DesktopTintSampler.revalued(
+                desktop.painting.tint,
+                peak: DesktopTintSampler.canvasTintPeak(isDark: isDark)
+            )
+            let coverage = DesktopTintSampler.canvasTintCoverage(isDark: isDark)
+            let color = Color(red: tint.red, green: tint.green, blue: tint.blue)
             ZStack {
                 Color(nsColor: .windowBackgroundColor)
                 LinearGradient(
-                    colors: [
-                        desktop.tintColor.opacity(colorScheme == .dark ? 0.16 : 0.12),
-                        desktop.tintColor.opacity(colorScheme == .dark ? 0.09 : 0.055),
-                    ],
+                    colors: [color.opacity(coverage.top), color.opacity(coverage.bottom)],
                     startPoint: .topLeading,
                     endPoint: .bottomTrailing
                 )

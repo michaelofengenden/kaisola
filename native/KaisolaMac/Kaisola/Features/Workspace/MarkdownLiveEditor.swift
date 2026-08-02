@@ -219,6 +219,19 @@ enum MarkdownEditorScrollRetention {
         let fraction = min(1, max(0, previousOrigin / previousScrollable))
         return min(newScrollable, fraction * newScrollable)
     }
+
+    /// Whether the character that was at the top of the viewport still exists
+    /// in the incoming text.
+    ///
+    /// A pixel or proportional restore is measured against the *unstyled*
+    /// height of a freshly replaced string — headings at body size, table rows
+    /// uncollapsed — so it lands thousands of points away on a long document.
+    /// Restoring the same character instead is only meaningful while that
+    /// character is still there, which is exactly the case that matters:
+    /// reconciling an external edit of the file already open.
+    static func anchorSurvives(characterIndex: Int, in text: String) -> Bool {
+        characterIndex >= 0 && characterIndex < (text as NSString).length
+    }
 }
 
 // MARK: - Inline image layout

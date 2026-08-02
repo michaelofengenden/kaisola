@@ -2613,6 +2613,24 @@ final class WorkspaceFilesTests: XCTestCase {
         )
     }
 
+    /// Replacing the string strips every attribute, so the height available at
+    /// that instant is the *unstyled* height. Restoring a proportion of it
+    /// threw a 90 KB document 15 000 points off its reading position when the
+    /// file changed on disk. The character anchor is what has to survive.
+    func testLiveMarkdownReplacementKeepsAnAnchorThatSurvivesTheIncomingText() {
+        let text = "0123456789"
+        XCTAssertTrue(
+            MarkdownEditorScrollRetention.anchorSurvives(characterIndex: 9, in: text)
+        )
+        XCTAssertFalse(
+            MarkdownEditorScrollRetention.anchorSurvives(characterIndex: 10, in: text)
+        )
+        XCTAssertFalse(
+            MarkdownEditorScrollRetention.anchorSurvives(characterIndex: -1, in: text)
+        )
+        XCTAssertFalse(MarkdownEditorScrollRetention.anchorSurvives(characterIndex: 0, in: ""))
+    }
+
     // MARK: - Tables rendered in place
 
     /// A table is only a table when GitHub says so. Re-aligning prose that

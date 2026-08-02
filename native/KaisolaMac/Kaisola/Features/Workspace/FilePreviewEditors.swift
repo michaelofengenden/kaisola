@@ -422,7 +422,7 @@ enum FilePreviewTextScroll {
     /// next restore.
     static func canMeasure(_ textView: NSTextView, in scrollView: NSScrollView) -> Bool {
         textView.window != nil
-            && scrollView.contentView.bounds.height > 0
+            && scrollView.documentVisibleRect.height > 0
             && !textView.string.isEmpty
     }
 
@@ -430,19 +430,38 @@ enum FilePreviewTextScroll {
     static func scrollFraction(in textView: NSTextView, scrollView: NSScrollView) -> Double {
         let scrollable = scrollableHeight(textView, scrollView)
         guard scrollable > 0 else { return 0 }
-        return min(1, max(0, Double(scrollView.contentView.bounds.origin.y / scrollable)))
+        return min(1, max(0, Double(offset(in: scrollView) / scrollable)))
     }
 
     /// Put `fraction` of the scrollable range above the viewport.
     static func scroll(to fraction: Double, in textView: NSTextView, scrollView: NSScrollView) {
-        let clip = scrollView.contentView
         let scrollable = scrollableHeight(textView, scrollView)
-        clip.scroll(to: NSPoint(x: 0, y: CGFloat(min(1, max(0, fraction))) * scrollable))
-        scrollView.reflectScrolledClipView(clip)
+        scroll(to: CGFloat(min(1, max(0, fraction))) * scrollable, in: textView, scrollView: scrollView)
+    }
+
+    /// How far the viewport currently sits down the document, in the
+    /// document's own coordinates.
+    ///
+    /// Deliberately not `contentView.bounds.origin`. The Markdown editor's
+    /// clip view places the document view at a large negative frame origin, so
+    /// the clip's own bounds origin is nowhere near zero at the top of the
+    /// file — a caller testing `> 0` to mean "scrolled" is answered `false` at
+    /// every position, which is precisely how the viewport-pinning machinery
+    /// came to be dead code in the running app.
+    static func offset(in scrollView: NSScrollView) -> CGFloat {
+        scrollView.documentVisibleRect.origin.y
+    }
+
+    /// Scroll so `offset` in document coordinates sits at the top of the
+    /// viewport. `NSView.scroll(_:)` is coordinate-space safe in a way that
+    /// scrolling the clip view by hand is not.
+    static func scroll(to offset: CGFloat, in textView: NSTextView, scrollView: NSScrollView) {
+        textView.scroll(NSPoint(x: 0, y: offset))
+        scrollView.reflectScrolledClipView(scrollView.contentView)
     }
 
     private static func scrollableHeight(_ textView: NSTextView, _ scrollView: NSScrollView) -> CGFloat {
-        max(0, textView.bounds.height - scrollView.contentView.bounds.height)
+        max(0, textView.bounds.height - scrollView.documentVisibleRect.height)
     }
 }
 
@@ -1182,6 +1201,9 @@ struct MarkdownRenderedEditor: NSViewRepresentable {
         private var styleTask: Task<Void, Never>?
         /// Container width the current grid was measured against.
         private var styledWidth: CGFloat?
+        /// The viewport character a pending text replacement wants back once
+        /// the styling pass has given the document its real height.
+        private var pendingAnchor: (characterIndex: Int, offset: CGFloat)?
         private var importTask: Task<Void, Never>?
         private var imageTask: Task<Void, Never>?
         private var lastScrollKey: String?
@@ -1265,9 +1287,17 @@ struct MarkdownRenderedEditor: NSViewRepresentable {
         /// while keeping the reader roughly where they were.
         func replaceText(with value: String, restoring selection: NSRange) {
             guard let textView else { return }
-            let previousOrigin = scrollView?.contentView.bounds.origin.y ?? 0
+            let previousOrigin = scrollView.map(FilePreviewTextScroll.offset(in:)) ?? 0
             let previousHeight = textView.bounds.height
-            let viewportHeight = scrollView?.contentView.bounds.height ?? 0
+            let viewportHeight = scrollView?.documentVisibleRect.height ?? 0
+            // Taken before the swap, and honoured again after the styling pass
+            // below. Replacing the string strips every attribute, so the height
+            // measured moments from now is the height of an *unstyled*
+            // document — headings at body size, table rows at full height — and
+            // restoring a proportion of that throws the reader thousands of
+            // points off. The character that was at the top of the viewport is
+            // the only anchor that survives a restyle.
+            let anchor = viewportAnchor()
             isApplyingExternalValue = true
             programmaticScrollDepth += 1
             textView.string = value
@@ -1285,8 +1315,13 @@ struct MarkdownRenderedEditor: NSViewRepresentable {
                     newContentHeight: textView.bounds.height,
                     viewportHeight: viewportHeight
                 )
-                scrollView.contentView.scroll(to: NSPoint(x: 0, y: origin))
-                scrollView.reflectScrolledClipView(scrollView.contentView)
+                FilePreviewTextScroll.scroll(to: origin, in: textView, scrollView: scrollView)
+            }
+            if let anchor, MarkdownEditorScrollRetention.anchorSurvives(
+                characterIndex: anchor.characterIndex,
+                in: value
+            ) {
+                pendingAnchor = anchor
             }
             programmaticScrollDepth -= 1
         }
@@ -1384,8 +1419,13 @@ struct MarkdownRenderedEditor: NSViewRepresentable {
 
             // Typography changes the document's height, so pin the character at
             // the top of the viewport and put it back afterwards rather than
-            // letting the scroll view keep a now-meaningless pixel offset.
-            let anchor = viewportAnchor()
+            // letting the scroll view keep a now-meaningless pixel offset. A
+            // replacement that is still waiting for its real height hands its
+            // own anchor over here, because the one this view can read now was
+            // measured against unstyled text.
+            let anchor = pendingAnchor ?? viewportAnchor()
+            let restoringReplacement = pendingAnchor != nil
+            pendingAnchor = nil
             let before = storage.string
             let width = textView.textContainer?.size.width ?? textView.bounds.width
             styledWidth = width
@@ -1426,6 +1466,15 @@ struct MarkdownRenderedEditor: NSViewRepresentable {
 
             // A styling pass must never be able to change the document.
             assert(storage.string == before, "Markdown styling mutated document text")
+            if restoringReplacement, let container = textView.textContainer {
+                // `restore` asks for a line rect *without* additional layout,
+                // which after a whole-document restyle would answer with the
+                // unstyled geometry the replacement left behind — and put the
+                // reader back at 70 % of where they were. Paid only when a text
+                // replacement is waiting for its position; typing never
+                // reaches this.
+                textView.layoutManager?.ensureLayout(for: container)
+            }
             restore(anchor)
         }
 
@@ -1436,8 +1485,11 @@ struct MarkdownRenderedEditor: NSViewRepresentable {
                   let layoutManager = textView.layoutManager,
                   let container = textView.textContainer,
                   textView.window != nil else { return nil }
-            let visible = scrollView.contentView.bounds
-            guard visible.height > 0, visible.origin.y > 0 else { return nil }
+            // Document coordinates. The clip view holds this text view at a
+            // large negative frame origin, so its own bounds origin never
+            // reaches zero and a `> 0` test against it is false everywhere.
+            let visible = scrollView.documentVisibleRect
+            guard visible.height > 0, visible.origin.y > 0.5 else { return nil }
             let point = NSPoint(
                 x: 0,
                 y: visible.origin.y - textView.textContainerOrigin.y
@@ -1464,12 +1516,11 @@ struct MarkdownRenderedEditor: NSViewRepresentable {
                 withoutAdditionalLayout: true
             )
             let target = lineRect.minY + textView.textContainerOrigin.y + anchor.offset
-            let maximum = max(0, textView.bounds.height - scrollView.contentView.bounds.height)
+            let maximum = max(0, textView.bounds.height - scrollView.documentVisibleRect.height)
             let origin = min(max(0, target), maximum)
-            guard abs(origin - scrollView.contentView.bounds.origin.y) > 0.5 else { return }
+            guard abs(origin - FilePreviewTextScroll.offset(in: scrollView)) > 0.5 else { return }
             programmaticScrollDepth += 1
-            scrollView.contentView.scroll(to: NSPoint(x: 0, y: origin))
-            scrollView.reflectScrolledClipView(scrollView.contentView)
+            FilePreviewTextScroll.scroll(to: origin, in: textView, scrollView: scrollView)
             programmaticScrollDepth -= 1
         }
 

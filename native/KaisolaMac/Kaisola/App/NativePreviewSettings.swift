@@ -1847,6 +1847,59 @@ enum DesktopTintSampler {
     }
 }
 
+/// How much of the desktop one watch tick is allowed to read.
+///
+/// The two rungs are two orders of magnitude apart, measured on this machine:
+/// three `stat`s cost **0.045 ms**, and `NSWorkspace.desktopImageURL(for:)`
+/// costs **4.1 ms** — and the latter has to run on the main actor, because
+/// `NSScreen` is not `Sendable`. A 4 ms main-thread stall is a dropped frame,
+/// so it cannot be what a five-second timer does.
+enum DesktopProbeDepth: Equatable, Sendable {
+    /// `stat` only: the painted file, the wallpaper store's index, and the
+    /// aerial thumbnail cache. Catches every desktop change that goes through
+    /// the wallpaper store, which on macOS 26 is every change made from System
+    /// Settings, Finder's "Set Desktop Picture", or the Wallpaper API.
+    case shallow
+    /// The above plus `desktopImageURL(for:)`. The only thing this adds is a
+    /// desktop whose *path* moved without the store being rewritten — a
+    /// rotating picture folder advancing — so it is taken on a slow cadence
+    /// rather than every tick.
+    case deep
+}
+
+/// The cheap fingerprint of "which picture the desktop is showing".
+///
+/// Nothing in AppKit publishes a wallpaper-changed event that can be relied on
+/// (see `DesktopBackdropProvider.desktopChangedNotification` for what is
+/// observed and what that is worth), so the backstop is this: a handful of
+/// modification dates that a change cannot avoid moving, compared on a timer.
+/// It is deliberately *not* the backdrop cache key — building that key reads
+/// and parses two files, and this has to be affordable every few seconds.
+struct DesktopWallpaperSignature: Equatable, Sendable {
+    /// What `NSWorkspace` reports, on a `deep` probe only; `nil` on a shallow
+    /// one, and a `nil` on either side is not evidence of a change.
+    let desktopImagePath: String?
+    /// The file the current backdrop was baked from — "set as desktop picture"
+    /// over a path that never changed lands here.
+    let paintedModified: Date?
+    /// `Store/Index.plist`, which the wallpaper agent rewrites for every
+    /// desktop choice, including picking a different aerial *category*.
+    let storeModified: Date?
+    /// The aerial thumbnail cache directory. A rotating category has no
+    /// published pointer at the clip playing right now, so the backdrop picks a
+    /// deterministic representative from the stills macOS has downloaded — and
+    /// this directory's mtime is what moves when that set grows.
+    let thumbnailsModified: Date?
+}
+
+/// What a watch tick found, against the previous one.
+enum DesktopSignalDecision: Equatable {
+    /// Nothing moved, or there is no baseline yet — either way, no hint.
+    case unchanged
+    /// Something the desktop is made of moved. Hint the provider.
+    case changed
+}
+
 /// What a "the desktop may have changed" hint should do about it.
 enum DesktopResolveDecision: Equatable {
     /// The rate-limit floor has expired; read the desktop now.
@@ -1872,16 +1925,40 @@ final class DesktopBackdropProvider: ObservableObject {
 
     @Published private(set) var painting: DesktopPainting = .flat(DesktopTintSampler.fallback)
 
-    /// Wallpaper changes are not observable; they are polled off the hints
-    /// below. This is the floor between two disk reads.
+    /// The floor between two disk reads. Every hint — notification, watch tick,
+    /// or activation — is funnelled through it.
     static let minimumResolveInterval: TimeInterval = 2
     /// Enough for a light/dark pair on each of two recently seen desktops.
     private static let cacheLimit = 4
+
+    /// The distributed notification the wallpaper agent posts when the desktop
+    /// changes, and an honest account of what observing it is worth.
+    ///
+    /// `WallpaperAgent` links `NSDistributedNotificationCenter` and carries the
+    /// string `com.apple.desktop`, so the long-standing notification is very
+    /// likely still posted on macOS 26 — but that is inference from `nm` and
+    /// `strings`, not a measurement: confirming it needs an actual desktop
+    /// change, and changing the developer's desktop to find out is not a thing
+    /// this code is allowed to do. So it is observed as a *fast path* and
+    /// nothing depends on it. `desktopWatchInterval` below is the guarantee.
+    static let desktopChangedNotification = Notification.Name("com.apple.desktop")
+
+    /// How often the shallow watch tick runs while Kaisola is the active app.
+    ///
+    /// Three `stat`s, 0.045 ms — 0.001% duty at this cadence, and the timer
+    /// carries a wide tolerance so the wakeups coalesce with whatever else the
+    /// process is doing. It is suspended entirely when the app is not active,
+    /// because `didBecomeActive` already forces a resolve on the way back in,
+    /// which makes an unattended app cost exactly nothing.
+    static let desktopWatchInterval: TimeInterval = 5
+    /// How often a tick is allowed to be `deep` — see `DesktopProbeDepth`.
+    static let desktopDeepProbeInterval: TimeInterval = 30
 
     private var cache: [DesktopBackdropKey: DesktopPainting] = [:]
     private var cacheOrder: [DesktopBackdropKey] = []
     private var work: Task<Void, Never>?
     private var deferredResolve: Task<Void, Never>?
+    private var watch: Task<Void, Never>?
     /// Bumped on every resolve so a detached stage that finishes after a newer
     /// resolve started cannot publish its stale painting. `Task.cancel()` is not
     /// enough on its own: `Task.detached` deliberately does not inherit
@@ -1892,6 +1969,18 @@ final class DesktopBackdropProvider: ObservableObject {
     private var lastResolved = Date.distantPast
     private var lastAppearanceIsDark: Bool?
     private var observers: [any NSObjectProtocol] = []
+    private var lastKey: DesktopBackdropKey?
+    private var lastDeepProbe = Date.distantPast
+
+    /// The last fingerprint a watch tick read, and the number of times anything
+    /// has said "the desktop may have changed".
+    ///
+    /// Deliberately not `@Published`: a hint is not a repaint, and publishing
+    /// one would invalidate every glass surface in the app on a timer. They are
+    /// observable so the watch can be *proved* to fire rather than asserted to —
+    /// see `testTheWallpaperWatchFiresOnADistributedDesktopNotification`.
+    private(set) var wallpaperSignature: DesktopWallpaperSignature?
+    private(set) var wallpaperSignals = 0
 
     var tintColor: Color {
         let tint = painting.tint
@@ -1901,30 +1990,55 @@ final class DesktopBackdropProvider: ObservableObject {
     private init() {
         let workspace = NSWorkspace.shared.notificationCenter
         let center = NotificationCenter.default
+        let distributed = DistributedNotificationCenter.default()
         // Space switches and screen reconfiguration can both change which
         // desktop picture applies; becoming key is when a wallpaper the user
-        // changed in System Settings first matters to us.
+        // changed in System Settings first matters to us; waking is when a
+        // desktop set to rotate "on wake" has already rotated.
         observers = [
             workspace.addObserver(
                 forName: NSWorkspace.activeSpaceDidChangeNotification,
                 object: nil,
                 queue: .main
-            ) { [weak self] _ in MainActor.assumeIsolated { self?.invalidate() } },
+            ) { [weak self] _ in MainActor.assumeIsolated { self?.noteDesktopSignal() } },
+            workspace.addObserver(
+                forName: NSWorkspace.didWakeNotification,
+                object: nil,
+                queue: .main
+            ) { [weak self] _ in MainActor.assumeIsolated { self?.noteDesktopSignal() } },
             center.addObserver(
                 forName: NSApplication.didBecomeActiveNotification,
                 object: nil,
                 queue: .main
-            ) { [weak self] _ in MainActor.assumeIsolated { self?.invalidate() } },
+            ) { [weak self] _ in
+                MainActor.assumeIsolated {
+                    self?.noteDesktopSignal()
+                    self?.startWatching()
+                }
+            },
+            center.addObserver(
+                forName: NSApplication.didResignActiveNotification,
+                object: nil,
+                queue: .main
+            ) { [weak self] _ in MainActor.assumeIsolated { self?.stopWatching() } },
             center.addObserver(
                 forName: NSApplication.didChangeScreenParametersNotification,
                 object: nil,
                 queue: .main
-            ) { [weak self] _ in MainActor.assumeIsolated { self?.invalidate() } },
+            ) { [weak self] _ in MainActor.assumeIsolated { self?.noteDesktopSignal() } },
             center.addObserver(
                 forName: NSWindow.didBecomeKeyNotification,
                 object: nil,
                 queue: .main
-            ) { [weak self] _ in MainActor.assumeIsolated { self?.invalidate() } },
+            ) { [weak self] _ in MainActor.assumeIsolated { self?.noteDesktopSignal() } },
+            // The fast path. `object: nil` because the agent's object string is
+            // not documented and has changed across releases; the name alone is
+            // specific enough, and a spurious hint costs one coalesced resolve.
+            distributed.addObserver(
+                forName: Self.desktopChangedNotification,
+                object: nil,
+                queue: .main
+            ) { [weak self] _ in MainActor.assumeIsolated { self?.noteDesktopSignal() } },
         ]
     }
 
@@ -1947,12 +2061,154 @@ final class DesktopBackdropProvider: ObservableObject {
         return .deferBy(floor - elapsed)
     }
 
+    /// How much a watch tick at `now` is allowed to read.
+    ///
+    /// Pure, so the "4 ms call is not on the 5-second path" rule is a test
+    /// rather than a comment that a later edit can quietly break.
+    static func probeDepth(
+        now: Date,
+        lastDeepProbe: Date,
+        interval: TimeInterval = desktopDeepProbeInterval
+    ) -> DesktopProbeDepth {
+        now.timeIntervalSince(lastDeepProbe) >= interval ? .deep : .shallow
+    }
+
+    /// Whether a fingerprint that just came back means the desktop moved.
+    ///
+    /// Two rules that are easy to get wrong and impossible to see in a reading:
+    ///
+    /// * **No baseline is not a change.** The first tick after a resolve exists
+    ///   to record what "unchanged" looks like. Treating it as a change would
+    ///   make the watch re-resolve every time it started.
+    /// * **A field only one side has proves nothing.** A shallow tick does not
+    ///   pay for `desktopImageURL`, so its `desktopImagePath` is `nil`; if a
+    ///   missing value counted as different, every shallow tick after a deep one
+    ///   would fire, and the whole point of the two rungs would be lost.
+    static func signalDecision(
+        previous: DesktopWallpaperSignature?,
+        current: DesktopWallpaperSignature
+    ) -> DesktopSignalDecision {
+        guard let previous else { return .unchanged }
+        if previous.paintedModified != current.paintedModified { return .changed }
+        if previous.storeModified != current.storeModified { return .changed }
+        if previous.thumbnailsModified != current.thumbnailsModified { return .changed }
+        if let old = previous.desktopImagePath,
+           let new = current.desktopImagePath,
+           old != new { return .changed }
+        return .unchanged
+    }
+
+    /// The fingerprint itself. `modificationDate` is injected so the whole rule
+    /// — which files are read, and which of them a `deep` probe adds — is
+    /// testable against a fixture directory rather than against the developer's
+    /// own desktop.
+    nonisolated static func signature(
+        depth: DesktopProbeDepth,
+        desktopImagePath: String?,
+        paintedPath: String?,
+        supportDirectory: URL,
+        modificationDate: (URL) -> Date?
+    ) -> DesktopWallpaperSignature {
+        DesktopWallpaperSignature(
+            desktopImagePath: depth == .deep ? desktopImagePath : nil,
+            paintedModified: paintedPath.flatMap { modificationDate(URL(fileURLWithPath: $0)) },
+            storeModified: modificationDate(supportDirectory.appending(path: "Store/Index.plist")),
+            thumbnailsModified: modificationDate(
+                supportDirectory.appending(path: "aerials/thumbnails", directoryHint: .isDirectory)
+            )
+        )
+    }
+
+    nonisolated static func modificationDateOnDisk(_ url: URL) -> Date? {
+        try? url.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate
+    }
+
+    /// Whether the watch is currently armed. Observable so "an app with no
+    /// glass surface never starts a timer" is a test rather than a claim.
+    var isWatchingDesktop: Bool { watch != nil }
+
+    /// Start the watch. Idempotent, and a no-op until a glass surface has
+    /// actually asked for a backdrop — an app whose windows are all solid
+    /// never starts a timer.
+    private func startWatching() {
+        guard watch == nil, lastAppearanceIsDark != nil else { return }
+        watch = Task { [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(
+                    for: .seconds(Self.desktopWatchInterval),
+                    tolerance: .seconds(Self.desktopWatchInterval / 2)
+                )
+                guard !Task.isCancelled, let self else { return }
+                await self.probeDesktop()
+            }
+        }
+    }
+
+    private func stopWatching() {
+        watch?.cancel()
+        watch = nil
+    }
+
+    /// One watch tick.
+    ///
+    /// The main actor pays only for `desktopImageURL`, and only on a deep tick;
+    /// the `stat`s run detached. A tick that finds nothing does not touch the
+    /// backdrop at all, so the steady state is three `stat`s every five seconds
+    /// and no allocation, no decode, and no repaint.
+    ///
+    /// `supportDirectory` is a parameter only so the whole chain — filesystem
+    /// change, fingerprint, decision, coalescing door — can be driven end to end
+    /// against a fixture. There is no way to test it against the real store: it
+    /// would mean changing the developer's desktop.
+    func probeDesktop(
+        supportDirectory: URL = DesktopWallpaperLocator.defaultSupportDirectory
+    ) async {
+        guard lastAppearanceIsDark != nil else { return }
+        let depth = Self.probeDepth(now: Date(), lastDeepProbe: lastDeepProbe)
+        var desktopImagePath: String?
+        if depth == .deep {
+            lastDeepProbe = Date()
+            desktopImagePath = Self.currentScreen()
+                .flatMap { NSWorkspace.shared.desktopImageURL(for: $0) }?.path
+        }
+        let paintedPath = lastKey?.path
+        let support = supportDirectory
+        let current = await Task.detached(priority: .utility) {
+            Self.signature(
+                depth: depth,
+                desktopImagePath: desktopImagePath,
+                paintedPath: paintedPath,
+                supportDirectory: support,
+                modificationDate: Self.modificationDateOnDisk
+            )
+        }.value
+        let decision = Self.signalDecision(previous: wallpaperSignature, current: current)
+        wallpaperSignature = current
+        guard decision == .changed else { return }
+        noteDesktopSignal()
+    }
+
+    /// The one door every "the desktop may have changed" signal goes through —
+    /// the distributed notification, a watch tick that found something, a Space
+    /// switch, a wake, an activation, a screen change, a new key window.
+    ///
+    /// It records the signal and then defers entirely to `invalidate`, so the
+    /// coalescing contract is unchanged: a burst still arms exactly one
+    /// deferred resolve, and the generation counter still drops stale bakes.
+    private func noteDesktopSignal() {
+        wallpaperSignals += 1
+        invalidate()
+    }
+
     /// Ask for the backdrop that matches `isDark`. Cheap and idempotent: an
     /// appearance flip always re-resolves, anything else waits out the
     /// rate limit.
     func refresh(isDark: Bool) {
         let appearanceChanged = isDark != lastAppearanceIsDark
         lastAppearanceIsDark = isDark
+        // The first surface to ask for a backdrop is what arms the watch; an
+        // app with nothing but solid chrome never starts a timer at all.
+        startWatching()
         guard appearanceChanged
             || Date().timeIntervalSince(lastResolved) >= Self.minimumResolveInterval else { return }
         // An appearance flip supersedes any armed hint: it is about to do the
@@ -2017,6 +2273,12 @@ final class DesktopBackdropProvider: ObservableObject {
                 Self.key(desktopImageURL: desktopImageURL, isDark: isDark)
             }.value
             guard let self, generation == self.generation else { return }
+            // Whatever this resolve concluded is the new baseline: the file it
+            // painted has just been read, so the next watch tick must compare
+            // against *that* rather than fire a second time on the change this
+            // resolve already honoured.
+            self.lastKey = key
+            self.wallpaperSignature = nil
             guard let key else {
                 painting = .flat(DesktopTintSampler.fallback)
                 return

@@ -1688,6 +1688,296 @@ final class NativePreviewSettingsTests: XCTestCase {
         )
     }
 
+    // MARK: - Following the wallpaper
+
+    /// The gap this closes: everything that made the backdrop re-resolve was a
+    /// hint about the *window* — a Space switch, an activation, a screen change,
+    /// a new key window. A user who picks a new desktop picture while Kaisola
+    /// stays frontmost, or a rotating desktop that advances while they work,
+    /// moved nothing Kaisola was listening to, so the glass kept painting the
+    /// old wallpaper until they happened to leave the app and come back.
+    ///
+    /// The backstop is a fingerprint of a handful of modification dates. This
+    /// exercises it against a real directory rather than against the developer's
+    /// own desktop, which is the only way to *change* a wallpaper in a test.
+    func testAWallpaperChangedInPlaceMovesTheSignatureThatWatchesForIt() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appending(path: "kaisola-desktop-\(UUID().uuidString)", directoryHint: .isDirectory)
+        let store = root.appending(path: "Store", directoryHint: .isDirectory)
+        let thumbnails = root.appending(path: "aerials/thumbnails", directoryHint: .isDirectory)
+        try FileManager.default.createDirectory(at: store, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: thumbnails, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let picture = root.appending(path: "desktop.png")
+        try Data("first".utf8).write(to: picture)
+        try Data("index".utf8).write(to: store.appending(path: "Index.plist"))
+
+        func probe(depth: DesktopProbeDepth = .shallow, path: String? = nil)
+            -> DesktopWallpaperSignature {
+            DesktopBackdropProvider.signature(
+                depth: depth,
+                desktopImagePath: path ?? picture.path,
+                paintedPath: picture.path,
+                supportDirectory: root,
+                modificationDate: DesktopBackdropProvider.modificationDateOnDisk
+            )
+        }
+
+        let baseline = probe()
+        XCTAssertNotNil(baseline.paintedModified, "the painted file's mtime is the whole mechanism")
+        XCTAssertNotNil(baseline.storeModified)
+        XCTAssertNotNil(baseline.thumbnailsModified)
+
+        // Nothing has happened: repeated ticks must be silent, or the watch is
+        // a re-render loop rather than a watch.
+        XCTAssertEqual(
+            DesktopBackdropProvider.signalDecision(previous: baseline, current: probe()),
+            .unchanged
+        )
+
+        // 1. "Set as desktop picture" over the same path — the case a
+        //    path-keyed cache cannot see at all.
+        try Data("second and longer".utf8).write(to: picture)
+        try FileManager.default.setAttributes(
+            [.modificationDate: Date().addingTimeInterval(60)],
+            ofItemAtPath: picture.path
+        )
+        XCTAssertEqual(
+            DesktopBackdropProvider.signalDecision(previous: baseline, current: probe()),
+            .changed,
+            "a wallpaper replaced in place went unnoticed"
+        )
+
+        // 2. A different aerial *category*. No picture file exists for either
+        //    one and `desktopImageURL` returns the same stand-in for both, so
+        //    the store's index is the only thing that moves.
+        let afterPicture = probe()
+        try FileManager.default.setAttributes(
+            [.modificationDate: Date().addingTimeInterval(120)],
+            ofItemAtPath: store.appending(path: "Index.plist").path
+        )
+        XCTAssertEqual(
+            DesktopBackdropProvider.signalDecision(previous: afterPicture, current: probe()),
+            .changed,
+            "choosing a different aerial category went unnoticed"
+        )
+
+        // 3. A rotating category whose representative still can change because
+        //    macOS finished downloading another member of it. There is no
+        //    published pointer at the clip playing right now, so the backdrop
+        //    tracks the *set* it picks from, and that set is this directory.
+        let afterStore = probe()
+        try Data("thumb".utf8).write(to: thumbnails.appending(path: "new.png"))
+        XCTAssertEqual(
+            DesktopBackdropProvider.signalDecision(previous: afterStore, current: probe()),
+            .changed,
+            "a newly cached aerial still went unnoticed"
+        )
+
+        // 4. A rotating *picture folder* advancing: same store, same mtimes,
+        //    different file. Only a deep probe can see this one.
+        let afterThumbnails = probe(depth: .deep)
+        XCTAssertEqual(
+            DesktopBackdropProvider.signalDecision(
+                previous: afterThumbnails,
+                current: probe(depth: .deep, path: "/Users/test/Pictures/next.heic")
+            ),
+            .changed,
+            "a rotating picture folder advancing went unnoticed"
+        )
+    }
+
+    /// The two rungs must not fight each other. A shallow tick does not pay for
+    /// `desktopImageURL`, so its path is `nil` — and if a missing value counted
+    /// as a difference, every shallow tick after a deep one would fire a hint
+    /// and the rationing would be pointless.
+    func testAShallowTickIsNotMistakenForTheDesktopMoving() {
+        let deep = DesktopWallpaperSignature(
+            desktopImagePath: "/Users/test/Pictures/ridge.heic",
+            paintedModified: Date(timeIntervalSince1970: 1),
+            storeModified: Date(timeIntervalSince1970: 2),
+            thumbnailsModified: Date(timeIntervalSince1970: 3)
+        )
+        let shallow = DesktopWallpaperSignature(
+            desktopImagePath: nil,
+            paintedModified: deep.paintedModified,
+            storeModified: deep.storeModified,
+            thumbnailsModified: deep.thumbnailsModified
+        )
+        XCTAssertEqual(
+            DesktopBackdropProvider.signalDecision(previous: deep, current: shallow),
+            .unchanged
+        )
+        XCTAssertEqual(
+            DesktopBackdropProvider.signalDecision(previous: shallow, current: deep),
+            .unchanged
+        )
+        // …but a shallow tick still reports everything it *did* read.
+        XCTAssertEqual(
+            DesktopBackdropProvider.signalDecision(
+                previous: deep,
+                current: DesktopWallpaperSignature(
+                    desktopImagePath: nil,
+                    paintedModified: Date(timeIntervalSince1970: 99),
+                    storeModified: deep.storeModified,
+                    thumbnailsModified: deep.thumbnailsModified
+                )
+            ),
+            .changed
+        )
+        // No baseline is not a change: the first tick after a resolve exists to
+        // record what "unchanged" looks like, and treating it as a change would
+        // make the watch re-resolve every time it started.
+        XCTAssertEqual(
+            DesktopBackdropProvider.signalDecision(previous: nil, current: deep),
+            .unchanged
+        )
+    }
+
+    /// The costs, measured on this machine: three `stat`s take **0.045 ms**, and
+    /// `NSWorkspace.desktopImageURL(for:)` takes **4.1 ms** and has to run on the
+    /// main actor because `NSScreen` is not `Sendable`. A 4 ms main-thread stall
+    /// every five seconds is a dropped frame every five seconds, so the two are
+    /// rationed separately and that is the rule asserted here.
+    func testTheExpensiveHalfOfAWatchTickIsRationedSeparately() {
+        let now = Date()
+        let deepInterval = DesktopBackdropProvider.desktopDeepProbeInterval
+
+        XCTAssertEqual(
+            DesktopBackdropProvider.probeDepth(now: now, lastDeepProbe: .distantPast),
+            .deep,
+            "the first tick has never read the desktop URL and must"
+        )
+        XCTAssertEqual(
+            DesktopBackdropProvider.probeDepth(now: now, lastDeepProbe: now),
+            .shallow
+        )
+        XCTAssertEqual(
+            DesktopBackdropProvider.probeDepth(
+                now: now,
+                lastDeepProbe: now.addingTimeInterval(-deepInterval + 0.1)
+            ),
+            .shallow
+        )
+        XCTAssertEqual(
+            DesktopBackdropProvider.probeDepth(
+                now: now,
+                lastDeepProbe: now.addingTimeInterval(-deepInterval)
+            ),
+            .deep
+        )
+        // The cadences themselves: cheap often, expensive rarely, and both far
+        // enough apart that a wallpaper change is noticed while the user is
+        // looking at the window.
+        XCTAssertLessThanOrEqual(DesktopBackdropProvider.desktopWatchInterval, 5)
+        XCTAssertGreaterThanOrEqual(
+            deepInterval,
+            DesktopBackdropProvider.desktopWatchInterval * 4,
+            "a deep tick this often is a 4 ms main-thread stall on the fast cadence"
+        )
+    }
+
+    /// Proof that the signal path is wired, taken by *firing* it.
+    ///
+    /// Method, stated honestly. `WallpaperAgent` links
+    /// `NSDistributedNotificationCenter` and carries the string
+    /// `com.apple.desktop`, so the long-standing notification is very probably
+    /// still posted on macOS 26 — but confirming that needs a real desktop
+    /// change, and changing the developer's desktop is not something this suite
+    /// is allowed to do. So what is proved here is the half that *is* provable:
+    /// the observer is registered on the right centre under the right name, and
+    /// the handler reaches the coalescing door. The notification is posted by
+    /// this test, not by macOS.
+    ///
+    /// That is also why nothing depends on it: `desktopWatchInterval` and the
+    /// signature above are the guarantee, and this is the fast path.
+    @MainActor
+    func testTheDesktopChangedNotificationReachesTheBackdropProvider() {
+        let provider = DesktopBackdropProvider.shared
+        // The watch only arms once a glass surface has asked for a backdrop,
+        // which is also what makes `invalidate` do anything at all.
+        provider.refresh(isDark: true)
+        let before = provider.wallpaperSignals
+
+        let arrived = expectation(description: "com.apple.desktop reaches the provider")
+        let token = DistributedNotificationCenter.default().addObserver(
+            forName: DesktopBackdropProvider.desktopChangedNotification,
+            object: nil,
+            queue: .main
+        ) { _ in arrived.fulfill() }
+        defer { DistributedNotificationCenter.default().removeObserver(token) }
+
+        DistributedNotificationCenter.default().postNotificationName(
+            DesktopBackdropProvider.desktopChangedNotification,
+            object: nil,
+            userInfo: nil,
+            deliverImmediately: true
+        )
+        wait(for: [arrived], timeout: 5)
+        // The provider's own observer runs on the same main queue, so by the
+        // time ours has fired and the run loop has turned over once more, its
+        // counter has moved.
+        let bumped = expectation(description: "the provider counted the signal")
+        DispatchQueue.main.async { bumped.fulfill() }
+        wait(for: [bumped], timeout: 5)
+
+        XCTAssertGreaterThan(
+            provider.wallpaperSignals,
+            before,
+            "a com.apple.desktop notification did not reach the provider's invalidation path"
+        )
+    }
+
+    /// The guarantee, driven end to end: a file under the wallpaper store moves,
+    /// and the provider's own watch tick — not a reimplementation of it — turns
+    /// that into a hint.
+    ///
+    /// This is the half the notification test cannot cover. It runs the shipped
+    /// `probeDesktop` against a fixture store, because the only way to run it
+    /// against the real one is to change the developer's desktop.
+    @MainActor
+    func testAWatchTickTurnsAStoreChangeIntoAnInvalidation() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appending(path: "kaisola-watch-\(UUID().uuidString)", directoryHint: .isDirectory)
+        let store = root.appending(path: "Store", directoryHint: .isDirectory)
+        try FileManager.default.createDirectory(at: store, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let index = store.appending(path: "Index.plist")
+        try Data("first".utf8).write(to: index)
+
+        let provider = DesktopBackdropProvider.shared
+        provider.refresh(isDark: true)
+        XCTAssertTrue(
+            provider.isWatchingDesktop,
+            "a glass surface asked for a backdrop and no watch was armed"
+        )
+
+        // First tick: records the baseline. A tick with nothing to compare
+        // against must not fire, or the watch is a re-render loop.
+        await provider.probeDesktop(supportDirectory: root)
+        let baselineSignals = provider.wallpaperSignals
+        XCTAssertNotNil(provider.wallpaperSignature)
+        await provider.probeDesktop(supportDirectory: root)
+        XCTAssertEqual(
+            provider.wallpaperSignals, baselineSignals,
+            "an unchanged desktop still produced a hint"
+        )
+
+        // The user picks a new desktop picture: the wallpaper agent rewrites the
+        // store's index. Nothing about the window changed, which is exactly the
+        // case that used to go unnoticed until the app was left and re-entered.
+        try FileManager.default.setAttributes(
+            [.modificationDate: Date().addingTimeInterval(300)],
+            ofItemAtPath: index.path
+        )
+        await provider.probeDesktop(supportDirectory: root)
+        XCTAssertGreaterThan(
+            provider.wallpaperSignals, baselineSignals,
+            "the wallpaper store changed and the watch did not hint the provider"
+        )
+    }
+
     // MARK: - Opening sidebar width
 
     /// macOS honours `navigationSplitViewColumnWidth`'s `min:`/`max:` but not

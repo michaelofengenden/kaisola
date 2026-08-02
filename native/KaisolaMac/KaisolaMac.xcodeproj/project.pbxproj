@@ -202,6 +202,7 @@
 		C6B77BD965183EA73469C7A1 /* GitPanelModelTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 007B60933A677DAD3CB98F9D /* GitPanelModelTests.swift */; };
 		CB9F6E79A4449D825ED74216 /* editor.bundle.js in Resources */ = {isa = PBXBuildFile; fileRef = E7C5B0168DF6FF4903C2AD34 /* editor.bundle.js */; };
 		CC1B40953E2F4F16006A3623 /* CodeEditorView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5CC25EF79013C557429B7B46 /* CodeEditorView.swift */; };
+		CD43D40E248EEF8E5B5D41E0 /* AcpComposerMenuView.swift in Sources */ = {isa = PBXBuildFile; fileRef = CE80FA0295453D77144074F1 /* AcpComposerMenuView.swift */; };
 		CDC7BC20F1CECF9BB283CA58 /* BrokerHelperPackageTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = D7BF0B4BEB31139A942C49DC /* BrokerHelperPackageTests.swift */; };
 		CE2036C2C15219A63B1E36B2 /* CompanionProjectionBuilder.swift in Sources */ = {isa = PBXBuildFile; fileRef = 142C8737C1900DE903FF5E87 /* CompanionProjectionBuilder.swift */; };
 		CF3950FAA193A0B68E569A8C /* DataPreviewsTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2A0AA3187DEE4894928C6341 /* DataPreviewsTests.swift */; };
@@ -251,7 +252,6 @@
 		F54657F1A6F671121F2FB2B3 /* ObserveOnlyBrokerClientTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 96F1989B7416C050648E9CAB /* ObserveOnlyBrokerClientTests.swift */; };
 		F60ACD0B816BBDC03277BD4A /* KaisolaProductMigrationTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = EDCF271FCBDC7AAEACD59129 /* KaisolaProductMigrationTests.swift */; };
 		F70671167EAC7B9AB373F0DF /* PermissionRuleStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3D06ED8A6604C6BD4447869A /* PermissionRuleStore.swift */; };
-		F8B5C2E1B472FB2212016523 /* AcpModelPickerView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 84E6440222B538D80F478EBB /* AcpModelPickerView.swift */; };
 		F8C6FB0C2C3588D89201E634 /* SourceOutline.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3F83577979FF0B2A400B8F40 /* SourceOutline.swift */; };
 		F958069AD757FAAC93656C6C /* UnixBrokerTransport.swift in Sources */ = {isa = PBXBuildFile; fileRef = C1139547AB3E3B3A9C7AAEDA /* UnixBrokerTransport.swift */; };
 		F9F0465E4528725BBF84B7B3 /* NativeSessionStoreTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 977E366BEE44EBE7CFFBB95C /* NativeSessionStoreTests.swift */; };
@@ -400,7 +400,6 @@
 		83D17767E2F2F48BE60D3518 /* OmniBarView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OmniBarView.swift; sourceTree = "<group>"; };
 		83FF23C3F0FE8B751EF9300A /* VerifiedUsageHelperCache.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VerifiedUsageHelperCache.swift; sourceTree = "<group>"; };
 		84A4673AB95018489B81132A /* AcpTranscriptStoreTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AcpTranscriptStoreTests.swift; sourceTree = "<group>"; };
-		84E6440222B538D80F478EBB /* AcpModelPickerView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AcpModelPickerView.swift; sourceTree = "<group>"; };
 		84F61B27B7189310A3E0304F /* GitService+Apply.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "GitService+Apply.swift"; sourceTree = "<group>"; };
 		856354DE0BB8187DD641F300 /* AgentFileFollow.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AgentFileFollow.swift; sourceTree = "<group>"; };
 		8779132DE0F6325D261D6DEE /* NotificationBridgeBoundaryTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NotificationBridgeBoundaryTests.swift; sourceTree = "<group>"; };
@@ -473,6 +472,7 @@
 		CB03F186495669D5F881F00E /* UsageSettingsTab.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = UsageSettingsTab.swift; sourceTree = "<group>"; };
 		CBB83EF128840150F6F7103D /* RootShellView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RootShellView.swift; sourceTree = "<group>"; };
 		CD40F6DB5889F51004BEF1C9 /* BrokerControlClientTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BrokerControlClientTests.swift; sourceTree = "<group>"; };
+		CE80FA0295453D77144074F1 /* AcpComposerMenuView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AcpComposerMenuView.swift; sourceTree = "<group>"; };
 		CEA4E3B7B25D187C019B2CC9 /* FileTreeModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FileTreeModel.swift; sourceTree = "<group>"; };
 		CF0112BAE21EFB0355FAB3CA /* RememberedSessionCatalogTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RememberedSessionCatalogTests.swift; sourceTree = "<group>"; };
 		D011FEC3CB6A3F15FA1FC5AC /* QuietRollupTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = QuietRollupTests.swift; sourceTree = "<group>"; };
@@ -967,11 +967,11 @@
 				FDC5D762925B519587B9EF95 /* AcpChatHandle.swift */,
 				4AEB389DB67AC63D7147C0BA /* AcpChatView.swift */,
 				9B1563BF7D126A8B5C295EA7 /* AcpClient.swift */,
+				CE80FA0295453D77144074F1 /* AcpComposerMenuView.swift */,
 				28FFC42BA9783C68516FA31C /* AcpComposerModel.swift */,
 				446E609412A194ED4620DCDF /* AcpComposerView.swift */,
 				3ACF651DE22A050B1D4AF49C /* AcpConversation.swift */,
 				CA7E0A7AF7C58D8926909FDB /* AcpDiff.swift */,
-				84E6440222B538D80F478EBB /* AcpModelPickerView.swift */,
 				F979524745D6648E34835DF3 /* AcpModels.swift */,
 				DA6828DB9339AA4CAEDA765D /* AcpPermissionRules.swift */,
 				32406CFD933CD31D2751A8AF /* AcpProcessTransport.swift */,
@@ -1153,11 +1153,11 @@
 				C3C6A0FA37B46A4E2561429A /* AcpChatHandle.swift in Sources */,
 				7DF2FB061FD5D062D6A085DF /* AcpChatView.swift in Sources */,
 				907211E885D959CE7539719F /* AcpClient.swift in Sources */,
+				CD43D40E248EEF8E5B5D41E0 /* AcpComposerMenuView.swift in Sources */,
 				45BDB67E55C8E0C6B1F2FF3E /* AcpComposerModel.swift in Sources */,
 				722940467ACF9EDDCCFEF652 /* AcpComposerView.swift in Sources */,
 				A82D652E2C835E8ACC2DAFA0 /* AcpConversation.swift in Sources */,
 				BFDE2C98C977243CF4E89074 /* AcpDiff.swift in Sources */,
-				F8B5C2E1B472FB2212016523 /* AcpModelPickerView.swift in Sources */,
 				BCEE7C4B2655BD5F02B14ABA /* AcpModels.swift in Sources */,
 				98882138088B682565342107 /* AcpPermissionRules.swift in Sources */,
 				4552F75BAE695B4A4E2327A3 /* AcpProcessTransport.swift in Sources */,

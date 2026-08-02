@@ -2865,10 +2865,17 @@ final class AppModel: ObservableObject {
     /// spawned as a child of this app. The provider session id, visible
     /// transcript, layout, and draft are persisted so a capable adapter can
     /// resume after restart; a stale provider id falls back to a fresh session.
+    /// `initialDraft` carries an unsent message into the new chat. It exists for
+    /// the composer's agent switch: an ACP session is bound to one adapter
+    /// process, so choosing a different agent opens a second chat rather than
+    /// moving this one, and the sentence the user was mid-way through typing
+    /// has to survive that. The source chat keeps its own copy — a navigation
+    /// action must never be the reason typed text disappears.
     func openChat(
         _ agent: AgentProfile,
         inDirectory directory: URL,
-        accountProfile: UsageAccountProfile? = nil
+        accountProfile: UsageAccountProfile? = nil,
+        initialDraft: String? = nil
     ) {
         let project = sessionStore.openProject(directory: directory.path)
         refreshPersistedNavigationState(publish: false)
@@ -2897,7 +2904,7 @@ final class AppModel: ObservableObject {
             resumeSessionID: nil,
             accountBinding: accountBinding,
             initialTranscript: nil,
-            initialDraft: nil,
+            initialDraft: initialDraft,
             initialQueuedPrompts: []
         ) != nil else { return }
         focusPane(chatID, projectID: project.id)

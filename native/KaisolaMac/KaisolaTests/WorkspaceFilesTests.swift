@@ -2000,6 +2000,280 @@ final class WorkspaceFilesTests: XCTestCase {
         XCTAssertNil(memory.fraction(for: "/tmp/file1.swift"))
     }
 
+    // MARK: - Continuous Markdown editing
+
+    /// The jump this surface exists to remove. Save, autosave, the recovery
+    /// journal, and external reconciliation of identical bytes all re-run the
+    /// SwiftUI body with the string the text view already holds; swapping the
+    /// storage there collapses layout and throws the viewport to line 1.
+    func testLiveMarkdownEditorNeverReplacesStorageForIdenticalText() {
+        let source = "# Title\n\nA long document body.\n"
+
+        XCTAssertEqual(
+            MarkdownEditorTextSync.plan(
+                current: source,
+                incoming: source,
+                selection: NSRange(location: 12, length: 4)
+            ),
+            .unchanged
+        )
+    }
+
+    func testLiveMarkdownEditorClampsSelectionWhenExternalTextShrinks() {
+        let plan = MarkdownEditorTextSync.plan(
+            current: "# Title\n\nA long body that was truncated on disk.\n",
+            incoming: "# Title\n",
+            selection: NSRange(location: 40, length: 6)
+        )
+
+        XCTAssertEqual(plan, .replace(selection: NSRange(location: 8, length: 0)))
+    }
+
+    func testLiveMarkdownScrollRetentionKeepsPixelsWhenHeightBarelyMoves() {
+        // Typing a character grows the document by a hair; the viewport must
+        // not move at all.
+        XCTAssertEqual(
+            MarkdownEditorScrollRetention.restoredOrigin(
+                previousOrigin: 4_200,
+                previousContentHeight: 20_000,
+                newContentHeight: 20_019,
+                viewportHeight: 800
+            ),
+            4_200,
+            accuracy: 0.0001
+        )
+    }
+
+    func testLiveMarkdownScrollRetentionKeepsProportionAcrossRealReflows() {
+        // An external reload or a zoom step changes the height materially, so
+        // the old pixel offset no longer points at the same text.
+        XCTAssertEqual(
+            MarkdownEditorScrollRetention.restoredOrigin(
+                previousOrigin: 9_600,
+                previousContentHeight: 20_000,
+                newContentHeight: 10_000,
+                viewportHeight: 800
+            ),
+            4_600,
+            accuracy: 0.5
+        )
+        XCTAssertEqual(
+            MarkdownEditorScrollRetention.restoredOrigin(
+                previousOrigin: 500,
+                previousContentHeight: 20_000,
+                newContentHeight: 400,
+                viewportHeight: 800
+            ),
+            0,
+            accuracy: 0.0001
+        )
+    }
+
+    /// Inline images are drawn from these ranges, so a wrong range would paint
+    /// a picture over live prose.
+    func testLiveMarkdownFindsWholeLineImagesAndLeavesProseLinesAlone() throws {
+        let source = """
+        # Notes
+
+        ![screenshot](assets/backlog/shot.png)
+
+        See ![inline](a.png) in this sentence.
+
+          <img src="assets/logo.png" width="120" height="40" alt="Logo">
+
+        ![one](a.png) ![two](b.png)
+
+        [not an image](page.md)
+        """
+        let nsSource = source as NSString
+        let lines = MarkdownInlineImages.lines(in: source)
+
+        XCTAssertEqual(lines.count, 3, "prose-with-image and plain links must not render")
+        XCTAssertEqual(
+            nsSource.substring(with: lines[0].references[0].range),
+            "![screenshot](assets/backlog/shot.png)"
+        )
+        XCTAssertEqual(lines[0].references[0].source, "assets/backlog/shot.png")
+        XCTAssertEqual(lines[0].references[0].alt, "screenshot")
+
+        let html = lines[1].references[0]
+        XCTAssertEqual(html.source, "assets/logo.png")
+        XCTAssertEqual(html.declaredWidth, 120)
+        XCTAssertEqual(html.declaredHeight, 40)
+        XCTAssertEqual(html.alt, "Logo")
+
+        XCTAssertEqual(lines[2].references.map(\.source), ["a.png", "b.png"])
+        for line in lines {
+            for reference in line.references {
+                XCTAssertLessThanOrEqual(NSMaxRange(reference.range), nsSource.length)
+            }
+        }
+    }
+
+    /// Headings have to *look* like headings, or the continuous document reads
+    /// as one undifferentiated wall of prose.
+    func testLiveMarkdownHeadingsAreStyledLargerThanBody() throws {
+        let source = "# Title\n\nBody prose.\n\n## Second\n\n### Third\n"
+        let spans = MarkdownEditingStyle.spans(in: source)
+        let nsSource = source as NSString
+
+        let headings = spans.compactMap { span -> (Int, String)? in
+            guard case let .heading(level) = span.role else { return nil }
+            return (level, nsSource.substring(with: span.range))
+        }
+        XCTAssertEqual(headings.map(\.0), [1, 2, 3])
+        XCTAssertEqual(headings.map(\.1), ["Title", "Second", "Third"])
+
+        // The rendered size is what the reader actually perceives.
+        let sizes = headings.map { level, _ -> CGFloat in
+            let font = MarkdownEditingStyle.attributes(for: .heading(level))[.font] as? NSFont
+            return font?.pointSize ?? 0
+        }
+        XCTAssertEqual(sizes, [30, 25, 21])
+        XCTAssertTrue(sizes.allSatisfy { $0 > MarkdownEditingStyle.bodySize })
+
+        // The `#` markers collapse, but the heading text itself never does.
+        for span in spans where span.role == .syntax {
+            XCTAssertFalse(
+                nsSource.substring(with: span.range).contains("Title"),
+                "heading text must not be hidden as syntax"
+            )
+        }
+    }
+
+    /// The regression that made block editing necessary in the first place: a
+    /// styling pass must be able to restyle the whole document without altering
+    /// a single character — relative image links most of all.
+    func testLiveMarkdownStylingNeverAltersDocumentBytes() throws {
+        let source = """
+        # Release notes
+
+        A paragraph with **bold**, *italic*, `code`, and a
+        [relative link](docs/guide.md).
+
+        ![screenshot](assets/backlog/shot.png)
+
+        <img src="assets/logo.png" width="120">
+
+        | Surface | State |
+        | :------ | :---- |
+        | Markdown | Editable |
+
+        ```swift
+        let untouched = "**not bold**"
+        ```
+
+        > A quote. Trailing spaces and CRLF must survive too.\r
+        """
+        let storage = NSTextStorage(string: source)
+        let fullRange = NSRange(location: 0, length: storage.length)
+
+        // Exactly what the editor's styling pass does.
+        storage.beginEditing()
+        storage.setAttributes(MarkdownEditingStyle.baseAttributes, range: fullRange)
+        for span in MarkdownEditingStyle.spans(in: source)
+        where NSMaxRange(span.range) <= fullRange.length {
+            storage.addAttributes(MarkdownEditingStyle.attributes(for: span.role), range: span.range)
+        }
+        storage.endEditing()
+
+        XCTAssertEqual(storage.string, source, "styling must not touch a single byte")
+        XCTAssertEqual(storage.length, (source as NSString).length)
+        XCTAssertTrue(storage.string.contains("![screenshot](assets/backlog/shot.png)"))
+        XCTAssertTrue(storage.string.contains(#"<img src="assets/logo.png" width="120">"#))
+        XCTAssertTrue(storage.string.contains("\r"))
+        XCTAssertTrue(storage.string.contains(#"let untouched = "**not bold**""#))
+
+        // And the styling really did happen.
+        var headingFont: NSFont?
+        headingFont = storage.attribute(.font, at: 2, effectiveRange: nil) as? NSFont
+        XCTAssertEqual(headingFont?.pointSize, 30)
+    }
+
+    /// A drawn image replaces its whole reference. Leaving the alt text visible
+    /// prints a stray link caption underneath the picture it names.
+    func testLiveMarkdownCollapsesWholeLineImageReferencesIncludingAltText() throws {
+        let source = "# Title\n\n![Kaisola icon](assets/kaisola-icon.png)\n\nSee ![inline](a.png) here.\n"
+        let nsSource = source as NSString
+        let spans = MarkdownEditingStyle.spans(in: source)
+
+        let reference = nsSource.range(of: "![Kaisola icon](assets/kaisola-icon.png)")
+        XCTAssertTrue(
+            spans.contains { $0.role == .syntax && $0.range == reference },
+            "a whole-line image reference must collapse entirely"
+        )
+
+        // The last span wins, so the collapse has to outrank the link styling
+        // the alt text also matched.
+        let altRange = nsSource.range(of: "Kaisola icon")
+        let altIndex = spans.lastIndex { NSIntersectionRange($0.range, altRange).length > 0 }
+        XCTAssertEqual(spans[try XCTUnwrap(altIndex)].role, .syntax)
+
+        // An image sharing a line with prose keeps its source visible, because
+        // the picture is not drawn there.
+        let inline = nsSource.range(of: "![inline](a.png)")
+        XCTAssertFalse(spans.contains { $0.role == .syntax && $0.range == inline })
+    }
+
+    /// The styling pass runs 70 ms after the reader stops typing, so it has to
+    /// finish well inside a frame budget even on the longest document the
+    /// preview will open.
+    func testLiveMarkdownStylingPassStaysWithinInteractionBudget() throws {
+        let section = """
+        ## Section heading
+
+        A paragraph with **bold**, *italic*, `inline code`, and a
+        [link](docs/guide.md) that wraps across more than one line of prose.
+
+        - list item with **emphasis**
+        - another item
+
+        > a quoted line
+
+        ```swift
+        let value = 1
+        ```
+
+        """
+        var source = ""
+        while source.utf8.count < 100_000 { source += section }
+        XCTAssertGreaterThan(source.utf8.count, 100_000)
+        XCTAssertLessThan(source.utf8.count, FilePreviewContent.maxTextBytes)
+
+        let spanStart = CFAbsoluteTimeGetCurrent()
+        let spans = MarkdownEditingStyle.spans(in: source)
+        let spanElapsed = CFAbsoluteTimeGetCurrent() - spanStart
+
+        let storage = NSTextStorage(string: source)
+        let fullRange = NSRange(location: 0, length: storage.length)
+        let applyStart = CFAbsoluteTimeGetCurrent()
+        storage.beginEditing()
+        storage.setAttributes(MarkdownEditingStyle.baseAttributes, range: fullRange)
+        for span in spans where NSMaxRange(span.range) <= fullRange.length {
+            storage.addAttributes(MarkdownEditingStyle.attributes(for: span.role), range: span.range)
+        }
+        storage.endEditing()
+        let applyElapsed = CFAbsoluteTimeGetCurrent() - applyStart
+
+        XCTAssertEqual(storage.string, source)
+        // Span computation runs off the main actor; only the apply blocks it.
+        XCTAssertLessThan(spanElapsed, 0.35, "span scan took \(spanElapsed)s")
+        XCTAssertLessThan(applyElapsed, 0.25, "main-actor styling took \(applyElapsed)s")
+    }
+
+    func testLiveMarkdownImageScanStaysWithinInteractionBudgetOnALongDocument() {
+        let source = (0..<4_000).map { index in
+            "## Section \(index)\n\nProse \(index) with no pictures at all.\n"
+        }.joined()
+
+        let startedAt = CFAbsoluteTimeGetCurrent()
+        let lines = MarkdownInlineImages.lines(in: source)
+        let elapsed = CFAbsoluteTimeGetCurrent() - startedAt
+
+        XCTAssertTrue(lines.isEmpty)
+        XCTAssertLessThan(elapsed, 0.5, "Image scan took \(elapsed)s")
+    }
+
     func testLargeMarkdownStructuralProjectionStaysWithinInteractionBudget() {
         let sectionCount = 1_600
         let source = (0..<sectionCount).map { index in

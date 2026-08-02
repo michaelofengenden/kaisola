@@ -143,6 +143,7 @@
 		9229A2F4720268663EE8AC09 /* AcpTranscriptRendering.swift in Sources */ = {isa = PBXBuildFile; fileRef = 40AFF780B226613EC2DA25AA /* AcpTranscriptRendering.swift */; };
 		93DFA71C6988B2A423631EA3 /* SavedWindowsStoreTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0309F5DD6F095F40A096AA42 /* SavedWindowsStoreTests.swift */; };
 		941E9FD174F5BD0CF47EE87E /* AcpClientTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 87E8CB81899E1EDA02B677F9 /* AcpClientTests.swift */; };
+		94907F0CD6A85638D2CB1420 /* MarkdownLiveEditor.swift in Sources */ = {isa = PBXBuildFile; fileRef = C5828E934026DD96C9C6A1A9 /* MarkdownLiveEditor.swift */; };
 		94F2C07F9D519F8C1428062E /* GitPRTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 143732221EC63F82B5874931 /* GitPRTests.swift */; };
 		95094E0BFA321F0CDBB34A25 /* AuthModelTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 760FEDCDEC2F6023C11F7EE8 /* AuthModelTests.swift */; };
 		962C060B2EF48F35A66AAEDD /* AppModel+Pinning.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6EB61D36CC5BEB88B707C9D7 /* AppModel+Pinning.swift */; };
@@ -454,6 +455,7 @@
 		C1139547AB3E3B3A9C7AAEDA /* UnixBrokerTransport.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = UnixBrokerTransport.swift; sourceTree = "<group>"; };
 		C2C127B15864D9B20EE61750 /* SessionPinStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SessionPinStore.swift; sourceTree = "<group>"; };
 		C49D972FACEF9F904974B8EB /* SessionTitleTrackerTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SessionTitleTrackerTests.swift; sourceTree = "<group>"; };
+		C5828E934026DD96C9C6A1A9 /* MarkdownLiveEditor.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MarkdownLiveEditor.swift; sourceTree = "<group>"; };
 		C5926CF38392E45AD77539A6 /* AcpAttachmentsTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AcpAttachmentsTests.swift; sourceTree = "<group>"; };
 		C77EC0A7729995A36851FD19 /* CompanionConnection.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CompanionConnection.swift; sourceTree = "<group>"; };
 		C88BF5404563C22955EE7B51 /* UsageCenter.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = UsageCenter.swift; sourceTree = "<group>"; };
@@ -606,6 +608,7 @@
 				502B709E629F1098130633B7 /* FilePreviewView.swift */,
 				CEA4E3B7B25D187C019B2CC9 /* FileTreeModel.swift */,
 				D2D6020A7FBF1683EB7484D0 /* MarkdownAssets.swift */,
+				C5828E934026DD96C9C6A1A9 /* MarkdownLiveEditor.swift */,
 				9286E9EFA45E3FEE67AEB1E3 /* MarkdownPreview.swift */,
 				995477C896372B075A7640B8 /* QuickActionsBar.swift */,
 				6D76F5FBB1B68291847A102F /* QuickActionStore.swift */,
@@ -1203,6 +1206,7 @@
 				08AD90B91DFB148BF2F3B5E8 /* KaisolaMacAppDelegate.swift in Sources */,
 				7FC978B9CB1801B45BC82E36 /* KaisolaProductMigration.swift in Sources */,
 				5E7F7A75F43B6ED23B0A0C71 /* MarkdownAssets.swift in Sources */,
+				94907F0CD6A85638D2CB1420 /* MarkdownLiveEditor.swift in Sources */,
 				BDE65F12928C19D4C1D19381 /* MarkdownPreview.swift in Sources */,
 				12EAB0BC4C613FF5DF4FF4FF /* McpConfigStore.swift in Sources */,
 				D5863CCBBD41F0FD1FA9C2C5 /* McpSettingsTab.swift in Sources */,

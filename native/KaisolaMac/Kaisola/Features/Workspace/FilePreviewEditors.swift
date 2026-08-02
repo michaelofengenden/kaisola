@@ -181,10 +181,21 @@ struct MarkdownEditingStyle: Sendable {
             #"(?ms)^([ \t]*(?:```|~~~)[^\n]*\n).*?^([ \t]*(?:```|~~~)[ \t]*$)"#,
             role: { _ in .codeBlock }
         )
+        // A reference that occupies a whole line is painted as a picture by the
+        // layout manager, so its source collapses completely — alt text
+        // included. Without this the alt text renders as a stray link caption
+        // underneath the image it names. Appended last so it outranks the link
+        // rule that also matched it.
+        for line in MarkdownInlineImages.lines(in: source) {
+            for reference in line.references {
+                result.append(Span(range: reference.range, role: .syntax))
+            }
+        }
+
         // Several semantic recognizers intentionally overlap (for example an
         // `<em>` pair is found both by the emphasis rule and by the generic
         // tag rule). Apply each identical style/range once so TextKit does not
-        // redo temporary-attribute work while scrolling a Markdown document.
+        // redo attribute work while scrolling a Markdown document.
         var seen: Set<Span> = []
         var unique: [Span] = []
         unique.reserveCapacity(min(result.count, 20_000))
@@ -193,6 +204,130 @@ struct MarkdownEditingStyle: Sendable {
             if unique.count == 20_000 { break }
         }
         return unique
+    }
+
+    static let bodySize: CGFloat = 15
+
+    static var bodyParagraphStyle: NSParagraphStyle {
+        let paragraph = NSMutableParagraphStyle()
+        paragraph.lineSpacing = 3
+        paragraph.paragraphSpacing = 5
+        return paragraph
+    }
+
+    /// What every character looks like before a role claims it. A styling pass
+    /// resets to this first, so removing emphasis restores plain body text
+    /// rather than leaving the old attributes behind.
+    static var baseAttributes: [NSAttributedString.Key: Any] {
+        [
+            .font: NSFont.systemFont(ofSize: bodySize),
+            .foregroundColor: NSColor.labelColor,
+            .paragraphStyle: bodyParagraphStyle,
+        ]
+    }
+
+    /// The attributes a role paints with.
+    ///
+    /// These describe presentation only. They are applied to the text storage's
+    /// *attributes*, never its characters, so the document's bytes stay exactly
+    /// what was typed.
+    static func attributes(for role: Role) -> [NSAttributedString.Key: Any] {
+        switch role {
+        case let .heading(level):
+            let sizes: [CGFloat] = [0, 30, 25, 21, 18, 16, 15]
+            return [.font: NSFont.systemFont(
+                ofSize: sizes[min(6, max(1, level))],
+                weight: level <= 2 ? .bold : .semibold
+            )]
+        case .quote:
+            return [
+                .foregroundColor: NSColor.secondaryLabelColor,
+                .obliqueness: 0.12,
+            ]
+        case .codeBlock:
+            return [
+                .font: NSFont.monospacedSystemFont(ofSize: 13, weight: .regular),
+                .foregroundColor: NSColor.labelColor,
+                .backgroundColor: NSColor.controlBackgroundColor,
+            ]
+        case .bold:
+            return [.font: NSFont.systemFont(ofSize: bodySize, weight: .semibold)]
+        case .italic:
+            return [.obliqueness: 0.16]
+        case .inlineCode:
+            return [
+                .font: NSFont.monospacedSystemFont(ofSize: 13, weight: .regular),
+                .backgroundColor: NSColor.controlBackgroundColor,
+            ]
+        case .link:
+            return [
+                .foregroundColor: NSColor.linkColor,
+                .underlineStyle: NSUnderlineStyle.single.rawValue,
+            ]
+        case .listMarker:
+            return [
+                .font: NSFont.systemFont(ofSize: bodySize, weight: .semibold),
+                .foregroundColor: NSColor.controlAccentColor,
+            ]
+        case .centered:
+            let paragraph = NSMutableParagraphStyle()
+            paragraph.alignment = .center
+            paragraph.lineSpacing = 3
+            paragraph.paragraphSpacing = 5
+            return [.paragraphStyle: paragraph]
+        case .syntax:
+            // The document reads like prose: syntax occupies an effectively
+            // zero-width run while the source stays exact underneath. The
+            // toolbar's source toggle is the explicit escape hatch for editing
+            // delimiters and HTML attributes.
+            return [
+                .font: NSFont.systemFont(ofSize: 0.1),
+                .foregroundColor: NSColor.clear,
+            ]
+        }
+    }
+}
+
+/// Resolves the destination of the Markdown link under a character index.
+///
+/// The rendered document used SwiftUI's `openURL` for this. A text view has no
+/// equivalent, and a real `.link` attribute would have to live in the text
+/// storage, so the destination is read back out of the source instead — which
+/// also means the link the user follows is literally the link in the file.
+enum MarkdownLinkTargets {
+    private static let inlinePattern = #"(!?)\[([^\]\r\n]*)\]\(\s*<?([^)\s>]+)>?(?:\s+"[^"\r\n]*")?\s*\)"#
+    private static let anchorPattern = #"(?i)<a\b[^>]*\bhref\s*=\s*["']([^"']+)["'][^>]*>.*?</a\s*>"#
+    private static let barePattern = #"(?i)\bhttps?://[^\s<>()\[\]"']+"#
+
+    static func destination(at characterIndex: Int, in source: String) -> String? {
+        let nsSource = source as NSString
+        guard characterIndex >= 0, characterIndex <= nsSource.length else { return nil }
+        // Bound the scan to the paragraph so a long document stays cheap.
+        let paragraph = nsSource.paragraphRange(
+            for: NSRange(location: min(characterIndex, max(0, nsSource.length - 1)), length: 0)
+        )
+        guard paragraph.length > 0 else { return nil }
+        let local = characterIndex - paragraph.location
+        let text = nsSource.substring(with: paragraph)
+        let range = NSRange(location: 0, length: (text as NSString).length)
+
+        for (pattern, group) in [(inlinePattern, 3), (anchorPattern, 1), (barePattern, 0)] {
+            guard let expression = try? NSRegularExpression(
+                pattern: pattern,
+                options: [.dotMatchesLineSeparators]
+            ) else { continue }
+            for match in expression.matches(in: text, range: range)
+            where NSLocationInRange(local, match.range)
+                || local == NSMaxRange(match.range) {
+                // An image is not a link; following one would open the picture
+                // the reader is already looking at.
+                if pattern == inlinePattern,
+                   (text as NSString).substring(with: match.range(at: 1)) == "!" { continue }
+                let destination = (text as NSString).substring(with: match.range(at: group))
+                if !destination.isEmpty { return destination }
+            }
+        }
+        return nil
     }
 }
 
@@ -832,6 +967,15 @@ struct LineTargetTextEditor: NSViewRepresentable {
 
 /// Editable, styled Markdown with native selection, undo, find, contextual
 /// editing, image paste/drop, and trackpad/Command-scroll magnification.
+/// The whole Markdown document as one editable, styled text view.
+///
+/// The document reads like prose — headings, emphasis, code, and links are
+/// styled where they sit and their delimiters collapse — while the text storage
+/// holds the file's exact Markdown. Styling is applied as TextKit *temporary*
+/// attributes and images are painted by the layout manager, so neither the
+/// presentation nor the images ever reach the text storage. What is typed is
+/// what is saved; there is no serializer in the write path to lose a relative
+/// image link or a line ending.
 struct MarkdownRenderedEditor: NSViewRepresentable {
     @Binding var text: String
     let markdownURL: URL
@@ -839,6 +983,15 @@ struct MarkdownRenderedEditor: NSViewRepresentable {
     @Binding var zoom: CGFloat
     let targetLine: Int?
     let onError: (String) -> Void
+    /// Identity for remembered scroll positions. Empty opts out.
+    var documentID: String = ""
+    var scrollMemory: FilePreviewTextScrollMemory? = nil
+    /// Bumped by the workspace watcher. Only re-resolves images; an unchanged
+    /// image file keeps its decoded bytes and its drawn size.
+    var imageRevision: Int = 0
+    var navigationRevision: UInt64 = 0
+    var automaticallyFocus = false
+    var onOpenLink: ((URL) -> Void)? = nil
 
     func makeCoordinator() -> Coordinator {
         Coordinator(text: $text, zoom: $zoom)
@@ -852,16 +1005,36 @@ struct MarkdownRenderedEditor: NSViewRepresentable {
         scrollView.drawsBackground = true
         scrollView.backgroundColor = .textBackgroundColor
         scrollView.allowsMagnification = true
-        scrollView.minMagnification = 0.65
-        scrollView.maxMagnification = 2
+        scrollView.minMagnification = MarkdownPreviewLayout.minimumZoom
+        scrollView.maxMagnification = MarkdownPreviewLayout.maximumZoom
 
-        let textView = MarkdownNativeTextView(frame: NSRect(x: 0, y: 0, width: 640, height: 480))
+        // TextKit 1, assembled by hand so the document can carry a layout
+        // manager that draws inline images. An `NSTextAttachment` would need a
+        // real `U+FFFC` character in the storage, and putting rendering
+        // artifacts into the document is exactly how a previous version of this
+        // surface deleted relative images from saved files.
+        let storage = NSTextStorage()
+        let layoutManager = MarkdownInlineImageLayoutManager()
+        storage.addLayoutManager(layoutManager)
+        let container = NSTextContainer(
+            size: NSSize(width: 0, height: CGFloat.greatestFiniteMagnitude)
+        )
+        container.widthTracksTextView = true
+        container.lineFragmentPadding = 0
+        layoutManager.addTextContainer(container)
+        layoutManager.delegate = context.coordinator
+
+        let textView = MarkdownNativeTextView(
+            frame: NSRect(x: 0, y: 0, width: 640, height: 480),
+            textContainer: container
+        )
         textView.delegate = context.coordinator
         textView.isEditable = true
         textView.isSelectable = true
         textView.isRichText = false
         textView.allowsUndo = true
         textView.usesFindBar = true
+        textView.isIncrementalSearchingEnabled = true
         // Autocorrect is the one AppKit affordance here that mutates text
         // storage rather than presentation, so it can silently rewrite the
         // document — inside fenced code blocks especially. The plain source
@@ -879,24 +1052,19 @@ struct MarkdownRenderedEditor: NSViewRepresentable {
             width: CGFloat.greatestFiniteMagnitude,
             height: CGFloat.greatestFiniteMagnitude
         )
-        textView.textContainer?.containerSize = NSSize(
-            width: 0,
-            height: CGFloat.greatestFiniteMagnitude
-        )
-        textView.textContainer?.widthTracksTextView = true
-        textView.textContainer?.lineFragmentPadding = 0
         textView.textContainerInset = NSSize(width: 18, height: 20)
         textView.backgroundColor = .textBackgroundColor
-        textView.font = .systemFont(ofSize: 15)
+        textView.font = .systemFont(ofSize: MarkdownEditingStyle.bodySize)
         let paragraph = NSMutableParagraphStyle()
         paragraph.lineSpacing = 3
         paragraph.paragraphSpacing = 5
         textView.defaultParagraphStyle = paragraph
         textView.typingAttributes = [
-            .font: NSFont.systemFont(ofSize: 15),
+            .font: NSFont.systemFont(ofSize: MarkdownEditingStyle.bodySize),
             .foregroundColor: NSColor.labelColor,
             .paragraphStyle: paragraph,
         ]
+        textView.setAccessibilityLabel("Markdown document")
         textView.string = text
         textView.registerForDraggedTypes([.fileURL, .png, .tiff])
         textView.onImageImports = { [weak coordinator = context.coordinator] imports, range in
@@ -905,18 +1073,27 @@ struct MarkdownRenderedEditor: NSViewRepresentable {
         textView.onChooseImages = { [weak coordinator = context.coordinator] range in
             coordinator?.chooseImages(at: range)
         }
+        textView.onFollowLink = { [weak coordinator = context.coordinator] index in
+            coordinator?.followLink(at: index)
+        }
 
         scrollView.documentView = textView
         scrollView.magnification = zoom
         scrollView.onMagnificationChanged = { [weak coordinator = context.coordinator] value in
             coordinator?.zoom = value
         }
-        context.coordinator.textView = textView
+        context.coordinator.attach(textView: textView, scrollView: scrollView)
         context.coordinator.markdownURL = markdownURL
         context.coordinator.workspaceRoot = workspaceRoot
         context.coordinator.onError = onError
+        context.coordinator.onOpenLink = onOpenLink
+        context.coordinator.adopt(documentID: documentID, scrollMemory: scrollMemory)
         context.coordinator.scheduleStyling(immediately: true)
-        context.coordinator.scrollIfNeeded(to: targetLine)
+        context.coordinator.refreshImages(revision: imageRevision, force: true)
+        context.coordinator.scrollIfNeeded(to: targetLine, revision: navigationRevision)
+        if automaticallyFocus {
+            DispatchQueue.main.async { textView.window?.makeFirstResponder(textView) }
+        }
         return scrollView
     }
 
@@ -925,18 +1102,25 @@ struct MarkdownRenderedEditor: NSViewRepresentable {
         coordinator.markdownURL = markdownURL
         coordinator.workspaceRoot = workspaceRoot
         coordinator.onError = onError
+        coordinator.onOpenLink = onOpenLink
         guard let textView = coordinator.textView else { return }
+        coordinator.adopt(documentID: documentID, scrollMemory: scrollMemory)
 
-        if textView.string != text {
-            let selection = textView.selectedRange()
-            coordinator.isApplyingExternalValue = true
-            textView.string = text
-            let location = min(selection.location, (text as NSString).length)
-            let length = min(selection.length, (text as NSString).length - location)
-            textView.setSelectedRange(NSRange(location: location, length: length))
-            coordinator.isApplyingExternalValue = false
-            coordinator.scheduleStyling(immediately: true)
+        // The load-bearing guard. Saving, autosaving, journaling, and
+        // reconciling an unchanged file all re-run this body with the string
+        // already on screen; swapping the storage there collapses layout and
+        // throws the viewport back to line 1.
+        switch MarkdownEditorTextSync.plan(
+            current: textView.string,
+            incoming: text,
+            selection: textView.selectedRange()
+        ) {
+        case .unchanged:
+            break
+        case let .replace(selection):
+            coordinator.replaceText(with: text, restoring: selection)
         }
+
         if abs(scrollView.magnification - zoom) > 0.001 {
             let center = textView.convert(
                 NSPoint(x: scrollView.contentView.bounds.midX, y: scrollView.contentView.bounds.midY),
@@ -950,21 +1134,47 @@ struct MarkdownRenderedEditor: NSViewRepresentable {
         // the clip view. Reconcile here as well as during NSScrollView tiling so
         // external zoom changes and the first representable update both reflow.
         scrollView.reflowDocumentWidth()
-        coordinator.scrollIfNeeded(to: targetLine)
+        coordinator.refreshImages(revision: imageRevision, force: false)
+        coordinator.scrollIfNeeded(to: targetLine, revision: navigationRevision)
+    }
+
+    static func dismantleNSView(
+        _ scrollView: MarkdownMagnifyingScrollView,
+        coordinator: Coordinator
+    ) {
+        coordinator.recordScrollPosition()
     }
 
     @MainActor
-    final class Coordinator: NSObject, NSTextViewDelegate {
+    // Layout callbacks arrive on the main thread with the text view, but
+    // `NSLayoutManagerDelegate` predates the SDK's actor annotations.
+    final class Coordinator: NSObject, NSTextViewDelegate, @preconcurrency NSLayoutManagerDelegate {
         @Binding var text: String
         @Binding var zoom: CGFloat
         weak var textView: MarkdownNativeTextView?
+        private weak var scrollView: NSScrollView?
         var markdownURL: URL?
         var workspaceRoot: URL?
         var onError: ((String) -> Void)?
+        var onOpenLink: ((URL) -> Void)?
         var isApplyingExternalValue = false
+        /// Guards the attribute pass so a restyle cannot be mistaken for a user
+        /// edit and start the save/journal machinery.
+        private var isApplyingStyle = false
         private var styleTask: Task<Void, Never>?
         private var importTask: Task<Void, Never>?
+        private var imageTask: Task<Void, Never>?
         private var lastScrollKey: String?
+        private var appliedImageRevision: Int?
+        private var appliedImageSource: String?
+        private var appliedImageWidth: CGFloat?
+
+        // Scroll retention, matching the read-only source surface so the
+        // document/source toggle keeps the same text at the top.
+        private var scrollMemory: FilePreviewTextScrollMemory?
+        private var documentID = ""
+        private var pendingRestore = true
+        private var programmaticScrollDepth = 0
 
         init(text: Binding<String>, zoom: Binding<CGFloat>) {
             _text = text
@@ -974,27 +1184,134 @@ struct MarkdownRenderedEditor: NSViewRepresentable {
         deinit {
             styleTask?.cancel()
             importTask?.cancel()
+            imageTask?.cancel()
         }
 
+        func attach(textView: MarkdownNativeTextView, scrollView: NSScrollView) {
+            self.textView = textView
+            self.scrollView = scrollView
+            scrollView.contentView.postsBoundsChangedNotifications = true
+            // Selector-based registration is zeroing-weak, so no explicit
+            // removal is needed when the coordinator goes away.
+            NotificationCenter.default.addObserver(
+                self,
+                selector: #selector(viewportDidScroll),
+                name: NSView.boundsDidChangeNotification,
+                object: scrollView.contentView
+            )
+        }
+
+        func adopt(documentID: String, scrollMemory: FilePreviewTextScrollMemory?) {
+            self.scrollMemory = scrollMemory
+            guard self.documentID != documentID else { return }
+            recordScrollPosition()
+            self.documentID = documentID
+            pendingRestore = true
+            DispatchQueue.main.async { [weak self] in self?.restoreScrollPosition() }
+        }
+
+        @objc private func viewportDidScroll() {
+            recordScrollPosition()
+        }
+
+        func recordScrollPosition() {
+            guard !pendingRestore, programmaticScrollDepth == 0,
+                  let scrollMemory, !documentID.isEmpty,
+                  let textView, let scrollView,
+                  FilePreviewTextScroll.canMeasure(textView, in: scrollView) else { return }
+            scrollMemory.record(
+                FilePreviewTextScroll.scrollFraction(in: textView, scrollView: scrollView),
+                for: documentID
+            )
+        }
+
+        private func restoreScrollPosition() {
+            guard pendingRestore, let textView, let scrollView else { return }
+            pendingRestore = false
+            guard let fraction = scrollMemory?.fraction(for: documentID), fraction > 0 else { return }
+            programmaticScrollDepth += 1
+            FilePreviewTextScroll.scroll(to: fraction, in: textView, scrollView: scrollView)
+            DispatchQueue.main.async { [weak self] in
+                guard let self else { return }
+                if let textView = self.textView, let scrollView = self.scrollView,
+                   FilePreviewTextScroll.canMeasure(textView, in: scrollView) {
+                    FilePreviewTextScroll.scroll(to: fraction, in: textView, scrollView: scrollView)
+                }
+                self.programmaticScrollDepth -= 1
+            }
+        }
+
+        /// Replace the whole document (an external reload or a discarded draft)
+        /// while keeping the reader roughly where they were.
+        func replaceText(with value: String, restoring selection: NSRange) {
+            guard let textView else { return }
+            let previousOrigin = scrollView?.contentView.bounds.origin.y ?? 0
+            let previousHeight = textView.bounds.height
+            let viewportHeight = scrollView?.contentView.bounds.height ?? 0
+            isApplyingExternalValue = true
+            programmaticScrollDepth += 1
+            textView.string = value
+            textView.setSelectedRange(selection)
+            isApplyingExternalValue = false
+            scheduleStyling(immediately: true)
+            refreshImages(revision: appliedImageRevision ?? 0, force: true)
+            if let scrollView, previousOrigin > 0 {
+                if let container = textView.textContainer {
+                    textView.layoutManager?.ensureLayout(for: container)
+                }
+                let origin = MarkdownEditorScrollRetention.restoredOrigin(
+                    previousOrigin: previousOrigin,
+                    previousContentHeight: previousHeight,
+                    newContentHeight: textView.bounds.height,
+                    viewportHeight: viewportHeight
+                )
+                scrollView.contentView.scroll(to: NSPoint(x: 0, y: origin))
+                scrollView.reflectScrolledClipView(scrollView.contentView)
+            }
+            programmaticScrollDepth -= 1
+        }
+
+        // MARK: Editing
+
         func textDidChange(_ notification: Notification) {
-            guard !isApplyingExternalValue,
+            guard !isApplyingExternalValue, !isApplyingStyle,
                   let textView = notification.object as? MarkdownNativeTextView else { return }
             text = textView.string
             scheduleStyling(immediately: false)
+            scheduleImageRefresh()
         }
 
-        func scrollIfNeeded(to oneBasedLine: Int?) {
+        /// `revision` is what makes clicking the same outline row twice work:
+        /// the target line has not changed, but the request has.
+        func scrollIfNeeded(to oneBasedLine: Int?, revision: UInt64) {
             guard let oneBasedLine, oneBasedLine > 0, let textView else { return }
-            let key = "\(markdownURL?.path ?? "")|\(oneBasedLine)|\(textView.string.utf8.count)"
+            let key = "\(markdownURL?.path ?? "")|\(oneBasedLine)|\(revision)"
             guard key != lastScrollKey else { return }
             lastScrollKey = key
             let range = FileLineNavigation.range(forOneBasedLine: oneBasedLine, in: textView.string)
             textView.setSelectedRange(NSRange(location: range.location, length: 0))
+            // An explicit navigation outranks a remembered position.
+            pendingRestore = false
             DispatchQueue.main.async { [weak textView] in
                 textView?.scrollRangeToVisible(range)
                 textView?.showFindIndicator(for: range)
             }
         }
+
+        func followLink(at characterIndex: Int) {
+            guard let textView, let onOpenLink else { return }
+            guard let destination = MarkdownLinkTargets.destination(
+                at: characterIndex,
+                in: textView.string
+            ) else { return }
+            guard let url = URL(string: destination)
+                ?? URL(string: destination.addingPercentEncoding(
+                    withAllowedCharacters: .urlPathAllowed
+                ) ?? destination) else { return }
+            onOpenLink(url)
+        }
+
+        // MARK: Styling
 
         func scheduleStyling(immediately: Bool) {
             styleTask?.cancel()
@@ -1015,6 +1332,225 @@ struct MarkdownRenderedEditor: NSViewRepresentable {
                 self.apply(spans, to: textView)
             }
         }
+
+        /// Paint the document's typography.
+        ///
+        /// These are real text-storage attributes rather than TextKit
+        /// *temporary* attributes. Temporary attributes are documented as not
+        /// affecting layout, and in practice a temporary font does not drive
+        /// glyph metrics or line height: headings came out body-sized and
+        /// "hidden" delimiters kept their full width. That was tolerable when
+        /// this editor was a small box inside a separately rendered document.
+        /// Now that it *is* the document, the typography has to be real.
+        ///
+        /// This does not weaken the byte guarantee. Attributes are not
+        /// characters: `textView.string` is untouched, and the save path writes
+        /// that string. The text view is also `isRichText = false`, so styling
+        /// can never be typed, pasted, or copied out of the document either.
+        private func apply(_ spans: [MarkdownEditingStyle.Span], to textView: NSTextView) {
+            guard let storage = textView.textStorage else { return }
+            let fullRange = NSRange(location: 0, length: storage.length)
+            guard fullRange.length > 0 else { return }
+
+            // Typography changes the document's height, so pin the character at
+            // the top of the viewport and put it back afterwards rather than
+            // letting the scroll view keep a now-meaningless pixel offset.
+            let anchor = viewportAnchor()
+            let before = storage.string
+
+            isApplyingStyle = true
+            storage.beginEditing()
+            storage.setAttributes(MarkdownEditingStyle.baseAttributes, range: fullRange)
+            for span in spans where NSMaxRange(span.range) <= fullRange.length {
+                storage.addAttributes(
+                    MarkdownEditingStyle.attributes(for: span.role),
+                    range: span.range
+                )
+            }
+            storage.endEditing()
+            isApplyingStyle = false
+
+            // A styling pass must never be able to change the document.
+            assert(storage.string == before, "Markdown styling mutated document text")
+            restore(anchor)
+        }
+
+        /// The character at the top of the viewport plus how far above the
+        /// viewport top its line begins.
+        private func viewportAnchor() -> (characterIndex: Int, offset: CGFloat)? {
+            guard let textView, let scrollView,
+                  let layoutManager = textView.layoutManager,
+                  let container = textView.textContainer,
+                  textView.window != nil else { return nil }
+            let visible = scrollView.contentView.bounds
+            guard visible.height > 0, visible.origin.y > 0 else { return nil }
+            let point = NSPoint(
+                x: 0,
+                y: visible.origin.y - textView.textContainerOrigin.y
+            )
+            let glyph = layoutManager.glyphIndex(for: point, in: container)
+            let character = layoutManager.characterIndexForGlyph(at: glyph)
+            let lineRect = layoutManager.lineFragmentRect(
+                forGlyphAt: glyph,
+                effectiveRange: nil,
+                withoutAdditionalLayout: true
+            )
+            return (character, visible.origin.y - (lineRect.minY + textView.textContainerOrigin.y))
+        }
+
+        private func restore(_ anchor: (characterIndex: Int, offset: CGFloat)?) {
+            guard let anchor, let textView, let scrollView,
+                  let layoutManager = textView.layoutManager else { return }
+            let length = (textView.string as NSString).length
+            guard anchor.characterIndex < length else { return }
+            let glyph = layoutManager.glyphIndexForCharacter(at: anchor.characterIndex)
+            let lineRect = layoutManager.lineFragmentRect(
+                forGlyphAt: glyph,
+                effectiveRange: nil,
+                withoutAdditionalLayout: true
+            )
+            let target = lineRect.minY + textView.textContainerOrigin.y + anchor.offset
+            let maximum = max(0, textView.bounds.height - scrollView.contentView.bounds.height)
+            let origin = min(max(0, target), maximum)
+            guard abs(origin - scrollView.contentView.bounds.origin.y) > 0.5 else { return }
+            programmaticScrollDepth += 1
+            scrollView.contentView.scroll(to: NSPoint(x: 0, y: origin))
+            scrollView.reflectScrolledClipView(scrollView.contentView)
+            programmaticScrollDepth -= 1
+        }
+
+        // MARK: Inline images
+
+        private func scheduleImageRefresh() {
+            guard let textView else { return }
+            // Only re-scan when the set of image lines can actually have moved.
+            let source = textView.string
+            guard source != appliedImageSource else { return }
+            refreshImages(revision: appliedImageRevision ?? 0, force: true)
+        }
+
+        func refreshImages(revision: Int, force: Bool) {
+            guard let textView, let markdownURL else { return }
+            let width = textView.textContainer?.size.width ?? textView.bounds.width
+            let source = textView.string
+            let unchanged = !force
+                && appliedImageRevision == revision
+                && appliedImageSource == source
+                && appliedImageWidth.map { abs($0 - width) < 0.5 } == true
+            guard !unchanged else { return }
+            appliedImageRevision = revision
+            appliedImageSource = source
+            appliedImageWidth = width
+
+            let workspaceRoot = workspaceRoot
+            imageTask?.cancel()
+            imageTask = Task { [weak self] in
+                let lines = await Task.detached(priority: .utility) {
+                    MarkdownInlineImages.lines(in: source)
+                }.value
+                guard !Task.isCancelled else { return }
+                var resolved: [(MarkdownInlineImageReference, MarkdownImagePayload?)] = []
+                for line in lines {
+                    for reference in line.references {
+                        let payload = await Task.detached(priority: .utility) {
+                            MarkdownLocalImageCache.shared.load(
+                                source: reference.source,
+                                documentURL: markdownURL,
+                                workspaceRoot: workspaceRoot
+                            )
+                        }.value
+                        guard !Task.isCancelled else { return }
+                        resolved.append((reference, payload))
+                    }
+                }
+                guard !Task.isCancelled, let self, let textView = self.textView,
+                      textView.string == source else { return }
+                self.install(resolved, availableWidth: width, in: textView)
+            }
+        }
+
+        private func install(
+            _ resolved: [(MarkdownInlineImageReference, MarkdownImagePayload?)],
+            availableWidth: CGFloat,
+            in textView: MarkdownNativeTextView
+        ) {
+            guard let layoutManager = textView.layoutManager
+                as? MarkdownInlineImageLayoutManager else { return }
+            let anchor = viewportAnchor()
+            // Several images on one line share the width.
+            var perLine: [Int: Int] = [:]
+            let nsSource = textView.string as NSString
+            for (reference, _) in resolved {
+                let line = nsSource.lineRange(for: NSRange(location: reference.range.location, length: 0))
+                perLine[line.location, default: 0] += 1
+            }
+            let placements = resolved.map { reference, payload -> MarkdownInlineImageLayoutManager.Placement in
+                let line = nsSource.lineRange(
+                    for: NSRange(location: reference.range.location, length: 0)
+                )
+                let share = CGFloat(max(1, perLine[line.location] ?? 1))
+                let budget = max(48, (availableWidth - (share - 1) * 8) / share)
+                let size = MarkdownPreviewLayout.imageSize(
+                    intrinsicSize: payload?.image.size ?? CGSize(width: 240, height: 44),
+                    declaredWidth: reference.declaredWidth,
+                    declaredHeight: reference.declaredHeight,
+                    availableWidth: budget,
+                    // The scroll view magnifies the whole document, so image
+                    // sizing works in unzoomed document coordinates.
+                    zoom: 1
+                )
+                return MarkdownInlineImageLayoutManager.Placement(
+                    range: reference.range,
+                    size: payload == nil ? CGSize(width: min(240, budget), height: 44) : size,
+                    image: payload?.image,
+                    alt: reference.alt
+                )
+            }
+            layoutManager.setPlacements(placements)
+            let fullRange = NSRange(location: 0, length: nsSource.length)
+            layoutManager.invalidateLayout(forCharacterRange: fullRange, actualCharacterRange: nil)
+            if let container = textView.textContainer {
+                layoutManager.ensureLayout(for: container)
+            }
+            restore(anchor)
+        }
+
+        /// Give an image line the height of its tallest image.
+        ///
+        /// The reference text itself is styled away by `MarkdownEditingStyle`,
+        /// so the line would otherwise collapse to nothing and the picture
+        /// would paint over its neighbours.
+        func layoutManager(
+            _ layoutManager: NSLayoutManager,
+            shouldSetLineFragmentRect lineFragmentRect: UnsafeMutablePointer<NSRect>,
+            lineFragmentUsedRect: UnsafeMutablePointer<NSRect>,
+            baselineOffset: UnsafeMutablePointer<CGFloat>,
+            in textContainer: NSTextContainer,
+            forGlyphRange glyphRange: NSRange
+        ) -> Bool {
+            guard let manager = layoutManager as? MarkdownInlineImageLayoutManager,
+                  !manager.placements.isEmpty,
+                  let storage = layoutManager.textStorage else { return false }
+            // Deliberately not `characterRange(forGlyphRange:)`: asking the
+            // layout manager to map a range mid-layout can re-enter layout.
+            let start = manager.characterIndexForGlyph(at: glyphRange.location)
+            guard start < storage.length else { return false }
+            let line = (storage.string as NSString).lineRange(
+                for: NSRange(location: start, length: 0)
+            )
+            guard let height = manager.imageHeight(inCharacterRange: line) else { return false }
+            let target = height + MarkdownInlineImageLayoutManager.verticalPadding
+            var rect = lineFragmentRect.pointee
+            var used = lineFragmentUsedRect.pointee
+            rect.size.height = target
+            used.size.height = target
+            lineFragmentRect.pointee = rect
+            lineFragmentUsedRect.pointee = used
+            baselineOffset.pointee = target - 2
+            return true
+        }
+
+        // MARK: Images from paste, drop, and the menu
 
         func importImages(_ imports: [MarkdownImageImport], at requestedRange: NSRange) {
             guard let markdownURL else { return }
@@ -1062,82 +1598,6 @@ struct MarkdownRenderedEditor: NSViewRepresentable {
             panel.canChooseDirectories = false
             guard panel.runModal() == .OK else { return }
             importImages(panel.urls.map(MarkdownImageImport.file), at: range)
-        }
-
-        private func apply(_ spans: [MarkdownEditingStyle.Span], to textView: NSTextView) {
-            guard let layoutManager = textView.layoutManager else { return }
-            let fullRange = NSRange(location: 0, length: (textView.string as NSString).length)
-            for key in [
-                NSAttributedString.Key.font,
-                .foregroundColor,
-                .backgroundColor,
-                .underlineStyle,
-                .obliqueness,
-                .paragraphStyle,
-            ] {
-                layoutManager.removeTemporaryAttribute(key, forCharacterRange: fullRange)
-            }
-
-            let bodySize: CGFloat = 15
-            for span in spans where NSMaxRange(span.range) <= fullRange.length {
-                switch span.role {
-                case let .heading(level):
-                    let sizes: [CGFloat] = [0, 30, 25, 21, 18, 16, 15]
-                    layoutManager.addTemporaryAttribute(
-                        .font,
-                        value: NSFont.systemFont(ofSize: sizes[min(6, level)], weight: level <= 2 ? .bold : .semibold),
-                        forCharacterRange: span.range
-                    )
-                case .quote:
-                    layoutManager.addTemporaryAttribute(.foregroundColor, value: NSColor.secondaryLabelColor, forCharacterRange: span.range)
-                    layoutManager.addTemporaryAttribute(.obliqueness, value: 0.12, forCharacterRange: span.range)
-                case .codeBlock:
-                    layoutManager.addTemporaryAttribute(.font, value: NSFont.monospacedSystemFont(ofSize: 13, weight: .regular), forCharacterRange: span.range)
-                    layoutManager.addTemporaryAttribute(.foregroundColor, value: NSColor.labelColor, forCharacterRange: span.range)
-                    layoutManager.addTemporaryAttribute(.backgroundColor, value: NSColor.controlBackgroundColor, forCharacterRange: span.range)
-                case .bold:
-                    layoutManager.addTemporaryAttribute(.font, value: NSFont.systemFont(ofSize: bodySize, weight: .semibold), forCharacterRange: span.range)
-                case .italic:
-                    layoutManager.addTemporaryAttribute(.obliqueness, value: 0.16, forCharacterRange: span.range)
-                case .inlineCode:
-                    layoutManager.addTemporaryAttribute(.font, value: NSFont.monospacedSystemFont(ofSize: 13, weight: .regular), forCharacterRange: span.range)
-                    layoutManager.addTemporaryAttribute(.backgroundColor, value: NSColor.controlBackgroundColor, forCharacterRange: span.range)
-                case .link:
-                    layoutManager.addTemporaryAttribute(.foregroundColor, value: NSColor.linkColor, forCharacterRange: span.range)
-                    layoutManager.addTemporaryAttribute(.underlineStyle, value: NSUnderlineStyle.single.rawValue, forCharacterRange: span.range)
-                case .listMarker:
-                    layoutManager.addTemporaryAttribute(
-                        .font,
-                        value: NSFont.systemFont(ofSize: bodySize, weight: .semibold),
-                        forCharacterRange: span.range
-                    )
-                    layoutManager.addTemporaryAttribute(
-                        .foregroundColor,
-                        value: NSColor.controlAccentColor,
-                        forCharacterRange: span.range
-                    )
-                case .centered:
-                    let paragraph = NSMutableParagraphStyle()
-                    paragraph.alignment = .center
-                    paragraph.lineSpacing = 3
-                    paragraph.paragraphSpacing = 5
-                    layoutManager.addTemporaryAttribute(.paragraphStyle, value: paragraph, forCharacterRange: span.range)
-                case .syntax:
-                    // Default mode reads like a document: syntax occupies an
-                    // effectively zero-width run while the source stays exact
-                    // underneath. The toolbar's source toggle is the explicit
-                    // escape hatch for editing delimiters and HTML attributes.
-                    layoutManager.addTemporaryAttribute(.font, value: NSFont.systemFont(ofSize: 0.1), forCharacterRange: span.range)
-                    layoutManager.addTemporaryAttribute(.foregroundColor, value: NSColor.clear, forCharacterRange: span.range)
-                }
-            }
-            // Temporary font attributes affect glyph metrics only after the
-            // layout pass is invalidated. Without this, invisible delimiters
-            // can still wrap visible text at narrow panel widths.
-            layoutManager.invalidateLayout(forCharacterRange: fullRange, actualCharacterRange: nil)
-            if let container = textView.textContainer {
-                layoutManager.ensureLayout(for: container)
-            }
         }
     }
 }
@@ -1325,9 +1785,21 @@ enum MarkdownListContinuation: Equatable, Sendable {
 final class MarkdownNativeTextView: NSTextView {
     var onImageImports: (([MarkdownImageImport], NSRange) -> Void)?
     var onChooseImages: ((NSRange) -> Void)?
+    /// Command-click on a Markdown link. A plain click has to keep placing the
+    /// caret — this is a document you type in, not a page you browse.
+    var onFollowLink: ((Int) -> Void)?
 
     static func wholeFileSourceEditor() -> MarkdownNativeTextView {
         MarkdownNativeTextView(usingTextLayoutManager: true)
+    }
+
+    override func mouseDown(with event: NSEvent) {
+        guard onFollowLink != nil, event.modifierFlags.contains(.command) else {
+            super.mouseDown(with: event)
+            return
+        }
+        let point = convert(event.locationInWindow, from: nil)
+        onFollowLink?(min(characterIndexForInsertion(at: point), (string as NSString).length))
     }
 
     override func insertNewline(_ sender: Any?) {

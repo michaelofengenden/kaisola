@@ -509,7 +509,12 @@ final class NativePreviewSettingsTests: XCTestCase {
         // passed no desktop colour at all, and the 0.16 that replaced it was
         // calibrated against vibrancy but ended up over a *painted wallpaper*,
         // which passes everything.
-        XCTAssertEqual(GlassBackdropWash.sidebar(isDark: false).baseOpacity, 0.60, accuracy: 0.0001)
+        // Light moved for the same reason dark did, one round later: "light
+        // mode should also be translucent to wallpaper much better". 0.60 →
+        // 0.45, transmission 0.40 → 0.55, and — like dark — only reachable
+        // because the bake bounds the still's range first.
+        XCTAssertEqual(GlassBackdropWash.sidebar(isDark: false).baseOpacity, 0.45, accuracy: 0.0001)
+        XCTAssertEqual(GlassBackdropWash.workspace(isDark: false).baseOpacity, 0.40, accuracy: 0.0001)
         // Dark is thinner than light now, and deliberately so: it used to be
         // the least translucent surface in the app (0.40 transmission against
         // light's 0.40 on the sidebar and 0.45 on the workspace), which is what
@@ -528,6 +533,14 @@ final class NativePreviewSettingsTests: XCTestCase {
         // half again as much desktop as it did, on both surfaces.
         XCTAssertGreaterThan(GlassBackdropWash.sidebar(isDark: true).desktopTransmission, 0.65)
         XCTAssertGreaterThan(GlassBackdropWash.workspace(isDark: true).desktopTransmission, 0.60)
+        // …and light, whose ask came next, passes at least a third more than the
+        // 0.40/0.45 it shipped with.
+        XCTAssertGreaterThan(
+            GlassBackdropWash.sidebar(isDark: false).desktopTransmission, 0.40 * 1.33
+        )
+        XCTAssertGreaterThan(
+            GlassBackdropWash.workspace(isDark: false).desktopTransmission, 0.45 * 1.33
+        )
     }
 
     /// Dark's gradient carried half the light direction light's did — 0.0144 of
@@ -562,12 +575,14 @@ final class NativePreviewSettingsTests: XCTestCase {
     /// not — and only a band expresses that. A one-sided floor is what let the
     /// veil drift to 0.16 without a single test objecting.
     ///
-    /// The ceiling is per appearance now. In dark the "not a photograph" half of
-    /// the contract is enforced by the *bake* — mean normalized to 0.16, range
-    /// capped at `darkStillSpreadCeiling` — so the veil is no longer the thing
-    /// standing between the user and a raw wallpaper, and holding it to light's
-    /// number would be pricing in a guarantee that is now made elsewhere. Light
-    /// has no range cap and so keeps the tighter ceiling.
+    /// The ceiling is per appearance now. In *both* appearances the "not a
+    /// photograph" half of the contract is enforced by the **bake** — mean
+    /// normalized to `targetLuminance`, range capped at
+    /// `stillSpreadCeiling(isDark:)` — so the veil is no longer the thing
+    /// standing between the user and a raw wallpaper, and holding either to an
+    /// historical 0.50 would be pricing in a guarantee that is now made
+    /// elsewhere. Light stays the tighter of the two because its *contrast*
+    /// budget is tighter, not because it is unguarded.
     func testGlassVeilsFrostTheDesktopWithoutErasingIt() {
         for isDark in [false, true] {
             let band = GlassBackdropWash.desktopTransmissionBand(isDark: isDark)
@@ -587,14 +602,27 @@ final class NativePreviewSettingsTests: XCTestCase {
                 )
             }
         }
-        // Dark's wider ceiling is *bought* by the range cap, so the two have to
-        // move together: relaxing the veil while deleting the cap is the
-        // combination that puts a raw wallpaper behind the labels.
+        // Every ceiling past 0.50 is *bought* by the range cap, so the two have
+        // to move together: relaxing a veil while deleting the cap that pays for
+        // it is the combination that puts a raw wallpaper behind the labels.
+        // Asserted for both appearances now that both carry a cap.
         XCTAssertGreaterThan(
             GlassBackdropWash.desktopTransmissionBand(isDark: true).ceiling,
             GlassBackdropWash.desktopTransmissionBand(isDark: false).ceiling
         )
-        XCTAssertLessThan(DesktopBackdropRenderer.darkStillSpreadCeiling, 0.45)
+        for isDark in [false, true] {
+            XCTAssertLessThan(
+                DesktopBackdropRenderer.stillSpreadCeiling(isDark: isDark), 0.45,
+                "a veil past 0.50 transmission is unpaid for in \(isDark ? "dark" : "light")"
+            )
+        }
+        // Light's cap is the tighter of the two, because its contrast budget is:
+        // black ink on a near-white surface has less to spend than white ink on
+        // a near-black one.
+        XCTAssertLessThan(
+            DesktopBackdropRenderer.lightStillSpreadCeiling,
+            DesktopBackdropRenderer.darkStillSpreadCeiling
+        )
     }
 
 
@@ -1601,6 +1629,138 @@ final class NativePreviewSettingsTests: XCTestCase {
         }
     }
 
+    /// The light half of the same constraint, and the place where the stated
+    /// floor is honestly not met — so it is written down as an assertion rather
+    /// than as a sentence in a report.
+    ///
+    /// Light's **primary** clears 7:1 with room to spare. Light's **secondary**
+    /// cannot reach 4.5:1 on any surface, and that is not a property of the
+    /// veil: AppKit's `secondaryLabelColor` in Aqua is black at α 0.498, and
+    /// black at α 0.498 over *pure white* — the brightest background that can
+    /// exist — is 3.98:1. The first assertion below proves that, so the number
+    /// this test does hold light to is a measured ceiling and not a guess.
+    ///
+    /// What is therefore asserted is the thing that is actually in the app's
+    /// control: the worst patch stays at or above the figure the **previous**
+    /// constants delivered (3.43:1 over the five aerial extremes, 3.17:1 over
+    /// the adversarial ramps), so the translucency retune did not buy itself
+    /// legibility. 3.4 is that bound with the fixture's own margin.
+    func testLightGlassStaysLegibleOnTheWorstPatchOfEveryWallpaper() throws {
+        // The ceiling, proved rather than asserted. `secondaryLabelColor` is
+        // read from AppKit itself so this cannot drift away from the platform.
+        let aqua = try XCTUnwrap(NSAppearance(named: .aqua))
+        var secondaryAlpha = 0.0
+        aqua.performAsCurrentDrawingAppearance {
+            secondaryAlpha = Double(
+                (NSColor.secondaryLabelColor.usingColorSpace(.sRGB)?.alphaComponent) ?? 0
+            )
+        }
+        XCTAssertEqual(secondaryAlpha, 0.498, accuracy: 0.01)
+        let bestPossible = contrastRatio(
+            text: (1 - secondaryAlpha, 1 - secondaryAlpha, 1 - secondaryAlpha),
+            over: (1, 1, 1)
+        )
+        XCTAssertLessThan(
+            bestPossible, 4.5,
+            """
+            AppKit's secondary label now reaches \(bestPossible):1 on pure white, \
+            so the 4.5 floor is reachable in light after all and this test should \
+            be tightened to hold it.
+            """
+        )
+
+        let directory = FileManager.default.temporaryDirectory
+            .appending(path: "kaisola-lightpatch-\(UUID().uuidString)", directoryHint: .isDirectory)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        // The same six fixtures the dark test uses, so the two appearances are
+        // held to the same wallpapers.
+        let wallpapers: [(name: String, base: (Double, Double, Double), range: Double)] = [
+            ("aerial", (0.263, 0.476, 0.575), 0.9),     // Michael's own desktop
+            ("dim", (0.06, 0.07, 0.09), 0.9),
+            ("bright", (0.82, 0.80, 0.76), 0.7),
+            ("saturated", (0.42, 0.20, 0.08), 0.8),
+            ("neutral-wide", (0.435, 0.435, 0.435), 1.6),
+            ("adversarial", (0.5, 0.5, 0.5), 1.95),
+        ]
+
+        for (name, base, range) in wallpapers {
+            let url = try writeRampWallpaper(base: base, range: range, into: directory, named: name)
+            for (surface, wash, width, height) in [
+                ("sidebar", GlassBackdropWash.sidebar(isDark: false), 210, 900),
+                ("workspace", GlassBackdropWash.workspace(isDark: false), 900, 900),
+            ] {
+                let key = DesktopBackdropKey(path: url.path, modified: nil, isDark: false)
+                guard case let .wallpaper(still, _)? = DesktopBackdropRenderer.render(key: key) else {
+                    return XCTFail("\(name) produced no painting")
+                }
+                let pixels = try renderGlassSurface(
+                    still: still, wash: wash, isDark: false, width: width, height: height
+                )
+                let worst = worstPatchContrast(pixels, isDark: false)
+                print(String(
+                    format: "[light-glass] %@ %@ worst patch %.3f/%.3f/%.3f  primary %.2f:1  secondary %.2f:1  spread %.4f",
+                    name, surface, worst.patch.0, worst.patch.1, worst.patch.2,
+                    worst.primary, worst.secondary, luminanceSpread(pixels)
+                ))
+                XCTAssertGreaterThanOrEqual(
+                    worst.primary, 7,
+                    "\(name) \(surface): primary label on the worst patch is \(worst.primary):1"
+                )
+                XCTAssertGreaterThanOrEqual(
+                    worst.secondary, 3.4,
+                    """
+                    \(name) \(surface): secondary label on the worst patch is \
+                    \(worst.secondary):1, below what the pre-retune veil delivered
+                    """
+                )
+            }
+        }
+    }
+
+    /// The mechanism that *would* lift light's secondary over the floor, kept as
+    /// a live measurement rather than a note: a custom ink instead of the system
+    /// semantic. Recorded here so the follow-up has a number, and so it stops
+    /// being true the moment the surface drifts far enough that it would not
+    /// work.
+    func testACustomSecondaryInkWouldClearTheFloorOnLightGlass() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appending(path: "kaisola-lightink-\(UUID().uuidString)", directoryHint: .isDirectory)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        // The worst of the six: the widest range on the deeper of the two
+        // surfaces is where every light worst case in this file is found.
+        let url = try writeRampWallpaper(
+            base: (0.5, 0.5, 0.5), range: 1.95, into: directory, named: "adversarial"
+        )
+        let key = DesktopBackdropKey(path: url.path, modified: nil, isDark: false)
+        guard case let .wallpaper(still, _)? = DesktopBackdropRenderer.render(key: key) else {
+            return XCTFail("the adversarial fixture produced no painting")
+        }
+        let pixels = try renderGlassSurface(
+            still: still, wash: GlassBackdropWash.workspace(isDark: false),
+            isDark: false, width: 900, height: 900
+        )
+        let patch = worstPatchContrast(pixels, isDark: false).patch
+        func inked(_ alpha: Double) -> Double {
+            contrastRatio(
+                text: (patch.0 * (1 - alpha), patch.1 * (1 - alpha), patch.2 * (1 - alpha)),
+                over: patch
+            )
+        }
+        print(String(
+            format: "[light-glass] worst-patch secondary: AppKit α0.498 %.2f:1, custom α0.60 %.2f:1",
+            inked(0.498), inked(0.60)
+        ))
+        XCTAssertLessThan(inked(0.498), 4.5, "the system semantic clears the floor after all")
+        XCTAssertGreaterThanOrEqual(
+            inked(0.60), 4.5,
+            "a custom α0.60 ink no longer buys the floor; the follow-up needs re-deriving"
+        )
+    }
+
     /// The other half of the same trade: the surface has to have got *more*
     /// translucent, or the retune bought nothing and only spent contrast.
     ///
@@ -1649,6 +1809,82 @@ final class NativePreviewSettingsTests: XCTestCase {
         XCTAssertGreaterThan(now.desktopTransmission, before.desktopTransmission * 1.3)
     }
 
+    /// The same claim for light, and stated in the currency light's retune is
+    /// actually paid in.
+    ///
+    /// Dark's headline was luminance spread. Light's is **chroma**: across the
+    /// whole change (old bake + old veil → new bake + new veil) the composite's
+    /// luminance spread comes out level, 0.0805 → 0.0803 on Michael's own
+    /// desktop, because the range cap gives back what the thinner veil takes;
+    /// what actually rises is colour, 0.0501 → 0.0696. Asserting spread alone
+    /// would therefore report "no change" on a retune that moved a great deal.
+    ///
+    /// Like its dark sibling this holds the **veil** to account with the bake
+    /// fixed — both surfaces are rendered from the same still — so what it
+    /// measures is exactly the veil's contribution, and there both figures rise.
+    func testTheLightVeilLetsThroughMoreWallpaperThanItUsedTo() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appending(path: "kaisola-lighttrans-\(UUID().uuidString)", directoryHint: .isDirectory)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let url = try writeRampWallpaper(
+            base: (0.263, 0.476, 0.575), range: 0.9, into: directory, named: "aerial"
+        )
+        let key = DesktopBackdropKey(path: url.path, modified: nil, isDark: false)
+        guard case let .wallpaper(still, _)? = DesktopBackdropRenderer.render(key: key) else {
+            return XCTFail("the aerial fixture produced no painting")
+        }
+
+        /// v1.1.11's light sidebar, for comparison.
+        let before = GlassBackdropWash(
+            red: 1, green: 1, blue: 1,
+            topOpacity: 0.66, baseOpacity: 0.60, bottomOpacity: 0.56
+        )
+        let now = GlassBackdropWash.sidebar(isDark: false)
+
+        /// Largest per-channel departure from the composite's own channel mean —
+        /// "how much of the desktop's colour is in the glass", in absolute units
+        /// so it stays comparable across a change in surface brightness.
+        func chroma(_ pixels: [UInt8]) -> Double {
+            var totals = (0.0, 0.0, 0.0)
+            var index = 0
+            while index + 3 < pixels.count {
+                totals.0 += Double(pixels[index]) / 255
+                totals.1 += Double(pixels[index + 1]) / 255
+                totals.2 += Double(pixels[index + 2]) / 255
+                index += 4
+            }
+            let count = Double(pixels.count / 4)
+            let channels = [totals.0 / count, totals.1 / count, totals.2 / count]
+            let mean = channels.reduce(0, +) / 3
+            return channels.map { abs($0 - mean) }.max() ?? 0
+        }
+
+        let beforePixels = try renderGlassSurface(
+            still: still, wash: before, isDark: false, width: 210, height: 900
+        )
+        let nowPixels = try renderGlassSurface(
+            still: still, wash: now, isDark: false, width: 210, height: 900
+        )
+        print(String(
+            format: "[light-glass] sidebar chroma %.4f -> %.4f  spread %.4f -> %.4f  (transmission %.2f -> %.2f)",
+            chroma(beforePixels), chroma(nowPixels),
+            luminanceSpread(beforePixels), luminanceSpread(nowPixels),
+            before.desktopTransmission, now.desktopTransmission
+        ))
+        XCTAssertGreaterThan(
+            chroma(nowPixels), chroma(beforePixels) * 1.25,
+            "the thinner light veil did not put appreciably more of the desktop's colour in the surface"
+        )
+        // And it did not pay for that by flattening the surface.
+        XCTAssertGreaterThan(
+            luminanceSpread(nowPixels), luminanceSpread(beforePixels),
+            "light traded its wallpaper's light and shade for its colour"
+        )
+        XCTAssertGreaterThan(now.desktopTransmission, before.desktopTransmission * 1.3)
+    }
+
     /// Live glass is the other half of "especially on live and wallpaper". There
     /// the tint and the veil stack, so what reaches the eye is the *product* of
     /// what each one leaves — and that is the number the ask is about.
@@ -1663,11 +1899,21 @@ final class NativePreviewSettingsTests: XCTestCase {
         XCTAssertEqual(before, 0.336, accuracy: 0.001)
         XCTAssertGreaterThan(after, before * 1.6, "live dark barely moved")
 
-        // Light is untouched — it was never the complaint, and the tint exists
-        // for light in the first place: AppKit's light materials are near-white
-        // and pass almost no desktop colour, which a dark material does not do.
+        // The light *tint* is untouched, and deliberately: the tint exists for
+        // light in the first place — AppKit's light materials are near-white and
+        // pass almost no desktop colour, which a dark material does not do — so
+        // cutting it would take away the layer that is carrying the hue.
         XCTAssertEqual(SidebarBackdropView.liveTint.light, 0.26, accuracy: 0.0001)
         XCTAssertLessThan(SidebarBackdropView.liveTint.dark, SidebarBackdropView.liveTint.light)
+        // Light's own translucency ask reaches Live through the veil instead,
+        // and by the same factor the painted source gained.
+        let lightBefore = transmission(tint: 0.26, veil: 0.60)
+        let lightAfter = transmission(
+            tint: SidebarBackdropView.liveTint.light,
+            veil: GlassBackdropWash.sidebar(isDark: false).baseOpacity
+        )
+        XCTAssertEqual(lightBefore, 0.296, accuracy: 0.001)
+        XCTAssertGreaterThan(lightAfter, lightBefore * 1.3, "live light barely moved")
     }
 
     /// The bake bounds the wallpaper's dynamic range, not only its mean — the
@@ -1740,12 +1986,76 @@ final class NativePreviewSettingsTests: XCTestCase {
             "an ordinary wallpaper lost its structure to a cap that should not have bound"
         )
 
-        // Light has no cap and must be unchanged by all of this.
-        XCTAssertEqual(DesktopBackdropRenderer.rangeGain(spread: 1.5, isDark: false), 1)
+        // Light carries the same bound, at its own ceiling — and it does more
+        // there than bound a range. Normalizing a dim wallpaper *up* to 0.72
+        // pushes its highlights past 1, which is the mirror of the black crush
+        // `bakeColorSpace` describes: measured on this fixture the uncapped
+        // light bake blew 19.1% of the still to flat white, and the capped one
+        // blows none.
         let lightWide = try stillSpread(wide, isDark: false)
+        XCTAssertLessThanOrEqual(
+            lightWide.spread,
+            DesktopBackdropRenderer.lightStillSpreadCeiling * 1.15,
+            "a high-range wallpaper arrived in light with \(lightWide.spread) of range"
+        )
+        XCTAssertEqual(
+            lightWide.mean, DesktopBackdropRenderer.targetLuminance(isDark: false), accuracy: 0.06
+        )
+        let lightCalm = try stillSpread(calm, isDark: false)
         XCTAssertGreaterThan(
-            lightWide.spread, DesktopBackdropRenderer.darkStillSpreadCeiling,
-            "light picked up a range cap it was never given"
+            lightCalm.spread, 0.05,
+            "an ordinary wallpaper lost its structure to a cap that should not have bound"
+        )
+    }
+
+    /// The light bake's highlights, which are the mirror of the dark bake's
+    /// shadows and were wrong in the same way for the same reason.
+    ///
+    /// `luminanceShift` is additive, so lifting a dim wallpaper onto light's
+    /// 0.72 target pushes everything above `1 - shift` past white. Nothing
+    /// measured it, and it was not small: the widest still in this Mac's aerial
+    /// library arrived with 17.3% of its pixels clipped and a full-range ramp
+    /// with 19.1% blown to *flat white* — range no veil could have shown,
+    /// however thin. Solving the gain with the offset removes it.
+    func testTheLightBakeStopsBlowingTheWallpapersHighlightsToWhite() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appending(path: "kaisola-highlights-\(UUID().uuidString)", directoryHint: .isDirectory)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        // A full-range ramp: blur-invariant, so unlike a photograph its whole
+        // range survives to the normalization.
+        let url = try writeRampWallpaper(
+            base: (0.5, 0.5, 0.5), range: 1.9, into: directory, named: "ramp"
+        )
+        let key = DesktopBackdropKey(path: url.path, modified: nil, isDark: false)
+        guard case let .wallpaper(image, _)? = DesktopBackdropRenderer.render(key: key) else {
+            return XCTFail("the ramp fixture produced no painting")
+        }
+
+        var pixels = [UInt8](repeating: 0, count: image.width * image.height * 4)
+        pixels.withUnsafeMutableBytes { bytes in
+            let context = CGContext(
+                data: bytes.baseAddress, width: image.width, height: image.height,
+                bitsPerComponent: 8, bytesPerRow: image.width * 4,
+                space: CGColorSpaceCreateDeviceRGB(),
+                bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+            )!
+            context.draw(image, in: CGRect(x: 0, y: 0, width: image.width, height: image.height))
+        }
+        var blown = 0
+        var index = 0
+        while index + 3 < pixels.count {
+            if pixels[index] == 255, pixels[index + 1] == 255, pixels[index + 2] == 255 {
+                blown += 1
+            }
+            index += 4
+        }
+        let share = Double(blown) / Double(image.width * image.height)
+        print(String(format: "[light-glass] full-range ramp blown to white: %.1f%%", share * 100))
+        XCTAssertLessThanOrEqual(
+            share, 0.01,
+            "the light bake blew \(Int(share * 100))% of the still to flat white"
         )
     }
 
@@ -1753,49 +2063,54 @@ final class NativePreviewSettingsTests: XCTestCase {
     /// offset. Both are pure, and both are the kind of arithmetic that looks
     /// right and is off by `(0.5 - mean)(1 - gain)`.
     func testTheRangeCapOnlyEverRemovesRangeAndTheOffsetIsSolvedAfterIt() {
-        // Never manufactures contrast a desktop does not have.
-        for spread in [0.0, 0.05, 0.2, DesktopBackdropRenderer.darkStillSpreadCeiling] {
-            XCTAssertEqual(
-                DesktopBackdropRenderer.rangeGain(spread: spread, isDark: true), 1, accuracy: 0.0001,
-                "a \(spread)-range wallpaper was given a gain other than 1"
-            )
-        }
-        XCTAssertLessThan(DesktopBackdropRenderer.rangeGain(spread: 0.7, isDark: true), 1)
-        // Monotone: the wider the picture, the harder the cap bites.
-        XCTAssertLessThan(
-            DesktopBackdropRenderer.rangeGain(spread: 0.9, isDark: true),
-            DesktopBackdropRenderer.rangeGain(spread: 0.6, isDark: true)
-        )
-        // A degenerate decode cannot divide by zero into an infinite gain.
-        XCTAssertEqual(DesktopBackdropRenderer.rangeGain(spread: 0, isDark: true), 1)
-
-        // The offset lands the mean on target *after* the gain has moved it.
-        // `CIColorControls` applies contrast about 0.5 and then adds brightness,
-        // which this reproduces.
-        for mean in [0.08, 0.263, 0.5, 0.792] {
-            for gain in [1.0, 0.75, 0.4] {
-                let shift = DesktopBackdropRenderer.luminanceShift(
-                    mean: mean, isDark: true, gain: gain
-                )
-                let landed = (mean - 0.5) * gain + 0.5 + shift
+        for isDark in [false, true] {
+            let ceiling = DesktopBackdropRenderer.stillSpreadCeiling(isDark: isDark)
+            // Never manufactures contrast a desktop does not have.
+            for spread in [0.0, 0.05, 0.2, ceiling] {
                 XCTAssertEqual(
-                    landed, DesktopBackdropRenderer.targetLuminance(isDark: true), accuracy: 0.0001,
-                    "mean \(mean) at gain \(gain) landed on \(landed)"
+                    DesktopBackdropRenderer.rangeGain(spread: spread, isDark: isDark),
+                    1, accuracy: 0.0001,
+                    "a \(spread)-range wallpaper was given a gain other than 1"
                 )
             }
+            XCTAssertLessThan(DesktopBackdropRenderer.rangeGain(spread: 0.7, isDark: isDark), 1)
+            // Monotone: the wider the picture, the harder the cap bites.
+            XCTAssertLessThan(
+                DesktopBackdropRenderer.rangeGain(spread: 0.9, isDark: isDark),
+                DesktopBackdropRenderer.rangeGain(spread: 0.6, isDark: isDark)
+            )
+            // A degenerate decode cannot divide by zero into an infinite gain.
+            XCTAssertEqual(DesktopBackdropRenderer.rangeGain(spread: 0, isDark: isDark), 1)
+
+            // The offset lands the mean on target *after* the gain has moved it.
+            // `CIColorControls` applies contrast about 0.5 and then adds
+            // brightness, which this reproduces.
+            for mean in [0.08, 0.263, 0.5, 0.792] {
+                for gain in [1.0, 0.75, 0.4] {
+                    let shift = DesktopBackdropRenderer.luminanceShift(
+                        mean: mean, isDark: isDark, gain: gain
+                    )
+                    let landed = (mean - 0.5) * gain + 0.5 + shift
+                    XCTAssertEqual(
+                        landed, DesktopBackdropRenderer.targetLuminance(isDark: isDark),
+                        accuracy: 0.0001,
+                        "mean \(mean) at gain \(gain) landed on \(landed)"
+                    )
+                }
+            }
+            // At gain 1 it is the expression it always was.
+            XCTAssertEqual(
+                DesktopBackdropRenderer.luminanceShift(mean: 0.438, isDark: isDark),
+                DesktopBackdropRenderer.targetLuminance(isDark: isDark) - 0.438,
+                accuracy: 0.0001
+            )
+            // And the chroma the gain would have eaten is divided back out, so a
+            // capped wallpaper is not also a desaturated one.
+            XCTAssertGreaterThan(
+                DesktopBackdropRenderer.saturation(mean: 0.435, isDark: isDark, gain: 0.55),
+                DesktopBackdropRenderer.saturation(mean: 0.435, isDark: isDark, gain: 1)
+            )
         }
-        // At gain 1 it is the expression it always was.
-        XCTAssertEqual(
-            DesktopBackdropRenderer.luminanceShift(mean: 0.438, isDark: true),
-            DesktopBackdropRenderer.targetLuminance(isDark: true) - 0.438,
-            accuracy: 0.0001
-        )
-        // And the chroma the gain would have eaten is divided back out, so a
-        // capped wallpaper is not also a desaturated one.
-        XCTAssertGreaterThan(
-            DesktopBackdropRenderer.saturation(mean: 0.435, isDark: true, gain: 0.55),
-            DesktopBackdropRenderer.saturation(mean: 0.435, isDark: true, gain: 1)
-        )
     }
 
     /// Dark damps chroma harder than light, and for a reason that is about the
@@ -2035,9 +2350,21 @@ final class NativePreviewSettingsTests: XCTestCase {
     }
 
     /// The whole point of normalizing: the composite the eye actually sees is
-    /// the same brightness on every desktop, so "0.60 coverage" means one thing
-    /// rather than one thing per wallpaper. Modelled end to end — normalize the
-    /// still, then lay the veil over it — across the full range of wallpapers.
+    /// the same brightness on every desktop, so a coverage number means one
+    /// thing rather than one thing per wallpaper. Modelled end to end —
+    /// normalize the still, then lay the veil over it — across the full range of
+    /// wallpapers.
+    ///
+    /// The *invariance* is what this test is for and it is exact (spread < 0.001
+    /// across every possible wallpaper mean). The two brightness bounds under it
+    /// are a much weaker "and the result is still frost" sanity check, and the
+    /// light one moves with the veil: at 0.60 coverage the light composite sat
+    /// at 0.888, at 0.45 it sits at 0.846. That is the translucency Michael
+    /// asked for arriving, not a surface going grey — 0.846 is still 45% of the
+    /// way from the still to pure white, and the composite is 0.774/0.860/0.897.
+    /// The legibility this bound was standing in for is held directly, on
+    /// rendered pixels, by `testLightGlassStaysLegibleOnTheWorstPatchOfEveryWallpaper`,
+    /// so it does not need a proxy here as well.
     func testFrostCompositeLandsOnTheSameGroundForEveryWallpaper() throws {
         func veilLuminance(isDark: Bool) -> Double {
             guard isDark else { return 1.0 }
@@ -2064,8 +2391,15 @@ final class NativePreviewSettingsTests: XCTestCase {
                 // Near-black: white text has room, whatever the desktop is.
                 XCTAssertLessThan(composite, 0.16)
             } else {
-                // Near-white frost, the Safari sidebar reference.
-                XCTAssertGreaterThan(composite, 0.85)
+                // Still white-led frost rather than a tinted photograph: the
+                // veil has to contribute more of the surface than the gap
+                // between the still and white does.
+                XCTAssertGreaterThan(composite, 0.83)
+                XCTAssertGreaterThan(
+                    composite,
+                    DesktopBackdropRenderer.targetLuminance(isDark: false),
+                    "the light surface is darker than the still it is supposed to be frosting"
+                )
             }
         }
     }

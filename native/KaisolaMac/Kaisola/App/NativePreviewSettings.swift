@@ -967,10 +967,57 @@ struct GlassBackdropWash: Equatable, Sendable {
     /// stops buying *structure*: the cap has to tighten in step, and
     /// `(1 - base) × ceiling` is conserved. It keeps buying chroma, which is
     /// most of what reads as translucency at this luminance.
+    ///
+    /// **Light, 0.60 → 0.45.** The same request, one round later: "light mode
+    /// should also be translucent to wallpaper much better". Transmission
+    /// 0.40 → **0.55**. Light had been left alone twice on the argument that a
+    /// 0.72 surface has headroom to spare; rendering it says otherwise, and this
+    /// is the number that says so. Measured against Michael's own desktop, light
+    /// sidebar at 210×900:
+    ///
+    ///     composite rgb   0.836/0.898/0.924  →  0.774/0.860/0.897
+    ///     mean luminance              0.887  →  0.845
+    ///     luminance spread p5..p95   0.0805  →  0.0803
+    ///     veil gradient top→bottom   0.0385  →  0.0378
+    ///     off-neutral                 0.057  →  0.083
+    ///     absolute chroma            0.0501  →  0.0696
+    ///     primary label contrast     12.3:1  →  11.4:1  (worst patch 9.5:1)
+    ///     secondary label contrast    3.8:1  →   3.7:1  (worst patch 3.5:1)
+    ///
+    /// The wallpaper's colour arrives **39% stronger** and its light and shade
+    /// arrive unchanged — the trade the range cap makes is chroma-for-structure
+    /// at fixed contrast, and at these constants the structure comes out level.
+    ///
+    /// Like dark, this is only available because the bake bounds the still's
+    /// range first (`DesktopBackdropRenderer.lightStillSpreadCeiling`). Thinning
+    /// the light veil to 0.45 *without* the cap puts the worst patch of an
+    /// adversarial ramp at **5.9:1 primary** — below the 7.0 floor — and the
+    /// worst patch of the five aerial extremes at 3.20:1 secondary against a
+    /// 3.43 baseline. With the cap the worst patch **improves** on every
+    /// adversarial fixture (primary 7.27 → 8.88, secondary 3.17 → 3.40) and
+    /// returns exactly to baseline on the aerials.
+    ///
+    /// What stopped light at 0.45 is **not** the same constraint that stopped
+    /// dark, and it is worth being precise about which floor binds. Light's
+    /// primary has room to spare (9.05:1 at the worst patch, against 7.0).
+    /// Light's *secondary* cannot reach the stated 4.5 floor at any veil,
+    /// because it is not a property of the veil: AppKit's `secondaryLabelColor`
+    /// in Aqua is black at **α 0.498** (measured, not assumed), and black at
+    /// α 0.498 over *pure white* is **3.98:1**. Every light surface in every
+    /// Mac app is under that ceiling. So the honest constraint here is "do not
+    /// make it worse", the worst-patch secondary is held at its pre-change 3.43,
+    /// and 0.45 is exactly where that binds. Going to 0.40 costs 0.06 of it.
+    ///
+    /// The mechanism that would lift it is a **custom secondary ink** rather
+    /// than the system semantic: on this surface, black at α 0.60 measures
+    /// **4.60:1** at the worst patch (4.56:1 adversarial), clearing the floor.
+    /// It is not done here because the 207 `.secondary` call sites all live in
+    /// `Features/*` and `Acp/*`, and a glass constant that silently restyles
+    /// every label in the app is a change that should be made on purpose.
     static func sidebar(isDark: Bool) -> GlassBackdropWash {
         isDark
             ? dark(top: 0.27, base: 0.34, bottom: 0.43)
-            : light(top: 0.66, base: 0.60, bottom: 0.56)
+            : light(top: 0.51, base: 0.45, bottom: 0.41)
     }
 
     /// How much of the composited backdrop is still the desktop's own colour
@@ -984,10 +1031,17 @@ struct GlassBackdropWash: Equatable, Sendable {
     /// near-black in dark mode. Dark moves with the sidebar and keeps its three
     /// points of separation (0.55 → 0.37); measured composite 0.102/0.126/0.135,
     /// spread 0.094, primary 12.2:1 (worst 11.0:1), secondary 5.9:1 (worst 5.5:1).
+    ///
+    /// Light moves with the sidebar too and keeps its five points of separation
+    /// (0.55 → 0.40, transmission 0.45 → **0.60**); measured composite
+    /// 0.752/0.847/0.888, spread 0.088, chroma 0.0767, primary 11.0:1 (worst
+    /// 9.1:1), secondary 3.7:1 (worst 3.4:1). The workspace is the deeper
+    /// surface, so it is also the one the worst patch is always found on — every
+    /// light figure quoted as a worst case in this file is a workspace figure.
     static func workspace(isDark: Bool) -> GlassBackdropWash {
         isDark
             ? dark(top: 0.30, base: 0.37, bottom: 0.46)
-            : light(top: 0.61, base: 0.55, bottom: 0.51)
+            : light(top: 0.46, base: 0.40, bottom: 0.36)
     }
 
     /// The band a glass veil's transmission has to live in, per appearance.
@@ -999,18 +1053,22 @@ struct GlassBackdropWash: Equatable, Sendable {
     ///
     /// It used to be 0.50 for both appearances because the veil was the only
     /// thing keeping the desktop's brightness and dynamic range out of the
-    /// surface. In dark it no longer is: the bake normalizes the still's mean to
-    /// 0.16 **and** caps its p5..p95 range at
-    /// `DesktopBackdropRenderer.darkStillSpreadCeiling`, so "not a photograph"
-    /// is now a property of the layer underneath rather than of the layer over
-    /// it. A dark still cannot be brighter, and cannot have more range, than
-    /// those two constants allow, whatever the desktop is — which is exactly the
-    /// guarantee the 0.50 ceiling was standing in for.
+    /// surface. It no longer is, in either appearance: the bake normalizes the
+    /// still's mean **and** caps its p5..p95 range at
+    /// `DesktopBackdropRenderer.stillSpreadCeiling(isDark:)`, so "not a
+    /// photograph" is now a property of the layer underneath rather than of the
+    /// layer over it. A still cannot be brighter, and cannot have more range,
+    /// than those two constants allow, whatever the desktop is — which is
+    /// exactly the guarantee the 0.50 ceiling was standing in for.
     ///
-    /// Light keeps 0.50: it has no range cap (it does not need one at a 0.72
-    /// surface), so there the veil is still the only bound.
+    /// Both ceilings therefore sit one step above the veil they permit
+    /// (dark 0.66 under 0.70, light 0.60 under 0.65) rather than at an
+    /// historical number. Light stays the tighter of the two because its own
+    /// contrast budget is tighter, not because it is unguarded: see
+    /// `sidebar(isDark:)` for the 3.98:1 AppKit ceiling that is the real bound
+    /// on the light surface.
     static func desktopTransmissionBand(isDark: Bool) -> (floor: Double, ceiling: Double) {
-        isDark ? (floor: 0.30, ceiling: 0.70) : (floor: 0.30, ceiling: 0.50)
+        isDark ? (floor: 0.30, ceiling: 0.70) : (floor: 0.30, ceiling: 0.65)
     }
 
     /// How much of a glass surface Increased Contrast must cover, counting the
@@ -1049,9 +1107,11 @@ struct GlassBackdropWash: Equatable, Sendable {
     /// have started binding and the accessibility guarantee would have been met
     /// by a `min` rather than by arithmetic (0.34 + 0.6·0.66 = 0.74, not 0.80).
     /// Raised to 0.80, which leaves the exact solutions for today's four bases
-    /// (0.60/0.55 light, 0.34/0.37 dark → 0.500/0.556/0.697/0.683) strictly
+    /// (0.45/0.40 light, 0.34/0.37 dark → 0.636/0.667/0.697/0.683) strictly
     /// inside it, and still keeps a fifth of the surface translucent at the
-    /// extreme.
+    /// extreme. The light veil's own retune moved its two solutions from
+    /// 0.500/0.556 to those figures without touching this constant, which is the
+    /// whole point of deriving them.
     static let increasedContrastOverlayCeiling = 0.80
 
     /// `base` is read live from `sidebar(isDark:)` / `workspace(isDark:)` so a
@@ -1556,8 +1616,12 @@ enum DesktopBackdropRenderer {
     /// this machine the dark composite's off-neutrality drops from 0.003–1.181
     /// to 0.009–0.330 — the surface stops changing personality with the desktop.
     ///
-    /// Light keeps 0.85. Light was never the complaint, and a 0.85-luminance
-    /// surface has the headroom to carry the desktop's hue at full strength.
+    /// Light keeps 0.85. When light's turn came the ask was translucency rather
+    /// than cast, and the light composite was measured at 0.057 off-neutral
+    /// against dark's 0.165 — a light surface at 0.85 luminance has the headroom
+    /// to carry the desktop's hue at full strength and does not read as coloured
+    /// when it does. Thinning the light veil raises that to 0.083, which is
+    /// still half of dark's, so the ceiling did not have to move with it.
     static let darkSaturationCeiling: Double = 0.50
 
     static func saturationCeiling(isDark: Bool) -> Double {
@@ -1655,18 +1719,63 @@ enum DesktopBackdropRenderer {
     /// whole design: more wallpaper everywhere, less of the one thing that was
     /// making the worst case a function of the desktop.
     ///
-    /// Light has no cap — a 0.72 surface has the headroom, light was never the
-    /// complaint, and this leaves the light half of every glass measurement in
-    /// this file exactly where it was.
+    /// Light got the same cap one round later, for the same reason — see
+    /// `lightStillSpreadCeiling`.
     static let darkStillSpreadCeiling: Double = 0.30
+
+    /// The same bound for **light**, and the constant that lets the light veil
+    /// get out of the way.
+    ///
+    /// Round 3 left light alone on the argument that a 0.72 surface has the
+    /// headroom and light was never the complaint. It is the complaint now —
+    /// "light mode should also be translucent to wallpaper much better" — and
+    /// rendering the light surface says the headroom was never really there:
+    /// with the shipped 0.60 veil the *worst patch* of an adversarial ramp
+    /// measured **7.27:1** primary against a 7.0 floor, so thinning the light
+    /// veil by even a step took primary below the floor. Light was closer to its
+    /// limit than dark ever was; it merely had no test looking.
+    ///
+    /// The cap is the same lever and it does the same work, mirrored. In light
+    /// the worst patch is the *darkest* pixel, and the bake's linear map is
+    /// `out = (in - mean)·gain + target`, so a gain below 1 lifts the darkest
+    /// patch toward the target — exactly the patch the floor is measured on.
+    ///
+    /// It also fixes a second thing that was wrong on its own terms. The light
+    /// bake is the mirror of the dark black-crush `bakeColorSpace` describes,
+    /// in a milder form: normalizing a dim wallpaper *up* to 0.72 pushes its
+    /// highlights past 1. Rendered against this Mac's aerial library, the
+    /// widest-range still arrived with **17.3%** of its pixels clipped, and an
+    /// adversarial full-range ramp with **19.1% blown to flat white** — range
+    /// the surface could not show however thin the veil got. With the cap both
+    /// are **0.0%**.
+    ///
+    /// Light sidebar/workspace, worst-patch contrast over the five extremes of
+    /// this Mac's aerial library plus four blur-invariant ramp fixtures:
+    ///
+    ///     veil 0.60, no cap    P 9.08 / 7.27   S 3.43 / 3.17   ← shipped
+    ///     veil 0.45, no cap    P 7.49 / 5.9    S 3.20 / 2.9    ← veil alone fails
+    ///     veil 0.45, cap 0.26  P 9.05 / 8.88   S 3.43 / 3.40   ← shipped here
+    ///
+    /// **0.26 rather than dark's 0.30** because light's contrast budget is far
+    /// tighter: black ink on a near-white surface tops out at 3.98:1 for the
+    /// secondary role whatever the surface does (see
+    /// `GlassBackdropWash.sidebar(isDark:)`), so every point of transmission
+    /// costs more of what little margin there is. 0.26 is the value at which the
+    /// worst-patch secondary returns exactly to its pre-change figure at the
+    /// chosen veil — the honest stopping point, not a round number.
+    static let lightStillSpreadCeiling: Double = 0.26
+
+    /// The widest luminance range a baked still may carry, per appearance.
+    static func stillSpreadCeiling(isDark: Bool) -> Double {
+        isDark ? darkStillSpreadCeiling : lightStillSpreadCeiling
+    }
 
     /// The gain `CIColorControls.contrast` is set to, from the still's measured
     /// p5..p95 spread. Never above 1: a wallpaper with less range than the
     /// ceiling is passed through exactly as it was, so this only ever *removes*
     /// an excess and can never manufacture contrast the desktop does not have.
     static func rangeGain(spread: Double, isDark: Bool) -> Double {
-        guard isDark else { return 1 }
-        return min(1, darkStillSpreadCeiling / max(spread, 0.01))
+        min(1, stillSpreadCeiling(isDark: isDark) / max(spread, 0.01))
     }
 
     /// Mean luminance the baked still is moved to, per appearance.
@@ -2669,6 +2778,12 @@ struct SidebarBackdropView: View {
     /// desktop's hue, which is a light-appearance problem. A dark `.sidebar`
     /// material is already dark and already carries the desktop's colour, so
     /// most of what a 0.30 tint did there was dim it — the very complaint.
+    ///
+    /// Light's own translucency ask is answered by the veil rather than here,
+    /// and it reaches Live for free: `(1 - 0.26) · (1 - 0.60) = 0.296` of the
+    /// material before, `(1 - 0.26) · (1 - 0.45) = 0.407` after — **+38%**,
+    /// the same factor the painted source gained, without cutting the one layer
+    /// that is carrying the desktop's hue into a near-white material.
     ///
     /// (Unlike the wallpaper source, this cannot be measured offline: it lands
     /// on live vibrancy, whose input is whatever is behind the window. The

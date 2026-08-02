@@ -25,6 +25,11 @@ struct AcpComposerCard: View {
     @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
     @State private var menuPresented = false
     @State private var menuQuery = ""
+    /// Bumped on every open so the menu's own `@State` — which row is armed,
+    /// where the highlight sits, whether Advanced is expanded — starts clean.
+    /// SwiftUI keeps popover content alive between presentations, so without a
+    /// fresh identity the menu reopens mid-drilldown on last session's row.
+    @State private var menuGeneration = 0
     @State private var favorites: Set<String> = []
 
     private let favoritesStore = AcpModelFavoritesStore()
@@ -220,6 +225,8 @@ struct AcpComposerCard: View {
             option: primaryOption
         )
         return Button {
+            menuQuery = ""
+            menuGeneration += 1
             menuPresented = true
         } label: {
             AcpComposerPillLabel(primary: values.primary, secondary: values.secondary) {
@@ -262,8 +269,10 @@ struct AcpComposerCard: View {
                     )
                 },
                 dismiss: { menuPresented = false },
+                isPresented: { menuPresented },
                 query: $menuQuery
             )
+            .id(menuGeneration)
         }
     }
 

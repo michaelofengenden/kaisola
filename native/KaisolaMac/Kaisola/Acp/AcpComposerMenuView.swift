@@ -33,15 +33,39 @@ struct AcpComposerMenuView: View {
     let toggleFavorite: (String) -> Void
     let manageAgents: () -> Void
     let dismiss: () -> Void
+    /// Read by the key monitor before it consumes anything. The monitor is
+    /// app-wide while installed, so this is the gate that keeps a closed menu
+    /// from eating the arrow keys of every other surface.
+    let isPresented: () -> Bool
     /// Bound so a typed filter survives the pointer moving between rows; only a
     /// submenu past `AcpComposerMenu.searchThreshold` ever shows the field.
     @Binding var query: String
 
-    @State private var armed: AcpComposerMenuRow.Target?
-    @State private var highlightedRow: Int?
-    @State private var highlightedOption: Int?
-    @State private var advancedExpanded = false
-    @FocusState private var panelFocused: Bool
+    /// Highlight and drilldown live in a reference type so the key monitor's
+    /// closure can read and write the same state the body renders, rather than
+    /// a struct copy frozen at the moment it was installed.
+    @StateObject private var state = AcpComposerMenuState()
+    @StateObject private var keyMonitor = AcpMenuKeyMonitor()
+
+    private var armed: AcpComposerMenuRow.Target? {
+        get { state.armed }
+        nonmutating set { state.armed = newValue }
+    }
+
+    private var highlightedRow: Int? {
+        get { state.highlightedRow }
+        nonmutating set { state.highlightedRow = newValue }
+    }
+
+    private var highlightedOption: Int? {
+        get { state.highlightedOption }
+        nonmutating set { state.highlightedOption = newValue }
+    }
+
+    private var advancedExpanded: Bool {
+        get { state.advancedExpanded }
+        nonmutating set { state.advancedExpanded = newValue }
+    }
 
     private static let rowsWidth: CGFloat = 232
     private static let submenuWidth: CGFloat = 208
@@ -58,22 +82,12 @@ struct AcpComposerMenuView: View {
                 submenuColumn(panel)
             }
         }
-        .focusable()
-        .focusEffectDisabled()
-        .focused($panelFocused)
-        .onAppear { panelFocused = true }
-        .onKeyPress(.upArrow) { moveHighlight(-1) }
-        .onKeyPress(.downArrow) { moveHighlight(1) }
-        .onKeyPress(.rightArrow) { enterSubmenu() }
-        .onKeyPress(.leftArrow) { leaveSubmenu() }
-        .onKeyPress(.return) { activateHighlighted() }
-        .onExitCommand {
-            if armed == nil {
-                dismiss()
-            } else {
-                _ = leaveSubmenu()
-            }
+        .onAppear {
+            keyMonitor.handle = handleKey
+            keyMonitor.start()
         }
+        .onDisappear { keyMonitor.stop() }
+        .onChange(of: rows) { keyMonitor.handle = handleKey }
         .accessibilityElement(children: .contain)
         .accessibilityLabel("Chat settings")
         .accessibilityIdentifier("acp.composer.menu")
@@ -322,6 +336,32 @@ struct AcpComposerMenuView: View {
 
     // MARK: - Keyboard
 
+    /// Arrow keys walk, Return commits, Escape steps back out one level and
+    /// then closes.
+    private func handleKey(_ code: UInt16) -> Bool {
+        guard isPresented() else { return false }
+        switch code {
+        case 126: return moveHighlight(-1) == .handled
+        case 125: return moveHighlight(1) == .handled
+        case 124: return enterSubmenu() == .handled
+        case 123: return leaveSubmenu() == .handled
+        case 36, 76: return activateHighlighted() == .handled
+        case 53:
+            // Escape closes the open submenu, then the menu. Left arrow is the
+            // one that also steps the highlight back out of the option column;
+            // Escape doing that too would need three presses to leave.
+            guard armed != nil else {
+                dismiss()
+                return true
+            }
+            armed = nil
+            highlightedOption = nil
+            return true
+        default:
+            return false
+        }
+    }
+
     /// Up/Down walks whichever column the highlight is in; the submenu's walk
     /// skips rows Return cannot activate.
     private func moveHighlight(_ delta: Int) -> KeyPress.Result {
@@ -378,5 +418,55 @@ struct AcpComposerMenuView: View {
     private func activate(_ option: AcpComposerMenuOption) {
         guard option.isEnabled, let target = armed else { return }
         choose(target, option.id)
+    }
+}
+
+/// Which row is armed and where the highlight sits, as a reference type.
+///
+/// It exists so the key monitor's closure and the rendered body share one
+/// value. A `@State` struct copy captured when the monitor was installed would
+/// read the right storage but write into a view SwiftUI has since replaced.
+@MainActor
+final class AcpComposerMenuState: ObservableObject {
+    @Published var armed: AcpComposerMenuRow.Target?
+    @Published var highlightedRow: Int?
+    @Published var highlightedOption: Int?
+    @Published var advancedExpanded = false
+}
+
+/// Keyboard for the menu, as an app-local event monitor.
+///
+/// A SwiftUI popover's window never becomes the app's key window here, so
+/// `onKeyPress` never fires and a modifier-less `keyboardShortcut` is never
+/// dispatched — verified against the running app, where neither the arrows nor
+/// Escape reached the panel, and an `NSView` taking first responder inside the
+/// popover did not help because the press is delivered to the key window.
+/// (⌘-shortcuts do work: those go through the main menu. That is why the old
+/// picker's ⌘-digits appeared to.)
+///
+/// A local monitor sees the press before dispatch regardless of key window. It
+/// is installed on appear and removed on disappear — and, because a stray
+/// monitor swallowing arrow keys across the whole app would be a far worse bug
+/// than a menu that ignores them, `handleKey` refuses every press while the
+/// popover is closed. That gate, not the teardown, is what makes this safe.
+@MainActor
+final class AcpMenuKeyMonitor: ObservableObject {
+    private var token: Any?
+    /// Returns true when the press was consumed.
+    var handle: ((UInt16) -> Bool)?
+
+    func start() {
+        guard token == nil else { return }
+        token = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
+            guard let self, let handle = self.handle, handle(event.keyCode) else { return event }
+            return nil
+        }
+    }
+
+    func stop() {
+        handle = nil
+        guard let token else { return }
+        NSEvent.removeMonitor(token)
+        self.token = nil
     }
 }

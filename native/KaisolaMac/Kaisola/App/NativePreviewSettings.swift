@@ -2753,6 +2753,15 @@ final class DesktopBackdropProvider: ObservableObject {
         }
     }
 
+    /// Waits for whatever resolve is in flight, and exists for one reason: a
+    /// resolve deliberately clears the watch's baseline signature when it lands
+    /// ("whatever this resolve concluded is the new baseline"), so a test that
+    /// drives `probeDesktop` has to know the previous resolve has finished
+    /// rather than race it. Without this the watch test passes or fails
+    /// depending on how long a bake happens to take — which is a property of
+    /// the machine, not of the watch.
+    func settleResolves() async { await work?.value }
+
     private nonisolated static func key(
         desktopImageURL: URL?,
         isDark: Bool

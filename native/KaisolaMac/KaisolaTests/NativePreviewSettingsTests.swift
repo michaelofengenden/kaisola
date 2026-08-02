@@ -3075,6 +3075,12 @@ final class NativePreviewSettingsTests: XCTestCase {
             "a glass surface asked for a backdrop and no watch was armed"
         )
 
+        // `refresh` starts a resolve, and a resolve clears the watch's baseline
+        // when it lands — by design, because the file it just read *is* the new
+        // baseline. So wait for it before taking one, or this test measures how
+        // long a bake took rather than what the watch does.
+        await provider.settleResolves()
+
         // First tick: records the baseline. A tick with nothing to compare
         // against must not fire, or the watch is a re-render loop.
         await provider.probeDesktop(supportDirectory: root)

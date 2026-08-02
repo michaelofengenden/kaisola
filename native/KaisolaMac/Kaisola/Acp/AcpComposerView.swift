@@ -416,7 +416,6 @@ struct AcpEmptyStateHeadline: View {
             .foregroundStyle(.primary)
             .padding(.horizontal, 24)
             .accessibilityLabel(heading.spoken)
-            .accessibilityIdentifier("acp.emptyState.heading")
     }
 
     private var attributed: AttributedString {

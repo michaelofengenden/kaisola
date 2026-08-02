@@ -41,6 +41,15 @@ struct AcpChatView: View {
         self.onKeyboardFocus = onKeyboardFocus
     }
 
+    /// The chat has produced nothing yet, so the transcript's space belongs to
+    /// the invitation instead. A restored chat arrives with its tail page
+    /// already applied (`AppModel.appendChat(initialTranscript:)`), and a
+    /// paged-out history leaves `hiddenEarlierCount` non-zero, so neither
+    /// flashes "What should we build…" on the way in.
+    private var showsEmptyState: Bool {
+        conversation.rows.isEmpty && conversation.hiddenEarlierCount == 0
+    }
+
     var body: some View {
         VStack(spacing: 0) {
             if presentation == .standard {
@@ -49,7 +58,11 @@ struct AcpChatView: View {
                 embeddedControls
             }
             Divider()
-            transcript
+            if showsEmptyState {
+                emptyState
+            } else {
+                transcript
+            }
             if let review = conversation.pendingPermissionReview {
                 AcpPermissionBar(
                     review: review,
@@ -60,7 +73,6 @@ struct AcpChatView: View {
                     createRule: { conversation.answerPermissionAlways() }
                 )
             }
-            Divider()
             composer
         }
         // SwiftUI can reuse this view position when the selected chat changes.
@@ -119,33 +131,16 @@ struct AcpChatView: View {
         .frame(height: 34)
     }
 
+    /// What stays in the header now that the composer owns the agent controls.
+    ///
+    /// Model, permission mode, and adapter options moved onto the composer's
+    /// chip rail, where the reference apps put them and where they sit next to
+    /// the message they will govern. Duplicating them up here would have left
+    /// two controls for one setting; what remains is session *history* and
+    /// *accounting*, which belong to the whole conversation rather than the
+    /// next turn.
     @ViewBuilder
     private var sessionControls: some View {
-        if !conversation.modes.isEmpty {
-            Picker("Mode", selection: Binding(
-                get: { conversation.currentModeID ?? conversation.modes.first?.id ?? "" },
-                set: { conversation.selectMode($0) }
-            )) {
-                ForEach(conversation.modes) { mode in
-                    Text(mode.name).tag(mode.id)
-                }
-            }
-            .labelsHidden()
-            .frame(maxWidth: presentation == .embedded ? 128 : 150)
-            .help("Permission mode — how the agent asks before acting")
-        }
-        if !conversation.models.isEmpty {
-            Picker("Model", selection: Binding(
-                get: { conversation.currentModelID ?? conversation.models.first?.id ?? "" },
-                set: { conversation.selectModel($0) }
-            )) {
-                ForEach(conversation.models) { model in
-                    Text(model.name).tag(model.id)
-                }
-            }
-            .labelsHidden()
-            .frame(maxWidth: presentation == .embedded ? 150 : 180)
-        }
         if !conversation.checkpoints.isEmpty {
             Menu {
                 Text("Restore the working tree to before a turn:")
@@ -172,26 +167,6 @@ struct AcpChatView: View {
             } message: {
                 Text("Applies the snapshot taken before turn \(restoreTarget?.turn ?? 0) over the current working tree. Conflicts surface as git conflict markers.")
             }
-        }
-        if !conversation.configOptions.isEmpty {
-            Menu {
-                ForEach(conversation.configOptions) { option in
-                    Picker(option.name, selection: Binding(
-                        get: { option.currentValue ?? option.choices.first?.value ?? "" },
-                        set: { conversation.selectConfigOption(option.id, value: $0) }
-                    )) {
-                        ForEach(option.choices) { choice in
-                            Text(choice.name).tag(choice.value)
-                        }
-                    }
-                    .pickerStyle(.menu)
-                }
-            } label: {
-                Image(systemName: "slider.horizontal.3")
-            }
-            .menuStyle(.borderlessButton)
-            .fixedSize()
-            .help("Agent options (effort, presets)")
         }
         if let usage = conversation.usage {
             Text("\(usage.used / 1000)k / \(usage.max / 1000)k")
@@ -396,52 +371,28 @@ struct AcpChatView: View {
             if !conversation.pendingAttachments.isEmpty {
                 attachmentStrip
             }
-            HStack(alignment: .bottom, spacing: 8) {
-                Button(action: openAttachmentPanel) {
-                    if conversation.preparingAttachmentCount > 0 {
-                        ProgressView().controlSize(.mini)
-                    } else {
-                        Image(systemName: "paperclip")
-                    }
-                }
-                .buttonStyle(.borderless)
-                .disabled(!conversation.isConnected)
-                .help("Attach files or images")
-                .accessibilityLabel("Attach files or images")
-                TextField(conversation.isRunning ? "Queue a follow-up…" : "Message the agent…", text: $draft, axis: .vertical)
-                    .textFieldStyle(.plain)
-                    .lineLimit(1...6)
-                    .padding(8)
-                    .background(.quaternary, in: RoundedRectangle(cornerRadius: 8))
-                    .focused($composerFocused)
-                    .onChange(of: composerFocused) { _, focused in
-                        if focused { onKeyboardFocus?() }
-                    }
-                    .onSubmit(sendDraft)
-                if conversation.isRunning {
-                    Button(action: conversation.cancel) {
-                        Image(systemName: "stop.circle.fill")
-                    }
-                    .buttonStyle(.borderless)
-                    .help("Stop the current turn")
-                    .accessibilityLabel("Stop the current turn")
-                }
-                Button(action: sendDraft) {
-                    Image(systemName: conversation.isRunning ? "text.badge.plus" : "arrow.up.circle.fill")
-                }
-                .buttonStyle(.borderless)
-                .disabled(sendDisabled)
-                .help(conversation.isRunning ? "Queue this as a follow-up" : "Send")
-                .accessibilityLabel(conversation.isRunning ? "Queue follow-up" : "Send message")
-            }
+            AcpComposerCard(
+                conversation: conversation,
+                draft: $draft,
+                focused: $composerFocused,
+                isNewConversation: showsEmptyState,
+                send: sendDraft,
+                onKeyboardFocus: onKeyboardFocus
+            )
         }
-        .padding(12)
-        .background(.bar)
+        // The card carries its own border and shadow, so the composer region
+        // is a gutter rather than a bar: no divider, no material, nothing that
+        // would draw a second edge a few points from the card's own.
+        .frame(maxWidth: AcpChatView.composerMaximumWidth)
+        .frame(maxWidth: .infinity)
+        .padding(.horizontal, 14)
+        .padding(.top, 10)
+        .padding(.bottom, 13)
         .overlay {
             if isDropTargeted {
-                RoundedRectangle(cornerRadius: 8)
+                RoundedRectangle(cornerRadius: KaisolaVisualSystem.panelRadius)
                     .strokeBorder(Color.accentColor, style: StrokeStyle(lineWidth: 2, dash: [6]))
-                    .padding(4)
+                    .padding(6)
                     .allowsHitTesting(false)
             }
         }
@@ -449,20 +400,38 @@ struct AcpChatView: View {
         .onPasteCommand(of: [.png, .tiff], perform: handlePaste)
     }
 
+    /// A composer wider than this stops being one object and starts being a
+    /// band across the window; the references all cap it well short of a
+    /// full-screen pane.
+    static let composerMaximumWidth: CGFloat = 860
+
+    /// The invitation that stands in for an empty transcript. It sits low in
+    /// the vacated space rather than dead-centre, so the heading and the
+    /// composer read as one group and the heading does not visibly jump when
+    /// the first message pushes it away.
+    private var emptyState: some View {
+        VStack(spacing: 0) {
+            // Two spacers above, one below: the heading settles about two
+            // thirds down, next to the composer rather than marooned in the
+            // middle of an empty pane.
+            Spacer(minLength: 12)
+            Spacer(minLength: 0)
+            AcpEmptyStateHeadline(
+                heading: AcpEmptyState.heading(
+                    projectName: AcpEmptyState.projectName(for: conversation.workspaceURL)
+                )
+            )
+            Spacer(minLength: 16)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .accessibilityIdentifier("acp.emptyState")
+    }
+
     private func applyFocusRequest(_ generation: UInt64?) {
         guard generation != nil else { return }
         DispatchQueue.main.async {
             composerFocused = true
         }
-    }
-
-    /// Send is enabled when there's something to deliver. While a turn runs the
-    /// send becomes a queued follow-up (which can't carry attachments), so text
-    /// is required; idle, either text or a staged attachment is enough.
-    private var sendDisabled: Bool {
-        guard conversation.isConnected else { return true }
-        let empty = draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-        return conversation.isRunning ? empty : (empty && conversation.pendingAttachments.isEmpty)
     }
 
     private var attachmentStrip: some View {
@@ -497,27 +466,6 @@ struct AcpChatView: View {
 
     private func byteLabel(_ bytes: Int) -> String {
         ByteCountFormatter.string(fromByteCount: Int64(bytes), countStyle: .file)
-    }
-
-    /// Open Finder without entering a nested modal run loop. The picker starts
-    /// in this chat's workspace, and selected files are materialized/read on a
-    /// detached task so adding an iCloud or large-on-disk item never blocks chat
-    /// rendering or terminal input.
-    private func openAttachmentPanel() {
-        let panel = NSOpenPanel()
-        panel.allowsMultipleSelection = true
-        panel.canChooseDirectories = false
-        panel.canChooseFiles = true
-        panel.directoryURL = conversation.workspaceURL
-        panel.treatsFilePackagesAsDirectories = false
-        panel.prompt = "Attach"
-        panel.begin { response in
-            guard response == .OK else { return }
-            let urls = panel.urls
-            Task { @MainActor in
-                for url in urls { conversation.prepareAttachment(fileURL: url) }
-            }
-        }
     }
 
     /// Stage files dropped onto the composer.

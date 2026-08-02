@@ -1,5 +1,136 @@
 # Changelog
 
+## 1.1.9 — 2026-08-01
+
+This release contains the complete 42-commit product, reliability, and release
+delta after the published v1.1.8 tag.
+
+### Editing, previews, and files
+
+- Text and HTML files now edit in a fast, offline CodeMirror 6 surface while
+  Swift retains authority over exact source bytes, line endings, undo/redo,
+  save/revert, recovery, permissions, and file access. The packaged editor now
+  resolves its flattened Xcode resources correctly in optimized builds.
+- Source outlines navigate exact Markdown, Swift, Python, JavaScript,
+  TypeScript, HTML, CSS, shell, JSON, and YAML structure, including repeated
+  selection of the same symbol.
+- Bounded PDFs now open in a native PDFKit surface with selection, scrolling,
+  magnification, accessibility, and off-main parsing.
+- Markdown tables state exactly how many rows were omitted from a bounded
+  preview instead of silently truncating them.
+- Rendered Markdown blocks credential-bearing links, custom schemes,
+  scheme-relative URLs, and filesystem escapes. Approved web links and
+  symlink-confined project files share one explicit navigation policy.
+- Markdown navigation flushes the latest edit, waits for any in-flight save,
+  and saves a newer draft again before switching files, so a rapid click cannot
+  lose text.
+- Restored drafts, disk conflicts, editor failures, and save failures now use
+  dismissible, accessible notices with truthful informational, warning, and
+  error severity.
+- The former preview monolith is split into bounded content-policy, recovery,
+  tab, editor, Markdown-rendering, and asset-loading units with complete
+  changed-file test routing.
+- CSV, JSON, and HTML preparation is cached by file identity and explicit
+  reload revision on a dedicated actor, keeping structured-data parsing off the
+  main thread.
+- Files and search patch only repository areas named by exact FSEvents batches;
+  dropped or root-level events use a safe full bounded refresh.
+- An opt-in Files control follows only structured locations and diff artifacts
+  declared by the selected Chat or Mesh, never path-like transcript prose.
+- Files and folders move between project directories through a bounded picker
+  with collision checks, symlink confinement, open-tab/index reconciliation,
+  and exact Undo/Redo.
+
+### Chat, Mesh, and session continuity
+
+- Chat and Mesh share one off-main, cadence-coalesced transcript renderer for
+  native headings, tables, highlighted code, copy controls, clickable project
+  citations, and explicitly expandable responses, tool output, and diffs.
+- Long Chat and Mesh histories migrate atomically from JSON into a mode-0600
+  SQLite store, restore only a bounded tail, and load exact earlier pages while
+  preserving viewport anchors, deliberate scrolling, drafts, attachments,
+  usage, costs, tool cards, and provider continuation identity.
+- Retained terminal pages sanitize control strings incrementally and transcript
+  search prepares in a cancellable off-main cache instead of repeatedly
+  rebuilding attributed text on the UI thread.
+- Oversized valid ACP images downscale through a bounded off-main ImageIO path
+  rather than being rejected outright.
+- Failed pop-out targets keep a standard recovery card with Try Again and Back
+  to Main Window instead of becoming blank windows.
+- Waiting Mesh prompts persist in exact FIFO order, restore paused, and remain
+  inspectable, individually removable, and explicitly resumable.
+- Chat and Mesh distinguish Hide, Stop, Close to Recently Closed, Restore/Undo,
+  and confirmed permanent Delete while preserving transcripts, drafts, queued
+  work, and recoverable Mesh worktrees for every non-delete action.
+- ACP follow-up queues persist in FIFO order. After an adapter restart, only
+  never-dispatched prompts resume automatically; an interrupted prompt remains
+  visible for an explicit non-duplicating Retry.
+
+### Terminal and accessibility
+
+- Terminal pane chrome derives from the active opaque terminal palette, and
+  focused VoiceOver output is bounded and coalesced without replaying
+  background backlog.
+- An ended owned pane can recreate its exact agent, account, title, and draft
+  recipe in place with a fresh PTY.
+- Attention, working, completion, and failure states use distinct shapes plus
+  contrast-tested colors instead of color-only dots.
+- Reduce Motion applies throughout workspace and Settings descendants, and
+  keyboard pane cycling reaches real Chat and Mesh composer focus targets.
+- Consequential toasts are announced and actionable, controls have truthful
+  names and states, and the shared native status vocabulary remains legible in
+  light and dark appearances.
+
+### Commands, settings, Git, and permissions
+
+- Menus, the command palette, project launch actions, and workspace controls
+  run through one typed command registry with one implementation, shared
+  shortcut hints, and clear unavailable-state explanations.
+- Keyboard Settings can create, validate, reload, and reset a private
+  `keymap.json`; unknown or conflicting overrides fail safely while preserving
+  every default shortcut.
+- Settings unifies app defaults, named provider accounts, and per-project
+  account overrides. Saved or newly pasted direct-API keys can be verified with
+  a bounded no-prompt request that refuses redirects and never reveals the key
+  or upstream response body.
+- First run is now a live readiness checklist for the project, terminal
+  continuity, selected account, update policy, and a runnable first session;
+  Help opens a user guide with shortcuts and recovery steps.
+- Git can stage or unstage all changes in one reversible action and permits
+  only clean-tree, upstream-backed, non-interactive fast-forward pulls.
+- Pull-request review shows the complete changed-file set plus a
+  credential-redacted remote, repository, base, head, commits, title, and body;
+  execution refuses to continue if the reviewed destination changes.
+- Agent permission cards show the adapter's raw request, every declared path,
+  and the exact workspace/action/resource rule scope, with separate Deny,
+  Allow Once, and Create Rule decisions in Chat and Mesh.
+
+### Broker updates, reliability, and release confidence
+
+- Rolling broker updates stage verified helper generations outside the
+  replaceable app bundle, route all new terminals to the installed generation,
+  and keep existing PTYs on authenticated draining brokers until they end
+  naturally.
+- Cutover requires broker-authoritative quiescence and aborts on agent activity,
+  queued input, Companion-lease changes, identity changes, or inventory races;
+  rollback selects an already verified generation and only empty detached
+  generations retire.
+- A late older inventory response can no longer steal the acknowledged
+  generation route for a newly created terminal.
+- Unix socket work, reconnect behavior, Git branch probes, teardown
+  bookkeeping, process metadata scans, and bootstrap output draining are
+  bounded so repeated refresh, close, and reconnect cycles cannot leak work or
+  stall on full pipes.
+- Xcode 16 actor-isolation and SQLite sendability checks now compile the same
+  confined editor and transcript contracts as newer local toolchains.
+- The feature/fix trackers, architecture notes, migration roadmap, and user
+  guide now reflect the completed rich-workspace, transcript, accessibility,
+  and rolling-update contracts instead of presenting shipped work as open.
+- Native visual gates now accept valid compact account and workspace sheets at
+  hosted-runner scale while retaining surface-specific geometry and visible-
+  content checks; the FSEvents suite also accepts its correctness-preserving
+  full-refresh fallback.
+
 ## 1.1.8 — 2026-08-01
 
 - Projects stay in their saved order instead of moving when selected.
@@ -7,22 +138,6 @@
 - Document and Files controls now sit together, and Document closes either a file preview or browser card correctly.
 - Both right-side dividers keep their resize cursor and drag behavior along their full height, even beside rendered documents.
 - Glass is calmer, subtly warmer, and consistently rounded.
-- Menus, the command palette, project actions, and workspace controls now run through one command system with clear unavailable-state explanations.
-- Keyboard Settings can create, validate, reload, or reset a private `keymap.json`; conflicting shortcuts safely keep every default.
-- Attention badges stay readable in light and dark mode, and status shapes no longer rely on color alone.
-- Reduce Motion now applies throughout the workspace and Settings; keyboard pane cycling also reaches Chat and Mesh composers.
-- Session status refreshes now share bounded process probes, and a noisy session helper can no longer stall app startup on a full output pipe.
-- Git can stage or unstage all changes at once and safely fast-forward a clean branch from its upstream.
-- Pull request review now shows every changed file plus the credential-safe remote, repository, and base branch, and refuses to run if that destination changes.
-- Agent permission prompts now show the raw request, every declared path, and the exact standing-rule scope, with separate Deny, Allow Once, and Create Rule actions.
-- Chat and Mesh now render agent Markdown as native headings, tables, highlighted code with copy controls, and clickable project file citations; large responses, tool output, and diffs have explicit Show More and Collapse controls.
-- Text and HTML files now edit in a fast, syntax-aware CodeMirror surface while Swift keeps source bytes, line endings, undo, save/revert, recovery, permissions, and file access under native control.
-- Source outlines jump to exact Markdown and code structure, including repeated navigation to the same symbol.
-- Files and search now update only the changed repository areas during ordinary agent edits, with a safe full refresh when macOS reports dropped or root-level events.
-- An opt-in Files control follows files declared by the selected Chat or Mesh without treating transcript prose as a path.
-- Files and folders can move between project directories with collision checks, open-tab reconciliation, and exact Undo/Redo.
-- Long Chat and Mesh histories now open from a bounded SQLite tail; scrolling upward loads exact earlier pages without moving your reading position, while drafts, attachments, usage, costs, and continuation identity survive relaunch and the one-time JSON migration.
-- Rolling broker updates now stage verified helper generations outside the replaceable app bundle, send all new terminals to the installed generation, keep existing PTYs on authenticated draining brokers, abort on activity or Companion-lease races, offer verified rollback, and retire only empty detached generations. The installed two-generation handoff passed with the original broker and PTY process IDs intact.
 
 ## 1.1.7 — 2026-07-31
 

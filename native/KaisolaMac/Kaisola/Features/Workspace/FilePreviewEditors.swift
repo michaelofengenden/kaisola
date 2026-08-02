@@ -288,6 +288,20 @@ struct MarkdownEditingStyle: Sendable {
     }
 }
 
+/// Everything one debounced styling pass needs, computed off the main actor in
+/// a single scan of the source.
+struct MarkdownLiveStyleScan: Sendable {
+    let spans: [MarkdownEditingStyle.Span]
+    let tables: [MarkdownTableRegion]
+    let thematicBreaks: [NSRange]
+
+    nonisolated init(source: String) {
+        spans = MarkdownEditingStyle.spans(in: source)
+        tables = MarkdownTableRegions.scan(source)
+        thematicBreaks = MarkdownThematicBreaks.scan(source)
+    }
+}
+
 /// Resolves the destination of the Markdown link under a character index.
 ///
 /// The rendered document used SwiftUI's `openURL` for this. A text view has no
@@ -1082,6 +1096,9 @@ struct MarkdownRenderedEditor: NSViewRepresentable {
         scrollView.onMagnificationChanged = { [weak coordinator = context.coordinator] value in
             coordinator?.zoom = value
         }
+        scrollView.onDocumentWidthChanged = { [weak coordinator = context.coordinator] in
+            coordinator?.restyleIfDocumentWidthChanged()
+        }
         context.coordinator.attach(textView: textView, scrollView: scrollView)
         context.coordinator.markdownURL = markdownURL
         context.coordinator.workspaceRoot = workspaceRoot
@@ -1135,6 +1152,7 @@ struct MarkdownRenderedEditor: NSViewRepresentable {
         // external zoom changes and the first representable update both reflow.
         scrollView.reflowDocumentWidth()
         coordinator.refreshImages(revision: imageRevision, force: false)
+        coordinator.restyleIfDocumentWidthChanged()
         coordinator.scrollIfNeeded(to: targetLine, revision: navigationRevision)
     }
 
@@ -1162,6 +1180,8 @@ struct MarkdownRenderedEditor: NSViewRepresentable {
         /// edit and start the save/journal machinery.
         private var isApplyingStyle = false
         private var styleTask: Task<Void, Never>?
+        /// Container width the current grid was measured against.
+        private var styledWidth: CGFloat?
         private var importTask: Task<Void, Never>?
         private var imageTask: Task<Void, Never>?
         private var lastScrollKey: String?
@@ -1322,15 +1342,25 @@ struct MarkdownRenderedEditor: NSViewRepresentable {
                     try? await Task.sleep(for: .milliseconds(70))
                 }
                 guard !Task.isCancelled else { return }
-                let spans = await Task.detached(priority: .utility) {
-                    MarkdownEditingStyle.spans(in: source)
+                let scan = await Task.detached(priority: .utility) {
+                    MarkdownLiveStyleScan(source: source)
                 }.value
                 guard !Task.isCancelled,
                       let self,
                       let textView,
                       textView.string == source else { return }
-                self.apply(spans, to: textView)
+                self.apply(scan, to: textView)
             }
+        }
+
+        /// Column widths are measured against the pane, so a resize or a zoom
+        /// step has to re-align the grid. Ordinary scrolling and typing do not
+        /// change the container width and so cost nothing here.
+        func restyleIfDocumentWidthChanged() {
+            guard let width = textView?.textContainer?.size.width, width > 0 else { return }
+            guard styledWidth.map({ abs($0 - width) > 0.5 }) ?? true else { return }
+            styledWidth = width
+            scheduleStyling(immediately: false)
         }
 
         /// Paint the document's typography.
@@ -1347,7 +1377,7 @@ struct MarkdownRenderedEditor: NSViewRepresentable {
         /// characters: `textView.string` is untouched, and the save path writes
         /// that string. The text view is also `isRichText = false`, so styling
         /// can never be typed, pasted, or copied out of the document either.
-        private func apply(_ spans: [MarkdownEditingStyle.Span], to textView: NSTextView) {
+        private func apply(_ scan: MarkdownLiveStyleScan, to textView: NSTextView) {
             guard let storage = textView.textStorage else { return }
             let fullRange = NSRange(location: 0, length: storage.length)
             guard fullRange.length > 0 else { return }
@@ -1357,18 +1387,42 @@ struct MarkdownRenderedEditor: NSViewRepresentable {
             // letting the scroll view keep a now-meaningless pixel offset.
             let anchor = viewportAnchor()
             let before = storage.string
+            let width = textView.textContainer?.size.width ?? textView.bounds.width
+            styledWidth = width
 
             isApplyingStyle = true
             storage.beginEditing()
             storage.setAttributes(MarkdownEditingStyle.baseAttributes, range: fullRange)
-            for span in spans where NSMaxRange(span.range) <= fullRange.length {
+            // Table rows take their base face first so a cell's own emphasis,
+            // link, or inline code still wins over it.
+            MarkdownTableStyler.applyTypography(
+                regions: scan.tables,
+                thematicBreaks: scan.thematicBreaks,
+                to: storage
+            )
+            for span in scan.spans where NSMaxRange(span.range) <= fullRange.length {
                 storage.addAttributes(
                     MarkdownEditingStyle.attributes(for: span.role),
                     range: span.range
                 )
             }
+            // ...and the grid is measured last, against what the storage
+            // actually resolved to, so a cell with collapsed delimiters still
+            // lands on its column.
+            let decorations = MarkdownTableStyler.applyGeometry(
+                regions: scan.tables,
+                thematicBreaks: scan.thematicBreaks,
+                to: storage,
+                availableWidth: width
+            )
             storage.endEditing()
             isApplyingStyle = false
+
+            (textView.layoutManager as? MarkdownInlineImageLayoutManager)?
+                .setDecorations(decorations)
+            if !decorations.isEmpty || !scan.tables.isEmpty {
+                textView.needsDisplay = true
+            }
 
             // A styling pass must never be able to change the document.
             assert(storage.string == before, "Markdown styling mutated document text")
@@ -1604,6 +1658,8 @@ struct MarkdownRenderedEditor: NSViewRepresentable {
 
 final class MarkdownMagnifyingScrollView: NSScrollView {
     var onMagnificationChanged: ((CGFloat) -> Void)?
+    /// A narrower pane means narrower table columns, so the grid re-measures.
+    var onDocumentWidthChanged: (() -> Void)?
 
     override func tile() {
         super.tile()
@@ -1641,6 +1697,7 @@ final class MarkdownMagnifyingScrollView: NSScrollView {
             layoutManager.invalidateLayout(forCharacterRange: range, actualCharacterRange: nil)
             layoutManager.ensureLayout(for: container)
         }
+        onDocumentWidthChanged?()
     }
 
     override func magnify(with event: NSEvent) {

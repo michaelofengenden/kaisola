@@ -1031,7 +1031,7 @@ final class NativePreviewSettingsTests: XCTestCase {
         let painting = try XCTUnwrap(DesktopBackdropRenderer.render(
             key: DesktopBackdropKey(path: url.path, modified: nil, isDark: false)
         ))
-        guard case let .wallpaper(image, tint) = painting else {
+        guard case let .wallpaper(image, tint, _) = painting else {
             return XCTFail("a readable still must render as a painted wallpaper, got \(painting)")
         }
         // Pre-rendered small: the surface it fills is many times wider.
@@ -1071,7 +1071,7 @@ final class NativePreviewSettingsTests: XCTestCase {
         let painting = DesktopBackdropRenderer.render(
             key: DesktopBackdropKey(path: url.path, modified: nil, isDark: false)
         )
-        guard case let .wallpaper(image, _) = painting else {
+        guard case let .wallpaper(image, _, _) = painting else {
             return XCTFail("live desktop \(url.path) did not render a painted backdrop")
         }
         XCTAssertLessThanOrEqual(image.width, DesktopBackdropRenderer.stillWidth)
@@ -1143,7 +1143,21 @@ final class NativePreviewSettingsTests: XCTestCase {
     /// sidebar's peak channel spread was 0.53 against the raw desktop's 0.33 —
     /// the "glass" was more colourful than the wallpaper it imitated. The veil
     /// decides how much desktop arrives; the bake must not put a thumb on it.
+    ///
+    /// **Round 8**: this constant no longer reaches the bake — chroma is solved
+    /// against the finished still's measured Oklab colourfulness now, because a
+    /// filter *input* says nothing about what a given wallpaper's hue does to
+    /// the output. The statement is still worth keeping, because it is the
+    /// round-7 pipeline the hue-invariance test freezes, and because the same
+    /// "never boost" rule is what `okSaturationCeiling` asserts for the solve.
     func testWallpaperBakeCarriesNoSaturationBoost() {
+        // The solved pipeline's own ceiling, which is where the rule lives now:
+        // a target on the finished still's perceived colourfulness, never a
+        // boost of whatever the wallpaper happened to have.
+        XCTAssertLessThanOrEqual(DesktopBackdropRenderer.desktopChromaShare, 1.0)
+        XCTAssertLessThanOrEqual(DesktopBackdropRenderer.darkDesktopChromaShare, 1.0)
+        XCTAssertGreaterThan(DesktopBackdropRenderer.okSaturationCeiling, 0)
+
         // v1.1.8 goes one step further and CUTS chroma to 0.85: the surface
         // should not change personality with the desktop picture. The ceiling is
         // what this test is really for — the bake must never boost again — and
@@ -1362,7 +1376,7 @@ final class NativePreviewSettingsTests: XCTestCase {
             let url = try writeWallpaper(base: base, name: name)
             for isDark in [true, false] {
                 let key = DesktopBackdropKey(path: url.path, modified: nil, isDark: isDark)
-                guard case let .wallpaper(image, _)? = DesktopBackdropRenderer.render(key: key) else {
+                guard case let .wallpaper(image, _, _)? = DesktopBackdropRenderer.render(key: key) else {
                     return XCTFail("\(name) (isDark: \(isDark)) produced no painting")
                 }
                 let measured = measure(image)
@@ -1451,8 +1465,24 @@ final class NativePreviewSettingsTests: XCTestCase {
         wash: GlassBackdropWash,
         isDark: Bool,
         width: Int,
-        height: Int
+        height: Int,
+        crop: CGRect = CGRect(x: 0, y: 0, width: 1, height: 1),
+        warmth: Double? = nil
     ) throws -> [UInt8] {
+        // `DesktopWallpaperPatch` draws the still through a `contentsRect`;
+        // cropping the `CGImage` to the same unit rectangle is the same
+        // operation in CoreGraphics, and both count y **down from the top**.
+        let patch: CGImage
+        if crop == CGRect(x: 0, y: 0, width: 1, height: 1) {
+            patch = still
+        } else {
+            patch = try XCTUnwrap(still.cropping(to: CGRect(
+                x: (crop.minX * CGFloat(still.width)).rounded(.down),
+                y: (crop.minY * CGFloat(still.height)).rounded(.down),
+                width: max(1, (crop.width * CGFloat(still.width)).rounded()),
+                height: max(1, (crop.height * CGFloat(still.height)).rounded())
+            )))
+        }
         var pixels = [UInt8](repeating: 0, count: width * height * 4)
         try pixels.withUnsafeMutableBytes { bytes in
             let context = try XCTUnwrap(CGContext(
@@ -1462,11 +1492,10 @@ final class NativePreviewSettingsTests: XCTestCase {
             ))
             context.interpolationQuality = .high
             let rect = CGRect(x: 0, y: 0, width: width, height: height)
-            // `.resizable()` with no aspect mode: stretched, not filled.
-            context.draw(still, in: rect)
+            context.draw(patch, in: rect)
             context.setFillColor(
                 red: GlassWarmth.red, green: GlassWarmth.green, blue: GlassWarmth.blue,
-                alpha: GlassWarmth.opacity(isDark: isDark)
+                alpha: warmth ?? GlassWarmth.opacity(isDark: isDark)
             )
             context.fill(rect)
 
@@ -1677,7 +1706,7 @@ final class NativePreviewSettingsTests: XCTestCase {
                 ("workspace", GlassBackdropWash.workspace(isDark: true), 900, 900),
             ] {
                 let key = DesktopBackdropKey(path: url.path, modified: nil, isDark: true)
-                guard case let .wallpaper(still, _)? = DesktopBackdropRenderer.render(key: key) else {
+                guard case let .wallpaper(still, _, _)? = DesktopBackdropRenderer.render(key: key) else {
                     return XCTFail("\(name) produced no painting")
                 }
                 let pixels = try renderGlassSurface(
@@ -1764,7 +1793,7 @@ final class NativePreviewSettingsTests: XCTestCase {
                 ("workspace", GlassBackdropWash.workspace(isDark: false), 900, 900),
             ] {
                 let key = DesktopBackdropKey(path: url.path, modified: nil, isDark: false)
-                guard case let .wallpaper(still, _)? = DesktopBackdropRenderer.render(key: key) else {
+                guard case let .wallpaper(still, _, _)? = DesktopBackdropRenderer.render(key: key) else {
                     return XCTFail("\(name) produced no painting")
                 }
                 let pixels = try renderGlassSurface(
@@ -1808,7 +1837,7 @@ final class NativePreviewSettingsTests: XCTestCase {
             base: (0.5, 0.5, 0.5), range: 1.95, into: directory, named: "adversarial"
         )
         let key = DesktopBackdropKey(path: url.path, modified: nil, isDark: false)
-        guard case let .wallpaper(still, _)? = DesktopBackdropRenderer.render(key: key) else {
+        guard case let .wallpaper(still, _, _)? = DesktopBackdropRenderer.render(key: key) else {
             return XCTFail("the adversarial fixture produced no painting")
         }
         let pixels = try renderGlassSurface(
@@ -1896,6 +1925,625 @@ final class NativePreviewSettingsTests: XCTestCase {
         return url
     }
 
+    // MARK: - The hue family
+
+    /// One structured wallpaper, written at a chosen hue — the fixture family
+    /// the hue-invariance contract is measured on.
+    ///
+    /// Every member is **identical in HSV value and HSV saturation** and differs
+    /// only in hue, so any difference the pipeline produces in the *lightness*
+    /// or the *colourfulness* of the finished surface is the pipeline's, not the
+    /// wallpaper's. The value field is the same horizon-plus-masses field
+    /// `writeStructuredWallpaper` uses, so this is a photograph-shaped fixture
+    /// rather than a flat swatch.
+    private func writeHueWallpaper(
+        hue: Double,
+        saturation: Double,
+        into directory: URL,
+        named name: String
+    ) throws -> URL {
+        let side = 768
+        var pixels = [UInt8](repeating: 255, count: side * side * 4)
+        func value(_ nx: Double, _ ny: Double) -> Double {
+            var value = 0.5 + 0.42 * (ny - 0.5)
+            value += 0.09 * (1 / (1 + exp(-(ny - 0.58) * 46)) - 0.5)
+            func mass(_ cx: Double, _ cy: Double, _ rx: Double, _ ry: Double, _ amplitude: Double)
+                -> Double {
+                let dx = (nx - cx) / rx
+                let dy = (ny - cy) / ry
+                return amplitude * exp(-(dx * dx + dy * dy) * 2.2)
+            }
+            value += mass(0.26, 0.72, 0.30, 0.20, 0.13)
+            value += mass(0.74, 0.44, 0.34, 0.16, -0.11)
+            value += mass(0.52, 0.18, 0.22, 0.13, 0.09)
+            value += 0.032 * sin(nx * 7.3 + ny * 3.1) * cos(ny * 5.9 - nx * 2.2)
+            value += 0.015 * sin(nx * 15.7 - ny * 11.3) * cos(ny * 13.1 + nx * 6.5)
+            return min(1, max(0.02, value))
+        }
+        for y in 0..<side {
+            let ny = Double(y) / Double(side - 1)
+            for x in 0..<side {
+                let nx = Double(x) / Double(side - 1)
+                let rgb = Self.hsvToRGB(hue: hue, saturation: saturation, value: value(nx, ny))
+                let index = (y * side + x) * 4
+                pixels[index] = UInt8(min(255, max(0, rgb.0 * 255)))
+                pixels[index + 1] = UInt8(min(255, max(0, rgb.1 * 255)))
+                pixels[index + 2] = UInt8(min(255, max(0, rgb.2 * 255)))
+            }
+        }
+        var image: CGImage?
+        pixels.withUnsafeMutableBytes { bytes in
+            image = CGContext(
+                data: bytes.baseAddress, width: side, height: side, bitsPerComponent: 8,
+                bytesPerRow: side * 4, space: CGColorSpaceCreateDeviceRGB(),
+                bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+            )?.makeImage()
+        }
+        let url = directory.appending(path: "\(name).png")
+        let destination = try XCTUnwrap(CGImageDestinationCreateWithURL(
+            url as CFURL, "public.png" as CFString, 1, nil
+        ))
+        CGImageDestinationAddImage(destination, try XCTUnwrap(image), nil)
+        XCTAssertTrue(CGImageDestinationFinalize(destination))
+        return url
+    }
+
+    static func hsvToRGB(hue: Double, saturation: Double, value: Double)
+        -> (Double, Double, Double) {
+        let chroma = value * saturation
+        let sector = (hue.truncatingRemainder(dividingBy: 360) + 360)
+            .truncatingRemainder(dividingBy: 360) / 60
+        let second = chroma * (1 - abs(sector.truncatingRemainder(dividingBy: 2) - 1))
+        let base: (Double, Double, Double) = switch Int(sector) {
+        case 0: (chroma, second, 0)
+        case 1: (second, chroma, 0)
+        case 2: (0, chroma, second)
+        case 3: (0, second, chroma)
+        case 4: (second, 0, chroma)
+        default: (chroma, 0, second)
+        }
+        let floor = value - chroma
+        return (base.0 + floor, base.1 + floor, base.2 + floor)
+    }
+
+    /// The two quantities the hue-invariance contract is stated in, read off a
+    /// rendered surface: **perceived lightness** (Oklab L*, the mean over the
+    /// surface) and **colourfulness relative to that lightness** (Oklab chroma
+    /// over L*, which is the perceptual analogue of HSV saturation and the thing
+    /// "it becomes white" and "it is very green" are each half of).
+    ///
+    /// Oklab rather than Rec. 709 luma precisely because luma is the quantity
+    /// that produced the bug: it weights green 9.9× blue, so it reads a blue
+    /// picture as almost black and a green one as almost white.
+    private func perceivedSurface(_ pixels: [UInt8])
+        -> (lightness: Double, saturation: Double, chroma: Double) {
+        var lightness = 0.0
+        var chroma = 0.0
+        var saturation = 0.0
+        var count = 0.0
+        var index = 0
+        while index + 3 < pixels.count {
+            let lab = Self.oklab(
+                Double(pixels[index]) / 255,
+                Double(pixels[index + 1]) / 255,
+                Double(pixels[index + 2]) / 255
+            )
+            let magnitude = (lab.a * lab.a + lab.b * lab.b).squareRoot()
+            lightness += lab.L
+            chroma += magnitude
+            saturation += magnitude / max(lab.L, 0.001)
+            count += 1
+            index += 4
+        }
+        return (lightness / count, saturation / count, chroma / count)
+    }
+
+    /// Oklab from gamma-encoded sRGB.
+    static func oklab(_ red: Double, _ green: Double, _ blue: Double)
+        -> (L: Double, a: Double, b: Double) {
+        func linear(_ channel: Double) -> Double {
+            channel <= 0.04045 ? channel / 12.92 : pow((channel + 0.055) / 1.055, 2.4)
+        }
+        let r = linear(red)
+        let g = linear(green)
+        let b = linear(blue)
+        let long = cbrt(0.4122214708 * r + 0.5363325363 * g + 0.0514459929 * b)
+        let medium = cbrt(0.2119034982 * r + 0.6806995451 * g + 0.1073969566 * b)
+        let short = cbrt(0.0883024619 * r + 0.2817188376 * g + 0.6299787005 * b)
+        return (
+            L: 0.2104542553 * long + 0.7936177850 * medium - 0.0040720468 * short,
+            a: 1.9779984951 * long - 2.4285922050 * medium + 0.4505937099 * short,
+            b: 0.0259040371 * long + 0.7827717662 * medium - 0.8086757660 * short
+        )
+    }
+
+    // MARK: - The glass is where the window is
+
+    /// **The round-8 contract, half one**: a glass surface shows the region of
+    /// wallpaper that is actually behind it.
+    ///
+    /// Michael: "we don't get the translucence at all. I meant the glass
+    /// wallpaper should be translucent to the wallpaper itself (like
+    /// transparent)." Three rounds of veil-thinning could not deliver that,
+    /// because the layer under the veil was **one still stretched across every
+    /// surface** — a blurry photograph of the whole desktop painted onto a
+    /// panel, identical whether the window sat on the left of the screen or the
+    /// right. Nothing in it corresponded to what was behind the window and
+    /// nothing in it moved when the window moved, which is precisely what
+    /// transparency is.
+    ///
+    /// The numbers below are the arithmetic of "behind": a window at x pt on a
+    /// display shows the wallpaper at x pt. They are hand-computed from the
+    /// fixture rather than re-derived from the code under test.
+    func testEachGlassSurfaceShowsTheWallpaperRegionBehindIt() {
+        // A Retina laptop: 1512×982 pt, 2× backing, a wallpaper that is exactly
+        // the display's pixel size, "Fill Screen".
+        let screen = CGRect(x: 0, y: 0, width: 1512, height: 982)
+        let wallpaper = CGSize(width: 3024, height: 1964)
+        func sample(_ surface: CGRect) -> CGRect {
+            DesktopBackdropGeometry.contentsRect(
+                surface: surface, imagePixels: wallpaper, screen: screen,
+                scaling: .scaleProportionallyUpOrDown, allowsClipping: true, backingScale: 2
+            )
+        }
+
+        // A 210 pt sidebar in a window 100 pt from the left edge, 60 pt up.
+        // 100/1512 across, (982 − 960)/982 down, 210/1512 wide, 900/982 tall.
+        let left = sample(CGRect(x: 100, y: 60, width: 210, height: 900))
+        XCTAssertEqual(left.minX, 100.0 / 1512, accuracy: 1e-6)
+        XCTAssertEqual(left.minY, 22.0 / 982, accuracy: 1e-6)
+        XCTAssertEqual(left.width, 210.0 / 1512, accuracy: 1e-6)
+        XCTAssertEqual(left.height, 900.0 / 982, accuracy: 1e-6)
+
+        // Drag the window 300 pt right: the sample slides 300 pt of wallpaper
+        // right and does nothing else. This is the whole behaviour — the
+        // backdrop stays put while the window travels over it.
+        let dragged = sample(CGRect(x: 400, y: 60, width: 210, height: 900))
+        XCTAssertEqual(dragged.minX - left.minX, 300.0 / 1512, accuracy: 1e-6)
+        XCTAssertEqual(dragged.minY, left.minY, accuracy: 1e-9)
+        XCTAssertEqual(dragged.width, left.width, accuracy: 1e-9)
+
+        // Down 40 pt: in AppKit the window's y *falls*, so the sample walks
+        // *down* the image. Getting this flip wrong is the classic version of
+        // this bug and it is invisible on a symmetric fixture. (40 pt, because
+        // a 900 pt surface on a 982 pt display has only 82 pt of travel before
+        // it runs off an edge and the clamp below takes over.)
+        let lowered = sample(CGRect(x: 100, y: 20, width: 210, height: 900))
+        XCTAssertEqual(lowered.minY - left.minY, 40.0 / 982, accuracy: 1e-6)
+
+        // A second display, larger and to the right, with its own origin and
+        // its own backing scale. What must hold is that the wallpaper is still
+        // sampled at the *display's* scale — a 210 pt surface covers 210 pt of
+        // that display's wallpaper — and that it is a different part of the
+        // picture from the one the same window showed on display one.
+        let second = CGRect(x: 1512, y: -230, width: 2560, height: 1440)
+        let secondFrame = DesktopBackdropGeometry.wallpaperFrame(
+            imagePixels: wallpaper, screen: second,
+            scaling: .scaleProportionallyUpOrDown, allowsClipping: true, backingScale: 1
+        )
+        // Fill: 2560/3024 = 0.8466 against 1440/1964 = 0.7332, so width binds
+        // and the picture overhangs top and bottom.
+        XCTAssertEqual(secondFrame.width, 2560, accuracy: 0.001)
+        XCTAssertEqual(secondFrame.height, 1964 * (2560.0 / 3024), accuracy: 0.001)
+        XCTAssertEqual(secondFrame.midY, second.midY, accuracy: 0.001)
+        let onSecond = DesktopBackdropGeometry.contentsRect(
+            surface: CGRect(x: 1612, y: 100, width: 210, height: 900), imagePixels: wallpaper,
+            screen: second, scaling: .scaleProportionallyUpOrDown, allowsClipping: true,
+            backingScale: 1
+        )
+        XCTAssertEqual(onSecond.width * secondFrame.width, 210, accuracy: 0.001)
+        XCTAssertEqual(onSecond.minX, 100.0 / 2560, accuracy: 1e-6)
+        XCTAssertNotEqual(onSecond.minX, left.minX, accuracy: 1e-4)
+
+        // Off the left edge: slid back inside at full size rather than shrunk,
+        // so the surface still shows wallpaper at the right scale instead of
+        // one stretched strip. Same on the right edge and the top.
+        let offLeft = sample(CGRect(x: -150, y: 60, width: 210, height: 900))
+        XCTAssertEqual(offLeft.minX, 0, accuracy: 1e-9)
+        XCTAssertEqual(offLeft.width, 210.0 / 1512, accuracy: 1e-6)
+        let offRight = sample(CGRect(x: 1450, y: 60, width: 210, height: 900))
+        XCTAssertEqual(offRight.maxX, 1, accuracy: 1e-6)
+        XCTAssertEqual(offRight.width, 210.0 / 1512, accuracy: 1e-6)
+        let offTop = sample(CGRect(x: 100, y: 500, width: 210, height: 900))
+        XCTAssertEqual(offTop.minY, 0, accuracy: 1e-9)
+        // A surface bigger than the whole wallpaper degenerates to all of it,
+        // and cannot produce a rectangle outside the image.
+        let huge = sample(CGRect(x: -400, y: -400, width: 3000, height: 2000))
+        XCTAssertEqual(huge, CGRect(x: 0, y: 0, width: 1, height: 1))
+
+        // Every fill mode macOS offers, on a square wallpaper so the layouts
+        // are actually different from each other.
+        let square = CGSize(width: 2000, height: 2000)
+        let stretch = DesktopBackdropGeometry.wallpaperFrame(
+            imagePixels: square, screen: screen,
+            scaling: .scaleAxesIndependently, allowsClipping: true, backingScale: 2
+        )
+        XCTAssertEqual(stretch, screen)
+        let fit = DesktopBackdropGeometry.wallpaperFrame(
+            imagePixels: square, screen: screen,
+            scaling: .scaleProportionallyUpOrDown, allowsClipping: false, backingScale: 2
+        )
+        XCTAssertEqual(fit.width, 982, accuracy: 0.001)
+        XCTAssertEqual(fit.height, 982, accuracy: 0.001)
+        XCTAssertEqual(fit.midX, screen.midX, accuracy: 0.001)
+        let fill = DesktopBackdropGeometry.wallpaperFrame(
+            imagePixels: square, screen: screen,
+            scaling: .scaleProportionallyUpOrDown, allowsClipping: true, backingScale: 2
+        )
+        XCTAssertEqual(fill.width, 1512, accuracy: 0.001)
+        // Centre: the picture at its own point size, un-scaled.
+        let centred = DesktopBackdropGeometry.wallpaperFrame(
+            imagePixels: square, screen: screen,
+            scaling: .scaleNone, allowsClipping: false, backingScale: 2
+        )
+        XCTAssertEqual(centred.width, 1000, accuracy: 0.001)
+        XCTAssertEqual(centred.minX, 256, accuracy: 0.001)
+        // Tile: the same 1000 pt picture, repeating, so a window past the first
+        // copy samples the second one rather than clamping to the first's edge.
+        let firstTile = DesktopBackdropGeometry.contentsRect(
+            surface: CGRect(x: 100, y: 60, width: 210, height: 900), imagePixels: square,
+            screen: screen, scaling: .scaleNone, allowsClipping: true, backingScale: 2
+        )
+        let secondTile = DesktopBackdropGeometry.contentsRect(
+            surface: CGRect(x: 1100, y: 60, width: 210, height: 900), imagePixels: square,
+            screen: screen, scaling: .scaleNone, allowsClipping: true, backingScale: 2
+        )
+        XCTAssertEqual(firstTile.minX, secondTile.minX, accuracy: 1e-6)
+
+        // The option dictionary macOS actually publishes, and the defaults for
+        // a screen it says nothing about.
+        let read = DesktopBackdropGeometry.layout(from: [
+            .imageScaling: NSNumber(value: NSImageScaling.scaleAxesIndependently.rawValue),
+            .allowClipping: NSNumber(value: false),
+        ])
+        XCTAssertEqual(read.scaling, .scaleAxesIndependently)
+        XCTAssertFalse(read.allowsClipping)
+        let defaults = DesktopBackdropGeometry.layout(from: nil)
+        XCTAssertEqual(defaults.scaling, .scaleProportionallyUpOrDown)
+        XCTAssertTrue(defaults.allowsClipping)
+    }
+
+    /// The end-to-end version of the same claim, rendered rather than asserted
+    /// about: a surface pinned over the left of a left-to-right wallpaper is
+    /// **darker** than the same surface pinned over the right of it, and by the
+    /// amount the wallpaper's own gradient says it should be.
+    ///
+    /// The stretched pipeline cannot pass this at all — every position produced
+    /// the identical surface, which is the bug in one line.
+    func testMovingTheWindowMovesTheWallpaperUnderTheGlass() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appending(path: "kaisola-pinned-\(UUID().uuidString)", directoryHint: .isDirectory)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        // A wallpaper that is dark on the left and bright on the right, so
+        // "which part is behind the window" is directly readable off the
+        // surface's luminance.
+        let side = 1024
+        var raw = [UInt8](repeating: 255, count: side * side * 4)
+        for y in 0..<side {
+            for x in 0..<side {
+                let value = UInt8(min(255, max(0, 20 + 215 * Double(x) / Double(side - 1))))
+                let index = (y * side + x) * 4
+                raw[index] = value
+                raw[index + 1] = value
+                raw[index + 2] = value
+            }
+        }
+        var image: CGImage?
+        raw.withUnsafeMutableBytes { bytes in
+            image = CGContext(
+                data: bytes.baseAddress, width: side, height: side, bitsPerComponent: 8,
+                bytesPerRow: side * 4, space: CGColorSpaceCreateDeviceRGB(),
+                bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+            )?.makeImage()
+        }
+        let url = directory.appending(path: "sweep.png")
+        let destination = try XCTUnwrap(CGImageDestinationCreateWithURL(
+            url as CFURL, "public.png" as CFString, 1, nil
+        ))
+        CGImageDestinationAddImage(destination, try XCTUnwrap(image), nil)
+        XCTAssertTrue(CGImageDestinationFinalize(destination))
+
+        let screen = CGRect(x: 0, y: 0, width: 1512, height: 982)
+        for isDark in [true, false] {
+            let key = DesktopBackdropKey(path: url.path, modified: nil, isDark: isDark)
+            guard case let .wallpaper(still, _, pixels)? = DesktopBackdropRenderer.render(key: key)
+            else { return XCTFail("no painting") }
+            var means: [Double] = []
+            for originX in [40.0, 651, 1262] {
+                let crop = DesktopBackdropGeometry.contentsRect(
+                    surface: CGRect(x: originX, y: 41, width: 210, height: 900),
+                    imagePixels: pixels, screen: screen,
+                    scaling: .scaleProportionallyUpOrDown, allowsClipping: true, backingScale: 2
+                )
+                let surface = try renderGlassSurface(
+                    still: still, wash: GlassBackdropWash.sidebar(isDark: isDark),
+                    isDark: isDark, width: 210, height: 900, crop: crop
+                )
+                var total = 0.0
+                for pixel in stride(from: 0, to: surface.count, by: 4) {
+                    total += Double(surface[pixel]) / 255 * 0.2126
+                        + Double(surface[pixel + 1]) / 255 * 0.7152
+                        + Double(surface[pixel + 2]) / 255 * 0.0722
+                }
+                means.append(total / Double(surface.count / 4))
+            }
+            // Left, middle, right: strictly increasing, because the wallpaper
+            // is. A stretched still would return three identical numbers.
+            XCTAssertLessThan(means[0], means[1], "\(isDark ? "dark" : "light") left ≥ middle")
+            XCTAssertLessThan(means[1], means[2], "\(isDark ? "dark" : "light") middle ≥ right")
+            XCTAssertGreaterThan(
+                means[2] - means[0], 0.01,
+                """
+                the surface moved only \(means[2] - means[0]) across the whole \
+                width of a black-to-white wallpaper — the glass is not \
+                following the desktop
+                """
+            )
+        }
+    }
+
+    /// Following a drag is a **sampling rectangle**, not a re-bake — which is
+    /// the answer to round 2's stated reason for skipping desktop pinning
+    /// ("it re-lays out on every window drag").
+    ///
+    /// `DesktopWallpaperPatch` sets one `CALayer.contentsRect` per frame from
+    /// this arithmetic, so the cost of a drag frame *is* this function plus a
+    /// property assignment on a layer whose texture never changes. Bound it, so
+    /// nobody can later put a decode behind it.
+    func testFollowingADragCostsArithmeticAndNotABake() {
+        let screen = CGRect(x: 0, y: 0, width: 1512, height: 982)
+        let wallpaper = CGSize(width: 3024, height: 1964)
+        let iterations = 100_000
+        let started = Date()
+        var sink = 0.0
+        for step in 0..<iterations {
+            let rect = DesktopBackdropGeometry.contentsRect(
+                surface: CGRect(
+                    x: Double(step % 1200), y: 41, width: 210, height: 900
+                ),
+                imagePixels: wallpaper, screen: screen,
+                scaling: .scaleProportionallyUpOrDown, allowsClipping: true, backingScale: 2
+            )
+            sink += rect.minX
+        }
+        let each = Date().timeIntervalSince(started) / Double(iterations)
+        XCTAssertGreaterThan(sink, 0)
+        print(String(format: "[drag] contentsRect %.4f µs per frame", each * 1e6))
+        XCTAssertLessThan(
+            each, 20e-6,
+            "a drag frame costs \(each * 1e6) µs of geometry — something expensive got added"
+        )
+    }
+
+    /// The bake exactly as it shipped in **round 7** — a 448 px still, a blur
+    /// of 5% of it, and lightness measured as **Rec. 709 luma** with the
+    /// correction applied as `CIColorControls`' additive brightness. Frozen
+    /// here as the reference the hue-invariance contract is measured against,
+    /// the same way round 7 froze the bake before it.
+    private func bakeAsShippedBeforeRound8(_ url: URL, isDark: Bool) -> CGImage? {
+        guard let source = CGImageSourceCreateWithURL(url as CFURL, nil),
+              let still = CGImageSourceCreateThumbnailAtIndex(source, 0, [
+                  kCGImageSourceCreateThumbnailFromImageAlways: true,
+                  kCGImageSourceCreateThumbnailWithTransform: true,
+                  kCGImageSourceThumbnailMaxPixelSize: 448,
+              ] as CFDictionary)
+        else { return nil }
+        let input = CIImage(cgImage: still)
+        let extent = input.extent
+        var options: [CIContextOption: Any] = [.useSoftwareRenderer: false]
+        if let space = DesktopBackdropRenderer.bakeColorSpace {
+            options[.workingColorSpace] = space
+        }
+        let context = CIContext(options: options)
+        let radius = 448.0 * 0.05
+        let gaussian = CIFilter.gaussianBlur()
+        gaussian.inputImage = input.clampedToExtent()
+        gaussian.radius = Float(radius)
+        guard let softened = gaussian.outputImage else { return nil }
+        let unsharp = CIFilter.unsharpMask()
+        unsharp.inputImage = softened
+        unsharp.radius = Float(radius * DesktopBackdropRenderer.localContrastRadiusFactor)
+        unsharp.intensity = Float(DesktopBackdropRenderer.localContrastIntensity)
+        guard let structured = unsharp.outputImage,
+              let probe = context.createCGImage(structured, from: extent),
+              let sampled = DesktopTintSampler.pixels(
+                  image: probe, side: DesktopBackdropRenderer.probeSide
+              )
+        else { return nil }
+        let mean = DesktopTintSampler.meanLuminance(rgba: sampled)
+            ?? DesktopBackdropRenderer.targetLuminance(isDark: isDark)
+        let tail = DesktopTintSampler.worstPatchLuminance(rgba: sampled, isDark: isDark) ?? mean
+        let gain = DesktopBackdropRenderer.tailGain(
+            excursion: abs(tail - mean), isDark: isDark
+        )
+        let controls = CIFilter.colorControls()
+        controls.inputImage = structured
+        controls.saturation = Float(
+            DesktopBackdropRenderer.saturation(mean: mean, isDark: isDark, gain: gain)
+        )
+        controls.contrast = Float(gain)
+        controls.brightness = Float(
+            DesktopBackdropRenderer.luminanceShift(mean: mean, isDark: isDark, gain: gain)
+        )
+        guard let output = controls.outputImage else { return nil }
+        return context.createCGImage(output, from: extent)
+    }
+
+    /// **The round-8 contract, half two**: the glass is the same material
+    /// whatever hue the wallpaper happens to be.
+    ///
+    /// Michael: "huh the saturation is bizarre though, on blue wallpaper it
+    /// becomes white and on green wallpaper it's very green."
+    ///
+    /// He is describing a real bug and the mechanism is exact. Every lightness
+    /// in the bake was **Rec. 709 luma**, which weights green 9.9x blue, and
+    /// the correction was `CIColorControls`' *additive* brightness. So four
+    /// pictures that are identical in HSV value and saturation and differ only
+    /// in hue read as 0.24 / 0.20 / 0.39 / 0.50 bright — a 2.4x spread from
+    /// nothing — and each is handed a different flat grey to make up the
+    /// difference. Adding a large constant to a blue walks it toward white;
+    /// adding a small one to a green leaves it green. Rendered, the shipped
+    /// light sidebar measured Oklab saturation **0.036 blue against 0.083
+    /// green**.
+    ///
+    /// The reason it survived four rounds of careful measurement is that every
+    /// one of those rounds checked wallpapers **one at a time**. A per-wallpaper
+    /// spot check cannot see a quantity that is only wrong *relative to another
+    /// hue*. This test holds the family against itself, which is the only shape
+    /// of assertion that can.
+    func testGlassIsTheSameMaterialWhateverHueTheWallpaperIs() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appending(path: "kaisola-hue-\(UUID().uuidString)", directoryHint: .isDirectory)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let screen = CGRect(x: 0, y: 0, width: 1512, height: 982)
+        let family: [(name: String, hue: Double, saturation: Double)] = [
+            ("blue", 220, 0.75), ("green", 120, 0.75), ("red", 0, 0.75), ("neutral", 0, 0),
+        ]
+        for isDark in [true, false] {
+            var stillLightness: [Double] = []
+            var stillSaturation: [Double] = []
+            var surfaceLightness: [Double] = []
+            var surfaceSaturation: [Double] = []
+            var bareSaturation: [Double] = []
+            var frozenSaturation: [Double] = []
+            var neutralSurface = 0.0
+
+            for member in family {
+                let url = try writeHueWallpaper(
+                    hue: member.hue, saturation: member.saturation, into: directory,
+                    named: "\(member.name)-\(isDark ? "d" : "l")"
+                )
+                let key = DesktopBackdropKey(path: url.path, modified: nil, isDark: isDark)
+                guard case let .wallpaper(still, _, pixels)? =
+                    DesktopBackdropRenderer.render(key: key)
+                else { return XCTFail("\(member.name) produced no painting") }
+                let frozen = try XCTUnwrap(bakeAsShippedBeforeRound8(url, isDark: isDark))
+
+                // The still, measured directly: this is the quantity the bake
+                // controls, and it is where the invariance is exact.
+                let box = try XCTUnwrap(DesktopTintSampler.pixels(image: still, side: 96))
+                var lightness = 0.0
+                var saturation = 0.0
+                var count = 0.0
+                for pixel in stride(from: 0, to: box.count, by: 4) {
+                    let parts = Oklab.components(
+                        red: Double(box[pixel]) / 255,
+                        green: Double(box[pixel + 1]) / 255,
+                        blue: Double(box[pixel + 2]) / 255
+                    )
+                    lightness += parts.lightness
+                    saturation += (parts.a * parts.a + parts.b * parts.b).squareRoot()
+                        / max(parts.lightness, 0.001)
+                    count += 1
+                }
+                stillLightness.append(lightness / count)
+                stillSaturation.append(saturation / count)
+
+                // And the finished surface, in the shipped geometry: a 210 pt
+                // sidebar pinned over the middle of the desktop.
+                let crop = DesktopBackdropGeometry.contentsRect(
+                    surface: CGRect(x: 651, y: 41, width: 210, height: 900),
+                    imagePixels: pixels, screen: screen,
+                    scaling: .scaleProportionallyUpOrDown, allowsClipping: true, backingScale: 2
+                )
+                let wash = GlassBackdropWash.sidebar(isDark: isDark)
+                let surface = try renderGlassSurface(
+                    still: still, wash: wash, isDark: isDark,
+                    width: 210, height: 900, crop: crop
+                )
+                let perceived = perceivedSurface(surface)
+                surfaceLightness.append(perceived.lightness)
+                surfaceSaturation.append(perceived.saturation)
+                bareSaturation.append(perceivedSurface(try renderGlassSurface(
+                    still: still, wash: wash, isDark: isDark,
+                    width: 210, height: 900, crop: crop, warmth: 0
+                )).saturation)
+                frozenSaturation.append(perceivedSurface(try renderGlassSurface(
+                    still: frozen, wash: wash, isDark: isDark,
+                    width: 210, height: 900
+                )).saturation)
+                if member.name == "neutral" { neutralSurface = perceived.saturation }
+
+                // Whatever the hue, the floors hold on the same renders. Both
+                // halves at once, because separately each is trivial: a grey
+                // surface is perfectly hue-invariant and perfectly useless.
+                let worst = worstPatchContrast(surface, isDark: isDark)
+                XCTAssertGreaterThanOrEqual(worst.primary, 7, "\(member.name) primary")
+                XCTAssertGreaterThanOrEqual(
+                    worst.secondary, isDark ? 4.5 : 3.43, "\(member.name) secondary"
+                )
+            }
+
+            func spread(_ values: [Double]) -> Double {
+                let coloured = values.prefix(3)
+                return coloured.max()! / max(coloured.min()!, 1e-9)
+            }
+
+            // The bake itself: exact, to the fourth decimal.
+            XCTAssertLessThan(
+                spread(stillLightness), 1.01,
+                "the baked still's perceived lightness still depends on hue: \(stillLightness)"
+            )
+            XCTAssertLessThan(
+                spread(stillSaturation), 1.01,
+                "the baked still's colourfulness still depends on hue: \(stillSaturation)"
+            )
+            // The finished surface: the residual is `GlassWarmth`, which is a
+            // fixed amber *vector* and so adds to a red surface and cancels a
+            // blue one. The next assertion proves that is all it is.
+            XCTAssertLessThan(
+                spread(surfaceLightness), 1.01,
+                "the surface's perceived lightness depends on hue: \(surfaceLightness)"
+            )
+            XCTAssertLessThan(
+                spread(surfaceSaturation), 1.12,
+                "the surface's colourfulness depends on hue: \(surfaceSaturation)"
+            )
+            XCTAssertLessThan(
+                spread(bareSaturation), 1.03,
+                """
+                with the declared amber removed the surfaces still disagree by \
+                \(spread(bareSaturation)) — the residual is no longer GlassWarmth \
+                and something else has become hue-dependent: \(bareSaturation)
+                """
+            )
+
+            // The wallpaper's colour does still reach the glass — otherwise a
+            // pipeline that painted grey would pass everything above.
+            XCTAssertGreaterThan(
+                surfaceSaturation.prefix(3).min()!, neutralSurface * 4,
+                "the glass no longer carries the desktop's hue at all"
+            )
+
+            // And the pipeline this replaces fails the same bound, loudly. If
+            // this ever stops failing, the fixture has stopped exercising the
+            // bug and the tolerances above are no longer evidence of anything.
+            XCTAssertGreaterThan(
+                spread(frozenSaturation), 1.2,
+                """
+                the pre-round-8 bake now agrees across hues to \
+                \(spread(frozenSaturation)) — this fixture no longer reproduces \
+                the bug it was built for
+                """
+            )
+            print(String(
+                format: "[hue] %@ still L %.4f..%.4f sat %.4f..%.4f | surface L %.4f..%.4f "
+                    + "sat %.4f..%.4f (bare %.4f..%.4f, before %.4f..%.4f)",
+                isDark ? "dark " : "light",
+                stillLightness.min()!, stillLightness.max()!,
+                stillSaturation.prefix(3).min()!, stillSaturation.prefix(3).max()!,
+                surfaceLightness.min()!, surfaceLightness.max()!,
+                surfaceSaturation.prefix(3).min()!, surfaceSaturation.prefix(3).max()!,
+                bareSaturation.prefix(3).min()!, bareSaturation.prefix(3).max()!,
+                frozenSaturation.prefix(3).min()!, frozenSaturation.prefix(3).max()!
+            ))
+        }
+    }
+
     /// The bake exactly as it shipped before round 7 — 176px still, radius 28,
     /// gain solved from a 16×16 box's p5..p95 against the declared spread
     /// ceiling. Frozen here as the reference the detail metric is measured
@@ -1980,7 +2628,7 @@ final class NativePreviewSettingsTests: XCTestCase {
             )
             for isDark in [true, false] {
                 let key = DesktopBackdropKey(path: url.path, modified: nil, isDark: isDark)
-                guard case let .wallpaper(still, _)? = DesktopBackdropRenderer.render(key: key),
+                guard case let .wallpaper(still, _, _)? = DesktopBackdropRenderer.render(key: key),
                       let legacy = bakeAsShippedBeforeRound7(url, isDark: isDark)
                 else { return XCTFail("\(name) produced no painting") }
 
@@ -2068,7 +2716,7 @@ final class NativePreviewSettingsTests: XCTestCase {
             base: (0.263, 0.476, 0.575), range: 0.9, into: directory, named: "aerial"
         )
         let key = DesktopBackdropKey(path: url.path, modified: nil, isDark: true)
-        guard case let .wallpaper(still, _)? = DesktopBackdropRenderer.render(key: key) else {
+        guard case let .wallpaper(still, _, _)? = DesktopBackdropRenderer.render(key: key) else {
             return XCTFail("the aerial fixture produced no painting")
         }
 
@@ -2123,7 +2771,7 @@ final class NativePreviewSettingsTests: XCTestCase {
             base: (0.263, 0.476, 0.575), range: 0.9, into: directory, named: "aerial"
         )
         let key = DesktopBackdropKey(path: url.path, modified: nil, isDark: false)
-        guard case let .wallpaper(still, _)? = DesktopBackdropRenderer.render(key: key) else {
+        guard case let .wallpaper(still, _, _)? = DesktopBackdropRenderer.render(key: key) else {
             return XCTFail("the aerial fixture produced no painting")
         }
 
@@ -2219,7 +2867,7 @@ final class NativePreviewSettingsTests: XCTestCase {
 
         func stillSpread(_ url: URL, isDark: Bool) throws -> (spread: Double, mean: Double) {
             let key = DesktopBackdropKey(path: url.path, modified: nil, isDark: isDark)
-            guard case let .wallpaper(image, _)? = DesktopBackdropRenderer.render(key: key) else {
+            guard case let .wallpaper(image, _, _)? = DesktopBackdropRenderer.render(key: key) else {
                 throw XCTSkip("no painting")
             }
             var pixels = [UInt8](repeating: 0, count: image.width * image.height * 4)
@@ -2320,7 +2968,7 @@ final class NativePreviewSettingsTests: XCTestCase {
             base: (0.5, 0.5, 0.5), range: 1.9, into: directory, named: "ramp"
         )
         let key = DesktopBackdropKey(path: url.path, modified: nil, isDark: false)
-        guard case let .wallpaper(image, _)? = DesktopBackdropRenderer.render(key: key) else {
+        guard case let .wallpaper(image, _, _)? = DesktopBackdropRenderer.render(key: key) else {
             return XCTFail("the ramp fixture produced no painting")
         }
 
@@ -2602,44 +3250,58 @@ final class NativePreviewSettingsTests: XCTestCase {
         XCTAssertGreaterThan(GlassWarmth.opacity, 0.02, "deleted in all but name")
     }
 
-    /// The blur is a fraction of the frame, not a pixel count — and the band it
-    /// has to stay inside is two-sided.
+    /// The blur is a size **on screen**, not a fraction of the picture — and
+    /// the band it has to stay inside is two-sided.
     ///
-    /// This used to assert `blurRadius >= 24` on a 176px still: 14% of the
-    /// frame, one-sided, and it passed for exactly the wrong reason. The bake
-    /// had been tuned until *no* structure survived, which is what produced the
-    /// flat colour field Michael described as missing the wallpaper's "vibe".
-    /// A one-sided floor cannot see that, in the same way the veil's one-sided
-    /// floor could not see the surface going opaque.
+    /// It used to assert `blurRadius >= 24` on a 176px still: one-sided, and it
+    /// passed for exactly the wrong reason — the bake had been tuned until *no*
+    /// structure survived, which is what produced the flat colour field
+    /// round 7 had to undo. Round 7 made it two-sided as a fraction of the
+    /// still, which was right while every surface showed the whole still
+    /// stretched to its own width. Desktop pinning ends that identity: a 210 pt
+    /// sidebar now shows about an eighth of the wallpaper, so a fraction of the
+    /// wallpaper is eight times that fraction of the sidebar.
     ///
-    /// Both ends now. Too small and the desktop is a recognisable picture behind
-    /// the labels, which is the thing the original note was right about; too
-    /// large and the surface is a colour field again. Stated relative to the
-    /// still's width so it keeps meaning the same thing if `stillWidth` moves.
-    func testWallpaperBakeBlursPastAnyRecognisableShapeButNotPastEveryShape() {
-        let fraction = DesktopBackdropRenderer.blurRadius
-            / Double(DesktopBackdropRenderer.stillWidth)
-        XCTAssertEqual(fraction, DesktopBackdropRenderer.blurFraction, accuracy: 0.0001)
+    /// So the bound moves to where it was always really about — how much of a
+    /// **surface** one blur radius covers. Too small and the desktop resolves
+    /// as a legible picture behind the labels; too large and the narrowest
+    /// surface is one soft wash end to end, which is a colour field again.
+    func testWallpaperBakeBlursPastAnyLegibleShapeButNotPastEveryShape() {
+        let share = DesktopBackdropRenderer.blurShareOfNarrowestSurface
         XCTAssertGreaterThanOrEqual(
-            fraction, 0.03,
+            share, 0.06,
             "the wallpaper resolves as a picture rather than as a wash"
         )
         XCTAssertLessThanOrEqual(
-            fraction, 0.09,
+            share, 0.22,
             """
-            the blur spans \(Int(fraction * 100))% of the frame, which leaves \
-            about \(Int(1 / fraction)) masses across the whole wallpaper — a \
-            colour field, not frosted glass
+            one blur radius covers \(Int(share * 100))% of a 210 pt sidebar, \
+            leaving about \(Int(1 / share)) masses across it — a colour field, \
+            not frosted glass
             """
         )
-        // The working resolution has to be fine enough that the structure the
-        // blur keeps is the wallpaper's and not the decode's. Measured: at
-        // 176px the baked still correlates 0.841 with a 1024px reference, at
-        // 448px 0.932 — so 176 was showing ~16% aliasing as texture.
-        XCTAssertGreaterThanOrEqual(
-            Double(DesktopBackdropRenderer.stillWidth), 1 / fraction * 20,
-            "too few pixels per retained feature; the texture is decode aliasing"
-        )
+        // A blur stated in points has to survive being converted for whatever
+        // display the desktop is on, and it stays in band across every width a
+        // Mac can report.
+        for screenPoints in [1280.0, 1512, 1728, 2560, 3440] {
+            let radius = DesktopBackdropRenderer.blurRadius(screenPoints: screenPoints)
+            XCTAssertEqual(
+                radius / Double(DesktopBackdropRenderer.stillWidth) * screenPoints,
+                DesktopBackdropRenderer.desktopBlurPoints,
+                accuracy: 0.001,
+                "the blur stops being \(DesktopBackdropRenderer.desktopBlurPoints) pt on screen"
+            )
+            // The working resolution has to be fine enough that the structure
+            // the blur keeps is the wallpaper's and not the decode's: measured,
+            // a 176px still correlates 0.841 with a 1024px reference and a
+            // 448px one 0.932. Twenty pixels per retained feature is the floor
+            // round 7 established, and it has to hold at the *widest* display,
+            // where the radius in still pixels is smallest.
+            XCTAssertGreaterThanOrEqual(
+                radius, 4,
+                "at \(Int(screenPoints)) pt the blur is \(radius) still-pixels — aliasing, not texture"
+            )
+        }
     }
 
     /// `NSVisualEffectView` normalized luminance; a raw wallpaper does not, so

@@ -1516,21 +1516,52 @@ struct DesktopBackdropKey: Hashable, Sendable {
     let path: String
     let modified: Date?
     let isDark: Bool
+    /// How wide the desktop is, in points — and the one thing about the
+    /// *screen* the bake does have to know.
+    ///
+    /// The still is pinned to desktop coordinates now, so it is stretched
+    /// across the whole display rather than across each surface. Its blur is
+    /// therefore no longer measurable as a fraction of the picture: the same
+    /// fraction is a different number of **points** on a 1512 pt laptop and a
+    /// 3440 pt ultrawide, and points are what the eye and the contrast floors
+    /// are stated in. See `DesktopBackdropRenderer.desktopBlurPoints`.
+    ///
+    /// Quantized to 128 pt so that a display which reports a slightly
+    /// different width — or a second display close in size — reuses the cached
+    /// bake instead of paying for another one.
+    let screenPoints: Double
+
+    static func quantized(screenPoints: Double) -> Double {
+        max(512, (screenPoints / 128).rounded() * 128)
+    }
+
+    init(path: String, modified: Date?, isDark: Bool, screenPoints: Double = 1512) {
+        self.path = path
+        self.modified = modified
+        self.isDark = isDark
+        self.screenPoints = Self.quantized(screenPoints: screenPoints)
+    }
 
     var url: URL { URL(fileURLWithPath: path) }
 }
 
 /// What a glass surface paints under its veil.
 enum DesktopPainting: @unchecked Sendable {
-    /// The pre-blurred desktop still, plus the tint sampled from that same
-    /// decode so a single pass produces both products.
-    case wallpaper(CGImage, tint: DesktopTintComponents)
+    /// The pre-blurred desktop still, the pixel size of the wallpaper it was
+    /// baked from, and the tint sampled from that same decode so a single pass
+    /// produces every product.
+    ///
+    /// The full pixel size travels with the still because the still is a
+    /// *thumbnail* — it keeps the wallpaper's aspect but not its size, and
+    /// where macOS lays a desktop picture out on a screen depends on the size
+    /// for the "Center" and "Tile" fill modes. See `DesktopBackdropGeometry`.
+    case wallpaper(CGImage, tint: DesktopTintComponents, wallpaperPixels: CGSize)
     /// No readable still anywhere on the ladder.
     case flat(DesktopTintComponents)
 
     var tint: DesktopTintComponents {
         switch self {
-        case let .wallpaper(_, tint): tint
+        case let .wallpaper(_, tint, _): tint
         case let .flat(tint): tint
         }
     }
@@ -1539,13 +1570,169 @@ enum DesktopPainting: @unchecked Sendable {
 extension DesktopPainting: Equatable {
     static func == (lhs: DesktopPainting, rhs: DesktopPainting) -> Bool {
         switch (lhs, rhs) {
-        case let (.wallpaper(lhsImage, lhsTint), .wallpaper(rhsImage, rhsTint)):
-            lhsImage === rhsImage && lhsTint == rhsTint
+        case let (.wallpaper(lhsImage, lhsTint, lhsSize), .wallpaper(rhsImage, rhsTint, rhsSize)):
+            lhsImage === rhsImage && lhsTint == rhsTint && lhsSize == rhsSize
         case let (.flat(lhsTint), .flat(rhsTint)):
             lhsTint == rhsTint
         default:
             false
         }
+    }
+}
+
+// MARK: - Where the wallpaper actually is
+
+/// The arithmetic that makes the glass *glass* rather than a picture of the
+/// desktop painted onto a panel.
+///
+/// Until this round every glass surface drew the **whole** baked still
+/// stretched to its own shape, so what the sidebar showed bore no relation to
+/// the wallpaper actually behind the sidebar — a blurry photograph on a panel,
+/// which is exactly why the surface never read as transparent however thin the
+/// veil got. Round 2 skipped desktop pinning on the grounds that it would
+/// "re-lay out on every window drag"; it does not, because the still is already
+/// baked and cached and following a drag is a change of **sampling rectangle**,
+/// not a change of pixels.
+///
+/// What is left is one piece of arithmetic: given where a surface is on a
+/// screen, which part of the wallpaper image is under it? That depends on how
+/// macOS laid the picture out, which `NSWorkspace.desktopImageOptions(for:)`
+/// publishes as an `NSImageScaling` plus an `allowClipping` flag — the two
+/// together spelling out aspect-fill, aspect-fit, stretch, centre or tile.
+enum DesktopBackdropGeometry {
+    /// The two option keys that decide the layout, read with the same defaults
+    /// macOS uses when it does not publish them: fill the screen.
+    static func layout(from options: [NSWorkspace.DesktopImageOptionKey: Any]?)
+        -> (scaling: NSImageScaling, allowsClipping: Bool) {
+        let raw = (options?[.imageScaling] as? NSNumber)?.uintValue
+        let scaling = raw.flatMap { NSImageScaling(rawValue: $0) } ?? .scaleProportionallyUpOrDown
+        let clipping = (options?[.allowClipping] as? NSNumber)?.boolValue ?? true
+        return (scaling, clipping)
+    }
+
+    /// Where a wallpaper of `imagePixels` lands inside `screen`, in the
+    /// screen's own (AppKit, y-up) coordinates.
+    ///
+    /// For the tiled desktop this is the *first* tile; `contentsRect` walks the
+    /// grid from it.
+    static func wallpaperFrame(
+        imagePixels: CGSize,
+        screen: CGRect,
+        scaling: NSImageScaling,
+        allowsClipping: Bool,
+        backingScale: CGFloat
+    ) -> CGRect {
+        guard imagePixels.width > 0, imagePixels.height > 0,
+              screen.width > 0, screen.height > 0
+        else { return screen }
+        let scale = max(backingScale, 1)
+        let natural = CGSize(
+            width: imagePixels.width / scale,
+            height: imagePixels.height / scale
+        )
+        let widthRatio = screen.width / natural.width
+        let heightRatio = screen.height / natural.height
+
+        let size: CGSize = switch scaling {
+        case .scaleAxesIndependently:
+            screen.size
+        case .scaleNone:
+            natural
+        case .scaleProportionallyDown:
+            natural.scaled(by: min(1, min(widthRatio, heightRatio)))
+        case .scaleProportionallyUpOrDown:
+            // The pair that spells "Fill Screen" against "Fit to Screen".
+            natural.scaled(by: allowsClipping
+                ? max(widthRatio, heightRatio)
+                : min(widthRatio, heightRatio))
+        @unknown default:
+            natural.scaled(by: max(widthRatio, heightRatio))
+        }
+        return CGRect(
+            x: screen.midX - size.width / 2,
+            y: screen.midY - size.height / 2,
+            width: size.width,
+            height: size.height
+        )
+    }
+
+    /// The unit sub-rectangle of the wallpaper image lying behind `surface`.
+    ///
+    /// **Top-left origin**, because that is `CALayer.contentsRect`'s
+    /// convention and a `CGImage`'s, while `surface` and `screen` arrive in
+    /// AppKit's y-up coordinates — the flip happens here, once, rather than at
+    /// each call site.
+    ///
+    /// A surface that runs off the wallpaper — a window dragged half off the
+    /// screen, or sitting on the letterboxed margin of a "Fit to Screen"
+    /// desktop — is **slid back inside at its full size** rather than being
+    /// shrunk to the overlap. Shrinking would stretch the visible strip across
+    /// the whole surface, which is the one artefact that would read as a bug;
+    /// sliding shows the nearest real wallpaper at the correct scale, and the
+    /// case only arises where there is no desktop under the glass to be honest
+    /// about anyway.
+    static func contentsRect(
+        surface: CGRect,
+        imagePixels: CGSize,
+        screen: CGRect,
+        scaling: NSImageScaling,
+        allowsClipping: Bool,
+        backingScale: CGFloat
+    ) -> CGRect {
+        var frame = wallpaperFrame(
+            imagePixels: imagePixels,
+            screen: screen,
+            scaling: scaling,
+            allowsClipping: allowsClipping,
+            backingScale: backingScale
+        )
+        guard frame.width > 0, frame.height > 0 else { return CGRect(x: 0, y: 0, width: 1, height: 1) }
+
+        // "Tile": the picture repeats from the screen's own origin, so the
+        // surface is mapped into whichever copy its centre falls in.
+        if scaling == .scaleNone, allowsClipping {
+            let column = ((surface.midX - screen.minX) / frame.width).rounded(.down)
+            let row = ((surface.midY - screen.minY) / frame.height).rounded(.down)
+            frame = CGRect(
+                x: screen.minX + column * frame.width,
+                y: screen.minY + row * frame.height,
+                width: frame.width,
+                height: frame.height
+            )
+        }
+
+        let width = surface.width / frame.width
+        let height = surface.height / frame.height
+        // AppKit counts y up from the bottom; the image counts it down from the
+        // top, so the surface's *top* edge is the sub-rect's origin.
+        let left = (surface.minX - frame.minX) / frame.width
+        let top = (frame.maxY - surface.maxY) / frame.height
+        return CGRect(
+            x: width >= 1 ? 0 : min(max(left, 0), 1 - width),
+            y: height >= 1 ? 0 : min(max(top, 0), 1 - height),
+            width: min(1, width),
+            height: min(1, height)
+        )
+    }
+}
+
+private extension CGSize {
+    func scaled(by factor: CGFloat) -> CGSize {
+        CGSize(width: width * factor, height: height * factor)
+    }
+}
+
+extension Array where Element == Double {
+    /// Index of the first element not less than `value`, on an already-ascending
+    /// array — i.e. where `value` has to go to keep it ascending.
+    func partitionPoint(before value: Double) -> Int {
+        var low = 0
+        var high = count
+        while low < high {
+            let middle = (low + high) / 2
+            if self[middle] < value { low = middle + 1 } else { high = middle }
+        }
+        return low
     }
 }
 
@@ -1577,12 +1764,65 @@ enum DesktopBackdropRenderer {
     ///
     /// Resolution is deliberately *not* the lever that produces detail — the
     /// detail metric is flat in it, because what the eye sees is set by the blur
-    /// as a **fraction of the frame**, not by the pixel count. Raising it only
-    /// buys fidelity of the structure `blurFraction` chose to keep.
-    static let stillWidth = 448
+    /// as a size on screen, not by the pixel count. Raising it only buys
+    /// fidelity of the structure `desktopBlurPoints` chose to keep.
+    ///
+    /// 448 → **896** for desktop pinning, and this time the magnification is
+    /// the argument rather than the decode. A stretched still was drawn about
+    /// 1:2 into a 210 pt sidebar; a pinned one shows the eighth of the
+    /// wallpaper behind that sidebar, which at 448 px is 62 source pixels
+    /// blown up to 420 backing pixels — 6.8×, where the round-7 correlation
+    /// ladder already put 448 px at 7% non-wallpaper structure. 896 halves the
+    /// magnification and takes the correlation past the 640 px rung (0.975).
+    static let stillWidth = 896
 
-    /// The blur, as a fraction of `stillWidth` — the constant that actually
-    /// decides whether the surface is a colour field or frosted glass.
+    /// The blur, **in screen points** — the scattering length of the material,
+    /// and the constant that decides whether the surface is a colour field or
+    /// frosted glass.
+    ///
+    /// It was a fraction of the still (`blurFraction` 0.05), which was the
+    /// right way to state it while every surface showed the whole wallpaper
+    /// stretched to its own width: the sidebar was the frame, so 5% of the
+    /// frame was 5% of the sidebar. Desktop pinning breaks that identity. A
+    /// 210 pt sidebar on a 1512 pt display shows about **an eighth** of the
+    /// wallpaper, so 5% of the wallpaper is 36% of the sidebar — one soft wash
+    /// end to end, with no texture in it at all. Measured: the structured
+    /// fixtures' surface detail fell from 0.0038–0.0058 stretched to
+    /// **0.0018–0.0022** pinned, which is below even the pre-round-7 figure the
+    /// last round doubled.
+    ///
+    /// A real frosted material has a fixed scattering length in physical units,
+    /// not one that scales with the picture behind it, so that is how it is
+    /// stated here. 28 pt is also, not coincidentally, the neighbourhood
+    /// AppKit's own behind-window blur works in, so the pinned wallpaper reads
+    /// as the same kind of material as the Live source it sits beside.
+    ///
+    /// The old requirement — "no locatable shape" — is *deliberately* relaxed,
+    /// because it was the requirement that made the surface a picture on a
+    /// panel. What replaces it is the requirement a glass surface actually
+    /// has: no *legible* shape, meaning nothing crisp enough to read text or an
+    /// icon through. At 28 pt over a 210 pt sidebar that is about seven soft
+    /// masses across — the horizon, the shoreline, the cloud bank — and every
+    /// contrast floor in this file still holds on the worst of them.
+    static let desktopBlurPoints: Double = 28
+
+    /// Radius in still pixels, for a desktop `screenPoints` wide.
+    ///
+    /// The still spans the whole display, so still pixels per screen point is
+    /// `stillPixels / screenPoints` and the conversion is that ratio.
+    ///
+    /// `stillPixels` is the width the decode actually produced, not
+    /// `stillWidth`: `CGImageSourceCreateThumbnailAtIndex` treats its maximum
+    /// as a **maximum**, so a wallpaper smaller than `stillWidth` comes back at
+    /// its own size, and using the declared width there would blur a small
+    /// picture by the wrong number of points.
+    static func blurRadius(screenPoints: Double, stillPixels: Int = stillWidth) -> Double {
+        Double(stillPixels) * desktopBlurPoints / max(screenPoints, 1)
+    }
+
+    /// The legacy fraction-of-the-frame statement of the same blur, kept
+    /// because the "does it still blur past anything legible" test is naturally
+    /// stated in it.
     ///
     /// It was 28 px on a 176 px still: **15.9%** of the frame. That is a blur
     /// wide enough to reduce any wallpaper to about six distinguishable masses
@@ -1603,10 +1843,11 @@ enum DesktopBackdropRenderer {
     /// contrast floors cannot afford. It is affordable here only because the cap
     /// underneath it moved from a *proxy* to the real quantity — see
     /// `tailHeadroom(isDark:)`.
-    static let blurFraction: Double = 0.05
-
-    /// Radius in `stillWidth` pixels.
-    static var blurRadius: Double { Double(stillWidth) * blurFraction }
+    /// The share of a **surface** — not of the wallpaper — the blur covers, on
+    /// the narrowest glass surface in the app (a 210 pt sidebar). This is the
+    /// quantity "no legible shape" is really about, and it is now stated where
+    /// it is true rather than where it happened to be equal to it.
+    static var blurShareOfNarrowestSurface: Double { desktopBlurPoints / 210 }
 
     /// A local-contrast add-back, applied to the blurred still before the tone
     /// map — the "compress the global range, keep the local one" half of the
@@ -1730,6 +1971,16 @@ enum DesktopBackdropRenderer {
     /// `rangeGain(spread:isDark:)`. Without this the range cap would damp the
     /// wallpaper's colour as a side effect of damping its dynamic range, which
     /// is the one thing the whole layer exists to show.
+    /// **Round 8 note.** `saturation`, `luminanceShift` and `tailGain` are no
+    /// longer on the bake's path: all three are now *solved* against the
+    /// rendered structure in a perceptual space rather than computed from
+    /// Rec. 709 luma — see `solveToneMap(probe:isDark:)`, and
+    /// `Oklab` for why measuring lightness as luma is what produced
+    /// "on blue wallpaper it becomes white and on green wallpaper it's very
+    /// green". They are retained because they *are* the round-7 pipeline, which
+    /// the hue-invariance test freezes and measures against, and because
+    /// `targetLuminance` and `tailHeadroom` still define the targets the solve
+    /// aims at. Nothing new should be built on them.
     static func saturation(mean: Double, isDark: Bool, gain: Double = 1) -> Double {
         let target = targetLuminance(isDark: isDark)
         return saturationCeiling(isDark: isDark)
@@ -1955,8 +2206,18 @@ enum DesktopBackdropRenderer {
         let tint = DesktopTintSampler.pixels(image: still)
             .flatMap { DesktopTintSampler.wallpaperAverage(rgba: $0) }
             ?? DesktopTintSampler.fallback
-        guard let blurred = blur(still, isDark: key.isDark) else { return .flat(tint) }
-        return .wallpaper(blurred, tint: tint)
+        guard let blurred = blur(still, isDark: key.isDark, screenPoints: key.screenPoints)
+        else { return .flat(tint) }
+        // The wallpaper's own pixel size, not the thumbnail's — the layout the
+        // glass is pinned to depends on it for the centred and tiled desktops.
+        let properties = CGImageSourceCopyPropertiesAtIndex(source, index, nil) as? [CFString: Any]
+        let pixels = CGSize(
+            width: (properties?[kCGImagePropertyPixelWidth] as? Int).map(CGFloat.init)
+                ?? CGFloat(blurred.width),
+            height: (properties?[kCGImagePropertyPixelHeight] as? Int).map(CGFloat.init)
+                ?? CGFloat(blurred.height)
+        )
+        return .wallpaper(blurred, tint: tint, wallpaperPixels: pixels)
     }
 
     /// The colour space the bake's arithmetic is done in, and the fix for
@@ -2016,7 +2277,8 @@ enum DesktopBackdropRenderer {
     /// `clampedToExtent` before the blur, cropped back after: without it the
     /// Gaussian averages in transparent black at every edge and the backdrop
     /// arrives with a dark vignette exactly where the window's corners are.
-    private static func blur(_ image: CGImage, isDark: Bool) -> CGImage? {
+    private static func blur(_ image: CGImage, isDark: Bool, screenPoints: Double) -> CGImage? {
+        let radius = blurRadius(screenPoints: screenPoints, stillPixels: image.width)
         let input = CIImage(cgImage: image)
         let extent = input.extent
 
@@ -2029,7 +2291,7 @@ enum DesktopBackdropRenderer {
 
         let gaussian = CIFilter.gaussianBlur()
         gaussian.inputImage = input.clampedToExtent()
-        gaussian.radius = Float(blurRadius)
+        gaussian.radius = Float(radius)
         guard let softened = gaussian.outputImage else { return nil }
 
         // The local-contrast add-back. Zero-mean by construction, so it changes
@@ -2038,33 +2300,28 @@ enum DesktopBackdropRenderer {
         // line and paid for by the gain.
         let unsharp = CIFilter.unsharpMask()
         unsharp.inputImage = softened
-        unsharp.radius = Float(blurRadius * localContrastRadiusFactor)
+        unsharp.radius = Float(radius * localContrastRadiusFactor)
         unsharp.intensity = Float(localContrastIntensity)
         guard let structured = unsharp.outputImage,
               let probe = context.createCGImage(structured, from: extent),
               let sampled = DesktopTintSampler.pixels(image: probe, side: probeSide)
         else { return nil }
 
-        let mean = DesktopTintSampler.meanLuminance(rgba: sampled)
-            ?? targetLuminance(isDark: isDark)
-        let tail = DesktopTintSampler.worstPatchLuminance(rgba: sampled, isDark: isDark) ?? mean
-        let gain = tailGain(excursion: abs(tail - mean), isDark: isDark)
-        let brightness = luminanceShift(mean: mean, isDark: isDark, gain: gain)
-        let saturation = saturation(mean: mean, isDark: isDark, gain: gain)
-
-        // All three normalizations ride the one `CIColorControls` pass already
-        // in the chain, so none costs an extra filter. The filter evaluates
-        // saturation, then contrast about 0.5, then brightness — measured, not
-        // assumed — which is why chroma, range and mean have to be solved
-        // together rather than treated as three independent constants. See
-        // `saturation(mean:isDark:gain:)`, `tailGain(excursion:isDark:)` and
-        // `luminanceShift(mean:isDark:gain:)`.
-        let controls = CIFilter.colorControls()
-        controls.inputImage = structured
-        controls.saturation = Float(saturation)
-        controls.contrast = Float(gain)
-        controls.brightness = Float(brightness)
-        guard let output = controls.outputImage else { return nil }
+        // Lightness, range and chroma are solved together against the probe,
+        // in a perceptual space, by applying the candidate map and measuring
+        // what it did. All three still ride **one** filter pass — see
+        // `BakeToneMap` for the map and `solveToneMap` for why it is solved by
+        // measurement rather than by formula.
+        let map = solveToneMap(probe: sampled, isDark: isDark)
+        let vectors = map.matrix
+        let matrix = CIFilter.colorMatrix()
+        matrix.inputImage = structured
+        matrix.rVector = vectors.red
+        matrix.gVector = vectors.green
+        matrix.bVector = vectors.blue
+        matrix.aVector = vectors.alpha
+        matrix.biasVector = vectors.bias
+        guard let output = matrix.outputImage else { return nil }
         return context.createCGImage(output, from: extent)
     }
 
@@ -2077,6 +2334,415 @@ enum DesktopBackdropRenderer {
     /// reduction averages away completely — measuring the tail on that box would
     /// reintroduce exactly the proxy this replaced.
     static let probeSide = 96
+}
+
+// MARK: - A tone map that does not care which hue carries the light
+
+/// Perceived lightness and colourfulness, and the fix for "the saturation is
+/// bizarre — on blue wallpaper it becomes white and on green wallpaper it's
+/// very green".
+///
+/// Every lightness in the bake used to be **Rec. 709 luma**, which weights
+/// green 9.9× blue (`0.7152` against `0.0722`). Measured on a fixture family
+/// that is identical in HSV value and saturation and differs only in hue, that
+/// one choice reads four equally-bright pictures as:
+///
+///     blue 0.2415   red 0.2047   green 0.3932   neutral 0.5000
+///
+/// — a **2.4× spread in "brightness" from pictures that are equally bright by
+/// construction**. Everything downstream then diverges: `luminanceShift` is a
+/// per-channel *offset*, so the blue picture is handed +0.48 of flat grey and
+/// the green one +0.33; and the offset is exactly the operation that destroys
+/// saturation, because adding a constant to `(0.125, 0.29, 0.5)` walks it
+/// toward white while adding a smaller constant to `(0.125, 0.5, 0.125)`
+/// barely touches it. The rendered light sidebar over that family measured
+/// Oklab saturation **0.036 blue against 0.083 green — 2.3×** — which is
+/// "blue becomes white, green stays very green", in numbers.
+///
+/// Oklab is the replacement because it is a *perceptual* lightness: the same
+/// family reads 0.384 / 0.400 / 0.525 / 0.598, and — the property that makes
+/// the whole thing work — its **chroma-to-lightness ratio is very nearly
+/// hue-invariant** for that family (0.298 / 0.326 / 0.300 / 0.000), where
+/// Rec. 709 luma has no such property at all.
+enum Oklab {
+    /// Oklab `L*`, `a`, `b` from gamma-encoded sRGB — the space the bake's
+    /// probe is read in (see `DesktopBackdropRenderer.bakeColorSpace`).
+    static func components(red: Double, green: Double, blue: Double)
+        -> (lightness: Double, a: Double, b: Double) {
+        let r = linear(red)
+        let g = linear(green)
+        let b = linear(blue)
+        let long = cbrt(0.4122214708 * r + 0.5363325363 * g + 0.0514459929 * b)
+        let medium = cbrt(0.2119034982 * r + 0.6806995451 * g + 0.1073969566 * b)
+        let short = cbrt(0.0883024619 * r + 0.2817188376 * g + 0.6299787005 * b)
+        return (
+            lightness: 0.2104542553 * long + 0.7936177850 * medium - 0.0040720468 * short,
+            a: 1.9779984951 * long - 2.4285922050 * medium + 0.4505937099 * short,
+            b: 0.0259040371 * long + 0.7827717662 * medium - 0.8086757660 * short
+        )
+    }
+
+    static func lightness(red: Double, green: Double, blue: Double) -> Double {
+        components(red: red, green: green, blue: blue).lightness
+    }
+
+    /// Colourfulness relative to lightness — the perceptual analogue of HSV
+    /// saturation, and the quantity "it becomes white" and "it is very green"
+    /// are the two halves of.
+    static func saturation(red: Double, green: Double, blue: Double) -> Double {
+        let parts = components(red: red, green: green, blue: blue)
+        return (parts.a * parts.a + parts.b * parts.b).squareRoot()
+            / max(parts.lightness, 0.001)
+    }
+
+    /// The gamma-encoded grey that has a given `L*`.
+    ///
+    /// For a neutral colour the three cube roots are equal and the `L*`
+    /// coefficients sum to 1, so `L* = cbrt(linear)` exactly — which makes the
+    /// inverse a cube and one sRGB encode. This is what lets the solve state
+    /// its lightness correction as an ordinary offset in the space the filter
+    /// works in, while the quantity it is correcting is perceptual.
+    static func grey(lightness: Double) -> Double {
+        encoded(max(0, lightness) * max(0, lightness) * max(0, lightness))
+    }
+
+    static func linear(_ channel: Double) -> Double {
+        let value = min(1, max(0, channel))
+        return value <= 0.04045 ? value / 12.92 : pow((value + 0.055) / 1.055, 2.4)
+    }
+
+    /// `linear(_:)` as a table, because the solve evaluates it a quarter of a
+    /// million times and `pow` is most of what that costs.
+    ///
+    /// 4096 entries with linear interpolation between them: the transfer curve
+    /// has no feature narrower than a table step, so the worst interpolation
+    /// error is under 2×10⁻⁸ — five orders of magnitude below anything the
+    /// solve's tolerances care about, and the exact function is what every
+    /// *assertion* still uses.
+    static let linearTable: [Double] = (0...4096).map {
+        linear(Double($0) / 4096)
+    }
+
+    static func tabulatedLinear(_ channel: Double) -> Double {
+        let position = min(1, max(0, channel)) * 4096
+        let index = Int(position)
+        guard index < 4096 else { return linearTable[4096] }
+        let fraction = position - Double(index)
+        return linearTable[index] + (linearTable[index + 1] - linearTable[index]) * fraction
+    }
+
+    static func encoded(_ channel: Double) -> Double {
+        let value = min(1, max(0, channel))
+        return value <= 0.0031308 ? value * 12.92 : 1.055 * pow(value, 1 / 2.4) - 0.055
+    }
+}
+
+/// The one linear map the bake applies to its structured still, stated in full.
+///
+/// `out = (luma + (in − luma) · saturation) · gain + offset`, per channel, in
+/// the bake's working space. It replaces `CIColorControls` — not because that
+/// filter was wrong, but because the solve below has to evaluate this map in
+/// software thousands of times, and a map whose exact form is *declared here*
+/// can be modelled exactly, where the filter's internal luma weights and
+/// operation order could only be inferred. (Round 3 had to measure that order
+/// on the real filter to get the offset right; this removes the need.)
+///
+/// One `CIColorMatrix` is the same single filter pass `CIColorControls` was, so
+/// nothing about the bake's cost changes.
+struct BakeToneMap: Equatable, Sendable {
+    /// Chroma scale about each pixel's own luma.
+    var saturation: Double
+    /// Range gain — never above 1, so the map can only ever *remove* contrast.
+    var gain: Double
+    /// The flat offset that lands the still's mean on its target lightness.
+    var offset: Double
+
+    /// The luma the saturation term mixes about. Rec. 709 here is not the bug
+    /// this round fixes: as a *chroma axis* it is standard and harmless, and
+    /// the solve measures what it actually did to the result rather than
+    /// assuming. The bug was using it as a **lightness**.
+    static let lumaWeights = (red: 0.2126, green: 0.7152, blue: 0.0722)
+
+    func apply(red: Double, green: Double, blue: Double) -> (Double, Double, Double) {
+        let luma = Self.lumaWeights.red * red
+            + Self.lumaWeights.green * green
+            + Self.lumaWeights.blue * blue
+        func channel(_ value: Double) -> Double {
+            min(1, max(0, (luma + (value - luma) * saturation) * gain + offset))
+        }
+        return (channel(red), channel(green), channel(blue))
+    }
+
+    /// The same map as `CIColorMatrix`'s five vectors.
+    var matrix: (
+        red: CIVector, green: CIVector, blue: CIVector, alpha: CIVector, bias: CIVector
+    ) {
+        let mix = gain * (1 - saturation)
+        let keep = gain * saturation
+        let weights = Self.lumaWeights
+        return (
+            red: CIVector(
+                x: CGFloat(keep + mix * weights.red),
+                y: CGFloat(mix * weights.green),
+                z: CGFloat(mix * weights.blue),
+                w: 0
+            ),
+            green: CIVector(
+                x: CGFloat(mix * weights.red),
+                y: CGFloat(keep + mix * weights.green),
+                z: CGFloat(mix * weights.blue),
+                w: 0
+            ),
+            blue: CIVector(
+                x: CGFloat(mix * weights.red),
+                y: CGFloat(mix * weights.green),
+                z: CGFloat(keep + mix * weights.blue),
+                w: 0
+            ),
+            alpha: CIVector(x: 0, y: 0, z: 0, w: 1),
+            bias: CIVector(x: CGFloat(offset), y: CGFloat(offset), z: CGFloat(offset), w: 0)
+        )
+    }
+}
+
+extension DesktopBackdropRenderer {
+    /// The `L*` the baked still's mean is driven to, per appearance.
+    ///
+    /// Derived from `targetLuminance` rather than declared, so a *neutral*
+    /// wallpaper lands on exactly the grey the veil arithmetic of rounds 2–4
+    /// was priced against and every published composite figure still holds.
+    /// What changes is only which pictures count as having reached it: a blue
+    /// desktop now arrives at the same **perceived** lightness as a green one
+    /// instead of being flooded with grey until its *luma* matched.
+    static func targetLightness(isDark: Bool) -> Double {
+        Oklab.lightness(
+            red: targetLuminance(isDark: isDark),
+            green: targetLuminance(isDark: isDark),
+            blue: targetLuminance(isDark: isDark)
+        )
+    }
+
+    /// `tailHeadroom` restated in `L*`, and derived from it for the same reason
+    /// — the bound the previous round measured and shipped is preserved
+    /// exactly for a neutral wallpaper and merely stops depending on hue.
+    static func tailHeadroomLightness(isDark: Bool) -> Double {
+        let target = targetLuminance(isDark: isDark)
+        let headroom = tailHeadroom(isDark: isDark)
+        let edge = isDark ? target + headroom : target - headroom
+        return abs(Oklab.lightness(red: edge, green: edge, blue: edge)
+            - targetLightness(isDark: isDark))
+    }
+
+    /// The share of the wallpaper's own colourfulness that reaches the still.
+    ///
+    /// This is `saturationCeiling` restated as a *perceptual* quantity, and the
+    /// difference is the whole round. The old constant scaled the filter's
+    /// saturation **input** and left the output wherever the picture's hue put
+    /// it; this one is a target the solve drives the measured Oklab
+    /// chroma-to-lightness of the finished still onto, so two wallpapers that
+    /// are equally colourful arrive equally colourful whatever their hue.
+    ///
+    /// Both values are chosen so the *average* colourfulness over the hue
+    /// family is what the shipped pipeline already delivered — surface Oklab
+    /// saturation 0.128 in dark and 0.055 in light. **Nothing about how
+    /// colourful the glass is has moved; only how evenly it is reached.** Dark
+    /// keeps the larger share and still ends up the more damped surface, for
+    /// the reason `darkSaturationCeiling` gives: at near-black the same
+    /// absolute chroma is a far larger fraction of the surface, so a bigger
+    /// number here is what *holds* dark where round 7 put it.
+    static let desktopChromaShare: Double = 0.162
+    static let darkDesktopChromaShare: Double = 0.228
+
+    static func desktopChromaShare(isDark: Bool) -> Double {
+        isDark ? darkDesktopChromaShare : desktopChromaShare
+    }
+
+    /// A hard ceiling on the still's perceived colourfulness, so an extreme
+    /// desktop cannot ask the solve for a saturation that only gamut clipping
+    /// could deliver.
+    static let okSaturationCeiling: Double = 0.24
+    /// And a ceiling on the filter input itself, for the same reason from the
+    /// other side.
+    static let toneSaturationCeiling: Double = 3.0
+
+    /// How much of the still the worst patch is.
+    ///
+    /// **0.25%, not the 2% every contrast floor is stated in** — and the reason
+    /// is desktop pinning. A glass surface no longer shows the whole still: it
+    /// shows the region of wallpaper actually behind it, and the smallest glass
+    /// surface in the app (a 210 pt sidebar on a 1512 pt display) is about an
+    /// eighth of the screen. Its own brightest 2% is therefore roughly the
+    /// **brightest 0.25% of the wallpaper**, and that — not the whole picture's
+    /// 2% — is the patch the floors have to survive. Bounding the looser
+    /// quantity would leave every floor in this file stated about a surface
+    /// that no longer exists.
+    static let tailFraction: Double = 0.0025
+
+    /// How many times the solve refines the map.
+    ///
+    /// Each knob is close to independent of the other two — the offset moves
+    /// lightness, the gain moves the tail, the saturation moves chroma — and
+    /// the offset is re-settled to convergence inside every pass, so the outer
+    /// loop only has to let the gain walk down to its constraint. Four passes
+    /// land the still's mean `L*` on target to four decimals on every fixture
+    /// measured; a fifth moves nothing.
+    static let toneSolveIterations = 4
+
+    /// Solve the tone map **against the structure the surface will actually
+    /// show**, in the space the guarantee is stated in.
+    ///
+    /// Round 7 moved the bake from solving blind to measuring its own structure
+    /// once and solving from that. This goes one step further because the
+    /// quantities now being targeted — perceived lightness, perceived
+    /// colourfulness — are not linear in the knobs that move them, so a single
+    /// closed-form step lands near the target rather than on it. Applying the
+    /// candidate map to the probe in software and re-measuring is a few hundred
+    /// microseconds and removes the last place the bake was estimating.
+    ///
+    /// Three targets, three knobs:
+    ///
+    /// - **offset** → the mean `L*` lands on `targetLightness`.
+    /// - **gain** → the worst patch's `L*` sits inside `tailHeadroomLightness`.
+    /// - **saturation** → the mean Oklab saturation lands on the wallpaper's
+    ///   own, scaled by `desktopChromaShare`.
+    ///
+    /// The saturation target being *proportional to the wallpaper's* is what
+    /// keeps a grey desktop grey: a neutral picture has zero colourfulness, so
+    /// its target is zero and no amount of solving can invent a hue.
+    static func solveToneMap(probe rgba: [UInt8], isDark: Bool) -> BakeToneMap {
+        var pixels: [(red: Double, green: Double, blue: Double)] = []
+        pixels.reserveCapacity(rgba.count / 4)
+        var index = 0
+        while index + 3 < rgba.count {
+            if Double(rgba[index + 3]) / 255 > 0.05 {
+                pixels.append((
+                    Double(rgba[index]) / 255,
+                    Double(rgba[index + 1]) / 255,
+                    Double(rgba[index + 2]) / 255
+                ))
+            }
+            index += 4
+        }
+        var map = BakeToneMap(saturation: 1, gain: 1, offset: 0)
+        guard !pixels.isEmpty else { return map }
+
+        let target = targetLightness(isDark: isDark)
+        let headroom = tailHeadroomLightness(isDark: isDark)
+        let band = max(1, Int(Double(pixels.count) * tailFraction))
+        // The wallpaper's own colourfulness, measured once and **exactly**
+        // hue-neutrally: HSV saturation is invariant under a hue rotation by
+        // construction, where even Oklab's chroma-to-lightness carries a
+        // residual 9% hue dependence (0.298 blue / 0.300 green / 0.326 red on
+        // the hue family). The *target* is perceptual and the *source* measure
+        // is hue-blind, which is the pairing the invariance needs.
+        let chromaTarget = min(
+            okSaturationCeiling,
+            pixels.reduce(0.0) { total, pixel in
+                let peak = max(pixel.red, max(pixel.green, pixel.blue))
+                let floor = min(pixel.red, min(pixel.green, pixel.blue))
+                return total + (peak > 0.004 ? (peak - floor) / peak : 0)
+            } / Double(pixels.count) * desktopChromaShare(isDark: isDark)
+        )
+
+        // The map is `(luma + delta·saturation)·gain + offset` per channel, and
+        // `luma` and `delta` do not move between iterations — so they are
+        // computed once and each pass is two multiplies per channel.
+        let weights = BakeToneMap.lumaWeights
+        let luma = pixels.map {
+            weights.red * $0.red + weights.green * $0.green + weights.blue * $0.blue
+        }
+        let deltas = pixels.enumerated().map {
+            ($0.element.red - luma[$0.offset],
+             $0.element.green - luma[$0.offset],
+             $0.element.blue - luma[$0.offset])
+        }
+
+        /// Mean and worst-patch `L*`, and mean Oklab saturation, of the probe
+        /// under a candidate map.
+        ///
+        /// The worst patch is taken by keeping the running extreme `band`
+        /// values rather than sorting all 9216 — the band is about twenty
+        /// entries, so an insertion into a sorted twenty is cheaper than a sort
+        /// of nine thousand, and this runs a dozen times per bake.
+        func measure(_ candidate: BakeToneMap)
+            -> (mean: Double, tail: Double, saturation: Double) {
+            var mean = 0.0
+            var saturation = 0.0
+            var extremes: [Double] = []
+            extremes.reserveCapacity(band + 1)
+            for position in pixels.indices {
+                let base = luma[position]
+                let delta = deltas[position]
+                func channel(_ value: Double) -> Double {
+                    min(1, max(0, (base + value * candidate.saturation) * candidate.gain
+                        + candidate.offset))
+                }
+                let red = Oklab.tabulatedLinear(channel(delta.0))
+                let green = Oklab.tabulatedLinear(channel(delta.1))
+                let blue = Oklab.tabulatedLinear(channel(delta.2))
+                let long = cbrt(0.4122214708 * red + 0.5363325363 * green + 0.0514459929 * blue)
+                let medium = cbrt(0.2119034982 * red + 0.6806995451 * green + 0.1073969566 * blue)
+                let short = cbrt(0.0883024619 * red + 0.2817188376 * green + 0.6299787005 * blue)
+                let lightness = 0.2104542553 * long + 0.7936177850 * medium - 0.0040720468 * short
+                let a = 1.9779984951 * long - 2.4285922050 * medium + 0.4505937099 * short
+                let b = 0.0259040371 * long + 0.7827717662 * medium - 0.8086757660 * short
+                mean += lightness
+                saturation += (a * a + b * b).squareRoot() / max(lightness, 0.001)
+
+                // `extremes` is kept ascending; dark wants the top of it, light
+                // the bottom, so each drops the opposite end.
+                if extremes.count < band {
+                    extremes.insert(lightness, at: extremes.partitionPoint(before: lightness))
+                } else if isDark ? lightness > extremes[0] : lightness < extremes[band - 1] {
+                    extremes.insert(lightness, at: extremes.partitionPoint(before: lightness))
+                    extremes.remove(at: isDark ? 0 : band)
+                }
+            }
+            let tail = extremes.reduce(0, +) / Double(max(extremes.count, 1))
+            return (mean / Double(pixels.count), tail, saturation / Double(pixels.count))
+        }
+
+        // The offset is re-solved **to convergence** for whatever gain and
+        // saturation are current, rather than nudged once per outer pass. That
+        // separation is what makes the whole thing converge: mean `L*` is
+        // strictly increasing in the offset, and `Oklab.grey` is its exact
+        // inverse for a neutral pixel, so the fixed point is reached in two or
+        // three steps from any starting point.
+        func settleOffset(_ candidate: inout BakeToneMap)
+            -> (mean: Double, tail: Double, saturation: Double) {
+            var reading = measure(candidate)
+            for _ in 0..<3 {
+                let correction = Oklab.grey(lightness: target)
+                    - Oklab.grey(lightness: reading.mean)
+                if abs(correction) < 0.0005 { break }
+                candidate.offset = min(1, max(-1, candidate.offset + correction))
+                reading = measure(candidate)
+            }
+            return reading
+        }
+
+        for _ in 0..<toneSolveIterations {
+            let reading = settleOffset(&map)
+            // The gain only ever *shrinks*, from 1 toward whatever the tail
+            // constraint needs. Letting it climb back would make the solve
+            // chase its own last correction — the tail is small precisely
+            // because the gain is small — and oscillate instead of settle.
+            let excursion = abs(reading.tail - target)
+            if excursion > headroom {
+                map.gain = max(0.02, map.gain * headroom / excursion)
+            }
+            if chromaTarget <= 0 {
+                map.saturation = 0
+            } else if reading.saturation > 0.0005 {
+                map.saturation = min(
+                    toneSaturationCeiling,
+                    max(0, map.saturation * chromaTarget / reading.saturation)
+                )
+            }
+        }
+        _ = settleOffset(&map)
+        return map
+    }
 }
 
 struct DesktopTintComponents: Equatable, Sendable {
@@ -2479,6 +3145,19 @@ final class DesktopBackdropProvider: ObservableObject {
                 object: nil,
                 queue: .main
             ) { [weak self] _ in MainActor.assumeIsolated { self?.noteDesktopSignal() } },
+            // A window dragged onto another display changes neither the
+            // wallpaper file nor the Space, but it does change how wide the
+            // desktop the still is stretched across is — which the bake's blur
+            // is now stated against. Deliberately **not** funnelled straight
+            // into `noteDesktopSignal`: this notification also fires the first
+            // time any window acquires a screen, so an unconditional hint would
+            // turn opening a window into a desktop re-resolve and reset the
+            // watch's baseline in the process.
+            center.addObserver(
+                forName: NSWindow.didChangeScreenNotification,
+                object: nil,
+                queue: .main
+            ) { [weak self] _ in MainActor.assumeIsolated { self?.noteScreenWidthChange() } },
             // The fast path. `object: nil` because the agent's object string is
             // not documented and has changed across releases; the name alone is
             // specific enough, and a spurious hint costs one coalesced resolve.
@@ -2713,12 +3392,18 @@ final class DesktopBackdropProvider: ObservableObject {
     private func resolve(isDark: Bool) {
         generation &+= 1
         let generation = generation
-        let desktopImageURL = Self.currentScreen()
-            .flatMap { NSWorkspace.shared.desktopImageURL(for: $0) }
+        let screen = Self.currentScreen()
+        let desktopImageURL = screen.flatMap { NSWorkspace.shared.desktopImageURL(for: $0) }
+        // The blur is stated in screen points and the still now spans the whole
+        // desktop, so how wide that desktop is belongs to the bake — and so to
+        // the cache key. See `DesktopBackdropKey.screenPoints`.
+        let screenPoints = Double(screen?.frame.width ?? 1512)
         work?.cancel()
         work = Task { [weak self] in
             let key = await Task.detached(priority: .utility) {
-                Self.key(desktopImageURL: desktopImageURL, isDark: isDark)
+                Self.key(
+                    desktopImageURL: desktopImageURL, isDark: isDark, screenPoints: screenPoints
+                )
             }.value
             guard let self, generation == self.generation else { return }
             // Whatever this resolve concluded is the new baseline: the file it
@@ -2758,19 +3443,34 @@ final class DesktopBackdropProvider: ObservableObject {
     /// ("whatever this resolve concluded is the new baseline"), so a test that
     /// drives `probeDesktop` has to know the previous resolve has finished
     /// rather than race it. Without this the watch test passes or fails
-    /// depending on how long a bake happens to take — which is a property of
-    /// the machine, not of the watch.
+    /// depending on how long a bake happens to take.
     func settleResolves() async { await work?.value }
+
+    /// Hint only if the display the glass is on is a **different width** from
+    /// the one the current backdrop was baked for. Everything else about the
+    /// wallpaper is unchanged by a window moving between screens, and the
+    /// quantization in `DesktopBackdropKey` means two similar displays do not
+    /// count as different either.
+    private func noteScreenWidthChange() {
+        guard let baked = lastKey?.screenPoints,
+              let width = Self.currentScreen()?.frame.width,
+              baked != DesktopBackdropKey.quantized(screenPoints: Double(width))
+        else { return }
+        noteDesktopSignal()
+    }
 
     private nonisolated static func key(
         desktopImageURL: URL?,
-        isDark: Bool
+        isDark: Bool,
+        screenPoints: Double
     ) -> DesktopBackdropKey? {
         guard let url = DesktopWallpaperLocator
             .resolveOnDisk(desktopImageURL: desktopImageURL).url else { return nil }
         let modified = try? url.resourceValues(forKeys: [.contentModificationDateKey])
             .contentModificationDate
-        return DesktopBackdropKey(path: url.path, modified: modified, isDark: isDark)
+        return DesktopBackdropKey(
+            path: url.path, modified: modified, isDark: isDark, screenPoints: screenPoints
+        )
     }
 
     /// The desktop under *this* window, falling back to the primary display.
@@ -2891,20 +3591,25 @@ struct DesktopGlassLayer: View {
         }
     }
 
-    /// The still is stretched, not aspect-filled. Every glass surface is a
-    /// different shape — a tall narrow sidebar beside a wide canvas — and
-    /// filling each one to its own aspect shows each a *different* crop of the
-    /// wallpaper, which reads as a seam between them. Stretching gives them all
-    /// the same left-to-right colour story, and at this blur radius the
-    /// distortion has nothing recognisable left to distort.
+    /// The still is **pinned to desktop coordinates** — each surface shows the
+    /// region of wallpaper actually behind it, at the wallpaper's own scale and
+    /// at the window's own offset on its own screen.
+    ///
+    /// It used to be stretched: one still, spread across every surface
+    /// whatever its shape and wherever the window was. The argument was that
+    /// filling each surface to its own aspect would show each a different crop
+    /// and read as a seam — true, and beside the point, because the fix for
+    /// that is not to show every surface the *same wrong* crop but to show each
+    /// the *right* one. What a stretched still cannot do at any blur radius or
+    /// any veil opacity is read as transparent, because nothing in it moves
+    /// when the window moves, and nothing in it corresponds to what is behind
+    /// the window. Michael: "we don't get the translucence at all. I meant the
+    /// glass wallpaper should be translucent to the wallpaper itself."
     @ViewBuilder
     private var paintedDesktop: some View {
         switch desktop.painting {
-        case let .wallpaper(image, _):
-            Image(decorative: image, scale: 1, orientation: .up)
-                .resizable()
-                .interpolation(.high)
-                .antialiased(true)
+        case let .wallpaper(image, _, pixels):
+            DesktopWallpaperPatch(still: image, wallpaperPixels: pixels)
                 // The declared warm layer (v1.1.8), over the still and under
                 // the veil. Over, so the desaturated wallpaper is what it warms
                 // rather than the other way round; under, because the veil is
@@ -2926,6 +3631,157 @@ struct DesktopGlassLayer: View {
             // not read as two different materials.
             .overlay(GlassWarmth.color.opacity(GlassWarmth.opacity(isDark: colorScheme == .dark)))
         }
+    }
+}
+
+/// A glass surface's window onto the wallpaper behind it.
+///
+/// One `CALayer` holding the cached still, with `contentsRect` set to the part
+/// of the wallpaper this view covers. Following a drag is therefore **one
+/// property assignment on an existing layer** — no decode, no blur, no
+/// re-render of the still, no new texture upload; the same texture is sampled
+/// from a different rectangle. That is what makes desktop pinning affordable
+/// at drag cadence and is why round 2's "it would re-lay out on every drag"
+/// worry does not apply to a *baked and cached* still.
+struct DesktopWallpaperPatch: NSViewRepresentable {
+    let still: CGImage
+    let wallpaperPixels: CGSize
+
+    func makeNSView(context: Context) -> DesktopWallpaperPatchView {
+        let view = DesktopWallpaperPatchView()
+        view.apply(still: still, wallpaperPixels: wallpaperPixels)
+        return view
+    }
+
+    func updateNSView(_ view: DesktopWallpaperPatchView, context: Context) {
+        view.apply(still: still, wallpaperPixels: wallpaperPixels)
+    }
+}
+
+/// The `NSView` half, and the app's only hook into where its windows are.
+///
+/// Everything it listens to is a *frame* signal — the window moved, the window
+/// resized, the window landed on another display, the displays themselves were
+/// reconfigured. The wallpaper's own change signals stay where they were, on
+/// `DesktopBackdropProvider`; nothing here re-reads the desktop or re-bakes
+/// anything.
+final class DesktopWallpaperPatchView: NSView {
+    /// Registrations, held so both the main actor and `deinit` can drop them.
+    /// `NotificationCenter` is itself thread-safe, so the only thing the box
+    /// buys is a home for the tokens that is not actor-isolated — and it
+    /// remembers *which* centre each token came from, because one of them is
+    /// `NSWorkspace`'s rather than the default one.
+    private final class Registrations: @unchecked Sendable {
+        var tokens: [(center: NotificationCenter, token: any NSObjectProtocol)] = []
+
+        func drop() {
+            for entry in tokens { entry.center.removeObserver(entry.token) }
+            tokens = []
+        }
+    }
+
+    private let patch = CALayer()
+    private var wallpaperPixels: CGSize = .zero
+    private let registrations = Registrations()
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        wantsLayer = true
+        layer?.masksToBounds = true
+        patch.contentsGravity = .resize
+        // The still is magnified into the surface — a 210 pt sidebar is about
+        // an eighth of a display — so the filter matters. Trilinear keeps the
+        // upscale free of the faceting bilinear leaves on a smooth gradient.
+        patch.magnificationFilter = .trilinear
+        patch.minificationFilter = .trilinear
+        patch.needsDisplayOnBoundsChange = false
+        layer?.addSublayer(patch)
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+
+    deinit { registrations.drop() }
+
+    func apply(still: CGImage, wallpaperPixels: CGSize) {
+        self.wallpaperPixels = wallpaperPixels
+        if !(patch.contents as AnyObject? === still) {
+            patch.contents = still
+        }
+        refresh()
+    }
+
+    override func layout() {
+        super.layout()
+        refresh()
+    }
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        observe()
+        refresh()
+    }
+
+    override func viewDidChangeBackingProperties() {
+        super.viewDidChangeBackingProperties()
+        refresh()
+    }
+
+    /// Every signal that can move the wallpaper *under* this view without
+    /// changing the wallpaper itself.
+    private func observe() {
+        registrations.drop()
+        guard let window else { return }
+        let center = NotificationCenter.default
+        func watch(_ name: Notification.Name, on center: NotificationCenter, object: Any?) {
+            registrations.tokens.append((center, center.addObserver(
+                forName: name, object: object, queue: .main
+            ) { [weak self] _ in MainActor.assumeIsolated { self?.refresh() } }))
+        }
+        // `didMove` fires continuously through a live drag, which is exactly
+        // the cadence the backdrop has to follow to read as glass.
+        for name: Notification.Name in [
+            NSWindow.didMoveNotification,
+            NSWindow.didResizeNotification,
+            NSWindow.didChangeScreenNotification,
+            NSWindow.didChangeBackingPropertiesNotification,
+        ] {
+            watch(name, on: center, object: window)
+        }
+        watch(NSApplication.didChangeScreenParametersNotification, on: center, object: nil)
+        watch(
+            NSWorkspace.activeSpaceDidChangeNotification,
+            on: NSWorkspace.shared.notificationCenter,
+            object: nil
+        )
+    }
+
+    private func refresh() {
+        guard patch.contents != nil, let window else { return }
+        // `window.screen` is the display AppKit considers the window to be on
+        // — the one it overlaps most — which is the display whose desktop
+        // picture and whose fill mode apply.
+        guard let screen = window.screen ?? NSScreen.main else { return }
+        let onScreen = window.convertToScreen(convert(bounds, to: nil))
+        let layout = DesktopBackdropGeometry.layout(
+            from: NSWorkspace.shared.desktopImageOptions(for: screen)
+        )
+        let rect = DesktopBackdropGeometry.contentsRect(
+            surface: onScreen,
+            imagePixels: wallpaperPixels,
+            screen: screen.frame,
+            scaling: layout.scaling,
+            allowsClipping: layout.allowsClipping,
+            backingScale: screen.backingScaleFactor
+        )
+        // No implicit animation: a drag would otherwise ease the backdrop
+        // toward each new position a quarter-second behind the window, which
+        // reads as the glass sliding rather than the desktop staying put.
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        patch.frame = bounds
+        patch.contentsRect = rect
+        CATransaction.commit()
     }
 }
 

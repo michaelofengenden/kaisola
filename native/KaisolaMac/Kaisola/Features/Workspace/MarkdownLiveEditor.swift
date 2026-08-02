@@ -5,10 +5,10 @@ import Foundation
 /// over the whole file that reads like a document while the bytes underneath
 /// stay exact Markdown.
 ///
-/// Everything here is presentation-only. Image placement, viewport styling
-/// windows, and text synchronisation all describe how to *draw* or *scroll* a
-/// document; none of them rewrite it. That is the property the block editor was
-/// originally built to guarantee, and it is the one this surface has to keep.
+/// Everything here is presentation-only. Image placement, scroll retention, and
+/// text synchronisation all describe how to *draw* or *scroll* a document; none
+/// of them rewrite it. That is the property the block editor was originally
+/// built to guarantee, and it is the one this surface has to keep.
 
 // MARK: - Inline images
 
@@ -218,40 +218,6 @@ enum MarkdownEditorScrollRetention {
         }
         let fraction = min(1, max(0, previousOrigin / previousScrollable))
         return min(newScrollable, fraction * newScrollable)
-    }
-}
-
-/// The slice of a document the editor styles right now.
-///
-/// Temporary attributes are applied on the main actor, so a document-sized
-/// pass is a document-sized main-thread stall on every keystroke. Styling a
-/// generous window around the viewport keeps that cost constant while leaving
-/// enough margin that ordinary scrolling never shows unstyled source.
-enum MarkdownStylingWindow {
-    /// Screens of margin kept styled on each side of the viewport.
-    static let margin: CGFloat = 2
-
-    static func characterRange(
-        visible: NSRange,
-        documentLength: Int,
-        expansion: Int
-    ) -> NSRange {
-        guard documentLength > 0 else { return NSRange(location: 0, length: 0) }
-        let safeLocation = min(max(0, visible.location), documentLength)
-        let safeLength = min(max(0, visible.length), documentLength - safeLocation)
-        let start = max(0, safeLocation - expansion)
-        let end = min(documentLength, safeLocation + safeLength + expansion)
-        return NSRange(location: start, length: max(0, end - start))
-    }
-
-    /// Whether an already-styled window still covers the viewport with at least
-    /// half its margin intact. Re-styling on every scroll notification would
-    /// undo the saving the window exists to make.
-    static func needsRestyle(applied: NSRange?, visible: NSRange, expansion: Int) -> Bool {
-        guard let applied else { return true }
-        let slack = expansion / 2
-        return visible.location < applied.location + slack
-            || NSMaxRange(visible) > NSMaxRange(applied) - slack
     }
 }
 

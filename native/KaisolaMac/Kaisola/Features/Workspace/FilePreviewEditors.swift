@@ -181,10 +181,21 @@ struct MarkdownEditingStyle: Sendable {
             #"(?ms)^([ \t]*(?:```|~~~)[^\n]*\n).*?^([ \t]*(?:```|~~~)[ \t]*$)"#,
             role: { _ in .codeBlock }
         )
+        // A reference that occupies a whole line is painted as a picture by the
+        // layout manager, so its source collapses completely — alt text
+        // included. Without this the alt text renders as a stray link caption
+        // underneath the image it names. Appended last so it outranks the link
+        // rule that also matched it.
+        for line in MarkdownInlineImages.lines(in: source) {
+            for reference in line.references {
+                result.append(Span(range: reference.range, role: .syntax))
+            }
+        }
+
         // Several semantic recognizers intentionally overlap (for example an
         // `<em>` pair is found both by the emphasis rule and by the generic
         // tag rule). Apply each identical style/range once so TextKit does not
-        // redo temporary-attribute work while scrolling a Markdown document.
+        // redo attribute work while scrolling a Markdown document.
         var seen: Set<Span> = []
         var unique: [Span] = []
         unique.reserveCapacity(min(result.count, 20_000))
@@ -197,10 +208,29 @@ struct MarkdownEditingStyle: Sendable {
 
     static let bodySize: CGFloat = 15
 
-    /// The TextKit attributes a role paints with.
+    static var bodyParagraphStyle: NSParagraphStyle {
+        let paragraph = NSMutableParagraphStyle()
+        paragraph.lineSpacing = 3
+        paragraph.paragraphSpacing = 5
+        return paragraph
+    }
+
+    /// What every character looks like before a role claims it. A styling pass
+    /// resets to this first, so removing emphasis restores plain body text
+    /// rather than leaving the old attributes behind.
+    static var baseAttributes: [NSAttributedString.Key: Any] {
+        [
+            .font: NSFont.systemFont(ofSize: bodySize),
+            .foregroundColor: NSColor.labelColor,
+            .paragraphStyle: bodyParagraphStyle,
+        ]
+    }
+
+    /// The attributes a role paints with.
     ///
-    /// Applied as *temporary* attributes, so none of this reaches the text
-    /// storage and the document's bytes stay exactly what was typed.
+    /// These describe presentation only. They are applied to the text storage's
+    /// *attributes*, never its characters, so the document's bytes stay exactly
+    /// what was typed.
     static func attributes(for role: Role) -> [NSAttributedString.Key: Any] {
         switch role {
         case let .heading(level):
@@ -1060,7 +1090,7 @@ struct MarkdownRenderedEditor: NSViewRepresentable {
         context.coordinator.adopt(documentID: documentID, scrollMemory: scrollMemory)
         context.coordinator.scheduleStyling(immediately: true)
         context.coordinator.refreshImages(revision: imageRevision, force: true)
-        context.coordinator.scrollIfNeeded(to: targetLine)
+        context.coordinator.scrollIfNeeded(to: targetLine, revision: navigationRevision)
         if automaticallyFocus {
             DispatchQueue.main.async { textView.window?.makeFirstResponder(textView) }
         }
@@ -1105,7 +1135,7 @@ struct MarkdownRenderedEditor: NSViewRepresentable {
         // external zoom changes and the first representable update both reflow.
         scrollView.reflowDocumentWidth()
         coordinator.refreshImages(revision: imageRevision, force: false)
-        coordinator.scrollIfNeeded(to: targetLine)
+        coordinator.scrollIfNeeded(to: targetLine, revision: navigationRevision)
     }
 
     static func dismantleNSView(
@@ -1128,6 +1158,9 @@ struct MarkdownRenderedEditor: NSViewRepresentable {
         var onError: ((String) -> Void)?
         var onOpenLink: ((URL) -> Void)?
         var isApplyingExternalValue = false
+        /// Guards the attribute pass so a restyle cannot be mistaken for a user
+        /// edit and start the save/journal machinery.
+        private var isApplyingStyle = false
         private var styleTask: Task<Void, Never>?
         private var importTask: Task<Void, Never>?
         private var imageTask: Task<Void, Never>?
@@ -1241,16 +1274,18 @@ struct MarkdownRenderedEditor: NSViewRepresentable {
         // MARK: Editing
 
         func textDidChange(_ notification: Notification) {
-            guard !isApplyingExternalValue,
+            guard !isApplyingExternalValue, !isApplyingStyle,
                   let textView = notification.object as? MarkdownNativeTextView else { return }
             text = textView.string
             scheduleStyling(immediately: false)
             scheduleImageRefresh()
         }
 
-        func scrollIfNeeded(to oneBasedLine: Int?) {
+        /// `revision` is what makes clicking the same outline row twice work:
+        /// the target line has not changed, but the request has.
+        func scrollIfNeeded(to oneBasedLine: Int?, revision: UInt64) {
             guard let oneBasedLine, oneBasedLine > 0, let textView else { return }
-            let key = "\(markdownURL?.path ?? "")|\(oneBasedLine)|\(textView.string.utf8.count)"
+            let key = "\(markdownURL?.path ?? "")|\(oneBasedLine)|\(revision)"
             guard key != lastScrollKey else { return }
             lastScrollKey = key
             let range = FileLineNavigation.range(forOneBasedLine: oneBasedLine, in: textView.string)
@@ -1298,44 +1333,45 @@ struct MarkdownRenderedEditor: NSViewRepresentable {
             }
         }
 
+        /// Paint the document's typography.
+        ///
+        /// These are real text-storage attributes rather than TextKit
+        /// *temporary* attributes. Temporary attributes are documented as not
+        /// affecting layout, and in practice a temporary font does not drive
+        /// glyph metrics or line height: headings came out body-sized and
+        /// "hidden" delimiters kept their full width. That was tolerable when
+        /// this editor was a small box inside a separately rendered document.
+        /// Now that it *is* the document, the typography has to be real.
+        ///
+        /// This does not weaken the byte guarantee. Attributes are not
+        /// characters: `textView.string` is untouched, and the save path writes
+        /// that string. The text view is also `isRichText = false`, so styling
+        /// can never be typed, pasted, or copied out of the document either.
         private func apply(_ spans: [MarkdownEditingStyle.Span], to textView: NSTextView) {
-            guard let layoutManager = textView.layoutManager else { return }
-            let fullRange = NSRange(location: 0, length: (textView.string as NSString).length)
+            guard let storage = textView.textStorage else { return }
+            let fullRange = NSRange(location: 0, length: storage.length)
+            guard fullRange.length > 0 else { return }
 
-            // Styling changes glyph metrics — hidden delimiters most of all —
-            // so the document's height moves underneath the viewport. Anchor on
-            // the character at the top of the screen and put it back afterwards
-            // instead of letting the scroll view keep a now-meaningless pixel
-            // offset. This is what kept the old surface jumping on every save.
+            // Typography changes the document's height, so pin the character at
+            // the top of the viewport and put it back afterwards rather than
+            // letting the scroll view keep a now-meaningless pixel offset.
             let anchor = viewportAnchor()
+            let before = storage.string
 
-            for key in [
-                NSAttributedString.Key.font,
-                .foregroundColor,
-                .backgroundColor,
-                .underlineStyle,
-                .obliqueness,
-                .paragraphStyle,
-            ] {
-                layoutManager.removeTemporaryAttribute(key, forCharacterRange: fullRange)
-            }
-
+            isApplyingStyle = true
+            storage.beginEditing()
+            storage.setAttributes(MarkdownEditingStyle.baseAttributes, range: fullRange)
             for span in spans where NSMaxRange(span.range) <= fullRange.length {
-                for (key, value) in MarkdownEditingStyle.attributes(for: span.role) {
-                    layoutManager.addTemporaryAttribute(
-                        key,
-                        value: value,
-                        forCharacterRange: span.range
-                    )
-                }
+                storage.addAttributes(
+                    MarkdownEditingStyle.attributes(for: span.role),
+                    range: span.range
+                )
             }
-            // Temporary font attributes affect glyph metrics only after the
-            // layout pass is invalidated. Without this, invisible delimiters
-            // can still wrap visible text at narrow panel widths.
-            layoutManager.invalidateLayout(forCharacterRange: fullRange, actualCharacterRange: nil)
-            if let container = textView.textContainer {
-                layoutManager.ensureLayout(for: container)
-            }
+            storage.endEditing()
+            isApplyingStyle = false
+
+            // A styling pass must never be able to change the document.
+            assert(storage.string == before, "Markdown styling mutated document text")
             restore(anchor)
         }
 

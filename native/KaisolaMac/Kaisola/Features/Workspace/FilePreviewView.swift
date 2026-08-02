@@ -653,7 +653,9 @@ struct FilePreviewView: View {
         outlineNavigationRevision &+= 1
         switch content {
         case .markdown:
-            showMarkdownSource = true
+            // The rendered document is itself a text editor now, so jumping to
+            // a heading no longer has to drop the reader into raw source.
+            break
         case .text, .html:
             isEditingText = true
         default:

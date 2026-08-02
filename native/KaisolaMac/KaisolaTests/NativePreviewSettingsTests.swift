@@ -1773,35 +1773,62 @@ final class NativePreviewSettingsTests: XCTestCase {
         XCTAssertEqual(closed.collapsed, ["other"])
     }
 
-    /// v1.1.9 deleted the detail column's 40pt chrome band. It carried two
-    /// toggles and nothing else, so it was the top of the app's largest column
-    /// spent on two controls; the toggles are hover-revealed now and the card
-    /// took the difference.
+    /// The whole 40pt chrome band, finally.
     ///
-    /// What is left has to stay a *strip* — exactly as tall as the controls it
-    /// reveals — so a later pass cannot grow it back into somewhere to put
-    /// chrome, and so the pair can never be laid out over the card's own
-    /// top-right controls.
-    func testTheDetailStripIsOnlyAsTallAsTheControlsItReveals() {
+    /// v1.1.9 deleted the band and gave the card its height, but only 12 of the
+    /// 40 points reached the pane: the two toggles were still anchored to the
+    /// card's top-right corner, and the Files rail opens a 30pt header bar 6pt
+    /// below that corner, so a card run to the window's top put the revealed
+    /// pair over the controls the user was aiming at. The card stopped 28pt
+    /// short to keep them apart.
+    ///
+    /// v1.1.10 removes the pair from this layout instead — every place it could
+    /// have been relocated to was measured and rejected, see
+    /// `detailPanelTopInset(layout:)` — so nothing is drawn over the card's
+    /// corner and the card takes the rest.
+    func testTheDetailCardRunsToTheWindowTopInTheSidebarLayout() {
+        // Nothing above the card but the gutter every other side already has.
         XCTAssertEqual(
-            NativeWorkspaceChrome.detailPanelTopInset,
+            NativeWorkspaceChrome.detailPanelTopInset(layout: .leftTree),
+            KaisolaVisualSystem.chromeInset
+        )
+        XCTAssertEqual(NativeWorkspaceChrome.detailPanelTopInset(layout: .leftTree), 6)
+
+        // The reclaim, stated as a number rather than as a memory. The band was
+        // `chromePanelTopInset - chromeInset` = 40pt tall with no card inset
+        // beneath it; v1.1.9 took it to 28, and this takes it to 6. Measured on
+        // a dev launch as the card's content growing 852 → 874pt in an 886pt
+        // window, its top edge moving from y 123 to y 101 under a window top of
+        // y 95.
+        let oldBand = NativeWorkspaceChrome.chromePanelTopInset - KaisolaVisualSystem.chromeInset
+        XCTAssertEqual(oldBand, 40)
+        XCTAssertEqual(oldBand - NativeWorkspaceChrome.detailPanelTopInset(layout: .leftTree), 34)
+        XCTAssertEqual(
+            NativeWorkspaceChrome.detailToggleStripHeight
+                - NativeWorkspaceChrome.detailPanelTopInset(layout: .leftTree),
+            22,
+            "the 22pt v1.1.9 could not reach is what this release is for"
+        )
+    }
+
+    /// The top-bar layout has no sidebar footer to fall back on, so it keeps the
+    /// pair and the strip — and the strip has to stay exactly as tall as the
+    /// controls it reveals, so a later pass cannot grow it back into somewhere
+    /// to put chrome.
+    func testTheTopBarLayoutKeepsTheStripItRevealsItsTogglesIn() {
+        XCTAssertEqual(
+            NativeWorkspaceChrome.detailPanelTopInset(layout: .topBar),
+            NativeWorkspaceChrome.detailToggleStripHeight
+        )
+        XCTAssertEqual(
+            NativeWorkspaceChrome.detailToggleStripHeight,
             NativeWorkspaceChrome.detailChromeControlHeight
                 + NativeWorkspaceChrome.detailToggleRevealPadding * 2
         )
-        XCTAssertEqual(NativeWorkspaceChrome.detailPanelTopInset, 28)
-
-        // The reclaim, stated as a number rather than as a memory. The band the
-        // strip replaced was `chromePanelTopInset - chromeInset` tall and the
-        // card carried no top inset of its own beneath it, so the card used to
-        // start 40pt down and now starts 28pt down: 12pt of the app's largest
-        // column, measured on a dev launch as the document pane growing from
-        // 415pt to 427pt in a 500pt window.
-        let oldBand = NativeWorkspaceChrome.chromePanelTopInset - KaisolaVisualSystem.chromeInset
-        XCTAssertEqual(oldBand - NativeWorkspaceChrome.detailPanelTopInset, 12)
-        XCTAssertLessThan(
-            NativeWorkspaceChrome.detailPanelTopInset,
-            oldBand,
-            "the strip has to be shorter than the band it replaced, or nothing was reclaimed"
+        XCTAssertEqual(NativeWorkspaceChrome.detailPanelTopInset(layout: .topBar), 28)
+        XCTAssertGreaterThan(
+            NativeWorkspaceChrome.detailPanelTopInset(layout: .topBar),
+            NativeWorkspaceChrome.detailPanelTopInset(layout: .leftTree)
         )
 
         // The hover target is sized from the pointer, not from the pair it
@@ -1812,6 +1839,29 @@ final class NativePreviewSettingsTests: XCTestCase {
             NativeWorkspaceChrome.detailChromeControlWidth * 2
                 + NativeWorkspaceChrome.detailChromeControlGap
         )
+    }
+
+    /// The sidebar layout reclaims the band by *removing* the pair rather than
+    /// relocating it, so the thing worth pinning is that the doors it held are
+    /// all still open — the two the sidebar footer's overflow menu carries are
+    /// the ones a pointer needs.
+    ///
+    /// Both were verified present in the AX tree on the same dev launch that
+    /// measured the reclaim, along with the Files rail's own permanent Hide
+    /// Files button: a real synthesized click through that button closed the
+    /// rail, and an `AXPress` on the footer's `Show or Hide Files` reopened it.
+    func testBothPanelsKeepACommandThatIsNotAPointerCornerOrAShortcut() {
+        for id in [AppCommandID.toggleFiles, AppCommandID.toggleDocumentPreview] {
+            let definition = AppCommandRegistry.definition(for: id)
+            XCTAssertNotNil(
+                definition,
+                "\(id.rawValue) lost its command, so the palette and menus lost it too"
+            )
+            XCTAssertNotNil(
+                definition?.defaultShortcut,
+                "\(id.rawValue) has no keyboard door left"
+            )
+        }
     }
 
     func testChromePanelTokensSitBetweenCardAndShell() {

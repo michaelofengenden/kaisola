@@ -636,12 +636,18 @@ struct RootShellView: View {
     /// The detail column: the content on its own inset floating card, gutters
     /// equal on all four sides.
     ///
-    /// v1.1.9 deleted the 40pt chrome band that used to sit above it. The band
-    /// carried two toggles and nothing else, so it was 40pt of permanent window
-    /// spent on two controls — the top of the app's largest column, given over
-    /// to chrome. The toggles now live in `detailPanelToggles`, revealed on
-    /// hover exactly where they were, plus a permanent door each in the footer's
-    /// overflow menu; the card takes the band's height.
+    /// v1.1.9 deleted the 40pt chrome band that used to sit above it and gave
+    /// the card the height — but only 12 of the 40 points actually reached the
+    /// pane. The card could not run to the window's top, because the two panel
+    /// toggles were still anchored to *its* top-right corner and the Files
+    /// rail's own 30pt header bar starts 6pt below that corner: a card at the
+    /// top put the revealed pair directly over the controls the user was aiming
+    /// at.
+    ///
+    /// v1.1.10 resolves that by moving the pair out of this column entirely (see
+    /// `detailPanelToggles`), which lets the card take the whole column down to
+    /// the standard `chromeInset` gutter. The remaining 22pt of the original
+    /// band is now pane.
     private var detailArea: some View {
         VStack(spacing: 0) {
             // A degraded workspace archive usually means an empty detail pane,
@@ -651,9 +657,19 @@ struct RootShellView: View {
                 .padding(.horizontal, KaisolaVisualSystem.chromeInset + 4)
                 .padding(.bottom, 6)
             detailPane
-                .kaisolaChromePanel(topInset: NativeWorkspaceChrome.detailPanelTopInset)
+                .kaisolaChromePanel(
+                    topInset: NativeWorkspaceChrome.detailPanelTopInset(
+                        layout: settings.navigationLayout
+                    )
+                )
         }
-        .overlay(alignment: .topTrailing) { detailPanelToggles }
+        // In the top-bar layout there is no sidebar band to host the pair, so
+        // they stay in this corner and stay hover-revealed — and there the
+        // collision never existed, because the card's top sits under a real top
+        // bar rather than under the window's own edge.
+        .overlay(alignment: .topTrailing) {
+            if settings.navigationLayout == .topBar { detailPanelToggles }
+        }
         // The other half of the sidebar divider's corridor. It has to live in
         // this column: a tracking area is clipped to its own split-view
         // subview, so the sidebar's tracker stops dead at the boundary.
@@ -676,28 +692,21 @@ struct RootShellView: View {
         }
     }
 
-    /// The detail column's two panel toggles, revealed on hover at the content
-    /// pane's top-right.
+    /// The two panel toggles, for the **top-bar layout only**: revealed on hover
+    /// at the content pane's top-right, exactly as v1.1.9 drew them.
+    ///
+    /// The sidebar layout does not draw them at all any more — see
+    /// `detailPanelTopInset(layout:)` for the measurements that killed every
+    /// place they could have gone.
     ///
     /// They are a PAIR, in the order the panels themselves sit: the document
     /// preview opens to the left of the Files rail, so its control is to the
     /// left of the Files control.
     ///
-    /// Hover-revealed rather than relocated into the sidebar footer, which was
-    /// the other candidate. The footer's control row is width-bound, not
-    /// space-bound: `FooterAccountBudget.nameWidth` charges the account name for
-    /// every control beside it, and two more slots cost it 36pt — at the 210pt
-    /// default rail that takes the name from ~109pt to ~73pt, below the floor
-    /// `QuietIdentityMarkTests` holds. So the footer would not have removed
-    /// permanent chrome, only moved it onto the one label in the sidebar that
-    /// still has to fit. Revealing on hover removes it outright: at rest the
-    /// detail column carries no chrome at all and the card owns the whole
-    /// column.
-    ///
-    /// Every non-pointer door stays open: ⌘B / ⇧⌘B, the View menu, the command
-    /// palette, and one item each in the footer's overflow menu. The controls
-    /// keep their identifiers and labels, so they remain addressable to
-    /// VoiceOver and to automation whether or not they are drawn.
+    /// Every non-pointer door stays open in both layouts: ⌘B / ⇧⌘B, the View
+    /// menu, the command palette, and one item each in the footer's overflow
+    /// menu. The controls keep their identifiers and labels, so they remain
+    /// addressable to VoiceOver and to automation whether or not they are drawn.
     private var detailPanelToggles: some View {
         HStack(spacing: NativeWorkspaceChrome.detailChromeControlGap) {
             filePreviewToolbarControl
@@ -3643,27 +3652,71 @@ enum NativeWorkspaceChrome {
             + detailToggleRevealLead
     }
 
-    /// The detail card's top gutter, and the height of the strip the two panel
-    /// toggles are revealed in.
+    /// The detail card's top gutter in the **top-bar** layout, and the height of
+    /// the strip the two panel toggles are revealed in there.
     ///
-    /// v1.1.9 cut this from 46 to 28 — 18pt of the app's largest column handed
-    /// back to the pane — by deleting the chrome *band*. The band was 40pt of
-    /// permanent window carrying two controls and nothing else; what is left is
-    /// a strip exactly as tall as those controls, empty at rest.
-    ///
-    /// It is not cut to `chromeInset` and the card is deliberately not run to
-    /// the window's top edge, even though the measurement says it could be:
-    /// the window is `fullSizeContentView` with a transparent titlebar, the
-    /// traffic lights sit over the *sidebar* column, and a real click at
-    /// window-top + 28 was verified to reach a control drawn there. What stops
-    /// it is the card's own contents. At the card's top-right corner sits the
-    /// Files rail's header — its view-mode and filter controls land within a
-    /// few points of where these toggles want to be — so a card run to the top
-    /// puts the hover-revealed pair directly over controls the user is aiming
-    /// at. The strip keeps the two apart by construction rather than by a pair
-    /// of coordinates that agree today.
-    static var detailPanelTopInset: CGFloat {
+    /// v1.1.9 cut this from 46 to 28 — deleting the 40pt chrome band and leaving
+    /// a strip exactly as tall as the controls it reveals, empty at rest.
+    static var detailToggleStripHeight: CGFloat {
         detailChromeControlHeight + detailToggleRevealPadding * 2
+    }
+
+    /// The detail card's top gutter, per navigation layout.
+    ///
+    /// **`.leftTree` (the default): `chromeInset`.** The card runs to the
+    /// window's own top edge with nothing above it but the standard gutter every
+    /// other side of the card already has, and the two panel toggles are not
+    /// drawn in this layout at all.
+    ///
+    /// v1.1.9 stopped 28pt short and said why: the Files rail opens a 30pt
+    /// header bar 6pt below the card's top edge, and the hover-revealed toggles
+    /// were anchored to the card's top-**right** corner, which is precisely
+    /// where that header's controls are. Only 12 of the original 40pt band ever
+    /// reached the pane.
+    ///
+    /// Three homes for the pair were tried and measured on a dev launch before
+    /// settling on none of them:
+    ///
+    /// 1. **The sidebar's traffic-light band.** The obvious answer — 46pt of
+    ///    space the platform reserves whether or not anything is drawn in it.
+    ///    Two problems, both found by measurement rather than by reasoning.
+    ///    `NavigationSplitView` already puts its own Hide Sidebar item in the
+    ///    band's trailing 47pt (`AXButton "Hide Sidebar" @(305, 95) 47×52`), and
+    ///    — fatally — that band is the AppKit `AXToolbar`'s territory, which
+    ///    swallows mouse events over the sidebar column. Controls drawn there
+    ///    render, report correct frames, and respond to `AXPress`, but a real
+    ///    synthesized click at their centre does nothing. A control that only
+    ///    VoiceOver can operate is not a control.
+    /// 2. **The card's top-leading corner.** 16pt of clearance before the
+    ///    session pane's own title button starts.
+    /// 3. **The card's top-trailing corner with the card at the top.** The
+    ///    original collision, unchanged.
+    ///
+    /// So the pair is *removed* here rather than relocated, which is also the
+    /// direction this rail has been moving in for three releases. Every door it
+    /// held stays open, and all of them were verified present on the same
+    /// launch: the Files rail's own header carries a permanent, clickable Hide
+    /// Files button; the document preview carries its own close control; the
+    /// sidebar footer's overflow menu carries a permanent `Show or Hide Files`
+    /// and `Show or Hide Document Preview`; and ⌘B / ⇧⌘B, the View menu and the
+    /// command palette are untouched. Closing a panel stays one click. Opening
+    /// one by mouse is the footer menu instead of a hover the user had to know
+    /// about.
+    ///
+    /// The detail column at this height *is* clickable — the same launch put a
+    /// real click through the Files rail's own header button at window-top + 31
+    /// and watched the rail close — so the card's own contents lose nothing by
+    /// moving up into the toolbar band. Only the sidebar half of that band is
+    /// dead to the mouse.
+    ///
+    /// **`.topBar`: the strip.** That layout draws no `NavigationSplitView` and
+    /// no sidebar footer, so the pair stays in the corner and keeps the 28pt
+    /// strip it is revealed in.
+    static func detailPanelTopInset(layout: NavigationLayout) -> CGFloat {
+        switch layout {
+        case .leftTree: return KaisolaVisualSystem.chromeInset
+        case .topBar: return detailToggleStripHeight
+        }
     }
 }
 

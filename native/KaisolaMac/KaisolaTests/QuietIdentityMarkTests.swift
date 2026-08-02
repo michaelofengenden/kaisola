@@ -140,93 +140,151 @@ final class QuietIdentityMarkTests: XCTestCase {
         )
     }
 
-    /// "Monoline weight matched across marks": the coral rays, the knot's
-    /// outline and an SF Symbol at `.regular` all have to land within a few
-    /// tenths of a point of each other, or the rail reads as one bold mark and
-    /// four thin ones.
-    func testDrawnMarksShareOneMonolineStrokeWeight() {
-        let unit = QuietIdentityMarkView.slot / 24
-        let starburst = unit * QuietIdentityMarkView.starburstStroke
-        let knot = QuietOpenAIKnot.strokeWidth(unit: unit)
-
+    /// The two first-class agent marks have to weigh the same as each other and
+    /// sit a deliberate step above the generic ones — that is the naked-mark
+    /// grammar, and without a tile to hide behind it is the only thing keeping
+    /// the rail from reading as one bold mark beside four thin ones.
+    ///
+    /// The knot is filled now, so a stroke width cannot express this; ink can.
+    /// Measured by rendering each mark into the 16pt slot at 8× and summing
+    /// alpha: `terminal` 0.208, `arrow.up.arrow.down` 0.162, the coral starburst
+    /// 0.314, and the filled knot 0.376 at full span — which is why the knot is
+    /// inset to `span` (0.308 there, level with the starburst).
+    func testTheTwoAgentMarksAreInkedAlikeAndTheKnotIsInsetToGetThere() {
+        let starburstStroke = (QuietIdentityMarkView.slot / 24) * QuietIdentityMarkView.starburstStroke
         // Monoline: a hairline, not a rule.
-        XCTAssertGreaterThan(starburst, 0.9)
-        XCTAssertLessThan(starburst, 1.8)
-        XCTAssertEqual(
-            starburst,
-            knot,
-            accuracy: 0.35,
-            "the starburst and the knot no longer read as the same pen"
-        )
+        XCTAssertGreaterThan(starburstStroke, 0.9)
+        XCTAssertLessThan(starburstStroke, 1.8)
+
+        // The knot gives up one and a half points of the slot. Less and it
+        // out-inks the burst; much more and it stops reading at rail size.
+        XCTAssertEqual(Double(QuietOpenAIKnot.span), 14.5 / 16, accuracy: 0.0001)
+        XCTAssertLessThan(QuietOpenAIKnot.span, 1)
+        XCTAssertGreaterThan(QuietOpenAIKnot.span, 0.85)
     }
 
     // MARK: - OpenAI knot geometry
 
-    /// The mark is six copies of ONE strand at 60°, which is the logo's actual
-    /// construction. If that ever stops being true the mark stops being the
-    /// logo, so the symmetry is asserted rather than eyeballed.
-    func testKnotIsSixStrandsEvenlySpacedOnOneOrbit() {
-        let rect = CGRect(x: 0, y: 0, width: 16, height: 16)
-        let centers = QuietOpenAIKnot.strandCenters(in: rect)
-        XCTAssertEqual(centers.count, 6)
-
-        let middle = CGPoint(x: rect.midX, y: rect.midY)
-        let radii = centers.map { hypot($0.x - middle.x, $0.y - middle.y) }
-        let expected = QuietOpenAIKnot.orbit * QuietOpenAIKnot.unit(in: rect)
-        for radius in radii {
-            XCTAssertEqual(radius, expected, accuracy: 0.001, "a strand left the orbit")
+    /// The outline is the official mark's, transcribed — 8 subpaths, 36 cubics,
+    /// 32 lines — not a construction that hopes to resemble it. The counts are
+    /// asserted because the reader is what turns the transcription into
+    /// geometry, and a reader that silently dropped a command would still draw
+    /// *something* knot-shaped.
+    func testKnotOutlineIsTheTranscribedOfficialPath() {
+        let outline = QuietOpenAIKnot.outline
+        var moves = 0, lines = 0, curves = 0, closes = 0
+        for segment in outline {
+            switch segment {
+            case .move: moves += 1
+            case .line: lines += 1
+            case .curve: curves += 1
+            case .close: closes += 1
+            }
         }
+        XCTAssertEqual(moves, 8, "a subpath went missing — the knot loses a strand or a counter")
+        XCTAssertEqual(closes, 8, "every subpath of a filled outline has to close")
+        XCTAssertEqual(curves, 36)
+        XCTAssertEqual(lines, 32)
 
-        // Consecutive strands are exactly 60° apart.
-        let angles = centers.map { atan2($0.y - middle.y, $0.x - middle.x) }
-        for index in 1 ..< angles.count {
-            var delta = angles[index] - angles[index - 1]
-            if delta < 0 { delta += 2 * .pi }
-            XCTAssertEqual(delta, .pi / 3, accuracy: 0.001)
+        // The offline normalization centres the outline's *tight* bounds on
+        // 12,12 and scales its long side to 24, so every on-curve point sits in
+        // the viewbox and the control points stray only a fraction outside it.
+        let points = outline.flatMap { segment -> [CGPoint] in
+            switch segment {
+            case let .move(point), let .line(point): [point]
+            case let .curve(to, control1, control2): [to, control1, control2]
+            case .close: []
+            }
         }
+        XCTAssertGreaterThan(points.count, 100)
+        let coordinates = points.flatMap { [$0.x, $0.y] }
+        XCTAssertGreaterThan(coordinates.min() ?? -99, -0.5)
+        XCTAssertLessThan(coordinates.max() ?? 99, 24.5)
     }
 
-    /// The two numbers that carry the likeness. `lengthRatio` above ~1.16 is
-    /// what makes consecutive strands *cross* instead of merely meeting — that
-    /// overlap is the knot; without it the mark is a plain hexagonal ring. The
-    /// skew is what gives it chirality, and past roughly 20° the interior fills
-    /// in and the mark turns to mud at 16pt.
-    func testKnotStrandsOverlapAndLeanOffTangential() {
-        let neighbourGapRatio = 2 * tan(Double.pi / 6) // 1.1547
+    /// The four-command reader, exercised on its own. `Z` closes, `M`/`L` take
+    /// pairs, `C` takes triples, and a command whose numbers repeat emits one
+    /// segment per group.
+    func testOutlineReaderHandlesItsFourCommands() {
+        let segments = QuietVectorOutline.segments("M1 2 L3 4 5 6 C7 8 9 10 11 12 Z")
+        XCTAssertEqual(segments, [
+            .move(CGPoint(x: 1, y: 2)),
+            .line(CGPoint(x: 3, y: 4)),
+            .line(CGPoint(x: 5, y: 6)),
+            .curve(
+                to: CGPoint(x: 11, y: 12),
+                control1: CGPoint(x: 7, y: 8),
+                control2: CGPoint(x: 9, y: 10)
+            ),
+            .close,
+        ])
+        XCTAssertTrue(QuietVectorOutline.segments("").isEmpty)
+    }
+
+    /// The logo is a six-fold knot, and the transcription has to still be one.
+    /// Sampled rather than asserted on constants, because there are no
+    /// symmetry constants any more — the outline either maps onto itself under
+    /// a 60° turn or it is not the mark.
+    ///
+    /// The tolerance is real: the official outline is hand-tuned, so a 60° turn
+    /// disagrees on ~5.6% of the mark's own area (measured on a 1024² raster of
+    /// the reference). The 30° control is what gives this teeth — an ordinary
+    /// blob would pass a lax 60° check and fail nothing else.
+    func testKnotIsSixFoldSymmetric() {
+        let rect = CGRect(x: 0, y: 0, width: 96, height: 96)
+        let path = QuietOpenAIKnot.path(in: rect)
+        let centre = CGPoint(x: rect.midX, y: rect.midY)
+
+        func disagreement(turnedBy degrees: Double) -> Double {
+            let angle = degrees * .pi / 180
+            var checked = 0.0
+            var mismatched = 0.0
+            for step in stride(from: 3.0, to: 96, by: 1.5) {
+                for other in stride(from: 3.0, to: 96, by: 1.5) {
+                    let point = CGPoint(x: step, y: other)
+                    let dx = point.x - centre.x
+                    let dy = point.y - centre.y
+                    guard hypot(dx, dy) < 44 else { continue }
+                    let turned = CGPoint(
+                        x: centre.x + dx * cos(angle) - dy * sin(angle),
+                        y: centre.y + dx * sin(angle) + dy * cos(angle)
+                    )
+                    checked += 1
+                    if path.contains(point) != path.contains(turned) { mismatched += 1 }
+                }
+            }
+            return checked == 0 ? 1 : mismatched / checked
+        }
+
+        XCTAssertLessThan(disagreement(turnedBy: 60), 0.10, "the knot lost its six-fold symmetry")
         XCTAssertGreaterThan(
-            Double(QuietOpenAIKnot.lengthRatio),
-            neighbourGapRatio,
-            "strands no longer overlap — the mark is a hexagon, not a knot"
+            disagreement(turnedBy: 30),
+            0.30,
+            "a shape this symmetric under 30° is a disc, not a knot"
         )
-        XCTAssertGreaterThan(QuietOpenAIKnot.skew.degrees, 0, "a skew of 0 draws a symmetric ring")
-        XCTAssertLessThan(QuietOpenAIKnot.skew.degrees, 20, "past ~20° the knot fills in at 16pt")
-
-        // Elongated, not round: a stadium at aspect 1 is a circle.
-        XCTAssertGreaterThan(QuietOpenAIKnot.aspect, 2)
-        // Michael's spec: outline weight ≈ strand width × 0.35, give or take.
-        XCTAssertEqual(Double(QuietOpenAIKnot.strokeRatio), 0.45, accuracy: 0.15)
     }
 
-    /// Six-fold symmetry means the union's bounding box is centred on the slot,
-    /// and the whole mark has to stay inside its 16pt slot once the outline
-    /// weight is added — a mark that overflows its slot collides with the row's
-    /// title column.
+    /// The mark has to stay inside its 16pt slot — a mark that overflows
+    /// collides with the row's title column — and stay centred in it, and still
+    /// fill it. Filled now, so there is no stroke to inset for.
     func testKnotFitsItsSlotAndStaysCentred() {
         let slot = QuietIdentityMarkView.slot
         let rect = CGRect(x: 0, y: 0, width: slot, height: slot)
-        let unit = QuietOpenAIKnot.unit(in: rect)
         let bounds = QuietOpenAIKnot.path(in: rect).boundingRect
-            .insetBy(dx: -QuietOpenAIKnot.strokeWidth(unit: unit) / 2,
-                     dy: -QuietOpenAIKnot.strokeWidth(unit: unit) / 2)
 
         XCTAssertEqual(bounds.midX, rect.midX, accuracy: 0.01, "the knot is off-centre horizontally")
-        XCTAssertEqual(bounds.midY, rect.midY, accuracy: 0.01, "the knot is off-centre vertically")
+        XCTAssertEqual(bounds.midY, rect.midY, accuracy: 0.05, "the knot is off-centre vertically")
         XCTAssertTrue(rect.contains(bounds), "the knot overflows its \(slot)pt slot: \(bounds)")
 
         // …but it still fills the slot: a mark that shrank to nothing would
         // also pass the containment check above.
-        XCTAssertGreaterThan(bounds.width / slot, 0.75)
-        XCTAssertGreaterThan(bounds.height / slot, 0.75)
+        XCTAssertGreaterThan(bounds.width / slot, 0.85)
+        XCTAssertGreaterThan(bounds.height / slot, 0.85)
+
+        // And it scales: the same outline at 2× is the same mark twice the size.
+        let doubled = QuietOpenAIKnot.path(in: CGRect(x: 0, y: 0, width: 2 * slot, height: 2 * slot))
+            .boundingRect
+        XCTAssertEqual(doubled.width, bounds.width * 2, accuracy: 0.01)
     }
 
     func testUnrecognizedAgentsFallBackToTheirInitial() {

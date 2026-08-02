@@ -105,8 +105,7 @@ enum TerminalMetaService: Sendable {
         var result: [Int32: TerminalMeta] = [:]
         for root in roots {
             let chain = chains[root] ?? [root]
-            let foreground = chain.last ?? root
-            let name = snapshot[foreground].flatMap { processName(fromCommand: $0.command) }
+            let name = foregroundName(chain: chain, recordsByPID: snapshot)
             let ports = chain
                 .reduce(into: Set<Int>()) { collected, pid in
                     collected.formUnion(portsByPID[pid] ?? [])
@@ -222,27 +221,118 @@ enum TerminalMetaService: Sendable {
         return name.isEmpty ? nil : name
     }
 
+    /// The agent CLIs the rail has something to say about, in precedence order.
+    private static let agentMarkers: [(marker: String, display: String)] = [
+        ("codex", "codex"),
+        ("claude", "claude"),
+        ("gemini", "gemini"),
+        ("opencode", "opencode"),
+        ("aider", "aider"),
+    ]
+
+    /// Interpreters that are never themselves the interesting program: what they
+    /// are running is. Matched on the executable's basename.
+    private static let runtimeWrappers: Set<String> = [
+        "node", "nodejs", "bun", "deno", "npx", "pnpm", "yarn",
+        "python", "python3", "uv", "uvx", "ruby", "perl",
+    ]
+
+    /// The parts of a command line that may legitimately *name* the program.
+    ///
+    /// Deliberately not the whole command. Matching a marker anywhere in the
+    /// argv turns `zsh -c 'source ~/.claude/shell-snapshots/…'` — which is a
+    /// real link in a real Claude chain, and a real shell everywhere else —
+    /// into a Claude row, and would do the same for `vim ~/.claude/settings.json`.
+    /// Only two things can name the program: the executable, and (when the
+    /// executable is a runtime) the first non-flag argument after it, which is
+    /// the script or package being run.
+    ///
+    /// Each candidate is reduced to its last **two** path components. One is too
+    /// few — `…/@anthropic-ai/claude-code/cli.js` is named by its directory, not
+    /// its file — and the whole path is too many, because any checkout under a
+    /// folder with an agent's name in it would match.
+    static func markerCandidates(fromCommand command: String) -> [String] {
+        let tokens = command
+            .split(whereSeparator: \.isWhitespace)
+            .prefix(6)
+            .map(String.init)
+        guard let executable = tokens.first else { return [] }
+        var candidates = [executable]
+        if runtimeWrappers.contains((executable as NSString).lastPathComponent.lowercased()),
+           let script = tokens.dropFirst().first(where: { !$0.hasPrefix("-") }) {
+            candidates.append(script)
+        }
+        return candidates.map { candidate in
+            let components = candidate.split(separator: "/", omittingEmptySubsequences: true)
+            return components.suffix(2).joined(separator: "/").lowercased()
+        }
+    }
+
+    /// The agent CLI a command *is*, or `nil` when it is something else.
+    ///
+    /// Separate from `processName(fromCommand:)` because the chain scan needs to
+    /// ask "is this link an agent?" without also being told "…and if not, it is
+    /// called `sleep`".
+    static func agentName(fromCommand command: String) -> String? {
+        let candidates = markerCandidates(fromCommand: command)
+        guard !candidates.isEmpty else { return nil }
+        for (marker, display) in agentMarkers {
+            let pattern = #"(^|[/._@-])"# + marker + #"([/._ -]|$)"#
+            if candidates.contains(where: { $0.range(of: pattern, options: .regularExpression) != nil }) {
+                return display
+            }
+        }
+        return nil
+    }
+
     /// Prefer a recognizable CLI name even when it is launched through a
     /// runtime wrapper (`node …/@openai/codex…`, for example), otherwise fall
     /// back to the executable's basename.
     static func processName(fromCommand command: String) -> String? {
         let trimmed = command.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return nil }
-        let lowered = trimmed.lowercased()
-        let markers: [(String, String)] = [
-            ("codex", "codex"),
-            ("claude", "claude"),
-            ("gemini", "gemini"),
-            ("opencode", "opencode"),
-            ("aider", "aider"),
-        ]
-        for (marker, display) in markers {
-            if lowered.range(of: #"(^|[/._@-])"# + marker + #"([/._ -]|$)"#, options: .regularExpression) != nil {
-                return display
-            }
-        }
+        if let agent = agentName(fromCommand: trimmed) { return agent }
         guard let executable = trimmed.split(whereSeparator: \.isWhitespace).first else { return nil }
         return processName(fromComm: String(executable))
+    }
+
+    /// What to call a whole foreground chain, root first.
+    ///
+    /// The bug this exists for: `collect` used to name the row from
+    /// `chain.last`, and a running agent is never the leaf. A real capture from
+    /// a Kaisola broker terminal with `claude` in it —
+    ///
+    ///     69807 40496 /bin/zsh -i
+    ///     69863 69807 claude
+    ///     99646 69863 /bin/zsh -c source …/.claude/shell-snapshots/…
+    ///     74322 99646 sleep 10
+    ///
+    /// — descends to `sleep`, so the row rendered the shell mark and Claude's
+    /// coral never appeared. Codex is the same shape: `-zsh` → `node …/bin/codex`
+    /// → `…/vendor/…/bin/codex` → `node ./mcp/server.cjs`, leaf `node`.
+    ///
+    /// So: scan the *whole* chain for an agent and prefer the **shallowest**
+    /// match, because an agent is the ancestor of every helper it spawns — the
+    /// `zsh -c` and the `sleep` above are Claude's children, not its peers. Only
+    /// when no link is an agent does the leaf get to name the row, which is what
+    /// keeps `zsh` → `npm` → `node` reading as the build it is.
+    static func foregroundName(
+        chain: [Int32],
+        recordsByPID: [Int32: TerminalProcessRecord]
+    ) -> String? {
+        for pid in chain {
+            if let command = recordsByPID[pid]?.command,
+               let agent = agentName(fromCommand: command) {
+                return agent
+            }
+        }
+        for pid in chain.reversed() {
+            if let command = recordsByPID[pid]?.command,
+               let name = processName(fromCommand: command) {
+                return name
+            }
+        }
+        return nil
     }
 
     // MARK: - Bounded process runner

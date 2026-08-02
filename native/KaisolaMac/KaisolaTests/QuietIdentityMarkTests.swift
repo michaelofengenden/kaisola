@@ -433,17 +433,57 @@ final class QuietIdentityMarkTests: XCTestCase {
         )
     }
 
-    // MARK: - Row emphasis (no wash)
+    // MARK: - Row emphasis and selection
 
-    /// v1.1.7 deleted the rounded grey wash from surface rows entirely. The
-    /// only thing left that says "this is the session on screen" is the title's
-    /// own weight, so the two weights have to actually differ — a table where
-    /// selected and resting collapsed to the same value would render the rail
-    /// with no selection signal at all.
-    func testTheVisibleSessionIsSignalledByWeightAlone() {
+    /// v1.1.9 gives the selected surface row a colour and a pill back, but the
+    /// weight step stays: it is the cue that survives a user who cannot
+    /// separate the accent from the surrounding grey, and it costs nothing.
+    func testTheVisibleSessionKeepsItsWeightStepOnTopOfTheColour() {
         XCTAssertNotEqual(QuietRowEmphasis.selectedWeight, QuietRowEmphasis.restingWeight)
         XCTAssertEqual(QuietRowEmphasis.weight(isSelected: true), .semibold)
         XCTAssertEqual(QuietRowEmphasis.weight(isSelected: false), .regular)
+    }
+
+    /// The active project is signalled by weight and by weight only — the
+    /// tinted glass capsule is gone. A table where the two collapsed would
+    /// leave the rail with no "which project am I in" signal at all.
+    func testTheActiveProjectIsSignalledByWeightAlone() {
+        XCTAssertNotEqual(QuietProjectEmphasis.activeWeight, QuietProjectEmphasis.restingWeight)
+        XCTAssertEqual(QuietProjectEmphasis.weight(isActive: true), .bold)
+        XCTAssertEqual(QuietProjectEmphasis.weight(isActive: false), .regular)
+        // Bolder than the selected *session*: a heading outranks a row, and the
+        // two signals have to stay legible in the same column.
+        XCTAssertNotEqual(QuietProjectEmphasis.activeWeight, QuietRowEmphasis.selectedWeight)
+    }
+
+    /// Exactly one row wears the pill, and which one is a rule rather than a
+    /// rendering accident. Both ways it can break are invisible in a screenshot
+    /// of the happy path.
+    func testExactlyOneSurfaceRowIsSelected() {
+        // Nothing on screen: no row is selected, and no row is invented.
+        XCTAssertNil(QuietRowSelection.selectedID(visibleIDs: [], focusedPaneID: nil))
+        XCTAssertNil(QuietRowSelection.selectedID(visibleIDs: [], focusedPaneID: "a"))
+
+        // The ordinary case: one visible surface, with or without focus.
+        XCTAssertEqual(QuietRowSelection.selectedID(visibleIDs: ["a"], focusedPaneID: nil), "a")
+        XCTAssertEqual(QuietRowSelection.selectedID(visibleIDs: ["a"], focusedPaneID: "a"), "a")
+
+        // A split shows two surfaces; the focused pane wins, so one pill.
+        XCTAssertEqual(
+            QuietRowSelection.selectedID(visibleIDs: ["a", "b"], focusedPaneID: "b"),
+            "b"
+        )
+
+        // Focus naming a surface that is not on screen (another window, or one
+        // just hidden) must fall back to a real row, never to no row.
+        XCTAssertEqual(
+            QuietRowSelection.selectedID(visibleIDs: ["a", "b"], focusedPaneID: "ghost"),
+            "a"
+        )
+        XCTAssertEqual(
+            QuietRowSelection.selectedID(visibleIDs: ["a", "b"], focusedPaneID: nil),
+            "a"
+        )
     }
 
     // MARK: - Footer budget
@@ -562,32 +602,35 @@ final class QuietIdentityMarkTests: XCTestCase {
         XCTAssertEqual(withChip - withBoth, 30 + FooterAccountBudget.gap, accuracy: 0.001)
     }
 
-    // MARK: - Active project glass
+    // MARK: - Selected row pill
 
-    /// The whole risk of a tinted row is drift toward candy. These are the
-    /// ceilings the mock approved; the relationships between them are what keep
-    /// it reading as glass.
-    func testActiveProjectGlassStaysRestrained() {
-        XCTAssertGreaterThan(QuietActiveGlass.topFillOpacity, QuietActiveGlass.bottomFillOpacity,
-                             "a flat fill is a coloured chip, not glass")
-        XCTAssertLessThan(QuietActiveGlass.topFillOpacity, 0.25, "the tint is a wash, not a fill")
-        XCTAssertGreaterThan(QuietActiveGlass.strokeOpacity, QuietActiveGlass.topFillOpacity,
-                             "the edge must read against the fill")
-        XCTAssertLessThan(QuietActiveGlass.strokeOpacity, 0.4, "that is an outline, not a hairline")
-
-        // The lit top edge: bright in light mode, barely there in dark, where
-        // white at light-mode strength reads as a seam.
-        XCTAssertGreaterThan(
-            QuietActiveGlass.highlightOpacity(dark: false),
-            QuietActiveGlass.highlightOpacity(dark: true)
+    /// The tinted glass capsule is deleted, not relocated: the pill under the
+    /// selected surface row is NEUTRAL, and the only colour in the row is the
+    /// label, in the user's own accent. A tinted pill under tinted text is the
+    /// coloured chip v1.1.7 was right to remove.
+    func testTheSelectionPillStaysANeutralWhisper() {
+        XCTAssertGreaterThan(QuietSelectionPill.lightFillOpacity, 0)
+        XCTAssertLessThan(
+            QuietSelectionPill.lightFillOpacity, 0.12,
+            "a pill this strong is a chip, and it will out-shout the label sitting on it"
         )
-        XCTAssertLessThan(QuietActiveGlass.highlightOpacity(dark: true), 0.2)
-        XCTAssertLessThan(QuietActiveGlass.highlightOpacity(dark: false), 0.5)
+        // Dark mode swallows the same recipe, so it gets more — but still less
+        // than a chip's worth.
+        XCTAssertGreaterThan(
+            QuietSelectionPill.fillOpacity(dark: true),
+            QuietSelectionPill.fillOpacity(dark: false)
+        )
+        XCTAssertLessThan(QuietSelectionPill.fillOpacity(dark: true), 0.16)
 
-        // It is a *top* highlight: it has to be gone before the row's bottom
-        // edge, or it is a second fill.
-        XCTAssertLessThanOrEqual(QuietActiveGlass.highlightFalloff, 0.6)
-        XCTAssertGreaterThan(QuietActiveGlass.highlightFalloff, 0)
+        // Same corner as every other rounded surface in the window, and inset
+        // from the column edge rather than reaching it.
+        XCTAssertEqual(QuietSelectionPill.cornerRadius, KaisolaVisualSystem.insetRadius)
+        XCTAssertGreaterThan(QuietSelectionPill.horizontalInset, 0)
+        XCTAssertLessThan(
+            QuietSelectionPill.horizontalInset,
+            QuietRowBudget.projectIndent,
+            "the pill must stay inside the row's own leading inset"
+        )
     }
 
     // MARK: - Project drag mapping

@@ -186,6 +186,13 @@ struct AcpCommand: Equatable, Sendable, Identifiable {
 struct AcpConfigOption: Equatable, Sendable, Identifiable {
     let id: String
     let name: String
+    /// ACP's own classification of what this option *is* (`mode`, `model`,
+    /// `thought_level`, …). Adapters name the same setting differently — Codex
+    /// says "Reasoning effort", our mock says the same, a third could say
+    /// "Thinking" — so the category is the only non-guessing way to know that
+    /// two surfaces are describing one setting. `nil` when the adapter omits it,
+    /// which is why the name heuristics survive alongside it.
+    var category: String?
     var currentValue: String?
     let choices: [Choice]
 

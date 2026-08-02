@@ -37,16 +37,25 @@ struct AcpComposerCard: View {
     private var agentName: String { AcpAgentIdentity.agentName(fromChatTitle: conversation.title) }
     private var identity: QuietIdentity { AcpAgentIdentity.identity(fromChatTitle: conversation.title) }
 
-    private var currentModelName: String? {
-        AcpComposerMenu.currentModel(
+    /// Everything the adapter declared, with each setting stated once. Every
+    /// model/option read below goes through this rather than the conversation's
+    /// raw arrays, so the pill and the menu cannot disagree.
+    private var surface: AcpComposerSurface {
+        AcpComposerSurface.reconciled(
             models: conversation.models,
-            currentModelID: conversation.currentModelID
-        )?.name
+            currentModelID: conversation.currentModelID,
+            modes: conversation.modes,
+            configOptions: conversation.configOptions
+        )
+    }
+
+    private var currentModelName: String? {
+        AcpComposerMenu.currentModel(surface)?.name
     }
 
     /// The adapter option worth naming on the pill's face.
     private var primaryOption: AcpConfigOption? {
-        AcpComposerMetrics.primaryOption(conversation.configOptions)
+        AcpComposerMetrics.primaryOption(surface.options)
     }
 
     private var sendAction: AcpComposerAction {
@@ -239,16 +248,10 @@ struct AcpComposerCard: View {
         .accessibilityIdentifier("acp.composer.settings")
         .popover(isPresented: $menuPresented, arrowEdge: .top) {
             AcpComposerMenuView(
-                rows: AcpComposerMenu.rows(
-                    agentName: agentName,
-                    models: conversation.models,
-                    currentModelID: conversation.currentModelID,
-                    configOptions: conversation.configOptions
-                ),
+                rows: AcpComposerMenu.rows(agentName: agentName, surface: surface),
                 advancedLines: AcpComposerMenu.advancedLines(
                     usage: conversation.usage,
-                    currentModelID: conversation.currentModelID,
-                    models: conversation.models
+                    surface: surface
                 ),
                 submenu: submenu,
                 identity: { agentID in
@@ -291,13 +294,12 @@ struct AcpComposerCard: View {
             )
         case .model:
             return AcpComposerMenu.modelSubmenu(
-                models: conversation.models,
-                currentModelID: conversation.currentModelID,
+                surface: surface,
                 favorites: favorites,
                 query: menuQuery
             )
         case .option(let id):
-            guard let option = conversation.configOptions.first(where: { $0.id == id }) else {
+            guard let option = surface.options.first(where: { $0.id == id }) else {
                 return AcpComposerSubmenu(title: id, options: [])
             }
             return AcpComposerMenu.optionSubmenu(option)
@@ -309,7 +311,16 @@ struct AcpComposerCard: View {
         case .agent:
             switchAgent(to: value)
         case .model:
-            conversation.selectModel(value)
+            // Which request carries a model depends on where the surviving
+            // model list came from: an adapter that lists model × effort pairs
+            // takes `session/set_model`; one that also declares a base-model
+            // option takes that, because setting it leaves the effort alone.
+            switch surface.modelTarget {
+            case .setModel:
+                conversation.selectModel(value)
+            case .configOption(let id):
+                conversation.selectConfigOption(id, value: value)
+            }
             menuPresented = false
         case .option(let id):
             conversation.selectConfigOption(id, value: value)

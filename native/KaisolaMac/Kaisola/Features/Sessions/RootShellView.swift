@@ -37,6 +37,10 @@ struct RootShellView: View {
     @State private var showOnboarding = false
     @State private var showSettings = false
     @State private var settingsSectionID: String?
+    /// Whether the detail column's two panel toggles are currently drawn. They
+    /// are hover-only chrome (see `detailPanelToggles`), so this is the whole of
+    /// what used to be a permanent 40pt band.
+    @State private var detailTogglesRevealed = false
     /// Opt-in, window-local follow mode. It is deliberately off at launch so a
     /// background tool call can never steal the user's document unexpectedly.
     @State private var followsSelectedAgentFiles = false
@@ -629,13 +633,17 @@ struct RootShellView: View {
         .navigationSplitViewStyle(.balanced)
     }
 
-    /// The detail column: a titlebar-height chrome band carrying the trailing
-    /// Files control, then the content on its own inset floating card. The
-    /// band's height plus the panel's inset equals the sidebar card's top
-    /// inset, so the two cards start on the same line.
+    /// The detail column: the content on its own inset floating card, gutters
+    /// equal on all four sides.
+    ///
+    /// v1.1.9 deleted the 40pt chrome band that used to sit above it. The band
+    /// carried two toggles and nothing else, so it was 40pt of permanent window
+    /// spent on two controls — the top of the app's largest column, given over
+    /// to chrome. The toggles now live in `detailPanelToggles`, revealed on
+    /// hover exactly where they were, plus a permanent door each in the footer's
+    /// overflow menu; the card takes the band's height.
     private var detailArea: some View {
         VStack(spacing: 0) {
-            detailChromeBar
             // A degraded workspace archive usually means an empty detail pane,
             // so this belongs in the layout rather than over it: covering the
             // empty state's own actions is exactly the wrong trade.
@@ -643,8 +651,9 @@ struct RootShellView: View {
                 .padding(.horizontal, KaisolaVisualSystem.chromeInset + 4)
                 .padding(.bottom, 6)
             detailPane
-                .kaisolaChromePanel(topInset: 0)
+                .kaisolaChromePanel(topInset: NativeWorkspaceChrome.detailPanelTopInset)
         }
+        .overlay(alignment: .topTrailing) { detailPanelToggles }
         // The other half of the sidebar divider's corridor. It has to live in
         // this column: a tracking area is clipped to its own split-view
         // subview, so the sidebar's tracker stops dead at the boundary.
@@ -667,26 +676,57 @@ struct RootShellView: View {
         }
     }
 
-    /// The detail column's two panel toggles, top-right.
+    /// The detail column's two panel toggles, revealed on hover at the content
+    /// pane's top-right.
     ///
     /// They are a PAIR, in the order the panels themselves sit: the document
     /// preview opens to the left of the Files rail, so its control is to the
-    /// left of the Files control. Files shipped here alone in v1.1.6 while the
-    /// preview's only door stayed buried in the footer's overflow menu — one of
-    /// two adjacent columns had a visible toggle and the other did not, which
-    /// read as an oversight because it was one.
-    private var detailChromeBar: some View {
+    /// left of the Files control.
+    ///
+    /// Hover-revealed rather than relocated into the sidebar footer, which was
+    /// the other candidate. The footer's control row is width-bound, not
+    /// space-bound: `FooterAccountBudget.nameWidth` charges the account name for
+    /// every control beside it, and two more slots cost it 36pt — at the 210pt
+    /// default rail that takes the name from ~109pt to ~73pt, below the floor
+    /// `QuietIdentityMarkTests` holds. So the footer would not have removed
+    /// permanent chrome, only moved it onto the one label in the sidebar that
+    /// still has to fit. Revealing on hover removes it outright: at rest the
+    /// detail column carries no chrome at all and the card owns the whole
+    /// column.
+    ///
+    /// Every non-pointer door stays open: ⌘B / ⇧⌘B, the View menu, the command
+    /// palette, and one item each in the footer's overflow menu. The controls
+    /// keep their identifiers and labels, so they remain addressable to
+    /// VoiceOver and to automation whether or not they are drawn.
+    private var detailPanelToggles: some View {
         HStack(spacing: NativeWorkspaceChrome.detailChromeControlGap) {
-            Spacer(minLength: 0)
             filePreviewToolbarControl
             filesToolbarControl
         }
-        .padding(.trailing, KaisolaVisualSystem.chromeInset + 4)
-        .frame(
-            height: NativeWorkspaceChrome.detailChromeBandHeight(
-                topBarLayout: settings.navigationLayout == .topBar
-            )
+        .padding(NativeWorkspaceChrome.detailToggleRevealPadding)
+        .opacity(detailTogglesRevealed ? 1 : 0)
+        .allowsHitTesting(detailTogglesRevealed)
+        .animation(
+            .easeOut(duration: KaisolaVisualSystem.hoverDuration),
+            value: detailTogglesRevealed
         )
+        // The hover target reaches well past the two 26pt controls: a pointer
+        // heading for a corner is only approximately aimed, and a target the
+        // size of what it reveals is one you have to already know is there.
+        // Bought as *leading padding on the box the sensor backs*, not as a
+        // width on the sensor itself — a background is proposed its parent's
+        // size, so a wider frame inside one is a claim the layout does not
+        // honour and the target silently stays control-sized.
+        .padding(.leading, NativeWorkspaceChrome.detailToggleRevealLead)
+        // The sensor is an AppKit tracking area whose `hitTest` returns nil, so
+        // it can never take a click — which matters because this strip sits
+        // inside the window's own titlebar drag region, and a hit-testable
+        // SwiftUI shape here would stop the window being dragged by it. A
+        // SwiftUI `.onHover` needs exactly that hit-testable shape to fire.
+        .background {
+            DetailToggleHoverSensor { hovering in detailTogglesRevealed = hovering }
+        }
+        .padding(.trailing, KaisolaVisualSystem.chromeInset + 4)
     }
 
     /// The workspace rail toggle lives at the top-right of the content area,
@@ -1341,6 +1381,12 @@ struct RootShellView: View {
             newIdeaMesh: { runCommand(.newIdeaMesh) },
             filePreviewVisible: detailPreviewPanelVisible,
             toggleFilePreview: { runCommand(.toggleDocumentPreview) },
+            // The Files toggle's permanent, pointer-independent door. Its
+            // visible control is hover-only now (see `detailPanelToggles`), and
+            // a control that only exists under the pointer needs a door that
+            // always does — this one costs the footer no width at all.
+            filesVisible: settings.workspaceRailVisible,
+            toggleFiles: { runCommand(.toggleFiles) },
             showSettings: {
                 settingsSectionID = nil
                 showSettings = true
@@ -2575,6 +2621,53 @@ struct InitialSidebarWidthApplier: NSViewRepresentable {
     }
 }
 
+/// Reports the pointer entering and leaving a region **without ever being able
+/// to take a click from it**.
+///
+/// `hitTest` returns nil unconditionally, so the view is invisible to the event
+/// system while its tracking area still fires — which is the whole point. A
+/// SwiftUI `.onHover` cannot do this: it needs a hit-testable shape, and a
+/// hit-testable overlay sitting over the content pane's top-right corner is an
+/// overlay that can swallow a click meant for the Files rail underneath it.
+/// Same idiom as `NavigationSidebarResizeHandle.TrackingView`, minus everything
+/// that view does with the click it accepts.
+struct DetailToggleHoverSensor: NSViewRepresentable {
+    var hoverChanged: (Bool) -> Void
+
+    func makeNSView(context: Context) -> SensorView {
+        let view = SensorView()
+        view.hoverChanged = hoverChanged
+        return view
+    }
+
+    func updateNSView(_ nsView: SensorView, context: Context) {
+        nsView.hoverChanged = hoverChanged
+    }
+
+    final class SensorView: NSView {
+        var hoverChanged: (Bool) -> Void = { _ in }
+        private var trackingArea: NSTrackingArea?
+
+        override func hitTest(_ point: NSPoint) -> NSView? { nil }
+        override func isAccessibilityElement() -> Bool { false }
+
+        override func updateTrackingAreas() {
+            super.updateTrackingAreas()
+            if let trackingArea { removeTrackingArea(trackingArea) }
+            let area = NSTrackingArea(
+                rect: bounds,
+                options: [.activeInActiveApp, .inVisibleRect, .mouseEnteredAndExited],
+                owner: self
+            )
+            addTrackingArea(area)
+            trackingArea = area
+        }
+
+        override func mouseEntered(with event: NSEvent) { hoverChanged(true) }
+        override func mouseExited(with event: NSEvent) { hoverChanged(false) }
+    }
+}
+
 // MARK: - Sidebar scroll pin
 
 /// Where the sidebar list is allowed to be scrolled to, kept pure and free of
@@ -3531,22 +3624,46 @@ enum NativeWorkspaceChrome {
     /// Between the two toggles. Tight enough that they read as one group and not
     /// as two unrelated buttons that happen to share a corner.
     static let detailChromeControlGap: CGFloat = 2
-    /// Breathing room above and below that control when the band carries
-    /// nothing else.
-    static let detailChromeControlPadding: CGFloat = 4
-
-    /// Height of the detail column's chrome band.
+    /// Breathing room around the hover-revealed toggles, which is also what
+    /// sizes the strip they live in.
+    static let detailToggleRevealPadding: CGFloat = 2
+    /// How far past the two controls the hover target reaches, leading side.
     ///
-    /// In the split layout the band doubles as the clearance for the traffic
-    /// lights and the AppKit toolbar `NavigationSplitView` installs, so it must
-    /// land the detail card on the sidebar card's line. The top-bar layout has
-    /// no such band to match — the tab strip already owns that clearance — so
-    /// the strip shrinks to a tight fit around the Files control instead of
-    /// leaving an empty 40pt gutter.
-    static func detailChromeBandHeight(topBarLayout: Bool) -> CGFloat {
-        topBarLayout
-            ? detailChromeControlHeight + detailChromeControlPadding * 2
-            : chromePanelTopInset - KaisolaVisualSystem.chromeInset
+    /// Sized from the pointer rather than from the pair it reveals: a target the
+    /// size of what it shows is one you have to already know is there. It costs
+    /// nothing to be generous — the strip is empty at rest, and the sensor takes
+    /// no clicks.
+    static let detailToggleRevealLead: CGFloat = 60
+    /// The whole hover target, which is what a test can hold: the two controls,
+    /// their gap, the padding around them, and the leading reach.
+    static var detailToggleRevealWidth: CGFloat {
+        detailChromeControlWidth * 2
+            + detailChromeControlGap
+            + detailToggleRevealPadding * 2
+            + detailToggleRevealLead
+    }
+
+    /// The detail card's top gutter, and the height of the strip the two panel
+    /// toggles are revealed in.
+    ///
+    /// v1.1.9 cut this from 46 to 28 — 18pt of the app's largest column handed
+    /// back to the pane — by deleting the chrome *band*. The band was 40pt of
+    /// permanent window carrying two controls and nothing else; what is left is
+    /// a strip exactly as tall as those controls, empty at rest.
+    ///
+    /// It is not cut to `chromeInset` and the card is deliberately not run to
+    /// the window's top edge, even though the measurement says it could be:
+    /// the window is `fullSizeContentView` with a transparent titlebar, the
+    /// traffic lights sit over the *sidebar* column, and a real click at
+    /// window-top + 28 was verified to reach a control drawn there. What stops
+    /// it is the card's own contents. At the card's top-right corner sits the
+    /// Files rail's header — its view-mode and filter controls land within a
+    /// few points of where these toggles want to be — so a card run to the top
+    /// puts the hover-revealed pair directly over controls the user is aiming
+    /// at. The strip keeps the two apart by construction rather than by a pair
+    /// of coordinates that agree today.
+    static var detailPanelTopInset: CGFloat {
+        detailChromeControlHeight + detailToggleRevealPadding * 2
     }
 }
 
@@ -4198,6 +4315,8 @@ private struct ConnectionFooter: View {
     var newIdeaMesh: (() -> Void)?
     let filePreviewVisible: Bool
     let toggleFilePreview: () -> Void
+    let filesVisible: Bool
+    let toggleFiles: () -> Void
     let showSettings: () -> Void
     let showUsage: () -> Void
 
@@ -4334,10 +4453,22 @@ private struct ConnectionFooter: View {
     /// content-area control) and minus any persistent color.
     private var overflowMenu: some View {
         Menu {
+            // The two panel toggles' permanent doors. Their visible controls are
+            // hover-only at the content pane's top-right (v1.1.9 reclaimed the
+            // 40pt band they used to sit in), so the menu is what a pointer that
+            // never visits that corner — or a user driving by keyboard alone —
+            // finds instead. Both, symmetrically: shipping one here and one on
+            // screen is the asymmetry v1.1.6 already had to correct once.
             Button(action: toggleFilePreview) {
                 Label(
                     filePreviewVisible ? "Hide File Preview" : "Show File Preview",
                     systemImage: "doc.text.magnifyingglass"
+                )
+            }
+            Button(action: toggleFiles) {
+                Label(
+                    filesVisible ? "Hide Files" : "Show Files",
+                    systemImage: "sidebar.trailing"
                 )
             }
             if newMesh != nil || newStagedMesh != nil || newIdeaMesh != nil {

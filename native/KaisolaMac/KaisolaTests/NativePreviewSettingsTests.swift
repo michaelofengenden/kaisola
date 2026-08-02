@@ -1526,21 +1526,45 @@ final class NativePreviewSettingsTests: XCTestCase {
         XCTAssertEqual(closed.collapsed, ["other"])
     }
 
-    func testTopBarLayoutTightensTheDetailChromeBand() {
-        let split = NativeWorkspaceChrome.detailChromeBandHeight(topBarLayout: false)
-        let topBar = NativeWorkspaceChrome.detailChromeBandHeight(topBarLayout: true)
-        // The split band is unchanged: it still lands the detail card on the
-        // sidebar card's line.
+    /// v1.1.9 deleted the detail column's 40pt chrome band. It carried two
+    /// toggles and nothing else, so it was the top of the app's largest column
+    /// spent on two controls; the toggles are hover-revealed now and the card
+    /// took the difference.
+    ///
+    /// What is left has to stay a *strip* — exactly as tall as the controls it
+    /// reveals — so a later pass cannot grow it back into somewhere to put
+    /// chrome, and so the pair can never be laid out over the card's own
+    /// top-right controls.
+    func testTheDetailStripIsOnlyAsTallAsTheControlsItReveals() {
         XCTAssertEqual(
-            split,
-            NativeWorkspaceChrome.chromePanelTopInset - KaisolaVisualSystem.chromeInset
+            NativeWorkspaceChrome.detailPanelTopInset,
+            NativeWorkspaceChrome.detailChromeControlHeight
+                + NativeWorkspaceChrome.detailToggleRevealPadding * 2
         )
-        XCTAssertEqual(split, 40)
-        // Top bar has no toolbar band to clear, so the strip is a tight fit
-        // around the Files control instead of an empty gutter.
-        XCTAssertEqual(topBar, 32)
-        XCTAssertLessThan(topBar, split)
-        XCTAssertGreaterThan(topBar, NativeWorkspaceChrome.detailChromeControlHeight)
+        XCTAssertEqual(NativeWorkspaceChrome.detailPanelTopInset, 28)
+
+        // The reclaim, stated as a number rather than as a memory. The band the
+        // strip replaced was `chromePanelTopInset - chromeInset` tall and the
+        // card carried no top inset of its own beneath it, so the card used to
+        // start 40pt down and now starts 28pt down: 12pt of the app's largest
+        // column, measured on a dev launch as the document pane growing from
+        // 415pt to 427pt in a 500pt window.
+        let oldBand = NativeWorkspaceChrome.chromePanelTopInset - KaisolaVisualSystem.chromeInset
+        XCTAssertEqual(oldBand - NativeWorkspaceChrome.detailPanelTopInset, 12)
+        XCTAssertLessThan(
+            NativeWorkspaceChrome.detailPanelTopInset,
+            oldBand,
+            "the strip has to be shorter than the band it replaced, or nothing was reclaimed"
+        )
+
+        // The hover target is sized from the pointer, not from the pair it
+        // reveals: a target the size of what it shows is one you have to
+        // already know is there.
+        XCTAssertGreaterThan(
+            NativeWorkspaceChrome.detailToggleRevealWidth,
+            NativeWorkspaceChrome.detailChromeControlWidth * 2
+                + NativeWorkspaceChrome.detailChromeControlGap
+        )
     }
 
     func testChromePanelTokensSitBetweenCardAndShell() {

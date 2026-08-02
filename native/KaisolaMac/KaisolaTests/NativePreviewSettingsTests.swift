@@ -514,8 +514,8 @@ final class NativePreviewSettingsTests: XCTestCase {
         // the least translucent surface in the app (0.40 transmission against
         // light's 0.40 on the sidebar and 0.45 on the workspace), which is what
         // "the background in dark mode looks bad… needs to be glassy/smooth/
-        // translucent to the wallpaper" was describing.
-        XCTAssertEqual(GlassBackdropWash.sidebar(isDark: true).baseOpacity, 0.55, accuracy: 0.0001)
+        // translucent to the wallpaper" was describing. 0.55 → 0.52 in v1.1.10.
+        XCTAssertEqual(GlassBackdropWash.sidebar(isDark: true).baseOpacity, 0.52, accuracy: 0.0001)
         XCTAssertGreaterThan(
             GlassBackdropWash.sidebar(isDark: true).desktopTransmission,
             GlassBackdropWash.sidebar(isDark: false).desktopTransmission
@@ -1184,8 +1184,190 @@ final class NativePreviewSettingsTests: XCTestCase {
             )
             // Roughly wallpaper-independent, which is the point of normalizing
             // at all: before, the multiple sat at 1.0–1.3 and the surface's
-            // colour was whatever the desktop happened to be.
-            XCTAssertEqual(shipped / desktop, 0.60, accuracy: 0.10, "for \(wallpaper)")
+            // colour was whatever the desktop happened to be. v1.1.10's dark
+            // saturation ceiling takes the band down again, from 0.5–0.7 to
+            // 0.25–0.50 — the second half of "still reads a little blue".
+            XCTAssertLessThan(shipped / desktop, 0.55, "for \(wallpaper)")
+            XCTAssertGreaterThan(
+                shipped / desktop,
+                0.20,
+                "the wallpaper has been greyed out rather than damped: \(wallpaper)"
+            )
+        }
+    }
+
+    /// The bug behind "the dark glass still reads flat", and the test that
+    /// would have caught it: the bake has to actually *arrive* at the luminance
+    /// it declares.
+    ///
+    /// Every other test here checks the constants and the arithmetic around
+    /// them. None of them rendered anything, so none of them noticed that
+    /// `CIColorControls.brightness` is applied in `CIContext`'s working space —
+    /// linear sRGB by default — while `luminanceShift` is measured from
+    /// gamma-encoded bytes. Subtracting an encoded quantity from linear values
+    /// drove the dark still 79.7% pure black: mean luminance 0.002 against the
+    /// 0.16 it declares, a veil over nothing.
+    ///
+    /// Rendering three synthetic wallpapers end to end and measuring what comes
+    /// out is the only form of this test that could have failed.
+    func testTheBakeArrivesAtTheLuminanceItDeclares() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appending(path: "kaisola-bake-\(UUID().uuidString)", directoryHint: .isDirectory)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        // A gradient, so the still has real luminance structure to preserve —
+        // a flat colour would pass even a bake that crushed every gradient to
+        // one value.
+        func writeWallpaper(base: (Double, Double, Double), name: String) throws -> URL {
+            let side = 256
+            let context = CGContext(
+                data: nil, width: side, height: side, bitsPerComponent: 8,
+                bytesPerRow: side * 4, space: CGColorSpaceCreateDeviceRGB(),
+                bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+            )!
+            for y in 0..<side {
+                // 0.55×…1.45× across the frame.
+                let ramp = 0.55 + 0.9 * Double(y) / Double(side - 1)
+                context.setFillColor(
+                    red: min(1, base.0 * ramp), green: min(1, base.1 * ramp),
+                    blue: min(1, base.2 * ramp), alpha: 1
+                )
+                context.fill(CGRect(x: 0, y: y, width: side, height: 1))
+            }
+            let url = directory.appending(path: "\(name).png")
+            let destination = CGImageDestinationCreateWithURL(
+                url as CFURL, "public.png" as CFString, 1, nil
+            )!
+            CGImageDestinationAddImage(destination, context.makeImage()!, nil)
+            XCTAssertTrue(CGImageDestinationFinalize(destination))
+            return url
+        }
+
+        /// Mean Rec. 709 luma of a rendered painting, plus the share of it that
+        /// clamped to pure black and its p5..p95 luminance spread.
+        func measure(_ image: CGImage) -> (mean: Double, black: Double, spread: Double) {
+            let width = image.width
+            let height = image.height
+            var pixels = [UInt8](repeating: 0, count: width * height * 4)
+            pixels.withUnsafeMutableBytes { bytes in
+                let context = CGContext(
+                    data: bytes.baseAddress, width: width, height: height,
+                    bitsPerComponent: 8, bytesPerRow: width * 4,
+                    space: CGColorSpaceCreateDeviceRGB(),
+                    bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+                )!
+                context.draw(image, in: CGRect(x: 0, y: 0, width: width, height: height))
+            }
+            var lumas: [Double] = []
+            var black = 0
+            for index in stride(from: 0, to: pixels.count, by: 4) {
+                let red = Double(pixels[index]) / 255
+                let green = Double(pixels[index + 1]) / 255
+                let blue = Double(pixels[index + 2]) / 255
+                lumas.append(red * 0.2126 + green * 0.7152 + blue * 0.0722)
+                if pixels[index] == 0, pixels[index + 1] == 0, pixels[index + 2] == 0 { black += 1 }
+            }
+            lumas.sort()
+            let count = Double(lumas.count)
+            return (
+                lumas.reduce(0, +) / count,
+                Double(black) / count,
+                lumas[Int(count * 0.95)] - lumas[Int(count * 0.05)]
+            )
+        }
+
+        // `maximumBlack`: how much of the baked still may clamp to zero.
+        //
+        // A linear ramp is the adversarial case for this, and deliberately so —
+        // a Gaussian leaves a linear gradient untouched, so unlike a real
+        // photograph none of the fixture's range is softened away before the
+        // normalization sees it. Two of the three hold the tight bound. The
+        // bright one cannot and the arithmetic says why: its mean is 0.78, dark
+        // normalizes to 0.16, and an additive shift of −0.62 puts everything
+        // below 0.62 at zero — a quarter of a ±45% ramp. It is allowed 0.30
+        // rather than being quietly dropped, and the surface it produces is
+        // still the opposite of the bug (spread 0.37, against the 0.014 that
+        // shipped). Every real wallpaper on this machine, including the
+        // brightest aerial Apple ships at luma 0.79, measured 0.0% — a blurred
+        // photograph's range collapses where a ramp's does not.
+        let wallpapers: [(name: String, base: (Double, Double, Double), maximumBlack: Double)] = [
+            // Michael's own desktop's average: a decidedly blue aerial.
+            ("aerial", (0.263, 0.476, 0.575), 0.02),
+            ("bright", (0.82, 0.80, 0.76), 0.30),
+            ("dim", (0.11, 0.13, 0.16), 0.02),
+        ]
+
+        for (name, base, maximumBlack) in wallpapers {
+            let url = try writeWallpaper(base: base, name: name)
+            for isDark in [true, false] {
+                let key = DesktopBackdropKey(path: url.path, modified: nil, isDark: isDark)
+                guard case let .wallpaper(image, _)? = DesktopBackdropRenderer.render(key: key) else {
+                    return XCTFail("\(name) (isDark: \(isDark)) produced no painting")
+                }
+                let measured = measure(image)
+                let target = DesktopBackdropRenderer.targetLuminance(isDark: isDark)
+
+                // The headline: what the veil's coverage arithmetic assumes.
+                // Before the working-space fix the dark row here measured 0.002.
+                XCTAssertEqual(
+                    measured.mean, target, accuracy: 0.06,
+                    "\(name) (isDark: \(isDark)) baked to \(measured.mean), not the \(target) it declares"
+                )
+                // A still that clamps is a still whose structure is gone. This
+                // is the direct form of the flatness: 80% of the dark bake was
+                // one value, and one value is what "flat" means.
+                XCTAssertLessThanOrEqual(
+                    measured.black, maximumBlack,
+                    "\(name) (isDark: \(isDark)) clamped \(Int(measured.black * 100))% of the still to black"
+                )
+                // …and the wallpaper's own light and shade have to survive to
+                // the veil, or there is nothing for the glass to show. This is
+                // the assertion that actually fails on the pre-v1.1.10 bake: it
+                // delivered 0.014 here, against the 0.09–0.49 below.
+                XCTAssertGreaterThan(
+                    measured.spread, 0.05,
+                    "\(name) (isDark: \(isDark)) arrived with no luminance structure left"
+                )
+            }
+        }
+    }
+
+    /// The measurement and the operation have to happen in the same space —
+    /// which is the whole of the bug above, stated as the constant that fixes
+    /// it. `DesktopTintSampler.meanLuminance` reads gamma-encoded bytes out of a
+    /// `DeviceRGB` context, so the filter chain that consumes its output must be
+    /// asked for a gamma-encoded working space rather than CoreImage's linear
+    /// default.
+    func testTheBakeWorksInTheSpaceItsNormalizationIsMeasuredIn() throws {
+        let space = try XCTUnwrap(DesktopBackdropRenderer.bakeColorSpace)
+        XCTAssertEqual(space.name, CGColorSpace.sRGB)
+        // Not `NSNull`/unmanaged: a Display P3 wallpaper still has to be
+        // converted before its bytes may be treated as sRGB.
+        XCTAssertFalse(space.isWideGamutRGB)
+    }
+
+    /// Dark damps chroma harder than light, and for a reason that is about the
+    /// surface rather than about taste: at a composite luminance near 0.10 a
+    /// channel difference light would not notice is most of what the surface is.
+    func testDarkDampsTheWallpapersChromaHarderThanLight() {
+        XCTAssertEqual(DesktopBackdropRenderer.saturationCeiling(isDark: false), 0.85, accuracy: 0.0001)
+        XCTAssertEqual(DesktopBackdropRenderer.saturationCeiling(isDark: true), 0.50, accuracy: 0.0001)
+        XCTAssertLessThan(
+            DesktopBackdropRenderer.saturationCeiling(isDark: true),
+            DesktopBackdropRenderer.saturationCeiling(isDark: false)
+        )
+        // Still a *damping* and not a conversion to greyscale: the painted
+        // wallpaper has to remain the reason the layer exists.
+        XCTAssertGreaterThan(DesktopBackdropRenderer.saturationCeiling(isDark: true), 0.35)
+
+        // And the ceiling really is the ceiling in dark too — the normalization
+        // below it still scales with the wallpaper's own luminance.
+        for mean in [0.30, 0.45, 0.60] {
+            XCTAssertLessThan(
+                DesktopBackdropRenderer.saturation(mean: mean, isDark: true),
+                DesktopBackdropRenderer.saturationCeiling(isDark: true)
+            )
         }
     }
 
@@ -1782,10 +1964,8 @@ final class NativePreviewSettingsTests: XCTestCase {
     /// pair over the controls the user was aiming at. The card stopped 28pt
     /// short to keep them apart.
     ///
-    /// v1.1.10 removes the pair from this layout instead — every place it could
-    /// have been relocated to was measured and rejected, see
-    /// `detailPanelTopInset(layout:)` — so nothing is drawn over the card's
-    /// corner and the card takes the rest.
+    /// v1.1.10 moves the pair into the sidebar's traffic-light band instead, so
+    /// nothing is drawn over the card's corner and the card takes the rest.
     func testTheDetailCardRunsToTheWindowTopInTheSidebarLayout() {
         // Nothing above the card but the gutter every other side already has.
         XCTAssertEqual(
@@ -1796,10 +1976,7 @@ final class NativePreviewSettingsTests: XCTestCase {
 
         // The reclaim, stated as a number rather than as a memory. The band was
         // `chromePanelTopInset - chromeInset` = 40pt tall with no card inset
-        // beneath it; v1.1.9 took it to 28, and this takes it to 6. Measured on
-        // a dev launch as the card's content growing 852 → 874pt in an 886pt
-        // window, its top edge moving from y 123 to y 101 under a window top of
-        // y 95.
+        // beneath it; v1.1.9 took it to 28, and this takes it to 6.
         let oldBand = NativeWorkspaceChrome.chromePanelTopInset - KaisolaVisualSystem.chromeInset
         XCTAssertEqual(oldBand, 40)
         XCTAssertEqual(oldBand - NativeWorkspaceChrome.detailPanelTopInset(layout: .leftTree), 34)
@@ -1811,10 +1988,9 @@ final class NativePreviewSettingsTests: XCTestCase {
         )
     }
 
-    /// The top-bar layout has no sidebar footer to fall back on, so it keeps the
-    /// pair and the strip — and the strip has to stay exactly as tall as the
-    /// controls it reveals, so a later pass cannot grow it back into somewhere
-    /// to put chrome.
+    /// The top-bar layout has no sidebar band to move the pair into, so it keeps
+    /// the strip — and the strip has to stay exactly as tall as the controls it
+    /// reveals, so a later pass cannot grow it back into somewhere to put chrome.
     func testTheTopBarLayoutKeepsTheStripItRevealsItsTogglesIn() {
         XCTAssertEqual(
             NativeWorkspaceChrome.detailPanelTopInset(layout: .topBar),
@@ -1848,8 +2024,7 @@ final class NativePreviewSettingsTests: XCTestCase {
     ///
     /// Both were verified present in the AX tree on the same dev launch that
     /// measured the reclaim, along with the Files rail's own permanent Hide
-    /// Files button: a real synthesized click through that button closed the
-    /// rail, and an `AXPress` on the footer's `Show or Hide Files` reopened it.
+    /// Files button (a real synthesized click through it closed the rail).
     func testBothPanelsKeepACommandThatIsNotAPointerCornerOrAShortcut() {
         for id in [AppCommandID.toggleFiles, AppCommandID.toggleDocumentPreview] {
             let definition = AppCommandRegistry.definition(for: id)

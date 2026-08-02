@@ -929,9 +929,21 @@ struct GlassBackdropWash: Equatable, Sendable {
     /// 0.060 and the veil's own top-to-bottom range 0.0144 — half of light's
     /// 0.0283. Thinner veil, wider gradient: spread 0.072, gradient 0.0165, and
     /// primary/secondary label contrast still 12.8:1 / 6.0:1.
+    ///
+    /// v1.1.10 takes dark one more step down, 0.55 → 0.52. On its own that is a
+    /// small change and it is deliberately small: the flatness Michael reported
+    /// after the v1.1.9 pass was not the veil's doing at all but
+    /// `DesktopBackdropRenderer.bakeColorSpace`, which was rendering the dark
+    /// still as near-solid black no matter what the veil above it did. With the
+    /// still actually arriving, 45% transmission already delivers a measured
+    /// composite spread of 0.078 against light's 0.063 — dark is no longer the
+    /// flattest surface in the app. The extra three points buy margin (spread
+    /// 0.083, gradient 0.037) without leaving the frost band
+    /// `testGlassVeilsFrostTheDesktopWithoutErasingIt` holds: at 0.48
+    /// transmission the surface is still glass and not a photograph.
     static func sidebar(isDark: Bool) -> GlassBackdropWash {
         isDark
-            ? dark(top: 0.48, base: 0.55, bottom: 0.63)
+            ? dark(top: 0.45, base: 0.52, bottom: 0.61)
             : light(top: 0.66, base: 0.60, bottom: 0.56)
     }
 
@@ -946,7 +958,7 @@ struct GlassBackdropWash: Equatable, Sendable {
     /// near-black in dark mode.
     static func workspace(isDark: Bool) -> GlassBackdropWash {
         isDark
-            ? dark(top: 0.51, base: 0.58, bottom: 0.66)
+            ? dark(top: 0.48, base: 0.55, bottom: 0.64)
             : light(top: 0.61, base: 0.55, bottom: 0.51)
     }
 
@@ -1453,6 +1465,38 @@ enum DesktopBackdropRenderer {
     /// `saturation(mean:isDark:)`, which is where the dark cast was.
     static let saturationCeiling: Double = 0.85
 
+    /// The ceiling for **dark**, which is a different number for a reason that
+    /// is not taste.
+    ///
+    /// Chroma and luminance are not independent to the eye at near-black. The
+    /// dark still is normalized to 0.16 and sits under a veil that passes ~45%
+    /// of it, so the composite's total luminance is ~0.10 — and against a mean
+    /// that small, a channel difference the light surface would not notice is
+    /// most of what the surface *is*. Measured against Michael's own desktop
+    /// (a Lake Tahoe aerial, off-neutral 0.399) with the bake rendering
+    /// correctly, the dark sidebar came back **0.221** off-neutral against
+    /// light's 0.059 on the identical wallpaper. Same picture, same veil
+    /// arithmetic, 3.7× the cast — which is what "still reads a little
+    /// blue/purple" is.
+    ///
+    /// Damping the dark still's chroma to 0.50 takes that to **0.129** while
+    /// leaving the surface's luminance spread untouched at 0.083 (0.0785 →
+    /// 0.0785 across the sweep — chroma and structure are separable here even
+    /// though chroma and *brightness* are not). That is the property that makes
+    /// this the right lever for the cast rather than a lever that greys the
+    /// wallpaper out: the wallpaper's light and shade all survive; only how
+    /// loudly it is coloured moves. Across the five most extreme wallpapers on
+    /// this machine the dark composite's off-neutrality drops from 0.003–1.181
+    /// to 0.009–0.330 — the surface stops changing personality with the desktop.
+    ///
+    /// Light keeps 0.85. Light was never the complaint, and a 0.85-luminance
+    /// surface has the headroom to carry the desktop's hue at full strength.
+    static let darkSaturationCeiling: Double = 0.50
+
+    static func saturationCeiling(isDark: Bool) -> Double {
+        isDark ? darkSaturationCeiling : saturationCeiling
+    }
+
     /// The chroma that actually reaches a baked still — and the fix for
     /// "the background in dark mode looks… purple/blue".
     ///
@@ -1491,7 +1535,7 @@ enum DesktopBackdropRenderer {
     /// every wallpaper dimmer than the 0.72 target, which is nearly all of them.
     static func saturation(mean: Double, isDark: Bool) -> Double {
         let target = targetLuminance(isDark: isDark)
-        return saturationCeiling * min(1, target / max(mean, 0.02))
+        return saturationCeiling(isDark: isDark) * min(1, target / max(mean, 0.02))
     }
 
     /// Mean luminance the baked still is moved to, per appearance.
@@ -1564,6 +1608,49 @@ enum DesktopBackdropRenderer {
         return .wallpaper(blurred, tint: tint)
     }
 
+    /// The colour space the bake's arithmetic is done in, and the fix for
+    /// "the dark glass still reads flat".
+    ///
+    /// `CIContext` colour-manages by default: its working space is **linear**
+    /// sRGB, so every filter operates on linearized values. `luminanceShift` is
+    /// measured in the opposite space — `DesktopTintSampler.meanLuminance` reads
+    /// a `CGContext` raster in `DeviceRGB`, i.e. gamma-**encoded** bytes. The
+    /// bake was therefore subtracting an encoded quantity from linear values.
+    ///
+    /// It is not a rounding error. For Michael's own desktop the encoded mean is
+    /// 0.438 and the shift is −0.278, but that still's *linear* mean is 0.17, so
+    /// the offset drove the whole image past zero: the rendered dark still came
+    /// back **79.7% pure black**, mean luminance **0.0021** against the 0.16 it
+    /// declares. The dark surface was a veil over black — a single flat colour
+    /// with a 0.010 luminance spread across the entire sidebar. That is the
+    /// flatness, and no amount of veil tuning could have reached it, because
+    /// there was nothing underneath the veil to let through.
+    ///
+    /// (Light suffered the mirror version and got away with it. Adding 0.282 in
+    /// linear space then re-encoding happens to land near the 0.72 target, so
+    /// light merely lost structure — spread 0.039 where the same constants in
+    /// the measured space give 0.063 — rather than losing the picture.)
+    ///
+    /// Doing the arithmetic where it was measured fixes both: the dark still
+    /// arrives at mean 0.153 with 2.1% black and a 0.167 spread, and the
+    /// composite lands on 0.089/0.105/0.112 — which is, to three decimals, the
+    /// surface v1.1.9's constants were *designed* to produce and modelled as
+    /// producing. The constants were right; they were being evaluated in the
+    /// wrong space.
+    ///
+    /// sRGB rather than `NSNull` (which would disable colour management
+    /// entirely): a Display P3 or HDR wallpaper must still be converted before
+    /// its bytes are treated as sRGB, or a wide-gamut desktop would bake with
+    /// the wrong primaries. This asks for management *into the space the
+    /// measurement is taken in*, which is the actual requirement.
+    ///
+    /// The cost is that the Gaussian is no longer a physically linear blur.
+    /// Blurring in the encoded space is slightly "darker" through high-contrast
+    /// edges — irrelevant at radius 28 on a 176px still whose whole job is to
+    /// stop being a picture, and the same trade every design tool makes by
+    /// default.
+    static let bakeColorSpace = CGColorSpace(name: CGColorSpace.sRGB)
+
     /// `clampedToExtent` before the blur, cropped back after: without it the
     /// Gaussian averages in transparent black at every edge and the backdrop
     /// arrives with a dark vignette exactly where the window's corners are.
@@ -1591,8 +1678,12 @@ enum DesktopBackdropRenderer {
         controls.brightness = Float(brightness)
         guard let output = controls.outputImage else { return nil }
 
-        return CIContext(options: [.useSoftwareRenderer: false])
-            .createCGImage(output, from: extent)
+        var options: [CIContextOption: Any] = [.useSoftwareRenderer: false]
+        // See `bakeColorSpace`. Falls through to the default working space only
+        // if the system cannot vend sRGB, which is the pre-v1.1.10 behaviour —
+        // degraded, not broken.
+        if let bakeColorSpace { options[.workingColorSpace] = bakeColorSpace }
+        return CIContext(options: options).createCGImage(output, from: extent)
     }
 }
 

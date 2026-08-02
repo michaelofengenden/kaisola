@@ -3,12 +3,14 @@ import SwiftUI
 /// Who is on the other end of a rail row, as a *mark* rather than a word
 /// (spec: quiet fleet v4.4 "Safari").
 ///
-/// v1.1.7 grammar, taken from Codex's agent list: every mark is a **naked
-/// monoline glyph** at one optical size — no tile, no chip, no fill behind
-/// anything. The two first-class agents carry full ink (Claude's coral, the
-/// knot in the label colour); every generic surface recedes to `.secondary`.
-/// So the rail's only colour besides the status dot is still Claude's coral,
-/// but nothing is boxed to say so.
+/// v1.1.7 grammar, taken from Codex's agent list: every mark is **naked** at one
+/// optical size — no tile, no chip, no fill behind anything. The generic
+/// surfaces are monoline glyphs that recede to `.secondary`; the two first-class
+/// agents are each their vendor's real logomark, traced and *filled* (Claude's
+/// coral burst, the knot in the label colour), and carry full ink. So the rail's
+/// only colour besides the status dot is still Claude's coral, but nothing is
+/// boxed to say so. The two filled marks are held level with each other by ink
+/// rather than by span — see each one's `span`.
 enum QuietIdentity: Equatable {
     case claude
     case openai
@@ -78,10 +80,13 @@ struct QuietIdentityMarkView: View {
     nonisolated static let slot: CGFloat = 16
 
     /// One optical size for every symbol mark, chosen to match the *drawn*
-    /// marks rather than the slot: the starburst spans `2 × 9.6/24 × slot`
-    /// = 12.8pt, so a 12.5pt glyph sits on the same optical circle. Making
-    /// this a constant is what keeps a future SF Symbol from arriving a size
-    /// larger than its neighbours, which is exactly what a tile used to hide.
+    /// marks rather than the slot: both drawn marks span a shade over 14pt of
+    /// the 16pt slot (`QuietClaudeBurst.span`, `QuietOpenAIKnot.span`), and a
+    /// 12.5pt glyph sits on the same optical circle — an SF Symbol's box carries
+    /// more air than a traced silhouette's does, so equal boxes would not be
+    /// equal marks. Making this a constant is what keeps a future SF Symbol from
+    /// arriving a size larger than its neighbours, which is exactly what a tile
+    /// used to hide.
     nonisolated static let symbolSize: CGFloat = 12.5
     /// The letter fallback, a shade smaller: a cap-height letter at the symbol
     /// size out-inks a monoline glyph.
@@ -91,11 +96,10 @@ struct QuietIdentityMarkView: View {
         Group {
             switch identity {
             case .claude:
-                QuietStarburstMark(rays: 12, innerRadius: 3.6, outerRadius: 9.6)
-                    .stroke(
-                        Color(light: 0xD97757, dark: 0xE58A6D),
-                        style: StrokeStyle(lineWidth: unit * QuietIdentityMarkView.starburstStroke, lineCap: .round)
-                    )
+                // Filled, non-zero: the official mark is a solid asterisk of
+                // tapered petals around a solid hub, not twelve strokes.
+                QuietClaudeBurstMark()
+                    .fill(Color(light: 0xD97757, dark: 0xE58A6D), style: FillStyle(eoFill: false))
             case .openai:
                 // Filled, non-zero: the official mark's white gaps are counters
                 // in its own outline, not a stroke around a skeleton.
@@ -119,16 +123,6 @@ struct QuietIdentityMarkView: View {
         .accessibilityHidden(true)
     }
 
-    /// Stroke weight of the Claude starburst in viewbox units. Sits where it
-    /// does so the coral rays and an SF Symbol at `.regular` land within a few
-    /// tenths of a point of each other, and so the burst's *ink* (0.314 of the
-    /// slot, measured at 8× supersample) matches the filled knot's at
-    /// `QuietOpenAIKnot.span` — the two first-class agent marks have to weigh
-    /// the same as each other, whatever pen each is drawn with.
-    nonisolated static let starburstStroke: CGFloat = 2.0
-
-    private var unit: CGFloat { size / 24 }
-
     /// A naked SF Symbol at the shared optical size. `.regular` is the monoline
     /// weight; anything heavier reads as a filled badge next to the knot.
     private func symbol(_ name: String) -> some View {
@@ -142,27 +136,6 @@ struct QuietIdentityMarkView: View {
         Text(text)
             .font(.system(size: glyphSize * (size / QuietIdentityMarkView.slot), weight: .regular))
             .foregroundStyle(.secondary)
-    }
-}
-
-/// Claude's mark: evenly spaced rays from an inner to an outer radius.
-private struct QuietStarburstMark: Shape {
-    let rays: Int
-    let innerRadius: CGFloat
-    let outerRadius: CGFloat
-
-    func path(in rect: CGRect) -> Path {
-        let unit = min(rect.width, rect.height) / 24
-        let center = CGPoint(x: rect.midX, y: rect.midY)
-        let inner = innerRadius * unit
-        let outer = outerRadius * unit
-        var path = Path()
-        for index in 0..<max(rays, 1) {
-            let angle = (2 * .pi / CGFloat(max(rays, 1))) * CGFloat(index)
-            path.move(to: CGPoint(x: center.x + cos(angle) * inner, y: center.y + sin(angle) * inner))
-            path.addLine(to: CGPoint(x: center.x + cos(angle) * outer, y: center.y + sin(angle) * outer))
-        }
-        return path
     }
 }
 
@@ -247,6 +220,84 @@ enum QuietVectorOutline {
         }
         return path
     }
+}
+
+/// Claude's mark — the **official silhouette**, traced, not a construction.
+///
+/// What it replaced, and why: v1.1.7–v1.1.9 drew twelve uniform straight
+/// round-capped strokes on an even 30° pitch. The real Anthropic mark is not
+/// that. It is a filled asterisk of twelve **tapered petals of unequal length**
+/// around a solid hub, each petal wide where it leaves the hub and narrowing to
+/// a blunt point, and the petals sit at irregular angles — that irregularity is
+/// the mark's whole character, and even spokes read as a generic sparkle
+/// instead. Measured against `assets/backlog/pasted-image-2.png` (the real mark,
+/// 1280²), rasterized and cropped to its own ink box, the spoke construction
+/// scores an intersection-over-union of **0.40**. Michael's note — "we should
+/// fix the claude symbol to be more precise" — is that number.
+///
+/// Route: the reference's own alpha silhouette, thresholded at 50%, its single
+/// closed contour traced and simplified (Ramer–Douglas–Peucker, ε = 1.5px at
+/// 1280², which is where the fidelity curve flattens), then translated and
+/// uniformly scaled so its **tight** bounding box centres in the shared 24-unit
+/// viewbox — the same normalization `QuietOpenAIKnot` uses, and the same one the
+/// artwork itself was exported with (the reference's ink reaches all four of its
+/// own edges). Result: one subpath, 129 lines, **IoU 0.989** against the
+/// reference; the measurement floor at that raster size is 0.992, so the trace
+/// is within three thousandths of exact. Straight segments rather than cubics
+/// because the mark's edges genuinely are straight — a curve fit here would be
+/// inventing smoothness the artwork does not have.
+///
+/// It is *filled* with the non-zero winding rule, so the taper and the solid
+/// centre are real geometry rather than a stroke width pretending to be them.
+enum QuietClaudeBurst {
+    /// The traced outline, in the 24-unit viewbox. Absolute `M`/`L`/`Z`; see
+    /// `QuietVectorOutline`.
+    static let outlineData = """
+        M6.78 0 L 6.3 0.11 5.58 1.11 5.62 1.63 5.85 2.48 6.52 3.53 7.93 5.97 9.24 8.48
+        9.41 8.73 9.41 8.82 9.24 8.93 3.57 4.6 2.52 4.48 1.87 5.2 2 6.21 2.37 6.7 3.07 7.15
+        4.33 8.09 9.32 11.39 9.56 11.62 9.52 11.77 8.98 11.78 6.73 11.5 2.81 11.28
+        0.55 11.09 0.05 11.41 0.01 11.77 0.52 12.48 1.04 12.59 5.62 12.84 9.43 12.95
+        9.52 13.1 9.43 13.34 4.74 15.95 2.84 17.26 2.58 17.53 2.52 18.24 2.99 18.71
+        4.12 18.58 10.46 14.45 10.56 14.47 10.57 14.58 9.6 15.69 8.19 17.56 5.77 20.64
+        5.39 21.19 5.32 21.86 6.05 22.22 6.43 22.07 8.17 20.23 11.77 15.27 11.92 15.27
+        11.94 15.37 11.74 16.18 11.49 17.88 10.8 21.34 10.46 22.84 10.78 23.51 11.38 24
+        12.09 23.72 12.41 23.36 13.11 16.1 13.22 16.01 14.36 17.98 15.83 20.17 17.22 22.07
+        17.85 22.2 18.47 21.95 18.62 21.65 18.51 20.55 15.73 16.4 15.73 16.19 15.88 16.21
+        18.64 18.56 20.84 20.23 21.18 20.28 21.48 19.83 21.36 19.23 16.97 15.24 15.72 14
+        15.75 13.9 15.92 13.9 22.66 15.52 23.92 14.9 23.99 14.43 23.56 13.81 22.75 13.3
+        19.75 13.06 17.89 13.06 15.98 12.89 15.83 12.82 15.92 12.74 19.34 11.95 21.66 11.48
+        23.58 11.01 23.92 10.21 23.82 9.81 23 9.44 19.66 10 16.78 10.64 16.58 10.64
+        16.5 10.55 17.27 9.14 18.55 7.43 20.48 4.99 20.82 3.81 20.09 2.7 19.06 2.68
+        18.57 3.06 17.55 4.09 16.9 4.86 15.23 6.94 14.29 8.2 14.03 8.48 13.82 8.48
+        14.16 6.47 14.8 3.58 15.11 1.29 14.65 0.62 14.03 0.36 13.29 0.86 12.92 1.78
+        12.64 5.09 12.38 7.24 12.26 9.14 12.09 9.16 11.77 8.11 9.71 4.15 8.12 0.49 7.7 0.13
+        Z
+        """
+
+    /// Read once. `[QuietOutlineSegment]` is `Sendable`; a `Path` is not, which
+    /// is why the cache holds segments rather than the built path.
+    static let outline: [QuietOutlineSegment] = QuietVectorOutline.segments(outlineData)
+
+    /// How much of the 16pt slot the filled burst spans.
+    ///
+    /// Chosen for optical mass, exactly as `QuietOpenAIKnot.span` was. Measured
+    /// by rendering each mark into the slot at 8× and summing alpha: the SF
+    /// `terminal` glyph at the shared 12.5pt size inks 0.208 of the slot,
+    /// `arrow.up.arrow.down` 0.162, the filled knot 0.308 at its own span, and
+    /// this burst 0.395 at full span — a filled asterisk is a much heavier
+    /// object than the twelve hairlines it replaces, so left alone it would have
+    /// made Claude's row the loudest thing in the rail. 14.2/16 is where it
+    /// inks **0.311**, between the knot's 0.308 and the 0.314 the old stroked
+    /// burst carried: the rail's weight does not change, only its drawing.
+    static let span: CGFloat = 14.2 / 16
+
+    static func path(in rect: CGRect) -> Path {
+        QuietVectorOutline.path(outline, in: rect, span: span)
+    }
+}
+
+private struct QuietClaudeBurstMark: Shape {
+    func path(in rect: CGRect) -> Path { QuietClaudeBurst.path(in: rect) }
 }
 
 /// The OpenAI/ChatGPT knot — the **official outline**, not a reconstruction.

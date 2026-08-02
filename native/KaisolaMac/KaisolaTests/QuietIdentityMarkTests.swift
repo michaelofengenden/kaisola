@@ -2,6 +2,43 @@ import SwiftUI
 import XCTest
 @testable import Kaisola
 
+/// How much of the identity slot a drawn mark actually inks.
+///
+/// The rail's "both first-class agent marks weigh the same" rule used to live in
+/// a comment quoting numbers somebody measured once offline. It is cheap to
+/// measure in-process instead: rasterize the mark's own `Path` into the 16pt
+/// slot at 8× with CoreGraphics, fill it non-zero, and average the coverage.
+/// Deterministic — no display, no appearance, no SF Symbol.
+enum QuietIdentityMarkInk {
+    static func fraction(
+        slot: CGFloat = QuietIdentityMarkView.slot,
+        scale: CGFloat = 8,
+        of path: (CGRect) -> Path
+    ) -> Double {
+        let side = Int(slot * scale)
+        guard let context = CGContext(
+            data: nil,
+            width: side,
+            height: side,
+            bitsPerComponent: 8,
+            bytesPerRow: side,
+            space: CGColorSpaceCreateDeviceGray(),
+            bitmapInfo: CGImageAlphaInfo.none.rawValue
+        ) else { return .nan }
+        let rect = CGRect(x: 0, y: 0, width: CGFloat(side), height: CGFloat(side))
+        context.setFillColor(gray: 0, alpha: 1)
+        context.fill(rect)
+        context.setFillColor(gray: 1, alpha: 1)
+        context.addPath(path(rect).cgPath)
+        context.fillPath(using: .winding)
+        guard let data = context.data else { return .nan }
+        let pixels = data.assumingMemoryBound(to: UInt8.self)
+        var total = 0.0
+        for index in 0 ..< side * side { total += Double(pixels[index]) / 255 }
+        return total / Double(side * side)
+    }
+}
+
 /// The rail's three pure derivations: who a row belongs to (`QuietIdentity`),
 /// what a row is called when its title carries no information
 /// (`QuietRailTitle`), and where a compact-list drag lands in the persisted
@@ -11,7 +48,7 @@ final class QuietIdentityMarkTests: XCTestCase {
 
     // MARK: - Identity mapping
 
-    func testClaudeAgentsMapToTheStarburst() {
+    func testClaudeAgentsMapToTheCoralBurst() {
         XCTAssertEqual(QuietIdentity.identity(agentName: "Claude Code", processName: nil), .claude)
         XCTAssertEqual(QuietIdentity.identity(agentName: "claude", processName: "node"), .claude)
         XCTAssertEqual(QuietIdentity.identity(agentName: "CLAUDE", processName: nil), .claude)
@@ -129,11 +166,17 @@ final class QuietIdentityMarkTests: XCTestCase {
             "the letter mark drifted out of the row's optical size"
         )
 
-        // …and the DRAWN marks land on the same optical circle. The starburst
-        // spans 2 × outerRadius in the 24-unit viewbox.
-        let starburstDiameter = 2 * 9.6 * (slot / 24)
+        // …and the DRAWN marks land on the same optical circle as each other
+        // first, and near the glyphs second. Both are traced silhouettes placed
+        // by `span`, so this is one comparison rather than two constructions.
         XCTAssertEqual(
-            starburstDiameter,
+            QuietClaudeBurst.span,
+            QuietOpenAIKnot.span,
+            accuracy: 0.05,
+            "the two drawn marks stopped spanning the slot alike"
+        )
+        XCTAssertEqual(
+            QuietClaudeBurst.span * slot,
             QuietIdentityMarkView.symbolSize,
             accuracy: 2,
             "the coral mark no longer matches the glyph marks beside it"
@@ -145,22 +188,229 @@ final class QuietIdentityMarkTests: XCTestCase {
     /// grammar, and without a tile to hide behind it is the only thing keeping
     /// the rail from reading as one bold mark beside four thin ones.
     ///
-    /// The knot is filled now, so a stroke width cannot express this; ink can.
+    /// Both are filled now, so no stroke width can express this; ink can.
     /// Measured by rendering each mark into the 16pt slot at 8× and summing
-    /// alpha: `terminal` 0.208, `arrow.up.arrow.down` 0.162, the coral starburst
-    /// 0.314, and the filled knot 0.376 at full span — which is why the knot is
-    /// inset to `span` (0.308 there, level with the starburst).
-    func testTheTwoAgentMarksAreInkedAlikeAndTheKnotIsInsetToGetThere() {
-        let starburstStroke = (QuietIdentityMarkView.slot / 24) * QuietIdentityMarkView.starburstStroke
-        // Monoline: a hairline, not a rule.
-        XCTAssertGreaterThan(starburstStroke, 0.9)
-        XCTAssertLessThan(starburstStroke, 1.8)
+    /// alpha: `terminal` 0.208, `arrow.up.arrow.down` 0.162, the filled knot
+    /// 0.376 at full span and the traced coral burst 0.395 at full span — which
+    /// is why each is inset to its own `span`, where they land on 0.308 and
+    /// 0.311. The inks are *measured* here rather than restated, because both
+    /// spans are otherwise just two constants nothing checks.
+    func testTheTwoAgentMarksAreInkedAlikeAndBothAreInsetToGetThere() {
+        let burst = QuietIdentityMarkInk.fraction { QuietClaudeBurst.path(in: $0) }
+        let knot = QuietIdentityMarkInk.fraction { QuietOpenAIKnot.path(in: $0) }
 
-        // The knot gives up one and a half points of the slot. Less and it
-        // out-inks the burst; much more and it stops reading at rail size.
+        // Level with each other: that is the grammar, not a coincidence of two
+        // hand-picked spans.
+        XCTAssertEqual(
+            burst, knot, accuracy: 0.015,
+            "the agent marks stopped weighing the same: burst \(burst), knot \(knot)"
+        )
+
+        // …and a deliberate step above the generic `.secondary` glyphs, whose
+        // measured inks are 0.208 and 0.162, without becoming badges.
+        for ink in [burst, knot] {
+            XCTAssertGreaterThan(ink, 0.24, "an agent mark receded to a generic surface's weight")
+            XCTAssertLessThan(ink, 0.36, "an agent mark is inking like a filled tile")
+        }
+
+        // The pinned numbers, so a future edit that deforms the geometry but
+        // keeps the spans still fails.
+        XCTAssertEqual(burst, 0.311, accuracy: 0.012)
+        XCTAssertEqual(knot, 0.308, accuracy: 0.012)
+
+        // Each gives up a point or so of the slot. Less and it out-inks its
+        // neighbour; much more and it stops reading at rail size.
         XCTAssertEqual(Double(QuietOpenAIKnot.span), 14.5 / 16, accuracy: 0.0001)
-        XCTAssertLessThan(QuietOpenAIKnot.span, 1)
-        XCTAssertGreaterThan(QuietOpenAIKnot.span, 0.85)
+        XCTAssertEqual(Double(QuietClaudeBurst.span), 14.2 / 16, accuracy: 0.0001)
+        for span in [QuietOpenAIKnot.span, QuietClaudeBurst.span] {
+            XCTAssertLessThan(span, 1)
+            XCTAssertGreaterThan(span, 0.85)
+        }
+    }
+
+    // MARK: - Claude burst geometry
+
+    /// The outline is the official mark's silhouette, traced — one closed
+    /// subpath of 129 straight segments — not twelve strokes on an even pitch.
+    /// The counts are asserted because the reader is what turns the trace into
+    /// geometry, and a reader that dropped commands would still draw a blob.
+    func testClaudeBurstOutlineIsTheTracedOfficialSilhouette() {
+        var moves = 0, lines = 0, curves = 0, closes = 0
+        for segment in QuietClaudeBurst.outline {
+            switch segment {
+            case .move: moves += 1
+            case .line: lines += 1
+            case .curve: curves += 1
+            case .close: closes += 1
+            }
+        }
+        XCTAssertEqual(moves, 1, "the burst is one closed contour — it has no counters")
+        XCTAssertEqual(closes, 1)
+        XCTAssertEqual(lines, 129)
+        XCTAssertEqual(curves, 0, "the mark's edges are straight; a cubic here is invented smoothness")
+
+        // The trace is normalized to the viewbox: every point inside it, and the
+        // tight bounds reaching both ends of it.
+        let points = QuietClaudeBurst.outline.compactMap { segment -> CGPoint? in
+            switch segment {
+            case let .move(point), let .line(point): point
+            default: nil
+            }
+        }
+        XCTAssertEqual(points.count, 130)
+        let xs = points.map(\.x), ys = points.map(\.y)
+        XCTAssertGreaterThan(xs.min() ?? -99, -0.5)
+        XCTAssertGreaterThan(ys.min() ?? -99, -0.5)
+        XCTAssertLessThan(xs.max() ?? 99, 24.5)
+        XCTAssertLessThan(ys.max() ?? 99, 24.5)
+        XCTAssertGreaterThan(xs.max() ?? 0, 23.5)
+        XCTAssertGreaterThan(ys.max() ?? 0, 23.5)
+
+        // Shape invariant that no rasterizer can drift: the enclosed area of the
+        // traced polygon, by the shoelace formula, in viewbox units. Signed, so
+        // a reversed winding is caught too.
+        var signed: CGFloat = 0
+        for index in points.indices {
+            let a = points[index], b = points[(index + 1) % points.count]
+            signed += a.x * b.y - a.y * b.x
+        }
+        XCTAssertEqual(Double(signed / 2), -227.38, accuracy: 0.5, "the traced outline changed shape")
+    }
+
+    /// The complaint this release is FOR: "we should fix the claude symbol to be
+    /// more precise." The old mark was twelve *uniform* strokes on an even 30°
+    /// pitch; the real one is twelve **tapered petals of unequal length** at
+    /// irregular angles around a solid hub. Those three properties are what the
+    /// eye reads as this logo rather than as a generic sparkle, so they are
+    /// measured off the shipped geometry rather than restated in a comment.
+    func testTheBurstHasTwelveUnequalPetalsAroundASolidHub() {
+        let points = QuietClaudeBurst.outline.compactMap { segment -> CGPoint? in
+            switch segment {
+            case let .move(point), let .line(point): point
+            default: nil
+            }
+        }
+        let centre = CGPoint(x: 12, y: 12)
+        func radius(_ point: CGPoint) -> CGFloat { hypot(point.x - centre.x, point.y - centre.y) }
+
+        // Petal tips: vertices that are local maxima of radius around the ring.
+        var tips: [CGPoint] = []
+        for index in points.indices {
+            let previous = points[(index + points.count - 1) % points.count]
+            let next = points[(index + 1) % points.count]
+            let here = radius(points[index])
+            if here > 8, here >= radius(previous), here >= radius(next) {
+                if let last = tips.last, radius(last) >= here, hypot(last.x - points[index].x, last.y - points[index].y) < 2 {
+                    continue
+                }
+                tips.append(points[index])
+            }
+        }
+        XCTAssertEqual(tips.count, 12, "the mark stopped having twelve petals")
+
+        // Unequal LENGTH. Even spokes would put every tip on one circle.
+        let radii = tips.map(radius).sorted()
+        XCTAssertGreaterThan(
+            (radii.last ?? 0) - (radii.first ?? 0), 1.0,
+            "every petal reaches the same radius — that is the spoke burst again"
+        )
+
+        // Unequal ANGLE. Even spokes would sit on an exact 30° pitch.
+        let angles = tips.map { atan2($0.y - centre.y, $0.x - centre.x) * 180 / .pi }.sorted()
+        let gaps = angles.indices.map { index -> Double in
+            let next = angles[(index + 1) % angles.count]
+            return Double((next - angles[index] + 360).truncatingRemainder(dividingBy: 360))
+        }
+        XCTAssertGreaterThan(
+            (gaps.max() ?? 0) - (gaps.min() ?? 0), 10,
+            "the petals are back on an even pitch"
+        )
+
+        // A SOLID hub, not a hole the strokes radiate from: the centre is inked,
+        // and stays inked well out from it.
+        //
+        // Asked of the CGPath with the winding rule rather than of
+        // `Path.contains`, and the difference is not pedantry: SwiftUI's
+        // containment test ray-casts horizontally and answers `false` for the
+        // interior point (12, 10) of this outline, because the ray leaves
+        // through the vertex that sits at exactly `19.66 10`. `.winding` is also
+        // the rule `QuietIdentityMarkView` fills the burst with, so this asserts
+        // the hub is solid in precisely the sense the view draws it.
+        let rect = CGRect(x: 0, y: 0, width: 240, height: 240)
+        let filled = QuietClaudeBurst.path(in: rect).cgPath
+        let unit = rect.width * QuietClaudeBurst.span / 24
+        for step in 0 ..< 24 {
+            let angle = CGFloat(step) * .pi / 12
+            for reach in [CGFloat(0), 1, 2] {
+                let probe = CGPoint(
+                    x: rect.midX + cos(angle) * reach * unit,
+                    y: rect.midY + sin(angle) * reach * unit
+                )
+                XCTAssertTrue(
+                    filled.contains(probe, using: .winding),
+                    "the hub is hollow \(reach) units out at \(angle) rad"
+                )
+            }
+        }
+    }
+
+    /// The negative control the petal test needs: the mark must NOT map onto
+    /// itself under a 30° turn. On this exact sampling grid the twelve even
+    /// spokes it replaced score **0.000** — they are perfectly 12-fold
+    /// symmetric — and this outline scores **0.274**. That pair of numbers is
+    /// the whole change in one measurement.
+    func testTheBurstIsNotTheEvenTwelveFoldSparkleItReplaced() {
+        let rect = CGRect(x: 0, y: 0, width: 96, height: 96)
+        let path = QuietClaudeBurst.path(in: rect).cgPath
+        let centre = CGPoint(x: rect.midX, y: rect.midY)
+
+        func disagreement(turnedBy degrees: Double) -> Double {
+            let angle = degrees * .pi / 180
+            var checked = 0.0, mismatched = 0.0
+            for x in stride(from: 3.0, to: 96, by: 1.5) {
+                for y in stride(from: 3.0, to: 96, by: 1.5) {
+                    let dx = x - centre.x, dy = y - centre.y
+                    guard hypot(dx, dy) < 44 else { continue }
+                    let here = CGPoint(x: x, y: y)
+                    let turned = CGPoint(
+                        x: centre.x + dx * cos(angle) - dy * sin(angle),
+                        y: centre.y + dx * sin(angle) + dy * cos(angle)
+                    )
+                    checked += 1
+                    if path.contains(here, using: .winding) != path.contains(turned, using: .winding) {
+                        mismatched += 1
+                    }
+                }
+            }
+            return checked == 0 ? 0 : mismatched / checked
+        }
+
+        XCTAssertGreaterThan(
+            disagreement(turnedBy: 30), 0.15,
+            "a mark this symmetric under 30° is the uniform sparkle, not Anthropic's asterisk"
+        )
+    }
+
+    /// Same contract the knot is held to: inside the 16pt slot, centred in it,
+    /// still filling it, and scaling.
+    func testClaudeBurstFitsItsSlotAndStaysCentred() {
+        let slot = QuietIdentityMarkView.slot
+        let rect = CGRect(x: 0, y: 0, width: slot, height: slot)
+        let bounds = QuietClaudeBurst.path(in: rect).boundingRect
+
+        XCTAssertEqual(bounds.midX, rect.midX, accuracy: 0.02, "the burst is off-centre horizontally")
+        XCTAssertEqual(bounds.midY, rect.midY, accuracy: 0.02, "the burst is off-centre vertically")
+        XCTAssertTrue(rect.contains(bounds), "the burst overflows its \(slot)pt slot: \(bounds)")
+
+        XCTAssertGreaterThan(bounds.width / slot, 0.85)
+        XCTAssertGreaterThan(bounds.height / slot, 0.85)
+        // Square to within the artwork's own tolerance: the reference's tight
+        // bounds are 1278 × 1279, and a uniform scale has to keep that.
+        XCTAssertEqual(bounds.width, bounds.height, accuracy: 0.05)
+
+        let doubled = QuietClaudeBurst.path(in: CGRect(x: 0, y: 0, width: 2 * slot, height: 2 * slot))
+            .boundingRect
+        XCTAssertEqual(doubled.width, bounds.width * 2, accuracy: 0.01)
     }
 
     // MARK: - OpenAI knot geometry

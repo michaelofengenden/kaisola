@@ -227,7 +227,10 @@ struct FilePreviewView: View {
                 reportOversizedDraft()
                 return
             }
-            if !isEditingText { refreshHighlight() }
+            // Markdown never renders the highlighted source, so re-highlighting
+            // the whole file on every keystroke was pure cost — and on a long
+            // document it was cost paid while the user was typing into it.
+            if !isEditingText, !isMarkdownContent { refreshHighlight() }
             scheduleOutlineRefresh()
             if draft == savedText, !recoveredDraftPending, let loadedURL {
                 clearRecoveryTokens(for: loadedURL)
@@ -780,13 +783,12 @@ struct FilePreviewView: View {
             if showMarkdownSource {
                 editor
             } else {
-                // Keep the structurally rendered document as the default.
-                // Hiding Markdown delimiters inside NSTextView left their
-                // newline/indent geometry behind, which produced the enormous
-                // gaps and clipped lists seen in narrow panes. Editing remains
-                // source-faithful: the pencil or a double-click enters the raw
-                // Markdown editor, so tables, task lists and relative images
-                // are never round-tripped through a lossy rich-text serializer.
+                // One continuous document rather than a rendered stack whose
+                // blocks were swapped for an editor one at a time. Editing is
+                // source-faithful for a stronger reason than before: the text
+                // view holds the file's exact Markdown, so there is no
+                // structural write-back path that could round-trip a table,
+                // task list, or relative image through a lossy serializer.
                 MarkdownDocumentView(
                     source: $draft,
                     documentURL: loadedURL ?? url,
@@ -794,11 +796,15 @@ struct FilePreviewView: View {
                     imageRevision: workspaceWatcher.changeToken,
                     zoom: $documentZoom,
                     onError: { previewNotice = .error($0) },
-                    automaticallyEditFirstBlock: ProcessInfo.processInfo.environment["KAISOLA_NATIVE_VISUAL_FIXTURE"] == "1"
-                        && (ProcessInfo.processInfo.environment["KAISOLA_NATIVE_VISUAL_SURFACE"] == "preview-edit"
-                            || ProcessInfo.processInfo.environment["KAISOLA_NATIVE_VISUAL_SURFACE"] == "preview-dirty-tab"),
-                    automaticallyEditFirstTableCell: ProcessInfo.processInfo.environment["KAISOLA_NATIVE_VISUAL_FIXTURE"] == "1"
-                        && ProcessInfo.processInfo.environment["KAISOLA_NATIVE_VISUAL_SURFACE"] == "preview-table-edit"
+                    scrollMemory: textScrollMemory,
+                    targetLine: outlineTargetLine ?? targetLine,
+                    navigationRevision: outlineNavigationRevision,
+                    automaticallyFocus: ProcessInfo.processInfo.environment["KAISOLA_NATIVE_VISUAL_FIXTURE"] == "1"
+                        && [
+                            "preview-edit",
+                            "preview-dirty-tab",
+                            "preview-table-edit",
+                        ].contains(ProcessInfo.processInfo.environment["KAISOLA_NATIVE_VISUAL_SURFACE"] ?? "")
                 )
             }
         case .image:

@@ -2000,6 +2000,171 @@ final class WorkspaceFilesTests: XCTestCase {
         XCTAssertNil(memory.fraction(for: "/tmp/file1.swift"))
     }
 
+    // MARK: - Continuous Markdown editing
+
+    /// The jump this surface exists to remove. Save, autosave, the recovery
+    /// journal, and external reconciliation of identical bytes all re-run the
+    /// SwiftUI body with the string the text view already holds; swapping the
+    /// storage there collapses layout and throws the viewport to line 1.
+    func testLiveMarkdownEditorNeverReplacesStorageForIdenticalText() {
+        let source = "# Title\n\nA long document body.\n"
+
+        XCTAssertEqual(
+            MarkdownEditorTextSync.plan(
+                current: source,
+                incoming: source,
+                selection: NSRange(location: 12, length: 4)
+            ),
+            .unchanged
+        )
+    }
+
+    func testLiveMarkdownEditorClampsSelectionWhenExternalTextShrinks() {
+        let plan = MarkdownEditorTextSync.plan(
+            current: "# Title\n\nA long body that was truncated on disk.\n",
+            incoming: "# Title\n",
+            selection: NSRange(location: 40, length: 6)
+        )
+
+        XCTAssertEqual(plan, .replace(selection: NSRange(location: 8, length: 0)))
+    }
+
+    func testLiveMarkdownScrollRetentionKeepsPixelsWhenHeightBarelyMoves() {
+        // Typing a character grows the document by a hair; the viewport must
+        // not move at all.
+        XCTAssertEqual(
+            MarkdownEditorScrollRetention.restoredOrigin(
+                previousOrigin: 4_200,
+                previousContentHeight: 20_000,
+                newContentHeight: 20_019,
+                viewportHeight: 800
+            ),
+            4_200,
+            accuracy: 0.0001
+        )
+    }
+
+    func testLiveMarkdownScrollRetentionKeepsProportionAcrossRealReflows() {
+        // An external reload or a zoom step changes the height materially, so
+        // the old pixel offset no longer points at the same text.
+        XCTAssertEqual(
+            MarkdownEditorScrollRetention.restoredOrigin(
+                previousOrigin: 9_600,
+                previousContentHeight: 20_000,
+                newContentHeight: 10_000,
+                viewportHeight: 800
+            ),
+            4_600,
+            accuracy: 0.5
+        )
+        XCTAssertEqual(
+            MarkdownEditorScrollRetention.restoredOrigin(
+                previousOrigin: 500,
+                previousContentHeight: 20_000,
+                newContentHeight: 400,
+                viewportHeight: 800
+            ),
+            0,
+            accuracy: 0.0001
+        )
+    }
+
+    func testLiveMarkdownStylingWindowStaysBoundedAndReusesItsMargin() {
+        let window = MarkdownStylingWindow.characterRange(
+            visible: NSRange(location: 50_000, length: 2_000),
+            documentLength: 200_000,
+            expansion: 8_000
+        )
+        XCTAssertEqual(window, NSRange(location: 42_000, length: 18_000))
+
+        // Scrolling inside the styled margin must not repeat the work.
+        XCTAssertFalse(
+            MarkdownStylingWindow.needsRestyle(
+                applied: window,
+                visible: NSRange(location: 52_000, length: 2_000),
+                expansion: 8_000
+            )
+        )
+        XCTAssertTrue(
+            MarkdownStylingWindow.needsRestyle(
+                applied: window,
+                visible: NSRange(location: 58_000, length: 2_000),
+                expansion: 8_000
+            )
+        )
+        XCTAssertTrue(
+            MarkdownStylingWindow.needsRestyle(
+                applied: nil,
+                visible: NSRange(location: 0, length: 2_000),
+                expansion: 8_000
+            )
+        )
+
+        // Clamped to the document at both ends.
+        XCTAssertEqual(
+            MarkdownStylingWindow.characterRange(
+                visible: NSRange(location: 100, length: 400),
+                documentLength: 900,
+                expansion: 8_000
+            ),
+            NSRange(location: 0, length: 900)
+        )
+    }
+
+    /// Inline images are drawn from these ranges, so a wrong range would paint
+    /// a picture over live prose.
+    func testLiveMarkdownFindsWholeLineImagesAndLeavesProseLinesAlone() throws {
+        let source = """
+        # Notes
+
+        ![screenshot](assets/backlog/shot.png)
+
+        See ![inline](a.png) in this sentence.
+
+          <img src="assets/logo.png" width="120" height="40" alt="Logo">
+
+        ![one](a.png) ![two](b.png)
+
+        [not an image](page.md)
+        """
+        let nsSource = source as NSString
+        let lines = MarkdownInlineImages.lines(in: source)
+
+        XCTAssertEqual(lines.count, 3, "prose-with-image and plain links must not render")
+        XCTAssertEqual(
+            nsSource.substring(with: lines[0].references[0].range),
+            "![screenshot](assets/backlog/shot.png)"
+        )
+        XCTAssertEqual(lines[0].references[0].source, "assets/backlog/shot.png")
+        XCTAssertEqual(lines[0].references[0].alt, "screenshot")
+
+        let html = lines[1].references[0]
+        XCTAssertEqual(html.source, "assets/logo.png")
+        XCTAssertEqual(html.declaredWidth, 120)
+        XCTAssertEqual(html.declaredHeight, 40)
+        XCTAssertEqual(html.alt, "Logo")
+
+        XCTAssertEqual(lines[2].references.map(\.source), ["a.png", "b.png"])
+        for line in lines {
+            for reference in line.references {
+                XCTAssertLessThanOrEqual(NSMaxRange(reference.range), nsSource.length)
+            }
+        }
+    }
+
+    func testLiveMarkdownImageScanStaysWithinInteractionBudgetOnALongDocument() {
+        let source = (0..<4_000).map { index in
+            "## Section \(index)\n\nProse \(index) with no pictures at all.\n"
+        }.joined()
+
+        let startedAt = CFAbsoluteTimeGetCurrent()
+        let lines = MarkdownInlineImages.lines(in: source)
+        let elapsed = CFAbsoluteTimeGetCurrent() - startedAt
+
+        XCTAssertTrue(lines.isEmpty)
+        XCTAssertLessThan(elapsed, 0.5, "Image scan took \(elapsed)s")
+    }
+
     func testLargeMarkdownStructuralProjectionStaysWithinInteractionBudget() {
         let sectionCount = 1_600
         let source = (0..<sectionCount).map { index in

@@ -97,11 +97,10 @@ struct QuietIdentityMarkView: View {
                         style: StrokeStyle(lineWidth: unit * QuietIdentityMarkView.starburstStroke, lineCap: .round)
                     )
             case .openai:
+                // Filled, non-zero: the official mark's white gaps are counters
+                // in its own outline, not a stroke around a skeleton.
                 QuietOpenAIKnotMark()
-                    .stroke(
-                        Color(light: 0x202123, dark: 0xF2F2F2),
-                        style: StrokeStyle(lineWidth: QuietOpenAIKnot.strokeWidth(unit: unit))
-                    )
+                    .fill(Color(light: 0x202123, dark: 0xF2F2F2), style: FillStyle(eoFill: false))
             case .shell:
                 // The reference's Terminal mark: a rounded window outline with
                 // a prompt inside it, no fill. SF's own `terminal` is that
@@ -121,9 +120,11 @@ struct QuietIdentityMarkView: View {
     }
 
     /// Stroke weight of the Claude starburst in viewbox units. Sits where it
-    /// does so the coral rays, the knot's outline and an SF Symbol at
-    /// `.regular` all land within a few tenths of a point of each other — the
-    /// "monoline weight matched across marks" rule the reference sets.
+    /// does so the coral rays and an SF Symbol at `.regular` land within a few
+    /// tenths of a point of each other, and so the burst's *ink* (0.314 of the
+    /// slot, measured at 8× supersample) matches the filled knot's at
+    /// `QuietOpenAIKnot.span` — the two first-class agent marks have to weigh
+    /// the same as each other, whatever pen each is drawn with.
     nonisolated static let starburstStroke: CGFloat = 2.0
 
     private var unit: CGFloat { size / 24 }
@@ -165,82 +166,155 @@ private struct QuietStarburstMark: Shape {
     }
 }
 
-/// The OpenAI/Codex knot, as geometry rather than as a picture.
-///
-/// The logo is six identical elongated loops arranged with six-fold rotational
-/// symmetry, overlapping into a hexagonal knot. This reproduces that
-/// construction: one stadium (a rounded rect whose corner radius is half its
-/// width), placed with its centre on an orbit around the mark's centre and its
-/// long axis nearly tangential, then repeated every 60°.
-///
-/// Two numbers carry the whole likeness, and both were picked by rendering the
-/// mark at its shipping size rather than by eye at poster size:
-///
-/// * `lengthRatio` — each strand is longer than the arc it spans, so
-///   consecutive strands cross rather than meet. Purely tangential strands of
-///   exactly the right length draw a plain hexagonal ring with beads at the
-///   vertices; it is the *overlap* that reads as a knot.
-/// * `skew` — the strands lean off tangential, which is what gives the mark its
-///   chirality. At 0° it is a symmetric ring and reads as a generic hexagon; far
-///   past 14° the strands cross so much the interior fills in and at 16pt the
-///   mark turns to mud. 14° is the point where the six lobes and the hexagonal
-///   void in the middle both survive a 16pt rasterization.
-///
-/// Everything is expressed in the shared 24-unit viewbox, so the same geometry
-/// serves any slot size.
-enum QuietOpenAIKnot {
-    static let strandCount = 6
-    /// Distance from the mark's centre to each strand's centre.
-    static let orbit: CGFloat = 5.7
-    /// Strand length as a multiple of `orbit`. Above ~1.16 the strands overlap.
-    static let lengthRatio: CGFloat = 1.70
-    /// Strand length ÷ strand width.
-    static let aspect: CGFloat = 2.6
-    /// Outline weight as a fraction of strand width.
-    static let strokeRatio: CGFloat = 0.48
-    /// How far each strand's long axis is turned off tangential.
-    static let skew = Angle(degrees: 14)
+/// One straight-line/cubic segment of a vector outline, in the shared 24-unit
+/// viewbox. `Sendable`, so a transcribed outline can be a `static let` under
+/// Swift 6 strict concurrency (a `Path` cannot).
+enum QuietOutlineSegment: Equatable, Sendable {
+    case move(CGPoint)
+    case line(CGPoint)
+    case curve(to: CGPoint, control1: CGPoint, control2: CGPoint)
+    case close
+}
 
-    static func unit(in rect: CGRect) -> CGFloat { min(rect.width, rect.height) / 24 }
-    static func strandLength(unit: CGFloat) -> CGFloat { lengthRatio * orbit * unit }
-    static func strandWidth(unit: CGFloat) -> CGFloat { strandLength(unit: unit) / aspect }
-    static func strokeWidth(unit: CGFloat) -> CGFloat { strandWidth(unit: unit) * strokeRatio }
-
-    /// Where each strand sits. Pure, so the mark's symmetry is testable without
-    /// rasterizing anything.
-    static func strandCenters(in rect: CGRect) -> [CGPoint] {
-        let radius = orbit * unit(in: rect)
-        return (0..<strandCount).map { index in
-            let angle = (2 * .pi / CGFloat(strandCount)) * CGFloat(index)
-            return CGPoint(x: rect.midX + cos(angle) * radius, y: rect.midY + sin(angle) * radius)
+/// A four-command reader for transcribed outlines: absolute `M`, `L`, `C`, `Z`.
+///
+/// Deliberately *not* an SVG path parser. Arcs, relative commands, and implicit
+/// repeats are normalized away offline (see `QuietOpenAIKnot.outlineData`), so
+/// the shipped reader has four cases and no elliptical-arc conversion in it.
+enum QuietVectorOutline {
+    /// Numbers each command consumes. A command that repeats its numbers —
+    /// `L a b c d` — emits one segment per group, the way path data does.
+    private static func arity(_ command: Character) -> Int? {
+        switch command {
+        case "M", "L": 2
+        case "C": 6
+        default: nil
         }
     }
 
-    /// The whole mark's outline. Lives on the geometry rather than inside the
-    /// `Shape` so the knot's bounds and symmetry can be asserted directly.
-    static func path(in rect: CGRect) -> Path {
-        let unit = unit(in: rect)
-        let length = strandLength(unit: unit)
-        let width = strandWidth(unit: unit)
-        // Built at the origin once and transformed into place: six copies of
-        // ONE shape is the logo's actual construction, and building it that way
-        // makes the six-fold symmetry structural rather than arithmetic that
-        // could drift.
-        let strand = Path(
-            roundedRect: CGRect(x: -length / 2, y: -width / 2, width: length, height: width),
-            cornerRadius: width / 2,
-            style: .circular
-        )
+    static func segments(_ data: String) -> [QuietOutlineSegment] {
+        var segments: [QuietOutlineSegment] = []
+        var command: Character = "Z"
+        var numbers: [CGFloat] = []
+
+        func drain() {
+            guard let arity = arity(command) else { return }
+            while numbers.count >= arity {
+                let group = Array(numbers.prefix(arity))
+                numbers.removeFirst(arity)
+                let point = { (index: Int) in CGPoint(x: group[index], y: group[index + 1]) }
+                switch command {
+                case "M": segments.append(.move(point(0)))
+                case "L": segments.append(.line(point(0)))
+                default: segments.append(.curve(to: point(4), control1: point(0), control2: point(2)))
+                }
+            }
+        }
+
+        for token in data.split(whereSeparator: \.isWhitespace) {
+            if let first = token.first, first.isLetter {
+                drain()
+                numbers = []
+                command = first
+                if first == "Z" { segments.append(.close) }
+                if let value = Double(token.dropFirst()) { numbers.append(CGFloat(value)) }
+            } else if let value = Double(token) {
+                numbers.append(CGFloat(value))
+            }
+            drain()
+        }
+        return segments
+    }
+
+    /// Place a 24-unit outline into `rect`, scaled uniformly and centred.
+    static func path(_ segments: [QuietOutlineSegment], in rect: CGRect, span: CGFloat) -> Path {
+        let side = min(rect.width, rect.height) * span
+        let scale = side / 24
+        let originX = rect.midX - side / 2
+        let originY = rect.midY - side / 2
+        func place(_ point: CGPoint) -> CGPoint {
+            CGPoint(x: originX + point.x * scale, y: originY + point.y * scale)
+        }
         var path = Path()
-        for (index, center) in strandCenters(in: rect).enumerated() {
-            let orbitAngle = (2 * .pi / CGFloat(strandCount)) * CGFloat(index)
-            let axis = orbitAngle + .pi / 2 - CGFloat(skew.radians)
-            path.addPath(
-                strand,
-                transform: CGAffineTransform(translationX: center.x, y: center.y).rotated(by: axis)
-            )
+        for segment in segments {
+            switch segment {
+            case let .move(point): path.move(to: place(point))
+            case let .line(point): path.addLine(to: place(point))
+            case let .curve(to, control1, control2):
+                path.addCurve(to: place(to), control1: place(control1), control2: place(control2))
+            case .close: path.closeSubpath()
+            }
         }
         return path
+    }
+}
+
+/// The OpenAI/ChatGPT knot — the **official outline**, not a reconstruction.
+///
+/// What it replaced, and why: v1.1.7–v1.1.9 drew six stroked stadiums on an
+/// orbit and hoped the overlaps would read as the weave. They do not. Measured
+/// against `assets/backlog/pasted-image.png` (the real mark, 1024²), both
+/// rasterized and cropped to their own ink box, that construction scores an
+/// intersection-over-union of **0.33** and covers 0.57 of its box against the
+/// reference's 0.38 — it is a heavier, blunter object that happens to be
+/// hexagonal. Michael's note — "please fix the codex icon to be the real
+/// chatgpt icon" — is that number.
+///
+/// Route: the official logomark's outline, transcribed, its elliptical arcs
+/// converted to cubics offline (a standard endpoint→centre parameterization,
+/// ≤90° per segment), then translated and uniformly scaled so its **tight**
+/// bounding box — `boundingBoxOfPath`, which is what SwiftUI's
+/// `Path.boundingRect` reports, not the control-point-inclusive one — is
+/// centred in the shared 24-unit viewbox. Result: 36 cubics, 32 lines, 8
+/// subpaths, **IoU 0.983** against the reference with ink coverage 0.381 vs
+/// 0.382. It is *filled* with the non-zero winding rule — the white gaps
+/// between the strands are the reference's own counters, not a stroke.
+enum QuietOpenAIKnot {
+    /// The transcribed outline, in the 24-unit viewbox. Absolute `M`/`L`/`C`/`Z`
+    /// only; see `QuietVectorOutline`.
+    static let outlineData = """
+        M22.282 9.821 C22.825 8.186 22.637 6.397 21.766 4.91 C20.457 2.632 17.826 1.46 15.256 2.01
+        C13.808 0.4 11.611 -0.317 9.492 0.131 C7.373 0.579 5.653 2.123 4.981 4.182 C3.293 4.528
+        1.836 5.585 0.983 7.082 C-0.34 9.357 -0.04 12.227 1.726 14.178 C1.181 15.812 1.367 17.602
+        2.237 19.089 C3.548 21.369 6.18 22.541 8.751 21.989 C9.895 23.277 11.538 24.01 13.26 24
+        C15.894 24.002 18.227 22.302 19.032 19.794 C20.719 19.447 22.176 18.391 23.029 16.894
+        C24.337 14.623 24.035 11.769 22.282 9.821 Z M13.26 22.429 C12.209 22.431 11.19 22.062 10.384
+        21.388 L10.525 21.308 L15.304 18.55 C15.546 18.408 15.695 18.149 15.696 17.868 L15.696
+        11.132 L17.716 12.3 C17.737 12.31 17.751 12.33 17.754 12.352 L17.754 17.935 C17.749 20.415
+        15.74 22.423 13.26 22.429 Z M3.599 18.304 C3.072 17.393 2.883 16.326 3.065 15.29 L3.207
+        15.375 L7.99 18.133 C8.231 18.275 8.529 18.275 8.77 18.133 L14.613 14.765 L14.613 17.097
+        C14.612 17.122 14.6 17.144 14.58 17.159 L9.74 19.95 C7.589 21.189 4.842 20.452 3.599 18.304
+        Z M2.341 7.896 C2.872 6.979 3.71 6.281 4.706 5.923 L4.706 11.6 C4.703 11.879 4.851 12.139
+        5.094 12.277 L10.909 15.631 L8.889 16.799 C8.866 16.811 8.84 16.811 8.818 16.799 L3.987
+        14.013 C1.841 12.769 1.105 10.023 2.341 7.872 Z M18.937 11.751 L13.104 8.364 L15.119 7.2
+        C15.141 7.188 15.168 7.188 15.19 7.2 L20.02 9.991 C21.528 10.861 22.398 12.523 22.253 14.258
+        C22.108 15.993 20.975 17.488 19.344 18.095 L19.344 12.418 C19.335 12.14 19.181 11.886 18.937
+        11.751 Z M20.948 8.728 L20.806 8.643 L16.032 5.861 C15.79 5.719 15.489 5.719 15.247 5.861
+        L9.409 9.23 L9.409 6.897 C9.406 6.873 9.417 6.85 9.437 6.836 L14.268 4.049 C15.779 3.179
+        17.657 3.26 19.088 4.258 C20.518 5.256 21.243 6.99 20.948 8.709 Z M8.307 12.863 L6.287
+        11.699 C6.266 11.687 6.252 11.666 6.249 11.643 L6.249 6.074 C6.251 4.33 7.261 2.745 8.84
+        2.006 C10.419 1.266 12.283 1.506 13.624 2.621 L13.482 2.701 L8.704 5.459 C8.462 5.601 8.313
+        5.86 8.311 6.14 Z M9.404 10.498 L12.006 8.998 L14.613 10.498 L14.613 13.497 L12.016 14.997
+        L9.409 13.497 Z
+        """
+
+    /// Read once. `[QuietOutlineSegment]` is `Sendable`; a `Path` is not, which
+    /// is why the cache holds segments rather than the built path.
+    static let outline: [QuietOutlineSegment] = QuietVectorOutline.segments(outlineData)
+
+    /// How much of the 16pt slot the filled knot spans.
+    ///
+    /// Not 1.0, and the reason is optical mass rather than fit. Measured by
+    /// rendering each mark into the slot at 8× and summing alpha: the SF
+    /// `terminal` glyph at the shared 12.5pt size inks 0.208 of the slot,
+    /// `arrow.up.arrow.down` 0.162, the coral starburst 0.314, and the filled
+    /// knot 0.376 at full span. The rail's grammar puts the two first-class
+    /// agents a step above the generic surfaces and level with *each other*;
+    /// 14.5/16 is where the knot lands on 0.308 and matches the burst.
+    static let span: CGFloat = 14.5 / 16
+
+    static func path(in rect: CGRect) -> Path {
+        QuietVectorOutline.path(outline, in: rect, span: span)
     }
 }
 

@@ -125,30 +125,23 @@ struct AcpModelChoice: Equatable, Sendable, Identifiable {
     let subtitle: String?
     let isFavorite: Bool
     let isCurrent: Bool
-    /// 1…9, the ⌘-digit that selects this row. Assigned over the *visible*
-    /// order so the digits stay dense as the query narrows the list.
-    let shortcut: Int?
 }
 
 enum AcpModelPicker {
-    static let maximumShortcuts = 9
-
-    /// Filter, order, and number the adapter's declared models.
+    /// Filter and order the adapter's declared models.
     ///
-    /// Ordering is deliberately stable rather than relevance-ranked: a ⌘-digit
-    /// that moves between keystrokes is worse than a perfect sort. Favourites
-    /// float to the top keeping their declared order among themselves, and
-    /// everything else follows in the order the adapter sent it.
+    /// Ordering is deliberately stable rather than relevance-ranked: a row that
+    /// moves between keystrokes is worse than a perfect sort. Favourites float
+    /// to the top keeping their declared order among themselves, and everything
+    /// else follows in the order the adapter sent it.
     static func choices(
         models: [AcpSessionInfo.Model],
         currentID: String?,
         favorites: Set<String>,
-        query: String,
-        favoritesOnly: Bool = false
+        query: String
     ) -> [AcpModelChoice] {
         let trimmedQuery = query.trimmingCharacters(in: .whitespacesAndNewlines)
         let matching = models.filter { model in
-            if favoritesOnly, !favorites.contains(model.id) { return false }
             guard !trimmedQuery.isEmpty else { return true }
             return FuzzyMatch.matches(query: trimmedQuery, candidate: model.name)
                 || FuzzyMatch.matches(query: trimmedQuery, candidate: model.id)
@@ -156,14 +149,13 @@ enum AcpModelPicker {
         let ordered = matching.filter { favorites.contains($0.id) }
             + matching.filter { !favorites.contains($0.id) }
 
-        return ordered.enumerated().map { index, model in
+        return ordered.map { model in
             AcpModelChoice(
                 id: model.id,
                 name: model.name,
                 subtitle: subtitle(id: model.id, name: model.name),
                 isFavorite: favorites.contains(model.id),
-                isCurrent: model.id == currentID,
-                shortcut: index < maximumShortcuts ? index + 1 : nil
+                isCurrent: model.id == currentID
             )
         }
     }

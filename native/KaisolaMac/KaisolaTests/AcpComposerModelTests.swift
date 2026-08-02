@@ -123,10 +123,9 @@ final class AcpComposerModelTests: XCTestCase {
         ]
     }
 
-    func testChoicesPreserveAdapterOrderAndNumberTheFirstNine() {
+    func testChoicesPreserveTheAdapterOrder() {
         let choices = AcpModelPicker.choices(models: models, currentID: "claude-sonnet-4-5", favorites: [], query: "")
         XCTAssertEqual(choices.map(\.name), ["Opus 4.5", "Sonnet 4.5", "Haiku 4.5"])
-        XCTAssertEqual(choices.map(\.shortcut), [1, 2, 3])
         XCTAssertEqual(choices.filter(\.isCurrent).map(\.id), ["claude-sonnet-4-5"])
     }
 
@@ -140,13 +139,11 @@ final class AcpComposerModelTests: XCTestCase {
         // Favourites keep the adapter's relative order among themselves.
         XCTAssertEqual(choices.map(\.name), ["Sonnet 4.5", "Haiku 4.5", "Opus 4.5"])
         XCTAssertEqual(choices.map(\.isFavorite), [true, true, false])
-        XCTAssertEqual(choices.map(\.shortcut), [1, 2, 3])
     }
 
-    func testQueryFiltersOnNameOrIdentifierAndRenumbers() {
+    func testQueryFiltersOnNameOrIdentifier() {
         let choices = AcpModelPicker.choices(models: models, currentID: nil, favorites: [], query: "haiku")
         XCTAssertEqual(choices.map(\.name), ["Haiku 4.5"])
-        XCTAssertEqual(choices.map(\.shortcut), [1])
     }
 
     func testQueryMatchesTheModelIdentifierToo() {
@@ -156,13 +153,6 @@ final class AcpComposerModelTests: XCTestCase {
 
     func testNonMatchingQueryYieldsNoRows() {
         XCTAssertTrue(AcpModelPicker.choices(models: models, currentID: nil, favorites: [], query: "zzz").isEmpty)
-    }
-
-    func testShortcutsStopAtNine() {
-        let many = (1...12).map { AcpSessionInfo.Model(id: "m\($0)", name: "Model \($0)") }
-        let choices = AcpModelPicker.choices(models: many, currentID: nil, favorites: [], query: "")
-        XCTAssertEqual(choices.prefix(9).compactMap(\.shortcut), Array(1...9))
-        XCTAssertTrue(choices.dropFirst(9).allSatisfy { $0.shortcut == nil })
     }
 
     /// A model whose display name already says everything the identifier does
@@ -187,17 +177,6 @@ final class AcpComposerModelTests: XCTestCase {
         XCTAssertEqual(favorites, ["a"])
         favorites = AcpModelPicker.toggledFavorites(favorites, modelID: "a")
         XCTAssertTrue(favorites.isEmpty)
-    }
-
-    func testFavouritesOnlyFilterHidesEverythingElse() {
-        let choices = AcpModelPicker.choices(
-            models: models,
-            currentID: nil,
-            favorites: ["claude-haiku-4-5"],
-            query: "",
-            favoritesOnly: true
-        )
-        XCTAssertEqual(choices.map(\.id), ["claude-haiku-4-5"])
     }
 
     // MARK: - Settings menu rows

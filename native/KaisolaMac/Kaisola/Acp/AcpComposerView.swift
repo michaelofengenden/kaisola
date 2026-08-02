@@ -20,9 +20,16 @@ struct AcpComposerCard: View {
     let send: () -> Void
     var onKeyboardFocus: (() -> Void)?
 
+    @EnvironmentObject private var model: AppModel
     @Environment(\.colorScheme) private var colorScheme
     @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
-    @State private var modelPickerPresented = false
+    @State private var menuPresented = false
+    @State private var menuQuery = ""
+    /// Bumped on every open so the menu's own `@State` — which row is armed,
+    /// where the highlight sits, whether Advanced is expanded — starts clean.
+    /// SwiftUI keeps popover content alive between presentations, so without a
+    /// fresh identity the menu reopens mid-drilldown on last session's row.
+    @State private var menuGeneration = 0
     @State private var favorites: Set<String> = []
 
     private let favoritesStore = AcpModelFavoritesStore()
@@ -31,8 +38,15 @@ struct AcpComposerCard: View {
     private var identity: QuietIdentity { AcpAgentIdentity.identity(fromChatTitle: conversation.title) }
 
     private var currentModelName: String? {
-        guard let id = conversation.currentModelID ?? conversation.models.first?.id else { return nil }
-        return conversation.models.first { $0.id == id }?.name
+        AcpComposerMenu.currentModel(
+            models: conversation.models,
+            currentModelID: conversation.currentModelID
+        )?.name
+    }
+
+    /// The adapter option worth naming on the pill's face.
+    private var primaryOption: AcpConfigOption? {
+        AcpComposerMetrics.primaryOption(conversation.configOptions)
     }
 
     private var sendAction: AcpComposerAction {
@@ -100,32 +114,27 @@ struct AcpComposerCard: View {
 
     // MARK: - Control row
 
+    /// The reference's arrangement: what the agent is *allowed* to do sits on
+    /// the left beside the paperclip, because it is the answer that has a wrong
+    /// value; what it will be *spent on* sits on the right, next to send.
     private var controlRow: some View {
         HStack(spacing: 8) {
-            ScrollView(.horizontal, showsIndicators: false) {
-                HStack(spacing: 4) {
-                    attachmentMenu
+            HStack(spacing: 4) {
+                attachmentMenu
+                if let posture = AcpPermissionPostureMap.current(
+                    modes: conversation.modes,
+                    currentID: conversation.currentModeID
+                ) {
                     chipDivider
-                    modelChip
-                    if let metrics = AcpComposerMetrics.chipLabel(
-                        option: AcpComposerMetrics.primaryOption(conversation.configOptions),
-                        usage: conversation.usage
-                    ) {
-                        chipDivider
-                        metricsChip(metrics)
-                    }
-                    if let posture = AcpPermissionPostureMap.current(
-                        modes: conversation.modes,
-                        currentID: conversation.currentModeID
-                    ) {
-                        chipDivider
-                        permissionChip(posture)
-                    }
+                    permissionChip(posture)
                 }
-                .padding(.vertical, 1)
             }
-            .scrollBounceBehavior(.basedOnSize, axes: .horizontal)
+            .fixedSize()
 
+            Spacer(minLength: 8)
+
+            settingsPill
+                .layoutPriority(1)
             trailingControls
                 .fixedSize()
         }
@@ -204,69 +213,140 @@ struct AcpComposerCard: View {
         }
     }
 
-    // MARK: - Model chip
+    // MARK: - Settings pill
 
-    private var modelChip: some View {
-        Button {
-            modelPickerPresented = true
+    /// The reference's `5.6 Sol Light ⌄`: the model, then the setting most
+    /// likely to have moved since, then the caret. One chip now opens
+    /// everything the old model chip and effort chip opened separately.
+    private var settingsPill: some View {
+        let values = AcpComposerMenu.chipValues(
+            agentName: agentName,
+            modelName: currentModelName,
+            option: primaryOption
+        )
+        return Button {
+            menuQuery = ""
+            menuGeneration += 1
+            menuPresented = true
         } label: {
-            AcpComposerChipLabel(
-                label: AcpAgentIdentity.chipLabel(agentName: agentName, modelName: currentModelName)
-            ) {
+            AcpComposerPillLabel(primary: values.primary, secondary: values.secondary) {
                 QuietIdentityMarkView(identity: identity, size: 13)
             }
         }
-        .buttonStyle(AcpComposerChipButtonStyle())
-        .help("Choose the model this chat runs on")
-        .accessibilityLabel("Model: \(AcpAgentIdentity.chipLabel(agentName: agentName, modelName: currentModelName))")
-        .accessibilityIdentifier("acp.composer.model")
-        .popover(isPresented: $modelPickerPresented, arrowEdge: .top) {
-            AcpModelPickerView(
-                identity: identity,
-                agentName: agentName,
-                models: conversation.models,
-                currentID: conversation.currentModelID,
-                favorites: favorites,
-                select: { id in
-                    conversation.selectModel(id)
-                    modelPickerPresented = false
+        .buttonStyle(AcpComposerChipButtonStyle(shape: AnyShape(Capsule()), restingOpacity: 0.32))
+        .help("Agent, model, and the settings this chat runs on")
+        .accessibilityLabel(pillAccessibilityLabel(values))
+        .accessibilityIdentifier("acp.composer.settings")
+        .popover(isPresented: $menuPresented, arrowEdge: .top) {
+            AcpComposerMenuView(
+                rows: AcpComposerMenu.rows(
+                    agentName: agentName,
+                    models: conversation.models,
+                    currentModelID: conversation.currentModelID,
+                    configOptions: conversation.configOptions
+                ),
+                advancedLines: AcpComposerMenu.advancedLines(
+                    usage: conversation.usage,
+                    currentModelID: conversation.currentModelID,
+                    models: conversation.models
+                ),
+                submenu: submenu,
+                identity: { agentID in
+                    QuietIdentity.identity(
+                        agentName: AgentRegistry.profile(id: agentID)?.name,
+                        processName: nil
+                    )
                 },
+                choose: choose,
                 toggleFavorite: { id in
                     favorites = favoritesStore.toggle(id, agentKey: agentName)
                 },
-                dismiss: { modelPickerPresented = false }
+                manageAgents: {
+                    NSApp.sendAction(
+                        #selector(KaisolaMacAppDelegate.openAgentSettings(_:)),
+                        to: nil,
+                        from: nil
+                    )
+                },
+                dismiss: { menuPresented = false },
+                isPresented: { menuPresented },
+                query: $menuQuery
             )
+            .id(menuGeneration)
         }
     }
 
-    // MARK: - Effort · context chip
+    private func pillAccessibilityLabel(_ values: (primary: String, secondary: String?)) -> String {
+        let tail = values.secondary.map { ", \($0)" } ?? ""
+        return "Chat settings: \(values.primary)\(tail)"
+    }
 
-    private func metricsChip(_ label: String) -> some View {
-        Menu {
-            ForEach(conversation.configOptions) { option in
-                Picker(option.name, selection: Binding(
-                    get: { option.currentValue ?? option.choices.first?.value ?? "" },
-                    set: { conversation.selectConfigOption(option.id, value: $0) }
-                )) {
-                    ForEach(option.choices) { choice in
-                        Text(choice.name).tag(choice.value)
-                    }
-                }
-                .pickerStyle(.inline)
+    private func submenu(_ target: AcpComposerMenuRow.Target) -> AcpComposerSubmenu {
+        switch target {
+        case .agent:
+            return AcpComposerMenu.agentSubmenu(
+                agents: AgentRegistry.all,
+                currentAgentID: currentAgentID,
+                isChatCapable: { AcpAdapter.forAgent($0) != nil }
+            )
+        case .model:
+            return AcpComposerMenu.modelSubmenu(
+                models: conversation.models,
+                currentModelID: conversation.currentModelID,
+                favorites: favorites,
+                query: menuQuery
+            )
+        case .option(let id):
+            guard let option = conversation.configOptions.first(where: { $0.id == id }) else {
+                return AcpComposerSubmenu(title: id, options: [])
             }
-            if let usage = conversation.usage, usage.max > 0 {
-                Divider()
-                Text("Context used: \(AcpComposerMetrics.compactTokens(usage.used)) of \(AcpComposerMetrics.compactTokens(usage.max))")
-            }
-        } label: {
-            AcpComposerChipLabel(label: label) { EmptyView() }
+            return AcpComposerMenu.optionSubmenu(option)
         }
-        .menuStyle(.borderlessButton)
-        .menuIndicator(.hidden)
-        .fixedSize()
-        .help("Agent effort and context window")
-        .accessibilityLabel("Agent effort and context window: \(label)")
-        .accessibilityIdentifier("acp.composer.effort")
+    }
+
+    private func choose(_ target: AcpComposerMenuRow.Target, _ value: String) {
+        switch target {
+        case .agent:
+            switchAgent(to: value)
+        case .model:
+            conversation.selectModel(value)
+            menuPresented = false
+        case .option(let id):
+            conversation.selectConfigOption(id, value: value)
+            menuPresented = false
+        }
+    }
+
+    // MARK: - Agent switch
+
+    /// The agent id driving this chat. `AcpChatHandle` holds it; the title is
+    /// only a display string a rename can overwrite, so it is not the source.
+    private var currentAgentID: String {
+        model.chats.first { $0.conversation === conversation }?.agentID
+            ?? AgentRegistry.profile(displayName: agentName)?.id
+            ?? ""
+    }
+
+    /// An ACP conversation is one adapter process holding one session, and
+    /// `AcpConversation` fixes its command and cwd at construction — the
+    /// protocol has no handoff. So switching opens a *new* chat with the chosen
+    /// agent in the same project and hands it the unsent draft. This chat stays
+    /// open, transcript and all; that is why every other row in the submenu
+    /// says "Starts a new chat" before it is pressed.
+    private func switchAgent(to agentID: String) {
+        menuPresented = false
+        let decision = AcpAgentSwitch.decision(
+            agentID: agentID,
+            currentAgentID: currentAgentID,
+            isChatCapable: { AcpAdapter.forAgent($0) != nil }
+        )
+        guard case .startNewChat(let chosenID) = decision,
+              let agent = AgentRegistry.profile(id: chosenID) else { return }
+        model.openChat(
+            agent,
+            inDirectory: conversation.workspaceURL,
+            initialDraft: draft.isEmpty ? nil : draft
+        )
     }
 
     // MARK: - Permission chip
@@ -369,28 +449,76 @@ struct AcpComposerChipLabel<Leading: View>: View {
     }
 }
 
+/// The settings pill: `<primary> <secondary in grey> ⌄`, the one chip in the
+/// row that carries a resting surface. It has one because it is the row's only
+/// object with a menu behind *four* settings rather than one, and because the
+/// reference gives it one — the eye needs somewhere to aim on the right edge.
+struct AcpComposerPillLabel<Leading: View>: View {
+    let primary: String
+    var secondary: String?
+    @ViewBuilder var leading: () -> Leading
+
+    init(primary: String, secondary: String? = nil, @ViewBuilder leading: @escaping () -> Leading) {
+        self.primary = primary
+        self.secondary = secondary
+        self.leading = leading
+    }
+
+    var body: some View {
+        HStack(spacing: 5) {
+            leading()
+            Text(primary)
+                .font(.caption.weight(.medium))
+                .lineLimit(1)
+                .truncationMode(.tail)
+            if let secondary {
+                Text(secondary)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+            }
+            Image(systemName: "chevron.down")
+                .font(.system(size: 7, weight: .semibold))
+                .foregroundStyle(.tertiary)
+        }
+        .padding(.horizontal, 9)
+        .padding(.vertical, 5)
+        .contentShape(Capsule())
+    }
+}
+
 /// A chip's only decoration: a faint surface on hover, matching what the
-/// borderless menu style does for the chips that open menus.
+/// borderless menu style does for the chips that open menus. The pill passes a
+/// capsule and a resting fill; everything else stays naked until hovered.
 struct AcpComposerChipButtonStyle: ButtonStyle {
+    var shape = AnyShape(RoundedRectangle(cornerRadius: KaisolaVisualSystem.controlRadius))
+    var restingOpacity: Double = 0
+
     func makeBody(configuration: Configuration) -> some View {
         // The hover state lives in a real `View`, not in the style struct.
         // SwiftUI does not allocate storage for `@State` declared on a
         // `ButtonStyle`, so a chip written that way would never light up.
-        Surface(configuration: configuration)
+        Surface(configuration: configuration, shape: shape, restingOpacity: restingOpacity)
     }
 
     private struct Surface: View {
         let configuration: ButtonStyleConfiguration
+        let shape: AnyShape
+        let restingOpacity: Double
         @State private var hovering = false
         @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
+        private var fillOpacity: Double {
+            (configuration.isPressed || hovering) ? 0.6 : restingOpacity
+        }
 
         var body: some View {
             configuration.label
                 .background(
-                    (configuration.isPressed || hovering)
-                        ? AnyShapeStyle(.quaternary.opacity(0.6))
+                    fillOpacity > 0
+                        ? AnyShapeStyle(.quaternary.opacity(fillOpacity))
                         : AnyShapeStyle(Color.clear),
-                    in: RoundedRectangle(cornerRadius: KaisolaVisualSystem.controlRadius)
+                    in: shape
                 )
                 .onHover { inside in
                     guard !reduceMotion else {

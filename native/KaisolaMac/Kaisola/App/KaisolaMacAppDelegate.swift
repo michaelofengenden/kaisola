@@ -3044,6 +3044,16 @@ final class KaisolaMacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDele
 
     private var settingsWindow: NSWindow?
 
+    /// Settings, opened on the Agents pane. The composer's agent menu offers
+    /// "Manage agents…" as the answer to "why can this agent not chat?", and
+    /// landing on whichever pane was last visited would not answer it.
+    /// `openSettings` re-installs the content in both its branches, so setting
+    /// the remembered section first is all the deep link needs.
+    @objc func openAgentSettings(_ sender: Any?) {
+        settingsSelectedSectionID = "agents"
+        openSettings(sender)
+    }
+
     @objc func openSettings(_ sender: Any?) {
         let model = activeSettingsModel()
         if let settingsWindow, settingsWindow.isVisible {

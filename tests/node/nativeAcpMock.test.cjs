@@ -230,7 +230,8 @@ test('mock initializes, creates a session, and streams the exact happy path', as
     }],
     agentCapabilities: {
       loadSession: true,
-      sessionCapabilities: { resume: true, close: true },
+      // Objects, not booleans — the shape the shipping adapters use.
+      sessionCapabilities: { resume: {}, close: {} },
       promptCapabilities: { image: false },
       mcpCapabilities: { http: true },
       _meta: { claudeCode: { promptQueueing: true } },

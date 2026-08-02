@@ -1,9 +1,15 @@
 #!/usr/bin/env node
 'use strict'
 
+const fs = require('node:fs')
 const readline = require('node:readline')
 
 const PROTOCOL_VERSION = 1
+// Optional on-disk thread store. Sessions live in memory by default, so a
+// relaunched host that offers a prior session id gets an empty thread. Point
+// this at a file and the fixture's history outlives the process, which is what
+// makes a real `session/load` replay reproducible across an app restart.
+const HISTORY_FILE = process.env.KAISOLA_MOCK_HISTORY_FILE || ''
 const MOCK_TERMINAL_ENABLED = process.env.KAISOLA_MOCK_TERMINAL === '1'
 const AUTH_METHODS = [
   {
@@ -126,16 +132,49 @@ function sessionResult(session) {
   }
 }
 
+function readStoredHistory(sessionId) {
+  if (!HISTORY_FILE) return null
+  try {
+    const stored = JSON.parse(fs.readFileSync(HISTORY_FILE, 'utf8'))
+    const entries = stored && stored[sessionId]
+    return Array.isArray(entries) ? entries : null
+  } catch {
+    return null
+  }
+}
+
+function writeStoredHistory(session) {
+  if (!HISTORY_FILE) return
+  let stored = {}
+  try {
+    stored = JSON.parse(fs.readFileSync(HISTORY_FILE, 'utf8')) || {}
+  } catch {
+    stored = {}
+  }
+  stored[session.sessionId] = session.history
+  try {
+    fs.writeFileSync(HISTORY_FILE, JSON.stringify(stored), { mode: 0o600 })
+  } catch {
+    // A fixture that cannot persist still serves every in-memory test.
+  }
+}
+
+function recordHistory(session, text) {
+  session.history.push({ messageId: `mock-msg-${session.nextMessageNumber++}`, text })
+  writeStoredHistory(session)
+}
+
 function createSession(sessionId = `native-mock-session-${nextSessionNumber++}`) {
+  // Prompts this session has seen, replayed on `session/load` exactly as the
+  // real adapters replay a loaded thread's history.
+  const history = readStoredHistory(sessionId) || []
   const session = {
     sessionId,
     modelId: AVAILABLE_MODELS[0].modelId,
     modeId: AVAILABLE_MODES[0].id,
     reasoningEffort: 'high',
-    // Prompts this session has seen, replayed on `session/load` exactly as the
-    // real adapters replay a loaded thread's history.
-    history: [],
-    nextMessageNumber: 1,
+    history,
+    nextMessageNumber: history.length + 1,
   }
   sessions.set(sessionId, session)
   return session
@@ -201,7 +240,7 @@ function handleSteering(id, params) {
     return
   }
   const text = promptText(blocks)
-  session.history.push({ messageId: `mock-msg-${session.nextMessageNumber++}`, text })
+  recordHistory(session, text)
   const turn = [...turns].find((candidate) => turnIsActive(candidate))
   sessionUpdate(turn, {
     sessionUpdate: 'agent_message_chunk',
@@ -403,7 +442,7 @@ async function handlePrompt(requestId, params) {
   }
 
   const text = promptText(params.prompt)
-  session.history.push({ messageId: `mock-msg-${session.nextMessageNumber++}`, text })
+  recordHistory(session, text)
   const turnNumber = nextTurnNumber++
   const turn = {
     requestId,
@@ -533,7 +572,13 @@ function handleInitialize(id) {
     authMethods: AUTH_METHODS,
     agentCapabilities: {
       loadSession: true,
-      sessionCapabilities: { resume: true, close: true },
+      // Shaped exactly as the shipping adapters shape it: each session
+      // capability is an OBJECT, not a boolean. The distinction is load-bearing
+      // — a host reading `resume` as a boolean sees "unsupported" and restores
+      // through `session/load` instead, which is the path that replays history.
+      // A fixture that said `resume: true` would quietly exercise a route no
+      // real adapter offers.
+      sessionCapabilities: { resume: {}, close: {} },
       promptCapabilities: { image: false },
       mcpCapabilities: { http: true },
       _meta: { claudeCode: { promptQueueing: true } },

@@ -512,6 +512,8 @@ struct AcpChatView: View {
                     Image(systemName: "clock").font(.caption2).foregroundStyle(.secondary)
                     Text(message.text).font(.caption).lineLimit(1)
                     Spacer()
+                    // Identified so the row's own contents, and whether it is
+                    // currently offering the steer action, are inspectable.
                     // Offered only while a steering-capable adapter has a turn
                     // running — the one window in which the request can do what
                     // the button says. Otherwise this stays a plain queued row.
@@ -526,6 +528,7 @@ struct AcpChatView: View {
                         .foregroundStyle(KaisolaStatusTone.needsYou.foregroundColor)
                         .disabled(conversation.injectingQueuedIDs.contains(message.id))
                         .help("Steer: send this into the running turn now")
+                        .accessibilityIdentifier("acp.queued.\(message.id).steer")
                         .accessibilityLabel("Steer this queued follow-up into the running turn")
                     }
                     Button {
@@ -537,9 +540,14 @@ struct AcpChatView: View {
                     .foregroundStyle(.secondary)
                     .disabled(conversation.injectingQueuedIDs.contains(message.id))
                     .help("Remove this queued follow-up")
+                    .accessibilityIdentifier("acp.queued.\(message.id).remove")
+                    .accessibilityLabel("Remove this queued follow-up")
                 }
                 .padding(.horizontal, 8).padding(.vertical, 4)
                 .background(.quaternary.opacity(0.4), in: RoundedRectangle(cornerRadius: 6))
+                .accessibilityElement(children: .contain)
+                .accessibilityIdentifier("acp.queued.\(message.id)")
+                .accessibilityLabel("Queued follow-up: \(message.text)")
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
@@ -637,6 +645,12 @@ struct TranscriptRowView: View {
                     }
                     .textSelection(.enabled)
             }
+            // Identified so the user's own side of the transcript — including a
+            // prompt restored from a resumed thread, and a message steered into
+            // a running turn — is inspectable.
+            .accessibilityElement(children: .contain)
+            .accessibilityIdentifier("acp.transcript.\(row.id)")
+            .accessibilityLabel("You said: \(text)")
         case let .message(_, text):
             AssistantMarkdownText(text: text, workspaceURL: workspaceURL)
         case let .thought(_, text):

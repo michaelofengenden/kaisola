@@ -609,6 +609,15 @@ struct RootShellView: View {
                     .frame(width: 0, height: 0)
                     .accessibilityHidden(true)
             }
+            // Holds the rail at its top through launch. Without it AppKit's
+            // keep-the-top-row-stable compensation, which SwiftUI triggers on
+            // every row diff, leaves the list parked above its own content and
+            // the first project row clipped or gone. See `SidebarScrollPin`.
+            .background {
+                SidebarScrollTopPin()
+                    .frame(width: 0, height: 0)
+                    .accessibilityHidden(true)
+            }
             .navigationSplitViewColumnWidth(
                 min: NativeWorkspaceChrome.projectSidebarMinimumWidth,
                 ideal: NativeWorkspaceChrome.projectSidebarIdealWidth,
@@ -2562,6 +2571,173 @@ struct InitialSidebarWidthApplier: NSViewRepresentable {
                         + "\(splitView.subviews[0].frame.width)"
                 )
             }
+        }
+    }
+}
+
+// MARK: - Sidebar scroll pin
+
+/// Where the sidebar list is allowed to be scrolled to, kept pure and free of
+/// AppKit so the arithmetic can be tested without a window.
+///
+/// The defect it exists for: at launch the rail was reliably left scrolled 8pt
+/// down with its content shorter than its own clip view, so the first project
+/// row was clipped by a quarter — and on a workspace whose sessions arrive over
+/// several seconds, once for every batch, until the first project row was gone
+/// altogether. It is not an inset and not a safe area (both measured zero); it
+/// is AppKit's own `-[NSTableRowData _keepTopRowStableAtLeastOnce:…]`
+/// compensation, which runs inside the `endUpdates` that SwiftUI's
+/// `OutlineListCoordinator.diffRows` performs whenever the rail's row set
+/// changes. That compensation exists to hold a *user's* scroll position steady
+/// while rows are inserted above it. At launch there is no such position to
+/// hold, so what it preserves is an artefact.
+enum SidebarScrollPin {
+    /// How long after the sidebar appears the list is held at its top.
+    ///
+    /// Long enough to cover the row-diff batches a restored workspace produces
+    /// (measured: the first compensation lands between 0.5s and 1.0s, and a
+    /// broker reconnect can add more), short enough that it can never be
+    /// confused with owning the scroll position. Any deliberate scroll ends it
+    /// early — see `SidebarScrollTopPin`.
+    static let pinDuration: TimeInterval = 3.0
+
+    /// - Parameters:
+    ///   - currentY: the clip view's current vertical bounds origin.
+    ///   - contentHeight: the document view's height.
+    ///   - visibleHeight: the clip view's height.
+    ///   - pinnedToTop: whether the launch settling window is still open.
+    /// - Returns: the offset the clip view should be moved to, or `nil` when
+    ///   the current one is already legal.
+    ///
+    /// Two rules, and neither can fight a user:
+    /// 1. While pinned, the top is the only legal offset.
+    /// 2. Always, the offset must lie inside the scrollable range. Landing
+    ///    outside it is not something a scroll gesture can do — it is only ever
+    ///    a compensation that out-ran its own content, which is exactly the bug.
+    static func correction(
+        currentY: CGFloat,
+        contentHeight: CGFloat,
+        visibleHeight: CGFloat,
+        pinnedToTop: Bool
+    ) -> CGFloat? {
+        if pinnedToTop { return currentY == 0 ? nil : 0 }
+        let maximum = max(0, contentHeight - visibleHeight)
+        let clamped = min(max(currentY, 0), maximum)
+        return clamped == currentY ? nil : clamped
+    }
+}
+
+/// Holds the project rail at its top through launch, and forever after keeps it
+/// inside its own scrollable range.
+///
+/// Introspection, written to fail quietly for the same reason
+/// `InitialSidebarWidthApplier` is: if a future SwiftUI stops backing the
+/// sidebar `List` with an `NSTableView`, the walk finds nothing and the rail
+/// behaves exactly as it does today — the pre-existing behaviour, not a broken
+/// one.
+struct SidebarScrollTopPin: NSViewRepresentable {
+    var pinDuration: TimeInterval = SidebarScrollPin.pinDuration
+
+    func makeNSView(context: Context) -> PinView {
+        let view = PinView()
+        view.pinDuration = pinDuration
+        return view
+    }
+
+    func updateNSView(_ nsView: PinView, context: Context) {}
+
+    final class PinView: NSView {
+        var pinDuration: TimeInterval = SidebarScrollPin.pinDuration
+
+        private weak var scrollView: NSScrollView?
+        private var pinDeadline: Date?
+        private var attempts = 0
+        private var correcting = false
+        /// Same settling shape the width applier uses: the list is not backed by
+        /// a table view the instant this is parented.
+        private static let maximumAttempts = 12
+        private static let retryInterval: TimeInterval = 0.05
+
+        override var isFlipped: Bool { true }
+        override func hitTest(_ point: NSPoint) -> NSView? { nil }
+
+        deinit { NotificationCenter.default.removeObserver(self) }
+
+        override func viewDidMoveToWindow() {
+            super.viewDidMoveToWindow()
+            guard window != nil, scrollView == nil else { return }
+            pinDeadline = Date().addingTimeInterval(pinDuration)
+            attach()
+        }
+
+        private func attach() {
+            attempts += 1
+            guard let found = sidebarScrollView() else {
+                if attempts < Self.maximumAttempts {
+                    DispatchQueue.main.asyncAfter(deadline: .now() + Self.retryInterval) { [weak self] in
+                        self?.attach()
+                    }
+                }
+                return
+            }
+            scrollView = found
+            found.contentView.postsBoundsChangedNotifications = true
+            let center = NotificationCenter.default
+            center.addObserver(
+                self,
+                selector: #selector(clipBoundsChanged),
+                name: NSView.boundsDidChangeNotification,
+                object: found.contentView
+            )
+            // A deliberate scroll ends the pin immediately, so the settling
+            // window can never be felt as the list refusing to move.
+            center.addObserver(
+                self,
+                selector: #selector(releasePin),
+                name: NSScrollView.willStartLiveScrollNotification,
+                object: found
+            )
+            correct()
+        }
+
+        @objc private func releasePin() { pinDeadline = nil }
+
+        @objc private func clipBoundsChanged() { correct() }
+
+        private func correct() {
+            guard !correcting, let scrollView, let document = scrollView.documentView else { return }
+            let clip = scrollView.contentView
+            let pinned = pinDeadline.map { Date() < $0 } ?? false
+            guard let target = SidebarScrollPin.correction(
+                currentY: clip.bounds.origin.y,
+                contentHeight: document.frame.height,
+                visibleHeight: clip.bounds.height,
+                pinnedToTop: pinned
+            ) else { return }
+            correcting = true
+            clip.scroll(to: NSPoint(x: clip.bounds.origin.x, y: target))
+            scrollView.reflectScrolledClipView(clip)
+            correcting = false
+        }
+
+        /// The rail's scroll view is the nearest `NSTableView`-backed one at or
+        /// above this view, which is planted in the sidebar column. The detail
+        /// column's own scroll views are siblings' descendants, never ancestors.
+        private func sidebarScrollView() -> NSScrollView? {
+            var candidate: NSView? = superview
+            while let view = candidate {
+                if let scroll = tableBackedScrollView(in: view) { return scroll }
+                candidate = view.superview
+            }
+            return nil
+        }
+
+        private func tableBackedScrollView(in view: NSView) -> NSScrollView? {
+            if let scroll = view as? NSScrollView, scroll.documentView is NSTableView { return scroll }
+            for child in view.subviews {
+                if let scroll = tableBackedScrollView(in: child) { return scroll }
+            }
+            return nil
         }
     }
 }

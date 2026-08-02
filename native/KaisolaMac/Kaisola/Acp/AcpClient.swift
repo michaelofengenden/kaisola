@@ -1010,6 +1010,7 @@ actor AcpClient {
             return AcpConfigOption(
                 id: id,
                 name: o["name"]?.stringValue ?? id,
+                category: o["category"]?.stringValue,
                 currentValue: o["currentValue"]?.stringValue,
                 choices: choices
             )

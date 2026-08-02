@@ -318,6 +318,31 @@ final class McpConfigStoreTests: XCTestCase {
         XCTAssertEqual(saved.first { $0.name == "new" }?.enabled, false)
     }
 
+    // MARK: - Protocol revision negotiation (pure)
+
+    func testProtocolRevisionRequestsTheNewestKnownRevision() {
+        XCTAssertEqual(McpProtocolRevision.requested, "2025-11-25")
+    }
+
+    func testProtocolRevisionAcceptsAnExactMatch() {
+        XCTAssertTrue(McpProtocolRevision.isAccepted("2025-11-25"))
+    }
+
+    func testProtocolRevisionAcceptsAServerDowngradeToAKnownOlderRevision() {
+        XCTAssertTrue(McpProtocolRevision.isAccepted("2025-06-18"))
+    }
+
+    func testProtocolRevisionRejectsAnUnknownOrFutureRevision() {
+        XCTAssertFalse(McpProtocolRevision.isAccepted("2024-11-05"))
+        XCTAssertFalse(McpProtocolRevision.isAccepted("2099-01-01"))
+    }
+
+    func testProtocolRevisionRejectsMalformedOrMissingVersions() {
+        XCTAssertFalse(McpProtocolRevision.isAccepted(nil))
+        XCTAssertFalse(McpProtocolRevision.isAccepted(""))
+        XCTAssertFalse(McpProtocolRevision.isAccepted("not-a-revision"))
+    }
+
     // MARK: - MCP lifecycle probe
 
     func testStdioAndLegacySSEProbesNeverOpenANetworkConnection() async {
@@ -350,7 +375,11 @@ final class McpConfigStoreTests: XCTestCase {
             switch method {
             case "initialize":
                 XCTAssertNil(request.value(forHTTPHeaderField: "MCP-Protocol-Version"))
+                let params = object["params"] as? [String: Any]
+                XCTAssertEqual(params?["protocolVersion"] as? String, "2025-11-25")
                 headers = ["Content-Type": "application/json", "Mcp-Session-Id": "probe-session"]
+                // Server legitimately downgrades to the older revision it
+                // supports; the probe must accept it, not demand an exact echo.
                 data = Data(#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-06-18","capabilities":{"tools":{}},"serverInfo":{"name":"fixture","version":"1.2"}}}"#.utf8)
             case "notifications/initialized":
                 XCTAssertEqual(request.value(forHTTPHeaderField: "MCP-Protocol-Version"), "2025-06-18")
@@ -432,6 +461,29 @@ final class McpConfigStoreTests: XCTestCase {
         XCTAssertEqual(result.status, .ready)
         XCTAssertNil(result.toolCount)
         XCTAssertEqual(capture.snapshot().count, 2)
+    }
+
+    func testHTTPProbeFailsOnAGenuinelyUnsupportedProtocolVersion() async throws {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [McpProbeURLProtocol.self]
+        McpProbeURLProtocol.handler = { request in
+            let request = try request.materializingBody()
+            let data = Data(#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2099-01-01","capabilities":{},"serverInfo":{"name":"future","version":"1"}}}"#.utf8)
+            let response = HTTPURLResponse(
+                url: try XCTUnwrap(request.url),
+                statusCode: 200,
+                httpVersion: "HTTP/1.1",
+                headerFields: ["Content-Type": "application/json"]
+            )!
+            return (response, data)
+        }
+        defer { McpProbeURLProtocol.handler = nil }
+        let service = McpProbeService(session: URLSession(configuration: configuration))
+
+        let result = await service.probe(McpServerConfig(name: "remote", kind: .http, url: "https://example.com/mcp"))
+        XCTAssertEqual(result.status, .failed)
+        XCTAssertTrue(result.verified)
+        XCTAssertTrue(result.message.contains("Unsupported protocol version"))
     }
 
     private func write(_ value: String, relativePath: String, home: URL) throws {

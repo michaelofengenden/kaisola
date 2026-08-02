@@ -549,3 +549,42 @@ test('session/cancel stops a turn and resolves its prompt request', async (t) =>
     250,
   )
 })
+
+test('session/load replays the thread history, user prompts included', async (t) => {
+  const client = await clientFor(t)
+  const { created } = await initializeAndCreateSession(client)
+  const promptPromise = client.request('session/prompt', {
+    sessionId: created.sessionId,
+    prompt: [{ type: 'text', text: 'what changed?' }],
+  })
+  const { permission } = await readThroughPermission(client, created.sessionId)
+  client.respond(permission.id, { outcome: { outcome: 'selected', optionId: 'allow-once' } })
+  await promptPromise
+  // Drain the tail of the completed turn.
+  for (let index = 0; index < 3; index += 1) await client.take()
+
+  const loaded = client.request('session/load', {
+    sessionId: created.sessionId,
+    cwd: '/tmp/native-acp-mock',
+    mcpServers: [],
+  })
+  const replayed = assertUpdateFrame(await client.take(), created.sessionId)
+  assert.deepEqual(replayed, {
+    sessionUpdate: 'user_message_chunk',
+    messageId: 'mock-msg-1',
+    content: { type: 'text', text: 'what changed?' },
+  })
+  const reply = assertUpdateFrame(await client.take(), created.sessionId)
+  assert.equal(reply.sessionUpdate, 'agent_message_chunk')
+  assert.equal((await loaded).sessionId, created.sessionId)
+
+  // `session/resume` restores without re-streaming, so a host that resumes
+  // never sees the replay at all.
+  const resumed = await client.request('session/resume', {
+    sessionId: created.sessionId,
+    cwd: '/tmp/native-acp-mock',
+    mcpServers: [],
+  })
+  assert.equal(resumed.sessionId, created.sessionId)
+  await client.expectNo((message) => message.method === 'session/update', 250)
+})

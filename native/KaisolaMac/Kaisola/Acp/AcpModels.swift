@@ -12,6 +12,12 @@ enum AcpWire {
 enum AcpTurnItem: Equatable, Sendable, Identifiable {
     case message(id: String, text: String)
     case thought(id: String, text: String)
+    /// A user message the AGENT reported (`user_message_chunk`), as opposed to
+    /// one this client sent. Adapters emit these when they replay a resumed
+    /// session's history, and some echo the live turn's user input. `id` is the
+    /// adapter's `messageId` when it sent one — the only stable identity a
+    /// replayed row has — and `nil` otherwise.
+    case userMessage(id: String?, text: String)
     case toolCall(AcpToolCall)
     case plan(entries: [AcpPlanEntry])
 
@@ -19,6 +25,7 @@ enum AcpTurnItem: Equatable, Sendable, Identifiable {
         switch self {
         case let .message(id, _): "msg-\(id)"
         case let .thought(id, _): "thought-\(id)"
+        case let .userMessage(id, text): "user-\(id ?? "live-\(text.count)")"
         case let .toolCall(call): "tool-\(call.id)"
         case .plan: "plan"
         }

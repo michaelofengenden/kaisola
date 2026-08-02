@@ -132,9 +132,39 @@ function createSession(sessionId = `native-mock-session-${nextSessionNumber++}`)
     modelId: AVAILABLE_MODELS[0].modelId,
     modeId: AVAILABLE_MODES[0].id,
     reasoningEffort: 'high',
+    // Prompts this session has seen, replayed on `session/load` exactly as the
+    // real adapters replay a loaded thread's history.
+    history: [],
+    nextMessageNumber: 1,
   }
   sessions.set(sessionId, session)
   return session
+}
+
+/// Replay a loaded session's history. Mirrors
+/// `@agentclientprotocol/claude-agent-acp`'s `replaySessionHistory` and
+/// `codex-acp`'s `streamThreadHistory`: the whole thread streams back as
+/// `session/update` notifications — user prompts included, each stamped with the
+/// stable message id the thread persisted — before the load response is sent.
+function replaySessionHistory(session) {
+  for (const entry of session.history) {
+    notify('session/update', {
+      sessionId: session.sessionId,
+      update: {
+        sessionUpdate: 'user_message_chunk',
+        messageId: entry.messageId,
+        content: { type: 'text', text: entry.text },
+      },
+    })
+    notify('session/update', {
+      sessionId: session.sessionId,
+      update: {
+        sessionUpdate: 'agent_message_chunk',
+        messageId: `${entry.messageId}-reply`,
+        content: { type: 'text', text: `Replayed reply to ${entry.text}.` },
+      },
+    })
+  }
 }
 
 function addTurn(turn) {
@@ -330,6 +360,7 @@ async function handlePrompt(requestId, params) {
   }
 
   const text = promptText(params.prompt)
+  session.history.push({ messageId: `mock-msg-${session.nextMessageNumber++}`, text })
   const turnNumber = nextTurnNumber++
   const turn = {
     requestId,
@@ -528,6 +559,9 @@ function dispatch(message) {
     respond(id, sessionResult(createSession()))
   } else if (method === 'session/load' || method === 'session/resume') {
     const session = sessions.get(params.sessionId) || createSession(params.sessionId)
+    // Only `load` replays. `resume` restores the thread without re-streaming it,
+    // matching both shipping adapters.
+    if (method === 'session/load') replaySessionHistory(session)
     respond(id, sessionResult(session))
   } else if (method === 'session/close') {
     cancelSession(params.sessionId)

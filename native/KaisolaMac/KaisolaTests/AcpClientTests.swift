@@ -416,6 +416,155 @@ final class AcpClientTests: XCTestCase {
         conversation.removeQueued(id)
         XCTAssertTrue(conversation.queued.isEmpty)
     }
+
+    // MARK: - Resumed sessions show the user's own prompts
+
+    @MainActor
+    func testResumedSessionRestoresTheUsersOwnPromptsWithoutDuplicatingThem() async throws {
+        // `session/load` replays the whole thread. "already asked" is a prompt
+        // this chat persisted locally, so its replay must be absorbed; "asked
+        // before the store was pruned" is history only the adapter still has,
+        // so it must appear.
+        let transport = ScriptedAcpTransport(loadReplay: [
+            (messageID: "m1", text: "already asked"),
+            (messageID: "m2", text: "asked before the store was pruned"),
+        ])
+        let client = AcpClient(transport: transport)
+        let conversation = AcpConversation(
+            title: "Resume", command: "mock", arguments: [], environment: [:],
+            cwd: "/tmp", client: client,
+            resumeSessionID: "sess-persisted",
+            initialRows: [
+                .user(id: "1", text: "already asked", failed: false),
+                .message(id: "1", text: "An answer."),
+            ]
+        )
+        await conversation.start()
+
+        try await Self.until("the replay reached the transcript") {
+            conversation.rows.contains { row in
+                if case let .user(_, text, _) = row {
+                    return text == "asked before the store was pruned"
+                }
+                return false
+            }
+        }
+        let userTexts = conversation.rows.compactMap { row -> String? in
+            if case let .user(_, text, _) = row { return text } else { return nil }
+        }
+        XCTAssertEqual(userTexts, ["already asked", "asked before the store was pruned"])
+    }
+
+    func testLedgerAbsorbsAReplayOnlyAsOftenAsTheTranscriptAlreadyShowsIt() {
+        var ledger = AcpUserMessageLedger(rows: [
+            .user(id: "1", text: "continue", failed: false),
+            .user(id: "2", text: "continue", failed: false),
+            .message(id: "1", text: "…"),
+        ])
+        // Two local rows absorb exactly two replayed copies.
+        XCTAssertEqual(ledger.reconcile(text: "continue", adapterMessageID: "a"), .drop)
+        XCTAssertEqual(ledger.reconcile(text: "continue", adapterMessageID: "b"), .drop)
+        // A third is history this transcript does not have, so it is shown.
+        XCTAssertEqual(
+            ledger.reconcile(text: "continue", adapterMessageID: "c"),
+            .append(id: "acp:c")
+        )
+        // …and recognized by id the next time the thread is loaded, without
+        // needing the text to be unique.
+        XCTAssertEqual(ledger.reconcile(text: "continue", adapterMessageID: "c"), .drop)
+    }
+
+    func testLedgerRecognizesItsOwnEarlierReplayAcrossARestart() {
+        // The row an earlier replay appended was persisted under its adapter id,
+        // so a later load matches on that id and shows it once.
+        var ledger = AcpUserMessageLedger(rows: [
+            .user(id: "acp:m2", text: "asked before the store was pruned", failed: false),
+        ])
+        XCTAssertEqual(
+            ledger.reconcile(text: "asked before the store was pruned", adapterMessageID: "m2"),
+            .drop
+        )
+    }
+
+    func testLedgerGivesUnkeyedReplayChunksDistinctRowIdentities() {
+        // Codex's rollout-file fallback replays user messages with no messageId.
+        var ledger = AcpUserMessageLedger()
+        XCTAssertEqual(ledger.reconcile(text: "one", adapterMessageID: nil), .append(id: "acp:anon-1"))
+        XCTAssertEqual(ledger.reconcile(text: "two", adapterMessageID: nil), .append(id: "acp:anon-2"))
+    }
+
+    @MainActor
+    func testLocallySentPromptIsNotShownTwiceWhenTheAdapterEchoesIt() async throws {
+        // Claude echoes any prompt that carried more than one content block
+        // (every attachment send) straight back as `user_message_chunk`.
+        let transport = ScriptedAcpTransport()
+        let client = AcpClient(transport: transport)
+        let conversation = AcpConversation(
+            title: "Echo", command: "mock", arguments: [], environment: [:],
+            cwd: "/tmp", client: client
+        )
+        await conversation.start()
+        conversation.send("look at this")
+        try await Self.until("the send landed") {
+            conversation.rows.contains { if case .user = $0 { return true } else { return false } }
+        }
+        conversation.receiveTurnItemForTesting(.userMessage(id: "echo-1", text: "look at this"))
+
+        let userTexts = conversation.rows.compactMap { row -> String? in
+            if case let .user(_, text, _) = row { return text } else { return nil }
+        }
+        XCTAssertEqual(userTexts, ["look at this"])
+    }
+
+    @MainActor
+    func testMultiBlockReplayFoldsIntoOneRowInsteadOfLeakingItsContext() {
+        // A file attachment replays as several chunks sharing one messageId:
+        // the prompt text, a link, then a `<context>` dump. They are one message
+        // and must render as one row.
+        let conversation = AcpConversation(
+            title: "Replay", command: "mock", arguments: [], environment: [:], cwd: "/tmp"
+        )
+        conversation.receiveTurnItemForTesting(.userMessage(id: "m9", text: "review this"))
+        conversation.receiveTurnItemForTesting(.userMessage(id: "m9", text: " [notes.txt]"))
+        conversation.receiveTurnItemForTesting(.userMessage(id: "m9", text: "\n<context>…</context>"))
+
+        let userRows = conversation.rows.compactMap { row -> String? in
+            if case let .user(_, text, _) = row { return text } else { return nil }
+        }
+        XCTAssertEqual(userRows, ["review this [notes.txt]\n<context>…</context>"])
+    }
+
+    @MainActor
+    func testSuppressedMultiBlockReplayDoesNotLeakItsRemainingChunks() {
+        // When the first chunk is recognized as one the transcript already
+        // shows, the rest of that message must stay suppressed with it —
+        // otherwise the context dump would appear as a user row of its own.
+        let conversation = AcpConversation(
+            title: "Replay", command: "mock", arguments: [], environment: [:], cwd: "/tmp",
+            initialRows: [.user(id: "1", text: "review this", failed: false)]
+        )
+        conversation.receiveTurnItemForTesting(.userMessage(id: "m9", text: "review this"))
+        conversation.receiveTurnItemForTesting(.userMessage(id: "m9", text: "\n<context>…</context>"))
+
+        let userRows = conversation.rows.compactMap { row -> String? in
+            if case let .user(_, text, _) = row { return text } else { return nil }
+        }
+        XCTAssertEqual(userRows, ["review this"])
+    }
+
+    /// Poll until `condition` holds, failing with `description` on timeout.
+    @MainActor
+    private static func until(
+        _ description: String,
+        timeout: TimeInterval = 10,
+        _ condition: () -> Bool
+    ) async throws {
+        let deadline = Date().addingTimeInterval(timeout)
+        while !condition() {
+            if Date() > deadline { return XCTFail("timed out waiting for \(description)") }
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+    }
 }
 
 private final class EventCollector: @unchecked Sendable {
@@ -438,6 +587,7 @@ private actor ScriptedAcpTransport: AcpByteTransport {
     private let resumeCapability: Bool
     private let rejectRestoration: Bool
     private let crashOnFirstPrompt: Bool
+    private let loadReplay: [(messageID: String?, text: String)]
     private var sessionMcpServers: [JSONValue] = []
     private var sessionMcpAttempts: [[JSONValue]] = []
     private var sessionMethods: [String] = []
@@ -453,8 +603,10 @@ private actor ScriptedAcpTransport: AcpByteTransport {
         rejectFirstMcpSession: Bool = false,
         resumeCapability: Bool = false,
         rejectRestoration: Bool = false,
-        crashOnFirstPrompt: Bool = false
+        crashOnFirstPrompt: Bool = false,
+        loadReplay: [(messageID: String?, text: String)] = []
     ) {
+        self.loadReplay = loadReplay
         self.protocolVersion = protocolVersion
         self.mcpHTTP = mcpHTTP
         self.mcpSSE = mcpSSE
@@ -536,6 +688,23 @@ private actor ScriptedAcpTransport: AcpByteTransport {
                 replyError(id: id, message: "Unknown session")
             } else {
                 let restoredID = object["params"]?.objectValue?["sessionId"]?.stringValue ?? "sess-restored"
+                // Both shipping adapters replay a loaded thread's whole history
+                // as `session/update`s BEFORE answering the load.
+                if method == "session/load" {
+                    for entry in loadReplay {
+                        var update: [String: JSONValue] = [
+                            "sessionUpdate": .string("user_message_chunk"),
+                            "content": .object([
+                                "type": .string("text"),
+                                "text": .string(entry.text),
+                            ]),
+                        ]
+                        if let messageID = entry.messageID {
+                            update["messageId"] = .string(messageID)
+                        }
+                        notify(update: .object(update))
+                    }
+                }
                 reply(id: id, result: .object(["sessionId": .string(restoredID)]))
             }
         case "session/set_config_option":

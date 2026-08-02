@@ -690,6 +690,19 @@ actor AcpClient {
             if let text = object["content"]?.objectValue?["text"]?.stringValue {
                 eventHandler?(.turnItem(.thought(id: "live", text: text)))
             }
+        case "user_message_chunk":
+            // The user's OWN prompts. Adapters emit these when they replay a
+            // loaded session's history, which is how a resumed chat gets back
+            // the questions that produced the replies beside them; Claude also
+            // echoes any prompt that carried more than a single text block.
+            // Dropping them (the old `default: break`) is what made a resumed
+            // conversation read as the agent talking to itself.
+            if let text = object["content"]?.objectValue?["text"]?.stringValue {
+                eventHandler?(.turnItem(.userMessage(
+                    id: object["messageId"]?.stringValue,
+                    text: text
+                )))
+            }
         case "tool_call":
             recordToolCallReviewContext(object)
             if let call = Self.parseToolCall(object) {

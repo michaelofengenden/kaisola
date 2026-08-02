@@ -25,6 +25,92 @@ enum AcpTranscriptRow: Codable, Identifiable, Equatable, Sendable {
     }
 }
 
+/// Reconciles user messages the ADAPTER reports against the ones the transcript
+/// already holds, so a resumed session shows the user's own prompts exactly
+/// once.
+///
+/// Both shipping adapters replay a loaded session's whole history as
+/// `session/update` notifications, `user_message_chunk` included. Kaisola also
+/// restores that same history from its own durable store, so without
+/// reconciliation every restored prompt would appear twice. Two identities are
+/// used, in order:
+///
+///  1. **The row id the store already keys on.** A replayed message the store
+///     has never seen is appended under `acp:<adapterMessageId>`, so the NEXT
+///     load recognizes its own earlier replay by id. Both adapters' message ids
+///     come out of their persisted transcript, so they are stable across loads.
+///  2. **Text, consumed one-for-one.** Rows this client wrote itself carry local
+///     ids the adapter has never heard of, so the replay of a prompt Kaisola
+///     sent can only be recognized by its text. Matching is a multiset take, not
+///     a set membership test: sending "continue" three times leaves three rows
+///     and absorbs exactly three replayed copies.
+///
+/// Pure and value-typed so both rules can be tested without an adapter.
+struct AcpUserMessageLedger: Equatable, Sendable {
+    /// Row-id prefix for a user row that came from an adapter rather than from
+    /// this client. Kept inside the existing `.user(id:)` payload so the durable
+    /// row shape — and every test that pins it — is unchanged.
+    static let adapterIDPrefix = "acp:"
+
+    enum Decision: Equatable, Sendable {
+        /// The transcript already shows this message.
+        case drop
+        /// Append a new user row under this id.
+        case append(id: String)
+    }
+
+    private var adapterIDs: Set<String> = []
+    private var unmatchedTexts: [String: Int] = [:]
+    private var generatedCounter = 0
+
+    init(rows: [AcpTranscriptRow] = []) {
+        for row in rows {
+            guard case let .user(id, text, _) = row else { continue }
+            if id.hasPrefix(Self.adapterIDPrefix) {
+                adapterIDs.insert(id)
+            }
+            unmatchedTexts[text, default: 0] += 1
+        }
+    }
+
+    /// Record a user row this client just wrote, so the adapter's replay of it
+    /// is recognized. Claude echoes multi-block prompts (anything carrying an
+    /// attachment) back live, and a later load replays every prompt, so this
+    /// covers both.
+    mutating func recordLocal(text: String) {
+        unmatchedTexts[text, default: 0] += 1
+    }
+
+    mutating func reconcile(text: String, adapterMessageID: String?) -> Decision {
+        if let adapterMessageID {
+            let rowID = Self.adapterIDPrefix + adapterMessageID
+            if adapterIDs.contains(rowID) { return .drop }
+        }
+        if let remaining = unmatchedTexts[text], remaining > 0 {
+            if remaining == 1 {
+                unmatchedTexts.removeValue(forKey: text)
+            } else {
+                unmatchedTexts[text] = remaining - 1
+            }
+            return .drop
+        }
+        let rowID: String
+        if let adapterMessageID {
+            rowID = Self.adapterIDPrefix + adapterMessageID
+            adapterIDs.insert(rowID)
+        } else {
+            // An adapter that sends no message id (Codex's rollout-file
+            // fallback) still needs a collision-free row id.
+            generatedCounter += 1
+            rowID = "\(Self.adapterIDPrefix)anon-\(generatedCounter)"
+        }
+        // Deliberately NOT recorded as an unmatched text: a history that really
+        // does contain the same prompt twice must produce two rows, and rule 1
+        // already stops a later load from replaying this one again.
+        return .append(id: rowID)
+    }
+}
+
 /// Drives one ACP agent conversation and accumulates its streaming turn into a
 /// transcript the chat view renders. Owns the AcpClient; runs on the main actor
 /// so published transcript mutations are UI-safe.
@@ -152,6 +238,12 @@ final class AcpConversation: ObservableObject {
     /// `saveDraft` is a no-op.
     var draftStorageKey: String?
     private var client: AcpClient
+    /// Reconciles adapter-reported user messages against the rows already shown.
+    private var userMessageLedger: AcpUserMessageLedger
+    /// The adapter user message whose chunks are still arriving, and the row it
+    /// opened — `nil` when the message was recognized as one already shown, in
+    /// which case its remaining chunks stay suppressed too.
+    private var streamingUserMessage: (adapterID: String, rowID: String?)?
     private var reportedFileActivityKeys: Set<String> = []
     private var reportedFileActivityOrder: [String] = []
     private static let maximumReportedFileActivityKeys = 2_048
@@ -239,6 +331,7 @@ final class AcpConversation: ObservableObject {
         self.draftStorageKey = draftKey
         self.resumeSessionID = resumeSessionID
         self.rows = initialRows
+        self.userMessageLedger = AcpUserMessageLedger(rows: initialRows)
         self.loadedRowStartOrdinal = max(0, initialRowStartOrdinal)
         self.unloadedEarlierRowCount = max(0, initialEarlierRowCount)
         self.restoredDraft = initialDraft
@@ -562,6 +655,11 @@ final class AcpConversation: ObservableObject {
         let turn = turnCounter
         let displayText = Self.userText(trimmed, attachments: attachments)
         rows.append(.user(id: rowID, text: displayText, failed: false))
+        // Claude echoes any prompt carrying more than one content block (i.e.
+        // every attachment send) straight back as `user_message_chunk`, and a
+        // later `session/load` replays all of them. Record it so neither shows
+        // up as a second copy of what the user just typed.
+        userMessageLedger.recordLocal(text: displayText)
         isRunning = true
         let dispatchClient = client
         activePromptTurn = turn
@@ -1074,6 +1172,8 @@ final class AcpConversation: ObservableObject {
             appendChunk(text, isThought: false)
         case let .thought(_, text):
             appendChunk(text, isThought: true)
+        case let .userMessage(adapterID, text):
+            appendUserChunk(adapterID: adapterID, text: text)
         case let .toolCall(call):
             rows.append(.tool(call))
             publishFileActivity(for: call)
@@ -1109,6 +1209,34 @@ final class AcpConversation: ObservableObject {
             reportedFileActivityKeys.remove(key)
         }
         reportedFileActivityOrder.removeFirst(overflow)
+    }
+
+    /// Fold one adapter-reported `user_message_chunk` into the transcript.
+    ///
+    /// A prompt made of several content blocks replays as several chunks that
+    /// share one `messageId` — Claude turns a file attachment into a link block
+    /// plus a trailing `<context>` block, so the file's whole text arrives as
+    /// extra chunks of the same message. The message is therefore decided ONCE,
+    /// on its first chunk (whose text is exactly the text this client shows for
+    /// its own sends), and every later chunk of that message follows that
+    /// decision: extending the row it opened, or staying suppressed with it.
+    /// Reconciling each chunk separately would leak a context dump into the
+    /// transcript as its own user row.
+    private func appendUserChunk(adapterID: String?, text: String) {
+        if let adapterID, streamingUserMessage?.adapterID == adapterID {
+            guard let rowID = streamingUserMessage?.rowID,
+                  let index = rows.lastIndex(where: { $0.id == "user-\(rowID)" }),
+                  case let .user(id, existing, _) = rows[index] else { return }
+            rows[index] = .user(id: id, text: existing + text, failed: false)
+            return
+        }
+        switch userMessageLedger.reconcile(text: text, adapterMessageID: adapterID) {
+        case .drop:
+            streamingUserMessage = adapterID.map { ($0, nil) }
+        case let .append(id):
+            rows.append(.user(id: id, text: text, failed: false))
+            streamingUserMessage = adapterID.map { ($0, id) }
+        }
     }
 
     private func appendChunk(_ text: String, isThought: Bool) {

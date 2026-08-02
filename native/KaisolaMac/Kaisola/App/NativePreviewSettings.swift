@@ -930,20 +930,46 @@ struct GlassBackdropWash: Equatable, Sendable {
     /// 0.0283. Thinner veil, wider gradient: spread 0.072, gradient 0.0165, and
     /// primary/secondary label contrast still 12.8:1 / 6.0:1.
     ///
-    /// v1.1.10 takes dark one more step down, 0.55 → 0.52. On its own that is a
-    /// small change and it is deliberately small: the flatness Michael reported
-    /// after the v1.1.9 pass was not the veil's doing at all but
-    /// `DesktopBackdropRenderer.bakeColorSpace`, which was rendering the dark
-    /// still as near-solid black no matter what the veil above it did. With the
-    /// still actually arriving, 45% transmission already delivers a measured
-    /// composite spread of 0.078 against light's 0.063 — dark is no longer the
-    /// flattest surface in the app. The extra three points buy margin (spread
-    /// 0.083, gradient 0.037) without leaving the frost band
-    /// `testGlassVeilsFrostTheDesktopWithoutErasingIt` holds: at 0.48
-    /// transmission the surface is still glass and not a photograph.
+    /// v1.1.10 took dark one step down, 0.55 → 0.52, and said so was
+    /// deliberately small because the flatness was a colour-space bug rather
+    /// than a veil. With that fixed and the surface finally showing what its
+    /// constants describe, Michael's next note is about the veil and only the
+    /// veil: "dark glass mode could look more glassy/translucent if possible!
+    /// especially on live and wallpaper (dark mode should be very translucent)".
+    ///
+    /// **0.52 → 0.34.** Transmission 0.48 → 0.66 — the veil now covers a third
+    /// of the surface rather than half, the largest single move this constant
+    /// has made. Measured through the real pipeline against Michael's own
+    /// desktop (the Lake Tahoe aerial macOS resolves for his rotating category),
+    /// dark sidebar at 210×900:
+    ///
+    ///     composite rgb   0.089/0.107/0.115  →  0.103/0.129/0.139
+    ///     mean luminance              0.104  →  0.124
+    ///     luminance spread p5..p95    0.086  →  0.095
+    ///     off-neutral                 0.143  →  0.165
+    ///     primary label contrast     12.7:1  →  12.1:1  (worst patch 10.9:1)
+    ///     secondary label contrast    6.0:1  →   5.8:1  (worst patch  5.5:1)
+    ///
+    /// This is only available because `DesktopBackdropRenderer`
+    /// `darkStillSpreadCeiling` bounds the still's dynamic range first. Thinning
+    /// the veil this far *without* that cap put the worst patch of the widest
+    /// wallpaper measured at **3.9:1** secondary — below the 4.5 floor. With it,
+    /// the worst patch over the five extremes of this Mac's aerial library
+    /// **improves** to 4.9:1 (from 4.6:1 at the thicker veil), because the cap
+    /// removes more of the worst case than the veil it replaces did.
+    ///
+    /// The floor is what stopped this at 0.34 rather than lower, and the binding
+    /// case is not a photograph: a wallpaper that *is* a linear gradient (macOS
+    /// ships several) passes the Gaussian untouched, so its whole range reaches
+    /// the veil. Against that fixture the worst patch measures 4.6:1 here, 4.4:1
+    /// at a 0.26 base — so roughly 0.30 is the real limit and the margin between
+    /// there and here is deliberate. Past that point extra transmission also
+    /// stops buying *structure*: the cap has to tighten in step, and
+    /// `(1 - base) × ceiling` is conserved. It keeps buying chroma, which is
+    /// most of what reads as translucency at this luminance.
     static func sidebar(isDark: Bool) -> GlassBackdropWash {
         isDark
-            ? dark(top: 0.45, base: 0.52, bottom: 0.61)
+            ? dark(top: 0.27, base: 0.34, bottom: 0.43)
             : light(top: 0.66, base: 0.60, bottom: 0.56)
     }
 
@@ -955,11 +981,36 @@ struct GlassBackdropWash: Equatable, Sendable {
 
     /// The workspace sits one step deeper than the sidebar so the inset chrome
     /// panels have something to float above: less white in light mode, more
-    /// near-black in dark mode.
+    /// near-black in dark mode. Dark moves with the sidebar and keeps its three
+    /// points of separation (0.55 → 0.37); measured composite 0.102/0.126/0.135,
+    /// spread 0.094, primary 12.2:1 (worst 11.0:1), secondary 5.9:1 (worst 5.5:1).
     static func workspace(isDark: Bool) -> GlassBackdropWash {
         isDark
-            ? dark(top: 0.48, base: 0.55, bottom: 0.64)
+            ? dark(top: 0.30, base: 0.37, bottom: 0.46)
             : light(top: 0.61, base: 0.55, bottom: 0.51)
+    }
+
+    /// The band a glass veil's transmission has to live in, per appearance.
+    ///
+    /// The contract is unchanged and still two-sided: too little transmission
+    /// and the surface is the flat #EDEDED panel of v1.1; too much and it is a
+    /// blurred photograph with a haze on it. What changed is *where the upper
+    /// bound comes from in dark*.
+    ///
+    /// It used to be 0.50 for both appearances because the veil was the only
+    /// thing keeping the desktop's brightness and dynamic range out of the
+    /// surface. In dark it no longer is: the bake normalizes the still's mean to
+    /// 0.16 **and** caps its p5..p95 range at
+    /// `DesktopBackdropRenderer.darkStillSpreadCeiling`, so "not a photograph"
+    /// is now a property of the layer underneath rather than of the layer over
+    /// it. A dark still cannot be brighter, and cannot have more range, than
+    /// those two constants allow, whatever the desktop is — which is exactly the
+    /// guarantee the 0.50 ceiling was standing in for.
+    ///
+    /// Light keeps 0.50: it has no range cap (it does not need one at a 0.72
+    /// surface), so there the veil is still the only bound.
+    static func desktopTransmissionBand(isDark: Bool) -> (floor: Double, ceiling: Double) {
+        isDark ? (floor: 0.30, ceiling: 0.70) : (floor: 0.30, ceiling: 0.50)
     }
 
     /// How much of a glass surface Increased Contrast must cover, counting the
@@ -988,15 +1039,31 @@ struct GlassBackdropWash: Equatable, Sendable {
     ///
     ///     overlay = (coverage - base) / (1 - base)
     ///
+    /// The overlay may not paint a glass surface into an opaque panel — that is
+    /// what `SidebarAppearance.solid` and Reduce Transparency are for, and an
+    /// overlay that reached 1 would make Increased Contrast silently a third
+    /// opacity setting.
+    ///
+    /// It was 0.6, and 0.6 is exactly the overlay a 0.50 base needs to reach the
+    /// 0.80 floor — so the moment the dark veil went below 0.50 the clamp would
+    /// have started binding and the accessibility guarantee would have been met
+    /// by a `min` rather than by arithmetic (0.34 + 0.6·0.66 = 0.74, not 0.80).
+    /// Raised to 0.80, which leaves the exact solutions for today's four bases
+    /// (0.60/0.55 light, 0.34/0.37 dark → 0.500/0.556/0.697/0.683) strictly
+    /// inside it, and still keeps a fifth of the surface translucent at the
+    /// extreme.
+    static let increasedContrastOverlayCeiling = 0.80
+
     /// `base` is read live from `sidebar(isDark:)` / `workspace(isDark:)` so a
     /// future veil retune re-derives this instead of falling behind. Clamped to
-    /// `[0, 0.6]`: a base that already meets the floor needs no overlay, and no
-    /// surface is ever painted into an opaque panel. The ceiling binds only if
-    /// some future base drops below 0.5; at today's 0.55–0.65 the exact
-    /// solution is 0.43–0.56 and the floor is met precisely.
+    /// `[0, increasedContrastOverlayCeiling]`: a base that already meets the
+    /// floor needs no overlay.
     private static func increasedContrastOverlay(base: Double) -> Double {
         guard base < 1 else { return 0 }
-        return min(0.6, max(0, (increasedContrastCoverage - base) / (1 - base)))
+        return min(
+            increasedContrastOverlayCeiling,
+            max(0, (increasedContrastCoverage - base) / (1 - base))
+        )
     }
 
     /// Increased Contrast overlay opacity for the sidebar veil.
@@ -1533,9 +1600,73 @@ enum DesktopBackdropRenderer {
     /// 0.078/0.106/0.119 — 0.229 off-neutral, cool but no longer coloured, and
     /// with red back at 65% of blue instead of 38%. Light is unchanged for
     /// every wallpaper dimmer than the 0.72 target, which is nearly all of them.
-    static func saturation(mean: Double, isDark: Bool) -> Double {
+    /// `gain` is divided back out because `CIColorControls`' contrast scales
+    /// channel *differences* along with the luminance range — see
+    /// `rangeGain(spread:isDark:)`. Without this the range cap would damp the
+    /// wallpaper's colour as a side effect of damping its dynamic range, which
+    /// is the one thing the whole layer exists to show.
+    static func saturation(mean: Double, isDark: Bool, gain: Double = 1) -> Double {
         let target = targetLuminance(isDark: isDark)
-        return saturationCeiling(isDark: isDark) * min(1, target / max(mean, 0.02))
+        return saturationCeiling(isDark: isDark)
+            * min(1, target / max(mean, 0.02))
+            / max(gain, 0.05)
+    }
+
+    /// The widest luminance range a **dark** baked still may carry, p5..p95 of
+    /// the 16×16 box reduction — and the constant that lets the dark veil get
+    /// out of the way.
+    ///
+    /// Michael's ask was "dark glass could look more glassy/translucent…
+    /// especially on live and wallpaper". The veil is the obvious lever and it
+    /// was already the binding one: at the shipped 0.52 base, the *worst patch*
+    /// of the most extreme wallpaper in this Mac's aerial library (`AB7FC3C3`,
+    /// luma 0.435 — a bright sky over dark ground, box spread **0.615**, 1.7×
+    /// the next widest) measured **4.6:1** secondary contrast against a 4.5
+    /// floor. There was no room to thin anything.
+    ///
+    /// The reason is that the bake normalized the still's *mean* and left its
+    /// *range* alone, so how bright the brightest patch of the sidebar got was
+    /// still a function of the user's desktop — the exact dependency
+    /// `targetLuminance` exists to remove, surviving in the second moment.
+    /// `CIColorControls`' contrast is a gain about 0.5, so solving it together
+    /// with the brightness offset removes it: the still's range is capped, its
+    /// mean still lands on target, and the surface's worst case stops depending
+    /// on the picture.
+    ///
+    /// Dark sidebar, worst-patch (brightest 2% band) secondary contrast against
+    /// a 4.5 floor, measured by rendering:
+    ///
+    ///     veil 0.52, no cap    4.6 : 1   ← shipped; already at the floor
+    ///     veil 0.34, no cap    3.9 : 1   ← thinning the veil alone fails
+    ///     veil 0.34, cap 0.30  4.9 : 1   ← shipped here
+    ///
+    /// The cap does more for the worst case than the veil it buys out, which is
+    /// why the surface can be a third more transparent *and* better on its worst
+    /// wallpaper at the same time.
+    ///
+    /// The gain is computed from the *unblurred* box, which over-states what
+    /// actually reaches the veil — radius 28 on a 176px still smooths most of a
+    /// photograph's range away, so the cap is deliberately conservative. What it
+    /// does in practice, over the five extremes of this Mac's 156-still aerial
+    /// library and with the thinner veil above: the composite's luminance spread
+    /// **rises** on four of them (0.086 → 0.095 on Michael's own desktop, 0.064 →
+    /// 0.081 on the brightest, 0.022 → 0.034 on the darkest) and **falls** on the
+    /// one whose range was the problem (0.197 → 0.158). That asymmetry is the
+    /// whole design: more wallpaper everywhere, less of the one thing that was
+    /// making the worst case a function of the desktop.
+    ///
+    /// Light has no cap — a 0.72 surface has the headroom, light was never the
+    /// complaint, and this leaves the light half of every glass measurement in
+    /// this file exactly where it was.
+    static let darkStillSpreadCeiling: Double = 0.30
+
+    /// The gain `CIColorControls.contrast` is set to, from the still's measured
+    /// p5..p95 spread. Never above 1: a wallpaper with less range than the
+    /// ceiling is passed through exactly as it was, so this only ever *removes*
+    /// an excess and can never manufacture contrast the desktop does not have.
+    static func rangeGain(spread: Double, isDark: Bool) -> Double {
+        guard isDark else { return 1 }
+        return min(1, darkStillSpreadCeiling / max(spread, 0.01))
     }
 
     /// Mean luminance the baked still is moved to, per appearance.
@@ -1558,13 +1689,23 @@ enum DesktopBackdropRenderer {
     /// brightness is a straight per-channel offset, so it moves mean luminance
     /// by exactly this amount while leaving every channel *difference* — the
     /// hue and the chroma spread the frost exists to show — untouched. An
-    /// exposure/gain step would scale chroma along with brightness and make a
-    /// dark wallpaper's tint vanish in light mode. Clamped only to keep a
-    /// degenerate decode (a fully black or blown-out still) from inverting into
-    /// a shift larger than the range it is correcting; inside the clamp the
+    /// exposure step would scale chroma along with brightness and make a dark
+    /// wallpaper's tint vanish in light mode. Clamped only to keep a degenerate
+    /// decode (a fully black or blown-out still) from inverting into a shift
+    /// larger than the range it is correcting; inside the clamp the
     /// normalization is exact.
-    static func luminanceShift(mean: Double, isDark: Bool) -> Double {
-        min(0.9, max(-0.9, targetLuminance(isDark: isDark) - mean))
+    ///
+    /// `gain` is the range cap's contrast, and it has to be solved *with* the
+    /// offset rather than before it. Measured on the real filter (see
+    /// `rangeGain(spread:isDark:)`), `CIColorControls` evaluates saturation,
+    /// then contrast about **0.5**, then brightness — so a gain below 1 has
+    /// already moved the mean to `(mean - 0.5) · gain + 0.5` by the time this
+    /// offset lands, and normalizing against the raw mean would miss by
+    /// `(0.5 - mean) · (1 - gain)`. At gain 1 this is the identical expression
+    /// it always was.
+    static func luminanceShift(mean: Double, isDark: Bool, gain: Double = 1) -> Double {
+        let pivoted = (mean - 0.5) * gain + 0.5
+        return min(0.9, max(-0.9, targetLuminance(isDark: isDark) - pivoted))
     }
 
     /// Dynamic desktops pack every hour of the day into one HEIC with nothing
@@ -1598,12 +1739,18 @@ enum DesktopBackdropRenderer {
             ?? DesktopTintSampler.fallback
         let mean = pixels.flatMap { DesktopTintSampler.meanLuminance(rgba: $0) }
             ?? targetLuminance(isDark: key.isDark)
-        let brightness = luminanceShift(mean: mean, isDark: key.isDark)
-        let saturation = saturation(mean: mean, isDark: key.isDark)
+        // The range cap reads the same 16×16 reduction the mean does, so
+        // bounding the still's dynamic range costs no extra decode and no extra
+        // draw — one box, three products.
+        let spread = pixels.flatMap { DesktopTintSampler.luminanceSpread(rgba: $0) } ?? 0
+        let gain = rangeGain(spread: spread, isDark: key.isDark)
+        let brightness = luminanceShift(mean: mean, isDark: key.isDark, gain: gain)
+        let saturation = saturation(mean: mean, isDark: key.isDark, gain: gain)
         guard let blurred = blur(
             still,
             brightness: brightness,
-            saturation: saturation
+            saturation: saturation,
+            gain: gain
         ) else { return .flat(tint) }
         return .wallpaper(blurred, tint: tint)
     }
@@ -1657,7 +1804,8 @@ enum DesktopBackdropRenderer {
     private static func blur(
         _ image: CGImage,
         brightness: Double,
-        saturation: Double
+        saturation: Double,
+        gain: Double
     ) -> CGImage? {
         let input = CIImage(cgImage: image)
         let extent = input.extent
@@ -1667,14 +1815,17 @@ enum DesktopBackdropRenderer {
         gaussian.radius = Float(blurRadius)
         guard let softened = gaussian.outputImage else { return nil }
 
-        // Both normalizations ride the one `CIColorControls` pass already in
-        // the chain, so neither costs an extra filter. Saturation is applied
-        // about the pixel's own luminance and brightness is the offset after
-        // it, which is why the two have to be solved together rather than
-        // treating the chroma as a fixed constant — see `saturation(mean:isDark:)`.
+        // All three normalizations ride the one `CIColorControls` pass already
+        // in the chain, so none costs an extra filter. The filter evaluates
+        // saturation, then contrast about 0.5, then brightness — measured, not
+        // assumed — which is why chroma, range and mean have to be solved
+        // together rather than treated as three independent constants. See
+        // `saturation(mean:isDark:gain:)`, `rangeGain(spread:isDark:)` and
+        // `luminanceShift(mean:isDark:gain:)`.
         let controls = CIFilter.colorControls()
         controls.inputImage = softened
         controls.saturation = Float(saturation)
+        controls.contrast = Float(gain)
         controls.brightness = Float(brightness)
         guard let output = controls.outputImage else { return nil }
 
@@ -1756,6 +1907,33 @@ enum DesktopTintSampler {
     static func meanLuminance(rgba: [UInt8]) -> Double? {
         guard let average = plainAverage(rgba: rgba) else { return nil }
         return average.0 * 0.2126 + average.1 * 0.7152 + average.2 * 0.0722
+    }
+
+    /// The wallpaper's p5..p95 luminance range, read from the same box the mean
+    /// is — the *second* moment the bake normalizes, and the one that decides
+    /// how bright the brightest patch of a glass surface gets.
+    ///
+    /// Percentiles rather than min..max because a 16×16 box has 256 samples and
+    /// one blown highlight in a corner should not set the gain for the whole
+    /// picture. Two samples either end are trimmed, so a wallpaper needs a real
+    /// bright *region* to be treated as high-range.
+    static func luminanceSpread(rgba: [UInt8]) -> Double? {
+        var lumas: [Double] = []
+        var index = 0
+        while index + 3 < rgba.count {
+            if Double(rgba[index + 3]) / 255 > 0.05 {
+                lumas.append(
+                    Double(rgba[index]) / 255 * 0.2126
+                        + Double(rgba[index + 1]) / 255 * 0.7152
+                        + Double(rgba[index + 2]) / 255 * 0.0722
+                )
+            }
+            index += 4
+        }
+        guard lumas.count >= 20 else { return nil }
+        lumas.sort()
+        let count = Double(lumas.count)
+        return lumas[Int(count * 0.95)] - lumas[Int(count * 0.05)]
     }
 
     private static func plainAverage(rgba: [UInt8]) -> (Double, Double, Double)? {
@@ -2385,6 +2563,9 @@ struct DesktopGlassLayer: View {
     /// appearance AppKit's materials are near-white and pass almost no desktop
     /// colour through, so live mode needs the sampled average to carry the hue.
     /// The painted wallpaper already is the hue and must not be tinted twice.
+    ///
+    /// See `SidebarBackdropView` for why the dark half of the pair is so much
+    /// smaller than the light one.
     var liveTint: (dark: Double, light: Double)?
 
     @Environment(\.colorScheme) private var colorScheme
@@ -2472,6 +2653,29 @@ struct DesktopGlassLayer: View {
 /// Reusable material used by both the project sidebar and the workspace file
 /// rail, keeping the two left-hand navigation surfaces visually coherent.
 struct SidebarBackdropView: View {
+    /// Coverage of the sampled desktop average laid over *live* vibrancy.
+    ///
+    /// Michael's translucency note names both glass sources — "especially on
+    /// live and wallpaper" — and in Live the veil is not the only thing between
+    /// the user and the desktop: this tint sits under it, so the two coverages
+    /// multiply. At the shipped pair the dark Live sidebar passed
+    /// `(1 - 0.30) · (1 - 0.52) = 0.336` of the material; the thinner veil alone
+    /// takes that to 0.462, and halving the dark tint takes it to **0.561** —
+    /// the material behind the window contributes 67% more than it did.
+    ///
+    /// Halving *dark* specifically, and leaving light at 0.26, is the same
+    /// argument this layer was introduced with rather than a new one: the tint
+    /// exists because AppKit's light materials are near-white and eat the
+    /// desktop's hue, which is a light-appearance problem. A dark `.sidebar`
+    /// material is already dark and already carries the desktop's colour, so
+    /// most of what a 0.30 tint did there was dim it — the very complaint.
+    ///
+    /// (Unlike the wallpaper source, this cannot be measured offline: it lands
+    /// on live vibrancy, whose input is whatever is behind the window. The
+    /// numbers above are compositing algebra over the two declared coverages,
+    /// which is exactly as much as is knowable without a screenshot.)
+    static let liveTint = (dark: 0.15, light: 0.26)
+
     @Environment(\.colorScheme) private var colorScheme
     @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
     @Environment(\.colorSchemeContrast) private var accessibilityContrast
@@ -2485,7 +2689,7 @@ struct SidebarBackdropView: View {
                 Color(nsColor: .controlBackgroundColor)
             } else {
                 ZStack {
-                    DesktopGlassLayer(liveMaterial: .sidebar, liveTint: (dark: 0.30, light: 0.26))
+                    DesktopGlassLayer(liveMaterial: .sidebar, liveTint: Self.liveTint)
                     GlassBackdropWash.sidebar(isDark: colorScheme == .dark).veil
                     if accessibilityContrast == .increased {
                         Color(nsColor: .controlBackgroundColor)

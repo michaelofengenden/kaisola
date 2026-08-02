@@ -290,6 +290,274 @@ enum AcpComposerMetrics {
     }
 }
 
+// MARK: - Settings menu
+
+/// One top-level row of the composer's settings menu: `Label … value ›`.
+///
+/// The menu is a *disclosure* list, not a list of controls: every row states
+/// the setting's name, the value in force, and that there is more behind it.
+/// Nothing is chosen at this level, so nothing here needs a widget.
+struct AcpComposerMenuRow: Equatable, Sendable, Identifiable {
+    enum Target: Equatable, Sendable {
+        case agent
+        case model
+        /// An adapter-declared configuration option, by its ACP id.
+        case option(String)
+    }
+
+    let target: Target
+    let label: String
+    let value: String
+
+    var id: String {
+        switch target {
+        case .agent: return "agent"
+        case .model: return "model"
+        case .option(let id): return "option.\(id)"
+        }
+    }
+}
+
+/// One row of a submenu panel: a name, an optional grey caption under it, and
+/// a checkmark when it is the value in force.
+struct AcpComposerMenuOption: Equatable, Sendable, Identifiable {
+    let id: String
+    let name: String
+    /// The small grey line the reference puts under a row that needs a
+    /// sentence — the model's raw identifier, or what choosing an agent will
+    /// actually do. `nil` for the overwhelming majority of rows.
+    let caption: String?
+    let isSelected: Bool
+    /// A row that cannot be chosen is still listed and still spoken. An agent
+    /// with no ACP adapter is a fact about the app; omitting it would read as
+    /// a bug, and greying it with the reason reads as the truth.
+    var isEnabled = true
+}
+
+/// A submenu panel: a grey section header over its options.
+struct AcpComposerSubmenu: Equatable, Sendable {
+    let title: String
+    let options: [AcpComposerMenuOption]
+
+    /// Search is a cost, not a feature. It appears only once a panel is long
+    /// enough that reading it top to bottom stops working.
+    var showsSearch: Bool { options.count > AcpComposerMenu.searchThreshold }
+}
+
+enum AcpComposerMenu {
+    static let searchThreshold = 8
+
+    /// Leading words that qualify a setting rather than name it. The reference
+    /// menu's rows are one word wide — "Model", "Effort", "Speed" — because the
+    /// panel is already the context; "Reasoning effort" spends a line saying so
+    /// again.
+    private static let qualifiers: Set<String> = ["reasoning", "agent", "model", "session"]
+
+    static func rows(
+        agentName: String,
+        models: [AcpSessionInfo.Model],
+        currentModelID: String?,
+        configOptions: [AcpConfigOption]
+    ) -> [AcpComposerMenuRow] {
+        var rows = [AcpComposerMenuRow(target: .agent, label: "Agent", value: agentName)]
+        if let model = currentModel(models: models, currentModelID: currentModelID) {
+            rows.append(AcpComposerMenuRow(target: .model, label: "Model", value: model.name))
+        }
+        for option in configOptions where !option.choices.isEmpty {
+            let value = AcpComposerMetrics.optionLabel(option) ?? option.choices[0].name
+            rows.append(AcpComposerMenuRow(
+                target: .option(option.id),
+                label: shortLabel(name: option.name, id: option.id),
+                value: value
+            ))
+        }
+        return rows
+    }
+
+    /// Adapters may report models before naming a current one; the first
+    /// declared model is the one in force until they do, exactly as with modes.
+    static func currentModel(
+        models: [AcpSessionInfo.Model],
+        currentModelID: String?
+    ) -> AcpSessionInfo.Model? {
+        guard let currentModelID else { return models.first }
+        return models.first { $0.id == currentModelID } ?? models.first
+    }
+
+    static func shortLabel(name: String, id: String) -> String {
+        let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return capitalizedFirst(id) }
+        var words = trimmed.split(separator: " ").map(String.init)
+        if words.count > 1, qualifiers.contains(words[0].lowercased()) {
+            words.removeFirst()
+        }
+        return capitalizedFirst(words.joined(separator: " "))
+    }
+
+    // MARK: Submenus
+
+    static func modelSubmenu(
+        models: [AcpSessionInfo.Model],
+        currentModelID: String?,
+        favorites: Set<String>,
+        query: String
+    ) -> AcpComposerSubmenu {
+        let selectedID = currentModel(models: models, currentModelID: currentModelID)?.id
+        let options = AcpModelPicker.choices(
+            models: models,
+            currentID: selectedID,
+            favorites: favorites,
+            query: query
+        ).map { choice in
+            AcpComposerMenuOption(
+                id: choice.id,
+                name: choice.name,
+                caption: choice.subtitle,
+                isSelected: choice.isCurrent
+            )
+        }
+        return AcpComposerSubmenu(title: "Model", options: options)
+    }
+
+    static func optionSubmenu(_ option: AcpConfigOption) -> AcpComposerSubmenu {
+        let selected = option.currentValue ?? option.choices.first?.value
+        return AcpComposerSubmenu(
+            title: shortLabel(name: option.name, id: option.id),
+            options: option.choices.map { choice in
+                AcpComposerMenuOption(
+                    id: choice.value,
+                    name: choice.name,
+                    caption: nil,
+                    isSelected: choice.value == selected
+                )
+            }
+        )
+    }
+
+    /// The agent list, in registry order, with the one driving this chat
+    /// checked.
+    ///
+    /// Every other row carries a caption, because the single thing this menu
+    /// must never imply is that the conversation moves. An ACP session is bound
+    /// to one adapter process for its whole life — see `AcpAgentSwitch`.
+    static func agentSubmenu(
+        agents: [AgentProfile],
+        currentAgentID: String,
+        isChatCapable: (String) -> Bool
+    ) -> AcpComposerSubmenu {
+        let options = agents.map { agent -> AcpComposerMenuOption in
+            let isCurrent = agent.id == currentAgentID
+            let capable = isCurrent || isChatCapable(agent.id)
+            return AcpComposerMenuOption(
+                id: agent.id,
+                name: agent.name,
+                caption: isCurrent
+                    ? nil
+                    : (capable ? "Starts a new chat" : "Terminal only — no chat adapter"),
+                isSelected: isCurrent,
+                isEnabled: capable
+            )
+        }
+        return AcpComposerSubmenu(title: "Agent", options: options)
+    }
+
+    // MARK: Advanced disclosure
+
+    /// What the pill cannot hold and no row can change: statements, not
+    /// controls. An empty result hides the disclosure entirely rather than
+    /// opening onto a blank panel.
+    static func advancedLines(
+        usage: AcpUsage?,
+        currentModelID: String?,
+        models: [AcpSessionInfo.Model]
+    ) -> [String] {
+        var lines: [String] = []
+        if let usage, usage.max > 0 {
+            lines.append(
+                "Context used: \(AcpComposerMetrics.compactTokens(usage.used))"
+                    + " of \(AcpComposerMetrics.compactTokens(usage.max))"
+            )
+        }
+        if let model = currentModel(models: models, currentModelID: currentModelID),
+           folded(model.id) != folded(model.name) {
+            lines.append("Model id: \(model.id)")
+        }
+        return lines
+    }
+
+    // MARK: Chip
+
+    /// The pill's face: `<primary> <secondary in grey> ⌄`, matching the
+    /// reference's `5.6 Sol Light`. The model leads because it is what the
+    /// message will be spent on; the effort follows because it is the setting
+    /// most likely to have been changed since.
+    static func chipValues(
+        agentName: String,
+        modelName: String?,
+        option: AcpConfigOption?
+    ) -> (primary: String, secondary: String?) {
+        let model = (modelName ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        return (model.isEmpty ? agentName : model, AcpComposerMetrics.optionLabel(option))
+    }
+
+    // MARK: Keyboard
+
+    /// Move a highlight by one row, wrapping. `nil` enters the list from the
+    /// end the arrow came from.
+    static func move(from index: Int?, by delta: Int, count: Int) -> Int? {
+        guard count > 0 else { return nil }
+        guard let index else { return delta > 0 ? 0 : count - 1 }
+        return ((index + delta) % count + count) % count
+    }
+
+    /// The same walk, refusing to park the highlight on a row Return cannot
+    /// activate.
+    static func move(from index: Int?, by delta: Int, enabled: [Bool]) -> Int? {
+        guard enabled.contains(true) else { return nil }
+        var candidate = index
+        for _ in 0..<enabled.count {
+            guard let next = move(from: candidate, by: delta, count: enabled.count) else { return nil }
+            if enabled[next] { return next }
+            candidate = next
+        }
+        return nil
+    }
+
+    private static func capitalizedFirst(_ value: String) -> String {
+        guard let first = value.first else { return value }
+        return first.uppercased() + value.dropFirst()
+    }
+
+    private static func folded(_ value: String) -> String {
+        value.lowercased().filter { $0.isLetter || $0.isNumber }
+    }
+}
+
+/// What choosing an agent in the composer can actually do.
+///
+/// An ACP conversation is one adapter process holding one session: the
+/// protocol has no move, and `AcpConversation` fixes its command, arguments,
+/// and cwd at construction. So a "switch" is a new chat beside the old one —
+/// never a silent handoff, and never a discarded transcript.
+enum AcpAgentSwitchDecision: Equatable, Sendable {
+    case alreadyCurrent
+    /// The agent has no ACP adapter, so it cannot drive a chat at all.
+    case unavailable
+    case startNewChat(String)
+}
+
+enum AcpAgentSwitch {
+    static func decision(
+        agentID: String,
+        currentAgentID: String,
+        isChatCapable: (String) -> Bool
+    ) -> AcpAgentSwitchDecision {
+        if agentID == currentAgentID { return .alreadyCurrent }
+        guard isChatCapable(agentID) else { return .unavailable }
+        return .startNewChat(agentID)
+    }
+}
+
 // MARK: - Agent identity
 
 enum AcpAgentIdentity {

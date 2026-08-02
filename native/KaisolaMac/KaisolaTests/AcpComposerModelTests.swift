@@ -200,6 +200,234 @@ final class AcpComposerModelTests: XCTestCase {
         XCTAssertEqual(choices.map(\.id), ["claude-haiku-4-5"])
     }
 
+    // MARK: - Settings menu rows
+
+    private var effortOption: AcpConfigOption {
+        AcpConfigOption(id: "effort", name: "Reasoning effort", currentValue: "light", choices: [
+            .init(value: "light", name: "Light"),
+            .init(value: "medium", name: "Medium"),
+            .init(value: "high", name: "High"),
+        ])
+    }
+
+    func testMenuLeadsWithAgentThenModelThenTheDeclaredOptions() {
+        let rows = AcpComposerMenu.rows(
+            agentName: "Claude",
+            models: models,
+            currentModelID: "claude-sonnet-4-5",
+            configOptions: [effortOption]
+        )
+        XCTAssertEqual(rows.map(\.label), ["Agent", "Model", "Effort"])
+        XCTAssertEqual(rows.map(\.value), ["Claude", "Sonnet 4.5", "Light"])
+        XCTAssertEqual(rows.map(\.target), [.agent, .model, .option("effort")])
+    }
+
+    /// An adapter that declares no models gets no Model row: a row whose
+    /// submenu would be empty is a dead button, not a disclosure.
+    func testMenuOmitsRowsTheAdapterCannotFill() {
+        let rows = AcpComposerMenu.rows(
+            agentName: "Claude",
+            models: [],
+            currentModelID: nil,
+            configOptions: [AcpConfigOption(id: "preset", name: "Preset", currentValue: nil, choices: [])]
+        )
+        XCTAssertEqual(rows.map(\.label), ["Agent"])
+    }
+
+    /// Nothing is selected yet: the adapter's first declared model is the one
+    /// in force, exactly as with permission modes.
+    func testModelRowFallsBackToTheFirstDeclaredModel() {
+        let rows = AcpComposerMenu.rows(
+            agentName: "Claude", models: models, currentModelID: nil, configOptions: []
+        )
+        XCTAssertEqual(rows.first(where: { $0.target == .model })?.value, "Opus 4.5")
+    }
+
+    func testOptionLabelsAreShortenedToTheWordThatVaries() {
+        XCTAssertEqual(AcpComposerMenu.shortLabel(name: "Reasoning effort", id: "effort"), "Effort")
+        XCTAssertEqual(AcpComposerMenu.shortLabel(name: "effort", id: "effort"), "Effort")
+        XCTAssertEqual(AcpComposerMenu.shortLabel(name: "Speed", id: "speed"), "Speed")
+        // Only a leading qualifier is dropped; a two-word name that says two
+        // things keeps both.
+        XCTAssertEqual(AcpComposerMenu.shortLabel(name: "Approval preset", id: "preset"), "Approval preset")
+        XCTAssertEqual(AcpComposerMenu.shortLabel(name: "   ", id: "preset"), "Preset")
+    }
+
+    // MARK: - Submenus
+
+    func testModelSubmenuChecksTheCurrentRowAndCaptionsAUsefulIdentifier() {
+        let submenu = AcpComposerMenu.modelSubmenu(
+            models: [
+                AcpSessionInfo.Model(id: "gpt-5.6-sol", name: "GPT-5.6-Sol"),
+                AcpSessionInfo.Model(id: "claude-sonnet-4-5-20250929", name: "Sonnet 4.5"),
+            ],
+            currentModelID: "claude-sonnet-4-5-20250929",
+            favorites: [],
+            query: ""
+        )
+        XCTAssertEqual(submenu.title, "Model")
+        XCTAssertEqual(submenu.options.map(\.isSelected), [false, true])
+        XCTAssertNil(submenu.options[0].caption)
+        XCTAssertEqual(submenu.options[1].caption, "claude-sonnet-4-5-20250929")
+        XCTAssertTrue(submenu.options.allSatisfy(\.isEnabled))
+    }
+
+    /// Favourites survive the redesign only as a group that floats to the top.
+    /// There is no star column, so nothing about the row says "favourite".
+    func testModelSubmenuFloatsFavouritesWithoutMarkingThem() {
+        let submenu = AcpComposerMenu.modelSubmenu(
+            models: models,
+            currentModelID: "claude-opus-4-5",
+            favorites: ["claude-haiku-4-5"],
+            query: ""
+        )
+        XCTAssertEqual(submenu.options.map(\.name), ["Haiku 4.5", "Opus 4.5", "Sonnet 4.5"])
+        XCTAssertEqual(submenu.options.map(\.isSelected), [false, true, false])
+    }
+
+    func testModelSubmenuStillFiltersOnAQuery() {
+        let submenu = AcpComposerMenu.modelSubmenu(
+            models: models, currentModelID: nil, favorites: [], query: "haiku"
+        )
+        XCTAssertEqual(submenu.options.map(\.name), ["Haiku 4.5"])
+    }
+
+    /// Search is a cost, not a feature: it only appears once a submenu is long
+    /// enough that scanning it stops working.
+    func testSearchAppearsOnlyBeyondEightOptions() {
+        func submenu(count: Int) -> AcpComposerSubmenu {
+            AcpComposerMenu.modelSubmenu(
+                models: (1...count).map { AcpSessionInfo.Model(id: "m\($0)", name: "Model \($0)") },
+                currentModelID: nil,
+                favorites: [],
+                query: ""
+            )
+        }
+        XCTAssertFalse(submenu(count: 8).showsSearch)
+        XCTAssertTrue(submenu(count: 9).showsSearch)
+    }
+
+    func testOptionSubmenuMarksTheChosenValue() {
+        let submenu = AcpComposerMenu.optionSubmenu(effortOption)
+        XCTAssertEqual(submenu.title, "Effort")
+        XCTAssertEqual(submenu.options.map(\.name), ["Light", "Medium", "High"])
+        XCTAssertEqual(submenu.options.map(\.isSelected), [true, false, false])
+        XCTAssertFalse(submenu.showsSearch)
+    }
+
+    // MARK: - Agent submenu
+
+    private var registryAgents: [AgentProfile] {
+        [
+            AgentProfile(id: "claude-code", name: "Claude", launchCommand: "claude", symbol: "sparkle"),
+            AgentProfile(id: "codex", name: "Codex", launchCommand: "codex", symbol: "chevron.left.forwardslash.chevron.right"),
+            AgentProfile(id: "opencode", name: "OpenCode", launchCommand: "opencode", symbol: "curlybraces"),
+        ]
+    }
+
+    private func chatCapable(_ id: String) -> Bool { id == "claude-code" || id == "codex" }
+
+    func testAgentSubmenuChecksTheAgentDrivingThisChat() {
+        let submenu = AcpComposerMenu.agentSubmenu(
+            agents: registryAgents,
+            currentAgentID: "codex",
+            isChatCapable: chatCapable
+        )
+        XCTAssertEqual(submenu.title, "Agent")
+        XCTAssertEqual(submenu.options.map(\.id), ["claude-code", "codex", "opencode"])
+        XCTAssertEqual(submenu.options.map(\.isSelected), [false, true, false])
+    }
+
+    /// The one thing this menu must never do is imply the conversation moves.
+    /// Every switchable row says, in its own caption, what pressing it does.
+    func testEveryOtherAgentSaysItStartsANewChat() {
+        let submenu = AcpComposerMenu.agentSubmenu(
+            agents: registryAgents, currentAgentID: "codex", isChatCapable: chatCapable
+        )
+        XCTAssertNil(submenu.options[1].caption)
+        XCTAssertEqual(submenu.options[0].caption, "Starts a new chat")
+    }
+
+    /// An agent with no ACP adapter cannot drive a chat at all. Hiding it would
+    /// read as an omission; listing it disabled with the reason is the truth.
+    func testAgentsWithoutAnAdapterStayVisibleButUnselectable() {
+        let submenu = AcpComposerMenu.agentSubmenu(
+            agents: registryAgents, currentAgentID: "claude-code", isChatCapable: chatCapable
+        )
+        let openCode = try? XCTUnwrap(submenu.options.first { $0.id == "opencode" })
+        XCTAssertEqual(openCode?.isEnabled, false)
+        XCTAssertEqual(openCode?.caption, "Terminal only — no chat adapter")
+        XCTAssertEqual(submenu.options.filter(\.isEnabled).map(\.id), ["claude-code", "codex"])
+    }
+
+    // MARK: - Agent switch
+
+    func testChoosingTheCurrentAgentDoesNothing() {
+        XCTAssertEqual(
+            AcpAgentSwitch.decision(agentID: "codex", currentAgentID: "codex", isChatCapable: chatCapable),
+            .alreadyCurrent
+        )
+    }
+
+    func testChoosingAnAgentWithoutAnAdapterIsRefused() {
+        XCTAssertEqual(
+            AcpAgentSwitch.decision(agentID: "opencode", currentAgentID: "codex", isChatCapable: chatCapable),
+            .unavailable
+        )
+    }
+
+    /// ACP binds a conversation to one adapter process for its whole life:
+    /// there is no protocol move. So the honest switch is a new chat beside the
+    /// old one, which stays open with its transcript intact.
+    func testChoosingAnotherChatCapableAgentStartsANewChat() {
+        XCTAssertEqual(
+            AcpAgentSwitch.decision(agentID: "claude-code", currentAgentID: "codex", isChatCapable: chatCapable),
+            .startNewChat("claude-code")
+        )
+    }
+
+    // MARK: - Advanced disclosure
+
+    func testAdvancedStatesWhatTheChipCannotHold() {
+        let lines = AcpComposerMenu.advancedLines(
+            usage: AcpUsage(used: 12_000, max: 1_000_000),
+            currentModelID: "claude-sonnet-4-5-20250929",
+            models: [AcpSessionInfo.Model(id: "claude-sonnet-4-5-20250929", name: "Sonnet 4.5")]
+        )
+        XCTAssertEqual(lines, ["Context used: 12k of 1M", "Model id: claude-sonnet-4-5-20250929"])
+    }
+
+    /// Nothing to disclose, no disclosure: the row is hidden rather than
+    /// opening onto an empty panel.
+    func testAdvancedDisappearsWhenThereIsNothingToSay() {
+        XCTAssertTrue(AcpComposerMenu.advancedLines(usage: nil, currentModelID: nil, models: []).isEmpty)
+        XCTAssertTrue(AcpComposerMenu.advancedLines(
+            usage: AcpUsage(used: 0, max: 0),
+            currentModelID: "sonnet",
+            models: [AcpSessionInfo.Model(id: "sonnet", name: "Sonnet")]
+        ).isEmpty)
+    }
+
+    // MARK: - Keyboard navigation
+
+    func testArrowKeysWrapAroundTheRows() {
+        XCTAssertEqual(AcpComposerMenu.move(from: nil, by: 1, count: 3), 0)
+        XCTAssertEqual(AcpComposerMenu.move(from: nil, by: -1, count: 3), 2)
+        XCTAssertEqual(AcpComposerMenu.move(from: 2, by: 1, count: 3), 0)
+        XCTAssertEqual(AcpComposerMenu.move(from: 0, by: -1, count: 3), 2)
+        XCTAssertNil(AcpComposerMenu.move(from: nil, by: 1, count: 0))
+    }
+
+    /// Arrowing past a disabled row must not park the highlight on something
+    /// Return cannot activate.
+    func testArrowKeysSkipDisabledRows() {
+        let enabled = [true, false, true]
+        XCTAssertEqual(AcpComposerMenu.move(from: 0, by: 1, enabled: enabled), 2)
+        XCTAssertEqual(AcpComposerMenu.move(from: 2, by: 1, enabled: enabled), 0)
+        XCTAssertEqual(AcpComposerMenu.move(from: 0, by: -1, enabled: enabled), 2)
+        XCTAssertNil(AcpComposerMenu.move(from: nil, by: 1, enabled: [false, false]))
+    }
+
     // MARK: - Favourites store
 
     func testFavouritesStoreRoundTripsPerAgent() throws {
@@ -297,6 +525,24 @@ final class AcpComposerModelTests: XCTestCase {
     func testIdentityFallsBackToScanningTheWholeTitle() {
         XCTAssertEqual(AcpAgentIdentity.identity(fromChatTitle: "Rewrite the parser with Claude"), .claude)
         XCTAssertEqual(AcpAgentIdentity.identity(fromChatTitle: "Zebra"), .letter("Z"))
+    }
+
+    /// The pill reads `<primary> <secondary in grey> ⌄`: the model, then the
+    /// setting most likely to have been changed since.
+    func testPillReadsModelThenEffort() {
+        let values = AcpComposerMenu.chipValues(
+            agentName: "Codex",
+            modelName: "GPT-5.6-Sol",
+            option: effortOption
+        )
+        XCTAssertEqual(values.primary, "GPT-5.6-Sol")
+        XCTAssertEqual(values.secondary, "Light")
+    }
+
+    func testPillFallsBackToTheAgentWhenNoModelIsDeclared() {
+        let values = AcpComposerMenu.chipValues(agentName: "Claude", modelName: nil, option: nil)
+        XCTAssertEqual(values.primary, "Claude")
+        XCTAssertNil(values.secondary)
     }
 
     func testChipLabelAvoidsSayingTheBrandTwice() {

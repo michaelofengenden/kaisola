@@ -209,6 +209,7 @@ struct SettingsView: View {
         case .models: ApiKeysSettingsTab(settings: settings).scrollContentBackground(.hidden)
         case .shortcuts: CommandKeymapSettingsView()
         case .usage: UsageSettingsTab(workspace: workspace).scrollContentBackground(.hidden)
+        case .updates: softwareUpdates.scrollContentBackground(.hidden)
         }
     }
 
@@ -346,6 +347,40 @@ struct SettingsView: View {
                             .background(.quaternary.opacity(0.45), in: RoundedRectangle(cornerRadius: 8))
                             .accessibilityLabel("External editor")
                     }
+                }
+            }
+            .padding(18)
+        }
+    }
+
+    /// Updates get their own section rather than a footnote under General.
+    ///
+    /// They used to be three rows below the external-editor field, at the
+    /// bottom of the longest card in Settings — reachable, but only if you
+    /// already knew to scroll General looking for them. Whether the app you are
+    /// running is the current one is not a General preference; it is its own
+    /// question, and the first one people go to Settings to answer. Michael:
+    /// "software updates should be easily accessible in settings."
+    private var softwareUpdates: some View {
+        ScrollView {
+            VStack(spacing: 16) {
+                SettingsCard(title: "Software updates", symbol: "arrow.triangle.2.circlepath") {
+                    SettingsRow(
+                        title: "This copy of Kaisola",
+                        detail: softwareUpdateDetail,
+                        symbol: "app.badge.checkmark"
+                    ) {
+                        if updates.pendingUpdate != nil {
+                            Button("Restart and Update") { restartRequest = RestartRequest() }
+                                .buttonStyle(.borderedProminent)
+                                .controlSize(.small)
+                        } else {
+                            Button("Check Now") { checkForUpdates?() }
+                                .buttonStyle(.bordered)
+                                .controlSize(.small)
+                                .disabled(checkForUpdates == nil)
+                        }
+                    }
                     SettingsDivider()
                     SettingsRow(
                         title: "Check for updates automatically",
@@ -379,19 +414,6 @@ struct SettingsView: View {
                                   || !updates.allowsAutomaticUpdates
                                   || !updates.automaticallyChecksForUpdates)
                         .accessibilityLabel("Download updates in the background")
-                    }
-                    SettingsDivider()
-                    SettingsRow(title: "Software updates", detail: softwareUpdateDetail, symbol: "arrow.triangle.2.circlepath") {
-                        if updates.pendingUpdate != nil {
-                            Button("Restart and Update") { restartRequest = RestartRequest() }
-                                .buttonStyle(.borderedProminent)
-                                .controlSize(.small)
-                        } else {
-                            Button("Check Now") { checkForUpdates?() }
-                                .buttonStyle(.bordered)
-                                .controlSize(.small)
-                                .disabled(checkForUpdates == nil)
-                        }
                     }
                 }
             }
@@ -679,7 +701,7 @@ struct SettingsView: View {
 }
 
 private enum SettingsSection: String, CaseIterable, Identifiable {
-    case general, terminal, companion, guardrails, mcp, accounts, agents, models, shortcuts, usage
+    case general, terminal, companion, guardrails, mcp, accounts, agents, models, shortcuts, usage, updates
     var id: String { rawValue }
     var title: String {
         switch self {
@@ -693,6 +715,7 @@ private enum SettingsSection: String, CaseIterable, Identifiable {
         case .models: "Models & Keys"
         case .shortcuts: "Keyboard"
         case .usage: "Usage"
+        case .updates: "Updates"
         }
     }
     var subtitle: String {
@@ -707,6 +730,7 @@ private enum SettingsSection: String, CaseIterable, Identifiable {
         case .models: "Provider credentials, models, and routing"
         case .shortcuts: "Shortcuts and keymap.json overrides"
         case .usage: "Provider limits and live context"
+        case .updates: "Version, automatic checks, and downloads"
         }
     }
     var symbol: String {
@@ -721,6 +745,7 @@ private enum SettingsSection: String, CaseIterable, Identifiable {
         case .models: "key"
         case .shortcuts: "keyboard"
         case .usage: "gauge.with.dots.needle.bottom.50percent"
+        case .updates: "arrow.triangle.2.circlepath"
         }
     }
 }

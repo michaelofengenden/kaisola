@@ -23,7 +23,7 @@ struct SubscriptionCardView: View {
     var onRemove: (() -> Void)?
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 10) {
+        VStack(alignment: .leading, spacing: 8) {
             header
             authLine
             if let usage, !usage.windows.isEmpty {
@@ -38,7 +38,7 @@ struct SubscriptionCardView: View {
             }
             footer
         }
-        .padding(12)
+        .padding(10)
         .background(.quaternary.opacity(0.28), in: RoundedRectangle(cornerRadius: KaisolaVisualSystem.cardRadius, style: .continuous))
         .overlay {
             RoundedRectangle(cornerRadius: KaisolaVisualSystem.cardRadius, style: .continuous)
@@ -49,7 +49,7 @@ struct SubscriptionCardView: View {
     // MARK: - Header
 
     private var header: some View {
-        HStack(spacing: 9) {
+        HStack(spacing: 8) {
             ZStack(alignment: .topLeading) {
                 // The mark the sidebar and the Accounts list both draw. This was
                 // a generic `sparkle` / `chevron` pair, so one account wore a

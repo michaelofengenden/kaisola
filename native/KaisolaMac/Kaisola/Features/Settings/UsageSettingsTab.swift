@@ -106,10 +106,17 @@ struct UsageSettingsTab: View {
                             // longest line (an email and an org), so a wide
                             // window shows two or three abreast and a narrow
                             // one falls back to the single column it had.
+                            // Two per row at the narrowest Settings can be, more
+                            // as it widens. 320 needed a wide window before it
+                            // broke into columns, which put us back to scrolling
+                            // one account at a time; the card's own content — a
+                            // label, a plan pill, three meters — sits happily at
+                            // 250, and the directory line truncates as it always
+                            // did.
                             LazyVGrid(
-                                columns: [GridItem(.adaptive(minimum: 320), spacing: 12, alignment: .top)],
+                                columns: [GridItem(.adaptive(minimum: 250), spacing: 10, alignment: .top)],
                                 alignment: .leading,
-                                spacing: 12
+                                spacing: 10
                             ) {
                                 ForEach(accountProfiles) { profile in
                                     SubscriptionCardView(

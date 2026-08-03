@@ -252,6 +252,15 @@ final class AcpConversation: ObservableObject {
     /// opened — `nil` when the message was recognized as one already shown, in
     /// which case its remaining chunks stay suppressed too.
     private var streamingUserMessage: (adapterID: String, rowID: String?)?
+    /// Streaming text collected since the last publish; see `bufferChunk`.
+    private var pendingChunk: (text: String, isThought: Bool)?
+    private var chunkFlushTask: Task<Void, Never>?
+
+    /// How long buffered text waits before it reaches the transcript.
+    ///
+    /// Short enough to read as live typing (three frames at 60 Hz), long enough
+    /// that a fast adapter's chunks collapse into one update instead of dozens.
+    static let chunkFlushInterval: Duration = .milliseconds(50)
     private var reportedFileActivityKeys: Set<String> = []
     private var reportedFileActivityOrder: [String] = []
     private static let maximumReportedFileActivityKeys = 2_048
@@ -904,6 +913,7 @@ final class AcpConversation: ObservableObject {
         let finalDraft = pendingDraftPersistence
         pendingDraftPersistence = nil
         await client.stop()
+        flushPendingChunk()
         isConnected = false
         isRunning = false
         supportsSteering = false
@@ -1196,15 +1206,19 @@ final class AcpConversation: ObservableObject {
         case let .permission(request):
             handlePermission(request)
         case .turnEnded:
+            // The turn's last words must be on screen before it reads as over.
+            flushPendingChunk()
             isRunning = false
             onAttention?(.turnCompleted, "Finished a turn")
             flushQueue()
         case let .error(message):
+            flushPendingChunk()
             statusMessage = message
             isRunning = false
             // Leave the queue intact on error — auto-dispatching into a failing
             // agent would loop; the user can retry or clear it.
         case let .exited(code):
+            flushPendingChunk()
             isConnected = false
             isRunning = false
             supportsSteering = false
@@ -1239,15 +1253,21 @@ final class AcpConversation: ObservableObject {
     private func accumulate(_ item: AcpTurnItem) {
         switch item {
         case let .message(_, text):
-            appendChunk(text, isThought: false)
+            bufferChunk(text, isThought: false)
         case let .thought(_, text):
-            appendChunk(text, isThought: true)
+            bufferChunk(text, isThought: true)
         case let .userMessage(adapterID, text):
+            flushPendingChunk()
             appendUserChunk(adapterID: adapterID, text: text)
         case let .toolCall(call):
+            // Anything that is not more of the current text has to wait for
+            // that text to land, or a tool card jumps ahead of the sentence
+            // that introduced it.
+            flushPendingChunk()
             rows.append(.tool(call))
             publishFileActivity(for: call)
         case let .plan(entries):
+            flushPendingChunk()
             let planID = "\(turnCounter)"
             if let index = rows.lastIndex(where: {
                 if case let .plan(id, _) = $0 { return id == planID }
@@ -1307,6 +1327,69 @@ final class AcpConversation: ObservableObject {
             rows.append(.user(id: id, text: text, failed: false))
             streamingUserMessage = adapterID.map { ($0, id) }
         }
+    }
+
+    /// Hold streaming text briefly instead of republishing on every chunk.
+    ///
+    /// Each chunk used to rewrite the last row and republish the whole `rows`
+    /// array, so SwiftUI re-diffed the entire transcript per chunk while the
+    /// message string was re-concatenated each time — quadratic in the length
+    /// of the message, at streaming cadence. That is why text arrived in
+    /// lurches. Buffering for one interval turns a burst of chunks into one
+    /// update; nothing waits longer than the interval, so it still reads as
+    /// live typing.
+    ///
+    /// Correctness rests on one rule: **buffered text lands before anything
+    /// else touches `rows`.** `accumulate` is the only place streaming items
+    /// arrive, so every non-text case there flushes first, and so do turn end
+    /// and cancellation.
+    private func bufferChunk(_ text: String, isThought: Bool) {
+        // A thought/message switch opens a different row: publish the old one
+        // before collecting the new.
+        if let pending = pendingChunk, pending.isThought != isThought {
+            flushPendingChunk()
+        }
+        // A chunk that *starts* a row is published immediately. Only text added
+        // to a row that already exists is held back.
+        //
+        // Buffering the first chunk delayed the row itself, so for one interval
+        // the transcript was missing a segment rather than missing its tail —
+        // caught by `testNonContiguousSegmentsWithinOneTurnHaveUniqueRowIDs`,
+        // which reads `rows` straight after a tool call and a following
+        // message. Structure is what everything else keys off; only the text is
+        // safe to coalesce.
+        if pendingChunk == nil, wouldStartNewRow(isThought: isThought) {
+            appendChunk(text, isThought: isThought)
+            return
+        }
+        pendingChunk = ((pendingChunk?.text ?? "") + text, isThought)
+        scheduleChunkFlush()
+    }
+
+    /// Whether the next chunk of this kind opens a row rather than extending
+    /// the trailing one. Mirrors `appendChunk`'s own branch.
+    private func wouldStartNewRow(isThought: Bool) -> Bool {
+        guard let last = rows.last else { return true }
+        if !isThought, case .message = last { return false }
+        if isThought, case .thought = last { return false }
+        return true
+    }
+
+    private func scheduleChunkFlush() {
+        guard chunkFlushTask == nil else { return }
+        chunkFlushTask = Task { [weak self] in
+            try? await Task.sleep(for: Self.chunkFlushInterval)
+            guard let self else { return }
+            self.chunkFlushTask = nil
+            self.flushPendingChunk()
+        }
+    }
+
+    /// Publish whatever has been collected. Safe to call at any time.
+    func flushPendingChunk() {
+        guard let pending = pendingChunk else { return }
+        pendingChunk = nil
+        appendChunk(pending.text, isThought: pending.isThought)
     }
 
     private func appendChunk(_ text: String, isThought: Bool) {

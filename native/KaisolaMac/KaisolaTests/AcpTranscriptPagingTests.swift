@@ -148,6 +148,9 @@ final class AcpTranscriptPagingTests: XCTestCase {
         XCTAssertEqual(requestCount, 5)
     }
 
+    /// Chunks after the first are held for `chunkFlushInterval` and published
+    /// together, so this flushes rather than reading mid-buffer. The accumulated
+    /// result is unchanged — one row, one growing string.
     func testStreamingContentVersionAdvancesWithoutGrowingRowCount() {
         let conversation = makeConversation()
         conversation.receiveTurnItemForTesting(.message(id: "wire-1", text: "Hello"))
@@ -155,6 +158,7 @@ final class AcpTranscriptPagingTests: XCTestCase {
         let version = conversation.contentVersion
 
         conversation.receiveTurnItemForTesting(.message(id: "wire-2", text: " world"))
+        conversation.flushPendingChunk()
 
         XCTAssertEqual(conversation.rows.count, rowCount)
         XCTAssertGreaterThan(conversation.contentVersion, version)
@@ -162,6 +166,55 @@ final class AcpTranscriptPagingTests: XCTestCase {
             return XCTFail("Expected one accumulated assistant row")
         }
         XCTAssertEqual(text, "Hello world")
+    }
+
+    /// The reason the buffer exists: a burst of chunks becomes one publish.
+    ///
+    /// Every chunk used to rewrite the trailing row and republish the whole
+    /// `rows` array, so SwiftUI re-diffed the entire transcript per chunk and
+    /// text arrived in lurches. Twenty chunks must now cost one update, not
+    /// twenty.
+    func testABurstOfChunksPublishesOnce() {
+        let conversation = makeConversation()
+        conversation.receiveTurnItemForTesting(.message(id: "wire-0", text: "start"))
+        let version = conversation.contentVersion
+
+        for index in 1...20 {
+            conversation.receiveTurnItemForTesting(.message(id: "wire-\(index)", text: " \(index)"))
+        }
+        XCTAssertEqual(
+            conversation.contentVersion,
+            version,
+            "Buffered chunks must not republish the transcript one at a time"
+        )
+
+        conversation.flushPendingChunk()
+        XCTAssertGreaterThan(conversation.contentVersion, version)
+        guard case let .message(_, text) = conversation.rows.first else {
+            return XCTFail("Expected one accumulated assistant row")
+        }
+        XCTAssertTrue(text.hasPrefix("start 1 2"), text)
+        XCTAssertTrue(text.hasSuffix(" 20"), text)
+        XCTAssertEqual(conversation.rows.count, 1)
+    }
+
+    /// A tool call arriving mid-sentence must not jump ahead of the text that
+    /// introduced it — buffered text lands before any other row is appended.
+    func testBufferedTextLandsBeforeAToolCallIsAppended() {
+        let conversation = makeConversation()
+        conversation.receiveTurnItemForTesting(.message(id: "w1", text: "Reading "))
+        conversation.receiveTurnItemForTesting(.message(id: "w2", text: "the file"))
+        conversation.receiveTurnItemForTesting(
+            .toolCall(AcpToolCall(id: "t1", title: "read", kind: "read", status: .pending))
+        )
+
+        guard case let .message(_, text) = conversation.rows.first else {
+            return XCTFail("Expected the assistant row first")
+        }
+        XCTAssertEqual(text, "Reading the file", "The tool call must not outrun its sentence")
+        guard case .tool = conversation.rows.last else {
+            return XCTFail("Expected the tool row last")
+        }
     }
 
     func testNonContiguousSegmentsWithinOneTurnHaveUniqueRowIDs() {

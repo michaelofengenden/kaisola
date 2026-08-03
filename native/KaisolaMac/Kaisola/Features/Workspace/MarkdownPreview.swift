@@ -403,6 +403,82 @@ struct MarkdownTableSourceCell: Equatable, Sendable {
 /// cosmetic padding are not part of the editable range, so changing one cell
 /// cannot reformat the table or normalize the document's line endings.
 enum MarkdownTableSource {
+    /// Where a single table line's pipes and cells actually are.
+    ///
+    /// The continuous editor styles a table by kerning the padding that already
+    /// sits between these pipes, so it needs the separators as well as the cell
+    /// content — the same scan the block editor used for exact-range writes.
+    struct LineLayout: Equatable, Sendable {
+        /// Whitespace-trimmed content range of each cell, local to the line.
+        let cells: [NSRange]
+        /// Every unescaped `|` in the line, local to the line.
+        let pipes: [Int]
+        let hasLeadingPipe: Bool
+        let hasTrailingPipe: Bool
+    }
+
+    static func layout(of line: String) -> LineLayout {
+        let value = line as NSString
+        guard value.length > 0 else {
+            return LineLayout(cells: [], pipes: [], hasLeadingPipe: false, hasTrailingPipe: false)
+        }
+        var delimiters: [Int] = []
+        var backslashes = 0
+        for index in 0..<value.length {
+            let character = value.character(at: index)
+            if character == 0x5C {
+                backslashes += 1
+                continue
+            }
+            if character == 0x7C, backslashes.isMultiple(of: 2) {
+                delimiters.append(index)
+            }
+            backslashes = 0
+        }
+
+        func isWhitespace(_ character: unichar) -> Bool {
+            character == 0x20 || character == 0x09
+        }
+        var firstContent = 0
+        while firstContent < value.length, isWhitespace(value.character(at: firstContent)) {
+            firstContent += 1
+        }
+        var lastContent = value.length
+        while lastContent > firstContent, isWhitespace(value.character(at: lastContent - 1)) {
+            lastContent -= 1
+        }
+        let hasLeadingPipe = delimiters.first == firstContent
+        // One lone `|` is both the first and the last delimiter; it can only be
+        // one of the two, or the caller would kern the same character twice.
+        let hasTrailingPipe = delimiters.last == lastContent - 1
+            && !(hasLeadingPipe && delimiters.count == 1)
+        var separators = delimiters
+        var cellStart = 0
+        if hasLeadingPipe, let leading = separators.first {
+            cellStart = leading + 1
+            separators.removeFirst()
+        }
+        let cellEnd = hasTrailingPipe ? (separators.last ?? value.length) : value.length
+        if hasTrailingPipe, !separators.isEmpty { separators.removeLast() }
+
+        var cells: [NSRange] = []
+        for separator in separators + [cellEnd] {
+            guard separator >= cellStart else { continue }
+            var start = cellStart
+            var end = separator
+            while start < end, isWhitespace(value.character(at: start)) { start += 1 }
+            while end > start, isWhitespace(value.character(at: end - 1)) { end -= 1 }
+            cells.append(NSRange(location: start, length: end - start))
+            cellStart = separator + 1
+        }
+        return LineLayout(
+            cells: cells,
+            pipes: delimiters,
+            hasLeadingPipe: hasLeadingPipe,
+            hasTrailingPipe: hasTrailingPipe
+        )
+    }
+
     static func values(in line: String) -> [String] {
         localCellRanges(in: line).map { range in
             decodeCell((line as NSString).substring(with: range))
@@ -470,55 +546,7 @@ enum MarkdownTableSource {
     }
 
     private static func localCellRanges(in line: String) -> [NSRange] {
-        let value = line as NSString
-        guard value.length > 0 else { return [] }
-        var delimiters: [Int] = []
-        var backslashes = 0
-        for index in 0..<value.length {
-            let character = value.character(at: index)
-            if character == 0x5C {
-                backslashes += 1
-                continue
-            }
-            if character == 0x7C, backslashes.isMultiple(of: 2) {
-                delimiters.append(index)
-            }
-            backslashes = 0
-        }
-
-        func isWhitespace(_ character: unichar) -> Bool {
-            character == 0x20 || character == 0x09
-        }
-        var firstContent = 0
-        while firstContent < value.length, isWhitespace(value.character(at: firstContent)) {
-            firstContent += 1
-        }
-        var lastContent = value.length
-        while lastContent > firstContent, isWhitespace(value.character(at: lastContent - 1)) {
-            lastContent -= 1
-        }
-        let hasLeadingPipe = delimiters.first == firstContent
-        let hasTrailingPipe = delimiters.last == lastContent - 1
-        var separators = delimiters
-        var cellStart = 0
-        if hasLeadingPipe, let leading = separators.first {
-            cellStart = leading + 1
-            separators.removeFirst()
-        }
-        let cellEnd = hasTrailingPipe ? (separators.last ?? value.length) : value.length
-        if hasTrailingPipe, !separators.isEmpty { separators.removeLast() }
-
-        var ranges: [NSRange] = []
-        for separator in separators + [cellEnd] {
-            guard separator >= cellStart else { continue }
-            var start = cellStart
-            var end = separator
-            while start < end, isWhitespace(value.character(at: start)) { start += 1 }
-            while end > start, isWhitespace(value.character(at: end - 1)) { end -= 1 }
-            ranges.append(NSRange(location: start, length: end - start))
-            cellStart = separator + 1
-        }
-        return ranges
+        layout(of: line).cells
     }
 
     private static func decodeCell(_ source: String) -> String {
@@ -911,45 +939,26 @@ enum MarkdownTableNavigation {
     }
 }
 
-private struct MarkdownTableCellID: Hashable {
-    let blockLocation: Int
-    let row: Int
-    let column: Int
-}
-
-/// Own hover state at block granularity. Keeping it on the parent document
-/// invalidated every rendered block whenever scrolling moved a new block under
-/// a stationary pointer; image decoding and Markdown layout then fought native
-/// scroll momentum. Local state redraws only the affected block chrome.
-private struct MarkdownBlockHoverChrome<Content: View>: View {
-    let onEdit: () -> Void
-    let content: Content
-    @State private var isHovered = false
-
-    init(onEdit: @escaping () -> Void, @ViewBuilder content: () -> Content) {
-        self.onEdit = onEdit
-        self.content = content()
-    }
-
-    var body: some View {
-        ZStack(alignment: .topTrailing) {
-            content
-            if isHovered {
-                Button(action: onEdit) {
-                    Image(systemName: "pencil")
-                        .font(.system(size: 11, weight: .semibold))
-                        .frame(width: 25, height: 23)
-                        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 7))
-                }
-                .buttonStyle(.plain)
-                .help("Edit this block in place")
-                .accessibilityLabel("Edit this Markdown block")
-            }
-        }
-        .onHover { isHovered = $0 }
-    }
-}
-
+/// The continuous Markdown surface: one editor over the whole document.
+///
+/// This replaced a rendered document whose blocks were swapped one at a time
+/// for a small embedded text editor on double-click. That model cost the reader
+/// twice. Editing was per block: every change was committed into an exact
+/// source range and the editor had to be re-entered for the next paragraph.
+/// And the viewport jumped, because a `LazyVStack` identified each block by its
+/// source location, so any keystroke that changed a block's length
+/// re-identified every block below it and tore the stack down underneath the
+/// scroll view.
+///
+/// The document is now a single `NSTextView` holding the file's exact Markdown,
+/// styled in place so it reads like prose. It owns its text storage, selection,
+/// and scroll position, so typing, saving, autosaving, and reconciling an
+/// unchanged file on disk cost the viewport nothing.
+///
+/// Byte fidelity came out stronger rather than weaker: there is no source-range
+/// write path left to get wrong, because the bytes on screen are the bytes that
+/// are saved. Styling is applied as TextKit temporary attributes and images are
+/// painted by the layout manager, so neither ever reaches the text storage.
 struct MarkdownDocumentView: View {
     @Binding var source: String
     let documentURL: URL
@@ -957,664 +966,68 @@ struct MarkdownDocumentView: View {
     let imageRevision: Int
     @Binding var zoom: CGFloat
     let onError: (String) -> Void
-    let automaticallyEditFirstBlock: Bool
-    let automaticallyEditFirstTableCell: Bool
-    @State private var pinchStartZoom: CGFloat?
-    @State private var activeEdit: ActiveEdit?
-    @State private var activeTableCell: (id: MarkdownTableCellID, text: String)?
-    @State private var appliedAutomaticEdit = false
-    @State private var blockCache = MarkdownSourceBlockCache()
-
-    private struct ActiveEdit {
-        var range: NSRange
-        var text: String
-        var before: [MarkdownSourceBlock]
-        var after: [MarkdownSourceBlock]
-    }
+    /// Shared with the raw-source editor so the source toggle keeps its place.
+    var scrollMemory: FilePreviewTextScrollMemory? = nil
+    var targetLine: Int? = nil
+    var navigationRevision: UInt64 = 0
+    /// Visual fixtures open with the caret already placed, so a capture proves
+    /// the editable surface rather than a static rendering.
+    var automaticallyFocus = false
 
     var body: some View {
-        GeometryReader { geometry in
-            let contentWidth = MarkdownPreviewLayout.contentWidth(
-                viewportWidth: geometry.size.width
-            )
-            ScrollView {
-                LazyVStack(alignment: .leading, spacing: 0) {
-                    if let activeEdit {
-                        sourceBlocks(activeEdit.before, availableWidth: contentWidth)
-                        activeEditor(activeEdit, availableWidth: contentWidth)
-                        sourceBlocks(activeEdit.after, availableWidth: contentWidth)
-                    } else {
-                        let blocks = blockCache.blocks(for: source)
-                        if blocks.isEmpty {
-                            Button {
-                                beginEditingEmptyDocument()
-                            } label: {
-                                ContentUnavailableView(
-                                    "Empty Markdown document",
-                                    systemImage: "text.badge.plus",
-                                    description: Text("Click to start writing in place.")
-                                )
-                                .frame(maxWidth: .infinity, minHeight: 220)
-                            }
-                            .buttonStyle(.plain)
-                        } else {
-                            sourceBlocks(blocks, availableWidth: contentWidth)
-                        }
-                    }
-                }
-                .accessibilityElement(children: .contain)
-                .frame(width: contentWidth, alignment: .leading)
-                .frame(maxWidth: .infinity, alignment: .center)
-                .padding(.vertical, 24)
-            }
-            .scrollBounceBehavior(.basedOnSize)
-        }
+        MarkdownRenderedEditor(
+            text: $source,
+            markdownURL: documentURL,
+            workspaceRoot: workspaceRoot,
+            zoom: $zoom,
+            targetLine: targetLine,
+            onError: onError,
+            documentID: documentURL.standardizedFileURL.path,
+            scrollMemory: scrollMemory,
+            imageRevision: imageRevision,
+            navigationRevision: navigationRevision,
+            automaticallyFocus: automaticallyFocus,
+            onOpenLink: open
+        )
         .background {
             MarkdownCommandScrollZoomBridge(zoom: $zoom)
         }
-        .environment(\.openURL, OpenURLAction { link in
-            switch WorkspacePreviewLinkPolicy.decision(
-                for: link,
-                documentURL: documentURL,
-                workspaceRoot: workspaceRoot
-            ) {
-            case let .external(url):
-                NSWorkspace.shared.open(url)
-                return .handled
-            case let .workspaceFile(url, line):
-                var userInfo: [AnyHashable: Any] = [
-                    "url": url,
-                    "workspaceHint": workspaceRoot
-                        ?? documentURL.deletingLastPathComponent(),
-                ]
-                if let line { userInfo["line"] = line }
-                NotificationCenter.default.post(
-                    name: .kaisolaOpenFileLink,
-                    object: nil,
-                    userInfo: userInfo
-                )
-                return .handled
-            case .blocked:
-                onError(
-                    "Kaisola blocked a Markdown link outside this project or using an unsupported scheme."
-                )
-                return .discarded
-            }
-        })
-        .onAppear { beginAutomaticEditIfReady() }
-        .onChange(of: source) { _, _ in beginAutomaticEditIfReady() }
-        .simultaneousGesture(
-            MagnificationGesture()
-                .onChanged { scale in
-                    let start = pinchStartZoom ?? zoom
-                    if pinchStartZoom == nil { pinchStartZoom = zoom }
-                    zoom = MarkdownPreviewLayout.magnifiedZoom(
-                        start: start,
-                        gestureScale: scale
-                    )
-                }
-                .onEnded { scale in
-                    zoom = MarkdownPreviewLayout.magnifiedZoom(
-                        start: pinchStartZoom ?? zoom,
-                        gestureScale: scale
-                    )
-                    pinchStartZoom = nil
-                }
-        )
     }
 
-    @ViewBuilder
-    private func sourceBlocks(
-        _ blocks: [MarkdownSourceBlock],
-        availableWidth: CGFloat
-    ) -> some View {
-        let renderedBlocks = blocks.map(\.block)
-        ForEach(Array(blocks.enumerated()), id: \.element.id) { index, sourceBlock in
-            let renderedBlock = MarkdownBlockHoverChrome(
-                onEdit: { beginEditing(sourceBlock) }
-            ) {
-                blockView(sourceBlock, availableWidth: availableWidth)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-            }
-
-            if case .table = sourceBlock.block {
-                interactiveTableBlock(
-                    renderedBlock.accessibilityElement(children: .contain),
-                    sourceBlock: sourceBlock,
-                    index: index,
-                    renderedBlocks: renderedBlocks
-                )
-            } else {
-                interactiveBlock(
-                    renderedBlock
-                        .textSelection(.enabled)
-                        .accessibilityElement(children: .combine),
-                    sourceBlock: sourceBlock,
-                    index: index,
-                    renderedBlocks: renderedBlocks
-                )
-            }
-        }
-    }
-
-    private func interactiveBlock<Content: View>(
-        _ content: Content,
-        sourceBlock: MarkdownSourceBlock,
-        index: Int,
-        renderedBlocks: [MarkdownDocument.Block]
-    ) -> some View {
-        content
-            .contentShape(Rectangle())
-            .simultaneousGesture(
-                TapGesture(count: 2).onEnded {
-                    // Tables own double-click at cell granularity. The hover
-                    // pencil remains available for exact whole-block source.
-                    if case .table = sourceBlock.block { return }
-                    beginEditing(sourceBlock)
-                }
+    /// Command-clicking a Markdown link follows it under the same policy the
+    /// rendered document used: project files open in Kaisola, external schemes
+    /// go to the system browser, everything else is refused.
+    private func open(_ link: URL) {
+        switch WorkspacePreviewLinkPolicy.decision(
+            for: link,
+            documentURL: documentURL,
+            workspaceRoot: workspaceRoot
+        ) {
+        case let .external(url):
+            NSWorkspace.shared.open(url)
+        case let .workspaceFile(url, line):
+            var userInfo: [AnyHashable: Any] = [
+                "url": url,
+                "workspaceHint": workspaceRoot
+                    ?? documentURL.deletingLastPathComponent(),
+            ]
+            if let line { userInfo["line"] = line }
+            NotificationCenter.default.post(
+                name: .kaisolaOpenFileLink,
+                object: nil,
+                userInfo: userInfo
             )
-            .focusable()
-            .onKeyPress(.return) {
-                beginEditing(sourceBlock)
-                return .handled
-            }
-            .accessibilityAction(named: "Edit Markdown source") {
-                beginEditing(sourceBlock)
-            }
-            .accessibilityHint("Press Return to edit this block's exact Markdown source")
-            .help("Double-click, focus and press Return, or use the pencil to edit this block in place")
-            .padding(.bottom, spacing(after: index, in: renderedBlocks))
-    }
-
-    private func interactiveTableBlock<Content: View>(
-        _ content: Content,
-        sourceBlock: MarkdownSourceBlock,
-        index: Int,
-        renderedBlocks: [MarkdownDocument.Block]
-    ) -> some View {
-        content
-            .contentShape(Rectangle())
-            // Individual table cells own Return and arrow-key handling. A
-            // focusable whole-table Return handler receives the bubbled key
-            // first on macOS and incorrectly opens raw block source instead.
-            .accessibilityAction(named: "Edit Markdown source") {
-                beginEditing(sourceBlock)
-            }
-            .accessibilityHint("Navigate individual cells to edit them, or use this action to edit exact table source")
-            .help("Double-click a cell to edit it, or use the pencil to edit exact table source")
-            .padding(.bottom, spacing(after: index, in: renderedBlocks))
-    }
-
-    private func activeEditor(
-        _ edit: ActiveEdit,
-        availableWidth: CGFloat
-    ) -> some View {
-        VStack(alignment: .leading, spacing: 8) {
-            HStack(spacing: 7) {
-                Image(systemName: "pencil.line")
-                    .foregroundStyle(.tint)
-                Text("Editing this Markdown block directly")
-                    .font(.caption.weight(.medium))
-                Spacer()
-                Button("Done") { activeEdit = nil }
-                    .buttonStyle(.bordered)
-                    .controlSize(.small)
-                    .keyboardShortcut(.return, modifiers: .command)
-            }
-            MarkdownRenderedEditor(
-                text: activeTextBinding,
-                markdownURL: documentURL,
-                workspaceRoot: workspaceRoot,
-                zoom: $zoom,
-                targetLine: nil,
-                onError: onError
+        case .blocked:
+            onError(
+                "Kaisola blocked a Markdown link outside this project or using an unsupported scheme."
             )
-            .frame(width: availableWidth)
-            .frame(
-                minHeight: editorHeight(for: edit.text),
-                maxHeight: min(420, editorHeight(for: edit.text))
-            )
-            .clipShape(RoundedRectangle(cornerRadius: 9, style: .continuous))
-            .overlay {
-                RoundedRectangle(cornerRadius: 9, style: .continuous)
-                    .stroke(Color.accentColor.opacity(0.48), lineWidth: 1)
-            }
-        }
-        .padding(10)
-        .background(Color.accentColor.opacity(0.055), in: RoundedRectangle(cornerRadius: 11))
-        .padding(.bottom, 16 * zoom)
-    }
-
-    private var activeTextBinding: Binding<String> {
-        Binding(
-            get: { activeEdit?.text ?? "" },
-            set: { replacement in updateActiveText(replacement) }
-        )
-    }
-
-    private var activeTableTextBinding: Binding<String> {
-        Binding(
-            get: { activeTableCell?.text ?? "" },
-            set: { replacement in
-                guard var edit = activeTableCell else { return }
-                edit.text = replacement
-                activeTableCell = edit
-            }
-        )
-    }
-
-    private func beginEditing(_ block: MarkdownSourceBlock) {
-        let blocks = MarkdownSourceDocument.blocks(in: source)
-        guard let exact = blocks.first(where: { $0.range == block.range })
-            ?? blocks.first(where: { $0.range.location == block.range.location }) else { return }
-        activeTableCell = nil
-        activeEdit = ActiveEdit(
-            range: exact.range,
-            text: exact.source,
-            before: blocks.filter { NSMaxRange($0.range) <= exact.range.location },
-            after: blocks.filter { $0.range.location >= NSMaxRange(exact.range) }
-        )
-    }
-
-    private func beginEditingEmptyDocument() {
-        activeTableCell = nil
-        activeEdit = ActiveEdit(
-            range: NSRange(location: 0, length: 0),
-            text: "",
-            before: [],
-            after: []
-        )
-    }
-
-    private func beginAutomaticEditIfReady() {
-        guard !appliedAutomaticEdit else { return }
-        let blocks = MarkdownSourceDocument.blocks(in: source)
-        let tableAndCell: (MarkdownSourceBlock, MarkdownTableSourceCell)? = blocks
-            .compactMap { block -> (MarkdownSourceBlock, MarkdownTableSourceCell)? in
-                guard case .table = block.block else { return nil }
-                let cells = MarkdownTableSource.cells(in: block)
-                let cell = cells.first(where: { $0.row == 1 && $0.column == 1 })
-                    ?? cells.first(where: { $0.row > 0 })
-                return cell.map { (block, $0) }
-            }
-            .first
-        if automaticallyEditFirstTableCell,
-           let (table, cell) = tableAndCell {
-            appliedAutomaticEdit = true
-            beginEditingTableCell(
-                blockLocation: table.range.location,
-                row: cell.row,
-                column: cell.column,
-                text: cell.text
-            )
-            return
-        }
-        guard automaticallyEditFirstBlock, let first = blocks.first else { return }
-        appliedAutomaticEdit = true
-        beginEditing(first)
-    }
-
-    private func updateActiveText(_ replacement: String) {
-        guard var edit = activeEdit,
-              let updatedSource = MarkdownSourceDocument.replacing(
-                edit.range,
-                in: source,
-                with: replacement
-              ) else { return }
-        let delta = replacement.utf16.count - edit.range.length
-        edit.range.length = replacement.utf16.count
-        edit.text = replacement
-        if delta != 0 {
-            edit.after = edit.after.map { block in
-                MarkdownSourceBlock(
-                    range: NSRange(
-                        location: block.range.location + delta,
-                        length: block.range.length
-                    ),
-                    source: block.source,
-                    block: block.block
-                )
-            }
-        }
-        activeEdit = edit
-        source = updatedSource
-    }
-
-    private func beginEditingTableCell(
-        blockLocation: Int,
-        row: Int,
-        column: Int,
-        text: String
-    ) {
-        activeEdit = nil
-        activeTableCell = (
-            MarkdownTableCellID(
-                blockLocation: blockLocation,
-                row: row,
-                column: column
-            ),
-            text
-        )
-    }
-
-    private func commitTableCellEdit() {
-        guard let edit = activeTableCell else { return }
-        let blocks = MarkdownSourceDocument.blocks(in: source)
-        guard let block = blocks.first(where: { block in
-            guard block.range.location == edit.id.blockLocation else { return false }
-            if case .table = block.block { return true }
-            return false
-        }), let updatedSource = MarkdownTableSource.replacingCell(
-            row: edit.id.row,
-            column: edit.id.column,
-            in: block,
-            source: source,
-            with: edit.text
-        ) else {
-            activeTableCell = nil
-            return
-        }
-        activeTableCell = nil
-        source = updatedSource
-    }
-
-    private func editorHeight(for text: String) -> CGFloat {
-        let lines = max(1, text.reduce(1) { $1 == "\n" ? $0 + 1 : $0 })
-        return min(420, max(76, CGFloat(lines) * max(18, 19 * zoom) + 28))
-    }
-
-    @ViewBuilder
-    private func blockView(
-        _ sourceBlock: MarkdownSourceBlock,
-        availableWidth: CGFloat
-    ) -> some View {
-        switch sourceBlock.block {
-        case let .heading(level, text, alignment):
-            VStack(alignment: .leading, spacing: 7 * zoom) {
-                Text(inline(text))
-                    .font(headingFont(level))
-                    .multilineTextAlignment(textAlignment(alignment))
-                    .frame(maxWidth: .infinity, alignment: frameAlignment(alignment))
-                if level <= 2 {
-                    Divider()
-                }
-            }
-            .padding(.top, level <= 2 ? 8 : 2)
-        case let .paragraph(text, alignment):
-            Text(inline(text))
-                .font(.system(size: 14 * zoom))
-                .lineSpacing(4 * zoom)
-                .multilineTextAlignment(textAlignment(alignment))
-                .frame(maxWidth: .infinity, alignment: frameAlignment(alignment))
-        case let .image(source, alt, declaredWidth, declaredHeight, alignment):
-            MarkdownLocalImageView(
-                source: source,
-                alt: alt,
-                declaredWidth: declaredWidth,
-                declaredHeight: declaredHeight,
-                alignment: alignment,
-                availableWidth: availableWidth,
-                zoom: zoom,
-                documentURL: documentURL,
-                workspaceRoot: workspaceRoot,
-                revision: imageRevision
-            )
-        case let .listItem(indent, marker, text):
-            HStack(alignment: .firstTextBaseline, spacing: 9) {
-                Text(marker)
-                    .font(.system(size: 14 * zoom, design: .monospaced))
-                    .foregroundStyle(.secondary)
-                    .frame(minWidth: 18, alignment: .trailing)
-                Text(inline(text)).font(.system(size: 14 * zoom)).lineSpacing(3 * zoom)
-            }
-            .padding(.leading, CGFloat(indent) * 20 * zoom)
-        case let .quote(text):
-            HStack(alignment: .top, spacing: 12) {
-                RoundedRectangle(cornerRadius: 2)
-                    .fill(Color.accentColor.opacity(0.75))
-                    .frame(width: 3)
-                Text(inline(text))
-                    .font(.system(size: 14 * zoom))
-                    .italic()
-                    .foregroundStyle(.secondary)
-                    .lineSpacing(4)
-            }
-            .padding(.vertical, 4)
-        case let .code(language, text):
-            VStack(alignment: .leading, spacing: 0) {
-                if let language {
-                    Text(language.uppercased())
-                        .font(.caption2.weight(.semibold))
-                        .foregroundStyle(.secondary)
-                        .padding(.horizontal, 12)
-                        .padding(.top, 9)
-                }
-                ScrollView(.horizontal, showsIndicators: false) {
-                    Text(verbatim: text)
-                        .font(.system(size: 13 * zoom, design: .monospaced))
-                        .lineSpacing(3 * zoom)
-                        .padding(12 * zoom)
-                }
-            }
-            .background(.quaternary.opacity(0.55), in: RoundedRectangle(cornerRadius: 10))
-            .overlay(RoundedRectangle(cornerRadius: 10).strokeBorder(.quaternary))
-        case let .table(headers, rows, omittedRows):
-            VStack(alignment: .leading, spacing: 7 * zoom) {
-                MarkdownTable(
-                    headers: headers,
-                    rows: rows,
-                    zoom: zoom,
-                    blockLocation: sourceBlock.range.location,
-                    activeCell: activeTableCell?.id,
-                    activeText: activeTableTextBinding,
-                    onBeginEdit: { row, column, text in
-                        beginEditingTableCell(
-                            blockLocation: sourceBlock.range.location,
-                            row: row,
-                            column: column,
-                            text: text
-                        )
-                    },
-                    onCommit: commitTableCellEdit,
-                    onCancel: { activeTableCell = nil }
-                )
-                if omittedRows > 0 {
-                    Label(
-                        MarkdownTableTruncation.message(omittedRows: omittedRows),
-                        systemImage: "ellipsis.rectangle"
-                    )
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .accessibilityLabel(
-                        MarkdownTableTruncation.message(omittedRows: omittedRows)
-                    )
-                }
-            }
-        case .rule:
-            Divider().padding(.vertical, 4)
         }
     }
-
-    private func spacing(after index: Int, in blocks: [MarkdownDocument.Block]) -> CGFloat {
-        guard index + 1 < blocks.count else { return 0 }
-        let current = blocks[index]
-        let next = blocks[index + 1]
-        if case .listItem = current, case .listItem = next { return 5 * zoom }
-        if case .heading = current { return 10 * zoom }
-        if case .heading = next { return 20 * zoom }
-        return 16 * zoom
-    }
-
-    private func inline(_ text: String) -> AttributedString {
-        (try? AttributedString(
-            markdown: MarkdownInlinePresentation.preventingOrphanedSeparators(text),
-            options: .init(interpretedSyntax: .inlineOnlyPreservingWhitespace)
-        )) ?? AttributedString(text)
-    }
-
-    private func headingFont(_ level: Int) -> Font {
-        switch level {
-        case 1: .system(size: 30 * zoom, weight: .bold)
-        case 2: .system(size: 24 * zoom, weight: .bold)
-        case 3: .system(size: 20 * zoom, weight: .semibold)
-        case 4: .system(size: 17 * zoom, weight: .semibold)
-        default: .system(size: 15 * zoom, weight: .semibold)
-        }
-    }
-
-    private func textAlignment(_ alignment: MarkdownDocument.ContentAlignment?) -> TextAlignment {
-        switch alignment {
-        case .center: .center
-        case .trailing: .trailing
-        default: .leading
-        }
-    }
-
-    private func frameAlignment(_ alignment: MarkdownDocument.ContentAlignment?) -> Alignment {
-        switch alignment {
-        case .center: .center
-        case .trailing: .trailing
-        default: .leading
-        }
-    }
-
 }
 
 enum MarkdownTableTruncation {
     static func message(omittedRows: Int) -> String {
         let noun = omittedRows == 1 ? "row" : "rows"
         return "\(omittedRows) more \(noun) not shown"
-    }
-}
-
-private struct MarkdownTable: View {
-    let headers: [String]
-    let rows: [[String]]
-    let zoom: CGFloat
-    let blockLocation: Int
-    let activeCell: MarkdownTableCellID?
-    @Binding var activeText: String
-    let onBeginEdit: (_ row: Int, _ column: Int, _ text: String) -> Void
-    let onCommit: () -> Void
-    let onCancel: () -> Void
-    @FocusState private var focusedCell: MarkdownTableCellID?
-
-    var body: some View {
-        ScrollView(.horizontal, showsIndicators: false) {
-            Grid(horizontalSpacing: 0, verticalSpacing: 0) {
-                GridRow { cells(headers, row: 0, header: true) }
-                ForEach(Array(rows.enumerated()), id: \.offset) { index, row in
-                    GridRow { cells(row, row: index + 1, header: false) }
-                        .background(index.isMultiple(of: 2) ? Color.primary.opacity(0.025) : .clear)
-                }
-            }
-            .accessibilityElement(children: .contain)
-            .overlay(RoundedRectangle(cornerRadius: 8).strokeBorder(.quaternary))
-            .clipShape(RoundedRectangle(cornerRadius: 8))
-        }
-        .accessibilityElement(children: .contain)
-    }
-
-    @ViewBuilder
-    private func cells(_ values: [String], row: Int, header: Bool) -> some View {
-        ForEach(Array(values.enumerated()), id: \.offset) { column, value in
-            let id = MarkdownTableCellID(
-                blockLocation: blockLocation,
-                row: row,
-                column: column
-            )
-            Group {
-                if activeCell == id {
-                    TextField("Cell", text: $activeText)
-                        .textFieldStyle(.plain)
-                        .focused($focusedCell, equals: id)
-                        .onSubmit(onCommit)
-                        .onExitCommand(perform: onCancel)
-                        .onAppear {
-                            DispatchQueue.main.async { focusedCell = id }
-                        }
-                        .onChange(of: focusedCell) { oldValue, newValue in
-                            if oldValue == id, newValue != id { onCommit() }
-                        }
-                        .accessibilityLabel("Editing table cell")
-                } else {
-                    Button {
-                        onBeginEdit(row, column, value)
-                    } label: {
-                        Text(inline(value))
-                            .frame(maxWidth: .infinity, alignment: .leading)
-                            .contentShape(Rectangle())
-                    }
-                        .buttonStyle(.plain)
-                        .focused($focusedCell, equals: id)
-                        .onKeyPress(.leftArrow) {
-                            moveFocus(from: id, direction: .left)
-                        }
-                        .onKeyPress(.rightArrow) {
-                            moveFocus(from: id, direction: .right)
-                        }
-                        .onKeyPress(.upArrow) {
-                            moveFocus(from: id, direction: .up)
-                        }
-                        .onKeyPress(.downArrow) {
-                            moveFocus(from: id, direction: .down)
-                        }
-                        .help("Click or focus and press Return to edit this table cell")
-                        .accessibilityLabel(
-                            "\(header ? "Header" : "Row \(row)") column \(column + 1): \(value)"
-                        )
-                        .accessibilityHint("Press Return to edit; use arrow keys to move between cells")
-                        .accessibilityAction(named: "Edit table cell") {
-                            onBeginEdit(row, column, value)
-                        }
-                }
-            }
-                .font(.system(size: 13 * zoom, weight: header ? .semibold : .regular))
-                .frame(minWidth: 100 * zoom, maxWidth: 280 * zoom, alignment: .leading)
-                .padding(.horizontal, 10 * zoom)
-                .padding(.vertical, 8 * zoom)
-                .background(
-                    activeCell == id
-                        ? Color.accentColor.opacity(0.12)
-                        : (header ? Color.primary.opacity(0.07) : .clear)
-                )
-                .overlay {
-                    ZStack(alignment: .trailing) {
-                        Rectangle()
-                            .fill(Color(nsColor: .separatorColor).opacity(0.55))
-                            .frame(width: 1)
-                        if activeCell == id {
-                            RoundedRectangle(cornerRadius: 5, style: .continuous)
-                                .stroke(Color.accentColor, lineWidth: 1.5)
-                                .padding(2)
-                        }
-                    }
-                }
-        }
-    }
-
-    private func moveFocus(
-        from id: MarkdownTableCellID,
-        direction: MarkdownTableNavigation.Direction
-    ) -> KeyPress.Result {
-        let matrix = [headers] + rows
-        guard let destination = MarkdownTableNavigation.destination(
-            from: .init(row: id.row, column: id.column),
-            direction: direction,
-            rows: matrix
-        ) else { return .ignored }
-        focusedCell = MarkdownTableCellID(
-            blockLocation: blockLocation,
-            row: destination.row,
-            column: destination.column
-        )
-        return .handled
-    }
-
-    private func inline(_ text: String) -> AttributedString {
-        (try? AttributedString(
-            markdown: MarkdownInlinePresentation.preventingOrphanedSeparators(text),
-            options: .init(interpretedSyntax: .inlineOnlyPreservingWhitespace)
-        )) ?? AttributedString(text)
     }
 }

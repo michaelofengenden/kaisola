@@ -230,11 +230,15 @@ test('mock initializes, creates a session, and streams the exact happy path', as
     }],
     agentCapabilities: {
       loadSession: true,
-      sessionCapabilities: { resume: true, close: true },
+      // Objects, not booleans — the shape the shipping adapters use.
+      sessionCapabilities: { resume: {}, close: {} },
       promptCapabilities: { image: false },
       mcpCapabilities: { http: true },
       _meta: { claudeCode: { promptQueueing: true } },
     },
+    // Sibling of `agentCapabilities`, matching where the shipping adapters
+    // advertise the `_session/steering` extension.
+    _meta: { steering: { supported: true } },
   })
   assert.equal(created.sessionId, 'native-mock-session-1')
   assert.equal(created.models.currentModelId, 'mock-model-pro')
@@ -548,4 +552,109 @@ test('session/cancel stops a turn and resolves its prompt request', async (t) =>
     (message) => message.method === 'session/update' || message.method === 'session/request_permission',
     250,
   )
+})
+
+test('_session/steering injects into a running turn and reports "injected"', async (t) => {
+  const client = await clientFor(t)
+  const { created } = await initializeAndCreateSession(client)
+  const promptPromise = client.request('session/prompt', {
+    sessionId: created.sessionId,
+    // "cancel" makes the fixture step slowly, so the turn is still running
+    // when the steering request lands.
+    prompt: [{ type: 'text', text: 'cancel this deliberately slow turn' }],
+  })
+
+  const first = assertUpdateFrame(await client.take(), created.sessionId)
+  assert.equal(first.sessionUpdate, 'agent_thought_chunk')
+
+  const steered = await client.request('_session/steering', {
+    sessionId: created.sessionId,
+    prompt: [{ type: 'text', text: 'actually use tabs' }],
+    _meta: { steering: { idleBehavior: 'promptRequired' } },
+  })
+  assert.deepEqual(steered, { outcome: 'injected' })
+
+  // The injected message reaches the RUNNING turn's stream. No
+  // `user_message_chunk` is echoed for it — neither shipping adapter does —
+  // so the host owns showing what the user said.
+  const steerEcho = await client.take(
+    (message) => message.method === 'session/update'
+      && message.params.update.sessionUpdate === 'agent_message_chunk'
+      && String(message.params.update.content.text).includes('Steered'),
+  )
+  assert.equal(
+    assertUpdateFrame(steerEcho, created.sessionId).content.text,
+    ' Steered: actually use tabs.',
+  )
+  await client.expectNo(
+    (message) => message.method === 'session/update'
+      && message.params.update.sessionUpdate === 'user_message_chunk',
+    250,
+  )
+
+  client.notify('session/cancel', { sessionId: created.sessionId })
+  assert.deepEqual(await promptPromise, { stopReason: 'cancelled' })
+})
+
+test('_session/steering on an idle session honors the promptRequired opt-in', async (t) => {
+  const client = await clientFor(t)
+  const { created } = await initializeAndCreateSession(client)
+
+  assert.deepEqual(
+    await client.request('_session/steering', {
+      sessionId: created.sessionId,
+      prompt: [{ type: 'text', text: 'nothing is running' }],
+      _meta: { steering: { idleBehavior: 'promptRequired' } },
+    }),
+    { outcome: 'promptRequired', reason: 'noRunningTurn' },
+  )
+
+  // Without the opt-in the adapter takes ownership and starts its own turn —
+  // the behavior the opt-in exists to avoid.
+  assert.deepEqual(
+    await client.request('_session/steering', {
+      sessionId: created.sessionId,
+      prompt: [{ type: 'text', text: 'nothing is running' }],
+    }),
+    { outcome: 'startedNewTurn' },
+  )
+})
+
+test('session/load replays the thread history, user prompts included', async (t) => {
+  const client = await clientFor(t)
+  const { created } = await initializeAndCreateSession(client)
+  const promptPromise = client.request('session/prompt', {
+    sessionId: created.sessionId,
+    prompt: [{ type: 'text', text: 'what changed?' }],
+  })
+  const { permission } = await readThroughPermission(client, created.sessionId)
+  client.respond(permission.id, { outcome: { outcome: 'selected', optionId: 'allow-once' } })
+  await promptPromise
+  // Drain the tail of the completed turn.
+  for (let index = 0; index < 3; index += 1) await client.take()
+
+  const loaded = client.request('session/load', {
+    sessionId: created.sessionId,
+    cwd: '/tmp/native-acp-mock',
+    mcpServers: [],
+  })
+  const replayed = assertUpdateFrame(await client.take(), created.sessionId)
+  assert.deepEqual(replayed, {
+    sessionUpdate: 'user_message_chunk',
+    messageId: 'mock-msg-1',
+    content: { type: 'text', text: 'what changed?' },
+  })
+  const reply = assertUpdateFrame(await client.take(), created.sessionId)
+  assert.equal(reply.sessionUpdate, 'agent_message_chunk')
+  assert.equal((await loaded).sessionId, created.sessionId)
+
+  // `session/resume` restores without re-streaming, so a host that resumes
+  // never sees the replay at all.
+  const resumed = await client.request('session/resume', {
+    sessionId: created.sessionId,
+    cwd: '/tmp/native-acp-mock',
+    mcpServers: [],
+  })
+  assert.equal(resumed.sessionId, created.sessionId)
+  await client.expectNo((message) => message.method === 'session/update', 250)
 })

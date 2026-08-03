@@ -241,15 +241,33 @@ enum MarkdownAssetStore {
     }
 }
 
-private struct MarkdownImagePayload: @unchecked Sendable {
+struct MarkdownImagePayload: @unchecked Sendable {
     let image: NSImage
 }
 
-/// Thread-safe decoded-image cache for rendered Markdown. LazyVStack may
-/// remount offscreen blocks during momentum; decoding from disk in blockView on
-/// each remount made image-heavy documents hitch. The workspace watcher token
-/// is part of the key, so agent-written replacements still refresh.
-private final class MarkdownLocalImageCache: @unchecked Sendable {
+/// The cache identity of a resolved Markdown image.
+///
+/// This used to be the workspace watcher's monotonic change token, which made
+/// every cache lookup a guaranteed miss after *any* write anywhere in the
+/// project — including the document's own 700 ms Markdown autosave. Every image
+/// then blanked to a placeholder and re-decoded, the document's height
+/// collapsed while they were gone, and the viewport was dragged back toward the
+/// top. Keying on what actually identifies the bytes keeps an agent-written
+/// replacement refreshing while a save of the Markdown file changes nothing.
+struct MarkdownImageIdentity: Equatable, Hashable, Sendable {
+    let path: String
+    let modifiedAt: Date?
+    let bytes: Int
+
+    var cacheKey: String {
+        "\(path)#\(modifiedAt?.timeIntervalSince1970 ?? 0)#\(bytes)"
+    }
+}
+
+/// Thread-safe decoded-image cache for rendered Markdown. The same decoded
+/// image backs both the continuous editor's inline drawing and any structural
+/// renderer, so scrolling an image-heavy document never re-reads from disk.
+final class MarkdownLocalImageCache: @unchecked Sendable {
     static let shared = MarkdownLocalImageCache()
     private let images = NSCache<NSString, NSImage>()
 
@@ -258,12 +276,16 @@ private final class MarkdownLocalImageCache: @unchecked Sendable {
         images.totalCostLimit = 128 * 1_048_576
     }
 
-    func load(
+    /// Resolve a Markdown image reference to a workspace-contained file.
+    ///
+    /// Returns `nil` for remote and `data:` sources, for anything resolving
+    /// outside the workspace (symlinks included), and for files over the
+    /// preview's image ceiling.
+    nonisolated static func identity(
         source: String,
         documentURL: URL,
-        workspaceRoot: URL?,
-        revision: Int
-    ) -> MarkdownImagePayload? {
+        workspaceRoot: URL?
+    ) -> MarkdownImageIdentity? {
         guard !source.contains("://"), !source.hasPrefix("data:") else { return nil }
         let decoded = source.removingPercentEncoding ?? source
         let base = documentURL.deletingLastPathComponent().standardizedFileURL
@@ -276,83 +298,31 @@ private final class MarkdownLocalImageCache: @unchecked Sendable {
               let attributes = try? FileManager.default.attributesOfItem(atPath: candidate.path),
               let bytes = attributes[.size] as? Int,
               bytes <= FilePreviewContent.maxImageBytes else { return nil }
-        let key = "\(candidate.path)#\(revision)" as NSString
+        return MarkdownImageIdentity(
+            path: candidate.path,
+            modifiedAt: attributes[.modificationDate] as? Date,
+            bytes: bytes
+        )
+    }
+
+    func load(
+        source: String,
+        documentURL: URL,
+        workspaceRoot: URL?
+    ) -> MarkdownImagePayload? {
+        guard let identity = Self.identity(
+            source: source,
+            documentURL: documentURL,
+            workspaceRoot: workspaceRoot
+        ) else { return nil }
+        return load(identity)
+    }
+
+    func load(_ identity: MarkdownImageIdentity) -> MarkdownImagePayload? {
+        let key = identity.cacheKey as NSString
         if let cached = images.object(forKey: key) { return MarkdownImagePayload(image: cached) }
-        guard let image = NSImage(contentsOf: candidate) else { return nil }
-        images.setObject(image, forKey: key, cost: max(1, bytes))
+        guard let image = NSImage(contentsOfFile: identity.path) else { return nil }
+        images.setObject(image, forKey: key, cost: max(1, identity.bytes))
         return MarkdownImagePayload(image: image)
-    }
-}
-
-struct MarkdownLocalImageView: View {
-    let source: String
-    let alt: String?
-    let declaredWidth: Double?
-    let declaredHeight: Double?
-    let alignment: MarkdownDocument.ContentAlignment?
-    let availableWidth: CGFloat
-    let zoom: CGFloat
-    let documentURL: URL
-    let workspaceRoot: URL?
-    let revision: Int
-    @State private var image: NSImage?
-    @State private var didFinishLoading = false
-
-    private var loadIdentity: String {
-        "\(documentURL.path)|\(source)|\(revision)"
-    }
-
-    var body: some View {
-        Group {
-            if let image {
-                let renderedSize = MarkdownPreviewLayout.imageSize(
-                    intrinsicSize: image.size,
-                    declaredWidth: declaredWidth,
-                    declaredHeight: declaredHeight,
-                    availableWidth: availableWidth,
-                    zoom: zoom
-                )
-                Image(nsImage: image)
-                    .resizable()
-                    .aspectRatio(contentMode: .fit)
-                    .frame(width: renderedSize.width, height: renderedSize.height)
-                    .clipShape(RoundedRectangle(cornerRadius: 12 * zoom, style: .continuous))
-                    .frame(maxWidth: .infinity, alignment: frameAlignment)
-                    .accessibilityLabel(alt ?? "Markdown image")
-            } else if !didFinishLoading {
-                ProgressView()
-                    .controlSize(.small)
-                    .frame(maxWidth: .infinity, minHeight: 64, alignment: frameAlignment)
-                    .accessibilityLabel("Loading Markdown image")
-            } else {
-                Label(alt ?? "Image unavailable", systemImage: "photo")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .frame(maxWidth: .infinity, alignment: frameAlignment)
-            }
-        }
-        .task(id: loadIdentity) {
-            image = nil
-            didFinishLoading = false
-            let payload = await Task.detached(priority: .utility) {
-                MarkdownLocalImageCache.shared.load(
-                    source: source,
-                    documentURL: documentURL,
-                    workspaceRoot: workspaceRoot,
-                    revision: revision
-                )
-            }.value
-            guard !Task.isCancelled else { return }
-            image = payload?.image
-            didFinishLoading = true
-        }
-    }
-
-    private var frameAlignment: Alignment {
-        switch alignment {
-        case .center: .center
-        case .trailing: .trailing
-        default: .leading
-        }
     }
 }

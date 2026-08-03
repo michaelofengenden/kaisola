@@ -12,6 +12,12 @@ enum AcpWire {
 enum AcpTurnItem: Equatable, Sendable, Identifiable {
     case message(id: String, text: String)
     case thought(id: String, text: String)
+    /// A user message the AGENT reported (`user_message_chunk`), as opposed to
+    /// one this client sent. Adapters emit these when they replay a resumed
+    /// session's history, and some echo the live turn's user input. `id` is the
+    /// adapter's `messageId` when it sent one — the only stable identity a
+    /// replayed row has — and `nil` otherwise.
+    case userMessage(id: String?, text: String)
     case toolCall(AcpToolCall)
     case plan(entries: [AcpPlanEntry])
 
@@ -19,6 +25,7 @@ enum AcpTurnItem: Equatable, Sendable, Identifiable {
         switch self {
         case let .message(id, _): "msg-\(id)"
         case let .thought(id, _): "thought-\(id)"
+        case let .userMessage(id, text): "user-\(id ?? "live-\(text.count)")"
         case let .toolCall(call): "tool-\(call.id)"
         case .plan: "plan"
         }
@@ -162,6 +169,9 @@ struct AcpSessionInfo: Equatable, Sendable {
     var currentModeID: String?
     /// Adapter configuration options (effort levels etc.).
     var configOptions: [AcpConfigOption] = []
+    /// Whether the adapter advertised the `_session/steering` extension, so a
+    /// queued follow-up may be injected into a turn that is already running.
+    var supportsSteering = false
 
     struct Model: Equatable, Sendable, Identifiable {
         let id: String
@@ -186,6 +196,13 @@ struct AcpCommand: Equatable, Sendable, Identifiable {
 struct AcpConfigOption: Equatable, Sendable, Identifiable {
     let id: String
     let name: String
+    /// ACP's own classification of what this option *is* (`mode`, `model`,
+    /// `thought_level`, …). Adapters name the same setting differently — Codex
+    /// says "Reasoning effort", our mock says the same, a third could say
+    /// "Thinking" — so the category is the only non-guessing way to know that
+    /// two surfaces are describing one setting. `nil` when the adapter omits it,
+    /// which is why the name heuristics survive alongside it.
+    var category: String?
     var currentValue: String?
     let choices: [Choice]
 
@@ -202,6 +219,10 @@ struct AcpAgentCapabilities: Equatable, Sendable {
     var resumeSession = false
     var closeSession = false
     var promptQueueing = false
+    /// `InitializeResponse._meta.steering.supported`. Deliberately read from the
+    /// TOP-LEVEL `_meta` (a sibling of `agentCapabilities`, not a member of it),
+    /// which is where both shipping adapters put it.
+    var steering = false
     var mcpHTTP = false
     var mcpSSE = false
     var promptImage = false

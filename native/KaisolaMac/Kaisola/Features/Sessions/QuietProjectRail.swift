@@ -10,21 +10,32 @@ import SwiftUI
 /// active project meant activating a project *moved* it, so the rail rearranged
 /// itself under the pointer on the single most common action in the app and the
 /// spatial memory the stored order exists to give you was destroyed by using
-/// it. Activation now changes exactly two things: which row wears the tinted
-/// capsule, and which row is expanded. Nothing moves. There is no second
-/// section and therefore no "Projects" label above one — a single unbroken list
-/// needs no heading, and the column already announces itself to assistive
-/// technology through the List's own accessibility label.
+/// it. Activation now changes exactly two things: which row is drawn bold, and
+/// which row is expanded. Nothing moves. There is no second section and
+/// therefore no "Projects" label above one — a single unbroken list needs no
+/// heading, and the column already announces itself to assistive technology
+/// through the List's own accessibility label.
 ///
 /// Row grammar is unchanged: identity mark · title · time-in-state · dot at the
 /// right edge, and idle rows draw no dot.
 ///
-/// v1.1.7 removed the last of the rail's boxes. There is now **exactly one**
-/// background fill in the whole sidebar — the active project's tinted glass
-/// capsule. Surface rows have none at all: a visible session is signalled by
-/// its title alone (primary, semibold) against `.secondary` regular for the
-/// rest, and by the `.isSelected` accessibility trait, which is the only part
-/// of "selected" assistive technology ever read out of the wash.
+/// v1.1.9 settles which row carries a fill, and it is not the project's.
+///
+/// The active project used to wear a tinted gradient glass capsule. A project
+/// row is a *heading*, and a heading that is also the loudest painted object in
+/// the column competes with the thing the column exists to point at — the
+/// surface you are actually looking at. The active project is now signalled by
+/// **weight alone**: bold against regular, with the 36pt session indent
+/// carrying the hierarchy. No capsule, no gradient, no tint fill, no stroke.
+///
+/// The single fill in the rail moved to the selected surface row, Safari's
+/// sidebar grammar: the row on screen draws its title in the user's accent
+/// colour on a soft neutral pill (`QuietSelectionPill`), every other row is
+/// plain `.secondary`. This supersedes v1.1.7's "no washes anywhere" — that
+/// pass removed the wash while the project capsule stayed, which left the
+/// loudest object in the column on the row that mattered least. Exactly one row
+/// is selected at a time (`QuietRowSelection`), and the `.isSelected`
+/// accessibility trait rides the same rule.
 ///
 /// The rail is pure presentation: every mutating action it offers is a closure
 /// or an `AppModel` call that already existed, so the sidebar's context menus
@@ -39,8 +50,10 @@ struct QuietProjectRail: View {
     /// Terminal selection carries a focus policy the rail must not own (window
     /// hand-off, focused-pane and cross-project guards), so the host supplies it.
     private let selectSession: (BrokerTerminalRecord) -> Void
-    /// The hover `+` offers creation only; destructive project actions stay in
-    /// the row's context menu.
+    /// The active header's `+` offers creation only; destructive project actions
+    /// stay in the row's context menu. Its contents (New Terminal, the agent
+    /// terminals, Chat, Mesh) are the host's — the rail only decides where the
+    /// control sits and when it is drawn.
     private let launchMenu: (AppModel.ProjectGroup) -> AnyView
     private let projectMenu: (AppModel.ProjectGroup) -> AnyView
     private let sessionMenu: (BrokerTerminalRecord) -> AnyView
@@ -245,7 +258,55 @@ private enum QuietRailMetrics {
     /// Distance from the row's trailing edge to the `+` slot. Lands the slot
     /// just inside the active project's capsule, which is itself inset by
     /// `KaisolaVisualSystem.chromeInset`.
-    static let plusTrailingInset: CGFloat = 10
+    ///
+    /// 10 → 12 in v1.1.10, when the active header's `+` stopped being
+    /// hover-only. The sidebar's resize corridor is an *overlay* on the trailing
+    /// edge of the List and reaches `NativeWorkspaceChrome.projectSidebarDividerReach`
+    /// (10.5pt) inward, so at 10 the corridor sat over the last half-point of
+    /// the `+` slot — already noted in `RootShellView` as a known ~1.5pt overlap
+    /// and left alone while the control only existed under the pointer. A
+    /// permanent control that is now *the* way to make a session cannot share
+    /// its edge with a drag handle, so the slot moves inside the reach instead.
+    static let plusTrailingInset: CGFloat = 12
+}
+
+/// Which of the project header's trailing controls are drawn, given the row's
+/// placement and whether the pointer is inside the group.
+///
+/// Pure so "creating a session is always one click away" is a test rather than
+/// a `if hovering` that the next layout pass can quietly re-add.
+enum QuietProjectHeaderControls {
+    /// The `+` launch menu.
+    ///
+    /// Permanent on the **active** project, hover-only on every other row.
+    ///
+    /// v1.1.7 removed the rail's last resting chrome and left creation four
+    /// doors, all of them either hidden or remembered: this `+` (revealed on
+    /// hover), the project and session context menus, ⌘T, and the command
+    /// palette. Michael's round-2 note is that this is the wrong trade — "make
+    /// it easier to open new sessions" — and it is the wrong trade specifically
+    /// on the row you are already working in. Exactly one project is active at a
+    /// time, so making its `+` permanent adds exactly one 18pt glyph to the
+    /// whole rail: the app's most common action becomes visible without the
+    /// column acquiring a control per row.
+    ///
+    /// Inactive projects keep the hover rule, and today they draw no `+` at all
+    /// — creating a session in a project you are not in goes through that row's
+    /// context menu. The rule is stated for both placements anyway so that a
+    /// future compact `+` cannot arrive as a *resting* one: one permanent glyph
+    /// in the whole rail is a control, one per row is a toolbar.
+    static func showsLaunchControl(isActive: Bool, hovering: Bool) -> Bool {
+        isActive || hovering
+    }
+
+    /// Accessibility identifier for the active project's launch menu, so its
+    /// presence-without-hover can be asserted from outside the process.
+    static let launchIdentifier = "rail.new-session"
+
+    /// The expand/collapse chevron stays hover-only in both placements: the
+    /// whole row is already the disclosure control, so the glyph is a hint
+    /// rather than the only way in.
+    static func showsDisclosureChevron(hovering: Bool) -> Bool { hovering }
 }
 
 /// What a surface row's title is actually given, derived from the same metrics
@@ -307,10 +368,28 @@ enum QuietRowBudget {
 /// How a project row is drawn. NOT where it sits — v1.1.8 decoupled those: the
 /// active project is drawn `.active` in whatever slot the stored order gives it.
 private enum QuietProjectPlacement {
-    /// The project you are in: expanded, with its surfaces, on a tinted capsule.
+    /// The project you are in: expanded, with its surfaces, and drawn bold.
     case active
     /// Any other project: one compact line, expandable in place.
     case compact
+}
+
+/// How a project row says it is the one you are in — with type, and nothing
+/// else.
+///
+/// Stated as a table for the same reason `QuietRowEmphasis` is: "the ONLY
+/// difference between the active project and every other one is weight" has to
+/// be a testable claim, not a pair of literals two hundred lines apart that a
+/// later pass can quietly re-tint.
+enum QuietProjectEmphasis {
+    /// The project you are in.
+    static let activeWeight: Font.Weight = .bold
+    /// Every other project.
+    static let restingWeight: Font.Weight = .regular
+
+    static func weight(isActive: Bool) -> Font.Weight {
+        isActive ? activeWeight : restingWeight
+    }
 }
 
 /// A project's leading mark: the stacked-tile glyph the v4 mock uses, in the
@@ -336,8 +415,9 @@ private struct QuietProjectMarkView: View {
 
 // MARK: - Project group
 
-/// One project. Pinned: a 32pt header carrying the project's tinted name, its
-/// chats/meshes/sessions beneath, and a hover-revealed "New session" row.
+/// One project. Pinned: a 32pt header carrying the project's tinted name, a
+/// resting `+` that opens the launch menu, and its chats/meshes/sessions
+/// beneath.
 /// Compact: a single 32pt row with a folder glyph, the project's name, its
 /// rollup, and a hover chevron that expands the project in place *without*
 /// activating it — activation is the row body's job.
@@ -398,17 +478,28 @@ private struct QuietProjectGroup: View {
         let sessions = SessionOrderStore.apply(manualOrder, to: project.sessions)
         let statuses = statusMap(sessions: sessions, chats: chats, meshes: meshes)
 
+        // Exactly one row in the whole rail wears the selection pill, and it is
+        // computed here rather than per row: a split shows two surfaces at once,
+        // and a non-active project can still hold a stored pane layout, so
+        // "is this surface on screen?" is not by itself the selection rule.
+        let selected = selectedSurfaceID(chats: chats, meshes: meshes, sessions: sessions)
+
         Group {
             header(statuses: statuses)
             if isExpanded {
                 ForEach(chats) { chat in
-                    chatRow(chat, status: statuses[chat.id] ?? .idle)
+                    chatRow(chat, status: statuses[chat.id] ?? .idle, selected: selected)
                 }
                 ForEach(meshes) { mesh in
-                    meshRow(mesh, status: statuses[mesh.id] ?? .idle)
+                    meshRow(mesh, status: statuses[mesh.id] ?? .idle, selected: selected)
                 }
                 ForEach(Array(sessions.enumerated()), id: \.element.id) { index, session in
-                    sessionRow(session, ordinal: index + 1, status: statuses[session.id] ?? .idle)
+                    sessionRow(
+                        session,
+                        ordinal: index + 1,
+                        status: statuses[session.id] ?? .idle,
+                        selected: selected
+                    )
                 }
                 .onMove { indices, target in
                     var ids = sessions.map(\.id)
@@ -445,15 +536,14 @@ private struct QuietProjectGroup: View {
         for (id, status) in statuses { note(id, status) }
     }
 
-    /// The active project, drawn on its own tinted glass capsule *in place*.
+    /// The active project, drawn bold *in place*.
     ///
-    /// This is the one place in the rail where colour is *identity* rather than
-    /// status, and it is deliberate: the capsule is what says "this is the
-    /// project you are in". Its language is the approved v1.1.6 mock's —
-    /// a shallow tint gradient, a lit top edge and a hairline tint stroke (see
-    /// `QuietActiveGlass`) — restrained enough that the status dots two columns
-    /// over still read first. Name and mark keep the same tint, so the row is
-    /// one object rather than a coloured box with grey contents.
+    /// No capsule, no gradient, no tint fill and no stroke: the row paints
+    /// nothing behind itself in any state. What says "this is the project you
+    /// are in" is the name's weight, and — one row down — the sessions the
+    /// expansion reveals at their 36pt indent. The project's own tint survives
+    /// on its 11.5pt identity mark, which is a colour *label* rather than a
+    /// highlight; nothing else in the row is coloured.
     private func activeHeader(statuses: [String: QuietSessionStatus]) -> some View {
         // Spacing 0: the `+` slot below carries its own trailing inset, and a
         // stack gap on top of it would push the menu back out of the row.
@@ -470,8 +560,11 @@ private struct QuietProjectGroup: View {
                     QuietProjectMarkView(tint: tint)
                         .padding(.trailing, QuietRailMetrics.markGap)
                     Text(project.name)
-                        .font(.system(size: QuietRailMetrics.headerText, weight: .semibold))
-                        .foregroundStyle(tint)
+                        .font(.system(
+                            size: QuietRailMetrics.headerText,
+                            weight: QuietProjectEmphasis.weight(isActive: true)
+                        ))
+                        .foregroundStyle(HierarchicalShapeStyle.primary)
                         .lineLimit(1)
                         .truncationMode(.middle)
                         .layoutPriority(1)
@@ -480,7 +573,7 @@ private struct QuietProjectGroup: View {
                         if !isExpanded {
                             QuietRollupView(rollup: QuietRollup.of(Array(statuses.values)))
                         }
-                        if hovering {
+                        if QuietProjectHeaderControls.showsDisclosureChevron(hovering: hovering) {
                             Image(systemName: isExpanded ? "chevron.down" : "chevron.right")
                                 .font(.system(size: QuietRailMetrics.chevronText, weight: .semibold))
                                 .foregroundStyle(.tertiary)
@@ -510,13 +603,25 @@ private struct QuietProjectGroup: View {
             // ever be laid out INSIDE the row. As a bare sibling of a
             // `maxWidth: .infinity` button it was pushed past the row's trailing
             // edge and rendered clipped in half.
+            //
+            // On the active project it is drawn at rest — see
+            // `QuietProjectHeaderControls.showsLaunchControl`. It is the rail's
+            // only piece of resting chrome and it buys the app's most common
+            // action; everything else in the column still appears only under the
+            // pointer.
             ZStack {
-                if hovering {
+                if QuietProjectHeaderControls.showsLaunchControl(
+                    isActive: isActive,
+                    hovering: hovering
+                ) {
                     Menu {
                         launchMenu(project)
                     } label: {
                         Image(systemName: "plus")
                             .font(.system(size: QuietRailMetrics.plusText, weight: .semibold))
+                            // `.secondary` at rest, not `.primary`: present
+                            // enough to find without competing with the project
+                            // name beside it, which is the row's actual subject.
                             .foregroundStyle(.secondary)
                     }
                     .menuStyle(.borderlessButton)
@@ -524,6 +629,7 @@ private struct QuietProjectGroup: View {
                     .fixedSize()
                     .help("New session in \(project.name)")
                     .accessibilityLabel("New session in \(project.name)")
+                    .accessibilityIdentifier(QuietProjectHeaderControls.launchIdentifier)
                 }
             }
             .frame(width: QuietRailMetrics.plusSlot, height: QuietRailMetrics.rowHeight)
@@ -531,7 +637,6 @@ private struct QuietProjectGroup: View {
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         .contentShape(Rectangle())
-        .background { QuietActiveProjectGlass(tint: tint) }
         .modifier(projectRowChrome)
     }
 
@@ -543,7 +648,10 @@ private struct QuietProjectGroup: View {
                     QuietProjectMarkView(tint: nil)
                         .padding(.trailing, QuietRailMetrics.markGap)
                     Text(project.name)
-                        .font(.system(size: QuietRailMetrics.headerText))
+                        .font(.system(
+                            size: QuietRailMetrics.headerText,
+                            weight: QuietProjectEmphasis.weight(isActive: false)
+                        ))
                         .foregroundStyle(HierarchicalShapeStyle.primary)
                         .lineLimit(1)
                         .truncationMode(.middle)
@@ -608,7 +716,7 @@ private struct QuietProjectGroup: View {
     private var tint: Color { ProjectTint.color(project.colorHex) ?? WorkspacePalette.project }
 
     /// Activation moves nothing. The row keeps its slot in the stored order and
-    /// simply becomes the one wearing the tinted capsule — v1.1.8's whole point.
+    /// simply becomes the bold one — v1.1.8's whole point.
     /// It does expand: a project opened collapsed would hide the surfaces the
     /// click was asking for.
     private func activate() {
@@ -688,19 +796,45 @@ private struct QuietProjectGroup: View {
         }
     }
 
-    // The hover-revealed "New session" ghost row is gone (v1.1.7). A row that
-    // appears under the pointer whenever it crosses the group is a row that
-    // pops at the user, and it was the rail's last piece of resting chrome.
-    // Creation keeps four doors that do not move: the active header's `+` menu,
-    // the project and session context menus, the File menu (⌘T), and the
-    // command palette.
+    // The hover-revealed "New session" ghost row is gone (v1.1.7) and is not
+    // coming back. A row that appears under the pointer whenever it crosses the
+    // group is a row that pops at the user, and it moves the rows below it while
+    // the pointer is travelling.
+    //
+    // v1.1.10 answers "make it easier to open new sessions" the other way: the
+    // active header's `+` is simply drawn at rest (see
+    // `QuietProjectHeaderControls.showsLaunchControl`) rather than a second
+    // affordance being added beside it. One glyph, in the row the user is
+    // already in, that does not move and does not appear or disappear. The other
+    // doors are unchanged: the project and session context menus, the File menu
+    // (⌘T), and the command palette.
 
     // MARK: Rows
+
+    /// The one surface in this group that is drawn as selected, or `nil`.
+    ///
+    /// Only the active project can own the selection — every other project's
+    /// pane layout is a memory of where its surfaces *were*, not what is on
+    /// screen — and inside it the focused pane wins, so a split highlights the
+    /// pane you are typing in rather than both of its rows.
+    private func selectedSurfaceID(
+        chats: [AcpChatHandle],
+        meshes: [MeshSession],
+        sessions: [BrokerTerminalRecord]
+    ) -> String? {
+        guard isActive else { return nil }
+        let ids = chats.map(\.id) + meshes.map(\.id) + sessions.map(\.id)
+        return QuietRowSelection.selectedID(
+            visibleIDs: ids.filter { model.isSurfaceVisible($0) },
+            focusedPaneID: model.focusedPaneID
+        )
+    }
 
     private func sessionRow(
         _ record: BrokerTerminalRecord,
         ordinal: Int,
-        status: QuietSessionStatus
+        status: QuietSessionStatus,
+        selected: String?
     ) -> some View {
         let processName = model.meta(for: record.id)?.processName
         return QuietSurfaceRowView(
@@ -717,7 +851,7 @@ private struct QuietProjectGroup: View {
             ),
             status: status,
             timeLabel: timeLabel(record.id),
-            isSelected: model.isSurfaceVisible(record.id),
+            isSelected: selected == record.id,
             tooltip: tooltip(for: record),
             groupHover: setHover,
             select: { selectSession(record) },
@@ -726,14 +860,14 @@ private struct QuietProjectGroup: View {
         )
     }
 
-    private func chatRow(_ chat: AcpChatHandle, status: QuietSessionStatus) -> some View {
+    private func chatRow(_ chat: AcpChatHandle, status: QuietSessionStatus, selected: String?) -> some View {
         QuietSurfaceRowView(
             id: chat.id,
             identity: QuietIdentity.identity(agentName: chat.agentID, processName: nil),
             title: chat.conversation.title,
             status: status,
             timeLabel: timeLabel(chat.id),
-            isSelected: model.isSurfaceVisible(chat.id),
+            isSelected: selected == chat.id,
             tooltip: chatTooltip(chat),
             groupHover: setHover,
             select: { model.selectChat(chat.id) },
@@ -742,14 +876,14 @@ private struct QuietProjectGroup: View {
         )
     }
 
-    private func meshRow(_ mesh: MeshSession, status: QuietSessionStatus) -> some View {
+    private func meshRow(_ mesh: MeshSession, status: QuietSessionStatus, selected: String?) -> some View {
         QuietSurfaceRowView(
             id: mesh.id,
             identity: .mesh,
             title: mesh.title,
             status: status,
             timeLabel: timeLabel(mesh.id),
-            isSelected: model.isSurfaceVisible(mesh.id),
+            isSelected: selected == mesh.id,
             tooltip: mesh.stage == "Idle" ? "Mesh · Ready" : "Mesh · \(mesh.stage)",
             groupHover: setHover,
             select: { model.selectMesh(mesh.id) },
@@ -921,18 +1055,24 @@ private struct QuietRollupView: View {
 
 // MARK: - Row anatomy
 
-/// How a surface row says it is the one on screen — with no box at all.
+/// How a surface row says it is the one on screen.
 ///
-/// v1.1.7 deleted `QuietSelectionWash`, the rounded grey rectangle that used to
-/// sit under a visible row. A wash is a second selection language competing
-/// with the active project's capsule, and stacked down a column of five rows it
-/// turned the rail back into a list of chips. What is left is the least a row
-/// can say and still be found: the title's own weight and colour.
+/// v1.1.7 deleted `QuietSelectionWash` on the grounds that a wash was "a second
+/// selection language competing with the active project's capsule". v1.1.9
+/// resolves that competition the other way round: the capsule is gone (a
+/// project row is a heading, see `QuietProjectEmphasis`) and the fill it freed
+/// moves onto the row it was always meant to mark — the surface you are looking
+/// at. That is Safari's sidebar grammar, and it is what the rail is measured
+/// against: accent-coloured label on a soft neutral pill, everything else plain.
 ///
-/// Stated as a table rather than inline ternaries so "the ONLY difference is
-/// type" is a testable claim.
+/// Stated as a table rather than inline ternaries so "selected differs from
+/// resting in exactly these three tokens" is a testable claim.
 enum QuietRowEmphasis {
-    /// The visible surface: full ink, semibold.
+    /// The visible surface: accent ink, semibold.
+    ///
+    /// Weight is kept as a *second* cue on top of the colour. The pill and the
+    /// accent both vanish for a user who cannot separate the hues (or who has
+    /// set a low-contrast accent); the weight does not, and it costs nothing.
     static let selectedWeight: Font.Weight = .semibold
     /// Everything else in the rail: regular, one step back.
     static let restingWeight: Font.Weight = .regular
@@ -942,82 +1082,69 @@ enum QuietRowEmphasis {
     }
 }
 
-/// Every number the active project's tinted glass capsule is made of.
+/// Which surface row is drawn as selected.
 ///
-/// Stated as one table rather than inline literals because the whole risk of
-/// this treatment is drift toward candy: each value is the *ceiling* the mock
-/// approved, and the relationships between them (top heavier than bottom, the
-/// lit edge brighter in light mode than in dark, every value well under half)
-/// are what keep it reading as glass rather than as a coloured chip. Tested.
-enum QuietActiveGlass {
-    /// Tint alpha at the capsule's top edge…
-    static let topFillOpacity: Double = 0.18
-    /// …and at its bottom, so the fill falls away rather than sitting flat.
-    static let bottomFillOpacity: Double = 0.08
-    /// Hairline tint stroke: enough to draw the capsule's edge against a busy
-    /// wallpaper, not enough to outline it.
-    static let strokeOpacity: Double = 0.26
-    /// The 1pt lit top edge that makes the capsule read as a reflective
-    /// surface. Light mode can carry a bright specular; dark mode cannot —
-    /// white at that strength on a dark rail reads as a seam, not a highlight.
-    static func highlightOpacity(dark: Bool) -> Double { dark ? 0.12 : 0.35 }
-    /// Where the highlight has faded to nothing, as a fraction of row height.
-    /// It is a *top* highlight: past this point the capsule is only its tint.
-    static let highlightFalloff: Double = 0.5
+/// Pure, because "exactly one row at a time" is a rule and not a rendering
+/// detail — and because the two ways it can break are both invisible in a
+/// screenshot of the happy path: a split makes two surfaces visible at once,
+/// and a project that is not the active one can still carry a stored pane
+/// layout from the last time you were in it. Callers pass only the ids that
+/// belong to the project actually on screen.
+enum QuietRowSelection {
+    /// - Parameters:
+    ///   - visibleIDs: surfaces of the active project that are on screen, in
+    ///     the order the rail draws them.
+    ///   - focusedPaneID: the pane holding focus, if any.
+    /// - Returns: the single id that wears the pill, or `nil` when nothing of
+    ///   this project is on screen.
+    static func selectedID(visibleIDs: [String], focusedPaneID: String?) -> String? {
+        guard !visibleIDs.isEmpty else { return nil }
+        // The focused pane wins a split. It is deliberately checked against the
+        // visible set rather than trusted: focus can still name a surface that
+        // has since been hidden or that belongs to another window entirely, and
+        // that must fall back to a real row rather than to no row at all.
+        if let focusedPaneID, visibleIDs.contains(focusedPaneID) { return focusedPaneID }
+        return visibleIDs.first
+    }
 }
 
-/// The active project's tint as a reflective glass capsule.
+/// Every number the selected row's pill is made of.
 ///
-/// Three layers, cheapest first: a vertical tint gradient, a hairline tint
-/// stroke on the border, and a 1pt white inner edge along the top that fades
-/// out by mid-row. No material and no blur — the sidebar's backdrop is already
-/// one live layer (v1.1.5) and stacking a second one here is exactly the cost
-/// that got the old four-layer sidebar card deleted.
-private struct QuietActiveProjectGlass: View {
-    let tint: Color
+/// Neutral on purpose. The colour in this row is the *label*, in the user's own
+/// accent; a tinted pill under tinted text is the coloured chip the v1.1.7 pass
+/// was right to delete. The fill exists only to give the accent something to sit
+/// on, which is why both values are single digits of opacity.
+enum QuietSelectionPill {
+    /// Light appearance: a whisper of the label colour's own ink.
+    static let lightFillOpacity: Double = 0.06
+    /// Dark appearance, where the same recipe would disappear: white, slightly
+    /// stronger, because a dark rail swallows a 6% black.
+    static let darkFillOpacity: Double = 0.10
+    /// Shares the app's inset radius, so the pill is the same corner as every
+    /// other rounded surface in the window.
+    static var cornerRadius: CGFloat { KaisolaVisualSystem.insetRadius }
+    /// Inset from the row's own edges, so the pill floats inside the column
+    /// rather than reaching the sidebar's border.
+    static let horizontalInset: CGFloat = 6
 
+    static func fillOpacity(dark: Bool) -> Double { dark ? darkFillOpacity : lightFillOpacity }
+}
+
+/// The soft neutral pill under the selected surface row.
+private struct QuietSelectionPillView: View {
     @Environment(\.colorScheme) private var colorScheme
 
-    private var shape: RoundedRectangle {
-        RoundedRectangle(cornerRadius: KaisolaVisualSystem.insetRadius, style: .continuous)
-    }
-
-    private var highlight: Color {
-        .white.opacity(QuietActiveGlass.highlightOpacity(dark: colorScheme == .dark))
-    }
-
     var body: some View {
-        shape
-            .fill(
-                LinearGradient(
-                    colors: [
-                        tint.opacity(QuietActiveGlass.topFillOpacity),
-                        tint.opacity(QuietActiveGlass.bottomFillOpacity),
-                    ],
-                    startPoint: .top,
-                    endPoint: .bottom
-                )
-            )
-            // `strokeBorder`, not `stroke`: the hairline has to sit inside the
-            // capsule, or half of it lands on the neighbouring row's pixels.
-            .overlay { shape.strokeBorder(tint.opacity(QuietActiveGlass.strokeOpacity), lineWidth: 1) }
-            .overlay {
-                shape
-                    .inset(by: 0.5)
-                    .stroke(
-                        LinearGradient(
-                            stops: [
-                                .init(color: highlight, location: 0),
-                                .init(color: highlight.opacity(0), location: QuietActiveGlass.highlightFalloff),
-                            ],
-                            startPoint: .top,
-                            endPoint: .bottom
-                        ),
-                        lineWidth: 1
-                    )
-            }
-            .padding(.horizontal, 6)
+        RoundedRectangle(cornerRadius: QuietSelectionPill.cornerRadius, style: .continuous)
+            .fill(fill)
+            .padding(.horizontal, QuietSelectionPill.horizontalInset)
             .accessibilityHidden(true)
+    }
+
+    private var fill: Color {
+        let dark = colorScheme == .dark
+        let base: Color = dark ? .white : .primary
+        return base.opacity(QuietSelectionPill.fillOpacity(dark: dark))
     }
 }
 
@@ -1043,9 +1170,9 @@ private struct QuietRowBody: View {
                 .padding(.trailing, QuietRailMetrics.markGap)
             Text(title)
                 .font(.system(size: QuietRailMetrics.titleText, weight: QuietRowEmphasis.weight(isSelected: isSelected)))
-                // Three steps, and type carries all of them: an ended row is
-                // tertiary, the row you are looking at is primary semibold,
-                // everything else is secondary regular. No fill anywhere.
+                // Three steps: the row you are looking at is the user's accent
+                // colour, an ended row is tertiary, everything else is
+                // secondary regular.
                 .foregroundStyle(titleStyle)
                 .lineLimit(1)
                 .truncationMode(.tail)
@@ -1060,10 +1187,12 @@ private struct QuietRowBody: View {
         .frame(height: QuietRailMetrics.rowHeight)
         .frame(maxWidth: .infinity, alignment: .leading)
         .contentShape(Rectangle())
-        // No `.background` at all. The row draws nothing behind itself in any
-        // state; `.isSelected` on the enclosing Button is what assistive
-        // technology reads, and it is unaffected by the wash's removal.
-        //
+        // The rail's ONE fill, and only under the row on screen. `.isSelected`
+        // on the enclosing Button carries the same fact to assistive
+        // technology, so the pill is decoration and is hidden from it.
+        .background {
+            if isSelected { QuietSelectionPillView() }
+        }
         // Deliberately NOT `.accessibilityElement(children: .combine)` here:
         // that would make this the row's own isolated accessibility node,
         // nested *inside* the enclosing Button in `QuietSurfaceRowView`
@@ -1072,9 +1201,13 @@ private struct QuietRowBody: View {
         // descends into. The combine + label live on the Button itself.
     }
 
-    private var titleStyle: HierarchicalShapeStyle {
-        if status.isDimmed { return .tertiary }
-        return isSelected ? .primary : .secondary
+    /// Selection outranks dimming: an ended session you are still looking at is
+    /// the row the sidebar is pointing at, and greying it would leave the pill
+    /// under a title that reads as inactive.
+    private var titleStyle: AnyShapeStyle {
+        if isSelected { return AnyShapeStyle(Color.accentColor) }
+        if status.isDimmed { return AnyShapeStyle(HierarchicalShapeStyle.tertiary) }
+        return AnyShapeStyle(HierarchicalShapeStyle.secondary)
     }
 
     /// Reveal, time-in-state and dot travel as ONE `fixedSize` lane.

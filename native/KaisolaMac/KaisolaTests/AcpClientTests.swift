@@ -98,7 +98,7 @@ final class AcpClientTests: XCTestCase {
     }
 
     @MainActor
-    func testSteeringQueuedTurnClearsPresentedAndQueuedPermissions() async throws {
+    func testInjectingQueuedMessageLeavesTheTurnAndItsPermissionsAlone() async throws {
         let transport = ScriptedAcpTransport()
         let client = AcpClient(transport: transport)
         let ruleDirectory = FileManager.default.temporaryDirectory
@@ -125,11 +125,369 @@ final class AcpClientTests: XCTestCase {
         XCTAssertEqual(conversation.pendingPermissionCount, 2)
 
         let queuedID = try XCTUnwrap(conversation.queued.first?.id)
-        conversation.steerQueued(queuedID)
+        conversation.injectQueued(queuedID)
 
-        XCTAssertNil(conversation.pendingPermission)
-        XCTAssertEqual(conversation.pendingPermissionCount, 0)
-        XCTAssertEqual(conversation.queued.first?.text, "steer me")
+        // Injection joins the running turn instead of interrupting it, so the
+        // asks that turn already raised stay exactly where they were. (The old
+        // cancel-based steer had to discard them.)
+        XCTAssertEqual(conversation.pendingPermissionCount, 2)
+        XCTAssertEqual(conversation.pendingPermission?.title, "First")
+    }
+
+    func testSteeringCapabilityIsReadFromTheResponsesOwnMeta() {
+        // Both adapters advertise steering on the InitializeResponse's own
+        // `_meta`, a SIBLING of `agentCapabilities`. Reading it from inside the
+        // capability block would leave the action permanently hidden.
+        let advertised = AcpClient.parseCapabilities(.object([
+            "protocolVersion": .integer(1),
+            "agentCapabilities": .object(["loadSession": .bool(true)]),
+            "_meta": .object(["steering": .object(["supported": .bool(true)])]),
+        ]))
+        XCTAssertTrue(advertised.steering)
+        XCTAssertTrue(advertised.loadSession)
+
+        // Nested in the wrong place is not an advertisement.
+        let misplaced = AcpClient.parseCapabilities(.object([
+            "agentCapabilities": .object([
+                "_meta": .object(["steering": .object(["supported": .bool(true)])]),
+            ]),
+        ]))
+        XCTAssertFalse(misplaced.steering)
+
+        XCTAssertFalse(AcpClient.parseCapabilities(.object([:])).steering)
+    }
+
+    func testSteerRequestIsShapedLikeAPromptWithTheIdleOptIn() throws {
+        let params = try XCTUnwrap(
+            AcpSteering.requestParams(sessionID: "sess-1", text: "use tabs").objectValue
+        )
+        XCTAssertEqual(params["sessionId"], .string("sess-1"))
+        XCTAssertEqual(params["prompt"], .array([.object([
+            "type": .string("text"),
+            "text": .string("use tabs"),
+        ])]))
+        // The opt-in keeps an idle session from starting a DETACHED turn whose
+        // `session/prompt` response this client would never see.
+        XCTAssertEqual(
+            params["_meta"],
+            .object(["steering": .object(["idleBehavior": .string("promptRequired")])])
+        )
+    }
+
+    func testSteerOutcomeParsingTreatsAnythingUnknownAsRejected() {
+        XCTAssertEqual(AcpSteering.parseOutcome(.object(["outcome": .string("injected")])), .injected)
+        XCTAssertEqual(
+            AcpSteering.parseOutcome(.object(["outcome": .string("startedNewTurn")])),
+            .startedNewTurn
+        )
+        XCTAssertEqual(
+            AcpSteering.parseOutcome(.object([
+                "outcome": .string("promptRequired"),
+                "reason": .string("noRunningTurn"),
+            ])),
+            .promptRequired
+        )
+        // Codex's own refusal vocabulary.
+        guard case .rejected = AcpSteering.parseOutcome(.object(["outcome": .string("failed")])) else {
+            return XCTFail("\"failed\" must not read as delivered")
+        }
+        guard case .rejected = AcpSteering.parseOutcome(.object(["outcome": .string("teleported")])) else {
+            return XCTFail("an unknown outcome must not read as delivered")
+        }
+        guard case .rejected = AcpSteering.parseOutcome(.object([:])) else {
+            return XCTFail("a missing outcome must not read as delivered")
+        }
+        guard case .rejected = AcpSteering.parseOutcome(nil) else {
+            return XCTFail("no body must not read as delivered")
+        }
+    }
+
+    func testInjectActionIsOfferedOnlyWhenItCanWork() {
+        XCTAssertTrue(AcpSteering.canInject(supportsSteering: true, isConnected: true, isRunning: true))
+        XCTAssertFalse(AcpSteering.canInject(supportsSteering: false, isConnected: true, isRunning: true))
+        XCTAssertFalse(AcpSteering.canInject(supportsSteering: true, isConnected: false, isRunning: true))
+        XCTAssertFalse(AcpSteering.canInject(supportsSteering: true, isConnected: true, isRunning: false))
+    }
+
+    func testSteerOutcomesMapToQueueTransitions() {
+        XCTAssertEqual(AcpSteering.decide(.injected), .delivered)
+        guard case .deliveredAsNewTurn = AcpSteering.decide(.startedNewTurn) else {
+            return XCTFail("a turn the adapter started is already sent and must leave the queue")
+        }
+        guard case .keptQueued = AcpSteering.decide(.promptRequired) else {
+            return XCTFail("nothing was sent, so the message must stay queued")
+        }
+        guard case let .keptQueued(notice) = AcpSteering.decide(.rejected("busy")) else {
+            return XCTFail("a refusal must never lose the message")
+        }
+        XCTAssertTrue(notice.contains("busy"), "the user must be told why: \(notice)")
+    }
+
+    @MainActor
+    func testInjectedQueuedMessageLeavesTheQueueAndJoinsTheTranscript() async throws {
+        let transport = ScriptedAcpTransport(steerOutcome: "injected")
+        let client = AcpClient(transport: transport)
+        let conversation = AcpConversation(
+            title: "Steer", command: "mock", arguments: [], environment: [:],
+            cwd: "/tmp", client: client
+        )
+        await conversation.start()
+        XCTAssertTrue(conversation.supportsSteering)
+        XCTAssertFalse(conversation.canInjectQueued, "no turn is running yet")
+
+        conversation.send("first")
+        conversation.send("actually use tabs")
+        XCTAssertTrue(conversation.canInjectQueued)
+        let queuedID = try XCTUnwrap(conversation.queued.first?.id)
+        conversation.injectQueued(queuedID)
+
+        try await Self.until("the injected message left the queue") {
+            conversation.queued.isEmpty && conversation.injectingQueuedIDs.isEmpty
+        }
+        let steerTexts = await transport.receivedSteerRequests().compactMap {
+            $0.objectValue?["prompt"]?.arrayValue?.first?.objectValue?["text"]?.stringValue
+        }
+        XCTAssertEqual(steerTexts, ["actually use tabs"])
+        // It rode the running turn, not a second `session/prompt` — checked once
+        // the turn has fully settled so an unsent prompt cannot pass by being
+        // merely late.
+        try await Self.until("the turn settled") { !conversation.isRunning }
+        let prompts = await transport.receivedPromptTexts()
+        XCTAssertEqual(prompts, ["first"])
+        let userTexts = conversation.rows.compactMap { row -> String? in
+            if case let .user(_, text, _) = row { return text } else { return nil }
+        }
+        XCTAssertEqual(userTexts, ["first", "actually use tabs"])
+    }
+
+    @MainActor
+    func testRefusedInjectionKeepsTheMessageAndTellsTheUser() async throws {
+        let transport = ScriptedAcpTransport(steerErrorMessage: "Session not found")
+        let client = AcpClient(transport: transport)
+        let conversation = AcpConversation(
+            title: "Steer", command: "mock", arguments: [], environment: [:],
+            cwd: "/tmp", client: client
+        )
+        await conversation.start()
+        conversation.send("first")
+        conversation.send("actually use tabs")
+        let queuedID = try XCTUnwrap(conversation.queued.first?.id)
+        conversation.injectQueued(queuedID)
+
+        try await Self.until("the refusal was reported") {
+            conversation.injectingQueuedIDs.isEmpty && conversation.statusMessage != nil
+        }
+        // Nothing was delivered, so nothing was lost: the message is still
+        // queued and the ordinary flush will send it as its own turn.
+        XCTAssertEqual(conversation.queued.map(\.text), ["actually use tabs"])
+        XCTAssertTrue(
+            conversation.statusMessage?.contains("Session not found") == true,
+            "the user must be told: \(conversation.statusMessage ?? "nil")"
+        )
+        XCTAssertFalse(conversation.rows.contains { row in
+            if case let .user(_, text, _) = row { return text == "actually use tabs" }
+            return false
+        }, "an undelivered message must not appear as if it had been said")
+    }
+
+    @MainActor
+    func testTurnEndingMidInjectionSendsTheMessageExactlyOnce() async throws {
+        // The Claude adapter answers `promptRequired` when the turn it was asked
+        // to steer has already finished — the content stays host-owned, so the
+        // queue must send it in the ordinary way and MUST NOT send it twice.
+        let transport = ScriptedAcpTransport(steerOutcome: "promptRequired")
+        let client = AcpClient(transport: transport)
+        let conversation = AcpConversation(
+            title: "Steer", command: "mock", arguments: [], environment: [:],
+            cwd: "/tmp", client: client
+        )
+        await conversation.start()
+        conversation.send("first")
+        conversation.send("actually use tabs")
+        let queuedID = try XCTUnwrap(conversation.queued.first?.id)
+        conversation.injectQueued(queuedID)
+
+        try await Self.until("the queue drained normally") {
+            conversation.queued.isEmpty && !conversation.isRunning
+        }
+        let prompts = await transport.receivedPromptTexts()
+        XCTAssertEqual(prompts, ["first", "actually use tabs"])
+        let userTexts = conversation.rows.compactMap { row -> String? in
+            if case let .user(_, text, _) = row { return text } else { return nil }
+        }
+        XCTAssertEqual(userTexts, ["first", "actually use tabs"])
+    }
+
+    @MainActor
+    func testUnsupportedAdapterNeverOffersTheInjectAction() async {
+        let transport = ScriptedAcpTransport(steeringSupported: false)
+        let client = AcpClient(transport: transport)
+        let conversation = AcpConversation(
+            title: "Steer", command: "mock", arguments: [], environment: [:],
+            cwd: "/tmp", client: client
+        )
+        await conversation.start()
+        conversation.send("first")
+        conversation.send("actually use tabs")
+        XCTAssertFalse(conversation.supportsSteering)
+        XCTAssertFalse(conversation.canInjectQueued)
+
+        // Even called directly it must not put an unanswerable request on the
+        // wire; the message simply stays queued.
+        conversation.injectQueued(conversation.queued[0].id)
+        XCTAssertTrue(conversation.injectingQueuedIDs.isEmpty)
+        XCTAssertEqual(conversation.queued.map(\.text), ["actually use tabs"])
+        let steers = await transport.receivedSteerRequests()
+        XCTAssertTrue(steers.isEmpty)
+    }
+
+    // MARK: - Resumed sessions show the user's own prompts
+
+    @MainActor
+    func testResumedSessionRestoresTheUsersOwnPromptsWithoutDuplicatingThem() async throws {
+        // `session/load` replays the whole thread. "already asked" is a prompt
+        // this chat persisted locally, so its replay must be absorbed; "asked
+        // before the store was pruned" is history only the adapter still has,
+        // so it must appear.
+        let transport = ScriptedAcpTransport(loadReplay: [
+            (messageID: "m1", text: "already asked"),
+            (messageID: "m2", text: "asked before the store was pruned"),
+        ])
+        let client = AcpClient(transport: transport)
+        let conversation = AcpConversation(
+            title: "Resume", command: "mock", arguments: [], environment: [:],
+            cwd: "/tmp", client: client,
+            resumeSessionID: "sess-persisted",
+            initialRows: [
+                .user(id: "1", text: "already asked", failed: false),
+                .message(id: "1", text: "An answer."),
+            ]
+        )
+        await conversation.start()
+
+        try await Self.until("the replay reached the transcript") {
+            conversation.rows.contains { row in
+                if case let .user(_, text, _) = row {
+                    return text == "asked before the store was pruned"
+                }
+                return false
+            }
+        }
+        let userTexts = conversation.rows.compactMap { row -> String? in
+            if case let .user(_, text, _) = row { return text } else { return nil }
+        }
+        XCTAssertEqual(userTexts, ["already asked", "asked before the store was pruned"])
+    }
+
+    func testLedgerAbsorbsAReplayOnlyAsOftenAsTheTranscriptAlreadyShowsIt() {
+        var ledger = AcpUserMessageLedger(rows: [
+            .user(id: "1", text: "continue", failed: false),
+            .user(id: "2", text: "continue", failed: false),
+            .message(id: "1", text: "…"),
+        ])
+        // Two local rows absorb exactly two replayed copies.
+        XCTAssertEqual(ledger.reconcile(text: "continue", adapterMessageID: "a"), .drop)
+        XCTAssertEqual(ledger.reconcile(text: "continue", adapterMessageID: "b"), .drop)
+        // A third is history this transcript does not have, so it is shown.
+        XCTAssertEqual(
+            ledger.reconcile(text: "continue", adapterMessageID: "c"),
+            .append(id: "acp:c")
+        )
+        // …and recognized by id the next time the thread is loaded, without
+        // needing the text to be unique.
+        XCTAssertEqual(ledger.reconcile(text: "continue", adapterMessageID: "c"), .drop)
+    }
+
+    func testLedgerRecognizesItsOwnEarlierReplayAcrossARestart() {
+        // The row an earlier replay appended was persisted under its adapter id,
+        // so a later load matches on that id and shows it once.
+        var ledger = AcpUserMessageLedger(rows: [
+            .user(id: "acp:m2", text: "asked before the store was pruned", failed: false),
+        ])
+        XCTAssertEqual(
+            ledger.reconcile(text: "asked before the store was pruned", adapterMessageID: "m2"),
+            .drop
+        )
+    }
+
+    func testLedgerGivesUnkeyedReplayChunksDistinctRowIdentities() {
+        // Codex's rollout-file fallback replays user messages with no messageId.
+        var ledger = AcpUserMessageLedger()
+        XCTAssertEqual(ledger.reconcile(text: "one", adapterMessageID: nil), .append(id: "acp:anon-1"))
+        XCTAssertEqual(ledger.reconcile(text: "two", adapterMessageID: nil), .append(id: "acp:anon-2"))
+    }
+
+    @MainActor
+    func testLocallySentPromptIsNotShownTwiceWhenTheAdapterEchoesIt() async throws {
+        // Claude echoes any prompt that carried more than one content block
+        // (every attachment send) straight back as `user_message_chunk`.
+        let transport = ScriptedAcpTransport()
+        let client = AcpClient(transport: transport)
+        let conversation = AcpConversation(
+            title: "Echo", command: "mock", arguments: [], environment: [:],
+            cwd: "/tmp", client: client
+        )
+        await conversation.start()
+        conversation.send("look at this")
+        try await Self.until("the send landed") {
+            conversation.rows.contains { if case .user = $0 { return true } else { return false } }
+        }
+        conversation.receiveTurnItemForTesting(.userMessage(id: "echo-1", text: "look at this"))
+
+        let userTexts = conversation.rows.compactMap { row -> String? in
+            if case let .user(_, text, _) = row { return text } else { return nil }
+        }
+        XCTAssertEqual(userTexts, ["look at this"])
+    }
+
+    @MainActor
+    func testMultiBlockReplayFoldsIntoOneRowInsteadOfLeakingItsContext() {
+        // A file attachment replays as several chunks sharing one messageId:
+        // the prompt text, a link, then a `<context>` dump. They are one message
+        // and must render as one row.
+        let conversation = AcpConversation(
+            title: "Replay", command: "mock", arguments: [], environment: [:], cwd: "/tmp"
+        )
+        conversation.receiveTurnItemForTesting(.userMessage(id: "m9", text: "review this"))
+        conversation.receiveTurnItemForTesting(.userMessage(id: "m9", text: " [notes.txt]"))
+        conversation.receiveTurnItemForTesting(.userMessage(id: "m9", text: "\n<context>…</context>"))
+
+        let userRows = conversation.rows.compactMap { row -> String? in
+            if case let .user(_, text, _) = row { return text } else { return nil }
+        }
+        XCTAssertEqual(userRows, ["review this [notes.txt]\n<context>…</context>"])
+    }
+
+    @MainActor
+    func testSuppressedMultiBlockReplayDoesNotLeakItsRemainingChunks() {
+        // When the first chunk is recognized as one the transcript already
+        // shows, the rest of that message must stay suppressed with it —
+        // otherwise the context dump would appear as a user row of its own.
+        let conversation = AcpConversation(
+            title: "Replay", command: "mock", arguments: [], environment: [:], cwd: "/tmp",
+            initialRows: [.user(id: "1", text: "review this", failed: false)]
+        )
+        conversation.receiveTurnItemForTesting(.userMessage(id: "m9", text: "review this"))
+        conversation.receiveTurnItemForTesting(.userMessage(id: "m9", text: "\n<context>…</context>"))
+
+        let userRows = conversation.rows.compactMap { row -> String? in
+            if case let .user(_, text, _) = row { return text } else { return nil }
+        }
+        XCTAssertEqual(userRows, ["review this"])
+    }
+
+    /// Poll until `condition` holds, failing with `description` on timeout.
+    @MainActor
+    private static func until(
+        _ description: String,
+        timeout: TimeInterval = 10,
+        _ condition: () -> Bool
+    ) async throws {
+        let deadline = Date().addingTimeInterval(timeout)
+        while !condition() {
+            if Date() > deadline { return XCTFail("timed out waiting for \(description)") }
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
     }
 
     @MainActor
@@ -371,8 +729,10 @@ final class AcpClientTests: XCTestCase {
     }
 
     @MainActor
-    func testSteerPromotesQueuedMessageToFront() async throws {
-        let transport = ScriptedAcpTransport()
+    func testInjectingOneQueuedMessageLeavesTheRestOfTheQueueInOrder() async throws {
+        // Steering is per-message: the one the user picked reaches the running
+        // turn, and every other follow-up keeps its place in the FIFO.
+        let transport = ScriptedAcpTransport(steerOutcome: "injected")
         let client = AcpClient(transport: transport)
         let conversation = AcpConversation(
             title: "Test", command: "mock", arguments: [], environment: [:],
@@ -384,17 +744,15 @@ final class AcpClientTests: XCTestCase {
         conversation.send("third")
         XCTAssertEqual(conversation.queued.map(\.text), ["second", "third"])
 
-        // Steering "third" promotes it ahead of "second" and interrupts the
-        // current turn; the flush then dispatches in promoted order.
         let steerID = try XCTUnwrap(conversation.queued.last?.id)
-        conversation.steerQueued(steerID)
-        XCTAssertEqual(conversation.queued.first?.text, "third")
+        conversation.injectQueued(steerID)
 
-        let deadline = Date().addingTimeInterval(5)
-        while conversation.isRunning || !conversation.queued.isEmpty {
-            if Date() > deadline { XCTFail("steered queue did not drain"); break }
-            try await Task.sleep(nanoseconds: 20_000_000)
+        try await Self.until("the queue drained") {
+            !conversation.isRunning && conversation.queued.isEmpty
+                && conversation.injectingQueuedIDs.isEmpty
         }
+        let prompts = await transport.receivedPromptTexts()
+        XCTAssertEqual(prompts, ["first", "second"], "\"third\" was steered, not prompted")
         let userTexts = conversation.rows.compactMap { row -> String? in
             if case let .user(_, text, _) = row { return text } else { return nil }
         }
@@ -438,10 +796,15 @@ private actor ScriptedAcpTransport: AcpByteTransport {
     private let resumeCapability: Bool
     private let rejectRestoration: Bool
     private let crashOnFirstPrompt: Bool
+    private let steeringSupported: Bool
+    private let steerOutcome: String?
+    private let steerErrorMessage: String?
+    private let loadReplay: [(messageID: String?, text: String)]
     private var sessionMcpServers: [JSONValue] = []
     private var sessionMcpAttempts: [[JSONValue]] = []
     private var sessionMethods: [String] = []
     private var promptTexts: [String] = []
+    private var steerRequests: [JSONValue] = []
     private var didCrashPrompt = false
     private var recordedExitCode: Int32 = 0
     private var terminations = 0
@@ -453,7 +816,11 @@ private actor ScriptedAcpTransport: AcpByteTransport {
         rejectFirstMcpSession: Bool = false,
         resumeCapability: Bool = false,
         rejectRestoration: Bool = false,
-        crashOnFirstPrompt: Bool = false
+        crashOnFirstPrompt: Bool = false,
+        steeringSupported: Bool = true,
+        steerOutcome: String? = "injected",
+        steerErrorMessage: String? = nil,
+        loadReplay: [(messageID: String?, text: String)] = []
     ) {
         self.protocolVersion = protocolVersion
         self.mcpHTTP = mcpHTTP
@@ -462,12 +829,17 @@ private actor ScriptedAcpTransport: AcpByteTransport {
         self.resumeCapability = resumeCapability
         self.rejectRestoration = rejectRestoration
         self.crashOnFirstPrompt = crashOnFirstPrompt
+        self.steeringSupported = steeringSupported
+        self.steerOutcome = steerOutcome
+        self.steerErrorMessage = steerErrorMessage
+        self.loadReplay = loadReplay
     }
 
     func receivedSessionMcpServers() -> [JSONValue] { sessionMcpServers }
     func receivedSessionMcpAttempts() -> [[JSONValue]] { sessionMcpAttempts }
     func receivedSessionMethods() -> [String] { sessionMethods }
     func receivedPromptTexts() -> [String] { promptTexts }
+    func receivedSteerRequests() -> [JSONValue] { steerRequests }
     func terminationCount() -> Int { terminations }
 
     func start(command: String, arguments: [String], environment: [String: String], cwd: String) async throws {
@@ -492,6 +864,9 @@ private actor ScriptedAcpTransport: AcpByteTransport {
                         "sse": .bool(mcpSSE),
                     ]),
                 ]),
+                // Sibling of `agentCapabilities`, exactly where both shipping
+                // adapters advertise the steering extension.
+                "_meta": .object(["steering": .object(["supported": .bool(steeringSupported)])]),
             ]))
         case "session/new":
             sessionMethods.append("session/new")
@@ -536,7 +911,33 @@ private actor ScriptedAcpTransport: AcpByteTransport {
                 replyError(id: id, message: "Unknown session")
             } else {
                 let restoredID = object["params"]?.objectValue?["sessionId"]?.stringValue ?? "sess-restored"
+                // Both shipping adapters replay a loaded thread's whole history
+                // as `session/update`s BEFORE answering the load.
+                if method == "session/load" {
+                    for entry in loadReplay {
+                        var update: [String: JSONValue] = [
+                            "sessionUpdate": .string("user_message_chunk"),
+                            "content": .object([
+                                "type": .string("text"),
+                                "text": .string(entry.text),
+                            ]),
+                        ]
+                        if let messageID = entry.messageID {
+                            update["messageId"] = .string(messageID)
+                        }
+                        notify(update: .object(update))
+                    }
+                }
                 reply(id: id, result: .object(["sessionId": .string(restoredID)]))
+            }
+        case AcpSteering.method:
+            steerRequests.append(object["params"] ?? .null)
+            if let steerErrorMessage {
+                replyError(id: id, message: steerErrorMessage)
+            } else if let steerOutcome {
+                reply(id: id, result: .object(["outcome": .string(steerOutcome)]))
+            } else {
+                reply(id: id, result: .object([:]))
             }
         case "session/set_config_option":
             reply(id: id, result: .object([

@@ -488,6 +488,34 @@ struct McpProbeResult: Equatable, Sendable {
     var hasMoreTools = false
 }
 
+/// Pure MCP `initialize` revision negotiation: given the server's reply,
+/// decide whether this probe can speak that revision. Per the MCP spec a
+/// server may legitimately answer with an older revision it supports
+/// instead of the one requested — the client should accept any revision
+/// it can itself speak rather than demanding an exact echo of what it
+/// asked for. Kept free of the actor's networking so it's a synchronous,
+/// directly testable function; the previous exact-match check pinned to
+/// `2025-06-18` and rejected the `2025-11-25` reply every SDK ≥1.19
+/// server sends, surfacing "Unsupported protocol version" for servers
+/// that work fine (real traffic goes through the ACP adapter's bundled
+/// MCP SDK 1.30.0, which already speaks both revisions).
+enum McpProtocolRevision {
+    /// Requested in the probe's `initialize` call — the newest revision
+    /// current servers and the ACP adapter's bundled MCP SDK speak.
+    static let requested = "2025-11-25"
+
+    /// Every revision this probe can correctly speak, most-preferred
+    /// first. A reply outside this set is genuinely unsupported.
+    static let accepted: [String] = ["2025-11-25", "2025-06-18"]
+
+    /// Whether `reply` (the server's `initialize` `result.protocolVersion`)
+    /// is a revision this probe can speak.
+    static func isAccepted(_ reply: String?) -> Bool {
+        guard let reply, !reply.isEmpty else { return false }
+        return accepted.contains(reply)
+    }
+}
+
 /// Settings health checks intentionally never launch stdio servers. Remote
 /// Streamable HTTP endpoints are verified against the MCP lifecycle with tight
 /// request/response bounds; legacy SSE remains agent-session verified.
@@ -507,7 +535,6 @@ actor McpProbeService {
         case message(String)
     }
 
-    private static let protocolVersion = "2025-06-18"
     private static let maximumResponseBytes = 200_000
     private let session: URLSession
 
@@ -550,7 +577,7 @@ actor McpProbeService {
                     "id": 1,
                     "method": "initialize",
                     "params": [
-                        "protocolVersion": Self.protocolVersion,
+                        "protocolVersion": McpProtocolRevision.requested,
                         "capabilities": [:],
                         "clientInfo": [
                             "name": "kaisola",
@@ -570,7 +597,7 @@ actor McpProbeService {
                   let negotiated = result["protocolVersion"] as? String else {
                 throw ProbeFailure.message("Malformed initialize response")
             }
-            guard negotiated == Self.protocolVersion else {
+            guard McpProtocolRevision.isAccepted(negotiated) else {
                 throw ProbeFailure.message("Unsupported protocol version \(safeInline(negotiated))")
             }
             let info = result["serverInfo"] as? [String: Any]

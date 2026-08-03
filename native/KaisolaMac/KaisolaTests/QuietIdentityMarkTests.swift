@@ -2,6 +2,43 @@ import SwiftUI
 import XCTest
 @testable import Kaisola
 
+/// How much of the identity slot a drawn mark actually inks.
+///
+/// The rail's "both first-class agent marks weigh the same" rule used to live in
+/// a comment quoting numbers somebody measured once offline. It is cheap to
+/// measure in-process instead: rasterize the mark's own `Path` into the 16pt
+/// slot at 8× with CoreGraphics, fill it non-zero, and average the coverage.
+/// Deterministic — no display, no appearance, no SF Symbol.
+enum QuietIdentityMarkInk {
+    static func fraction(
+        slot: CGFloat = QuietIdentityMarkView.slot,
+        scale: CGFloat = 8,
+        of path: (CGRect) -> Path
+    ) -> Double {
+        let side = Int(slot * scale)
+        guard let context = CGContext(
+            data: nil,
+            width: side,
+            height: side,
+            bitsPerComponent: 8,
+            bytesPerRow: side,
+            space: CGColorSpaceCreateDeviceGray(),
+            bitmapInfo: CGImageAlphaInfo.none.rawValue
+        ) else { return .nan }
+        let rect = CGRect(x: 0, y: 0, width: CGFloat(side), height: CGFloat(side))
+        context.setFillColor(gray: 0, alpha: 1)
+        context.fill(rect)
+        context.setFillColor(gray: 1, alpha: 1)
+        context.addPath(path(rect).cgPath)
+        context.fillPath(using: .winding)
+        guard let data = context.data else { return .nan }
+        let pixels = data.assumingMemoryBound(to: UInt8.self)
+        var total = 0.0
+        for index in 0 ..< side * side { total += Double(pixels[index]) / 255 }
+        return total / Double(side * side)
+    }
+}
+
 /// The rail's three pure derivations: who a row belongs to (`QuietIdentity`),
 /// what a row is called when its title carries no information
 /// (`QuietRailTitle`), and where a compact-list drag lands in the persisted
@@ -11,7 +48,7 @@ final class QuietIdentityMarkTests: XCTestCase {
 
     // MARK: - Identity mapping
 
-    func testClaudeAgentsMapToTheStarburst() {
+    func testClaudeAgentsMapToTheCoralBurst() {
         XCTAssertEqual(QuietIdentity.identity(agentName: "Claude Code", processName: nil), .claude)
         XCTAssertEqual(QuietIdentity.identity(agentName: "claude", processName: "node"), .claude)
         XCTAssertEqual(QuietIdentity.identity(agentName: "CLAUDE", processName: nil), .claude)
@@ -129,104 +166,375 @@ final class QuietIdentityMarkTests: XCTestCase {
             "the letter mark drifted out of the row's optical size"
         )
 
-        // …and the DRAWN marks land on the same optical circle. The starburst
-        // spans 2 × outerRadius in the 24-unit viewbox.
-        let starburstDiameter = 2 * 9.6 * (slot / 24)
+        // …and the DRAWN marks land on the same optical circle as each other
+        // first, and near the glyphs second. Both are traced silhouettes placed
+        // by `span`, so this is one comparison rather than two constructions.
         XCTAssertEqual(
-            starburstDiameter,
+            QuietClaudeBurst.span,
+            QuietOpenAIKnot.span,
+            accuracy: 0.05,
+            "the two drawn marks stopped spanning the slot alike"
+        )
+        XCTAssertEqual(
+            QuietClaudeBurst.span * slot,
             QuietIdentityMarkView.symbolSize,
             accuracy: 2,
             "the coral mark no longer matches the glyph marks beside it"
         )
     }
 
-    /// "Monoline weight matched across marks": the coral rays, the knot's
-    /// outline and an SF Symbol at `.regular` all have to land within a few
-    /// tenths of a point of each other, or the rail reads as one bold mark and
-    /// four thin ones.
-    func testDrawnMarksShareOneMonolineStrokeWeight() {
-        let unit = QuietIdentityMarkView.slot / 24
-        let starburst = unit * QuietIdentityMarkView.starburstStroke
-        let knot = QuietOpenAIKnot.strokeWidth(unit: unit)
+    /// The two first-class agent marks have to weigh the same as each other and
+    /// sit a deliberate step above the generic ones — that is the naked-mark
+    /// grammar, and without a tile to hide behind it is the only thing keeping
+    /// the rail from reading as one bold mark beside four thin ones.
+    ///
+    /// Both are filled now, so no stroke width can express this; ink can.
+    /// Measured by rendering each mark into the 16pt slot at 8× and summing
+    /// alpha: `terminal` 0.208, `arrow.up.arrow.down` 0.162, the filled knot
+    /// 0.376 at full span and the traced coral burst 0.395 at full span — which
+    /// is why each is inset to its own `span`, where they land on 0.308 and
+    /// 0.311. The inks are *measured* here rather than restated, because both
+    /// spans are otherwise just two constants nothing checks.
+    func testTheTwoAgentMarksAreInkedAlikeAndBothAreInsetToGetThere() {
+        let burst = QuietIdentityMarkInk.fraction { QuietClaudeBurst.path(in: $0) }
+        let knot = QuietIdentityMarkInk.fraction { QuietOpenAIKnot.path(in: $0) }
 
-        // Monoline: a hairline, not a rule.
-        XCTAssertGreaterThan(starburst, 0.9)
-        XCTAssertLessThan(starburst, 1.8)
+        // Level with each other: that is the grammar, not a coincidence of two
+        // hand-picked spans.
         XCTAssertEqual(
-            starburst,
-            knot,
-            accuracy: 0.35,
-            "the starburst and the knot no longer read as the same pen"
+            burst, knot, accuracy: 0.015,
+            "the agent marks stopped weighing the same: burst \(burst), knot \(knot)"
         )
+
+        // …and a deliberate step above the generic `.secondary` glyphs, whose
+        // measured inks are 0.208 and 0.162, without becoming badges.
+        for ink in [burst, knot] {
+            XCTAssertGreaterThan(ink, 0.24, "an agent mark receded to a generic surface's weight")
+            XCTAssertLessThan(ink, 0.36, "an agent mark is inking like a filled tile")
+        }
+
+        // The pinned numbers, so a future edit that deforms the geometry but
+        // keeps the spans still fails.
+        XCTAssertEqual(burst, 0.311, accuracy: 0.012)
+        XCTAssertEqual(knot, 0.308, accuracy: 0.012)
+
+        // Each gives up a point or so of the slot. Less and it out-inks its
+        // neighbour; much more and it stops reading at rail size.
+        XCTAssertEqual(Double(QuietOpenAIKnot.span), 14.5 / 16, accuracy: 0.0001)
+        XCTAssertEqual(Double(QuietClaudeBurst.span), 14.2 / 16, accuracy: 0.0001)
+        for span in [QuietOpenAIKnot.span, QuietClaudeBurst.span] {
+            XCTAssertLessThan(span, 1)
+            XCTAssertGreaterThan(span, 0.85)
+        }
+    }
+
+    // MARK: - Claude burst geometry
+
+    /// The outline is the official mark's silhouette, traced — one closed
+    /// subpath of 129 straight segments — not twelve strokes on an even pitch.
+    /// The counts are asserted because the reader is what turns the trace into
+    /// geometry, and a reader that dropped commands would still draw a blob.
+    func testClaudeBurstOutlineIsTheTracedOfficialSilhouette() {
+        var moves = 0, lines = 0, curves = 0, closes = 0
+        for segment in QuietClaudeBurst.outline {
+            switch segment {
+            case .move: moves += 1
+            case .line: lines += 1
+            case .curve: curves += 1
+            case .close: closes += 1
+            }
+        }
+        XCTAssertEqual(moves, 1, "the burst is one closed contour — it has no counters")
+        XCTAssertEqual(closes, 1)
+        XCTAssertEqual(lines, 129)
+        XCTAssertEqual(curves, 0, "the mark's edges are straight; a cubic here is invented smoothness")
+
+        // The trace is normalized to the viewbox: every point inside it, and the
+        // tight bounds reaching both ends of it.
+        let points = QuietClaudeBurst.outline.compactMap { segment -> CGPoint? in
+            switch segment {
+            case let .move(point), let .line(point): point
+            default: nil
+            }
+        }
+        XCTAssertEqual(points.count, 130)
+        let xs = points.map(\.x), ys = points.map(\.y)
+        XCTAssertGreaterThan(xs.min() ?? -99, -0.5)
+        XCTAssertGreaterThan(ys.min() ?? -99, -0.5)
+        XCTAssertLessThan(xs.max() ?? 99, 24.5)
+        XCTAssertLessThan(ys.max() ?? 99, 24.5)
+        XCTAssertGreaterThan(xs.max() ?? 0, 23.5)
+        XCTAssertGreaterThan(ys.max() ?? 0, 23.5)
+
+        // Shape invariant that no rasterizer can drift: the enclosed area of the
+        // traced polygon, by the shoelace formula, in viewbox units. Signed, so
+        // a reversed winding is caught too.
+        var signed: CGFloat = 0
+        for index in points.indices {
+            let a = points[index], b = points[(index + 1) % points.count]
+            signed += a.x * b.y - a.y * b.x
+        }
+        XCTAssertEqual(Double(signed / 2), -227.38, accuracy: 0.5, "the traced outline changed shape")
+    }
+
+    /// The complaint this release is FOR: "we should fix the claude symbol to be
+    /// more precise." The old mark was twelve *uniform* strokes on an even 30°
+    /// pitch; the real one is twelve **tapered petals of unequal length** at
+    /// irregular angles around a solid hub. Those three properties are what the
+    /// eye reads as this logo rather than as a generic sparkle, so they are
+    /// measured off the shipped geometry rather than restated in a comment.
+    func testTheBurstHasTwelveUnequalPetalsAroundASolidHub() {
+        let points = QuietClaudeBurst.outline.compactMap { segment -> CGPoint? in
+            switch segment {
+            case let .move(point), let .line(point): point
+            default: nil
+            }
+        }
+        let centre = CGPoint(x: 12, y: 12)
+        func radius(_ point: CGPoint) -> CGFloat { hypot(point.x - centre.x, point.y - centre.y) }
+
+        // Petal tips: vertices that are local maxima of radius around the ring.
+        var tips: [CGPoint] = []
+        for index in points.indices {
+            let previous = points[(index + points.count - 1) % points.count]
+            let next = points[(index + 1) % points.count]
+            let here = radius(points[index])
+            if here > 8, here >= radius(previous), here >= radius(next) {
+                if let last = tips.last, radius(last) >= here, hypot(last.x - points[index].x, last.y - points[index].y) < 2 {
+                    continue
+                }
+                tips.append(points[index])
+            }
+        }
+        XCTAssertEqual(tips.count, 12, "the mark stopped having twelve petals")
+
+        // Unequal LENGTH. Even spokes would put every tip on one circle.
+        let radii = tips.map(radius).sorted()
+        XCTAssertGreaterThan(
+            (radii.last ?? 0) - (radii.first ?? 0), 1.0,
+            "every petal reaches the same radius — that is the spoke burst again"
+        )
+
+        // Unequal ANGLE. Even spokes would sit on an exact 30° pitch.
+        let angles = tips.map { atan2($0.y - centre.y, $0.x - centre.x) * 180 / .pi }.sorted()
+        let gaps = angles.indices.map { index -> Double in
+            let next = angles[(index + 1) % angles.count]
+            return Double((next - angles[index] + 360).truncatingRemainder(dividingBy: 360))
+        }
+        XCTAssertGreaterThan(
+            (gaps.max() ?? 0) - (gaps.min() ?? 0), 10,
+            "the petals are back on an even pitch"
+        )
+
+        // A SOLID hub, not a hole the strokes radiate from: the centre is inked,
+        // and stays inked well out from it.
+        //
+        // Asked of the CGPath with the winding rule rather than of
+        // `Path.contains`, and the difference is not pedantry: SwiftUI's
+        // containment test ray-casts horizontally and answers `false` for the
+        // interior point (12, 10) of this outline, because the ray leaves
+        // through the vertex that sits at exactly `19.66 10`. `.winding` is also
+        // the rule `QuietIdentityMarkView` fills the burst with, so this asserts
+        // the hub is solid in precisely the sense the view draws it.
+        let rect = CGRect(x: 0, y: 0, width: 240, height: 240)
+        let filled = QuietClaudeBurst.path(in: rect).cgPath
+        let unit = rect.width * QuietClaudeBurst.span / 24
+        for step in 0 ..< 24 {
+            let angle = CGFloat(step) * .pi / 12
+            for reach in [CGFloat(0), 1, 2] {
+                let probe = CGPoint(
+                    x: rect.midX + cos(angle) * reach * unit,
+                    y: rect.midY + sin(angle) * reach * unit
+                )
+                XCTAssertTrue(
+                    filled.contains(probe, using: .winding),
+                    "the hub is hollow \(reach) units out at \(angle) rad"
+                )
+            }
+        }
+    }
+
+    /// The negative control the petal test needs: the mark must NOT map onto
+    /// itself under a 30° turn. On this exact sampling grid the twelve even
+    /// spokes it replaced score **0.000** — they are perfectly 12-fold
+    /// symmetric — and this outline scores **0.274**. That pair of numbers is
+    /// the whole change in one measurement.
+    func testTheBurstIsNotTheEvenTwelveFoldSparkleItReplaced() {
+        let rect = CGRect(x: 0, y: 0, width: 96, height: 96)
+        let path = QuietClaudeBurst.path(in: rect).cgPath
+        let centre = CGPoint(x: rect.midX, y: rect.midY)
+
+        func disagreement(turnedBy degrees: Double) -> Double {
+            let angle = degrees * .pi / 180
+            var checked = 0.0, mismatched = 0.0
+            for x in stride(from: 3.0, to: 96, by: 1.5) {
+                for y in stride(from: 3.0, to: 96, by: 1.5) {
+                    let dx = x - centre.x, dy = y - centre.y
+                    guard hypot(dx, dy) < 44 else { continue }
+                    let here = CGPoint(x: x, y: y)
+                    let turned = CGPoint(
+                        x: centre.x + dx * cos(angle) - dy * sin(angle),
+                        y: centre.y + dx * sin(angle) + dy * cos(angle)
+                    )
+                    checked += 1
+                    if path.contains(here, using: .winding) != path.contains(turned, using: .winding) {
+                        mismatched += 1
+                    }
+                }
+            }
+            return checked == 0 ? 0 : mismatched / checked
+        }
+
+        XCTAssertGreaterThan(
+            disagreement(turnedBy: 30), 0.15,
+            "a mark this symmetric under 30° is the uniform sparkle, not Anthropic's asterisk"
+        )
+    }
+
+    /// Same contract the knot is held to: inside the 16pt slot, centred in it,
+    /// still filling it, and scaling.
+    func testClaudeBurstFitsItsSlotAndStaysCentred() {
+        let slot = QuietIdentityMarkView.slot
+        let rect = CGRect(x: 0, y: 0, width: slot, height: slot)
+        let bounds = QuietClaudeBurst.path(in: rect).boundingRect
+
+        XCTAssertEqual(bounds.midX, rect.midX, accuracy: 0.02, "the burst is off-centre horizontally")
+        XCTAssertEqual(bounds.midY, rect.midY, accuracy: 0.02, "the burst is off-centre vertically")
+        XCTAssertTrue(rect.contains(bounds), "the burst overflows its \(slot)pt slot: \(bounds)")
+
+        XCTAssertGreaterThan(bounds.width / slot, 0.85)
+        XCTAssertGreaterThan(bounds.height / slot, 0.85)
+        // Square to within the artwork's own tolerance: the reference's tight
+        // bounds are 1278 × 1279, and a uniform scale has to keep that.
+        XCTAssertEqual(bounds.width, bounds.height, accuracy: 0.05)
+
+        let doubled = QuietClaudeBurst.path(in: CGRect(x: 0, y: 0, width: 2 * slot, height: 2 * slot))
+            .boundingRect
+        XCTAssertEqual(doubled.width, bounds.width * 2, accuracy: 0.01)
     }
 
     // MARK: - OpenAI knot geometry
 
-    /// The mark is six copies of ONE strand at 60°, which is the logo's actual
-    /// construction. If that ever stops being true the mark stops being the
-    /// logo, so the symmetry is asserted rather than eyeballed.
-    func testKnotIsSixStrandsEvenlySpacedOnOneOrbit() {
-        let rect = CGRect(x: 0, y: 0, width: 16, height: 16)
-        let centers = QuietOpenAIKnot.strandCenters(in: rect)
-        XCTAssertEqual(centers.count, 6)
-
-        let middle = CGPoint(x: rect.midX, y: rect.midY)
-        let radii = centers.map { hypot($0.x - middle.x, $0.y - middle.y) }
-        let expected = QuietOpenAIKnot.orbit * QuietOpenAIKnot.unit(in: rect)
-        for radius in radii {
-            XCTAssertEqual(radius, expected, accuracy: 0.001, "a strand left the orbit")
+    /// The outline is the official mark's, transcribed — 8 subpaths, 36 cubics,
+    /// 32 lines — not a construction that hopes to resemble it. The counts are
+    /// asserted because the reader is what turns the transcription into
+    /// geometry, and a reader that silently dropped a command would still draw
+    /// *something* knot-shaped.
+    func testKnotOutlineIsTheTranscribedOfficialPath() {
+        let outline = QuietOpenAIKnot.outline
+        var moves = 0, lines = 0, curves = 0, closes = 0
+        for segment in outline {
+            switch segment {
+            case .move: moves += 1
+            case .line: lines += 1
+            case .curve: curves += 1
+            case .close: closes += 1
+            }
         }
+        XCTAssertEqual(moves, 8, "a subpath went missing — the knot loses a strand or a counter")
+        XCTAssertEqual(closes, 8, "every subpath of a filled outline has to close")
+        XCTAssertEqual(curves, 36)
+        XCTAssertEqual(lines, 32)
 
-        // Consecutive strands are exactly 60° apart.
-        let angles = centers.map { atan2($0.y - middle.y, $0.x - middle.x) }
-        for index in 1 ..< angles.count {
-            var delta = angles[index] - angles[index - 1]
-            if delta < 0 { delta += 2 * .pi }
-            XCTAssertEqual(delta, .pi / 3, accuracy: 0.001)
+        // The offline normalization centres the outline's *tight* bounds on
+        // 12,12 and scales its long side to 24, so every on-curve point sits in
+        // the viewbox and the control points stray only a fraction outside it.
+        let points = outline.flatMap { segment -> [CGPoint] in
+            switch segment {
+            case let .move(point), let .line(point): [point]
+            case let .curve(to, control1, control2): [to, control1, control2]
+            case .close: []
+            }
         }
+        XCTAssertGreaterThan(points.count, 100)
+        let coordinates = points.flatMap { [$0.x, $0.y] }
+        XCTAssertGreaterThan(coordinates.min() ?? -99, -0.5)
+        XCTAssertLessThan(coordinates.max() ?? 99, 24.5)
     }
 
-    /// The two numbers that carry the likeness. `lengthRatio` above ~1.16 is
-    /// what makes consecutive strands *cross* instead of merely meeting — that
-    /// overlap is the knot; without it the mark is a plain hexagonal ring. The
-    /// skew is what gives it chirality, and past roughly 20° the interior fills
-    /// in and the mark turns to mud at 16pt.
-    func testKnotStrandsOverlapAndLeanOffTangential() {
-        let neighbourGapRatio = 2 * tan(Double.pi / 6) // 1.1547
+    /// The four-command reader, exercised on its own. `Z` closes, `M`/`L` take
+    /// pairs, `C` takes triples, and a command whose numbers repeat emits one
+    /// segment per group.
+    func testOutlineReaderHandlesItsFourCommands() {
+        let segments = QuietVectorOutline.segments("M1 2 L3 4 5 6 C7 8 9 10 11 12 Z")
+        XCTAssertEqual(segments, [
+            .move(CGPoint(x: 1, y: 2)),
+            .line(CGPoint(x: 3, y: 4)),
+            .line(CGPoint(x: 5, y: 6)),
+            .curve(
+                to: CGPoint(x: 11, y: 12),
+                control1: CGPoint(x: 7, y: 8),
+                control2: CGPoint(x: 9, y: 10)
+            ),
+            .close,
+        ])
+        XCTAssertTrue(QuietVectorOutline.segments("").isEmpty)
+    }
+
+    /// The logo is a six-fold knot, and the transcription has to still be one.
+    /// Sampled rather than asserted on constants, because there are no
+    /// symmetry constants any more — the outline either maps onto itself under
+    /// a 60° turn or it is not the mark.
+    ///
+    /// The tolerance is real: the official outline is hand-tuned, so a 60° turn
+    /// disagrees on ~5.6% of the mark's own area (measured on a 1024² raster of
+    /// the reference). The 30° control is what gives this teeth — an ordinary
+    /// blob would pass a lax 60° check and fail nothing else.
+    func testKnotIsSixFoldSymmetric() {
+        let rect = CGRect(x: 0, y: 0, width: 96, height: 96)
+        let path = QuietOpenAIKnot.path(in: rect)
+        let centre = CGPoint(x: rect.midX, y: rect.midY)
+
+        func disagreement(turnedBy degrees: Double) -> Double {
+            let angle = degrees * .pi / 180
+            var checked = 0.0
+            var mismatched = 0.0
+            for step in stride(from: 3.0, to: 96, by: 1.5) {
+                for other in stride(from: 3.0, to: 96, by: 1.5) {
+                    let point = CGPoint(x: step, y: other)
+                    let dx = point.x - centre.x
+                    let dy = point.y - centre.y
+                    guard hypot(dx, dy) < 44 else { continue }
+                    let turned = CGPoint(
+                        x: centre.x + dx * cos(angle) - dy * sin(angle),
+                        y: centre.y + dx * sin(angle) + dy * cos(angle)
+                    )
+                    checked += 1
+                    if path.contains(point) != path.contains(turned) { mismatched += 1 }
+                }
+            }
+            return checked == 0 ? 1 : mismatched / checked
+        }
+
+        XCTAssertLessThan(disagreement(turnedBy: 60), 0.10, "the knot lost its six-fold symmetry")
         XCTAssertGreaterThan(
-            Double(QuietOpenAIKnot.lengthRatio),
-            neighbourGapRatio,
-            "strands no longer overlap — the mark is a hexagon, not a knot"
+            disagreement(turnedBy: 30),
+            0.30,
+            "a shape this symmetric under 30° is a disc, not a knot"
         )
-        XCTAssertGreaterThan(QuietOpenAIKnot.skew.degrees, 0, "a skew of 0 draws a symmetric ring")
-        XCTAssertLessThan(QuietOpenAIKnot.skew.degrees, 20, "past ~20° the knot fills in at 16pt")
-
-        // Elongated, not round: a stadium at aspect 1 is a circle.
-        XCTAssertGreaterThan(QuietOpenAIKnot.aspect, 2)
-        // Michael's spec: outline weight ≈ strand width × 0.35, give or take.
-        XCTAssertEqual(Double(QuietOpenAIKnot.strokeRatio), 0.45, accuracy: 0.15)
     }
 
-    /// Six-fold symmetry means the union's bounding box is centred on the slot,
-    /// and the whole mark has to stay inside its 16pt slot once the outline
-    /// weight is added — a mark that overflows its slot collides with the row's
-    /// title column.
+    /// The mark has to stay inside its 16pt slot — a mark that overflows
+    /// collides with the row's title column — and stay centred in it, and still
+    /// fill it. Filled now, so there is no stroke to inset for.
     func testKnotFitsItsSlotAndStaysCentred() {
         let slot = QuietIdentityMarkView.slot
         let rect = CGRect(x: 0, y: 0, width: slot, height: slot)
-        let unit = QuietOpenAIKnot.unit(in: rect)
         let bounds = QuietOpenAIKnot.path(in: rect).boundingRect
-            .insetBy(dx: -QuietOpenAIKnot.strokeWidth(unit: unit) / 2,
-                     dy: -QuietOpenAIKnot.strokeWidth(unit: unit) / 2)
 
         XCTAssertEqual(bounds.midX, rect.midX, accuracy: 0.01, "the knot is off-centre horizontally")
-        XCTAssertEqual(bounds.midY, rect.midY, accuracy: 0.01, "the knot is off-centre vertically")
+        XCTAssertEqual(bounds.midY, rect.midY, accuracy: 0.05, "the knot is off-centre vertically")
         XCTAssertTrue(rect.contains(bounds), "the knot overflows its \(slot)pt slot: \(bounds)")
 
         // …but it still fills the slot: a mark that shrank to nothing would
         // also pass the containment check above.
-        XCTAssertGreaterThan(bounds.width / slot, 0.75)
-        XCTAssertGreaterThan(bounds.height / slot, 0.75)
+        XCTAssertGreaterThan(bounds.width / slot, 0.85)
+        XCTAssertGreaterThan(bounds.height / slot, 0.85)
+
+        // And it scales: the same outline at 2× is the same mark twice the size.
+        let doubled = QuietOpenAIKnot.path(in: CGRect(x: 0, y: 0, width: 2 * slot, height: 2 * slot))
+            .boundingRect
+        XCTAssertEqual(doubled.width, bounds.width * 2, accuracy: 0.01)
     }
 
     func testUnrecognizedAgentsFallBackToTheirInitial() {
@@ -433,17 +741,107 @@ final class QuietIdentityMarkTests: XCTestCase {
         )
     }
 
-    // MARK: - Row emphasis (no wash)
+    /// "Make it easier to open new sessions" (Michael, round 2).
+    ///
+    /// Before this, every door to creation was either hidden or remembered: the
+    /// `+` appeared only under the pointer, the context menus need a
+    /// right-click on the right row, and ⌘T / the palette have to be known.
+    /// The active project's `+` is now simply *there*.
+    func testTheActiveProjectsNewSessionControlIsThereWithoutHovering() {
+        XCTAssertTrue(
+            QuietProjectHeaderControls.showsLaunchControl(isActive: true, hovering: false),
+            "the active project's + is hidden until the pointer finds it"
+        )
+        XCTAssertTrue(
+            QuietProjectHeaderControls.showsLaunchControl(isActive: true, hovering: true)
+        )
+    }
 
-    /// v1.1.7 deleted the rounded grey wash from surface rows entirely. The
-    /// only thing left that says "this is the session on screen" is the title's
-    /// own weight, so the two weights have to actually differ — a table where
-    /// selected and resting collapsed to the same value would render the rail
-    /// with no selection signal at all.
-    func testTheVisibleSessionIsSignalledByWeightAlone() {
+    /// …and the rail does not become a toolbar to do it. Exactly one project is
+    /// active, so exactly one `+` rests in the column; every other project's
+    /// stays behind the pointer.
+    func testOnlyTheActiveProjectRestsAControlInTheColumn() {
+        XCTAssertFalse(
+            QuietProjectHeaderControls.showsLaunchControl(isActive: false, hovering: false),
+            "an inactive project would draw a resting + too — one per row is a toolbar"
+        )
+        XCTAssertTrue(
+            QuietProjectHeaderControls.showsLaunchControl(isActive: false, hovering: true)
+        )
+        // The disclosure chevron is a hint on top of a row that is already the
+        // disclosure control, so it stays hover-only in both placements.
+        XCTAssertFalse(QuietProjectHeaderControls.showsDisclosureChevron(hovering: false))
+        XCTAssertTrue(QuietProjectHeaderControls.showsDisclosureChevron(hovering: true))
+    }
+
+    /// A control that is only there under the pointer can share its edge with a
+    /// drag handle; a permanent one cannot.
+    ///
+    /// The sidebar's resize corridor is an overlay on the trailing edge of the
+    /// List and reaches `projectSidebarDividerReach` inward. At the old 10pt
+    /// inset the corridor covered the last half-point of the `+` slot —
+    /// documented in `RootShellView` as a known overlap and tolerated while the
+    /// `+` was hover-only. Now that it is the app's main creation door, the slot
+    /// has to start clear of the corridor by construction.
+    func testTheRestingPlusDoesNotShareItsEdgeWithTheResizeCorridor() {
+        XCTAssertGreaterThan(
+            QuietRowBudget.headerPlusTrailingInset,
+            NativeWorkspaceChrome.projectSidebarDividerReach,
+            "the resize corridor overlaps the + the user is aiming at"
+        )
+    }
+
+    // MARK: - Row emphasis and selection
+
+    /// v1.1.9 gives the selected surface row a colour and a pill back, but the
+    /// weight step stays: it is the cue that survives a user who cannot
+    /// separate the accent from the surrounding grey, and it costs nothing.
+    func testTheVisibleSessionKeepsItsWeightStepOnTopOfTheColour() {
         XCTAssertNotEqual(QuietRowEmphasis.selectedWeight, QuietRowEmphasis.restingWeight)
         XCTAssertEqual(QuietRowEmphasis.weight(isSelected: true), .semibold)
         XCTAssertEqual(QuietRowEmphasis.weight(isSelected: false), .regular)
+    }
+
+    /// The active project is signalled by weight and by weight only — the
+    /// tinted glass capsule is gone. A table where the two collapsed would
+    /// leave the rail with no "which project am I in" signal at all.
+    func testTheActiveProjectIsSignalledByWeightAlone() {
+        XCTAssertNotEqual(QuietProjectEmphasis.activeWeight, QuietProjectEmphasis.restingWeight)
+        XCTAssertEqual(QuietProjectEmphasis.weight(isActive: true), .bold)
+        XCTAssertEqual(QuietProjectEmphasis.weight(isActive: false), .regular)
+        // Bolder than the selected *session*: a heading outranks a row, and the
+        // two signals have to stay legible in the same column.
+        XCTAssertNotEqual(QuietProjectEmphasis.activeWeight, QuietRowEmphasis.selectedWeight)
+    }
+
+    /// Exactly one row wears the pill, and which one is a rule rather than a
+    /// rendering accident. Both ways it can break are invisible in a screenshot
+    /// of the happy path.
+    func testExactlyOneSurfaceRowIsSelected() {
+        // Nothing on screen: no row is selected, and no row is invented.
+        XCTAssertNil(QuietRowSelection.selectedID(visibleIDs: [], focusedPaneID: nil))
+        XCTAssertNil(QuietRowSelection.selectedID(visibleIDs: [], focusedPaneID: "a"))
+
+        // The ordinary case: one visible surface, with or without focus.
+        XCTAssertEqual(QuietRowSelection.selectedID(visibleIDs: ["a"], focusedPaneID: nil), "a")
+        XCTAssertEqual(QuietRowSelection.selectedID(visibleIDs: ["a"], focusedPaneID: "a"), "a")
+
+        // A split shows two surfaces; the focused pane wins, so one pill.
+        XCTAssertEqual(
+            QuietRowSelection.selectedID(visibleIDs: ["a", "b"], focusedPaneID: "b"),
+            "b"
+        )
+
+        // Focus naming a surface that is not on screen (another window, or one
+        // just hidden) must fall back to a real row, never to no row.
+        XCTAssertEqual(
+            QuietRowSelection.selectedID(visibleIDs: ["a", "b"], focusedPaneID: "ghost"),
+            "a"
+        )
+        XCTAssertEqual(
+            QuietRowSelection.selectedID(visibleIDs: ["a", "b"], focusedPaneID: nil),
+            "a"
+        )
     }
 
     // MARK: - Footer budget
@@ -562,32 +960,35 @@ final class QuietIdentityMarkTests: XCTestCase {
         XCTAssertEqual(withChip - withBoth, 30 + FooterAccountBudget.gap, accuracy: 0.001)
     }
 
-    // MARK: - Active project glass
+    // MARK: - Selected row pill
 
-    /// The whole risk of a tinted row is drift toward candy. These are the
-    /// ceilings the mock approved; the relationships between them are what keep
-    /// it reading as glass.
-    func testActiveProjectGlassStaysRestrained() {
-        XCTAssertGreaterThan(QuietActiveGlass.topFillOpacity, QuietActiveGlass.bottomFillOpacity,
-                             "a flat fill is a coloured chip, not glass")
-        XCTAssertLessThan(QuietActiveGlass.topFillOpacity, 0.25, "the tint is a wash, not a fill")
-        XCTAssertGreaterThan(QuietActiveGlass.strokeOpacity, QuietActiveGlass.topFillOpacity,
-                             "the edge must read against the fill")
-        XCTAssertLessThan(QuietActiveGlass.strokeOpacity, 0.4, "that is an outline, not a hairline")
-
-        // The lit top edge: bright in light mode, barely there in dark, where
-        // white at light-mode strength reads as a seam.
-        XCTAssertGreaterThan(
-            QuietActiveGlass.highlightOpacity(dark: false),
-            QuietActiveGlass.highlightOpacity(dark: true)
+    /// The tinted glass capsule is deleted, not relocated: the pill under the
+    /// selected surface row is NEUTRAL, and the only colour in the row is the
+    /// label, in the user's own accent. A tinted pill under tinted text is the
+    /// coloured chip v1.1.7 was right to remove.
+    func testTheSelectionPillStaysANeutralWhisper() {
+        XCTAssertGreaterThan(QuietSelectionPill.lightFillOpacity, 0)
+        XCTAssertLessThan(
+            QuietSelectionPill.lightFillOpacity, 0.12,
+            "a pill this strong is a chip, and it will out-shout the label sitting on it"
         )
-        XCTAssertLessThan(QuietActiveGlass.highlightOpacity(dark: true), 0.2)
-        XCTAssertLessThan(QuietActiveGlass.highlightOpacity(dark: false), 0.5)
+        // Dark mode swallows the same recipe, so it gets more — but still less
+        // than a chip's worth.
+        XCTAssertGreaterThan(
+            QuietSelectionPill.fillOpacity(dark: true),
+            QuietSelectionPill.fillOpacity(dark: false)
+        )
+        XCTAssertLessThan(QuietSelectionPill.fillOpacity(dark: true), 0.16)
 
-        // It is a *top* highlight: it has to be gone before the row's bottom
-        // edge, or it is a second fill.
-        XCTAssertLessThanOrEqual(QuietActiveGlass.highlightFalloff, 0.6)
-        XCTAssertGreaterThan(QuietActiveGlass.highlightFalloff, 0)
+        // Same corner as every other rounded surface in the window, and inset
+        // from the column edge rather than reaching it.
+        XCTAssertEqual(QuietSelectionPill.cornerRadius, KaisolaVisualSystem.insetRadius)
+        XCTAssertGreaterThan(QuietSelectionPill.horizontalInset, 0)
+        XCTAssertLessThan(
+            QuietSelectionPill.horizontalInset,
+            QuietRowBudget.projectIndent,
+            "the pill must stay inside the row's own leading inset"
+        )
     }
 
     // MARK: - Project drag mapping

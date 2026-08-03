@@ -25,6 +25,92 @@ enum AcpTranscriptRow: Codable, Identifiable, Equatable, Sendable {
     }
 }
 
+/// Reconciles user messages the ADAPTER reports against the ones the transcript
+/// already holds, so a resumed session shows the user's own prompts exactly
+/// once.
+///
+/// Both shipping adapters replay a loaded session's whole history as
+/// `session/update` notifications, `user_message_chunk` included. Kaisola also
+/// restores that same history from its own durable store, so without
+/// reconciliation every restored prompt would appear twice. Two identities are
+/// used, in order:
+///
+///  1. **The row id the store already keys on.** A replayed message the store
+///     has never seen is appended under `acp:<adapterMessageId>`, so the NEXT
+///     load recognizes its own earlier replay by id. Both adapters' message ids
+///     come out of their persisted transcript, so they are stable across loads.
+///  2. **Text, consumed one-for-one.** Rows this client wrote itself carry local
+///     ids the adapter has never heard of, so the replay of a prompt Kaisola
+///     sent can only be recognized by its text. Matching is a multiset take, not
+///     a set membership test: sending "continue" three times leaves three rows
+///     and absorbs exactly three replayed copies.
+///
+/// Pure and value-typed so both rules can be tested without an adapter.
+struct AcpUserMessageLedger: Equatable, Sendable {
+    /// Row-id prefix for a user row that came from an adapter rather than from
+    /// this client. Kept inside the existing `.user(id:)` payload so the durable
+    /// row shape — and every test that pins it — is unchanged.
+    static let adapterIDPrefix = "acp:"
+
+    enum Decision: Equatable, Sendable {
+        /// The transcript already shows this message.
+        case drop
+        /// Append a new user row under this id.
+        case append(id: String)
+    }
+
+    private var adapterIDs: Set<String> = []
+    private var unmatchedTexts: [String: Int] = [:]
+    private var generatedCounter = 0
+
+    init(rows: [AcpTranscriptRow] = []) {
+        for row in rows {
+            guard case let .user(id, text, _) = row else { continue }
+            if id.hasPrefix(Self.adapterIDPrefix) {
+                adapterIDs.insert(id)
+            }
+            unmatchedTexts[text, default: 0] += 1
+        }
+    }
+
+    /// Record a user row this client just wrote, so the adapter's replay of it
+    /// is recognized. Claude echoes multi-block prompts (anything carrying an
+    /// attachment) back live, and a later load replays every prompt, so this
+    /// covers both.
+    mutating func recordLocal(text: String) {
+        unmatchedTexts[text, default: 0] += 1
+    }
+
+    mutating func reconcile(text: String, adapterMessageID: String?) -> Decision {
+        if let adapterMessageID {
+            let rowID = Self.adapterIDPrefix + adapterMessageID
+            if adapterIDs.contains(rowID) { return .drop }
+        }
+        if let remaining = unmatchedTexts[text], remaining > 0 {
+            if remaining == 1 {
+                unmatchedTexts.removeValue(forKey: text)
+            } else {
+                unmatchedTexts[text] = remaining - 1
+            }
+            return .drop
+        }
+        let rowID: String
+        if let adapterMessageID {
+            rowID = Self.adapterIDPrefix + adapterMessageID
+            adapterIDs.insert(rowID)
+        } else {
+            // An adapter that sends no message id (Codex's rollout-file
+            // fallback) still needs a collision-free row id.
+            generatedCounter += 1
+            rowID = "\(Self.adapterIDPrefix)anon-\(generatedCounter)"
+        }
+        // Deliberately NOT recorded as an unmatched text: a history that really
+        // does contain the same prompt twice must produce two rows, and rule 1
+        // already stops a later load from replaying this one again.
+        return .append(id: rowID)
+    }
+}
+
 /// Drives one ACP agent conversation and accumulates its streaming turn into a
 /// transcript the chat view renders. Owns the AcpClient; runs on the main actor
 /// so published transcript mutations are UI-safe.
@@ -59,6 +145,14 @@ final class AcpConversation: ObservableObject {
     @Published private(set) var currentModeID: String?
     @Published private(set) var configOptions: [AcpConfigOption] = []
     @Published private(set) var commands: [AcpCommand] = []
+    /// Whether this adapter advertised `_session/steering` at `initialize`.
+    /// Reset on every connect so a swapped agent can never inherit the previous
+    /// one's answer.
+    @Published private(set) var supportsSteering = false
+    /// Queued messages whose `_session/steering` request is still in flight.
+    /// The row stays queued (and un-removable) until the adapter answers, so a
+    /// rejected injection cannot lose it and a double tap cannot send it twice.
+    @Published private(set) var injectingQueuedIDs: Set<String> = []
     @Published var pendingPermission: AcpPermissionRequest?
     @Published private(set) var statusMessage: String?
     /// Follow-up messages typed while a turn was running; each dispatches when
@@ -152,6 +246,12 @@ final class AcpConversation: ObservableObject {
     /// `saveDraft` is a no-op.
     var draftStorageKey: String?
     private var client: AcpClient
+    /// Reconciles adapter-reported user messages against the rows already shown.
+    private var userMessageLedger: AcpUserMessageLedger
+    /// The adapter user message whose chunks are still arriving, and the row it
+    /// opened — `nil` when the message was recognized as one already shown, in
+    /// which case its remaining chunks stay suppressed too.
+    private var streamingUserMessage: (adapterID: String, rowID: String?)?
     private var reportedFileActivityKeys: Set<String> = []
     private var reportedFileActivityOrder: [String] = []
     private static let maximumReportedFileActivityKeys = 2_048
@@ -239,6 +339,7 @@ final class AcpConversation: ObservableObject {
         self.draftStorageKey = draftKey
         self.resumeSessionID = resumeSessionID
         self.rows = initialRows
+        self.userMessageLedger = AcpUserMessageLedger(rows: initialRows)
         self.loadedRowStartOrdinal = max(0, initialRowStartOrdinal)
         self.unloadedEarlierRowCount = max(0, initialEarlierRowCount)
         self.restoredDraft = initialDraft
@@ -292,6 +393,7 @@ final class AcpConversation: ObservableObject {
             modes = info.modes
             currentModeID = info.currentModeID
             configOptions = info.configOptions
+            supportsSteering = info.supportsSteering
             isConnected = true
             statusMessage = nil
             // Only entries still in `queued` are known never to have been
@@ -307,6 +409,7 @@ final class AcpConversation: ObservableObject {
             eventConsumerTask = nil
             statusMessage = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
             isConnected = false
+            supportsSteering = false
         }
     }
 
@@ -359,8 +462,12 @@ final class AcpConversation: ObservableObject {
         return true
     }
 
-    /// Drop a still-pending queued follow-up before it dispatches.
+    /// Drop a still-pending queued follow-up before it dispatches. A message
+    /// whose injection is in flight is left alone: the adapter may already have
+    /// taken it, and removing it here would hide a message that is about to
+    /// speak.
     func removeQueued(_ id: String) {
+        guard !injectingQueuedIDs.contains(id) else { return }
         queued.removeAll { $0.id == id }
     }
 
@@ -370,20 +477,66 @@ final class AcpConversation: ObservableObject {
         flushQueue()
     }
 
-    /// Steer: promote a queued follow-up to the front and interrupt the current
-    /// turn so it dispatches now (the cancel ends the turn, and the normal
-    /// turn-end flush sends the promoted message). Idle → dispatches directly.
-    func steerQueued(_ id: String) {
-        guard let index = queued.firstIndex(where: { $0.id == id }) else { return }
-        let message = queued.remove(at: index)
-        if isRunning {
-            queued.insert(message, at: 0)
-            pendingPermission = nil
-            permissionQueue.removeAll()
-            Task { await client.cancel() }
-        } else {
-            dispatch(message.text)
+    /// Whether a queued row may offer the inject action right now. Sending
+    /// mid-turn still queues — this is the per-message escape hatch, and it is
+    /// offered only when it can actually work.
+    var canInjectQueued: Bool {
+        AcpSteering.canInject(
+            supportsSteering: supportsSteering,
+            isConnected: isConnected,
+            isRunning: isRunning
+        )
+    }
+
+    /// Steer: inject ONE queued follow-up into the turn that is running, via
+    /// `_session/steering`. The message stays queued for the whole round trip
+    /// and leaves the queue only once the adapter says it took it, so a refusal
+    /// or a turn that ended first can never lose it.
+    func injectQueued(_ id: String) {
+        guard canInjectQueued,
+              !injectingQueuedIDs.contains(id),
+              let message = queued.first(where: { $0.id == id }) else { return }
+        injectingQueuedIDs.insert(id)
+        let steerClient = client
+        Task { [weak self] in
+            let outcome = await steerClient.steer(message.text)
+            self?.applySteerOutcome(outcome, for: message)
         }
+    }
+
+    private func applySteerOutcome(_ outcome: AcpSteerOutcome, for message: QueuedMessage) {
+        injectingQueuedIDs.remove(message.id)
+        switch AcpSteering.decide(outcome) {
+        case .delivered:
+            queued.removeAll { $0.id == message.id }
+            appendInjectedUserRow(message.text)
+        case let .deliveredAsNewTurn(notice):
+            queued.removeAll { $0.id == message.id }
+            appendInjectedUserRow(message.text)
+            statusMessage = notice
+            ToastCenter.shared.show(notice, style: .info)
+        case let .keptQueued(notice):
+            // Left exactly where it was. `turnEnded` still flushes the queue in
+            // the ordinary way, so a message the adapter would not inject is
+            // sent as its own turn rather than dropped.
+            statusMessage = notice
+            ToastCenter.shared.show(notice, style: .error)
+        }
+        // The turn may have ended while the request was in flight, with the
+        // ordinary flush held back for exactly this message.
+        flushQueue()
+    }
+
+    /// Show an injected message in the transcript at the point in the turn where
+    /// it landed. Neither adapter echoes an injected message back — Claude's
+    /// consumer drops the echo as an unrelated replay, and Codex never surfaces
+    /// live user items — so the row has to be written here. The ledger records
+    /// it so a LATER `session/load` replay of the same message is recognized
+    /// rather than shown a second time.
+    private func appendInjectedUserRow(_ text: String) {
+        turnCounter += 1
+        rows.append(.user(id: "\(turnCounter)", text: text, failed: false))
+        userMessageLedger.recordLocal(text: text)
     }
 
     /// Retry a failed optimistic send: the failed row is replaced by a fresh
@@ -562,6 +715,11 @@ final class AcpConversation: ObservableObject {
         let turn = turnCounter
         let displayText = Self.userText(trimmed, attachments: attachments)
         rows.append(.user(id: rowID, text: displayText, failed: false))
+        // Claude echoes any prompt carrying more than one content block (i.e.
+        // every attachment send) straight back as `user_message_chunk`, and a
+        // later `session/load` replays all of them. Record it so neither shows
+        // up as a second copy of what the user just typed.
+        userMessageLedger.recordLocal(text: displayText)
         isRunning = true
         let dispatchClient = client
         activePromptTurn = turn
@@ -748,6 +906,8 @@ final class AcpConversation: ObservableObject {
         await client.stop()
         isConnected = false
         isRunning = false
+        supportsSteering = false
+        injectingQueuedIDs.removeAll()
         statusMessage = queued.isEmpty
             ? "The agent is stopped."
             : "The agent is stopped. \(queued.count) queued follow-up\(queued.count == 1 ? " is" : "s are") ready to resume."
@@ -1047,6 +1207,8 @@ final class AcpConversation: ObservableObject {
         case let .exited(code):
             isConnected = false
             isRunning = false
+            supportsSteering = false
+            injectingQueuedIDs.removeAll()
             pendingPermission = nil
             permissionQueue.removeAll()
             // Preserve queued user text for inspection/copying. The adapter is
@@ -1060,8 +1222,14 @@ final class AcpConversation: ObservableObject {
     }
 
     /// Dispatch the next queued follow-up after a turn ends.
+    ///
+    /// Held while any injection is still in flight. Otherwise a turn that ends
+    /// inside a `_session/steering` round trip would dispatch the very message
+    /// the adapter is about to inject, and the user would say it twice.
+    /// `applySteerOutcome` flushes again once the answer is in, so a refused
+    /// injection is sent as its own turn immediately afterwards.
     private func flushQueue() {
-        guard !isRunning, isConnected, !queued.isEmpty else { return }
+        guard !isRunning, isConnected, injectingQueuedIDs.isEmpty, !queued.isEmpty else { return }
         let next = queued.removeFirst()
         dispatch(next.text)
     }
@@ -1074,6 +1242,8 @@ final class AcpConversation: ObservableObject {
             appendChunk(text, isThought: false)
         case let .thought(_, text):
             appendChunk(text, isThought: true)
+        case let .userMessage(adapterID, text):
+            appendUserChunk(adapterID: adapterID, text: text)
         case let .toolCall(call):
             rows.append(.tool(call))
             publishFileActivity(for: call)
@@ -1109,6 +1279,34 @@ final class AcpConversation: ObservableObject {
             reportedFileActivityKeys.remove(key)
         }
         reportedFileActivityOrder.removeFirst(overflow)
+    }
+
+    /// Fold one adapter-reported `user_message_chunk` into the transcript.
+    ///
+    /// A prompt made of several content blocks replays as several chunks that
+    /// share one `messageId` — Claude turns a file attachment into a link block
+    /// plus a trailing `<context>` block, so the file's whole text arrives as
+    /// extra chunks of the same message. The message is therefore decided ONCE,
+    /// on its first chunk (whose text is exactly the text this client shows for
+    /// its own sends), and every later chunk of that message follows that
+    /// decision: extending the row it opened, or staying suppressed with it.
+    /// Reconciling each chunk separately would leak a context dump into the
+    /// transcript as its own user row.
+    private func appendUserChunk(adapterID: String?, text: String) {
+        if let adapterID, streamingUserMessage?.adapterID == adapterID {
+            guard let rowID = streamingUserMessage?.rowID,
+                  let index = rows.lastIndex(where: { $0.id == "user-\(rowID)" }),
+                  case let .user(id, existing, _) = rows[index] else { return }
+            rows[index] = .user(id: id, text: existing + text, failed: false)
+            return
+        }
+        switch userMessageLedger.reconcile(text: text, adapterMessageID: adapterID) {
+        case .drop:
+            streamingUserMessage = adapterID.map { ($0, nil) }
+        case let .append(id):
+            rows.append(.user(id: id, text: text, failed: false))
+            streamingUserMessage = adapterID.map { ($0, id) }
+        }
     }
 
     private func appendChunk(_ text: String, isThought: Bool) {

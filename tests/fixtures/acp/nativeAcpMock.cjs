@@ -1,9 +1,15 @@
 #!/usr/bin/env node
 'use strict'
 
+const fs = require('node:fs')
 const readline = require('node:readline')
 
 const PROTOCOL_VERSION = 1
+// Optional on-disk thread store. Sessions live in memory by default, so a
+// relaunched host that offers a prior session id gets an empty thread. Point
+// this at a file and the fixture's history outlives the process, which is what
+// makes a real `session/load` replay reproducible across an app restart.
+const HISTORY_FILE = process.env.KAISOLA_MOCK_HISTORY_FILE || ''
 const MOCK_TERMINAL_ENABLED = process.env.KAISOLA_MOCK_TERMINAL === '1'
 const AUTH_METHODS = [
   {
@@ -126,15 +132,121 @@ function sessionResult(session) {
   }
 }
 
+function readStoredHistory(sessionId) {
+  if (!HISTORY_FILE) return null
+  try {
+    const stored = JSON.parse(fs.readFileSync(HISTORY_FILE, 'utf8'))
+    const entries = stored && stored[sessionId]
+    return Array.isArray(entries) ? entries : null
+  } catch {
+    return null
+  }
+}
+
+function writeStoredHistory(session) {
+  if (!HISTORY_FILE) return
+  let stored = {}
+  try {
+    stored = JSON.parse(fs.readFileSync(HISTORY_FILE, 'utf8')) || {}
+  } catch {
+    stored = {}
+  }
+  stored[session.sessionId] = session.history
+  try {
+    fs.writeFileSync(HISTORY_FILE, JSON.stringify(stored), { mode: 0o600 })
+  } catch {
+    // A fixture that cannot persist still serves every in-memory test.
+  }
+}
+
+function recordHistory(session, text) {
+  session.history.push({ messageId: `mock-msg-${session.nextMessageNumber++}`, text })
+  writeStoredHistory(session)
+}
+
 function createSession(sessionId = `native-mock-session-${nextSessionNumber++}`) {
+  // Prompts this session has seen, replayed on `session/load` exactly as the
+  // real adapters replay a loaded thread's history.
+  const history = readStoredHistory(sessionId) || []
   const session = {
     sessionId,
     modelId: AVAILABLE_MODELS[0].modelId,
     modeId: AVAILABLE_MODES[0].id,
     reasoningEffort: 'high',
+    history,
+    nextMessageNumber: history.length + 1,
   }
   sessions.set(sessionId, session)
   return session
+}
+
+/// Replay a loaded session's history. Mirrors
+/// `@agentclientprotocol/claude-agent-acp`'s `replaySessionHistory` and
+/// `codex-acp`'s `streamThreadHistory`: the whole thread streams back as
+/// `session/update` notifications — user prompts included, each stamped with the
+/// stable message id the thread persisted — before the load response is sent.
+function replaySessionHistory(session) {
+  for (const entry of session.history) {
+    notify('session/update', {
+      sessionId: session.sessionId,
+      update: {
+        sessionUpdate: 'user_message_chunk',
+        messageId: entry.messageId,
+        content: { type: 'text', text: entry.text },
+      },
+    })
+    notify('session/update', {
+      sessionId: session.sessionId,
+      update: {
+        sessionUpdate: 'agent_message_chunk',
+        messageId: `${entry.messageId}-reply`,
+        content: { type: 'text', text: `Replayed reply to ${entry.text}.` },
+      },
+    })
+  }
+}
+
+/// The `_session/steering` extension. Outcomes match the two shipping adapters:
+/// `injected` when a turn is running, `promptRequired` when none is and the
+/// client opted into the host-owned idle fallback, `startedNewTurn` otherwise.
+/// Nothing is echoed back for an injected message — neither real adapter does —
+/// so the client is responsible for showing it.
+function handleSteering(id, params) {
+  const session = sessions.get(params && params.sessionId)
+  if (!session) {
+    respondError(id, -32603, 'Session not found')
+    return
+  }
+  const blocks = Array.isArray(params.prompt) ? params.prompt : []
+  if (blocks.length === 0) {
+    respondError(id, -32602, 'steer params require a non-empty prompt array')
+    return
+  }
+  if (process.env.KAISOLA_MOCK_STEERING === 'reject') {
+    respondError(id, -32603, 'Steering refused by the fixture')
+    return
+  }
+  const turns = activeTurns.get(session.sessionId)
+  const running = turns && [...turns].some((turn) => turnIsActive(turn))
+  if (!running) {
+    const idleBehavior = params._meta
+      && params._meta.steering
+      && params._meta.steering.idleBehavior
+    if (idleBehavior === 'promptRequired') {
+      respond(id, { outcome: 'promptRequired', reason: 'noRunningTurn' })
+      return
+    }
+    respond(id, { outcome: 'startedNewTurn' })
+    return
+  }
+  const text = promptText(blocks)
+  recordHistory(session, text)
+  const turn = [...turns].find((candidate) => turnIsActive(candidate))
+  sessionUpdate(turn, {
+    sessionUpdate: 'agent_message_chunk',
+    content: { type: 'text', text: ` Steered: ${text}.` },
+  })
+  respond(id, { outcome: 'injected' })
 }
 
 function addTurn(turn) {
@@ -330,6 +442,7 @@ async function handlePrompt(requestId, params) {
   }
 
   const text = promptText(params.prompt)
+  recordHistory(session, text)
   const turnNumber = nextTurnNumber++
   const turn = {
     requestId,
@@ -459,11 +572,20 @@ function handleInitialize(id) {
     authMethods: AUTH_METHODS,
     agentCapabilities: {
       loadSession: true,
-      sessionCapabilities: { resume: true, close: true },
+      // Shaped exactly as the shipping adapters shape it: each session
+      // capability is an OBJECT, not a boolean. The distinction is load-bearing
+      // — a host reading `resume` as a boolean sees "unsupported" and restores
+      // through `session/load` instead, which is the path that replays history.
+      // A fixture that said `resume: true` would quietly exercise a route no
+      // real adapter offers.
+      sessionCapabilities: { resume: {}, close: {} },
       promptCapabilities: { image: false },
       mcpCapabilities: { http: true },
       _meta: { claudeCode: { promptQueueing: true } },
     },
+    // Top-level `_meta`, a sibling of `agentCapabilities` — where both shipping
+    // adapters advertise the steering extension.
+    _meta: { steering: { supported: process.env.KAISOLA_MOCK_STEERING !== 'off' } },
   })
 }
 
@@ -528,7 +650,12 @@ function dispatch(message) {
     respond(id, sessionResult(createSession()))
   } else if (method === 'session/load' || method === 'session/resume') {
     const session = sessions.get(params.sessionId) || createSession(params.sessionId)
+    // Only `load` replays. `resume` restores the thread without re-streaming it,
+    // matching both shipping adapters.
+    if (method === 'session/load') replaySessionHistory(session)
     respond(id, sessionResult(session))
+  } else if (method === '_session/steering') {
+    handleSteering(id, params)
   } else if (method === 'session/close') {
     cancelSession(params.sessionId)
     sessions.delete(params.sessionId)

@@ -74,6 +74,16 @@ struct ProjectAccountsSection: View {
                                 .truncationMode(.middle)
                         }
                         Spacer()
+                        // Sign-in belongs beside the account it signs in, not
+                        // one tab away under Usage. Adding a subscription and
+                        // logging into it are one intention; splitting them
+                        // across two screens is why five logins could go into
+                        // one directory without a single new card appearing.
+                        Button("Sign In") { signIn(to: profile) }
+                            .buttonStyle(.bordered)
+                            .controlSize(.small)
+                            .help("Run \(profile.provider == .claude ? "claude setup-token" : "codex login") scoped to \(profile.directory)")
+                            .accessibilityLabel("Sign in to \(profile.label)")
                         Button(role: .destructive) { pendingRemoval = profile } label: {
                             Image(systemName: "xmark")
                                 .font(.caption.weight(.semibold))
@@ -227,6 +237,30 @@ struct ProjectAccountsSection: View {
         accountError = nil
         loadUsageProfiles()
         NotificationCenter.default.post(name: .kaisolaUsageAccountsChanged, object: nil)
+    }
+
+    /// Sign in *as this account*, by scoping the provider's own login command
+    /// to that account's config directory.
+    ///
+    /// This is the whole mechanism that keeps subscriptions apart, and the
+    /// reason a login has to start here rather than in a bare terminal: run
+    /// `claude setup-token` with no scope and the credential lands in the
+    /// default `~/.claude`, replacing whoever was signed in before and taking
+    /// every project with it. Five logins done that way are not five accounts
+    /// — they are one account, overwritten four times, which is exactly what
+    /// Michael saw. Kaisola never handles the credential itself; the CLI
+    /// writes it into the directory this points at.
+    private func signIn(to profile: UsageAccountProfile) {
+        let login = profile.provider == .claude ? "claude setup-token" : "codex login"
+        let quoted = "'" + profile.expandedDirectory.replacingOccurrences(of: "'", with: "'\\''") + "'"
+        NotificationCenter.default.post(
+            name: .kaisolaRunInTerminal,
+            object: nil,
+            userInfo: [
+                SignInCardView.commandUserInfoKey:
+                    "\(profile.provider.environmentKey)=\(quoted) \(login)"
+            ]
+        )
     }
 
     private func removeProfile(_ profile: UsageAccountProfile) {

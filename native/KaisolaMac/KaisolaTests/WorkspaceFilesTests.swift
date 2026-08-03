@@ -835,6 +835,9 @@ final class WorkspaceFilesTests: XCTestCase {
         let probe = ProjectFileIndexProbe()
         let index = ProjectFileIndex(enumerateFiles: probe.enumerate)
 
+        // The first walk is held open, so the waiter below cannot finish early
+        // and the "has it joined yet" wait has no deadline to lose to.
+        probe.holdFirstWalk()
         let owner = Task { await index.files(for: root) }
         for _ in 0..<200 where probe.startedCount == 0 {
             try? await Task.sleep(for: .milliseconds(1))
@@ -842,8 +845,9 @@ final class WorkspaceFilesTests: XCTestCase {
         XCTAssertEqual(probe.startedCount, 1)
 
         let preInvalidationWaiter = Task { await index.files(for: root) }
-        for _ in 0..<5 { await Task.yield() }
+        for _ in 0..<50 { await Task.yield() }
         index.invalidate()
+        probe.releaseFirstWalk()
 
         let ownerFiles = await owner.value
         let waiterFiles = await preInvalidationWaiter.value
@@ -3326,17 +3330,41 @@ private final class ProjectFileIndexProbe: @unchecked Sendable {
         lock.withLock { maximumActiveWalks }
     }
 
+    /// Holds the first walk open until the test releases it.
+    ///
+    /// Without this the first walk simply slept 80 ms and every test racing it
+    /// had to join inside that window. On a loaded CI runner the walk finished
+    /// first, so a waiter got the cached result, `invalidate()` found nothing
+    /// in flight, and no replacement walk ever ran — the test then read
+    /// `["walk-1"]` and a start count of 1. A gate removes the deadline
+    /// entirely rather than widening it and hoping.
+    private let gate = DispatchSemaphore(value: 0)
+    private var gated = false
+
+    /// Make the first walk block until `releaseFirstWalk()` is called.
+    func holdFirstWalk() {
+        lock.withLock { gated = true }
+    }
+
+    func releaseFirstWalk() {
+        gate.signal()
+    }
+
     func enumerate(_ root: URL) -> [String] {
-        let sequence = lock.withLock { () -> Int in
+        let (sequence, isGated) = lock.withLock { () -> (Int, Bool) in
             starts += 1
             activeWalks += 1
             maximumActiveWalks = max(maximumActiveWalks, activeWalks)
-            return starts
+            return (starts, gated)
         }
         // Deliberately ignore task cancellation long enough to expose an
         // overlapping replacement if ProjectFileIndex starts one eagerly.
         if sequence == 1 {
-            Thread.sleep(forTimeInterval: 0.08)
+            if isGated {
+                gate.wait()
+            } else {
+                Thread.sleep(forTimeInterval: 0.08)
+            }
         }
         lock.withLock {
             activeWalks -= 1

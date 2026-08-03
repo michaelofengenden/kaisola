@@ -1,6 +1,6 @@
 # Changelog
 
-## 1.3.1 — 2026-08-03
+## 1.3.2 — 2026-08-03
 
 - Sign in to Claude and Codex accounts inside Settings, instead of a terminal opening in whatever project was in front.
 - Each subscription keeps its own credentials, so several accounts can be signed in at once and Usage shows them side by side.

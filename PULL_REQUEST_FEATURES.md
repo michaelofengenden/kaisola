@@ -1,169 +1,18 @@
-# Native Kaisola: large feature and implementation PRs
+# Native Kaisola: remaining feature and implementation PRs
 
-This is the working order for substantial product and architecture pull
-requests. Each slice must remain independently reviewable, preserve detached
-broker sessions, and use the fast local lane during implementation. Full
-distribution, visual, resource, and interaction gates belong at milestones
-rather than every edit.
+This tracker contains only unfinished product and architecture work after
+v1.1.9. Completed PRs and their shipped behavior are recorded in
+[`CHANGELOG.md`](CHANGELOG.md). Bounded regressions and reliability work live in
+[`PULL_REQUEST_FIXES.md`](PULL_REQUEST_FIXES.md).
 
-Bounded regressions, reliability work, and release-speed improvements live in
-[PULL_REQUEST_FIXES.md](PULL_REQUEST_FIXES.md).
-
-## PR 1 — Rich editor and workspace spine
-
-Build the strongest remaining daily-use surface without recreating an Electron
-application inside the native app.
-
-The v1.1.8 editor slice adds a pinned, offline CodeMirror 6 bundle behind a
-private `kaisola-editor` scheme. The page receives an opaque document token and
-validated text transactions only; it has no workspace path, file URL, cookie
-store, navigation escape, credential, or permitted network path. Swift remains the
-authority for exact source, line endings, dirty state, save/revert, recovery,
-path confinement, permissions, and undo/redo. The same fixture edits a CRLF
-Swift file through the bridge, undoes it, redoes it, and verifies syntax in
-light and dark mode. Bounded multi-language outlines navigate exact source
-lines; exact FSEvents batches patch only affected tree/index subtrees. An
-explicit Files-rail control follows structured ACP locations from only the
-selected Chat or Mesh, and the in-project move sheet performs collision-safe,
-symlink-confined cross-directory moves with exact undo/redo.
-
-Completed scope:
-
-- Add a confined CodeMirror 6 `WKWebView` editor surface.
-- Keep file reads/writes, path confinement, dirty state, save/revert, undo
-  ownership, and permissions in Swift.
-- Add transient preview tabs, persistent edited tabs, and safe same-directory
-  rename, Trash/restore, and reveal actions.
-- Add bounded outline navigation with repeatable exact-line selection.
-- Add explicit follow-the-agent navigation from structured ACP locations and
-  diff artifacts without inferring paths from transcript prose.
-- Add safe cross-directory moves with bounded in-project destination search,
-  tab/path reconciliation, and exact undo/redo.
-- Patch repository indexes and loaded tree directories from bounded exact
-  watcher batches, with full-refresh fallback for dropped/root events.
-
-Implementation status: complete.
-
-Acceptance:
-
-- Opening, editing, saving, reverting, and reopening preserve exact source.
-- File citations route to the requested file and line.
-- A web editor cannot access arbitrary files, navigation, credentials, or the
-  network outside its explicit message bridge.
-- Focused workspace/editor tests pass, with native light/dark interaction QA.
-
-## PR 2 — Unified command and keymap architecture
-
-The v1.1.8 implementation provides one typed command registry for the menu bar,
-command palette, project launch menus, toolbar actions, Settings controls, and
-validated user keymaps. Menu shortcuts, palette hints, availability reasons,
-and execution now come from that registry; the old per-command app-delegate
-selectors and duplicated palette actions are gone.
-
-Completed scope:
-
-- Define command identifiers, availability, discoverability, default shortcuts,
-  and typed execution context.
-- Move duplicated actions out of `KaisolaMacAppDelegate`, `RootShellView`, and
-  feature-specific menus.
-- Add validated `keymap.json` overrides with conflict reporting and reset.
-
-Acceptance:
-
-- A command has one implementation regardless of invocation surface.
-- Disabled commands explain why they are unavailable.
-- Invalid or conflicting keymaps fail safely without breaking default menus.
-
-## PR 3 — Page-oriented transcript persistence
-
-Keep the current anchored auto-pagination behavior while replacing monolithic
-JSON transcript persistence with a store designed for long-lived sessions.
-
-The v1.1.8 implementation migrates the untouched v1 JSON archive into a
-mode-0600 SQLite database in one immediate transaction. Chat and Mesh restore
-only the newest 120 rows, read earlier history in bounded 200-row pages, and
-write the loaded ordinal range without deleting older pages that remain on
-disk. Compact per-chat metadata keeps usage and cost rollups, drafts, staged
-attachments, and provider continuation identity together.
-
-Completed scope:
-
-- Add an actor-backed SQLite/page API with bounded reads and atomic migration.
-- Persist stable row order, usage rollups, drafts, attachments, and session
-  identity without loading every row at launch.
-- Preserve viewport anchors when earlier pages are inserted.
-
-Implementation status: complete.
-
-Acceptance:
-
-- Repeated top-edge loading reaches the first retained message.
-- Relaunch and migration preserve ordering, drafts, costs, and tool cards.
-- Streaming and history insertion never override deliberate user scrolling.
-
-## PR 4 — Quiescent rolling broker updates
-
-Make the broker shipped by an app update current for all new work immediately,
-without terminating PTYs that are still owned by an older broker process.
-
-The immutable generation digest, parity reporting, authenticated empty-broker
-shutdown, automatic empty-broker replacement, and active-PTY preservation guard
-shipped in v1.0.0 and are recorded in [`CHANGELOG.md`](CHANGELOG.md). The
-generation-aware routing and drain-retirement slice below completes that
-continuity contract.
-
-Scope:
-
-- Stage verified packages in a private, versioned Application Support location
-  so an installed-app replacement cannot remove files needed by a draining
-  broker.
-- Replace the single broker rendezvous with an atomic private registry that
-  identifies one current generation and zero or more draining generations,
-  each with its own socket and metadata.
-- Add a broker-authoritative quiescence handshake. A cutover is eligible only
-  after every CLI agent reports `busy:false` for a stability window, there are
-  no in-flight create/write/control operations, and the broker rechecks the
-  same activity epoch atomically when committing the cutover.
-- Treat quiet output as a signal, not proof that a session is disposable. An
-  idle Claude, Codex, Gemini, or OpenCode process still owns a live PTY and must
-  never be killed merely because its turn settled.
-- When the old broker owns live PTYs, launch the verified bundled generation
-  alongside it and route every new terminal to the new generation while
-  existing terminals remain connected to the generation that owns them.
-- Abort and retry the cutover if an agent becomes busy, a user sends terminal
-  input, a Companion control lease changes, or broker identity changes during
-  the quiescence window.
-- Stop and garbage-collect a draining generation only after its terminal
-  inventory is empty, its clients have detached, and its identity is rechecked.
-- Surface app, current-broker, and draining-broker versions in diagnostics and
-  make rollback select an already verified generation rather than mutating a
-  running process.
-
-Implementation status: complete. Verified package staging, the private
-registry/CAS contract, generation-specific sockets, broker-authoritative
-quiescence, multi-generation routing, rollback selection, and empty-drain
-retirement are enabled.
-
-The 2026-08-01 installed same-path replacement gate kept predecessor broker PID
-57356 and PTY PID 57395 alive while the replacement generation became current
-and owned a newly created terminal. Releasing that old terminal advanced the
-registry from its two-generation cutover to a one-generation topology and
-retired only the now-empty predecessor.
-
-Acceptance:
-
-- Immediately after an update, the current generation matches the installed
-  app's sealed broker manifest and owns every newly created terminal.
-- Terminals created before the update retain their broker and PTY process IDs
-  until the user ends them naturally.
-- Synthetic quiet output, a late activity event, queued terminal input, and a
-  Companion lease race all cancel the attempted cutover without losing data.
-- Empty old generations retire automatically; live generations are never
-  killed merely because a newer app launched.
-- Crash, power-loss, tampered-registry, downgrade, and incompatible-protocol
-  tests fail closed without orphaning or adopting an ambiguous terminal.
+Each slice must remain independently reviewable, preserve detached broker
+sessions, and use the fast local lane during implementation. Full distribution,
+visual, resource, and interaction gates belong at milestones rather than every
+edit.
 
 ## PR 5 — Native Companion production hardening
+
+Status: open.
 
 Close the remaining cutover evidence for the Swift desktop Companion host.
 
@@ -182,6 +31,8 @@ Acceptance:
 
 ## PR 6 — Extensions and customization
 
+Status: open.
+
 Add safe registries for language grammars, previews, MCP packages, custom
 agents, and editor themes after the command/editor boundaries are stable.
 
@@ -194,11 +45,15 @@ Acceptance:
 
 ## PR 7 — Project and session ergonomics
 
+Status: open.
+
 Add project detach/adopt, ad-hoc cross-project session groups, richer task
 ledger views, and workflow automation only after the daily editor and Companion
 paths are dependable.
 
 ## PR 8 — Pixel-smooth terminal viewport parity
+
+Status: open.
 
 The v1.0.0 build 1002002 fix removes repaint snap-back, preserves native
 momentum routing, and adds an always-visible AppKit scrollbar. The remaining
@@ -209,10 +64,11 @@ Scope:
 - Add a narrow SwiftTerm viewport API or maintained patch that exposes a
   continuous macOS scroll origin without duplicating terminal protocol parsing.
 - Back normal-buffer history with native `NSScrollView` momentum, rubber-band,
-  scrollbar, keyboard, and accessibility behavior while leaving alternate-screen
-  mouse reporting and application-owned scrolling untouched.
-- Preserve terminal selection, links, semantic prompt navigation, paged history,
-  live-bottom following, retained surfaces, and broker cursor continuity.
+  scrollbar, keyboard, and accessibility behavior while leaving
+  alternate-screen mouse reporting and application-owned scrolling untouched.
+- Preserve terminal selection, links, semantic prompt navigation, paged
+  history, live-bottom following, retained surfaces, and broker cursor
+  continuity.
 
 Acceptance:
 
@@ -223,201 +79,37 @@ Acceptance:
 - Light/dark visual fixtures, VoiceOver, 120 Hz cadence, and deep-history memory
   gates pass on the installed optimized app.
 
-## PR 9 — Review and control workbench
+## PR 11 — Native preview installed-build performance gates
 
-The project-level Git inspector now follows workspace and `.git` changes,
-supports per-file and all-file stage/unstage, and permits only clean-tree,
-upstream-backed fast-forward pulls. Pull-request review now captures a
-credential-redacted remote, repository, and base branch; execution rechecks and
-uses that exact destination. Chat and Mesh permission asks now disclose the
-adapter's raw input, every declared path, and the literal local-rule scope before
-offering separate Deny, Allow Once, and Create Rule actions. Cached block
-rendering is shared by Chat and Mesh, keeps streaming parse work off the main
-actor, and presents Markdown, code, tables, file citations, and bounded
-artifacts as reviewable native controls.
+Status: implementation shipped; installed-build acceptance remains open.
 
-Completed scope:
+TextKit 2 read mode, off-main structured-data preparation, PDFKit, bounded
+Markdown images, truthful external-edit handling, safe navigation, and explicit
+truncation all shipped in v1.1.9. The remaining work is performance evidence on
+the installed optimized app.
 
-- Promote Git from a terminal-attached sheet into a project-level live
-  inspector driven by workspace and `.git` changes, with stage/unstage-all and
-  clean-tree, non-interactive fast-forward pull controls.
-- Replace the opaque “Push & Create PR” action with a two-step composer that
-  previews base, head, commits, files, title, body, remote, repository, and
-  destination before any push or pull-request creation.
-- Expand permission cards into a bounded, selectable inspector for raw ACP
-  input, every declared affected path, and the exact workspace/action/resource
-  tuple Kaisola will persist. Keep adapter-owned opaque persistence out of the
-  safe controls, and preserve Deny, Allow Once, and Create Rule as distinct
-  decisions in both Chat and Mesh.
-- Build one cached block-transcript renderer for Chat and Mesh with fenced,
-  syntax-highlighted code, copy controls, tables, clickable file-and-line
-  references, and expandable tool artifacts. Keep streaming updates bounded so
-  a growing answer does not reparse the whole transcript on every token. Long
-  responses, tool output, and diffs disclose their bounded prefix and provide
-  explicit Show More, Collapse, and copy paths.
+Acceptance remaining:
 
-Acceptance:
+- Keep installed-build performance gates for 1 MiB text, large CSV/JSON data,
+  bounded PDFs, and image-heavy Markdown.
+- Confirm those surfaces retain native momentum without main-thread parse or
+  decode spikes.
 
-- Reviewing agent output never requires interpreting raw Markdown or trusting
-  hidden permission scope.
-- Large streaming answers and diffs remain responsive and expose an explicit
-  expand path instead of silently truncating data.
-- No push, PR, or standing permission rule occurs without a complete preview
-  and an explicit confirmation.
+## PR 12 — Terminal sustained-history acceptance
 
-## PR 10 — Reversible session and Mesh lifecycle
+Status: implementation shipped; sustained-history acceptance remains open.
 
-The immediate audit pass adds non-destructive Chat stop controls, per-column
-and global Mesh stop, active-run close confirmation, and draft-safe sending.
-Waiting staged prompts now persist in exact FIFO order, restore paused, and can
-be inspected, removed individually, or explicitly resumed from either Mesh
-presentation. Chat and Mesh now also separate Hide, Stop, Close to Recently
-Closed, Restore/Undo, and confirmed permanent Delete without overloading
-“close” to mean deletion.
+Incremental transcript sanitizing, cached search, tail-first paging, AppKit
+focus, keyboard pane cycling, OSC 52 consent, terminal commands, focused
+VoiceOver output, palette-matched chrome, exact-pane reopen, and bounded image
+downscaling shipped in v1.1.9.
 
-Completed scope:
+Acceptance remaining:
 
-- Persist staged Mesh prompts across window close and app restart; expose their
-  order and allow individual removal before dispatch.
-- Distinguish Hide, Stop Current Turn, Stop All, Close to Recently Closed,
-  Restore, and permanently Delete for Chat and Mesh.
-- Preserve transcripts, drafts, queued prompts, and recoverable worktrees for
-  every non-delete action, with Undo for recently closed surfaces.
-- Persist ordinary ACP follow-up queues in exact FIFO order. Restart reconnects
-  with a fresh transport and resumes only entries that were never dispatched;
-  interrupted prompts stay failed for an explicit, non-duplicating Retry.
-
-Implementation status: complete.
-
-Acceptance:
-
-- Ordinary close and stop operations never destroy history, drafts, queued
-  prompts, or recoverable Git work.
-- A running Mesh cannot disappear without a clear confirmation even when no
-  worktree file has changed.
-- Relaunch restores Recently Closed entries and staged prompt order exactly.
-
-## PR 11 — Native preview performance, safety, and file coverage
-
-The audit pass adds live-file reconciliation, dirty conflict banners, encoding
-detection, binary sniffing, safe dead-end actions, notebook JSON rendering, and
-off-main cached Markdown images. A bounded native PDFKit preview now covers PDF
-selection, scrolling, magnification, and accessibility while parsing off the
-main actor, and bounded Markdown tables visibly disclose omitted rows. Rendered
-Markdown links now fail closed to explicit http(s) destinations or
-symlink-confined project files, and
-navigation flushes the latest Markdown draft before switching documents.
-Recovery, conflict, and failure feedback now retain typed severity in a
-dismissible accessible notice row instead of sharing a red header label. The
-former 6,600-line preview monolith is now partitioned into content policy,
-recovery, tabs, editors, Markdown rendering, and asset-loading units. CSV, JSON,
-and HTML readiness now prepare once per path/mtime/revision on a dedicated actor.
-
-Completed scope:
-
-- Use TextKit 2 for read-only text and Markdown-source views, preserving
-  viewport position and providing native Find without entering edit mode.
-- Parse CSV, JSON, and HTML readiness once per content/mtime and cache those
-  results off the main thread.
-
-Acceptance:
-
-- A 1 MiB text file, a large CSV/JSON file, and image-heavy Markdown retain
-  native momentum without main-thread parse or decode spikes.
-- External edits remain truthful, dirty edits are never overwritten, and every
-  unsupported state offers Finder and external-editor recovery.
-- Rendered Markdown cannot launch an unapproved URL scheme, and truncated
-  tables always disclose omitted rows.
-
-## PR 12 — Terminal lifecycle, deep history, and accessibility
-
-Build on PR 8 and the audit pass's ownership-safe surfaces, controller-lane
-recovery, serialized input, strict resize acknowledgements, and retained
-geometry reconciliation. The same pass now forwards replay-safe BEL attention,
-matches Shift-Enter modifiers exactly, warns when Claude did not receive a
-dropped image, and shows accessible ended/reconnecting state in the pane.
-
-Completed scope:
-
-- Incrementally sanitize transcript pages and move cached search off the main
-  thread; subscribe tail-first and page older observer history on demand.
-- Synchronize pane focus rings with AppKit first responder and add keyboard pane
-  cycling.
-- Add OSC 52 copy with consent and Clear/Jump-to-Bottom commands.
-- Remove the dead legacy terminal grid and make the transcript viewer inherit
-  the configured terminal font.
-- Provide throttled, focused-pane VoiceOver output announcements and use the
-  active terminal palette for opaque card chrome.
-- Add target-specific Reopen from an ended pane and safe, bounded oversized-
-  image downscaling.
-
-Acceptance:
-
-- Twelve long retained sessions stay within a documented memory ceiling and
-  history search remains responsive while output streams.
-- Keyboard and VoiceOver users can identify, focus, operate, and recover every
-  terminal state without a mouse.
-- An exited pane, failed attachment, clipboard request, or attention bell is
-  never silently ignored.
-
-## PR 13 — Native accessibility, design-system adoption, and readiness
-
-The v1.1.8 accessibility pass makes transient toasts VoiceOver-actionable and
-announced, turns first run into a live operational-readiness checklist, and
-adds a user guide with shortcuts and troubleshooting. The final app-wide slice
-adds one contrast-tested status vocabulary, shape-distinct rail markers,
-workspace/Settings Reduce Motion boundaries, and real composer focus for Chat
-and Mesh. Deterministic mixed and Mesh fixtures fail unless the requested
-composer becomes AppKit's first responder.
-
-Completed scope:
-
-- Introduce shared labeled, colorblind-safe status indicators; semantic diff
-  colors; app-wide Reduce Motion fallbacks; and truthful focus state.
-- Adopt the existing radius, motion, palette, hairline, and compact-type tokens
-  across Chat, Git, Mesh, files, Settings, badges, and terminal chrome.
-- Give palette and project controls truthful button/selection semantics,
-  disabled reasons, and labels sourced from the same command/status models.
-
-Implementation status: complete.
-
-Acceptance:
-
-- Accessibility inspection finds no unnamed controls, color-only status, low-
-  contrast diff text, unannounced consequential toast, or mandatory motion.
-- Menu shortcuts and palette hints come from one registry and cannot drift.
-- Onboarding ends with a verified project, background session service, agent
-  adapter/account state, and runnable first session.
-
-## PR 14 — Durable failure visibility and core scaling
-
-The reliability pass moves Unix socket work to dedicated queues, makes close
-wake blocked I/O, bounds Git branch probes, reconnects after repeated inventory
-failures, orders menu-window targeting, and cleans completed teardown tasks.
-Failed pop-out targets retain a standard missing-session recovery card with Try
-Again and Back to Main Window instead of becoming blank windows. Persistence
-failures now have explicit recovery, observer history loads tail-first, retained
-terminal memory is bounded, process metadata refreshes in batches, and direct
-bootstrap output drains concurrently without unbounded retention.
-
-Completed scope:
-
-- Surface workspace-archive corruption and session-store disk-write failures in
-  a recoverable degraded-state UI, including rename-aside recovery and retry.
-- Replace eager 64 MiB observer restoration with bounded tail-first paging and
-  explicit memory budgets for retained terminal surfaces.
-- Batch idle process metadata probes, harden bootstrap process output draining,
-  and ensure all long-lived tasks remove their completion bookkeeping.
-
-Implementation status: complete.
-
-Acceptance:
-
-- No data-affecting persistence or restoration failure is silent.
-- Reconnect, wake, and repeated open/close cycles cannot leak executor threads,
-  tasks, sockets, or unbounded terminal documents.
-- Corrupt state and unavailable sessions fail closed while preserving a clear
-  recovery path.
+- Prove twelve long retained sessions stay within the documented memory ceiling
+  while history search remains responsive under streaming output.
+- Re-run the sustained interaction and memory gate on the installed optimized
+  app alongside PR 8's physical-trackpad gate.
 
 ## Explicitly deferred
 

@@ -967,7 +967,7 @@ final class AcpConversation: ObservableObject {
             let renderer = TranscriptRenderer(cache: .incremental)
             ```
 
-            Inspect `PULL_REQUEST_FEATURES.md:211` for the exact acceptance contract.
+            Inspect PR 8 in `PULL_REQUEST_FEATURES.md` for the exact acceptance contract.
             """),
             .tool(AcpToolCall(
                 id: "visual-tool",

@@ -30,7 +30,9 @@ if (!requested || !/^\d+\.\d+\.\d+$/.test(requested)) {
 }
 
 const tag = `v${requested}`
-const message = process.argv.slice(3).join(' ') || `Release ${tag}`
+// Flags are not commit-message words.
+const message = process.argv.slice(3).filter((word) => !word.startsWith('--')).join(' ')
+  || `Release ${tag}`
 if (output('git', ['branch', '--show-current']) !== 'main') fail('releases must be cut from main')
 
 // Existing tracked edits must already be staged. This keeps the release
@@ -54,7 +56,21 @@ const currentParts = current.split('.').map(Number)
 const isNewer = requestedParts.some((part, index) => (
   part > currentParts[index] && requestedParts.slice(0, index).every((value, prior) => value === currentParts[prior])
 ))
-if (!isNewer) fail(`${requested} must be newer than package version ${current}`)
+// Going backwards is allowed only when asked for by name.
+//
+// The guard exists because a version that goes down is almost always a typo,
+// and a published release cannot be taken back. A deliberate renumbering is the
+// exception, so it takes a flag rather than the guard being removed — the next
+// accidental `0.9.0` still stops here.
+//
+// Safe for installed copies because Sparkle compares `CFBundleVersion`, which
+// `native-release-candidate.cjs` derives from a monotonic build counter
+// (`LAST_PUBLIC_BUILD` + the run number) and never from this string. The
+// marketing version is what people read; the build number decides the update.
+const allowsReset = process.argv.includes('--allow-version-reset')
+if (!isNewer && !allowsReset) {
+  fail(`${requested} must be newer than package version ${current} (pass --allow-version-reset to renumber deliberately)`)
+}
 
 command('npm', ['version', requested, '--no-git-tag-version', '--ignore-scripts'])
 command('git', ['add', 'package.json', 'package-lock.json'])

@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.1.1 — 2026-08-03
+
+Version numbers restart here. Kaisola was at 1.3.3; this release is the same
+app, renumbered. Updates are unaffected — they are decided by an internal build
+number that keeps counting up, not by the version shown in the app.
+
 ## 1.3.3 — 2026-08-03
 
 - Signing in to an account now finds the Claude and Codex commands wherever they are installed, instead of failing with "command not found".

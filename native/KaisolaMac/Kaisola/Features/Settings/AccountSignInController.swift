@@ -61,6 +61,8 @@ final class AccountSignInController: ObservableObject {
 
     private var process: Process?
     private var input: FileHandle?
+    /// Ours, so the blocking read loop never occupies a cooperative thread.
+    private let readQueue = DispatchQueue(label: "com.kaisola.account-signin.read")
 
     /// The first `https://` URL in a chunk of CLI output.
     ///
@@ -102,21 +104,36 @@ final class AccountSignInController: ObservableObject {
         self.process = process
         self.input = stdin.fileHandleForWriting
 
-        output.fileHandleForReading.readabilityHandler = { handle in
-            let data = handle.availableData
-            guard !data.isEmpty, let text = String(data: data, encoding: .utf8) else { return }
-            Task { @MainActor [weak self] in self?.absorb(text) }
-        }
-        process.terminationHandler = { finished in
-            Task { @MainActor [weak self] in
-                self?.finish(status: finished.terminationStatus)
-            }
-        }
-
         do {
             try process.run()
         } catch {
             phase = .failed("Kaisola couldn't start the sign-in: \(error.localizedDescription)")
+            return
+        }
+
+        // One dedicated thread reads to EOF and then reaps the child.
+        //
+        // Deliberately *not* `readabilityHandler`. That is a block owned by the
+        // pipe's own dispatch source, and dropping the pipe while the source is
+        // mid-callback releases the block underneath it — which crashed the
+        // whole app the first time this shipped: a `doDecrementSlow` on
+        // `com.apple.NSFileHandle.fd_monitoring` corrupted the heap, and the
+        // segfault then surfaced in an unrelated timer closure in the sidebar.
+        // A blocking read on a thread we own has no such lifetime to get wrong;
+        // `read(upToCount:)` also throws in Swift rather than raising the
+        // uncatchable ObjC exception `availableData` raises on a closed
+        // descriptor.
+        let handle = output.fileHandleForReading
+        readQueue.async { [weak self] in
+            while let chunk = try? handle.read(upToCount: 8_192), !chunk.isEmpty {
+                guard let text = String(data: chunk, encoding: .utf8) else { continue }
+                Task { @MainActor [weak self] in self?.absorb(text) }
+            }
+            // EOF means the child closed its output; waiting now yields the
+            // real status rather than racing it.
+            process.waitUntilExit()
+            let status = process.terminationStatus
+            Task { @MainActor [weak self] in self?.finish(status: status) }
         }
     }
 
@@ -141,7 +158,9 @@ final class AccountSignInController: ObservableObject {
     }
 
     private func finish(status: Int32) {
-        process?.standardOutput = nil
+        // The pipes are left attached on purpose. Detaching them here is what
+        // released a live dispatch source out from under itself; the process is
+        // already reaped, and letting it deallocate normally is safe.
         process = nil
         try? input?.close()
         input = nil

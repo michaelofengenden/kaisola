@@ -104,8 +104,13 @@ struct AccountSignInSheet: View {
                 tone: .secondary
             )
         case .awaitingCode:
+            // The CLI prints this prompt even when the browser can finish the
+            // handshake by itself — in which case sign-in completes with no
+            // code ever shown. So the copy offers the field without demanding
+            // it, rather than leaving the user hunting for a code that the
+            // browser already said "all set up" about.
             label(
-                "Approve the sign-in, then paste the code it gives you.",
+                "Approve the sign-in in your browser. Paste the code below if it gives you one.",
                 symbol: "arrow.down.doc",
                 tone: .secondary
             )

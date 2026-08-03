@@ -137,3 +137,140 @@ final class AppModelTerminalRetentionTests: XCTestCase {
         XCTAssertFalse(protectedIDs.contains("elsewhere"))
     }
 }
+
+/// PR 12's acceptance claim, checked rather than asserted in a comment.
+///
+/// `AppModel.maximumRetainedTerminalBytes` carries a promise in prose — "96 MiB
+/// comfortably holds six saturated terminals, or one saturated terminal plus a
+/// deep deck of ordinary ones" — and the deck is capped at twelve surfaces.
+/// Those are the numbers PR 12 says must hold for twelve long retained
+/// sessions, and until now nothing checked that the eviction policy actually
+/// delivers them at full scale: the existing cases use small synthetic sizes.
+///
+/// These drive the real constants at the real deck size. They cover the
+/// in-process half of the acceptance; measuring the installed app's resident
+/// memory under sustained streaming remains, and needs a signed build.
+@MainActor
+final class RetainedTerminalDeckAtScaleTests: XCTestCase {
+    private static let megabyte = 1_024 * 1_024
+
+    /// Bytes surviving after eviction, given each terminal's size.
+    private func survivingBytes(
+        _ sizes: [String: Int],
+        order: [String],
+        protected: Set<String> = []
+    ) -> Int {
+        let evicted = Set(AppModel.retainedSurfaceEvictions(
+            order: order,
+            byteCount: { sizes[$0] ?? 0 },
+            protected: protected,
+            maximumSurfaces: AppModel.maximumRetainedTerminalSurfaces,
+            maximumBytes: AppModel.maximumRetainedTerminalBytes
+        ))
+        return order.filter { !evicted.contains($0) }.reduce(0) { $0 + (sizes[$1] ?? 0) }
+    }
+
+    /// The worst case the cap exists to prevent: twelve terminals, every one
+    /// saturated. A count-only bound allowed 192 MiB here.
+    func testTwelveSaturatedTerminalsStayInsideTheBudget() {
+        let order = (1...12).map { "terminal-\($0)" }
+        let sizes = Dictionary(uniqueKeysWithValues: order.map {
+            ($0, TerminalDocument.maximumRetainedBytes)
+        })
+
+        let surviving = survivingBytes(sizes, order: order)
+        XCTAssertLessThanOrEqual(
+            surviving,
+            AppModel.maximumRetainedTerminalBytes,
+            "Twelve saturated terminals must not exceed the stated 96 MiB"
+        )
+        XCTAssertLessThan(surviving, 192 * Self.megabyte, "…which is what count-only permitted")
+    }
+
+    /// The comment's first promise: six saturated terminals fit.
+    func testSixSaturatedTerminalsAreHeldWithoutEviction() {
+        let order = (1...6).map { "terminal-\($0)" }
+        let sizes = Dictionary(uniqueKeysWithValues: order.map {
+            ($0, TerminalDocument.maximumRetainedBytes)
+        })
+        XCTAssertEqual(
+            survivingBytes(sizes, order: order),
+            6 * TerminalDocument.maximumRetainedBytes,
+            "96 MiB is exactly six saturated terminals; none should be evicted"
+        )
+    }
+
+    /// The comment's second promise: one saturated terminal plus a deep deck of
+    /// ordinary ones. An agent log beside eleven working shells is the shape a
+    /// real day actually takes.
+    func testOneSaturatedTerminalPlusADeepDeckOfOrdinaryOnesSurvives() {
+        var sizes = ["agent-log": TerminalDocument.maximumRetainedBytes]
+        var order = ["agent-log"]
+        for index in 1...11 {
+            let id = "shell-\(index)"
+            order.append(id)
+            sizes[id] = 2 * Self.megabyte
+        }
+
+        let evicted = AppModel.retainedSurfaceEvictions(
+            order: order,
+            byteCount: { sizes[$0] ?? 0 },
+            protected: [],
+            maximumSurfaces: AppModel.maximumRetainedTerminalSurfaces,
+            maximumBytes: AppModel.maximumRetainedTerminalBytes
+        )
+        XCTAssertTrue(evicted.isEmpty, "16 + 22 MiB across twelve surfaces fits inside 96 MiB")
+        XCTAssertLessThanOrEqual(order.count, AppModel.maximumRetainedTerminalSurfaces)
+    }
+
+    /// Touring long-lived terminals is exactly how the old bound was reached,
+    /// so the budget has to hold across a long walk, not just a snapshot.
+    func testTouringThirtyTerminalsNeverLetsTheDeckExceedTheBudget() {
+        var order: [String] = []
+        var sizes: [String: Int] = [:]
+        for index in 1...30 {
+            let id = "terminal-\(index)"
+            order.append(id)
+            // Alternate saturated and ordinary, so the walk crosses the byte
+            // bound repeatedly rather than settling under it.
+            sizes[id] = index.isMultiple(of: 2) ? TerminalDocument.maximumRetainedBytes : Self.megabyte
+
+            let surviving = survivingBytes(sizes, order: order)
+            XCTAssertLessThanOrEqual(
+                surviving,
+                AppModel.maximumRetainedTerminalBytes,
+                "deck exceeded the budget after visiting \(index) terminals"
+            )
+            let evicted = Set(AppModel.retainedSurfaceEvictions(
+                order: order,
+                byteCount: { sizes[$0] ?? 0 },
+                protected: [],
+                maximumSurfaces: AppModel.maximumRetainedTerminalSurfaces,
+                maximumBytes: AppModel.maximumRetainedTerminalBytes
+            ))
+            XCTAssertLessThanOrEqual(
+                order.filter { !evicted.contains($0) }.count,
+                AppModel.maximumRetainedTerminalSurfaces
+            )
+            order.removeAll { evicted.contains($0) }
+        }
+    }
+
+    /// Mounted surfaces are exempt, so a full screen of visible terminals can
+    /// legitimately exceed the budget — evicting one would blank a live card.
+    /// What must not happen is the policy evicting them anyway.
+    func testVisibleTerminalsAreNeverEvictedEvenWhenTheyAloneExceedTheBudget() {
+        let order = (1...12).map { "terminal-\($0)" }
+        let sizes = Dictionary(uniqueKeysWithValues: order.map {
+            ($0, TerminalDocument.maximumRetainedBytes)
+        })
+        let evicted = AppModel.retainedSurfaceEvictions(
+            order: order,
+            byteCount: { sizes[$0] ?? 0 },
+            protected: Set(order),
+            maximumSurfaces: AppModel.maximumRetainedTerminalSurfaces,
+            maximumBytes: AppModel.maximumRetainedTerminalBytes
+        )
+        XCTAssertTrue(evicted.isEmpty, "a mounted card must never be blanked to satisfy the budget")
+    }
+}

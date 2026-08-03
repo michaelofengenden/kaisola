@@ -106,10 +106,15 @@ downscaling shipped in v1.1.9.
 
 Acceptance remaining:
 
-- Prove twelve long retained sessions stay within the documented memory ceiling
-  while history search remains responsive under streaming output.
+- ~~Prove the twelve-surface retained deck stays within the documented 96 MiB
+  ceiling.~~ Done: `RetainedTerminalDeckAtScaleTests` drives the real constants
+  at full deck size, including twelve saturated terminals, the two cases the
+  budget's own comment promises, a thirty-terminal tour that crosses the bound
+  repeatedly, and the mounted-surface exemption.
+- Prove history search remains responsive under streaming output.
 - Re-run the sustained interaction and memory gate on the installed optimized
-  app alongside PR 8's physical-trackpad gate.
+  app alongside PR 8's physical-trackpad gate. Blocked on a signed installed
+  build; the in-process half above is what can be checked without one.
 
 ## Explicitly deferred
 

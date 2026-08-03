@@ -97,22 +97,37 @@ struct UsageSettingsTab: View {
                         if accountProfiles.isEmpty, usage.planUsage.isEmpty {
                             emptyAccountState
                         } else {
-                            ForEach(accountProfiles) { profile in
-                                SubscriptionCardView(
-                                    profile: profile,
-                                    usage: reading(for: profile),
-                                    isRefreshing: usage.isRefreshingPlanUsage,
-                                    now: Date(),
-                                    onSignIn: { signingIn = profile },
-                                    onReveal: { reveal(profile) },
-                                    onRemove: { pendingAccountRemoval = profile }
-                                )
-                            }
-                            // A reading with no matching configured profile —
-                            // the CLI's own default login, which has no named
-                            // account entry.
-                            ForEach(unmatchedReadings) { provider in
-                                ProviderPlanUsageRow(provider: provider)
+                            // Accounts flow into columns rather than stacking.
+                            //
+                            // One card per row meant five subscriptions were
+                            // five screens of scrolling to compare — and
+                            // comparing them is the entire reason this list
+                            // exists. At 320pt minimum a card still holds its
+                            // longest line (an email and an org), so a wide
+                            // window shows two or three abreast and a narrow
+                            // one falls back to the single column it had.
+                            LazyVGrid(
+                                columns: [GridItem(.adaptive(minimum: 320), spacing: 12, alignment: .top)],
+                                alignment: .leading,
+                                spacing: 12
+                            ) {
+                                ForEach(accountProfiles) { profile in
+                                    SubscriptionCardView(
+                                        profile: profile,
+                                        usage: reading(for: profile),
+                                        isRefreshing: usage.isRefreshingPlanUsage,
+                                        now: Date(),
+                                        onSignIn: { signingIn = profile },
+                                        onReveal: { reveal(profile) },
+                                        onRemove: { pendingAccountRemoval = profile }
+                                    )
+                                }
+                                // A reading with no matching configured profile
+                                // — the CLI's own default login, which has no
+                                // named account entry.
+                                ForEach(unmatchedReadings) { provider in
+                                    ProviderPlanUsageRow(provider: provider)
+                                }
                             }
                         }
                     }
@@ -262,32 +277,49 @@ struct UsageSettingsTab: View {
     }
 }
 
+/// A reading with no named account behind it — the CLI's own default login.
+///
+/// It used to draw its own header, its own meters and its own card-less layout,
+/// so the same Usage list showed two visibly different things: severity-tinted
+/// hairline bars inside a card for a named account, and blue full-width bars on
+/// their own lines, at roughly triple the height, for this. Michael: "see how
+/// they're not consistent formatting.. the color and all, also the space is a
+/// little wasted."
+///
+/// It is now the same card and the same `SubscriptionUsageMeter`. The only
+/// thing that still distinguishes it is what it honestly is: an account Kaisola
+/// has no entry for, so it says so instead of naming a directory it does not
+/// own.
 private struct ProviderPlanUsageRow: View {
     let provider: UsageCenter.ProviderPlanUsage
+    var now: Date = Date()
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            HStack(alignment: .firstTextBaseline) {
-                Text(provider.displayName)
-                    .font(.callout.weight(.semibold))
-                if let label = provider.profileLabel, !label.isEmpty {
-                    Text(label)
-                        .font(.caption.weight(.medium))
-                        .foregroundStyle(.secondary)
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(spacing: 9) {
+                QuietIdentityMarkView(
+                    identity: provider.provider == "claude" ? .claude : .openai,
+                    size: 16
+                )
+                .frame(width: 22, height: 22)
+                VStack(alignment: .leading, spacing: 1) {
+                    Text(provider.profileLabel.flatMap { $0.isEmpty ? nil : $0 } ?? provider.displayName)
+                        .font(.callout.weight(.semibold))
+                        .lineLimit(1)
+                    Text("Signed in to the CLI directly")
+                        .font(.caption2)
+                        .foregroundStyle(.tertiary)
                 }
+                Spacer(minLength: 6)
                 if let plan = provider.plan, !plan.isEmpty {
                     Text(plan.capitalized)
                         .font(.caption.weight(.medium))
-                        .foregroundStyle(.secondary)
-                        .padding(.horizontal, 6)
+                        .padding(.horizontal, 7)
                         .padding(.vertical, 2)
                         .background(.quaternary, in: Capsule())
                 }
-                Spacer()
-                Text(provider.ok ? "Available" : "Needs Attention")
-                    .font(.caption2)
-                    .foregroundStyle(.tertiary)
             }
+
             if let account = provider.account, !account.isEmpty {
                 Text(account)
                     .font(.caption)
@@ -295,56 +327,29 @@ private struct ProviderPlanUsageRow: View {
                     .lineLimit(1)
                     .truncationMode(.middle)
             }
-            if provider.experimental == true {
-                Text("Experimental usage support")
-                    .font(.caption2)
-                    .foregroundStyle(.tertiary)
-            }
+
             if provider.windows.isEmpty {
-                Label(provider.message ?? "No limit windows available.", systemImage: provider.ok ? "info.circle" : "exclamationmark.circle")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
+                Label(
+                    provider.message ?? "No limit windows available.",
+                    systemImage: provider.ok ? "info.circle" : "exclamationmark.circle"
+                )
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .lineLimit(2)
             } else {
                 ForEach(provider.windows) { window in
-                    ProviderPlanWindowRow(window: window)
+                    SubscriptionUsageMeter(window: window, now: now)
                 }
             }
         }
-        .padding(.vertical, 4)
-    }
-}
-
-private struct ProviderPlanWindowRow: View {
-    let window: UsageCenter.PlanWindow
-
-    private var fraction: Double {
-        min(max((window.usedPercent ?? 0) / 100, 0), 1)
-    }
-
-    var body: some View {
-        VStack(spacing: 4) {
-            HStack {
-                Text(window.label)
-                    .font(.caption)
-                Spacer()
-                if let used = window.usedPercent {
-                    Text("\(Int(used.rounded()))% used")
-                        .font(.caption.monospacedDigit())
-                        .foregroundStyle(.secondary)
-                }
-                if let resetsAt = window.resetsAt {
-                    Text("resets")
-                        .font(.caption2)
-                        .foregroundStyle(.tertiary)
-                    Text(Date(timeIntervalSince1970: resetsAt), style: .relative)
-                        .font(.caption2.monospacedDigit())
-                        .foregroundStyle(.tertiary)
-                }
-            }
-            ProgressView(value: fraction)
-                .tint(fraction >= 0.85 ? .orange : .accentColor)
-                .accessibilityLabel("\(window.label) usage")
-                .accessibilityValue("\(Int((window.usedPercent ?? 0).rounded())) percent used")
+        .padding(12)
+        .background(
+            .quaternary.opacity(0.28),
+            in: RoundedRectangle(cornerRadius: KaisolaVisualSystem.cardRadius, style: .continuous)
+        )
+        .overlay {
+            RoundedRectangle(cornerRadius: KaisolaVisualSystem.cardRadius, style: .continuous)
+                .strokeBorder(.quaternary, lineWidth: KaisolaVisualSystem.hairline)
         }
     }
 }

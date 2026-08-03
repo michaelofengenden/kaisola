@@ -89,12 +89,19 @@ struct SettingsView: View {
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
         }
+        // Settings opens large.
+        //
+        // The old ideal was 810×540, which is where the wasted space came from:
+        // a card list laid out for a window barely taller than three rows, so
+        // Usage could show one account and part of the next. These fill a laptop
+        // display without pinning a larger one, and the account grid spends the
+        // extra width on columns rather than margins.
         .frame(
-            minWidth: 760,
-            idealWidth: 810,
+            minWidth: 820,
+            idealWidth: 1_100,
             maxWidth: .infinity,
-            minHeight: 500,
-            idealHeight: 540,
+            minHeight: 560,
+            idealHeight: 800,
             maxHeight: .infinity
         )
         .background(Color(nsColor: .windowBackgroundColor).opacity(0.82))

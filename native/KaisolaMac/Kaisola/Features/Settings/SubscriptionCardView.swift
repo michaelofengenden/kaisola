@@ -272,7 +272,12 @@ struct SubscriptionUsageMeter: View {
     }
 
     /// Pure, so the switch and its boundary are testable without a view.
-    static func resetCaption(resetsAt: Double?, now: Date) -> String? {
+    ///
+    /// `nonisolated` because it is: a `View` is main-actor isolated and its
+    /// statics inherit that, which made a synchronous test call an isolation
+    /// error under CI's stricter concurrency settings while building fine
+    /// locally. Nothing here touches actor state.
+    nonisolated static func resetCaption(resetsAt: Double?, now: Date) -> String? {
         guard let resetsAt, resetsAt > 0 else { return nil }
         let date = Date(timeIntervalSince1970: resetsAt)
         let remaining = date.timeIntervalSince(now)

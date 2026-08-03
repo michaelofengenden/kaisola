@@ -3985,6 +3985,10 @@ final class DesktopWallpaperPatchView: NSView {
     /// What the layer is already showing, so a repeated signal is free.
     private var appliedContentsRect: CGRect?
     private var appliedFrame: CGRect?
+    /// Live only while the window is moving; see `setNeedsBackdropRefresh`.
+    private var displayLink: CADisplayLink?
+    private var backdropNeedsRefresh = false
+    private var idleFrames = 0
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
@@ -4021,6 +4025,9 @@ final class DesktopWallpaperPatchView: NSView {
     override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
         observe()
+        // A view with no window has nothing to pace against, and a display
+        // link outliving its window is a retained timer firing at 120 Hz.
+        if window == nil { stopDisplayLink() }
         refresh()
     }
 
@@ -4057,7 +4064,7 @@ final class DesktopWallpaperPatchView: NSView {
         ] {
             registrations.tokens.append((center, center.addObserver(
                 forName: name, object: window, queue: nil
-            ) { [weak self] _ in MainActor.assumeIsolated { self?.refresh() } }))
+            ) { [weak self] _ in MainActor.assumeIsolated { self?.setNeedsBackdropRefresh() } }))
         }
         watch(NSApplication.didChangeScreenParametersNotification, on: center, object: nil)
         watch(
@@ -4065,6 +4072,54 @@ final class DesktopWallpaperPatchView: NSView {
             on: NSWorkspace.shared.notificationCenter,
             object: nil
         )
+    }
+
+    /// Ask for one backdrop update on the next frame the display actually draws.
+    ///
+    /// A window drag posts `didMove` on the event stream, not the display's —
+    /// so the events arrive in bursts that do not line up with frames, and
+    /// several can land inside one refresh interval. Answering each of them
+    /// individually does work the screen never shows and paces the backdrop by
+    /// the mouse rather than by the display.
+    ///
+    /// A display link is the opposite: exactly one update per frame while the
+    /// window is moving, at whatever the screen's real rate is (60 Hz, 120 Hz
+    /// on ProMotion), and — because it stops itself once the moves stop —
+    /// nothing at all while the window sits still. Michael: "60 fps for the
+    /// background wallpaper, but only when moving the app."
+    private func setNeedsBackdropRefresh() {
+        backdropNeedsRefresh = true
+        startDisplayLinkIfNeeded()
+    }
+
+    private func startDisplayLinkIfNeeded() {
+        guard displayLink == nil, window != nil else { return }
+        let link = displayLink(target: self, selector: #selector(displayLinkFired))
+        link.add(to: .main, forMode: .common)
+        displayLink = link
+        idleFrames = 0
+    }
+
+    /// Frames of no movement before the link stops. A drag pauses mid-gesture
+    /// constantly; tearing the link down on the first still frame would spend
+    /// more on starting and stopping than on drawing.
+    private static let idleFramesBeforeStopping = 12
+
+    @objc private func displayLinkFired() {
+        guard backdropNeedsRefresh else {
+            idleFrames += 1
+            if idleFrames >= Self.idleFramesBeforeStopping { stopDisplayLink() }
+            return
+        }
+        backdropNeedsRefresh = false
+        idleFrames = 0
+        refresh()
+    }
+
+    private func stopDisplayLink() {
+        displayLink?.invalidate()
+        displayLink = nil
+        idleFrames = 0
     }
 
     private func refresh() {

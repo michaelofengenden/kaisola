@@ -396,16 +396,24 @@ enum QuietProjectEmphasis {
 /// same 16pt slot a surface row's identity mark occupies, so project names and
 /// session titles start on two consistent columns.
 ///
-/// Deliberately not `folder`/`folder.fill`: a folder reads as a *file system*
-/// row, and the rail's projects are workspaces. Only the active project's mark
-/// carries the project tint — every other row's mark stays neutral so the tint
-/// means "this is the project you are in" rather than "this is a project".
+/// A **folder**, at Michael's direction. This mark used to be
+/// `square.on.square` on the argument that a folder reads as a *file system*
+/// row while the rail's projects are workspaces. That distinction turns out to
+/// be one the rail does not need to draw: every project here *is* a directory
+/// on disk, it is the one the sessions beneath it run in, and the stacked
+/// squares read as "duplicate" far more readily than as "workspace". It also
+/// now agrees with the Files rail, which has drawn folders as folders all
+/// along.
+///
+/// Only the active project's mark carries the project tint — every other row's
+/// mark stays neutral, so the tint means "this is the project you are in"
+/// rather than "this is a project".
 private struct QuietProjectMarkView: View {
     /// `nil` for a compact (non-active) row.
     let tint: Color?
 
     var body: some View {
-        Image(systemName: "square.on.square")
+        Image(systemName: "folder")
             .font(.system(size: QuietRailMetrics.projectMarkText, weight: .regular))
             .foregroundStyle(tint ?? Color.secondary)
             .frame(width: QuietRailMetrics.mark, height: QuietRailMetrics.mark)
@@ -657,8 +665,16 @@ private struct QuietProjectGroup: View {
                         .truncationMode(.middle)
                         .layoutPriority(1)
                     Spacer(minLength: QuietRailMetrics.laneGap)
-                    QuietRollupView(rollup: QuietRollup.of(Array(statuses.values)))
-                        .fixedSize()
+                    // The rollup summarises rows you cannot see. Once the
+                    // project is expanded you can see them, and every working
+                    // agent is already saying so on its own row — so the
+                    // header's "1 ●" is the same news printed twice, on two
+                    // lines that sit directly above one another. The hover
+                    // lane already made this call; the resting lane did not.
+                    if !isExpanded {
+                        QuietRollupView(rollup: QuietRollup.of(Array(statuses.values)))
+                            .fixedSize()
+                    }
                 }
                 .padding(.leading, QuietRailMetrics.horizontalInset)
                 .frame(height: QuietRailMetrics.rowHeight)

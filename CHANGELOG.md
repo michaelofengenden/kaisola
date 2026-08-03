@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.3.3 — 2026-08-03
+
+- Signing in to an account now finds the Claude and Codex commands wherever they are installed, instead of failing with "command not found".
+
 ## 1.3.2 — 2026-08-03
 
 - Sign in to Claude and Codex accounts inside Settings, instead of a terminal opening in whatever project was in front.

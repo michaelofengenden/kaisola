@@ -85,16 +85,77 @@ final class AccountSignInController: ObservableObject {
         output.lowercased().contains("paste code")
     }
 
+    /// The provider's CLI tool name.
+    nonisolated static func toolName(for provider: UsageAccountProfile.Provider) -> String {
+        provider == .claude ? "claude" : "codex"
+    }
+
+    /// Where that CLI actually is on disk.
+    ///
+    /// A GUI-launched app inherits `/usr/bin:/bin`, not your shell's PATH — and
+    /// `zsh -lc` does **not** source `~/.zshrc`, because `-c` is not
+    /// interactive. Every PATH-extending installer people actually use — nvm,
+    /// conda, npm global, mise — writes into `.zshrc`, so the CLI is invisible
+    /// to a plain login shell. That is why sign-in failed with
+    /// `zsh:1: command not found: claude` while the identical command works in
+    /// any Kaisola terminal, which runs an *interactive* shell.
+    ///
+    /// So the tool is located once, through an interactive login shell with the
+    /// same PATH prelude terminals get, and the login then runs against an
+    /// absolute path where nothing can lose it again.
+    nonisolated static func resolveExecutable(
+        _ tool: String,
+        shell: String = "/bin/zsh"
+    ) -> String? {
+        let probe = Process()
+        probe.executableURL = URL(fileURLWithPath: shell)
+        probe.arguments = [
+            "-ilc",
+            NativeTerminalLaunchEnvironment.preferredPathPrelude() + "command -v \(tool)",
+        ]
+        let output = Pipe()
+        probe.standardOutput = output
+        probe.standardError = Pipe()
+        do {
+            try probe.run()
+        } catch {
+            return nil
+        }
+        let data = output.fileHandleForReading.readDataToEndOfFile()
+        probe.waitUntilExit()
+        let text = String(data: data, encoding: .utf8) ?? ""
+        // An interactive shell can print its own noise; the answer is the last
+        // absolute path it emitted.
+        return firstExecutablePath(in: text)
+    }
+
+    /// Pure, so the parsing survives whatever a person's shell prints at start.
+    nonisolated static func firstExecutablePath(in output: String) -> String? {
+        output
+            .split(whereSeparator: \.isNewline)
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+            .last { $0.hasPrefix("/") && !$0.contains(" ") }
+    }
+
     func start(profile: UsageAccountProfile) {
-        let login = profile.provider == .claude ? "claude auth login --claudeai" : "codex login"
+        let tool = Self.toolName(for: profile.provider)
+        guard let executable = Self.resolveExecutable(tool) else {
+            phase = .failed(
+                "Kaisola couldn’t find the \(tool) command. Open a terminal and check that \(tool) runs there."
+            )
+            return
+        }
+        let quotedTool = "'" + executable.replacingOccurrences(of: "'", with: "'\\''") + "'"
+        let login = profile.provider == .claude
+            ? "\(quotedTool) auth login --claudeai"
+            : "\(quotedTool) login"
         let quoted = "'" + profile.expandedDirectory.replacingOccurrences(of: "'", with: "'\\''") + "'"
-        // Through a login shell, so the CLI resolves on the same PATH a
-        // terminal would give it. Anything else finds `claude` only for users
-        // whose install happens to sit in a system directory.
         let command = "\(profile.provider.environmentKey)=\(quoted) \(login)"
 
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/bin/zsh")
+        // A plain login shell is enough now that the tool is an absolute path;
+        // the interactive shell was only ever needed to *find* it.
         process.arguments = ["-lc", command]
         let output = Pipe()
         let stdin = Pipe()

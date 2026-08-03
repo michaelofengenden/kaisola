@@ -107,3 +107,53 @@ final class SubscriptionResetCaptionTests: XCTestCase {
         XCTAssertNil(caption(inSeconds: -60))
     }
 }
+
+/// Locating the provider CLI. A GUI app inherits `/usr/bin:/bin`, and a
+/// non-interactive login shell never sources `~/.zshrc` — where nvm, conda,
+/// npm-global and mise all write PATH — so the tool has to be found before it
+/// can be run.
+final class AccountSignInExecutableTests: XCTestCase {
+    /// The real answer, alone on a line.
+    func testAPlainPathIsTaken() {
+        XCTAssertEqual(
+            AccountSignInController.firstExecutablePath(in: "/opt/homebrew/bin/claude\n"),
+            "/opt/homebrew/bin/claude"
+        )
+    }
+
+    /// An interactive shell prints whatever the user's startup files print —
+    /// conda banners, version-manager notices, MOTDs. The path is the last
+    /// absolute token, not the first line.
+    func testShellStartupNoiseIsSkipped() {
+        let output = """
+        Using node v22.3.0 (npm v10.8.1)
+        (base) conda environment activated
+        /Users/x/miniforge3/bin/claude
+        """
+        XCTAssertEqual(
+            AccountSignInController.firstExecutablePath(in: output),
+            "/Users/x/miniforge3/bin/claude"
+        )
+    }
+
+    /// `command -v` prints nothing when the tool is missing — which is exactly
+    /// what the GUI environment produced, and what must now be reported rather
+    /// than run as a bare name.
+    func testNothingFoundIsNil() {
+        XCTAssertNil(AccountSignInController.firstExecutablePath(in: ""))
+        XCTAssertNil(AccountSignInController.firstExecutablePath(in: "claude not found\n"))
+    }
+
+    /// A shell alias or function prints prose, not a path; it is not a binary
+    /// we can exec.
+    func testAnAliasLineIsNotMistakenForAPath() {
+        XCTAssertNil(
+            AccountSignInController.firstExecutablePath(in: "claude: aliased to /usr/bin/env claude")
+        )
+    }
+
+    func testToolNamesMatchTheProviders() {
+        XCTAssertEqual(AccountSignInController.toolName(for: .claude), "claude")
+        XCTAssertEqual(AccountSignInController.toolName(for: .codex), "codex")
+    }
+}

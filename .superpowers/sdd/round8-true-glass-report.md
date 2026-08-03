@@ -7,9 +7,14 @@ Branch: `round8-glass-desktop-pinning`, branched from `a3cc3cc` (`backlog-integr
 | --- | --- |
 | `6567721` | test(glass): stop the wallpaper watch test racing the resolve it starts |
 | `16ef320` | feat(glass): pin the backdrop to the desktop and make the tone map hue-blind |
+| `b9e3bf7` | docs(sdd): record round 8 |
+| `76cdbc2` | feat(settings): make the glass configurable — clarity, blur and colour |
 
-Files touched: `App/NativePreviewSettings.swift` and `KaisolaTests/NativePreviewSettingsTests.swift`
-only. The window-frame hook lives in the same file — see §1.3.
+Files touched: `App/NativePreviewSettings.swift` and
+`KaisolaTests/NativePreviewSettingsTests.swift`, plus
+`Features/Settings/SettingsView.swift` for the three new rows Michael asked for
+mid-round (§5). The window-frame hook lives in `NativePreviewSettings.swift` —
+see §1.3.
 
 ---
 
@@ -301,19 +306,78 @@ It is off the main thread (`Task.detached(priority: .utility)`), cached per
 
 ---
 
-## 5. Verification
+## 5. Configurable glass (asked for mid-round)
+
+> "could you also add more configurable glass settings to settings as well?"
+
+Three rows in Settings ▸ Appearance, each mapped to a constant this round made
+meaningful, each defaulting to **exactly what ships today** so nobody who never
+opens Settings sees a different surface (asserted, not assumed).
+
+| row | choices | what it moves |
+| --- | --- | --- |
+| **Glass clarity** | Frosted / Balanced / Clear | every veil coverage × 1.16 / 1.0 / 0.89 |
+| **Glass blur** | Soft / Balanced / Crisp | `desktopBlurPoints` 44 / 28 / 18 |
+| **Glass colour** | Muted / Balanced / Vivid | the solve's Oklab chroma target × 0.45 / 1.0 / 1.8 |
+
+Blur and colour change the *bake*, so they join `DesktopBackdropKey`: switching
+either re-bakes once through the same cached, coalesced, off-thread path a
+wallpaper change takes, then draws from cache. Clarity is a veil scale and costs
+nothing. Colour moves chroma without moving lightness and **cannot** reintroduce
+hue dependence — the target is proportional to the wallpaper's own colourfulness,
+so a grey desktop stays grey at every setting.
+
+### What bounds `clear`, and the surprise
+
+Clarity is the only knob with a real cost: thinning the veil is precisely what
+rounds 3 and 4 measured the floors could not afford. Rendered across all
+twenty-seven combinations, they now can:
+
+| `clear` scale | dark P / S | light P / S |
+| --- | --- | --- |
+| 0.92 | 9.48 / **4.97** | 9.65 / 3.50 |
+| 0.80 | 9.25 / **4.89** | 9.31 / 3.46 |
+| floors | 7.0 / 4.5 | 7.0 / 3.43 |
+
+The worst patch **barely moves across a 15% change in veil**, because round 7's
+tail cap already bounds the still the veil is letting through — a thinner veil
+now transmits a *bounded* picture rather than an arbitrary one. That is the cap
+paying out a second time, and it means "where the test starts failing" is a long
+way down and not a safe place to stop.
+
+So the bound is taken from the invariant that still bites:
+`desktopTransmissionBand`. **0.89** is the largest step keeping every surface
+inside the transmission ceiling rounds 3 and 4 declared and priced (dark 0.66 →
+0.697, ceiling 0.70). These fixtures are the extremes of the wallpapers we have,
+not of every desktop a user can choose, and an opt-in setting is not a reason to
+spend a margin that exists for wallpapers nobody has tested.
+
+`testEveryGlassSettingCombinationStaysLegible` renders the whole grid on the
+adversarial ramp, both surfaces, both appearances, pinned:
+**dark 9.54 / 4.99, light 9.56 / 3.49.**
+`testGlassSettingsPersistAndDefaultToWhatShipped` holds the defaults against the
+shipped constants, round-trips each through `UserDefaults`, falls back on an
+unknown stored value, asserts the bake knobs are in the cache key and the veil
+knob is not, and holds the transmission band and the veil's neutrality at every
+setting.
+
+---
+
+## 6. Verification
 
 - `npm run native:fast:build` — clean, no warnings, no errors.
-- `npm run native:test:focus -- NativePreviewSettingsTests` — **117 tests, 0
+- `npm run native:test:focus -- NativePreviewSettingsTests` — **119 tests, 0
   failures**.
 - `npm run native:test:changed -- --include-working-tree` — passed (core package
   25 tests + 10 selected native suites).
 - Commit `6567721` was built and tested on its own before `16ef320` was applied,
-  so neither commit is broken in isolation.
+  so neither commit is broken in isolation; the settings commit `76cdbc2` was
+  built, tested and launched again after it.
 - Dev-profile launch only (`KAISOLA_NATIVE_BROKER_PROFILE=development npm run
-  native:fast -- --refresh-helper`, pid 44356), stopped with `kill -TERM`. It ran
-  ~2 minutes at **0.0% CPU**, RSS flat at 149 MiB, no crash report, and the only
-  log line is a pre-existing `NSTableView` reentrancy warning unrelated to glass.
+  native:fast -- --refresh-helper`, pids 44356 then 58238), each stopped with
+  `kill -TERM`. Both ran at **0.0% CPU** with RSS flat at 149–151 MiB, no crash
+  report, and the only log line is a pre-existing `NSTableView` reentrancy
+  warning unrelated to glass.
   Production `/Applications/Kaisola.app` was left running and untouched; no
   `defaults delete`.
 - The pinned arm64 Node runtime was missing in this worktree and was fetched with
@@ -328,7 +392,7 @@ It is off the main thread (`Task.detached(priority: .utility)`), cached per
 
 ---
 
-## 6. Concerns and what was deliberately not done
+## 7. Concerns and what was deliberately not done
 
 1. **The detail metric no longer compares across geometries.** Round 7's
    `localDetail` — high-pass at radius 32 on a 210×900 surface — measures a

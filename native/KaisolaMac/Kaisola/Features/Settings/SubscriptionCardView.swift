@@ -22,8 +22,6 @@ struct SubscriptionCardView: View {
     var onReveal: (() -> Void)?
     var onRemove: (() -> Void)?
 
-    @State private var emailRevealed = false
-
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
             header
@@ -115,31 +113,23 @@ struct SubscriptionCardView: View {
 
     // MARK: - Identity
 
-    /// The account email is blurred until clicked. This is a screen you might
-    /// share or screenshot while comparing two subscriptions.
+    /// Only the states that need saying.
+    ///
+    /// This used to print the account's email behind a click-to-reveal blur, on
+    /// the reasoning that you might screenshot this screen while comparing
+    /// subscriptions. Michael: "why are email accounts covered? no need to be
+    /// shown i think." He is right, and the masking made it worse rather than
+    /// better — a row of ●●●●●●● is *more* conspicuous than a line that was
+    /// never there, and it cost a click to learn something the account's own
+    /// label already told you. You named these accounts; the email underneath
+    /// is the provider's business.
+    ///
+    /// A signed-in account therefore says nothing here at all. The two states
+    /// you can act on still speak.
     @ViewBuilder
     private var authLine: some View {
         if let account = usage?.account, !account.isEmpty {
-            Button {
-                emailRevealed.toggle()
-            } label: {
-                HStack(spacing: 5) {
-                    Text("Signed in as")
-                        .foregroundStyle(.secondary)
-                    Text(emailRevealed ? account : String(repeating: "●", count: min(account.count, 12)))
-                        .foregroundStyle(.primary)
-                        .lineLimit(1)
-                        .truncationMode(.middle)
-                }
-                .font(.caption)
-            }
-            .buttonStyle(.plain)
-            .help(emailRevealed ? "Hide email" : "Click to reveal email")
-            .accessibilityLabel(
-                emailRevealed
-                    ? "Hide email for \(profile.label)"
-                    : "Reveal email for \(profile.label)"
-            )
+            EmptyView()
         } else if usage == nil {
             Text("Checking this account…")
                 .font(.caption)
@@ -229,30 +219,35 @@ struct SubscriptionUsageMeter: View {
     }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 3) {
-            HStack(spacing: 6) {
+        VStack(alignment: .leading, spacing: 4) {
+            HStack(alignment: .firstTextBaseline, spacing: 6) {
                 Text(window.label)
-                    .font(.caption2)
+                    .font(.caption)
                     .foregroundStyle(.secondary)
                 Spacer(minLength: 4)
+                // The number is the point of the row, so it carries the weight
+                // rather than sharing the label's grey. At a glance you should
+                // be reading percentages down a column, not hunting for them.
                 if let percent = window.usedPercent {
                     Text("\(Int(percent.rounded()))%")
-                        .font(.caption2.monospacedDigit())
-                        .foregroundStyle(.secondary)
+                        .font(.caption.weight(.semibold).monospacedDigit())
+                        .foregroundStyle(.primary)
                 }
                 if let resets = resetCaption {
                     Text(resets)
-                        .font(.caption2)
+                        .font(.caption2.monospacedDigit())
                         .foregroundStyle(.tertiary)
                 }
             }
             GeometryReader { geometry in
                 ZStack(alignment: .leading) {
                     Capsule().fill(.quaternary)
-                    Capsule().fill(tint).frame(width: max(2, geometry.size.width * fraction))
+                    Capsule().fill(tint).frame(width: max(3, geometry.size.width * fraction))
                 }
             }
-            .frame(height: 4)
+            // 4pt read as a hairline once the cards sat side by side; 6 gives
+            // the fill enough body to compare across a row of accounts.
+            .frame(height: 6)
         }
         .accessibilityElement(children: .ignore)
         .accessibilityLabel("\(window.label) usage")
@@ -264,12 +259,33 @@ struct SubscriptionUsageMeter: View {
         return resetCaption.map { "\(percent), \($0)" } ?? percent
     }
 
+    /// When this window resets, said the way that horizon is actually useful.
+    ///
+    /// Short horizons want the countdown — "in 40m" is what you need when
+    /// deciding whether to wait. Long ones want the clock: "in 2d" is a range
+    /// covering forty-eight hours, and once you are planning a day around a
+    /// reset you want to know it lands Tuesday morning. So this switches at
+    /// twelve hours rather than picking one style and being vague half the
+    /// time.
     private var resetCaption: String? {
-        guard let resetsAt = window.resetsAt, resetsAt > 0 else { return nil }
-        let remaining = Date(timeIntervalSince1970: resetsAt).timeIntervalSince(now)
+        Self.resetCaption(resetsAt: window.resetsAt, now: now)
+    }
+
+    /// Pure, so the switch and its boundary are testable without a view.
+    static func resetCaption(resetsAt: Double?, now: Date) -> String? {
+        guard let resetsAt, resetsAt > 0 else { return nil }
+        let date = Date(timeIntervalSince1970: resetsAt)
+        let remaining = date.timeIntervalSince(now)
         guard remaining > 0 else { return nil }
-        if remaining < 3_600 { return "resets in \(Int(remaining / 60))m" }
-        if remaining < 86_400 { return "resets in \(Int(remaining / 3_600))h" }
-        return "resets in \(Int(remaining / 86_400))d"
+        if remaining < 3_600 { return "in \(Int(remaining / 60))m" }
+        if remaining < 43_200 { return "in \(Int(remaining / 3_600))h" }
+
+        let formatter = DateFormatter()
+        formatter.locale = .autoupdatingCurrent
+        // Within the week the weekday names it; beyond that the date does.
+        formatter.setLocalizedDateFormatFromTemplate(
+            remaining < 6 * 86_400 ? "EEE j:mm" : "MMM d"
+        )
+        return formatter.string(from: date)
     }
 }

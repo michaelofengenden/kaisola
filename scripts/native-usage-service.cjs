@@ -36,10 +36,23 @@ function normalizedWindow(label, raw) {
   const resetsAt = resetEpoch(raw.resetsAt ?? raw.resets_at ?? raw.resetAt ?? raw.reset_at)
   if (usedPercent == null && resetsAt == null) return null
   return {
-    label,
+    ...(label == null ? {} : { label }),
     ...(usedPercent == null ? {} : { usedPercent }),
     ...(resetsAt == null ? {} : { resetsAt }),
   }
+}
+
+/** Name a lone Codex window from how far out it resets.
+ *
+ * A window resetting within a day is the short rolling limit; anything further
+ * is the weekly one. The boundary sits at 24h because the two real windows are
+ * 5 hours and 7 days apart — nothing legitimate lands near it. A window with no
+ * reset time at all keeps the historical name rather than guessing. */
+function codexWindowLabel(win, now = Date.now()) {
+  const resetsAt = finite(win && win.resetsAt)
+  if (resetsAt == null) return '5 hour'
+  const remainingHours = (resetsAt * 1000 - now) / 3_600_000
+  return remainingHours > 24 ? 'Weekly' : '5 hour'
 }
 
 function normalizeCodex(raw, now = Date.now()) {
@@ -54,10 +67,23 @@ function normalizeCodex(raw, now = Date.now()) {
       updatedAt: now,
     }
   }
-  const windows = [
-    normalizedWindow('5 hour', raw.primary),
-    normalizedWindow('Weekly', raw.secondary),
-  ].filter(Boolean)
+  // Label each window by how long it actually runs, not by its position.
+  //
+  // These were hardcoded 'primary' -> '5 hour' and 'secondary' -> 'Weekly'.
+  // Codex now reports a weekly limit only, so that single window arrives as
+  // `primary` and got drawn as "5 hour ... resets in 4d" — a five-hour window
+  // that resets in four days, which is nonsense on its face. Deriving the name
+  // from the reset horizon is right whichever slot a window shows up in, and
+  // keeps working if Codex changes its mind again.
+  const primary = normalizedWindow(null, raw.primary)
+  const secondary = normalizedWindow(null, raw.secondary)
+  // With both windows present the slots mean what they always meant, and
+  // position is the better evidence. It is the *lone* window that is ambiguous
+  // — Codex now reports a weekly limit only, and it arrives as `primary` — so
+  // only then is the name inferred from how far out it resets.
+  const windows = primary && secondary
+    ? [{ ...primary, label: '5 hour' }, { ...secondary, label: 'Weekly' }]
+    : [primary || secondary].filter(Boolean).map((win) => ({ ...win, label: codexWindowLabel(win, now) }))
   return {
     provider: 'codex',
     displayName: 'Codex',

@@ -56,3 +56,42 @@ test('native usage bridge can scope one process to one provider without changing
   assert.deepEqual(fixture(1_700_000_000_000, 'codex').providers.map((value) => value.provider), ['codex'])
   assert.throws(() => parseArguments(['--provider', 'unknown']), /Usage:/)
 })
+
+test('a lone Codex weekly window is not labelled "5 hour"', () => {
+  // Codex now reports a weekly limit only, and it arrives in the `primary`
+  // slot. Labelling by position drew "5 hour ... resets in 4d" — a five-hour
+  // window resetting in four days.
+  const now = Date.UTC(2026, 7, 3, 0, 0, 0)
+  const fourDaysOut = now / 1000 + 4 * 86_400
+  const value = normalizeCodex(
+    { ok: true, plan: 'pro', primary: { usedPercent: 36, resetsAt: fourDaysOut }, updatedAt: now },
+    now
+  )
+  assert.equal(value.windows.length, 1, 'one reported window stays one window')
+  assert.equal(value.windows[0].label, 'Weekly')
+  assert.equal(value.windows[0].usedPercent, 36)
+})
+
+test('a Codex window resetting within the day is still the 5-hour one', () => {
+  const now = Date.UTC(2026, 7, 3, 0, 0, 0)
+  const threeHoursOut = now / 1000 + 3 * 3_600
+  const value = normalizeCodex(
+    { ok: true, primary: { usedPercent: 10, resetsAt: threeHoursOut }, updatedAt: now },
+    now
+  )
+  assert.equal(value.windows[0].label, '5 hour')
+})
+
+test('both Codex windows keep their own names when both are reported', () => {
+  const now = Date.UTC(2026, 7, 3, 0, 0, 0)
+  const value = normalizeCodex(
+    {
+      ok: true,
+      primary: { usedPercent: 10, resetsAt: now / 1000 + 2 * 3_600 },
+      secondary: { usedPercent: 55, resetsAt: now / 1000 + 5 * 86_400 },
+      updatedAt: now,
+    },
+    now
+  )
+  assert.deepEqual(value.windows.map((w) => w.label), ['5 hour', 'Weekly'])
+})

@@ -70,3 +70,40 @@ final class AccountSignInControllerTests: XCTestCase {
         XCTAssertEqual(message, "Sign-in did not complete (exit code 130).")
     }
 }
+
+/// A reset time is said the way its horizon is useful: a countdown when you
+/// might wait for it, a clock time when you would plan around it.
+final class SubscriptionResetCaptionTests: XCTestCase {
+    private let now = Date(timeIntervalSince1970: 1_785_700_000)
+
+    private func caption(inSeconds: TimeInterval) -> String? {
+        SubscriptionUsageMeter.resetCaption(
+            resetsAt: now.addingTimeInterval(inSeconds).timeIntervalSince1970,
+            now: now
+        )
+    }
+
+    func testMinutesAndHoursCountDown() {
+        XCTAssertEqual(caption(inSeconds: 40 * 60), "in 40m")
+        XCTAssertEqual(caption(inSeconds: 3 * 3_600), "in 3h")
+        XCTAssertEqual(caption(inSeconds: 11 * 3_600), "in 11h")
+    }
+
+    /// Past twelve hours a countdown stops helping: "in 2d" covers a span of
+    /// forty-eight hours, so the clock takes over.
+    func testLongerHorizonsBecomeAClockTime() throws {
+        let sameWeek = try XCTUnwrap(caption(inSeconds: 2 * 86_400))
+        XCTAssertFalse(sameWeek.hasPrefix("in "), "got \(sameWeek)")
+        XCTAssertTrue(sameWeek.contains(":"), "a weekday reset names its time: \(sameWeek)")
+
+        let farOut = try XCTUnwrap(caption(inSeconds: 20 * 86_400))
+        XCTAssertFalse(farOut.hasPrefix("in "), "got \(farOut)")
+    }
+
+    /// An elapsed or missing reset says nothing rather than counting backwards.
+    func testNothingIsSaidWithoutALiveReset() {
+        XCTAssertNil(SubscriptionUsageMeter.resetCaption(resetsAt: nil, now: now))
+        XCTAssertNil(SubscriptionUsageMeter.resetCaption(resetsAt: 0, now: now))
+        XCTAssertNil(caption(inSeconds: -60))
+    }
+}

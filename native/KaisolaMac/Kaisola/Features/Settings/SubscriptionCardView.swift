@@ -218,6 +218,8 @@ struct SubscriptionUsageMeter: View {
     /// content: "Weekly" is the longest label, "100%" the widest number.
     private static let labelWidth: CGFloat = 44
     private static let percentWidth: CGFloat = 34
+    /// Wide enough for the longest form the caption can take ("Wed 11:59 PM").
+    private static let resetWidth: CGFloat = 68
 
     /// One line per window, not two.
     ///
@@ -258,15 +260,17 @@ struct SubscriptionUsageMeter: View {
                     .foregroundStyle(.primary)
                     .frame(width: Self.percentWidth, alignment: .trailing)
             }
-            // Lowest priority: in a narrow card the reset gives up its width to
-            // the bar, which is the part that has to stay readable.
-            if let resets = resetCaption {
-                Text(resets)
-                    .font(.caption2.monospacedDigit())
-                    .foregroundStyle(.tertiary)
-                    .lineLimit(1)
-                    .layoutPriority(-1)
-            }
+            // When a limit comes back is genuinely useful, so it gets a column
+            // of its own rather than whatever the bar leaves over. It had
+            // negative layout priority, which in a narrow card let it truncate
+            // to nothing — the one outcome that makes the information useless.
+            // The bar flexes instead; it has a floor of its own.
+            Text(resetCaption ?? "")
+                .font(.caption2.monospacedDigit())
+                .foregroundStyle(.tertiary)
+                .lineLimit(1)
+                .frame(width: Self.resetWidth, alignment: .trailing)
+                .help(resetDescription ?? "")
         }
         .frame(height: 18)
         .accessibilityElement(children: .ignore)
@@ -291,26 +295,79 @@ struct SubscriptionUsageMeter: View {
         Self.resetCaption(resetsAt: window.resetsAt, now: now)
     }
 
+    private var resetDescription: String? {
+        Self.resetDescription(resetsAt: window.resetsAt, now: now)
+    }
+
     /// Pure, so the switch and its boundary are testable without a view.
     ///
     /// `nonisolated` because it is: a `View` is main-actor isolated and its
     /// statics inherit that, which made a synchronous test call an isolation
     /// error under CI's stricter concurrency settings while building fine
     /// locally. Nothing here touches actor state.
-    nonisolated static func resetCaption(resetsAt: Double?, now: Date) -> String? {
+    nonisolated static func resetCaption(
+        resetsAt: Double?,
+        now: Date,
+        calendar: Calendar = .autoupdatingCurrent
+    ) -> String? {
         guard let resetsAt, resetsAt > 0 else { return nil }
         let date = Date(timeIntervalSince1970: resetsAt)
         let remaining = date.timeIntervalSince(now)
         guard remaining > 0 else { return nil }
+
+        // Under an hour you are deciding whether to wait, so the countdown is
+        // the answer.
         if remaining < 3_600 { return "in \(Int(remaining / 60))m" }
         if remaining < 43_200 { return "in \(Int(remaining / 3_600))h" }
 
+        // Past that you are planning around it, and a clock time is the answer.
+        // Minutes are kept only when they carry information: a limit that comes
+        // back at 3 PM should say "3 PM", not "3:00 PM".
+        let minute = calendar.component(.minute, from: date)
+        let clock = minute == 0 ? "j" : "j:mm"
+        let sameDay = calendar.isDate(date, inSameDayAs: now)
+        // Today needs no day name; this week wants the weekday; beyond that
+        // only the date is meaningful.
+        let template = sameDay ? clock
+            : (remaining < 6 * 86_400 ? "EEE \(clock)" : "MMM d")
+
         let formatter = DateFormatter()
         formatter.locale = .autoupdatingCurrent
-        // Within the week the weekday names it; beyond that the date does.
-        formatter.setLocalizedDateFormatFromTemplate(
-            remaining < 6 * 86_400 ? "EEE j:mm" : "MMM d"
-        )
+        formatter.calendar = calendar
+        // The same zone the "is this today" question was answered in. Setting
+        // only the calendar left the formatter on the system zone, so a
+        // caption could say one day while `isDate(inSameDayAs:)` had decided
+        // another.
+        formatter.timeZone = calendar.timeZone
+        formatter.setLocalizedDateFormatFromTemplate(template)
         return formatter.string(from: date)
+    }
+
+    /// The same moment, spelled out, for the row's tooltip.
+    ///
+    /// The row has to stay narrow enough that the bar survives, so it says
+    /// "Wed 3 PM". Hovering gives the unabbreviated sentence — this is
+    /// information worth being able to read exactly, which is why it is
+    /// available in full rather than only in shorthand.
+    nonisolated static func resetDescription(
+        resetsAt: Double?,
+        now: Date,
+        calendar: Calendar = .autoupdatingCurrent
+    ) -> String? {
+        guard let resetsAt, resetsAt > 0 else { return nil }
+        let date = Date(timeIntervalSince1970: resetsAt)
+        guard date > now else { return nil }
+
+        let formatter = DateFormatter()
+        formatter.locale = .autoupdatingCurrent
+        formatter.calendar = calendar
+        formatter.timeZone = calendar.timeZone
+        formatter.dateStyle = .full
+        formatter.timeStyle = .short
+
+        let relative = RelativeDateTimeFormatter()
+        relative.locale = .autoupdatingCurrent
+        relative.unitsStyle = .full
+        return "Resets \(formatter.string(from: date)) — \(relative.localizedString(for: date, relativeTo: now))"
     }
 }

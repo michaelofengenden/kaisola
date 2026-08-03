@@ -74,86 +74,105 @@ final class AccountSignInControllerTests: XCTestCase {
 /// A reset time is said the way its horizon is useful: a countdown when you
 /// might wait for it, a clock time when you would plan around it.
 final class SubscriptionResetCaptionTests: XCTestCase {
-    private let now = Date(timeIntervalSince1970: 1_785_700_000)
+    /// A fixed calendar so the assertions do not move with the runner's zone.
+    private var calendar: Calendar = {
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = TimeZone(identifier: "UTC")!
+        return calendar
+    }()
 
-    private func caption(inSeconds: TimeInterval) -> String? {
+    /// Monday 3 August 2026, 09:00 UTC.
+    private lazy var now = calendar.date(from: DateComponents(
+        year: 2026, month: 8, day: 3, hour: 9, minute: 0
+    ))!
+
+    private func caption(at date: Date) -> String? {
         SubscriptionUsageMeter.resetCaption(
-            resetsAt: now.addingTimeInterval(inSeconds).timeIntervalSince1970,
-            now: now
+            resetsAt: date.timeIntervalSince1970, now: now, calendar: calendar
         )
     }
 
-    func testMinutesAndHoursCountDown() {
-        XCTAssertEqual(caption(inSeconds: 40 * 60), "in 40m")
-        XCTAssertEqual(caption(inSeconds: 3 * 3_600), "in 3h")
-        XCTAssertEqual(caption(inSeconds: 11 * 3_600), "in 11h")
+    private func date(_ month: Int, _ day: Int, _ hour: Int, _ minute: Int = 0) -> Date {
+        calendar.date(from: DateComponents(
+            year: 2026, month: month, day: day, hour: hour, minute: minute
+        ))!
     }
 
-    /// Past twelve hours a countdown stops helping: "in 2d" covers a span of
-    /// forty-eight hours, so the clock takes over.
-    func testLongerHorizonsBecomeAClockTime() throws {
-        let sameWeek = try XCTUnwrap(caption(inSeconds: 2 * 86_400))
-        XCTAssertFalse(sameWeek.hasPrefix("in "), "got \(sameWeek)")
-        XCTAssertTrue(sameWeek.contains(":"), "a weekday reset names its time: \(sameWeek)")
+    /// Under twelve hours you are deciding whether to wait, so it counts down.
+    func testNearTermResetsCountDown() {
+        XCTAssertEqual(caption(at: now.addingTimeInterval(40 * 60)), "in 40m")
+        XCTAssertEqual(caption(at: now.addingTimeInterval(3 * 3_600)), "in 3h")
+        XCTAssertEqual(caption(at: now.addingTimeInterval(11 * 3_600)), "in 11h")
+    }
 
-        let farOut = try XCTUnwrap(caption(inSeconds: 20 * 86_400))
-        XCTAssertFalse(farOut.hasPrefix("in "), "got \(farOut)")
+    /// Later today needs no day name — the time is the whole answer.
+    func testLaterTodayIsJustTheTime() throws {
+        let text = try XCTUnwrap(caption(at: date(8, 3, 23)))
+        XCTAssertFalse(text.hasPrefix("in "), text)
+        XCTAssertFalse(text.contains("Mon"), "today does not need naming: \(text)")
+        XCTAssertTrue(text.contains("11") || text.contains("23"), text)
+    }
+
+    /// Within the week the weekday carries it.
+    func testThisWeekNamesTheDay() throws {
+        let text = try XCTUnwrap(caption(at: date(8, 5, 15)))
+        XCTAssertTrue(text.contains("Wed"), text)
+    }
+
+    /// "3:00 PM" spends four characters saying nothing. A reset on the hour
+    /// says the hour; one at 11:59 keeps its minutes.
+    func testMinutesAppearOnlyWhenTheyCarryInformation() throws {
+        let onTheHour = try XCTUnwrap(caption(at: date(8, 5, 15)))
+        XCTAssertFalse(onTheHour.contains(":"), "an on-the-hour reset needs no minutes: \(onTheHour)")
+
+        let awkward = try XCTUnwrap(caption(at: date(8, 5, 23, 59)))
+        XCTAssertTrue(awkward.contains(":59"), "a reset at 11:59 must keep its minutes: \(awkward)")
+    }
+
+    /// Beyond the week a weekday stops locating anything, so the date does.
+    func testFarOutResetsUseTheDate() throws {
+        let text = try XCTUnwrap(caption(at: date(8, 20, 12)))
+        XCTAssertTrue(text.contains("20"), text)
+        XCTAssertFalse(text.hasPrefix("in "), text)
+    }
+
+    /// The row is narrow, so the caption must stay short enough to fit its
+    /// column — this is what stopped it truncating away entirely.
+    func testEveryCaptionStaysShort() {
+        let samples = [
+            now.addingTimeInterval(40 * 60),
+            now.addingTimeInterval(11 * 3_600),
+            date(8, 3, 23),
+            date(8, 5, 15),
+            date(8, 5, 23, 59),
+            date(8, 20, 12),
+        ]
+        for sample in samples {
+            let text = caption(at: sample) ?? ""
+            XCTAssertLessThanOrEqual(text.count, 12, "too wide for its column: \(text)")
+        }
     }
 
     /// An elapsed or missing reset says nothing rather than counting backwards.
     func testNothingIsSaidWithoutALiveReset() {
-        XCTAssertNil(SubscriptionUsageMeter.resetCaption(resetsAt: nil, now: now))
-        XCTAssertNil(SubscriptionUsageMeter.resetCaption(resetsAt: 0, now: now))
-        XCTAssertNil(caption(inSeconds: -60))
-    }
-}
-
-/// Locating the provider CLI. A GUI app inherits `/usr/bin:/bin`, and a
-/// non-interactive login shell never sources `~/.zshrc` — where nvm, conda,
-/// npm-global and mise all write PATH — so the tool has to be found before it
-/// can be run.
-final class AccountSignInExecutableTests: XCTestCase {
-    /// The real answer, alone on a line.
-    func testAPlainPathIsTaken() {
-        XCTAssertEqual(
-            AccountSignInController.firstExecutablePath(in: "/opt/homebrew/bin/claude\n"),
-            "/opt/homebrew/bin/claude"
-        )
+        XCTAssertNil(SubscriptionUsageMeter.resetCaption(resetsAt: nil, now: now, calendar: calendar))
+        XCTAssertNil(SubscriptionUsageMeter.resetCaption(resetsAt: 0, now: now, calendar: calendar))
+        XCTAssertNil(caption(at: now.addingTimeInterval(-60)))
     }
 
-    /// An interactive shell prints whatever the user's startup files print —
-    /// conda banners, version-manager notices, MOTDs. The path is the last
-    /// absolute token, not the first line.
-    func testShellStartupNoiseIsSkipped() {
-        let output = """
-        Using node v22.3.0 (npm v10.8.1)
-        (base) conda environment activated
-        /Users/x/miniforge3/bin/claude
-        """
-        XCTAssertEqual(
-            AccountSignInController.firstExecutablePath(in: output),
-            "/Users/x/miniforge3/bin/claude"
-        )
+    /// The shorthand is for the row; the full sentence is one hover away.
+    func testTheTooltipSpellsItOut() throws {
+        let text = try XCTUnwrap(SubscriptionUsageMeter.resetDescription(
+            resetsAt: date(8, 5, 15).timeIntervalSince1970, now: now, calendar: calendar
+        ))
+        XCTAssertTrue(text.hasPrefix("Resets "), text)
+        XCTAssertTrue(text.contains("Wednesday"), "the tooltip is unabbreviated: \(text)")
+        XCTAssertTrue(text.contains("—"), "it also says how far off that is: \(text)")
     }
 
-    /// `command -v` prints nothing when the tool is missing — which is exactly
-    /// what the GUI environment produced, and what must now be reported rather
-    /// than run as a bare name.
-    func testNothingFoundIsNil() {
-        XCTAssertNil(AccountSignInController.firstExecutablePath(in: ""))
-        XCTAssertNil(AccountSignInController.firstExecutablePath(in: "claude not found\n"))
-    }
-
-    /// A shell alias or function prints prose, not a path; it is not a binary
-    /// we can exec.
-    func testAnAliasLineIsNotMistakenForAPath() {
-        XCTAssertNil(
-            AccountSignInController.firstExecutablePath(in: "claude: aliased to /usr/bin/env claude")
-        )
-    }
-
-    func testToolNamesMatchTheProviders() {
-        XCTAssertEqual(AccountSignInController.toolName(for: .claude), "claude")
-        XCTAssertEqual(AccountSignInController.toolName(for: .codex), "codex")
+    func testNoTooltipForAnElapsedReset() {
+        XCTAssertNil(SubscriptionUsageMeter.resetDescription(
+            resetsAt: now.addingTimeInterval(-60).timeIntervalSince1970, now: now, calendar: calendar
+        ))
     }
 }

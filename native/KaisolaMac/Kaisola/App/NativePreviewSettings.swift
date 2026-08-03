@@ -2039,13 +2039,24 @@ enum DesktopBackdropRenderer {
     /// just above what the blur removed rather than a fixed pixel size that
     /// would mean something different at every `stillWidth`.
     ///
-    /// 0.6 rather than more: at 1.0 the worst-patch secondary in dark falls back
-    /// to the shipped 4.51 and stops improving, and past ~1.8 the upscale to the
-    /// surface starts ringing — measured, the dark worst patch drops to 4.32,
-    /// *below* the 4.5 floor, which the still-side cap cannot see because the
-    /// overshoot is created by the interpolation and not by the bake.
+    /// **1.2**, doubled from 0.6.
+    ///
+    /// 0.6 left the composite's luminance spread at about 0.095 on a real
+    /// desktop — structure that is mathematically present and invisible in
+    /// practice, which is why the canvas read as flat paint even in Crisp.
+    /// Michael: "the glass totally erases all the details/texture of the
+    /// wallpaper, even on crisp/clear mode."
+    ///
+    /// The bound above is unchanged and still governs: past ~1.8 the upscale to
+    /// the surface starts ringing, and the measured dark worst patch drops to
+    /// 4.32 — *below* the 4.5 floor. Two things are worth stating plainly about
+    /// that number. It is not what the still-side cap measures, because the
+    /// overshoot is created by the interpolation rather than by the bake; and
+    /// the 120-test suite passes at 1.8 for exactly that reason. Passing tests
+    /// are therefore **not** evidence of safety here, so this sits at two
+    /// thirds of the documented edge rather than against it.
     static let localContrastRadiusFactor: Double = 1.4
-    static let localContrastIntensity: Double = 0.6
+    static let localContrastIntensity: Double = 1.2
     /// A slight saturation *cut*.
     ///
     /// This was 1.3, from the era when a heavy veil ate most of the desktop's

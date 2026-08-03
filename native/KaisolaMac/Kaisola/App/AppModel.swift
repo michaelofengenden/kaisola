@@ -2896,6 +2896,15 @@ final class AppModel: ObservableObject {
             ToastCenter.shared.show("That account does not match \(agent.name).", style: .error)
             return
         }
+        // Say it before the first turn fails rather than after. Advisory only:
+        // starting on a spent account stays allowed, because the reading can be
+        // stale and the call is not Kaisola's to make.
+        if let warning = SessionAccountBinding.headroomWarning(
+            for: accountBinding,
+            readings: UsageCenter.shared.planUsage
+        ) {
+            ToastCenter.shared.show(warning, style: .info, duration: 5)
+        }
         guard appendChat(
             id: chatID,
             agent: agent,

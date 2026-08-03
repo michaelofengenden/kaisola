@@ -736,8 +736,23 @@ struct FilePreviewView: View {
         ToastCenter.shared.show("Copied \((loadedURL ?? url).lastPathComponent)", style: .success)
     }
 
+    /// Reveal the file, or the nearest folder that is actually there.
+    ///
+    /// `activateFileViewerSelecting` with a path that does not exist opens
+    /// Finder selecting nothing, which reads exactly like a broken button —
+    /// and this tab can be showing a file that was moved, deleted, or cited by
+    /// a name that never resolved. Landing in the containing folder is a real
+    /// answer; a blank Finder window is not.
     private func revealCurrentFileInFinder() {
-        NSWorkspace.shared.activateFileViewerSelecting([loadedURL ?? url])
+        let target = loadedURL ?? url
+        guard let reachable = TerminalFileLinkResolver.revealTarget(for: target) else {
+            ToastCenter.shared.show(
+                "\(target.lastPathComponent) isn’t on disk any more.",
+                style: .error
+            )
+            return
+        }
+        NSWorkspace.shared.activateFileViewerSelecting([reachable])
     }
 
     private var supportsZoom: Bool {

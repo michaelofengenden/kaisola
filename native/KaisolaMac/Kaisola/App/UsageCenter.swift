@@ -112,6 +112,83 @@ struct SessionAccountBinding: Codable, Equatable, Hashable, Sendable {
         ).normalized
     }
 
+    /// Whether a session is about to start on an account with nothing left,
+    /// and which account does have room.
+    ///
+    /// Kaisola reads every account's remaining limit and then took no notice of
+    /// it at launch: an account sitting at 100% on its weekly window would
+    /// accept a new session and fail on the first turn, while another
+    /// subscription sat idle. Knowing and not saying is the worst of the two.
+    ///
+    /// Pure, and handed its readings rather than reaching for them, so the rule
+    /// is testable without a probe or a signed-in account.
+    struct HeadroomAdvice: Equatable {
+        /// Highest percentage used across the account's windows — the binding
+        /// constraint, which is what "spent" actually means. An account at 0%
+        /// on five hours and 100% on its weekly bucket is spent.
+        let usedPercent: Double
+        /// An account of the same provider with meaningfully more room.
+        let alternativeLabel: String?
+        let alternativeUsedPercent: Double?
+    }
+
+    /// At or above this, an account counts as spent. Not 100: the last few
+    /// percent buy a turn or two, and hearing about it after the failure is no
+    /// use.
+    static let exhaustedPercent: Double = 95
+
+    /// An alternative is only worth naming if it is this much freer. Trading a
+    /// 96% account for a 94% one is churn, not advice.
+    static let worthSwitchingMargin: Double = 20
+
+    static func headroomAdvice(
+        for binding: SessionAccountBinding,
+        readings: [UsageCenter.ProviderPlanUsage]
+    ) -> HeadroomAdvice? {
+        func worst(_ reading: UsageCenter.ProviderPlanUsage) -> Double? {
+            reading.windows.compactMap(\.usedPercent).max()
+        }
+        let current = readings.first {
+            $0.provider == binding.provider.rawValue
+                && $0.profileID != nil
+                && $0.profileLabel == binding.label
+        }
+        guard let current, let used = worst(current), used >= exhaustedPercent else { return nil }
+
+        let ceiling = used - worthSwitchingMargin
+        var bestLabel: String?
+        var bestUsed: Double?
+        for reading in readings {
+            guard reading.provider == binding.provider.rawValue else { continue }
+            guard let label = reading.profileLabel, !label.isEmpty, label != binding.label else { continue }
+            guard let value = worst(reading), value <= ceiling else { continue }
+            if bestUsed == nil || value < bestUsed! {
+                bestUsed = value
+                bestLabel = label
+            }
+        }
+
+        return HeadroomAdvice(
+            usedPercent: used,
+            alternativeLabel: bestLabel,
+            alternativeUsedPercent: bestUsed
+        )
+    }
+
+    /// One sentence a person can act on, or nothing.
+    static func headroomWarning(
+        for binding: SessionAccountBinding,
+        readings: [UsageCenter.ProviderPlanUsage]
+    ) -> String? {
+        guard let advice = headroomAdvice(for: binding, readings: readings) else { return nil }
+        let used = Int(advice.usedPercent.rounded())
+        guard let label = advice.alternativeLabel,
+              let alternative = advice.alternativeUsedPercent else {
+            return "\(binding.label) is \(used)% used."
+        }
+        return "\(binding.label) is \(used)% used. \(label) is at \(Int(alternative.rounded()))%."
+    }
+
     static func applying(
         _ binding: SessionAccountBinding?,
         to environment: [String: String]

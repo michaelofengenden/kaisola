@@ -1258,15 +1258,40 @@ struct NativeTerminalSurface: NSViewRepresentable {
                 // built-in preview via the shell rather than executing/revealing
                 // the file through Launch Services. RootShellView observes
                 // `.kaisolaOpenFileLink` and drives its file preview.
-                var userInfo: [AnyHashable: Any] = ["url": fileURL]
-                if let line { userInfo["line"] = line }
-                userInfo["workspaceHint"] = workingDirectory
-                    ?? fileURL.deletingLastPathComponent()
-                NotificationCenter.default.post(
-                    name: .kaisolaOpenFileLink,
-                    object: nil,
-                    userInfo: userInfo
+                //
+                // An agent cites a file by the name it used in prose, which is
+                // rarely a path relative to the session's directory — so the
+                // citation is resolved against the project before it is opened,
+                // and a click that cannot find its file says so instead of
+                // opening a tab onto nothing.
+                let resolved = TerminalFileLinkResolver.resolve(
+                    fileURL,
+                    projectRoot: workingDirectory
                 )
+                switch resolved {
+                case let .found(url):
+                    var userInfo: [AnyHashable: Any] = ["url": url]
+                    if let line { userInfo["line"] = line }
+                    userInfo["workspaceHint"] = workingDirectory
+                        ?? url.deletingLastPathComponent()
+                    NotificationCenter.default.post(
+                        name: .kaisolaOpenFileLink,
+                        object: nil,
+                        userInfo: userInfo
+                    )
+                case let .ambiguous(name, count):
+                    ToastCenter.shared.show(
+                        "\(count) files are named \(name). Open the one you want from Files.",
+                        style: .info,
+                        duration: 4
+                    )
+                case let .missing(name):
+                    ToastCenter.shared.show(
+                        "Couldn’t find \(name) in this project.",
+                        style: .error,
+                        duration: 4
+                    )
+                }
             }
         }
         func bell(source: TerminalView) {

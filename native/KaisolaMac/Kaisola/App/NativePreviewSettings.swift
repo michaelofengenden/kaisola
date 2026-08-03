@@ -2750,6 +2750,52 @@ extension DesktopBackdropRenderer {
     /// A hard ceiling on the still's perceived colourfulness, so an extreme
     /// desktop cannot ask the solve for a saturation that only gamut clipping
     /// could deliver.
+    /// The saturation a wallpaper actually *reads* as, rather than its average.
+    ///
+    /// A plain mean asks "how colourful is the typical pixel", and for most real
+    /// desktops the honest answer is "not at all". A photograph of near-black
+    /// basalt with green moss along its ridges is ~95% dark grey rock, so the
+    /// mean lands near 0.08 — times a 0.162 share, an effective chroma of 0.013
+    /// — and the still comes out grey with the green averaged out of existence.
+    /// The green is the only colour anyone would name if asked about that
+    /// picture.
+    ///
+    /// This weights every pixel by its own saturation, so the measure answers
+    /// "where is this picture's colour, and how strong is it there" (`Σs²/Σs`).
+    /// Grey pixels contribute to neither numerator nor denominator, so they
+    /// dilute nothing.
+    ///
+    /// Two properties make it safe rather than merely louder:
+    ///
+    /// * A genuinely grey desktop still measures **zero** and stays grey —
+    ///   there is no colour to find, as opposed to a little colour being
+    ///   drowned.
+    /// * A *uniformly* coloured desktop measures exactly its own saturation, so
+    ///   nothing that already worked is pushed further.
+    ///
+    /// It can therefore only raise the reading for a picture whose colour is
+    /// concentrated rather than spread — which is precisely the case that was
+    /// broken. Michael: "it doesn't need to be exactly 1:1 translucent, it could
+    /// take peaks and move them."
+    ///
+    /// Pure, so the three properties above are tested rather than argued.
+    static func characteristicSaturation(
+        _ pixels: [(red: Double, green: Double, blue: Double)]
+    ) -> Double {
+        var weighted = 0.0
+        var weight = 0.0
+        for pixel in pixels {
+            let peak = max(pixel.red, max(pixel.green, pixel.blue))
+            guard peak > 0.004 else { continue }
+            let base = min(pixel.red, min(pixel.green, pixel.blue))
+            let saturation = (peak - base) / peak
+            weighted += saturation * saturation
+            weight += saturation
+        }
+        guard weight > 0.0001 else { return 0 }
+        return weighted / weight
+    }
+
     static let okSaturationCeiling: Double = 0.24
     /// And a ceiling on the filter input itself, for the same reason from the
     /// other side.
@@ -2831,11 +2877,9 @@ extension DesktopBackdropRenderer {
         // is hue-blind, which is the pairing the invariance needs.
         let chromaTarget = min(
             okSaturationCeiling,
-            pixels.reduce(0.0) { total, pixel in
-                let peak = max(pixel.red, max(pixel.green, pixel.blue))
-                let floor = min(pixel.red, min(pixel.green, pixel.blue))
-                return total + (peak > 0.004 ? (peak - floor) / peak : 0)
-            } / Double(pixels.count) * desktopChromaShare(isDark: isDark) * max(0, chromaScale)
+            characteristicSaturation(pixels)
+                * desktopChromaShare(isDark: isDark)
+                * max(0, chromaScale)
         )
 
         // The map is `(luma + delta·saturation)·gain + offset` per channel, and

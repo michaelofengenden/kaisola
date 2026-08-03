@@ -26,69 +26,9 @@ struct ProjectAccountsSection: View {
     private let usageAccountStore = UsageAccountStore()
 
     var body: some View {
-        Section("Per-Project Account") {
-            if let projectID {
-                accountDirectoryRow(
-                    title: "Claude",
-                    environmentName: "CLAUDE_CONFIG_DIR",
-                    provider: .claude,
-                    value: $claudeConfigDir,
-                    projectID: projectID
-                )
-                accountDirectoryRow(
-                    title: "Codex",
-                    environmentName: "CODEX_HOME",
-                    provider: .codex,
-                    value: $codexHome,
-                    projectID: projectID
-                )
-                Text("Overrides the app-wide account for sessions in \(projectName ?? "this project") only. Leave a field blank to keep using the app default above for that CLI.")
-                    .font(.caption).foregroundStyle(.secondary)
-            } else {
-                Text("Open a project to give it its own Claude/Codex account. Its agent sessions then use these directories instead of the app-wide account above.")
-                    .font(.caption).foregroundStyle(.secondary)
-            }
-        }
-
-        Section("Named Accounts") {
-            if usageProfiles.isEmpty {
-                Label("Add each subscription once, then view all of their exact limits together in Usage.", systemImage: "person.2")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-            } else {
-                ForEach(usageProfiles) { profile in
-                    accountRow(profile)
-                }
-            }
-
-            Picker("Provider", selection: $newProvider) {
-                ForEach(UsageAccountProfile.Provider.allCases) { provider in
-                    Text(provider.displayName).tag(provider)
-                }
-            }
-            .pickerStyle(.segmented)
-            .onChange(of: newProvider) { _, _ in accountError = nil }
-            TextField("Account label", text: $newLabel, prompt: Text("Work, Personal, Research…"))
-                .onChange(of: newLabel) { _, _ in accountError = nil }
-            TextField(
-                "Account directory",
-                text: $newDirectory,
-                prompt: Text(suggestedDirectory ?? newProvider.defaultDirectory)
-            )
-            .onChange(of: newDirectory) { _, _ in accountError = nil }
-            if let accountError {
-                Text(accountError)
-                    .font(.caption)
-                    .foregroundStyle(KaisolaStatusTone.failed.foregroundColor)
-            }
-            HStack {
-                Text("Only the label and directory are stored. Tokens remain in the provider's own credential files.")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                Spacer()
-                Button("Add Account") { addProfile() }
-                    .disabled(newLabel.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
-            }
+        VStack(spacing: 16) {
+            namedAccountsCard
+            perProjectCard
         }
         // A fresh load whenever the active project changes underneath the window.
         .onAppear {
@@ -141,34 +81,6 @@ struct ProjectAccountsSection: View {
         )
     }
 
-    @ViewBuilder
-    private func accountDirectoryRow(
-        title: String,
-        environmentName: String,
-        provider: UsageAccountProfile.Provider,
-        value: Binding<String>,
-        projectID: String
-    ) -> some View {
-        HStack(spacing: 8) {
-            TextField(environmentName, text: value, prompt: Text("app default"))
-                .onSubmit { save(projectID) }
-            if usageProfiles.contains(where: { $0.provider == provider }) {
-                Menu {
-                    Button("App Default") { value.wrappedValue = "" }
-                    Divider()
-                    ForEach(usageProfiles.filter { $0.provider == provider }) { profile in
-                        Button(profile.label) { value.wrappedValue = profile.directory }
-                    }
-                } label: {
-                    Label("Choose \(title)", systemImage: "person.crop.circle")
-                        .labelStyle(.iconOnly)
-                }
-                .menuIndicator(.hidden)
-                .help("Choose a named \(title) account")
-            }
-        }
-    }
-
     private var suggestedDirectory: String? {
         UsageAccountStore.suggestedDirectory(provider: newProvider, label: newLabel)
     }
@@ -211,37 +123,65 @@ struct ProjectAccountsSection: View {
         NotificationCenter.default.post(name: .kaisolaUsageAccountsChanged, object: nil)
     }
 
-    /// One named account: what it is, where it keeps its credentials, and the
-    /// two things you can do to it.
+    // MARK: - Cards
+
+    /// Every subscription, and the one place you add another.
     ///
-    /// Extracted from the `Section` body because the whole section became one
-    /// expression the type-checker gave up on.
-    private func accountRow(_ profile: UsageAccountProfile) -> some View {
-        HStack(spacing: 10) {
-            Image(systemName: profile.provider == .claude ? "bubble.left.and.text.bubble.right" : "terminal")
-                .frame(width: 18)
-                .foregroundStyle(.secondary)
-            VStack(alignment: .leading, spacing: 2) {
-                HStack(spacing: 6) {
-                    Text(profile.label)
-                        .font(.callout.weight(.medium))
-                    Text(profile.provider.displayName)
-                        .font(.caption2.weight(.medium))
-                        .foregroundStyle(.secondary)
+    /// This section used to be raw `Form`/`Section` while General, Terminal and
+    /// Updates were built from `SettingsCard`/`SettingsRow` — two visual
+    /// languages inside one window, which is what made Settings read as
+    /// unfinished here. It now speaks the same one.
+    private var namedAccountsCard: some View {
+        SettingsCard(title: "Named accounts", symbol: "person.2") {
+            if usageProfiles.isEmpty {
+                Text("Add each subscription once. Every account keeps its own credentials, and Usage shows their limits side by side.")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.horizontal, 16)
+                    .padding(.vertical, 14)
+            } else {
+                ForEach(Array(usageProfiles.enumerated()), id: \.element.id) { index, profile in
+                    if index > 0 { SettingsDivider() }
+                    accountRow(profile)
                 }
+            }
+            SettingsDivider()
+            addAccountRow
+        }
+    }
+
+    /// One named account: what it is, where its credentials live, and the two
+    /// things you can do to it.
+    ///
+    /// The mark is the same one the sidebar draws, so a Claude account looks
+    /// like Claude in both places. It used to be a speech bubble here and a
+    /// starburst there, which made two views of one account look like two
+    /// different things.
+    private func accountRow(_ profile: UsageAccountProfile) -> some View {
+        HStack(spacing: 12) {
+            QuietIdentityMarkView(
+                identity: profile.provider == .claude ? .claude : .openai,
+                size: 18
+            )
+            .frame(width: 22)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(profile.label)
+                    .font(.callout.weight(.medium))
+                    .lineLimit(1)
                 Text(profile.directory)
                     .font(.caption.monospaced())
-                    .foregroundStyle(.tertiary)
+                    .foregroundStyle(.secondary)
                     .lineLimit(1)
                     .truncationMode(.middle)
             }
-            Spacer()
+            Spacer(minLength: 12)
             // Sign-in belongs beside the account it signs in, not one tab away
             // under Usage. Adding a subscription and logging into it are one
             // intention; splitting them across two screens is why five logins
             // could go into one directory without a single new card appearing.
             Button("Sign In") { signingIn = profile }
-                .buttonStyle(.bordered)
                 .controlSize(.small)
                 .accessibilityLabel("Sign in to \(profile.label)")
             Button(role: .destructive) { pendingRemoval = profile } label: {
@@ -252,6 +192,122 @@ struct ProjectAccountsSection: View {
             .help("Remove this account from Kaisola; its provider files stay on disk")
             .accessibilityLabel("Remove account \(profile.label)")
         }
+        .padding(.horizontal, 16)
+        .frame(minHeight: 58)
+    }
+
+    /// Adding an account is a label and a provider; the directory is derived
+    /// unless you insist otherwise, which is why it sits behind a placeholder
+    /// rather than demanding a path up front.
+    private var addAccountRow: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(spacing: 10) {
+                Picker("", selection: $newProvider) {
+                    ForEach(UsageAccountProfile.Provider.allCases) { provider in
+                        Text(provider.displayName).tag(provider)
+                    }
+                }
+                .pickerStyle(.segmented)
+                .labelsHidden()
+                .fixedSize()
+                .onChange(of: newProvider) { _, _ in accountError = nil }
+
+                TextField("Label", text: $newLabel, prompt: Text("Work, Personal, Research…"))
+                    .textFieldStyle(.roundedBorder)
+                    .onChange(of: newLabel) { _, _ in accountError = nil }
+
+                Button("Add") { addProfile() }
+                    .controlSize(.small)
+                    .disabled(newLabel.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+            }
+            TextField(
+                "",
+                text: $newDirectory,
+                prompt: Text(suggestedDirectory ?? newProvider.defaultDirectory)
+            )
+            .textFieldStyle(.roundedBorder)
+            .font(.caption.monospaced())
+            .onChange(of: newDirectory) { _, _ in accountError = nil }
+            .accessibilityLabel("Account directory")
+
+            if let accountError {
+                Label(accountError, systemImage: "exclamationmark.triangle.fill")
+                    .font(.caption)
+                    .foregroundStyle(KaisolaStatusTone.failed.foregroundColor)
+                    .fixedSize(horizontal: false, vertical: true)
+            } else {
+                Text("Kaisola stores only the label and this directory. Credentials stay with the provider.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 12)
+    }
+
+    /// Which account this project's sessions actually run as.
+    private var perProjectCard: some View {
+        SettingsCard(title: "This project", symbol: "folder") {
+            if let projectID {
+                SettingsRow(
+                    title: "Claude account",
+                    detail: projectName.map { "Used by Claude sessions in \($0)" } ?? "Used by Claude sessions here",
+                    symbol: "person.crop.circle"
+                ) {
+                    accountPicker(provider: .claude, value: $claudeConfigDir, projectID: projectID)
+                }
+                SettingsDivider()
+                SettingsRow(
+                    title: "Codex account",
+                    detail: projectName.map { "Used by Codex sessions in \($0)" } ?? "Used by Codex sessions here",
+                    symbol: "person.crop.circle"
+                ) {
+                    accountPicker(provider: .codex, value: $codexHome, projectID: projectID)
+                }
+            } else {
+                Text("Open a project to give it its own account. Until then, sessions use the app default.")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.horizontal, 16)
+                    .padding(.vertical, 14)
+            }
+        }
+    }
+
+    /// Pick a named account by name. The directory is what actually gets
+    /// stored, but nobody thinks in config directories — they think "the work
+    /// one" — so the menu shows labels and keeps the path in the caption.
+    private func accountPicker(
+        provider: UsageAccountProfile.Provider,
+        value: Binding<String>,
+        projectID: String
+    ) -> some View {
+        let matching = usageProfiles.filter { $0.provider == provider }
+        let selected = matching.first { $0.directory == value.wrappedValue }
+        return Menu {
+            Button("App Default") {
+                value.wrappedValue = ""
+                save(projectID)
+            }
+            if !matching.isEmpty {
+                Divider()
+                ForEach(matching) { profile in
+                    Button(profile.label) {
+                        value.wrappedValue = profile.directory
+                        save(projectID)
+                    }
+                }
+            }
+        } label: {
+            Text(selected?.label ?? (value.wrappedValue.isEmpty ? "App Default" : value.wrappedValue))
+                .lineLimit(1)
+                .truncationMode(.middle)
+        }
+        .menuStyle(.borderlessButton)
+        .frame(width: 170)
+        .accessibilityLabel("\(provider.displayName) account for this project")
     }
 
     private func removeProfile(_ profile: UsageAccountProfile) {

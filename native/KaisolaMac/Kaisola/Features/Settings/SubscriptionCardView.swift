@@ -53,11 +53,14 @@ struct SubscriptionCardView: View {
     private var header: some View {
         HStack(spacing: 9) {
             ZStack(alignment: .topLeading) {
-                Image(systemName: profile.provider == .claude ? "sparkle" : "chevron.left.forwardslash.chevron.right")
-                    .font(.system(size: 12, weight: .semibold))
-                    .foregroundStyle(.secondary)
-                    .frame(width: 22, height: 22)
-                    .background(.quaternary.opacity(0.5), in: RoundedRectangle(cornerRadius: 6, style: .continuous))
+                // The mark the sidebar and the Accounts list both draw. This was
+                // a generic `sparkle` / `chevron` pair, so one account wore a
+                // different face on each surface that showed it.
+                QuietIdentityMarkView(
+                    identity: profile.provider == .claude ? .claude : .openai,
+                    size: 16
+                )
+                .frame(width: 22, height: 22)
                 // Four states shared one tinted dot, and the red one — the
                 // account that needs attention — had no text anywhere to fall
                 // back on. Each state now carries its own glyph and its own

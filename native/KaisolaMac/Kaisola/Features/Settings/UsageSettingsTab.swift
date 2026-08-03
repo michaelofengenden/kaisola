@@ -30,13 +30,32 @@ struct UsageSettingsTab: View {
         }
     }
 
-    /// Sign in *as this account*, in a Settings sheet.
-    ///
-    /// This used to post `.kaisolaRunInTerminal`, which opened a terminal in
-    /// whichever project happened to be in front — a stray session in an
-    /// unrelated project every time you signed in. `AccountSignInSheet` drives
-    /// the same command over pipes instead, so the login stays where the
-    /// account lives.
+    /// What "Account limits" shows before there is anything to show.
+    @ViewBuilder
+    private var emptyAccountState: some View {
+        if usage.isRefreshingPlanUsage {
+            HStack(spacing: 9) {
+                ProgressView().controlSize(.small)
+                Text("Reading provider account limits…")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+            }
+        } else if let error = usage.planUsageError {
+            Label(error, systemImage: "exclamationmark.triangle")
+                .font(.callout)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+        } else {
+            Label(
+                "Add a Claude or Codex account under Accounts to see its plan and limits here.",
+                systemImage: "person.2"
+            )
+            .font(.callout)
+            .foregroundStyle(.secondary)
+            .fixedSize(horizontal: false, vertical: true)
+        }
+    }
+
     private func reveal(_ profile: UsageAccountProfile) {
         NSWorkspace.shared.activateFileViewerSelecting([
             URL(fileURLWithPath: profile.expandedDirectory)
@@ -44,93 +63,95 @@ struct UsageSettingsTab: View {
     }
 
     var body: some View {
-        Form {
-            if !usage.byChat.isEmpty {
-                totals
-            }
+        ScrollView {
+            VStack(spacing: 16) {
+                if !usage.byChat.isEmpty {
+                    totals
+                }
 
-            Section {
-                // Cards first, one per configured subscription, rendered from
-                // whatever reading is already known. A configured account always
-                // gets a card even before its first probe returns — an account
-                // you set up should never simply be absent from this list.
-                if accountProfiles.isEmpty, usage.planUsage.isEmpty {
-                    if usage.isRefreshingPlanUsage {
-                        HStack(spacing: 9) {
-                            ProgressView().controlSize(.small)
-                            Text("Reading provider account limits…")
+                SettingsCard(title: "Account limits", symbol: "gauge.with.dots.needle.bottom.50percent") {
+                    VStack(alignment: .leading, spacing: 12) {
+                        HStack {
+                            Text("Each account is read separately, with no model prompt and no copied credentials.")
+                                .font(.caption)
                                 .foregroundStyle(.secondary)
+                                .fixedSize(horizontal: false, vertical: true)
+                            Spacer(minLength: 12)
+                            Button {
+                                usage.refreshPlanUsage(workspace: workspace, force: true)
+                            } label: {
+                                if usage.isRefreshingPlanUsage {
+                                    ProgressView().controlSize(.mini)
+                                } else {
+                                    Label("Refresh", systemImage: "arrow.clockwise")
+                                }
+                            }
+                            .controlSize(.small)
+                            .disabled(usage.isRefreshingPlanUsage)
+                            .accessibilityLabel("Refresh account limits")
                         }
-                    } else if let error = usage.planUsageError {
-                        Label(error, systemImage: "exclamationmark.triangle")
-                            .foregroundStyle(.secondary)
-                    } else {
-                        Label(
-                            "Add a Claude or Codex account in Accounts settings to see its plan and limits here.",
-                            systemImage: "person.2"
-                        )
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                    }
-                } else {
-                    ForEach(accountProfiles) { profile in
-                        SubscriptionCardView(
-                            profile: profile,
-                            usage: reading(for: profile),
-                            isRefreshing: usage.isRefreshingPlanUsage,
-                            now: Date(),
-                            onSignIn: { signingIn = profile },
-                            onReveal: { reveal(profile) },
-                            onRemove: { pendingAccountRemoval = profile }
-                        )
-                    }
-                    // A reading with no matching configured profile — the CLI's
-                    // own default login, which has no named account entry.
-                    ForEach(unmatchedReadings) { provider in
-                        ProviderPlanUsageRow(provider: provider)
-                    }
-                }
-            } header: {
-                HStack {
-                    Text("Account Limits")
-                    Spacer()
-                    Button {
-                        usage.refreshPlanUsage(workspace: workspace, force: true)
-                    } label: {
-                        if usage.isRefreshingPlanUsage {
-                            ProgressView().controlSize(.mini)
-                        } else {
-                            Label("Refresh", systemImage: "arrow.clockwise")
-                        }
-                    }
-                    .buttonStyle(.borderless)
-                    .disabled(usage.isRefreshingPlanUsage)
-                    .accessibilityLabel("Refresh account limits")
-                }
-            } footer: {
-                Text("Kaisola reads each named account separately without sending a model prompt or copying its credentials. Provider usage support may be experimental, and refreshes use the CLI already signed in to that account.")
-            }
 
-            if usage.byChat.isEmpty {
-                Section("Agent Chats") {
-                    Label("Context usage appears after an agent chat reports a window.", systemImage: "gauge.with.dots.needle.bottom.50percent")
-                        .foregroundStyle(.secondary)
-                }
-            } else {
-                Section("Agent Chats") {
-                    ForEach(usage.all) { chat in
-                        ChatUsageRow(chat: chat)
+                        // A configured account gets a card even before its
+                        // first probe returns — an account you set up should
+                        // never simply be absent from this list.
+                        if accountProfiles.isEmpty, usage.planUsage.isEmpty {
+                            emptyAccountState
+                        } else {
+                            ForEach(accountProfiles) { profile in
+                                SubscriptionCardView(
+                                    profile: profile,
+                                    usage: reading(for: profile),
+                                    isRefreshing: usage.isRefreshingPlanUsage,
+                                    now: Date(),
+                                    onSignIn: { signingIn = profile },
+                                    onReveal: { reveal(profile) },
+                                    onRemove: { pendingAccountRemoval = profile }
+                                )
+                            }
+                            // A reading with no matching configured profile —
+                            // the CLI's own default login, which has no named
+                            // account entry.
+                            ForEach(unmatchedReadings) { provider in
+                                ProviderPlanUsageRow(provider: provider)
+                            }
+                        }
                     }
+                    .padding(.horizontal, 16)
+                    .padding(.vertical, 14)
                 }
-                Section {
-                    Button("Reset Usage", role: .destructive) {
-                        showsResetConfirmation = true
+
+                SettingsCard(title: "Agent chats", symbol: "bubble.left.and.bubble.right") {
+                    if usage.byChat.isEmpty {
+                        Text("Context usage appears once an agent chat reports a window.")
+                            .font(.callout)
+                            .foregroundStyle(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .padding(.horizontal, 16)
+                            .padding(.vertical, 14)
+                    } else {
+                        ForEach(Array(usage.all.enumerated()), id: \.element.id) { index, chat in
+                            if index > 0 { SettingsDivider() }
+                            ChatUsageRow(chat: chat)
+                                .padding(.horizontal, 16)
+                                .padding(.vertical, 10)
+                        }
+                        SettingsDivider()
+                        HStack {
+                            Spacer()
+                            Button("Reset Usage", role: .destructive) {
+                                showsResetConfirmation = true
+                            }
+                            .controlSize(.small)
+                        }
+                        .padding(.horizontal, 16)
+                        .padding(.vertical, 10)
                     }
                 }
             }
+            .padding(18)
         }
-        .formStyle(.grouped)
-        .padding(6)
+
         .task(id: workspace?.standardizedFileURL.path) {
             // Reading the account list is a small local JSON decode, so cards
             // can paint before any probe runs.
@@ -182,17 +203,39 @@ struct UsageSettingsTab: View {
         }
     }
 
+    /// The session's headline numbers.
+    ///
+    /// A `Section` reads as a titled group only inside a `Form`; out here it
+    /// would flatten into loose rows with no card around them. Same content, in
+    /// the vocabulary the rest of Settings speaks.
     private var totals: some View {
-        Section("Restored Totals") {
-            LabeledContent("Total peak tokens", value: Self.tokens(usage.totalPeakTokens))
-            LabeledContent("Active chats", value: "\(usage.byChat.count)")
+        SettingsCard(title: "Restored totals", symbol: "sum") {
+            SettingsRow(
+                title: "Total peak tokens",
+                detail: "Highest simultaneous context across chats",
+                symbol: "number"
+            ) {
+                Text(Self.tokens(usage.totalPeakTokens))
+                    .font(.callout.monospacedDigit())
+            }
+            SettingsDivider()
+            SettingsRow(title: "Active chats", detail: "Reporting a context window", symbol: "bubble.left") {
+                Text("\(usage.byChat.count)")
+                    .font(.callout.monospacedDigit())
+            }
             ForEach(usage.costTotals) { total in
-                LabeledContent("Session cost (\(total.currency))") {
+                SettingsDivider()
+                SettingsRow(title: "Session cost", detail: total.currency, symbol: "creditcard") {
                     Text(total.amount, format: .currency(code: total.currency))
-                        .monospacedDigit()
+                        .font(.callout.monospacedDigit())
                 }
             }
-            LabeledContent("Context pressure") {
+            SettingsDivider()
+            SettingsRow(
+                title: "Context pressure",
+                detail: "How full the fullest chat is",
+                symbol: "gauge.with.dots.needle.bottom.50percent"
+            ) {
                 let pressure = usage.contextPressure
                 VStack(alignment: .trailing, spacing: 3) {
                     Text("\(Int((pressure * 100).rounded()))%")

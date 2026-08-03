@@ -643,30 +643,46 @@ struct SettingsView: View {
     }
 
     private var accounts: some View {
-        Form {
-            Section("App Account Defaults") {
-                TextField("CLAUDE_CONFIG_DIR", text: $settings.claudeConfigDir, prompt: Text("CLI default"))
-                TextField("CODEX_HOME", text: $settings.codexHome, prompt: Text("CLI default"))
-                Text("Applied to new Claude and Codex sessions; leave blank to use each CLI's own sign-in.")
-                    .font(.caption).foregroundStyle(.secondary)
-            }
-            ProjectAccountsSection(
-                projectID: workspace.map { NativeSessionStore.projectID(forDirectory: $0.path) },
-                projectName: workspace.map { ($0.path as NSString).lastPathComponent }
-            )
-            Section {
-                SignInCardView { command in
-                    NotificationCenter.default.post(
-                        name: .kaisolaRunInTerminal,
-                        object: nil,
-                        userInfo: [SignInCardView.commandUserInfoKey: command]
-                    )
+        ScrollView {
+            VStack(spacing: 16) {
+                SettingsCard(title: "App default account", symbol: "person.crop.circle") {
+                    SettingsRow(
+                        title: "Claude",
+                        detail: "CLAUDE_CONFIG_DIR for new sessions",
+                        symbol: "folder"
+                    ) {
+                        TextField("", text: $settings.claudeConfigDir, prompt: Text("CLI default"))
+                            .textFieldStyle(.plain)
+                            .multilineTextAlignment(.trailing)
+                            .font(.caption.monospaced())
+                            .padding(.horizontal, 10)
+                            .frame(width: 230, height: 30)
+                            .background(.quaternary.opacity(0.45), in: RoundedRectangle(cornerRadius: 8))
+                            .accessibilityLabel("Default Claude account directory")
+                    }
+                    SettingsDivider()
+                    SettingsRow(
+                        title: "Codex",
+                        detail: "CODEX_HOME for new sessions",
+                        symbol: "folder"
+                    ) {
+                        TextField("", text: $settings.codexHome, prompt: Text("CLI default"))
+                            .textFieldStyle(.plain)
+                            .multilineTextAlignment(.trailing)
+                            .font(.caption.monospaced())
+                            .padding(.horizontal, 10)
+                            .frame(width: 230, height: 30)
+                            .background(.quaternary.opacity(0.45), in: RoundedRectangle(cornerRadius: 8))
+                            .accessibilityLabel("Default Codex account directory")
+                    }
                 }
-                .listRowInsets(EdgeInsets())
+                ProjectAccountsSection(
+                    projectID: workspace.map { NativeSessionStore.projectID(forDirectory: $0.path) },
+                    projectName: workspace.map { ($0.path as NSString).lastPathComponent }
+                )
             }
+            .padding(18)
         }
-        .formStyle(.grouped)
-        .padding(6)
     }
 
     private var agents: some View {

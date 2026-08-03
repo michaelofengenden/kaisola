@@ -1,5 +1,20 @@
 # Changelog
 
+## 1.2.0 — 2026-08-02
+
+- Glass tracks the desktop behind the window, so moving Kaisola slides the wallpaper underneath it like real glass.
+- Glass reads the same on any wallpaper — blues no longer wash out to white, greens no longer oversaturate.
+- Glass follows the wallpaper's texture, not just its colour, and re-reads it whenever the wallpaper changes.
+- New Appearance controls for glass clarity, blur, and colour.
+- The active project reads bold instead of filled, and the open session is marked in blue.
+- The sidebar no longer scrolls the first project out of view at launch.
+- Real ChatGPT and Claude marks, and a terminal running Claude Code now shows the Claude one.
+- Tinted canvas is actually tinted, and Solid is named for what it does.
+- Markdown edits as one continuous document, tables and all — no block-by-block, no jumping to the top.
+- Panels run to the window's top edge, reclaiming the empty band above them.
+- A rebuilt agent composer: model, provider, and reasoning effort all change mid-conversation from one menu.
+- Queued messages can be steered into a turn that is already running.
+
 ## 1.1.9 — 2026-08-01
 
 This release contains the complete 42-commit product, reliability, and release

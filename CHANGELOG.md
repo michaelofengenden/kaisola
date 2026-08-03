@@ -1,5 +1,23 @@
 # Changelog
 
+## 1.3.0 — 2026-08-03
+
+- Sign in to Claude and Codex accounts inside Settings, instead of a terminal opening in whatever project was in front.
+- Each subscription keeps its own credentials, so several accounts can be signed in at once and Usage shows them side by side.
+- Starting a session on a nearly-spent account now says so, and names one with room left.
+- Settings opens large, and Accounts and Usage match the rest of Settings instead of using their own look.
+- Usage cards are compact enough to compare several at a glance, with one meter style throughout.
+- Software updates have their own place in Settings.
+- Clicking a file an agent mentions opens it, even when the file sits deeper than the name suggests.
+- Reveal in Finder lands in the nearest real folder rather than an empty window.
+- Images copied or dragged into a terminal arrive as the picture, not as the file's icon.
+- Drop an image anywhere on an agent chat, not only on the composer.
+- Agent replies stream smoothly instead of arriving in lurches.
+- The glass backdrop follows a window drag at the display's own refresh rate, and rests when the window does.
+- Codex reports a weekly limit only, and it is now named and drawn as one.
+- The project mark is a folder, and a working agent is announced once rather than twice.
+- Long file names in the Files rail fade out instead of colliding with the options button.
+
 ## 1.2.0 — 2026-08-02
 
 - Glass tracks the desktop behind the window, so moving Kaisola slides the wallpaper underneath it like real glass.

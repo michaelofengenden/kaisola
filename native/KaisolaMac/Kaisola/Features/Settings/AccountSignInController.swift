@@ -145,6 +145,28 @@ final class AccountSignInController: ObservableObject {
             )
             return
         }
+        // The account's directory has to exist before the CLI is pointed at it.
+        //
+        // `claude` creates its config directory; `codex` does not — it reads
+        // `CODEX_HOME`, finds nothing, and stops with "Error loading
+        // configuration: CODEX_HOME points to …, but that path does not exist".
+        // Kaisola invented the path when the account was added, so creating it
+        // is Kaisola's job rather than something to hand back to the user.
+        //
+        // 0700 because a config directory is about to hold credentials.
+        do {
+            try FileManager.default.createDirectory(
+                at: URL(fileURLWithPath: profile.expandedDirectory, isDirectory: true),
+                withIntermediateDirectories: true,
+                attributes: [.posixPermissions: 0o700]
+            )
+        } catch {
+            phase = .failed(
+                "Kaisola couldn’t create \(profile.directory): \(error.localizedDescription)"
+            )
+            return
+        }
+
         let quotedTool = "'" + executable.replacingOccurrences(of: "'", with: "'\\''") + "'"
         let login = profile.provider == .claude
             ? "\(quotedTool) auth login --claudeai"

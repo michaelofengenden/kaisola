@@ -135,6 +135,90 @@ enum TerminalImageDrop {
         )
     }
 
+    /// What to insert for an image on the clipboard, staged to a real file.
+    ///
+    /// Two clipboard shapes reach a terminal, and only one of them is what it
+    /// appears to be:
+    ///
+    /// * **A file copied in Finder** carries `public.file-url` *and* an image
+    ///   representation — and that image is the file's **icon**, not its
+    ///   contents. So anything that asks the pasteboard for pixels gets a
+    ///   1024×1024 generic document icon. This is the whole of the bug: Claude
+    ///   Code's own Control-V reads the clipboard, faithfully writes what it
+    ///   finds to `~/.claude/image-cache/<session>/N.png`, and attaches a
+    ///   picture of a file icon. Nothing errors anywhere, so the model
+    ///   cheerfully describes an image it was never shown. The recovered cache
+    ///   entry for one such attachment is exactly that icon — 1024×1024, 70 KB
+    ///   — while the screenshot it was meant to be sat unread on the Desktop.
+    /// * **A screenshot copied straight to the clipboard** carries only pixel
+    ///   data, and those pixels are the real thing.
+    ///
+    /// Hence the order below: a file behind the clipboard always wins, and the
+    /// pasteboard's own image is trusted only when there is no file to prefer.
+    ///
+    /// - Returns: `nil` when the clipboard holds no image this syntax can
+    ///   attach, which is the caller's signal to fall through to a plain paste.
+    static func pastePlan(
+        from pasteboard: NSPasteboard,
+        syntax: AgentSyntax,
+        stage: (URL) -> URL? = { stageImage($0) },
+        stageData: (Data, Date) -> URL? = { stagePastedImage($0, now: $1) },
+        now: Date = Date()
+    ) -> InsertionPlan? {
+        guard syntax == .claudeMention else { return nil }
+
+        let files = (pasteboard.readObjects(
+            forClasses: [NSURL.self],
+            options: [.urlReadingFileURLsOnly: true]
+        ) as? [URL] ?? []).filter(isImage)
+        if !files.isEmpty {
+            return insertionPlan(for: files, syntax: syntax, stage: stage)
+        }
+
+        guard let data = pastedImageData(from: pasteboard),
+              let staged = stageData(data, now)
+        else { return nil }
+        return InsertionPlan(
+            text: "@" + staged.standardizedFileURL.path + " ",
+            unattachedClaudeImageCount: 0
+        )
+    }
+
+    /// PNG bytes for a clipboard carrying pixels rather than a file.
+    ///
+    /// `.png` is taken as it is. A `.tiff` clipboard — what most Mac apps
+    /// actually put down — is re-encoded, because an `@` mention is read by
+    /// extension and Claude does not accept TIFF.
+    static func pastedImageData(from pasteboard: NSPasteboard) -> Data? {
+        if let png = pasteboard.data(forType: .png) { return png }
+        guard let tiff = pasteboard.data(forType: .tiff),
+              let representation = NSBitmapImageRep(data: tiff)
+        else { return nil }
+        return representation.representation(using: .png, properties: [:])
+    }
+
+    /// Write clipboard pixels into the same staging area a dropped file uses.
+    static func stagePastedImage(_ data: Data, now: Date = Date()) -> URL? {
+        guard !data.isEmpty, data.count <= maximumImageBytes else { return nil }
+        let directory = stagingDirectory
+        guard (try? FileManager.default.createDirectory(
+            at: directory,
+            withIntermediateDirectories: true,
+            attributes: [.posixPermissions: 0o700]
+        )) != nil else { return nil }
+
+        let destination = directory.appendingPathComponent(
+            stagedName(for: URL(fileURLWithPath: "pasted-image.png"), now: now),
+            isDirectory: false
+        )
+        do {
+            try data.write(to: destination, options: .atomic)
+            return destination
+        } catch {
+            return nil
+        }
+    }
+
     /// Copy an image to a space-free, collision-free staged path.
     static func stageImage(_ url: URL, now: Date = Date()) -> URL? {
         let source = url.standardizedFileURL

@@ -75,6 +75,25 @@ struct AcpChatView: View {
             }
             composer
         }
+        // The drop target is the whole chat, not just the composer.
+        //
+        // It used to be the composer alone — a ~90pt gutter at the very bottom
+        // — so a screenshot dragged at the transcript, which is all of the
+        // conversation and most of the pane, landed on nothing and silently did
+        // nothing. A drag aimed anywhere in a chat is aimed at that chat, and
+        // asking the user to find the one strip that accepts it is precision a
+        // drag should never demand. `handleDrop` is unchanged, so
+        // `AcpAttachmentClassifier` still decides what is attachable.
+        .onDrop(of: [.fileURL], isTargeted: $isDropTargeted, perform: handleDrop)
+        .overlay {
+            if isDropTargeted {
+                RoundedRectangle(cornerRadius: KaisolaVisualSystem.panelRadius)
+                    .strokeBorder(Color.accentColor, style: StrokeStyle(lineWidth: 2, dash: [6]))
+                    .padding(6)
+                    .allowsHitTesting(false)
+                    .accessibilityHidden(true)
+            }
+        }
         // SwiftUI can reuse this view position when the selected chat changes.
         // Key the startup work to the object so a new session never flashes or
         // saves the preceding session's draft.
@@ -388,15 +407,8 @@ struct AcpChatView: View {
         .padding(.horizontal, 14)
         .padding(.top, 10)
         .padding(.bottom, 13)
-        .overlay {
-            if isDropTargeted {
-                RoundedRectangle(cornerRadius: KaisolaVisualSystem.panelRadius)
-                    .strokeBorder(Color.accentColor, style: StrokeStyle(lineWidth: 2, dash: [6]))
-                    .padding(6)
-                    .allowsHitTesting(false)
-            }
-        }
-        .onDrop(of: [.fileURL], isTargeted: $isDropTargeted, perform: handleDrop)
+        // The drop target and its highlight now live on the whole chat; the
+        // composer keeps only paste, which is focus-driven rather than aimed.
         .onPasteCommand(of: [.png, .tiff], perform: handlePaste)
     }
 

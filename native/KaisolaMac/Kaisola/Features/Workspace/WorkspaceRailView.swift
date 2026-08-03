@@ -611,11 +611,17 @@ struct WorkspaceRailView: View {
                 Image(systemName: node.isDirectory ? "folder" : "doc.text")
                     .font(.caption)
                     .foregroundStyle(node.isDirectory ? Color.accentColor : .secondary)
-                Text(node.name).font(.callout).lineLimit(1)
+                fileName(node.name)
                 Spacer(minLength: 0)
             }
             .padding(.vertical, 2.5)
             .padding(.leading, CGFloat(depth) * 14 + 10)
+            // The options button is a trailing *overlay*, so it floats over
+            // whatever the row draws. Without this the name ran under it and
+            // its own "…" landed on the three dots, which at a zoomed text
+            // size read as one smeared "⋯⋯". This is the button's 18pt plus
+            // its 6pt inset, plus a little air.
+            .padding(.trailing, Self.optionsClearance)
             .background(
                 !node.isDirectory && selectedFile?.standardizedFileURL.path == node.url.standardizedFileURL.path
                     ? Color.accentColor.opacity(0.15)
@@ -640,6 +646,43 @@ struct WorkspaceRailView: View {
             itemMenu(node)
                 .padding(.trailing, 6)
         }
+    }
+
+    /// Room kept clear at the trailing edge for the floating options button.
+    private static let optionsClearance: CGFloat = 30
+
+    /// How far the name's last characters take to fade out.
+    private static let nameFadeWidth: CGFloat = 18
+
+    /// A name too long for its rail **fades out** rather than truncating.
+    ///
+    /// A tail "…" beside a "⋯" button is two ellipses in a row, and at a zoomed
+    /// text size they collide into something that reads as neither. A fade also
+    /// tells the truth better: it says the name continues, where "…" says three
+    /// specific characters were dropped. Michael: "the words shouldn't run into
+    /// the three dots, the words should fade a little before."
+    ///
+    /// `fixedSize` stops the text truncating itself; the frame around it is
+    /// what reports width upward, so the long name overflows into a clip rather
+    /// than widening the rail.
+    private func fileName(_ name: String) -> some View {
+        Text(name)
+            .font(.callout)
+            .lineLimit(1)
+            .fixedSize(horizontal: true, vertical: false)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .clipped()
+            .mask(alignment: .leading) {
+                HStack(spacing: 0) {
+                    Rectangle()
+                    LinearGradient(
+                        colors: [.black, .black.opacity(0)],
+                        startPoint: .leading,
+                        endPoint: .trailing
+                    )
+                    .frame(width: Self.nameFadeWidth)
+                }
+            }
     }
 
     private func itemMenu(_ node: FileNode) -> some View {

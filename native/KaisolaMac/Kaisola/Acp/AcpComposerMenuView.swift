@@ -71,6 +71,25 @@ struct AcpComposerMenuView: View {
     private static let submenuWidth: CGFloat = 208
     private static let panelInset: CGFloat = 6
 
+    /// How tall the panel stands once a submenu is open, whatever that submenu
+    /// happens to hold.
+    ///
+    /// It used to have no bound at all: the panel was as tall as the list
+    /// inside it, and the Codex model list alone is thirty-odd rows. So opening
+    /// one row's choices grew the popover past the window and over the
+    /// conversation, and — because a submenu opens on *hover* — sliding the
+    /// pointer down the left column resized the whole panel under it, row by
+    /// row. Michael: "it keeps changing its size and goes below and hides the
+    /// chat interface."
+    ///
+    /// One height for every submenu fixes both halves. The panel steps to this
+    /// size once when a submenu opens and then holds still no matter which row
+    /// the pointer is on, and a list too long for it scrolls rather than
+    /// growing. Chosen to seat nine caption-less options — enough that the
+    /// short lists (effort, mode) never scroll at all — while staying well
+    /// inside the composer's own height.
+    private static let openPanelHeight: CGFloat = 268
+
     private var openSubmenu: AcpComposerSubmenu? { armed.map(submenu) }
     private var submenuOptions: [AcpComposerMenuOption] { openSubmenu?.options ?? [] }
 
@@ -217,12 +236,25 @@ struct AcpComposerMenuView: View {
                     .padding(.horizontal, 9)
                     .padding(.vertical, 6)
                     .accessibilityIdentifier("acp.composer.menu.submenu.empty")
+                Spacer(minLength: 0)
             } else {
-                ForEach(Array(panel.options.enumerated()), id: \.element.id) { index, option in
-                    optionRow(option, isHighlighted: highlightedOption == index)
-                        .onHover { inside in
-                            if inside { highlightedOption = index }
+                ScrollViewReader { proxy in
+                    ScrollView(.vertical) {
+                        VStack(alignment: .leading, spacing: 1) {
+                            ForEach(Array(panel.options.enumerated()), id: \.element.id) { index, option in
+                                optionRow(option, isHighlighted: highlightedOption == index)
+                                    .id(index)
+                                    .onHover { inside in
+                                        if inside { highlightedOption = index }
+                                    }
+                            }
                         }
+                    }
+                    // A short list should not look like a scroller.
+                    .scrollBounceBehavior(.basedOnSize)
+                    // The arrow keys can now walk the highlight past the
+                    // bottom of the viewport, so the viewport follows it.
+                    .onChange(of: highlightedOption) { proxy.scrollTo(highlightedOption, anchor: .center) }
                 }
             }
 
@@ -232,7 +264,10 @@ struct AcpComposerMenuView: View {
             }
         }
         .padding(Self.panelInset)
-        .frame(width: Self.submenuWidth, alignment: .leading)
+        // The height lives here rather than on the enclosing row so the scroll
+        // view is actually *offered* a bounded height — a frame on the parent
+        // would clip the list instead of letting it scroll.
+        .frame(width: Self.submenuWidth, height: Self.openPanelHeight, alignment: .topLeading)
         .accessibilityElement(children: .contain)
         .accessibilityLabel(panel.title)
         .accessibilityIdentifier("acp.composer.menu.submenu")

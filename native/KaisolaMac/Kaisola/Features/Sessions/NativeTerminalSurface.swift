@@ -2877,7 +2877,32 @@ final class OwnedTerminalView: ReadOnlyTerminalView {
             send(source: getTerminal(), data: ArraySlice([0x16]))
             return
         }
+        if let plan = TerminalImageDrop.pastePlan(
+            from: .general,
+            syntax: TerminalImageDrop.syntax(forLaunchCommand: agentLaunchCommand)
+        ) {
+            insert(plan)
+            return
+        }
         super.paste(sender)
+    }
+
+    /// Claude Code's own image paste is Control-V, and that path reads the
+    /// macOS clipboard itself — which is precisely how it ends up attaching a
+    /// file's *icon* instead of the file (see `TerminalImageDrop.pastePlan`).
+    /// So when an image is on the clipboard, Control-V is answered here with a
+    /// staged `@` mention instead of being forwarded.
+    ///
+    /// Only when a plan comes back: with no image on the clipboard Control-V is
+    /// still Control-V, which in a plain shell is the literal-next-character
+    /// quote and must keep working.
+    func handleControlVIfImagePresent() -> Bool {
+        guard let plan = TerminalImageDrop.pastePlan(
+            from: .general,
+            syntax: TerminalImageDrop.syntax(forLaunchCommand: agentLaunchCommand)
+        ) else { return false }
+        insert(plan)
+        return true
     }
 
     /// ⌥-click moves the cursor to the click, the way iTerm2 and Terminal.app
@@ -3011,6 +3036,15 @@ final class OwnedTerminalView: ReadOnlyTerminalView {
         let plan = Self.droppedFilePlan(urls, agentLaunchCommand: agentLaunchCommand)
         guard !plan.text.isEmpty else { return false }
         window?.makeFirstResponder(self)
+        insert(plan)
+        return true
+    }
+
+    /// Bracketed-paste an insertion plan and disclose anything it downgraded.
+    ///
+    /// Shared by the drop and the paste paths so a clipboard image and a
+    /// dropped one reach the CLI by exactly the same route.
+    private func insert(_ plan: TerminalImageDrop.InsertionPlan) {
         let terminal = getTerminal()
         if terminal.bracketedPasteMode {
             send(source: terminal, data: ArraySlice(Array("\u{1B}[200~".utf8)))
@@ -3022,7 +3056,6 @@ final class OwnedTerminalView: ReadOnlyTerminalView {
         if let warning = plan.warningMessage {
             ToastCenter.shared.show(warning, style: .error, duration: 5)
         }
-        return true
     }
 
     /// Shift+Enter types a newline instead of submitting — ESC CR, the mapping
@@ -3041,6 +3074,19 @@ final class OwnedTerminalView: ReadOnlyTerminalView {
             && modifierFlags.intersection(.deviceIndependentFlagsMask) == .shift
     }
 
+    /// Control-V — `v` is key code 9 — with no other modifier.
+    ///
+    /// Matching the keystroke is not the same as claiming it: the monitor only
+    /// claims it when the clipboard actually holds an image the agent can be
+    /// handed, so Control-V keeps its shell meaning the rest of the time.
+    static func shouldConsiderControlV(
+        keyCode: UInt16,
+        modifierFlags: NSEvent.ModifierFlags
+    ) -> Bool {
+        keyCode == 9
+            && modifierFlags.intersection(.deviceIndependentFlagsMask) == .control
+    }
+
     override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
         if window == nil {
@@ -3053,10 +3099,15 @@ final class OwnedTerminalView: ReadOnlyTerminalView {
         } else if shiftEnterMonitor == nil {
             registerForDraggedTypes([.fileURL])
             shiftEnterMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
-                guard Self.shouldHandleShiftEnter(
+                let isShiftEnter = Self.shouldHandleShiftEnter(
                     keyCode: event.keyCode,
                     modifierFlags: event.modifierFlags
-                ) else { return event }
+                )
+                let isControlV = Self.shouldConsiderControlV(
+                    keyCode: event.keyCode,
+                    modifierFlags: event.modifierFlags
+                )
+                guard isShiftEnter || isControlV else { return event }
                 // Local monitors fire on the main thread; NSEvent itself must
                 // stay outside the isolation hop (it isn't Sendable).
                 let handled = MainActor.assumeIsolated { () -> Bool in
@@ -3068,6 +3119,7 @@ final class OwnedTerminalView: ReadOnlyTerminalView {
                           let window = self.window,
                           window.isKeyWindow,
                           window.firstResponder === self else { return false }
+                    if isControlV { return self.handleControlVIfImagePresent() }
                     self.terminalDelegate?.send(source: self, data: ArraySlice([0x1B, 0x0D]))
                     return true
                 }

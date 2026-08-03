@@ -2203,6 +2203,42 @@ final class NativePreviewSettingsTests: XCTestCase {
         XCTAssertTrue(defaults.allowsClipping)
     }
 
+    /// Reading the desktop's layout costs ~4.4 ms — a hop into the picture
+    /// store, not a property read — and the patch wants it on every window
+    /// move, once per glass surface, against an 8.3 ms frame at 120 Hz. So the
+    /// read happens once per display and a drag pays nothing.
+    ///
+    /// `DesktopLayoutCache` itself needs a display to exercise; this is its
+    /// rule, extracted so the rule can be asserted rather than described.
+    func testLayoutIsResolvedOncePerDisplayUntilTheDesktopChanges() {
+        var cache = ResolveOnceCache<CGDirectDisplayID, String>()
+        var resolved: [CGDirectDisplayID] = []
+        func layout(for id: CGDirectDisplayID) -> String {
+            resolved.append(id)
+            return "layout-\(id)"
+        }
+
+        // A drag is hundreds of these. One read.
+        for _ in 0..<400 {
+            XCTAssertEqual(cache.value(for: 1, resolve: layout), "layout-1")
+        }
+        XCTAssertEqual(resolved, [1])
+        XCTAssertEqual(cache.resolveCount, 1)
+
+        // A second display is a second layout, not a second copy of the first.
+        XCTAssertEqual(cache.value(for: 2, resolve: layout), "layout-2")
+        XCTAssertEqual(resolved, [1, 2])
+        XCTAssertEqual(cache.value(for: 1, resolve: layout), "layout-1")
+        XCTAssertEqual(resolved, [1, 2])
+
+        // And the signals that can change a layout really do force the read
+        // again — a cache that never dropped would be the wallpaper bug back.
+        cache.invalidate()
+        XCTAssertEqual(cache.value(for: 1, resolve: layout), "layout-1")
+        XCTAssertEqual(resolved, [1, 2, 1])
+        XCTAssertEqual(cache.resolveCount, 3)
+    }
+
     /// The end-to-end version of the same claim, rendered rather than asserted
     /// about: a surface pinned over the left of a left-to-right wallpaper is
     /// **darker** than the same surface pinned over the right of it, and by the

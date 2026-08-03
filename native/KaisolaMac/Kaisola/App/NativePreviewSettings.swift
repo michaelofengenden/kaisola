@@ -3870,6 +3870,93 @@ struct DesktopWallpaperPatch: NSViewRepresentable {
     }
 }
 
+/// A value resolved at most once per key until something drops it.
+///
+/// Extracted from `DesktopLayoutCache` with no AppKit in it so the rule that
+/// actually matters — *one* resolve per key, and a drop really does force the
+/// next one — is a test rather than a claim about a call an assertion cannot
+/// reach without a display attached.
+struct ResolveOnceCache<Key: Hashable, Value> {
+    private var entries: [Key: Value] = [:]
+
+    /// Number of times `resolve` has actually run. Test-facing; the production
+    /// path never reads it.
+    private(set) var resolveCount = 0
+
+    mutating func value(for key: Key, resolve: (Key) -> Value) -> Value {
+        if let cached = entries[key] { return cached }
+        resolveCount += 1
+        let resolved = resolve(key)
+        entries[key] = resolved
+        return resolved
+    }
+
+    mutating func invalidate() { entries.removeAll(keepingCapacity: true) }
+}
+
+/// How macOS lays the desktop picture out on each display, cached.
+///
+/// `NSWorkspace.desktopImageOptions(for:)` reads like a property and is not
+/// one: it is a hop into the desktop-picture store, measured on this machine at
+/// **4.4 ms a call**. The patch needs the layout every time the window moves,
+/// once per glass surface — and a 120 Hz frame is 8.3 ms in total, so asking
+/// for it there spent more than a whole frame's budget per surface per frame.
+/// That is the judder Michael saw dragging the window; the arithmetic around it
+/// was already sub-microsecond.
+///
+/// A layout changes only when the desktop picture or the display arrangement
+/// changes, and both announce themselves. So this drops on those signals and is
+/// a dictionary lookup the rest of the time — including throughout a drag,
+/// which posts none of them.
+@MainActor
+enum DesktopLayoutCache {
+    typealias Layout = (scaling: NSImageScaling, allowsClipping: Bool)
+
+    private static var cache = ResolveOnceCache<CGDirectDisplayID, Layout>()
+    private static var observers: [(center: NotificationCenter, token: any NSObjectProtocol)] = []
+
+    static func layout(for screen: NSScreen) -> Layout {
+        install()
+        // A screen with no display number is not a display we can key on, so it
+        // pays the read. It is also not a case that arises on a real desktop.
+        guard let id = displayID(of: screen) else {
+            return DesktopBackdropGeometry.layout(
+                from: NSWorkspace.shared.desktopImageOptions(for: screen)
+            )
+        }
+        return cache.value(for: id) { _ in
+            DesktopBackdropGeometry.layout(
+                from: NSWorkspace.shared.desktopImageOptions(for: screen)
+            )
+        }
+    }
+
+    private static func displayID(of screen: NSScreen) -> CGDirectDisplayID? {
+        (screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber)
+            .map { CGDirectDisplayID($0.uint32Value) }
+    }
+
+    /// Registered once, never torn down: the cache outlives every window and
+    /// costs five observers for the life of the process.
+    private static func install() {
+        guard observers.isEmpty else { return }
+        func watch(_ name: Notification.Name, on center: NotificationCenter) {
+            observers.append((center, center.addObserver(
+                forName: name, object: nil, queue: .main
+            ) { _ in MainActor.assumeIsolated { cache.invalidate() } }))
+        }
+        // The subset of `DesktopBackdropProvider`'s signals that can change a
+        // *layout* rather than the picture's pixels: the displays were
+        // rearranged, another Space with its own desktop came forward, the
+        // machine woke, or the user was in System Settings while we were away.
+        watch(NSApplication.didChangeScreenParametersNotification, on: .default)
+        watch(NSApplication.didBecomeActiveNotification, on: .default)
+        watch(NSWorkspace.activeSpaceDidChangeNotification, on: NSWorkspace.shared.notificationCenter)
+        watch(NSWorkspace.didWakeNotification, on: NSWorkspace.shared.notificationCenter)
+        watch(DesktopBackdropProvider.desktopChangedNotification, on: DistributedNotificationCenter.default())
+    }
+}
+
 /// The `NSView` half, and the app's only hook into where its windows are.
 ///
 /// Everything it listens to is a *frame* signal — the window moved, the window
@@ -3895,6 +3982,9 @@ final class DesktopWallpaperPatchView: NSView {
     private let patch = CALayer()
     private var wallpaperPixels: CGSize = .zero
     private let registrations = Registrations()
+    /// What the layer is already showing, so a repeated signal is free.
+    private var appliedContentsRect: CGRect?
+    private var appliedFrame: CGRect?
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
@@ -3952,13 +4042,22 @@ final class DesktopWallpaperPatchView: NSView {
         }
         // `didMove` fires continuously through a live drag, which is exactly
         // the cadence the backdrop has to follow to read as glass.
+        //
+        // Delivered on `queue: nil` — synchronously, on the thread that posted
+        // — rather than hopping through `OperationQueue.main`. These four are
+        // AppKit window notifications and are always posted on the main thread,
+        // so the isolation assumption below holds; what the hop cost was a
+        // frame of latency, which during a drag is the backdrop trailing the
+        // window. Trailing is the one thing a pane of glass never does.
         for name: Notification.Name in [
             NSWindow.didMoveNotification,
             NSWindow.didResizeNotification,
             NSWindow.didChangeScreenNotification,
             NSWindow.didChangeBackingPropertiesNotification,
         ] {
-            watch(name, on: center, object: window)
+            registrations.tokens.append((center, center.addObserver(
+                forName: name, object: window, queue: nil
+            ) { [weak self] _ in MainActor.assumeIsolated { self?.refresh() } }))
         }
         watch(NSApplication.didChangeScreenParametersNotification, on: center, object: nil)
         watch(
@@ -3975,9 +4074,7 @@ final class DesktopWallpaperPatchView: NSView {
         // picture and whose fill mode apply.
         guard let screen = window.screen ?? NSScreen.main else { return }
         let onScreen = window.convertToScreen(convert(bounds, to: nil))
-        let layout = DesktopBackdropGeometry.layout(
-            from: NSWorkspace.shared.desktopImageOptions(for: screen)
-        )
+        let layout = DesktopLayoutCache.layout(for: screen)
         let rect = DesktopBackdropGeometry.contentsRect(
             surface: onScreen,
             imagePixels: wallpaperPixels,
@@ -3986,6 +4083,12 @@ final class DesktopWallpaperPatchView: NSView {
             allowsClipping: layout.allowsClipping,
             backingScale: screen.backingScaleFactor
         )
+        // A drag posts `didMove` once per frame per surface, and a window
+        // nudged inside one point produces the same rectangle twice. Committing
+        // an identical transaction is not free at that cadence.
+        guard rect != appliedContentsRect || bounds != appliedFrame else { return }
+        appliedContentsRect = rect
+        appliedFrame = bounds
         // No implicit animation: a drag would otherwise ease the backdrop
         // toward each new position a quarter-second behind the window, which
         // reads as the glass sliding rather than the desktop staying put.

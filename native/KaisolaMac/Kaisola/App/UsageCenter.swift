@@ -175,6 +175,56 @@ struct SessionAccountBinding: Codable, Equatable, Hashable, Sendable {
         )
     }
 
+    /// Which named accounts the CLI's own default login resolves to.
+    ///
+    /// A reading with `profileID == "active"` is whatever a session gets when
+    /// no named account is pinned. That is usually one of the accounts already
+    /// listed — so Usage drew the same subscription twice, once under its name
+    /// and once as "Current project", with identical percentages and identical
+    /// reset times. Michael: "usage should see which account is current
+    /// project, not put the same twice."
+    ///
+    /// Matched on provider plus account identity rather than directory, because
+    /// the active reading reports the credentials it actually used and two
+    /// directories can hold the same login.
+    ///
+    /// Pure and given its readings, so the rule is testable without a probe.
+    static func currentProjectProfileIDs(
+        readings: [UsageCenter.ProviderPlanUsage]
+    ) -> Set<String> {
+        var active: [String: String] = [:]
+        for reading in readings where reading.profileID == "active" {
+            guard let account = reading.account?.trimmingCharacters(in: .whitespacesAndNewlines),
+                  !account.isEmpty else { continue }
+            active[reading.provider] = account
+        }
+        guard !active.isEmpty else { return [] }
+
+        var matched: Set<String> = []
+        for reading in readings {
+            guard let id = reading.profileID, id != "active" else { continue }
+            guard let account = reading.account?.trimmingCharacters(in: .whitespacesAndNewlines),
+                  !account.isEmpty else { continue }
+            if active[reading.provider] == account { matched.insert(id) }
+        }
+        return matched
+    }
+
+    /// Whether an "active" reading is already represented by a named card.
+    static func isRepresentedByNamedAccount(
+        _ reading: UsageCenter.ProviderPlanUsage,
+        readings: [UsageCenter.ProviderPlanUsage]
+    ) -> Bool {
+        guard reading.profileID == "active" else { return false }
+        guard let account = reading.account?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !account.isEmpty else { return false }
+        return readings.contains { other in
+            guard let id = other.profileID, id != "active" else { return false }
+            guard other.provider == reading.provider else { return false }
+            return other.account?.trimmingCharacters(in: .whitespacesAndNewlines) == account
+        }
+    }
+
     /// One sentence a person can act on, or nothing.
     static func headroomWarning(
         for binding: SessionAccountBinding,

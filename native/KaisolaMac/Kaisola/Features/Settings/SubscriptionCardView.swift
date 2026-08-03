@@ -18,6 +18,8 @@ struct SubscriptionCardView: View {
     let usage: UsageCenter.ProviderPlanUsage?
     let isRefreshing: Bool
     let now: Date
+    /// This account is what a session in the current project actually runs on.
+    var isCurrentProject = false
     var onSignIn: (() -> Void)?
     var onReveal: (() -> Void)?
     var onRemove: (() -> Void)?
@@ -80,6 +82,16 @@ struct SubscriptionCardView: View {
                     .foregroundStyle(.tertiary)
             }
             Spacer(minLength: 6)
+            if isCurrentProject {
+                Text("Current")
+                    .font(.caption2.weight(.semibold))
+                    .foregroundStyle(Color.accentColor)
+                    .padding(.horizontal, 6)
+                    .padding(.vertical, 2)
+                    .background(Color.accentColor.opacity(0.14), in: Capsule())
+                    .help("Sessions in this project use this account")
+                    .accessibilityLabel("Current project account")
+            }
             if let plan = usage?.plan, !plan.isEmpty {
                 Text(plan.capitalized)
                     .font(.caption.weight(.medium))
@@ -210,13 +222,7 @@ struct SubscriptionUsageMeter: View {
         min(max((window.usedPercent ?? 0) / 100, 0), 1)
     }
 
-    private var tint: Color {
-        switch fraction {
-        case ..<0.75: .green
-        case ..<0.9: .orange
-        default: .red
-        }
-    }
+    private var tint: Color { UsageMeterPalette.color(for: fraction) }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 4) {
@@ -241,8 +247,14 @@ struct SubscriptionUsageMeter: View {
             }
             GeometryReader { geometry in
                 ZStack(alignment: .leading) {
-                    Capsule().fill(.quaternary)
-                    Capsule().fill(tint).frame(width: max(3, geometry.size.width * fraction))
+                    Capsule().fill(.quaternary.opacity(0.55))
+                    Capsule()
+                        .fill(UsageMeterPalette.fill(for: fraction))
+                        .frame(width: max(3, geometry.size.width * fraction))
+                        // A meter running out should look like it is running
+                        // hot, so the glow rises with the fill instead of
+                        // sitting at a constant.
+                        .shadow(color: tint.opacity(0.35 * fraction), radius: 3, y: 0.5)
                 }
             }
             // 4pt read as a hairline once the cards sat side by side; 6 gives

@@ -21,13 +21,24 @@ struct UsageSettingsTab: View {
     }
 
     private var unmatchedReadings: [UsageCenter.ProviderPlanUsage] {
-        return usage.planUsage.filter { reading in
+        let all = usage.planUsage
+        return all.filter { reading in
             guard let id = reading.profileID else { return true }
             // A removed named account can remain in the previous in-memory
             // reading until the forced refresh finishes. Do not resurrect it
             // as an anonymous provider row during that short handoff.
-            return id == "active"
+            guard id == "active" else { return false }
+            // The CLI's default login is usually one of the accounts already
+            // listed. Drawing it again as "Current project" showed the same
+            // subscription twice with identical numbers; the named card wears
+            // the badge instead.
+            return !SessionAccountBinding.isRepresentedByNamedAccount(reading, readings: all)
         }
+    }
+
+    /// Named accounts the CLI's own default resolves to.
+    private var currentProjectIDs: Set<String> {
+        SessionAccountBinding.currentProjectProfileIDs(readings: usage.planUsage)
     }
 
     /// What "Account limits" shows before there is anything to show.
@@ -124,7 +135,8 @@ struct UsageSettingsTab: View {
                                         usage: reading(for: profile),
                                         isRefreshing: usage.isRefreshingPlanUsage,
                                         now: Date(),
-                                        onSignIn: { signingIn = profile },
+                                        isCurrentProject: currentProjectIDs.contains(profile.id),
+                                    onSignIn: { signingIn = profile },
                                         onReveal: { reveal(profile) },
                                         onRemove: { pendingAccountRemoval = profile }
                                     )

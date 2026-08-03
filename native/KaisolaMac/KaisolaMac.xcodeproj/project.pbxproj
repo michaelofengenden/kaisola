@@ -77,6 +77,7 @@
 		4552F75BAE695B4A4E2327A3 /* AcpProcessTransport.swift in Sources */ = {isa = PBXBuildFile; fileRef = 32406CFD933CD31D2751A8AF /* AcpProcessTransport.swift */; };
 		45BDB67E55C8E0C6B1F2FF3E /* AcpComposerModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = 28FFC42BA9783C68516FA31C /* AcpComposerModel.swift */; };
 		461796BC63E29B3BAD8CAB8D /* BrokerBootstrapMain.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6647914275EC9AD4E4A1C04B /* BrokerBootstrapMain.swift */; };
+		46E02CD62E68B411ADECE3D9 /* UsageMeterPaletteTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = B12E9F413AC35E693709288A /* UsageMeterPaletteTests.swift */; };
 		4AEED15A504F6575273F165A /* AcpAdapterResolver.swift in Sources */ = {isa = PBXBuildFile; fileRef = BC20168C86DDDBA7D70222F3 /* AcpAdapterResolver.swift */; };
 		4B4670EA43E862CC87D986E2 /* AcpTranscriptPagingTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5B9366DA57DF29F48E569785 /* AcpTranscriptPagingTests.swift */; };
 		4BDC5B5AB5EC929E37C0181B /* NativePreviewSettings.swift in Sources */ = {isa = PBXBuildFile; fileRef = 081788CB50A2F8085E0929CE /* NativePreviewSettings.swift */; };
@@ -227,6 +228,7 @@
 		D8684CF2B2E76859A488B89C /* NativeSessionStore+AutoTitle.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8C11BDCCBCE80BB806B9AF63 /* NativeSessionStore+AutoTitle.swift */; };
 		D9CC5B14BE10AAA4250C69C5 /* TerminalImageDrop.swift in Sources */ = {isa = PBXBuildFile; fileRef = 678CF5145359C73DCF6F759F /* TerminalImageDrop.swift */; };
 		D9F08EBBD24B11EC7FA83C3C /* SignInCardView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 95FFBAD11DCF40DF75829960 /* SignInCardView.swift */; };
+		D9F62D7BF944B5FF7DC5F508 /* UsageMeterPalette.swift in Sources */ = {isa = PBXBuildFile; fileRef = 22979BDC18D58657F10D3A45 /* UsageMeterPalette.swift */; };
 		DB2D418E97E6131AF8B7EE3D /* UsageCenter.swift in Sources */ = {isa = PBXBuildFile; fileRef = C88BF5404563C22955EE7B51 /* UsageCenter.swift */; };
 		DC00CE55888A4B1629DF4C86 /* FuzzyMatch.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8FCBB2E107C280C3B125DF67 /* FuzzyMatch.swift */; };
 		DD88322BBB0BD5470118188E /* OmniBarView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 83D17767E2F2F48BE60D3518 /* OmniBarView.swift */; };
@@ -318,6 +320,7 @@
 		1E1D8BD37B438582BF78F52C /* ObserveOnlyBrokerHistoryPagingTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ObserveOnlyBrokerHistoryPagingTests.swift; sourceTree = "<group>"; };
 		1E90B4D2D24769D0CEB3DD2B /* CompanionEventLogTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CompanionEventLogTests.swift; sourceTree = "<group>"; };
 		2245F534D44AA15E71263FA8 /* FilePreviewContent.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FilePreviewContent.swift; sourceTree = "<group>"; };
+		22979BDC18D58657F10D3A45 /* UsageMeterPalette.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = UsageMeterPalette.swift; sourceTree = "<group>"; };
 		22E249E295A11287D3B9227F /* FirebaseAuthConfig.json */ = {isa = PBXFileReference; lastKnownFileType = text.json; path = FirebaseAuthConfig.json; sourceTree = "<group>"; };
 		22F183A542A74098D9877FD8 /* PlanUsageSnapshotStoreTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PlanUsageSnapshotStoreTests.swift; sourceTree = "<group>"; };
 		24239D14B42DA0C8AFF7B561 /* CompanionLinkClient.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CompanionLinkClient.swift; sourceTree = "<group>"; };
@@ -458,6 +461,7 @@
 		A9878CE4AE9D997C699F9827 /* AppModelBookkeeping.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppModelBookkeeping.swift; sourceTree = "<group>"; };
 		AD8887E4ADA2A72E8F2F8B9B /* QuietStatusDerivationTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = QuietStatusDerivationTests.swift; sourceTree = "<group>"; };
 		AF52791E7FB87F94AF30DBD2 /* NoBoardBoundaryTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NoBoardBoundaryTests.swift; sourceTree = "<group>"; };
+		B12E9F413AC35E693709288A /* UsageMeterPaletteTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = UsageMeterPaletteTests.swift; sourceTree = "<group>"; };
 		B29CF4F90D6C4CD2F54D1948 /* ProjectReorderTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ProjectReorderTests.swift; sourceTree = "<group>"; };
 		B2C1094B3B6E5323C1AAE22E /* TerminalTranscriptTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TerminalTranscriptTests.swift; sourceTree = "<group>"; };
 		B2E93B6B24B1536CA24F517A /* TerminalScrollPinTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TerminalScrollPinTests.swift; sourceTree = "<group>"; };
@@ -769,6 +773,7 @@
 				1DC5E2009F74FD5A05DFB27D /* SettingsView.swift */,
 				95FFBAD11DCF40DF75829960 /* SignInCardView.swift */,
 				E180769B3F8FA3924EE82AF3 /* SubscriptionCardView.swift */,
+				22979BDC18D58657F10D3A45 /* UsageMeterPalette.swift */,
 				CB03F186495669D5F881F00E /* UsageSettingsTab.swift */,
 			);
 			path = Settings;
@@ -931,6 +936,7 @@
 				B2C1094B3B6E5323C1AAE22E /* TerminalTranscriptTests.swift */,
 				BA242AA2050FAC6C58C15F19 /* ToastCenterTests.swift */,
 				E321EB733F62BC0E2D6CF1AF /* UsageCenterTests.swift */,
+				B12E9F413AC35E693709288A /* UsageMeterPaletteTests.swift */,
 				3E4B0A58CFF401C1C82E8239 /* WorkspaceFilesTests.swift */,
 				9E8A890E106780D1EBC76860 /* WorkspacePersistenceVisibilityTests.swift */,
 				2709C3EF1FBBB647E9258793 /* WorkspaceWatcherTests.swift */,
@@ -1307,6 +1313,7 @@
 				F958069AD757FAAC93656C6C /* UnixBrokerTransport.swift in Sources */,
 				84C10713F1568FF52C3C01B5 /* UpdateCenter.swift in Sources */,
 				DB2D418E97E6131AF8B7EE3D /* UsageCenter.swift in Sources */,
+				D9F62D7BF944B5FF7DC5F508 /* UsageMeterPalette.swift in Sources */,
 				9D8B0AB207CB7097EB17FD0B /* UsageSettingsTab.swift in Sources */,
 				BDE6C88324D3D561ADA7AF38 /* VerifiedUsageHelperCache.swift in Sources */,
 				A265252D179828EAC5598D96 /* WorkspaceRailView.swift in Sources */,
@@ -1427,6 +1434,7 @@
 				B245BBDC77E5759C77403AD7 /* TerminalTranscriptTests.swift in Sources */,
 				A9D68830C6E13C6151B98646 /* ToastCenterTests.swift in Sources */,
 				4F54CE61D748E5469408987F /* UsageCenterTests.swift in Sources */,
+				46E02CD62E68B411ADECE3D9 /* UsageMeterPaletteTests.swift in Sources */,
 				C0A9194905016828644B7D86 /* WorkspaceFilesTests.swift in Sources */,
 				1B90B06DA94C489692815A00 /* WorkspacePersistenceVisibilityTests.swift in Sources */,
 				7F9A5DAA9548D99E55198D7E /* WorkspaceWatcherTests.swift in Sources */,

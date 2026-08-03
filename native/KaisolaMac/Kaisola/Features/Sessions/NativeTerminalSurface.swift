@@ -253,6 +253,27 @@ struct NativeTerminalSurface: NSViewRepresentable {
     @MainActor
     static func configureKeyboardInput(on view: ReadOnlyTerminalView) {
         view.optionAsMetaKey = false
+        configureLinkActivation(on: view)
+    }
+
+    /// A file an agent cites opens on a plain click.
+    ///
+    /// The routing for this was already complete — `linkTarget(for:)` resolves
+    /// OSC 8 links and bare `path:line` citations against the shell's OSC 7
+    /// directory, and `requestOpenLink` hands the result to Kaisola's own file
+    /// preview. What was missing is that SwiftTerm's macOS default is
+    /// `.hoverWithModifier`, so none of it ran without ⌘ held down. Nothing
+    /// says a link needs a modifier, so a click that lands on one did nothing
+    /// at all and the whole feature read as absent. Michael: "I want files
+    /// linked in the terminal cli for me to be able to click them and they
+    /// open."
+    ///
+    /// `.hover` underlines a link only while the pointer is on it, so nothing
+    /// is underlined at rest and a drag still selects text — a drag is not a
+    /// click.
+    @MainActor
+    static func configureLinkActivation(on view: ReadOnlyTerminalView) {
+        view.linkHighlightMode = .hover
     }
 
     @MainActor

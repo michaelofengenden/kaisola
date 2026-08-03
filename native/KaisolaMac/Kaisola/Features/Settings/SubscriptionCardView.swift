@@ -38,7 +38,6 @@ struct SubscriptionCardView: View {
                     .foregroundStyle(.secondary)
                     .lineLimit(2)
             }
-            footer
         }
         .padding(10)
         .background(.quaternary.opacity(0.28), in: RoundedRectangle(cornerRadius: KaisolaVisualSystem.cardRadius, style: .continuous))
@@ -73,14 +72,12 @@ struct SubscriptionCardView: View {
                     .accessibilityLabel("\(profile.label): \(statusDescription)")
                     .help(statusDescription)
             }
-            VStack(alignment: .leading, spacing: 1) {
-                Text(profile.label)
-                    .font(.callout.weight(.semibold))
-                    .lineLimit(1)
-                Text(profile.provider.displayName)
-                    .font(.caption2)
-                    .foregroundStyle(.tertiary)
-            }
+            // The brand mark already says Claude or Codex, so the word under
+            // the label was a line spent restating the icon beside it.
+            Text(profile.label)
+                .font(.callout.weight(.semibold))
+                .lineLimit(1)
+                .truncationMode(.middle)
             Spacer(minLength: 6)
             if isCurrentProject {
                 Text("Current")
@@ -102,7 +99,37 @@ struct SubscriptionCardView: View {
             if isRefreshing {
                 ProgressView().controlSize(.mini)
             }
+            actionsMenu
         }
+    }
+
+    /// The card's actions. Moved up from a footer of its own: that row carried
+    /// the config directory, which duplicates what the account's name already
+    /// tells you and cost every card a line plus its spacing. The directory now
+    /// lives in the menu, where it is one hover away when it actually matters.
+    private var actionsMenu: some View {
+        Menu {
+            Section(profile.directory) {
+                if let onSignIn { Button("Sign In…", action: onSignIn) }
+                if let onReveal { Button("Reveal Directory in Finder", action: onReveal) }
+            }
+            if let staleness = stalenessCaption {
+                Section { Text("Updated \(staleness)") }
+            }
+            if let onRemove {
+                Divider()
+                Button("Remove Account", role: .destructive, action: onRemove)
+            }
+        } label: {
+            Image(systemName: "ellipsis")
+                .font(.caption)
+                .frame(width: 18, height: 16)
+                .contentShape(Rectangle())
+        }
+        .menuStyle(.borderlessButton)
+        .menuIndicator(.hidden)
+        .fixedSize()
+        .accessibilityLabel("Account actions for \(profile.label)")
     }
 
     private var statusColor: Color {
@@ -153,46 +180,6 @@ struct SubscriptionCardView: View {
         }
     }
 
-    // MARK: - Footer
-
-    private var footer: some View {
-        HStack(spacing: 8) {
-            Text(profile.directory)
-                .font(.caption2.monospaced())
-                .foregroundStyle(.tertiary)
-                .lineLimit(1)
-                .truncationMode(.middle)
-                .help("This account's config directory (\(profile.provider.environmentKey))")
-            Spacer(minLength: 6)
-            if let staleness = stalenessCaption {
-                Text(staleness)
-                    .font(.caption2)
-                    .foregroundStyle(.tertiary)
-            }
-            Menu {
-                if let onSignIn {
-                    Button("Sign In…", action: onSignIn)
-                }
-                if let onReveal {
-                    Button("Reveal Directory in Finder", action: onReveal)
-                }
-                if let onRemove {
-                    Divider()
-                    Button("Remove Account", role: .destructive, action: onRemove)
-                }
-            } label: {
-                Image(systemName: "ellipsis")
-                    .font(.caption)
-                    .frame(width: 20, height: 18)
-                    .contentShape(Rectangle())
-            }
-            .menuStyle(.borderlessButton)
-            .menuIndicator(.hidden)
-            .fixedSize()
-            .accessibilityLabel("Account actions for \(profile.label)")
-        }
-    }
-
     /// Says how old the numbers are rather than hiding that they are cached.
     private var stalenessCaption: String? {
         Self.stalenessCaption(updatedAt: usage?.updatedAt, now: now)
@@ -224,27 +211,30 @@ struct SubscriptionUsageMeter: View {
 
     private var tint: Color { UsageMeterPalette.color(for: fraction) }
 
+    /// Column widths, fixed so the bars line up down the card.
+    ///
+    /// Alignment is what makes a stack of meters scannable — a ragged left edge
+    /// makes the eye re-find the start of every bar. Sized for the real
+    /// content: "Weekly" is the longest label, "100%" the widest number.
+    private static let labelWidth: CGFloat = 44
+    private static let percentWidth: CGFloat = 34
+
+    /// One line per window, not two.
+    ///
+    /// This used to stack — label and numbers on one row, bar beneath — so
+    /// three windows cost six lines and a card of them could not be taken in at
+    /// a glance. Michael: "is there a way to make the cards even more
+    /// compact/easy and fast to read?" On one line the bar sits between its
+    /// name and its number, and three windows are three lines you read straight
+    /// down.
     var body: some View {
-        VStack(alignment: .leading, spacing: 4) {
-            HStack(alignment: .firstTextBaseline, spacing: 6) {
-                Text(window.label)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                Spacer(minLength: 4)
-                // The number is the point of the row, so it carries the weight
-                // rather than sharing the label's grey. At a glance you should
-                // be reading percentages down a column, not hunting for them.
-                if let percent = window.usedPercent {
-                    Text("\(Int(percent.rounded()))%")
-                        .font(.caption.weight(.semibold).monospacedDigit())
-                        .foregroundStyle(.primary)
-                }
-                if let resets = resetCaption {
-                    Text(resets)
-                        .font(.caption2.monospacedDigit())
-                        .foregroundStyle(.tertiary)
-                }
-            }
+        HStack(spacing: 7) {
+            Text(window.label)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+                .frame(width: Self.labelWidth, alignment: .leading)
+
             GeometryReader { geometry in
                 ZStack(alignment: .leading) {
                     Capsule().fill(.quaternary.opacity(0.55))
@@ -252,15 +242,33 @@ struct SubscriptionUsageMeter: View {
                         .fill(UsageMeterPalette.fill(for: fraction))
                         .frame(width: max(3, geometry.size.width * fraction))
                         // A meter running out should look like it is running
-                        // hot, so the glow rises with the fill instead of
-                        // sitting at a constant.
+                        // hot, so the glow rises with the fill.
                         .shadow(color: tint.opacity(0.35 * fraction), radius: 3, y: 0.5)
                 }
+                .frame(height: 6)
+                .frame(maxHeight: .infinity)
             }
-            // 4pt read as a hairline once the cards sat side by side; 6 gives
-            // the fill enough body to compare across a row of accounts.
-            .frame(height: 6)
+            .frame(minWidth: 40)
+
+            // The number is the point of the row, so it carries the weight
+            // rather than sharing the label's grey.
+            if let percent = window.usedPercent {
+                Text("\(Int(percent.rounded()))%")
+                    .font(.caption.weight(.semibold).monospacedDigit())
+                    .foregroundStyle(.primary)
+                    .frame(width: Self.percentWidth, alignment: .trailing)
+            }
+            // Lowest priority: in a narrow card the reset gives up its width to
+            // the bar, which is the part that has to stay readable.
+            if let resets = resetCaption {
+                Text(resets)
+                    .font(.caption2.monospacedDigit())
+                    .foregroundStyle(.tertiary)
+                    .lineLimit(1)
+                    .layoutPriority(-1)
+            }
         }
+        .frame(height: 18)
         .accessibilityElement(children: .ignore)
         .accessibilityLabel("\(window.label) usage")
         .accessibilityValue(accessibilityValue)

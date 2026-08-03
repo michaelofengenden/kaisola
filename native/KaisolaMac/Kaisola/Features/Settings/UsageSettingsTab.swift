@@ -9,6 +9,7 @@ struct UsageSettingsTab: View {
 
     @State private var accountProfiles: [UsageAccountProfile] = []
     @State private var pendingAccountRemoval: UsageAccountProfile?
+    @State private var signingIn: UsageAccountProfile?
     @State private var showsResetConfirmation = false
     private let accountStore = UsageAccountStore()
 
@@ -29,23 +30,13 @@ struct UsageSettingsTab: View {
         }
     }
 
-    /// Sign in *as this account* by scoping the CLI's own login to that
-    /// account's config directory. Kaisola never touches the credential — the
-    /// CLI writes it into that directory (or the Keychain entry derived from
-    /// it), which is precisely what keeps two subscriptions separate.
-    private func signIn(to profile: UsageAccountProfile) {
-        let login = profile.provider == .claude ? "claude auth login" : "codex login"
-        let quoted = "'" + profile.expandedDirectory.replacingOccurrences(of: "'", with: "'\\''") + "'"
-        NotificationCenter.default.post(
-            name: .kaisolaRunInTerminal,
-            object: nil,
-            userInfo: [
-                SignInCardView.commandUserInfoKey:
-                    "\(profile.provider.environmentKey)=\(quoted) \(login)"
-            ]
-        )
-    }
-
+    /// Sign in *as this account*, in a Settings sheet.
+    ///
+    /// This used to post `.kaisolaRunInTerminal`, which opened a terminal in
+    /// whichever project happened to be in front — a stray session in an
+    /// unrelated project every time you signed in. `AccountSignInSheet` drives
+    /// the same command over pipes instead, so the login stays where the
+    /// account lives.
     private func reveal(_ profile: UsageAccountProfile) {
         NSWorkspace.shared.activateFileViewerSelecting([
             URL(fileURLWithPath: profile.expandedDirectory)
@@ -88,7 +79,7 @@ struct UsageSettingsTab: View {
                             usage: reading(for: profile),
                             isRefreshing: usage.isRefreshingPlanUsage,
                             now: Date(),
-                            onSignIn: { signIn(to: profile) },
+                            onSignIn: { signingIn = profile },
                             onReveal: { reveal(profile) },
                             onRemove: { pendingAccountRemoval = profile }
                         )
@@ -154,6 +145,12 @@ struct UsageSettingsTab: View {
             accountProfiles = accountStore.profiles()
             guard ProcessInfo.processInfo.environment["KAISOLA_NATIVE_VISUAL_FIXTURE"] != "1" else { return }
             usage.refreshPlanUsage(workspace: workspace, force: true)
+        }
+        .sheet(item: $signingIn) { profile in
+            AccountSignInSheet(profile: profile) {
+                signingIn = nil
+                accountProfiles = accountStore.profiles()
+            }
         }
         .confirmationDialog(
             "Remove \(pendingAccountRemoval?.label ?? "Account")?",

@@ -20,6 +20,8 @@ struct ProjectAccountsSection: View {
     @State private var newDirectory = ""
     @State private var accountError: String?
     @State private var pendingRemoval: UsageAccountProfile?
+    /// The account whose sign-in sheet is open, if any.
+    @State private var signingIn: UsageAccountProfile?
     private let store = ProjectAccountStore()
     private let usageAccountStore = UsageAccountStore()
 
@@ -55,43 +57,7 @@ struct ProjectAccountsSection: View {
                     .foregroundStyle(.secondary)
             } else {
                 ForEach(usageProfiles) { profile in
-                    HStack(spacing: 10) {
-                        Image(systemName: profile.provider == .claude ? "bubble.left.and.text.bubble.right" : "terminal")
-                            .frame(width: 18)
-                            .foregroundStyle(.secondary)
-                        VStack(alignment: .leading, spacing: 2) {
-                            HStack(spacing: 6) {
-                                Text(profile.label)
-                                    .font(.callout.weight(.medium))
-                                Text(profile.provider.displayName)
-                                    .font(.caption2.weight(.medium))
-                                    .foregroundStyle(.secondary)
-                            }
-                            Text(profile.directory)
-                                .font(.caption.monospaced())
-                                .foregroundStyle(.tertiary)
-                                .lineLimit(1)
-                                .truncationMode(.middle)
-                        }
-                        Spacer()
-                        // Sign-in belongs beside the account it signs in, not
-                        // one tab away under Usage. Adding a subscription and
-                        // logging into it are one intention; splitting them
-                        // across two screens is why five logins could go into
-                        // one directory without a single new card appearing.
-                        Button("Sign In") { signIn(to: profile) }
-                            .buttonStyle(.bordered)
-                            .controlSize(.small)
-                            .help("Run \(profile.provider == .claude ? "claude auth login" : "codex login") scoped to \(profile.directory)")
-                            .accessibilityLabel("Sign in to \(profile.label)")
-                        Button(role: .destructive) { pendingRemoval = profile } label: {
-                            Image(systemName: "xmark")
-                                .font(.caption.weight(.semibold))
-                        }
-                        .buttonStyle(.borderless)
-                        .help("Remove this account from Kaisola; its provider files stay on disk")
-                        .accessibilityLabel("Remove account \(profile.label)")
-                    }
+                    accountRow(profile)
                 }
             }
 
@@ -136,6 +102,12 @@ struct ProjectAccountsSection: View {
         .onChange(of: codexHome) { _, _ in if let projectID { save(projectID) } }
         .onReceive(NotificationCenter.default.publisher(for: .kaisolaUsageAccountsChanged)) { _ in
             loadUsageProfiles()
+        }
+        .sheet(item: $signingIn) { profile in
+            AccountSignInSheet(profile: profile) {
+                signingIn = nil
+                loadUsageProfiles()
+            }
         }
         .confirmationDialog(
             "Remove \(pendingRemoval?.label ?? "Account")?",
@@ -239,28 +211,47 @@ struct ProjectAccountsSection: View {
         NotificationCenter.default.post(name: .kaisolaUsageAccountsChanged, object: nil)
     }
 
-    /// Sign in *as this account*, by scoping the provider's own login command
-    /// to that account's config directory.
+    /// One named account: what it is, where it keeps its credentials, and the
+    /// two things you can do to it.
     ///
-    /// This is the whole mechanism that keeps subscriptions apart, and the
-    /// reason a login has to start here rather than in a bare terminal: run
-    /// `claude auth login` with no scope and the credential lands in the
-    /// default `~/.claude`, replacing whoever was signed in before and taking
-    /// every project with it. Five logins done that way are not five accounts
-    /// — they are one account, overwritten four times, which is exactly what
-    /// Michael saw. Kaisola never handles the credential itself; the CLI
-    /// writes it into the directory this points at.
-    private func signIn(to profile: UsageAccountProfile) {
-        let login = profile.provider == .claude ? "claude auth login" : "codex login"
-        let quoted = "'" + profile.expandedDirectory.replacingOccurrences(of: "'", with: "'\\''") + "'"
-        NotificationCenter.default.post(
-            name: .kaisolaRunInTerminal,
-            object: nil,
-            userInfo: [
-                SignInCardView.commandUserInfoKey:
-                    "\(profile.provider.environmentKey)=\(quoted) \(login)"
-            ]
-        )
+    /// Extracted from the `Section` body because the whole section became one
+    /// expression the type-checker gave up on.
+    private func accountRow(_ profile: UsageAccountProfile) -> some View {
+        HStack(spacing: 10) {
+            Image(systemName: profile.provider == .claude ? "bubble.left.and.text.bubble.right" : "terminal")
+                .frame(width: 18)
+                .foregroundStyle(.secondary)
+            VStack(alignment: .leading, spacing: 2) {
+                HStack(spacing: 6) {
+                    Text(profile.label)
+                        .font(.callout.weight(.medium))
+                    Text(profile.provider.displayName)
+                        .font(.caption2.weight(.medium))
+                        .foregroundStyle(.secondary)
+                }
+                Text(profile.directory)
+                    .font(.caption.monospaced())
+                    .foregroundStyle(.tertiary)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+            }
+            Spacer()
+            // Sign-in belongs beside the account it signs in, not one tab away
+            // under Usage. Adding a subscription and logging into it are one
+            // intention; splitting them across two screens is why five logins
+            // could go into one directory without a single new card appearing.
+            Button("Sign In") { signingIn = profile }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+                .accessibilityLabel("Sign in to \(profile.label)")
+            Button(role: .destructive) { pendingRemoval = profile } label: {
+                Image(systemName: "xmark")
+                    .font(.caption.weight(.semibold))
+            }
+            .buttonStyle(.borderless)
+            .help("Remove this account from Kaisola; its provider files stay on disk")
+            .accessibilityLabel("Remove account \(profile.label)")
+        }
     }
 
     private func removeProfile(_ profile: UsageAccountProfile) {

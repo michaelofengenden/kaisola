@@ -158,3 +158,45 @@ final class SidebarScrollPinTests: XCTestCase {
         XCTAssertLessThanOrEqual(SidebarScrollPin.pinDuration, 5.0)
     }
 }
+
+/// A split shows two surfaces at once. The rail marked only the focused one, so
+/// the companion pane sat beside it looking like a closed session — Michael:
+/// "there is a bug with the double clicked/viewing multiple tabs".
+final class QuietSplitSelectionTests: XCTestCase {
+    /// Focus still decides which single row is *selected*; the rest of the
+    /// visible set is what the rail was throwing away.
+    func testTheFocusedPaneIsSelectedOutOfSeveralOnScreen() {
+        XCTAssertEqual(
+            QuietRowSelection.selectedID(visibleIDs: ["chat-1", "term-2"], focusedPaneID: "term-2"),
+            "term-2"
+        )
+    }
+
+    /// Focus can name a surface that has been hidden, or one belonging to
+    /// another window. A stale id must fall back to a row that is really there.
+    func testAStaleFocusFallsBackToARowThatIsActuallyOnScreen() {
+        XCTAssertEqual(
+            QuietRowSelection.selectedID(visibleIDs: ["chat-1", "term-2"], focusedPaneID: "gone"),
+            "chat-1"
+        )
+        XCTAssertEqual(
+            QuietRowSelection.selectedID(visibleIDs: ["chat-1"], focusedPaneID: nil),
+            "chat-1"
+        )
+    }
+
+    func testNothingOnScreenSelectsNothing() {
+        XCTAssertNil(QuietRowSelection.selectedID(visibleIDs: [], focusedPaneID: "term-2"))
+    }
+
+    /// The companion treatment has to be visibly weaker than the selected one,
+    /// or a split reads as two equally-focused rows.
+    func testACompanionPaneIsMarkedButRanksBelowTheSelectedRow() {
+        XCTAssertGreaterThan(QuietSelectionPill.companionOpacity, 0)
+        XCTAssertLessThan(
+            QuietSelectionPill.companionOpacity,
+            1,
+            "a companion pane must not wear the same pill as the focused row"
+        )
+    }
+}

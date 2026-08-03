@@ -486,27 +486,36 @@ private struct QuietProjectGroup: View {
         let sessions = SessionOrderStore.apply(manualOrder, to: project.sessions)
         let statuses = statusMap(sessions: sessions, chats: chats, meshes: meshes)
 
-        // Exactly one row in the whole rail wears the selection pill, and it is
-        // computed here rather than per row: a split shows two surfaces at once,
-        // and a non-active project can still hold a stored pane layout, so
-        // "is this surface on screen?" is not by itself the selection rule.
-        let selected = selectedSurfaceID(chats: chats, meshes: meshes, sessions: sessions)
+        // One row wears the selection pill; every other row that is *also* on
+        // screen wears a quieter one.
+        //
+        // A split shows two surfaces at once, and the rail used to mark only
+        // the focused one — so the second pane sat beside the first looking
+        // closed. Michael: "there is a bug with the double clicked/viewing
+        // multiple tabs." The rail already knew the whole visible set; it was
+        // collapsing it to a single id before drawing.
+        let onScreen = onScreenSurfaceIDs(chats: chats, meshes: meshes, sessions: sessions)
+        let selected = QuietRowSelection.selectedID(
+            visibleIDs: onScreen,
+            focusedPaneID: model.focusedPaneID
+        )
 
         Group {
             header(statuses: statuses)
             if isExpanded {
                 ForEach(chats) { chat in
-                    chatRow(chat, status: statuses[chat.id] ?? .idle, selected: selected)
+                    chatRow(chat, status: statuses[chat.id] ?? .idle, selected: selected, onScreen: onScreen)
                 }
                 ForEach(meshes) { mesh in
-                    meshRow(mesh, status: statuses[mesh.id] ?? .idle, selected: selected)
+                    meshRow(mesh, status: statuses[mesh.id] ?? .idle, selected: selected, onScreen: onScreen)
                 }
                 ForEach(Array(sessions.enumerated()), id: \.element.id) { index, session in
                     sessionRow(
                         session,
                         ordinal: index + 1,
                         status: statuses[session.id] ?? .idle,
-                        selected: selected
+                        selected: selected,
+                        onScreen: onScreen
                     )
                 }
                 .onMove { indices, target in
@@ -833,24 +842,23 @@ private struct QuietProjectGroup: View {
     /// pane layout is a memory of where its surfaces *were*, not what is on
     /// screen — and inside it the focused pane wins, so a split highlights the
     /// pane you are typing in rather than both of its rows.
-    private func selectedSurfaceID(
+    /// Every surface of this project currently on screen, in draw order.
+    private func onScreenSurfaceIDs(
         chats: [AcpChatHandle],
         meshes: [MeshSession],
         sessions: [BrokerTerminalRecord]
-    ) -> String? {
-        guard isActive else { return nil }
+    ) -> [String] {
+        guard isActive else { return [] }
         let ids = chats.map(\.id) + meshes.map(\.id) + sessions.map(\.id)
-        return QuietRowSelection.selectedID(
-            visibleIDs: ids.filter { model.isSurfaceVisible($0) },
-            focusedPaneID: model.focusedPaneID
-        )
+        return ids.filter { model.isSurfaceVisible($0) }
     }
 
     private func sessionRow(
         _ record: BrokerTerminalRecord,
         ordinal: Int,
         status: QuietSessionStatus,
-        selected: String?
+        selected: String?,
+        onScreen: [String]
     ) -> some View {
         let processName = model.meta(for: record.id)?.processName
         return QuietSurfaceRowView(
@@ -868,6 +876,7 @@ private struct QuietProjectGroup: View {
             status: status,
             timeLabel: timeLabel(record.id),
             isSelected: selected == record.id,
+            isOnScreen: onScreen.contains(record.id),
             tooltip: tooltip(for: record),
             groupHover: setHover,
             select: { selectSession(record) },
@@ -876,7 +885,7 @@ private struct QuietProjectGroup: View {
         )
     }
 
-    private func chatRow(_ chat: AcpChatHandle, status: QuietSessionStatus, selected: String?) -> some View {
+    private func chatRow(_ chat: AcpChatHandle, status: QuietSessionStatus, selected: String?, onScreen: [String]) -> some View {
         QuietSurfaceRowView(
             id: chat.id,
             identity: QuietIdentity.identity(agentName: chat.agentID, processName: nil),
@@ -884,6 +893,7 @@ private struct QuietProjectGroup: View {
             status: status,
             timeLabel: timeLabel(chat.id),
             isSelected: selected == chat.id,
+            isOnScreen: onScreen.contains(chat.id),
             tooltip: chatTooltip(chat),
             groupHover: setHover,
             select: { model.selectChat(chat.id) },
@@ -892,7 +902,7 @@ private struct QuietProjectGroup: View {
         )
     }
 
-    private func meshRow(_ mesh: MeshSession, status: QuietSessionStatus, selected: String?) -> some View {
+    private func meshRow(_ mesh: MeshSession, status: QuietSessionStatus, selected: String?, onScreen: [String]) -> some View {
         QuietSurfaceRowView(
             id: mesh.id,
             identity: .mesh,
@@ -900,6 +910,7 @@ private struct QuietProjectGroup: View {
             status: status,
             timeLabel: timeLabel(mesh.id),
             isSelected: selected == mesh.id,
+            isOnScreen: onScreen.contains(mesh.id),
             tooltip: mesh.stage == "Idle" ? "Mesh · Ready" : "Mesh · \(mesh.stage)",
             groupHover: setHover,
             select: { model.selectMesh(mesh.id) },
@@ -1142,6 +1153,13 @@ enum QuietSelectionPill {
     /// Inset from the row's own edges, so the pill floats inside the column
     /// rather than reaching the sidebar's border.
     static let horizontalInset: CGFloat = 6
+    /// How much of the pill a split's *other* pane wears.
+    ///
+    /// Both panes are genuinely on screen, so both are marked — but only one
+    /// holds focus, and the rail must not present them as equals. Just over
+    /// half reads as "also open" at a glance without competing with the row
+    /// whose title is in the accent colour.
+    static let companionOpacity: Double = 0.55
 
     static func fillOpacity(dark: Bool) -> Double { dark ? darkFillOpacity : lightFillOpacity }
 }
@@ -1174,6 +1192,8 @@ private struct QuietRowBody: View {
     let timeLabel: String
     let status: QuietSessionStatus
     let isSelected: Bool
+    /// On screen, but not the pane holding focus.
+    var isOnScreen = false
     let showsReveal: Bool
     let reveal: () -> Void
 
@@ -1206,8 +1226,17 @@ private struct QuietRowBody: View {
         // The rail's ONE fill, and only under the row on screen. `.isSelected`
         // on the enclosing Button carries the same fact to assistive
         // technology, so the pill is decoration and is hidden from it.
+        // The focused row wears the pill; a companion pane in a split wears a
+        // fainter one. A split used to mark only the focused surface, so the
+        // other pane — equally on screen — was indistinguishable from a closed
+        // session. The two states stay clearly ranked: colour and a full pill
+        // for the row you are typing in, a quiet fill for the one beside it.
         .background {
-            if isSelected { QuietSelectionPillView() }
+            if isSelected {
+                QuietSelectionPillView()
+            } else if isOnScreen {
+                QuietSelectionPillView().opacity(QuietSelectionPill.companionOpacity)
+            }
         }
         // Deliberately NOT `.accessibilityElement(children: .combine)` here:
         // that would make this the row's own isolated accessibility node,
@@ -1222,6 +1251,10 @@ private struct QuietRowBody: View {
     /// under a title that reads as inactive.
     private var titleStyle: AnyShapeStyle {
         if isSelected { return AnyShapeStyle(Color.accentColor) }
+        // A companion pane is on screen, so it reads at full strength — but in
+        // the primary ink rather than the accent, which stays the mark of the
+        // one row you are typing in.
+        if isOnScreen { return AnyShapeStyle(HierarchicalShapeStyle.primary) }
         if status.isDimmed { return AnyShapeStyle(HierarchicalShapeStyle.tertiary) }
         return AnyShapeStyle(HierarchicalShapeStyle.secondary)
     }
@@ -1311,6 +1344,8 @@ private struct QuietSurfaceRowView: View {
     let status: QuietSessionStatus
     let timeLabel: String
     let isSelected: Bool
+    /// On screen, but not the pane holding focus.
+    var isOnScreen = false
     let tooltip: String
     /// Reports this row's hover into its project group's shared `hovering`
     /// flag (see `setHover`), which is what keeps the header's hover-only

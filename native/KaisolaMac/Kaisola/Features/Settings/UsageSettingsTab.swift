@@ -34,7 +34,7 @@ struct UsageSettingsTab: View {
     /// CLI writes it into that directory (or the Keychain entry derived from
     /// it), which is precisely what keeps two subscriptions separate.
     private func signIn(to profile: UsageAccountProfile) {
-        let login = profile.provider == .claude ? "claude setup-token" : "codex login"
+        let login = profile.provider == .claude ? "claude auth login" : "codex login"
         let quoted = "'" + profile.expandedDirectory.replacingOccurrences(of: "'", with: "'\\''") + "'"
         NotificationCenter.default.post(
             name: .kaisolaRunInTerminal,

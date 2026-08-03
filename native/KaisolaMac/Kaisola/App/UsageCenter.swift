@@ -896,7 +896,7 @@ final class UsageCenter: ObservableObject {
             .joined()
     }
 
-    /// Account switches performed by `claude setup-token` or `codex login`
+    /// Account switches performed by `claude auth login` or `codex login`
     /// mutate credential files without changing CODEX_HOME/CLAUDE_CONFIG_DIR.
     /// Fold the small credential files into the opaque cache fingerprint so a
     /// different account cannot inherit the previous account's 180-second card.

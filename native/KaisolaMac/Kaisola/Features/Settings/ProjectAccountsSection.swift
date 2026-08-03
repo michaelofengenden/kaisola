@@ -82,7 +82,7 @@ struct ProjectAccountsSection: View {
                         Button("Sign In") { signIn(to: profile) }
                             .buttonStyle(.bordered)
                             .controlSize(.small)
-                            .help("Run \(profile.provider == .claude ? "claude setup-token" : "codex login") scoped to \(profile.directory)")
+                            .help("Run \(profile.provider == .claude ? "claude auth login" : "codex login") scoped to \(profile.directory)")
                             .accessibilityLabel("Sign in to \(profile.label)")
                         Button(role: .destructive) { pendingRemoval = profile } label: {
                             Image(systemName: "xmark")
@@ -244,14 +244,14 @@ struct ProjectAccountsSection: View {
     ///
     /// This is the whole mechanism that keeps subscriptions apart, and the
     /// reason a login has to start here rather than in a bare terminal: run
-    /// `claude setup-token` with no scope and the credential lands in the
+    /// `claude auth login` with no scope and the credential lands in the
     /// default `~/.claude`, replacing whoever was signed in before and taking
     /// every project with it. Five logins done that way are not five accounts
     /// — they are one account, overwritten four times, which is exactly what
     /// Michael saw. Kaisola never handles the credential itself; the CLI
     /// writes it into the directory this points at.
     private func signIn(to profile: UsageAccountProfile) {
-        let login = profile.provider == .claude ? "claude setup-token" : "codex login"
+        let login = profile.provider == .claude ? "claude auth login" : "codex login"
         let quoted = "'" + profile.expandedDirectory.replacingOccurrences(of: "'", with: "'\\''") + "'"
         NotificationCenter.default.post(
             name: .kaisolaRunInTerminal,

@@ -36,7 +36,7 @@ struct SignInCardView: View {
                 .fixedSize(horizontal: false, vertical: true)
             HStack(spacing: 10) {
                 Button {
-                    runInTerminal("claude setup-token")
+                    runInTerminal("claude auth login")
                 } label: {
                     Label("Sign In to Claude", systemImage: "sparkle")
                 }
@@ -48,7 +48,7 @@ struct SignInCardView: View {
                 }
                 .buttonStyle(.borderedProminent)
             }
-            Text("Claude runs \u{201C}claude setup-token\u{201D}; Codex runs \u{201C}codex login\u{201D}. Each signs in to the CLAUDE_CONFIG_DIR / CODEX_HOME that applies to the active project — its per-project account if set, otherwise the app default.")
+            Text("Claude runs \u{201C}claude auth login\u{201D}; Codex runs \u{201C}codex login\u{201D}. Each signs in to the CLAUDE_CONFIG_DIR / CODEX_HOME that applies to the active project — its per-project account if set, otherwise the app default.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)

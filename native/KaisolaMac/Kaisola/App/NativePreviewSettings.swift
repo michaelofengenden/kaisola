@@ -85,6 +85,117 @@ enum GlassBackdropSource: String, CaseIterable, Identifiable, Sendable {
     var title: String { self == .wallpaper ? "Wallpaper" : "Live" }
 }
 
+/// How far past legibility the wallpaper under the glass is blurred, as the
+/// **scattering length of the material in screen points**.
+///
+/// A knob rather than a constant because it is the one number in the glass
+/// stack that is a taste call rather than a measurement: every contrast floor
+/// in this app holds across the whole range (swept and rendered, 14 pt to
+/// 56 pt), so what it decides is only how much of the desktop is recognisable
+/// through the surface. `balanced` is the shipped 28 pt, which is also roughly
+/// where AppKit's own behind-window blur sits.
+enum GlassTexture: String, CaseIterable, Identifiable, Sendable {
+    case soft
+    case balanced
+    case crisp
+
+    var id: String { rawValue }
+    var title: String {
+        switch self {
+        case .soft: "Soft"
+        case .balanced: "Balanced"
+        case .crisp: "Crisp"
+        }
+    }
+
+    /// Blur radius in screen points.
+    var blurPoints: Double {
+        switch self {
+        case .soft: 44
+        case .balanced: 28
+        case .crisp: 18
+        }
+    }
+}
+
+/// How much of the desktop's colour the glass carries.
+///
+/// Scales `DesktopBackdropRenderer.desktopChromaShare`, which is a *target* on
+/// the finished still's measured Oklab colourfulness — so this moves how
+/// colourful the surface is without touching how bright it is, and without
+/// reintroducing any dependence on which hue the wallpaper happens to be.
+/// A neutral desktop stays neutral at every setting, because the target is
+/// proportional to the wallpaper's own colourfulness and a grey picture's is
+/// zero.
+enum GlassColour: String, CaseIterable, Identifiable, Sendable {
+    case muted
+    case balanced
+    case vivid
+
+    var id: String { rawValue }
+    var title: String {
+        switch self {
+        case .muted: "Muted"
+        case .balanced: "Balanced"
+        case .vivid: "Vivid"
+        }
+    }
+
+    var chromaScale: Double {
+        switch self {
+        case .muted: 0.45
+        case .balanced: 1.0
+        case .vivid: 1.8
+        }
+    }
+}
+
+/// How much of the wallpaper the veil lets through.
+///
+/// The only knob here with a real cost: thinning the veil is exactly what
+/// rounds 3 and 4 found the contrast floors could not afford.
+///
+/// The floors turn out **not** to be what bounds it any more. Rendered across
+/// all twenty-seven setting combinations, the worst patch of the worst fixture
+/// barely moves — dark secondary 4.97 at 0.92 against 4.89 at 0.80, on a 4.5
+/// floor — because the tail cap already bounds the still the veil is letting
+/// through, so a thinner veil transmits a *bounded* picture rather than an
+/// arbitrary one. That is round 7's cap paying out a second time.
+///
+/// So the bound is taken from the invariant that is still meaningful:
+/// `GlassBackdropWash.desktopTransmissionBand(isDark:)`. **0.89** is the
+/// largest step that keeps every surface inside the transmission ceiling those
+/// two rounds declared and priced — dark's 0.66 goes to 0.70, exactly the
+/// ceiling. Stopping at a declared invariant rather than at "where the test
+/// starts failing" is deliberate: the fixtures here are the extremes of the
+/// wallpapers we have, not of every desktop a user can choose.
+/// `testEveryGlassSettingCombinationStaysLegible` renders the whole grid and
+/// `testGlassSettingsPersistAndDefaultToWhatShipped` holds the band.
+enum GlassClarity: String, CaseIterable, Identifiable, Sendable {
+    case frosted
+    case balanced
+    case clear
+
+    var id: String { rawValue }
+    var title: String {
+        switch self {
+        case .frosted: "Frosted"
+        case .balanced: "Balanced"
+        case .clear: "Clear"
+        }
+    }
+
+    /// Multiplier on every veil coverage. Above 1 is always safe — more veil is
+    /// more contrast — so only the step below 1 is bounded by measurement.
+    var veilScale: Double {
+        switch self {
+        case .frosted: 1.16
+        case .balanced: 1.0
+        case .clear: 0.89
+        }
+    }
+}
+
 /// The canvas behind workspace surfaces. Terminals keep an opaque, legible
 /// palette; this backdrop is visible through navigation chrome, empty states,
 /// chats, and lightweight utilities.
@@ -341,6 +452,18 @@ final class NativePreviewSettings: ObservableObject {
 
     @Published var workspaceBackdrop: WorkspaceBackdropMode {
         didSet { persist(workspaceBackdrop.rawValue, forKey: Keys.workspaceBackdrop) }
+    }
+
+    @Published var glassTexture: GlassTexture {
+        didSet { persist(glassTexture.rawValue, forKey: Keys.glassTexture) }
+    }
+
+    @Published var glassColour: GlassColour {
+        didSet { persist(glassColour.rawValue, forKey: Keys.glassColour) }
+    }
+
+    @Published var glassClarity: GlassClarity {
+        didSet { persist(glassClarity.rawValue, forKey: Keys.glassClarity) }
     }
 
     @Published var glassBackdropSource: GlassBackdropSource {
@@ -614,6 +737,9 @@ final class NativePreviewSettings: ObservableObject {
         static let sidebarAppearance = "sidebarAppearance"
         static let workspaceBackdrop = "workspaceBackdrop"
         static let glassBackdropSource = "glassBackdropSource"
+        static let glassTexture = "glassTexture"
+        static let glassColour = "glassColour"
+        static let glassClarity = "glassClarity"
         static let terminalFontSize = "terminalFontSize"
         static let terminalFontFamily = "terminalFontFamily"
         static let terminalFontWeight = "terminalFontWeight"
@@ -647,6 +773,12 @@ final class NativePreviewSettings: ObservableObject {
         workspaceBackdrop = defaults.string(forKey: Keys.workspaceBackdrop).flatMap(WorkspaceBackdropMode.init) ?? .glass
         glassBackdropSource = defaults.string(forKey: Keys.glassBackdropSource)
             .flatMap(GlassBackdropSource.init) ?? .wallpaper
+        glassTexture = defaults.string(forKey: Keys.glassTexture)
+            .flatMap(GlassTexture.init) ?? .balanced
+        glassColour = defaults.string(forKey: Keys.glassColour)
+            .flatMap(GlassColour.init) ?? .balanced
+        glassClarity = defaults.string(forKey: Keys.glassClarity)
+            .flatMap(GlassClarity.init) ?? .balanced
         let stored = defaults.double(forKey: Keys.terminalFontSize)
         terminalFontSize = stored > 0
             ? min(max(stored, Self.terminalFontRange.lowerBound), Self.terminalFontRange.upperBound)
@@ -860,6 +992,22 @@ struct GlassBackdropWash: Equatable, Sendable {
 
     var color: Color { Color(red: red, green: green, blue: blue) }
 
+    /// Every coverage scaled by the same factor, clamped so a setting can never
+    /// produce a veil outside the range the constants are declared in. The hue
+    /// is untouched — this moves how much veil there is, never what colour it
+    /// is, so the neutrality invariant holds at every setting.
+    func scaled(by factor: Double) -> GlassBackdropWash {
+        func coverage(_ value: Double) -> Double { min(0.95, max(0, value * factor)) }
+        return GlassBackdropWash(
+            red: red,
+            green: green,
+            blue: blue,
+            topOpacity: coverage(topOpacity),
+            baseOpacity: coverage(baseOpacity),
+            bottomOpacity: coverage(bottomOpacity)
+        )
+    }
+
     /// One neutral gradient. In light mode the top carries *more* white; in
     /// dark mode it carries *less* near-black. Both read as light from above.
     var veil: LinearGradient {
@@ -1014,7 +1162,11 @@ struct GlassBackdropWash: Equatable, Sendable {
     /// It is not done here because the 207 `.secondary` call sites all live in
     /// `Features/*` and `Acp/*`, and a glass constant that silently restyles
     /// every label in the app is a change that should be made on purpose.
-    static func sidebar(isDark: Bool) -> GlassBackdropWash {
+    static func sidebar(isDark: Bool, clarity: GlassClarity = .balanced) -> GlassBackdropWash {
+        sidebarBase(isDark: isDark).scaled(by: clarity.veilScale)
+    }
+
+    private static func sidebarBase(isDark: Bool) -> GlassBackdropWash {
         isDark
             ? dark(top: 0.27, base: 0.34, bottom: 0.43)
             : light(top: 0.51, base: 0.45, bottom: 0.41)
@@ -1038,7 +1190,11 @@ struct GlassBackdropWash: Equatable, Sendable {
     /// 9.1:1), secondary 3.7:1 (worst 3.4:1). The workspace is the deeper
     /// surface, so it is also the one the worst patch is always found on — every
     /// light figure quoted as a worst case in this file is a workspace figure.
-    static func workspace(isDark: Bool) -> GlassBackdropWash {
+    static func workspace(isDark: Bool, clarity: GlassClarity = .balanced) -> GlassBackdropWash {
+        workspaceBase(isDark: isDark).scaled(by: clarity.veilScale)
+    }
+
+    private static func workspaceBase(isDark: Bool) -> GlassBackdropWash {
         isDark
             ? dark(top: 0.30, base: 0.37, bottom: 0.46)
             : light(top: 0.46, base: 0.40, bottom: 0.36)
@@ -1535,11 +1691,26 @@ struct DesktopBackdropKey: Hashable, Sendable {
         max(512, (screenPoints / 128).rounded() * 128)
     }
 
-    init(path: String, modified: Date?, isDark: Bool, screenPoints: Double = 1512) {
+    /// The two glass settings that change the *bake* rather than the veil over
+    /// it, so switching either re-bakes once and then draws from cache like any
+    /// other desktop change.
+    let texture: GlassTexture
+    let colour: GlassColour
+
+    init(
+        path: String,
+        modified: Date?,
+        isDark: Bool,
+        screenPoints: Double = 1512,
+        texture: GlassTexture = .balanced,
+        colour: GlassColour = .balanced
+    ) {
         self.path = path
         self.modified = modified
         self.isDark = isDark
         self.screenPoints = Self.quantized(screenPoints: screenPoints)
+        self.texture = texture
+        self.colour = colour
     }
 
     var url: URL { URL(fileURLWithPath: path) }
@@ -1816,8 +1987,12 @@ enum DesktopBackdropRenderer {
     /// as a **maximum**, so a wallpaper smaller than `stillWidth` comes back at
     /// its own size, and using the declared width there would blur a small
     /// picture by the wrong number of points.
-    static func blurRadius(screenPoints: Double, stillPixels: Int = stillWidth) -> Double {
-        Double(stillPixels) * desktopBlurPoints / max(screenPoints, 1)
+    static func blurRadius(
+        screenPoints: Double,
+        stillPixels: Int = stillWidth,
+        blurPoints: Double = desktopBlurPoints
+    ) -> Double {
+        Double(stillPixels) * blurPoints / max(screenPoints, 1)
     }
 
     /// The legacy fraction-of-the-frame statement of the same blur, kept
@@ -2206,8 +2381,13 @@ enum DesktopBackdropRenderer {
         let tint = DesktopTintSampler.pixels(image: still)
             .flatMap { DesktopTintSampler.wallpaperAverage(rgba: $0) }
             ?? DesktopTintSampler.fallback
-        guard let blurred = blur(still, isDark: key.isDark, screenPoints: key.screenPoints)
-        else { return .flat(tint) }
+        guard let blurred = blur(
+            still,
+            isDark: key.isDark,
+            screenPoints: key.screenPoints,
+            texture: key.texture,
+            colour: key.colour
+        ) else { return .flat(tint) }
         // The wallpaper's own pixel size, not the thumbnail's — the layout the
         // glass is pinned to depends on it for the centred and tiled desktops.
         let properties = CGImageSourceCopyPropertiesAtIndex(source, index, nil) as? [CFString: Any]
@@ -2277,8 +2457,18 @@ enum DesktopBackdropRenderer {
     /// `clampedToExtent` before the blur, cropped back after: without it the
     /// Gaussian averages in transparent black at every edge and the backdrop
     /// arrives with a dark vignette exactly where the window's corners are.
-    private static func blur(_ image: CGImage, isDark: Bool, screenPoints: Double) -> CGImage? {
-        let radius = blurRadius(screenPoints: screenPoints, stillPixels: image.width)
+    private static func blur(
+        _ image: CGImage,
+        isDark: Bool,
+        screenPoints: Double,
+        texture: GlassTexture,
+        colour: GlassColour
+    ) -> CGImage? {
+        let radius = blurRadius(
+            screenPoints: screenPoints,
+            stillPixels: image.width,
+            blurPoints: texture.blurPoints
+        )
         let input = CIImage(cgImage: image)
         let extent = input.extent
 
@@ -2312,7 +2502,7 @@ enum DesktopBackdropRenderer {
         // what it did. All three still ride **one** filter pass — see
         // `BakeToneMap` for the map and `solveToneMap` for why it is solved by
         // measurement rather than by formula.
-        let map = solveToneMap(probe: sampled, isDark: isDark)
+        let map = solveToneMap(probe: sampled, isDark: isDark, chromaScale: colour.chromaScale)
         let vectors = map.matrix
         let matrix = CIFilter.colorMatrix()
         matrix.inputImage = structured
@@ -2609,7 +2799,11 @@ extension DesktopBackdropRenderer {
     /// The saturation target being *proportional to the wallpaper's* is what
     /// keeps a grey desktop grey: a neutral picture has zero colourfulness, so
     /// its target is zero and no amount of solving can invent a hue.
-    static func solveToneMap(probe rgba: [UInt8], isDark: Bool) -> BakeToneMap {
+    static func solveToneMap(
+        probe rgba: [UInt8],
+        isDark: Bool,
+        chromaScale: Double = 1
+    ) -> BakeToneMap {
         var pixels: [(red: Double, green: Double, blue: Double)] = []
         pixels.reserveCapacity(rgba.count / 4)
         var index = 0
@@ -2641,7 +2835,7 @@ extension DesktopBackdropRenderer {
                 let peak = max(pixel.red, max(pixel.green, pixel.blue))
                 let floor = min(pixel.red, min(pixel.green, pixel.blue))
                 return total + (peak > 0.004 ? (peak - floor) / peak : 0)
-            } / Double(pixels.count) * desktopChromaShare(isDark: isDark)
+            } / Double(pixels.count) * desktopChromaShare(isDark: isDark) * max(0, chromaScale)
         )
 
         // The map is `(luma + delta·saturation)·gain + offset` per channel, and
@@ -3398,11 +3592,17 @@ final class DesktopBackdropProvider: ObservableObject {
         // desktop, so how wide that desktop is belongs to the bake — and so to
         // the cache key. See `DesktopBackdropKey.screenPoints`.
         let screenPoints = Double(screen?.frame.width ?? 1512)
+        let texture = NativePreviewSettings.shared.glassTexture
+        let colour = NativePreviewSettings.shared.glassColour
         work?.cancel()
         work = Task { [weak self] in
             let key = await Task.detached(priority: .utility) {
                 Self.key(
-                    desktopImageURL: desktopImageURL, isDark: isDark, screenPoints: screenPoints
+                    desktopImageURL: desktopImageURL,
+                    isDark: isDark,
+                    screenPoints: screenPoints,
+                    texture: texture,
+                    colour: colour
                 )
             }.value
             guard let self, generation == self.generation else { return }
@@ -3462,14 +3662,21 @@ final class DesktopBackdropProvider: ObservableObject {
     private nonisolated static func key(
         desktopImageURL: URL?,
         isDark: Bool,
-        screenPoints: Double
+        screenPoints: Double,
+        texture: GlassTexture,
+        colour: GlassColour
     ) -> DesktopBackdropKey? {
         guard let url = DesktopWallpaperLocator
             .resolveOnDisk(desktopImageURL: desktopImageURL).url else { return nil }
         let modified = try? url.resourceValues(forKeys: [.contentModificationDateKey])
             .contentModificationDate
         return DesktopBackdropKey(
-            path: url.path, modified: modified, isDark: isDark, screenPoints: screenPoints
+            path: url.path,
+            modified: modified,
+            isDark: isDark,
+            screenPoints: screenPoints,
+            texture: texture,
+            colour: colour
         )
     }
 
@@ -3565,6 +3772,11 @@ struct DesktopGlassLayer: View {
         layer
             .onAppear { desktop.refresh(isDark: colorScheme == .dark) }
             .onChange(of: colorScheme) { desktop.refresh(isDark: colorScheme == .dark) }
+            // Both of these change the bake rather than the veil, so the still
+            // has to be re-rendered — once, through the same cached, coalesced,
+            // off-thread path any desktop change takes.
+            .onChange(of: settings.glassTexture) { desktop.refresh(isDark: colorScheme == .dark) }
+            .onChange(of: settings.glassColour) { desktop.refresh(isDark: colorScheme == .dark) }
     }
 
     @ViewBuilder
@@ -3820,6 +4032,7 @@ struct SidebarBackdropView: View {
     @Environment(\.colorScheme) private var colorScheme
     @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
     @Environment(\.colorSchemeContrast) private var accessibilityContrast
+    @ObservedObject private var settings = NativePreviewSettings.shared
     let appearance: SidebarAppearance
 
     @ViewBuilder
@@ -3831,7 +4044,9 @@ struct SidebarBackdropView: View {
             } else {
                 ZStack {
                     DesktopGlassLayer(liveMaterial: .sidebar, liveTint: Self.liveTint)
-                    GlassBackdropWash.sidebar(isDark: colorScheme == .dark).veil
+                    GlassBackdropWash
+                        .sidebar(isDark: colorScheme == .dark, clarity: settings.glassClarity)
+                        .veil
                     if accessibilityContrast == .increased {
                         Color(nsColor: .controlBackgroundColor)
                             .opacity(GlassBackdropWash.sidebarIncreasedContrastOverlay(isDark: colorScheme == .dark))
@@ -3849,6 +4064,7 @@ struct WorkspaceBackdropView: View {
     @Environment(\.colorScheme) private var colorScheme
     @Environment(\.colorSchemeContrast) private var accessibilityContrast
     @ObservedObject private var desktop = DesktopBackdropProvider.shared
+    @ObservedObject private var settings = NativePreviewSettings.shared
     let mode: WorkspaceBackdropMode
 
     var body: some View {
@@ -3876,7 +4092,9 @@ struct WorkspaceBackdropView: View {
             } else {
                 ZStack {
                     DesktopGlassLayer(liveMaterial: .underWindowBackground)
-                    GlassBackdropWash.workspace(isDark: colorScheme == .dark).veil
+                    GlassBackdropWash
+                        .workspace(isDark: colorScheme == .dark, clarity: settings.glassClarity)
+                        .veil
                     if accessibilityContrast == .increased {
                         Color(nsColor: .windowBackgroundColor)
                             .opacity(GlassBackdropWash.workspaceIncreasedContrastOverlay(isDark: colorScheme == .dark))

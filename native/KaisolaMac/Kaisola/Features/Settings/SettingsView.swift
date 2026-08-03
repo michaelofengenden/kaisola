@@ -266,6 +266,48 @@ struct SettingsView: View {
                         .accessibilityLabel("Glass source")
                     }
                     SettingsDivider()
+                    SettingsRow(
+                        title: "Glass clarity",
+                        detail: "How much of the desktop comes through",
+                        symbol: "drop.halffull"
+                    ) {
+                        Menu {
+                            ForEach(GlassClarity.allCases) { clarity in
+                                Button(clarity.title) { settings.glassClarity = clarity }
+                            }
+                        } label: { SettingsChoiceLabel(settings.glassClarity.title) }
+                        .menuIndicator(.hidden)
+                        .accessibilityLabel("Glass clarity")
+                    }
+                    SettingsDivider()
+                    SettingsRow(
+                        title: "Glass blur",
+                        detail: "How far the wallpaper is softened behind the glass",
+                        symbol: "circle.hexagongrid"
+                    ) {
+                        Menu {
+                            ForEach(GlassTexture.allCases) { texture in
+                                Button(texture.title) { settings.glassTexture = texture }
+                            }
+                        } label: { SettingsChoiceLabel(settings.glassTexture.title) }
+                        .menuIndicator(.hidden)
+                        .accessibilityLabel("Glass blur")
+                    }
+                    SettingsDivider()
+                    SettingsRow(
+                        title: "Glass colour",
+                        detail: "How much of the wallpaper's colour the glass carries",
+                        symbol: "paintpalette"
+                    ) {
+                        Menu {
+                            ForEach(GlassColour.allCases) { colour in
+                                Button(colour.title) { settings.glassColour = colour }
+                            }
+                        } label: { SettingsChoiceLabel(settings.glassColour.title) }
+                        .menuIndicator(.hidden)
+                        .accessibilityLabel("Glass colour")
+                    }
+                    SettingsDivider()
                     SettingsRow(title: "Canvas", detail: "Backdrop behind chats and tools", symbol: "square.on.square") {
                         Menu {
                             ForEach(WorkspaceBackdropMode.allCases) { mode in

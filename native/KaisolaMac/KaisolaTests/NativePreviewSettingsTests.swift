@@ -2317,6 +2317,205 @@ final class NativePreviewSettingsTests: XCTestCase {
         )
     }
 
+    /// Three glass knobs, twenty-seven combinations, and **every one of them
+    /// rendered** rather than argued about.
+    ///
+    /// Making the glass configurable is only safe if the contrast floors are a
+    /// property of the *range* rather than of the default. Two of the three
+    /// knobs are free — blur is a taste call the floors are flat in, and colour
+    /// moves chroma without moving lightness — but `GlassClarity` thins the
+    /// veil, which is exactly what rounds 3 and 4 measured the floors could not
+    /// afford. So the whole grid is held to the same floors the default is, on
+    /// the worst fixtures, at several window positions.
+    ///
+    /// This is what sets `GlassClarity.clear`'s multiplier. It is 0.92 and not
+    /// 0.85 because 0.85 is where this test starts failing.
+    func testEveryGlassSettingCombinationStaysLegible() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appending(path: "kaisola-knobs-\(UUID().uuidString)", directoryHint: .isDirectory)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let screen = CGRect(x: 0, y: 0, width: 1512, height: 982)
+        // The two fixtures that bind: the widest-range ramp round 3 found, and
+        // the adversarial one wider than anything Apple ships.
+        // One fixture, and the strictly hardest one: a full-range blur-invariant
+        // ramp, wider than anything Apple ships and wider than the
+        // `neutral-wide` fixture the floors tests use. Nine bakes and a hundred
+        // renders is already the expensive end of a unit test.
+        let wallpapers: [(String, (Double, Double, Double), Double)] = [
+            ("adversarial", (0.5, 0.5, 0.5), 1.95),
+        ]
+        var worstDark = (primary: Double.infinity, secondary: Double.infinity)
+        var worstLight = (primary: Double.infinity, secondary: Double.infinity)
+
+        for texture in GlassTexture.allCases {
+            for colour in GlassColour.allCases {
+                for (name, base, range) in wallpapers {
+                    for isDark in [true, false] {
+                        let url = try writeRampWallpaper(
+                            base: base, range: range, into: directory,
+                            named: "\(name)-\(texture.rawValue)-\(colour.rawValue)"
+                        )
+                        let key = DesktopBackdropKey(
+                            path: url.path, modified: nil, isDark: isDark,
+                            texture: texture, colour: colour
+                        )
+                        guard case let .wallpaper(still, _, pixels)? =
+                            DesktopBackdropRenderer.render(key: key)
+                        else { return XCTFail("\(name) produced no painting") }
+                        for clarity in GlassClarity.allCases {
+                            // Dark's worst case is the sidebar (thinner veil)
+                            // and light's is the canvas (deeper veil), so both
+                            // are rendered — the canvas at a size that still
+                            // exercises a real crop without making this test a
+                            // minute long. Position: hard against the left edge
+                            // of the display, which is where the sidebar sits.
+                            for (label, width, height, wash) in [
+                                (
+                                    "sidebar", 210, 900,
+                                    GlassBackdropWash.sidebar(isDark: isDark, clarity: clarity)
+                                ),
+                                (
+                                    "canvas", 420, 380,
+                                    GlassBackdropWash.workspace(isDark: isDark, clarity: clarity)
+                                ),
+                            ] {
+                                let crop = DesktopBackdropGeometry.contentsRect(
+                                    surface: CGRect(
+                                        x: 0, y: 41,
+                                        width: Double(width), height: Double(height)
+                                    ),
+                                    imagePixels: pixels, screen: screen,
+                                    scaling: .scaleProportionallyUpOrDown,
+                                    allowsClipping: true, backingScale: 2
+                                )
+                                let surface = try renderGlassSurface(
+                                    still: still, wash: wash, isDark: isDark,
+                                    width: width, height: height, crop: crop
+                                )
+                                let worst = worstPatchContrast(surface, isDark: isDark)
+                                let place = """
+                                \(name)/\(texture.rawValue)/\(colour.rawValue)/\
+                                \(clarity.rawValue)/\(label)/\(isDark ? "dark" : "light")
+                                """
+                                XCTAssertGreaterThanOrEqual(
+                                    worst.primary, 7, "\(place): primary \(worst.primary):1"
+                                )
+                                XCTAssertGreaterThanOrEqual(
+                                    worst.secondary, isDark ? 4.5 : 3.43,
+                                    "\(place): secondary \(worst.secondary):1"
+                                )
+                                if isDark {
+                                    worstDark = (
+                                        min(worstDark.primary, worst.primary),
+                                        min(worstDark.secondary, worst.secondary)
+                                    )
+                                } else {
+                                    worstLight = (
+                                        min(worstLight.primary, worst.primary),
+                                        min(worstLight.secondary, worst.secondary)
+                                    )
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        print(String(
+            format: "[knobs] worst over all combinations — dark P %.2f S %.2f, light P %.2f S %.2f",
+            worstDark.primary, worstDark.secondary, worstLight.primary, worstLight.secondary
+        ))
+    }
+
+    /// The knobs are preferences like any other: they persist, they default to
+    /// exactly what shipped, and a stored value the app no longer understands
+    /// falls back rather than crashing.
+    func testGlassSettingsPersistAndDefaultToWhatShipped() {
+        let suite = "kaisola-glass-knobs-\(UUID().uuidString)"
+        let defaults = try! XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+
+        let fresh = NativePreviewSettings(defaults: defaults)
+        // The default must be the shipped constant on every knob, or this round
+        // silently changed the surface for everyone who never opens Settings.
+        XCTAssertEqual(fresh.glassTexture, .balanced)
+        XCTAssertEqual(fresh.glassColour, .balanced)
+        XCTAssertEqual(fresh.glassClarity, .balanced)
+        XCTAssertEqual(
+            GlassTexture.balanced.blurPoints,
+            DesktopBackdropRenderer.desktopBlurPoints,
+            accuracy: 0.0001
+        )
+        XCTAssertEqual(GlassColour.balanced.chromaScale, 1, accuracy: 0.0001)
+        XCTAssertEqual(GlassClarity.balanced.veilScale, 1, accuracy: 0.0001)
+        XCTAssertEqual(
+            GlassBackdropWash.sidebar(isDark: true, clarity: .balanced),
+            GlassBackdropWash.sidebar(isDark: true)
+        )
+
+        fresh.glassTexture = .crisp
+        fresh.glassColour = .vivid
+        fresh.glassClarity = .clear
+        let reopened = NativePreviewSettings(defaults: defaults)
+        XCTAssertEqual(reopened.glassTexture, .crisp)
+        XCTAssertEqual(reopened.glassColour, .vivid)
+        XCTAssertEqual(reopened.glassClarity, .clear)
+
+        defaults.set("holographic", forKey: "glassTexture")
+        XCTAssertEqual(NativePreviewSettings(defaults: defaults).glassTexture, .balanced)
+
+        // Each knob has to actually reach the layer it claims to: the two that
+        // change the bake belong to the cache key, the one that changes the
+        // veil must not.
+        let base = DesktopBackdropKey(path: "/a", modified: nil, isDark: true)
+        XCTAssertNotEqual(
+            base, DesktopBackdropKey(path: "/a", modified: nil, isDark: true, texture: .crisp)
+        )
+        XCTAssertNotEqual(
+            base, DesktopBackdropKey(path: "/a", modified: nil, isDark: true, colour: .vivid)
+        )
+        XCTAssertNotEqual(
+            GlassBackdropWash.sidebar(isDark: true, clarity: .clear).baseOpacity,
+            GlassBackdropWash.sidebar(isDark: true, clarity: .frosted).baseOpacity
+        )
+        XCTAssertGreaterThan(GlassTexture.soft.blurPoints, GlassTexture.crisp.blurPoints)
+        XCTAssertGreaterThan(GlassColour.vivid.chromaScale, GlassColour.muted.chromaScale)
+        XCTAssertGreaterThan(GlassClarity.frosted.veilScale, GlassClarity.clear.veilScale)
+
+        // The veil's hue is never a setting: scaling coverage must not move the
+        // surface off neutral, which is the invariant three rounds have paid
+        // for. Held on the scaler itself so no future knob can break it.
+        //
+        // And every setting has to stay inside the transmission band rounds 3
+        // and 4 declared and priced the whole veil stack against. That band —
+        // not the contrast floors — is what bounds `clear`: rendered, the
+        // floors barely move across the range, because the tail cap already
+        // bounds the still the veil is letting through.
+        for clarity in GlassClarity.allCases {
+            for isDark in [true, false] {
+                let band = GlassBackdropWash.desktopTransmissionBand(isDark: isDark)
+                for (surface, wash) in [
+                    ("sidebar", GlassBackdropWash.sidebar(isDark: isDark, clarity: clarity)),
+                    ("workspace", GlassBackdropWash.workspace(isDark: isDark, clarity: clarity)),
+                ] {
+                    XCTAssertEqual(wash.red, wash.green, accuracy: 1e-9)
+                    XCTAssertEqual(wash.green, wash.blue, accuracy: 1e-9)
+                    let transmission = 1 - wash.baseOpacity
+                    XCTAssertGreaterThanOrEqual(
+                        transmission, band.floor,
+                        "\(clarity.rawValue) \(surface) transmits \(transmission)"
+                    )
+                    XCTAssertLessThanOrEqual(
+                        transmission, band.ceiling,
+                        "\(clarity.rawValue) \(surface) transmits \(transmission)"
+                    )
+                }
+            }
+        }
+    }
+
     /// The bake exactly as it shipped in **round 7** — a 448 px still, a blur
     /// of 5% of it, and lightness measured as **Rec. 709 luma** with the
     /// correction applied as `CIColorControls`' additive brightness. Frozen

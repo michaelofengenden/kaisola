@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.1.102 — 2026-08-04
+
+- Switch a chat's model from inside the chat — Opus, Sonnet, Haiku, or any typed model id — and the conversation resumes under it. The account stays put, so nothing restarts from scratch.
+- Move a terminal to another project: right-click it in the sidebar or its pane header. It keeps running exactly where it was; only where you see it changes, its tooltip names where it came from, and Return puts it back.
+- Decide per event when notifications arrive: permission asks, finished turns, and terminal bells each get Never / When in background / Always.
+
 ## 0.1.101 — 2026-08-04
 
 - The bell is now the all-agents center: every session that needs you, across every project, grouped by project with Permissions / Done / Bells filters. Entries whose session is gone dim and clear with one click.

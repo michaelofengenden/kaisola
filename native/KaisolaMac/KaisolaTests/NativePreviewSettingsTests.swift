@@ -2444,14 +2444,20 @@ final class NativePreviewSettingsTests: XCTestCase {
                                 // numbers: they are a floor Clear must still
                                 // clear, and thinning its veil further will
                                 // fail here rather than degrade silently.
-                                let relaxed = clarity.relaxesTextContrast
+                                // Clear concedes exactly one number: light
+                                // secondary text, 3.43 → 3.2. Primary keeps its
+                                // full 7:1 everywhere and dark keeps all of its
+                                // floors, because the veil is not what bounds
+                                // them — the tail cap is, which is why 0.92
+                                // transmission costs six percent rather than
+                                // collapsing the surface.
+                                let relaxed = clarity.relaxesTextContrast && !isDark
                                 XCTAssertGreaterThanOrEqual(
-                                    worst.primary, relaxed ? 3.4 : 7,
-                                    "\(place): primary \(worst.primary):1"
+                                    worst.primary, 7, "\(place): primary \(worst.primary):1"
                                 )
                                 XCTAssertGreaterThanOrEqual(
                                     worst.secondary,
-                                    relaxed ? 1.7 : (isDark ? 4.5 : 3.43),
+                                    relaxed ? 3.2 : (isDark ? 4.5 : 3.43),
                                     "\(place): secondary \(worst.secondary):1"
                                 )
                                 if isDark {
@@ -2561,7 +2567,7 @@ final class NativePreviewSettingsTests: XCTestCase {
                     )
                     XCTAssertLessThanOrEqual(
                         transmission,
-                        clarity.relaxesTextContrast ? band.ceiling + 0.18 : band.ceiling,
+                        clarity.relaxesTextContrast ? band.ceiling + 0.40 : band.ceiling,
                         "\(clarity.rawValue) \(surface) transmits \(transmission)"
                     )
                 }

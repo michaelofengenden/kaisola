@@ -11,7 +11,7 @@ final class GlassClarityTradeTests: XCTestCase {
     func testClearIsSubstantiallyThinnerThanBalanced() {
         let clear = GlassClarity.clear.veilScale
         let balanced = GlassClarity.balanced.veilScale
-        XCTAssertLessThan(clear, balanced * 0.7, "Clear must be a visible step, not a nudge")
+        XCTAssertLessThan(clear, balanced * 0.3, "Clear must be a real step, not a nudge")
         XCTAssertGreaterThan(clear, 0, "…and still a veil, not nothing")
         XCTAssertGreaterThan(GlassClarity.frosted.veilScale, balanced)
     }
@@ -63,7 +63,7 @@ final class GlassClarityTradeTests: XCTestCase {
     /// Crisp has to be a real step too: at 18pt over a 210pt sidebar nothing
     /// read as itself, which is why "crisp" changed nothing visible.
     func testCrispIsMeaningfullySharperThanBalanced() {
-        XCTAssertLessThan(GlassTexture.crisp.blurPoints, GlassTexture.balanced.blurPoints * 0.5)
+        XCTAssertLessThan(GlassTexture.crisp.blurPoints, GlassTexture.balanced.blurPoints * 0.25)
         XCTAssertGreaterThan(
             GlassTexture.crisp.blurPoints, 0,
             "still a blur — text behind the window must never be readable through it"

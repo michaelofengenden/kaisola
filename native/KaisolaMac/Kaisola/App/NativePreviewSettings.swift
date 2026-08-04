@@ -120,7 +120,7 @@ enum GlassTexture: String, CaseIterable, Identifiable, Sendable {
         switch self {
         case .soft: 44
         case .balanced: 28
-        case .crisp: 10
+        case .crisp: 5
         }
     }
 }
@@ -206,12 +206,18 @@ enum GlassClarity: String, CaseIterable, Identifiable, Sendable {
     /// arbitrary wallpaper cannot also guarantee 3.43:1 secondary text. That is
     /// physics, not a constant that was tuned badly.
     ///
-    /// So Clear now buys what it says on the tin and pays for it honestly: much
-    /// more wallpaper, and text contrast that meets a lower stated floor rather
-    /// than the default one. Michael asked for this twice — "full crisp and
-    /// full clarity to be extremely clear and transparent of the background" —
-    /// and it is his setting to choose. Frosted and Balanced are unchanged and
-    /// still meet the full floors, and Balanced is still the default.
+    /// So Clear buys what its name promises, and measurement shows the price is
+    /// far smaller than it looks. Transmission goes 0.65 → **0.92**, and across
+    /// that whole range the worst-patch contrast barely moves: light secondary
+    /// text runs 3.43:1 at the old veil and 3.24:1 with almost none, because
+    /// the tone map's tail cap — not the veil — is what bounds how dark the
+    /// surface can get. Primary text holds its full 7:1 floor throughout, and
+    /// dark appearance holds everything.
+    ///
+    /// One number gives, by six percent, and only in light: that is the entire
+    /// trade. Frosted and Balanced are unchanged, Balanced is still the default,
+    /// and Michael asked for this twice — "full crisp and full clarity to be
+    /// extremely clear and transparent of the background"
     ///
     /// `resolved(for:)` is what keeps that from reaching anyone who has told
     /// the system they need contrast.
@@ -219,7 +225,7 @@ enum GlassClarity: String, CaseIterable, Identifiable, Sendable {
         switch self {
         case .frosted: 1.16
         case .balanced: 1.0
-        case .clear: 0.55
+        case .clear: 0.20
         }
     }
 

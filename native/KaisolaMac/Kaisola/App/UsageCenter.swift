@@ -247,6 +247,15 @@ struct SessionAccountBinding: Codable, Equatable, Hashable, Sendable {
         return environment.merging(binding.environmentOverlay) { _, session in session }
     }
 
+    /// Which row of a chat's account menu carries the checkmark. `profileID`
+    /// nil is the "Project/default" row, current exactly when the live binding
+    /// names no account (the resolve fallback). Pure so the menu cannot invent
+    /// its own idea of "current".
+    static func menuRowIsCurrent(binding: SessionAccountBinding?, profileID: String?) -> Bool {
+        guard let profileID else { return binding?.accountID == nil }
+        return binding?.accountID == profileID
+    }
+
     private static func canonicalDirectory(_ rawValue: String) -> String? {
         let trimmed = rawValue.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty,

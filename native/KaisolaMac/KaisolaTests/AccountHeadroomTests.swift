@@ -98,3 +98,30 @@ final class AccountHeadroomTests: XCTestCase {
         ))
     }
 }
+
+/// The chat account menu's idea of "current", kept pure so the menu cannot
+/// invent its own.
+final class ChatAccountMenuRowTests: XCTestCase {
+    private func binding(_ id: String?) -> SessionAccountBinding {
+        SessionAccountBinding(
+            accountID: id,
+            provider: .claude,
+            label: id ?? "Project/default",
+            configDirectory: "/Users/x/.claude-test"
+        )
+    }
+
+    /// The "Project/default" row is current exactly when the binding names no
+    /// account, and a named row exactly when its profile id matches. A chat
+    /// with no binding at all (a pre-account legacy descriptor) reads as
+    /// default rather than as some named account it never had.
+    func testTheAccountMenuMarksTheRightRowCurrent() {
+        XCTAssertTrue(SessionAccountBinding.menuRowIsCurrent(binding: binding("work"), profileID: "work"))
+        XCTAssertFalse(SessionAccountBinding.menuRowIsCurrent(binding: binding("work"), profileID: "personal"))
+        XCTAssertFalse(SessionAccountBinding.menuRowIsCurrent(binding: binding("work"), profileID: nil))
+        XCTAssertTrue(SessionAccountBinding.menuRowIsCurrent(binding: binding(nil), profileID: nil))
+        XCTAssertFalse(SessionAccountBinding.menuRowIsCurrent(binding: binding(nil), profileID: "work"))
+        XCTAssertTrue(SessionAccountBinding.menuRowIsCurrent(binding: nil, profileID: nil))
+        XCTAssertFalse(SessionAccountBinding.menuRowIsCurrent(binding: nil, profileID: "work"))
+    }
+}

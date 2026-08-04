@@ -3189,6 +3189,92 @@ final class AppModel: ObservableObject {
         Task { _ = await chat.conversation.stop() }
     }
 
+    /// Move a live chat to a different provider account, mid-conversation
+    /// included — "should be able to change subscription login in an mcp/acp
+    /// agent chat and during if possible".
+    ///
+    /// The transcript, draft, and queued prompts survive; the provider thread
+    /// does not. Resuming a continuation under different credentials is never
+    /// safe (the same rule `appendChat`'s `safeResumeSessionID` enforces at
+    /// restore), so the switch stops the running adapter, lets persistence
+    /// drain, and restarts the same chat surface under the new binding with a
+    /// fresh provider session. Switching during a turn cuts that turn — which
+    /// is what asking to switch *now* means — and the queue then flushes into
+    /// the new session.
+    func switchChatAccount(_ chatID: String, to profile: UsageAccountProfile?) async {
+        guard let chat = chats.first(where: { $0.id == chatID }),
+              let agent = AgentRegistry.profile(id: chat.agentID) else { return }
+        let projectID = chat.projectID
+        let overlay = ProjectAccountStore.mergedOverlay(
+            app: NativePreviewSettings.shared.agentEnvironmentOverlay,
+            project: ProjectAccountStore().override(forProject: projectID)
+        )
+        guard let binding = SessionAccountBinding.resolve(
+            agentID: chat.agentID,
+            profile: profile,
+            fallbackEnvironment: ProcessInfo.processInfo.environment
+                .merging(overlay) { _, configured in configured }
+        ) else {
+            ToastCenter.shared.show("That account does not match \(agent.name).", style: .error)
+            return
+        }
+        if let current = chat.accountBinding?.normalized,
+           current.continuationKey == binding.continuationKey {
+            ToastCenter.shared.show("This chat is already using \(binding.label).", style: .info)
+            return
+        }
+        if let warning = SessionAccountBinding.headroomWarning(
+            for: binding,
+            readings: UsageCenter.shared.planUsage
+        ) {
+            ToastCenter.shared.show(warning, style: .info, duration: 5)
+        }
+        let directory = chat.workspaceDirectory
+        let title = chat.conversation.title
+        let queued = chat.conversation.queued.map(\.text)
+        // Stop the adapter and let every buffered row and the draft reach the
+        // store before the transcript is read back for the new handle.
+        let finalDraft = await chat.conversation.stop()
+        await flushTranscriptPersistence()
+        let transcript = await transcriptStore.restoration(
+            for: chatID,
+            tailLimit: AcpConversation.defaultVisibleLimit
+        )
+        // Re-check after the awaits: a concurrent close, delete, or second
+        // switch may have replaced or removed the handle this call captured.
+        guard let live = chats.first(where: { $0.id == chatID }),
+              live.conversation === chat.conversation else { return }
+        // The surface stays: same id, same pane, same selection. Only the
+        // handle and its process are replaced, with no await between removal
+        // and re-append, so no frame renders a missing session.
+        chats.removeAll { $0.id == chatID }
+        usageObservers.removeValue(forKey: chatID)?.forEach { $0.cancel() }
+        usageCenter.unregister(chatID: chatID, sourceID: usageSourceID, forgetWhenLast: false)
+        surfaceObservers.removeValue(forKey: chatID)?.cancel()
+        guard appendChat(
+            id: chatID,
+            agent: agent,
+            directory: directory,
+            title: title,
+            resumeSessionID: nil,
+            accountBinding: binding,
+            initialTranscript: transcript,
+            initialDraft: finalDraft ?? transcript?.draft,
+            initialQueuedPrompts: queued
+        ) != nil else {
+            ToastCenter.shared.show(
+                "The chat adapter is unavailable, so the account was not switched.",
+                style: .error
+            )
+            return
+        }
+        scheduleWorkspaceStateSave(projectID: projectID)
+        ToastCenter.shared.show(
+            "Switched to \(binding.label). Fresh provider session; the transcript stays.",
+            style: .success
+        )
+    }
+
     func selectChat(_ chatID: String?) {
         selectedChatID = chatID
         if let chatID {

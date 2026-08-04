@@ -1915,6 +1915,10 @@ struct RootShellView: View {
                 MeshStagedPromptQueueButton(mesh: mesh)
                 MeshConfigurationMenu(mesh: mesh)
             }
+            if let chat = model.chats.first(where: { $0.id == id }),
+               SessionAccountBinding.provider(forAgentID: chat.agentID) != nil {
+                chatAccountMenu(chat)
+            }
             Button { model.toggleMaximizeSurface(id) } label: {
                 Image(systemName: model.maximizedPaneID == id
                     ? "arrow.down.right.and.arrow.up.left"
@@ -1988,6 +1992,67 @@ struct RootShellView: View {
             light: colorScheme == .light,
             mode: settings.terminalPalette
         )
+    }
+
+    /// The chat's subscription account, visible and changeable from inside the
+    /// chat — including mid-conversation. Switching restarts the provider
+    /// session under the new credentials; the transcript, draft, and queued
+    /// prompts stay (see `AppModel.switchChatAccount`).
+    private func chatAccountMenu(_ chat: AcpChatHandle) -> some View {
+        let provider = SessionAccountBinding.provider(forAgentID: chat.agentID)
+        let currentLabel = chat.accountBinding?.label ?? "Project/default"
+        return Menu {
+            Section("Account · \(currentLabel)") {
+                accountMenuRow(
+                    title: "Project/default",
+                    isCurrent: SessionAccountBinding.menuRowIsCurrent(
+                        binding: chat.accountBinding, profileID: nil
+                    )
+                ) {
+                    Task { await model.switchChatAccount(chat.id, to: nil) }
+                }
+                ForEach(
+                    UsageAccountStore().profiles()
+                        .filter { $0.provider == provider }
+                        .sorted { $0.label.localizedCaseInsensitiveCompare($1.label) == .orderedAscending }
+                ) { profile in
+                    accountMenuRow(
+                        title: profile.label,
+                        isCurrent: SessionAccountBinding.menuRowIsCurrent(
+                            binding: chat.accountBinding, profileID: profile.id
+                        )
+                    ) {
+                        Task { await model.switchChatAccount(chat.id, to: profile) }
+                    }
+                }
+            }
+            Divider()
+            Text("Switching starts a fresh provider session. The transcript, draft, and queued prompts stay.")
+        } label: {
+            Image(systemName: "person.crop.circle")
+                .frame(width: 24, height: 22)
+        }
+        .menuStyle(.borderlessButton)
+        .menuIndicator(.hidden)
+        .fixedSize()
+        .foregroundStyle(.secondary)
+        .help("Account: \(currentLabel) — click to switch, even mid-conversation")
+        .accessibilityLabel("Account: \(currentLabel)")
+    }
+
+    @ViewBuilder
+    private func accountMenuRow(
+        title: String,
+        isCurrent: Bool,
+        action: @escaping () -> Void
+    ) -> some View {
+        Button(action: action) {
+            if isCurrent {
+                Label(title, systemImage: "checkmark")
+            } else {
+                Text(title)
+            }
+        }
     }
 
     private func companionControllerName(for terminalID: String) -> String? {

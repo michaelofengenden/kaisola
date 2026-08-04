@@ -66,10 +66,23 @@ enum DesktopCaptureSource {
             guard let display = content.displays.first(where: { $0.displayID == displayID })
                 ?? content.displays.first else { return nil }
 
-            // Excluding *every* on-screen window is what leaves the wallpaper
-            // by itself. Kaisola's own windows are in that set too, so this
-            // cannot capture the glass it is about to draw and feed it back.
-            let filter = SCContentFilter(display: display, excludingWindows: content.windows)
+            // Capture the desktop picture window *itself*, rather than the
+            // display minus every window we happened to know about.
+            //
+            // Subtracting was wrong and shipped a real leak: `excludingWindows`
+            // can only exclude the windows in the snapshot it was handed, so
+            // anything the list missed — a window on another Space, one raised
+            // between the query and the capture, a surface the enumeration does
+            // not report — came through, and Kaisola painted other people's
+            // apps into its own glass. Michael: "it now does wallpaper glass
+            // and also records the windows of other apps behind it."
+            //
+            // Naming the one window we want inverts the failure: an incomplete
+            // list now means *no* capture instead of a capture of too much.
+            guard let desktop = desktopPictureWindow(in: content, displayID: displayID) else {
+                return nil
+            }
+            let filter = SCContentFilter(desktopIndependentWindow: desktop)
             let configuration = SCStreamConfiguration()
             // The bake downsamples to `stillWidth` anyway, so a full-resolution
             // grab would be paid for twice. This is generous enough that the
@@ -89,6 +102,40 @@ enum DesktopCaptureSource {
         } catch {
             return nil
         }
+    }
+
+    /// The window the Dock draws the wallpaper into.
+    ///
+    /// It is owned by the Dock and sits at the desktop window level, below
+    /// every ordinary window — which is exactly what makes it safe to capture:
+    /// nothing an application draws can be inside it.
+    ///
+    /// Returning nil when it cannot be identified is deliberate. The caller
+    /// then falls back to the existing resolution ladder, which may guess the
+    /// wrong wallpaper; capturing the whole display instead would show
+    /// whatever happened to be on screen, which is not a wallpaper at all.
+    private static func desktopPictureWindow(
+        in content: SCShareableContent,
+        displayID: CGDirectDisplayID
+    ) -> SCWindow? {
+        let frame = CGDisplayBounds(displayID)
+        // Three predicates, each load-bearing. The Dock owns the wallpaper, and
+        // on this Mac it also owns the Dock itself at layer 20 — hence the
+        // level check. And the level check cannot stand alone: fourteen windows
+        // belonging to *other* applications were observed below layer zero, so
+        // "anything behind everything" would have captured them.
+        //
+        // macOS titles these `Wallpaper-<UUID>`, one per display, which is the
+        // narrowest identification available and the one that fails closed if
+        // Apple renames it.
+        let candidates = content.windows.filter { window in
+            window.owningApplication?.bundleIdentifier == "com.apple.dock"
+                && window.windowLayer < 0
+                && (window.title?.hasPrefix("Wallpaper-") ?? false)
+        }
+        // A Mac with several displays has one wallpaper window per display, so
+        // prefer the one covering this screen before falling back to the first.
+        return candidates.first { $0.frame.intersects(frame) } ?? candidates.first
     }
 
     /// Write the frame where the bake can read it, atomically.

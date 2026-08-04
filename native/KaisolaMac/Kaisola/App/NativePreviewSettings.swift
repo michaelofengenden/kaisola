@@ -268,16 +268,10 @@ enum WorkspaceBackdropMode: String, CaseIterable, Identifiable, Sendable {
     }
 }
 
-/// Terminal color choices. Native is deliberately the default: a high-contrast
-/// white/near-black terminal canvas with clear semantic ANSI accents. Kaisola
-/// preserves the richer Electron-matched palette for users who prefer it.
-enum TerminalPaletteMode: String, CaseIterable, Identifiable, Sendable {
-    case native
-    case kaisola
-
-    var id: String { rawValue }
-    var title: String { self == .native ? "macOS Terminal" : "Kaisola" }
-}
+// Terminal color choices are a registry now — see `TerminalThemeRegistry`.
+// The old `TerminalPaletteMode` raw values live on as the shipped theme ids
+// ("native", "kaisola"), which is what keeps every persisted choice meaning
+// the same thing without a migration.
 
 /// Provider whose direct-API routing is edited in Settings ▸ Models & Keys.
 /// Secrets remain in `ApiKeyStore`; these non-secret values are ordinary app
@@ -634,8 +628,12 @@ final class NativePreviewSettings: ObservableObject {
         } ?? terminalHistoryWarningDefaultMiB
     }
 
-    @Published var terminalPalette: TerminalPaletteMode {
-        didSet { persist(terminalPalette.rawValue, forKey: Keys.terminalPalette) }
+    /// The selected terminal theme's id — a `TerminalThemeRegistry` id, which
+    /// may name a custom theme. An id whose theme has since been removed or
+    /// invalidated resolves to the shipped default at install time rather
+    /// than being rewritten here, so fixing the theme restores the choice.
+    @Published var terminalThemeID: String {
+        didSet { persist(terminalThemeID, forKey: Keys.terminalPalette) }
     }
 
     /// Retype a privately persisted, unsent CLI composer draft only after a
@@ -892,7 +890,7 @@ final class NativePreviewSettings: ObservableObject {
         terminalHistoryWarningMiB = storedHistoryWarning > 0
             ? Self.clampedTerminalHistoryWarning(storedHistoryWarning)
             : Self.terminalHistoryWarningDefaultMiB
-        terminalPalette = defaults.string(forKey: Keys.terminalPalette).flatMap(TerminalPaletteMode.init) ?? .native
+        terminalThemeID = defaults.string(forKey: Keys.terminalPalette) ?? "native"
         restoreCLIDrafts = defaults.object(forKey: Keys.restoreCLIDrafts) as? Bool ?? true
         semanticShellIntegration = defaults.object(forKey: Keys.semanticShellIntegration) as? Bool ?? false
         terminalClipboardWriteAllowed = defaults.object(forKey: Keys.terminalClipboardWriteAllowed) as? Bool ?? false
@@ -936,7 +934,7 @@ final class NativePreviewSettings: ObservableObject {
         terminalFontFamily = TerminalFontOptions.systemMonoSentinel
         terminalFontWeight = "regular"
         terminalLineSpacing = Self.terminalLineSpacingDefault
-        terminalPalette = .native
+        terminalThemeID = "native"
     }
 
     static func clampedWorkspaceRailWidth(_ width: Double) -> Double {

@@ -82,15 +82,13 @@ enum TerminalTheme {
         )
     }
 
-    static func palette(light: Bool, mode: TerminalPaletteMode) -> Palette {
-        switch mode {
-        case .native: light ? nativeLight : nativeDark
-        case .kaisola: light ? Self.light : Self.dark
-        }
+    static func palette(light: Bool, themeID: String) -> Palette {
+        let definition = TerminalThemeRegistry.definition(id: themeID)
+        return light ? definition.light : definition.dark
     }
 
-    static func paneChrome(light: Bool, mode: TerminalPaletteMode) -> PaneChrome {
-        let palette = palette(light: light, mode: mode)
+    static func paneChrome(light: Bool, themeID: String) -> PaneChrome {
+        let palette = palette(light: light, themeID: themeID)
         return PaneChrome(
             background: palette.background,
             foreground: palette.foreground,
@@ -132,5 +130,74 @@ enum TerminalTheme {
             green: UInt16((rgb >> 8) & 0xFF) * 257,
             blue: UInt16(rgb & 0xFF) * 257
         )
+    }
+}
+
+extension TerminalTheme.Palette {
+    /// An ANSI slot as an `NSColor`, for settings previews — kept here so no
+    /// UI file has to import SwiftTerm (whose `Color` collides with SwiftUI's).
+    func ansiColor(_ index: Int) -> NSColor {
+        guard ansi.indices.contains(index) else { return foreground }
+        let slot = ansi[index]
+        return NSColor(
+            srgbRed: CGFloat(slot.red) / 65535,
+            green: CGFloat(slot.green) / 65535,
+            blue: CGFloat(slot.blue) / 65535,
+            alpha: 1
+        )
+    }
+}
+
+/// One terminal theme the app can install: a stable id, a menu title, and a
+/// palette per appearance. Shipped themes and validated custom themes meet in
+/// this shape, so every consumer downstream of the registry is indifferent to
+/// where a theme came from.
+struct ThemeDefinition: Identifiable {
+    let id: String
+    let title: String
+    let light: TerminalTheme.Palette
+    let dark: TerminalTheme.Palette
+}
+
+/// The theme roster: the shipped pair plus every *valid* custom theme, in
+/// menu order. PR 6's registry contract in one type — data only (a theme can
+/// name no command, no file, no URL), invalid entries degrade to a disabled
+/// row with the reason (`CustomThemeStore` reports those separately), and an
+/// unknown or since-removed id resolves to the shipped default rather than a
+/// crash or a blank terminal.
+enum TerminalThemeRegistry {
+    /// "native" and "kaisola" are the two historical `TerminalPaletteMode`
+    /// raw values; keeping them as the shipped ids is what lets an existing
+    /// install's persisted choice keep meaning the same thing with no
+    /// migration step. Computed, not stored, for the same strict-concurrency
+    /// reason every `TerminalTheme` palette is: `NSColor` is not `Sendable`.
+    static var shipped: [ThemeDefinition] { [
+        ThemeDefinition(
+            id: "native",
+            title: "macOS Terminal",
+            light: TerminalTheme.nativeLight,
+            dark: TerminalTheme.nativeDark
+        ),
+        ThemeDefinition(
+            id: "kaisola",
+            title: "Kaisola",
+            light: TerminalTheme.light,
+            dark: TerminalTheme.dark
+        ),
+    ] }
+
+    static func all(store: CustomThemeStore = CustomThemeStore()) -> [ThemeDefinition] {
+        shipped + store.specs().compactMap { $0.asDefinition() }
+    }
+
+    static func definition(
+        id: String,
+        store: CustomThemeStore = CustomThemeStore()
+    ) -> ThemeDefinition {
+        if let shipped = shipped.first(where: { $0.id == id }) { return shipped }
+        if let custom = store.specs().first(where: { $0.id == id })?.asDefinition() {
+            return custom
+        }
+        return shipped[0]
     }
 }

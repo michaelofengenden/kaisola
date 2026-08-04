@@ -675,10 +675,10 @@ final class NativeTerminalInteractionTests: XCTestCase {
     }
 
     func testTerminalPaneChromeUsesTheActiveOpaqueTerminalPalette() {
-        for mode in TerminalPaletteMode.allCases {
+        for definition in TerminalThemeRegistry.shipped {
             for light in [false, true] {
-                let palette = TerminalTheme.palette(light: light, mode: mode)
-                let chrome = TerminalTheme.paneChrome(light: light, mode: mode)
+                let palette = TerminalTheme.palette(light: light, themeID: definition.id)
+                let chrome = TerminalTheme.paneChrome(light: light, themeID: definition.id)
 
                 XCTAssertTrue(chrome.background.isEqual(palette.background))
                 XCTAssertTrue(chrome.foreground.isEqual(palette.foreground))
@@ -1178,7 +1178,7 @@ final class NativeTerminalInteractionTests: XCTestCase {
             font: NSFont.monospacedSystemFont(ofSize: 13, weight: .regular)
         )
         view.terminalDelegate = coordinator
-        view.configureTerminalTheme(light: true, mode: .native)
+        view.configureTerminalTheme(light: true, themeID: "native")
 
         // These are the exact families seen in the corrupted prompt screenshot:
         // cursor position plus foreground/background color queries. Replaying a
@@ -1257,7 +1257,7 @@ final class NativeTerminalInteractionTests: XCTestCase {
             font: NSFont.monospacedSystemFont(ofSize: 13, weight: .regular)
         )
         view.terminalDelegate = coordinator
-        view.configureTerminalTheme(light: true, mode: .native)
+        view.configureTerminalTheme(light: true, themeID: "native")
 
         coordinator.apply(output: "", epoch: "epoch-a", endOffset: 0, to: view)
         let query = "\u{1B}[6n"

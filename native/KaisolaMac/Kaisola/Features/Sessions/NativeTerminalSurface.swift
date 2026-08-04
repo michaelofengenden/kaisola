@@ -58,8 +58,8 @@ struct NativeTerminalSurface: NSViewRepresentable {
     /// Whether OSC 52 may write the system clipboard from this surface
     /// (Settings > Terminal, off by default).
     var allowsClipboardWrite: Bool = false
-    /// Native macOS Terminal by default; Kaisola keeps Electron palette parity.
-    var paletteMode: TerminalPaletteMode = .native
+    /// A `TerminalThemeRegistry` id. Native macOS Terminal by default.
+    var themeID: String = "native"
     /// Paper palette on light appearances, ink on dark.
     var lightSurface: Bool = false
     /// Identity used to retain this terminal's parsed view across the SwiftUI
@@ -141,7 +141,7 @@ struct NativeTerminalSurface: NSViewRepresentable {
         view.configureSemanticPromptMarks()
         view.configureJumpToLiveBottomAffordance()
         view.terminalDelegate = context.coordinator
-        view.configureTerminalTheme(light: lightSurface, mode: paletteMode)
+        view.configureTerminalTheme(light: lightSurface, themeID: themeID)
         view.allowMouseReporting = isOwned
         view.configureLinkInteraction()
         Self.configureKeyboardInput(on: view)
@@ -183,7 +183,7 @@ struct NativeTerminalSurface: NSViewRepresentable {
         let coordinator = context.coordinator
         view.scrollerStyle = .legacy
         view.terminalDelegate = coordinator
-        view.configureTerminalTheme(light: lightSurface, mode: paletteMode)
+        view.configureTerminalTheme(light: lightSurface, themeID: themeID)
         view.allowMouseReporting = isOwned
         Self.configureKeyboardInput(on: view)
         view.agentLaunchCommand = agentLaunchCommand
@@ -230,8 +230,8 @@ struct NativeTerminalSurface: NSViewRepresentable {
         if view.font.fontName != desired.fontName || abs(view.font.pointSize - desired.pointSize) > 0.1 {
             view.font = desired
         }
-        if view.themeKey != Self.themeKey(light: lightSurface, mode: paletteMode) {
-            view.configureTerminalTheme(light: lightSurface, mode: paletteMode)
+        if view.themeKey != Self.themeKey(light: lightSurface, themeID: themeID) {
+            view.configureTerminalTheme(light: lightSurface, themeID: themeID)
         }
         context.coordinator.apply(
             scrollback: scrollback ?? TerminalScrollback(output),
@@ -242,8 +242,8 @@ struct NativeTerminalSurface: NSViewRepresentable {
         )
     }
 
-    private static func themeKey(light: Bool, mode: TerminalPaletteMode) -> String {
-        "\(mode.rawValue):\(light ? "light" : "dark")"
+    private static func themeKey(light: Bool, themeID: String) -> String {
+        "\(themeID):\(light ? "light" : "dark")"
     }
 
     /// Keep Option available to the active keyboard layout. Hard-wiring it to
@@ -2320,10 +2320,10 @@ class ReadOnlyTerminalView: TerminalView {
     /// Installs either the clean native palette or the Electron-matched Kaisola
     /// palette. Both remain fully opaque so glass chrome never compromises a
     /// terminal's contrast.
-    func configureTerminalTheme(light: Bool = false, mode: TerminalPaletteMode = .native) {
-        let palette = TerminalTheme.palette(light: light, mode: mode)
+    func configureTerminalTheme(light: Bool = false, themeID: String = "native") {
+        let palette = TerminalTheme.palette(light: light, themeID: themeID)
         isLightTheme = light
-        themeKey = "\(mode.rawValue):\(light ? "light" : "dark")"
+        themeKey = "\(themeID):\(light ? "light" : "dark")"
         installColors(palette.ansi)
         nativeForegroundColor = palette.foreground
         nativeBackgroundColor = palette.background

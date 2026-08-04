@@ -177,7 +177,7 @@ final class NativePreviewSettingsTests: XCTestCase {
         XCTAssertEqual(settings.appearance, .system)
         XCTAssertEqual(settings.sidebarAppearance, .glass)
         XCTAssertEqual(settings.workspaceBackdrop, .glass)
-        XCTAssertEqual(settings.terminalPalette, .native)
+        XCTAssertEqual(settings.terminalThemeID, "native")
         XCTAssertTrue(settings.restoreCLIDrafts)
         XCTAssertFalse(settings.semanticShellIntegration)
         XCTAssertEqual(settings.terminalLineSpacing, NativePreviewSettings.terminalLineSpacingDefault)
@@ -190,7 +190,7 @@ final class NativePreviewSettingsTests: XCTestCase {
         settings.appearance = .dark
         settings.sidebarAppearance = .solid
         settings.workspaceBackdrop = .tinted
-        settings.terminalPalette = .kaisola
+        settings.terminalThemeID = "kaisola"
         settings.restoreCLIDrafts = false
         settings.semanticShellIntegration = true
         settings.terminalLineSpacing = 1.18
@@ -203,7 +203,7 @@ final class NativePreviewSettingsTests: XCTestCase {
         XCTAssertEqual(reloaded.appearance, .dark)
         XCTAssertEqual(reloaded.sidebarAppearance, .solid)
         XCTAssertEqual(reloaded.workspaceBackdrop, .tinted)
-        XCTAssertEqual(reloaded.terminalPalette, .kaisola)
+        XCTAssertEqual(reloaded.terminalThemeID, "kaisola")
         XCTAssertFalse(reloaded.restoreCLIDrafts)
         XCTAssertTrue(reloaded.semanticShellIntegration)
         XCTAssertEqual(reloaded.terminalLineSpacing, 1.18, accuracy: 0.001)
@@ -320,7 +320,7 @@ final class NativePreviewSettingsTests: XCTestCase {
         settings.terminalFontFamily = "Menlo"
         settings.terminalFontWeight = "bold"
         settings.terminalLineSpacing = 1.2
-        settings.terminalPalette = .kaisola
+        settings.terminalThemeID = "kaisola"
 
         settings.applyTerminalAppDefaults()
 
@@ -328,7 +328,7 @@ final class NativePreviewSettingsTests: XCTestCase {
         XCTAssertEqual(settings.terminalFontFamily, TerminalFontOptions.systemMonoSentinel)
         XCTAssertEqual(settings.terminalFontWeight, "regular")
         XCTAssertEqual(settings.terminalLineSpacing, 1)
-        XCTAssertEqual(settings.terminalPalette, .native)
+        XCTAssertEqual(settings.terminalThemeID, "native")
     }
 
     func testNonPersistentSettingsKeepVisualFixturesSideEffectFree() {
@@ -478,7 +478,7 @@ final class NativePreviewSettingsTests: XCTestCase {
         // stored value is unchanged, so nobody's preference moves.
         XCTAssertEqual(WorkspaceBackdropMode.system.title, "Solid")
         XCTAssertEqual(WorkspaceBackdropMode.system.rawValue, "system")
-        XCTAssertEqual(TerminalPaletteMode.native.title, "macOS Terminal")
+        XCTAssertEqual(TerminalThemeRegistry.shipped.first?.title, "macOS Terminal")
     }
 
     func testGlassBackdropWashIsWhiteLedInLightAndNearBlackInDark() {

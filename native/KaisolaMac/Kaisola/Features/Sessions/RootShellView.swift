@@ -1990,7 +1990,7 @@ struct RootShellView: View {
         guard model.sessions.contains(where: { $0.id == id }) else { return nil }
         return TerminalTheme.paneChrome(
             light: colorScheme == .light,
-            mode: settings.terminalPalette
+            themeID: settings.terminalThemeID
         )
     }
 
@@ -2131,7 +2131,7 @@ struct RootShellView: View {
                         lineSpacing: settings.terminalLineSpacing,
                         scrollbackLines: settings.terminalScrollbackLines,
                         allowsClipboardWrite: settings.terminalClipboardWriteAllowed,
-                        paletteMode: settings.terminalPalette,
+                        themeID: settings.terminalThemeID,
                         lightSurface: colorScheme == .light,
                         sessionID: id,
                         agentLaunchCommand: model.agentProfile(for: id)?.launchCommand,

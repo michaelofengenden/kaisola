@@ -1,5 +1,6 @@
 import AppKit
 import SwiftUI
+import UniformTypeIdentifiers
 
 extension Notification.Name {
     /// Bridges the in-workspace settings sheet to the delegate-owned Sparkle
@@ -553,20 +554,7 @@ struct SettingsView: View {
                     }
                 }
 
-                SettingsCard(title: "Color", symbol: "paintpalette") {
-                    SettingsRow(title: "Terminal palette", detail: "Opaque for reliable contrast", symbol: "circle.hexagongrid") {
-                        Menu {
-                            ForEach(TerminalPaletteMode.allCases) { mode in
-                                Button(mode.title) { settings.terminalPalette = mode }
-                            }
-                        } label: { SettingsChoiceLabel(settings.terminalPalette.title) }
-                        .menuIndicator(.hidden)
-                        .accessibilityLabel("Terminal palette")
-                    }
-                    TerminalPalettePreview(mode: settings.terminalPalette)
-                        .padding(.horizontal, 16)
-                        .padding(.bottom, 14)
-                }
+                TerminalColorCard(settings: settings)
 
                 SettingsCard(title: "History Storage", symbol: "externaldrive") {
                     SettingsRow(
@@ -879,26 +867,157 @@ private struct SettingsChoiceLabel: View {
     }
 }
 
-private struct TerminalPalettePreview: View {
-    let mode: TerminalPaletteMode
+/// The Color card: theme picker over the registry, a live preview drawn from
+/// the selected theme's own palette, and the custom-theme roster — import,
+/// remove, and an explanation line for any theme that cannot install (PR 6's
+/// disabled-with-a-reason contract).
+private struct TerminalColorCard: View {
+    @ObservedObject var settings: NativePreviewSettings
+    @Environment(\.colorScheme) private var colorScheme
+    @State private var customSpecs: [CustomThemeSpec] = []
+    private let store = CustomThemeStore()
+
     var body: some View {
+        SettingsCard(title: "Color", symbol: "paintpalette") {
+            SettingsRow(title: "Terminal theme", detail: "Opaque for reliable contrast", symbol: "circle.hexagongrid") {
+                Menu {
+                    ForEach(TerminalThemeRegistry.shipped) { definition in
+                        Button(definition.title) { settings.terminalThemeID = definition.id }
+                    }
+                    let installable = customSpecs.compactMap { $0.asDefinition() }
+                    if !installable.isEmpty {
+                        Divider()
+                        ForEach(installable) { definition in
+                            Button(definition.title) { settings.terminalThemeID = definition.id }
+                        }
+                    }
+                } label: {
+                    SettingsChoiceLabel(
+                        TerminalThemeRegistry.definition(id: settings.terminalThemeID, store: store).title
+                    )
+                }
+                .menuIndicator(.hidden)
+                .accessibilityLabel("Terminal theme")
+            }
+            TerminalPalettePreview(
+                definition: TerminalThemeRegistry.definition(id: settings.terminalThemeID, store: store),
+                light: colorScheme == .light
+            )
+                .padding(.horizontal, 16)
+                .padding(.bottom, customSpecs.isEmpty ? 14 : 6)
+            customThemeRoster
+        }
+        .onAppear { customSpecs = store.specs() }
+    }
+
+    @ViewBuilder
+    private var customThemeRoster: some View {
+        ForEach(customSpecs) { spec in
+            HStack(spacing: 8) {
+                if let reason = spec.validationError {
+                    Image(systemName: "exclamationmark.triangle")
+                        .foregroundStyle(.orange)
+                    VStack(alignment: .leading, spacing: 1) {
+                        Text(spec.title.isEmpty ? spec.id : spec.title)
+                            .foregroundStyle(.secondary)
+                        Text(reason)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                } else {
+                    Image(systemName: "paintpalette")
+                        .foregroundStyle(.secondary)
+                    Text(spec.title)
+                }
+                Spacer()
+                Button("Remove") {
+                    store.remove(id: spec.id)
+                    customSpecs = store.specs()
+                    // Removing the selected theme falls back at resolve time;
+                    // the stored choice is left alone so re-importing the
+                    // theme restores it.
+                }
+                .buttonStyle(.link)
+            }
+            .font(.system(size: 12))
+            .padding(.horizontal, 16)
+            .padding(.vertical, 3)
+        }
+        HStack {
+            Button {
+                importCustomTheme()
+            } label: {
+                Label("Import Theme…", systemImage: "square.and.arrow.down")
+            }
+            .buttonStyle(.link)
+            .help("A JSON file with id, title, and light/dark palettes (hex colors, 16 ANSI slots)")
+            Spacer()
+        }
+        .padding(.horizontal, 16)
+        .padding(.top, 4)
+        .padding(.bottom, 14)
+    }
+
+    private func importCustomTheme() {
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = true
+        panel.canChooseDirectories = false
+        panel.allowsMultipleSelection = false
+        panel.allowedContentTypes = [.json]
+        panel.prompt = "Import Theme"
+        panel.begin { response in
+            guard response == .OK, let url = panel.urls.first else { return }
+            Task { @MainActor in
+                guard let data = try? Data(contentsOf: url),
+                      let spec = try? JSONDecoder().decode(CustomThemeSpec.self, from: data) else {
+                    ToastCenter.shared.show(
+                        "That file is not a theme: it must be JSON with id, title, and light/dark palettes.",
+                        style: .error,
+                        duration: 5
+                    )
+                    return
+                }
+                if let reason = store.upsert(spec) {
+                    ToastCenter.shared.show(
+                        "Imported, but it cannot be used yet: \(reason)",
+                        style: .info,
+                        duration: 6
+                    )
+                } else {
+                    settings.terminalThemeID = spec.id
+                    ToastCenter.shared.show("Imported \(spec.title) and switched to it", style: .success)
+                }
+                customSpecs = store.specs()
+            }
+        }
+    }
+}
+
+private struct TerminalPalettePreview: View {
+    let definition: ThemeDefinition
+    let light: Bool
+    var body: some View {
+        let palette = light ? definition.light : definition.dark
         HStack(spacing: 10) {
             Text("~/Kaisola")
-                .foregroundStyle(.secondary)
+                .foregroundStyle(Color(nsColor: palette.foreground).opacity(0.65))
             Text("%")
-                .foregroundStyle(mode == .native ? Color(red: 0.05, green: 0.50, blue: 0.22) : .purple)
+                .foregroundStyle(Color(nsColor: palette.ansiColor(2)))
             Text("codex")
-                .foregroundStyle(mode == .native ? Color(red: 0.00, green: 0.43, blue: 0.72) : .green)
-            Rectangle().frame(width: 7, height: 15)
+                .foregroundStyle(Color(nsColor: palette.ansiColor(4)))
+            Rectangle()
+                .fill(Color(nsColor: palette.cursor))
+                .frame(width: 7, height: 15)
             Spacer()
         }
         .font(.system(size: 13, design: .monospaced))
         .padding(.horizontal, 13)
         .frame(height: 44)
-        .background(Color(nsColor: .textBackgroundColor), in: RoundedRectangle(cornerRadius: 9))
+        .background(Color(nsColor: palette.background), in: RoundedRectangle(cornerRadius: 9))
         .overlay(RoundedRectangle(cornerRadius: 9).strokeBorder(.quaternary))
         .accessibilityHidden(true)
     }
+
 }
 
 enum SensitiveGlobPolicy {

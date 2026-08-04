@@ -1156,7 +1156,7 @@ struct FilePreviewView: View {
             highlightedSource = AttributedSource(value: NSAttributedString())
             return
         }
-        let language = SyntaxHighlighter.language(
+        let grammar = SyntaxHighlighter.grammar(
             forExtension: (loadedURL ?? url).pathExtension
         )
         let dark = colorScheme == .dark
@@ -1165,12 +1165,12 @@ struct FilePreviewView: View {
         // background pass. Without this, returning from an edit would briefly
         // render the pre-edit snapshot.
         if highlightedSource.value.string != source {
-            highlightedSource = SyntaxHighlighter.attributedSource(source, language: nil, dark: dark)
+            highlightedSource = SyntaxHighlighter.attributedSource(source, grammar: nil, dark: dark)
         }
-        guard language != nil else { return }
+        guard grammar != nil else { return }
         highlightTask = Task {
             let rendered = await Task.detached(priority: .utility) {
-                SyntaxHighlighter.attributedSource(source, language: language, dark: dark)
+                SyntaxHighlighter.attributedSource(source, grammar: grammar, dark: dark)
             }.value
             guard !Task.isCancelled, source == draft else { return }
             highlightedSource = rendered

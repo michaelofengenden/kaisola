@@ -247,22 +247,22 @@ enum AcpTranscriptLinkRouting {
 }
 
 enum AcpTranscriptCodeLanguage {
-    static func language(for fence: String?) -> SyntaxHighlighter.Language? {
+    static func grammar(for fence: String?) -> SyntaxHighlighter.GrammarChoice? {
         guard let token = fence?
             .trimmingCharacters(in: .whitespacesAndNewlines)
             .lowercased()
             .split(whereSeparator: { $0.isWhitespace })
             .first else { return nil }
         switch token {
-        case "swift": return .swift
-        case "js", "jsx", "javascript", "ts", "tsx", "typescript": return .javascript
-        case "py", "python": return .python
-        case "json", "jsonc", "json5": return .json
-        case "sh", "shell", "bash", "zsh", "console": return .shell
-        case "yml", "yaml": return .yaml
-        case "html", "xml", "svg": return .html
-        case "css", "scss", "less": return .css
-        default: return SyntaxHighlighter.language(forExtension: String(token))
+        case "swift": return .shipped(.swift)
+        case "js", "jsx", "javascript", "ts", "tsx", "typescript": return .shipped(.javascript)
+        case "py", "python": return .shipped(.python)
+        case "json", "jsonc", "json5": return .shipped(.json)
+        case "sh", "shell", "bash", "zsh", "console": return .shipped(.shell)
+        case "yml", "yaml": return .shipped(.yaml)
+        case "html", "xml", "svg": return .shipped(.html)
+        case "css", "scss", "less": return .shipped(.css)
+        default: return SyntaxHighlighter.grammar(forFence: String(token))
         }
     }
 }
@@ -419,12 +419,12 @@ private struct AcpTranscriptCodeBlock: View {
     @State private var copied = false
 
     private var highlighted: AttributedString {
-        guard let language = AcpTranscriptCodeLanguage.language(for: languageName) else {
+        guard let grammar = AcpTranscriptCodeLanguage.grammar(for: languageName) else {
             return AttributedString(text)
         }
         return SyntaxHighlighter.highlight(
             text,
-            language: language,
+            grammar: grammar,
             theme: colorScheme == .dark ? .dark : .light
         )
     }

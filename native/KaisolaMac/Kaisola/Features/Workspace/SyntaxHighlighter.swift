@@ -104,15 +104,105 @@ enum SyntaxHighlighter {
         }
     }
 
+    /// Every extension the shipped table claims. Custom grammars may not take
+    /// these over — the shipped grammars are part of the product's behavior,
+    /// and a user file that silently restyles Swift is the kind of quiet
+    /// override PR 6 forbids. `testShippedExtensionsMatchTheShippedTable`
+    /// holds this set and `language(forExtension:)` to each other.
+    nonisolated static let shippedExtensions: Set<String> = [
+        "swift",
+        "js", "jsx", "mjs", "cjs", "ts", "tsx", "mts", "cts",
+        "py", "pyw", "pyi",
+        "json", "jsonc", "json5",
+        "sh", "bash", "zsh", "command", "zshrc", "bashrc",
+        "yml", "yaml",
+        "html", "htm", "xhtml", "xml", "svg", "vue", "plist",
+        "css", "scss", "less",
+    ]
+
+    /// What a consumer holds after resolution: a shipped language, or a custom
+    /// grammar's compiled-checked rule set. Both scan through
+    /// `spans(in:rules:)`; the split exists only so shipped languages keep
+    /// costing a table lookup.
+    enum GrammarChoice: Sendable, Equatable {
+        case shipped(Language)
+        case custom(id: String, rules: [Rule])
+
+        var rules: [Rule] {
+            switch self {
+            case let .shipped(language): SyntaxHighlighter.rules(for: language)
+            case let .custom(_, rules): rules
+            }
+        }
+
+        /// Identity comparison: a shipped language is its case, a custom
+        /// grammar is its id — rule arrays are derived data.
+        static func == (lhs: GrammarChoice, rhs: GrammarChoice) -> Bool {
+            switch (lhs, rhs) {
+            case let (.shipped(left), .shipped(right)): left == right
+            case let (.custom(left, _), .custom(right, _)): left == right
+            default: false
+            }
+        }
+    }
+
+    /// The grammar for a file extension: shipped table first, then the
+    /// validated custom registry. Case-insensitive; nil means plain text.
+    static func grammar(
+        forExtension ext: String,
+        store: CustomGrammarStore = CustomGrammarStore()
+    ) -> GrammarChoice? {
+        if let language = language(forExtension: ext) { return .shipped(language) }
+        return CustomGrammarCache.shared.grammar(forExtension: ext.lowercased(), store: store)
+    }
+
+    /// The grammar for a fenced-code-block token, same precedence.
+    static func grammar(
+        forFence token: String,
+        store: CustomGrammarStore = CustomGrammarStore()
+    ) -> GrammarChoice? {
+        if let language = language(forExtension: token) { return .shipped(language) }
+        return CustomGrammarCache.shared.grammar(forFence: token.lowercased(), store: store)
+    }
+
+    /// `attributedSource` over a resolved grammar — the registry-aware form of
+    /// the `language:` entry point below it.
+    nonisolated static func attributedSource(
+        _ text: String,
+        grammar: GrammarChoice?,
+        dark: Bool
+    ) -> AttributedSource {
+        attributedSource(text, rules: grammar?.rules, dark: dark)
+    }
+
+    /// `highlight` over a resolved grammar.
+    static func highlight(_ text: String, grammar: GrammarChoice, theme: Theme) -> AttributedString {
+        var result = AttributedString(text)
+        let spans = spans(in: text, rules: grammar.rules)
+        guard !spans.isEmpty else { return result }
+        let length = (text as NSString).length
+        let indexMap = buildIndexMap(text: text, attributed: result)
+        for span in spans {
+            apply(span, color: theme.color(for: span.role), to: &result, indexMap: indexMap, length: length)
+        }
+        return result
+    }
+
     /// The colored regions of `text` for `language`, in application order.
     /// Pure; never throws. Empty and oversized inputs yield no spans, so both
     /// rendering paths degrade to plain text without a second size check.
     nonisolated static func spans(in text: String, language: Language) -> [Span] {
+        spans(in: text, rules: rules(for: language))
+    }
+
+    /// The same scan over an explicit rule set — the entry point a custom
+    /// grammar uses. Shipped languages route through it unchanged, so both
+    /// kinds of grammar exercise one code path and one set of guarantees.
+    nonisolated static func spans(in text: String, rules: [Rule]) -> [Span] {
         let ns = text as NSString
         let length = ns.length
         guard length > 0, length <= maxLength else { return [] }
         let fullRange = NSRange(location: 0, length: length)
-        let rules = rules(for: language)
 
         // 1) Protected pass: strings + comments merged into one leftmost-longest,
         //    non-overlapping set. Because both kinds compete here, a comment that
@@ -191,6 +281,14 @@ enum SyntaxHighlighter {
         language: Language?,
         dark: Bool
     ) -> AttributedSource {
+        attributedSource(text, rules: language.map { rules(for: $0) }, dark: dark)
+    }
+
+    nonisolated static func attributedSource(
+        _ text: String,
+        rules: [Rule]?,
+        dark: Bool
+    ) -> AttributedSource {
         let paragraph = NSMutableParagraphStyle()
         paragraph.lineSpacing = 2
         let storage = NSMutableAttributedString(
@@ -200,8 +298,8 @@ enum SyntaxHighlighter {
                 .paragraphStyle: paragraph,
             ]
         )
-        guard let language else { return AttributedSource(value: storage) }
-        let spans = spans(in: text, language: language)
+        guard let rules else { return AttributedSource(value: storage) }
+        let spans = spans(in: text, rules: rules)
         guard !spans.isEmpty else { return AttributedSource(value: storage) }
 
         // Five roles, resolved once — a per-span conversion would allocate an
@@ -246,7 +344,10 @@ enum SyntaxHighlighter {
         let priority: Int
     }
 
-    private struct Rule {
+    /// One highlight rule. Internal (not private) because custom grammars are
+    /// rule arrays too — validated by `CustomGrammarSpec` and scanned by the
+    /// same `spans(in:rules:)` pass as every shipped language.
+    struct Rule: Sendable {
         let pattern: String
         let role: Role
         let context: Bool

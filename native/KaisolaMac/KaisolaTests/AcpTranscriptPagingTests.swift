@@ -401,8 +401,8 @@ final class AcpTranscriptPagingTests: XCTestCase {
         guard case .table = blocks[1].block else {
             return XCTFail("Expected native table block")
         }
-        XCTAssertEqual(AcpTranscriptCodeLanguage.language(for: "typescript"), .javascript)
-        XCTAssertEqual(AcpTranscriptCodeLanguage.language(for: "py"), .python)
+        XCTAssertEqual(AcpTranscriptCodeLanguage.grammar(for: "typescript"), .shipped(.javascript))
+        XCTAssertEqual(AcpTranscriptCodeLanguage.grammar(for: "py"), .shipped(.python))
         XCTAssertFalse(SyntaxHighlighter.spans(in: code, language: .swift).isEmpty)
     }
 

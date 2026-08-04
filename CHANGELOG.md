@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.1.105 — 2026-08-04
+
+- The glass is a quarter less saturated everywhere — the wallpaper's colour arrives calmer while its texture and detail stay exactly as they were. The idle canvas keeps its transparency but reads as glass over the picture rather than the picture at full strength.
+- The project now introduces itself as what it is: an open-source IDE GUI for coding agents, native in Swift.
+
 ## 0.1.104 — 2026-08-04
 
 - Custom agents can now reach the chat surface — safely. Declare an npm ACP adapter and whose accounts it uses, then enable it: Kaisola installs the exact package with scripts disabled, pins its whole dependency graph, and runs only that pinned code. If anything about the install changes, chat turns off and says why until you approve again.

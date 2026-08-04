@@ -47,7 +47,13 @@ final class DesktopChromaMeasureTests: XCTestCase {
     ///
     /// The thresholds below are derived from this fixture, not guessed — rock
     /// sits at 0.048 saturation and moss at 0.778, so a 95/5 split averages to
-    /// 0.084 while the weighted measure finds 0.385.
+    /// 0.084 while the weighted measure finds 0.176.
+    ///
+    /// That was 0.385 when the weight was squared. Squaring found more of the
+    /// moss and also amplified a residual hue dependence enough to break the
+    /// invariance round 8 established, so `concentrationExponent` was softened
+    /// to 0.5 — see its own note. Twice the mean is still the difference
+    /// between reading this picture as grey and reading it as green.
     func testMossOnBasaltIsFoundRatherThanAveragedAway() {
         var pixels: [Pixel] = Array(repeating: (0.100, 0.102, 0.105), count: 95)  // basalt
         pixels.append(contentsOf: Array(repeating: (0.35, 0.72, 0.16), count: 5))  // moss
@@ -56,11 +62,11 @@ final class DesktopChromaMeasureTests: XCTestCase {
         let characteristic = DesktopBackdropRenderer.characteristicSaturation(pixels)
 
         XCTAssertEqual(averaged, 0.084, accuracy: 0.002, "the mean genuinely reads this as grey")
-        XCTAssertEqual(characteristic, 0.385, accuracy: 0.002, "the green survives the measure")
+        XCTAssertEqual(characteristic, 0.176, accuracy: 0.002, "the green survives the measure")
         XCTAssertGreaterThan(
             characteristic / averaged,
-            4,
-            "a concentrated colour must read far stronger than its average"
+            2,
+            "a concentrated colour must read markedly stronger than its average"
         )
     }
 

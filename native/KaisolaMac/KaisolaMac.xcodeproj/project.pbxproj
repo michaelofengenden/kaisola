@@ -131,6 +131,7 @@
 		7FC978B9CB1801B45BC82E36 /* KaisolaProductMigration.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0AB04B1B3E725C0E0F09B57B /* KaisolaProductMigration.swift */; };
 		7FF3EA80ABF0D3AA00F5FA0B /* QuietStatusClock.swift in Sources */ = {isa = PBXBuildFile; fileRef = 24F47DB42ECE72E7A870B5E7 /* QuietStatusClock.swift */; };
 		8073BF3B3D019ED2F8CA11EB /* CompanionPairingCoordinatorTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A84A690D14C8F442F82CE86E /* CompanionPairingCoordinatorTests.swift */; };
+		81C489277F8E1844A2E19BBE /* DesktopCaptureSource.swift in Sources */ = {isa = PBXBuildFile; fileRef = 426D7BDBEB0882FAF75AC5F3 /* DesktopCaptureSource.swift */; };
 		81EC29BF425F665E2EF89DF2 /* ProjectReorderTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = B29CF4F90D6C4CD2F54D1948 /* ProjectReorderTests.swift */; };
 		84C10713F1568FF52C3C01B5 /* UpdateCenter.swift in Sources */ = {isa = PBXBuildFile; fileRef = 40FA963B9539F48222ACB620 /* UpdateCenter.swift */; };
 		85ACCE7516210AF313C10CCC /* PlanUsageSnapshotStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = F07359E5FCD9B5DF4E23DE50 /* PlanUsageSnapshotStore.swift */; };
@@ -356,6 +357,7 @@
 		40508869DD92A10AE3EF0352 /* CompanionHost.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CompanionHost.swift; sourceTree = "<group>"; };
 		40AFF780B226613EC2DA25AA /* AcpTranscriptRendering.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AcpTranscriptRendering.swift; sourceTree = "<group>"; };
 		40FA963B9539F48222ACB620 /* UpdateCenter.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = UpdateCenter.swift; sourceTree = "<group>"; };
+		426D7BDBEB0882FAF75AC5F3 /* DesktopCaptureSource.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DesktopCaptureSource.swift; sourceTree = "<group>"; };
 		44220D13FC4D0265D132F67A /* TerminalCursorStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TerminalCursorStore.swift; sourceTree = "<group>"; };
 		446E609412A194ED4620DCDF /* AcpComposerView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AcpComposerView.swift; sourceTree = "<group>"; };
 		455D0FF2F635A75069247811 /* BrokerBootstrapClient.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BrokerBootstrapClient.swift; sourceTree = "<group>"; };
@@ -826,6 +828,7 @@
 				9606084ED3CB161CA3F53665 /* AppModel+QuickActions.swift */,
 				A9878CE4AE9D997C699F9827 /* AppModelBookkeeping.swift */,
 				BD79D4F2FC6603ED61013FA9 /* AttentionCenter.swift */,
+				426D7BDBEB0882FAF75AC5F3 /* DesktopCaptureSource.swift */,
 				FBDFA0DF725244691C0496A5 /* Info.plist */,
 				D624AF2C46BA83B73A21F0B3 /* KaisolaMacAppDelegate.swift */,
 				0AB04B1B3E725C0E0F09B57B /* KaisolaProductMigration.swift */,
@@ -1242,6 +1245,7 @@
 				F4C6C5462997C4F025270D7D /* CustomAgentStore.swift in Sources */,
 				5760827CF9F4168466291A60 /* CustomAgentsSection.swift in Sources */,
 				F369C66C4AB127DBFD4B5773 /* DataPreviews.swift in Sources */,
+				81C489277F8E1844A2E19BBE /* DesktopCaptureSource.swift in Sources */,
 				6A17D13258D14DC0222A37FA /* FilePreviewContent.swift in Sources */,
 				DDE8DE7312A55EEAC190CF53 /* FilePreviewEditors.swift in Sources */,
 				4E6A3E96C33819EB4C16738C /* FilePreviewRecovery.swift in Sources */,

@@ -1539,8 +1539,13 @@ enum DesktopWallpaperLocator {
     static func resolve(
         desktopImageURL: URL?,
         readableStill: (URL) -> Bool,
-        aerialStill: () -> URL?
+        aerialStill: () -> URL?,
+        captured: URL? = nil
     ) -> DesktopWallpaperResolution {
+        // A captured desktop is the picture actually on screen, so it outranks
+        // every deduced one. Everything below this line is inference; this line
+        // is observation.
+        if let captured, readableStill(captured) { return .picture(captured) }
         if let desktopImageURL,
            !isDynamicDesktopSentinel(desktopImageURL),
            readableStill(desktopImageURL) {
@@ -1556,10 +1561,12 @@ enum DesktopWallpaperLocator {
         supportDirectory: URL? = nil
     ) -> DesktopWallpaperResolution {
         let support = supportDirectory ?? defaultSupportDirectory
+        let captured = DesktopCaptureSource.captureURL
         return resolve(
             desktopImageURL: desktopImageURL,
             readableStill: { CGImageSourceCreateWithURL($0 as CFURL, nil) != nil },
-            aerialStill: { currentAerialStill(supportDirectory: support) }
+            aerialStill: { currentAerialStill(supportDirectory: support) },
+            captured: FileManager.default.fileExists(atPath: captured.path) ? captured : nil
         )
     }
 
@@ -2821,6 +2828,21 @@ extension DesktopBackdropRenderer {
     /// the reason `darkSaturationCeiling` gives: at near-black the same
     /// absolute chroma is a far larger fraction of the surface, so a bigger
     /// number here is what *holds* dark where round 7 put it.
+    /// Left at the shipped values deliberately.
+    ///
+    /// Halving these did make the surface calmer, and it also broke the
+    /// hue-invariance property round 8 established: with the wallpaper's chroma
+    /// cut, `GlassWarmth`'s fixed amber becomes proportionally larger and the
+    /// invariance test's "amber removed" correction stops accounting for the
+    /// difference (1.035× against a 1.03 tolerance). Rebalancing the two
+    /// together is the right change and is worth doing on its own.
+    ///
+    /// It is also not urgent, because the over-saturation Michael saw was mostly
+    /// the *wrong picture*: the shuffle heuristic was painting an autumn
+    /// hillside, all yellows and greens, behind a desktop of grey basalt. With
+    /// the desktop captured rather than guessed, the source is his own muted
+    /// wallpaper and the share is being asked to colour something that is barely
+    /// coloured to begin with.
     static let desktopChromaShare: Double = 0.162
     static let darkDesktopChromaShare: Double = 0.228
 
@@ -2860,6 +2882,19 @@ extension DesktopBackdropRenderer {
     /// take peaks and move them."
     ///
     /// Pure, so the three properties above are tested rather than argued.
+    /// How strongly concentrated colour outweighs spread colour.
+    ///
+    /// 0 is a plain mean. 1 squares the weight, which found the moss but
+    /// amplified a residual hue dependence in the pixel distribution enough to
+    /// break the invariance round 8 established — measured, the surface's
+    /// colourfulness varied 1.156× across the hue family against a 1.12
+    /// tolerance. That property is worth more than the extra lift, so the
+    /// emphasis is softened rather than the tolerance widened.
+    ///
+    /// At 0.5 the moss fixture still reads roughly twice its mean, which is the
+    /// difference between "grey" and "green".
+    static let concentrationExponent: Double = 0.5
+
     static func characteristicSaturation(
         _ pixels: [(red: Double, green: Double, blue: Double)]
     ) -> Double {
@@ -2870,8 +2905,9 @@ extension DesktopBackdropRenderer {
             guard peak > 0.004 else { continue }
             let base = min(pixel.red, min(pixel.green, pixel.blue))
             let saturation = (peak - base) / peak
-            weighted += saturation * saturation
-            weight += saturation
+            let emphasis = pow(saturation, concentrationExponent)
+            weighted += saturation * emphasis
+            weight += emphasis
         }
         guard weight > 0.0001 else { return 0 }
         return weighted / weight
@@ -3717,10 +3753,27 @@ final class DesktopBackdropProvider: ObservableObject {
         // desktop, so how wide that desktop is belongs to the bake — and so to
         // the cache key. See `DesktopBackdropKey.screenPoints`.
         let screenPoints = Double(screen?.frame.width ?? 1512)
+        // Resolved here, on the main actor: `NSScreen` is not `Sendable`, and
+        // the capture below runs off it.
+        let displayID = screen?.displayID
         let texture = NativePreviewSettings.shared.glassTexture
         let colour = NativePreviewSettings.shared.glassColour
         work?.cancel()
         work = Task { [weak self] in
+            // Observe the desktop before deducing it. The capture writes a file
+            // the ladder below prefers, so a shuffled or dynamic desktop bakes
+            // the picture actually on screen rather than a guessed stand-in.
+            if let displayID {
+                // Asked once, and only when a wallpaper-backed surface is
+                // actually being drawn — never at launch, and never for someone
+                // whose glass source is Live or Eco.
+                if !DesktopCaptureSource.isAuthorized {
+                    _ = DesktopCaptureSource.requestAuthorization()
+                }
+                if DesktopCaptureSource.isAuthorized {
+                    _ = await DesktopCaptureSource.captureDesktop(displayID: displayID)
+                }
+            }
             let key = await Task.detached(priority: .utility) {
                 Self.key(
                     desktopImageURL: desktopImageURL,

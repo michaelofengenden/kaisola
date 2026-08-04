@@ -97,3 +97,54 @@ final class SummonPolicyTests: XCTestCase {
         XCTAssertNil(SummonPolicy.chatToFocus(selectedChatID: "x", chatIDs: []))
     }
 }
+
+/// The instruction-file staleness rule: gentle, pure, and silent for fresh
+/// or absent files.
+final class InstructionFileStalenessTests: XCTestCase {
+    private let now = Date(timeIntervalSince1970: 1_800_000_000)
+
+    func testFreshAndUnknowableFilesStaySilent() {
+        XCTAssertNil(InstructionFileStaleness.nudge(fileName: "CLAUDE.md", modified: nil, now: now))
+        XCTAssertNil(InstructionFileStaleness.nudge(
+            fileName: "CLAUDE.md",
+            modified: now.addingTimeInterval(-Double(89) * 86_400),
+            now: now
+        ))
+    }
+
+    func testAStaleFileNamesItsAgeAndGenerations() throws {
+        let nudge = try XCTUnwrap(InstructionFileStaleness.nudge(
+            fileName: "CLAUDE.md",
+            modified: now.addingTimeInterval(-Double(120) * 86_400),
+            now: now
+        ))
+        XCTAssertTrue(nudge.contains("120 days"), nudge)
+        XCTAssertTrue(nudge.contains("3 model generations"), nudge)
+        XCTAssertTrue(nudge.contains("CLAUDE.md"), nudge)
+    }
+
+    func testExactlyOneGenerationReadsSingular() throws {
+        let nudge = try XCTUnwrap(InstructionFileStaleness.nudge(
+            fileName: "AGENTS.md",
+            modified: now.addingTimeInterval(-Double(95) * 86_400),
+            now: now
+        ))
+        XCTAssertTrue(nudge.contains("about 2 model generations"), nudge)
+    }
+
+    func testTheDiskCheckPrefersClaudeMdAndSkipsAbsentProjects() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appending(path: "kaisola-stale-\(UUID().uuidString)", directoryHint: .isDirectory)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        addTeardownBlock { try? FileManager.default.removeItem(at: directory) }
+
+        XCTAssertNil(InstructionFileStaleness.nudge(forProjectAt: directory), "no file, no nudge")
+
+        let claude = directory.appending(path: "CLAUDE.md")
+        try Data("x".utf8).write(to: claude)
+        let old = Date().addingTimeInterval(-Double(200) * 86_400)
+        try FileManager.default.setAttributes([.modificationDate: old], ofItemAtPath: claude.path)
+        let nudge = try XCTUnwrap(InstructionFileStaleness.nudge(forProjectAt: directory))
+        XCTAssertTrue(nudge.contains("CLAUDE.md"))
+    }
+}

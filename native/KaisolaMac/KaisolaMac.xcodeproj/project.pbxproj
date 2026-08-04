@@ -54,6 +54,7 @@
 		2D87B2E1CE804065E07728CC /* RememberedSessionCatalog.swift in Sources */ = {isa = PBXBuildFile; fileRef = A8A8DBF7E5E633D17ADDE128 /* RememberedSessionCatalog.swift */; };
 		2DDDCA865F413721721D800C /* ApiKeyStoreTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5661F60153A30E55C8217B2A /* ApiKeyStoreTests.swift */; };
 		2EEAAAC8E8944A0A47F12576 /* BrokerGenerationRoutingTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = D917DA578BC63AF251ADA075 /* BrokerGenerationRoutingTests.swift */; };
+		2EEF618C0672590D5F84E02E /* InstructionFileStaleness.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8B86A2CF95725BC0B94C0DF1 /* InstructionFileStaleness.swift */; };
 		2F5FE737F53A209D9EF0884A /* AcpTerminalHostTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 07F25711B7E71707CD583039 /* AcpTerminalHostTests.swift */; };
 		30F274FD0EBF18BBC2120734 /* AcpPermissionRulesTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 757C6A4EEAF0C23D949EF4A5 /* AcpPermissionRulesTests.swift */; };
 		33692846E196A13311DD86C6 /* OnboardingView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 59057824C59D8B945BB9D032 /* OnboardingView.swift */; };
@@ -449,6 +450,7 @@
 		88248FB2EEAA9902A80D000D /* CompanionCommandRouterTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CompanionCommandRouterTests.swift; sourceTree = "<group>"; };
 		8A7A17FC91F373F5881DB97C /* BrokerReconnectBackoff.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BrokerReconnectBackoff.swift; sourceTree = "<group>"; };
 		8B3E3C357D3C2EC2452B447B /* CompanionSettingsTab.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CompanionSettingsTab.swift; sourceTree = "<group>"; };
+		8B86A2CF95725BC0B94C0DF1 /* InstructionFileStaleness.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = InstructionFileStaleness.swift; sourceTree = "<group>"; };
 		8C11BDCCBCE80BB806B9AF63 /* NativeSessionStore+AutoTitle.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "NativeSessionStore+AutoTitle.swift"; sourceTree = "<group>"; };
 		8C12BBC20CE649CC674E0BF6 /* CompanionPairingCoordinator.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CompanionPairingCoordinator.swift; sourceTree = "<group>"; };
 		8D98396E44670C6412BE1415 /* BrokerModels.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BrokerModels.swift; sourceTree = "<group>"; };
@@ -863,6 +865,7 @@
 				426D7BDBEB0882FAF75AC5F3 /* DesktopCaptureSource.swift */,
 				715B03F60293662C778FCB2C /* GlobalHotkeyCenter.swift */,
 				FBDFA0DF725244691C0496A5 /* Info.plist */,
+				8B86A2CF95725BC0B94C0DF1 /* InstructionFileStaleness.swift */,
 				D624AF2C46BA83B73A21F0B3 /* KaisolaMacAppDelegate.swift */,
 				0AB04B1B3E725C0E0F09B57B /* KaisolaProductMigration.swift */,
 				6E78A73E4BF5DABAB5BF6826 /* NativePreviewPaths.swift */,
@@ -1307,6 +1310,7 @@
 				C109697A36B8E2CDC10ED68C /* GitService+PR.swift in Sources */,
 				F377CC5A92CBA50885FEE900 /* GitService.swift in Sources */,
 				CF3A73BF1400EC4646AE71EF /* GlobalHotkeyCenter.swift in Sources */,
+				2EEF618C0672590D5F84E02E /* InstructionFileStaleness.swift in Sources */,
 				08AD90B91DFB148BF2F3B5E8 /* KaisolaMacAppDelegate.swift in Sources */,
 				7FC978B9CB1801B45BC82E36 /* KaisolaProductMigration.swift in Sources */,
 				5E7F7A75F43B6ED23B0A0C71 /* MarkdownAssets.swift in Sources */,

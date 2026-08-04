@@ -327,6 +327,8 @@ final class AppModel: ObservableObject {
     var persistedSessionAliases: [String: String] = [:]
     var persistedPinnedIDs: Set<String> = []
     private let adoptionStore: SessionAdoptionStore
+    /// Projects already nudged about a stale instruction file this run.
+    private var staleInstructionNudgesShown: Set<String> = []
     /// The adoption overlay, mirrored from `SessionAdoptionStore` so display
     /// grouping never reads a file per render. Presentation resolves a
     /// terminal's project through `displayProjectID(_:)`; broker RPCs never
@@ -2951,6 +2953,13 @@ final class AppModel: ObservableObject {
         refreshPersistedNavigationState(publish: false)
         selectedProjectID = project.id
         selectedProjectName = project.name
+        // The staleness nudge fires at the one moment instructions start
+        // mattering, once per project per run, and stays informational.
+        if !staleInstructionNudgesShown.contains(project.id),
+           let nudge = InstructionFileStaleness.nudge(forProjectAt: directory) {
+            staleInstructionNudgesShown.insert(project.id)
+            ToastCenter.shared.show(nudge, style: .info, duration: 6)
+        }
         let chatID = "chat-\(UUID().uuidString.lowercased().prefix(8))"
         let projectOverlay = ProjectAccountStore.mergedOverlay(
             app: NativePreviewSettings.shared.agentEnvironmentOverlay,

@@ -799,6 +799,9 @@ struct NativeRestorableSurfaceState: Codable, Equatable, Hashable, Sendable {
     /// generic surface layer so schema-one archives decode without migration;
     /// `agentChatDescriptor` normalizes absence to an empty queue.
     let queuedPrompts: [String]?
+    /// A per-chat model override (ANTHROPIC_MODEL / OPENAI_MODEL at spawn).
+    /// Optional and additive so schema-one archives decode without migration.
+    let modelOverride: String?
     let mesh: NativeRestorableMeshDescriptor?
 
     init(
@@ -811,6 +814,7 @@ struct NativeRestorableSurfaceState: Codable, Equatable, Hashable, Sendable {
         accountBinding: SessionAccountBinding? = nil,
         title: String? = nil,
         queuedPrompts: [String]? = nil,
+        modelOverride: String? = nil,
         mesh: NativeRestorableMeshDescriptor? = nil
     ) {
         self.kind = kind
@@ -822,6 +826,7 @@ struct NativeRestorableSurfaceState: Codable, Equatable, Hashable, Sendable {
         self.accountBinding = accountBinding?.normalized
         self.title = title
         self.queuedPrompts = queuedPrompts
+        self.modelOverride = modelOverride
         self.mesh = mesh
     }
 }
@@ -835,6 +840,9 @@ struct NativeRestorableAgentChatDescriptor: Codable, Equatable, Hashable, Identi
     let accountBinding: SessionAccountBinding?
     let title: String?
     let queuedPrompts: [String]
+    /// A per-chat model override, applied as ANTHROPIC_MODEL / OPENAI_MODEL
+    /// when the adapter spawns. Additive: legacy archives decode as nil.
+    let modelOverride: String?
 
     init(
         id: String,
@@ -844,7 +852,8 @@ struct NativeRestorableAgentChatDescriptor: Codable, Equatable, Hashable, Identi
         acpSessionID: String?,
         accountBinding: SessionAccountBinding? = nil,
         title: String?,
-        queuedPrompts: [String] = []
+        queuedPrompts: [String] = [],
+        modelOverride: String? = nil
     ) {
         self.id = id
         self.projectID = projectID
@@ -854,6 +863,7 @@ struct NativeRestorableAgentChatDescriptor: Codable, Equatable, Hashable, Identi
         self.accountBinding = accountBinding?.normalized
         self.title = title
         self.queuedPrompts = queuedPrompts
+        self.modelOverride = modelOverride
     }
 
     private enum CodingKeys: String, CodingKey {
@@ -865,6 +875,7 @@ struct NativeRestorableAgentChatDescriptor: Codable, Equatable, Hashable, Identi
         case accountBinding
         case title
         case queuedPrompts
+        case modelOverride
     }
 
     init(from decoder: any Decoder) throws {
@@ -880,6 +891,7 @@ struct NativeRestorableAgentChatDescriptor: Codable, Equatable, Hashable, Identi
         )?.normalized
         title = try container.decodeIfPresent(String.self, forKey: .title)
         queuedPrompts = try container.decodeIfPresent([String].self, forKey: .queuedPrompts) ?? []
+        modelOverride = try container.decodeIfPresent(String.self, forKey: .modelOverride)
     }
 
     func encode(to encoder: any Encoder) throws {
@@ -892,6 +904,7 @@ struct NativeRestorableAgentChatDescriptor: Codable, Equatable, Hashable, Identi
         try container.encodeIfPresent(accountBinding, forKey: .accountBinding)
         try container.encodeIfPresent(title, forKey: .title)
         try container.encode(queuedPrompts, forKey: .queuedPrompts)
+        try container.encodeIfPresent(modelOverride, forKey: .modelOverride)
     }
 }
 
@@ -906,7 +919,8 @@ extension NativeRestorableSurfaceState {
             acpSessionID: descriptor.acpSessionID,
             accountBinding: descriptor.accountBinding,
             title: descriptor.title,
-            queuedPrompts: descriptor.queuedPrompts
+            queuedPrompts: descriptor.queuedPrompts,
+            modelOverride: descriptor.modelOverride
         )
     }
 
@@ -924,7 +938,8 @@ extension NativeRestorableSurfaceState {
             acpSessionID: acpSessionID,
             accountBinding: accountBinding,
             title: title,
-            queuedPrompts: queuedPrompts ?? []
+            queuedPrompts: queuedPrompts ?? [],
+            modelOverride: modelOverride
         )
     }
 

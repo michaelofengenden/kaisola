@@ -29,6 +29,9 @@ struct RootShellView: View {
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @Environment(\.undoManager) private var undoManager
     @State private var renameTarget: String?
+    /// Chat id awaiting a typed model id (the menu's "Custom Model…").
+    @State private var customModelTarget: String?
+    @State private var customModelText: String = ""
     @State private var renameProjectTarget: String?
     @State private var renameText: String = ""
     @State private var gitRepo: URL?
@@ -318,6 +321,14 @@ struct RootShellView: View {
                 renameProjectTarget = nil
             } cancel: {
                 renameProjectTarget = nil
+            }
+        }
+        .sheet(item: Binding(get: { customModelTarget.map(RenameID.init) }, set: { customModelTarget = $0?.id })) { target in
+            RenameSheet(text: $customModelText, title: "Model for this chat") { modelID in
+                customModelTarget = nil
+                Task { await model.switchChatModel(target.id, to: modelID) }
+            } cancel: {
+                customModelTarget = nil
             }
         }
         .sheet(item: Binding(get: { gitRepo.map(GitRepoID.init) }, set: { gitRepo = $0?.url })) { repo in
@@ -2027,8 +2038,22 @@ struct RootShellView: View {
                     }
                 }
             }
+            Section("Model · \(chat.modelOverride ?? "Default")") {
+                accountMenuRow(title: "App default", isCurrent: chat.modelOverride == nil) {
+                    Task { await model.switchChatModel(chat.id, to: nil) }
+                }
+                ForEach(SessionModelOverride.quickChoices(forAgentID: chat.agentID), id: \.id) { choice in
+                    accountMenuRow(title: choice.title, isCurrent: chat.modelOverride == choice.id) {
+                        Task { await model.switchChatModel(chat.id, to: choice.id) }
+                    }
+                }
+                Button("Custom Model…") {
+                    customModelText = chat.modelOverride ?? ""
+                    customModelTarget = chat.id
+                }
+            }
             Divider()
-            Text("Switching starts a fresh provider session. The transcript, draft, and queued prompts stay.")
+            Text("Account switches start a fresh provider session; a model switch resumes the conversation. The transcript, draft, and queued prompts always stay.")
         } label: {
             Image(systemName: "person.crop.circle")
                 .frame(width: 24, height: 22)
@@ -2037,8 +2062,8 @@ struct RootShellView: View {
         .menuIndicator(.hidden)
         .fixedSize()
         .foregroundStyle(.secondary)
-        .help("Account: \(currentLabel) — click to switch, even mid-conversation")
-        .accessibilityLabel("Account: \(currentLabel)")
+        .help("Account: \(currentLabel) · Model: \(chat.modelOverride ?? "default") — switch either, even mid-conversation")
+        .accessibilityLabel("Account and model: \(currentLabel), \(chat.modelOverride ?? "default model")")
     }
 
     @ViewBuilder

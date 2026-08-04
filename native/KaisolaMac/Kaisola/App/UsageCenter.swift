@@ -255,8 +255,53 @@ struct SessionAccountBinding: Codable, Equatable, Hashable, Sendable {
         guard let profileID else { return binding?.accountID == nil }
         return binding?.accountID == profileID
     }
+}
 
-    private static func canonicalDirectory(_ rawValue: String) -> String? {
+/// A per-chat model override, expressed the way both CLIs already accept one:
+/// the same environment variables the app-wide Models & Keys routing sets.
+/// Pure so the env mapping is testable.
+enum SessionModelOverride {
+    /// The variable each provider's CLI honors for model selection, or nil
+    /// for agents with no known model env (the override is then inert rather
+    /// than guessed).
+    static func environmentKey(forAgentID agentID: String) -> String? {
+        switch agentID {
+        case "claude-code": "ANTHROPIC_MODEL"
+        case "codex": "OPENAI_MODEL"
+        default: nil
+        }
+    }
+
+    /// The curated quick choices per agent. Claude Code accepts its alias
+    /// names; Codex model ids move too fast to curate honestly, so its menu
+    /// offers only Default plus free-text.
+    static func quickChoices(forAgentID agentID: String) -> [(id: String, title: String)] {
+        switch agentID {
+        case "claude-code":
+            [("opus", "Opus"), ("sonnet", "Sonnet"), ("haiku", "Haiku")]
+        default:
+            []
+        }
+    }
+
+    static func applying(
+        _ model: String?,
+        agentID: String,
+        to environment: [String: String]
+    ) -> [String: String] {
+        guard let model = model?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !model.isEmpty,
+              model.count <= 128,
+              !model.unicodeScalars.contains(where: CharacterSet.controlCharacters.contains),
+              let key = environmentKey(forAgentID: agentID) else { return environment }
+        var environment = environment
+        environment[key] = model
+        return environment
+    }
+}
+
+extension SessionAccountBinding {
+    fileprivate static func canonicalDirectory(_ rawValue: String) -> String? {
         let trimmed = rawValue.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty,
               trimmed.count <= 4_096,

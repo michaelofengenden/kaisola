@@ -2084,7 +2084,8 @@ final class AppModel: ObservableObject {
                 acpSessionID: chat.conversation.providerSessionID,
                 accountBinding: chat.accountBinding,
                 title: chat.conversation.title,
-                queuedPrompts: chat.conversation.queued.map(\.text)
+                queuedPrompts: chat.conversation.queued.map(\.text),
+                modelOverride: chat.modelOverride
             )
             panes.append(NativeRestorablePaneState(
                 id: chat.id,
@@ -2595,6 +2596,7 @@ final class AppModel: ObservableObject {
                         ?? "\(agent.name) · \(directory.lastPathComponent)",
                     resumeSessionID: descriptor.acpSessionID ?? transcript?.sessionID,
                     accountBinding: descriptor.accountBinding,
+                    modelOverride: descriptor.modelOverride,
                     initialTranscript: transcript,
                     initialDraft: draft,
                     initialQueuedPrompts: descriptor.queuedPrompts
@@ -2929,6 +2931,7 @@ final class AppModel: ObservableObject {
         title: String,
         resumeSessionID: String?,
         accountBinding: SessionAccountBinding?,
+        modelOverride: String? = nil,
         initialTranscript: AcpTranscriptStore.Restoration?,
         initialDraft: String?,
         initialQueuedPrompts: [String]
@@ -2944,6 +2947,7 @@ final class AppModel: ObservableObject {
             )
         ) { _, custom in custom }
         var environment = SessionAccountBinding.applying(accountBinding, to: baseEnvironment)
+        environment = SessionModelOverride.applying(modelOverride, agentID: agent.id, to: environment)
         // The host marker — see the terminal spawn's twin assignment.
         environment["KAISOLA"] = "1"
         environment["KAISOLA_SESSION_ID"] = chatID
@@ -3067,6 +3071,7 @@ final class AppModel: ObservableObject {
             agentID: agent.id,
             workspaceDirectory: directory,
             accountBinding: accountBinding,
+            modelOverride: modelOverride,
             conversation: conversation
         )
         chats.append(handle)
@@ -3108,7 +3113,8 @@ final class AppModel: ObservableObject {
             acpSessionID: closingChat.conversation.providerSessionID,
             accountBinding: closingChat.accountBinding,
             title: closingChat.conversation.title,
-            queuedPrompts: closingChat.conversation.queued.map(\.text)
+            queuedPrompts: closingChat.conversation.queued.map(\.text),
+            modelOverride: closingChat.modelOverride
         )
         storeRecentlyClosedPane(NativeRestorablePaneState(
             id: chatID,
@@ -3261,6 +3267,7 @@ final class AppModel: ObservableObject {
             title: title,
             resumeSessionID: nil,
             accountBinding: binding,
+            modelOverride: chat.modelOverride,
             initialTranscript: transcript,
             initialDraft: finalDraft ?? transcript?.draft,
             initialQueuedPrompts: queued
@@ -3274,6 +3281,65 @@ final class AppModel: ObservableObject {
         scheduleWorkspaceStateSave(projectID: projectID)
         ToastCenter.shared.show(
             "Switched to \(binding.label). Fresh provider session; the transcript stays.",
+            style: .success
+        )
+    }
+
+    /// Move a live chat to a different model — the account switch's twin, with
+    /// one important difference: the credentials do not change, so the
+    /// provider thread is a legitimate resume candidate and the conversation's
+    /// context survives wherever the adapter honors resume. `nil` returns the
+    /// chat to the app-default model.
+    func switchChatModel(_ chatID: String, to model: String?) async {
+        guard let chat = chats.first(where: { $0.id == chatID }),
+              let agent = AgentRegistry.profile(id: chat.agentID) else { return }
+        let trimmed = model?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let target = (trimmed?.isEmpty == false) ? trimmed : nil
+        guard target != chat.modelOverride else {
+            ToastCenter.shared.show(
+                "This chat is already on \(target ?? "the default model").",
+                style: .info
+            )
+            return
+        }
+        let projectID = chat.projectID
+        let directory = chat.workspaceDirectory
+        let title = chat.conversation.title
+        let queued = chat.conversation.queued.map(\.text)
+        let resumeSessionID = chat.conversation.providerSessionID
+        let finalDraft = await chat.conversation.stop()
+        await flushTranscriptPersistence()
+        let transcript = await transcriptStore.restoration(
+            for: chatID,
+            tailLimit: AcpConversation.defaultVisibleLimit
+        )
+        guard let live = chats.first(where: { $0.id == chatID }),
+              live.conversation === chat.conversation else { return }
+        chats.removeAll { $0.id == chatID }
+        usageObservers.removeValue(forKey: chatID)?.forEach { $0.cancel() }
+        usageCenter.unregister(chatID: chatID, sourceID: usageSourceID, forgetWhenLast: false)
+        surfaceObservers.removeValue(forKey: chatID)?.cancel()
+        guard appendChat(
+            id: chatID,
+            agent: agent,
+            directory: directory,
+            title: title,
+            resumeSessionID: resumeSessionID ?? transcript?.sessionID,
+            accountBinding: chat.accountBinding,
+            modelOverride: target,
+            initialTranscript: transcript,
+            initialDraft: finalDraft ?? transcript?.draft,
+            initialQueuedPrompts: queued
+        ) != nil else {
+            ToastCenter.shared.show(
+                "The chat adapter is unavailable, so the model was not switched.",
+                style: .error
+            )
+            return
+        }
+        scheduleWorkspaceStateSave(projectID: projectID)
+        ToastCenter.shared.show(
+            "Switched to \(target ?? "the default model").",
             style: .success
         )
     }
@@ -3485,6 +3551,7 @@ final class AppModel: ObservableObject {
                 title: descriptor.title ?? "\(agent.name) · \(directory.lastPathComponent)",
                 resumeSessionID: descriptor.acpSessionID ?? transcript?.sessionID,
                 accountBinding: descriptor.accountBinding,
+                modelOverride: descriptor.modelOverride,
                 initialTranscript: transcript,
                 initialDraft: draft,
                 initialQueuedPrompts: descriptor.queuedPrompts

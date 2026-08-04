@@ -12,6 +12,9 @@ struct AcpChatHandle: Identifiable {
     let workspaceDirectory: URL
     /// Immutable provider-account context for this continuation.
     let accountBinding: SessionAccountBinding?
+    /// The model this chat runs on, when it departs from the app default —
+    /// applied as an environment override at adapter spawn.
+    let modelOverride: String?
     let conversation: AcpConversation
 
     init(
@@ -19,12 +22,14 @@ struct AcpChatHandle: Identifiable {
         agentID: String,
         workspaceDirectory: URL,
         accountBinding: SessionAccountBinding? = nil,
+        modelOverride: String? = nil,
         conversation: AcpConversation
     ) {
         self.id = id
         self.agentID = agentID
         self.workspaceDirectory = workspaceDirectory
         self.accountBinding = accountBinding?.normalized
+        self.modelOverride = modelOverride
         self.conversation = conversation
     }
 

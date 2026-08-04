@@ -125,3 +125,65 @@ final class ChatAccountMenuRowTests: XCTestCase {
         XCTAssertFalse(SessionAccountBinding.menuRowIsCurrent(binding: nil, profileID: "work"))
     }
 }
+
+/// The per-chat model override's env mapping — the same variables the
+/// app-wide Models & Keys routing sets, so the CLIs need nothing new.
+final class SessionModelOverrideTests: XCTestCase {
+    func testEachProviderGetsItsOwnVariable() {
+        let claude = SessionModelOverride.applying("opus", agentID: "claude-code", to: [:])
+        XCTAssertEqual(claude["ANTHROPIC_MODEL"], "opus")
+        XCTAssertNil(claude["OPENAI_MODEL"])
+        let codex = SessionModelOverride.applying("gpt-x", agentID: "codex", to: [:])
+        XCTAssertEqual(codex["OPENAI_MODEL"], "gpt-x")
+        XCTAssertNil(codex["ANTHROPIC_MODEL"])
+    }
+
+    /// An unknown agent, an empty string, or a hostile value leaves the
+    /// environment untouched — the override is inert, never guessed.
+    func testInvalidOverridesAreInert() {
+        XCTAssertEqual(SessionModelOverride.applying("m", agentID: "custom-thing", to: ["A": "1"]), ["A": "1"])
+        XCTAssertEqual(SessionModelOverride.applying("   ", agentID: "claude-code", to: [:]), [:])
+        XCTAssertEqual(SessionModelOverride.applying(nil, agentID: "claude-code", to: [:]), [:])
+        XCTAssertEqual(
+            SessionModelOverride.applying("bad\u{0}model", agentID: "claude-code", to: [:]),
+            [:]
+        )
+        XCTAssertEqual(
+            SessionModelOverride.applying(String(repeating: "m", count: 200), agentID: "claude-code", to: [:]),
+            [:]
+        )
+    }
+
+    func testTheOverrideWinsOverAnAppWideRoutingValue() {
+        let env = SessionModelOverride.applying(
+            "haiku",
+            agentID: "claude-code",
+            to: ["ANTHROPIC_MODEL": "sonnet"]
+        )
+        XCTAssertEqual(env["ANTHROPIC_MODEL"], "haiku")
+    }
+
+    /// The persisted chat descriptor round-trips the override, and a legacy
+    /// archive without the key decodes as nil rather than failing.
+    func testDescriptorRoundTripsAndLegacyDecodes() throws {
+        let descriptor = NativeRestorableAgentChatDescriptor(
+            id: "chat-1",
+            projectID: "nproj_abc",
+            agentID: "claude-code",
+            workspacePath: "/tmp/x",
+            acpSessionID: "s1",
+            title: "T",
+            queuedPrompts: ["later"],
+            modelOverride: "opus"
+        )
+        let data = try JSONEncoder().encode(descriptor)
+        let decoded = try JSONDecoder().decode(NativeRestorableAgentChatDescriptor.self, from: data)
+        XCTAssertEqual(decoded.modelOverride, "opus")
+
+        let legacy = Data("""
+        {"id":"chat-2","projectID":"nproj_abc","agentID":"codex","workspacePath":"/tmp/x","queuedPrompts":[]}
+        """.utf8)
+        let old = try JSONDecoder().decode(NativeRestorableAgentChatDescriptor.self, from: legacy)
+        XCTAssertNil(old.modelOverride)
+    }
+}

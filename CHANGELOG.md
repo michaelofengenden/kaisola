@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.1.101 — 2026-08-04
+
+- The bell is now the all-agents center: every session that needs you, across every project, grouped by project with Permissions / Done / Bells filters. Entries whose session is gone dim and clear with one click.
+- Terminal themes are yours to add: import a JSON theme (light and dark palettes, 16 ANSI colors) and switch to it; a theme that can't be used says exactly which color failed.
+- New languages highlight without an app update: import a grammar naming its file extensions, fence tokens, and coloring rules. Built-in languages can't be overridden.
+- Route unfamiliar file extensions to the preview you want — a .geojson to the JSON table, a .svelte to HTML. Text previews only, by design: nothing can be routed into the PDF or image parsers.
+- Every hosted terminal and chat exports KAISOLA=1 and KAISOLA_SESSION_ID, so shell profiles and CLIs can detect they're running inside Kaisola and adapt.
+
 ## 0.1.100 — 2026-08-03
 
 - Switch a chat's subscription account from inside the chat — even mid-conversation. The transcript, draft, and queued prompts stay; the agent restarts on the account you picked.

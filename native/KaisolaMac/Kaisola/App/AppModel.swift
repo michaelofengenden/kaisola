@@ -2943,7 +2943,10 @@ final class AppModel: ObservableObject {
                 project: ProjectAccountStore().override(forProject: projectID)
             )
         ) { _, custom in custom }
-        let environment = SessionAccountBinding.applying(accountBinding, to: baseEnvironment)
+        var environment = SessionAccountBinding.applying(accountBinding, to: baseEnvironment)
+        // The host marker — see the terminal spawn's twin assignment.
+        environment["KAISOLA"] = "1"
+        environment["KAISOLA_SESSION_ID"] = chatID
         guard let adapter = AcpAdapter.forAgent(agent.id, environment: environment) else { return nil }
         // Legacy descriptors have no immutable account context. Starting a new
         // provider thread preserves the visible transcript without risking a
@@ -4554,6 +4557,12 @@ final class AppModel: ObservableObject {
         } else {
             accountBinding = nil
         }
+        // The host marker, same convention as Cursor's CURSOR_AGENT: shell
+        // profiles and CLIs can detect they are running inside Kaisola (and
+        // which session) to suppress pagers, heavy prompt themes, or anything
+        // else that fights inline capture.
+        overlay["KAISOLA"] = "1"
+        overlay["KAISOLA_SESSION_ID"] = terminalID
         // The overlay can carry secrets (ANTHROPIC_API_KEY / OPENAI_API_KEY).
         // The broker's createTerminal has no env channel, so the env must reach
         // the shell through the `-c` command — but embedding `export KEY=secret`

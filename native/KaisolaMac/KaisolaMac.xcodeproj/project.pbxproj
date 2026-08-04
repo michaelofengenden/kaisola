@@ -120,6 +120,7 @@
 		7467E7C0CF10006DE74138EA /* AccountSignInControllerTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0D0C0AB93E53CC4CC7AA3A38 /* AccountSignInControllerTests.swift */; };
 		752FE6366E7DCEFE83F82182 /* QuickActionStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6D76F5FBB1B68291847A102F /* QuickActionStore.swift */; };
 		75C96456BA526067D7B840A7 /* SettingsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1DC5E2009F74FD5A05DFB27D /* SettingsView.swift */; };
+		768806706220AA2FBF980582 /* TranscriptSearchBudgetTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = D77D695C72611E34382FDF10 /* TranscriptSearchBudgetTests.swift */; };
 		77A3BE106C196A76FF285F1F /* AgentFileFollow.swift in Sources */ = {isa = PBXBuildFile; fileRef = 856354DE0BB8187DD641F300 /* AgentFileFollow.swift */; };
 		798DE8FD51B9FFE7D6F9706F /* BrokerLaunchConfiguration.swift in Sources */ = {isa = PBXBuildFile; fileRef = 58663742F2D4497A3D234BF7 /* BrokerLaunchConfiguration.swift */; };
 		7B168B0E70A7503AD02FF74D /* DetachedBrokerProcess.swift in Sources */ = {isa = PBXBuildFile; fileRef = A8C8F92A50B6817748440EAE /* DetachedBrokerProcess.swift */; };
@@ -506,6 +507,7 @@
 		D5CC774EC646C7FF89176197 /* FilePreviewEditors.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FilePreviewEditors.swift; sourceTree = "<group>"; };
 		D5E2B204EE7B57EDF7B64A59 /* AccountSignInSheet.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AccountSignInSheet.swift; sourceTree = "<group>"; };
 		D624AF2C46BA83B73A21F0B3 /* KaisolaMacAppDelegate.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KaisolaMacAppDelegate.swift; sourceTree = "<group>"; };
+		D77D695C72611E34382FDF10 /* TranscriptSearchBudgetTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TranscriptSearchBudgetTests.swift; sourceTree = "<group>"; };
 		D7B13A899955A8094A15E262 /* CompanionConnectionSessionTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CompanionConnectionSessionTests.swift; sourceTree = "<group>"; };
 		D7BF0B4BEB31139A942C49DC /* BrokerHelperPackageTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BrokerHelperPackageTests.swift; sourceTree = "<group>"; };
 		D8FDE37840FBA272560EFB21 /* AcpWordDiffTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AcpWordDiffTests.swift; sourceTree = "<group>"; };
@@ -950,6 +952,7 @@
 				B2E93B6B24B1536CA24F517A /* TerminalScrollPinTests.swift */,
 				B2C1094B3B6E5323C1AAE22E /* TerminalTranscriptTests.swift */,
 				BA242AA2050FAC6C58C15F19 /* ToastCenterTests.swift */,
+				D77D695C72611E34382FDF10 /* TranscriptSearchBudgetTests.swift */,
 				E321EB733F62BC0E2D6CF1AF /* UsageCenterTests.swift */,
 				B12E9F413AC35E693709288A /* UsageMeterPaletteTests.swift */,
 				3E4B0A58CFF401C1C82E8239 /* WorkspaceFilesTests.swift */,
@@ -1453,6 +1456,7 @@
 				B566395F4947361F71EF2293 /* TerminalScrollbackDepthTests.swift in Sources */,
 				B245BBDC77E5759C77403AD7 /* TerminalTranscriptTests.swift in Sources */,
 				A9D68830C6E13C6151B98646 /* ToastCenterTests.swift in Sources */,
+				768806706220AA2FBF980582 /* TranscriptSearchBudgetTests.swift in Sources */,
 				4F54CE61D748E5469408987F /* UsageCenterTests.swift in Sources */,
 				46E02CD62E68B411ADECE3D9 /* UsageMeterPaletteTests.swift in Sources */,
 				C0A9194905016828644B7D86 /* WorkspaceFilesTests.swift in Sources */,

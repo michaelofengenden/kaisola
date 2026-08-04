@@ -124,7 +124,12 @@ Acceptance remaining:
   at full deck size, including twelve saturated terminals, the two cases the
   budget's own comment promises, a thirty-terminal tour that crosses the bound
   repeatedly, and the mounted-surface exemption.
-- Prove history search remains responsive under streaming output.
+- ~~Prove history search remains responsive under streaming output.~~ Done:
+  `TranscriptSearchBudgetTests` searches an ~8 MB retained history inside
+  1.5 s, holds six keystrokes over a ~4 MB buffer to 2 s, requires the cost to
+  stay roughly linear so a saturated 16 MiB document does not stall, and
+  requires an empty query — what the field holds most of the time — to cost
+  nothing.
 - Re-run the sustained interaction and memory gate on the installed optimized
   app alongside PR 8's physical-trackpad gate. Blocked on a signed installed
   build; the in-process half above is what can be checked without one.

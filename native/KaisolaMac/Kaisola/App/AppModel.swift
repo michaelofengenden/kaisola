@@ -3713,6 +3713,28 @@ final class AppModel: ObservableObject {
         await disconnect()
     }
 
+    /// Where an inbox entry's target lives now, resolved at render time —
+    /// `AttentionCenter.Entry` deliberately carries no project, so the inbox
+    /// asks the live surfaces instead of trusting a snapshot that could name
+    /// a project the session has since left.
+    func attentionContext(for targetID: String) -> (projectName: String?, exists: Bool) {
+        func name(_ projectID: String) -> String? {
+            projects.first(where: { $0.id == projectID })?.name
+        }
+        if let chat = chats.first(where: { $0.id == targetID }) {
+            return (name(chat.projectID), true)
+        }
+        if let terminal = sessions.first(where: { $0.id == targetID }) {
+            return (name(terminal.projectID), true)
+        }
+        if let mesh = meshes.first(where: { mesh in
+            mesh.id == targetID || mesh.columns.contains(where: { $0.id == targetID })
+        }) {
+            return (name(mesh.projectID), true)
+        }
+        return (nil, false)
+    }
+
     /// Jump from an inbox entry to its surface (chat or terminal session).
     func jumpToAttentionTarget(_ targetID: String) {
         if chats.contains(where: { $0.id == targetID }) {

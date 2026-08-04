@@ -1395,6 +1395,7 @@ struct RootShellView: View {
             },
             reload: { Task { await model.reload() } },
             jumpToAttention: { model.jumpToAttentionTarget($0) },
+            attentionContext: { model.attentionContext(for: $0) },
             newMesh: { runCommand(.newMesh) },
             newStagedMesh: { runCommand(.newStagedMesh) },
             newIdeaMesh: { runCommand(.newIdeaMesh) },
@@ -4476,6 +4477,11 @@ private struct ConnectionFooter: View {
     let rollbackBrokerGeneration: (String) -> Void
     let reload: () -> Void
     var jumpToAttention: ((String) -> Void)?
+    /// Resolves an inbox target to its project and liveness at render time —
+    /// see `AttentionInboxModel`. Nil (previews, fixtures) renders the flat
+    /// ungrouped inbox.
+    var attentionContext: ((String) -> (projectName: String?, exists: Bool))?
+    @State private var inboxFilter: Set<AttentionCenter.Kind>?
     var newMesh: (() -> Void)?
     var newStagedMesh: (() -> Void)?
     var newIdeaMesh: (() -> Void)?
@@ -4814,38 +4820,116 @@ private struct ConnectionFooter: View {
             .accessibilityLabel("Attention inbox, \(attention.count) items")
             .accessibilityIdentifier("footer.attention")
             .popover(isPresented: $showInbox, arrowEdge: .top) {
-                VStack(alignment: .leading, spacing: 0) {
-                    ForEach(attention.entries.reversed()) { entry in
-                        Button {
-                            showInbox = false
-                            jumpToAttention?(entry.targetID)
-                        } label: {
-                            HStack(spacing: 8) {
-                                KaisolaStatusGlyph(
-                                    systemImage: Self.attentionSymbol(entry.kind),
-                                    tone: Self.attentionTone(entry.kind)
-                                )
-                                VStack(alignment: .leading, spacing: 1) {
-                                    Text(entry.title).font(.callout).lineLimit(1)
-                                    Text(entry.detail).font(.caption).foregroundStyle(.secondary).lineLimit(1)
-                                }
-                                Spacer()
-                            }
-                            .contentShape(Rectangle())
-                        }
-                        .buttonStyle(.plain)
-                        .padding(.horizontal, 12).padding(.vertical, 6)
-                    }
-                    Divider()
-                    Button("Clear All") { attention.clearAll(); showInbox = false }
-                        .buttonStyle(.borderless)
-                        .font(.caption)
-                        .padding(8)
-                }
-                .frame(width: 300)
-                .padding(.vertical, 6)
+                attentionInbox
             }
         }
     }
 
+    /// The all-agents inbox: grouped by project, filterable by kind, with
+    /// gone-target rows dimmed to clear-only. Every session that needs you,
+    /// across every project, in one place.
+    private var attentionInbox: some View {
+        let sections = AttentionInboxModel.sections(
+            entries: attention.entries,
+            kinds: inboxFilter,
+            context: attentionContext ?? { _ in (nil, true) }
+        )
+        return VStack(alignment: .leading, spacing: 0) {
+            HStack(spacing: 6) {
+                inboxFilterChip(label: "All", kinds: nil)
+                ForEach(AttentionInboxModel.filterChips, id: \.label) { chip in
+                    inboxFilterChip(label: chip.label, kinds: chip.kinds)
+                }
+                Spacer()
+            }
+            .padding(.horizontal, 12)
+            .padding(.bottom, 6)
+            ScrollView {
+                VStack(alignment: .leading, spacing: 0) {
+                    ForEach(sections) { section in
+                        if attentionContext != nil {
+                            Text(section.title)
+                                .font(.caption2.weight(.semibold))
+                                .foregroundStyle(.secondary)
+                                .textCase(.uppercase)
+                                .padding(.horizontal, 12)
+                                .padding(.top, 8)
+                                .padding(.bottom, 2)
+                        }
+                        ForEach(section.rows) { row in
+                            attentionRow(row)
+                        }
+                    }
+                    if sections.isEmpty {
+                        Text("Nothing needs you in this filter.")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .padding(12)
+                    }
+                }
+            }
+            .frame(maxHeight: 360)
+            Divider()
+            Button("Clear All") { attention.clearAll(); showInbox = false }
+                .buttonStyle(.borderless)
+                .font(.caption)
+                .padding(8)
+        }
+        .frame(width: 320)
+        .padding(.vertical, 6)
+    }
+
+    private func inboxFilterChip(label: String, kinds: Set<AttentionCenter.Kind>?) -> some View {
+        let selected = inboxFilter == kinds
+        return Button(label) { inboxFilter = kinds }
+            .buttonStyle(.borderless)
+            .font(.caption2.weight(selected ? .semibold : .regular))
+            .foregroundStyle(selected ? Color.accentColor : Color.secondary)
+            .accessibilityAddTraits(selected ? .isSelected : [])
+    }
+
+    @ViewBuilder
+    private func attentionRow(_ row: AttentionInboxModel.Row) -> some View {
+        if row.targetExists {
+            Button {
+                showInbox = false
+                jumpToAttention?(row.entry.targetID)
+            } label: {
+                attentionRowLabel(row)
+            }
+            .buttonStyle(.plain)
+            .padding(.horizontal, 12).padding(.vertical, 6)
+        } else {
+            // The surface is gone: jumping would land on "session
+            // unavailable", so the row dims and offers only its own removal.
+            HStack(spacing: 8) {
+                attentionRowLabel(row)
+                    .opacity(0.55)
+                Button {
+                    attention.clear(targetID: row.entry.targetID)
+                } label: {
+                    Image(systemName: "xmark.circle.fill")
+                        .foregroundStyle(.secondary)
+                }
+                .buttonStyle(.plain)
+                .help("This session is gone; clear the entry")
+            }
+            .padding(.horizontal, 12).padding(.vertical, 6)
+        }
+    }
+
+    private func attentionRowLabel(_ row: AttentionInboxModel.Row) -> some View {
+        HStack(spacing: 8) {
+            KaisolaStatusGlyph(
+                systemImage: Self.attentionSymbol(row.entry.kind),
+                tone: Self.attentionTone(row.entry.kind)
+            )
+            VStack(alignment: .leading, spacing: 1) {
+                Text(row.entry.title).font(.callout).lineLimit(1)
+                Text(row.entry.detail).font(.caption).foregroundStyle(.secondary).lineLimit(1)
+            }
+            Spacer()
+        }
+        .contentShape(Rectangle())
+    }
 }

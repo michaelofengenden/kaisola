@@ -1638,6 +1638,61 @@ enum DesktopWallpaperLocator {
         }?.id
     }
 
+    /// Whether the store names a *rotating* desktop rather than one picture.
+    ///
+    /// macOS 26's headline desktops are shuffles, and the store records the
+    /// shuffle itself — `shuffle-all-aerials` — where a pinned wallpaper would
+    /// record an asset UUID. It is neither a still's name nor a category in the
+    /// manifest, whose categories are all UUIDs, so every lookup keyed on it
+    /// found nothing and the backdrop fell all the way through to the flat grey
+    /// fallback. Michael saw a featureless canvas and reasonably read it as the
+    /// glass erasing his wallpaper; the glass had simply never been given one.
+    static func isShuffleAssetID(_ id: String) -> Bool {
+        id.hasPrefix("shuffle-")
+    }
+
+    /// Which aerial a shuffled desktop is currently showing.
+    ///
+    /// The pick lives in the wallpaper agent and is written nowhere readable —
+    /// the store holds only the shuffle's name and its cadence. What the agent
+    /// does leave behind is the file it plays, so the most recently *read*
+    /// video is the strongest evidence available, and it beats the alternative
+    /// (an arbitrary member of the set) decisively.
+    ///
+    /// It is a heuristic and is documented as one: a shuffle that rotates while
+    /// the app sleeps can leave the previous pick as the newest read. That is a
+    /// wrong aerial rather than no aerial, which is the trade being made.
+    ///
+    /// Pure, with the readings injected, so the ordering is testable without a
+    /// wallpaper agent.
+    static func shuffledAerialStill(
+        videoAccess: [(id: String, accessedAt: Date)],
+        cachedStillIDs: Set<String>
+    ) -> String? {
+        videoAccess
+            .filter { cachedStillIDs.contains($0.id) }
+            .max { $0.accessedAt < $1.accessedAt }?
+            .id
+    }
+
+    /// Access times for every downloaded aerial video, newest last read first.
+    private static func aerialVideoAccess(directory: URL) -> [(id: String, accessedAt: Date)] {
+        guard let names = try? FileManager.default.contentsOfDirectory(atPath: directory.path)
+        else { return [] }
+        return names.compactMap { name in
+            guard name.hasSuffix(".mov") else { return nil }
+            let url = directory.appending(path: name)
+            guard let accessed = (try? FileManager.default.attributesOfItem(atPath: url.path))?[
+                .modificationDate
+            ] as? Date else { return nil }
+            // `atime` is what actually tracks playback, and `URLResourceValues`
+            // exposes it where `FileAttributeKey` does not.
+            let access = (try? url.resourceValues(forKeys: [.contentAccessDateKey]))?
+                .contentAccessDate ?? accessed
+            return (String(name.dropLast(4)), access)
+        }
+    }
+
     private static func currentAerialStill(supportDirectory: URL) -> URL? {
         let thumbnails = supportDirectory
             .appending(path: "aerials/thumbnails", directoryHint: .isDirectory)
@@ -1653,6 +1708,21 @@ enum DesktopWallpaperLocator {
         ), let cached = try? FileManager.default.contentsOfDirectory(atPath: thumbnails.path)
         else { return nil }
         let ids = Set(cached.lazy.filter { $0.hasSuffix(".png") }.map { String($0.dropLast(4)) })
+        // A shuffle names no category, so ask which video is being played
+        // before falling back to a representative member of the set.
+        if isShuffleAssetID(assetID) {
+            let access = aerialVideoAccess(
+                directory: supportDirectory.appending(path: "aerials/videos", directoryHint: .isDirectory)
+            )
+            if let playing = shuffledAerialStill(videoAccess: access, cachedStillIDs: ids) {
+                return thumbnails.appending(path: "\(playing).png")
+            }
+            // Nothing downloaded yet: any real aerial beats a flat grey panel.
+            if let any = ids.sorted().first {
+                return thumbnails.appending(path: "\(any).png")
+            }
+            return nil
+        }
         guard let pick = representativeAerialStill(
             assetID: assetID,
             manifest: manifest,

@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.1.103 — 2026-08-04
+
+- Summon Kaisola from any app with ⌥⌘K — it comes forward and lands in your last chat's composer. Off by default; turn it on in Settings next to notifications.
+- Every chat's usage card now shows a per-turn ledger: what each recent turn added to the context (negative when compaction shrank it) and what it cost.
+
 ## 0.1.102 — 2026-08-04
 
 - Switch a chat's model from inside the chat — Opus, Sonnet, Haiku, or any typed model id — and the conversation resumes under it. The account stays put, so nothing restarts from scratch.

@@ -47,6 +47,16 @@ targets:
         PRODUCT_BUNDLE_IDENTIFIER: com.kaisola.companion
         MARKETING_VERSION: 1.0.0
         TARGETED_DEVICE_FAMILY: "1"
+        # Declared, because deriving it from SDKROOT gives device only.
+        #
+        # Without this the scheme reported *zero* eligible destinations — the
+        # Simulator was not among them — so the Companion could only ever be
+        # built onto physical hardware. That is why PR 5's whole matrix read as
+        # blocked on a phone: pairing, resume, revoke, account isolation and
+        # capability grants are all reachable in the Simulator, which shares the
+        # Mac's network stack and therefore sees the Mac's `_kaisola._tcp`
+        # advertisement.
+        SUPPORTED_PLATFORMS: iphoneos iphonesimulator
         GENERATE_INFOPLIST_FILE: YES
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
         INFOPLIST_KEY_CFBundleDisplayName: Kaisola

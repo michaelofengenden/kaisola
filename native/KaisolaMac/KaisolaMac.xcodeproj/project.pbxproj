@@ -88,6 +88,7 @@
 		4E6A3E96C33819EB4C16738C /* FilePreviewRecovery.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6E5069F25B113346A58119D3 /* FilePreviewRecovery.swift */; };
 		4F2D5C5B7F7CFDEC0554F3A7 /* AppModel+QuickActions.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9606084ED3CB161CA3F53665 /* AppModel+QuickActions.swift */; };
 		4F54CE61D748E5469408987F /* UsageCenterTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = E321EB733F62BC0E2D6CF1AF /* UsageCenterTests.swift */; };
+		50D43293D5D16358308D0E77 /* PreviewMappingTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1630C2BF94B82E3E1CE1529D /* PreviewMappingTests.swift */; };
 		50E4AD9DC49C82B758116FCF /* TerminalTheme.swift in Sources */ = {isa = PBXBuildFile; fileRef = E9BB2E9EA7403C1040B07AB9 /* TerminalTheme.swift */; };
 		51E20BB18D6A545E5DBCBD0A /* AppModelBrokerFallbackTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4A70FC513A508673AD06C7E8 /* AppModelBrokerFallbackTests.swift */; };
 		52AE6E4E8BA301B6D72A0A5E /* QuietProjectRail.swift in Sources */ = {isa = PBXBuildFile; fileRef = BF1963B69A68F8B8B3326F9E /* QuietProjectRail.swift */; };
@@ -246,6 +247,7 @@
 		DDE8DE7312A55EEAC190CF53 /* FilePreviewEditors.swift in Sources */ = {isa = PBXBuildFile; fileRef = D5CC774EC646C7FF89176197 /* FilePreviewEditors.swift */; };
 		DE3AC5C4180DE02722CB1470 /* CompanionEventLog.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6DFAD4E1DBEFB8075FE1DE21 /* CompanionEventLog.swift */; };
 		E1DAD231CBE5620F9B604C58 /* BrokerGenerationRegistryTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5531DF3E35ADBE7EBBA1054E /* BrokerGenerationRegistryTests.swift */; };
+		E2484D69B0F74307AC81294B /* PreviewMappingStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = FD11C0718AB79EB611A1B01B /* PreviewMappingStore.swift */; };
 		E255262499CA22D8FB25AD64 /* CompanionTerminalControl.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9D10523E5E2321CBD2C8C1C2 /* CompanionTerminalControl.swift */; };
 		E2DC7F36968EA13B0E6FB431 /* AccountSignInSheet.swift in Sources */ = {isa = PBXBuildFile; fileRef = D5E2B204EE7B57EDF7B64A59 /* AccountSignInSheet.swift */; };
 		E313BDF65101B117D853A5F6 /* SwiftTerm in Frameworks */ = {isa = PBXBuildFile; productRef = D66795E8DB06EF352071B68C /* SwiftTerm */; };
@@ -319,6 +321,7 @@
 		143732221EC63F82B5874931 /* GitPRTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GitPRTests.swift; sourceTree = "<group>"; };
 		14A620CB3BAB100C84E6472B /* OmniBarDispatchTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OmniBarDispatchTests.swift; sourceTree = "<group>"; };
 		154C63628A43E6BD8410F578 /* ProjectAccountsSection.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ProjectAccountsSection.swift; sourceTree = "<group>"; };
+		1630C2BF94B82E3E1CE1529D /* PreviewMappingTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PreviewMappingTests.swift; sourceTree = "<group>"; };
 		16F343A1F0C6E1A6F95DB932 /* BrokerInfo.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BrokerInfo.swift; sourceTree = "<group>"; };
 		172BD0290C1A7F15B30D881B /* QuickActionStoreTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = QuickActionStoreTests.swift; sourceTree = "<group>"; };
 		172FA557F42248FF6A752716 /* TerminalTranscriptView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TerminalTranscriptView.swift; sourceTree = "<group>"; };
@@ -558,6 +561,7 @@
 		FB62A4685780F0E38D2120A0 /* ProjectAccountStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ProjectAccountStore.swift; sourceTree = "<group>"; };
 		FBDFA0DF725244691C0496A5 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist; path = Info.plist; sourceTree = "<group>"; };
 		FCA8B752F1EFCBEFAED78260 /* SavedWindowsStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SavedWindowsStore.swift; sourceTree = "<group>"; };
+		FD11C0718AB79EB611A1B01B /* PreviewMappingStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PreviewMappingStore.swift; sourceTree = "<group>"; };
 		FD76B9C89A35C06E7942F6D6 /* FirebaseAuthBackend.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FirebaseAuthBackend.swift; sourceTree = "<group>"; };
 		FDC5D762925B519587B9EF95 /* AcpChatHandle.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AcpChatHandle.swift; sourceTree = "<group>"; };
 		FDE152F4457B8AF7E5A92225 /* McpConfigStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = McpConfigStore.swift; sourceTree = "<group>"; };
@@ -660,6 +664,7 @@
 				C5828E934026DD96C9C6A1A9 /* MarkdownLiveEditor.swift */,
 				9286E9EFA45E3FEE67AEB1E3 /* MarkdownPreview.swift */,
 				F0BA033A578D32686122F7B3 /* MarkdownTableRendering.swift */,
+				FD11C0718AB79EB611A1B01B /* PreviewMappingStore.swift */,
 				995477C896372B075A7640B8 /* QuickActionsBar.swift */,
 				6D76F5FBB1B68291847A102F /* QuickActionStore.swift */,
 				3F83577979FF0B2A400B8F40 /* SourceOutline.swift */,
@@ -931,6 +936,7 @@
 				14A620CB3BAB100C84E6472B /* OmniBarDispatchTests.swift */,
 				A2C7EDA69DE3059B6E1F7333 /* OnboardingStateTests.swift */,
 				22F183A542A74098D9877FD8 /* PlanUsageSnapshotStoreTests.swift */,
+				1630C2BF94B82E3E1CE1529D /* PreviewMappingTests.swift */,
 				F31D5C02E5186D5E22284E23 /* PreviewPreparationBudgetTests.swift */,
 				B629B0BA3C5297E755F46087 /* ProjectAccountStoreTests.swift */,
 				B29CF4F90D6C4CD2F54D1948 /* ProjectReorderTests.swift */,
@@ -1308,6 +1314,7 @@
 				33692846E196A13311DD86C6 /* OnboardingView.swift in Sources */,
 				F70671167EAC7B9AB373F0DF /* PermissionRuleStore.swift in Sources */,
 				85ACCE7516210AF313C10CCC /* PlanUsageSnapshotStore.swift in Sources */,
+				E2484D69B0F74307AC81294B /* PreviewMappingStore.swift in Sources */,
 				86BA79F25DD512120D54105D /* ProjectAccountStore.swift in Sources */,
 				7DAB0AD69D2C07C5526C14B9 /* ProjectAccountsSection.swift in Sources */,
 				438E0552CA9EAAAB09ED0C1B /* ProjectTabStripView.swift in Sources */,
@@ -1439,6 +1446,7 @@
 				A046C6509A6463F293CBEAB7 /* OmniBarDispatchTests.swift in Sources */,
 				6A00EA5F231E518C8B154F62 /* OnboardingStateTests.swift in Sources */,
 				DD89F25377A4D52E5ED66886 /* PlanUsageSnapshotStoreTests.swift in Sources */,
+				50D43293D5D16358308D0E77 /* PreviewMappingTests.swift in Sources */,
 				5BF12B4AEA260B658F89B865 /* PreviewPreparationBudgetTests.swift in Sources */,
 				56020A049B6645F55D0B9AD0 /* ProjectAccountStoreTests.swift in Sources */,
 				81EC29BF425F665E2EF89DF2 /* ProjectReorderTests.swift in Sources */,

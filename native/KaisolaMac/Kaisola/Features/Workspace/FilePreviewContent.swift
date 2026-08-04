@@ -55,7 +55,10 @@ enum FilePreviewContent: Equatable, Sendable {
         "a", "bin", "class", "dmg", "dylib", "exe", "framework", "o", "pkg", "so", "wasm", "zip",
     ]
 
-    static func load(url: URL) -> FilePreviewContent {
+    static func load(
+        url: URL,
+        mappings: PreviewMappingStore = PreviewMappingStore()
+    ) -> FilePreviewContent {
         let path = url.path
         guard let attributes = try? FileManager.default.attributesOfItem(atPath: path),
               let size = attributes[.size] as? Int else { return .unreadable }
@@ -75,7 +78,21 @@ enum FilePreviewContent: Equatable, Sendable {
         if ext == "html" || ext == "htm" { return .html(text) }
         if ext == "csv" || ext == "tsv" { return .csv(text) }
         if ext == "json" || ext == "ipynb" { return .json(text) }
-        return ext == "md" || ext == "markdown" ? .markdown(text) : .text(text)
+        if ext == "md" || ext == "markdown" { return .markdown(text) }
+        // Custom preview mappings run *after* every built-in decision — a
+        // mapping can never take over an image, a document, the binary sniff,
+        // or a built-in text kind; it only decides how bytes that already
+        // passed the size cap and text decode get styled.
+        if let custom = mappings.kind(forExtension: ext) {
+            switch custom {
+            case .html: return .html(text)
+            case .csv: return .csv(text)
+            case .json: return .json(text)
+            case .markdown: return .markdown(text)
+            case .text: return .text(text)
+            }
+        }
+        return .text(text)
     }
 
     /// Prefer explicit Unicode BOMs, then UTF-8 and common repository-export

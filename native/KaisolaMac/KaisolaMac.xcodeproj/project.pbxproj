@@ -226,6 +226,7 @@
 		CDC7BC20F1CECF9BB283CA58 /* BrokerHelperPackageTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = D7BF0B4BEB31139A942C49DC /* BrokerHelperPackageTests.swift */; };
 		CE2036C2C15219A63B1E36B2 /* CompanionProjectionBuilder.swift in Sources */ = {isa = PBXBuildFile; fileRef = 142C8737C1900DE903FF5E87 /* CompanionProjectionBuilder.swift */; };
 		CF3950FAA193A0B68E569A8C /* DataPreviewsTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2A0AA3187DEE4894928C6341 /* DataPreviewsTests.swift */; };
+		CF3A73BF1400EC4646AE71EF /* GlobalHotkeyCenter.swift in Sources */ = {isa = PBXBuildFile; fileRef = 715B03F60293662C778FCB2C /* GlobalHotkeyCenter.swift */; };
 		D03D33CB4441F782774F21CD /* QuietIdentityMark.swift in Sources */ = {isa = PBXBuildFile; fileRef = FAE3A01EB2EEB4DDB4267B50 /* QuietIdentityMark.swift */; };
 		D067393E0B5AB8131238FAC4 /* NotificationBridge.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6CDF76F788AF144D1713A04E /* NotificationBridge.swift */; };
 		D167CD6D3218C8561E973F0A /* TerminalImageDropTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2582D1A9439C7C175E3FCDF5 /* TerminalImageDropTests.swift */; };
@@ -425,6 +426,7 @@
 		6E5069F25B113346A58119D3 /* FilePreviewRecovery.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FilePreviewRecovery.swift; sourceTree = "<group>"; };
 		6E78A73E4BF5DABAB5BF6826 /* NativePreviewPaths.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NativePreviewPaths.swift; sourceTree = "<group>"; };
 		6EB61D36CC5BEB88B707C9D7 /* AppModel+Pinning.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "AppModel+Pinning.swift"; sourceTree = "<group>"; };
+		715B03F60293662C778FCB2C /* GlobalHotkeyCenter.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GlobalHotkeyCenter.swift; sourceTree = "<group>"; };
 		732793D0CFBFD121B1D4146D /* SessionOrderStoreTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SessionOrderStoreTests.swift; sourceTree = "<group>"; };
 		73C156565BA4025A74960AD9 /* GitServiceTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GitServiceTests.swift; sourceTree = "<group>"; };
 		73DA2DC376948BFD21915726 /* MeshStagedTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MeshStagedTests.swift; sourceTree = "<group>"; };
@@ -859,6 +861,7 @@
 				A9878CE4AE9D997C699F9827 /* AppModelBookkeeping.swift */,
 				BD79D4F2FC6603ED61013FA9 /* AttentionCenter.swift */,
 				426D7BDBEB0882FAF75AC5F3 /* DesktopCaptureSource.swift */,
+				715B03F60293662C778FCB2C /* GlobalHotkeyCenter.swift */,
 				FBDFA0DF725244691C0496A5 /* Info.plist */,
 				D624AF2C46BA83B73A21F0B3 /* KaisolaMacAppDelegate.swift */,
 				0AB04B1B3E725C0E0F09B57B /* KaisolaProductMigration.swift */,
@@ -1303,6 +1306,7 @@
 				A83C0BFF243C1F87812AABFA /* GitService+Apply.swift in Sources */,
 				C109697A36B8E2CDC10ED68C /* GitService+PR.swift in Sources */,
 				F377CC5A92CBA50885FEE900 /* GitService.swift in Sources */,
+				CF3A73BF1400EC4646AE71EF /* GlobalHotkeyCenter.swift in Sources */,
 				08AD90B91DFB148BF2F3B5E8 /* KaisolaMacAppDelegate.swift in Sources */,
 				7FC978B9CB1801B45BC82E36 /* KaisolaProductMigration.swift in Sources */,
 				5E7F7A75F43B6ED23B0A0C71 /* MarkdownAssets.swift in Sources */,

@@ -806,6 +806,10 @@ final class KaisolaMacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDele
         }
         settings.applyAppearance()
         if !visualFixture && resourceWorkload == nil {
+            // The summon hotkey (⌥⌘K), armed only when the user turned it on —
+            // fixtures and workloads must never claim a system-wide key.
+            GlobalHotkeyCenter.shared.onSummon = { Self.summon() }
+            GlobalHotkeyCenter.shared.setEnabled(settings.summonHotkeyEnabled)
             NotificationBridge.shared.requestAuthorizationIfNeeded()
             CompanionHost.shared.configureTerminalControl(
                 adapter: companionTerminalControlAdapter
@@ -2892,6 +2896,29 @@ final class KaisolaMacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDele
 
     /// Open a session in its own fresh window (the native "pop out"): the new
     /// window's independent AppModel selects the same broker session.
+    /// The ⌥⌘K summon: bring Kaisola forward from any app and land in the
+    /// last chat's composer. No panel of its own (that is a design
+    /// conversation); the value is the zero-mouse arrival.
+    static func summon() {
+        NSApp.activate(ignoringOtherApps: true)
+        guard let delegate = NSApp.delegate as? KaisolaMacAppDelegate else { return }
+        let window = NSApp.mainWindow
+            ?? NSApp.windows.first(where: { $0.canBecomeKey && !($0 is NSPanel) })
+        guard let window else {
+            _ = delegate.makeWindow()
+            return
+        }
+        if window.isMiniaturized { window.deminiaturize(nil) }
+        window.makeKeyAndOrderFront(nil)
+        guard let model = delegate.windowModels[ObjectIdentifier(window)] else { return }
+        if let chatID = SummonPolicy.chatToFocus(
+            selectedChatID: model.selectedChatID,
+            chatIDs: model.chats.map(\.id)
+        ) {
+            model.selectChat(chatID)
+        }
+    }
+
     static func popOut(sessionID: String) {
         guard let delegate = NSApp.delegate as? KaisolaMacAppDelegate else {
             ToastCenter.shared.show("Kaisola could not open a new window.", style: .error)

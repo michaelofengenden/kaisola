@@ -74,3 +74,26 @@ final class AttentionInboxModelTests: XCTestCase {
         XCTAssertTrue(AttentionInboxModel.sections(entries: []) { _ in (nil, true) }.isEmpty)
     }
 }
+
+/// Where the ⌥⌘K summon lands.
+final class SummonPolicyTests: XCTestCase {
+    func testTheSelectedChatWinsWhenItExists() {
+        XCTAssertEqual(
+            SummonPolicy.chatToFocus(selectedChatID: "b", chatIDs: ["a", "b", "c"]),
+            "b"
+        )
+    }
+
+    func testAStaleSelectionFallsBackToTheNewestChat() {
+        XCTAssertEqual(
+            SummonPolicy.chatToFocus(selectedChatID: "gone", chatIDs: ["a", "b"]),
+            "b"
+        )
+        XCTAssertEqual(SummonPolicy.chatToFocus(selectedChatID: nil, chatIDs: ["a"]), "a")
+    }
+
+    func testNoChatsMeansNoFocusTarget() {
+        XCTAssertNil(SummonPolicy.chatToFocus(selectedChatID: nil, chatIDs: []))
+        XCTAssertNil(SummonPolicy.chatToFocus(selectedChatID: "x", chatIDs: []))
+    }
+}

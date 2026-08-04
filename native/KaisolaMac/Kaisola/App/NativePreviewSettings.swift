@@ -643,6 +643,12 @@ final class NativePreviewSettings: ObservableObject {
         didSet { persist(restoreCLIDrafts, forKey: Keys.restoreCLIDrafts) }
     }
 
+    /// The system-wide summon hotkey (⌥⌘K). Off by default — an app that
+    /// silently claims a global combo on update has overstepped.
+    @Published var summonHotkeyEnabled: Bool {
+        didSet { persist(summonHotkeyEnabled, forKey: Keys.summonHotkeyEnabled) }
+    }
+
     /// Opt-in while the shell-injection compatibility matrix is still being
     /// proven. New zsh sessions use app-owned startup files that source (but do
     /// not edit) the user's configuration and emit semantic command marks.
@@ -813,6 +819,7 @@ final class NativePreviewSettings: ObservableObject {
         static let terminalHistoryWarningMiB = "terminalHistoryWarningMiB"
         static let terminalPalette = "terminalPalette"
         static let restoreCLIDrafts = "restoreCLIDrafts"
+        static let summonHotkeyEnabled = "summonHotkeyEnabled"
         static let semanticShellIntegration = "semanticShellIntegration"
         static let terminalClipboardWriteAllowed = "terminalClipboardWriteAllowed"
         static let workspaceRail = "workspaceRailVisible"
@@ -892,6 +899,7 @@ final class NativePreviewSettings: ObservableObject {
             : Self.terminalHistoryWarningDefaultMiB
         terminalThemeID = defaults.string(forKey: Keys.terminalPalette) ?? "native"
         restoreCLIDrafts = defaults.object(forKey: Keys.restoreCLIDrafts) as? Bool ?? true
+        summonHotkeyEnabled = defaults.object(forKey: Keys.summonHotkeyEnabled) as? Bool ?? false
         semanticShellIntegration = defaults.object(forKey: Keys.semanticShellIntegration) as? Bool ?? false
         terminalClipboardWriteAllowed = defaults.object(forKey: Keys.terminalClipboardWriteAllowed) as? Bool ?? false
         sensitiveGlobs = defaults.stringArray(forKey: Keys.sensitiveGlobs) ?? AcpPermissionRules.defaultSensitiveGlobs

@@ -397,6 +397,23 @@ struct SettingsView: View {
                         }
                     }
                     SettingsDivider()
+                    SettingsRow(
+                        title: "Summon with \(GlobalHotkeyCenter.comboDisplay)",
+                        detail: "Bring Kaisola forward from any app, into the last chat",
+                        symbol: "keyboard"
+                    ) {
+                        Toggle("", isOn: Binding(
+                            get: { settings.summonHotkeyEnabled },
+                            set: { enabled in
+                                settings.summonHotkeyEnabled = enabled
+                                GlobalHotkeyCenter.shared.setEnabled(enabled)
+                            }
+                        ))
+                        .labelsHidden()
+                        .toggleStyle(.switch)
+                        .accessibilityLabel("Summon hotkey")
+                    }
+                    SettingsDivider()
                     SettingsRow(title: "External editor", detail: "Used by Shift-Command-O", symbol: "arrow.up.forward.app") {
                         TextField("System default", text: $settings.externalEditorApp)
                             .textFieldStyle(.plain)

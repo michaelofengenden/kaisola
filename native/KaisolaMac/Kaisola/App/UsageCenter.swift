@@ -452,6 +452,23 @@ final class UsageCenter: ObservableObject {
     /// tokens seen this session (context can shrink after a compaction, so the
     /// latest reading undercounts how much the chat has actually pushed through).
     struct ChatUsage: Identifiable, Equatable {
+        /// One completed turn's cost, as a delta against the turn before it.
+        /// `usedDelta` may be negative — compaction shrinks the context, and a
+        /// ledger that clamped it would quietly overstate every session.
+        struct TurnDelta: Equatable, Identifiable {
+            let index: Int
+            let at: Date
+            let usedDelta: Int
+            let costDelta: Double?
+
+            var id: Int { index }
+        }
+
+        /// How many completed turns the ledger keeps. Session-local by
+        /// design: the persisted usage schema stays untouched, and a relaunch
+        /// starts the ledger fresh rather than pretending to remember.
+        static let ledgerLimit = 12
+
         let id: String
         var title: String
         var agentID: String
@@ -461,6 +478,11 @@ final class UsageCenter: ObservableObject {
         var turns: Int
         var costAmount: Double?
         var costCurrency: String?
+        var recentTurns: [TurnDelta] = []
+        /// The reading the last completed turn ended on — the baseline the
+        /// next turn's delta is measured against.
+        var lastTurnUsed: Int = 0
+        var lastTurnCost: Double = 0
     }
 
     // Encodable as well as Decodable so the last good reading can be persisted
@@ -690,6 +712,23 @@ final class UsageCenter: ObservableObject {
     func recordTurn(chatID: String) -> AcpPersistedUsage? {
         guard var existing = byChat[chatID] else { return nil }
         existing.turns += 1
+        let costDelta: Double?
+        if let cost = existing.costAmount, cost > existing.lastTurnCost {
+            costDelta = cost - existing.lastTurnCost
+        } else {
+            costDelta = nil
+        }
+        existing.recentTurns.append(ChatUsage.TurnDelta(
+            index: existing.turns,
+            at: Date(),
+            usedDelta: existing.latestUsed - existing.lastTurnUsed,
+            costDelta: costDelta
+        ))
+        if existing.recentTurns.count > ChatUsage.ledgerLimit {
+            existing.recentTurns.removeFirst(existing.recentTurns.count - ChatUsage.ledgerLimit)
+        }
+        existing.lastTurnUsed = existing.latestUsed
+        existing.lastTurnCost = existing.costAmount ?? existing.lastTurnCost
         byChat[chatID] = existing
         let snapshot = persistedSnapshot(chatID: chatID)
         if let snapshot {

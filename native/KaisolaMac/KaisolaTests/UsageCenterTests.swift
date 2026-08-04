@@ -760,3 +760,55 @@ private final class UsageContextResolverProbe: @unchecked Sendable {
         return key
     }
 }
+
+/// The per-turn ledger: which turns spent the context, honest about
+/// compaction, capped, session-local.
+@MainActor
+final class UsageTurnLedgerTests: XCTestCase {
+    func testTurnDeltasMeasureAgainstThePreviousTurn() {
+        let center = UsageCenter()
+        center.record(chatID: "a", title: "A", agentID: "claude-code", usage: 100, max: 1_000)
+        _ = center.recordTurn(chatID: "a")
+        center.record(chatID: "a", title: "A", agentID: "claude-code", usage: 180, max: 1_000)
+        _ = center.recordTurn(chatID: "a")
+
+        let turns = center.byChat["a"]?.recentTurns ?? []
+        XCTAssertEqual(turns.map(\.usedDelta), [100, 80])
+        XCTAssertEqual(turns.map(\.index), [1, 2])
+    }
+
+    /// Compaction shrinks the context between turns; the ledger reports the
+    /// negative delta rather than clamping it into a lie.
+    func testCompactionShowsAsANegativeDelta() {
+        let center = UsageCenter()
+        center.record(chatID: "a", title: "A", agentID: "claude-code", usage: 900, max: 1_000)
+        _ = center.recordTurn(chatID: "a")
+        center.record(chatID: "a", title: "A", agentID: "claude-code", usage: 300, max: 1_000)
+        _ = center.recordTurn(chatID: "a")
+        XCTAssertEqual(center.byChat["a"]?.recentTurns.last?.usedDelta, -600)
+    }
+
+    func testTheLedgerIsCappedNewestKept() {
+        let center = UsageCenter()
+        center.record(chatID: "a", title: "A", agentID: "claude-code", usage: 0, max: 1_000)
+        for turn in 1...20 {
+            center.record(chatID: "a", title: "A", agentID: "claude-code", usage: turn * 10, max: 1_000)
+            _ = center.recordTurn(chatID: "a")
+        }
+        let turns = center.byChat["a"]?.recentTurns ?? []
+        XCTAssertEqual(turns.count, UsageCenter.ChatUsage.ledgerLimit)
+        XCTAssertEqual(turns.last?.index, 20, "the newest turns survive the cap")
+        XCTAssertEqual(turns.first?.index, 20 - UsageCenter.ChatUsage.ledgerLimit + 1)
+    }
+
+    func testCostDeltaOnlyWhenTheCostActuallyRose() {
+        let center = UsageCenter()
+        center.record(chatID: "a", title: "A", agentID: "codex", usage: 10, max: 100, costAmount: 0.50, costCurrency: "USD")
+        _ = center.recordTurn(chatID: "a")
+        XCTAssertEqual(center.byChat["a"]?.recentTurns.last?.costDelta ?? 0, 0.50, accuracy: 0.001)
+
+        center.record(chatID: "a", title: "A", agentID: "codex", usage: 20, max: 100, costAmount: 0.50, costCurrency: "USD")
+        _ = center.recordTurn(chatID: "a")
+        XCTAssertNil(center.byChat["a"]?.recentTurns.last?.costDelta, "an unchanged cost is not a delta")
+    }
+}

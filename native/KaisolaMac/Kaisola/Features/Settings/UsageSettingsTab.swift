@@ -416,7 +416,28 @@ private struct ChatUsageRow: View {
                     .font(.caption.monospacedDigit())
                     .foregroundStyle(.secondary)
             }
+            if !chat.recentTurns.isEmpty {
+                // The per-turn ledger, newest first: which turns spent the
+                // context. A negative delta is compaction, shown as such.
+                Text("turns: " + chat.recentTurns.suffix(5).reversed()
+                    .map { Self.turnLabel($0) }
+                    .joined(separator: " · "))
+                    .font(.caption2.monospacedDigit())
+                    .foregroundStyle(.tertiary)
+                    .lineLimit(1)
+                    .help("Context change per completed turn, newest first. Negative is compaction. This session only.")
+                    .accessibilityLabel("Recent turns, newest first")
+            }
         }
         .padding(.vertical, 2)
+    }
+
+    static func turnLabel(_ turn: UsageCenter.ChatUsage.TurnDelta) -> String {
+        let sign = turn.usedDelta < 0 ? "−" : "+"
+        var label = "\(sign)\(UsageSettingsTab.tokens(abs(turn.usedDelta)))"
+        if let cost = turn.costDelta {
+            label += String(format: " $%.2f", cost)
+        }
+        return label
     }
 }

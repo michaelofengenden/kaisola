@@ -23,8 +23,28 @@ Scope:
 - Observe, agent-control, and terminal-control lease expiry and authentication.
 - VoiceOver, Full Keyboard Access, clean-account, and signed update continuity.
 
+Most of this is reachable on the **Simulator**, which shares the Mac's network
+stack and therefore sees the `_kaisola._tcp` advertisement. `npm run
+companion:sim` builds, installs and launches it; the Companion now runs there
+and reaches its sign-in screen cleanly.
+
+Two blockers were in the way and are fixed:
+
+- The project declared no `SUPPORTED_PLATFORMS`, so Xcode derived device-only
+  support from `SDKROOT` and the scheme offered *zero* eligible destinations.
+  This is why the whole matrix read as needing hardware.
+- Building with `CODE_SIGNING_ALLOWED=NO` yields an app with no entitlements,
+  which fails at launch with "a required entitlement isn't present". A signed
+  simulator build carries `application-identifier` and works. Not a product
+  bug; the harness signs.
+
 Acceptance:
 
+- Pairing, resume, revoke, account isolation, capability grants and lease
+  expiry — reachable on the Simulator, gated only on signing in to the account
+  and enabling the Companion host on the Mac.
+- Nearby-to-Link switching and Face ID genuinely need a device: a simulator
+  never leaves the LAN, and Face ID there is synthetic.
 - A real-device matrix passes across LAN and Link routes.
 - Revocation and account changes invalidate old access immediately.
 - GUI replacement preserves authorized sessions without widening capabilities.

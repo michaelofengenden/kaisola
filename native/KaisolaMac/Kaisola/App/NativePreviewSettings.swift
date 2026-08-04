@@ -1561,12 +1561,14 @@ enum DesktopWallpaperLocator {
         supportDirectory: URL? = nil
     ) -> DesktopWallpaperResolution {
         let support = supportDirectory ?? defaultSupportDirectory
-        let captured = DesktopCaptureSource.captureURL
+        // `captured:` stays nil while desktop capture is disabled — see the
+        // note in `DesktopBackdropProvider.resolve(isDark:)`. A stale file from
+        // an earlier build must never be picked up.
         return resolve(
             desktopImageURL: desktopImageURL,
             readableStill: { CGImageSourceCreateWithURL($0 as CFURL, nil) != nil },
             aerialStill: { currentAerialStill(supportDirectory: support) },
-            captured: FileManager.default.fileExists(atPath: captured.path) ? captured : nil
+            captured: nil
         )
     }
 
@@ -3763,17 +3765,23 @@ final class DesktopBackdropProvider: ObservableObject {
             // Observe the desktop before deducing it. The capture writes a file
             // the ladder below prefers, so a shuffled or dynamic desktop bakes
             // the picture actually on screen rather than a guessed stand-in.
-            if let displayID {
-                // Asked once, and only when a wallpaper-backed surface is
-                // actually being drawn — never at launch, and never for someone
-                // whose glass source is Live or Eco.
-                if !DesktopCaptureSource.isAuthorized {
-                    _ = DesktopCaptureSource.requestAuthorization()
-                }
-                if DesktopCaptureSource.isAuthorized {
-                    _ = await DesktopCaptureSource.captureDesktop(displayID: displayID)
-                }
-            }
+            // Desktop capture is OFF.
+            //
+            // It shipped twice and grabbed the wrong content both times: first
+            // other applications' windows (`excludingWindows` can only exclude
+            // what it was handed), then — after switching to naming the Dock's
+            // `Wallpaper-<UUID>` window directly — a frame containing Kaisola's
+            // own Settings popover on white. The identification is evidently
+            // still wrong, and the failure mode of getting it wrong is putting
+            // other people's screens inside this app's chrome.
+            //
+            // That is not a bug to iterate on in place. `DesktopCaptureSource`
+            // is left intact and unreferenced so the work is not lost, and the
+            // resolution ladder below runs exactly as it did before capture
+            // existed. Re-enabling it needs a test that asserts what the
+            // captured frame actually contains, which is the check that was
+            // missing both times.
+            _ = displayID
             let key = await Task.detached(priority: .utility) {
                 Self.key(
                     desktopImageURL: desktopImageURL,

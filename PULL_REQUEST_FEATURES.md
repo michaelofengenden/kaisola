@@ -96,7 +96,13 @@ Acceptance remaining:
   size and stalling on a real file, requires malformed JSON to be rejected in
   under a second, and holds delimiter detection to a sample rather than a full
   scan.
-- Bounded PDFs and image-heavy Markdown still need equivalent budgets.
+- ~~Image-heavy Markdown.~~ Done: a 1,500-figure document parses inside the
+  same budget, and image sizing — called per image per layout pass — is held to
+  200,000 calls in under a second, which is what keeps it arithmetic rather
+  than something that touches the file.
+- Bounded PDFs still need an equivalent budget. PDFKit does its own paging and
+  decoding, so a meaningful gate has to measure the *surface*, not a parser,
+  and that needs the installed app.
 - Confirm those surfaces retain native momentum on the **installed optimized
   app**. The in-process budgets above are what can be measured without one;
   momentum under gesture needs the signed build and a physical trackpad, which

@@ -112,4 +112,51 @@ final class PreviewPreparationBudgetTests: XCTestCase {
             "delimiter detection took \(duration)s — it should sample, not scan"
         )
     }
+
+    // MARK: - Markdown
+
+    /// An image-heavy Markdown document is the remaining surface PR 11 names.
+    /// Parsing must stay bounded by the *document*, not by what its images
+    /// would cost to decode — the decode is the renderer's job and is bounded
+    /// separately.
+    func testImageHeavyMarkdownParsesWithinBudget() {
+        var lines: [String] = []
+        for index in 0..<1_500 {
+            lines.append("## Section \(index)")
+            lines.append("")
+            lines.append("![figure \(index)](assets/figure-\(index).png)")
+            lines.append("")
+            lines.append("Body text for section \(index), long enough to be a real paragraph "
+                + "rather than a token, so the parser walks inline content as it would on a "
+                + "genuine document.")
+            lines.append("")
+        }
+        let source = lines.joined(separator: "\n")
+        XCTAssertGreaterThan(source.utf8.count, 200_000)
+
+        var document: MarkdownDocument?
+        let duration = elapsed { document = MarkdownDocument.parse(source) }
+        XCTAssertNotNil(document)
+        XCTAssertLessThan(
+            duration, 3.0,
+            "image-heavy Markdown took \(duration)s to parse"
+        )
+    }
+
+    /// Sizing an image is called per image per layout pass, so it has to be
+    /// arithmetic rather than anything that touches the file.
+    func testImageSizingIsPureArithmetic() {
+        let duration = elapsed {
+            for index in 0..<200_000 {
+                _ = MarkdownPreviewLayout.imageSize(
+                    intrinsicSize: CGSize(width: 1_600, height: 900),
+                    declaredWidth: index.isMultiple(of: 2) ? 800 : nil,
+                    declaredHeight: Double?.none,
+                    availableWidth: 720,
+                    zoom: 1
+                )
+            }
+        }
+        XCTAssertLessThan(duration, 1.0, "200k sizings took \(duration)s")
+    }
 }

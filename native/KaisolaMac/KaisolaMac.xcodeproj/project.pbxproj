@@ -195,6 +195,7 @@
 		B9E42D4C5DC974E0AAFA2D99 /* ToastCenter.swift in Sources */ = {isa = PBXBuildFile; fileRef = 81A1444F9C5905630D1DC018 /* ToastCenter.swift */; };
 		BA06D02D0D784812DFE9BD1C /* NotificationBridgeTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 37780782E5170FFD4996C1D8 /* NotificationBridgeTests.swift */; };
 		BA2BA718F195BAADA3415BA8 /* NativeUpdateController.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5245B06FDE5E37D212A59E72 /* NativeUpdateController.swift */; };
+		BA6D43828E4685E984297FCF /* GlassClarityTradeTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = E3D72AABAD7E8FBF9B665E43 /* GlassClarityTradeTests.swift */; };
 		BCEE7C4B2655BD5F02B14ABA /* AcpModels.swift in Sources */ = {isa = PBXBuildFile; fileRef = F979524745D6648E34835DF3 /* AcpModels.swift */; };
 		BDE65F12928C19D4C1D19381 /* MarkdownPreview.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9286E9EFA45E3FEE67AEB1E3 /* MarkdownPreview.swift */; };
 		BDE6C88324D3D561ADA7AF38 /* VerifiedUsageHelperCache.swift in Sources */ = {isa = PBXBuildFile; fileRef = 83FF23C3F0FE8B751EF9300A /* VerifiedUsageHelperCache.swift */; };
@@ -521,6 +522,7 @@
 		E26113F09678188A74E298A6 /* Kaisola.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = Kaisola.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		E2C62AECA29EC2AB89B8C85A /* QuietRollup.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = QuietRollup.swift; sourceTree = "<group>"; };
 		E321EB733F62BC0E2D6CF1AF /* UsageCenterTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = UsageCenterTests.swift; sourceTree = "<group>"; };
+		E3D72AABAD7E8FBF9B665E43 /* GlassClarityTradeTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GlassClarityTradeTests.swift; sourceTree = "<group>"; };
 		E438E95AD251C6069A846859 /* CompanionTerminalControlTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CompanionTerminalControlTests.swift; sourceTree = "<group>"; };
 		E49280DD117D97BF6CBB23B5 /* GitRefreshPolicy.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GitRefreshPolicy.swift; sourceTree = "<group>"; };
 		E66C339455BFF598A81C41DE /* NativeTerminalSurface.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NativeTerminalSurface.swift; sourceTree = "<group>"; };
@@ -895,6 +897,7 @@
 				007B60933A677DAD3CB98F9D /* GitPanelModelTests.swift */,
 				143732221EC63F82B5874931 /* GitPRTests.swift */,
 				73C156565BA4025A74960AD9 /* GitServiceTests.swift */,
+				E3D72AABAD7E8FBF9B665E43 /* GlassClarityTradeTests.swift */,
 				EDCF271FCBDC7AAEACD59129 /* KaisolaProductMigrationTests.swift */,
 				BBC39D51D190999C81FEFA9D /* LocalhostDetectorTests.swift */,
 				B645C36AE63ACE3FAEDDCE0C /* McpConfigStoreTests.swift */,
@@ -1396,6 +1399,7 @@
 				94F2C07F9D519F8C1428062E /* GitPRTests.swift in Sources */,
 				C6B77BD965183EA73469C7A1 /* GitPanelModelTests.swift in Sources */,
 				D1DF7C334CB6E3B1B0D12BBF /* GitServiceTests.swift in Sources */,
+				BA6D43828E4685E984297FCF /* GlassClarityTradeTests.swift in Sources */,
 				F60ACD0B816BBDC03277BD4A /* KaisolaProductMigrationTests.swift in Sources */,
 				1780D63195E079FEFBD762C0 /* LocalhostDetectorTests.swift in Sources */,
 				238020DBF76BFC455A16486B /* McpConfigStoreTests.swift in Sources */,

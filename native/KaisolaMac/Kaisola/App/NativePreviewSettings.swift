@@ -109,11 +109,18 @@ enum GlassTexture: String, CaseIterable, Identifiable, Sendable {
     }
 
     /// Blur radius in screen points.
+    /// Blur radius in screen points.
+    ///
+    /// Crisp was 18, which over a 210pt sidebar is still a dozen soft masses —
+    /// blurred enough that no wallpaper reads as itself. 10 keeps individual
+    /// features legible as *shapes* while staying well past the point where
+    /// text or an icon behind the window could be read through it, which is the
+    /// requirement that actually matters.
     var blurPoints: Double {
         switch self {
         case .soft: 44
         case .balanced: 28
-        case .crisp: 18
+        case .crisp: 10
         }
     }
 }
@@ -187,12 +194,48 @@ enum GlassClarity: String, CaseIterable, Identifiable, Sendable {
 
     /// Multiplier on every veil coverage. Above 1 is always safe — more veil is
     /// more contrast — so only the step below 1 is bounded by measurement.
+    ///
+    /// **Clear is a deliberate trade, and the only setting that makes one.**
+    ///
+    /// It was 0.89 — an 11% thinner veil, which is not a visible difference and
+    /// certainly not "clear". It sat there because the same 7:1 / 3.43:1 text
+    /// floors were enforced at every clarity, and in light appearance those
+    /// floors are what a veil *is*: the worst patch is the darkest 2% of the
+    /// surface, thinning the veil darkens it, and dark text on a dark patch
+    /// fails no matter how opaque the ink. A transparent light surface over an
+    /// arbitrary wallpaper cannot also guarantee 3.43:1 secondary text. That is
+    /// physics, not a constant that was tuned badly.
+    ///
+    /// So Clear now buys what it says on the tin and pays for it honestly: much
+    /// more wallpaper, and text contrast that meets a lower stated floor rather
+    /// than the default one. Michael asked for this twice — "full crisp and
+    /// full clarity to be extremely clear and transparent of the background" —
+    /// and it is his setting to choose. Frosted and Balanced are unchanged and
+    /// still meet the full floors, and Balanced is still the default.
+    ///
+    /// `resolved(for:)` is what keeps that from reaching anyone who has told
+    /// the system they need contrast.
     var veilScale: Double {
         switch self {
         case .frosted: 1.16
         case .balanced: 1.0
-        case .clear: 0.89
+        case .clear: 0.55
         }
+    }
+
+    /// Whether this clarity trades text contrast for transparency.
+    var relaxesTextContrast: Bool { self == .clear }
+
+    /// The clarity actually used, given the accessibility settings.
+    ///
+    /// Increase Contrast and Reduce Transparency are explicit statements that
+    /// legibility outranks appearance, so Clear is not honoured for anyone who
+    /// has set them — it falls back to Balanced, which meets the full floors.
+    /// A preference the user typed into Settings must never override one they
+    /// typed into System Settings.
+    func resolved(increasedContrast: Bool, reduceTransparency: Bool) -> GlassClarity {
+        guard self == .clear, increasedContrast || reduceTransparency else { return self }
+        return .balanced
     }
 }
 
@@ -4420,7 +4463,10 @@ struct SidebarBackdropView: View {
                 ZStack {
                     DesktopGlassLayer(liveMaterial: .sidebar, liveTint: Self.liveTint)
                     GlassBackdropWash
-                        .sidebar(isDark: colorScheme == .dark, clarity: settings.glassClarity)
+                        .sidebar(isDark: colorScheme == .dark, clarity: settings.glassClarity.resolved(
+                            increasedContrast: accessibilityContrast == .increased,
+                            reduceTransparency: reduceTransparency
+                        ))
                         .veil
                     if accessibilityContrast == .increased {
                         Color(nsColor: .controlBackgroundColor)
@@ -4468,7 +4514,10 @@ struct WorkspaceBackdropView: View {
                 ZStack {
                     DesktopGlassLayer(liveMaterial: .underWindowBackground)
                     GlassBackdropWash
-                        .workspace(isDark: colorScheme == .dark, clarity: settings.glassClarity)
+                        .workspace(isDark: colorScheme == .dark, clarity: settings.glassClarity.resolved(
+                            increasedContrast: accessibilityContrast == .increased,
+                            reduceTransparency: reduceTransparency
+                        ))
                         .veil
                     if accessibilityContrast == .increased {
                         Color(nsColor: .windowBackgroundColor)

@@ -2435,11 +2435,23 @@ final class NativePreviewSettingsTests: XCTestCase {
                                 \(name)/\(texture.rawValue)/\(colour.rawValue)/\
                                 \(clarity.rawValue)/\(label)/\(isDark ? "dark" : "light")
                                 """
+                                // Clear buys transparency with contrast, and
+                                // states what it is willing to spend. Frosted
+                                // and Balanced still meet the full floors, so a
+                                // regression there cannot hide behind this.
+                                //
+                                // These are not "whatever it happens to do"
+                                // numbers: they are a floor Clear must still
+                                // clear, and thinning its veil further will
+                                // fail here rather than degrade silently.
+                                let relaxed = clarity.relaxesTextContrast
                                 XCTAssertGreaterThanOrEqual(
-                                    worst.primary, 7, "\(place): primary \(worst.primary):1"
+                                    worst.primary, relaxed ? 3.4 : 7,
+                                    "\(place): primary \(worst.primary):1"
                                 )
                                 XCTAssertGreaterThanOrEqual(
-                                    worst.secondary, isDark ? 4.5 : 3.43,
+                                    worst.secondary,
+                                    relaxed ? 1.7 : (isDark ? 4.5 : 3.43),
                                     "\(place): secondary \(worst.secondary):1"
                                 )
                                 if isDark {
@@ -2524,11 +2536,15 @@ final class NativePreviewSettingsTests: XCTestCase {
         // surface off neutral, which is the invariant three rounds have paid
         // for. Held on the scaler itself so no future knob can break it.
         //
-        // And every setting has to stay inside the transmission band rounds 3
-        // and 4 declared and priced the whole veil stack against. That band —
-        // not the contrast floors — is what bounds `clear`: rendered, the
-        // floors barely move across the range, because the tail cap already
-        // bounds the still the veil is letting through.
+        // Frosted and Balanced stay inside the transmission band rounds 3 and 4
+        // declared and priced the whole veil stack against.
+        //
+        // Clear is deliberately outside it. That band's upper bound exists to
+        // stop the surface becoming "a blurred photograph with a haze on it",
+        // and for Clear that is the requested outcome rather than the failure
+        // mode — it is the setting whose whole purpose is to show the desktop.
+        // It still has a ceiling, one step above the band's, so thinning the
+        // veil further fails here instead of drifting to fully transparent.
         for clarity in GlassClarity.allCases {
             for isDark in [true, false] {
                 let band = GlassBackdropWash.desktopTransmissionBand(isDark: isDark)
@@ -2544,7 +2560,8 @@ final class NativePreviewSettingsTests: XCTestCase {
                         "\(clarity.rawValue) \(surface) transmits \(transmission)"
                     )
                     XCTAssertLessThanOrEqual(
-                        transmission, band.ceiling,
+                        transmission,
+                        clarity.relaxesTextContrast ? band.ceiling + 0.18 : band.ceiling,
                         "\(clarity.rawValue) \(surface) transmits \(transmission)"
                     )
                 }

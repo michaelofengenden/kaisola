@@ -1,4 +1,9 @@
-# PR 6 — Extensions and customization: spec (v1, 2026-08-03)
+# PR 6 — Extensions and customization: spec (v2, 2026-08-04)
+
+> v2 incorporates the Codex adversarial review (REVISE verdict, four
+> findings). The data slices (themes, grammars, preview mappings) shipped as
+> v1 described; the **custom-agents-to-chat slice is redesigned below** and
+> was not shipped under v1's weaker model.
 
 Tracker acceptance (PULL_REQUEST_FEATURES.md):
 
@@ -34,9 +39,14 @@ closed and enforced at the integration seam, not by the extension:
   `NSRegularExpression` only.
 - **process** (custom agents' ACP adapters, MCP stdio servers): may spawn a
   named command. Requires explicit user enablement per entry (imports and new
-  entries start disabled), shows the exact command line it will run, and the
-  spawn inherits the session's account/config isolation (CLAUDE_CONFIG_DIR /
-  CODEX_HOME overlay) — never ambient secrets.
+  entries start disabled) and shows the exact command it will run. **The
+  promise is stated honestly** (review finding 1): enabling a process
+  extension grants publisher-controlled code the user's ordinary filesystem
+  and network access and the parent environment — the CLAUDE_CONFIG_DIR /
+  CODEX_HOME overlay redirects provider *configuration*, it is not isolation.
+  The enable sheet says exactly that. Tightening it further (sandbox +
+  allowlisted environment) is real work scheduled with the adapter-install
+  manager below, not a checkbox.
 - **network** (MCP http/sse): https-only, credential-free URLs (existing
   `McpServerConfig.validationError` rules).
 
@@ -63,16 +73,27 @@ acceptance, applied uniformly.
      strings; validation: parseable hex, 16 ANSI slots, distinct id.
    - Settings menu iterates registry; invalid entries listed disabled with
      reason.
-2. **Custom agents reach chat** (`acpAdapter` on the roster)
-   - Fold `builtIns` and `custom` into one data shape carrying optional
-     `acpPackage: String?` (npm package spec) — the two shipped adapters move
-     into the built-in entries' data.
-   - `AcpAdapter.forAgent` becomes a roster lookup.
-   - `CustomAgentSpec.acpPackage` validation: npm package-name shape, version
-     tag allowed, no path/URL forms (registry packages only), length caps.
-   - A custom agent with `acpPackage` set starts **disabled for chat** until
-     the user enables it in settings, where the exact `npx <package>` line is
-     shown (process capability, D1).
+2. **Custom agents reach chat** — redesigned per the adversarial review;
+   ships only when all four parts exist:
+   - **Immutable built-in ids** (finding 4): `claude-code`, `codex`,
+     `opencode`, `gemini` are durable schema keys flowing through persisted
+     sessions, restoration descriptors, drafts, and account bindings. They
+     are never migrated into `custom-agents.json`; shipped definitions stay
+     packaged and the roster is a merged *view*. Built-in ids are reserved
+     against custom specs; a new `enabledForChat` flag decodes missing as
+     `false` for every legacy entry.
+   - **Credential context is declared data** (finding 3): each roster entry
+     names `credentials: claude | codex | none`. Known providers get exactly
+     their selected `SessionAccountBinding`; `none` opens a chat with no
+     resumable provider identity. Never inferred from an id or package name.
+   - **Approval must be durable** (finding 2): `npx <pkg>@latest` is mutable
+     code, so enablement *resolves*: an app-owned install (scripts disabled)
+     pins the full dependency graph with integrity data, and the chat spawns
+     the resolved executable directly — the displayed command is the executed
+     command. Any version or integrity drift disables chat for that agent
+     pending renewed approval.
+   - **The honest grant** (finding 1): the enable sheet states that the
+     adapter runs with the user's ordinary access. No overlay language.
 3. **Language grammars** (`GrammarRegistry`)
    - `LanguageGrammar { id, extensions: [String], rules: [Rule] }` — shipped
      grammars become data; `CustomGrammarStore` (cap 16) holds user grammars

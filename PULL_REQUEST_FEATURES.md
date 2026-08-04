@@ -51,25 +51,45 @@ Acceptance:
 
 ## PR 6 — Extensions and customization
 
-Status: open.
+Status: data registries shipped; the process slice is specced and gated.
 
-Add safe registries for language grammars, previews, MCP packages, custom
-agents, and editor themes after the command/editor boundaries are stable.
+Spec: `notes/pr6-extensions-spec.md` (v2, revised after an adversarial Codex
+review). Shipped 2026-08-04:
 
-Acceptance:
+- **Terminal themes** are a registry: shipped pair plus validated custom
+  themes (JSON import, hex palettes, 16 ANSI slots), invalid entries listed
+  disabled with the exact failing field named, removal one click, stored
+  choice migrated for free.
+- **Language grammars** are a registry: custom grammars (extensions + fence
+  tokens + regex rules over the five fixed roles) run through the same
+  never-crash scanner as shipped languages behind an mtime-checked cache;
+  shipped extensions cannot be taken over.
+- **Preview mappings** are a registry: unknown extensions can route to the
+  preview's *text* kinds only — image/PDF/docx loaders are deliberately
+  unreachable, and every built-in classification (binary sniff, size caps)
+  runs first.
+- MCP packages were already the reference registry; unchanged.
 
-- Extensions declare capabilities and cannot silently gain filesystem or secret
-  access.
-- Invalid packages degrade to a disabled state with an actionable explanation.
-- Installation and removal are reversible and workspace/account scoped.
+Remaining (gated by the review's four findings, all encoded in the spec):
+custom agents reaching the chat surface requires the durable-approval
+install manager (resolve-on-enable, pinned dependency graph, integrity
+drift → disable), declared credential contexts on the roster, immutable
+built-in ids with a merged roster view, and the honestly-worded grant
+sheet. A consolidated Extensions settings tab (grammar/mapping rosters
+have stores but no UI yet) rides with that work.
 
 ## PR 7 — Project and session ergonomics
 
-Status: open.
+Status: task ledger shipped; detach/adopt specced.
 
-Add project detach/adopt, ad-hoc cross-project session groups, richer task
-ledger views, and workflow automation only after the daily editor and Companion
-paths are dependable.
+Spec: `notes/pr7-ergonomics-spec.md`. Shipped 2026-08-04: the needs-you
+inbox is the all-agents center — grouped by project (resolved live, never
+persisted), filterable by kind, gone targets dimmed to clear-only.
+
+Remaining: terminal detach/adopt via the adoption overlay (the broker keeps
+the real projectID; persistence writes the adopter's id to survive the
+workspace-state guard), then the cross-project-groups design gate. Workflow
+automation stays deferred.
 
 ## PR 8 — Pixel-smooth terminal viewport parity
 

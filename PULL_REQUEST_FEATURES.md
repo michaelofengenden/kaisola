@@ -10,9 +10,30 @@ sessions, and use the fast local lane during implementation. Full distribution,
 visual, resource, and interaction gates belong at milestones rather than every
 edit.
 
+## Completion snapshot — 2026-08-04
+
+The 2026-08-03–04 backlog iteration completed roughly **40–45% of the remaining
+tracker scope** on a simple, unweighted section-by-section estimate. This is a
+progress indicator, not an engineering-effort estimate. None of the six retained
+PR sections is fully closable yet: five were advanced, four gained substantive
+feature or acceptance completion, and PR 8 was untouched.
+
+| PR | Completion in the iteration | Remaining state |
+| --- | --- | --- |
+| PR 5 | Simulator/build blockers removed | Final real-device and production acceptance remains open |
+| PR 6 | Core registry and custom-agent process slices shipped | Consolidated settings UI remains; stronger process sandboxing is optional future work |
+| PR 7 | 2 of 4 major slices shipped | Cross-project groups need a design decision; workflow automation is deferred |
+| PR 8 | No new completion | Pixel-smooth viewport implementation and physical-trackpad acceptance remain open |
+| PR 11 | 2 of 4 explicit acceptance gates completed | Bounded-PDF and installed-app momentum gates remain |
+| PR 12 | 2 of 3 explicit acceptance gates completed | Installed-app sustained-history acceptance remains |
+
+The independently runnable evidence for PRs 6, 7, 11, and 12 currently passes
+60 of 60 focused tests. That does not close device-only, signed-installed-app,
+physical-trackpad, accessibility, or sustained-interaction gates.
+
 ## PR 5 — Native Companion production hardening
 
-Status: open.
+Status: Simulator enablement shipped; final production acceptance remains open.
 
 Close the remaining cutover evidence for the Swift desktop Companion host.
 
@@ -51,7 +72,8 @@ Acceptance:
 
 ## PR 6 — Extensions and customization
 
-Status: data registries shipped; the process slice is specced and gated.
+Status: core data registries and the custom-agent process slice shipped;
+settings consolidation remains.
 
 Spec: `notes/pr6-extensions-spec.md` (v2, revised after an adversarial Codex
 review). Shipped 2026-08-04:
@@ -85,8 +107,8 @@ adapter process if the stronger promise is ever wanted.
 
 ## PR 7 — Project and session ergonomics
 
-Status: task ledger and detach/adopt shipped; groups gated on a design
-decision.
+Status: 2 of 4 major slices shipped; groups are gated on a design decision and
+workflow automation is deferred.
 
 Spec: `notes/pr7-ergonomics-spec.md`. Shipped 2026-08-04:
 
@@ -104,7 +126,7 @@ group store — Michael's call), and workflow automation stays deferred.
 
 ## PR 8 — Pixel-smooth terminal viewport parity
 
-Status: open.
+Status: open; no completion in the 2026-08-03–04 backlog iteration.
 
 The v1.0.0 build 1002002 fix removes repaint snap-back, preserves native
 momentum routing, and adds an always-visible AppKit scrollbar. The remaining
@@ -132,7 +154,7 @@ Acceptance:
 
 ## PR 11 — Native preview installed-build performance gates
 
-Status: implementation shipped; installed-build acceptance remains open.
+Status: implementation shipped; 2 of 4 explicit acceptance gates are complete.
 
 TextKit 2 read mode, off-main structured-data preparation, PDFKit, bounded
 Markdown images, truthful external-edit handling, safe navigation, and explicit
@@ -161,7 +183,7 @@ Acceptance remaining:
 
 ## PR 12 — Terminal sustained-history acceptance
 
-Status: implementation shipped; sustained-history acceptance remains open.
+Status: implementation shipped; 2 of 3 explicit acceptance gates are complete.
 
 Incremental transcript sanitizing, cached search, tail-first paging, AppKit
 focus, keyboard pane cycling, OSC 52 consent, terminal commands, focused

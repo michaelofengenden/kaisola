@@ -80,16 +80,22 @@ have stores but no UI yet) rides with that work.
 
 ## PR 7 — Project and session ergonomics
 
-Status: task ledger shipped; detach/adopt specced.
+Status: task ledger and detach/adopt shipped; groups gated on a design
+decision.
 
-Spec: `notes/pr7-ergonomics-spec.md`. Shipped 2026-08-04: the needs-you
-inbox is the all-agents center — grouped by project (resolved live, never
-persisted), filterable by kind, gone targets dimmed to clear-only.
+Spec: `notes/pr7-ergonomics-spec.md`. Shipped 2026-08-04:
 
-Remaining: terminal detach/adopt via the adoption overlay (the broker keeps
-the real projectID; persistence writes the adopter's id to survive the
-workspace-state guard), then the cross-project-groups design gate. Workflow
-automation stays deferred.
+- The needs-you inbox is the all-agents center — grouped by project
+  (resolved live, never persisted), filterable by kind, gone targets dimmed
+  to clear-only — with per-event notification delivery rules beside it.
+- Terminal **Move to Project** via the adoption overlay: presentation
+  regroups, the broker keeps addressing the real project, the adopter's
+  workspace snapshot enrolls the pane under its own id (proven against the
+  persistence normalizer), provenance is named in the row tooltip, and
+  Return is deleting one row.
+
+Remaining: the cross-project-groups design gate (ephemeral vs first-class
+group store — Michael's call), and workflow automation stays deferred.
 
 ## PR 8 — Pixel-smooth terminal viewport parity
 

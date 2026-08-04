@@ -93,6 +93,70 @@ final class NotificationBridge: NSObject, UNUserNotificationCenterDelegate {
 
     private enum Keys {
         static let enabled = "nativeNotificationsEnabled"
+        static func rule(_ group: RuleGroup) -> String {
+            "nativeNotificationRule.\(group.rawValue)"
+        }
+    }
+
+    /// When a needs-you event may become a system notification. The historical
+    /// behavior — post only while the app is in the background — is the
+    /// default for every group, so nothing changes until a user asks it to.
+    enum Rule: String, CaseIterable, Identifiable {
+        case never
+        case whenBackgrounded
+        case always
+
+        var id: String { rawValue }
+        var title: String {
+            switch self {
+            case .never: "Never"
+            case .whenBackgrounded: "When in background"
+            case .always: "Always"
+            }
+        }
+    }
+
+    /// The three user-facing event groups, matching the inbox's filter chips.
+    enum RuleGroup: String, CaseIterable, Identifiable {
+        case permission
+        case done
+        case bell
+
+        var id: String { rawValue }
+        var title: String {
+            switch self {
+            case .permission: "Permission asks"
+            case .done: "Finished turns"
+            case .bell: "Terminal bells"
+            }
+        }
+
+        init(_ kind: AttentionCenter.Kind) {
+            switch kind {
+            case .permission: self = .permission
+            case .turnCompleted, .sessionResponded: self = .done
+            case .bell: self = .bell
+            }
+        }
+    }
+
+    func rule(for group: RuleGroup) -> Rule {
+        defaults.string(forKey: Keys.rule(group)).flatMap(Rule.init) ?? .whenBackgrounded
+    }
+
+    func setRule(_ rule: Rule, for group: RuleGroup) {
+        defaults.set(rule.rawValue, forKey: Keys.rule(group))
+    }
+
+    /// The gate, pure: `never` is silence, `always` ignores focus, and
+    /// `whenBackgrounded` requires a definite "not active" — a nil app state
+    /// stays ineligible, exactly the old contract.
+    static func shouldPost(rule: Rule, appIsActive: Bool?) -> Bool {
+        switch rule {
+        case .never: false
+        case .always: true
+        case .whenBackgrounded: appIsActive == false
+        }
     }
 
     init(defaults: UserDefaults = .standard) {
@@ -191,7 +255,10 @@ final class NotificationBridge: NSObject, UNUserNotificationCenterDelegate {
     /// banner. Never throws — a delivery failure is logged and dropped.
     func post(kind: AttentionCenter.Kind, title: String, detail: String, targetID: String) {
         guard enabled else { return }
-        guard appIsActiveProvider() == false else { return }
+        guard Self.shouldPost(
+            rule: rule(for: RuleGroup(kind)),
+            appIsActive: appIsActiveProvider()
+        ) else { return }
 
         let request = PostRequest(
             identifier: targetID,

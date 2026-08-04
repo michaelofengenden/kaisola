@@ -264,3 +264,76 @@ final class NotificationBridgeTests: XCTestCase {
         XCTAssertNil(defaults.data(forKey: key))
     }
 }
+
+/// Per-event delivery rules: each needs-you group carries its own
+/// Never / when-backgrounded / Always, defaulting to the historical
+/// background-only behavior.
+@MainActor
+final class NotificationRuleTests: XCTestCase {
+    private func makeDefaults() -> UserDefaults {
+        let name = "notification-rules-\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: name)!
+        defaults.removePersistentDomain(forName: name)
+        return defaults
+    }
+
+    func testTheGateIsPureAndExact() {
+        XCTAssertFalse(NotificationBridge.shouldPost(rule: .never, appIsActive: false))
+        XCTAssertFalse(NotificationBridge.shouldPost(rule: .never, appIsActive: true))
+        XCTAssertTrue(NotificationBridge.shouldPost(rule: .always, appIsActive: true))
+        XCTAssertTrue(NotificationBridge.shouldPost(rule: .always, appIsActive: nil))
+        XCTAssertTrue(NotificationBridge.shouldPost(rule: .whenBackgrounded, appIsActive: false))
+        XCTAssertFalse(NotificationBridge.shouldPost(rule: .whenBackgrounded, appIsActive: true))
+        XCTAssertFalse(
+            NotificationBridge.shouldPost(rule: .whenBackgrounded, appIsActive: nil),
+            "an unknowable app state stays ineligible — the historical contract"
+        )
+    }
+
+    func testRulesDefaultToBackgroundOnlyAndPersistPerGroup() {
+        let bridge = NotificationBridge(defaults: makeDefaults())
+        for group in NotificationBridge.RuleGroup.allCases {
+            XCTAssertEqual(bridge.rule(for: group), .whenBackgrounded)
+        }
+        bridge.setRule(.always, for: .permission)
+        bridge.setRule(.never, for: .done)
+        XCTAssertEqual(bridge.rule(for: .permission), .always)
+        XCTAssertEqual(bridge.rule(for: .done), .never)
+        XCTAssertEqual(bridge.rule(for: .bell), .whenBackgrounded, "untouched groups keep the default")
+    }
+
+    /// Every attention kind belongs to a group, so no event can slip past the
+    /// rules unclassified.
+    func testEveryKindHasAGroup() {
+        for kind in AttentionCenter.Kind.allCases {
+            _ = NotificationBridge.RuleGroup(kind)
+        }
+    }
+
+    func testPostHonorsThePerGroupRule() {
+        let bridge = NotificationBridge(defaults: makeDefaults())
+        bridge.enabled = true
+        var posted: [NotificationBridge.PostRequest] = []
+        bridge.postHook = { posted.append($0) }
+
+        // App active: the default background-only rule stays silent…
+        bridge.appIsActiveProvider = { true }
+        bridge.post(kind: .permission, title: "t", detail: "d", targetID: "x")
+        XCTAssertTrue(posted.isEmpty)
+
+        // …but Always speaks through focus.
+        bridge.setRule(.always, for: .permission)
+        bridge.post(kind: .permission, title: "t", detail: "d", targetID: "x")
+        XCTAssertEqual(posted.count, 1)
+
+        // Never silences even a backgrounded app.
+        bridge.setRule(.never, for: .done)
+        bridge.appIsActiveProvider = { false }
+        bridge.post(kind: .turnCompleted, title: "t", detail: "d", targetID: "y")
+        XCTAssertEqual(posted.count, 1)
+
+        // And an unconfigured group still behaves as it always has.
+        bridge.post(kind: .bell, title: "t", detail: "d", targetID: "z")
+        XCTAssertEqual(posted.count, 2)
+    }
+}

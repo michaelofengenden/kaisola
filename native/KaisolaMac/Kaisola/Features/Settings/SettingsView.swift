@@ -24,6 +24,9 @@ struct SettingsView: View {
     @ObservedObject private var updates = UpdateCenter.shared
     @State private var restartRequest: RestartRequest?
     @State private var notificationsEnabled = true
+    /// Bumped when a per-event notification rule changes, so the menu labels
+    /// re-read the bridge (which owns the persisted rules).
+    @State private var notificationRuleRevision = 0
     @State private var notificationAuthorization = NotificationAuthorizationState.unknown
 
     /// Identifiable wrapper so the confirmation presents via `.alert(item:)`.
@@ -362,6 +365,34 @@ struct SettingsView: View {
                                 Button("Open Settings", action: openNotificationSettings)
                                     .buttonStyle(.borderless)
                                     .font(.caption)
+                            }
+                        }
+                    }
+                    if notificationsEnabled {
+                        SettingsDivider()
+                        // Per-event delivery: each needs-you group carries its
+                        // own Never / background-only / Always rule, so a user
+                        // can hear about permission asks everywhere while
+                        // finished turns stay quiet — the ChatGPT-app pattern.
+                        ForEach(NotificationBridge.RuleGroup.allCases) { group in
+                            SettingsRow(
+                                title: group.title,
+                                detail: "System notification for this event",
+                                symbol: "bell"
+                            ) {
+                                Menu {
+                                    ForEach(NotificationBridge.Rule.allCases) { rule in
+                                        Button(rule.title) {
+                                            NotificationBridge.shared.setRule(rule, for: group)
+                                            notificationRuleRevision += 1
+                                        }
+                                    }
+                                } label: {
+                                    SettingsChoiceLabel(NotificationBridge.shared.rule(for: group).title)
+                                }
+                                .menuIndicator(.hidden)
+                                .accessibilityLabel("\(group.title) notifications")
+                                .id(notificationRuleRevision)
                             }
                         }
                     }

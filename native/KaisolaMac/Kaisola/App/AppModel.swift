@@ -3652,6 +3652,21 @@ final class AppModel: ObservableObject {
         let root = workspace.standardizedFileURL
         let project = sessionStore.openProject(directory: root.path)
         sessionStore.setProjectColor(id: project.id, colorHex: "7C5CFC")
+        // The one fixture with *nothing mounted*: a project, a connected
+        // shell, and an empty canvas — the state the idle glass backdrop and
+        // the empty-state card exist for (see `WorkspaceBackdropView.idle`).
+        // Every other surface seeds sessions, so without this the idle canvas
+        // is unreachable under the deterministic harness.
+        if ProcessInfo.processInfo.environment["KAISOLA_NATIVE_VISUAL_SURFACE"] == "empty-workspace" {
+            refreshPersistedNavigationState(publish: false)
+            controlAvailable = true
+            connectionState = .connected(
+                version: "visual fixture", pid: 4_200, serverEnforcedObserver: true
+            )
+            selectedProjectID = project.id
+            selectedProjectName = project.name
+            return
+        }
         let secondaryURL = root.appendingPathComponent("native/KaisolaMac", isDirectory: true)
         if FileManager.default.fileExists(atPath: secondaryURL.path) {
             let secondary = sessionStore.openProject(directory: secondaryURL.path)

@@ -288,8 +288,18 @@ struct RootShellView: View {
         }
         .preferredColorScheme(settings.appearance.colorScheme)
         .background {
-            WorkspaceBackdropView(mode: settings.workspaceBackdrop)
-                .ignoresSafeArea()
+            WorkspaceBackdropView(
+                mode: settings.workspaceBackdrop,
+                idle: NativeWorkspaceChrome.canvasIsIdle(
+                    layoutIsEmpty: model.paneLayout(for: activeProjectID).isEmpty,
+                    hasRecovery: model.missingSessionRecovery != nil,
+                    browserMounted: model.browserCardURL != nil,
+                    previewMounted: model.previewedFileURL != nil,
+                    filesRailVisible: settings.workspaceRailVisible
+                        && model.currentProjectDirectory != nil
+                )
+            )
+            .ignoresSafeArea()
         }
         .sheet(item: Binding(get: { renameTarget.map(RenameID.init) }, set: { renameTarget = $0?.id })) { target in
             RenameSheet(text: $renameText) { newTitle in
@@ -1607,8 +1617,26 @@ struct RootShellView: View {
     /// The fresh/offline empty state: instead of a dead end, offer the first
     /// actions (start a shell, open a chat, open a folder) right where the user
     /// is looking.
+    ///
+    /// The card carries its own material because the canvas underneath it does
+    /// not guarantee legibility any more: an empty canvas is exactly when the
+    /// glass drops to the clear still (see `WorkspaceBackdropView.idle`), so
+    /// this text is the one thing that must bring its own surface.
     @ViewBuilder
     private var emptyWorkspaceState: some View {
+        emptyWorkspaceContent
+            .frame(maxWidth: 520)
+            .fixedSize(horizontal: false, vertical: true)
+            .padding(.vertical, 8)
+            .background(
+                .regularMaterial,
+                in: RoundedRectangle(cornerRadius: 22, style: .continuous)
+            )
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+
+    @ViewBuilder
+    private var emptyWorkspaceContent: some View {
         let chatAgent = AgentRegistry.all.first { AcpAdapter.forAgent($0.id) != nil }
         ContentUnavailableView {
             Label("Nothing running yet", systemImage: "sparkles")
@@ -3717,6 +3745,26 @@ enum NativeWorkspaceChrome {
         case .leftTree: return KaisolaVisualSystem.chromeInset
         case .topBar: return detailToggleStripHeight
         }
+    }
+
+    /// Whether the canvas is holding *nothing* — the state in which the glass
+    /// backdrop is allowed to drop its legibility wash and be genuinely
+    /// transparent to the wallpaper (see `WorkspaceBackdropView.idle`).
+    ///
+    /// Every mounted surface disqualifies it, because every one of them puts
+    /// text over the backdrop that the wash's contrast floors are solved for:
+    /// session panes, the document preview, the browser card, and the Files
+    /// rail all count, and so does the missing-session recovery state, which is
+    /// itself text on the canvas. The empty-state card does not — it carries
+    /// its own material.
+    nonisolated static func canvasIsIdle(
+        layoutIsEmpty: Bool,
+        hasRecovery: Bool,
+        browserMounted: Bool,
+        previewMounted: Bool,
+        filesRailVisible: Bool
+    ) -> Bool {
+        layoutIsEmpty && !hasRecovery && !browserMounted && !previewMounted && !filesRailVisible
     }
 }
 

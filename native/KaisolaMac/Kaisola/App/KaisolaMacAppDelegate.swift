@@ -794,7 +794,10 @@ final class KaisolaMacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDele
             settings.appearance = visualAppearance == "dark" ? .dark : .light
             settings.sidebarAppearance = .glass
             settings.workspaceBackdrop = .glass
+            // `empty-workspace` is the *idle* canvas — nothing mounted is its
+            // whole definition, and a visible Files rail is a mounted surface.
             settings.workspaceRailVisible = visualSurface != "topbar" && visualSurface != "terminal-solo"
+                && visualSurface != "empty-workspace"
             settings.workspaceRailWidth = 196
             // Pin both ordinary and failure-boundary document widths. The
             // fixture settings object is non-persistent, so these values can

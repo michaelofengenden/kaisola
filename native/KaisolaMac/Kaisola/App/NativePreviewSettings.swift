@@ -1267,6 +1267,24 @@ struct GlassBackdropWash: Equatable, Sendable {
             : light(top: 0.46, base: 0.40, bottom: 0.36)
     }
 
+    /// How much of the workspace veil an **idle** canvas keeps.
+    ///
+    /// Every number above is solved against text that has to survive on the
+    /// surface. An idle canvas has none — nothing mounted, nothing to read but
+    /// the empty-state card, which carries its own material — so the veil's
+    /// only remaining job is to seat the picture faintly into the app's
+    /// appearance rather than to guard anything. 0.30 of the veil over the
+    /// *clear* still (see `DesktopBackdropRenderer.renderBake`) leaves the
+    /// canvas at ≥ 0.85 transmission in balanced clarity and ~0.97 in Clear,
+    /// which is the "translucent to the wallpaper" Michael asked for. The
+    /// moment anything mounts, the crossfade brings the full wash back and all
+    /// of the guarantees with it.
+    static let idleVeilFactor = 0.30
+
+    static func workspaceIdle(isDark: Bool, clarity: GlassClarity = .balanced) -> GlassBackdropWash {
+        workspaceBase(isDark: isDark).scaled(by: clarity.veilScale * idleVeilFactor)
+    }
+
     /// The band a glass veil's transmission has to live in, per appearance.
     ///
     /// The contract is unchanged and still two-sided: too little transmission
@@ -1904,6 +1922,17 @@ extension DesktopPainting: Equatable {
     }
 }
 
+/// Both products of one bake pass: the legibility still every washed surface
+/// draws, and the clear still an idle canvas shows instead. They travel
+/// together because they are made together — same decode, same working space,
+/// same cache entry — so neither can go stale against the other.
+struct DesktopBake: @unchecked Sendable {
+    let painting: DesktopPainting
+    /// `nil` whenever the painting is `.flat` — clear glass over no picture is
+    /// the same flat, so there is nothing separate to show.
+    let clearStill: CGImage?
+}
+
 // MARK: - Where the wallpaper actually is
 
 /// The arithmetic that makes the glass *glass* rather than a picture of the
@@ -2527,6 +2556,10 @@ enum DesktopBackdropRenderer {
     }
 
     static func render(key: DesktopBackdropKey) -> DesktopPainting? {
+        renderBake(key: key)?.painting
+    }
+
+    static func renderBake(key: DesktopBackdropKey) -> DesktopBake? {
         guard let source = CGImageSourceCreateWithURL(key.url as CFURL, nil) else { return nil }
         let index = frameIndex(imageCount: CGImageSourceGetCount(source), isDark: key.isDark)
         let options: [CFString: Any] = [
@@ -2551,7 +2584,7 @@ enum DesktopBackdropRenderer {
             screenPoints: key.screenPoints,
             texture: key.texture,
             colour: key.colour
-        ) else { return .flat(tint) }
+        ) else { return DesktopBake(painting: .flat(tint), clearStill: nil) }
         // The wallpaper's own pixel size, not the thumbnail's — the layout the
         // glass is pinned to depends on it for the centred and tiled desktops.
         let properties = CGImageSourceCopyPropertiesAtIndex(source, index, nil) as? [CFString: Any]
@@ -2561,7 +2594,49 @@ enum DesktopBackdropRenderer {
             height: (properties?[kCGImagePropertyPixelHeight] as? Int).map(CGFloat.init)
                 ?? CGFloat(blurred.height)
         )
-        return .wallpaper(blurred, tint: tint, wallpaperPixels: pixels)
+        return DesktopBake(
+            painting: .wallpaper(blurred, tint: tint, wallpaperPixels: pixels),
+            clearStill: clearBlur(still, screenPoints: key.screenPoints, texture: key.texture)
+        )
+    }
+
+    /// The wallpaper through *clear* glass: the same still, blurred at the
+    /// texture's own scattering length — and nothing else.
+    ///
+    /// The legibility bake exists so labels can sit on the surface, and every
+    /// stage of it trades fidelity for that: the tone map normalizes the
+    /// still's brightness onto a target, the tail cap compresses its range, and
+    /// the saturation ceiling damps its chroma. An **idle** canvas carries no
+    /// labels, so it does not owe those guarantees — and paying for them anyway
+    /// is exactly why "translucent to the wallpaper" was impossible before:
+    /// however thin the veil got, what it revealed was a managed picture, not
+    /// the desktop. Michael: "when nothing is on the canvas [it] should be
+    /// transluscent to the wallpaper".
+    ///
+    /// No local-contrast add-back either: unsharp exists to restore what the
+    /// legibility pipeline's compression takes away, and nothing here
+    /// compressed. The blur still runs clamped-then-cropped so the corners do
+    /// not vignette, and in the same working space as the main bake so the two
+    /// stills a crossfade passes through are colour-managed identically.
+    private static func clearBlur(
+        _ image: CGImage,
+        screenPoints: Double,
+        texture: GlassTexture
+    ) -> CGImage? {
+        let radius = blurRadius(
+            screenPoints: screenPoints,
+            stillPixels: image.width,
+            blurPoints: texture.blurPoints
+        )
+        let input = CIImage(cgImage: image)
+        var options: [CIContextOption: Any] = [.useSoftwareRenderer: false]
+        if let bakeColorSpace { options[.workingColorSpace] = bakeColorSpace }
+        let context = CIContext(options: options)
+        let gaussian = CIFilter.gaussianBlur()
+        gaussian.inputImage = input.clampedToExtent()
+        gaussian.radius = Float(radius)
+        guard let softened = gaussian.outputImage else { return nil }
+        return context.createCGImage(softened, from: input.extent)
     }
 
     /// The colour space the bake's arithmetic is done in, and the fix for
@@ -3469,6 +3544,10 @@ final class DesktopBackdropProvider: ObservableObject {
     static let shared = DesktopBackdropProvider()
 
     @Published private(set) var painting: DesktopPainting = .flat(DesktopTintSampler.fallback)
+    /// The clear half of the same bake — see `DesktopBake.clearStill`. Published
+    /// in the same resolve that publishes `painting`, so the idle canvas can
+    /// never crossfade between two different desktops.
+    @Published private(set) var clearStill: CGImage?
 
     /// The floor between two disk reads. Every hint — notification, watch tick,
     /// or activation — is funnelled through it.
@@ -3499,7 +3578,7 @@ final class DesktopBackdropProvider: ObservableObject {
     /// How often a tick is allowed to be `deep` — see `DesktopProbeDepth`.
     static let desktopDeepProbeInterval: TimeInterval = 30
 
-    private var cache: [DesktopBackdropKey: DesktopPainting] = [:]
+    private var cache: [DesktopBackdropKey: DesktopBake] = [:]
     private var cacheOrder: [DesktopBackdropKey] = []
     private var work: Task<Void, Never>?
     private var deferredResolve: Task<Void, Never>?
@@ -3877,25 +3956,29 @@ final class DesktopBackdropProvider: ObservableObject {
             self.wallpaperSignature = nil
             guard let key else {
                 painting = .flat(DesktopTintSampler.fallback)
+                clearStill = nil
                 return
             }
             if let cached = cache[key] {
-                painting = cached
+                painting = cached.painting
+                clearStill = cached.clearStill
                 return
             }
             let rendered = await Task.detached(priority: .utility) {
-                DesktopBackdropRenderer.render(key: key)
+                DesktopBackdropRenderer.renderBake(key: key)
             }.value
             guard generation == self.generation else { return }
-            let resolved = rendered ?? .flat(DesktopTintSampler.fallback)
+            let resolved = rendered
+                ?? DesktopBake(painting: .flat(DesktopTintSampler.fallback), clearStill: nil)
             self.store(resolved, for: key)
-            self.painting = resolved
+            self.painting = resolved.painting
+            self.clearStill = resolved.clearStill
         }
     }
 
-    private func store(_ painting: DesktopPainting, for key: DesktopBackdropKey) {
+    private func store(_ bake: DesktopBake, for key: DesktopBackdropKey) {
         if cache[key] == nil { cacheOrder.append(key) }
-        cache[key] = painting
+        cache[key] = bake
         while cacheOrder.count > Self.cacheLimit {
             cache.removeValue(forKey: cacheOrder.removeFirst())
         }
@@ -4493,12 +4576,52 @@ struct WorkspaceBackdropView: View {
     @ObservedObject private var desktop = DesktopBackdropProvider.shared
     @ObservedObject private var settings = NativePreviewSettings.shared
     let mode: WorkspaceBackdropMode
+    /// True while the canvas holds nothing — see
+    /// `NativeWorkspaceChrome.canvasIsIdle`. An idle glass canvas drops to the
+    /// clear still and a whisper of veil; mounting anything crossfades the
+    /// legibility wash back in.
+    var idle: Bool = false
+
+    init(mode: WorkspaceBackdropMode, idle: Bool = false) {
+        self.mode = mode
+        self.idle = idle
+    }
+
+    /// Whether the idle canvas may drop its wash, stated once so it is
+    /// testable. Accessibility outranks idleness: Reduce Transparency and
+    /// Increased Contrast users asked for *less* desktop, and an empty canvas
+    /// does not change what they asked for. The painted source additionally
+    /// needs its clear still baked — until it is, the washed branch mounts,
+    /// its `DesktopGlassLayer` triggers the resolve, and the idle branch takes
+    /// over when the bake lands. The live source has no still to wait for; its
+    /// idleness is just the thinner veil over the same material.
+    nonisolated static func idleGlassEngages(
+        idle: Bool,
+        reduceTransparency: Bool,
+        increasedContrast: Bool,
+        paintedSource: Bool,
+        clearStillAvailable: Bool
+    ) -> Bool {
+        guard idle, !reduceTransparency, !increasedContrast else { return false }
+        return paintedSource ? clearStillAvailable : true
+    }
 
     var body: some View {
         backdrop
             .onAppear { if mode == .tinted { desktop.refresh(isDark: colorScheme == .dark) } }
             .onChange(of: colorScheme) {
                 if mode == .tinted { desktop.refresh(isDark: colorScheme == .dark) }
+            }
+            // While idle glass is showing, `DesktopGlassLayer` — which owns
+            // these hooks on the washed branch — is unmounted, so a texture or
+            // colour change made from Settings over an empty canvas would
+            // otherwise keep painting the stale bake until the next desktop
+            // signal.
+            .onChange(of: settings.glassTexture) {
+                if mode == .glass { desktop.refresh(isDark: colorScheme == .dark) }
+            }
+            .onChange(of: settings.glassColour) {
+                if mode == .glass { desktop.refresh(isDark: colorScheme == .dark) }
             }
     }
 
@@ -4517,19 +4640,52 @@ struct WorkspaceBackdropView: View {
             if reduceTransparency {
                 Color(nsColor: .windowBackgroundColor)
             } else {
+                let clarity = settings.glassClarity.resolved(
+                    increasedContrast: accessibilityContrast == .increased,
+                    reduceTransparency: reduceTransparency
+                )
+                let paintedSource = settings.glassBackdropSource == .wallpaper
+                let idleActive = Self.idleGlassEngages(
+                    idle: idle,
+                    reduceTransparency: reduceTransparency,
+                    increasedContrast: accessibilityContrast == .increased,
+                    paintedSource: paintedSource,
+                    clearStillAvailable: desktop.clearStill != nil
+                )
                 ZStack {
-                    DesktopGlassLayer(liveMaterial: .underWindowBackground)
-                    GlassBackdropWash
-                        .workspace(isDark: colorScheme == .dark, clarity: settings.glassClarity.resolved(
-                            increasedContrast: accessibilityContrast == .increased,
-                            reduceTransparency: reduceTransparency
-                        ))
-                        .veil
-                    if accessibilityContrast == .increased {
-                        Color(nsColor: .windowBackgroundColor)
-                            .opacity(GlassBackdropWash.workspaceIncreasedContrastOverlay(isDark: colorScheme == .dark))
+                    if idleActive,
+                       paintedSource,
+                       let clear = desktop.clearStill,
+                       case let .wallpaper(_, _, pixels) = desktop.painting {
+                        // The clear still, pinned exactly as the washed one is,
+                        // under the idle whisper of veil. No `GlassWarmth`:
+                        // warmth is the declared compensation for the bake's
+                        // chroma damping, and this still was never damped.
+                        DesktopWallpaperPatch(still: clear, wallpaperPixels: pixels)
+                            .allowsHitTesting(false)
+                        GlassBackdropWash
+                            .workspaceIdle(isDark: colorScheme == .dark, clarity: clarity)
+                            .veil
+                    } else {
+                        DesktopGlassLayer(liveMaterial: .underWindowBackground)
+                        if idleActive {
+                            // Live source: the material is the transmission, so
+                            // idleness is only the thinner veil.
+                            GlassBackdropWash
+                                .workspaceIdle(isDark: colorScheme == .dark, clarity: clarity)
+                                .veil
+                        } else {
+                            GlassBackdropWash
+                                .workspace(isDark: colorScheme == .dark, clarity: clarity)
+                                .veil
+                        }
+                        if accessibilityContrast == .increased {
+                            Color(nsColor: .windowBackgroundColor)
+                                .opacity(GlassBackdropWash.workspaceIncreasedContrastOverlay(isDark: colorScheme == .dark))
+                        }
                     }
                 }
+                .animation(.easeInOut(duration: 0.35), value: idleActive)
             }
         case .tinted:
             // The desktop's *hue*, laid into the solid canvas — see

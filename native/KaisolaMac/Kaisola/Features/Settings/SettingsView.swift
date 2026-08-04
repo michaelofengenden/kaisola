@@ -275,6 +275,26 @@ struct SettingsView: View {
                     }
                     SettingsDivider()
                     SettingsRow(
+                        title: "Glass wallpaper",
+                        detail: settings.glassWallpaper.isEmpty
+                            ? "Follows the desktop"
+                            : (settings.glassWallpaper as NSString).lastPathComponent,
+                        symbol: "photo"
+                    ) {
+                        HStack(spacing: 8) {
+                            if !settings.glassWallpaper.isEmpty {
+                                Button("Clear") { settings.glassWallpaper = "" }
+                                    .controlSize(.small)
+                            }
+                            Button(settings.glassWallpaper.isEmpty ? "Choose…" : "Change…") {
+                                chooseGlassWallpaper()
+                            }
+                            .controlSize(.small)
+                        }
+                        .help("Pin a picture for the glass. A rotating desktop keeps rotating; the glass stops chasing it.")
+                    }
+                    SettingsDivider()
+                    SettingsRow(
                         title: "Glass clarity",
                         detail: "How much of the desktop comes through",
                         symbol: "drop.halffull"
@@ -426,6 +446,26 @@ struct SettingsView: View {
             }
             .padding(18)
         }
+    }
+
+    /// Pin a picture for the glass.
+    ///
+    /// macOS will not name the wallpaper of a rotating desktop — a shuffle
+    /// records only its own name, and a dynamic desktop like Tahoe Day returns
+    /// the same stand-in a shuffle does. Choosing a file answers the question
+    /// the system refuses to, without a permission or a guess.
+    private func chooseGlassWallpaper() {
+        let panel = NSOpenPanel()
+        panel.allowsMultipleSelection = false
+        panel.canChooseDirectories = false
+        panel.allowedContentTypes = [.image]
+        panel.message = "Choose the picture the glass should use."
+        panel.prompt = "Use for Glass"
+        // Where macOS keeps its own, so the desktop you are actually looking at
+        // is a couple of clicks away rather than a path to remember.
+        panel.directoryURL = URL(fileURLWithPath: "/System/Library/Desktop Pictures")
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        settings.glassWallpaper = url.path
     }
 
     private var terminal: some View {

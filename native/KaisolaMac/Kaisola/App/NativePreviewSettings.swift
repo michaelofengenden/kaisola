@@ -462,6 +462,22 @@ final class NativePreviewSettings: ObservableObject {
         didSet { persist(glassColour.rawValue, forKey: Keys.glassColour) }
     }
 
+    /// A picture pinned for the glass, independent of the desktop.
+    ///
+    /// macOS will not say which wallpaper a *rotating* desktop is showing —
+    /// a shuffle records only `shuffle-all-aerials` and a cadence, and a
+    /// dynamic desktop like Tahoe Day hands back the same stand-in path a
+    /// shuffle does. Every automatic route therefore either guesses or needs
+    /// the screen-recording permission.
+    ///
+    /// Naming a file sidesteps the question rather than answering it, which is
+    /// what Michael asked for: "I want it to be able to pin a wallpaper even
+    /// with a rotation." The desktop keeps rotating; the glass stops chasing
+    /// it. Empty means automatic, exactly as before.
+    @Published var glassWallpaper: String {
+        didSet { persist(glassWallpaper, forKey: Keys.glassWallpaper) }
+    }
+
     @Published var glassClarity: GlassClarity {
         didSet { persist(glassClarity.rawValue, forKey: Keys.glassClarity) }
     }
@@ -739,6 +755,7 @@ final class NativePreviewSettings: ObservableObject {
         static let glassBackdropSource = "glassBackdropSource"
         static let glassTexture = "glassTexture"
         static let glassColour = "glassColour"
+        static let glassWallpaper = "glassWallpaper"
         static let glassClarity = "glassClarity"
         static let terminalFontSize = "terminalFontSize"
         static let terminalFontFamily = "terminalFontFamily"
@@ -773,6 +790,7 @@ final class NativePreviewSettings: ObservableObject {
         workspaceBackdrop = defaults.string(forKey: Keys.workspaceBackdrop).flatMap(WorkspaceBackdropMode.init) ?? .glass
         glassBackdropSource = defaults.string(forKey: Keys.glassBackdropSource)
             .flatMap(GlassBackdropSource.init) ?? .wallpaper
+        glassWallpaper = defaults.string(forKey: Keys.glassWallpaper) ?? ""
         glassTexture = defaults.string(forKey: Keys.glassTexture)
             .flatMap(GlassTexture.init) ?? .balanced
         glassColour = defaults.string(forKey: Keys.glassColour)
@@ -1558,17 +1576,24 @@ enum DesktopWallpaperLocator {
     /// Live wiring for `resolve(desktopImageURL:readableStill:aerialStill:)`.
     static func resolveOnDisk(
         desktopImageURL: URL?,
-        supportDirectory: URL? = nil
+        supportDirectory: URL? = nil,
+        pinnedWallpaperPath: String? = nil
     ) -> DesktopWallpaperResolution {
         let support = supportDirectory ?? defaultSupportDirectory
+        // A picture the user pinned outranks everything: it is a statement of
+        // intent, not an inference, so it is not second-guessed even when the
+        // desktop could have been identified.
+        //
         // `captured:` stays nil while desktop capture is disabled — see the
         // note in `DesktopBackdropProvider.resolve(isDark:)`. A stale file from
         // an earlier build must never be picked up.
+        let pinned = (pinnedWallpaperPath ?? "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
         return resolve(
             desktopImageURL: desktopImageURL,
             readableStill: { CGImageSourceCreateWithURL($0 as CFURL, nil) != nil },
             aerialStill: { currentAerialStill(supportDirectory: support) },
-            captured: nil
+            captured: pinned.isEmpty ? nil : URL(fileURLWithPath: pinned)
         )
     }
 
@@ -3760,6 +3785,8 @@ final class DesktopBackdropProvider: ObservableObject {
         let displayID = screen?.displayID
         let texture = NativePreviewSettings.shared.glassTexture
         let colour = NativePreviewSettings.shared.glassColour
+        // Read on the main actor; the resolve below runs off it.
+        let pinnedWallpaper = NativePreviewSettings.shared.glassWallpaper
         work?.cancel()
         work = Task { [weak self] in
             // Observe the desktop before deducing it. The capture writes a file
@@ -3785,6 +3812,7 @@ final class DesktopBackdropProvider: ObservableObject {
             let key = await Task.detached(priority: .utility) {
                 Self.key(
                     desktopImageURL: desktopImageURL,
+                    pinnedWallpaperPath: pinnedWallpaper,
                     isDark: isDark,
                     screenPoints: screenPoints,
                     texture: texture,
@@ -3847,13 +3875,16 @@ final class DesktopBackdropProvider: ObservableObject {
 
     private nonisolated static func key(
         desktopImageURL: URL?,
+        pinnedWallpaperPath: String?,
         isDark: Bool,
         screenPoints: Double,
         texture: GlassTexture,
         colour: GlassColour
     ) -> DesktopBackdropKey? {
-        guard let url = DesktopWallpaperLocator
-            .resolveOnDisk(desktopImageURL: desktopImageURL).url else { return nil }
+        guard let url = DesktopWallpaperLocator.resolveOnDisk(
+            desktopImageURL: desktopImageURL,
+            pinnedWallpaperPath: pinnedWallpaperPath
+        ).url else { return nil }
         let modified = try? url.resourceValues(forKeys: [.contentModificationDateKey])
             .contentModificationDate
         return DesktopBackdropKey(

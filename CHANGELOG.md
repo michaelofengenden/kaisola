@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.1.100 — 2026-08-03
+
+- Switch a chat's subscription account from inside the chat — even mid-conversation. The transcript, draft, and queued prompts stay; the agent restarts on the account you picked.
+- An empty canvas is now genuinely transparent to the wallpaper. Open a terminal or a document and the frosted glass fades back in; close everything and the desktop shows through.
+- Crisp and Clear go as far as measurement allows: Clear keeps a fifth of its old veil, Crisp sharpens from 18pt of blur to 5.
+- Pin a picture for the glass when the desktop rotates or shuffles, and shuffled aerial desktops paint the right still instead of grey.
+- The wallpaper's texture survives the veil, and its colour is measured where it is strongest rather than averaged away.
+- Usage shows one card per subscription with one meter style, reset times in their own column, and nothing spare.
+- Starting an agent session on a nearly-spent subscription says so and names an account with room.
+- Split panes mark every session they show in the sidebar, not only the focused one.
+- The iPhone Companion runs on the Simulator (`npm run companion:sim`), so pairing work no longer waits on hardware.
+
 ## 0.1.1 — 2026-08-03
 
 Version numbers restart here. Kaisola was at 1.3.3; this release is the same

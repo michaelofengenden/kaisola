@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.1.104 — 2026-08-04
+
+- Custom agents can now reach the chat surface — safely. Declare an npm ACP adapter and whose accounts it uses, then enable it: Kaisola installs the exact package with scripts disabled, pins its whole dependency graph, and runs only that pinned code. If anything about the install changes, chat turns off and says why until you approve again.
+- A gentle heads-up when a project's CLAUDE.md or AGENTS.md hasn't changed in months — models move faster than instruction files, and stale ones quietly mislead. Once per project per launch, only when you open a chat there.
+
 ## 0.1.103 — 2026-08-04
 
 - Summon Kaisola from any app with ⌥⌘K — it comes forward and lands in your last chat's composer. Off by default; turn it on in Settings next to notifications.

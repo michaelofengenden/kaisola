@@ -1,11 +1,14 @@
 # Kaisola for macOS
 
-This directory contains the production Swift/AppKit desktop app, distributed
-as `Kaisola.app` with bundle identifier `com.kaisola.mac`.
+This directory contains the production Swift/AppKit desktop app — the macOS
+half of Kaisola, the open-source IDE GUI for coding agents — distributed as
+`Kaisola.app` with bundle identifier `com.kaisola.mac`.
 
 Kaisola includes project navigation, durable native terminals, terminal-based
-agents, ACP chats, project-scoped Mesh, rendered and editable Markdown, file
-preview/editing, Git and PR flows, settings/accounts/MCP, multi-window layouts,
+agents, ACP chats with in-conversation account and model switching,
+project-scoped Mesh, rendered and editable Markdown, file preview/editing,
+Git and PR flows, settings/accounts/MCP, extension registries (themes,
+grammars, preview mappings, custom agents), multi-window layouts,
 notifications, browser cards, and native Google sign-in. A deliberately small
 Node broker under `runtime/node-broker` remains packaged by the native app while
 its Swift replacement is completed and proven compatible with live sessions.

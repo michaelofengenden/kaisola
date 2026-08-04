@@ -1,8 +1,31 @@
 # Kaisola
 
-Kaisola is a native agent workspace for macOS with an iPhone Companion. The
-product UI, lifecycle, storage, security, and Companion host are implemented in
-Swift and SwiftUI/AppKit.
+Kaisola is an **open-source IDE GUI for coding agents**, built native in
+Swift. It hosts the agent CLIs you already use — Claude Code, Codex, and any
+CLI you register — in durable terminals and rich ACP chat surfaces, organized
+by project, with an iPhone Companion for approving and steering from your
+pocket. The interface is the product; the agent runtimes stay the vendors'
+own.
+
+What that means in practice:
+
+- **Agents, first-class.** Terminal-hosted CLI agents and ACP chats side by
+  side per project; switch the subscription account *or* the model
+  mid-conversation with the transcript intact; a cross-project attention
+  center for everything that needs you, with per-event notification rules.
+- **Many subscriptions, one app.** Sign in to multiple Claude and Codex
+  accounts, see each plan's usage, reset windows, and per-turn cost, and get
+  told before you start a session on a spent account.
+- **An IDE around the agents.** File tree, editable Markdown and file
+  previews, syntax highlighting, Git panels, project-scoped MCP
+  configuration, command palette, multi-window and split layouts, terminals
+  that survive relaunches through a detached broker.
+- **Native all the way down.** SwiftUI/AppKit, a measured glass aesthetic
+  over your desktop wallpaper, Sparkle updates — no Electron, no web-view
+  shell.
+- **Yours to extend.** Validated registries for custom terminal themes,
+  syntax grammars, preview mappings, and custom agents — including
+  chat-capable ACP adapters installed as pinned, integrity-verified code.
 
 This repository intentionally contains only the shipping native product:
 

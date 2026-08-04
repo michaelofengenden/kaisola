@@ -1,6 +1,7 @@
 # Kaisola Companion
 
-This is the native, iPhone-first Kaisola Companion. It signs in with the same
+This is the native, iPhone-first companion to Kaisola — the open-source IDE
+GUI for coding agents. It signs in with the same
 Firebase/Google account as the desktop, pairs to a specific Mac with a signed
 short-lived offer and four-word verification, and mirrors live activity,
 agent transcripts, and terminal streams over one end-to-end encrypted channel.

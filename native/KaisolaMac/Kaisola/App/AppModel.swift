@@ -327,8 +327,10 @@ final class AppModel: ObservableObject {
     var persistedSessionAliases: [String: String] = [:]
     var persistedPinnedIDs: Set<String> = []
     private let adoptionStore: SessionAdoptionStore
-    /// Projects already nudged about a stale instruction file this run.
-    private var staleInstructionNudgesShown: Set<String> = []
+    /// Projects already nudged about a stale instruction file this run —
+    /// process-wide, because "once per run" must hold across windows and
+    /// every window owns its own AppModel.
+    private static var staleInstructionNudgesShown: Set<String> = []
     /// The adoption overlay, mirrored from `SessionAdoptionStore` so display
     /// grouping never reads a file per render. Presentation resolves a
     /// terminal's project through `displayProjectID(_:)`; broker RPCs never
@@ -2955,9 +2957,9 @@ final class AppModel: ObservableObject {
         selectedProjectName = project.name
         // The staleness nudge fires at the one moment instructions start
         // mattering, once per project per run, and stays informational.
-        if !staleInstructionNudgesShown.contains(project.id),
+        if !Self.staleInstructionNudgesShown.contains(project.id),
            let nudge = InstructionFileStaleness.nudge(forProjectAt: directory) {
-            staleInstructionNudgesShown.insert(project.id)
+            Self.staleInstructionNudgesShown.insert(project.id)
             ToastCenter.shared.show(nudge, style: .info, duration: 6)
         }
         let chatID = "chat-\(UUID().uuidString.lowercased().prefix(8))"
@@ -3026,6 +3028,20 @@ final class AppModel: ObservableObject {
     ) -> AcpChatHandle? {
         guard chats.contains(where: { $0.id == chatID }) == false else { return nil }
         explicitlyClosedChatIDs.remove(chatID)
+        // The declared-credentials contract is enforced HERE, not only at
+        // openChat: every path into a chat — new, workspace restore, Recently
+        // Closed, account and model switches — funnels through this method,
+        // so a persisted binding that no longer matches the roster's current
+        // declaration is dropped, and its resumable identity with it
+        // (adversarial review, finding 3). A declared `.none` never carries a
+        // binding at all.
+        let declaredProvider = SessionAccountBinding.declaredProvider(forAgentID: agent.id)
+        let accountBinding: SessionAccountBinding? = {
+            guard let declaredProvider else { return nil }
+            guard let normalized = accountBinding?.normalized,
+                  normalized.provider == declaredProvider else { return nil }
+            return normalized
+        }()
         let projectID = NativeSessionStore.projectID(forDirectory: directory.path)
         let mcp = McpConfigStore(workspace: directory).servers()
         let baseEnvironment = ProcessInfo.processInfo.environment.merging(

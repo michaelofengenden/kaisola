@@ -18,6 +18,12 @@ struct InstalledAdapterRecord: Codable, Equatable, Identifiable {
     /// Relative to the agent's install root.
     let binRelativePath: String
     let lockfileSHA256: String
+    /// A digest over the *installed code itself* — every file under the
+    /// install, path and content (symlinks contribute their destination
+    /// string, never their target's content). The lockfile pins what npm
+    /// resolved; this pins what actually sits on disk, so editing `cli.js`
+    /// or any dependency file after approval reads as drift.
+    let treeSHA256: String
     let installedAt: Date
 
     var id: String { agentID }
@@ -123,25 +129,76 @@ struct AdapterInstallManager: Sendable {
         installsRoot.appendingPathComponent(agentID, isDirectory: true)
     }
 
-    /// Whether an agent's recorded install still is what the user approved.
-    /// Pure over the filesystem: recompute the lockfile hash, require the
-    /// executable to exist. Every mismatch names itself.
-    func verify(agentID: String) -> VerifyResult {
+    /// Whether an agent's recorded install still is what the user approved:
+    /// the lockfile hash (the resolved graph), the tree hash (the code
+    /// actually on disk), and a canonically-contained executable. Every
+    /// mismatch names itself. The residual gap is the instant between this
+    /// check and the spawn — persistent tampering is always caught on the
+    /// next verify, but a write that lands inside that window is not; closing
+    /// it needs descriptor-based spawning, which is deliberately out of scope
+    /// here and noted rather than pretended away.
+    func verify(agentID: String, expectedPackage: String? = nil) -> VerifyResult {
         guard let record = store.record(agentID: agentID) else { return .notInstalled }
+        if let expectedPackage, expectedPackage != record.package {
+            return .drifted(reason: "The approved install is for \(record.package), not \(expectedPackage).")
+        }
         let root = installRoot(agentID: agentID)
         let lockfile = root.appendingPathComponent("package-lock.json")
         guard let lockData = try? Data(contentsOf: lockfile) else {
             return .drifted(reason: "The install's lockfile is missing.")
         }
-        let hash = Self.sha256(lockData)
-        guard hash == record.lockfileSHA256 else {
+        guard Self.sha256(lockData) == record.lockfileSHA256 else {
             return .drifted(reason: "The install's dependency graph changed since it was approved.")
         }
+        guard let tree = Self.treeDigest(root: root), tree == record.treeSHA256 else {
+            return .drifted(reason: "The install's files changed since they were approved.")
+        }
         let bin = root.appendingPathComponent(record.binRelativePath)
+        // Canonical containment: the executable, symlinks resolved, must
+        // still live inside this install — a symlinked escape is drift.
+        let canonicalRoot = root.resolvingSymlinksInPath().standardizedFileURL.path
+        let canonicalBin = bin.resolvingSymlinksInPath().standardizedFileURL.path
+        guard canonicalBin == canonicalRoot || canonicalBin.hasPrefix(canonicalRoot + "/") else {
+            return .drifted(reason: "The adapter executable points outside its install.")
+        }
         guard FileManager.default.isExecutableFile(atPath: bin.path) else {
             return .drifted(reason: "The adapter executable is missing or not executable.")
         }
         return .verified(binURL: bin)
+    }
+
+    /// One digest over every file under `root`, deterministic: sorted
+    /// relative paths, each contributing its path and content (a symlink
+    /// contributes its destination string instead of following it, so a link
+    /// cannot smuggle out-of-tree content into — or hide changes from — the
+    /// approval). Nil when the tree is unreadable.
+    static func treeDigest(root: URL) -> String? {
+        let fileManager = FileManager.default
+        guard let enumerator = fileManager.enumerator(
+            at: root,
+            includingPropertiesForKeys: [.isRegularFileKey, .isSymbolicLinkKey],
+            options: []
+        ) else { return nil }
+        var entries: [(path: String, digest: String)] = []
+        let rootPath = root.standardizedFileURL.path
+        for case let url as URL in enumerator {
+            let values = try? url.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey])
+            let standardized = url.standardizedFileURL.path
+            guard standardized.hasPrefix(rootPath + "/") else { continue }
+            let relative = String(standardized.dropFirst(rootPath.count + 1))
+            if values?.isSymbolicLink == true {
+                guard let destination = try? fileManager.destinationOfSymbolicLink(atPath: url.path) else {
+                    return nil
+                }
+                entries.append((relative, sha256(Data("link:\(destination)".utf8))))
+            } else if values?.isRegularFile == true {
+                guard let data = try? Data(contentsOf: url) else { return nil }
+                entries.append((relative, sha256(data)))
+            }
+        }
+        entries.sort { $0.path < $1.path }
+        let manifest = entries.map { "\($0.path)\u{1F}\($0.digest)" }.joined(separator: "\u{1E}")
+        return sha256(Data(manifest.utf8))
     }
 
     /// Resolve a package into a pinned install and record it. `runner` is the
@@ -183,12 +240,16 @@ struct AdapterInstallManager: Sendable {
         guard let binRelative = Self.binRelativePath(root: root, packageName: bareName) else {
             throw InstallError.unresolvable("\(bareName) declares no executable.")
         }
+        guard let tree = Self.treeDigest(root: root) else {
+            throw InstallError.unresolvable("the installed files could not be read back for pinning.")
+        }
         let record = InstalledAdapterRecord(
             agentID: agentID,
             package: package,
             resolvedVersion: resolved,
             binRelativePath: binRelative,
             lockfileSHA256: Self.sha256(lockData),
+            treeSHA256: tree,
             installedAt: now
         )
         store.upsert(record)

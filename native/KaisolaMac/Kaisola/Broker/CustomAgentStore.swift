@@ -97,8 +97,12 @@ struct CustomAgentStore: Sendable {
 
     /// Replace the stored set. Keeps the first `cap` entries if handed more, so
     /// the file can never grow unbounded even if a caller ignores the ceiling.
+    /// Duplicate ids keep only their first row: an id is a contract key, and
+    /// a second row under it could cross packages and credentials.
     func save(_ specs: [CustomAgentSpec]) {
-        let capped = specs.count > cap ? Array(specs.prefix(cap)) : specs
+        var seen = Set<String>()
+        let unique = specs.filter { seen.insert($0.id).inserted }
+        let capped = unique.count > cap ? Array(unique.prefix(cap)) : unique
         write(Payload(agents: capped))
     }
 
@@ -118,9 +122,13 @@ struct CustomAgentStore: Sendable {
     /// Derive a stable, filesystem-safe id from a display name: lowercased, ASCII
     /// alphanumerics kept, every other run collapsed to a single dash, leading and
     /// trailing dashes trimmed, then "custom-" prefixed. Empty input — or a name
-    /// with no alphanumerics — falls back to "custom-agent". Collision suffixing is
-    /// intentionally not applied, so two identically named agents share an id.
-    static func slugify(_ name: String) -> String {
+    /// with no alphanumerics — falls back to "custom-agent".
+    ///
+    /// Collision suffixing IS applied when `existing` ids are handed in: an id
+    /// is a credential and package contract now (chat enablement binds to it),
+    /// so two agents sharing one silently cross those contracts — the
+    /// adversarial review's finding 2.
+    static func slugify(_ name: String, existing: Set<String> = []) -> String {
         let allowed = Set("abcdefghijklmnopqrstuvwxyz0123456789")
         var slug = ""
         var lastWasDash = false
@@ -134,7 +142,11 @@ struct CustomAgentStore: Sendable {
             }
         }
         while slug.hasSuffix("-") { slug.removeLast() }
-        return slug.isEmpty ? "custom-agent" : "custom-\(slug)"
+        let base = slug.isEmpty ? "custom-agent" : "custom-\(slug)"
+        guard existing.contains(base) else { return base }
+        var suffix = 2
+        while existing.contains("\(base)-\(suffix)") { suffix += 1 }
+        return "\(base)-\(suffix)"
     }
 
     private func read() -> Payload? {

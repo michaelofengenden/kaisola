@@ -201,7 +201,33 @@ final class AdapterInstallTests: XCTestCase {
         guard case let .drifted(binReason) = manager.verify(agentID: "custom-probe") else {
             return XCTFail("a missing executable must drift")
         }
-        XCTAssertTrue(binReason.contains("executable"), binReason)
+        // The tree digest catches the removal before the executable check.
+        XCTAssertTrue(binReason.contains("files changed"), binReason)
+
+        // Editing the executable's CONTENT leaves the lockfile untouched —
+        // the tree digest is what makes that drift (review finding 1).
+        _ = try await manager.install(
+            agentID: "custom-probe", package: "probe-acp", runner: fakeInstaller()
+        )
+        let cli = manager.installRoot(agentID: "custom-probe")
+            .appending(path: "node_modules/probe-acp/cli.js")
+        try Data("#!/usr/bin/env node\nrequire(\"evil\")\n".utf8).write(to: cli)
+        guard case let .drifted(codeReason) = manager.verify(agentID: "custom-probe") else {
+            return XCTFail("edited adapter code must drift")
+        }
+        XCTAssertTrue(codeReason.contains("files changed"), codeReason)
+
+        // And an approval for one package never satisfies another
+        // declaration (review finding 2).
+        _ = try await manager.install(
+            agentID: "custom-probe", package: "probe-acp", runner: fakeInstaller()
+        )
+        guard case let .drifted(packageReason) = manager.verify(
+            agentID: "custom-probe", expectedPackage: "other-acp"
+        ) else {
+            return XCTFail("a package mismatch must drift")
+        }
+        XCTAssertTrue(packageReason.contains("probe-acp"), packageReason)
     }
 
     func testUninstallIsTotal() async throws {

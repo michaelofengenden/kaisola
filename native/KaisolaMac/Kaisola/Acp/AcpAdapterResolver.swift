@@ -20,7 +20,15 @@ struct AcpAdapter: Equatable, Sendable {
         // A dev/test override spawns an arbitrary adapter command (e.g. the mock
         // agent) instead of the published package, so chats can be exercised
         // offline. Format: "<executable>\t<arg>\t<arg>…".
-        if let override = environment["KAISOLA_ACP_ADAPTER_OVERRIDE"], !override.isEmpty {
+        //
+        // Honored ONLY inside a test or fixture process: an inherited
+        // production environment variable must never be able to make every
+        // agent chat-capable and run an arbitrary command (adversarial
+        // review, finding 4).
+        if let override = environment["KAISOLA_ACP_ADAPTER_OVERRIDE"], !override.isEmpty,
+           environment["KAISOLA_NATIVE_VISUAL_FIXTURE"] == "1"
+               || environment["XCTestConfigurationFilePath"] != nil
+               || environment["XCTestBundlePath"] != nil {
             let parts = override.split(separator: "\t").map(String.init)
             if let command = parts.first {
                 return AcpAdapter(command: command, arguments: Array(parts.dropFirst()))
@@ -57,9 +65,15 @@ struct AcpAdapter: Equatable, Sendable {
     ) -> AcpAdapter? {
         guard let spec = store.all().first(where: { $0.id == agentID }),
               spec.chatEnabled == true,
-              spec.acpPackage?.isEmpty == false,
+              let package = spec.acpPackage, !package.isEmpty,
               spec.acpPackageValidationError == nil,
-              case let .verified(binURL) = installs.verify(agentID: agentID) else {
+              // `expectedPackage` binds the install record to *this* spec's
+              // declaration — an approval recorded for a different package
+              // (or a duplicate-id sibling) never satisfies it.
+              case let .verified(binURL) = installs.verify(
+                  agentID: agentID,
+                  expectedPackage: package.trimmingCharacters(in: .whitespacesAndNewlines)
+              ) else {
             return nil
         }
         let quoted = "'" + binURL.path.replacingOccurrences(of: "'", with: "'\\''") + "'"

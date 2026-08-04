@@ -105,7 +105,7 @@ struct CustomAgentsSection: View {
         let command = newCommand.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !name.isEmpty, !command.isEmpty, specs.count < cap else { return }
         specs.append(CustomAgentSpec(
-            id: CustomAgentStore.slugify(name),
+            id: CustomAgentStore.slugify(name, existing: Set(specs.map(\.id))),
             name: name,
             launchCommand: command,
             symbol: symbolChoices.first ?? "terminal"

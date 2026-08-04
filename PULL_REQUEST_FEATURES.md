@@ -90,10 +90,17 @@ the installed optimized app.
 
 Acceptance remaining:
 
-- Keep installed-build performance gates for 1 MiB text, large CSV/JSON data,
-  bounded PDFs, and image-heavy Markdown.
-- Confirm those surfaces retain native momentum without main-thread parse or
-  decode spikes.
+- ~~Preparation budgets for 1 MiB text and large CSV/JSON data.~~ Done:
+  `PreviewPreparationBudgetTests` holds a >1 MiB CSV and a >500 KB JSON to a
+  3 s budget, asserts CSV parsing stays roughly linear rather than passing one
+  size and stalling on a real file, requires malformed JSON to be rejected in
+  under a second, and holds delimiter detection to a sample rather than a full
+  scan.
+- Bounded PDFs and image-heavy Markdown still need equivalent budgets.
+- Confirm those surfaces retain native momentum on the **installed optimized
+  app**. The in-process budgets above are what can be measured without one;
+  momentum under gesture needs the signed build and a physical trackpad, which
+  is the same gate PR 8 is waiting on.
 
 ## PR 12 — Terminal sustained-history acceptance
 

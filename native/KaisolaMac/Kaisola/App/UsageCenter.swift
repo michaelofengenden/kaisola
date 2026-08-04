@@ -85,6 +85,49 @@ struct SessionAccountBinding: Codable, Equatable, Hashable, Sendable {
         }
     }
 
+    /// The provider an agent's chats bind to, consulting the roster's
+    /// *declared* credentials for custom agents — declared data, never
+    /// inferred from an id or a package name (review finding 3). Returns nil
+    /// both for a declared `.none` and for an unknown agent; callers that
+    /// need the distinction check the roster's spec directly.
+    static func declaredProvider(
+        forAgentID agentID: String,
+        store: CustomAgentStore = CustomAgentStore()
+    ) -> UsageAccountProfile.Provider? {
+        if let builtin = provider(forAgentID: agentID) { return builtin }
+        guard let spec = store.all().first(where: { $0.id == agentID }) else { return nil }
+        switch spec.resolvedCredentials {
+        case .claude: return .claude
+        case .codex: return .codex
+        case .none: return nil
+        }
+    }
+
+    /// `resolve(agentID:…)`'s body with the provider already decided, so a
+    /// declared custom provider resolves through the identical rules.
+    static func resolve(
+        provider: UsageAccountProfile.Provider,
+        profile: UsageAccountProfile?,
+        fallbackEnvironment: [String: String]
+    ) -> SessionAccountBinding? {
+        if let profile {
+            guard let profile = profile.normalized, profile.provider == provider else { return nil }
+            return SessionAccountBinding(
+                accountID: profile.id,
+                provider: provider,
+                label: profile.label,
+                configDirectory: profile.expandedDirectory
+            ).normalized
+        }
+        let directory = fallbackEnvironment[provider.environmentKey] ?? provider.defaultDirectory
+        return SessionAccountBinding(
+            accountID: nil,
+            provider: provider,
+            label: "Project/default",
+            configDirectory: directory
+        ).normalized
+    }
+
     /// Resolve either an explicit named profile or the exact effective
     /// app/project default. Returning nil for a provider mismatch is deliberate:
     /// a Claude profile must never be applied to a Codex continuation.

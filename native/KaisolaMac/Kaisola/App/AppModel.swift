@@ -2967,21 +2967,32 @@ final class AppModel: ObservableObject {
         )
         let effectiveAccountEnvironment = ProcessInfo.processInfo.environment
             .merging(projectOverlay) { _, configured in configured }
-        guard let accountBinding = SessionAccountBinding.resolve(
-            agentID: agent.id,
-            profile: accountProfile,
-            fallbackEnvironment: effectiveAccountEnvironment
-        ) else {
-            ToastCenter.shared.show("That account does not match \(agent.name).", style: .error)
-            return
+        // Custom agents bind by their *declared* credentials (review finding
+        // 3): a declared provider resolves through the identical rules the
+        // built-ins use, and a declared `.none` opens the chat with no
+        // account binding and no resumable provider identity.
+        let accountBinding: SessionAccountBinding?
+        if let provider = SessionAccountBinding.declaredProvider(forAgentID: agent.id) {
+            guard let resolved = SessionAccountBinding.resolve(
+                provider: provider,
+                profile: accountProfile,
+                fallbackEnvironment: effectiveAccountEnvironment
+            ) else {
+                ToastCenter.shared.show("That account does not match \(agent.name).", style: .error)
+                return
+            }
+            accountBinding = resolved
+        } else {
+            accountBinding = nil
         }
         // Say it before the first turn fails rather than after. Advisory only:
         // starting on a spent account stays allowed, because the reading can be
         // stale and the call is not Kaisola's to make.
-        if let warning = SessionAccountBinding.headroomWarning(
-            for: accountBinding,
-            readings: UsageCenter.shared.planUsage
-        ) {
+        if let accountBinding,
+           let warning = SessionAccountBinding.headroomWarning(
+               for: accountBinding,
+               readings: UsageCenter.shared.planUsage
+           ) {
             ToastCenter.shared.show(warning, style: .info, duration: 5)
         }
         guard appendChat(

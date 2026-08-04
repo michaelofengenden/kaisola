@@ -70,13 +70,18 @@ review). Shipped 2026-08-04:
   runs first.
 - MCP packages were already the reference registry; unchanged.
 
-Remaining (gated by the review's four findings, all encoded in the spec):
-custom agents reaching the chat surface requires the durable-approval
-install manager (resolve-on-enable, pinned dependency graph, integrity
-drift → disable), declared credential contexts on the roster, immutable
-built-in ids with a merged roster view, and the honestly-worded grant
-sheet. A consolidated Extensions settings tab (grammar/mapping rosters
-have stores but no UI yet) rides with that work.
+The process slice shipped 2026-08-04 against all four review findings:
+custom agents reach chat only through `AdapterInstallManager` — enable
+resolves the npm package into an app-owned install with scripts disabled,
+pins the full dependency graph by lockfile hash, and spawns the resolved
+executable itself (never `npx`); any drift refuses chat by name until
+re-approved. Credential contexts are declared roster data
+(claude/codex/none — `.none` chats open bindingless), built-in ids and
+adapters are untouched, legacy specs decode chat-disabled, and the enable
+sheet states plainly that the adapter runs with the user's ordinary
+access. Remaining niceties: a consolidated Extensions settings tab
+(grammar/mapping rosters still have stores but no UI), and sandboxing the
+adapter process if the stronger promise is ever wanted.
 
 ## PR 7 — Project and session ergonomics
 

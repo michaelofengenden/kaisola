@@ -24,6 +24,11 @@ struct CustomAgentsSection: View {
     @State private var specs: [CustomAgentSpec] = []
     @State private var newName = ""
     @State private var newCommand = ""
+    /// Which row's honest-grant confirmation is open.
+    @State private var pendingEnableIndex: Int?
+    /// The agent whose pinned install is currently running.
+    @State private var installingAgentID: String?
+    private let installs = AdapterInstallManager()
 
     var body: some View {
         Section("Custom Agents") {
@@ -32,26 +37,29 @@ struct CustomAgentsSection: View {
                     .font(.caption).foregroundStyle(.secondary)
             }
             ForEach(Array(specs.enumerated()), id: \.offset) { index, spec in
-                HStack(spacing: 10) {
-                    VStack(alignment: .leading, spacing: 1) {
-                        Text(spec.name).font(.callout)
-                        Text(spec.launchCommand)
-                            .font(.caption.monospaced()).foregroundStyle(.secondary)
-                            .lineLimit(1).truncationMode(.middle)
-                    }
-                    Spacer()
-                    Picker("", selection: symbolBinding(index)) {
-                        ForEach(symbolChoices, id: \.self) { name in
-                            Image(systemName: name).tag(name)
+                VStack(alignment: .leading, spacing: 5) {
+                    HStack(spacing: 10) {
+                        VStack(alignment: .leading, spacing: 1) {
+                            Text(spec.name).font(.callout)
+                            Text(spec.launchCommand)
+                                .font(.caption.monospaced()).foregroundStyle(.secondary)
+                                .lineLimit(1).truncationMode(.middle)
                         }
+                        Spacer()
+                        Picker("", selection: symbolBinding(index)) {
+                            ForEach(symbolChoices, id: \.self) { name in
+                                Image(systemName: name).tag(name)
+                            }
+                        }
+                        .labelsHidden()
+                        .pickerStyle(.menu)
+                        .frame(width: 64)
+                        Button(role: .destructive) { delete(index) } label: {
+                            Image(systemName: "trash")
+                        }
+                        .buttonStyle(.borderless)
                     }
-                    .labelsHidden()
-                    .pickerStyle(.menu)
-                    .frame(width: 64)
-                    Button(role: .destructive) { delete(index) } label: {
-                        Image(systemName: "trash")
-                    }
-                    .buttonStyle(.borderless)
+                    acpControls(index: index, spec: spec)
                 }
             }
             HStack {
@@ -119,5 +127,132 @@ struct CustomAgentsSection: View {
     private func persist() {
         store.save(specs)
         NotificationCenter.default.post(name: .kaisolaAgentsChanged, object: nil)
+    }
+
+    // MARK: - Chat surface (ACP adapter)
+
+    /// The per-agent ACP block: declare a package and a credential context,
+    /// then enable the chat surface through the pinned-install approval flow.
+    /// Every state names itself — invalid package, install failure, drift.
+    @ViewBuilder
+    private func acpControls(index: Int, spec: CustomAgentSpec) -> some View {
+        HStack(spacing: 8) {
+            TextField("ACP adapter (npm package, optional)", text: packageBinding(index))
+                .font(.caption.monospaced())
+                .textFieldStyle(.plain)
+                .disabled(spec.chatEnabled == true)
+            Picker("", selection: credentialsBinding(index)) {
+                ForEach(CustomAgentSpec.Credentials.allCases) { credentials in
+                    Text(credentials.title).tag(credentials.rawValue)
+                }
+            }
+            .labelsHidden()
+            .pickerStyle(.menu)
+            .frame(width: 150)
+            .disabled(spec.chatEnabled == true)
+            if spec.chatEnabled == true {
+                Button("Disable Chat") { disableChat(index) }
+                    .font(.caption)
+            } else if spec.acpPackage?.isEmpty == false, spec.acpPackageValidationError == nil {
+                Button(installingAgentID == spec.id ? "Installing…" : "Enable Chat…") {
+                    pendingEnableIndex = index
+                }
+                .font(.caption)
+                .disabled(installingAgentID != nil)
+            }
+        }
+        if let reason = spec.acpPackageValidationError {
+            Text(reason).font(.caption).foregroundStyle(.orange)
+        } else if spec.chatEnabled == true {
+            switch installs.verify(agentID: spec.id) {
+            case let .verified(binURL):
+                let version = installs.store.record(agentID: spec.id)?.resolvedVersion ?? "?"
+                Text("Chat enabled · \(spec.acpPackage ?? "") v\(version) · runs \(binURL.lastPathComponent)")
+                    .font(.caption).foregroundStyle(.secondary)
+            case let .drifted(reason):
+                Text("Chat disabled: \(reason) Re-enable to approve the current version.")
+                    .font(.caption).foregroundStyle(.orange)
+            case .notInstalled:
+                Text("Chat disabled: the approved install is gone. Re-enable to install again.")
+                    .font(.caption).foregroundStyle(.orange)
+            }
+        }
+        if pendingEnableIndex == index {
+            // The honest grant (review finding 1): enabling runs
+            // publisher-controlled code with this account's ordinary access.
+            VStack(alignment: .leading, spacing: 6) {
+                Text("Enabling installs \(spec.acpPackage ?? "") from the npm registry with install scripts disabled, pins its exact dependency graph, and runs that pinned code as this agent's chat adapter. It runs with your user's ordinary file and network access — Kaisola does not sandbox it. Any change to the pinned install disables chat until you approve again.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                HStack {
+                    Button("Install and Enable") { enableChat(index) }
+                        .font(.caption)
+                    Button("Cancel") { pendingEnableIndex = nil }
+                        .font(.caption)
+                }
+            }
+            .padding(8)
+            .background(.quaternary.opacity(0.4), in: RoundedRectangle(cornerRadius: 8))
+        }
+    }
+
+    private func packageBinding(_ index: Int) -> Binding<String> {
+        Binding(
+            get: { specs.indices.contains(index) ? (specs[index].acpPackage ?? "") : "" },
+            set: { newValue in
+                guard specs.indices.contains(index) else { return }
+                let trimmed = newValue.trimmingCharacters(in: .whitespacesAndNewlines)
+                specs[index].acpPackage = trimmed.isEmpty ? nil : trimmed
+                persist()
+            }
+        )
+    }
+
+    private func credentialsBinding(_ index: Int) -> Binding<String> {
+        Binding(
+            get: {
+                specs.indices.contains(index)
+                    ? specs[index].resolvedCredentials.rawValue
+                    : CustomAgentSpec.Credentials.none.rawValue
+            },
+            set: { newValue in
+                guard specs.indices.contains(index) else { return }
+                specs[index].credentials = newValue
+                persist()
+            }
+        )
+    }
+
+    private func enableChat(_ index: Int) {
+        guard specs.indices.contains(index),
+              let package = specs[index].acpPackage else { return }
+        let agentID = specs[index].id
+        pendingEnableIndex = nil
+        installingAgentID = agentID
+        Task { @MainActor in
+            defer { installingAgentID = nil }
+            do {
+                let record = try await installs.install(agentID: agentID, package: package)
+                if let liveIndex = specs.firstIndex(where: { $0.id == agentID }) {
+                    specs[liveIndex].chatEnabled = true
+                    persist()
+                }
+                ToastCenter.shared.show(
+                    "\(package) v\(record.resolvedVersion) installed and pinned. Chat is enabled.",
+                    style: .success
+                )
+            } catch {
+                ToastCenter.shared.show(error.localizedDescription, style: .error, duration: 6)
+            }
+        }
+    }
+
+    private func disableChat(_ index: Int) {
+        guard specs.indices.contains(index) else { return }
+        let agentID = specs[index].id
+        installs.uninstall(agentID: agentID)
+        specs[index].chatEnabled = false
+        persist()
     }
 }

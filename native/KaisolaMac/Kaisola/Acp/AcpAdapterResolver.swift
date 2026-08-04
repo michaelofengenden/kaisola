@@ -31,11 +31,38 @@ struct AcpAdapter: Equatable, Sendable {
         switch agentID {
         case "claude-code": package = "@agentclientprotocol/claude-agent-acp@latest"
         case "codex": package = "@agentclientprotocol/codex-acp@latest"
-        default: return nil
+        default:
+            // Custom agents reach chat only through an explicitly enabled,
+            // pinned, integrity-verified install — never through `npx` and a
+            // mutable tag. Built-in ids never fall through to here, so the
+            // shipped adapters above are untouched (review finding 4).
+            return forCustomAgent(agentID, shell: shell)
         }
         let resolved = packageOverride ?? package
         // -ilc keeps the interactive login environment; the ACP adapter then
         // owns stdio for JSON-RPC.
         return AcpAdapter(command: shell, arguments: ["-ilc", "exec npx -y \(resolved)"])
+    }
+
+    /// The custom-agent path: the roster says chat is enabled, and the
+    /// recorded install still verifies (review finding 2 — approval is
+    /// durable because what runs is exactly what was approved). The spawned
+    /// command is the resolved executable itself; the login shell is only for
+    /// PATH, so a JS adapter's `node` shebang resolves.
+    static func forCustomAgent(
+        _ agentID: String,
+        shell: String = ProcessInfo.processInfo.environment["SHELL"] ?? "/bin/zsh",
+        store: CustomAgentStore = CustomAgentStore(),
+        installs: AdapterInstallManager = AdapterInstallManager()
+    ) -> AcpAdapter? {
+        guard let spec = store.all().first(where: { $0.id == agentID }),
+              spec.chatEnabled == true,
+              spec.acpPackage?.isEmpty == false,
+              spec.acpPackageValidationError == nil,
+              case let .verified(binURL) = installs.verify(agentID: agentID) else {
+            return nil
+        }
+        let quoted = "'" + binURL.path.replacingOccurrences(of: "'", with: "'\\''") + "'"
+        return AcpAdapter(command: shell, arguments: ["-ilc", "exec \(quoted)"])
     }
 }

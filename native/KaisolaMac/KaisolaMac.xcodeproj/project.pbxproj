@@ -144,6 +144,7 @@
 		85ACCE7516210AF313C10CCC /* PlanUsageSnapshotStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = F07359E5FCD9B5DF4E23DE50 /* PlanUsageSnapshotStore.swift */; };
 		86BA79F25DD512120D54105D /* ProjectAccountStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = FB62A4685780F0E38D2120A0 /* ProjectAccountStore.swift */; };
 		877ECA92F6EF051E2C1A5B6D /* BrokerInfo.swift in Sources */ = {isa = PBXBuildFile; fileRef = 16F343A1F0C6E1A6F95DB932 /* BrokerInfo.swift */; };
+		878E66733A69293F577B0FC7 /* AdapterInstallManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1423BFC7C8A3FCE35B4366C9 /* AdapterInstallManager.swift */; };
 		89543933B6E63A62D1EA271E /* QuickActionStoreTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 172BD0290C1A7F15B30D881B /* QuickActionStoreTests.swift */; };
 		897B77B765BE67C87E3258C5 /* SidebarScrollPinTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = ED0277730A353A218BAC1101 /* SidebarScrollPinTests.swift */; };
 		89C7CC13ADA6A74DA94F405B /* MeshSession.swift in Sources */ = {isa = PBXBuildFile; fileRef = DA63C78CB95AECCF06926DB8 /* MeshSession.swift */; };
@@ -323,6 +324,7 @@
 		1186936559305BAEF5106851 /* AccountHeadroomTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AccountHeadroomTests.swift; sourceTree = "<group>"; };
 		13BFA68C0E2E3E83379B2835 /* TerminalDocument.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TerminalDocument.swift; sourceTree = "<group>"; };
 		13EBC07FC170BBA533902C87 /* CustomAgentStoreTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CustomAgentStoreTests.swift; sourceTree = "<group>"; };
+		1423BFC7C8A3FCE35B4366C9 /* AdapterInstallManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AdapterInstallManager.swift; sourceTree = "<group>"; };
 		142C8737C1900DE903FF5E87 /* CompanionProjectionBuilder.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CompanionProjectionBuilder.swift; sourceTree = "<group>"; };
 		143732221EC63F82B5874931 /* GitPRTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GitPRTests.swift; sourceTree = "<group>"; };
 		14A620CB3BAB100C84E6472B /* OmniBarDispatchTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OmniBarDispatchTests.swift; sourceTree = "<group>"; };
@@ -1059,6 +1061,7 @@
 				A85A5A6E3A5EC404CB81A0BD /* AcpTerminalHost.swift */,
 				40AFF780B226613EC2DA25AA /* AcpTranscriptRendering.swift */,
 				E0BA874BD9613768958ED354 /* AcpTranscriptStore.swift */,
+				1423BFC7C8A3FCE35B4366C9 /* AdapterInstallManager.swift */,
 				FDE152F4457B8AF7E5A92225 /* McpConfigStore.swift */,
 				3D06ED8A6604C6BD4447869A /* PermissionRuleStore.swift */,
 			);
@@ -1248,6 +1251,7 @@
 				04F51C3955F0C4BD44AE3B81 /* AcpTerminalHost.swift in Sources */,
 				9229A2F4720268663EE8AC09 /* AcpTranscriptRendering.swift in Sources */,
 				2D548448B8258638948FF620 /* AcpTranscriptStore.swift in Sources */,
+				878E66733A69293F577B0FC7 /* AdapterInstallManager.swift in Sources */,
 				77A3BE106C196A76FF285F1F /* AgentFileFollow.swift in Sources */,
 				67D6685044396C16062285D8 /* AgentRegistry.swift in Sources */,
 				AA5487512D79B408303CE1FE /* ApiKeyStore.swift in Sources */,

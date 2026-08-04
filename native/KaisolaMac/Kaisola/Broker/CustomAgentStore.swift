@@ -1,14 +1,76 @@
 import Foundation
 
 /// A user-registered terminal agent — any CLI the user wants in the New menu
-/// beyond the built-in roster (Electron Settings ▸ Agents parity). Terminal-only
-/// by construction: it carries no ACP adapter, so it always launches into an
-/// owned terminal rather than the chat surface.
+/// beyond the built-in roster (Electron Settings ▸ Agents parity).
+///
+/// Terminal-only by default. A spec may additionally declare an ACP adapter
+/// package and a credential context, and — after the user explicitly enables
+/// it and the adapter is resolved into a pinned, integrity-checked install
+/// (`AdapterInstallManager`) — reach the chat surface. All three fields are
+/// additive optionals: every legacy roster entry decodes with them absent,
+/// which reads as terminal-only and chat-disabled (the adversarial review's
+/// finding 4 — a missing enablement flag must never decode as enabled).
 struct CustomAgentSpec: Codable, Equatable, Identifiable {
+    /// Whose credentials a chat with this agent uses — declared data, never
+    /// inferred from an id or a package name (review finding 3).
+    enum Credentials: String, Codable, CaseIterable, Identifiable {
+        /// The Claude account bindings (CLAUDE_CONFIG_DIR profiles).
+        case claude
+        /// The Codex account bindings (CODEX_HOME profiles).
+        case codex
+        /// No provider identity: chats open with no account binding and no
+        /// resumable provider continuation.
+        case none
+
+        var id: String { rawValue }
+        var title: String {
+            switch self {
+            case .claude: "Claude accounts"
+            case .codex: "Codex accounts"
+            case .none: "No provider account"
+            }
+        }
+    }
+
     var id: String
     var name: String
     var launchCommand: String
     var symbol: String
+    /// npm registry package (optionally `@version`) for this agent's ACP
+    /// adapter. Registry names only — never a path, git ref, or URL.
+    var acpPackage: String?
+    /// Raw `Credentials` value; absent means `.none`.
+    var credentials: String?
+    /// Whether the user has explicitly enabled the chat surface for this
+    /// agent. Enablement is only honored when a verified install exists.
+    var chatEnabled: Bool?
+
+    var resolvedCredentials: Credentials {
+        credentials.flatMap(Credentials.init) ?? .none
+    }
+
+    /// Why the declared ACP package can never be installed, or nil when the
+    /// declaration is usable (or absent).
+    var acpPackageValidationError: String? {
+        guard let package = acpPackage?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !package.isEmpty else { return nil }
+        return Self.packageNameError(package)
+    }
+
+    /// npm-registry package shape: optional scope, name, optional version tag.
+    /// Anything path-like, URL-like, or shell-hostile is refused by name.
+    static func packageNameError(_ package: String) -> String? {
+        if package.count > 214 { return "The package name exceeds npm's 214-character limit." }
+        if package.contains("://") || package.hasPrefix(".") || package.hasPrefix("/")
+            || package.contains("..") {
+            return "Only npm registry package names are allowed — no paths, URLs, or git references."
+        }
+        let pattern = #"^(@[a-z0-9~][a-z0-9-._~]*\/)?[a-z0-9~][a-z0-9-._~]*(@[A-Za-z0-9-._^~<>=]+)?$"#
+        if package.range(of: pattern, options: .regularExpression) == nil {
+            return "\"\(package)\" is not an npm registry package name."
+        }
+        return nil
+    }
 }
 
 /// Persists the user's custom agents to the native application-support directory

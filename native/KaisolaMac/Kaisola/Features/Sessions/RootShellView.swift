@@ -1940,7 +1940,7 @@ struct RootShellView: View {
                 MeshConfigurationMenu(mesh: mesh)
             }
             if let chat = model.chats.first(where: { $0.id == id }),
-               SessionAccountBinding.provider(forAgentID: chat.agentID) != nil {
+               SessionAccountBinding.declaredProvider(forAgentID: chat.agentID) != nil {
                 chatAccountMenu(chat)
             }
             Button { model.toggleMaximizeSurface(id) } label: {

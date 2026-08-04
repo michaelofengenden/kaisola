@@ -2624,6 +2624,14 @@ enum DesktopBackdropRenderer {
     /// compressed. The blur still runs clamped-then-cropped so the corners do
     /// not vignette, and in the same working space as the main bake so the two
     /// stills a crossfade passes through are colour-managed identically.
+    /// The clear still's one departure from raw: a declared chroma damp,
+    /// linear about luma (the same `BakeToneMap` shape the legibility bake
+    /// uses, saturation-only), so the idle canvas reads as glass over the
+    /// wallpaper rather than the wallpaper at poster strength — "less
+    /// saturated, still detailed". Structure is untouched: no tone map, no
+    /// range cap, no local-contrast pass.
+    static let clearStillSaturation: Double = 0.75
+
     private static func clearBlur(
         _ image: CGImage,
         screenPoints: Double,
@@ -2642,7 +2650,20 @@ enum DesktopBackdropRenderer {
         gaussian.inputImage = input.clampedToExtent()
         gaussian.radius = Float(radius)
         guard let softened = gaussian.outputImage else { return nil }
-        return context.createCGImage(softened, from: input.extent)
+        let vectors = BakeToneMap(
+            saturation: clearStillSaturation,
+            gain: 1,
+            offset: 0
+        ).matrix
+        let matrix = CIFilter.colorMatrix()
+        matrix.inputImage = softened
+        matrix.rVector = vectors.red
+        matrix.gVector = vectors.green
+        matrix.bVector = vectors.blue
+        matrix.aVector = vectors.alpha
+        matrix.biasVector = vectors.bias
+        guard let output = matrix.outputImage else { return nil }
+        return context.createCGImage(output, from: input.extent)
     }
 
     /// The colour space the bake's arithmetic is done in, and the fix for
@@ -3000,8 +3021,15 @@ extension DesktopBackdropRenderer {
     /// the desktop captured rather than guessed, the source is his own muted
     /// wallpaper and the share is being asked to colour something that is barely
     /// coloured to begin with.
-    static let desktopChromaShare: Double = 0.162
-    static let darkDesktopChromaShare: Double = 0.228
+    /// 2026-08-04: both shares (and `okSaturationCeiling`, and `GlassWarmth`)
+    /// take a deliberate 27% step down together — "less saturated, still
+    /// detailed". Scaling the amber WITH the chroma is what the earlier
+    /// halving attempt missed: warmth left at full strength becomes
+    /// proportionally larger against the cut chroma and the hue-invariance
+    /// correction stops accounting for it. Texture is untouched — the blur
+    /// and local-contrast constants do not move.
+    static let desktopChromaShare: Double = 0.118
+    static let darkDesktopChromaShare: Double = 0.166
 
     static func desktopChromaShare(isDark: Bool) -> Double {
         isDark ? darkDesktopChromaShare : desktopChromaShare
@@ -3070,7 +3098,7 @@ extension DesktopBackdropRenderer {
         return weighted / weight
     }
 
-    static let okSaturationCeiling: Double = 0.24
+    static let okSaturationCeiling: Double = 0.20
     /// And a ceiling on the filter input itself, for the same reason from the
     /// other side.
     static let toneSaturationCeiling: Double = 3.0
@@ -3094,9 +3122,12 @@ extension DesktopBackdropRenderer {
     /// lightness, the gain moves the tail, the saturation moves chroma — and
     /// the offset is re-settled to convergence inside every pass, so the outer
     /// loop only has to let the gain walk down to its constraint. Four passes
-    /// land the still's mean `L*` on target to four decimals on every fixture
-    /// measured; a fifth moves nothing.
-    static let toneSolveIterations = 4
+    /// landed mean `L*` to four decimals; the 2026-08-04 chroma cut showed
+    /// the SATURATION fixed point converging slower at lower targets (the
+    /// hue-invariance spread crept from under 1.03 to 1.033 with nothing else
+    /// hue-dependent in the pipeline), so the loop runs longer — each extra
+    /// pass is one 96×96 probe measure on a rare off-thread bake.
+    static let toneSolveIterations = 8
 
     /// Solve the tone map **against the structure the surface will actually
     /// show**, in the space the guarantee is stated in.
@@ -4067,7 +4098,10 @@ enum GlassWarmth {
     static let blue = 112.0 / 255
 
     /// Coverage in light, and the number the dark one is derived from.
-    static let opacity = 0.04
+    /// 0.029 (was 0.04): scaled down with the 2026-08-04 chroma cut so the
+    /// declared amber stays the same *proportion* of the surface's colour —
+    /// the ratio the hue-invariance correction depends on.
+    static let opacity = 0.029
 
     /// Coverage per appearance.
     ///

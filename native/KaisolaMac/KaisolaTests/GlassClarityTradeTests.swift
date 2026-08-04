@@ -249,12 +249,18 @@ final class GlassClarityTradeTests: XCTestCase {
             luma(bakedChannels), luma(sourceChannels) - 0.15,
             "sanity: the dark bake should be normalizing this bright fixture down"
         )
-        // Chroma: the blur does not change channel *means*, so the clear
-        // still's spread must essentially be the wallpaper's. The bake damps
-        // dark chroma to half — that is its contract, not this still's.
-        XCTAssertGreaterThanOrEqual(
-            spread(clearChannels), spread(sourceChannels) * 0.85,
-            "the clear still damped the wallpaper's chroma"
+        // Chroma: the clear still carries exactly its declared damp — less
+        // saturated than the wallpaper by `clearStillSaturation`, and still
+        // meaningfully more colourful than the washed dark bake.
+        XCTAssertEqual(
+            spread(clearChannels),
+            spread(sourceChannels) * DesktopBackdropRenderer.clearStillSaturation,
+            accuracy: spread(sourceChannels) * 0.08,
+            "the clear still's chroma departed from its declared damp"
+        )
+        XCTAssertGreaterThan(
+            spread(clearChannels), spread(sourceChannels) * 0.6,
+            "…and must never slide toward the washed bake's half-chroma"
         )
     }
 }

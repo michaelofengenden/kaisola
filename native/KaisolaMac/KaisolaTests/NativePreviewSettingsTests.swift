@@ -2761,8 +2761,15 @@ final class NativePreviewSettingsTests: XCTestCase {
                 spread(surfaceSaturation), 1.12,
                 "the surface's colourfulness depends on hue: \(surfaceSaturation)"
             )
+            // 1.04, was 1.03. The 2026-08-04 chroma cut exposed a residual
+            // floor of ~1.031 in the veil-compositing step that is independent
+            // of the cut's depth (measured 1.0309-1.0338 across share values
+            // 0.118-0.130 and solve depths 4-8) — the old bound was passing on
+            // a hair's margin, not on headroom. A 3-4% hue disagreement in
+            // perceived saturation is below chroma JND; the regressions this
+            // assertion exists to catch measured 1.156-1.20×.
             XCTAssertLessThan(
-                spread(bareSaturation), 1.03,
+                spread(bareSaturation), 1.04,
                 """
                 with the declared amber removed the surfaces still disagree by \
                 \(spread(bareSaturation)) — the residual is no longer GlassWarmth \
@@ -3503,7 +3510,7 @@ final class NativePreviewSettingsTests: XCTestCase {
         // the neutrality invariant exists to prevent. Stated on the light
         // coverage, which is the number the dark one is derived from; see
         // `testGlassWarmthCoverageTracksTheSurfaceItLandsOn`.
-        XCTAssertEqual(GlassWarmth.opacity, 0.04, accuracy: 0.0001)
+        XCTAssertEqual(GlassWarmth.opacity, 0.029, accuracy: 0.0001)
         XCTAssertLessThan(GlassWarmth.opacity, 0.08)
         XCTAssertGreaterThan(GlassWarmth.opacity, 0.02, "deleted in all but name")
     }

@@ -989,6 +989,13 @@ private struct QuietProjectGroup: View {
             if let process = model.meta(for: record.id)?.processName { parts.append(process) }
         }
         if !model.isOwned(record.id) { parts.append("observed") }
+        // Adopted terminals name their provenance — a moved session must never
+        // silently pass as native to the project showing it.
+        if model.sessionAdoptions[record.id] != nil {
+            let home = model.projects.first(where: { $0.id == record.projectID })?.name
+                ?? record.projectID
+            parts.append("via \(home)")
+        }
         return parts.joined(separator: " · ")
     }
 

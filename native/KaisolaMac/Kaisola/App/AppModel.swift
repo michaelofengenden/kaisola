@@ -326,6 +326,12 @@ final class AppModel: ObservableObject {
     var persistedOwnedSessions: [NativeOwnedSession] = []
     var persistedSessionAliases: [String: String] = [:]
     var persistedPinnedIDs: Set<String> = []
+    private let adoptionStore: SessionAdoptionStore
+    /// The adoption overlay, mirrored from `SessionAdoptionStore` so display
+    /// grouping never reads a file per render. Presentation resolves a
+    /// terminal's project through `displayProjectID(_:)`; broker RPCs never
+    /// look here — they keep addressing the terminal's real `projectID`.
+    @Published private(set) var sessionAdoptions: [String: String] = [:]
 
     init(
         brokerPreparer: any BrokerInfoPreparing = BrokerStartupCoordinator.live(),
@@ -336,6 +342,7 @@ final class AppModel: ObservableObject {
         cursorStore: TerminalCursorStore = TerminalCursorStore(fileURL: NativePreviewPaths.terminalCursorStore),
         workspaceStateStore: NativeWorkspaceStateStore = .live,
         transcriptStore: AcpTranscriptStore = .live,
+        adoptionStore: SessionAdoptionStore = SessionAdoptionStore(),
         usageCenter: UsageCenter = .shared,
         attentionCenter: AttentionCenter = .shared,
         reconnectBackoff: BrokerReconnectBackoff = BrokerReconnectBackoff(),
@@ -355,6 +362,7 @@ final class AppModel: ObservableObject {
         self.cursorStore = cursorStore
         self.workspaceStateStore = workspaceStateStore
         self.transcriptStore = transcriptStore
+        self.adoptionStore = adoptionStore
         self.usageCenter = usageCenter
         self.attentionCenter = attentionCenter
         self.reconnectBackoff = reconnectBackoff
@@ -379,6 +387,7 @@ final class AppModel: ObservableObject {
         persistedOwnedSessions = navigation.sessions
         persistedSessionAliases = navigation.sessionAliases
         persistedPinnedIDs = SessionPinStore().pins()
+        sessionAdoptions = adoptionStore.adoptions()
     }
 
     /// Keeps each chat's usage observers alive only while that chat exists.
@@ -480,7 +489,7 @@ final class AppModel: ObservableObject {
             persistedOwnedSessions.map { ($0.projectID, $0) },
             uniquingKeysWith: { first, _ in first }
         )
-        let sessionsByProject = Dictionary(grouping: sessions, by: \.projectID)
+        let sessionsByProject = Dictionary(grouping: sessions, by: { self.displayProjectID($0) })
         let chatsByProject = Dictionary(grouping: chats, by: \.projectID)
         let meshesByProject = Dictionary(grouping: meshes, by: \.projectID)
         let recentlyClosedByProject = Dictionary(
@@ -890,9 +899,62 @@ final class AppModel: ObservableObject {
     }
 
     private func projectID(forSurface id: String) -> String? {
-        sessions.first(where: { $0.id == id })?.projectID
+        sessions.first(where: { $0.id == id }).map { displayProjectID($0) }
             ?? chats.first(where: { $0.id == id })?.projectID
             ?? meshes.first(where: { $0.id == id })?.projectID
+    }
+
+    /// The project a terminal is *shown* in: the adoption overlay's answer,
+    /// falling back to the broker's real project. Presentation-only — see
+    /// `sessionAdoptions`.
+    func displayProjectID(_ record: BrokerTerminalRecord) -> String {
+        sessionAdoptions[record.id] ?? record.projectID
+    }
+
+    /// Show a terminal in another open project — or return it home when
+    /// `projectID` is its real project. The broker keeps believing the
+    /// terminal lives where it always did (its identity encodes that); only
+    /// what the user *sees* moves: sidebar grouping, pane layouts, and the
+    /// adopting project's persisted workspace state, which records the pane
+    /// under its own id so restoration keeps it.
+    func moveTerminal(_ terminalID: String, toProject projectID: String) {
+        guard let record = sessions.first(where: { $0.id == terminalID }) else { return }
+        let store = adoptionStore
+        let previousDisplay = displayProjectID(record)
+        guard previousDisplay != projectID else { return }
+        if projectID == record.projectID {
+            store.clear(terminalID: terminalID)
+            sessionAdoptions.removeValue(forKey: terminalID)
+        } else {
+            guard store.adopt(terminalID: terminalID, into: projectID) else {
+                ToastCenter.shared.show(
+                    "Too many moved terminals. Return one home first.",
+                    style: .error
+                )
+                return
+            }
+            sessionAdoptions[terminalID] = projectID
+        }
+        var source = paneLayouts[previousDisplay] ?? SessionPaneLayout()
+        source.remove(terminalID)
+        paneLayouts[previousDisplay] = source
+        var target = paneLayouts[projectID] ?? SessionPaneLayout()
+        if !target.contains(terminalID) { target.add(terminalID) }
+        paneLayouts[projectID] = target
+        if let project = projects.first(where: { $0.id == projectID }) {
+            selectedProjectID = project.id
+            selectedProjectName = project.name
+        }
+        focusPane(terminalID, projectID: projectID)
+        scheduleWorkspaceStateSave(projectID: previousDisplay)
+        scheduleWorkspaceStateSave(projectID: projectID)
+        let destination = projects.first(where: { $0.id == projectID })?.name ?? "that project"
+        ToastCenter.shared.show(
+            projectID == record.projectID
+                ? "Returned to \(destination)."
+                : "Moved to \(destination). The terminal keeps running exactly where it was.",
+            style: .success
+        )
     }
 
     /// Retire a surface's needs-you state because the user just visited it. A
@@ -1037,7 +1099,7 @@ final class AppModel: ObservableObject {
         } ?? false
         let selectedTerminalBelongsHere = selectedSessionID.map { selected in
             visibleIDs.contains(selected)
-                && sessions.first(where: { $0.id == selected })?.projectID == project.id
+                && sessions.first(where: { $0.id == selected }).map { self.displayProjectID($0) } == project.id
         } ?? false
         guard !selectedChatBelongsHere, !selectedMeshBelongsHere, !selectedTerminalBelongsHere else { return }
 
@@ -1077,7 +1139,7 @@ final class AppModel: ObservableObject {
         guard var layout = paneLayouts[projectID] else { return false }
         let previous = layout
         let available = Set(
-            sessions.lazy.filter { $0.projectID == projectID }.map(\.id)
+            sessions.lazy.filter { self.displayProjectID($0) == projectID }.map(\.id)
         ).union(chats(in: projectID).map(\.id))
             .union(meshes(in: projectID).map(\.id))
         layout.normalize(availableSessionIDs: available)
@@ -2053,6 +2115,12 @@ final class AppModel: ObservableObject {
         }
     }
 
+    /// Test-only window onto the private snapshot builder, so the adoption
+    /// overlay's persistence contract is provable without a relaunch.
+    func workspaceSnapshotForTesting(projectID: String) -> NativeProjectWorkspaceState? {
+        workspaceSnapshot(projectID: projectID)
+    }
+
     private func workspaceSnapshot(projectID: String) -> NativeProjectWorkspaceState? {
         let layout = paneLayouts[projectID] ?? SessionPaneLayout()
         var panes: [NativeRestorablePaneState] = []
@@ -2060,7 +2128,7 @@ final class AppModel: ObservableObject {
 
         for terminalID in layout.sessionIDs {
             guard let terminal = sessions.first(where: { $0.id == terminalID }),
-                  terminal.projectID == projectID,
+                  displayProjectID(terminal) == projectID,
                   seen.insert(terminalID).inserted else { continue }
             panes.append(NativeRestorablePaneState(
                 id: terminalID,
@@ -3792,7 +3860,7 @@ final class AppModel: ObservableObject {
             return (name(chat.projectID), true)
         }
         if let terminal = sessions.first(where: { $0.id == targetID }) {
-            return (name(terminal.projectID), true)
+            return (name(displayProjectID(terminal)), true)
         }
         if let mesh = meshes.first(where: { mesh in
             mesh.id == targetID || mesh.columns.contains(where: { $0.id == targetID })

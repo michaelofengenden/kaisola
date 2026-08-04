@@ -175,6 +175,7 @@
 		9CF1B17121C7EA3A74101CD7 /* TerminalThemeRegistryTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A5B1E8D66FD540F29E239E3E /* TerminalThemeRegistryTests.swift */; };
 		9D8B0AB207CB7097EB17FD0B /* UsageSettingsTab.swift in Sources */ = {isa = PBXBuildFile; fileRef = CB03F186495669D5F881F00E /* UsageSettingsTab.swift */; };
 		9D9F0944BD72F9C09E3A2B09 /* NativePreviewPaths.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6E78A73E4BF5DABAB5BF6826 /* NativePreviewPaths.swift */; };
+		A03F00327572BDE3A12D2187 /* SessionAdoptionStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = 35BDE208E1EC7A98B2ECAA87 /* SessionAdoptionStore.swift */; };
 		A046C6509A6463F293CBEAB7 /* OmniBarDispatchTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 14A620CB3BAB100C84E6472B /* OmniBarDispatchTests.swift */; };
 		A0866D44257B82ED4F1484E7 /* RememberedSessionCatalogTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = CF0112BAE21EFB0355FAB3CA /* RememberedSessionCatalogTests.swift */; };
 		A265252D179828EAC5598D96 /* WorkspaceRailView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2709FF5202ACBC7BD9696C64 /* WorkspaceRailView.swift */; };
@@ -258,6 +259,7 @@
 		E5AF1D08B4924F79ECC5CCF0 /* SessionPaneLayout.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1D546C26BAA99A03D0E76CA7 /* SessionPaneLayout.swift */; };
 		E6781527DAD43EDB96DBD461 /* BrokerHelperPackage.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3CE14B47B11FF8AEDD22CC1A /* BrokerHelperPackage.swift */; };
 		E7EC945D70A1071B42558C89 /* CompanionDeviceRosterStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = 481C565423F2C82B8F330468 /* CompanionDeviceRosterStore.swift */; };
+		EA0D0D3DAFF6CDF0B33FC8AA /* SessionAdoptionTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7FD95A9C0C35F965BA5D79A1 /* SessionAdoptionTests.swift */; };
 		EB35F29036B0051D6ED3BCBD /* BrokerLaunchConfigurationTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8F9EDBEF947F0725DF51BDA4 /* BrokerLaunchConfigurationTests.swift */; };
 		EB574B84578D2F2C9608D94E /* CompanionProjectionBuilderTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 53F710A393B9F0B30F9D2F91 /* CompanionProjectionBuilderTests.swift */; };
 		EBD24B42377F41E7D46E8E94 /* AppModelTerminalRetentionTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7D5753B3730D2AFC56ED20F9 /* AppModelTerminalRetentionTests.swift */; };
@@ -357,6 +359,7 @@
 		30302FC993E589B6B0D08005 /* CompanionListener.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CompanionListener.swift; sourceTree = "<group>"; };
 		32406CFD933CD31D2751A8AF /* AcpProcessTransport.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AcpProcessTransport.swift; sourceTree = "<group>"; };
 		346DC3875261051CDA13A916 /* TerminalDocumentTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TerminalDocumentTests.swift; sourceTree = "<group>"; };
+		35BDE208E1EC7A98B2ECAA87 /* SessionAdoptionStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SessionAdoptionStore.swift; sourceTree = "<group>"; };
 		3722B2ED76D7E872E1CEEC39 /* TerminalMetaServiceTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TerminalMetaServiceTests.swift; sourceTree = "<group>"; };
 		37780782E5170FFD4996C1D8 /* NotificationBridgeTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NotificationBridgeTests.swift; sourceTree = "<group>"; };
 		3ACF651DE22A050B1D4AF49C /* AcpConversation.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AcpConversation.swift; sourceTree = "<group>"; };
@@ -431,6 +434,7 @@
 		7D5753B3730D2AFC56ED20F9 /* AppModelTerminalRetentionTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppModelTerminalRetentionTests.swift; sourceTree = "<group>"; };
 		7DE33FAC2761474B7B6A46A2 /* ObserveOnlyBrokerPolicyTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ObserveOnlyBrokerPolicyTests.swift; sourceTree = "<group>"; };
 		7FB737D5C0A6E0BA42FFC65E /* WorkspaceWatcher.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WorkspaceWatcher.swift; sourceTree = "<group>"; };
+		7FD95A9C0C35F965BA5D79A1 /* SessionAdoptionTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SessionAdoptionTests.swift; sourceTree = "<group>"; };
 		81A1444F9C5905630D1DC018 /* ToastCenter.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ToastCenter.swift; sourceTree = "<group>"; };
 		83D17767E2F2F48BE60D3518 /* OmniBarView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OmniBarView.swift; sourceTree = "<group>"; };
 		83FF23C3F0FE8B751EF9300A /* VerifiedUsageHelperCache.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VerifiedUsageHelperCache.swift; sourceTree = "<group>"; };
@@ -954,6 +958,7 @@
 				AD8887E4ADA2A72E8F2F8B9B /* QuietStatusDerivationTests.swift */,
 				CF0112BAE21EFB0355FAB3CA /* RememberedSessionCatalogTests.swift */,
 				0309F5DD6F095F40A096AA42 /* SavedWindowsStoreTests.swift */,
+				7FD95A9C0C35F965BA5D79A1 /* SessionAdoptionTests.swift */,
 				732793D0CFBFD121B1D4146D /* SessionOrderStoreTests.swift */,
 				0441702AA1CD407632FB480D /* SessionPaneLayoutTests.swift */,
 				0B2E1FD28106BD28EB2758AE /* SessionPinStoreTests.swift */,
@@ -1020,6 +1025,7 @@
 				8C11BDCCBCE80BB806B9AF63 /* NativeSessionStore+AutoTitle.swift */,
 				CA0225E687EE0462F0D9C548 /* ObserveOnlyBrokerClient.swift */,
 				5D434A4435BCB68FD69050A4 /* ObserveOnlyBrokerPolicy.swift */,
+				35BDE208E1EC7A98B2ECAA87 /* SessionAdoptionStore.swift */,
 				27165DF5641D8A7739273769 /* SessionOrderStore.swift */,
 				C2C127B15864D9B20EE61750 /* SessionPinStore.swift */,
 				44220D13FC4D0265D132F67A /* TerminalCursorStore.swift */,
@@ -1337,6 +1343,7 @@
 				2D87B2E1CE804065E07728CC /* RememberedSessionCatalog.swift in Sources */,
 				048E24B33924C66C0A0F484F /* RootShellView.swift in Sources */,
 				B417F4F52D40B81736E1F7CC /* SavedWindowsStore.swift in Sources */,
+				A03F00327572BDE3A12D2187 /* SessionAdoptionStore.swift in Sources */,
 				B64B3788574C41B5D0BC8A4A /* SessionOrderStore.swift in Sources */,
 				E5AF1D08B4924F79ECC5CCF0 /* SessionPaneLayout.swift in Sources */,
 				27677409CAA8A4C646F990C9 /* SessionPinStore.swift in Sources */,
@@ -1466,6 +1473,7 @@
 				081A41C0B1FA213B7CD74208 /* QuietStatusDerivationTests.swift in Sources */,
 				A0866D44257B82ED4F1484E7 /* RememberedSessionCatalogTests.swift in Sources */,
 				93DFA71C6988B2A423631EA3 /* SavedWindowsStoreTests.swift in Sources */,
+				EA0D0D3DAFF6CDF0B33FC8AA /* SessionAdoptionTests.swift in Sources */,
 				4E414C9D7F85C2BA40C92E76 /* SessionOrderStoreTests.swift in Sources */,
 				0F372789A67A0DE521EBBB92 /* SessionPaneLayoutTests.swift in Sources */,
 				41C16D5DE1E0A270FBCB9BBE /* SessionPinStoreTests.swift in Sources */,

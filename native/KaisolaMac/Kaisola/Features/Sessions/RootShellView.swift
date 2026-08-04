@@ -867,6 +867,18 @@ struct RootShellView: View {
             }
         }
         Button("Rename…") { renameTarget = session.id }
+        Menu("Move to Project") {
+            ForEach(model.projects.filter { $0.id != model.displayProjectID(session) }) { project in
+                Button(project.name) {
+                    model.moveTerminal(session.id, toProject: project.id)
+                }
+            }
+        }
+        if model.sessionAdoptions[session.id] != nil {
+            Button("Return to \(model.projects.first(where: { $0.id == session.projectID })?.name ?? "its project")") {
+                model.moveTerminal(session.id, toProject: session.projectID)
+            }
+        }
         if model.isOwned(session.id) {
             if let dir = model.directory(for: session.id) {
                 Button("Git Panel…") { gitRepo = dir }
@@ -1988,11 +2000,26 @@ struct RootShellView: View {
         }
         .contextMenu {
             Button("Rename…") { renameTarget = id }
-            if model.sessions.contains(where: { $0.id == id }) {
+            if let record = model.sessions.first(where: { $0.id == id }) {
                 Button("Open Transcript") {
                     openTerminalTranscript(id)
                 }
                 .disabled(model.terminalTranscriptContext(for: id) == nil)
+                // The adoption overlay: show this terminal in another open
+                // project. The broker keeps addressing its real project — see
+                // `AppModel.moveTerminal`.
+                Menu("Move to Project") {
+                    ForEach(model.projects.filter { $0.id != model.displayProjectID(record) }) { project in
+                        Button(project.name) {
+                            model.moveTerminal(id, toProject: project.id)
+                        }
+                    }
+                }
+                if model.sessionAdoptions[id] != nil {
+                    Button("Return to \(model.projects.first(where: { $0.id == record.projectID })?.name ?? "its project")") {
+                        model.moveTerminal(id, toProject: record.projectID)
+                    }
+                }
             }
             Button("Hide Pane") { Task { await model.minimizeSurface(id) } }
         }

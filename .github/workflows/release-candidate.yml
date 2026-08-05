@@ -21,8 +21,12 @@ jobs:
     with:
       skip-ios: true
 
+  # Runs in parallel with swift-contracts: the candidate never consumes its
+  # artifacts, and promotion (release.yml) requires this whole run — both
+  # jobs — to succeed for the exact tagged commit. The gate is unchanged;
+  # only the wall clock shrinks from sum to max of the two jobs. A commit
+  # whose tests fail wastes one signed build, which costs nothing durable.
   candidate:
-    needs: swift-contracts
     runs-on: macos-15
     timeout-minutes: 60
     steps:

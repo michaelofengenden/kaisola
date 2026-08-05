@@ -1,3 +1,29 @@
+// Cut a release with the least possible waiting.
+//
+//   npm run release:fast -- <version> [title words...] [flags]
+//
+// The expensive work (universal build, notarization) happens in
+// release-candidate.yml on every push to main, and release.yml only promotes
+// an existing green candidate for the exact tagged commit. So the fastest
+// release is one whose commit already has a green candidate. This script
+// arranges that permanently:
+//
+// - FAST PATH: when package.json already carries <version> (the normal state,
+//   because every release ends by pre-bumping to the next version), HEAD is
+//   simply tagged once its candidate is green. If the candidate finished
+//   earlier in the day, the release is live in about a minute.
+// - SLOW PATH: when <version> differs, the classic bump commit is created and
+//   pushed first, then the script waits for that commit's candidate before
+//   tagging. One-time cost per adoption or renumbering.
+//
+// Either way the script ends by pre-bumping package.json to the next patch
+// version ("Start vX.Y.Z+1"), so the next release takes the fast path.
+// The tag is only ever pushed after the candidate is green, so release.yml
+// never fires before its input exists.
+//
+// Flags: --no-wait (fail instead of polling for the candidate),
+//        --no-next-bump (skip the trailing pre-bump commit),
+//        --allow-version-reset (deliberate renumbering below current).
 const { spawnSync } = require('node:child_process')
 const fs = require('node:fs')
 const path = require('node:path')
@@ -24,22 +50,22 @@ function fail(message) {
   process.exit(1)
 }
 
-const requested = process.argv[2]?.replace(/^v/, '')
+function sleep(seconds) {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, seconds * 1000)
+}
+
+const flags = new Set(process.argv.slice(2).filter((word) => word.startsWith('--')))
+const positional = process.argv.slice(2).filter((word) => !word.startsWith('--'))
+
+const requested = positional[0]?.replace(/^v/, '')
 if (!requested || !/^\d+\.\d+\.\d+$/.test(requested)) {
-  fail('usage: npm run release:fast -- <version> [commit message]')
+  fail('usage: npm run release:fast -- <version> [title words...] [--no-wait] [--no-next-bump]')
 }
 
 const tag = `v${requested}`
-// Flags are not commit-message words.
-const message = process.argv.slice(3).filter((word) => !word.startsWith('--')).join(' ')
-  || `Release ${tag}`
-if (output('git', ['branch', '--show-current']) !== 'main') fail('releases must be cut from main')
+const message = positional.slice(1).join(' ') || `Release ${tag}`
 
-// Existing tracked edits must already be staged. This keeps the release
-// boundary explicit and never sweeps unrelated untracked files into a commit.
-if (command('git', ['diff', '--quiet'], { allowFailure: true }).status !== 0) {
-  fail('stage the intended tracked changes before releasing')
-}
+if (output('git', ['branch', '--show-current']) !== 'main') fail('releases must be cut from main')
 command('git', ['fetch', '--quiet', '--tags', 'origin'])
 if (command('git', ['show-ref', '--verify', '--quiet', `refs/tags/${tag}`], { allowFailure: true }).status === 0) {
   fail(`tag ${tag} already exists`)
@@ -50,39 +76,102 @@ if (Number(output('git', ['rev-list', '--count', 'HEAD..origin/main'])) > 0) {
 
 const packagePath = path.join(root, 'package.json')
 const current = JSON.parse(fs.readFileSync(packagePath, 'utf8')).version
-if (current === requested) fail(`package.json is already at ${requested}`)
-const requestedParts = requested.split('.').map(Number)
-const currentParts = current.split('.').map(Number)
-const isNewer = requestedParts.some((part, index) => (
-  part > currentParts[index] && requestedParts.slice(0, index).every((value, prior) => value === currentParts[prior])
-))
-// Going backwards is allowed only when asked for by name.
-//
-// The guard exists because a version that goes down is almost always a typo,
-// and a published release cannot be taken back. A deliberate renumbering is the
-// exception, so it takes a flag rather than the guard being removed — the next
-// accidental `0.9.0` still stops here.
-//
-// Safe for installed copies because Sparkle compares `CFBundleVersion`, which
-// `native-release-candidate.cjs` derives from a monotonic build counter
-// (`LAST_PUBLIC_BUILD` + the run number) and never from this string. The
-// marketing version is what people read; the build number decides the update.
-const allowsReset = process.argv.includes('--allow-version-reset')
-if (!isNewer && !allowsReset) {
-  fail(`${requested} must be newer than package version ${current} (pass --allow-version-reset to renumber deliberately)`)
+
+let releaseSha
+if (current === requested) {
+  // Fast path: HEAD already carries this version; its candidate is the
+  // release. The tree must match the candidate's bytes exactly.
+  if (command('git', ['diff', '--quiet'], { allowFailure: true }).status !== 0
+    || command('git', ['diff', '--cached', '--quiet'], { allowFailure: true }).status !== 0) {
+    fail('the tree has tracked changes; commit and push them first so the candidate matches HEAD')
+  }
+  if (Number(output('git', ['rev-list', '--count', 'origin/main..HEAD'])) > 0) {
+    fail('HEAD is ahead of origin/main; push first so a candidate exists for it')
+  }
+  releaseSha = output('git', ['rev-parse', 'HEAD'])
+  console.log(`release-fast: fast path: tagging existing commit ${releaseSha.slice(0, 10)} as ${tag}`)
+} else {
+  // Slow path: classic bump commit. Existing tracked edits must already be
+  // staged; unrelated untracked files are never swept into the commit.
+  if (command('git', ['diff', '--quiet'], { allowFailure: true }).status !== 0) {
+    fail('stage the intended tracked changes before releasing')
+  }
+  const requestedParts = requested.split('.').map(Number)
+  const currentParts = current.split('.').map(Number)
+  const isNewer = requestedParts.some((part, index) => (
+    part > currentParts[index] && requestedParts.slice(0, index).every((value, prior) => value === currentParts[prior])
+  ))
+  // Going backwards is allowed only when asked for by name: a version that
+  // goes down is almost always a typo, and a published release cannot be
+  // taken back. Safe for installed copies because Sparkle compares
+  // CFBundleVersion, which the candidate derives from a monotonic build
+  // counter and never from this string.
+  if (!isNewer && !flags.has('--allow-version-reset')) {
+    fail(`${requested} must be newer than package version ${current} (pass --allow-version-reset to renumber deliberately)`)
+  }
+  command('npm', ['version', requested, '--no-git-tag-version', '--ignore-scripts'])
+  command('git', ['add', 'package.json', 'package-lock.json'])
+  if (command('git', ['diff', '--cached', '--quiet'], { allowFailure: true }).status === 0) {
+    fail('there is nothing staged to release')
+  }
+  command('git', ['commit', '-m', message])
+  command('git', ['push', 'origin', 'HEAD:refs/heads/main'])
+  releaseSha = output('git', ['rev-parse', 'HEAD'])
+  console.log(`release-fast: slow path: pushed release commit ${releaseSha.slice(0, 10)}; its candidate must build before the tag`)
 }
 
-command('npm', ['version', requested, '--no-git-tag-version', '--ignore-scripts'])
-command('git', ['add', 'package.json', 'package-lock.json'])
-if (command('git', ['diff', '--cached', '--quiet'], { allowFailure: true }).status === 0) {
-  fail('there is nothing staged to release')
+// The tag is pushed only after the candidate for releaseSha is green, so the
+// promotion workflow always finds its input on the first attempt.
+function candidateRun(sha) {
+  const raw = output('gh', ['api', '-X', 'GET',
+    'repos/{owner}/{repo}/actions/workflows/release-candidate.yml/runs',
+    '-f', `head_sha=${sha}`, '-f', 'per_page=100'])
+  const runs = (JSON.parse(raw).workflow_runs || [])
+    .filter((run) => run.head_sha === sha && run.head_branch === 'main'
+      && (run.event === 'push' || run.event === 'workflow_dispatch'))
+    .sort((a, b) => (a.run_number - b.run_number) || (a.run_attempt - b.run_attempt))
+  return runs[runs.length - 1] || null
 }
 
-command('git', ['commit', '-m', message])
-command('git', ['tag', '-a', tag, '-m', `Kaisola ${tag}`])
+const startedAt = Date.now()
+const pollLimitMinutes = 45
+for (;;) {
+  const run = candidateRun(releaseSha)
+  const elapsed = Math.round((Date.now() - startedAt) / 60000)
+  if (run && run.conclusion === 'success') {
+    console.log(`release-fast: candidate is green (run ${run.id})`)
+    break
+  }
+  if (run && run.conclusion) {
+    fail(`the candidate for ${releaseSha.slice(0, 10)} finished ${run.conclusion}: ${run.html_url}`)
+  }
+  if (flags.has('--no-wait')) {
+    fail(run
+      ? `the candidate for ${releaseSha.slice(0, 10)} is still ${run.status}: ${run.html_url}`
+      : `no candidate run exists yet for ${releaseSha.slice(0, 10)}; it starts on push within a minute`)
+  }
+  if (elapsed >= pollLimitMinutes) {
+    fail(`gave up after ${pollLimitMinutes} minutes; check the candidate workflow and re-run (the fast path will resume here)`)
+  }
+  console.log(run
+    ? `release-fast: candidate ${run.status} (${elapsed}m elapsed), waiting…`
+    : `release-fast: waiting for the candidate run to appear (${elapsed}m elapsed)…`)
+  sleep(30)
+}
 
-// One network round trip, and the server accepts the commit and tag together.
-// This also prevents a tag-triggered release from seeing only half the push.
-command('git', ['push', '--atomic', 'origin', 'HEAD:refs/heads/main', `refs/tags/${tag}`])
+command('git', ['tag', '-a', tag, '-m', `Kaisola ${tag}: ${message}`, releaseSha])
+command('git', ['push', 'origin', `refs/tags/${tag}`])
+console.log(`Release ${tag} promoting: https://github.com/michaelofengenden/kaisola/actions/workflows/release.yml`)
 
-console.log(`Release ${tag} started: https://github.com/michaelofengenden/kaisola/actions/workflows/release.yml`)
+if (!flags.has('--no-next-bump')) {
+  // Pre-bump so every future commit carries the next version and the next
+  // release takes the fast path (tag an existing green candidate, ~1 minute).
+  const next = requested.split('.').map(Number)
+  next[2] += 1
+  const nextVersion = next.join('.')
+  command('npm', ['version', nextVersion, '--no-git-tag-version', '--ignore-scripts'])
+  command('git', ['add', 'package.json', 'package-lock.json'])
+  command('git', ['commit', '-m', `Start v${nextVersion}`])
+  command('git', ['push', 'origin', 'HEAD:refs/heads/main'])
+  console.log(`Pre-bumped to ${nextVersion}; the next release of it will promote in about a minute.`)
+}

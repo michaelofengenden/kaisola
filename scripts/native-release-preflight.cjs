@@ -5,7 +5,11 @@ const fs = require('node:fs')
 const path = require('node:path')
 const { spawnSync } = require('node:child_process')
 
-const EXPECTED_ARCHITECTURES = Object.freeze(['arm64', 'x86_64'])
+// Apple Silicon only, decided 2026-08-04: the universal build doubled every
+// release compile and shipped a second Node runtime for Intel Macs the
+// product no longer targets. Reversible by restoring 'x86_64' here (and the
+// ARCHS lists in the workflows).
+const EXPECTED_ARCHITECTURES = Object.freeze(['arm64'])
 const EXPECTED_BUNDLE_IDENTIFIER = 'com.kaisola.mac'
 const EXPECTED_HELPER_LABEL = 'com.kaisola.mac.broker-bootstrap'
 
@@ -38,7 +42,7 @@ function architectures(file) {
 function requireExactArchitectures(actual, label) {
   const normalized = [...new Set(actual)].sort()
   if (JSON.stringify(normalized) !== JSON.stringify(EXPECTED_ARCHITECTURES)) {
-    fail(`${label} must contain exactly arm64 and x86_64; found ${normalized.join(', ') || 'none'}`)
+    fail(`${label} must contain exactly ${EXPECTED_ARCHITECTURES.join(' and ')}; found ${normalized.join(', ') || 'none'}`)
   }
   return normalized
 }
@@ -239,8 +243,9 @@ function usage() {
     [--require-updates] [--require-developer-id] [--require-notarized] \\
     [--source-commit <40-hex>] [--json-output <receipt.json>]
 
-The default gate accepts a locally signed universal build. Distribution flags
-add real Sparkle configuration, Developer ID, Gatekeeper, and stapling checks.`
+The default gate accepts a locally signed Apple Silicon build. Distribution
+flags add real Sparkle configuration, Developer ID, Gatekeeper, and stapling
+checks.`
 }
 
 function preflight(options) {

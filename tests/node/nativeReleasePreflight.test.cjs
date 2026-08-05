@@ -16,10 +16,11 @@ const {
 
 const validKey = Buffer.alloc(32, 0xA5).toString('base64')
 
-test('release preflight requires exact universal architecture coverage', () => {
-  assert.deepEqual(requireExactArchitectures(['x86_64', 'arm64'], 'test'), ['arm64', 'x86_64'])
-  assert.throws(() => requireExactArchitectures(['arm64'], 'test'), /exactly arm64 and x86_64/)
-  assert.throws(() => requireExactArchitectures(['arm64', 'x86_64', 'i386'], 'test'), /exactly arm64 and x86_64/)
+test('release preflight requires exact Apple Silicon architecture coverage', () => {
+  assert.deepEqual(requireExactArchitectures(['arm64'], 'test'), ['arm64'])
+  assert.throws(() => requireExactArchitectures(['x86_64', 'arm64'], 'test'), /exactly arm64/)
+  assert.throws(() => requireExactArchitectures(['x86_64'], 'test'), /exactly arm64/)
+  assert.throws(() => requireExactArchitectures([], 'test'), /exactly arm64/)
 })
 
 test('release preflight mirrors the fail-closed Sparkle configuration policy', () => {

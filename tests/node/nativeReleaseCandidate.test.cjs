@@ -47,9 +47,9 @@ function fixture(t) {
     version,
     build,
     architectures: {
-      app: ['x86_64', 'arm64'],
-      node: ['arm64', 'x86_64'],
-      bootstrap: ['x86_64', 'arm64'],
+      app: ['arm64'],
+      node: ['arm64'],
+      bootstrap: ['arm64'],
     },
     helper: {
       packageVersion: '1.1.0',

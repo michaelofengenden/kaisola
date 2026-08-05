@@ -10,7 +10,9 @@ const SCHEMA_VERSION = 1
 const KIND = 'kaisola-native-release-candidate'
 const RECEIPT_NAME = 'release-candidate.json'
 const EXPECTED_BUNDLE_IDENTIFIER = 'com.kaisola.mac'
-const EXPECTED_ARCHITECTURES = Object.freeze(['arm64', 'x86_64'])
+// Apple Silicon only, decided 2026-08-04; must stay in lockstep with
+// native-release-preflight.cjs.
+const EXPECTED_ARCHITECTURES = Object.freeze(['arm64'])
 const SPARKLE_PUBLIC_ED_KEY = 'BQgU8WTQzeYBaYnbWrYBgoP7JPYyCXVrNgHCMBvmYrk='
 // The recreated repository reset Actions run numbers, but the last public app
 // was build 15501. Sparkle compares CFBundleVersion independently of SemVer.
@@ -142,7 +144,7 @@ function requireString(value, label, pattern = null) {
 
 function requireArchitectures(value, label) {
   if (!Array.isArray(value) || JSON.stringify([...value].sort()) !== JSON.stringify(EXPECTED_ARCHITECTURES)) {
-    fail(`${label} must contain exactly arm64 and x86_64`)
+    fail(`${label} must contain exactly ${EXPECTED_ARCHITECTURES.join(' and ')}`)
   }
   return [...EXPECTED_ARCHITECTURES]
 }

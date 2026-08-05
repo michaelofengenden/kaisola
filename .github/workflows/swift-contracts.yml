@@ -9,6 +9,13 @@ on:
         type: boolean
         default: false
         required: false
+      # The release-candidate pipeline builds, preflights, and probes the real
+      # Developer ID bytes in its own job, so its call skips this workflow's
+      # duplicate macOS release compile. Standalone push/PR runs keep it.
+      skip-macos-release-build:
+        type: boolean
+        default: false
+        required: false
   workflow_dispatch:
   push:
     branches: [main]
@@ -57,8 +64,8 @@ jobs:
         run: npm ci --prefer-offline --no-audit --no-fund
         env:
           KAISOLA_SKIP_NATIVE_REBUILD: '1'
-      - name: Download checksum-pinned universal Node runtimes
-        run: npm run native:helper:download
+      - name: Download checksum-pinned Node runtime
+        run: node scripts/download-native-node-runtime.cjs arm64
       - name: Test native packaging, compatibility, and resource policies
         run: >-
           node --test
@@ -106,6 +113,7 @@ jobs:
           CODE_SIGNING_ALLOWED=NO
           test-without-building
       - name: Compile optimized Kaisola macOS app
+        if: ${{ !inputs.skip-macos-release-build }}
         run: >-
           xcodebuild
           -project native/KaisolaMac/KaisolaMac.xcodeproj
@@ -113,15 +121,17 @@ jobs:
           -configuration LocalRelease
           -destination 'generic/platform=macOS'
           -derivedDataPath "$RUNNER_TEMP/kaisola-mac"
-          ARCHS='arm64 x86_64'
+          ARCHS=arm64
           ONLY_ACTIVE_ARCH=NO
           CODE_SIGN_IDENTITY=-
           build
-      - name: Verify sealed universal Kaisola package
+      - name: Verify sealed Kaisola package
+        if: ${{ !inputs.skip-macos-release-build }}
         run: >-
           npm run native:preflight --
           --app "$RUNNER_TEMP/kaisola-mac/Build/Products/LocalRelease/Kaisola.app"
       - name: Prove packaged broker and PTY continuity
+        if: ${{ !inputs.skip-macos-release-build }}
         run: >-
           npm run native:helper:probe --
           "$RUNNER_TEMP/kaisola-mac/Build/Products/LocalRelease/Kaisola.app/Contents/Resources/BrokerHelper"

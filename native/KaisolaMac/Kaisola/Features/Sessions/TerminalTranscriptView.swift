@@ -278,7 +278,7 @@ struct TerminalTranscriptView: View {
                 maxBytes: pageBytes
             )
             pages = [page]
-            await rebuildRenderedPages()
+            await renderNewPage(page)
             errorMessage = nil
             await Task.yield()
             proxy.scrollTo(bottomID, anchor: .bottom)
@@ -310,7 +310,7 @@ struct TerminalTranscriptView: View {
                 throw BrokerClientError.malformedResponse
             }
             pages.insert(page, at: 0)
-            await rebuildRenderedPages()
+            await renderNewPage(page)
             errorMessage = nil
             await Task.yield()
             TerminalTranscriptScrollPolicy.preserveUserVelocity {
@@ -369,6 +369,37 @@ struct TerminalTranscriptView: View {
         } catch {
             errorMessage = "Could not export transcript: \(error.localizedDescription)"
         }
+    }
+
+    /// Sanitize exactly one newly fetched page and merge it into the rendered
+    /// set, leaving every existing page's text byte-identical. Scroll-up
+    /// paging used to replay *all* loaded pages through a fresh terminal per
+    /// prepend, making deep history O(n²) in cumulative reparse and shifting
+    /// already-visible text on every load (the combined replay re-apportioned
+    /// lines proportionally each time). A page rendered alone still collapses
+    /// cursor-addressed repaints within its own 4 MiB; what it gives up is
+    /// overwrite and control state crossing this page's boundary, which is
+    /// bounded to one active screen (`context.rows` lines) and one possibly
+    /// truncated escape sequence — the same conditions the oldest loaded page
+    /// has always started under. Load All keeps the full-fidelity combined
+    /// replay below.
+    @MainActor
+    private func renderNewPage(_ page: TerminalHistoryPage) async {
+        let output = page.output
+        let isLastLoadedPage = pages.last?.id == page.id
+        let columns = context.columns
+        let rows = context.rows
+        let plain = await Task.detached(priority: .userInitiated) {
+            TerminalTranscriptSanitizer.incrementalPageText(
+                output: output,
+                isLastLoadedPage: isLastLoadedPage,
+                columns: columns,
+                rows: rows
+            )
+        }.value
+        guard pages.contains(where: { $0.id == page.id }) else { return }
+        renderedPages[page.id] = plain
+        renderedGeneration &+= 1
     }
 
     @MainActor
@@ -771,12 +802,36 @@ enum TerminalTranscriptSanitizer {
 
         let weights = pages.map { max(1, $0.utf8.count) }
         let totalWeight = weights.reduce(0, +)
+        return apportion(lines: lines, weights: weights, totalWeight: totalWeight, pageCount: pages.count)
+    }
+
+    /// Render one page so it joins an already-rendered transcript without
+    /// touching the other pages: single-page replay, plus the same trailing
+    /// newline the combined apportionment gives every non-final page so
+    /// adjacent page texts never run together in the joined transcript.
+    static func incrementalPageText(
+        output: String,
+        isLastLoadedPage: Bool,
+        columns: Int = 160,
+        rows: Int = 60
+    ) -> String {
+        let plain = plainPages([output], columns: columns, rows: rows).first ?? ""
+        guard !plain.isEmpty, !isLastLoadedPage else { return plain }
+        return plain + "\n"
+    }
+
+    private static func apportion(
+        lines: [String],
+        weights: [Int],
+        totalWeight: Int,
+        pageCount: Int
+    ) -> [String] {
         var cumulativeWeight = 0
         var startLine = 0
-        var result = Array(repeating: "", count: pages.count)
-        for index in pages.indices {
+        var result = Array(repeating: "", count: pageCount)
+        for index in 0..<pageCount {
             cumulativeWeight += weights[index]
-            let endLine = index == pages.index(before: pages.endIndex)
+            let endLine = index == pageCount - 1
                 ? lines.count
                 : min(lines.count, max(startLine, lines.count * cumulativeWeight / totalWeight))
             guard endLine > startLine else { continue }

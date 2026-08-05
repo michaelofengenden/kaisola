@@ -285,4 +285,46 @@ final class TerminalTranscriptTests: XCTestCase {
         XCTAssertEqual(pages.count, 2)
         XCTAssertEqual(pages.joined(), "first\nsecond\nthird🙂")
     }
+
+    func testIncrementalPageJoinsWithoutRunningIntoTheNextPage() {
+        let older = TerminalTranscriptSanitizer.incrementalPageText(
+            output: "older tail",
+            isLastLoadedPage: false
+        )
+        let newest = TerminalTranscriptSanitizer.incrementalPageText(
+            output: "newest head",
+            isLastLoadedPage: true
+        )
+        XCTAssertEqual(older + newest, "older tail\nnewest head")
+        XCTAssertEqual(
+            TerminalTranscriptSanitizer.incrementalPageText(output: "", isLastLoadedPage: false),
+            ""
+        )
+    }
+
+    func testIncrementalPageStillCollapsesCursorAddressedRepaints() {
+        let page = TerminalTranscriptSanitizer.incrementalPageText(
+            output: "\u{1B}[1;1HW\u{1B}[K\u{1B}[1;1HWork\u{1B}[K\u{1B}[1;1HWorking\u{1B}[K",
+            isLastLoadedPage: true,
+            columns: 80,
+            rows: 24
+        )
+        XCTAssertEqual(page, "Working")
+    }
+
+    func testIncrementalPrependNeverRewritesAnAlreadyRenderedPage() {
+        // Scroll-up used to replay every loaded page and re-apportion all
+        // rendered text per prepend; the incremental path must render the new
+        // page alone so existing renders stay byte-identical.
+        let renderedFirst = TerminalTranscriptSanitizer.incrementalPageText(
+            output: "newest page", isLastLoadedPage: true
+        )
+        _ = TerminalTranscriptSanitizer.incrementalPageText(
+            output: "older page arriving later", isLastLoadedPage: false
+        )
+        XCTAssertEqual(
+            renderedFirst,
+            TerminalTranscriptSanitizer.incrementalPageText(output: "newest page", isLastLoadedPage: true)
+        )
+    }
 }

@@ -18,6 +18,8 @@ SCHEME="Kaisola"
 CONFIGURATION="${KAISOLA_NATIVE_CONFIGURATION:-Debug}"
 DERIVED_DATA="${KAISOLA_NATIVE_DERIVED_DATA:-$ROOT/.build/Kaisola.noindex}"
 APP="${KAISOLA_NATIVE_APP:-$HOME/Applications/Kaisola Dev.app}"
+BUNDLE_ID="${KAISOLA_NATIVE_BUNDLE_ID:-com.kaisola.mac.dev}"
+DISPLAY_NAME="${KAISOLA_NATIVE_DISPLAY_NAME:-Kaisola Dev}"
 SOURCE_APP="$DERIVED_DATA/Build/Products/$CONFIGURATION/Kaisola.app"
 PROFILE_ROUTE="${KAISOLA_NATIVE_BROKER_PROFILE:-native}"
 case "$PROFILE_ROUTE" in
@@ -44,20 +46,28 @@ case "$APP" in
 esac
 
 usage() {
-  /bin/echo "Usage: $0 [--launch-only] [--clean-legacy]"
+  /bin/echo "Usage: $0 [--launch-only] [--install-only] [--clean-legacy]"
   /bin/echo "  --launch-only   Open the installed development app without rebuilding"
+  /bin/echo "  --install-only  Build and install without starting the broker or launching"
   /bin/echo "  --clean-legacy  Trash known copies and purge stale Launch Services registrations"
 }
 
+LAUNCH_APP=1
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --launch-only) BUILD_CURRENT=0 ;;
+    --install-only) LAUNCH_APP=0 ;;
     --clean-legacy) CLEAN_LEGACY=1 ;;
     -h|--help) usage; exit 0 ;;
     *) /bin/echo "Unknown option: $1" >&2; usage >&2; exit 2 ;;
   esac
   shift
 done
+
+if [[ "$BUILD_CURRENT" -eq 0 && "$LAUNCH_APP" -eq 0 ]]; then
+  /bin/echo "--launch-only and --install-only are mutually exclusive." >&2
+  exit 2
+fi
 
 stop_development_app() {
   local pattern="^${APP}/Contents/MacOS/Kaisola$"
@@ -90,6 +100,17 @@ build_current_source() {
   version="$(/usr/bin/env node -p "require(process.argv[1]).version" "$ROOT/package.json")"
   build_number="$(git -C "$ROOT" rev-list --count HEAD)"
 
+  # Optional stable signing identity. The project's automatic style has no
+  # team, so plain builds sign ad-hoc, whose identity changes every build
+  # (TCC grants and Keychain access follow the signature). Lanes that want a
+  # durable identity (canary) set KAISOLA_NATIVE_SIGN_IDENTITY to a local
+  # certificate name; everything else keeps today's behavior.
+  local -a sign_args=()
+  if [[ -n "${KAISOLA_NATIVE_SIGN_IDENTITY:-}" ]]; then
+    sign_args+=("CODE_SIGN_STYLE=Manual" "CODE_SIGN_IDENTITY=${KAISOLA_NATIVE_SIGN_IDENTITY}")
+    [[ -n "${KAISOLA_NATIVE_TEAM:-}" ]] && sign_args+=("DEVELOPMENT_TEAM=${KAISOLA_NATIVE_TEAM}")
+  fi
+
   /bin/mkdir -p "$DERIVED_DATA"
   /usr/bin/touch "$DERIVED_DATA/.metadata_never_index"
   /bin/echo "Building Kaisola $version from current source…"
@@ -100,11 +121,12 @@ build_current_source() {
     -derivedDataPath "$DERIVED_DATA" \
     -destination "platform=macOS,arch=$(uname -m)" \
     ONLY_ACTIVE_ARCH=YES \
-    PRODUCT_BUNDLE_IDENTIFIER=com.kaisola.mac.dev \
-    INFOPLIST_KEY_CFBundleDisplayName="Kaisola Dev" \
+    PRODUCT_BUNDLE_IDENTIFIER="$BUNDLE_ID" \
+    INFOPLIST_KEY_CFBundleDisplayName="$DISPLAY_NAME" \
     KAISOLA_PACKAGE_BROKER_HELPER=1 \
     MARKETING_VERSION="$version" \
     CURRENT_PROJECT_VERSION="$build_number" \
+    ${sign_args[@]+"${sign_args[@]}"} \
     build
 
   if [[ ! -x "$SOURCE_APP/Contents/MacOS/Kaisola" ]]; then
@@ -370,8 +392,13 @@ fi
 unregister_noncanonical_products
 "$LSREGISTER" -f -R -trusted "$APP" 2>/dev/null || true
 
+if [[ "$LAUNCH_APP" -eq 0 ]]; then
+  /bin/echo "Installed without launching: $APP"
+  exit 0
+fi
+
 start_broker_if_needed
-/bin/echo "Launching Kaisola Dev ($PROFILE_NAME profile)…"
+/bin/echo "Launching $DISPLAY_NAME ($PROFILE_NAME profile)…"
 stop_development_app
 # Launch Services detaches the app from the calling shell, so the app stays
 # open when this script returns (including from npm and non-interactive shells).

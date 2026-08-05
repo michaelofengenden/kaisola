@@ -14,6 +14,8 @@
     "native:frame-cadence": "node scripts/native-frame-cadence-gate.cjs",
     "native:resource-fixture": "node scripts/native-resource-fixture-gate.cjs",
     "native:dev": "./scripts/native-dev.sh",
+    "native:canary": "./scripts/native-canary.sh",
+    "native:canary:archive": "./scripts/native-canary.sh --install-only --archive",
     "native:fast": "./scripts/native-fast.sh",
     "native:fast:build": "./scripts/native-fast.sh --build-only",
     "native:fast:launch": "./scripts/native-fast.sh --launch-only",

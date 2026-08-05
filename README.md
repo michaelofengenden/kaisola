@@ -64,6 +64,19 @@ entitlements, Keychain, notifications, or launch behavior changed:
 npm run native:dev
 ```
 
+Cut a canary when you want to daily-drive or hand off current source without
+waiting on CI: a LocalRelease-optimized "Kaisola Canary.app", signed locally
+with the Developer ID certificate (instant, no Apple round trip, stable
+identity so permissions and Keychain survive rebuilds), never notarized,
+never in the appcast. `--archive` zips it under `release/canary/` for
+scp/rsync handoff (transfers that skip quarantine launch as-is; quarantined
+copies need Open Anyway).
+
+```bash
+npm run native:canary
+npm run native:canary:archive
+```
+
 See [the macOS development guide](native/KaisolaMac/README.md) for release and
 broker-continuity details.
 

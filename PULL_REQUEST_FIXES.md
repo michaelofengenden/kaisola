@@ -18,6 +18,22 @@ Large product and architecture work remains ordered in
   continuous in the installed app; row-quantized SwiftTerm scrolling is not
   considered fixed by the repaint/geometry work alone.
 
+### Checkpoint keep-alive ref collisions
+
+- Checkpoint refs are named by stash-commit hash alone
+  (`refs/kaisola/checkpoints/<hash>`, `GitService.checkpoint()`), so two
+  conversations that snapshot an identical tree within the same second mint
+  the same commit and share one ref; whichever conversation ages its
+  checkpoint out first (`dropCheckpointRef`) deletes the ref and strands the
+  other's restore point until git gc actually prunes it. Reproduction: two
+  ACP chats in one project, both send a turn with the same dirty tree inside
+  one second; age one conversation's checkpoint out of the menu; the other's
+  Restore can fail after gc. Fix boundary: name refs by conversation and
+  turn (`refs/kaisola/checkpoints/<conversation>/<turn>-<hash>`) and drop
+  only the owning conversation's ref; regression test covers two owners of
+  one snapshot hash. Found during the 2026-08-04 harvest-blueprint review
+  (`notes/harvest-blueprint-2026-08.md`).
+
 ## Adding a fix
 
 Each confirmed fix should include:

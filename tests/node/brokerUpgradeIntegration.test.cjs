@@ -6,7 +6,7 @@ const crypto = require('node:crypto')
 const fs = require('node:fs')
 const net = require('node:net')
 const path = require('node:path')
-const { spawn } = require('node:child_process')
+const { spawn, spawnSync } = require('node:child_process')
 
 const brokerScript = path.resolve(__dirname, '../../runtime/node-broker/session-broker.cjs')
 const oldDigest = 'a'.repeat(64)
@@ -110,6 +110,11 @@ test('sealed broker identity is published and safe update commit rejects racing 
   const fixture = startBroker()
   t.after(() => {
     try { fixture.child.kill('SIGKILL') } catch {}
+    // SIGKILL gives the broker no chance to reap its PTY children, and the
+    // orphaned spawn-helpers otherwise outlive the test by days. The mkdtemp
+    // root is unique to this fixture, so a full-command-line match kills
+    // exactly its helpers and nothing else.
+    try { spawnSync('/usr/bin/pkill', ['-9', '-f', fixture.root]) } catch {}
     fs.rmSync(fixture.root, { recursive: true, force: true })
   })
   await waitFor(() => fs.existsSync(fixture.config.infoFile), 'broker metadata')
@@ -180,6 +185,11 @@ test('rolling cutover preserves an idle PTY and rejects late activity, input, an
   const fixture = startBroker()
   t.after(() => {
     try { fixture.child.kill('SIGKILL') } catch {}
+    // SIGKILL gives the broker no chance to reap its PTY children, and the
+    // orphaned spawn-helpers otherwise outlive the test by days. The mkdtemp
+    // root is unique to this fixture, so a full-command-line match kills
+    // exactly its helpers and nothing else.
+    try { spawnSync('/usr/bin/pkill', ['-9', '-f', fixture.root]) } catch {}
     fs.rmSync(fixture.root, { recursive: true, force: true })
   })
   await waitFor(() => fs.existsSync(fixture.config.infoFile), 'broker metadata')
@@ -213,7 +223,10 @@ test('rolling cutover preserves an idle PTY and rejects late activity, input, an
     command: '/bin/sh',
     args: [
       '-c',
-      'while [ ! -f "$1" ]; do sleep 0.01; done; printf synthetic-output; sleep 5',
+      // Bounded poll (~60s ceiling): if the test aborts before writing the
+      // trigger file, the watcher exits on its own instead of spinning
+      // forever in an orphaned PTY.
+      'i=0; while [ ! -f "$1" ]; do i=$((i+1)); [ "$i" -gt 6000 ] && exit 1; sleep 0.01; done; printf synthetic-output; sleep 5',
       'kaisola-output-race',
       outputTrigger,
     ],

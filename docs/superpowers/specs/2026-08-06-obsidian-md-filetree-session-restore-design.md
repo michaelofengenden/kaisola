@@ -10,7 +10,9 @@ Three independent workstreams, agreed with Michael on 2026-08-06. They share no 
 
 ### Current state
 
-The rendered Markdown view is already a live editor, not a preview. `MarkdownRenderedEditor` (`native/KaisolaMac/Kaisola/Features/Workspace/FilePreviewEditors.swift`) holds the file's exact bytes in an editable TextKit 1 `NSTextView`, styles them with temporary attributes, paints images from the layout manager, and autosaves after 700 ms of quiet. Byte fidelity is the design's spine: the bytes on screen are the bytes saved.
+The rendered Markdown view is already a live editor, not a preview. `MarkdownRenderedEditor` (`native/KaisolaMac/Kaisola/Features/Workspace/FilePreviewEditors.swift`) holds the file's exact bytes in an editable TextKit 1 `NSTextView`, styles them with real text-storage attributes (attributes are not characters, `isRichText` is false, and an assert enforces that styling never changes the string), paints images from the layout manager, and autosaves after 700 ms of quiet. Byte fidelity is the design's spine: the bytes on screen are the bytes saved.
+
+One constraint discovered in review: the current styling pass (`apply(_:to:)`, around line 1415) resets attributes over the whole document and reapplies every span, on the main actor. That is tolerable at today's debounce cadence but rules out naively restyling on every cursor move.
 
 The gap to Obsidian is one behavior: syntax marks (`##`, `**`, backticks, link URLs, HTML tags) are hidden permanently, rendered as invisible 0.1 pt runs (`MarkdownEditingStyle`, `.syntax` case). Editing a delimiter requires flipping to the raw source editor with the toolbar pencil. Obsidian instead reveals syntax exactly where the cursor is.
 
@@ -20,8 +22,11 @@ Extend the native editor. Do not move Markdown into the CodeMirror 6 webview isl
 
 ### Changes
 
+**1a-pre. Incremental attribute application (prerequisite).**
+Before reveal can exist, the apply pass must become range-scoped: given a set of paragraph ranges, reset and reapply attributes only inside them, reusing the existing off-main-actor scan. The whole-document pass remains only for initial load and width changes. The viewport-anchor save/restore that wraps the full pass runs only when a restyled range's height can actually change (which cursor-driven reveal does cause, since delimiters gain real width). This is an architectural change to the existing editor, not a tweak, and it is what keeps per-cursor-move work bounded by paragraph size rather than document size.
+
 **1a. Cursor-line syntax reveal (the core).**
-The styling pass gains an active range: the paragraph or paragraphs containing the cursor or selection. Syntax spans inside the active range render as visible dimmed marks at normal text size (secondary label color). Everywhere else they stay hidden exactly as today. On selection change, only the paragraphs whose state changed (newly active, newly inactive) are restyled; the pass never re-walks the whole document. The line reflows slightly when marks appear; Obsidian behaves the same way and it is acceptable. The raw source toggle stays as the escape hatch and as the surface for bulk syntax surgery.
+The styling pass gains an active range: the paragraph or paragraphs containing the cursor or selection. Syntax spans inside the active range render as visible dimmed marks at normal text size (secondary label color). Everywhere else they stay hidden exactly as today. On selection change, only the paragraphs whose state changed (newly active, newly inactive) are restyled through the incremental pass from 1a-pre. The line reflows slightly when marks appear; Obsidian behaves the same way and it is acceptable. The raw source toggle stays as the escape hatch and as the surface for bulk syntax surgery.
 
 Reveal also applies to constructs the editor draws over the source: a table row under the cursor shows its raw pipe syntax; a heading under the cursor shows its `#` prefix.
 
@@ -39,11 +44,11 @@ With a selection: Cmd+B toggles `**` wrapping, Cmd+I toggles `*`, Cmd+K wraps as
 
 ### What stays the same
 
-The outline panel, the source toggle, autosave, crash-recovery journaling, external-change reconciliation, table drawing, and the byte-fidelity contract (styling never mutates text storage) all stay as they are.
+The outline panel, the source toggle, autosave, crash-recovery journaling, external-change reconciliation, table drawing, and the byte-fidelity contract (styling touches attributes only, never characters; the existing assert stays) all stay as they are.
 
 ### Performance
 
-The span scanner already runs off the main actor on a debounce. Syntax reveal adds selection-change work bounded by the size of the affected paragraphs, not the document. The wikilink name index is a dictionary rebuilt when the file tree model changes, never on keystroke.
+The span scanner already runs off the main actor on a debounce. The incremental apply pass (1a-pre) is the enforcement mechanism for the performance principle here: after it lands, selection-change work is bounded by the size of the affected paragraphs, not the document, and the whole-document attribute reset survives only for initial load and width changes. The wikilink name index is a dictionary rebuilt when the file tree model changes, never on keystroke. A perf test opens a large document (several megabytes) and asserts that cursor movement does not trigger a full-document styling pass.
 
 ### Testing
 
@@ -93,6 +98,8 @@ At restore, each dormant plain-shell terminal is respawned through the broker at
 
 **3c. Cold scrollback replay.**
 The broker stops destroying prior spools. A respawn for a known terminal id reads the retained spool first and returns it as recovered scrollback, which the terminal view shows above the new session with a clear divider (dimmed, marked as from before the restart). Spools are kept indefinitely and rotated by size generously (disk is free); a size cap exists only to bound single-file read time, not to save space.
+
+Durability change required for this to work across a crash or hard reboot: today the spool keeps a visible terminal's newest output only in RAM (disk flush happens on queue overflow, on hide, and on snapshot in `runtime/node-broker/ipc/terminalSpool.cjs`), so the hot tail dies with the broker. The spool switches to eager appends: output reaches disk on a short debounce (on the order of a second, or a modest byte threshold, whichever comes first) even while the terminal is visible, and the RAM tail becomes purely a read cache. Disk is free; the only loss window after this change is the debounce interval, and only on power loss.
 
 **3d. Working-directory tracking.**
 The broker refreshes each terminal record's cwd from the live process (macOS `proc_pidinfo`-based lookup) whenever it writes its periodic state snapshot, and once more during shutdown flush, so resurrection reopens where the shell actually was, not where it started.

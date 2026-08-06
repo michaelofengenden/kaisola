@@ -6239,6 +6239,10 @@ final class AppModel: ObservableObject {
             terminalDocument.exited = true
             publishTerminalSurfaceDocument(terminalDocument)
             queueCursorPersistence()
+            // A dead shell has nothing to resume into; without this, a
+            // resurrected shell that exits immediately renders the resume
+            // chip and the "Session ended" banner stacked on each other.
+            pendingAgentResume.removeValue(forKey: event.terminalID)
         case .activity:
             break
         }

@@ -955,18 +955,30 @@ struct RootShellView: View {
         )
     }
 
-    /// Recent folders that are real directories and not already open — the
-    /// one-click reopen list behind the ghost row's chevron.
+    /// Recent folders not already open — the one-click reopen list behind the
+    /// ghost row's chevron. Existence is deliberately NOT checked here: this
+    /// recomputes on every body evaluation, and a stat against a sleeping
+    /// network volume would stall the main thread on renders that have
+    /// nothing to do with the sidebar. A dead folder is caught at click time.
     private var addableRecentFolders: [URL] {
         AddableRecentFolders.compute(
             recent: model.recentFolders,
             openProjectPaths: Set(model.projects.compactMap { $0.directory?.standardizedFileURL.path }),
-            isDirectory: { url in
-                var isDirectory: ObjCBool = false
-                return FileManager.default.fileExists(atPath: url.path, isDirectory: &isDirectory)
-                    && isDirectory.boolValue
-            }
+            isDirectory: { _ in true }
         )
+    }
+
+    private func openRecentFolder(_ folder: URL) {
+        var isDirectory: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: folder.path, isDirectory: &isDirectory),
+              isDirectory.boolValue else {
+            ToastCenter.shared.show(
+                "\(folder.lastPathComponent) is no longer there.",
+                style: .error
+            )
+            return
+        }
+        model.openProject(directory: folder)
     }
 
     /// The rail's only standing invitation: a quiet "+ Add Project" row at the
@@ -977,7 +989,7 @@ struct RootShellView: View {
         Menu {
             ForEach(addableRecentFolders, id: \.self) { folder in
                 Button(folder.lastPathComponent) {
-                    model.openProject(directory: folder)
+                    openRecentFolder(folder)
                 }
                 .help(folder.path)
             }
@@ -1005,9 +1017,13 @@ struct RootShellView: View {
         } primaryAction: {
             Self.promptForOpenFolder(model: model)
         }
-        .menuStyle(.borderlessButton)
+        // Default menu style, deliberately: `.borderlessButton` opens the
+        // menu on any press and never honors the primaryAction split, which
+        // would put an extra click on every mouse-driven add. The default
+        // style fires primaryAction on click and keeps the indicator as the
+        // visible doorway to recent folders.
         .buttonStyle(.plain)
-        .help("Add a project folder (⌘O); hold for recent folders")
+        .help("Add a project folder (⌘O); the chevron holds recent folders")
         .accessibilityLabel("Add Project")
     }
 
@@ -2323,7 +2339,11 @@ struct RootShellView: View {
                     fulfillTerminalKeyboardFocusRequest(for: id)
                 }
 
-                if let agentID = model.pendingAgentResume[id] {
+                // Never alongside the "Session ended" banner: both are
+                // top-center capsules in this ZStack, and a resurrected shell
+                // that exits immediately would otherwise stack them.
+                if let agentID = model.pendingAgentResume[id],
+                   unifiedTerminalDocument(id)?.exited != true {
                     agentResumeChip(id, agentID: agentID)
                 }
                 terminalLifecycleOverlay(id)

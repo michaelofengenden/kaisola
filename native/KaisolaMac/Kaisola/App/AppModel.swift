@@ -2142,18 +2142,35 @@ final class AppModel: ObservableObject {
         var seen = Set<String>()
 
         for terminalID in layout.sessionIDs {
-            guard let terminal = sessions.first(where: { $0.id == terminalID }),
-                  displayProjectID(terminal) == projectID,
-                  seen.insert(terminalID).inserted else { continue }
-            panes.append(NativeRestorablePaneState(
-                id: terminalID,
-                surface: NativeRestorableSurfaceState(
-                    kind: .terminal,
+            if let terminal = sessions.first(where: { $0.id == terminalID }),
+               displayProjectID(terminal) == projectID {
+                guard seen.insert(terminalID).inserted else { continue }
+                panes.append(NativeRestorablePaneState(
                     id: terminalID,
-                    projectID: projectID,
-                    title: sessionTitle(for: terminal)
-                )
-            ))
+                    surface: NativeRestorableSurfaceState(
+                        kind: .terminal,
+                        id: terminalID,
+                        projectID: projectID,
+                        title: sessionTitle(for: terminal)
+                    )
+                ))
+            } else if dormantTerminalIDs.contains(terminalID),
+                      let stored = persistedOwnedSessions.first(where: { $0.id == terminalID }),
+                      stored.projectID == projectID {
+                // A dormant terminal is not in live inventory, but its pane is
+                // a resurrection target — dropping it here is how panes used
+                // to be erased forever on the first save after a reboot.
+                guard seen.insert(terminalID).inserted else { continue }
+                panes.append(NativeRestorablePaneState(
+                    id: terminalID,
+                    surface: NativeRestorableSurfaceState(
+                        kind: .terminal,
+                        id: terminalID,
+                        projectID: projectID,
+                        title: stored.title
+                    )
+                ))
+            }
         }
 
         // A hidden chat remains a restorable sidebar session; closing it is the
@@ -4720,7 +4737,8 @@ final class AppModel: ObservableObject {
         draftRestoreSeed: TerminalDraftResumeSeed? = nil,
         terminalIDOverride: String? = nil,
         restore: Bool = false,
-        select: Bool = true
+        select: Bool = true,
+        environmentBinding: SessionAccountBinding? = nil
     ) async -> String? {
         guard controlAvailable else {
             // Never fail silently: say WHY sessions can't be created here.
@@ -4772,6 +4790,14 @@ final class AppModel: ObservableObject {
                 accountBinding = resolved
             }
             overlay = SessionAccountBinding.applying(accountBinding, to: overlay)
+        } else if let environmentBinding = environmentBinding?.normalized {
+            // A resurrected agent terminal boots as a plain shell (the resume
+            // chip is the launch gate), but its saved account environment
+            // must already be in place — otherwise the chip's resume command
+            // would run under the default account, the exact hazard the chip
+            // guards against.
+            accountBinding = environmentBinding
+            overlay = SessionAccountBinding.applying(environmentBinding, to: overlay)
         } else {
             accountBinding = nil
         }
@@ -5825,7 +5851,8 @@ final class AppModel: ObservableObject {
                 titleOverride: stored.title,
                 terminalIDOverride: stored.id,
                 restore: true,
-                select: false
+                select: false,
+                environmentBinding: stored.agentID != nil ? stored.accountBinding : nil
             )
             guard created == stored.id else { continue }
             dormantTerminalIDs.remove(stored.id)

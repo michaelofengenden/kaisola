@@ -998,6 +998,10 @@ struct MarkdownDocumentView: View {
     /// rendered document used: project files open in Kaisola, external schemes
     /// go to the system browser, everything else is refused.
     private func open(_ link: URL) {
+        if link.scheme == MarkdownLinkTargets.wikiScheme {
+            openWikilink(link)
+            return
+        }
         switch WorkspacePreviewLinkPolicy.decision(
             for: link,
             documentURL: documentURL,
@@ -1020,6 +1024,27 @@ struct MarkdownDocumentView: View {
         case .blocked:
             onError(
                 "Kaisola blocked a Markdown link outside this project or using an unsupported scheme."
+            )
+        }
+    }
+
+    /// `[[name]]` resolves against the project's cached file list (30s TTL,
+    /// invalidation-aware) at click time — never during styling, so typing
+    /// and cursor movement pay nothing for wikilinks. An unresolvable name
+    /// is inert.
+    private func openWikilink(_ link: URL) {
+        let name = String(link.path.dropFirst()).removingPercentEncoding
+            ?? String(link.path.dropFirst())
+        let root = workspaceRoot ?? documentURL.deletingLastPathComponent()
+        Task { @MainActor in
+            let files = await ProjectFileIndex.shared.files(for: root)
+            guard let target = WikilinkResolver.resolve(name, inFiles: files, root: root) else {
+                return
+            }
+            NotificationCenter.default.post(
+                name: .kaisolaOpenFileLink,
+                object: nil,
+                userInfo: ["url": target, "workspaceHint": root]
             )
         }
     }

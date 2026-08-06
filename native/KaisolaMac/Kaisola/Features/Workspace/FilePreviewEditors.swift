@@ -139,6 +139,21 @@ struct MarkdownEditingStyle: Sendable {
         collect(#"(?<!\*)(\*)([^*\n]+)(\*)(?!\*)"#, role: { _ in .italic }, contentGroup: 2, syntaxGroups: [1, 3])
         collect(#"(?<!_)(_)([^_\n]+)(_)(?!_)"#, role: { _ in .italic }, contentGroup: 2, syntaxGroups: [1, 3])
         collect(#"(`)([^`\n]+)(`)"#, role: { _ in .inlineCode }, contentGroup: 2, syntaxGroups: [1, 3])
+        // Wikilinks: the name reads as a link, the double brackets collapse
+        // like any other syntax until the cursor's line reveals them.
+        collect(
+            #"(\[\[)([^\[\]\r\n]+)(\]\])"#,
+            role: { _ in .link },
+            contentGroup: 2,
+            syntaxGroups: [1, 3]
+        )
+        // Task markers: the bracket group reads as a control (click toggles it
+        // via MarkdownTaskToggle); accent + semibold matches list markers.
+        collect(
+            #"(?m)^[ \t]*(?:[-*+])[ \t]+(\[(?: |x|X)\])(?=[ \t])"#,
+            role: { _ in .listMarker },
+            contentGroup: 1
+        )
         collect(
             #"(!?\[)([^]\r\n]+)(\]\()([^)\r\n]+)(\))"#,
             role: { _ in .link },
@@ -278,13 +293,55 @@ struct MarkdownEditingStyle: Sendable {
         case .syntax:
             // The document reads like prose: syntax occupies an effectively
             // zero-width run while the source stays exact underneath. The
-            // toolbar's source toggle is the explicit escape hatch for editing
-            // delimiters and HTML attributes.
+            // cursor's paragraph reveals its marks (see `attributes(for:revealed:)`);
+            // the toolbar's source toggle remains for bulk syntax surgery.
             return [
                 .font: NSFont.systemFont(ofSize: 0.1),
                 .foregroundColor: NSColor.clear,
             ]
         }
+    }
+
+    /// Role attributes with cursor-line reveal. Only `.syntax` changes:
+    /// revealed marks render dimmed at near-body size so the line under the
+    /// cursor reads as editable Markdown, Obsidian-style, while every other
+    /// paragraph keeps its marks collapsed.
+    static func attributes(for role: Role, revealed: Bool) -> [NSAttributedString.Key: Any] {
+        guard revealed, role == .syntax else { return attributes(for: role) }
+        return [
+            .font: NSFont.systemFont(ofSize: max(11, bodySize * 0.85)),
+            .foregroundColor: NSColor.tertiaryLabelColor,
+        ]
+    }
+}
+
+/// Range arithmetic for the incremental style pass: a changed paragraph that
+/// touches a table grows to cover the whole table region (its geometry is
+/// measured as a unit), and overlapping results merge so a range is never
+/// painted twice in one pass.
+enum MarkdownIncrementalStyle {
+    static func rangesToRestyle(
+        changed: [NSRange],
+        tables: [MarkdownTableRegion],
+        in source: NSString
+    ) -> [NSRange] {
+        var extended = changed.map { range in
+            tables.reduce(range) { widened, table in
+                NSIntersectionRange(widened, table.range).length > 0
+                    ? NSUnionRange(widened, table.range)
+                    : widened
+            }
+        }
+        extended.sort { $0.location < $1.location }
+        var merged: [NSRange] = []
+        for range in extended {
+            if let last = merged.last, NSMaxRange(last) >= range.location {
+                merged[merged.count - 1] = NSUnionRange(last, range)
+            } else {
+                merged.append(range)
+            }
+        }
+        return merged
     }
 }
 
@@ -309,9 +366,14 @@ struct MarkdownLiveStyleScan: Sendable {
 /// storage, so the destination is read back out of the source instead — which
 /// also means the link the user follows is literally the link in the file.
 enum MarkdownLinkTargets {
+    private static let wikiPattern = #"\[\[([^\[\]\r\n]+)\]\]"#
     private static let inlinePattern = #"(!?)\[([^\]\r\n]*)\]\(\s*<?([^)\s>]+)>?(?:\s+"[^"\r\n]*")?\s*\)"#
     private static let anchorPattern = #"(?i)<a\b[^>]*\bhref\s*=\s*["']([^"']+)["'][^>]*>.*?</a\s*>"#
     private static let barePattern = #"(?i)\bhttps?://[^\s<>()\[\]"']+"#
+
+    /// The scheme wikilink destinations travel under: the name rides in the
+    /// URL path so case and spaces survive the round trip.
+    static let wikiScheme = "kaisola-wiki"
 
     static func destination(at characterIndex: Int, in source: String) -> String? {
         let nsSource = source as NSString
@@ -325,7 +387,7 @@ enum MarkdownLinkTargets {
         let text = nsSource.substring(with: paragraph)
         let range = NSRange(location: 0, length: (text as NSString).length)
 
-        for (pattern, group) in [(inlinePattern, 3), (anchorPattern, 1), (barePattern, 0)] {
+        for (pattern, group) in [(wikiPattern, 1), (inlinePattern, 3), (anchorPattern, 1), (barePattern, 0)] {
             guard let expression = try? NSRegularExpression(
                 pattern: pattern,
                 options: [.dotMatchesLineSeparators]
@@ -338,6 +400,12 @@ enum MarkdownLinkTargets {
                 if pattern == inlinePattern,
                    (text as NSString).substring(with: match.range(at: 1)) == "!" { continue }
                 let destination = (text as NSString).substring(with: match.range(at: group))
+                if pattern == wikiPattern {
+                    let encoded = destination.addingPercentEncoding(
+                        withAllowedCharacters: .urlPathAllowed
+                    ) ?? destination
+                    return wikiScheme + ":/" + encoded
+                }
                 if !destination.isEmpty { return destination }
             }
         }
@@ -1198,6 +1266,20 @@ struct MarkdownRenderedEditor: NSViewRepresentable {
         /// Guards the attribute pass so a restyle cannot be mistaken for a user
         /// edit and start the save/journal machinery.
         private var isApplyingStyle = false
+
+        /// The paragraphs currently revealing their syntax marks, and the scan
+        /// the last styling pass painted from. A selection change diffs the
+        /// state and repaints only the changed paragraphs through the cached
+        /// scan; the next debounced full pass replaces the cache.
+        var revealState: MarkdownRevealState = .none
+        private var lastScan: MarkdownLiveStyleScan?
+
+        private func revealed(_ span: MarkdownEditingStyle.Span) -> Bool {
+            guard span.role == .syntax else { return false }
+            return revealState.activeParagraphs.contains {
+                NSIntersectionRange($0, span.range).length > 0
+            }
+        }
         private var styleTask: Task<Void, Never>?
         /// Container width the current grid was measured against.
         private var styledWidth: CGFloat?
@@ -1332,8 +1414,27 @@ struct MarkdownRenderedEditor: NSViewRepresentable {
             guard !isApplyingExternalValue, !isApplyingStyle,
                   let textView = notification.object as? MarkdownNativeTextView else { return }
             text = textView.string
+            // The cached scan's offsets are stale the moment the text changes;
+            // reveal pauses until the debounced rescan lands rather than paint
+            // old spans at shifted positions.
+            lastScan = nil
             scheduleStyling(immediately: false)
             scheduleImageRefresh()
+        }
+
+        func textViewDidChangeSelection(_ notification: Notification) {
+            guard !isApplyingStyle, !isApplyingExternalValue,
+                  let textView,
+                  notification.object as? NSTextView === textView else { return }
+            let new = MarkdownRevealState.compute(
+                selection: textView.selectedRange(),
+                in: textView.string as NSString
+            )
+            guard new != revealState else { return }
+            let changed = MarkdownRevealState.changedRanges(from: revealState, to: new)
+            revealState = new
+            guard let lastScan, !changed.isEmpty else { return }
+            apply(lastScan, to: textView, limitedTo: changed)
         }
 
         /// `revision` is what makes clicking the same outline row twice work:
@@ -1412,17 +1513,42 @@ struct MarkdownRenderedEditor: NSViewRepresentable {
         /// characters: `textView.string` is untouched, and the save path writes
         /// that string. The text view is also `isRichText = false`, so styling
         /// can never be typed, pasted, or copied out of the document either.
-        private func apply(_ scan: MarkdownLiveStyleScan, to textView: NSTextView) {
+        private func apply(
+            _ scan: MarkdownLiveStyleScan,
+            to textView: NSTextView,
+            limitedTo ranges: [NSRange]? = nil
+        ) {
             guard let storage = textView.textStorage else { return }
             let fullRange = NSRange(location: 0, length: storage.length)
             guard fullRange.length > 0 else { return }
+
+            // A limited pass repaints only the given paragraph ranges — the
+            // cursor-reveal path — widened to whole table regions where they
+            // intersect one, so per-cursor-move cost is bounded by paragraph
+            // (or table) size, never document size.
+            let targets: [NSRange]
+            if let ranges {
+                let clamped = ranges
+                    .map { NSIntersectionRange($0, fullRange) }
+                    .filter { $0.length > 0 }
+                guard !clamped.isEmpty else { return }
+                targets = MarkdownIncrementalStyle.rangesToRestyle(
+                    changed: clamped,
+                    tables: scan.tables,
+                    in: storage.string as NSString
+                )
+            } else {
+                targets = [fullRange]
+            }
+            lastScan = scan
 
             // Typography changes the document's height, so pin the character at
             // the top of the viewport and put it back afterwards rather than
             // letting the scroll view keep a now-meaningless pixel offset. A
             // replacement that is still waiting for its real height hands its
             // own anchor over here, because the one this view can read now was
-            // measured against unstyled text.
+            // measured against unstyled text. Reveal changes heights too, so
+            // limited passes anchor the same way.
             let anchor = pendingAnchor ?? viewportAnchor()
             let restoringReplacement = pendingAnchor != nil
             pendingAnchor = nil
@@ -1432,36 +1558,57 @@ struct MarkdownRenderedEditor: NSViewRepresentable {
 
             isApplyingStyle = true
             storage.beginEditing()
-            storage.setAttributes(MarkdownEditingStyle.baseAttributes, range: fullRange)
-            // Table rows take their base face first so a cell's own emphasis,
-            // link, or inline code still wins over it.
-            MarkdownTableStyler.applyTypography(
-                regions: scan.tables,
-                thematicBreaks: scan.thematicBreaks,
-                to: storage
-            )
-            for span in scan.spans where NSMaxRange(span.range) <= fullRange.length {
-                storage.addAttributes(
-                    MarkdownEditingStyle.attributes(for: span.role),
-                    range: span.range
-                )
+            var touchedTables = ranges == nil && !scan.tables.isEmpty
+            for target in targets {
+                storage.setAttributes(MarkdownEditingStyle.baseAttributes, range: target)
+                // Table rows take their base face first so a cell's own emphasis,
+                // link, or inline code still wins over it.
+                let regions = scan.tables.filter {
+                    NSIntersectionRange($0.range, target).length > 0
+                }
+                if !regions.isEmpty {
+                    touchedTables = true
+                    MarkdownTableStyler.applyTypography(
+                        regions: regions,
+                        thematicBreaks: scan.thematicBreaks,
+                        to: storage
+                    )
+                }
+                for span in scan.spans where NSMaxRange(span.range) <= fullRange.length {
+                    let paint = NSIntersectionRange(span.range, target)
+                    guard paint.length > 0 else { continue }
+                    storage.addAttributes(
+                        MarkdownEditingStyle.attributes(
+                            for: span.role,
+                            revealed: revealed(span)
+                        ),
+                        range: paint
+                    )
+                }
             }
             // ...and the grid is measured last, against what the storage
             // actually resolved to, so a cell with collapsed delimiters still
-            // lands on its column.
-            let decorations = MarkdownTableStyler.applyGeometry(
-                regions: scan.tables,
-                thematicBreaks: scan.thematicBreaks,
-                to: storage,
-                availableWidth: width
-            )
+            // lands on its column. Decorations are recomputed whenever any
+            // table was repainted (they are a whole-document set); a limited
+            // pass that touched no table leaves them untouched.
+            var decorations: [MarkdownInlineImageLayoutManager.Decoration] = []
+            if touchedTables || ranges == nil {
+                decorations = MarkdownTableStyler.applyGeometry(
+                    regions: scan.tables,
+                    thematicBreaks: scan.thematicBreaks,
+                    to: storage,
+                    availableWidth: width
+                )
+            }
             storage.endEditing()
             isApplyingStyle = false
 
-            (textView.layoutManager as? MarkdownInlineImageLayoutManager)?
-                .setDecorations(decorations)
-            if !decorations.isEmpty || !scan.tables.isEmpty {
-                textView.needsDisplay = true
+            if touchedTables || ranges == nil {
+                (textView.layoutManager as? MarkdownInlineImageLayoutManager)?
+                    .setDecorations(decorations)
+                if !decorations.isEmpty || !scan.tables.isEmpty {
+                    textView.needsDisplay = true
+                }
             }
 
             // A styling pass must never be able to change the document.
@@ -1903,11 +2050,76 @@ final class MarkdownNativeTextView: NSTextView {
 
     override func mouseDown(with event: NSEvent) {
         guard onFollowLink != nil, event.modifierFlags.contains(.command) else {
+            // A plain click inside a task marker's brackets toggles it; the
+            // rest of the line still just places the caret. The toggle rides
+            // the normal insertText path, so undo and autosave see one typed
+            // character.
+            if event.clickCount == 1, !event.modifierFlags.contains(.command) {
+                let point = convert(event.locationInWindow, from: nil)
+                let source = string as NSString
+                let index = min(characterIndexForInsertion(at: point), source.length)
+                if MarkdownTaskToggle.bracketGroupContains(index, in: source),
+                   let edit = MarkdownTaskToggle.toggleRange(at: index, in: source) {
+                    insertText(edit.replacement, replacementRange: edit.range)
+                    return
+                }
+            }
             super.mouseDown(with: event)
             return
         }
         let point = convert(event.locationInWindow, from: nil)
         onFollowLink?(min(characterIndexForInsertion(at: point), (string as NSString).length))
+    }
+
+    override func insertTab(_ sender: Any?) {
+        if applyListIndent(.indent) { return }
+        super.insertTab(sender)
+    }
+
+    override func insertBacktab(_ sender: Any?) {
+        if applyListIndent(.outdent) { return }
+        super.insertBacktab(sender)
+    }
+
+    private func applyListIndent(_ direction: MarkdownListIndent.Direction) -> Bool {
+        let selection = selectedRange()
+        guard selection.length == 0 else { return false }
+        let source = string as NSString
+        let paragraph = source.paragraphRange(for: selection)
+        guard let edit = MarkdownListIndent.edit(
+            for: source, paragraph: paragraph, direction: direction
+        ) else { return false }
+        insertText(edit.replacement, replacementRange: edit.range)
+        renumberOrderedBlock(around: paragraph.location)
+        return true
+    }
+
+    private func renumberOrderedBlock(around location: Int) {
+        let source = string as NSString
+        guard source.length > 0,
+              let block = MarkdownListIndent.orderedBlock(
+                  containing: min(location, source.length - 1), in: source
+              ) else { return }
+        for edit in MarkdownListIndent.renumber(block: block, in: source) {
+            insertText(edit.replacement, replacementRange: edit.range)
+        }
+    }
+
+    override func performKeyEquivalent(with event: NSEvent) -> Bool {
+        // Every view in the window is asked about key equivalents; only act
+        // when this editor actually holds focus, or Cmd+B in a terminal pane
+        // would bold-toggle a background document.
+        if window?.firstResponder === self,
+           event.modifierFlags.intersection(.deviceIndependentFlagsMask) == .command,
+           let key = event.charactersIgnoringModifiers?.lowercased() {
+            switch key {
+            case "b": formatBold(nil); return true
+            case "i": formatItalic(nil); return true
+            case "k": formatLink(nil); return true
+            default: break
+            }
+        }
+        return super.performKeyEquivalent(with: event)
     }
 
     override func insertNewline(_ sender: Any?) {
@@ -1952,11 +2164,26 @@ final class MarkdownNativeTextView: NSTextView {
 
     override func paste(_ sender: Any?) {
         let imports = MarkdownPasteboardReader.imports(from: .general)
-        guard !imports.isEmpty else {
-            super.paste(sender)
+        guard imports.isEmpty else {
+            onImageImports?(imports, selectedRange())
             return
         }
-        onImageImports?(imports, selectedRange())
+        // A bare URL pasted over a selection becomes the selection's link
+        // destination instead of replacing the words.
+        let selection = selectedRange()
+        if selection.length > 0,
+           let candidate = NSPasteboard.general.string(forType: .string),
+           let url = MarkdownInlineFormatting.pastedURL(from: candidate),
+           let result = MarkdownInlineFormatting.linkEdit(
+               selection: selection, url: url, in: string as NSString
+           ) {
+            for edit in result.edits {
+                insertText(edit.1, replacementRange: edit.0)
+            }
+            setSelectedRange(result.newSelection)
+            return
+        }
+        super.paste(sender)
     }
 
     override func draggingEntered(_ sender: any NSDraggingInfo) -> NSDragOperation {
@@ -1993,11 +2220,27 @@ final class MarkdownNativeTextView: NSTextView {
     }
 
     @objc private func formatBold(_ sender: Any?) {
-        wrapSelection(prefix: "**", suffix: "**", placeholder: "bold text")
+        toggleWrapOrPlaceholder("**", placeholder: "bold text")
     }
 
     @objc private func formatItalic(_ sender: Any?) {
-        wrapSelection(prefix: "*", suffix: "*", placeholder: "italic text")
+        toggleWrapOrPlaceholder("*", placeholder: "italic text")
+    }
+
+    /// Cmd+B on an already-bold selection unwraps it; a collapsed selection
+    /// falls back to the placeholder insertion the context menu always did.
+    private func toggleWrapOrPlaceholder(_ delimiter: String, placeholder: String) {
+        let selection = selectedRange()
+        if let result = MarkdownInlineFormatting.toggleWrap(
+            delimiter, selection: selection, in: string as NSString
+        ) {
+            for edit in result.edits {
+                insertText(edit.1, replacementRange: edit.0)
+            }
+            setSelectedRange(result.newSelection)
+            return
+        }
+        wrapSelection(prefix: delimiter, suffix: delimiter, placeholder: placeholder)
     }
 
     @objc private func formatInlineCode(_ sender: Any?) {

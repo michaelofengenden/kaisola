@@ -84,7 +84,9 @@ actor AcpTranscriptStore {
         case invalidSnapshot
     }
 
-    static let maximumChatCount = 40
+    /// Disk is deliberately cheap to spend (2026-08-06 spec): retention is
+    /// generous, and eviction stays oldest-first purely as a sanity bound.
+    static let maximumChatCount = 1_000
     static let maximumPageSize = 500
     static let maximumDraftBytes = 256 * 1_024
     static let maximumAttachmentCount = 8

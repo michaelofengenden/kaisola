@@ -417,7 +417,8 @@ private actor RoutingControlClient: BrokerControlServing {
         arguments: [String],
         cwd: String,
         columns: Int,
-        rows: Int
+        rows: Int,
+        restore: Bool
     ) async throws -> TerminalCreation {
         recordedCalls.append("create:\(terminalID)")
         return TerminalCreation(

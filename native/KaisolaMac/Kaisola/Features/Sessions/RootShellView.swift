@@ -2235,6 +2235,43 @@ struct RootShellView: View {
 
     /// A terminal card always owns exactly one SwiftTerm representable keyed by
     /// the card's stable session id. Broker focus may swap a session between the
+    /// A resurrected terminal that was running an agent CLI before the
+    /// restart: one click resumes it, one click dismisses. Never auto-run —
+    /// usage cost and account binding are the user's call (2026-08-06 spec §3).
+    private func agentResumeChip(_ id: String, agentID: String) -> some View {
+        let agent = AgentRegistry.all.first { $0.id == agentID }
+        let command = agent?.resumeCommand ?? "resume"
+        return HStack(spacing: 8) {
+            Image(systemName: "arrow.counterclockwise.circle.fill")
+                .foregroundStyle(Color.accentColor)
+            Text("Resume \(agent?.name ?? agentID)")
+                .fontWeight(.semibold)
+            Text(command)
+                .font(.caption.monospaced())
+                .foregroundStyle(.secondary)
+            Button {
+                Task { await model.runPendingAgentResume(for: id) }
+            } label: {
+                Text("Run").fontWeight(.semibold)
+            }
+            .buttonStyle(.borderedProminent)
+            .controlSize(.small)
+            Button {
+                model.dismissPendingAgentResume(for: id)
+            } label: {
+                Image(systemName: "xmark")
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel("Dismiss resume suggestion")
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 7)
+        .background(.regularMaterial, in: Capsule())
+        .overlay(Capsule().stroke(Color.primary.opacity(0.1), lineWidth: 0.8))
+        .padding(.top, 10)
+        .help("This terminal was running \(agent?.name ?? agentID) before the restart. Run resumes the conversation; dismiss keeps the plain shell.")
+    }
+
     /// primary and secondary subscription lanes, but that no longer swaps the
     /// SwiftUI subtree (the source of the old white flash and ANSI replay).
     @ViewBuilder
@@ -2280,6 +2317,9 @@ struct RootShellView: View {
                     fulfillTerminalKeyboardFocusRequest(for: id)
                 }
 
+                if let agentID = model.pendingAgentResume[id] {
+                    agentResumeChip(id, agentID: agentID)
+                }
                 terminalLifecycleOverlay(id)
             }
         } else {

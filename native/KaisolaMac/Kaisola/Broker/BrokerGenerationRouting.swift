@@ -356,7 +356,8 @@ actor BrokerGenerationControlRouter: BrokerControlServing {
         arguments: [String],
         cwd: String,
         columns: Int,
-        rows: Int
+        rows: Int,
+        restore: Bool
     ) async throws -> TerminalCreation {
         let current = try await routes.currentGenerationID()
         guard let client = clients[current] else { throw BrokerClientError.notConnected }
@@ -367,7 +368,8 @@ actor BrokerGenerationControlRouter: BrokerControlServing {
             arguments: arguments,
             cwd: cwd,
             columns: columns,
-            rows: rows
+            rows: rows,
+            restore: restore
         )
         try await routes.noteCreated(terminalID: terminalID)
         return created

@@ -143,6 +143,9 @@ struct BrokerTerminalRecord: Identifiable, Equatable, Hashable, Sendable {
     /// broker inventory and never accepted from the wire payload itself.
     let brokerGenerationID: String?
     let brokerPersistenceIdentity: String?
+    /// The shell's live working directory as tracked by the broker (refreshed
+    /// on its snapshot cadence). Resurrection reopens here after a reboot.
+    var cwd: String?
     var agentActivity: AgentActivity
 
     var title: String {
@@ -179,6 +182,7 @@ struct BrokerTerminalRecord: Identifiable, Equatable, Hashable, Sendable {
         self.lastOwnerInstanceID = Self.instanceID(from: lastOwner)
         self.brokerGenerationID = nil
         self.brokerPersistenceIdentity = nil
+        self.cwd = (live?["cwd"] ?? object["cwd"])?.stringValue
         let busy = (live?["agentBusy"] ?? object["agentBusy"])?.boolValue ?? false
         if busy {
             self.agentActivity = .working
@@ -226,7 +230,7 @@ struct BrokerTerminalRecord: Identifiable, Equatable, Hashable, Sendable {
     }
 
     func routed(to generation: BrokerGenerationRecord) -> BrokerTerminalRecord {
-        BrokerTerminalRecord(
+        var record = BrokerTerminalRecord(
             id: id,
             projectID: projectID,
             pid: pid,
@@ -244,6 +248,8 @@ struct BrokerTerminalRecord: Identifiable, Equatable, Hashable, Sendable {
             brokerPersistenceIdentity: generation.info.persistenceIdentity,
             agentActivity: agentActivity
         )
+        record.cwd = cwd
+        return record
     }
 
     func wasOwned(by stableOwnerID: String) -> Bool {

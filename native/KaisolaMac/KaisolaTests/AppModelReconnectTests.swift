@@ -820,7 +820,8 @@ private actor RecordingBrokerControlClient: BrokerControlServing {
         arguments: [String],
         cwd: String,
         columns: Int,
-        rows: Int
+        rows: Int,
+        restore: Bool
     ) async throws -> TerminalCreation {
         TerminalCreation(
             terminalID: terminalID,

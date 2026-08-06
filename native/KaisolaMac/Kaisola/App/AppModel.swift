@@ -104,6 +104,14 @@ final class AppModel: ObservableObject {
     /// Terminals this app created and may mutate. Everything else stays
     /// strictly observed no matter what the UI asks for.
     @Published private(set) var ownedTerminalIDs: Set<String> = []
+    /// Persisted terminals the broker no longer holds (a reboot or broker
+    /// death took their PTYs). Their panes survive layout normalization and
+    /// `resurrectDormantTerminals()` respawns them at their recorded cwd.
+    @Published private(set) var dormantTerminalIDs: Set<String> = []
+    /// Resurrected terminals that were running an agent CLI: the pane shows a
+    /// one-keystroke resume chip instead of auto-running the agent (usage cost
+    /// and account binding are the user's call).
+    @Published private(set) var pendingAgentResume: [String: String] = [:]
     /// Whether the connected broker accepted a controller connection; older
     /// brokers stay observe-only and hide every mutation affordance.
     @Published private(set) var controlAvailable = false
@@ -1142,10 +1150,13 @@ final class AppModel: ObservableObject {
     ) -> Bool {
         guard var layout = paneLayouts[projectID] else { return false }
         let previous = layout
+        // Dormant terminals stay: their PTYs died with the broker, but the
+        // panes are resurrection targets, not garbage.
         let available = Set(
             sessions.lazy.filter { self.displayProjectID($0) == projectID }.map(\.id)
         ).union(chats(in: projectID).map(\.id))
             .union(meshes(in: projectID).map(\.id))
+            .union(dormantTerminalIDs)
         layout.normalize(availableSessionIDs: available)
         guard layout != previous else { return false }
 
@@ -2761,10 +2772,15 @@ final class AppModel: ObservableObject {
 
             var layout = projectState.layout
             if connectionState.isConnected {
+                // Dormant terminals (persisted records the broker no longer
+                // holds — a reboot killed their PTYs) stay in the layout so a
+                // later resurrection revives the same pane instead of the next
+                // state save erasing it forever.
                 let available = Set(
                     sessions.lazy.filter { $0.projectID == projectState.projectID }.map(\.id)
                 ).union(chats(in: projectState.projectID).map(\.id))
                     .union(meshes(in: projectState.projectID).map(\.id))
+                    .union(dormantTerminalIDs)
                 layout.normalize(availableSessionIDs: available)
             } else {
                 layout.normalize()
@@ -4204,6 +4220,11 @@ final class AppModel: ObservableObject {
         await restoreWorkspaceStateIfNeeded()
         await restoreTerminalDraftTrackers()
         if connected {
+            // Resurrection never blocks launch: the restored UI (including
+            // dormant panes) is already up; shells come back concurrently.
+            Task { [weak self] in await self?.resurrectDormantTerminals() }
+        }
+        if connected {
             await restoreVisibleSecondarySubscriptions(
                 expectedConnectionGeneration: generation
             )
@@ -4696,7 +4717,10 @@ final class AppModel: ObservableObject {
         lockedAccountBinding: SessionAccountBinding? = nil,
         resumeAgent: Bool = false,
         titleOverride: String? = nil,
-        draftRestoreSeed: TerminalDraftResumeSeed? = nil
+        draftRestoreSeed: TerminalDraftResumeSeed? = nil,
+        terminalIDOverride: String? = nil,
+        restore: Bool = false,
+        select: Bool = true
     ) async -> String? {
         guard controlAvailable else {
             // Never fail silently: say WHY sessions can't be created here.
@@ -4710,7 +4734,8 @@ final class AppModel: ObservableObject {
         }
         let cwd = directory.path
         let projectID = NativeSessionStore.projectID(forDirectory: cwd)
-        let terminalID = NativeSessionStore.terminalID(projectID: projectID)
+        let terminalID = terminalIDOverride
+            ?? NativeSessionStore.terminalID(projectID: projectID)
         let userShell = NativeTerminalLaunchEnvironment.resolvedShell(
             environment: ProcessInfo.processInfo.environment
         )
@@ -4810,7 +4835,8 @@ final class AppModel: ObservableObject {
                 arguments: arguments,
                 cwd: cwd,
                 columns: 100,
-                rows: 30
+                rows: 30,
+                restore: restore
             )
             let folder = (cwd as NSString).lastPathComponent
             let requestedTitle = titleOverride?.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -4844,7 +4870,9 @@ final class AppModel: ObservableObject {
                 endOffset: 0,
                 currentOwnerID: observerOwnerID
             ))
-            await select(terminalID)
+            if select {
+                await self.select(terminalID)
+            }
             if resumeAgent, agent?.resumeCommand != nil, let draftRestoreSeed,
                NativePreviewSettings.shared.restoreCLIDrafts {
                 terminalDraftTrackers[terminalID] = TerminalAgentDraftTracker(
@@ -5518,6 +5546,7 @@ final class AppModel: ObservableObject {
                 notifyInventoryCompletions(previous: sessions, next: status.terminals)
                 sessions = status.terminals
                 reconcileAllPaneLayoutsWithAvailableSurfaces()
+                syncTrackedWorkingDirectories()
             }
             let emptyDrains = await client.detachEmptyDrainingGenerations()
             if !emptyDrains.isEmpty {
@@ -5707,10 +5736,14 @@ final class AppModel: ObservableObject {
         sessionStore.recoverOwnedSessions(from: sessions)
         refreshPersistedNavigationState(publish: false)
         var owned: Set<String> = []
+        var dormant: Set<String> = []
         for stored in persistedOwnedSessions {
             guard let record = sessions.first(where: { $0.id == stored.id }) else {
                 // This record may belong to the other broker in a dual-broker
-                // drain. Absence from the current inventory is not deletion.
+                // drain. Absence from the current inventory is not deletion —
+                // the pane goes dormant, survives layout normalization, and is
+                // a resurrection candidate once the upgrade state is settled.
+                dormant.insert(stored.id)
                 continue
             }
             if record.exited {
@@ -5725,12 +5758,112 @@ final class AppModel: ObservableObject {
             }
         }
         ownedTerminalIDs = owned
+        dormantTerminalIDs = dormant
         // Layout may have reported its real size while inventory was visible
         // but before ownership finished restoring. Those callbacks are retained
         // above; ownership publication is the level-triggered flush point.
         for terminalID in owned {
             scheduleDesiredTerminalResize(terminalID, force: true)
         }
+    }
+
+    /// The broker's tracked cwd (refreshed as shells `cd` around) flows back
+    /// into the app's persisted records, so a resurrection after the NEXT
+    /// reboot reopens where the shell actually was, not where it started.
+    private func syncTrackedWorkingDirectories() {
+        var changed = false
+        for record in sessions {
+            guard let cwd = record.cwd, !cwd.isEmpty,
+                  let stored = persistedOwnedSessions.first(where: { $0.id == record.id }),
+                  stored.cwd != cwd else { continue }
+            var updated = NativeOwnedSession(
+                id: stored.id,
+                projectID: stored.projectID,
+                cwd: cwd,
+                title: stored.title,
+                createdAt: stored.createdAt,
+                agentID: stored.agentID,
+                accountBinding: stored.accountBinding
+            )
+            updated.lastAutoTitle = stored.lastAutoTitle
+            sessionStore.upsert(updated)
+            changed = true
+        }
+        if changed { refreshPersistedNavigationState(publish: false) }
+    }
+
+    /// Respawns every dormant terminal at its recorded working directory,
+    /// automatically for plain shells; a terminal that was running an agent
+    /// CLI comes back as a shell plus a resume chip (never auto-run — usage
+    /// cost and account binding are the user's call). Runs after the restored
+    /// UI is up; failures leave the pane dormant for the next attempt.
+    func resurrectDormantTerminals() async {
+        guard controlAvailable, !dormantTerminalIDs.isEmpty else { return }
+        // An in-flight broker upgrade means a draining generation may still
+        // own these PTYs; respawning now could fork them. Wait for a settled
+        // state — the pane loses nothing by staying dormant one launch.
+        switch brokerUpgradeState {
+        case .unknown, .current: break
+        default: return
+        }
+        let records = persistedOwnedSessions.filter { dormantTerminalIDs.contains($0.id) }
+        for stored in records {
+            // Freshest inventory wins: a drain handoff may have surfaced the
+            // terminal since restore marked it dormant.
+            guard !sessions.contains(where: { $0.id == stored.id }) else {
+                dormantTerminalIDs.remove(stored.id)
+                continue
+            }
+            // A vanished directory keeps the pane dormant rather than
+            // respawning under a different project identity.
+            var isDirectory: ObjCBool = false
+            guard FileManager.default.fileExists(atPath: stored.cwd, isDirectory: &isDirectory),
+                  isDirectory.boolValue else { continue }
+            let created = await createOwnedSession(
+                inDirectory: URL(fileURLWithPath: stored.cwd),
+                agent: nil,
+                titleOverride: stored.title,
+                terminalIDOverride: stored.id,
+                restore: true,
+                select: false
+            )
+            guard created == stored.id else { continue }
+            dormantTerminalIDs.remove(stored.id)
+            if let agentID = stored.agentID {
+                // The plain-shell spawn overwrote the stored record; put the
+                // agent identity and account binding back so the chip (and a
+                // later resurrection) still know what this terminal was.
+                sessionStore.upsert(stored)
+                refreshPersistedNavigationState(publish: false)
+                if ResumeChipEligibility.shouldShow(
+                    agentID: agentID,
+                    accountBindingResolves: stored.accountBinding == nil
+                        || stored.accountBinding?.normalized != nil
+                ) {
+                    pendingAgentResume[stored.id] = agentID
+                }
+            }
+        }
+    }
+
+    /// Chip action: boot the agent's resume command in the resurrected shell.
+    func runPendingAgentResume(for terminalID: String) async {
+        guard let agentID = pendingAgentResume.removeValue(forKey: terminalID),
+              let command = AgentRegistry.all.first(where: { $0.id == agentID })?.resumeCommand,
+              let stored = persistedOwnedSessions.first(where: { $0.id == terminalID }) else {
+            pendingAgentResume.removeValue(forKey: terminalID)
+            return
+        }
+        try? await controlClient.write(
+            projectID: stored.projectID,
+            terminalID: terminalID,
+            data: command + "\n"
+        )
+    }
+
+    /// Chip dismissal without resuming.
+    func dismissPendingAgentResume(for terminalID: String) {
+        pendingAgentResume.removeValue(forKey: terminalID)
     }
 
     /// App-quit path: detach so owned shells keep running on the broker, then

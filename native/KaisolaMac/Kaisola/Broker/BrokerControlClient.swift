@@ -25,6 +25,16 @@ struct TerminalCreation: Equatable, Sendable {
     let projectID: String
     let pid: Int32
     let streamEpoch: String?
+    /// Cold scrollback captured from a retained spool when the spawn carried
+    /// `restore: true`. Informational: when the broker keeps the spool as one
+    /// continuous transcript, history replay already covers it and this may
+    /// be nil or empty.
+    var recovered: TerminalRecoveredScrollback?
+}
+
+struct TerminalRecoveredScrollback: Equatable, Sendable {
+    let text: String
+    let truncated: Bool
 }
 
 protocol BrokerControlServing: Sendable {
@@ -39,7 +49,8 @@ protocol BrokerControlServing: Sendable {
         arguments: [String],
         cwd: String,
         columns: Int,
-        rows: Int
+        rows: Int,
+        restore: Bool
     ) async throws -> TerminalCreation
     func attach(projectID: String, terminalID: String) async throws
     func write(projectID: String, terminalID: String, data: String) async throws
@@ -55,6 +66,28 @@ protocol BrokerControlServing: Sendable {
 
 extension BrokerControlServing {
     var connectionInstanceID: String { "" }
+
+    /// Source compatibility for callers and doubles that predate resurrection.
+    func createTerminal(
+        projectID: String,
+        terminalID: String,
+        command: String,
+        arguments: [String],
+        cwd: String,
+        columns: Int,
+        rows: Int
+    ) async throws -> TerminalCreation {
+        try await createTerminal(
+            projectID: projectID,
+            terminalID: terminalID,
+            command: command,
+            arguments: arguments,
+            cwd: cwd,
+            columns: columns,
+            rows: rows,
+            restore: false
+        )
+    }
 
     func connect(
         to topology: BrokerGenerationTopology,
@@ -166,9 +199,10 @@ actor BrokerControlClient: BrokerControlServing, BrokerRollingUpdateRequesting {
         arguments: [String],
         cwd: String,
         columns: Int,
-        rows: Int
+        rows: Int,
+        restore: Bool = false
     ) async throws -> TerminalCreation {
-        let result = try await request(.create, params: .object([
+        var params: [String: JSONValue] = [
             "ownerId": .string(ownerID),
             "projectId": .string(projectID),
             "id": .string(terminalID),
@@ -181,17 +215,32 @@ actor BrokerControlClient: BrokerControlServing, BrokerRollingUpdateRequesting {
             "env": .object(Self.cleanTerminalEnvironment),
             "cols": .integer(Int64(columns)),
             "rows": .integer(Int64(rows)),
-        ]))
+        ]
+        if restore {
+            // Resurrection: the broker keeps this id's retained spool instead
+            // of wiping it, so old scrollback survives into the new session.
+            params["restore"] = .bool(true)
+        }
+        let result = try await request(.create, params: .object(params))
         guard let object = result.objectValue,
               object["ok"]?.boolValue != false,
               let pid = object["pid"]?.intValue.flatMap(Int32.init(exactly:)) else {
             throw BrokerClientError.requestFailed("terminal.create")
         }
+        var recovered: TerminalRecoveredScrollback?
+        if let payload = object["recovered"]?.objectValue,
+           let text = payload["text"]?.stringValue {
+            recovered = TerminalRecoveredScrollback(
+                text: text,
+                truncated: payload["truncated"]?.boolValue ?? false
+            )
+        }
         return TerminalCreation(
             terminalID: terminalID,
             projectID: projectID,
             pid: pid,
-            streamEpoch: object["streamEpoch"]?.stringValue
+            streamEpoch: object["streamEpoch"]?.stringValue,
+            recovered: recovered
         )
     }
 

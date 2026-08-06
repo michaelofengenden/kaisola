@@ -149,14 +149,12 @@ struct WorkspaceRailView: View {
                                     Image(systemName: "doc.text")
                                         .font(.caption)
                                         .foregroundStyle(.secondary)
-                                    Text(path)
-                                        .font(.callout)
-                                        .lineLimit(1)
-                                        .truncationMode(.middle)
+                                    FadingFileName(text: path)
                                     Spacer(minLength: 0)
                                 }
                                 .padding(.horizontal, 10)
                                 .padding(.vertical, 4)
+                                .padding(.trailing, Self.optionsClearance - 10)
                                 .background(
                                     selectedFile?.standardizedFileURL.path
                                         == root.appendingPathComponent(path).standardizedFileURL.path
@@ -651,38 +649,8 @@ struct WorkspaceRailView: View {
     /// Room kept clear at the trailing edge for the floating options button.
     private static let optionsClearance: CGFloat = 30
 
-    /// How far the name's last characters take to fade out.
-    private static let nameFadeWidth: CGFloat = 18
-
-    /// A name too long for its rail **fades out** rather than truncating.
-    ///
-    /// A tail "…" beside a "⋯" button is two ellipses in a row, and at a zoomed
-    /// text size they collide into something that reads as neither. A fade also
-    /// tells the truth better: it says the name continues, where "…" says three
-    /// specific characters were dropped. Michael: "the words shouldn't run into
-    /// the three dots, the words should fade a little before."
-    ///
-    /// `fixedSize` stops the text truncating itself; the frame around it is
-    /// what reports width upward, so the long name overflows into a clip rather
-    /// than widening the rail.
     private func fileName(_ name: String) -> some View {
-        Text(name)
-            .font(.callout)
-            .lineLimit(1)
-            .fixedSize(horizontal: true, vertical: false)
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .clipped()
-            .mask(alignment: .leading) {
-                HStack(spacing: 0) {
-                    Rectangle()
-                    LinearGradient(
-                        colors: [.black, .black.opacity(0)],
-                        startPoint: .leading,
-                        endPoint: .trailing
-                    )
-                    .frame(width: Self.nameFadeWidth)
-                }
-            }
+        FadingFileName(text: name)
     }
 
     private func itemMenu(_ node: FileNode) -> some View {
@@ -905,6 +873,65 @@ private struct WorkspaceMoveSheet: View {
         let prefix = root.path.hasSuffix("/") ? root.path : root.path + "/"
         guard directory.path.hasPrefix(prefix) else { return directory.lastPathComponent }
         return String(directory.path.dropFirst(prefix.count))
+    }
+}
+
+/// A name too long for its rail **fades out** rather than truncating.
+///
+/// A tail "…" beside a "⋯" button is two ellipses in a row, and at a zoomed
+/// text size they collide into something that reads as neither. A fade also
+/// tells the truth better: it says the name continues, where "…" says three
+/// specific characters were dropped. Michael: "the words shouldn't run into
+/// the three dots, the words should fade a little before."
+///
+/// The layout participant is a *hidden* copy of the text, which compresses
+/// like any label and so can never report an oversized minimum width up the
+/// row. That was the original regression: a `fixedSize` name reported its full
+/// ideal width as its minimum, the row grew past the rail's clip, and the
+/// floating "⋯" anchored to the row's trailing edge was carried off-panel with
+/// it. The visible copy is an overlay — outside layout entirely — clipped to
+/// the row, and faded only when the name genuinely overflows, so a short name
+/// whose tail happens to sit near the edge is not dimmed for no reason.
+struct FadingFileName: View {
+    let text: String
+    /// How far the name's last characters take to fade out.
+    var fadeWidth: CGFloat = 18
+
+    @State private var textWidth: CGFloat = 0
+    @State private var availableWidth: CGFloat = 0
+
+    private var overflows: Bool { textWidth > availableWidth + 0.5 }
+
+    var body: some View {
+        Text(text)
+            .font(.callout)
+            .lineLimit(1)
+            .hidden()
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .overlay(alignment: .leading) {
+                Text(text)
+                    .font(.callout)
+                    .lineLimit(1)
+                    .fixedSize(horizontal: true, vertical: false)
+                    .onGeometryChange(for: CGFloat.self) { proxy in
+                        proxy.size.width
+                    } action: { textWidth = $0 }
+            }
+            .onGeometryChange(for: CGFloat.self) { proxy in
+                proxy.size.width
+            } action: { availableWidth = $0 }
+            .clipped()
+            .mask(alignment: .leading) {
+                HStack(spacing: 0) {
+                    Rectangle()
+                    LinearGradient(
+                        colors: [.black, .black.opacity(overflows ? 0 : 1)],
+                        startPoint: .leading,
+                        endPoint: .trailing
+                    )
+                    .frame(width: fadeWidth)
+                }
+            }
     }
 }
 

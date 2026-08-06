@@ -17,6 +17,7 @@
 		081A41C0B1FA213B7CD74208 /* QuietStatusDerivationTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = AD8887E4ADA2A72E8F2F8B9B /* QuietStatusDerivationTests.swift */; };
 		08AD90B91DFB148BF2F3B5E8 /* KaisolaMacAppDelegate.swift in Sources */ = {isa = PBXBuildFile; fileRef = D624AF2C46BA83B73A21F0B3 /* KaisolaMacAppDelegate.swift */; };
 		094E4A2FC294A9392EAF649F /* MeshSessionTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 53455843EE4C394EEF0158BC /* MeshSessionTests.swift */; };
+		0A96ED7B9E79E83CA2C8997F /* WorkspaceRailNameFadeTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = ADDA11F70D5A2C27923186B5 /* WorkspaceRailNameFadeTests.swift */; };
 		0C134B5332C1E4A62E0A21E6 /* NativePreviewSettingsTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6AE795C503468AA7CEC0D736 /* NativePreviewSettingsTests.swift */; };
 		0CE4EF608C42C39B4319A304 /* CustomThemeStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0947C7DA82513DC2C0D20226 /* CustomThemeStore.swift */; };
 		0D74F8F2D3065EDE13BEB326 /* WorkspaceWatcher.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7FB737D5C0A6E0BA42FFC65E /* WorkspaceWatcher.swift */; };
@@ -494,6 +495,7 @@
 		A9878CE4AE9D997C699F9827 /* AppModelBookkeeping.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppModelBookkeeping.swift; sourceTree = "<group>"; };
 		AADD91E3C10425B025BF5441 /* DesktopChromaMeasureTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DesktopChromaMeasureTests.swift; sourceTree = "<group>"; };
 		AD8887E4ADA2A72E8F2F8B9B /* QuietStatusDerivationTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = QuietStatusDerivationTests.swift; sourceTree = "<group>"; };
+		ADDA11F70D5A2C27923186B5 /* WorkspaceRailNameFadeTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WorkspaceRailNameFadeTests.swift; sourceTree = "<group>"; };
 		AF52791E7FB87F94AF30DBD2 /* NoBoardBoundaryTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NoBoardBoundaryTests.swift; sourceTree = "<group>"; };
 		B12E9F413AC35E693709288A /* UsageMeterPaletteTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = UsageMeterPaletteTests.swift; sourceTree = "<group>"; };
 		B29CF4F90D6C4CD2F54D1948 /* ProjectReorderTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ProjectReorderTests.swift; sourceTree = "<group>"; };
@@ -994,6 +996,7 @@
 				B12E9F413AC35E693709288A /* UsageMeterPaletteTests.swift */,
 				3E4B0A58CFF401C1C82E8239 /* WorkspaceFilesTests.swift */,
 				9E8A890E106780D1EBC76860 /* WorkspacePersistenceVisibilityTests.swift */,
+				ADDA11F70D5A2C27923186B5 /* WorkspaceRailNameFadeTests.swift */,
 				2709C3EF1FBBB647E9258793 /* WorkspaceWatcherTests.swift */,
 			);
 			path = KaisolaTests;
@@ -1513,6 +1516,7 @@
 				46E02CD62E68B411ADECE3D9 /* UsageMeterPaletteTests.swift in Sources */,
 				C0A9194905016828644B7D86 /* WorkspaceFilesTests.swift in Sources */,
 				1B90B06DA94C489692815A00 /* WorkspacePersistenceVisibilityTests.swift in Sources */,
+				0A96ED7B9E79E83CA2C8997F /* WorkspaceRailNameFadeTests.swift in Sources */,
 				7F9A5DAA9548D99E55198D7E /* WorkspaceWatcherTests.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;

@@ -1,6 +1,6 @@
-# Obsidian-style Markdown, file tree fade, session restore (2026-08-06)
+# Obsidian-style Markdown, file tree fade, session restore, add-project (2026-08-06)
 
-Three independent workstreams, agreed with Michael on 2026-08-06. They share no code and should land as three separate PR-sized tracks. A cross-cutting principle applies to all of them.
+Four independent workstreams, agreed with Michael on 2026-08-06. They share no code and should land as separate PR-sized tracks. A cross-cutting principle applies to all of them.
 
 **Performance principle (applies everywhere):** Kaisola should feel instant. No feature here may block the main thread, delay app launch, or add per-keystroke work proportional to document size. Disk space is explicitly free to spend: prefer keeping data (scrollback, transcripts, recovery snapshots) over pruning it, and prefer precomputed or cached state on disk over recomputing at runtime.
 
@@ -118,3 +118,23 @@ Launch paints the restored UI first; respawns and spool reads happen after, conc
 ### Testing
 
 Broker-side tests: spool retained across restart, respawn returns recovered scrollback, cwd refresh updates the record. App-side tests: dormant pane survives normalization and a save/load round trip; agent terminal produces a chip and does not auto-run; account-binding mismatch suppresses the chip. One end-to-end test through the existing broker test harness simulating kill-broker-then-relaunch.
+
+---
+
+## 4. Adding project folders from the left sidebar
+
+### Current state
+
+In the left-sidebar (tree) layout there is no visible way to add a project: the buttons that once lived in the sidebar title row were moved to File > Open Folder and the command palette, and the top-bar layout's "+" button does not exist in this layout.
+
+### Changes
+
+Three affordances, all approved, all funneling into the existing `openProject` path:
+
+- **Ghost row.** A quiet "+ Add Project" row pinned at the bottom of the project list, styled to the quiet-fleet rules (secondary at rest, no wash, standard rail row height). Clicking it opens the existing asynchronous folder picker.
+- **Recent folders.** The ghost row is a menu whose primary action is the picker; its menu lists recent folders (already persisted in `native-sessions.json`) that still exist on disk and are not already open, for one-click reopen.
+- **Finder drag-and-drop.** Dropping one or more folders from Finder anywhere on the sidebar list opens each as a project, with a subtle accent outline while a drop is hovering. Typed to URLs so the rail's internal text-based drags never collide with it.
+
+### Testing
+
+Unit test for the recent-folders filter (existing, not open, capped). Manual check of picker, recents, and drop in the running app.

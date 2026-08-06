@@ -108,6 +108,7 @@
 		626A402BA6B8D124DFE4D4E7 /* FirebaseAuthConfig.json in Resources */ = {isa = PBXBuildFile; fileRef = 22E249E295A11287D3B9227F /* FirebaseAuthConfig.json */; };
 		6654B3A1CE2F11C7026F61B2 /* BrokerReconnectBackoffTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A451FC25E152BC8B61FB5702 /* BrokerReconnectBackoffTests.swift */; };
 		6726EDF110F46DD0A390141F /* AcpToolArtifactsTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0A75F9D9A2E3D4F6821B1F0A /* AcpToolArtifactsTests.swift */; };
+		67857BDDB5A014DE98000CB4 /* AddableRecentFoldersTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3CB1136B689EC654887DE1D8 /* AddableRecentFoldersTests.swift */; };
 		67D6685044396C16062285D8 /* AgentRegistry.swift in Sources */ = {isa = PBXBuildFile; fileRef = F9AE494034173A39FE10B346 /* AgentRegistry.swift */; };
 		68254BB4E0B5E4B718119113 /* TerminalCursorStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = 44220D13FC4D0265D132F67A /* TerminalCursorStore.swift */; };
 		6966243948430FA43F69B729 /* NotificationBridgeBoundaryTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8779132DE0F6325D261D6DEE /* NotificationBridgeBoundaryTests.swift */; };
@@ -371,6 +372,7 @@
 		3B1A175C81DA229AA3A9DFE1 /* ApiKeysSettingsTab.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ApiKeysSettingsTab.swift; sourceTree = "<group>"; };
 		3BC1C07309495EC7EC2B4AD2 /* CustomGrammarRegistryTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CustomGrammarRegistryTests.swift; sourceTree = "<group>"; };
 		3C39FF0D2776D41DC0294227 /* TerminalOptionClickTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TerminalOptionClickTests.swift; sourceTree = "<group>"; };
+		3CB1136B689EC654887DE1D8 /* AddableRecentFoldersTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AddableRecentFoldersTests.swift; sourceTree = "<group>"; };
 		3CC5460B6E0069C69E57550C /* AttentionInboxModelTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AttentionInboxModelTests.swift; sourceTree = "<group>"; };
 		3CE14B47B11FF8AEDD22CC1A /* BrokerHelperPackage.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BrokerHelperPackage.swift; sourceTree = "<group>"; };
 		3D06ED8A6604C6BD4447869A /* PermissionRuleStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PermissionRuleStore.swift; sourceTree = "<group>"; };
@@ -901,6 +903,7 @@
 				5B9366DA57DF29F48E569785 /* AcpTranscriptPagingTests.swift */,
 				84A4673AB95018489B81132A /* AcpTranscriptStoreTests.swift */,
 				D8FDE37840FBA272560EFB21 /* AcpWordDiffTests.swift */,
+				3CB1136B689EC654887DE1D8 /* AddableRecentFoldersTests.swift */,
 				5661F60153A30E55C8217B2A /* ApiKeyStoreTests.swift */,
 				4A75B9CDDB712B8E40FD295E /* AppModelBookkeepingTests.swift */,
 				4A70FC513A508673AD06C7E8 /* AppModelBrokerFallbackTests.swift */,
@@ -1421,6 +1424,7 @@
 				4B4670EA43E862CC87D986E2 /* AcpTranscriptPagingTests.swift in Sources */,
 				20C8CC811E88C38BEBF9C371 /* AcpTranscriptStoreTests.swift in Sources */,
 				D4BED77A57B981C90BB99AC3 /* AcpWordDiffTests.swift in Sources */,
+				67857BDDB5A014DE98000CB4 /* AddableRecentFoldersTests.swift in Sources */,
 				2DDDCA865F413721721D800C /* ApiKeyStoreTests.swift in Sources */,
 				F237D2EA9920CCEDF99DA792 /* AppModelBookkeepingTests.swift in Sources */,
 				51E20BB18D6A545E5DBCBD0A /* AppModelBrokerFallbackTests.swift in Sources */,

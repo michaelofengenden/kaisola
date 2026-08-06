@@ -29,6 +29,7 @@ struct RootShellView: View {
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @Environment(\.undoManager) private var undoManager
     @State private var renameTarget: String?
+    @State private var sidebarDropTargeted = false
     /// Chat id awaiting a typed model id (the menu's "Custom Model…").
     @State private var customModelTarget: String?
     @State private var customModelText: String = ""
@@ -546,8 +547,31 @@ struct RootShellView: View {
                         meshContextMenu: { AnyView(meshContextMenuContent($0)) },
                         deleteRecentlyClosed: requestDeleteRecentlyClosed
                     )
+                    addProjectRow
+                        .listRowInsets(QuietRailMetrics.listRowBleed)
+                        .listRowSeparator(.hidden)
                     if auth.isSignedIn, showsRememberedSessionSection {
                         rememberedSessionSidebarSection
+                    }
+                }
+                // A folder from Finder dropped anywhere on the rail opens as a
+                // project — the zero-chrome sibling of the ghost row below it.
+                // Typed to URLs, so the rail's own internal text drags (project
+                // reorder) never collide with it.
+                .dropDestination(for: URL.self) { urls, _ in
+                    let folders = urls.filter(\.hasDirectoryPath)
+                    guard !folders.isEmpty else { return false }
+                    for folder in folders {
+                        model.openProject(directory: folder)
+                    }
+                    return true
+                } isTargeted: { sidebarDropTargeted = $0 }
+                .overlay {
+                    if sidebarDropTargeted {
+                        RoundedRectangle(cornerRadius: 8, style: .continuous)
+                            .strokeBorder(Color.accentColor.opacity(0.55), lineWidth: 1.5)
+                            .padding(3)
+                            .allowsHitTesting(false)
                     }
                 }
                 // `.sidebar` reserves ~16pt of leading and trailing row inset
@@ -929,6 +953,56 @@ struct RootShellView: View {
             remoteDeviceCount: rememberedSessions.remoteDevices.count,
             errorMessage: rememberedSessions.errorMessage
         )
+    }
+
+    /// Recent folders that are real directories and not already open — the
+    /// one-click reopen list behind the ghost row's chevron.
+    private var addableRecentFolders: [URL] {
+        AddableRecentFolders.compute(
+            recent: model.recentFolders,
+            openProjectPaths: Set(model.projects.compactMap { $0.directory?.standardizedFileURL.path }),
+            isDirectory: { url in
+                var isDirectory: ObjCBool = false
+                return FileManager.default.fileExists(atPath: url.path, isDirectory: &isDirectory)
+                    && isDirectory.boolValue
+            }
+        )
+    }
+
+    /// The rail's only standing invitation: a quiet "+ Add Project" row at the
+    /// bottom of the project list. Click opens the folder picker; the chevron
+    /// (or a long press) offers recent folders for one-click reopen. Styled to
+    /// the quiet-fleet rules — secondary at rest, no wash, 32pt row.
+    private var addProjectRow: some View {
+        Menu {
+            ForEach(addableRecentFolders, id: \.self) { folder in
+                Button(folder.lastPathComponent) {
+                    model.openProject(directory: folder)
+                }
+                .help(folder.path)
+            }
+            if !addableRecentFolders.isEmpty { Divider() }
+            Button("Choose Folder…") { Self.promptForOpenFolder(model: model) }
+        } label: {
+            HStack(spacing: 6) {
+                Image(systemName: "plus")
+                    .font(.system(size: QuietRailMetrics.plusText, weight: .semibold))
+                Text("Add Project")
+                    .font(.callout)
+                Spacer(minLength: 0)
+            }
+            .foregroundStyle(.secondary)
+            .padding(.leading, 12)
+            .frame(height: QuietRailMetrics.rowHeight)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .contentShape(Rectangle())
+        } primaryAction: {
+            Self.promptForOpenFolder(model: model)
+        }
+        .menuStyle(.borderlessButton)
+        .buttonStyle(.plain)
+        .help("Add a project folder (⌘O); hold for recent folders")
+        .accessibilityLabel("Add Project")
     }
 
     @ViewBuilder
@@ -4517,6 +4591,31 @@ enum FooterAccountName {
             return name
         }
         return String(first)
+    }
+}
+
+/// The "Add Project" ghost row's recent-folders menu: recents that still exist
+/// as directories and are not already open, newest first, capped so the menu
+/// stays a quick pick rather than a history browser.
+enum AddableRecentFolders {
+    static let limit = 8
+
+    static func compute(
+        recent: [String],
+        openProjectPaths: Set<String>,
+        isDirectory: (URL) -> Bool
+    ) -> [URL] {
+        var seen = Set<String>()
+        var result: [URL] = []
+        for path in recent {
+            let url = URL(fileURLWithPath: path).standardizedFileURL
+            guard !openProjectPaths.contains(url.path),
+                  seen.insert(url.path).inserted,
+                  isDirectory(url) else { continue }
+            result.append(url)
+            if result.count == limit { break }
+        }
+        return result
     }
 }
 

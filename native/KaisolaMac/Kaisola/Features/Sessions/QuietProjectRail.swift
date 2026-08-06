@@ -187,7 +187,7 @@ enum QuietRailOrder {
 /// Every size the rail uses. Text bottoms out at 10.5pt — no *label* in the
 /// sidebar is smaller than the time label; symbol glyphs (the hover chevron and
 /// `+`) may be smaller, since they carry no reading load.
-private enum QuietRailMetrics {
+enum QuietRailMetrics {
     static let headerText: CGFloat = 13
     static let titleText: CGFloat = 13
     static let secondaryText: CGFloat = 10.5

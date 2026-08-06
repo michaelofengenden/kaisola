@@ -21,6 +21,18 @@ function terminalCreateRoute({
 
   const existed = manager.isLive(id)
   const restore = params.restore === true
+  if (restore && !manager.has(id)) {
+    // A restore for an id this broker process no longer remembers must still
+    // prove project ownership before any retained spool is served:
+    // `requireAllowed` has nothing to check against after a broker restart,
+    // and the retained spool may hold another project's transcript. The id
+    // embeds its project (`term-<project>-<hex8>`), so bind the claim there.
+    const embedded = /^term-(.+)-[0-9a-f]{8}$/.exec(id)
+    const requested = String(params.projectId ?? '')
+    if (!embedded || !requested || embedded[1] !== requested) {
+      return { ok: false, message: 'terminal restore denied: project mismatch' }
+    }
+  }
   const rec = manager.spawn({
     id,
     command: typeof params.command === 'string' ? params.command : undefined,

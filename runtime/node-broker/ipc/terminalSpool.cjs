@@ -330,7 +330,7 @@ class TerminalSpool {
   }
 
   push(data) {
-    if (!data) return
+    if (!data || this.closed) return
     this._trackModes(data) // input modes matter even when output is not retained
     if (this.retentionCap === 0) { this.truncated = true; return }
     // Every byte is queued exactly once regardless of renderer visibility.
@@ -448,6 +448,16 @@ class TerminalSpool {
   close({ remove = false } = {}) {
     this.flush()
     this.persistMeta()
+    // Late PTY output must not resurrect a closed spool: release() deletes
+    // the files synchronously, but the kernel can still deliver buffered
+    // onData afterwards through the pty handler's captured spool reference —
+    // and a debounced append 750ms later would silently recreate the file
+    // the user just asked to be wiped.
+    this.closed = true
+    if (this.appendTimer) {
+      clearTimeout(this.appendTimer)
+      this.appendTimer = null
+    }
     if (!remove) return
     try { fs.unlinkSync(this.file) } catch { /* absent */ }
     try { fs.unlinkSync(this.prevFile) } catch { /* absent */ }

@@ -166,7 +166,7 @@ test('cwd refresh batches live pids and fails soft without erasing last known cw
   assert.equal(records[1].cwd, '/live/two')
 })
 
-test('live terminal inventory and diagnostics expose cwd', (t) => {
+test('live terminal inventory and diagnostics expose cwd', async (t) => {
   const id = 'terminal-inventory-cwd'
   const record = manager.spawn({
     id,
@@ -178,6 +178,15 @@ test('live terminal inventory and diagnostics expose cwd', (t) => {
   t.after(() => manager.release(id))
 
   const liveCwd = fs.realpathSync(managerSpoolDir)
-  assert.equal(manager.list().find((row) => row.id === id)?.cwd, liveCwd)
+  // The periodic cwd refresh is deliberately asynchronous — a slow lsof
+  // must never stall the broker event loop — so poll briefly for the
+  // background refresh triggered by list() to land on the record.
+  let listed = null
+  for (let attempt = 0; attempt < 40; attempt += 1) {
+    listed = manager.list().find((row) => row.id === id)?.cwd
+    if (listed === liveCwd) break
+    await new Promise((resolve) => setTimeout(resolve, 100))
+  }
+  assert.equal(listed, liveCwd)
   assert.equal(manager.diagnostics().find((row) => row.id === id)?.cwd, liveCwd)
 })

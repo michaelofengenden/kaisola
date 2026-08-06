@@ -1369,6 +1369,12 @@ struct MarkdownRenderedEditor: NSViewRepresentable {
         /// while keeping the reader roughly where they were.
         func replaceText(with value: String, restoring selection: NSRange) {
             guard let textView else { return }
+            // The cached scan describes the text being replaced; a selection
+            // change landing between this swap and the debounced rescan (an
+            // external reload often arrives together with a line-target
+            // navigation) must not paint stale spans — or their stale table
+            // ranges — against the new string.
+            lastScan = nil
             let previousOrigin = scrollView.map(FilePreviewTextScroll.offset(in:)) ?? 0
             let previousHeight = textView.bounds.height
             let viewportHeight = scrollView?.documentVisibleRect.height ?? 0
@@ -1532,11 +1538,17 @@ struct MarkdownRenderedEditor: NSViewRepresentable {
                     .map { NSIntersectionRange($0, fullRange) }
                     .filter { $0.length > 0 }
                 guard !clamped.isEmpty else { return }
+                // Re-clamp after widening: a stale scan's table ranges can
+                // reach past the current storage, and setAttributes past the
+                // end raises NSRangeException.
                 targets = MarkdownIncrementalStyle.rangesToRestyle(
                     changed: clamped,
                     tables: scan.tables,
                     in: storage.string as NSString
                 )
+                .map { NSIntersectionRange($0, fullRange) }
+                .filter { $0.length > 0 }
+                guard !targets.isEmpty else { return }
             } else {
                 targets = [fullRange]
             }
@@ -2053,8 +2065,13 @@ final class MarkdownNativeTextView: NSTextView {
             // A plain click inside a task marker's brackets toggles it; the
             // rest of the line still just places the caret. The toggle rides
             // the normal insertText path, so undo and autosave see one typed
-            // character.
-            if event.clickCount == 1, !event.modifierFlags.contains(.command) {
+            // character. Only in the rendered surface (onFollowLink set) —
+            // the raw source editor renders `[ ]` as plain text with no
+            // affordance — and only a truly plain click: Shift extends the
+            // selection and must never be swallowed.
+            if onFollowLink != nil,
+               event.clickCount == 1,
+               event.modifierFlags.intersection([.command, .shift, .option, .control]).isEmpty {
                 let point = convert(event.locationInWindow, from: nil)
                 let source = string as NSString
                 let index = min(characterIndexForInsertion(at: point), source.length)
@@ -2096,11 +2113,18 @@ final class MarkdownNativeTextView: NSTextView {
 
     private func renumberOrderedBlock(around location: Int) {
         let source = string as NSString
-        guard source.length > 0,
-              let block = MarkdownListIndent.orderedBlock(
-                  containing: min(location, source.length - 1), in: source
-              ) else { return }
-        for edit in MarkdownListIndent.renumber(block: block, in: source) {
+        guard source.length > 0 else { return }
+        let clamped = min(location, source.length - 1)
+        guard let block = MarkdownListIndent.orderedBlock(containing: clamped, in: source) else {
+            return
+        }
+        // Renumber at the origin line's (post-edit) depth; nested sub-lists
+        // keep their own numbering.
+        let originLine = source.substring(
+            with: source.paragraphRange(for: NSRange(location: clamped, length: 0))
+        )
+        let indent = MarkdownListIndent.indent(of: originLine)
+        for edit in MarkdownListIndent.renumber(block: block, in: source, indent: indent) {
             insertText(edit.replacement, replacementRange: edit.range)
         }
     }
@@ -2109,8 +2133,12 @@ final class MarkdownNativeTextView: NSTextView {
         // Every view in the window is asked about key equivalents; only act
         // when this editor actually holds focus, or Cmd+B in a terminal pane
         // would bold-toggle a background document.
+        // Caps Lock is part of deviceIndependentFlagsMask; without the
+        // subtraction, engaged Caps Lock silently disables all three
+        // shortcuts (verified against AppKit).
         if window?.firstResponder === self,
-           event.modifierFlags.intersection(.deviceIndependentFlagsMask) == .command,
+           event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+               .subtracting(.capsLock) == .command,
            let key = event.charactersIgnoringModifiers?.lowercased() {
             switch key {
             case "b": formatBold(nil); return true

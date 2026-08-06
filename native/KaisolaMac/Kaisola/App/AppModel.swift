@@ -112,6 +112,7 @@ final class AppModel: ObservableObject {
     /// one-keystroke resume chip instead of auto-running the agent (usage cost
     /// and account binding are the user's call).
     @Published private(set) var pendingAgentResume: [String: String] = [:]
+    private var resurrectionSweepInFlight = false
     /// Whether the connected broker accepted a controller connection; older
     /// brokers stay observe-only and hide every mutation affordance.
     @Published private(set) var controlAvailable = false
@@ -4237,11 +4238,6 @@ final class AppModel: ObservableObject {
         await restoreWorkspaceStateIfNeeded()
         await restoreTerminalDraftTrackers()
         if connected {
-            // Resurrection never blocks launch: the restored UI (including
-            // dormant panes) is already up; shells come back concurrently.
-            Task { [weak self] in await self?.resurrectDormantTerminals() }
-        }
-        if connected {
             await restoreVisibleSecondarySubscriptions(
                 expectedConnectionGeneration: generation
             )
@@ -5410,6 +5406,14 @@ final class AppModel: ObservableObject {
     /// removed. (App quit is different — quitting detaches and the shell keeps
     /// running on the broker.)
     func endSession(_ terminalID: String) async {
+        // A dormant terminal has no live record and is not owned, but the
+        // user must still be able to close its pane — a vanished project
+        // folder would otherwise leave an un-closable "Session unavailable"
+        // tile forever. The record moves to the closed stack (⌘⌥T restores).
+        if dormantTerminalIDs.contains(terminalID) {
+            endDormantSession(terminalID)
+            return
+        }
         guard isOwned(terminalID),
               let record = sessions.first(where: { $0.id == terminalID }) else { return }
         terminalDraftDebounceTasks.removeValue(forKey: terminalID)?.cancel()
@@ -5461,6 +5465,7 @@ final class AppModel: ObservableObject {
         pendingTerminalDraftRestores.removeValue(forKey: terminalID)
         terminalLastOutputAt.removeValue(forKey: terminalID)
         terminalDraftTrackers.removeValue(forKey: terminalID)
+        pendingAgentResume.removeValue(forKey: terminalID)
         // Drop the parked SwiftTerm buffer too; this terminal cannot come back.
         TerminalSurfaceCache.shared.evict(sessionID: terminalID)
         if selectedSessionID == terminalID {
@@ -5468,6 +5473,39 @@ final class AppModel: ObservableObject {
             await select(nil)
         }
         await refreshInventory()
+    }
+
+    /// Closes a dormant pane: no broker call (there is no PTY), the persisted
+    /// record moves to the closed-session stack so ⌘⌥T can bring it back, and
+    /// the pane leaves every layout.
+    private func endDormantSession(_ terminalID: String) {
+        let closedSession = persistedOwnedSessions
+            .first(where: { $0.id == terminalID })
+            .map {
+                ClosedSession(
+                    cwd: $0.cwd,
+                    agentID: $0.agentID,
+                    title: $0.title,
+                    accountBinding: $0.accountBinding,
+                    sourceTerminalID: terminalID
+                )
+            }
+        if let closedSession {
+            sessionStore.pushClosedSession(closedSession)
+        }
+        sessionStore.remove(terminalID: terminalID)
+        refreshPersistedNavigationState(publish: false)
+        dormantTerminalIDs.remove(terminalID)
+        pendingAgentResume.removeValue(forKey: terminalID)
+        for projectID in Array(paneLayouts.keys) {
+            _ = reconcilePaneLayoutWithAvailableSurfaces(for: projectID, persist: true)
+        }
+        if selectedSessionID == terminalID {
+            selectedSessionID = nil
+        }
+        if focusedPaneID == terminalID {
+            focusedPaneID = nil
+        }
     }
 
     /// Recreate the most recently ended session (⌘⌥T). Provider CLIs with a
@@ -5791,6 +5829,13 @@ final class AppModel: ObservableObject {
         for terminalID in owned {
             scheduleDesiredTerminalResize(terminalID, force: true)
         }
+        // Resurrection is scheduled HERE — not only from reload() — so a
+        // broker that dies and reconnects mid-session (crash, generation
+        // rollover) also gets its lost terminals back, not just a fresh app
+        // launch. Detached: it must never block restore or reconnect.
+        if !dormant.isEmpty {
+            Task { [weak self] in await self?.resurrectDormantTerminals() }
+        }
     }
 
     /// The broker's tracked cwd (refreshed as shells `cd` around) flows back
@@ -5825,15 +5870,23 @@ final class AppModel: ObservableObject {
     /// UI is up; failures leave the pane dormant for the next attempt.
     func resurrectDormantTerminals() async {
         guard controlAvailable, !dormantTerminalIDs.isEmpty else { return }
-        // An in-flight broker upgrade means a draining generation may still
-        // own these PTYs; respawning now could fork them. Wait for a settled
-        // state — the pane loses nothing by staying dormant one launch.
-        switch brokerUpgradeState {
-        case .unknown, .current: break
-        default: return
-        }
+        // One sweep at a time: reload, reconnect, and launch can all schedule
+        // this, and two overlapping sweeps could double-spawn the same id.
+        guard !resurrectionSweepInFlight else { return }
+        resurrectionSweepInFlight = true
+        defer { resurrectionSweepInFlight = false }
         let records = persistedOwnedSessions.filter { dormantTerminalIDs.contains($0.id) }
         for stored in records {
+            // An in-flight broker upgrade means a draining generation may
+            // still own these PTYs; respawning now could fork them. Checked
+            // per iteration — each spawn is a suspension point during which
+            // an upgrade can start — and a pane loses nothing by staying
+            // dormant until the next settled reconnect.
+            switch brokerUpgradeState {
+            case .unknown, .current: break
+            default: return
+            }
+            guard controlAvailable, dormantTerminalIDs.contains(stored.id) else { continue }
             // Freshest inventory wins: a drain handoff may have surfaced the
             // terminal since restore marked it dormant.
             guard !sessions.contains(where: { $0.id == stored.id }) else {

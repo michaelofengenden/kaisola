@@ -7,7 +7,7 @@ const os = require('node:os')
 const path = require('node:path')
 const fs = require('node:fs')
 const crypto = require('node:crypto')
-const { execFileSync } = require('node:child_process')
+const { execFile, execFileSync } = require('node:child_process')
 const { agentEnv } = require('./shellEnv.cjs')
 const { TerminalSpool, DEFAULT_HOT_CAP, DEFAULT_SNAPSHOT_CAP } = require('./terminalSpool.cjs')
 const { TerminalObservers } = require('./terminalObservers.cjs')
@@ -232,6 +232,10 @@ function parseLsofCwd(output) {
   for (const line of String(output ?? '').split(/\r?\n/)) {
     if (line.startsWith('p')) {
       const pid = Number(line.slice(1))
+      // A malformed p-line (e.g. a path fragment from a cwd containing an
+      // embedded newline) drops tracking until the next valid p-line: the
+      // stray n-fragments that follow it must not be misattributed to the
+      // previous pid, and real output always re-anchors on the next record.
       currentPid = Number.isSafeInteger(pid) && pid > 0 ? pid : null
     } else if (line.startsWith('n') && currentPid != null) {
       const cwd = line.slice(1)
@@ -277,7 +281,47 @@ function refreshCwds({ force = false, now = Date.now, run = execFileSync } = {})
     && refreshedAt >= lastCwdRefreshAt
     && refreshedAt - lastCwdRefreshAt < CWD_REFRESH_COALESCE_MS) return true
   lastCwdRefreshAt = refreshedAt
-  return refreshTerminalCwds(terms.values(), run)
+  // Only the forced path (shutdown flush, tests) runs lsof synchronously.
+  // The periodic path — the app's ~2.5s inventory heartbeat — must never
+  // block the event loop: a slow lsof under load froze every terminal's
+  // write/output for up to 1.5s per tick. Callers get the last known cwd
+  // immediately; the refresh lands in the background.
+  if (force || run !== execFileSync) return refreshTerminalCwds(terms.values(), run)
+  if (cwdRefreshInFlight) return true
+  cwdRefreshInFlight = true
+  refreshTerminalCwdsAsync(terms.values()).finally(() => {
+    cwdRefreshInFlight = false
+  })
+  return true
+}
+
+let cwdRefreshInFlight = false
+
+/** The non-blocking twin of `refreshTerminalCwds`: same lsof invocation and
+ * parse, run through the async `execFile` so a stalled lsof never stalls the
+ * broker. Failure is equally non-destructive. */
+function refreshTerminalCwdsAsync(records) {
+  const live = [...records].filter((record) => !record.exited)
+  const pids = [...new Set(live
+    .map((record) => Number(record.pty?.pid))
+    .filter((pid) => Number.isSafeInteger(pid) && pid > 0))]
+    .sort((a, b) => a - b)
+  if (!pids.length) return Promise.resolve(true)
+  return new Promise((resolve) => {
+    execFile('/usr/sbin/lsof', ['-a', '-p', pids.join(','), '-d', 'cwd', '-Fn'], {
+      encoding: 'utf8',
+      timeout: 1_500,
+      maxBuffer: 1024 * 1024,
+    }, (error, stdout) => {
+      if (error && !stdout) { resolve(false); return }
+      const cwdByPid = parseLsofCwd(stdout)
+      for (const record of live) {
+        const cwd = cwdByPid.get(Number(record.pty?.pid))
+        if (cwd) record.cwd = cwd
+      }
+      resolve(true)
+    })
+  })
 }
 
 /**

@@ -44,3 +44,17 @@ test('evicting the durable hot tail never queues bytes a second time', (t) => {
   assert.equal(fs.readFileSync(spool.file, 'utf8'), chunks.join(''))
   assert.equal(spool.snapshot(1024).output, chunks.join(''))
 })
+
+test('late pty output after close({remove}) cannot resurrect the deleted spool file', async (t) => {
+  const spool = fixture(t)
+  spool.push('before-close')
+  spool.close({ remove: true })
+  assert.equal(fs.existsSync(spool.file), false)
+
+  // The kernel can deliver buffered onData after release() already deleted
+  // the spool; the debounced append must not recreate the file.
+  spool.push('buffered-after-close')
+  spool.flush()
+  await new Promise((resolve) => setTimeout(resolve, SPOOL_APPEND_DEBOUNCE_MS + 350))
+  assert.equal(fs.existsSync(spool.file), false)
+})

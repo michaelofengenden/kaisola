@@ -80,3 +80,38 @@ test('terminal create route always returns recovered null for a plain spawn', ()
   assert.equal(manager.calls[0].restore, false)
   assert.equal(response.recovered, null)
 })
+
+test('restore for an id unknown to this broker requires the id-embedded project to match', () => {
+  const { terminalCreateRoute } = require('../../runtime/node-broker/ipc/terminalCreateRoute.cjs')
+  const manager = fakeManager({ recovered: { text: 'secret-project-a-output', truncated: false } })
+  manager.has = () => false // fresh broker process: nothing in memory to check ownership against
+
+  const denied = terminalCreateRoute({
+    manager,
+    params: {
+      id: 'term-nproj_project-a-11112222',
+      projectId: 'nproj_project-b',
+      restore: true,
+    },
+    owner: 'instance|owner|nproj_project-b',
+    clientInstanceId: 'new-instance',
+    requireAllowed: () => { throw new Error('nothing to check against post-restart') },
+  })
+  assert.equal(denied.ok, false)
+  assert.match(denied.message, /project mismatch/)
+  assert.equal(manager.calls.length, 0, 'a denied restore must never reach spawn')
+
+  const allowed = terminalCreateRoute({
+    manager,
+    params: {
+      id: 'term-nproj_project-a-11112222',
+      projectId: 'nproj_project-a',
+      restore: true,
+    },
+    owner: 'instance|owner|nproj_project-a',
+    clientInstanceId: 'new-instance',
+    requireAllowed: () => {},
+  })
+  assert.equal(allowed.ok, true)
+  assert.equal(allowed.recovered.text, 'secret-project-a-output')
+})

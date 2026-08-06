@@ -40,43 +40,58 @@ enum MarkdownListIndent {
         }
     }
 
+    /// The exact leading whitespace of a list line — nesting depth.
+    static func indent(of line: String) -> String {
+        String(line.prefix(while: { $0 == " " || $0 == "\t" }))
+    }
+
     /// The contiguous run of ordered-list lines containing `location`, or nil
-    /// when that line is not an ordered item. This is the unit `renumber`
-    /// re-sequences after an indent or continuation edit.
+    /// when that line is not an ordered item. Deeper (nested) items ride
+    /// along inside the block; a shallower ordered line is a different outer
+    /// list and bounds it. This is the unit `renumber` re-sequences after an
+    /// indent or continuation edit.
     static func orderedBlock(containing location: Int, in source: NSString) -> NSRange? {
         guard let orderedLine, source.length > 0, location >= 0, location < source.length else { return nil }
-        func isOrdered(_ paragraph: NSRange) -> Bool {
+        func orderedIndent(_ paragraph: NSRange) -> String? {
             let line = source.substring(with: paragraph)
-            return orderedLine.firstMatch(
+            guard orderedLine.firstMatch(
                 in: line,
                 range: NSRange(location: 0, length: (line as NSString).length)
-            ) != nil
+            ) != nil else { return nil }
+            return indent(of: line)
         }
         var block = source.paragraphRange(for: NSRange(location: location, length: 0))
-        guard isOrdered(block) else { return nil }
+        guard let originIndent = orderedIndent(block) else { return nil }
+        func continues(_ paragraph: NSRange) -> Bool {
+            guard let lineIndent = orderedIndent(paragraph) else { return false }
+            return lineIndent.count >= originIndent.count
+        }
         while block.location > 0 {
             let previous = source.paragraphRange(
                 for: NSRange(location: block.location - 1, length: 0)
             )
-            guard isOrdered(previous) else { break }
+            guard continues(previous) else { break }
             block = NSUnionRange(block, previous)
         }
         while NSMaxRange(block) < source.length {
             let next = source.paragraphRange(
                 for: NSRange(location: NSMaxRange(block), length: 0)
             )
-            guard next.length > 0, isOrdered(next) else { break }
+            guard next.length > 0, continues(next) else { break }
             block = NSUnionRange(block, next)
         }
         return block
     }
 
-    /// Re-sequences a contiguous ordered-list block to 1, 2, 3… Edits are
-    /// returned bottom-up so earlier ranges stay valid while the caller
+    /// Re-sequences a contiguous ordered-list block to 1, 2, 3… at exactly
+    /// the given nesting depth: deeper sub-lists keep their own independent
+    /// numbering and are skipped without breaking the outer sequence. Edits
+    /// are returned bottom-up so earlier ranges stay valid while the caller
     /// applies them in order. Lines keep their own indent and delimiter.
     static func renumber(
         block: NSRange,
-        in source: NSString
+        in source: NSString,
+        indent targetIndent: String = ""
     ) -> [(range: NSRange, replacement: String)] {
         guard let orderedLine, block.length > 0,
               NSMaxRange(block) <= source.length else { return [] }
@@ -97,6 +112,10 @@ enum MarkdownListIndent {
             let lineRange = NSRange(location: 0, length: (line as NSString).length)
             guard let match = orderedLine.firstMatch(in: line, range: lineRange) else {
                 expected = 1
+                continue
+            }
+            // A nested sub-list rides inside the block but numbers itself.
+            guard (line as NSString).substring(with: match.range(at: 1)) == targetIndent else {
                 continue
             }
             let numberRange = match.range(at: 2)

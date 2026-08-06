@@ -996,6 +996,12 @@ struct RootShellView: View {
             .frame(height: QuietRailMetrics.rowHeight)
             .frame(maxWidth: .infinity, alignment: .leading)
             .contentShape(Rectangle())
+            // The sidebar's resize corridor overlays the List's trailing
+            // ~10.5pt; a permanent control cannot share its edge with a drag
+            // handle (the header "+" learned this — see
+            // QuietRailMetrics.plusTrailingInset), so the hit target stops
+            // short of the corridor's reach.
+            .padding(.trailing, QuietRailMetrics.plusTrailingInset)
         } primaryAction: {
             Self.promptForOpenFolder(model: model)
         }
@@ -2233,8 +2239,6 @@ struct RootShellView: View {
         }
     }
 
-    /// A terminal card always owns exactly one SwiftTerm representable keyed by
-    /// the card's stable session id. Broker focus may swap a session between the
     /// A resurrected terminal that was running an agent CLI before the
     /// restart: one click resumes it, one click dismisses. Never auto-run —
     /// usage cost and account binding are the user's call (2026-08-06 spec §3).
@@ -2272,6 +2276,8 @@ struct RootShellView: View {
         .help("This terminal was running \(agent?.name ?? agentID) before the restart. Run resumes the conversation; dismiss keeps the plain shell.")
     }
 
+    /// A terminal card always owns exactly one SwiftTerm representable keyed by
+    /// the card's stable session id. Broker focus may swap a session between the
     /// primary and secondary subscription lanes, but that no longer swaps the
     /// SwiftUI subtree (the source of the old white flash and ANSI replay).
     @ViewBuilder

@@ -638,8 +638,16 @@ final class SessionStoreWriteFailureMonitor: @unchecked Sendable {
 
 /// The persisted surface type is deliberately smaller than the live AppModel surface.
 /// In particular, terminal entries are only broker-session references: restoring this
-/// state must never synthesize ownership or launch a replacement terminal. Callers must
-/// intersect terminal IDs with the broker's live session inventory before attaching.
+/// state must never synthesize ownership or launch a replacement terminal *inline*.
+/// Callers must intersect terminal IDs with the broker's live session inventory before
+/// attaching.
+///
+/// Deliberately superseded for reboot survival (2026-08-06 spec §3): a terminal absent
+/// from inventory becomes *dormant* rather than dropped, and the one sanctioned
+/// respawn path is `AppModel.resurrectDormantTerminals()` — which runs after restore
+/// completes, respawns through `terminal.create restore:true` under the old id, and
+/// never launches an agent CLI without an explicit user gesture. Restoration itself
+/// still never spawns anything.
 enum NativeRestorableSurfaceKind: String, Codable, CaseIterable, Sendable {
     case terminal
     case agentChat

@@ -68,4 +68,24 @@ final class MarkdownListIndentTests: XCTestCase {
         let source = "1. a\n2. b\n" as NSString
         XCTAssertEqual(MarkdownListIndent.renumber(block: NSRange(location: 0, length: 10), in: source).count, 0)
     }
+
+    func testRenumberLeavesNestedSubListsAlone() {
+        let source = "1. a\n2. b\n\t1. c\n\t5. d\n9. e\n" as NSString
+        let block = MarkdownListIndent.orderedBlock(containing: 0, in: source)
+        XCTAssertEqual(block, NSRange(location: 0, length: source.length))
+        let edits = MarkdownListIndent.renumber(
+            block: block ?? NSRange(location: 0, length: 0), in: source, indent: ""
+        )
+        // Only top-level "9. e" resequences (to 3); the nested "\t5. d"
+        // keeps its own independent numbering at this depth.
+        XCTAssertEqual(edits.count, 1)
+        XCTAssertEqual(edits.first?.replacement, "3")
+    }
+
+    func testOrderedBlockStopsAtShallowerList() {
+        let source = "1. outer\n\t1. child\n\t2. child\n" as NSString
+        // Origin inside the nested list: the shallower outer line bounds it.
+        let block = MarkdownListIndent.orderedBlock(containing: 12, in: source)
+        XCTAssertEqual(block, NSRange(location: 9, length: 20))
+    }
 }

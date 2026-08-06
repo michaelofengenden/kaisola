@@ -1033,8 +1033,9 @@ struct MarkdownDocumentView: View {
     /// and cursor movement pay nothing for wikilinks. An unresolvable name
     /// is inert.
     private func openWikilink(_ link: URL) {
-        let name = String(link.path.dropFirst()).removingPercentEncoding
-            ?? String(link.path.dropFirst())
+        // `URL.path` already percent-decodes; decoding again corrupts names
+        // that legitimately contain %XX-shaped text.
+        let name = String(link.path.dropFirst())
         let root = workspaceRoot ?? documentURL.deletingLastPathComponent()
         Task { @MainActor in
             let files = await ProjectFileIndex.shared.files(for: root)

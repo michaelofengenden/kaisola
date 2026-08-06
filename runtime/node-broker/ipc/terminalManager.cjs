@@ -7,6 +7,7 @@ const os = require('node:os')
 const path = require('node:path')
 const fs = require('node:fs')
 const crypto = require('node:crypto')
+const { execFileSync } = require('node:child_process')
 const { agentEnv } = require('./shellEnv.cjs')
 const { TerminalSpool, DEFAULT_HOT_CAP, DEFAULT_SNAPSHOT_CAP } = require('./terminalSpool.cjs')
 const { TerminalObservers } = require('./terminalObservers.cjs')
@@ -76,6 +77,7 @@ let flushMs = FLUSH_MS_FOCUSED
 const FLUSH_CAP = 65_536 // a burst bigger than this flushes immediately
 const OBSERVER_CHUNK_BYTES = 64 * 1024
 const AGENT_QUIET_MS = 4500
+const CWD_REFRESH_COALESCE_MS = 250
 
 /** main.cjs calls this on app focus/blur — the stream profile follows. */
 function setAppFocused(focused) {
@@ -88,6 +90,7 @@ const releaseTimers = new Map()
 let spoolDir = path.join(os.tmpdir(), `kaisola-terminal-cache-${process.pid}`)
 let eventSink = null
 let activitySink = null
+let lastCwdRefreshAt = 0
 
 function configureStorage(dir) {
   if (dir) {
@@ -221,22 +224,81 @@ function splitUtf8(value, maxBytes = OBSERVER_CHUNK_BYTES) {
   return chunks
 }
 
+/** Parse macOS `lsof -Fn` process/name records for `-d cwd`. Process markers
+ * scope the following name field; malformed blocks are ignored. */
+function parseLsofCwd(output) {
+  const cwdByPid = new Map()
+  let currentPid = null
+  for (const line of String(output ?? '').split(/\r?\n/)) {
+    if (line.startsWith('p')) {
+      const pid = Number(line.slice(1))
+      currentPid = Number.isSafeInteger(pid) && pid > 0 ? pid : null
+    } else if (line.startsWith('n') && currentPid != null) {
+      const cwd = line.slice(1)
+      if (path.isAbsolute(cwd)) cwdByPid.set(currentPid, cwd)
+    }
+  }
+  return cwdByPid
+}
+
+/** Refresh live records through one lsof process. Failure is deliberately
+ * non-destructive: every record keeps its last known cwd. */
+function refreshTerminalCwds(records, run = execFileSync) {
+  const live = [...records].filter((record) => !record.exited)
+  const pids = [...new Set(live
+    .map((record) => Number(record.pty?.pid))
+    .filter((pid) => Number.isSafeInteger(pid) && pid > 0))]
+    .sort((a, b) => a - b)
+  if (!pids.length) return true
+
+  let output
+  try {
+    output = run('/usr/sbin/lsof', ['-a', '-p', pids.join(','), '-d', 'cwd', '-Fn'], {
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'ignore'],
+      timeout: 1_500,
+      maxBuffer: 1024 * 1024,
+    })
+  } catch {
+    return false
+  }
+  const cwdByPid = parseLsofCwd(output)
+  for (const record of live) {
+    const cwd = cwdByPid.get(Number(record.pty?.pid))
+    if (cwd) record.cwd = cwd
+  }
+  return true
+}
+
+function refreshCwds({ force = false, now = Date.now, run = execFileSync } = {}) {
+  const refreshedAt = Number(now())
+  if (!force
+    && lastCwdRefreshAt > 0
+    && refreshedAt >= lastCwdRefreshAt
+    && refreshedAt - lastCwdRefreshAt < CWD_REFRESH_COALESCE_MS) return true
+  lastCwdRefreshAt = refreshedAt
+  return refreshTerminalCwds(terms.values(), run)
+}
+
 /**
  * Spawn a pty. `command`/`args` default to an interactive login shell. Streams
  * data to `sender` on terminal:data:<id> and accumulates output for snapshots
  * and ACP terminal/output. Resolves exit via waitForExit().
  */
-function spawn({ id, command, args, cwd, env, outputByteLimit, cols, rows, sender }) {
+function spawn({ id, command, args, cwd, env, outputByteLimit, cols, rows, sender, restore = false }) {
   cancelRelease(id)
   if (!pty) return null
+  const restoring = restore === true
   const prior = terms.get(id)
   if (prior) {
     if (!prior.exited) return prior
     // a dead pty is not a session — drop the record and spawn fresh under the
     // same id, so a reloaded window gets a working shell instead of a corpse
-    prior.spool.close({ remove: true })
+    prior.spool.close({ remove: !restoring })
     terms.delete(id)
   }
+  const recovered = restoring ? TerminalSpool.coldTail(id, spoolDir) : null
+  const retainSpool = restoring && recovered !== null
   const shell = process.env.SHELL || '/bin/zsh'
   // a persisted cwd can be GONE by now (removed worktree, deleted folder) —
   // pty.spawn throws uncaught on a missing dir; fall back to home instead
@@ -259,13 +321,16 @@ function spawn({ id, command, args, cwd, env, outputByteLimit, cols, rows, sende
     pty: p,
     cols: initialCols,
     rows: initialRows,
+    cwd: startCwd,
     sender,
     // Hidden renderers leave zero scrollback in RAM. The pty stays alive and
     // writes to this bounded disk spool until an xterm reattaches.
     spool: new TerminalSpool({
       dir: spoolDir,
       id,
-      fresh: true,
+      // Restore reuses an existing durable log. Every other create remains a
+      // fresh terminal and must not inherit stale bytes for a recycled id.
+      fresh: !retainSpool,
       ...(retainedOutputBytes == null ? {} : {
         diskCap: Math.max(1, retainedOutputBytes),
         hotCap: Math.max(1, Math.min(DEFAULT_HOT_CAP, retainedOutputBytes)),
@@ -274,6 +339,7 @@ function spawn({ id, command, args, cwd, env, outputByteLimit, cols, rows, sende
       }),
     }),
     outputByteLimit: retainedOutputBytes,
+    recovered,
     cursor,
     observers: null,
     rendererVisible: true,
@@ -731,6 +797,9 @@ function rollingUpdateReadiness() {
 }
 
 function killAll() {
+  // Capture one last shell cwd while every pid is still live. Missing/erroring
+  // lsof is non-fatal and leaves the last inventory value intact.
+  refreshCwds({ force: true })
   for (const timer of releaseTimers.values()) clearTimeout(timer)
   releaseTimers.clear()
   for (const r of terms.values()) {
@@ -765,6 +834,7 @@ function killAll() {
 /** Live sessions with their pid + FOREGROUND process name (node-pty reads the
  *  active process on the pty, e.g. 'zsh' idle vs 'node'/'python' running). */
 function list() {
+  refreshCwds()
   const out = []
   for (const r of terms.values()) {
     if (r.exited) continue
@@ -772,15 +842,17 @@ function list() {
     try {
       proc = r.pty.process || ''
     } catch { /* pty backend may refuse mid-teardown */ }
-    out.push({ id: r.id, pid: r.pty.pid, process: proc, cols: r.cols, rows: r.rows, owner: senderId(r.sender), lastOwner: senderId(r.lastSender), agentBusy: r.agentBusy, agentCompletedAt: r.agentCompletedAt, agentRespondedAt: r.agentRespondedAt })
+    out.push({ id: r.id, pid: r.pty.pid, process: proc, cwd: r.cwd, cols: r.cols, rows: r.rows, owner: senderId(r.sender), lastOwner: senderId(r.lastSender), agentBusy: r.agentBusy, agentCompletedAt: r.agentCompletedAt, agentRespondedAt: r.agentRespondedAt })
   }
   return out
 }
 
 function diagnostics() {
+  refreshCwds()
   return [...terms.values()].map((r) => ({
     ...r.spool.stats(),
     pid: r.pty && r.pty.pid,
+    cwd: r.cwd,
     cols: r.cols,
     rows: r.rows,
     exited: r.exited,
@@ -795,4 +867,4 @@ function diagnostics() {
   }))
 }
 
-module.exports = { available, has, isLive, ownership, spawn, write, agentTurn, resize, setSender, detachRenderer, detachSender, detachSenderPrefix, snapshot, history, subscribe, unsubscribe, unsubscribeSubscriberPrefix, waitForExit, kill, release, scheduleRelease, cancelRelease, trackChild, untrackChild, upgradeReadiness, rollingUpdateReadiness, killAll, list, setAppFocused, configureStorage, setEventSink, setActivitySink, diagnostics, __test: { resizeRecord, resumeFromSnapshot, splitUtf8, terminalEnv, summarizeUpgradeReadiness } }
+module.exports = { available, has, isLive, ownership, spawn, write, agentTurn, resize, setSender, detachRenderer, detachSender, detachSenderPrefix, snapshot, history, subscribe, unsubscribe, unsubscribeSubscriberPrefix, waitForExit, kill, release, scheduleRelease, cancelRelease, trackChild, untrackChild, upgradeReadiness, rollingUpdateReadiness, killAll, list, setAppFocused, configureStorage, setEventSink, setActivitySink, diagnostics, __test: { resizeRecord, resumeFromSnapshot, splitUtf8, terminalEnv, summarizeUpgradeReadiness, parseLsofCwd, refreshTerminalCwds } }

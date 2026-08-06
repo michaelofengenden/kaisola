@@ -9,10 +9,10 @@
 const crypto = require('node:crypto')
 const fs = require('node:fs')
 const net = require('node:net')
-const os = require('node:os')
 const path = require('node:path')
 const { StringDecoder } = require('node:string_decoder')
 const mgr = require('./ipc/terminalManager.cjs')
+const { terminalCreateRoute } = require('./ipc/terminalCreateRoute.cjs')
 const { terminalOwnerAllowed, terminalOwnerParts } = require('./ipc/securityPolicy.cjs')
 const {
   PROTOCOL,
@@ -416,31 +416,13 @@ async function dispatch(client, method, params = {}) {
     case 'terminal.available':
       return { ok: mgr.available() }
     case 'terminal.create': { // user terminal or ACP terminal
-      if (!mgr.available()) return { ok: false, message: 'node-pty unavailable in session broker' }
-      const id = String(params.id || '').slice(0, 240)
-      if (!id) return { ok: false, message: 'terminal id required' }
-      if (mgr.has(id)) requireAllowed(id, true)
-      const existed = mgr.isLive(id)
-      const rec = mgr.spawn({
-        id,
-        command: typeof params.command === 'string' ? params.command : undefined,
-        args: Array.isArray(params.args) ? params.args.map(String).slice(0, 200) : undefined,
-        cwd: typeof params.cwd === 'string' ? params.cwd : os.homedir(),
-        env: params.env && typeof params.env === 'object' ? params.env : undefined,
-        outputByteLimit: Number.isFinite(Number(params.outputByteLimit))
-          ? Math.max(0, Math.min(Math.floor(Number(params.outputByteLimit)), 8 * 1024 * 1024))
-          : undefined,
-        cols: Number(params.cols) || 80,
-        rows: Number(params.rows) || 24,
-        sender: owner,
+      return terminalCreateRoute({
+        manager: mgr,
+        params,
+        owner,
+        clientInstanceId: client.instanceId,
+        requireAllowed,
       })
-      if (!rec) return { ok: false, message: 'could not start terminal' }
-      const continuity = mgr.setSender(id, owner)
-      const previousInstance = continuity?.previousOwner?.split('|')[0]
-      const continuation = continuity && previousInstance && previousInstance !== client.instanceId
-        ? { ...continuity, acrossRestart: true, reattachedAt: Date.now(), brokerPid: process.pid, terminalPid: rec.pty?.pid }
-        : null
-      return { ok: true, existed, pid: rec.pty?.pid, continuation, ...mgr.snapshot(id) }
     }
     case 'terminal.attach': {
       const id = terminalId()

@@ -1,7 +1,7 @@
-// Disk-backed terminal scrollback. A live/visible terminal keeps only the hot
-// xterm-sized tail in RAM; once its renderer detaches, every byte is flushed to
-// this spool and the pty continues without a hidden renderer or a megabyte ring.
-// The pty is NEVER stopped by this class.
+// Disk-backed terminal scrollback. Every byte is eagerly appended while a
+// live/visible terminal keeps only an xterm-sized read tail in RAM; detaching
+// drops that cache and the pty continues without a hidden renderer or a
+// megabyte ring. The pty is NEVER stopped by this class.
 const crypto = require('node:crypto')
 const fs = require('node:fs')
 const path = require('node:path')
@@ -28,6 +28,8 @@ const DEFAULT_HOT_CAP = intEnv('KAISOLA_TERMINAL_HOT_KB', 1024, 128, 4096) * 102
 // half of the scrollback problem.
 const DEFAULT_SNAPSHOT_CAP = intEnv('KAISOLA_TERMINAL_SNAPSHOT_KB', 4096, 256, 16_384) * 1024
 const DEFAULT_QUEUE_CAP = intEnv('KAISOLA_TERMINAL_SPOOL_BATCH_KB', 256, 32, 1024) * 1024
+const DEFAULT_COLD_TAIL_CAP = 512 * 1024
+const SPOOL_APPEND_DEBOUNCE_MS = 750
 
 function safeBase(id) {
   return crypto.createHash('sha256').update(String(id)).digest('hex').slice(0, 32)
@@ -110,6 +112,33 @@ function readRange(file, start, length) {
 }
 
 class TerminalSpool {
+  static coldTail(id, dir, maxBytes = DEFAULT_COLD_TAIL_CAP) {
+    const base = safeBase(id)
+    const currentFile = path.join(dir, `${base}.log`)
+    const prevFile = path.join(dir, `${base}.prev.log`)
+    const segments = []
+    for (const file of [prevFile, currentFile]) {
+      try {
+        const size = fs.statSync(file).size
+        segments.push({ file, size })
+      } catch { /* no retained segment */ }
+    }
+    if (!segments.length) return null
+
+    const capValue = Number(maxBytes)
+    const cap = Number.isFinite(capValue)
+      ? Math.max(0, Math.floor(capValue))
+      : DEFAULT_COLD_TAIL_CAP
+    const totalBytes = segments.reduce((sum, segment) => sum + segment.size, 0)
+    const current = readTail(currentFile, cap)
+    const remaining = Math.max(0, cap - Buffer.byteLength(current))
+    const previous = remaining ? readTail(prevFile, remaining) : ''
+    return {
+      text: previous + current,
+      truncated: totalBytes > cap,
+    }
+  }
+
   constructor({ dir, id, diskCap = DEFAULT_DISK_CAP, hotCap = DEFAULT_HOT_CAP, queueCap = DEFAULT_QUEUE_CAP, retentionCap = null, fresh = false }) {
     this.id = String(id)
     this.diskCap = diskCap
@@ -121,6 +150,7 @@ class TerminalSpool {
     this.chunksLen = 0
     this.queued = []
     this.queuedLen = 0
+    this.appendTimer = null
     this.truncated = false
     this.viewState = null
     fs.mkdirSync(dir, { recursive: true, mode: 0o700 })
@@ -132,6 +162,14 @@ class TerminalSpool {
       for (const file of [this.file, this.prevFile, this.metaFile]) {
         try { fs.unlinkSync(file) } catch { /* absent or already unavailable */ }
       }
+    }
+    // A restored terminal appends to the retained log, but its live stream
+    // starts after the recovered bytes. Snapshot/history reads use this
+    // boundary so the cold payload is returned once through `recovered`
+    // instead of being replayed again as output from the new PTY.
+    this.readStartBytes = 0
+    for (const file of [this.prevFile, this.file]) {
+      try { this.readStartBytes += fs.statSync(file).size } catch { /* absent */ }
     }
     this.fallbackChunks = []
     this.fallbackLen = 0
@@ -186,7 +224,15 @@ class TerminalSpool {
     if (this.retentionCap === 0) { this.truncated = true; return }
     this.queued.push(text)
     this.queuedLen += Buffer.byteLength(text)
-    if (this.queuedLen >= this.queueCap) this.flush()
+    if (this.queuedLen >= this.queueCap) {
+      this.flush()
+    } else if (!this.appendTimer) {
+      this.appendTimer = setTimeout(() => {
+        this.appendTimer = null
+        this.flush()
+      }, SPOOL_APPEND_DEBOUNCE_MS)
+      this.appendTimer.unref?.()
+    }
   }
 
   _append(text) {
@@ -209,7 +255,10 @@ class TerminalSpool {
       // explicit retentionCap; only those use the bounded two-segment rotation.
       if (this.retentionCap != null && size > Math.max(1, Math.floor(this.diskCap / 2))) {
         const discarded = fs.existsSync(this.prevFile)
+        let discardedBytes = 0
+        if (discarded) try { discardedBytes = fs.statSync(this.prevFile).size } catch { /* unavailable */ }
         try { fs.unlinkSync(this.prevFile) } catch { /* first segment */ }
+        if (discardedBytes) this.readStartBytes = Math.max(0, this.readStartBytes - discardedBytes)
         fs.renameSync(this.file, this.prevFile)
         if (discarded) this.truncated = true
       }
@@ -232,14 +281,47 @@ class TerminalSpool {
     }
   }
 
+  _diskSegments() {
+    const segments = []
+    let skip = this.readStartBytes
+    for (const file of [this.prevFile, this.file]) {
+      try {
+        const size = fs.statSync(file).size
+        const fileStart = Math.min(size, skip)
+        skip -= fileStart
+        if (size > fileStart) segments.push({ file, fileStart, length: size - fileStart })
+      } catch { /* absent */ }
+    }
+    return segments
+  }
+
   _diskTail(bytes) {
-    if (!bytes) return ''
-    const current = readTail(this.file, bytes)
-    const remaining = Math.max(0, bytes - Buffer.byteLength(current))
-    return (remaining ? readTail(this.prevFile, remaining) : '') + current
+    const cap = Math.max(0, Math.floor(Number(bytes) || 0))
+    if (!cap) return ''
+    const segments = this._diskSegments()
+    const totalBytes = segments.reduce((sum, segment) => sum + segment.length, 0)
+    // Read a few extra bytes so utf8Tail can move a boundary that lands in the
+    // middle of a multi-byte scalar without returning less history than needed.
+    const startByte = Math.max(0, totalBytes - cap - 3)
+    const slices = []
+    let segmentStart = 0
+    for (const segment of segments) {
+      const segmentEnd = segmentStart + segment.length
+      const sliceStart = Math.max(startByte, segmentStart)
+      if (segmentEnd > sliceStart) {
+        const localStart = sliceStart - segmentStart
+        slices.push(readRange(segment.file, segment.fileStart + localStart, segmentEnd - sliceStart))
+      }
+      segmentStart = segmentEnd
+    }
+    return utf8Tail(Buffer.concat(slices), cap)
   }
 
   flush() {
+    if (this.appendTimer) {
+      clearTimeout(this.appendTimer)
+      this.appendTimer = null
+    }
     if (!this.queuedLen) return
     const text = this.queued.join('')
     this.queued = []
@@ -251,16 +333,17 @@ class TerminalSpool {
     if (!data) return
     this._trackModes(data) // input modes matter even when output is not retained
     if (this.retentionCap === 0) { this.truncated = true; return }
-    if (!this.visible) {
-      this._queue(data)
-      return
-    }
+    // Every byte is queued exactly once regardless of renderer visibility.
+    // `chunks` below is only a bounded read cache; its evictions are already
+    // durable (or represented in the disk-failure fallback) and must never be
+    // re-queued.
+    this._queue(data)
+    if (!this.visible) return
     this.chunks.push(data)
     this.chunksLen += Buffer.byteLength(data)
     while (this.chunks.length > 1 && this.chunksLen > this.hotCap) {
       const old = this.chunks.shift()
       this.chunksLen -= Buffer.byteLength(old)
-      this._queue(old)
     }
   }
 
@@ -268,7 +351,6 @@ class TerminalSpool {
     this.visible = !!visible
     if (viewState && typeof viewState === 'object') this.viewState = viewState
     if (!this.visible) {
-      for (const chunk of this.chunks) this._queue(chunk)
       this.chunks = []
       this.chunksLen = 0
       this.flush()
@@ -287,15 +369,18 @@ class TerminalSpool {
     const hotBytes = Buffer.byteLength(hot)
     const fallback = this.fallbackChunks.join('')
     const fallbackBytes = Buffer.byteLength(fallback)
-    const liveBytes = Math.min(cap, hotBytes + fallbackBytes)
-    const old = this._diskTail(Math.max(0, cap - liveBytes))
-    let output = old + fallback + hot
-    if (Buffer.byteLength(output) > cap) output = utf8Tail(output, cap)
+    // Eager append means the hot tail overlaps the end of the disk log. Use it
+    // directly only when it can satisfy the whole read; otherwise read the
+    // authoritative disk tail and append only disk-write fallback bytes.
+    const output = !fallbackBytes && !this.diskError && hotBytes >= cap
+      ? utf8Tail(hot, cap)
+      : utf8Tail(this._diskTail(cap) + fallback, cap)
     let diskBytes = 0
     for (const file of [this.prevFile, this.file]) {
       try { diskBytes += fs.statSync(file).size } catch { /* absent */ }
     }
-    return { output, truncated: this.truncated || diskBytes + hotBytes + fallbackBytes > cap, viewState: this.viewState, modePrefix: this._modePrefix() }
+    const liveDiskBytes = Math.max(0, diskBytes - this.readStartBytes)
+    return { output, truncated: this.truncated || liveDiskBytes + fallbackBytes > cap, viewState: this.viewState, modePrefix: this._modePrefix() }
   }
 
   /** Return one bounded page ending `distanceFromEnd` bytes before the live
@@ -304,14 +389,10 @@ class TerminalSpool {
    * translated to absolute stream offsets by terminalManager. */
   historyPage(distanceFromEnd = 0, outputCap = DEFAULT_SNAPSHOT_CAP) {
     this.flush()
-    const segments = []
-    for (const file of [this.prevFile, this.file]) {
-      try {
-        const length = fs.statSync(file).size
-        if (length > 0) segments.push({ file, length })
-      } catch { /* absent */ }
-    }
-    for (const value of [this.fallbackChunks.join(''), this.chunks.join('')]) {
+    const segments = this._diskSegments()
+    // `chunks` is a cache of the already-appended disk suffix. Only fallback
+    // bytes represent output not present in the disk segments.
+    for (const value of [this.fallbackChunks.join('')]) {
       const buffer = Buffer.from(value, 'utf8')
       if (buffer.length > 0) segments.push({ buffer, length: buffer.length })
     }
@@ -332,7 +413,7 @@ class TerminalSpool {
         const length = sliceEnd - sliceStart
         slices.push(segment.buffer
           ? segment.buffer.subarray(localStart, localStart + length)
-          : readRange(segment.file, localStart, length))
+          : readRange(segment.file, segment.fileStart + localStart, length))
       }
       segmentStart = segmentEnd
     }
@@ -380,6 +461,8 @@ module.exports = {
   DEFAULT_HOT_CAP,
   DEFAULT_SNAPSHOT_CAP,
   DEFAULT_QUEUE_CAP,
+  DEFAULT_COLD_TAIL_CAP,
+  SPOOL_APPEND_DEBOUNCE_MS,
   readTail,
   utf8Tail,
   readRange,

@@ -350,7 +350,10 @@ struct RootShellView: View {
                 settings: settings,
                 workspace: model.currentProjectDirectory,
                 initialSectionID: settingsSectionID,
-                dismiss: { showSettings = false }
+                dismiss: { showSettings = false },
+                updateDetail: KaisolaMacAppDelegate.sharedUpdateAvailabilityDetail(),
+                interruptibleTurnCount: { model.interruptibleTurnCount },
+                canCheckForUpdates: KaisolaMacAppDelegate.sharedCanCheckForUpdates()
             )
         }
         .sheet(item: $quickActionsTarget) { target in
@@ -3833,13 +3836,21 @@ private struct InAppSettingsSheet: View {
     let workspace: URL?
     let initialSectionID: String?
     let dismiss: () -> Void
+    /// Full capability parity with the ⌘, window (2026-08-06 spec §3c): the
+    /// sheet used to silently drop the updater's unavailability reason and
+    /// the restart warning's turn count.
+    var updateDetail: String?
+    var interruptibleTurnCount: (() -> Int)?
+    var canCheckForUpdates = true
 
     var body: some View {
         SettingsView(
             settings: settings,
-            checkForUpdates: {
+            checkForUpdates: canCheckForUpdates ? {
                 NotificationCenter.default.post(name: .kaisolaCheckForUpdates, object: nil)
-            },
+            } : nil,
+            updateDetail: updateDetail,
+            interruptibleTurnCount: interruptibleTurnCount,
             workspace: workspace,
             dismiss: dismiss,
             initialSectionID: initialSectionID

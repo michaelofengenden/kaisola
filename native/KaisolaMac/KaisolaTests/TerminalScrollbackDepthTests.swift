@@ -34,7 +34,7 @@ final class TerminalScrollbackDepthTests: XCTestCase {
         // Electron ran 5000. Twenty thousand keeps four times that interactive
         // depth while the broker-backed transcript owns lossless continuation.
         XCTAssertGreaterThanOrEqual(NativePreviewSettings.terminalScrollbackDefault, 5_000)
-        XCTAssertEqual(NativePreviewSettings.terminalScrollbackDefault, 20_000)
+        XCTAssertEqual(NativePreviewSettings.terminalScrollbackDefault, 5_000)
     }
 
     func testChangeScrollbackTakesEffect() {
@@ -99,12 +99,19 @@ final class TerminalScrollbackDepthTests: XCTestCase {
         defaults.set(100_000, forKey: "terminalScrollbackLines")
         XCTAssertEqual(
             NativePreviewSettings(defaults: defaults, persistsChanges: false).terminalScrollbackLines,
-            20_000
+            5_000
         )
-        defaults.set(5_000, forKey: "terminalScrollbackLines")
+        // The version-2 implicit default steps down too…
+        defaults.set(20_000, forKey: "terminalScrollbackLines")
         XCTAssertEqual(
             NativePreviewSettings(defaults: defaults, persistsChanges: false).terminalScrollbackLines,
             5_000
+        )
+        // …while a custom depth survives.
+        defaults.set(12_345, forKey: "terminalScrollbackLines")
+        XCTAssertEqual(
+            NativePreviewSettings(defaults: defaults, persistsChanges: false).terminalScrollbackLines,
+            12_345
         )
     }
 
@@ -131,8 +138,8 @@ final class TerminalScrollbackDepthTests: XCTestCase {
 
         let settings = NativePreviewSettings(defaults: defaults)
 
-        XCTAssertEqual(settings.terminalScrollbackLines, 20_000)
-        XCTAssertEqual(defaults.integer(forKey: "terminalScrollbackLines"), 20_000)
+        XCTAssertEqual(settings.terminalScrollbackLines, 5_000)
+        XCTAssertEqual(defaults.integer(forKey: "terminalScrollbackLines"), 5_000)
         XCTAssertEqual(
             defaults.integer(forKey: "terminalScrollbackPolicyVersion"),
             NativePreviewSettings.terminalScrollbackPolicyVersion

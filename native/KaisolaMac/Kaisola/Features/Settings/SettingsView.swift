@@ -44,11 +44,38 @@ struct SettingsView: View {
         return "\(subject) mid-turn and will be interrupted. \(terminals)"
     }
 
+    /// The row always answers "what am I running, and when did we last look?"
+    /// (2026-08-06 spec §3d) — the one question the old row never answered.
     private var softwareUpdateDetail: String {
+        let version = Bundle.main.object(
+            forInfoDictionaryKey: "CFBundleShortVersionString"
+        ) as? String ?? "—"
         if let pending = updates.pendingUpdate {
-            return "Kaisola \(pending.version) is downloaded and ready to install"
+            return "Kaisola \(version) — \(pending.version) is downloaded and ready to install"
         }
-        return updateDetail ?? "Sparkle preview channel"
+        if let updateDetail {
+            // An unavailable updater states its reason, not a channel name.
+            return "Kaisola \(version) — \(updateDetail)"
+        }
+        switch updates.checkStatus {
+        case .checking:
+            return "Kaisola \(version) — checking for updates…"
+        case .upToDate(let at):
+            return "Kaisola \(version) — up to date (checked \(Self.relative(at)))"
+        case .failed(let reason, let at):
+            return "Kaisola \(version) — check failed \(Self.relative(at)): \(reason)"
+        case .idle(let lastChecked):
+            if let lastChecked {
+                return "Kaisola \(version) — last checked \(Self.relative(lastChecked))"
+            }
+            return "Kaisola \(version)"
+        }
+    }
+
+    private static func relative(_ date: Date) -> String {
+        let formatter = RelativeDateTimeFormatter()
+        formatter.unitsStyle = .short
+        return formatter.localizedString(for: date, relativeTo: Date())
     }
     /// The key window's active project (feeds workspace-scoped tabs like MCP).
     var workspace: URL?
@@ -160,30 +187,18 @@ struct SettingsView: View {
             .padding(.horizontal, 14)
             .padding(.bottom, 16)
 
-            ForEach(SettingsSection.allCases) { section in
-                Button {
-                    withAnimation(.easeOut(duration: 0.14)) { selectedSection = section }
-                } label: {
-                    HStack(spacing: 10) {
-                        Image(systemName: section.symbol)
-                            .frame(width: 18)
-                        Text(section.title)
-                        Spacer(minLength: 0)
-                    }
-                    .font(.callout.weight(selectedSection == section ? .semibold : .regular))
-                    .foregroundStyle(selectedSection == section ? Color.primary : .secondary)
-                    .padding(.horizontal, 11)
-                    .frame(height: 36)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .background(
-                        selectedSection == section ? Color.accentColor.opacity(0.14) : .clear,
-                        in: RoundedRectangle(cornerRadius: 9)
-                    )
-                    .contentShape(Rectangle())
+            // Grouped clusters (spec §3a): quiet headers, eleven sections in
+            // four families instead of one flat run.
+            ForEach(SettingsGroup.allCases) { group in
+                Text(group.title.uppercased())
+                    .font(.system(size: 10.5, weight: .semibold))
+                    .foregroundStyle(.tertiary)
+                    .padding(.horizontal, 14)
+                    .padding(.top, group == SettingsGroup.allCases.first ? 0 : 10)
+                    .accessibilityAddTraits(.isHeader)
+                ForEach(group.sections) { section in
+                    sectionButton(section)
                 }
-                .buttonStyle(.plain)
-                .frame(maxWidth: .infinity)
-                .accessibilityAddTraits(selectedSection == section ? .isSelected : [])
             }
 
             Spacer()
@@ -205,6 +220,32 @@ struct SettingsView: View {
                 )
             }
         }
+    }
+
+    private func sectionButton(_ section: SettingsSection) -> some View {
+        Button {
+            withAnimation(.easeOut(duration: 0.14)) { selectedSection = section }
+        } label: {
+            HStack(spacing: 10) {
+                Image(systemName: section.symbol)
+                    .frame(width: 18)
+                Text(section.title)
+                Spacer(minLength: 0)
+            }
+            .font(.callout.weight(selectedSection == section ? .semibold : .regular))
+            .foregroundStyle(selectedSection == section ? Color.primary : .secondary)
+            .padding(.horizontal, 11)
+            .frame(height: 34)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(
+                selectedSection == section ? Color.accentColor.opacity(0.14) : .clear,
+                in: RoundedRectangle(cornerRadius: 9)
+            )
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .frame(maxWidth: .infinity)
+        .accessibilityAddTraits(selectedSection == section ? .isSelected : [])
     }
 
     @ViewBuilder
@@ -450,11 +491,18 @@ struct SettingsView: View {
                             Button("Restart and Update") { restartRequest = RestartRequest() }
                                 .buttonStyle(.borderedProminent)
                                 .controlSize(.small)
+                        } else if case .checking = updates.checkStatus {
+                            ProgressView()
+                                .controlSize(.small)
+                                .accessibilityLabel("Checking for updates")
                         } else {
+                            // Steps aside while Sparkle's own window is up so
+                            // the two UIs never fight over one check.
                             Button("Check Now") { checkForUpdates?() }
                                 .buttonStyle(.bordered)
                                 .controlSize(.small)
-                                .disabled(checkForUpdates == nil)
+                                .disabled(checkForUpdates == nil
+                                          || updates.sparkleIsPresentingUpdate)
                         }
                     }
                     SettingsDivider()
@@ -799,9 +847,36 @@ struct SettingsView: View {
     }
 }
 
-private enum SettingsSection: String, CaseIterable, Identifiable {
+/// Sidebar clusters (2026-08-06 spec §3a). Internal — selection travels as
+/// the enum end-to-end; deep links go through `SettingsSection(rawValue:)`.
+enum SettingsGroup: String, CaseIterable, Identifiable {
+    case app, workspace, agents, device
+    var id: String { rawValue }
+    var title: String {
+        switch self {
+        case .app: "App"
+        case .workspace: "Workspace"
+        case .agents: "Agents"
+        case .device: "Device"
+        }
+    }
+    var sections: [SettingsSection] {
+        SettingsSection.allCases.filter { $0.group == self }
+    }
+}
+
+enum SettingsSection: String, CaseIterable, Identifiable {
     case general, terminal, companion, guardrails, mcp, accounts, agents, models, shortcuts, usage, updates
     var id: String { rawValue }
+
+    var group: SettingsGroup {
+        switch self {
+        case .general, .updates: .app
+        case .terminal, .guardrails, .shortcuts: .workspace
+        case .agents, .models, .accounts, .mcp, .usage: .agents
+        case .companion: .device
+        }
+    }
     var title: String {
         switch self {
         case .general: "General"

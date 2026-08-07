@@ -579,6 +579,16 @@ final class KaisolaMacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDele
         )
     }()
     private let updateController = NativeUpdateController()
+
+    /// The in-workspace settings sheet needs the updater's state without a
+    /// delegate reference threaded through every view (spec §3c).
+    static func sharedUpdateAvailabilityDetail() -> String? {
+        (NSApp.delegate as? KaisolaMacAppDelegate)?.updateController.availability.detail
+    }
+
+    static func sharedCanCheckForUpdates() -> Bool {
+        (NSApp.delegate as? KaisolaMacAppDelegate)?.updateController.availability.canCheck ?? false
+    }
     // Each window is an independent workspace with its own AppModel and broker
     // observer connection — the broker's coexistence contract makes concurrent
     // observers safe. Keyed by the NSWindow so menu actions target the key one.
@@ -775,6 +785,11 @@ final class KaisolaMacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDele
             ProjectFileIndex.shared.purge()
         }
         MemoryPressureResponder.shared.start()
+        // Usage stats stay fresh on their own (spec §3e): frontmost window's
+        // workspace, every 5 minutes while active.
+        UsageCenter.shared.startBackgroundRefresh { [weak self] in
+            self?.activeSettingsModel()?.currentProjectDirectory
+        }
         if resourceWorkloadRequested, resourceWorkload == nil {
             print("KAISOLA_NATIVE_RESOURCE_WORKLOAD_READY=FAIL invalid-private-temporary-root")
             NSApp.terminate(nil)
@@ -3105,8 +3120,12 @@ final class KaisolaMacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDele
             settingsWindow.makeKeyAndOrderFront(nil)
             return
         }
+        // Sized to the SettingsView's own contract (minWidth 820, ideal
+        // 1100×800) — the old 810×540/min-760 window sat BELOW the view's
+        // minimum, so first layout fought and the window opened cramped
+        // (2026-08-06 spec §3a).
         let window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 810, height: 540),
+            contentRect: NSRect(x: 0, y: 0, width: 1_100, height: 800),
             styleMask: [.titled, .closable, .resizable, .fullSizeContentView],
             backing: .buffered,
             defer: false
@@ -3116,7 +3135,7 @@ final class KaisolaMacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDele
         window.titleVisibility = .hidden
         window.isOpaque = false
         window.backgroundColor = .clear
-        window.minSize = NSSize(width: 760, height: 500)
+        window.minSize = NSSize(width: 820, height: 560)
         window.isReleasedWhenClosed = false
         window.delegate = self
         bindSettingsWindow(window, to: model)

@@ -45,3 +45,10 @@ Modify `App/UsageCenter.swift`: published `planUsage` becomes `planUsageByContex
 
 ### Task 6: Full verification
 Full `KaisolaTests`; manual pass over every settings pane in window + sheet; update check against the live appcast; usage numbers refresh without touching Settings. Commit `test(settings): overhaul verified`.
+
+
+---
+
+## Status (2026-08-07 morning)
+
+Done: grouped navigation (Task 1 core), window sizing fix, sheet capability parity (Task 3), the two-axis update state machine with generation fencing and the honest row (Task 4), background usage refresh + async process wait (Task 5 core). Deferred to the next round: the per-pane file split (Task 2, pure refactor), Form→card conversion for Agents/Guardrails, per-context published usage (the existing context-key guard prevents cross-workspace bleed on write; a focus change can briefly show the previous workspace until the next tick).

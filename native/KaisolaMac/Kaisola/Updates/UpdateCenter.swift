@@ -39,6 +39,47 @@ final class UpdateCenter: ObservableObject {
     /// can step aside rather than duplicate it.
     @Published private(set) var sparkleIsPresentingUpdate = false
 
+    /// What checking is doing right now — deliberately a SEPARATE axis from
+    /// `pendingUpdate` (2026-08-06 spec §3d): clearing or replacing check
+    /// state must never discard a handed-over install block. Every Sparkle
+    /// delegate callback maps to exactly one transition here, and results are
+    /// generation-fenced so an abandoned check cannot overwrite a newer one.
+    enum CheckStatus: Equatable {
+        case idle(lastChecked: Date?)
+        case checking(generation: UInt64)
+        case upToDate(at: Date)
+        case failed(reason: String, at: Date)
+    }
+
+    @Published private(set) var checkStatus: CheckStatus = .idle(lastChecked: nil)
+    private var checkGeneration: UInt64 = 0
+
+    /// A user- or timer-initiated check began.
+    func beginCheck() -> UInt64 {
+        checkGeneration &+= 1
+        checkStatus = .checking(generation: checkGeneration)
+        return checkGeneration
+    }
+
+    /// The check finished with no update available.
+    func finishCheckUpToDate(generation: UInt64) {
+        guard case .checking(let current) = checkStatus, current == generation else { return }
+        checkStatus = .upToDate(at: Date())
+    }
+
+    /// The check failed (network, appcast, signature…).
+    func finishCheckFailed(generation: UInt64, reason: String) {
+        guard case .checking(let current) = checkStatus, current == generation else { return }
+        checkStatus = .failed(reason: reason, at: Date())
+    }
+
+    /// The check found an update (Sparkle proceeds to download/present); the
+    /// spinner ends, and readiness arrives later on the OTHER axis.
+    func finishCheckFoundUpdate(generation: UInt64) {
+        guard case .checking(let current) = checkStatus, current == generation else { return }
+        checkStatus = .idle(lastChecked: Date())
+    }
+
     /// Mirrors of Sparkle's preferences, republished so SwiftUI re-renders on
     /// change. `SPUUpdater` remains the source of truth — these are refreshed
     /// from it after every write rather than stored independently, because

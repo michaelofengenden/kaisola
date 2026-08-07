@@ -52,3 +52,10 @@ Thematic breaks, table strokes, link color, checkbox accent re-tuned to sit with
 
 ### Task 5: Full verification
 All markdown test classes + full suite; manual read of a long real document (harvest blueprint) checking: serif body, centered measure, quote bars, code cards, tables sans, reveal still works, no anchor jumps on zoom. Commit `test(md): serif reading verified`.
+
+
+---
+
+## Status (2026-08-07 morning)
+
+Done: serif face with trait composition (Task 1), centered reading measure (Task 2). Deferred to the next round: range-backed quote bars and code-block cards (Task 3) and the palette pass (Task 4) — decoration-model surgery deserves a fresh session.

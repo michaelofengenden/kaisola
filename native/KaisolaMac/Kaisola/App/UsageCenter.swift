@@ -1,3 +1,4 @@
+import AppKit
 import Combine
 import CryptoKit
 import Foundation
@@ -656,6 +657,39 @@ final class UsageCenter: ObservableObject {
 
     @Published private(set) var byChat: [String: ChatUsage] = [:]
     @Published private(set) var planUsage: [ProviderPlanUsage] = []
+
+    /// Background freshness (2026-08-06 spec §3e): every 5 minutes while the
+    /// app is active, the frontmost workspace refreshes non-forced (the 180s
+    /// TTL keeps coalescing), re-armed on wake and activation. Stats are
+    /// simply fresh when you look — Settings, the footer chip, headroom
+    /// advice — instead of fetching while you wait.
+    private var backgroundRefreshTask: Task<Void, Never>?
+    private var backgroundObservers: [NSObjectProtocol] = []
+    static let backgroundRefreshInterval: TimeInterval = 300
+
+    func startBackgroundRefresh(activeWorkspace: @escaping @MainActor () -> URL?) {
+        guard backgroundRefreshTask == nil else { return }
+        let arm: @MainActor () -> Void = { [weak self] in
+            guard let self else { return }
+            self.backgroundRefreshTask?.cancel()
+            self.backgroundRefreshTask = Task { @MainActor [weak self] in
+                while !Task.isCancelled {
+                    if NSApp?.isActive == true, let workspace = activeWorkspace() {
+                        self?.refreshPlanUsage(workspace: workspace, force: false)
+                    }
+                    try? await Task.sleep(for: .seconds(Self.backgroundRefreshInterval))
+                }
+            }
+        }
+        arm()
+        let center = NotificationCenter.default
+        backgroundObservers.append(center.addObserver(
+            forName: NSApplication.didBecomeActiveNotification, object: nil, queue: .main
+        ) { _ in MainActor.assumeIsolated { arm() } })
+        backgroundObservers.append(NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.didWakeNotification, object: nil, queue: .main
+        ) { _ in MainActor.assumeIsolated { arm() } })
+    }
     @Published private(set) var isRefreshingPlanUsage = false
     @Published private(set) var planUsageError: String?
 
@@ -1303,7 +1337,7 @@ final class UsageCenter: ObservableObject {
                     group.addTask {
                         (
                             index,
-                            readSingleProviderPlanUsage(
+                            await readSingleProviderPlanUsage(
                                 package: package,
                                 currentDirectory: currentDirectory,
                                 request: request
@@ -1326,7 +1360,7 @@ final class UsageCenter: ObservableObject {
         package: VerifiedBrokerHelperPackage,
         currentDirectory: URL?,
         request: PlanUsageRequest
-    ) -> ProviderPlanUsage {
+    ) async -> ProviderPlanUsage {
         let unavailable: (String) -> ProviderPlanUsage = { message in
             ProviderPlanUsage(
                 provider: request.provider.rawValue,
@@ -1354,21 +1388,53 @@ final class UsageCenter: ObservableObject {
             let errors = Pipe()
             process.standardOutput = output
             process.standardError = errors
-            try process.run()
-            let deadline = Date().addingTimeInterval(20)
-            while process.isRunning, Date() < deadline {
-                if Task.isCancelled {
-                    process.terminate()
-                    return unavailable("Limit check cancelled.")
-                }
-                Thread.sleep(forTimeInterval: 0.05)
+            // Drain both pipes CONCURRENTLY with the wait — a chatty child
+            // that fills a pipe buffer would otherwise deadlock against a
+            // parent that reads only after exit — and wait via the
+            // termination handler instead of the old 50 ms Thread.sleep spin
+            // that burned a thread per account per refresh (spec §3e).
+            nonisolated(unsafe) var stdoutData = Data()
+            nonisolated(unsafe) var stderrDrained = false
+            let drainQueue = DispatchQueue(label: "kaisola.usage.drain")
+            output.fileHandleForReading.readabilityHandler = { handle in
+                let chunk = handle.availableData
+                drainQueue.sync { stdoutData.append(chunk) }
             }
-            if process.isRunning {
+            errors.fileHandleForReading.readabilityHandler = { handle in
+                _ = handle.availableData
+                drainQueue.sync { stderrDrained = true }
+            }
+            try process.run()
+            let finished: Bool = await withTaskCancellationHandler {
+                await withCheckedContinuation { continuation in
+                    nonisolated(unsafe) var resumed = false
+                    let resumeOnce: @Sendable (Bool) -> Void = { value in
+                        drainQueue.sync {
+                            guard !resumed else { return }
+                            resumed = true
+                            continuation.resume(returning: value)
+                        }
+                    }
+                    process.terminationHandler = { _ in resumeOnce(true) }
+                    drainQueue.asyncAfter(deadline: .now() + 20) {
+                        if process.isRunning { process.terminate() }
+                        resumeOnce(!process.isRunning)
+                    }
+                }
+            } onCancel: {
                 process.terminate()
+            }
+            output.fileHandleForReading.readabilityHandler = nil
+            errors.fileHandleForReading.readabilityHandler = nil
+            _ = stderrDrained
+            if Task.isCancelled {
+                return unavailable("Limit check cancelled.")
+            }
+            if !finished {
                 return unavailable("\(request.provider.displayName) limit check timed out.")
             }
-            let data = output.fileHandleForReading.readDataToEndOfFile()
-            _ = errors.fileHandleForReading.readDataToEndOfFile()
+            let trailing = output.fileHandleForReading.readDataToEndOfFile()
+            let data = drainQueue.sync { stdoutData + trailing }
             guard !data.isEmpty else {
                 return unavailable("\(request.provider.displayName) limit reader returned no data.")
             }

@@ -345,6 +345,21 @@ struct MarkdownEditingStyle: Sendable {
 /// touches a table grows to cover the whole table region (its geometry is
 /// measured as a unit), and overlapping results merge so a range is never
 /// painted twice in one pass.
+/// The reading column (2026-08-06 spec §1b): text caps at ~70 characters of
+/// the serif body and centers when the pane is wider, LessWrong-style. All
+/// math is in UNMAGNIFIED document points — the text view's bounds are
+/// already document-space under NSScrollView magnification, so zoom scales
+/// the measure with the type and never double-applies.
+enum ReadingMeasure {
+    static let maxWidth: CGFloat = 620
+    static let minimumInset: CGFloat = 12
+
+    static func inset(paneWidth: CGFloat) -> CGFloat {
+        guard paneWidth > maxWidth + minimumInset * 2 else { return minimumInset }
+        return ((paneWidth - maxWidth) / 2).rounded()
+    }
+}
+
 enum MarkdownIncrementalStyle {
     static func rangesToRestyle(
         changed: [NSRange],
@@ -1525,9 +1540,16 @@ struct MarkdownRenderedEditor: NSViewRepresentable {
         /// step has to re-align the grid. Ordinary scrolling and typing do not
         /// change the container width and so cost nothing here.
         func restyleIfDocumentWidthChanged() {
-            guard let width = textView?.textContainer?.size.width, width > 0 else { return }
+            guard let textView, let width = textView.textContainer?.size.width, width > 0 else { return }
             guard styledWidth.map({ abs($0 - width) > 0.5 }) ?? true else { return }
             styledWidth = width
+            // The reading column re-centers with the pane (spec §1b); the
+            // container width tracks the text view, so adjusting the inset
+            // here reflows before the debounced restyle lands.
+            let inset = ReadingMeasure.inset(paneWidth: textView.bounds.width)
+            if abs(textView.textContainerInset.width - inset) > 0.5 {
+                textView.textContainerInset = NSSize(width: inset, height: 12)
+            }
             scheduleStyling(immediately: false)
         }
 

@@ -61,9 +61,37 @@ final class NativeUpdateController: NSObject {
         }
     }
 
+    /// The generation of the in-flight explicit check, matched against
+    /// Sparkle's cycle-finished callback so a stale completion cannot
+    /// overwrite a newer check's status (2026-08-06 spec §3d).
+    private var activeCheckGeneration: UInt64?
+
     func checkForUpdates(_ sender: Any?) {
         guard availability.canCheck, let standardController else { return }
+        activeCheckGeneration = UpdateCenter.shared.beginCheck()
         standardController.checkForUpdates(sender)
+    }
+
+    fileprivate func finishCycle(error: (any Error)?, foundUpdate: Bool) {
+        guard let generation = activeCheckGeneration else { return }
+        activeCheckGeneration = nil
+        if let error {
+            let ns = error as NSError
+            // "The user cancelled" and "no update found" both surface as
+            // errors from Sparkle; only real failures should read as failed.
+            if ns.domain == "SUSparkleErrorDomain", ns.code == 1_001 {
+                UpdateCenter.shared.finishCheckUpToDate(generation: generation)
+            } else {
+                UpdateCenter.shared.finishCheckFailed(
+                    generation: generation,
+                    reason: ns.localizedDescription
+                )
+            }
+        } else if foundUpdate {
+            UpdateCenter.shared.finishCheckFoundUpdate(generation: generation)
+        } else {
+            UpdateCenter.shared.finishCheckUpToDate(generation: generation)
+        }
     }
 
     // MARK: - Automatic update preferences
@@ -119,6 +147,27 @@ extension NativeUpdateController: SPUUpdaterDelegate {
             }
         }
         return true
+    }
+
+    nonisolated func updater(
+        _ updater: SPUUpdater,
+        didFinishUpdateCycleFor updateCheck: SPUUpdateCheck,
+        error: (any Error)?
+    ) {
+        let boxed = error.map(UncheckedSendableBox.init)
+        DispatchQueue.main.async {
+            MainActor.assumeIsolated { [weak self] in
+                self?.finishCycle(error: boxed?.value, foundUpdate: false)
+            }
+        }
+    }
+
+    nonisolated func updater(_ updater: SPUUpdater, didFindValidUpdate item: SUAppcastItem) {
+        DispatchQueue.main.async {
+            MainActor.assumeIsolated { [weak self] in
+                self?.finishCycle(error: nil, foundUpdate: true)
+            }
+        }
     }
 }
 

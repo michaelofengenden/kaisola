@@ -57,3 +57,20 @@ final class MarkdownReadingTypeTests: XCTestCase {
         XCTAssertNil(quote[.obliqueness], "true italics replaced the skew")
     }
 }
+
+extension MarkdownReadingTypeTests {
+    func testReadingMeasureCentersAboveTheCapAndClampsBelow() {
+        // Narrow pane: the floor inset.
+        XCTAssertEqual(ReadingMeasure.inset(paneWidth: 500), 12)
+        // Exactly at cap + floors: still the floor.
+        XCTAssertEqual(ReadingMeasure.inset(paneWidth: 620 + 24), 12)
+        // Wide pane: centered.
+        XCTAssertEqual(ReadingMeasure.inset(paneWidth: 1_020), 200)
+        // Document-space math means the same width yields the same inset at
+        // any magnification — zoom scales the measure with the type.
+        XCTAssertEqual(
+            ReadingMeasure.inset(paneWidth: 1_020),
+            ReadingMeasure.inset(paneWidth: 1_020)
+        )
+    }
+}

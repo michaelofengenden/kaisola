@@ -605,7 +605,7 @@ final class NativePreviewSettings: ObservableObject {
     // terminal cell buffers are the app's single largest memory consumer.
     // Users who customized the setting keep their value.
     static let terminalScrollbackDefault = 5_000
-    static let terminalScrollbackPolicyVersion = 2
+    static let terminalScrollbackPolicyVersion = 3
 
     static func clampedTerminalScrollback(_ lines: Int) -> Int {
         min(max(lines, terminalScrollbackRange.lowerBound), terminalScrollbackRange.upperBound)
@@ -880,12 +880,15 @@ final class NativePreviewSettings: ObservableObject {
         let storedScrollbackPolicyVersion = defaults.integer(
             forKey: Keys.terminalScrollbackPolicyVersion
         )
-        // Version 1 temporarily made 100 000 the implicit default. Migrate that
-        // exact value once now that lossless broker paging is the continuation
-        // path; after the marker is written, an explicit 100 000-row choice is
-        // preserved. Older custom depths remain untouched.
+        // Version 1 temporarily made 100 000 the implicit default; version 2
+        // made it 20 000. Each policy step migrates the PREVIOUS implicit
+        // default exactly once — after the marker is written, the same value
+        // chosen explicitly is preserved, and custom depths are never
+        // touched. Version 3 (2026-08-06 spec §2b) steps to the 5 000-line
+        // window now that history pages losslessly from the broker spool.
+        let previousImplicitDefaults = [Self.terminalScrollbackRange.upperBound, 20_000]
         let migratesLegacyMaximum = storedScrollbackPolicyVersion < Self.terminalScrollbackPolicyVersion
-            && storedScrollback == Self.terminalScrollbackRange.upperBound
+            && previousImplicitDefaults.contains(storedScrollback)
         let resolvedScrollback = migratesLegacyMaximum
             ? Self.terminalScrollbackDefault
             : storedScrollback > 0

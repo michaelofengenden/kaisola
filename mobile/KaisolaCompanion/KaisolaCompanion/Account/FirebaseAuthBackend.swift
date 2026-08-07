@@ -154,6 +154,14 @@ enum KeychainAuthInteractionPolicy: Equatable, Sendable {
 final class KeychainAuthSecureStore: AuthSecureStoring, @unchecked Sendable {
     private let service: String
     private let interactionPolicy: KeychainAuthInteractionPolicy
+    /// The data-protection keychain needs an application-identifier
+    /// entitlement on macOS; a build signed without one gets
+    /// errSecMissingEntitlement on EVERY operation — which shipped as
+    /// "sign-in doesn't work" in 0.1.109. Once the modern keychain refuses,
+    /// this store falls back to the legacy keychain for the process; builds
+    /// that do carry the entitlement keep the modern, never-prompting path.
+    private let fallbackLock = NSLock()
+    private var useLegacyKeychain = false
 
     /// Stable signed-product namespace. Passing the bundle identifier in tests
     /// makes the identity contract observable without touching the Keychain.
@@ -178,6 +186,10 @@ final class KeychainAuthSecureStore: AuthSecureStoring, @unchecked Sendable {
 
         var result: CFTypeRef?
         let status = SecItemCopyMatching(query as CFDictionary, &result)
+        if status == errSecMissingEntitlement {
+            recordMissingEntitlement()
+            return try data(for: key)
+        }
         if status == errSecItemNotFound {
             return try migrateLegacyItemIfPresent(for: key)
         }
@@ -185,6 +197,18 @@ final class KeychainAuthSecureStore: AuthSecureStoring, @unchecked Sendable {
             throw KeychainStoreError(status: status)
         }
         return data
+    }
+
+    private var legacyFallbackActive: Bool {
+        fallbackLock.lock()
+        defer { fallbackLock.unlock() }
+        return useLegacyKeychain
+    }
+
+    private func recordMissingEntitlement() {
+        fallbackLock.lock()
+        defer { fallbackLock.unlock() }
+        useLegacyKeychain = true
     }
 
     /// One-time rescue of an item written by an older build into the legacy
@@ -214,6 +238,10 @@ final class KeychainAuthSecureStore: AuthSecureStoring, @unchecked Sendable {
         ]
         let updateStatus = SecItemUpdate(query as CFDictionary, attributes as CFDictionary)
         if updateStatus == errSecSuccess { return }
+        if updateStatus == errSecMissingEntitlement {
+            recordMissingEntitlement()
+            return try set(data, for: key)
+        }
         guard updateStatus == errSecItemNotFound else {
             throw KeychainStoreError(status: updateStatus)
         }
@@ -221,6 +249,10 @@ final class KeychainAuthSecureStore: AuthSecureStoring, @unchecked Sendable {
         var addQuery = query
         attributes.forEach { addQuery[$0.key] = $0.value }
         let addStatus = SecItemAdd(addQuery as CFDictionary, nil)
+        if addStatus == errSecMissingEntitlement {
+            recordMissingEntitlement()
+            return try set(data, for: key)
+        }
         guard addStatus == errSecSuccess else {
             throw KeychainStoreError(status: addStatus)
         }
@@ -228,6 +260,10 @@ final class KeychainAuthSecureStore: AuthSecureStoring, @unchecked Sendable {
 
     func removeData(for key: String) throws {
         let status = SecItemDelete(baseQuery(for: key) as CFDictionary)
+        if status == errSecMissingEntitlement {
+            recordMissingEntitlement()
+            return try removeData(for: key)
+        }
         // Sweep any stale legacy copy too, so sign-out removes both worlds.
         SecItemDelete(legacyQuery(for: key) as CFDictionary)
         guard status == errSecSuccess || status == errSecItemNotFound else {
@@ -236,16 +272,19 @@ final class KeychainAuthSecureStore: AuthSecureStoring, @unchecked Sendable {
     }
 
     private func baseQuery(for key: String) -> [String: Any] {
-        let query: [String: Any] = [
+        var query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service,
             kSecAttrAccount as String: key,
-            // The data-protection keychain grants access by signed identity
-            // (like ApiKeyStore already does), not by a per-binary ACL — so
-            // auto-updates stop re-prompting for the Firebase sign-in.
-            kSecUseDataProtectionKeychain as String: true,
             kSecUseAuthenticationContext as String: interactionPolicy.makeAuthenticationContext(),
         ]
+        // The data-protection keychain grants access by signed identity, not
+        // by a per-binary ACL — the fix for the per-update re-prompt. It
+        // requires the application-identifier entitlement; a build without it
+        // trips the errSecMissingEntitlement fallback above and stays legacy.
+        if !legacyFallbackActive {
+            query[kSecUseDataProtectionKeychain as String] = true
+        }
         return query
     }
 

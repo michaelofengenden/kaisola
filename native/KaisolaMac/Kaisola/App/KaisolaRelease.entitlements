@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!-- Applied only in the Developer ID release lane (CI passes
+	     CODE_SIGN_ENTITLEMENTS explicitly; local debug builds stay
+	     entitlement-free and use the auth store's legacy-keychain fallback).
+	     The application identifier + keychain access group are what let the
+	     data-protection keychain grant access by signed identity — the fix
+	     for the per-update "Kaisola wants to access the firebase key"
+	     prompts (2026-08-07). -->
+	<key>com.apple.application-identifier</key>
+	<string>$(AppIdentifierPrefix)com.kaisola.mac</string>
+	<key>keychain-access-groups</key>
+	<array>
+		<string>$(AppIdentifierPrefix)com.kaisola.mac</string>
+	</array>
+</dict>
+</plist>

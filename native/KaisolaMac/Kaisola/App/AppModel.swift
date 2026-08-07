@@ -3365,7 +3365,11 @@ final class AppModel: ObservableObject {
             paneLayouts[projectID] = layout
             scheduleWorkspaceStateSave(projectID: projectID)
         }
-        if forgetDurableChat { enqueueTranscriptRemoval(chatID: chatID) }
+        // Unconditional (§4e): the user deleted the chat, so its transcript
+        // goes — the old forgetDurableChat gate could leave tombstoned
+        // content on disk forever when usage bookkeeping said "shared".
+        _ = forgetDurableChat
+        enqueueTranscriptRemoval(chatID: chatID)
         enqueueDraftRemoval(chatID: chatID)
         // The workspace archive must reflect the deletion durably NOW, not
         // after a 220 ms debounce a crash can beat (§4e).
@@ -4920,6 +4924,18 @@ final class AppModel: ObservableObject {
                 agentID: agent?.id,
                 accountBinding: accountBinding
             ))
+            // A restore can resolve to a COLD record: the terminal ended
+            // before the broker restart, so no shell spawned — history is
+            // servable, the pane shows its ended state, and the record is
+            // stamped so it never becomes a resurrection candidate (§2h-1b).
+            if creation.exited {
+                sessionStore.stampEnded(
+                    terminalID, at: Int64(Date().timeIntervalSince1970 * 1_000)
+                )
+                refreshPersistedNavigationState(publish: false)
+                Task { [weak self] in await self?.refreshInventory() }
+                return terminalID
+            }
             // Ensure the session's folder is a persistent project tab — but
             // never on the resurrection path: a respawn must not re-open a
             // closed project's tab or eat its ⌘⇧T undo entry (§4c).
@@ -5461,10 +5477,10 @@ final class AppModel: ObservableObject {
     /// the pane removal. A ⌘Q in the same runloop turn, a dead broker, or a
     /// respawn already in flight all see the truth. Broker cleanup is
     /// best-effort behind it via `drainPendingReleases()`.
-    func commitClose(_ terminalID: String) {
+    func commitClose(_ terminalID: String, recordUndo: Bool = true) {
         terminalDraftDebounceTasks.removeValue(forKey: terminalID)?.cancel()
         persistTerminalDraftNow(terminalID)
-        sessionStore.commitCloseTerminal(terminalID)
+        sessionStore.commitCloseTerminal(terminalID, recordUndo: recordUndo)
         refreshPersistedNavigationState(publish: false)
         dormantTerminalIDs.remove(terminalID)
         terminalResizeTasks.removeValue(forKey: terminalID)?.cancel()
@@ -5492,6 +5508,9 @@ final class AppModel: ObservableObject {
         }
         if selectedSessionID == terminalID {
             selectedSessionID = nil
+            // Async surface teardown (empty document publish) — pure UI, so
+            // it may follow the synchronous state commit.
+            Task { [weak self] in await self?.select(nil) }
         }
         if focusedPaneID == terminalID {
             focusedPaneID = nil
@@ -5533,18 +5552,18 @@ final class AppModel: ObservableObject {
         guard controlAvailable else { return }
         for pending in sessionStore.pendingReleaseList() {
             do {
+                // The broker acknowledges release idempotently — an absent
+                // terminal succeeds — so success is the ONLY ack. An error
+                // (network blip, generation rollover) keeps the entry queued
+                // for the next drain; acking on failure was how a closed
+                // terminal's still-alive PTY could be re-adopted later.
                 try await controlClient.release(
                     projectID: pending.projectID,
                     terminalID: pending.id
                 )
                 sessionStore.acknowledgeRelease(id: pending.id)
             } catch {
-                // The terminal may already be gone (broker restarted without
-                // it): a definitive absence from fresh inventory acknowledges.
-                if !sessions.contains(where: { $0.id == pending.id }) {
-                    sessionStore.acknowledgeRelease(id: pending.id)
-                }
-                // Otherwise keep it queued for the next drain.
+                continue
             }
         }
         await refreshInventory()
@@ -5604,8 +5623,16 @@ final class AppModel: ObservableObject {
             sourceTerminalID: terminalID
         )
         guard let createdID = await recreateSession(from: closed) else { return }
-
-        if var layout = originalLayout,
+        // The create suspended; another window may have closed the old id
+        // (tombstoned it) meanwhile. Its close already reconciled the layout,
+        // so swap against the CURRENT layout, never the pre-await snapshot —
+        // overwriting with the stale copy was a lost-update.
+        if sessionStore.isTerminalTombstoned(terminalID) {
+            focusedPaneID = createdID
+            scheduleWorkspaceStateSave(projectID: record.projectID)
+            return
+        }
+        if var layout = paneLayouts[record.projectID] ?? originalLayout,
            layout.replace(terminalID, with: createdID) {
             paneLayouts[record.projectID] = layout
             focusedPaneID = createdID
@@ -5615,9 +5642,8 @@ final class AppModel: ObservableObject {
         // The replacement owns the pane now; the old record must not linger
         // as a permanent resurrection candidate (§4b). Runs after the layout
         // swap so the reconcile inside commitClose sees the new id, not a
-        // hole. commitClose also queues the release that reaps the exited
-        // diagnostic row on the broker.
-        commitClose(terminalID)
+        // hole. No undo entry: the user asked for a replacement, not a close.
+        commitClose(terminalID, recordUndo: false)
         Task { [weak self] in await self?.drainPendingReleases() }
     }
 
@@ -5663,12 +5689,18 @@ final class AppModel: ObservableObject {
             // this runs on a 2.5s timer for the life of the app — assigning
             // unconditionally rebuilt the entire shell every tick even when the
             // broker reported no change at all.
-            if status.terminals != sessions {
-                notifyInventoryCompletions(previous: sessions, next: status.terminals)
-                sessions = status.terminals
+            // Tombstoned ids never re-enter the visible inventory: a poll
+            // tick landing between commitClose and the broker release must
+            // not flicker the closed terminal back into the tab strip.
+            let visibleTerminals = status.terminals.filter {
+                !sessionStore.isTerminalTombstoned($0.id)
+            }
+            if visibleTerminals != sessions {
+                notifyInventoryCompletions(previous: sessions, next: visibleTerminals)
+                sessions = visibleTerminals
                 reconcileAllPaneLayoutsWithAvailableSurfaces()
                 syncTrackedWorkingDirectories()
-                stampEndedFromInventory(status.terminals)
+                stampEndedFromInventory(visibleTerminals)
             }
             let emptyDrains = await client.detachEmptyDrainingGenerations()
             if !emptyDrains.isEmpty {
@@ -6005,6 +6037,12 @@ final class AppModel: ObservableObject {
             }
             guard created == stored.id else { continue }
             dormantTerminalIDs.remove(stored.id)
+            // A restore can resolve to a COLD record (the terminal had ended
+            // before the reboot): the fresh store record carries endedAt, and
+            // upserting the stale pre-await snapshot would erase that
+            // evidence and offer a resume chip into a dead session.
+            let fresh = sessionStore.sessions().first { $0.id == stored.id }
+            if fresh?.endedAt != nil { continue }
             if let agentID = stored.agentID {
                 // The plain-shell spawn overwrote the stored record; put the
                 // agent identity and account binding back so the chip (and a
@@ -6167,8 +6205,11 @@ final class AppModel: ObservableObject {
                 Task { @MainActor in self?.connectionLost(error, generation: generation) }
             }
 
-            notifyInventoryCompletions(previous: sessions, next: status.terminals)
-            sessions = status.terminals
+            let visibleTerminals = status.terminals.filter {
+                !sessionStore.isTerminalTombstoned($0.id)
+            }
+            notifyInventoryCompletions(previous: sessions, next: visibleTerminals)
+            sessions = visibleTerminals
             connectedBrokerFeatures = hello.features
             brokerUpgradeState = await activeBrokerUpgradeMonitor?.upgradeState() ?? .unknown
             brokerGenerationDetail = BrokerGenerationDiagnostics.detail(

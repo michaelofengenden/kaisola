@@ -50,12 +50,14 @@ final class ClosedLifecycleStoreTests: XCTestCase {
         XCTAssertTrue(store.isTerminalTombstoned(session.id))
     }
 
-    func testAcknowledgeReleaseDrainsTombstoneWhenNothingReferencesIt() {
+    func testAcknowledgeReleaseKeepsTheTombstone() {
         let session = seedSession()
         store.commitCloseTerminal(session.id)
         store.acknowledgeRelease(id: session.id)
         XCTAssertTrue(store.pendingReleaseList().isEmpty)
-        XCTAssertFalse(store.isTerminalTombstoned(session.id))
+        // Permanent by design: the store cannot prove no archived pane still
+        // references the id, and a dropped tombstone revives closed work.
+        XCTAssertTrue(store.isTerminalTombstoned(session.id))
     }
 
     func testRecoverSkipsTombstonedAndExitedRecords() {

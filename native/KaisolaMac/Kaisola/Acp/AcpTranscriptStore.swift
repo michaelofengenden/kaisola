@@ -459,6 +459,10 @@ actor AcpTranscriptStore {
             try transaction(database) {
                 for chatID in writes.keys.sorted() {
                     guard let write = writes[chatID] else { continue }
+                    // A buffered write racing a deletion (a final stream chunk
+                    // landing as the user hits delete) must not re-materialize
+                    // tombstoned content 350ms later (§4e).
+                    guard !isTombstoned(chatID: chatID) else { continue }
                     try apply(write, chatID: chatID, database: database)
                 }
                 try pruneEmptyChats(database)

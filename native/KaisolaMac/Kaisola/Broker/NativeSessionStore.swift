@@ -498,7 +498,7 @@ struct NativeSessionStore: Sendable {
     /// the permanent tombstone, pushes the undo entry, and queues the broker
     /// release — one payload write, synchronous, so a quit in the same
     /// runloop turn already persists the truth.
-    func commitCloseTerminal(_ id: String) {
+    func commitCloseTerminal(_ id: String, recordUndo: Bool = true) {
         var payload = read() ?? Payload(ownerID: ownerID(), sessions: [])
         let record = payload.sessions.first { $0.id == id }
         payload.sessions.removeAll { $0.id == id }
@@ -506,7 +506,7 @@ struct NativeSessionStore: Sendable {
         var tombstones = payload.closedTerminals ?? [:]
         tombstones[id] = Int64(Date().timeIntervalSince1970 * 1_000)
         payload.closedTerminals = tombstones
-        if let record {
+        if let record, recordUndo {
             var stack = payload.closedSessions ?? []
             stack.append(ClosedSession(
                 cwd: record.cwd,
@@ -517,6 +517,10 @@ struct NativeSessionStore: Sendable {
             ))
             if stack.count > closedStackCap { stack.removeFirst(stack.count - closedStackCap) }
             payload.closedSessions = stack
+        }
+        // The broker release is owed whether or not this close records an
+        // undo entry (reopen-replacement closes skip the undo, not the reap).
+        if let record {
             var releases = payload.pendingReleases ?? []
             if !releases.contains(where: { $0.id == id }) {
                 releases.append(PendingRelease(id: id, projectID: record.projectID))
@@ -534,15 +538,15 @@ struct NativeSessionStore: Sendable {
         read()?.pendingReleases ?? []
     }
 
-    /// Release acknowledged (or terminal proven absent). The tombstone drains
-    /// with it only when nothing references the id anymore; kept otherwise so
-    /// archived panes cannot revive the terminal.
+    /// Release acknowledged. The TOMBSTONE stays: this store cannot see the
+    /// workspace archive's panes, so "nothing references the id anymore" is
+    /// unprovable from here — and a dropped tombstone is exactly how a stale
+    /// archived pane or lingering broker PTY revives a closed terminal.
+    /// Tombstones are small (one id + timestamp per explicit close) and
+    /// permanent by design (§4a-1).
     func acknowledgeRelease(id: String) {
         guard var payload = read() else { return }
         payload.pendingReleases?.removeAll { $0.id == id }
-        if payload.sessions.contains(where: { $0.id == id }) == false {
-            payload.closedTerminals?.removeValue(forKey: id)
-        }
         write(payload)
     }
 

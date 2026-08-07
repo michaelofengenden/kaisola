@@ -166,10 +166,12 @@ final class NativeSessionStoreTests: XCTestCase {
     }
 
     func testClosedSessionStackIsBounded() {
-        for index in 0..<15 {
+        // Cap raised 10 → 50 (2026-08-06 spec §4a-1): the stack is a UI
+        // convenience; permanent tombstones carry the closed-state guarantee.
+        for index in 0..<55 {
             store.pushClosedSession(ClosedSession(cwd: "/tmp/s\(index)", agentID: nil, title: "s\(index)"))
         }
-        XCTAssertEqual(store.closedSessions().count, 10)
+        XCTAssertEqual(store.closedSessions().count, 50)
         XCTAssertEqual(store.closedSessions().first?.cwd, "/tmp/s5")   // oldest dropped
     }
 

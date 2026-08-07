@@ -87,6 +87,7 @@ function setAppFocused(focused) {
 /** id → record */
 const terms = new Map()
 const releaseTimers = new Map()
+let shuttingDown = false
 let spoolDir = path.join(os.tmpdir(), `kaisola-terminal-cache-${process.pid}`)
 let eventSink = null
 let activitySink = null
@@ -491,6 +492,7 @@ function spawn({ id, command, args, cwd, env, outputByteLimit, cols, rows, sende
     rec.exited = true
     rec.exitedWhileDetached = !rec.rendererVisible
     rec.exitStatus = { exitCode: exitCode ?? 0, signal: signal ?? null }
+    if (!shuttingDown) rec.spool.markExited(rec.exitStatus)
     settleAgentTurn()
     send(rec.sender, `terminal:exit:${id}`, rec.exitStatus.exitCode)
     rec.observers.broadcast('terminal:observer-exit', {
@@ -841,6 +843,7 @@ function rollingUpdateReadiness() {
 }
 
 function killAll() {
+  shuttingDown = true
   // Capture one last shell cwd while every pid is still live. Missing/erroring
   // lsof is non-fatal and leaves the last inventory value intact.
   refreshCwds({ force: true })

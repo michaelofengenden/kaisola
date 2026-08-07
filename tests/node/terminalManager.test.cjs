@@ -226,3 +226,62 @@ test('live terminal inventory and diagnostics expose cwd', async (t) => {
   assert.equal(listed, liveCwd)
   assert.equal(manager.diagnostics().find((row) => row.id === id)?.cwd, liveCwd)
 })
+
+test('a natural pty exit stamps durable exit evidence', async (t) => {
+  const id = 'natural-exit-evidence'
+  t.after(() => manager.release(id))
+  manager.spawn({
+    id,
+    command: '/bin/sh',
+    args: ['-c', 'exit 7'],
+    cwd: managerSpoolDir,
+  })
+
+  const exitStatus = await manager.waitForExit(id)
+  const meta = TerminalSpool.readMeta(id, managerSpoolDir)
+  assert.ok(Number.isSafeInteger(meta.exitedAt))
+  assert.equal(exitStatus.exitCode, 7)
+  assert.deepEqual(meta.exitStatus, exitStatus)
+})
+
+test('release deletes the spool without recreating exit evidence', async () => {
+  const id = 'released-terminal-has-no-exit-evidence'
+  const record = manager.spawn({
+    id,
+    command: '/bin/cat',
+    args: [],
+    cwd: managerSpoolDir,
+  })
+  const exited = new Promise((resolve) => record.pty.onExit(resolve))
+
+  manager.release(id)
+  await exited
+
+  assert.equal(TerminalSpool.readMeta(id, managerSpoolDir), null)
+  assert.equal(TerminalSpool.coldTail(id, managerSpoolDir), null)
+})
+
+test('killAll suppresses exit stamping during managed broker shutdown', async () => {
+  const id = 'managed-shutdown-has-no-exit-evidence'
+  const record = manager.spawn({
+    id,
+    command: '/bin/cat',
+    args: [],
+    cwd: managerSpoolDir,
+  })
+  let markExitedCalls = 0
+  const markExited = record.spool.markExited.bind(record.spool)
+  record.spool.markExited = (status) => {
+    markExitedCalls += 1
+    return markExited(status)
+  }
+  const exited = new Promise((resolve) => record.pty.onExit(resolve))
+
+  manager.killAll()
+  await exited
+
+  const meta = TerminalSpool.readMeta(id, managerSpoolDir)
+  assert.equal(markExitedCalls, 0)
+  assert.equal(meta.exitedAt, undefined)
+  assert.equal(meta.exitStatus, undefined)
+})

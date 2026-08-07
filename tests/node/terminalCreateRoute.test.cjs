@@ -1,7 +1,21 @@
 'use strict'
 
-const test = require('node:test')
+const { after, test } = require('node:test')
 const assert = require('node:assert/strict')
+const fs = require('node:fs')
+const os = require('node:os')
+const path = require('node:path')
+const realManager = require('../../runtime/node-broker/ipc/terminalManager.cjs')
+const { TerminalSpool } = require('../../runtime/node-broker/ipc/terminalSpool.cjs')
+
+const managerSpoolDir = fs.mkdtempSync(path.join(os.tmpdir(), 'kaisola-terminal-create-route-'))
+realManager.configureStorage(managerSpoolDir)
+realManager.setEventSink(() => true)
+after(() => {
+  realManager.killAll()
+  realManager.setEventSink(null)
+  fs.rmSync(managerSpoolDir, { recursive: true, force: true })
+})
 
 function fakeManager({ live = false, recovered = null } = {}) {
   const calls = []
@@ -111,4 +125,64 @@ test('restore for an id unknown to this broker requires the id-embedded project 
   })
   assert.equal(allowed.ok, true)
   assert.equal(allowed.recovered, null)
+})
+
+test('restore of naturally ended spool registers a history-serving cold record', (t) => {
+  const { terminalCreateRoute } = require('../../runtime/node-broker/ipc/terminalCreateRoute.cjs')
+  const projectId = 'nproj_cold-history'
+  const id = `term-${projectId}-deadbeef`
+  const oldOutput = 'first byte through final byte\n'
+  const exitStatus = { exitCode: 23, signal: null }
+  const spool = new TerminalSpool({ dir: managerSpoolDir, id, fresh: true })
+  spool.push(oldOutput)
+  spool.markExited(exitStatus)
+  spool.close()
+  t.after(() => realManager.release(id))
+
+  const response = terminalCreateRoute({
+    manager: realManager,
+    params: {
+      id,
+      projectId,
+      command: '/bin/cat',
+      cwd: managerSpoolDir,
+      restore: true,
+    },
+    owner: `instance|owner|${projectId}`,
+    clientInstanceId: 'instance',
+    requireAllowed: () => {},
+  })
+
+  const oldBytes = Buffer.byteLength(oldOutput)
+  assert.equal(response.ok, true)
+  assert.equal(response.existed, false)
+  assert.equal(response.pid, null)
+  assert.equal(response.exited, true)
+  assert.deepEqual(response.exitStatus, exitStatus)
+  assert.equal(response.recovered, null)
+  assert.equal(response.output, '')
+  assert.equal(response.startOffset, oldBytes)
+  assert.equal(response.endOffset, oldBytes)
+
+  assert.deepEqual(realManager.history(id, {
+    streamEpoch: response.streamEpoch,
+    beforeOffset: response.endOffset,
+    maxBytes: 1024 * 1024,
+  }), {
+    ok: true,
+    streamEpoch: response.streamEpoch,
+    output: oldOutput,
+    startOffset: 0,
+    endOffset: oldBytes,
+    hasMore: false,
+    truncated: false,
+  })
+  assert.deepEqual(realManager.write(id, 'must not reach a pty'), {
+    ok: false,
+    message: 'terminal already ended',
+  })
+  assert.deepEqual(realManager.resize(id, 100, 40), {
+    ok: false,
+    message: 'terminal already ended',
+  })
 })

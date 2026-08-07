@@ -14,7 +14,6 @@ function terminalCreateRoute({
   brokerPid = process.pid,
   now = Date.now,
 }) {
-  if (!manager.available()) return { ok: false, message: 'node-pty unavailable in session broker' }
   const id = String(params.id || '').slice(0, 240)
   if (!id) return { ok: false, message: 'terminal id required' }
   if (manager.has(id)) requireAllowed(id, true)
@@ -47,7 +46,11 @@ function terminalCreateRoute({
     sender: owner,
     restore,
   })
-  if (!rec) return { ok: false, message: 'could not start terminal' }
+  if (!rec) {
+    return manager.available()
+      ? { ok: false, message: 'could not start terminal' }
+      : { ok: false, message: 'node-pty unavailable in session broker' }
+  }
 
   const continuity = manager.setSender(id, owner)
   const previousInstance = continuity?.previousOwner?.split('|')[0]
@@ -57,7 +60,7 @@ function terminalCreateRoute({
   return {
     ok: true,
     existed,
-    pid: rec.pty?.pid,
+    pid: rec.pty?.pid ?? null,
     continuation,
     ...manager.snapshot(id),
     recovered: null,

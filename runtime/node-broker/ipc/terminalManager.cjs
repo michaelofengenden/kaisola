@@ -332,36 +332,22 @@ function refreshTerminalCwdsAsync(records) {
  */
 function spawn({ id, command, args, cwd, env, outputByteLimit, cols, rows, sender, restore = false }) {
   cancelRelease(id)
-  if (!pty) return null
   const restoring = restore === true
   const prior = terms.get(id)
   if (prior) {
     if (!prior.exited) return prior
+    if (restoring && !prior.pty) return prior
     // a dead pty is not a session — drop the record and spawn fresh under the
     // same id, so a reloaded window gets a working shell instead of a corpse
     prior.spool.close({ remove: !restoring })
     terms.delete(id)
   }
-  const shell = process.env.SHELL || '/bin/zsh'
-  // a persisted cwd can be GONE by now (removed worktree, deleted folder) —
-  // pty.spawn throws uncaught on a missing dir; fall back to home instead
-  const missingCwd = !!cwd && !fs.existsSync(cwd)
-  const startCwd = missingCwd ? os.homedir() : (cwd || os.homedir())
   const retainedOutputBytes = Number.isFinite(outputByteLimit) ? Math.max(0, Math.floor(outputByteLimit)) : null
   const initialCols = cols || 80
   const initialRows = rows || 24
-  const p = pty.spawn(command || shell, command ? args || [] : ['-l'], {
-    name: 'xterm-256color',
-    cols: initialCols,
-    rows: initialRows,
-    cwd: startCwd,
-    env: terminalEnv(env),
-  })
-  const terminalSpool = new TerminalSpool({
+  const spoolOptions = {
     dir: spoolDir,
     id,
-    // Restore reuses the complete durable transcript. Every other create is
-    // a fresh terminal and must not inherit bytes for a recycled id.
     fresh: !restoring,
     ...(retainedOutputBytes == null ? {} : {
       diskCap: Math.max(1, retainedOutputBytes),
@@ -369,7 +355,61 @@ function spawn({ id, command, args, cwd, env, outputByteLimit, cols, rows, sende
       queueCap: Math.max(1, Math.min(256 * 1024, retainedOutputBytes)),
       retentionCap: retainedOutputBytes,
     }),
+  }
+  const retainedMeta = restoring ? TerminalSpool.readMeta(id, spoolDir) : null
+  if (retainedMeta && Number.isSafeInteger(retainedMeta.exitedAt) && retainedMeta.exitedAt >= 0) {
+    const terminalSpool = new TerminalSpool(spoolOptions)
+    const epochStartOffset = terminalSpool.retainedByteCount()
+    terminalSpool.startEpoch(epochStartOffset)
+    const cursor = new TerminalCursor({ streamEpoch: crypto.randomUUID(), startOffset: epochStartOffset })
+    const rec = {
+      id,
+      pty: null,
+      cols: initialCols,
+      rows: initialRows,
+      cwd: cwd || os.homedir(),
+      sender,
+      spool: terminalSpool,
+      outputByteLimit: retainedOutputBytes,
+      cursor,
+      observers: null,
+      rendererVisible: true,
+      pending: '',
+      flushTimer: null,
+      truncated: false,
+      exited: true,
+      exitStatus: retainedMeta.exitStatus ?? null,
+      waiters: [],
+      lastSender: sender,
+      detachedAt: null,
+      detachedBytes: 0,
+      exitedWhileDetached: false,
+      agentBusy: false,
+      agentCompletedAt: null,
+      agentRespondedAt: null,
+      agentQuietTimer: null,
+    }
+    rec.observers = new TerminalObservers({
+      terminalId: id,
+      deliver: (subscriber, channel, payload, options) => send(subscriber, channel, payload, options),
+    })
+    terms.set(id, rec)
+    return rec
+  }
+  if (!pty) return null
+  const shell = process.env.SHELL || '/bin/zsh'
+  // a persisted cwd can be GONE by now (removed worktree, deleted folder) —
+  // pty.spawn throws uncaught on a missing dir; fall back to home instead
+  const missingCwd = !!cwd && !fs.existsSync(cwd)
+  const startCwd = missingCwd ? os.homedir() : (cwd || os.homedir())
+  const p = pty.spawn(command || shell, command ? args || [] : ['-l'], {
+    name: 'xterm-256color',
+    cols: initialCols,
+    rows: initialRows,
+    cwd: startCwd,
+    env: terminalEnv(env),
   })
+  const terminalSpool = new TerminalSpool(spoolOptions)
   const epochStartOffset = restoring ? terminalSpool.retainedByteCount() : 0
   terminalSpool.startEpoch(epochStartOffset)
   const streamEpoch = crypto.randomUUID()
@@ -520,8 +560,10 @@ function spawn({ id, command, args, cwd, env, outputByteLimit, cols, rows, sende
 
 function write(id, data) {
   const r = terms.get(id)
-  if (r) r.pty.write(data)
-  return !!r
+  if (!r) return { ok: false }
+  if (r.exited || !r.pty) return { ok: false, message: 'terminal already ended' }
+  r.pty.write(data)
+  return { ok: true }
 }
 
 function agentTurn(id, busy) {
@@ -546,7 +588,9 @@ function resizeRecord(record, cols, rows) {
 }
 
 function resize(id, cols, rows) {
-  return resizeRecord(terms.get(id), cols, rows)
+  const record = terms.get(id)
+  if (record?.exited || (record && !record.pty)) return { ok: false, message: 'terminal already ended' }
+  return { ok: resizeRecord(record, cols, rows) }
 }
 
 /** Re-bind a record's output stream to a (possibly new) renderer webContents. */

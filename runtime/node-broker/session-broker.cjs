@@ -473,7 +473,7 @@ async function dispatch(client, method, params = {}) {
     case 'terminal.write': {
       const id = terminalId()
       requireAllowed(id)
-      return { ok: mgr.write(id, String(params.data ?? '')) }
+      return mgr.write(id, String(params.data ?? ''))
     }
     case 'terminal.agentTurn': {
       const id = terminalId()
@@ -495,7 +495,7 @@ async function dispatch(client, method, params = {}) {
     case 'terminal.resize': {
       const id = terminalId()
       requireAllowed(id)
-      return { ok: mgr.resize(id, Number(params.cols), Number(params.rows)) }
+      return mgr.resize(id, Number(params.cols), Number(params.rows))
     }
     case 'terminal.snapshot':
     case 'terminal.output': {
@@ -511,7 +511,7 @@ async function dispatch(client, method, params = {}) {
     case 'terminal.signal': {
       const id = terminalId()
       requireAllowed(id)
-      return { ok: mgr.write(id, '\x03') }
+      return mgr.write(id, '\x03')
     }
     case 'terminal.kill': {
       const id = terminalId()

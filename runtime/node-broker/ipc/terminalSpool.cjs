@@ -112,6 +112,18 @@ function readRange(file, start, length) {
 }
 
 class TerminalSpool {
+  static readMeta(id, dir) {
+    const terminalId = String(id)
+    const metaFile = path.join(dir, `${safeBase(terminalId)}.json`)
+    try {
+      const meta = JSON.parse(fs.readFileSync(metaFile, 'utf8'))
+      if (!meta || meta.id !== terminalId || (meta.v != null && meta.v !== META_VERSION)) return null
+      return meta
+    } catch {
+      return null
+    }
+  }
+
   static coldTail(id, dir, maxBytes = DEFAULT_COLD_TAIL_CAP) {
     const base = safeBase(id)
     const currentFile = path.join(dir, `${base}.log`)
@@ -153,6 +165,9 @@ class TerminalSpool {
     this.appendTimer = null
     this.truncated = false
     this.viewState = null
+    this.epochStartOffset = 0
+    this.exitedAt = null
+    this.exitStatus = null
     fs.mkdirSync(dir, { recursive: true, mode: 0o700 })
     const base = safeBase(this.id)
     this.file = path.join(dir, `${base}.log`)
@@ -176,18 +191,23 @@ class TerminalSpool {
     this.diskError = null
     this.decModes = new Map()
     this.decCarry = ''
-    try {
-      const m = JSON.parse(fs.readFileSync(this.metaFile, 'utf8'))
-      if (m && m.id === this.id && (m.v == null || m.v === META_VERSION)) {
-        this.viewState = m.viewState || null
-        if (m.decModes && typeof m.decModes === 'object') {
-          for (const [mode, set] of Object.entries(m.decModes)) {
-            const n = Number(mode)
-            if (TRACKED_DEC_MODES.has(n)) this.decModes.set(n, !!set)
-          }
+    const meta = TerminalSpool.readMeta(this.id, dir)
+    if (meta) {
+      this.viewState = meta.viewState || null
+      if (Number.isSafeInteger(meta.epochStartOffset) && meta.epochStartOffset >= 0) {
+        this.epochStartOffset = meta.epochStartOffset
+      }
+      if (Number.isSafeInteger(meta.exitedAt) && meta.exitedAt >= 0) {
+        this.exitedAt = meta.exitedAt
+        this.exitStatus = meta.exitStatus ?? null
+      }
+      if (meta.decModes && typeof meta.decModes === 'object') {
+        for (const [mode, set] of Object.entries(meta.decModes)) {
+          const n = Number(mode)
+          if (TRACKED_DEC_MODES.has(n)) this.decModes.set(n, !!set)
         }
       }
-    } catch { /* no prior state */ }
+    }
   }
 
   _trackModes(data) {
@@ -359,7 +379,32 @@ class TerminalSpool {
   }
 
   persistMeta() {
-    try { atomicJson(this.metaFile, { v: META_VERSION, id: this.id, viewState: this.viewState, decModes: Object.fromEntries(this.decModes), touchedAt: Date.now() }) } catch { /* cache failure is non-fatal */ }
+    const exitEvidence = this.exitEvidence()
+    try {
+      atomicJson(this.metaFile, {
+        v: META_VERSION,
+        id: this.id,
+        viewState: this.viewState,
+        decModes: Object.fromEntries(this.decModes),
+        epochStartOffset: this.epochStartOffset,
+        ...(exitEvidence || {}),
+        touchedAt: Date.now(),
+      })
+    } catch { /* cache failure is non-fatal */ }
+  }
+
+  markExited(status) {
+    if (this.closed) return null
+    this.flush()
+    this.exitedAt = Date.now()
+    this.exitStatus = status ?? null
+    this.persistMeta()
+    return this.exitEvidence()
+  }
+
+  exitEvidence() {
+    if (!Number.isSafeInteger(this.exitedAt) || this.exitedAt < 0) return null
+    return { exitedAt: this.exitedAt, exitStatus: this.exitStatus }
   }
 
   snapshot(outputCap = DEFAULT_HOT_CAP) {

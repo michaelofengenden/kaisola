@@ -58,3 +58,31 @@ test('late pty output after close({remove}) cannot resurrect the deleted spool f
   await new Promise((resolve) => setTimeout(resolve, SPOOL_APPEND_DEBOUNCE_MS + 350))
   assert.equal(fs.existsSync(spool.file), false)
 })
+
+test('exit evidence and the epoch boundary survive a fresh meta read', (t) => {
+  const id = 'terminal-spool-exit-evidence'
+  const spool = fixture(t, { id })
+  spool.push('completed output')
+  spool.markExited({ exitCode: 0, signal: null })
+
+  const meta = TerminalSpool.readMeta(id, path.dirname(spool.file))
+  assert.ok(Number.isSafeInteger(meta.exitedAt))
+  assert.deepEqual(meta.exitStatus, { exitCode: 0, signal: null })
+  assert.equal(meta.epochStartOffset, 0)
+  assert.deepEqual(spool.exitEvidence(), {
+    exitedAt: meta.exitedAt,
+    exitStatus: { exitCode: 0, signal: null },
+  })
+})
+
+test('a spool without a natural-exit stamp has no exit evidence', (t) => {
+  const id = 'terminal-spool-no-exit-evidence'
+  const spool = fixture(t, { id })
+  spool.persistMeta()
+
+  const meta = TerminalSpool.readMeta(id, path.dirname(spool.file))
+  assert.equal(meta.exitedAt, undefined)
+  assert.equal(meta.exitStatus, undefined)
+  assert.equal(meta.epochStartOffset, 0)
+  assert.equal(spool.exitEvidence(), null)
+})

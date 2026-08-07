@@ -178,10 +178,31 @@ final class KeychainAuthSecureStore: AuthSecureStoring, @unchecked Sendable {
 
         var result: CFTypeRef?
         let status = SecItemCopyMatching(query as CFDictionary, &result)
-        if status == errSecItemNotFound { return nil }
+        if status == errSecItemNotFound {
+            return try migrateLegacyItemIfPresent(for: key)
+        }
         guard status == errSecSuccess, let data = result as? Data else {
             throw KeychainStoreError(status: status)
         }
+        return data
+    }
+
+    /// One-time rescue of an item written by an older build into the legacy
+    /// file-based keychain. Legacy items gate access on an ACL bound to the
+    /// exact code signature, and Kaisola re-signs itself on every update — the
+    /// source of the endless "Kaisola wants to access …" prompts. Reading the
+    /// legacy item may prompt ONE last time; the copy then lives in the
+    /// data-protection keychain, where access is granted by the app's signed
+    /// identity and never prompts again.
+    private func migrateLegacyItemIfPresent(for key: String) throws -> Data? {
+        var legacy = legacyQuery(for: key)
+        legacy[kSecReturnData as String] = true
+        legacy[kSecMatchLimit as String] = kSecMatchLimitOne
+        var result: CFTypeRef?
+        let status = SecItemCopyMatching(legacy as CFDictionary, &result)
+        guard status == errSecSuccess, let data = result as? Data else { return nil }
+        try set(data, for: key)
+        SecItemDelete(legacyQuery(for: key) as CFDictionary)
         return data
     }
 
@@ -207,6 +228,8 @@ final class KeychainAuthSecureStore: AuthSecureStoring, @unchecked Sendable {
 
     func removeData(for key: String) throws {
         let status = SecItemDelete(baseQuery(for: key) as CFDictionary)
+        // Sweep any stale legacy copy too, so sign-out removes both worlds.
+        SecItemDelete(legacyQuery(for: key) as CFDictionary)
         guard status == errSecSuccess || status == errSecItemNotFound else {
             throw KeychainStoreError(status: status)
         }
@@ -217,9 +240,24 @@ final class KeychainAuthSecureStore: AuthSecureStoring, @unchecked Sendable {
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service,
             kSecAttrAccount as String: key,
+            // The data-protection keychain grants access by signed identity
+            // (like ApiKeyStore already does), not by a per-binary ACL — so
+            // auto-updates stop re-prompting for the Firebase sign-in.
+            kSecUseDataProtectionKeychain as String: true,
             kSecUseAuthenticationContext as String: interactionPolicy.makeAuthenticationContext(),
         ]
         return query
+    }
+
+    /// The pre-migration item's home: identical query minus the
+    /// data-protection flag, addressing the legacy file-based keychain.
+    private func legacyQuery(for key: String) -> [String: Any] {
+        [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: service,
+            kSecAttrAccount as String: key,
+            kSecUseAuthenticationContext as String: interactionPolicy.makeAuthenticationContext(),
+        ]
     }
 }
 

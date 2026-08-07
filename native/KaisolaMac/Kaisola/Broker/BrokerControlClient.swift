@@ -23,7 +23,11 @@ enum ControlBrokerMethod: String, CaseIterable, Sendable {
 struct TerminalCreation: Equatable, Sendable {
     let terminalID: String
     let projectID: String
-    let pid: Int32
+    /// Nil for a cold record: a restore of a terminal that ended before the
+    /// broker restart serves history without spawning a shell (§2h-1b).
+    let pid: Int32?
+    /// True when the create resolved to an ended terminal (cold record).
+    var exited: Bool = false
     let streamEpoch: String?
     /// Cold scrollback captured from a retained spool when the spawn carried
     /// `restore: true`. Informational: when the broker keeps the spool as one
@@ -223,8 +227,14 @@ actor BrokerControlClient: BrokerControlServing, BrokerRollingUpdateRequesting {
         }
         let result = try await request(.create, params: .object(params))
         guard let object = result.objectValue,
-              object["ok"]?.boolValue != false,
-              let pid = object["pid"]?.intValue.flatMap(Int32.init(exactly:)) else {
+              object["ok"]?.boolValue != false else {
+            throw BrokerClientError.requestFailed("terminal.create")
+        }
+        let pid = object["pid"]?.intValue.flatMap(Int32.init(exactly:))
+        let exited = object["exited"]?.boolValue ?? false
+        // A live spawn always has a pid; only a cold record (ended terminal
+        // restored for history) may omit it.
+        guard pid != nil || exited else {
             throw BrokerClientError.requestFailed("terminal.create")
         }
         var recovered: TerminalRecoveredScrollback?
@@ -239,6 +249,7 @@ actor BrokerControlClient: BrokerControlServing, BrokerRollingUpdateRequesting {
             terminalID: terminalID,
             projectID: projectID,
             pid: pid,
+            exited: exited,
             streamEpoch: object["streamEpoch"]?.stringValue,
             recovered: recovered
         )

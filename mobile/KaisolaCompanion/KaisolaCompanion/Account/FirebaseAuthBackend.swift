@@ -162,6 +162,22 @@ final class KeychainAuthSecureStore: AuthSecureStoring, @unchecked Sendable {
     /// that do carry the entitlement keep the modern, never-prompting path.
     private let fallbackLock = NSLock()
     private var useLegacyKeychain = false
+    /// One authentication context per store, allocated lazily — building one
+    /// per QUERY exhausted iOS's per-process LAContext allocation cap under
+    /// the companion test suite (the fallback/migration paths issue several
+    /// queries per operation), crashing with "exceeded number of allocated
+    /// contexts". The context carries no per-operation state, so sharing is
+    /// semantically identical.
+    private var cachedAuthenticationContext: LAContext?
+
+    private func authenticationContext() -> LAContext {
+        fallbackLock.lock()
+        defer { fallbackLock.unlock() }
+        if let cachedAuthenticationContext { return cachedAuthenticationContext }
+        let context = interactionPolicy.makeAuthenticationContext()
+        cachedAuthenticationContext = context
+        return context
+    }
 
     /// Stable signed-product namespace. Passing the bundle identifier in tests
     /// makes the identity contract observable without touching the Keychain.
@@ -276,7 +292,7 @@ final class KeychainAuthSecureStore: AuthSecureStoring, @unchecked Sendable {
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service,
             kSecAttrAccount as String: key,
-            kSecUseAuthenticationContext as String: interactionPolicy.makeAuthenticationContext(),
+            kSecUseAuthenticationContext as String: authenticationContext(),
         ]
         // The data-protection keychain grants access by signed identity, not
         // by a per-binary ACL — the fix for the per-update re-prompt. It
@@ -295,7 +311,7 @@ final class KeychainAuthSecureStore: AuthSecureStoring, @unchecked Sendable {
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service,
             kSecAttrAccount as String: key,
-            kSecUseAuthenticationContext as String: interactionPolicy.makeAuthenticationContext(),
+            kSecUseAuthenticationContext as String: authenticationContext(),
         ]
     }
 }

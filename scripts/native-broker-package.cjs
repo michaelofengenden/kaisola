@@ -18,6 +18,7 @@ const brokerSources = Object.freeze([
   'runtime/node-broker/ipc/shellEnv.cjs',
   'runtime/node-broker/ipc/nativeAgentPaths.cjs',
   'runtime/node-broker/ipc/usageHandler.cjs',
+  'runtime/node-broker/ipc/terminalCreateRoute.cjs',
   'runtime/node-broker/ipc/terminalManager.cjs',
   'runtime/node-broker/ipc/terminalObservers.cjs',
   'runtime/node-broker/ipc/terminalSpool.cjs',

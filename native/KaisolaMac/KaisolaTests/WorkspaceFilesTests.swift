@@ -2133,7 +2133,7 @@ final class WorkspaceFilesTests: XCTestCase {
             let font = MarkdownEditingStyle.attributes(for: .heading(level))[.font] as? NSFont
             return font?.pointSize ?? 0
         }
-        XCTAssertEqual(sizes, [30, 25, 21])
+        XCTAssertEqual(sizes, [28, 23, 20])
         XCTAssertTrue(sizes.allSatisfy { $0 > MarkdownEditingStyle.bodySize })
 
         // The `#` markers collapse, but the heading text itself never does.
@@ -2191,7 +2191,7 @@ final class WorkspaceFilesTests: XCTestCase {
         // And the styling really did happen.
         var headingFont: NSFont?
         headingFont = storage.attribute(.font, at: 2, effectiveRange: nil) as? NSFont
-        XCTAssertEqual(headingFont?.pointSize, 30)
+        XCTAssertEqual(headingFont?.pointSize, 28)
     }
 
     /// A drawn image replaces its whole reference. Leaving the alt text visible

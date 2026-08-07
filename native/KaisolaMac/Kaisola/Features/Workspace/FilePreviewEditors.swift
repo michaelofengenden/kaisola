@@ -221,12 +221,35 @@ struct MarkdownEditingStyle: Sendable {
         return unique
     }
 
-    static let bodySize: CGFloat = 15
+    static let bodySize: CGFloat = 16
+
+    /// The reading face: the system serif (New York) at body size, LessWrong-
+    /// style. Falls back to the plain system font if the serif design is
+    /// unavailable (it ships on every supported macOS).
+    static func bodyFont(size: CGFloat = bodySize, weight: NSFont.Weight = .regular) -> NSFont {
+        let base = NSFont.systemFont(ofSize: size, weight: weight)
+        guard let descriptor = base.fontDescriptor.withDesign(.serif),
+              let serif = NSFont(descriptor: descriptor, size: size) else { return base }
+        return serif
+    }
+
+    /// Trait composition (2026-08-06 spec 1a): emphasis composes onto the face
+    /// already resolved at that range — serif bold in body, sans bold in a
+    /// table cell, bold+italic nesting — instead of stamping a static font.
+    static func composed(base: NSFont, bold: Bool = false, italic: Bool = false) -> NSFont {
+        var traits = base.fontDescriptor.symbolicTraits
+        if bold { traits.insert(.bold) }
+        if italic { traits.insert(.italic) }
+        let descriptor = base.fontDescriptor.withSymbolicTraits(traits)
+        return NSFont(descriptor: descriptor, size: base.pointSize) ?? base
+    }
 
     static var bodyParagraphStyle: NSParagraphStyle {
         let paragraph = NSMutableParagraphStyle()
-        paragraph.lineSpacing = 3
-        paragraph.paragraphSpacing = 5
+        // ~1.5 effective leading on the 16pt serif — the reading rhythm the
+        // whole treatment hangs on.
+        paragraph.lineSpacing = 6
+        paragraph.paragraphSpacing = 10
         return paragraph
     }
 
@@ -235,7 +258,7 @@ struct MarkdownEditingStyle: Sendable {
     /// rather than leaving the old attributes behind.
     static var baseAttributes: [NSAttributedString.Key: Any] {
         [
-            .font: NSFont.systemFont(ofSize: bodySize),
+            .font: bodyFont(),
             .foregroundColor: NSColor.labelColor,
             .paragraphStyle: bodyParagraphStyle,
         ]
@@ -249,26 +272,29 @@ struct MarkdownEditingStyle: Sendable {
     static func attributes(for role: Role) -> [NSAttributedString.Key: Any] {
         switch role {
         case let .heading(level):
-            let sizes: [CGFloat] = [0, 30, 25, 21, 18, 16, 15]
-            return [.font: NSFont.systemFont(
-                ofSize: sizes[min(6, max(1, level))],
-                weight: level <= 2 ? .bold : .semibold
+            // Headings stay sans against the serif body — the same contrast
+            // LessWrong plays — with tightened tracking on the display sizes.
+            let sizes: [CGFloat] = [0, 28, 23, 20, 17, 16, 15]
+            let clamped = min(6, max(1, level))
+            var attributes: [NSAttributedString.Key: Any] = [.font: NSFont.systemFont(
+                ofSize: sizes[clamped],
+                weight: clamped <= 2 ? .bold : .semibold
             )]
+            if clamped <= 2 { attributes[.kern] = -0.3 }
+            return attributes
         case .quote:
-            return [
-                .foregroundColor: NSColor.secondaryLabelColor,
-                .obliqueness: 0.12,
-            ]
+            // Full-size serif italic (not dimmed): a quotation reads as prose
+            // with the drawn accent bar carrying the demarcation.
+            return [.font: composed(base: bodyFont(), italic: true)]
         case .codeBlock:
             return [
                 .font: NSFont.monospacedSystemFont(ofSize: 13, weight: .regular),
                 .foregroundColor: NSColor.labelColor,
-                .backgroundColor: NSColor.controlBackgroundColor,
             ]
         case .bold:
-            return [.font: NSFont.systemFont(ofSize: bodySize, weight: .semibold)]
+            return [.font: composed(base: bodyFont(), bold: true)]
         case .italic:
-            return [.obliqueness: 0.16]
+            return [.font: composed(base: bodyFont(), italic: true)]
         case .inlineCode:
             return [
                 .font: NSFont.monospacedSystemFont(ofSize: 13, weight: .regular),
@@ -1589,13 +1615,41 @@ struct MarkdownRenderedEditor: NSViewRepresentable {
                 for span in scan.spans where NSMaxRange(span.range) <= fullRange.length {
                     let paint = NSIntersectionRange(span.range, target)
                     guard paint.length > 0 else { continue }
-                    storage.addAttributes(
-                        MarkdownEditingStyle.attributes(
-                            for: span.role,
-                            revealed: revealed(span)
-                        ),
-                        range: paint
-                    )
+                    switch span.role {
+                    case .bold, .italic:
+                        // Trait composition (spec 1a): emphasis composes onto
+                        // whatever face is already resolved at each position —
+                        // serif in body, sans in a table cell, and nested
+                        // bold+italic stack because each pass reads the font
+                        // the previous one left.
+                        var location = paint.location
+                        while location < NSMaxRange(paint) {
+                            var effective = NSRange(location: location, length: 0)
+                            let base = storage.attribute(
+                                .font, at: location, effectiveRange: &effective
+                            ) as? NSFont ?? MarkdownEditingStyle.bodyFont()
+                            let run = NSIntersectionRange(effective, paint)
+                            guard run.length > 0 else { break }
+                            storage.addAttribute(
+                                .font,
+                                value: MarkdownEditingStyle.composed(
+                                    base: base,
+                                    bold: span.role == .bold,
+                                    italic: span.role == .italic
+                                ),
+                                range: run
+                            )
+                            location = NSMaxRange(run)
+                        }
+                    default:
+                        storage.addAttributes(
+                            MarkdownEditingStyle.attributes(
+                                for: span.role,
+                                revealed: revealed(span)
+                            ),
+                            range: paint
+                        )
+                    }
                 }
             }
             // ...and the grid is measured last, against what the storage

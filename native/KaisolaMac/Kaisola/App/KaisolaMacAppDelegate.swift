@@ -761,6 +761,20 @@ final class KaisolaMacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDele
         // a live workspace and starve process-based ACP/Mesh tests. Tests create
         // every AppModel/window they need explicitly.
         guard !NotificationBridge.isRunningUnderXCTest else { return }
+        // Memory pressure sheds every discretionary cache (2026-08-06 §2g).
+        MemoryPressureResponder.shared.register(name: "terminal-surfaces") {
+            TerminalSurfaceCache.shared.removeAll()
+        }
+        MemoryPressureResponder.shared.register(name: "markdown-images") {
+            MarkdownLocalImageCache.shared.purge()
+        }
+        MemoryPressureResponder.shared.register(name: "backdrop-bakes") {
+            DesktopBackdropProvider.shared.purgeBakes()
+        }
+        MemoryPressureResponder.shared.register(name: "project-file-index") {
+            ProjectFileIndex.shared.purge()
+        }
+        MemoryPressureResponder.shared.start()
         if resourceWorkloadRequested, resourceWorkload == nil {
             print("KAISOLA_NATIVE_RESOURCE_WORKLOAD_READY=FAIL invalid-private-temporary-root")
             NSApp.terminate(nil)

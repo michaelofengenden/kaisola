@@ -32,12 +32,15 @@ final class AppModelTerminalRetentionTests: XCTestCase {
 
     private static let megabyte = 1_024 * 1_024
 
-    func testTheBudgetIsStatedInBytesAndIsSmallerThanTheOldWorstCase() {
-        XCTAssertEqual(AppModel.maximumRetainedTerminalBytes, 96 * Self.megabyte)
+    func testTheBudgetIsStatedInBytesAndTracksThePerDocumentCap() {
+        // 2026-08-06 spec §2c: 5 MiB per document (bytes past ~4 MiB were
+        // renderer-unreachable), 12 surfaces, and the byte budget now binds
+        // at the count-only worst case rather than sitting above it.
+        XCTAssertEqual(TerminalDocument.maximumRetainedBytes, 5 * Self.megabyte)
         let countOnlyWorstCase = AppModel.maximumRetainedTerminalSurfaces
             * TerminalDocument.maximumRetainedBytes
-        XCTAssertEqual(countOnlyWorstCase, 192 * Self.megabyte, "This is what a count-only bound permitted.")
-        XCTAssertLessThan(AppModel.maximumRetainedTerminalBytes, countOnlyWorstCase)
+        XCTAssertEqual(countOnlyWorstCase, 60 * Self.megabyte)
+        XCTAssertLessThanOrEqual(AppModel.maximumRetainedTerminalBytes, countOnlyWorstCase)
     }
 
     func testNothingIsEvictedWhileBothBoundsHold() {
@@ -54,15 +57,16 @@ final class AppModelTerminalRetentionTests: XCTestCase {
     }
 
     func testTheByteBudgetEvictsUntilTheDeckFitsEvenUnderTheCountCap() {
-        // Five documents, well under the count cap, 160 MiB between them.
+        // Five documents, well under the count cap, 80 MiB against the
+        // 48 MiB budget (spec §2c): the two oldest go.
         let order = ["a", "b", "c", "d", "e"]
-        let bytes = Dictionary(uniqueKeysWithValues: order.map { ($0, 32 * Self.megabyte) })
+        let bytes = Dictionary(uniqueKeysWithValues: order.map { ($0, 16 * Self.megabyte) })
         XCTAssertEqual(evictions(order, bytes: bytes), ["a", "b"])
     }
 
     func testEvictionStopsAsSoonAsTheDeckFits() {
         let order = ["a", "b", "c"]
-        let bytes = ["a": 64 * Self.megabyte, "b": 32 * Self.megabyte, "c": 32 * Self.megabyte]
+        let bytes = ["a": 24 * Self.megabyte, "b": 16 * Self.megabyte, "c": 16 * Self.megabyte]
         XCTAssertEqual(evictions(order, bytes: bytes), ["a"])
     }
 

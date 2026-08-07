@@ -308,21 +308,71 @@ final class MarkdownLocalImageCache: @unchecked Sendable {
     func load(
         source: String,
         documentURL: URL,
-        workspaceRoot: URL?
+        workspaceRoot: URL?,
+        displayWidth: CGFloat? = nil
     ) -> MarkdownImagePayload? {
         guard let identity = Self.identity(
             source: source,
             documentURL: documentURL,
             workspaceRoot: workspaceRoot
         ) else { return nil }
-        return load(identity)
+        return load(identity, displayWidth: displayWidth)
+    }
+
+    /// Memory-pressure hook (spec §2g).
+    func purge() {
+        images.removeAllObjects()
     }
 
     func load(_ identity: MarkdownImageIdentity) -> MarkdownImagePayload? {
-        let key = identity.cacheKey as NSString
+        load(identity, displayWidth: nil)
+    }
+
+    /// `displayWidth` (document points) selects a downsample bucket; nil loads
+    /// full resolution. Cost accounting uses DECODED pixel bytes — charging
+    /// file size undercounted a 3 MB PNG's ~48 MB bitmap by an order of
+    /// magnitude, letting the "128 MiB" ceiling admit over a gigabyte of
+    /// pixels (2026-08-06 spec §2f).
+    func load(_ identity: MarkdownImageIdentity, displayWidth: CGFloat?) -> MarkdownImagePayload? {
+        let bucket = Self.widthBucket(displayWidth)
+        let key = "\(identity.cacheKey)|w\(bucket)" as NSString
         if let cached = images.object(forKey: key) { return MarkdownImagePayload(image: cached) }
-        guard let image = NSImage(contentsOfFile: identity.path) else { return nil }
-        images.setObject(image, forKey: key, cost: max(1, identity.bytes))
+        guard let image = Self.decode(path: identity.path, bucket: bucket) else { return nil }
+        images.setObject(image, forKey: key, cost: Self.decodedCost(image))
         return MarkdownImagePayload(image: image)
+    }
+
+    /// Bucketed so a narrow 1x decode never serves a wide 2x request: widths
+    /// round UP to the next bucket, and the bucket rides in the cache key.
+    static func widthBucket(_ displayWidth: CGFloat?) -> Int {
+        guard let displayWidth, displayWidth > 0 else { return 0 } // 0 = full res
+        let buckets = [320, 640, 1024, 1600, 2400]
+        let scaled = Int((displayWidth * 2).rounded(.up)) // retina headroom
+        return buckets.first { $0 >= scaled } ?? 0
+    }
+
+    static func decodedCost(_ image: NSImage) -> Int {
+        let pixels = image.representations.reduce(0) { best, rep in
+            max(best, rep.pixelsWide * rep.pixelsHigh)
+        }
+        return max(1, pixels * 4)
+    }
+
+    private static func decode(path: String, bucket: Int) -> NSImage? {
+        guard bucket > 0,
+              let source = CGImageSourceCreateWithURL(
+                  URL(fileURLWithPath: path) as CFURL, nil
+              ),
+              let thumbnail = CGImageSourceCreateThumbnailAtIndex(source, 0, [
+                  kCGImageSourceCreateThumbnailFromImageAlways: true,
+                  kCGImageSourceCreateThumbnailWithTransform: true,
+                  kCGImageSourceThumbnailMaxPixelSize: bucket,
+              ] as CFDictionary) else {
+            return NSImage(contentsOfFile: path)
+        }
+        return NSImage(
+            cgImage: thumbnail,
+            size: NSSize(width: thumbnail.width, height: thumbnail.height)
+        )
     }
 }

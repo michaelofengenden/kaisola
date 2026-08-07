@@ -855,8 +855,10 @@ private struct ConfinedFileWebView: NSViewRepresentable {
 
     func makeNSView(context: Context) -> WKWebView {
         let configuration = WKWebViewConfiguration()
-        // Ephemeral: rendering a local file must not touch on-disk cookies/cache.
-        configuration.websiteDataStore = .nonPersistent()
+        // Ephemeral, and SHARED with the browser card: same trust class, and
+        // one store gives the content surfaces shared process affinity
+        // instead of isolated ephemeral state per view (spec §2e).
+        configuration.websiteDataStore = SharedWebKit.ephemeralContentStore
         // The web view is ephemeral and file-confined. Script execution remains
         // off until the user opts in from the visible preview menu.
         let pagePreferences = WKWebpagePreferences()

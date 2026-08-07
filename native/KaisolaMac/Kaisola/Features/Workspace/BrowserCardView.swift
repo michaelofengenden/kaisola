@@ -98,8 +98,9 @@ private struct ConfinedWebView: NSViewRepresentable {
 
     func makeNSView(context: Context) -> WKWebView {
         let configuration = WKWebViewConfiguration()
-        // Ephemeral: nothing this card loads touches on-disk cookies/cache.
-        configuration.websiteDataStore = .nonPersistent()
+        // Ephemeral, shared with the HTML preview (spec §2e) — nothing here
+        // touches on-disk cookies/cache.
+        configuration.websiteDataStore = SharedWebKit.ephemeralContentStore
         let webView = WKWebView(frame: .zero, configuration: configuration)
         webView.navigationDelegate = context.coordinator
         webView.setValue(false, forKey: "drawsBackground")

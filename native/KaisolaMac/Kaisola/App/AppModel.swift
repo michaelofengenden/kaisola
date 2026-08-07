@@ -100,7 +100,10 @@ final class AppModel: ObservableObject {
     /// terminals. Retained bytes are therefore bounded too, evicting
     /// least-recently-used first. 96 MiB comfortably holds six saturated
     /// terminals, or one saturated terminal plus a deep deck of ordinary ones.
-    nonisolated static let maximumRetainedTerminalBytes = 96 * 1_024 * 1_024
+    // 48 MiB (was 96; 2026-08-06 spec §2c): with documents capped at 5 MiB
+    // the old budget could never bind. This holds ~9 saturated documents and
+    // makes the byte bound the real constraint again.
+    nonisolated static let maximumRetainedTerminalBytes = 48 * 1_024 * 1_024
     /// Terminals this app created and may mutate. Everything else stays
     /// strictly observed no matter what the UI asks for.
     @Published private(set) var ownedTerminalIDs: Set<String> = []

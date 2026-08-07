@@ -40,12 +40,18 @@ final class TerminalSurfaceCache {
     /// buffers, and a `BufferLine` heap-allocates 24 bytes per cell, so a
     /// terminal that has actually filled the scrollback is tens of MiB.
     ///
-    /// Six is a deliberate trade rather than a limit: retaining a parked view is
+    /// A deliberate trade rather than a limit: retaining a parked view is
     /// what makes returning to a project instant *and* correct, since the
     /// alternative is re-parsing the transcript at a possibly-narrower width.
-    /// Six covers the projects a session realistically cycles between while
-    /// keeping the worst case bounded.
-    static let maximumRetainedSurfaces = 6
+    /// Three covers the immediate cycle set; deeper history is one gesture
+    /// away in the transcript viewer, paged from the broker's disk spool
+    /// (2026-08-06 spec §2a).
+    static let maximumRetainedSurfaces = 3
+
+    /// The scrollback a parked, bottom-pinned view keeps. Its full depth
+    /// comes back automatically on mount (`updateNSView` re-applies the
+    /// setting), and the dropped rows remain reachable via the transcript.
+    static let parkedScrollbackLines = 500
 
     private var entries: [String: Entry] = [:]
     private var order: [String] = []
@@ -75,7 +81,17 @@ final class TerminalSurfaceCache {
     }
 
     /// Hand a pair back for reuse after SwiftUI tears its card down.
+    ///
+    /// A parked view pinned to the live bottom sheds its scrollback — those
+    /// cell buffers are the app's single largest memory consumer, and a
+    /// pinned view is by definition not being read into history. A view the
+    /// user left scrolled INTO history keeps its buffer and its position.
     func store(sessionID: String, view: ReadOnlyTerminalView, coordinator: NativeTerminalSurface.Coordinator) {
+        let pinnedToBottom = !view.canScroll || view.scrollPosition >= 0.99
+        if pinnedToBottom,
+           view.getTerminal().options.scrollback > Self.parkedScrollbackLines {
+            view.changeScrollback(Self.parkedScrollbackLines)
+        }
         entries[sessionID] = Entry(view: view, coordinator: coordinator)
         order.removeAll { $0 == sessionID }
         order.append(sessionID)

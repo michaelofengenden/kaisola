@@ -285,3 +285,34 @@ test('killAll suppresses exit stamping during managed broker shutdown', async ()
   assert.equal(meta.exitedAt, undefined)
   assert.equal(meta.exitStatus, undefined)
 })
+
+test('spool hot cache lives only while observed', async (t) => {
+  const id = 'observer-driven-spool-cache'
+  const record = manager.spawn({
+    id,
+    command: '/bin/sh',
+    args: ['-c', 'printf watched-bytes; sleep 5'],
+    cwd: managerSpoolDir,
+  })
+  assert.ok(record)
+  t.after(() => manager.release(id))
+
+  manager.setEventSink(() => true)
+  t.after(() => manager.setEventSink(null))
+  const sub = manager.subscribe(id, 'window-a|observer', {})
+  assert.equal(sub.ok, true)
+  await new Promise((resolve) => setTimeout(resolve, 300))
+  assert.ok(record.spool.visible, 'an observed spool caches')
+
+  manager.unsubscribe(id, 'window-a|observer')
+  assert.equal(record.spool.visible, false, 'last unsubscribe drops the cache')
+  assert.equal(record.spool.chunksLen, 0)
+
+  // Two observers across two fake connections: one leaving keeps the cache.
+  manager.subscribe(id, 'window-a|observer', {})
+  manager.subscribe(id, 'window-b|observer', {})
+  manager.unsubscribeSubscriberPrefix('window-a|')
+  assert.equal(record.spool.visible, true, 'a remaining observer keeps the cache')
+  manager.unsubscribeSubscriberPrefix('window-b|')
+  assert.equal(record.spool.visible, false)
+})

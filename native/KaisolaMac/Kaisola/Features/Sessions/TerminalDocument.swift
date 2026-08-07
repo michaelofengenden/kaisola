@@ -216,7 +216,12 @@ struct TerminalDocument: Equatable, Sendable {
     /// it past the first frame. Deep history beyond this cap is the
     /// transcript viewer's job — it pages further `terminal.history` straight
     /// from the broker's durable spool instead of holding it all in memory.
-    static let maximumRetainedBytes = 16 * 1_024 * 1_024
+    // 5 MiB (was 16; 2026-08-06 spec §2c): the observer tail policy's own
+    // comment proves bytes past ~4 MiB are unreachable by the renderer — a
+    // deeper tail could not put a single additional row within reach — so
+    // 5 MiB keeps one slack megabyte and returns up to 11 MiB per retained
+    // document to the user.
+    static let maximumRetainedBytes = 5 * 1_024 * 1_024
 
     /// How far *below* the cap a trim drops the buffer.
     ///
@@ -226,7 +231,7 @@ struct TerminalDocument: Equatable, Sendable {
     /// across the ~2 MB of output that follows it, while keeping the retained
     /// ceiling at exactly `maximumRetainedBytes`: the cap is a memory budget
     /// spanning every retained surface, so it must not drift upwards.
-    static let retainedTrimSlackBytes = 4 * 1_024 * 1_024
+    static let retainedTrimSlackBytes = 1 * 1_024 * 1_024
 
     var sessionID: String?
     private(set) var scrollback: TerminalScrollback

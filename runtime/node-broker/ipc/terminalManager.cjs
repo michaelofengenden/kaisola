@@ -762,25 +762,43 @@ function resumeFromSnapshot(current, streamEpoch, afterOffset) {
   }
 }
 
+// The spool's RAM read cache exists only for attached readers. Deriving its
+// visibility from the observer COUNT (2026-08-06 spec §2d) frees ~1 MiB per
+// unwatched terminal — the never-called renderer bit had left every terminal
+// ever attached holding its hot cache for the broker's lifetime — and a
+// count can never let one window's detach clear another window's cache.
+function syncSpoolVisibility(r) {
+  if (!r) return
+  r.spool.setVisible(r.observers.stats().subscribers > 0)
+}
+
 function subscribe(id, subscriber, { streamEpoch, afterOffset, maxQueueBytes } = {}) {
   const r = terms.get(id)
   if (!r) return { ok: false, message: 'Terminal is no longer available.' }
   r.observers.subscribe(subscriber, { maxQueueBytes })
+  syncSpoolVisibility(r)
   try {
     return { ok: true, ...resumeFromSnapshot(snapshot(id), streamEpoch, afterOffset) }
   } catch (error) {
     r.observers.unsubscribe(subscriber)
+    syncSpoolVisibility(r)
     throw error
   }
 }
 
 function unsubscribe(id, subscriber) {
-  return terms.get(id)?.observers.unsubscribe(subscriber) ?? false
+  const r = terms.get(id)
+  const removed = r?.observers.unsubscribe(subscriber) ?? false
+  syncSpoolVisibility(r)
+  return removed
 }
 
 function unsubscribeSubscriberPrefix(prefix) {
   let removed = 0
-  for (const r of terms.values()) removed += r.observers.unsubscribePrefix(prefix)
+  for (const r of terms.values()) {
+    removed += r.observers.unsubscribePrefix(prefix)
+    syncSpoolVisibility(r)
+  }
   return removed
 }
 

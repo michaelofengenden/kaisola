@@ -1768,13 +1768,17 @@ struct MarkdownRenderedEditor: NSViewRepresentable {
                 }.value
                 guard !Task.isCancelled else { return }
                 var resolved: [(MarkdownInlineImageReference, MarkdownImagePayload?)] = []
+                // Decode to the pane's width bucket, not full resolution — a
+                // screenshot never needs more pixels than the column shows.
+                let displayWidth = self?.textView?.textContainer?.size.width
                 for line in lines {
                     for reference in line.references {
                         let payload = await Task.detached(priority: .utility) {
                             MarkdownLocalImageCache.shared.load(
                                 source: reference.source,
                                 documentURL: markdownURL,
-                                workspaceRoot: workspaceRoot
+                                workspaceRoot: workspaceRoot,
+                                displayWidth: displayWidth
                             )
                         }.value
                         guard !Task.isCancelled else { return }

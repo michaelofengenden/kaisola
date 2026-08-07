@@ -679,6 +679,16 @@ final class ProjectFileIndex {
     }
 
     private var cache: [String: (at: Date, files: [String])] = [:]
+
+    /// Memory-pressure hook and closed-project eviction (spec §2g/§2i): the
+    /// palette re-walks on demand, so residency is purely discretionary.
+    func purge() {
+        cache.removeAll()
+    }
+
+    func evict(root: URL) {
+        cache.removeValue(forKey: root.standardizedFileURL.path)
+    }
     private var inFlight: [String: InFlightWalk] = [:]
     /// A replacement walk waits for its canceled predecessor to finish. The
     /// production enumerator cooperates promptly, and the ordering guarantee

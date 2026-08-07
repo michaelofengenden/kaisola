@@ -83,7 +83,17 @@ public struct BrokerLineFrameDecoder: Sendable {
                 } else {
                     buffer.append(contentsOf: segment)
                     frame = buffer
-                    buffer.removeAll(keepingCapacity: true)
+                    // One large frame (a 4 MiB history page, a big tool
+                    // result) must not pin its high-water storage for the
+                    // client's lifetime — there is one decoder per ACP chat
+                    // and per Mesh column. Small buffers keep their storage;
+                    // big ones release it (2026-08-06 spec §2i). Data hides
+                    // capacity, so the frame's size is the signal.
+                    if frame.count <= 64 * 1_024 {
+                        buffer.removeAll(keepingCapacity: true)
+                    } else {
+                        buffer = Data()
+                    }
                 }
 
                 if !frame.isEmpty {

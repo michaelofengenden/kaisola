@@ -598,7 +598,13 @@ final class NativePreviewSettings: ObservableObject {
     /// Keep 100 000 available as an explicit high-memory choice, but use the
     /// measured 20 000-row tier for fresh and legacy-default installations.
     static let terminalScrollbackRange: ClosedRange<Int> = 500...100_000
-    static let terminalScrollbackDefault = 20_000
+    // 5,000 (was 20,000; 2026-08-06 spec §2b): the live view is a WINDOW.
+    // The renderer's reachable tail is ~4 MiB ≈ 20k rows anyway, deep history
+    // pages from the broker's append-only disk spool via the transcript
+    // viewer — back to the session's first byte, across reboots — and
+    // terminal cell buffers are the app's single largest memory consumer.
+    // Users who customized the setting keep their value.
+    static let terminalScrollbackDefault = 5_000
     static let terminalScrollbackPolicyVersion = 2
 
     static func clampedTerminalScrollback(_ lines: Int) -> Int {
@@ -3617,6 +3623,13 @@ final class DesktopBackdropProvider: ObservableObject {
 
     private var cache: [DesktopBackdropKey: DesktopBake] = [:]
     private var cacheOrder: [DesktopBackdropKey] = []
+
+    /// Memory-pressure hook (2026-08-06 spec §2g): bakes rebuild lazily on
+    /// the next resolve, so dropping them under pressure costs one re-bake.
+    func purgeBakes() {
+        cache.removeAll()
+        cacheOrder.removeAll()
+    }
     private var work: Task<Void, Never>?
     private var deferredResolve: Task<Void, Never>?
     private var watch: Task<Void, Never>?

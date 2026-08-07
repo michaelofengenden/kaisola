@@ -179,6 +179,13 @@ struct NativeSessionStore: Sendable {
             defer { lock.unlock() }
             loaded.insert(url)
             entries[url] = payload
+            // Bounded (spec §2i): production uses one archive URL; tests
+            // construct hundreds of temporary stores in one process, and the
+            // decoded payloads should not accumulate.
+            if entries.count > 8, let evictable = entries.keys.first(where: { $0 != url }) {
+                entries.removeValue(forKey: evictable)
+                loaded.remove(evictable)
+            }
         }
     }
 

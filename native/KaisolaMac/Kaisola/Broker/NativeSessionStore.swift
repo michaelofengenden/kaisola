@@ -23,6 +23,10 @@ struct NativeOwnedSession: Codable, Equatable, Identifiable, Sendable {
     /// from the visible title lets later process/OSC updates keep improving an
     /// automatic name without ever overwriting a manual rename.
     var lastAutoTitle: String?
+    /// When the terminal's process ended (naturally), in ms. Stamped from exit
+    /// events and inventory reconciliation; an ended terminal is never a
+    /// resurrection candidate. Nil on records from older builds.
+    var endedAt: Int64?
 
     init(
         id: String,
@@ -32,7 +36,8 @@ struct NativeOwnedSession: Codable, Equatable, Identifiable, Sendable {
         createdAt: Int64,
         agentID: String? = nil,
         accountBinding: SessionAccountBinding? = nil,
-        lastAutoTitle: String? = nil
+        lastAutoTitle: String? = nil,
+        endedAt: Int64? = nil
     ) {
         self.id = id
         self.projectID = projectID
@@ -42,6 +47,7 @@ struct NativeOwnedSession: Codable, Equatable, Identifiable, Sendable {
         self.agentID = agentID
         self.accountBinding = accountBinding?.normalized
         self.lastAutoTitle = lastAutoTitle
+        self.endedAt = endedAt
     }
 }
 
@@ -123,6 +129,23 @@ struct NativeSessionStore: Sendable {
         /// own (for example an Electron-created terminal).  Ownership still
         /// gates every broker mutation; aliases are local navigation metadata.
         var sessionAliases: [String: String]?
+        /// Permanent closed-state markers: id → closedAt (ms). Distinct from
+        /// the bounded `closedSessions` UNDO stack — eviction from undo never
+        /// weakens the guarantee that a closed terminal stays closed. A
+        /// tombstone drains only once its pending release is acknowledged and
+        /// nothing references the id (2026-08-06 spec §4a-1).
+        var closedTerminals: [String: Int64]?
+        /// Broker releases still owed for closed terminals; drained on every
+        /// connect, idempotent.
+        var pendingReleases: [PendingRelease]?
+        /// Permanent closed-project markers. The `closedProjects` UNDO stack
+        /// above stays a bounded convenience; this set is the closed state.
+        var closedProjectIDs: [String]?
+    }
+
+    struct PendingRelease: Codable, Equatable, Sendable {
+        let id: String
+        let projectID: String
     }
 
     /// Process-wide decoded-payload cache, keyed by archive URL.
@@ -162,7 +185,10 @@ struct NativeSessionStore: Sendable {
     private static let decoder = JSONDecoder()
     private static let encoder = JSONEncoder()
 
-    private let closedStackCap = 10
+    /// Undo-stack depth (⌘⌥T / ⌘⇧T). A pure UI convenience: the permanent
+    /// closed-state markers (`closedTerminals`, `closedProjectIDs`) are what
+    /// enforce closed-stays-closed, and they never evict by depth.
+    private let closedStackCap = 50
 
     let fileURL: URL
 
@@ -234,7 +260,11 @@ struct NativeSessionStore: Sendable {
 
         for record in records where !record.exited && !known.contains(record.id) {
             guard record.wasOwned(by: payload.ownerID),
-                  let project = projectsByID[record.projectID] else { continue }
+                  let project = projectsByID[record.projectID],
+                  // A tombstoned id is a session the user closed; a lingering
+                  // broker PTY (failed release, drain handoff) must not
+                  // re-adopt it — the pending-release queue will reap it.
+                  payload.closedTerminals?[record.id] == nil else { continue }
             let session = NativeOwnedSession(
                 id: record.id,
                 projectID: record.projectID,
@@ -262,8 +292,10 @@ struct NativeSessionStore: Sendable {
     func openProject(directory path: String) -> OpenProject {
         let id = Self.projectID(forDirectory: path)
         var payload = read() ?? Payload(ownerID: ownerID(), sessions: [], projects: [])
-        // Re-opening a folder retires any stale closed-stack entry for it.
+        // Re-opening a folder retires any stale closed-stack entry for it,
+        // and clears the permanent closed marker — the user opened it again.
         payload.closedProjects?.removeAll { $0.id == id }
+        payload.closedProjectIDs?.removeAll { $0 == id }
         // Every open lands at the head of File ▸ Open Recent.
         let normalized = (path as NSString).standardizingPath
         var recents = payload.recentFolders ?? []
@@ -388,6 +420,11 @@ struct NativeSessionStore: Sendable {
             if stack.count > closedStackCap { stack.removeFirst(stack.count - closedStackCap) }
             payload.closedProjects = stack
         }
+        // The permanent marker is what keeps the tab from re-deriving out of
+        // live sessions or archived panes; the stack above is only the undo UI.
+        var markers = payload.closedProjectIDs ?? []
+        if !markers.contains(id) { markers.append(id) }
+        payload.closedProjectIDs = markers
         payload.projects?.removeAll { $0.id == id }
         write(payload)
     }
@@ -403,6 +440,9 @@ struct NativeSessionStore: Sendable {
         }
         payload.projects = projects
         payload.closedProjects = stack
+        // Reopening clears the permanent closed marker — the user asked for
+        // the project back, so its work and archived state surface again.
+        payload.closedProjectIDs?.removeAll { $0 == restored.id }
         write(payload)
         return restored
     }
@@ -441,10 +481,83 @@ struct NativeSessionStore: Sendable {
 
     func upsert(_ session: NativeOwnedSession) {
         var payload = read() ?? Payload(ownerID: ownerID(), sessions: [])
+        // The store is the last line of the closed-stays-closed guarantee: no
+        // caller — resurrection mid-suspension, cwd sync, broker re-adoption —
+        // may re-create a record the user closed. This is an expected race,
+        // not a programmer error, so it refuses quietly.
+        if payload.closedTerminals?[session.id] != nil {
+            return
+        }
         payload.sessions.removeAll { $0.id == session.id }
         payload.sessions.append(session)
         payload.sessions.sort { $0.createdAt < $1.createdAt }
         write(payload)
+    }
+
+    /// The one sanctioned way to close a terminal: removes the record, adds
+    /// the permanent tombstone, pushes the undo entry, and queues the broker
+    /// release — one payload write, synchronous, so a quit in the same
+    /// runloop turn already persists the truth.
+    func commitCloseTerminal(_ id: String) {
+        var payload = read() ?? Payload(ownerID: ownerID(), sessions: [])
+        let record = payload.sessions.first { $0.id == id }
+        payload.sessions.removeAll { $0.id == id }
+        payload.sessionAliases?.removeValue(forKey: id)
+        var tombstones = payload.closedTerminals ?? [:]
+        tombstones[id] = Int64(Date().timeIntervalSince1970 * 1_000)
+        payload.closedTerminals = tombstones
+        if let record {
+            var stack = payload.closedSessions ?? []
+            stack.append(ClosedSession(
+                cwd: record.cwd,
+                agentID: record.agentID,
+                title: record.title,
+                accountBinding: record.accountBinding,
+                sourceTerminalID: id
+            ))
+            if stack.count > closedStackCap { stack.removeFirst(stack.count - closedStackCap) }
+            payload.closedSessions = stack
+            var releases = payload.pendingReleases ?? []
+            if !releases.contains(where: { $0.id == id }) {
+                releases.append(PendingRelease(id: id, projectID: record.projectID))
+            }
+            payload.pendingReleases = releases
+        }
+        write(payload)
+    }
+
+    func isTerminalTombstoned(_ id: String) -> Bool {
+        read()?.closedTerminals?[id] != nil
+    }
+
+    func pendingReleaseList() -> [PendingRelease] {
+        read()?.pendingReleases ?? []
+    }
+
+    /// Release acknowledged (or terminal proven absent). The tombstone drains
+    /// with it only when nothing references the id anymore; kept otherwise so
+    /// archived panes cannot revive the terminal.
+    func acknowledgeRelease(id: String) {
+        guard var payload = read() else { return }
+        payload.pendingReleases?.removeAll { $0.id == id }
+        if payload.sessions.contains(where: { $0.id == id }) == false {
+            payload.closedTerminals?.removeValue(forKey: id)
+        }
+        write(payload)
+    }
+
+    /// Exit evidence: the terminal's process ended (naturally). An ended
+    /// terminal is never a resurrection candidate.
+    func stampEnded(_ id: String, at endedAt: Int64) {
+        guard var payload = read(),
+              let index = payload.sessions.firstIndex(where: { $0.id == id }),
+              payload.sessions[index].endedAt == nil else { return }
+        payload.sessions[index].endedAt = endedAt
+        write(payload)
+    }
+
+    func isProjectClosed(_ id: String) -> Bool {
+        read()?.closedProjectIDs?.contains(id) ?? false
     }
 
     func remove(terminalID: String) {

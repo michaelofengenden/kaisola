@@ -172,10 +172,10 @@ struct RootShellView: View {
         alert.addButton(withTitle: "Cancel")
         if let window = NSApp.keyWindow {
             alert.beginSheetModal(for: window) { response in
-                if response == .alertFirstButtonReturn { model.deleteChat(chat.id) }
+                if response == .alertFirstButtonReturn { Task { await model.deleteChat(chat.id) } }
             }
         } else if alert.runModal() == .alertFirstButtonReturn {
-            model.deleteChat(chat.id)
+            Task { await model.deleteChat(chat.id) }
         }
     }
 
@@ -907,10 +907,14 @@ struct RootShellView: View {
             if let dir = model.directory(for: session.id) {
                 Button("Git Panel…") { gitRepo = dir }
             }
-            if !session.exited {
-                Button("End Session", role: .destructive) {
-                    Task { await model.endSession(session.id) }
-                }
+        }
+        // Closing must be available for every state — live, exited, dormant,
+        // unavailable. The commit is synchronous (closed-stays-closed §4a);
+        // broker cleanup drains behind it.
+        if model.isOwned(session.id) || model.canClose(session.id) {
+            Button("End Session", role: .destructive) {
+                model.commitClose(session.id)
+                Task { await model.drainPendingReleases() }
             }
         }
     }
@@ -1236,7 +1240,29 @@ struct RootShellView: View {
             quickActionsTarget = QuickActionsTarget(id: project.id, name: project.name)
         }
         Divider()
-        Button("Close Project", role: .destructive) { model.closeProject(id: project.id) }
+        Button("Close Project", role: .destructive) { requestCloseProject(project) }
+    }
+
+    /// Closing a project hides its tab but does NOT stop its work (§4d): the
+    /// user confirms when live sessions would keep running out of sight.
+    /// Attention events still surface; ⌘⇧T reopens with everything intact.
+    private func requestCloseProject(_ project: AppModel.ProjectGroup) {
+        let running = model.runningWorkCount(inProject: project.id)
+        guard running > 0 else {
+            model.closeProject(id: project.id)
+            return
+        }
+        let alert = NSAlert()
+        alert.messageText = "Close \(project.name)?"
+        alert.informativeText = running == 1
+            ? "1 session keeps running in the background. Reopen the project with ⌘⇧T to get back to it."
+            : "\(running) sessions keep running in the background. Reopen the project with ⌘⇧T to get back to them."
+        alert.addButton(withTitle: "Close Project")
+        alert.addButton(withTitle: "Cancel")
+        alert.alertStyle = .warning
+        if alert.runModal() == .alertFirstButtonReturn {
+            model.closeProject(id: project.id)
+        }
     }
 
     /// Session creation is anchored to the project whose menu was clicked — it
@@ -2251,7 +2277,16 @@ struct RootShellView: View {
             )
                 .id(mesh.id)
         } else {
-            ContentUnavailableView("Session unavailable", systemImage: "rectangle.slash")
+            VStack(spacing: 12) {
+                ContentUnavailableView("Session unavailable", systemImage: "rectangle.slash")
+                if model.canClose(id) {
+                    Button("Close") {
+                        model.commitClose(id)
+                        Task { await model.drainPendingReleases() }
+                    }
+                    .buttonStyle(.bordered)
+                }
+            }
         }
     }
 
@@ -4427,11 +4462,10 @@ private struct SessionStrip: View {
                     .buttonStyle(.plain)
                     .contextMenu {
                         Button("Rename…") { rename(session.id) }
-                        if model.isOwned(session.id) {
-                            if !session.exited {
-                                Button("End Session", role: .destructive) {
-                                    Task { await model.endSession(session.id) }
-                                }
+                        if model.isOwned(session.id) || model.canClose(session.id) {
+                            Button("End Session", role: .destructive) {
+                                model.commitClose(session.id)
+                                Task { await model.drainPendingReleases() }
                             }
                         }
                     }

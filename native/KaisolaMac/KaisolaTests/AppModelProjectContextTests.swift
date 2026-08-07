@@ -640,7 +640,7 @@ final class AppModelProjectContextTests: XCTestCase {
     }
 
     @MainActor
-    func testFileWorkbenchNeverSilentlyEvictsPinnedTabsAtCapacity() throws {
+    func testFileWorkbenchNeverSilentlyEvictsPinnedTabsAtCapacity() async throws {
         let (model, _) = makeModel()
         let root = storeFile.deletingLastPathComponent().appendingPathComponent("tab-cap")
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
@@ -660,7 +660,7 @@ final class AppModelProjectContextTests: XCTestCase {
     }
 
     @MainActor
-    func testChatIsPersistedAndGroupedUnderItsProject() throws {
+    func testChatIsPersistedAndGroupedUnderItsProject() async throws {
         let (model, _) = makeModel()
         let agent = try XCTUnwrap(AgentRegistry.all.first { AcpAdapter.forAgent($0.id) != nil })
         let directory = URL(fileURLWithPath: "/tmp/ctx-chat", isDirectory: true)
@@ -674,7 +674,7 @@ final class AppModelProjectContextTests: XCTestCase {
         XCTAssertEqual(model.selectedProjectID, project.id)
         XCTAssertEqual(model.selectedProjectName, project.name)
 
-        if let chatID = model.chats.first?.id { model.deleteChat(chatID) }
+        if let chatID = model.chats.first?.id { await model.deleteChat(chatID) }
     }
 
     @MainActor
@@ -702,9 +702,18 @@ final class AppModelProjectContextTests: XCTestCase {
         XCTAssertTrue(model.chats.isEmpty)
         XCTAssertEqual(model.recentlyClosedSurfaces(in: chat.projectID).map(\.id), [chat.id])
         model.closeProject(id: chat.projectID)
+        // Deliberately inverted (2026-08-06 spec §4d): closed stays closed.
+        // Recently Closed work no longer forces the tab back — reopening the
+        // project (⌘⇧T / Open Folder) is the recovery path, and it restores
+        // the rail with everything intact.
+        XCTAssertFalse(
+            model.projects.contains(where: { $0.id == chat.projectID }),
+            "a closed project must stay out of the rail even with Recently Closed work"
+        )
+        model.reopenLastClosedProject()
         XCTAssertTrue(
             model.projects.contains(where: { $0.id == chat.projectID }),
-            "a project with Recently Closed work must keep its recovery controls reachable"
+            "reopening restores the project's recovery controls"
         )
 
         let restoreResult = await model.restoreRecentlyClosedSurface(chat.id)
@@ -736,7 +745,7 @@ final class AppModelProjectContextTests: XCTestCase {
     }
 
     @MainActor
-    func testSwitchingProjectRestoresASurfaceInsideThatProject() throws {
+    func testSwitchingProjectRestoresASurfaceInsideThatProject() async throws {
         let (model, _) = makeModel()
         let agent = try XCTUnwrap(AgentRegistry.all.first { AcpAdapter.forAgent($0.id) != nil })
         let first = URL(fileURLWithPath: "/tmp/ctx-chat-a", isDirectory: true)
@@ -754,7 +763,7 @@ final class AppModelProjectContextTests: XCTestCase {
         XCTAssertEqual(model.selectedChatID, secondChat.id)
         XCTAssertNotEqual(model.selectedChatID, firstChat.id)
 
-        for chat in model.chats { model.deleteChat(chat.id) }
+        for chat in model.chats { await model.deleteChat(chat.id) }
     }
 
     @MainActor

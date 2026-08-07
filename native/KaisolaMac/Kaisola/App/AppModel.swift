@@ -561,14 +561,19 @@ final class AppModel: ObservableObject {
 
         // Opened tabs keep their persisted (user-reordered) sequence; projects
         // that only exist through live sessions/chats/Mesh or Recently Closed
-        // follow, sorted by name. Closing a tab therefore never strands a
-        // restorable or permanently deletable surface.
+        // follow, sorted by name — EXCEPT projects the user closed. Closed
+        // stays closed (2026-08-06 spec §4d): a closed project's live work
+        // keeps running (the close confirmation says so, and its attention
+        // events still surface), but the tab returns only via reopen (⌘⇧T) or
+        // Open Folder. This deliberately inverts the old rule that Recently
+        // Closed work forced a project visible.
         let openedGroups = opened.map { group(for: $0.id) }
         let liveProjectIDs = Set(sessionsByProject.keys)
             .union(chatsByProject.keys)
             .union(meshesByProject.keys)
             .union(recentlyClosedByProject.keys)
         let sessionOnly = liveProjectIDs.subtracting(opened.map(\.id))
+            .filter { !sessionStore.isProjectClosed($0) }
             .map(group(for:))
             .sorted { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
         return openedGroups + sessionOnly
@@ -1157,7 +1162,7 @@ final class AppModel: ObservableObject {
             sessions.lazy.filter { self.displayProjectID($0) == projectID }.map(\.id)
         ).union(chats(in: projectID).map(\.id))
             .union(meshes(in: projectID).map(\.id))
-            .union(dormantTerminalIDs)
+            .union(dormantTerminalIDs(in: projectID))
         layout.normalize(availableSessionIDs: available)
         guard layout != previous else { return false }
 
@@ -2133,6 +2138,16 @@ final class AppModel: ObservableObject {
 
     /// Test-only window onto the private snapshot builder, so the adoption
     /// overlay's persistence contract is provable without a relaunch.
+    /// Test-only layout injection for close/quit races.
+    func setPaneLayoutForTesting(_ layout: SessionPaneLayout, projectID: String) {
+        paneLayouts[projectID] = layout
+    }
+
+    /// Test-only dormant marking (production sets this in restoreOwnedSessions).
+    func markDormantForTesting(_ terminalID: String) {
+        dormantTerminalIDs.insert(terminalID)
+    }
+
     func workspaceSnapshotForTesting(projectID: String) -> NativeProjectWorkspaceState? {
         workspaceSnapshot(projectID: projectID)
     }
@@ -2666,14 +2681,26 @@ final class AppModel: ObservableObject {
             await raiseWorkspaceRestorationNotice(for: error)
             return
         }
-        recentlyClosedPanes = restoration.projects.flatMap { project in
+        // Closed projects sit out of restoration entirely (§4d): their
+        // archived state stays on disk for ⌘⇧T reopen, but no chats, meshes,
+        // layouts, or Recently Closed rows materialize for them at launch.
+        let restorableProjects = restoration.projects.filter {
+            !sessionStore.isProjectClosed($0.projectID)
+        }
+        recentlyClosedPanes = restorableProjects.flatMap { project in
             project.panes.filter(\.isRecentlyClosed)
         }
-        for projectState in restoration.projects {
+        // Deleted chats whose rows are fully gone can drain their tombstones.
+        await transcriptStore.vacuumTombstones()
+        for projectState in restorableProjects {
             for pane in projectState.panes {
                 guard !pane.isRecentlyClosed,
                       let descriptor = pane.surface.agentChatDescriptor,
                       chats.contains(where: { $0.id == descriptor.id }) == false,
+                      // A tombstoned chat was deleted; a stale archived pane
+                      // (crash between phases, another window) must not
+                      // revive it (§4e).
+                      await transcriptStore.isTombstoned(chatID: descriptor.id) == false,
                       let agent = AgentRegistry.profile(id: descriptor.agentID) else { continue }
                 let directory = URL(fileURLWithPath: descriptor.workspacePath, isDirectory: true)
                     .standardizedFileURL
@@ -2798,7 +2825,7 @@ final class AppModel: ObservableObject {
                     sessions.lazy.filter { $0.projectID == projectState.projectID }.map(\.id)
                 ).union(chats(in: projectState.projectID).map(\.id))
                     .union(meshes(in: projectState.projectID).map(\.id))
-                    .union(dormantTerminalIDs)
+                    .union(dormantTerminalIDs(in: projectState.projectID))
                 layout.normalize(availableSessionIDs: available)
             } else {
                 layout.normalize()
@@ -3294,7 +3321,21 @@ final class AppModel: ObservableObject {
     }
 
     /// The explicit permanent-delete boundary for a live chat.
-    func deleteChat(_ chatID: String) {
+    func deleteChat(_ chatID: String) async {
+        // Tombstone FIRST (§4e): the durable record of intent that every
+        // later phase — and every other window sharing the database —
+        // converges on, even across a crash. A failed write aborts the
+        // delete instead of reporting success. If the app dies before this
+        // lands, the delete simply didn't happen — never half-happened.
+        do {
+            try await transcriptStore.tombstone(chatID: chatID)
+        } catch {
+            ToastCenter.shared.show(
+                "Couldn't delete the chat: \(error.kaisolaSafeDescription)",
+                style: .error
+            )
+            return
+        }
         let closingChat = chats.first(where: { $0.id == chatID })
         if let closingChat {
             // Quiesce persistence synchronously on MainActor before stop()
@@ -3326,6 +3367,11 @@ final class AppModel: ObservableObject {
         }
         if forgetDurableChat { enqueueTranscriptRemoval(chatID: chatID) }
         enqueueDraftRemoval(chatID: chatID)
+        // The workspace archive must reflect the deletion durably NOW, not
+        // after a 220 ms debounce a crash can beat (§4e).
+        if let projectID = closingChat?.projectID {
+            Task { await persistWorkspaceStateImmediately(projectID: projectID) }
+        }
     }
 
     /// Stop the adapter without deleting the surface, transcript, or draft.
@@ -4874,8 +4920,12 @@ final class AppModel: ObservableObject {
                 agentID: agent?.id,
                 accountBinding: accountBinding
             ))
-            // Ensure the session's folder is a persistent project tab.
-            sessionStore.openProject(directory: cwd)
+            // Ensure the session's folder is a persistent project tab — but
+            // never on the resurrection path: a respawn must not re-open a
+            // closed project's tab or eat its ⌘⇧T undo entry (§4c).
+            if !restore {
+                sessionStore.openProject(directory: cwd)
+            }
             refreshPersistedNavigationState(publish: false)
             ownedTerminalIDs.insert(terminalID)
 
@@ -5405,50 +5455,18 @@ final class AppModel: ObservableObject {
     /// Ends an owned session for good: the PTY dies and the registry entry is
     /// removed. (App quit is different — quitting detaches and the shell keeps
     /// running on the broker.)
-    func endSession(_ terminalID: String) async {
-        // A dormant terminal has no live record and is not owned, but the
-        // user must still be able to close its pane — a vanished project
-        // folder would otherwise leave an un-closable "Session unavailable"
-        // tile forever. The record moves to the closed stack (⌘⌥T restores).
-        if dormantTerminalIDs.contains(terminalID) {
-            endDormantSession(terminalID)
-            return
-        }
-        guard isOwned(terminalID),
-              let record = sessions.first(where: { $0.id == terminalID }) else { return }
+    /// Closing is user intent (2026-08-06 spec §4a): everything that decides
+    /// whether the terminal can ever come back happens HERE, synchronously —
+    /// the store commit (record removed, tombstone added, release queued) and
+    /// the pane removal. A ⌘Q in the same runloop turn, a dead broker, or a
+    /// respawn already in flight all see the truth. Broker cleanup is
+    /// best-effort behind it via `drainPendingReleases()`.
+    func commitClose(_ terminalID: String) {
         terminalDraftDebounceTasks.removeValue(forKey: terminalID)?.cancel()
         persistTerminalDraftNow(terminalID)
-        await draftPersistenceTask?.value
-        // Remember enough to recreate it (⌘⌥T), but do not mutate the local
-        // registry unless the broker confirms the permanent close (or a
-        // timeout races with a close that inventory can already prove).
-        let closedSession = persistedOwnedSessions
-            .first(where: { $0.id == terminalID })
-            .map {
-                ClosedSession(
-                    cwd: $0.cwd,
-                    agentID: $0.agentID,
-                    title: $0.title,
-                    accountBinding: $0.accountBinding,
-                    sourceTerminalID: terminalID
-                )
-            }
-        // terminal.kill leaves an exited diagnostic record behind; release is
-        // the owner-gated permanent close and removes the spool + sidebar row.
-        do {
-            try await controlClient.release(projectID: record.projectID, terminalID: terminalID)
-        } catch {
-            await refreshInventory()
-            guard !sessions.contains(where: { $0.id == terminalID }) else {
-                ToastCenter.shared.show("Couldn't end session: \(error.kaisolaSafeDescription)", style: .error)
-                return
-            }
-        }
-        if let closedSession {
-            sessionStore.pushClosedSession(closedSession)
-        }
-        sessionStore.remove(terminalID: terminalID)
+        sessionStore.commitCloseTerminal(terminalID)
         refreshPersistedNavigationState(publish: false)
+        dormantTerminalIDs.remove(terminalID)
         terminalResizeTasks.removeValue(forKey: terminalID)?.cancel()
         terminalResizeGeneration.removeValue(forKey: terminalID)
         desiredTerminalGeometry.removeValue(forKey: terminalID)
@@ -5466,37 +5484,9 @@ final class AppModel: ObservableObject {
         terminalLastOutputAt.removeValue(forKey: terminalID)
         terminalDraftTrackers.removeValue(forKey: terminalID)
         pendingAgentResume.removeValue(forKey: terminalID)
+        sessions.removeAll { $0.id == terminalID }
         // Drop the parked SwiftTerm buffer too; this terminal cannot come back.
         TerminalSurfaceCache.shared.evict(sessionID: terminalID)
-        if selectedSessionID == terminalID {
-            selectedSessionID = nil
-            await select(nil)
-        }
-        await refreshInventory()
-    }
-
-    /// Closes a dormant pane: no broker call (there is no PTY), the persisted
-    /// record moves to the closed-session stack so ⌘⌥T can bring it back, and
-    /// the pane leaves every layout.
-    private func endDormantSession(_ terminalID: String) {
-        let closedSession = persistedOwnedSessions
-            .first(where: { $0.id == terminalID })
-            .map {
-                ClosedSession(
-                    cwd: $0.cwd,
-                    agentID: $0.agentID,
-                    title: $0.title,
-                    accountBinding: $0.accountBinding,
-                    sourceTerminalID: terminalID
-                )
-            }
-        if let closedSession {
-            sessionStore.pushClosedSession(closedSession)
-        }
-        sessionStore.remove(terminalID: terminalID)
-        refreshPersistedNavigationState(publish: false)
-        dormantTerminalIDs.remove(terminalID)
-        pendingAgentResume.removeValue(forKey: terminalID)
         for projectID in Array(paneLayouts.keys) {
             _ = reconcilePaneLayoutWithAvailableSurfaces(for: projectID, persist: true)
         }
@@ -5506,6 +5496,66 @@ final class AppModel: ObservableObject {
         if focusedPaneID == terminalID {
             focusedPaneID = nil
         }
+    }
+
+    /// Live work that would keep running out of sight if this project closed:
+    /// unexited terminals, running chats, running mesh columns.
+    func runningWorkCount(inProject projectID: String) -> Int {
+        let terminals = sessions.filter {
+            displayProjectID($0) == projectID && !$0.exited
+        }.count
+        let runningChats = chats(in: projectID).filter(\.conversation.isRunning).count
+        let runningColumns = meshes(in: projectID).reduce(into: 0) { count, mesh in
+            count += mesh.columns.filter(\.conversation.isRunning).count
+        }
+        return terminals + runningChats + runningColumns
+    }
+
+    /// Whether a close affordance applies: any terminal with a persisted
+    /// record (live, exited, dormant, or unavailable) can be closed.
+    func canClose(_ terminalID: String) -> Bool {
+        sessionStore.owns(terminalID: terminalID) || dormantTerminalIDs.contains(terminalID)
+    }
+
+    /// Dormant ids scoped to one project — a dormant terminal must hold a
+    /// pane open only in its own project's layout.
+    private func dormantTerminalIDs(in projectID: String) -> Set<String> {
+        let byID = Dictionary(
+            persistedOwnedSessions.map { ($0.id, $0.projectID) },
+            uniquingKeysWith: { first, _ in first }
+        )
+        return dormantTerminalIDs.filter { byID[$0] == projectID }
+    }
+
+    /// Owed broker releases, drained after every close and every connect.
+    /// Idempotent: an absent terminal acknowledges the release too.
+    func drainPendingReleases() async {
+        guard controlAvailable else { return }
+        for pending in sessionStore.pendingReleaseList() {
+            do {
+                try await controlClient.release(
+                    projectID: pending.projectID,
+                    terminalID: pending.id
+                )
+                sessionStore.acknowledgeRelease(id: pending.id)
+            } catch {
+                // The terminal may already be gone (broker restarted without
+                // it): a definitive absence from fresh inventory acknowledges.
+                if !sessions.contains(where: { $0.id == pending.id }) {
+                    sessionStore.acknowledgeRelease(id: pending.id)
+                }
+                // Otherwise keep it queued for the next drain.
+            }
+        }
+        await refreshInventory()
+    }
+
+    /// Compatibility shim for existing async call sites; the commit itself is
+    /// synchronous per §4a.
+    func endSession(_ terminalID: String) async {
+        commitClose(terminalID)
+        await drainPendingReleases()
+        await select(selectedSessionID)
     }
 
     /// Recreate the most recently ended session (⌘⌥T). Provider CLIs with a
@@ -5562,6 +5612,13 @@ final class AppModel: ObservableObject {
             if wasMaximized { maximizedPaneID = createdID }
             scheduleWorkspaceStateSave(projectID: record.projectID)
         }
+        // The replacement owns the pane now; the old record must not linger
+        // as a permanent resurrection candidate (§4b). Runs after the layout
+        // swap so the reconcile inside commitClose sees the new id, not a
+        // hole. commitClose also queues the release that reaps the exited
+        // diagnostic row on the broker.
+        commitClose(terminalID)
+        Task { [weak self] in await self?.drainPendingReleases() }
     }
 
     private func recreateSession(from closed: ClosedSession) async -> String? {
@@ -5611,6 +5668,7 @@ final class AppModel: ObservableObject {
                 sessions = status.terminals
                 reconcileAllPaneLayoutsWithAvailableSurfaces()
                 syncTrackedWorkingDirectories()
+                stampEndedFromInventory(status.terminals)
             }
             let emptyDrains = await client.detachEmptyDrainingGenerations()
             if !emptyDrains.isEmpty {
@@ -5829,22 +5887,40 @@ final class AppModel: ObservableObject {
         for terminalID in owned {
             scheduleDesiredTerminalResize(terminalID, force: true)
         }
-        // Resurrection is scheduled HERE — not only from reload() — so a
-        // broker that dies and reconnects mid-session (crash, generation
-        // rollover) also gets its lost terminals back, not just a fresh app
-        // launch. Detached: it must never block restore or reconnect.
-        if !dormant.isEmpty {
-            Task { [weak self] in await self?.resurrectDormantTerminals() }
+        // Owed releases from closes that happened while disconnected drain
+        // FIRST, so a resurrection sweep can never race a queued close.
+        Task { [weak self] in
+            await self?.drainPendingReleases()
+            // Resurrection is scheduled HERE — not only from reload() — so a
+            // broker that dies and reconnects mid-session also gets its lost
+            // terminals back. Detached: never blocks restore or reconnect.
+            await self?.resurrectDormantTerminals()
         }
     }
 
     /// The broker's tracked cwd (refreshed as shells `cd` around) flows back
     /// into the app's persisted records, so a resurrection after the NEXT
     /// reboot reopens where the shell actually was, not where it started.
+    /// Inventory is the durable exit evidence (§4b): exit events only reach
+    /// current observers, but every refresh lists exited rows, so a terminal
+    /// that ended while the app was away is still remembered as ended — and
+    /// never resurrected.
+    private func stampEndedFromInventory(_ records: [BrokerTerminalRecord]) {
+        var changed = false
+        for record in records where record.exited {
+            guard let stored = persistedOwnedSessions.first(where: { $0.id == record.id }),
+                  stored.endedAt == nil else { continue }
+            sessionStore.stampEnded(record.id, at: Int64(Date().timeIntervalSince1970 * 1_000))
+            changed = true
+        }
+        if changed { refreshPersistedNavigationState(publish: false) }
+    }
+
     private func syncTrackedWorkingDirectories() {
         var changed = false
         for record in sessions {
             guard let cwd = record.cwd, !cwd.isEmpty,
+                  !sessionStore.isTerminalTombstoned(record.id),
                   let stored = persistedOwnedSessions.first(where: { $0.id == record.id }),
                   stored.cwd != cwd else { continue }
             var updated = NativeOwnedSession(
@@ -5887,6 +5963,15 @@ final class AppModel: ObservableObject {
             default: return
             }
             guard controlAvailable, dormantTerminalIDs.contains(stored.id) else { continue }
+            // Closed-stays-closed (§4b/§4c): never respawn a terminal the
+            // user closed, one whose process ended, or one whose project is
+            // closed.
+            guard !sessionStore.isTerminalTombstoned(stored.id),
+                  stored.endedAt == nil,
+                  !sessionStore.isProjectClosed(stored.projectID) else {
+                dormantTerminalIDs.remove(stored.id)
+                continue
+            }
             // Freshest inventory wins: a drain handoff may have surfaced the
             // terminal since restore marked it dormant.
             guard !sessions.contains(where: { $0.id == stored.id }) else {
@@ -5907,6 +5992,17 @@ final class AppModel: ObservableObject {
                 select: false,
                 environmentBinding: stored.agentID != nil ? stored.accountBinding : nil
             )
+            // The spawn suspended; the user (or another window) may have
+            // closed this id meanwhile. A create that landed for a tombstoned
+            // id gets a compensating release immediately — the store already
+            // refused the upsert, so the PTY would otherwise leak untracked.
+            if sessionStore.isTerminalTombstoned(stored.id) {
+                try? await controlClient.release(
+                    projectID: stored.projectID, terminalID: stored.id
+                )
+                dormantTerminalIDs.remove(stored.id)
+                continue
+            }
             guard created == stored.id else { continue }
             dormantTerminalIDs.remove(stored.id)
             if let agentID = stored.agentID {
@@ -6243,6 +6339,12 @@ final class AppModel: ObservableObject {
             // resurrected shell that exits immediately renders the resume
             // chip and the "Session ended" banner stacked on each other.
             pendingAgentResume.removeValue(forKey: event.terminalID)
+            // Exit evidence (§4b): an ended terminal is never resurrected.
+            sessionStore.stampEnded(
+                event.terminalID,
+                at: Int64(Date().timeIntervalSince1970 * 1_000)
+            )
+            refreshPersistedNavigationState(publish: false)
         case .activity:
             break
         }

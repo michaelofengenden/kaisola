@@ -524,6 +524,16 @@ final class MeshSession: ObservableObject, Identifiable {
         environment: [String: String] = ProcessInfo.processInfo.environment
     ) async {
         guard !isDestroyed, columns.isEmpty else { return }
+        // A mesh the user deleted stays deleted (2026-08-06 spec §4e): a
+        // pendingDeletion manifest resumes destruction instead of restoring
+        // columns. No adapters start; failure keeps the retryable recovery
+        // surface; success completes the tombstone through the caller's
+        // pendingDeletion cleanup path.
+        if lifecycle == .pendingDeletion {
+            _ = await destroy(allowRecoverableWork: true)
+            onDescriptorChanged?()
+            return
+        }
         let serverConfigs = McpConfigStore(workspace: baseDirectory).servers()
         let mcp = McpConfigStore.jsonValues(serverConfigs)
         configuredMCPServerNames = serverConfigs.filter(\.enabled).map(\.name)
@@ -636,7 +646,10 @@ final class MeshSession: ObservableObject, Identifiable {
         configuredAgentNames = columns.map(\.agent.name)
         if !recovery.isEmpty {
             lifecycle = .recoveryRequired
-        } else if lifecycle != .pendingDeletion || !columns.isEmpty {
+        } else if lifecycle != .pendingDeletion {
+            // pendingDeletion is handled at entry and must never flip back to
+            // a live lifecycle here (§4e) — the old `|| !columns.isEmpty`
+            // escape hatch was exactly how deleted meshes came back.
             lifecycle = .suspended
         }
         if !recovery.isEmpty {

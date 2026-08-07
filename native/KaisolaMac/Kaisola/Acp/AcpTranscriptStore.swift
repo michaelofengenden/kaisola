@@ -376,6 +376,79 @@ actor AcpTranscriptStore {
         }
     }
 
+    // MARK: - Deletion tombstones (closed-stays-closed §4e)
+
+    /// Written FIRST when a chat is deleted, before any in-memory removal, so
+    /// every phase after it — and every other window sharing this database —
+    /// converges on "gone" even across a crash. Throws so the caller can
+    /// surface a failed delete instead of reporting success.
+    func tombstone(chatID: String) throws {
+        guard Self.validChatID(chatID) else { return }
+        pending.removeValue(forKey: chatID)
+        let database = try openDatabase()
+        try transaction(database) {
+            try execute(
+                """
+                CREATE TABLE IF NOT EXISTS deleted_chats (
+                    chat_id TEXT PRIMARY KEY NOT NULL,
+                    deleted_at INTEGER NOT NULL
+                ) WITHOUT ROWID
+                """,
+                database: database
+            )
+            try withStatement(
+                "INSERT OR REPLACE INTO deleted_chats(chat_id, deleted_at) VALUES (?, ?)",
+                database: database
+            ) {
+                try bind(chatID, at: 1, statement: $0, database: database)
+                try bind(Int64(Date().timeIntervalSince1970 * 1_000), at: 2, statement: $0, database: database)
+                try stepDone($0, database: database)
+            }
+        }
+    }
+
+    func isTombstoned(chatID: String) -> Bool {
+        guard Self.validChatID(chatID),
+              let database = try? openDatabase(),
+              tableExists("deleted_chats", database: database) else { return false }
+        var found = false
+        try? withStatement(
+            "SELECT 1 FROM deleted_chats WHERE chat_id = ? LIMIT 1",
+            database: database
+        ) {
+            try bind(chatID, at: 1, statement: $0, database: database)
+            found = try stepRow($0, database: database)
+        }
+        return found
+    }
+
+    /// Tombstones whose chat rows are fully gone can drain — run once per
+    /// open; keeps the table from growing forever without ever weakening the
+    /// guarantee while references remain.
+    func vacuumTombstones() {
+        guard let database = try? openDatabase(),
+              tableExists("deleted_chats", database: database) else { return }
+        try? execute(
+            """
+            DELETE FROM deleted_chats
+            WHERE chat_id NOT IN (SELECT chat_id FROM chats)
+            """,
+            database: database
+        )
+    }
+
+    private func tableExists(_ name: String, database: SQLiteHandle) -> Bool {
+        var exists = false
+        try? withStatement(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ? LIMIT 1",
+            database: database
+        ) {
+            try bind(name, at: 1, statement: $0, database: database)
+            exists = try stepRow($0, database: database)
+        }
+        return exists
+    }
+
     func flush() {
         flushTask = nil
         guard !pending.isEmpty else { return }
@@ -922,6 +995,26 @@ actor AcpTranscriptStore {
 
     private func stepDone(_ statement: OpaquePointer, database: SQLiteHandle) throws {
         guard sqlite3_step(statement) == SQLITE_DONE else { throw databaseError(database) }
+    }
+
+    /// True when the statement yields a row; DONE means no match.
+    private func stepRow(_ statement: OpaquePointer, database: SQLiteHandle) throws -> Bool {
+        switch sqlite3_step(statement) {
+        case SQLITE_ROW: return true
+        case SQLITE_DONE: return false
+        default: throw databaseError(database)
+        }
+    }
+
+    private func bind(
+        _ value: Int64,
+        at index: Int32,
+        statement: OpaquePointer,
+        database: SQLiteHandle
+    ) throws {
+        guard sqlite3_bind_int64(statement, index, value) == SQLITE_OK else {
+            throw databaseError(database)
+        }
     }
 
     private func bind(

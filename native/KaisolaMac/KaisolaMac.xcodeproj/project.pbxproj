@@ -33,6 +33,7 @@
 		1402D69DCC56FF170B7E18A4 /* QuietStatusClockTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = C04010C4C83AE322453E2F1F /* QuietStatusClockTests.swift */; };
 		1763DAFD85AE9A3BC6ED6D8B /* WorkspaceRestorationNotice.swift in Sources */ = {isa = PBXBuildFile; fileRef = 02A10A6A4198BF7AD4807A20 /* WorkspaceRestorationNotice.swift */; };
 		1780D63195E079FEFBD762C0 /* LocalhostDetectorTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = BBC39D51D190999C81FEFA9D /* LocalhostDetectorTests.swift */; };
+		181D98C2AE14BD88EDCA6458 /* ClosedLifecycleQuitTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2D50688D03104371F2AEF0CA /* ClosedLifecycleQuitTests.swift */; };
 		1869F552C4F7CEA346F1E96A /* SessionTitleTracker.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2D21E5A80D0B8BA9622A84FE /* SessionTitleTracker.swift */; };
 		1B90B06DA94C489692815A00 /* WorkspacePersistenceVisibilityTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9E8A890E106780D1EBC76860 /* WorkspacePersistenceVisibilityTests.swift */; };
 		1C675F4AF5327A3E83E5D7F8 /* CompanionCommandRouterTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 88248FB2EEAA9902A80D000D /* CompanionCommandRouterTests.swift */; };
@@ -64,6 +65,7 @@
 		33692846E196A13311DD86C6 /* OnboardingView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 59057824C59D8B945BB9D032 /* OnboardingView.swift */; };
 		336BCD151BF7DF4E1FBDE151 /* QuietRollup.swift in Sources */ = {isa = PBXBuildFile; fileRef = E2C62AECA29EC2AB89B8C85A /* QuietRollup.swift */; };
 		3769FF88F6731888F7913E56 /* ProjectTint.swift in Sources */ = {isa = PBXBuildFile; fileRef = DD0520C7CA820BC9B9798C98 /* ProjectTint.swift */; };
+		380F8D745A8FFB7E44651A98 /* ClosedLifecycleStoreTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 464ED169861ADF834D75A7E3 /* ClosedLifecycleStoreTests.swift */; };
 		38943553D49563BB8063182C /* AppModelBookkeeping.swift in Sources */ = {isa = PBXBuildFile; fileRef = A9878CE4AE9D997C699F9827 /* AppModelBookkeeping.swift */; };
 		395CF5D2389A3A14D23A5888 /* BrokerDiscoveryTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9F5A8717F4788368FDE60F93 /* BrokerDiscoveryTests.swift */; };
 		3A3057A403EEDE75E24FCFE6 /* NativeUpdateConfiguration.swift in Sources */ = {isa = PBXBuildFile; fileRef = 269A1E4D253C170CBDB084CA /* NativeUpdateConfiguration.swift */; };
@@ -375,6 +377,7 @@
 		2A6971FB4400D5FB64CC8D8C /* CompanionCommandRouter.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CompanionCommandRouter.swift; sourceTree = "<group>"; };
 		2A7B902D6525FF8C39FC9CD3 /* CompanionTerminalStreamHub.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CompanionTerminalStreamHub.swift; sourceTree = "<group>"; };
 		2D21E5A80D0B8BA9622A84FE /* SessionTitleTracker.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SessionTitleTracker.swift; sourceTree = "<group>"; };
+		2D50688D03104371F2AEF0CA /* ClosedLifecycleQuitTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ClosedLifecycleQuitTests.swift; sourceTree = "<group>"; };
 		2D6B491EE7B2C3DBFB78A87D /* MeshView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MeshView.swift; sourceTree = "<group>"; };
 		30302FC993E589B6B0D08005 /* CompanionListener.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CompanionListener.swift; sourceTree = "<group>"; };
 		32406CFD933CD31D2751A8AF /* AcpProcessTransport.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AcpProcessTransport.swift; sourceTree = "<group>"; };
@@ -405,6 +408,7 @@
 		446E609412A194ED4620DCDF /* AcpComposerView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AcpComposerView.swift; sourceTree = "<group>"; };
 		455D0FF2F635A75069247811 /* BrokerBootstrapClient.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BrokerBootstrapClient.swift; sourceTree = "<group>"; };
 		45799AC8A5D80828BB3EB235 /* AppModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppModel.swift; sourceTree = "<group>"; };
+		464ED169861ADF834D75A7E3 /* ClosedLifecycleStoreTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ClosedLifecycleStoreTests.swift; sourceTree = "<group>"; };
 		46530C246C60DC969457FB84 /* QuietStatusDerivation.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = QuietStatusDerivation.swift; sourceTree = "<group>"; };
 		47544E136A1B0FEEC9D16378 /* THIRD_PARTY_NOTICES.md */ = {isa = PBXFileReference; lastKnownFileType = net.daringfireball.markdown; path = THIRD_PARTY_NOTICES.md; sourceTree = "<group>"; };
 		481C565423F2C82B8F330468 /* CompanionDeviceRosterStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CompanionDeviceRosterStore.swift; sourceTree = "<group>"; };
@@ -950,6 +954,8 @@
 				991FCF32D009E1236EBF19A5 /* BrokerModelsTests.swift */,
 				A451FC25E152BC8B61FB5702 /* BrokerReconnectBackoffTests.swift */,
 				A7E57351BA3A72C99024DAEC /* BrokerStartupCoordinatorTests.swift */,
+				2D50688D03104371F2AEF0CA /* ClosedLifecycleQuitTests.swift */,
+				464ED169861ADF834D75A7E3 /* ClosedLifecycleStoreTests.swift */,
 				5B7E991B45873080FAD43C47 /* CodeEditorViewTests.swift */,
 				EEC8E541404472EF4F2F17A4 /* CommandRegistryTests.swift */,
 				88248FB2EEAA9902A80D000D /* CompanionCommandRouterTests.swift */,
@@ -1483,6 +1489,8 @@
 				AE16DBA9C3C56992F46A611A /* BrokerModelsTests.swift in Sources */,
 				6654B3A1CE2F11C7026F61B2 /* BrokerReconnectBackoffTests.swift in Sources */,
 				5EA24E714C9FF79494C0DDFA /* BrokerStartupCoordinatorTests.swift in Sources */,
+				181D98C2AE14BD88EDCA6458 /* ClosedLifecycleQuitTests.swift in Sources */,
+				380F8D745A8FFB7E44651A98 /* ClosedLifecycleStoreTests.swift in Sources */,
 				2B0106FB232612C7046A680A /* CodeEditorViewTests.swift in Sources */,
 				A56F42A67BA70F97CC9B7396 /* CommandRegistryTests.swift in Sources */,
 				1C675F4AF5327A3E83E5D7F8 /* CompanionCommandRouterTests.swift in Sources */,

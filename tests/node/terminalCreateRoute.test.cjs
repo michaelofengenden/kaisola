@@ -27,7 +27,7 @@ function fakeManager({ live = false, recovered = null } = {}) {
   }
 }
 
-test('terminal create route forwards restore and returns recovered scrollback for reused id', () => {
+test('terminal create route forwards restore but never returns a recovered payload', () => {
   const { terminalCreateRoute } = require('../../runtime/node-broker/ipc/terminalCreateRoute.cjs')
   const manager = fakeManager({
     recovered: { text: 'retained-before-restart', truncated: true },
@@ -56,10 +56,7 @@ test('terminal create route forwards restore and returns recovered scrollback fo
   assert.equal(manager.calls.length, 1)
   assert.equal(manager.calls[0].id, 'caller-supplied-terminal-id')
   assert.equal(manager.calls[0].restore, true)
-  assert.deepEqual(response.recovered, {
-    text: 'retained-before-restart',
-    truncated: true,
-  })
+  assert.equal(response.recovered, null)
   assert.equal(response.output, 'new-session-output')
 })
 
@@ -113,5 +110,5 @@ test('restore for an id unknown to this broker requires the id-embedded project 
     requireAllowed: () => {},
   })
   assert.equal(allowed.ok, true)
-  assert.equal(allowed.recovered.text, 'secret-project-a-output')
+  assert.equal(allowed.recovered, null)
 })

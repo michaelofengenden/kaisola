@@ -341,8 +341,6 @@ function spawn({ id, command, args, cwd, env, outputByteLimit, cols, rows, sende
     prior.spool.close({ remove: !restoring })
     terms.delete(id)
   }
-  const recovered = restoring ? TerminalSpool.coldTail(id, spoolDir) : null
-  const retainSpool = restoring && recovered !== null
   const shell = process.env.SHELL || '/bin/zsh'
   // a persisted cwd can be GONE by now (removed worktree, deleted folder) —
   // pty.spawn throws uncaught on a missing dir; fall back to home instead
@@ -358,8 +356,23 @@ function spawn({ id, command, args, cwd, env, outputByteLimit, cols, rows, sende
     cwd: startCwd,
     env: terminalEnv(env),
   })
+  const terminalSpool = new TerminalSpool({
+    dir: spoolDir,
+    id,
+    // Restore reuses the complete durable transcript. Every other create is
+    // a fresh terminal and must not inherit bytes for a recycled id.
+    fresh: !restoring,
+    ...(retainedOutputBytes == null ? {} : {
+      diskCap: Math.max(1, retainedOutputBytes),
+      hotCap: Math.max(1, Math.min(DEFAULT_HOT_CAP, retainedOutputBytes)),
+      queueCap: Math.max(1, Math.min(256 * 1024, retainedOutputBytes)),
+      retentionCap: retainedOutputBytes,
+    }),
+  })
+  const epochStartOffset = restoring ? terminalSpool.retainedByteCount() : 0
+  terminalSpool.startEpoch(epochStartOffset)
   const streamEpoch = crypto.randomUUID()
-  const cursor = new TerminalCursor({ streamEpoch })
+  const cursor = new TerminalCursor({ streamEpoch, startOffset: epochStartOffset })
   const rec = {
     id,
     pty: p,
@@ -369,21 +382,8 @@ function spawn({ id, command, args, cwd, env, outputByteLimit, cols, rows, sende
     sender,
     // Hidden renderers leave zero scrollback in RAM. The pty stays alive and
     // writes to this bounded disk spool until an xterm reattaches.
-    spool: new TerminalSpool({
-      dir: spoolDir,
-      id,
-      // Restore reuses an existing durable log. Every other create remains a
-      // fresh terminal and must not inherit stale bytes for a recycled id.
-      fresh: !retainSpool,
-      ...(retainedOutputBytes == null ? {} : {
-        diskCap: Math.max(1, retainedOutputBytes),
-        hotCap: Math.max(1, Math.min(DEFAULT_HOT_CAP, retainedOutputBytes)),
-        queueCap: Math.max(1, Math.min(256 * 1024, retainedOutputBytes)),
-        retentionCap: retainedOutputBytes,
-      }),
-    }),
+    spool: terminalSpool,
     outputByteLimit: retainedOutputBytes,
-    recovered,
     cursor,
     observers: null,
     rendererVisible: true,

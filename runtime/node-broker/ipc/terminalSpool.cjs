@@ -178,14 +178,6 @@ class TerminalSpool {
         try { fs.unlinkSync(file) } catch { /* absent or already unavailable */ }
       }
     }
-    // A restored terminal appends to the retained log, but its live stream
-    // starts after the recovered bytes. Snapshot/history reads use this
-    // boundary so the cold payload is returned once through `recovered`
-    // instead of being replayed again as output from the new PTY.
-    this.readStartBytes = 0
-    for (const file of [this.prevFile, this.file]) {
-      try { this.readStartBytes += fs.statSync(file).size } catch { /* absent */ }
-    }
     this.fallbackChunks = []
     this.fallbackLen = 0
     this.diskError = null
@@ -278,7 +270,7 @@ class TerminalSpool {
         let discardedBytes = 0
         if (discarded) try { discardedBytes = fs.statSync(this.prevFile).size } catch { /* unavailable */ }
         try { fs.unlinkSync(this.prevFile) } catch { /* first segment */ }
-        if (discardedBytes) this.readStartBytes = Math.max(0, this.readStartBytes - discardedBytes)
+        if (discardedBytes) this.epochStartOffset = Math.max(0, this.epochStartOffset - discardedBytes)
         fs.renameSync(this.file, this.prevFile)
         if (discarded) this.truncated = true
       }
@@ -301,9 +293,9 @@ class TerminalSpool {
     }
   }
 
-  _diskSegments() {
+  _diskSegments(startOffset = 0) {
     const segments = []
-    let skip = this.readStartBytes
+    let skip = Math.max(0, Math.floor(Number(startOffset) || 0))
     for (const file of [this.prevFile, this.file]) {
       try {
         const size = fs.statSync(file).size
@@ -315,10 +307,10 @@ class TerminalSpool {
     return segments
   }
 
-  _diskTail(bytes) {
+  _diskTail(bytes, startOffset = 0) {
     const cap = Math.max(0, Math.floor(Number(bytes) || 0))
     if (!cap) return ''
-    const segments = this._diskSegments()
+    const segments = this._diskSegments(startOffset)
     const totalBytes = segments.reduce((sum, segment) => sum + segment.length, 0)
     // Read a few extra bytes so utf8Tail can move a boundary that lands in the
     // middle of a multi-byte scalar without returning less history than needed.
@@ -407,6 +399,21 @@ class TerminalSpool {
     return { exitedAt: this.exitedAt, exitStatus: this.exitStatus }
   }
 
+  retainedByteCount() {
+    this.flush()
+    let diskBytes = 0
+    for (const file of [this.prevFile, this.file]) {
+      try { diskBytes += fs.statSync(file).size } catch { /* absent */ }
+    }
+    return diskBytes + this.fallbackLen
+  }
+
+  startEpoch(offset = this.retainedByteCount()) {
+    this.epochStartOffset = Math.max(0, Math.floor(Number(offset) || 0))
+    this.persistMeta()
+    return this.epochStartOffset
+  }
+
   snapshot(outputCap = DEFAULT_HOT_CAP) {
     this.flush()
     const cap = Number.isFinite(Number(outputCap)) ? Math.max(0, Math.floor(Number(outputCap))) : DEFAULT_HOT_CAP
@@ -419,12 +426,12 @@ class TerminalSpool {
     // authoritative disk tail and append only disk-write fallback bytes.
     const output = !fallbackBytes && !this.diskError && hotBytes >= cap
       ? utf8Tail(hot, cap)
-      : utf8Tail(this._diskTail(cap) + fallback, cap)
+      : utf8Tail(this._diskTail(cap, this.epochStartOffset) + fallback, cap)
     let diskBytes = 0
     for (const file of [this.prevFile, this.file]) {
       try { diskBytes += fs.statSync(file).size } catch { /* absent */ }
     }
-    const liveDiskBytes = Math.max(0, diskBytes - this.readStartBytes)
+    const liveDiskBytes = Math.max(0, diskBytes - this.epochStartOffset)
     return { output, truncated: this.truncated || liveDiskBytes + fallbackBytes > cap, viewState: this.viewState, modePrefix: this._modePrefix() }
   }
 

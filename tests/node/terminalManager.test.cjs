@@ -75,25 +75,59 @@ test('coldTail reads the bounded retained tail across previous and current segme
 
 test('restore spawn reuses retained bytes and appends new output', async (t) => {
   const id = 'restore-after-broker-restart'
+  const before = 'before-restart\n'
+  const after = 'after-restart'
   const seeded = new TerminalSpool({ dir: managerSpoolDir, id, fresh: true })
-  seeded.push('before-restart\n')
+  seeded.push(before)
   seeded.close()
   t.after(() => manager.release(id))
 
   const record = manager.spawn({
     id,
     command: '/bin/sh',
-    args: ['-c', 'printf after-restart'],
+    args: ['-c', `printf ${after}`],
     cwd: managerSpoolDir,
     restore: true,
   })
 
-  assert.deepEqual(record.recovered, { text: 'before-restart\n', truncated: false })
-  assert.doesNotMatch(manager.snapshot(id).output, /before-restart/)
+  const beforeBytes = Buffer.byteLength(before)
+  assert.equal(record.cursor.nextOffset, beforeBytes)
+  assert.equal(record.spool.epochStartOffset, beforeBytes)
+  assert.equal(Object.hasOwn(record.spool, 'readStartBytes'), false)
+  assert.deepEqual(manager.snapshot(id), {
+    output: '',
+    truncated: false,
+    viewState: null,
+    modePrefix: '',
+    streamEpoch: record.cursor.streamEpoch,
+    startOffset: beforeBytes,
+    endOffset: beforeBytes,
+    exited: false,
+    exitStatus: null,
+    agentBusy: false,
+    agentCompletedAt: null,
+    agentRespondedAt: null,
+  })
   await manager.waitForExit(id)
-  record.spool.flush()
+  const liveSnapshot = manager.snapshot(id)
+  assert.equal(liveSnapshot.output, after)
+  assert.equal(liveSnapshot.startOffset, beforeBytes)
+  assert.equal(liveSnapshot.endOffset, beforeBytes + Buffer.byteLength(after))
+  assert.doesNotMatch(liveSnapshot.output, /before-restart/)
+
+  const history = manager.history(id, {
+    streamEpoch: liveSnapshot.streamEpoch,
+    beforeOffset: liveSnapshot.endOffset,
+    maxBytes: 1024 * 1024,
+  })
+  assert.equal(history.ok, true)
+  assert.equal(history.output, before + after)
+  assert.equal(history.startOffset, 0)
+  assert.equal(history.endOffset, liveSnapshot.endOffset)
+  assert.equal(history.hasMore, false)
+  assert.equal(TerminalSpool.readMeta(id, managerSpoolDir).epochStartOffset, beforeBytes)
   assert.deepEqual(TerminalSpool.coldTail(id, managerSpoolDir), {
-    text: 'before-restart\nafter-restart',
+    text: before + after,
     truncated: false,
   })
 })
@@ -112,9 +146,11 @@ test('plain spawn wipes stale bytes instead of inheriting them', async (t) => {
     cwd: managerSpoolDir,
   })
 
-  assert.equal(record.recovered, null)
   await manager.waitForExit(id)
   record.spool.flush()
+  assert.equal(record.cursor.nextOffset, Buffer.byteLength('fresh-output'))
+  assert.equal(record.spool.epochStartOffset, 0)
+  assert.equal(Object.hasOwn(record.spool, 'readStartBytes'), false)
   assert.deepEqual(TerminalSpool.coldTail(id, managerSpoolDir), {
     text: 'fresh-output',
     truncated: false,

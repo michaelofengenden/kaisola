@@ -54,19 +54,13 @@ function terminalCreateRoute({
   const continuation = continuity && previousInstance && previousInstance !== clientInstanceId
     ? { ...continuity, acrossRestart: true, reattachedAt: now(), brokerPid, terminalPid: rec.pty?.pid }
     : null
-  const recovered = restore
-    && !existed
-    && rec.recovered
-    && typeof rec.recovered.text === 'string'
-    ? { text: rec.recovered.text, truncated: !!rec.recovered.truncated }
-    : null
   return {
     ok: true,
     existed,
     pid: rec.pty?.pid,
     continuation,
     ...manager.snapshot(id),
-    recovered,
+    recovered: null,
   }
 }
 

@@ -8,6 +8,18 @@ import XCTest
 final class UsageCenterTests: XCTestCase {
     private func makeCenter() -> UsageCenter { UsageCenter() }
 
+    func testProcessCompletionGateCanBeClaimedFromTimeoutQueueWithoutReentrancy() async {
+        let gate = UsageProcessCompletionGate()
+        let claims: (Bool, Bool) = await withCheckedContinuation { continuation in
+            DispatchQueue(label: "kaisola.usage.drain.test").async {
+                continuation.resume(returning: (gate.claim(), gate.claim()))
+            }
+        }
+
+        XCTAssertEqual(claims.0, true, "the first completion wins")
+        XCTAssertEqual(claims.1, false, "a competing callback cannot resume twice")
+    }
+
     // MARK: - record: latest + peak
 
     func testRecordCreatesEntryWithZeroTurns() {

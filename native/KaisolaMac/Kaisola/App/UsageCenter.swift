@@ -3,6 +3,22 @@ import Combine
 import CryptoKit
 import Foundation
 
+/// Serializes the competing process-exit and timeout callbacks without tying
+/// completion to the pipe-drain queue. The timeout itself runs on that queue,
+/// so synchronously re-entering it would trap in libdispatch.
+final class UsageProcessCompletionGate: @unchecked Sendable {
+    private let lock = NSLock()
+    private var claimed = false
+
+    func claim() -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        guard !claimed else { return false }
+        claimed = true
+        return true
+    }
+}
+
 /// A locally named subscription whose credentials remain inside the provider's
 /// normal config directory. Kaisola stores only this label + directory pointer;
 /// tokens and credential contents are never copied into app state or usage
@@ -1407,13 +1423,10 @@ final class UsageCenter: ObservableObject {
             try process.run()
             let finished: Bool = await withTaskCancellationHandler {
                 await withCheckedContinuation { continuation in
-                    nonisolated(unsafe) var resumed = false
+                    let completionGate = UsageProcessCompletionGate()
                     let resumeOnce: @Sendable (Bool) -> Void = { value in
-                        drainQueue.sync {
-                            guard !resumed else { return }
-                            resumed = true
-                            continuation.resume(returning: value)
-                        }
+                        guard completionGate.claim() else { return }
+                        continuation.resume(returning: value)
                     }
                     process.terminationHandler = { _ in resumeOnce(true) }
                     drainQueue.asyncAfter(deadline: .now() + 20) {

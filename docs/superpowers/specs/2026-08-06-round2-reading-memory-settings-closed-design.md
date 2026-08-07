@@ -1,6 +1,6 @@
-# Round 2: serif reading, memory efficiency, settings overhaul, closed-stays-closed (2026-08-06)
+# Round 2: serif reading, memory efficiency, settings overhaul, closed-stays-closed (2026-08-06, rev 2)
 
-Four workstreams approved by Michael on 2026-08-06 (evening). Section 4 is a bug-fix track and ships first as its own release. The round-1 performance principle carries over: nothing blocks the main thread or launch; disk is free to spend; RAM is the scarce resource this round.
+Four workstreams approved by Michael on 2026-08-06 (evening); revised after Codex plan-review (same night). Section 4 is a bug-fix track and ships first as its own release. The round-1 performance principle carries over: nothing blocks the main thread or launch; disk is free to spend; RAM is the scarce resource this round.
 
 ---
 
@@ -8,21 +8,23 @@ Four workstreams approved by Michael on 2026-08-06 (evening). Section 4 is a bug
 
 ### Current state
 
-The markdown editor (`FilePreviewEditors.swift`) renders the file's exact bytes with real text-storage attributes: system sans body (`MarkdownEditingStyle.baseAttributes`), heading sizes `[30, 25, 21, 18, 16, 15]`, full-width text container, quotes as gray oblique text, code as monospaced runs with a background color.
+The markdown editor (`FilePreviewEditors.swift`) renders the file's exact bytes with real text-storage attributes: system sans body, heading sizes `[30, 25, 21, 18, 16, 15]`, full-width text container, quotes as gray oblique text, code as monospaced runs with a background color. Edit-time styling is a debounced (70 ms) whole-document scan + apply on the main actor; only cursor-line reveal uses the range-scoped pass.
 
 ### Changes
 
-**1a. Reading face.** Body text becomes the system serif (New York: `NSFont` with `.serif` design) at 16 pt with line spacing tuned to ~1.5 leading. Headings stay sans (SF Pro) for contrast, retuned scale with tightened tracking on H1/H2. Bold/italic map to the serif's own weights and true italics (replacing the `obliqueness` skew for body italics). Inline code and code blocks stay monospaced; tables stay sans (grid legibility beats warmth there).
+**1a. Reading face with trait composition.** Body text becomes the system serif (New York) at 16 pt with ~1.5 leading; headings stay sans with a retuned scale. Emphasis attributes stop being static fonts: `attributes(for:)` composes traits onto the *resolved base face at that range* — bold inside body composes onto the serif, bold inside a table cell composes onto the table's sans, bold+italic nest correctly. Body italics use the serif's true italic (replacing the `obliqueness` skew). Inline code and code blocks stay monospaced; tables stay sans.
 
-**1b. Reading measure.** The text column caps at a comfortable measure (about 70 characters of the body face, ≈ 620 pt) and centers when the pane is wider, via the text container inset — the pane keeps its width, the text gets margins, LessWrong-style. Below the cap, behavior is unchanged. Zoom scales the measure with the type.
+**1b. Reading measure.** The text column caps at ~70 characters of the body face (≈ 620 unmagnified document points) and centers when the pane is wider, via the text container inset. The measure is defined in document space, so magnification scales it naturally — no double-scaling. Tests cover viewport-anchor continuity and table/image alignment across pane resize and zoom steps.
 
-**1c. Block styling.** Blockquotes: serif italic at full size (not gray), with a soft accent bar drawn by the existing layout-manager decoration path (same machinery as table decorations — nothing enters storage). Code blocks: a quiet rounded card behind the run (decoration-drawn), monospaced at a size that harmonizes with the serif body. Thematic breaks and tables keep their current drawing, restyled to the new palette.
+**1c. Block styling via extended decorations.** The layout-manager decoration model (today: one character index + width, `.rule`/`.fill`, drawn per line fragment) gains two kinds: `.quoteBar` (a leading accent bar drawn on each line fragment of a blockquote, with the quote text set in full-size serif italic) and `.codeBlockBackground` (a quiet background drawn per line fragment across the block's lines; corner rounding only on the block's first and last fragments). This is a bounded extension of existing machinery — per-line-fragment drawing, nothing enters text storage — not a new layout system. Thematic breaks and tables keep their current drawing, restyled to the new palette.
 
-**1d. Explicitly unchanged.** Byte fidelity, the incremental restyle pass, cursor-line reveal, checkboxes, wikilinks, lists, image painting, autosave. Syntax highlighting inside code blocks is out of scope this round.
+**1d. Honest performance boundary.** Edit-time styling remains today's debounced whole-document pass; this section adds no per-edit cost beyond it (same span count, decorations computed in the same pass). A true edit-delta/dirty-range styling pipeline stays future work, tracked separately — this spec does not claim bounded edit-time styling, only bounded *cursor-move* styling (which already ships).
+
+**1e. Explicitly unchanged.** Byte fidelity, cursor-line reveal, checkboxes, wikilinks, lists, image painting, autosave. Syntax highlighting inside code blocks is out of scope this round.
 
 ### Testing
 
-Attribute-level unit tests: base/heading/quote attributes report the intended fonts and spacing; measure computation (pure function of pane width and zoom) clamps and centers correctly. Byte-fidelity and bounded-restyle regression tests already exist and must stay green. Visual check on a long real document.
+Attribute-level tests: trait composition (serif bold in body, sans bold in table cell, nested bold-italic), measure computation (pure function of pane width and zoom; clamps and centers), decoration emission for quote/code blocks. Byte-fidelity and bounded-restyle regressions stay green. Visual check on a long real document at several zoom levels.
 
 ---
 
@@ -30,33 +32,33 @@ Attribute-level unit tests: base/heading/quote attributes report the intended fo
 
 ### Current state (measured)
 
-Checked-in `footprint` receipts: 84–168 MiB across gate workloads — but the gates run at 5,000 scrollback lines while the shipping default is 20,000, so production is understated on the single largest consumer. Top consumers from the audit: SwiftTerm cell buffers (24 B/cell × scrollback × columns, × up to 6 parked + 8 mounted surfaces), retained `TerminalDocument` strings (16 MiB cap each, bytes past ~4 MiB unreachable by the renderer per the code's own comments), per-window WebKit processes (fresh configuration per webview, no shared pool), the broker's per-terminal 1 MiB hot cache that never releases (nothing ever calls `detachRenderer`), and a markdown image cache that charges decoded bitmaps at file-on-disk cost (10–20x undercount) while the layout manager holds every image strongly.
+Checked-in `footprint` receipts: 84–168 MiB across gate workloads — but gates run at 5,000 scrollback lines while the shipping default is 20,000. Top consumers: SwiftTerm cell buffers (24 B/cell × scrollback × columns × parked + mounted surfaces), retained `TerminalDocument` strings (16 MiB cap each; bytes past ~4 MiB unreachable by the renderer per the code's own comments), per-window WebKit processes (fresh configuration per webview), the broker's per-terminal 1 MiB hot cache that never releases, and a markdown image cache charging decoded bitmaps at file-size cost while the layout manager holds every image strongly.
 
 ### The history guarantee (Michael's ask)
 
-Terminal lines must be recoverable to the very start of a session — especially claude/codex sessions. This is already the disk-side design: user terminals get append-only spools (`retentionCap == null` skips the two-segment rotation entirely), `terminal.history` pages back to the first byte, and round 1's durable appends made it reboot-proof. This round pins it:
+Terminal lines must be recoverable to the very start of a session — especially claude/codex sessions — across reboots. Append-only spools and history paging already exist, but review confirmed a real gap: **after a resurrection, `readStartBytes` hides all pre-restart bytes from `terminal.history`, and the app discards the `recovered` payload — pre-reboot scrollback is currently unreachable.** The fix makes the spool the single continuous transcript:
 
-- Tests assert an interactive terminal's spool never rotates or truncates and history pages reach offset zero after gigabytes of output.
-- The live-view scrollback buffer becomes a *window* (default 5,000 lines), and scrolling past its top hands off to the transcript viewer (the `onHistoryBoundary` path that already exists) which pages the full spool. The handoff must feel like continuous scrolling, not a mode switch: same font, position continuity.
-- `release()` (explicit close) still deletes the spool — closed means closed (section 4). Everything else keeps its spool forever.
+- **2h-1. Cross-epoch continuous offsets.** A restore-spawn initializes the new stream's offset at the retained spool's byte count instead of zero, so transcript offsets are monotonic across restarts. `readStartBytes` skipping and the `recovered` response payload are retired (the field stays on the wire as `null` for compatibility, then is removed once the Swift side stops decoding it). `terminal.history` pages the whole spool — pre-restart bytes included — back to offset zero.
+- **2h-2. Retention pinned by tests.** An interactive terminal's spool never rotates or truncates (`retentionCap == null` path), and history pages reach offset zero after a restart with pre-restart content intact.
+- **2h-3. The view is a window.** Live-view scrollback defaults to 5,000 lines. Scrolling past its top opens the transcript viewer *pre-positioned at the boundary* with matching monospace styling — a deliberate, one-gesture handoff with position continuity, not a promise of seamless inline scrolling (an inline hybrid scroller is explicitly deferred). `release()` (explicit close) still deletes the spool — closed means closed (section 4).
 
 ### Changes (in descending yield)
 
-- **2a.** `TerminalSurfaceCache.store` trims a parked view's scrollback to a small depth and `claim` restores the setting; parked views are by definition not being scrolled. Cap parked surfaces at 3 (from 6).
-- **2b.** `terminalScrollbackLines` default 20,000 → 5,000 (range unchanged; users who customized keep their value). Paired with the history handoff above so nothing is lost.
-- **2c.** `TerminalDocument.maximumRetainedBytes` 16 MiB → 5 MiB, trim target 4 MiB; clamp protected surfaces to the cap so the 96 MiB budget is real.
-- **2d.** Broker: spool RAM cache visibility follows attached renderers/observers — the Swift side sends `detachRenderer` when a surface unmounts, or the broker derives visibility from subscription count. Frees ~1–1.5 MiB × every terminal ever attached.
-- **2e.** One shared `WKProcessPool`/configuration for the CodeMirror editor, HTML preview, and browser card, so all webviews share one WebContent process.
-- **2f.** Markdown image cache: cost = decoded pixel bytes (`pixelsWide × pixelsHigh × 4`), and images downsample to display size on load. Layout manager keeps only placements for a bounded window around the viewport if the strong-hold proves hot after the cost fix.
-- **2g.** A process-wide memory-pressure source (`DispatchSource.makeMemoryPressureSource`) that on warning/critical purges: parked surfaces, the image cache, backdrop bakes, the project file index, and payload caches.
-- **2h.** Small bounds: `ProjectFileIndex` evicts closed-project roots; `PayloadCache` capped; `BrokerLineFrameDecoder` releases high-water capacity above 64 KiB after large frames.
-- **2i.** Resource gates re-run at shipping scrollback; receipts updated; a new gate workload covers "three saturated terminals" so the dominant consumer is measured.
+- **2a.** `TerminalSurfaceCache.store` trims a parked view's scrollback **only when the view is pinned to the live bottom**; a parked view scrolled into history keeps its buffer (and its scroll position). Parked cap drops 6 → 3.
+- **2b.** `terminalScrollbackLines` default 20,000 → 5,000 (range unchanged; customized values respected), paired with 2h-3.
+- **2c.** `TerminalDocument.maximumRetainedBytes` 16 MiB → 5 MiB, trim target 4 MiB; protected surfaces clamp to the cap so the 96 MiB budget is real. (A process-wide budget across windows is deferred; the acceptance workload is per-window.)
+- **2d.** Broker derives spool hot-cache visibility from its observer count — cache fills only while at least one subscriber is attached, drops on last unsubscribe. No new RPC; one window can't clear another's state because the rule is count-based.
+- **2e.** All webviews share one `WKProcessPool` only — each surface keeps its own hardened configuration and its own non-persistent data store (the CodeMirror scheme handler and script bridges must not leak to preview/browser surfaces). Acceptance is measured: WebContent process count and RSS before/after.
+- **2f.** Markdown images: cache cost = decoded pixel bytes; images downsample to display size on load with **size-bucketed cache keys** (a 1x narrow decode never serves a 2x wide view); the layout manager bounds strong placements to a window around the viewport (not deferred — the strong retention is source-confirmed).
+- **2g.** A process-wide memory-pressure source purges parked surfaces, the image cache, backdrop bakes, the project file index, and payload caches on warning/critical.
+- **2i.** Small bounds: `ProjectFileIndex` evicts closed-project roots; `PayloadCache` capped; `BrokerLineFrameDecoder` releases high-water capacity above 64 KiB.
+- **2j.** Resource gates re-run at shipping scrollback; a new gate workload covers three saturated terminals. Target: the three-window restored workload stays under 150 MiB app+broker at shipping settings, measured per the gate harness, with no streaming-latency regression.
 
-Deferred (structural, noted for a later round): per-process rather than per-window terminal byte budget; ACP attachments as file references instead of in-memory `Data`.
+Deferred (structural): process-wide terminal byte budget; ACP attachments as file references.
 
 ### Testing
 
-Unit tests per cap/eviction; broker test for visibility-driven cache release; gate receipts as the acceptance measure (target: three-window restored workload under 150 MiB app + broker at shipping settings, and no regression in streaming latency).
+Unit tests per cap/eviction; broker tests for observer-count-driven cache release and cross-epoch history continuity (spawn → output → simulated restart → restore → history reaches pre-restart bytes and offset zero); gate receipts as the acceptance measure.
 
 ---
 
@@ -64,23 +66,23 @@ Unit tests per cap/eviction; broker test for visibility-driven cache release; ga
 
 ### Current state
 
-`SettingsView.swift` (1,193 lines) hand-rolls a sidebar with 11 flat sections; the General pane is a 212-line builder; one pane still uses `Form`; backgrounds are applied inconsistently; the window's `minSize` (760×500) is smaller than the view's `minWidth` (820) so first layout fights; the in-app sheet path drops `updateDetail` and `interruptibleTurnCount`. The update row never shows the installed version, gives zero feedback while checking (`lastUpdateCheckDate` exists and is never read), models only pending/not-pending (no checking/failed/up-to-date), and never clears a stale pending state. Usage stats fetch only on window appear, project switch, pane open, or manual refresh — a 180 s TTL in-memory cache with disk snapshots, one Node subprocess per account per cold fetch, and a blocking 50 ms `Thread.sleep` poll loop per fetch.
+`SettingsView.swift` (1,193 lines) hand-rolls a sidebar with 11 flat sections; the General pane is a 212-line builder; the Agents *and* Guardrails panes use `Form` against the `SettingsCard` idiom; backgrounds are inconsistent; the window's `minSize` (760×500) is below the view's `minWidth` (820); the in-app sheet drops `updateDetail` and `interruptibleTurnCount`. The update row never shows the installed version, gives no feedback while checking, models only pending/not-pending, and never clears stale pending state. Usage stats fetch only on window appear, project switch, pane open, or manual refresh; each cold fetch spawns one Node subprocess per account and busy-waits in a 50 ms `Thread.sleep` loop.
 
 ### Changes
 
-**3a. Grouped navigation.** Sidebar sections group under quiet headers: **App** (General, Software Updates), **Workspace** (Terminal, Guardrails, Shortcuts), **Agents** (Agents, Models, Accounts, MCP, Usage), **Device** (Companion). Selection model becomes the enum (no `String` round-trip). The window `contentRect`/`minSize` match the view's minimum; every pane gets the same `.scrollContentBackground(.hidden)` treatment; the Agents pane converts from `Form` to the `SettingsCard`/`SettingsRow` idiom.
+**3a. Grouped navigation.** Sidebar groups under quiet headers: **App** (General, Software Updates), **Workspace** (Terminal, Guardrails, Shortcuts), **Agents** (Agents, Models, Accounts, MCP, Usage), **Device** (Companion). The section enum becomes internal so selection stops round-tripping through strings. Window `contentRect`/`minSize` match the view minimum; uniform `.scrollContentBackground(.hidden)`; Agents and Guardrails panes convert to the card idiom.
 
-**3b. File split.** `SettingsView.swift` shrinks to the shell (navigation + routing): General, Updates, Terminal panes and the guardrails/glob types move to their own files, following the existing `*SettingsTab.swift` pattern.
+**3b. File split.** `SettingsView.swift` shrinks to shell (navigation + routing); General, Updates, Terminal, Guardrails panes and the glob types move to their own files per the `*SettingsTab.swift` pattern.
 
-**3c. One settings surface.** The in-app sheet passes the full argument set (updateDetail, interruptibleTurnCount) so both entry points are equally capable; `Check Now` respects `availability.canCheck` in both.
+**3c. One settings surface.** The sheet passes the full argument set; `Check Now` respects `availability.canCheck` in both entry points.
 
-**3d. Honest update row.** An `UpdateCenter`-owned state machine: `idle(lastChecked:) → checking → upToDate | ready(version:) | failed(reason:)`. The row shows the installed version always ("Kaisola 0.1.108 — last checked 12 min ago"), a spinner during checks, the failure reason inline on failure, and "Restart and Update" only while Sparkle actually holds a pending install (pending state clears when Sparkle's session ends). `sparkleIsPresentingUpdate` finally gates Kaisola's own affordance so the two UIs never fight.
+**3d. Honest update row — two independent axes.** `UpdateCenter` publishes `checkStatus: idle(lastChecked:) | checking | upToDate(at:) | failed(reason:)` *separately from* `pendingUpdate` (which keeps holding Sparkle's live install closure — clearing check state must never discard a handed-over install block). Every Sparkle delegate callback maps to an explicit transition; late results are generation-fenced so an abandoned check can't overwrite a newer one. The row always shows the installed version and last-checked time, a spinner during checks, inline failure reasons, and "Restart and Update" only while Sparkle actually holds an install. `sparkleIsPresentingUpdate` gates Kaisola's affordance so the two UIs never fight.
 
-**3e. Live usage.** `UsageCenter` owns a background refresh loop: every 5 minutes while the app is active (non-forced, so the 180 s TTL keeps coalescing), suspended while inactive/hidden, re-armed on `didBecomeActive` and `didWake` (matching the remembered-sessions loop pattern at `KaisolaMacAppDelegate.swift:2221`). The per-fetch busy-wait converts to a `terminationHandler` continuation. The footer chip, onboarding readiness, and headroom advice all consume the same published state and get fresher for free. Snapshot writes debounce.
+**3e. Live usage.** `UsageCenter` owns a background refresh loop: every 5 minutes while the app is active, refreshing **the frontmost window's workspace only** (the existing active-model resolver), non-forced so the 180 s TTL coalesces; suspended while inactive; re-armed on `didBecomeActive`/`didWake`. The busy-wait becomes a cancellation-aware `terminationHandler` continuation that drains stdout/stderr (no pipe deadlock). Footer chip, onboarding, and headroom advice get fresher for free. Snapshot writes debounce.
 
 ### Testing
 
-Section-grouping and routing unit tests; update state machine tests (every transition, including Sparkle-session-ended clearing pending); usage loop tests via injected clock (ticks only while active, coalesces under TTL, force paths unchanged); a test that the sheet and window construct settings with identical capability.
+Grouping/routing tests; update-axes tests (every Sparkle transition, including session-ended with a pending install — closure must survive; generation fencing); usage loop with injected clock (active-only ticks, TTL coalescing, cancellation mid-fetch); sheet/window capability parity test.
 
 ---
 
@@ -88,26 +90,25 @@ Section-grouping and routing unit tests; update state machine tests (every trans
 
 ### Current state (bug map, ranked)
 
-v0.1.107's resurrection turned a pre-existing leak into visible self-reinstating state. The full map: (1) ended/exited terminals are never pruned from `native-sessions.json` (End Session is hidden for exited terminals; `sessionStore.remove` has two callers), so after any broker restart they respawn; (2) respawn calls `sessionStore.openProject`, which re-opens a closed project's tab AND deletes its ⌘⇧T undo entry; (3) `closeProject` leaves records/panes everywhere and the project tab re-derives from live sessions, test-enforced; (4) workspace restore iterates every archived project with no open-project gate; (5) `endSession` silently no-ops when the broker is down; (6) a failed release abandons the close; (7) dormant panes have no reachable close affordance; (8) broker reconnect can re-adopt a record the user's close removed (signature: title == project name); (9) chat deletion persists only via a 220 ms debounce; (10) a mesh marked `pendingDeletion` flips back to `.suspended` on restore; (13) dormant ids leak across projects in normalization; (quit) `endSession` is unawaited by `teardown`, so close-then-⌘Q re-saves the pane.
+v0.1.107's resurrection turned a pre-existing leak into self-reinstating state: (1) ended/exited terminals are never pruned from `native-sessions.json`, so after a broker restart they respawn; (2) respawn re-opens closed project tabs and deletes ⌘⇧T undo entries; (3) `closeProject` leaves records/panes everywhere and the tab re-derives from live sessions; (4) workspace restore has no open-project gate; (5) `endSession` silently no-ops while disconnected; (6) failed release abandons the close; (7) dormant panes have no close affordance; (8) reconnect re-adopts closed records; (9) chat deletion persists via a 220 ms debounce; (10) mesh `pendingDeletion` flips back to `.suspended` on restore; (13) dormant ids leak across projects; (quit) `endSession` is unawaited at teardown.
 
 ### Principle
 
-Closing is user intent. The record dies first, synchronously, unconditionally; broker cleanup is best-effort. Nothing the user closed may ever be resurrected by restore, reconnect, or respawn.
+Closing is user intent. The close commits **locally and durably first** — one synchronous store transaction before any await — and broker cleanup is best-effort behind it. Nothing the user closed may be resurrected by restore, reconnect, respawn, or another window.
 
 ### Changes
 
-- **4a. Close always lands.** `endSession` removes the store record and the pane immediately — before and regardless of the broker release. When connected, release proceeds; on failure it retries once on the next connect (a small persisted pending-release list) instead of resurrecting the record. The disconnected/dormant/exited cases all route through the same removal. "End Session" becomes available for exited and dormant/unavailable panes (routing to the appropriate cleanup), and the "Session unavailable" tile gets a Close button.
-- **4b. Ended is remembered.** `NativeOwnedSession` gains `endedAt: Int64?`. The broker exit event stamps it. Resurrection skips any record with `endedAt != nil`; `reopenEndedSession` removes the old record when it creates the replacement.
-- **4c. Resurrection is polite.** `createOwnedSession(restore: true)` never calls `sessionStore.openProject` and never touches the closed-projects stack; `resurrectDormantTerminals` processes only records whose project is currently open; dormant sets filter by project in normalization (fixes 13).
-- **4d. Tombstones beat re-adoption.** `recoverOwnedSessions` skips any broker record whose id appears in the closed-sessions stack (the stack entry already exists — it becomes the tombstone). Stack cap rises from 10 to 50 so tombstones survive long enough to matter.
-- **4e. Closed projects disappear.** The `projects` derivation excludes projects present in the closed stack (a closed project with live sessions/chats/Recently Closed no longer forces its tab back); `restoreWorkspaceStateIfNeeded` skips restoring chats/meshes/layouts for closed projects (their state stays on disk for ⌘⇧T reopen, which restores everything). The `AppModelProjectContextTests` assertion that a Recently-Closed project must stay visible is deliberately inverted — reopen is the recovery path now.
-- **4f. Deletion is durable.** `deleteChat` persists the removal immediately (same ordering as `deleteRecentlyClosedSurface`: durable store first, then memory). A mesh restored with `lifecycle == .pendingDeletion` stays `pendingDeletion` (no flip to `.suspended`) and completes its tombstone instead of coming back to life.
-- **4g. Quit joins closes.** In-flight `endSession`/`endDormantSession` tasks register in a drain set that `teardown` awaits before its first `persistWorkspaceStateNow`, closing the close-then-⌘Q window.
+- **4a. Close is one durable transaction.** `NativeSessionStore` gains a throwing lifecycle mutation that, in a single payload write: removes the session record, adds a **tombstone** (`closedTerminals: [id: closedAt]`, capped at 500 by age — a separate durable structure, NOT the bounded undo stack), pushes the undo entry, and queues a **pending release** (`projectID`+`id`). Write failure surfaces to the caller (toast) instead of reporting success. `endSession` runs this transaction and removes the pane synchronously *before* any await; the broker release drains from the pending-release queue (retried on every connect until acknowledged, idempotent). The disconnected, dormant, and exited cases all route through the same transaction; "End Session" appears for exited and dormant panes, and the "Session unavailable" tile gets a Close button.
+- **4b. Ended is remembered, with durable evidence.** `NativeOwnedSession` gains `endedAt: Int64?`, stamped from exit events AND from inventory reconciliation (exited rows are already in every inventory refresh, so evidence survives missed events). The broker additionally persists `exitedAt` into the spool's meta file; a restore-spawn consults it and reports the terminal as ended rather than respawning a shell. Resurrection skips any record with `endedAt`; `reopenEndedSession` removes the old record when creating its replacement.
+- **4c. Resurrection is polite and tombstone-aware.** `createOwnedSession(restore: true)` never calls `sessionStore.openProject` and never touches the closed-projects stack; `resurrectDormantTerminals` processes only records whose project is open, and **re-checks the tombstone set and record existence after every await** (each spawn is a suspension point during which another actor may close the id); `syncTrackedWorkingDirectories` and `recoverOwnedSessions` refuse tombstoned ids; store upserts refuse tombstoned ids at the store layer, so no caller can resurrect one by accident. Dormant sets filter by project (fixes 13). A full multi-window lifecycle coordinator is deferred; these conditional store-layer guards are the enforced invariant in the meantime.
+- **4d. Closed projects disappear, with eyes open.** The `projects` derivation excludes closed projects; workspace restore skips closed projects' chats/meshes/layouts (state stays on disk; ⌘⇧T reopen restores everything). Closing a project that still has running work shows a confirmation naming what keeps running in the background; the attention inbox continues to surface those sessions' events so running work is never invisible. `closedProjects` cap rises to 50 and entries survive until reopened. The `AppModelProjectContextTests` assertion that Recently-Closed work forces a project visible is deliberately inverted.
+- **4e. Deletion is durable and phase-tested.** `deleteChat` writes its tombstone/durable removal first, then memory, then garbage-collects transcript, draft, and usage idempotently; `AcpTranscriptStore.remove` failures surface. Tests inject failures between each phase. A mesh restored with `lifecycle == .pendingDeletion` branches *before* ordinary restore: no adapters start, the destroy manifest resumes, and failure leaves a retryable recovery card — never a live mesh.
+- **4f. Quit needs no joins.** Because 4a commits close transactions synchronously before any await, `persistWorkspaceStateNow` at teardown always sees the truth; teardown does NOT await broker releases (they retry from the pending queue next launch), preserving the bounded 12 s shutdown budget.
 
 ### Testing
 
-One test per numbered path in the bug map, each written to fail against HEAD first: end-while-disconnected removes the record; exited terminals never resurrect; resurrection doesn't reopen closed projects or eat undo entries; tombstoned ids aren't re-adopted; closed projects stay out of the rail and out of restore; chat delete survives a simulated crash after the call returns; pendingDeletion survives restore; quit-after-close persists the pane's absence. Plus one end-to-end: close a session and a project, kill the broker, relaunch — nothing returns.
+One failing-first test per numbered path, plus: close-while-disconnected commits and survives relaunch; tombstoned id refused by upsert/re-adoption/cwd-sync; resurrection re-check after suspension (simulated interleaved close); pending release retries then acknowledges; exited-at evidence via inventory with events suppressed; restore-spawn honors spool-meta `exitedAt`; chat-deletion phase injection; mesh destroy-resume; quit-after-close persists absence within the shutdown budget. End-to-end: close a session and a project, kill the broker, relaunch — nothing returns.
 
 ### Ship order
 
-Section 4 ships first (bug-fix release), then 2, then 3 and 1 in either order.
+Section 4 first (its internal order: store schema + transactions + guards → route all paths through them → tests → UI derivation/restore filtering), then 2 (history continuity before the scrollback default drops), then 3 and 1 in either order.

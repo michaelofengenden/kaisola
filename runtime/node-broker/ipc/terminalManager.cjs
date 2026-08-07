@@ -331,6 +331,11 @@ function refreshTerminalCwdsAsync(records) {
  * and ACP terminal/output. Resolves exit via waitForExit().
  */
 function spawn({ id, command, args, cwd, env, outputByteLimit, cols, rows, sender, restore = false }) {
+  // Continuous cross-restart offsets assume an append-only spool; bounded
+  // two-segment rotation would shrink disk bytes underneath a cursor that
+  // never decreases. No caller combines these today — refuse loudly so a
+  // future one cannot silently corrupt history offsets.
+  if (restore && Number.isFinite(outputByteLimit)) return null
   cancelRelease(id)
   const restoring = restore === true
   const prior = terms.get(id)
@@ -790,7 +795,7 @@ function kill(id) {
   const r = terms.get(id)
   if (r) {
     try {
-      r.pty.kill()
+      if (r.pty) r.pty.kill()
     } catch {
       /* noop */
     }
@@ -897,7 +902,7 @@ function killAll() {
     if (r.flushTimer) clearTimeout(r.flushTimer)
     if (r.agentQuietTimer) clearTimeout(r.agentQuietTimer)
     try {
-      r.pty.kill()
+      if (r.pty) r.pty.kill()
     } catch {
       /* noop */
     }

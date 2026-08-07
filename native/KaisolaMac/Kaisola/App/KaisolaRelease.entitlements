@@ -2,13 +2,15 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-	<!-- Applied only in the Developer ID release lane (CI passes
-	     CODE_SIGN_ENTITLEMENTS explicitly; local debug builds stay
-	     entitlement-free and use the auth store's legacy-keychain fallback).
-	     The application identifier + keychain access group are what let the
-	     data-protection keychain grant access by signed identity — the fix
-	     for the per-update "Kaisola wants to access the firebase key"
-	     prompts (2026-08-07). -->
+	<!-- NOT YET WIRED (2026-08-07): keychain-access-groups is a restricted
+	     entitlement — Developer ID signing requires a Developer ID
+	     provisioning profile (created in the Apple Developer portal, added
+	     to CI, and referenced alongside CODE_SIGN_ENTITLEMENTS for the
+	     Kaisola target only, NOT as a global xcodebuild override, which
+	     leaks into SwiftPM targets). Until then the auth store's
+	     errSecMissingEntitlement fallback keeps sign-in working on the
+	     legacy keychain. Wiring this file up is what finally kills the
+	     per-update "Kaisola wants to access the firebase key" prompt. -->
 	<key>com.apple.application-identifier</key>
 	<string>$(AppIdentifierPrefix)com.kaisola.mac</string>
 	<key>keychain-access-groups</key>

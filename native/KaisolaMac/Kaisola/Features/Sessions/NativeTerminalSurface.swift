@@ -1900,7 +1900,27 @@ class ReadOnlyTerminalView: TerminalView {
         bounds.width > 1 && bounds.height > 1
     }
 
-    override func send(source: Terminal, data: ArraySlice<UInt8>) {}
+    /// Typed bytes reaching a read-only surface used to vanish without a
+    /// word — during the 2026-08-07 phantom-owner incident that silence WAS
+    /// the user-visible bug ("can't type"). The bytes still go nowhere (this
+    /// surface has no input authority by construction), but the user hears
+    /// why, throttled so held keys don't stack toasts. Input restores
+    /// automatically once the ownership self-heal reattaches;
+    /// OwnedTerminalView overrides this with the real forwarding path.
+    private static var lastReadOnlyNoticeAt: Date?
+
+    override func send(source: Terminal, data: ArraySlice<UInt8>) {
+        let now = Date()
+        if Self.lastReadOnlyNoticeAt.map({ now.timeIntervalSince($0) > 3 }) ?? true {
+            Self.lastReadOnlyNoticeAt = now
+            Task { @MainActor in
+                ToastCenter.shared.show(
+                    "This terminal is read-only right now — input reconnects automatically.",
+                    style: .info
+                )
+            }
+        }
+    }
 
     /// SwiftTerm checks registered OSC handlers before its built-ins, so OSC
     /// 133/633 support does not require patching the dependency parser. Both

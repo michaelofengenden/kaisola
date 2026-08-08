@@ -116,6 +116,9 @@ final class AppModel: ObservableObject {
     /// and account binding are the user's call).
     @Published private(set) var pendingAgentResume: [String: String] = [:]
     private var resurrectionSweepInFlight = false
+    /// Throttles the ownership self-heal (2026-08-07 phantom-owner incident:
+    /// a refused attach used to be permanent until the user reloaded).
+    private var lastAttachRetryAt: Date?
     /// Whether the connected broker accepted a controller connection; older
     /// brokers stay observe-only and hide every mutation affordance.
     @Published private(set) var controlAvailable = false
@@ -5705,6 +5708,7 @@ final class AppModel: ObservableObject {
                 syncTrackedWorkingDirectories()
                 stampEndedFromInventory(visibleTerminals)
             }
+            await retryUnownedAttaches()
             let emptyDrains = await client.detachEmptyDrainingGenerations()
             if !emptyDrains.isEmpty {
                 await controlClient.detachGenerations(emptyDrains)
@@ -6095,6 +6099,43 @@ final class AppModel: ObservableObject {
     /// Chip dismissal without resuming.
     func dismissPendingAgentResume(for terminalID: String) {
         pendingAgentResume.removeValue(forKey: terminalID)
+    }
+
+    /// Ownership self-heal: a session this install owns on record but could
+    /// not attach (a stale owner on a draining broker, another window mid-
+    /// handoff) is retried on the inventory cadence, throttled to every 10s.
+    /// The moment the blocker releases — as in the 2026-08-07 incident —
+    /// input comes back on its own instead of waiting for a manual reload.
+    private func retryUnownedAttaches() async {
+        guard controlAvailable else { return }
+        let unowned = persistedOwnedSessions.filter { stored in
+            !ownedTerminalIDs.contains(stored.id)
+                && !dormantTerminalIDs.contains(stored.id)
+                && stored.endedAt == nil
+                && sessions.contains { $0.id == stored.id && !$0.exited }
+        }
+        guard !unowned.isEmpty else { return }
+        if let last = lastAttachRetryAt, Date().timeIntervalSince(last) < 10 { return }
+        lastAttachRetryAt = Date()
+        var regained = 0
+        for stored in unowned {
+            do {
+                try await controlClient.attach(projectID: stored.projectID, terminalID: stored.id)
+                ownedTerminalIDs.insert(stored.id)
+                scheduleDesiredTerminalResize(stored.id, force: true)
+                regained += 1
+            } catch {
+                continue
+            }
+        }
+        if regained > 0 {
+            ToastCenter.shared.show(
+                regained == 1
+                    ? "Terminal input restored."
+                    : "Input restored for \(regained) terminals.",
+                style: .success
+            )
+        }
     }
 
     /// App-quit path: detach so owned shells keep running on the broker, then

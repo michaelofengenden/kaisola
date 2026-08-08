@@ -5894,6 +5894,7 @@ final class AppModel: ObservableObject {
         refreshPersistedNavigationState(publish: false)
         var owned: Set<String> = []
         var dormant: Set<String> = []
+        var attachRefusals = 0
         for stored in persistedOwnedSessions {
             guard let record = sessions.first(where: { $0.id == stored.id }) else {
                 // This record may belong to the other broker in a dual-broker
@@ -5911,11 +5912,24 @@ final class AppModel: ObservableObject {
                 try await controlClient.attach(projectID: stored.projectID, terminalID: stored.id)
                 owned.insert(stored.id)
             } catch {
-                // Another controller holds it; leave it observed.
+                // Another controller holds it; leave it observed — but never
+                // silently: a read-only terminal looks exactly like "typing
+                // is broken" (2026-08-07 phantom-owner incident, where stale
+                // ownership on a draining broker left every terminal mute
+                // with no explanation).
+                attachRefusals += 1
             }
         }
         ownedTerminalIDs = owned
         dormantTerminalIDs = dormant
+        if attachRefusals > 0 {
+            ToastCenter.shared.show(
+                attachRefusals == 1
+                    ? "1 terminal is read-only — another window or a stale connection holds its input. Reload to retry."
+                    : "\(attachRefusals) terminals are read-only — another window or a stale connection holds their input. Reload to retry.",
+                style: .error
+            )
+        }
         // Layout may have reported its real size while inventory was visible
         // but before ownership finished restoring. Those callbacks are retained
         // above; ownership publication is the level-triggered flush point.

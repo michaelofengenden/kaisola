@@ -700,6 +700,31 @@ final class AppModelReconnectTests: XCTestCase {
         await fixture.model.disconnect()
     }
 
+    func testInputToAnUnownedTerminalExplainsItselfInsteadOfVanishing() async throws {
+        let fixture = try Fixture(failingConnectAttempts: Set(2...20))
+        defer { fixture.cleanUp() }
+        await fixture.model.reload()
+        XCTAssertTrue(fixture.model.connectionState.isConnected)
+
+        // Connection loss clears ownership while the owned surface is still
+        // mounted, so its keystrokes still route here. Those bytes used to
+        // vanish with no explanation — the same silence the 2026-08-07
+        // phantom-owner incident turned into "typing is broken".
+        await fixture.client.failNextInventoryRequests(3)
+        await fixture.model.refreshInventory()
+        await fixture.model.refreshInventory()
+        await fixture.model.refreshInventory()
+        XCTAssertFalse(fixture.model.connectionState.isConnected)
+
+        for toast in ToastCenter.shared.toasts { ToastCenter.shared.dismiss(toast.id) }
+        fixture.model.sendInput("x", to: ReconnectBrokerClient.firstTerminalID)
+        XCTAssertEqual(
+            ToastCenter.shared.toasts.last?.message,
+            "Terminal connection is recovering; input was not sent"
+        )
+        await fixture.model.disconnect()
+    }
+
     func testStaleAttentionJumpLeavesCurrentSurfaceSelected() async throws {
         let fixture = try VisualControlFixture()
         defer { fixture.cleanUp() }

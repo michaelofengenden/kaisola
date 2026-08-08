@@ -5197,8 +5197,15 @@ final class AppModel: ObservableObject {
     /// an agent session, a submitted line (carriage return) opens an agent
     /// turn; the broker's quiet timer settles it back to idle.
     func sendInput(_ data: String, to terminalID: String) {
-        guard isOwned(terminalID),
-              let record = sessions.first(where: { $0.id == terminalID }) else { return }
+        guard let record = sessions.first(where: { $0.id == terminalID }) else { return }
+        // Every caller wires this from an owned surface, so reaching it
+        // unowned means ownership flapped underneath a still-mounted view
+        // (teardown, mid-restore). Say so — silently eating the bytes is
+        // indistinguishable from broken typing (2026-08-07 incident).
+        guard isOwned(terminalID) else {
+            reportTerminalInputFailure(terminalID)
+            return
+        }
         let projectID = record.projectID
         trackTerminalDraftInput(data, terminalID: terminalID)
         let opensAgentTurn = (

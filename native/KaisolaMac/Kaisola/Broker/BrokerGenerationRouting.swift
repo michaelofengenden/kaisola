@@ -99,7 +99,10 @@ actor BrokerGenerationRouteTable {
 
 /// One read-only socket per registered generation. Inventories are merged only
 /// after every generation independently proves its sealed identity; duplicate
-/// terminal IDs fail closed instead of making routing order-dependent.
+/// terminal IDs fail closed instead of making routing order-dependent. The one
+/// exception: a drain this router already detached from as provably empty is
+/// skipped, not re-proven, until a reconnect rebuilds every lane (see
+/// `detachedGenerationIDs`).
 actor BrokerGenerationObserverRouter: ObserveOnlyBrokerServing {
     typealias ClientFactory = @Sendable () -> any ObserveOnlyBrokerServing
 
@@ -112,6 +115,13 @@ actor BrokerGenerationObserverRouter: ObserveOnlyBrokerServing {
     private var reportedDisconnect = false
     private var emptyDrainingGenerationIDs: Set<String> = []
     private var preservedDrainingGenerationIDs: Set<String> = []
+    /// Empty drains this router has already detached from. Retirement is a
+    /// separate registry-owner transaction, so the topology keeps naming such
+    /// a generation for as long as that takes — inventory must treat it as
+    /// what it provably was at detach time (no terminals) rather than as a
+    /// missing connection. Cleared whenever a topology (re)connect rebuilds
+    /// every lane.
+    private var detachedGenerationIDs: Set<String> = []
 
     init(
         routes: BrokerGenerationRouteTable,
@@ -171,6 +181,10 @@ actor BrokerGenerationObserverRouter: ObserveOnlyBrokerServing {
         var owners: [String: String] = [:]
         var emptyDrains: Set<String> = []
         for generation in topology.all {
+            // Already detached as an empty drain: it has no terminals to
+            // report and no client on purpose. Skipping keeps the poll loop
+            // healthy while the registry owner gets around to retirement.
+            if detachedGenerationIDs.contains(generation.id) { continue }
             guard let client = clients[generation.id] else {
                 throw BrokerClientError.notConnected
             }
@@ -194,6 +208,7 @@ actor BrokerGenerationObserverRouter: ObserveOnlyBrokerServing {
         let generationIDs = emptyDrainingGenerationIDs
             .subtracting(preservedDrainingGenerationIDs)
         emptyDrainingGenerationIDs = []
+        detachedGenerationIDs.formUnion(generationIDs)
         for generationID in generationIDs {
             guard let client = clients.removeValue(forKey: generationID) else { continue }
             await client.setDisconnectHandler(nil)
@@ -261,6 +276,7 @@ actor BrokerGenerationObserverRouter: ObserveOnlyBrokerServing {
         reportedDisconnect = false
         emptyDrainingGenerationIDs = []
         preservedDrainingGenerationIDs = []
+        detachedGenerationIDs = []
         for client in active {
             await client.setDisconnectHandler(nil)
             await client.setEventHandler(nil)

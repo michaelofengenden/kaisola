@@ -481,38 +481,46 @@ actor BrokerStartupCoordinator:
         let store = BrokerGenerationRegistryStore(profileRoot: locator.preferredUserDataRoot)
         guard let registry = try? store.load(), registry.topology == topology else { return }
         let retainedRollbackID = registry.selection?.selectingAppContentDigest
-        guard let draining = topology.draining.first(where: {
-            $0.id != retainedRollbackID
-        }) else { return }
-        let decision: BrokerRetirementDecision
-        do {
-            decision = try await rolling.requestRetirement(
-                of: draining.info,
-                targetContentDigest: topology.current.id
-            )
-        } catch {
-            return
-        }
-        guard decision == .accepted else { return }
-        do {
-            try await waitForRetirement(of: draining, profileRoot: locator.preferredUserDataRoot)
-            let registry = try store.load()
-            guard registry.topology == topology,
-                  registry.currentGenerationID == topology.current.id else {
-                throw BrokerGenerationRegistryError.revisionChanged
+        // Every non-rollback drain is a candidate, not only the first: the
+        // broker itself is the emptiness authority (a populated or still-
+        // connected drain answers `pending`), and a populated drain that
+        // sorts first would otherwise starve the empty generations behind it
+        // of retirement on every heartbeat — the 2026-08-07 stuck-typing
+        // incident kept two empty drains pinned in the registry exactly this
+        // way. At most one retirement is committed per heartbeat.
+        for draining in topology.draining where draining.id != retainedRollbackID {
+            let decision: BrokerRetirementDecision
+            do {
+                decision = try await rolling.requestRetirement(
+                    of: draining.info,
+                    targetContentDigest: topology.current.id
+                )
+            } catch {
+                continue
             }
-            let retained = registry.generations.filter { $0.id != draining.id }
-            let next = try store.save(
-                currentGenerationID: topology.current.id,
-                generations: retained,
-                expectedRevision: registry.revision,
-                selection: registry.selection
-            )
-            currentTopology = next.topology
-            try garbageCollectRetiredMetadata(draining, store: store)
-        } catch {
-            // The registry intentionally retains the generation if retirement
-            // or its identity recheck is ambiguous. A later heartbeat retries.
+            guard decision == .accepted else { continue }
+            do {
+                try await waitForRetirement(of: draining, profileRoot: locator.preferredUserDataRoot)
+                let registry = try store.load()
+                guard registry.topology == topology,
+                      registry.currentGenerationID == topology.current.id else {
+                    throw BrokerGenerationRegistryError.revisionChanged
+                }
+                let retained = registry.generations.filter { $0.id != draining.id }
+                let next = try store.save(
+                    currentGenerationID: topology.current.id,
+                    generations: retained,
+                    expectedRevision: registry.revision,
+                    selection: registry.selection
+                )
+                currentTopology = next.topology
+                try garbageCollectRetiredMetadata(draining, store: store)
+            } catch {
+                // The registry intentionally retains the generation if
+                // retirement or its identity recheck is ambiguous. A later
+                // heartbeat retries.
+            }
+            return
         }
     }
 

@@ -485,6 +485,165 @@ final class BrokerStartupCoordinatorTests: XCTestCase {
         await launcher.close()
     }
 
+    func testBlockedFirstDrainDoesNotStarveAnEmptyLaterDrainOfRetirement() async throws {
+        let home = try privateTemporaryDirectory()
+        let oldDigest = String(repeating: "e", count: 64)
+        // Not "d": that is the fake launcher's staged (current) digest, and a
+        // collision would silently fold this record into the current
+        // generation at save time. "c" still sorts ahead of the empty "e".
+        let blockedDigest = String(repeating: "c", count: 64)
+        let live = try makeRegisteredLiveBroker(home: home, contentDigest: oldDigest)
+        defer { Darwin.close(live.descriptor) }
+        let cutoverRequester = FakeRollingBrokerUpgradeRequester(upgradeDecision: .accepted)
+        let launcher = FakeBrokerHelperLauncher(implementationVersion: 2)
+        let locator = BrokerInfoLocator(userDataCandidates: [live.profile])
+        let cutoverCoordinator = BrokerStartupCoordinator(
+            locator: locator,
+            launcher: launcher,
+            homeDirectory: home,
+            appVersion: "native-test",
+            upgradeRequester: cutoverRequester,
+            rollingUpdatesEnabled: true
+        )
+        _ = try await cutoverCoordinator.prepare()
+
+        let store = BrokerGenerationRegistryStore(profileRoot: live.profile)
+        let cutoverRegistry = try store.load()
+        let cutoverTopology = try XCTUnwrap(cutoverRegistry.topology)
+        let old = try XCTUnwrap(cutoverTopology.draining.first)
+        let childPID = try spawnPausedChild()
+        defer {
+            _ = Darwin.kill(childPID, SIGKILL)
+            var status: Int32 = 0
+            _ = waitpid(childPID, &status, WNOHANG)
+        }
+        let emptyInfo = BrokerInfo(
+            protocolVersion: old.info.protocolVersion,
+            securityEpoch: old.info.securityEpoch,
+            implementationVersion: old.info.implementationVersion,
+            packageSchema: old.info.packageSchema,
+            packageVersion: old.info.packageVersion,
+            contentDigest: old.info.contentDigest,
+            pid: childPID,
+            socketPath: old.info.socketPath,
+            token: old.info.token,
+            startedAt: old.info.startedAt,
+            version: old.info.version
+        )
+        let emptyGeneration = BrokerGenerationRecord(
+            id: old.id,
+            role: .draining,
+            info: emptyInfo,
+            packageRoot: old.packageRoot,
+            registeredAt: old.registeredAt
+        )
+        // Sorts ahead of the empty drain ("d" < "e"): the registry canonical
+        // order is by generation id, so this populated broker is the first
+        // retirement candidate every heartbeat. It must look genuinely live
+        // (bound canonical socket, live pid, metadata, package root) so
+        // prepare() retains it rather than pruning a dead drain.
+        let blockedPackageRoot = live.profile
+            .appendingPathComponent("broker-generations", isDirectory: true)
+            .appendingPathComponent(blockedDigest, isDirectory: true)
+        try FileManager.default.createDirectory(
+            at: blockedPackageRoot,
+            withIntermediateDirectories: true,
+            attributes: [.posixPermissions: 0o700]
+        )
+        let blockedSocket = live.profile
+            .appendingPathComponent("session-broker", isDirectory: true)
+            .appendingPathComponent(
+                BrokerLaunchConfiguration.generationSocketLeaf(
+                    userData: live.profile,
+                    contentDigest: blockedDigest
+                )
+            )
+        let blockedDescriptor = try bindUnixSocket(at: blockedSocket)
+        defer { Darwin.close(blockedDescriptor) }
+        let blockedInfo = BrokerInfo(
+            protocolVersion: old.info.protocolVersion,
+            securityEpoch: old.info.securityEpoch,
+            implementationVersion: old.info.implementationVersion,
+            packageSchema: old.info.packageSchema,
+            packageVersion: old.info.packageVersion,
+            contentDigest: blockedDigest,
+            pid: getpid(),
+            socketPath: blockedSocket.path,
+            token: old.info.token,
+            startedAt: old.info.startedAt,
+            version: old.info.version
+        )
+        let blockedGeneration = BrokerGenerationRecord(
+            id: blockedDigest,
+            role: .draining,
+            info: blockedInfo,
+            packageRoot: blockedPackageRoot.path,
+            registeredAt: old.registeredAt
+        )
+        let emptyMetadataURL = store.metadataURL(for: emptyGeneration)
+        try JSONEncoder().encode(emptyInfo).write(to: emptyMetadataURL)
+        _ = chmod(emptyMetadataURL.path, 0o600)
+        let blockedMetadataURL = store.metadataURL(for: blockedGeneration)
+        try JSONEncoder().encode(blockedInfo).write(to: blockedMetadataURL)
+        _ = chmod(blockedMetadataURL.path, 0o600)
+        let rewritten = try store.save(
+            currentGenerationID: cutoverTopology.current.id,
+            generations: [cutoverTopology.current, blockedGeneration, emptyGeneration],
+            expectedRevision: cutoverRegistry.revision
+        )
+        XCTAssertEqual(
+            rewritten.topology?.draining.map(\.id),
+            [blockedDigest, oldDigest]
+        )
+
+        let emptyMetadataPath = emptyMetadataURL.path
+        let emptySocketPath = emptyInfo.socketPath
+        let retirementRequester = FakeRollingBrokerUpgradeRequester(
+            upgradeDecision: .accepted,
+            retirementDecisionsByDigest: [
+                blockedDigest: .deferred(
+                    BrokerUpgradeBlockers(
+                        liveTerminalCount: 3,
+                        liveTerminalIDs: ["a", "b", "c"],
+                        busyAgentCount: 0,
+                        busyTerminalIDs: [],
+                        childTaskCount: 0
+                    ),
+                    clientCount: 2
+                ),
+                oldDigest: .accepted,
+            ],
+            onRetirement: {
+                _ = Darwin.kill(childPID, SIGKILL)
+                var status: Int32 = 0
+                _ = waitpid(childPID, &status, 0)
+                _ = emptyMetadataPath.withCString(Darwin.unlink)
+                _ = emptySocketPath.withCString(Darwin.unlink)
+            }
+        )
+        let retirementCoordinator = BrokerStartupCoordinator(
+            locator: locator,
+            launcher: launcher,
+            homeDirectory: home,
+            appVersion: "native-test",
+            upgradeRequester: retirementRequester,
+            rollingUpdatesEnabled: true
+        )
+        // No prepare(): the retirement sweep locates topology on its own, and
+        // prepare's full startup reconciliation is not what this test pins.
+        _ = await retirementCoordinator.attemptUpgradeIfNeeded()
+
+        let retired = try store.load()
+        let retirementCalls = await retirementRequester.retirementCallCount()
+        // Both drains were asked; only the empty one retired. The populated
+        // drain (still pending) must survive with its terminals intact.
+        XCTAssertEqual(retirementCalls, 2)
+        XCTAssertEqual(retired.currentGenerationID, cutoverTopology.current.id)
+        XCTAssertEqual(retired.topology?.draining.map(\.id), [blockedDigest])
+        XCTAssertFalse(FileManager.default.fileExists(atPath: emptyMetadataPath))
+        await launcher.close()
+    }
+
     func testRollbackRefusesOlderImplementationEvenWhenItsProcessIsLive() async throws {
         let home = try privateTemporaryDirectory()
         let oldDigest = String(repeating: "e", count: 64)
@@ -729,6 +888,9 @@ private actor FakeBrokerUpgradeRequester: BrokerUpgradeRequesting {
 private actor FakeRollingBrokerUpgradeRequester: BrokerRollingUpdateRequesting {
     private let upgradeDecision: BrokerUpgradeDecision
     private let retirementDecision: BrokerRetirementDecision
+    /// Per-generation overrides so one fake can play a populated drain
+    /// (pending) and an empty one (accepted) in the same heartbeat.
+    private let retirementDecisionsByDigest: [String: BrokerRetirementDecision]
     private let onRetirement: @Sendable () -> Void
     private var upgrades = 0
     private var cancels = 0
@@ -746,10 +908,12 @@ private actor FakeRollingBrokerUpgradeRequester: BrokerRollingUpdateRequesting {
             ),
             clientCount: 1
         ),
+        retirementDecisionsByDigest: [String: BrokerRetirementDecision] = [:],
         onRetirement: @escaping @Sendable () -> Void = {}
     ) {
         self.upgradeDecision = upgradeDecision
         self.retirementDecision = retirementDecision
+        self.retirementDecisionsByDigest = retirementDecisionsByDigest
         self.onRetirement = onRetirement
     }
 
@@ -770,8 +934,10 @@ private actor FakeRollingBrokerUpgradeRequester: BrokerRollingUpdateRequesting {
         targetContentDigest: String
     ) async throws -> BrokerRetirementDecision {
         retirements += 1
-        onRetirement()
-        return retirementDecision
+        let decision = info.contentDigest.flatMap { retirementDecisionsByDigest[$0] }
+            ?? retirementDecision
+        if decision == .accepted { onRetirement() }
+        return decision
     }
 
     func upgradeCallCount() -> Int { upgrades }

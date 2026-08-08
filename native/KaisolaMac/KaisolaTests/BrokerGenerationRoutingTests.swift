@@ -215,6 +215,35 @@ final class BrokerGenerationRoutingTests: XCTestCase {
         XCTAssertEqual(drainingControlDisconnects, 1)
     }
 
+    func testInventoryKeepsWorkingAfterAnEmptyDrainIsDetached() async throws {
+        let topology = makeTopology()
+        let currentObserver = RoutingObserverClient(
+            status: BrokerStatus(terminals: [terminal("current-terminal")])
+        )
+        let drainingObserver = RoutingObserverClient(status: BrokerStatus(terminals: []))
+        let observerQueue = ObserverClientQueue([currentObserver, drainingObserver])
+        let observer = BrokerGenerationObserverRouter(
+            routes: BrokerGenerationRouteTable(),
+            factory: { observerQueue.next() }
+        )
+
+        _ = try await observer.connect(to: topology)
+        _ = try await observer.inventory()
+        let detached = await observer.detachEmptyDrainingGenerations()
+        XCTAssertEqual(detached, Set([topology.draining[0].id]))
+
+        // Retirement is a separate registry-owner transaction, so the topology
+        // can keep naming an empty drain long after both lanes detached from
+        // it. Inventory must keep serving the remaining generations instead of
+        // failing every poll tick: the 2026-08-07 stuck-typing regression was
+        // this exact throw counting up to a full reconnect every ~10 seconds,
+        // forever, while two empty 0.1.110 drains sat in the registry.
+        let after = try await observer.inventory()
+        XCTAssertEqual(after.terminals.map(\.id), ["current-terminal"])
+        let repeated = await observer.detachEmptyDrainingGenerations()
+        XCTAssertEqual(repeated, [])
+    }
+
     func testDiagnosticsNameAppCurrentAndEveryDrainingBrokerVersion() {
         let topology = makeTopology()
         let detail = BrokerGenerationDiagnostics.detail(

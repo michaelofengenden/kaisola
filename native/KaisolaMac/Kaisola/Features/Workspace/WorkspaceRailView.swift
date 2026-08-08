@@ -66,15 +66,6 @@ struct WorkspaceRailView: View {
     var body: some View {
         AnyView(VStack(spacing: 0) {
             HStack(spacing: 6) {
-                Button(action: close) {
-                    Image(systemName: "sidebar.trailing")
-                        .font(.caption.weight(.semibold))
-                        .foregroundStyle(Color.accentColor)
-                        .frame(width: 20, height: 20)
-                }
-                .buttonStyle(.borderless)
-                .help("Hide \(root.lastPathComponent) files (Command-B)")
-                .accessibilityLabel("Hide Files")
                 Image(systemName: "magnifyingglass")
                     .font(.caption)
                     .foregroundStyle(.secondary)
@@ -115,6 +106,16 @@ struct WorkspaceRailView: View {
                     ProgressView().controlSize(.mini)
                         .accessibilityLabel("Updating project files")
                 }
+                Button(action: close) {
+                    Image(systemName: "minus")
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(.secondary)
+                        .frame(width: 20, height: 20)
+                }
+                .buttonStyle(.borderless)
+                .help("Hide \(root.lastPathComponent) files (Command-B)")
+                .accessibilityLabel("Hide Files")
+                .accessibilityIdentifier("files.hide")
             }
             .padding(.horizontal, 8)
             .frame(height: 30)

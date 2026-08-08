@@ -41,10 +41,6 @@ struct RootShellView: View {
     @State private var showOnboarding = false
     @State private var showSettings = false
     @State private var settingsSectionID: String?
-    /// Whether the detail column's two panel toggles are currently drawn. They
-    /// are hover-only chrome (see `detailPanelToggles`), so this is the whole of
-    /// what used to be a permanent 40pt band.
-    @State private var detailTogglesRevealed = false
     /// Opt-in, window-local follow mode. It is deliberately off at launch so a
     /// background tool call can never steal the user's document unexpectedly.
     @State private var followsSelectedAgentFiles = false
@@ -692,10 +688,12 @@ struct RootShellView: View {
     /// top put the revealed pair directly over the controls the user was aiming
     /// at.
     ///
-    /// v1.1.10 resolves that by moving the pair out of this column entirely (see
-    /// `detailPanelToggles`), which lets the card take the whole column down to
-    /// the standard `chromeInset` gutter. The remaining 22pt of the original
-    /// band is now pane.
+    /// v1.1.10 moved the pair out of this column entirely, which let the card
+    /// take the whole column down to the standard `chromeInset` gutter; the
+    /// remaining 22pt of the original band is now pane. The pane chrome now
+    /// lives on the surfaces themselves — each pane hides from its own minus,
+    /// and `detailShowDoors` floats the show buttons over the content surface
+    /// only while something is hidden.
     private var detailArea: some View {
         VStack(spacing: 0) {
             // A degraded workspace archive usually means an empty detail pane,
@@ -710,13 +708,6 @@ struct RootShellView: View {
                         layout: settings.navigationLayout
                     )
                 )
-        }
-        // In the top-bar layout there is no sidebar band to host the pair, so
-        // they stay in this corner and stay hover-revealed — and there the
-        // collision never existed, because the card's top sits under a real top
-        // bar rather than under the window's own edge.
-        .overlay(alignment: .topTrailing) {
-            if settings.navigationLayout == .topBar { detailPanelToggles }
         }
         // The other half of the sidebar divider's corridor. It has to live in
         // this column: a tracking area is clipped to its own split-view
@@ -740,88 +731,73 @@ struct RootShellView: View {
         }
     }
 
-    /// The two panel toggles, for the **top-bar layout only**: revealed on hover
-    /// at the content pane's top-right, exactly as v1.1.9 drew them.
+    /// The show half of the pane chrome: each hidden pane's door floats at the
+    /// content surface's top-right, on a material capsule so it reads over
+    /// terminal text. The panes' own minus buttons are the hide half, so when
+    /// both panes are open this renders nothing and the corner is clean.
     ///
-    /// The sidebar layout does not draw them at all any more — see
-    /// `detailPanelTopInset(layout:)` for the measurements that killed every
-    /// place they could have gone.
+    /// Doors keep the old pair's order (document left of Files, matching how
+    /// the panels themselves sit) and their identifiers/labels, so VoiceOver
+    /// and automation keep their addresses. Every non-pointer door stays open:
+    /// ⌘B / the toggle-document shortcut, the command palette, and one item
+    /// each in the footer's overflow menu.
     ///
-    /// They are a PAIR, in the order the panels themselves sit: the document
-    /// preview opens to the left of the Files rail, so its control is to the
-    /// left of the Files control.
-    ///
-    /// Every non-pointer door stays open in both layouts: ⌘B / ⇧⌘B, the View
-    /// menu, the command palette, and one item each in the footer's overflow
-    /// menu. The controls keep their identifiers and labels, so they remain
-    /// addressable to VoiceOver and to automation whether or not they are drawn.
-    private var detailPanelToggles: some View {
-        HStack(spacing: NativeWorkspaceChrome.detailChromeControlGap) {
-            filePreviewToolbarControl
-            filesToolbarControl
-        }
-        .padding(NativeWorkspaceChrome.detailToggleRevealPadding)
-        .opacity(detailTogglesRevealed ? 1 : 0)
-        .allowsHitTesting(detailTogglesRevealed)
-        .animation(
-            .easeOut(duration: KaisolaVisualSystem.hoverDuration),
-            value: detailTogglesRevealed
+    /// The Show Document door reuses the toggle path, so with nothing to
+    /// restore it opens Files instead of doing nothing — same fallback the
+    /// footer's menu item has always had.
+    @ViewBuilder
+    private var detailShowDoors: some View {
+        let doors = DetailShowDoors.resolve(
+            railVisible: detailRailPanelVisible,
+            previewVisible: detailPreviewPanelVisible,
+            hasProjectDirectory: model.currentProjectDirectory != nil
         )
-        // The hover target reaches well past the two 26pt controls: a pointer
-        // heading for a corner is only approximately aimed, and a target the
-        // size of what it reveals is one you have to already know is there.
-        // Bought as *leading padding on the box the sensor backs*, not as a
-        // width on the sensor itself — a background is proposed its parent's
-        // size, so a wider frame inside one is a claim the layout does not
-        // honour and the target silently stays control-sized.
-        .padding(.leading, NativeWorkspaceChrome.detailToggleRevealLead)
-        // The sensor is an AppKit tracking area whose `hitTest` returns nil, so
-        // it can never take a click — which matters because this strip sits
-        // inside the window's own titlebar drag region, and a hit-testable
-        // SwiftUI shape here would stop the window being dragged by it. A
-        // SwiftUI `.onHover` needs exactly that hit-testable shape to fire.
-        .background {
-            DetailToggleHoverSensor { hovering in detailTogglesRevealed = hovering }
+        if !doors.isEmpty {
+            HStack(spacing: NativeWorkspaceChrome.detailChromeControlGap) {
+                if doors.showDocument {
+                    showDoor(
+                        symbol: "doc.text",
+                        label: "Show Document",
+                        shortcut: keymap.shortcut(for: .toggleDocumentPreview)?.display,
+                        identifier: "detail.toggle-document",
+                        action: { runCommand(.toggleDocumentPreview) }
+                    )
+                }
+                if doors.showFiles {
+                    showDoor(
+                        symbol: "sidebar.trailing",
+                        label: "Show Files",
+                        shortcut: keymap.shortcut(for: .toggleFiles)?.display,
+                        identifier: "detail.toggle-files",
+                        action: { runCommand(.toggleFiles) }
+                    )
+                }
+            }
+            .padding(4)
+            .background(.regularMaterial, in: Capsule())
+            .padding(.top, 8)
+            .padding(.trailing, 10)
         }
-        .padding(.trailing, KaisolaVisualSystem.chromeInset + 4)
     }
 
-    /// The workspace rail toggle lives at the top-right of the content area,
-    /// where a document app puts its sidebar controls. ⌘B and the command
-    /// palette drive the same setting.
-    private var filesToolbarControl: some View {
-        let visible = settings.workspaceRailVisible
-        let shortcut = keymap.shortcut(for: .toggleFiles)?.display
-        let action = visible ? "Hide Files" : "Show Files"
-        return detailChromeToggle(
-            symbol: "sidebar.trailing",
-            isOn: visible,
-            help: shortcut.map { "\(action) (\($0))" } ?? action,
-            label: action,
-            identifier: "detail.toggle-files",
-            action: { runCommand(.toggleFiles) }
-        )
-    }
-
-    /// Its twin for the document-preview column. There is no `showFilePreview`
-    /// flag to bind: the preview column is present exactly when the model has a
-    /// file (or browser card) to show, so `AppModel.toggleFilePreview()` is the
-    /// state — it hides the column, or restores the last file and reports
-    /// whether it found one. When it finds none there is nothing to preview, so
-    /// the control opens Files instead of doing nothing, which is what the
-    /// footer's menu item has always done.
-    private var filePreviewToolbarControl: some View {
-        let visible = model.previewedFileURL != nil || model.browserCardURL != nil
-        let shortcut = keymap.shortcut(for: .toggleDocumentPreview)?.display
-        let action = visible ? "Hide Document" : "Show Document"
-        return detailChromeToggle(
-            symbol: "doc.text",
-            isOn: visible,
-            help: shortcut.map { "\(action) (\($0))" } ?? action,
-            label: action,
-            identifier: "detail.toggle-document",
-            action: { runCommand(.toggleDocumentPreview) }
-        )
+    private func showDoor(
+        symbol: String,
+        label: String,
+        shortcut: String?,
+        identifier: String,
+        action: @escaping () -> Void
+    ) -> some View {
+        Button(action: action) {
+            Image(systemName: symbol)
+                .font(.system(size: NativeWorkspaceChrome.detailChromeGlyphSize, weight: .regular))
+                .foregroundStyle(.secondary)
+                .frame(width: 24, height: 20)
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .help(shortcut.map { "\(label) (\($0))" } ?? label)
+        .accessibilityLabel(label)
+        .accessibilityIdentifier(identifier)
     }
 
     private func toggleFilePreviewColumn() {
@@ -830,39 +806,6 @@ struct RootShellView: View {
             return
         }
         if !model.toggleFilePreview() { settings.workspaceRailVisible = true }
-    }
-
-    /// One shape for both, so "consistent spacing" is structural rather than two
-    /// call sites that happen to agree today.
-    private func detailChromeToggle(
-        symbol: String,
-        isOn: Bool,
-        help: String,
-        label: String,
-        identifier: String,
-        action: @escaping () -> Void
-    ) -> some View {
-        Button(action: action) {
-            Image(systemName: symbol)
-                .font(.system(size: NativeWorkspaceChrome.detailChromeGlyphSize, weight: .regular))
-                .foregroundStyle(isOn ? Color.primary : Color.secondary)
-                .frame(
-                    width: NativeWorkspaceChrome.detailChromeControlWidth,
-                    height: NativeWorkspaceChrome.detailChromeControlHeight
-                )
-                .background(
-                    isOn ? Color.primary.opacity(0.10) : Color.clear,
-                    in: RoundedRectangle(
-                        cornerRadius: KaisolaVisualSystem.controlRadius,
-                        style: .continuous
-                    )
-                )
-                .contentShape(Rectangle())
-        }
-        .buttonStyle(.plain)
-        .help(help)
-        .accessibilityLabel(label)
-        .accessibilityIdentifier(identifier)
     }
 
     // MARK: Left-tree context menus
@@ -1354,6 +1297,7 @@ struct RootShellView: View {
                     .frame(minWidth: NativeDetailPaneSizing.minimumContentWidth,
                            maxWidth: .infinity, maxHeight: .infinity)
                     .layoutPriority(1)
+                    .overlay(alignment: .topTrailing) { detailShowDoors }
                 if let browserURL = model.browserCardURL {
                     filePreviewDivider
                     BrowserCardView(url: browserURL) { model.browserCardURL = nil }
@@ -1551,9 +1495,10 @@ struct RootShellView: View {
             filePreviewVisible: detailPreviewPanelVisible,
             toggleFilePreview: { runCommand(.toggleDocumentPreview) },
             // The Files toggle's permanent, pointer-independent door. Its
-            // visible control is hover-only now (see `detailPanelToggles`), and
-            // a control that only exists under the pointer needs a door that
-            // always does — this one costs the footer no width at all.
+            // visible controls live on the panes themselves now (a minus on
+            // each open pane, `detailShowDoors` while hidden), and a keyboard
+            // or VoiceOver user still needs a door that is always drawn —
+            // this one costs the footer no width at all.
             filesVisible: settings.workspaceRailVisible,
             toggleFiles: { runCommand(.toggleFiles) },
             showSettings: {
@@ -2952,53 +2897,6 @@ struct InitialSidebarWidthApplier: NSViewRepresentable {
                 )
             }
         }
-    }
-}
-
-/// Reports the pointer entering and leaving a region **without ever being able
-/// to take a click from it**.
-///
-/// `hitTest` returns nil unconditionally, so the view is invisible to the event
-/// system while its tracking area still fires — which is the whole point. A
-/// SwiftUI `.onHover` cannot do this: it needs a hit-testable shape, and a
-/// hit-testable overlay sitting over the content pane's top-right corner is an
-/// overlay that can swallow a click meant for the Files rail underneath it.
-/// Same idiom as `NavigationSidebarResizeHandle.TrackingView`, minus everything
-/// that view does with the click it accepts.
-struct DetailToggleHoverSensor: NSViewRepresentable {
-    var hoverChanged: (Bool) -> Void
-
-    func makeNSView(context: Context) -> SensorView {
-        let view = SensorView()
-        view.hoverChanged = hoverChanged
-        return view
-    }
-
-    func updateNSView(_ nsView: SensorView, context: Context) {
-        nsView.hoverChanged = hoverChanged
-    }
-
-    final class SensorView: NSView {
-        var hoverChanged: (Bool) -> Void = { _ in }
-        private var trackingArea: NSTrackingArea?
-
-        override func hitTest(_ point: NSPoint) -> NSView? { nil }
-        override func isAccessibilityElement() -> Bool { false }
-
-        override func updateTrackingAreas() {
-            super.updateTrackingAreas()
-            if let trackingArea { removeTrackingArea(trackingArea) }
-            let area = NSTrackingArea(
-                rect: bounds,
-                options: [.activeInActiveApp, .inVisibleRect, .mouseEnteredAndExited],
-                owner: self
-            )
-            addTrackingArea(area)
-            trackingArea = area
-        }
-
-        override func mouseEntered(with event: NSEvent) { hoverChanged(true) }
-        override func mouseExited(with event: NSEvent) { hoverChanged(false) }
     }
 }
 

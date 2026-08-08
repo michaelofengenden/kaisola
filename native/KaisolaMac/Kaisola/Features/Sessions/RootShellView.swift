@@ -1373,7 +1373,8 @@ struct RootShellView: View {
                         reopenClosedTab: { model.reopenClosedFileTab() },
                         commandScopeID: ObjectIdentifier(model),
                         navigationCommitted: { model.commitFileNavigation($0) },
-                        restoreSelection: { model.cancelFileNavigation(restoring: $0) }
+                        restoreSelection: { model.cancelFileNavigation(restoring: $0) },
+                        hide: { runCommand(.toggleDocumentPreview) }
                     ) {
                         model.closeFilePreview()
                     }

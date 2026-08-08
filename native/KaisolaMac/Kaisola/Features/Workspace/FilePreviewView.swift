@@ -22,6 +22,10 @@ struct FilePreviewView: View {
     let navigationCommitted: (URL) -> Void
     /// Restores AppModel's selection when a pending file switch is cancelled.
     let restoreSelection: (URL) -> Void
+    /// Hides the whole preview column non-destructively (the toggle-document
+    /// path): tabs and the current file stay remembered for reopen. `close`
+    /// remains the destructive per-document door.
+    let hide: () -> Void
     let close: () -> Void
     private let recoveryStore: FilePreviewRecoveryStore
     /// The file tree already watches the project for agent edits. The mounted
@@ -42,6 +46,7 @@ struct FilePreviewView: View {
         commandScopeID: ObjectIdentifier? = nil,
         navigationCommitted: @escaping (URL) -> Void = { _ in },
         restoreSelection: @escaping (URL) -> Void,
+        hide: @escaping () -> Void,
         close: @escaping () -> Void,
         recoveryStore: FilePreviewRecoveryStore = FilePreviewRecoveryStore()
     ) {
@@ -57,6 +62,7 @@ struct FilePreviewView: View {
         self.commandScopeID = commandScopeID
         self.navigationCommitted = navigationCommitted
         self.restoreSelection = restoreSelection
+        self.hide = hide
         self.close = close
         self.recoveryStore = recoveryStore
         _workspaceWatcher = StateObject(
@@ -135,6 +141,7 @@ struct FilePreviewView: View {
     private enum PendingAction: Equatable {
         case navigate(URL)
         case close
+        case hide
     }
 
     private var isDirty: Bool {
@@ -335,6 +342,8 @@ struct FilePreviewView: View {
             beginLoad(next)
         case .close:
             close()
+        case .hide:
+            hide()
         case nil:
             break
         }
@@ -347,6 +356,19 @@ struct FilePreviewView: View {
             showUnsavedPrompt = true
         } else {
             close()
+        }
+    }
+
+    /// Same dirty guard as `requestClose`: hiding unmounts this view, so an
+    /// unsaved draft gets the save/discard/cancel prompt before the column
+    /// disappears rather than relying on recovery alone.
+    private func requestHide() {
+        if isDirty {
+            pendingAction = .hide
+            autosavePendingAction = false
+            showUnsavedPrompt = true
+        } else {
+            hide()
         }
     }
 
@@ -467,15 +489,15 @@ struct FilePreviewView: View {
                 .help("Save")
             }
             previewOptionsMenu
-            if tabs.isEmpty {
-                Button {
-                    requestClose()
-                } label: {
-                    Image(systemName: "xmark")
-                }
-                .buttonStyle(.borderless)
-                .help("Close document")
+            Button {
+                requestHide()
+            } label: {
+                Image(systemName: "minus")
             }
+            .buttonStyle(.borderless)
+            .help("Hide Document")
+            .accessibilityLabel("Hide Document")
+            .accessibilityIdentifier("preview.hide")
         }
         .padding(.horizontal, 11)
         .frame(height: 38)

@@ -8,7 +8,13 @@ const os = require('node:os')
 const path = require('node:path')
 const manager = require('../../runtime/node-broker/ipc/terminalManager.cjs')
 const { TerminalSpool } = require('../../runtime/node-broker/ipc/terminalSpool.cjs')
+const { TERMINAL_GEOMETRY_LIMITS } = require('../../runtime/node-broker/ipc/terminalCreateRoute.cjs')
 const { __test } = manager
+
+const {
+  maxCols: MAX_TERMINAL_COLS,
+  maxRows: MAX_TERMINAL_ROWS,
+} = TERMINAL_GEOMETRY_LIMITS
 
 const managerSpoolDir = fs.mkdtempSync(path.join(os.tmpdir(), 'kaisola-terminal-manager-'))
 manager.configureStorage(managerSpoolDir)
@@ -51,10 +57,121 @@ test('terminal resize rejects invalid or fractional wire geometry', () => {
   }
 
   assert.equal(__test.resizeRecord(record, 0, 24), false)
+  assert.equal(__test.resizeRecord(record, -1, 24), false)
   assert.equal(__test.resizeRecord(record, 80.5, 24), false)
+  assert.equal(__test.resizeRecord(record, '80', 24), false)
+  assert.equal(__test.resizeRecord(record, 80, '24'), false)
+  assert.equal(__test.resizeRecord(record, Number.POSITIVE_INFINITY, 24), false)
   assert.equal(__test.resizeRecord(record, 80, Number.NaN), false)
   assert.equal(record.cols, 80)
   assert.equal(record.rows, 24)
+})
+
+test('terminal resize applies the create validator maxima before node-pty', () => {
+  const calls = []
+  const record = {
+    cols: 80,
+    rows: 24,
+    pty: { resize: (cols, rows) => calls.push([cols, rows]) },
+  }
+
+  assert.equal(__test.resizeRecord(record, MAX_TERMINAL_COLS, MAX_TERMINAL_ROWS), true)
+  assert.equal(__test.resizeRecord(record, Number.MAX_SAFE_INTEGER, Number.MAX_SAFE_INTEGER), true)
+  assert.deepEqual(calls, [
+    [MAX_TERMINAL_COLS, MAX_TERMINAL_ROWS],
+    [MAX_TERMINAL_COLS, MAX_TERMINAL_ROWS],
+  ])
+  assert.equal(record.cols, MAX_TERMINAL_COLS)
+  assert.equal(record.rows, MAX_TERMINAL_ROWS)
+})
+
+function spawnKillTestRecord(t, id) {
+  const record = manager.spawn({
+    id,
+    command: '/bin/cat',
+    args: [],
+    cwd: managerSpoolDir,
+  })
+  assert.ok(record)
+  const pty = record.pty
+  const acceptedKill = pty.kill.bind(pty)
+  t.after(() => {
+    record.exited = false
+    record.pty = pty
+    pty.kill = acceptedKill
+    manager.release(id)
+  })
+  return { record, pty }
+}
+
+test('terminal kill reports node-pty refusal and leaves the registered terminal live', (t) => {
+  const id = 'kill-refusal-stays-live'
+  const { record, pty } = spawnKillTestRecord(t, id)
+
+  pty.kill = () => false
+  assert.deepEqual(manager.kill(id), {
+    id,
+    ok: false,
+    code: 'terminal_kill_failed',
+    message: 'terminal signal failed',
+  })
+  assert.equal(manager.has(id), true)
+  assert.equal(manager.isLive(id), true)
+
+  pty.kill = () => { throw new Error('sensitive node-pty diagnostic') }
+  assert.deepEqual(manager.kill(id), {
+    id,
+    ok: false,
+    code: 'terminal_kill_failed',
+    message: 'terminal signal failed',
+  })
+  assert.equal(manager.has(id), true)
+  assert.equal(manager.isLive(id), true)
+})
+
+test('terminal kill distinguishes a missing record from signaling refusal', () => {
+  const id = 'missing-terminal-kill'
+  assert.deepEqual(manager.kill(id), {
+    id,
+    ok: false,
+    code: 'terminal_not_found',
+    message: 'terminal is no longer available',
+  })
+})
+
+test('terminal kill is idempotent after exit and never signals node-pty', (t) => {
+  const id = 'kill-already-exited'
+  const { record, pty } = spawnKillTestRecord(t, id)
+  let killCalls = 0
+  pty.kill = () => { killCalls += 1 }
+  record.exited = true
+  const alreadyExited = { id, ok: true, alreadyExited: true }
+  assert.deepEqual(manager.kill(id), alreadyExited)
+  assert.deepEqual(manager.kill(id), alreadyExited)
+  assert.equal(killCalls, 0)
+})
+
+test('terminal kill fails closed when a live record has no pty', (t) => {
+  const id = 'kill-live-without-pty'
+  const { record } = spawnKillTestRecord(t, id)
+  record.pty = null
+  assert.deepEqual(manager.kill(id), {
+    id,
+    ok: false,
+    code: 'terminal_kill_unavailable',
+    message: 'terminal signal unavailable',
+  })
+})
+
+test('terminal kill reports accepted signaling without claiming synchronous exit', (t) => {
+  const id = 'kill-signal-accepted'
+  const { record, pty } = spawnKillTestRecord(t, id)
+  let killCalls = 0
+  pty.kill = () => { killCalls += 1 }
+
+  assert.deepEqual(manager.kill(id), { id, ok: true })
+  assert.equal(killCalls, 1)
+  assert.equal(record.exited, false)
 })
 
 test('coldTail reads the bounded retained tail across previous and current segments', (t) => {

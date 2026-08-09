@@ -11,10 +11,13 @@ function queueLimit(value) {
 }
 
 class TerminalObservers {
-  constructor({ terminalId, deliver }) {
+  constructor({ terminalId, deliver, onDrop }) {
     this.terminalId = String(terminalId)
     if (!this.terminalId || typeof deliver !== 'function') throw new Error('terminal observer dependencies are invalid')
     this.deliver = deliver
+    // Called with (owner, reason) whenever broadcast retires a subscription on
+    // its own, so the owner can resync anything derived from the subscriber set.
+    this.onDrop = typeof onDrop === 'function' ? onDrop : null
     this.subscribers = new Map()
   }
 
@@ -47,6 +50,7 @@ class TerminalObservers {
   broadcast(channel, payload, cursor = {}) {
     let delivered = 0
     let paused = 0
+    let dropped = 0
     for (const [owner, subscriber] of this.subscribers) {
       if (subscriber.paused) continue
       const ok = this.deliver(owner, channel, payload, { maxQueueBytes: subscriber.maxQueueBytes }) !== false
@@ -54,18 +58,29 @@ class TerminalObservers {
         delivered++
         continue
       }
-      subscriber.paused = true
-      paused++
       // One forced, small reset marker is the only permitted overflow. Future
       // deltas are discarded until an explicit resubscribe obtains a snapshot.
-      this.deliver(owner, 'terminal:observer-snapshot-required', {
+      const marked = this.deliver(owner, 'terminal:observer-snapshot-required', {
         id: this.terminalId,
         reason: 'slow_consumer',
         ...(cursor.streamEpoch ? { streamEpoch: cursor.streamEpoch } : {}),
         ...(Number.isSafeInteger(cursor.endOffset) ? { endOffset: cursor.endOffset } : {}),
-      }, { force: true, maxQueueBytes: subscriber.maxQueueBytes })
+      }, { force: true, maxQueueBytes: subscriber.maxQueueBytes }) !== false
+      if (marked) {
+        subscriber.paused = true
+        paused++
+        continue
+      }
+      // Pausing a subscriber whose marker never landed would silence it
+      // forever: the marker is the only signal that a resubscribe is owed, and
+      // a paused subscription is never spoken to again. Retire it instead, so
+      // the transport-level reconnect — which always begins with a snapshot —
+      // is the only way this owner sees this terminal again.
+      this.subscribers.delete(owner)
+      dropped++
+      this.onDrop?.(owner, 'undeliverable_snapshot_marker')
     }
-    return { delivered, paused }
+    return { delivered, paused, dropped }
   }
 
   stats() {

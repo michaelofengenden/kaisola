@@ -12,7 +12,7 @@ const net = require('node:net')
 const path = require('node:path')
 const { StringDecoder } = require('node:string_decoder')
 const mgr = require('./ipc/terminalManager.cjs')
-const { terminalCreateRoute } = require('./ipc/terminalCreateRoute.cjs')
+const { terminalAttachRoute, terminalCreateRoute, terminalKillRoute, terminalResizeRoute } = require('./ipc/terminalCreateRoute.cjs')
 const { terminalOwnerAllowed, terminalOwnerParts } = require('./ipc/securityPolicy.cjs')
 const {
   PROTOCOL,
@@ -24,6 +24,9 @@ const {
   MAX_FRAME,
   atomicJson,
   brokerMethodAllowedForAccess,
+  // Framing and queue accounting live in brokerWire so the observer layer can
+  // be exercised against the exact delivery verdict a real socket produces.
+  writeFrame: send,
 } = require('./ipc/brokerWire.cjs')
 
 const NO_CLIENT_EXIT_MS = process.env.NODE_ENV === 'test' && process.env.KAISOLA_TEST_BROKER_NO_CLIENT_EXIT_MS
@@ -131,18 +134,6 @@ function waitMilliseconds(milliseconds) {
     const timer = setTimeout(resolve, milliseconds)
     timer.unref?.()
   })
-}
-
-function send(socket, frame, { maxQueueBytes, force = false } = {}) {
-  if (!socket || socket.destroyed) return false
-  try {
-    const encoded = `${JSON.stringify(frame)}\n`
-    const frameBytes = Buffer.byteLength(encoded, 'utf8')
-    if (!force && Number.isFinite(maxQueueBytes) && socket.writableLength + frameBytes > maxQueueBytes) return false
-    return socket.write(encoded)
-  } catch {
-    return false // reconnect replays snapshots
-  }
 }
 
 const LEGACY_PROJECT_SCOPE = 'legacy'
@@ -415,13 +406,13 @@ async function dispatch(client, method, params = {}) {
     }
     case 'terminal.attach': {
       const id = terminalId()
-      requireAllowed(id, true)
-      const continuity = mgr.setSender(id, owner)
-      const previousInstance = continuity?.previousOwner?.split('|')[0]
-      const continuation = continuity && previousInstance && previousInstance !== client.instanceId
-        ? { ...continuity, acrossRestart: true, reattachedAt: Date.now(), brokerPid: process.pid }
-        : null
-      return { ...mgr.snapshot(id), continuation }
+      return terminalAttachRoute({
+        manager: mgr,
+        id,
+        owner,
+        clientInstanceId: client.instanceId,
+        requireAllowed,
+      })
     }
     case 'terminal.subscribe': {
       if (admin) throw new Error('terminal observer requires an exact project capability')
@@ -483,8 +474,7 @@ async function dispatch(client, method, params = {}) {
     }
     case 'terminal.resize': {
       const id = terminalId()
-      requireAllowed(id)
-      return mgr.resize(id, Number(params.cols), Number(params.rows))
+      return terminalResizeRoute({ manager: mgr, id, params, requireAllowed })
     }
     case 'terminal.snapshot':
     case 'terminal.output': {
@@ -504,8 +494,7 @@ async function dispatch(client, method, params = {}) {
     }
     case 'terminal.kill': {
       const id = terminalId()
-      requireAllowed(id)
-      return { ok: mgr.kill(id) }
+      return terminalKillRoute({ manager: mgr, id, requireAllowed })
     }
     case 'terminal.release': {
       const id = terminalId()

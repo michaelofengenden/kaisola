@@ -710,6 +710,12 @@ struct GitPanelView: View {
         _model = StateObject(wrappedValue: GitPanelModel(repoRoot: repoRoot))
     }
 
+    /// Internal injection keeps mounted layout contracts deterministic without
+    /// weakening the production initializer's repository ownership.
+    init(model: GitPanelModel) {
+        _model = StateObject(wrappedValue: model)
+    }
+
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             header
@@ -860,15 +866,13 @@ struct GitPanelView: View {
 
     @ViewBuilder
     private func content(_ status: GitService.Status) -> some View {
-        if status.isClean {
-            VStack(spacing: 0) {
-                ContentUnavailableView("Working tree clean", systemImage: "checkmark.seal")
-                logSection
-                prSection
-            }
-        } else {
-            ScrollView {
-                LazyVStack(alignment: .leading, spacing: 4) {
+        ScrollView {
+            LazyVStack(alignment: .leading, spacing: 4) {
+                if status.isClean {
+                    ContentUnavailableView("Working tree clean", systemImage: "checkmark.seal")
+                        .frame(maxWidth: .infinity)
+                        .frame(minHeight: 180)
+                } else {
                     bulkActions(status)
                     fileSection(
                         "Staged", status.staged.map { ($0.path, $0.code) }, stats: status.stagedStats,
@@ -882,11 +886,16 @@ struct GitPanelView: View {
                         "Untracked", status.untracked.map { ($0, "?") }, stats: nil,
                         action: "Stage", staged: false
                     ) { model.stage($0) }
-                    logSection
-                    prSection
                 }
-                .padding(12)
+                logSection
+                prSection
             }
+            .padding(12)
+        }
+        .accessibilityElement(children: .contain)
+        .accessibilityIdentifier("git.content.scroll")
+
+        if !status.isClean {
             Divider()
             HStack(spacing: 8) {
                 TextField("Commit message…", text: $model.commitMessage)
@@ -951,7 +960,6 @@ struct GitPanelView: View {
                 }
             }
         }
-        .padding(.horizontal, model.status?.isClean == true ? 12 : 0)
     }
 
     /// Pull requests in two steps. "Review Pull Request" assembles the plan and
@@ -990,7 +998,6 @@ struct GitPanelView: View {
                     .font(.caption2).foregroundStyle(.tertiary)
             }
         }
-        .padding(.horizontal, model.status?.isClean == true ? 12 : 0)
         .padding(.bottom, 10)
     }
 

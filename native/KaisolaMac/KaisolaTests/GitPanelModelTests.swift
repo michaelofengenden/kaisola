@@ -1,5 +1,7 @@
+import AppKit
 import Combine
 import Foundation
+import SwiftUI
 import XCTest
 @testable import Kaisola
 
@@ -471,6 +473,85 @@ final class GitPanelModelTests: XCTestCase {
     }
 
     // MARK: - Live model behavior
+
+    /// A clean repository used to take a different, non-scrolling layout path:
+    /// its expanding empty state could push History and Pull Request below a
+    /// short pane with no way to reach them. Exercise the mounted hierarchy at
+    /// an accessibility text size with both lower sections expanded so the
+    /// contract covers the real failure, not just a layout-policy helper.
+    @MainActor
+    func testCleanExpandedHistoryAndPullRequestRemainScrollableAtMinimumHeightAndLargeText() throws {
+        try write("base.txt", "base\n")
+        try git(["add", "base.txt"])
+        try git(["commit", "-q", "-m", "base"])
+        let baseOID = try gitOutput(["rev-parse", "HEAD"])
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        try git(["remote", "add", "origin", "git@github.com:acme/widget.git"])
+        try git(["update-ref", "refs/remotes/origin/main", baseOID])
+        try git(["symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/main"])
+        try write("feature.txt", "feature\n")
+        try git(["add", "feature.txt"])
+        try git(["commit", "-q", "-m", "feature work"])
+
+        let model = GitPanelModel(repoRoot: repo)
+        model.refresh()
+        XCTAssertTrue(pump(until: { model.status?.isClean == true && !model.isBusy }, timeout: 10))
+
+        model.loadLog()
+        XCTAssertTrue(pump(until: { model.log.count == 2 && !model.isBusy }, timeout: 10))
+
+        model.preparePR()
+        XCTAssertTrue(
+            pump(until: { model.prPlan != nil || model.errorMessage != nil }, timeout: 10),
+            "expanded PR review should load, error: \(model.errorMessage ?? "none")"
+        )
+        XCTAssertNotNil(model.prPlan)
+
+        let hostingView = NSHostingView(
+            rootView: GitPanelView(model: model)
+                .environment(\.dynamicTypeSize, .accessibility3)
+        )
+        hostingView.frame = NSRect(x: 0, y: 0, width: 520, height: 260)
+        let window = NSWindow(
+            contentRect: hostingView.frame,
+            styleMask: .borderless,
+            backing: .buffered,
+            defer: false
+        )
+        window.contentView = hostingView
+        hostingView.layoutSubtreeIfNeeded()
+
+        XCTAssertTrue(
+            pump(until: {
+                hostingView.layoutSubtreeIfNeeded()
+                return self.largestScrollView(in: hostingView) != nil
+            }, timeout: 5),
+            "the clean-state content must mount the same outer scroll region as a dirty tree"
+        )
+
+        let scrollView = try XCTUnwrap(self.largestScrollView(in: hostingView))
+        hostingView.layoutSubtreeIfNeeded()
+        let documentHeight = try XCTUnwrap(scrollView.documentView).frame.height
+        XCTAssertGreaterThan(
+            documentHeight,
+            scrollView.contentView.bounds.height + 1,
+            "expanded clean-state content must have real vertical scroll extent at the minimum-height fixture"
+        )
+        let initialOffset = scrollView.contentView.bounds.origin.y
+        let maximumOffset = documentHeight - scrollView.contentView.bounds.height
+        let targetOffset = abs(initialOffset) > abs(initialOffset - maximumOffset) ? 0 : maximumOffset
+        scrollView.contentView.scroll(
+            to: NSPoint(x: scrollView.contentView.bounds.origin.x, y: targetOffset)
+        )
+        scrollView.reflectScrolledClipView(scrollView.contentView)
+        hostingView.layoutSubtreeIfNeeded()
+        XCTAssertGreaterThan(
+            abs(scrollView.contentView.bounds.origin.y - initialOffset),
+            1,
+            "the mounted clean-state scroll region must move far enough to reach expanded History and Pull Request"
+        )
+        withExtendedLifetime(window) {}
+    }
 
     /// The first click must assemble a review and execute NOTHING: no fork, no
     /// push, no `gh`, even with a real web destination configured.
@@ -948,6 +1029,17 @@ final class GitPanelModelTests: XCTestCase {
             return .nan
         }
         return seconds
+    }
+
+    @MainActor
+    private func largestScrollView(in view: NSView) -> NSScrollView? {
+        var candidates = view.subviews.compactMap { $0 as? NSScrollView }
+        for child in view.subviews {
+            if let nested = largestScrollView(in: child) { candidates.append(nested) }
+        }
+        return candidates.max {
+            ($0.frame.width * $0.frame.height) < ($1.frame.width * $1.frame.height)
+        }
     }
 
     /// Pump the main run loop until `condition` holds (see WorkspaceWatcherTests):

@@ -39,14 +39,13 @@ closed and enforced at the integration seam, not by the extension:
   `NSRegularExpression` only.
 - **process** (custom agents' ACP adapters, MCP stdio servers): may spawn a
   named command. Requires explicit user enablement per entry (imports and new
-  entries start disabled) and shows the exact command it will run. **The
-  promise is stated honestly** (review finding 1): enabling a process
-  extension grants publisher-controlled code the user's ordinary filesystem
-  and network access and the parent environment — the CLAUDE_CONFIG_DIR /
-  CODEX_HOME overlay redirects provider *configuration*, it is not isolation.
-  The enable sheet says exactly that. Tightening it further (sandbox +
-  allowlisted environment) is real work scheduled with the adapter-install
-  manager below, not a checkbox.
+  entries start disabled) and shows the exact contained-access grant. The
+  original v2 honest grant was ordinary user access; issue #26 replaced it with
+  a deny-by-default Seatbelt, a provider-scoped environment allowlist, and
+  reviewable workspace/network/process privileges bound to the pinned install.
+  Host fs/MCP bridges enforce the same grant and host terminals are unavailable
+  to custom adapters. The supported boundary and residual limits are in
+  `notes/custom-acp-adapter-containment.md`.
 - **network** (MCP http/sse): https-only, credential-free URLs (existing
   `McpServerConfig.validationError` rules).
 
@@ -120,7 +119,7 @@ package files).
 - Marketplace/remote fetching of extensions (everything is local, typed in or
   imported from sibling tools' configs read-only).
 - Pluggable preview *renderers* (new SwiftUI views can't come from data).
-- Per-extension filesystem grants.
+- Domain-scoped network grants or arbitrary non-Node adapter runtimes.
 
 ## Test plan
 

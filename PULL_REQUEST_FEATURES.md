@@ -158,7 +158,7 @@ Acceptance:
 
 ## PR 11 — Native preview installed-build performance gates
 
-Status: implementation shipped; 2 of 4 explicit acceptance gates are complete.
+Status: implementation shipped; 3 of 4 explicit acceptance gates are complete.
 
 TextKit 2 read mode, off-main structured-data preparation, PDFKit, bounded
 Markdown images, truthful external-edit handling, safe navigation, and explicit
@@ -177,9 +177,11 @@ Acceptance remaining:
   same budget, and image sizing — called per image per layout pass — is held to
   200,000 calls in under a second, which is what keeps it arithmetic rather
   than something that touches the file.
-- Bounded PDFs still need an equivalent budget. PDFKit does its own paging and
-  decoding, so a meaningful gate has to measure the *surface*, not a parser,
-  and that needs the installed app.
+- ~~Bounded PDFs.~~ Done: `native:pdf-preview-budget` launches copied optimized
+  app bytes once per deterministic fixture (96-page, six-page image-heavy,
+  malformed, and 14,400-point large-page), then gates first draw, exact paging,
+  malformed rejection, sustained real-PDFView scrolling, and peak process-tree
+  physical footprint with fixture-named failure diagnostics.
 - Confirm those surfaces retain native momentum on the **installed optimized
   app**. The in-process budgets above are what can be measured without one;
   momentum under gesture needs the signed build and a physical trackpad, which

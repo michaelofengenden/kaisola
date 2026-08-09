@@ -1502,6 +1502,180 @@ final class WorkspaceFilesTests: XCTestCase {
         XCTAssertNil(try currentStore.loadNewest(for: file, workspaceRoot: root))
     }
 
+    func testFailedRecoveryClaimStaysTypedInsteadOfLookingLikeNoDraft() throws {
+        let recoveryDirectory = root.appendingPathComponent(".preview-recovery", isDirectory: true)
+        let store = FilePreviewRecoveryStore(directoryURL: recoveryDirectory)
+        let file = root.appendingPathComponent("README.md")
+        let orphan = try store.saveText(
+            "prior-process draft",
+            for: file,
+            workspaceRoot: root,
+            expectedModificationDate: nil,
+            ownerID: "prior-process",
+            revision: 1
+        )
+        // The claimant slot already holds a newer revision, so copying the
+        // orphan into it is rejected by the store itself.
+        let stale = try store.saveText(
+            "claimant journal",
+            for: file,
+            workspaceRoot: root,
+            expectedModificationDate: nil,
+            ownerID: "claimant",
+            revision: 5
+        )
+        let registry = FilePreviewRecoveryOwnerRegistry()
+        registry.register("claimant")
+        defer { registry.unregister("claimant") }
+
+        let failed = store.claimOutcome(
+            for: file,
+            workspaceRoot: root,
+            claimantID: "claimant",
+            ownerRegistry: registry
+        )
+        XCTAssertEqual(failed.failure?.reason, .staleRevision)
+        XCTAssertEqual(
+            failed.failure?.message,
+            "A newer recovery revision is already stored for this editor."
+        )
+        XCTAssertNil(failed.claim)
+        XCTAssertNotEqual(failed, .noDraft)
+
+        // A file with nothing journaled is the genuinely empty answer, and it
+        // has to stay distinguishable from the failure above.
+        XCTAssertEqual(
+            store.claimOutcome(
+                for: root.appendingPathComponent("src/main.swift"),
+                workspaceRoot: root,
+                claimantID: "claimant",
+                ownerRegistry: registry
+            ),
+            .noDraft
+        )
+
+        // The refused claim wrote nothing, so the draft is still recoverable.
+        XCTAssertTrue(store.remove(stale, for: file, workspaceRoot: root))
+        let retried = store.claimOutcome(
+            for: file,
+            workspaceRoot: root,
+            claimantID: "claimant",
+            ownerRegistry: registry
+        )
+        XCTAssertEqual(retried.claim?.record.text, "prior-process draft")
+        XCTAssertEqual(retried.claim?.sourceTokens, [orphan])
+        store.releaseClaims(
+            retried.claim?.sourceTokens ?? [],
+            for: file,
+            workspaceRoot: root,
+            claimantID: "claimant"
+        )
+    }
+
+    func testRecoveryFailureActionsLeaveTheRestOfTheJournalAlone() throws {
+        let recoveryDirectory = root.appendingPathComponent(".preview-recovery", isDirectory: true)
+        let store = FilePreviewRecoveryStore(directoryURL: recoveryDirectory)
+        let file = root.appendingPathComponent("README.md")
+        let otherFile = root.appendingPathComponent("src/main.swift")
+        _ = try store.saveText(
+            "orphan draft",
+            for: file,
+            workspaceRoot: root,
+            expectedModificationDate: nil,
+            ownerID: "prior-process",
+            revision: 1
+        )
+        let live = try store.saveText(
+            "live window draft",
+            for: file,
+            workspaceRoot: root,
+            expectedModificationDate: nil,
+            ownerID: "live-window",
+            revision: 1
+        )
+        let otherOrphan = try store.saveText(
+            "another file's draft",
+            for: otherFile,
+            workspaceRoot: root,
+            expectedModificationDate: nil,
+            ownerID: "prior-process",
+            revision: 1
+        )
+        let registry = FilePreviewRecoveryOwnerRegistry()
+        registry.register("live-window")
+        defer { registry.unregister("live-window") }
+
+        let recordCount: () -> Int = {
+            ((try? FileManager.default.contentsOfDirectory(
+                at: recoveryDirectory,
+                includingPropertiesForKeys: nil
+            )) ?? []).filter { $0.pathExtension == "json" }.count
+        }
+
+        // Inspect resolves the exact record and is read-only.
+        let inspected = try XCTUnwrap(store.newestOrphanRecordURL(
+            for: file,
+            workspaceRoot: root,
+            ownerRegistry: registry
+        ))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: inspected.path))
+        XCTAssertEqual(recordCount(), 3)
+
+        XCTAssertEqual(
+            try store.discardOrphans(for: file, workspaceRoot: root, ownerRegistry: registry),
+            1
+        )
+        XCTAssertFalse(FileManager.default.fileExists(atPath: inspected.path))
+        XCTAssertNil(store.newestOrphanRecordURL(
+            for: file,
+            workspaceRoot: root,
+            ownerRegistry: registry
+        ))
+        // The live window's own journal and every other file's draft survive.
+        XCTAssertEqual(try store.loadNewest(for: file, workspaceRoot: root)?.token, live)
+        XCTAssertEqual(try store.loadNewest(for: otherFile, workspaceRoot: root)?.token, otherOrphan)
+        XCTAssertEqual(recordCount(), 2)
+    }
+
+    func testRecoveryFailurePolicySurfacesOnlyActionableFailures() {
+        let stale = FilePreviewRecoveryClaimFailure(
+            FilePreviewRecoveryStore.RecoveryError.staleRevision
+        )
+        let unavailable = FilePreviewRecoveryClaimFailure(
+            FilePreviewRecoveryStore.RecoveryError.storageUnavailable
+        )
+        let outside = FilePreviewRecoveryClaimFailure(
+            FilePreviewRecoveryStore.RecoveryError.outsideWorkspace
+        )
+        XCTAssertTrue(FilePreviewRecoveryFailurePolicy.shouldSurface(stale))
+        XCTAssertTrue(FilePreviewRecoveryFailurePolicy.shouldSurface(unavailable))
+        // Every file opened without a project root reports this; it hides no draft.
+        XCTAssertFalse(FilePreviewRecoveryFailurePolicy.shouldSurface(outside))
+
+        XCTAssertTrue(FilePreviewRecoveryFailurePolicy.canRetry(
+            isDirty: false,
+            isLoading: false,
+            isSaving: false
+        ))
+        // Retry re-runs the load, so it must not run over an unsaved draft or
+        // across an in-flight load or save.
+        XCTAssertFalse(FilePreviewRecoveryFailurePolicy.canRetry(
+            isDirty: true,
+            isLoading: false,
+            isSaving: false
+        ))
+        XCTAssertFalse(FilePreviewRecoveryFailurePolicy.canRetry(
+            isDirty: false,
+            isLoading: true,
+            isSaving: false
+        ))
+        XCTAssertFalse(FilePreviewRecoveryFailurePolicy.canRetry(
+            isDirty: false,
+            isLoading: false,
+            isSaving: true
+        ))
+    }
+
     func testClaimReadsOwnerLivenessAtSelectionTime() throws {
         let store = FilePreviewRecoveryStore(
             directoryURL: root.appendingPathComponent(".preview-recovery", isDirectory: true)

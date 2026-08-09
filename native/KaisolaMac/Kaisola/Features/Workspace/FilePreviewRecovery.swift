@@ -50,6 +50,60 @@ struct FilePreviewRecoveryClaim: Equatable, Sendable {
     let sourceTokens: [FilePreviewRecoveryToken]
 }
 
+/// A claim the store refused to complete. Storage and ownership failures used
+/// to be swallowed at the load site, so a draft that was still on disk simply
+/// never appeared and the user had nothing to diagnose or retry.
+struct FilePreviewRecoveryClaimFailure: Equatable, Sendable {
+    /// Set whenever the store itself rejected the claim. Foundation failures
+    /// (an unwritable directory, an interrupted rename) leave this `nil` and are
+    /// still described by `message`.
+    let reason: FilePreviewRecoveryStore.RecoveryError?
+    let message: String
+
+    init(_ error: Error) {
+        let typed = error as? FilePreviewRecoveryStore.RecoveryError
+        reason = typed
+        message = typed?.errorDescription ?? error.localizedDescription
+    }
+}
+
+/// The typed result of the claim a preview attempts while it loads. "No draft
+/// was journaled" and "the journal could not be read" are different answers and
+/// the view renders a different surface for each.
+enum FilePreviewRecoveryClaimOutcome: Equatable, Sendable {
+    case claimed(FilePreviewRecoveryClaim)
+    case noDraft
+    case failed(FilePreviewRecoveryClaimFailure)
+
+    var claim: FilePreviewRecoveryClaim? {
+        guard case let .claimed(claim) = self else { return nil }
+        return claim
+    }
+
+    var failure: FilePreviewRecoveryClaimFailure? {
+        guard case let .failed(failure) = self else { return nil }
+        return failure
+    }
+}
+
+/// Pure policy for the failed-claim banner.
+enum FilePreviewRecoveryFailurePolicy {
+    /// A file the journal never covers can hold no record, so that refusal is
+    /// the ordinary "recovery does not apply here" that every file opened
+    /// without a project root reports. Every other failure hides a draft that is
+    /// still on disk and is worth a banner.
+    static func shouldSurface(_ failure: FilePreviewRecoveryClaimFailure) -> Bool {
+        failure.reason != .outsideWorkspace
+    }
+
+    /// Retry re-runs the whole load, so it waits until this editor has nothing
+    /// of its own to lose. Inspect and discard never read or replace the open
+    /// draft and stay available throughout.
+    static func canRetry(isDirty: Bool, isLoading: Bool, isSaving: Bool) -> Bool {
+        !isDirty && !isLoading && !isSaving
+    }
+}
+
 /// A process-local registration created before an off-main recovery write is
 /// launched. Fences can be retired as soon as every registration at or below
 /// their high-water revision completes, rather than pinning tombstones for the
@@ -240,12 +294,7 @@ struct FilePreviewRecoveryStore: Sendable {
         let paths = try canonicalPaths(fileURL: fileURL, workspaceRoot: workspaceRoot)
         return try withMutationLock {
             try prepareDirectory()
-            let records = recoveryRecordURLs().compactMap { url -> FilePreviewRecoveryRecord? in
-                guard let record = readRecord(at: url) else { return nil }
-                guard record.filePath == paths.file,
-                      record.workspacePath == paths.workspace else { return nil }
-                return record
-            }
+            let records = recordsPrepared(for: paths)
             // Every durable descendant carries its exact predecessor lineage.
             // A legitimate journal may supersede a fence in the same owner
             // slot, so suppression cannot depend on tombstones alone.
@@ -276,12 +325,7 @@ struct FilePreviewRecoveryStore: Sendable {
         return try ownerRegistry.withActiveOwnerIDs { activeOwnerIDs in
             try withMutationLock {
                 try prepareDirectory()
-                let records = recoveryRecordURLs().compactMap { url -> FilePreviewRecoveryRecord? in
-                    guard let record = readRecord(at: url),
-                          record.filePath == paths.file,
-                          record.workspacePath == paths.workspace else { return nil }
-                    return record
-                }
+                let records = recordsPrepared(for: paths)
                 var claimed = Set(records.compactMap { record -> FilePreviewRecoveryToken? in
                     let key = claimKey(paths: paths, token: record.token)
                     return Self.claimedRecords[key] == nil ? nil : record.token
@@ -325,6 +369,88 @@ struct FilePreviewRecoveryStore: Sendable {
                     throw error
                 }
                 return FilePreviewRecoveryClaim(record: claimedRecord, sourceTokens: lineage)
+            }
+        }
+    }
+
+    /// Claims without throwing and keeps the exact failure. Preview loading has
+    /// to tell "nothing was journaled" apart from "the journal could not be
+    /// read": only the second one hides a draft that is still on disk.
+    func claimOutcome(
+        for fileURL: URL,
+        workspaceRoot: URL?,
+        claimantID: String,
+        ownerRegistry: FilePreviewRecoveryOwnerRegistry = .shared
+    ) -> FilePreviewRecoveryClaimOutcome {
+        do {
+            guard let claim = try claimNewestOrphan(
+                for: fileURL,
+                workspaceRoot: workspaceRoot,
+                claimantID: claimantID,
+                ownerRegistry: ownerRegistry
+            ) else { return .noDraft }
+            return .claimed(claim)
+        } catch {
+            return .failed(FilePreviewRecoveryClaimFailure(error))
+        }
+    }
+
+    /// The journal file behind the newest draft this window could restore, for
+    /// the inspect action. Strictly read-only: a draft the user is still
+    /// deciding about must survive being looked at.
+    func newestOrphanRecordURL(
+        for fileURL: URL,
+        workspaceRoot: URL?,
+        ownerRegistry: FilePreviewRecoveryOwnerRegistry = .shared
+    ) -> URL? {
+        guard let paths = try? canonicalPaths(fileURL: fileURL, workspaceRoot: workspaceRoot) else { return nil }
+        return ownerRegistry.withActiveOwnerIDs { activeOwnerIDs in
+            withMutationLock { () -> URL? in
+                guard let record = FilePreviewRecoveryViewPolicy.newestRestorable(
+                    in: recordsPrepared(for: paths),
+                    activeOwnerIDs: activeOwnerIDs
+                ) else { return nil }
+                return recordURL(
+                    filePath: record.filePath,
+                    workspacePath: record.workspacePath,
+                    ownerID: record.ownerID
+                )
+            }
+        }
+    }
+
+    /// Explicit discard of the drafts a window could not claim. Only restorable
+    /// records for this exact project/file pair are unlinked; tombstones, other
+    /// files, and anything owned or claimed by a live window stay, so answering
+    /// one failed claim can never overwrite the rest of the journal.
+    @discardableResult
+    func discardOrphans(
+        for fileURL: URL,
+        workspaceRoot: URL?,
+        ownerRegistry: FilePreviewRecoveryOwnerRegistry = .shared
+    ) throws -> Int {
+        let paths = try canonicalPaths(fileURL: fileURL, workspaceRoot: workspaceRoot)
+        return try ownerRegistry.withActiveOwnerIDs { activeOwnerIDs in
+            try withMutationLock { () -> Int in
+                try prepareDirectory()
+                let records = recordsPrepared(for: paths)
+                let discardable = records.filter { record in
+                    record.kind != .tombstone
+                        && !activeOwnerIDs.contains(record.ownerID)
+                        && Self.claimedRecords[claimKey(paths: paths, token: record.token)] == nil
+                }
+                var removed = 0
+                for record in discardable {
+                    let url = recordURL(
+                        filePath: record.filePath,
+                        workspacePath: record.workspacePath,
+                        ownerID: record.ownerID
+                    )
+                    guard (try? FileManager.default.removeItem(at: url)) != nil else { continue }
+                    removed += 1
+                }
+                if removed > 0 { synchronizeDirectory() }
+                return removed
             }
         }
     }
@@ -621,6 +747,20 @@ struct FilePreviewRecoveryStore: Sendable {
             return nil
         }
         return record
+    }
+
+    /// Every stored record for one canonical project/file pair. Callers already
+    /// hold `mutationLock` and, except for read-only lookups, have prepared the
+    /// directory.
+    private func recordsPrepared(
+        for paths: (file: String, workspace: String)
+    ) -> [FilePreviewRecoveryRecord] {
+        recoveryRecordURLs().compactMap { url -> FilePreviewRecoveryRecord? in
+            guard let record = readRecord(at: url),
+                  record.filePath == paths.file,
+                  record.workspacePath == paths.workspace else { return nil }
+            return record
+        }
     }
 
     private func recoveryRecordURLs() -> [URL] {
@@ -927,7 +1067,13 @@ enum FilePreviewDraftBounds {
 struct FilePreviewSnapshot: Sendable {
     let content: FilePreviewContent
     let modificationDate: Date?
-    let recoveryClaim: FilePreviewRecoveryClaim?
+    /// The typed recovery result travels with the loaded content. Flattening a
+    /// failed claim into "no draft" here is what made a recoverable draft vanish
+    /// with nothing for the user to act on.
+    let recoveryOutcome: FilePreviewRecoveryClaimOutcome
+
+    var recoveryClaim: FilePreviewRecoveryClaim? { recoveryOutcome.claim }
+    var recoveryFailure: FilePreviewRecoveryClaimFailure? { recoveryOutcome.failure }
 }
 
 enum FilePreviewRecoveryWorkResult: Sendable {

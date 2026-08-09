@@ -140,6 +140,7 @@ actor BrokerControlClient: BrokerControlServing, BrokerRollingUpdateRequesting {
     private var requestTimeoutTasks: [String: Task<Void, Never>] = [:]
     private var readerTask: Task<Void, Never>?
     private var disconnectHandler: DisconnectHandler?
+    private var connectionAbortInProgress = false
 
     init(
         transport: any BrokerByteTransport = UnixBrokerTransport(),
@@ -471,7 +472,10 @@ actor BrokerControlClient: BrokerControlServing, BrokerRollingUpdateRequesting {
             }
             Task {
                 do { try await transport.send(encoded) }
-                catch { failRequest(requestID, with: error) }
+                // A failed socket write is verified controller-connection
+                // loss, not a terminal rejection. Abort the lane so the
+                // router cannot reuse a poisoned child on reconnect.
+                catch { await abortConnection(with: error) }
             }
         }
     }
@@ -590,6 +594,12 @@ actor BrokerControlClient: BrokerControlServing, BrokerRollingUpdateRequesting {
     }
 
     private func abortConnection(with error: any Error) async {
+        // Closing the transport wakes the reader, which can observe the same
+        // failure. Settle and report the connection only once.
+        guard !connectionAbortInProgress,
+              connected || helloWaiter != nil || !pending.isEmpty else { return }
+        connectionAbortInProgress = true
+        defer { connectionAbortInProgress = false }
         await transport.close()
         readerTask = nil
         decoder = BrokerLineFrameDecoder()

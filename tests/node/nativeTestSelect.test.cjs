@@ -44,6 +44,31 @@ test('a native test file selects exactly its test class', () => {
   assert.deepEqual(plan.swiftPackages, [])
 })
 
+test('terminal authority sources retain replay, input, and option-click contracts', () => {
+  const expectations = [
+    [
+      'native/KaisolaMac/Kaisola/Features/Sessions/NativeTerminalSurface.swift',
+      ['NativeTerminalInteractionTests', 'TerminalOptionClickTests', 'TerminalReplayFidelityTests'],
+    ],
+    [
+      'native/KaisolaMac/Kaisola/Features/Sessions/RootShellView.swift',
+      ['SessionPaneLayoutTests', 'TerminalReplayFidelityTests'],
+    ],
+    [
+      'native/KaisolaMac/Kaisola/Features/Sessions/TerminalSurfaceCache.swift',
+      ['TerminalReplayFidelityTests'],
+    ],
+  ]
+
+  for (const [file, required] of expectations) {
+    const plan = selector.planForChanges([file], inventory)
+    for (const testClass of required) {
+      assert.ok(plan.native.selectors.includes(testClass), `${file} must select ${testClass}`)
+    }
+    assert.equal(plan.fallback, false)
+  }
+})
+
 test('extracted workspace rail stays on the narrow workspace contract', () => {
   const plan = selector.planForChanges([
     'native/KaisolaMac/Kaisola/Features/Workspace/WorkspaceRailView.swift',

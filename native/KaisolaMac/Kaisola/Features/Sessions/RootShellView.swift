@@ -505,9 +505,52 @@ struct RootShellView: View {
 
     // MARK: - Layouts
 
+    /// The one action surface injected into either navigation shell. Layout
+    /// switching changes presentation only; it cannot select a different
+    /// implementation of project, session, or destructive actions.
+    private var shellActions: RootShellActionModel {
+        RootShellActionModel(
+            openDroppedProjects: { urls in
+                let folders = urls.filter(\.hasDirectoryPath)
+                guard !folders.isEmpty else { return false }
+                for folder in folders { model.openProject(directory: folder) }
+                return true
+            },
+            openProject: { runCommand(.openProject) },
+            useLeftTreeNavigation: { runCommand(.navigationLayout(.leftTree)) },
+            moveProject: { model.moveProject(id: $0, toIndex: $1) },
+            runQuickAction: { action, directory in
+                Task { await model.runQuickAction(action, inProject: directory) }
+            },
+            selectSession: { session in
+                if KaisolaMacAppDelegate.focusWindow(displayingSurface: session.id) { return }
+                guard SurfaceSelectionPolicy.shouldRequestFocus(
+                    focusedPaneID: model.focusedPaneID,
+                    targetID: session.id,
+                    browserOpen: model.browserCardURL != nil,
+                    activeProjectID: model.selectedProjectID,
+                    targetProjectID: session.projectID
+                ) else { return }
+                Task { await model.focusSurface(session.id) }
+            },
+            projectLaunchMenu: { AnyView(projectLaunchMenu($0)) },
+            projectContextMenu: { AnyView(projectContextMenu($0)) },
+            sessionContextMenu: { AnyView(sessionContextMenuContent($0)) },
+            chatContextMenu: { AnyView(chatContextMenuContent($0)) },
+            meshContextMenu: { AnyView(meshContextMenuContent($0)) },
+            renameSurface: { renameTarget = $0 },
+            closeChat: { model.closeChat($0.id) },
+            deleteChat: requestDeleteChat,
+            closeMesh: requestMoveMeshToRecentlyClosed,
+            deleteMesh: requestDeleteMesh,
+            deleteRecentlyClosed: requestDeleteRecentlyClosed
+        )
+    }
+
     /// Nested project→session tree in a left sidebar (the default).
     private var leftTreeLayout: some View {
-        NavigationSplitView {
+        let actions = shellActions
+        return RootLeftTreeShell(actions: actions) { actions in
             VStack(spacing: 0) {
                 // No "Projects" title row: the chrome panel already starts below
                 // the traffic lights, the rail's own pinned project names the
@@ -528,23 +571,13 @@ struct RootShellView: View {
                         // uses, so the rail always pins exactly the project
                         // whose sessions are expanded.
                         isActiveProject: { activeProjectID == $0 },
-                        selectSession: { session in
-                            if KaisolaMacAppDelegate.focusWindow(displayingSurface: session.id) { return }
-                            guard SurfaceSelectionPolicy.shouldRequestFocus(
-                                focusedPaneID: model.focusedPaneID,
-                                targetID: session.id,
-                                browserOpen: model.browserCardURL != nil,
-                                activeProjectID: model.selectedProjectID,
-                                targetProjectID: session.projectID
-                            ) else { return }
-                            Task { await model.focusSurface(session.id) }
-                        },
-                        launchMenu: { AnyView(projectLaunchMenu($0)) },
-                        contextMenu: { AnyView(projectContextMenu($0)) },
-                        sessionContextMenu: { AnyView(sessionContextMenuContent($0)) },
-                        chatContextMenu: { AnyView(chatContextMenuContent($0)) },
-                        meshContextMenu: { AnyView(meshContextMenuContent($0)) },
-                        deleteRecentlyClosed: requestDeleteRecentlyClosed
+                        selectSession: actions.selectSession,
+                        launchMenu: actions.projectLaunchMenu,
+                        contextMenu: actions.projectContextMenu,
+                        sessionContextMenu: actions.sessionContextMenu,
+                        chatContextMenu: actions.chatContextMenu,
+                        meshContextMenu: actions.meshContextMenu,
+                        deleteRecentlyClosed: actions.deleteRecentlyClosed
                     )
                     addProjectRow
                         .listRowInsets(QuietRailMetrics.listRowBleed)
@@ -558,12 +591,7 @@ struct RootShellView: View {
                 // Typed to URLs, so the rail's own internal text drags (project
                 // reorder) never collide with it.
                 .dropDestination(for: URL.self) { urls, _ in
-                    let folders = urls.filter(\.hasDirectoryPath)
-                    guard !folders.isEmpty else { return false }
-                    for folder in folders {
-                        model.openProject(directory: folder)
-                    }
-                    return true
+                    actions.openDroppedProjects(urls)
                 } isTargeted: { sidebarDropTargeted = $0 }
                 .overlay {
                     if sidebarDropTargeted {
@@ -671,10 +699,9 @@ struct RootShellView: View {
                 ideal: NativeWorkspaceChrome.projectSidebarIdealWidth,
                 max: NativeWorkspaceChrome.projectSidebarMaximumWidth
             )
-        } detail: {
+        } detail: { _ in
             detailArea
         }
-        .navigationSplitViewStyle(.balanced)
     }
 
     /// The detail column: the content on its own inset floating card, gutters
@@ -1085,39 +1112,39 @@ struct RootShellView: View {
     /// A project tab strip over a session row, then the detail pane (Electron's
     /// "Top bar" mode).
     private var topBarLayout: some View {
-        VStack(spacing: 0) {
+        let actions = shellActions
+        return RootTopBarShell(actions: actions) { actions in
             ProjectTabStripView(
                 projects: model.projects,
                 selected: activeProjectBinding,
-                menu: { project in AnyView(self.projectContextMenu(project)) },
-                openFolder: { runCommand(.openProject) },
-                useSidebar: { runCommand(.navigationLayout(.leftTree)) },
-                reorder: { model.moveProject(id: $0, toIndex: $1) }
+                menu: actions.projectContextMenu,
+                openFolder: actions.openProject,
+                useSidebar: actions.useLeftTreeNavigation,
+                reorder: actions.moveProject
             )
             .padding(.leading, NativeWorkspaceChrome.topBarTrafficLightClearance)
-            Divider()
+        } quickActions: { actions in
             if let active = model.projects.first(where: { $0.id == activeProjectID }),
                let activeDir = active.directory {
                 QuickActionsBar(projectID: active.id, projectName: active.name) { action in
-                    Task { await model.runQuickAction(action, inProject: activeDir) }
+                    actions.runQuickAction(action, activeDir)
                 }
             }
+        } sessions: { actions in
             SessionStrip(
                 model: model,
                 projectID: activeProjectID,
-                rename: { renameTarget = $0 },
-                closeChat: { model.closeChat($0.id) },
-                deleteChat: requestDeleteChat,
-                closeMesh: requestMoveMeshToRecentlyClosed,
-                deleteMesh: requestDeleteMesh,
-                deleteRecentlyClosed: requestDeleteRecentlyClosed
+                rename: actions.renameSurface,
+                closeChat: actions.closeChat,
+                deleteChat: actions.deleteChat,
+                closeMesh: actions.closeMesh,
+                deleteMesh: actions.deleteMesh,
+                deleteRecentlyClosed: actions.deleteRecentlyClosed
             )
-            Divider()
+        } detail: { _ in
             detailArea
-            HStack(spacing: 0) {
-                footer.frame(width: 235)
-                Spacer(minLength: 0)
-            }
+        } footer: { _ in
+            footer
         }
     }
 

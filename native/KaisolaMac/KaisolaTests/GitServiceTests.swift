@@ -383,6 +383,62 @@ final class GitServiceTests: XCTestCase {
         XCTAssertFalse(FileManager.default.fileExists(atPath: worktreePath))
     }
 
+    func testWorktreeRemoveResumesBranchCleanupWithoutRemovingReplacementPath() throws {
+        try write("base.txt", "base\n")
+        try git(["add", "base.txt"])
+        try git(["commit", "-q", "-m", "base"])
+
+        let service = GitService(repoRoot: repo)
+        let worktreeURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("kaisola-wt-\(UUID().uuidString.prefix(6))", isDirectory: true)
+        let branch = "\(GitService.meshBranchPrefix)partial-cleanup"
+        let branchLock = repo.appendingPathComponent(".git/refs/heads/\(branch).lock")
+        defer {
+            try? FileManager.default.removeItem(at: branchLock)
+            try? FileManager.default.removeItem(at: worktreeURL)
+            if (try? service.branchExists(branch)) == true {
+                _ = try? git(["branch", "-D", branch])
+            }
+        }
+
+        try service.worktreeAdd(
+            path: worktreeURL.path,
+            branch: branch,
+            startPoint: service.headOID()
+        )
+        XCTAssertEqual(
+            try service.worktreeRemovalPhase(path: worktreeURL.path, branch: branch),
+            .registered
+        )
+
+        try "hold branch deletion\n".write(to: branchLock, atomically: true, encoding: .utf8)
+        XCTAssertThrowsError(try service.worktreeRemove(path: worktreeURL.path, branch: branch))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: worktreeURL.path))
+        XCTAssertTrue(try service.branchExists(branch))
+        XCTAssertEqual(
+            try service.worktreeRemovalPhase(path: worktreeURL.path, branch: branch),
+            .branchCleanupPending
+        )
+
+        try FileManager.default.removeItem(at: branchLock)
+        try FileManager.default.createDirectory(at: worktreeURL, withIntermediateDirectories: true)
+        let sentinel = worktreeURL.appendingPathComponent("do-not-remove.txt")
+        try "replacement directory\n".write(to: sentinel, atomically: true, encoding: .utf8)
+
+        XCTAssertEqual(
+            try service.worktreeRemove(path: worktreeURL.path, branch: branch),
+            .complete
+        )
+        XCTAssertFalse(try service.branchExists(branch))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: sentinel.path))
+
+        XCTAssertEqual(
+            try service.worktreeRemove(path: worktreeURL.path, branch: branch),
+            .complete
+        )
+        XCTAssertTrue(FileManager.default.fileExists(atPath: sentinel.path))
+    }
+
     func testWorktreeAPIsRefuseNonMeshBranches() throws {
         try write("f.txt", "x\n")
         try git(["add", "f.txt"])
@@ -409,7 +465,7 @@ final class GitServiceTests: XCTestCase {
         let worktreePath = FileManager.default.temporaryDirectory
             .appendingPathComponent("kaisola-wt-\(UUID().uuidString.prefix(6))").path
         let branch = "\(GitService.meshBranchPrefix)captured"
-        defer { try? service.worktreeRemove(path: worktreePath, branch: branch) }
+        defer { _ = try? service.worktreeRemove(path: worktreePath, branch: branch) }
         try service.worktreeAdd(path: worktreePath, branch: branch, startPoint: capturedOID)
 
         let worktreeURL = URL(fileURLWithPath: worktreePath, isDirectory: true)
@@ -450,8 +506,8 @@ final class GitServiceTests: XCTestCase {
         let secondBranch = "\(GitService.meshBranchPrefix)second"
         let baseOID = try service.headOID()
         defer {
-            try? service.worktreeRemove(path: firstPath, branch: firstBranch)
-            try? service.worktreeRemove(path: secondPath, branch: secondBranch)
+            _ = try? service.worktreeRemove(path: firstPath, branch: firstBranch)
+            _ = try? service.worktreeRemove(path: secondPath, branch: secondBranch)
         }
 
         try service.worktreeAdd(path: firstPath, branch: firstBranch, startPoint: baseOID)
@@ -515,7 +571,7 @@ final class GitServiceTests: XCTestCase {
         let worktreePath = FileManager.default.temporaryDirectory
             .appendingPathComponent("kaisola-wt-\(UUID().uuidString.prefix(6))").path
         let branch = "\(GitService.meshBranchPrefix)dirty"
-        defer { try? service.worktreeRemove(path: worktreePath, branch: branch) }
+        defer { _ = try? service.worktreeRemove(path: worktreePath, branch: branch) }
         try service.worktreeAdd(path: worktreePath, branch: branch, startPoint: baseOID)
 
         let worktreeURL = URL(fileURLWithPath: worktreePath, isDirectory: true)
@@ -549,7 +605,7 @@ final class GitServiceTests: XCTestCase {
         let worktreePath = FileManager.default.temporaryDirectory
             .appendingPathComponent("kaisola-wt-\(UUID().uuidString.prefix(6))").path
         let branch = "\(GitService.meshBranchPrefix)ignored"
-        defer { try? service.worktreeRemove(path: worktreePath, branch: branch) }
+        defer { _ = try? service.worktreeRemove(path: worktreePath, branch: branch) }
         try service.worktreeAdd(path: worktreePath, branch: branch, startPoint: baseOID)
 
         let worktreeURL = URL(fileURLWithPath: worktreePath, isDirectory: true)
@@ -579,7 +635,7 @@ final class GitServiceTests: XCTestCase {
         let worktreePath = FileManager.default.temporaryDirectory
             .appendingPathComponent("kaisola-wt-\(UUID().uuidString.prefix(6))").path
         let branch = "\(GitService.meshBranchPrefix)committed"
-        defer { try? service.worktreeRemove(path: worktreePath, branch: branch) }
+        defer { _ = try? service.worktreeRemove(path: worktreePath, branch: branch) }
         try service.worktreeAdd(path: worktreePath, branch: branch, startPoint: baseOID)
 
         let worktreeURL = URL(fileURLWithPath: worktreePath, isDirectory: true)

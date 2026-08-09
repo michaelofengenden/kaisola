@@ -146,6 +146,14 @@ final class MeshSession: ObservableObject, Identifiable {
     private var provisioningColumns: [NativeRestorableMeshColumnDescriptor] = []
     private var retiredColumnIDs: Set<String> = []
 
+    private struct WorktreeCleanupTarget: Sendable {
+        let id: String
+        let agentName: String
+        let path: String
+        let branch: String
+        let createdBaseOID: String
+    }
+
     /// Transaction-boundary persistence is mandatory before any Git mutation.
     /// A missing or failed writer is treated as a safety failure, never as a
     /// successful save.
@@ -530,6 +538,11 @@ final class MeshSession: ObservableObject, Identifiable {
         // surface; success completes the tombstone through the caller's
         // pendingDeletion cleanup path.
         if lifecycle == .pendingDeletion {
+            // The constructor has no live columns yet. Seed the exact persisted
+            // cleanup manifest so destruction can resume a registered
+            // worktree or a branch-only partial transaction without launching
+            // an adapter or recreating a directory.
+            provisioningColumns = states.map(\.descriptor)
             _ = await destroy(allowRecoverableWork: true)
             onDescriptorChanged?()
             return
@@ -670,7 +683,9 @@ final class MeshSession: ObservableObject, Identifiable {
         for column in columns {
             _ = await column.conversation.stop()
         }
-        lifecycle = provisioningColumns.isEmpty ? .suspended : .recoveryRequired
+        if lifecycle != .pendingDeletion {
+            lifecycle = provisioningColumns.isEmpty ? .suspended : .recoveryRequired
+        }
         onDescriptorChanged?()
         await persistBestEffort()
     }
@@ -704,37 +719,48 @@ final class MeshSession: ObservableObject, Identifiable {
     /// Inventory uncommitted files AND unique commits. Any probe failure blocks
     /// deletion; uncertainty must never be treated as a clean worktree.
     func discardAssessment() async -> DiscardAssessment {
-        let editing = columns.filter { $0.worktreePath != nil || $0.branch != nil }
         let pendingEditing = provisioningColumns.filter { $0.workspaceKind == .worktree }
-        guard pendingEditing.isEmpty else {
+        guard pendingEditing.isEmpty || lifecycle == .pendingDeletion else {
             return .blocked("Mesh is still provisioning or needs recovery; its worktrees were preserved.")
+        }
+        let targets: [WorktreeCleanupTarget]
+        do {
+            targets = try worktreeCleanupTargets(includeProvisioning: lifecycle == .pendingDeletion)
+        } catch {
+            return .blocked(error.localizedDescription)
         }
         var atRisk = 0
         let baseDirectory = baseDirectory
-        for column in editing {
-            guard let path = column.worktreePath,
-                  let branch = column.branch,
-                  let baseOID = column.createdBaseOID,
-                  isOwnedWorktreePath(path, agentID: column.agent.id) else {
-                return .blocked("A Mesh worktree manifest is incomplete; nothing was deleted.")
-            }
-            let result = await Task.detached(priority: .userInitiated) { () -> Result<GitService.MeshDiscardInventory, Error> in
+        for target in targets {
+            let result = await Task.detached(priority: .userInitiated) { () -> Result<GitService.MeshDiscardInventory?, Error> in
                 do {
                     let baseService = GitService(repoRoot: baseDirectory)
-                    guard try baseService.isRegisteredWorktree(path: path, branch: branch) else {
-                        throw GitService.GitError.commandFailed("The Mesh worktree is no longer registered.")
+                    switch try baseService.worktreeRemovalPhase(path: target.path, branch: target.branch) {
+                    case .registered:
+                        let worktreeService = GitService(
+                            repoRoot: URL(fileURLWithPath: target.path, isDirectory: true)
+                        )
+                        return .success(
+                            try worktreeService.meshDiscardInventory(
+                                createdBaseOID: target.createdBaseOID
+                            )
+                        )
+                    case .branchCleanupPending, .complete:
+                        // The destructive worktree step already completed.
+                        // There is no directory left to inventory or confirm.
+                        return .success(nil)
                     }
-                    let worktreeService = GitService(repoRoot: URL(fileURLWithPath: path, isDirectory: true))
-                    return .success(try worktreeService.meshDiscardInventory(createdBaseOID: baseOID))
                 } catch {
                     return .failure(error)
                 }
             }.value
             switch result {
-            case let .success(inventory):
+            case let .success(inventory?):
                 if inventory.hasRecoverableWork { atRisk += 1 }
+            case .success(nil):
+                break
             case let .failure(error):
-                return .blocked("Could not verify \(column.agent.name)'s worktree: \(error.localizedDescription)")
+                return .blocked("Could not verify \(target.agentName)'s worktree: \(error.localizedDescription)")
             }
         }
         return atRisk == 0 ? .safe : .recoverableWork(columns: atRisk)
@@ -761,31 +787,40 @@ final class MeshSession: ObservableObject, Identifiable {
         }
 
         let service = GitService(repoRoot: baseDirectory)
-        let editingColumns = columns.filter { $0.worktreePath != nil || $0.branch != nil }
-        for column in editingColumns {
-            guard let path = column.worktreePath, let branch = column.branch else {
-                lifecycle = .recoveryRequired
-                await persistBestEffort()
-                return .blocked("A Mesh cleanup manifest is incomplete; nothing else was deleted.")
-            }
+        let cleanupTargets: [WorktreeCleanupTarget]
+        do {
+            cleanupTargets = try worktreeCleanupTargets(includeProvisioning: true)
+        } catch {
+            lifecycle = .pendingDeletion
+            isolationNote = error.localizedDescription
+            await persistBestEffort()
+            return .blocked(error.localizedDescription)
+        }
+        for target in cleanupTargets {
             do {
-                try await Task.detached(priority: .utility) {
-                    try service.worktreeRemove(path: path, branch: branch)
+                _ = try await Task.detached(priority: .utility) {
+                    try service.worktreeRemove(path: target.path, branch: target.branch)
                 }.value
                 // Persist each successful cleanup before attempting the next.
                 // A later Git failure therefore leaves only the genuinely
                 // remaining pair in the retryable manifest.
-                columns.removeAll { $0.id == column.id }
-                retiredColumnIDs.insert(column.id)
-                usageCenter.remove(chatID: column.id)
+                columns.removeAll { $0.id == target.id }
+                provisioningColumns.removeAll { $0.id == target.id }
+                retiredColumnIDs.insert(target.id)
+                usageCenter.remove(chatID: target.id)
                 onDescriptorChanged?()
                 guard await persistBoundary("Cleanup paused because the updated recovery manifest could not be saved.") else {
                     return .blocked(isolationNote ?? "Cleanup paused because the recovery manifest could not be saved.")
                 }
             } catch {
-                lifecycle = .recoveryRequired
+                // Deletion intent was persisted before the first Git mutation.
+                // Keep that lifecycle plus the exact path/branch manifest so a
+                // relaunch can derive branchCleanupPending and resume safely.
+                lifecycle = .pendingDeletion
+                isolationNote = "Mesh cleanup stopped: \(error.localizedDescription)"
+                onDescriptorChanged?()
                 await persistBestEffort()
-                return .blocked("Mesh cleanup stopped: \(error.localizedDescription)")
+                return .blocked(isolationNote ?? "Mesh cleanup stopped.")
             }
         }
         isDestroyed = true
@@ -802,6 +837,49 @@ final class MeshSession: ObservableObject, Identifiable {
             return .blocked(isolationNote ?? "Mesh cleanup completed, but its final tombstone could not be saved.")
         }
         return .safe
+    }
+
+    private func worktreeCleanupTargets(
+        includeProvisioning: Bool
+    ) throws -> [WorktreeCleanupTarget] {
+        var targets: [WorktreeCleanupTarget] = []
+        for column in columns where column.worktreePath != nil || column.branch != nil {
+            guard let path = column.worktreePath,
+                  let branch = column.branch,
+                  let createdBaseOID = column.createdBaseOID,
+                  isOwnedWorktreePath(path, agentID: column.agent.id) else {
+                throw GitService.GitError.commandFailed(
+                    "A Mesh worktree manifest is incomplete; nothing else was deleted."
+                )
+            }
+            targets.append(WorktreeCleanupTarget(
+                id: column.id,
+                agentName: column.agent.name,
+                path: path,
+                branch: branch,
+                createdBaseOID: createdBaseOID
+            ))
+        }
+        if includeProvisioning {
+            for descriptor in provisioningColumns where descriptor.workspaceKind == .worktree {
+                guard let path = descriptor.worktreePath,
+                      let branch = descriptor.branch,
+                      let createdBaseOID = descriptor.createdBaseOID,
+                      isOwnedWorktreePath(path, agentID: descriptor.agentID) else {
+                    throw GitService.GitError.commandFailed(
+                        "A Mesh cleanup manifest is incomplete; nothing else was deleted."
+                    )
+                }
+                targets.append(WorktreeCleanupTarget(
+                    id: descriptor.id,
+                    agentName: AgentRegistry.profile(id: descriptor.agentID)?.name ?? descriptor.agentID,
+                    path: path,
+                    branch: branch,
+                    createdBaseOID: createdBaseOID
+                ))
+            }
+        }
+        return targets
     }
 
     private func makeConversation(

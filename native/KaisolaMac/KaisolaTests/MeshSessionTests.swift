@@ -195,6 +195,117 @@ final class MeshSessionTests: XCTestCase {
     }
 
     @MainActor
+    func testDestroyPersistsAndResumesBranchOnlyCleanupAfterRelaunch() async throws {
+        let meshID = "mesh-partial-cleanup"
+        let agent = try XCTUnwrap(AgentRegistry.profile(id: "codex"))
+        let columnID = "\(meshID)-\(agent.id)"
+        let worktreeURL = worktreeRoot.appendingPathComponent(columnID, isDirectory: true)
+        let branch = "\(GitService.meshBranchPrefix)\(meshID.suffix(6))-\(agent.id)"
+        let branchLock = repo.appendingPathComponent(".git/refs/heads/\(branch).lock")
+        let service = GitService(repoRoot: repo)
+        let baseOID = try service.headOID()
+        defer {
+            try? FileManager.default.removeItem(at: branchLock)
+            try? FileManager.default.removeItem(at: worktreeURL)
+            if (try? service.branchExists(branch)) == true {
+                _ = try? git(["branch", "-D", branch])
+            }
+        }
+
+        try service.worktreeAdd(path: worktreeURL.path, branch: branch, startPoint: baseOID)
+        let columnDescriptor = NativeRestorableMeshColumnDescriptor(
+            id: columnID,
+            agentID: agent.id,
+            role: .peer,
+            worktreePath: worktreeURL.path,
+            branch: branch,
+            createdBaseOID: baseOID,
+            acpSessionID: nil,
+            accountBinding: SessionAccountBinding(
+                accountID: "codex-test",
+                provider: .codex,
+                label: "Test",
+                configDirectory: "/tmp/kaisola-codex-test"
+            ),
+            provisioning: .attached,
+            workspaceKind: .worktree
+        )
+        let mesh = MeshSession(
+            id: meshID,
+            baseDirectory: repo,
+            lifecycle: .suspended,
+            worktreeRoot: worktreeRoot
+        )
+        mesh.persistDescriptor = {}
+        var environment = ProcessInfo.processInfo.environment
+        environment["KAISOLA_ACP_ADAPTER_OVERRIDE"] = "/usr/bin/true"
+        await mesh.restore(
+            states: [
+                MeshSession.RestoredColumnState(
+                    descriptor: columnDescriptor,
+                    rows: [],
+                    initialDraft: nil,
+                    usage: nil
+                ),
+            ],
+            agents: [agent],
+            environment: environment
+        )
+        XCTAssertEqual(mesh.columns.count, 1)
+
+        try "hold branch deletion\n".write(to: branchLock, atomically: true, encoding: .utf8)
+        guard case .blocked = await mesh.destroy(allowRecoverableWork: true) else {
+            return XCTFail("branch deletion failure must leave a retryable cleanup manifest")
+        }
+        XCTAssertFalse(FileManager.default.fileExists(atPath: worktreeURL.path))
+        XCTAssertTrue(try service.branchExists(branch))
+        XCTAssertEqual(mesh.lifecycle, .pendingDeletion)
+        XCTAssertEqual(
+            try service.worktreeRemovalPhase(path: worktreeURL.path, branch: branch),
+            .branchCleanupPending
+        )
+
+        // Round-trip the exact partial manifest to prove relaunch recovery does
+        // not depend on the old in-memory MeshSession.
+        let encoded = try JSONEncoder().encode(mesh.restorationDescriptor)
+        let persisted = try JSONDecoder().decode(NativeRestorableMeshDescriptor.self, from: encoded)
+        XCTAssertEqual(persisted.lifecycle, .pendingDeletion)
+        XCTAssertEqual(persisted.columns.map(\.id), [columnID])
+
+        try FileManager.default.removeItem(at: branchLock)
+        try FileManager.default.createDirectory(at: worktreeURL, withIntermediateDirectories: true)
+        let sentinel = worktreeURL.appendingPathComponent("replacement-must-survive.txt")
+        try "keep\n".write(to: sentinel, atomically: true, encoding: .utf8)
+
+        let resumed = MeshSession(
+            id: persisted.id,
+            baseDirectory: repo,
+            mode: persisted.mode,
+            purpose: persisted.purpose,
+            title: persisted.title,
+            lifecycle: persisted.lifecycle,
+            worktreeRoot: worktreeRoot
+        )
+        resumed.persistDescriptor = {}
+        await resumed.restore(
+            states: persisted.columns.map {
+                MeshSession.RestoredColumnState(
+                    descriptor: $0,
+                    rows: [],
+                    initialDraft: nil,
+                    usage: nil
+                )
+            },
+            agents: [],
+            environment: environment
+        )
+
+        XCTAssertFalse(try service.branchExists(branch))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: sentinel.path))
+        XCTAssertTrue(resumed.restorationDescriptor.columns.isEmpty)
+    }
+
+    @MainActor
     func testPersistenceFailureCreatesNoWorktreeOrBranch() async throws {
         enum ExpectedFailure: Error { case manifestWrite }
 

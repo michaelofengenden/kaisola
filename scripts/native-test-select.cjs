@@ -23,7 +23,7 @@ const NATIVE_CONTRACT_TESTS = Object.freeze([
 const NATIVE_DIRECTORY_TESTS = Object.freeze([
   ['native/KaisolaMac/Kaisola/Acp/', [
     'AcpClientTests', 'AcpPermissionRulesTests', 'AcpTerminalHostTests',
-    'AcpTranscriptStoreTests', 'AcpToolArtifactsTests',
+    'AcpTranscriptStoreTests', 'AcpToolArtifactsTests', 'CustomAgentStoreTests',
   ]],
   ['native/KaisolaMac/Kaisola/App/', [
     'AppModelProjectContextTests', 'AppModelReconnectTests',
@@ -70,7 +70,7 @@ const NATIVE_DIRECTORY_TESTS = Object.freeze([
 ])
 
 const FILE_PREVIEW_TESTS = Object.freeze([
-  'DataPreviewsTests', 'SyntaxHighlighterTests', 'WorkspaceFilesTests',
+  'DataPreviewsTests', 'PDFPreviewBudgetTests', 'SyntaxHighlighterTests', 'WorkspaceFilesTests',
 ])
 
 const CODE_EDITOR_TESTS = Object.freeze([
@@ -78,6 +78,15 @@ const CODE_EDITOR_TESTS = Object.freeze([
 ])
 
 const NATIVE_FILE_TESTS = Object.freeze(new Map([
+  ['native/KaisolaMac/Kaisola/Acp/AcpAdapterResolver.swift', [
+    'AcpClientTests', 'CustomAgentStoreTests',
+  ]],
+  ['native/KaisolaMac/Kaisola/Acp/AdapterInstallManager.swift', [
+    'AcpClientTests', 'CustomAgentStoreTests',
+  ]],
+  ['native/KaisolaMac/Kaisola/Acp/CustomAdapterContainment.swift', [
+    'AcpClientTests', 'CustomAgentStoreTests',
+  ]],
   ['native/KaisolaMac/Kaisola/Acp/AcpTranscriptStore.swift', [
     'AcpTranscriptStoreTests', 'AppModelProjectContextTests', 'UsageCenterTests',
   ]],
@@ -94,11 +103,18 @@ const NATIVE_FILE_TESTS = Object.freeze(new Map([
   ['native/KaisolaMac/Kaisola/App/NativePreviewPaths.swift', [
     'AcpTranscriptStoreTests', 'NativePreviewSettingsTests',
   ]],
+  ['native/KaisolaMac/Kaisola/Broker/CustomAgentStore.swift', [
+    'AcpClientTests', 'CustomAgentStoreTests',
+  ]],
+  ['native/KaisolaMac/Kaisola/Features/Settings/CustomAgentsSection.swift', [
+    'AcpClientTests', 'CustomAgentStoreTests',
+  ]],
   ['native/KaisolaMac/Kaisola/Features/Onboarding/OnboardingView.swift', [
     'CommandRegistryTests', 'OnboardingStateTests', 'UsageCenterTests',
   ]],
   ['native/KaisolaMac/Kaisola/App/KaisolaMacAppDelegate.swift', [
     'CommandRegistryTests', 'NativePreviewSettingsTests', 'NativeTerminalInteractionTests',
+    'PDFPreviewBudgetTests', 'TerminalReplayFidelityTests',
   ]],
   ['native/KaisolaMac/Kaisola/Features/Palette/CommandPaletteView.swift', [
     'CommandRegistryTests', 'FuzzyMatchTests',
@@ -109,15 +125,20 @@ const NATIVE_FILE_TESTS = Object.freeze(new Map([
   ['native/KaisolaMac/Kaisola/App/AppModel.swift', [
     'AppModelBrokerFallbackTests', 'AppModelProjectContextTests',
     'AppModelReconnectTests', 'AppModelTerminalRetentionTests',
+    'TerminalReplayFidelityTests',
   ]],
   ['native/KaisolaMac/Kaisola/Features/Sessions/NativeTerminalSurface.swift', [
     'NativeTerminalInteractionTests', 'SwiftTermStressTests',
+    'TerminalOptionClickTests',
     'TerminalReplayFidelityTests', 'TerminalScrollPinTests',
     'TerminalScrollbackDepthTests',
   ]],
   ['native/KaisolaMac/Kaisola/Features/Sessions/RootShellView.swift', [
     'AppModelProjectContextTests', 'CommandRegistryTests', 'NativePreviewSettingsTests',
-    'SessionPaneLayoutTests',
+    'SessionPaneLayoutTests', 'TerminalReplayFidelityTests',
+  ]],
+  ['native/KaisolaMac/Kaisola/Features/Sessions/TerminalSurfaceCache.swift', [
+    'TerminalReplayFidelityTests',
   ]],
   ['native/KaisolaMac/Kaisola/Features/Workspace/BrowserCardView.swift', [
     'AppModelProjectContextTests', 'LocalhostDetectorTests',
@@ -127,6 +148,9 @@ const NATIVE_FILE_TESTS = Object.freeze(new Map([
   ]],
   ['native/KaisolaMac/Kaisola/Features/Workspace/FilePreviewContent.swift', FILE_PREVIEW_TESTS],
   ['native/KaisolaMac/Kaisola/Features/Workspace/FilePreviewEditors.swift', FILE_PREVIEW_TESTS],
+  ['native/KaisolaMac/Kaisola/Features/Workspace/PDFPreviewBudget.swift', [
+    'PDFPreviewBudgetTests', 'WorkspaceFilesTests',
+  ]],
   ['native/KaisolaMac/Kaisola/Features/Workspace/FilePreviewRecovery.swift', FILE_PREVIEW_TESTS],
   ['native/KaisolaMac/Kaisola/Features/Workspace/FilePreviewTabs.swift', FILE_PREVIEW_TESTS],
   ['native/KaisolaMac/Kaisola/Features/Workspace/CodeEditorView.swift', CODE_EDITOR_TESTS],

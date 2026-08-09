@@ -59,20 +59,13 @@ struct PDFFilePreview: NSViewRepresentable {
 
     func makeNSView(context: Context) -> PDFView {
         let view = PDFView()
-        view.autoScales = true
-        view.displayMode = .singlePageContinuous
-        view.displayDirection = .vertical
-        view.displaysPageBreaks = true
-        view.pageShadowsEnabled = true
-        view.backgroundColor = .underPageBackgroundColor
-        view.document = document
+        PDFPreviewViewConfiguration.install(document: document, in: view)
         return view
     }
 
     func updateNSView(_ view: PDFView, context: Context) {
         guard view.document !== document else { return }
-        view.document = document
-        view.autoScales = true
+        PDFPreviewViewConfiguration.install(document: document, in: view)
     }
 
     static func dismantleNSView(_ view: PDFView, coordinator: ()) {

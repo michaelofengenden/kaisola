@@ -87,6 +87,10 @@ actor AcpClient {
     /// Sensitive globs the fs bridge refuses to read or write (set by the
     /// conversation from the user's guardrails; defaults applied otherwise).
     private var fsSensitiveGlobs = AcpPermissionRules.defaultSensitiveGlobs
+    /// Built-ins retain the historical full client bridge. A custom adapter's
+    /// reviewed containment grant narrows advertised MCP/fs/terminal services
+    /// and is enforced again when a request arrives.
+    private var access = AcpAdapterAccess.unrestricted
     /// Mirrors Electron's MAX_TEXT_FILE_BYTES ACP fs limit.
     static let maxTextFileBytes = 8 * 1024 * 1024
 
@@ -115,7 +119,8 @@ actor AcpClient {
         environment: [String: String],
         cwd: String,
         mcpServers: [JSONValue],
-        resumeSessionID: String? = nil
+        resumeSessionID: String? = nil,
+        access: AcpAdapterAccess = .unrestricted
     ) async throws -> AcpSessionInfo {
         connectionGeneration &+= 1
         decoder = BrokerLineFrameDecoder(maximumFrameBytes: 64 * 1_024 * 1_024)
@@ -124,6 +129,7 @@ actor AcpClient {
         toolCallReviewContexts.removeAll(keepingCapacity: true)
         toolCallReviewOrder.removeAll(keepingCapacity: true)
         workspaceRoot = (cwd as NSString).standardizingPath
+        self.access = access
         do {
             try await transport.start(command: command, arguments: arguments, environment: environment, cwd: cwd)
             readerTask = Task { await readLoop() }
@@ -131,10 +137,13 @@ actor AcpClient {
             let initResult = try await request("initialize", params: .object([
             "protocolVersion": .integer(Int64(AcpWire.protocolVersion)),
             "clientCapabilities": .object([
-                "fs": .object(["readTextFile": .bool(true), "writeTextFile": .bool(true)]),
-                "terminal": .bool(true),
-                "auth": .object(["terminal": .bool(true)]),
-                "_meta": .object(["terminal-auth": .bool(true)]),
+                "fs": .object([
+                    "readTextFile": .bool(access.workspaceRead),
+                    "writeTextFile": .bool(access.workspaceWrite),
+                ]),
+                "terminal": .bool(access.hostTerminal),
+                "auth": .object(["terminal": .bool(access.hostTerminal)]),
+                "_meta": .object(["terminal-auth": .bool(access.hostTerminal)]),
             ]),
         ]))
         // ACP requires the client to disconnect when the negotiated protocol is
@@ -431,9 +440,14 @@ actor AcpClient {
     private func sessionMcpServers(_ servers: [JSONValue]) -> [JSONValue] {
         servers.filter { entry in
             switch entry.objectValue?["type"]?.stringValue {
-            case "http": capabilities.mcpHTTP
-            case "sse": capabilities.mcpSSE
-            default: true
+            case "http": access.network && capabilities.mcpHTTP
+            case "sse": access.network && capabilities.mcpSSE
+            case nil: access.childProcess
+            default:
+                // Preserve the historical pass-through for built-ins, but a
+                // contained adapter must never gain an unclassified transport
+                // through the broader child-process grant.
+                access == .unrestricted
             }
         }
     }
@@ -581,6 +595,14 @@ actor AcpClient {
 
     private func handleTerminalMethod(_ method: String, id: JSONValue?, params: JSONValue?) {
         guard let id else { return }
+        guard access.hostTerminal else {
+            respondError(
+                id: id,
+                code: -32000,
+                message: "Blocked by custom adapter containment: host terminals are unavailable; use a reviewed in-sandbox child-process grant instead."
+            )
+            return
+        }
         let object = params?.objectValue ?? [:]
         Task {
             do {
@@ -978,6 +1000,14 @@ actor AcpClient {
 
     private func handleReadTextFile(id: JSONValue?, params: JSONValue?) {
         guard let id else { return }
+        guard access.workspaceRead else {
+            respondError(
+                id: id,
+                code: -32000,
+                message: "Blocked by custom adapter containment: workspace read was not approved."
+            )
+            return
+        }
         do {
             let path = try workspacePath(params?.objectValue?["path"]?.stringValue, mustExist: true)
             guard !AcpPermissionRules.pathIsSensitive(globs: fsSensitiveGlobs, pathish: path) else {
@@ -996,6 +1026,14 @@ actor AcpClient {
 
     private func handleWriteTextFile(id: JSONValue?, params: JSONValue?) {
         guard let id else { return }
+        guard access.workspaceWrite else {
+            respondError(
+                id: id,
+                code: -32000,
+                message: "Blocked by custom adapter containment: workspace write was not approved."
+            )
+            return
+        }
         do {
             let content = params?.objectValue?["content"]?.stringValue ?? ""
             guard content.utf8.count <= Self.maxTextFileBytes else {

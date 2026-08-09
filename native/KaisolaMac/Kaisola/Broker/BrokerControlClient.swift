@@ -41,6 +41,16 @@ struct TerminalRecoveredScrollback: Equatable, Sendable {
     let truncated: Bool
 }
 
+/// A terminal release is complete both when a broker acknowledges the
+/// idempotent request and when validated generation routing proves there is no
+/// broker left that could still own it. Transport/identity errors throw and
+/// remain retryable instead of being confused with either safe outcome.
+enum BrokerTerminalReleaseDisposition: Equatable, Sendable {
+    case released
+    case terminalAbsent
+    case generationAbsent
+}
+
 protocol BrokerControlServing: Sendable {
     var connectionInstanceID: String { get }
     func setDisconnectHandler(_ handler: (@Sendable (any Error) -> Void)?) async
@@ -61,6 +71,11 @@ protocol BrokerControlServing: Sendable {
     func resize(projectID: String, terminalID: String, columns: Int, rows: Int) async throws
     func kill(projectID: String, terminalID: String) async throws
     func release(projectID: String, terminalID: String) async throws
+    func release(
+        projectID: String,
+        terminalID: String,
+        brokerGenerationID: String?
+    ) async throws -> BrokerTerminalReleaseDisposition
     func detachOwner(projectID: String, terminalID: String) async throws
     func setAgentTurn(projectID: String, terminalID: String, busy: Bool) async throws
     func setControlLease(projectID: String, terminalID: String, active: Bool) async throws
@@ -104,6 +119,17 @@ extension BrokerControlServing {
     /// disconnect so AppModel can stop accepting writes and reattach ownership.
     func setDisconnectHandler(_ handler: (@Sendable (any Error) -> Void)?) async {}
     func detachGenerations(_ generationIDs: Set<String>) async {}
+
+    /// Single-generation clients and focused doubles need no routing metadata:
+    /// their ordinary idempotent release is an acknowledgement.
+    func release(
+        projectID: String,
+        terminalID: String,
+        brokerGenerationID: String?
+    ) async throws -> BrokerTerminalReleaseDisposition {
+        try await release(projectID: projectID, terminalID: terminalID)
+        return .released
+    }
 }
 
 /// A second, write-capable connection to the same broker the observer client

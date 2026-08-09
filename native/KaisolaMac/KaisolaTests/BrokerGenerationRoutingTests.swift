@@ -116,6 +116,71 @@ final class BrokerGenerationRoutingTests: XCTestCase {
         )
     }
 
+    func testReleaseClassifiesAbsentTerminalAndRetiredGenerationWithoutGuessingARoute() async throws {
+        let topology = makeTopology()
+        let connectionID = "22222222-2222-4222-8222-222222222222"
+        let current = RoutingControlClient(connectionInstanceID: connectionID)
+        let draining = RoutingControlClient(connectionInstanceID: connectionID)
+        let queue = ControlClientQueue([current, draining])
+        let routes = BrokerGenerationRouteTable()
+        let control = BrokerGenerationControlRouter(
+            routes: routes,
+            connectionInstanceID: connectionID,
+            factory: { _ in queue.next() }
+        )
+        try await control.connect(to: topology, ownerID: "owner")
+
+        do {
+            _ = try await control.release(
+                projectID: "project",
+                terminalID: "not-yet-classified",
+                brokerGenerationID: nil
+            )
+            XCTFail("An empty route map is not absence until inventory validates it")
+        } catch {
+            XCTAssertEqual(
+                error as? BrokerClientError,
+                .requestFailed("terminal generation unavailable")
+            )
+        }
+        try await routes.replaceTerminalOwners(["moved-terminal": topology.current.id])
+        do {
+            _ = try await control.release(
+                projectID: "project",
+                terminalID: "moved-terminal",
+                brokerGenerationID: topology.draining[0].id
+            )
+            XCTFail("Persisted generation evidence must not override current inventory")
+        } catch {
+            XCTAssertEqual(error as? BrokerClientError, .identityChanged)
+        }
+        try await routes.replaceTerminalOwners([:])
+
+        let legacyAbsent = try await control.release(
+            projectID: "project",
+            terminalID: "legacy-absent",
+            brokerGenerationID: nil
+        )
+        let retiredGeneration = try await control.release(
+            projectID: "project",
+            terminalID: "retired-terminal",
+            brokerGenerationID: String(repeating: "f", count: 64)
+        )
+        let activeButAbsent = try await control.release(
+            projectID: "project",
+            terminalID: "active-absent",
+            brokerGenerationID: topology.current.id
+        )
+
+        XCTAssertEqual(legacyAbsent, .terminalAbsent)
+        XCTAssertEqual(retiredGeneration, .generationAbsent)
+        XCTAssertEqual(activeButAbsent, .released)
+        let currentCalls = await current.calls()
+        let drainingCalls = await draining.calls()
+        XCTAssertEqual(currentCalls, ["release:active-absent"])
+        XCTAssertEqual(drainingCalls, [])
+    }
+
     func testDuplicateTerminalIdentityAcrossGenerationsFailsClosed() async throws {
         let topology = makeTopology()
         let duplicate = terminal("duplicate")

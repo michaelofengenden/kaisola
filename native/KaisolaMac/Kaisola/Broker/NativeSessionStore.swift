@@ -151,6 +151,17 @@ struct NativeSessionStore: Sendable {
     struct PendingRelease: Codable, Equatable, Sendable {
         let id: String
         let projectID: String
+        /// Exact broker generation that owned the terminal when close was
+        /// committed. Nil keeps archives written before generation routing
+        /// readable; a validated inventory can still classify those entries
+        /// by terminal identity.
+        let brokerGenerationID: String?
+
+        init(id: String, projectID: String, brokerGenerationID: String? = nil) {
+            self.id = id
+            self.projectID = projectID
+            self.brokerGenerationID = brokerGenerationID
+        }
     }
 
     /// What one look at the durable archive established. Absence is its own
@@ -244,6 +255,12 @@ struct NativeSessionStore: Sendable {
     /// its contents; a legitimate archive is normally orders of magnitude
     /// smaller, while this ceiling leaves ample room for legacy installations.
     static let maximumArchiveBytes: Int64 = 8 * 1_024 * 1_024
+
+    /// Retry records are only broker cleanup metadata: permanent tombstones
+    /// remain the closed-state authority even if a months-long outage exceeds
+    /// this queue. Keeping the newest 256 identities bounds both the archive
+    /// and every reconnect drain without weakening closed-stays-closed.
+    static let maximumPendingReleases = 256
 
     /// Undo-stack depth (⌘⌥T / ⌘⇧T). A pure UI convenience: the permanent
     /// closed-state markers (`closedTerminals`, `closedProjectIDs`) are what
@@ -624,7 +641,11 @@ struct NativeSessionStore: Sendable {
     /// the permanent tombstone, pushes the undo entry, and queues the broker
     /// release — one payload write, synchronous, so a quit in the same
     /// runloop turn already persists the truth.
-    func commitCloseTerminal(_ id: String, recordUndo: Bool = true) {
+    func commitCloseTerminal(
+        _ id: String,
+        recordUndo: Bool = true,
+        brokerGenerationID: String? = nil
+    ) {
         var payload = read() ?? Payload(ownerID: ownerID(), sessions: [])
         let record = payload.sessions.first { $0.id == id }
         payload.sessions.removeAll { $0.id == id }
@@ -648,10 +669,15 @@ struct NativeSessionStore: Sendable {
         // undo entry (reopen-replacement closes skip the undo, not the reap).
         if let record {
             var releases = payload.pendingReleases ?? []
-            if !releases.contains(where: { $0.id == id }) {
-                releases.append(PendingRelease(id: id, projectID: record.projectID))
-            }
-            payload.pendingReleases = releases
+            // Stable terminal identity is the coalescing key. A later close
+            // carries better generation evidence than an older/legacy entry.
+            releases.removeAll { $0.id == id }
+            releases.append(PendingRelease(
+                id: id,
+                projectID: record.projectID,
+                brokerGenerationID: brokerGenerationID
+            ))
+            payload.pendingReleases = Self.normalizedPendingReleases(releases)
         }
         write(payload)
     }
@@ -661,7 +687,7 @@ struct NativeSessionStore: Sendable {
     }
 
     func pendingReleaseList() -> [PendingRelease] {
-        read()?.pendingReleases ?? []
+        Self.normalizedPendingReleases(read()?.pendingReleases ?? [])
     }
 
     /// Release acknowledged. The TOMBSTONE stays: this store cannot see the
@@ -790,9 +816,40 @@ struct NativeSessionStore: Sendable {
         guard var payload = try? Self.decoder.decode(Payload.self, from: data) else {
             return quarantine(.corrupt, bytes: data)
         }
+        let storedReleases = payload.pendingReleases
+        let normalizedReleases = Self.normalizedPendingReleases(storedReleases ?? [])
+        let compactedReleases = storedReleases.map { $0 != normalizedReleases } ?? false
+        if storedReleases != nil { payload.pendingReleases = normalizedReleases }
         payload = quarantineDuplicateProjectIdentities(in: payload, archiveBytes: data)
-        PayloadCache.shared.store(payload, for: fileURL)
+        if compactedReleases,
+           SessionStoreProjectIdentityQuarantineMonitor.shared.quarantine(for: fileURL) == nil {
+            // Compact legacy duplicates/overflow durably on the first clean
+            // read. A project-identity quarantine keeps its original archive
+            // untouched; its recovery copy must remain the truth surface.
+            write(payload)
+        } else {
+            PayloadCache.shared.store(payload, for: fileURL)
+        }
         return .loaded(payload)
+    }
+
+    /// Last occurrence wins because it carries the newest project/generation
+    /// evidence. Iterating backward preserves the relative order of those last
+    /// occurrences, then retaining the suffix gives deterministic newest-first
+    /// overflow behavior without ever dropping the permanent tombstones.
+    private static func normalizedPendingReleases(
+        _ releases: [PendingRelease]
+    ) -> [PendingRelease] {
+        var seen: Set<String> = []
+        var newestUnique: [PendingRelease] = []
+        newestUnique.reserveCapacity(min(releases.count, maximumPendingReleases))
+        for release in releases.reversed()
+            where !release.id.isEmpty && !release.projectID.isEmpty {
+            guard seen.insert(release.id).inserted else { continue }
+            newestUnique.append(release)
+        }
+        let canonical = newestUnique.reversed()
+        return Array(canonical.suffix(maximumPendingReleases))
     }
 
     /// Treat every record for a repeated identity as ambiguous. First- or

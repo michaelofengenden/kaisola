@@ -4019,6 +4019,8 @@ final class AppModel: ObservableObject {
     /// It is reachable only through the explicit app launch environment used
     /// by `.github/workflows/native-visual.yml`; normal app launches never call
     /// it and still derive every session from the real broker.
+    static let visualFixtureBrokerGenerationID = "visual-fixture-generation"
+
     func loadVisualFixture(workspace: URL, includeSplit: Bool = false) {
         usesVisualFixtureTransport = true
         let root = workspace.standardizedFileURL
@@ -4076,6 +4078,7 @@ final class AppModel: ObservableObject {
                 streamEpoch: "visual-shell",
                 endOffset: 0,
                 diskBytes: visualSurface == "terminal-transcript" ? 2 * 1_024 * 1_024 * 1_024 : 0,
+                brokerGenerationID: Self.visualFixtureBrokerGenerationID,
                 agentActivity: .idle
             ),
             BrokerTerminalRecord(
@@ -4085,6 +4088,7 @@ final class AppModel: ObservableObject {
                 exited: false,
                 streamEpoch: "visual-codex",
                 endOffset: 0,
+                brokerGenerationID: Self.visualFixtureBrokerGenerationID,
                 agentActivity: .working
             ),
         ]
@@ -5493,7 +5497,12 @@ final class AppModel: ObservableObject {
     func commitClose(_ terminalID: String, recordUndo: Bool = true) {
         terminalDraftDebounceTasks.removeValue(forKey: terminalID)?.cancel()
         persistTerminalDraftNow(terminalID)
-        sessionStore.commitCloseTerminal(terminalID, recordUndo: recordUndo)
+        let brokerGenerationID = sessions.first { $0.id == terminalID }?.brokerGenerationID
+        sessionStore.commitCloseTerminal(
+            terminalID,
+            recordUndo: recordUndo,
+            brokerGenerationID: brokerGenerationID
+        )
         refreshPersistedNavigationState(publish: false)
         dormantTerminalIDs.remove(terminalID)
         terminalResizeTasks.removeValue(forKey: terminalID)?.cancel()
@@ -5570,9 +5579,14 @@ final class AppModel: ObservableObject {
                 // (network blip, generation rollover) keeps the entry queued
                 // for the next drain; acking on failure was how a closed
                 // terminal's still-alive PTY could be re-adopted later.
-                try await controlClient.release(
+                // Every returned disposition is terminal: either the broker
+                // acknowledged the idempotent release, the terminal is absent
+                // from every validated inventory, or its captured generation
+                // has retired. Only a thrown transport/identity error retries.
+                _ = try await controlClient.release(
                     projectID: pending.projectID,
-                    terminalID: pending.id
+                    terminalID: pending.id,
+                    brokerGenerationID: pending.brokerGenerationID
                 )
                 sessionStore.acknowledgeRelease(id: pending.id)
             } catch {

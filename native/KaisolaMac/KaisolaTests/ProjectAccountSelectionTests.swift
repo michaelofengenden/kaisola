@@ -20,6 +20,16 @@ final class ProjectAccountSelectionTests: XCTestCase {
 
     private var profiles: [UsageAccountProfile] { [work, personal, codex] }
 
+    func testNewAccountProviderPickerNamesItsPurposeAndEverySegment() {
+        XCTAssertEqual(NewAccountProviderAccessibility.label, "New account provider")
+        XCTAssertEqual(
+            UsageAccountProfile.Provider.allCases.map(NewAccountProviderAccessibility.value),
+            ["Claude", "Codex"]
+        )
+        XCTAssertEqual(NewAccountProviderAccessibility.value(.claude), "Claude")
+        XCTAssertEqual(NewAccountProviderAccessibility.value(.codex), "Codex")
+    }
+
     // MARK: - Healthy assignments
 
     func testBlankOverrideIsAppDefault() {

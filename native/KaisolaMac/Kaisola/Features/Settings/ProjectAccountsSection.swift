@@ -127,6 +127,18 @@ enum ProjectAccountSelection: Equatable {
     }
 }
 
+/// The spoken contract for the provider control in the add-account form.
+///
+/// The segmented picker hides its visual label to preserve the compact row, so
+/// it must name both what it changes and the value that is currently selected.
+enum NewAccountProviderAccessibility {
+    static let label = "New account provider"
+
+    static func value(_ provider: UsageAccountProfile.Provider) -> String {
+        provider.displayName
+    }
+}
+
 /// Settings ▸ Accounts section that pins a per-project Claude/Codex account on top
 /// of the app-wide one. Overrides are project-scoped, so a nil `projectID` (no
 /// active project) has nowhere to store them — the section shows a hint instead
@@ -329,7 +341,7 @@ struct ProjectAccountsSection: View {
     private var addAccountRow: some View {
         VStack(alignment: .leading, spacing: 10) {
             HStack(spacing: 10) {
-                Picker("", selection: $newProvider) {
+                Picker(NewAccountProviderAccessibility.label, selection: $newProvider) {
                     ForEach(UsageAccountProfile.Provider.allCases) { provider in
                         Text(provider.displayName).tag(provider)
                     }
@@ -337,6 +349,8 @@ struct ProjectAccountsSection: View {
                 .pickerStyle(.segmented)
                 .labelsHidden()
                 .fixedSize()
+                .accessibilityLabel(Text(NewAccountProviderAccessibility.label))
+                .accessibilityValue(Text(NewAccountProviderAccessibility.value(newProvider)))
                 .onChange(of: newProvider) { _, _ in accountError = nil }
 
                 TextField("Label", text: $newLabel, prompt: Text("Work, Personal, Research…"))

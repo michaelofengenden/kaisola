@@ -36,6 +36,10 @@
     {
       "id": "broker-free-terminal-64mib",
       "description": "One Release-build fixture window reconstructing an exact deterministic 64 MiB terminal transcript directly from 64 bounded 1 MiB sealed TerminalScrollback pages, with no broker or helper process. Incremental output is independently capped to a 16 KiB mutable copy-on-write tail. Pin the explicit maximum 100,000-row renderer independently of the product default, require the post-replay exact-byte/page/tail/cursor/renderer receipt, warm for 15 seconds, then capture at least seven samples. The p95 physical-footprint ceiling is 512 MiB."
+    },
+    {
+      "id": "bounded-pdf-preview-v1",
+      "description": "Four separate optimized installed-app launches render deterministic bounded PDFKit fixtures: 96 vector pages, six 896 x 896 high-entropy raster pages, an exact malformed byte stream, and one 14,400 x 14,400-point vector page. Gate first-visible-page latency, exact paging targets, malformed rejection, three seconds of real PDFView scrolling, and per-launch peak process-tree physical footprint. The launch uses isolated non-persistent settings and returns before Sparkle, broker, Companion, workspace, or PTY startup."
     }
   ],
   "countingPolicy": "Measure each app root and its complete descendant process tree, then add the detached broker and control-plane PIDs explicitly. Use the top-level total footprint from one footprint invocation so Electron and native share one metric family and shared regions are handled consistently."

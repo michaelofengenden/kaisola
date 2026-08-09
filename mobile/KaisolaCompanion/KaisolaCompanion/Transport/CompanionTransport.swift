@@ -9,13 +9,44 @@ enum CompanionTransportState: String, Codable, Hashable, Sendable {
     case handshaking
     case live
     case reconnecting
+    case reconnectRequired
 
     var storeState: CompanionConnectionState {
         switch self {
         case .live: .live
         case .reconnecting, .connecting, .handshaking, .discovering: .reconnecting
+        case .reconnectRequired: .stale
         case .idle: .offline
         }
+    }
+}
+
+/// One foreground resume episode gets a finite retry budget. A paired phone
+/// remains recoverable after the budget is spent, but only a new path event,
+/// foreground activation, or explicit user action starts another episode.
+/// This prevents a sleeping/offline Mac from causing an unbounded retry loop.
+struct CompanionReconnectPolicy: Equatable, Sendable {
+    enum Decision: Equatable, Sendable {
+        case retry(afterSeconds: TimeInterval)
+        case requireUserAction
+    }
+
+    static let maximumAutomaticAttempts = 6
+    static let discoveryTimeout: TimeInterval = 8
+    static let linkWaitingTimeout: TimeInterval = 10
+
+    static func decision(forAttempt attempt: Int) -> Decision {
+        guard attempt >= 0, attempt < maximumAutomaticAttempts else {
+            return .requireUserAction
+        }
+        return .retry(afterSeconds: min(pow(2.0, Double(attempt)), 30.0))
+    }
+
+    /// A spent episode stays paused until a lifecycle/path event or an
+    /// explicit reconnect starts a fresh one. Passive Bonjour churn must not
+    /// create an unbounded sequence of one-off attempts behind the paused UI.
+    static func allowsPassiveRouteAdoption(in state: CompanionTransportState) -> Bool {
+        state != .reconnectRequired
     }
 }
 
@@ -140,6 +171,8 @@ final class CompanionTransport: ObservableObject {
         } else if canUseLink {
             preferLink = true
             connectLink(reconnecting: false)
+        } else {
+            armDiscoveryDeadline()
         }
     }
 
@@ -185,7 +218,10 @@ final class CompanionTransport: ObservableObject {
         if connection != nil || linkConnection.isReady { return }
         reconnectWorkItem?.cancel()
         reconnectWorkItem = nil
-        reconnectAttempt = 0
+        if state == .reconnectRequired {
+            reconnectAttempt = 0
+            transition(to: .reconnecting)
+        }
         connectBestAvailable(reconnecting: true)
     }
 
@@ -246,6 +282,7 @@ final class CompanionTransport: ObservableObject {
         }
         discoveredDesktops = desktops
         guard autoConnect, let candidate = preferredDiscoveredDesktop() else { return }
+        guard CompanionReconnectPolicy.allowsPassiveRouteAdoption(in: state) else { return }
         // Never replace a socket while TCP or Noise is still negotiating.
         // Bonjour result identities can churn as interfaces wake, and each
         // update used to cancel the in-flight secure resume before it could
@@ -365,10 +402,15 @@ final class CompanionTransport: ObservableObject {
         connection = nil
         connectionEndpoint = nil
         route = .none
-        transition(to: .reconnecting)
         reconnectWorkItem?.cancel()
-        let delay = min(pow(2.0, Double(reconnectAttempt)), 30.0)
+        reconnectWorkItem = nil
+        let decision = CompanionReconnectPolicy.decision(forAttempt: reconnectAttempt)
+        guard case let .retry(delay) = decision else {
+            transition(to: .reconnectRequired)
+            return
+        }
         reconnectAttempt += 1
+        transition(to: .reconnecting)
         let item = DispatchWorkItem { [weak self] in
             Task { @MainActor [weak self] in
                 guard let self, !self.intentionallyStopped else { return }
@@ -396,9 +438,11 @@ final class CompanionTransport: ObservableObject {
                     self.connect(to: endpoint, reconnecting: true)
                 } else if self.browser != nil {
                     self.transition(to: .discovering)
+                    self.armDiscoveryDeadline()
                 } else {
                     self.startBrowser()
                     self.transition(to: .discovering)
+                    self.armDiscoveryDeadline()
                 }
             }
         }
@@ -448,7 +492,29 @@ final class CompanionTransport: ObservableObject {
             connectLink(reconnecting: reconnecting)
         } else {
             transition(to: .discovering)
+            armDiscoveryDeadline()
         }
+    }
+
+    /// Bonjour can remain healthy while the paired Mac is asleep or offline.
+    /// Treat an empty discovery window as an attempt too; otherwise the phone
+    /// spins forever without ever reaching the actionable paused state.
+    private func armDiscoveryDeadline(
+        after seconds: TimeInterval = CompanionReconnectPolicy.discoveryTimeout
+    ) {
+        connectionDeadlineWorkItem?.cancel()
+        let item = DispatchWorkItem { [weak self] in
+            Task { @MainActor [weak self] in
+                guard let self, !self.intentionallyStopped,
+                      self.state == .discovering,
+                      self.connection == nil,
+                      !self.linkConnection.isActive,
+                      self.preferredDiscoveredDesktop() == nil else { return }
+                self.scheduleReconnect()
+            }
+        }
+        connectionDeadlineWorkItem = item
+        DispatchQueue.main.asyncAfter(deadline: .now() + seconds, execute: item)
     }
 
     private func armAlternateFallback(for direct: NWConnection, after seconds: TimeInterval = 1.8) {
@@ -592,14 +658,14 @@ final class CompanionTransport: ObservableObject {
         case .ready:
             guard state != .live else { return }
             decoder = CompanionLengthFrameDecoder()
-            reconnectAttempt = 0
             transition(to: .handshaking)
             armLinkHandshakeDeadline()
         case .waiting:
-            connectionDeadlineWorkItem?.cancel()
-            connectionDeadlineWorkItem = nil
             decoder = CompanionLengthFrameDecoder()
             if state != .reconnecting { transition(to: .reconnecting) }
+            // Duplicate relay.waiting control frames must not extend the
+            // attempt forever; the first one owns this attempt's deadline.
+            if connectionDeadlineWorkItem == nil { armLinkWaitingDeadline() }
         case let .data(data):
             do {
                 for frame in try decoder.push(data) { try onWireFrame?(frame) }
@@ -628,6 +694,28 @@ final class CompanionTransport: ObservableObject {
                 guard let self, !self.intentionallyStopped,
                       self.route == .kaisolaLink,
                       self.state == .handshaking else { return }
+                self.scheduleReconnect()
+            }
+        }
+        connectionDeadlineWorkItem = item
+        DispatchQueue.main.asyncAfter(deadline: .now() + seconds, execute: item)
+    }
+
+    /// A healthy relay can truthfully report that the paired desktop is
+    /// offline. That is still a failed resume attempt, not an indefinitely
+    /// live transport: count it against the same bounded episode so the UI can
+    /// eventually stop spinning and offer an explicit recovery action.
+    private func armLinkWaitingDeadline(
+        after seconds: TimeInterval = CompanionReconnectPolicy.linkWaitingTimeout
+    ) {
+        connectionDeadlineWorkItem?.cancel()
+        let item = DispatchWorkItem { [weak self] in
+            Task { @MainActor [weak self] in
+                guard let self, !self.intentionallyStopped,
+                      self.route == .kaisolaLink,
+                      self.state == .reconnecting,
+                      self.linkConnection.isActive,
+                      !self.linkConnection.isReady else { return }
                 self.scheduleReconnect()
             }
         }

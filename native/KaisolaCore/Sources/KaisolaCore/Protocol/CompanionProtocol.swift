@@ -27,6 +27,208 @@ public enum CompanionCapability: String, Codable, CaseIterable, Hashable, Sendab
     case terminalControl = "terminal-control"
 }
 
+/// Canonical authority and disclosure contract for Companion protocol v1.
+/// `observe` permits the fixed, sanitized read model (including agent and
+/// terminal observation); the two control grants add commands only and never
+/// widen the projection. This keeps permission to mutate independent from the
+/// amount of data a paired observer can see.
+public enum CompanionCapabilityPolicy {
+    public static let commandCapabilities: [String: CompanionCapability] = [
+        "attention.ack": .observe,
+        "stream.subscribe": .observe,
+        "stream.unsubscribe": .observe,
+        "agent.prompt": .agentControl,
+        "agent.steer": .agentControl,
+        "agent.cancel": .agentControl,
+        "permission.respond": .agentControl,
+        "terminal.acquire-control": .terminalControl,
+        "terminal.renew-control": .terminalControl,
+        "terminal.write": .terminalControl,
+        "terminal.resize": .terminalControl,
+        "terminal.interrupt": .terminalControl,
+        "terminal.release-control": .terminalControl,
+    ]
+
+    public static let snapshotCapabilities: [String: CompanionCapability] = [
+        "snapshot.projects": .observe,
+        "terminal.snapshot": .observe,
+    ]
+
+    public static let eventCapabilities: [String: CompanionCapability] = [
+        "desktop.status": .observe,
+        "project.updated": .observe,
+        "session.updated": .observe,
+        "attention.raised": .observe,
+        "attention.cleared": .observe,
+        "agent.turn.delta": .observe,
+        "agent.turn.completed": .observe,
+        "agent.permission.requested": .observe,
+        "agent.permission.resolved": .observe,
+        "terminal.snapshot": .observe,
+        "terminal.output": .observe,
+        "terminal.exit": .observe,
+        "ledger.task.updated": .observe,
+    ]
+
+    public static let projectionFields: [String: Set<String>] = [
+        "projection": [
+            "projectionKind", "revision", "generatedAt", "freshness",
+            "projects", "sessions", "attention", "permissions", "board",
+        ],
+        "project": ["id", "name", "connection", "lastContactAt", "counts"],
+        "projectCounts": ["running", "waiting", "done", "failed"],
+        "session": [
+            "id", "projectId", "kind", "title", "status", "needsYou", "unread",
+            "updatedAt", "completedAt", "provider", "startedAt",
+            "terminalStreamEpoch", "terminalEndOffset",
+        ],
+        "attention": [
+            "id", "projectId", "sessionId", "kind", "title", "detail", "createdAt", "severity",
+        ],
+        "permission": [
+            "permId", "projectId", "sessionId", "agent", "title", "kind", "requestedAt",
+            "options", "diffs", "revision", "completeness",
+        ],
+        "permissionOption": ["id", "label"],
+        "permissionDiff": ["relativePath", "oldText", "newText"],
+        "board": ["columns"],
+        "boardColumn": ["id", "title", "sourceLabel", "count", "cards"],
+        "boardCard": [
+            "id", "type", "projectId", "title", "status", "needsYou", "updatedAt", "provider",
+        ],
+    ]
+
+    public static func allowsCommand(
+        type: String,
+        claimedCapability: CompanionCapability,
+        grantedCapabilities: Set<CompanionCapability>
+    ) -> Bool {
+        guard let required = commandCapabilities[type],
+              required == claimedCapability else { return false }
+        return grantedCapabilities.contains(required)
+    }
+
+    public static func allowsOutbound(
+        kind: CompanionEnvelopeKind,
+        bodyType: String,
+        grantedCapabilities: Set<CompanionCapability>
+    ) -> Bool {
+        let required: CompanionCapability?
+        switch kind {
+        case .snapshot: required = snapshotCapabilities[bodyType]
+        case .event: required = eventCapabilities[bodyType]
+        case .command: return false
+        case .hello, .receipt, .ack, .error: return true
+        }
+        guard let required else { return false }
+        return grantedCapabilities.contains(required)
+    }
+
+    /// Reconstruct at the transport boundary so future local-only model fields
+    /// remain absent until this policy and its cross-language table explicitly
+    /// opt them in.
+    public static func sanitizedProjection(
+        _ projection: CompanionProjection,
+        grantedCapabilities: Set<CompanionCapability>
+    ) -> CompanionProjection? {
+        guard grantedCapabilities.contains(.observe) else { return nil }
+        return CompanionProjection(
+            projectionKind: projection.projectionKind,
+            revision: projection.revision,
+            generatedAt: projection.generatedAt,
+            freshness: projection.freshness,
+            projects: projection.projects.map { project in
+                CompanionProject(
+                    id: project.id,
+                    name: project.name,
+                    connection: project.connection,
+                    lastContactAt: project.lastContactAt,
+                    counts: project.counts.map {
+                        CompanionProjectCounts(
+                            running: $0.running,
+                            waiting: $0.waiting,
+                            done: $0.done,
+                            failed: $0.failed
+                        )
+                    }
+                )
+            },
+            sessions: projection.sessions.map { session in
+                CompanionSession(
+                    id: session.id,
+                    projectId: session.projectId,
+                    kind: session.kind,
+                    title: session.title,
+                    status: session.status,
+                    needsYou: session.needsYou,
+                    unread: session.unread,
+                    updatedAt: session.updatedAt,
+                    completedAt: session.completedAt,
+                    provider: session.provider,
+                    startedAt: session.startedAt,
+                    terminalStreamEpoch: session.terminalStreamEpoch,
+                    terminalEndOffset: session.terminalEndOffset
+                )
+            },
+            attention: projection.attention.map { item in
+                CompanionAttention(
+                    id: item.id,
+                    projectId: item.projectId,
+                    sessionId: item.sessionId,
+                    kind: item.kind,
+                    title: item.title,
+                    detail: item.detail,
+                    createdAt: item.createdAt,
+                    severity: item.severity
+                )
+            },
+            permissions: projection.permissions.map { permission in
+                CompanionPermission(
+                    permId: permission.permId,
+                    projectId: permission.projectId,
+                    sessionId: permission.sessionId,
+                    agent: permission.agent,
+                    title: permission.title,
+                    kind: permission.kind,
+                    requestedAt: permission.requestedAt,
+                    options: permission.options.map {
+                        CompanionPermissionOption(id: $0.id, label: $0.label)
+                    },
+                    diffs: permission.diffs.map {
+                        CompanionPermissionDiff(
+                            relativePath: $0.relativePath,
+                            oldText: $0.oldText,
+                            newText: $0.newText
+                        )
+                    },
+                    revision: permission.revision,
+                    completeness: permission.completeness
+                )
+            },
+            board: CompanionBoard(columns: projection.board.columns.map { column in
+                CompanionBoardColumn(
+                    id: column.id,
+                    title: column.title,
+                    sourceLabel: column.sourceLabel,
+                    count: column.count,
+                    cards: column.cards.map { card in
+                        CompanionBoardCard(
+                            id: card.id,
+                            type: card.type,
+                            projectId: card.projectId,
+                            title: card.title,
+                            status: card.status,
+                            needsYou: card.needsYou,
+                            updatedAt: card.updatedAt,
+                            provider: card.provider
+                        )
+                    }
+                )
+            })
+        )
+    }
+}
+
 public struct CompanionBody: Codable, Hashable, Sendable {
     public let fields: [String: JSONValue]
 
@@ -235,27 +437,8 @@ public struct CompanionEnvelope: Codable, Hashable, Sendable {
         }
     }
 
-    public static let eventTypes: Set<String> = [
-        "desktop.status", "project.updated", "session.updated", "attention.raised", "attention.cleared",
-        "agent.turn.delta", "agent.turn.completed", "agent.permission.requested", "agent.permission.resolved",
-        "terminal.snapshot", "terminal.output", "terminal.exit", "ledger.task.updated",
-    ]
-
-    public static let commandCapabilities: [String: CompanionCapability] = [
-        "attention.ack": .observe,
-        "stream.subscribe": .observe,
-        "stream.unsubscribe": .observe,
-        "agent.prompt": .agentControl,
-        "agent.steer": .agentControl,
-        "agent.cancel": .agentControl,
-        "permission.respond": .agentControl,
-        "terminal.acquire-control": .terminalControl,
-        "terminal.renew-control": .terminalControl,
-        "terminal.write": .terminalControl,
-        "terminal.resize": .terminalControl,
-        "terminal.interrupt": .terminalControl,
-        "terminal.release-control": .terminalControl,
-    ]
+    public static let eventTypes = Set(CompanionCapabilityPolicy.eventCapabilities.keys)
+    public static let commandCapabilities = CompanionCapabilityPolicy.commandCapabilities
 }
 
 public enum CompanionProtocolCodec {

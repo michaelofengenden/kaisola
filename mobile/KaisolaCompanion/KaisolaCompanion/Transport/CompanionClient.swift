@@ -4,11 +4,13 @@ import Foundation
 
 enum CompanionCommandError: LocalizedError, Equatable {
     case unavailable
+    case capabilityDenied
     case timedOut
 
     var errorDescription: String? {
         switch self {
         case .unavailable: "The Mac disconnected before confirming this action. It was not retried."
+        case .capabilityDenied: "This action is not enabled for this iPhone. Refresh access on the Mac and try again."
         case .timedOut: "The Mac did not confirm this action in time. It was not retried."
         }
     }
@@ -16,16 +18,23 @@ enum CompanionCommandError: LocalizedError, Equatable {
 
 @MainActor
 final class CompanionClient: ObservableObject {
+    struct SessionAuthority: Equatable, Sendable {
+        let accountScope: CompanionAccountScope
+        let generation: UInt64
+    }
+
     @Published private(set) var sas: CompanionSAS?
     @Published private(set) var lastError: String?
     @Published private(set) var pairedDesktop: CompanionPairedDesktop?
+    @Published private(set) var grantedCapabilities: Set<CompanionCapability> = []
 
-    var onEnvelope: ((CompanionEnvelope) -> Void)?
-    var onTransportState: ((CompanionTransportState) -> Void)?
-    var onPairedDesktop: ((CompanionPairedDesktop) -> Void)?
-    var onAckCursor: ((CompanionAckCursor) -> Void)?
-    var onCapabilities: ((Set<CompanionCapability>) -> Void)?
-    var onStreamIssue: ((String, String?) -> Void)?
+    var onEnvelope: ((SessionAuthority, CompanionEnvelope) -> Void)?
+    var onTransportState: ((SessionAuthority?, CompanionTransportState) -> Void)?
+    var onPairedDesktop: ((SessionAuthority, CompanionPairedDesktop) -> Void)?
+    var onAckCursor: ((SessionAuthority, CompanionAckCursor) -> Void)?
+    var onCapabilities: ((SessionAuthority, Set<CompanionCapability>) -> Void)?
+    var onStreamIssue: ((SessionAuthority, String, String?) -> Void)?
+    var onRevoked: ((SessionAuthority, String) -> Void)?
 
     let transport: CompanionTransport
 
@@ -56,18 +65,34 @@ final class CompanionClient: ObservableObject {
     private var activeStreamSubscriptions: Set<StreamSubscription> = []
     private var streamSubscriptionTasks: [StreamSubscription: Task<Void, Never>] = [:]
     private var streamSubscriptionGenerations: [StreamSubscription: Int] = [:]
-    private var pendingCommands: [String: CheckedContinuation<CompanionReceiptBody, Error>] = [:]
+    private struct PendingCommand {
+        let capability: CompanionCapability
+        let continuation: CheckedContinuation<CompanionReceiptBody, Error>
+    }
+    private var pendingCommands: [String: PendingCommand] = [:]
     private var commandTimeouts: [String: Task<Void, Never>] = [:]
+    private var sessionGeneration: UInt64 = 0
+
+    /// Persisted cursors describe replay position, not authority for a newly
+    /// authenticated connection. Once the desktop publishes its live epoch,
+    /// every command (including stream teardown) must use that value.
+    static func outboundCommandEpoch(
+        liveEpoch: String?,
+        persistedCursor: CompanionAckCursor?
+    ) -> String {
+        liveEpoch ?? persistedCursor?.epoch ?? "initial"
+    }
 
     init(transport: CompanionTransport = CompanionTransport()) {
         self.transport = transport
         transport.onWireFrame = { [weak self] data in try self?.receive(data) }
         transport.onStateChange = { [weak self] state in
             guard let self else { return }
-            self.onTransportState?(state)
+            self.onTransportState?(self.currentSessionAuthority, state)
             if state != .live {
                 self.resetActiveStreamSubscriptions()
                 self.failPendingCommands(with: CompanionCommandError.unavailable)
+                self.replaceGrantedCapabilities([])
             }
             if state == .handshaking, case .resume = self.mode {
                 do { try self.startHandshake() } catch { self.fail(error) }
@@ -76,7 +101,7 @@ final class CompanionClient: ObservableObject {
         transport.onError = { [weak self] error in
             guard let self else { return }
             switch self.transport.state {
-            case .discovering, .connecting, .live, .reconnecting:
+            case .discovering, .connecting, .live, .reconnecting, .reconnectRequired:
                 // Direct endpoint and Bonjour failures are recoverable. The
                 // transport keeps racing/retrying them without invalidating the
                 // single-use offer or flashing a terminal error in the UI.
@@ -87,9 +112,16 @@ final class CompanionClient: ObservableObject {
         }
     }
 
-    func beginPairing(payload: CompanionPairingPayload, identity: CompanionIdentity) throws {
+    func beginPairing(
+        payload: CompanionPairingPayload,
+        identity: CompanionIdentity,
+        accountScope: CompanionAccountScope
+    ) throws {
         try payload.validate()
-        guard identity.role == .device else { throw CompanionCryptoError.roleMismatch }
+        guard identity.role == .device,
+              payload.accountScope == accountScope else {
+            throw CompanionCryptoError.identityMismatch
+        }
         self.identity = identity
         pairedDesktop = nil
         ackCursor = nil
@@ -101,9 +133,13 @@ final class CompanionClient: ObservableObject {
     func configureResume(
         desktop: CompanionPairedDesktop,
         identity: CompanionIdentity,
-        cursor: CompanionAckCursor?
+        cursor: CompanionAckCursor?,
+        accountScope: CompanionAccountScope
     ) throws {
-        guard identity.role == .device else { throw CompanionCryptoError.roleMismatch }
+        guard identity.role == .device,
+              desktop.accountScope == accountScope else {
+            throw CompanionCryptoError.identityMismatch
+        }
         self.identity = identity
         pairedDesktop = desktop
         mode = .resume(desktop)
@@ -134,10 +170,13 @@ final class CompanionClient: ObservableObject {
         subscribed: Bool,
         force: Bool = false
     ) throws {
+        guard let authority = currentSessionAuthority else {
+            throw CompanionWireError.connectionUnavailable
+        }
         let subscription = StreamSubscription(projectId: projectId, sessionId: sessionId)
         if subscribed {
             desiredStreamSubscriptions.insert(subscription)
-            onStreamIssue?(sessionId, nil)
+            onStreamIssue?(authority, sessionId, nil)
             guard transport.state == .live else { return }
             if force { invalidateStreamSubscription(subscription) }
             startStreamSubscription(subscription)
@@ -145,18 +184,21 @@ final class CompanionClient: ObservableObject {
             desiredStreamSubscriptions.remove(subscription)
             let wasActive = activeStreamSubscriptions.contains(subscription)
             invalidateStreamSubscription(subscription)
-            onStreamIssue?(sessionId, nil)
+            onStreamIssue?(authority, sessionId, nil)
             // A subscribe that never became active has nothing remote to tear
             // down. Skipping that no-op removes the recurring “already
             // unsubscribed” receipt while keeping real teardown exact.
             guard wasActive else { return }
-            guard transport.state == .live else { return }
+            guard transport.state == .live,
+                  grantedCapabilities.contains(.observe) else { return }
             try sendStreamSubscription(subscription, subscribed: false)
         }
     }
 
     private func startStreamSubscription(_ subscription: StreamSubscription) {
         guard transport.state == .live,
+              let sessionAuthority = currentSessionAuthority,
+              grantedCapabilities.contains(.observe),
               desiredStreamSubscriptions.contains(subscription),
               !activeStreamSubscriptions.contains(subscription),
               streamSubscriptionTasks[subscription] == nil else { return }
@@ -168,6 +210,7 @@ final class CompanionClient: ObservableObject {
             var attempt = 0
             while true {
                 guard !Task.isCancelled,
+                      self.currentSessionAuthority == sessionAuthority,
                       self.transport.state == .live,
                       self.desiredStreamSubscriptions.contains(subscription),
                       self.streamSubscriptionGenerations[subscription] == generation else { return }
@@ -181,9 +224,10 @@ final class CompanionClient: ObservableObject {
                     )
                     if receipt.status == .accepted || receipt.status == .applied {
                         guard self.desiredStreamSubscriptions.contains(subscription),
+                              self.currentSessionAuthority == sessionAuthority,
                               self.streamSubscriptionGenerations[subscription] == generation else { return }
                         self.activeStreamSubscriptions.insert(subscription)
-                        self.onStreamIssue?(subscription.sessionId, nil)
+                        self.onStreamIssue?(sessionAuthority, subscription.sessionId, nil)
                         break
                     }
                     lastMessage = receipt.message ?? lastMessage
@@ -195,12 +239,16 @@ final class CompanionClient: ObservableObject {
                 // relaunch can briefly publish its project before the durable
                 // broker inventory is reattached; three one-shot attempts made
                 // that harmless ordering race look permanent until a manual tap.
-                if attempt >= 3 { self.onStreamIssue?(subscription.sessionId, lastMessage) }
+                guard self.currentSessionAuthority == sessionAuthority else { return }
+                if attempt >= 3 {
+                    self.onStreamIssue?(sessionAuthority, subscription.sessionId, lastMessage)
+                }
                 let delay = min(5_000, 500 * (1 << min(attempt, 3)))
                 do { try await Task.sleep(for: .milliseconds(delay)) }
                 catch { return }
             }
-            guard self.streamSubscriptionGenerations[subscription] == generation else { return }
+            guard self.currentSessionAuthority == sessionAuthority,
+                  self.streamSubscriptionGenerations[subscription] == generation else { return }
             self.streamSubscriptionTasks[subscription] = nil
         }
     }
@@ -238,7 +286,14 @@ final class CompanionClient: ObservableObject {
             desktopId: context.desktopId,
             deviceId: context.deviceId,
             connectionId: context.connectionId,
-            epoch: ackCursor?.epoch ?? "initial",
+            // A desktop relaunch rotates the host epoch while preserving the
+            // paired identity. Unsubscribe must use this connection's learned
+            // epoch just like ordinary commands; the persisted cursor can only
+            // seed replay and must never authenticate a fresh command.
+            epoch: Self.outboundCommandEpoch(
+                liveEpoch: liveEpoch,
+                persistedCursor: ackCursor
+            ),
             seq: outboundSeq,
             id: commandId,
             sentAt: Self.nowMilliseconds,
@@ -257,6 +312,13 @@ final class CompanionClient: ObservableObject {
         timeout: Duration = .seconds(15)
     ) async throws -> CompanionReceiptBody {
         guard transport.state == .live else { throw CompanionCommandError.unavailable }
+        guard CompanionCapabilityPolicy.allowsCommand(
+            type: type,
+            claimedCapability: capability,
+            grantedCapabilities: grantedCapabilities
+        ) else {
+            throw CompanionCommandError.capabilityDenied
+        }
         let commandId = "cmd-\(UUID().uuidString.lowercased())"
         let body = CompanionCommandBody(
             type: type,
@@ -269,7 +331,10 @@ final class CompanionClient: ObservableObject {
         )
         return try await withTaskCancellationHandler {
             try await withCheckedThrowingContinuation { continuation in
-                pendingCommands[commandId] = continuation
+                pendingCommands[commandId] = PendingCommand(
+                    capability: capability,
+                    continuation: continuation
+                )
                 commandTimeouts[commandId] = Task { @MainActor [weak self] in
                     try? await Task.sleep(for: timeout)
                     guard !Task.isCancelled else { return }
@@ -301,7 +366,10 @@ final class CompanionClient: ObservableObject {
             // restart. Commands are only ever sent after the first inbound frame
             // (subscriptions are gated, other commands are user-driven), so
             // liveEpoch is populated in every realistic path.
-            epoch: liveEpoch ?? ackCursor?.epoch ?? "initial",
+            epoch: Self.outboundCommandEpoch(
+                liveEpoch: liveEpoch,
+                persistedCursor: ackCursor
+            ),
             seq: outboundSeq,
             id: body.commandId,
             sentAt: Self.nowMilliseconds,
@@ -325,7 +393,7 @@ final class CompanionClient: ObservableObject {
         )
         try sendSecureFrame(channel.encrypt(CompanionProtocolCodec.encode(envelope)))
         ackCursor = cursor
-        onAckCursor?(cursor)
+        if let authority = currentSessionAuthority { onAckCursor?(authority, cursor) }
     }
 
     private func startHandshake() throws {
@@ -338,6 +406,7 @@ final class CompanionClient: ObservableObject {
         sessionId = nil
         localSASConfirmed = false
         remoteSASConfirmed = false
+        replaceGrantedCapabilities([])
         // Each connection learns its epoch afresh from the first inbound frame.
         liveEpoch = nil
 
@@ -379,12 +448,13 @@ final class CompanionClient: ObservableObject {
                 "connectionId": .string(connectionId),
                 "message1": .string(message1),
             ])
-        case .resume:
+        case let .resume(desktop):
             start = .object([
                 "v": .integer(1),
                 "type": .string("resume.start"),
                 "deviceId": .string(identity.id),
                 "connectionId": .string(connectionId),
+                "accountScope": .string(desktop.accountScope.rawValue),
                 "message1": .string(message1),
             ])
         }
@@ -481,8 +551,10 @@ final class CompanionClient: ObservableObject {
         }
         if type == "paired" {
             guard case let .pairing(payload) = mode,
+                  let payloadAccountScope = payload.accountScope,
                   localSASConfirmed, remoteSASConfirmed,
                   object["deviceId"]?.stringValue == identity?.id,
+                  object["accountScope"]?.stringValue == payloadAccountScope.rawValue,
                   object["transcriptHash"]?.stringValue == result.handshakeHash.base64URLEncodedString() else {
                 throw CompanionCryptoError.authenticationFailed
             }
@@ -506,12 +578,24 @@ final class CompanionClient: ObservableObject {
                 identityPublic: payload.identityPublic,
                 x25519StaticPublic: payload.keyRecord.x25519StaticPublic,
                 capabilities: CompanionCapability.allCases.filter(granted.contains),
-                transportHint: payload.transportHint
+                transportHint: payload.transportHint,
+                accountScope: payloadAccountScope
             )
             pairedDesktop = desktop
             mode = .resume(desktop)
-            onPairedDesktop?(desktop)
+            guard let authority = currentSessionAuthority else {
+                throw CompanionCryptoError.authenticationFailed
+            }
+            onPairedDesktop?(authority, desktop)
             try activateLive()
+            return
+        }
+        if type == "device-revoked" {
+            guard case .resume = mode else { throw CompanionCryptoError.authenticationFailed }
+            handleDeviceRevocation(
+                message: object["message"]?.stringValue
+                    ?? "This iPhone was revoked on the Mac. Pair it again to reconnect."
+            )
             return
         }
         throw CompanionCryptoError.invalidSecurePayload
@@ -555,12 +639,22 @@ final class CompanionClient: ObservableObject {
         guard let channel else { throw CompanionWireError.connectionUnavailable }
         let secure = try JSONDecoder().decode(CompanionSecureFrame.self, from: data)
         let envelope = try CompanionProtocolCodec.decode(channel.decrypt(secure))
+        if envelope.kind == .error {
+            let error = try envelope.body.decode(CompanionErrorBody.self)
+            if error.code == "device_revoked" {
+                handleDeviceRevocation(message: error.message)
+                return
+            }
+        }
         // First inbound frame on this connection tells us the desktop's current
         // epoch. Adopt it for outbound commands and only now fire the deferred
         // stream subscriptions, so they can never carry a stale (rejected) epoch.
-        if liveEpoch == nil {
+        let isFirstApplicationFrame = liveEpoch == nil
+        if isFirstApplicationFrame {
+            guard envelope.kind == .hello else {
+                throw CompanionCryptoError.authenticationFailed
+            }
             liveEpoch = envelope.epoch
-            flushDesiredStreamSubscriptions()
         }
         if envelope.kind == .hello {
             let hello = try envelope.body.decode(CompanionHelloBody.self)
@@ -573,38 +667,101 @@ final class CompanionClient: ObservableObject {
             if let transportHint = hello.transportHint {
                 try transportHint.validate()
             }
-            onCapabilities?(granted)
+            replaceGrantedCapabilities(granted)
             if let current = pairedDesktop {
                 let updated = CompanionPairedDesktop(
                     desktopId: current.desktopId,
                     identityPublic: current.identityPublic,
                     x25519StaticPublic: current.x25519StaticPublic,
                     capabilities: CompanionCapability.allCases.filter(granted.contains),
-                    transportHint: hello.transportHint ?? current.transportHint
+                    transportHint: hello.transportHint ?? current.transportHint,
+                    accountScope: current.accountScope
                 )
                 pairedDesktop = updated
                 mode = .resume(updated)
-                onPairedDesktop?(updated)
+                if let authority = currentSessionAuthority {
+                    onPairedDesktop?(authority, updated)
+                }
             }
+            if isFirstApplicationFrame { flushDesiredStreamSubscriptions() }
         } else if envelope.kind == .receipt {
             let receipt = try envelope.body.decode(CompanionReceiptBody.self)
             finishCommand(receipt.commandId, result: .success(receipt))
         }
-        onEnvelope?(envelope)
+        if let authority = currentSessionAuthority { onEnvelope?(authority, envelope) }
+    }
+
+    func handleDeviceRevocation(message: String) {
+        // The authenticated desktop controls only the terminal-state code,
+        // never UI content. Discard its message so terminal output, paths, or
+        // other accidental payloads cannot survive revocation on the phone.
+        _ = message
+        let safeMessage = "This iPhone was revoked on the Mac. Pair it again to reconnect."
+        guard let authority = currentSessionAuthority else { return }
+        clearSessionAuthority()
+        // The coordinator clears persisted resume authority and seals lifecycle
+        // reconnect intent synchronously before stop publishes an idle state.
+        onRevoked?(authority, safeMessage)
+        transport.stop()
+    }
+
+    /// Account changes are a local authority boundary, not a remote
+    /// revocation. Drop every in-flight command and cryptographic/session bit
+    /// without retaining or presenting peer-controlled content.
+    func resetForAccountTransition() {
+        clearSessionAuthority()
+        transport.stop()
+    }
+
+    private func clearSessionAuthority() {
+        sessionGeneration &+= 1
+        failPendingCommands(with: CompanionCommandError.unavailable)
+        grantedCapabilities.removeAll()
+        desiredStreamSubscriptions.removeAll()
+        resetActiveStreamSubscriptions()
+        ackCursor = nil
+        liveEpoch = nil
+        mode = nil
+        pairedDesktop = nil
+        sas = nil
+        lastError = nil
+        initiator = nil
+        handshakeResult = nil
+        channel = nil
+        connectionContext = nil
+        sessionId = nil
+        localSASConfirmed = false
+        remoteSASConfirmed = false
+        outboundSeq = 0
     }
 
     private func finishCommand(_ commandId: String, result: Result<CompanionReceiptBody, Error>) {
-        guard let continuation = pendingCommands.removeValue(forKey: commandId) else { return }
+        guard let pending = pendingCommands.removeValue(forKey: commandId) else { return }
         commandTimeouts.removeValue(forKey: commandId)?.cancel()
         switch result {
-        case let .success(receipt): continuation.resume(returning: receipt)
-        case let .failure(error): continuation.resume(throwing: error)
+        case let .success(receipt): pending.continuation.resume(returning: receipt)
+        case let .failure(error): pending.continuation.resume(throwing: error)
         }
     }
 
     private func failPendingCommands(with error: Error) {
         for commandId in Array(pendingCommands.keys) {
             finishCommand(commandId, result: .failure(error))
+        }
+    }
+
+    private func replaceGrantedCapabilities(
+        _ capabilities: Set<CompanionCapability>
+    ) {
+        let removed = grantedCapabilities.subtracting(capabilities)
+        grantedCapabilities = capabilities
+        if let authority = currentSessionAuthority {
+            onCapabilities?(authority, capabilities)
+        }
+        guard !removed.isEmpty else { return }
+        for (commandId, pending) in Array(pendingCommands)
+        where removed.contains(pending.capability) {
+            finishCommand(commandId, result: .failure(CompanionCommandError.capabilityDenied))
         }
     }
 
@@ -621,6 +778,20 @@ final class CompanionClient: ObservableObject {
     private var isPairing: Bool {
         if case .pairing = mode { return true }
         return false
+    }
+
+    private var currentAccountScope: CompanionAccountScope? {
+        switch mode {
+        case let .pairing(payload): payload.accountScope
+        case let .resume(desktop): desktop.accountScope
+        case nil: nil
+        }
+    }
+
+    var currentSessionAuthority: SessionAuthority? {
+        currentAccountScope.map {
+            SessionAuthority(accountScope: $0, generation: sessionGeneration)
+        }
     }
 
     private func fail(_ error: Error) {

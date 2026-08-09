@@ -188,6 +188,38 @@ final class CompanionCryptoContractTests: XCTestCase {
         XCTAssertEqual(try createNoisePrologue(context), try decoded(handshake, "prologue"))
     }
 
+    func testAccountScopeIsOpaqueDeterministicCanonicalAndRequiredForNewPairing() throws {
+        let first = try CompanionAccountScope(accountID: "firebase-account-a")
+        let repeated = try CompanionAccountScope(accountID: "firebase-account-a")
+        let second = try CompanionAccountScope(accountID: "firebase-account-b")
+
+        XCTAssertEqual(first, repeated)
+        XCTAssertNotEqual(first, second)
+        XCTAssertEqual(Data(base64URLString: first.rawValue)?.count, 32)
+        XCTAssertFalse(first.rawValue.contains("firebase-account-a"))
+        XCTAssertEqual(
+            try JSONDecoder().decode(
+                CompanionAccountScope.self,
+                from: JSONEncoder().encode(first)
+            ),
+            first
+        )
+        XCTAssertThrowsError(try CompanionAccountScope(accountID: " firebase-account-a"))
+        XCTAssertThrowsError(try CompanionAccountScope(accountID: "firebase-account-a\n"))
+        XCTAssertThrowsError(try CompanionAccountScope(rawValue: first.rawValue + "="))
+        XCTAssertThrowsError(try CompanionAccountScope(rawValue: "not-a-scope"))
+
+        var legacy = try XCTUnwrap(vector["qrPayload"]?.objectValue)
+        legacy["expiresAt"] = .integer(Int64(Date.now.timeIntervalSince1970 * 1_000) + 60_000)
+        legacy.removeValue(forKey: "accountScope")
+        let decodedLegacy = try JSONDecoder().decode(
+            CompanionPairingPayload.self,
+            from: CanonicalJSON.data(from: .object(legacy))
+        )
+        XCTAssertNil(decodedLegacy.accountScope)
+        XCTAssertThrowsError(try decodedLegacy.validate(clockSkewMilliseconds: 0))
+    }
+
     private func goldenHandshakeResult() throws -> NoiseHandshakeResult {
         let identities = try XCTUnwrap(vector["identities"]?.objectValue)
         let handshake = try XCTUnwrap(vector["handshake"]?.objectValue)

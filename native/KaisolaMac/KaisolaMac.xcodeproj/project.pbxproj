@@ -63,6 +63,7 @@
 		2F5FE737F53A209D9EF0884A /* AcpTerminalHostTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 07F25711B7E71707CD583039 /* AcpTerminalHostTests.swift */; };
 		2FB7A43822C41E01166489DE /* MarkdownTaskToggleTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 43DE8262D5D789B8D0AF17B1 /* MarkdownTaskToggleTests.swift */; };
 		30F274FD0EBF18BBC2120734 /* AcpPermissionRulesTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 757C6A4EEAF0C23D949EF4A5 /* AcpPermissionRulesTests.swift */; };
+		318A00000000000000000002 /* PermissionRuleStoreConcurrencyTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 318A00000000000000000001 /* PermissionRuleStoreConcurrencyTests.swift */; };
 		317314707EEA686047D7DB42 /* DetailShowDoorsTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = EC8170548CE831438700C2F4 /* DetailShowDoorsTests.swift */; };
 		33692846E196A13311DD86C6 /* OnboardingView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 59057824C59D8B945BB9D032 /* OnboardingView.swift */; };
 		336BCD151BF7DF4E1FBDE151 /* QuietRollup.swift in Sources */ = {isa = PBXBuildFile; fileRef = E2C62AECA29EC2AB89B8C85A /* QuietRollup.swift */; };
@@ -471,6 +472,7 @@
 		73C156565BA4025A74960AD9 /* GitServiceTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GitServiceTests.swift; sourceTree = "<group>"; };
 		73DA2DC376948BFD21915726 /* MeshStagedTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MeshStagedTests.swift; sourceTree = "<group>"; };
 		757C6A4EEAF0C23D949EF4A5 /* AcpPermissionRulesTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AcpPermissionRulesTests.swift; sourceTree = "<group>"; };
+		318A00000000000000000001 /* PermissionRuleStoreConcurrencyTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PermissionRuleStoreConcurrencyTests.swift; sourceTree = "<group>"; };
 		760FEDCDEC2F6023C11F7EE8 /* AuthModelTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AuthModelTests.swift; sourceTree = "<group>"; };
 		7B38F18265244392487F7BED /* index.html */ = {isa = PBXFileReference; lastKnownFileType = text.html; path = index.html; sourceTree = "<group>"; };
 		7D5753B3730D2AFC56ED20F9 /* AppModelTerminalRetentionTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppModelTerminalRetentionTests.swift; sourceTree = "<group>"; };
@@ -947,6 +949,7 @@
 				87E8CB81899E1EDA02B677F9 /* AcpClientTests.swift */,
 				67FEB4FC59825677F0542D06 /* AcpComposerModelTests.swift */,
 				757C6A4EEAF0C23D949EF4A5 /* AcpPermissionRulesTests.swift */,
+				318A00000000000000000001 /* PermissionRuleStoreConcurrencyTests.swift */,
 				9FAD1CF1DFF4378CF3677E4A /* AcpProcessIntegrationTests.swift */,
 				07F25711B7E71707CD583039 /* AcpTerminalHostTests.swift */,
 				0A75F9D9A2E3D4F6821B1F0A /* AcpToolArtifactsTests.swift */,
@@ -1488,6 +1491,7 @@
 				941E9FD174F5BD0CF47EE87E /* AcpClientTests.swift in Sources */,
 				3D355C6C5B793869FC49D708 /* AcpComposerModelTests.swift in Sources */,
 				30F274FD0EBF18BBC2120734 /* AcpPermissionRulesTests.swift in Sources */,
+				318A00000000000000000002 /* PermissionRuleStoreConcurrencyTests.swift in Sources */,
 				3C0717751127B8CD4BE8359F /* AcpProcessIntegrationTests.swift in Sources */,
 				2F5FE737F53A209D9EF0884A /* AcpTerminalHostTests.swift in Sources */,
 				6726EDF110F46DD0A390141F /* AcpToolArtifactsTests.swift in Sources */,

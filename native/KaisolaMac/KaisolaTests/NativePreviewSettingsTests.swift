@@ -5452,6 +5452,46 @@ final class NativePreviewSettingsTests: XCTestCase {
         XCTAssertEqual(darkItem.state, .on)
     }
 
+    // MARK: - Settings catalog search (#423)
+
+    func testSettingsCatalogSearchFindsSectionTitlesRowsAndUsefulSynonyms() {
+        XCTAssertEqual(SettingsCatalogSearch.matches(query: "Terminal"), [.terminal])
+        for section in SettingsSection.allCases {
+            XCTAssertTrue(
+                SettingsCatalogSearch.matches(query: section.title).contains(section),
+                "Section title did not find \(section.rawValue)"
+            )
+        }
+        XCTAssertEqual(SettingsCatalogSearch.matches(query: "external editor"), [.general])
+        XCTAssertEqual(SettingsCatalogSearch.matches(query: "account directory"), [.accounts])
+        XCTAssertEqual(SettingsCatalogSearch.matches(query: "MCP server"), [.extensions])
+        XCTAssertEqual(SettingsCatalogSearch.matches(query: "safety approvals"), [.guardrails])
+    }
+
+    func testSettingsCatalogSearchRequiresEveryQueryToken() {
+        XCTAssertEqual(SettingsCatalogSearch.matches(query: "background downloads"), [.updates])
+        XCTAssertEqual(SettingsCatalogSearch.matches(query: "provider credentials"), [.models])
+        XCTAssertEqual(SettingsCatalogSearch.matches(query: "project overrides"), [.accounts])
+        XCTAssertTrue(SettingsCatalogSearch.matches(query: "provider downloads").isEmpty)
+    }
+
+    func testSettingsCatalogSearchPreservesGroupedBrowseAndHasATruthfulEmptyState() {
+        XCTAssertFalse(SettingsCatalogSearch.isFiltering("   \n"))
+        XCTAssertTrue(SettingsCatalogSearch.isFiltering("terminal"))
+        XCTAssertTrue(SettingsCatalogSearch.matches(query: "no such preference").isEmpty)
+        XCTAssertTrue(SettingsSection.allCases.allSatisfy { !$0.searchTerms.isEmpty })
+    }
+
+    func testSettingsCatalogSearchExposesVoiceOverResultCounts() {
+        XCTAssertEqual(SettingsCatalogSearch.resultCountLabel(0), "No results")
+        XCTAssertEqual(SettingsCatalogSearch.resultCountLabel(1), "1 result")
+        XCTAssertEqual(SettingsCatalogSearch.resultCountLabel(3), "3 results")
+        XCTAssertEqual(
+            SettingsCatalogSearch.accessibilityValue(query: "MCP", resultCount: 1),
+            "MCP. 1 result."
+        )
+    }
+
     // MARK: - Settings window controls (#306)
 
     /// A Settings window built the way the product builds it.

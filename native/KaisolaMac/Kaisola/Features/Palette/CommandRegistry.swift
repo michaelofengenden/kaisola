@@ -44,6 +44,7 @@ struct AppCommandID: RawRepresentable, Codable, Hashable, Sendable {
     static let focusNextPane = Self(rawValue: "pane.focus-next")
     static let openSettings = Self(rawValue: "app.open-settings")
     static let checkForUpdates = Self(rawValue: "app.check-for-updates")
+    static let readinessChecklist = Self(rawValue: "app.readiness-checklist")
     static let openHelp = Self(rawValue: "app.open-help")
 
     static func newAgent(_ agentID: String) -> Self {
@@ -366,6 +367,14 @@ enum AppCommandRegistry {
             definition(.focusNextPane, "Focus Next Pane", .view, "arrow.right.to.line", "command+control+right"),
             definition(.openSettings, "Settings…", .app, "gearshape", "command+comma"),
             definition(.checkForUpdates, "Check for Updates…", .app, "arrow.triangle.2.circlepath", nil),
+            definition(
+                .readinessChecklist,
+                "Readiness Checklist…",
+                .help,
+                "checklist.checked",
+                nil,
+                surfaces: [.palette]
+            ),
             definition(.openHelp, "Kaisola Help", .help, "questionmark.circle", "command+shift+slash"),
         ]
 
@@ -594,7 +603,7 @@ enum AppCommandRegistry {
             delegate?.performCheckForUpdatesCommand()
         case .openHelp:
             delegate?.performOpenHelpCommand()
-        case .commandPalette, .messageCurrentAgent, .toggleDocumentPreview:
+        case .commandPalette, .messageCurrentAgent, .toggleDocumentPreview, .readinessChecklist:
             NotificationCenter.default.post(
                 name: .kaisolaLocalCommand,
                 object: model,

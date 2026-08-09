@@ -55,6 +55,20 @@ final class OnboardingStateTests: XCTestCase {
                       "A different suite has its own, still-unseen record.")
     }
 
+    func testManualReopenInstructionNamesPaletteRouteWithoutResettingSeenState() {
+        let defaults = makeDefaults()
+        OnboardingState.markSeen(defaults: defaults)
+
+        XCTAssertEqual(
+            OnboardingState.reopenInstruction,
+            "Reopen anytime: press Command-K and choose Readiness Checklist…"
+        )
+        XCTAssertFalse(
+            OnboardingState.shouldShow(defaults: defaults),
+            "explaining or using the manual route must not re-arm first-run onboarding"
+        )
+    }
+
     func testHostedFixturesNeverCoverTheirDeclaredSurfaceWithOnboarding() {
         let defaults = makeDefaults()
         XCTAssertTrue(OnboardingState.shouldShow(defaults: defaults))
@@ -70,6 +84,20 @@ final class OnboardingStateTests: XCTestCase {
             environment: [:],
             defaults: defaults
         ))
+    }
+
+    func testReadinessReopenFixtureUsesOnlyItsBrokerFreeSurface() {
+        XCTAssertTrue(RootShellView.shouldPresentReadinessReopenFixture(environment: [
+            "KAISOLA_NATIVE_VISUAL_FIXTURE": "1",
+            "KAISOLA_NATIVE_VISUAL_SURFACE": "onboarding-reopen",
+        ]))
+        XCTAssertFalse(RootShellView.shouldPresentReadinessReopenFixture(environment: [
+            "KAISOLA_NATIVE_VISUAL_FIXTURE": "1",
+            "KAISOLA_NATIVE_VISUAL_SURFACE": "onboarding",
+        ]))
+        XCTAssertFalse(RootShellView.shouldPresentReadinessReopenFixture(environment: [
+            "KAISOLA_NATIVE_VISUAL_SURFACE": "onboarding-reopen",
+        ]))
     }
 
     func testTerminalReadinessRequiresWriteControlNotOnlyObservation() {

@@ -15,6 +15,7 @@ final class CompanionCommandRouter {
 
     private struct Pending {
         let id: UUID
+        let hostGeneration: UInt64
         let generation: UInt64
         let fingerprint: Data
         let task: Task<CompanionReceiptBody, Never>
@@ -24,6 +25,7 @@ final class CompanionCommandRouter {
     private var cacheOrder: [String] = []
     private var pending: [String: Pending] = [:]
     private var authorityGenerations: [String: UInt64] = [:]
+    private var hostGeneration: UInt64 = 0
 
     func route(
         _ envelope: CompanionEnvelope,
@@ -40,6 +42,7 @@ final class CompanionCommandRouter {
         guard isAuthorized() else { return revokedReceipt(command) }
         let fingerprint = try CanonicalJSON.data(from: .object(envelope.body.fields))
         let cacheKey = "\(device.deviceId)\u{0}\(command.commandId)"
+        let currentHostGeneration = hostGeneration
         let generation = authorityGenerations[device.deviceId, default: 0]
         if let prior = cache[cacheKey] {
             guard prior.fingerprint == fingerprint else {
@@ -52,7 +55,8 @@ final class CompanionCommandRouter {
             return prior.receipt
         }
         if let inFlight = pending[cacheKey] {
-            guard inFlight.generation == generation else { return revokedReceipt(command) }
+            guard inFlight.hostGeneration == currentHostGeneration,
+                  inFlight.generation == generation else { return revokedReceipt(command) }
             guard inFlight.fingerprint == fingerprint else {
                 return receipt(
                     command,
@@ -66,6 +70,7 @@ final class CompanionCommandRouter {
         let pendingID = UUID()
         let task = Task { @MainActor [projection] in
             guard !Task.isCancelled,
+                  self.hostGeneration == currentHostGeneration,
                   self.authorityGenerations[device.deviceId, default: 0] == generation,
                   isAuthorized() else { return self.revokedReceipt(command) }
             switch command.type {
@@ -92,13 +97,15 @@ final class CompanionCommandRouter {
         }
         pending[cacheKey] = Pending(
             id: pendingID,
+            hostGeneration: currentHostGeneration,
             generation: generation,
             fingerprint: fingerprint,
             task: task
         )
         let result = await task.value
         if pending[cacheKey]?.id == pendingID { pending.removeValue(forKey: cacheKey) }
-        guard authorityGenerations[device.deviceId, default: 0] == generation,
+        guard hostGeneration == currentHostGeneration,
+              authorityGenerations[device.deviceId, default: 0] == generation,
               isAuthorized() else { return revokedReceipt(command) }
         remember(result, fingerprint: fingerprint, key: cacheKey)
         return result
@@ -114,6 +121,19 @@ final class CompanionCommandRouter {
         }
         for key in cache.keys.filter({ $0.hasPrefix(prefix) }) { cache.removeValue(forKey: key) }
         cacheOrder.removeAll { $0.hasPrefix(prefix) }
+    }
+
+    /// Cross-account host transitions are a global authority boundary. Clear
+    /// every cached receipt and cancel every queued route before the old
+    /// transports are closed so an account-A result cannot be observed or
+    /// reused by a later account-B host with the same device/command IDs.
+    func invalidateAll() {
+        hostGeneration &+= 1
+        for work in pending.values { work.task.cancel() }
+        pending.removeAll()
+        cache.removeAll()
+        cacheOrder.removeAll()
+        authorityGenerations.removeAll()
     }
 
     private func acknowledge(

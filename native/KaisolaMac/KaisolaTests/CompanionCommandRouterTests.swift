@@ -269,6 +269,93 @@ final class CompanionCommandRouterTests: XCTestCase {
         XCTAssertEqual(routeCount, 2)
     }
 
+    func testAccountTransitionRejectsLateRoutesAndPurgesEveryDeviceReceipt() async throws {
+        let router = CompanionCommandRouter()
+        let firstDevice = try pairedDevice(capabilities: [.observe, .terminalControl])
+        let secondDevice = try pairedDevice(
+            id: "device-account-transition-2",
+            capabilities: [.observe]
+        )
+        let inFlightEnvelope = try terminalCommandEnvelope(
+            id: "command-shared-across-accounts",
+            type: "terminal.interrupt"
+        )
+        let cachedEnvelope = try commandEnvelope(
+            id: "command-cached-before-account-switch",
+            projectID: "project-1",
+            targetID: "attention-session-1",
+            expectedRevision: 7
+        )
+        let gate = SuspendedCommandRoute()
+        var externalRouteCount = 0
+        var attentionApplyCount = 0
+
+        let cached = try await router.route(
+            cachedEnvelope,
+            device: secondDevice,
+            projection: projection(revision: 7),
+            acknowledgeAttention: { _ in attentionApplyCount += 1; return true }
+        )
+        XCTAssertEqual(cached.status, .applied)
+        XCTAssertEqual(attentionApplyCount, 1)
+
+        let staleTask = Task { @MainActor in
+            try await router.route(
+                inFlightEnvelope,
+                device: firstDevice,
+                projection: nil,
+                acknowledgeAttention: { _ in false },
+                handleExternal: { command in
+                    externalRouteCount += 1
+                    await gate.suspend()
+                    return CompanionReceiptBody(
+                        type: "command.receipt",
+                        commandId: command.commandId,
+                        status: .applied,
+                        message: "stale account result",
+                        payload: nil
+                    )
+                }
+            )
+        }
+        await gate.waitUntilStarted()
+        router.invalidateAll()
+        gate.release()
+
+        let stale = try await staleTask.value
+        XCTAssertEqual(stale.status, .rejected)
+        XCTAssertEqual(externalRouteCount, 1)
+
+        let fresh = try await router.route(
+            inFlightEnvelope,
+            device: firstDevice,
+            projection: nil,
+            acknowledgeAttention: { _ in false },
+            handleExternal: { command in
+                externalRouteCount += 1
+                return CompanionReceiptBody(
+                    type: "command.receipt",
+                    commandId: command.commandId,
+                    status: .applied,
+                    message: "fresh account result",
+                    payload: nil
+                )
+            }
+        )
+        XCTAssertEqual(fresh.status, .applied)
+        XCTAssertEqual(fresh.message, "fresh account result")
+
+        let recached = try await router.route(
+            cachedEnvelope,
+            device: secondDevice,
+            projection: projection(revision: 7),
+            acknowledgeAttention: { _ in attentionApplyCount += 1; return true }
+        )
+        XCTAssertEqual(recached.status, .applied)
+        XCTAssertEqual(attentionApplyCount, 2)
+        XCTAssertEqual(externalRouteCount, 2)
+    }
+
     private func projection(revision: Int) -> CompanionProjection {
         CompanionProjection(
             projectionKind: "kaisola.companion.projection",
@@ -296,16 +383,18 @@ final class CompanionCommandRouterTests: XCTestCase {
     }
 
     private func pairedDevice(
+        id: String = "device-router-test",
         capabilities: [CompanionCapability] = [.observe]
     ) throws -> CompanionPairedDeviceRecord {
         CompanionPairedDeviceRecord(
-            deviceId: "device-router-test",
+            deviceId: id,
             displayName: "iPhone",
             identityPublic: Data(repeating: 1, count: 32).base64URLEncodedString(),
             x25519StaticPublic: Data(repeating: 2, count: 32).base64URLEncodedString(),
             capabilities: capabilities,
             pairedAt: 1,
-            lastSeenAt: 1
+            lastSeenAt: 1,
+            accountScope: try CompanionAccountScope(accountID: "command-router-test-account")
         )
     }
 

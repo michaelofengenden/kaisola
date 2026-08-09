@@ -11,6 +11,7 @@ struct CompanionPairedDeviceRecord: Codable, Equatable, Identifiable, Sendable {
     var capabilities: [CompanionCapability]
     let pairedAt: Int64
     var lastSeenAt: Int64
+    let accountScope: CompanionAccountScope
 
     var pin: CompanionIdentityPin {
         CompanionIdentityPin(
@@ -26,6 +27,7 @@ struct CompanionRevokedDeviceRecord: Codable, Equatable, Sendable {
     let identityPublic: String
     let x25519StaticPublic: String
     let revokedAt: Int64
+    let accountScope: CompanionAccountScope
 
     var pin: CompanionIdentityPin {
         CompanionIdentityPin(
@@ -43,6 +45,7 @@ enum CompanionDeviceRosterError: LocalizedError, Equatable {
     case deviceLimit
     case duplicateDevice
     case unknownDevice
+    case accountMismatch
 
     var errorDescription: String? {
         switch self {
@@ -52,6 +55,7 @@ enum CompanionDeviceRosterError: LocalizedError, Equatable {
         case .deviceLimit: "Kaisola supports at most 64 paired devices."
         case .duplicateDevice: "This device is already paired."
         case .unknownDevice: "This device is no longer paired."
+        case .accountMismatch: "Kaisola refused paired-device state from another account."
         }
     }
 }
@@ -59,8 +63,9 @@ enum CompanionDeviceRosterError: LocalizedError, Equatable {
 actor CompanionDeviceRosterStore {
     private struct Archive: Codable {
         let version: Int
+        let accountScope: CompanionAccountScope
         let devices: [CompanionPairedDeviceRecord]
-        let revoked: [CompanionRevokedDeviceRecord]?
+        let revoked: [CompanionRevokedDeviceRecord]
     }
 
     static let maximumStoreBytes = 1 * 1_024 * 1_024
@@ -68,15 +73,17 @@ actor CompanionDeviceRosterStore {
     static let maximumRevokedDevices = 256
 
     private let fileURL: URL
+    nonisolated let accountScope: CompanionAccountScope
     private var devicesByID: [String: CompanionPairedDeviceRecord]
     private var revokedByID: [String: CompanionRevokedDeviceRecord]
 
-    init(fileURL: URL = NativePreviewPaths.companionDevices) throws {
+    init(fileURL: URL, accountScope: CompanionAccountScope) throws {
         guard fileURL.isFileURL, fileURL.path.hasPrefix("/") else {
             throw CompanionDeviceRosterError.unsafePath
         }
         self.fileURL = fileURL.standardizedFileURL
-        let archive = try Self.load(from: self.fileURL)
+        self.accountScope = accountScope
+        let archive = try Self.load(from: self.fileURL, accountScope: accountScope)
         var indexed: [String: CompanionPairedDeviceRecord] = [:]
         for record in archive.devices {
             guard indexed.updateValue(record, forKey: record.deviceId) == nil else {
@@ -126,8 +133,10 @@ actor CompanionDeviceRosterStore {
                 x25519StaticPublic: peer.x25519StaticPublic,
                 capabilities: capabilities,
                 pairedAt: now,
-                lastSeenAt: now
-            )
+                lastSeenAt: now,
+                accountScope: accountScope
+            ),
+            accountScope: accountScope
         )
         let priorRevocation = revokedByID.removeValue(forKey: record.deviceId)
         devicesByID[record.deviceId] = record
@@ -182,7 +191,8 @@ actor CompanionDeviceRosterStore {
             deviceId: previous.deviceId,
             identityPublic: previous.identityPublic,
             x25519StaticPublic: previous.x25519StaticPublic,
-            revokedAt: max(0, now)
+            revokedAt: max(0, now),
+            accountScope: accountScope
         )
         pruneRevocations(preserving: id)
         do { try persist() }
@@ -195,7 +205,8 @@ actor CompanionDeviceRosterStore {
     }
 
     private static func load(
-        from url: URL
+        from url: URL,
+        accountScope: CompanionAccountScope
     ) throws -> (devices: [CompanionPairedDeviceRecord], revoked: [CompanionRevokedDeviceRecord]) {
         var metadata = stat()
         if lstat(url.path, &metadata) != 0 {
@@ -210,25 +221,39 @@ actor CompanionDeviceRosterStore {
             throw CompanionDeviceRosterError.unsafePath
         }
         let data = try Data(contentsOf: url, options: [.mappedIfSafe])
-        guard data.count <= maximumStoreBytes,
-              let archive = try? JSONDecoder().decode(Archive.self, from: data),
-              (archive.version == 1 && archive.revoked == nil)
-                || (archive.version == 2 && archive.revoked != nil),
-              archive.devices.count <= maximumDevices,
-              (archive.revoked?.count ?? 0) <= maximumRevokedDevices else {
+        guard data.count <= maximumStoreBytes else {
             throw CompanionDeviceRosterError.invalidStore
+        }
+        if let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+           let version = object["version"] as? Int,
+           version == 1 || version == 2 {
+            // Old global rosters cannot be attributed to the account that
+            // created them. Keep the legacy file inert and require a fresh
+            // pairing instead of silently granting it to whichever user signs
+            // in first after upgrade.
+            throw CompanionDeviceRosterError.accountMismatch
+        }
+        guard let archive = try? JSONDecoder().decode(Archive.self, from: data),
+              archive.version == 3,
+              archive.devices.count <= maximumDevices,
+              archive.revoked.count <= maximumRevokedDevices else {
+            throw CompanionDeviceRosterError.invalidStore
+        }
+        guard archive.accountScope == accountScope else {
+            throw CompanionDeviceRosterError.accountMismatch
         }
         do {
             return (
-                try archive.devices.map(normalizedRecord),
-                try (archive.revoked ?? []).map(normalizedRevocation)
+                try archive.devices.map { try normalizedRecord($0, accountScope: accountScope) },
+                try archive.revoked.map { try normalizedRevocation($0, accountScope: accountScope) }
             )
         }
         catch { throw CompanionDeviceRosterError.invalidStore }
     }
 
     private static func normalizedRecord(
-        _ record: CompanionPairedDeviceRecord
+        _ record: CompanionPairedDeviceRecord,
+        accountScope: CompanionAccountScope
     ) throws -> CompanionPairedDeviceRecord {
         _ = try CompanionCrypto.validateIdentifier(record.deviceId, label: "deviceId")
         _ = try CompanionCrypto.decodeBase64URL(
@@ -243,6 +268,7 @@ actor CompanionDeviceRosterStore {
               !name.unicodeScalars.contains(where: CharacterSet.controlCharacters.contains),
               record.pairedAt >= 0,
               record.lastSeenAt >= record.pairedAt,
+              record.accountScope == accountScope,
               !record.capabilities.isEmpty,
               record.capabilities.count <= CompanionCapability.allCases.count,
               Set(record.capabilities).count == record.capabilities.count,
@@ -257,12 +283,14 @@ actor CompanionDeviceRosterStore {
             x25519StaticPublic: record.x25519StaticPublic,
             capabilities: ordered,
             pairedAt: record.pairedAt,
-            lastSeenAt: record.lastSeenAt
+            lastSeenAt: record.lastSeenAt,
+            accountScope: accountScope
         )
     }
 
     private static func normalizedRevocation(
-        _ record: CompanionRevokedDeviceRecord
+        _ record: CompanionRevokedDeviceRecord,
+        accountScope: CompanionAccountScope
     ) throws -> CompanionRevokedDeviceRecord {
         _ = try CompanionCrypto.validateIdentifier(record.deviceId, label: "deviceId")
         _ = try CompanionCrypto.decodeBase64URL(
@@ -271,7 +299,9 @@ actor CompanionDeviceRosterStore {
         _ = try CompanionCrypto.decodeBase64URL(
             record.x25519StaticPublic, bytes: 32, label: "x25519StaticPublic"
         )
-        guard record.revokedAt >= 0 else { throw CompanionDeviceRosterError.invalidStore }
+        guard record.revokedAt >= 0, record.accountScope == accountScope else {
+            throw CompanionDeviceRosterError.invalidStore
+        }
         return record
     }
 
@@ -291,7 +321,12 @@ actor CompanionDeviceRosterStore {
     private func persist() throws {
         let records = devicesByID.values.sorted { $0.deviceId < $1.deviceId }
         let revoked = revokedByID.values.sorted { $0.deviceId < $1.deviceId }
-        let data = try JSONEncoder().encode(Archive(version: 2, devices: records, revoked: revoked))
+        let data = try JSONEncoder().encode(Archive(
+            version: 3,
+            accountScope: accountScope,
+            devices: records,
+            revoked: revoked
+        ))
         guard data.count <= Self.maximumStoreBytes else { throw CompanionDeviceRosterError.tooLarge }
         let directory = fileURL.deletingLastPathComponent()
         try NativePreviewPaths.prepareCompanionDirectory(at: directory)

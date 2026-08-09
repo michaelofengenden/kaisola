@@ -2196,17 +2196,29 @@ final class KaisolaMacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDele
         let nextAccountID: String?
         if case let .signedIn(account) = phase {
             nextAccountID = account.uid
-            if !visualFixture {
-                UserDefaults.standard.set(
-                    true,
-                    forKey: NativeAccountKeychainMigration.completionDefaultsKey
-                )
-            }
         } else {
             nextAccountID = nil
         }
 
-        CompanionHost.shared.setKaisolaLinkSignedIn(nextAccountID != nil)
+        // Combine delivery is wrapped in a MainActor task. A rapid A -> B
+        // transition can therefore leave an older phase task queued behind the
+        // newer value. Fence the captured phase against the live auth model
+        // before it can reopen Account A's Companion authority.
+        let currentAccountID: String?
+        if case let .signedIn(account) = auth.phase {
+            currentAccountID = account.uid
+        } else {
+            currentAccountID = nil
+        }
+        guard nextAccountID == currentAccountID else { return }
+        if nextAccountID != nil, !visualFixture {
+            UserDefaults.standard.set(
+                true,
+                forKey: NativeAccountKeychainMigration.completionDefaultsKey
+            )
+        }
+
+        CompanionHost.shared.setActiveAccountID(nextAccountID)
         guard nextAccountID != rememberedSessionAccountID else { return }
 
         rememberedSessionAccountID = nextAccountID
@@ -2409,8 +2421,12 @@ final class KaisolaMacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDele
                     role: .desktop,
                     displayName: "Kaisola signed relay smoke"
                 )
+                let accountScope = try CompanionAccountScope(
+                    accountID: "native-browser-link-smoke"
+                )
                 let roster = try CompanionDeviceRosterStore(
-                    fileURL: directory.appendingPathComponent("devices-v1.json")
+                    fileURL: directory.appendingPathComponent("devices-v3.json"),
+                    accountScope: accountScope
                 )
                 let coordinator = try CompanionPairingCoordinator(
                     identity: identity,

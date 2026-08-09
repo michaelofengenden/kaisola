@@ -154,7 +154,8 @@ actor CompanionPairingCoordinator {
                 protocol: "tcp",
                 port: Int(listenerPort)
             ),
-            expiresAt: nowMilliseconds + ttlMilliseconds
+            expiresAt: nowMilliseconds + ttlMilliseconds,
+            accountScope: roster.accountScope
         )
         try payload.validate(
             now: Date(timeIntervalSince1970: TimeInterval(nowMilliseconds) / 1_000),
@@ -166,6 +167,14 @@ actor CompanionPairingCoordinator {
 
     func cancelOffer(pairingID: String) -> Bool {
         offers.removeValue(forKey: pairingID) != nil
+    }
+
+    /// Account/host shutdown is an authority boundary. A consumed offer may
+    /// already live in `sessionsBySocket`, so clearing offers alone would still
+    /// allow a late SAS frame to persist a pairing for the retired account.
+    func invalidateAll() {
+        offers.removeAll()
+        sessionsBySocket.removeAll()
     }
 
     func receive(
@@ -256,7 +265,7 @@ actor CompanionPairingCoordinator {
         nowMilliseconds: Int64
     ) async throws -> CompanionPairingCoordinatorOutput {
         let object = try Self.strictObject(value, allowed: [
-            "v", "type", "qrPayload", "deviceId", "connectionId", "message1",
+            "v", "type", "qrPayload", "deviceId", "connectionId", "message1", "accountScope",
         ])
         guard object["v"]?.intValue == Int64(CompanionCrypto.protocolVersion),
               let type = object["type"]?.stringValue,
@@ -269,7 +278,9 @@ actor CompanionPairingCoordinator {
 
         switch type {
         case "pair.start":
-            guard object["deviceId"] == nil, let qrValue = object["qrPayload"],
+            guard object["deviceId"] == nil,
+                  object["accountScope"] == nil,
+                  let qrValue = object["qrPayload"],
                   let qrPayload = try? JSONDecoder().decode(
                     CompanionPairingPayload.self,
                     from: CanonicalJSON.data(from: qrValue)
@@ -280,6 +291,9 @@ actor CompanionPairingCoordinator {
                     clockSkewMilliseconds: 0
                 )
             } catch {
+                throw CompanionPairingCoordinatorError.invalidOffer
+            }
+            guard qrPayload.accountScope == roster.accountScope else {
                 throw CompanionPairingCoordinatorError.invalidOffer
             }
             guard let offer = offers.removeValue(forKey: qrPayload.pairingNonce) else {
@@ -318,7 +332,10 @@ actor CompanionPairingCoordinator {
 
         case "resume.start":
             guard object["qrPayload"] == nil,
-                  let deviceID = object["deviceId"]?.stringValue else {
+                  let deviceID = object["deviceId"]?.stringValue,
+                  let accountScopeText = object["accountScope"]?.stringValue,
+                  let accountScope = try? CompanionAccountScope(rawValue: accountScopeText),
+                  accountScope == roster.accountScope else {
                 throw CompanionPairingCoordinatorError.invalidFrame
             }
             _ = try CompanionCrypto.validateIdentifier(deviceID, label: "deviceId")
@@ -343,6 +360,7 @@ actor CompanionPairingCoordinator {
                 "desktopId": .string(identity.id),
                 "deviceId": .string(deviceID),
                 "connectionId": .string(connectionID),
+                "accountScope": .string(roster.accountScope.rawValue),
             ])
             let responder = try NoiseXXResponder(
                 identity: identity,
@@ -574,6 +592,7 @@ actor CompanionPairingCoordinator {
             let payload: JSONValue = .object([
                 "type": .string("paired"),
                 "deviceId": .string(record.deviceId),
+                "accountScope": .string(record.accountScope.rawValue),
                 "capabilities": try JSONValue.from(record.capabilities),
                 "transcriptHash": .string(result.handshakeHash.base64URLEncodedString()),
             ])

@@ -7,7 +7,17 @@ import XCTest
 
 private struct LegacyCompanionRosterArchive: Codable {
     let version: Int
-    let devices: [CompanionPairedDeviceRecord]
+    let devices: [LegacyCompanionPairedDeviceRecord]
+}
+
+private struct LegacyCompanionPairedDeviceRecord: Codable {
+    let deviceId: String
+    let displayName: String
+    let identityPublic: String
+    let x25519StaticPublic: String
+    let capabilities: [CompanionCapability]
+    let pairedAt: Int64
+    let lastSeenAt: Int64
 }
 
 final class CompanionHostFoundationTests: XCTestCase {
@@ -15,6 +25,75 @@ final class CompanionHostFoundationTests: XCTestCase {
     private let desktopAgreementSeed = Data((32..<64).map { UInt8($0) })
     private let phoneSigningSeed = Data((64..<96).map { UInt8($0) })
     private let phoneAgreementSeed = Data((96..<128).map { UInt8($0) })
+
+    func testAccountScopedRosterPathsAndRecordsCannotCrossAccounts() async throws {
+        let accountA = try CompanionAccountScope(accountID: "firebase-account-a")
+        let accountB = try CompanionAccountScope(accountID: "firebase-account-b")
+        XCTAssertEqual(accountA, try CompanionAccountScope(accountID: "firebase-account-a"))
+        XCTAssertNotEqual(accountA, accountB)
+        XCTAssertFalse(accountA.rawValue.contains("firebase-account-a"))
+
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "kaisola-companion-account-rosters-\(UUID().uuidString)",
+            isDirectory: true
+        )
+        try FileManager.default.createDirectory(
+            at: directory,
+            withIntermediateDirectories: true,
+            attributes: [.posixPermissions: 0o700]
+        )
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let accountAFile = NativePreviewPaths.companionDevices(
+            accountScope: accountA,
+            directory: directory
+        )
+        let accountBFile = NativePreviewPaths.companionDevices(
+            accountScope: accountB,
+            directory: directory
+        )
+        XCTAssertNotEqual(accountAFile, accountBFile)
+        XCTAssertFalse(accountAFile.lastPathComponent.contains("firebase-account-a"))
+
+        let accountAStore = try CompanionDeviceRosterStore(
+            fileURL: accountAFile,
+            accountScope: accountA
+        )
+        let device = try CompanionIdentity(
+            id: "device-account-scope",
+            role: .device,
+            displayName: "Scoped iPhone"
+        )
+        let record = try await accountAStore.pair(
+            peer: CompanionIdentityPin(
+                id: device.id,
+                identityPublic: device.identityPublic,
+                x25519StaticPublic: device.x25519StaticPublic
+            ),
+            displayName: device.displayName,
+            capabilities: [.observe],
+            now: 100
+        )
+        XCTAssertEqual(record.accountScope, accountA)
+
+        XCTAssertThrowsError(try CompanionDeviceRosterStore(
+            fileURL: accountAFile,
+            accountScope: accountB
+        )) { error in
+            XCTAssertEqual(error as? CompanionDeviceRosterError, .accountMismatch)
+        }
+        let accountBStore = try CompanionDeviceRosterStore(
+            fileURL: accountBFile,
+            accountScope: accountB
+        )
+        let accountBDevices = await accountBStore.list()
+        XCTAssertTrue(accountBDevices.isEmpty)
+        let restoredA = try CompanionDeviceRosterStore(
+            fileURL: accountAFile,
+            accountScope: accountA
+        )
+        let restoredADevices = await restoredA.list()
+        XCTAssertEqual(restoredADevices, [record])
+    }
 
     @MainActor
     func testRevocationFenceInvalidatesEveryTransportAndRejectsRacedResume() {
@@ -59,6 +138,37 @@ final class CompanionHostFoundationTests: XCTestCase {
         XCTAssertTrue(repaired.map(fence.isAuthorized) == true)
     }
 
+    @MainActor
+    func testAccountTransitionClearsOnlyInMemoryRevocationIdentity() {
+        let fence = CompanionDeviceRevocationFence()
+        let accountAToken = fence.authorize(
+            deviceID: "shared-device-id",
+            connectionID: "account-a-link",
+            resumed: true
+        )
+        XCTAssertNotNil(accountAToken)
+        XCTAssertEqual(
+            fence.revoke(deviceID: "shared-device-id"),
+            ["account-a-link"]
+        )
+        XCTAssertNil(fence.authorize(
+            deviceID: "shared-device-id",
+            connectionID: "account-b-link-before-reset",
+            resumed: true
+        ))
+
+        fence.resetForAccountChange()
+
+        XCTAssertFalse(accountAToken.map(fence.isAuthorized) == true)
+        let accountBToken = fence.authorize(
+            deviceID: "shared-device-id",
+            connectionID: "account-b-link",
+            resumed: true
+        )
+        XCTAssertNotNil(accountBToken)
+        XCTAssertTrue(accountBToken.map(fence.isAuthorized) == true)
+    }
+
     func testDesktopIdentityIsStableAndPrivateKeysNeverSynchronize() throws {
         let service = "com.kaisola.mac.companion-identity.test-\(UUID().uuidString)"
         let store = CompanionIdentityStore(service: service)
@@ -93,7 +203,11 @@ final class CompanionHostFoundationTests: XCTestCase {
         )
         defer { try? FileManager.default.removeItem(at: directory) }
         let file = directory.appendingPathComponent("devices-v1.json")
-        let store = try CompanionDeviceRosterStore(fileURL: file)
+        let accountScope = try CompanionAccountScope(accountID: "roster-round-trip-account")
+        let store = try CompanionDeviceRosterStore(
+            fileURL: file,
+            accountScope: accountScope
+        )
         let device = try CompanionIdentity(
             id: "device-test",
             role: .device,
@@ -114,7 +228,10 @@ final class CompanionHostFoundationTests: XCTestCase {
         var attributes = try FileManager.default.attributesOfItem(atPath: file.path)
         XCTAssertEqual((attributes[.posixPermissions] as? NSNumber)?.intValue, 0o600)
 
-        let reopened = try CompanionDeviceRosterStore(fileURL: file)
+        let reopened = try CompanionDeviceRosterStore(
+            fileURL: file,
+            accountScope: accountScope
+        )
         let reopenedDevices = await reopened.list()
         XCTAssertEqual(reopenedDevices, [paired])
         try await reopened.markSeen(device.id, now: 200)
@@ -128,7 +245,10 @@ final class CompanionHostFoundationTests: XCTestCase {
         XCTAssertEqual(tombstone?.pin, paired.pin)
         XCTAssertEqual(tombstone?.revokedAt, 300)
 
-        let reopenedAfterRevocation = try CompanionDeviceRosterStore(fileURL: file)
+        let reopenedAfterRevocation = try CompanionDeviceRosterStore(
+            fileURL: file,
+            accountScope: accountScope
+        )
         let reopenedTombstone = await reopenedAfterRevocation.revokedDevice(device.id)
         XCTAssertEqual(reopenedTombstone, tombstone)
 
@@ -145,12 +265,15 @@ final class CompanionHostFoundationTests: XCTestCase {
         let file = directory.appendingPathComponent("devices-v1.json")
         try Data(#"{"version":1,"devices":[]}"#.utf8).write(to: file)
         try FileManager.default.setAttributes([.posixPermissions: 0o644], ofItemAtPath: file.path)
-        XCTAssertThrowsError(try CompanionDeviceRosterStore(fileURL: file)) { error in
+        XCTAssertThrowsError(try CompanionDeviceRosterStore(
+            fileURL: file,
+            accountScope: try CompanionAccountScope(accountID: "unsafe-roster-account")
+        )) { error in
             XCTAssertEqual(error as? CompanionDeviceRosterError, .unsafePath)
         }
     }
 
-    func testRosterLoadsVersionOneAndUpgradesOnlyAfterAValidatedMutation() async throws {
+    func testUnscopedVersionOneRosterCannotBeAdoptedByTheFirstSignedInAccount() async throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(
             "kaisola-companion-roster-v1-\(UUID().uuidString)", isDirectory: true
         )
@@ -166,7 +289,7 @@ final class CompanionHostFoundationTests: XCTestCase {
             role: .device,
             displayName: "Legacy iPhone"
         )
-        let record = CompanionPairedDeviceRecord(
+        let record = LegacyCompanionPairedDeviceRecord(
             deviceId: identity.id,
             displayName: identity.displayName,
             identityPublic: identity.identityPublic,
@@ -184,19 +307,16 @@ final class CompanionHostFoundationTests: XCTestCase {
             ofItemAtPath: file.path
         )
 
-        let store = try CompanionDeviceRosterStore(fileURL: file)
-        let loaded = await store.list()
-        let priorRevocation = await store.revokedDevice(record.deviceId)
-        let revoked = try await store.revoke(record.deviceId, now: 200)
-        XCTAssertEqual(loaded, [record])
-        XCTAssertNil(priorRevocation)
-        XCTAssertTrue(revoked)
-
-        let upgraded = try JSONSerialization.jsonObject(with: Data(contentsOf: file))
+        XCTAssertThrowsError(try CompanionDeviceRosterStore(
+            fileURL: file,
+            accountScope: try CompanionAccountScope(accountID: "first-account-after-upgrade")
+        )) { error in
+            XCTAssertEqual(error as? CompanionDeviceRosterError, .accountMismatch)
+        }
+        let untouched = try JSONSerialization.jsonObject(with: Data(contentsOf: file))
             as? [String: Any]
-        XCTAssertEqual(upgraded?["version"] as? Int, 2)
-        XCTAssertEqual((upgraded?["devices"] as? [Any])?.count, 0)
-        XCTAssertEqual((upgraded?["revoked"] as? [Any])?.count, 1)
+        XCTAssertEqual(untouched?["version"] as? Int, 1)
+        XCTAssertEqual((untouched?["devices"] as? [Any])?.count, 1)
     }
 
     func testBonjourAdvertisementMatchesShippingPhoneContract() throws {
@@ -359,6 +479,7 @@ final class CompanionHostFoundationTests: XCTestCase {
             "desktopId": .string(fixture.desktop.id),
             "deviceId": .string(fixture.phone.id),
             "connectionId": .string(resumeConnectionID),
+            "accountScope": .string(fixture.roster.accountScope.rawValue),
         ])
         let resumeInitiator = try NoiseXXInitiator(
             identity: fixture.phone,
@@ -376,6 +497,7 @@ final class CompanionHostFoundationTests: XCTestCase {
                 "type": .string("resume.start"),
                 "deviceId": .string(fixture.phone.id),
                 "connectionId": .string(resumeConnectionID),
+                "accountScope": .string(fixture.roster.accountScope.rawValue),
                 "message1": .string(try resumeInitiator.writeMessage1().base64URLEncodedString()),
             ]),
             nowMilliseconds: now + 10
@@ -458,6 +580,7 @@ final class CompanionHostFoundationTests: XCTestCase {
             "desktopId": .string(fixture.desktop.id),
             "deviceId": .string(fixture.phone.id),
             "connectionId": .string(connectionID),
+            "accountScope": .string(fixture.roster.accountScope.rawValue),
         ])
         let initiator = try NoiseXXInitiator(
             identity: fixture.phone,
@@ -475,6 +598,7 @@ final class CompanionHostFoundationTests: XCTestCase {
                 "type": .string("resume.start"),
                 "deviceId": .string(fixture.phone.id),
                 "connectionId": .string(connectionID),
+                "accountScope": .string(fixture.roster.accountScope.rawValue),
                 "message1": .string(try initiator.writeMessage1().base64URLEncodedString()),
             ]),
             nowMilliseconds: 1_200
@@ -610,7 +734,8 @@ final class CompanionHostFoundationTests: XCTestCase {
             agreementSeed: phoneAgreementSeed
         )
         let roster = try CompanionDeviceRosterStore(
-            fileURL: directory.appendingPathComponent("devices-v1.json")
+            fileURL: directory.appendingPathComponent("devices-v3.json"),
+            accountScope: try CompanionAccountScope(accountID: "host-foundation-pairing")
         )
         return PairingFixture(
             directory: directory,

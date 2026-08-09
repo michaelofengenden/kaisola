@@ -69,6 +69,7 @@ final class CompanionResumePolicyTests: XCTestCase {
         let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
         defer { defaults.removePersistentDomain(forName: suite) }
         let persistence = UserDefaultsPairedDesktopStore(defaults: defaults)
+        let accountScope = try CompanionAccountScope(accountID: "resume-policy-account")
         let desktop = CompanionPairedDesktop(
             desktopId: "desktop-resume-test",
             identityPublic: "desktop-ed25519-pin",
@@ -79,14 +80,21 @@ final class CompanionResumePolicyTests: XCTestCase {
                 protocol: "tcp",
                 host: "mac.local",
                 port: 49_200
-            )
+            ),
+            accountScope: accountScope
         )
 
-        persistence.save(desktop)
+        persistence.save(desktop, accountScope: accountScope)
 
         let relaunchedStore = UserDefaultsPairedDesktopStore(defaults: defaults)
-        XCTAssertEqual(relaunchedStore.load(), desktop)
-        XCTAssertEqual(relaunchedStore.load()?.capabilities, [.observe, .agentControl])
-        XCTAssertFalse(relaunchedStore.load()?.capabilities.contains(.terminalControl) == true)
+        XCTAssertEqual(relaunchedStore.load(accountScope: accountScope), desktop)
+        XCTAssertEqual(
+            relaunchedStore.load(accountScope: accountScope)?.capabilities,
+            [.observe, .agentControl]
+        )
+        XCTAssertFalse(
+            relaunchedStore.load(accountScope: accountScope)?.capabilities
+                .contains(.terminalControl) == true
+        )
     }
 }

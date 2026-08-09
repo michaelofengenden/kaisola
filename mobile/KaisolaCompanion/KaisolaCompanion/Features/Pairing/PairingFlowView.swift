@@ -11,6 +11,7 @@ struct PairingFlowView: View {
     @Environment(\.colorScheme) private var colorScheme
     @State private var showPaste = false
     @State private var pasted = ""
+    @State private var accountIntent: CompanionConnectionCoordinator.AccountIntent?
 
     var body: some View {
         NavigationStack {
@@ -23,7 +24,10 @@ struct PairingFlowView: View {
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .topBarLeading) {
-                    Button("Cancel") { coordinator.cancelPairing(); dismiss() }
+                    Button("Cancel") {
+                        coordinator.cancelPairing(intent: accountIntent)
+                        dismiss()
+                    }
                 }
             }
             .onChange(of: isPaired) { _, paired in
@@ -31,6 +35,11 @@ struct PairingFlowView: View {
             }
         }
         .interactiveDismissDisabled(isBusy || coordinator.accountLookupInProgress)
+        .onAppear { accountIntent = coordinator.captureActiveAccountIntent() }
+        .onChange(of: coordinator.accountGeneration) { _, generation in
+            guard accountIntent?.generation != generation else { return }
+            dismiss()
+        }
     }
 
     private var isPaired: Bool { if case .paired = coordinator.pairingPhase { return true }; return false }
@@ -108,7 +117,8 @@ struct PairingFlowView: View {
                 Text("Choose a Mac").font(.footnote.weight(.semibold)).foregroundStyle(.secondary)
                 ForEach(coordinator.accountOffers) { offer in
                     Button {
-                        Task { await coordinator.pair(with: offer) }
+                        let intent = accountIntent
+                        Task { await coordinator.pair(with: offer, intent: intent) }
                     } label: {
                         HStack {
                             Image(systemName: "desktopcomputer")
@@ -178,11 +188,14 @@ struct PairingFlowView: View {
                 }
             }
             HStack(spacing: 10) {
-                Button("They differ") { coordinator.cancelPairing(); dismiss() }
+                Button("They differ") {
+                    coordinator.cancelPairing(intent: accountIntent)
+                    dismiss()
+                }
                     .font(.subheadline.weight(.semibold)).frame(maxWidth: .infinity).frame(height: 50)
                     .background(KaisolaTheme.raised(for: colorScheme), in: RoundedRectangle(cornerRadius: 13, style: .continuous))
                     .foregroundStyle(.primary)
-                Button("They match") { coordinator.confirmSAS() }
+                Button("They match") { coordinator.confirmSAS(intent: accountIntent) }
                     .font(.subheadline.weight(.semibold)).frame(maxWidth: .infinity).frame(height: 50)
                     .foregroundStyle(KaisolaTheme.darkFrame)
                     .background(KaisolaTheme.accent, in: RoundedRectangle(cornerRadius: 13, style: .continuous))
@@ -204,19 +217,22 @@ struct PairingFlowView: View {
     private func scan(_ code: String) {
         guard let data = code.data(using: .utf8),
               let payload = try? JSONDecoder().decode(CompanionPairingPayload.self, from: data) else {
-            Task { @MainActor in coordinator.reportInvalidCode() }
+            let intent = accountIntent
+            Task { @MainActor in coordinator.reportInvalidCode(intent: intent) }
             return
         }
-        Task { await coordinator.pair(with: payload) }
+        let intent = accountIntent
+        Task { await coordinator.pair(with: payload, intent: intent) }
     }
 
     private func findAccountMac() {
+        let intent = accountIntent
         Task {
             do {
                 let token = try await auth.freshIDToken()
-                await coordinator.findAccountMac(idToken: token)
+                await coordinator.findAccountMac(idToken: token, intent: intent)
             } catch {
-                coordinator.reportAccountPairingError(error)
+                coordinator.reportAccountPairingError(error, intent: intent)
             }
         }
     }

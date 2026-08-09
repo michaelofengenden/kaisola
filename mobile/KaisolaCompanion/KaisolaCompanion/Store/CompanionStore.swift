@@ -69,22 +69,25 @@ final class CompanionStore: ObservableObject {
 
     func bind(to client: CompanionClient) {
         guard !isPreview else { return }
-        client.onTransportState = { [weak self] state in
-            guard let self else { return }
+        client.onTransportState = { [weak self, weak client] authority, state in
+            guard let self, let authority,
+                  client?.currentSessionAuthority == authority else { return }
             transportState = state
             connection = state.storeState
         }
-        client.onEnvelope = { [weak self, weak client] envelope in
-            guard let self else { return }
+        client.onEnvelope = { [weak self, weak client] authority, envelope in
+            guard let self, client?.currentSessionAuthority == authority else { return }
             do {
                 if try apply(envelope), let cursor = lastAckCursor {
+                    guard client?.currentSessionAuthority == authority else { return }
                     try client?.acknowledge(cursor)
                 }
             } catch {
                 connection = .stale
             }
         }
-        client.onCapabilities = { [weak self] capabilities in
+        client.onCapabilities = { [weak self, weak client] authority, capabilities in
+            guard client?.currentSessionAuthority == authority else { return }
             self?.capabilities = capabilities
         }
     }
@@ -101,8 +104,25 @@ final class CompanionStore: ObservableObject {
         selectedProjectId = nil
         lastAckCursor = nil
         capabilities = [.observe]
+        transportState = .idle
         connection = .offline
         previewReceipt = String(message.prefix(240))
+    }
+
+    /// Account changes are silent local boundaries. No projection, replay
+    /// cursor, grant, selection, or prior-account notice survives the switch.
+    func clearForAccountChange() {
+        projects.removeAll()
+        sessions.removeAll()
+        attention.removeAll()
+        permissions.removeAll()
+        projectIdsByWindowId.removeAll()
+        selectedProjectId = nil
+        lastAckCursor = nil
+        capabilities = [.observe]
+        transportState = .idle
+        connection = .offline
+        previewReceipt = nil
     }
 
     @discardableResult

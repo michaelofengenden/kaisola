@@ -60,6 +60,14 @@ final class CompanionDeviceRevocationFence {
     func invalidateAllConnections() {
         tokensByConnection.removeAll()
     }
+
+    /// Durable roster tombstones remain account-scoped in their own stores.
+    /// The in-memory fence must not carry Account A's device identifiers into
+    /// Account B, where an unrelated device may legitimately use the same ID.
+    func resetForAccountChange() {
+        tokensByConnection.removeAll()
+        revokedDeviceIDs.removeAll()
+    }
 }
 
 @MainActor
@@ -116,10 +124,12 @@ final class CompanionHost: ObservableObject {
     private var identity: CompanionIdentity?
     private var roster: CompanionDeviceRosterStore?
     private var coordinator: CompanionPairingCoordinator?
+    private var pairingCoordinatorDisposal: (id: UUID, task: Task<Void, Never>)?
     private var linkConfiguration: LinkConfiguration?
     private var linkClient: CompanionLinkClient?
     private var linkObservations: Set<AnyCancellable> = []
     private var linkSignedIn = false
+    private var activeAccountScope: CompanionAccountScope?
     private var connections: [String: any CompanionHostConnection] = [:]
     private var deviceConnections: [String: String] = [:]
     private var liveConnectionIDs: Set<String> = []
@@ -127,7 +137,7 @@ final class CompanionHost: ObservableObject {
     private var synchronizationTokens: [String: UUID] = [:]
     private var connectionEpoch: String
     private var eventLog: CompanionEventLog
-    private let projectionRevisions = CompanionProjectionRevisions()
+    private var projectionRevisions = CompanionProjectionRevisions()
     private let commandRouter = CompanionCommandRouter()
     private let revocationFence = CompanionDeviceRevocationFence()
     private var terminalControlAdapter: CompanionTerminalControlAdapter?
@@ -135,9 +145,13 @@ final class CompanionHost: ObservableObject {
     private var terminalControlDisposal: (id: UUID, task: Task<Void, Never>)?
     private var terminalControlGeneration = UUID()
     private var terminalRecordsByKey: [String: BrokerTerminalRecord] = [:]
-    private lazy var terminalStreamHub = CompanionTerminalStreamHub { [weak self] delivery in
-        Task { @MainActor in self?.deliver(delivery) }
-    }
+    private var terminalStreamHubInstance: CompanionTerminalStreamHub?
+    private var terminalStreamHubGeneration = UUID()
+    /// Invalidates every async callback and resource capture from an older
+    /// signed-in account or host incarnation. This is separate from device
+    /// revocation: account switches must also fence pairing and roster work
+    /// that has not authenticated a device yet.
+    private var hostGeneration = UUID()
 
     init(defaults: UserDefaults = .standard) {
         let epoch = "epoch-\(UUID().uuidString.lowercased())"
@@ -155,6 +169,7 @@ final class CompanionHost: ObservableObject {
     /// status without opening a listener, touching Keychain, or reaching the
     /// relay.
     func loadVisualLinkFixture() {
+        let accountScope = try! CompanionAccountScope(accountID: "visual-companion-account")
         state = .ready(port: 48_911)
         linkPhase = .ready
         linkChannelCount = 1
@@ -166,7 +181,8 @@ final class CompanionHost: ObservableObject {
                 x25519StaticPublic: Data(repeating: 0x22, count: 32).base64EncodedString(),
                 capabilities: [.observe, .terminalControl],
                 pairedAt: 1_785_216_000_000,
-                lastSeenAt: 1_785_216_060_000
+                lastSeenAt: 1_785_216_060_000,
+                accountScope: accountScope
             )
         ]
         connectedDeviceIDs = ["visual-iphone"]
@@ -180,8 +196,8 @@ final class CompanionHost: ObservableObject {
 
     /// Configure the account-authenticated remote transport. This does not
     /// connect until both the Companion host is enabled and native account
-    /// restore has proven a signed-in user. LAN pairing remains available
-    /// without an account; Link never receives a stale or anonymous token.
+    /// restore has proven a signed-in user. Neither LAN nor Link may inherit
+    /// pairing authority from an anonymous or stale account session.
     func configureKaisolaLink(
         baseURL: URL,
         tokenProvider: @escaping CompanionLinkClient.TokenProvider
@@ -214,26 +230,70 @@ final class CompanionHost: ObservableObject {
         }
     }
 
+    /// Switch the entire Companion authority partition. The old listener,
+    /// connections, command lanes, leases, replay log, and roster references
+    /// are synchronously sealed before the replacement account can start.
+    func setActiveAccountID(_ accountID: String?) {
+        let nextScope = accountID.flatMap { try? CompanionAccountScope(accountID: $0) }
+        guard nextScope != activeAccountScope else {
+            setKaisolaLinkSignedIn(nextScope != nil)
+            return
+        }
+        hostGeneration = UUID()
+        if isEnabled || identity != nil || !connections.isEmpty {
+            stop(persistPreference: false)
+        }
+        activeAccountScope = nextScope
+        setKaisolaLinkSignedIn(nextScope != nil)
+        if nextScope != nil, defaults.bool(forKey: Self.enabledDefaultsKey) {
+            startAfterRetiredPairingStateIsSealed()
+        }
+    }
+
     private func prepareKaisolaLink() {
         guard isEnabled, linkSignedIn, linkClient == nil,
               let linkConfiguration, let identity else { return }
+        let generation = hostGeneration
         guard let client = CompanionLinkClient(
             desktopID: identity.id,
             baseURL: linkConfiguration.baseURL,
             tokenProvider: linkConfiguration.tokenProvider,
-            acceptSocket: { [weak self] socket in self?.accept(socket) }
+            acceptSocket: { [weak self] socket in
+                self?.accept(socket, generation: generation)
+            }
         ) else {
             linkPhase = .unavailable
             return
         }
         linkClient = client
         client.$phase
-            .sink { [weak self] in self?.linkPhase = $0 }
+            .sink { [weak self] phase in
+                guard self?.isCurrentHost(generation) == true,
+                      self?.linkClient === client else { return }
+                self?.linkPhase = phase
+            }
             .store(in: &linkObservations)
         client.$channelCount
-            .sink { [weak self] in self?.linkChannelCount = $0 }
+            .sink { [weak self] count in
+                guard self?.isCurrentHost(generation) == true,
+                      self?.linkClient === client else { return }
+                self?.linkChannelCount = count
+            }
             .store(in: &linkObservations)
         client.enable()
+    }
+
+    private func terminalStreamHub() -> CompanionTerminalStreamHub {
+        if let terminalStreamHubInstance { return terminalStreamHubInstance }
+        let generation = terminalStreamHubGeneration
+        let hub = CompanionTerminalStreamHub { [weak self] delivery in
+            Task { @MainActor in
+                guard let self, self.terminalStreamHubGeneration == generation else { return }
+                self.deliver(delivery)
+            }
+        }
+        terminalStreamHubInstance = hub
+        return hub
     }
 
     private func installTerminalControl(_ adapter: CompanionTerminalControlAdapter) {
@@ -276,13 +336,14 @@ final class CompanionHost: ObservableObject {
     }
 
     func startIfEnabled() {
-        guard defaults.bool(forKey: Self.enabledDefaultsKey) else { return }
-        setEnabled(true)
+        guard activeAccountScope != nil,
+              defaults.bool(forKey: Self.enabledDefaultsKey) else { return }
+        startAfterRetiredPairingStateIsSealed()
     }
 
     func setEnabled(_ enabled: Bool) {
         defaults.set(enabled, forKey: Self.enabledDefaultsKey)
-        if enabled { start() }
+        if enabled { startAfterRetiredPairingStateIsSealed() }
         else { stop() }
     }
 
@@ -293,7 +354,7 @@ final class CompanionHost: ObservableObject {
         lastError = nil
         if case .failed = state {
             stop(persistPreference: false)
-            start()
+            startAfterRetiredPairingStateIsSealed()
             return
         }
         if !isEnabled {
@@ -303,12 +364,44 @@ final class CompanionHost: ObservableObject {
         linkClient?.refresh()
     }
 
+    private func startAfterRetiredPairingStateIsSealed() {
+        guard activeAccountScope != nil else {
+            state = .disabled
+            lastError = "Sign in before enabling Companion."
+            return
+        }
+        guard let pending = pairingCoordinatorDisposal else {
+            start()
+            return
+        }
+        let generation = hostGeneration
+        state = .starting
+        Task { @MainActor [weak self] in
+            await pending.task.value
+            guard let self else { return }
+            if self.pairingCoordinatorDisposal?.id == pending.id {
+                self.pairingCoordinatorDisposal = nil
+            }
+            guard self.hostGeneration == generation,
+                  self.activeAccountScope != nil,
+                  self.defaults.bool(forKey: Self.enabledDefaultsKey) else { return }
+            self.state = .disabled
+            self.start()
+        }
+    }
+
     func createPairingOffer(allowsTerminalControl: Bool) async throws {
-        guard case let .ready(port) = state, let coordinator else {
+        guard case let .ready(port) = state, let coordinator,
+              let accountScope = activeAccountScope else {
             throw CompanionWireError.connectionUnavailable
         }
+        let generation = hostGeneration
         if let current = pairingPayload {
             _ = await coordinator.cancelOffer(pairingID: current.pairingNonce)
+            guard isCurrentHost(generation, accountScope: accountScope),
+                  self.coordinator === coordinator else {
+                throw CompanionWireError.connectionUnavailable
+            }
         }
         pairingPhrase = nil
         let capabilities: [CompanionCapability] = allowsTerminalControl
@@ -319,6 +412,12 @@ final class CompanionHost: ObservableObject {
             requestedCapabilities: capabilities,
             nowMilliseconds: Self.nowMilliseconds()
         )
+        guard isCurrentHost(generation, accountScope: accountScope),
+              self.coordinator === coordinator,
+              payload.accountScope == accountScope else {
+            _ = await coordinator.cancelOffer(pairingID: payload.pairingNonce)
+            throw CompanionWireError.connectionUnavailable
+        }
         let encoded = try CanonicalJSON.data(from: payload)
         guard let code = String(data: encoded, encoding: .utf8) else {
             throw CompanionPairingCoordinatorError.invalidOffer
@@ -339,16 +438,30 @@ final class CompanionHost: ObservableObject {
 
     func confirmPairing() async throws {
         guard let phrase = pairingPhrase,
-              let connection = connections[phrase.connectionID] else {
+              let connection = connections[phrase.connectionID],
+              let roster else {
             throw CompanionPairingCoordinatorError.handshakeOrder
         }
+        let generation = hostGeneration
         guard await connection.confirmPairing(pairingID: phrase.pairingID) else {
             throw CompanionPairingCoordinatorError.handshakeOrder
+        }
+        guard isCurrentHost(generation),
+              connections[phrase.connectionID] != nil else {
+            // If the final SAS frame won the race with account shutdown, leave
+            // a durable tombstone in the retired account rather than allowing
+            // that late pairing to reappear when the user switches back.
+            _ = try? await roster.revoke(phrase.deviceID)
+            await connection.close(reason: "account_changed")
+            throw CompanionWireError.connectionUnavailable
         }
     }
 
     func revoke(deviceID: String) async throws {
         guard let roster else { throw CompanionWireError.connectionUnavailable }
+        let generation = hostGeneration
+        let streamHub = terminalStreamHubInstance
+        let terminalControl = self.terminalControl
         // Seal authority before the first await. This is the revocation
         // linearization point for both transports and every queued command.
         var revokedConnectionIDs = Set(revocationFence.revoke(deviceID: deviceID))
@@ -371,12 +484,12 @@ final class CompanionHost: ObservableObject {
         // fence remains closed if persistence fails, so access never widens.
         _ = try await roster.revoke(deviceID)
         for (connectionID, connection) in revokedConnections {
-            await terminalStreamHub.releaseConnection(connectionID)
+            await streamHub?.releaseConnection(connectionID)
             await terminalControl?.releaseConnection(connectionID)
             _ = try? await connection.sendDeviceRevoked()
             await connection.close(reason: "device_revoked")
         }
-        await refreshDevices()
+        await refreshDevices(using: roster, generation: generation)
     }
 
     /// Accept a whole-app snapshot from the AppDelegate's window registry.
@@ -386,6 +499,10 @@ final class CompanionHost: ObservableObject {
         terminalStreams: [String: CompanionTerminalStreamHead],
         terminalRecords: [BrokerTerminalRecord]
     ) {
+        // Projection caches are account capabilities, not app-global display
+        // state. Never stage a signed-out snapshot for whichever user signs in
+        // next, and reset the gate synchronously during stop/account switch.
+        guard activeAccountScope != nil, isEnabled else { return }
         var records: [String: BrokerTerminalRecord] = [:]
         for terminal in terminalRecords {
             let key = terminalKey(
@@ -441,6 +558,13 @@ final class CompanionHost: ObservableObject {
             if case .failed = state { return true }
             return false
         }() else { return }
+        guard let accountScope = activeAccountScope else {
+            state = .disabled
+            lastError = "Sign in before enabling Companion."
+            return
+        }
+        let generation = UUID()
+        hostGeneration = generation
         state = .starting
         lastError = nil
         prepareTerminalControl()
@@ -449,7 +573,10 @@ final class CompanionHost: ObservableObject {
             let identity = try CompanionIdentityStore().loadOrCreate(
                 displayName: Host.current().localizedName ?? "Kaisola Desktop"
             )
-            let roster = try CompanionDeviceRosterStore()
+            let roster = try CompanionDeviceRosterStore(
+                fileURL: NativePreviewPaths.companionDevices(accountScope: accountScope),
+                accountScope: accountScope
+            )
             let coordinator = try CompanionPairingCoordinator(identity: identity, roster: roster)
             self.identity = identity
             self.roster = roster
@@ -460,11 +587,13 @@ final class CompanionHost: ObservableObject {
                 _ = try appendProjection(projection)
             }
             listener.onConnection = { [weak self] connection in
-                Task { @MainActor in self?.accept(connection) }
+                Task { @MainActor in
+                    self?.accept(connection, generation: generation)
+                }
             }
             try listener.start(identity: identity)
             prepareKaisolaLink()
-            Task { await refreshDevices() }
+            Task { await refreshDevices(using: roster, generation: generation) }
         } catch {
             fail(error)
         }
@@ -472,6 +601,8 @@ final class CompanionHost: ObservableObject {
 
     private func stop(persistPreference: Bool = true) {
         if persistPreference { defaults.set(false, forKey: Self.enabledDefaultsKey) }
+        hostGeneration = UUID()
+        commandRouter.invalidateAll()
         listener.stop()
         linkClient?.disable()
         linkClient = nil
@@ -479,6 +610,17 @@ final class CompanionHost: ObservableObject {
         linkPhase = .off
         linkChannelCount = 0
         let active = Array(connections.values)
+        let expiringCoordinator = coordinator
+        let priorPairingDisposal = pairingCoordinatorDisposal
+        let pairingDisposalID = UUID()
+        let pairingDisposalTask = Task {
+            await priorPairingDisposal?.task.value
+            await expiringCoordinator?.invalidateAll()
+        }
+        pairingCoordinatorDisposal = (pairingDisposalID, pairingDisposalTask)
+        let expiringTerminalStreamHub = terminalStreamHubInstance
+        terminalStreamHubInstance = nil
+        terminalStreamHubGeneration = UUID()
         let expiringTerminalControl = terminalControl
         terminalControl = nil
         terminalControlGeneration = UUID()
@@ -491,10 +633,13 @@ final class CompanionHost: ObservableObject {
         synchronizationTasks.removeAll()
         synchronizationTokens.removeAll()
         connections.removeAll()
-        revocationFence.invalidateAllConnections()
+        revocationFence.resetForAccountChange()
         deviceConnections.removeAll()
         liveConnectionIDs.removeAll()
         terminalRecordsByKey.removeAll()
+        connectionEpoch = "epoch-\(UUID().uuidString.lowercased())"
+        eventLog = CompanionEventLog(epoch: connectionEpoch)
+        projectionRevisions = CompanionProjectionRevisions()
         identity = nil
         roster = nil
         coordinator = nil
@@ -507,17 +652,21 @@ final class CompanionHost: ObservableObject {
         lastError = nil
         state = .disabled
         Task {
+            await pairingDisposalTask.value
             for connection in active { await connection.close(reason: "host_disabled") }
-            await terminalStreamHub.shutdown()
+            await expiringTerminalStreamHub?.shutdown()
             await disposalTask.value
             if terminalControlDisposal?.id == disposalID {
                 terminalControlDisposal = nil
             }
+            if pairingCoordinatorDisposal?.id == pairingDisposalID {
+                pairingCoordinatorDisposal = nil
+            }
         }
     }
 
-    private func accept(_ networkConnection: NWConnection) {
-        guard isEnabled, let coordinator else {
+    private func accept(_ networkConnection: NWConnection, generation: UUID) {
+        guard isCurrentHost(generation), isEnabled, let coordinator, let roster else {
             networkConnection.cancel()
             return
         }
@@ -538,7 +687,14 @@ final class CompanionHost: ObservableObject {
             epoch: connectionEpoch,
             transportHint: hint
         ) { [weak self] event in
-            Task { @MainActor in self?.handle(event, connectionID: id) }
+            Task { @MainActor in
+                self?.handle(
+                    event,
+                    connectionID: id,
+                    generation: generation,
+                    roster: roster
+                )
+            }
         }
         connections[id] = connection
         Task {
@@ -547,8 +703,9 @@ final class CompanionHost: ObservableObject {
         }
     }
 
-    private func accept(_ relaySocket: CompanionRelayVirtualSocket) {
-        guard isEnabled, linkSignedIn, let coordinator else {
+    private func accept(_ relaySocket: CompanionRelayVirtualSocket, generation: UUID) {
+        guard isCurrentHost(generation), isEnabled, linkSignedIn,
+              let coordinator, let roster else {
             Task { await relaySocket.localClose() }
             return
         }
@@ -562,7 +719,14 @@ final class CompanionHost: ObservableObject {
             coordinator: coordinator,
             epoch: connectionEpoch
         ) { [weak self] event in
-            Task { @MainActor in self?.handle(event, connectionID: id) }
+            Task { @MainActor in
+                self?.handle(
+                    event,
+                    connectionID: id,
+                    generation: generation,
+                    roster: roster
+                )
+            }
         }
         connections[id] = connection
         Task {
@@ -571,9 +735,21 @@ final class CompanionHost: ObservableObject {
         }
     }
 
-    private func handle(_ event: CompanionConnectionEvent, connectionID: String) {
+    private func handle(
+        _ event: CompanionConnectionEvent,
+        connectionID: String,
+        generation: UUID,
+        roster: CompanionDeviceRosterStore
+    ) {
+        guard isCurrentHost(generation), self.roster === roster else {
+            if case let .authenticated(device, resumed) = event, !resumed {
+                Task { _ = try? await roster.revoke(device.deviceId) }
+            }
+            return
+        }
         switch event {
         case let .pairingPhrase(pairingID, deviceID, displayName, sas):
+            guard connections[connectionID] != nil else { break }
             pairingPhrase = PairingPhrase(
                 pairingID: pairingID,
                 connectionID: connectionID,
@@ -582,7 +758,7 @@ final class CompanionHost: ObservableObject {
                 sas: sas
             )
         case let .authenticated(device, resumed):
-            let rejectedConnection = connections[connectionID]
+            guard let rejectedConnection = connections[connectionID] else { break }
             guard revocationFence.authorize(
                 deviceID: device.deviceId,
                 connectionID: connectionID,
@@ -590,8 +766,8 @@ final class CompanionHost: ObservableObject {
             ) != nil else {
                 connections.removeValue(forKey: connectionID)
                 Task {
-                    _ = try? await rejectedConnection?.sendDeviceRevoked()
-                    await rejectedConnection?.close(reason: "device_revoked")
+                    _ = try? await rejectedConnection.sendDeviceRevoked()
+                    await rejectedConnection.close(reason: "device_revoked")
                 }
                 break
             }
@@ -599,12 +775,14 @@ final class CompanionHost: ObservableObject {
             if let previousID = deviceConnections[device.deviceId],
                previousID != connectionID,
                let previous = connections.removeValue(forKey: previousID) {
+                let streamHub = terminalStreamHubInstance
+                let terminalControl = self.terminalControl
                 revocationFence.invalidate(connectionID: previousID)
                 synchronizationTasks.removeValue(forKey: previousID)?.cancel()
                 synchronizationTokens.removeValue(forKey: previousID)
                 liveConnectionIDs.remove(previousID)
                 Task {
-                    await terminalStreamHub.releaseConnection(previousID)
+                    await streamHub?.releaseConnection(previousID)
                     await terminalControl?.releaseConnection(previousID)
                     await previous.close(reason: "device_connection_replaced")
                 }
@@ -613,7 +791,7 @@ final class CompanionHost: ObservableObject {
             pairingPayload = nil
             pairingCode = nil
             pairingPhrase = nil
-            Task { await refreshDevices() }
+            Task { await refreshDevices(using: roster, generation: generation) }
         case let .live(device, _, resumeCursor):
             guard let connection = connections[connectionID] else { break }
             guard let authority = revocationFence.token(
@@ -635,7 +813,8 @@ final class CompanionHost: ObservableObject {
                     deviceID: device.deviceId,
                     resumeCursor: resumeCursor,
                     connection: connection,
-                    authority: authority
+                    authority: authority,
+                    generation: generation
                 )
             }
             synchronizationTasks[connectionID] = synchronization
@@ -645,7 +824,8 @@ final class CompanionHost: ObservableObject {
                       self.synchronizationTokens[connectionID] == synchronizationToken else { return }
                 self.synchronizationTasks.removeValue(forKey: connectionID)
                 self.synchronizationTokens.removeValue(forKey: connectionID)
-                guard synchronized, self.connections[connectionID] != nil,
+                guard synchronized, self.isCurrentHost(generation),
+                      self.connections[connectionID] != nil,
                       self.revocationFence.isAuthorized(authority) else { return }
                 self.liveConnectionIDs.insert(connectionID)
             }
@@ -665,11 +845,14 @@ final class CompanionHost: ObservableObject {
                 break
             }
             guard envelope.kind == .command else { break }
+            let streamHub = terminalStreamHub()
+            let terminalControl = self.terminalControl
             Task { @MainActor [weak self] in
                 guard let self else { return }
                 if let synchronization = synchronizationTasks[connectionID],
                    await synchronization.value == false { return }
-                guard connections[connectionID] != nil,
+                guard isCurrentHost(generation),
+                      connections[connectionID] != nil,
                       revocationFence.isAuthorized(authority) else { return }
                 do {
                     let command = try envelope.body.decode(CompanionCommandBody.self)
@@ -678,7 +861,9 @@ final class CompanionHost: ObservableObject {
                         device: device,
                         projection: projectionRevisions.current,
                         isAuthorized: { [weak self] in
-                            self?.revocationFence.isAuthorized(authority) == true
+                            guard let self else { return false }
+                            return self.isCurrentHost(generation)
+                                && self.revocationFence.isAuthorized(authority)
                         },
                         acknowledgeAttention: { portableSessionID in
                             guard let entry = AttentionCenter.shared.entries.first(where: {
@@ -697,11 +882,15 @@ final class CompanionHost: ObservableObject {
                                 command,
                                 deviceID: device.deviceId,
                                 connectionID: connectionID,
-                                authority: authority
+                                authority: authority,
+                                generation: generation,
+                                streamHub: streamHub,
+                                terminalControl: terminalControl
                             )
                         }
                     )
-                    guard self.revocationFence.isAuthorized(authority),
+                    guard self.isCurrentHost(generation),
+                          self.revocationFence.isAuthorized(authority),
                           self.connections[connectionID] != nil else { return }
                     try await connection.sendReceipt(
                         receipt,
@@ -710,11 +899,12 @@ final class CompanionHost: ObservableObject {
                     )
                     if command.type == "stream.subscribe",
                        receipt.status == .applied || receipt.status == .accepted,
-                       let snapshot = await terminalStreamHub.currentSnapshot(
+                       let snapshot = await streamHub.currentSnapshot(
                            connectionID: connectionID,
                            command: command
                        ) {
-                        guard self.revocationFence.isAuthorized(authority),
+                        guard self.isCurrentHost(generation),
+                              self.revocationFence.isAuthorized(authority),
                               self.connections[connectionID] != nil else { return }
                         let record = try eventLog.append(
                             kind: .event,
@@ -723,7 +913,8 @@ final class CompanionHost: ObservableObject {
                             sentAt: Self.nowMilliseconds(),
                             audience: [connectionID]
                         )
-                        guard self.revocationFence.isAuthorized(authority),
+                        guard self.isCurrentHost(generation),
+                              self.revocationFence.isAuthorized(authority),
                               self.connections[connectionID] != nil else { return }
                         try await send(record, to: connection)
                     }
@@ -732,6 +923,9 @@ final class CompanionHost: ObservableObject {
                 }
             }
         case .closed:
+            guard connections[connectionID] != nil else { break }
+            let streamHub = terminalStreamHubInstance
+            let terminalControl = self.terminalControl
             synchronizationTasks.removeValue(forKey: connectionID)?.cancel()
             synchronizationTokens.removeValue(forKey: connectionID)
             connections.removeValue(forKey: connectionID)
@@ -747,59 +941,83 @@ final class CompanionHost: ObservableObject {
             deviceConnections = deviceConnections.filter { $0.value != connectionID }
             if pairingPhrase?.connectionID == connectionID { pairingPhrase = nil }
             Task {
-                await terminalStreamHub.releaseConnection(connectionID)
+                await streamHub?.releaseConnection(connectionID)
                 await terminalControl?.releaseConnection(connectionID)
             }
         }
     }
 
-    private func refreshDevices() async {
-        pairedDevices = await roster?.list() ?? []
+    private func refreshDevices(
+        using roster: CompanionDeviceRosterStore,
+        generation: UUID
+    ) async {
+        let devices = await roster.list()
+        guard isCurrentHost(generation), self.roster === roster else { return }
+        pairedDevices = devices
     }
 
     private func routeExternal(
         _ command: CompanionCommandBody,
         deviceID: String,
         connectionID: String,
-        authority: CompanionDeviceRevocationFence.Token
+        authority: CompanionDeviceRevocationFence.Token,
+        generation: UUID,
+        streamHub: CompanionTerminalStreamHub,
+        terminalControl: CompanionTerminalControl?
     ) async -> CompanionReceiptBody? {
-        guard revocationFence.isAuthorized(authority) else { return revokedReceipt(command) }
+        guard isCurrentHost(generation),
+              revocationFence.isAuthorized(authority) else { return revokedReceipt(command) }
         let key = terminalKey(projectID: command.projectId, terminalID: command.targetId)
+        let terminal = terminalRecordsByKey[key]
         switch command.type {
         case "stream.subscribe":
-            guard let terminal = terminalRecordsByKey[key] else {
+            guard let terminal else {
                 return receipt(
                     command,
                     status: .rejected,
                     message: "That terminal is no longer available in this project."
                 )
             }
-            let response = await terminalStreamHub.subscribe(
+            let response = await streamHub.subscribe(
                 connectionID: connectionID,
                 command: command,
                 terminal: terminal
             )
-            guard revocationFence.isAuthorized(authority) else {
-                await terminalStreamHub.releaseConnection(connectionID)
+            guard isCurrentHost(generation),
+                  revocationFence.isAuthorized(authority) else {
+                await streamHub.releaseConnection(connectionID)
                 return revokedReceipt(command)
             }
             return response.receipt
         case "stream.unsubscribe":
-            return await terminalStreamHub.unsubscribe(
+            let response = await streamHub.unsubscribe(
                 connectionID: connectionID,
                 command: command,
-                terminal: terminalRecordsByKey[key]
-            ).receipt
+                terminal: terminal
+            )
+            guard isCurrentHost(generation),
+                  revocationFence.isAuthorized(authority) else {
+                await streamHub.releaseConnection(connectionID)
+                return revokedReceipt(command)
+            }
+            return response.receipt
         default:
-            return await terminalControl?.route(
+            let response = await terminalControl?.route(
                 command: command,
                 deviceID: deviceID,
                 connectionID: connectionID,
-                terminal: terminalRecordsByKey[key],
+                terminal: terminal,
                 isAuthorized: { [weak self] in
-                    self?.revocationFence.isAuthorized(authority) == true
+                    guard let self else { return false }
+                    return self.isCurrentHost(generation)
+                        && self.revocationFence.isAuthorized(authority)
                 }
             )
+            guard isCurrentHost(generation),
+                  revocationFence.isAuthorized(authority) else {
+                return revokedReceipt(command)
+            }
+            return response
         }
     }
 
@@ -887,7 +1105,8 @@ final class CompanionHost: ObservableObject {
         deviceID: String,
         resumeCursor: CompanionAckCursor?,
         connection: any CompanionHostConnection,
-        authority: CompanionDeviceRevocationFence.Token
+        authority: CompanionDeviceRevocationFence.Token,
+        generation: UUID
     ) async -> Bool {
         do {
             var cursor = resumeCursor
@@ -895,13 +1114,17 @@ final class CompanionHost: ObservableObject {
             // window where a projection is published while the socket write is
             // suspended, without allowing a noisy peer to starve hello forever.
             for _ in 0..<4 {
-                guard !Task.isCancelled, revocationFence.isAuthorized(authority) else { return false }
+                guard !Task.isCancelled, isCurrentHost(generation),
+                      revocationFence.isAuthorized(authority) else { return false }
                 let synchronizedThrough: Int64
                 switch try eventLog.replay(after: cursor, connectionID: connectionID) {
                 case let .replay(records, currentSequence):
                     for record in records {
-                        guard revocationFence.isAuthorized(authority) else { return false }
+                        guard isCurrentHost(generation),
+                              revocationFence.isAuthorized(authority) else { return false }
                         try await send(record, to: connection)
+                        guard isCurrentHost(generation),
+                              revocationFence.isAuthorized(authority) else { return false }
                     }
                     synchronizedThrough = currentSequence
                 case let .snapshotRequired(_, currentSequence):
@@ -918,8 +1141,11 @@ final class CompanionHost: ObservableObject {
                         )),
                         audience: nil
                     )
-                    guard revocationFence.isAuthorized(authority) else { return false }
+                    guard isCurrentHost(generation),
+                          revocationFence.isAuthorized(authority) else { return false }
                     try await send(record, to: connection)
+                    guard isCurrentHost(generation),
+                          revocationFence.isAuthorized(authority) else { return false }
                     synchronizedThrough = currentSequence
                 }
                 cursor = CompanionAckCursor(epoch: connectionEpoch, seq: synchronizedThrough)
@@ -931,6 +1157,7 @@ final class CompanionHost: ObservableObject {
             // at the latest cursor; the phone will immediately re-subscribe for
             // its own bounded terminal tail.
             if let projection = projectionRevisions.current,
+               isCurrentHost(generation),
                revocationFence.isAuthorized(authority) {
                 let sequence = eventLog.currentSequence
                 try await send(CompanionOutboundRecord(
@@ -945,6 +1172,8 @@ final class CompanionHost: ObservableObject {
                     )),
                     audience: nil
                 ), to: connection)
+                guard isCurrentHost(generation),
+                      revocationFence.isAuthorized(authority) else { return false }
             }
             _ = deviceID
             return true
@@ -987,6 +1216,15 @@ final class CompanionHost: ObservableObject {
             deviceConnections = deviceConnections.filter { $0.value != connectionID }
             await terminalControl?.releaseConnection(connectionID)
         }
+    }
+
+    private func isCurrentHost(
+        _ generation: UUID,
+        accountScope: CompanionAccountScope? = nil
+    ) -> Bool {
+        guard hostGeneration == generation else { return false }
+        guard let accountScope else { return true }
+        return activeAccountScope == accountScope
     }
 
     private func adopt(listenerState: CompanionListener.State) {

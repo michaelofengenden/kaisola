@@ -26,7 +26,8 @@ final class CompanionConnectionSessionTests: XCTestCase {
             displayName: "Test iPhone"
         )
         let roster = try CompanionDeviceRosterStore(
-            fileURL: directory.appendingPathComponent("devices-v1.json")
+            fileURL: directory.appendingPathComponent("devices-v3.json"),
+            accountScope: try CompanionAccountScope(accountID: "connection-session-test-account")
         )
         _ = try await roster.pair(
             peer: CompanionIdentityPin(
@@ -68,6 +69,7 @@ final class CompanionConnectionSessionTests: XCTestCase {
             "desktopId": .string(desktop.id),
             "deviceId": .string(device.id),
             "connectionId": .string(connectionID),
+            "accountScope": .string(roster.accountScope.rawValue),
         ])
         let initiator = try NoiseXXInitiator(
             identity: device,
@@ -83,6 +85,7 @@ final class CompanionConnectionSessionTests: XCTestCase {
             "type": .string("resume.start"),
             "deviceId": .string(device.id),
             "connectionId": .string(connectionID),
+            "accountScope": .string(roster.accountScope.rawValue),
             "message1": .string(try initiator.writeMessage1().base64URLEncodedString()),
         ]))
         let startWire = try CompanionLengthFrameDecoder.encode(startPayload)
@@ -308,7 +311,8 @@ final class CompanionConnectionSessionTests: XCTestCase {
             displayName: "Test Mac"
         )
         let roster = try CompanionDeviceRosterStore(
-            fileURL: directory.appendingPathComponent("devices-v1.json")
+            fileURL: directory.appendingPathComponent("devices-v3.json"),
+            accountScope: try CompanionAccountScope(accountID: "connection-session-revoked-account")
         )
         let coordinator = try CompanionPairingCoordinator(identity: desktop, roster: roster)
         let wire = WireCapture()

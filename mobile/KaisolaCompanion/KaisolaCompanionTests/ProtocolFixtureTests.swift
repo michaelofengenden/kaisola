@@ -11,11 +11,41 @@ private final class RevocationDesktopStore: PairedDesktopPersisting {
         self.desktop = desktop
     }
 
-    func load() -> CompanionPairedDesktop? { desktop }
-    func save(_ desktop: CompanionPairedDesktop) { self.desktop = desktop }
-    func clear() {
+    func load(accountScope: CompanionAccountScope) -> CompanionPairedDesktop? {
+        desktop?.accountScope == accountScope ? desktop : nil
+    }
+    func save(_ desktop: CompanionPairedDesktop, accountScope: CompanionAccountScope) {
+        guard desktop.accountScope == accountScope else { return }
+        self.desktop = desktop
+    }
+    func clear(accountScope: CompanionAccountScope) {
+        guard desktop?.accountScope == accountScope else { return }
         clearCount += 1
         desktop = nil
+    }
+}
+
+private actor GatedAccountRendezvous: CompanionAccountRendezvousServing {
+    private var didStart = false
+    private var startWaiters: [CheckedContinuation<Void, Never>] = []
+    private var response: CheckedContinuation<[CompanionAccountOffer], Error>?
+
+    func listOffers(idToken: String) async throws -> [CompanionAccountOffer] {
+        _ = idToken
+        didStart = true
+        startWaiters.forEach { $0.resume() }
+        startWaiters.removeAll()
+        return try await withCheckedThrowingContinuation { response = $0 }
+    }
+
+    func waitUntilStarted() async {
+        if didStart { return }
+        await withCheckedContinuation { startWaiters.append($0) }
+    }
+
+    func resolve(_ offers: [CompanionAccountOffer]) {
+        response?.resume(returning: offers)
+        response = nil
     }
 }
 
@@ -25,6 +55,291 @@ final class ProtocolFixtureTests: XCTestCase {
         "snapshot-board", "stale-revision-error", "terminal-output",
         "terminal-control-command", "terminal-control-receipt",
     ]
+
+    @MainActor
+    func testAccountSwitchHidesProjectionAndRestoresOnlyMatchingDesktopTicket() throws {
+        let suite = "kaisola-companion-account-store-\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let persistence = UserDefaultsPairedDesktopStore(defaults: defaults)
+        let accountA = try CompanionAccountScope(accountID: "firebase-account-a")
+        let accountB = try CompanionAccountScope(accountID: "firebase-account-b")
+        let desktopA = CompanionPairedDesktop(
+            desktopId: "desktop-account-a",
+            identityPublic: Data(repeating: 1, count: 32).base64URLEncodedString(),
+            x25519StaticPublic: Data(repeating: 2, count: 32).base64URLEncodedString(),
+            capabilities: [.observe],
+            transportHint: nil,
+            accountScope: accountA
+        )
+        let desktopB = CompanionPairedDesktop(
+            desktopId: "desktop-account-b",
+            identityPublic: Data(repeating: 3, count: 32).base64URLEncodedString(),
+            x25519StaticPublic: Data(repeating: 4, count: 32).base64URLEncodedString(),
+            capabilities: [.observe],
+            transportHint: nil,
+            accountScope: accountB
+        )
+        persistence.save(desktopA, accountScope: accountA)
+        persistence.save(desktopB, accountScope: accountB)
+
+        let transport = CompanionTransport(autoConnect: false)
+        let client = CompanionClient(transport: transport)
+        let store = CompanionStore.live(client: client)
+        let coordinator = CompanionConnectionCoordinator(
+            client: client,
+            persistence: persistence,
+            store: store
+        )
+
+        coordinator.activateAccount(accountID: "firebase-account-a")
+        XCTAssertEqual(coordinator.pairedDesktop, desktopA)
+        let accountAIntent = try XCTUnwrap(coordinator.captureAccountIntent())
+        let phone = try CompanionIdentity(
+            id: "device-account-switch",
+            role: .device,
+            displayName: "Account switch iPhone"
+        )
+        try client.configureResume(
+            desktop: desktopA,
+            identity: phone,
+            cursor: CompanionAckCursor(epoch: "account-a-epoch", seq: 41),
+            accountScope: accountA
+        )
+        let clientAccountA = try XCTUnwrap(client.currentSessionAuthority)
+        XCTAssertTrue(coordinator.adoptConfiguredClientAuthority(clientAccountA))
+        client.onStreamIssue?(clientAccountA, "terminal-account-a", "Account A stream issue")
+        XCTAssertTrue(try store.apply(CompanionProtocolCodec.decode(fixtureData("snapshot-board"))))
+        XCTAssertFalse(store.projects.isEmpty)
+        XCTAssertNotNil(store.lastAckCursor)
+
+        coordinator.activateAccount(accountID: "firebase-account-b")
+        XCTAssertEqual(coordinator.pairedDesktop, desktopB)
+        XCTAssertTrue(store.projects.isEmpty)
+        XCTAssertNil(store.lastAckCursor)
+        XCTAssertEqual(store.capabilities, [.observe])
+        XCTAssertNil(client.pairedDesktop)
+        XCTAssertNil(client.ackCursor)
+        XCTAssertTrue(coordinator.terminalStreamIssues.isEmpty)
+        XCTAssertEqual(coordinator.activeRoute, .none)
+
+        client.onStreamIssue?(clientAccountA, "terminal-account-b", "stale Account A issue")
+        XCTAssertNil(coordinator.terminalStreamIssues["terminal-account-b"])
+        try client.configureResume(
+            desktop: desktopB,
+            identity: phone,
+            cursor: nil,
+            accountScope: accountB
+        )
+        let clientAccountB = try XCTUnwrap(client.currentSessionAuthority)
+        XCTAssertTrue(coordinator.adoptConfiguredClientAuthority(clientAccountB))
+        client.onStreamIssue?(clientAccountB, "terminal-account-b", "Account B stream issue")
+        coordinator.setTerminalStream(
+            projectId: "project-account-a",
+            sessionId: "terminal-account-b",
+            subscribed: true,
+            intent: accountAIntent
+        )
+        XCTAssertEqual(
+            coordinator.terminalStreamIssues["terminal-account-b"],
+            "Account B stream issue"
+        )
+        let accountBIntent = try XCTUnwrap(coordinator.captureAccountIntent())
+        coordinator.setTerminalStream(
+            projectId: "project-account-b",
+            sessionId: "terminal-account-b",
+            subscribed: true,
+            intent: accountBIntent
+        )
+        XCTAssertNil(coordinator.terminalStreamIssues["terminal-account-b"])
+
+        coordinator.activateAccount(accountID: nil)
+        XCTAssertNil(coordinator.pairedDesktop)
+        XCTAssertTrue(store.projects.isEmpty)
+        XCTAssertEqual(store.transportState, .idle)
+        client.onTransportState?(nil, .live)
+        XCTAssertEqual(store.transportState, .idle)
+        XCTAssertEqual(store.connection, .offline)
+
+        coordinator.activateAccount(accountID: "firebase-account-a")
+        XCTAssertEqual(coordinator.pairedDesktop, desktopA)
+        XCTAssertNil(store.lastAckCursor)
+        XCTAssertTrue(store.projects.isEmpty)
+        try client.configureResume(
+            desktop: desktopA,
+            identity: phone,
+            cursor: nil,
+            accountScope: accountA
+        )
+        let replacementClientAccountA = try XCTUnwrap(client.currentSessionAuthority)
+        XCTAssertNotEqual(replacementClientAccountA, clientAccountA)
+        XCTAssertTrue(coordinator.adoptConfiguredClientAuthority(replacementClientAccountA))
+        client.onRevoked?(clientAccountA, "stale revocation from old Account A connection")
+        XCTAssertEqual(coordinator.pairedDesktop, desktopA)
+        XCTAssertEqual(persistence.load(accountScope: accountA), desktopA)
+    }
+
+    @MainActor
+    func testPairedDesktopPersistenceRejectsLegacyAndCrossAccountContent() throws {
+        let suite = "kaisola-companion-account-store-boundary-\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let persistence = UserDefaultsPairedDesktopStore(defaults: defaults)
+        let accountA = try CompanionAccountScope(accountID: "firebase-account-a")
+        let accountB = try CompanionAccountScope(accountID: "firebase-account-b")
+        let desktopB = CompanionPairedDesktop(
+            desktopId: "desktop-account-b",
+            identityPublic: Data(repeating: 3, count: 32).base64URLEncodedString(),
+            x25519StaticPublic: Data(repeating: 4, count: 32).base64URLEncodedString(),
+            capabilities: [.observe],
+            transportHint: nil,
+            accountScope: accountB
+        )
+
+        defaults.set(
+            try JSONEncoder().encode(desktopB),
+            forKey: "com.kaisola.companion.paired-desktop.v2.\(accountA.rawValue)"
+        )
+        defaults.set(Data("legacy-unscoped-ticket".utf8), forKey: "com.kaisola.companion.paired-desktop.v1")
+
+        XCTAssertNil(persistence.load(accountScope: accountA))
+        XCTAssertNil(defaults.object(forKey: "com.kaisola.companion.paired-desktop.v1"))
+        persistence.save(desktopB, accountScope: accountB)
+        let restoredB = persistence.load(accountScope: accountB)
+        XCTAssertEqual(restoredB, desktopB)
+
+        persistence.save(desktopB, accountScope: accountA)
+        XCTAssertNil(persistence.load(accountScope: accountA))
+    }
+
+    @MainActor
+    func testPairingPayloadFromAnotherAccountFailsBeforeIdentityOrTransportWork() async throws {
+        let accountA = try CompanionAccountScope(accountID: "firebase-account-a")
+        let desktop = try CompanionIdentity(
+            id: "desktop-other-account",
+            role: .desktop,
+            displayName: "Other account Mac"
+        )
+        let payload = CompanionPairingPayload(
+            desktopId: desktop.id,
+            identityPublic: desktop.identityPublic,
+            keyRecord: desktop.keyRecord,
+            pairingNonce: Data(repeating: 7, count: 32).base64EncodedString(),
+            requestedCapabilities: [.observe],
+            transportHint: CompanionPairingTransportHint(
+                service: "_kaisola._tcp",
+                protocol: "tcp",
+                port: 49_321
+            ),
+            expiresAt: Int64(Date.now.timeIntervalSince1970 * 1_000) + 30_000,
+            accountScope: accountA
+        )
+        let coordinator = CompanionConnectionCoordinator(
+            client: CompanionClient(transport: CompanionTransport(autoConnect: false))
+        )
+        coordinator.activateAccount(accountID: "firebase-account-b")
+
+        await coordinator.pair(with: payload)
+
+        XCTAssertEqual(
+            coordinator.pairingPhase,
+            .failed("This pairing code belongs to another Kaisola account.")
+        )
+        XCTAssertEqual(coordinator.activeRoute, .none)
+    }
+
+    @MainActor
+    func testAccountSwitchDuringRendezvousCannotPublishOldMacOffersEvenAfterReturning() async throws {
+        let accountA = try CompanionAccountScope(accountID: "firebase-rendezvous-a")
+        let desktop = try CompanionIdentity(
+            id: "desktop-rendezvous-a",
+            role: .desktop,
+            displayName: "Account A Mac"
+        )
+        let payload = CompanionPairingPayload(
+            desktopId: desktop.id,
+            identityPublic: desktop.identityPublic,
+            keyRecord: desktop.keyRecord,
+            pairingNonce: Data(repeating: 8, count: 32).base64EncodedString(),
+            requestedCapabilities: [.observe],
+            transportHint: CompanionPairingTransportHint(
+                service: "_kaisola._tcp",
+                protocol: "tcp",
+                port: 49_321
+            ),
+            expiresAt: Int64(Date.now.timeIntervalSince1970 * 1_000) + 30_000,
+            accountScope: accountA
+        )
+        let rendezvous = GatedAccountRendezvous()
+        let coordinator = CompanionConnectionCoordinator(
+            client: CompanionClient(transport: CompanionTransport(autoConnect: false)),
+            accountRendezvous: rendezvous
+        )
+        coordinator.activateAccount(accountID: "firebase-rendezvous-a")
+        let oldIntent = try XCTUnwrap(coordinator.captureActiveAccountIntent())
+
+        let lookup = Task { @MainActor in
+            await coordinator.findAccountMac(idToken: "account-a-token", intent: oldIntent)
+        }
+        await rendezvous.waitUntilStarted()
+        coordinator.activateAccount(accountID: "firebase-rendezvous-b")
+        coordinator.activateAccount(accountID: "firebase-rendezvous-a")
+        await rendezvous.resolve([
+            CompanionAccountOffer(desktopName: "Account A private Mac", payload: payload),
+        ])
+        await lookup.value
+
+        XCTAssertTrue(coordinator.accountOffers.isEmpty)
+        XCTAssertEqual(coordinator.pairingPhase, .idle)
+        XCTAssertEqual(coordinator.activeRoute, .none)
+    }
+
+    @MainActor
+    func testRendezvousRejectsSignedOfferFromDifferentAccountBeforeDisplayingName() async throws {
+        let accountA = try CompanionAccountScope(accountID: "firebase-rendezvous-wrong-a")
+        let desktop = try CompanionIdentity(
+            id: "desktop-rendezvous-wrong-a",
+            role: .desktop,
+            displayName: "Wrong Account Mac"
+        )
+        let payload = CompanionPairingPayload(
+            desktopId: desktop.id,
+            identityPublic: desktop.identityPublic,
+            keyRecord: desktop.keyRecord,
+            pairingNonce: Data(repeating: 9, count: 32).base64EncodedString(),
+            requestedCapabilities: [.observe],
+            transportHint: CompanionPairingTransportHint(
+                service: "_kaisola._tcp",
+                protocol: "tcp",
+                port: 49_321
+            ),
+            expiresAt: Int64(Date.now.timeIntervalSince1970 * 1_000) + 30_000,
+            accountScope: accountA
+        )
+        let rendezvous = GatedAccountRendezvous()
+        let coordinator = CompanionConnectionCoordinator(
+            client: CompanionClient(transport: CompanionTransport(autoConnect: false)),
+            accountRendezvous: rendezvous
+        )
+        coordinator.activateAccount(accountID: "firebase-rendezvous-wrong-b")
+        let intent = try XCTUnwrap(coordinator.captureActiveAccountIntent())
+
+        let lookup = Task { @MainActor in
+            await coordinator.findAccountMac(idToken: "wrong-account-token", intent: intent)
+        }
+        await rendezvous.waitUntilStarted()
+        await rendezvous.resolve([
+            CompanionAccountOffer(desktopName: "Private Account A Mac", payload: payload),
+        ])
+        await lookup.value
+
+        XCTAssertTrue(coordinator.accountOffers.isEmpty)
+        if case let .failed(message) = coordinator.pairingPhase {
+            XCTAssertFalse(message.contains("Private Account A Mac"))
+        } else {
+            XCTFail("Cross-account rendezvous content must fail closed")
+        }
+    }
 
     func testEveryValidProtocolEnvelopeRoundTripsSemantically() throws {
         for name in validEnvelopeFixtures {
@@ -247,12 +562,15 @@ final class ProtocolFixtureTests: XCTestCase {
 
     @MainActor
     func testDeviceRevocationClearsResumeAuthorityBeforeStoppingTransport() throws {
+        let accountID = "revocation-fixture-account"
+        let accountScope = try CompanionAccountScope(accountID: accountID)
         let desktop = CompanionPairedDesktop(
             desktopId: "desktop-revocation-fixture",
             identityPublic: Data(repeating: 1, count: 32).base64URLEncodedString(),
             x25519StaticPublic: Data(repeating: 2, count: 32).base64URLEncodedString(),
             capabilities: [.observe, .terminalControl],
-            transportHint: nil
+            transportHint: nil,
+            accountScope: accountScope
         )
         let persistence = RevocationDesktopStore(desktop: desktop)
         let transport = CompanionTransport(autoConnect: false)
@@ -273,6 +591,7 @@ final class ProtocolFixtureTests: XCTestCase {
             persistence: persistence,
             store: store
         )
+        coordinator.activateAccount(accountID: accountID)
         let identity = try CompanionIdentity(
             id: "device-revocation-fixture",
             role: .device,
@@ -281,8 +600,11 @@ final class ProtocolFixtureTests: XCTestCase {
         try client.configureResume(
             desktop: desktop,
             identity: identity,
-            cursor: CompanionAckCursor(epoch: "old-epoch", seq: 42)
+            cursor: CompanionAckCursor(epoch: "old-epoch", seq: 42),
+            accountScope: accountScope
         )
+        let clientAuthority = try XCTUnwrap(client.currentSessionAuthority)
+        XCTAssertTrue(coordinator.adoptConfiguredClientAuthority(clientAuthority))
         XCTAssertNotNil(client.pairedDesktop)
         XCTAssertNotNil(client.ackCursor)
         XCTAssertNotNil(coordinator.pairedDesktop)

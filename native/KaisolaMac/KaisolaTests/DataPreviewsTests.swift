@@ -183,12 +183,73 @@ final class DataPreviewsTests: XCTestCase {
 
     func testNodeIdentityIsTheDeterministicPathToTheValue() throws {
         let root = JsonTree.build(try object(from: #"{"tags":["a","b"],"meta":{"n":1}}"#))
-        XCTAssertEqual(root.id, "$")
+        // Identities are RFC 6901 JSON Pointers; the whole document is "".
+        XCTAssertEqual(root.id, "")
 
         let byKey = Dictionary(uniqueKeysWithValues: root.children.map { ($0.key ?? "", $0) })
-        XCTAssertEqual(byKey["tags"]?.id, "$.tags")
-        XCTAssertEqual(byKey["tags"]?.children.map(\.id), ["$.tags[0]", "$.tags[1]"])
-        XCTAssertEqual(byKey["meta"]?.children.map(\.id), ["$.meta.n"])
+        XCTAssertEqual(byKey["tags"]?.id, "/tags")
+        XCTAssertEqual(byKey["tags"]?.children.map(\.id), ["/tags/0", "/tags/1"])
+        XCTAssertEqual(byKey["meta"]?.children.map(\.id), ["/meta/n"])
+    }
+
+    func testKeysAreEscapedIntoPointerTokens() throws {
+        // RFC 6901 §3: `~` becomes `~0` and `/` becomes `~1`, in that order, so
+        // a key can never introduce a level separator of its own.
+        let root = JsonTree.build(try object(from: #"{"a/b":1,"a~b":2,"a~1b":3}"#))
+        let byKey = Dictionary(uniqueKeysWithValues: root.children.map { ($0.key ?? "", $0) })
+        XCTAssertEqual(byKey["a/b"]?.id, "/a~1b")
+        XCTAssertEqual(byKey["a~b"]?.id, "/a~0b")
+        XCTAssertEqual(byKey["a~1b"]?.id, "/a~01b")
+    }
+
+    func testDottedKeysDoNotCollideWithNestedObjects() throws {
+        // The reported collision: `{"a.b":…}` and `{"a":{"b":…}}` are different
+        // values that used to share the identity `$.a.b`.
+        let root = JsonTree.build(try object(from: #"{"a.b":1,"a":{"b":2}}"#))
+        let ids = identifiers(of: root)
+        XCTAssertEqual(Set(ids).count, ids.count)
+
+        let byKey = Dictionary(uniqueKeysWithValues: root.children.map { ($0.key ?? "", $0) })
+        XCTAssertEqual(byKey["a.b"]?.id, "/a.b")
+        XCTAssertEqual(byKey["a"]?.children.map(\.id), ["/a/b"])
+    }
+
+    func testBracketKeysDoNotCollideWithArrayIndices() throws {
+        let root = JsonTree.build(try object(from: #"{"a[0]":1,"a":[2]}"#))
+        let ids = identifiers(of: root)
+        XCTAssertEqual(Set(ids).count, ids.count)
+
+        let byKey = Dictionary(uniqueKeysWithValues: root.children.map { ($0.key ?? "", $0) })
+        XCTAssertEqual(byKey["a[0]"]?.id, "/a[0]")
+        XCTAssertEqual(byKey["a"]?.children.map(\.id), ["/a/0"])
+    }
+
+    func testEmptyKeysDoNotCollideWithDottedSiblings() throws {
+        // `{"":{"x":…}}` and `{".x":…}` both used to produce `$..x`.
+        let ids = identifiers(of: JsonTree.build(try object(from: #"{"":{"x":1},".x":2,".":3}"#)))
+        XCTAssertEqual(Set(ids).count, ids.count)
+        XCTAssertTrue(ids.contains("//x"))   // the "x" member of the ""-keyed object
+    }
+
+    func testPipedKeysDoNotCollideWithNestedPaths() throws {
+        // Pipes are the truncation marker's old separator, and they travel with
+        // dots in real documents (log fields, composite keys).
+        let ids = identifiers(of: JsonTree.build(try object(from: """
+        {"a|b.c":1,"a|b":{"c":2},"a|truncated":3,"a":{"|truncated":4}}
+        """)))
+        XCTAssertEqual(Set(ids).count, ids.count)
+    }
+
+    func testDuplicateLookingNestedPathsStayDistinct() throws {
+        // Every spelling of a.b.c at once: three different values, three ids.
+        let root = JsonTree.build(try object(from: #"{"a":{"b":{"c":1}},"a.b":{"c":2},"a.b.c":3}"#))
+        let ids = identifiers(of: root)
+        XCTAssertEqual(Set(ids).count, ids.count)
+
+        let byKey = Dictionary(uniqueKeysWithValues: root.children.map { ($0.key ?? "", $0) })
+        XCTAssertEqual(byKey["a"]?.children.first?.children.map(\.id), ["/a/b/c"])
+        XCTAssertEqual(byKey["a.b"]?.children.map(\.id), ["/a.b/c"])
+        XCTAssertEqual(byKey["a.b.c"]?.id, "/a.b.c")
     }
 
     func testNodeIdentityIsStableAcrossRebuilds() throws {
@@ -212,7 +273,9 @@ final class DataPreviewsTests: XCTestCase {
         let bigArray = "[" + (0..<(JsonTree.maxNodes + 50)).map(String.init).joined(separator: ",") + "]"
         let ids = identifiers(of: JsonTree.build(try object(from: bigArray)))
         XCTAssertEqual(Set(ids).count, ids.count)
-        XCTAssertTrue(ids.contains { $0.hasSuffix("|truncated") })
+        // `~t` is not a legal escape, so the marker token is one no member can
+        // spell — not even a key literally named `truncated`.
+        XCTAssertTrue(ids.contains { $0.hasSuffix("/~truncated") })
     }
 
     // MARK: - Content-identity parse caches

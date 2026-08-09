@@ -177,6 +177,115 @@ final class BrokerModelsTests: XCTestCase {
         }
     }
 
+    func testStatusRejectsDuplicateLiveTerminalIdentifiers() {
+        XCTAssertThrowsError(try BrokerStatus(
+            status: validStatus,
+            diagnostics: .array([diagnosticEntry(id: "terminal:codex-7")]),
+            live: .array([
+                liveEntry(id: "terminal:codex-7", pid: 11),
+                liveEntry(id: "terminal:codex-7", pid: 12),
+            ]),
+            expectedHello: hello
+        )) { error in
+            XCTAssertEqual(error as? BrokerClientError, .malformedResponse)
+        }
+    }
+
+    func testStatusRejectsDuplicateDiagnosticTerminalIdentifiers() {
+        XCTAssertThrowsError(try BrokerStatus(
+            status: validStatus,
+            diagnostics: .array([
+                diagnosticEntry(id: "terminal:zsh"),
+                diagnosticEntry(id: "terminal:zsh"),
+            ]),
+            live: .array([]),
+            expectedHello: hello
+        )) { error in
+            XCTAssertEqual(error as? BrokerClientError, .malformedResponse)
+        }
+    }
+
+    func testStatusStillPairsLiveValuesWhenEveryIdentifierIsDistinct() throws {
+        let status = try BrokerStatus(
+            status: validStatus,
+            diagnostics: .array([
+                diagnosticEntry(id: "terminal:one"),
+                diagnosticEntry(id: "terminal:two"),
+            ]),
+            live: .array([liveEntry(id: "terminal:two", pid: 4_242)]),
+            expectedHello: hello
+        )
+        XCTAssertEqual(status.terminals.map(\.id), ["terminal:one", "terminal:two"])
+        XCTAssertNil(status.terminals[0].pid)
+        XCTAssertEqual(status.terminals[1].pid, 4_242)
+    }
+
+    /// Duplicate ids used to reach `Dictionary(uniqueKeysWithValues:)`, which
+    /// traps. Reaching the assertions below at all is the coverage: a trap
+    /// would take the whole test process down instead of failing a case.
+    func testDuplicateIdentifierFuzzNeverTrapsTheProcess() {
+        var generator = SeededGenerator(seed: 0x5EED_0467)
+        let pool = ["terminal:a", "terminal:b", "terminal:c", ""]
+        for iteration in 0 ..< 500 {
+            let diagnostics = (0 ..< Int.random(in: 0 ... 6, using: &generator)).map { _ in
+                fuzzEntry(pool: pool, generator: &generator) { id in
+                    self.diagnosticEntry(id: id)
+                }
+            }
+            let live = (0 ..< Int.random(in: 0 ... 6, using: &generator)).map { _ in
+                fuzzEntry(pool: pool, generator: &generator) { id in
+                    self.liveEntry(id: id, pid: 4_000)
+                }
+            }
+            do {
+                let status = try BrokerStatus(
+                    status: validStatus,
+                    diagnostics: .array(diagnostics),
+                    live: .array(live),
+                    expectedHello: hello
+                )
+                XCTAssertEqual(
+                    Set(status.terminals.map(\.id)).count,
+                    status.terminals.count,
+                    "iteration \(iteration) decoded a duplicate terminal id"
+                )
+            } catch let error as BrokerClientError {
+                XCTAssertEqual(error, .malformedResponse, "iteration \(iteration)")
+            } catch {
+                XCTFail("iteration \(iteration) threw an unexpected error: \(error)")
+            }
+        }
+    }
+
+    private func diagnosticEntry(id: String) -> JSONValue {
+        .object([
+            "id": .string(id),
+            "owner": .string("instance-uuid|42|kaisola.project-1"),
+            "exited": .bool(false),
+        ])
+    }
+
+    private func liveEntry(id: String, pid: Int64) -> JSONValue {
+        .object([
+            "id": .string(id),
+            "pid": .integer(pid),
+        ])
+    }
+
+    /// One fuzz element: usually a well-formed entry drawn from a tiny id pool
+    /// so duplicates are common, occasionally shaped junk the decoder skips.
+    private func fuzzEntry(
+        pool: [String],
+        generator: inout SeededGenerator,
+        make: (String) -> JSONValue
+    ) -> JSONValue {
+        switch Int.random(in: 0 ... 9, using: &generator) {
+        case 0: .string("not-an-object")
+        case 1: .object(["owner": .string("instance-uuid|42|kaisola.project-1")])
+        default: make(pool.randomElement(using: &generator) ?? "")
+        }
+    }
+
     private var validStatus: JSONValue {
         .object([
             "ok": .bool(true),
@@ -198,5 +307,22 @@ final class BrokerModelsTests: XCTestCase {
             version: "test",
             serverEnforcedObserver: true
         )
+    }
+}
+
+/// SplitMix64. Deterministic so a fuzz failure reproduces from the seed alone.
+private struct SeededGenerator: RandomNumberGenerator {
+    private var state: UInt64
+
+    init(seed: UInt64) {
+        state = seed
+    }
+
+    mutating func next() -> UInt64 {
+        state &+= 0x9E37_79B9_7F4A_7C15
+        var mixed = state
+        mixed = (mixed ^ (mixed >> 30)) &* 0xBF58_476D_1CE4_E5B9
+        mixed = (mixed ^ (mixed >> 27)) &* 0x94D0_49BB_1331_11EB
+        return mixed ^ (mixed >> 31)
     }
 }

@@ -94,15 +94,28 @@ struct BrokerStatus: Equatable, Sendable {
               let liveValues = live.arrayValue else {
             throw BrokerClientError.malformedResponse
         }
-        let liveByID = Dictionary(
-            uniqueKeysWithValues: liveValues.compactMap { value -> (String, JSONValue)? in
-                guard let object = value.objectValue, let id = object["id"]?.stringValue else { return nil }
-                return (id, value)
-            }
-        )
-        terminals = diagnosticValues.compactMap { value in
-            BrokerTerminalRecord(value: value, liveValue: value.objectValue?["id"]?.stringValue.flatMap { liveByID[$0] })
+        // A repeated terminal id is a protocol violation with no safe merge:
+        // the client cannot tell which record is authoritative. Reject the
+        // whole inventory rather than trapping, so one malformed authenticated
+        // response is a recoverable error instead of a process termination.
+        var liveByID: [String: JSONValue] = [:]
+        for value in liveValues {
+            guard let object = value.objectValue, let id = object["id"]?.stringValue else { continue }
+            guard liveByID[id] == nil else { throw BrokerClientError.malformedResponse }
+            liveByID[id] = value
         }
+        var seenIDs: Set<String> = []
+        var records: [BrokerTerminalRecord] = []
+        records.reserveCapacity(diagnosticValues.count)
+        for value in diagnosticValues {
+            guard let record = BrokerTerminalRecord(
+                value: value,
+                liveValue: value.objectValue?["id"]?.stringValue.flatMap { liveByID[$0] }
+            ) else { continue }
+            guard seenIDs.insert(record.id).inserted else { throw BrokerClientError.malformedResponse }
+            records.append(record)
+        }
+        terminals = records
     }
 }
 

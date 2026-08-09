@@ -306,7 +306,7 @@ CryptoNoiseVectorTests (200) encountered an error (Test crashed with signal bus 
   assert.equal(result.classification, 'pre_app_entry_sigbus')
 })
 
-test('successful xcodebuild is rejected unless app milestones and real tests are counted', () => {
+test('successful xcodebuild requires counted tests but not optional app milestones', () => {
   const milestones = `
 KAISOLA_COMPANION_TEST_LAUNCH phase=app_init_started pid=501
 KAISOLA_COMPANION_TEST_LAUNCH phase=auth_model_constructed pid=501
@@ -345,8 +345,9 @@ KAISOLA_COMPANION_TEST_LAUNCH phase=auth_restore_completed pid=501
     xcresultTestCount: 1,
     xcresultResult: 'Passed',
   })
-  assert.equal(missingMilestones.classification, 'missing_launch_diagnostics')
-  assert.equal(missingMilestones.pass, false)
+  assert.equal(missingMilestones.classification, 'pass')
+  assert.equal(missingMilestones.pass, true)
+  assert.equal(missingMilestones.launchDiagnosticsComplete, false)
 
   const mismatchedCount = classify(`${milestones}\nTest Case '-[KaisolaCompanionTests.ExampleTests testOne]' started.\nExecuted 46 tests, with 0 failures\n** TEST EXECUTE SUCCEEDED **`, {
     exitCode: 0,

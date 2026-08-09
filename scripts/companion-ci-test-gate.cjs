@@ -327,7 +327,11 @@ function classifyTestRun({
     else if (xcresultSummaryPresent && xcresultEnvironmentMatches !== true) classification = 'xcresult_environment_mismatch'
     else if (xcresultSummaryPresent && xcresultResult !== 'Passed') classification = 'xcresult_not_passed'
     else if (xcresultSummaryPresent && xcresultTestCount !== executedTestCount) classification = 'test_count_mismatch'
-    else if (!launchDiagnosticsComplete) classification = 'missing_launch_diagnostics'
+    // A nonzero, matching Passed xcresult plus xcodebuild's success marker is
+    // stronger bootstrap evidence than optional app milestone logging: every
+    // counted XCTest already ran inside the launched host. Keep milestones for
+    // locating prebootstrap failures, but never turn a sealed successful run
+    // into a failure merely because unified logging omitted those messages.
     else classification = 'pass'
   } else if (exitCode === 0) {
     classification = 'xcode_success_without_success_marker'

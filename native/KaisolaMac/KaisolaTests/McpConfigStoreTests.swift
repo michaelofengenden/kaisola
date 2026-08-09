@@ -125,6 +125,30 @@ final class McpConfigStoreTests: XCTestCase {
         XCTAssertNil(McpSettingsPolicy.duplicateName("other", servers: servers))
     }
 
+    func testSettingsChangeScopeNamesEveryMutationAndOffersANewChatOnlyWhenUseful() {
+        XCTAssertEqual(McpSettingsPolicy.changeScopeTitle, "New chats only")
+        XCTAssertEqual(
+            McpSettingsPolicy.changeScopeDetail(openChatCount: 0),
+            "Enable, disable, add, edit, delete, and import changes apply when you start a new chat."
+        )
+        XCTAssertEqual(
+            McpSettingsPolicy.changeScopeDetail(openChatCount: 2),
+            "2 open chats keep their current MCP tools. Start a new chat to use enable, disable, add, edit, delete, or import changes."
+        )
+        XCTAssertFalse(McpSettingsPolicy.offersNewChatAction(
+            openChatCount: 0,
+            canStartNewChat: true
+        ))
+        XCTAssertFalse(McpSettingsPolicy.offersNewChatAction(
+            openChatCount: 1,
+            canStartNewChat: false
+        ))
+        XCTAssertTrue(McpSettingsPolicy.offersNewChatAction(
+            openChatCount: 1,
+            canStartNewChat: true
+        ))
+    }
+
     func testSettingsAddPolicyUsesOneCaseInsensitiveTrimmedNameForValidationAndPersistence() {
         let servers = [
             McpServerConfig(name: "Project Files", kind: .stdio, command: "server"),

@@ -16,6 +16,7 @@ struct McpSettingsTab: View {
             // load — whenever the active project changes underneath the window.
             McpServerEditor(
                 store: McpConfigStore(workspace: workspace),
+                workspace: workspace,
                 projectName: workspace.lastPathComponent,
                 highlightedID: highlightedID
             )
@@ -39,6 +40,24 @@ struct McpSettingsTab: View {
 /// bounded store can persist.
 enum McpSettingsPolicy {
     private static let nameComparisonLocale = Locale(identifier: "en_US_POSIX")
+
+    static let changeScopeTitle = "New chats only"
+
+    static func changeScopeDetail(openChatCount: Int) -> String {
+        let count = max(0, openChatCount)
+        guard count > 0 else {
+            return "Enable, disable, add, edit, delete, and import changes apply when you start a new chat."
+        }
+        let subject = count == 1 ? "1 open chat keeps" : "\(count) open chats keep"
+        return "\(subject) their current MCP tools. Start a new chat to use enable, disable, add, edit, delete, or import changes."
+    }
+
+    static func offersNewChatAction(openChatCount: Int, canStartNewChat: Bool) -> Bool {
+        openChatCount > 0 && canStartNewChat
+    }
+
+    static let mutationAccessibilityHint =
+        "This MCP configuration change applies to new chats only. Existing chats keep their current tools."
 
     /// One line of a `NAME=value` block that could not be read, addressed the
     /// way the user sees it: the 1-based line number plus what is wrong. Blank
@@ -168,8 +187,11 @@ enum McpSettingsPolicy {
 /// add-form whose visible fields follow the chosen transport.
 private struct McpServerEditor: View {
     let store: McpConfigStore
+    let workspace: URL
     let projectName: String
     let highlightedID: String?
+
+    @Environment(\.dismiss) private var dismiss
 
     @State private var servers: [McpServerConfig] = []
     @State private var draft = Draft()
@@ -203,6 +225,7 @@ private struct McpServerEditor: View {
     var body: some View {
         ScrollViewReader { proxy in
             Form {
+                changeScopeSection
                 configuredSection
                 discoverySection
                 addSection
@@ -222,6 +245,77 @@ private struct McpServerEditor: View {
                 guard !Task.isCancelled else { return }
                 recentlyDeleted = nil
             }
+        }
+    }
+
+    private var chatAgents: [AgentProfile] {
+        AgentRegistry.all.filter { AcpAdapter.forAgent($0.id) != nil }
+    }
+
+    private var openChatCount: Int {
+        KaisolaMacAppDelegate.sharedMcpOpenChatCount(in: workspace)
+    }
+
+    private var changeScopeSection: some View {
+        Section {
+            HStack(alignment: .top, spacing: 10) {
+                Image(systemName: "arrow.triangle.branch")
+                    .foregroundStyle(Color.accentColor)
+                    .accessibilityHidden(true)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(McpSettingsPolicy.changeScopeTitle)
+                        .font(.callout.weight(.semibold))
+                    Text(McpSettingsPolicy.changeScopeDetail(openChatCount: openChatCount))
+                        .font(.caption)
+                        .foregroundStyle(.kaisolaSecondary)
+                }
+                Spacer(minLength: 8)
+                if McpSettingsPolicy.offersNewChatAction(
+                    openChatCount: openChatCount,
+                    canStartNewChat: !chatAgents.isEmpty
+                ) {
+                    Menu {
+                        ForEach(chatAgents) { agent in
+                            Button("Chat with \(agent.name)") {
+                                startNewChat(agentID: agent.id)
+                            }
+                        }
+                    } label: {
+                        Label("Start New Chat", systemImage: "bubble.left.and.bubble.right")
+                    }
+                    .fixedSize()
+                    .accessibilityHint("Leaves existing chats open and starts a new chat with this MCP configuration.")
+                    .accessibilityIdentifier("extensions.mcp.start-new-chat")
+                }
+            }
+            .accessibilityElement(children: .contain)
+            .accessibilityIdentifier("extensions.mcp.new-chat-scope")
+        }
+    }
+
+    private func startNewChat(agentID: String) {
+        // A Settings sheet must get out of the command's way before the
+        // existing account chooser is presented. In the standalone Settings
+        // window this is a no-op; the delegate brings the owning workspace
+        // forward before routing through the same New Chat command.
+        dismiss()
+        Task { @MainActor in
+            await Task.yield()
+            _ = KaisolaMacAppDelegate.sharedStartMcpChat(
+                agentID: agentID,
+                in: workspace
+            )
+        }
+    }
+
+    private func scopeSectionHeader(_ title: String) -> some View {
+        HStack {
+            Text(title)
+            Spacer()
+            Text(McpSettingsPolicy.changeScopeTitle)
+                .font(.caption2.weight(.semibold))
+                .foregroundStyle(Color.accentColor)
+                .textCase(nil)
         }
     }
 
@@ -264,7 +358,7 @@ private struct McpServerEditor: View {
     // MARK: - Configured servers
 
     private var configuredSection: some View {
-        Section("Configured Servers") {
+        Section {
             if servers.isEmpty {
                 Text("No MCP servers yet — add one below.")
                     .font(.caption)
@@ -278,6 +372,7 @@ private struct McpServerEditor: View {
                             .labelsHidden()
                             .toggleStyle(.switch)
                             .accessibilityLabel("Enable MCP server \(server.name)")
+                            .accessibilityHint(McpSettingsPolicy.mutationAccessibilityHint)
                         VStack(alignment: .leading, spacing: 1) {
                             Text(server.name).font(.callout)
                             Text(subtitle(for: server))
@@ -312,6 +407,7 @@ private struct McpServerEditor: View {
                         }
                         .buttonStyle(.borderless)
                         .accessibilityLabel("Delete MCP server \(server.name)")
+                        .accessibilityHint(McpSettingsPolicy.mutationAccessibilityHint)
                     }
                     if let result = probeResults[server.name] {
                         HStack(spacing: 5) {
@@ -378,6 +474,8 @@ private struct McpServerEditor: View {
                         .buttonStyle(.borderless)
                 }
             }
+        } header: {
+            scopeSectionHeader("Configured Servers")
         }
     }
 
@@ -459,7 +557,7 @@ private struct McpServerEditor: View {
     // MARK: - Discovery and disabled import
 
     private var discoverySection: some View {
-        Section("Import Existing Configuration") {
+        Section {
             Text("Find MCP servers already configured in Cursor, Claude, Codex, Gemini, VS Code, or Windsurf. Kaisola reads only their standard local config files, never expands secrets, and imports selected servers disabled.")
                 .font(.caption)
                 .foregroundStyle(.kaisolaSecondary)
@@ -492,6 +590,7 @@ private struct McpServerEditor: View {
                 HStack {
                     Button("Import as Disabled") { importSelected() }
                         .disabled(selectedDiscoveryIDs.isEmpty || isImporting || remainingCapacity == 0)
+                        .accessibilityHint(McpSettingsPolicy.mutationAccessibilityHint)
                     Button("Search Again") { discover() }
                         .disabled(isDiscovering || isImporting)
                     if isImporting { ProgressView().controlSize(.small) }
@@ -507,6 +606,8 @@ private struct McpServerEditor: View {
                     .font(.caption)
                     .foregroundStyle(.kaisolaSecondary)
             }
+        } header: {
+            scopeSectionHeader("Import Existing Configuration")
         }
     }
 
@@ -564,7 +665,7 @@ private struct McpServerEditor: View {
     // MARK: - Add form
 
     private var addSection: some View {
-        Section("Add a Server") {
+        Section {
             TextField("Name", text: $draft.name, prompt: Text("unique per project"))
                 .onChange(of: draft.name) { _, _ in addError = nil }
                 .accessibilityHint(
@@ -617,8 +718,10 @@ private struct McpServerEditor: View {
             Button("Add Server", action: add)
                 .disabled(!canAddServer)
                 .accessibilityHint(
-                    duplicateNameMessage ?? "Adds this server to the current project."
+                    duplicateNameMessage ?? McpSettingsPolicy.mutationAccessibilityHint
                 )
+        } header: {
+            scopeSectionHeader("Add a Server")
         }
     }
 

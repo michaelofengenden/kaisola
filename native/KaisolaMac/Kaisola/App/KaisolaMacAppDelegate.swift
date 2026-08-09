@@ -751,6 +751,56 @@ final class KaisolaMacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDele
     static func sharedCanCheckForUpdates() -> Bool {
         (NSApp.delegate as? KaisolaMacAppDelegate)?.updateController.availability.canCheck ?? false
     }
+
+    /// Settings can be hosted either as a workspace sheet or in the standalone
+    /// Command-comma window. Resolve its workspace back to the owning AppModel
+    /// instead of making the editor guess which window/session is active.
+    @MainActor
+    static func sharedMcpOpenChatCount(in workspace: URL) -> Int {
+        guard let delegate = NSApp.delegate as? KaisolaMacAppDelegate,
+              let context = delegate.mcpWorkspaceContext(for: workspace) else { return 0 }
+        return context.model.chats(in: context.projectID).count
+    }
+
+    /// Route the MCP affordance through the product's existing New Chat command
+    /// so account selection, adapter availability, focus, and persistence stay
+    /// identical to every other launch surface. Existing chats are untouched.
+    @MainActor
+    @discardableResult
+    static func sharedStartMcpChat(agentID: String, in workspace: URL) -> Bool {
+        guard let delegate = NSApp.delegate as? KaisolaMacAppDelegate,
+              let context = delegate.mcpWorkspaceContext(for: workspace) else { return false }
+        context.model.activateProject(id: context.projectID)
+        context.window?.makeKeyAndOrderFront(nil)
+        return AppCommandRegistry.execute(
+            .newChat(agentID),
+            in: AppCommandContext(model: context.model, settings: delegate.settings)
+        )
+    }
+
+    @MainActor
+    private func mcpWorkspaceContext(
+        for workspace: URL
+    ) -> (model: AppModel, projectID: String, window: NSWindow?)? {
+        let target = workspace.standardizedFileURL
+        let preferred = keyModel()
+        let models = ([preferred].compactMap { $0 } + windowModels.values).reduce(into: [AppModel]()) {
+            models, candidate in
+            if !models.contains(where: { existing in existing === candidate }) {
+                models.append(candidate)
+            }
+        }
+        for model in models {
+            guard let project = model.projects.first(where: {
+                $0.directory?.standardizedFileURL == target
+            }) else { continue }
+            let window = NSApp.windows.first {
+                windowModels[ObjectIdentifier($0)] === model
+            }
+            return (model, project.id, window)
+        }
+        return nil
+    }
     // Each window is an independent workspace with its own AppModel and broker
     // observer connection — the broker's coexistence contract makes concurrent
     // observers safe. Keyed by the NSWindow so menu actions target the key one.

@@ -1102,6 +1102,47 @@ actor AcpClient {
 enum AcpWorkspaceFileWriter {
     typealias BeforeMutation = () throws -> Void
 
+    enum ExtendedAttributeDisposition: Equatable {
+        case preserve
+        case remove
+    }
+
+    private struct ExtendedAttribute {
+        let name: String
+        let value: Data
+    }
+
+    private final class AccessControlList {
+        let rawValue: acl_t
+
+        init(_ rawValue: acl_t) {
+            self.rawValue = rawValue
+        }
+
+        deinit {
+            _ = acl_free(UnsafeMutableRawPointer(rawValue))
+        }
+    }
+
+    private enum AccessControlListSnapshot {
+        case unsupported
+        case absent
+        case value(AccessControlList)
+    }
+
+    private struct MetadataSnapshot {
+        let mode: mode_t
+        let owner: uid_t
+        let group: gid_t
+        let extendedAttributes: [ExtendedAttribute]
+        let accessControlList: AccessControlListSnapshot
+    }
+
+    private static let maximumExtendedAttributeCount = 128
+    private static let maximumExtendedAttributeNameBytes = 64 * 1_024
+    private static let maximumExtendedAttributeValueBytes = 1 * 1_024 * 1_024
+    private static let maximumExtendedAttributeTotalBytes = 4 * 1_024 * 1_024
+
     private final class Descriptor {
         private(set) var rawValue: Int32
 
@@ -1137,7 +1178,8 @@ enum AcpWorkspaceFileWriter {
         _ data: Data,
         to requestedPath: String,
         workspaceRoot: String,
-        beforeMutation: BeforeMutation? = nil
+        beforeMutation: BeforeMutation? = nil,
+        beforeReplacementCommit: BeforeMutation? = nil
     ) throws {
         let rootPath = (workspaceRoot as NSString).standardizingPath
         let targetPath = try normalizedTargetPath(requestedPath, workspaceRoot: rootPath)
@@ -1156,6 +1198,7 @@ enum AcpWorkspaceFileWriter {
         )
         let reviewedParent = try descriptorMetadata(parent)
         let reviewedEntry = try entryMetadata(named: leaf, in: parent)
+        var reviewedMetadata: MetadataSnapshot?
         if let reviewedEntry {
             guard !isSymbolicLink(reviewedEntry) else {
                 throw rejected("symbolic-link targets are not writable")
@@ -1163,6 +1206,15 @@ enum AcpWorkspaceFileWriter {
             guard isRegularFile(reviewedEntry) else {
                 throw rejected("the target is not a regular file")
             }
+            let reviewedDescriptor = try openReviewedEntry(
+                named: leaf,
+                in: parent,
+                expected: reviewedEntry
+            )
+            reviewedMetadata = try captureMetadata(
+                from: reviewedDescriptor,
+                expected: reviewedEntry
+            )
         }
 
         // Deterministic test seam: production has no callback. Re-open the
@@ -1182,11 +1234,17 @@ enum AcpWorkspaceFileWriter {
             matches: reviewedEntry
         )
 
-        let mode = reviewedEntry.map { mode_t($0.st_mode & 0o777) }
+        let mode = reviewedMetadata?.mode
             ?? mode_t(S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH)
         let temporary = try createTemporaryFile(in: parent, mode: mode)
         do {
             try writeAll(data, to: temporary.descriptor.rawValue)
+            if let reviewedMetadata {
+                try applyMetadata(reviewedMetadata, to: temporary.descriptor)
+            }
+            guard Darwin.fsync(temporary.descriptor.rawValue) == 0 else {
+                throw rejected("the target metadata could not be preserved")
+            }
             let installationParent = try openParent(
                 components: parentComponents,
                 root: root,
@@ -1207,7 +1265,8 @@ enum AcpWorkspaceFileWriter {
                     leaf: leaf,
                     reviewedEntry: reviewedEntry,
                     temporaryLeaf: temporary.leaf,
-                    parent: parent
+                    parent: parent,
+                    beforeCommit: beforeReplacementCommit
                 )
             } else {
                 try installNew(
@@ -1223,6 +1282,230 @@ enum AcpWorkspaceFileWriter {
                 in: parent
             )
             throw error
+        }
+    }
+
+    /// Preserve ordinary metadata but deliberately discard attributes whose
+    /// bytes describe the old file contents or duplicate policy restored via
+    /// the ACL API. Quarantine, Finder tags, and application-defined metadata
+    /// remain attached to the replacement.
+    static func extendedAttributeDisposition(for name: String) -> ExtendedAttributeDisposition {
+        if name == XATTR_RESOURCEFORK_NAME
+            || name == "com.apple.decmpfs"
+            || name == "com.apple.system.Security"
+            || name.hasPrefix("com.apple.cs.") {
+            return .remove
+        }
+        return .preserve
+    }
+
+    private static func openReviewedEntry(
+        named leaf: String,
+        in parent: Descriptor,
+        expected: stat
+    ) throws -> Descriptor {
+        let raw = leaf.withCString { name in
+            Darwin.openat(parent.rawValue, name, O_RDONLY | O_NOFOLLOW | O_CLOEXEC)
+        }
+        guard raw >= 0 else {
+            if errno == ELOOP { throw rejected("symbolic-link targets are not writable") }
+            throw rejected("the target metadata could not be read")
+        }
+        let descriptor = Descriptor(raw)
+        let actual = try descriptorMetadata(descriptor)
+        guard isRegularFile(actual), sameIdentity(expected, actual) else {
+            throw rejected("the target changed after review")
+        }
+        return descriptor
+    }
+
+    private static func captureMetadata(
+        from descriptor: Descriptor,
+        expected: stat
+    ) throws -> MetadataSnapshot {
+        let actual = try descriptorMetadata(descriptor)
+        guard isRegularFile(actual), sameIdentity(expected, actual) else {
+            throw rejected("the target changed after review")
+        }
+        return MetadataSnapshot(
+            mode: mode_t(actual.st_mode & 0o777),
+            owner: actual.st_uid,
+            group: actual.st_gid,
+            extendedAttributes: try captureExtendedAttributes(from: descriptor),
+            accessControlList: try captureAccessControlList(from: descriptor)
+        )
+    }
+
+    private static func captureExtendedAttributes(
+        from descriptor: Descriptor
+    ) throws -> [ExtendedAttribute] {
+        let listSize = Darwin.flistxattr(descriptor.rawValue, nil, 0, 0)
+        if listSize < 0 {
+            if errno == ENOTSUP { return [] }
+            throw rejected("the target metadata could not be read")
+        }
+        guard listSize <= ssize_t(maximumExtendedAttributeNameBytes) else {
+            throw rejected("the target metadata exceeds safe limits")
+        }
+        if listSize == 0 { return [] }
+
+        var names = [CChar](repeating: 0, count: Int(listSize))
+        let readSize = names.withUnsafeMutableBufferPointer { buffer in
+            Darwin.flistxattr(descriptor.rawValue, buffer.baseAddress, buffer.count, 0)
+        }
+        guard readSize >= 0, readSize <= ssize_t(names.count) else {
+            throw rejected("the target metadata changed during review")
+        }
+
+        var attributes: [ExtendedAttribute] = []
+        var totalBytes = 0
+        var start = 0
+        let namesRead = Int(readSize)
+        for index in 0..<namesRead where names[index] == 0 {
+            guard index > start else {
+                throw rejected("the target metadata could not be read")
+            }
+            let nameBytes = names[start..<index].map { UInt8(bitPattern: $0) }
+            guard let name = String(bytes: nameBytes, encoding: .utf8),
+                  name.utf8.count <= Int(XATTR_MAXNAMELEN) else {
+                throw rejected("the target metadata could not be read")
+            }
+            start = index + 1
+            guard extendedAttributeDisposition(for: name) == .preserve else { continue }
+            guard attributes.count < maximumExtendedAttributeCount else {
+                throw rejected("the target metadata exceeds safe limits")
+            }
+            guard let value = try readExtendedAttribute(named: name, from: descriptor) else {
+                continue
+            }
+            let (nextTotal, overflow) = totalBytes.addingReportingOverflow(value.count)
+            guard !overflow, nextTotal <= maximumExtendedAttributeTotalBytes else {
+                throw rejected("the target metadata exceeds safe limits")
+            }
+            totalBytes = nextTotal
+            attributes.append(ExtendedAttribute(name: name, value: value))
+        }
+        guard start == namesRead else {
+            throw rejected("the target metadata could not be read")
+        }
+        return attributes
+    }
+
+    private static func readExtendedAttribute(
+        named name: String,
+        from descriptor: Descriptor
+    ) throws -> Data? {
+        let size = name.withCString { attributeName in
+            Darwin.fgetxattr(descriptor.rawValue, attributeName, nil, 0, 0, 0)
+        }
+        if size < 0 {
+            if errno == ENOATTR { return nil }
+            throw rejected("the target metadata could not be read")
+        }
+        guard size <= ssize_t(maximumExtendedAttributeValueBytes) else {
+            throw rejected("the target metadata exceeds safe limits")
+        }
+        if size == 0 { return Data() }
+
+        var value = Data(count: Int(size))
+        let readSize = value.withUnsafeMutableBytes { bytes in
+            name.withCString { attributeName in
+                Darwin.fgetxattr(
+                    descriptor.rawValue,
+                    attributeName,
+                    bytes.baseAddress,
+                    bytes.count,
+                    0,
+                    0
+                )
+            }
+        }
+        if readSize < 0, errno == ENOATTR { return nil }
+        guard readSize == size else {
+            throw rejected("the target metadata changed during review")
+        }
+        return value
+    }
+
+    private static func captureAccessControlList(
+        from descriptor: Descriptor
+    ) throws -> AccessControlListSnapshot {
+        errno = 0
+        if let accessControlList = Darwin.acl_get_fd_np(
+            descriptor.rawValue,
+            ACL_TYPE_EXTENDED
+        ) {
+            return .value(AccessControlList(accessControlList))
+        }
+        if errno == ENOENT { return .absent }
+        if errno == ENOTSUP { return .unsupported }
+        throw rejected("the target metadata could not be read")
+    }
+
+    private static func applyMetadata(
+        _ metadata: MetadataSnapshot,
+        to descriptor: Descriptor
+    ) throws {
+        let current = try descriptorMetadata(descriptor)
+        if current.st_uid != metadata.owner || current.st_gid != metadata.group {
+            guard Darwin.fchown(descriptor.rawValue, metadata.owner, metadata.group) == 0 else {
+                throw rejected("the target ownership could not be preserved")
+            }
+        }
+
+        for attribute in metadata.extendedAttributes {
+            let result = attribute.value.withUnsafeBytes { bytes in
+                attribute.name.withCString { name in
+                    Darwin.fsetxattr(
+                        descriptor.rawValue,
+                        name,
+                        bytes.baseAddress,
+                        bytes.count,
+                        0,
+                        0
+                    )
+                }
+            }
+            guard result == 0 else {
+                throw rejected("the target metadata could not be preserved")
+            }
+        }
+        try applyAccessControlList(metadata.accessControlList, to: descriptor)
+        guard Darwin.fchmod(descriptor.rawValue, metadata.mode) == 0 else {
+            throw rejected("the target mode could not be preserved")
+        }
+
+        let applied = try descriptorMetadata(descriptor)
+        guard applied.st_uid == metadata.owner,
+              applied.st_gid == metadata.group,
+              mode_t(applied.st_mode & 0o777) == metadata.mode else {
+            throw rejected("the target metadata could not be preserved")
+        }
+    }
+
+    private static func applyAccessControlList(
+        _ snapshot: AccessControlListSnapshot,
+        to descriptor: Descriptor
+    ) throws {
+        switch snapshot {
+        case .unsupported:
+            return
+        case .absent:
+            guard let empty = Darwin.acl_init(0) else {
+                throw rejected("the target ACL could not be preserved")
+            }
+            defer { _ = acl_free(UnsafeMutableRawPointer(empty)) }
+            guard Darwin.acl_set_fd_np(descriptor.rawValue, empty, ACL_TYPE_EXTENDED) == 0 else {
+                throw rejected("the target ACL could not be preserved")
+            }
+        case let .value(accessControlList):
+            guard Darwin.acl_set_fd_np(
+                descriptor.rawValue,
+                accessControlList.rawValue,
+                ACL_TYPE_EXTENDED
+            ) == 0 else {
+                throw rejected("the target ACL could not be preserved")
+            }
         }
     }
 
@@ -1408,7 +1691,8 @@ enum AcpWorkspaceFileWriter {
         leaf: String,
         reviewedEntry: stat,
         temporaryLeaf: String,
-        parent: Descriptor
+        parent: Descriptor,
+        beforeCommit: BeforeMutation?
     ) throws {
         guard exchange(temporaryLeaf, leaf, in: parent) == 0 else {
             if errno == ENOENT { throw rejected("the target changed after review") }
@@ -1422,11 +1706,20 @@ enum AcpWorkspaceFileWriter {
                   sameIdentity(reviewedEntry, displaced) else {
                 throw rejected("the target changed after review")
             }
+            try beforeCommit?()
+            let stillDisplaced = try entryMetadata(named: temporaryLeaf, in: parent)
+            guard let stillDisplaced,
+                  !isSymbolicLink(stillDisplaced),
+                  sameIdentity(reviewedEntry, stillDisplaced) else {
+                throw rejected("the target changed before replacement committed")
+            }
             guard unlink(named: temporaryLeaf, in: parent) == 0 else {
                 throw rejected("the target could not be safely replaced")
             }
         } catch {
-            _ = exchange(temporaryLeaf, leaf, in: parent)
+            guard exchange(temporaryLeaf, leaf, in: parent) == 0 else {
+                throw rejected("the target could not be safely restored")
+            }
             throw error
         }
     }

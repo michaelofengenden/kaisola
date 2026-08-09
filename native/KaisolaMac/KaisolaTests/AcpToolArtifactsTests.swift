@@ -1,3 +1,4 @@
+import Darwin
 import Foundation
 import KaisolaCore
 import XCTest
@@ -380,6 +381,142 @@ final class AcpToolArtifactsTests: XCTestCase {
         XCTAssertEqual(try String(contentsOf: created, encoding: .utf8), "created")
     }
 
+    func testAgentWritePreservesExecutableOrdinaryModesAndOwnership() throws {
+        let fixture = try agentWriteFixture()
+        for (name, mode) in [("executable.sh", mode_t(0o755)), ("ordinary.txt", mode_t(0o640))] {
+            let target = fixture.workspace.appendingPathComponent(name)
+            try "old".write(to: target, atomically: true, encoding: .utf8)
+            XCTAssertEqual(Darwin.chmod(target.path, mode), 0)
+            let before = try fileMetadata(at: target)
+
+            try AcpWorkspaceFileWriter.write(
+                Data("updated".utf8),
+                to: target.path,
+                workspaceRoot: fixture.workspace.path
+            )
+
+            let after = try fileMetadata(at: target)
+            XCTAssertEqual(mode_t(after.st_mode & 0o777), mode)
+            XCTAssertEqual(after.st_uid, before.st_uid)
+            XCTAssertEqual(after.st_gid, before.st_gid)
+        }
+    }
+
+    func testAgentWritePreservesAllowedXattrsAndDropsContentCoupledMetadata() throws {
+        let fixture = try agentWriteFixture()
+        let target = fixture.workspace.appendingPathComponent("metadata.txt")
+        try "old".write(to: target, atomically: true, encoding: .utf8)
+        let preservedName = "com.kaisola.acp.metadata"
+        let preservedValue = Data("preserve me".utf8)
+        let removedAttributes = [
+            (XATTR_RESOURCEFORK_NAME, Data("stale fork".utf8)),
+            ("com.apple.cs.CodeDirectory", Data("stale signature".utf8)),
+        ]
+        try setExtendedAttribute(preservedName, value: preservedValue, at: target)
+        for (name, value) in removedAttributes {
+            try setExtendedAttribute(name, value: value, at: target)
+        }
+
+        XCTAssertEqual(
+            AcpWorkspaceFileWriter.extendedAttributeDisposition(for: preservedName),
+            .preserve
+        )
+        XCTAssertEqual(
+            AcpWorkspaceFileWriter.extendedAttributeDisposition(for: "com.apple.quarantine"),
+            .preserve,
+            "dropping quarantine would weaken an existing security policy"
+        )
+        XCTAssertEqual(
+            AcpWorkspaceFileWriter.extendedAttributeDisposition(for: "com.apple.system.Security"),
+            .remove,
+            "ACL bytes are restored only through the dedicated descriptor API"
+        )
+
+        try AcpWorkspaceFileWriter.write(
+            Data("updated".utf8),
+            to: target.path,
+            workspaceRoot: fixture.workspace.path
+        )
+
+        XCTAssertEqual(try extendedAttribute(preservedName, at: target), preservedValue)
+        for (name, _) in removedAttributes {
+            XCTAssertNil(try extendedAttribute(name, at: target))
+            XCTAssertEqual(
+                AcpWorkspaceFileWriter.extendedAttributeDisposition(for: name),
+                .remove
+            )
+        }
+    }
+
+    func testAgentWritePreservesExtendedACLWhenSupported() throws {
+        let fixture = try agentWriteFixture()
+        let target = fixture.workspace.appendingPathComponent("acl.txt")
+        try "old".write(to: target, atomically: true, encoding: .utf8)
+        try installTestACL(at: target)
+        let before = try XCTUnwrap(extendedACLText(at: target))
+
+        try AcpWorkspaceFileWriter.write(
+            Data("updated".utf8),
+            to: target.path,
+            workspaceRoot: fixture.workspace.path
+        )
+
+        XCTAssertEqual(try extendedACLText(at: target), before)
+    }
+
+    func testAgentWriteCreatesNewFilesWithSafeDefaults() throws {
+        let fixture = try agentWriteFixture()
+        let target = fixture.workspace.appendingPathComponent("new.txt")
+
+        try AcpWorkspaceFileWriter.write(
+            Data("created".utf8),
+            to: target.path,
+            workspaceRoot: fixture.workspace.path
+        )
+
+        let metadata = try fileMetadata(at: target)
+        let parentMetadata = try fileMetadata(at: fixture.workspace)
+        XCTAssertEqual(mode_t(metadata.st_mode & 0o777), mode_t(0o644))
+        XCTAssertEqual(metadata.st_uid, Darwin.geteuid())
+        XCTAssertEqual(metadata.st_gid, parentMetadata.st_gid)
+        XCTAssertNil(try extendedACLText(at: target))
+    }
+
+    func testAgentWriteRollsBackContentAndMetadataWhenReplacementCommitFails() throws {
+        let fixture = try agentWriteFixture()
+        let target = fixture.workspace.appendingPathComponent("rollback.txt")
+        try "original".write(to: target, atomically: true, encoding: .utf8)
+        XCTAssertEqual(Darwin.chmod(target.path, 0o751), 0)
+        let attributeName = "com.kaisola.acp.rollback"
+        let attributeValue = Data("original metadata".utf8)
+        try setExtendedAttribute(attributeName, value: attributeValue, at: target)
+        let before = try fileMetadata(at: target)
+
+        XCTAssertThrowsError(
+            try AcpWorkspaceFileWriter.write(
+                Data("replacement".utf8),
+                to: target.path,
+                workspaceRoot: fixture.workspace.path,
+                beforeReplacementCommit: {
+                    throw NSError(domain: "AcpWorkspaceFileWriterTests", code: 487)
+                }
+            )
+        )
+
+        let after = try fileMetadata(at: target)
+        XCTAssertEqual(try String(contentsOf: target, encoding: .utf8), "original")
+        XCTAssertEqual(after.st_dev, before.st_dev)
+        XCTAssertEqual(after.st_ino, before.st_ino)
+        XCTAssertEqual(mode_t(after.st_mode & 0o777), mode_t(0o751))
+        XCTAssertEqual(after.st_uid, before.st_uid)
+        XCTAssertEqual(after.st_gid, before.st_gid)
+        XCTAssertEqual(try extendedAttribute(attributeName, at: target), attributeValue)
+        XCTAssertFalse(
+            try FileManager.default.contentsOfDirectory(atPath: fixture.workspace.path)
+                .contains(where: { $0.hasPrefix(".kaisola-acp-write-") })
+        )
+    }
+
     func testAgentWriteRejectsSymbolicLinkLeafBeforeMutation() throws {
         let fixture = try agentWriteFixture()
         let real = fixture.workspace.appendingPathComponent("real.txt")
@@ -508,6 +645,95 @@ final class AcpToolArtifactsTests: XCTestCase {
         try FileManager.default.createDirectory(at: outside, withIntermediateDirectories: true)
         addTeardownBlock { try? FileManager.default.removeItem(at: base) }
         return (workspace, outside)
+    }
+
+    private func fileMetadata(at url: URL) throws -> stat {
+        var metadata = stat()
+        let result = url.path.withCString { Darwin.lstat($0, &metadata) }
+        guard result == 0 else { throw posixError() }
+        return metadata
+    }
+
+    private func setExtendedAttribute(_ name: String, value: Data, at url: URL) throws {
+        let result = value.withUnsafeBytes { bytes in
+            url.path.withCString { path in
+                name.withCString { attributeName in
+                    Darwin.setxattr(
+                        path,
+                        attributeName,
+                        bytes.baseAddress,
+                        bytes.count,
+                        0,
+                        XATTR_NOFOLLOW
+                    )
+                }
+            }
+        }
+        guard result == 0 else { throw posixError() }
+    }
+
+    private func extendedAttribute(_ name: String, at url: URL) throws -> Data? {
+        let size = url.path.withCString { path in
+            name.withCString { attributeName in
+                Darwin.getxattr(path, attributeName, nil, 0, 0, XATTR_NOFOLLOW)
+            }
+        }
+        if size < 0, errno == ENOATTR { return nil }
+        guard size >= 0 else { throw posixError() }
+        if size == 0 { return Data() }
+        var value = Data(count: Int(size))
+        let readSize = value.withUnsafeMutableBytes { bytes in
+            url.path.withCString { path in
+                name.withCString { attributeName in
+                    Darwin.getxattr(
+                        path,
+                        attributeName,
+                        bytes.baseAddress,
+                        bytes.count,
+                        0,
+                        XATTR_NOFOLLOW
+                    )
+                }
+            }
+        }
+        guard readSize == size else { throw posixError() }
+        return value
+    }
+
+    private func installTestACL(at url: URL) throws {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/bin/chmod")
+        process.arguments = ["+a", "everyone allow read", url.path]
+        try process.run()
+        process.waitUntilExit()
+        guard process.terminationStatus == 0 else {
+            throw XCTSkip("extended ACLs are unavailable on this filesystem")
+        }
+    }
+
+    private func extendedACLText(at url: URL) throws -> String? {
+        let descriptor = Darwin.open(url.path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC)
+        guard descriptor >= 0 else { throw posixError() }
+        defer { _ = Darwin.close(descriptor) }
+        errno = 0
+        guard let accessControlList = Darwin.acl_get_fd_np(descriptor, ACL_TYPE_EXTENDED) else {
+            if errno == ENOENT { return nil }
+            if errno == ENOTSUP {
+                throw XCTSkip("extended ACLs are unavailable on this filesystem")
+            }
+            throw posixError()
+        }
+        defer { _ = acl_free(UnsafeMutableRawPointer(accessControlList)) }
+        var length: ssize_t = 0
+        guard let text = Darwin.acl_to_text(accessControlList, &length) else {
+            throw posixError()
+        }
+        defer { _ = acl_free(text) }
+        return String(cString: text)
+    }
+
+    private func posixError() -> NSError {
+        NSError(domain: NSPOSIXErrorDomain, code: Int(errno))
     }
 
     private func assertAgentWriteRejected(

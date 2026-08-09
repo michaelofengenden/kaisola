@@ -1,4 +1,5 @@
 import AppKit
+import Darwin
 import SwiftUI
 
 /// The workspace rail: a lazy file tree for the active project (⌘B). Clicking a
@@ -34,6 +35,7 @@ struct WorkspaceRailView: View {
     @State private var creationRequest: CreationRequest?
     @State private var creationDraft = ""
     @State private var trashTarget: FileNode?
+    @State private var instructionFileFailure: WorkspaceInstructionFile.Failure?
     @State private var isMutating = false
     /// Live FSEvents watcher — agent writes refresh the tree automatically.
     @StateObject private var watcher: WorkspaceWatcher
@@ -241,15 +243,7 @@ struct WorkspaceRailView: View {
                 .disabled(isMutating)
             Divider()
             Button("Refresh") { refresh() }
-            Button("New AGENTS.md") {
-                let target = root.appendingPathComponent("AGENTS.md")
-                if !FileManager.default.fileExists(atPath: target.path) {
-                    try? Self.agentsTemplate.write(to: target, atomically: true, encoding: .utf8)
-                    ProjectFileIndex.shared.invalidate(root: root)
-                    tree.refresh(expandedDirectories: expanded.map { URL(fileURLWithPath: $0, isDirectory: true) })
-                }
-                openFile(target, true)
-            }
+            Button("New AGENTS.md") { createInstructionFile() }
         }
         .alert(
             "Rename \(renameTarget?.isDirectory == true ? "Folder" : "File")",
@@ -289,6 +283,19 @@ struct WorkspaceRailView: View {
         } message: {
             Text("This is recoverable from the macOS Trash.")
         }
+        .alert(
+            "Couldn't Create \(WorkspaceInstructionFile.fileName)",
+            isPresented: instructionFileFailurePresented,
+            presenting: instructionFileFailure
+        ) { _ in
+            // The alert writes `isPresented` back *after* this action returns,
+            // so a synchronous retry's new failure would be cleared before it
+            // could be shown. Retry on the next turn instead.
+            Button("Try Again") { Task { @MainActor in createInstructionFile() } }
+            Button("Cancel", role: .cancel) { instructionFileFailure = nil }
+        } message: { failure in
+            Text(failure.message)
+        }
         .accessibilityLabel("Project files")
     }
 
@@ -310,6 +317,13 @@ struct WorkspaceRailView: View {
         Binding(
             get: { creationRequest != nil },
             set: { if !$0 { creationRequest = nil } }
+        )
+    }
+
+    private var instructionFileFailurePresented: Binding<Bool> {
+        Binding(
+            get: { instructionFileFailure != nil },
+            set: { if !$0 { instructionFileFailure = nil } }
         )
     }
 
@@ -515,6 +529,24 @@ struct WorkspaceRailView: View {
         }
     }
 
+    /// Writes the starter AGENTS.md and opens it *only* once the write is
+    /// confirmed. A suppressed error used to open a tab regardless, so a
+    /// permission or disk failure left a phantom document that implied the
+    /// instruction file was there. Failures now surface with a retry instead.
+    private func createInstructionFile() {
+        switch WorkspaceInstructionFile.create(in: root) {
+        case let .success(outcome):
+            if outcome.didWrite {
+                ProjectFileIndex.shared.invalidate(root: root)
+                tree.refresh(expandedDirectories: expanded.map { URL(fileURLWithPath: $0, isDirectory: true) })
+            }
+            instructionFileFailure = nil
+            openFile(outcome.url, true)
+        case let .failure(failure):
+            instructionFileFailure = failure
+        }
+    }
+
     private func performTrash() {
         guard let target = trashTarget, prepareMutation(target) else { return }
         let root = self.root
@@ -541,30 +573,6 @@ struct WorkspaceRailView: View {
             isMutating = false
         }
     }
-
-    /// Starter AGENTS.md dropped at the project root — the emerging convention
-    /// agent CLIs read for repo-specific guidance. Opens the existing file
-    /// instead when one is already there.
-    static let agentsTemplate = """
-    # AGENTS.md
-
-    Guidance for AI agents working in this repository.
-
-    ## Project overview
-
-    Describe what this project is and how it fits together.
-
-    ## Commands
-
-    - Build:
-    - Test:
-    - Lint:
-
-    ## Conventions
-
-    Code style, structure, and review expectations agents should follow.
-    """
-
 
     @ViewBuilder
     private func nodeRows(for directory: URL, depth: Int) -> some View {
@@ -933,6 +941,180 @@ struct FadingFileName: View {
                     .frame(width: fadeWidth)
                 }
             }
+    }
+}
+
+/// The project's starter AGENTS.md — the emerging convention agent CLIs read
+/// for repo-specific guidance.
+///
+/// Creation is its own type because the rail may only open a document it can
+/// prove is on disk. The write is exclusive (an existing file is never
+/// overwritten), a partial write is discarded rather than left looking like a
+/// real instruction file, and every failure comes back with advice a person can
+/// act on before retrying the same action.
+enum WorkspaceInstructionFile {
+    static let fileName = "AGENTS.md"
+
+    enum Outcome: Equatable, Sendable {
+        /// This action wrote the starter file.
+        case created(URL)
+        /// A regular file was already there; nothing was written.
+        case alreadyExisted(URL)
+
+        /// The file the rail may open. It exists in both cases — that is the
+        /// point of returning an outcome rather than a bare path.
+        var url: URL {
+            switch self {
+            case let .created(url), let .alreadyExisted(url): url
+            }
+        }
+
+        var didWrite: Bool {
+            if case .created = self { true } else { false }
+        }
+    }
+
+    struct Failure: Error, Equatable, Sendable {
+        enum Reason: Equatable, Sendable {
+            case collision
+            case permission
+            case diskFull
+            case workspaceUnavailable
+            case unknown
+        }
+
+        let reason: Reason
+
+        /// Each message names the cause the person can clear, because the alert
+        /// that carries it offers the action again straight away.
+        var message: String {
+            switch reason {
+            case .collision:
+                "A folder or link named \(fileName) is already in this project. Rename or remove it, then try again."
+            case .permission:
+                "Kaisola doesn't have permission to write \(fileName) in this project folder."
+            case .diskFull:
+                "The disk is full, so \(fileName) wasn't written. Free some space, then try again."
+            case .workspaceUnavailable:
+                "The project folder is unavailable, so \(fileName) wasn't written."
+            case .unknown:
+                "Kaisola couldn't write \(fileName). Check the project folder, then try again."
+            }
+        }
+    }
+
+    /// Creates the starter file when it is missing. Success means a real file
+    /// is on disk right now; a failure never yields a path to open.
+    static func create(in workspaceRoot: URL) -> Result<Outcome, Failure> {
+        let root = workspaceRoot.standardizedFileURL
+        var rootIsDirectory: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: root.path, isDirectory: &rootIsDirectory),
+              rootIsDirectory.boolValue else {
+            return .failure(Failure(reason: .workspaceUnavailable))
+        }
+
+        let target = root.appendingPathComponent(fileName).standardizedFileURL
+        var targetIsDirectory: ObjCBool = false
+        if FileManager.default.fileExists(atPath: target.path, isDirectory: &targetIsDirectory) {
+            // A folder or a link under that name is a collision, not an
+            // instruction file: opening it would preview something that is not
+            // the guidance the action promised.
+            guard !targetIsDirectory.boolValue else {
+                return .failure(Failure(reason: .collision))
+            }
+            let values = try? target.resourceValues(forKeys: [.isSymbolicLinkKey])
+            guard values?.isSymbolicLink != true else {
+                return .failure(Failure(reason: .collision))
+            }
+            return .success(.alreadyExisted(target))
+        }
+
+        if let failure = write(template, to: target) {
+            return .failure(failure)
+        }
+        guard FileManager.default.fileExists(atPath: target.path) else {
+            return .failure(Failure(reason: .unknown))
+        }
+        return .success(.created(target))
+    }
+
+    /// errno is the only signal that separates a full disk from a folder the
+    /// app may not write to, and the two need different advice.
+    static func failure(forErrno code: Int32) -> Failure {
+        switch code {
+        case EEXIST:
+            Failure(reason: .collision)
+        case EACCES, EPERM, EROFS:
+            Failure(reason: .permission)
+        case ENOSPC, EDQUOT, EFBIG:
+            Failure(reason: .diskFull)
+        case ENOENT, ENOTDIR:
+            Failure(reason: .workspaceUnavailable)
+        default:
+            Failure(reason: .unknown)
+        }
+    }
+
+    static let template = """
+    # AGENTS.md
+
+    Guidance for AI agents working in this repository.
+
+    ## Project overview
+
+    Describe what this project is and how it fits together.
+
+    ## Commands
+
+    - Build:
+    - Test:
+    - Lint:
+
+    ## Conventions
+
+    Code style, structure, and review expectations agents should follow.
+    """
+
+    /// Exclusive create plus a complete write, or nothing at all. `O_EXCL`
+    /// keeps the filesystem the collision authority even if a file appears
+    /// between the check above and this call.
+    private static func write(_ contents: String, to destination: URL) -> Failure? {
+        let descriptor = destination.path.withCString { path in
+            Darwin.open(path, O_WRONLY | O_CREAT | O_EXCL, S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH)
+        }
+        guard descriptor >= 0 else { return failure(forErrno: errno) }
+
+        let bytes = Array(contents.utf8)
+        var offset = 0
+        while offset < bytes.count {
+            let written = bytes.withUnsafeBytes { buffer in
+                Darwin.write(descriptor, buffer.baseAddress! + offset, bytes.count - offset)
+            }
+            if written < 0 {
+                let code = errno
+                if code == EINTR { continue }
+                return discard(descriptor, at: destination, reporting: failure(forErrno: code))
+            }
+            offset += written
+        }
+        // A truncated instruction file is worse than none: it would read as
+        // real guidance, and the retry would then collide with itself.
+        guard Darwin.close(descriptor) == 0 else {
+            let code = errno
+            try? FileManager.default.removeItem(at: destination)
+            return failure(forErrno: code)
+        }
+        return nil
+    }
+
+    private static func discard(
+        _ descriptor: Int32,
+        at destination: URL,
+        reporting failure: Failure
+    ) -> Failure {
+        Darwin.close(descriptor)
+        try? FileManager.default.removeItem(at: destination)
+        return failure
     }
 }
 

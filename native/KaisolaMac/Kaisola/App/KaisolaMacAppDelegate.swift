@@ -669,6 +669,21 @@ enum KaisolaMacMain {
             print("KAISOLA_NATIVE_LAUNCH_PROBE=PASS")
             return
         }
+        // The layout gate judges snapshots a capture run already wrote. It only
+        // reads JSON, so it runs on a headless runner with no window, no
+        // display and no user state, and reports through the exit status.
+        let commandArguments = Array(ProcessInfo.processInfo.arguments.dropFirst())
+        if NativeVisualLayoutCommand.requestsGate(arguments: commandArguments) {
+            guard let invocation = NativeVisualLayoutCommand.parse(arguments: commandArguments) else {
+                FileHandle.standardError.write(Data(
+                    ("KAISOLA_NATIVE_VISUAL_LAYOUT_GATE=FAIL usage: "
+                        + "--visual-layout-gate <directory> | --visual-layout-self-test <directory>"
+                        + " [--expectations <path>] [--review <path>]\n").utf8
+                ))
+                exit(2)
+            }
+            exit(NativeVisualLayoutCommand.run(invocation))
+        }
         KaisolaProductMigration.run()
         let application = NSApplication.shared
         application.setActivationPolicy(.regular)
@@ -868,6 +883,14 @@ final class KaisolaMacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDele
     private let visualWorkspace = ProcessInfo.processInfo.environment["KAISOLA_NATIVE_VISUAL_WORKSPACE"]
     private let visualDocument = ProcessInfo.processInfo.environment["KAISOLA_NATIVE_VISUAL_DOCUMENT"]
     private let visualCapturePath = ProcessInfo.processInfo.environment["KAISOLA_NATIVE_VISUAL_CAPTURE_PATH"]
+    private let visualLargeText = ProcessInfo.processInfo.environment[
+        "KAISOLA_NATIVE_VISUAL_LARGE_TEXT"
+    ] == "1"
+    /// Pixels per point the capture is written at. Unset (0) keeps whatever the
+    /// host renders; `1` is the non-Retina inspection.
+    private let visualCaptureScale: CGFloat = ProcessInfo.processInfo.environment[
+        "KAISOLA_NATIVE_VISUAL_SCALE"
+    ].flatMap { Double($0) }.map { CGFloat($0) } ?? 0
     private let pdfPreviewBudgetRequested = ProcessInfo.processInfo.environment[
         "KAISOLA_NATIVE_PDF_PREVIEW_BUDGET"
     ] != nil
@@ -1405,8 +1428,8 @@ final class KaisolaMacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDele
                 if !data.isEmpty, (try? data.write(to: document, options: .atomic)) != nil {
                     model.openFilePreview(document)
                 }
-            } else if visualSurface == "mesh" {
-                model.loadVisualMeshFixture(workspace: workspace)
+            } else if let mesh = NativeVisualMeshFixture.parse(visualSurface) {
+                model.loadVisualMeshFixture(workspace: workspace, agentCount: mesh.agentCount)
             }
         }
         if let initialProjectDirectory, !visualFixture {
@@ -1421,7 +1444,7 @@ final class KaisolaMacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDele
             // real project id or leaves the ordinary restored selection alone.
             model.selectedProjectName = legacyInitialProjectName
         }
-        let content: AnyView
+        var content: AnyView
         if visualFixture, visualSurface == "onboarding" {
             UsageCenter.shared.loadVisualFixture()
             content = AnyView(OnboardingView(
@@ -1431,7 +1454,7 @@ final class KaisolaMacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDele
                 openAccounts: {},
                 openUpdateSettings: {}
             ))
-        } else if visualFixture, ["settings", "settings-terminal", "settings-terminal-history", "settings-terminal-interaction", "settings-companion", "settings-mcp", "settings-extensions", "settings-extensions-narrow", "settings-accounts", "settings-models", "settings-shortcuts", "settings-account-recovery", "usage"].contains(visualSurface) {
+        } else if visualFixture, SettingsWindowChrome.visualSurfaces.contains(visualSurface) {
             let workspace = URL(
                 fileURLWithPath: visualWorkspace ?? FileManager.default.currentDirectoryPath,
                 isDirectory: true
@@ -1464,7 +1487,9 @@ final class KaisolaMacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDele
                 workspace: workspace,
                 initialSectionID: initialSectionID,
                 initialContentAnchorID: initialContentAnchorID
-            ).environmentObject(auth))
+            )
+            .environment(\.dynamicTypeSize, visualLargeText ? .accessibility1 : .large)
+            .environmentObject(auth))
         } else {
             content = AnyView(
                 RootShellView()
@@ -1476,17 +1501,25 @@ final class KaisolaMacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDele
         }
 
         let visualSettings = visualFixture
-            && ["settings", "settings-terminal", "settings-terminal-history", "settings-terminal-interaction", "settings-companion", "settings-mcp", "settings-extensions", "settings-extensions-narrow", "settings-accounts", "settings-models", "settings-shortcuts", "settings-account-recovery", "usage"].contains(visualSurface)
+            && SettingsWindowChrome.visualSurfaces.contains(visualSurface)
         let visualOnboarding = visualFixture && visualSurface == "onboarding"
-        let visualExtensions = visualFixture && visualSurface == "settings-extensions"
-        let visualExtensionsNarrow = visualFixture && visualSurface == "settings-extensions-narrow"
+        let visualMesh = visualFixture ? NativeVisualMeshFixture.parse(visualSurface) : nil
+        if visualMesh?.usesLargeText == true {
+            // The accessibility text sizes are what actually strand a Mesh
+            // column, so the large-text fixtures ask for one rather than
+            // nudging the ordinary steps.
+            content = AnyView(content.dynamicTypeSize(.accessibility1))
+        }
+        // Settings fixtures now capture a window the product can actually be
+        // resized to: the minimum, or the ideal for `settings-ideal`.
+        let visualSettingsSize = SettingsWindowChrome.visualContentSize(surface: visualSurface)
 
         let window = NSWindow(
             contentRect: NSRect(
                 x: 0,
                 y: 0,
-                width: visualExtensions ? 1_100 : (visualExtensionsNarrow ? 820 : (visualSettings ? 810 : (visualOnboarding ? 760 : (resourceWorkload != nil ? 1_280 : (visualFixture ? 1_360 : 1_080))))),
-                height: visualExtensions ? 800 : (visualExtensionsNarrow ? 560 : (visualSettings ? 540 : (visualOnboarding ? 560 : (resourceWorkload != nil ? 800 : (visualFixture ? 860 : 700)))))
+                width: visualSettings ? visualSettingsSize.width : (visualOnboarding ? 760 : (resourceWorkload != nil ? 1_280 : (visualMesh?.width.points ?? (visualFixture ? 1_360 : 1_080)))),
+                height: visualSettings ? visualSettingsSize.height : (visualOnboarding ? 560 : (resourceWorkload != nil ? 800 : (visualFixture ? 860 : 700)))
             ),
             styleMask: [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView],
             backing: .buffered,
@@ -1981,6 +2014,48 @@ final class KaisolaMacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDele
                 return
             }
 
+            // Settings draws its own chrome under a hidden title bar, so the
+            // window buttons are only safe by construction. Prove it on the
+            // real, laid-out window before the PNG is written.
+            if NativeVisualWindowControlGate.applies(to: visualSurface) {
+                let report = NativeVisualWindowControlGate.inspect(captureWindow)
+                if let failure = report.failure {
+                    print(
+                        "KAISOLA_NATIVE_VISUAL_WINDOW_CONTROLS=FAIL "
+                            + "surface=\(visualSurface) reason=\(failure)"
+                    )
+                    requestVisualFixtureTermination()
+                    return
+                }
+                print(
+                    "KAISOLA_NATIVE_VISUAL_WINDOW_CONTROLS=PASS "
+                        + "surface=\(visualSurface) controls=\(report.controls) "
+                        + "accessibilityElements=\(report.accessibilityElements)"
+                )
+            }
+
+            if visualSurface == "settings-account-recovery" {
+                let size: DynamicTypeSize = visualLargeText ? .accessibility1 : .large
+                let layout = AppAccountRecoveryLayout.resolve(
+                    hasRecoveryNotice: true,
+                    dynamicTypeSize: size
+                )
+                guard layout.stacksActionBelowIdentity,
+                      layout.headlineLineLimit == nil,
+                      layout.dynamicTypeSize == size else {
+                    print(
+                        "KAISOLA_NATIVE_ACCOUNT_RECOVERY_LAYOUT=FAIL "
+                            + "largeText=\(visualLargeText)"
+                    )
+                    requestVisualFixtureTermination()
+                    return
+                }
+                print(
+                    "KAISOLA_NATIVE_ACCOUNT_RECOVERY_LAYOUT=PASS "
+                        + "largeText=\(visualLargeText) verticalAction=true unclampedHeadline=true"
+                )
+            }
+
             if ["settings-extensions", "settings-extensions-narrow"].contains(visualSurface) {
                 guard let model = windowModels[ObjectIdentifier(window)] else {
                     print("KAISOLA_NATIVE_EXTENSIONS_SETTINGS=FAIL no-mounted-model")
@@ -2022,7 +2097,7 @@ final class KaisolaMacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDele
             // hosted. Their generation-based request must survive that mount
             // and land on the real composer field editor, or the visible focus
             // ring and keyboard target have drifted again.
-            if ["mixed", "mesh"].contains(visualSurface) {
+            if visualSurface == "mixed" || NativeVisualMeshFixture.parse(visualSurface) != nil {
                 guard captureWindow.firstResponder is NSText else {
                     let responder = captureWindow.firstResponder
                         .map { String(describing: type(of: $0)) }
@@ -2313,9 +2388,8 @@ final class KaisolaMacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDele
                 screenCapture = nil
             }
 
-            let data: Data?
+            let rendered: CGImage?
             if let screenCapture {
-                let rendered: CGImage
                 let method: String
                 if let webSnapshot,
                    let composited = NativeVisualCapture.compositedImage(
@@ -2330,14 +2404,32 @@ final class KaisolaMacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDele
                     method = screenCapture.method
                 }
                 print("KAISOLA_NATIVE_VISUAL_CAPTURE_METHOD=\(method)")
-                data = NSBitmapImageRep(cgImage: rendered)
-                    .representation(using: .png, properties: [:])
             } else if let bitmap = view.bitmapImageRepForCachingDisplay(in: view.bounds) {
                 print("KAISOLA_NATIVE_VISUAL_CAPTURE_METHOD=view-cache-fallback")
                 view.cacheDisplay(in: view.bounds, to: bitmap)
-                data = bitmap.representation(using: .png, properties: [:])
+                rendered = bitmap.cgImage
             } else {
-                data = nil
+                rendered = nil
+            }
+            // A Retina host captures two pixels per point. `SCALE=1` asks for
+            // the same window at one, which is the inspection a hairline, a
+            // 30pt mark and a traffic-light clearance are actually decided at.
+            // CI's headless WindowServer already renders near 1×, so this is a
+            // no-op there and a real resample on a developer's display.
+            let scaled = rendered.map { image -> CGImage in
+                guard let resampled = NativeVisualCapture.rescaled(
+                    image,
+                    pointSize: captureWindow.frame.size,
+                    pointPixelScale: visualCaptureScale
+                ) else { return image }
+                print(
+                    "KAISOLA_NATIVE_VISUAL_CAPTURE_SCALE=\(visualCaptureScale) "
+                        + "pixels=\(resampled.width)x\(resampled.height)"
+                )
+                return resampled
+            }
+            let data = scaled.flatMap {
+                NSBitmapImageRep(cgImage: $0).representation(using: .png, properties: [:])
             }
             guard let data else {
                 print("KAISOLA_NATIVE_VISUAL_CAPTURE=FAIL png-encoding")
@@ -2356,7 +2448,42 @@ final class KaisolaMacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDele
             } catch {
                 print("KAISOLA_NATIVE_VISUAL_CAPTURE=FAIL \(error.localizedDescription)")
             }
+            // A PNG only proves something rendered. Record the geometry the
+            // screenshot cannot be checked for by eye — window-control zone,
+            // accessibility inventory, app-drawn ink — beside it, and let the
+            // post-capture gate judge every surface at once.
+            writeVisualLayoutSnapshot(of: captureWindow, capturePath: path)
             requestVisualFixtureTermination()
+        }
+    }
+
+    /// Structural evidence beside the capture. Never fails the fixture on its
+    /// own: the surface still gets its PNG, and `--visual-layout-gate` decides
+    /// after the whole inspection set exists, so one verdict covers every
+    /// screenshot instead of aborting at the first bad one.
+    private func writeVisualLayoutSnapshot(of window: NSWindow, capturePath: String) {
+        guard let snapshot = NativeVisualLayoutProbe.snapshot(
+            of: window,
+            surface: visualSurface,
+            appearance: visualAppearance
+        ) else {
+            print("KAISOLA_NATIVE_VISUAL_LAYOUT_SNAPSHOT=FAIL surface=\(visualSurface) reason=no-content-view")
+            return
+        }
+        let url = NativeVisualLayoutProbe.snapshotURL(forCapturePath: capturePath)
+        do {
+            try NativeVisualLayoutProbe.write(snapshot, to: url)
+            print(
+                "KAISOLA_NATIVE_VISUAL_LAYOUT_SNAPSHOT=PASS surface=\(visualSurface) "
+                    + "elements=\(snapshot.elements.count) source=\(snapshot.inventorySource) "
+                    + "controls=\(snapshot.windowControls.filter { !$0.isHidden }.count) "
+                    + "path=\(url.path)"
+            )
+        } catch {
+            print(
+                "KAISOLA_NATIVE_VISUAL_LAYOUT_SNAPSHOT=FAIL surface=\(visualSurface) "
+                    + "reason=\(error.localizedDescription)"
+            )
         }
     }
 
@@ -4239,10 +4366,16 @@ final class KaisolaMacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDele
         // Sized to the SettingsView's own contract (minWidth 820, ideal
         // 1100×800) — the old 810×540/min-760 window sat BELOW the view's
         // minimum, so first layout fought and the window opened cramped
-        // (2026-08-06 spec §3a).
+        // (2026-08-06 spec §3a). Both sizes and the style mask now come from
+        // `SettingsWindowChrome`, which is also what reserves the title-bar
+        // band the traffic lights sit in and what adds the `.miniaturizable`
+        // this window spent its whole life without (#306).
         let window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 1_100, height: 800),
-            styleMask: [.titled, .closable, .resizable, .fullSizeContentView],
+            contentRect: NSRect(
+                origin: .zero,
+                size: SettingsWindowChrome.idealContentSize
+            ),
+            styleMask: SettingsWindowChrome.styleMask,
             backing: .buffered,
             defer: false
         )
@@ -4251,7 +4384,7 @@ final class KaisolaMacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDele
         window.titleVisibility = .hidden
         window.isOpaque = false
         window.backgroundColor = .clear
-        window.minSize = NSSize(width: 820, height: 560)
+        window.minSize = SettingsWindowChrome.minimumContentSize
         window.isReleasedWhenClosed = false
         window.delegate = self
         bindSettingsWindow(window, to: model)
@@ -4831,6 +4964,57 @@ final class KaisolaMacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDele
     }
 }
 
+/// Mesh visual fixtures carry their own shape in the surface name:
+/// `mesh-<agents>-<width>`, optionally suffixed `-large-text`. Bare `mesh`
+/// stays the three-agent, typical-width fixture the workflow already captures.
+/// Parsing it here keeps the capture matrix data in the workflow rather than
+/// one Swift branch per cell.
+struct NativeVisualMeshFixture: Equatable {
+    enum Width: String, CaseIterable {
+        case min
+        case typical
+        case full
+
+        /// Content widths: the app's own minimum window, an ordinary laptop
+        /// window, and a full-screen one on an external display. A hosted
+        /// runner whose virtual display is narrower than these constrains the
+        /// window to its own width.
+        var points: CGFloat {
+            switch self {
+            case .min: 760
+            case .typical: 1_360
+            case .full: 1_920
+            }
+        }
+    }
+
+    var agentCount = 3
+    var width = Width.typical
+    var usesLargeText = false
+
+    static let largeTextSuffix = "-large-text"
+    static let supportedAgentCounts = 2...4
+
+    static func parse(_ surface: String) -> NativeVisualMeshFixture? {
+        if surface == "mesh" { return NativeVisualMeshFixture() }
+        guard surface.hasPrefix("mesh-") else { return nil }
+        var remainder = String(surface.dropFirst("mesh-".count))
+        var fixture = NativeVisualMeshFixture()
+        if remainder.hasSuffix(largeTextSuffix) {
+            fixture.usesLargeText = true
+            remainder = String(remainder.dropLast(largeTextSuffix.count))
+        }
+        let parts = remainder.split(separator: "-", omittingEmptySubsequences: false)
+        guard parts.count == 2,
+              let agents = Int(parts[0]),
+              supportedAgentCounts.contains(agents),
+              let width = Width(rawValue: String(parts[1])) else { return nil }
+        fixture.agentCount = agents
+        fixture.width = width
+        return fixture
+    }
+}
+
 enum NativeVisualCaptureTarget {
     @MainActor
     static func window(rootedAt root: NSWindow, surface: String) -> NSWindow? {
@@ -5018,6 +5202,146 @@ enum NativeVisualTerminalAccessibilityGate {
     }
 }
 
+/// The three standard window buttons are the one part of a
+/// `.fullSizeContentView` window AppKit still owns. Custom content drawn in that
+/// corner renders on top of them, so a fixture can look perfectly composed while
+/// minimize and zoom are buried under a 30pt mark — which is exactly what every
+/// Settings capture showed until #306.
+///
+/// This gate runs before each Settings capture and fails it three ways: a
+/// missing or disabled control, a rect the layout itself declares over a
+/// control, and an accessibility element — the thing VoiceOver actually lands
+/// on — whose frame meets one. A failure suppresses the PNG, so the visual
+/// workflow fails rather than publishing the collision as a fixture.
+@MainActor
+enum NativeVisualWindowControlGate {
+    /// A rectangle in window points measured from the content view's *top-left*
+    /// corner, which is the corner the traffic lights sit in.
+    struct Region: Equatable {
+        let name: String
+        let frame: CGRect
+    }
+
+    static let buttons: [(name: String, kind: NSWindow.ButtonType)] = [
+        ("close", .closeButton),
+        ("miniaturize", .miniaturizeButton),
+        ("zoom", .zoomButton),
+    ]
+
+    static func applies(to surface: String) -> Bool {
+        SettingsWindowChrome.visualSurfaces.contains(surface)
+    }
+
+    /// AppKit hands out window coordinates measured from the bottom-left. Flip
+    /// them once, here, so every comparison below reads the way the layout does.
+    static func topLeftFrame(_ frame: CGRect, in window: NSWindow) -> CGRect {
+        let height = window.contentView?.bounds.height ?? window.frame.height
+        return CGRect(
+            x: frame.minX,
+            y: height - frame.maxY,
+            width: frame.width,
+            height: frame.height
+        )
+    }
+
+    static func controlRegions(in window: NSWindow) -> [Region] {
+        buttons.compactMap { name, kind in
+            guard let button = window.standardWindowButton(kind) else { return nil }
+            return Region(
+                name: name,
+                frame: topLeftFrame(button.convert(button.bounds, to: nil), in: window)
+            )
+        }
+    }
+
+    /// A control the user can see but not operate is the same failure as one
+    /// they cannot see, so enablement is checked alongside presence.
+    static func missingControl(in window: NSWindow) -> String? {
+        for (name, kind) in buttons {
+            guard let button = window.standardWindowButton(kind) else {
+                return "absent-\(name)"
+            }
+            if button.isHidden { return "hidden-\(name)" }
+            if !button.isEnabled { return "disabled-\(name)" }
+        }
+        return nil
+    }
+
+    /// The first custom region that meets a window button, named for the log.
+    static func collision(controls: [Region], content: [Region]) -> String? {
+        for control in controls {
+            for region in content where region.frame.intersects(control.frame) {
+                return "\(region.name)-over-\(control.name)"
+            }
+        }
+        return nil
+    }
+
+    /// Every accessibility element under the content view, in the same top-left
+    /// window points. Rooted at the content view on purpose: the window buttons
+    /// are the *window's* accessibility children, never the content's, so
+    /// nothing here can collide with itself.
+    static func accessibilityRegions(in window: NSWindow, limit: Int = 600) -> [Region] {
+        guard let root = window.contentView else { return [] }
+        var regions: [Region] = []
+        var queue = children(of: root)
+        var visited = 0
+        while !queue.isEmpty, visited < limit {
+            let element = queue.removeFirst()
+            visited += 1
+            queue.append(contentsOf: children(of: element))
+            let screenFrame = element.accessibilityFrame()
+            guard screenFrame.width > 0, screenFrame.height > 0 else { continue }
+            let name = element.accessibilityLabel()
+                ?? element.accessibilityTitle()
+                ?? String(describing: type(of: element))
+            regions.append(Region(
+                name: name,
+                frame: topLeftFrame(window.convertFromScreen(screenFrame), in: window)
+            ))
+        }
+        return regions
+    }
+
+    private static func children(
+        of element: any NSAccessibilityProtocol
+    ) -> [any NSAccessibilityProtocol] {
+        (element.accessibilityChildren() ?? [])
+            .compactMap { $0 as? any NSAccessibilityProtocol }
+    }
+
+    struct Report {
+        let failure: String?
+        let controls: Int
+        let accessibilityElements: Int
+    }
+
+    static func inspect(_ window: NSWindow) -> Report {
+        let controls = controlRegions(in: window)
+        let accessibility = accessibilityRegions(in: window)
+        let failure: String?
+        if let missing = missingControl(in: window) {
+            failure = missing
+        } else if controls.count != buttons.count {
+            failure = "controls-\(controls.count)"
+        } else if let declared = collision(
+            controls: controls,
+            content: SettingsWindowChrome.topLeadingContentFrames().map {
+                Region(name: $0.name, frame: $0.frame)
+            }
+        ) {
+            failure = declared
+        } else {
+            failure = collision(controls: controls, content: accessibility)
+        }
+        return Report(
+            failure: failure,
+            controls: controls.count,
+            accessibilityElements: accessibility.count
+        )
+    }
+}
+
 enum NativeVisualCapture {
     struct PixelSize: Equatable {
         let width: Int
@@ -5034,6 +5358,46 @@ enum NativeVisualCapture {
             width: max(1, Int(ceil(contentRect.width * pointPixelScale))),
             height: max(1, Int(ceil(contentRect.height * pointPixelScale)))
         )
+    }
+
+    /// Redraw a capture at a requested pixels-per-point, or return nil when
+    /// there is nothing to do: no scale was asked for, the size is unusable, or
+    /// the image already has exactly those pixels.
+    ///
+    /// Resampling the finished capture rather than rendering the window offscreen
+    /// keeps the non-Retina fixture on the same path as every other one. An
+    /// offscreen redraw of a material-backed window is the case the visual
+    /// workflow already warns about: it can come back transparent.
+    static func rescaled(
+        _ image: CGImage,
+        pointSize: CGSize,
+        pointPixelScale: CGFloat
+    ) -> CGImage? {
+        guard pointPixelScale > 0, pointSize.width > 0, pointSize.height > 0 else {
+            return nil
+        }
+        let target = pixelSize(
+            contentRect: CGRect(origin: .zero, size: pointSize),
+            pointPixelScale: pointPixelScale
+        )
+        guard target.width != image.width || target.height != image.height else {
+            return nil
+        }
+        guard let context = CGContext(
+            data: nil,
+            width: target.width,
+            height: target.height,
+            bitsPerComponent: 8,
+            bytesPerRow: 0,
+            space: image.colorSpace ?? CGColorSpaceCreateDeviceRGB(),
+            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+        ) else { return nil }
+        context.interpolationQuality = .high
+        context.draw(
+            image,
+            in: CGRect(x: 0, y: 0, width: target.width, height: target.height)
+        )
+        return context.makeImage()
     }
 
     static func cropRect(

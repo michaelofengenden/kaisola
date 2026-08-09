@@ -94,7 +94,7 @@ struct ExtensionsSettingsHub: View {
     private var searchHeader: some View {
         HStack(spacing: 10) {
             Image(systemName: "magnifyingglass")
-                .foregroundStyle(.secondary)
+                .foregroundStyle(.kaisolaSecondary)
                 .accessibilityHidden(true)
             TextField("Search agents, servers, themes, grammars, and previews", text: $query)
                 .textFieldStyle(.plain)
@@ -109,7 +109,7 @@ struct ExtensionsSettingsHub: View {
                     Image(systemName: "xmark.circle.fill")
                 }
                 .buttonStyle(.plain)
-                .foregroundStyle(.secondary)
+                .foregroundStyle(.kaisolaSecondary)
                 .accessibilityLabel("Clear extension search")
             }
             Button("Search") { searchFocused = true }
@@ -145,7 +145,7 @@ struct ExtensionsSettingsHub: View {
         HStack(spacing: 10) {
             Text("Showing")
                 .font(.caption)
-                .foregroundStyle(.secondary)
+                .foregroundStyle(.kaisolaSecondary)
             Picker("Extension category", selection: $selectedCategory) {
                 Text("All Extensions").tag(nil as ExtensionsSettingsCategory?)
                 ForEach(ExtensionsSettingsCategory.allCases) { category in
@@ -157,7 +157,7 @@ struct ExtensionsSettingsHub: View {
             Spacer()
             Text(scopeSummary)
                 .font(.caption)
-                .foregroundStyle(.secondary)
+                .foregroundStyle(.kaisolaSecondary)
                 .lineLimit(1)
         }
         .padding(.horizontal, 16)
@@ -189,11 +189,11 @@ struct ExtensionsSettingsHub: View {
                 } else {
                     Text("\(categoryItems.count)")
                         .font(.caption2.monospacedDigit())
-                        .foregroundStyle(.tertiary)
+                        .foregroundStyle(.kaisolaTertiary)
                 }
             }
             .font(.callout.weight(selected ? .semibold : .regular))
-            .foregroundStyle(selected ? Color.primary : .secondary)
+            .foregroundStyle(selected ? Color.primary : .kaisolaSecondary)
             .padding(.horizontal, 10)
             .frame(height: 34)
             .frame(maxWidth: .infinity, alignment: .leading)
@@ -215,7 +215,7 @@ struct ExtensionsSettingsHub: View {
             Label("Current project", systemImage: "folder")
         }
         .font(.caption2)
-        .foregroundStyle(.tertiary)
+        .foregroundStyle(.kaisolaTertiary)
         .padding(.horizontal, 10)
         .padding(.bottom, 4)
         .accessibilityElement(children: .combine)
@@ -235,7 +235,7 @@ struct ExtensionsSettingsHub: View {
         if isLoading {
             VStack(spacing: 10) {
                 ProgressView()
-                Text("Loading extensions…").foregroundStyle(.secondary)
+                Text("Loading extensions…").foregroundStyle(.kaisolaSecondary)
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
             .accessibilityElement(children: .combine)
@@ -267,7 +267,7 @@ struct ExtensionsSettingsHub: View {
                             Text(title).font(.title3.weight(.semibold))
                             Text("Every row uses the same status, source, version and integrity, scope, and update vocabulary.")
                                 .font(.caption)
-                                .foregroundStyle(.secondary)
+                                .foregroundStyle(.kaisolaSecondary)
                         }
                         Spacer()
                         if case let .content(invalidCount) = state, invalidCount > 0 {
@@ -413,7 +413,7 @@ private struct ExtensionCategoryIntro: View {
                  ? "Changes apply only to \(workspace?.lastPathComponent ?? "the current project")."
                  : "Changes apply across Kaisola.")
                 .font(.caption)
-                .foregroundStyle(.secondary)
+                .foregroundStyle(.kaisolaSecondary)
         }
         .accessibilityIdentifier("extensions.category-intro.\(category.rawValue)")
     }
@@ -433,7 +433,7 @@ private struct ExtensionCategoryHeader: View {
                      ? "Project scope · \(workspace?.lastPathComponent ?? "open a project")"
                      : "App-wide scope")
                     .font(.caption)
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(.kaisolaSecondary)
             }
             Spacer()
         }
@@ -451,7 +451,7 @@ struct ExtensionRegistryRow<Trailing: View>: View {
         VStack(alignment: .leading, spacing: 9) {
             HStack(alignment: .top, spacing: 10) {
                 Image(systemName: item.category.symbol)
-                    .foregroundStyle(item.status.isEnabled ? Color.accentColor : .secondary)
+                    .foregroundStyle(item.status.isEnabled ? Color.accentColor : .kaisolaSecondary)
                     .frame(width: 19)
                     .accessibilityHidden(true)
                 VStack(alignment: .leading, spacing: 2) {
@@ -459,7 +459,7 @@ struct ExtensionRegistryRow<Trailing: View>: View {
                     if !item.detail.isEmpty {
                         Text(item.detail)
                             .font(.caption)
-                            .foregroundStyle(.secondary)
+                            .foregroundStyle(.kaisolaSecondary)
                             .lineLimit(2)
                     }
                 }
@@ -517,10 +517,10 @@ struct ExtensionMetadataGrid: View {
         VStack(alignment: .leading, spacing: 1) {
             Text(label.uppercased())
                 .font(.caption2.weight(.semibold))
-                .foregroundStyle(.secondary)
+                .foregroundStyle(.kaisolaSecondary)
             Text(value)
                 .font(.caption2)
-                .foregroundStyle(.secondary)
+                .foregroundStyle(.kaisolaSecondary)
                 .lineLimit(2)
         }
     }
@@ -554,12 +554,12 @@ private struct ExtensionsEmptyState: View {
         VStack(spacing: 8) {
             Image(systemName: symbol)
                 .font(.system(size: 26))
-                .foregroundStyle(.secondary)
+                .foregroundStyle(.kaisolaSecondary)
                 .accessibilityHidden(true)
             Text(title).font(.headline)
             Text(detail)
                 .font(.callout)
-                .foregroundStyle(.secondary)
+                .foregroundStyle(.kaisolaSecondary)
                 .multilineTextAlignment(.center)
         }
         .frame(maxWidth: .infinity, minHeight: 180)
@@ -574,13 +574,58 @@ private struct ExtensionsEmptyState: View {
 private struct TerminalThemesExtensionEditor: View {
     @ObservedObject var settings: NativePreviewSettings
     let highlightedID: String?
-    @State private var specs: [CustomThemeSpec] = []
+    @State private var snapshot = CustomThemeStore.Snapshot(specs: [], state: .missing)
+    @State private var operationError: String?
+    @State private var confirmReset = false
+    @State private var pendingRemoval: TerminalThemeRemovalPlan?
     private let store = CustomThemeStore()
 
     var body: some View {
         ScrollViewReader { proxy in
             Form {
                 ExtensionCategoryIntro(category: .terminalThemes, workspace: nil)
+                if !snapshot.state.allowsMutations {
+                    Section("Registry Recovery") {
+                        let item = ExtensionSettingsItem.customThemeRegistryIssue(snapshot.state)
+                        Label(item.versionIntegrity, systemImage: "exclamationmark.triangle.fill")
+                            .foregroundStyle(.orange)
+                            .accessibilityIdentifier("extensions.themes.registry-warning")
+                        if let message = item.validationMessage {
+                            Text(message)
+                                .font(.callout)
+                                .foregroundStyle(.secondary)
+                        }
+                        if let recoveryURL = snapshot.state.preservedCopyURL {
+                            Text(recoveryURL.path)
+                                .font(.caption.monospaced())
+                                .foregroundStyle(.secondary)
+                                .textSelection(.enabled)
+                                .lineLimit(2)
+                                .accessibilityLabel("Terminal theme recovery copy \(recoveryURL.lastPathComponent)")
+                            HStack {
+                                Button("Reveal Recovery Copy") {
+                                    NSWorkspace.shared.activateFileViewerSelecting([recoveryURL])
+                                }
+                                Button("Reset Registry", role: .destructive) {
+                                    confirmReset = true
+                                }
+                                .disabled(!snapshot.state.canReset)
+                                .accessibilityHint("Replaces the active unreadable registry with an empty version. The recovery copy is kept.")
+                            }
+                        } else {
+                            Button("Reload Registry") { reload() }
+                                .accessibilityHint("Tries to read and preserve the terminal-theme registry again.")
+                        }
+                    }
+                    .id(CustomThemeStore.registryIssueID)
+                }
+                if let operationError {
+                    Section("Save Error") {
+                        Label(operationError, systemImage: "xmark.circle.fill")
+                            .foregroundStyle(.red)
+                            .accessibilityIdentifier("extensions.themes.save-error")
+                    }
+                }
                 Section("Built-in Themes") {
                     ForEach(TerminalThemeRegistry.shipped) { definition in
                         let item = ExtensionSettingsItem.builtInTheme(
@@ -601,9 +646,11 @@ private struct TerminalThemesExtensionEditor: View {
                 }
                 Section("Custom Themes") {
                     if specs.isEmpty {
-                        Text("No custom themes yet. Import a JSON palette to add one.")
+                        Text(snapshot.state.allowsMutations
+                            ? "No custom themes yet. Import a JSON palette to add one."
+                            : "No last-known-good custom themes are available. Recover or reset the registry before importing one.")
                             .font(.callout)
-                            .foregroundStyle(.secondary)
+                            .foregroundStyle(.kaisolaSecondary)
                             .accessibilityIdentifier("extensions.themes.empty")
                     }
                     ForEach(specs) { spec in
@@ -621,11 +668,15 @@ private struct TerminalThemesExtensionEditor: View {
                                     .controlSize(.small)
                                     .disabled(settings.terminalThemeID == spec.id)
                                 }
-                                Button(role: .destructive) { remove(spec) } label: {
-                                    Image(systemName: "trash")
+                                Button { requestRemoval(spec) } label: {
+                                    Label("Remove", systemImage: "trash")
                                 }
                                 .buttonStyle(.borderless)
+                                .foregroundStyle(.red)
+                                .disabled(!snapshot.state.allowsMutations)
                                 .accessibilityLabel("Remove theme \(item.name)")
+                                .accessibilityHint("Opens a confirmation before permanently removing this theme.")
+                                .accessibilityAction { requestRemoval(spec) }
                             }
                         }
                         .id(spec.id)
@@ -643,15 +694,51 @@ private struct TerminalThemesExtensionEditor: View {
                         Label("Import Theme…", systemImage: "square.and.arrow.down")
                     }
                     .accessibilityHint("Choose a JSON file with light and dark palettes")
+                    .disabled(!snapshot.state.allowsMutations)
                 }
             }
             .formStyle(.grouped)
             .padding(6)
             .onAppear {
-                specs = store.specs()
+                reload()
                 scrollToHighlight(using: proxy)
             }
+            .confirmationDialog(
+                "Reset custom terminal themes?",
+                isPresented: $confirmReset,
+                titleVisibility: .visible
+            ) {
+                Button("Reset Registry", role: .destructive) { reset() }
+                Button("Cancel", role: .cancel) {}
+            } message: {
+                Text("Kaisola will replace the active unreadable registry with an empty version. The recovery copy will remain on disk.")
+            }
         }
+        // Keep the removal confirmation on a different presentation host from
+        // the registry-reset dialog above. SwiftUI otherwise accepts the row
+        // action but can suppress the second presenter on macOS.
+        .confirmationDialog(
+            pendingRemoval?.title ?? "Remove custom terminal theme?",
+            isPresented: removalConfirmationPresented,
+            titleVisibility: .visible,
+            presenting: pendingRemoval
+        ) { plan in
+            Button("Remove Theme", role: .destructive) { confirmRemoval(plan) }
+            Button("Cancel", role: .cancel) {}
+        } message: { plan in
+            Text(plan.message)
+        }
+    }
+
+    private var specs: [CustomThemeSpec] { snapshot.specs }
+
+    private var removalConfirmationPresented: Binding<Bool> {
+        Binding(
+            get: { pendingRemoval != nil },
+            set: { isPresented in
+                if !isPresented { pendingRemoval = nil }
+            }
+        )
     }
 
     private func scrollToHighlight(using proxy: ScrollViewProxy) {
@@ -661,10 +748,31 @@ private struct TerminalThemesExtensionEditor: View {
         }
     }
 
-    private func remove(_ spec: CustomThemeSpec) {
-        _ = store.remove(id: spec.id)
-        specs = store.specs()
-        NotificationCenter.default.post(name: .kaisolaExtensionsChanged, object: nil)
+    private func requestRemoval(_ spec: CustomThemeSpec) {
+        guard let fallback = TerminalThemeRegistry.shipped.first else { return }
+        pendingRemoval = TerminalThemeRemovalPlan(
+            theme: spec,
+            selectedThemeID: settings.terminalThemeID,
+            fallbackThemeID: fallback.id,
+            fallbackThemeTitle: fallback.title
+        )
+    }
+
+    private func confirmRemoval(_ plan: TerminalThemeRemovalPlan) {
+        do {
+            let removed = try store.remove(id: plan.theme.id)
+            settings.terminalThemeID = plan.selectionAfterSuccessfulRemoval(
+                currentThemeID: settings.terminalThemeID
+            )
+            reload()
+            ToastCenter.shared.show(
+                removed ? "Removed \(plan.displayName)" : "That theme was already removed",
+                style: .success
+            )
+            NotificationCenter.default.post(name: .kaisolaExtensionsChanged, object: nil)
+        } catch {
+            report(error)
+        }
     }
 
     private func importTheme() {
@@ -686,20 +794,49 @@ private struct TerminalThemesExtensionEditor: View {
                     )
                     return
                 }
-                if let reason = store.upsert(spec) {
-                    ToastCenter.shared.show(
-                        "Imported as disabled: \(reason)",
-                        style: .info,
-                        duration: 6
-                    )
-                } else {
-                    settings.terminalThemeID = spec.id
-                    ToastCenter.shared.show("Imported \(spec.title) and made it active", style: .success)
+                do {
+                    if let reason = try store.upsert(spec) {
+                        ToastCenter.shared.show(
+                            "Imported as disabled: \(reason)",
+                            style: .info,
+                            duration: 6
+                        )
+                    } else {
+                        settings.terminalThemeID = spec.id
+                        ToastCenter.shared.show("Imported \(spec.title) and made it active", style: .success)
+                    }
+                    reload()
+                    NotificationCenter.default.post(name: .kaisolaExtensionsChanged, object: nil)
+                } catch {
+                    report(error)
                 }
-                specs = store.specs()
-                NotificationCenter.default.post(name: .kaisolaExtensionsChanged, object: nil)
             }
         }
+    }
+
+    private func reset() {
+        do {
+            snapshot = try store.resetUnreadableRegistry()
+            operationError = nil
+            if !TerminalThemeRegistry.shipped.contains(where: { $0.id == settings.terminalThemeID }) {
+                settings.terminalThemeID = TerminalThemeRegistry.shipped[0].id
+            }
+            ToastCenter.shared.show("Reset terminal themes; recovery copy kept", style: .success, duration: 6)
+            NotificationCenter.default.post(name: .kaisolaExtensionsChanged, object: nil)
+        } catch {
+            report(error)
+        }
+    }
+
+    private func reload() {
+        snapshot = store.load()
+        operationError = nil
+    }
+
+    private func report(_ error: Error) {
+        snapshot = store.load()
+        operationError = error.localizedDescription
+        ToastCenter.shared.show(error.localizedDescription, style: .error, duration: 6)
     }
 }
 
@@ -723,7 +860,7 @@ private struct LanguageGrammarsExtensionEditor: View {
                     if specs.isEmpty {
                         Text("No custom grammars. Built-in languages keep working as usual.")
                             .font(.callout)
-                            .foregroundStyle(.secondary)
+                            .foregroundStyle(.kaisolaSecondary)
                             .accessibilityIdentifier("extensions.grammars.empty")
                     }
                     ForEach(specs) { spec in
@@ -763,7 +900,7 @@ private struct LanguageGrammarsExtensionEditor: View {
                         .disabled(!canAdd)
                     Text("A grammar is data only. Invalid expressions stay listed but disabled with the exact reason.")
                         .font(.caption)
-                        .foregroundStyle(.secondary)
+                        .foregroundStyle(.kaisolaSecondary)
                 }
             }
             .formStyle(.grouped)
@@ -829,21 +966,66 @@ private struct LanguageGrammarsExtensionEditor: View {
 
 private struct PreviewMappingsExtensionEditor: View {
     let highlightedID: String?
-    @State private var specs: [PreviewMappingSpec] = []
+    @State private var snapshot = PreviewMappingStore.Snapshot(specs: [], state: .missing)
     @State private var name = ""
     @State private var extensionsText = ""
     @State private var kind = PreviewMappingSpec.Kind.text
+    @State private var operationError: String?
+    @State private var confirmReset = false
     private let store = PreviewMappingStore()
 
     var body: some View {
         ScrollViewReader { proxy in
             Form {
                 ExtensionCategoryIntro(category: .previewMappings, workspace: nil)
+                if !snapshot.state.allowsMutations {
+                    Section("Registry Recovery") {
+                        let item = ExtensionSettingsItem.previewMappingRegistryIssue(snapshot.state)
+                        Label(item.versionIntegrity, systemImage: "exclamationmark.triangle.fill")
+                            .foregroundStyle(.orange)
+                            .accessibilityIdentifier("extensions.previews.registry-warning")
+                        if let message = item.validationMessage {
+                            Text(message)
+                                .font(.callout)
+                                .foregroundStyle(.kaisolaSecondary)
+                        }
+                        if let recoveryURL = snapshot.state.preservedCopyURL {
+                            Text(recoveryURL.path)
+                                .font(.caption.monospaced())
+                                .foregroundStyle(.kaisolaSecondary)
+                                .textSelection(.enabled)
+                                .lineLimit(2)
+                                .accessibilityLabel("Preview mapping recovery copy \(recoveryURL.lastPathComponent)")
+                            HStack {
+                                Button("Reveal Recovery Copy") {
+                                    NSWorkspace.shared.activateFileViewerSelecting([recoveryURL])
+                                }
+                                Button("Reset Registry", role: .destructive) {
+                                    confirmReset = true
+                                }
+                                .disabled(!snapshot.state.canReset)
+                                .accessibilityHint("Replaces the active unreadable registry with an empty version. The recovery copy is kept.")
+                            }
+                        } else {
+                            Button("Reload Registry") { reload() }
+                                .accessibilityHint("Tries to read and preserve the preview-mapping registry again.")
+                        }
+                    }
+                }
+                if let operationError {
+                    Section("Save Error") {
+                        Label(operationError, systemImage: "xmark.circle.fill")
+                            .foregroundStyle(.red)
+                            .accessibilityIdentifier("extensions.previews.save-error")
+                    }
+                }
                 Section("Installed Mappings") {
                     if specs.isEmpty {
-                        Text("No custom preview mappings. Built-in file classifications still run first.")
+                        Text(snapshot.state.allowsMutations
+                            ? "No custom preview mappings. Built-in file classifications still run first."
+                            : "Preview mappings are unavailable until the registry issue is resolved.")
                             .font(.callout)
-                            .foregroundStyle(.secondary)
+                            .foregroundStyle(.kaisolaSecondary)
                             .accessibilityIdentifier("extensions.previews.empty")
                     }
                     ForEach(specs) { spec in
@@ -852,6 +1034,7 @@ private struct PreviewMappingsExtensionEditor: View {
                                 Image(systemName: "trash")
                             }
                             .buttonStyle(.borderless)
+                            .disabled(!snapshot.state.allowsMutations)
                             .accessibilityLabel("Remove preview mapping \(spec.id)")
                         }
                         .id(spec.id)
@@ -878,17 +1061,29 @@ private struct PreviewMappingsExtensionEditor: View {
                         .disabled(!canAdd)
                     Text("Mappings can select text previews only. Images, PDFs, documents, binary sniffing, and size limits cannot be overridden.")
                         .font(.caption)
-                        .foregroundStyle(.secondary)
+                        .foregroundStyle(.kaisolaSecondary)
                 }
             }
             .formStyle(.grouped)
             .padding(6)
             .onAppear {
-                specs = store.specs()
+                reload()
                 scrollToHighlight(using: proxy)
+            }
+            .confirmationDialog(
+                "Reset preview mappings?",
+                isPresented: $confirmReset,
+                titleVisibility: .visible
+            ) {
+                Button("Reset Registry", role: .destructive) { reset() }
+                Button("Cancel", role: .cancel) {}
+            } message: {
+                Text("Kaisola will replace the active unreadable registry with an empty version. The recovery copy will remain on disk.")
             }
         }
     }
+
+    private var specs: [PreviewMappingSpec] { snapshot.specs }
 
     private func scrollToHighlight(using proxy: ScrollViewProxy) {
         guard let highlightedID else { return }
@@ -898,7 +1093,8 @@ private struct PreviewMappingsExtensionEditor: View {
     }
 
     private var canAdd: Bool {
-        !name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        snapshot.state.allowsMutations
+            && !name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
             && !extensionsText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
 
@@ -909,20 +1105,51 @@ private struct PreviewMappingsExtensionEditor: View {
             extensions: ExtensionsSettingsDraftPolicy.extensions(extensionsText),
             kind: kind.rawValue
         )
-        if let reason = store.upsert(spec) {
-            ToastCenter.shared.show("Added as disabled: \(reason)", style: .info, duration: 6)
-        } else {
-            ToastCenter.shared.show("Added \(id)", style: .success)
+        do {
+            let reason = try store.upsert(spec)
+            reload()
+            name = ""
+            extensionsText = ""
+            if let reason {
+                ToastCenter.shared.show("Added as disabled: \(reason)", style: .info, duration: 6)
+            } else {
+                ToastCenter.shared.show("Added \(id)", style: .success)
+            }
+            NotificationCenter.default.post(name: .kaisolaExtensionsChanged, object: nil)
+        } catch {
+            report(error)
         }
-        specs = store.specs()
-        name = ""
-        extensionsText = ""
-        NotificationCenter.default.post(name: .kaisolaExtensionsChanged, object: nil)
     }
 
     private func remove(_ spec: PreviewMappingSpec) {
-        _ = store.remove(id: spec.id)
-        specs = store.specs()
-        NotificationCenter.default.post(name: .kaisolaExtensionsChanged, object: nil)
+        do {
+            _ = try store.remove(id: spec.id)
+            reload()
+            NotificationCenter.default.post(name: .kaisolaExtensionsChanged, object: nil)
+        } catch {
+            report(error)
+        }
+    }
+
+    private func reset() {
+        do {
+            snapshot = try store.resetUnreadableRegistry()
+            operationError = nil
+            ToastCenter.shared.show("Reset preview mappings; recovery copy kept", style: .success, duration: 6)
+            NotificationCenter.default.post(name: .kaisolaExtensionsChanged, object: nil)
+        } catch {
+            report(error)
+        }
+    }
+
+    private func reload() {
+        snapshot = store.load()
+        operationError = nil
+    }
+
+    private func report(_ error: Error) {
+        snapshot = store.load()
+        operationError = error.localizedDescription
+        ToastCenter.shared.show(error.localizedDescription, style: .error, duration: 6)
     }
 }

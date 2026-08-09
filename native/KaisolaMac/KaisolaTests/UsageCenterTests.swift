@@ -1,3 +1,4 @@
+import Darwin
 import XCTest
 @testable import Kaisola
 
@@ -208,6 +209,7 @@ final class UsageCenterTests: XCTestCase {
             "provider": "claude",
             "displayName": "Claude",
             "ok": true,
+            "authRequired": false,
             "sourceLabel": "Claude Agent SDK 0.3.205",
             "experimental": true,
             "plan": "max",
@@ -220,6 +222,7 @@ final class UsageCenterTests: XCTestCase {
         let providers = try UsageCenter.decodeProviderPlanUsage(data)
         XCTAssertEqual(providers.count, 1)
         XCTAssertEqual(providers.first?.provider, "claude")
+        XCTAssertEqual(providers.first?.authRequired, false)
         XCTAssertEqual(providers.first?.plan, "max")
         XCTAssertEqual(providers.first?.windows.first?.usedPercent, 37.5)
         XCTAssertEqual(providers.first?.windows.first?.resetsAt, 1_800_000_000)
@@ -379,6 +382,34 @@ final class UsageCenterTests: XCTestCase {
         XCTAssertFalse(center.isRefreshingPlanUsage)
     }
 
+    func testCorruptProjectAccountsBlockUsageProbeBeforeContextResolutionOrProviderProcess() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("kaisola-usage-corrupt-account-\(UUID().uuidString.prefix(8))")
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let accountURL = root.appendingPathComponent("project-accounts.json")
+        let original = Data("not project account json".utf8)
+        try original.write(to: accountURL)
+        let recoveryCenter = ProjectAccountRecoveryCenter(
+            store: ProjectAccountStore(fileURL: accountURL)
+        )
+        let probe = UsageContextResolverProbe(delay: 0, key: "must-not-resolve")
+        let center = UsageCenter(
+            projectAccountRecoveryCenter: recoveryCenter,
+            planUsageContextResolver: { workspace, environment in
+                probe.resolve(workspace: workspace, environment: environment)
+            }
+        )
+
+        center.refreshPlanUsage(workspace: root)
+
+        XCTAssertEqual(probe.count, 0, "the helper context must not be prepared for a blocked launch")
+        XCTAssertFalse(center.isRefreshingPlanUsage)
+        XCTAssertTrue(center.planUsageError?.contains("blocked") == true)
+        XCTAssertEqual(recoveryCenter.issue?.kind, .corrupt)
+        XCTAssertEqual(try Data(contentsOf: accountURL), original)
+    }
+
     func testProviderCacheContextChangesWithEffectiveAccountWithoutExposingIt() {
         let workspace = URL(fileURLWithPath: "/tmp/kaisola-usage-account", isDirectory: true)
         let first = UsageCenter.planUsageContextKey(
@@ -500,6 +531,74 @@ final class UsageCenterTests: XCTestCase {
         XCTAssertNil(closedEntry?.usage)
     }
 
+    func testUsageAccountProfileDirectoryLimitCountsUTF8BytesAndRejectsControls() {
+        let maximumBytes = 4_096
+        let atLimit = "/" + String(repeating: "a", count: maximumBytes - 1)
+        let overLimit = atLimit + "a"
+        let multibyteOverLimit = "/" + String(repeating: "é", count: maximumBytes / 2)
+
+        func profile(directory: String) -> UsageAccountProfile {
+            UsageAccountProfile(
+                id: "directory-boundary",
+                provider: .codex,
+                label: "Boundary",
+                directory: directory
+            )
+        }
+
+        XCTAssertEqual(profile(directory: atLimit).normalized?.directory, atLimit)
+        XCTAssertNil(profile(directory: overLimit).normalized)
+        XCTAssertLessThan(multibyteOverLimit.count, maximumBytes)
+        XCTAssertGreaterThan(multibyteOverLimit.utf8.count, maximumBytes)
+        XCTAssertNil(profile(directory: multibyteOverLimit).normalized)
+
+        for control in ["\0", "\t", "\n", "\u{1B}"] {
+            XCTAssertNil(profile(directory: "/tmp/account\(control)escape").normalized)
+            XCTAssertNil(profile(directory: "/tmp/account\(control)").normalized)
+        }
+    }
+
+    func testUsageAccountStoreRejectsUnsafeDirectoriesOnLoadAndAdd() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("kaisola-usage-profiles-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let fileURL = directory.appendingPathComponent("usage-accounts.json")
+        let payload: [String: Any] = [
+            "schemaVersion": 1,
+            "profiles": [
+                [
+                    "id": "valid",
+                    "provider": "codex",
+                    "label": "Valid",
+                    "directory": "/tmp/valid-account",
+                ],
+                [
+                    "id": "control",
+                    "provider": "claude",
+                    "label": "Control",
+                    "directory": "/tmp/unsafe\u{1B}[31m",
+                ],
+            ],
+        ]
+        try JSONSerialization.data(withJSONObject: payload).write(to: fileURL)
+        let store = UsageAccountStore(fileURL: fileURL)
+
+        XCTAssertEqual(store.profiles().map(\.id), ["valid"])
+        let lastKnownGood = try Data(contentsOf: fileURL)
+        XCTAssertNil(store.add(
+            provider: .claude,
+            label: "Control",
+            directory: "/tmp/unsafe\nnext-line"
+        ))
+        XCTAssertNil(store.add(
+            provider: .claude,
+            label: "Oversized",
+            directory: "/" + String(repeating: "a", count: 4_096)
+        ))
+        XCTAssertEqual(try Data(contentsOf: fileURL), lastKnownGood)
+    }
+
     func testUsageAccountStoreRoundTripsNamedProfilesWithoutCredentialMaterial() throws {
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent("kaisola-usage-profiles-\(UUID().uuidString)", isDirectory: true)
@@ -526,6 +625,207 @@ final class UsageCenterTests: XCTestCase {
         XCTAssertTrue(store.remove(id: claude.id))
         XCTAssertEqual(store.profiles().map(\.label), ["Research"])
         XCTAssertFalse(store.remove(id: "missing"))
+    }
+
+    /// A symlink, a trailing slash and a `..` hop are three spellings of one
+    /// credential directory. Registering them as separate accounts splits one
+    /// subscription's usage across rows and makes attribution meaningless.
+    func testUsageAccountStoreRejectsAliasesOfOneCredentialDirectory() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("kaisola-account-alias-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let target = root.appendingPathComponent("claude-work", isDirectory: true)
+        let sibling = root.appendingPathComponent("sibling", isDirectory: true)
+        let link = root.appendingPathComponent("claude-alias", isDirectory: true)
+        try FileManager.default.createDirectory(at: target, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: sibling, withIntermediateDirectories: true)
+        try FileManager.default.createSymbolicLink(at: link, withDestinationURL: target)
+        let store = UsageAccountStore(fileURL: root.appendingPathComponent("usage-accounts.json"))
+
+        let work = try XCTUnwrap(store.add(provider: .claude, label: "Work", directory: target.path))
+        XCTAssertNil(store.add(provider: .claude, label: "Alias", directory: link.path))
+        XCTAssertNil(store.add(provider: .claude, label: "Slash", directory: target.path + "/"))
+        XCTAssertNil(store.add(provider: .claude, label: "Dot", directory: target.path + "/."))
+        XCTAssertNil(store.add(
+            provider: .claude,
+            label: "Relative",
+            directory: sibling.path + "/../claude-work"
+        ))
+        XCTAssertEqual(store.profiles().map(\.id), [work.id])
+
+        // The rejection has to be explainable: settings names the account the
+        // alias collides with rather than refusing without a reason.
+        XCTAssertEqual(store.existingProfile(provider: .claude, directory: link.path)?.label, "Work")
+        // A different provider pointed at the same path is still its own account,
+        // and a genuinely different directory still gets added.
+        XCTAssertNil(store.existingProfile(provider: .codex, directory: link.path))
+        XCTAssertNotNil(store.add(provider: .claude, label: "Sibling", directory: sibling.path))
+    }
+
+    /// The same collapse applies to rows already on disk, saved before the add
+    /// path knew how to compare them.
+    func testUsageAccountStoreCollapsesAliasesAlreadySavedOnDisk() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("kaisola-account-stored-alias-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let target = root.appendingPathComponent("codex-research", isDirectory: true)
+        let link = root.appendingPathComponent("codex-alias", isDirectory: true)
+        try FileManager.default.createDirectory(at: target, withIntermediateDirectories: true)
+        try FileManager.default.createSymbolicLink(at: link, withDestinationURL: target)
+        let fileURL = root.appendingPathComponent("usage-accounts.json")
+        try """
+        {"schemaVersion":1,"profiles":[\
+        {"id":"research","provider":"codex","label":"Research","directory":"\(target.path)"},\
+        {"id":"alias","provider":"codex","label":"Alias","directory":"\(link.path)"},\
+        {"id":"other","provider":"codex","label":"Other","directory":"\(target.path)/../codex-other"}\
+        ]}
+        """.write(to: fileURL, atomically: true, encoding: .utf8)
+
+        let profiles = UsageAccountStore(fileURL: fileURL).profiles()
+
+        XCTAssertEqual(profiles.map(\.id), ["research", "other"])
+        XCTAssertEqual(
+            profiles[0].canonicalDirectory,
+            target.standardizedFileURL.resolvingSymlinksInPath().path
+        )
+    }
+
+    /// Resolved paths cannot see an alias the filesystem itself collapses. On a
+    /// case-insensitive volume — the macOS default — two spellings of one name
+    /// are one directory, and only file identity says so.
+    func testUsageAccountStoreRejectsCaseAliasOnCaseInsensitiveVolume() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("kaisola-account-case-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let target = root.appendingPathComponent("Claude-Work", isDirectory: true)
+        let lowercased = root.appendingPathComponent("claude-work", isDirectory: true)
+        try FileManager.default.createDirectory(at: target, withIntermediateDirectories: true)
+        try XCTSkipUnless(
+            FileManager.default.fileExists(atPath: lowercased.path),
+            "case-sensitive volume: the two spellings really are two directories"
+        )
+        let store = UsageAccountStore(fileURL: root.appendingPathComponent("usage-accounts.json"))
+
+        XCTAssertNotNil(store.add(provider: .claude, label: "Work", directory: target.path))
+        XCTAssertNil(store.add(provider: .claude, label: "Lowercase", directory: lowercased.path))
+        XCTAssertEqual(store.profiles().map(\.label), ["Work"])
+    }
+
+    func testUsageAccountStoreRemovesTemporaryFileWhenInstallationFails() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("kaisola-usage-profiles-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let fileURL = directory.appendingPathComponent("usage-accounts.json")
+        let store = UsageAccountStore(
+            fileURL: fileURL,
+            installTemporary: { temporary, destination in
+                XCTAssertEqual(destination, fileURL)
+                XCTAssertTrue(
+                    FileManager.default.fileExists(atPath: temporary.path),
+                    "fault injection must happen after the exact temporary file exists"
+                )
+                throw UsageAccountInstallFailure.injected
+            }
+        )
+
+        XCTAssertNil(store.add(
+            provider: .codex,
+            label: "Failure fixture",
+            directory: "~/.codex-failure-fixture"
+        ))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: fileURL.path))
+
+        let prefix = ".\(fileURL.lastPathComponent)."
+        let entries = try FileManager.default.contentsOfDirectory(atPath: directory.path)
+        let orphanedTemporaryFiles = entries.filter { name in
+            guard name.hasPrefix(prefix) else { return false }
+            return UUID(uuidString: String(name.dropFirst(prefix.count))) != nil
+        }
+        XCTAssertEqual(orphanedTemporaryFiles, [])
+    }
+
+    func testUsageAccountStoreKeepsEveryAccountWhenIndependentInstancesWriteAtOnce() {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("kaisola-usage-profiles-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let fileURL = directory.appendingPathComponent("usage-accounts.json")
+        let writers = 12
+
+        // Twelve windows adding at the same moment, each through its own store
+        // value the way a second Settings window would.
+        let adding = DispatchGroup()
+        let added = UsageAccountConcurrencyProbe()
+        for index in 0..<writers {
+            DispatchQueue.global().async(group: adding) {
+                let profile = UsageAccountStore(fileURL: fileURL).add(
+                    provider: .claude,
+                    label: "Account \(index)",
+                    directory: "~/.claude-account-\(index)"
+                )
+                if let profile { added.record(profile.id) }
+            }
+        }
+        XCTAssertEqual(adding.wait(timeout: .now() + 30), .success)
+
+        let store = UsageAccountStore(fileURL: fileURL)
+        XCTAssertEqual(added.ids.count, writers, "every add reported success")
+        XCTAssertEqual(
+            Set(store.profiles().map(\.label)),
+            Set((0..<writers).map { "Account \($0)" }),
+            "a concurrent add must not erase an account it never saw"
+        )
+
+        // The same in the other direction: overlapping removals must not
+        // resurrect an account another window already deleted.
+        let removing = DispatchGroup()
+        for id in added.ids {
+            DispatchQueue.global().async(group: removing) {
+                _ = UsageAccountStore(fileURL: fileURL).remove(id: id)
+            }
+        }
+        XCTAssertEqual(removing.wait(timeout: .now() + 30), .success)
+        XCTAssertEqual(store.profiles(), [])
+    }
+
+    func testUsageAccountStoreAddWaitsWhileAnotherWriterHoldsTheRegistryLock() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("kaisola-usage-profiles-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let fileURL = directory.appendingPathComponent("usage-accounts.json")
+        let store = UsageAccountStore(fileURL: fileURL)
+
+        // Stand in for a window that is mid-write: hold the registry's advisory
+        // lock exactly as a mutation does, so the add below has to wait on it.
+        let descriptor = open(store.lockURL.path, O_RDWR | O_CREAT, 0o600)
+        XCTAssertGreaterThanOrEqual(descriptor, 0)
+        XCTAssertEqual(flock(descriptor, LOCK_EX | LOCK_NB), 0)
+
+        let started = DispatchSemaphore(value: 0)
+        let finished = DispatchSemaphore(value: 0)
+        let probe = UsageAccountConcurrencyProbe()
+        DispatchQueue.global().async {
+            started.signal()
+            let profile = UsageAccountStore(fileURL: fileURL).add(
+                provider: .claude,
+                label: "Second window",
+                directory: "~/.claude-second"
+            )
+            if let profile { probe.record(profile.id) }
+            probe.markFinished()
+            finished.signal()
+        }
+
+        XCTAssertEqual(started.wait(timeout: .now() + 5), .success)
+        Thread.sleep(forTimeInterval: 0.4)
+        XCTAssertFalse(probe.isFinished, "an add must not land while another writer holds the lock")
+
+        XCTAssertEqual(flock(descriptor, LOCK_UN), 0)
+        Darwin.close(descriptor)
+
+        XCTAssertEqual(finished.wait(timeout: .now() + 5), .success)
+        XCTAssertEqual(probe.ids.count, 1, "the waiting add lands once the lock is free")
+        XCTAssertEqual(store.profiles().map(\.label), ["Second window"])
     }
 
     func testUsageAccountStoreSuggestedDirectoriesMatchProviderIsolation() {
@@ -603,6 +903,27 @@ final class UsageCenterTests: XCTestCase {
         ).normalized)
     }
 
+    func testSessionAccountBindingRejectsDirectoryByteOverflowAndControls() {
+        let multibyteOverLimit = "/" + String(repeating: "é", count: 2_048)
+        XCTAssertLessThan(multibyteOverLimit.count, 4_096)
+        XCTAssertGreaterThan(multibyteOverLimit.utf8.count, 4_096)
+        XCTAssertNil(SessionAccountBinding(
+            accountID: "oversized",
+            provider: .codex,
+            label: "Oversized",
+            configDirectory: multibyteOverLimit
+        ).normalized)
+
+        for control in ["\0", "\t", "\n", "\u{1B}"] {
+            XCTAssertNil(SessionAccountBinding(
+                accountID: "control",
+                provider: .codex,
+                label: "Control",
+                configDirectory: "/tmp/account\(control)escape"
+            ).normalized)
+        }
+    }
+
     func testSessionAccountBindingPinsExistingSymlinkTarget() throws {
         let root = FileManager.default.temporaryDirectory
             .appendingPathComponent("kaisola-account-binding-\(UUID().uuidString)", isDirectory: true)
@@ -645,6 +966,34 @@ final class UsageCenterTests: XCTestCase {
         XCTAssertEqual(requests[1].environment["CLAUDE_CONFIG_DIR"], "/tmp/claude-personal")
         XCTAssertEqual(requests[3].environment["CODEX_HOME"], "/tmp/codex-research")
         XCTAssertEqual(Set(requests.map { "\($0.provider.rawValue):\($0.profileID)" }).count, requests.count)
+    }
+
+    /// A named account that aliases the active directory is the active account.
+    /// Fanning out a second request for it queries one subscription twice and
+    /// shows it as two limits side by side.
+    func testPlanUsageRequestsCollapseAnAliasOfTheActiveDirectory() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("kaisola-plan-alias-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let target = root.appendingPathComponent("claude-work", isDirectory: true)
+        let link = root.appendingPathComponent("claude-alias", isDirectory: true)
+        try FileManager.default.createDirectory(at: target, withIntermediateDirectories: true)
+        try FileManager.default.createSymbolicLink(at: link, withDestinationURL: target)
+
+        let requests = UsageCenter.planUsageRequests(
+            workspace: URL(fileURLWithPath: "/tmp/project", isDirectory: true),
+            environment: [
+                "HOME": "/tmp/home",
+                "CLAUDE_CONFIG_DIR": target.path,
+            ],
+            profiles: [
+                UsageAccountProfile(id: "claude-work", provider: .claude, label: "Work", directory: link.path),
+            ]
+        )
+
+        XCTAssertEqual(requests.filter { $0.provider == .claude }.count, 1)
+        XCTAssertEqual(requests.first?.profileID, "claude-work")
+        XCTAssertEqual(requests.first?.environment["CLAUDE_CONFIG_DIR"], target.path)
     }
 
     func testNamedAccountFingerprintInvalidatesCacheWithoutExposingPaths() {
@@ -746,6 +1095,34 @@ final class UsageCenterTests: XCTestCase {
         XCTAssertEqual(reading?.level, .critical)
         XCTAssertEqual(reading?.accessibilityLabel, "Claude plan usage, 91 percent of 5-hour used")
         XCTAssertEqual(reading?.help, "Claude · 5-hour 91% used — open Usage settings")
+    }
+}
+
+private enum UsageAccountInstallFailure: Error {
+    case injected
+}
+
+/// Collects what background writers did to the account registry, so the
+/// concurrency tests can assert from the main thread without racing them.
+private final class UsageAccountConcurrencyProbe: @unchecked Sendable {
+    private let lock = NSLock()
+    private var recorded: [String] = []
+    private var finished = false
+
+    var ids: [String] {
+        lock.withLock { recorded }
+    }
+
+    var isFinished: Bool {
+        lock.withLock { finished }
+    }
+
+    func record(_ id: String) {
+        lock.withLock { recorded.append(id) }
+    }
+
+    func markFinished() {
+        lock.withLock { finished = true }
     }
 }
 

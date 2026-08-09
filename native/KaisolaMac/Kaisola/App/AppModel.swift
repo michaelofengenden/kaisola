@@ -276,6 +276,9 @@ final class AppModel: ObservableObject {
     private let cursorStore: TerminalCursorStore
     private let workspaceStateStore: NativeWorkspaceStateStore
     private let transcriptStore: AcpTranscriptStore
+    /// Shared launch gate and recovery truth observed by the workspace and
+    /// Settings surfaces.
+    let projectAccountRecoveryCenter: ProjectAccountRecoveryCenter
     private let usageCenter: UsageCenter
     private let usageAccountStore: UsageAccountStore
     private let attentionCenter: AttentionCenter
@@ -406,6 +409,7 @@ final class AppModel: ObservableObject {
         cursorStore: TerminalCursorStore = TerminalCursorStore(fileURL: NativePreviewPaths.terminalCursorStore),
         workspaceStateStore: NativeWorkspaceStateStore = .live,
         transcriptStore: AcpTranscriptStore = .live,
+        projectAccountRecoveryCenter: ProjectAccountRecoveryCenter = .shared,
         adoptionStore: SessionAdoptionStore = SessionAdoptionStore(),
         usageCenter: UsageCenter = .shared,
         usageAccountStore: UsageAccountStore = UsageAccountStore(),
@@ -431,6 +435,7 @@ final class AppModel: ObservableObject {
         self.cursorStore = cursorStore
         self.workspaceStateStore = workspaceStateStore
         self.transcriptStore = transcriptStore
+        self.projectAccountRecoveryCenter = projectAccountRecoveryCenter
         self.adoptionStore = adoptionStore
         self.usageCenter = usageCenter
         self.usageAccountStore = usageAccountStore
@@ -2792,6 +2797,56 @@ final class AppModel: ObservableObject {
     /// restore actually succeeds, never merely because the banner was closed.
     @Published private(set) var workspaceRestorationNotice: WorkspaceRestorationNotice?
 
+    /// Resolve the environment overlay at the process-launch boundary. Missing
+    /// storage intentionally permits app defaults; every unsafe present-file
+    /// state raises the recovery surface and returns nil.
+    private func projectAccountOverlay(forProject projectID: String) -> [String: String]? {
+        let previousIssue = projectAccountRecoveryCenter.issue
+        switch projectAccountRecoveryCenter.launchOverlay(
+            app: NativePreviewSettings.shared.agentEnvironmentOverlay,
+            forProject: projectID
+        ) {
+        case .success(let overlay):
+            return overlay
+        case .failure(let issue):
+            let isNew = previousIssue != issue
+            if isNew { ToastCenter.shared.show(issue.summary, style: .error, duration: 6) }
+            return nil
+        }
+    }
+
+    /// Re-read after the user repairs or replaces the account file. The launch
+    /// that was refused stays refused; success makes an explicit retry safe.
+    func retryProjectAccountRecovery() {
+        if projectAccountRecoveryCenter.retry() {
+            ToastCenter.shared.show("Project accounts are readable again", style: .success)
+        } else if let issue = projectAccountRecoveryCenter.issue {
+            ToastCenter.shared.show(issue.summary, style: .error, duration: 6)
+        }
+    }
+
+    func revealProjectAccountRecovery() {
+        guard let url = projectAccountRecoveryCenter.issue?.revealURL else { return }
+        NSWorkspace.shared.activateFileViewerSelecting([url])
+    }
+
+    /// Explicitly discard the active mapping only after the store has secured
+    /// the original bytes as a preserved copy (or can move the unreadable file
+    /// itself there atomically).
+    func resetProjectAccountsAfterFailure() {
+        do {
+            let preserved = try projectAccountRecoveryCenter.resetAfterFailure()
+            ToastCenter.shared.show(
+                "Reset project account overrides; kept \(preserved.lastPathComponent)",
+                style: .success,
+                duration: 6
+            )
+        } catch {
+            retryProjectAccountRecovery()
+            ToastCenter.shared.show(error.localizedDescription, style: .error, duration: 6)
+        }
+    }
+
     func restoreWorkspaceStateIfNeeded() async {
         guard !restoredWorkspaceState else { return }
         restoredWorkspaceState = true
@@ -2877,6 +2932,14 @@ final class AppModel: ObservableObject {
                     deferredMeshPanesByProject[descriptor.projectID, default: []].append(pane)
                     continue
                 }
+                guard let projectOverlay = projectAccountOverlay(
+                    forProject: descriptor.projectID
+                ) else {
+                    deferredMeshPanesByProject[descriptor.projectID, default: []].append(pane)
+                    continue
+                }
+                let environment = ProcessInfo.processInfo.environment
+                    .merging(projectOverlay) { _, custom in custom }
 
                 Self.claimedRestoredMeshIDs.insert(descriptor.id)
                 deferredMeshPanesByProject[descriptor.projectID]?.removeAll { $0.id == descriptor.id }
@@ -2913,12 +2976,6 @@ final class AppModel: ObservableObject {
                         usage: transcript?.usage
                     ))
                 }
-                let environment = ProcessInfo.processInfo.environment.merging(
-                    ProjectAccountStore.mergedOverlay(
-                        app: NativePreviewSettings.shared.agentEnvironmentOverlay,
-                        project: ProjectAccountStore().override(forProject: descriptor.projectID)
-                    )
-                ) { _, custom in custom }
                 let restoreCompletion = await meshLifecycleCoordinator.restore(
                     mesh,
                     states: states,
@@ -3160,10 +3217,7 @@ final class AppModel: ObservableObject {
             ToastCenter.shared.show(nudge, style: .info, duration: 6)
         }
         let chatID = "chat-\(UUID().uuidString.lowercased().prefix(8))"
-        let projectOverlay = ProjectAccountStore.mergedOverlay(
-            app: NativePreviewSettings.shared.agentEnvironmentOverlay,
-            project: ProjectAccountStore().override(forProject: project.id)
-        )
+        guard let projectOverlay = projectAccountOverlay(forProject: project.id) else { return }
         let effectiveAccountEnvironment = ProcessInfo.processInfo.environment
             .merging(projectOverlay) { _, configured in configured }
         // Custom agents bind by their *declared* credentials (review finding
@@ -3243,12 +3297,9 @@ final class AppModel: ObservableObject {
         }()
         let projectID = NativeSessionStore.projectID(forDirectory: directory.path)
         let mcp = McpConfigStore(workspace: directory).servers()
-        let baseEnvironment = ProcessInfo.processInfo.environment.merging(
-            ProjectAccountStore.mergedOverlay(
-                app: NativePreviewSettings.shared.agentEnvironmentOverlay,
-                project: ProjectAccountStore().override(forProject: projectID)
-            )
-        ) { _, custom in custom }
+        guard let projectOverlay = projectAccountOverlay(forProject: projectID) else { return nil }
+        let baseEnvironment = ProcessInfo.processInfo.environment
+            .merging(projectOverlay) { _, custom in custom }
         var environment = SessionAccountBinding.applying(accountBinding, to: baseEnvironment)
         environment = SessionModelOverride.applying(modelOverride, agentID: agent.id, to: environment)
         // The host marker — see the terminal spawn's twin assignment.
@@ -3747,10 +3798,7 @@ final class AppModel: ObservableObject {
         guard let chat = chats.first(where: { $0.id == chatID }),
               let agent = AgentRegistry.profile(id: chat.agentID) else { return }
         let projectID = chat.projectID
-        let overlay = ProjectAccountStore.mergedOverlay(
-            app: NativePreviewSettings.shared.agentEnvironmentOverlay,
-            project: ProjectAccountStore().override(forProject: projectID)
-        )
+        guard let overlay = projectAccountOverlay(forProject: projectID) else { return }
         guard let binding = SessionAccountBinding.resolve(
             agentID: chat.agentID,
             profile: profile,
@@ -3923,6 +3971,9 @@ final class AppModel: ObservableObject {
         refreshPersistedNavigationState(publish: false)
         selectedProjectID = project.id
         selectedProjectName = project.name
+        guard let projectOverlay = projectAccountOverlay(forProject: project.id) else { return }
+        let environment = ProcessInfo.processInfo.environment
+            .merging(projectOverlay) { _, custom in custom }
         let mesh = MeshSession(
             baseDirectory: directory,
             mode: staged ? .staged : .flat,
@@ -3938,14 +3989,6 @@ final class AppModel: ObservableObject {
         selectedChatID = nil
         focusPane(mesh.id, projectID: project.id)
         scheduleWorkspaceStateSave(projectID: project.id)
-        let environment = ProcessInfo.processInfo.environment.merging(
-            ProjectAccountStore.mergedOverlay(
-                app: NativePreviewSettings.shared.agentEnvironmentOverlay,
-                project: ProjectAccountStore().override(
-                    forProject: NativeSessionStore.projectID(forDirectory: directory.path)
-                )
-            )
-        ) { _, custom in custom }
         meshLifecycleCoordinator.start(mesh, agents: agents, environment: environment)
     }
 
@@ -4273,12 +4316,11 @@ final class AppModel: ObservableObject {
                 usage: transcript?.usage
             ))
         }
-        let environment = ProcessInfo.processInfo.environment.merging(
-            ProjectAccountStore.mergedOverlay(
-                app: NativePreviewSettings.shared.agentEnvironmentOverlay,
-                project: ProjectAccountStore().override(forProject: descriptor.projectID)
-            )
-        ) { _, custom in custom }
+        guard let projectOverlay = projectAccountOverlay(forProject: descriptor.projectID) else {
+            return nil
+        }
+        let environment = ProcessInfo.processInfo.environment
+            .merging(projectOverlay) { _, custom in custom }
         let completion = await meshLifecycleCoordinator.restore(
             mesh,
             states: states,
@@ -4658,9 +4700,14 @@ final class AppModel: ObservableObject {
         )
     }
 
-    func loadVisualMeshFixture(workspace: URL) {
+    /// `agentCount` drives the 2/3/4-column visual fixtures; the deck the Mesh
+    /// picks for that many columns is a function of the window width the
+    /// fixture declares.
+    func loadVisualMeshFixture(workspace: URL, agentCount: Int = 3) {
         let mesh = MeshSession(baseDirectory: workspace.standardizedFileURL)
-        mesh.loadVisualFixture()
+        mesh.loadVisualFixture(
+            agents: Array(AgentRegistry.builtIns.prefix(max(1, agentCount)))
+        )
         surfaceObservers[mesh.id] = mesh.objectWillChange.sink { [weak self] _ in
             self?.objectWillChange.send()
         }
@@ -5242,10 +5289,7 @@ final class AppModel: ObservableObject {
         // Account isolation (custom CLAUDE_CONFIG_DIR / CODEX_HOME) rides in
         // as exported variables ahead of the CLI. Per-project overrides win
         // over the app-wide setting, key by key.
-        var overlay = ProjectAccountStore.mergedOverlay(
-            app: NativePreviewSettings.shared.agentEnvironmentOverlay,
-            project: ProjectAccountStore().override(forProject: projectID)
-        )
+        guard var overlay = projectAccountOverlay(forProject: projectID) else { return nil }
         let accountBinding: SessionAccountBinding?
         if let agent, SessionAccountBinding.provider(forAgentID: agent.id) != nil {
             if let lockedAccountBinding {

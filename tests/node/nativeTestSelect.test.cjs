@@ -201,6 +201,31 @@ test('custom ACP containment sources select launch and approval contracts', () =
   assert.equal(plan.fallback, false)
 })
 
+test('terminal theme persistence and settings retain recovery contracts', () => {
+  const expectations = [
+    [
+      'native/KaisolaMac/Kaisola/Features/Sessions/CustomThemeStore.swift',
+      ['ExtensionsSettingsHubTests', 'TerminalThemeRegistryTests'],
+    ],
+    [
+      'native/KaisolaMac/Kaisola/Features/Settings/ExtensionsSettingsHub.swift',
+      ['ExtensionsSettingsHubTests'],
+    ],
+    [
+      'native/KaisolaMac/Kaisola/Features/Settings/ExtensionsSettingsModel.swift',
+      ['ExtensionsSettingsHubTests'],
+    ],
+  ]
+
+  for (const [file, selectors] of expectations) {
+    const plan = selector.planForChanges([file], inventory)
+    assert.equal(plan.native.mode, 'focused')
+    assert.deepEqual(plan.native.selectors, selectors)
+    assert.equal(plan.node.mode, 'none')
+    assert.equal(plan.fallback, false)
+  }
+})
+
 test('broker and shared wire changes expand to the reproducible contract lane', () => {
   const plan = selector.planForChanges([
     'runtime/node-broker/ipc/brokerWire.cjs',

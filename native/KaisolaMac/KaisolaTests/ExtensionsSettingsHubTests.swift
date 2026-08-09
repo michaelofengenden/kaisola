@@ -125,6 +125,39 @@ final class ExtensionsSettingsHubTests: XCTestCase {
         }
     }
 
+    func testUnreadablePreviewRegistryIsASecretFreeActionableCatalogRow() {
+        let preservedURL = URL(fileURLWithPath: "/private/tmp/preview-mappings.json.preserved-deadbeef.json")
+        let state = PreviewMappingStore.LoadState.corrupt(.preserved(preservedURL))
+        let item = ExtensionSettingsItem.previewMappingRegistryIssue(state)
+
+        XCTAssertEqual(item.id, PreviewMappingStore.registryIssueID)
+        XCTAssertEqual(item.category, .previewMappings)
+        XCTAssertEqual(item.status, .disabled("Needs attention"))
+        XCTAssertEqual(item.source, .user)
+        XCTAssertEqual(item.scope, .appWide)
+        XCTAssertEqual(item.versionIntegrity, "Unreadable registry preserved")
+        XCTAssertEqual(item.updateState, .manual("Reset explicitly to repair"))
+        XCTAssertTrue(item.validationMessage?.contains(preservedURL.lastPathComponent) == true)
+        XCTAssertFalse(item.searchableText.contains("/private/tmp"))
+        XCTAssertFalse(item.accessibilityDescription.contains("/private/tmp"))
+        XCTAssertTrue(state.canReset)
+        XCTAssertFalse(state.allowsMutations)
+        XCTAssertEqual(state.preservedCopyURL, preservedURL)
+    }
+
+    func testPreviewRegistryIOFailureCannotOfferDestructiveRecovery() {
+        let state = PreviewMappingStore.LoadState.ioFailure("permission denied at /secret/location")
+        let item = ExtensionSettingsItem.previewMappingRegistryIssue(state)
+
+        XCTAssertFalse(state.canReset)
+        XCTAssertFalse(state.allowsMutations)
+        XCTAssertNil(state.preservedCopyURL)
+        XCTAssertEqual(item.versionIntegrity, "Registry unavailable")
+        XCTAssertEqual(item.updateState, .manual("Resolve storage access to continue"))
+        XCTAssertFalse(item.searchableText.contains("/secret/location"))
+        XCTAssertFalse(item.accessibilityDescription.contains("/secret/location"))
+    }
+
     func testMCPRowsStayProjectOwnedAndNeverExposeCredentialValues() {
         let server = McpServerConfig(
             name: "project-files",
@@ -168,6 +201,110 @@ final class ExtensionsSettingsHubTests: XCTestCase {
         XCTAssertEqual(custom.source, .user)
         XCTAssertNotNil(custom.validationMessage)
         guard case .disabled = custom.status else { return XCTFail("Invalid theme was enabled") }
+    }
+
+    func testUnreadableThemeRegistryIsASecretFreeActionableCatalogRow() {
+        let preservedURL = URL(fileURLWithPath: "/private/tmp/terminal-themes.json.preserved-deadbeef.json")
+        let state = CustomThemeStore.LoadState.corrupt(.preserved(preservedURL))
+        let item = ExtensionSettingsItem.customThemeRegistryIssue(state)
+
+        XCTAssertEqual(item.id, CustomThemeStore.registryIssueID)
+        XCTAssertEqual(item.category, .terminalThemes)
+        XCTAssertEqual(item.status, .disabled("Needs attention"))
+        XCTAssertEqual(item.source, .user)
+        XCTAssertEqual(item.scope, .appWide)
+        XCTAssertEqual(item.versionIntegrity, "Unreadable registry preserved")
+        XCTAssertEqual(item.updateState, .manual("Reset explicitly to repair"))
+        XCTAssertTrue(item.validationMessage?.contains(preservedURL.lastPathComponent) == true)
+        XCTAssertTrue(item.validationMessage?.lowercased().contains("last-known-good") == true)
+        XCTAssertFalse(item.searchableText.contains("/private/tmp"))
+        XCTAssertFalse(item.accessibilityDescription.contains("/private/tmp"))
+        XCTAssertTrue(state.canReset)
+        XCTAssertFalse(state.allowsMutations)
+        XCTAssertEqual(state.preservedCopyURL, preservedURL)
+    }
+
+    func testThemeRegistryIOFailureCannotOfferDestructiveRecoveryOrLeakItsPath() {
+        let state = CustomThemeStore.LoadState.ioFailure("permission denied at /secret/location")
+        let item = ExtensionSettingsItem.customThemeRegistryIssue(state)
+
+        XCTAssertFalse(state.canReset)
+        XCTAssertFalse(state.allowsMutations)
+        XCTAssertNil(state.preservedCopyURL)
+        XCTAssertEqual(item.versionIntegrity, "Registry unavailable")
+        XCTAssertEqual(item.updateState, .manual("Resolve storage access to continue"))
+        XCTAssertFalse(item.searchableText.contains("/secret/location"))
+        XCTAssertFalse(item.accessibilityDescription.contains("/secret/location"))
+    }
+
+    func testInactiveThemeRemovalPlanNamesTheExactThemeAndPromisesNoSelectionChange() {
+        let theme = removalTheme(id: "midnight", title: "Midnight")
+        let plan = TerminalThemeRemovalPlan(
+            theme: theme,
+            selectedThemeID: "kaisola",
+            fallbackThemeID: "native",
+            fallbackThemeTitle: "macOS Terminal"
+        )
+
+        XCTAssertEqual(plan.id, theme.id)
+        XCTAssertEqual(plan.theme, theme, "the confirmation must retain the exact stored spec")
+        XCTAssertEqual(plan.title, "Remove “Midnight” theme?")
+        XCTAssertEqual(
+            plan.message,
+            "This permanently removes “Midnight” from Kaisola. Your current terminal theme stays active."
+        )
+        XCTAssertEqual(plan.selectionAfterSuccessfulRemoval(currentThemeID: "kaisola"), "kaisola")
+    }
+
+    func testSelectedThemeRemovalPlanNamesTheFallbackBeforeConfirmation() {
+        let plan = TerminalThemeRemovalPlan(
+            theme: removalTheme(id: "midnight", title: "Midnight"),
+            selectedThemeID: "midnight",
+            fallbackThemeID: "native",
+            fallbackThemeTitle: "macOS Terminal"
+        )
+
+        XCTAssertEqual(
+            plan.message,
+            "“Midnight” is currently active. Removing it permanently switches Kaisola to “macOS Terminal”."
+        )
+        XCTAssertEqual(plan.selectionAfterSuccessfulRemoval(currentThemeID: "midnight"), "native")
+    }
+
+    func testRemovalUsesCurrentSelectionAtCommitTimeRatherThanAStaleAlertSnapshot() {
+        let plan = TerminalThemeRemovalPlan(
+            theme: removalTheme(id: "midnight", title: "Midnight"),
+            selectedThemeID: "kaisola",
+            fallbackThemeID: "native",
+            fallbackThemeTitle: "macOS Terminal"
+        )
+
+        XCTAssertEqual(
+            plan.selectionAfterSuccessfulRemoval(currentThemeID: "midnight"),
+            "native",
+            "another Settings window can select the theme while confirmation is open"
+        )
+        XCTAssertEqual(
+            plan.selectionAfterSuccessfulRemoval(currentThemeID: "kaisola"),
+            "kaisola",
+            "another Settings window can move away from the theme while confirmation is open"
+        )
+    }
+
+    func testRemovalConfirmationNormalizesControlCharactersInUserThemeTitles() {
+        let plan = TerminalThemeRemovalPlan(
+            theme: removalTheme(id: "night-shift", title: "  Night\n\tShift  "),
+            selectedThemeID: "night-shift",
+            fallbackThemeID: "native",
+            fallbackThemeTitle: "macOS\nTerminal"
+        )
+
+        XCTAssertEqual(plan.displayName, "Night Shift")
+        XCTAssertEqual(plan.title, "Remove “Night Shift” theme?")
+        XCTAssertEqual(
+            plan.message,
+            "“Night Shift” is currently active. Removing it permanently switches Kaisola to “macOS Terminal”."
+        )
     }
 
     func testSearchIsCaseAndDiacriticInsensitiveAcrossNameCategoryAndMetadata() {
@@ -289,5 +426,16 @@ final class ExtensionsSettingsHubTests: XCTestCase {
             "missing-compact-picker-label-ax"
         )
         XCTAssertEqual(receipt(width: 900).failure, "wide-content-too-narrow-900.0")
+    }
+
+    private func removalTheme(id: String, title: String) -> CustomThemeSpec {
+        let palette = CustomThemeSpec.PaletteSpec(
+            background: "#101010",
+            foreground: "#eeeeee",
+            cursor: "#ffffff",
+            selection: "#334455",
+            ansi: Array(repeating: "#777777", count: 16)
+        )
+        return CustomThemeSpec(id: id, title: title, light: palette, dark: palette)
     }
 }

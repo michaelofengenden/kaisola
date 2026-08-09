@@ -219,6 +219,11 @@ enum GlassClarity: String, CaseIterable, Identifiable, Sendable {
     /// and Michael asked for this twice — "full crisp and full clarity to be
     /// extremely clear and transparent of the background"
     ///
+    /// Those figures are the *system* semantic's. Since `KaisolaInk`, the same
+    /// adversarial worst patch reads 4.65:1 at Balanced and 3.99:1 here, so Clear
+    /// is still the one setting that does not meet the 4.5 floor — it just gives
+    /// up 0.66 of a ratio the app now has rather than 0.19 of one it never did.
+    ///
     /// `resolved(for:)` is what keeps that from reaching anyone who has told
     /// the system they need contrast.
     var veilScale: Double {
@@ -1017,6 +1022,149 @@ enum KaisolaVisualSystem {
     static let layoutDuration = 0.22
 }
 
+/// Kaisola's own text inks, and the one place a label's weight is decided.
+///
+/// **Why the app does not use `secondaryLabelColor`.** In Aqua that colour is
+/// black at α 0.498 — measured from AppKit, not assumed — and black at α 0.498
+/// over *pure white*, the brightest background that can exist, is **3.98:1**.
+/// No light Mac app clears the 4.5 floor with it. On light glass, whose worst
+/// patch renders as a 0.75 grey rather than white, the same ink measures
+/// **3.43:1**, and `GlassBackdropWash.sidebar` records at length why no veil can
+/// fix that: a light surface's worst patch is its *darkest* 2%, so thinning the
+/// veil and thickening it move the number by hundredths in opposite directions.
+///
+/// What moves it is the ink. Measured on that same worst patch — the deeper
+/// workspace surface under the widest wallpaper the fixtures carry:
+///
+///     α 0.498 (AppKit)   3.43:1
+///     α 0.600 (Kaisola)  4.65:1
+///
+/// **The ladder.** Four rungs, stated as ink coverage, resolved per appearance
+/// at draw time. Alpha is not the contract — contrast is — so each rung is
+/// chosen against the worst patch of the surface it has to survive. Measured,
+/// with the glass columns on the adversarial fixture and solid on white:
+///
+///                    light glass   light solid   dark glass
+///     primary            9.2:1        15.1:1        9.0:1
+///     secondary          4.7:1         4.8:1        4.8:1
+///     tertiary           3.3:1         3.2:1        3.3:1
+///     disabled           2.1:1         2.1:1        2.4:1
+///
+/// Over all six wallpaper fixtures, both surfaces and both clarities that do not
+/// declare a trade, the tightest secondary is **4.65:1** in light and **4.57:1**
+/// in dark, and the tightest tertiary is 3.18:1.
+///
+/// Secondary clears 4.5 (WCAG 1.4.3) everywhere. Tertiary clears 3.0 (1.4.11),
+/// the floor an **icon-only control** is held to — the reason tertiary moves at
+/// all, since AppKit's α 0.26 measures 1.79:1 on light glass and a glyph that is
+/// the only affordance in a control cannot sit there. Disabled is the one rung
+/// allowed under the floors, because 1.4.3 exempts inactive controls, and it is
+/// deliberately *heavier* than AppKit's α 0.098, which on glass is 1.2:1 —
+/// invisible rather than inactive.
+///
+/// The one place the floor is not met is **Clear** clarity, the app's only
+/// declared contrast trade (`GlassClarity.veilScale`): a surface that is 92%
+/// desktop cannot promise 4.5:1 at any ink. The ink still takes that case from
+/// 3.08:1 to 3.99:1, and Clear already falls back to Balanced for anyone who has
+/// asked the system for contrast.
+///
+/// **Three surfaces, because they are three different backgrounds.** Light glass
+/// is the hard one and sets α 0.60. Light solid is white — `windowBackgroundColor`,
+/// `controlBackgroundColor` and `textBackgroundColor` all resolve to #FFFFFF in
+/// Aqua — where α 0.535 already reaches exactly 4.5, so it takes 0.55 and keeps
+/// documents and terminals from reading heavier than they are. Dark keeps
+/// AppKit's α 0.55 at secondary, so dark appearance changes at tertiary and
+/// below only.
+enum KaisolaInk {
+    /// What the ink will land on. Glass is any surface with the desktop under
+    /// it; solid is an opaque one — documents, terminals, transcripts, and
+    /// every surface under Reduce Transparency.
+    enum Surface: String, CaseIterable, Sendable {
+        case glass
+        case solid
+    }
+
+    /// The rungs, in order. `allCases` is the ladder, and
+    /// `testTheInkLadderKeepsItsHierarchy` walks it.
+    enum Level: String, CaseIterable, Sendable {
+        case primary
+        case secondary
+        case tertiary
+        case disabled
+    }
+
+    /// Ink coverage for a rung on a surface.
+    ///
+    /// Primary is AppKit's `labelColor` alpha unchanged, on purpose: it already
+    /// clears 7:1 on the worst light patch with room to spare, and a token that
+    /// moved it would restyle every title in the app for nothing.
+    static func alpha(_ level: Level, isDark: Bool, on surface: Surface = .glass) -> Double {
+        switch level {
+        case .primary:
+            0.85
+        case .secondary:
+            isDark ? 0.55 : (surface == .glass ? 0.60 : 0.55)
+        case .tertiary:
+            isDark ? 0.40 : (surface == .glass ? 0.48 : 0.44)
+        case .disabled:
+            isDark ? 0.28 : (surface == .glass ? 0.32 : 0.30)
+        }
+    }
+
+    /// Placeholder text is text. WCAG 1.4.3 gives it no exemption — a hint the
+    /// user has to read to know what the field wants is content — so it takes
+    /// the secondary ink rather than a lighter rung of its own. AppKit's
+    /// `placeholderTextColor` is α 0.25, which is 1.8:1 on white.
+    static func placeholderAlpha(isDark: Bool, on surface: Surface = .glass) -> Double {
+        alpha(.secondary, isDark: isDark, on: surface)
+    }
+
+    /// The rung as an appearance-adaptive `NSColor`: black in Aqua, white in
+    /// Dark Aqua, resolved by the drawing appearance rather than by whatever
+    /// the colour was created under. Text-view attributes and other AppKit
+    /// call sites take this one.
+    static func nsColor(_ level: Level, on surface: Surface = .glass) -> NSColor {
+        NSColor(name: nil) { appearance in
+            let isDark = appearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
+            let ink: CGFloat = isDark ? 1 : 0
+            return NSColor(
+                srgbRed: ink, green: ink, blue: ink,
+                alpha: CGFloat(alpha(level, isDark: isDark, on: surface))
+            )
+        }
+    }
+
+    static func color(_ level: Level, on surface: Surface = .glass) -> Color {
+        Color(nsColor: nsColor(level, on: surface))
+    }
+
+    /// The placeholder ink, which is the secondary ink under another name so
+    /// the audit can see which call sites are placeholders.
+    static func placeholder(on surface: Surface = .glass) -> Color {
+        color(.secondary, on: surface)
+    }
+}
+
+extension ShapeStyle where Self == Color {
+    /// Secondary label ink. The glass value, because one view tree spans both
+    /// kinds of surface and glass is the safe superset: α 0.60 on an opaque
+    /// white surface is 5.7:1, still unmistakably junior to primary's 15:1.
+    /// Surfaces that are opaque *by construction* — the document editors, the
+    /// terminal — ask for `.solid` explicitly through `KaisolaInk`.
+    static var kaisolaSecondary: Color { KaisolaInk.color(.secondary) }
+
+    /// Tertiary ink: decorative glyphs, dimmed status, and icon-only controls,
+    /// which is why it is held to 3:1 rather than left decorative.
+    static var kaisolaTertiary: Color { KaisolaInk.color(.tertiary) }
+
+    /// Inactive controls. The only rung under the contrast floors, and the only
+    /// one WCAG exempts.
+    static var kaisolaDisabled: Color { KaisolaInk.color(.disabled) }
+
+    /// Placeholder and prompt text — the secondary ink, deliberately.
+    static var kaisolaPlaceholder: Color { KaisolaInk.placeholder() }
+}
+
 /// One last-resort motion boundary for the two native view roots.
 ///
 /// Individual surfaces can still choose a calmer replacement transition (the
@@ -1244,12 +1392,13 @@ struct GlassBackdropWash: Equatable, Sendable {
     /// make it worse", the worst-patch secondary is held at its pre-change 3.43,
     /// and 0.45 is exactly where that binds. Going to 0.40 costs 0.06 of it.
     ///
-    /// The mechanism that would lift it is a **custom secondary ink** rather
-    /// than the system semantic: on this surface, black at α 0.60 measures
+    /// The mechanism that lifts it is a **custom secondary ink** rather than
+    /// the system semantic: on this surface, black at α 0.60 measures
     /// **4.60:1** at the worst patch (4.56:1 adversarial), clearing the floor.
-    /// It is not done here because the 207 `.secondary` call sites all live in
-    /// `Features/*` and `Acp/*`, and a glass constant that silently restyles
-    /// every label in the app is a change that should be made on purpose.
+    /// That is `KaisolaInk` now, adopted at the call sites rather than smuggled
+    /// in through a glass constant — the veil still may not make text legible
+    /// on its own, and the sentence above still binds this number. What changed
+    /// is that the app no longer *asks* the veil to.
     static func sidebar(isDark: Bool, clarity: GlassClarity = .balanced) -> GlassBackdropWash {
         sidebarBase(isDark: isDark).scaled(by: clarity.veilScale)
     }

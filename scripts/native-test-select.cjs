@@ -61,7 +61,9 @@ const NATIVE_DIRECTORY_TESTS = Object.freeze([
     'SyntaxHighlighterTests', 'WorkspaceFilesTests', 'WorkspaceWatcherTests',
   ]],
   ['native/KaisolaMac/Kaisola/Git/', ['GitPRTests', 'GitPanelModelTests', 'GitServiceTests']],
-  ['native/KaisolaMac/Kaisola/Mesh/', ['MeshSessionTests', 'MeshStagedTests']],
+  ['native/KaisolaMac/Kaisola/Mesh/', [
+    'MeshColumnDeckTests', 'MeshDiffSheetTests', 'MeshSessionTests', 'MeshStagedTests',
+  ]],
   ['native/KaisolaMac/Kaisola/Updates/', [
     'NativeUpdateConfigurationTests', 'BrokerHelperPackageTests',
   ]],
@@ -107,6 +109,12 @@ const NATIVE_FILE_TESTS = Object.freeze(new Map([
   ['native/KaisolaMac/Kaisola/Features/Settings/CustomAgentsSection.swift', [
     'AcpClientTests', 'CustomAgentStoreTests',
   ]],
+  ['native/KaisolaMac/Kaisola/Features/Settings/ExtensionsSettingsHub.swift', [
+    'ExtensionsSettingsHubTests',
+  ]],
+  ['native/KaisolaMac/Kaisola/Features/Settings/ExtensionsSettingsModel.swift', [
+    'ExtensionsSettingsHubTests',
+  ]],
   ['native/KaisolaMac/Kaisola/Features/Onboarding/OnboardingView.swift', [
     'CommandRegistryTests', 'OnboardingStateTests', 'UsageCenterTests',
   ]],
@@ -130,6 +138,9 @@ const NATIVE_FILE_TESTS = Object.freeze(new Map([
     'TerminalOptionClickTests',
     'TerminalReplayFidelityTests', 'TerminalScrollPinTests',
     'TerminalScrollbackDepthTests',
+  ]],
+  ['native/KaisolaMac/Kaisola/Features/Sessions/CustomThemeStore.swift', [
+    'ExtensionsSettingsHubTests', 'TerminalThemeRegistryTests',
   ]],
   ['native/KaisolaMac/Kaisola/Features/Sessions/RootShellView.swift', [
     'AppModelProjectContextTests', 'CommandRegistryTests', 'NativePreviewSettingsTests',

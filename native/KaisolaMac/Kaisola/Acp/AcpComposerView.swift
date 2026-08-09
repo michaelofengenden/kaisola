@@ -424,7 +424,7 @@ struct AcpComposerCard: View {
                     .foregroundStyle(Color.white.opacity(sendEnabled ? 1 : 0.7))
                     .frame(width: 26, height: 26)
                     .background(
-                        sendEnabled ? Color.accentColor : Color.secondary.opacity(0.32),
+                        sendEnabled ? Color.accentColor : Color.kaisolaDisabled,
                         in: Circle()
                     )
             }
@@ -459,7 +459,7 @@ struct AcpComposerChipLabel<Leading: View>: View {
                 .lineLimit(1)
             Image(systemName: "chevron.down")
                 .font(.system(size: 7, weight: .semibold))
-                .foregroundStyle(.tertiary)
+                .foregroundStyle(.kaisolaTertiary)
         }
         .foregroundStyle(tint ?? .primary)
         .padding(.horizontal, 7)
@@ -500,7 +500,7 @@ struct AcpComposerPillLabel<Leading: View>: View {
             if let secondary {
                 Text(secondary)
                     .font(.caption)
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(.kaisolaSecondary)
                     .lineLimit(1)
             }
             if isPending {
@@ -511,7 +511,7 @@ struct AcpComposerPillLabel<Leading: View>: View {
             } else {
                 Image(systemName: "chevron.down")
                     .font(.system(size: 7, weight: .semibold))
-                    .foregroundStyle(.tertiary)
+                    .foregroundStyle(.kaisolaTertiary)
             }
         }
         .padding(.horizontal, 9)

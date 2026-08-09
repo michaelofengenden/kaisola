@@ -84,6 +84,10 @@ enum AcpTranscriptMarkdownExport {
                 sections.append(toolSummary(call))
             case let .plan(_, entries):
                 sections.append(planSummary(entries))
+            case .permissionDecision:
+                // Permission decisions are ephemeral UI evidence and are never
+                // part of the durable transcript exported to disk.
+                break
             }
         }
         if hiddenReasoningCount > 0 {
@@ -1957,7 +1961,7 @@ actor AcpTranscriptStore {
     private static func isPinnedEvidence(_ row: AcpTranscriptRow) -> Bool {
         switch row {
         case .user, .tool: true
-        case .message, .thought, .plan: false
+        case .message, .thought, .plan, .permissionDecision: false
         }
     }
 

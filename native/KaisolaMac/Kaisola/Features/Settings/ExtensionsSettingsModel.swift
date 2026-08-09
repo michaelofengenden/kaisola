@@ -1,5 +1,62 @@
 import Foundation
 
+/// Immutable context carried from the trash button into the destructive
+/// confirmation. Keeping the exact spec prevents a reordered/reloaded catalog
+/// from deleting a different row, while recomputing the selected id after the
+/// store mutation handles another Settings window changing themes while the
+/// alert is open.
+struct TerminalThemeRemovalPlan: Identifiable, Equatable, Sendable {
+    let theme: CustomThemeSpec
+    let wasSelectedWhenRequested: Bool
+    let fallbackThemeID: String
+    let fallbackThemeTitle: String
+
+    init(
+        theme: CustomThemeSpec,
+        selectedThemeID: String,
+        fallbackThemeID: String,
+        fallbackThemeTitle: String
+    ) {
+        self.theme = theme
+        wasSelectedWhenRequested = selectedThemeID == theme.id
+        self.fallbackThemeID = fallbackThemeID
+        self.fallbackThemeTitle = fallbackThemeTitle
+    }
+
+    var id: String { theme.id }
+
+    var title: String { "Remove “\(displayName)” theme?" }
+
+    var message: String {
+        if wasSelectedWhenRequested {
+            return "“\(displayName)” is currently active. Removing it permanently switches Kaisola to “\(safeFallbackTitle)”."
+        }
+        return "This permanently removes “\(displayName)” from Kaisola. Your current terminal theme stays active."
+    }
+
+    func selectionAfterSuccessfulRemoval(currentThemeID: String) -> String {
+        currentThemeID == theme.id ? fallbackThemeID : currentThemeID
+    }
+
+    var displayName: String {
+        Self.safeName(theme.title, fallback: theme.id)
+    }
+
+    private var safeFallbackTitle: String {
+        Self.safeName(fallbackThemeTitle, fallback: "the built-in theme")
+    }
+
+    private static func safeName(_ value: String, fallback: String) -> String {
+        let withoutControls = value
+            .components(separatedBy: .controlCharacters)
+            .joined(separator: " ")
+        let normalized = withoutControls
+            .split(whereSeparator: \Character.isWhitespace)
+            .joined(separator: " ")
+        return normalized.isEmpty ? fallback : normalized
+    }
+}
+
 /// The five registries that share the consolidated Extensions destination.
 /// These are presentation categories only: each underlying store keeps its
 /// existing ownership and persistence contract.
@@ -291,6 +348,51 @@ struct ExtensionSettingsItem: Equatable, Sendable {
         )
     }
 
+    static func customThemeRegistryIssue(_ state: CustomThemeStore.LoadState) -> Self {
+        let integrity: String
+        let updates: String
+        let message: String
+        switch state {
+        case let .corrupt(.preserved(url)):
+            integrity = "Unreadable registry preserved"
+            updates = "Reset explicitly to repair"
+            message = "Kaisola preserved the unreadable registry as \(url.lastPathComponent). Last-known-good themes remain active for this run; review the recovery copy, then reset explicitly to change themes."
+        case .corrupt(.failed):
+            integrity = "Unreadable registry not preserved"
+            updates = "Resolve storage access before reset"
+            message = "Kaisola could not preserve the unreadable theme registry. Last-known-good themes remain active for this run; resolve storage access before recovery."
+        case let .newerVersion(version, .preserved(url)):
+            integrity = "Newer registry v\(version) preserved"
+            updates = "Reset explicitly to replace"
+            message = "This theme registry uses schema v\(version), which is newer than Kaisola supports. It was preserved as \(url.lastPathComponent), and last-known-good themes remain active for this run."
+        case let .newerVersion(version, .failed):
+            integrity = "Newer registry v\(version) not preserved"
+            updates = "Resolve storage access before reset"
+            message = "This theme registry uses unsupported schema v\(version), and Kaisola could not create a recovery copy. Last-known-good themes remain active for this run."
+        case .ioFailure:
+            integrity = "Registry unavailable"
+            updates = "Resolve storage access to continue"
+            message = "Kaisola could not read the terminal-theme registry. The file was not changed, and last-known-good themes remain active for this run."
+        case .missing, .ready:
+            integrity = "Registry ready"
+            updates = "Local · no remote updates"
+            message = "The terminal-theme registry is ready."
+        }
+
+        return Self(
+            id: CustomThemeStore.registryIssueID,
+            category: .terminalThemes,
+            name: "Terminal theme registry",
+            detail: "Recovery required before custom themes can change",
+            status: .disabled("Needs attention"),
+            source: .user,
+            versionIntegrity: integrity,
+            scope: .appWide,
+            updateState: .manual(updates),
+            validationMessage: message
+        )
+    }
+
     static func languageGrammar(_ spec: CustomGrammarSpec) -> Self {
         let validation = spec.validationError
         return Self(
@@ -324,6 +426,51 @@ struct ExtensionSettingsItem: Equatable, Sendable {
             validationMessage: validation
         )
     }
+
+    static func previewMappingRegistryIssue(_ state: PreviewMappingStore.LoadState) -> Self {
+        let integrity: String
+        let updates: String
+        let message: String
+        switch state {
+        case let .corrupt(.preserved(url)):
+            integrity = "Unreadable registry preserved"
+            updates = "Reset explicitly to repair"
+            message = "Kaisola preserved the unreadable registry as \(url.lastPathComponent). Review that recovery copy, then reset explicitly to repair mappings."
+        case .corrupt(.failed):
+            integrity = "Unreadable registry not preserved"
+            updates = "Resolve storage access before reset"
+            message = "Kaisola could not preserve the unreadable registry. Resolve storage access before attempting recovery."
+        case let .newerVersion(version, .preserved(url)):
+            integrity = "Newer registry v\(version) preserved"
+            updates = "Reset explicitly to replace"
+            message = "This registry uses schema v\(version), which is newer than Kaisola supports. It was preserved as \(url.lastPathComponent)."
+        case let .newerVersion(version, .failed):
+            integrity = "Newer registry v\(version) not preserved"
+            updates = "Resolve storage access before reset"
+            message = "This registry uses unsupported schema v\(version), and Kaisola could not create a recovery copy."
+        case .ioFailure:
+            integrity = "Registry unavailable"
+            updates = "Resolve storage access to continue"
+            message = "Kaisola could not read the preview-mapping registry. The file was not changed; resolve storage access and try again."
+        case .missing, .ready:
+            integrity = "Registry ready"
+            updates = "Local · no remote updates"
+            message = "The preview-mapping registry is ready."
+        }
+
+        return Self(
+            id: PreviewMappingStore.registryIssueID,
+            category: .previewMappings,
+            name: "Preview mapping registry",
+            detail: "Recovery required before mappings can change",
+            status: .disabled("Needs attention"),
+            source: .user,
+            versionIntegrity: integrity,
+            scope: .appWide,
+            updateState: .manual(updates),
+            validationMessage: message
+        )
+    }
 }
 
 enum ExtensionsSettingsCatalog {
@@ -347,11 +494,19 @@ enum ExtensionsSettingsCatalog {
                 selected: selectedThemeID == $0.id
             )
         }
-        let customThemes = CustomThemeStore().specs().map {
+        let themeSnapshot = CustomThemeStore().load()
+        var customThemes = themeSnapshot.specs.map {
             ExtensionSettingsItem.customTheme($0, selected: selectedThemeID == $0.id)
         }
+        if !themeSnapshot.state.allowsMutations {
+            customThemes.append(.customThemeRegistryIssue(themeSnapshot.state))
+        }
         let grammars = CustomGrammarStore().specs().map(ExtensionSettingsItem.languageGrammar)
-        let mappings = PreviewMappingStore().specs().map(ExtensionSettingsItem.previewMapping)
+        let mappingSnapshot = PreviewMappingStore().load()
+        var mappings = mappingSnapshot.specs.map(ExtensionSettingsItem.previewMapping)
+        if !mappingSnapshot.state.allowsMutations {
+            mappings.append(.previewMappingRegistryIssue(mappingSnapshot.state))
+        }
         return agents + servers + shippedThemes + customThemes + grammars + mappings
     }
 

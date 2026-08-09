@@ -12,6 +12,7 @@ const { agentEnv } = require('./shellEnv.cjs')
 const { TerminalSpool, DEFAULT_HOT_CAP, DEFAULT_SNAPSHOT_CAP } = require('./terminalSpool.cjs')
 const { TerminalObservers } = require('./terminalObservers.cjs')
 const { TerminalCursor, isUtf8Boundary } = require('../companion/terminalCursor.cjs')
+const { validatedTerminalGeometry } = require('./terminalCreateRoute.cjs')
 
 let pty = null
 let ptyLoadAttempted = false
@@ -336,6 +337,8 @@ function spawn({ id, command, args, cwd, env, outputByteLimit, cols, rows, sende
   // never decreases. No caller combines these today — refuse loudly so a
   // future one cannot silently corrupt history offsets.
   if (restore && Number.isFinite(outputByteLimit)) return null
+  const geometry = validatedTerminalGeometry({ cols, rows }, { defaults: true })
+  if (!geometry.ok) return null
   cancelRelease(id)
   const restoring = restore === true
   const prior = terms.get(id)
@@ -348,8 +351,8 @@ function spawn({ id, command, args, cwd, env, outputByteLimit, cols, rows, sende
     terms.delete(id)
   }
   const retainedOutputBytes = Number.isFinite(outputByteLimit) ? Math.max(0, Math.floor(outputByteLimit)) : null
-  const initialCols = cols || 80
-  const initialRows = rows || 24
+  const initialCols = geometry.value.cols
+  const initialRows = geometry.value.rows
   const spoolOptions = {
     dir: spoolDir,
     id,
@@ -577,18 +580,18 @@ function agentTurn(id, busy) {
 }
 
 function resizeRecord(record, cols, rows) {
-  if (!record || !Number.isInteger(cols) || !Number.isInteger(rows) || cols <= 0 || rows <= 0) {
-    return false
-  }
+  if (!record) return false
+  const geometry = validatedTerminalGeometry({ cols, rows })
+  if (!geometry.ok) return false
   try {
-    record.pty.resize(cols, rows)
+    record.pty.resize(geometry.value.cols, geometry.value.rows)
   } catch {
     // The controller must not cache a geometry the PTY never accepted. A later
     // level-triggered desktop synchronization can safely retry the same size.
     return false
   }
-  record.cols = cols
-  record.rows = rows
+  record.cols = geometry.value.cols
+  record.rows = geometry.value.rows
   return true
 }
 

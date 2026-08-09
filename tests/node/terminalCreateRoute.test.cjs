@@ -7,7 +7,10 @@ const os = require('node:os')
 const path = require('node:path')
 const realManager = require('../../runtime/node-broker/ipc/terminalManager.cjs')
 const { TerminalSpool } = require('../../runtime/node-broker/ipc/terminalSpool.cjs')
-const { TERMINAL_CREATE_LIMITS } = require('../../runtime/node-broker/ipc/terminalCreateRoute.cjs')
+const {
+  TERMINAL_CREATE_LIMITS,
+  TERMINAL_GEOMETRY_LIMITS,
+} = require('../../runtime/node-broker/ipc/terminalCreateRoute.cjs')
 
 const {
   argumentCount: MAX_ARGUMENT_COUNT,
@@ -18,6 +21,11 @@ const {
   environmentValueBytes: MAX_ENVIRONMENT_VALUE_BYTES,
   environmentBytes: MAX_ENVIRONMENT_BYTES,
 } = TERMINAL_CREATE_LIMITS
+
+const {
+  maxCols: MAX_TERMINAL_COLS,
+  maxRows: MAX_TERMINAL_ROWS,
+} = TERMINAL_GEOMETRY_LIMITS
 
 const managerSpoolDir = fs.mkdtempSync(path.join(os.tmpdir(), 'kaisola-terminal-create-route-'))
 realManager.configureStorage(managerSpoolDir)
@@ -120,6 +128,113 @@ test('terminal create route preserves safe multibyte arguments and environment',
   assert.equal(response.ok, true)
   assert.deepEqual(manager.calls[0].args, args)
   assert.deepEqual(manager.calls[0].env, env)
+})
+
+test('terminal create route defaults only omitted geometry before spawn', () => {
+  const { terminalCreateRoute } = require('../../runtime/node-broker/ipc/terminalCreateRoute.cjs')
+  const manager = fakeManager()
+  manager.has = () => false
+
+  const response = terminalCreateRoute({
+    manager,
+    params: { id: 'default-terminal-geometry' },
+    owner: 'instance|owner|project',
+    clientInstanceId: 'instance',
+    requireAllowed: () => assert.fail('a new terminal must not require adoption'),
+  })
+
+  assert.equal(response.ok, true)
+  assert.equal(manager.calls.length, 1)
+  assert.equal(manager.calls[0].cols, 80)
+  assert.equal(manager.calls[0].rows, 24)
+})
+
+test('terminal create route rejects malformed geometry before ownership lookup or spawn', async (t) => {
+  const { terminalCreateRoute } = require('../../runtime/node-broker/ipc/terminalCreateRoute.cjs')
+  const fixtures = [
+    { name: 'numeric-string columns', params: { cols: '120', rows: 40 }, field: 'cols' },
+    { name: 'fractional columns', params: { cols: 80.5, rows: 24 }, field: 'cols' },
+    { name: 'fractional rows', params: { cols: 80, rows: 24.5 }, field: 'rows' },
+    { name: 'zero columns', params: { cols: 0, rows: 24 }, field: 'cols' },
+    { name: 'negative rows', params: { cols: 80, rows: -1 }, field: 'rows' },
+    { name: 'infinite columns', params: { cols: Number.POSITIVE_INFINITY, rows: 24 }, field: 'cols' },
+    { name: 'NaN rows', params: { cols: 80, rows: Number.NaN }, field: 'rows' },
+    { name: 'null columns', params: { cols: null, rows: 24 }, field: 'cols' },
+  ]
+
+  for (const fixture of fixtures) {
+    await t.test(fixture.name, () => {
+      const manager = fakeManager()
+      manager.has = () => assert.fail('invalid geometry must fail before ownership lookup')
+      manager.isLive = () => assert.fail('invalid geometry must fail before liveness lookup')
+      const response = terminalCreateRoute({
+        manager,
+        params: { id: `invalid-geometry-${fixture.name}`, ...fixture.params },
+        owner: 'instance|owner|project',
+        clientInstanceId: 'instance',
+        requireAllowed: () => assert.fail('invalid geometry must not authorize'),
+      })
+
+      assert.deepEqual(response, {
+        ok: false,
+        code: 'terminal_geometry_invalid',
+        message: `terminal ${fixture.field} must be a finite positive integer`,
+        field: fixture.field,
+        expected: 'finite positive integer',
+      })
+      assert.equal(manager.calls.length, 0)
+    })
+  }
+})
+
+test('terminal create route clamps extreme integers and preserves documented boundaries', async (t) => {
+  const { terminalCreateRoute } = require('../../runtime/node-broker/ipc/terminalCreateRoute.cjs')
+  const fixtures = [
+    {
+      name: 'minimum boundary',
+      params: { cols: 1, rows: 1 },
+      expected: { cols: 1, rows: 1 },
+    },
+    {
+      name: 'maximum boundary',
+      params: { cols: MAX_TERMINAL_COLS, rows: MAX_TERMINAL_ROWS },
+      expected: { cols: MAX_TERMINAL_COLS, rows: MAX_TERMINAL_ROWS },
+    },
+    {
+      name: 'extreme positive integers',
+      params: { cols: Number.MAX_SAFE_INTEGER, rows: Number.MAX_SAFE_INTEGER },
+      expected: { cols: MAX_TERMINAL_COLS, rows: MAX_TERMINAL_ROWS },
+    },
+    {
+      name: 'one above each maximum',
+      params: { cols: MAX_TERMINAL_COLS + 1, rows: MAX_TERMINAL_ROWS + 1 },
+      expected: { cols: MAX_TERMINAL_COLS, rows: MAX_TERMINAL_ROWS },
+    },
+    {
+      name: 'one omitted dimension',
+      params: { cols: 132 },
+      expected: { cols: 132, rows: 24 },
+    },
+  ]
+
+  for (const fixture of fixtures) {
+    await t.test(fixture.name, () => {
+      const manager = fakeManager()
+      manager.has = () => false
+      const response = terminalCreateRoute({
+        manager,
+        params: { id: `bounded-geometry-${fixture.name}`, ...fixture.params },
+        owner: 'instance|owner|project',
+        clientInstanceId: 'instance',
+        requireAllowed: () => assert.fail('a new terminal must not require adoption'),
+      })
+
+      assert.equal(response.ok, true)
+      assert.equal(manager.calls.length, 1)
+      assert.equal(manager.calls[0].cols, fixture.expected.cols)
+      assert.equal(manager.calls[0].rows, fixture.expected.rows)
+    })
+  }
 })
 
 test('terminal create route rejects invalid argument shapes before spawn', async (t) => {

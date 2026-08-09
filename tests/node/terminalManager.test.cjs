@@ -7,7 +7,13 @@ const os = require('node:os')
 const path = require('node:path')
 const manager = require('../../runtime/node-broker/ipc/terminalManager.cjs')
 const { TerminalSpool } = require('../../runtime/node-broker/ipc/terminalSpool.cjs')
+const { TERMINAL_GEOMETRY_LIMITS } = require('../../runtime/node-broker/ipc/terminalCreateRoute.cjs')
 const { __test } = manager
+
+const {
+  maxCols: MAX_TERMINAL_COLS,
+  maxRows: MAX_TERMINAL_ROWS,
+} = TERMINAL_GEOMETRY_LIMITS
 
 const managerSpoolDir = fs.mkdtempSync(path.join(os.tmpdir(), 'kaisola-terminal-manager-'))
 manager.configureStorage(managerSpoolDir)
@@ -50,10 +56,32 @@ test('terminal resize rejects invalid or fractional wire geometry', () => {
   }
 
   assert.equal(__test.resizeRecord(record, 0, 24), false)
+  assert.equal(__test.resizeRecord(record, -1, 24), false)
   assert.equal(__test.resizeRecord(record, 80.5, 24), false)
+  assert.equal(__test.resizeRecord(record, '80', 24), false)
+  assert.equal(__test.resizeRecord(record, 80, '24'), false)
+  assert.equal(__test.resizeRecord(record, Number.POSITIVE_INFINITY, 24), false)
   assert.equal(__test.resizeRecord(record, 80, Number.NaN), false)
   assert.equal(record.cols, 80)
   assert.equal(record.rows, 24)
+})
+
+test('terminal resize applies the create validator maxima before node-pty', () => {
+  const calls = []
+  const record = {
+    cols: 80,
+    rows: 24,
+    pty: { resize: (cols, rows) => calls.push([cols, rows]) },
+  }
+
+  assert.equal(__test.resizeRecord(record, MAX_TERMINAL_COLS, MAX_TERMINAL_ROWS), true)
+  assert.equal(__test.resizeRecord(record, Number.MAX_SAFE_INTEGER, Number.MAX_SAFE_INTEGER), true)
+  assert.deepEqual(calls, [
+    [MAX_TERMINAL_COLS, MAX_TERMINAL_ROWS],
+    [MAX_TERMINAL_COLS, MAX_TERMINAL_ROWS],
+  ])
+  assert.equal(record.cols, MAX_TERMINAL_COLS)
+  assert.equal(record.rows, MAX_TERMINAL_ROWS)
 })
 
 test('coldTail reads the bounded retained tail across previous and current segments', (t) => {

@@ -13,6 +13,51 @@ const TERMINAL_CREATE_LIMITS = Object.freeze({
   environmentBytes: 256 * 1024,
 })
 
+/** Protocol-level PTY geometry. A real renderer is far below these ceilings,
+ * while 1,000 still leaves ample headroom for large displays and automation.
+ * Keeping the bounds here makes create, resize, and manager defense-in-depth
+ * consume one documented contract instead of drifting independently. */
+const TERMINAL_GEOMETRY_LIMITS = Object.freeze({
+  defaultCols: 80,
+  defaultRows: 24,
+  maxCols: 1_000,
+  maxRows: 1_000,
+})
+
+function geometryError(field) {
+  return {
+    ok: false,
+    code: 'terminal_geometry_invalid',
+    message: `terminal ${field} must be a finite positive integer`,
+    field,
+    expected: 'finite positive integer',
+  }
+}
+
+function validatedTerminalGeometry(raw = {}, { defaults = false } = {}) {
+  const cols = raw.cols === undefined && defaults
+    ? TERMINAL_GEOMETRY_LIMITS.defaultCols
+    : raw.cols
+  const rows = raw.rows === undefined && defaults
+    ? TERMINAL_GEOMETRY_LIMITS.defaultRows
+    : raw.rows
+
+  if (typeof cols !== 'number' || !Number.isFinite(cols) || !Number.isInteger(cols) || cols <= 0) {
+    return geometryError('cols')
+  }
+  if (typeof rows !== 'number' || !Number.isFinite(rows) || !Number.isInteger(rows) || rows <= 0) {
+    return geometryError('rows')
+  }
+
+  return {
+    ok: true,
+    value: {
+      cols: Math.min(cols, TERMINAL_GEOMETRY_LIMITS.maxCols),
+      rows: Math.min(rows, TERMINAL_GEOMETRY_LIMITS.maxRows),
+    },
+  }
+}
+
 function payloadTypeError(message, scope, expected, index) {
   return {
     ok: false,
@@ -181,6 +226,16 @@ function validatedEnvironment(raw) {
   return { ok: true, value: raw }
 }
 
+/** Validate raw resize wire values before consulting terminal ownership. The
+ * manager repeats the same validation at its node-pty boundary for non-wire
+ * callers. */
+function terminalResizeRoute({ manager, id, params = {}, requireAllowed }) {
+  const geometry = validatedTerminalGeometry(params)
+  if (!geometry.ok) return geometry
+  requireAllowed(id)
+  return manager.resize(id, geometry.value.cols, geometry.value.rows)
+}
+
 /** The authenticated `terminal.create` operation after access selection. Kept
  * separate from the executable broker so the additive resurrection wire can
  * be contract-tested without binding its AF_UNIX listener. */
@@ -208,6 +263,8 @@ function terminalCreateRoute({
   if (!args.ok) return args
   const env = validatedEnvironment(params.env)
   if (!env.ok) return env
+  const geometry = validatedTerminalGeometry(params, { defaults: true })
+  if (!geometry.ok) return geometry
   if (manager.has(id)) requireAllowed(id, true)
 
   const existed = manager.isLive(id)
@@ -233,8 +290,8 @@ function terminalCreateRoute({
     outputByteLimit: Number.isFinite(Number(params.outputByteLimit))
       ? Math.max(0, Math.min(Math.floor(Number(params.outputByteLimit)), 8 * 1024 * 1024))
       : undefined,
-    cols: Number(params.cols) || 80,
-    rows: Number(params.rows) || 24,
+    cols: geometry.value.cols,
+    rows: geometry.value.rows,
     sender: owner,
     restore,
   })
@@ -259,4 +316,10 @@ function terminalCreateRoute({
   }
 }
 
-module.exports = { terminalCreateRoute, TERMINAL_CREATE_LIMITS }
+module.exports = {
+  terminalCreateRoute,
+  terminalResizeRoute,
+  validatedTerminalGeometry,
+  TERMINAL_CREATE_LIMITS,
+  TERMINAL_GEOMETRY_LIMITS,
+}

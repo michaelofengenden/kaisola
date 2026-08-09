@@ -92,6 +92,12 @@ struct SettingsView: View {
     /// switch rebuilds workspace-scoped Settings content.
     var sectionChanged: ((String) -> Void)? = nil
 
+    /// Extra top inset for the standalone window's sidebar. 14 (the sidebar's
+    /// own vertical padding) plus this clears the 28-point titlebar strip and
+    /// the six points of breathing room the layout gate reserves around the
+    /// window buttons.
+    static let windowControlReserve: CGFloat = 18
+
     var body: some View {
         HStack(spacing: 0) {
             settingsNavigation
@@ -187,27 +193,45 @@ struct SettingsView: View {
             .padding(.horizontal, 14)
             .padding(.bottom, 16)
 
-            // Grouped clusters (spec §3a): quiet headers, eleven sections in
-            // four families instead of one flat run.
-            ForEach(SettingsGroup.allCases) { group in
-                Text(group.title.uppercased())
-                    .font(.system(size: 10.5, weight: .semibold))
-                    .foregroundStyle(.tertiary)
-                    .padding(.horizontal, 14)
-                    .padding(.top, group == SettingsGroup.allCases.first ? 0 : 10)
-                    .accessibilityAddTraits(.isHeader)
-                ForEach(group.sections) { section in
-                    sectionButton(section)
+            // Eleven rows in four families are taller than a short window. An
+            // overflowing VStack centres itself, which pushed the mark and the
+            // headline up off the top of the sidebar and straight onto the
+            // window buttons (issue #309). Scroll the rows instead so the
+            // header keeps the position the layout gives it.
+            ScrollView(.vertical, showsIndicators: false) {
+                // Grouped clusters (spec §3a): quiet headers, eleven sections
+                // in four families instead of one flat run.
+                VStack(alignment: .leading, spacing: 5) {
+                    ForEach(SettingsGroup.allCases) { group in
+                        Text(group.title.uppercased())
+                            .font(.system(size: 10.5, weight: .semibold))
+                            .foregroundStyle(.tertiary)
+                            .padding(.horizontal, 14)
+                            .padding(.top, group == SettingsGroup.allCases.first ? 0 : 10)
+                            .accessibilityAddTraits(.isHeader)
+                        ForEach(group.sections) { section in
+                            sectionButton(section)
+                        }
+                    }
                 }
+                .frame(maxWidth: .infinity, alignment: .leading)
             }
+            .scrollBounceBehavior(.basedOnSize)
 
-            Spacer()
+            Spacer(minLength: 0)
             Text("Changes apply instantly")
                 .font(.caption2)
                 .foregroundStyle(.tertiary)
                 .padding(.horizontal, 14)
         }
         .padding(.vertical, 14)
+        // The standalone Command-comma window is `fullSizeContentView` with a
+        // transparent titlebar, so its first row lands underneath the close,
+        // minimise and zoom buttons — the mark and the "Settings" headline were
+        // printed over them in every captured screenshot (issue #309). Reserve
+        // the titlebar strip there. The in-workspace sheet has no window
+        // controls and keeps the tight inset.
+        .padding(.top, dismiss == nil ? Self.windowControlReserve : 0)
         .padding(.horizontal, 8)
         .frame(width: 176)
         .background {

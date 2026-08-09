@@ -150,13 +150,40 @@ jobs:
 
           # Dimension and file-size checks cannot distinguish a real capture
           # from an all-transparent material-backed sheet. Sample visible
-          # alpha and luminance once across the complete inspection set.
+          # alpha and luminance once across the complete inspection set. This
+          # is a prerequisite for the structural gate below, not the whole
+          # visual check: it passes happily on a screenshot whose header is
+          # printed over the window buttons.
           xcrun swift scripts/native-visual-image-gate.swift "$output"/*.png
 
+          baselines="$GITHUB_WORKSPACE/native/KaisolaMac/VisualBaselines"
+
+          # Prove the structural gate still rejects the regressions it was
+          # built for before trusting its verdict on this run. The cases are
+          # recorded snapshots, so this needs no window and no display.
+          "$binary" \
+            --visual-layout-self-test "$GITHUB_WORKSPACE/tests/fixtures/native-visual" \
+            --expectations "$baselines/layout-expectations.json"
+
+          # Judge every captured surface: content over the window controls,
+          # clipped or offscreen elements, overlapping controls, truncation,
+          # missing labels and actions, focus, and the masked content-ink
+          # floor. Refuses to run at all unless the reviewed baseline still
+          # matches its review record.
+          "$binary" \
+            --visual-layout-gate "$output" \
+            --expectations "$baselines/layout-expectations.json" \
+            --review "$baselines/layout-review.json"
+
       - name: Upload native visual inspection set
+        # A failing gate is exactly when the screenshots and their structural
+        # snapshots need to reach a reviewer, so upload either way.
+        if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: native-visual-${{ github.sha }}
-          path: ${{ runner.temp }}/kaisola-native-screenshots/*.png
+          path: |
+            ${{ runner.temp }}/kaisola-native-screenshots/*.png
+            ${{ runner.temp }}/kaisola-native-screenshots/*.layout.json
           if-no-files-found: error
           retention-days: 14

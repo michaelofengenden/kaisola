@@ -1,0 +1,89 @@
+{
+  "schemaVersion": 1,
+  "notes": [
+    "Reviewed baseline for the native-visual layout gate.",
+    "Rules judged from window geometry and app-drawn ink run at fail.",
+    "Rules that depend on what the accessibility tree reports on a hosted runner start at observe: the first captured run is what promotes them, and promoting one is a reviewed edit to this file.",
+    "Editing anything here changes the digest in layout-review.json, and the gate refuses the run until that record names the before/after artifacts and the reviewer."
+  ],
+  "inventoryPolicy": "observe",
+  "severities": {
+    "control-overlap": "fail",
+    "control-zone-ink": "fail",
+    "content-ink-floor": "fail",
+    "clipped": "observe",
+    "offscreen": "observe",
+    "element-collision": "observe",
+    "truncated-text": "observe",
+    "missing-label": "observe",
+    "missing-action": "observe",
+    "missing-focus": "observe",
+    "focus-outside-content": "observe",
+    "type-floor": "observe",
+    "missing-window-controls": "observe"
+  },
+  "controlZoneInk": {
+    "coverageThreshold": 0.04,
+    "luminanceRangeThreshold": 0.18,
+    "margin": 0.002,
+    "minimumSamples": 64
+  },
+  "containerAreaShare": 0.5,
+  "containerSpanShare": 0.9,
+  "controlOverlapShare": 0.02,
+  "edgeSlack": 0.004,
+  "defaults": {
+    "minimumTextPointHeight": 9,
+    "minimumContentInkCoverage": 0.005,
+    "masks": []
+  },
+  "surfaces": {
+    "terminal": {
+      "masks": [{ "x": 0.17, "y": 0.05, "width": 0.83, "height": 0.95 }]
+    },
+    "terminal-solo": {
+      "masks": [{ "x": 0.17, "y": 0.05, "width": 0.83, "height": 0.95 }]
+    },
+    "terminal-semantic": {
+      "masks": [{ "x": 0.17, "y": 0.05, "width": 0.83, "height": 0.95 }]
+    },
+    "terminal-scroll-output": {
+      "masks": [{ "x": 0.17, "y": 0.05, "width": 0.83, "height": 0.95 }]
+    },
+    "terminal-transcript": {
+      "allowsWindowControlsHidden": true,
+      "masks": [{ "x": 0.0, "y": 0.1, "width": 1.0, "height": 0.9 }]
+    },
+    "mixed": {
+      "masks": [{ "x": 0.17, "y": 0.05, "width": 0.83, "height": 0.95 }]
+    },
+    "preview-html": {
+      "masks": [{ "x": 0.3, "y": 0.05, "width": 0.7, "height": 0.95 }]
+    },
+    "preview-pdf": {
+      "masks": [{ "x": 0.3, "y": 0.05, "width": 0.7, "height": 0.95 }]
+    },
+    "preview-docx": {
+      "masks": [{ "x": 0.3, "y": 0.05, "width": 0.7, "height": 0.95 }]
+    },
+    "preview-code-editor": {
+      "masks": [{ "x": 0.3, "y": 0.05, "width": 0.7, "height": 0.95 }]
+    },
+    "workspace-rename": {
+      "allowsWindowControlsHidden": true,
+      "severities": { "truncated-text": "fail" }
+    },
+    "workspace-new-file": {
+      "allowsWindowControlsHidden": true,
+      "severities": { "truncated-text": "fail" }
+    },
+    "workspace-move": {
+      "allowsWindowControlsHidden": true,
+      "severities": { "truncated-text": "fail" }
+    },
+    "account-picker": {
+      "allowsWindowControlsHidden": true,
+      "severities": { "truncated-text": "fail" }
+    }
+  }
+}

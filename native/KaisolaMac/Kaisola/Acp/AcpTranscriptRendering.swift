@@ -2,6 +2,195 @@ import AppKit
 import Foundation
 import SwiftUI
 
+extension Notification.Name {
+    static let kaisolaTranscriptFindCommand = Notification.Name("kaisola.transcriptFindCommand")
+}
+
+enum AcpTranscriptFindCommand: Int, Equatable {
+    static let notificationActionKey = "action"
+
+    case show = 1
+    case next = 2
+    case previous = 3
+    case useSelection = 7
+}
+
+enum AcpTranscriptSearchDirection: Equatable {
+    case next
+    case previous
+}
+
+struct AcpTranscriptSearchMatch: Equatable, Sendable {
+    let rowID: String
+    let occurrence: Int
+}
+
+/// Builds a bounded index over exactly the transcript content the chat can
+/// render. The durable store remains complete; this view-local index never
+/// retains unbounded tool output or scans unloaded pages until asked.
+enum AcpTranscriptSearchIndex {
+    static let maximumMatches = 500
+    static let maximumSearchCharacters = 512_000
+    static let maximumQueryCharacters = 512
+
+    struct Result: Equatable, Sendable {
+        let matches: [AcpTranscriptSearchMatch]
+        let hasAdditionalMatches: Bool
+    }
+
+    static func build(query: String, rows: [AcpTranscriptRow]) -> Result {
+        let query = String(query.prefix(maximumQueryCharacters))
+        guard !query.isEmpty else { return Result(matches: [], hasAdditionalMatches: false) }
+
+        var matches: [AcpTranscriptSearchMatch] = []
+        var remainingCharacters = maximumSearchCharacters
+        var hasAdditionalMatches = false
+        for (rowIndex, row) in rows.enumerated() where remainingCharacters > 0 {
+            let source = searchableText(for: row)
+            let bounded = String(source.prefix(remainingCharacters))
+            remainingCharacters -= bounded.count
+            var occurrence = 0
+            var cursor = bounded.startIndex
+            while cursor < bounded.endIndex,
+                  let range = bounded.range(
+                      of: query,
+                      options: [.caseInsensitive, .diacriticInsensitive],
+                      range: cursor..<bounded.endIndex
+                  ) {
+                if matches.count == maximumMatches {
+                    hasAdditionalMatches = true
+                    return Result(matches: matches, hasAdditionalMatches: true)
+                }
+                matches.append(AcpTranscriptSearchMatch(rowID: row.id, occurrence: occurrence))
+                occurrence += 1
+                cursor = range.upperBound
+            }
+            if bounded.count < source.count || (remainingCharacters == 0 && rowIndex < rows.count - 1) {
+                hasAdditionalMatches = true
+            }
+        }
+        return Result(matches: matches, hasAdditionalMatches: hasAdditionalMatches)
+    }
+
+    private static func searchableText(for row: AcpTranscriptRow) -> String {
+        switch row {
+        case let .user(_, text, _),
+             let .message(_, text),
+             let .thought(_, text),
+             let .permissionDecision(_, text):
+            return AcpChatRendering.bounded(
+                text,
+                characterLimit: AcpChatRendering.assistantCharacterLimit,
+                lineLimit: AcpChatRendering.assistantLineLimit
+            ).text
+        case let .tool(call):
+            var fields = [call.title, call.kind, call.status.rawValue]
+            fields.append(contentsOf: call.declaredFilePaths)
+            for artifact in call.content {
+                switch artifact {
+                case let .text(text):
+                    fields.append(AcpChatRendering.bounded(
+                        text,
+                        characterLimit: AcpChatRendering.toolCharacterLimit,
+                        lineLimit: AcpChatRendering.toolLineLimit
+                    ).text)
+                case let .diff(path, oldText, newText):
+                    fields.append(path)
+                    if let oldText {
+                        fields.append(AcpChatRendering.bounded(
+                            oldText,
+                            characterLimit: AcpChatRendering.diffCharacterLimit,
+                            lineLimit: AcpChatRendering.diffLineLimit
+                        ).text)
+                    }
+                    fields.append(AcpChatRendering.bounded(
+                        newText,
+                        characterLimit: AcpChatRendering.diffCharacterLimit,
+                        lineLimit: AcpChatRendering.diffLineLimit
+                    ).text)
+                case let .terminal(id):
+                    fields.append(id)
+                }
+            }
+            return fields.joined(separator: "\n")
+        case let .plan(_, entries):
+            return entries.flatMap { [$0.content, $0.priority, $0.status] }.joined(separator: "\n")
+        }
+    }
+}
+
+struct AcpTranscriptSearchState: Equatable, Sendable {
+    private(set) var isPresented = false
+    private(set) var query = ""
+    private(set) var matches: [AcpTranscriptSearchMatch] = []
+    private(set) var hasAdditionalMatches = false
+    private var selectedIndex: Int?
+
+    var matchCount: Int { matches.count }
+    var currentRowID: String? {
+        guard let selectedIndex, matches.indices.contains(selectedIndex) else { return nil }
+        return matches[selectedIndex].rowID
+    }
+
+    mutating func present() { isPresented = true }
+
+    mutating func dismiss() {
+        isPresented = false
+        selectedIndex = nil
+    }
+
+    mutating func updateQuery(_ value: String, rows: [AcpTranscriptRow]) {
+        query = String(value.prefix(AcpTranscriptSearchIndex.maximumQueryCharacters))
+        selectedIndex = nil
+        rebuild(rows: rows, preserving: nil)
+    }
+
+    mutating func refresh(rows: [AcpTranscriptRow]) {
+        let selected = selectedIndex.flatMap { matches.indices.contains($0) ? matches[$0] : nil }
+        rebuild(rows: rows, preserving: selected)
+    }
+
+    mutating func move(_ direction: AcpTranscriptSearchDirection) -> String? {
+        guard !matches.isEmpty else {
+            selectedIndex = nil
+            return nil
+        }
+        switch (direction, selectedIndex) {
+        case (.next, nil): selectedIndex = 0
+        case (.previous, nil): selectedIndex = matches.count - 1
+        case let (.next, index?): selectedIndex = (index + 1) % matches.count
+        case let (.previous, index?): selectedIndex = (index - 1 + matches.count) % matches.count
+        }
+        return currentRowID
+    }
+
+    func statusText(hasHiddenEarlierRows: Bool) -> String {
+        guard !query.isEmpty else { return "Type to search" }
+        guard !matches.isEmpty else {
+            return hasHiddenEarlierRows ? "No matches loaded" : "No matches"
+        }
+        if let selectedIndex {
+            return "\(selectedIndex + 1) of \(matches.count)"
+        }
+        return hasAdditionalMatches ? "\(matches.count)+ matches" : "\(matches.count) matches"
+    }
+
+    private mutating func rebuild(
+        rows: [AcpTranscriptRow],
+        preserving selected: AcpTranscriptSearchMatch?
+    ) {
+        let result = AcpTranscriptSearchIndex.build(query: query, rows: rows)
+        matches = result.matches
+        hasAdditionalMatches = result.hasAdditionalMatches
+        selectedIndex = selected.flatMap { matches.firstIndex(of: $0) }
+    }
+}
+
+struct AcpTranscriptSearchNavigationRequest: Equatable {
+    let generation: UInt64
+    let direction: AcpTranscriptSearchDirection
+}
+
 /// Incremental structural cache for one assistant row. ACP message chunks are
 /// append-only, so an update reparses the final (potentially still-open) block
 /// rather than every stable block above it. Two short sentinels validate that

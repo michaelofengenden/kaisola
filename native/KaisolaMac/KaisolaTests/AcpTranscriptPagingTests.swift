@@ -161,6 +161,93 @@ final class AcpTranscriptPagingTests: XCTestCase {
         XCTAssertEqual(requestCount, 5)
     }
 
+    func testTranscriptSearchCountsVisibleOccurrencesAndNavigatesInOrder() {
+        let rows: [AcpTranscriptRow] = [
+            .user(id: "u", text: "Needle once", failed: false),
+            .message(id: "m", text: "needle twice NEEDLE"),
+            .plan(id: "p", entries: [
+                AcpPlanEntry(id: "e", content: "No match", priority: "medium", status: "pending"),
+            ]),
+        ]
+        var state = AcpTranscriptSearchState()
+
+        state.updateQuery("needle", rows: rows)
+
+        XCTAssertEqual(state.matchCount, 3)
+        XCTAssertNil(state.currentRowID, "typing must not jump the reading anchor")
+        XCTAssertEqual(state.statusText(hasHiddenEarlierRows: false), "3 matches")
+        XCTAssertEqual(state.move(.next), "user-u")
+        XCTAssertEqual(state.statusText(hasHiddenEarlierRows: false), "1 of 3")
+        XCTAssertEqual(state.move(.next), "msg-m")
+        XCTAssertEqual(state.move(.next), "msg-m")
+        XCTAssertEqual(state.move(.next), "user-u", "next wraps")
+        XCTAssertEqual(state.move(.previous), "msg-m", "previous wraps")
+    }
+
+    func testTranscriptSearchRefreshPreservesSelectionDuringStreaming() {
+        var state = AcpTranscriptSearchState()
+        state.updateQuery("ship", rows: [
+            .message(id: "one", text: "ship it"),
+            .message(id: "two", text: "waiting"),
+        ])
+        XCTAssertEqual(state.move(.next), "msg-one")
+
+        state.refresh(rows: [
+            .message(id: "one", text: "ship it"),
+            .message(id: "two", text: "waiting, then ship"),
+        ])
+
+        XCTAssertEqual(state.matchCount, 2)
+        XCTAssertEqual(state.currentRowID, "msg-one")
+        XCTAssertEqual(state.statusText(hasHiddenEarlierRows: false), "1 of 2")
+    }
+
+    func testPagedTranscriptSearchFindsOlderRowsWithoutDiscardingReadingAnchor() async throws {
+        var rows = Self.messageRows(count: 500)
+        rows[0] = .message(id: "oldest", text: "the buried needle")
+        let conversation = makeConversation()
+        conversation.seedRowsForTesting(rows)
+        let readingAnchor = try XCTUnwrap(conversation.visibleRows.first?.id)
+        var search = AcpTranscriptSearchState()
+        search.updateQuery("needle", rows: conversation.visibleRows)
+        XCTAssertEqual(search.matchCount, 0)
+        XCTAssertEqual(search.statusText(hasHiddenEarlierRows: true), "No matches loaded")
+
+        while search.matchCount == 0, conversation.hiddenEarlierCount > 0 {
+            await conversation.expandEarlier()
+            search.refresh(rows: conversation.visibleRows)
+            XCTAssertTrue(
+                conversation.visibleRows.contains(where: { $0.id == readingAnchor }),
+                "prepending a search page must keep the prior reading anchor addressable"
+            )
+        }
+
+        XCTAssertEqual(search.matchCount, 1)
+        XCTAssertNil(search.currentRowID, "fetching older matches does not move the viewport")
+        XCTAssertEqual(search.move(.next), "msg-oldest")
+    }
+
+    func testTranscriptSearchIsBoundedAndDismissalRetainsNoActiveMatch() {
+        let text = Array(repeating: "needle", count: AcpTranscriptSearchIndex.maximumMatches + 10)
+            .joined(separator: " ")
+        var state = AcpTranscriptSearchState()
+        state.present()
+        state.updateQuery("needle", rows: [.message(id: "many", text: text)])
+
+        XCTAssertEqual(state.matchCount, AcpTranscriptSearchIndex.maximumMatches)
+        XCTAssertTrue(state.hasAdditionalMatches)
+        XCTAssertEqual(
+            state.statusText(hasHiddenEarlierRows: false),
+            "\(AcpTranscriptSearchIndex.maximumMatches)+ matches"
+        )
+        XCTAssertEqual(state.move(.next), "msg-many")
+
+        state.dismiss()
+        XCTAssertFalse(state.isPresented)
+        XCTAssertNil(state.currentRowID)
+        XCTAssertEqual(state.query, "needle", "reopening Find should retain the last query")
+    }
+
     /// Chunks after the first are held for `chunkFlushInterval` and published
     /// together, so this flushes rather than reading mid-buffer. The accumulated
     /// result is unchanged — one row, one growing string.

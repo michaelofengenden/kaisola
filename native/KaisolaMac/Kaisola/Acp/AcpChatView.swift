@@ -155,6 +155,7 @@ struct AcpChatView: View {
         // Key the startup work to the object so a new session never flashes or
         // saves the preceding session's draft.
         .task(id: ObjectIdentifier(conversation)) {
+            transcriptSearch = AcpTranscriptSearchState()
             draft = conversation.loadDraft()
             await conversation.start()
         }
@@ -164,6 +165,9 @@ struct AcpChatView: View {
         .onAppear { applyFocusRequest(focusRequestGeneration) }
         .onChange(of: focusRequestGeneration) { _, request in
             applyFocusRequest(request)
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .kaisolaTranscriptFindCommand)) { notification in
+            handleTranscriptFindCommand(notification)
         }
     }
 
@@ -272,6 +276,16 @@ struct AcpChatView: View {
     }
 
     private var transcript: some View {
+        VStack(spacing: 0) {
+            if transcriptSearch.isPresented {
+                transcriptSearchBar
+                Divider()
+            }
+            transcriptScrollView
+        }
+    }
+
+    private var transcriptScrollView: some View {
         ScrollViewReader { proxy in
             ZStack(alignment: .bottomTrailing) {
                 ScrollView {
@@ -286,26 +300,7 @@ struct AcpChatView: View {
                             .frame(maxWidth: .infinity)
                             .padding(.vertical, 6)
                             .onAppear {
-                                guard transcriptIsReady,
-                                      transcriptConversationID == ObjectIdentifier(conversation),
-                                      !loadingEarlierRows,
-                                      let anchor = conversation.visibleRows.first?.id else { return }
-                                loadingEarlierRows = true
-                                Task { @MainActor in
-                                    await conversation.expandEarlier()
-                                    guard transcriptConversationID == ObjectIdentifier(conversation) else {
-                                        loadingEarlierRows = false
-                                        return
-                                    }
-                                    // Expanding prepends rows. Restore the formerly
-                                    // first visible row so the viewport does not jump,
-                                    // while retaining active trackpad velocity on
-                                    // macOS 15 and newer.
-                                    TerminalTranscriptScrollPolicy.preserveUserVelocity {
-                                        proxy.scrollTo(anchor, anchor: .top)
-                                    }
-                                    loadingEarlierRows = false
-                                }
+                                loadEarlierRows(using: proxy)
                             }
                         } else if transcriptIsReady, !conversation.rows.isEmpty {
                             Label("Beginning of session", systemImage: "checkmark.circle")
@@ -328,6 +323,13 @@ struct AcpChatView: View {
                                 terminalSnapshot: { [weak conversation] id in await conversation?.terminalSnapshot(id) }
                             )
                             .id(row.id)
+                            .background {
+                                if transcriptSearch.currentRowID == row.id {
+                                    RoundedRectangle(cornerRadius: 8)
+                                        .fill(Color.accentColor.opacity(0.12))
+                                        .accessibilityHidden(true)
+                                }
+                            }
                         }
                         Color.clear
                             .frame(height: 1)
@@ -364,6 +366,7 @@ struct AcpChatView: View {
             }
             .onAppear {
                 transcriptConversationID = ObjectIdentifier(conversation)
+                transcriptSearch.refresh(rows: conversation.visibleRows)
                 transcriptIsReady = false
                 transcriptIsAtBottom = true
                 hasUnseenTranscriptUpdates = false
@@ -373,6 +376,7 @@ struct AcpChatView: View {
                 }
             }
             .onChange(of: conversation.contentVersion) { _, newVersion in
+                transcriptSearch.refresh(rows: conversation.visibleRows)
                 guard transcriptIsReady,
                       conversation.lastHistoryInsertionContentVersion != newVersion else { return }
                 if transcriptIsAtBottom {
@@ -391,8 +395,158 @@ struct AcpChatView: View {
                     hasUnseenTranscriptUpdates = true
                 }
             }
+            .onChange(of: searchNavigationRequest) { _, request in
+                guard let request,
+                      let rowID = transcriptSearch.move(request.direction) else { return }
+                TerminalTranscriptScrollPolicy.preserveUserVelocity {
+                    proxy.scrollTo(rowID, anchor: .center)
+                }
+            }
+            .onChange(of: searchPageRequestGeneration) { _, _ in
+                loadEarlierRows(using: proxy)
+            }
         }
         .id(ObjectIdentifier(conversation))
+    }
+
+    @State private var transcriptSearch = AcpTranscriptSearchState()
+    @State private var searchNavigationGeneration: UInt64 = 0
+    @State private var searchNavigationRequest: AcpTranscriptSearchNavigationRequest?
+    @State private var searchPageRequestGeneration: UInt64 = 0
+    @FocusState private var transcriptSearchFocused: Bool
+
+    private var transcriptSearchBar: some View {
+        HStack(spacing: 8) {
+            Image(systemName: "magnifyingglass")
+                .foregroundStyle(.secondary)
+                .accessibilityHidden(true)
+            TextField(
+                "Find in conversation",
+                text: Binding(
+                    get: { transcriptSearch.query },
+                    set: { transcriptSearch.updateQuery($0, rows: conversation.visibleRows) }
+                )
+            )
+            .textFieldStyle(.roundedBorder)
+            .focused($transcriptSearchFocused)
+            .onSubmit { requestTranscriptSearchNavigation(.next) }
+            .accessibilityIdentifier("acp.transcript.search.field")
+            .accessibilityHint("Searches the loaded transcript without moving your reading position")
+
+            Text(transcriptSearch.statusText(hasHiddenEarlierRows: conversation.hiddenEarlierCount > 0))
+                .font(.caption.monospacedDigit())
+                .foregroundStyle(.kaisolaSecondary)
+                .fixedSize()
+                .accessibilityIdentifier("acp.transcript.search.status")
+
+            if conversation.hiddenEarlierCount > 0, !transcriptSearch.query.isEmpty {
+                Button {
+                    searchPageRequestGeneration &+= 1
+                } label: {
+                    Label("Search earlier", systemImage: "arrow.up.to.line")
+                        .labelStyle(.iconOnly)
+                }
+                .disabled(loadingEarlierRows)
+                .help("Load an earlier transcript page and include it in search")
+                .accessibilityLabel("Search earlier messages")
+                .accessibilityHint("Loads older messages without moving the current reading position")
+                .accessibilityIdentifier("acp.transcript.search.earlier")
+            }
+
+            Button { requestTranscriptSearchNavigation(.previous) } label: {
+                Image(systemName: "chevron.up")
+            }
+            .disabled(transcriptSearch.matches.isEmpty)
+            .help("Previous match")
+            .accessibilityLabel("Previous transcript match")
+            .accessibilityIdentifier("acp.transcript.search.previous")
+
+            Button { requestTranscriptSearchNavigation(.next) } label: {
+                Image(systemName: "chevron.down")
+            }
+            .disabled(transcriptSearch.matches.isEmpty)
+            .help("Next match")
+            .accessibilityLabel("Next transcript match")
+            .accessibilityIdentifier("acp.transcript.search.next")
+
+            Button { dismissTranscriptSearch() } label: {
+                Image(systemName: "xmark")
+            }
+            .help("Close Find")
+            .accessibilityLabel("Close transcript search")
+            .accessibilityIdentifier("acp.transcript.search.close")
+        }
+        .buttonStyle(.borderless)
+        .controlSize(.small)
+        .padding(.horizontal, 12)
+        .padding(.vertical, 7)
+        .background(Color(nsColor: .controlBackgroundColor).opacity(0.55))
+        .onExitCommand { dismissTranscriptSearch() }
+        .onChange(of: transcriptSearchFocused) { _, isFocused in
+            if isFocused { onKeyboardFocus?() }
+        }
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel("Find in ACP transcript")
+        .accessibilityIdentifier("acp.transcript.search")
+    }
+
+    private func handleTranscriptFindCommand(_ notification: Notification) {
+        guard let source = notification.object as? AcpConversation,
+              source === conversation,
+              let rawValue = notification.userInfo?[AcpTranscriptFindCommand.notificationActionKey] as? Int,
+              let command = AcpTranscriptFindCommand(rawValue: rawValue) else { return }
+        switch command {
+        case .show, .useSelection:
+            presentTranscriptSearch()
+        case .next:
+            requestTranscriptSearchNavigation(.next)
+        case .previous:
+            requestTranscriptSearchNavigation(.previous)
+        }
+    }
+
+    private func presentTranscriptSearch() {
+        transcriptSearch.present()
+        transcriptSearch.refresh(rows: conversation.visibleRows)
+        composerFocused = false
+        DispatchQueue.main.async { transcriptSearchFocused = true }
+    }
+
+    private func dismissTranscriptSearch() {
+        transcriptSearch.dismiss()
+        transcriptSearchFocused = false
+    }
+
+    private func requestTranscriptSearchNavigation(_ direction: AcpTranscriptSearchDirection) {
+        if !transcriptSearch.isPresented { presentTranscriptSearch() }
+        searchNavigationGeneration &+= 1
+        searchNavigationRequest = AcpTranscriptSearchNavigationRequest(
+            generation: searchNavigationGeneration,
+            direction: direction
+        )
+    }
+
+    private func loadEarlierRows(using proxy: ScrollViewProxy) {
+        guard transcriptIsReady,
+              transcriptConversationID == ObjectIdentifier(conversation),
+              !loadingEarlierRows,
+              conversation.hiddenEarlierCount > 0,
+              let anchor = conversation.visibleRows.first?.id else { return }
+        loadingEarlierRows = true
+        Task { @MainActor in
+            await conversation.expandEarlier()
+            guard transcriptConversationID == ObjectIdentifier(conversation) else {
+                loadingEarlierRows = false
+                return
+            }
+            transcriptSearch.refresh(rows: conversation.visibleRows)
+            // Expanding prepends rows. Restore the formerly first visible row
+            // so paging for history or search never jumps the reading anchor.
+            TerminalTranscriptScrollPolicy.preserveUserVelocity {
+                proxy.scrollTo(anchor, anchor: .top)
+            }
+            loadingEarlierRows = false
+        }
     }
 
     /// Slash commands matching the draft's leading "/query", ranked by FuzzyMatch.

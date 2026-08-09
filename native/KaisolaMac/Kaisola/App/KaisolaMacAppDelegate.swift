@@ -54,6 +54,73 @@ private let catalogSmokeTimeoutSignalHandler: @convention(c) (Int32) -> Void = {
     Darwin._exit(124)
 }
 
+/// The visible workspace surface that owns Edit > Find. AppKit's ordinary
+/// responder chain is retained for real file editors, but a hidden retained
+/// editor cannot outrank the pane the workspace model says is focused.
+enum WorkspaceFindSurfaceTarget: Equatable {
+    case nativeFileResponder
+    case chat(String)
+    case terminal(String)
+    case responderChain
+}
+
+@MainActor
+enum WorkspaceFindSurfaceResolver {
+    private static let fileAccessibilityLabels: Set<String> = [
+        "File contents",
+        "Markdown document",
+        "Source editor",
+    ]
+
+    static func resolve(
+        focusedPaneID: String?,
+        chatIDs: Set<String>,
+        terminalIDs: Set<String>,
+        hasVisibleFileResponder: Bool
+    ) -> WorkspaceFindSurfaceTarget {
+        if hasVisibleFileResponder { return .nativeFileResponder }
+        guard let focusedPaneID else { return .responderChain }
+        if chatIDs.contains(focusedPaneID) { return .chat(focusedPaneID) }
+        if terminalIDs.contains(focusedPaneID) { return .terminal(focusedPaneID) }
+        return .responderChain
+    }
+
+    /// A file editor has to be mounted, visible through every ancestor, and in
+    /// the target window. The labels are the existing inspectable contracts of
+    /// the TextKit readers/editors and the networkless CodeMirror web view.
+    static func isVisibleFileResponder(_ responder: NSResponder?, in window: NSWindow?) -> Bool {
+        guard let window, let view = responder as? NSView, view.window === window else {
+            return false
+        }
+        var isFileSurface = false
+        var candidate: NSView? = view
+        while let current = candidate {
+            guard !current.isHidden else { return false }
+            if current is MarkdownNativeTextView { isFileSurface = true }
+            if let label = current.accessibilityLabel(), fileAccessibilityLabels.contains(label) {
+                isFileSurface = true
+            }
+            candidate = current.superview
+        }
+        return isFileSurface
+    }
+
+    static func isFindBarResponder(_ responder: NSResponder?, in window: NSWindow?) -> Bool {
+        guard let window, let view = responder as? NSView, view.window === window else {
+            return false
+        }
+        var belongsToFindBar = false
+        var candidate: NSView? = view
+        while let current = candidate {
+            guard !current.isHidden else { return false }
+            let name = String(describing: type(of: current)).lowercased()
+            if name.contains("find") && name.contains("bar") { belongsToFindBar = true }
+            candidate = current.superview
+        }
+        return belongsToFindBar
+    }
+}
+
 private let catalogSmokeInputTimeoutSignalHandler: @convention(c) (Int32) -> Void = { _ in
     "KAISOLA_NATIVE_CATALOG_SMOKE=INPUT_TIMEOUT\n".withCString { pointer in
         _ = Darwin.write(STDOUT_FILENO, pointer, 43)
@@ -770,6 +837,10 @@ final class KaisolaMacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDele
     // observer connection — the broker's coexistence contract makes concurrent
     // observers safe. Keyed by the NSWindow so menu actions target the key one.
     private var windowModels: [ObjectIdentifier: AppModel] = [:]
+    /// Remembers which native find bar a window just opened. AppKit moves first
+    /// responder into the find field, whose private view is no longer a child
+    /// of the document text view, so Command-G needs this scoped continuation.
+    private var lastWorkspaceFindTargets: [ObjectIdentifier: WorkspaceFindSurfaceTarget] = [:]
     /// The last actual project window remains the Settings target while the
     /// standalone Settings window itself is key.
     private weak var lastWorkspaceWindow: NSWindow?
@@ -3345,6 +3416,60 @@ final class KaisolaMacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDele
         )
     }
 
+    /// Route Find from the visible workspace owner rather than trusting a
+    /// retained hidden AppKit editor. File editors keep their native find bar,
+    /// terminals keep SwiftTerm's bounded scrollback search, and ACP chats get
+    /// a pane-scoped notification consumed only by that conversation view.
+    @objc func routeWorkspaceFind(_ sender: Any?) {
+        guard let item = sender as? NSMenuItem,
+              let model = keyModel(),
+              let window = commandWindow(for: model) else { return }
+        let windowID = ObjectIdentifier(window)
+        let target: WorkspaceFindSurfaceTarget
+        if WorkspaceFindSurfaceResolver.isFindBarResponder(window.firstResponder, in: window),
+           let continuing = lastWorkspaceFindTargets[windowID] {
+            target = continuing
+        } else {
+            target = WorkspaceFindSurfaceResolver.resolve(
+                focusedPaneID: model.focusedPaneID,
+                chatIDs: Set(model.chats.map(\.id)),
+                terminalIDs: Set(model.sessions.map(\.id)),
+                hasVisibleFileResponder: WorkspaceFindSurfaceResolver.isVisibleFileResponder(
+                    window.firstResponder,
+                    in: window
+                )
+            )
+        }
+
+        let nativeAction = #selector(NSTextView.performFindPanelAction(_:))
+        switch target {
+        case .nativeFileResponder:
+            _ = window.firstResponder?.tryToPerform(nativeAction, with: item)
+            lastWorkspaceFindTargets[windowID] = target
+        case let .chat(id):
+            guard let conversation = model.chats.first(where: { $0.id == id })?.conversation else {
+                return
+            }
+            NotificationCenter.default.post(
+                name: .kaisolaTranscriptFindCommand,
+                object: conversation,
+                userInfo: [AcpTranscriptFindCommand.notificationActionKey: item.tag]
+            )
+            lastWorkspaceFindTargets[windowID] = target
+        case let .terminal(id):
+            guard let root = window.contentView,
+                  let terminal = TerminalFocusResolver.terminal(in: root, paneID: id) else { return }
+            if window.firstResponder !== terminal {
+                _ = window.makeFirstResponder(terminal)
+            }
+            _ = terminal.tryToPerform(nativeAction, with: item)
+            lastWorkspaceFindTargets[windowID] = target
+        case .responderChain:
+            _ = window.firstResponder?.tryToPerform(nativeAction, with: item)
+            lastWorkspaceFindTargets[windowID] = nil
+        }
+    }
+
     var commandCanCheckForUpdates: Bool { updateController.availability.canCheck }
     var commandUpdateDetail: String? { updateController.availability.detail }
 
@@ -4063,6 +4188,7 @@ final class KaisolaMacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDele
             return
         }
         let id = ObjectIdentifier(window)
+        lastWorkspaceFindTargets.removeValue(forKey: id)
         let model = windowModels.removeValue(forKey: id)
         if window === lastWorkspaceWindow { lastWorkspaceWindow = nil }
         if settingsWorkspaceModelID == id {
@@ -4487,6 +4613,8 @@ final class KaisolaMacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDele
             commandTarget: self,
             commandAction: #selector(runRegisteredCommand(_:)),
             keymap: AppCommandKeymapCenter.shared.snapshot,
+            findTarget: self,
+            findAction: #selector(routeWorkspaceFind(_:)),
             dynamicMenusDelegate: self,
             saveWindowTarget: self,
             saveWindowAction: #selector(saveWindowLayout(_:)),
@@ -4508,6 +4636,8 @@ final class KaisolaMacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDele
         commandTarget: AnyObject? = nil,
         commandAction: Selector? = nil,
         keymap: AppCommandKeymapSnapshot? = nil,
+        findTarget: AnyObject? = nil,
+        findAction: Selector? = nil,
         newWindowTarget: AnyObject? = nil,
         newWindowAction: Selector? = nil,
         openFolderTarget: AnyObject? = nil,
@@ -4771,15 +4901,19 @@ final class KaisolaMacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDele
         editMenu.addItem(withTitle: "Select All", action: #selector(NSText.selectAll(_:)), keyEquivalent: "a")
         editMenu.addItem(.separator())
 
-        let findAction = #selector(NSTextView.performFindPanelAction(_:))
-        let find = editMenu.addItem(withTitle: "Find…", action: findAction, keyEquivalent: "f")
+        let effectiveFindAction = findAction ?? #selector(NSTextView.performFindPanelAction(_:))
+        let find = editMenu.addItem(withTitle: "Find…", action: effectiveFindAction, keyEquivalent: "f")
+        find.target = findTarget
         find.tag = Int(NSFindPanelAction.showFindPanel.rawValue)
-        let findNext = editMenu.addItem(withTitle: "Find Next", action: findAction, keyEquivalent: "g")
+        let findNext = editMenu.addItem(withTitle: "Find Next", action: effectiveFindAction, keyEquivalent: "g")
+        findNext.target = findTarget
         findNext.tag = Int(NSFindPanelAction.next.rawValue)
-        let findPrevious = editMenu.addItem(withTitle: "Find Previous", action: findAction, keyEquivalent: "G")
+        let findPrevious = editMenu.addItem(withTitle: "Find Previous", action: effectiveFindAction, keyEquivalent: "G")
+        findPrevious.target = findTarget
         findPrevious.keyEquivalentModifierMask = [.command, .shift]
         findPrevious.tag = Int(NSFindPanelAction.previous.rawValue)
-        let useSelection = editMenu.addItem(withTitle: "Use Selection for Find", action: findAction, keyEquivalent: "e")
+        let useSelection = editMenu.addItem(withTitle: "Use Selection for Find", action: effectiveFindAction, keyEquivalent: "e")
+        useSelection.target = findTarget
         useSelection.tag = Int(NSFindPanelAction.setFindString.rawValue)
 
         editItem.submenu = editMenu

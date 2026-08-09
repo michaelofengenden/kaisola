@@ -235,6 +235,74 @@ private struct FilePreviewRevertConfirmationModifier: ViewModifier {
     }
 }
 
+struct FilePreviewTabOverflowPresentation {
+    struct Entry: Identifiable {
+        let tab: AppModel.FileWorkbenchTab
+        let title: String
+        let isSelected: Bool
+        let isModified: Bool
+
+        var id: URL { url }
+        var url: URL { tab.url.standardizedFileURL }
+
+        var accessibilityLabel: String {
+            var details = [title]
+            if isSelected { details.append("selected") }
+            details.append(tab.isPinned ? "kept open" : "preview")
+            if isModified { details.append("modified") }
+            return details.joined(separator: ", ")
+        }
+    }
+
+    static let accessibilityIdentifier = "preview.allDocuments"
+
+    let entries: [Entry]
+    let selectedScrollTarget: URL?
+
+    init(
+        tabs: [AppModel.FileWorkbenchTab],
+        selectedURL: URL,
+        workspaceRoot: URL?,
+        loadedURL: URL?,
+        isDirty: Bool
+    ) {
+        let normalizedSelection = selectedURL.standardizedFileURL
+        entries = tabs.map { tab in
+            let normalizedURL = tab.url.standardizedFileURL
+            return Entry(
+                tab: tab,
+                title: FilePreviewTabPolicy.displayTitle(
+                    for: tab,
+                    among: tabs,
+                    workspaceRoot: workspaceRoot
+                ),
+                isSelected: normalizedURL == normalizedSelection,
+                isModified: FilePreviewTabPolicy.isModified(
+                    tab,
+                    loadedURL: loadedURL,
+                    isDirty: isDirty
+                )
+            )
+        }
+        selectedScrollTarget = entries.contains { $0.url == normalizedSelection }
+            ? normalizedSelection
+            : nil
+    }
+
+    var label: String { "All Documents" }
+
+    var value: String {
+        guard let selected = entries.first(where: \.isSelected) else {
+            return "\(entries.count) open"
+        }
+        return "\(entries.count) open, \(selected.title) selected"
+    }
+
+    static func visibleTitle(openDocumentCount: Int) -> String {
+        "All \(openDocumentCount)"
+    }
+}
+
 struct FilePreviewEditorControlAccessibility: Equatable {
     enum Kind: Equatable {
         case markdown
@@ -1010,6 +1078,13 @@ struct FilePreviewView: View {
                 .truncationMode(.middle)
             Spacer()
         } else {
+            let presentation = FilePreviewTabOverflowPresentation(
+                tabs: tabs,
+                selectedURL: url,
+                workspaceRoot: workspaceRoot,
+                loadedURL: loadedURL,
+                isDirty: isDirty
+            )
             ScrollViewReader { tabScroll in
                 ScrollView(.horizontal, showsIndicators: false) {
                     HStack(spacing: 4) {
@@ -1117,17 +1192,63 @@ struct FilePreviewView: View {
                     }
                 }
                 .onAppear {
-                    tabScroll.scrollTo(url.standardizedFileURL, anchor: .center)
-                }
-                .onChange(of: url.standardizedFileURL) { _, selectedURL in
-                    withAnimation(.easeOut(duration: 0.16)) {
+                    if let selectedURL = presentation.selectedScrollTarget {
                         tabScroll.scrollTo(selectedURL, anchor: .center)
+                    }
+                }
+                .onChange(of: presentation.selectedScrollTarget) { _, selectedURL in
+                    if let selectedURL {
+                        withAnimation(.easeOut(duration: 0.16)) {
+                            tabScroll.scrollTo(selectedURL, anchor: .center)
+                        }
                     }
                 }
                 .scrollBounceBehavior(.basedOnSize)
                 .frame(maxWidth: .infinity, alignment: .leading)
             }
+            allDocumentsMenu(presentation)
         }
+    }
+
+    private func allDocumentsMenu(
+        _ presentation: FilePreviewTabOverflowPresentation
+    ) -> some View {
+        Menu {
+            ForEach(presentation.entries) { entry in
+                Button {
+                    selectTab(entry.url)
+                } label: {
+                    Label(
+                        entry.title,
+                        systemImage: entry.isSelected ? "checkmark" : "doc"
+                    )
+                }
+                .accessibilityLabel(entry.accessibilityLabel)
+            }
+            Divider()
+            Button("Reopen Closed Tab") {
+                reopenClosedTab()
+            }
+            .disabled(!canReopenClosedTab)
+        } label: {
+            HStack(spacing: 3) {
+                Image(systemName: "rectangle.stack")
+                Text(
+                    FilePreviewTabOverflowPresentation.visibleTitle(
+                        openDocumentCount: presentation.entries.count
+                    )
+                )
+                .font(.caption2.monospacedDigit())
+            }
+        }
+        .menuStyle(.borderlessButton)
+        .menuIndicator(.hidden)
+        .fixedSize()
+        .help("All Documents")
+        .accessibilityLabel(presentation.label)
+        .accessibilityValue(presentation.value)
+        .accessibilityHint("Shows every open document")
+        .accessibilityIdentifier(FilePreviewTabOverflowPresentation.accessibilityIdentifier)
     }
 
     private func editModeButton(

@@ -8,6 +8,60 @@ import XCTest
 /// ProjectFiles (tree listing + bounded enumeration) and FilePreviewContent
 /// (what a file renders as) — the workspace rail's foundations.
 final class WorkspaceFilesTests: XCTestCase {
+    func testAllDocumentsPresentationKeepsEveryTabReachableInSourceOrder() {
+        let project = URL(fileURLWithPath: "/tmp/Overflow project", isDirectory: true)
+        let first = AppModel.FileWorkbenchTab(
+            url: project.appendingPathComponent("README.md"),
+            isPinned: true,
+            line: nil
+        )
+        let selected = AppModel.FileWorkbenchTab(
+            url: project.appendingPathComponent("Sources/main.swift"),
+            isPinned: false,
+            line: nil
+        )
+        let last = AppModel.FileWorkbenchTab(
+            url: project.appendingPathComponent("Tests/main.swift"),
+            isPinned: true,
+            line: nil
+        )
+
+        let presentation = FilePreviewTabOverflowPresentation(
+            tabs: [first, selected, last],
+            selectedURL: selected.url,
+            workspaceRoot: project,
+            loadedURL: selected.url,
+            isDirty: true
+        )
+
+        XCTAssertEqual(presentation.label, "All Documents")
+        XCTAssertEqual(presentation.value, "3 open, main.swift — Sources selected")
+        XCTAssertEqual(presentation.selectedScrollTarget, selected.url.standardizedFileURL)
+        XCTAssertEqual(
+            presentation.entries.map(\.url),
+            [first.url, selected.url, last.url].map(\.standardizedFileURL)
+        )
+        XCTAssertEqual(
+            presentation.entries.map(\.accessibilityLabel),
+            [
+                "README.md, kept open",
+                "main.swift — Sources, selected, preview, modified",
+                "main.swift — Tests, kept open",
+            ]
+        )
+    }
+
+    func testAllDocumentsPresentationHasAStableKeyboardAndVoiceOverTarget() {
+        XCTAssertEqual(
+            FilePreviewTabOverflowPresentation.accessibilityIdentifier,
+            "preview.allDocuments"
+        )
+        XCTAssertEqual(
+            FilePreviewTabOverflowPresentation.visibleTitle(openDocumentCount: 12),
+            "All 12"
+        )
+    }
+
     func testEditorModeControlsSpeakTheirActionAndCurrentToggleValue() {
         let cases: [(FilePreviewEditorControlAccessibility.Kind, Bool, String, String)] = [
             (.markdown, false, "Edit Markdown source", "Markdown preview shown"),

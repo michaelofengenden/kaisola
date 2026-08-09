@@ -134,6 +134,100 @@ final class AcpClientTests: XCTestCase {
         XCTAssertEqual(conversation.pendingPermission?.title, "First")
     }
 
+    @MainActor
+    func testPermissionCountOverflowReturnsExactRejectOnceResponse() async throws {
+        let transport = ScriptedAcpTransport()
+        let conversation = AcpConversation(
+            title: "Permission bounds", command: "mock", arguments: [], environment: [:],
+            cwd: "/tmp", client: AcpClient(transport: transport)
+        )
+        await conversation.start()
+        for id in 1...AcpConversation.maximumOutstandingPermissionCount {
+            await transport.emitPermission(wireID: Int64(id), title: "Accepted \(id)")
+        }
+        try await Self.until("the bounded permission queue filled") {
+            conversation.pendingPermissionCount == AcpConversation.maximumOutstandingPermissionCount
+        }
+
+        let overflowWireID: Int64 = 9_999
+        await transport.emitPermission(wireID: overflowWireID, title: "Overflow")
+        try await Self.until("the overflow denial reached the adapter") {
+            await transport.permissionResponse(for: overflowWireID) != nil
+        }
+
+        let response = await transport.permissionResponse(for: overflowWireID)
+        XCTAssertEqual(response?.objectValue?["outcome"], .object([
+            "outcome": .string("selected"),
+            "optionId": .string("reject"),
+        ]))
+        XCTAssertEqual(
+            conversation.pendingPermissionCount,
+            AcpConversation.maximumOutstandingPermissionCount
+        )
+        XCTAssertTrue(conversation.rows.contains { row in
+            guard case let .permissionDecision(_, text) = row else { return false }
+            return text.contains("Overflow") && text.contains("denied automatically")
+        })
+        _ = await conversation.stop()
+    }
+
+    @MainActor
+    func testExpiredPermissionReturnsRejectOnceResponseAndTimelineEvent() async throws {
+        let transport = ScriptedAcpTransport()
+        let conversation = AcpConversation(
+            title: "Permission expiry", command: "mock", arguments: [], environment: [:],
+            cwd: "/tmp", client: AcpClient(transport: transport)
+        )
+        await conversation.start()
+        let wireID: Int64 = 8_888
+        await transport.emitPermission(wireID: wireID, title: "Stale operation")
+        try await Self.until("the permission surfaced") {
+            conversation.pendingPermission != nil
+        }
+
+        conversation.expirePermissionsForTesting(
+            at: Date().addingTimeInterval(AcpConversation.permissionPromptLifetime + 1)
+        )
+        try await Self.until("the expiry denial reached the adapter") {
+            await transport.permissionResponse(for: wireID) != nil
+        }
+
+        let response = await transport.permissionResponse(for: wireID)
+        XCTAssertEqual(response?.objectValue?["outcome"], .object([
+            "outcome": .string("selected"),
+            "optionId": .string("reject"),
+        ]))
+        XCTAssertNil(conversation.pendingPermission)
+        XCTAssertTrue(conversation.rows.contains { row in
+            guard case let .permissionDecision(_, text) = row else { return false }
+            return text.contains("Stale operation") && text.contains("expired after 5 minutes")
+        })
+
+        // An adapter without exact reject_once must receive ACP's safe,
+        // non-persistent cancelled outcome, never an opaque reject_always.
+        let cancelledWireID: Int64 = 8_889
+        await transport.emitPermission(
+            wireID: cancelledWireID,
+            title: "No one-time reject",
+            includeRejectOnce: false
+        )
+        try await Self.until("the fallback permission surfaced") {
+            conversation.pendingPermission != nil
+        }
+        conversation.expirePermissionsForTesting(
+            at: Date().addingTimeInterval(AcpConversation.permissionPromptLifetime + 1)
+        )
+        try await Self.until("the cancelled expiry reached the adapter") {
+            await transport.permissionResponse(for: cancelledWireID) != nil
+        }
+        let cancelled = await transport.permissionResponse(for: cancelledWireID)
+        XCTAssertEqual(
+            cancelled?.objectValue?["outcome"],
+            .object(["outcome": .string("cancelled")])
+        )
+        _ = await conversation.stop()
+    }
+
     func testSteeringCapabilityIsReadFromTheResponsesOwnMeta() {
         // Both adapters advertise steering on the InitializeResponse's own
         // `_meta`, a SIBLING of `agentCapabilities`. Reading it from inside the
@@ -490,6 +584,20 @@ final class AcpClientTests: XCTestCase {
         }
     }
 
+    /// Async variant for actor-backed transport receipts.
+    @MainActor
+    private static func until(
+        _ description: String,
+        timeout: TimeInterval = 10,
+        _ condition: () async -> Bool
+    ) async throws {
+        let deadline = Date().addingTimeInterval(timeout)
+        while !(await condition()) {
+            if Date() > deadline { return XCTFail("timed out waiting for \(description)") }
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+    }
+
     @MainActor
     func testConversationStopReturnsFinalDebouncedDraft() async {
         let key = "stop-draft-\(UUID().uuidString)"
@@ -805,6 +913,7 @@ private actor ScriptedAcpTransport: AcpByteTransport {
     private var sessionMethods: [String] = []
     private var promptTexts: [String] = []
     private var steerRequests: [JSONValue] = []
+    private var permissionResponses: [Int64: JSONValue] = [:]
     private var didCrashPrompt = false
     private var recordedExitCode: Int32 = 0
     private var terminations = 0
@@ -840,7 +949,46 @@ private actor ScriptedAcpTransport: AcpByteTransport {
     func receivedSessionMethods() -> [String] { sessionMethods }
     func receivedPromptTexts() -> [String] { promptTexts }
     func receivedSteerRequests() -> [JSONValue] { steerRequests }
+    func permissionResponse(for wireID: Int64) -> JSONValue? { permissionResponses[wireID] }
     func terminationCount() -> Int { terminations }
+
+    func emitPermission(
+        wireID: Int64,
+        title: String,
+        includeRejectOnce: Bool = true
+    ) {
+        var options: [JSONValue] = [
+            .object(["optionId": .string("allow"), "name": .string("Allow"), "kind": .string("allow_once")]),
+        ]
+        if includeRejectOnce {
+            options.append(.object([
+                "optionId": .string("reject"),
+                "name": .string("Reject"),
+                "kind": .string("reject_once"),
+            ]))
+        } else {
+            options.append(.object([
+                "optionId": .string("reject-always"),
+                "name": .string("Always reject"),
+                "kind": .string("reject_always"),
+            ]))
+        }
+        enqueue(.object([
+            "jsonrpc": .string("2.0"),
+            "id": .integer(wireID),
+            "method": .string("session/request_permission"),
+            "params": .object([
+                "sessionId": .string("sess-1"),
+                "toolCall": .object([
+                    "toolCallId": .string("permission-\(wireID)"),
+                    "title": .string(title),
+                    "kind": .string("execute"),
+                    "rawInput": .object(["command": .string("echo safe")]),
+                ]),
+                "options": .array(options),
+            ]),
+        ]))
+    }
 
     func start(command: String, arguments: [String], environment: [String: String], cwd: String) async throws {
         started = true
@@ -849,6 +997,12 @@ private actor ScriptedAcpTransport: AcpByteTransport {
     func send(_ data: Data) async throws {
         guard let object = try? JSONDecoder().decode(JSONValue.self, from: trimmed(data)).objectValue else { return }
         let id = object["id"]
+        if object["method"] == nil,
+           let wireID = id?.intValue,
+           let result = object["result"] {
+            permissionResponses[wireID] = result
+            return
+        }
         switch object["method"]?.stringValue {
         case "initialize":
             reply(id: id, result: .object([

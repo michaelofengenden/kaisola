@@ -130,7 +130,8 @@ actor AcpClient {
                 environment: environment,
                 cwd: cwd,
                 mcpServers: mcpServers,
-                resumeSessionID: resumeSessionID
+                resumeSessionID: resumeSessionID,
+                access: access
             )
             if Task.isCancelled {
                 await stop()
@@ -150,7 +151,8 @@ actor AcpClient {
         environment: [String: String],
         cwd: String,
         mcpServers: [JSONValue],
-        resumeSessionID: String?
+        resumeSessionID: String?,
+        access: AcpAdapterAccess
     ) async throws -> AcpSessionInfo {
         connectionGeneration &+= 1
         decoder = BrokerLineFrameDecoder(maximumFrameBytes: 64 * 1_024 * 1_024)

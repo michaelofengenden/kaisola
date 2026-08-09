@@ -1759,15 +1759,20 @@ private actor ScriptedAcpTransport: AcpByteTransport {
 
     func send(_ data: Data) async throws {
         guard let object = try? JSONDecoder().decode(JSONValue.self, from: trimmed(data)).objectValue else { return }
-        if object["method"] == nil, let id = object["id"]?.intValue {
-            clientResponses[id] = .object(object)
-            return
-        }
         let id = object["id"]
         if object["method"] == nil,
            let wireID = id?.intValue,
            let result = object["result"] {
+            // The containment tests inspect every client response, while the
+            // permission-bound tests also index the response result by wire
+            // ID. A permission reply belongs to both views of this scripted
+            // transport; recording the generic response must not swallow it.
+            clientResponses[wireID] = .object(object)
             permissionResponses[wireID] = result
+            return
+        }
+        if object["method"] == nil, let wireID = id?.intValue {
+            clientResponses[wireID] = .object(object)
             return
         }
         switch object["method"]?.stringValue {

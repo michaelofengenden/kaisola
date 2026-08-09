@@ -16,9 +16,11 @@ const brokerRuntimeTestFiles = Object.freeze([
   'tests/node/brokerUpgrade.test.cjs',
   'tests/node/brokerUpgradeIntegration.test.cjs',
   'tests/node/companionProtocolTables.test.cjs',
+  'tests/node/shellEnv.test.cjs',
   'tests/node/terminalCreateRoute.test.cjs',
   'tests/node/terminalManager.test.cjs',
   'tests/node/terminalSpool.test.cjs',
+  'tests/node/terminalWarning.test.cjs',
 ])
 
 function discoversBrokerRuntime(source, file) {

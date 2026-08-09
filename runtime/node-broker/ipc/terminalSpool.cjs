@@ -41,6 +41,7 @@ const META_RETRY_MAX_MS = 8000
 const META_RETRY_ATTEMPTS = 6
 const SPOOL_DELETE_RETRY_ATTEMPTS = 3
 const TRANSIENT_DELETE_CODES = new Set(['EAGAIN', 'EBUSY', 'EINTR', 'EIO', 'EMFILE', 'ENFILE'])
+const ASYNC_WRITER_MAX_MULTIPLIER = 2
 // Retained-history quotas. Interactive terminals used to be append-only with no
 // ceiling at all, so one long-lived noisy shell could fill the user's volume.
 // Two bounds now apply: how much history a single terminal may keep, and how
@@ -65,7 +66,7 @@ function safeBase(id) {
   return crypto.createHash('sha256').update(String(id)).digest('hex').slice(0, 32)
 }
 
-const { O_APPEND, O_CREAT, O_NOFOLLOW, O_NONBLOCK, O_RDONLY, O_WRONLY } = fs.constants
+const { O_APPEND, O_CREAT, O_EXCL, O_NOFOLLOW, O_NONBLOCK, O_RDONLY, O_WRONLY } = fs.constants
 
 function spoolPathRefused(code, file) {
   const error = new Error(`refusing unsafe terminal spool path ${file}`)
@@ -96,6 +97,21 @@ function openSegment(file, flags, mode) {
   }
 }
 
+async function openSegmentAsync(file, flags, mode) {
+  const handle = await fs.promises.open(file, flags | O_NOFOLLOW | O_NONBLOCK, mode)
+  try {
+    const stat = await handle.stat()
+    if (!stat.isFile()) throw spoolPathRefused('ESPOOLNOTFILE', file)
+    if (typeof process.getuid === 'function' && stat.uid !== process.getuid()) {
+      throw spoolPathRefused('ESPOOLNOTOWNED', file)
+    }
+    return handle
+  } catch (error) {
+    try { await handle.close() } catch { /* noop */ }
+    throw error
+  }
+}
+
 /** Retained size of one segment, or null when the path is absent, is a
  * symlink, or is not a regular file this uid owns. Callers treat null exactly
  * like "no retained segment", so a swapped-in link contributes neither bytes
@@ -105,6 +121,17 @@ function openSegment(file, flags, mode) {
 function segmentSize(file) {
   try {
     const stat = fs.lstatSync(file)
+    if (!stat.isFile()) return null
+    if (typeof process.getuid === 'function' && stat.uid !== process.getuid()) return null
+    return stat.size
+  } catch {
+    return null
+  }
+}
+
+async function segmentSizeAsync(file) {
+  try {
+    const stat = await fs.promises.lstat(file)
     if (!stat.isFile()) return null
     if (typeof process.getuid === 'function' && stat.uid !== process.getuid()) return null
     return stat.size
@@ -132,6 +159,25 @@ const DEC_CARRY_MAX = 48
 const DEC_CARRY_RE = /\x1b(?:\[(?:[?!][0-9;]{0,40})?)?$/
 
 const { atomicJson } = require('./brokerWire.cjs')
+let asyncAtomicSequence = 0
+
+async function atomicJsonAsync(file, value) {
+  await fs.promises.mkdir(path.dirname(file), { recursive: true, mode: 0o700 })
+  const tmp = `${file}.${process.pid}.${++asyncAtomicSequence}.async.tmp`
+  let handle
+  try {
+    handle = await fs.promises.open(tmp, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, 0o600)
+    await handle.writeFile(JSON.stringify(value), 'utf8')
+    await handle.close()
+    handle = null
+    await fs.promises.rename(tmp, file)
+    try { await fs.promises.chmod(file, 0o600) } catch { /* best effort */ }
+  } catch (error) {
+    if (handle) try { await handle.close() } catch { /* noop */ }
+    try { await fs.promises.unlink(tmp) } catch { /* absent */ }
+    throw error
+  }
+}
 
 // On-disk meta layout version. Readers treat an unknown version as "no prior
 // state" (matching projectionStore's fail-closed-to-absent behavior) so the
@@ -167,6 +213,16 @@ function normalizeTruncation(value) {
 // terminal from an orphan left behind by a closed one. Every spool is removed
 // again by close(), which terminalManager pairs with every record it drops.
 const liveSpools = new Set()
+const directorySweepTails = new Map()
+
+function serializeDirectorySweep(dir, operation) {
+  const previous = directorySweepTails.get(dir) || Promise.resolve()
+  const current = previous.catch(() => {}).then(operation)
+  directorySweepTails.set(dir, current)
+  return current.finally(() => {
+    if (directorySweepTails.get(dir) === current) directorySweepTails.delete(dir)
+  })
+}
 
 function ownerOf(file) {
   for (const spool of liveSpools) {
@@ -199,6 +255,33 @@ function recordOrphanTruncation(dir, segmentName, bytes) {
     return null
   } finally {
     if (fd != null) try { fs.closeSync(fd) } catch { /* noop */ }
+  }
+}
+
+async function recordOrphanTruncationAsync(dir, segmentName, bytes) {
+  const metaFile = path.join(dir, `${segmentName.replace(/(?:\.prev)?\.log$/, '')}.json`)
+  let handle
+  try {
+    handle = await openSegmentAsync(metaFile, O_RDONLY)
+    const meta = JSON.parse(await handle.readFile('utf8'))
+    if (!meta || (meta.v != null && meta.v !== META_VERSION)) return null
+    const at = Date.now()
+    const prior = normalizeTruncation(meta.truncation)
+    meta.truncation = {
+      evictedBytes: prior.evictedBytes + Math.max(0, Math.floor(Number(bytes) || 0)),
+      evictions: prior.evictions + 1,
+      reason: 'directory-quota',
+      firstAt: prior.firstAt ?? at,
+      lastAt: at,
+    }
+    await handle.close()
+    handle = null
+    await atomicJsonAsync(metaFile, meta)
+    return typeof meta.id === 'string' ? meta.id : null
+  } catch {
+    return null
+  } finally {
+    if (handle) try { await handle.close() } catch { /* noop */ }
   }
 }
 
@@ -556,6 +639,9 @@ class TerminalSpool {
     historyQuota = DEFAULT_HISTORY_QUOTA,
     totalHistoryQuota = DEFAULT_TOTAL_HISTORY_QUOTA,
     onQuota = null,
+    asyncWriter = false,
+    writerHooks = null,
+    onWriterBackpressure = null,
   }) {
     this.id = String(id)
     this.dir = dir
@@ -566,6 +652,11 @@ class TerminalSpool {
     this.historyQuota = normalizeQuota(historyQuota)
     this.totalHistoryQuota = normalizeQuota(totalHistoryQuota)
     this.onQuota = typeof onQuota === 'function' ? onQuota : null
+    this.asyncWriter = asyncWriter === true
+    this.writerHooks = writerHooks && typeof writerHooks === 'object' ? writerHooks : null
+    this.onWriterBackpressure = typeof onWriterBackpressure === 'function'
+      ? onWriterBackpressure
+      : null
     this.truncation = normalizeTruncation(null)
     this.quotaWarned = false
     this.directoryQuotaWarned = false
@@ -604,6 +695,18 @@ class TerminalSpool {
     this.metaRetryTimer = null
     this.metaRetries = 0
     this.closed = false
+    this.closing = false
+    this.closePromise = null
+    this.closeRemove = false
+    this.writerQueuedText = ''
+    this.writerQueuedBytes = 0
+    this.writerActiveBytes = 0
+    this.writerRunning = false
+    this.writerPaused = false
+    this.writerIdleWaiters = []
+    this.writerMaxBytes = Math.max(1, this.queueCap * ASYNC_WRITER_MAX_MULTIPLIER)
+    this.writerLowWaterBytes = Math.max(0, Math.floor(this.queueCap / 2))
+    this.writerTruncationDirty = false
     this.decModes = new Map()
     this.decCarry = ''
     const meta = TerminalSpool.readMeta(this.id, root)
@@ -662,6 +765,14 @@ class TerminalSpool {
   _queue(text) {
     if (!text) return
     if (this.retentionCap === 0) { this.truncated = true; return }
+    // Once the asynchronous writer has applied PTY backpressure, do not build
+    // a second debounce buffer outside its hard bound. Native streams may
+    // still deliver an already-buffered chunk after pause(); coalesce that
+    // chunk directly into the writer's bounded pending tail.
+    if (this.asyncWriter && this.writerPaused) {
+      this._append(text)
+      return
+    }
     this.queued.push(text)
     this.queuedLen += Buffer.byteLength(text)
     if (this.queuedLen >= this.queueCap) {
@@ -676,6 +787,14 @@ class TerminalSpool {
   }
 
   _append(text) {
+    if (this.asyncWriter) {
+      this._enqueueAsyncAppend(text)
+      return
+    }
+    this._appendSync(text)
+  }
+
+  _appendSync(text) {
     if (!text) return
     if (this.retentionCap === 0) { this.truncated = true; return }
     const recovery = this.fallbackChunks.join('')
@@ -686,7 +805,7 @@ class TerminalSpool {
       // planted link would take the append — and the 0600 chmod — to whatever
       // file it names. openSegment refuses the link and this write goes to a
       // regular file we own, or nowhere.
-      const size = this._writeSegment(payload)
+      const size = this._writeSegmentSync(payload)
       appended = true
       this.fallbackChunks = []
       this.fallbackLen = 0
@@ -719,7 +838,7 @@ class TerminalSpool {
   /** Append `payload` to the current segment through a no-follow descriptor
    * and return the segment's new size. Throws when the path is not a regular
    * file this uid owns, which `_append` reports as a disk error. */
-  _writeSegment(payload) {
+  _writeSegmentSync(payload) {
     const buffer = Buffer.from(payload, 'utf8')
     const fd = openSegment(this.file, O_WRONLY | O_APPEND | O_CREAT, 0o600)
     try {
@@ -735,6 +854,124 @@ class TerminalSpool {
     }
   }
 
+  _setWriterBackpressure(paused) {
+    if (!this.asyncWriter || this.writerPaused === paused) return
+    this.writerPaused = paused
+    try { this.onWriterBackpressure?.(paused) } catch { /* backpressure reporting cannot break output */ }
+  }
+
+  _enqueueAsyncAppend(text) {
+    if (!text || this.closed) return
+    const room = Math.max(0, this.writerMaxBytes - this.writerActiveBytes)
+    const combined = this.writerQueuedText + text
+    const combinedBytes = Buffer.byteLength(combined)
+    const retained = combinedBytes > room ? utf8Tail(combined, room) : combined
+    const retainedBytes = Buffer.byteLength(retained)
+    const droppedBytes = combinedBytes - retainedBytes
+    this.writerQueuedText = retained
+    this.writerQueuedBytes = retainedBytes
+    if (droppedBytes > 0) {
+      this._recordEviction(droppedBytes, 'writer-backpressure')
+      this.writerTruncationDirty = true
+    }
+    if (this.writerActiveBytes + this.writerQueuedBytes >= this.queueCap) {
+      this._setWriterBackpressure(true)
+    }
+    if (!this.writerRunning) queueMicrotask(() => { void this._drainAsyncWriter() })
+  }
+
+  async _drainAsyncWriter() {
+    if (this.writerRunning) return
+    this.writerRunning = true
+    try {
+      while (this.writerQueuedBytes > 0) {
+        const text = this.writerQueuedText
+        this.writerActiveBytes = this.writerQueuedBytes
+        this.writerQueuedText = ''
+        this.writerQueuedBytes = 0
+        await this._appendAsync(text)
+        this.writerActiveBytes = 0
+        if (this.writerQueuedBytes <= this.writerLowWaterBytes) this._setWriterBackpressure(false)
+      }
+      if (this.writerTruncationDirty && !this.closed) {
+        this.writerTruncationDirty = false
+        await this._writeMetaAsync()
+      }
+    } finally {
+      this.writerActiveBytes = 0
+      this.writerRunning = false
+      if (this.writerQueuedBytes > 0) {
+        queueMicrotask(() => { void this._drainAsyncWriter() })
+      } else {
+        this._setWriterBackpressure(false)
+        const idleWaiters = this.writerIdleWaiters
+        this.writerIdleWaiters = []
+        for (const resolve of idleWaiters) resolve()
+      }
+    }
+  }
+
+  whenSettled() {
+    if (this.asyncWriter && this.queuedLen > 0) this.flush()
+    if (!this.asyncWriter
+        || (!this.writerRunning && this.writerActiveBytes === 0
+          && this.writerQueuedBytes === 0 && !this.writerTruncationDirty)) return null
+    return new Promise((resolve) => this.writerIdleWaiters.push(resolve))
+  }
+
+  settled() {
+    this.flush()
+    return this.whenSettled() || Promise.resolve()
+  }
+
+  async _appendAsync(text) {
+    if (!text) return
+    if (this.retentionCap === 0) { this.truncated = true; return }
+    const recovery = this.fallbackChunks.join('')
+    const payload = recovery + text
+    let appended = false
+    try {
+      await this.writerHooks?.beforeAppend?.({ id: this.id, bytes: Buffer.byteLength(payload) })
+      const size = await this._writeSegmentAsync(payload)
+      appended = true
+      this.fallbackChunks = []
+      this.fallbackLen = 0
+      this.diskError = null
+      this.bytesSinceSweep += Buffer.byteLength(payload)
+      const budget = this.retentionCap != null ? this.diskCap : this.historyQuota
+      if (budget != null) {
+        const quotaDriven = this.retentionCap == null
+        if (quotaDriven) await this._noteQuotaPressureAsync(size, budget)
+        if (size > Math.max(1, Math.floor(budget / 2))) {
+          await this._rotateSegmentsAsync(quotaDriven)
+        }
+      }
+      await this._sweepDirectoryQuotaAsync()
+      await this.writerHooks?.afterAppend?.({ id: this.id, bytes: Buffer.byteLength(payload) })
+    } catch (error) {
+      this.diskError = String((error && error.code) || (error && error.message) || error || 'disk-write-failed')
+      this.truncated = true
+      if (!appended) this._retainFallback(text)
+    }
+  }
+
+  async _writeSegmentAsync(payload) {
+    const buffer = Buffer.from(payload, 'utf8')
+    const handle = await openSegmentAsync(this.file, O_WRONLY | O_APPEND | O_CREAT, 0o600)
+    try {
+      let written = 0
+      while (written < buffer.length) {
+        const result = await handle.write(buffer, written, buffer.length - written)
+        if (!result.bytesWritten) throw spoolPathRefused('ESPOOLNOWRITE', this.file)
+        written += result.bytesWritten
+      }
+      try { await handle.chmod(0o600) } catch { /* noop */ }
+      return (await handle.stat()).size
+    } finally {
+      try { await handle.close() } catch { /* noop */ }
+    }
+  }
+
   _emitQuota(event) {
     const payload = { id: this.id, at: Date.now(), ...event }
     this.lastQuotaEvent = payload
@@ -746,6 +983,17 @@ class TerminalSpool {
    * after an eviction so a terminal that keeps filling keeps saying so. */
   _noteQuotaPressure(currentSize, budget) {
     const retained = currentSize + (segmentSize(this.prevFile) || 0)
+    if (retained < Math.floor(budget * QUOTA_WARN_RATIO)) {
+      this.quotaWarned = false
+      return
+    }
+    if (this.quotaWarned) return
+    this.quotaWarned = true
+    this._emitQuota({ phase: 'warning', scope: 'terminal', retainedBytes: retained, quotaBytes: budget })
+  }
+
+  async _noteQuotaPressureAsync(currentSize, budget) {
+    const retained = currentSize + ((await segmentSizeAsync(this.prevFile)) || 0)
     if (retained < Math.floor(budget * QUOTA_WARN_RATIO)) {
       this.quotaWarned = false
       return
@@ -794,11 +1042,41 @@ class TerminalSpool {
     })
   }
 
+  async _rotateSegmentsAsync(quotaDriven) {
+    await this.writerHooks?.beforeRotate?.({ id: this.id, quotaDriven })
+    const priorSize = await segmentSizeAsync(this.prevFile)
+    const discarded = priorSize != null
+    const discardedBytes = priorSize || 0
+    try { await fs.promises.unlink(this.prevFile) } catch { /* first segment */ }
+    if (discardedBytes) this.epochStartOffset = Math.max(0, this.epochStartOffset - discardedBytes)
+    await fs.promises.rename(this.file, this.prevFile)
+    if (!discarded) return
+    this._recordEviction(discardedBytes, quotaDriven ? 'terminal-quota' : 'retention-cap')
+    if (!quotaDriven) return
+    await this._writeMetaAsync()
+    this._emitQuota({
+      phase: 'evicted',
+      scope: 'terminal',
+      reason: 'terminal-quota',
+      evictedBytes: discardedBytes,
+      retainedBytes: await this._retainedDiskBytesAsync(),
+    })
+  }
+
   /** A directory sweep removed this spool's cold segment out from under it. */
   _noteSegmentEvicted(bytes) {
     if (bytes) this.epochStartOffset = Math.max(0, this.epochStartOffset - bytes)
     this._recordEviction(bytes, 'directory-quota')
     this.persistMeta()
+  }
+
+  async _noteSegmentEvictedAsync(bytes) {
+    if (bytes) this.epochStartOffset = Math.max(0, this.epochStartOffset - bytes)
+    this._recordEviction(bytes, 'directory-quota')
+    // This method can be called by another terminal's directory sweep. Queue
+    // the metadata behind our own writer without waiting for it, otherwise two
+    // simultaneous sweeps could wait on one another's per-terminal writers.
+    void this.persistMeta()
   }
 
   /** Bound what every spool sharing this directory retains between them. This
@@ -841,6 +1119,7 @@ class TerminalSpool {
       if (total <= quota) break
       const owner = ownerOf(segment.file)
       if (owner && segment.file === owner.file) continue // never wipe a live tail
+      if (owner && owner !== this && owner.asyncWriter) continue
       try { fs.unlinkSync(segment.file) } catch { continue }
       total -= segment.size
       let terminalId = null
@@ -863,8 +1142,81 @@ class TerminalSpool {
     }
   }
 
+  _sweepDirectoryQuotaAsync() {
+    return serializeDirectorySweep(this.dir, () => this._sweepDirectoryQuotaAsyncSerialized())
+  }
+
+  async _sweepDirectoryQuotaAsyncSerialized() {
+    const quota = this.totalHistoryQuota
+    if (quota == null) return
+    if (this.bytesSinceSweep < Math.min(MAX_SWEEP_INTERVAL, Math.max(1, Math.floor(quota / 8)))) return
+    this.bytesSinceSweep = 0
+    const segments = []
+    let names
+    try {
+      names = await fs.promises.readdir(this.dir)
+    } catch {
+      return
+    }
+    for (const name of names) {
+      if (!name.endsWith('.log')) continue
+      const file = path.join(this.dir, name)
+      try {
+        const stat = await fs.promises.lstat(file)
+        if (stat.isFile()
+            && (typeof process.getuid !== 'function' || stat.uid === process.getuid())) {
+          segments.push({ file, name, size: stat.size, mtimeMs: stat.mtimeMs })
+        }
+      } catch { /* vanished mid-sweep */ }
+    }
+
+    let total = segments.reduce((sum, segment) => sum + segment.size, 0)
+    if (total < Math.floor(quota * QUOTA_WARN_RATIO)) this.directoryQuotaWarned = false
+    else if (!this.directoryQuotaWarned) {
+      this.directoryQuotaWarned = true
+      this._emitQuota({ phase: 'warning', scope: 'directory', retainedBytes: total, quotaBytes: quota })
+    }
+    if (total <= quota) return
+
+    segments.sort((a, b) => a.mtimeMs - b.mtimeMs)
+    for (const segment of segments) {
+      if (total <= quota) break
+      const owner = ownerOf(segment.file)
+      // Another terminal may be rotating its two segments on its own writer.
+      // Do not unlink either of its live paths from this writer: a path-only
+      // lstat/unlink pair could otherwise delete the newly rotated segment.
+      // Closed spools are still reclaimed here, while each live spool remains
+      // free to reclaim its own previous segment below.
+      if (owner && owner !== this) continue
+      if (owner && segment.file === owner.file) continue
+      try { await fs.promises.unlink(segment.file) } catch { continue }
+      total -= segment.size
+      let terminalId = null
+      if (owner) {
+        await owner._noteSegmentEvictedAsync(segment.size)
+        terminalId = owner.id
+      } else {
+        terminalId = await recordOrphanTruncationAsync(this.dir, segment.name, segment.size)
+      }
+      this._emitQuota({
+        id: terminalId,
+        phase: 'evicted',
+        scope: 'directory',
+        reason: 'directory-quota',
+        evictedBytes: segment.size,
+        retainedBytes: total,
+        quotaBytes: quota,
+        segment: segment.name,
+      })
+    }
+  }
+
   _retainedDiskBytes() {
     return (segmentSize(this.prevFile) || 0) + (segmentSize(this.file) || 0)
+  }
+
+  async _retainedDiskBytesAsync() {
+    return ((await segmentSizeAsync(this.prevFile)) || 0) + ((await segmentSizeAsync(this.file)) || 0)
   }
 
   _retainFallback(text) {
@@ -931,7 +1283,7 @@ class TerminalSpool {
   }
 
   push(data) {
-    if (!data || this.closed) return
+    if (!data || this.closed || this.closing) return
     this._trackModes(data) // input modes matter even when output is not retained
     if (this.retentionCap === 0) { this.truncated = true; return }
     // Every byte is queued exactly once regardless of renderer visibility.
@@ -962,6 +1314,11 @@ class TerminalSpool {
   persistMeta() {
     this.metaRetries = 0
     this._clearMetaRetry()
+    if (this.asyncWriter) {
+      this.flush()
+      const waiting = this.whenSettled()
+      if (waiting) return waiting.then(() => this._writeMeta())
+    }
     return this._writeMeta()
   }
 
@@ -996,6 +1353,33 @@ class TerminalSpool {
     }
   }
 
+  async _writeMetaAsync() {
+    if (this.closed) return false
+    const exitEvidence = this.exitEvidence()
+    const truncation = this.truncationEvidence()
+    try {
+      await atomicJsonAsync(this.metaFile, {
+        v: META_VERSION,
+        id: this.id,
+        viewState: this.viewState,
+        decModes: Object.fromEntries(this.decModes),
+        epochStartOffset: this.epochStartOffset,
+        ...(exitEvidence || {}),
+        ...(truncation ? { truncation } : {}),
+        touchedAt: Date.now(),
+      })
+      this.metaDirty = false
+      this.metaError = null
+      this.metaRetries = 0
+      return true
+    } catch (error) {
+      this.metaDirty = true
+      this.metaError = String((error && error.code) || (error && error.message) || error || 'meta-write-failed')
+      this._scheduleMetaRetry()
+      return false
+    }
+  }
+
   _scheduleMetaRetry() {
     if (this.metaRetryTimer || this.closed) return
     // Budget exhausted: stop spinning on a disk that is not coming back. The
@@ -1006,7 +1390,11 @@ class TerminalSpool {
     this.metaRetries += 1
     this.metaRetryTimer = setTimeout(() => {
       this.metaRetryTimer = null
-      this._writeMeta()
+      if (this.asyncWriter) {
+        const waiting = this.whenSettled()
+        if (waiting) void waiting.then(() => this._writeMeta())
+        else this._writeMeta()
+      } else this._writeMeta()
     }, delay)
     this.metaRetryTimer.unref?.()
   }
@@ -1022,6 +1410,13 @@ class TerminalSpool {
     this.flush()
     this.exitedAt = Date.now()
     this.exitStatus = status ?? null
+    const waiting = this.whenSettled()
+    if (waiting) {
+      return waiting.then(() => {
+        this.persistMeta()
+        return this.exitEvidence()
+      })
+    }
     this.persistMeta()
     return this.exitEvidence()
   }
@@ -1161,10 +1556,31 @@ class TerminalSpool {
       truncation: this.truncationEvidence(),
       metaError: this.metaError,
       metaDirty: this.metaDirty,
+      writerPendingBytes: this.writerActiveBytes + this.writerQueuedBytes + this.queuedLen,
+      writerMaxBytes: this.writerMaxBytes,
+      writerPaused: this.writerPaused,
     }
   }
 
   close({ remove = false } = {}) {
+    if (this.asyncWriter && !this.closed) {
+      this.closeRemove = this.closeRemove || remove
+      if (this.closePromise) return this.closePromise
+      this.closing = true
+      this.flush()
+      const waiting = this.whenSettled()
+      if (waiting) {
+        this.closePromise = waiting.then(() => {
+          this.closePromise = null
+          return this._closeSync({ remove: this.closeRemove })
+        })
+        return this.closePromise
+      }
+    }
+    return this._closeSync({ remove })
+  }
+
+  _closeSync({ remove = false } = {}) {
     if (this.closed) {
       return remove
         ? deleteSpoolArtifacts(this.file, this.prevFile, this.metaFile)
@@ -1178,6 +1594,7 @@ class TerminalSpool {
     // and a debounced append 750ms later would silently recreate the file
     // the user just asked to be wiped.
     this.closed = true
+    this.closing = false
     // Deregister before any unlink: from here on these segments are an orphan
     // the directory sweep may reclaim, not a live terminal's tail.
     liveSpools.delete(this)

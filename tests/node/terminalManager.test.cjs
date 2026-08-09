@@ -6,6 +6,7 @@ const crypto = require('node:crypto')
 const fs = require('node:fs')
 const os = require('node:os')
 const path = require('node:path')
+const { performance } = require('node:perf_hooks')
 const manager = require('../../runtime/node-broker/ipc/terminalManager.cjs')
 const { TerminalSpool } = require('../../runtime/node-broker/ipc/terminalSpool.cjs')
 const { DEFAULT_OBSERVER_QUEUE_BYTES } = require('../../runtime/node-broker/ipc/terminalObservers.cjs')
@@ -18,7 +19,7 @@ const {
 } = TERMINAL_GEOMETRY_LIMITS
 
 const managerSpoolDir = fs.mkdtempSync(path.join(os.tmpdir(), 'kaisola-terminal-manager-'))
-manager.configureStorage(managerSpoolDir)
+manager.configureStorage(managerSpoolDir, { asyncWrites: false })
 after(() => {
   manager.killAll()
   fs.rmSync(managerSpoolDir, { recursive: true, force: true })
@@ -528,6 +529,130 @@ test('release deletes the spool without recreating exit evidence', async () => {
   assert.equal(TerminalSpool.coldTail(id, managerSpoolDir), null)
 })
 
+test('a durable response snapshot pauses primary output until its result is ready', async (t) => {
+  manager.configureStorage(managerSpoolDir, { asyncWrites: true })
+  t.after(() => manager.configureStorage(managerSpoolDir, { asyncWrites: false }))
+  const id = 'manager-async-snapshot-response'
+  const record = manager.spawn({
+    id,
+    command: '/bin/cat',
+    args: [],
+    cwd: managerSpoolDir,
+  })
+  assert.ok(record)
+  let pauseCalls = 0
+  let resumeCalls = 0
+  const pause = record.pty.pause.bind(record.pty)
+  const resume = record.pty.resume.bind(record.pty)
+  record.pty.pause = () => { pauseCalls += 1; return pause() }
+  record.pty.resume = () => { resumeCalls += 1; return resume() }
+
+  let enterWriter
+  let releaseWriter
+  const writerEntered = new Promise((resolve) => { enterWriter = resolve })
+  const writerRelease = new Promise((resolve) => { releaseWriter = resolve })
+  record.spool.writerHooks = {
+    beforeAppend: async () => {
+      enterWriter()
+      await writerRelease
+    },
+  }
+  record.spool.push('snapshot waits for this durable tail')
+  record.spool.flush()
+  await writerEntered
+
+  const snapshot = manager.snapshot(id, { responseBarrier: true })
+  assert.equal(typeof snapshot?.then, 'function')
+  assert.equal(pauseCalls, 1)
+  assert.equal(resumeCalls, 0)
+  releaseWriter()
+  assert.equal((await snapshot).output, 'snapshot waits for this durable tail')
+  assert.equal(resumeCalls, 1)
+
+  let enterSubscriptionWriter
+  let releaseSubscriptionWriter
+  const subscriptionWriterEntered = new Promise((resolve) => { enterSubscriptionWriter = resolve })
+  const subscriptionWriterRelease = new Promise((resolve) => { releaseSubscriptionWriter = resolve })
+  record.spool.writerHooks = {
+    beforeAppend: async () => {
+      enterSubscriptionWriter()
+      await subscriptionWriterRelease
+    },
+  }
+  record.spool.push(' and this subscriber tail')
+  record.spool.flush()
+  await subscriptionWriterEntered
+  const subscription = manager.subscribe(id, 'window|observer|project', {})
+  assert.equal(typeof subscription?.then, 'function')
+  assert.equal(record.observers.stats().subscribers, 0, 'live events wait behind the initial snapshot')
+  releaseSubscriptionWriter()
+  const subscribed = await subscription
+  assert.equal(
+    subscribed.snapshot.output,
+    'snapshot waits for this durable tail and this subscriber tail',
+  )
+  assert.equal(record.observers.stats().subscribers, 1)
+  manager.unsubscribe(id, 'window|observer|project')
+  await manager.release(id)
+})
+
+test('manager controls stay responsive while an asynchronous spool writer drains', async (t) => {
+  manager.configureStorage(managerSpoolDir, { asyncWrites: true })
+  t.after(() => manager.configureStorage(managerSpoolDir, { asyncWrites: false }))
+  const id = 'manager-async-spool-control'
+  const record = manager.spawn({
+    id,
+    command: '/bin/cat',
+    args: [],
+    cwd: managerSpoolDir,
+  })
+  assert.ok(record)
+  let pauseCalls = 0
+  let resumeCalls = 0
+  const pause = record.pty.pause.bind(record.pty)
+  const resume = record.pty.resume.bind(record.pty)
+  record.pty.pause = () => { pauseCalls += 1; return pause() }
+  record.pty.resume = () => { resumeCalls += 1; return resume() }
+  record.spool.queueCap = 16
+  record.spool.writerMaxBytes = 32
+  record.spool.writerLowWaterBytes = 8
+
+  let enterWriter
+  let releaseWriter
+  const writerEntered = new Promise((resolve) => { enterWriter = resolve })
+  const writerRelease = new Promise((resolve) => { releaseWriter = resolve })
+  record.spool.writerHooks = {
+    beforeAppend: async () => {
+      enterWriter()
+      await writerRelease
+    },
+  }
+  record.spool.push('blocked storage write')
+  record.spool.flush()
+  await writerEntered
+  assert.equal(pauseCalls, 1, 'the manager pauses its PTY at the writer high-water mark')
+
+  const startedAt = performance.now()
+  assert.deepEqual(manager.resize(id, 90, 30), { ok: true })
+  assert.ok(performance.now() - startedAt < 100, 'resize must not wait for terminal storage')
+
+  const releasing = manager.release(id)
+  assert.equal(typeof releasing?.then, 'function')
+  assert.equal(manager.has(id), false, 'release revokes the live record before storage finishes')
+  let released = false
+  releasing.then(() => { released = true })
+  await new Promise((resolve) => setImmediate(resolve))
+  assert.equal(released, false, 'release receipt waits for the queued append and deletion')
+
+  releaseWriter()
+  const result = await releasing
+  assert.equal(resumeCalls, 1, 'the manager resumes its PTY after the writer drains')
+  assert.equal(result.ok, true)
+  assert.equal(result.deletion.complete, true)
+  assert.equal(TerminalSpool.readMeta(id, managerSpoolDir), null)
+  assert.equal(TerminalSpool.coldTail(id, managerSpoolDir), null)
+})
+
 test('killAll suppresses exit stamping during managed broker shutdown', async () => {
   const id = 'managed-shutdown-has-no-exit-evidence'
   const record = manager.spawn({
@@ -1008,4 +1133,42 @@ test('an exit wait accepts a bound and drops itself when the bound expires', { t
   )
   assert.equal(__test.exitWaiterCount(id), 0, 'an expired wait leaves nothing behind')
   assert.equal(manager.diagnostics().find((row) => row.id === id)?.exitWaiterCount, 0)
+})
+
+test('managed shutdown waits for each asynchronous spool writer to become durable', async () => {
+  manager.configureStorage(managerSpoolDir, { asyncWrites: true })
+  const id = 'managed-shutdown-awaits-spool'
+  const record = manager.spawn({
+    id,
+    command: '/bin/cat',
+    args: [],
+    cwd: managerSpoolDir,
+  })
+  assert.ok(record)
+
+  let enterWriter
+  let releaseWriter
+  const writerEntered = new Promise((resolve) => { enterWriter = resolve })
+  const writerRelease = new Promise((resolve) => { releaseWriter = resolve })
+  record.spool.writerHooks = {
+    beforeAppend: async () => {
+      enterWriter()
+      await writerRelease
+    },
+  }
+  record.spool.push('durable shutdown tail')
+  record.spool.flush()
+  await writerEntered
+
+  const shuttingDown = manager.killAll()
+  assert.equal(typeof shuttingDown?.then, 'function')
+  let finished = false
+  shuttingDown.then(() => { finished = true })
+  await new Promise((resolve) => setImmediate(resolve))
+  assert.equal(finished, false)
+
+  releaseWriter()
+  await shuttingDown
+  assert.equal(fs.readFileSync(record.spool.file, 'utf8'), 'durable shutdown tail')
+  assert.equal(TerminalSpool.readMeta(id, managerSpoolDir)?.id, id)
 })

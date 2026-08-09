@@ -28,7 +28,7 @@ const {
 } = TERMINAL_GEOMETRY_LIMITS
 
 const managerSpoolDir = fs.mkdtempSync(path.join(os.tmpdir(), 'kaisola-terminal-create-route-'))
-realManager.configureStorage(managerSpoolDir)
+realManager.configureStorage(managerSpoolDir, { asyncWrites: false })
 realManager.setEventSink(() => true)
 after(() => {
   realManager.killAll()
@@ -60,14 +60,21 @@ function fakeManager({ live = false, recovered = null } = {}) {
   }
 }
 
-test('terminal create route forwards restore but never returns a recovered payload', () => {
+test('terminal create route awaits asynchronous replacement and snapshot work', async () => {
   const { terminalCreateRoute } = require('../../runtime/node-broker/ipc/terminalCreateRoute.cjs')
   const manager = fakeManager({
     recovered: { text: 'retained-before-restart', truncated: true },
   })
+  const spawn = manager.spawn
+  const snapshot = manager.snapshot
+  manager.spawn = async (options) => spawn(options)
+  manager.snapshot = async (...args) => {
+    manager.snapshotArgs = args
+    return snapshot()
+  }
   const authorized = []
 
-  const response = terminalCreateRoute({
+  const response = await terminalCreateRoute({
     manager,
     params: {
       id: 'caller-supplied-terminal-id',
@@ -89,6 +96,10 @@ test('terminal create route forwards restore but never returns a recovered paylo
   assert.equal(manager.calls.length, 1)
   assert.equal(manager.calls[0].id, 'caller-supplied-terminal-id')
   assert.equal(manager.calls[0].restore, true)
+  assert.deepEqual(manager.snapshotArgs, [
+    'caller-supplied-terminal-id',
+    { responseBarrier: true },
+  ])
   assert.equal(response.recovered, null)
   assert.equal(response.output, 'new-session-output')
 })

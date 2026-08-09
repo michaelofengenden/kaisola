@@ -250,6 +250,10 @@ function terminalReleaseRoute({ manager, id, requireAllowed }) {
   return manager.release(id)
 }
 
+function mapMaybePromise(value, transform) {
+  return value && typeof value.then === 'function' ? value.then(transform) : transform(value)
+}
+
 /** Attach is an ownership mutation, so absence must be decided explicitly
  * before setSender can make the caller believe it adopted a terminal. */
 function terminalAttachRoute({
@@ -278,14 +282,14 @@ function terminalAttachRoute({
   const continuation = continuity && previousInstance && previousInstance !== clientInstanceId
     ? { ...continuity, acrossRestart: true, reattachedAt: now(), brokerPid }
     : null
-  return {
-    ...manager.snapshot(id),
+  return mapMaybePromise(manager.snapshot(id, { responseBarrier: true }), (snapshot) => ({
+    ...snapshot,
     // Seal the authority-bearing fields after the snapshot so a future
     // snapshot extension cannot accidentally override the attach contract.
     id,
     ok: true,
     continuation,
-  }
+  }))
 }
 
 /** The authenticated `terminal.create` operation after access selection. Kept
@@ -347,25 +351,27 @@ function terminalCreateRoute({
     sender: owner,
     restore,
   })
-  if (!rec) {
-    return manager.available()
-      ? { ok: false, message: 'could not start terminal' }
-      : { ok: false, message: 'node-pty unavailable in session broker' }
-  }
+  return mapMaybePromise(rec, (record) => {
+    if (!record) {
+      return manager.available()
+        ? { ok: false, message: 'could not start terminal' }
+        : { ok: false, message: 'node-pty unavailable in session broker' }
+    }
 
-  const continuity = manager.setSender(id, owner)
-  const previousInstance = continuity?.previousOwner?.split('|')[0]
-  const continuation = continuity && previousInstance && previousInstance !== clientInstanceId
-    ? { ...continuity, acrossRestart: true, reattachedAt: now(), brokerPid, terminalPid: rec.pty?.pid }
-    : null
-  return {
-    ok: true,
-    existed,
-    pid: rec.pty?.pid ?? null,
-    continuation,
-    ...manager.snapshot(id),
-    recovered: null,
-  }
+    const continuity = manager.setSender(id, owner)
+    const previousInstance = continuity?.previousOwner?.split('|')[0]
+    const continuation = continuity && previousInstance && previousInstance !== clientInstanceId
+      ? { ...continuity, acrossRestart: true, reattachedAt: now(), brokerPid, terminalPid: record.pty?.pid }
+      : null
+    return mapMaybePromise(manager.snapshot(id, { responseBarrier: true }), (snapshot) => ({
+      ok: true,
+      existed,
+      pid: record.pty?.pid ?? null,
+      continuation,
+      ...snapshot,
+      recovered: null,
+    }))
+  })
 }
 
 module.exports = {

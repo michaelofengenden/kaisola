@@ -542,7 +542,7 @@ async function dispatch(client, method, params = {}) {
     case 'terminal.output': {
       const id = terminalId()
       requireAllowed(id)
-      return mgr.snapshot(id)
+      return mgr.snapshot(id, { responseBarrier: true })
     }
     case 'terminal.waitForExit': {
       const id = terminalId()
@@ -885,21 +885,25 @@ function gracefulExit(killSessions) {
   clearRendezvousRetry()
   if (socketPathTimer) clearInterval(socketPathTimer)
   socketPathTimer = null
-  if (killSessions) mgr.killAll()
-  else for (const client of clients.values()) detachInstance(client.instanceId)
+  const draining = killSessions ? mgr.killAll() : null
+  if (!killSessions) for (const client of clients.values()) detachInstance(client.instanceId)
   for (const client of clients.values()) client.socket.destroy()
   clients.clear()
-  const active = server
-  for (const candidate of servers) {
-    if (candidate === active) continue
-    try { candidate.close() } catch {}
-  }
-  active.close(() => {
-    cleanupFiles()
-    process.exit(0)
-  })
   const hard = setTimeout(() => { cleanupFiles(); process.exit(0) }, 1500)
   hard.unref?.()
+  const finish = () => {
+    const active = server
+    for (const candidate of servers) {
+      if (candidate === active) continue
+      try { candidate.close() } catch {}
+    }
+    active.close(() => {
+      cleanupFiles()
+      process.exit(0)
+    })
+  }
+  if (draining && typeof draining.then === 'function') draining.then(finish, finish)
+  else finish()
 }
 
 process.on('SIGTERM', () => gracefulExit(true))

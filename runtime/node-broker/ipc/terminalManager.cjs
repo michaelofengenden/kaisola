@@ -187,11 +187,13 @@ const terms = new Map()
 const releaseTimers = new Map()
 let shuttingDown = false
 let spoolDir = path.join(os.tmpdir(), `kaisola-terminal-cache-${process.pid}`)
+let asyncSpoolWrites = true
 let eventSink = null
 let activitySink = null
 let lastCwdRefreshAt = 0
 
-function configureStorage(dir) {
+function configureStorage(dir, { asyncWrites = true } = {}) {
+  asyncSpoolWrites = asyncWrites !== false
   if (dir) {
     spoolDir = dir
     loadPty(path.join(dir, '.native'))
@@ -500,8 +502,22 @@ function spawn({ id, command, args, cwd, env, outputByteLimit, cols, rows, sende
     if (restoring && !prior.pty) return prior
     // a dead pty is not a session — drop the record and spawn fresh under the
     // same id, so a reloaded window gets a working shell instead of a corpse
-    prior.spool.close({ remove: !restoring })
+    const closing = prior.spool.close({ remove: !restoring })
     terms.delete(id)
+    if (closing && typeof closing.then === 'function') {
+      return closing.then(() => spawn({
+        id,
+        command,
+        args,
+        cwd,
+        env,
+        outputByteLimit,
+        cols,
+        rows,
+        sender,
+        restore,
+      }))
+    }
   }
   const retainedOutputBytes = Number.isFinite(outputByteLimit) ? Math.max(0, Math.floor(outputByteLimit)) : null
   const initialCols = geometry.value.cols
@@ -511,6 +527,7 @@ function spawn({ id, command, args, cwd, env, outputByteLimit, cols, rows, sende
     id,
     fresh: !restoring,
     onQuota: reportQuota,
+    asyncWriter: asyncSpoolWrites,
     ...(retainedOutputBytes == null ? {} : {
       diskCap: Math.max(1, retainedOutputBytes),
       hotCap: Math.max(1, Math.min(DEFAULT_HOT_CAP, retainedOutputBytes)),
@@ -581,7 +598,15 @@ function spawn({ id, command, args, cwd, env, outputByteLimit, cols, rows, sende
   // an unreferenced process behind on every rejected create.
   let terminalSpool
   try {
-    terminalSpool = new TerminalSpool(spoolOptions)
+    terminalSpool = new TerminalSpool({
+      ...spoolOptions,
+      onWriterBackpressure: (paused) => {
+        try {
+          if (paused) p.pause()
+          else p.resume()
+        } catch { /* a PTY may exit while its final spool append drains */ }
+      },
+    })
   } catch (error) {
     try { p.kill() } catch { /* already gone */ }
     throw error
@@ -753,20 +778,24 @@ function spawn({ id, command, args, cwd, env, outputByteLimit, cols, rows, sende
     rec.exited = true
     rec.exitedWhileDetached = !rec.rendererVisible
     rec.exitStatus = { exitCode: exitCode ?? 0, signal: signal ?? null }
-    if (!shuttingDown) rec.spool.markExited(rec.exitStatus)
-    settleAgentTurn('terminal-exit')
-    // The whole status, not just the code: a signal-killed session exits 0 and
-    // would otherwise be indistinguishable from a clean one. Clients that never
-    // negotiated terminal-exit-status-v1 are downgraded back to the bare code
-    // by the broker's event sink — the manager does not track features.
-    send(rec.sender, `terminal:exit:${id}`, rec.exitStatus)
-    rec.observers.broadcast('terminal:observer-exit', {
-      id,
-      streamEpoch: rec.cursor.streamEpoch,
-      offset: rec.cursor.nextOffset,
-      exitStatus: rec.exitStatus,
-    }, { streamEpoch: rec.cursor.streamEpoch, endOffset: rec.cursor.nextOffset })
-    resolveExitWaiters(rec, rec.exitStatus)
+    const finishExit = () => {
+      settleAgentTurn('terminal-exit')
+      // The whole status, not just the code: a signal-killed session exits 0 and
+      // would otherwise be indistinguishable from a clean one. Clients that never
+      // negotiated terminal-exit-status-v1 are downgraded back to the bare code
+      // by the broker's event sink — the manager does not track features.
+      send(rec.sender, `terminal:exit:${id}`, rec.exitStatus)
+      rec.observers.broadcast('terminal:observer-exit', {
+        id,
+        streamEpoch: rec.cursor.streamEpoch,
+        offset: rec.cursor.nextOffset,
+        exitStatus: rec.exitStatus,
+      }, { streamEpoch: rec.cursor.streamEpoch, endOffset: rec.cursor.nextOffset })
+      resolveExitWaiters(rec, rec.exitStatus)
+    }
+    const persisted = !shuttingDown ? rec.spool.markExited(rec.exitStatus) : null
+    if (persisted && typeof persisted.then === 'function') persisted.then(finishExit, finishExit)
+    else finishExit()
   })
   terms.set(id, rec)
   if (missingCwd) {
@@ -911,9 +940,11 @@ function ownership(id) {
     : { exists: false, owner: '', lastOwner: '', exited: true }
 }
 
-function snapshot(id) {
-  const r = terms.get(id)
-  if (!r) return { output: '', startOffset: 0, endOffset: 0, streamEpoch: null, truncated: false, exited: true, exitStatus: null }
+function missingSnapshot() {
+  return { output: '', startOffset: 0, endOffset: 0, streamEpoch: null, truncated: false, exited: true, exitStatus: null }
+}
+
+function snapshotRecord(r) {
   const retained = r.spool.snapshot(r.outputByteLimit ?? SNAPSHOT_CAP)
   const outputBytes = Buffer.byteLength(retained.output, 'utf8')
   return {
@@ -931,6 +962,31 @@ function snapshot(id) {
   }
 }
 
+function snapshot(id, { responseBarrier = false } = {}) {
+  const r = terms.get(id)
+  if (!r) return missingSnapshot()
+  const waiting = r.spool.whenSettled()
+  if (waiting) {
+    let pausedForResponse = false
+    if (responseBarrier && r.pty && !r.spool.writerPaused) {
+      try {
+        r.pty.pause()
+        pausedForResponse = true
+      } catch { /* an exited PTY can still serve its durable snapshot */ }
+    }
+    const result = waiting.then(() => {
+      const current = terms.get(id)
+      return current ? snapshotRecord(current) : missingSnapshot()
+    })
+    return pausedForResponse
+      ? result.finally(() => {
+          try { r.pty.resume() } catch { /* exited while storage drained */ }
+        })
+      : result
+  }
+  return snapshotRecord(r)
+}
+
 /** Read one older, observer-safe history page without mutating terminal state. */
 function history(id, { streamEpoch, beforeOffset, maxBytes } = {}) {
   const r = terms.get(id)
@@ -938,6 +994,10 @@ function history(id, { streamEpoch, beforeOffset, maxBytes } = {}) {
   if (streamEpoch !== r.cursor.streamEpoch) throw new Error('terminal history epoch mismatch')
   if (!Number.isSafeInteger(beforeOffset) || beforeOffset < 0 || beforeOffset > r.cursor.nextOffset) {
     throw new Error('invalid terminal history offset')
+  }
+  const waiting = r.spool.whenSettled()
+  if (waiting) {
+    return waiting.then(() => history(id, { streamEpoch, beforeOffset, maxBytes }))
   }
   const cap = Math.min(TERMINAL_HISTORY_PAGE_BYTES, Math.max(64 * 1024, Math.floor(Number(maxBytes) || DEFAULT_SNAPSHOT_CAP)))
   const page = r.spool.historyPage(r.cursor.nextOffset - beforeOffset, cap)
@@ -1001,15 +1061,27 @@ function syncSpoolVisibility(r) {
 function subscribe(id, subscriber, { streamEpoch, afterOffset, maxQueueBytes } = {}) {
   const r = terms.get(id)
   if (!r) return { ok: false, message: 'Terminal is no longer available.' }
-  r.observers.subscribe(subscriber, { maxQueueBytes })
-  syncSpoolVisibility(r)
-  try {
-    return { ok: true, ...resumeFromSnapshot(snapshot(id), streamEpoch, afterOffset) }
-  } catch (error) {
-    r.observers.unsubscribe(subscriber)
-    syncSpoolVisibility(r)
-    throw error
+  const finish = (record) => {
+    record.observers.subscribe(subscriber, { maxQueueBytes })
+    syncSpoolVisibility(record)
+    try {
+      return { ok: true, ...resumeFromSnapshot(snapshotRecord(record), streamEpoch, afterOffset) }
+    } catch (error) {
+      record.observers.unsubscribe(subscriber)
+      syncSpoolVisibility(record)
+      throw error
+    }
   }
+  const waiting = r.spool.whenSettled()
+  if (waiting) {
+    return waiting.then(() => {
+      const current = terms.get(id)
+      return current
+        ? finish(current)
+        : { ok: false, message: 'Terminal is no longer available.' }
+    })
+  }
+  return finish(r)
 }
 
 function unsubscribe(id, subscriber) {
@@ -1185,13 +1257,14 @@ function release(id) {
   terms.delete(id)
   // The record is gone, so its pty exit can no longer reach these resolvers.
   rejectExitWaiters(takeExitWaiters(r), 'Terminal is no longer available.')
-  return {
+  const result = (receipt) => ({
     id,
-    ok: deletion.complete,
+    ok: receipt.complete,
     released: true,
-    deletion,
-    cleanup: deletion.complete ? null : { method: 'terminal.release', id },
-  }
+    deletion: receipt,
+    cleanup: receipt.complete ? null : { method: 'terminal.release', id },
+  })
+  return deletion && typeof deletion.then === 'function' ? deletion.then(result) : result(deletion)
 }
 
 /** Broker-owned close grace survives renderer crashes, appearance swaps, and
@@ -1283,6 +1356,7 @@ function rollingUpdateReadiness() {
 
 function killAll() {
   shuttingDown = true
+  const closing = []
   // Capture one last shell cwd while every pid is still live. Missing/erroring
   // lsof is non-fatal and leaves the last inventory value intact.
   refreshCwds({ force: true })
@@ -1298,7 +1372,8 @@ function killAll() {
     }
     // App quit is not a user close: retain the spool so persisted terminal
     // records can restore their previous scrollback on next launch.
-    r.spool.close()
+    const result = r.spool.close()
+    if (result && typeof result.then === 'function') closing.push(result)
     rejectExitWaiters(takeExitWaiters(r), 'Terminal is no longer available.')
   }
   terms.clear()
@@ -1316,6 +1391,7 @@ function killAll() {
     }
   }
   runChildren.clear()
+  return closing.length > 0 ? Promise.allSettled(closing).then(() => undefined) : undefined
 }
 
 /** Live sessions with their pid + FOREGROUND process name (node-pty reads the

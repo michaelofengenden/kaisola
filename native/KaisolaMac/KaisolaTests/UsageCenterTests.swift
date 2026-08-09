@@ -528,6 +528,90 @@ final class UsageCenterTests: XCTestCase {
         XCTAssertFalse(store.remove(id: "missing"))
     }
 
+    /// A symlink, a trailing slash and a `..` hop are three spellings of one
+    /// credential directory. Registering them as separate accounts splits one
+    /// subscription's usage across rows and makes attribution meaningless.
+    func testUsageAccountStoreRejectsAliasesOfOneCredentialDirectory() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("kaisola-account-alias-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let target = root.appendingPathComponent("claude-work", isDirectory: true)
+        let sibling = root.appendingPathComponent("sibling", isDirectory: true)
+        let link = root.appendingPathComponent("claude-alias", isDirectory: true)
+        try FileManager.default.createDirectory(at: target, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: sibling, withIntermediateDirectories: true)
+        try FileManager.default.createSymbolicLink(at: link, withDestinationURL: target)
+        let store = UsageAccountStore(fileURL: root.appendingPathComponent("usage-accounts.json"))
+
+        let work = try XCTUnwrap(store.add(provider: .claude, label: "Work", directory: target.path))
+        XCTAssertNil(store.add(provider: .claude, label: "Alias", directory: link.path))
+        XCTAssertNil(store.add(provider: .claude, label: "Slash", directory: target.path + "/"))
+        XCTAssertNil(store.add(provider: .claude, label: "Dot", directory: target.path + "/."))
+        XCTAssertNil(store.add(
+            provider: .claude,
+            label: "Relative",
+            directory: sibling.path + "/../claude-work"
+        ))
+        XCTAssertEqual(store.profiles().map(\.id), [work.id])
+
+        // The rejection has to be explainable: settings names the account the
+        // alias collides with rather than refusing without a reason.
+        XCTAssertEqual(store.existingProfile(provider: .claude, directory: link.path)?.label, "Work")
+        // A different provider pointed at the same path is still its own account,
+        // and a genuinely different directory still gets added.
+        XCTAssertNil(store.existingProfile(provider: .codex, directory: link.path))
+        XCTAssertNotNil(store.add(provider: .claude, label: "Sibling", directory: sibling.path))
+    }
+
+    /// The same collapse applies to rows already on disk, saved before the add
+    /// path knew how to compare them.
+    func testUsageAccountStoreCollapsesAliasesAlreadySavedOnDisk() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("kaisola-account-stored-alias-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let target = root.appendingPathComponent("codex-research", isDirectory: true)
+        let link = root.appendingPathComponent("codex-alias", isDirectory: true)
+        try FileManager.default.createDirectory(at: target, withIntermediateDirectories: true)
+        try FileManager.default.createSymbolicLink(at: link, withDestinationURL: target)
+        let fileURL = root.appendingPathComponent("usage-accounts.json")
+        try """
+        {"schemaVersion":1,"profiles":[\
+        {"id":"research","provider":"codex","label":"Research","directory":"\(target.path)"},\
+        {"id":"alias","provider":"codex","label":"Alias","directory":"\(link.path)"},\
+        {"id":"other","provider":"codex","label":"Other","directory":"\(target.path)/../codex-other"}\
+        ]}
+        """.write(to: fileURL, atomically: true, encoding: .utf8)
+
+        let profiles = UsageAccountStore(fileURL: fileURL).profiles()
+
+        XCTAssertEqual(profiles.map(\.id), ["research", "other"])
+        XCTAssertEqual(
+            profiles[0].canonicalDirectory,
+            target.standardizedFileURL.resolvingSymlinksInPath().path
+        )
+    }
+
+    /// Resolved paths cannot see an alias the filesystem itself collapses. On a
+    /// case-insensitive volume — the macOS default — two spellings of one name
+    /// are one directory, and only file identity says so.
+    func testUsageAccountStoreRejectsCaseAliasOnCaseInsensitiveVolume() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("kaisola-account-case-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let target = root.appendingPathComponent("Claude-Work", isDirectory: true)
+        let lowercased = root.appendingPathComponent("claude-work", isDirectory: true)
+        try FileManager.default.createDirectory(at: target, withIntermediateDirectories: true)
+        try XCTSkipUnless(
+            FileManager.default.fileExists(atPath: lowercased.path),
+            "case-sensitive volume: the two spellings really are two directories"
+        )
+        let store = UsageAccountStore(fileURL: root.appendingPathComponent("usage-accounts.json"))
+
+        XCTAssertNotNil(store.add(provider: .claude, label: "Work", directory: target.path))
+        XCTAssertNil(store.add(provider: .claude, label: "Lowercase", directory: lowercased.path))
+        XCTAssertEqual(store.profiles().map(\.label), ["Work"])
+    }
+
     func testUsageAccountStoreSuggestedDirectoriesMatchProviderIsolation() {
         XCTAssertEqual(
             UsageAccountStore.suggestedDirectory(provider: .claude, label: "Research Team"),
@@ -645,6 +729,34 @@ final class UsageCenterTests: XCTestCase {
         XCTAssertEqual(requests[1].environment["CLAUDE_CONFIG_DIR"], "/tmp/claude-personal")
         XCTAssertEqual(requests[3].environment["CODEX_HOME"], "/tmp/codex-research")
         XCTAssertEqual(Set(requests.map { "\($0.provider.rawValue):\($0.profileID)" }).count, requests.count)
+    }
+
+    /// A named account that aliases the active directory is the active account.
+    /// Fanning out a second request for it queries one subscription twice and
+    /// shows it as two limits side by side.
+    func testPlanUsageRequestsCollapseAnAliasOfTheActiveDirectory() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("kaisola-plan-alias-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let target = root.appendingPathComponent("claude-work", isDirectory: true)
+        let link = root.appendingPathComponent("claude-alias", isDirectory: true)
+        try FileManager.default.createDirectory(at: target, withIntermediateDirectories: true)
+        try FileManager.default.createSymbolicLink(at: link, withDestinationURL: target)
+
+        let requests = UsageCenter.planUsageRequests(
+            workspace: URL(fileURLWithPath: "/tmp/project", isDirectory: true),
+            environment: [
+                "HOME": "/tmp/home",
+                "CLAUDE_CONFIG_DIR": target.path,
+            ],
+            profiles: [
+                UsageAccountProfile(id: "claude-work", provider: .claude, label: "Work", directory: link.path),
+            ]
+        )
+
+        XCTAssertEqual(requests.filter { $0.provider == .claude }.count, 1)
+        XCTAssertEqual(requests.first?.profileID, "claude-work")
+        XCTAssertEqual(requests.first?.environment["CLAUDE_CONFIG_DIR"], target.path)
     }
 
     func testNamedAccountFingerprintInvalidatesCacheWithoutExposingPaths() {

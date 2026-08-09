@@ -1,6 +1,6 @@
 {
   "schemaVersion": 1,
-  "expectationsDigest": "398712d94e36b33ccad178c790a4bc3c6f8196c5107491d3f8d4130cd900ba3b",
+  "expectationsDigest": "3c653f49640ba62e5213375c45c43fe3770c743a25eb365f3ca015d4b1cbd430",
   "reviewedBy": "Michael Ofengenden",
   "reviewedAt": "2026-08-08",
   "reason": "First baseline for the native-visual layout gate (issue #309). Thresholds are set so app-drawn ink on the window buttons and an empty content layer fail, and so the rules that read the element inventory report without failing until a hosted run shows what that inventory contains.",

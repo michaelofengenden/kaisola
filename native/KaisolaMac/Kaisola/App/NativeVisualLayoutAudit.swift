@@ -52,15 +52,6 @@ struct NativeVisualLayoutSnapshot: Codable, Equatable, Sendable {
                 && maxY <= other.maxY + slack
         }
 
-        func inset(by amount: Double) -> Rect {
-            Rect(
-                x: x + amount,
-                y: y + amount,
-                width: Swift.max(0, width - 2 * amount),
-                height: Swift.max(0, height - 2 * amount)
-            )
-        }
-
         var describedForReport: String {
             String(
                 format: "x=%.4f y=%.4f w=%.4f h=%.4f",
@@ -323,15 +314,13 @@ struct NativeVisualLayoutExpectations: Codable, Equatable, Sendable {
         /// A flat sidebar fill under the buttons is fine; contrast inside the
         /// strip is what a reader sees as content sitting on the controls.
         var luminanceRangeThreshold: Double
-        /// Normalized inset applied before sampling, so antialiasing at the
-        /// zone border cannot decide the verdict.
-        var margin: Double
+        /// A handful of antialiased pixels is not evidence. The probe samples
+        /// the strip densely, so this only rejects a degenerate measurement.
         var minimumSamples: Int
 
         static let `default` = ControlZoneInkPolicy(
             coverageThreshold: 0.04,
             luminanceRangeThreshold: 0.18,
-            margin: 0.002,
             minimumSamples: 64
         )
     }

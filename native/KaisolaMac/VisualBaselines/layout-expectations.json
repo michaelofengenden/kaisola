@@ -25,7 +25,6 @@
   "controlZoneInk": {
     "coverageThreshold": 0.04,
     "luminanceRangeThreshold": 0.18,
-    "margin": 0.002,
     "minimumSamples": 64
   },
   "containerAreaShare": 0.5,

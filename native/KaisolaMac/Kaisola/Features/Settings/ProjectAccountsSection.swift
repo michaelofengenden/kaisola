@@ -1,5 +1,132 @@
 import SwiftUI
 
+/// What a project's stored account directory currently points at.
+///
+/// The stored value is a path, but the menu speaks in account names, so the
+/// path has to be resolved back to a named account before it can be shown. A
+/// path no named account claims is its own state rather than a third kind of
+/// title: an account can be removed, moved, or edited outside Kaisola, and
+/// printing the orphaned path where a name belongs made a broken assignment
+/// look like an ordinary selection.
+enum ProjectAccountSelection: Equatable {
+    /// No override stored: sessions here run as the app-wide account.
+    case appDefault
+    /// The stored directory belongs to this named account.
+    case account(UsageAccountProfile)
+    /// Nothing claims the stored directory, which is kept verbatim so the row
+    /// can show what broke and the repair menu can leave it alone.
+    case missing(String)
+
+    /// One way out of a broken (or merely unwanted) assignment. Repairs are a
+    /// value rather than menu code so the offer and its tests agree on what is
+    /// compatible: App Default always, plus the named accounts of this
+    /// provider. Nothing is written until one is chosen.
+    enum Repair: Equatable, Identifiable {
+        case appDefault
+        case account(UsageAccountProfile)
+
+        var id: String {
+            switch self {
+            case .appDefault: "app-default"
+            case .account(let profile): profile.id
+            }
+        }
+
+        var title: String {
+            switch self {
+            case .appDefault: "App Default"
+            case .account(let profile): profile.label
+            }
+        }
+
+        /// What this repair stores in the override. App Default stores nothing,
+        /// which is how the store learns to drop the entry.
+        var storedDirectory: String {
+            switch self {
+            case .appDefault: ""
+            case .account(let profile): profile.directory
+            }
+        }
+    }
+
+    static func resolve(
+        storedDirectory: String,
+        provider: UsageAccountProfile.Provider,
+        profiles: [UsageAccountProfile]
+    ) -> ProjectAccountSelection {
+        let stored = storedDirectory.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !stored.isEmpty else { return .appDefault }
+        let target = canonicalPath(stored)
+        let match = profiles.first {
+            $0.provider == provider
+                && !$0.directory.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                && canonicalPath($0.directory) == target
+        }
+        return match.map(ProjectAccountSelection.account) ?? .missing(stored)
+    }
+
+    static func repairs(
+        provider: UsageAccountProfile.Provider,
+        profiles: [UsageAccountProfile]
+    ) -> [Repair] {
+        [.appDefault] + profiles.filter { $0.provider == provider }.map(Repair.account)
+    }
+
+    /// Tilde expansion plus path standardisation, the same shape UsageCenter
+    /// uses to collapse duplicate accounts. Without it an account saved as
+    /// `~/.claude-work` and an assignment saved in its expanded form would read
+    /// as broken while pointing at one directory.
+    private static func canonicalPath(_ value: String) -> String {
+        let expanded = (value.trimmingCharacters(in: .whitespacesAndNewlines) as NSString)
+            .expandingTildeInPath
+        return URL(fileURLWithPath: expanded, isDirectory: true).standardizedFileURL.path
+    }
+
+    /// The stored directory when nothing claims it; nil otherwise.
+    var missingDirectory: String? {
+        if case .missing(let directory) = self { return directory }
+        return nil
+    }
+
+    var isMissing: Bool { missingDirectory != nil }
+
+    /// What the menu button reads. A broken assignment says so instead of
+    /// showing its path where a name belongs.
+    var menuTitle: String {
+        switch self {
+        case .appDefault: "App Default"
+        case .account(let profile): profile.label
+        case .missing: "Missing account"
+        }
+    }
+
+    /// The caption under the row title: normally who uses this account, and for
+    /// a broken assignment the path that no longer resolves.
+    func detail(provider: UsageAccountProfile.Provider, projectName: String?) -> String {
+        if let missingDirectory {
+            return "No named account uses \(missingDirectory)"
+        }
+        if let projectName {
+            return "Used by \(provider.displayName) sessions in \(projectName)"
+        }
+        return "Used by \(provider.displayName) sessions here"
+    }
+
+    /// Header above the repairs, naming what broke.
+    var repairHeader: String? {
+        missingDirectory.map { "Missing: \($0)" }
+    }
+
+    /// VoiceOver reads the state, not just the row's name, so a broken
+    /// assignment is audible without opening the menu.
+    var accessibilityValue: String {
+        if let missingDirectory {
+            return "Missing account, \(missingDirectory)"
+        }
+        return menuTitle
+    }
+}
+
 /// Settings ▸ Accounts section that pins a per-project Claude/Codex account on top
 /// of the app-wide one. Overrides are project-scoped, so a nil `projectID` (no
 /// active project) has nowhere to store them — the section shows a hint instead
@@ -249,21 +376,9 @@ struct ProjectAccountsSection: View {
     private var perProjectCard: some View {
         SettingsCard(title: "This project", symbol: "folder") {
             if let projectID {
-                SettingsRow(
-                    title: "Claude account",
-                    detail: projectName.map { "Used by Claude sessions in \($0)" } ?? "Used by Claude sessions here",
-                    symbol: "person.crop.circle"
-                ) {
-                    accountPicker(provider: .claude, value: $claudeConfigDir, projectID: projectID)
-                }
+                projectAccountRow(provider: .claude, value: $claudeConfigDir, projectID: projectID)
                 SettingsDivider()
-                SettingsRow(
-                    title: "Codex account",
-                    detail: projectName.map { "Used by Codex sessions in \($0)" } ?? "Used by Codex sessions here",
-                    symbol: "person.crop.circle"
-                ) {
-                    accountPicker(provider: .codex, value: $codexHome, projectID: projectID)
-                }
+                projectAccountRow(provider: .codex, value: $codexHome, projectID: projectID)
             } else {
                 Text("Open a project to give it its own account. Until then, sessions use the app default.")
                     .font(.callout)
@@ -276,38 +391,91 @@ struct ProjectAccountsSection: View {
         }
     }
 
-    /// Pick a named account by name. The directory is what actually gets
-    /// stored, but nobody thinks in config directories — they think "the work
-    /// one" — so the menu shows labels and keeps the path in the caption.
-    private func accountPicker(
+    /// One provider's assignment for this project. The caption carries the
+    /// broken path when there is one, because the menu button has room for a
+    /// state but not for a diagnostic.
+    private func projectAccountRow(
         provider: UsageAccountProfile.Provider,
         value: Binding<String>,
         projectID: String
     ) -> some View {
-        let matching = usageProfiles.filter { $0.provider == provider }
-        let selected = matching.first { $0.directory == value.wrappedValue }
-        return Menu {
-            Button("App Default") {
-                value.wrappedValue = ""
-                save(projectID)
-            }
-            if !matching.isEmpty {
-                Divider()
-                ForEach(matching) { profile in
-                    Button(profile.label) {
-                        value.wrappedValue = profile.directory
-                        save(projectID)
-                    }
+        let selection = ProjectAccountSelection.resolve(
+            storedDirectory: value.wrappedValue,
+            provider: provider,
+            profiles: usageProfiles
+        )
+        return SettingsRow(
+            title: "\(provider.displayName) account",
+            detail: selection.detail(provider: provider, projectName: projectName),
+            symbol: selection.isMissing ? "exclamationmark.triangle" : "person.crop.circle"
+        ) {
+            accountPicker(
+                provider: provider,
+                value: value,
+                projectID: projectID,
+                selection: selection
+            )
+        }
+    }
+
+    /// Pick a named account by name. The directory is what actually gets
+    /// stored, but nobody thinks in config directories — they think "the work
+    /// one" — so the menu shows labels and keeps the path in the caption.
+    ///
+    /// A directory no account claims reads as "Missing account" rather than as
+    /// a selected value, and the same menu doubles as the repair: App Default
+    /// or any account of this provider, one click each. The broken value stays
+    /// stored until one of them is picked — a silent reset would hide that the
+    /// project ever pointed somewhere else.
+    private func accountPicker(
+        provider: UsageAccountProfile.Provider,
+        value: Binding<String>,
+        projectID: String,
+        selection: ProjectAccountSelection
+    ) -> some View {
+        Menu {
+            if let repairHeader = selection.repairHeader {
+                Section(repairHeader) {
+                    repairItems(provider: provider, value: value, projectID: projectID)
                 }
+            } else {
+                repairItems(provider: provider, value: value, projectID: projectID)
             }
         } label: {
-            Text(selected?.label ?? (value.wrappedValue.isEmpty ? "App Default" : value.wrappedValue))
-                .lineLimit(1)
-                .truncationMode(.middle)
+            HStack(spacing: 4) {
+                if selection.isMissing {
+                    Image(systemName: "exclamationmark.triangle.fill")
+                        .font(.caption)
+                        .foregroundStyle(KaisolaStatusTone.failed.foregroundColor)
+                }
+                Text(selection.menuTitle)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+            }
         }
         .menuStyle(.borderlessButton)
         .frame(width: 170)
+        .help(selection.missingDirectory.map { "No named \(provider.displayName) account uses \($0)" }
+            ?? "Choose which account \(provider.displayName) sessions in this project run as")
         .accessibilityLabel("\(provider.displayName) account for this project")
+        .accessibilityValue(selection.accessibilityValue)
+    }
+
+    private func repairItems(
+        provider: UsageAccountProfile.Provider,
+        value: Binding<String>,
+        projectID: String
+    ) -> some View {
+        let repairs = ProjectAccountSelection.repairs(provider: provider, profiles: usageProfiles)
+        return ForEach(Array(repairs.enumerated()), id: \.element.id) { index, repair in
+            // App Default is the first entry; the named accounts follow it
+            // under a rule, as they did before repairs became a list.
+            if index == 1 { Divider() }
+            Button(repair.title) {
+                value.wrappedValue = repair.storedDirectory
+                save(projectID)
+            }
+        }
     }
 
     private func removeProfile(_ profile: UsageAccountProfile) {

@@ -39,6 +39,8 @@ const SPOOL_APPEND_DEBOUNCE_MS = 750
 const META_RETRY_BASE_MS = 250
 const META_RETRY_MAX_MS = 8000
 const META_RETRY_ATTEMPTS = 6
+const SPOOL_DELETE_RETRY_ATTEMPTS = 3
+const TRANSIENT_DELETE_CODES = new Set(['EAGAIN', 'EBUSY', 'EINTR', 'EIO', 'EMFILE', 'ENFILE'])
 // Retained-history quotas. Interactive terminals used to be append-only with no
 // ceiling at all, so one long-lived noisy shell could fill the user's volume.
 // Two bounds now apply: how much history a single terminal may keep, and how
@@ -426,7 +428,68 @@ function ensurePrivateSpoolDir(dir) {
   return target
 }
 
+function safeDeletionCode(error) {
+  const code = String(error?.code || '')
+  return /^[A-Z][A-Z0-9_]{0,63}$/.test(code) ? code : 'EUNLINK'
+}
+
+function deleteSpoolArtifact(name, file) {
+  for (let attempts = 1; attempts <= SPOOL_DELETE_RETRY_ATTEMPTS; attempts += 1) {
+    try {
+      fs.unlinkSync(file)
+      return { name, status: 'deleted', attempts }
+    } catch (error) {
+      if (error?.code === 'ENOENT') return { name, status: 'absent', attempts }
+      const code = safeDeletionCode(error)
+      if (TRANSIENT_DELETE_CODES.has(code) && attempts < SPOOL_DELETE_RETRY_ATTEMPTS) continue
+      return { name, status: 'failed', code, attempts }
+    }
+  }
+  return { name, status: 'failed', code: 'EUNLINK', attempts: SPOOL_DELETE_RETRY_ATTEMPTS }
+}
+
+function deletionResult(artifacts) {
+  const complete = artifacts.every(({ status }) => status !== 'failed')
+  return { complete, retryable: !complete, artifacts }
+}
+
+function deleteSpoolArtifacts(currentFile, previousFile, metadataFile) {
+  return deletionResult([
+    deleteSpoolArtifact('current', currentFile),
+    deleteSpoolArtifact('previous', previousFile),
+    deleteSpoolArtifact('metadata', metadataFile),
+  ])
+}
+
+function refusedDeletion(error) {
+  const code = safeDeletionCode(error)
+  return deletionResult(['current', 'previous', 'metadata'].map((name) => ({
+    name,
+    status: 'failed',
+    code,
+    attempts: 0,
+  })))
+}
+
 class TerminalSpool {
+  /** Retry a prior removal without constructing a spool, reading retained
+   * content, or creating a PTY. The terminal ID is hashed to the same fixed
+   * artifact names used by a live spool. */
+  static cleanup(id, dir) {
+    let root
+    try {
+      root = ensurePrivateSpoolDir(dir)
+    } catch (error) {
+      return refusedDeletion(error)
+    }
+    const base = safeBase(id)
+    return deleteSpoolArtifacts(
+      path.join(root, `${base}.log`),
+      path.join(root, `${base}.prev.log`),
+      path.join(root, `${base}.json`),
+    )
+  }
+
   static readMeta(id, dir) {
     const terminalId = String(id)
     const metaFile = path.join(dir, `${safeBase(terminalId)}.json`)
@@ -540,6 +603,7 @@ class TerminalSpool {
     this.metaDirty = false
     this.metaRetryTimer = null
     this.metaRetries = 0
+    this.closed = false
     this.decModes = new Map()
     this.decCarry = ''
     const meta = TerminalSpool.readMeta(this.id, root)
@@ -1101,6 +1165,11 @@ class TerminalSpool {
   }
 
   close({ remove = false } = {}) {
+    if (this.closed) {
+      return remove
+        ? deleteSpoolArtifacts(this.file, this.prevFile, this.metaFile)
+        : null
+    }
     this.flush()
     this.persistMeta()
     // Late PTY output must not resurrect a closed spool: release() deletes
@@ -1117,12 +1186,10 @@ class TerminalSpool {
       this.appendTimer = null
     }
     this._clearMetaRetry()
-    if (!remove) return
+    if (!remove) return null
     // Same as the fresh-start wipe: unlink drops our entry, so a swapped-in
     // link dies with the terminal and the file it named survives untouched.
-    try { fs.unlinkSync(this.file) } catch { /* absent */ }
-    try { fs.unlinkSync(this.prevFile) } catch { /* absent */ }
-    try { fs.unlinkSync(this.metaFile) } catch { /* absent */ }
+    return deleteSpoolArtifacts(this.file, this.prevFile, this.metaFile)
   }
 }
 
@@ -1144,6 +1211,7 @@ module.exports = {
   META_RETRY_BASE_MS,
   META_RETRY_MAX_MS,
   META_RETRY_ATTEMPTS,
+  SPOOL_DELETE_RETRY_ATTEMPTS,
   ensurePrivateSpoolDir,
   readTail,
   utf8Tail,

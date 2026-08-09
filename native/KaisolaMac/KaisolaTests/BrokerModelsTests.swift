@@ -3,6 +3,69 @@ import XCTest
 @testable import Kaisola
 
 final class BrokerModelsTests: XCTestCase {
+    func testStatusParsesExactProcessWideTerminalCapacity() throws {
+        var object = validStatus.objectValue!
+        object["terminalCapacity"] = .object([
+            "liveTerminalCount": .integer(17),
+            "maximumLiveTerminals": .integer(64),
+            "availableTerminalSlots": .integer(47),
+        ])
+        let status = try BrokerStatus(
+            status: .object(object),
+            diagnostics: .array([]),
+            live: .array([]),
+            expectedHello: hello
+        )
+
+        XCTAssertEqual(status.terminalCapacity, BrokerTerminalCapacity(value: .object([
+            "liveTerminalCount": .integer(17),
+            "maximumLiveTerminals": .integer(64),
+            "availableTerminalSlots": .integer(47),
+        ])))
+    }
+
+    func testStatusRejectsMalformedOrInternallyInconsistentTerminalCapacity() {
+        let invalidValues: [JSONValue] = [
+            .object([
+                "liveTerminalCount": .integer(-1),
+                "maximumLiveTerminals": .integer(64),
+                "availableTerminalSlots": .integer(65),
+            ]),
+            .object([
+                "liveTerminalCount": .integer(65),
+                "maximumLiveTerminals": .integer(64),
+                "availableTerminalSlots": .integer(0),
+            ]),
+            .object([
+                "liveTerminalCount": .integer(1),
+                "maximumLiveTerminals": .integer(513),
+                "availableTerminalSlots": .integer(512),
+            ]),
+            .object([
+                "liveTerminalCount": .integer(1),
+                "maximumLiveTerminals": .integer(64),
+                "availableTerminalSlots": .integer(64),
+            ]),
+            .object([
+                "liveTerminalCount": .string("1"),
+                "maximumLiveTerminals": .integer(64),
+                "availableTerminalSlots": .integer(63),
+            ]),
+        ]
+        for invalid in invalidValues {
+            var object = validStatus.objectValue!
+            object["terminalCapacity"] = invalid
+            XCTAssertThrowsError(try BrokerStatus(
+                status: .object(object),
+                diagnostics: .array([]),
+                live: .array([]),
+                expectedHello: hello
+            )) { error in
+                XCTAssertEqual(error as? BrokerClientError, .malformedResponse)
+            }
+        }
+    }
+
     func testStatusParsesPositiveBrokerActivityEpoch() throws {
         let status = try BrokerStatus(
             status: .object([

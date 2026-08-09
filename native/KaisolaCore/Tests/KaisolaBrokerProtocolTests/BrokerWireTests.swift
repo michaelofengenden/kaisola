@@ -15,8 +15,11 @@ final class BrokerWireTests: XCTestCase {
         XCTAssertEqual(BrokerWire.observerRoleFeature, "observer-role-v1")
         XCTAssertEqual(BrokerWire.brokerUpdateFeature, "broker-update-v1")
         XCTAssertEqual(BrokerWire.brokerRollingUpdateFeature, "broker-rolling-update-v1")
+        XCTAssertEqual(BrokerWire.brokerMutationIdempotencyFeature, "broker-mutation-idempotency-v1")
         XCTAssertEqual(BrokerWire.brokerInventoryFeature, "broker-inventory-v1")
         XCTAssertEqual(BrokerWire.brokerAdministrationFeature, "broker-administration-v1")
+        XCTAssertEqual(BrokerWire.defaultMaximumLiveTerminals, 64)
+        XCTAssertEqual(BrokerWire.maximumConfigurableLiveTerminals, 512)
         XCTAssertEqual(BrokerWire.observerMethods, [
             "broker.status",
             "broker.inventory",

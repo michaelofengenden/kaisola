@@ -312,7 +312,12 @@ final class ObserveOnlyBrokerClientTests: XCTestCase {
             helloAccess: "observer",
             advertiseObserverRole: true,
             advertiseAtomicInventory: true,
-            replyToRequests: true
+            replyToRequests: true,
+            terminalCapacity: .object([
+                "liveTerminalCount": .integer(1),
+                "maximumLiveTerminals": .integer(64),
+                "availableTerminalSlots": .integer(63),
+            ])
         )
         let client = ObserveOnlyBrokerClient(
             transport: transport,
@@ -330,6 +335,9 @@ final class ObserveOnlyBrokerClientTests: XCTestCase {
             ["broker.inventory"]
         )
         XCTAssertEqual(inventory.terminals.map(\.id), ["terminal:codex-1"])
+        XCTAssertEqual(inventory.terminalCapacity?.liveTerminalCount, 1)
+        XCTAssertEqual(inventory.terminalCapacity?.maximumLiveTerminals, 64)
+        XCTAssertEqual(inventory.terminalCapacity?.availableTerminalSlots, 63)
         await client.disconnect()
     }
 
@@ -675,6 +683,7 @@ private actor ScriptedBrokerTransport: BrokerByteTransport {
     private let contentDigest: String?
     private let statusImplementationVersion: Int?
     private let activityEpoch: Int64
+    private let terminalCapacity: JSONValue?
     private let atomicInventoryStatusEpochOffset: Int64
     private let subscribeOutput: String?
     private let subscribeStartOffset: Int64
@@ -706,6 +715,7 @@ private actor ScriptedBrokerTransport: BrokerByteTransport {
         contentDigest: String? = String(repeating: "a", count: 64),
         statusImplementationVersion: Int? = nil,
         activityEpoch: Int64 = 1,
+        terminalCapacity: JSONValue? = nil,
         statusEpochs: [Int64] = [],
         atomicInventoryRejections: Int = 0,
         atomicInventoryStatusEpochOffset: Int64 = 0,
@@ -727,6 +737,7 @@ private actor ScriptedBrokerTransport: BrokerByteTransport {
         self.contentDigest = contentDigest
         self.statusImplementationVersion = statusImplementationVersion
         self.activityEpoch = activityEpoch
+        self.terminalCapacity = terminalCapacity
         self.statusEpochs = statusEpochs
         self.atomicInventoryRejections = atomicInventoryRejections
         self.atomicInventoryStatusEpochOffset = atomicInventoryStatusEpochOffset
@@ -907,6 +918,7 @@ private actor ScriptedBrokerTransport: BrokerByteTransport {
         if let packageSchema { status["packageSchema"] = .integer(Int64(packageSchema)) }
         if let packageVersion { status["packageVersion"] = .string(packageVersion) }
         if let contentDigest { status["contentDigest"] = .string(contentDigest) }
+        if let terminalCapacity { status["terminalCapacity"] = terminalCapacity }
         return .object(status)
     }
 

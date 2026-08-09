@@ -18,7 +18,7 @@ const {
 } = require('./ipc/brokerRejectionPolicy.cjs')
 const { terminalAttachRoute, terminalCreateRoute, terminalKillRoute, terminalReleaseRoute, terminalResizeRoute } = require('./ipc/terminalCreateRoute.cjs')
 const { terminalDetachOwnerRoute } = require('./ipc/terminalDetachOwnerRoute.cjs')
-const { BrokerRequestGate, dispatchBrokerRequest } = require('./ipc/brokerRequestGate.cjs')
+const { BrokerMutationLedger, BrokerRequestGate, dispatchBrokerRequest } = require('./ipc/brokerRequestGate.cjs')
 const { collectBrokerInventorySnapshot } = require('./ipc/brokerInventorySnapshot.cjs')
 const { terminalOwnerAllowed, terminalOwnerParts } = require('./ipc/securityPolicy.cjs')
 const {
@@ -88,6 +88,12 @@ function readLaunch() {
   for (const key of ['socketPath', 'infoFile', 'lockFile', 'storageDir', 'logFile']) {
     if (!path.isAbsolute(String(config[key] || ''))) throw new Error(`invalid ${key}`)
   }
+  if (config.maximumLiveTerminals != null
+      && (!Number.isSafeInteger(config.maximumLiveTerminals)
+        || config.maximumLiveTerminals < 1
+        || config.maximumLiveTerminals > mgr.MAX_CONFIGURABLE_LIVE_TERMINALS)) {
+    throw new Error('invalid maximumLiveTerminals')
+  }
   return config
 }
 
@@ -95,6 +101,7 @@ const config = readLaunch()
 const smoke = config.smoke === true
 process.umask(0o077)
 mgr.configureStorage(config.storageDir)
+mgr.configureCapacity(config.maximumLiveTerminals ?? mgr.DEFAULT_MAX_LIVE_TERMINALS)
 
 function log(message) {
   try {
@@ -127,6 +134,7 @@ let companionLeaseEpoch = 1
 const companionLeases = new Set()
 let inFlightMutations = 0
 const requestGate = new BrokerRequestGate()
+const mutationLedger = new BrokerMutationLedger()
 let everConnected = false
 
 const MUTATING_METHODS = new Set([
@@ -145,6 +153,41 @@ const MUTATING_METHODS = new Set([
   'terminal.setFocused',
   'terminal.controlLease',
 ])
+const IDEMPOTENT_METHODS = new Set([
+  ...MUTATING_METHODS,
+  'broker.shutdownForUpdate',
+  'broker.prepareRollingUpdate',
+  'broker.cancelRollingUpdate',
+  'broker.retireDraining',
+])
+
+const MUTATION_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/
+
+function canonicalMutationValue(value) {
+  if (Array.isArray(value)) return value.map(canonicalMutationValue)
+  if (!value || typeof value !== 'object') return value
+  const result = {}
+  for (const key of Object.keys(value).sort()) {
+    if (key !== 'mutationId') result[key] = canonicalMutationValue(value[key])
+  }
+  return result
+}
+
+function mutationIdempotency(client, method, params) {
+  if (params?.mutationId == null) return null
+  const mutationId = String(params.mutationId)
+  if (!MUTATION_ID_PATTERN.test(mutationId)) return { invalid: true }
+  const key = JSON.stringify([
+    client.instanceId,
+    String(params.ownerId ?? '0'),
+    String(params.projectId ?? LEGACY_PROJECT_SCOPE),
+    mutationId,
+  ])
+  const fingerprint = crypto.createHash('sha256')
+    .update(JSON.stringify([method, canonicalMutationValue(params)]))
+    .digest('hex')
+  return { ledger: mutationLedger, key, fingerprint }
+}
 
 function noteActivity() {
   activityEpoch = activityEpoch >= Number.MAX_SAFE_INTEGER ? 1 : activityEpoch + 1
@@ -209,7 +252,7 @@ function scheduleNoClientExit() {
   noClientTimer.unref?.()
 }
 
-function brokerStatusSnapshot(terminals) {
+function brokerStatusSnapshot(terminals, terminalCapacity = null) {
   return {
     ok: true,
     protocol: PROTOCOL,
@@ -233,6 +276,7 @@ function brokerStatusSnapshot(terminals) {
     rendezvous: rendezvousStatus(),
     health: rejectionSupervisor.status(),
     authenticatedClientCount: clients.size,
+    ...(terminalCapacity == null ? {} : { terminalCapacity }),
     terminals,
   }
 }
@@ -313,12 +357,18 @@ async function dispatch(client, method, params = {}) {
   }))
   switch (method) {
     case 'broker.status':
-      return brokerStatusSnapshot(visibleRows(mgr.diagnostics()))
+      return brokerStatusSnapshot(
+        visibleRows(mgr.diagnostics()),
+        globalObservation ? mgr.capacity() : null,
+      )
     case 'broker.inventory':
       return collectBrokerInventorySnapshot({
         activityEpoch: () => activityEpoch,
         inFlightMutations: () => inFlightMutations,
-        status: () => brokerStatusSnapshot(visibleRows(mgr.diagnostics())),
+        status: () => brokerStatusSnapshot(
+          visibleRows(mgr.diagnostics()),
+          globalObservation ? mgr.capacity() : null,
+        ),
         diagnostics: () => visibleRows(mgr.diagnostics()),
         live: () => visibleRows(mgr.list()),
       })
@@ -671,6 +721,16 @@ function handleLine(client, line) {
   }
   if (frame?.type !== 'request' || typeof frame.id !== 'string' || typeof frame.method !== 'string') return
   const mutating = MUTATING_METHODS.has(frame.method)
+  const idempotency = IDEMPOTENT_METHODS.has(frame.method)
+    ? mutationIdempotency(client, frame.method, frame.params)
+    : null
+  if (idempotency?.invalid) {
+    send(client.socket, {
+      type: 'response', id: frame.id, ok: false,
+      code: 'invalid_mutation_id', message: 'broker mutation id is invalid',
+    }, { method: frame.method })
+    return
+  }
   dispatchBrokerRequest({
     gate: requestGate,
     client,
@@ -683,6 +743,7 @@ function handleLine(client, line) {
     // the originating method to enforce its response-specific encoded cap.
     respond: (response) => send(client.socket, response, { method: frame.method }),
     onSuccess: scheduleNoClientExit,
+    idempotency,
   })
 }
 

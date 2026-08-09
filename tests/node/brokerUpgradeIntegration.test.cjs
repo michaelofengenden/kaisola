@@ -26,7 +26,7 @@ async function waitFor(predicate, label, timeoutMs = 5_000) {
   throw new Error(`timed out waiting for ${label}`)
 }
 
-function startBroker({ rejectionProbe = false } = {}) {
+function startBroker({ rejectionProbe = false, maximumLiveTerminals } = {}) {
   const root = fs.mkdtempSync('/tmp/kaisola-broker-upgrade-')
   fs.chmodSync(root, 0o700)
   const brokerRoot = path.join(root, 'session-broker')
@@ -49,6 +49,7 @@ function startBroker({ rejectionProbe = false } = {}) {
     startedAt: Date.now(),
     version: 'integration-test',
     smoke: false,
+    ...(maximumLiveTerminals == null ? {} : { maximumLiveTerminals }),
   }
   const launchFile = path.join(brokerRoot, 'launch-native-integration.json')
   fs.writeFileSync(launchFile, JSON.stringify(config), { mode: 0o600 })
@@ -65,6 +66,103 @@ function startBroker({ rejectionProbe = false } = {}) {
   child.stderr.on('data', (chunk) => { stderr += chunk })
   return { root, config, child, stderr: () => stderr }
 }
+
+test('process-wide pty capacity is typed, scoped, diagnostic, and reusable', async (t) => {
+  const fixture = startBroker({ maximumLiveTerminals: 1 })
+  t.after(() => {
+    try { fixture.child.kill('SIGKILL') } catch {}
+    try { spawnSync('/usr/bin/pkill', ['-9', '-f', fixture.root]) } catch {}
+    fs.rmSync(fixture.root, { recursive: true, force: true })
+  })
+  await waitFor(() => fs.existsSync(fixture.config.infoFile), 'broker metadata')
+
+  const first = await connectClient(fixture.config, 'controller')
+  const firstParams = {
+    mutationId: crypto.randomUUID(),
+    ownerId: 'first-owner',
+    projectId: 'capacity-first-project',
+    id: 'capacity-first-terminal',
+    command: '/bin/cat',
+    args: [],
+    cwd: fixture.root,
+  }
+  const created = await first.request('terminal.create', firstParams)
+  assert.equal(created.ok, true)
+  assert.equal(created.result.ok, true)
+
+  const idempotent = await first.request('terminal.create', {
+    ...firstParams,
+    mutationId: crypto.randomUUID(),
+  })
+  assert.equal(idempotent.result.ok, true)
+  assert.equal(idempotent.result.existed, true)
+
+  const controllerStatus = await first.request('broker.status', {
+    ownerId: 'first-owner',
+    projectId: 'capacity-first-project',
+  })
+  assert.equal(controllerStatus.ok, true)
+  assert.equal(controllerStatus.result.terminalCapacity, undefined)
+
+  const second = await connectClient(fixture.config, 'controller')
+  const denied = await second.request('terminal.create', {
+    mutationId: crypto.randomUUID(),
+    ownerId: 'second-owner',
+    projectId: 'capacity-second-project',
+    id: 'capacity-second-terminal',
+    command: '/bin/cat',
+    args: [],
+    cwd: fixture.root,
+  })
+  assert.equal(denied.ok, true)
+  assert.deepEqual(denied.result, {
+    ok: false,
+    code: 'terminal_capacity_exceeded',
+    message: 'broker terminal capacity reached',
+    maximumLiveTerminals: 1,
+  })
+
+  const observer = await connectClient(fixture.config, 'observer')
+  const inventory = await observer.request('broker.inventory', { ownerId: '0' })
+  assert.equal(inventory.ok, true)
+  assert.deepEqual(inventory.result.status.terminalCapacity, {
+    liveTerminalCount: 1,
+    maximumLiveTerminals: 1,
+    availableTerminalSlots: 0,
+  })
+  assert.deepEqual(
+    inventory.result.live.map((row) => row.id),
+    ['capacity-first-terminal'],
+  )
+
+  const released = await first.request('terminal.release', {
+    mutationId: crypto.randomUUID(),
+    ownerId: 'first-owner',
+    projectId: 'capacity-first-project',
+    id: 'capacity-first-terminal',
+  })
+  assert.equal(released.result.ok, true)
+  const replacement = await second.request('terminal.create', {
+    mutationId: crypto.randomUUID(),
+    ownerId: 'second-owner',
+    projectId: 'capacity-second-project',
+    id: 'capacity-second-terminal',
+    command: '/bin/cat',
+    args: [],
+    cwd: fixture.root,
+  })
+  assert.equal(replacement.result.ok, true)
+
+  await second.request('terminal.release', {
+    mutationId: crypto.randomUUID(),
+    ownerId: 'second-owner',
+    projectId: 'capacity-second-project',
+    id: 'capacity-second-terminal',
+  })
+  observer.socket.destroy()
+  second.socket.destroy()
+  first.socket.destroy()
+})
 
 async function connectClient(
   config,
@@ -115,6 +213,60 @@ async function connectClient(
   }
   return { socket, hello, request }
 }
+
+test('broker mutation ids replay one terminal.write outcome without duplicate input', async (t) => {
+  const fixture = startBroker()
+  t.after(() => {
+    try { fixture.child.kill('SIGKILL') } catch {}
+    try { spawnSync('/usr/bin/pkill', ['-9', '-f', fixture.root]) } catch {}
+    fs.rmSync(fixture.root, { recursive: true, force: true })
+  })
+  await waitFor(() => fs.existsSync(fixture.config.infoFile), 'broker metadata')
+  const controller = await connectClient(fixture.config)
+  const ownerId = 'mutation-owner'
+  const projectId = 'mutation-idempotency'
+  const terminalId = 'idempotent-write-terminal'
+  const created = await controller.request('terminal.create', {
+    mutationId: crypto.randomUUID(),
+    ownerId,
+    projectId,
+    id: terminalId,
+    command: '/bin/sh',
+    args: ['-c', 'stty -echo; while IFS= read -r line; do printf "SEEN:%s\\n" "$line"; done'],
+    cwd: fixture.root,
+  })
+  assert.equal(created.result.ok, true)
+
+  const mutationId = crypto.randomUUID()
+  const params = {
+    mutationId,
+    ownerId,
+    projectId,
+    id: terminalId,
+    data: 'apply-once\n',
+  }
+  const first = await controller.request('terminal.write', params)
+  const replay = await controller.request('terminal.write', params)
+  assert.deepEqual(replay.result, first.result)
+  assert.equal(first.result.ok, true)
+
+  const output = await waitFor(async () => {
+    const response = await controller.request('terminal.snapshot', {
+      ownerId, projectId, id: terminalId,
+    })
+    return response.result.output.includes('SEEN:apply-once') ? response.result.output : null
+  }, 'one applied write')
+  assert.equal(output.match(/SEEN:apply-once/g)?.length, 1)
+
+  const reused = await controller.request('terminal.write', { ...params, data: 'different-input\n' })
+  assert.equal(reused.ok, false)
+  assert.equal(reused.code, 'mutation_id_reused')
+
+  await controller.request('terminal.release', {
+    mutationId: crypto.randomUUID(), ownerId, projectId, id: terminalId,
+  })
+  controller.socket.destroy()
+})
 
 test('administration is negotiated separately from controller owner identity', async (t) => {
   const fixture = startBroker()

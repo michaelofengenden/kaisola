@@ -13,7 +13,11 @@ const { TerminalSpool, DEFAULT_HOT_CAP, DEFAULT_SNAPSHOT_CAP } = require('./term
 const { DEFAULT_OBSERVER_QUEUE_BYTES, TerminalObservers } = require('./terminalObservers.cjs')
 const { TerminalCursor, isUtf8Boundary } = require('../companion/terminalCursor.cjs')
 const { validatedTerminalGeometry } = require('./terminalCreateRoute.cjs')
-const { TERMINAL_HISTORY_PAGE_BYTES } = require('./brokerWire.cjs')
+const {
+  DEFAULT_MAX_LIVE_TERMINALS,
+  MAX_CONFIGURABLE_LIVE_TERMINALS,
+  TERMINAL_HISTORY_PAGE_BYTES,
+} = require('./brokerWire.cjs')
 
 let pty = null
 let ptyLoadAttempted = false
@@ -176,6 +180,10 @@ const MAX_EXIT_WAITERS = 32
 // instant timeout. Unbounded stays the default: a wait is how the agent learns
 // a command finished, and cutting it short would report a false non-exit.
 const MAX_EXIT_WAIT_MS = 6 * 60 * 60 * 1_000
+// A single detached broker serves every open project, so PTYs need a broker-
+// wide ceiling in addition to per-terminal byte and waiter limits. The launch
+// request may lower or raise the production default, but never remove the
+// ceiling or turn one typo into an effectively unbounded process inventory.
 
 /** main.cjs calls this on app focus/blur — the stream profile follows. */
 function setAppFocused(focused) {
@@ -191,6 +199,50 @@ let asyncSpoolWrites = true
 let eventSink = null
 let activitySink = null
 let lastCwdRefreshAt = 0
+let maximumLiveTerminals = DEFAULT_MAX_LIVE_TERMINALS
+
+class TerminalCapacityError extends Error {
+  constructor({ liveTerminalCount, maximumLiveTerminals }) {
+    super('broker terminal capacity reached')
+    this.name = 'TerminalCapacityError'
+    this.code = 'TERMINAL_CAPACITY_EXCEEDED'
+    this.liveTerminalCount = liveTerminalCount
+    this.maximumLiveTerminals = maximumLiveTerminals
+  }
+}
+
+function validatedMaximumLiveTerminals(value) {
+  if (!Number.isSafeInteger(value)
+      || value < 1
+      || value > MAX_CONFIGURABLE_LIVE_TERMINALS) {
+    throw new RangeError(
+      `maximum live terminals must be an integer from 1 to ${MAX_CONFIGURABLE_LIVE_TERMINALS}`,
+    )
+  }
+  return value
+}
+
+function configureCapacity(value = DEFAULT_MAX_LIVE_TERMINALS) {
+  maximumLiveTerminals = validatedMaximumLiveTerminals(value)
+  return capacity()
+}
+
+function liveTerminalCount() {
+  let count = 0
+  for (const record of terms.values()) {
+    if (!record.exited) count += 1
+  }
+  return count
+}
+
+function capacity() {
+  const live = liveTerminalCount()
+  return {
+    liveTerminalCount: live,
+    maximumLiveTerminals,
+    availableTerminalSlots: Math.max(0, maximumLiveTerminals - live),
+  }
+}
 
 function configureStorage(dir, { asyncWrites = true } = {}) {
   asyncSpoolWrites = asyncWrites !== false
@@ -494,12 +546,30 @@ function spawn({ id, command, args, cwd, env, outputByteLimit, cols, rows, sende
   if (restore && Number.isFinite(outputByteLimit)) return null
   const geometry = validatedTerminalGeometry({ cols, rows }, { defaults: true })
   if (!geometry.ok) return null
-  cancelRelease(id)
   const restoring = restore === true
   const prior = terms.get(id)
   if (prior) {
-    if (!prior.exited) return prior
-    if (restoring && !prior.pty) return prior
+    if (!prior.exited) {
+      cancelRelease(id)
+      return prior
+    }
+    if (restoring && !prior.pty) {
+      cancelRelease(id)
+      return prior
+    }
+  }
+  const retainedMeta = restoring ? TerminalSpool.readMeta(id, spoolDir) : null
+  const restoresColdRecord = retainedMeta
+    && Number.isSafeInteger(retainedMeta.exitedAt)
+    && retainedMeta.exitedAt >= 0
+  if (!restoresColdRecord) {
+    const currentCapacity = capacity()
+    if (currentCapacity.availableTerminalSlots === 0) {
+      throw new TerminalCapacityError(currentCapacity)
+    }
+  }
+  cancelRelease(id)
+  if (prior) {
     // a dead pty is not a session — drop the record and spawn fresh under the
     // same id, so a reloaded window gets a working shell instead of a corpse
     const closing = prior.spool.close({ remove: !restoring })
@@ -535,8 +605,7 @@ function spawn({ id, command, args, cwd, env, outputByteLimit, cols, rows, sende
       retentionCap: retainedOutputBytes,
     }),
   }
-  const retainedMeta = restoring ? TerminalSpool.readMeta(id, spoolDir) : null
-  if (retainedMeta && Number.isSafeInteger(retainedMeta.exitedAt) && retainedMeta.exitedAt >= 0) {
+  if (restoresColdRecord) {
     const terminalSpool = new TerminalSpool(spoolOptions)
     const epochStartOffset = terminalSpool.retainedByteCount()
     terminalSpool.startEpoch(epochStartOffset)
@@ -1437,4 +1506,4 @@ function diagnostics() {
   }))
 }
 
-module.exports = { available, has, isLive, ownership, spawn, write, agentTurn, resize, setSender, detachRenderer, detachSender, detachSenderPrefix, snapshot, history, subscribe, unsubscribe, unsubscribeSubscriberPrefix, waitForExit, cancelExitWaiters, cancelExitWaitersPrefix, kill, release, scheduleRelease, cancelRelease, trackChild, untrackChild, upgradeReadiness, rollingUpdateReadiness, killAll, list, setAppFocused, configureStorage, setEventSink, setActivitySink, diagnostics, __test: { resizeRecord, resumeFromSnapshot, splitUtf8, terminalEnv, summarizeUpgradeReadiness, consumeCommandEndMark, parseLsofCwd, refreshTerminalCwds, prepareHelperDir, installSpawnHelper, exitWaiterCount, MAX_EXIT_WAITERS } }
+module.exports = { available, has, isLive, ownership, spawn, write, agentTurn, resize, setSender, detachRenderer, detachSender, detachSenderPrefix, snapshot, history, subscribe, unsubscribe, unsubscribeSubscriberPrefix, waitForExit, cancelExitWaiters, cancelExitWaitersPrefix, kill, release, scheduleRelease, cancelRelease, trackChild, untrackChild, upgradeReadiness, rollingUpdateReadiness, killAll, list, setAppFocused, configureStorage, configureCapacity, capacity, setEventSink, setActivitySink, diagnostics, DEFAULT_MAX_LIVE_TERMINALS, MAX_CONFIGURABLE_LIVE_TERMINALS, __test: { resizeRecord, resumeFromSnapshot, splitUtf8, terminalEnv, summarizeUpgradeReadiness, consumeCommandEndMark, parseLsofCwd, refreshTerminalCwds, prepareHelperDir, installSpawnHelper, exitWaiterCount, liveTerminalCount, validatedMaximumLiveTerminals, TerminalCapacityError, MAX_EXIT_WAITERS } }

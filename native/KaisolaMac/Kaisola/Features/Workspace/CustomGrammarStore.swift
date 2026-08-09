@@ -1,3 +1,4 @@
+import CryptoKit
 import Foundation
 
 /// A user-supplied language grammar: file extensions and fence tokens it
@@ -107,10 +108,94 @@ struct CustomGrammarSpec: Codable, Equatable, Identifiable {
     }
 }
 
-/// Persists custom grammars — the `CustomAgentStore` recipe: capped array,
-/// atomic replace, corrupt → empty, user-scoped file.
+/// Persists custom grammars — the `CustomAgentStore` recipe (capped array,
+/// atomic replace, user-scoped file) with one deliberate difference: bytes
+/// this build cannot read are never reported as an empty registry. A malformed
+/// or newer-schema file is copied beside the active one and every write is
+/// refused until the user resets the registry, so the next edit can no longer
+/// destroy the only copy of somebody's grammars.
 struct CustomGrammarStore: Sendable {
+    /// The schema `write` emits. A registry saved by a newer Kaisola carries a
+    /// higher number; this build preserves it instead of guessing at it.
+    static let schemaVersion = 1
+
+    /// Where unreadable bytes were copied, or why the copy could not be made.
+    /// A failed copy is what keeps the reset unavailable — with nothing
+    /// preserved there is nothing to recover from afterwards.
+    enum PreservedCopy: Equatable, Sendable {
+        case saved(URL)
+        case failed(String)
+
+        var url: URL? {
+            if case let .saved(url) = self { return url }
+            return nil
+        }
+    }
+
+    /// What the last read found. Every state but `ready` answers `[]` specs —
+    /// falling back to plain text is safe — while the refusal to write is what
+    /// keeps the file recoverable.
+    enum LoadState: Equatable, Sendable {
+        /// No registry file yet: the ordinary first-run state.
+        case absent
+        case ready(version: Int)
+        /// The bytes are not a registry this build can decode.
+        case malformed(PreservedCopy)
+        case newerSchema(version: Int, preserved: PreservedCopy)
+        /// The file exists but could not be read at all (permissions, I/O).
+        case unreadable(String)
+
+        var allowsWrites: Bool {
+            switch self {
+            case .absent, .ready: true
+            case .malformed, .newerSchema, .unreadable: false
+            }
+        }
+
+        var preservedCopy: URL? {
+            switch self {
+            case let .malformed(copy), let .newerSchema(_, copy): copy.url
+            case .absent, .ready, .unreadable: nil
+            }
+        }
+
+        /// A reset discards the active file, so it is offered only once the
+        /// preserved copy has actually landed.
+        var canReset: Bool { preservedCopy != nil }
+    }
+
+    struct Snapshot: Equatable, Sendable {
+        var specs: [CustomGrammarSpec]
+        var state: LoadState
+    }
+
+    /// Every way a write can be refused, each carrying the sentence the
+    /// Extensions settings pane shows.
+    enum WriteRefusal: LocalizedError, Equatable, Sendable {
+        case registryUnreadable(LoadState)
+        case resetNeedsPreservedCopy
+        case writeFailed(String)
+
+        var errorDescription: String? {
+            switch self {
+            case .registryUnreadable:
+                "Custom grammars are read-only until the unreadable registry is reset."
+            case .resetNeedsPreservedCopy:
+                "Kaisola will not reset the registry without a preserved copy of the current file."
+            case let .writeFailed(reason):
+                "Kaisola could not save custom grammars: \(reason) The stored registry is unchanged."
+            }
+        }
+    }
+
+    /// Read before the full payload, so a future registry is preserved by its
+    /// version even when its grammars decode as nonsense here.
+    private struct VersionProbe: Codable {
+        var version: Int?
+    }
+
     private struct Payload: Codable {
+        var version: Int?
         var grammars: [CustomGrammarSpec]
     }
 
@@ -122,57 +207,153 @@ struct CustomGrammarStore: Sendable {
         self.fileURL = fileURL
     }
 
+    /// Every stored spec, valid or not, in insertion order. An unreadable
+    /// registry answers `[]`; `load()` is what says why.
     func specs() -> [CustomGrammarSpec] {
-        read()?.grammars ?? []
+        load().specs
     }
 
-    func save(_ specs: [CustomGrammarSpec]) {
-        let capped = specs.count > cap ? Array(specs.prefix(cap)) : specs
-        write(Payload(grammars: capped))
+    func load() -> Snapshot {
+        let data: Data
+        do {
+            data = try Data(contentsOf: fileURL)
+        } catch {
+            let failure = error as NSError
+            if failure.domain == NSCocoaErrorDomain, failure.code == NSFileReadNoSuchFileError {
+                return Snapshot(specs: [], state: .absent)
+            }
+            return Snapshot(specs: [], state: .unreadable(Self.describe(error)))
+        }
+        guard let probe = try? JSONDecoder().decode(VersionProbe.self, from: data) else {
+            return Snapshot(specs: [], state: .malformed(preserve(data)))
+        }
+        // A registry with no version predates the field; it reads as 0 and is
+        // rewritten at the current version by the next successful save.
+        let version = probe.version ?? 0
+        if version < 0 {
+            return Snapshot(specs: [], state: .malformed(preserve(data)))
+        }
+        if version > Self.schemaVersion {
+            return Snapshot(
+                specs: [],
+                state: .newerSchema(version: version, preserved: preserve(data))
+            )
+        }
+        guard let payload = try? JSONDecoder().decode(Payload.self, from: data) else {
+            return Snapshot(specs: [], state: .malformed(preserve(data)))
+        }
+        return Snapshot(specs: payload.grammars, state: .ready(version: version))
     }
 
+    func save(_ specs: [CustomGrammarSpec]) throws {
+        let state = load().state
+        guard state.allowsWrites else { throw WriteRefusal.registryUnreadable(state) }
+        try write(specs.count > cap ? Array(specs.prefix(cap)) : specs)
+    }
+
+    /// Add or replace by id. Returns the reason the spec can never install when
+    /// it is invalid — it is still stored, so the user sees it listed with that
+    /// reason instead of wondering where the import went.
     @discardableResult
-    func upsert(_ spec: CustomGrammarSpec) -> String? {
-        var current = specs()
+    func upsert(_ spec: CustomGrammarSpec) throws -> String? {
+        let snapshot = load()
+        guard snapshot.state.allowsWrites else {
+            throw WriteRefusal.registryUnreadable(snapshot.state)
+        }
+        var current = snapshot.specs
         if let index = current.firstIndex(where: { $0.id == spec.id }) {
             current[index] = spec
         } else {
             current.append(spec)
         }
-        save(current)
+        try write(current.count > cap ? Array(current.prefix(cap)) : current)
         return spec.validationError
     }
 
     @discardableResult
-    func remove(id: String) -> Bool {
-        let current = specs()
-        let remaining = current.filter { $0.id != id }
-        guard remaining.count != current.count else { return false }
-        save(remaining)
+    func remove(id: String) throws -> Bool {
+        let snapshot = load()
+        guard snapshot.state.allowsWrites else {
+            throw WriteRefusal.registryUnreadable(snapshot.state)
+        }
+        let remaining = snapshot.specs.filter { $0.id != id }
+        guard remaining.count != snapshot.specs.count else { return false }
+        try write(remaining)
         return true
     }
 
-    private func read() -> Payload? {
-        guard let data = try? Data(contentsOf: fileURL) else { return nil }
-        return try? JSONDecoder().decode(Payload.self, from: data)
+    /// The one path that replaces an unreadable registry with an empty one.
+    /// It exists only alongside a preserved copy, so "start over" never means
+    /// "lose the file".
+    @discardableResult
+    func resetUnreadableRegistry() throws -> Snapshot {
+        guard load().state.canReset else { throw WriteRefusal.resetNeedsPreservedCopy }
+        try write([])
+        return Snapshot(specs: [], state: .ready(version: Self.schemaVersion))
     }
 
-    private func write(_ payload: Payload) {
+    /// Copies the bytes we refuse to interpret next to the active file. The
+    /// name carries a fingerprint of the content, so re-reading the same broken
+    /// registry lands on the same copy instead of littering the directory.
+    private func preserve(_ data: Data) -> PreservedCopy {
         let directory = fileURL.deletingLastPathComponent()
-        try? FileManager.default.createDirectory(
-            at: directory,
-            withIntermediateDirectories: true,
-            attributes: [.posixPermissions: 0o700]
+        let preserved = directory.appendingPathComponent(
+            "\(fileURL.lastPathComponent).quarantined-\(Self.fingerprint(of: data)).json",
+            isDirectory: false
         )
-        guard let data = try? JSONEncoder().encode(payload) else { return }
-        let temporary = directory.appendingPathComponent(".\(fileURL.lastPathComponent).\(ProcessInfo.processInfo.processIdentifier)")
+        if let existing = try? Data(contentsOf: preserved) {
+            return existing == data
+                ? .saved(preserved)
+                : .failed("A different file already occupies \(preserved.lastPathComponent).")
+        }
         do {
+            try FileManager.default.createDirectory(
+                at: directory,
+                withIntermediateDirectories: true,
+                attributes: [.posixPermissions: 0o700]
+            )
+            try data.write(to: preserved, options: [.withoutOverwriting])
+            try FileManager.default.setAttributes(
+                [.posixPermissions: 0o600], ofItemAtPath: preserved.path
+            )
+            return .saved(preserved)
+        } catch {
+            return .failed(Self.describe(error))
+        }
+    }
+
+    private func write(_ specs: [CustomGrammarSpec]) throws {
+        let payload = Payload(version: Self.schemaVersion, grammars: specs)
+        let directory = fileURL.deletingLastPathComponent()
+        let temporary = directory.appendingPathComponent(
+            ".\(fileURL.lastPathComponent).\(ProcessInfo.processInfo.processIdentifier)"
+        )
+        do {
+            try FileManager.default.createDirectory(
+                at: directory,
+                withIntermediateDirectories: true,
+                attributes: [.posixPermissions: 0o700]
+            )
+            let data = try JSONEncoder().encode(payload)
             try data.write(to: temporary, options: [])
-            try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: temporary.path)
+            try FileManager.default.setAttributes(
+                [.posixPermissions: 0o600], ofItemAtPath: temporary.path
+            )
             _ = try FileManager.default.replaceItemAt(fileURL, withItemAt: temporary)
         } catch {
             try? FileManager.default.removeItem(at: temporary)
+            throw WriteRefusal.writeFailed(Self.describe(error))
         }
+    }
+
+    /// One sentence, no domain codes: these strings end up in a settings row.
+    private static func describe(_ error: Error) -> String {
+        let message = (error as NSError).localizedDescription
+        return message.hasSuffix(".") ? message : "\(message)."
+    }
+
+    private static func fingerprint(of data: Data) -> String {
+        SHA256.hash(data: data).prefix(8).map { String(format: "%02x", $0) }.joined()
     }
 }
 

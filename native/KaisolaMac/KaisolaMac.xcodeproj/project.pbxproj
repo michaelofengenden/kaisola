@@ -142,6 +142,7 @@
 		75C96456BA526067D7B840A7 /* SettingsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1DC5E2009F74FD5A05DFB27D /* SettingsView.swift */; };
 		768806706220AA2FBF980582 /* TranscriptSearchBudgetTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = D77D695C72611E34382FDF10 /* TranscriptSearchBudgetTests.swift */; };
 		77A3BE106C196A76FF285F1F /* AgentFileFollow.swift in Sources */ = {isa = PBXBuildFile; fileRef = 856354DE0BB8187DD641F300 /* AgentFileFollow.swift */; };
+		783A4B8398A69AD527445AB3 /* ExtensionsSettingsTab.swift in Sources */ = {isa = PBXBuildFile; fileRef = AA68884E2C71911624EE510E /* ExtensionsSettingsTab.swift */; };
 		798DE8FD51B9FFE7D6F9706F /* BrokerLaunchConfiguration.swift in Sources */ = {isa = PBXBuildFile; fileRef = 58663742F2D4497A3D234BF7 /* BrokerLaunchConfiguration.swift */; };
 		7B168B0E70A7503AD02FF74D /* DetachedBrokerProcess.swift in Sources */ = {isa = PBXBuildFile; fileRef = A8C8F92A50B6817748440EAE /* DetachedBrokerProcess.swift */; };
 		7D7BE0BDADEA2A4373D66096 /* CommandPaletteView.swift in Sources */ = {isa = PBXBuildFile; fileRef = DAF1B7984AA5A644F1BA5BB3 /* CommandPaletteView.swift */; };
@@ -531,6 +532,7 @@
 		A8C8F92A50B6817748440EAE /* DetachedBrokerProcess.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DetachedBrokerProcess.swift; sourceTree = "<group>"; };
 		A962C9CEB31001E24F6C64BE /* TerminalMetaService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TerminalMetaService.swift; sourceTree = "<group>"; };
 		A9878CE4AE9D997C699F9827 /* AppModelBookkeeping.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppModelBookkeeping.swift; sourceTree = "<group>"; };
+		AA68884E2C71911624EE510E /* ExtensionsSettingsTab.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ExtensionsSettingsTab.swift; sourceTree = "<group>"; };
 		AABBF49984658B7AB571E382 /* TerminalResurrectionTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TerminalResurrectionTests.swift; sourceTree = "<group>"; };
 		AADD91E3C10425B025BF5441 /* DesktopChromaMeasureTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DesktopChromaMeasureTests.swift; sourceTree = "<group>"; };
 		AD8887E4ADA2A72E8F2F8B9B /* QuietStatusDerivationTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = QuietStatusDerivationTests.swift; sourceTree = "<group>"; };
@@ -862,6 +864,7 @@
 				5F2770649BEF99AA932FFBDF /* AppAccountView.swift */,
 				8B3E3C357D3C2EC2452B447B /* CompanionSettingsTab.swift */,
 				F962ED6ABB7DF6857352C351 /* CustomAgentsSection.swift */,
+				AA68884E2C71911624EE510E /* ExtensionsSettingsTab.swift */,
 				4A9119A3AFA982A1A42C4356 /* McpSettingsTab.swift */,
 				154C63628A43E6BD8410F578 /* ProjectAccountsSection.swift */,
 				1DC5E2009F74FD5A05DFB27D /* SettingsView.swift */,
@@ -1367,6 +1370,7 @@
 				F369C66C4AB127DBFD4B5773 /* DataPreviews.swift in Sources */,
 				81C489277F8E1844A2E19BBE /* DesktopCaptureSource.swift in Sources */,
 				16EE3B2F8BBC6BC4AFBAC503 /* DetailShowDoors.swift in Sources */,
+				783A4B8398A69AD527445AB3 /* ExtensionsSettingsTab.swift in Sources */,
 				6A17D13258D14DC0222A37FA /* FilePreviewContent.swift in Sources */,
 				DDE8DE7312A55EEAC190CF53 /* FilePreviewEditors.swift in Sources */,
 				4E6A3E96C33819EB4C16738C /* FilePreviewRecovery.swift in Sources */,

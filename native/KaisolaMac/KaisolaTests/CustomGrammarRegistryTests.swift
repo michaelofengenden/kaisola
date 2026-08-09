@@ -46,7 +46,7 @@ final class CustomGrammarRegistryTests: XCTestCase {
 
     func testACustomGrammarHighlightsItsOwnExtensionAndFence() throws {
         let store = try temporaryStore()
-        XCTAssertNil(store.upsert(tomlGrammar()))
+        XCTAssertNil(try store.upsert(tomlGrammar()))
 
         let byExtension = SyntaxHighlighter.grammar(forExtension: "TOML", store: store)
         XCTAssertEqual(byExtension, .custom(id: "toml", rules: []))
@@ -73,7 +73,7 @@ final class CustomGrammarRegistryTests: XCTestCase {
         let store = try temporaryStore()
         var greedy = tomlGrammar()
         greedy.extensions = ["swift"]
-        let reason = store.upsert(greedy)
+        let reason = try store.upsert(greedy)
         XCTAssertTrue(reason?.contains("built-in") == true, String(describing: reason))
         XCTAssertEqual(SyntaxHighlighter.grammar(forExtension: "swift", store: store), .shipped(.swift))
     }
@@ -105,7 +105,7 @@ final class CustomGrammarRegistryTests: XCTestCase {
         let store = try temporaryStore()
         var broken = tomlGrammar()
         broken.rules[0].pattern = "([unclosed"
-        XCTAssertNotNil(store.upsert(broken))
+        XCTAssertNotNil(try store.upsert(broken))
         XCTAssertEqual(store.specs().count, 1)
         XCTAssertNil(SyntaxHighlighter.grammar(forExtension: "toml", store: store))
     }
@@ -115,10 +115,164 @@ final class CustomGrammarRegistryTests: XCTestCase {
     func testTheCacheFollowsStoreChanges() throws {
         let store = try temporaryStore()
         XCTAssertNil(SyntaxHighlighter.grammar(forExtension: "toml", store: store))
-        store.upsert(tomlGrammar())
+        try store.upsert(tomlGrammar())
         XCTAssertNotNil(SyntaxHighlighter.grammar(forExtension: "toml", store: store))
-        store.remove(id: "toml")
+        try store.remove(id: "toml")
         XCTAssertNil(SyntaxHighlighter.grammar(forExtension: "toml", store: store))
+    }
+
+    // MARK: - Quarantine
+
+    /// A registry whose entries are only half-written decodes as nothing, and
+    /// "nothing" used to mean "empty" — the next upsert then wrote that empty
+    /// catalog over the only copy. Now the bytes are preserved beside the file,
+    /// the file itself is untouched, and the upsert is refused by name.
+    func testAPartialEntryIsQuarantinedInsteadOfEmptied() throws {
+        let store = try temporaryStore()
+        let original = Data(#"{"version":1,"grammars":[{"id":"toml","title":"TOML"}]}"#.utf8)
+        try original.write(to: store.fileURL)
+
+        let snapshot = store.load()
+        guard case let .malformed(preserved) = snapshot.state else {
+            return XCTFail("a half-written entry must read as malformed, got \(snapshot.state)")
+        }
+        XCTAssertTrue(snapshot.specs.isEmpty)
+        let copy = try XCTUnwrap(preserved.url)
+        XCTAssertEqual(try Data(contentsOf: copy), original, "the preserved copy must be byte-for-byte")
+        XCTAssertNotEqual(copy, store.fileURL, "the copy lives beside the active file, not over it")
+
+        XCTAssertThrowsError(try store.upsert(tomlGrammar())) { error in
+            guard case .registryUnreadable = error as? CustomGrammarStore.WriteRefusal else {
+                return XCTFail("an upsert over an unreadable registry must be refused, got \(error)")
+            }
+        }
+        XCTAssertEqual(try Data(contentsOf: store.fileURL), original, "the registry was overwritten")
+        XCTAssertThrowsError(try store.remove(id: "toml"))
+        XCTAssertThrowsError(try store.save([tomlGrammar()]))
+    }
+
+    /// Re-reading the same broken registry lands on the same preserved copy
+    /// instead of filling the directory with one per read.
+    func testPreservingTheSameBytesTwiceReusesOneCopy() throws {
+        let store = try temporaryStore()
+        try Data("not json at all".utf8).write(to: store.fileURL)
+        let first = try XCTUnwrap(store.load().state.preservedCopy)
+        let second = try XCTUnwrap(store.load().state.preservedCopy)
+        XCTAssertEqual(first, second)
+        let siblings = try FileManager.default.contentsOfDirectory(
+            atPath: store.fileURL.deletingLastPathComponent().path
+        )
+        XCTAssertEqual(siblings.count, 2, "expected the registry and exactly one copy, got \(siblings)")
+    }
+
+    /// A registry written by a newer Kaisola is preserved by its version alone,
+    /// before this build tries to read entries whose shape it does not know.
+    func testAForwardVersionIsPreservedNotParsed() throws {
+        let store = try temporaryStore()
+        let future = Data(#"{"version":99,"grammars":[],"palettes":[{"id":"x"}]}"#.utf8)
+        try future.write(to: store.fileURL)
+
+        let snapshot = store.load()
+        guard case let .newerSchema(version, preserved) = snapshot.state else {
+            return XCTFail("a forward version must read as newerSchema, got \(snapshot.state)")
+        }
+        XCTAssertEqual(version, 99)
+        XCTAssertEqual(try Data(contentsOf: try XCTUnwrap(preserved.url)), future)
+        XCTAssertThrowsError(try store.upsert(tomlGrammar()))
+        XCTAssertEqual(try Data(contentsOf: store.fileURL), future, "the newer registry was overwritten")
+    }
+
+    /// The registry predating the version field still reads, and the next
+    /// successful write stamps the current schema on it.
+    func testALegacyRegistryReadsAndIsStampedOnTheNextWrite() throws {
+        let store = try temporaryStore()
+        let legacy = Data(#"{"grammars":[{"id":"ini","title":"INI","extensions":["ini"],"rules":[{"pattern":";[^\n]*","role":"comment"}]}]}"#.utf8)
+        try legacy.write(to: store.fileURL)
+
+        XCTAssertEqual(store.load().state, .ready(version: 0))
+        XCTAssertEqual(store.specs().map(\.id), ["ini"])
+        try store.upsert(tomlGrammar())
+        XCTAssertEqual(store.load().state, .ready(version: CustomGrammarStore.schemaVersion))
+        XCTAssertEqual(store.specs().map(\.id), ["ini", "toml"])
+    }
+
+    /// Recovery is explicit and never blind: the reset is offered only once the
+    /// copy exists, it clears the way for new grammars, and the preserved file
+    /// is still there afterwards.
+    func testResetIsTheOnlyWayBackAndKeepsThePreservedCopy() throws {
+        let store = try temporaryStore()
+        XCTAssertThrowsError(try store.resetUnreadableRegistry()) { error in
+            XCTAssertEqual(
+                error as? CustomGrammarStore.WriteRefusal, .resetNeedsPreservedCopy,
+                "a readable registry has nothing to reset"
+            )
+        }
+
+        let original = Data("{".utf8)
+        try original.write(to: store.fileURL)
+        let copy = try XCTUnwrap(store.load().state.preservedCopy)
+
+        let after = try store.resetUnreadableRegistry()
+        XCTAssertEqual(after.state, .ready(version: CustomGrammarStore.schemaVersion))
+        XCTAssertTrue(after.specs.isEmpty)
+        XCTAssertNil(try store.upsert(tomlGrammar()))
+        XCTAssertEqual(store.specs().map(\.id), ["toml"])
+        XCTAssertEqual(try Data(contentsOf: copy), original, "the recovery copy must survive the reset")
+    }
+
+    /// A write that cannot land says so and leaves the stored registry alone —
+    /// the failure reaches the settings row instead of vanishing.
+    func testUnwritableStorageSurfacesTheFailure() throws {
+        let store = try temporaryStore()
+        try store.upsert(tomlGrammar())
+        let stored = try Data(contentsOf: store.fileURL)
+
+        let directory = store.fileURL.deletingLastPathComponent()
+        try FileManager.default.setAttributes([.posixPermissions: 0o500], ofItemAtPath: directory.path)
+        defer {
+            try? FileManager.default.setAttributes(
+                [.posixPermissions: 0o700], ofItemAtPath: directory.path
+            )
+        }
+
+        var second = tomlGrammar()
+        second.id = "ini"
+        second.extensions = ["ini"]
+        XCTAssertThrowsError(try store.upsert(second)) { error in
+            guard case let .writeFailed(reason) = error as? CustomGrammarStore.WriteRefusal else {
+                return XCTFail("an unwritable directory must surface a write failure, got \(error)")
+            }
+            XCTAssertFalse(reason.isEmpty)
+            XCTAssertTrue(
+                (error as? CustomGrammarStore.WriteRefusal)?.errorDescription?
+                    .contains("could not save") == true
+            )
+        }
+        XCTAssertEqual(try Data(contentsOf: store.fileURL), stored)
+        XCTAssertEqual(store.specs().map(\.id), ["toml"])
+    }
+
+    /// Extensions settings names the preserved copy, keeps the reset button
+    /// honest, and stays quiet when the registry is fine.
+    func testExtensionsSettingsNamesThePreservedCopy() throws {
+        let store = try temporaryStore()
+        XCTAssertNil(ExtensionsSettingsPolicy.registryNotice(for: .absent))
+        XCTAssertNil(ExtensionsSettingsPolicy.registryNotice(for: .ready(version: 1)))
+
+        try Data("{".utf8).write(to: store.fileURL)
+        let state = store.load().state
+        let copy = try XCTUnwrap(state.preservedCopy)
+        let notice = try XCTUnwrap(ExtensionsSettingsPolicy.registryNotice(for: state))
+        XCTAssertTrue(notice.message.contains(copy.path), notice.message)
+        XCTAssertTrue(notice.canReset)
+        XCTAssertEqual(notice.preservedCopy, copy)
+
+        let unpreservable = ExtensionsSettingsPolicy.registryNotice(
+            for: .newerSchema(version: 9, preserved: .failed("The disk is full."))
+        )
+        XCTAssertEqual(unpreservable?.canReset, false)
+        XCTAssertTrue(unpreservable?.message.contains("The disk is full.") == true)
+        XCTAssertTrue(unpreservable?.message.contains("version 9") == true)
     }
 }
 

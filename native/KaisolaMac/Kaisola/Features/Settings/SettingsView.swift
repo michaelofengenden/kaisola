@@ -256,6 +256,7 @@ struct SettingsView: View {
         case .companion: CompanionSettingsTab()
         case .guardrails: guardrails.scrollContentBackground(.hidden)
         case .mcp: McpSettingsTab(workspace: workspace).scrollContentBackground(.hidden)
+        case .extensions: ExtensionsSettingsTab().scrollContentBackground(.hidden)
         case .accounts: accounts.scrollContentBackground(.hidden)
         case .agents: agents.scrollContentBackground(.hidden)
         case .models: ApiKeysSettingsTab(settings: settings).scrollContentBackground(.hidden)
@@ -866,13 +867,13 @@ enum SettingsGroup: String, CaseIterable, Identifiable {
 }
 
 enum SettingsSection: String, CaseIterable, Identifiable {
-    case general, terminal, companion, guardrails, mcp, accounts, agents, models, shortcuts, usage, updates
+    case general, terminal, companion, guardrails, mcp, extensions, accounts, agents, models, shortcuts, usage, updates
     var id: String { rawValue }
 
     var group: SettingsGroup {
         switch self {
         case .general, .updates: .app
-        case .terminal, .guardrails, .shortcuts: .workspace
+        case .terminal, .guardrails, .shortcuts, .extensions: .workspace
         case .agents, .models, .accounts, .mcp, .usage: .agents
         case .companion: .device
         }
@@ -884,6 +885,7 @@ enum SettingsSection: String, CaseIterable, Identifiable {
         case .companion: "Companion"
         case .guardrails: "Guardrails"
         case .mcp: "MCP"
+        case .extensions: "Extensions"
         case .accounts: "Accounts"
         case .agents: "Agents"
         case .models: "Models & Keys"
@@ -899,6 +901,7 @@ enum SettingsSection: String, CaseIterable, Identifiable {
         case .companion: "Pair nearby devices and stay connected anywhere"
         case .guardrails: "Standing rules and sensitive files"
         case .mcp: "Project tool servers"
+        case .extensions: "Custom grammars and registry health"
         case .accounts: "Sign-ins, named accounts, and project overrides"
         case .agents: "Custom agents and ACP adapters"
         case .models: "Provider credentials, models, and routing"
@@ -914,6 +917,7 @@ enum SettingsSection: String, CaseIterable, Identifiable {
         case .companion: "iphone.and.arrow.forward"
         case .guardrails: "shield.lefthalf.filled"
         case .mcp: "puzzlepiece.extension"
+        case .extensions: "curlybraces.square"
         case .accounts: "person.crop.circle"
         case .agents: "sparkles"
         case .models: "key"

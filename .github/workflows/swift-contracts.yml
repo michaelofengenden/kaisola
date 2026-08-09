@@ -75,6 +75,7 @@ jobs:
       - name: Test native packaging, compatibility, and resource policies
         run: >-
           node --test
+          tests/node/swiftContractsPaths.test.cjs
           tests/node/brokerCompatibility.test.cjs
           tests/node/companionProtocolTables.test.cjs
           tests/node/nativeAppcast.test.cjs
@@ -83,7 +84,6 @@ jobs:
           tests/node/nativeReleasePreflight.test.cjs
           tests/node/nativeResourceGate.test.cjs
           tests/node/nativeResourceFixtureGate.test.cjs
-          tests/node/swiftContractsPaths.test.cjs
       - name: Test shared Swift contracts
         run: swift test --package-path native/KaisolaCore
       - name: Compile optimized iPhone app against KaisolaCore
